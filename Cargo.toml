@@ -1,0 +1,61 @@
+[workspace]
+members = [
+    "crates/rustyfin-server",
+    "crates/rustyfin-api",
+    "crates/rustyfin-model",
+    "crates/rustyfin-core",
+    "crates/rustyfin-db",
+    "crates/rustyfin-auth",
+    "crates/rustyfin-cli",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
+
+# Web framework
+axum = { version = "0.8", features = ["macros"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace", "fs"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Database
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "migrate", "chrono", "uuid"] }
+
+# Auth
+argon2 = { version = "0.5", features = ["std"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+jsonwebtoken = "9"
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json"] }
+
+# Image processing
+image = "0.25"
+
+# XML parsing (NFO files)
+quick-xml = { version = "0.37", features = ["serialize"] }
+
+# Utilities
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+anyhow = "1"
+
+# Workspace crates
+rustyfin-api = { path = "crates/rustyfin-api" }
+rustyfin-model = { path = "crates/rustyfin-model" }
+rustyfin-core = { path = "crates/rustyfin-core" }
+rustyfin-db = { path = "crates/rustyfin-db" }
+rustyfin-auth = { path = "crates/rustyfin-auth" }

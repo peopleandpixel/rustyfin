@@ -1,0 +1,17 @@
+[package]
+name = "rustyfin-auth"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rustyfin-model = { workspace = true }
+rustyfin-db = { workspace = true }
+argon2 = { workspace = true }
+rand_core = { workspace = true }
+jsonwebtoken = { workspace = true }
+sqlx = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

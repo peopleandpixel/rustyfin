@@ -1,0 +1,20 @@
+[package]
+name = "rustyfin-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rustyfin-model = { workspace = true }
+rustyfin-db = { workspace = true }
+sqlx = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+walkdir = "2"
+reqwest = { workspace = true }
+image = { workspace = true }
+quick-xml = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }

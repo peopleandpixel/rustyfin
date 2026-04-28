@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<module type="EMPTY_MODULE" version="4">
+  <component name="NewModuleRootManager">
+    <content url="file://$MODULE_DIR$">
+      <sourceFolder url="file://$MODULE_DIR$/crates/rustyfin-api/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/rustyfin-auth/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/rustyfin-core/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/rustyfin-db/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/rustyfin-model/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/rustyfin-server/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/rustyfin-cli/src" isTestSource="false" />
+      <excludeFolder url="file://$MODULE_DIR$/target" />
+    </content>
+    <orderEntry type="inheritedJdk" />
+    <orderEntry type="sourceFolder" forTests="false" />
+  </component>
+</module>

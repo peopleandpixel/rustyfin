@@ -1,0 +1,15 @@
+[package]
+name = "rustyfin-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "rustyfin-cli"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive", "env"] }
+reqwest = { version = "0.12", features = ["json", "multipart"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

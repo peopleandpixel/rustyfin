@@ -1,0 +1,1 @@
+ALTER TABLE users ADD COLUMN configuration TEXT NOT NULL DEFAULT '{}';
