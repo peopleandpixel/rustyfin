@@ -1,10 +1,11 @@
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use rustyfin_model::server_info::{
-    FullServerInfo, LogFile, ServerConfiguration, ServerInfo,
+    EndpointInfo, FullServerInfo, LogFile, ServerConfiguration, ServerInfo,
 };
+use std::net::SocketAddr;
 
 use crate::error::ApiError;
 use crate::state::AppState;
@@ -22,6 +23,7 @@ pub fn protected_routes() -> Router<AppState> {
     Router::new()
         .route("/System/Info", get(get_full_info))
         .route("/System/Configuration", get(get_configuration).post(update_configuration))
+        .route("/System/Endpoint", get(get_endpoint))
         .route("/System/Shutdown", post(shutdown))
         .route("/System/Restart", post(restart))
         .route("/System/Logs", get(get_logs))
@@ -68,6 +70,41 @@ async fn get_full_info(State(state): State<AppState>) -> Json<FullServerInfo> {
         program_data_path,
         web_socket_port_number: config.public_port,
         local_address: format!("http://{}", state.bind_addr),
+    })
+}
+
+async fn get_endpoint(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    req: axum::extract::Request,
+) -> Json<EndpointInfo> {
+    let remote_ip = req
+        .headers()
+        .get("X-Forwarded-For")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| addr.ip().to_string());
+
+    let is_local = addr.ip().is_loopback()
+        || remote_ip == "127.0.0.1"
+        || remote_ip == "::1";
+
+    let is_in_network = is_local || addr.ip().is_loopback() || {
+        let ip_str = addr.ip().to_string();
+        ip_str.starts_with("192.168.")
+            || ip_str.starts_with("10.")
+            || ip_str.starts_with("172.")
+            || remote_ip.starts_with("192.168.")
+            || remote_ip.starts_with("10.")
+            || remote_ip.starts_with("172.")
+    };
+
+    Json(EndpointInfo {
+        is_local,
+        is_in_network,
+        local_address: format!("http://{}", state.bind_addr),
+        remote_address: remote_ip,
     })
 }
 

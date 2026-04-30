@@ -10,6 +10,7 @@ struct TmdbSearchResult {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct TmdbSearchItem {
     id: i64,
     title: Option<String>,
@@ -30,6 +31,7 @@ struct TmdbImages {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct TmdbImage {
     file_path: String,
     width: Option<i32>,

@@ -82,6 +82,32 @@ pub async fn get_children(
     Ok(rows.into_iter().map(Into::into).collect())
 }
 
+pub async fn get_children_paged(
+    pool: &SqlitePool,
+    parent_id: Uuid,
+    start_index: i64,
+    limit: i64,
+) -> Result<Vec<MediaItem>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, MediaItemRow>(
+        "SELECT * FROM media_items WHERE parent_id = ? ORDER BY index_number, sort_name, name LIMIT ? OFFSET ?",
+    )
+    .bind(parent_id.to_string())
+    .bind(limit)
+    .bind(start_index)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.into_iter().map(Into::into).collect())
+}
+
+pub async fn count_children(pool: &SqlitePool, parent_id: Uuid) -> Result<i64, sqlx::Error> {
+    let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM media_items WHERE parent_id = ?")
+        .bind(parent_id.to_string())
+        .fetch_one(pool)
+        .await?;
+    Ok(row.0)
+}
+
 pub async fn delete_item(pool: &SqlitePool, id: Uuid) -> Result<bool, sqlx::Error> {
     // Delete children first (recursive via foreign key would be nice, but let's be explicit)
     sqlx::query("DELETE FROM media_items WHERE parent_id = ?")

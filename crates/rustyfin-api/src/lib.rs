@@ -1,4 +1,4 @@
 pub mod routes;
 pub mod state;
-mod error;
-mod middleware;
+pub mod error;
+pub mod middleware;

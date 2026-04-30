@@ -5,3 +5,8 @@ pub mod provider_omdb;
 pub mod local_images;
 pub mod image_proxy;
 pub mod metadata;
+pub mod transcode;
+pub mod subtitle;
+pub mod dlna;
+pub mod scheduler;
+pub mod plugin_manager;

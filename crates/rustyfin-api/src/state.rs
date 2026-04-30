@@ -1,3 +1,7 @@
+use crate::middleware::RateLimiter;
+use rustyfin_core::plugin_manager::PluginManager;
+use rustyfin_core::scheduler::TaskScheduler;
+use rustyfin_core::transcode::TranscodeManager;
 use rustyfin_model::quick_connect::QuickConnectResult;
 use rustyfin_model::server_info::ServerConfiguration;
 use sqlx::SqlitePool;
@@ -18,4 +22,8 @@ pub struct AppState {
     pub api_key: Option<Arc<String>>,
     /// Quick Connect requests keyed by secret. Code→secret lookup done by scanning.
     pub quick_connect: Arc<RwLock<HashMap<String, QuickConnectResult>>>,
+    pub transcode_manager: TranscodeManager,
+    pub task_scheduler: TaskScheduler,
+    pub plugin_manager: PluginManager,
+    pub rate_limiter: RateLimiter,
 }

@@ -1,4 +1,4 @@
-use rustyfin_model::image::{ImageType, ItemImage, detect_image_type_from_filename};
+use rustyfin_model::image::{ItemImage, detect_image_type_from_filename};
 use std::path::Path;
 use uuid::Uuid;
 

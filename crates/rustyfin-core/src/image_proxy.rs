@@ -1,5 +1,5 @@
 use image::imageops::FilterType;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use tokio::fs;
 
 /// Serve an image with optional resizing, using a cache directory

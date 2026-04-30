@@ -1,0 +1,13 @@
+{
+  "name": "rustyfin-web",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "npx @tailwindcss/cli -i ./src/input.css -o ./dist/assets/style.css --minify && cp ./src/index.html ./dist/index.html && cp ./src/api.js ./dist/assets/api.js && cp ./src/app.js ./dist/assets/app.js",
+    "dev": "npx @tailwindcss/cli -i ./src/input.css -o ./dist/assets/style.css --watch"
+  },
+  "devDependencies": {
+    "tailwindcss": "^4",
+    "daisyui": "^5"
+  }
+}

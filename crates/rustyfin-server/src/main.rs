@@ -1,19 +1,34 @@
+use std::net::SocketAddr;
 use std::sync::Arc;
+use tower::Service;
 
 use tokio::sync::{watch, RwLock};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 
+use rustyfin_api::middleware::RateLimiter;
 use rustyfin_api::routes::build_router;
 use rustyfin_api::state::AppState;
 use rustyfin_model::server_info::ServerConfiguration;
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
-        .init();
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
+    let use_json = std::env::var("RUSTYFIN_LOG_JSON").map(|v| v == "1" || v == "true").unwrap_or(false);
+    if use_json {
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .json()
+            .with_target(true)
+            .with_thread_ids(true)
+            .with_span_list(true)
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .init();
+    }
 
     let data_dir = data_dir();
     std::fs::create_dir_all(&data_dir).ok();
@@ -30,7 +45,11 @@ async fn main() {
     let server_id = std::env::var("RUSTYFIN_SERVER_ID")
         .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
 
+    // IPv6 dual-stack: use [::]:8096 to listen on both IPv4 and IPv6
     let bind_addr = std::env::var("RUSTYFIN_BIND").unwrap_or_else(|_| "0.0.0.0:8096".to_string());
+
+    let tls_cert = std::env::var("RUSTYFIN_TLS_CERT").ok();
+    let tls_key = std::env::var("RUSTYFIN_TLS_KEY").ok();
 
     let api_key = std::env::var("RUSTYFIN_API_KEY").ok();
 
@@ -56,18 +75,75 @@ async fn main() {
 
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
 
+    let transcode_manager = rustyfin_core::transcode::TranscodeManager::new(&data_dir);
+
+    let data_dir_arc = Arc::new(data_dir);
+    let task_scheduler = rustyfin_core::scheduler::TaskScheduler::new(
+        pool.clone(),
+        data_dir_arc.clone(),
+    );
+
+    let plugin_manager = rustyfin_core::plugin_manager::PluginManager::new(&data_dir_arc);
+    plugin_manager.load_all().await;
+
+    // Rate limiter: 100 requests per 60 seconds per IP (configurable via env)
+    let rate_max: usize = std::env::var("RUSTYFIN_RATE_LIMIT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100);
+    let rate_window: u64 = std::env::var("RUSTYFIN_RATE_WINDOW")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60);
+    let rate_limiter = RateLimiter::new(rate_max, rate_window);
+    rate_limiter.start_cleanup();
+
     let state = AppState {
         db: pool,
         jwt_secret: Arc::new(jwt_secret),
         server_id: Arc::new(server_id),
-        data_dir: Arc::new(data_dir),
+        data_dir: data_dir_arc,
         config: Arc::new(RwLock::new(config)),
         shutdown_tx: Arc::new(shutdown_tx),
         bind_addr: Arc::new(bind_addr.clone()),
         api_key: api_key.map(|k| Arc::new(k)),
         quick_connect: Arc::new(RwLock::new(std::collections::HashMap::new())),
+        transcode_manager,
+        task_scheduler: task_scheduler.clone(),
+        plugin_manager,
+        rate_limiter,
     };
 
+    // Background task: scheduled tasks (library scan, metadata refresh, cache cleanup)
+    {
+        let shutdown_rx = state.shutdown_tx.subscribe();
+        task_scheduler.start(shutdown_rx);
+    }
+
+    // Background task: SSDP discovery (DLNA)
+    {
+        let dlna_config = std::sync::Arc::new(rustyfin_core::dlna::DlnaConfig {
+            server_name: "Rustyfin".to_string(),
+            server_id: state.server_id.to_string(),
+            http_port: bind_addr
+                .rsplit(':')
+                .next()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(8096),
+            bind_ip: std::net::Ipv4Addr::UNSPECIFIED,
+        });
+        let shutdown_rx = state.shutdown_tx.subscribe();
+        let cfg = dlna_config.clone();
+        tokio::spawn(async move {
+            rustyfin_core::dlna::run_ssdp_responder(cfg, shutdown_rx).await;
+        });
+        let shutdown_rx = state.shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            rustyfin_core::dlna::run_ssdp_advertiser(dlna_config, shutdown_rx).await;
+        });
+    }
+
+    let cleanup_db = state.db.clone();
     let app = build_router(state)
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http());
@@ -76,15 +152,81 @@ async fn main() {
         .await
         .expect("failed to bind");
 
-    tracing::info!("rustyfin listening on {}", bind_addr);
+    // Log detected local port (automatic port detection when using port 0)
+    let local_addr = listener.local_addr().expect("failed to get local address");
+    tracing::info!("rustyfin listening on {}", local_addr);
 
-    axum::serve(listener, app)
+    // Background task: cleanup expired sessions every 5 minutes
+    {
+        let db = cleanup_db;
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+            loop {
+                interval.tick().await;
+                match rustyfin_db::repo_session::cleanup_expired_sessions(&db, 30).await {
+                    Ok(n) if n > 0 => tracing::info!("cleaned up {n} expired sessions"),
+                    Err(e) => tracing::warn!("session cleanup error: {e}"),
+                    _ => {}
+                }
+            }
+        });
+    }
+
+    // TLS support via rustls (set RUSTYFIN_TLS_CERT and RUSTYFIN_TLS_KEY)
+    if let (Some(cert_path), Some(key_path)) = (tls_cert, tls_key) {
+        let tls_config = load_tls_config(&cert_path, &key_path);
+        tracing::info!("TLS enabled with cert={}, key={}", cert_path, key_path);
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
+
+        // Also start a plain HTTP listener that redirects if RUSTYFIN_BIND_HTTP is set
+        // For now, serve HTTPS only on the main bind address
+        tracing::info!("HTTPS server ready – clients must connect via https://");
+
+        let mut make_svc = app.into_make_service_with_connect_info::<SocketAddr>();
+        loop {
+            tokio::select! {
+                result = listener.accept() => {
+                    match result {
+                        Ok((tcp_stream, remote_addr)) => {
+                            let acceptor = acceptor.clone();
+                            let svc = make_svc.call(remote_addr).await.unwrap();
+                            tokio::spawn(async move {
+                                match acceptor.accept(tcp_stream).await {
+                                    Ok(tls_stream) => {
+                                        let stream = hyper_util::rt::TokioIo::new(tls_stream);
+                                        let hyper_svc = hyper_util::service::TowerToHyperService::new(svc);
+                                        let _ = hyper_util::server::conn::auto::Builder::new(
+                                            hyper_util::rt::TokioExecutor::new(),
+                                        )
+                                        .serve_connection(stream, hyper_svc)
+                                        .await;
+                                    }
+                                    Err(e) => tracing::debug!("TLS handshake failed: {}", e),
+                                }
+                            });
+                        }
+                        Err(e) => tracing::warn!("accept error: {}", e),
+                    }
+                }
+                _ = shutdown_rx.wait_for(|v| *v) => {
+                    tracing::info!("graceful shutdown initiated");
+                    break;
+                }
+            }
+        }
+    } else {
+        // Plain HTTP with ConnectInfo for reverse-proxy header support
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
         .with_graceful_shutdown(async move {
             let _ = shutdown_rx.wait_for(|v| *v).await;
             tracing::info!("graceful shutdown initiated");
         })
         .await
         .expect("server error");
+    }
 
     tracing::info!("server stopped");
 }
@@ -113,6 +255,25 @@ fn load_config(data_dir: &std::path::Path) -> ServerConfiguration {
         std::fs::write(&config_path, &json).ok();
     }
     cfg
+}
+
+fn load_tls_config(cert_path: &str, key_path: &str) -> rustls::ServerConfig {
+    let cert_file = std::fs::File::open(cert_path).expect("failed to open TLS certificate file");
+    let key_file = std::fs::File::open(key_path).expect("failed to open TLS key file");
+
+    let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+        rustls_pemfile::certs(&mut std::io::BufReader::new(cert_file))
+            .filter_map(|r| r.ok())
+            .collect();
+
+    let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(key_file))
+        .expect("failed to read TLS private key")
+        .expect("no private key found in key file");
+
+    rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .expect("failed to build TLS config")
 }
 
 fn data_dir() -> std::path::PathBuf {

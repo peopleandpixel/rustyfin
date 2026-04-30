@@ -108,6 +108,16 @@ impl Default for ServerConfiguration {
     }
 }
 
+/// Network endpoint information returned by GET /System/Endpoint
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct EndpointInfo {
+    pub is_local: bool,
+    pub is_in_network: bool,
+    pub local_address: String,
+    pub remote_address: String,
+}
+
 /// A single log file entry
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "PascalCase")]

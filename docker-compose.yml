@@ -1,0 +1,17 @@
+services:
+  rustyfin:
+    build: .
+    container_name: rustyfin
+    ports:
+      - "8096:8096"
+    volumes:
+      - /pfad/zu/medien:/media:ro
+      - rustyfin-data:/data
+    environment:
+      - RUSTYFIN_DATA=/data
+      - RUSTYFIN_BIND=0.0.0.0:8096
+      - RUST_LOG=info
+    restart: unless-stopped
+
+volumes:
+  rustyfin-data:

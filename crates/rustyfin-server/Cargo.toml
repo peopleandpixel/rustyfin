@@ -3,6 +3,10 @@ name = "rustyfin-server"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = ["webclient"]
+webclient = ["rustyfin-api/webclient"]
+
 [[bin]]
 name = "rustyfin"
 path = "src/main.rs"
@@ -10,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 rustyfin-api = { workspace = true }
 rustyfin-model = { workspace = true }
+rustyfin-core = { workspace = true }
 rustyfin-db = { workspace = true }
 rustyfin-auth = { workspace = true }
 serde_json = { workspace = true }
@@ -19,3 +24,8 @@ tracing-subscriber = { workspace = true }
 axum = { workspace = true }
 tower-http = { workspace = true }
 uuid = { workspace = true }
+tower = { workspace = true }
+rustls = { version = "0.23", features = ["ring"] }
+rustls-pemfile = "2"
+tokio-rustls = "0.26"
+hyper-util = { version = "0.1", features = ["tokio", "server-auto", "http1", "http2"] }

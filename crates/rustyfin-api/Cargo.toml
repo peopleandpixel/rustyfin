@@ -3,6 +3,10 @@ name = "rustyfin-api"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+webclient = []
+
 [dependencies]
 rustyfin-model = { workspace = true }
 rustyfin-db = { workspace = true }
@@ -19,3 +23,12 @@ tokio-util = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 tower-http = { workspace = true }
+futures-util = "0.3"
+
+[dev-dependencies]
+http-body-util = "0.1"
+tower = { workspace = true }
+rustyfin-db = { workspace = true }
+rustyfin-auth = { workspace = true }
+rustyfin-core = { workspace = true }
+uuid = { workspace = true }

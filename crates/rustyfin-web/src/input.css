@@ -1,0 +1,208 @@
+@import "tailwindcss";
+@plugin "daisyui" {
+  themes: dark --default, light;
+}
+
+/* Jellyfin-inspired custom styles */
+:root {
+  --jf-primary: #00a4dc;
+  --jf-bg-dark: #101010;
+  --jf-bg-card: #1a1a1a;
+  --jf-bg-surface: #202020;
+  --jf-accent: #00a4dc;
+}
+
+[data-theme="dark"] {
+  --b1: 6.27% 0 0;
+  --b2: 10.2% 0 0;
+  --b3: 7.84% 0 0;
+  --p: 63.47% 0.1182 220.73;
+  --pc: 100% 0 0;
+  --s: 55.83% 0.1574 276.97;
+  --sc: 100% 0 0;
+  --a: 63.47% 0.1182 220.73;
+  --ac: 100% 0 0;
+  --n: 27.06% 0.01 256.09;
+  --nc: 80% 0 0;
+}
+
+body {
+  background: var(--jf-bg-dark);
+  font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+}
+
+/* Backdrop blur for navbar */
+.jf-navbar {
+  background: rgba(16, 16, 16, 0.85);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border-bottom: 1px solid rgba(255,255,255,0.06);
+}
+
+/* Card hover effects */
+.jf-card {
+  background: var(--jf-bg-card);
+  border-radius: 0.5rem;
+  overflow: hidden;
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+  cursor: pointer;
+}
+.jf-card:hover {
+  transform: translateY(-4px);
+  box-shadow: 0 8px 25px rgba(0,0,0,0.4);
+}
+.jf-card img {
+  transition: transform 0.3s ease;
+}
+.jf-card:hover img {
+  transform: scale(1.05);
+}
+
+/* Poster aspect ratio */
+.jf-poster {
+  aspect-ratio: 2/3;
+  background: var(--jf-bg-surface);
+  overflow: hidden;
+  position: relative;
+}
+
+/* Backdrop hero */
+.jf-backdrop {
+  position: relative;
+  background: var(--jf-bg-dark);
+  overflow: hidden;
+}
+.jf-backdrop::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(to top, var(--jf-bg-dark) 0%, transparent 60%),
+              linear-gradient(to right, var(--jf-bg-dark) 0%, transparent 50%);
+}
+
+/* Sidebar */
+.jf-sidebar {
+  background: var(--jf-bg-card);
+  border-right: 1px solid rgba(255,255,255,0.06);
+}
+.jf-sidebar a {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.625rem 1rem;
+  border-radius: 0.375rem;
+  color: rgba(255,255,255,0.7);
+  transition: all 0.15s ease;
+  font-size: 0.9rem;
+}
+.jf-sidebar a:hover, .jf-sidebar a.active {
+  background: rgba(0, 164, 220, 0.15);
+  color: var(--jf-accent);
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.15); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.25); }
+
+/* Horizontal scroll row */
+.jf-scroll-row {
+  display: flex;
+  gap: 1rem;
+  overflow-x: auto;
+  padding-bottom: 0.5rem;
+  scroll-snap-type: x mandatory;
+}
+.jf-scroll-row > * {
+  scroll-snap-align: start;
+  flex-shrink: 0;
+}
+
+/* Badge styles */
+.jf-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.2rem 0.6rem;
+  border-radius: 0.25rem;
+  font-size: 0.75rem;
+  font-weight: 500;
+  background: rgba(255,255,255,0.1);
+  color: rgba(255,255,255,0.8);
+}
+.jf-badge-primary {
+  background: rgba(0, 164, 220, 0.2);
+  color: var(--jf-accent);
+}
+
+/* Play button overlay */
+.jf-play-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0,0,0,0.5);
+  opacity: 0;
+  transition: opacity 0.2s ease;
+}
+.jf-card:hover .jf-play-overlay {
+  opacity: 1;
+}
+
+/* Progress bar on cards */
+.jf-progress {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 3px;
+  background: rgba(255,255,255,0.1);
+}
+.jf-progress-bar {
+  height: 100%;
+  background: var(--jf-accent);
+  border-radius: 0 1px 0 0;
+}
+
+/* Setup wizard */
+.jf-wizard-step {
+  display: none;
+}
+.jf-wizard-step.active {
+  display: block;
+}
+
+/* Toast animation */
+@keyframes slideIn {
+  from { transform: translateX(100%); opacity: 0; }
+  to { transform: translateX(0); opacity: 1; }
+}
+@keyframes slideOut {
+  from { transform: translateX(0); opacity: 1; }
+  to { transform: translateX(100%); opacity: 0; }
+}
+.jf-toast {
+  animation: slideIn 0.3s ease;
+}
+.jf-toast.removing {
+  animation: slideOut 0.3s ease forwards;
+}
+
+/* Settings card */
+.jf-settings-card {
+  background: var(--jf-bg-card);
+  border-radius: 0.75rem;
+  border: 1px solid rgba(255,255,255,0.06);
+  padding: 1.5rem;
+  margin-bottom: 1rem;
+}
+
+/* Smooth page transitions */
+.jf-page {
+  animation: fadeIn 0.2s ease;
+}
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}

@@ -1,7 +1,7 @@
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::header;
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use rustyfin_model::image::{ImageInfo, ImageType, ItemImage};

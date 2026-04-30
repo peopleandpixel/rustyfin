@@ -68,116 +68,116 @@
 - [x] Content-Type-Erkennung (video/mp4, audio/flac, etc.)
 
 ### Transkodierung
-- [ ] `GET /Videos/{id}/master.m3u8` – HLS-Transkodierung
-- [ ] FFmpeg-Prozess-Management (Start, Stop, Cleanup)
-- [ ] Transkodierungs-Profile (Bitrate, Codec, Auflösung)
-- [ ] Hardware-Beschleunigung (VAAPI, NVENC, QSV)
-- [ ] Untertitel-Einbrennung (Burn-in)
-- [ ] Segment-basiertes Streaming (HLS-Segmente)
-- [ ] Transkodierungs-Cache-Management
+- [x] `GET /Videos/{id}/master.m3u8` – HLS-Transkodierung
+- [x] FFmpeg-Prozess-Management (Start, Stop, Cleanup)
+- [x] Transkodierungs-Profile (Bitrate, Codec, Auflösung)
+- [x] Hardware-Beschleunigung (VAAPI, NVENC, QSV)
+- [x] Untertitel-Einbrennung (Burn-in)
+- [x] Segment-basiertes Streaming (HLS-Segmente)
+- [x] Transkodierungs-Cache-Management
 
 ### Wiedergabe-Status
-- [ ] `POST /Sessions/Playing` – Wiedergabe gestartet
-- [ ] `POST /Sessions/Playing/Progress` – Fortschritt melden
-- [ ] `POST /Sessions/Playing/Stopped` – Wiedergabe gestoppt
-- [ ] `POST /Users/{id}/PlayedItems/{itemId}` – Als gesehen markieren
-- [ ] `DELETE /Users/{id}/PlayedItems/{itemId}` – Als ungesehen markieren
-- [ ] `POST /Users/{id}/FavoriteItems/{itemId}` – Favorit setzen
-- [ ] Wiedergabe-Position speichern & wiederherstellen
+- [x] `POST /Sessions/Playing` – Wiedergabe gestartet
+- [x] `POST /Sessions/Playing/Progress` – Fortschritt melden
+- [x] `POST /Sessions/Playing/Stopped` – Wiedergabe gestoppt
+- [x] `POST /Users/{id}/PlayedItems/{itemId}` – Als gesehen markieren
+- [x] `DELETE /Users/{id}/PlayedItems/{itemId}` – Als ungesehen markieren
+- [x] `POST /Users/{id}/FavoriteItems/{itemId}` – Favorit setzen
+- [x] Wiedergabe-Position speichern & wiederherstellen
 
 ### Untertitel
-- [ ] `GET /Videos/{id}/Subtitles/{index}` – Untertitel abrufen
-- [ ] Externe Untertitel-Dateien erkennen (.srt, .ass, .vtt)
-- [ ] Untertitel-Format-Konvertierung (SRT → VTT)
-- [ ] `GET /Items/{id}/RemoteSearch/Subtitles` – Untertitel suchen (OpenSubtitles)
+- [x] `GET /Videos/{id}/Subtitles/{index}` – Untertitel abrufen
+- [x] Externe Untertitel-Dateien erkennen (.srt, .ass, .vtt)
+- [x] Untertitel-Format-Konvertierung (SRT → VTT)
+- [x] `GET /Items/{id}/RemoteSearch/Subtitles` – Untertitel suchen (OpenSubtitles)
 
 ## Phase 3: Session & Geräte-Management
 
 ### Sessions
-- [ ] `GET /Sessions` – Aktive Sessions auflisten
-- [ ] `POST /Sessions/Logout` – Session beenden
-- [ ] Session-Timeout & automatische Bereinigung
-- [ ] WebSocket-Verbindung für Echtzeit-Updates
-- [ ] `POST /Sessions/{id}/Command` – Remote-Steuerung
+- [x] `GET /Sessions` – Aktive Sessions auflisten
+- [x] `POST /Sessions/Logout` – Session beenden
+- [x] Session-Timeout & automatische Bereinigung
+- [x] WebSocket-Verbindung für Echtzeit-Updates
+- [x] `POST /Sessions/{id}/Command` – Remote-Steuerung
 
 ### Geräte
-- [ ] `GET /Devices` – Registrierte Geräte
-- [ ] `DELETE /Devices` – Gerät entfernen
-- [ ] Device-ID-Tracking pro Client
+- [x] `GET /Devices` – Registrierte Geräte
+- [x] `DELETE /Devices` – Gerät entfernen
+- [x] Device-ID-Tracking pro Client
 
 ## Phase 4: Erweiterte Features
 
 ### Suche
-- [ ] `GET /Search/Hints` – Suchvorschläge
-- [ ] Volltextsuche über Titel, Beschreibung, Personen
-- [ ] Fuzzy-Search / Tippfehler-Toleranz
+- [x] `GET /Search/Hints` – Suchvorschläge
+- [x] Volltextsuche über Titel, Beschreibung, Personen
+- [x] Fuzzy-Search / Tippfehler-Toleranz
 
 ### Sammlungen & Playlists
-- [ ] `GET /Collections` – Sammlungen
-- [ ] `POST /Collections` – Sammlung erstellen
-- [ ] `GET /Playlists/{id}/Items` – Playlist-Inhalte
-- [ ] `POST /Playlists` – Playlist erstellen
+- [x] `GET /Collections` – Sammlungen
+- [x] `POST /Collections` – Sammlung erstellen
+- [x] `GET /Playlists/{id}/Items` – Playlist-Inhalte
+- [x] `POST /Playlists` – Playlist erstellen
 
 ### Personen & Genres
-- [ ] `GET /Persons` – Schauspieler/Regisseure
-- [ ] `GET /Persons/{id}` – Person-Details
-- [ ] `GET /Genres` – Genre-Liste
-- [ ] `GET /Studios` – Studio-Liste
-- [ ] `GET /Artists` – Künstler (Musik)
+- [x] `GET /Persons` – Schauspieler/Regisseure
+- [x] `GET /Persons/{id}` – Person-Details
+- [x] `GET /Genres` – Genre-Liste
+- [x] `GET /Studios` – Studio-Liste
+- [x] `GET /Artists` – Künstler (Musik)
 
 ### Aktivitätslog
-- [ ] `GET /System/ActivityLog/Entries` – Aktivitätsprotokoll
-- [ ] Login-Versuche loggen
-- [ ] Medien-Wiedergabe loggen
+- [x] `GET /System/ActivityLog/Entries` – Aktivitätsprotokoll
+- [x] Login-Versuche loggen
+- [x] Medien-Wiedergabe loggen
 
 ### Benachrichtigungen
-- [ ] `GET /Notifications/{userId}` – Benachrichtigungen
-- [ ] Webhook-Support
+- [x] `GET /Notifications/{userId}` – Benachrichtigungen
+- [x] Webhook-Support
 
 ## Phase 5: Netzwerk & Discovery
 
 ### DLNA
-- [ ] UPnP-Discovery (SSDP)
-- [ ] DLNA-Medienserver
-- [ ] DLNA-Content-Directory-Service
+- [x] UPnP-Discovery (SSDP)
+- [x] DLNA-Medienserver
+- [x] DLNA-Content-Directory-Service
 
 ### Netzwerk
-- [ ] `GET /System/Endpoint` – Netzwerk-Endpoint-Info
-- [ ] Automatische Port-Erkennung
-- [ ] HTTPS/TLS-Support (rustls)
-- [ ] Reverse-Proxy-Kompatibilität (X-Forwarded-For, etc.)
-- [ ] IPv6-Support
+- [x] `GET /System/Endpoint` – Netzwerk-Endpoint-Info
+- [x] Automatische Port-Erkennung
+- [x] HTTPS/TLS-Support (rustls)
+- [x] Reverse-Proxy-Kompatibilität (X-Forwarded-For, etc.)
+- [x] IPv6-Support
 
 ## Phase 6: Setup & Administration
 
 ### Ersteinrichtung (Setup Wizard)
-- [ ] `GET /Startup/Configuration` – Setup-Status
-- [ ] `POST /Startup/Configuration` – Setup abschließen
-- [ ] `GET /Startup/User` – Initialen Admin-User abfragen
-- [ ] `POST /Startup/User` – Admin-User erstellen
-- [ ] `POST /Startup/Complete` – Setup abschließen
-- [ ] Wizard-Flow für Ersteinrichtung
+- [x] `GET /Startup/Configuration` – Setup-Status
+- [x] `POST /Startup/Configuration` – Setup abschließen
+- [x] `GET /Startup/User` – Initialen Admin-User abfragen
+- [x] `POST /Startup/User` – Admin-User erstellen
+- [x] `POST /Startup/Complete` – Setup abschließen
+- [x] Wizard-Flow für Ersteinrichtung
 
 ### Scheduled Tasks
-- [ ] `GET /ScheduledTasks` – Geplante Aufgaben
-- [ ] `POST /ScheduledTasks/{id}/Triggers` – Task-Trigger setzen
-- [ ] Automatischer Library-Scan (Intervall-basiert)
-- [ ] Automatische Metadaten-Aktualisierung
-- [ ] Transkodierungs-Cache-Bereinigung
+- [x] `GET /ScheduledTasks` – Geplante Aufgaben
+- [x] `POST /ScheduledTasks/{id}/Triggers` – Task-Trigger setzen
+- [x] Automatischer Library-Scan (Intervall-basiert)
+- [x] Automatische Metadaten-Aktualisierung
+- [x] Transkodierungs-Cache-Bereinigung
 
 ### Plugin-System
-- [ ] Plugin-API definieren (Trait-basiert)
-- [ ] Plugin-Laden (dynamisch via `libloading` oder WASM)
-- [ ] `GET /Plugins` – Installierte Plugins
-- [ ] Plugin-Konfiguration
+- [x] Plugin-API definieren (Trait-basiert)
+- [x] Plugin-Laden (dynamisch via `libloading` oder WASM)
+- [x] `GET /Plugins` – Installierte Plugins
+- [x] Plugin-Konfiguration
 
 ## Phase 7: Client-Kompatibilität
 
 ### Jellyfin Web Client
-- [ ] Statische Web-UI ausliefern (jellyfin-web)
-- [ ] WebSocket-Endpoint (`/socket`)
-- [ ] Alle benötigten API-Responses im exakten Jellyfin-Format
-- [ ] CORS-Konfiguration für Web-Client
+- [x] Statische Web-UI ausliefern (jellyfin-web)
+- [x] WebSocket-Endpoint (`/socket`)
+- [x] Alle benötigten API-Responses im exakten Jellyfin-Format
+- [x] CORS-Konfiguration für Web-Client
 
 ### Mobile & TV Clients
 - [ ] Jellyfin Android App kompatibel
@@ -193,22 +193,22 @@
 ## Phase 8: Qualität & Betrieb
 
 ### Testing
-- [ ] Unit-Tests für alle Repository-Funktionen
-- [ ] Unit-Tests für Auth-Logik
-- [ ] Integrationstests für API-Endpoints
-- [ ] End-to-End-Tests mit echtem Client
+- [x] Unit-Tests für alle Repository-Funktionen
+- [x] Unit-Tests für Auth-Logik
+- [x] Integrationstests für API-Endpoints
+- [x] End-to-End-Tests mit echtem Client
 
 ### Dokumentation
-- [ ] README mit Setup-Anleitung
-- [ ] API-Dokumentation (OpenAPI/Swagger)
-- [ ] Konfigurationsdokumentation
-- [ ] Docker-Image & Dockerfile
-- [ ] docker-compose.yml Beispiel
+- [x] README mit Setup-Anleitung
+- [x] API-Dokumentation (OpenAPI/Swagger)
+- [x] Konfigurationsdokumentation
+- [x] Docker-Image & Dockerfile
+- [x] docker-compose.yml Beispiel
 
 ### Performance & Stabilität
-- [ ] Graceful Shutdown
-- [ ] Connection Pooling (DB)
-- [ ] Rate Limiting
-- [ ] Request-Logging (strukturiert)
-- [ ] Fehlerbehandlung & Error-Responses im Jellyfin-Format
-- [ ] Speicher-Optimierung für große Bibliotheken (>100k Items)
+- [x] Graceful Shutdown
+- [x] Connection Pooling (DB)
+- [x] Rate Limiting
+- [x] Request-Logging (strukturiert)
+- [x] Fehlerbehandlung & Error-Responses im Jellyfin-Format
+- [x] Speicher-Optimierung für große Bibliotheken (>100k Items)
