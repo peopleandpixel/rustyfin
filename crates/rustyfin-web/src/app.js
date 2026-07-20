@@ -59,11 +59,18 @@ async function wizNext() {
         if (pw && pw !== pw2) { $('wiz-user-error').textContent = 'Passwörter stimmen nicht überein'; show('wiz-user-error'); return; }
         hide('wiz-user-error');
         try { await API.createStartupUser(user, pw || ''); } catch {}
+        // Automatisch einloggen, damit nachfolgende Schritte (Library) authentifiziert sind
+        try { await API.login(user, pw || ''); } catch (e) { console.warn('Auto-Login im Wizard fehlgeschlagen:', e); }
     } else if (wizStep === 2) {
         const name = $('wiz-lib-name').value.trim();
         const path = $('wiz-lib-path').value.trim();
         if (name && path) {
-            try { await API.createLibrary(name, $('wiz-lib-type').value, [path]); } catch {}
+            if (!API.isLoggedIn()) {
+                toast('Bibliothek wird übersprungen – bitte nach dem Setup im Admin-Bereich anlegen', 'error');
+            } else {
+                try { await API.createLibrary(name, $('wiz-lib-type').value, [path]); }
+                catch (e) { toast('Bibliothek konnte nicht angelegt werden: ' + e.message, 'error'); }
+            }
         }
     }
     wizSetStep(Math.min(wizStep + 1, 3));
@@ -195,7 +202,12 @@ async function renderHome() {
         let c = '<div class="jf-page">';
         c += sectionRow('Weiterschauen', resume);
         c += sectionRow('Zuletzt hinzugefügt', latest);
-        if (!resume.length && !latest.length) c += '<div class="text-center py-16 text-white/40"><img src="/web/assets/logo.webp" class="w-16 h-16 mx-auto rounded-xl opacity-30 mb-4"><p class="text-lg">Willkommen! Deine Bibliothek ist noch leer.</p><p class="text-sm mt-2">Füge Medienbibliotheken in den Einstellungen hinzu.</p></div>';
+        if (!resume.length && !latest.length) {
+            const adminCta = API.isAdmin
+                ? '<button class="mt-6 px-6 py-3 rounded-lg bg-[#00a4dc] hover:bg-[#0090c4] text-white font-medium transition" onclick="openAddLibrary()">＋ Bibliothek hinzufügen</button>'
+                : '<p class="text-sm mt-2">Bitte einen Administrator kontaktieren, um Bibliotheken hinzuzufügen.</p>';
+            c += `<div class="text-center py-16 text-white/40"><img src="/web/assets/logo.webp" class="w-16 h-16 mx-auto rounded-xl opacity-30 mb-4"><p class="text-lg">Willkommen! Deine Bibliothek ist noch leer.</p>${adminCta}</div>`;
+        }
         c += '</div>';
         page.innerHTML = c;
     } catch (e) { page.innerHTML = `<div class="p-4 rounded-lg bg-red-500/10 text-red-400">${e.message}</div>`; }
@@ -256,7 +268,7 @@ async function renderLibrary(libId) {
     const page = $('page-library');
     page.innerHTML = '<div class="flex justify-center py-8"><div class="w-8 h-8 border-2 border-[#00a4dc] border-t-transparent rounded-full animate-spin"></div></div>';
     try {
-        const data = await API.getItems({ ParentId: libId, Recursive: true, Limit: 100, SortBy: 'SortName', SortOrder: 'Ascending' });
+        const data = await API.getItems({ LibraryId: libId, Limit: 200, SortBy: 'SortName', SortOrder: 'Ascending' });
         const items = data.Items || data.items || [];
         const total = data.TotalRecordCount || data.total_record_count || items.length;
         const lib = libraries.find(l => (l.id || l.Id) === libId);
@@ -569,6 +581,12 @@ async function renderAdmin() {
 
             <div id="admin-libs" class="hidden">
                 <div class="jf-settings-card">
+                    <div class="flex items-center justify-between mb-4">
+                        <h3 class="font-semibold">Bibliotheken (${libs.length})</h3>
+                        <button class="px-4 py-2 rounded-lg bg-[#00a4dc] hover:bg-[#0090c4] text-white text-sm font-medium transition flex items-center gap-2" onclick="openAddLibrary()">
+                            <span class="text-lg leading-none">＋</span><span>Neue Bibliothek</span>
+                        </button>
+                    </div>
                     <div class="overflow-x-auto"><table class="w-full text-sm">
                         <thead><tr class="text-left text-white/40 border-b border-white/10"><th class="pb-3">Name</th><th class="pb-3">Typ</th><th class="pb-3">Pfade</th><th class="pb-3">Aktionen</th></tr></thead>
                         <tbody>${libs.map(l => `<tr class="border-b border-white/5">
@@ -670,14 +688,58 @@ async function loadSidebar() {
         const list = $('sidebar-lib-list');
         if (!list) return;
         list.innerHTML = '';
-        const icons = { movies: '🎬', tvshows: '📺', music: '🎵', mixed: '📁' };
+        const icons = { movies: '🎬', tvshows: '📺', music: '🎵', photos: '🖼️', mixed: '📁',
+                        Movies: '🎬', TvShows: '📺', Music: '🎵', Photos: '🖼️', Mixed: '📁' };
         libraries.forEach(lib => {
             const id = lib.id || lib.Id;
             const name = lib.name || lib.Name;
             const type = lib.content_type || lib.ContentType || 'mixed';
             list.innerHTML += `<a onclick="navigate('library','${id}')">${icons[type] || '📁'} ${name}</a>`;
         });
+        if (!libraries.length) {
+            list.innerHTML = '<p class="text-xs text-white/30 px-1 py-2">Keine Bibliotheken</p>';
+        }
+        if (API.isAdmin) {
+            show('sidebar-add-lib');
+            show('sidebar-add-lib-row');
+        }
     } catch {}
+}
+
+// --- Add Library Modal ---
+function openAddLibrary() {
+    if (!API.isAdmin) { toast('Nur Administratoren können Bibliotheken anlegen', 'error'); return; }
+    const dlg = $('add-library-modal');
+    if (!dlg) return;
+    const form = $('add-library-form');
+    if (form) form.reset();
+    if (typeof dlg.showModal === 'function') dlg.showModal();
+    else dlg.setAttribute('open', '');
+}
+
+function closeAddLibrary() {
+    const dlg = $('add-library-modal');
+    if (!dlg) return;
+    if (typeof dlg.close === 'function') dlg.close();
+    else dlg.removeAttribute('open');
+}
+
+async function submitAddLibrary(e) {
+    e.preventDefault();
+    const f = e.target;
+    const name = f.name.value.trim();
+    const type = f.type.value;
+    const paths = f.paths.value.split(',').map(p => p.trim()).filter(Boolean);
+    if (!name || !paths.length) { toast('Name und mindestens ein Pfad erforderlich', 'error'); return; }
+    try {
+        await API.createLibrary(name, type, paths);
+        toast('Bibliothek erstellt');
+        closeAddLibrary();
+        await loadSidebar();
+        if (currentPage === 'admin') renderAdmin();
+    } catch (err) {
+        toast(err.message, 'error');
+    }
 }
 
 // --- Auth UI ---
@@ -688,10 +750,11 @@ function updateAuthUI() {
         $('nav-avatar-letter').textContent = (API.userName || 'U')[0].toUpperCase();
         $('nav-user-name').textContent = API.userName || '';
         $('dropdown-username').textContent = API.userName || '';
-        if (API.isAdmin) show('nav-admin-link');
+        if (API.isAdmin) { show('nav-admin-link'); show('nav-add-lib'); }
     } else {
         show('nav-login-btn');
         hide('nav-user-menu');
+        hide('nav-add-lib');
         hide('sidebar');
     }
 }

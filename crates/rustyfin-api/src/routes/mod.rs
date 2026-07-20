@@ -19,6 +19,7 @@ mod startup;
 mod scheduled_tasks;
 mod plugins;
 mod websocket;
+mod display_preferences;
 
 use axum::Router;
 use axum::middleware as axum_mw;
@@ -54,6 +55,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(activity::routes())
         .merge(scheduled_tasks::routes())
         .merge(plugins::routes())
+        .merge(display_preferences::routes())
         .layer(axum_mw::from_fn_with_state(state.clone(), require_auth));
 
     #[allow(unused_mut)]

@@ -125,6 +125,7 @@ const API = {
     // Images
     imageUrl(itemId, type = 'Primary', opts = {}) {
         const q = new URLSearchParams(opts);
+        if (this.token) q.set('api_key', this.token);
         return `${this.base}/Items/${itemId}/Images/${type}?${q}`;
     },
 

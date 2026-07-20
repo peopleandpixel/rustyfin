@@ -39,4 +39,16 @@ impl LibraryContentType {
             Self::Mixed => MediaType::Unknown,
         }
     }
+
+    /// Lowercase Jellyfin `CollectionType` value used by clients
+    /// (e.g. "movies", "tvshows", "music", "homevideos", "mixed").
+    pub fn jellyfin_collection_type(&self) -> &'static str {
+        match self {
+            Self::Movies => "movies",
+            Self::TvShows => "tvshows",
+            Self::Music => "music",
+            Self::Photos => "homevideos",
+            Self::Mixed => "mixed",
+        }
+    }
 }

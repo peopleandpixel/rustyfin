@@ -15,6 +15,54 @@ pub fn routes() -> Router<AppState> {
         .route("/Library/VirtualFolders/{id}", delete(remove_library))
         .route("/Library/VirtualFolders/{id}/Refresh", post(scan_library))
         .route("/Library/Refresh", post(refresh_all))
+        .route("/Users/{userId}/Views", get(get_user_views))
+        .route("/UserViews", get(get_user_views_no_user))
+}
+
+fn libraries_to_views(libs: &[Library]) -> Value {
+    let items: Vec<Value> = libs
+        .iter()
+        .map(|lib| {
+            json!({
+                "Id": lib.id,
+                "Name": lib.name,
+                "Type": "CollectionFolder",
+                "CollectionType": lib.content_type.jellyfin_collection_type(),
+                "MediaType": "Unknown",
+                "IsFolder": true,
+                "ServerId": "rustyfin",
+                "ParentId": Value::Null,
+                "ChildCount": 0,
+                "UserData": {
+                    "PlaybackPositionTicks": 0,
+                    "PlayCount": 0,
+                    "IsFavorite": false,
+                    "Played": false,
+                },
+            })
+        })
+        .collect();
+    let count = items.len() as i64;
+    json!({
+        "Items": items,
+        "TotalRecordCount": count,
+        "StartIndex": 0,
+    })
+}
+
+async fn get_user_views(
+    State(state): State<AppState>,
+    Path(_user_id): Path<Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    let libs = rustyfin_db::repo_library::get_all_libraries(&state.db).await?;
+    Ok(Json(libraries_to_views(&libs)))
+}
+
+async fn get_user_views_no_user(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, ApiError> {
+    let libs = rustyfin_db::repo_library::get_all_libraries(&state.db).await?;
+    Ok(Json(libraries_to_views(&libs)))
 }
 
 async fn get_libraries(State(state): State<AppState>) -> Result<Json<Vec<Library>>, ApiError> {
