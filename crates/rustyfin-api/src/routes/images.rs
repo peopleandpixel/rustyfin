@@ -15,7 +15,10 @@ use crate::state::AppState;
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/Items/{id}/Images", get(get_item_images))
-        .route("/Items/{id}/Images/{image_type}", get(get_item_image).post(upload_item_image))
+        .route(
+            "/Items/{id}/Images/{image_type}",
+            get(get_item_image).post(upload_item_image),
+        )
         .route("/Items/{id}/Refresh", post(refresh_item))
 }
 
@@ -23,8 +26,7 @@ async fn get_item_images(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Vec<ImageInfo>>, ApiError> {
-    let images = rustyfin_db::repo_image::get_images_for_item(&state.db, id)
-        .await?;
+    let images = rustyfin_db::repo_image::get_images_for_item(&state.db_ro, id).await?;
 
     let infos: Vec<ImageInfo> = images
         .into_iter()
@@ -60,21 +62,42 @@ async fn get_item_image(
         .ok_or_else(|| ApiError::BadRequest(format!("unknown image type: {}", image_type_str)))?;
 
     let index = query.image_index.unwrap_or(0);
-    let img = rustyfin_db::repo_image::get_image(&state.db, id, &image_type, index)
+    let img = rustyfin_db::repo_image::get_image(&state.db_ro, id, &image_type, index)
         .await?
         .ok_or_else(|| ApiError::NotFound("image not found".into()))?;
 
-    let cache_dir = state.data_dir.join("cache").join("images");
-    let bytes = rustyfin_core::image_proxy::get_or_resize_image(
-        &img.path,
-        query.max_width,
-        query.max_height,
-        &cache_dir,
-    )
-    .await
-    .map_err(|e| ApiError::Internal(e))?;
+    // Build cache key for in-memory image cache
+    let cache_key = format!(
+        "{}:{}:{}:{}:{}",
+        id,
+        image_type_str,
+        index,
+        query.max_width.unwrap_or(0),
+        query.max_height.unwrap_or(0)
+    );
 
-    let content_type = guess_content_type(&img.path, query.max_width.is_some() || query.max_height.is_some());
+    // Check in-memory cache first
+    let bytes = if let Some(cached) = state.image_cache.get(&cache_key) {
+        cached
+    } else {
+        let cache_dir = state.data_dir.join("cache").join("images");
+        let bytes = rustyfin_core::image_proxy::get_or_resize_image(
+            &img.path,
+            query.max_width,
+            query.max_height,
+            &cache_dir,
+        )
+        .await
+        .map_err(ApiError::Internal)?;
+        // Store in in-memory cache
+        state.image_cache.insert(cache_key.clone(), bytes.clone());
+        bytes
+    };
+
+    let content_type = guess_content_type(
+        &img.path,
+        query.max_width.is_some() || query.max_height.is_some(),
+    );
 
     Ok(Response::builder()
         .header(header::CONTENT_TYPE, content_type)
@@ -129,7 +152,7 @@ async fn refresh_item(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>, ApiError> {
-    let item = rustyfin_db::repo_media::get_item_by_id(&state.db, id)
+    let item = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, id)
         .await?
         .ok_or_else(|| ApiError::NotFound("item not found".into()))?;
 
@@ -139,7 +162,11 @@ async fn refresh_item(
 
     rustyfin_core::metadata::refresh_item_metadata(&state.db, &item, tmdb_key, omdb_key)
         .await
-        .map_err(|e| ApiError::Internal(e))?;
+        .map_err(ApiError::Internal)?;
+
+    // Invalidate cached item details and images after metadata refresh
+    state.cache.invalidate_item(&id.to_string());
+    state.image_cache.invalidate_item(&id.to_string());
 
     Ok(Json(json!({ "status": "ok" })))
 }
@@ -167,7 +194,11 @@ fn detect_image_extension(bytes: &[u8]) -> &'static str {
         "png"
     } else if bytes.starts_with(&[0x47, 0x49, 0x46]) {
         "gif"
-    } else if bytes.len() >= 4 && &bytes[0..4] == b"RIFF" && bytes.len() >= 12 && &bytes[8..12] == b"WEBP" {
+    } else if bytes.len() >= 4
+        && &bytes[0..4] == b"RIFF"
+        && bytes.len() >= 12
+        && &bytes[8..12] == b"WEBP"
+    {
         "webp"
     } else {
         "jpg"

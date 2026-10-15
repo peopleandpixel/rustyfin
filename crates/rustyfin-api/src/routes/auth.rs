@@ -23,8 +23,17 @@ async fn login(
             .await?;
 
     let (client, version, device, device_id) = parse_emby_auth(&headers);
+    let session_id = Uuid::new_v4();
+
+    // Create session in database
+    rustyfin_db::repo_session::create_session(
+        &state.db, session_id, user.id, &user.name, &client, &device, &device_id, &version,
+    )
+    .await
+    .ok();
+
     let session_info = AuthSessionInfo {
-        id: Uuid::new_v4().to_string(),
+        id: session_id.to_string(),
         user_id: user.id,
         user_name: user.name.clone(),
         client,

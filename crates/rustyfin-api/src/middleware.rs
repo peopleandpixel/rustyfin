@@ -41,33 +41,30 @@ pub async fn require_auth(
             // Check query parameter api_key
             req.uri()
                 .query()
-                .and_then(|q| {
-                    q.split('&')
-                        .find_map(|pair| pair.strip_prefix("api_key="))
-                })
+                .and_then(|q| q.split('&').find_map(|pair| pair.strip_prefix("api_key=")))
                 .map(|s| s.to_string())
         })
         .ok_or(ApiError::Unauthorized)?;
 
     // Check if the token matches a configured API key
-    if let Some(ref api_key) = state.api_key {
-        if token == **api_key {
-            // API key auth: create admin claims
-            let claims = Claims {
-                sub: uuid::Uuid::nil(),
-                name: "ApiKey".to_string(),
-                is_admin: true,
-                iat: 0,
-                exp: i64::MAX,
-            };
-            req.extensions_mut().insert(claims);
-            return Ok(next.run(req).await);
-        }
+    if let Some(ref api_key) = state.api_key
+        && token == **api_key
+    {
+        // API key auth: create admin claims
+        let claims = Claims {
+            sub: uuid::Uuid::nil(),
+            name: "ApiKey".to_string(),
+            is_admin: true,
+            iat: 0,
+            exp: i64::MAX,
+        };
+        req.extensions_mut().insert(claims);
+        return Ok(next.run(req).await);
     }
 
     // Otherwise validate as JWT
-    let claims =
-        rustyfin_auth::validate_token(&token, &state.jwt_secret).map_err(|_| ApiError::Unauthorized)?;
+    let claims = rustyfin_auth::validate_token(&token, &state.jwt_secret)
+        .map_err(|_| ApiError::Unauthorized)?;
 
     req.extensions_mut().insert(claims);
     Ok(next.run(req).await)
@@ -105,7 +102,7 @@ impl RateLimiter {
     }
 
     /// Periodically clean up expired entries to prevent memory leaks.
-    pub fn start_cleanup(self: &Self) {
+    pub fn start_cleanup(&self) {
         let state = self.state.clone();
         let window = self.window;
         tokio::spawn(async move {

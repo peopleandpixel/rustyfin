@@ -64,15 +64,15 @@ pub async fn parse_nfo(nfo_path: &Path) -> Option<ExternalMetadata> {
             }
         }
 
-        if let Some(fanart) = &nfo.fanart {
-            if let Some(thumbs) = &fanart.thumb {
-                for t in thumbs {
-                    if let Some(url) = &t.url {
-                        images.push(MetadataImage {
-                            image_type: "Backdrop".to_string(),
-                            url: url.clone(),
-                        });
-                    }
+        if let Some(fanart) = &nfo.fanart
+            && let Some(thumbs) = &fanart.thumb
+        {
+            for t in thumbs {
+                if let Some(url) = &t.url {
+                    images.push(MetadataImage {
+                        image_type: "Backdrop".to_string(),
+                        url: url.clone(),
+                    });
                 }
             }
         }
@@ -89,6 +89,7 @@ pub async fn parse_nfo(nfo_path: &Path) -> Option<ExternalMetadata> {
             premiere_date: nfo.premiered,
             runtime_ticks,
             image_urls: images,
+            tmdb_id: None,
         });
     }
 

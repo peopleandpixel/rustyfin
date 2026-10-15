@@ -1,3 +1,4 @@
+use rustyfin_model::media::{MediaItem, MediaType};
 use rustyfin_model::search::SearchHint;
 use sqlx::SqlitePool;
 use uuid::Uuid;
@@ -53,4 +54,49 @@ pub async fn search_hints(
             })
         })
         .collect())
+}
+
+/// Full search returning MediaItem results
+pub async fn search_items(
+    pool: &SqlitePool,
+    query: &str,
+    item_types: &[MediaType],
+    limit: i64,
+) -> Result<Vec<MediaItem>, sqlx::Error> {
+    // Build media type filter
+    let type_filters: Vec<String> = item_types
+        .iter()
+        .map(|t| serde_json::to_string(t).unwrap_or_default())
+        .collect();
+
+    if type_filters.is_empty() {
+        // Fallback: search all types
+        let like = format!("%{}%", query);
+        let rows = sqlx::query_as::<_, super::repo_media::MediaItemRow>(
+            "SELECT * FROM media_items WHERE name LIKE ?1 OR overview LIKE ?1 LIMIT ?2",
+        )
+        .bind(&like)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+        return Ok(rows.into_iter().map(Into::into).collect());
+    }
+
+    let placeholders: Vec<&str> = type_filters.iter().map(|_| "?").collect();
+    let mut sql = format!(
+        "SELECT * FROM media_items WHERE (name LIKE ? OR overview LIKE ?) AND media_type IN ({})",
+        placeholders.join(",")
+    );
+    sql.push_str(" LIMIT ?");
+
+    let mut q = sqlx::query_as::<_, super::repo_media::MediaItemRow>(&sql);
+    let like = format!("%{}%", query);
+    q = q.bind(&like).bind(&like);
+    for t in &type_filters {
+        q = q.bind(t);
+    }
+    q = q.bind(limit);
+
+    let rows = q.fetch_all(pool).await?;
+    Ok(rows.into_iter().map(Into::into).collect())
 }

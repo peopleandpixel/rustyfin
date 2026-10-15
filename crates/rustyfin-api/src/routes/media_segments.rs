@@ -20,12 +20,28 @@ struct MediaSegmentsResult {
 }
 
 async fn get_media_segments(
-    Path(_item_id): Path<Uuid>,
+    State(state): State<AppState>,
+    Path(item_id): Path<Uuid>,
 ) -> Result<Json<MediaSegmentsResult>, ApiError> {
-    // No persisted segments yet (intros, outros, recaps, previews, commercials).
+    let segments = rustyfin_db::repo_media_segment::get_media_segments(&state.db_ro, item_id)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    let items: Vec<serde_json::Value> = segments
+        .iter()
+        .map(|seg| {
+            serde_json::json!({
+                "ItemId": seg.item_id,
+                "Type": seg.segment_type,
+                "SegmentStartTicks": seg.segment_start_ticks,
+                "SegmentEndTicks": seg.segment_end_ticks,
+            })
+        })
+        .collect();
+
     Ok(Json(MediaSegmentsResult {
-        items: Vec::new(),
-        total_record_count: 0,
+        items,
+        total_record_count: segments.len() as i64,
         start_index: 0,
     }))
 }

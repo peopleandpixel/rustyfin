@@ -4,17 +4,17 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Rustyfin</title>
-    <link rel="icon" type="image/webp" href="/web/assets/logo.webp">
+    <link rel="icon" type="image/png" href="/web/assets/logo.png">
     <link rel="stylesheet" href="/web/assets/style.css">
 </head>
-<body class="h-full text-white" style="background:#101010">
+<body class="h-full text-white jf-body">
 <div id="app" class="min-h-full flex flex-col">
 
 <!-- Setup Wizard (shown when startup_wizard_completed === false) -->
-<div id="setup-wizard" class="hidden fixed inset-0 z-[100] flex items-center justify-center" style="background:#101010">
+<div id="setup-wizard" class="hidden fixed inset-0 z-[100] flex items-center justify-center jf-body">
     <div class="w-full max-w-lg p-8">
         <div class="text-center mb-8">
-            <img src="/web/assets/logo.webp" alt="Rustyfin" class="w-24 h-24 mx-auto rounded-2xl shadow-lg mb-4">
+            <img src="/web/assets/logo.png" alt="Rustyfin" class="w-28 h-28 mx-auto rounded-2xl shadow-lg mb-4">
             <h1 class="text-3xl font-bold text-white">Willkommen bei Rustyfin</h1>
             <p class="text-white/50 mt-2">Ersteinrichtungsassistent</p>
         </div>
@@ -35,7 +35,7 @@
                 <div class="space-y-4">
                     <div>
                         <label class="block text-sm text-white/70 mb-1">Metadaten-Sprache</label>
-                        <select id="wiz-lang" class="select select-bordered w-full bg-[#202020] border-white/10">
+                        <select id="wiz-lang" class="jf-input w-full">
                             <option value="de">Deutsch</option>
                             <option value="en">English</option>
                             <option value="fr">Français</option>
@@ -47,7 +47,7 @@
                     </div>
                     <div>
                         <label class="block text-sm text-white/70 mb-1">Land</label>
-                        <select id="wiz-country" class="select select-bordered w-full bg-[#202020] border-white/10">
+                        <select id="wiz-country" class="jf-input w-full">
                             <option value="DE">Deutschland</option>
                             <option value="AT">Österreich</option>
                             <option value="CH">Schweiz</option>
@@ -60,7 +60,7 @@
                 </div>
             </div>
             <div class="flex justify-end mt-4">
-                <button class="btn bg-[#00a4dc] hover:bg-[#0090c4] text-white border-0" onclick="wizNext()">Weiter →</button>
+                <button class="jf-btn-primary" onclick="wizNext()">Weiter →</button>
             </div>
         </div>
 
@@ -72,22 +72,22 @@
                 <div class="space-y-4">
                     <div>
                         <label class="block text-sm text-white/70 mb-1">Benutzername</label>
-                        <input type="text" id="wiz-username" class="input input-bordered w-full bg-[#202020] border-white/10" placeholder="admin" value="admin">
+                        <input type="text" id="wiz-username" class="jf-input w-full" placeholder="admin" value="admin">
                     </div>
                     <div>
                         <label class="block text-sm text-white/70 mb-1">Passwort</label>
-                        <input type="password" id="wiz-password" class="input input-bordered w-full bg-[#202020] border-white/10" placeholder="Passwort eingeben">
+                        <input type="password" id="wiz-password" class="jf-input w-full" placeholder="Passwort eingeben">
                     </div>
                     <div>
                         <label class="block text-sm text-white/70 mb-1">Passwort bestätigen</label>
-                        <input type="password" id="wiz-password2" class="input input-bordered w-full bg-[#202020] border-white/10" placeholder="Passwort wiederholen">
+                        <input type="password" id="wiz-password2" class="jf-input w-full" placeholder="Passwort wiederholen">
                     </div>
                 </div>
             </div>
             <div id="wiz-user-error" class="text-red-400 text-sm mt-2 hidden"></div>
             <div class="flex justify-between mt-4">
-                <button class="btn btn-ghost text-white/60" onclick="wizPrev()">← Zurück</button>
-                <button class="btn bg-[#00a4dc] hover:bg-[#0090c4] text-white border-0" onclick="wizNext()">Weiter →</button>
+                <button class="jf-btn-ghost" onclick="wizPrev()">← Zurück</button>
+                <button class="jf-btn-primary" onclick="wizNext()">Weiter →</button>
             </div>
         </div>
 
@@ -99,11 +99,11 @@
                 <div class="space-y-4">
                     <div>
                         <label class="block text-sm text-white/70 mb-1">Bibliotheksname</label>
-                        <input type="text" id="wiz-lib-name" class="input input-bordered w-full bg-[#202020] border-white/10" placeholder="z.B. Filme">
+                        <input type="text" id="wiz-lib-name" class="jf-input w-full" placeholder="z.B. Filme">
                     </div>
                     <div>
                         <label class="block text-sm text-white/70 mb-1">Inhaltstyp</label>
-                        <select id="wiz-lib-type" class="select select-bordered w-full bg-[#202020] border-white/10">
+                        <select id="wiz-lib-type" class="jf-input w-full">
                             <option value="Movies">Filme</option>
                             <option value="TvShows">Serien</option>
                             <option value="Music">Musik</option>
@@ -113,14 +113,14 @@
                     </div>
                     <div>
                         <label class="block text-sm text-white/70 mb-1">Medienpfad</label>
-                        <input type="text" id="wiz-lib-path" class="input input-bordered w-full bg-[#202020] border-white/10" placeholder="/media/filme">
+                        <input type="text" id="wiz-lib-path" class="jf-input w-full" placeholder="/media/filme">
                     </div>
                 </div>
                 <p class="text-white/40 text-xs mt-3">Dieser Schritt ist optional. Du kannst Bibliotheken auch später in den Einstellungen hinzufügen.</p>
             </div>
             <div class="flex justify-between mt-4">
-                <button class="btn btn-ghost text-white/60" onclick="wizPrev()">← Zurück</button>
-                <button class="btn bg-[#00a4dc] hover:bg-[#0090c4] text-white border-0" onclick="wizNext()">Weiter →</button>
+                <button class="jf-btn-ghost" onclick="wizPrev()">← Zurück</button>
+                <button class="jf-btn-primary" onclick="wizNext()">Weiter →</button>
             </div>
         </div>
 
@@ -137,95 +137,82 @@
                 </div>
             </div>
             <div class="flex justify-between mt-4">
-                <button class="btn btn-ghost text-white/60" onclick="wizPrev()">← Zurück</button>
-                <button class="btn bg-[#00a4dc] hover:bg-[#0090c4] text-white border-0" onclick="wizComplete()">Fertigstellen ✓</button>
+                <button class="jf-btn-ghost" onclick="wizPrev()">← Zurück</button>
+                <button class="jf-btn-primary" onclick="wizComplete()">Fertigstellen ✓</button>
             </div>
         </div>
     </div>
 </div>
 
-<!-- Navbar -->
-<nav id="main-navbar" class="jf-navbar sticky top-0 z-50 px-4 h-16 flex items-center">
-    <div class="flex items-center gap-3 flex-shrink-0">
-        <button id="sidebar-btn" class="lg:hidden p-2 rounded-lg hover:bg-white/10 transition" onclick="toggleSidebar()">
-            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg>
+<!-- Header -->
+<header id="main-navbar" class="jf-header sticky top-0 z-50 px-3 h-14 flex items-center gap-2">
+    <div class="flex items-center gap-1 flex-shrink-0">
+        <button id="sidebar-btn" class="jf-icon-btn lg:hidden" title="Menü" onclick="toggleSidebar()">
+            <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg>
         </button>
-        <a class="flex items-center gap-2 cursor-pointer select-none" onclick="navigate('home')">
-            <img src="/web/assets/logo.webp" alt="Rustyfin" class="w-8 h-8 rounded-lg">
-            <span class="text-lg font-bold hidden sm:inline">Rustyfin</span>
+        <a class="flex items-center gap-2 cursor-pointer select-none ml-1" onclick="navigate('home')">
+            <img src="/web/assets/logo.png" alt="Rustyfin" class="w-8 h-8 rounded-md">
+            <span class="text-base font-semibold tracking-wide hidden sm:inline">Rustyfin</span>
         </a>
     </div>
 
-    <div class="flex-1 flex justify-center px-4">
-        <div class="relative w-full max-w-md">
+    <div class="flex-1 flex justify-center px-2 sm:px-4">
+        <div class="relative w-full max-w-xl">
             <svg class="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-white/40" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/></svg>
-            <input id="search-input" type="text" placeholder="Suchen…"
-                   class="w-full pl-10 pr-4 py-2 rounded-lg bg-white/10 border border-white/10 text-sm text-white placeholder-white/40 focus:outline-none focus:border-[#00a4dc] focus:bg-white/15 transition"
+            <input id="search-input" type="text" placeholder="Suchen…" class="jf-search w-full"
                    onkeydown="if(event.key==='Enter')doSearch(this.value)">
         </div>
     </div>
 
-    <div class="flex items-center gap-3 flex-shrink-0">
-        <button id="nav-add-lib" class="hidden px-3 py-2 rounded-lg bg-[#00a4dc] hover:bg-[#0090c4] text-white text-sm font-medium transition flex items-center gap-1.5" title="Neue Bibliothek hinzufügen" onclick="openAddLibrary()">
+    <div class="flex items-center gap-2 flex-shrink-0">
+        <button id="nav-add-lib" class="hidden jf-btn-primary !py-1.5 flex items-center gap-1.5" title="Neue Bibliothek hinzufügen" onclick="openAddLibrary()">
             <span class="text-base leading-none">＋</span>
             <span class="hidden sm:inline">Bibliothek</span>
         </button>
         <span id="nav-version" class="text-xs text-white/30 hidden sm:inline"></span>
         <div id="nav-user-menu" class="hidden relative">
-            <button onclick="toggleUserMenu()" class="flex items-center gap-2 p-1.5 rounded-lg hover:bg-white/10 transition">
+            <button onclick="toggleUserMenu()" class="flex items-center gap-2 p-1 rounded-full hover:bg-white/10 transition">
                 <div class="w-8 h-8 rounded-full bg-[#00a4dc] flex items-center justify-center text-sm font-bold">
                     <span id="nav-avatar-letter">U</span>
                 </div>
                 <span id="nav-user-name" class="text-sm hidden md:inline"></span>
             </button>
-            <div id="user-dropdown" class="hidden absolute right-0 top-12 w-56 rounded-xl shadow-2xl border border-white/10 overflow-hidden" style="background:#1a1a1a">
+            <div id="user-dropdown" class="hidden absolute right-0 top-12 w-56 rounded-md shadow-2xl border border-white/10 overflow-hidden jf-menu">
                 <div class="p-3 border-b border-white/10">
                     <p id="dropdown-username" class="font-semibold text-sm"></p>
                     <p class="text-xs text-white/40">Angemeldet</p>
                 </div>
                 <div class="py-1">
-                    <a class="flex items-center gap-3 px-4 py-2.5 text-sm text-white/70 hover:bg-white/10 hover:text-white cursor-pointer transition" onclick="navigate('settings');closeUserMenu()">
-                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
-                        Einstellungen
-                    </a>
-                    <a id="nav-admin-link" class="hidden flex items-center gap-3 px-4 py-2.5 text-sm text-white/70 hover:bg-white/10 hover:text-white cursor-pointer transition" onclick="navigate('admin');closeUserMenu()">
-                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/></svg>
-                        Administration
-                    </a>
+                    <a class="jf-menu-item" onclick="navigate('settings');closeUserMenu()">Einstellungen</a>
+                    <a id="nav-admin-link" class="hidden jf-menu-item" onclick="navigate('admin');closeUserMenu()">Administration</a>
                 </div>
                 <div class="border-t border-white/10 py-1">
-                    <a class="flex items-center gap-3 px-4 py-2.5 text-sm text-red-400 hover:bg-white/10 cursor-pointer transition" onclick="doLogout()">
-                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"/></svg>
-                        Abmelden
-                    </a>
+                    <a class="jf-menu-item text-red-400" onclick="doLogout()">Abmelden</a>
                 </div>
             </div>
         </div>
-        <button id="nav-login-btn" class="px-4 py-2 rounded-lg bg-[#00a4dc] hover:bg-[#0090c4] text-sm font-medium transition" onclick="navigate('login')">Anmelden</button>
+        <button id="nav-login-btn" class="jf-btn-primary !py-1.5" onclick="navigate('login')">Anmelden</button>
     </div>
-</nav>
+</header>
 
 <!-- Main layout -->
 <div class="flex flex-1 overflow-hidden">
-    <!-- Sidebar -->
-    <aside id="sidebar" class="jf-sidebar w-60 min-h-full overflow-y-auto hidden lg:block flex-shrink-0">
-        <div class="p-4">
-            <div class="mb-6">
-                <p class="text-xs text-white/30 uppercase tracking-wider mb-3 px-1">Menü</p>
-                <nav class="space-y-0.5">
-                    <a onclick="navigate('home')" class="active">
-                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6"/></svg>
-                        Startseite
-                    </a>
-                </nav>
-            </div>
-            <div id="sidebar-libraries">
-                <div class="flex items-center justify-between mb-3 px-1">
-                    <p class="text-xs text-white/30 uppercase tracking-wider">Bibliotheken</p>
-                    <button id="sidebar-add-lib" class="hidden w-6 h-6 rounded-md bg-[#00a4dc]/20 hover:bg-[#00a4dc] text-[#00a4dc] hover:text-white transition flex items-center justify-center text-base leading-none font-bold" title="Bibliothek hinzufügen" onclick="openAddLibrary()">+</button>
+    <!-- Sidebar (drawer) -->
+    <aside id="sidebar" class="jf-drawer w-60 min-h-full overflow-y-auto hidden lg:block flex-shrink-0">
+        <div class="py-3">
+            <nav class="px-2 space-y-0.5">
+                <a onclick="navigate('home')" class="jf-drawer-item active">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6"/></svg>
+                    Startseite
+                </a>
+            </nav>
+            <div id="sidebar-libraries" class="mt-4 px-2">
+                <div class="flex items-center justify-between mb-1 px-3">
+                    <p class="text-xs text-white/40 uppercase tracking-wider">Bibliotheken</p>
+                    <button id="sidebar-add-lib" class="hidden w-6 h-6 rounded text-white/60 hover:text-white hover:bg-white/10 transition flex items-center justify-center text-base leading-none" title="Bibliothek hinzufügen" onclick="openAddLibrary()">+</button>
                 </div>
                 <nav id="sidebar-lib-list" class="space-y-0.5"></nav>
-                <button id="sidebar-add-lib-row" class="hidden w-full mt-2 px-2 py-2 rounded-lg text-sm text-[#00a4dc] hover:bg-[#00a4dc]/10 transition flex items-center gap-2" onclick="openAddLibrary()">
+                <button id="sidebar-add-lib-row" class="hidden w-full mt-2 px-3 py-2 rounded text-sm text-[#00a4dc] hover:bg-white/5 transition flex items-center gap-2" onclick="openAddLibrary()">
                     <span class="text-lg leading-none">＋</span>
                     <span>Bibliothek hinzufügen</span>
                 </button>
@@ -235,13 +222,13 @@
 
     <!-- Mobile sidebar overlay -->
     <div id="sidebar-overlay" class="hidden fixed inset-0 bg-black/60 z-40 lg:hidden" onclick="toggleSidebar()"></div>
-    <aside id="sidebar-mobile" class="jf-sidebar fixed left-0 top-16 bottom-0 w-60 z-50 overflow-y-auto hidden lg:hidden transform -translate-x-full transition-transform">
+    <aside id="sidebar-mobile" class="jf-drawer fixed left-0 top-14 bottom-0 w-60 z-50 overflow-y-auto hidden lg:hidden transform -translate-x-full transition-transform">
         <div class="p-4" id="sidebar-mobile-content"></div>
     </aside>
 
     <!-- Content -->
     <main class="flex-1 overflow-y-auto">
-        <div class="p-4 lg:p-6 max-w-[1600px] mx-auto">
+        <div class="px-4 py-5 lg:px-10 max-w-[1800px] mx-auto">
             <div id="page-home"></div>
             <div id="page-login" class="hidden"></div>
             <div id="page-library" class="hidden"></div>
@@ -271,7 +258,7 @@
 
 <!-- Add Library Modal -->
 <dialog id="add-library-modal" class="modal">
-    <div class="modal-box max-w-lg" style="background:#1a1a1a;border:1px solid rgba(255,255,255,0.1)">
+    <div class="modal-box max-w-lg jf-menu">
         <div class="flex items-center justify-between mb-4">
             <h3 class="text-lg font-bold text-white">Neue Bibliothek hinzufügen</h3>
             <button onclick="closeAddLibrary()" class="text-white/40 hover:text-white text-xl leading-none">×</button>
@@ -279,11 +266,11 @@
         <form id="add-library-form" onsubmit="submitAddLibrary(event)" class="space-y-4">
             <div>
                 <label class="block text-sm text-white/70 mb-1">Name</label>
-                <input name="name" required class="w-full px-3 py-2 rounded-lg bg-white/10 border border-white/10 text-sm text-white" placeholder="z. B. Filme">
+                <input name="name" required class="jf-input w-full" placeholder="z. B. Filme">
             </div>
             <div>
                 <label class="block text-sm text-white/70 mb-1">Inhaltstyp</label>
-                <select name="type" class="select select-bordered w-full bg-[#202020] border-white/10 text-white">
+                <select name="type" class="jf-input w-full">
                     <option value="Movies">Filme</option>
                     <option value="TvShows">Serien</option>
                     <option value="Music">Musik</option>
@@ -293,11 +280,11 @@
             </div>
             <div>
                 <label class="block text-sm text-white/70 mb-1">Pfade <span class="text-white/40">(kommagetrennt)</span></label>
-                <input name="paths" required class="w-full px-3 py-2 rounded-lg bg-white/10 border border-white/10 text-sm text-white" placeholder="/media/filme">
+                <input name="paths" required class="jf-input w-full" placeholder="/media/filme">
             </div>
             <div class="flex justify-end gap-2 pt-2">
-                <button type="button" onclick="closeAddLibrary()" class="px-4 py-2 rounded-lg bg-white/10 hover:bg-white/15 text-white text-sm transition">Abbrechen</button>
-                <button type="submit" class="px-4 py-2 rounded-lg bg-[#00a4dc] hover:bg-[#0090c4] text-white text-sm font-medium transition">Erstellen</button>
+                <button type="button" onclick="closeAddLibrary()" class="jf-btn-ghost">Abbrechen</button>
+                <button type="submit" class="jf-btn-primary">Erstellen</button>
             </div>
         </form>
     </div>

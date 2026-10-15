@@ -30,7 +30,8 @@ pub fn find_local_images(media_path: &Path, item_id: Uuid) -> Vec<ItemImage> {
             continue;
         }
 
-        let ext = path.extension()
+        let ext = path
+            .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("")
             .to_lowercase();
@@ -39,9 +40,7 @@ pub fn find_local_images(media_path: &Path, item_id: Uuid) -> Vec<ItemImage> {
             continue;
         }
 
-        let filename = path.file_name()
-            .and_then(|f| f.to_str())
-            .unwrap_or("");
+        let filename = path.file_name().and_then(|f| f.to_str()).unwrap_or("");
 
         if let Some(image_type) = detect_image_type_from_filename(filename) {
             let type_key = image_type.as_str().to_string();

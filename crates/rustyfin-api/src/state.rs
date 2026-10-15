@@ -1,18 +1,22 @@
+use crate::cache::{ApiCache, ImageCache};
 use crate::middleware::RateLimiter;
 use rustyfin_core::plugin_manager::PluginManager;
 use rustyfin_core::scheduler::TaskScheduler;
 use rustyfin_core::transcode::TranscodeManager;
 use rustyfin_model::quick_connect::QuickConnectResult;
 use rustyfin_model::server_info::ServerConfiguration;
+use rustyfin_model::ws_event::WsEvent;
 use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::{watch, RwLock};
+use tokio::sync::{RwLock, broadcast, watch};
 
 #[derive(Clone)]
 pub struct AppState {
     pub db: SqlitePool,
+    /// Read-only connection pool for query-heavy operations (PRAGMA query_only = ON).
+    pub db_ro: SqlitePool,
     pub jwt_secret: Arc<String>,
     pub server_id: Arc<String>,
     pub data_dir: Arc<PathBuf>,
@@ -26,4 +30,10 @@ pub struct AppState {
     pub task_scheduler: TaskScheduler,
     pub plugin_manager: PluginManager,
     pub rate_limiter: RateLimiter,
+    /// Broadcast channel for WebSocket real-time events
+    pub ws_broadcast: broadcast::Sender<WsEvent>,
+    /// In-memory response caches for API endpoints
+    pub cache: ApiCache,
+    /// In-memory cache for image proxy results
+    pub image_cache: ImageCache,
 }

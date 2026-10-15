@@ -1,0 +1,78 @@
+-- Media sources: one row per media file (container, protocol, bitrate, paths, etc.)
+CREATE TABLE IF NOT EXISTS media_sources (
+    id TEXT PRIMARY KEY NOT NULL,
+    item_id TEXT NOT NULL REFERENCES media_items(id) ON DELETE CASCADE,
+    uid TEXT NOT NULL,
+    container TEXT,
+    protocol TEXT NOT NULL DEFAULT 'File',
+    path TEXT NOT NULL,
+    type TEXT NOT NULL DEFAULT 'Default',
+    run_time_ticks INTEGER,
+    size INTEGER,
+    bitrate INTEGER,
+    video_bitrate INTEGER,
+    audio_bitrate INTEGER,
+    width INTEGER,
+    height INTEGER,
+    aspect_ratio TEXT,
+    is_remote INTEGER NOT NULL DEFAULT 0,
+    media_state TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_media_sources_item ON media_sources(item_id);
+
+-- Media streams: video, audio, subtitle tracks within a media source
+CREATE TABLE IF NOT EXISTS media_streams (
+    id TEXT PRIMARY KEY NOT NULL,
+    source_id TEXT NOT NULL REFERENCES media_sources(id) ON DELETE CASCADE,
+    codec TEXT,
+    codec_type TEXT NOT NULL,
+    language TEXT,
+    time_base TEXT,
+    codec_time_base TEXT,
+    codec_tag TEXT,
+    codec_tag_string TEXT,
+    external TEXT,
+    is_external INTEGER NOT NULL DEFAULT 0,
+    path TEXT,
+    width INTEGER,
+    height INTEGER,
+    average_frame_rate TEXT,
+    real_frame_rate TEXT,
+    bit_rate INTEGER,
+    bit_depth INTEGER,
+    channels INTEGER,
+    channel_layout TEXT,
+    sample_rate INTEGER,
+    profile TEXT,
+    type TEXT,
+    aspect_ratio_text TEXT,
+    aspect_ratio REAL,
+    title TEXT,
+    color_space TEXT,
+    color_transfer TEXT,
+    color_primaries TEXT,
+    color_range TEXT,
+    localized_uri TEXT,
+    default_stream INTEGER NOT NULL DEFAULT 0,
+    forced INTEGER NOT NULL DEFAULT 0,
+    is_interlaced INTEGER NOT NULL DEFAULT 0,
+    embedded_bitmaps INTEGER NOT NULL DEFAULT 0,
+    is_forced INTEGER NOT NULL DEFAULT 0,
+    height_value INTEGER,
+    width_value INTEGER,
+    pixel_format TEXT,
+    level INTEGER,
+    channel_layouts TEXT,
+    score INTEGER,
+    is_default INTEGER NOT NULL DEFAULT 0,
+    is_hearing_impaired INTEGER NOT NULL DEFAULT 0,
+    is_visual_impaired INTEGER NOT NULL DEFAULT 0,
+    is_commentary INTEGER NOT NULL DEFAULT 0,
+    stream_index INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_media_streams_source ON media_streams(source_id);
+CREATE INDEX IF NOT EXISTS idx_media_streams_codec_type ON media_streams(codec_type);

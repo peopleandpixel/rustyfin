@@ -13,9 +13,7 @@ pub fn routes() -> Router<AppState> {
         .route("/ScheduledTasks/{id}/Triggers", post(set_task_triggers))
 }
 
-async fn get_scheduled_tasks(
-    State(state): State<AppState>,
-) -> Json<Vec<ScheduledTaskInfo>> {
+async fn get_scheduled_tasks(State(state): State<AppState>) -> Json<Vec<ScheduledTaskInfo>> {
     let tasks = state.task_scheduler.get_all_tasks().await;
     Json(tasks)
 }

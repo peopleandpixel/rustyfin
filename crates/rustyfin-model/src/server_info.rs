@@ -27,6 +27,12 @@ pub struct FullServerInfo {
     pub program_data_path: String,
     pub web_socket_port_number: u16,
     pub local_address: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_end_point: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_addresses: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub package_version: Option<String>,
 }
 
 /// Server configuration stored as JSON on disk

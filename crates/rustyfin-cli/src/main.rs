@@ -7,7 +7,12 @@ use serde_json::Value;
 #[command(name = "rustyfin-cli", version, about)]
 struct Cli {
     /// Base URL of the Rustyfin server (e.g. http://localhost:8096)
-    #[arg(short, long, env = "RUSTYFIN_URL", default_value = "http://localhost:8096")]
+    #[arg(
+        short,
+        long,
+        env = "RUSTYFIN_URL",
+        default_value = "http://localhost:8096"
+    )]
     url: String,
 
     /// Auth token (returned by `auth login`). Not needed for public endpoints.
@@ -60,9 +65,7 @@ enum Commands {
     /// Get current user (auth required)
     UsersMe,
     /// Get user by id (auth required)
-    UserGet {
-        id: String,
-    },
+    UserGet { id: String },
     /// Create a new user (auth required)
     UserCreate {
         #[arg(short = 'U', long)]
@@ -71,9 +74,7 @@ enum Commands {
         password: String,
     },
     /// Delete a user (auth required)
-    UserDelete {
-        id: String,
-    },
+    UserDelete { id: String },
     /// Change a user's password (auth required)
     UserChangePassword {
         id: String,
@@ -95,9 +96,7 @@ enum Commands {
         json: String,
     },
     /// Forgot password
-    ForgotPassword {
-        username: String,
-    },
+    ForgotPassword { username: String },
 
     // ── Library ──────────────────────────────────────────────
     /// List virtual folders / libraries (auth required)
@@ -114,13 +113,9 @@ enum Commands {
         paths: String,
     },
     /// Remove a library (auth required)
-    LibraryRemove {
-        id: String,
-    },
+    LibraryRemove { id: String },
     /// Scan / refresh a single library (auth required)
-    LibraryScan {
-        id: String,
-    },
+    LibraryScan { id: String },
     /// Refresh all libraries (auth required)
     LibraryRefreshAll,
 
@@ -149,17 +144,11 @@ enum Commands {
         years: Option<String>,
     },
     /// Get a single item by id (auth required)
-    ItemGet {
-        id: String,
-    },
+    ItemGet { id: String },
     /// Delete an item (auth required)
-    ItemDelete {
-        id: String,
-    },
+    ItemDelete { id: String },
     /// Get children of an item (auth required)
-    ItemChildren {
-        id: String,
-    },
+    ItemChildren { id: String },
     /// Get similar items (auth required)
     ItemSimilar {
         id: String,
@@ -201,15 +190,11 @@ enum Commands {
         limit: Option<u32>,
     },
     /// Get resume items for a specific user (auth required)
-    UserItemsResume {
-        user_id: String,
-    },
+    UserItemsResume { user_id: String },
 
     // ── Images ───────────────────────────────────────────────
     /// List images for an item (auth required)
-    ItemImages {
-        id: String,
-    },
+    ItemImages { id: String },
     /// Get a specific image (auth required). Streams to stdout.
     ItemImage {
         id: String,
@@ -227,9 +212,7 @@ enum Commands {
         file: String,
     },
     /// Refresh item metadata (auth required)
-    ItemRefresh {
-        id: String,
-    },
+    ItemRefresh { id: String },
 
     // ── QuickConnect ─────────────────────────────────────────
     /// Check if QuickConnect is enabled (public)
@@ -237,9 +220,7 @@ enum Commands {
     /// Initiate a QuickConnect session (public)
     QuickConnectInitiate,
     /// Poll QuickConnect status (public)
-    QuickConnectConnect {
-        secret: String,
-    },
+    QuickConnectConnect { secret: String },
     /// Authorize a QuickConnect request (auth required)
     QuickConnectAuthorize {
         /// JSON body, e.g. '{"Secret":"..."}'
@@ -270,26 +251,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Build a request with optional auth header.
 fn auth_header(token: &Option<String>) -> Option<(&'static str, String)> {
-    token.as_ref().map(|t| {
-        ("Authorization", format!("MediaBrowser Token=\"{t}\""))
-    })
+    token
+        .as_ref()
+        .map(|t| ("Authorization", format!("MediaBrowser Token=\"{t}\"")))
 }
 
-fn apply_auth(
-    mut req: reqwest::RequestBuilder,
-    token: &Option<String>,
-) -> reqwest::RequestBuilder {
+fn apply_auth(mut req: reqwest::RequestBuilder, token: &Option<String>) -> reqwest::RequestBuilder {
     if let Some((k, v)) = auth_header(token) {
         req = req.header(k, v);
     }
     req
 }
 
-async fn run(
-    cli: &Cli,
-    client: &Client,
-    base: &str,
-) -> Result<Value, Box<dyn std::error::Error>> {
+async fn run(cli: &Cli, client: &Client, base: &str) -> Result<Value, Box<dyn std::error::Error>> {
     let token = &cli.token;
 
     match &cli.command {
@@ -307,15 +281,19 @@ async fn run(
             let text = resp.text().await?;
             Ok(Value::String(text))
         }
-        Commands::SystemInfo => {
-            Ok(get(client, &format!("{base}/System/Info"), token).await?)
-        }
+        Commands::SystemInfo => Ok(get(client, &format!("{base}/System/Info"), token).await?),
         Commands::SystemConfigGet => {
             Ok(get(client, &format!("{base}/System/Configuration"), token).await?)
         }
         Commands::SystemConfigUpdate { json } => {
             let body: Value = serde_json::from_str(json)?;
-            Ok(post_json(client, &format!("{base}/System/Configuration"), token, &body).await?)
+            Ok(post_json(
+                client,
+                &format!("{base}/System/Configuration"),
+                token,
+                &body,
+            )
+            .await?)
         }
         Commands::SystemShutdown => {
             Ok(post_empty(client, &format!("{base}/System/Shutdown"), token).await?)
@@ -323,9 +301,7 @@ async fn run(
         Commands::SystemRestart => {
             Ok(post_empty(client, &format!("{base}/System/Restart"), token).await?)
         }
-        Commands::SystemLogs => {
-            Ok(get(client, &format!("{base}/System/Logs"), token).await?)
-        }
+        Commands::SystemLogs => Ok(get(client, &format!("{base}/System/Logs"), token).await?),
 
         // ── Auth ─────────────────────────────────────────────
         Commands::Login { username, password } => {
@@ -333,22 +309,20 @@ async fn run(
                 "Username": username,
                 "Pw": password,
             });
-            Ok(post_json(client, &format!("{base}/Users/AuthenticateByName"), &None, &body).await?)
+            Ok(post_json(
+                client,
+                &format!("{base}/Users/AuthenticateByName"),
+                &None,
+                &body,
+            )
+            .await?)
         }
 
         // ── Users ────────────────────────────────────────────
-        Commands::UsersPublic => {
-            Ok(get(client, &format!("{base}/Users/Public"), &None).await?)
-        }
-        Commands::Users => {
-            Ok(get(client, &format!("{base}/Users"), token).await?)
-        }
-        Commands::UsersMe => {
-            Ok(get(client, &format!("{base}/Users/Me"), token).await?)
-        }
-        Commands::UserGet { id } => {
-            Ok(get(client, &format!("{base}/Users/{id}"), token).await?)
-        }
+        Commands::UsersPublic => Ok(get(client, &format!("{base}/Users/Public"), &None).await?),
+        Commands::Users => Ok(get(client, &format!("{base}/Users"), token).await?),
+        Commands::UsersMe => Ok(get(client, &format!("{base}/Users/Me"), token).await?),
+        Commands::UserGet { id } => Ok(get(client, &format!("{base}/Users/{id}"), token).await?),
         Commands::UserCreate { username, password } => {
             let body = serde_json::json!({
                 "Name": username,
@@ -359,7 +333,11 @@ async fn run(
         Commands::UserDelete { id } => {
             Ok(post_empty(client, &format!("{base}/Users/{id}/Delete"), token).await?)
         }
-        Commands::UserChangePassword { id, current_pw, new_pw } => {
+        Commands::UserChangePassword {
+            id,
+            current_pw,
+            new_pw,
+        } => {
             let body = serde_json::json!({
                 "CurrentPw": current_pw,
                 "NewPw": new_pw,
@@ -372,57 +350,111 @@ async fn run(
         }
         Commands::UserUpdateConfig { id, json } => {
             let body: Value = serde_json::from_str(json)?;
-            Ok(post_json(client, &format!("{base}/Users/{id}/Configuration"), token, &body).await?)
+            Ok(post_json(
+                client,
+                &format!("{base}/Users/{id}/Configuration"),
+                token,
+                &body,
+            )
+            .await?)
         }
         Commands::ForgotPassword { username } => {
             let body = serde_json::json!({ "EnteredUsername": username });
-            Ok(post_json(client, &format!("{base}/Users/ForgotPassword"), &None, &body).await?)
+            Ok(post_json(
+                client,
+                &format!("{base}/Users/ForgotPassword"),
+                &None,
+                &body,
+            )
+            .await?)
         }
 
         // ── Library ──────────────────────────────────────────
         Commands::Libraries => {
             Ok(get(client, &format!("{base}/Library/VirtualFolders"), token).await?)
         }
-        Commands::LibraryCreate { name, content_type, paths } => {
+        Commands::LibraryCreate {
+            name,
+            content_type,
+            paths,
+        } => {
             let paths_vec: Vec<&str> = paths.split(',').map(|s| s.trim()).collect();
             let body = serde_json::json!({
                 "Name": name,
                 "ContentType": content_type,
                 "Paths": paths_vec,
             });
-            Ok(post_json(client, &format!("{base}/Library/VirtualFolders"), token, &body).await?)
+            Ok(post_json(
+                client,
+                &format!("{base}/Library/VirtualFolders"),
+                token,
+                &body,
+            )
+            .await?)
         }
-        Commands::LibraryRemove { id } => {
-            Ok(delete(client, &format!("{base}/Library/VirtualFolders/{id}"), token).await?)
-        }
-        Commands::LibraryScan { id } => {
-            Ok(post_empty(client, &format!("{base}/Library/VirtualFolders/{id}/Refresh"), token).await?)
-        }
+        Commands::LibraryRemove { id } => Ok(delete(
+            client,
+            &format!("{base}/Library/VirtualFolders/{id}"),
+            token,
+        )
+        .await?),
+        Commands::LibraryScan { id } => Ok(post_empty(
+            client,
+            &format!("{base}/Library/VirtualFolders/{id}/Refresh"),
+            token,
+        )
+        .await?),
         Commands::LibraryRefreshAll => {
             Ok(post_empty(client, &format!("{base}/Library/Refresh"), token).await?)
         }
 
         // ── Items ────────────────────────────────────────────
         Commands::Items {
-            parent_id, include_item_types, sort_by, sort_order,
-            start_index, limit, recursive, search_term, genres, years,
+            parent_id,
+            include_item_types,
+            sort_by,
+            sort_order,
+            start_index,
+            limit,
+            recursive,
+            search_term,
+            genres,
+            years,
         } => {
             let mut params = Vec::new();
-            if let Some(v) = parent_id { params.push(("ParentId", v.clone())); }
-            if let Some(v) = include_item_types { params.push(("IncludeItemTypes", v.clone())); }
-            if let Some(v) = sort_by { params.push(("SortBy", v.clone())); }
-            if let Some(v) = sort_order { params.push(("SortOrder", v.clone())); }
-            if let Some(v) = start_index { params.push(("StartIndex", v.to_string())); }
-            if let Some(v) = limit { params.push(("Limit", v.to_string())); }
-            if let Some(v) = recursive { params.push(("Recursive", v.to_string())); }
-            if let Some(v) = search_term { params.push(("SearchTerm", v.clone())); }
-            if let Some(v) = genres { params.push(("Genres", v.clone())); }
-            if let Some(v) = years { params.push(("Years", v.clone())); }
+            if let Some(v) = parent_id {
+                params.push(("ParentId", v.clone()));
+            }
+            if let Some(v) = include_item_types {
+                params.push(("IncludeItemTypes", v.clone()));
+            }
+            if let Some(v) = sort_by {
+                params.push(("SortBy", v.clone()));
+            }
+            if let Some(v) = sort_order {
+                params.push(("SortOrder", v.clone()));
+            }
+            if let Some(v) = start_index {
+                params.push(("StartIndex", v.to_string()));
+            }
+            if let Some(v) = limit {
+                params.push(("Limit", v.to_string()));
+            }
+            if let Some(v) = recursive {
+                params.push(("Recursive", v.to_string()));
+            }
+            if let Some(v) = search_term {
+                params.push(("SearchTerm", v.clone()));
+            }
+            if let Some(v) = genres {
+                params.push(("Genres", v.clone()));
+            }
+            if let Some(v) = years {
+                params.push(("Years", v.clone()));
+            }
             Ok(get_query(client, &format!("{base}/Items"), token, &params).await?)
         }
-        Commands::ItemGet { id } => {
-            Ok(get(client, &format!("{base}/Items/{id}"), token).await?)
-        }
+        Commands::ItemGet { id } => Ok(get(client, &format!("{base}/Items/{id}"), token).await?),
         Commands::ItemDelete { id } => {
             Ok(delete(client, &format!("{base}/Items/{id}"), token).await?)
         }
@@ -431,49 +463,107 @@ async fn run(
         }
         Commands::ItemSimilar { id, limit } => {
             let mut params = Vec::new();
-            if let Some(v) = limit { params.push(("Limit", v.to_string())); }
-            Ok(get_query(client, &format!("{base}/Items/{id}/Similar"), token, &params).await?)
+            if let Some(v) = limit {
+                params.push(("Limit", v.to_string()));
+            }
+            Ok(get_query(
+                client,
+                &format!("{base}/Items/{id}/Similar"),
+                token,
+                &params,
+            )
+            .await?)
         }
         Commands::ItemsLatest { parent_id, limit } => {
             let mut params = Vec::new();
-            if let Some(v) = parent_id { params.push(("ParentId", v.clone())); }
-            if let Some(v) = limit { params.push(("Limit", v.to_string())); }
+            if let Some(v) = parent_id {
+                params.push(("ParentId", v.clone()));
+            }
+            if let Some(v) = limit {
+                params.push(("Limit", v.to_string()));
+            }
             Ok(get_query(client, &format!("{base}/Items/Latest"), token, &params).await?)
         }
-        Commands::ItemsResume => {
-            Ok(get(client, &format!("{base}/Items/Resume"), token).await?)
-        }
+        Commands::ItemsResume => Ok(get(client, &format!("{base}/Items/Resume"), token).await?),
         Commands::ItemsFilters { parent_id } => {
             let mut params = Vec::new();
-            if let Some(v) = parent_id { params.push(("ParentId", v.clone())); }
+            if let Some(v) = parent_id {
+                params.push(("ParentId", v.clone()));
+            }
             Ok(get_query(client, &format!("{base}/Items/Filters"), token, &params).await?)
         }
-        Commands::UserItems { user_id, parent_id, include_item_types, limit, recursive } => {
+        Commands::UserItems {
+            user_id,
+            parent_id,
+            include_item_types,
+            limit,
+            recursive,
+        } => {
             let mut params = Vec::new();
-            if let Some(v) = parent_id { params.push(("ParentId", v.clone())); }
-            if let Some(v) = include_item_types { params.push(("IncludeItemTypes", v.clone())); }
-            if let Some(v) = limit { params.push(("Limit", v.to_string())); }
-            if let Some(v) = recursive { params.push(("Recursive", v.to_string())); }
-            Ok(get_query(client, &format!("{base}/Users/{user_id}/Items"), token, &params).await?)
+            if let Some(v) = parent_id {
+                params.push(("ParentId", v.clone()));
+            }
+            if let Some(v) = include_item_types {
+                params.push(("IncludeItemTypes", v.clone()));
+            }
+            if let Some(v) = limit {
+                params.push(("Limit", v.to_string()));
+            }
+            if let Some(v) = recursive {
+                params.push(("Recursive", v.to_string()));
+            }
+            Ok(get_query(
+                client,
+                &format!("{base}/Users/{user_id}/Items"),
+                token,
+                &params,
+            )
+            .await?)
         }
-        Commands::UserItemsLatest { user_id, parent_id, limit } => {
+        Commands::UserItemsLatest {
+            user_id,
+            parent_id,
+            limit,
+        } => {
             let mut params = Vec::new();
-            if let Some(v) = parent_id { params.push(("ParentId", v.clone())); }
-            if let Some(v) = limit { params.push(("Limit", v.to_string())); }
-            Ok(get_query(client, &format!("{base}/Users/{user_id}/Items/Latest"), token, &params).await?)
+            if let Some(v) = parent_id {
+                params.push(("ParentId", v.clone()));
+            }
+            if let Some(v) = limit {
+                params.push(("Limit", v.to_string()));
+            }
+            Ok(get_query(
+                client,
+                &format!("{base}/Users/{user_id}/Items/Latest"),
+                token,
+                &params,
+            )
+            .await?)
         }
-        Commands::UserItemsResume { user_id } => {
-            Ok(get(client, &format!("{base}/Users/{user_id}/Items/Resume"), token).await?)
-        }
+        Commands::UserItemsResume { user_id } => Ok(get(
+            client,
+            &format!("{base}/Users/{user_id}/Items/Resume"),
+            token,
+        )
+        .await?),
 
         // ── Images ───────────────────────────────────────────
         Commands::ItemImages { id } => {
             Ok(get(client, &format!("{base}/Items/{id}/Images"), token).await?)
         }
-        Commands::ItemImage { id, image_type, max_width, max_height } => {
+        Commands::ItemImage {
+            id,
+            image_type,
+            max_width,
+            max_height,
+        } => {
             let mut params = Vec::new();
-            if let Some(v) = max_width { params.push(("maxWidth", v.to_string())); }
-            if let Some(v) = max_height { params.push(("maxHeight", v.to_string())); }
+            if let Some(v) = max_width {
+                params.push(("maxWidth", v.to_string()));
+            }
+            if let Some(v) = max_height {
+                params.push(("maxHeight", v.to_string()));
+            }
             // Image endpoint returns binary; we report status + content-type
             let mut req = client.get(format!("{base}/Items/{id}/Images/{image_type}"));
             req = apply_auth(req, token);
@@ -481,7 +571,9 @@ async fn run(
                 req = req.query(&params);
             }
             let resp = req.send().await?.error_for_status()?;
-            let ct = resp.headers().get("content-type")
+            let ct = resp
+                .headers()
+                .get("content-type")
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("unknown")
                 .to_string();
@@ -499,7 +591,11 @@ async fn run(
                 "size": len,
             }))
         }
-        Commands::ItemImageUpload { id, image_type, file } => {
+        Commands::ItemImageUpload {
+            id,
+            image_type,
+            file,
+        } => {
             let bytes = tokio::fs::read(file).await?;
             let content_type = if file.ends_with(".png") {
                 "image/png"
@@ -529,11 +625,23 @@ async fn run(
         }
         Commands::QuickConnectConnect { secret } => {
             let params = vec![("secret", secret.clone())];
-            Ok(get_query(client, &format!("{base}/QuickConnect/Connect"), &None, &params).await?)
+            Ok(get_query(
+                client,
+                &format!("{base}/QuickConnect/Connect"),
+                &None,
+                &params,
+            )
+            .await?)
         }
         Commands::QuickConnectAuthorize { json } => {
             let body: Value = serde_json::from_str(json)?;
-            Ok(post_json(client, &format!("{base}/QuickConnect/Authorize"), token, &body).await?)
+            Ok(post_json(
+                client,
+                &format!("{base}/QuickConnect/Authorize"),
+                token,
+                &body,
+            )
+            .await?)
         }
     }
 }
@@ -554,7 +662,10 @@ async fn get_query(
     client: &Client,
     url: &str,
     token: &Option<String>,
-    params: &[(impl AsRef<str> + serde::Serialize, impl AsRef<str> + serde::Serialize)],
+    params: &[(
+        impl AsRef<str> + serde::Serialize,
+        impl AsRef<str> + serde::Serialize,
+    )],
 ) -> Result<Value, Box<dyn std::error::Error>> {
     let req = apply_auth(client.get(url).query(params), token);
     let resp = req.send().await?.error_for_status()?;
@@ -592,9 +703,7 @@ async fn delete(
     parse_response(resp).await
 }
 
-async fn parse_response(
-    resp: reqwest::Response,
-) -> Result<Value, Box<dyn std::error::Error>> {
+async fn parse_response(resp: reqwest::Response) -> Result<Value, Box<dyn std::error::Error>> {
     let status = resp.status();
     let text = resp.text().await?;
     if text.is_empty() {

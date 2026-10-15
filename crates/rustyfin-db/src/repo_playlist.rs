@@ -87,11 +87,49 @@ pub async fn get_playlist_items(
 
     let mut items = Vec::with_capacity(ids.len());
     for (id_str,) in ids {
-        if let Ok(id) = Uuid::parse_str(&id_str) {
-            if let Ok(Some(item)) = crate::repo_media::get_item_by_id(pool, id).await {
-                items.push(item);
-            }
+        if let Ok(id) = Uuid::parse_str(&id_str)
+            && let Ok(Some(item)) = crate::repo_media::get_item_by_id(pool, id).await
+        {
+            items.push(item);
         }
     }
     Ok(items)
+}
+
+pub async fn get_playlist(pool: &SqlitePool, id: Uuid) -> Result<Option<PlaylistDto>, sqlx::Error> {
+    let pid = id.to_string();
+    let row = sqlx::query_as::<_, (String, String, String, Option<String>, i64, String)>(
+        "SELECT p.id, p.name, p.user_id, p.media_type, COUNT(pi.item_id), p.created_at
+         FROM playlists p
+         LEFT JOIN playlist_items pi ON pi.playlist_id = p.id
+         WHERE p.id = ?1
+         GROUP BY p.id",
+    )
+    .bind(&pid)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.and_then(|r| {
+        Some(PlaylistDto {
+            id: Uuid::parse_str(&r.0).ok()?,
+            name: r.1,
+            user_id: Uuid::parse_str(&r.2).ok()?,
+            media_type: r.3,
+            child_count: r.4,
+            date_created: parse_dt(&r.5),
+        })
+    }))
+}
+
+pub async fn delete_playlist(pool: &SqlitePool, id: Uuid) -> Result<(), sqlx::Error> {
+    let pid = id.to_string();
+    sqlx::query("DELETE FROM playlist_items WHERE playlist_id = ?1")
+        .bind(&pid)
+        .execute(pool)
+        .await?;
+    sqlx::query("DELETE FROM playlists WHERE id = ?1")
+        .bind(&pid)
+        .execute(pool)
+        .await?;
+    Ok(())
 }

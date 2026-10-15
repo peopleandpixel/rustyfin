@@ -14,8 +14,14 @@ use crate::state::AppState;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route("/Startup/Configuration", get(get_startup_config).post(update_startup_config))
-        .route("/Startup/User", get(get_startup_user).post(create_startup_user))
+        .route(
+            "/Startup/Configuration",
+            get(get_startup_config).post(update_startup_config),
+        )
+        .route(
+            "/Startup/User",
+            get(get_startup_user).post(create_startup_user),
+        )
         .route("/Startup/Complete", post(complete_startup))
 }
 
@@ -47,7 +53,7 @@ async fn update_startup_config(
 
 async fn get_startup_user(State(state): State<AppState>) -> Result<Json<StartupUser>, ApiError> {
     // Return the first admin user if one exists, otherwise empty
-    let users = rustyfin_db::repo_user::get_all_users(&state.db)
+    let users = rustyfin_db::repo_user::get_all_users(&state.db_ro)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
 
@@ -93,8 +99,7 @@ async fn create_startup_user(
 
     // Create new admin user
     let hash = if input.password.is_empty() {
-        rustyfin_auth::hash_password("")
-            .map_err(|e| ApiError::Internal(e.to_string()))?
+        rustyfin_auth::hash_password("").map_err(|e| ApiError::Internal(e.to_string()))?
     } else {
         rustyfin_auth::hash_password(&input.password)
             .map_err(|e| ApiError::Internal(e.to_string()))?
@@ -129,8 +134,8 @@ async fn complete_startup(State(state): State<AppState>) -> Result<StatusCode, A
 async fn persist_config(state: &AppState) -> Result<(), ApiError> {
     let config = state.config.read().await;
     let config_path = state.data_dir.join("config.json");
-    let json = serde_json::to_string_pretty(&*config)
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let json =
+        serde_json::to_string_pretty(&*config).map_err(|e| ApiError::Internal(e.to_string()))?;
     tokio::fs::write(&config_path, &json)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;

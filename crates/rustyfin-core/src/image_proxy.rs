@@ -23,10 +23,10 @@ pub async fn get_or_resize_image(
     let cache_path = cache_dir.join(&cache_name);
 
     // Return cached version if exists
-    if cache_path.exists() {
-        if let Ok(bytes) = fs::read(&cache_path).await {
-            return Ok(bytes);
-        }
+    if cache_path.exists()
+        && let Ok(bytes) = fs::read(&cache_path).await
+    {
+        return Ok(bytes);
     }
 
     // Read and resize

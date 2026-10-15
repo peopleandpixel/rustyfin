@@ -1,14 +1,15 @@
+use axum::extract::Path;
 use axum::extract::State;
 use axum::routing::get;
 use axum::{Json, Router};
-use axum::extract::Path;
 
 use crate::state::AppState;
 
 pub fn routes() -> Router<AppState> {
-    Router::new()
-        .route("/Plugins", get(get_plugins))
-        .route("/Plugins/{id}/Configuration", get(get_plugin_config).post(set_plugin_config))
+    Router::new().route("/Plugins", get(get_plugins)).route(
+        "/Plugins/{id}/Configuration",
+        get(get_plugin_config).post(set_plugin_config),
+    )
 }
 
 async fn get_plugins(
@@ -37,5 +38,5 @@ async fn set_plugin_config(
         .plugin_manager
         .set_configuration(&id, config)
         .await
-        .map_err(|e| crate::error::ApiError::NotFound(e))
+        .map_err(crate::error::ApiError::NotFound)
 }

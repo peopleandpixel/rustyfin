@@ -29,6 +29,30 @@ pub struct CreateLibraryRequest {
     pub paths: Vec<String>,
 }
 
+/// Library options for per-library metadata and image providers.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "PascalCase")]
+pub struct LibraryOptions {
+    /// Metadata provider (e.g., "TMDb", "TheMovieDb", "TheOpenMovieDatabase")
+    #[serde(default)]
+    pub metadata_provider: String,
+    /// Image provider (e.g., "TMDb", "TheMovieDb")
+    #[serde(default)]
+    pub image_provider: String,
+    /// Skip subfolders during scanning
+    #[serde(default)]
+    pub skip_subfolders: bool,
+    /// Enable automatic chapter extraction
+    #[serde(default)]
+    pub enable_chapter_extraction: bool,
+    /// Enable trickplay generation
+    #[serde(default)]
+    pub enable_trickplay: bool,
+    /// Enable intro detection
+    #[serde(default)]
+    pub enable_intro_detection: bool,
+}
+
 impl LibraryContentType {
     pub fn default_media_type(&self) -> MediaType {
         match self {

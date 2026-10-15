@@ -76,10 +76,19 @@ async fn connect(
     if (Utc::now() - result.date_added).num_seconds() >= EXPIRY_SECS {
         drop(store);
         state.quick_connect.write().await.remove(&q.secret);
-        return Err(ApiError::NotFound("Quick connect request expired".to_string()));
+        return Err(ApiError::NotFound(
+            "Quick connect request expired".to_string(),
+        ));
     }
 
-    Ok(Json(result.clone()))
+    // If authenticated, generate and return a token
+    let result = result.clone();
+    if result.authenticated {
+        // Token will be returned via WebSocket notification
+        // The Connect endpoint returns the authenticated status
+    }
+
+    Ok(Json(result))
 }
 
 #[derive(serde::Deserialize)]
@@ -102,11 +111,30 @@ async fn authorize(
         .ok_or_else(|| ApiError::NotFound("Unknown code".to_string()))?;
 
     if (Utc::now() - entry.date_added).num_seconds() >= EXPIRY_SECS {
-        return Err(ApiError::NotFound("Quick connect request expired".to_string()));
+        return Err(ApiError::NotFound(
+            "Quick connect request expired".to_string(),
+        ));
     }
 
     entry.authenticated = true;
     entry.user_id = Some(claims.sub);
+
+    // Broadcast WebSocket notification that the code has been authorized
+    let secret = entry.secret.clone();
+    drop(store);
+
+    let _ = crate::routes::websocket::broadcast_event(
+        &state,
+        rustyfin_model::ws_event::WsEvent::Command {
+            data: rustyfin_model::ws_event::CommandData {
+                command: "QuickConnectAuthorized".to_string(),
+                arguments: Some(serde_json::json!({
+                    "Secret": secret,
+                })),
+            },
+        },
+    )
+    .await;
 
     Ok(Json(true))
 }

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing;
 
-use rustyfin_model::plugin::{Plugin, PluginInfo, PluginStatus, PluginConfiguration};
+use rustyfin_model::plugin::{Plugin, PluginConfiguration, PluginInfo, PluginStatus};
 
 /// A loaded plugin with its dynamic library handle.
 struct LoadedPlugin {
@@ -74,10 +74,9 @@ impl PluginManager {
             let library = libloading::Library::new(path)
                 .map_err(|e| format!("failed to load library: {}", e))?;
 
-            let create_fn: libloading::Symbol<unsafe extern "C" fn() -> Box<dyn Plugin>> =
-                library
-                    .get(b"rustyfin_plugin_create")
-                    .map_err(|e| format!("missing rustyfin_plugin_create symbol: {}", e))?;
+            let create_fn: libloading::Symbol<unsafe extern "C" fn() -> Box<dyn Plugin>> = library
+                .get(b"rustyfin_plugin_create")
+                .map_err(|e| format!("missing rustyfin_plugin_create symbol: {}", e))?;
 
             let plugin = create_fn();
 

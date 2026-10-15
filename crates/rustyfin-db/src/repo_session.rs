@@ -2,6 +2,7 @@ use chrono::{NaiveDateTime, TimeZone, Utc};
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
+use rustyfin_model::media::MediaItem;
 use rustyfin_model::session::{DeviceInfo, SessionInfo};
 
 fn parse_dt(s: &str) -> chrono::DateTime<Utc> {
@@ -63,7 +64,21 @@ pub async fn update_session_now_playing(
 }
 
 pub async fn get_active_sessions(pool: &SqlitePool) -> Result<Vec<SessionInfo>, sqlx::Error> {
-    let rows = sqlx::query_as::<_, (String, String, String, String, String, String, Option<String>, Option<i64>, i64, String)>(
+    let rows = sqlx::query_as::<
+        _,
+        (
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<i64>,
+            i64,
+            String,
+        ),
+    >(
         "SELECT s.id, s.user_id, u.name, s.device_id, s.device_name, s.app_name,
                 s.now_playing_item_id, s.now_playing_position_ticks, s.is_paused, s.last_activity
          FROM sessions s
@@ -119,7 +134,10 @@ pub async fn delete_session(pool: &SqlitePool, session_id: &str) -> Result<(), s
     Ok(())
 }
 
-pub async fn delete_sessions_by_device(pool: &SqlitePool, device_id: &str) -> Result<(), sqlx::Error> {
+pub async fn delete_sessions_by_device(
+    pool: &SqlitePool,
+    device_id: &str,
+) -> Result<(), sqlx::Error> {
     sqlx::query("DELETE FROM sessions WHERE device_id = ?1")
         .bind(device_id)
         .execute(pool)
@@ -127,13 +145,14 @@ pub async fn delete_sessions_by_device(pool: &SqlitePool, device_id: &str) -> Re
     Ok(())
 }
 
-pub async fn cleanup_expired_sessions(pool: &SqlitePool, timeout_minutes: i64) -> Result<u64, sqlx::Error> {
-    let result = sqlx::query(
-        "DELETE FROM sessions WHERE last_activity < datetime('now', ?1)",
-    )
-    .bind(format!("-{timeout_minutes} minutes"))
-    .execute(pool)
-    .await?;
+pub async fn cleanup_expired_sessions(
+    pool: &SqlitePool,
+    timeout_minutes: i64,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query("DELETE FROM sessions WHERE last_activity < datetime('now', ?1)")
+        .bind(format!("-{timeout_minutes} minutes"))
+        .execute(pool)
+        .await?;
     Ok(result.rows_affected())
 }
 
@@ -200,4 +219,64 @@ pub async fn delete_device(pool: &SqlitePool, device_id: &str) -> Result<(), sql
         .execute(pool)
         .await?;
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn create_session(
+    pool: &SqlitePool,
+    session_id: Uuid,
+    user_id: Uuid,
+    _user_name: &str,
+    client: &str,
+    device_name: &str,
+    device_id: &str,
+    app_version: &str,
+) -> Result<(), sqlx::Error> {
+    let sid = session_id.to_string();
+    let uid = user_id.to_string();
+    sqlx::query(
+        "INSERT INTO sessions (id, user_id, device_id, device_name, app_name, app_version, last_activity)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))
+         ON CONFLICT(id) DO UPDATE SET
+           last_activity = datetime('now'),
+           user_id = excluded.user_id,
+           device_name = excluded.device_name,
+           app_name = excluded.app_name,
+           app_version = excluded.app_version",
+    )
+    .bind(&sid)
+    .bind(&uid)
+    .bind(device_id)
+    .bind(device_name)
+    .bind(client)
+    .bind(app_version)
+    .execute(pool)
+    .await?;
+
+    // Also upsert device
+    upsert_device(pool, device_id, device_name, client, app_version, user_id).await?;
+
+    Ok(())
+}
+
+pub async fn get_now_playing_item(
+    pool: &SqlitePool,
+    session_id: &str,
+) -> Result<Option<MediaItem>, sqlx::Error> {
+    let item_id: Option<String> =
+        sqlx::query_scalar("SELECT now_playing_item_id FROM sessions WHERE id = ?1")
+            .bind(session_id)
+            .fetch_optional(pool)
+            .await?;
+
+    match item_id {
+        Some(id_str) => {
+            if let Ok(id) = Uuid::parse_str(&id_str) {
+                super::repo_media::get_item_by_id(pool, id).await
+            } else {
+                Ok(None)
+            }
+        }
+        None => Ok(None),
+    }
 }

@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use rustyfin_model::user::User;
+use rustyfin_model::user::{User, UserPreferences};
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
@@ -126,8 +126,94 @@ impl From<UserRow> for User {
             password_hash: r.password_hash,
             is_administrator: r.is_administrator != 0,
             created_at: r.created_at.parse::<DateTime<Utc>>().unwrap_or_default(),
-            last_login_date: r.last_login_date.and_then(|s| s.parse::<DateTime<Utc>>().ok()),
+            last_login_date: r
+                .last_login_date
+                .and_then(|s| s.parse::<DateTime<Utc>>().ok()),
             configuration: serde_json::from_str(&r.configuration).unwrap_or_default(),
         }
     }
+}
+
+pub async fn update_user_name(
+    pool: &SqlitePool,
+    id: Uuid,
+    name: &str,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query("UPDATE users SET name = ? WHERE id = ?")
+        .bind(name)
+        .bind(id.to_string())
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+pub async fn get_user_preferences(
+    pool: &SqlitePool,
+    id: Uuid,
+) -> Result<UserPreferences, sqlx::Error> {
+    let uid = id.to_string();
+
+    // Try to read from display_preferences table
+    let prefs: Vec<(String, String)> =
+        sqlx::query_as("SELECT key, value FROM display_preferences WHERE user_id = ?")
+            .bind(&uid)
+            .fetch_all(pool)
+            .await?;
+
+    let prefs_map: std::collections::HashMap<String, String> = prefs.into_iter().collect();
+
+    // Merge with user configuration
+    let user = get_user_by_id(pool, id).await?;
+    let config = user
+        .as_ref()
+        .map(|u| &u.configuration)
+        .unwrap_or(&serde_json::Value::Null);
+
+    Ok(UserPreferences {
+        chart_missing_episodes: prefs_map
+            .get("chartMissingEpisodes")
+            .cloned()
+            .unwrap_or_default(),
+        chart_played_episodes: config
+            .get("chartPlayedEpisodes")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        group_episodes_by_season: prefs_map
+            .get("groupEpisodesBySeason")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(true),
+        group_by_collection: prefs_map
+            .get("groupByCollection")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(false),
+        hide_audio_playlists_in_music: prefs_map
+            .get("hideAudioPlaylistsInMusic")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(false),
+        hide_culture_titles: prefs_map
+            .get("hideCultureTitles")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(false),
+        hide_episodes: prefs_map
+            .get("hideEpisodes")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(false),
+        hide_empty_series: prefs_map
+            .get("hideEmptySeries")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(false),
+        hide_seasons: prefs_map
+            .get("hideSeasons")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(false),
+        limit_field: prefs_map.get("limitField").cloned().unwrap_or_default(),
+        metadata_country_code: prefs_map
+            .get("metadataCountryCode")
+            .cloned()
+            .unwrap_or_else(|| "US".to_string()),
+        preferred_metadata_language: prefs_map
+            .get("preferredMetadataLanguage")
+            .cloned()
+            .unwrap_or_else(|| "en".to_string()),
+    })
 }

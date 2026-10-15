@@ -39,30 +39,36 @@ pub async fn search(api_key: &str, name: &str, year: Option<i32>) -> Option<Exte
         return None;
     }
 
-    let production_year = resp.year.as_deref()
+    let production_year = resp
+        .year
+        .as_deref()
         .and_then(|y| y.split('–').next()) // handle ranges like "2019–2023"
         .and_then(|y| y.trim().parse().ok());
 
-    let community_rating = resp.imdb_rating.as_deref()
+    let community_rating = resp
+        .imdb_rating
+        .as_deref()
         .and_then(|r| r.parse::<f64>().ok());
 
-    let genres = resp.genre.map(|g| {
-        g.split(',').map(|s| s.trim().to_string()).collect()
-    });
+    let genres = resp
+        .genre
+        .map(|g| g.split(',').map(|s| s.trim().to_string()).collect());
 
-    let runtime_ticks = resp.runtime.as_deref()
+    let runtime_ticks = resp
+        .runtime
+        .as_deref()
         .and_then(|r| r.split(' ').next())
         .and_then(|m| m.parse::<i64>().ok())
         .map(|m| m * 600_000_000);
 
     let mut images = Vec::new();
-    if let Some(poster) = &resp.poster {
-        if poster != "N/A" {
-            images.push(MetadataImage {
-                image_type: "Primary".to_string(),
-                url: poster.clone(),
-            });
-        }
+    if let Some(poster) = &resp.poster
+        && poster != "N/A"
+    {
+        images.push(MetadataImage {
+            image_type: "Primary".to_string(),
+            url: poster.clone(),
+        });
     }
 
     Some(ExternalMetadata {
@@ -75,6 +81,7 @@ pub async fn search(api_key: &str, name: &str, year: Option<i32>) -> Option<Exte
         premiere_date: None,
         runtime_ticks,
         image_urls: images,
+        tmdb_id: None,
     })
 }
 

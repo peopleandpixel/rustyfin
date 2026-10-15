@@ -8,11 +8,10 @@ use crate::error::ApiError;
 use crate::state::AppState;
 
 pub fn routes() -> Router<AppState> {
-    Router::new()
-        .route(
-            "/DisplayPreferences/{key}",
-            get(get_display_preferences).post(update_display_preferences),
-        )
+    Router::new().route(
+        "/DisplayPreferences/{key}",
+        get(get_display_preferences).post(update_display_preferences),
+    )
 }
 
 #[derive(Debug, Deserialize)]

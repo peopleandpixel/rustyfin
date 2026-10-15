@@ -1,8 +1,10 @@
-use axum::extract::State;
-use axum::http::{header, StatusCode};
+use axum::Json;
+use axum::Router;
+use axum::extract::{Query, State};
+use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::Router;
+use std::collections::HashMap;
 
 use rustyfin_core::dlna;
 use rustyfin_model::media::MediaType;
@@ -15,8 +17,17 @@ pub fn routes() -> Router<AppState> {
         .route("/dlna/description.xml", get(description))
         .route("/dlna/ContentDirectory.xml", get(content_directory_scpd))
         .route("/dlna/ConnectionManager.xml", get(connection_manager_scpd))
-        .route("/dlna/control/ContentDirectory", post(content_directory_control))
-        .route("/dlna/control/ConnectionManager", post(connection_manager_control))
+        .route(
+            "/dlna/control/ContentDirectory",
+            post(content_directory_control),
+        )
+        .route(
+            "/dlna/control/ConnectionManager",
+            post(connection_manager_control),
+        )
+        .route("/Dlna/Profile", get(get_profile))
+        .route("/Dlna/Profile/DeviceDetection", post(device_detection))
+        .route("/Dlna/Profile/Device", get(get_device_profile))
 }
 
 async fn description(State(state): State<AppState>) -> Response {
@@ -55,7 +66,7 @@ async fn content_directory_control(
 
         let didl = if object_id == "0" {
             // Root: return libraries as containers
-            let libraries = rustyfin_db::repo_library::get_all_libraries(&state.db).await?;
+            let libraries = rustyfin_db::repo_library::get_all_libraries(&state.db_ro).await?;
             let mut items_xml = String::new();
             for lib in &libraries {
                 items_xml.push_str(&format!(
@@ -72,7 +83,8 @@ async fn content_directory_control(
         } else if browse_flag == "BrowseMetadata" {
             // Return metadata for a single object
             if let Ok(id) = object_id.parse::<uuid::Uuid>() {
-                if let Ok(Some(item)) = rustyfin_db::repo_media::get_item_by_id(&state.db, id).await {
+                if let Ok(Some(item)) = rustyfin_db::repo_media::get_item_by_id(&state.db, id).await
+                {
                     let item_xml = media_item_to_didl(&item, &state.bind_addr);
                     build_browse_response(&item_xml, 1, 1)
                 } else {
@@ -85,10 +97,14 @@ async fn content_directory_control(
             // BrowseDirectChildren: list children of a container
             if let Ok(parent_id) = object_id.parse::<uuid::Uuid>() {
                 let items = rustyfin_db::repo_media::get_children_paged(
-                    &state.db, parent_id, start_index, requested_count,
+                    &state.db_ro,
+                    parent_id,
+                    start_index,
+                    requested_count,
                 )
                 .await?;
-                let total = rustyfin_db::repo_media::count_children(&state.db, parent_id).await?;
+                let total =
+                    rustyfin_db::repo_media::count_children(&state.db_ro, parent_id).await?;
                 let mut items_xml = String::new();
                 for item in &items {
                     items_xml.push_str(&media_item_to_didl(item, &state.bind_addr));
@@ -244,4 +260,139 @@ fn parse_port(bind_addr: &str) -> u16 {
         .next()
         .and_then(|p| p.parse().ok())
         .unwrap_or(8096)
+}
+
+/// GET /Dlna/Profile — Returns the default DLNA profile.
+async fn get_profile() -> Result<Json<rustyfin_model::dlna_profile::DlnaProfile>, ApiError> {
+    let profile = default_dlna_profile();
+    Ok(Json(profile))
+}
+
+/// POST /Dlna/Profile/DeviceDetection — Detects device from user agent.
+async fn device_detection(
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<rustyfin_model::dlna_profile::DlnaDeviceDetection>, ApiError> {
+    let user_agent = params.get("UserAgent").cloned().unwrap_or_default();
+    let detection = detect_device(&user_agent);
+    Ok(Json(detection))
+}
+
+/// GET /Dlna/Profile/Device — Returns device-specific DLNA profile.
+async fn get_device_profile(
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<rustyfin_model::dlna_profile::DlnaProfile>, ApiError> {
+    let user_agent = params.get("UserAgent").cloned().unwrap_or_default();
+    let _detection = detect_device(&user_agent);
+    // Return the default profile; device-specific profiles can be added later
+    let profile = default_dlna_profile();
+    Ok(Json(profile))
+}
+
+/// Build the default DLNA profile matching Jellyfin's format.
+fn default_dlna_profile() -> rustyfin_model::dlna_profile::DlnaProfile {
+    use rustyfin_model::dlna_profile::*;
+
+    DlnaProfile {
+        name: "Default".to_string(),
+        device_profile_xml: None,
+        direct_play_profiles: vec![
+            DlnaStreamProfile {
+                container: Some("mp4,mkv,webm".to_string()),
+                profile_type: Some("Video".to_string()),
+                protocol: Some("http".to_string()),
+                estimate_content_length: Some(false),
+                enable_mpegts_m2ts_mode: Some(false),
+                video_codec: None,
+                audio_codec: None,
+            },
+            DlnaStreamProfile {
+                container: Some("mp3,aac,flac,ogg,wma".to_string()),
+                profile_type: Some("Audio".to_string()),
+                protocol: Some("http".to_string()),
+                estimate_content_length: Some(false),
+                enable_mpegts_m2ts_mode: Some(false),
+                video_codec: None,
+                audio_codec: None,
+            },
+        ],
+        transcoding_profiles: vec![
+            DlnaStreamProfile {
+                container: Some("ts".to_string()),
+                profile_type: Some("Video".to_string()),
+                protocol: Some("hls".to_string()),
+                estimate_content_length: Some(false),
+                enable_mpegts_m2ts_mode: Some(true),
+                video_codec: Some("h264".to_string()),
+                audio_codec: Some("aac,mp3".to_string()),
+            },
+            DlnaStreamProfile {
+                container: Some("mp3".to_string()),
+                profile_type: Some("Audio".to_string()),
+                protocol: Some("http".to_string()),
+                estimate_content_length: Some(false),
+                enable_mpegts_m2ts_mode: Some(false),
+                video_codec: None,
+                audio_codec: Some("mp3".to_string()),
+            },
+        ],
+        container_profiles: vec![],
+        response_profiles: vec![DlnaResponseProfile {
+            mime_type: "audio/mp4".to_string(),
+            container: Some("aac".to_string()),
+            profile_type: "Audio".to_string(),
+            org_path: None,
+        }],
+        codec_profiles: vec![],
+        subtitle_profiles: vec![
+            DlnaSubtitleProfile {
+                format: Some("srt".to_string()),
+                method: "External".to_string(),
+                didl_mode: None,
+            },
+            DlnaSubtitleProfile {
+                format: Some("ass".to_string()),
+                method: "Encode".to_string(),
+                didl_mode: None,
+            },
+        ],
+    }
+}
+
+/// Detect device information from a user agent string.
+fn detect_device(user_agent: &str) -> rustyfin_model::dlna_profile::DlnaDeviceDetection {
+    use rustyfin_model::dlna_profile::DlnaDeviceDetection;
+
+    // Try to identify common devices
+    let (friendly_name, model_name, model_number, manufacturer) = if user_agent.contains("Jellyfin")
+    {
+        ("Jellyfin Client", "Jellyfin", "1.0.0", "Jellyfin")
+    } else if user_agent.contains("Swiftfin") {
+        ("Swiftfin", "Swiftfin", "1.0.0", "Swiftfin")
+    } else if user_agent.contains("Kodi") {
+        ("Kodi", "Kodi", "1.0.0", "XBMC Foundation")
+    } else if user_agent.contains("PS3") || user_agent.contains("PLAYSTATION") {
+        ("PlayStation", "PlayStation", "1.0.0", "Sony")
+    } else if user_agent.contains("Xbox") {
+        ("Xbox", "Xbox", "1.0.0", "Microsoft")
+    } else if user_agent.contains("Android") {
+        ("Android Device", "Android", "1.0.0", "Google")
+    } else if user_agent.contains("iPhone") || user_agent.contains("iPad") {
+        ("Apple Device", "iOS", "1.0.0", "Apple")
+    } else if user_agent.contains("DLNA") || user_agent.contains("UPnP") {
+        ("DLNA Device", "DLNA", "1.0.0", "Unknown")
+    } else {
+        ("Unknown Device", "Unknown", "1.0.0", "Unknown")
+    };
+
+    DlnaDeviceDetection {
+        user_agent: user_agent.to_string(),
+        friendly_name: friendly_name.to_string(),
+        model_name: model_name.to_string(),
+        model_number: model_number.to_string(),
+        serial_number: String::new(),
+        manufacturer: manufacturer.to_string(),
+        manufacturer_url: String::new(),
+        device_id: uuid::Uuid::new_v4().to_string(),
+        icon_url: None,
+    }
 }

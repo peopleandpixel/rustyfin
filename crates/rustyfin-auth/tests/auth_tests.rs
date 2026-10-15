@@ -1,7 +1,16 @@
 use chrono::Utc;
+use std::sync::LazyLock;
 use uuid::Uuid;
 
 use rustyfin_model::user::User;
+
+// Serialize database initialization to avoid "schema is locked" errors
+static DB_INIT_MUTEX: LazyLock<std::sync::Mutex<()>> = LazyLock::new(|| std::sync::Mutex::new(()));
+
+async fn test_pool() -> sqlx::SqlitePool {
+    let _guard = DB_INIT_MUTEX.lock();
+    rustyfin_db::init_db("sqlite::memory:").await.unwrap()
+}
 
 fn make_user() -> User {
     User {
@@ -98,17 +107,20 @@ fn test_token_contains_correct_expiry() {
 
 #[tokio::test]
 async fn test_authenticate_success() {
-    let pool = rustyfin_db::init_db("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let secret = "jwt-secret";
 
     // Create user via the auth module
-    rustyfin_auth::create_initial_user(&pool, "admin", "password123").await.unwrap();
-
-    let (user, token) = rustyfin_auth::authenticate(&pool, "admin", "password123", secret)
+    let username = format!("admin_{}", uuid::Uuid::new_v4().simple());
+    rustyfin_auth::create_initial_user(&pool, &username, "password123")
         .await
         .unwrap();
 
-    assert_eq!(user.name, "admin");
+    let (user, token) = rustyfin_auth::authenticate(&pool, &username, "password123", secret)
+        .await
+        .unwrap();
+
+    assert_eq!(user.name, username);
     assert!(user.is_administrator);
     assert!(!token.is_empty());
 
@@ -119,16 +131,19 @@ async fn test_authenticate_success() {
 
 #[tokio::test]
 async fn test_authenticate_wrong_password() {
-    let pool = rustyfin_db::init_db("sqlite::memory:").await.unwrap();
-    rustyfin_auth::create_initial_user(&pool, "admin", "correct").await.unwrap();
+    let pool = test_pool().await;
+    let username = format!("admin_{}", uuid::Uuid::new_v4().simple());
+    rustyfin_auth::create_initial_user(&pool, &username, "correct")
+        .await
+        .unwrap();
 
-    let result = rustyfin_auth::authenticate(&pool, "admin", "wrong", "secret").await;
+    let result = rustyfin_auth::authenticate(&pool, &username, "wrong", "secret").await;
     assert!(result.is_err());
 }
 
 #[tokio::test]
 async fn test_authenticate_nonexistent_user() {
-    let pool = rustyfin_db::init_db("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
 
     let result = rustyfin_auth::authenticate(&pool, "ghost", "pass", "secret").await;
     assert!(result.is_err());
@@ -136,13 +151,18 @@ async fn test_authenticate_nonexistent_user() {
 
 #[tokio::test]
 async fn test_create_initial_user() {
-    let pool = rustyfin_db::init_db("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
+    let username = format!("newadmin_{}", uuid::Uuid::new_v4().simple());
 
-    let user = rustyfin_auth::create_initial_user(&pool, "newadmin", "pw").await.unwrap();
-    assert_eq!(user.name, "newadmin");
+    let user = rustyfin_auth::create_initial_user(&pool, &username, "pw")
+        .await
+        .unwrap();
+    assert_eq!(user.name, username);
     assert!(user.is_administrator);
 
     // Should be retrievable from DB
-    let found = rustyfin_db::repo_user::get_user_by_name(&pool, "newadmin").await.unwrap();
+    let found = rustyfin_db::repo_user::get_user_by_name(&pool, &username)
+        .await
+        .unwrap();
     assert!(found.is_some());
 }

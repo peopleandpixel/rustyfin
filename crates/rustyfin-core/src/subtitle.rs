@@ -1,7 +1,56 @@
+use serde::{Deserialize, Serialize};
+use sqlx::SqlitePool;
 use std::path::{Path, PathBuf};
 
 /// Supported external subtitle extensions.
 const SUBTITLE_EXTENSIONS: &[&str] = &["srt", "ass", "ssa", "vtt"];
+
+/// OpenSubtitles login response
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+struct OsLoginResponse {
+    error: Option<String>,
+    token: Option<String>,
+}
+
+/// OpenSubtitles search result
+#[derive(Debug, Deserialize)]
+struct OsSearchResponse {
+    data: Option<Vec<OsSubtitleEntry>>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(non_snake_case)]
+struct OsSubtitleEntry {
+    id: String,
+    SubFileName: String,
+    SubLanguageID: String,
+    #[allow(dead_code)]
+    SubDownloadLink: String,
+    #[allow(dead_code)]
+    SubVotes: Option<String>,
+    #[allow(dead_code)]
+    SubSumVotes: Option<String>,
+}
+
+/// Configuration for OpenSubtitles API
+#[derive(Debug, Clone)]
+pub struct OpenSubtitlesConfig {
+    pub user_agent: String,
+    pub username: Option<String>,
+    pub password: Option<String>,
+}
+
+impl Default for OpenSubtitlesConfig {
+    fn default() -> Self {
+        Self {
+            user_agent: format!("rustyfin/{}", env!("CARGO_PKG_VERSION")),
+            username: None,
+            password: None,
+        }
+    }
+}
 
 /// Represents an external subtitle file found alongside a media file.
 #[derive(Debug, Clone)]
@@ -57,16 +106,19 @@ pub fn discover_external_subtitles(media_path: &Path) -> Vec<ExternalSubtitle> {
                 format: ext,
                 index: 0, // assigned later
             });
-        } else if let Some(lang) = file_stem_full.strip_prefix(stem).and_then(|r| r.strip_prefix('.')) {
-            if !lang.is_empty() && lang.len() <= 10 {
-                let lang = lang.to_string();
-                results.push(ExternalSubtitle {
-                    path,
-                    language: Some(lang),
-                    format: ext,
-                    index: 0,
-                });
-            }
+        } else if let Some(lang) = file_stem_full
+            .strip_prefix(stem)
+            .and_then(|r| r.strip_prefix('.'))
+            && !lang.is_empty()
+            && lang.len() <= 10
+        {
+            let lang = lang.to_string();
+            results.push(ExternalSubtitle {
+                path,
+                language: Some(lang),
+                format: ext,
+                index: 0,
+            });
         }
     }
 
@@ -92,4 +144,190 @@ pub fn srt_to_vtt(srt: &str) -> String {
         out.push('\n');
     }
     out
+}
+
+/// Remote subtitle search result
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct RemoteSubtitleResult {
+    pub id: String,
+    pub name: String,
+    pub language: String,
+    pub format: String,
+    pub download_count: Option<i64>,
+}
+
+/// Search for remote subtitles using OpenSubtitles API
+pub async fn search_remote_subtitles(
+    _pool: &SqlitePool,
+    name: &str,
+    language: Option<&str>,
+    production_year: Option<i32>,
+) -> Result<Vec<RemoteSubtitleResult>, sqlx::Error> {
+    let config = OpenSubtitlesConfig::default();
+    search_open_subtitles(&config, name, language, production_year).await
+}
+
+/// Search OpenSubtitles API for subtitles
+async fn search_open_subtitles(
+    config: &OpenSubtitlesConfig,
+    name: &str,
+    language: Option<&str>,
+    year: Option<i32>,
+) -> Result<Vec<RemoteSubtitleResult>, sqlx::Error> {
+    let client = reqwest::Client::new();
+
+    // Build search query
+    let mut query = serde_json::Map::new();
+    query.insert("query".to_string(), serde_json::json!(name));
+    if let Some(y) = year {
+        query.insert("movie_year".to_string(), serde_json::json!(y));
+    }
+    if let Some(lang) = language {
+        query.insert("sublanguageid".to_string(), serde_json::json!(lang));
+    }
+
+    let body = serde_json::json!({
+        "method": "search",
+        "params": query,
+    });
+
+    let resp = client
+        .post("https://api.opensubtitles.com/api/v1/search")
+        .header("User-Agent", &config.user_agent)
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await;
+
+    let resp = match resp {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("OpenSubtitles search request failed: {}", e);
+            return Ok(vec![]);
+        }
+    };
+
+    let os_resp: OsSearchResponse = match resp.json().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("OpenSubtitles JSON parse failed: {}", e);
+            return Ok(vec![]);
+        }
+    };
+
+    if let Some(ref error) = os_resp.error {
+        tracing::warn!("OpenSubtitles API error: {}", error);
+        return Ok(vec![]);
+    }
+
+    let entries = os_resp.data.unwrap_or_default();
+    let mut results = Vec::new();
+
+    for entry in entries {
+        let lang_name = match entry.SubLanguageID.as_str() {
+            "eng" => "English",
+            "deu" => "German",
+            "fra" => "French",
+            "spa" => "Spanish",
+            "ita" => "Italian",
+            "por" => "Portuguese",
+            "jpn" => "Japanese",
+            "kor" => "Korean",
+            "chi" | "zho" => "Chinese",
+            "rus" => "Russian",
+            "nld" => "Dutch",
+            "pol" => "Polish",
+            "tur" => "Turkish",
+            "ara" => "Arabic",
+            other => other,
+        };
+
+        let download_count = entry
+            .SubVotes
+            .as_deref()
+            .and_then(|v| v.parse::<i64>().ok());
+
+        results.push(RemoteSubtitleResult {
+            id: entry.id,
+            name: entry.SubFileName,
+            language: lang_name.to_string(),
+            format: "srt".to_string(),
+            download_count,
+        });
+    }
+
+    Ok(results)
+}
+
+/// Download a subtitle from OpenSubtitles by ID and save it to the cache directory
+pub async fn download_subtitle(
+    config: &OpenSubtitlesConfig,
+    subtitle_id: &str,
+    cache_dir: &Path,
+) -> Result<PathBuf, String> {
+    let client = reqwest::Client::new();
+
+    // Ensure cache directory exists
+    tokio::fs::create_dir_all(cache_dir)
+        .await
+        .map_err(|e| format!("Failed to create cache directory: {}", e))?;
+
+    // Build download request
+    let body = serde_json::json!({
+        "method": "download",
+        "params": {
+            "subid": subtitle_id,
+        },
+    });
+
+    let resp = client
+        .post("https://api.opensubtitles.com/api/v1/download")
+        .header("User-Agent", &config.user_agent)
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("Download request failed: {}", e))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("Download failed with status: {}", status));
+    }
+
+    // The response is a JSON object with a download link
+    let download_resp: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse download response: {}", e))?;
+
+    let download_url = download_resp
+        .get("data")
+        .and_then(|d| d.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|d| d.get("data"))
+        .and_then(|d| d.as_str())
+        .ok_or_else(|| "No download URL in response".to_string())?;
+
+    // Fetch the actual subtitle file
+    let sub_bytes = client
+        .get(download_url)
+        .header("User-Agent", &config.user_agent)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to fetch subtitle: {}", e))?
+        .bytes()
+        .await
+        .map_err(|e| format!("Failed to read subtitle bytes: {}", e))?;
+
+    // Save to cache
+    let filename = format!("{}_en.srt", subtitle_id);
+    let file_path = cache_dir.join(&filename);
+
+    tokio::fs::write(&file_path, &sub_bytes)
+        .await
+        .map_err(|e| format!("Failed to write subtitle file: {}", e))?;
+
+    tracing::info!("Downloaded subtitle {} to {}", subtitle_id, filename);
+    Ok(file_path)
 }

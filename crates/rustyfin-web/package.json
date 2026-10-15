@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "build": "npx @tailwindcss/cli -i ./src/input.css -o ./dist/assets/style.css --minify && cp ./src/index.html ./dist/index.html && cp ./src/api.js ./dist/assets/api.js && cp ./src/app.js ./dist/assets/app.js",
+    "build": "npx @tailwindcss/cli -i ./src/input.css -o ./dist/assets/style.css --minify && cp ./src/index.html ./dist/index.html && cp ./src/api.js ./dist/assets/api.js && cp ./src/app.js ./dist/assets/app.js && cp ./src/assets/logo.png ./dist/assets/logo.png",
     "dev": "npx @tailwindcss/cli -i ./src/input.css -o ./dist/assets/style.css --watch"
   },
   "devDependencies": {

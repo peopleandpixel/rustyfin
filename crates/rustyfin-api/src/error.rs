@@ -1,6 +1,6 @@
+use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use serde::Serialize;
 
 /// Jellyfin-compatible error response format
@@ -29,26 +29,14 @@ pub enum ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, title, detail) = match self {
-            Self::NotFound(msg) => (
-                StatusCode::NOT_FOUND,
-                "Not Found".to_string(),
-                msg,
-            ),
-            Self::BadRequest(msg) => (
-                StatusCode::BAD_REQUEST,
-                "Bad Request".to_string(),
-                msg,
-            ),
+            Self::NotFound(msg) => (StatusCode::NOT_FOUND, "Not Found".to_string(), msg),
+            Self::BadRequest(msg) => (StatusCode::BAD_REQUEST, "Bad Request".to_string(), msg),
             Self::Unauthorized => (
                 StatusCode::UNAUTHORIZED,
                 "Unauthorized".to_string(),
                 "Authentication is required to access this resource.".to_string(),
             ),
-            Self::Forbidden(msg) => (
-                StatusCode::FORBIDDEN,
-                "Forbidden".to_string(),
-                msg,
-            ),
+            Self::Forbidden(msg) => (StatusCode::FORBIDDEN, "Forbidden".to_string(), msg),
             Self::Internal(msg) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Internal Server Error".to_string(),
@@ -82,9 +70,8 @@ impl From<sqlx::Error> for ApiError {
 impl From<rustyfin_auth::AuthError> for ApiError {
     fn from(e: rustyfin_auth::AuthError) -> Self {
         match e {
-            rustyfin_auth::AuthError::InvalidCredentials | rustyfin_auth::AuthError::UserNotFound => {
-                Self::Unauthorized
-            }
+            rustyfin_auth::AuthError::InvalidCredentials
+            | rustyfin_auth::AuthError::UserNotFound => Self::Unauthorized,
             other => {
                 tracing::error!(error = %other, "auth error");
                 Self::Internal("An internal authentication error occurred.".to_string())

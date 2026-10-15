@@ -1,25 +1,30 @@
-mod system;
-mod auth;
-mod users;
-mod library;
-mod items;
-mod quick_connect;
-mod images;
-mod streaming;
-mod transcode;
-mod playback;
-mod subtitle;
-mod session;
-mod search;
-mod collections;
-mod persons;
 mod activity;
-mod dlna;
-mod startup;
-mod scheduled_tasks;
-mod plugins;
-mod websocket;
+mod additional;
+mod auth;
+mod collections;
+mod configuration;
 mod display_preferences;
+mod dlna;
+mod encoding_manager;
+mod images;
+mod items;
+mod library;
+mod live_tv;
+mod persons;
+mod playback;
+mod plugins;
+mod quick_connect;
+mod scheduled_tasks;
+mod search;
+mod session;
+mod shows;
+mod startup;
+mod streaming;
+mod subtitle;
+mod system;
+mod transcode;
+mod users;
+mod websocket;
 
 use axum::Router;
 use axum::middleware as axum_mw;
@@ -39,6 +44,7 @@ pub fn build_router(state: AppState) -> Router {
 
     let protected = Router::new()
         .merge(system::protected_routes())
+        .merge(encoding_manager::routes())
         .merge(users::routes())
         .merge(library::routes())
         .merge(items::routes())
@@ -56,6 +62,10 @@ pub fn build_router(state: AppState) -> Router {
         .merge(scheduled_tasks::routes())
         .merge(plugins::routes())
         .merge(display_preferences::routes())
+        .merge(configuration::routes())
+        .merge(shows::routes())
+        .merge(live_tv::routes())
+        .merge(additional::routes())
         .layer(axum_mw::from_fn_with_state(state.clone(), require_auth));
 
     #[allow(unused_mut)]
@@ -85,13 +95,14 @@ mod webclient {
     pub fn mount_webclient(router: Router<AppState>) -> Router<AppState> {
         let web_dir = std::env::var("RUSTYFIN_WEBCLIENT_DIR").unwrap_or_else(|_| {
             // Default: look for the bundled web client next to the binary
-            let exe_dir = std::env::current_exe()
+            if let Some(exe_dir) = std::env::current_exe()
                 .ok()
                 .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-                .unwrap_or_default();
-            let candidate = exe_dir.join("web");
-            if candidate.exists() {
-                return candidate.to_string_lossy().to_string();
+            {
+                let candidate = exe_dir.join("web");
+                if candidate.exists() {
+                    return candidate.to_string_lossy().to_string();
+                }
             }
             // Fallback: workspace-relative path (development)
             "crates/rustyfin-web/dist".to_string()
@@ -99,8 +110,9 @@ mod webclient {
 
         tracing::info!("serving web client from: {}", web_dir);
 
-        router
-            .nest_service("/web", ServeDir::new(&web_dir))
-            .route("/", axum::routing::get(|| async { Redirect::permanent("/web/index.html") }))
+        router.nest_service("/web", ServeDir::new(&web_dir)).route(
+            "/",
+            axum::routing::get(|| async { Redirect::permanent("/web/index.html") }),
+        )
     }
 }

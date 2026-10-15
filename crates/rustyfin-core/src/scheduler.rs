@@ -13,6 +13,7 @@ use tokio::sync::watch;
 pub const TASK_LIBRARY_SCAN: &str = "LibraryScan";
 pub const TASK_METADATA_REFRESH: &str = "MetadataRefresh";
 pub const TASK_TRANSCODE_CLEANUP: &str = "TranscodeCacheCleanup";
+pub const TASK_INTRO_DETECTION: &str = "IntroDetection";
 
 /// Default interval: 12 hours in .NET ticks (1 tick = 100ns)
 const TICKS_12H: u64 = 12 * 60 * 60 * 10_000_000;
@@ -68,7 +69,9 @@ impl TaskScheduler {
                 info: ScheduledTaskInfo {
                     id: TASK_METADATA_REFRESH.to_string(),
                     name: "Refresh Metadata".to_string(),
-                    description: "Updates metadata for all media items from local and remote sources.".to_string(),
+                    description:
+                        "Updates metadata for all media items from local and remote sources."
+                            .to_string(),
                     category: "Library".to_string(),
                     state: TaskState::Idle,
                     current_progress_percentage: None,
@@ -90,8 +93,31 @@ impl TaskScheduler {
                 info: ScheduledTaskInfo {
                     id: TASK_TRANSCODE_CLEANUP.to_string(),
                     name: "Transcode Cache Cleanup".to_string(),
-                    description: "Removes old transcoded files from the cache directory.".to_string(),
+                    description: "Removes old transcoded files from the cache directory."
+                        .to_string(),
                     category: "Maintenance".to_string(),
+                    state: TaskState::Idle,
+                    current_progress_percentage: None,
+                    triggers: vec![TaskTriggerInfo {
+                        trigger_type: "IntervalTrigger".to_string(),
+                        interval_ticks: Some(TICKS_24H),
+                        time_of_day_ticks: None,
+                        max_runtime_ticks: None,
+                    }],
+                    last_execution_result: None,
+                },
+            },
+        );
+
+        // Intro/Outro Detection
+        tasks.insert(
+            TASK_INTRO_DETECTION.to_string(),
+            TaskEntry {
+                info: ScheduledTaskInfo {
+                    id: TASK_INTRO_DETECTION.to_string(),
+                    name: "Detect Intros and Outros".to_string(),
+                    description: "Analyzes episodes to detect intro and outro segments for skip functionality.".to_string(),
+                    category: "Library".to_string(),
                     state: TaskState::Idle,
                     current_progress_percentage: None,
                     triggers: vec![TaskTriggerInfo {
@@ -153,10 +179,10 @@ impl TaskScheduler {
         let tasks = self.tasks.read().await;
         let entry = tasks.get(id)?;
         for trigger in &entry.info.triggers {
-            if trigger.trigger_type == "IntervalTrigger" {
-                if let Some(ticks) = trigger.interval_ticks {
-                    return Some(ticks_to_duration(ticks));
-                }
+            if trigger.trigger_type == "IntervalTrigger"
+                && let Some(ticks) = trigger.interval_ticks
+            {
+                return Some(ticks_to_duration(ticks));
             }
         }
         None
@@ -164,7 +190,8 @@ impl TaskScheduler {
 
     /// Run the library scan task once
     async fn run_library_scan(&self) {
-        self.set_task_state(TASK_LIBRARY_SCAN, TaskState::Running).await;
+        self.set_task_state(TASK_LIBRARY_SCAN, TaskState::Running)
+            .await;
         let start = Utc::now();
 
         let result = match rustyfin_db::repo_library::get_all_libraries(&self.db).await {
@@ -204,12 +231,47 @@ impl TaskScheduler {
         };
 
         self.set_task_result(TASK_LIBRARY_SCAN, result).await;
-        self.set_task_state(TASK_LIBRARY_SCAN, TaskState::Idle).await;
+        self.set_task_state(TASK_LIBRARY_SCAN, TaskState::Idle)
+            .await;
+    }
+
+    /// Run intro/outro detection for all episodes
+    async fn run_intro_detection(&self) {
+        self.set_task_state(TASK_INTRO_DETECTION, TaskState::Running)
+            .await;
+        let start = Utc::now();
+
+        let result = match crate::media_segments::detect_for_all_episodes(&self.db).await {
+            Ok(count) => {
+                let end = Utc::now();
+                tracing::info!("Intro detection completed: {} episodes processed", count);
+                TaskResult {
+                    status: TaskCompletionStatus::Completed,
+                    error_message: Some(format!("Processed {} episodes", count)),
+                    start_time_utc: start.to_rfc3339(),
+                    end_time_utc: end.to_rfc3339(),
+                }
+            }
+            Err(e) => {
+                let end = Utc::now();
+                TaskResult {
+                    status: TaskCompletionStatus::Failed,
+                    error_message: Some(e),
+                    start_time_utc: start.to_rfc3339(),
+                    end_time_utc: end.to_rfc3339(),
+                }
+            }
+        };
+
+        self.set_task_result(TASK_INTRO_DETECTION, result).await;
+        self.set_task_state(TASK_INTRO_DETECTION, TaskState::Idle)
+            .await;
     }
 
     /// Run metadata refresh for all items across all libraries
     async fn run_metadata_refresh(&self) {
-        self.set_task_state(TASK_METADATA_REFRESH, TaskState::Running).await;
+        self.set_task_state(TASK_METADATA_REFRESH, TaskState::Running)
+            .await;
         let start = Utc::now();
 
         let result = match rustyfin_db::repo_library::get_all_libraries(&self.db).await {
@@ -221,7 +283,9 @@ impl TaskScheduler {
                             for item in &items {
                                 if let Err(e) = crate::metadata::refresh_item_metadata(
                                     &self.db, item, None, None,
-                                ).await {
+                                )
+                                .await
+                                {
                                     errors.push(format!("{}: {}", item.name, e));
                                 }
                             }
@@ -261,12 +325,14 @@ impl TaskScheduler {
         };
 
         self.set_task_result(TASK_METADATA_REFRESH, result).await;
-        self.set_task_state(TASK_METADATA_REFRESH, TaskState::Idle).await;
+        self.set_task_state(TASK_METADATA_REFRESH, TaskState::Idle)
+            .await;
     }
 
     /// Clean up old transcode cache files
     async fn run_transcode_cleanup(&self) {
-        self.set_task_state(TASK_TRANSCODE_CLEANUP, TaskState::Running).await;
+        self.set_task_state(TASK_TRANSCODE_CLEANUP, TaskState::Running)
+            .await;
         let start = Utc::now();
 
         let cache_dir = self.data_dir.join("cache").join("transcode");
@@ -305,11 +371,12 @@ impl TaskScheduler {
         };
 
         self.set_task_result(TASK_TRANSCODE_CLEANUP, result).await;
-        self.set_task_state(TASK_TRANSCODE_CLEANUP, TaskState::Idle).await;
+        self.set_task_state(TASK_TRANSCODE_CLEANUP, TaskState::Idle)
+            .await;
     }
 
     /// Start all scheduled task loops. Call once at startup.
-    pub fn start(self, mut shutdown_rx: watch::Receiver<bool>) {
+    pub fn start(self, shutdown_rx: watch::Receiver<bool>) {
         // Library scan loop
         let sched = self.clone();
         let mut rx = shutdown_rx.clone();
@@ -349,6 +416,7 @@ impl TaskScheduler {
 
         // Transcode cache cleanup loop
         let sched = self.clone();
+        let mut rx = shutdown_rx.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(300)).await;
             loop {
@@ -359,7 +427,25 @@ impl TaskScheduler {
                     .unwrap_or(std::time::Duration::from_secs(24 * 3600));
                 tokio::select! {
                     _ = tokio::time::sleep(interval) => {}
-                    _ = shutdown_rx.wait_for(|v| *v) => break,
+                    _ = rx.wait_for(|v| *v) => break,
+                }
+            }
+        });
+
+        // Intro/Outro detection loop
+        let sched = self.clone();
+        let mut rx = shutdown_rx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+            loop {
+                sched.run_intro_detection().await;
+                let interval = sched
+                    .get_interval_for_task(TASK_INTRO_DETECTION)
+                    .await
+                    .unwrap_or(std::time::Duration::from_secs(24 * 3600));
+                tokio::select! {
+                    _ = tokio::time::sleep(interval) => {}
+                    _ = rx.wait_for(|v| *v) => break,
                 }
             }
         });

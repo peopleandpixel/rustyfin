@@ -34,7 +34,7 @@ async fn get_activity_log(
     Query(query): Query<ActivityLogQuery>,
 ) -> Result<Json<ActivityLogResult>, ApiError> {
     let result = rustyfin_db::repo_activity::get_activity_log(
-        &state.db,
+        &state.db_ro,
         query.start_index.unwrap_or(0),
         query.limit,
     )
@@ -46,6 +46,6 @@ async fn get_notifications(
     State(state): State<AppState>,
     Path(user_id): Path<Uuid>,
 ) -> Result<Json<NotificationResult>, ApiError> {
-    let result = rustyfin_db::repo_notification::get_notifications(&state.db, user_id).await?;
+    let result = rustyfin_db::repo_notification::get_notifications(&state.db_ro, user_id).await?;
     Ok(Json(result))
 }

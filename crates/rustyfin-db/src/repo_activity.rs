@@ -36,7 +36,19 @@ pub async fn get_activity_log(
         .fetch_one(pool)
         .await?;
 
-    let rows = sqlx::query_as::<_, (i64, String, String, Option<String>, Option<String>, String, Option<String>, String)>(
+    let rows = sqlx::query_as::<
+        _,
+        (
+            i64,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            Option<String>,
+            String,
+        ),
+    >(
         "SELECT id, name, type, user_id, item_id, severity, overview, date
          FROM activity_log
          ORDER BY date DESC

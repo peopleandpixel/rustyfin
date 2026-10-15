@@ -8,6 +8,7 @@ rustyfin-model = { workspace = true }
 rustyfin-db = { workspace = true }
 argon2 = { workspace = true }
 rand_core = { workspace = true }
+rand = { workspace = true }
 jsonwebtoken = { workspace = true }
 sqlx = { workspace = true }
 uuid = { workspace = true }

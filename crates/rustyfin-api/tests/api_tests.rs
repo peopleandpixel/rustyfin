@@ -7,13 +7,15 @@ use axum::body::Body;
 use axum::extract::connect_info::MockConnectInfo;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
-use tokio::sync::{watch, RwLock};
+use tokio::sync::{RwLock, broadcast, watch};
 use tower::ServiceExt;
 
+use rustyfin_api::cache::{ApiCache, ImageCache};
 use rustyfin_api::middleware::RateLimiter;
 use rustyfin_api::routes::build_router;
 use rustyfin_api::state::AppState;
 use rustyfin_model::server_info::ServerConfiguration;
+use rustyfin_model::ws_event::WsEvent;
 
 async fn test_state() -> AppState {
     let pool = rustyfin_db::init_db("sqlite::memory:").await.unwrap();
@@ -26,15 +28,17 @@ async fn test_state() -> AppState {
     let data_dir_arc = Arc::new(data_dir.clone());
 
     let transcode_manager = rustyfin_core::transcode::TranscodeManager::new(&data_dir);
-    let task_scheduler = rustyfin_core::scheduler::TaskScheduler::new(
-        pool.clone(),
-        data_dir_arc.clone(),
-    );
+    let task_scheduler =
+        rustyfin_core::scheduler::TaskScheduler::new(pool.clone(), data_dir_arc.clone());
     let plugin_manager = rustyfin_core::plugin_manager::PluginManager::new(&data_dir_arc);
     let rate_limiter = RateLimiter::new(1000, 60);
+    let (ws_tx, _) = broadcast::channel::<WsEvent>(100);
+    let cache = ApiCache::new();
+    let image_cache = ImageCache::new();
 
     AppState {
-        db: pool,
+        db: pool.clone(),
+        db_ro: pool,
         jwt_secret: Arc::new("test-secret".to_string()),
         server_id: Arc::new("test-server-id".to_string()),
         data_dir: data_dir_arc,
@@ -47,12 +51,14 @@ async fn test_state() -> AppState {
         task_scheduler,
         plugin_manager,
         rate_limiter,
+        ws_broadcast: ws_tx,
+        cache,
+        image_cache,
     }
 }
 
 fn app(state: AppState) -> axum::Router {
-    build_router(state)
-        .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))))
+    build_router(state).layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))))
 }
 
 // ── Public Endpoint Tests ──
@@ -121,7 +127,10 @@ async fn test_public_info_endpoint() {
 #[tokio::test]
 async fn test_login_success() {
     let state = test_state().await;
-    rustyfin_auth::create_initial_user(&state.db, "admin", "admin").await.unwrap();
+    let username = format!("admin_{}", uuid::Uuid::new_v4().simple());
+    rustyfin_auth::create_initial_user(&state.db, &username, "admin")
+        .await
+        .unwrap();
     let app = app(state);
 
     let resp = app
@@ -130,7 +139,10 @@ async fn test_login_success() {
                 .method("POST")
                 .uri("/Users/AuthenticateByName")
                 .header("Content-Type", "application/json")
-                .body(Body::from(r#"{"Username":"admin","Pw":"admin"}"#))
+                .body(Body::from(format!(
+                    r#"{{"Username":"{}","Pw":"admin"}}"#,
+                    username
+                )))
                 .unwrap(),
         )
         .await
@@ -146,7 +158,10 @@ async fn test_login_success() {
 #[tokio::test]
 async fn test_login_wrong_password() {
     let state = test_state().await;
-    rustyfin_auth::create_initial_user(&state.db, "admin", "admin").await.unwrap();
+    let username = format!("admin_{}", uuid::Uuid::new_v4().simple());
+    rustyfin_auth::create_initial_user(&state.db, &username, "admin")
+        .await
+        .unwrap();
     let app = app(state);
 
     let resp = app
@@ -155,7 +170,10 @@ async fn test_login_wrong_password() {
                 .method("POST")
                 .uri("/Users/AuthenticateByName")
                 .header("Content-Type", "application/json")
-                .body(Body::from(r#"{"Username":"admin","Pw":"wrong"}"#))
+                .body(Body::from(format!(
+                    r#"{{"Username":"{}","Pw":"wrong"}}"#,
+                    username
+                )))
                 .unwrap(),
         )
         .await
@@ -209,8 +227,14 @@ async fn test_protected_endpoint_with_api_key() {
 #[tokio::test]
 async fn test_protected_endpoint_with_jwt() {
     let state = test_state().await;
-    rustyfin_auth::create_initial_user(&state.db, "admin", "admin").await.unwrap();
-    let user = rustyfin_db::repo_user::get_user_by_name(&state.db, "admin").await.unwrap().unwrap();
+    let username = format!("admin_{}", uuid::Uuid::new_v4().simple());
+    rustyfin_auth::create_initial_user(&state.db, &username, "admin")
+        .await
+        .unwrap();
+    let user = rustyfin_db::repo_user::get_user_by_name(&state.db, &username)
+        .await
+        .unwrap()
+        .unwrap();
     let token = rustyfin_auth::create_token(&user, "test-secret").unwrap();
     let app = app(state);
 

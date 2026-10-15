@@ -14,6 +14,8 @@ pub struct ExternalMetadata {
     pub runtime_ticks: Option<i64>,
     /// URLs for images (poster, backdrop, etc.)
     pub image_urls: Vec<MetadataImage>,
+    /// TMDb ID for the item, used to fetch cast/crew photos
+    pub tmdb_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1,8 +1,8 @@
-use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use argon2::password_hash::SaltString;
-use rand_core::OsRng;
+use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use chrono::Utc;
 use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
+use rand_core::OsRng;
 use rustyfin_model::auth::Claims;
 use rustyfin_model::user::User;
 use sqlx::SqlitePool;
@@ -106,4 +106,45 @@ pub async fn create_initial_user(
 
     rustyfin_db::repo_user::create_user(pool, &user).await?;
     Ok(user)
+}
+
+/// Refresh a JWT token, returning a new token with extended expiry.
+pub fn refresh_token(token: &str, secret: &str) -> Result<String, AuthError> {
+    let claims = validate_token(token, secret)?;
+    let now = Utc::now().timestamp();
+    let new_claims = Claims {
+        sub: claims.sub,
+        name: claims.name,
+        is_admin: claims.is_admin,
+        iat: now,
+        exp: now + 86400 * 30, // 30 days
+    };
+
+    let new_token = encode(
+        &Header::default(),
+        &new_claims,
+        &EncodingKey::from_secret(secret.as_bytes()),
+    )?;
+
+    Ok(new_token)
+}
+
+/// Generate a random PIN for password reset.
+pub fn generate_reset_pin() -> String {
+    let mut pin = String::with_capacity(6);
+    for _ in 0..6 {
+        let digit = rand::random::<u8>() % 10;
+        pin.push(char::from(digit as u8 + b'0'));
+    }
+    pin
+}
+
+/// Hash a PIN for storage.
+pub fn hash_pin(pin: &str) -> Result<String, AuthError> {
+    hash_password(pin)
+}
+
+/// Verify a PIN against its hash.
+pub fn verify_pin(pin: &str, hash: &str) -> Result<bool, AuthError> {
+    verify_password(pin, hash)
 }
