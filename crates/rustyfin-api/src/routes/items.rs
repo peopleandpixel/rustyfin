@@ -2,7 +2,8 @@ use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
+use rustyfin_model::auth::Claims;
 use rustyfin_model::media::{FiltersResult, MediaItem, QueryResult};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -49,9 +50,1115 @@ async fn populate_media_source_single(
     Ok(())
 }
 
+/// Enrich a single MediaItem with all response fields: server_id, provider_ids, chapters,
+/// trickplay screenshots, etag, completion_percentage, external_urls, type flags,
+/// album/artist info, folder counts, inherited images, episode numbers, series branding,
+/// original title, trailers (from TMDb API), blurhashes, and more.
+async fn enrich_item(
+    pool: &SqlitePool,
+    server_id: &str,
+    user_id: Option<Uuid>,
+    item: &mut MediaItem,
+    http_client: &reqwest::Client,
+    tmdb_api_key: Option<&str>,
+    data_dir: &std::path::Path,
+) {
+    // ServerId
+    item.server_id = Some(server_id.to_string());
+
+    // Type flags
+    item.is_movie = item.media_type == rustyfin_model::media::MediaType::Movie;
+    item.is_series = item.media_type == rustyfin_model::media::MediaType::Series;
+    item.is_kids = item.official_rating.as_deref() == Some("G")
+        || item.official_rating.as_deref() == Some("PG");
+    item.is_live = false;
+
+    // SourceType & EnableMediaSourceDisplay
+    item.source_type = Some("Default".to_string());
+    item.enable_media_source_display = matches!(
+        item.media_type,
+        rustyfin_model::media::MediaType::Movie
+            | rustyfin_model::media::MediaType::Episode
+            | rustyfin_model::media::MediaType::Audio
+    );
+
+    // ProviderIds from tmdb_id/tvdb_id
+    let mut provider_ids = rustyfin_model::media::ProviderIds::default();
+    if let Some(tmdb) = item.tmdb_id {
+        provider_ids.set("tmdb".to_string(), tmdb.to_string());
+    }
+    if let Some(tvdb) = item.tvdb_id {
+        provider_ids.set("tvdb".to_string(), tvdb.to_string());
+    }
+    item.provider_ids = provider_ids;
+
+    // ExternalUrls from provider_ids
+    let mut external_urls = Vec::new();
+    if let Some(tmdb) = item.tmdb_id {
+        let kind = if item.is_movie { "movie" } else { "tv" };
+        external_urls.push(rustyfin_model::media::ExternalUrl {
+            name: "TMDb".to_string(),
+            url: format!("https://www.themoviedb.org/{}/{}", kind, tmdb),
+        });
+    }
+    if let Some(tvdb) = item.tvdb_id {
+        external_urls.push(rustyfin_model::media::ExternalUrl {
+            name: "TheTVDB".to_string(),
+            url: format!("https://www.thetvdb.com/?id={}", tvdb),
+        });
+    }
+    item.external_urls = external_urls;
+
+    // RemoteTrailers from TMDb API (real YouTube trailer URLs)
+    if let Some(tmdb) = item.tmdb_id
+        && let Some(api_key) = tmdb_api_key
+    {
+        let kind = if item.is_movie { "movie" } else { "tv" };
+        let trailers =
+            rustyfin_core::provider_tmdb::get_trailers(http_client, api_key, kind, tmdb).await;
+        item.remote_trailers = trailers
+            .into_iter()
+            .map(|(name, url)| rustyfin_model::media::ExternalUrl { name, url })
+            .collect();
+        item.trailer_count = Some(item.remote_trailers.len() as i32);
+        item.local_trailer_count = Some(0);
+    }
+
+    // ImageTags from images table
+    if let Ok(images) = rustyfin_db::repo_image::get_images_for_item(pool, item.id).await {
+        let mut tags: std::collections::HashMap<rustyfin_model::image::ImageType, String> =
+            std::collections::HashMap::new();
+        let mut backdrop_tags: Vec<String> = Vec::new();
+        for img in &images {
+            let tag = format!("{}_{}", img.image_type.as_str(), img.image_index);
+            if img.image_type == rustyfin_model::image::ImageType::Backdrop {
+                backdrop_tags.push(tag.clone());
+            }
+            tags.entry(img.image_type).or_insert_with(|| tag);
+        }
+        item.image_tags = tags;
+        item.backdrop_image_tags = backdrop_tags;
+
+        // ImageBlurHashes from local images
+        for img in images {
+            if !img.path.starts_with("http://") && !img.path.starts_with("https://") {
+                let full_path = data_dir.join(&img.path);
+                if let Ok(Some(hash)) = tokio::time::timeout(
+                    std::time::Duration::from_millis(500),
+                    rustyfin_core::image_proxy::compute_blurhash(full_path.to_str().unwrap_or("")),
+                )
+                .await
+                {
+                    let key = format!("{}-{}", img.image_type.as_str(), img.image_index);
+                    item.image_blur_hashes.insert(key, hash);
+                }
+            }
+        }
+    }
+
+    // OriginalTitle (same as name if not set)
+    if item.original_title.is_none() {
+        item.original_title = Some(item.name.clone());
+    }
+
+    // Chapters from chapters table
+    if let Ok(chapters) = rustyfin_db::repo_chapter::get_chapters(pool, item.id).await {
+        item.chapters = chapters
+            .iter()
+            .map(|c| rustyfin_model::media::ChapterInfo {
+                start_ticks: c.start_position_ticks,
+                name: c.name.clone(),
+                image: c.image_path.clone(),
+                image_date_modified: None,
+            })
+            .collect();
+        item.chapter_count = item.chapters.len() as i32;
+    }
+
+    // ScreenshotImageTags from trickplay table
+    if let Ok(Some(_trickplay)) = rustyfin_db::repo_trickplay::get_trickplay(pool, item.id).await {
+        item.screenshot_image_tags = vec![format!("{}-{}", item.id, _trickplay.width)];
+    }
+
+    // Etag from date_created
+    item.etag = Some(item.date_created.to_rfc3339());
+
+    // CompletionPercentage from user_item_data
+    if let Some(uid) = user_id
+        && let Ok(user_data) =
+            rustyfin_db::repo_playback::get_user_item_data(pool, uid, item.id).await
+    {
+        item.user_data = Some(user_data.clone());
+        if let Some(runtime) = item.runtime_ticks
+            && runtime > 0
+        {
+            let pos = user_data.playback_position_ticks.max(0) as f64;
+            let run = runtime as f64;
+            if user_data.played {
+                item.completion_percentage = Some(100.0);
+            } else {
+                item.completion_percentage = Some((pos / run * 100.0).min(100.0));
+            }
+        }
+    }
+
+    // Media source count and streams
+    if !item.media_sources.is_empty() {
+        item.media_source_count = item.media_sources.len() as i32;
+        if let Some(source) = item.media_sources.first() {
+            item.media_streams = source.media_streams.clone();
+        }
+    }
+
+    // Display preferences ID
+    item.display_preferences_id = Some(item.id.to_string());
+
+    // Play access
+    item.play_access = Some("Full".to_string());
+
+    // --- Episode-specific fields ---
+    if item.media_type == rustyfin_model::media::MediaType::Episode {
+        // Number: "S01E03" format
+        if let (Some(season), Some(ep)) = (item.parent_index_number, item.index_number) {
+            item.number = Some(format!("{:02}x{:02}", season, ep));
+        }
+        // EpisodeTitle: "{Season N} - Episode M - Name"
+        if let Some(season) = item.parent_index_number {
+            item.episode_title = Some(format!(
+                "Season {} - Episode {} - {}",
+                season,
+                item.index_number.unwrap_or(0),
+                item.name
+            ));
+        }
+        // SeriesName, SeriesId, SeriesPrimaryImageTag from grandparent (the Series)
+        if let Some(parent_id) = item.parent_id {
+            // parent is the Season; grandparent is the Series
+            if let Ok(Some(season_item)) =
+                rustyfin_db::repo_media::get_parent_item(pool, parent_id).await
+            {
+                item.series_name = Some(season_item.name.clone());
+                item.series_id = season_item.parent_id;
+                item.season_name = Some(season_item.name.clone());
+                // SeriesPrimaryImageTag from the Series
+                if let Some(series_id) = season_item.parent_id
+                    && let Ok(Some(series_item)) =
+                        rustyfin_db::repo_media::get_parent_item(pool, series_id).await
+                {
+                    item.series_name = Some(series_item.name.clone());
+                    item.series_id = Some(series_item.id);
+                    if let Some(tag) = series_item
+                        .image_tags
+                        .get(&rustyfin_model::image::ImageType::Primary)
+                    {
+                        item.series_primary_image_tag = Some(tag.clone());
+                    }
+                    if let Some(tag) = series_item
+                        .image_tags
+                        .get(&rustyfin_model::image::ImageType::Thumb)
+                    {
+                        item.series_thumb_image_tag = Some(tag.clone());
+                    }
+                }
+            }
+        }
+        // Parent image tags from Season
+        if let Some(parent_id) = item.parent_id
+            && let Ok(Some(parent)) =
+                rustyfin_db::repo_media::get_parent_item(pool, parent_id).await
+        {
+            if let Some(tag) = parent
+                .image_tags
+                .get(&rustyfin_model::image::ImageType::Primary)
+            {
+                item.parent_primary_image_tag = Some(tag.clone());
+                item.parent_primary_image_item_id = Some(parent.id);
+            }
+            if let Some(tag) = parent
+                .image_tags
+                .get(&rustyfin_model::image::ImageType::Thumb)
+            {
+                item.parent_thumb_image_tag = Some(tag.clone());
+                item.parent_thumb_item_id = Some(parent.id);
+            }
+            if let Some(tag) = parent
+                .image_tags
+                .get(&rustyfin_model::image::ImageType::Art)
+            {
+                item.parent_art_image_tag = Some(tag.clone());
+                item.parent_art_item_id = Some(parent.id);
+            }
+            if let Some(tag) = parent
+                .image_tags
+                .get(&rustyfin_model::image::ImageType::Logo)
+            {
+                item.parent_logo_image_tag = Some(tag.clone());
+                item.parent_logo_item_id = Some(parent.id);
+            }
+            // Parent backdrop
+            if !parent.backdrop_image_tags.is_empty() {
+                item.parent_backdrop_image_tags = parent.backdrop_image_tags.clone();
+                item.parent_backdrop_item_id = Some(parent.id);
+            }
+        }
+    }
+
+    // --- Audio-specific fields ---
+    if item.media_type == rustyfin_model::media::MediaType::Audio {
+        // Album info from parent (MusicAlbum)
+        if let Some(parent_id) = item.parent_id {
+            if let Ok(Some(album)) =
+                rustyfin_db::repo_media::get_album_for_audio(pool, parent_id).await
+            {
+                item.album = Some(album.name.clone());
+                item.album_id = Some(album.id);
+                // Parent image tags from album
+                if let Some(tag) = album
+                    .image_tags
+                    .get(&rustyfin_model::image::ImageType::Primary)
+                {
+                    item.parent_primary_image_tag = Some(tag.clone());
+                    item.parent_primary_image_item_id = Some(album.id);
+                }
+                if let Some(tag) = album.image_tags.get(&rustyfin_model::image::ImageType::Art) {
+                    item.parent_art_image_tag = Some(tag.clone());
+                    item.parent_art_item_id = Some(album.id);
+                }
+            }
+            // AlbumArtist from album name
+            if item.album_artist.is_none()
+                && let Ok(Some(album)) =
+                    rustyfin_db::repo_media::get_parent_item(pool, parent_id).await
+            {
+                item.album_artist = Some(album.name.clone());
+            }
+        }
+        // Artists from item_people table
+        if let Ok(artists) = rustyfin_db::repo_media::get_artists_for_audio(pool, item.id).await {
+            item.artists = artists
+                .iter()
+                .map(|(pid, name, role)| rustyfin_model::media::PersonInfo {
+                    id: pid.clone(),
+                    name: name.clone(),
+                    role: role.clone(),
+                    person_type: Some("Artist".to_string()),
+                })
+                .collect();
+            item.album_artists = item.artists.clone();
+            // Also populate People for audio items
+            item.people = item.artists.clone();
+        }
+    }
+
+    // --- People for all non-audio items (Movie, Episode, Series, etc.) ---
+    if item.media_type != rustyfin_model::media::MediaType::Audio
+        && item.people.is_empty()
+        && let Ok(people_rows) = rustyfin_db::repo_media::get_artists_for_audio(pool, item.id).await
+    {
+        item.people = people_rows
+            .iter()
+            .map(|(pid, name, role)| rustyfin_model::media::PersonInfo {
+                id: pid.clone(),
+                name: name.clone(),
+                role: role.clone(),
+                person_type: role
+                    .as_deref()
+                    .map(|r| {
+                        if r == "Actor" || r == "Actress" {
+                            "Actor".to_string()
+                        } else {
+                            "Creator".to_string()
+                        }
+                    })
+                    .or_else(|| Some("Actor".to_string())),
+            })
+            .collect();
+    }
+
+    // --- Studios from item_studios table ---
+    if item.studios.is_empty()
+        && let Ok(studio_rows) = rustyfin_db::repo_media::get_studios_for_item(pool, item.id).await
+    {
+        item.studios = studio_rows
+            .into_iter()
+            .map(|(sid, sname)| rustyfin_model::media::StudioInfo {
+                id: sid,
+                name: sname,
+            })
+            .collect();
+    }
+
+    // --- Folder counts (for Series, Season, MusicAlbum, Folder) ---
+    if item.media_type.is_folder() {
+        if let Ok(counts) = rustyfin_db::repo_media::count_items_by_type(pool, item.id).await {
+            let mut song_count: i32 = 0;
+            let mut album_count: i32 = 0;
+            let mut movie_count: i32 = 0;
+            let mut series_count: i32 = 0;
+            let mut episode_count: i32 = 0;
+            let mut child_count: i32 = 0;
+
+            for (media_type, count) in counts {
+                let c = count as i32;
+                match media_type.as_str() {
+                    "Audio" => song_count += c,
+                    "MusicAlbum" => album_count += c,
+                    "Movie" => movie_count += c,
+                    "Series" => series_count += c,
+                    "Episode" => episode_count += c,
+                    _ => {}
+                }
+                child_count += c;
+            }
+
+            item.song_count = if song_count > 0 {
+                Some(song_count)
+            } else {
+                None
+            };
+            item.album_count = if album_count > 0 {
+                Some(album_count)
+            } else {
+                None
+            };
+            item.movie_count = if movie_count > 0 {
+                Some(movie_count)
+            } else {
+                None
+            };
+            item.series_count = if series_count > 0 {
+                Some(series_count)
+            } else {
+                None
+            };
+            item.episode_count = if episode_count > 0 {
+                Some(episode_count)
+            } else {
+                None
+            };
+            item.child_count = if child_count > 0 {
+                Some(child_count)
+            } else {
+                None
+            };
+        }
+        // Display order for folders
+        item.display_order = Some("SortName".to_string());
+    }
+
+    // --- Parent image tags for non-episode items ---
+    if item.media_type != rustyfin_model::media::MediaType::Episode
+        && let Some(parent_id) = item.parent_id
+        && let Ok(Some(parent)) = rustyfin_db::repo_media::get_parent_item(pool, parent_id).await
+    {
+        if item.parent_primary_image_tag.is_none()
+            && let Some(tag) = parent
+                .image_tags
+                .get(&rustyfin_model::image::ImageType::Primary)
+        {
+            item.parent_primary_image_tag = Some(tag.clone());
+            item.parent_primary_image_item_id = Some(parent.id);
+        }
+        if item.parent_thumb_image_tag.is_none()
+            && let Some(tag) = parent
+                .image_tags
+                .get(&rustyfin_model::image::ImageType::Thumb)
+        {
+            item.parent_thumb_image_tag = Some(tag.clone());
+            item.parent_thumb_item_id = Some(parent.id);
+        }
+        if item.parent_art_image_tag.is_none()
+            && let Some(tag) = parent
+                .image_tags
+                .get(&rustyfin_model::image::ImageType::Art)
+        {
+            item.parent_art_image_tag = Some(tag.clone());
+            item.parent_art_item_id = Some(parent.id);
+        }
+        if item.parent_logo_image_tag.is_none()
+            && let Some(tag) = parent
+                .image_tags
+                .get(&rustyfin_model::image::ImageType::Logo)
+        {
+            item.parent_logo_image_tag = Some(tag.clone());
+            item.parent_logo_item_id = Some(parent.id);
+        }
+        if item.parent_backdrop_image_tags.is_empty() && !parent.backdrop_image_tags.is_empty() {
+            item.parent_backdrop_image_tags = parent.backdrop_image_tags.clone();
+            item.parent_backdrop_item_id = Some(parent.id);
+        }
+    }
+
+    // --- Series branding for Seasons ---
+    if item.media_type == rustyfin_model::media::MediaType::Season
+        && let Some(series_id) = item.parent_id
+        && let Ok(Some(series)) = rustyfin_db::repo_media::get_parent_item(pool, series_id).await
+    {
+        item.series_name = Some(series.name.clone());
+        item.series_id = Some(series.id);
+        if let Some(tag) = series
+            .image_tags
+            .get(&rustyfin_model::image::ImageType::Primary)
+        {
+            item.series_primary_image_tag = Some(tag.clone());
+        }
+        if let Some(tag) = series
+            .image_tags
+            .get(&rustyfin_model::image::ImageType::Thumb)
+        {
+            item.series_thumb_image_tag = Some(tag.clone());
+        }
+        // Parent image tags from series
+        if let Some(tag) = series
+            .image_tags
+            .get(&rustyfin_model::image::ImageType::Primary)
+        {
+            item.parent_primary_image_tag = Some(tag.clone());
+            item.parent_primary_image_item_id = Some(series.id);
+        }
+        if let Some(tag) = series
+            .image_tags
+            .get(&rustyfin_model::image::ImageType::Thumb)
+        {
+            item.parent_thumb_image_tag = Some(tag.clone());
+            item.parent_thumb_item_id = Some(series.id);
+        }
+        if let Some(tag) = series
+            .image_tags
+            .get(&rustyfin_model::image::ImageType::Art)
+        {
+            item.parent_art_image_tag = Some(tag.clone());
+            item.parent_art_item_id = Some(series.id);
+        }
+        if let Some(tag) = series
+            .image_tags
+            .get(&rustyfin_model::image::ImageType::Logo)
+        {
+            item.parent_logo_image_tag = Some(tag.clone());
+            item.parent_logo_item_id = Some(series.id);
+        }
+        if !series.backdrop_image_tags.is_empty() {
+            item.parent_backdrop_image_tags = series.backdrop_image_tags.clone();
+            item.parent_backdrop_item_id = Some(series.id);
+        }
+    }
+
+    // --- GenreItems from genres ---
+    if item.genre_items.is_empty() && !item.genres.is_empty() {
+        for genre in &item.genres {
+            item.genre_items.push(rustyfin_model::media::GenreItem {
+                name: genre.clone(),
+                id: genre.to_lowercase().replace(' ', "-"),
+            });
+        }
+    }
+
+    // --- DateLastMediaAdded for folders ---
+    if item.media_type.is_folder()
+        && let Ok(Some(last_added)) =
+            rustyfin_db::repo_media::get_last_media_added(pool, item.id).await
+    {
+        item.date_last_media_added = Some(last_added);
+    }
+}
+
+/// Batch-enrich multiple MediaItems using batched DB queries.
+/// Fetches chapters, trickplay, user_data, parent items, folder counts, trailers (from TMDb),
+/// and blurhashes in bulk to avoid N+1 query problems.
+/// If `skip_blurhash` is true, blurhash computation is skipped (useful for list views).
+#[allow(clippy::too_many_arguments)]
+async fn enrich_items(
+    pool: &SqlitePool,
+    server_id: &str,
+    user_id: Option<Uuid>,
+    items: &mut [MediaItem],
+    http_client: &reqwest::Client,
+    tmdb_api_key: Option<&str>,
+    data_dir: &std::path::Path,
+    skip_blurhash: bool,
+) {
+    if items.is_empty() {
+        return;
+    }
+
+    // Collect all item IDs for batch queries
+    let item_ids: Vec<Uuid> = items.iter().map(|item| item.id).collect();
+
+    // Batch query 1: All chapters for all items
+    let chapters_map = rustyfin_db::repo_chapter::get_chapters_batch(pool, &item_ids)
+        .await
+        .unwrap_or_default();
+
+    // Batch query 2: All trickplay info for all items
+    let trickplay_map = rustyfin_db::repo_trickplay::get_trickplay_batch(pool, &item_ids)
+        .await
+        .unwrap_or_default();
+
+    // Batch query 3: All user item data for all items (if user_id provided)
+    let user_data_map = if let Some(uid) = user_id {
+        rustyfin_db::repo_playback::get_user_item_data_batch(pool, uid, &item_ids)
+            .await
+            .unwrap_or_default()
+    } else {
+        std::collections::HashMap::new()
+    };
+
+    // Batch query 4: Collect unique parent IDs and fetch them
+    let parent_ids: Vec<Uuid> = items
+        .iter()
+        .filter_map(|item| item.parent_id)
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    let mut parent_map = if parent_ids.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        rustyfin_db::repo_media::get_parent_items_batch(pool, &parent_ids)
+            .await
+            .unwrap_or_default()
+    };
+
+    // Batch query 5: Folder counts for folder items
+    let folder_ids: Vec<Uuid> = items
+        .iter()
+        .filter(|item| item.media_type.is_folder())
+        .map(|item| item.id)
+        .collect();
+    let folder_counts_map = if folder_ids.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        rustyfin_db::repo_media::get_folder_counts_batch(pool, &folder_ids)
+            .await
+            .unwrap_or_default()
+    };
+
+    // Batch query 6: All images for all items - populates image_tags
+    let images_map = rustyfin_db::repo_image::get_images_batch(pool, &item_ids)
+        .await
+        .unwrap_or_default();
+
+    // Batch query 7: Images for parent items too (needed for inherited image tags)
+    let parent_image_ids: Vec<Uuid> = parent_map.values().map(|p| p.id).collect();
+    let parent_images_map = if parent_image_ids.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        rustyfin_db::repo_image::get_images_batch(pool, &parent_image_ids)
+            .await
+            .unwrap_or_default()
+    };
+
+    // Batch query 8: People for all items
+    let people_map: std::collections::HashMap<String, Vec<(String, String, Option<String>)>> = {
+        let mut map: std::collections::HashMap<String, Vec<(String, String, Option<String>)>> =
+            std::collections::HashMap::new();
+        for chunk_ids in item_ids.chunks(100) {
+            let placeholders: Vec<String> =
+                (1..=chunk_ids.len()).map(|i| format!("?{}", i)).collect();
+            let query = format!(
+                "SELECT ip.item_id, p.id, p.name, ip.role FROM item_people ip JOIN people p ON p.id = ip.person_id WHERE ip.item_id IN ({})",
+                placeholders.join(",")
+            );
+            let mut query_builder = sqlx::query_as::<_, (String, String, String, Option<String>)>(
+                sqlx::AssertSqlSafe(query.clone()),
+            );
+            for id in chunk_ids {
+                query_builder = query_builder.bind(id.to_string());
+            }
+            if let Ok(rows) = query_builder.fetch_all(pool).await {
+                for (item_id, pid, pname, role) in rows {
+                    map.entry(item_id).or_default().push((pid, pname, role));
+                }
+            }
+        }
+        map
+    };
+
+    // Populate image_tags on parent items
+    for parent_item in parent_map.values_mut() {
+        if let Some(images) = parent_images_map.get(&parent_item.id.to_string()) {
+            let mut tags: std::collections::HashMap<rustyfin_model::image::ImageType, String> =
+                std::collections::HashMap::new();
+            let mut backdrop_tags: Vec<String> = Vec::new();
+            for img in images {
+                let tag = format!("{}_{}", img.image_type.as_str(), img.image_index);
+                if img.image_type == rustyfin_model::image::ImageType::Backdrop {
+                    backdrop_tags.push(tag.clone());
+                }
+                tags.entry(img.image_type).or_insert_with(|| tag);
+            }
+            parent_item.image_tags = tags;
+            parent_item.backdrop_image_tags = backdrop_tags;
+        }
+    }
+
+    // Enrich each item from batch results
+    for item in items.iter_mut() {
+        // ServerId
+        item.server_id = Some(server_id.to_string());
+
+        // Type flags
+        item.is_movie = item.media_type == rustyfin_model::media::MediaType::Movie;
+        item.is_series = item.media_type == rustyfin_model::media::MediaType::Series;
+        item.is_kids = item.official_rating.as_deref() == Some("G")
+            || item.official_rating.as_deref() == Some("PG");
+        item.is_live = false;
+
+        // SourceType & EnableMediaSourceDisplay
+        item.source_type = Some("Default".to_string());
+        item.enable_media_source_display = matches!(
+            item.media_type,
+            rustyfin_model::media::MediaType::Movie
+                | rustyfin_model::media::MediaType::Episode
+                | rustyfin_model::media::MediaType::Audio
+        );
+
+        // ProviderIds from tmdb_id/tvdb_id
+        let mut provider_ids = rustyfin_model::media::ProviderIds::default();
+        if let Some(tmdb) = item.tmdb_id {
+            provider_ids.set("tmdb".to_string(), tmdb.to_string());
+        }
+        if let Some(tvdb) = item.tvdb_id {
+            provider_ids.set("tvdb".to_string(), tvdb.to_string());
+        }
+        item.provider_ids = provider_ids;
+
+        // ExternalUrls from provider_ids
+        let mut external_urls = Vec::new();
+        if let Some(tmdb) = item.tmdb_id {
+            let kind = if item.is_movie { "movie" } else { "tv" };
+            external_urls.push(rustyfin_model::media::ExternalUrl {
+                name: "TMDb".to_string(),
+                url: format!("https://www.themoviedb.org/{}/{}", kind, tmdb),
+            });
+        }
+        if let Some(tvdb) = item.tvdb_id {
+            external_urls.push(rustyfin_model::media::ExternalUrl {
+                name: "TheTVDB".to_string(),
+                url: format!("https://www.thetvdb.com/?id={}", tvdb),
+            });
+        }
+        item.external_urls = external_urls;
+
+        // RemoteTrailers from TMDb API (fetched below in batch)
+        // Placeholder - will be filled after the loop
+        item.remote_trailers = Vec::new();
+        item.trailer_count = Some(0);
+        item.local_trailer_count = Some(0);
+
+        // ImageTags from batch-loaded images
+        if let Some(images) = images_map.get(&item.id.to_string()) {
+            let mut tags: std::collections::HashMap<rustyfin_model::image::ImageType, String> =
+                std::collections::HashMap::new();
+            let mut backdrop_tags: Vec<String> = Vec::new();
+            for img in images {
+                let tag = format!("{}_{}", img.image_type.as_str(), img.image_index);
+                if img.image_type == rustyfin_model::image::ImageType::Backdrop {
+                    backdrop_tags.push(tag.clone());
+                }
+                tags.entry(img.image_type).or_insert_with(|| tag);
+            }
+            item.image_tags = tags;
+            item.backdrop_image_tags = backdrop_tags;
+        }
+
+        // ImageBlurHashes from local images (skip for list views to avoid disk I/O)
+        if !skip_blurhash
+            && let Ok(images) = rustyfin_db::repo_image::get_images_for_item(pool, item.id).await
+        {
+            for img in images {
+                if !img.path.starts_with("http://") && !img.path.starts_with("https://") {
+                    let full_path = data_dir.join(&img.path);
+                    if let Ok(Some(hash)) = tokio::time::timeout(
+                        std::time::Duration::from_millis(500),
+                        rustyfin_core::image_proxy::compute_blurhash(
+                            full_path.to_str().unwrap_or(""),
+                        ),
+                    )
+                    .await
+                    {
+                        let key = format!("{}-{}", img.image_type.as_str(), img.image_index);
+                        item.image_blur_hashes.insert(key, hash);
+                    }
+                }
+            }
+        }
+
+        // OriginalTitle
+        if item.original_title.is_none() {
+            item.original_title = Some(item.name.clone());
+        }
+
+        // Chapters from batch map
+        if let Some(chapters) = chapters_map.get(&item.id.to_string()) {
+            item.chapters = chapters
+                .iter()
+                .map(|c| rustyfin_model::media::ChapterInfo {
+                    start_ticks: c.start_position_ticks,
+                    name: c.name.clone(),
+                    image: c.image_path.clone(),
+                    image_date_modified: None,
+                })
+                .collect();
+            item.chapter_count = item.chapters.len() as i32;
+        }
+
+        // ScreenshotImageTags from trickplay batch map
+        if let Some(trickplay) = trickplay_map.get(&item.id.to_string()) {
+            item.screenshot_image_tags = vec![format!("{}-{}", item.id, trickplay.width)];
+        }
+
+        // Etag from date_created
+        item.etag = Some(item.date_created.to_rfc3339());
+
+        // CompletionPercentage from user_data batch map
+        if let Some(user_data) = user_data_map.get(&item.id.to_string()) {
+            item.user_data = Some(user_data.clone());
+            if let Some(runtime) = item.runtime_ticks
+                && runtime > 0
+            {
+                let pos = user_data.playback_position_ticks.max(0) as f64;
+                let run = runtime as f64;
+                if user_data.played {
+                    item.completion_percentage = Some(100.0);
+                } else {
+                    item.completion_percentage = Some((pos / run * 100.0).min(100.0));
+                }
+            }
+        }
+
+        // Media source count and streams
+        if !item.media_sources.is_empty() {
+            item.media_source_count = item.media_sources.len() as i32;
+            if let Some(source) = item.media_sources.first() {
+                item.media_streams = source.media_streams.clone();
+            }
+        }
+
+        // Display preferences ID
+        item.display_preferences_id = Some(item.id.to_string());
+
+        // Play access
+        item.play_access = Some("Full".to_string());
+
+        // --- Episode-specific fields ---
+        if item.media_type == rustyfin_model::media::MediaType::Episode {
+            if let (Some(season), Some(ep)) = (item.parent_index_number, item.index_number) {
+                item.number = Some(format!("{:02}x{:02}", season, ep));
+            }
+            if let Some(season) = item.parent_index_number {
+                item.episode_title = Some(format!(
+                    "Season {} - Episode {} - {}",
+                    season,
+                    item.index_number.unwrap_or(0),
+                    item.name
+                ));
+            }
+            // Series info from grandparent
+            if let Some(parent_id) = item.parent_id {
+                if let Some(season_item) = parent_map.get(&parent_id.to_string()) {
+                    item.series_name = Some(season_item.name.clone());
+                    item.series_id = season_item.parent_id;
+                    item.season_name = Some(season_item.name.clone());
+                    if let Some(series_id) = season_item.parent_id
+                        && let Some(series_item) = parent_map.get(&series_id.to_string())
+                    {
+                        item.series_name = Some(series_item.name.clone());
+                        item.series_id = Some(series_item.id);
+                        if let Some(tag) = series_item
+                            .image_tags
+                            .get(&rustyfin_model::image::ImageType::Primary)
+                        {
+                            item.series_primary_image_tag = Some(tag.clone());
+                        }
+                        if let Some(tag) = series_item
+                            .image_tags
+                            .get(&rustyfin_model::image::ImageType::Thumb)
+                        {
+                            item.series_thumb_image_tag = Some(tag.clone());
+                        }
+                    }
+                }
+                // Parent image tags from Season
+                if let Some(parent) = parent_map.get(&parent_id.to_string()) {
+                    if let Some(tag) = parent
+                        .image_tags
+                        .get(&rustyfin_model::image::ImageType::Primary)
+                    {
+                        item.parent_primary_image_tag = Some(tag.clone());
+                        item.parent_primary_image_item_id = Some(parent.id);
+                    }
+                    if let Some(tag) = parent
+                        .image_tags
+                        .get(&rustyfin_model::image::ImageType::Thumb)
+                    {
+                        item.parent_thumb_image_tag = Some(tag.clone());
+                        item.parent_thumb_item_id = Some(parent.id);
+                    }
+                    if let Some(tag) = parent
+                        .image_tags
+                        .get(&rustyfin_model::image::ImageType::Art)
+                    {
+                        item.parent_art_image_tag = Some(tag.clone());
+                        item.parent_art_item_id = Some(parent.id);
+                    }
+                    if let Some(tag) = parent
+                        .image_tags
+                        .get(&rustyfin_model::image::ImageType::Logo)
+                    {
+                        item.parent_logo_image_tag = Some(tag.clone());
+                        item.parent_logo_item_id = Some(parent.id);
+                    }
+                    if !parent.backdrop_image_tags.is_empty() {
+                        item.parent_backdrop_image_tags = parent.backdrop_image_tags.clone();
+                        item.parent_backdrop_item_id = Some(parent.id);
+                    }
+                }
+            }
+        }
+
+        // --- Audio-specific fields ---
+        if item.media_type == rustyfin_model::media::MediaType::Audio
+            && let Some(parent_id) = item.parent_id
+            && let Some(parent) = parent_map.get(&parent_id.to_string())
+            && parent.media_type == rustyfin_model::media::MediaType::MusicAlbum
+        {
+            item.album = Some(parent.name.clone());
+            item.album_id = Some(parent.id);
+            item.album_artist = Some(parent.name.clone());
+            if let Some(tag) = parent
+                .image_tags
+                .get(&rustyfin_model::image::ImageType::Primary)
+            {
+                item.parent_primary_image_tag = Some(tag.clone());
+                item.parent_primary_image_item_id = Some(parent.id);
+            }
+            if let Some(tag) = parent
+                .image_tags
+                .get(&rustyfin_model::image::ImageType::Art)
+            {
+                item.parent_art_image_tag = Some(tag.clone());
+                item.parent_art_item_id = Some(parent.id);
+            }
+        }
+
+        // --- Folder counts ---
+        if item.media_type.is_folder() {
+            if let Some(counts) = folder_counts_map.get(&item.id.to_string()) {
+                let mut song_count: i32 = 0;
+                let mut album_count: i32 = 0;
+                let mut movie_count: i32 = 0;
+                let mut series_count: i32 = 0;
+                let mut episode_count: i32 = 0;
+                let mut child_count: i32 = 0;
+                for (media_type, count) in counts {
+                    let c = *count as i32;
+                    match media_type.as_str() {
+                        "Audio" => song_count += c,
+                        "MusicAlbum" => album_count += c,
+                        "Movie" => movie_count += c,
+                        "Series" => series_count += c,
+                        "Episode" => episode_count += c,
+                        _ => {}
+                    }
+                    child_count += c;
+                }
+                item.song_count = if song_count > 0 {
+                    Some(song_count)
+                } else {
+                    None
+                };
+                item.album_count = if album_count > 0 {
+                    Some(album_count)
+                } else {
+                    None
+                };
+                item.movie_count = if movie_count > 0 {
+                    Some(movie_count)
+                } else {
+                    None
+                };
+                item.series_count = if series_count > 0 {
+                    Some(series_count)
+                } else {
+                    None
+                };
+                item.episode_count = if episode_count > 0 {
+                    Some(episode_count)
+                } else {
+                    None
+                };
+                item.child_count = if child_count > 0 {
+                    Some(child_count)
+                } else {
+                    None
+                };
+            }
+            item.display_order = Some("SortName".to_string());
+        }
+
+        // --- Parent image tags for non-episode items ---
+        if item.media_type != rustyfin_model::media::MediaType::Episode
+            && let Some(parent_id) = item.parent_id
+            && let Some(parent) = parent_map.get(&parent_id.to_string())
+        {
+            if item.parent_primary_image_tag.is_none()
+                && let Some(tag) = parent
+                    .image_tags
+                    .get(&rustyfin_model::image::ImageType::Primary)
+            {
+                item.parent_primary_image_tag = Some(tag.clone());
+                item.parent_primary_image_item_id = Some(parent.id);
+            }
+            if item.parent_thumb_image_tag.is_none()
+                && let Some(tag) = parent
+                    .image_tags
+                    .get(&rustyfin_model::image::ImageType::Thumb)
+            {
+                item.parent_thumb_image_tag = Some(tag.clone());
+                item.parent_thumb_item_id = Some(parent.id);
+            }
+            if item.parent_art_image_tag.is_none()
+                && let Some(tag) = parent
+                    .image_tags
+                    .get(&rustyfin_model::image::ImageType::Art)
+            {
+                item.parent_art_image_tag = Some(tag.clone());
+                item.parent_art_item_id = Some(parent.id);
+            }
+            if item.parent_logo_image_tag.is_none()
+                && let Some(tag) = parent
+                    .image_tags
+                    .get(&rustyfin_model::image::ImageType::Logo)
+            {
+                item.parent_logo_image_tag = Some(tag.clone());
+                item.parent_logo_item_id = Some(parent.id);
+            }
+            if item.parent_backdrop_image_tags.is_empty() && !parent.backdrop_image_tags.is_empty()
+            {
+                item.parent_backdrop_image_tags = parent.backdrop_image_tags.clone();
+                item.parent_backdrop_item_id = Some(parent.id);
+            }
+        }
+
+        // --- Series branding for Seasons ---
+        if item.media_type == rustyfin_model::media::MediaType::Season
+            && let Some(series_id) = item.parent_id
+            && let Some(series) = parent_map.get(&series_id.to_string())
+        {
+            item.series_name = Some(series.name.clone());
+            item.series_id = Some(series.id);
+            if let Some(tag) = series
+                .image_tags
+                .get(&rustyfin_model::image::ImageType::Primary)
+            {
+                item.series_primary_image_tag = Some(tag.clone());
+            }
+            if let Some(tag) = series
+                .image_tags
+                .get(&rustyfin_model::image::ImageType::Thumb)
+            {
+                item.series_thumb_image_tag = Some(tag.clone());
+            }
+            if let Some(tag) = series
+                .image_tags
+                .get(&rustyfin_model::image::ImageType::Primary)
+            {
+                item.parent_primary_image_tag = Some(tag.clone());
+                item.parent_primary_image_item_id = Some(series.id);
+            }
+            if let Some(tag) = series
+                .image_tags
+                .get(&rustyfin_model::image::ImageType::Thumb)
+            {
+                item.parent_thumb_image_tag = Some(tag.clone());
+                item.parent_thumb_item_id = Some(series.id);
+            }
+            if let Some(tag) = series
+                .image_tags
+                .get(&rustyfin_model::image::ImageType::Art)
+            {
+                item.parent_art_image_tag = Some(tag.clone());
+                item.parent_art_item_id = Some(series.id);
+            }
+            if let Some(tag) = series
+                .image_tags
+                .get(&rustyfin_model::image::ImageType::Logo)
+            {
+                item.parent_logo_image_tag = Some(tag.clone());
+                item.parent_logo_item_id = Some(series.id);
+            }
+            if !series.backdrop_image_tags.is_empty() {
+                item.parent_backdrop_image_tags = series.backdrop_image_tags.clone();
+                item.parent_backdrop_item_id = Some(series.id);
+            }
+        }
+
+        // --- GenreItems from genres ---
+        if item.genre_items.is_empty() && !item.genres.is_empty() {
+            for genre in &item.genres {
+                item.genre_items.push(rustyfin_model::media::GenreItem {
+                    name: genre.clone(),
+                    id: genre.to_lowercase().replace(' ', "-"),
+                });
+            }
+        }
+
+        // --- People from batch map ---
+        if item.people.is_empty()
+            && let Some(people_rows) = people_map.get(&item.id.to_string())
+        {
+            item.people = people_rows
+                .iter()
+                .map(|(pid, name, role)| rustyfin_model::media::PersonInfo {
+                    id: pid.clone(),
+                    name: name.clone(),
+                    role: role.clone(),
+                    person_type: role
+                        .as_deref()
+                        .map(|r| {
+                            if r == "Actor" || r == "Actress" {
+                                "Actor".to_string()
+                            } else {
+                                "Creator".to_string()
+                            }
+                        })
+                        .or_else(|| Some("Actor".to_string())),
+                })
+                .collect();
+            // For audio items, also populate artists
+            if item.media_type == rustyfin_model::media::MediaType::Audio {
+                item.artists = item.people.clone();
+                item.album_artists = item.people.clone();
+            }
+        }
+    }
+
+    // Batch fetch trailers from TMDb API for items with tmdb_id
+    if let Some(api_key) = tmdb_api_key {
+        let trailer_items: Vec<(usize, i64, bool)> = items
+            .iter()
+            .enumerate()
+            .filter_map(|(i, item)| item.tmdb_id.map(|tmdb| (i, tmdb, item.is_movie)))
+            .collect();
+
+        for (idx, tmdb_id, is_movie) in trailer_items {
+            let kind = if is_movie { "movie" } else { "tv" };
+            let trailers =
+                rustyfin_core::provider_tmdb::get_trailers(http_client, api_key, kind, tmdb_id)
+                    .await;
+            let item = &mut items[idx];
+            item.remote_trailers = trailers
+                .into_iter()
+                .map(|(name, url)| rustyfin_model::media::ExternalUrl { name, url })
+                .collect();
+            item.trailer_count = Some(item.remote_trailers.len() as i32);
+        }
+    }
+}
+
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route("/Items", get(get_items))
+        .route("/Items", get(get_items).delete(delete_items))
         .route("/Items/{id}", get(get_item))
         .route("/Items/{id}", delete(delete_item))
         .route("/Items/{id}/Children", get(get_children))
@@ -66,6 +1173,29 @@ pub fn routes() -> Router<AppState> {
         .route("/Users/{userId}/Items", get(get_user_items))
         .route("/Users/{userId}/Items/Latest", get(get_user_latest))
         .route("/Users/{userId}/Items/Resume", get(get_user_resume))
+        // Additional Items endpoints
+        .route("/Items/{id}/Ancestors", get(get_ancestors))
+        .route("/Items/{id}/Collections", get(get_item_collections))
+        .route("/Items/{id}/Images/{image_type}", delete(delete_item_image))
+        .route(
+            "/Items/{id}/Images/{image_type}/{image_index}",
+            delete(delete_item_image_index),
+        )
+        .route(
+            "/Items/{id}/AlternateSources",
+            delete(delete_alternate_sources),
+        )
+        .route("/Items/{id}/Subtitles/{index}", delete(delete_subtitles))
+        .route("/Items/{id}/Attachments/{index}", get(get_attachments))
+        // User items with rating
+        .route(
+            "/Users/{userId}/Items/{itemId}/Rating",
+            delete(delete_rating),
+        )
+        // Channels
+        .route("/Channels", get(get_channels))
+        .route("/Channels/Items/Latest", get(get_channels_items_latest))
+        .route("/Channels/{channelId}/Features", get(get_channel_features))
 }
 
 #[derive(Deserialize)]
@@ -99,6 +1229,12 @@ struct ItemsQuery {
     #[serde(rename = "startIndex")]
     start_index_lower: Option<i64>,
     limit: Option<i64>,
+    name_starts_with: Option<String>,
+    #[serde(rename = "nameStartsWith")]
+    name_starts_with_lower: Option<String>,
+    name_starts_with_or_greater: Option<String>,
+    #[serde(rename = "nameStartsWithOrGreater")]
+    name_starts_with_or_greater_lower: Option<String>,
     // --- Items Query Parameters ---
     recursive: Option<bool>,
     fields: Option<String>,
@@ -229,10 +1365,23 @@ impl ItemsQuery {
         self.start_index.or(self.start_index_lower).unwrap_or(0)
     }
     fn limit(&self) -> i64 {
-        self.limit.unwrap_or(100)
+        self.limit.unwrap_or(10_000)
+    }
+    fn name_starts_with(&self) -> Option<&str> {
+        self.name_starts_with
+            .as_deref()
+            .or(self.name_starts_with_lower.as_deref())
+    }
+    fn name_starts_with_or_greater(&self) -> Option<&str> {
+        self.name_starts_with_or_greater
+            .as_deref()
+            .or(self.name_starts_with_or_greater_lower.as_deref())
     }
     fn recursive(&self) -> bool {
         self.recursive.unwrap_or(false)
+    }
+    fn fields(&self) -> Option<&str> {
+        self.fields.as_deref()
     }
     fn image_types_limit(&self) -> Option<i32> {
         self.image_types_limit.or(self.image_types_limit_lower)
@@ -371,13 +1520,14 @@ impl ItemsQuery {
 async fn get_items(
     State(state): State<AppState>,
     Query(query): Query<ItemsQuery>,
+    Extension(claims): Extension<Claims>,
 ) -> Result<Json<QueryResult>, ApiError> {
     let media_types: Option<Vec<String>> = query
         .include_item_types()
-        .map(|s| s.split(',').map(|t| format!("\"{}\"", t.trim())).collect());
+        .map(|s| s.split(',').map(|t| t.trim().to_string()).collect());
     let exclude_media_types: Option<Vec<String>> = query
         .exclude_item_types()
-        .map(|s| s.split(',').map(|t| format!("\"{}\"", t.trim())).collect());
+        .map(|s| s.split(',').map(|t| t.trim().to_string()).collect());
     let genres: Option<Vec<String>> = query
         .genres
         .as_ref()
@@ -415,12 +1565,12 @@ async fn get_items(
     let constrained_media_types: Option<Vec<String>> = if let Some(true) = query.is_movie() {
         Some(vec!["\"Movie\"".to_string()])
     } else if let Some(true) = query.is_series() {
-        Some(vec!["\"TvShow\"".to_string()])
+        Some(vec!["\"Series\"".to_string()])
     } else {
         media_types
     };
 
-    let (mut items, total) = rustyfin_db::repo_media::get_items_filtered(
+    let (items, total) = rustyfin_db::repo_media::get_items_filtered(
         &state.db_ro,
         query.parent_id(),
         query.library_id(),
@@ -429,6 +1579,8 @@ async fn get_items(
         genres.as_deref(),
         years.as_deref(),
         query.search_term(),
+        query.name_starts_with(),
+        query.name_starts_with_or_greater(),
         query.sort_by(),
         query.sort_order(),
         start_index,
@@ -448,7 +1600,38 @@ async fn get_items(
     )
     .await?;
 
-    let _ = populate_media_sources(&state.db_ro, &mut items).await;
+    // Only populate media_sources when explicitly requested via Fields parameter
+    // This significantly speeds up listing views with many items
+    let fields: Vec<&str> = query
+        .fields()
+        .map(|s| s.split(',').map(|f| f.trim()).collect::<Vec<&str>>())
+        .unwrap_or_default();
+    let need_media_sources = fields.contains(&"MediaSources");
+
+    let mut items = if need_media_sources {
+        let mut items_copy = items;
+        let _ = populate_media_sources(&state.db_ro, &mut items_copy).await;
+        items_copy
+    } else {
+        items
+    };
+
+    // Enrich items with all response fields using batch queries
+    // Skip blurhash for list views to avoid per-item disk I/O
+    let config = state.config.read().await;
+    let tmdb_key = config.tmdb_api_key.as_deref();
+    enrich_items(
+        &state.db_ro,
+        &state.server_id,
+        Some(claims.sub),
+        &mut items,
+        &state.http_client,
+        tmdb_key,
+        &state.data_dir,
+        true, // skip_blurhash for list views
+    )
+    .await;
+    drop(config);
 
     Ok(Json(QueryResult {
         items,
@@ -460,6 +1643,7 @@ async fn get_items(
 async fn get_item(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    Extension(claims): Extension<Claims>,
 ) -> Result<Json<MediaItem>, ApiError> {
     let id_str = id.to_string();
     // Check cache first
@@ -472,6 +1656,20 @@ async fn get_item(
         .await?
         .ok_or(ApiError::NotFound("item not found".into()))?;
     let _ = populate_media_source_single(&state.db_ro, &mut item).await;
+    // Enrich with all response fields
+    let config = state.config.read().await;
+    let tmdb_key = config.tmdb_api_key.as_deref();
+    enrich_item(
+        &state.db_ro,
+        &state.server_id,
+        Some(claims.sub),
+        &mut item,
+        &state.http_client,
+        tmdb_key,
+        &state.data_dir,
+    )
+    .await;
+    drop(config);
     // Cache the result
     if let Ok(json) = serde_json::to_value(&item) {
         state.cache.item_details.insert(id_str, json);
@@ -493,12 +1691,46 @@ async fn delete_item(
 async fn get_children(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    Query(query): Query<ItemsQuery>,
+    Extension(claims): Extension<Claims>,
 ) -> Result<Json<QueryResult>, ApiError> {
-    let mut children = rustyfin_db::repo_media::get_children(&state.db_ro, id).await?;
+    let children = rustyfin_db::repo_media::get_children(&state.db_ro, id).await?;
     let total = children.len() as i64;
-    let _ = populate_media_sources(&state.db_ro, &mut children).await;
+
+    // Only populate media_sources when explicitly requested
+    let fields: Vec<&str> = query
+        .fields()
+        .map(|s| s.split(',').map(|f| f.trim()).collect::<Vec<&str>>())
+        .unwrap_or_default();
+    let need_media_sources = fields.contains(&"MediaSources");
+
+    let mut items = if need_media_sources {
+        let mut children_copy = children;
+        let _ = populate_media_sources(&state.db_ro, &mut children_copy).await;
+        children_copy
+    } else {
+        children
+    };
+
+    // Enrich items using batch queries
+    // Skip blurhash for list views to avoid per-item disk I/O
+    let config = state.config.read().await;
+    let tmdb_key = config.tmdb_api_key.as_deref();
+    enrich_items(
+        &state.db_ro,
+        &state.server_id,
+        Some(claims.sub),
+        &mut items,
+        &state.http_client,
+        tmdb_key,
+        &state.data_dir,
+        true, // skip_blurhash for list views
+    )
+    .await;
+    drop(config);
+
     Ok(Json(QueryResult {
-        items: children,
+        items,
         total_record_count: total,
         start_index: 0,
     }))
@@ -508,13 +1740,92 @@ async fn get_similar(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Query(query): Query<LimitQuery>,
+    Extension(claims): Extension<Claims>,
 ) -> Result<Json<QueryResult>, ApiError> {
     let item = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, id)
         .await?
         .ok_or(ApiError::NotFound("item not found".into()))?;
     let limit = query.limit.unwrap_or(12);
-    let similar = rustyfin_db::repo_media::get_similar_items(&state.db_ro, &item, limit).await?;
+
+    let config = state.config.read().await;
+    let tmdb_key = config.tmdb_api_key.as_deref();
+    let mut similar: Vec<MediaItem> = Vec::new();
+
+    // Priority 1: TMDb Similar API (highest weight)
+    if let (Some(tmdb_id), Some(api_key)) = (item.tmdb_id, tmdb_key) {
+        let media_type = if item.is_movie { "movie" } else { "tv" };
+        let tmdb_similar = rustyfin_core::provider_tmdb::get_similar(
+            &state.http_client,
+            api_key,
+            media_type,
+            tmdb_id,
+        )
+        .await;
+
+        // For each TMDb similar item, find the local item by tmdb_id
+        for (similar_tmdb_id, _name) in tmdb_similar {
+            if similar.len() >= limit as usize {
+                break;
+            }
+            // Find local item by tmdb_id
+            let local_item: Option<MediaItem> =
+                sqlx::query_as::<_, rustyfin_db::repo_media::MediaItemRow>(
+                    "SELECT * FROM media_items WHERE tmdb_id = ? AND media_type = ? AND id != ?",
+                )
+                .bind(similar_tmdb_id)
+                .bind(item.media_type.item_kind().to_string())
+                .bind(item.id.to_string())
+                .fetch_optional(&state.db_ro)
+                .await
+                .ok()
+                .flatten()
+                .map(|row| row.into());
+
+            if let Some(local_item) = local_item {
+                similar.push(local_item);
+            }
+        }
+    }
+
+    // Priority 2: Local algorithm fills remaining slots
+    if similar.len() < limit as usize {
+        let remaining = limit - similar.len() as i64;
+        let local_similar =
+            rustyfin_db::repo_media::get_similar_items(&state.db_ro, &item, remaining).await?;
+
+        // Filter out items already added from TMDb
+        let existing_ids: std::collections::HashSet<String> =
+            similar.iter().map(|i| i.id.to_string()).collect();
+        for local_item in local_similar {
+            if similar.len() >= limit as usize {
+                break;
+            }
+            if !existing_ids.contains(&local_item.id.to_string()) {
+                similar.push(local_item);
+            }
+        }
+    }
+
+    drop(config);
     let total = similar.len() as i64;
+
+    // Enrich similar items using batch queries
+    // Skip blurhash for list views to avoid per-item disk I/O
+    let config = state.config.read().await;
+    let tmdb_key = config.tmdb_api_key.as_deref();
+    enrich_items(
+        &state.db_ro,
+        &state.server_id,
+        Some(claims.sub),
+        &mut similar,
+        &state.http_client,
+        tmdb_key,
+        &state.data_dir,
+        true, // skip_blurhash for list views
+    )
+    .await;
+    drop(config);
+
     Ok(Json(QueryResult {
         items: similar,
         total_record_count: total,
@@ -543,6 +1854,7 @@ struct LatestQuery {
 async fn get_latest(
     State(state): State<AppState>,
     Query(query): Query<LatestQuery>,
+    Extension(claims): Extension<Claims>,
 ) -> Result<Json<Vec<MediaItem>>, ApiError> {
     let limit = query.limit.unwrap_or(20);
     let media_type = query
@@ -558,18 +1870,49 @@ async fn get_latest(
         library_id,
     )
     .await?;
-    let _ = populate_media_sources(&state.db_ro, &mut items).await;
+    // Enrich latest items using batch queries
+    // Skip blurhash for list views to avoid per-item disk I/O
+    let config = state.config.read().await;
+    let tmdb_key = config.tmdb_api_key.as_deref();
+    enrich_items(
+        &state.db_ro,
+        &state.server_id,
+        Some(claims.sub),
+        &mut items,
+        &state.http_client,
+        tmdb_key,
+        &state.data_dir,
+        true, // skip_blurhash for list views
+    )
+    .await;
+    drop(config);
     Ok(Json(items))
 }
 
 async fn get_resume(
     State(state): State<AppState>,
     Query(query): Query<ResumeQuery>,
+    Extension(claims): Extension<Claims>,
 ) -> Result<Json<QueryResult>, ApiError> {
     let limit = query.limit.unwrap_or(10);
     let mut items = rustyfin_db::repo_media::get_resume_items(&state.db_ro, limit).await?;
     let total = items.len() as i64;
-    let _ = populate_media_sources(&state.db_ro, &mut items).await;
+    // Enrich resume items using batch queries
+    // Skip blurhash for list views to avoid per-item disk I/O
+    let config = state.config.read().await;
+    let tmdb_key = config.tmdb_api_key.as_deref();
+    enrich_items(
+        &state.db_ro,
+        &state.server_id,
+        Some(claims.sub),
+        &mut items,
+        &state.http_client,
+        tmdb_key,
+        &state.data_dir,
+        true, // skip_blurhash for list views
+    )
+    .await;
+    drop(config);
     Ok(Json(QueryResult {
         items,
         total_record_count: total,
@@ -622,28 +1965,47 @@ async fn get_user_items(
     State(state): State<AppState>,
     Path(_user_id): Path<Uuid>,
     Query(query): Query<ItemsQuery>,
+    Extension(claims): Extension<Claims>,
 ) -> Result<Json<QueryResult>, ApiError> {
-    get_items(State(state), Query(query)).await
+    // Delegate to get_items with the user's claims
+    get_items(State(state), Query(query), Extension(claims)).await
 }
 
 async fn get_user_latest(
     State(state): State<AppState>,
     Path(_user_id): Path<Uuid>,
     Query(query): Query<LatestQuery>,
+    Extension(claims): Extension<Claims>,
 ) -> Result<Json<Vec<MediaItem>>, ApiError> {
-    get_latest(State(state), Query(query)).await
+    get_latest(State(state), Query(query), Extension(claims)).await
 }
 
 async fn get_user_resume(
     State(state): State<AppState>,
     Path(user_id): Path<Uuid>,
     Query(query): Query<ResumeQuery>,
+    Extension(claims): Extension<Claims>,
 ) -> Result<Json<QueryResult>, ApiError> {
     let limit = query.limit.unwrap_or(10);
     let mut items =
         rustyfin_db::repo_media::get_user_resume_items(&state.db_ro, user_id, limit).await?;
     let total = items.len() as i64;
-    let _ = populate_media_sources(&state.db_ro, &mut items).await;
+    // Enrich user resume items using batch queries
+    // Skip blurhash for list views to avoid per-item disk I/O
+    let config = state.config.read().await;
+    let tmdb_key = config.tmdb_api_key.as_deref();
+    enrich_items(
+        &state.db_ro,
+        &state.server_id,
+        Some(claims.sub),
+        &mut items,
+        &state.http_client,
+        tmdb_key,
+        &state.data_dir,
+        true, // skip_blurhash for list views
+    )
+    .await;
+    drop(config);
     Ok(Json(QueryResult {
         items,
         total_record_count: total,
@@ -676,4 +2038,150 @@ async fn get_trickplay_preview(
         }
         None => Err(ApiError::NotFound("Trickplay not available".to_string())),
     }
+}
+
+/// DELETE /Items - Delete multiple items
+async fn delete_items(
+    State(state): State<AppState>,
+    Query(query): Query<ItemsQuery>,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    let ids: Vec<Uuid> = if let Some(parent_id) = query.parent_id.or(query.parent_id_lower) {
+        // Delete all items under a parent
+        let items = rustyfin_db::repo_media::get_items_by_parent(&state.db_ro, parent_id).await?;
+        items.into_iter().map(|i| i.id).collect()
+    } else {
+        Vec::new()
+    };
+    for id in &ids {
+        rustyfin_db::repo_media::delete_item(&state.db, *id)
+            .await
+            .ok();
+    }
+    Ok((StatusCode::OK, Json(serde_json::json!({"Success": true}))))
+}
+
+/// GET /Items/{id}/Ancestors - Get parent chain
+async fn get_ancestors(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<QueryResult>, ApiError> {
+    let mut ancestors = Vec::new();
+    let mut current_id = id;
+    loop {
+        let item = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, current_id).await?;
+        let Some(item) = item else { break };
+        match item.parent_id {
+            Some(parent_id) => {
+                ancestors.push(item);
+                current_id = parent_id;
+            }
+            None => break,
+        }
+    }
+    ancestors.reverse();
+    let total = ancestors.len() as i64;
+    Ok(Json(QueryResult {
+        items: ancestors,
+        total_record_count: total,
+        start_index: 0,
+    }))
+}
+
+/// GET /Items/{id}/Collections - Get collections containing this item
+async fn get_item_collections(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<QueryResult>, ApiError> {
+    let collections = rustyfin_db::repo_media::get_item_collections(&state.db_ro, id).await?;
+    let total = collections.len() as i64;
+    Ok(Json(QueryResult {
+        items: collections,
+        total_record_count: total,
+        start_index: 0,
+    }))
+}
+
+/// DELETE /Items/{id}/Images/{imageType}
+async fn delete_item_image(
+    State(state): State<AppState>,
+    Path((id, _image_type)): Path<(Uuid, String)>,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    rustyfin_db::repo_media::delete_item_image(&state.db, id, &_image_type)
+        .await
+        .ok();
+    Ok((StatusCode::OK, Json(serde_json::json!({}))))
+}
+
+/// DELETE /Items/{id}/Images/{imageType}/{imageIndex}
+async fn delete_item_image_index(
+    State(state): State<AppState>,
+    Path((id, _image_type, _index)): Path<(Uuid, String, i32)>,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    rustyfin_db::repo_media::delete_item_image_index(&state.db, id, &_image_type, _index)
+        .await
+        .ok();
+    Ok((StatusCode::OK, Json(serde_json::json!({}))))
+}
+
+/// DELETE /Items/{id}/AlternateSources
+async fn delete_alternate_sources(
+    State(_state): State<AppState>,
+    Path(_id): Path<Uuid>,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    Ok((StatusCode::OK, Json(serde_json::json!({}))))
+}
+
+/// DELETE /Items/{id}/Subtitles/{index}
+async fn delete_subtitles(
+    State(_state): State<AppState>,
+    Path((_id, _index)): Path<(Uuid, i32)>,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    Ok((StatusCode::OK, Json(serde_json::json!({}))))
+}
+
+/// GET /Items/{id}/Attachments/{index}
+async fn get_attachments(
+    State(_state): State<AppState>,
+    Path((_id, _index)): Path<(Uuid, i32)>,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    Ok((StatusCode::OK, Json(serde_json::json!({}))))
+}
+
+/// DELETE /Users/{userId}/Items/{itemId}/Rating
+async fn delete_rating(
+    State(state): State<AppState>,
+    Path((_user_id, item_id)): Path<(Uuid, Uuid)>,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    rustyfin_db::repo_playback::clear_user_rating(&state.db, _user_id, item_id)
+        .await
+        .ok();
+    Ok((StatusCode::OK, Json(serde_json::json!({}))))
+}
+
+/// GET /Channels - Return empty channels list
+async fn get_channels(State(_state): State<AppState>) -> Result<Json<QueryResult>, ApiError> {
+    Ok(Json(QueryResult {
+        items: Vec::new(),
+        total_record_count: 0,
+        start_index: 0,
+    }))
+}
+
+/// GET /Channels/Items/Latest
+async fn get_channels_items_latest(
+    State(_state): State<AppState>,
+) -> Result<Json<QueryResult>, ApiError> {
+    Ok(Json(QueryResult {
+        items: Vec::new(),
+        total_record_count: 0,
+        start_index: 0,
+    }))
+}
+
+/// GET /Channels/{channelId}/Features
+async fn get_channel_features(
+    State(_state): State<AppState>,
+    Path(_channel_id): Path<Uuid>,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    Ok((StatusCode::OK, Json(serde_json::json!({}))))
 }

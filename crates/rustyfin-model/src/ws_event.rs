@@ -57,6 +57,25 @@ pub enum WsEvent {
         #[serde(rename = "Data")]
         data: CommandData,
     },
+    /// Live log message streamed to admin UI
+    LogMessage {
+        #[serde(rename = "Data")]
+        data: LogMessageData,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct LogMessageData {
+    /// Timestamp in ISO 8601
+    pub timestamp: String,
+    /// Log level: DEBUG, INFO, WARN, ERROR, TRACE
+    pub level: String,
+    /// The log message
+    pub message: String,
+    /// Target module (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

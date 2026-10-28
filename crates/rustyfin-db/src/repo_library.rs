@@ -50,6 +50,20 @@ pub async fn delete_library(pool: &SqlitePool, id: Uuid) -> Result<(), sqlx::Err
     Ok(())
 }
 
+pub async fn update_library_paths(
+    pool: &SqlitePool,
+    id: Uuid,
+    paths: &[String],
+) -> Result<(), sqlx::Error> {
+    let paths_json = serde_json::to_string(paths).unwrap_or_default();
+    sqlx::query("UPDATE libraries SET paths = ? WHERE id = ?")
+        .bind(&paths_json)
+        .bind(id.to_string())
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 #[derive(sqlx::FromRow)]
 struct LibraryRow {
     id: String,

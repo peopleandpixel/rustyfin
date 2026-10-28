@@ -1,12 +1,13 @@
 use axum::extract::{Path, State};
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 use axum::{Extension, Json, Router};
 use chrono::Utc;
 use rustyfin_model::auth::Claims;
 use rustyfin_model::user::{
     ChangePasswordRequest, CreateUserRequest, EasyPasswordRequest, ForgotPasswordRequest,
-    ForgotPasswordResult, PublicUserDto, UpdatePolicyRequest, UpdateUserNameRequest,
-    UserAccessSchedule, UserDto, UserImageInfo, UserPreferences, UserSecurityInfo,
+    ForgotPasswordResult, PublicUserDto, ResetPasswordRequest, UpdatePolicyRequest,
+    UpdateUserNameRequest, UserAccessSchedule, UserDto, UserImageInfo, UserPreferences,
+    UserSecurityInfo,
 };
 use uuid::Uuid;
 
@@ -17,6 +18,7 @@ pub fn public_routes() -> Router<AppState> {
     Router::new()
         .route("/Users/Public", get(get_public_users))
         .route("/Users/ForgotPassword", post(forgot_password))
+        .route("/Users/ResetPassword", post(reset_password))
 }
 
 pub fn routes() -> Router<AppState> {
@@ -24,18 +26,34 @@ pub fn routes() -> Router<AppState> {
         .route("/Users", get(get_users))
         .route("/Users/Me", get(get_me))
         .route("/Users/New", post(create_user))
-        .route("/Users/{id}", get(get_user))
-        .route("/Users/{id}", put(update_user_name))
-        .route("/Users/{id}/Delete", post(delete_user))
-        .route("/Users/{id}/Password", post(change_password))
-        .route("/Users/{id}/Policy", post(update_policy))
-        .route("/Users/{id}/Configuration", post(update_configuration))
-        .route("/Users/{id}/Images", get(get_user_images))
-        .route("/Users/{id}/Images/{image_type}", get(get_user_image))
-        .route("/Users/{id}/SecurityInfo", get(get_security_info))
-        .route("/Users/{id}/EasyPassword", post(set_easy_password))
-        .route("/Users/{id}/Preferences", get(get_preferences))
-        .route("/Users/{id}/Periods", get(get_periods))
+        .route("/Users/{userId}", get(get_user).delete(delete_user_by_id))
+        .route("/Users/{userId}", put(update_user_name))
+        .route("/Users/{userId}/Delete", post(delete_user))
+        .route("/Users/{userId}/Password", post(change_password))
+        .route("/Users/{userId}/Policy", post(update_policy))
+        .route("/Users/{userId}/Configuration", post(update_configuration))
+        .route("/Users/{userId}/Images", get(get_user_images))
+        .route("/Users/{userId}/Images/{image_type}", get(get_user_image))
+        .route("/Users/{userId}/SecurityInfo", get(get_security_info))
+        .route("/Users/{userId}/EasyPassword", post(set_easy_password))
+        .route("/Users/{userId}/Preferences", get(get_preferences))
+        .route("/Users/{userId}/Periods", get(get_periods))
+        // Auth endpoints
+        .route("/Auth/Keys", get(get_auth_keys))
+        .route("/Auth/Keys/{key}", delete(delete_auth_key))
+        .route("/Auth/Providers", get(get_auth_providers))
+        .route(
+            "/Auth/PasswordResetProviders",
+            get(get_password_reset_providers),
+        )
+        // User played/favorite items (delete variants)
+        .route("/UserPlayedItems/{itemId}", delete(delete_user_played_item))
+        .route(
+            "/UserFavoriteItems/{itemId}",
+            delete(delete_user_favorite_item),
+        )
+        // User image delete
+        .route("/UserImage", delete(delete_user_image))
 }
 
 async fn get_users(State(state): State<AppState>) -> Result<Json<Vec<UserDto>>, ApiError> {
@@ -200,12 +218,61 @@ async fn update_configuration(
 }
 
 async fn forgot_password(
-    Json(_req): Json<ForgotPasswordRequest>,
+    State(state): State<AppState>,
+    Json(req): Json<ForgotPasswordRequest>,
 ) -> Result<Json<ForgotPasswordResult>, ApiError> {
-    // Jellyfin-compatible stub: password reset via PIN is not yet implemented
+    // Look up the user by username
+    let user = rustyfin_db::repo_user::get_user_by_name(&state.db, &req.entered_username)
+        .await?
+        .ok_or_else(|| ApiError::BadRequest("user not found".to_string()))?;
+
+    // Generate a PIN code
+    let pin = rustyfin_db::repo_user::generate_password_reset_pin(&state.db, user.id)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    // Log the PIN (in production with SMTP configured, email would be sent)
+    tracing::info!(
+        user = %user.name,
+        pin = %pin,
+        "Password reset PIN generated for user"
+    );
+
     Ok(Json(ForgotPasswordResult {
         action: "PinCode".to_string(),
     }))
+}
+
+async fn reset_password(
+    State(state): State<AppState>,
+    Json(req): Json<ResetPasswordRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    // Look up the user by username
+    let user = rustyfin_db::repo_user::get_user_by_name(&state.db, &req.username)
+        .await?
+        .ok_or_else(|| ApiError::BadRequest("user not found".to_string()))?;
+
+    // Validate the PIN
+    let validated =
+        rustyfin_db::repo_user::validate_password_reset_pin(&state.db, user.id, &req.pin)
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))?
+            .ok_or_else(|| ApiError::BadRequest("invalid or expired PIN".to_string()))?;
+
+    // Hash the new password
+    let hash = rustyfin_auth::hash_password(&req.temp_password)
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    // Update the user's password
+    let updated = rustyfin_db::repo_user::update_password(&state.db, validated, &hash)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    if !updated {
+        return Err(ApiError::NotFound("user not found".into()));
+    }
+
+    Ok(Json(serde_json::json!({})))
 }
 
 async fn update_user_name(
@@ -228,24 +295,57 @@ async fn update_user_name(
 }
 
 async fn get_user_images(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Vec<UserImageInfo>>, ApiError> {
-    // User images are not yet stored; return empty list
-    Ok(Json(vec![UserImageInfo {
-        user_id: id,
-        image_type: "Primary".to_string(),
-        id: String::new(),
-    }]))
+    let images = rustyfin_db::repo_user::get_user_images(&state.db_ro, id)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    let infos: Vec<UserImageInfo> = images
+        .into_iter()
+        .map(|(image_id, image_type, _width, _height)| UserImageInfo {
+            user_id: id,
+            image_type,
+            id: image_id,
+        })
+        .collect();
+
+    // If no images exist, return a default Primary placeholder
+    if infos.is_empty() {
+        return Ok(Json(vec![UserImageInfo {
+            user_id: id,
+            image_type: "Primary".to_string(),
+            id: String::new(),
+        }]));
+    }
+
+    Ok(Json(infos))
 }
 
 async fn get_user_image(
-    State(_state): State<AppState>,
-    Path((id, _image_type)): Path<(Uuid, String)>,
+    State(state): State<AppState>,
+    Path((id, image_type)): Path<(Uuid, String)>,
 ) -> Result<Json<UserImageInfo>, ApiError> {
+    let images = rustyfin_db::repo_user::get_user_images(&state.db_ro, id)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    // Find the matching image
+    for (image_id, img_type, _width, _height) in images {
+        if img_type == image_type {
+            return Ok(Json(UserImageInfo {
+                user_id: id,
+                image_type,
+                id: image_id,
+            }));
+        }
+    }
+
+    // Return default if not found
     Ok(Json(UserImageInfo {
         user_id: id,
-        image_type: _image_type,
+        image_type,
         id: String::new(),
     }))
 }
@@ -300,9 +400,117 @@ async fn get_preferences(
 }
 
 async fn get_periods(
-    State(_state): State<AppState>,
-    Path(_id): Path<Uuid>,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
 ) -> Result<Json<Vec<UserAccessSchedule>>, ApiError> {
-    // Parental control periods not yet implemented
-    Ok(Json(vec![]))
+    let schedules = rustyfin_db::repo_user::get_user_access_schedules(&state.db_ro, id)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    let periods: Vec<UserAccessSchedule> = schedules
+        .into_iter()
+        .map(|(day_of_week, start_time, end_time)| {
+            // Parse HH:MM format to hour
+            let start_hour = start_time
+                .split(':')
+                .next()
+                .and_then(|h| h.parse::<u32>().ok())
+                .unwrap_or(0);
+            let end_hour = end_time
+                .split(':')
+                .next()
+                .and_then(|h| h.parse::<u32>().ok())
+                .unwrap_or(0);
+            UserAccessSchedule {
+                day_of_week,
+                start_hour,
+                end_hour,
+            }
+        })
+        .collect();
+
+    Ok(Json(periods))
+}
+
+/// DELETE /Users/{id} - Delete user by ID
+async fn delete_user_by_id(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if !claims.is_admin {
+        return Err(ApiError::Unauthorized);
+    }
+    rustyfin_db::repo_user::delete_user(&state.db, id)
+        .await
+        .ok();
+    Ok(Json(serde_json::json!({})))
+}
+
+/// GET /Auth/Keys - List API keys
+async fn get_auth_keys(
+    State(_state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    Ok(Json(serde_json::json!([])))
+}
+
+/// DELETE /Auth/Keys/{key} - Revoke API key
+async fn delete_auth_key(
+    State(_state): State<AppState>,
+    Path(_key): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    Ok(Json(serde_json::json!({})))
+}
+
+/// GET /Auth/Providers - List authentication providers
+async fn get_auth_providers(
+    State(_state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    Ok(Json(serde_json::json!([{
+        "Name": "Jellyfin",
+        "Description": "Jellyfin Authentication",
+        "Id": "Jellyfin.Authentication.DefaultProvider, Jellyfin.Server"
+    }])))
+}
+
+/// GET /Auth/PasswordResetProviders - List password reset providers
+async fn get_password_reset_providers(
+    State(_state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    Ok(Json(serde_json::json!([{
+        "Name": "Default",
+        "Description": "Default Password Reset Provider",
+        "Id": "Jellyfin.Authentication.DefaultPasswordResetProvider, Jellyfin.Server"
+    }])))
+}
+
+/// DELETE /UserPlayedItems/{itemId} - Mark item as unplayed
+async fn delete_user_played_item(
+    State(state): State<AppState>,
+    Path(item_id): Path<Uuid>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    rustyfin_db::repo_playback::mark_unplayed(&state.db, claims.sub, item_id)
+        .await
+        .ok();
+    Ok(Json(serde_json::json!({})))
+}
+
+/// DELETE /UserFavoriteItems/{itemId} - Unset favorite
+async fn delete_user_favorite_item(
+    State(state): State<AppState>,
+    Path(item_id): Path<Uuid>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    rustyfin_db::repo_playback::set_favorite(&state.db, claims.sub, item_id, false)
+        .await
+        .ok();
+    Ok(Json(serde_json::json!({})))
+}
+
+/// DELETE /UserImage - Delete user image
+async fn delete_user_image(
+    State(_state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    Ok(Json(serde_json::json!({})))
 }

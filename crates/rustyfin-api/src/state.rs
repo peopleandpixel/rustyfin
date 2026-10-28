@@ -1,5 +1,6 @@
 use crate::cache::{ApiCache, ImageCache};
 use crate::middleware::RateLimiter;
+use reqwest::Client;
 use rustyfin_core::plugin_manager::PluginManager;
 use rustyfin_core::scheduler::TaskScheduler;
 use rustyfin_core::transcode::TranscodeManager;
@@ -32,8 +33,12 @@ pub struct AppState {
     pub rate_limiter: RateLimiter,
     /// Broadcast channel for WebSocket real-time events
     pub ws_broadcast: broadcast::Sender<WsEvent>,
+    /// Watch channel to control live log verbosity level (e.g. "info", "debug", "trace")
+    pub log_level_tx: watch::Sender<String>,
     /// In-memory response caches for API endpoints
     pub cache: ApiCache,
     /// In-memory cache for image proxy results
     pub image_cache: ImageCache,
+    /// Shared HTTP client for external API calls (TMDB, etc.)
+    pub http_client: Client,
 }

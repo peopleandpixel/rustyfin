@@ -90,6 +90,21 @@ pub async fn parse_nfo(nfo_path: &Path) -> Option<ExternalMetadata> {
             runtime_ticks,
             image_urls: images,
             tmdb_id: None,
+            tvdb_id: None,
+            status: None,
+            original_language: None,
+            tagline: None,
+            production_countries: None,
+            budget: None,
+            revenue: None,
+            homepage: None,
+            end_date: None,
+            vote_count: None,
+            popularity: None,
+            studios: None,
+            directors: None,
+            writers: None,
+            imdb_id: None,
         });
     }
 

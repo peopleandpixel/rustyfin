@@ -1,5 +1,6 @@
 use sqlx::Row;
 use sqlx::SqlitePool;
+use std::collections::HashMap;
 use uuid::Uuid;
 
 use rustyfin_model::chapter::Chapter;
@@ -69,6 +70,75 @@ pub async fn save_chapters(
     }
 
     Ok(())
+}
+
+/// Batch-get chapters for multiple items in a single query.
+/// Returns a HashMap of item_id -> Vec<Chapter>.
+pub async fn get_chapters_batch(
+    pool: &SqlitePool,
+    item_ids: &[Uuid],
+) -> Result<HashMap<String, Vec<Chapter>>, sqlx::Error> {
+    if item_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let placeholders: Vec<String> = (1..=item_ids.len()).map(|i| format!("?{}", i)).collect();
+    let placeholder_str = placeholders.join(",");
+    let sql = format!(
+        "SELECT id, item_id, chapter_number, name, start_ticks, end_ticks, image_path
+         FROM chapters
+         WHERE item_id IN ({})
+         ORDER BY item_id, chapter_number ASC",
+        placeholder_str
+    );
+
+    struct ChapterRow {
+        id: String,
+        item_id: String,
+        chapter_number: i32,
+        name: String,
+        start_ticks: i64,
+        end_ticks: i64,
+        image_path: Option<String>,
+    }
+
+    impl sqlx::FromRow<'_, sqlx::sqlite::SqliteRow> for ChapterRow {
+        fn from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Self, sqlx::Error> {
+            Ok(ChapterRow {
+                id: row.try_get("id")?,
+                item_id: row.try_get("item_id")?,
+                chapter_number: row.try_get("chapter_number")?,
+                name: row.try_get("name")?,
+                start_ticks: row.try_get("start_ticks")?,
+                end_ticks: row.try_get("end_ticks")?,
+                image_path: row.try_get("image_path")?,
+            })
+        }
+    }
+
+    let mut query = sqlx::query_as::<_, ChapterRow>(sqlx::AssertSqlSafe(sql));
+    for id in item_ids {
+        query = query.bind(id.to_string());
+    }
+
+    let rows = query.fetch_all(pool).await?;
+
+    let mut map: HashMap<String, Vec<Chapter>> = HashMap::new();
+    for row in rows {
+        let chapter = Chapter {
+            id: row.id,
+            item_id: row.item_id.clone(),
+            chapter_number: row.chapter_number,
+            name: row.name,
+            start_position_ticks: row.start_ticks,
+            end_position_ticks: row.end_ticks,
+            image_path: row.image_path,
+        };
+        map.entry(chapter.item_id.clone())
+            .or_default()
+            .push(chapter);
+    }
+    Ok(map)
 }
 
 /// Delete all chapters for an item.

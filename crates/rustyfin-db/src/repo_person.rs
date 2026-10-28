@@ -88,3 +88,46 @@ pub async fn get_person_items(
 
     Ok(rows.into_iter().map(Into::into).collect())
 }
+
+/// Search persons by name, returning MediaItem objects
+pub async fn search_persons(
+    pool: &SqlitePool,
+    name: &str,
+    limit: i64,
+) -> Result<Vec<MediaItem>, sqlx::Error> {
+    let pattern = format!("%{}%", name);
+    let rows = sqlx::query_as::<_, (String, String)>(
+        "SELECT id, name FROM people WHERE name LIKE ? ORDER BY name LIMIT ?",
+    )
+    .bind(&pattern)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    let mut items = Vec::new();
+    for (id, name) in rows {
+        let item = MediaItem {
+            id: uuid::Uuid::parse_str(&id).unwrap_or_default(),
+            name: name.clone(),
+            sort_name: Some(name.to_lowercase()),
+            overview: None,
+            media_type: rustyfin_model::media::MediaType::Unknown,
+            path: String::new(),
+            parent_id: None,
+            library_id: uuid::Uuid::nil(),
+            production_year: None,
+            community_rating: None,
+            official_rating: None,
+            genres: vec![],
+            date_created: chrono::Utc::now(),
+            premiere_date: None,
+            runtime_ticks: None,
+            index_number: None,
+            parent_index_number: None,
+            media_sources: Vec::new(),
+            ..MediaItem::default_dto_fields()
+        };
+        items.push(item);
+    }
+    Ok(items)
+}

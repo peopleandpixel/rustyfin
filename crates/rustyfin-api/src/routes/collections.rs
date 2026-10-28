@@ -28,9 +28,23 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/Playlists", get(get_playlists))
         .route("/Playlists", post(create_playlist))
-        .route("/Playlists/{id}", get(get_playlist))
+        .route("/Playlists/{id}", get(get_playlist).post(update_playlist))
         .route("/Playlists/{id}", delete(delete_playlist))
-        .route("/Playlists/{id}/Items", get(get_playlist_items))
+        .route(
+            "/Playlists/{id}/Items",
+            get(get_playlist_items)
+                .post(add_items_to_playlist)
+                .delete(remove_items_from_playlist),
+        )
+        .route("/Playlists/{id}/Users", get(get_playlist_users))
+        .route(
+            "/Playlists/{id}/Users/{userId}",
+            get(get_playlist_user).delete(remove_playlist_user),
+        )
+        .route(
+            "/Collections/{id}/Items",
+            post(add_items_to_collection).delete(remove_items_from_collection),
+        )
 }
 
 async fn get_collections(
@@ -179,4 +193,147 @@ async fn get_playlist_items(
         total_record_count: count,
         start_index: 0,
     }))
+}
+
+/// POST /Playlists/{id} - Update playlist
+async fn update_playlist(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<StatusCode, ApiError> {
+    let name = body
+        .get("Name")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let media_type = body
+        .get("MediaType")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    rustyfin_db::repo_playlist::update_playlist(
+        &state.db,
+        id,
+        name.as_deref(),
+        media_type.as_deref(),
+    )
+    .await
+    .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// POST /Playlists/{id}/Items - Add items to playlist
+async fn add_items_to_playlist(
+    State(state): State<AppState>,
+    Path(playlist_id): Path<Uuid>,
+    Json(_body): Json<serde_json::Value>,
+) -> Result<StatusCode, ApiError> {
+    if let Some(ids) = _body.get("Ids").and_then(|v| v.as_array()) {
+        for id_val in ids {
+            if let Some(id_str) = id_val.as_str()
+                && let Ok(item_id) = id_str.parse::<Uuid>()
+            {
+                rustyfin_db::repo_playlist::add_item_to_playlist(&state.db, playlist_id, item_id)
+                    .await
+                    .ok();
+            }
+        }
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// DELETE /Playlists/{id}/Items - Remove items from playlist
+async fn remove_items_from_playlist(
+    State(state): State<AppState>,
+    Path(playlist_id): Path<Uuid>,
+    Json(_body): Json<serde_json::Value>,
+) -> Result<StatusCode, ApiError> {
+    if let Some(ids) = _body.get("Ids").and_then(|v| v.as_array()) {
+        for id_val in ids {
+            if let Some(id_str) = id_val.as_str()
+                && let Ok(item_id) = id_str.parse::<Uuid>()
+            {
+                rustyfin_db::repo_playlist::remove_item_from_playlist(
+                    &state.db,
+                    playlist_id,
+                    item_id,
+                )
+                .await
+                .ok();
+            }
+        }
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// GET /Playlists/{id}/Users - Get playlist users
+async fn get_playlist_users(
+    State(_state): State<AppState>,
+    Path(_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    Ok(Json(serde_json::json!([])))
+}
+
+/// GET /Playlists/{id}/Users/{userId}
+async fn get_playlist_user(
+    State(_state): State<AppState>,
+    Path((_id, _user_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    Ok(Json(serde_json::json!({})))
+}
+
+/// DELETE /Playlists/{id}/Users/{userId}
+async fn remove_playlist_user(
+    State(_state): State<AppState>,
+    Path((_id, _user_id)): Path<(Uuid, Uuid)>,
+) -> Result<StatusCode, ApiError> {
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// POST /Collections/{id}/Items - Add items to collection (bulk)
+async fn add_items_to_collection(
+    State(state): State<AppState>,
+    Path(collection_id): Path<Uuid>,
+    Json(_body): Json<serde_json::Value>,
+) -> Result<StatusCode, ApiError> {
+    if let Some(ids) = _body.get("Ids").and_then(|v| v.as_array()) {
+        for id_val in ids {
+            if let Some(id_str) = id_val.as_str()
+                && let Ok(item_id) = id_str.parse::<Uuid>()
+            {
+                rustyfin_db::repo_collection::add_item_to_collection(
+                    &state.db,
+                    collection_id,
+                    item_id,
+                )
+                .await
+                .ok();
+            }
+        }
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// DELETE /Collections/{id}/Items - Remove items from collection (bulk)
+async fn remove_items_from_collection(
+    State(state): State<AppState>,
+    Path(collection_id): Path<Uuid>,
+    Json(_body): Json<serde_json::Value>,
+) -> Result<StatusCode, ApiError> {
+    if let Some(ids) = _body.get("Ids").and_then(|v| v.as_array()) {
+        for id_val in ids {
+            if let Some(id_str) = id_val.as_str()
+                && let Ok(item_id) = id_str.parse::<Uuid>()
+            {
+                rustyfin_db::repo_collection::remove_item_from_collection(
+                    &state.db,
+                    collection_id,
+                    item_id,
+                )
+                .await
+                .ok();
+            }
+        }
+    }
+    Ok(StatusCode::NO_CONTENT)
 }

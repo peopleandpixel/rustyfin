@@ -133,3 +133,71 @@ pub async fn delete_playlist(pool: &SqlitePool, id: Uuid) -> Result<(), sqlx::Er
         .await?;
     Ok(())
 }
+
+pub async fn add_item_to_playlist(
+    pool: &SqlitePool,
+    playlist_id: Uuid,
+    item_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    let pid = playlist_id.to_string();
+    let iid = item_id.to_string();
+    sqlx::query("INSERT OR IGNORE INTO playlist_items (playlist_id, item_id) VALUES (?1, ?2)")
+        .bind(&pid)
+        .bind(&iid)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn remove_item_from_playlist(
+    pool: &SqlitePool,
+    playlist_id: Uuid,
+    item_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    let pid = playlist_id.to_string();
+    let iid = item_id.to_string();
+    sqlx::query("DELETE FROM playlist_items WHERE playlist_id = ?1 AND item_id = ?2")
+        .bind(&pid)
+        .bind(&iid)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Update a playlist's name and/or media type
+pub async fn update_playlist(
+    pool: &SqlitePool,
+    id: Uuid,
+    name: Option<&str>,
+    media_type: Option<&str>,
+) -> Result<bool, sqlx::Error> {
+    let pid = id.to_string();
+
+    match (name, media_type) {
+        (Some(n), Some(mt)) => {
+            sqlx::query("UPDATE playlists SET name = ?1, media_type = ?2 WHERE id = ?3")
+                .bind(n)
+                .bind(mt)
+                .bind(&pid)
+                .execute(pool)
+                .await?;
+        }
+        (Some(n), None) => {
+            sqlx::query("UPDATE playlists SET name = ?1 WHERE id = ?2")
+                .bind(n)
+                .bind(&pid)
+                .execute(pool)
+                .await?;
+        }
+        (None, Some(mt)) => {
+            sqlx::query("UPDATE playlists SET media_type = ?1 WHERE id = ?2")
+                .bind(mt)
+                .bind(&pid)
+                .execute(pool)
+                .await?;
+        }
+        (None, None) => {}
+    }
+
+    Ok(true)
+}

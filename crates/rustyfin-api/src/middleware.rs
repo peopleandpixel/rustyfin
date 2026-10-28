@@ -119,7 +119,12 @@ impl RateLimiter {
         });
     }
 
-    async fn check(&self, key: &str) -> bool {
+    pub async fn check(&self, key: &str) -> bool {
+        // A limit of 0 disables rate limiting
+        if self.max_requests == 0 {
+            return true;
+        }
+
         let now = Instant::now();
         let mut map = self.state.lock().await;
         let timestamps = map.entry(key.to_string()).or_default();
@@ -146,7 +151,9 @@ pub async fn rate_limit(
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|| addr.ip().to_string());
 
-    if !state.rate_limiter.check(&ip).await {
+    // Exempt loopback/localhost traffic (127.0.0.1, ::1) from aggressive client throttling
+    let is_loopback = ip == "127.0.0.1" || ip == "::1" || ip == "localhost";
+    if !is_loopback && !state.rate_limiter.check(&ip).await {
         tracing::warn!(ip = %ip, "rate limit exceeded");
         return Err(ApiError::RateLimited);
     }

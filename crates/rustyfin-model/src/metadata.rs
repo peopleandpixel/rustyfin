@@ -16,6 +16,36 @@ pub struct ExternalMetadata {
     pub image_urls: Vec<MetadataImage>,
     /// TMDb ID for the item, used to fetch cast/crew photos
     pub tmdb_id: Option<i64>,
+    /// TheTVDB ID for the item, used to fetch fanart.tv images for TV shows
+    pub tvdb_id: Option<i64>,
+    /// Series/Show status (e.g. "Returning Series", "Ended", "Released", "Canceled")
+    pub status: Option<String>,
+    /// Original language code (e.g. "en", "de", "fr")
+    pub original_language: Option<String>,
+    /// Tagline / short promotional text
+    pub tagline: Option<String>,
+    /// Production countries (ISO 3166-1 alpha-2 codes, stored as JSON array string)
+    pub production_countries: Option<Vec<String>>,
+    /// Budget in USD (movies)
+    pub budget: Option<i64>,
+    /// Revenue in USD (movies)
+    pub revenue: Option<i64>,
+    /// Official homepage URL
+    pub homepage: Option<String>,
+    /// End date for TV series
+    pub end_date: Option<String>,
+    /// Number of votes for the rating
+    pub vote_count: Option<i32>,
+    /// Popularity score from TMDb
+    pub popularity: Option<f64>,
+    /// Studios (production companies)
+    pub studios: Option<Vec<String>>,
+    /// Directors
+    pub directors: Option<Vec<String>>,
+    /// Writers
+    pub writers: Option<Vec<String>>,
+    /// IMDb ID
+    pub imdb_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

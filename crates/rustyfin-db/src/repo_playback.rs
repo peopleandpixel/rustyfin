@@ -1,5 +1,6 @@
 use rustyfin_model::playback::UserItemDataDto;
 use sqlx::SqlitePool;
+use std::collections::HashMap;
 use uuid::Uuid;
 
 pub async fn get_user_item_data(
@@ -28,6 +29,10 @@ pub async fn get_user_item_data(
             last_played_date: last,
             likes: liked,
             user_rating: rating,
+            key: None,
+            rating: None,
+            unplayed_item_count: None,
+            favorite: Some(fav),
         },
         None => UserItemDataDto {
             playback_position_ticks: 0,
@@ -37,6 +42,10 @@ pub async fn get_user_item_data(
             last_played_date: None,
             likes: None,
             user_rating: None,
+            key: None,
+            rating: None,
+            unplayed_item_count: None,
+            favorite: None,
         },
     })
 }
@@ -366,4 +375,95 @@ pub async fn get_pinned_episode(
         }),
         None => Ok(None),
     }
+}
+
+/// Batch-get user item data for a single user and multiple items in one query.
+/// Returns a HashMap of item_id -> UserItemDataDto.
+pub async fn get_user_item_data_batch(
+    pool: &SqlitePool,
+    user_id: Uuid,
+    item_ids: &[Uuid],
+) -> Result<HashMap<String, UserItemDataDto>, sqlx::Error> {
+    if item_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let uid = user_id.to_string();
+    let placeholders: Vec<String> = (1..=item_ids.len()).map(|i| format!("?{}", i)).collect();
+    let placeholder_str = placeholders.join(",");
+    let sql = format!(
+        "SELECT item_id, playback_position_ticks, play_count, is_favorite, played, \
+         last_played_date, user_rating, likes \
+         FROM user_item_data WHERE user_id = ?1 AND item_id IN ({})",
+        placeholder_str
+    );
+
+    let mut query = sqlx::query_as::<
+        _,
+        (
+            String,
+            i64,
+            i64,
+            bool,
+            bool,
+            Option<String>,
+            Option<i32>,
+            Option<bool>,
+        ),
+    >(sqlx::AssertSqlSafe(sql));
+    query = query.bind(&uid);
+    for id in item_ids {
+        query = query.bind(id.to_string());
+    }
+
+    let rows = query.fetch_all(pool).await?;
+
+    let mut map = HashMap::new();
+    for (
+        item_id,
+        playback_position_ticks,
+        play_count,
+        is_favorite,
+        played,
+        last_played_date,
+        user_rating,
+        likes,
+    ) in rows
+    {
+        map.insert(
+            item_id.clone(),
+            UserItemDataDto {
+                playback_position_ticks,
+                play_count,
+                is_favorite,
+                played,
+                last_played_date,
+                likes,
+                user_rating,
+                key: None,
+                rating: None,
+                unplayed_item_count: None,
+                favorite: Some(is_favorite),
+            },
+        );
+    }
+    Ok(map)
+}
+
+/// Clear user rating for an item
+pub async fn clear_user_rating(
+    pool: &SqlitePool,
+    user_id: Uuid,
+    item_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    let uid = user_id.to_string();
+    let iid = item_id.to_string();
+    sqlx::query(
+        "UPDATE user_item_data SET user_rating = NULL, likes = NULL WHERE user_id = ? AND item_id = ?",
+    )
+    .bind(&uid)
+    .bind(&iid)
+    .execute(pool)
+    .await?;
+    Ok(())
 }

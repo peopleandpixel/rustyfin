@@ -1,15 +1,22 @@
 mod activity;
 mod additional;
 mod auth;
+mod backup;
 mod collections;
 mod configuration;
+mod devices;
 mod display_preferences;
 mod dlna;
+mod dlna_streaming;
+mod dynamic_hls;
 mod encoding_manager;
 mod images;
 mod items;
 mod library;
 mod live_tv;
+mod localization;
+mod media_segments;
+mod packages;
 mod persons;
 mod playback;
 mod plugins;
@@ -21,6 +28,7 @@ mod shows;
 mod startup;
 mod streaming;
 mod subtitle;
+mod sync_play;
 mod system;
 mod transcode;
 mod users;
@@ -66,6 +74,14 @@ pub fn build_router(state: AppState) -> Router {
         .merge(shows::routes())
         .merge(live_tv::routes())
         .merge(additional::routes())
+        .merge(media_segments::routes())
+        .merge(devices::routes())
+        .merge(dynamic_hls::routes())
+        .merge(localization::routes())
+        .merge(packages::routes())
+        .merge(dlna_streaming::routes())
+        .merge(backup::routes())
+        .merge(sync_play::routes())
         .layer(axum_mw::from_fn_with_state(state.clone(), require_auth));
 
     #[allow(unused_mut)]
@@ -93,26 +109,71 @@ mod webclient {
     use crate::state::AppState;
 
     pub fn mount_webclient(router: Router<AppState>) -> Router<AppState> {
-        let web_dir = std::env::var("RUSTYFIN_WEBCLIENT_DIR").unwrap_or_else(|_| {
-            // Default: look for the bundled web client next to the binary
-            if let Some(exe_dir) = std::env::current_exe()
-                .ok()
-                .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-            {
-                let candidate = exe_dir.join("web");
-                if candidate.exists() {
-                    return candidate.to_string_lossy().to_string();
+        let web_dir = std::env::var("RUSTYFIN_WEBCLIENT_DIR")
+            .ok()
+            .filter(|p| std::path::Path::new(p).exists())
+            .or_else(|| {
+                // Check relative to current executable location
+                if let Some(exe_dir) = std::env::current_exe()
+                    .ok()
+                    .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+                {
+                    let candidates = [
+                        exe_dir.join("web"),
+                        exe_dir.join("../web"),
+                        exe_dir.join("../../crates/rustyfin-web/dist"),
+                        exe_dir.join("../../../crates/rustyfin-web/dist"),
+                    ];
+                    for c in candidates {
+                        if c.exists() {
+                            return Some(c.to_string_lossy().to_string());
+                        }
+                    }
                 }
-            }
-            // Fallback: workspace-relative path (development)
-            "crates/rustyfin-web/dist".to_string()
-        });
+                None
+            })
+            .or_else(|| {
+                // Check relative to current working directory
+                let candidates = [
+                    std::path::PathBuf::from("crates/rustyfin-web/dist"),
+                    std::path::PathBuf::from("../crates/rustyfin-web/dist"),
+                    std::path::PathBuf::from("../../crates/rustyfin-web/dist"),
+                    std::path::PathBuf::from("rustyfin-web/dist"),
+                    std::path::PathBuf::from("dist"),
+                    std::path::PathBuf::from("web"),
+                ];
+                for c in candidates {
+                    if c.exists() {
+                        return Some(c.to_string_lossy().to_string());
+                    }
+                }
+                None
+            })
+            .or_else(|| {
+                // Compile-time manifest dir fallback for local workspace development
+                let compile_time_path =
+                    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../rustyfin-web/dist");
+                if compile_time_path.exists() {
+                    Some(compile_time_path.to_string_lossy().to_string())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| "crates/rustyfin-web/dist".to_string());
 
         tracing::info!("serving web client from: {}", web_dir);
 
-        router.nest_service("/web", ServeDir::new(&web_dir)).route(
-            "/",
-            axum::routing::get(|| async { Redirect::permanent("/web/index.html") }),
-        )
+        let serve_dir = ServeDir::new(&web_dir).append_index_html_on_directories(true);
+
+        router
+            .nest_service("/web", serve_dir)
+            .route(
+                "/",
+                axum::routing::get(|| async { Redirect::permanent("/web/index.html") }),
+            )
+            .route(
+                "/index.html",
+                axum::routing::get(|| async { Redirect::permanent("/web/index.html") }),
+            )
     }
 }

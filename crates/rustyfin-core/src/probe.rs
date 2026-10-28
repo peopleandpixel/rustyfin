@@ -1,14 +1,30 @@
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::process::Stdio;
+use std::sync::OnceLock;
 use tokio::process::Command;
 use tokio::sync::Semaphore;
 use tracing::warn;
 
 /// Global semaphore to limit concurrent ffprobe process spawns.
-/// Prevents process spawn overload during large library scans.
-const MAX_CONCURRENT_PROBES: usize = 4;
-static PROBE_SEMAPHORE: Semaphore = Semaphore::const_new(MAX_CONCURRENT_PROBES);
+/// Configurable via RUSTYFIN_MAX_PROBES env var; defaults to num_cpus * 2 (min 4, max 16).
+static PROBE_SEMAPHORE: OnceLock<Semaphore> = OnceLock::new();
+
+fn get_max_probes() -> usize {
+    std::env::var("RUSTYFIN_MAX_PROBES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| {
+            let cores = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4);
+            (cores * 2).clamp(4, 16)
+        })
+}
+
+fn probe_semaphore() -> &'static Semaphore {
+    PROBE_SEMAPHORE.get_or_init(|| Semaphore::const_new(get_max_probes()))
+}
 
 use rustyfin_model::chapter::Chapter;
 use rustyfin_model::media_source::{MediaSourceResponse, MediaStream};
@@ -60,16 +76,21 @@ struct FfprobeOutput {
 
 #[derive(Debug, Deserialize, Clone)]
 struct FfprobeStream {
+    #[serde(default, deserialize_with = "deserialize_i32_flexible")]
     index: i32,
     codec_name: Option<String>,
     codec_type: Option<String>,
     language: Option<String>,
     #[allow(dead_code)]
     codec_tag_string: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_u32")]
     width: Option<u32>,
+    #[serde(default, deserialize_with = "deserialize_optional_u32")]
     height: Option<u32>,
+    #[serde(default, deserialize_with = "deserialize_optional_u32")]
     bit_rate: Option<u32>,
     bits_per_raw_sample: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_u32")]
     channels: Option<u32>,
     channel_layout: Option<String>,
     sample_rate: Option<String>,
@@ -102,8 +123,96 @@ struct SideData {
 
 #[derive(Debug, Deserialize, Clone)]
 struct Disposition {
+    #[serde(default, deserialize_with = "deserialize_optional_u8")]
     default: Option<u8>,
+    #[serde(default, deserialize_with = "deserialize_optional_u8")]
     forced: Option<u8>,
+}
+
+fn deserialize_optional_u32<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum NumOrStr {
+        U32(u32),
+        I64(i64),
+        F64(f64),
+        Str(String),
+        Null,
+    }
+
+    match Option::<NumOrStr>::deserialize(deserializer)? {
+        Some(NumOrStr::U32(n)) => Ok(Some(n)),
+        Some(NumOrStr::I64(n)) => Ok(if n >= 0 { Some(n as u32) } else { None }),
+        Some(NumOrStr::F64(f)) => Ok(if f >= 0.0 { Some(f as u32) } else { None }),
+        Some(NumOrStr::Str(s)) => {
+            let s = s.trim();
+            if s.is_empty() || s.eq_ignore_ascii_case("N/A") || s.eq_ignore_ascii_case("null") {
+                Ok(None)
+            } else if let Ok(n) = s.parse::<u32>() {
+                Ok(Some(n))
+            } else if let Ok(f) = s.parse::<f64>() {
+                Ok(if f >= 0.0 { Some(f as u32) } else { None })
+            } else {
+                Ok(None)
+            }
+        }
+        Some(NumOrStr::Null) | None => Ok(None),
+    }
+}
+
+fn deserialize_optional_u8<'de, D>(deserializer: D) -> Result<Option<u8>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum NumOrStrOrBool {
+        U8(u8),
+        I64(i64),
+        Bool(bool),
+        Str(String),
+        Null,
+    }
+
+    match Option::<NumOrStrOrBool>::deserialize(deserializer)? {
+        Some(NumOrStrOrBool::U8(n)) => Ok(Some(n)),
+        Some(NumOrStrOrBool::I64(n)) => Ok(if n > 0 { Some(1) } else { Some(0) }),
+        Some(NumOrStrOrBool::Bool(b)) => Ok(Some(if b { 1 } else { 0 })),
+        Some(NumOrStrOrBool::Str(s)) => {
+            let s = s.trim();
+            if s == "1" || s.eq_ignore_ascii_case("true") {
+                Ok(Some(1))
+            } else if s == "0" || s.eq_ignore_ascii_case("false") {
+                Ok(Some(0))
+            } else {
+                Ok(None)
+            }
+        }
+        Some(NumOrStrOrBool::Null) | None => Ok(None),
+    }
+}
+
+fn deserialize_i32_flexible<'de, D>(deserializer: D) -> Result<i32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum NumOrStr {
+        I32(i32),
+        F64(f64),
+        Str(String),
+    }
+
+    match NumOrStr::deserialize(deserializer) {
+        Ok(NumOrStr::I32(n)) => Ok(n),
+        Ok(NumOrStr::F64(f)) => Ok(f as i32),
+        Ok(NumOrStr::Str(s)) => Ok(s.trim().parse::<i32>().unwrap_or(0)),
+        Err(_) => Ok(0),
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -625,7 +734,7 @@ pub fn spawn_probe_and_save(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // Acquire a permit from the semaphore to limit concurrent probes
-        let _permit = PROBE_SEMAPHORE.acquire().await;
+        let _permit = probe_semaphore().acquire().await;
         if let Err(e) = probe_and_save(&pool, &item_id, &path).await {
             tracing::warn!("failed to probe '{}': {}", path, e);
         }
@@ -640,7 +749,7 @@ pub fn spawn_probe_and_add_source(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // Acquire a permit from the semaphore to limit concurrent probes
-        let _permit = PROBE_SEMAPHORE.acquire().await;
+        let _permit = probe_semaphore().acquire().await;
         if let Err(e) = probe_and_add_source(&pool, &item_id, &path).await {
             tracing::warn!("failed to probe '{}': {}", path, e);
         }
@@ -705,5 +814,78 @@ mod tests {
     async fn test_probe_nonexistent_file() {
         let result = probe_file("/nonexistent/file.mp4").await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_deserialize_ffprobe_with_string_bitrate() {
+        let json_data = r#"{
+            "streams": [
+                {
+                    "index": 0,
+                    "codec_name": "hevc",
+                    "codec_type": "video",
+                    "width": "3840",
+                    "height": "2160",
+                    "bit_rate": "256000",
+                    "channels": 6,
+                    "disposition": {
+                        "default": 1,
+                        "forced": "0"
+                    }
+                },
+                {
+                    "index": "1",
+                    "codec_name": "eac3",
+                    "codec_type": "audio",
+                    "bit_rate": "958433",
+                    "channels": "6",
+                    "disposition": {
+                        "default": "true",
+                        "forced": false
+                    }
+                },
+                {
+                    "index": 2,
+                    "codec_name": "subrip",
+                    "codec_type": "subtitle",
+                    "bit_rate": "N/A"
+                }
+            ],
+            "format": {
+                "duration": "7200.5",
+                "bit_rate": "1214433",
+                "size": "1093029302"
+            }
+        }"#;
+
+        let parsed: FfprobeOutput =
+            serde_json::from_str(json_data).expect("should parse successfully");
+        assert_eq!(parsed.streams.len(), 3);
+        assert_eq!(parsed.streams[0].width, Some(3840));
+        assert_eq!(parsed.streams[0].height, Some(2160));
+        assert_eq!(parsed.streams[0].bit_rate, Some(256000));
+        assert_eq!(parsed.streams[0].channels, Some(6));
+        assert_eq!(
+            parsed.streams[0].disposition.as_ref().unwrap().default,
+            Some(1)
+        );
+        assert_eq!(
+            parsed.streams[0].disposition.as_ref().unwrap().forced,
+            Some(0)
+        );
+
+        assert_eq!(parsed.streams[1].index, 1);
+        assert_eq!(parsed.streams[1].bit_rate, Some(958433));
+        assert_eq!(parsed.streams[1].channels, Some(6));
+        assert_eq!(
+            parsed.streams[1].disposition.as_ref().unwrap().default,
+            Some(1)
+        );
+        assert_eq!(
+            parsed.streams[1].disposition.as_ref().unwrap().forced,
+            Some(0)
+        );
+
+        assert_eq!(parsed.streams[2].bit_rate, None);
     }
 }

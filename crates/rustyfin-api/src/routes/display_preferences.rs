@@ -1,6 +1,7 @@
-use axum::extract::{Path, Query};
+use axum::extract::{Path, Query, State};
 use axum::routing::get;
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
+use rustyfin_model::auth::Claims;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -22,7 +23,7 @@ struct DisplayPrefsQuery {
     client: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct DisplayPreferencesDto {
     id: String,
@@ -62,19 +63,46 @@ impl DisplayPreferencesDto {
 }
 
 async fn get_display_preferences(
+    State(state): State<AppState>,
     Path(key): Path<String>,
     Query(q): Query<DisplayPrefsQuery>,
+    Extension(claims): Extension<Claims>,
 ) -> Result<Json<DisplayPreferencesDto>, ApiError> {
     let client = q.client.unwrap_or_else(|| "emby".to_string());
-    let id = q.user_id.unwrap_or(key);
+    let user_id_str = q.user_id.unwrap_or_else(|| claims.sub.to_string());
+    let id = format!("{}-{}", user_id_str, key);
+
+    // Try to load from database
+    let stored = rustyfin_db::repo_user::get_display_preference(&state.db_ro, claims.sub, &key)
+        .await
+        .ok()
+        .flatten();
+
+    if let Some(stored_value) = &stored {
+        // Parse stored JSON and merge with defaults
+        if let Ok(mut prefs) = serde_json::from_str::<DisplayPreferencesDto>(stored_value) {
+            prefs.client = client;
+            prefs.id = id;
+            return Ok(Json(prefs));
+        }
+    }
+
     Ok(Json(DisplayPreferencesDto::default_for(id, client)))
 }
 
 async fn update_display_preferences(
-    Path(_key): Path<String>,
+    State(state): State<AppState>,
+    Path(key): Path<String>,
     Query(_q): Query<DisplayPrefsQuery>,
-    Json(_body): Json<serde_json::Value>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<serde_json::Value>,
 ) -> Result<axum::http::StatusCode, ApiError> {
-    // Persistenz noch nicht implementiert — wir akzeptieren Updates idempotent.
+    // Persist to database
+    let json_str = serde_json::to_string(&body).map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    rustyfin_db::repo_user::update_display_preference(&state.db, claims.sub, &key, &json_str)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
     Ok(axum::http::StatusCode::NO_CONTENT)
 }

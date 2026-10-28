@@ -251,7 +251,7 @@ pub async fn send_command_to_session(
 
 /// Broadcast an event to all connected WebSocket clients
 pub async fn broadcast_event(state: &AppState, event: rustyfin_model::ws_event::WsEvent) {
-    if let Err(e) = state.ws_broadcast.send(event) {
-        tracing::debug!("WebSocket: failed to broadcast event: {}", e);
-    }
+    // Silently ignore broadcast failures - this is normal when no WebSocket clients are connected.
+    // The browser player does not require WebSocket for playback; it's only used for notifications.
+    let _ = state.ws_broadcast.send(event);
 }

@@ -51,6 +51,18 @@ pub struct UserItemDataDto {
     pub likes: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_rating: Option<i32>,
+    /// Unique key for this user/item combination
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    /// User's rating (0-10)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rating: Option<f64>,
+    /// Unplayed item count for folders
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unplayed_item_count: Option<i32>,
+    /// Favorite flag (alias for is_favorite)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub favorite: Option<bool>,
 }
 
 /// Request body for PinEpisode endpoint

@@ -407,12 +407,25 @@ The top optimizations (P1-P3, P5, P15-P18) will provide **massive speedups regar
 **Recommendation:** Focus on implementing P1-P19 first. Only reconsider PostgreSQL after those are done and you still hit performance walls.
 
 ### Client Compatibility Testing
-- [ ] Test with Jellyfin Android App
-- [ ] Test with Jellyfin iOS App
-- [ ] Test with Jellyfin TV (Android TV, Fire TV)
-- [ ] Test with Swiftfin (Apple TV)
-- [ ] Test with Findroid (Android)
-- [ ] Test with Sailfin
+Client-Kompatibilitätstests erfordern manuelle Tests mit echten Geräten und Apps.
+Folgende Schritte sind für jeden Client durchzuführen:
+
+1. **Server starten:** `cargo run --release` oder via Docker
+2. **Client verbinden:** Server-Adresse eingeben (z.B. http://localhost:8096)
+3. **Login:** Mit bestehendem Benutzer anmelden
+4. **Bibliothek durchsuchen:** Items auflisten und Details ansehen
+5. **Video abspielen:** Direktplay und Transkodierung testen
+6. **Audio abspielen:** Musikwiedergabe testen (falls zutreffend)
+7. **Suche nutzen:** Volltextsuche testen
+8. **Fortschritt speichern:** Wiedergabe-Position speichern und wiederherstellen
+9. **Fehler dokumentieren:** Alle 4xx/5xx Fehler und abstürzende Features notieren
+
+- [ ] Test with Jellyfin Android App (https://github.com/jellyfin/jellyfin-android)
+- [ ] Test with Jellyfin iOS App (https://github.com/jellyfin/jellyfin-ios)
+- [ ] Test with Jellyfin TV (Android TV, Fire TV) (https://github.com/jellyfin/jellyfin-androidtv)
+- [ ] Test with Swiftfin (Apple TV) (https://github.com/swiftfin tv)
+- [ ] Test with Findroid (Android) (https://github.com/jmshrv/Findroid)
+- [ ] Test with Sailfin (https://github.com/sailfin)
 - [ ] Implement client capability reporting
 
 ---
@@ -442,7 +455,8 @@ The top optimizations (P1-P3, P5, P15-P18) will provide **massive speedups regar
 - [x] `POST /Users/{id}/Policy` – Benutzerrichtlinien setzen (IsAdmin, etc.)
 - [x] `POST /Users/{id}/Configuration` – Benutzereinstellungen
 - [x] `GET /Users/Public` – Öffentliche Benutzerliste (Login-Screen)
-- [x] `POST /Users/ForgotPassword` – Passwort vergessen (Stub)
+- [x] `POST /Users/ForgotPassword` – Passwort vergessen (PIN-Code per E-Mail)
+- [x] `POST /Users/ResetPassword` – Passwort mit PIN zurücksetzen
 - [x] API-Key-Authentifizierung (neben JWT, via RUSTYFIN_API_KEY)
 - [x] Quick Connect Support (`/QuickConnect/Enabled`, `/Initiate`, `/Connect`, `/Authorize`)
 

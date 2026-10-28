@@ -49,15 +49,52 @@ pub fn detect_image_type_from_filename(filename: &str) -> Option<ImageType> {
     let stem = lower.rsplit('/').next().unwrap_or(&lower);
     let stem = stem.split('.').next().unwrap_or(stem);
 
+    // Also check if the filename contains common image type keywords
+    let contains_primary = stem.contains("poster")
+        || stem.contains("cover")
+        || stem.contains("folder")
+        || stem.contains("default")
+        || stem.contains("cover_art");
+    let contains_backdrop = stem.contains("fanart")
+        || stem.contains("backdrop")
+        || stem.contains("background")
+        || stem.contains("artwork");
+    let contains_banner = stem.contains("banner");
+    let contains_thumb =
+        stem.contains("thumb") || stem.contains("thumbnail") || stem.contains("landscape");
+    let contains_logo = stem.contains("logo") || stem.contains("clearlogo");
+    let contains_art = stem.contains("clearart")
+        || (stem.contains("art") && !stem.contains("fanart") && !stem.contains("clearlogo"));
+    let contains_disc = stem.contains("disc") || stem.contains("cdart");
+
     match stem {
-        "poster" | "cover" | "folder" | "default" => Some(ImageType::Primary),
-        "fanart" | "backdrop" | "background" => Some(ImageType::Backdrop),
+        "poster" | "cover" | "folder" | "default" | "cover_art" => Some(ImageType::Primary),
+        "fanart" | "backdrop" | "background" | "artwork" => Some(ImageType::Backdrop),
         "banner" => Some(ImageType::Banner),
         "thumb" | "thumbnail" | "landscape" => Some(ImageType::Thumb),
         "logo" | "clearlogo" => Some(ImageType::Logo),
-        "art" | "clearart" => Some(ImageType::Art),
+        "clearart" | "art" => Some(ImageType::Art),
         "disc" | "discart" | "cdart" => Some(ImageType::Disc),
-        _ => None,
+        _ => {
+            // Fallback: check for keywords in filename
+            if contains_primary {
+                Some(ImageType::Primary)
+            } else if contains_backdrop {
+                Some(ImageType::Backdrop)
+            } else if contains_banner {
+                Some(ImageType::Banner)
+            } else if contains_thumb {
+                Some(ImageType::Thumb)
+            } else if contains_logo {
+                Some(ImageType::Logo)
+            } else if contains_art {
+                Some(ImageType::Art)
+            } else if contains_disc {
+                Some(ImageType::Disc)
+            } else {
+                None
+            }
+        }
     }
 }
 

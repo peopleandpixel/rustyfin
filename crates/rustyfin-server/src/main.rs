@@ -7,7 +7,10 @@ use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
+use rustyfin_api::log_stream::LogStreamLayer;
 use rustyfin_api::middleware::RateLimiter;
 use rustyfin_api::routes::build_router;
 use rustyfin_api::state::AppState;
@@ -16,9 +19,22 @@ use rustyfin_model::server_info::ServerConfiguration;
 #[tokio::main]
 async fn main() {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
+
+    // Live log level channel — default "info", can be changed at runtime via API
+    let (log_level_tx, log_level_rx) = watch::channel("info".to_string());
+
+    // We need ws_broadcast before LogStreamLayer, but ws_broadcast is created later.
+    // So we create it here and pass it to both LogStreamLayer and AppState.
+    // Broadcast channel size increased to 256 to prevent event loss with many connected clients
+    let (ws_broadcast, _) = broadcast::channel::<rustyfin_model::ws_event::WsEvent>(256);
+
+    // Build the tracing subscriber with LogStreamLayer
     let use_json = std::env::var("RUSTYFIN_LOG_JSON")
         .map(|v| v == "1" || v == "true")
         .unwrap_or(false);
+
+    let log_layer = LogStreamLayer::new(ws_broadcast.clone(), Arc::new(log_level_rx));
+
     if use_json {
         tracing_subscriber::fmt()
             .with_env_filter(env_filter)
@@ -26,9 +42,15 @@ async fn main() {
             .with_target(true)
             .with_thread_ids(true)
             .with_span_list(true)
+            .finish()
+            .with(log_layer)
             .init();
     } else {
-        tracing_subscriber::fmt().with_env_filter(env_filter).init();
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .finish()
+            .with(log_layer)
+            .init();
     }
 
     let data_dir = data_dir();
@@ -112,11 +134,11 @@ async fn main() {
     let plugin_manager = rustyfin_core::plugin_manager::PluginManager::new(&data_dir_arc);
     plugin_manager.load_all().await;
 
-    // Rate limiter: 100 requests per 60 seconds per IP (configurable via env)
+    // Rate limiter: default 500 requests per 60 seconds per IP (configurable via env, 0 to disable)
     let rate_max: usize = std::env::var("RUSTYFIN_RATE_LIMIT")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(100);
+        .unwrap_or(500);
     let rate_window: u64 = std::env::var("RUSTYFIN_RATE_WINDOW")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -124,12 +146,18 @@ async fn main() {
     let rate_limiter = RateLimiter::new(rate_max, rate_window);
     rate_limiter.start_cleanup();
 
-    // WebSocket broadcast channel (capacity 32 for buffered events)
-    let (ws_broadcast, _) = broadcast::channel::<rustyfin_model::ws_event::WsEvent>(32);
-
     // In-memory response caches
     let cache = rustyfin_api::cache::ApiCache::new();
     let image_cache = rustyfin_api::cache::ImageCache::new();
+
+    // Shared HTTP client for external API calls (TMDB, etc.) - reuse connection pool
+    let http_client = reqwest::Client::builder()
+        .user_agent("Rustyfin/1.0")
+        .pool_max_idle_per_host(10)
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("Failed to build HTTP client");
 
     let state = AppState {
         db: pool,
@@ -147,8 +175,10 @@ async fn main() {
         plugin_manager,
         rate_limiter,
         ws_broadcast,
+        log_level_tx,
         cache,
         image_cache,
+        http_client,
     };
 
     // Background task: scheduled tasks (library scan, metadata refresh, cache cleanup)
