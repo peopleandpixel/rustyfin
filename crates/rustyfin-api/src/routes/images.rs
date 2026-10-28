@@ -19,6 +19,10 @@ pub fn routes() -> Router<AppState> {
             "/Items/{id}/Images/{image_type}",
             get(get_item_image).post(upload_item_image),
         )
+        .route(
+            "/Items/{id}/Images/{image_type}/{image_index}",
+            get(get_item_image_indexed),
+        )
         .route("/Items/{id}/Refresh", post(refresh_item))
 }
 
@@ -43,25 +47,42 @@ async fn get_item_images(
     Ok(Json(infos))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 struct ImageQuery {
-    #[serde(rename = "maxWidth")]
+    #[serde(
+        alias = "maxWidth",
+        alias = "max_width",
+        alias = "width",
+        alias = "fillWidth"
+    )]
     max_width: Option<u32>,
-    #[serde(rename = "maxHeight")]
+    #[serde(
+        alias = "maxHeight",
+        alias = "max_height",
+        alias = "height",
+        alias = "fillHeight"
+    )]
     max_height: Option<u32>,
-    #[serde(rename = "imageIndex")]
+    #[serde(alias = "imageIndex", alias = "image_index")]
     image_index: Option<i32>,
+    tag: Option<String>,
+    format: Option<String>,
+    quality: Option<u32>,
 }
 
-async fn get_item_image(
-    State(state): State<AppState>,
-    Path((id, image_type_str)): Path<(Uuid, String)>,
-    Query(query): Query<ImageQuery>,
+async fn serve_image(
+    state: &AppState,
+    id: Uuid,
+    image_type_str: &str,
+    index: i32,
+    max_width: Option<u32>,
+    max_height: Option<u32>,
 ) -> Result<Response, ApiError> {
-    let image_type = ImageType::from_str(&image_type_str)
+    let image_type = ImageType::from_str(image_type_str)
         .ok_or_else(|| ApiError::BadRequest(format!("unknown image type: {}", image_type_str)))?;
 
-    let index = query.image_index.unwrap_or(0);
     let img = rustyfin_db::repo_image::get_image(&state.db_ro, id, &image_type, index)
         .await?
         .ok_or_else(|| ApiError::NotFound("image not found".into()))?;
@@ -72,8 +93,8 @@ async fn get_item_image(
         id,
         image_type_str,
         index,
-        query.max_width.unwrap_or(0),
-        query.max_height.unwrap_or(0)
+        max_width.unwrap_or(0),
+        max_height.unwrap_or(0)
     );
 
     // Check in-memory cache first
@@ -81,29 +102,62 @@ async fn get_item_image(
         cached
     } else {
         let cache_dir = state.data_dir.join("cache").join("images");
-        let bytes = rustyfin_core::image_proxy::get_or_resize_image(
-            &img.path,
-            query.max_width,
-            query.max_height,
-            &cache_dir,
+        let bytes = match rustyfin_core::image_proxy::get_or_resize_image(
+            &img.path, max_width, max_height, &cache_dir,
         )
         .await
-        .map_err(ApiError::Internal)?;
+        {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(error = %e, path = %img.path, "image could not be read or resized");
+                return Err(ApiError::NotFound(format!("image not found: {}", e)));
+            }
+        };
         // Store in in-memory cache
         state.image_cache.insert(cache_key.clone(), bytes.clone());
         bytes
     };
 
-    let content_type = guess_content_type(
-        &img.path,
-        query.max_width.is_some() || query.max_height.is_some(),
-    );
+    let content_type = guess_content_type(&img.path, max_width.is_some() || max_height.is_some());
 
     Ok(Response::builder()
         .header(header::CONTENT_TYPE, content_type)
         .header(header::CACHE_CONTROL, "public, max-age=86400")
         .body(Body::from(bytes))
         .unwrap())
+}
+
+async fn get_item_image(
+    State(state): State<AppState>,
+    Path((id, image_type_str)): Path<(Uuid, String)>,
+    Query(query): Query<ImageQuery>,
+) -> Result<Response, ApiError> {
+    let index = query.image_index.unwrap_or(0);
+    serve_image(
+        &state,
+        id,
+        &image_type_str,
+        index,
+        query.max_width,
+        query.max_height,
+    )
+    .await
+}
+
+async fn get_item_image_indexed(
+    State(state): State<AppState>,
+    Path((id, image_type_str, image_index)): Path<(Uuid, String, i32)>,
+    Query(query): Query<ImageQuery>,
+) -> Result<Response, ApiError> {
+    serve_image(
+        &state,
+        id,
+        &image_type_str,
+        image_index,
+        query.max_width,
+        query.max_height,
+    )
+    .await
 }
 
 async fn upload_item_image(
@@ -159,10 +213,18 @@ async fn refresh_item(
     let config = state.config.read().await;
     let tmdb_key = config.tmdb_api_key.as_deref();
     let omdb_key = config.omdb_api_key.as_deref();
+    let fanart_key = config.fanart_api_key.as_deref();
 
-    rustyfin_core::metadata::refresh_item_metadata(&state.db, &item, tmdb_key, omdb_key)
-        .await
-        .map_err(ApiError::Internal)?;
+    rustyfin_core::metadata::refresh_item_metadata(
+        &state.db,
+        &state.http_client,
+        &item,
+        tmdb_key,
+        omdb_key,
+        fanart_key,
+    )
+    .await
+    .map_err(ApiError::Internal)?;
 
     // Invalidate cached item details and images after metadata refresh
     state.cache.invalidate_item(&id.to_string());

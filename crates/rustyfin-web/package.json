@@ -3,11 +3,17 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "build": "npx @tailwindcss/cli -i ./src/input.css -o ./dist/assets/style.css --minify && cp ./src/index.html ./dist/index.html && cp ./src/api.js ./dist/assets/api.js && cp ./src/app.js ./dist/assets/app.js && cp ./src/assets/logo.png ./dist/assets/logo.png",
-    "dev": "npx @tailwindcss/cli -i ./src/input.css -o ./dist/assets/style.css --watch"
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
   },
   "devDependencies": {
+    "@tailwindcss/vite": "^4.3.3",
+    "daisyui": "^5",
     "tailwindcss": "^4",
-    "daisyui": "^5"
+    "vite": "^8.3.5"
+  },
+  "dependencies": {
+    "hls.js": "^1.5.7"
   }
 }

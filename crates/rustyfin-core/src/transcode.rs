@@ -369,7 +369,7 @@ fn build_ffmpeg_args(
                 profile.max_width, profile.max_height
             ),
             HwAccel::None => format!(
-                "scale='min({},iw)':min'({},ih)':force_original_aspect_ratio=decrease",
+                "scale='min({},iw)':'min({},ih)':force_original_aspect_ratio=decrease",
                 profile.max_width, profile.max_height
             ),
         };

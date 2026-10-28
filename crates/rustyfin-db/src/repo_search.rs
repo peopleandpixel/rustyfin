@@ -73,7 +73,12 @@ pub async fn search_items(
         // Fallback: search all types
         let like = format!("%{}%", query);
         let rows = sqlx::query_as::<_, super::repo_media::MediaItemRow>(
-            "SELECT * FROM media_items WHERE name LIKE ?1 OR overview LIKE ?1 LIMIT ?2",
+            "SELECT id, name, sort_name, overview, media_type, path, parent_id, library_id, \
+             production_year, community_rating, official_rating, genres, date_created, \
+             premiere_date, runtime_ticks, index_number, parent_index_number, tmdb_id, tvdb_id, \
+             tags, status, original_language, tagline, production_countries, budget, revenue, \
+             homepage, end_date, vote_count, popularity \
+             FROM media_items WHERE name LIKE ?1 OR overview LIKE ?1 LIMIT ?2",
         )
         .bind(&like)
         .bind(limit)
@@ -84,12 +89,17 @@ pub async fn search_items(
 
     let placeholders: Vec<&str> = type_filters.iter().map(|_| "?").collect();
     let mut sql = format!(
-        "SELECT * FROM media_items WHERE (name LIKE ? OR overview LIKE ?) AND media_type IN ({})",
+        "SELECT id, name, sort_name, overview, media_type, path, parent_id, library_id, \
+         production_year, community_rating, official_rating, genres, date_created, \
+         premiere_date, runtime_ticks, index_number, parent_index_number, tmdb_id, tvdb_id, \
+         tags, status, original_language, tagline, production_countries, budget, revenue, \
+         homepage, end_date, vote_count, popularity \
+         FROM media_items WHERE (name LIKE ? OR overview LIKE ?) AND media_type IN ({})",
         placeholders.join(",")
     );
     sql.push_str(" LIMIT ?");
 
-    let mut q = sqlx::query_as::<_, super::repo_media::MediaItemRow>(&sql);
+    let mut q = sqlx::query_as::<_, super::repo_media::MediaItemRow>(sqlx::AssertSqlSafe(sql));
     let like = format!("%{}%", query);
     q = q.bind(&like).bind(&like);
     for t in &type_filters {

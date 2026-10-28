@@ -67,6 +67,25 @@ pub struct ServerConfiguration {
     pub tmdb_api_key: Option<String>,
     #[serde(default)]
     pub omdb_api_key: Option<String>,
+    #[serde(default)]
+    pub fanart_api_key: Option<String>,
+    // SMTP mail server configuration for password reset emails
+    #[serde(default)]
+    pub smtp_host: Option<String>,
+    #[serde(default = "default_smtp_port")]
+    pub smtp_port: u16,
+    #[serde(default)]
+    pub smtp_username: Option<String>,
+    #[serde(default)]
+    pub smtp_password: Option<String>,
+    #[serde(default)]
+    pub smtp_enable_ssl: bool,
+    #[serde(default)]
+    pub smtp_from_address: Option<String>,
+}
+
+fn default_smtp_port() -> u16 {
+    587
 }
 
 fn default_server_name() -> String {
@@ -110,6 +129,13 @@ impl Default for ServerConfiguration {
             public_port: 8096,
             tmdb_api_key: None,
             omdb_api_key: None,
+            fanart_api_key: None,
+            smtp_host: None,
+            smtp_port: default_smtp_port(),
+            smtp_username: None,
+            smtp_password: None,
+            smtp_enable_ssl: false,
+            smtp_from_address: None,
         }
     }
 }

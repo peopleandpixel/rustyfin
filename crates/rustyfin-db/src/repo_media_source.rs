@@ -49,8 +49,8 @@ impl From<MediaSourceRow> for MediaSourceResponse {
             media_state: r.media_state,
             media_streams: Vec::new(),
             supports_transcoding: true,
-            supports_direct_stream: true,
-            supports_direct_play: true,
+            supports_direct_stream: false,
+            supports_direct_play: false,
         }
     }
 }
@@ -192,7 +192,7 @@ pub async fn insert_media_stream(
           bit_depth, channels, channel_layout, sample_rate, profile, type, aspect_ratio_text, \
           aspect_ratio, title, color_space, color_transfer, color_primaries, color_range, \
           localized_uri, is_default, is_forced, is_interlaced, embedded_bitmaps, stream_index) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&source_id_str)
@@ -255,12 +255,12 @@ pub async fn get_media_sources(
         let source_id = Uuid::parse_str(&source.id).ok();
         if let Some(sid) = source_id {
             let streams: Vec<MediaStreamRow> = sqlx::query_as(
-                "SELECT index, codec, codec_type, language, time_base, codec_time_base, codec_tag, \
+                "SELECT stream_index as [index], codec, codec_type, language, time_base, codec_time_base, codec_tag, \
                  is_external, path, width, height, average_frame_rate, real_frame_rate, bit_rate, \
                  bit_depth, channels, channel_layout, sample_rate, profile, type, aspect_ratio_text, \
                  aspect_ratio, title, color_space, color_transfer, color_primaries, color_range, \
                  localized_uri, is_default, is_forced, is_interlaced, embedded_bitmaps \
-                 FROM media_streams WHERE source_id = ? ORDER BY index",
+                 FROM media_streams WHERE source_id = ? ORDER BY stream_index",
             )
             .bind(sid.to_string())
             .fetch_all(pool)
@@ -343,7 +343,7 @@ pub async fn insert_media_source_with_streams(
               bit_depth, channels, channel_layout, sample_rate, profile, type, aspect_ratio_text, \
               aspect_ratio, title, color_space, color_transfer, color_primaries, color_range, \
               localized_uri, is_default, is_forced, is_interlaced, embedded_bitmaps, stream_index) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&stream_id)
         .bind(&id)
@@ -397,192 +397,119 @@ pub async fn get_media_sources_batch(
         return Ok(std::collections::HashMap::new());
     }
 
-    // Build placeholders for the IN clause
-    let placeholders: Vec<String> = (0..item_ids.len()).map(|i| format!("?{}", i + 1)).collect();
-    let in_clause = placeholders.join(",");
-
-    // Single query: JOIN media_sources with media_streams
-    // We fetch all sources and their streams in one round-trip
-    let query = format!(
-        "SELECT ms.id as source_id, ms.item_id, ms.uid, ms.container, ms.protocol, ms.path, \
-         ms.type as source_type, ms.run_time_ticks, ms.size, ms.bitrate, ms.video_bitrate, \
-         ms.audio_bitrate, ms.width, ms.height, ms.aspect_ratio, ms.is_remote, ms.media_state, \
-         mst.id as stream_id, mst.codec, mst.codec_type, mst.language, mst.time_base, \
-         mst.codec_time_base, mst.codec_tag, mst.is_external as stream_is_external, \
-         mst.path as stream_path, mst.width as stream_width, mst.height as stream_height, \
-         mst.average_frame_rate, mst.real_frame_rate, mst.bit_rate, mst.bit_depth, \
-         mst.channels, mst.channel_layout, mst.sample_rate, mst.profile, \
-         mst.type as stream_type, mst.aspect_ratio_text, mst.aspect_ratio as stream_aspect_ratio, \
-         mst.title, mst.color_space, mst.color_transfer, mst.color_primaries, mst.color_range, \
-         mst.localized_uri, mst.is_default, mst.is_forced, mst.is_interlaced, mst.embedded_bitmaps, \
-         mst.stream_index as stream_index_num \
-         FROM media_sources ms \
-         LEFT JOIN media_streams mst ON mst.source_id = ms.id \
-         WHERE ms.item_id IN ({}) \
-         ORDER BY ms.item_id, ms.id, mst.stream_index_num",
-        in_clause
-    );
-
-    let mut builder = sqlx::query_as::<_, BatchSourceStreamRow>(&query);
-    for id in item_ids.iter() {
-        builder = builder.bind(id.to_string());
-    }
-    let rows: Vec<BatchSourceStreamRow> = builder.fetch_all(pool).await?;
-
-    // Assemble into a map: item_id -> sources with streams
     let mut result: std::collections::HashMap<String, Vec<MediaSourceResponse>> =
         std::collections::HashMap::new();
-    // Track source order and avoid duplicates
-    let mut seen_sources: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
 
-    for row in rows {
-        let item_id = row.item_id.clone();
-        let source_id = row.source_id.clone();
+    // Chunk into batches of 200 items to stay well below SQLite host parameter limits
+    for chunk in item_ids.chunks(200) {
+        let placeholders: Vec<String> = (0..chunk.len()).map(|i| format!("?{}", i + 1)).collect();
+        let in_clause = placeholders.join(",");
 
-        // Get or create the source index for this item
-        let sources = result.entry(item_id).or_default();
+        let query = format!(
+            "SELECT ms.id as source_id, ms.item_id, ms.uid, ms.container, ms.protocol, ms.path, \
+             ms.type as source_type, ms.run_time_ticks, ms.size, ms.bitrate, ms.video_bitrate, \
+             ms.audio_bitrate, ms.width, ms.height, ms.aspect_ratio, ms.is_remote, ms.media_state, \
+             mst.id as stream_id, mst.codec, mst.codec_type, mst.language, mst.time_base, \
+             mst.codec_time_base, mst.codec_tag, mst.is_external as stream_is_external, \
+             mst.path as stream_path, mst.width as stream_width, mst.height as stream_height, \
+             mst.average_frame_rate, mst.real_frame_rate, mst.bit_rate, mst.bit_depth, \
+             mst.channels, mst.channel_layout, mst.sample_rate, mst.profile, \
+             mst.type as stream_type, mst.aspect_ratio_text, mst.aspect_ratio as stream_aspect_ratio, \
+             mst.title, mst.color_space, mst.color_transfer, mst.color_primaries, mst.color_range, \
+             mst.localized_uri, mst.is_default, mst.is_forced, mst.is_interlaced, mst.embedded_bitmaps, \
+             mst.stream_index as stream_index_num \
+             FROM media_sources ms \
+             LEFT JOIN media_streams mst ON mst.source_id = ms.id \
+             WHERE ms.item_id IN ({}) \
+             ORDER BY ms.item_id, ms.id, mst.stream_index",
+            in_clause
+        );
 
-        // Find the source index (or create it)
-        let source_idx = *seen_sources.entry(source_id.clone()).or_insert_with(|| {
-            let idx = sources.len();
-            let stream_index = row.stream_index_num;
-            let stream_codec = row.codec.clone();
-            let stream_codec_type = row.codec_type.clone();
-            let stream_language = row.language.clone();
-            let stream_time_base = row.time_base.clone();
-            let stream_codec_time_base = row.codec_time_base.clone();
-            let stream_codec_tag = row.codec_tag.clone();
-            let stream_is_external = row.stream_is_external;
-            let stream_path = row.stream_path.clone();
-            let stream_width = row.stream_width;
-            let stream_height = row.stream_height;
-            let stream_average_frame_rate = row.average_frame_rate.clone();
-            let stream_real_frame_rate = row.real_frame_rate.clone();
-            let stream_bit_rate = row.bit_rate;
-            let stream_bit_depth = row.bit_depth;
-            let stream_channels = row.channels;
-            let stream_channel_layout = row.channel_layout.clone();
-            let stream_sample_rate = row.sample_rate;
-            let stream_profile = row.profile.clone();
-            let stream_type = row.stream_type.clone();
-            let stream_aspect_ratio_text = row.aspect_ratio_text.clone();
-            let stream_aspect_ratio = row.stream_aspect_ratio;
-            let stream_title = row.title.clone();
-            let stream_color_space = row.color_space.clone();
-            let stream_color_transfer = row.color_transfer.clone();
-            let stream_color_primaries = row.color_primaries.clone();
-            let stream_color_range = row.color_range.clone();
-            let stream_localized_uri = row.localized_uri.clone();
-            let stream_is_default = row.is_default;
-            let stream_is_forced = row.is_forced;
-            let stream_is_interlaced = row.is_interlaced;
-            let stream_embedded_bitmaps = row.embedded_bitmaps;
+        let mut builder = sqlx::query_as::<_, BatchSourceStreamRow>(sqlx::AssertSqlSafe(query));
+        for id in chunk.iter() {
+            builder = builder.bind(id.to_string());
+        }
+        let rows: Vec<BatchSourceStreamRow> = builder.fetch_all(pool).await?;
 
-            let source = MediaSourceResponse {
-                id: source_id.clone(),
-                uid: row.uid.clone(),
-                container: row.container.clone(),
-                protocol: row.protocol.clone(),
-                path: row.path.clone(),
-                r#type: row.source_type.clone(),
-                run_time_ticks: row.run_time_ticks,
-                size: row.size,
-                bitrate: row.bitrate,
-                video_bitrate: row.video_bitrate,
-                audio_bitrate: row.audio_bitrate,
-                width: row.width,
-                height: row.height,
-                aspect_ratio: row.aspect_ratio.clone(),
-                is_remote: row.is_remote,
-                media_state: row.media_state.clone(),
-                media_streams: Vec::new(),
-                supports_transcoding: true,
-                supports_direct_stream: true,
-                supports_direct_play: true,
-            };
-            sources.push(source);
+        let mut seen_sources: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
 
-            // If this row has stream data, add it immediately
-            if stream_codec.is_some() || stream_codec_type != "Unknown" {
-                let stream = MediaStream {
-                    index: stream_index,
-                    codec: stream_codec,
-                    codec_type: stream_codec_type,
-                    language: stream_language,
-                    time_base: stream_time_base,
-                    codec_time_base: stream_codec_time_base,
-                    codec_tag: stream_codec_tag,
-                    is_external: stream_is_external,
-                    path: stream_path,
-                    width: stream_width,
-                    height: stream_height,
-                    average_frame_rate: stream_average_frame_rate,
-                    real_frame_rate: stream_real_frame_rate,
-                    bit_rate: stream_bit_rate,
-                    bit_depth: stream_bit_depth,
-                    channels: stream_channels,
-                    channel_layout: stream_channel_layout,
-                    sample_rate: stream_sample_rate,
-                    profile: stream_profile,
-                    r#type: stream_type,
-                    aspect_ratio_text: stream_aspect_ratio_text,
-                    aspect_ratio: stream_aspect_ratio,
-                    title: stream_title,
-                    color_space: stream_color_space,
-                    color_transfer: stream_color_transfer,
-                    color_primaries: stream_color_primaries,
-                    color_range: stream_color_range,
-                    localized_uri: stream_localized_uri,
-                    is_default: stream_is_default,
-                    is_forced: stream_is_forced,
-                    is_interlaced: stream_is_interlaced,
-                    embedded_bitmaps: stream_embedded_bitmaps,
+        for row in rows {
+            let item_id = row.item_id.clone();
+            let source_id = row.source_id.clone();
+
+            let sources = result.entry(item_id).or_default();
+
+            let source_idx = *seen_sources.entry(source_id.clone()).or_insert_with(|| {
+                let idx = sources.len();
+                let source = MediaSourceResponse {
+                    id: source_id.clone(),
+                    uid: row.uid.clone(),
+                    container: row.container.clone(),
+                    protocol: row.protocol.clone(),
+                    path: row.path.clone(),
+                    r#type: row.source_type.clone(),
+                    run_time_ticks: row.run_time_ticks,
+                    size: row.size,
+                    bitrate: row.bitrate,
+                    video_bitrate: row.video_bitrate,
+                    audio_bitrate: row.audio_bitrate,
+                    width: row.width,
+                    height: row.height,
+                    aspect_ratio: row.aspect_ratio.clone(),
+                    is_remote: row.is_remote,
+                    media_state: row.media_state.clone(),
+                    media_streams: Vec::new(),
+                    supports_transcoding: true,
+                    supports_direct_stream: true,
+                    supports_direct_play: true,
                 };
-                sources.last_mut().unwrap().media_streams.push(stream);
-            }
-            idx
-        });
+                sources.push(source);
+                idx
+            });
 
-        // If we've seen this source before and the row has stream data, add the stream
-        if row.stream_id.is_some()
-            && let Some(source) = sources.get_mut(source_idx)
-        {
-            let stream = MediaStream {
-                index: row.stream_index_num,
-                codec: row.codec.clone(),
-                codec_type: row.codec_type.clone(),
-                language: row.language.clone(),
-                time_base: row.time_base.clone(),
-                codec_time_base: row.codec_time_base.clone(),
-                codec_tag: row.codec_tag.clone(),
-                is_external: row.stream_is_external,
-                path: row.stream_path.clone(),
-                width: row.stream_width,
-                height: row.stream_height,
-                average_frame_rate: row.average_frame_rate.clone(),
-                real_frame_rate: row.real_frame_rate.clone(),
-                bit_rate: row.bit_rate,
-                bit_depth: row.bit_depth,
-                channels: row.channels,
-                channel_layout: row.channel_layout.clone(),
-                sample_rate: row.sample_rate,
-                profile: row.profile.clone(),
-                r#type: row.stream_type.clone(),
-                aspect_ratio_text: row.aspect_ratio_text.clone(),
-                aspect_ratio: row.stream_aspect_ratio,
-                title: row.title.clone(),
-                color_space: row.color_space.clone(),
-                color_transfer: row.color_transfer.clone(),
-                color_primaries: row.color_primaries.clone(),
-                color_range: row.color_range.clone(),
-                localized_uri: row.localized_uri.clone(),
-                is_default: row.is_default,
-                is_forced: row.is_forced,
-                is_interlaced: row.is_interlaced,
-                embedded_bitmaps: row.embedded_bitmaps,
-            };
-            source.media_streams.push(stream);
+            if row.stream_id.is_some()
+                && let Some(source) = sources.get_mut(source_idx)
+            {
+                let stream = MediaStream {
+                    index: row.stream_index_num.unwrap_or(0),
+                    codec: row.codec.clone(),
+                    codec_type: row
+                        .codec_type
+                        .clone()
+                        .unwrap_or_else(|| "Unknown".to_string()),
+                    language: row.language.clone(),
+                    time_base: row.time_base.clone(),
+                    codec_time_base: row.codec_time_base.clone(),
+                    codec_tag: row.codec_tag.clone(),
+                    is_external: row.stream_is_external.unwrap_or(false),
+                    path: row.stream_path.clone(),
+                    width: row.stream_width,
+                    height: row.stream_height,
+                    average_frame_rate: row.average_frame_rate.clone(),
+                    real_frame_rate: row.real_frame_rate.clone(),
+                    bit_rate: row.bit_rate,
+                    bit_depth: row.bit_depth,
+                    channels: row.channels,
+                    channel_layout: row.channel_layout.clone(),
+                    sample_rate: row.sample_rate,
+                    profile: row.profile.clone(),
+                    r#type: row.stream_type.clone(),
+                    aspect_ratio_text: row.aspect_ratio_text.clone(),
+                    aspect_ratio: row.stream_aspect_ratio,
+                    title: row.title.clone(),
+                    color_space: row.color_space.clone(),
+                    color_transfer: row.color_transfer.clone(),
+                    color_primaries: row.color_primaries.clone(),
+                    color_range: row.color_range.clone(),
+                    localized_uri: row.localized_uri.clone(),
+                    is_default: row.is_default.unwrap_or(false),
+                    is_forced: row.is_forced.unwrap_or(false),
+                    is_interlaced: row.is_interlaced.unwrap_or(false),
+                    embedded_bitmaps: row.embedded_bitmaps.unwrap_or(false),
+                };
+                source.media_streams.push(stream);
+            }
         }
     }
 
@@ -612,12 +539,12 @@ struct BatchSourceStreamRow {
     // Stream fields (may be NULL for sources without streams)
     stream_id: Option<String>,
     codec: Option<String>,
-    codec_type: String,
+    codec_type: Option<String>,
     language: Option<String>,
     time_base: Option<String>,
     codec_time_base: Option<String>,
     codec_tag: Option<String>,
-    stream_is_external: bool,
+    stream_is_external: Option<bool>,
     stream_path: Option<String>,
     stream_width: Option<u32>,
     stream_height: Option<u32>,
@@ -638,9 +565,9 @@ struct BatchSourceStreamRow {
     color_primaries: Option<String>,
     color_range: Option<String>,
     localized_uri: Option<String>,
-    is_default: bool,
-    is_forced: bool,
-    is_interlaced: bool,
-    embedded_bitmaps: bool,
-    stream_index_num: i32,
+    is_default: Option<bool>,
+    is_forced: Option<bool>,
+    is_interlaced: Option<bool>,
+    embedded_bitmaps: Option<bool>,
+    stream_index_num: Option<i32>,
 }

@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use tokio::fs;
 use uuid::Uuid;
 
+use crate::local_images;
 use crate::probe;
 
 // ---------------------------------------------------------------------------
@@ -161,58 +162,87 @@ const AUDIO_EXTENSIONS: &[&str] = &["mp3", "flac", "ogg", "wav", "aac", "wma", "
 const PHOTO_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "gif", "bmp", "webp", "tiff"];
 
 pub async fn scan_library(pool: &SqlitePool, library: &Library) -> Result<u32, sqlx::Error> {
-    scan_library_with_metadata(pool, library, None, None).await
+    scan_library_with_metadata(pool, library, &reqwest::Client::new(), None, None, None).await
 }
 
 pub async fn scan_library_with_metadata(
     pool: &SqlitePool,
     library: &Library,
+    http_client: &reqwest::Client,
     tmdb_api_key: Option<&str>,
     omdb_api_key: Option<&str>,
+    fanart_api_key: Option<&str>,
 ) -> Result<u32, sqlx::Error> {
-    let count = match library.content_type {
+    tracing::info!(
+        "scanning library '{}' (content_type={:?}, paths={:?})",
+        library.name,
+        library.content_type,
+        library.paths
+    );
+    let (count, new_item_ids) = match library.content_type {
         LibraryContentType::TvShows => scan_tv_library(pool, library).await?,
         LibraryContentType::Music => scan_music_library(pool, library).await?,
         _ => scan_flat_library(pool, library).await?,
     };
 
-    // Automatically fetch metadata for all items in this library
-    // Uses bounded concurrency (max 5 concurrent) to avoid overwhelming APIs
-    if let Ok(items) = rustyfin_db::repo_media::get_items_by_library(pool, library.id).await {
+    // Refresh metadata only for newly added items, not all items in the library.
+    // This avoids unnecessary API calls on incremental scans.
+    if !new_item_ids.is_empty() {
+        tracing::info!(
+            "refreshing metadata for {} newly added items in library '{}'",
+            new_item_ids.len(),
+            library.name
+        );
         let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(5));
         let mut handles = Vec::new();
-        for item in items {
-            let sem = semaphore.clone();
-            let pool = pool.clone();
-            let tmdb_key = tmdb_api_key.map(|s| s.to_string());
-            let omdb_key = omdb_api_key.map(|s| s.to_string());
-            let handle = tokio::spawn(async move {
-                let _perm = sem.acquire().await;
-                if let Err(e) = crate::metadata::refresh_item_metadata(
-                    &pool,
-                    &item,
-                    tmdb_key.as_deref(),
-                    omdb_key.as_deref(),
-                )
-                .await
-                {
-                    tracing::warn!("metadata refresh failed for '{}': {}", item.name, e);
-                }
-            });
-            handles.push(handle);
+        for new_id in new_item_ids {
+            if let Ok(Some(item)) = rustyfin_db::repo_media::get_item_by_id(pool, new_id).await {
+                let sem = semaphore.clone();
+                let pool = pool.clone();
+                let client = http_client.clone();
+                let tmdb_key = tmdb_api_key.map(|s| s.to_string());
+                let omdb_key = omdb_api_key.map(|s| s.to_string());
+                let fanart_key = fanart_api_key.map(|s| s.to_string());
+                let handle = tokio::spawn(async move {
+                    let _perm = sem.acquire().await;
+                    if let Err(e) = crate::metadata::refresh_item_metadata(
+                        &pool,
+                        &client,
+                        &item,
+                        tmdb_key.as_deref(),
+                        omdb_key.as_deref(),
+                        fanart_key.as_deref(),
+                    )
+                    .await
+                    {
+                        tracing::warn!("metadata refresh failed for '{}': {}", item.name, e);
+                    }
+                });
+                handles.push(handle);
+            }
         }
-        // Wait for all metadata refresh tasks to complete
         for handle in handles {
             let _ = handle.await;
         }
+    }
+
+    // Rebuild materialized filter indexes after scan completes
+    // This keeps the filter_genre_index, filter_year_index, filter_rating_index up-to-date
+    if let Err(e) = rustyfin_db::repo_media::rebuild_filter_indexes(pool).await {
+        tracing::warn!("failed to rebuild filter indexes: {}", e);
     }
 
     Ok(count)
 }
 
 /// Flat scan for Movies, Photos, Mixed libraries
-async fn scan_flat_library(pool: &SqlitePool, library: &Library) -> Result<u32, sqlx::Error> {
+async fn scan_flat_library(
+    pool: &SqlitePool,
+    library: &Library,
+) -> Result<(u32, Vec<Uuid>), sqlx::Error> {
     let mut count = 0u32;
+    let mut existing_count = 0u32;
+    let mut new_item_ids: Vec<Uuid> = Vec::new();
 
     // Load all existing paths into a HashSet for O(1) existence checks.
     // Avoids firing one DB query per file during scanning.
@@ -252,6 +282,7 @@ async fn scan_flat_library(pool: &SqlitePool, library: &Library) -> Result<u32, 
 
             // Skip if this exact file path already exists (in-memory check)
             if existing_paths.contains(&file_path) {
+                existing_count += 1;
                 continue;
             }
 
@@ -328,21 +359,55 @@ async fn scan_flat_library(pool: &SqlitePool, library: &Library) -> Result<u32, 
         if let Err(e) = rustyfin_db::repo_media::batch_upsert_media_items(pool, &new_items).await {
             tracing::error!("failed to batch insert media items: {}", e);
         } else {
-            // Spawn async probes for all newly inserted items (bounded concurrency)
+            // Find and save local images for all newly inserted items
+            let mut all_images: Vec<rustyfin_model::image::ItemImage> = Vec::new();
+            for item in &new_items {
+                let item_path = std::path::Path::new(&item.path);
+                let images = local_images::find_local_images(item_path, item.id);
+                if !images.is_empty() {
+                    tracing::debug!("found {} local images for '{}'", images.len(), item.name);
+                }
+                all_images.extend(images);
+            }
+            if !all_images.is_empty() {
+                if let Err(e) =
+                    rustyfin_db::repo_image::batch_upsert_images(pool, &all_images).await
+                {
+                    tracing::error!("failed to batch insert local images: {}", e);
+                } else {
+                    tracing::info!("saved {} local images", all_images.len());
+                }
+            }
+
+            // Spawn async probes for all newly inserted items (fire-and-forget).
+            // The semaphore in probe module limits concurrency, so probes run in the background
+            // without blocking the scan from returning.
             for item in &new_items {
                 probe::spawn_probe_and_save(pool.clone(), item.id, item.path.clone());
             }
             count += new_items.len() as u32;
+            // Collect IDs for metadata refresh
+            new_item_ids = new_items.iter().map(|item| item.id).collect();
         }
     }
 
-    tracing::info!("scanned {} items for library '{}'", count, library.name);
-    Ok(count)
+    tracing::info!(
+        "scanned library '{}': {} new items added ({} existing items unchanged)",
+        library.name,
+        count,
+        existing_count
+    );
+    Ok((count, new_item_ids))
 }
 
 /// Recursive scan for TV Shows: path/ShowName/Season XX/episode files
-async fn scan_tv_library(pool: &SqlitePool, library: &Library) -> Result<u32, sqlx::Error> {
+async fn scan_tv_library(
+    pool: &SqlitePool,
+    library: &Library,
+) -> Result<(u32, Vec<Uuid>), sqlx::Error> {
     let mut count = 0u32;
+    let mut existing_count = 0u32;
+    let mut new_item_ids: Vec<Uuid> = Vec::new();
 
     // Load all existing paths into a HashSet for O(1) existence checks.
     let existing_paths: HashSet<String> =
@@ -375,7 +440,15 @@ async fn scan_tv_library(pool: &SqlitePool, library: &Library) -> Result<u32, sq
 
         // Async directory traversal — non-blocking on Tokio runtime
         let files = collect_files(path).await;
+        tracing::info!(
+            "TV library '{}': found {} files in path {}",
+            library.name,
+            files.len(),
+            lib_path
+        );
 
+        let mut scanned_files = 0u32;
+        let mut skipped_ext = 0u32;
         for file_path_buf in files {
             let ext = file_path_buf
                 .extension()
@@ -383,7 +456,9 @@ async fn scan_tv_library(pool: &SqlitePool, library: &Library) -> Result<u32, sq
                 .unwrap_or("")
                 .to_lowercase();
 
+            scanned_files += 1;
             if !VIDEO_EXTENSIONS.contains(&ext.as_str()) {
+                skipped_ext += 1;
                 continue;
             }
 
@@ -391,6 +466,7 @@ async fn scan_tv_library(pool: &SqlitePool, library: &Library) -> Result<u32, sq
 
             // Skip if already exists (in-memory check)
             if existing_paths.contains(&file_path) {
+                existing_count += 1;
                 continue;
             }
 
@@ -565,6 +641,14 @@ async fn scan_tv_library(pool: &SqlitePool, library: &Library) -> Result<u32, sq
             new_items.push(episode_item);
         }
 
+        tracing::info!(
+            "TV library '{}': scanned {} files, skipped {} (non-video extension), created {} new items (series/seasons/episodes)",
+            library.name,
+            scanned_files,
+            skipped_ext,
+            new_items.len()
+        );
+
         // Batch-insert all new items (series, seasons, episodes) in a single transaction
         if !new_items.is_empty() {
             if let Err(e) =
@@ -572,25 +656,64 @@ async fn scan_tv_library(pool: &SqlitePool, library: &Library) -> Result<u32, sq
             {
                 tracing::error!("failed to batch insert TV items: {}", e);
             } else {
-                // Spawn async probes for episode items (bounded concurrency)
+                // Find and save local images for series and seasons
+                let mut all_images: Vec<rustyfin_model::image::ItemImage> = Vec::new();
+                for item in &new_items {
+                    if item.media_type == MediaType::Series || item.media_type == MediaType::Season
+                    {
+                        let item_path = std::path::Path::new(&item.path);
+                        let images = local_images::find_local_images(item_path, item.id);
+                        if !images.is_empty() {
+                            tracing::debug!(
+                                "found {} local images for '{}'",
+                                images.len(),
+                                item.name
+                            );
+                        }
+                        all_images.extend(images);
+                    }
+                }
+                if !all_images.is_empty() {
+                    if let Err(e) =
+                        rustyfin_db::repo_image::batch_upsert_images(pool, &all_images).await
+                    {
+                        tracing::error!("failed to batch insert local images: {}", e);
+                    } else {
+                        tracing::info!("saved {} local images for TV library", all_images.len());
+                    }
+                }
+
+                // Spawn async probes for episode items (fire-and-forget).
+                // The semaphore in probe module limits concurrency.
                 for item in &new_items {
                     if item.media_type == MediaType::Episode {
                         probe::spawn_probe_and_save(pool.clone(), item.id, item.path.clone());
                     }
                 }
                 count += new_items.len() as u32;
+                new_item_ids = new_items.iter().map(|item| item.id).collect();
             }
         }
     }
 
-    tracing::info!("scanned {} items for TV library '{}'", count, library.name);
-    Ok(count)
+    tracing::info!(
+        "scanned TV library '{}': {} new items added ({} existing items unchanged)",
+        library.name,
+        count,
+        existing_count
+    );
+    Ok((count, new_item_ids))
 }
 
 /// Recursive scan for Music: path/Artist/Album/track files
 /// Builds Artist → Album → Track hierarchy using directory structure and audio tags.
-async fn scan_music_library(pool: &SqlitePool, library: &Library) -> Result<u32, sqlx::Error> {
+async fn scan_music_library(
+    pool: &SqlitePool,
+    library: &Library,
+) -> Result<(u32, Vec<Uuid>), sqlx::Error> {
     let mut count = 0u32;
+    let mut existing_count = 0u32;
+    let mut new_item_ids: Vec<Uuid> = Vec::new();
 
     // Load all existing paths into a HashSet for O(1) existence checks.
     let existing_paths: HashSet<String> =
@@ -621,7 +744,15 @@ async fn scan_music_library(pool: &SqlitePool, library: &Library) -> Result<u32,
 
         // Async directory traversal — non-blocking on Tokio runtime
         let files = collect_files(path).await;
+        tracing::info!(
+            "music library '{}': found {} files in path {}",
+            library.name,
+            files.len(),
+            lib_path
+        );
 
+        let mut scanned_files = 0u32;
+        let mut skipped_ext = 0u32;
         for file_path_buf in files {
             let ext = file_path_buf
                 .extension()
@@ -629,7 +760,9 @@ async fn scan_music_library(pool: &SqlitePool, library: &Library) -> Result<u32,
                 .unwrap_or("")
                 .to_lowercase();
 
+            scanned_files += 1;
             if !AUDIO_EXTENSIONS.contains(&ext.as_str()) {
+                skipped_ext += 1;
                 continue;
             }
 
@@ -637,6 +770,7 @@ async fn scan_music_library(pool: &SqlitePool, library: &Library) -> Result<u32,
 
             // Skip if already exists (in-memory check)
             if existing_paths.contains(&file_path) {
+                existing_count += 1;
                 continue;
             }
 
@@ -803,7 +937,7 @@ async fn scan_music_library(pool: &SqlitePool, library: &Library) -> Result<u32,
                 sort_name: Some(file_name.to_lowercase()),
                 overview: None,
                 media_type: MediaType::Audio,
-                path: file_path.clone(),
+                path: file_path_buf.to_string_lossy().to_string(),
                 parent_id: Some(album_id),
                 library_id: library.id,
                 production_year: year,
@@ -822,6 +956,14 @@ async fn scan_music_library(pool: &SqlitePool, library: &Library) -> Result<u32,
             new_items.push(item);
         }
 
+        tracing::info!(
+            "music library '{}': scanned {} files, skipped {} (non-audio extension), created {} new items",
+            library.name,
+            scanned_files,
+            skipped_ext,
+            new_items.len()
+        );
+
         // Batch-insert all new items (artists, albums, tracks) in a single transaction
         if !new_items.is_empty() {
             if let Err(e) =
@@ -829,23 +971,53 @@ async fn scan_music_library(pool: &SqlitePool, library: &Library) -> Result<u32,
             {
                 tracing::error!("failed to batch insert music items: {}", e);
             } else {
-                // Spawn async probes for audio items (bounded concurrency)
+                // Find and save local images for albums (cover art)
+                let mut all_images: Vec<rustyfin_model::image::ItemImage> = Vec::new();
+                for item in &new_items {
+                    if item.media_type == MediaType::MusicAlbum {
+                        // For albums, look for images in the album directory
+                        let album_dir = std::path::Path::new(&item.path);
+                        let images = local_images::find_local_images(album_dir, item.id);
+                        if !images.is_empty() {
+                            tracing::debug!(
+                                "found {} local images for album '{}'",
+                                images.len(),
+                                item.name
+                            );
+                        }
+                        all_images.extend(images);
+                    }
+                }
+                if !all_images.is_empty() {
+                    if let Err(e) =
+                        rustyfin_db::repo_image::batch_upsert_images(pool, &all_images).await
+                    {
+                        tracing::error!("failed to batch insert local images: {}", e);
+                    } else {
+                        tracing::info!("saved {} local images for music library", all_images.len());
+                    }
+                }
+
+                // Spawn async probes for audio items (fire-and-forget).
+                // The semaphore in probe module limits concurrency.
                 for item in &new_items {
                     if item.media_type == MediaType::Audio {
                         probe::spawn_probe_and_save(pool.clone(), item.id, item.path.clone());
                     }
                 }
                 count += new_items.len() as u32;
+                new_item_ids = new_items.iter().map(|item| item.id).collect();
             }
         }
     }
 
     tracing::info!(
-        "scanned {} items for music library '{}'",
+        "scanned music library '{}': {} new items added ({} existing items unchanged)",
+        library.name,
         count,
-        library.name
+        existing_count
     );
-    Ok(count)
+    Ok((count, new_item_ids))
 }
 
 fn detect_media_type(ext: &str, content_type: &LibraryContentType) -> Option<MediaType> {
@@ -907,9 +1079,24 @@ async fn collect_files(root: &Path) -> Vec<PathBuf> {
         let mut children = Vec::new();
         while let Ok(Some(entry)) = entries.next_entry().await {
             let path = entry.path();
-            if path.is_dir() {
+            let is_dir = if let Ok(ft) = entry.file_type().await {
+                if ft.is_dir() {
+                    true
+                } else if ft.is_symlink() {
+                    fs::metadata(&path)
+                        .await
+                        .map(|m| m.is_dir())
+                        .unwrap_or(false)
+                } else {
+                    false
+                }
+            } else {
+                path.is_dir()
+            };
+
+            if is_dir {
                 children.push(path);
-            } else if path.is_file() {
+            } else {
                 result.push(path);
             }
         }

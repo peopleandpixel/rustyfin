@@ -415,3 +415,654 @@ async fn test_delete_device() {
         .unwrap();
     assert!(devices.is_empty());
 }
+
+// ── Media Source & Stream Tests ──
+
+#[tokio::test]
+async fn test_insert_media_source_with_streams() {
+    let temp_db = test_pool().await;
+    let pool = temp_db.pool.clone();
+
+    // Create a library and media item
+    let lib = make_library("Movies", LibraryContentType::Movies);
+    rustyfin_db::repo_library::create_library(&pool, &lib)
+        .await
+        .unwrap();
+
+    let item_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO media_items (id, library_id, name, media_type, path) VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(item_id.to_string())
+    .bind(lib.id.to_string())
+    .bind("Sample Movie")
+    .bind("Movie")
+    .bind("/media/movies/sample.mkv")
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let source = rustyfin_model::media_source::MediaSourceResponse {
+        id: Uuid::new_v4().to_string(),
+        uid: Uuid::new_v4().to_string(),
+        container: Some("mkv".to_string()),
+        protocol: "File".to_string(),
+        path: "/media/movies/sample.mkv".to_string(),
+        r#type: "Default".to_string(),
+        run_time_ticks: Some(72000000000),
+        size: Some(1024 * 1024 * 500),
+        bitrate: Some(2500000),
+        video_bitrate: Some(2000000),
+        audio_bitrate: Some(500000),
+        width: Some(1920),
+        height: Some(1080),
+        aspect_ratio: Some("16/9".to_string()),
+        is_remote: false,
+        media_state: None,
+        media_streams: vec![
+            rustyfin_model::media_source::MediaStream {
+                index: 0,
+                codec: Some("h264".to_string()),
+                codec_type: "Video".to_string(),
+                language: Some("eng".to_string()),
+                time_base: Some("1/1000".to_string()),
+                codec_time_base: None,
+                codec_tag: None,
+                is_external: false,
+                path: None,
+                width: Some(1920),
+                height: Some(1080),
+                average_frame_rate: Some("24".to_string()),
+                real_frame_rate: Some("24".to_string()),
+                bit_rate: Some(2000000),
+                bit_depth: Some(8),
+                channels: None,
+                channel_layout: None,
+                sample_rate: None,
+                profile: Some("High".to_string()),
+                r#type: None,
+                aspect_ratio_text: None,
+                aspect_ratio: None,
+                title: Some("Main Video".to_string()),
+                color_space: None,
+                color_transfer: None,
+                color_primaries: None,
+                color_range: None,
+                localized_uri: None,
+                is_default: true,
+                is_forced: false,
+                is_interlaced: false,
+                embedded_bitmaps: false,
+            },
+            rustyfin_model::media_source::MediaStream {
+                index: 1,
+                codec: Some("aac".to_string()),
+                codec_type: "Audio".to_string(),
+                language: Some("ger".to_string()),
+                time_base: Some("1/1000".to_string()),
+                codec_time_base: None,
+                codec_tag: None,
+                is_external: false,
+                path: None,
+                width: None,
+                height: None,
+                average_frame_rate: None,
+                real_frame_rate: None,
+                bit_rate: Some(500000),
+                bit_depth: None,
+                channels: Some(6),
+                channel_layout: Some("5.1".to_string()),
+                sample_rate: Some(48000),
+                profile: None,
+                r#type: None,
+                aspect_ratio_text: None,
+                aspect_ratio: None,
+                title: Some("German 5.1".to_string()),
+                color_space: None,
+                color_transfer: None,
+                color_primaries: None,
+                color_range: None,
+                localized_uri: None,
+                is_default: true,
+                is_forced: false,
+                is_interlaced: false,
+                embedded_bitmaps: false,
+            },
+        ],
+        supports_transcoding: true,
+        supports_direct_stream: true,
+        supports_direct_play: true,
+    };
+
+    let source_id =
+        rustyfin_db::repo_media_source::insert_media_source_with_streams(&pool, &item_id, &source)
+            .await
+            .unwrap();
+
+    let fetched = rustyfin_db::repo_media_source::get_media_sources(&pool, &item_id)
+        .await
+        .unwrap();
+    assert_eq!(fetched.len(), 1);
+    assert_eq!(fetched[0].id, source_id.to_string());
+    assert_eq!(fetched[0].media_streams.len(), 2);
+    assert_eq!(fetched[0].media_streams[0].codec.as_deref(), Some("h264"));
+    assert_eq!(fetched[0].media_streams[1].channels, Some(6));
+}
+
+#[tokio::test]
+async fn test_get_items_filtered_no_overflow() {
+    let temp_db = test_pool().await;
+    let pool = temp_db.pool.clone();
+
+    let lib = make_library("Movies", LibraryContentType::Movies);
+    rustyfin_db::repo_library::create_library(&pool, &lib)
+        .await
+        .unwrap();
+
+    let item_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO media_items (id, library_id, name, media_type, path) VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(item_id.to_string())
+    .bind(lib.id.to_string())
+    .bind("Sample Movie")
+    .bind("Movie")
+    .bind("/media/movies/sample.mkv")
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (items, count) = rustyfin_db::repo_media::get_items_filtered(
+        &pool,
+        None,
+        Some(lib.id),
+        Some(&["Movie".to_string()]),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        0,
+        10,
+        true,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(count, 1);
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].id, item_id);
+}
+
+#[tokio::test]
+async fn test_get_media_sources_batch_and_ordering() {
+    let temp_db = test_pool().await;
+    let pool = temp_db.pool.clone();
+
+    let lib = make_library("Movies", LibraryContentType::Movies);
+    rustyfin_db::repo_library::create_library(&pool, &lib)
+        .await
+        .unwrap();
+
+    let item_id_1 = Uuid::new_v4();
+    let item_id_2 = Uuid::new_v4();
+
+    for (item_id, name) in [(item_id_1, "Movie One"), (item_id_2, "Movie Two")] {
+        sqlx::query(
+            "INSERT INTO media_items (id, library_id, name, media_type, path) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(item_id.to_string())
+        .bind(lib.id.to_string())
+        .bind(name)
+        .bind("Movie")
+        .bind(format!("/media/{}.mkv", name))
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    // Source for item 1 with 2 streams
+    let source_1 = rustyfin_model::media_source::MediaSourceResponse {
+        id: Uuid::new_v4().to_string(),
+        uid: "uid-1".to_string(),
+        container: Some("mkv".to_string()),
+        protocol: "File".to_string(),
+        path: "/media/Movie One.mkv".to_string(),
+        r#type: "Default".to_string(),
+        run_time_ticks: Some(36000000000),
+        size: Some(1024000),
+        bitrate: Some(2000000),
+        video_bitrate: Some(1500000),
+        audio_bitrate: Some(500000),
+        width: Some(1920),
+        height: Some(1080),
+        aspect_ratio: Some("16:9".to_string()),
+        is_remote: false,
+        media_state: None,
+        media_streams: vec![
+            rustyfin_model::media_source::MediaStream {
+                index: 0,
+                codec: Some("h264".to_string()),
+                codec_type: "Video".to_string(),
+                language: None,
+                time_base: Some("1/1000".to_string()),
+                codec_time_base: None,
+                codec_tag: None,
+                is_external: false,
+                path: None,
+                width: Some(1920),
+                height: Some(1080),
+                average_frame_rate: Some("24".to_string()),
+                real_frame_rate: Some("24".to_string()),
+                bit_rate: Some(1500000),
+                bit_depth: Some(8),
+                channels: None,
+                channel_layout: None,
+                sample_rate: None,
+                profile: Some("High".to_string()),
+                r#type: None,
+                aspect_ratio_text: Some("16:9".to_string()),
+                aspect_ratio: Some(1.777),
+                title: None,
+                color_space: None,
+                color_transfer: None,
+                color_primaries: None,
+                color_range: None,
+                localized_uri: None,
+                is_default: true,
+                is_forced: false,
+                is_interlaced: false,
+                embedded_bitmaps: false,
+            },
+            rustyfin_model::media_source::MediaStream {
+                index: 1,
+                codec: Some("eac3".to_string()),
+                codec_type: "Audio".to_string(),
+                language: Some("deu".to_string()),
+                time_base: Some("1/1000".to_string()),
+                codec_time_base: None,
+                codec_tag: None,
+                is_external: false,
+                path: None,
+                width: None,
+                height: None,
+                average_frame_rate: None,
+                real_frame_rate: None,
+                bit_rate: Some(256000),
+                bit_depth: None,
+                channels: Some(6),
+                channel_layout: Some("5.1".to_string()),
+                sample_rate: Some(48000),
+                profile: None,
+                r#type: None,
+                aspect_ratio_text: None,
+                aspect_ratio: None,
+                title: Some("German 5.1".to_string()),
+                color_space: None,
+                color_transfer: None,
+                color_primaries: None,
+                color_range: None,
+                localized_uri: None,
+                is_default: true,
+                is_forced: false,
+                is_interlaced: false,
+                embedded_bitmaps: false,
+            },
+        ],
+        supports_transcoding: true,
+        supports_direct_stream: true,
+        supports_direct_play: true,
+    };
+
+    // Source for item 2 without streams
+    let source_2 = rustyfin_model::media_source::MediaSourceResponse {
+        id: Uuid::new_v4().to_string(),
+        uid: "uid-2".to_string(),
+        container: Some("avi".to_string()),
+        protocol: "File".to_string(),
+        path: "/media/Movie Two.avi".to_string(),
+        r#type: "Default".to_string(),
+        run_time_ticks: Some(18000000000),
+        size: Some(512000),
+        bitrate: Some(1000000),
+        video_bitrate: None,
+        audio_bitrate: None,
+        width: None,
+        height: None,
+        aspect_ratio: None,
+        is_remote: false,
+        media_state: None,
+        media_streams: vec![],
+        supports_transcoding: true,
+        supports_direct_stream: true,
+        supports_direct_play: true,
+    };
+
+    rustyfin_db::repo_media_source::insert_media_source_with_streams(&pool, &item_id_1, &source_1)
+        .await
+        .unwrap();
+
+    rustyfin_db::repo_media_source::insert_media_source_with_streams(&pool, &item_id_2, &source_2)
+        .await
+        .unwrap();
+
+    let batch =
+        rustyfin_db::repo_media_source::get_media_sources_batch(&pool, &[item_id_1, item_id_2])
+            .await
+            .unwrap();
+
+    assert_eq!(batch.len(), 2);
+    let sources_1 = batch.get(&item_id_1.to_string()).unwrap();
+    assert_eq!(sources_1.len(), 1);
+    assert_eq!(sources_1[0].media_streams.len(), 2);
+    assert_eq!(sources_1[0].media_streams[0].index, 0);
+    assert_eq!(sources_1[0].media_streams[1].index, 1);
+    assert_eq!(sources_1[0].media_streams[0].codec.as_deref(), Some("h264"));
+    assert_eq!(sources_1[0].media_streams[1].codec.as_deref(), Some("eac3"));
+
+    let sources_2 = batch.get(&item_id_2.to_string()).unwrap();
+    assert_eq!(sources_2.len(), 1);
+    assert_eq!(sources_2[0].media_streams.len(), 0);
+}
+
+#[tokio::test]
+async fn test_get_media_sources_batch_large() {
+    let temp_db = test_pool().await;
+    let pool = temp_db.pool.clone();
+    let lib = make_library("LargeLib", LibraryContentType::Movies);
+    rustyfin_db::repo_library::create_library(&pool, &lib)
+        .await
+        .unwrap();
+
+    // Create 450 items (exceeding chunk size of 200)
+    let mut item_ids = Vec::new();
+    for i in 0..450 {
+        let item_id = Uuid::new_v4();
+        let path = format!("/media/movie_{}.mkv", i);
+        sqlx::query(
+            "INSERT INTO media_items (id, library_id, name, media_type, path) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(item_id.to_string())
+        .bind(lib.id.to_string())
+        .bind(format!("Movie {}", i))
+        .bind("Movie")
+        .bind(&path)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        item_ids.push(item_id);
+
+        if i % 50 == 0 {
+            let source = rustyfin_model::media_source::MediaSourceResponse {
+                id: Uuid::new_v4().to_string(),
+                uid: format!("uid-{}", i),
+                container: Some("mkv".to_string()),
+                protocol: "File".to_string(),
+                path: path.clone(),
+                r#type: "Default".to_string(),
+                run_time_ticks: Some(36000000000),
+                size: Some(1024000),
+                bitrate: Some(2000000),
+                video_bitrate: None,
+                audio_bitrate: None,
+                width: None,
+                height: None,
+                aspect_ratio: None,
+                is_remote: false,
+                media_state: None,
+                media_streams: vec![],
+                supports_transcoding: true,
+                supports_direct_stream: true,
+                supports_direct_play: true,
+            };
+            rustyfin_db::repo_media_source::insert_media_source_with_streams(
+                &pool, &item_id, &source,
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    let batch = rustyfin_db::repo_media_source::get_media_sources_batch(&pool, &item_ids)
+        .await
+        .unwrap();
+
+    // 450 items total, 9 of them (0, 50, 100, 150, 200, 250, 300, 350, 400) have sources
+    assert_eq!(batch.len(), 9);
+    for i in (0..450).step_by(50) {
+        let id_str = item_ids[i].to_string();
+        assert!(batch.contains_key(&id_str));
+    }
+}
+
+#[tokio::test]
+async fn test_filtered_query_with_genres_and_tags() {
+    let temp_db = test_pool().await;
+    let pool = temp_db.pool.clone();
+    let lib = make_library("FilterLib", LibraryContentType::Movies);
+    rustyfin_db::repo_library::create_library(&pool, &lib)
+        .await
+        .unwrap();
+
+    let id1 = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO media_items (id, library_id, name, media_type, path, genres) VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(id1.to_string())
+    .bind(lib.id.to_string())
+    .bind("Sci-Fi Thriller")
+    .bind("Movie")
+    .bind("/media/scifi.mkv")
+    .bind("Sci-Fi|Thriller")
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let id2 = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO media_items (id, library_id, name, media_type, path, genres) VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(id2.to_string())
+    .bind(lib.id.to_string())
+    .bind("Action Comedy")
+    .bind("Movie")
+    .bind("/media/action.mkv")
+    .bind("Action|Comedy")
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Test genre filtering
+    let sci_fi_genre = vec!["Sci-Fi".to_string()];
+    let (items, total) = rustyfin_db::repo_media::get_items_filtered(
+        &pool,
+        None,
+        Some(lib.id),
+        None,
+        None,
+        Some(&sci_fi_genre),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        0,
+        10,
+        false,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(total, 1);
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].name, "Sci-Fi Thriller");
+}
+
+#[tokio::test]
+async fn test_filtered_query_with_name_starts_with() {
+    let temp_db = test_pool().await;
+    let pool = temp_db.pool.clone();
+    let lib = make_library("AlphaLib", LibraryContentType::Movies);
+    rustyfin_db::repo_library::create_library(&pool, &lib)
+        .await
+        .unwrap();
+
+    let items_data = [
+        (Uuid::new_v4(), "Alien", "Alien"),
+        (Uuid::new_v4(), "Avatar", "Avatar"),
+        (Uuid::new_v4(), "Blade Runner", "Blade Runner"),
+        (Uuid::new_v4(), "The Matrix", "Matrix, The"),
+        (
+            Uuid::new_v4(),
+            "2001: A Space Odyssey",
+            "2001: A Space Odyssey",
+        ),
+    ];
+
+    for (id, name, sort_name) in items_data {
+        sqlx::query(
+            "INSERT INTO media_items (id, library_id, name, sort_name, media_type, path) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(id.to_string())
+        .bind(lib.id.to_string())
+        .bind(name)
+        .bind(sort_name)
+        .bind("Movie")
+        .bind(format!("/media/{}.mkv", name))
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    // Filter by 'A'
+    let (items_a, total_a) = rustyfin_db::repo_media::get_items_filtered(
+        &pool,
+        None,
+        Some(lib.id),
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some("A"),
+        None,
+        None,
+        None,
+        0,
+        100,
+        false,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(total_a, 2);
+    assert_eq!(items_a.len(), 2);
+
+    // Filter by 'M' (matches "The Matrix" via sort_name)
+    let (items_m, total_m) = rustyfin_db::repo_media::get_items_filtered(
+        &pool,
+        None,
+        Some(lib.id),
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some("M"),
+        None,
+        None,
+        None,
+        0,
+        100,
+        false,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(total_m, 1);
+    assert_eq!(items_m[0].name, "The Matrix");
+
+    // Filter by '#' (matches numbers / symbols like "2001: A Space Odyssey")
+    let (items_hash, total_hash) = rustyfin_db::repo_media::get_items_filtered(
+        &pool,
+        None,
+        Some(lib.id),
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some("#"),
+        None,
+        None,
+        None,
+        0,
+        100,
+        false,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(total_hash, 1);
+    assert_eq!(items_hash[0].name, "2001: A Space Odyssey");
+}

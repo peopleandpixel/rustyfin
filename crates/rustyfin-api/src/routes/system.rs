@@ -5,6 +5,7 @@ use axum::{Json, Router};
 use rustyfin_model::server_info::{
     EndpointInfo, FullServerInfo, LogFile, ServerConfiguration, ServerInfo,
 };
+use serde::Deserialize;
 use std::net::SocketAddr;
 
 use crate::error::ApiError;
@@ -29,11 +30,27 @@ pub fn protected_routes() -> Router<AppState> {
             "/System/Configuration",
             get(get_configuration).post(update_configuration),
         )
+        .route(
+            "/System/Configuration/{key}",
+            get(get_configuration_by_key).post(update_configuration_by_key),
+        )
+        .route(
+            "/System/Configuration/Branding",
+            post(update_branding_config),
+        )
+        .route("/System/Info/Storage", get(get_storage_info))
+        .route("/System/Logs/Log", get(get_logs_log))
         .route("/System/Endpoint", get(get_endpoint))
         .route("/System/Shutdown", post(shutdown))
         .route("/System/Restart", post(restart))
         .route("/System/Logs", get(get_logs))
         .route("/System/Log/{name}", get(get_log_content))
+        .route("/System/LogLevel", get(get_log_level).post(set_log_level))
+        .route("/System/UpdatePackages", get(get_update_packages))
+        .route(
+            "/System/RestartScheduledTasks",
+            post(restart_scheduled_tasks),
+        )
 }
 
 async fn health() -> &'static str {
@@ -224,19 +241,169 @@ async fn get_log_content(
     Ok(content)
 }
 
+/// GET /System/LogLevel — Returns the current live log verbosity level.
+async fn get_log_level(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let level = state.log_level_tx.borrow().clone();
+    Json(serde_json::json!({ "LogLevel": level }))
+}
+
+#[derive(Deserialize)]
+#[allow(non_snake_case)]
+struct LogLevelRequest {
+    #[serde(alias = "level")]
+    LogLevel: String,
+}
+
+/// POST /System/LogLevel — Updates the live log verbosity level (trace, debug, info, warn, error).
+async fn set_log_level(
+    State(state): State<AppState>,
+    Json(req): Json<LogLevelRequest>,
+) -> Result<StatusCode, ApiError> {
+    let level = req.LogLevel.to_lowercase();
+    match level.as_str() {
+        "trace" | "debug" | "info" | "warn" | "error" => {
+            let level_clone = level.clone();
+            state
+                .log_level_tx
+                .send(level)
+                .map_err(|e| ApiError::Internal(format!("Failed to update log level: {}", e)))?;
+            tracing::info!(level = ?level_clone, "log level updated");
+            Ok(StatusCode::NO_CONTENT)
+        }
+        _ => Err(ApiError::BadRequest(format!(
+            "Invalid log level: {}. Must be one of: trace, debug, info, warn, error",
+            level
+        ))),
+    }
+}
+
 /// GET /Environment/Drives — Returns list of available drives.
 async fn get_drives() -> Result<Json<Vec<rustyfin_model::environment::DriveInfo>>, ApiError> {
     let drives = list_drives();
     Ok(Json(drives))
 }
 
-/// GET /Environment/NetworkShares — Returns list of network shares (stub on Linux).
+/// GET /Environment/NetworkShares — Returns list of network shares detected on Linux.
 async fn get_network_shares()
 -> Result<Json<Vec<rustyfin_model::environment::NetworkShare>>, ApiError> {
-    // Network share browsing is primarily a Windows feature.
-    // On Linux, we return an empty list as SMB/CIFS share discovery
-    // would require additional dependencies (e.g., smbclient).
-    Ok(Json(Vec::new()))
+    let shares = detect_network_shares();
+    Ok(Json(shares))
+}
+
+/// Detect network shares by parsing /etc/fstab and current mounts.
+fn detect_network_shares() -> Vec<rustyfin_model::environment::NetworkShare> {
+    use rustyfin_model::environment::NetworkShare;
+    use std::collections::HashMap;
+
+    let mut shares = Vec::new();
+
+    // Parse /etc/fstab for network share entries
+    // Format: device mount_point fs_type options dump pass
+    let mut fstab_shares: HashMap<String, (String, String, String)> = HashMap::new();
+    if let Ok(content) = std::fs::read_to_string("/etc/fstab") {
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 3 {
+                continue;
+            }
+
+            // fstab format: device(0) mount_point(1) fs_type(2) options(3) dump(4) pass(5)
+            let fs_type = parts[2].to_lowercase();
+            let mount_point = parts[1].to_string();
+
+            // Detect network filesystem types
+            if fs_type == "cifs" || fs_type == "smbfs" || fs_type == "nfs" || fs_type == "nfs4" {
+                let (server, share_name) = parse_server_share(parts[0]);
+                let share_type = if fs_type == "cifs" || fs_type == "smbfs" {
+                    "CIFS".to_string()
+                } else {
+                    "NFS".to_string()
+                };
+
+                fstab_shares.insert(mount_point.clone(), (server, share_name, share_type));
+            }
+        }
+    }
+
+    // Parse current mounts for active network shares
+    if let Ok(content) = std::fs::read_to_string("/proc/mounts") {
+        for line in content.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 3 {
+                continue;
+            }
+
+            let fs_type = parts[2].to_lowercase();
+            let mount_point = parts[1].to_string();
+
+            if fs_type == "cifs" || fs_type == "smbfs" || fs_type == "nfs" || fs_type == "nfs4" {
+                let (server, share_name) = parse_server_share(parts[0]);
+                let share_type = if fs_type == "cifs" || fs_type == "smbfs" {
+                    "CIFS".to_string()
+                } else {
+                    "NFS".to_string()
+                };
+
+                // Check if we already have this from fstab
+                if let Some((server, share_name, share_type)) = fstab_shares.remove(&mount_point) {
+                    shares.push(NetworkShare {
+                        name: share_name.clone(),
+                        path: mount_point.clone(),
+                        server: server.clone(),
+                        share_type: share_type.clone(),
+                    });
+                } else {
+                    shares.push(NetworkShare {
+                        name: share_name,
+                        path: mount_point,
+                        server,
+                        share_type,
+                    });
+                }
+            }
+        }
+    }
+
+    // Add any fstab entries that aren't currently mounted
+    for (mount_point, (server, share_name, share_type)) in fstab_shares {
+        shares.push(NetworkShare {
+            name: share_name,
+            path: mount_point,
+            server,
+            share_type,
+        });
+    }
+
+    shares
+}
+
+/// Parse a server/share string from fstab or mount output.
+/// Formats: "//server/share", "/server/share", "server:/share", "server:/path/to/share"
+fn parse_server_share(source: &str) -> (String, String) {
+    // CIFS format: //server/share
+    if let Some(rest) = source.strip_prefix("//") {
+        if let Some(pos) = rest.find('/') {
+            let server = &rest[..pos];
+            let share = &rest[pos + 1..];
+            return (server.to_string(), share.to_string());
+        }
+        return (rest.to_string(), "/".to_string());
+    }
+
+    // NFS format: server:/share
+    if let Some(pos) = source.find(':') {
+        let server = &source[..pos];
+        let share = &source[pos + 1..];
+        return (server.to_string(), share.to_string());
+    }
+
+    // Fallback
+    (source.to_string(), "/".to_string())
 }
 
 /// List available drives on the system.
@@ -291,4 +458,134 @@ fn disk_usage(path: &str) -> Result<(i64, i64), std::io::Error> {
     let available = total_size / 4; // rough estimate
 
     Ok((total_size, available))
+}
+
+/// GET /System/Configuration/{key} - Get configuration by key
+async fn get_configuration_by_key(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let config = state.config.read().await;
+    let json = serde_json::to_value(&*config).map_err(|e| ApiError::Internal(e.to_string()))?;
+    Ok(Json(
+        json.get(&key).cloned().unwrap_or(serde_json::json!({})),
+    ))
+}
+
+/// POST /System/Configuration/{key} - Update configuration by key
+async fn update_configuration_by_key(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<StatusCode, ApiError> {
+    // Update the in-memory config by merging the body into the specified key
+    let mut config = state.config.write().await;
+    let json = serde_json::to_value(&*config).map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    // Merge the body into the config at the specified key path
+    let merged = merge_json_values(json, &key, body);
+
+    // Parse back into ServerConfiguration
+    let new_config: ServerConfiguration =
+        serde_json::from_value(merged).map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    *config = new_config;
+    drop(config);
+
+    // Persist to disk
+    let config_path = state.data_dir.join("config.json");
+    let config = state.config.read().await;
+    let json =
+        serde_json::to_string_pretty(&*config).map_err(|e| ApiError::Internal(e.to_string()))?;
+    drop(config);
+    tokio::fs::write(&config_path, &json)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    tracing::info!("configuration key updated: {}", key);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Merge a JSON value into a parent at the specified key path
+fn merge_json_values(
+    parent: serde_json::Value,
+    key: &str,
+    child: serde_json::Value,
+) -> serde_json::Value {
+    match parent {
+        serde_json::Value::Object(mut map) => {
+            if let Some(val) = map.get_mut(key) {
+                *val = child;
+            } else {
+                map.insert(key.to_string(), child);
+            }
+            serde_json::Value::Object(map)
+        }
+        other => other,
+    }
+}
+
+/// POST /System/Configuration/Branding - Update branding configuration
+async fn update_branding_config(
+    State(state): State<AppState>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<StatusCode, ApiError> {
+    // Extract branding settings and store in cache
+    if let Some(enabled) = body.get("SplashscreenEnabled").and_then(|v| v.as_bool()) {
+        state
+            .cache
+            .branding
+            .insert("splashscreen_enabled".to_string(), enabled.to_string());
+    }
+    if let Some(css) = body.get("CustomCss").and_then(|v| v.as_str()) {
+        state
+            .cache
+            .branding
+            .insert("custom_css".to_string(), css.to_string());
+    }
+    if let Some(disclaimer) = body.get("LoginDisclaimer").and_then(|v| v.as_str()) {
+        state
+            .cache
+            .branding
+            .insert("login_disclaimer".to_string(), disclaimer.to_string());
+    }
+
+    tracing::info!("branding configuration updated");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// GET /System/Info/Storage - Get storage information
+async fn get_storage_info(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let log_path = state.data_dir.join("logs").to_string_lossy().to_string();
+    let cache_path = state.data_dir.join("cache").to_string_lossy().to_string();
+    let program_data_path = state.data_dir.to_string_lossy().to_string();
+    Ok(Json(serde_json::json!({
+        "LogPath": log_path,
+        "CachePath": cache_path,
+        "ProgramDataPath": program_data_path,
+        "InternalMemoryPaths": [],
+        "InternalUsbPaths": []
+    })))
+}
+
+/// GET /System/Logs/Log - Download a log file
+async fn get_logs_log(State(state): State<AppState>) -> Result<Json<Vec<LogFile>>, ApiError> {
+    get_logs(State(state)).await
+}
+
+/// GET /System/UpdatePackages - Get available updates
+async fn get_update_packages(
+    State(_state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    Ok(Json(serde_json::json!([])))
+}
+
+/// POST /System/RestartScheduledTasks - Restart scheduled tasks
+async fn restart_scheduled_tasks(State(state): State<AppState>) -> Result<StatusCode, ApiError> {
+    tracing::info!("scheduled tasks restart requested");
+    // Restart the task scheduler
+    state.task_scheduler.restart().await;
+    Ok(StatusCode::NO_CONTENT)
 }

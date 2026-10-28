@@ -8,7 +8,7 @@
 [![Edition](https://img.shields.io/badge/Edition-2024-blue)](https://doc.rust-lang.org/edition-guide/rust-2024/)
 [![Axum](https://img.shields.io/badge/Axum-0.8-blue?logo=rust&logoColor=white)](https://github.com/tokio-rs/axum)
 [![Tokio](https://img.shields.io/badge/Tokio-1.x-blue?logo=rust&logoColor=white)](https://tokio.rs)
-[![SQLx](https://img.shields.io/badge/SQLx-0.8-blue?logo=rust&logoColor=white)](https://github.com/launchbadge/sqlx)
+[![SQLx](https://img.shields.io/badge/SQLx-0.9-blue?logo=rust&logoColor=white)](https://github.com/launchbadge/sqlx)
 [![Jellyfin](https://img.shields.io/badge/Jellyfin-API%20Compatible-663399?logo=jellyfin&logoColor=white)](https://jellyfin.org)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 [![Build](https://github.com/peopleandpixel/rustyfin/actions/workflows/ci.yml/badge.svg)](https://github.com/peopleandpixel/rustyfin/actions)
@@ -18,7 +18,7 @@
 
 ---
 
-#### Rustyfin is an independent open-source project and is not affiliated with, endorsed by, or connected to the Jellyfin project.
+> ## **Rustyfin is an independent open-source project and is not affiliated with, endorsed by, or connected to the Jellyfin project.
 
 ## 🎯 Why Rustyfin?
 
@@ -92,7 +92,7 @@
 - ✅ **Network discovery** — UDP discovery on port 7359, mDNS/Bonjour support
 
 ### Web UI & Real-time
-- ✅ **Jellyfin Web UI** — Static web frontend served natively
+- ✅ **Optimized Web UI** — Custom frontend with virtual scrolling, infinite scroll, service worker caching, and Vite build system
 - ✅ **WebSocket** — Real-time events (playback, library changes, sessions, commands)
 - ✅ **Remote commands** — Session control via WebSocket and HTTP
 - ✅ **Activity log** — Login attempts, media playback logging
@@ -175,6 +175,31 @@ rustyfin/
 - **SQLite3** dev headers (bundled via `sqlx`)
 
 ### Build & Run
+
+#### Quick Start Script (Development & Testing)
+
+```bash
+# Start server locally in foreground (auto-builds web client and server)
+./start.sh
+
+# Start fresh with a clean database and reset cache
+./start.sh --fresh
+# or simply:
+./start.sh fresh
+
+# Run all tests and smoke tests
+./start.sh test
+./start.sh smoke
+
+# Start in background / status / live logs / stop
+./start.sh start
+./start.sh start --fresh
+./start.sh status
+./start.sh logs         # Follow live server logs in real time
+./start.sh stop
+```
+
+#### Manual Build & Run
 
 ```bash
 git clone https://github.com/peopleandpixel/rustyfin.git

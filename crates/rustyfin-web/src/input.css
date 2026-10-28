@@ -3,136 +3,140 @@
   themes: dark --default, light;
 }
 
-/* Jellyfin-inspired custom styles */
+/* Jellyfin 12.x inspired modern design system with Rustyfin aesthetics */
 :root {
   --jf-primary: #00a4dc;
-  --jf-bg-dark: #101010;
-  --jf-bg-card: #1a1a1a;
-  --jf-bg-surface: #202020;
+  --jf-primary-hover: #008fbf;
+  --jf-primary-glow: rgba(0, 164, 220, 0.4);
+  --rf-ember: #f97316;
+  --rf-ember-glow: rgba(249, 115, 22, 0.4);
+  --jf-bg-darkest: #07090e;
+  --jf-bg-dark: #0d1117;
+  --jf-bg-card: #151a23;
+  --jf-bg-surface: #1e2430;
+  --jf-bg-glass: rgba(19, 24, 34, 0.75);
+  --jf-border: rgba(255, 255, 255, 0.08);
+  --jf-border-hover: rgba(0, 164, 220, 0.35);
   --jf-accent: #00a4dc;
+  --jf-text-main: #f0f3f8;
+  --jf-text-muted: #8b949e;
 }
 
 [data-theme="dark"] {
-  --b1: 6.27% 0 0;
-  --b2: 10.2% 0 0;
-  --b3: 7.84% 0 0;
-  --p: 63.47% 0.1182 220.73;
+  --b1: 6% 0.01 250;
+  --b2: 9% 0.015 250;
+  --b3: 13% 0.02 250;
+  --p: 63% 0.15 220;
   --pc: 100% 0 0;
-  --s: 55.83% 0.1574 276.97;
+  --s: 65% 0.18 45;
   --sc: 100% 0 0;
-  --a: 63.47% 0.1182 220.73;
+  --a: 63% 0.15 220;
   --ac: 100% 0 0;
-  --n: 27.06% 0.01 256.09;
-  --nc: 80% 0 0;
+  --n: 20% 0.02 250;
+  --nc: 85% 0 0;
 }
 
 body {
-  background: var(--jf-bg-dark);
-  font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+  background-color: var(--jf-bg-darkest);
+  color: var(--jf-text-main);
+  font-family: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  overflow-x: hidden;
 }
 
-/* Backdrop blur for navbar */
-.jf-navbar {
-  background: rgba(16, 16, 16, 0.85);
-  backdrop-filter: blur(20px);
-  -webkit-backdrop-filter: blur(20px);
-  border-bottom: 1px solid rgba(255,255,255,0.06);
+/* Frosted glass header — backdrop-filter only on desktop to save mobile CPU */
+.jf-header {
+  background: var(--jf-bg-glass);
+  border-bottom: 1px solid var(--jf-border);
+  transition: all 0.25s ease;
+}
+@media (min-width: 768px) {
+  .jf-header {
+    backdrop-filter: blur(24px);
+    -webkit-backdrop-filter: blur(24px);
+  }
 }
 
-/* Card hover effects */
+/* Sidebar & Drawer — backdrop-filter only on desktop */
+.jf-drawer {
+  background: rgba(13, 17, 23, 0.85);
+  border-right: 1px solid var(--jf-border);
+}
+@media (min-width: 768px) {
+  .jf-drawer {
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+  }
+}
+
+.jf-drawer-item {
+  display: flex;
+  align-items: center;
+  gap: 0.85rem;
+  padding: 0.65rem 1rem;
+  border-radius: 0.6rem;
+  color: rgba(255, 255, 255, 0.7);
+  font-size: 0.875rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  user-select: none;
+}
+
+.jf-drawer-item:hover {
+  background: rgba(255, 255, 255, 0.05);
+  color: #fff;
+  transform: translateX(2px);
+}
+
+.jf-drawer-item.active {
+  background: linear-gradient(90deg, rgba(0, 164, 220, 0.2) 0%, rgba(0, 164, 220, 0.05) 100%);
+  color: #38bdf8;
+  border-left: 3px solid #00a4dc;
+}
+
+/* Card Styling - 12.x aesthetic */
 .jf-card {
   background: var(--jf-bg-card);
-  border-radius: 0.5rem;
+  border: 1px solid var(--jf-border);
+  border-radius: 0.85rem;
   overflow: hidden;
-  transition: transform 0.2s ease, box-shadow 0.2s ease;
+  position: relative;
   cursor: pointer;
-}
-.jf-card:hover {
-  transform: translateY(-4px);
-  box-shadow: 0 8px 25px rgba(0,0,0,0.4);
-}
-.jf-card img {
-  transition: transform 0.3s ease;
-}
-.jf-card:hover img {
-  transform: scale(1.05);
+  transition: transform 0.25s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.25s ease, border-color 0.25s ease;
+  will-change: transform;
 }
 
-/* Poster aspect ratio */
+.jf-card:hover {
+  transform: translateY(-6px) scale(1.02);
+  box-shadow: 0 16px 36px -10px rgba(0, 0, 0, 0.8), 0 0 20px -3px var(--jf-primary-glow);
+  border-color: var(--jf-border-hover);
+}
+
 .jf-poster {
   aspect-ratio: 2/3;
   background: var(--jf-bg-surface);
   overflow: hidden;
   position: relative;
+  border-radius: 0.85rem 0.85rem 0 0;
 }
 
-/* Backdrop hero */
-.jf-backdrop {
-  position: relative;
-  background: var(--jf-bg-dark);
+.jf-poster-backdrop {
+  aspect-ratio: 16/9;
+  background: var(--jf-bg-surface);
   overflow: hidden;
-}
-.jf-backdrop::after {
-  content: '';
-  position: absolute;
-  inset: 0;
-  background: linear-gradient(to top, var(--jf-bg-dark) 0%, transparent 60%),
-              linear-gradient(to right, var(--jf-bg-dark) 0%, transparent 50%);
+  position: relative;
+  border-radius: 0.85rem 0.85rem 0 0;
 }
 
-/* Sidebar */
-.jf-sidebar {
-  background: var(--jf-bg-card);
-  border-right: 1px solid rgba(255,255,255,0.06);
-}
-.jf-sidebar a {
-  display: flex;
-  align-items: center;
-  gap: 0.75rem;
-  padding: 0.625rem 1rem;
-  border-radius: 0.375rem;
-  color: rgba(255,255,255,0.7);
-  transition: all 0.15s ease;
-  font-size: 0.9rem;
-}
-.jf-sidebar a:hover, .jf-sidebar a.active {
-  background: rgba(0, 164, 220, 0.15);
-  color: var(--jf-accent);
+.jf-card img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  transition: transform 0.4s ease;
 }
 
-/* Scrollbar */
-::-webkit-scrollbar { width: 6px; height: 6px; }
-::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.15); border-radius: 3px; }
-::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.25); }
-
-/* Horizontal scroll row */
-.jf-scroll-row {
-  display: flex;
-  gap: 1rem;
-  overflow-x: auto;
-  padding-bottom: 0.5rem;
-  scroll-snap-type: x mandatory;
-}
-.jf-scroll-row > * {
-  scroll-snap-align: start;
-  flex-shrink: 0;
-}
-
-/* Badge styles */
-.jf-badge {
-  display: inline-flex;
-  align-items: center;
-  padding: 0.2rem 0.6rem;
-  border-radius: 0.25rem;
-  font-size: 0.75rem;
-  font-weight: 500;
-  background: rgba(255,255,255,0.1);
-  color: rgba(255,255,255,0.8);
-}
-.jf-badge-primary {
-  background: rgba(0, 164, 220, 0.2);
-  color: var(--jf-accent);
+.jf-card:hover img {
+  transform: scale(1.06);
 }
 
 /* Play button overlay */
@@ -142,12 +146,29 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: rgba(0,0,0,0.5);
+  background: radial-gradient(circle, rgba(0, 0, 0, 0.6) 0%, rgba(0, 0, 0, 0.3) 100%);
   opacity: 0;
-  transition: opacity 0.2s ease;
+  transition: opacity 0.25s ease, backdrop-filter 0.25s ease;
 }
+
 .jf-card:hover .jf-play-overlay {
   opacity: 1;
+}
+
+.jf-play-btn-circle {
+  width: 3.25rem;
+  height: 3.25rem;
+  border-radius: 9999px;
+  background: linear-gradient(135deg, #00a4dc 0%, #0077b6 100%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 8px 24px rgba(0, 164, 220, 0.5);
+  transition: transform 0.2s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+}
+
+.jf-card:hover .jf-play-btn-circle:hover {
+  transform: scale(1.15);
 }
 
 /* Progress bar on cards */
@@ -156,53 +177,519 @@ body {
   bottom: 0;
   left: 0;
   right: 0;
-  height: 3px;
-  background: rgba(255,255,255,0.1);
-}
-.jf-progress-bar {
-  height: 100%;
-  background: var(--jf-accent);
-  border-radius: 0 1px 0 0;
+  height: 4px;
+  background: rgba(0, 0, 0, 0.6);
+  backdrop-filter: blur(4px);
 }
 
-/* Setup wizard */
+.jf-progress-bar {
+  height: 100%;
+  background: linear-gradient(90deg, #00a4dc, #38bdf8);
+  box-shadow: 0 0 8px #00a4dc;
+}
+
+/* Badges & Chips */
+.jf-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.25rem 0.55rem;
+  border-radius: 0.4rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  color: rgba(255, 255, 255, 0.85);
+  backdrop-filter: blur(8px);
+}
+
+.jf-badge-primary {
+  background: rgba(0, 164, 220, 0.18);
+  border-color: rgba(0, 164, 220, 0.3);
+  color: #38bdf8;
+}
+
+.jf-badge-accent {
+  background: rgba(249, 115, 22, 0.18);
+  border-color: rgba(249, 115, 22, 0.3);
+  color: #fb923c;
+}
+
+.jf-badge-rating {
+  background: rgba(234, 179, 8, 0.15);
+  border-color: rgba(234, 179, 8, 0.3);
+  color: #facc15;
+}
+
+/* Hero Spotlight / Featured Banner */
+.jf-spotlight {
+  position: relative;
+  min-height: 420px;
+  border-radius: 1.25rem;
+  overflow: hidden;
+  border: 1px solid var(--jf-border);
+  box-shadow: 0 20px 40px -15px rgba(0, 0, 0, 0.7);
+}
+
+.jf-spotlight-backdrop {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.jf-spotlight-gradient {
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(circle at 75% 30%, transparent 0%, rgba(7, 9, 14, 0.85) 70%, #07090e 100%),
+              linear-gradient(to top, #07090e 0%, rgba(7, 9, 14, 0.4) 40%, transparent 100%),
+              linear-gradient(to right, #07090e 0%, rgba(7, 9, 14, 0.7) 45%, transparent 100%);
+}
+
+/* Detail view backdrop header */
+.jf-detail-hero {
+  position: relative;
+  min-height: 460px;
+  overflow: hidden;
+  border-radius: 1.25rem;
+  margin-bottom: 2rem;
+  border: 1px solid var(--jf-border);
+}
+
+.jf-detail-hero::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(to top, var(--jf-bg-darkest) 0%, rgba(7, 9, 14, 0.75) 45%, rgba(7, 9, 14, 0.3) 100%),
+              linear-gradient(to right, var(--jf-bg-darkest) 0%, rgba(7, 9, 14, 0.6) 50%, transparent 100%);
+}
+
+/* Buttons */
+.jf-btn-primary {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  padding: 0.65rem 1.35rem;
+  border-radius: 0.65rem;
+  font-weight: 600;
+  font-size: 0.875rem;
+  background: linear-gradient(135deg, #00a4dc 0%, #0080b0 100%);
+  color: #fff;
+  box-shadow: 0 4px 14px rgba(0, 164, 220, 0.35);
+  transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+  cursor: pointer;
+  border: none;
+}
+
+.jf-btn-primary:hover {
+  background: linear-gradient(135deg, #00b4f0 0%, #0090c4 100%);
+  box-shadow: 0 6px 20px rgba(0, 164, 220, 0.55);
+  transform: translateY(-2px);
+}
+
+.jf-btn-primary:active {
+  transform: translateY(0);
+}
+
+.jf-btn-ghost {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  padding: 0.65rem 1.25rem;
+  border-radius: 0.65rem;
+  font-weight: 500;
+  font-size: 0.875rem;
+  background: rgba(255, 255, 255, 0.07);
+  border: 1px solid var(--jf-border);
+  color: var(--jf-text-main);
+  backdrop-filter: blur(10px);
+  transition: all 0.2s ease;
+  cursor: pointer;
+}
+
+.jf-btn-ghost:hover {
+  background: rgba(255, 255, 255, 0.12);
+  border-color: rgba(255, 255, 255, 0.2);
+  transform: translateY(-1px);
+}
+
+.jf-btn-danger {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  padding: 0.65rem 1.25rem;
+  border-radius: 0.65rem;
+  font-weight: 600;
+  font-size: 0.875rem;
+  background: linear-gradient(135deg, #dc2626 0%, #b91c1c 100%);
+  border: none;
+  color: #fff;
+  box-shadow: 0 4px 14px rgba(220, 38, 38, 0.4);
+  transition: all 0.2s ease;
+  cursor: pointer;
+}
+
+.jf-btn-danger:hover {
+  background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%);
+  box-shadow: 0 6px 20px rgba(220, 38, 38, 0.55);
+  transform: translateY(-2px);
+}
+
+.jf-btn-danger:active {
+  transform: translateY(0);
+}
+
+.jf-icon-btn {
+  width: 2.5rem;
+  height: 2.5rem;
+  border-radius: 0.5rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--jf-border);
+  color: rgba(255, 255, 255, 0.8);
+  transition: all 0.15s ease;
+  cursor: pointer;
+}
+
+.jf-icon-btn:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: #fff;
+  border-color: rgba(255, 255, 255, 0.2);
+}
+
+/* Inputs & Form Controls */
+.jf-input {
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--jf-border);
+  border-radius: 0.65rem;
+  padding: 0.65rem 1rem;
+  color: #fff;
+  font-size: 0.875rem;
+  transition: all 0.2s ease;
+  outline: none;
+}
+
+.jf-input:focus {
+  background: rgba(255, 255, 255, 0.09);
+  border-color: #00a4dc;
+  box-shadow: 0 0 0 3px rgba(0, 164, 220, 0.2);
+}
+
+.jf-search {
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--jf-border);
+  border-radius: 9999px;
+  padding: 0.55rem 1rem 0.55rem 2.5rem;
+  color: #fff;
+  font-size: 0.875rem;
+  transition: all 0.2s ease;
+  outline: none;
+}
+
+.jf-search:focus {
+  background: rgba(255, 255, 255, 0.1);
+  border-color: #00a4dc;
+  box-shadow: 0 0 0 3px rgba(0, 164, 220, 0.25);
+}
+
+/* Settings & Glass cards */
+.jf-settings-card {
+  background: var(--jf-bg-card);
+  border: 1px solid var(--jf-border);
+  border-radius: 1rem;
+  padding: 1.5rem;
+  margin-bottom: 1.25rem;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
+}
+
+.jf-menu {
+  background: rgba(21, 26, 35, 0.95);
+  backdrop-filter: blur(20px);
+  border: 1px solid var(--jf-border);
+  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.6);
+}
+
+.jf-menu-item {
+  display: block;
+  padding: 0.6rem 1rem;
+  font-size: 0.875rem;
+  color: rgba(255, 255, 255, 0.8);
+  transition: background 0.15s ease, color 0.15s ease;
+  cursor: pointer;
+}
+
+.jf-menu-item:hover {
+  background: rgba(0, 164, 220, 0.15);
+  color: #38bdf8;
+}
+
+/* Custom Scrollbars */
+::-webkit-scrollbar {
+  width: 7px;
+  height: 7px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.15);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.3);
+}
+
+/* Horizontal scroll rail */
+.jf-scroll-row {
+  display: flex;
+  gap: 1.25rem;
+  overflow-x: auto;
+  padding-bottom: 0.75rem;
+  padding-top: 0.25rem;
+  scroll-behavior: smooth;
+  scroll-snap-type: x proximity;
+}
+
+.jf-scroll-row > * {
+  scroll-snap-align: start;
+  flex-shrink: 0;
+}
+
+/* Alphabet jump rail */
+.jf-alpha-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+  padding: 0.5rem;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--jf-border);
+  border-radius: 0.75rem;
+  margin-bottom: 1.5rem;
+}
+
+.jf-alpha-btn {
+  width: 1.85rem;
+  height: 1.85rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 0.4rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.6);
+  transition: all 0.15s ease;
+  cursor: pointer;
+}
+
+.jf-alpha-btn:hover, .jf-alpha-btn.active {
+  background: #00a4dc;
+  color: #fff;
+  box-shadow: 0 0 10px rgba(0, 164, 220, 0.5);
+}
+
+/* Episode card in series view */
+.jf-episode-card {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  background: var(--jf-bg-card);
+  border: 1px solid var(--jf-border);
+  border-radius: 0.85rem;
+  padding: 1rem;
+  transition: all 0.2s ease;
+}
+
+@media (min-width: 640px) {
+  .jf-episode-card {
+    flex-direction: row;
+    align-items: center;
+  }
+}
+
+.jf-episode-card:hover {
+  background: var(--jf-bg-surface);
+  border-color: var(--jf-border-hover);
+  transform: translateX(4px);
+}
+
+/* Player Custom Overlay */
+.jf-player-container {
+  position: relative;
+  background: #000;
+  border-radius: 1rem;
+  overflow: hidden;
+  box-shadow: 0 25px 60px rgba(0, 0, 0, 0.9);
+}
+
+.jf-player-controls {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  background: linear-gradient(to top, rgba(0, 0, 0, 0.95) 0%, rgba(0, 0, 0, 0.6) 60%, transparent 100%);
+  padding: 1.5rem 1.5rem 1rem;
+  opacity: 0;
+  transition: opacity 0.3s ease;
+}
+
+.jf-player-container:hover .jf-player-controls,
+.jf-player-controls.visible {
+  opacity: 1;
+}
+
+/* Animations */
+.jf-page {
+  animation: jfFadeUp 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes jfFadeUp {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
 .jf-wizard-step {
   display: none;
 }
 .jf-wizard-step.active {
   display: block;
+  animation: jfFadeUp 0.3s ease;
 }
 
-/* Toast animation */
-@keyframes slideIn {
-  from { transform: translateX(100%); opacity: 0; }
-  to { transform: translateX(0); opacity: 1; }
-}
-@keyframes slideOut {
-  from { transform: translateX(0); opacity: 1; }
-  to { transform: translateX(100%); opacity: 0; }
-}
 .jf-toast {
-  animation: slideIn 0.3s ease;
+  animation: jfToastIn 0.3s cubic-bezier(0.16, 1, 0.3, 1);
 }
 .jf-toast.removing {
-  animation: slideOut 0.3s ease forwards;
+  animation: jfToastOut 0.25s ease forwards;
 }
 
-/* Settings card */
-.jf-settings-card {
-  background: var(--jf-bg-card);
-  border-radius: 0.75rem;
-  border: 1px solid rgba(255,255,255,0.06);
-  padding: 1.5rem;
-  margin-bottom: 1rem;
+@keyframes jfToastIn {
+  from { transform: translateX(100%) scale(0.95); opacity: 0; }
+  to { transform: translateX(0) scale(1); opacity: 1; }
+}
+@keyframes jfToastOut {
+  from { transform: translateX(0) scale(1); opacity: 1; }
+  to { transform: translateX(100%) scale(0.95); opacity: 0; }
 }
 
-/* Smooth page transitions */
-.jf-page {
-  animation: fadeIn 0.2s ease;
+/* Visibility and Modal Overrides */
+.hidden {
+  display: none !important;
 }
-@keyframes fadeIn {
-  from { opacity: 0; transform: translateY(8px); }
-  to { opacity: 1; transform: translateY(0); }
+
+dialog.modal {
+  border: none;
+  padding: 0;
+}
+
+dialog.modal::backdrop {
+  background: rgba(0, 0, 0, 0.75);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+
+/* Lazy Loading Image Effects */
+img.jf-lazy-img {
+  opacity: 0;
+  transition: opacity 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+  will-change: opacity;
+}
+
+img.jf-lazy-img.loaded,
+img.jf-lazy-img:not([data-src]) {
+  opacity: 1;
+}
+
+/* Progressive thumbnail image - shown while full-res loads */
+img.jf-thumb-img {
+  transition: opacity 0.2s ease;
+  will-change: opacity;
+}
+
+.jf-poster, .jf-poster-backdrop {
+  background: linear-gradient(135deg, #151a23 0%, #1e2430 100%);
+  position: relative;
+  overflow: hidden;
+}
+
+.jf-poster-skeleton {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, rgba(255, 255, 255, 0.02) 25%, rgba(255, 255, 255, 0.06) 50%, rgba(255, 255, 255, 0.02) 75%);
+  background-size: 200% 100%;
+  animation: jfSkeleton 1.8s infinite;
+  z-index: 0;
+}
+
+@keyframes jfSkeleton {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+/* Skeleton text placeholders */
+@keyframes jfPulse {
+  0%, 100% { opacity: 0.05; }
+  50% { opacity: 0.1; }
+}
+
+/* Infinite Scroll: invisible sentinel element at bottom of grid */
+.jf-infinite-sentinel {
+  height: 1px;
+  width: 100%;
+  pointer-events: none;
+}
+
+/* Infinite Scroll: loading spinner */
+.jf-infinite-spinner {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1.5rem 0;
+}
+
+.jf-spinner {
+  width: 28px;
+  height: 28px;
+  border: 3px solid rgba(255, 255, 255, 0.1);
+  border-top-color: var(--jf-primary);
+  border-radius: 50%;
+  animation: jfSpin 0.7s linear infinite;
+}
+
+@keyframes jfSpin {
+  to { transform: rotate(360deg); }
+}
+
+/* Virtual Grid: scrollable container with custom scrollbar */
+.jf-virtual-grid {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.2) transparent;
+}
+.jf-virtual-grid::-webkit-scrollbar {
+  width: 6px;
+}
+.jf-virtual-grid::-webkit-scrollbar-track {
+  background: transparent;
+}
+.jf-virtual-grid::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.2);
+  border-radius: 3px;
+}
+.jf-virtual-grid::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.35);
+}
+.jf-virtual-cards {
+  width: 100%;
 }

@@ -10,7 +10,12 @@ use crate::state::AppState;
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/ScheduledTasks", get(get_scheduled_tasks))
+        .route("/ScheduledTasks/{id}", get(get_scheduled_task))
         .route("/ScheduledTasks/{id}/Triggers", post(set_task_triggers))
+        .route(
+            "/ScheduledTasks/Running/{taskId}",
+            post(start_task).delete(stop_task),
+        )
 }
 
 async fn get_scheduled_tasks(State(state): State<AppState>) -> Json<Vec<ScheduledTaskInfo>> {
@@ -27,5 +32,42 @@ async fn set_task_triggers(
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(ApiError::NotFound(format!("task '{}' not found", id)))
+    }
+}
+
+/// GET /ScheduledTasks/{taskId} - Get a specific task
+async fn get_scheduled_task(
+    State(state): State<AppState>,
+    Path(task_id): Path<String>,
+) -> Result<Json<ScheduledTaskInfo>, ApiError> {
+    let tasks = state.task_scheduler.get_all_tasks().await;
+    tasks
+        .into_iter()
+        .find(|t| t.id == task_id)
+        .map(Json)
+        .ok_or_else(|| ApiError::NotFound(format!("task '{}' not found", task_id)))
+}
+
+/// POST /ScheduledTasks/Running/{taskId} - Start a task
+async fn start_task(
+    State(state): State<AppState>,
+    Path(task_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    if state.task_scheduler.start_task(&task_id).await {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::NotFound(format!("task '{}' not found", task_id)))
+    }
+}
+
+/// DELETE /ScheduledTasks/Running/{taskId} - Stop a running task
+async fn stop_task(
+    State(state): State<AppState>,
+    Path(task_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    if state.task_scheduler.stop_task(&task_id).await {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::NotFound(format!("task '{}' not found", task_id)))
     }
 }

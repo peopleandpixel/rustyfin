@@ -14,6 +14,7 @@ pub const TASK_LIBRARY_SCAN: &str = "LibraryScan";
 pub const TASK_METADATA_REFRESH: &str = "MetadataRefresh";
 pub const TASK_TRANSCODE_CLEANUP: &str = "TranscodeCacheCleanup";
 pub const TASK_INTRO_DETECTION: &str = "IntroDetection";
+pub const TASK_DB_VACUUM: &str = "DatabaseVacuum";
 
 /// Default interval: 12 hours in .NET ticks (1 tick = 100ns)
 const TICKS_12H: u64 = 12 * 60 * 60 * 10_000_000;
@@ -131,6 +132,30 @@ impl TaskScheduler {
             },
         );
 
+        // Database VACUUM - runs nightly to defragment SQLite
+        tasks.insert(
+            TASK_DB_VACUUM.to_string(),
+            TaskEntry {
+                info: ScheduledTaskInfo {
+                    id: TASK_DB_VACUUM.to_string(),
+                    name: "Database Maintenance".to_string(),
+                    description:
+                        "Runs VACUUM to defragment the SQLite database and reclaim disk space."
+                            .to_string(),
+                    category: "Maintenance".to_string(),
+                    state: TaskState::Idle,
+                    current_progress_percentage: None,
+                    triggers: vec![TaskTriggerInfo {
+                        trigger_type: "IntervalTrigger".to_string(),
+                        interval_ticks: Some(TICKS_24H),
+                        time_of_day_ticks: None,
+                        max_runtime_ticks: None,
+                    }],
+                    last_execution_result: None,
+                },
+            },
+        );
+
         Self {
             tasks: Arc::new(RwLock::new(tasks)),
             db,
@@ -156,6 +181,70 @@ impl TaskScheduler {
         } else {
             false
         }
+    }
+
+    /// Start a task manually (returns true if task exists)
+    pub async fn start_task(&self, id: &str) -> bool {
+        let tasks = self.tasks.read().await;
+        if tasks.contains_key(id) {
+            drop(tasks);
+            // Spawn the task execution
+            match id {
+                TASK_LIBRARY_SCAN => {
+                    let sched = self.clone();
+                    tokio::spawn(async move { sched.run_library_scan().await });
+                }
+                TASK_METADATA_REFRESH => {
+                    let sched = self.clone();
+                    tokio::spawn(async move { sched.run_metadata_refresh().await });
+                }
+                TASK_TRANSCODE_CLEANUP => {
+                    let sched = self.clone();
+                    tokio::spawn(async move { sched.run_transcode_cleanup().await });
+                }
+                TASK_INTRO_DETECTION => {
+                    let sched = self.clone();
+                    tokio::spawn(async move { sched.run_intro_detection().await });
+                }
+                TASK_DB_VACUUM => {
+                    let sched = self.clone();
+                    tokio::spawn(async move { sched.run_db_vacuum().await });
+                }
+                _ => {}
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Stop a running task (sets state to Idle)
+    pub async fn stop_task(&self, id: &str) -> bool {
+        let tasks = self.tasks.read().await;
+        if let Some(entry) = tasks.get(id) {
+            if entry.info.state == TaskState::Running {
+                drop(tasks);
+                self.set_task_state(id, TaskState::Idle).await;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    }
+
+    /// Restart all scheduled tasks by resetting their state and triggers
+    pub async fn restart(&self) {
+        tracing::info!("Restarting all scheduled tasks");
+        let ids: Vec<String> = {
+            let tasks = self.tasks.read().await;
+            tasks.keys().cloned().collect()
+        };
+        for id in ids {
+            self.set_task_state(&id, TaskState::Idle).await;
+        }
+        tracing::info!("All scheduled tasks restarted");
     }
 
     async fn set_task_state(&self, id: &str, state: TaskState) {
@@ -281,8 +370,9 @@ impl TaskScheduler {
                     match rustyfin_db::repo_media::get_items_by_library(&self.db, lib.id).await {
                         Ok(items) => {
                             for item in &items {
+                                let client = reqwest::Client::new();
                                 if let Err(e) = crate::metadata::refresh_item_metadata(
-                                    &self.db, item, None, None,
+                                    &self.db, &client, item, None, None, None,
                                 )
                                 .await
                                 {
@@ -449,6 +539,99 @@ impl TaskScheduler {
                 }
             }
         });
+
+        // Database VACUUM loop - runs once per day
+        let sched = self.clone();
+        let mut rx = shutdown_rx.clone();
+        tokio::spawn(async move {
+            // Start VACUUM at a quiet time (after 2 hours initial delay, then daily)
+            tokio::time::sleep(std::time::Duration::from_secs(7200)).await;
+            loop {
+                sched.run_db_vacuum().await;
+                let interval = sched
+                    .get_interval_for_task(TASK_DB_VACUUM)
+                    .await
+                    .unwrap_or(std::time::Duration::from_secs(24 * 3600));
+                tokio::select! {
+                    _ = tokio::time::sleep(interval) => {}
+                    _ = rx.wait_for(|v| *v) => break,
+                }
+            }
+        });
+    }
+
+    /// Run SQLite VACUUM to defragment the database
+    async fn run_db_vacuum(&self) {
+        self.set_task_state(TASK_DB_VACUUM, TaskState::Running)
+            .await;
+        let start = Utc::now();
+
+        // Check integrity before vacuuming
+        match sqlx::query_scalar::<_, String>("PRAGMA integrity_check")
+            .fetch_one(&self.db)
+            .await
+        {
+            Ok(status) if status == "ok" => {
+                tracing::info!("Database integrity check passed, running VACUUM");
+            }
+            Ok(status) => {
+                let end = Utc::now();
+                tracing::warn!("Database integrity check returned: {}", status);
+                self.set_task_result(
+                    TASK_DB_VACUUM,
+                    TaskResult {
+                        status: TaskCompletionStatus::Failed,
+                        error_message: Some(format!("Integrity check: {}", status)),
+                        start_time_utc: start.to_rfc3339(),
+                        end_time_utc: end.to_rfc3339(),
+                    },
+                )
+                .await;
+                self.set_task_state(TASK_DB_VACUUM, TaskState::Idle).await;
+                return;
+            }
+            Err(e) => {
+                let end = Utc::now();
+                self.set_task_result(
+                    TASK_DB_VACUUM,
+                    TaskResult {
+                        status: TaskCompletionStatus::Failed,
+                        error_message: Some(e.to_string()),
+                        start_time_utc: start.to_rfc3339(),
+                        end_time_utc: end.to_rfc3339(),
+                    },
+                )
+                .await;
+                self.set_task_state(TASK_DB_VACUUM, TaskState::Idle).await;
+                return;
+            }
+        }
+
+        let result = match sqlx::query("VACUUM").execute(&self.db).await {
+            Ok(_) => {
+                let end = Utc::now();
+                tracing::info!("Database VACUUM completed successfully");
+                TaskResult {
+                    status: TaskCompletionStatus::Completed,
+                    error_message: None,
+                    start_time_utc: start.to_rfc3339(),
+                    end_time_utc: end.to_rfc3339(),
+                }
+            }
+            Err(e) => {
+                let end = Utc::now();
+                tracing::error!("Database VACUUM failed: {}", e);
+                TaskResult {
+                    status: TaskCompletionStatus::Failed,
+                    error_message: Some(e.to_string()),
+                    start_time_utc: start.to_rfc3339(),
+                    end_time_utc: end.to_rfc3339(),
+                }
+            }
+        };
+
+        self.set_task_result(TASK_DB_VACUUM, result).await;
+        self.set_task_state(TASK_DB_VACUUM, TaskState::Idle).await;
     }
 }
 

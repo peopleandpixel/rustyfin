@@ -7,6 +7,7 @@ pub mod metadata;
 pub mod nfo_parser;
 pub mod plugin_manager;
 pub mod probe;
+pub mod provider_fanart;
 pub mod provider_omdb;
 pub mod provider_tmdb;
 pub mod scanner;

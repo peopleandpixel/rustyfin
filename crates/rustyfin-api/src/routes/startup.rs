@@ -23,6 +23,8 @@ pub fn routes() -> Router<AppState> {
             get(get_startup_user).post(create_startup_user),
         )
         .route("/Startup/Complete", post(complete_startup))
+        .route("/Startup/FirstUser", get(get_startup_first_user))
+        .route("/Startup/RemoteAccess", post(setup_remote_access))
 }
 
 async fn get_startup_config(State(state): State<AppState>) -> Json<StartupConfiguration> {
@@ -140,4 +142,25 @@ async fn persist_config(state: &AppState) -> Result<(), ApiError> {
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
     Ok(())
+}
+
+/// GET /Startup/FirstUser - Check if first user exists
+async fn get_startup_first_user(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let users = rustyfin_db::repo_user::get_all_users(&state.db_ro)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "HasExistingUsers": !users.is_empty(),
+        "LocalLoginEnabled": true
+    })))
+}
+
+/// POST /Startup/RemoteAccess - Configure remote access
+async fn setup_remote_access(
+    State(_state): State<AppState>,
+    Json(_body): Json<serde_json::Value>,
+) -> Result<StatusCode, ApiError> {
+    Ok(StatusCode::NO_CONTENT)
 }

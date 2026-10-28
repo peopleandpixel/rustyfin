@@ -86,6 +86,23 @@ pub struct ForgotPasswordResult {
     pub action: String,
 }
 
+/// Request to validate a password reset PIN code
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ResetPasswordRequest {
+    pub pin: String,
+    pub username: String,
+    pub temp_password: String,
+}
+
+/// Request to update a user's password after PIN validation
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct UpdatePasswordRequest {
+    pub temp_password: String,
+    pub new_password: String,
+}
+
 /// User security information
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "PascalCase")]

@@ -1,17 +1,25 @@
+// SQLx queries inherently produce complex tuple types and functions with many parameters
+#![allow(clippy::type_complexity, clippy::too_many_arguments)]
+
 pub mod repo_activity;
 pub mod repo_chapter;
 pub mod repo_collection;
+pub mod repo_device;
 pub mod repo_image;
 pub mod repo_library;
+pub mod repo_live_tv;
 pub mod repo_media;
 pub mod repo_media_segment;
 pub mod repo_media_source;
+pub mod repo_misc;
 pub mod repo_notification;
+pub mod repo_package;
 pub mod repo_person;
 pub mod repo_playback;
 pub mod repo_playlist;
 pub mod repo_search;
 pub mod repo_session;
+pub mod repo_sync_play;
 pub mod repo_trickplay;
 pub mod repo_user;
 
@@ -42,8 +50,14 @@ pub async fn init_db(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
         // PRAGMA: WAL auto-checkpoint at 500 pages to control WAL file size
         .pragma("wal_autocheckpoint", "500");
 
+    // Connection pool size configurable via RUSTYFIN_DB_POOL_SIZE (default: 10)
+    let max_connections: u32 = std::env::var("RUSTYFIN_DB_POOL_SIZE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
+
     let pool = SqlitePoolOptions::new()
-        .max_connections(10)
+        .max_connections(max_connections)
         .min_connections(1)
         .idle_timeout(std::time::Duration::from_secs(300))
         .max_lifetime(std::time::Duration::from_secs(3600))
@@ -120,6 +134,73 @@ pub async fn init_db(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
         .ok();
 
     sqlx::query(include_str!("../migrations/012_trickplay.sql"))
+        .execute(&pool)
+        .await
+        .ok();
+
+    sqlx::query(include_str!("../migrations/013_native_types.sql"))
+        .execute(&pool)
+        .await
+        .ok();
+
+    sqlx::query(include_str!("../migrations/014_genres_tags_index.sql"))
+        .execute(&pool)
+        .await
+        .ok();
+
+    sqlx::query(include_str!("../migrations/015_covering_index.sql"))
+        .execute(&pool)
+        .await
+        .ok();
+
+    sqlx::query(include_str!("../migrations/016_external_ids.sql"))
+        .execute(&pool)
+        .await
+        .ok();
+
+    sqlx::query(include_str!("../migrations/017_user_features.sql"))
+        .execute(&pool)
+        .await
+        .ok();
+
+    sqlx::query(include_str!("../migrations/018_password_reset.sql"))
+        .execute(&pool)
+        .await
+        .ok();
+
+    sqlx::query(include_str!("../migrations/019_client_capabilities.sql"))
+        .execute(&pool)
+        .await
+        .ok();
+
+    sqlx::query(include_str!("../migrations/020_live_tv.sql"))
+        .execute(&pool)
+        .await
+        .ok();
+
+    sqlx::query(include_str!("../migrations/021_new_controllers.sql"))
+        .execute(&pool)
+        .await
+        .ok();
+
+    sqlx::query(include_str!("../migrations/022_performance.sql"))
+        .execute(&pool)
+        .await
+        .ok();
+
+    sqlx::query(include_str!("../migrations/023_fix_image_indices.sql"))
+        .execute(&pool)
+        .await
+        .ok();
+
+    sqlx::query(include_str!(
+        "../migrations/024_fix_local_image_matching.sql"
+    ))
+    .execute(&pool)
+    .await
+    .ok();
+
+    sqlx::query(include_str!("../migrations/025_extended_metadata.sql"))
         .execute(&pool)
         .await
         .ok();

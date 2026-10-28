@@ -31,6 +31,9 @@ pub fn routes() -> Router<AppState> {
         // Playstate Controller endpoints
         .route("/Playstate/PinEpisode", post(pin_episode))
         .route("/Playstate/LastActivityDate", post(last_activity_date))
+        .route("/Playstate/Pause", post(playstate_pause))
+        .route("/Playstate/Unpause", post(playstate_unpause))
+        .route("/Playstate/Stop", post(playstate_stop))
         .route("/Users/{userId}/Items/{itemId}/Rating", put(set_rating))
 }
 
@@ -217,4 +220,61 @@ async fn set_rating(
         req.user_rating
     );
     Ok(Json(data))
+}
+
+/// POST /Playstate/Pause – Report that playback has been paused
+async fn playstate_pause(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Json(_req): Json<PlaybackProgressInfo>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    broadcast_event(
+        &state,
+        WsEvent::SessionChanged {
+            data: serde_json::json!({
+                "UserId": claims.sub.to_string(),
+                "IsPaused": true,
+            }),
+        },
+    )
+    .await;
+    Ok(Json(serde_json::json!({})))
+}
+
+/// POST /Playstate/Unpause – Report that playback has been unpaused
+async fn playstate_unpause(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Json(_req): Json<PlaybackProgressInfo>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    broadcast_event(
+        &state,
+        WsEvent::SessionChanged {
+            data: serde_json::json!({
+                "UserId": claims.sub.to_string(),
+                "IsPaused": false,
+            }),
+        },
+    )
+    .await;
+    Ok(Json(serde_json::json!({})))
+}
+
+/// POST /Playstate/Stop – Report that playback has been stopped
+async fn playstate_stop(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Json(_req): Json<PlaybackStopInfo>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    broadcast_event(
+        &state,
+        WsEvent::SessionChanged {
+            data: serde_json::json!({
+                "UserId": claims.sub.to_string(),
+                "NowPlayingItem": null,
+            }),
+        },
+    )
+    .await;
+    Ok(Json(serde_json::json!({})))
 }

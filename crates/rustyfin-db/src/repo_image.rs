@@ -137,6 +137,70 @@ pub async fn delete_images_for_item(pool: &SqlitePool, item_id: Uuid) -> Result<
     Ok(())
 }
 
+/// Batch-fetch images for multiple items in a single query.
+/// Returns a map of item_id -> Vec<ItemImage>.
+pub async fn get_images_batch(
+    pool: &SqlitePool,
+    item_ids: &[Uuid],
+) -> Result<std::collections::HashMap<String, Vec<ItemImage>>, sqlx::Error> {
+    if item_ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+
+    let id_strs: Vec<String> = item_ids.iter().map(|id| id.to_string()).collect();
+    let placeholders: Vec<String> = (0..id_strs.len()).map(|i| format!("?{}", i + 1)).collect();
+    let query = format!(
+        "SELECT item_id, image_type, image_index, path, provider, width, height
+         FROM item_images WHERE item_id IN ({}) ORDER BY item_id, image_type, image_index",
+        placeholders.join(",")
+    );
+
+    let mut q = sqlx::query_as::<
+        _,
+        (
+            String,
+            String,
+            i32,
+            String,
+            String,
+            Option<i32>,
+            Option<i32>,
+        ),
+    >(sqlx::AssertSqlSafe(query.clone()));
+
+    for id_str in &id_strs {
+        q = q.bind(id_str);
+    }
+
+    let rows = q.fetch_all(pool).await?;
+
+    let mut map: std::collections::HashMap<String, Vec<ItemImage>> =
+        std::collections::HashMap::new();
+
+    for (item_id, img_type, idx, path, provider, w, h) in rows {
+        let image_type = match ImageType::from_str(&img_type) {
+            Some(t) => t,
+            None => continue,
+        };
+        let uuid = match Uuid::parse_str(&item_id) {
+            Ok(u) => u,
+            Err(_) => continue,
+        };
+        let img = ItemImage {
+            item_id: uuid,
+            image_type,
+            image_index: idx,
+            path,
+            provider,
+            width: w,
+            height: h,
+        };
+        map.entry(item_id).or_default().push(img);
+    }
+
+    Ok(map)
+}
+
 /// Batch-insert multiple images in a single transaction.
 /// Uses INSERT OR REPLACE so existing images of the same type are updated.
 pub async fn batch_upsert_images(

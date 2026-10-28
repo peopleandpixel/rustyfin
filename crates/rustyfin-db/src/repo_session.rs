@@ -231,18 +231,20 @@ pub async fn create_session(
     device_name: &str,
     device_id: &str,
     app_version: &str,
+    capabilities: &str,
 ) -> Result<(), sqlx::Error> {
     let sid = session_id.to_string();
     let uid = user_id.to_string();
     sqlx::query(
-        "INSERT INTO sessions (id, user_id, device_id, device_name, app_name, app_version, last_activity)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))
+        "INSERT INTO sessions (id, user_id, device_id, device_name, app_name, app_version, last_activity, capabilities)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'), ?7)
          ON CONFLICT(id) DO UPDATE SET
            last_activity = datetime('now'),
            user_id = excluded.user_id,
            device_name = excluded.device_name,
            app_name = excluded.app_name,
-           app_version = excluded.app_version",
+           app_version = excluded.app_version,
+           capabilities = excluded.capabilities",
     )
     .bind(&sid)
     .bind(&uid)
@@ -250,6 +252,7 @@ pub async fn create_session(
     .bind(device_name)
     .bind(client)
     .bind(app_version)
+    .bind(capabilities)
     .execute(pool)
     .await?;
 
@@ -257,6 +260,34 @@ pub async fn create_session(
     upsert_device(pool, device_id, device_name, client, app_version, user_id).await?;
 
     Ok(())
+}
+
+/// Update the capabilities for a session.
+pub async fn update_session_capabilities(
+    pool: &SqlitePool,
+    session_id: &str,
+    capabilities: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE sessions SET capabilities = ?1, last_activity = datetime('now') WHERE id = ?2",
+    )
+    .bind(capabilities)
+    .bind(session_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Get the capabilities JSON for a session.
+pub async fn get_session_capabilities(
+    pool: &SqlitePool,
+    session_id: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    let row: Option<(String,)> = sqlx::query_as("SELECT capabilities FROM sessions WHERE id = ?1")
+        .bind(session_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(|r| r.0))
 }
 
 pub async fn get_now_playing_item(

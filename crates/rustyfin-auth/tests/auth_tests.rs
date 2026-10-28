@@ -1,15 +1,15 @@
 use chrono::Utc;
-use std::sync::LazyLock;
 use uuid::Uuid;
 
 use rustyfin_model::user::User;
 
-// Serialize database initialization to avoid "schema is locked" errors
-static DB_INIT_MUTEX: LazyLock<std::sync::Mutex<()>> = LazyLock::new(|| std::sync::Mutex::new(()));
-
 async fn test_pool() -> sqlx::SqlitePool {
-    let _guard = DB_INIT_MUTEX.lock();
-    rustyfin_db::init_db("sqlite::memory:").await.unwrap()
+    let dir = std::env::temp_dir().join(format!("rustyfin_test_auth_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).ok();
+    let db_path = dir.join("test.db");
+    rustyfin_db::init_db(db_path.to_str().unwrap())
+        .await
+        .unwrap()
 }
 
 fn make_user() -> User {

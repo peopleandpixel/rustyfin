@@ -62,10 +62,40 @@ pub async fn get_or_resize_image(
 
 async fn read_image_bytes(source: &str) -> Result<Vec<u8>, String> {
     if source.starts_with("http://") || source.starts_with("https://") {
-        // Download remote image
-        let resp = reqwest::get(source)
+        // Download remote image with proper headers and status check
+        let client = reqwest::Client::builder()
+            .user_agent("Mozilla/5.0 (compatible; RustyFin/1.0)")
+            .redirect(reqwest::redirect::Policy::limited(5))
+            .build()
+            .map_err(|e| format!("failed to create HTTP client: {}", e))?;
+
+        let resp = client
+            .get(source)
+            .send()
             .await
             .map_err(|e| format!("failed to fetch remote image: {}", e))?;
+
+        // Check for successful HTTP status
+        if !resp.status().is_success() {
+            return Err(format!(
+                "remote image returned status {}: {}",
+                resp.status(),
+                resp.status().canonical_reason().unwrap_or("unknown")
+            ));
+        }
+
+        // Check content-type header to verify it's an image
+        let content_type = resp.headers().get(reqwest::header::CONTENT_TYPE);
+        if let Some(ct) = content_type
+            && let Ok(ct_str) = ct.to_str()
+            && !ct_str.starts_with("image/")
+        {
+            return Err(format!(
+                "remote image returned non-image content type: {}",
+                ct_str
+            ));
+        }
+
         resp.bytes()
             .await
             .map(|b| b.to_vec())
@@ -91,4 +121,21 @@ fn filename_stem(path: &str) -> String {
         .and_then(|s| s.to_str())
         .unwrap_or("image")
         .to_string()
+}
+
+/// Compute a blurhash string for an image file.
+/// Returns a short blurhash (8x8 components) suitable for progressive image loading.
+pub async fn compute_blurhash(source_path: &str) -> Option<String> {
+    let bytes = read_image_bytes(source_path).await.ok()?;
+    let img = image::load_from_memory(&bytes).ok()?;
+    // Downscale to a small image for faster encoding
+    let small = img.resize(16, 16, FilterType::Triangle);
+    let rgba = small.to_rgba8();
+    let width = rgba.width() as usize;
+    let height = rgba.height() as usize;
+    let pixels = rgba.as_raw();
+
+    // Use 4x4 components for a short hash
+    let hash = blurhash::encode(4, 4, width as u32, height as u32, pixels.as_slice()).ok()?;
+    Some(hash)
 }
