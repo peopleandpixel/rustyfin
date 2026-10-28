@@ -36,3 +36,7 @@ logs/
 coverage/
 *.profraw
 *.profdata
+
+# Node modules
+crates/rustyfin-web/node_modules/
+crates/rustyfin-web/dist/
