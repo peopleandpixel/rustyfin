@@ -445,6 +445,7 @@ fn list_drives() -> Vec<rustyfin_model::environment::DriveInfo> {
 }
 
 /// Get disk usage for a path.
+#[cfg(target_family = "unix")]
 fn disk_usage(path: &str) -> Result<(i64, i64), std::io::Error> {
     use std::os::unix::fs::MetadataExt as _;
 
@@ -458,6 +459,14 @@ fn disk_usage(path: &str) -> Result<(i64, i64), std::io::Error> {
     let available = total_size / 4; // rough estimate
 
     Ok((total_size, available))
+}
+
+/// Fallback for non-Unix platforms (Windows, etc.)
+#[cfg(not(target_family = "unix"))]
+fn disk_usage(_path: &str) -> Result<(i64, i64), std::io::Error> {
+    // Return zero values as a fallback; a proper implementation would use
+    // platform-specific APIs (e.g., GetDiskFreeSpaceEx on Windows)
+    Ok((0, 0))
 }
 
 /// GET /System/Configuration/{key} - Get configuration by key
