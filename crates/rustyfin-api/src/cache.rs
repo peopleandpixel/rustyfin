@@ -134,6 +134,50 @@ impl ApiCache {
                 tracing::warn!("Failed to load L2 library views cache: {}", e);
             }
         }
+
+        // Load item details
+        match sqlx::query_as::<_, (String, String)>(
+            "SELECT cache_key, cache_value FROM api_cache WHERE cache_key LIKE 'item:%'",
+        )
+        .fetch_all(pool)
+        .await
+        {
+            Ok(rows) => {
+                let count = rows.len();
+                for (key, value) in rows {
+                    if let Ok(json) = serde_json::from_str(&value) {
+                        let cache_key = key.strip_prefix("item:").unwrap_or(&key).to_string();
+                        self.item_details.insert(cache_key, json);
+                    }
+                }
+                tracing::info!("Loaded {} item entries from L2 cache", count);
+            }
+            Err(e) => {
+                tracing::warn!("Failed to load L2 item cache: {}", e);
+            }
+        }
+
+        // Load search results
+        match sqlx::query_as::<_, (String, String)>(
+            "SELECT cache_key, cache_value FROM api_cache WHERE cache_key LIKE 'search:%'",
+        )
+        .fetch_all(pool)
+        .await
+        {
+            Ok(rows) => {
+                let count = rows.len();
+                for (key, value) in rows {
+                    if let Ok(json) = serde_json::from_str(&value) {
+                        let cache_key = key.strip_prefix("search:").unwrap_or(&key).to_string();
+                        self.search_results.insert(cache_key, json);
+                    }
+                }
+                tracing::info!("Loaded {} search entries from L2 cache", count);
+            }
+            Err(e) => {
+                tracing::warn!("Failed to load L2 search cache: {}", e);
+            }
+        }
     }
 
     /// Save filter lists to L2 cache for persistence across restarts.
@@ -159,6 +203,76 @@ impl ApiCache {
         .await
         {
             tracing::warn!("Failed to save L2 cache: {}", e);
+        }
+    }
+
+    /// Save item details to L2 cache for persistence across restarts.
+    pub async fn save_item_to_l2(&self, item_id: &str, item: &Value) {
+        let Some(pool) = &self.db else { return };
+        let key = format!("item:{}", item_id);
+        let value = serde_json::to_string(item).unwrap_or_default();
+        // 1 hour TTL
+        let expires_at = chrono::Utc::now()
+            .checked_add_signed(chrono::TimeDelta::seconds(3600))
+            .unwrap()
+            .to_rfc3339();
+
+        if let Err(e) = sqlx::query(
+            "INSERT OR REPLACE INTO api_cache (cache_key, cache_value, expires_at) VALUES (?, ?, ?)",
+        )
+        .bind(&key)
+        .bind(&value)
+        .bind(&expires_at)
+        .execute(pool)
+        .await
+        {
+            tracing::warn!("Failed to save L2 item cache: {}", e);
+        }
+    }
+
+    /// Save search results to L2 cache for persistence across restarts.
+    pub async fn save_search_to_l2(&self, query: &str, results: &Value) {
+        let Some(pool) = &self.db else { return };
+        let key = format!("search:{}", query);
+        let value = serde_json::to_string(results).unwrap_or_default();
+        // 30 minute TTL
+        let expires_at = chrono::Utc::now()
+            .checked_add_signed(chrono::TimeDelta::seconds(1800))
+            .unwrap()
+            .to_rfc3339();
+
+        if let Err(e) = sqlx::query(
+            "INSERT OR REPLACE INTO api_cache (cache_key, cache_value, expires_at) VALUES (?, ?, ?)",
+        )
+        .bind(&key)
+        .bind(&value)
+        .bind(&expires_at)
+        .execute(pool)
+        .await
+        {
+            tracing::warn!("Failed to save L2 search cache: {}", e);
+        }
+    }
+
+    /// Periodically clean up expired L2 cache entries.
+    /// Call this from a background task every 6 hours.
+    pub async fn cleanup_l2_cache(&self) {
+        let Some(pool) = &self.db else { return };
+        let now = chrono::Utc::now().to_rfc3339();
+        match sqlx::query("DELETE FROM api_cache WHERE expires_at < ?")
+            .bind(&now)
+            .execute(pool)
+            .await
+        {
+            Ok(res) => {
+                tracing::info!(
+                    "Cleaned up {} expired L2 cache entries",
+                    res.rows_affected()
+                );
+            }
+            Err(e) => {
+                tracing::warn!("Failed to clean up L2 cache: {}", e);
+            }
         }
     }
 }

@@ -40,3 +40,6 @@ coverage/
 # Node modules
 crates/rustyfin-web/node_modules/
 crates/rustyfin-web/dist/
+
+# Website (marketing pages)
+website/

@@ -10,7 +10,7 @@
 [![Tokio](https://img.shields.io/badge/Tokio-1.x-blue?logo=rust&logoColor=white)](https://tokio.rs)
 [![SQLx](https://img.shields.io/badge/SQLx-0.8-blue?logo=rust&logoColor=white)](https://github.com/launchbadge/sqlx)
 [![Jellyfin](https://img.shields.io/badge/Jellyfin-API%20Compatible-663399?logo=jellyfin&logoColor=white)](https://jellyfin.org)
-[![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
+[![License](https://img.shields.io/badge/License-GPL%2F3.0-green)](LICENSE)
 [![Build](https://github.com/peopleandpixel/rustyfin/actions/workflows/ci.yml/badge.svg)](https://github.com/peopleandpixel/rustyfin/actions)
 
 > **A lightweight, Jellyfin-compatible media server written in Rust.**  
@@ -201,6 +201,40 @@ rustyfin/
 ./start.sh stop
 ```
 
+#### Build & Install (Production — systemd)
+
+```bash
+git clone https://github.com/peopleandpixel/rustyfin.git
+cd rustyfin
+
+# Full build: Quality Gates (fmt, clippy, test) → WebUI → Backend Release
+./build.sh
+
+# Install binary + systemd service (requires sudo)
+sudo ./build.sh --install
+
+# Start the service
+sudo systemctl start rustyfin
+
+# Check status
+systemctl status rustyfin
+```
+
+> **Default**: `http://0.0.0.0:8096` · Data dir: `/var/lib/rustyfin/`  
+> **First run**: Startup wizard guides you through initial setup  
+> **Default login**: `admin` / `admin`
+
+#### Build Commands
+
+```bash
+./build.sh              # Full build: Quality Gates + WebUI + Backend
+./build.sh --check      # Only Quality Gates (fmt, clippy, test)
+./build.sh --web        # Only WebUI (Vite)
+./build.sh --backend    # Only Backend (cargo build --release)
+./build.sh --install    # Install binary + systemd service (requires sudo)
+./build.sh --service    # Only setup systemd service (requires sudo)
+```
+
 #### Manual Build & Run
 
 ```bash
@@ -216,6 +250,34 @@ cargo build --release --workspace
 
 > **Default**: `http://0.0.0.0:8096` · Data dir: `~/.rustyfin/`  
 > **First run**: Startup wizard guides you through initial setup
+
+#### systemd Service Management
+
+After installing via `sudo ./build.sh --install`:
+
+```bash
+# Start / Stop / Restart
+sudo systemctl start rustyfin
+sudo systemctl stop rustyfin
+sudo systemctl restart rustyfin
+
+# Enable / Disable autostart
+sudo systemctl enable rustyfin
+sudo systemctl disable rustyfin
+
+# View logs (journald)
+journalctl -u rustyfin -f
+
+# Check status
+systemctl status rustyfin
+
+# Edit configuration
+sudo nano /etc/systemd/system/rustyfin.service
+sudo systemctl daemon-reload
+```
+
+The service runs as a dedicated `rustyfin` system user with data in `/var/lib/rustyfin/`.
+Hardening options (ProtectHome, ProtectSystem, NoNewPrivileges) are enabled by default.
 
 ### Configuration (Environment Variables)
 
@@ -340,7 +402,7 @@ cd crates/rustyfin-web && npm run build
 
 ## 📜 License
 
-**MIT License** — see [LICENSE](LICENSE) for details.
+**GNU General Public License v3.0** — see [LICENSE](LICENSE) for details.
 
 ---
 

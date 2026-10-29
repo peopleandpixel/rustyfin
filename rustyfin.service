@@ -1,0 +1,33 @@
+[Unit]
+Description=Rustyfin Media Server
+Documentation=https://github.com/peopleandpixel/rustyfin
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rustyfin
+Group=rustyfin
+ExecStart=/usr/local/bin/rustyfin
+Restart=on-failure
+RestartSec=5s
+
+# Environment configuration
+Environment="RUSTYFIN_DATA=/var/lib/rustyfin"
+Environment="RUSTYFIN_BIND=0.0.0.0:8096"
+Environment="RUST_LOG=info"
+
+# Hardening
+NoNewPrivileges=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/rustyfin
+PrivateTmp=true
+
+# Logging via journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=rustyfin
+
+[Install]
+WantedBy=multi-user.target

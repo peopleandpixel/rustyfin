@@ -104,7 +104,17 @@ async fn search_hints(
     };
     // Cache the result
     if let Ok(json) = serde_json::to_value(&result) {
-        state.cache.search_results.insert(cache_key, json);
+        state
+            .cache
+            .search_results
+            .insert(cache_key.clone(), json.clone());
+        // Persist to L2 cache for survival across restarts (fire-and-forget)
+        let cache = state.cache.clone();
+        let key = cache_key.clone();
+        let value = json.clone();
+        tokio::spawn(async move {
+            cache.save_search_to_l2(&key, &value).await;
+        });
     }
     Ok(Json(result))
 }
@@ -184,7 +194,17 @@ async fn full_search(
     };
     // Cache the result
     if let Ok(json) = serde_json::to_value(&result) {
-        state.cache.search_results.insert(cache_key, json);
+        state
+            .cache
+            .search_results
+            .insert(cache_key.clone(), json.clone());
+        // Persist to L2 cache for survival across restarts (fire-and-forget)
+        let cache = state.cache.clone();
+        let key = cache_key.clone();
+        let value = json.clone();
+        tokio::spawn(async move {
+            cache.save_search_to_l2(&key, &value).await;
+        });
     }
     Ok(Json(result))
 }

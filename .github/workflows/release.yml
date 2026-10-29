@@ -1,0 +1,79 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+          - x86_64-pc-windows-msvc
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: crates/rustyfin-web/package-lock.json
+
+      - name: Build web client
+        run: |
+          cd crates/rustyfin-web
+          npm install
+          npm run build
+
+      - name: Install cross
+        run: cargo install cross
+
+      - name: Build ${{ matrix.target }}
+        run: cross build --release --target ${{ matrix.target }} --bin rustyfin
+
+      - name: Package artifact
+        shell: bash
+        run: |
+          TARGET="${{ matrix.target }}"
+          STAGING="release-${TARGET}"
+          mkdir -p "$STAGING"
+
+          # Copy binary
+          if [[ "$TARGET" == *"windows"* ]]; then
+            cp "target/${TARGET}/release/rustyfin.exe" "$STAGING/"
+          else
+            cp "target/${TARGET}/release/rustyfin" "$STAGING/"
+          fi
+
+          # Copy web client
+          if [ -d "crates/rustyfin-web/dist" ]; then
+            mkdir -p "$STAGING/web"
+            cp -r crates/rustyfin-web/dist/* "$STAGING/web/"
+          fi
+
+          # Create archive
+          if [[ "$TARGET" == *"windows"* ]]; then
+            7z a "$STAGING.zip" "$STAGING/*" -r
+            mv "$STAGING.zip" "${{ github.event.repository.name }}-${TARGET}.zip"
+            echo "artifact=${{ github.event.repository.name }}-${TARGET}.zip" >> "$GITHUB_ENV"
+          else
+            tar czf "${{ github.event.repository.name }}-${TARGET}.tar.gz" "$STAGING/"
+            echo "artifact=${{ github.event.repository.name }}-${TARGET}.tar.gz" >> "$GITHUB_ENV"
+          fi
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.artifact }}

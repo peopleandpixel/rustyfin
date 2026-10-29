@@ -273,6 +273,155 @@ pub async fn get_media_sources(
     Ok(result)
 }
 
+/// Verify that a media item exists and fetch its media sources with streams in a single round-trip.
+/// Returns None if the item does not exist.
+/// Eliminates the N+1 pattern in streaming endpoints where get_item_by_id and get_media_sources
+/// were called separately.
+pub async fn get_media_sources_with_item_check(
+    pool: &SqlitePool,
+    item_id: &Uuid,
+) -> Option<Vec<MediaSourceResponse>> {
+    // Single query: JOIN media_sources with media_items to verify existence
+    let sources: Vec<MediaSourceRow> = sqlx::query_as(
+        "SELECT ms.id, ms.item_id, ms.uid, ms.container, ms.protocol, ms.path, ms.type, \
+         ms.run_time_ticks, ms.size, ms.bitrate, ms.video_bitrate, ms.audio_bitrate, \
+         ms.width, ms.height, ms.aspect_ratio, ms.is_remote, ms.media_state \
+         FROM media_sources ms \
+         INNER JOIN media_items mi ON mi.id = ms.item_id \
+         WHERE ms.item_id = ?",
+    )
+    .bind(item_id.to_string())
+    .fetch_all(pool)
+    .await
+    .ok()?;
+
+    // If no sources found, item might exist without sources — check existence
+    if sources.is_empty() {
+        let exists: Option<(i32,)> =
+            sqlx::query_as::<_, (i32,)>("SELECT EXISTS(SELECT 1 FROM media_items WHERE id = ?)")
+                .bind(item_id.to_string())
+                .fetch_optional(pool)
+                .await
+                .ok()?;
+        if exists.map(|r| r.0).unwrap_or(0) == 0 {
+            return None;
+        }
+        return Some(Vec::new());
+    }
+
+    let mut result: Vec<MediaSourceResponse> = sources.into_iter().map(Into::into).collect();
+
+    // Batch-fetch all streams in one query instead of N separate queries
+    let source_ids: Vec<String> = result.iter().map(|s| s.id.clone()).collect();
+    if !source_ids.is_empty() {
+        let placeholders: Vec<String> = (0..source_ids.len())
+            .map(|i| format!("?{}", i + 1))
+            .collect();
+        let in_clause = placeholders.join(",");
+        let query_str = format!(
+            "SELECT stream_index as [index], codec, codec_type, language, time_base, codec_time_base, codec_tag, \
+             is_external, path, width, height, average_frame_rate, real_frame_rate, bit_rate, \
+             bit_depth, channels, channel_layout, sample_rate, profile, type, aspect_ratio_text, \
+             aspect_ratio, title, color_space, color_transfer, color_primaries, color_range, \
+             localized_uri, is_default, is_forced, is_interlaced, embedded_bitmaps, source_id \
+             FROM media_streams WHERE source_id IN ({}) ORDER BY source_id, stream_index",
+            in_clause
+        );
+
+        let mut builder =
+            sqlx::query_as::<_, MediaStreamRowWithSource>(sqlx::AssertSqlSafe(query_str));
+        for sid in &source_ids {
+            builder = builder.bind(sid);
+        }
+        if let Ok(streams) = builder.fetch_all(pool).await {
+            // Group streams by source_id
+            let mut stream_map: std::collections::HashMap<String, Vec<MediaStream>> =
+                std::collections::HashMap::new();
+            for row in streams {
+                let stream: MediaStream = MediaStreamRow {
+                    index: row.index,
+                    codec: row.codec,
+                    codec_type: row.codec_type,
+                    language: row.language,
+                    time_base: row.time_base,
+                    codec_time_base: row.codec_time_base,
+                    codec_tag: row.codec_tag,
+                    is_external: row.is_external,
+                    path: row.path,
+                    width: row.width,
+                    height: row.height,
+                    average_frame_rate: row.average_frame_rate,
+                    real_frame_rate: row.real_frame_rate,
+                    bit_rate: row.bit_rate,
+                    bit_depth: row.bit_depth,
+                    channels: row.channels,
+                    channel_layout: row.channel_layout,
+                    sample_rate: row.sample_rate,
+                    profile: row.profile,
+                    r#type: row.r#type,
+                    aspect_ratio_text: row.aspect_ratio_text,
+                    aspect_ratio: row.aspect_ratio,
+                    title: row.title,
+                    color_space: row.color_space,
+                    color_transfer: row.color_transfer,
+                    color_primaries: row.color_primaries,
+                    color_range: row.color_range,
+                    localized_uri: row.localized_uri,
+                    is_default: row.is_default,
+                    is_forced: row.is_forced,
+                    is_interlaced: row.is_interlaced,
+                    embedded_bitmaps: row.embedded_bitmaps,
+                }
+                .into();
+                stream_map.entry(row.source_id).or_default().push(stream);
+            }
+            for source in result.iter_mut() {
+                source.media_streams = stream_map.remove(&source.id).unwrap_or_default();
+            }
+        }
+    }
+
+    Some(result)
+}
+
+/// MediaStream row extended with source_id for batch fetching
+#[derive(sqlx::FromRow)]
+struct MediaStreamRowWithSource {
+    source_id: String,
+    index: i32,
+    codec: Option<String>,
+    codec_type: String,
+    language: Option<String>,
+    time_base: Option<String>,
+    codec_time_base: Option<String>,
+    codec_tag: Option<String>,
+    is_external: bool,
+    path: Option<String>,
+    width: Option<u32>,
+    height: Option<u32>,
+    average_frame_rate: Option<String>,
+    real_frame_rate: Option<String>,
+    bit_rate: Option<u32>,
+    bit_depth: Option<u32>,
+    channels: Option<u32>,
+    channel_layout: Option<String>,
+    sample_rate: Option<u32>,
+    profile: Option<String>,
+    r#type: Option<String>,
+    aspect_ratio_text: Option<String>,
+    aspect_ratio: Option<f64>,
+    title: Option<String>,
+    color_space: Option<String>,
+    color_transfer: Option<String>,
+    color_primaries: Option<String>,
+    color_range: Option<String>,
+    localized_uri: Option<String>,
+    is_default: bool,
+    is_forced: bool,
+    is_interlaced: bool,
+    embedded_bitmaps: bool,
+}
+
 /// Delete all media sources and streams for an item.
 pub async fn delete_media_sources(pool: &SqlitePool, item_id: &Uuid) -> Result<(), sqlx::Error> {
     sqlx::query("DELETE FROM media_sources WHERE item_id = ?")

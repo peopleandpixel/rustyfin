@@ -245,6 +245,7 @@ async fn main() {
     let cleanup_db = state.db.clone();
     let sighup_config = state.config.clone();
     let sighup_data_dir = state.data_dir.clone();
+    let cache = state.cache.clone();
     let app = build_router(state)
         .layer(CompressionLayer::new())
         .layer(CorsLayer::permissive())
@@ -270,6 +271,17 @@ async fn main() {
                     Err(e) => tracing::warn!("session cleanup error: {e}"),
                     _ => {}
                 }
+            }
+        });
+    }
+
+    // Background task: cleanup expired L2 cache entries every 6 hours
+    {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600 * 6));
+            loop {
+                interval.tick().await;
+                cache.cleanup_l2_cache().await;
             }
         });
     }

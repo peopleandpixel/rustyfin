@@ -300,14 +300,11 @@ async fn audio_universal(
 ) -> Result<Response, ApiError> {
     let query = AudioUniversalQuery::from(params);
 
-    let _item = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, id)
-        .await?
-        .ok_or_else(|| ApiError::NotFound(format!("Audio item {id} not found")))?;
-
-    // Get media sources for this item
-    let media_sources = rustyfin_db::repo_media_source::get_media_sources(&state.db_ro, &id)
-        .await
-        .unwrap_or_default();
+    // Single query: verify item exists and fetch media sources with streams
+    let media_sources =
+        rustyfin_db::repo_media_source::get_media_sources_with_item_check(&state.db_ro, &id)
+            .await
+            .ok_or_else(|| ApiError::NotFound(format!("Audio item {id} not found")))?;
 
     // Select the appropriate media source
     let selected_source = if let Some(ref source_id) = query.media_source_id {
@@ -388,14 +385,11 @@ async fn audio_playback_info(
     Path(id): Path<Uuid>,
     Query(_params): Query<HashMap<String, String>>,
 ) -> Result<Response, ApiError> {
-    let _item = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, id)
-        .await?
-        .ok_or_else(|| ApiError::NotFound(format!("Audio item {id} not found")))?;
-
-    // Get media sources for this item
-    let media_sources = rustyfin_db::repo_media_source::get_media_sources(&state.db_ro, &id)
-        .await
-        .unwrap_or_default();
+    // Single query: verify item exists and fetch media sources with streams
+    let media_sources =
+        rustyfin_db::repo_media_source::get_media_sources_with_item_check(&state.db_ro, &id)
+            .await
+            .ok_or_else(|| ApiError::NotFound(format!("Audio item {id} not found")))?;
 
     // Generate playback session ID
     let play_session_id = uuid::Uuid::new_v4().to_string();
@@ -562,14 +556,11 @@ async fn video_universal(
 ) -> Result<Response, ApiError> {
     let query = VideoPlaybackInfoQuery::from(params.clone());
 
-    let _item = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, id)
-        .await?
-        .ok_or_else(|| ApiError::NotFound(format!("Video item {id} not found")))?;
-
-    // Get media sources for this item
-    let mut media_sources = rustyfin_db::repo_media_source::get_media_sources(&state.db_ro, &id)
-        .await
-        .unwrap_or_default();
+    // Single query: verify item exists and fetch media sources with streams
+    let mut media_sources =
+        rustyfin_db::repo_media_source::get_media_sources_with_item_check(&state.db_ro, &id)
+            .await
+            .ok_or_else(|| ApiError::NotFound(format!("Video item {id} not found")))?;
 
     // Select the appropriate media source
     let selected_source_index = if let Some(ref source_id) = query.media_source_id {
@@ -684,14 +675,11 @@ async fn video_playback_info(
 ) -> Result<Response, ApiError> {
     let query = VideoPlaybackInfoQuery::from(params);
 
-    let _item = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, id)
-        .await?
-        .ok_or_else(|| ApiError::NotFound(format!("Video item {id} not found")))?;
-
-    // Get media sources for this item
-    let mut media_sources = rustyfin_db::repo_media_source::get_media_sources(&state.db_ro, &id)
-        .await
-        .unwrap_or_default();
+    // Single query: verify item exists and fetch media sources with streams
+    let mut media_sources =
+        rustyfin_db::repo_media_source::get_media_sources_with_item_check(&state.db_ro, &id)
+            .await
+            .ok_or_else(|| ApiError::NotFound(format!("Video item {id} not found")))?;
 
     // Select the appropriate media source
     let selected_source_index = if let Some(ref source_id) = query.media_source_id {

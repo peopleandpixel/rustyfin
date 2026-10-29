@@ -205,6 +205,11 @@ pub async fn init_db(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
         .await
         .ok();
 
+    sqlx::query(include_str!("../migrations/026_filter_triggers.sql"))
+        .execute(&pool)
+        .await
+        .ok();
+
     Ok(pool)
 }
 

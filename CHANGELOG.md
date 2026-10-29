@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-29
+
+### Added
+- **Cross-platform release builds**: GitHub Actions workflow (`release.yml`) uses `cross` to build binaries for 5 platforms (Linux x86_64/aarch64, Windows x86_64, macOS x86_64/aarch64)
+- **Release artifacts**: Each binary is packaged with the embedded web client for standalone distribution
+
+### Changed
+- **Code formatting**: Applied `cargo fmt` to fix line-length violations across API and DB crates
+
+### Other
+- **Build script** (`build.sh`): Automated build pipeline with Quality Gates (fmt, clippy, test), WebUI build, and release build
+- **systemd service** (`rustyfin.service`): Production-ready service file with hardening (ProtectHome, ProtectSystem, NoNewPrivileges)
+- **One-command install**: `sudo ./build.sh --install` installs binary, creates system user, and sets up systemd service
+
 ## [0.4.0] - 2026-10-28
 
 ### Added

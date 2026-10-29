@@ -1672,7 +1672,17 @@ async fn get_item(
     drop(config);
     // Cache the result
     if let Ok(json) = serde_json::to_value(&item) {
-        state.cache.item_details.insert(id_str, json);
+        state
+            .cache
+            .item_details
+            .insert(id_str.clone(), json.clone());
+        // Persist to L2 cache for survival across restarts (fire-and-forget)
+        let cache = state.cache.clone();
+        let item_id = id_str.clone();
+        let item_json = json.clone();
+        tokio::spawn(async move {
+            cache.save_item_to_l2(&item_id, &item_json).await;
+        });
     }
     Ok(Json(item))
 }
