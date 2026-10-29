@@ -396,3 +396,281 @@ fn detect_device(user_agent: &str) -> rustyfin_model::dlna_profile::DlnaDeviceDe
         icon_url: None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustyfin_model::media::MediaType;
+
+    // ── xml_escape ──
+
+    #[test]
+    fn test_xml_escape_ampersand() {
+        assert_eq!(xml_escape("rock & roll"), "rock &amp; roll");
+    }
+
+    #[test]
+    fn test_xml_escape_less_than() {
+        assert_eq!(xml_escape("a < b"), "a &lt; b");
+    }
+
+    #[test]
+    fn test_xml_escape_greater_than() {
+        assert_eq!(xml_escape("a > b"), "a &gt; b");
+    }
+
+    #[test]
+    fn test_xml_escape_quotes() {
+        assert_eq!(xml_escape(r#"say "hello""#), r#"say &quot;hello&quot;"#);
+    }
+
+    #[test]
+    fn test_xml_escape_all_special_chars() {
+        assert_eq!(xml_escape(r#"a & "b" < c > d"#), r#"a &amp; &quot;b&quot; &lt; c &gt; d"#);
+    }
+
+    #[test]
+    fn test_xml_escape_empty_string() {
+        assert_eq!(xml_escape(""), "");
+    }
+
+    #[test]
+    fn test_xml_escape_no_special_chars() {
+        assert_eq!(xml_escape("Hello World 123!"), "Hello World 123!");
+    }
+
+    // ── upnp_class ──
+
+    #[test]
+    fn test_upnp_class_container() {
+        assert_eq!(
+            upnp_class(&MediaType::Movie, true),
+            "object.container.storageFolder"
+        );
+    }
+
+    #[test]
+    fn test_upnp_class_movie_item() {
+        assert_eq!(
+            upnp_class(&MediaType::Movie, false),
+            "object.item.videoItem.movie"
+        );
+    }
+
+    #[test]
+    fn test_upnp_class_episode_item() {
+        assert_eq!(
+            upnp_class(&MediaType::Episode, false),
+            "object.item.videoItem.movie"
+        );
+    }
+
+    #[test]
+    fn test_upnp_class_audio_item() {
+        assert_eq!(
+            upnp_class(&MediaType::Audio, false),
+            "object.item.audioItem.musicTrack"
+        );
+    }
+
+    #[test]
+    fn test_upnp_class_photo_item() {
+        assert_eq!(
+            upnp_class(&MediaType::Photo, false),
+            "object.item.imageItem.photo"
+        );
+    }
+
+    #[test]
+    fn test_upnp_class_unknown_item() {
+        assert_eq!(upnp_class(&MediaType::Unknown, false), "object.item");
+    }
+
+    #[test]
+    fn test_upnp_class_series_container() {
+        assert_eq!(
+            upnp_class(&MediaType::Series, true),
+            "object.container.storageFolder"
+        );
+    }
+
+    // ── build_browse_response ──
+
+    #[test]
+    fn test_build_browse_response_empty() {
+        let result = build_browse_response("", 0, 0);
+        assert!(result.contains("<Result>"));
+        assert!(result.contains("<NumberReturned>0</NumberReturned>"));
+        assert!(result.contains("<TotalMatches>0</TotalMatches>"));
+        assert!(result.contains("<UpdateID>1</UpdateID>"));
+    }
+
+    #[test]
+    fn test_build_browse_response_with_items() {
+        let result = build_browse_response("<item/>", 1, 10);
+        // The item is XML-escaped inside the DIDL-Lite wrapper
+        assert!(result.contains("&lt;item/&gt;"));
+        assert!(result.contains("<NumberReturned>1</NumberReturned>"));
+        assert!(result.contains("<TotalMatches>10</TotalMatches>"));
+    }
+
+    #[test]
+    fn test_build_browse_response_escapes_didl() {
+        let result = build_browse_response("<item><dc:title>Test</dc:title></item>", 1, 1);
+        // DIDL-Lite wrapper should be XML-escaped inside <Result>
+        assert!(result.contains("&lt;DIDL-Lite"));
+    }
+
+    // ── extract_xml_value ──
+
+    #[test]
+    fn test_extract_xml_value_simple() {
+        let xml = "<root><name>John</name></root>";
+        assert_eq!(extract_xml_value(xml, "name"), Some("John".to_string()));
+    }
+
+    #[test]
+    fn test_extract_xml_value_missing_tag() {
+        let xml = "<root><name>John</name></root>";
+        assert_eq!(extract_xml_value(xml, "age"), None);
+    }
+
+    #[test]
+    fn test_extract_xml_value_empty_content() {
+        let xml = "<root><name></name></root>";
+        assert_eq!(extract_xml_value(xml, "name"), Some("".to_string()));
+    }
+
+    #[test]
+    fn test_extract_xml_value_nested_tags() {
+        let xml = "<root><name><inner>John</inner></name></root>";
+        assert_eq!(
+            extract_xml_value(xml, "name"),
+            Some("<inner>John</inner>".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_xml_value_empty_xml() {
+        assert_eq!(extract_xml_value("", "name"), None);
+    }
+
+    #[test]
+    fn test_extract_xml_value_with_special_chars() {
+        let xml = "<root><url>http://example.com?a=1&b=2</url></root>";
+        assert_eq!(
+            extract_xml_value(xml, "url"),
+            Some("http://example.com?a=1&b=2".to_string())
+        );
+    }
+
+    // ── parse_port ──
+
+    #[test]
+    fn test_parse_port_standard() {
+        assert_eq!(parse_port("0.0.0.0:8096"), 8096);
+    }
+
+    #[test]
+    fn test_parse_port_loopback() {
+        assert_eq!(parse_port("127.0.0.1:8080"), 8080);
+    }
+
+    #[test]
+    fn test_parse_port_default_when_missing() {
+        assert_eq!(parse_port("0.0.0.0"), 8096);
+    }
+
+    #[test]
+    fn test_parse_port_invalid_port() {
+        assert_eq!(parse_port("0.0.0.0:abc"), 8096);
+    }
+
+    #[test]
+    fn test_parse_port_empty_string() {
+        assert_eq!(parse_port(""), 8096);
+    }
+
+    #[test]
+    fn test_parse_port_ipv6() {
+        assert_eq!(parse_port("[::1]:8096"), 8096);
+    }
+
+    // ── detect_device ──
+
+    #[test]
+    fn test_detect_device_jellyfin() {
+        let detection = detect_device("Jellyfin/10.8.0");
+        assert_eq!(detection.friendly_name, "Jellyfin Client");
+        assert_eq!(detection.manufacturer, "Jellyfin");
+    }
+
+    #[test]
+    fn test_detect_device_swiftfin() {
+        let detection = detect_device("Swiftfin/2.0.0");
+        assert_eq!(detection.friendly_name, "Swiftfin");
+        assert_eq!(detection.manufacturer, "Swiftfin");
+    }
+
+    #[test]
+    fn test_detect_device_kodi() {
+        let detection = detect_device("Kodi/19.0");
+        assert_eq!(detection.friendly_name, "Kodi");
+        assert_eq!(detection.manufacturer, "XBMC Foundation");
+    }
+
+    #[test]
+    fn test_detect_device_ps3() {
+        let detection = detect_device("PLAYSTATION 3");
+        assert_eq!(detection.friendly_name, "PlayStation");
+        assert_eq!(detection.manufacturer, "Sony");
+    }
+
+    #[test]
+    fn test_detect_device_xbox() {
+        let detection = detect_device("Xbox One");
+        assert_eq!(detection.friendly_name, "Xbox");
+        assert_eq!(detection.manufacturer, "Microsoft");
+    }
+
+    #[test]
+    fn test_detect_device_android() {
+        let detection = detect_device("Mozilla/5.0 (Linux; Android 12)");
+        assert_eq!(detection.friendly_name, "Android Device");
+        assert_eq!(detection.manufacturer, "Google");
+    }
+
+    #[test]
+    fn test_detect_device_iphone() {
+        let detection = detect_device("Mozilla/5.0 (iPhone; CPU iPhone OS 16_0)");
+        assert_eq!(detection.friendly_name, "Apple Device");
+        assert_eq!(detection.manufacturer, "Apple");
+    }
+
+    #[test]
+    fn test_detect_device_ipad() {
+        let detection = detect_device("Mozilla/5.0 (iPad; CPU OS 16_0)");
+        assert_eq!(detection.friendly_name, "Apple Device");
+        assert_eq!(detection.manufacturer, "Apple");
+    }
+
+    #[test]
+    fn test_detect_device_dlna() {
+        let detection = detect_device("DLNA 1.5");
+        assert_eq!(detection.friendly_name, "DLNA Device");
+        assert_eq!(detection.manufacturer, "Unknown");
+    }
+
+    #[test]
+    fn test_detect_device_unknown() {
+        let detection = detect_device("SomeRandomAgent/1.0");
+        assert_eq!(detection.friendly_name, "Unknown Device");
+        assert_eq!(detection.manufacturer, "Unknown");
+    }
+
+    #[test]
+    fn test_detect_device_empty() {
+        let detection = detect_device("");
+        assert_eq!(detection.friendly_name, "Unknown Device");
+    }
+}

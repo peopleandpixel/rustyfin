@@ -148,3 +148,153 @@ pub fn hash_pin(pin: &str) -> Result<String, AuthError> {
 pub fn verify_pin(pin: &str, hash: &str) -> Result<bool, AuthError> {
     verify_password(pin, hash)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── hash_password / verify_password ──
+
+    #[test]
+    fn test_hash_password_returns_hash() {
+        let hash = hash_password("secret123").unwrap();
+        assert!(!hash.is_empty());
+        assert!(hash.starts_with("$argon"));
+    }
+
+    #[test]
+    fn test_verify_password_correct() {
+        let hash = hash_password("mypassword").unwrap();
+        assert!(verify_password("mypassword", &hash).unwrap());
+    }
+
+    #[test]
+    fn test_verify_password_incorrect() {
+        let hash = hash_password("mypassword").unwrap();
+        assert!(!verify_password("wrongpassword", &hash).unwrap());
+    }
+
+    #[test]
+    fn test_verify_password_empty_hash() {
+        let result = verify_password("test", "");
+        assert!(result.is_err());
+    }
+
+    // ── create_token / validate_token ──
+
+    #[test]
+    fn test_create_token() {
+        let user = User {
+            id: Uuid::new_v4(),
+            name: "testuser".to_string(),
+            password_hash: "hash".to_string(),
+            is_administrator: true,
+            created_at: Utc::now(),
+            last_login_date: None,
+            configuration: serde_json::Value::Object(Default::default()),
+        };
+        let token = create_token(&user, "secret").unwrap();
+        assert!(!token.is_empty());
+    }
+
+    #[test]
+    fn test_validate_token_round_trip() {
+        let user = User {
+            id: Uuid::new_v4(),
+            name: "testuser".to_string(),
+            password_hash: "hash".to_string(),
+            is_administrator: true,
+            created_at: Utc::now(),
+            last_login_date: None,
+            configuration: serde_json::Value::Object(Default::default()),
+        };
+        let token = create_token(&user, "secret").unwrap();
+        let claims = validate_token(&token, "secret").unwrap();
+        assert_eq!(claims.name, "testuser");
+        assert!(claims.is_admin);
+    }
+
+    #[test]
+    fn test_validate_token_wrong_secret() {
+        let user = User {
+            id: Uuid::new_v4(),
+            name: "testuser".to_string(),
+            password_hash: "hash".to_string(),
+            is_administrator: false,
+            created_at: Utc::now(),
+            last_login_date: None,
+            configuration: serde_json::Value::Object(Default::default()),
+        };
+        let token = create_token(&user, "secret").unwrap();
+        let result = validate_token(&token, "wrong_secret");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_token_invalid() {
+        let result = validate_token("not.a.token", "secret");
+        assert!(result.is_err());
+    }
+
+    // ── refresh_token ──
+
+    #[test]
+    fn test_refresh_token() {
+        let user = User {
+            id: Uuid::new_v4(),
+            name: "testuser".to_string(),
+            password_hash: "hash".to_string(),
+            is_administrator: true,
+            created_at: Utc::now(),
+            last_login_date: None,
+            configuration: serde_json::Value::Object(Default::default()),
+        };
+        let token = create_token(&user, "secret").unwrap();
+        let old_claims = validate_token(&token, "secret").unwrap();
+        let new_token = refresh_token(&token, "secret").unwrap();
+        let new_claims = validate_token(&new_token, "secret").unwrap();
+        // New token should have equal or later expiry (same second is possible)
+        assert!(new_claims.exp >= old_claims.exp);
+        assert_eq!(new_claims.name, "testuser");
+        // The issued-at time should be the same or newer
+        assert!(new_claims.iat >= old_claims.iat);
+    }
+
+    // ── generate_reset_pin ──
+
+    #[test]
+    fn test_generate_reset_pin_length() {
+        let pin = generate_reset_pin();
+        assert_eq!(pin.len(), 6);
+    }
+
+    #[test]
+    fn test_generate_reset_pin_is_numeric() {
+        let pin = generate_reset_pin();
+        assert!(pin.chars().all(|c| c.is_ascii_digit()));
+    }
+
+    #[test]
+    fn test_generate_reset_pin_randomness() {
+        // Generate multiple PINs and verify they're not all identical
+        let pins: Vec<String> = (0..10).map(|_| generate_reset_pin()).collect();
+        let unique = pins.iter().collect::<std::collections::HashSet<_>>();
+        assert!(unique.len() > 1, "PINs should be random");
+    }
+
+    // ── hash_pin / verify_pin ──
+
+    #[test]
+    fn test_hash_and_verify_pin() {
+        let pin = "123456";
+        let hash = hash_pin(pin).unwrap();
+        assert!(verify_pin(pin, &hash).unwrap());
+    }
+
+    #[test]
+    fn test_verify_wrong_pin() {
+        let pin = "123456";
+        let hash = hash_pin(pin).unwrap();
+        assert!(!verify_pin("654321", &hash).unwrap());
+    }
+}

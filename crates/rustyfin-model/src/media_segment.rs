@@ -35,3 +35,28 @@ pub struct MediaSegment {
     /// End time in ticks (100-nanosecond units)
     pub segment_end_ticks: i64,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_segment_type_as_str_intro() {
+        assert_eq!(SegmentType::Intro.as_str(), "Intro");
+    }
+
+    #[test]
+    fn test_segment_type_as_str_outro() {
+        assert_eq!(SegmentType::Outro.as_str(), "Outro");
+    }
+
+    #[test]
+    fn test_segment_type_as_str_credits() {
+        assert_eq!(SegmentType::Credits.as_str(), "Credits");
+    }
+
+    #[test]
+    fn test_segment_type_as_str_recap() {
+        assert_eq!(SegmentType::Recap.as_str(), "Recap");
+    }
+}

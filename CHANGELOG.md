@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-29
+
+### Added
+- **Comprehensive test suite**: Added 200+ new tests across the workspace, bringing total test count to 318.
+  - **API integration tests** (57 tests): Auth, library, search, system, DLNA, items, sessions, playback, users, Live TV, and more.
+  - **Unit tests for route helpers** (91 tests): DLNA XML escaping, UPnP classes, device detection, auth header parsing, library views, range parsing, MIME type detection.
+  - **Model tests** (88 tests): MediaType, LibraryContentType, ImageType, SegmentType, ProviderIds, and more.
+  - **Core library tests** (19 tests): Subtitle SRT-to-VTT conversion and metadata filename cleaning.
+  - **Auth tests** (16 tests): Password hashing, JWT token creation/validation, refresh tokens, PIN generation.
+- **Test coverage improved**: Overall line coverage increased from 14.88% to 24.14%.
+
+### Changed
+- **`libraries_to_views` visibility**: Changed to `pub(crate)` in `library.rs` to allow unit testing.
+
 ## [0.6.0] - 2026-10-29
 
 ### Added

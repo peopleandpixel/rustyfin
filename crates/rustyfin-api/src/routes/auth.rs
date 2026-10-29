@@ -90,3 +90,125 @@ fn parse_emby_auth(headers: &HeaderMap) -> (String, String, String, String) {
     }
     (client, version, device, device_id)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderMap;
+
+    #[test]
+    fn test_parse_emby_auth_full() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Emby-Authorization",
+            "MediaBrowser Client=\"Jellyfin MPV\", Device=\"MPV\", DeviceId=\"test123\", Version=\"1.0.0\", Token=\"abc\""
+                .parse()
+                .unwrap(),
+        );
+        let (client, version, device, device_id) = parse_emby_auth(&headers);
+        assert_eq!(client, "Jellyfin MPV");
+        assert_eq!(version, "1.0.0");
+        assert_eq!(device, "MPV");
+        assert_eq!(device_id, "test123");
+    }
+
+    #[test]
+    fn test_parse_emby_auth_lowercase_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-emby-authorization",
+            "MediaBrowser Client=\"Test\", Device=\"Dev\", DeviceId=\"d1\", Version=\"2.0\""
+                .parse()
+                .unwrap(),
+        );
+        let (client, version, device, device_id) = parse_emby_auth(&headers);
+        assert_eq!(client, "Test");
+        assert_eq!(device, "Dev");
+        assert_eq!(device_id, "d1");
+        assert_eq!(version, "2.0");
+    }
+
+    #[test]
+    fn test_parse_emby_auth_authorization_fallback() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "Authorization",
+            "MediaBrowser Client=\"Fallback\", Device=\"Dev\", DeviceId=\"d1\", Version=\"1.0\""
+                .parse()
+                .unwrap(),
+        );
+        let (client, version, device, device_id) = parse_emby_auth(&headers);
+        assert_eq!(client, "Fallback");
+        assert_eq!(device, "Dev");
+    }
+
+    #[test]
+    fn test_parse_emby_auth_partial_fields() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Emby-Authorization",
+            "MediaBrowser Client=\"OnlyClient\""
+                .parse()
+                .unwrap(),
+        );
+        let (client, version, device, device_id) = parse_emby_auth(&headers);
+        assert_eq!(client, "OnlyClient");
+        assert_eq!(version, "");
+        assert_eq!(device, "");
+        assert_eq!(device_id, "");
+    }
+
+    #[test]
+    fn test_parse_emby_auth_empty_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Emby-Authorization", "".parse().unwrap());
+        let (client, version, device, device_id) = parse_emby_auth(&headers);
+        assert_eq!(client, "");
+        assert_eq!(version, "");
+        assert_eq!(device, "");
+        assert_eq!(device_id, "");
+    }
+
+    #[test]
+    fn test_parse_emby_auth_missing_header() {
+        let headers = HeaderMap::new();
+        let (client, version, device, device_id) = parse_emby_auth(&headers);
+        assert_eq!(client, "");
+        assert_eq!(version, "");
+        assert_eq!(device, "");
+        assert_eq!(device_id, "");
+    }
+
+    #[test]
+    fn test_parse_emby_auth_without_mediabrowser_prefix() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Emby-Authorization",
+            "Client=\"NoPrefix\", Device=\"Dev\", DeviceId=\"d1\", Version=\"1.0\""
+                .parse()
+                .unwrap(),
+        );
+        let (client, version, device, device_id) = parse_emby_auth(&headers);
+        assert_eq!(client, "NoPrefix");
+        assert_eq!(device, "Dev");
+    }
+
+    #[test]
+    fn test_parse_emby_auth_x_emby_wins_over_authorization() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Emby-Authorization",
+            "MediaBrowser Client=\"EmbyHeader\""
+                .parse()
+                .unwrap(),
+        );
+        headers.insert(
+            "Authorization",
+            "MediaBrowser Client=\"AuthHeader\""
+                .parse()
+                .unwrap(),
+        );
+        let (client, _version, _device, _device_id) = parse_emby_auth(&headers);
+        assert_eq!(client, "EmbyHeader");
+    }
+}

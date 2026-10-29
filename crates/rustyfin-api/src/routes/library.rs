@@ -33,7 +33,7 @@ pub fn routes() -> Router<AppState> {
         .route("/Library/BrowseDirectories", get(browse_directories))
 }
 
-fn libraries_to_views(libs: &[Library]) -> Value {
+pub(crate) fn libraries_to_views(libs: &[Library]) -> Value {
     let items: Vec<Value> = libs
         .iter()
         .map(|lib| {
@@ -553,4 +553,126 @@ async fn browse_directories(
     entries.sort_by_key(|a| a.name.to_lowercase());
 
     Ok(Json(entries))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_libraries_to_views_empty() {
+        let result = libraries_to_views(&[]);
+        assert_eq!(result["Items"].as_array().unwrap().len(), 0);
+        assert_eq!(result["TotalRecordCount"], 0);
+        assert_eq!(result["StartIndex"], 0);
+    }
+
+    #[test]
+    fn test_libraries_to_views_single_movie_library() {
+        let libs = vec![Library {
+            id: Uuid::new_v4(),
+            name: "Movies".to_string(),
+            content_type: rustyfin_model::library::LibraryContentType::Movies,
+            paths: vec!["/media/movies".to_string()],
+        }];
+        let result = libraries_to_views(&libs);
+        let items = result["Items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["Name"], "Movies");
+        assert_eq!(items[0]["Type"], "CollectionFolder");
+        assert_eq!(items[0]["CollectionType"], "movies");
+        assert_eq!(items[0]["IsFolder"], true);
+        assert_eq!(result["TotalRecordCount"], 1);
+    }
+
+    #[test]
+    fn test_libraries_to_views_tv_shows_library() {
+        let libs = vec![Library {
+            id: Uuid::new_v4(),
+            name: "TV Shows".to_string(),
+            content_type: rustyfin_model::library::LibraryContentType::TvShows,
+            paths: vec!["/media/tv".to_string()],
+        }];
+        let result = libraries_to_views(&libs);
+        let items = result["Items"].as_array().unwrap();
+        assert_eq!(items[0]["CollectionType"], "tvshows");
+    }
+
+    #[test]
+    fn test_libraries_to_views_music_library() {
+        let libs = vec![Library {
+            id: Uuid::new_v4(),
+            name: "Music".to_string(),
+            content_type: rustyfin_model::library::LibraryContentType::Music,
+            paths: vec!["/media/music".to_string()],
+        }];
+        let result = libraries_to_views(&libs);
+        let items = result["Items"].as_array().unwrap();
+        assert_eq!(items[0]["CollectionType"], "music");
+    }
+
+    #[test]
+    fn test_libraries_to_views_photos_library() {
+        let libs = vec![Library {
+            id: Uuid::new_v4(),
+            name: "Photos".to_string(),
+            content_type: rustyfin_model::library::LibraryContentType::Photos,
+            paths: vec!["/media/photos".to_string()],
+        }];
+        let result = libraries_to_views(&libs);
+        let items = result["Items"].as_array().unwrap();
+        assert_eq!(items[0]["CollectionType"], "homevideos");
+    }
+
+    #[test]
+    fn test_libraries_to_views_mixed_library() {
+        let libs = vec![Library {
+            id: Uuid::new_v4(),
+            name: "Mixed".to_string(),
+            content_type: rustyfin_model::library::LibraryContentType::Mixed,
+            paths: vec!["/media/mixed".to_string()],
+        }];
+        let result = libraries_to_views(&libs);
+        let items = result["Items"].as_array().unwrap();
+        assert_eq!(items[0]["CollectionType"], "mixed");
+    }
+
+    #[test]
+    fn test_libraries_to_views_multiple_libraries() {
+        let libs = vec![
+            Library {
+                id: Uuid::new_v4(),
+                name: "Movies".to_string(),
+                content_type: rustyfin_model::library::LibraryContentType::Movies,
+                paths: vec!["/media/movies".to_string()],
+            },
+            Library {
+                id: Uuid::new_v4(),
+                name: "TV Shows".to_string(),
+                content_type: rustyfin_model::library::LibraryContentType::TvShows,
+                paths: vec!["/media/tv".to_string()],
+            },
+        ];
+        let result = libraries_to_views(&libs);
+        let items = result["Items"].as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(result["TotalRecordCount"], 2);
+    }
+
+    #[test]
+    fn test_libraries_to_views_user_data_defaults() {
+        let libs = vec![Library {
+            id: Uuid::new_v4(),
+            name: "Test".to_string(),
+            content_type: rustyfin_model::library::LibraryContentType::Movies,
+            paths: vec!["/media/test".to_string()],
+        }];
+        let result = libraries_to_views(&libs);
+        let user_data = &result["Items"][0]["UserData"];
+        assert_eq!(user_data["PlaybackPositionTicks"], 0);
+        assert_eq!(user_data["PlayCount"], 0);
+        assert_eq!(user_data["IsFavorite"], false);
+        assert_eq!(user_data["Played"], false);
+    }
+
 }

@@ -76,3 +76,62 @@ impl LibraryContentType {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── LibraryContentType::default_media_type ──
+
+    #[test]
+    fn test_default_media_type_movies() {
+        assert_eq!(LibraryContentType::Movies.default_media_type(), MediaType::Movie);
+    }
+
+    #[test]
+    fn test_default_media_type_tv_shows() {
+        assert_eq!(LibraryContentType::TvShows.default_media_type(), MediaType::Series);
+    }
+
+    #[test]
+    fn test_default_media_type_music() {
+        assert_eq!(LibraryContentType::Music.default_media_type(), MediaType::Audio);
+    }
+
+    #[test]
+    fn test_default_media_type_photos() {
+        assert_eq!(LibraryContentType::Photos.default_media_type(), MediaType::Photo);
+    }
+
+    #[test]
+    fn test_default_media_type_mixed() {
+        assert_eq!(LibraryContentType::Mixed.default_media_type(), MediaType::Unknown);
+    }
+
+    // ── LibraryContentType::jellyfin_collection_type ──
+
+    #[test]
+    fn test_jellyfin_collection_type_movies() {
+        assert_eq!(LibraryContentType::Movies.jellyfin_collection_type(), "movies");
+    }
+
+    #[test]
+    fn test_jellyfin_collection_type_tv_shows() {
+        assert_eq!(LibraryContentType::TvShows.jellyfin_collection_type(), "tvshows");
+    }
+
+    #[test]
+    fn test_jellyfin_collection_type_music() {
+        assert_eq!(LibraryContentType::Music.jellyfin_collection_type(), "music");
+    }
+
+    #[test]
+    fn test_jellyfin_collection_type_photos() {
+        assert_eq!(LibraryContentType::Photos.jellyfin_collection_type(), "homevideos");
+    }
+
+    #[test]
+    fn test_jellyfin_collection_type_mixed() {
+        assert_eq!(LibraryContentType::Mixed.jellyfin_collection_type(), "mixed");
+    }
+}

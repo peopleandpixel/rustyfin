@@ -125,3 +125,270 @@ pub struct ImageInfo {
     pub width: Option<i32>,
     pub height: Option<i32>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── ImageType::as_str ──
+
+    #[test]
+    fn test_image_type_as_str_primary() {
+        assert_eq!(ImageType::Primary.as_str(), "Primary");
+    }
+
+    #[test]
+    fn test_image_type_as_str_backdrop() {
+        assert_eq!(ImageType::Backdrop.as_str(), "Backdrop");
+    }
+
+    #[test]
+    fn test_image_type_as_str_banner() {
+        assert_eq!(ImageType::Banner.as_str(), "Banner");
+    }
+
+    #[test]
+    fn test_image_type_as_str_thumb() {
+        assert_eq!(ImageType::Thumb.as_str(), "Thumb");
+    }
+
+    #[test]
+    fn test_image_type_as_str_logo() {
+        assert_eq!(ImageType::Logo.as_str(), "Logo");
+    }
+
+    #[test]
+    fn test_image_type_as_str_art() {
+        assert_eq!(ImageType::Art.as_str(), "Art");
+    }
+
+    #[test]
+    fn test_image_type_as_str_disc() {
+        assert_eq!(ImageType::Disc.as_str(), "Disc");
+    }
+
+    #[test]
+    fn test_image_type_as_str_screenshot() {
+        assert_eq!(ImageType::Screenshot.as_str(), "Screenshot");
+    }
+
+    // ── ImageType::from_str ──
+
+    #[test]
+    fn test_image_type_from_str_primary() {
+        assert_eq!(ImageType::from_str("primary"), Some(ImageType::Primary));
+    }
+
+    #[test]
+    fn test_image_type_from_str_backdrop() {
+        assert_eq!(ImageType::from_str("backdrop"), Some(ImageType::Backdrop));
+    }
+
+    #[test]
+    fn test_image_type_from_str_fanart() {
+        assert_eq!(ImageType::from_str("fanart"), Some(ImageType::Backdrop));
+    }
+
+    #[test]
+    fn test_image_type_from_str_banner() {
+        assert_eq!(ImageType::from_str("banner"), Some(ImageType::Banner));
+    }
+
+    #[test]
+    fn test_image_type_from_str_thumb() {
+        assert_eq!(ImageType::from_str("thumb"), Some(ImageType::Thumb));
+    }
+
+    #[test]
+    fn test_image_type_from_str_thumbnail() {
+        assert_eq!(ImageType::from_str("thumbnail"), Some(ImageType::Thumb));
+    }
+
+    #[test]
+    fn test_image_type_from_str_logo() {
+        assert_eq!(ImageType::from_str("logo"), Some(ImageType::Logo));
+    }
+
+    #[test]
+    fn test_image_type_from_str_art() {
+        assert_eq!(ImageType::from_str("art"), Some(ImageType::Art));
+    }
+
+    #[test]
+    fn test_image_type_from_str_clearart() {
+        assert_eq!(ImageType::from_str("clearart"), Some(ImageType::Art));
+    }
+
+    #[test]
+    fn test_image_type_from_str_disc() {
+        assert_eq!(ImageType::from_str("disc"), Some(ImageType::Disc));
+    }
+
+    #[test]
+    fn test_image_type_from_str_discart() {
+        assert_eq!(ImageType::from_str("discart"), Some(ImageType::Disc));
+    }
+
+    #[test]
+    fn test_image_type_from_str_screenshot() {
+        assert_eq!(ImageType::from_str("screenshot"), Some(ImageType::Screenshot));
+    }
+
+    #[test]
+    fn test_image_type_from_str_unknown() {
+        assert_eq!(ImageType::from_str("unknown"), None);
+    }
+
+    #[test]
+    fn test_image_type_from_str_case_insensitive() {
+        assert_eq!(ImageType::from_str("PRIMARY"), Some(ImageType::Primary));
+        assert_eq!(ImageType::from_str("Backdrop"), Some(ImageType::Backdrop));
+    }
+
+    // ── detect_image_type_from_filename ──
+
+    #[test]
+    fn test_detect_poster() {
+        assert_eq!(
+            detect_image_type_from_filename("/path/to/poster.jpg"),
+            Some(ImageType::Primary)
+        );
+    }
+
+    #[test]
+    fn test_detect_cover() {
+        assert_eq!(
+            detect_image_type_from_filename("/path/to/cover.png"),
+            Some(ImageType::Primary)
+        );
+    }
+
+    #[test]
+    fn test_detect_fanart() {
+        assert_eq!(
+            detect_image_type_from_filename("/path/to/fanart.jpg"),
+            Some(ImageType::Backdrop)
+        );
+    }
+
+    #[test]
+    fn test_detect_backdrop() {
+        assert_eq!(
+            detect_image_type_from_filename("/path/to/backdrop.jpg"),
+            Some(ImageType::Backdrop)
+        );
+    }
+
+    #[test]
+    fn test_detect_banner() {
+        assert_eq!(
+            detect_image_type_from_filename("/path/to/banner.jpg"),
+            Some(ImageType::Banner)
+        );
+    }
+
+    #[test]
+    fn test_detect_thumb() {
+        assert_eq!(
+            detect_image_type_from_filename("/path/to/thumb.jpg"),
+            Some(ImageType::Thumb)
+        );
+    }
+
+    #[test]
+    fn test_detect_logo() {
+        assert_eq!(
+            detect_image_type_from_filename("/path/to/logo.png"),
+            Some(ImageType::Logo)
+        );
+    }
+
+    #[test]
+    fn test_detect_clearlogo() {
+        assert_eq!(
+            detect_image_type_from_filename("/path/to/clearlogo.png"),
+            Some(ImageType::Logo)
+        );
+    }
+
+    #[test]
+    fn test_detect_clearart() {
+        assert_eq!(
+            detect_image_type_from_filename("/path/to/clearart.png"),
+            Some(ImageType::Art)
+        );
+    }
+
+    #[test]
+    fn test_detect_disc() {
+        assert_eq!(
+            detect_image_type_from_filename("/path/to/disc.jpg"),
+            Some(ImageType::Disc)
+        );
+    }
+
+    #[test]
+    fn test_detect_keyword_in_filename() {
+        // File with keyword embedded in name
+        assert_eq!(
+            detect_image_type_from_filename("/path/to/movie-poster.jpg"),
+            Some(ImageType::Primary)
+        );
+    }
+
+    #[test]
+    fn test_detect_unknown_filename() {
+        assert_eq!(
+            detect_image_type_from_filename("/path/to/random.jpg"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_detect_with_extension() {
+        assert_eq!(
+            detect_image_type_from_filename("poster.jpg"),
+            Some(ImageType::Primary)
+        );
+    }
+
+    #[test]
+    fn test_detect_folder_filename() {
+        assert_eq!(
+            detect_image_type_from_filename("/path/to/folder.jpg"),
+            Some(ImageType::Primary)
+        );
+    }
+
+    #[test]
+    fn test_detect_default_filename() {
+        assert_eq!(
+            detect_image_type_from_filename("/path/to/default.jpg"),
+            Some(ImageType::Primary)
+        );
+    }
+
+    #[test]
+    fn test_detect_landscape() {
+        assert_eq!(
+            detect_image_type_from_filename("/path/to/landscape.jpg"),
+            Some(ImageType::Thumb)
+        );
+    }
+
+    #[test]
+    fn test_detect_background() {
+        assert_eq!(
+            detect_image_type_from_filename("/path/to/background.jpg"),
+            Some(ImageType::Backdrop)
+        );
+    }
+
+    #[test]
+    fn test_detect_cdart() {
+        assert_eq!(
+            detect_image_type_from_filename("/path/to/cdart.jpg"),
+            Some(ImageType::Disc)
+        );
+    }
+}

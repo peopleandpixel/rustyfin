@@ -1000,3 +1000,187 @@ fn check_direct_stream(
 
     true
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── parse_range ──
+
+    #[test]
+    fn test_parse_range_full_range() {
+        assert_eq!(parse_range("bytes=0-999", 1000), Some((0, 999)));
+    }
+
+    #[test]
+    fn test_parse_range_partial() {
+        assert_eq!(parse_range("bytes=100-199", 1000), Some((100, 199)));
+    }
+
+    #[test]
+    fn test_parse_range_open_ended() {
+        assert_eq!(parse_range("bytes=500-", 1000), Some((500, 999)));
+    }
+
+    #[test]
+    fn test_parse_range_suffix() {
+        assert_eq!(parse_range("bytes=-100", 1000), Some((900, 999)));
+    }
+
+    #[test]
+    fn test_parse_range_clamp_end_to_file_size() {
+        assert_eq!(parse_range("bytes=0-9999", 1000), Some((0, 999)));
+    }
+
+    #[test]
+    fn test_parse_range_invalid_no_bytes_prefix() {
+        assert_eq!(parse_range("0-999", 1000), None);
+    }
+
+    #[test]
+    fn test_parse_range_start_beyond_file() {
+        assert_eq!(parse_range("bytes=1000-1100", 1000), None);
+    }
+
+    #[test]
+    fn test_parse_range_start_greater_than_end() {
+        assert_eq!(parse_range("bytes=500-100", 1000), None);
+    }
+
+    #[test]
+    fn test_parse_range_empty_string() {
+        assert_eq!(parse_range("", 1000), None);
+    }
+
+    #[test]
+    fn test_parse_range_invalid_numbers() {
+        assert_eq!(parse_range("bytes=abc-def", 1000), None);
+    }
+
+    #[test]
+    fn test_parse_range_suffix_larger_than_file() {
+        assert_eq!(parse_range("bytes=-1001", 1000), None);
+    }
+
+    // ── mime_from_path ──
+
+    #[test]
+    fn test_mime_mp4() {
+        assert_eq!(mime_from_path("/path/to/video.mp4"), "video/mp4");
+    }
+
+    #[test]
+    fn test_mime_mkv() {
+        assert_eq!(mime_from_path("/path/to/video.mkv"), "video/x-matroska");
+    }
+
+    #[test]
+    fn test_mime_avi() {
+        assert_eq!(mime_from_path("/path/to/video.avi"), "video/x-msvideo");
+    }
+
+    #[test]
+    fn test_mime_webm() {
+        assert_eq!(mime_from_path("/path/to/video.webm"), "video/webm");
+    }
+
+    #[test]
+    fn test_mime_mov() {
+        assert_eq!(mime_from_path("/path/to/video.mov"), "video/quicktime");
+    }
+
+    #[test]
+    fn test_mime_wmv() {
+        assert_eq!(mime_from_path("/path/to/video.wmv"), "video/x-ms-wmv");
+    }
+
+    #[test]
+    fn test_mime_ts() {
+        assert_eq!(mime_from_path("/path/to/video.ts"), "video/mp2t");
+    }
+
+    #[test]
+    fn test_mime_mpeg() {
+        assert_eq!(mime_from_path("/path/to/video.mpeg"), "video/mpeg");
+    }
+
+    #[test]
+    fn test_mime_mpg() {
+        assert_eq!(mime_from_path("/path/to/video.mpg"), "video/mpeg");
+    }
+
+    #[test]
+    fn test_mime_mp3() {
+        assert_eq!(mime_from_path("/path/to/song.mp3"), "audio/mpeg");
+    }
+
+    #[test]
+    fn test_mime_flac() {
+        assert_eq!(mime_from_path("/path/to/song.flac"), "audio/flac");
+    }
+
+    #[test]
+    fn test_mime_ogg() {
+        assert_eq!(mime_from_path("/path/to/song.ogg"), "audio/ogg");
+    }
+
+    #[test]
+    fn test_mime_opus() {
+        assert_eq!(mime_from_path("/path/to/song.opus"), "audio/opus");
+    }
+
+    #[test]
+    fn test_mime_wav() {
+        assert_eq!(mime_from_path("/path/to/song.wav"), "audio/wav");
+    }
+
+    #[test]
+    fn test_mime_aac() {
+        assert_eq!(mime_from_path("/path/to/song.aac"), "audio/aac");
+    }
+
+    #[test]
+    fn test_mime_m4a() {
+        assert_eq!(mime_from_path("/path/to/song.m4a"), "audio/mp4");
+    }
+
+    #[test]
+    fn test_mime_unknown_extension() {
+        assert_eq!(mime_from_path("/path/to/file.xyz"), "application/octet-stream");
+    }
+
+    #[test]
+    fn test_mime_no_extension() {
+        assert_eq!(mime_from_path("/path/to/file"), "application/octet-stream");
+    }
+
+    #[test]
+    fn test_mime_case_insensitive_extension() {
+        assert_eq!(mime_from_path("/path/to/video.MP4"), "video/mp4");
+    }
+
+    #[test]
+    fn test_mime_uppercase_extension() {
+        assert_eq!(mime_from_path("/path/to/video.MKV"), "video/x-matroska");
+    }
+
+    #[test]
+    fn test_mime_m4v() {
+        assert_eq!(mime_from_path("/path/to/video.m4v"), "video/mp4");
+    }
+
+    #[test]
+    fn test_mime_wma() {
+        assert_eq!(mime_from_path("/path/to/song.wma"), "audio/x-ms-wma");
+    }
+
+    #[test]
+    fn test_mime_aiff() {
+        assert_eq!(mime_from_path("/path/to/song.aiff"), "audio/aiff");
+    }
+
+    #[test]
+    fn test_mime_3gp() {
+        assert_eq!(mime_from_path("/path/to/video.3gp"), "video/3gpp");
+    }
+}

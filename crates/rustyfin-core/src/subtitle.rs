@@ -331,3 +331,65 @@ pub async fn download_subtitle(
     tracing::info!("Downloaded subtitle {} to {}", subtitle_id, filename);
     Ok(file_path)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── srt_to_vtt ──
+
+    #[test]
+    fn test_srt_to_vtt_basic() {
+        let srt = "1\n00:00:01,000 --> 00:00:02,000\nHello world";
+        let vtt = srt_to_vtt(srt);
+        assert!(vtt.starts_with("WEBVTT\n"));
+        assert!(vtt.contains("00:00:01.000 --> 00:00:02.000"));
+        assert!(vtt.contains("Hello world"));
+    }
+
+    #[test]
+    fn test_srt_to_vtt_empty() {
+        let vtt = srt_to_vtt("");
+        assert_eq!(vtt, "WEBVTT\n\n");
+    }
+
+    #[test]
+    fn test_srt_to_vtt_multiple_cues() {
+        let srt = "1\n00:00:01,000 --> 00:00:02,000\nFirst\n\n2\n00:00:03,000 --> 00:00:04,000\nSecond";
+        let vtt = srt_to_vtt(srt);
+        assert!(vtt.starts_with("WEBVTT\n"));
+        assert!(vtt.contains("First"));
+        assert!(vtt.contains("Second"));
+    }
+
+    #[test]
+    fn test_srt_to_vtt_commas_in_text_preserved() {
+        // Commas in subtitle text (not in timestamp lines) should be preserved
+        let srt = "1\n00:00:01,000 --> 00:00:02,000\nHello, world";
+        let vtt = srt_to_vtt(srt);
+        assert!(vtt.contains("Hello, world"));
+    }
+
+    #[test]
+    fn test_srt_to_vtt_commas_in_timestamp_replaced() {
+        let srt = "1\n00:01:02,345 --> 00:03:04,567\nText";
+        let vtt = srt_to_vtt(srt);
+        assert!(vtt.contains("00:01:02.345 --> 00:03:04.567"));
+    }
+
+    #[test]
+    fn test_srt_to_vtt_multiline_text() {
+        let srt = "1\n00:00:01,000 --> 00:00:02,000\nLine one\nLine two";
+        let vtt = srt_to_vtt(srt);
+        assert!(vtt.contains("Line one"));
+        assert!(vtt.contains("Line two"));
+    }
+
+    #[test]
+    fn test_srt_to_vtt_blank_line_preserved() {
+        let srt = "1\n00:00:01,000 --> 00:00:02,000\nText\n\n2\n00:00:03,000 --> 00:00:04,000\nMore";
+        let vtt = srt_to_vtt(srt);
+        // The blank line between cues should be preserved
+        assert!(vtt.contains("\n\n"));
+    }
+}

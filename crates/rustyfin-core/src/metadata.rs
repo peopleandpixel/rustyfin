@@ -557,3 +557,100 @@ async fn store_studios(
     tracing::debug!("stored {} studios for item {}", studio_names.len(), item_id);
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── clean_filename_for_search ──
+
+    #[test]
+    fn test_clean_filename_basic() {
+        let result = clean_filename_for_search("/path/to/Movie.2023.mkv");
+        assert_eq!(result, "Movie 2023");
+    }
+
+    #[test]
+    fn test_clean_filename_complex() {
+        let result = clean_filename_for_search(
+            "/path/to/Zombieland.2009.German.DL.1080p.BluRay.x264-SCENE.mkv",
+        );
+        assert!(result.contains("Zombieland"));
+        assert!(result.contains("2009"));
+        assert!(!result.contains("1080p"));
+        assert!(!result.contains("BluRay"));
+    }
+
+    #[test]
+    fn test_clean_filename_underscores() {
+        let result = clean_filename_for_search("/path/to/The.Movie.2020.mkv");
+        assert_eq!(result, "The Movie 2020");
+    }
+
+    #[test]
+    fn test_clean_filename_hyphens() {
+        let result = clean_filename_for_search("/path/to/The-Movie-2020.mkv");
+        // Hyphens are replaced with spaces, but trailing encoder groups after - are removed
+        assert!(result.contains("The"));
+        assert!(result.contains("Movie"));
+    }
+
+    #[test]
+    fn test_clean_filename_720p() {
+        let result = clean_filename_for_search("/path/to/Movie.2020.720p.WEB-DL.x264.mkv");
+        assert!(!result.contains("720p"));
+        assert!(!result.contains("WEB-DL"));
+        assert!(!result.contains("x264"));
+    }
+
+    #[test]
+    fn test_clean_filename_4k() {
+        let result = clean_filename_for_search("/path/to/Movie.2020.2160p.4K.UHD.mkv");
+        assert!(!result.contains("2160p"));
+        assert!(!result.contains("4K"));
+        assert!(!result.contains("UHD"));
+    }
+
+    #[test]
+    fn test_clean_filename_encoder_group() {
+        let result = clean_filename_for_search("/path/to/Movie.2020.x264-SCENE.mkv");
+        // After replacing separators with spaces, "x264-SCENE" becomes "x264 SCENE"
+        // x264 tag is removed, leaving "Movie 2020 SCENE"
+        // The encoder group removal (rfind('-')) won't find '-' since it was replaced
+        assert!(result.contains("Movie"));
+        assert!(result.contains("2020"));
+        assert!(!result.contains("x264"));
+    }
+
+    #[test]
+    fn test_clean_filename_no_extension() {
+        let result = clean_filename_for_search("Movie");
+        assert_eq!(result, "Movie");
+    }
+
+    #[test]
+    fn test_clean_filename_dolby() {
+        let result = clean_filename_for_search("/path/to/Movie.2020.Dolby.Vision.mkv");
+        assert!(!result.contains("Dolby"));
+    }
+
+    #[test]
+    fn test_clean_filename_hevc() {
+        let result = clean_filename_for_search("/path/to/Movie.2020.HEVC.x265.mkv");
+        assert!(!result.contains("HEVC"));
+        assert!(!result.contains("x265"));
+    }
+
+    #[test]
+    fn test_clean_filename_proper() {
+        let result = clean_filename_for_search("/path/to/Movie.2020.PROPER.mkv");
+        assert!(!result.contains("PROPER"));
+    }
+
+    #[test]
+    fn test_clean_filename_hdtv() {
+        let result = clean_filename_for_search("/path/to/Show.S01E01.HDTV.x264.mkv");
+        assert!(!result.contains("HDTV"));
+        assert!(!result.contains("x264"));
+    }
+}

@@ -2487,7 +2487,7 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "rustyfin-api"
-version = "0.5.0"
+version = "0.7.0"
 dependencies = [
  "axum",
  "chrono",
@@ -2515,7 +2515,7 @@ dependencies = [
 
 [[package]]
 name = "rustyfin-auth"
-version = "0.5.0"
+version = "0.7.0"
 dependencies = [
  "argon2",
  "chrono",
@@ -2534,7 +2534,7 @@ dependencies = [
 
 [[package]]
 name = "rustyfin-cli"
-version = "0.5.0"
+version = "0.7.0"
 dependencies = [
  "clap",
  "reqwest",
@@ -2545,7 +2545,7 @@ dependencies = [
 
 [[package]]
 name = "rustyfin-core"
-version = "0.5.0"
+version = "0.7.0"
 dependencies = [
  "blurhash",
  "chrono",
@@ -2568,7 +2568,7 @@ dependencies = [
 
 [[package]]
 name = "rustyfin-db"
-version = "0.5.0"
+version = "0.7.0"
 dependencies = [
  "chrono",
  "fastrand",
@@ -2584,7 +2584,7 @@ dependencies = [
 
 [[package]]
 name = "rustyfin-model"
-version = "0.5.0"
+version = "0.7.0"
 dependencies = [
  "chrono",
  "serde",
@@ -2594,7 +2594,7 @@ dependencies = [
 
 [[package]]
 name = "rustyfin-server"
-version = "0.5.0"
+version = "0.7.0"
 dependencies = [
  "axum",
  "hyper-util",

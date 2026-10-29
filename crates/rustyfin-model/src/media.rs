@@ -894,3 +894,189 @@ pub struct FiltersResult {
     pub years: Vec<i32>,
     pub official_ratings: Vec<String>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    // ── MediaType::from_str ──
+
+    #[test]
+    fn test_media_type_from_str_movie() {
+        assert_eq!(MediaType::from_str("Movie"), Ok(MediaType::Movie));
+    }
+
+    #[test]
+    fn test_media_type_from_str_series() {
+        assert_eq!(MediaType::from_str("Series"), Ok(MediaType::Series));
+    }
+
+    #[test]
+    fn test_media_type_from_str_season() {
+        assert_eq!(MediaType::from_str("Season"), Ok(MediaType::Season));
+    }
+
+    #[test]
+    fn test_media_type_from_str_episode() {
+        assert_eq!(MediaType::from_str("Episode"), Ok(MediaType::Episode));
+    }
+
+    #[test]
+    fn test_media_type_from_str_audio() {
+        assert_eq!(MediaType::from_str("Audio"), Ok(MediaType::Audio));
+    }
+
+    #[test]
+    fn test_media_type_from_str_music_album() {
+        assert_eq!(MediaType::from_str("MusicAlbum"), Ok(MediaType::MusicAlbum));
+    }
+
+    #[test]
+    fn test_media_type_from_str_photo() {
+        assert_eq!(MediaType::from_str("Photo"), Ok(MediaType::Photo));
+    }
+
+    #[test]
+    fn test_media_type_from_str_genre() {
+        assert_eq!(MediaType::from_str("Genre"), Ok(MediaType::Genre));
+    }
+
+    #[test]
+    fn test_media_type_from_str_unknown() {
+        assert_eq!(MediaType::from_str("UnknownThing"), Ok(MediaType::Unknown));
+    }
+
+    // ── MediaType::item_kind ──
+
+    #[test]
+    fn test_media_type_item_kind_movie() {
+        assert_eq!(MediaType::Movie.item_kind(), "Movie");
+    }
+
+    #[test]
+    fn test_media_type_item_kind_series() {
+        assert_eq!(MediaType::Series.item_kind(), "Series");
+    }
+
+    #[test]
+    fn test_media_type_item_kind_unknown() {
+        assert_eq!(MediaType::Unknown.item_kind(), "Folder");
+    }
+
+    #[test]
+    fn test_media_type_item_kind_music_album() {
+        assert_eq!(MediaType::MusicAlbum.item_kind(), "MusicAlbum");
+    }
+
+    // ── MediaType::media_kind ──
+
+    #[test]
+    fn test_media_type_media_kind_video() {
+        assert_eq!(MediaType::Movie.media_kind(), "Video");
+    }
+
+    #[test]
+    fn test_media_type_media_kind_episode_video() {
+        assert_eq!(MediaType::Episode.media_kind(), "Video");
+    }
+
+    #[test]
+    fn test_media_type_media_kind_audio() {
+        assert_eq!(MediaType::Audio.media_kind(), "Audio");
+    }
+
+    #[test]
+    fn test_media_type_media_kind_music_album() {
+        assert_eq!(MediaType::MusicAlbum.media_kind(), "Audio");
+    }
+
+    #[test]
+    fn test_media_type_media_kind_photo() {
+        assert_eq!(MediaType::Photo.media_kind(), "Photo");
+    }
+
+    #[test]
+    fn test_media_type_media_kind_series_unknown() {
+        assert_eq!(MediaType::Series.media_kind(), "Unknown");
+    }
+
+    // ── MediaType::is_folder ──
+
+    #[test]
+    fn test_media_type_is_folder_series() {
+        assert!(MediaType::Series.is_folder());
+    }
+
+    #[test]
+    fn test_media_type_is_folder_season() {
+        assert!(MediaType::Season.is_folder());
+    }
+
+    #[test]
+    fn test_media_type_is_folder_music_album() {
+        assert!(MediaType::MusicAlbum.is_folder());
+    }
+
+    #[test]
+    fn test_media_type_is_folder_genre() {
+        assert!(MediaType::Genre.is_folder());
+    }
+
+    #[test]
+    fn test_media_type_is_folder_movie() {
+        assert!(!MediaType::Movie.is_folder());
+    }
+
+    #[test]
+    fn test_media_type_is_folder_episode() {
+        assert!(!MediaType::Episode.is_folder());
+    }
+
+    // ── MediaType Display ──
+
+    #[test]
+    fn test_media_type_display() {
+        assert_eq!(MediaType::Movie.to_string(), "Movie");
+        assert_eq!(MediaType::Series.to_string(), "Series");
+    }
+
+    // ── LocationType::as_str ──
+
+    #[test]
+    fn test_location_type_as_str() {
+        assert_eq!(LocationType::FileSystem.as_str(), "FileSystem");
+        assert_eq!(LocationType::Virtual.as_str(), "Virtual");
+        assert_eq!(LocationType::Remote.as_str(), "Remote");
+    }
+
+    // ── VideoType::as_str ──
+
+    #[test]
+    fn test_video_type_as_str() {
+        assert_eq!(VideoType::VideoFile.as_str(), "VideoFile");
+        assert_eq!(VideoType::Iso.as_str(), "Iso");
+        assert_eq!(VideoType::Ifo.as_str(), "Ifo");
+    }
+
+    // ── ProviderIds ──
+
+    #[test]
+    fn test_provider_ids_get_set() {
+        let mut ids = ProviderIds::default();
+        ids.set("tmdb".to_string(), "12345".to_string());
+        assert_eq!(ids.get("tmdb"), Some("12345"));
+        assert_eq!(ids.get("imdb"), None);
+    }
+
+    #[test]
+    fn test_provider_ids_multiple() {
+        let mut ids = ProviderIds::default();
+        ids.set("tmdb".to_string(), "123".to_string());
+        ids.set("imdb".to_string(), "tt456".to_string());
+        ids.set("tvdb".to_string(), "789".to_string());
+        assert_eq!(ids.get("tmdb"), Some("123"));
+        assert_eq!(ids.get("imdb"), Some("tt456"));
+        assert_eq!(ids.get("tvdb"), Some("789"));
+    }
+}
