@@ -1,6 +1,8 @@
 name: Release
 
 on:
+  push:
+    branches: [master]
   release:
     types: [published]
 
@@ -72,7 +74,14 @@ jobs:
             echo "artifact=${{ github.event.repository.name }}-${TARGET}.tar.gz" >> "$GITHUB_ENV"
           fi
 
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.artifact }}
+          path: ${{ env.artifact }}
+
       - name: Upload to release
+        if: github.event_name == 'release'
         uses: softprops/action-gh-release@v2
         with:
           files: ${{ env.artifact }}
@@ -133,7 +142,14 @@ jobs:
           tar czf "${{ github.event.repository.name }}-${TARGET}.tar.gz" "$STAGING/"
           echo "artifact=${{ github.event.repository.name }}-${TARGET}.tar.gz" >> "$GITHUB_ENV"
 
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.artifact }}
+          path: ${{ env.artifact }}
+
       - name: Upload to release
+        if: github.event_name == 'release'
         uses: softprops/action-gh-release@v2
         with:
           files: ${{ env.artifact }}
