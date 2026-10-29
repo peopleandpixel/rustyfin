@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-29
+
+### Added
+- **Cross-platform binary releases**: GitHub Actions workflow builds and packages binaries for 5 platforms on every push to `master` and on published releases.
+
+### Changed
+- **TLS implementation**: Switched `reqwest` from `native-tls` (OpenSSL) to `rustls-tls` for reliable cross-compilation without system OpenSSL dependencies.
+- **Disk usage API**: Made `disk_usage()` cross-platform compatible with `#[cfg(target_family = "unix")]` guard and non-Unix fallback.
+- **Windows cross-compilation**: Added `cargo-xwin` support for building Windows binaries from Linux CI runners.
+- **macOS builds**: Native builds on macOS GitHub runners (x86_64 and aarch64), as `cross` cannot cross-compile to macOS.
+
+### Fixed
+- **aarch64-unknown-linux-gnu build**: Resolved OpenSSL version mismatch by using `rustls` instead of `native-tls`.
+- **x86_64-pc-windows-msvc build**: Configured `cargo-xwin` with required LLVM/clang dependencies for Windows cross-compilation.
+- **macOS aarch64 build**: Moved from `cross` fallback to native macOS runner builds.
+
 ## [0.5.0] - 2026-10-29
 
 ### Added
