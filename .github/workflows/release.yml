@@ -112,7 +112,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Install cargo-xwin
-        uses: cargo-xwin/cargo-xwin-action@v1
+        run: cargo install cargo-xwin
 
       - name: Build Windows binary
         run: cargo xwin-build --release --target x86_64-pc-windows-msvc --bin rustyfin
