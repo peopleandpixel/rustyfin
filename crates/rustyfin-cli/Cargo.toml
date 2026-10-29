@@ -9,7 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive", "env"] }
-reqwest = { workspace = true, features = ["json", "multipart"] }
+reqwest = { workspace = true, features = ["multipart"] }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
