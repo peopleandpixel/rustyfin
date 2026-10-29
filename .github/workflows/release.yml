@@ -8,8 +8,9 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-    name: Build ${{ matrix.target }}
+  # Linux and Windows: cross-compile from Linux using cross
+  build-cross:
+    name: Cross ${{ matrix.target }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -18,8 +19,6 @@ jobs:
           - x86_64-unknown-linux-gnu
           - aarch64-unknown-linux-gnu
           - x86_64-pc-windows-msvc
-          - x86_64-apple-darwin
-          - aarch64-apple-darwin
 
     steps:
       - uses: actions/checkout@v4
@@ -72,6 +71,67 @@ jobs:
             tar czf "${{ github.event.repository.name }}-${TARGET}.tar.gz" "$STAGING/"
             echo "artifact=${{ github.event.repository.name }}-${TARGET}.tar.gz" >> "$GITHUB_ENV"
           fi
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.artifact }}
+
+  # macOS: native build on macOS runner (cross cannot cross-compile to macOS)
+  build-macos:
+    name: macOS ${{ matrix.target }}
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: crates/rustyfin-web/package-lock.json
+
+      - name: Build web client
+        run: |
+          cd crates/rustyfin-web
+          npm install
+          npm run build
+
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }} --bin rustyfin
+
+      - name: Package artifact
+        shell: bash
+        run: |
+          TARGET="${{ matrix.target }}"
+          STAGING="release-${TARGET}"
+          mkdir -p "$STAGING"
+
+          cp "target/${TARGET}/release/rustyfin" "$STAGING/"
+
+          # Copy web client
+          if [ -d "crates/rustyfin-web/dist" ]; then
+            mkdir -p "$STAGING/web"
+            cp -r crates/rustyfin-web/dist/* "$STAGING/web/"
+          fi
+
+          tar czf "${{ github.event.repository.name }}-${TARGET}.tar.gz" "$STAGING/"
+          echo "artifact=${{ github.event.repository.name }}-${TARGET}.tar.gz" >> "$GITHUB_ENV"
 
       - name: Upload to release
         uses: softprops/action-gh-release@v2
