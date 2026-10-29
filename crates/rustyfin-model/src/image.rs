@@ -231,7 +231,10 @@ mod tests {
 
     #[test]
     fn test_image_type_from_str_screenshot() {
-        assert_eq!(ImageType::from_str("screenshot"), Some(ImageType::Screenshot));
+        assert_eq!(
+            ImageType::from_str("screenshot"),
+            Some(ImageType::Screenshot)
+        );
     }
 
     #[test]
@@ -338,10 +341,7 @@ mod tests {
 
     #[test]
     fn test_detect_unknown_filename() {
-        assert_eq!(
-            detect_image_type_from_filename("/path/to/random.jpg"),
-            None
-        );
+        assert_eq!(detect_image_type_from_filename("/path/to/random.jpg"), None);
     }
 
     #[test]

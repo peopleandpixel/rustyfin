@@ -147,9 +147,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(
             "X-Emby-Authorization",
-            "MediaBrowser Client=\"OnlyClient\""
-                .parse()
-                .unwrap(),
+            "MediaBrowser Client=\"OnlyClient\"".parse().unwrap(),
         );
         let (client, version, device, device_id) = parse_emby_auth(&headers);
         assert_eq!(client, "OnlyClient");
@@ -198,15 +196,11 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(
             "X-Emby-Authorization",
-            "MediaBrowser Client=\"EmbyHeader\""
-                .parse()
-                .unwrap(),
+            "MediaBrowser Client=\"EmbyHeader\"".parse().unwrap(),
         );
         headers.insert(
             "Authorization",
-            "MediaBrowser Client=\"AuthHeader\""
-                .parse()
-                .unwrap(),
+            "MediaBrowser Client=\"AuthHeader\"".parse().unwrap(),
         );
         let (client, _version, _device, _device_id) = parse_emby_auth(&headers);
         assert_eq!(client, "EmbyHeader");

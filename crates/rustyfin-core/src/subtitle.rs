@@ -355,7 +355,8 @@ mod tests {
 
     #[test]
     fn test_srt_to_vtt_multiple_cues() {
-        let srt = "1\n00:00:01,000 --> 00:00:02,000\nFirst\n\n2\n00:00:03,000 --> 00:00:04,000\nSecond";
+        let srt =
+            "1\n00:00:01,000 --> 00:00:02,000\nFirst\n\n2\n00:00:03,000 --> 00:00:04,000\nSecond";
         let vtt = srt_to_vtt(srt);
         assert!(vtt.starts_with("WEBVTT\n"));
         assert!(vtt.contains("First"));
@@ -387,7 +388,8 @@ mod tests {
 
     #[test]
     fn test_srt_to_vtt_blank_line_preserved() {
-        let srt = "1\n00:00:01,000 --> 00:00:02,000\nText\n\n2\n00:00:03,000 --> 00:00:04,000\nMore";
+        let srt =
+            "1\n00:00:01,000 --> 00:00:02,000\nText\n\n2\n00:00:03,000 --> 00:00:04,000\nMore";
         let vtt = srt_to_vtt(srt);
         // The blank line between cues should be preserved
         assert!(vtt.contains("\n\n"));

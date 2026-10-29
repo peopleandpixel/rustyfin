@@ -426,7 +426,10 @@ mod tests {
 
     #[test]
     fn test_xml_escape_all_special_chars() {
-        assert_eq!(xml_escape(r#"a & "b" < c > d"#), r#"a &amp; &quot;b&quot; &lt; c &gt; d"#);
+        assert_eq!(
+            xml_escape(r#"a & "b" < c > d"#),
+            r#"a &amp; &quot;b&quot; &lt; c &gt; d"#
+        );
     }
 
     #[test]

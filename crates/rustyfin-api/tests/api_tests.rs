@@ -1041,9 +1041,7 @@ async fn test_playback_progress_not_found() {
                 .uri(format!("/Items/{random_id}/Progress"))
                 .header("Content-Type", "application/json")
                 .header("Authorization", format!("Bearer {token}"))
-                .body(Body::from(
-                    r#"{"PositionTicks":1000000,"IsPlayed":false}"#,
-                ))
+                .body(Body::from(r#"{"PositionTicks":1000000,"IsPlayed":false}"#))
                 .unwrap(),
         )
         .await
@@ -1169,7 +1167,9 @@ async fn test_scheduled_tasks_list() {
     let body = resp.into_body().collect().await.unwrap().to_bytes();
     let tasks: serde_json::Value = serde_json::from_slice(&body).unwrap();
     // May return array or object with Items key
-    assert!(tasks.is_array() || tasks.get("Items").is_some() || tasks.get("ScheduledTasks").is_some());
+    assert!(
+        tasks.is_array() || tasks.get("Items").is_some() || tasks.get("ScheduledTasks").is_some()
+    );
 }
 
 // ── Localization Tests ──

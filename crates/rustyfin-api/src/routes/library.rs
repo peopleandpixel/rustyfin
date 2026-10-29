@@ -674,5 +674,4 @@ mod tests {
         assert_eq!(user_data["IsFavorite"], false);
         assert_eq!(user_data["Played"], false);
     }
-
 }

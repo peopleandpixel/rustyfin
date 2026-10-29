@@ -1146,7 +1146,10 @@ mod tests {
 
     #[test]
     fn test_mime_unknown_extension() {
-        assert_eq!(mime_from_path("/path/to/file.xyz"), "application/octet-stream");
+        assert_eq!(
+            mime_from_path("/path/to/file.xyz"),
+            "application/octet-stream"
+        );
     }
 
     #[test]
