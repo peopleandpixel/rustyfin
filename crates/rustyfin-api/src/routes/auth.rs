@@ -137,7 +137,7 @@ mod tests {
                 .parse()
                 .unwrap(),
         );
-        let (client, version, device, device_id) = parse_emby_auth(&headers);
+        let (client, _version, device, _device_id) = parse_emby_auth(&headers);
         assert_eq!(client, "Fallback");
         assert_eq!(device, "Dev");
     }
@@ -186,7 +186,7 @@ mod tests {
                 .parse()
                 .unwrap(),
         );
-        let (client, version, device, device_id) = parse_emby_auth(&headers);
+        let (client, _version, device, _device_id) = parse_emby_auth(&headers);
         assert_eq!(client, "NoPrefix");
         assert_eq!(device, "Dev");
     }

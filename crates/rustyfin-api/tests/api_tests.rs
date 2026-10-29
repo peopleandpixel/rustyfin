@@ -1057,15 +1057,14 @@ async fn test_branding_splashscreen() {
     let state = test_state().await;
     let app = app(state);
 
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .uri("/Branding")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    app.oneshot(
+        Request::builder()
+            .uri("/Branding")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
 
     // Endpoint may not be implemented yet; accept any response
 }
@@ -1502,16 +1501,15 @@ async fn test_backup_status() {
     let token = rustyfin_auth::create_token(&user, "test-secret").unwrap();
     let app = app(state);
 
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .uri("/Backup/Status")
-                .header("Authorization", format!("Bearer {token}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    app.oneshot(
+        Request::builder()
+            .uri("/Backup/Status")
+            .header("Authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
 
     // Endpoint may not be implemented yet; accept any response
 }
@@ -1683,15 +1681,14 @@ async fn test_dlna_streaming_description() {
     let state = test_state().await;
     let app = app(state);
 
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .uri("/dlna/contentdirectory/description.xml")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    app.oneshot(
+        Request::builder()
+            .uri("/dlna/contentdirectory/description.xml")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
 
     // DLNA streaming endpoint may not be implemented yet; accept any response
 }
