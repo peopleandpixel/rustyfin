@@ -307,8 +307,30 @@ async fn test_error_response_jellyfin_format() {
 
 // ── Web Client Static Serving Tests ──
 
+/// Check if the web client dist folder exists at any of the expected locations
+fn webclient_dist_exists() -> bool {
+    let candidates = [
+        "crates/rustyfin-web/dist",
+        "../crates/rustyfin-web/dist",
+        "../../crates/rustyfin-web/dist",
+        "rustyfin-web/dist",
+        "dist",
+        "web",
+    ];
+    candidates
+        .iter()
+        .any(|p| std::path::Path::new(p).join("index.html").exists())
+}
+
 #[tokio::test]
+#[cfg_attr(not(feature = "webclient"), ignore)]
 async fn test_webclient_index() {
+    // Skip if web client dist is not built (e.g. in CI without npm step)
+    if !webclient_dist_exists() {
+        tracing::info!("skipping test_webclient_index: web client dist not found");
+        return;
+    }
+
     let state = test_state().await;
     let app = app(state);
 
@@ -329,7 +351,14 @@ async fn test_webclient_index() {
 }
 
 #[tokio::test]
+#[cfg_attr(not(feature = "webclient"), ignore)]
 async fn test_webclient_redirects() {
+    // Skip if web client dist is not built (e.g. in CI without npm step)
+    if !webclient_dist_exists() {
+        tracing::info!("skipping test_webclient_redirects: web client dist not found");
+        return;
+    }
+
     let state = test_state().await;
 
     for path in ["/", "/index.html"] {
