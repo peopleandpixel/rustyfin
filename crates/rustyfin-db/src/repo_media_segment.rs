@@ -71,3 +71,45 @@ pub async fn delete_media_segments(pool: &SqlitePool, item_id: Uuid) -> Result<(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{insert_test_item, test_pool};
+
+    #[tokio::test]
+    async fn test_get_media_segments_empty() {
+        let pool = test_pool().await;
+        assert!(
+            get_media_segments(&pool, Uuid::new_v4())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_save_and_get_media_segment() {
+        let pool = test_pool().await;
+        let item = Uuid::new_v4();
+        insert_test_item(&pool, item).await;
+        save_media_segment(&pool, item, "Intro", 0, 500000)
+            .await
+            .unwrap();
+        let segments = get_media_segments(&pool, item).await.unwrap();
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].segment_type, "Intro");
+    }
+
+    #[tokio::test]
+    async fn test_delete_media_segments() {
+        let pool = test_pool().await;
+        let item = Uuid::new_v4();
+        insert_test_item(&pool, item).await;
+        save_media_segment(&pool, item, "Intro", 0, 500000)
+            .await
+            .unwrap();
+        delete_media_segments(&pool, item).await.unwrap();
+        assert!(get_media_segments(&pool, item).await.unwrap().is_empty());
+    }
+}

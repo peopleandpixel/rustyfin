@@ -1,0 +1,34 @@
+# Build artifacts
+target/
+**/target/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Junie agent
+.junie/
+
+# Website (not needed in Docker image)
+website/
+
+# Docs
+docs/
+
+# Dev files
+*.service
+*.sh
+docker-compose.yml
+Cross.toml
+tarpaulin-report.html
+tarpaulin-report.md
+tasks.md
+
+# Git
+.git/
+.gitignore
+
+# OS files
+.DS_Store
+Thumbs.db

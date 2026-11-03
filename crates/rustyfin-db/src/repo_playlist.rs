@@ -201,3 +201,109 @@ pub async fn update_playlist(
 
     Ok(true)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{insert_test_item, insert_test_user, test_pool};
+    use sqlx::SqlitePool;
+    use uuid::Uuid;
+
+    async fn setup() -> (SqlitePool, Uuid, Uuid) {
+        let pool = test_pool().await;
+        let user = Uuid::new_v4();
+        let item = Uuid::new_v4();
+        insert_test_user(&pool, user).await;
+        insert_test_item(&pool, item).await;
+        (pool, user, item)
+    }
+
+    #[tokio::test]
+    async fn test_create_and_get_playlist() {
+        let (pool, user, item) = setup().await;
+        let id = Uuid::new_v4();
+        create_playlist(&pool, id, "My Playlist", user, Some("Movie"), &[item])
+            .await
+            .unwrap();
+        let playlist = get_playlist(&pool, id).await.unwrap();
+        assert!(playlist.is_some());
+        let playlist = playlist.unwrap();
+        assert_eq!(playlist.name, "My Playlist");
+        assert_eq!(playlist.child_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_get_playlist_not_found() {
+        let pool = test_pool().await;
+        assert!(get_playlist(&pool, Uuid::new_v4()).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_playlists_empty() {
+        let (pool, user, _) = setup().await;
+        assert!(get_playlists(&pool, user).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_playlists() {
+        let (pool, user, _) = setup().await;
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+        create_playlist(&pool, id1, "Alpha", user, None, &[])
+            .await
+            .unwrap();
+        create_playlist(&pool, id2, "Beta", user, None, &[])
+            .await
+            .unwrap();
+        let playlists = get_playlists(&pool, user).await.unwrap();
+        assert_eq!(playlists.len(), 2);
+        assert_eq!(playlists[0].name, "Alpha");
+    }
+
+    #[tokio::test]
+    async fn test_delete_playlist() {
+        let (pool, user, _) = setup().await;
+        let pid = Uuid::new_v4();
+        create_playlist(&pool, pid, "To Delete", user, None, &[])
+            .await
+            .unwrap();
+        delete_playlist(&pool, pid).await.unwrap();
+        assert!(get_playlist(&pool, pid).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_add_and_remove_item() {
+        let (pool, user, item) = setup().await;
+        let pid = Uuid::new_v4();
+        create_playlist(&pool, pid, "Test", user, None, &[])
+            .await
+            .unwrap();
+        add_item_to_playlist(&pool, pid, item).await.unwrap();
+        let playlist = get_playlist(&pool, pid).await.unwrap().unwrap();
+        assert_eq!(playlist.child_count, 1);
+        remove_item_from_playlist(&pool, pid, item).await.unwrap();
+        let playlist = get_playlist(&pool, pid).await.unwrap().unwrap();
+        assert_eq!(playlist.child_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_update_playlist_name() {
+        let (pool, user, _) = setup().await;
+        let pid = Uuid::new_v4();
+        create_playlist(&pool, pid, "Old", user, None, &[])
+            .await
+            .unwrap();
+        update_playlist(&pool, pid, Some("New"), None)
+            .await
+            .unwrap();
+        let playlist = get_playlist(&pool, pid).await.unwrap().unwrap();
+        assert_eq!(playlist.name, "New");
+    }
+
+    #[tokio::test]
+    async fn test_get_playlist_items_empty() {
+        let pool = test_pool().await;
+        let items = get_playlist_items(&pool, Uuid::new_v4()).await.unwrap();
+        assert!(items.is_empty());
+    }
+}

@@ -220,3 +220,83 @@ pub async fn delete_backup(pool: &SqlitePool, backup_id: &str) -> Result<(), sql
         .await?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_pool;
+
+    #[tokio::test]
+    async fn test_streaming_profiles_empty() {
+        let pool = test_pool().await;
+        assert!(get_streaming_profiles(&pool).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_create_and_get_streaming_profile() {
+        let pool = test_pool().await;
+        create_streaming_profile(
+            &pool,
+            "p1",
+            "Profile 1",
+            "<xml/>",
+            "mp4",
+            "aac",
+            "h264",
+            "[]",
+            "[]",
+        )
+        .await
+        .unwrap();
+        let profile = get_streaming_profile(&pool, "p1").await.unwrap().unwrap();
+        assert_eq!(profile.name, "Profile 1");
+    }
+
+    #[tokio::test]
+    async fn test_delete_streaming_profile() {
+        let pool = test_pool().await;
+        create_streaming_profile(
+            &pool, "p1", "Del", "<xml/>", "mp4", "aac", "h264", "[]", "[]",
+        )
+        .await
+        .unwrap();
+        delete_streaming_profile(&pool, "p1").await.unwrap();
+        assert!(get_streaming_profile(&pool, "p1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_localization_providers_empty() {
+        let pool = test_pool().await;
+        assert!(get_localization_providers(&pool).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_add_and_delete_localization_provider() {
+        let pool = test_pool().await;
+        add_localization_provider(&pool, "l1", "Subs", "sub", "{}")
+            .await
+            .unwrap();
+        let providers = get_localization_providers(&pool).await.unwrap();
+        assert_eq!(providers.len(), 1);
+        delete_localization_provider(&pool, "l1").await.unwrap();
+        assert!(get_localization_providers(&pool).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_backups_empty() {
+        let pool = test_pool().await;
+        assert!(get_backups(&pool).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_create_and_delete_backup() {
+        let pool = test_pool().await;
+        create_backup(&pool, "b1", "Backup 1", "/path", 1024)
+            .await
+            .unwrap();
+        let backups = get_backups(&pool).await.unwrap();
+        assert_eq!(backups.len(), 1);
+        delete_backup(&pool, "b1").await.unwrap();
+        assert!(get_backups(&pool).await.unwrap().is_empty());
+    }
+}

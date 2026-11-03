@@ -39,3 +39,19 @@ pub async fn get_notifications(
         total_record_count: total.0,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{insert_test_user, test_pool};
+
+    #[tokio::test]
+    async fn test_notifications_empty() {
+        let pool = test_pool().await;
+        let user = Uuid::new_v4();
+        insert_test_user(&pool, user).await;
+        let result = get_notifications(&pool, user).await.unwrap();
+        assert!(result.notifications.is_empty());
+        assert_eq!(result.total_record_count, 0);
+    }
+}

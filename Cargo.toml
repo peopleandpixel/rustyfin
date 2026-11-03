@@ -11,18 +11,19 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.14.0"
+version = "0.15.0"
 edition = "2024"
 
 [workspace.dependencies]
-# Async runtime
-tokio = { version = "1", features = ["full"] }
+# Async runtime - selective features for smaller binary in production
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "fs", "sync", "signal", "macros", "parking_lot", "process"] }
 tokio-util = { version = "0.7", features = ["io"] }
 
 # Web framework
 axum = { version = "0.8", features = ["macros", "ws"] }
 tower = "0.5"
-tower-http = { version = "0.7", features = ["cors", "trace", "fs", "compression-full"] }
+# tower-http - select only needed compression algorithms (gzip, br)
+tower-http = { version = "0.7", features = ["cors", "trace", "fs", "compression-gzip", "compression-br"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

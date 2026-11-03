@@ -206,11 +206,11 @@ async fn main() {
         });
         let shutdown_rx = state.shutdown_tx.subscribe();
         let cfg = dlna_config.clone();
-        tokio::spawn(async move {
+        let _ = tokio::spawn(async move {
             rustyfin_core::dlna::run_ssdp_responder(cfg, shutdown_rx).await;
         });
         let shutdown_rx = state.shutdown_tx.subscribe();
-        tokio::spawn(async move {
+        let _ = tokio::spawn(async move {
             rustyfin_core::dlna::run_ssdp_advertiser(dlna_config, shutdown_rx).await;
         });
     }
@@ -225,7 +225,7 @@ async fn main() {
             endpoint_address: std::env::var("RUSTYFIN_PUBLISHED_URL").ok(),
         });
         let shutdown_rx = state.shutdown_tx.subscribe();
-        tokio::spawn(async move {
+        let _ = tokio::spawn(async move {
             rustyfin_core::udp_discovery::run_udp_discovery(udp_config, shutdown_rx).await;
         });
     }
@@ -239,7 +239,7 @@ async fn main() {
             bind_ip: std::net::Ipv4Addr::UNSPECIFIED,
         });
         let shutdown_rx = state.shutdown_tx.subscribe();
-        tokio::spawn(async move {
+        let _ = tokio::spawn(async move {
             rustyfin_core::mdns::run_mdns_responder(mdns_config, shutdown_rx).await;
         });
     }
@@ -264,7 +264,7 @@ async fn main() {
     // Background task: cleanup expired sessions every 5 minutes
     {
         let db = cleanup_db;
-        tokio::spawn(async move {
+        let _ = tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
             loop {
                 interval.tick().await;
@@ -279,7 +279,7 @@ async fn main() {
 
     // Background task: cleanup expired L2 cache entries every 6 hours
     {
-        tokio::spawn(async move {
+        let _ = tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600 * 6));
             loop {
                 interval.tick().await;
@@ -292,7 +292,7 @@ async fn main() {
     {
         let config = sighup_config;
         let data_dir = sighup_data_dir;
-        tokio::spawn(async move {
+        let _ = tokio::spawn(async move {
             #[cfg(unix)]
             {
                 let mut sig =

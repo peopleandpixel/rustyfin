@@ -467,3 +467,228 @@ pub async fn clear_user_rating(
     .await?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{insert_test_item, insert_test_user, test_pool};
+
+    async fn setup() -> (SqlitePool, Uuid, Uuid) {
+        let pool = test_pool().await;
+        let user = Uuid::new_v4();
+        let item = Uuid::new_v4();
+        insert_test_user(&pool, user).await;
+        insert_test_item(&pool, item).await;
+        (pool, user, item)
+    }
+
+    #[tokio::test]
+    async fn test_get_user_item_data_empty() {
+        let (pool, user, item) = setup().await;
+        let data = get_user_item_data(&pool, user, item).await.unwrap();
+        assert_eq!(data.playback_position_ticks, 0);
+        assert_eq!(data.play_count, 0);
+        assert!(!data.is_favorite);
+        assert!(!data.played);
+        assert!(data.last_played_date.is_none());
+        assert!(data.user_rating.is_none());
+        assert!(data.favorite.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_update_playback_position() {
+        let (pool, user, item) = setup().await;
+        update_playback_position(&pool, user, item, 12345)
+            .await
+            .unwrap();
+        let data = get_user_item_data(&pool, user, item).await.unwrap();
+        assert_eq!(data.playback_position_ticks, 12345);
+        assert!(data.last_played_date.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_update_playback_position_overwrite() {
+        let (pool, user, item) = setup().await;
+        update_playback_position(&pool, user, item, 100)
+            .await
+            .unwrap();
+        update_playback_position(&pool, user, item, 200)
+            .await
+            .unwrap();
+        let data = get_user_item_data(&pool, user, item).await.unwrap();
+        assert_eq!(data.playback_position_ticks, 200);
+    }
+
+    #[tokio::test]
+    async fn test_mark_played() {
+        let (pool, user, item) = setup().await;
+        let data = mark_played(&pool, user, item).await.unwrap();
+        assert!(data.played);
+        assert_eq!(data.play_count, 1);
+        assert!(data.last_played_date.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_mark_played_increment() {
+        let (pool, user, item) = setup().await;
+        mark_played(&pool, user, item).await.unwrap();
+        mark_played(&pool, user, item).await.unwrap();
+        let data = get_user_item_data(&pool, user, item).await.unwrap();
+        assert_eq!(data.play_count, 2);
+    }
+
+    #[tokio::test]
+    async fn test_mark_unplayed() {
+        let (pool, user, item) = setup().await;
+        mark_played(&pool, user, item).await.unwrap();
+        let data = mark_unplayed(&pool, user, item).await.unwrap();
+        assert!(!data.played);
+        assert_eq!(data.play_count, 0);
+        assert_eq!(data.playback_position_ticks, 0);
+    }
+
+    #[tokio::test]
+    async fn test_set_favorite() {
+        let (pool, user, item) = setup().await;
+        let data = set_favorite(&pool, user, item, true).await.unwrap();
+        assert!(data.is_favorite);
+        let data = set_favorite(&pool, user, item, false).await.unwrap();
+        assert!(!data.is_favorite);
+    }
+
+    #[tokio::test]
+    async fn test_on_playback_stopped() {
+        let (pool, user, item) = setup().await;
+        on_playback_stopped(&pool, user, item, Some(999))
+            .await
+            .unwrap();
+        let data = get_user_item_data(&pool, user, item).await.unwrap();
+        assert_eq!(data.playback_position_ticks, 999);
+    }
+
+    #[tokio::test]
+    async fn test_on_playback_stopped_none() {
+        let (pool, user, item) = setup().await;
+        on_playback_stopped(&pool, user, item, None).await.unwrap();
+        let data = get_user_item_data(&pool, user, item).await.unwrap();
+        assert_eq!(data.playback_position_ticks, 0);
+    }
+
+    #[tokio::test]
+    async fn test_set_user_rating_both() {
+        let (pool, user, item) = setup().await;
+        let data = set_user_rating(&pool, user, item, Some(true), Some(5))
+            .await
+            .unwrap();
+        assert_eq!(data.likes, Some(true));
+        assert_eq!(data.user_rating, Some(5));
+    }
+
+    #[tokio::test]
+    async fn test_set_user_rating_likes_only() {
+        let (pool, user, item) = setup().await;
+        let data = set_user_rating(&pool, user, item, Some(false), None)
+            .await
+            .unwrap();
+        assert_eq!(data.likes, Some(false));
+        assert_eq!(data.user_rating, None);
+    }
+
+    #[tokio::test]
+    async fn test_set_user_rating_stars_only() {
+        let (pool, user, item) = setup().await;
+        let data = set_user_rating(&pool, user, item, None, Some(3))
+            .await
+            .unwrap();
+        assert_eq!(data.user_rating, Some(3));
+    }
+
+    #[tokio::test]
+    async fn test_set_user_rating_clear() {
+        let (pool, user, item) = setup().await;
+        set_user_rating(&pool, user, item, Some(true), Some(5))
+            .await
+            .unwrap();
+        let data = set_user_rating(&pool, user, item, None, None)
+            .await
+            .unwrap();
+        assert_eq!(data.likes, None);
+        assert_eq!(data.user_rating, None);
+    }
+
+    #[tokio::test]
+    async fn test_clear_user_rating() {
+        let (pool, user, item) = setup().await;
+        set_user_rating(&pool, user, item, Some(true), Some(4))
+            .await
+            .unwrap();
+        clear_user_rating(&pool, user, item).await.unwrap();
+        let data = get_user_item_data(&pool, user, item).await.unwrap();
+        assert_eq!(data.likes, None);
+        assert_eq!(data.user_rating, None);
+    }
+
+    #[tokio::test]
+    async fn test_update_last_activity_date() {
+        let pool = test_pool().await;
+        let user = Uuid::new_v4();
+        let item1 = Uuid::new_v4();
+        let item2 = Uuid::new_v4();
+        insert_test_user(&pool, user).await;
+        insert_test_item(&pool, item1).await;
+        insert_test_item(&pool, item2).await;
+        update_last_activity_date(&pool, user, &[item1, item2])
+            .await
+            .unwrap();
+        let d1 = get_user_item_data(&pool, user, item1).await.unwrap();
+        let d2 = get_user_item_data(&pool, user, item2).await.unwrap();
+        assert!(d1.last_played_date.is_some());
+        assert!(d2.last_played_date.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_update_last_activity_date_empty() {
+        let pool = test_pool().await;
+        let user = Uuid::new_v4();
+        update_last_activity_date(&pool, user, &[]).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_get_user_item_data_batch() {
+        let pool = test_pool().await;
+        let user = Uuid::new_v4();
+        let item1 = Uuid::new_v4();
+        let item2 = Uuid::new_v4();
+        let item3 = Uuid::new_v4();
+        insert_test_user(&pool, user).await;
+        insert_test_item(&pool, item1).await;
+        insert_test_item(&pool, item2).await;
+        insert_test_item(&pool, item3).await;
+        mark_played(&pool, user, item1).await.unwrap();
+        set_favorite(&pool, user, item2, true).await.unwrap();
+        let batch = get_user_item_data_batch(&pool, user, &[item1, item2, item3])
+            .await
+            .unwrap();
+        assert_eq!(batch.len(), 2);
+        assert!(batch.get(&item1.to_string()).unwrap().played);
+        assert!(batch.get(&item2.to_string()).unwrap().is_favorite);
+        assert!(!batch.contains_key(&item3.to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_get_user_item_data_batch_empty() {
+        let pool = test_pool().await;
+        let user = Uuid::new_v4();
+        let batch = get_user_item_data_batch(&pool, user, &[]).await.unwrap();
+        assert!(batch.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_pinned_episode_empty() {
+        let pool = test_pool().await;
+        let user = Uuid::new_v4();
+        let series = Uuid::new_v4();
+        let pinned = get_pinned_episode(&pool, user, series).await.unwrap();
+        assert!(pinned.is_none());
+    }
+}

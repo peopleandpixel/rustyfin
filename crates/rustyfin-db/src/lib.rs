@@ -83,6 +83,63 @@ pub async fn init_db(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
     Ok(pool)
 }
 
+#[cfg(test)]
+pub async fn test_pool() -> SqlitePool {
+    let path = std::path::PathBuf::from(format!("/tmp/rustyfin_test_{}.db", uuid::Uuid::new_v4()));
+    init_db(path.to_str().unwrap()).await.unwrap()
+}
+
+#[cfg(test)]
+pub async fn insert_test_user(pool: &SqlitePool, id: uuid::Uuid) {
+    let uid = id.to_string();
+    sqlx::query(
+        "INSERT OR IGNORE INTO users (id, name, password_hash, is_administrator, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+    )
+    .bind(&uid)
+    .bind(format!("user_{}", id))
+    .bind("hashed")
+    .bind(1)
+    .bind(chrono::Utc::now().to_rfc3339())
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[cfg(test)]
+pub async fn insert_test_library(pool: &SqlitePool, id: uuid::Uuid) {
+    let lid = id.to_string();
+    sqlx::query(
+        "INSERT OR IGNORE INTO libraries (id, name, content_type, paths) VALUES (?1, ?2, ?3, ?4)",
+    )
+    .bind(&lid)
+    .bind("Test Library")
+    .bind("Movie")
+    .bind("[]")
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[cfg(test)]
+pub async fn insert_test_item(pool: &SqlitePool, id: uuid::Uuid) {
+    let iid = id.to_string();
+    let lib_id = uuid::Uuid::new_v4();
+    insert_test_library(pool, lib_id).await;
+    let lid = lib_id.to_string();
+    sqlx::query(
+        "INSERT OR IGNORE INTO media_items (id, name, media_type, path, library_id, date_created) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+    )
+    .bind(&iid)
+    .bind(format!("Item {}", id))
+    .bind("Movie")
+    .bind("/tmp/test.mp4")
+    .bind(&lid)
+    .bind(chrono::Utc::now().to_rfc3339())
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
 /// Initialize a read-only connection pool for query-heavy operations.
 /// Uses `PRAGMA query_only = ON` to prevent accidental writes and allow
 /// SQLite to optimize read paths by skipping write-lock overhead.

@@ -179,3 +179,47 @@ pub async fn search_items(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_fts_query_simple() {
+        assert_eq!(normalize_fts_query("hello"), "hello*");
+    }
+
+    #[test]
+    fn test_normalize_fts_query_escape_star() {
+        assert_eq!(normalize_fts_query("hello*world"), "hello\\*world*");
+    }
+
+    #[test]
+    fn test_normalize_fts_query_escape_quote() {
+        assert_eq!(normalize_fts_query("say \"hi\""), "say \\\"hi\\\"*");
+    }
+
+    #[test]
+    fn test_normalize_fts_query_escape_backslash() {
+        assert_eq!(normalize_fts_query("path\\to\\file"), "path\\\\to\\\\file*");
+    }
+
+    #[test]
+    fn test_normalize_fts_query_escape_question() {
+        assert_eq!(normalize_fts_query("what?"), "what\\?*");
+    }
+
+    #[tokio::test]
+    async fn test_search_hints_empty() {
+        let pool = crate::test_pool().await;
+        let hints = search_hints(&pool, "nonexistent", 10).await.unwrap();
+        assert!(hints.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_search_items_empty() {
+        let pool = crate::test_pool().await;
+        let items = search_items(&pool, "nonexistent", &[], 10).await.unwrap();
+        assert!(items.is_empty());
+    }
+}

@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-11-03
+
+### Added
+- **Comprehensive DB Repository test suite**: Added 70 new unit tests across 11 previously untested database repositories, significantly improving code coverage.
+  - **repo_playback** (20 tests): User item data, playback position, favorites, ratings, likes, batch queries, pinned episodes.
+  - **repo_playlist** (9 tests): CRUD operations, item management, updates.
+  - **repo_search** (7 tests): FTS5 query normalization, search hints, search items.
+  - **repo_chapter** (6 tests): Save, get, batch, delete, ordering.
+  - **repo_collection** (6 tests): CRUD operations, item management.
+  - **repo_misc** (7 tests): DLNA streaming profiles, localization providers, backups.
+  - **repo_trickplay** (4 tests): Save, get, batch, delete.
+  - **repo_sync_play** (5 tests): Groups, members, locking.
+  - **repo_activity** (3 tests): Activity logging, pagination.
+  - **repo_media_segment** (3 tests): Save, get, delete.
+  - **repo_notification** (1 test): Empty notifications query.
+- **Test infrastructure**: Added shared test helper functions (`test_pool`, `insert_test_user`, `insert_test_item`, `insert_test_library`) in `lib.rs` for consistent test database setup with proper Foreign Key constraints.
+
+### Changed
+- **Test coverage improved**: `rustyfin-db` line coverage increased from 25.7% to 38.8% (+13.1 percentage points). Total test count increased from 148 to 218.
+
 ## [0.14.0] - 2026-11-03
 
 ### Fixed

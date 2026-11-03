@@ -141,3 +141,71 @@ pub async fn delete_trickplay(pool: &SqlitePool, item_id: Uuid) -> Result<(), sq
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{insert_test_item, test_pool};
+
+    fn make_trickplay(item_id: &str) -> TrickplayInfo {
+        TrickplayInfo {
+            item_id: item_id.to_string(),
+            width: 80,
+            height: 45,
+            interval_ticks: 100000,
+            thumbnail_count: 100,
+            directory_path: "/tmp/trickplay".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_trickplay_empty() {
+        let pool = test_pool().await;
+        assert!(
+            get_trickplay(&pool, Uuid::new_v4())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_save_and_get_trickplay() {
+        let pool = test_pool().await;
+        let item = Uuid::new_v4();
+        insert_test_item(&pool, item).await;
+        let info = make_trickplay(&item.to_string());
+        save_trickplay(&pool, item, &info).await.unwrap();
+        let got = get_trickplay(&pool, item).await.unwrap().unwrap();
+        assert_eq!(got.width, 80);
+    }
+
+    #[tokio::test]
+    async fn test_delete_trickplay() {
+        let pool = test_pool().await;
+        let item = Uuid::new_v4();
+        insert_test_item(&pool, item).await;
+        save_trickplay(&pool, item, &make_trickplay(&item.to_string()))
+            .await
+            .unwrap();
+        delete_trickplay(&pool, item).await.unwrap();
+        assert!(get_trickplay(&pool, item).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_trickplay_batch() {
+        let pool = test_pool().await;
+        let item1 = Uuid::new_v4();
+        let item2 = Uuid::new_v4();
+        insert_test_item(&pool, item1).await;
+        insert_test_item(&pool, item2).await;
+        save_trickplay(&pool, item1, &make_trickplay(&item1.to_string()))
+            .await
+            .unwrap();
+        save_trickplay(&pool, item2, &make_trickplay(&item2.to_string()))
+            .await
+            .unwrap();
+        let batch = get_trickplay_batch(&pool, &[item1, item2]).await.unwrap();
+        assert_eq!(batch.len(), 2);
+    }
+}

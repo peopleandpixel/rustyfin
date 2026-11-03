@@ -76,3 +76,49 @@ pub async fn get_activity_log(
         total_record_count: total.0,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_pool;
+
+    #[tokio::test]
+    async fn test_activity_log_empty() {
+        let pool = test_pool().await;
+        let result = get_activity_log(&pool, 0, 10).await.unwrap();
+        assert!(result.items.is_empty());
+        assert_eq!(result.total_record_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_log_and_get_activity() {
+        let pool = test_pool().await;
+        log_activity(&pool, "User logged in", "Login", None, None, "Info", None)
+            .await
+            .unwrap();
+        let result = get_activity_log(&pool, 0, 10).await.unwrap();
+        assert_eq!(result.total_record_count, 1);
+        assert_eq!(result.items[0].name, "User logged in");
+    }
+
+    #[tokio::test]
+    async fn test_activity_log_pagination() {
+        let pool = test_pool().await;
+        for i in 0..5 {
+            log_activity(
+                &pool,
+                &format!("Entry {}", i),
+                "Test",
+                None,
+                None,
+                "Info",
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let result = get_activity_log(&pool, 0, 2).await.unwrap();
+        assert_eq!(result.total_record_count, 5);
+        assert_eq!(result.items.len(), 2);
+    }
+}

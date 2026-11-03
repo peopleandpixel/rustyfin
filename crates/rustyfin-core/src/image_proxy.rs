@@ -5,6 +5,8 @@ use tokio::fs;
 /// Serve an image with optional resizing, using a cache directory.
 /// If `http_client` is provided, it will be reused for remote image downloads,
 /// avoiding the overhead of creating a new client per request.
+/// CPU-intensive image processing (decode, resize, encode) runs on a blocking task
+/// to avoid starving the async runtime.
 pub async fn get_or_resize_image(
     source_path: &str,
     max_width: Option<u32>,
@@ -32,32 +34,41 @@ pub async fn get_or_resize_image(
         return Ok(bytes);
     }
 
-    // Read and resize
+    // Read source bytes (async I/O)
     let source_bytes = read_image_bytes(source_path, http_client).await?;
-    let img = image::load_from_memory(&source_bytes)
-        .map_err(|e| format!("failed to decode image: {}", e))?;
+    let cache_dir = cache_dir.to_path_buf();
 
-    let resized = if w > 0 && h > 0 {
-        img.resize(w, h, FilterType::Lanczos3)
-    } else if w > 0 {
-        let ratio = w as f64 / img.width() as f64;
-        let new_h = (img.height() as f64 * ratio) as u32;
-        img.resize(w, new_h, FilterType::Lanczos3)
-    } else {
-        let ratio = h as f64 / img.height() as f64;
-        let new_w = (img.width() as f64 * ratio) as u32;
-        img.resize(new_w, h, FilterType::Lanczos3)
-    };
+    // CPU-intensive image processing on a blocking task to avoid starving the async runtime
+    let bytes = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
+        // Decode image
+        let img = image::load_from_memory(&source_bytes)
+            .map_err(|e| format!("failed to decode image: {}", e))?;
 
-    // Encode as JPEG
-    let mut buf = std::io::Cursor::new(Vec::new());
-    resized
-        .write_to(&mut buf, image::ImageFormat::Jpeg)
-        .map_err(|e| format!("failed to encode image: {}", e))?;
-    let bytes = buf.into_inner();
+        // Resize image
+        let resized = if w > 0 && h > 0 {
+            img.resize(w, h, FilterType::Lanczos3)
+        } else if w > 0 {
+            let ratio = w as f64 / img.width() as f64;
+            let new_h = (img.height() as f64 * ratio) as u32;
+            img.resize(w, new_h, FilterType::Lanczos3)
+        } else {
+            let ratio = h as f64 / img.height() as f64;
+            let new_w = (img.width() as f64 * ratio) as u32;
+            img.resize(new_w, h, FilterType::Lanczos3)
+        };
 
-    // Cache
-    let _ = fs::create_dir_all(cache_dir).await;
+        // Encode as JPEG
+        let mut buf = std::io::Cursor::new(Vec::new());
+        resized
+            .write_to(&mut buf, image::ImageFormat::Jpeg)
+            .map_err(|e| format!("failed to encode image: {}", e))?;
+        Ok(buf.into_inner())
+    })
+    .await
+    .map_err(|e| format!("image processing task panicked: {}", e))??;
+
+    // Cache to disk (async I/O)
+    let _ = fs::create_dir_all(&cache_dir).await;
     let _ = fs::write(&cache_path, &bytes).await;
 
     Ok(bytes)
@@ -136,20 +147,26 @@ fn filename_stem(path: &str) -> String {
 /// Compute a blurhash string for an image file.
 /// Returns a short blurhash (8x8 components) suitable for progressive image loading.
 /// If `http_client` is provided, it will be reused for remote image downloads.
+/// CPU-intensive image processing runs on a blocking task to avoid starving the async runtime.
 pub async fn compute_blurhash(
     source_path: &str,
     http_client: Option<&reqwest::Client>,
 ) -> Option<String> {
     let bytes = read_image_bytes(source_path, http_client).await.ok()?;
-    let img = image::load_from_memory(&bytes).ok()?;
-    // Downscale to a small image for faster encoding
-    let small = img.resize(16, 16, FilterType::Triangle);
-    let rgba = small.to_rgba8();
-    let width = rgba.width() as usize;
-    let height = rgba.height() as usize;
-    let pixels = rgba.as_raw();
 
-    // Use 4x4 components for a short hash
-    let hash = blurhash::encode(4, 4, width as u32, height as u32, pixels.as_slice()).ok()?;
-    Some(hash)
+    // CPU-intensive image processing on a blocking task to avoid starving the async runtime
+    tokio::task::spawn_blocking(move || {
+        let img = image::load_from_memory(&bytes).ok()?;
+        // Downscale to a small image for faster encoding
+        let small = img.resize(16, 16, FilterType::Triangle);
+        let rgba = small.to_rgba8();
+        let width = rgba.width() as usize;
+        let height = rgba.height() as usize;
+        let pixels = rgba.as_raw();
+
+        // Use 4x4 components for a short hash
+        blurhash::encode(4, 4, width as u32, height as u32, pixels.as_slice()).ok()
+    })
+    .await
+    .ok()?
 }

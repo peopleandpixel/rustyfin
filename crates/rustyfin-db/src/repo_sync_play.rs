@@ -133,3 +133,58 @@ pub async fn lock_group(
         .await?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_pool;
+
+    #[tokio::test]
+    async fn test_groups_empty() {
+        let pool = test_pool().await;
+        assert!(get_groups(&pool).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_create_and_get_group() {
+        let pool = test_pool().await;
+        create_group(&pool, "g1", "Group 1", "u1", "sync")
+            .await
+            .unwrap();
+        let group = get_group(&pool, "g1").await.unwrap().unwrap();
+        assert_eq!(group.name, "Group 1");
+        assert!(!group.is_locked);
+    }
+
+    #[tokio::test]
+    async fn test_delete_group() {
+        let pool = test_pool().await;
+        create_group(&pool, "g1", "Del", "u1", "sync")
+            .await
+            .unwrap();
+        delete_group(&pool, "g1").await.unwrap();
+        assert!(get_group(&pool, "g1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_lock_group() {
+        let pool = test_pool().await;
+        create_group(&pool, "g1", "Lockable", "u1", "sync")
+            .await
+            .unwrap();
+        lock_group(&pool, "g1", true).await.unwrap();
+        assert!(get_group(&pool, "g1").await.unwrap().unwrap().is_locked);
+    }
+
+    #[tokio::test]
+    async fn test_add_and_remove_member() {
+        let pool = test_pool().await;
+        create_group(&pool, "g1", "Group", "u1", "sync")
+            .await
+            .unwrap();
+        add_member(&pool, "m1", "g1", "u1", "s1").await.unwrap();
+        assert_eq!(get_members(&pool, "g1").await.unwrap().len(), 1);
+        remove_member(&pool, "m1").await.unwrap();
+        assert!(get_members(&pool, "g1").await.unwrap().is_empty());
+    }
+}

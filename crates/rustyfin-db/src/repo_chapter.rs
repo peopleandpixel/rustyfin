@@ -151,3 +151,94 @@ pub async fn delete_chapters(pool: &SqlitePool, item_id: Uuid) -> Result<(), sql
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{insert_test_item, test_pool};
+
+    fn make_chapter(id: &str, number: i32, name: &str) -> Chapter {
+        Chapter {
+            id: id.to_string(),
+            item_id: "dummy".to_string(),
+            chapter_number: number,
+            name: name.to_string(),
+            start_position_ticks: number as i64 * 10000,
+            end_position_ticks: (number + 1) as i64 * 10000,
+            image_path: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_chapters_empty() {
+        let pool = test_pool().await;
+        let item = Uuid::new_v4();
+        assert!(get_chapters(&pool, item).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_save_and_get_chapters() {
+        let pool = test_pool().await;
+        let item = Uuid::new_v4();
+        insert_test_item(&pool, item).await;
+        let chapters = vec![
+            make_chapter("c1", 1, "Chapter 1"),
+            make_chapter("c2", 2, "Chapter 2"),
+        ];
+        save_chapters(&pool, item, chapters).await.unwrap();
+        let got = get_chapters(&pool, item).await.unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].name, "Chapter 1");
+    }
+
+    #[tokio::test]
+    async fn test_save_chapters_overwrites() {
+        let pool = test_pool().await;
+        let item = Uuid::new_v4();
+        insert_test_item(&pool, item).await;
+        save_chapters(&pool, item, vec![make_chapter("c1", 1, "Old")])
+            .await
+            .unwrap();
+        save_chapters(&pool, item, vec![make_chapter("c2", 1, "New")])
+            .await
+            .unwrap();
+        let got = get_chapters(&pool, item).await.unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].name, "New");
+    }
+
+    #[tokio::test]
+    async fn test_delete_chapters() {
+        let pool = test_pool().await;
+        let item = Uuid::new_v4();
+        insert_test_item(&pool, item).await;
+        save_chapters(&pool, item, vec![make_chapter("c1", 1, "Del")])
+            .await
+            .unwrap();
+        delete_chapters(&pool, item).await.unwrap();
+        assert!(get_chapters(&pool, item).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_chapters_batch_empty() {
+        let pool = test_pool().await;
+        assert!(get_chapters_batch(&pool, &[]).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_chapters_batch() {
+        let pool = test_pool().await;
+        let item1 = Uuid::new_v4();
+        let item2 = Uuid::new_v4();
+        insert_test_item(&pool, item1).await;
+        insert_test_item(&pool, item2).await;
+        save_chapters(&pool, item1, vec![make_chapter("c1", 1, "Ch1")])
+            .await
+            .unwrap();
+        save_chapters(&pool, item2, vec![make_chapter("c2", 1, "Ch2")])
+            .await
+            .unwrap();
+        let batch = get_chapters_batch(&pool, &[item1, item2]).await.unwrap();
+        assert_eq!(batch.len(), 2);
+    }
+}

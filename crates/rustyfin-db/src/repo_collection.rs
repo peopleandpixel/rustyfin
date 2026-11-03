@@ -177,3 +177,84 @@ pub async fn remove_item_from_collection(
         .await?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{insert_test_item, insert_test_user, test_pool};
+
+    async fn setup() -> (SqlitePool, Uuid, Uuid) {
+        let pool = test_pool().await;
+        let user = Uuid::new_v4();
+        let item = Uuid::new_v4();
+        insert_test_user(&pool, user).await;
+        insert_test_item(&pool, item).await;
+        (pool, user, item)
+    }
+
+    #[tokio::test]
+    async fn test_create_and_get_collection() {
+        let (pool, user, item) = setup().await;
+        let id = Uuid::new_v4();
+        create_collection(&pool, id, "My Collection", user, &[item])
+            .await
+            .unwrap();
+        let col = get_collection(&pool, id).await.unwrap().unwrap();
+        assert_eq!(col.name, "My Collection");
+        assert_eq!(col.child_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_get_collection_not_found() {
+        let pool = test_pool().await;
+        assert!(
+            get_collection(&pool, Uuid::new_v4())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_collections_empty() {
+        let (pool, user, _) = setup().await;
+        assert!(get_collections(&pool, user).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_delete_collection() {
+        let (pool, user, _) = setup().await;
+        let cid = Uuid::new_v4();
+        create_collection(&pool, cid, "Del", user, &[])
+            .await
+            .unwrap();
+        delete_collection(&pool, cid).await.unwrap();
+        assert!(get_collection(&pool, cid).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_add_and_remove_item() {
+        let (pool, user, item) = setup().await;
+        let cid = Uuid::new_v4();
+        create_collection(&pool, cid, "Test", user, &[])
+            .await
+            .unwrap();
+        add_item_to_collection(&pool, cid, item).await.unwrap();
+        let col = get_collection(&pool, cid).await.unwrap().unwrap();
+        assert_eq!(col.child_count, 1);
+        remove_item_from_collection(&pool, cid, item).await.unwrap();
+        let col = get_collection(&pool, cid).await.unwrap().unwrap();
+        assert_eq!(col.child_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_get_collection_items_empty() {
+        let pool = test_pool().await;
+        assert!(
+            get_collection_items(&pool, Uuid::new_v4())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+}

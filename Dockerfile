@@ -1,5 +1,10 @@
 # ---- Build Stage ----
-FROM rust:1.85-bookworm AS builder
+FROM rust:1.92-bookworm AS builder
+
+ENV CARGO_INCREMENTAL=0
+ENV CARGO_PROFILE_RELEASE_LTO=fat
+ENV CARGO_PROFILE_RELEASE_PANIC=abort
+ENV CARGO_PROFILE_RELEASE_STRIP=symbols
 
 WORKDIR /usr/src/rustyfin
 
@@ -49,7 +54,7 @@ ENV RUST_LOG=info
 
 EXPOSE 8096
 
-HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:8096/System/Info/Public || exit 1
 
 ENTRYPOINT ["rustyfin"]
