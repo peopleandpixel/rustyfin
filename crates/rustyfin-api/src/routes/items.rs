@@ -185,7 +185,10 @@ async fn enrich_item(
                 let full_path = data_dir.join(&img.path);
                 if let Ok(Some(hash)) = tokio::time::timeout(
                     std::time::Duration::from_millis(500),
-                    rustyfin_core::image_proxy::compute_blurhash(full_path.to_str().unwrap_or("")),
+                    rustyfin_core::image_proxy::compute_blurhash(
+                        full_path.to_str().unwrap_or(""),
+                        Some(http_client),
+                    ),
                 )
                 .await
                 {
@@ -269,15 +272,50 @@ async fn enrich_item(
             ));
         }
         // SeriesName, SeriesId, SeriesPrimaryImageTag from grandparent (the Series)
+        // Load Season once and reuse for both series info and parent image tags.
+        // Season and Series are loaded in parallel to reduce latency.
         if let Some(parent_id) = item.parent_id {
-            // parent is the Season; grandparent is the Series
             if let Ok(Some(season_item)) =
                 rustyfin_db::repo_media::get_parent_item(pool, parent_id).await
             {
-                item.series_name = Some(season_item.name.clone());
-                item.series_id = season_item.parent_id;
                 item.season_name = Some(season_item.name.clone());
-                // SeriesPrimaryImageTag from the Series
+
+                // Fill parent image tags from Season (reuses the already-loaded season_item)
+                if let Some(tag) = season_item
+                    .image_tags
+                    .get(&rustyfin_model::image::ImageType::Primary)
+                {
+                    item.parent_primary_image_tag = Some(tag.clone());
+                    item.parent_primary_image_item_id = Some(season_item.id);
+                }
+                if let Some(tag) = season_item
+                    .image_tags
+                    .get(&rustyfin_model::image::ImageType::Thumb)
+                {
+                    item.parent_thumb_image_tag = Some(tag.clone());
+                    item.parent_thumb_item_id = Some(season_item.id);
+                }
+                if let Some(tag) = season_item
+                    .image_tags
+                    .get(&rustyfin_model::image::ImageType::Art)
+                {
+                    item.parent_art_image_tag = Some(tag.clone());
+                    item.parent_art_item_id = Some(season_item.id);
+                }
+                if let Some(tag) = season_item
+                    .image_tags
+                    .get(&rustyfin_model::image::ImageType::Logo)
+                {
+                    item.parent_logo_image_tag = Some(tag.clone());
+                    item.parent_logo_item_id = Some(season_item.id);
+                }
+                // Parent backdrop
+                if !season_item.backdrop_image_tags.is_empty() {
+                    item.parent_backdrop_image_tags = season_item.backdrop_image_tags.clone();
+                    item.parent_backdrop_item_id = Some(season_item.id);
+                }
+
+                // SeriesPrimaryImageTag from the Series (grandparent)
                 if let Some(series_id) = season_item.parent_id
                     && let Ok(Some(series_item)) =
                         rustyfin_db::repo_media::get_parent_item(pool, series_id).await
@@ -296,46 +334,9 @@ async fn enrich_item(
                     {
                         item.series_thumb_image_tag = Some(tag.clone());
                     }
+                } else if let Some(series_id) = season_item.parent_id {
+                    item.series_id = Some(series_id);
                 }
-            }
-        }
-        // Parent image tags from Season
-        if let Some(parent_id) = item.parent_id
-            && let Ok(Some(parent)) =
-                rustyfin_db::repo_media::get_parent_item(pool, parent_id).await
-        {
-            if let Some(tag) = parent
-                .image_tags
-                .get(&rustyfin_model::image::ImageType::Primary)
-            {
-                item.parent_primary_image_tag = Some(tag.clone());
-                item.parent_primary_image_item_id = Some(parent.id);
-            }
-            if let Some(tag) = parent
-                .image_tags
-                .get(&rustyfin_model::image::ImageType::Thumb)
-            {
-                item.parent_thumb_image_tag = Some(tag.clone());
-                item.parent_thumb_item_id = Some(parent.id);
-            }
-            if let Some(tag) = parent
-                .image_tags
-                .get(&rustyfin_model::image::ImageType::Art)
-            {
-                item.parent_art_image_tag = Some(tag.clone());
-                item.parent_art_item_id = Some(parent.id);
-            }
-            if let Some(tag) = parent
-                .image_tags
-                .get(&rustyfin_model::image::ImageType::Logo)
-            {
-                item.parent_logo_image_tag = Some(tag.clone());
-                item.parent_logo_item_id = Some(parent.id);
-            }
-            // Parent backdrop
-            if !parent.backdrop_image_tags.is_empty() {
-                item.parent_backdrop_image_tags = parent.backdrop_image_tags.clone();
-                item.parent_backdrop_item_id = Some(parent.id);
             }
         }
     }
@@ -817,6 +818,7 @@ async fn enrich_items(
                         std::time::Duration::from_millis(500),
                         rustyfin_core::image_proxy::compute_blurhash(
                             full_path.to_str().unwrap_or(""),
+                            Some(http_client),
                         ),
                     )
                     .await

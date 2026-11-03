@@ -1,11 +1,10 @@
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
+use dashmap::DashMap;
 use tokio::process::{Child, Command};
-use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -92,7 +91,7 @@ struct TranscodeSession {
 
 #[derive(Clone)]
 pub struct TranscodeManager {
-    sessions: Arc<RwLock<HashMap<Uuid, TranscodeSession>>>,
+    sessions: Arc<DashMap<Uuid, TranscodeSession>>,
     cache_root: PathBuf,
 }
 
@@ -100,7 +99,7 @@ impl TranscodeManager {
     pub fn new(data_dir: &Path) -> Self {
         let cache_root = data_dir.join("transcodes");
         Self {
-            sessions: Arc::new(RwLock::new(HashMap::new())),
+            sessions: Arc::new(DashMap::new()),
             cache_root,
         }
     }
@@ -138,13 +137,10 @@ impl TranscodeManager {
         let playback_id = Uuid::new_v4();
 
         // Check if session already exists
-        {
-            let sessions = self.sessions.read().await;
-            if let Some(session) = sessions.get(&item_id) {
-                let playlist = session.output_dir.join("main.m3u8");
-                if playlist.exists() {
-                    return Ok((playlist, session.playback_id));
-                }
+        if let Some(session) = self.sessions.get(&item_id) {
+            let playlist = session.output_dir.join("main.m3u8");
+            if playlist.exists() {
+                return Ok((playlist, session.playback_id));
             }
         }
 
@@ -192,7 +188,7 @@ impl TranscodeManager {
             _profile: profile.clone(),
         };
 
-        self.sessions.write().await.insert(item_id, session);
+        self.sessions.insert(item_id, session);
 
         // Wait briefly for FFmpeg to create the playlist
         for _ in 0..30 {
@@ -207,8 +203,7 @@ impl TranscodeManager {
 
     /// Stop a running transcode session and clean up.
     pub async fn stop_transcode(&self, item_id: Uuid) {
-        let mut sessions = self.sessions.write().await;
-        if let Some(mut session) = sessions.remove(&item_id)
+        if let Some((_key, mut session)) = self.sessions.remove(&item_id)
             && let Some(mut child) = session.child.take()
         {
             let _ = child.kill().await;
@@ -218,9 +213,11 @@ impl TranscodeManager {
 
     /// Stop all running transcodes.
     pub async fn stop_all(&self) {
-        let mut sessions = self.sessions.write().await;
-        for (id, mut session) in sessions.drain() {
-            if let Some(mut child) = session.child.take() {
+        let ids: Vec<Uuid> = self.sessions.iter().map(|e| *e.key()).collect();
+        for id in ids {
+            if let Some((_key, mut session)) = self.sessions.remove(&id)
+                && let Some(mut child) = session.child.take()
+            {
                 let _ = child.kill().await;
                 debug!(item_id = %id, "Killed FFmpeg process");
             }
@@ -234,11 +231,7 @@ impl TranscodeManager {
 
     /// Get the playback ID for an active transcode session.
     pub async fn get_playback_id(&self, item_id: Uuid) -> Option<Uuid> {
-        self.sessions
-            .read()
-            .await
-            .get(&item_id)
-            .map(|s| s.playback_id)
+        self.sessions.get(&item_id).map(|s| s.playback_id)
     }
 
     /// Get the path to the master playlist.
@@ -248,12 +241,12 @@ impl TranscodeManager {
 
     /// Check if a transcode session is active for the given item.
     pub async fn is_active(&self, item_id: Uuid) -> bool {
-        self.sessions.read().await.contains_key(&item_id)
+        self.sessions.contains_key(&item_id)
     }
 
     /// Clean up transcode cache: remove directories for sessions that are no longer active.
     pub async fn cleanup_cache(&self) -> Result<(), TranscodeError> {
-        let active_ids: Vec<Uuid> = { self.sessions.read().await.keys().copied().collect() };
+        let active_ids: Vec<Uuid> = self.sessions.iter().map(|e| *e.key()).collect();
 
         if !self.cache_root.exists() {
             return Ok(());
@@ -282,14 +275,12 @@ impl TranscodeManager {
 
     /// Clean up stale sessions (running longer than max_duration).
     pub async fn cleanup_stale_sessions(&self, max_duration: Duration) {
-        let stale: Vec<Uuid> = {
-            let sessions = self.sessions.read().await;
-            sessions
-                .iter()
-                .filter(|(_, s)| s.started_at.elapsed() > max_duration)
-                .map(|(id, _)| *id)
-                .collect()
-        };
+        let stale: Vec<Uuid> = self
+            .sessions
+            .iter()
+            .filter(|e| e.value().started_at.elapsed() > max_duration)
+            .map(|e| *e.key())
+            .collect();
 
         for id in stale {
             warn!(item_id = %id, "Stopping stale transcode session");

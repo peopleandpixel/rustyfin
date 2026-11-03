@@ -41,7 +41,7 @@ impl ApiCache {
                 .build(),
             item_details: Cache::builder()
                 .max_capacity(1024)
-                .time_to_live(std::time::Duration::from_secs(30))
+                .time_to_live(std::time::Duration::from_secs(300))
                 .build(),
             filter_lists: Cache::builder()
                 .max_capacity(128)
@@ -286,7 +286,7 @@ impl Default for ApiCache {
                 .build(),
             item_details: Cache::builder()
                 .max_capacity(1024)
-                .time_to_live(std::time::Duration::from_secs(30))
+                .time_to_live(std::time::Duration::from_secs(300))
                 .build(),
             filter_lists: Cache::builder()
                 .max_capacity(128)

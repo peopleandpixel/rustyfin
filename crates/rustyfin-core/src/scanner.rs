@@ -54,14 +54,14 @@ const VERSION_TAGS: &[&str] = &[
 ///   "Inception (2010) 4K HDR.mkv"       -> "inception"
 ///   "Inception (2010) 1080p BluRay.mkv" -> "inception"
 ///   "Breaking Bad S01E01 720p.mkv"      -> "breaking bad s01e01"
+///
+/// Optimized: uses a single buffer and processes tags in one pass per word,
+/// reducing allocations from ~60 per call to ~2.
 fn normalize_name(file_stem: &str) -> String {
-    let lower = file_stem.to_lowercase();
-
-    // Remove bracketed content first: [4K], (2010), {HDR}, etc.
-    // This handles years, quality tags in brackets, etc.
-    let mut cleaned = String::new();
+    // Step 1: Remove bracketed content and lowercase in a single pass
+    let mut cleaned = String::with_capacity(file_stem.len());
     let mut depth = 0i32;
-    for ch in lower.chars() {
+    for ch in file_stem.chars() {
         match ch {
             '[' | '(' | '{' => depth += 1,
             ']' | ')' | '}' => {
@@ -71,57 +71,35 @@ fn normalize_name(file_stem: &str) -> String {
             }
             _ => {
                 if depth == 0 {
-                    cleaned.push(ch);
+                    cleaned.push(ch.to_ascii_lowercase());
                 }
             }
         }
     }
 
-    // Remove each tag (longest first to avoid partial matches)
-    // Only match tags that are surrounded by whitespace or at boundaries
-    let mut result = cleaned;
-    for tag in VERSION_TAGS {
-        // Replace tag when surrounded by spaces (case-insensitive, already lowered)
-        let pattern = format!(" {} ", tag);
-        result = result.replace(&pattern, " ");
-        // Also match at start
-        let start_pattern = format!("{} ", tag);
-        result = result.replace(&start_pattern, "");
-        // Also match at end
-        let end_pattern = format!(" {}", tag);
-        result = result.replace(&end_pattern, "");
-    }
-
-    // Strip standalone 4-digit years (1900-2100) that are not in brackets
-    let words: Vec<&str> = result.split_whitespace().collect();
-    result = words
-        .into_iter()
-        .filter(|w| {
-            if let Ok(y) = w.parse::<i32>() {
-                !(1900..=2100).contains(&y)
-            } else {
-                true
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
-
-    // Collapse multiple spaces and trim
-    let mut final_result = String::new();
-    let mut prev_space = false;
-    for ch in result.chars() {
-        if ch.is_whitespace() {
-            if !prev_space {
-                final_result.push(' ');
-            }
-            prev_space = true;
-        } else {
-            final_result.push(ch);
-            prev_space = false;
+    // Step 2: Split into words and filter out tags and years in one pass
+    let words: Vec<&str> = cleaned.split_whitespace().collect();
+    let mut result = String::with_capacity(cleaned.len());
+    let mut first = true;
+    for word in words {
+        // Skip VERSION_TAGS
+        if VERSION_TAGS.contains(&word) {
+            continue;
         }
+        // Skip standalone 4-digit years (1900-2100)
+        if let Ok(y) = word.parse::<i32>() {
+            if (1900..=2100).contains(&y) {
+                continue;
+            }
+        }
+        if !first {
+            result.push(' ');
+        }
+        result.push_str(word);
+        first = false;
     }
 
-    final_result.trim().to_string()
+    result
 }
 
 /// Build a HashMap for O(1) version detection lookups.
@@ -149,36 +127,32 @@ async fn build_version_map(
     Ok(map)
 }
 
-/// Look up an existing media item by normalized name within the same parent
-/// directory.  Returns the item ID if found, otherwise None.
-/// Used by TV scan for episode version detection.
-async fn find_item_by_normalized_name(
+/// Build a HashMap for O(1) episode version detection lookups.
+/// Key: (normalized_name, series_dir, season_id) -> Value: episode_id
+/// Pre-loading all episodes eliminates the N+1 query pattern during TV scanning.
+async fn build_episode_version_map(
     pool: &SqlitePool,
-    normalized: &str,
-    parent_dir: &str,
-    media_type: MediaType,
-) -> Result<Option<Uuid>, sqlx::Error> {
-    // Query items whose path starts with the parent directory and match by
-    // normalizing their file stem at the SQL level is expensive, so we fetch
-    // candidates and filter in Rust.
-    let media_type_str = media_type.item_kind().to_string();
-    let candidates: Vec<(String, String)> = sqlx::query_as(
-        "SELECT id, path FROM media_items WHERE path LIKE ? AND media_type = ? AND runtime_ticks IS NOT NULL",
-    )
-    .bind(format!("{}%", parent_dir))
-    .bind(&media_type_str)
-    .fetch_all(pool)
-    .await?;
-
-    for (id, path) in &candidates {
-        if let Some(stem) = Path::new(path).file_stem().and_then(|s| s.to_str())
-            && normalize_name(stem) == normalized
-        {
-            return Ok(Some(Uuid::parse_str(id).unwrap_or_default()));
+    library_id: Uuid,
+) -> Result<HashMap<(String, String, Uuid), Uuid>, sqlx::Error> {
+    let episodes = rustyfin_db::repo_media::get_library_episodes(pool, library_id).await?;
+    let mut map = HashMap::new();
+    for (path, id_str, parent_id_str) in episodes {
+        if let Ok(id) = Uuid::parse_str(&id_str) {
+            if let Ok(season_id) = Uuid::parse_str(&parent_id_str) {
+                let path_buf = Path::new(&path);
+                if let Some(stem) = path_buf.file_stem().and_then(|s| s.to_str()) {
+                    let normalized = normalize_name(stem);
+                    let series_dir = path_buf
+                        .parent()
+                        .and_then(|p| p.parent())
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    map.insert((normalized, series_dir, season_id), id);
+                }
+            }
         }
     }
-
-    Ok(None)
+    Ok(map)
 }
 
 const VIDEO_EXTENSIONS: &[&str] = &[
@@ -449,12 +423,15 @@ async fn scan_tv_library(
             .into_iter()
             .collect();
 
-    // Pre-load all existing series and season paths into HashMaps for O(1) ID lookup.
-    // Eliminates per-series/season database queries during directory traversal.
+    // Pre-load all existing series, season, and episode paths into HashMaps for O(1) ID lookup.
+    // Eliminates per-series/season/episode database queries during directory traversal.
     let existing_series: HashMap<String, Uuid> =
         rustyfin_db::repo_media::get_library_items_by_type(pool, library.id, "Series").await?;
     let existing_seasons: HashMap<String, Uuid> =
         rustyfin_db::repo_media::get_library_items_by_type(pool, library.id, "Season").await?;
+    // Pre-load all episodes for version detection — eliminates N+1 query pattern.
+    let episode_version_map: HashMap<(String, String, Uuid), Uuid> =
+        build_episode_version_map(pool, library.id).await?;
 
     for lib_path in &library.paths {
         let path = Path::new(lib_path);
@@ -609,35 +586,23 @@ async fn scan_tv_library(
                 id
             };
 
-            // Check if this is a version of an existing episode
+            // Check if this is a version of an existing episode using pre-loaded HashMap.
+            // O(1) lookup instead of N+1 database queries.
             let normalized = normalize_name(&episode_name);
-            let is_version = if let Ok(Some(existing_id)) =
-                find_item_by_normalized_name(pool, &normalized, &series_dir, MediaType::Episode)
-                    .await
+            let is_version = if let Some(&existing_id) =
+                episode_version_map.get(&(normalized.clone(), series_dir.clone(), season_id))
             {
-                // Check that the found item belongs to the same season
-                if let Ok(Some(existing_item)) =
-                    rustyfin_db::repo_media::get_item_by_id(pool, existing_id).await
-                {
-                    if existing_item.parent_id == Some(season_id) {
-                        tracing::info!(
-                            "detected version of episode {}: {} -> {}",
-                            existing_id,
-                            file_path,
-                            normalized
-                        );
-                        let file_path_clone = file_path.clone();
-                        let pool_clone = pool.clone();
-                        let item_id = existing_id;
-                        probe::spawn_probe_and_add_source(pool_clone, item_id, file_path_clone);
-                        count += 1;
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
+                tracing::info!(
+                    "detected version of episode {}: {} -> {}",
+                    existing_id,
+                    file_path,
+                    normalized
+                );
+                let file_path_clone = file_path.clone();
+                let pool_clone = pool.clone();
+                probe::spawn_probe_and_add_source(pool_clone, existing_id, file_path_clone);
+                count += 1;
+                true
             } else {
                 false
             };

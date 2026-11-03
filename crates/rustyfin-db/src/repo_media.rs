@@ -289,11 +289,11 @@ pub async fn get_latest_items(
 ///
 /// The signature is built from the number of array elements in each filter,
 /// not the actual values, so different values with the same shape share a plan.
-use std::sync::Mutex;
+/// Uses parking_lot::Mutex instead of std::sync::Mutex to avoid blocking Tokio threads.
+type QueryCache = parking_lot::Mutex<HashMap<u64, (String, String)>>;
 
-type QueryCache = Mutex<HashMap<u64, (String, String)>>;
-
-static FILTER_QUERY_CACHE: LazyLock<QueryCache> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static FILTER_QUERY_CACHE: LazyLock<QueryCache> =
+    LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
 
 /// Simple hash combiner for building a cache key from multiple u64 values.
 pub(crate) fn hash_combine(mut hash: u64, key: u64) -> u64 {
@@ -372,7 +372,7 @@ fn build_filtered_query(
 ) -> (String, String) {
     // Check cache first
     {
-        let cache = FILTER_QUERY_CACHE.lock().unwrap();
+        let cache = FILTER_QUERY_CACHE.lock();
         if let Some((count_sql, data_sql)) = cache.get(&cache_key) {
             return (count_sql.clone(), data_sql.clone());
         }
@@ -531,7 +531,7 @@ fn build_filtered_query(
 
     // Cache the result
     {
-        let mut cache = FILTER_QUERY_CACHE.lock().unwrap();
+        let mut cache = FILTER_QUERY_CACHE.lock();
         cache.insert(cache_key, (count_sql.clone(), data_sql.clone()));
     }
 
@@ -1263,6 +1263,23 @@ pub async fn get_library_movies(
     )
     .bind(library_id.to_string())
     .bind("Movie")
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// Fetch all episode items for a library, returning (path, id, parent_id) triples.
+/// Used by the TV scanner to pre-load episode paths for version detection,
+/// avoiding per-item database queries during scanning.
+pub async fn get_library_episodes(
+    pool: &SqlitePool,
+    library_id: Uuid,
+) -> Result<Vec<(String, String, String)>, sqlx::Error> {
+    let rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT path, id, parent_id FROM media_items WHERE library_id = ? AND media_type = ? AND runtime_ticks IS NOT NULL",
+    )
+    .bind(library_id.to_string())
+    .bind("Episode")
     .fetch_all(pool)
     .await?;
     Ok(rows)

@@ -23,7 +23,7 @@ pub async fn refresh_item_metadata(
     let mut local_images = local_images::find_local_images(media_path, item.id);
     for img in &mut local_images {
         if img.blurhash.is_none()
-            && let Some(bh) = crate::image_proxy::compute_blurhash(&img.path).await
+            && let Some(bh) = crate::image_proxy::compute_blurhash(&img.path, Some(client)).await
         {
             img.blurhash = Some(bh);
         }

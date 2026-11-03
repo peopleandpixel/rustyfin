@@ -135,8 +135,12 @@ fn filename_stem(path: &str) -> String {
 
 /// Compute a blurhash string for an image file.
 /// Returns a short blurhash (8x8 components) suitable for progressive image loading.
-pub async fn compute_blurhash(source_path: &str) -> Option<String> {
-    let bytes = read_image_bytes(source_path, None).await.ok()?;
+/// If `http_client` is provided, it will be reused for remote image downloads.
+pub async fn compute_blurhash(
+    source_path: &str,
+    http_client: Option<&reqwest::Client>,
+) -> Option<String> {
+    let bytes = read_image_bytes(source_path, http_client).await.ok()?;
     let img = image::load_from_memory(&bytes).ok()?;
     // Downscale to a small image for faster encoding
     let small = img.resize(16, 16, FilterType::Triangle);

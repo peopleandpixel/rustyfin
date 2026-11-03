@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-11-03
+
+### Changed
+- **Additional performance optimizations**: Further improvements to reduce latency, eliminate redundant queries, and optimize hot paths.
+  - **TV scanner version detection**: Pre-load all episodes into a HashMap for O(1) lookups, eliminating N+1 database queries during TV library scans (matching the movie scanner optimization).
+  - **Episode enrichment**: Eliminated duplicate Season database query by loading Season once and reusing it for both series info and parent image tags (3→2 queries per episode).
+  - **Filter query cache**: Replaced `std::sync::Mutex` with `parking_lot::Mutex` to avoid blocking Tokio worker threads under high concurrency.
+  - **Blurhash HTTP client reuse**: `compute_blurhash` now accepts an optional shared HTTP client, eliminating per-request client creation overhead for remote images.
+  - **`normalize_name` optimization**: Reduced string allocations from ~60 per call to ~2 by using a single buffer and processing tags in one word-based pass instead of 48x `.replace()` calls.
+  - **L1 cache TTL**: Increased item details cache TTL from 30 seconds to 5 minutes, improving cache hit rate for frequently accessed items.
+  - **Transcode manager**: Replaced `RwLock<HashMap>` with `DashMap` for lock-striping, reducing contention under concurrent transcoding workloads.
+
 ## [0.12.0] - 2026-11-03
 
 ### Changed
