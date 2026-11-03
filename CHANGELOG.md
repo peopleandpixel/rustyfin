@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-03
+
+### Changed
+- **Database migrations**: Replaced manual migration execution with SQLx's built-in `Migrator` for cleaner, tracked database migrations.
+  - SQLx now tracks applied migrations in the `sqlx_migrations` table, ensuring each migration runs exactly once.
+  - Renamed migration files to have unique sequential numbers (001–027), fixing the duplicate `002_` prefix.
+  - Reduced `lib.rs` from 245 to 115 lines by replacing 26 manual `include_str!()` calls with a single `MIGRATOR.run()` call.
+
 ## [0.7.0] - 2026-10-29
 
 ### Added

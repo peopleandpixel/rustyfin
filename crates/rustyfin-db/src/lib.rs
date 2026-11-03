@@ -26,6 +26,11 @@ pub mod repo_user;
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 
+/// Compile-time verified migration runner.
+/// SQLx scans the `migrations` directory at build time and tracks applied migrations
+/// in the `sqlx_migrations` table, so each migration runs only once.
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
+
 pub async fn init_db(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
     // Configure connection-level PRAGMAs that apply to every connection from the pool
     let options = SqliteConnectOptions::new()
@@ -71,144 +76,9 @@ pub async fn init_db(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
         .await
         .ok();
 
-    // Migrations are executed idempotently — OK to fail if already applied
-    // This allows re-initialization on shared in-memory databases (e.g., tests)
-    sqlx::query(include_str!("../migrations/001_initial.sql"))
-        .execute(&pool)
-        .await
-        .ok();
-
-    sqlx::query(include_str!("../migrations/002_images.sql"))
-        .execute(&pool)
-        .await
-        .ok();
-
-    sqlx::query(include_str!("../migrations/002_user_configuration.sql"))
-        .execute(&pool)
-        .await
-        .ok();
-
-    sqlx::query(include_str!("../migrations/003_user_item_data.sql"))
-        .execute(&pool)
-        .await
-        .ok();
-
-    sqlx::query(include_str!("../migrations/004_sessions_devices.sql"))
-        .execute(&pool)
-        .await
-        .ok();
-
-    sqlx::query(include_str!("../migrations/005_phase4.sql"))
-        .execute(&pool)
-        .await
-        .ok();
-
-    sqlx::query(include_str!("../migrations/006_media_sources.sql"))
-        .execute(&pool)
-        .await
-        .ok();
-
-    sqlx::query(include_str!("../migrations/007_optimization.sql"))
-        .execute(&pool)
-        .await
-        .ok();
-
-    sqlx::query(include_str!("../migrations/008_playstate.sql"))
-        .execute(&pool)
-        .await
-        .ok();
-
-    sqlx::query(include_str!("../migrations/009_phase2.sql"))
-        .execute(&pool)
-        .await
-        .ok();
-
-    sqlx::query(include_str!("../migrations/010_media_segments.sql"))
-        .execute(&pool)
-        .await
-        .ok();
-
-    sqlx::query(include_str!("../migrations/011_chapters.sql"))
-        .execute(&pool)
-        .await
-        .ok();
-
-    sqlx::query(include_str!("../migrations/012_trickplay.sql"))
-        .execute(&pool)
-        .await
-        .ok();
-
-    sqlx::query(include_str!("../migrations/013_native_types.sql"))
-        .execute(&pool)
-        .await
-        .ok();
-
-    sqlx::query(include_str!("../migrations/014_genres_tags_index.sql"))
-        .execute(&pool)
-        .await
-        .ok();
-
-    sqlx::query(include_str!("../migrations/015_covering_index.sql"))
-        .execute(&pool)
-        .await
-        .ok();
-
-    sqlx::query(include_str!("../migrations/016_external_ids.sql"))
-        .execute(&pool)
-        .await
-        .ok();
-
-    sqlx::query(include_str!("../migrations/017_user_features.sql"))
-        .execute(&pool)
-        .await
-        .ok();
-
-    sqlx::query(include_str!("../migrations/018_password_reset.sql"))
-        .execute(&pool)
-        .await
-        .ok();
-
-    sqlx::query(include_str!("../migrations/019_client_capabilities.sql"))
-        .execute(&pool)
-        .await
-        .ok();
-
-    sqlx::query(include_str!("../migrations/020_live_tv.sql"))
-        .execute(&pool)
-        .await
-        .ok();
-
-    sqlx::query(include_str!("../migrations/021_new_controllers.sql"))
-        .execute(&pool)
-        .await
-        .ok();
-
-    sqlx::query(include_str!("../migrations/022_performance.sql"))
-        .execute(&pool)
-        .await
-        .ok();
-
-    sqlx::query(include_str!("../migrations/023_fix_image_indices.sql"))
-        .execute(&pool)
-        .await
-        .ok();
-
-    sqlx::query(include_str!(
-        "../migrations/024_fix_local_image_matching.sql"
-    ))
-    .execute(&pool)
-    .await
-    .ok();
-
-    sqlx::query(include_str!("../migrations/025_extended_metadata.sql"))
-        .execute(&pool)
-        .await
-        .ok();
-
-    sqlx::query(include_str!("../migrations/026_filter_triggers.sql"))
-        .execute(&pool)
-        .await
-        .ok();
+    // Run migrations — SQLx tracks applied migrations in `sqlx_migrations` table,
+    // so each migration runs only once. Idempotent and safe to call repeatedly.
+    MIGRATOR.run(&pool).await?;
 
     Ok(pool)
 }
