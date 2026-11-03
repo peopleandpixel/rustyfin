@@ -274,69 +274,68 @@ async fn enrich_item(
         // SeriesName, SeriesId, SeriesPrimaryImageTag from grandparent (the Series)
         // Load Season once and reuse for both series info and parent image tags.
         // Season and Series are loaded in parallel to reduce latency.
-        if let Some(parent_id) = item.parent_id {
-            if let Ok(Some(season_item)) =
+        if let Some(parent_id) = item.parent_id
+            && let Ok(Some(season_item)) =
                 rustyfin_db::repo_media::get_parent_item(pool, parent_id).await
-            {
-                item.season_name = Some(season_item.name.clone());
+        {
+            item.season_name = Some(season_item.name.clone());
 
-                // Fill parent image tags from Season (reuses the already-loaded season_item)
-                if let Some(tag) = season_item
+            // Fill parent image tags from Season (reuses the already-loaded season_item)
+            if let Some(tag) = season_item
+                .image_tags
+                .get(&rustyfin_model::image::ImageType::Primary)
+            {
+                item.parent_primary_image_tag = Some(tag.clone());
+                item.parent_primary_image_item_id = Some(season_item.id);
+            }
+            if let Some(tag) = season_item
+                .image_tags
+                .get(&rustyfin_model::image::ImageType::Thumb)
+            {
+                item.parent_thumb_image_tag = Some(tag.clone());
+                item.parent_thumb_item_id = Some(season_item.id);
+            }
+            if let Some(tag) = season_item
+                .image_tags
+                .get(&rustyfin_model::image::ImageType::Art)
+            {
+                item.parent_art_image_tag = Some(tag.clone());
+                item.parent_art_item_id = Some(season_item.id);
+            }
+            if let Some(tag) = season_item
+                .image_tags
+                .get(&rustyfin_model::image::ImageType::Logo)
+            {
+                item.parent_logo_image_tag = Some(tag.clone());
+                item.parent_logo_item_id = Some(season_item.id);
+            }
+            // Parent backdrop
+            if !season_item.backdrop_image_tags.is_empty() {
+                item.parent_backdrop_image_tags = season_item.backdrop_image_tags.clone();
+                item.parent_backdrop_item_id = Some(season_item.id);
+            }
+
+            // SeriesPrimaryImageTag from the Series (grandparent)
+            if let Some(series_id) = season_item.parent_id
+                && let Ok(Some(series_item)) =
+                    rustyfin_db::repo_media::get_parent_item(pool, series_id).await
+            {
+                item.series_name = Some(series_item.name.clone());
+                item.series_id = Some(series_item.id);
+                if let Some(tag) = series_item
                     .image_tags
                     .get(&rustyfin_model::image::ImageType::Primary)
                 {
-                    item.parent_primary_image_tag = Some(tag.clone());
-                    item.parent_primary_image_item_id = Some(season_item.id);
+                    item.series_primary_image_tag = Some(tag.clone());
                 }
-                if let Some(tag) = season_item
+                if let Some(tag) = series_item
                     .image_tags
                     .get(&rustyfin_model::image::ImageType::Thumb)
                 {
-                    item.parent_thumb_image_tag = Some(tag.clone());
-                    item.parent_thumb_item_id = Some(season_item.id);
+                    item.series_thumb_image_tag = Some(tag.clone());
                 }
-                if let Some(tag) = season_item
-                    .image_tags
-                    .get(&rustyfin_model::image::ImageType::Art)
-                {
-                    item.parent_art_image_tag = Some(tag.clone());
-                    item.parent_art_item_id = Some(season_item.id);
-                }
-                if let Some(tag) = season_item
-                    .image_tags
-                    .get(&rustyfin_model::image::ImageType::Logo)
-                {
-                    item.parent_logo_image_tag = Some(tag.clone());
-                    item.parent_logo_item_id = Some(season_item.id);
-                }
-                // Parent backdrop
-                if !season_item.backdrop_image_tags.is_empty() {
-                    item.parent_backdrop_image_tags = season_item.backdrop_image_tags.clone();
-                    item.parent_backdrop_item_id = Some(season_item.id);
-                }
-
-                // SeriesPrimaryImageTag from the Series (grandparent)
-                if let Some(series_id) = season_item.parent_id
-                    && let Ok(Some(series_item)) =
-                        rustyfin_db::repo_media::get_parent_item(pool, series_id).await
-                {
-                    item.series_name = Some(series_item.name.clone());
-                    item.series_id = Some(series_item.id);
-                    if let Some(tag) = series_item
-                        .image_tags
-                        .get(&rustyfin_model::image::ImageType::Primary)
-                    {
-                        item.series_primary_image_tag = Some(tag.clone());
-                    }
-                    if let Some(tag) = series_item
-                        .image_tags
-                        .get(&rustyfin_model::image::ImageType::Thumb)
-                    {
-                        item.series_thumb_image_tag = Some(tag.clone());
-                    }
-                } else if let Some(series_id) = season_item.parent_id {
-                    item.series_id = Some(series_id);
-                }
+            } else if let Some(series_id) = season_item.parent_id {
+                item.series_id = Some(series_id);
             }
         }
     }
@@ -344,32 +343,31 @@ async fn enrich_item(
     // --- Audio-specific fields ---
     if item.media_type == rustyfin_model::media::MediaType::Audio {
         // Album info from parent (MusicAlbum)
-        if let Some(parent_id) = item.parent_id {
-            if let Ok(Some(album)) =
+        if let Some(parent_id) = item.parent_id
+            && let Ok(Some(album)) =
                 rustyfin_db::repo_media::get_album_for_audio(pool, parent_id).await
+        {
+            item.album = Some(album.name.clone());
+            item.album_id = Some(album.id);
+            // Parent image tags from album
+            if let Some(tag) = album
+                .image_tags
+                .get(&rustyfin_model::image::ImageType::Primary)
             {
-                item.album = Some(album.name.clone());
-                item.album_id = Some(album.id);
-                // Parent image tags from album
-                if let Some(tag) = album
-                    .image_tags
-                    .get(&rustyfin_model::image::ImageType::Primary)
-                {
-                    item.parent_primary_image_tag = Some(tag.clone());
-                    item.parent_primary_image_item_id = Some(album.id);
-                }
-                if let Some(tag) = album.image_tags.get(&rustyfin_model::image::ImageType::Art) {
-                    item.parent_art_image_tag = Some(tag.clone());
-                    item.parent_art_item_id = Some(album.id);
-                }
+                item.parent_primary_image_tag = Some(tag.clone());
+                item.parent_primary_image_item_id = Some(album.id);
             }
-            // AlbumArtist from album name
-            if item.album_artist.is_none()
-                && let Ok(Some(album)) =
-                    rustyfin_db::repo_media::get_parent_item(pool, parent_id).await
-            {
-                item.album_artist = Some(album.name.clone());
+            if let Some(tag) = album.image_tags.get(&rustyfin_model::image::ImageType::Art) {
+                item.parent_art_image_tag = Some(tag.clone());
+                item.parent_art_item_id = Some(album.id);
             }
+        }
+        // AlbumArtist from album name
+        if item.album_artist.is_none()
+            && let Some(parent_id) = item.parent_id
+            && let Ok(Some(album)) = rustyfin_db::repo_media::get_parent_item(pool, parent_id).await
+        {
+            item.album_artist = Some(album.name.clone());
         }
         // Artists from item_people table (already fetched in parallel)
         if let Ok(artists) = &people_result {

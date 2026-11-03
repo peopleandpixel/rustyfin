@@ -87,10 +87,10 @@ fn normalize_name(file_stem: &str) -> String {
             continue;
         }
         // Skip standalone 4-digit years (1900-2100)
-        if let Ok(y) = word.parse::<i32>() {
-            if (1900..=2100).contains(&y) {
-                continue;
-            }
+        if let Ok(y) = word.parse::<i32>()
+            && (1900..=2100).contains(&y)
+        {
+            continue;
         }
         if !first {
             result.push(' ');
@@ -137,18 +137,18 @@ async fn build_episode_version_map(
     let episodes = rustyfin_db::repo_media::get_library_episodes(pool, library_id).await?;
     let mut map = HashMap::new();
     for (path, id_str, parent_id_str) in episodes {
-        if let Ok(id) = Uuid::parse_str(&id_str) {
-            if let Ok(season_id) = Uuid::parse_str(&parent_id_str) {
-                let path_buf = Path::new(&path);
-                if let Some(stem) = path_buf.file_stem().and_then(|s| s.to_str()) {
-                    let normalized = normalize_name(stem);
-                    let series_dir = path_buf
-                        .parent()
-                        .and_then(|p| p.parent())
-                        .map(|p| p.to_string_lossy().to_string())
-                        .unwrap_or_default();
-                    map.insert((normalized, series_dir, season_id), id);
-                }
+        if let Ok(id) = Uuid::parse_str(&id_str)
+            && let Ok(season_id) = Uuid::parse_str(&parent_id_str)
+        {
+            let path_buf = Path::new(&path);
+            if let Some(stem) = path_buf.file_stem().and_then(|s| s.to_str()) {
+                let normalized = normalize_name(stem);
+                let series_dir = path_buf
+                    .parent()
+                    .and_then(|p| p.parent())
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                map.insert((normalized, series_dir, season_id), id);
             }
         }
     }

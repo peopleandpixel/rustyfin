@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-11-03
+
+### Fixed
+- **Clippy `collapsible_if` warnings**: Collapsed nested `if let` statements in `scanner.rs` and `items.rs` to comply with strict Clippy rules (`-D warnings`). Ensures CI passes with `cargo clippy --workspace --all-targets --all-features -- -D warnings`.
+
 ## [0.13.0] - 2026-11-03
 
 ### Changed
