@@ -103,7 +103,11 @@ async fn serve_image(
     } else {
         let cache_dir = state.data_dir.join("cache").join("images");
         let bytes = match rustyfin_core::image_proxy::get_or_resize_image(
-            &img.path, max_width, max_height, &cache_dir,
+            &img.path,
+            max_width,
+            max_height,
+            &cache_dir,
+            Some(&state.http_client),
         )
         .await
         {
@@ -195,6 +199,7 @@ async fn upload_item_image(
         provider: "upload".to_string(),
         width: None,
         height: None,
+        blurhash: None,
     };
 
     rustyfin_db::repo_image::upsert_image(&state.db, &img).await?;

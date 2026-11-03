@@ -105,6 +105,27 @@ impl TranscodeManager {
         }
     }
 
+    /// Spawn a background task that periodically cleans up stale transcode sessions
+    /// and removes old cache directories. Runs every 15 minutes.
+    pub fn spawn_cleanup_task(&self) {
+        let manager = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(900));
+            interval.tick().await; // skip the first immediate tick
+            loop {
+                interval.tick().await;
+                // Clean up stale sessions running longer than 1 hour
+                manager
+                    .cleanup_stale_sessions(Duration::from_secs(3600))
+                    .await;
+                // Remove cache directories for inactive sessions
+                if let Err(e) = manager.cleanup_cache().await {
+                    warn!("transcode cache cleanup failed: {}", e);
+                }
+            }
+        });
+    }
+
     /// Start an HLS transcode for the given media file.
     /// Returns the path to the main.m3u8 playlist.
     pub async fn start_transcode(

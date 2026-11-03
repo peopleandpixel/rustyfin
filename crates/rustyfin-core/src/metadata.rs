@@ -19,8 +19,15 @@ pub async fn refresh_item_metadata(
 ) -> Result<(), String> {
     let media_path = Path::new(&item.path);
 
-    // 1. Scan for local images
-    let local_images = local_images::find_local_images(media_path, item.id);
+    // 1. Scan for local images and compute blurhash for each
+    let mut local_images = local_images::find_local_images(media_path, item.id);
+    for img in &mut local_images {
+        if img.blurhash.is_none()
+            && let Some(bh) = crate::image_proxy::compute_blurhash(&img.path).await
+        {
+            img.blurhash = Some(bh);
+        }
+    }
     if !local_images.is_empty() {
         rustyfin_db::repo_image::batch_upsert_images(pool, &local_images)
             .await
@@ -464,6 +471,7 @@ async fn store_images_batch(
                     provider: provider.to_string(),
                     width: None,
                     height: None,
+                    blurhash: None,
                 });
             }
         }

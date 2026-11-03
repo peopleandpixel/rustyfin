@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-11-03
+
+### Changed
+- **Performance optimizations**: Comprehensive improvements across all layers to reduce latency and eliminate bottlenecks.
+  - **Scanner version detection**: Pre-load all existing movies into a HashMap for O(1) lookups, eliminating N+1 database queries during flat library scans.
+  - **Image proxy**: Reuse shared HTTP client for remote image downloads instead of creating a new client per request.
+  - **Item enrichment**: Parallelize 6 independent database queries (images, chapters, trickplay, user data, people, studios) using `tokio::join!` instead of running them sequentially.
+  - **Rate limiter**: Replaced `Mutex<HashMap>` with `DashMap` for lock-striping, reducing contention under high concurrency.
+  - **Batch inserts**: Disable filter triggers during batch media item inserts to avoid write amplification from per-row COUNT(*) queries.
+  - **Metadata refresh**: Increased concurrent API task semaphore from 5 to 10, better utilizing TMDb's 20-40 req/s rate limit.
+  - **Blurhash pre-computation**: Added `blurhash` column to `item_images` table; blurhash is now computed during metadata refresh and stored in the database, avoiding on-demand computation on every item detail request.
+  - **Transcode cache cleanup**: Added a periodic background task (every 15 minutes) that automatically removes stale transcode sessions (older than 1 hour) and cleans up orphaned cache directories.
+  - **Search performance**: Replaced slow LIKE substring queries with FTS5 full-text search across name, overview, and genres. LIKE fallback now uses prefix matching (`query%`) so B-tree indexes can be used when FTS5 is unavailable. Added `idx_media_items_name` and `idx_media_items_type_name` indexes.
+
 ## [0.8.0] - 2026-11-03
 
 ### Changed

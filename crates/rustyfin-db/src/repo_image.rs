@@ -33,9 +33,10 @@ pub async fn get_images_for_item(
             String,
             Option<i32>,
             Option<i32>,
+            Option<String>,
         ),
     >(
-        "SELECT item_id, image_type, image_index, path, provider, width, height
+        "SELECT item_id, image_type, image_index, path, provider, width, height, blurhash
          FROM item_images WHERE item_id = ? ORDER BY image_type, image_index",
     )
     .bind(&id_str)
@@ -44,7 +45,7 @@ pub async fn get_images_for_item(
 
     Ok(rows
         .into_iter()
-        .filter_map(|(item_id, img_type, idx, path, provider, w, h)| {
+        .filter_map(|(item_id, img_type, idx, path, provider, w, h, bh)| {
             let image_type = ImageType::from_str(&img_type)?;
             Some(ItemImage {
                 item_id: Uuid::parse_str(&item_id).ok()?,
@@ -54,6 +55,7 @@ pub async fn get_images_for_item(
                 provider,
                 width: w,
                 height: h,
+                blurhash: bh,
             })
         })
         .collect())
@@ -77,9 +79,10 @@ pub async fn get_image(
             String,
             Option<i32>,
             Option<i32>,
+            Option<String>,
         ),
     >(
-        "SELECT item_id, image_type, image_index, path, provider, width, height
+        "SELECT item_id, image_type, image_index, path, provider, width, height, blurhash
          FROM item_images WHERE item_id = ? AND image_type = ? AND image_index = ?",
     )
     .bind(&id_str)
@@ -89,7 +92,7 @@ pub async fn get_image(
     .await?;
 
     Ok(
-        row.and_then(|(item_id, img_type, idx, path, provider, w, h)| {
+        row.and_then(|(item_id, img_type, idx, path, provider, w, h, bh)| {
             let image_type = ImageType::from_str(&img_type)?;
             Some(ItemImage {
                 item_id: Uuid::parse_str(&item_id).ok()?,
@@ -99,6 +102,7 @@ pub async fn get_image(
                 provider,
                 width: w,
                 height: h,
+                blurhash: bh,
             })
         }),
     )
@@ -108,13 +112,14 @@ pub async fn upsert_image(pool: &SqlitePool, img: &ItemImage) -> Result<(), sqlx
     let id_str = img.item_id.to_string();
     let type_str = img.image_type.as_str();
     sqlx::query(
-        "INSERT INTO item_images (item_id, image_type, image_index, path, provider, width, height)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
+        "INSERT INTO item_images (item_id, image_type, image_index, path, provider, width, height, blurhash)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(item_id, image_type, image_index) DO UPDATE SET
            path = excluded.path,
            provider = excluded.provider,
            width = excluded.width,
-           height = excluded.height",
+           height = excluded.height,
+           blurhash = excluded.blurhash",
     )
     .bind(&id_str)
     .bind(type_str)
@@ -123,6 +128,7 @@ pub async fn upsert_image(pool: &SqlitePool, img: &ItemImage) -> Result<(), sqlx
     .bind(&img.provider)
     .bind(img.width)
     .bind(img.height)
+    .bind(&img.blurhash)
     .execute(pool)
     .await?;
     Ok(())
@@ -150,7 +156,7 @@ pub async fn get_images_batch(
     let id_strs: Vec<String> = item_ids.iter().map(|id| id.to_string()).collect();
     let placeholders: Vec<String> = (0..id_strs.len()).map(|i| format!("?{}", i + 1)).collect();
     let query = format!(
-        "SELECT item_id, image_type, image_index, path, provider, width, height
+        "SELECT item_id, image_type, image_index, path, provider, width, height, blurhash
          FROM item_images WHERE item_id IN ({}) ORDER BY item_id, image_type, image_index",
         placeholders.join(",")
     );
@@ -165,6 +171,7 @@ pub async fn get_images_batch(
             String,
             Option<i32>,
             Option<i32>,
+            Option<String>,
         ),
     >(sqlx::AssertSqlSafe(query.clone()));
 
@@ -177,7 +184,7 @@ pub async fn get_images_batch(
     let mut map: std::collections::HashMap<String, Vec<ItemImage>> =
         std::collections::HashMap::new();
 
-    for (item_id, img_type, idx, path, provider, w, h) in rows {
+    for (item_id, img_type, idx, path, provider, w, h, bh) in rows {
         let image_type = match ImageType::from_str(&img_type) {
             Some(t) => t,
             None => continue,
@@ -194,6 +201,7 @@ pub async fn get_images_batch(
             provider,
             width: w,
             height: h,
+            blurhash: bh,
         };
         map.entry(item_id).or_default().push(img);
     }
@@ -215,13 +223,14 @@ pub async fn batch_upsert_images(
         let id_str = img.item_id.to_string();
         let type_str = img.image_type.as_str();
         sqlx::query(
-            "INSERT INTO item_images (item_id, image_type, image_index, path, provider, width, height)
-             VALUES (?, ?, ?, ?, ?, ?, ?)
+            "INSERT INTO item_images (item_id, image_type, image_index, path, provider, width, height, blurhash)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(item_id, image_type, image_index) DO UPDATE SET
                path = excluded.path,
                provider = excluded.provider,
                width = excluded.width,
-               height = excluded.height",
+               height = excluded.height,
+               blurhash = excluded.blurhash",
         )
         .bind(&id_str)
         .bind(type_str)
@@ -230,6 +239,7 @@ pub async fn batch_upsert_images(
         .bind(&img.provider)
         .bind(img.width)
         .bind(img.height)
+        .bind(&img.blurhash)
         .execute(&mut *tx)
         .await?;
     }

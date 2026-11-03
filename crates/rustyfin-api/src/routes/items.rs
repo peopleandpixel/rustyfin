@@ -124,8 +124,43 @@ async fn enrich_item(
         item.local_trailer_count = Some(0);
     }
 
+    // Parallel queries: images, chapters, trickplay, user_data, people, studios
+    // These are independent and can run concurrently instead of sequentially.
+    let item_id = item.id;
+    let pool_clone = pool.clone();
+
+    let images_future = rustyfin_db::repo_image::get_images_for_item(&pool_clone, item_id);
+    let chapters_future = rustyfin_db::repo_chapter::get_chapters(&pool_clone, item_id);
+    let trickplay_future = rustyfin_db::repo_trickplay::get_trickplay(&pool_clone, item_id);
+    let user_data_future = async {
+        match user_id {
+            Some(uid) => {
+                rustyfin_db::repo_playback::get_user_item_data(&pool_clone, uid, item_id).await
+            }
+            None => Err(sqlx::Error::RowNotFound), // Skip if no user
+        }
+    };
+    let people_future = rustyfin_db::repo_media::get_artists_for_audio(&pool_clone, item_id);
+    let studios_future = rustyfin_db::repo_media::get_studios_for_item(&pool_clone, item_id);
+
+    let (
+        images_result,
+        chapters_result,
+        trickplay_result,
+        user_data_result,
+        people_result,
+        studios_result,
+    ) = tokio::join!(
+        images_future,
+        chapters_future,
+        trickplay_future,
+        user_data_future,
+        people_future,
+        studios_future
+    );
+
     // ImageTags from images table
-    if let Ok(images) = rustyfin_db::repo_image::get_images_for_item(pool, item.id).await {
+    if let Ok(images) = images_result {
         let mut tags: std::collections::HashMap<rustyfin_model::image::ImageType, String> =
             std::collections::HashMap::new();
         let mut backdrop_tags: Vec<String> = Vec::new();
@@ -139,9 +174,14 @@ async fn enrich_item(
         item.image_tags = tags;
         item.backdrop_image_tags = backdrop_tags;
 
-        // ImageBlurHashes from local images
+        // ImageBlurHashes: prefer stored values, fall back to on-demand computation
         for img in images {
-            if !img.path.starts_with("http://") && !img.path.starts_with("https://") {
+            // Use pre-computed blurhash from the database if available
+            if let Some(ref hash) = img.blurhash {
+                let key = format!("{}-{}", img.image_type.as_str(), img.image_index);
+                item.image_blur_hashes.insert(key, hash.clone());
+            } else if !img.path.starts_with("http://") && !img.path.starts_with("https://") {
+                // Fall back to on-demand computation for images without stored blurhash
                 let full_path = data_dir.join(&img.path);
                 if let Ok(Some(hash)) = tokio::time::timeout(
                     std::time::Duration::from_millis(500),
@@ -162,7 +202,7 @@ async fn enrich_item(
     }
 
     // Chapters from chapters table
-    if let Ok(chapters) = rustyfin_db::repo_chapter::get_chapters(pool, item.id).await {
+    if let Ok(chapters) = chapters_result {
         item.chapters = chapters
             .iter()
             .map(|c| rustyfin_model::media::ChapterInfo {
@@ -176,7 +216,7 @@ async fn enrich_item(
     }
 
     // ScreenshotImageTags from trickplay table
-    if let Ok(Some(_trickplay)) = rustyfin_db::repo_trickplay::get_trickplay(pool, item.id).await {
+    if let Ok(Some(_trickplay)) = trickplay_result {
         item.screenshot_image_tags = vec![format!("{}-{}", item.id, _trickplay.width)];
     }
 
@@ -184,10 +224,7 @@ async fn enrich_item(
     item.etag = Some(item.date_created.to_rfc3339());
 
     // CompletionPercentage from user_item_data
-    if let Some(uid) = user_id
-        && let Ok(user_data) =
-            rustyfin_db::repo_playback::get_user_item_data(pool, uid, item.id).await
-    {
+    if let Ok(user_data) = user_data_result {
         item.user_data = Some(user_data.clone());
         if let Some(runtime) = item.runtime_ticks
             && runtime > 0
@@ -333,8 +370,8 @@ async fn enrich_item(
                 item.album_artist = Some(album.name.clone());
             }
         }
-        // Artists from item_people table
-        if let Ok(artists) = rustyfin_db::repo_media::get_artists_for_audio(pool, item.id).await {
+        // Artists from item_people table (already fetched in parallel)
+        if let Ok(artists) = &people_result {
             item.artists = artists
                 .iter()
                 .map(|(pid, name, role)| rustyfin_model::media::PersonInfo {
@@ -353,7 +390,7 @@ async fn enrich_item(
     // --- People for all non-audio items (Movie, Episode, Series, etc.) ---
     if item.media_type != rustyfin_model::media::MediaType::Audio
         && item.people.is_empty()
-        && let Ok(people_rows) = rustyfin_db::repo_media::get_artists_for_audio(pool, item.id).await
+        && let Ok(people_rows) = &people_result
     {
         item.people = people_rows
             .iter()
@@ -377,7 +414,7 @@ async fn enrich_item(
 
     // --- Studios from item_studios table ---
     if item.studios.is_empty()
-        && let Ok(studio_rows) = rustyfin_db::repo_media::get_studios_for_item(pool, item.id).await
+        && let Ok(studio_rows) = studios_result
     {
         item.studios = studio_rows
             .into_iter()
@@ -761,12 +798,20 @@ async fn enrich_items(
             item.backdrop_image_tags = backdrop_tags;
         }
 
-        // ImageBlurHashes from local images (skip for list views to avoid disk I/O)
-        if !skip_blurhash
-            && let Ok(images) = rustyfin_db::repo_image::get_images_for_item(pool, item.id).await
-        {
-            for img in images {
-                if !img.path.starts_with("http://") && !img.path.starts_with("https://") {
+        // ImageBlurHashes: prefer stored values, fall back to on-demand computation
+        if !skip_blurhash {
+            // Use images from the batch-loaded map if available
+            let images_for_blurhash = images_map
+                .get(&item.id.to_string())
+                .cloned()
+                .unwrap_or_default();
+            for img in images_for_blurhash {
+                // Use pre-computed blurhash from the database if available
+                if let Some(ref hash) = img.blurhash {
+                    let key = format!("{}-{}", img.image_type.as_str(), img.image_index);
+                    item.image_blur_hashes.insert(key, hash.clone());
+                } else if !img.path.starts_with("http://") && !img.path.starts_with("https://") {
+                    // Fall back to on-demand computation
                     let full_path = data_dir.join(&img.path);
                     if let Ok(Some(hash)) = tokio::time::timeout(
                         std::time::Duration::from_millis(500),

@@ -2,16 +2,19 @@ use image::imageops::FilterType;
 use std::path::Path;
 use tokio::fs;
 
-/// Serve an image with optional resizing, using a cache directory
+/// Serve an image with optional resizing, using a cache directory.
+/// If `http_client` is provided, it will be reused for remote image downloads,
+/// avoiding the overhead of creating a new client per request.
 pub async fn get_or_resize_image(
     source_path: &str,
     max_width: Option<u32>,
     max_height: Option<u32>,
     cache_dir: &Path,
+    http_client: Option<&reqwest::Client>,
 ) -> Result<Vec<u8>, String> {
     // If no resize requested, return original
     if max_width.is_none() && max_height.is_none() {
-        return read_image_bytes(source_path).await;
+        return read_image_bytes(source_path, http_client).await;
     }
 
     let w = max_width.unwrap_or(0);
@@ -30,7 +33,7 @@ pub async fn get_or_resize_image(
     }
 
     // Read and resize
-    let source_bytes = read_image_bytes(source_path).await?;
+    let source_bytes = read_image_bytes(source_path, http_client).await?;
     let img = image::load_from_memory(&source_bytes)
         .map_err(|e| format!("failed to decode image: {}", e))?;
 
@@ -60,14 +63,21 @@ pub async fn get_or_resize_image(
     Ok(bytes)
 }
 
-async fn read_image_bytes(source: &str) -> Result<Vec<u8>, String> {
+async fn read_image_bytes(
+    source: &str,
+    http_client: Option<&reqwest::Client>,
+) -> Result<Vec<u8>, String> {
     if source.starts_with("http://") || source.starts_with("https://") {
         // Download remote image with proper headers and status check
-        let client = reqwest::Client::builder()
-            .user_agent("Mozilla/5.0 (compatible; RustyFin/1.0)")
-            .redirect(reqwest::redirect::Policy::limited(5))
-            .build()
-            .map_err(|e| format!("failed to create HTTP client: {}", e))?;
+        // Reuse provided client if available, otherwise create a new one
+        let client = match http_client {
+            Some(client) => client,
+            None => &reqwest::Client::builder()
+                .user_agent("Mozilla/5.0 (compatible; RustyFin/1.0)")
+                .redirect(reqwest::redirect::Policy::limited(5))
+                .build()
+                .map_err(|e| format!("failed to create HTTP client: {}", e))?,
+        };
 
         let resp = client
             .get(source)
@@ -126,7 +136,7 @@ fn filename_stem(path: &str) -> String {
 /// Compute a blurhash string for an image file.
 /// Returns a short blurhash (8x8 components) suitable for progressive image loading.
 pub async fn compute_blurhash(source_path: &str) -> Option<String> {
-    let bytes = read_image_bytes(source_path).await.ok()?;
+    let bytes = read_image_bytes(source_path, None).await.ok()?;
     let img = image::load_from_memory(&bytes).ok()?;
     // Downscale to a small image for faster encoding
     let small = img.resize(16, 16, FilterType::Triangle);

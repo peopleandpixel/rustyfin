@@ -113,6 +113,8 @@ pub struct ItemImage {
     pub width: Option<i32>,
     /// Image height in pixels (if known)
     pub height: Option<i32>,
+    /// Pre-computed blurhash string for progressive image loading
+    pub blurhash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -69,6 +69,8 @@ pub async fn upsert_media_item(pool: &SqlitePool, item: &MediaItem) -> Result<()
 
 /// Batch-insert multiple media items in a single transaction.
 /// Dramatically reduces WAL contention compared to per-item inserts.
+/// Disables filter triggers during insert to avoid write amplification,
+/// then rebuilds filter indexes after the transaction completes.
 pub async fn batch_upsert_media_items(
     pool: &SqlitePool,
     items: &[MediaItem],
@@ -78,6 +80,16 @@ pub async fn batch_upsert_media_items(
     }
 
     let mut tx = pool.begin().await?;
+
+    // Disable filter triggers during batch insert to avoid write amplification.
+    // Each trigger fires COUNT(*) on the entire table per row, which is expensive.
+    let _ = sqlx::query(
+        "DROP TRIGGER IF EXISTS update_filter_indexes_after_insert; \
+         DROP TRIGGER IF EXISTS update_filter_indexes_after_update; \
+         DROP TRIGGER IF EXISTS update_filter_indexes_after_delete",
+    )
+    .execute(&mut *tx)
+    .await;
 
     for item in items {
         let id = item.id.to_string();
@@ -133,6 +145,14 @@ pub async fn batch_upsert_media_items(
     }
 
     tx.commit().await?;
+
+    // Recreate filter triggers after batch insert.
+    // The scanner calls rebuild_filter_indexes() after the batch insert completes,
+    // so the indexes will be up-to-date.
+    let _ = sqlx::query(include_str!("../migrations/027_filter_triggers.sql"))
+        .execute(pool)
+        .await;
+
     Ok(())
 }
 
@@ -1229,6 +1249,23 @@ pub async fn get_library_items_by_type(
         .filter_map(|(path, id)| Uuid::parse_str(&id).ok().map(|uid| (path, uid)))
         .collect();
     Ok(map)
+}
+
+/// Fetch all movie items for a library, returning (path, id) pairs.
+/// Used by the scanner to pre-load movie paths for version detection,
+/// avoiding per-item database queries during scanning.
+pub async fn get_library_movies(
+    pool: &SqlitePool,
+    library_id: Uuid,
+) -> Result<Vec<(String, String)>, sqlx::Error> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT path, id FROM media_items WHERE library_id = ? AND media_type = ? AND runtime_ticks IS NOT NULL",
+    )
+    .bind(library_id.to_string())
+    .bind("Movie")
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
 }
 
 /// Get items with playback position > 0 (resume items) for all users

@@ -62,6 +62,7 @@ fn scan_directory(
                 provider: "local".to_string(),
                 width: None,
                 height: None,
+                blurhash: None,
             });
 
             *index += 1;

@@ -2,12 +2,11 @@ use axum::extract::{ConnectInfo, Request, State};
 use axum::http::header::AUTHORIZATION;
 use axum::middleware::Next;
 use axum::response::Response;
+use dashmap::DashMap;
 use rustyfin_model::auth::Claims;
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::Mutex;
 
 use crate::error::ApiError;
 use crate::state::AppState;
@@ -82,10 +81,11 @@ impl<T> ClaimsExt for axum::extract::Request<T> {
 }
 
 /// Simple in-memory rate limiter using a sliding window per IP.
+/// Uses DashMap for lock-striping to reduce contention under high concurrency.
 #[derive(Clone)]
 pub struct RateLimiter {
     /// Map of IP → list of request timestamps
-    state: Arc<Mutex<HashMap<String, Vec<Instant>>>>,
+    state: Arc<DashMap<String, Vec<Instant>>>,
     /// Maximum requests allowed within the window
     max_requests: usize,
     /// Time window duration
@@ -95,7 +95,7 @@ pub struct RateLimiter {
 impl RateLimiter {
     pub fn new(max_requests: usize, window_secs: u64) -> Self {
         Self {
-            state: Arc::new(Mutex::new(HashMap::new())),
+            state: Arc::new(DashMap::new()),
             max_requests,
             window: std::time::Duration::from_secs(window_secs),
         }
@@ -110,8 +110,7 @@ impl RateLimiter {
             loop {
                 interval.tick().await;
                 let now = Instant::now();
-                let mut map = state.lock().await;
-                map.retain(|_, timestamps| {
+                state.retain(|_, timestamps| {
                     timestamps.retain(|t| now.duration_since(*t) < window);
                     !timestamps.is_empty()
                 });
@@ -126,13 +125,12 @@ impl RateLimiter {
         }
 
         let now = Instant::now();
-        let mut map = self.state.lock().await;
-        let timestamps = map.entry(key.to_string()).or_default();
-        timestamps.retain(|t| now.duration_since(*t) < self.window);
-        if timestamps.len() >= self.max_requests {
+        let mut entry = self.state.entry(key.to_string()).or_default();
+        entry.retain(|t| now.duration_since(*t) < self.window);
+        if entry.len() >= self.max_requests {
             return false;
         }
-        timestamps.push(now);
+        entry.push(now);
         true
     }
 }

@@ -126,6 +126,8 @@ async fn main() {
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
 
     let transcode_manager = rustyfin_core::transcode::TranscodeManager::new(&data_dir);
+    // Start periodic cleanup of stale transcode sessions and old cache directories
+    transcode_manager.spawn_cleanup_task();
 
     let data_dir_arc = Arc::new(data_dir);
     let task_scheduler =

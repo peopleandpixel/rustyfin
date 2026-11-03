@@ -124,8 +124,34 @@ fn normalize_name(file_stem: &str) -> String {
     final_result.trim().to_string()
 }
 
+/// Build a HashMap for O(1) version detection lookups.
+/// Key: (normalized_name, parent_dir) -> Value: item_id
+/// Pre-loading all movies eliminates the N+1 query pattern during scanning.
+async fn build_version_map(
+    pool: &SqlitePool,
+    library_id: Uuid,
+) -> Result<HashMap<(String, String), Uuid>, sqlx::Error> {
+    let movies = rustyfin_db::repo_media::get_library_movies(pool, library_id).await?;
+    let mut map = HashMap::new();
+    for (path, id_str) in movies {
+        if let Ok(id) = Uuid::parse_str(&id_str) {
+            let path_buf = Path::new(&path);
+            if let Some(stem) = path_buf.file_stem().and_then(|s| s.to_str()) {
+                let normalized = normalize_name(stem);
+                let parent_dir = path_buf
+                    .parent()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                map.insert((normalized, parent_dir), id);
+            }
+        }
+    }
+    Ok(map)
+}
+
 /// Look up an existing media item by normalized name within the same parent
 /// directory.  Returns the item ID if found, otherwise None.
+/// Used by TV scan for episode version detection.
 async fn find_item_by_normalized_name(
     pool: &SqlitePool,
     normalized: &str,
@@ -193,7 +219,8 @@ pub async fn scan_library_with_metadata(
             new_item_ids.len(),
             library.name
         );
-        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(5));
+        // Increased from 5 to 10 — TMDb rate limits are typically 20-40 req/s, so 10 is safe.
+        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(10));
         let mut handles = Vec::new();
         for new_id in new_item_ids {
             if let Ok(Some(item)) = rustyfin_db::repo_media::get_item_by_id(pool, new_id).await {
@@ -252,6 +279,11 @@ async fn scan_flat_library(
             .into_iter()
             .collect();
 
+    // Pre-load all existing movies into a HashMap for O(1) version detection.
+    // Key: (normalized_name, parent_dir) -> item_id
+    // Eliminates the N+1 query pattern where each movie file triggered a DB query.
+    let version_map: HashMap<(String, String), Uuid> = build_version_map(pool, library.id).await?;
+
     // Collect new items for batch insert in a single transaction
     let mut new_items: Vec<MediaItem> = Vec::new();
 
@@ -300,9 +332,10 @@ async fn scan_flat_library(
                 .unwrap_or_default();
 
             let is_version = if matches!(media_type, MediaType::Movie) {
-                // Look for an existing item with the same normalized name in this directory
-                if let Ok(Some(existing_id)) =
-                    find_item_by_normalized_name(pool, &normalized, &parent_dir, media_type).await
+                // O(1) HashMap lookup instead of DB query
+                if let Some(existing_id) = version_map
+                    .get(&(normalized.clone(), parent_dir.clone()))
+                    .copied()
                 {
                     // This is a version of an existing item — add as a new media source
                     tracing::info!(

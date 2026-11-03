@@ -493,6 +493,7 @@ async fn test_item_image_missing_file_returns_404_not_500() {
         provider: "local".to_string(),
         width: None,
         height: None,
+        blurhash: None,
     };
     rustyfin_db::repo_image::upsert_image(&state.db, &img)
         .await
