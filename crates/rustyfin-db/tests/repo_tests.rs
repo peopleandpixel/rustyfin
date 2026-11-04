@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use uuid::Uuid;
 
 use rustyfin_model::library::{Library, LibraryContentType};
+use rustyfin_model::media::{MediaItem, MediaType};
 use rustyfin_model::user::User;
 
 /// Create a temporary file-based SQLite database for proper test isolation.
@@ -1065,4 +1066,70 @@ async fn test_filtered_query_with_name_starts_with() {
 
     assert_eq!(total_hash, 1);
     assert_eq!(items_hash[0].name, "2001: A Space Odyssey");
+}
+
+// ── Media Item Repository Tests ──
+
+fn make_movie(library_id: Uuid, name: &str) -> MediaItem {
+    MediaItem {
+        id: Uuid::new_v4(),
+        name: name.to_string(),
+        sort_name: Some(name.to_lowercase()),
+        media_type: MediaType::Movie,
+        path: format!("/media/movies/{name}.mkv"),
+        library_id,
+        production_year: Some(2020),
+        popularity: Some(12.5),
+        ..MediaItem::default_dto_fields()
+    }
+}
+
+#[tokio::test]
+async fn test_upsert_media_item_round_trip() {
+    let temp_db = test_pool().await;
+    let pool = temp_db.pool.clone();
+
+    let lib = make_library("Movies", LibraryContentType::Movies);
+    rustyfin_db::repo_library::create_library(&pool, &lib)
+        .await
+        .unwrap();
+
+    let movie = make_movie(lib.id, "Test Movie");
+    rustyfin_db::repo_media::upsert_media_item(&pool, &movie)
+        .await
+        .unwrap();
+
+    let stored = rustyfin_db::repo_media::get_item_by_id(&pool, movie.id)
+        .await
+        .unwrap()
+        .expect("item should exist after upsert");
+    assert_eq!(stored.name, "Test Movie");
+    assert_eq!(stored.path, movie.path);
+    assert_eq!(stored.production_year, Some(2020));
+    assert_eq!(stored.popularity, Some(12.5));
+}
+
+#[tokio::test]
+async fn test_batch_upsert_media_items_round_trip() {
+    let temp_db = test_pool().await;
+    let pool = temp_db.pool.clone();
+
+    let lib = make_library("Movies", LibraryContentType::Movies);
+    rustyfin_db::repo_library::create_library(&pool, &lib)
+        .await
+        .unwrap();
+
+    let movies = vec![make_movie(lib.id, "First"), make_movie(lib.id, "Second")];
+    rustyfin_db::repo_media::batch_upsert_media_items(&pool, &movies)
+        .await
+        .unwrap();
+
+    for movie in &movies {
+        let stored = rustyfin_db::repo_media::get_item_by_id(&pool, movie.id)
+            .await
+            .unwrap()
+            .expect("item should exist after batch upsert");
+        assert_eq!(stored.name, movie.name);
+        assert_eq!(stored.popularity, Some(12.5));
+    }
 }
