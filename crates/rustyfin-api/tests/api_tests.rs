@@ -930,6 +930,119 @@ async fn test_item_image_missing_file_returns_404_not_500() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
+/// A valid 2x2 RGB PNG, used as a series' folder image.
+const FOLDER_PNG: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02, 0x08, 0x02, 0x00, 0x00, 0x00, 0xfd, 0xd4, 0x9a,
+    0x73, 0x00, 0x00, 0x00, 0x10, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0x38, 0x61, 0x64, 0x04,
+    0x44, 0x0c, 0x10, 0x0a, 0x00, 0x23, 0x36, 0x04, 0xb1, 0xae, 0x7d, 0xb9, 0xbc, 0x00, 0x00, 0x00,
+    0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+];
+
+#[tokio::test]
+async fn test_series_folder_image_is_served_after_refresh() {
+    let state = test_state().await;
+    let username = format!("admin_{}", uuid::Uuid::new_v4().simple());
+    rustyfin_auth::create_initial_user(&state.db, &username, "admin")
+        .await
+        .unwrap();
+    let user = rustyfin_db::repo_user::get_user_by_name(&state.db, &username)
+        .await
+        .unwrap()
+        .unwrap();
+    let token = rustyfin_auth::create_token(&state.db, &user, &Default::default())
+        .await
+        .unwrap();
+
+    // Jellyfin/Kodi layout: the series poster is a generic name in the series folder
+    let tv_dir = state.data_dir.join("media").join("TV");
+    let show_dir = tv_dir.join("Show");
+    std::fs::create_dir_all(show_dir.join("Season 1")).unwrap();
+    std::fs::write(show_dir.join("folder.png"), FOLDER_PNG).unwrap();
+    std::fs::write(show_dir.join("Season 1").join("Show - S01E01.mkv"), b"").unwrap();
+
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: "Test Shows".to_string(),
+        content_type: rustyfin_model::library::LibraryContentType::TvShows,
+        paths: vec![tv_dir.to_string_lossy().to_string()],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+
+    // A Series item's path is its folder, as the TV scanner stores it
+    let series_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO media_items (id, library_id, name, media_type, path) VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(series_id.to_string())
+    .bind(lib.id.to_string())
+    .bind("Show")
+    .bind("Series")
+    .bind(show_dir.to_string_lossy().to_string())
+    .execute(&state.db)
+    .await
+    .unwrap();
+
+    let app = app(state);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/Items/{series_id}/Refresh"))
+                .header("Authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/Items/{series_id}/Images/Primary"))
+                .header("Authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body[..], FOLDER_PNG);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/Items?IncludeItemTypes=Series&Recursive=true")
+                .header("Authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let listing: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let series = listing["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| {
+            item["Id"]
+                .as_str()
+                .and_then(|id| uuid::Uuid::parse_str(id).ok())
+                == Some(series_id)
+        })
+        .expect("series is listed");
+    assert!(series["ImageTags"]["Primary"].is_string(), "{series}");
+}
+
 // ── Library Endpoint Tests ──
 
 #[tokio::test]
