@@ -37,7 +37,7 @@ mod websocket;
 use axum::Router;
 use axum::middleware as axum_mw;
 
-use crate::middleware::{rate_limit, require_auth};
+use crate::middleware::{rate_limit, require_auth, require_setup_or_admin};
 use crate::state::AppState;
 
 pub fn build_router(state: AppState) -> Router {
@@ -47,7 +47,10 @@ pub fn build_router(state: AppState) -> Router {
         .merge(users::public_routes())
         .merge(quick_connect::public_routes())
         .merge(dlna::routes())
-        .merge(startup::routes())
+        .merge(startup::routes().route_layer(axum_mw::from_fn_with_state(
+            state.clone(),
+            require_setup_or_admin,
+        )))
         .merge(websocket::routes());
 
     let protected = Router::new()

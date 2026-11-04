@@ -52,9 +52,11 @@ GET /System/Info?api_key=<token>
 |---|---|---|
 | `GET` | `/Startup/Configuration` | Setup-Status abfragen |
 | `POST` | `/Startup/Configuration` | Setup-Konfiguration setzen |
-| `GET` | `/Startup/User` | Initialen Admin-User abfragen |
-| `POST` | `/Startup/User` | Admin-User erstellen |
+| `GET` | `/Startup/User` | Namen des Server-Besitzers abfragen (leer, solange keiner existiert) |
+| `POST` | `/Startup/User` | Server-Besitzer anlegen (nur solange keiner existiert) |
 | `POST` | `/Startup/Complete` | Setup abschließen |
+
+Solange kein Server-Besitzer existiert, sind die `/Startup/*`-Endpunkte ohne Anmeldung erreichbar, danach nur für Administratoren.
 
 ---
 

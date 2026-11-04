@@ -47,12 +47,7 @@ cd rustyfin
 cargo run --release
 ```
 
-Rustyfin lauscht standardmäßig auf `0.0.0.0:8096`. Beim ersten Start wird ein Admin-Benutzer erstellt:
-
-- **Benutzername:** `admin`
-- **Passwort:** `admin`
-
-> ⚠️ **Das Standard-Passwort sofort nach dem ersten Login ändern!**
+Rustyfin lauscht standardmäßig auf `0.0.0.0:8096`. Beim ersten Aufruf des Web-Clients führt der Setup-Wizard durch die Ersteinrichtung. Dabei legt er das Administratorkonto an, den Server-Besitzer, mit dem gewählten Namen und Passwort. Es gibt kein Standardkonto.
 
 ## Lizenz
 

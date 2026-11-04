@@ -11,11 +11,11 @@ use std::time::Instant;
 use crate::error::ApiError;
 use crate::state::AppState;
 
-pub async fn require_auth(
-    State(state): State<AppState>,
-    mut req: Request,
-    next: Next,
-) -> Result<Response, ApiError> {
+/// Reads the credentials of a request and returns the claims they prove.
+///
+/// The token comes from the Bearer header, `X-Emby-Token`, `X-MediaBrowser-Token` or the `api_key`
+/// query parameter. The configured API key gives administrator claims. Any other token must be a JWT.
+fn request_claims(state: &AppState, req: &Request) -> Result<Claims, ApiError> {
     let token = req
         .headers()
         .get(AUTHORIZATION)
@@ -50,21 +50,45 @@ pub async fn require_auth(
         && token == **api_key
     {
         // API key auth: create admin claims
-        let claims = Claims {
+        return Ok(Claims {
             sub: uuid::Uuid::nil(),
             name: "ApiKey".to_string(),
             is_admin: true,
             iat: 0,
             exp: i64::MAX,
-        };
-        req.extensions_mut().insert(claims);
-        return Ok(next.run(req).await);
+        });
     }
 
     // Otherwise validate as JWT
-    let claims = rustyfin_auth::validate_token(&token, &state.jwt_secret)
-        .map_err(|_| ApiError::Unauthorized)?;
+    rustyfin_auth::validate_token(&token, &state.jwt_secret).map_err(|_| ApiError::Unauthorized)
+}
 
+pub async fn require_auth(
+    State(state): State<AppState>,
+    mut req: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let claims = request_claims(&state, &req)?;
+    req.extensions_mut().insert(claims);
+    Ok(next.run(req).await)
+}
+
+/// Guards the setup wizard routes. Until an owner exists, anyone may use them. After that, only an
+/// administrator may.
+pub async fn require_setup_or_admin(
+    State(state): State<AppState>,
+    mut req: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    if !rustyfin_db::repo_user::owner_exists(&state.db).await? {
+        return Ok(next.run(req).await);
+    }
+    let claims = request_claims(&state, &req)?;
+    if !claims.is_admin {
+        return Err(ApiError::Forbidden(
+            "Administrator access is required.".to_string(),
+        ));
+    }
     req.extensions_mut().insert(claims);
     Ok(next.run(req).await)
 }

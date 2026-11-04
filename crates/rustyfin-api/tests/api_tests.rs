@@ -1694,26 +1694,569 @@ async fn test_dlna_streaming_description() {
     // DLNA streaming endpoint may not be implemented yet; accept any response
 }
 
-// ── Startup Tests ──
+// ── Startup Wizard and Owner Tests ──
 
-#[tokio::test]
-async fn test_startup_ready() {
-    let state = test_state().await;
-    let app = app(state);
+/// Sends a request and returns the status and the JSON body (`Null` when the body is not JSON).
+async fn send(app: &axum::Router, req: Request<Body>) -> (StatusCode, serde_json::Value) {
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, json)
+}
 
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/Startup/Complete")
-                .header("Content-Type", "application/json")
-                .body(Body::from("{}"))
-                .unwrap(),
-        )
+/// Builds a request with an optional bearer token and an optional JSON body.
+fn request(
+    method: &str,
+    uri: &str,
+    token: Option<&str>,
+    body: Option<serde_json::Value>,
+) -> Request<Body> {
+    let mut builder = Request::builder().method(method).uri(uri);
+    if let Some(token) = token {
+        builder = builder.header("Authorization", format!("Bearer {token}"));
+    }
+    match body {
+        Some(body) => builder
+            .header("Content-Type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap(),
+        None => builder.body(Body::empty()).unwrap(),
+    }
+}
+
+/// Logs in and returns the access token and the user id, or `None` if login fails.
+async fn login(app: &axum::Router, name: &str, password: &str) -> Option<(String, String)> {
+    let body = serde_json::json!({ "Username": name, "Pw": password });
+    let req = request("POST", "/Users/AuthenticateByName", None, Some(body));
+    let (status, json) = send(app, req).await;
+    if status != StatusCode::OK {
+        return None;
+    }
+    Some((
+        json["AccessToken"].as_str().unwrap().to_string(),
+        json["User"]["Id"].as_str().unwrap().to_string(),
+    ))
+}
+
+/// Sends the wizard's `POST /Startup/User`.
+async fn post_startup_user(
+    app: &axum::Router,
+    token: Option<&str>,
+    name: &str,
+    password: &str,
+) -> StatusCode {
+    let body = serde_json::json!({ "Name": name, "Password": password });
+    send(app, request("POST", "/Startup/User", token, Some(body)))
+        .await
+        .0
+}
+
+/// Reads `StartupWizardCompleted` from the public and from the full system info.
+async fn wizard_completed(app: &axum::Router) -> (bool, bool) {
+    let (status, public) = send(app, request("GET", "/System/Info/Public", None, None)).await;
+    assert_eq!(status, StatusCode::OK);
+    let full_req = request("GET", "/System/Info", Some("test-api-key"), None);
+    let (status, full) = send(app, full_req).await;
+    assert_eq!(status, StatusCode::OK);
+    (
+        public["StartupWizardCompleted"].as_bool().unwrap(),
+        full["StartupWizardCompleted"].as_bool().unwrap(),
+    )
+}
+
+/// Creates a user that is not the owner. `create_initial_user` makes an administrator.
+async fn add_user(state: &AppState, name: &str, password: &str, admin: bool) -> uuid::Uuid {
+    let user = rustyfin_auth::create_initial_user(&state.db, name, password)
         .await
         .unwrap();
+    if !admin {
+        rustyfin_db::repo_user::update_policy(&state.db, user.id, false)
+            .await
+            .unwrap();
+    }
+    user.id
+}
 
-    assert!(resp.status().is_success());
+/// Returns `(is_administrator, is_owner, is_disabled)` for the named user, or `None` if it is gone.
+async fn user_flags(state: &AppState, name: &str) -> Option<(bool, bool, bool)> {
+    sqlx::query_as("SELECT is_administrator, is_owner, is_disabled FROM users WHERE name = ?")
+        .bind(name)
+        .fetch_optional(&state.db)
+        .await
+        .unwrap()
+}
+
+/// Returns the names of all owners and the total number of users.
+async fn owners_and_count(state: &AppState) -> (Vec<String>, i64) {
+    let owners: Vec<String> = sqlx::query_scalar("SELECT name FROM users WHERE is_owner = 1")
+        .fetch_all(&state.db)
+        .await
+        .unwrap();
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    (owners, count)
+}
+
+#[tokio::test]
+async fn test_startup_fresh_state_needs_setup() {
+    let state = test_state().await;
+    let app = app(state.clone());
+
+    let users = rustyfin_db::repo_user::get_all_users(&state.db)
+        .await
+        .unwrap();
+    assert!(users.is_empty());
+    assert_eq!(wizard_completed(&app).await, (false, false));
+
+    let (status, body) = send(&app, request("GET", "/Startup/User", None, None)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["Name"], "");
+}
+
+#[tokio::test]
+async fn test_startup_flag_without_owner_still_needs_setup() {
+    let state = test_state().await;
+    add_user(&state, "olduser", "oldpass", true).await;
+    state.config.write().await.is_startup_wizard_completed = true;
+    let app = app(state.clone());
+
+    assert_eq!(wizard_completed(&app).await, (false, false));
+}
+
+#[tokio::test]
+async fn test_startup_user_creates_owner_with_typed_name() {
+    let state = test_state().await;
+    let app = app(state.clone());
+
+    let config =
+        serde_json::json!({ "PreferredMetadataLanguage": "de", "MetadataCountryCode": "DE" });
+    let req = request("POST", "/Startup/Configuration", None, Some(config));
+    assert_eq!(send(&app, req).await.0, StatusCode::NO_CONTENT);
+
+    assert_eq!(
+        post_startup_user(&app, None, "karl", "geheim").await,
+        StatusCode::NO_CONTENT
+    );
+    assert!(login(&app, "karl", "geheim").await.is_some());
+    assert_eq!(wizard_completed(&app).await, (true, true));
+    assert_eq!(user_flags(&state, "karl").await, Some((true, true, false)));
+    assert_eq!(
+        owners_and_count(&state).await,
+        (vec!["karl".to_string()], 1)
+    );
+}
+
+#[tokio::test]
+async fn test_startup_user_rejected_once_owner_exists() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    assert_eq!(
+        post_startup_user(&app, None, "karl", "geheim").await,
+        StatusCode::NO_CONTENT
+    );
+    let (token, _) = login(&app, "karl", "geheim").await.unwrap();
+
+    assert_eq!(
+        post_startup_user(&app, None, "karl", "hacked").await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        post_startup_user(&app, None, "mallory", "hacked").await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        post_startup_user(&app, Some(&token), "karl", "changed").await,
+        StatusCode::FORBIDDEN
+    );
+
+    assert!(
+        login(&app, "karl", "geheim").await.is_some(),
+        "password unchanged"
+    );
+    assert!(login(&app, "karl", "hacked").await.is_none());
+    assert!(login(&app, "karl", "changed").await.is_none());
+    assert!(login(&app, "mallory", "hacked").await.is_none());
+    assert_eq!(
+        owners_and_count(&state).await,
+        (vec!["karl".to_string()], 1)
+    );
+}
+
+#[tokio::test]
+async fn test_startup_user_with_admin_but_no_owner() {
+    let state = test_state().await;
+    add_user(&state, "olduser", "oldpass", true).await;
+    let app = app(state.clone());
+
+    assert_eq!(wizard_completed(&app).await, (false, false));
+    let (status, body) = send(&app, request("GET", "/Startup/User", None, None)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["Name"], "",
+        "no user name leaks before an owner exists"
+    );
+
+    assert_eq!(
+        post_startup_user(&app, None, "karl", "geheim").await,
+        StatusCode::NO_CONTENT
+    );
+    assert!(login(&app, "karl", "geheim").await.is_some());
+    assert!(
+        login(&app, "olduser", "oldpass").await.is_some(),
+        "existing admin unchanged"
+    );
+    assert_eq!(
+        user_flags(&state, "olduser").await,
+        Some((true, false, false))
+    );
+    assert_eq!(
+        owners_and_count(&state).await,
+        (vec!["karl".to_string()], 2)
+    );
+}
+
+#[tokio::test]
+async fn test_startup_user_takes_over_existing_admin_name() {
+    let state = test_state().await;
+    // A leftover "admin" from an older version, demoted to show that the owner becomes an administrator.
+    let admin_id = add_user(&state, "admin", "admin", false).await;
+    let app = app(state.clone());
+
+    assert_eq!(
+        post_startup_user(&app, None, "admin", "newpass").await,
+        StatusCode::NO_CONTENT
+    );
+    let (_, user_id) = login(&app, "admin", "newpass")
+        .await
+        .expect("the typed name logs in with the new password");
+    assert_eq!(
+        user_id,
+        admin_id.to_string(),
+        "the existing account is reused"
+    );
+    assert!(login(&app, "admin", "admin").await.is_none());
+    assert_eq!(user_flags(&state, "admin").await, Some((true, true, false)));
+    assert_eq!(
+        owners_and_count(&state).await,
+        (vec!["admin".to_string()], 1)
+    );
+}
+
+#[tokio::test]
+async fn test_startup_user_rejects_empty_name() {
+    let state = test_state().await;
+    let app = app(state.clone());
+
+    assert_eq!(
+        post_startup_user(&app, None, "", "pw").await,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        post_startup_user(&app, None, "   ", "pw").await,
+        StatusCode::BAD_REQUEST
+    );
+    let users = rustyfin_db::repo_user::get_all_users(&state.db)
+        .await
+        .unwrap();
+    assert!(users.is_empty());
+    assert_eq!(wizard_completed(&app).await, (false, false));
+}
+
+#[tokio::test]
+async fn test_startup_user_allows_empty_password() {
+    let state = test_state().await;
+    let app = app(state.clone());
+
+    assert_eq!(
+        post_startup_user(&app, None, "karl", "").await,
+        StatusCode::NO_CONTENT
+    );
+    assert!(login(&app, "karl", "").await.is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_startup_user_concurrent_requests_one_owner() {
+    let state = test_state().await;
+    let app = app(state.clone());
+
+    let first = tokio::spawn({
+        let app = app.clone();
+        async move { post_startup_user(&app, None, "alice", "pw-alice").await }
+    });
+    let second = tokio::spawn({
+        let app = app.clone();
+        async move { post_startup_user(&app, None, "bob", "pw-bob").await }
+    });
+    let mut statuses = [
+        first.await.unwrap().as_u16(),
+        second.await.unwrap().as_u16(),
+    ];
+    statuses.sort_unstable();
+
+    assert_eq!(statuses, [204, 403]);
+    let (owners, count) = owners_and_count(&state).await;
+    assert_eq!(owners.len(), 1);
+    assert_eq!(count, 1);
+}
+
+#[tokio::test]
+async fn test_owner_cannot_be_deleted_or_demoted() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    assert_eq!(
+        post_startup_user(&app, None, "karl", "geheim").await,
+        StatusCode::NO_CONTENT
+    );
+    let (owner_token, owner_id) = login(&app, "karl", "geheim").await.unwrap();
+    let bob_id = add_user(&state, "bob", "bobpass", true).await;
+    let (bob_token, _) = login(&app, "bob", "bobpass").await.unwrap();
+
+    let demote = serde_json::json!({ "IsAdministrator": false });
+    let delete_uri = format!("/Users/{owner_id}/Delete");
+    let user_uri = format!("/Users/{owner_id}");
+    let policy_uri = format!("/Users/{owner_id}/Policy");
+    // Another admin and the owner itself are both refused.
+    for token in [bob_token.as_str(), owner_token.as_str()] {
+        let req = request("POST", &delete_uri, Some(token), None);
+        assert_eq!(send(&app, req).await.0, StatusCode::FORBIDDEN);
+        let req = request("DELETE", &user_uri, Some(token), None);
+        assert_eq!(send(&app, req).await.0, StatusCode::FORBIDDEN);
+        let req = request("POST", &policy_uri, Some(token), Some(demote.clone()));
+        assert_eq!(send(&app, req).await.0, StatusCode::FORBIDDEN);
+    }
+    let promote = serde_json::json!({ "IsAdministrator": true });
+    let req = request("POST", &policy_uri, Some(&bob_token), Some(promote));
+    assert_eq!(send(&app, req).await.0, StatusCode::OK);
+    assert_eq!(user_flags(&state, "karl").await, Some((true, true, false)));
+    assert!(login(&app, "karl", "geheim").await.is_some());
+
+    // Other administrators can still be demoted and deleted.
+    let req = request(
+        "POST",
+        &format!("/Users/{bob_id}/Policy"),
+        Some(&owner_token),
+        Some(demote),
+    );
+    assert_eq!(send(&app, req).await.0, StatusCode::OK);
+    assert_eq!(user_flags(&state, "bob").await, Some((false, false, false)));
+    let req = request(
+        "DELETE",
+        &format!("/Users/{bob_id}"),
+        Some(&owner_token),
+        None,
+    );
+    assert_eq!(send(&app, req).await.0, StatusCode::OK);
+    assert_eq!(user_flags(&state, "bob").await, None);
+}
+
+#[tokio::test]
+async fn test_startup_routes_require_admin_after_setup() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    assert_eq!(
+        post_startup_user(&app, None, "karl", "geheim").await,
+        StatusCode::NO_CONTENT
+    );
+    let (owner_token, _) = login(&app, "karl", "geheim").await.unwrap();
+    add_user(&state, "viewer", "viewerpass", false).await;
+    let (viewer_token, _) = login(&app, "viewer", "viewerpass").await.unwrap();
+    let language_before = state
+        .config
+        .read()
+        .await
+        .preferred_metadata_language
+        .clone();
+
+    let config = serde_json::json!({ "PreferredMetadataLanguage": "fr" });
+    let empty = serde_json::json!({});
+    let routes = [
+        ("GET", "/Startup/Configuration", None),
+        ("POST", "/Startup/Configuration", Some(config.clone())),
+        ("GET", "/Startup/User", None),
+        ("POST", "/Startup/Complete", Some(empty.clone())),
+        ("GET", "/Startup/FirstUser", None),
+        ("POST", "/Startup/RemoteAccess", Some(empty)),
+    ];
+    for (method, uri, body) in &routes {
+        let req = request(method, uri, None, body.clone());
+        assert_eq!(
+            send(&app, req).await.0,
+            StatusCode::UNAUTHORIZED,
+            "anonymous {method} {uri}"
+        );
+        let req = request(method, uri, Some("not-a-token"), body.clone());
+        assert_eq!(
+            send(&app, req).await.0,
+            StatusCode::UNAUTHORIZED,
+            "bad token {method} {uri}"
+        );
+        let req = request(method, uri, Some(&viewer_token), body.clone());
+        assert_eq!(
+            send(&app, req).await.0,
+            StatusCode::FORBIDDEN,
+            "non-admin {method} {uri}"
+        );
+    }
+    {
+        let config = state.config.read().await;
+        assert_eq!(config.preferred_metadata_language, language_before);
+        assert!(!config.is_startup_wizard_completed);
+    }
+
+    let req = request("GET", "/Startup/User", Some(&owner_token), None);
+    let (status, body) = send(&app, req).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["Name"], "karl");
+    assert_eq!(body["Password"], "");
+    let req = request(
+        "POST",
+        "/Startup/Configuration",
+        Some(&owner_token),
+        Some(config),
+    );
+    assert_eq!(send(&app, req).await.0, StatusCode::NO_CONTENT);
+    assert_eq!(state.config.read().await.preferred_metadata_language, "fr");
+    let req = request("GET", "/Startup/Configuration", Some("test-api-key"), None);
+    assert_eq!(send(&app, req).await.0, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_startup_complete_requires_owner() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let empty = serde_json::json!({});
+
+    let req = request("POST", "/Startup/Complete", None, Some(empty.clone()));
+    assert_eq!(send(&app, req).await.0, StatusCode::BAD_REQUEST);
+    assert!(!state.config.read().await.is_startup_wizard_completed);
+
+    assert_eq!(
+        post_startup_user(&app, None, "karl", "geheim").await,
+        StatusCode::NO_CONTENT
+    );
+    let (token, _) = login(&app, "karl", "geheim").await.unwrap();
+    let req = request("POST", "/Startup/Complete", Some(&token), Some(empty));
+    assert_eq!(send(&app, req).await.0, StatusCode::NO_CONTENT);
+    assert!(state.config.read().await.is_startup_wizard_completed);
+    let saved = std::fs::read_to_string(state.data_dir.join("config.json")).unwrap();
+    let saved: serde_json::Value = serde_json::from_str(&saved).unwrap();
+    assert_eq!(saved["IsStartupWizardCompleted"], true);
+}
+
+#[tokio::test]
+async fn test_startup_user_disables_leftover_default_admin() {
+    let state = test_state().await;
+    add_user(&state, "admin", "admin", true).await;
+    let app = app(state.clone());
+
+    assert_eq!(
+        post_startup_user(&app, None, "karl", "geheim").await,
+        StatusCode::NO_CONTENT
+    );
+    assert!(
+        login(&app, "karl", "geheim").await.is_some(),
+        "the owner can log in"
+    );
+    assert!(
+        login(&app, "admin", "admin").await.is_none(),
+        "admin/admin is disabled"
+    );
+    assert_eq!(
+        user_flags(&state, "admin").await,
+        Some((true, false, true)),
+        "disabled, not deleted"
+    );
+    assert_eq!(
+        owners_and_count(&state).await,
+        (vec!["karl".to_string()], 2)
+    );
+}
+
+#[tokio::test]
+async fn test_startup_user_keeps_admin_with_changed_password() {
+    let state = test_state().await;
+    add_user(&state, "admin", "secret", true).await;
+    let app = app(state.clone());
+
+    assert_eq!(
+        post_startup_user(&app, None, "karl", "geheim").await,
+        StatusCode::NO_CONTENT
+    );
+    assert!(
+        login(&app, "karl", "geheim").await.is_some(),
+        "the owner can log in"
+    );
+    assert!(
+        login(&app, "admin", "secret").await.is_some(),
+        "admin keeps working"
+    );
+    assert_eq!(
+        user_flags(&state, "admin").await,
+        Some((true, false, false))
+    );
+}
+
+#[tokio::test]
+async fn test_startup_user_name_match_is_exact() {
+    let state = test_state().await;
+    let admin_id = add_user(&state, "admin", "admin", true).await;
+    let app = app(state.clone());
+
+    assert_eq!(
+        post_startup_user(&app, None, "Admin", "geheim").await,
+        StatusCode::NO_CONTENT
+    );
+    let (_, owner_id) = login(&app, "Admin", "geheim")
+        .await
+        .expect("\"Admin\" is a new account");
+    assert_ne!(owner_id, admin_id.to_string());
+    assert!(
+        login(&app, "admin", "admin").await.is_none(),
+        "admin/admin is disabled"
+    );
+    assert_eq!(user_flags(&state, "admin").await, Some((true, false, true)));
+    assert_eq!(
+        owners_and_count(&state).await,
+        (vec!["Admin".to_string()], 2)
+    );
+}
+
+#[tokio::test]
+async fn test_upgrade_promotes_earliest_admin() {
+    use rustyfin_db::repo_user::promote_earliest_admin_to_owner;
+
+    let state = test_state().await;
+    add_user(&state, "viewer", "pw", false).await;
+    let promoted = promote_earliest_admin_to_owner(&state.db).await.unwrap();
+    assert!(promoted.is_none(), "no admin, nothing to promote");
+
+    // Insertion order differs from creation order, so only created_at can pick "first".
+    add_user(&state, "second", "pw", true).await;
+    add_user(&state, "first", "pw", true).await;
+    for (name, created_at) in [
+        ("viewer", "2020-01-01T00:00:00+00:00"),
+        ("first", "2021-01-01T00:00:00+00:00"),
+        ("second", "2022-01-01T00:00:00+00:00"),
+    ] {
+        sqlx::query("UPDATE users SET created_at = ? WHERE name = ?")
+            .bind(created_at)
+            .bind(name)
+            .execute(&state.db)
+            .await
+            .unwrap();
+    }
+
+    let promoted = promote_earliest_admin_to_owner(&state.db).await.unwrap();
+    assert_eq!(promoted.map(|u| u.name).as_deref(), Some("first"));
+    let again = promote_earliest_admin_to_owner(&state.db).await.unwrap();
+    assert!(again.is_none(), "an owner already exists");
+    assert_eq!(
+        owners_and_count(&state).await,
+        (vec!["first".to_string()], 3)
+    );
 }
 
 // ── Packages Tests ──

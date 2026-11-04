@@ -61,20 +61,22 @@ async fn ping() -> &'static str {
     "\"Rustyfin\""
 }
 
-async fn get_public_info(State(state): State<AppState>) -> Json<ServerInfo> {
+async fn get_public_info(State(state): State<AppState>) -> Result<Json<ServerInfo>, ApiError> {
+    let startup_wizard_completed = rustyfin_db::repo_user::owner_exists(&state.db_ro).await?;
     let config = state.config.read().await;
-    Json(ServerInfo {
+    Ok(Json(ServerInfo {
         server_name: config.server_name.clone(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         id: state.server_id.to_string(),
-        startup_wizard_completed: config.is_startup_wizard_completed,
-    })
+        startup_wizard_completed,
+    }))
 }
 
 async fn get_full_info(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
-) -> Json<FullServerInfo> {
+) -> Result<Json<FullServerInfo>, ApiError> {
+    let startup_wizard_completed = rustyfin_db::repo_user::owner_exists(&state.db_ro).await?;
     let config = state.config.read().await;
     let log_path = state.data_dir.join("logs").to_string_lossy().to_string();
     let cache_path = state.data_dir.join("cache").to_string_lossy().to_string();
@@ -82,11 +84,11 @@ async fn get_full_info(
 
     let os = std::env::consts::OS.to_string();
 
-    Json(FullServerInfo {
+    Ok(Json(FullServerInfo {
         server_name: config.server_name.clone(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         id: state.server_id.to_string(),
-        startup_wizard_completed: config.is_startup_wizard_completed,
+        startup_wizard_completed,
         operating_system: os,
         has_pending_restart: false,
         has_update_available: false,
@@ -100,7 +102,7 @@ async fn get_full_info(
         remote_end_point: Some(format!("http://{}", addr)),
         local_addresses: Some(vec![format!("http://{}", state.bind_addr)]),
         package_version: Some(env!("CARGO_PKG_VERSION").to_string()),
-    })
+    }))
 }
 
 async fn get_endpoint(

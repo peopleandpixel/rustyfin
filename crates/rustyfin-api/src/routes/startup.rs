@@ -1,13 +1,13 @@
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::{get, post};
-use axum::{Json, Router};
-use chrono::Utc;
+use axum::{Extension, Json, Router};
+use rustyfin_db::repo_user::OwnerClaim;
+use rustyfin_model::auth::Claims;
 use rustyfin_model::setup::{
     StartupConfiguration, StartupConfigurationUpdate, StartupUser, StartupUserCreate,
 };
 use rustyfin_model::user::User;
-use uuid::Uuid;
 
 use crate::error::ApiError;
 use crate::state::AppState;
@@ -53,78 +53,86 @@ async fn update_startup_config(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn get_startup_user(State(state): State<AppState>) -> Result<Json<StartupUser>, ApiError> {
-    // Return the first admin user if one exists, otherwise empty
-    let users = rustyfin_db::repo_user::get_all_users(&state.db_ro)
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
-
-    let admin = users.into_iter().find(|u| u.is_administrator);
-    match admin {
-        Some(u) => Ok(Json(StartupUser {
-            name: u.name,
-            password: String::new(),
-        })),
-        None => Ok(Json(StartupUser {
+async fn get_startup_user(
+    State(state): State<AppState>,
+    claims: Option<Extension<Claims>>,
+) -> Result<Json<StartupUser>, ApiError> {
+    let Some(owner) = rustyfin_db::repo_user::get_owner(&state.db_ro).await? else {
+        // Before an owner exists, the wizard starts empty, even if other administrators exist.
+        return Ok(Json(StartupUser {
             name: String::new(),
             password: String::new(),
-        })),
+        }));
+    };
+    // The guard already admits only administrators once an owner exists. This check covers a race.
+    if !claims.is_some_and(|Extension(c)| c.is_admin) {
+        return Err(ApiError::Unauthorized);
     }
+    Ok(Json(StartupUser {
+        name: owner.name,
+        password: String::new(),
+    }))
+}
+
+/// Returns the account named `admin` if its password is still the default `admin`. The owner claim
+/// disables such an account. The name `admin` itself is not a leftover, because the claim takes over
+/// that account. Any error counts as no leftover.
+async fn default_admin_leftover(state: &AppState, name: &str) -> Option<User> {
+    if name == "admin" {
+        return None;
+    }
+    let admin = rustyfin_db::repo_user::get_user_by_name(&state.db, "admin")
+        .await
+        .ok()
+        .flatten()?;
+    let has_default_password = matches!(
+        rustyfin_auth::verify_password("admin", &admin.password_hash),
+        Ok(true)
+    );
+    has_default_password.then_some(admin)
 }
 
 async fn create_startup_user(
     State(state): State<AppState>,
     Json(input): Json<StartupUserCreate>,
 ) -> Result<StatusCode, ApiError> {
-    if input.name.is_empty() {
+    if rustyfin_db::repo_user::owner_exists(&state.db).await? {
+        return Err(ApiError::Forbidden("A server owner already exists.".into()));
+    }
+    // The name is stored exactly as sent. Only this check trims it.
+    if input.name.trim().is_empty() {
         return Err(ApiError::BadRequest("Name is required".into()));
     }
 
-    // Check if an admin already exists
-    let users = rustyfin_db::repo_user::get_all_users(&state.db)
-        .await
+    let hash = rustyfin_auth::hash_password(&input.password)
         .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let leftover = default_admin_leftover(&state, &input.name).await;
 
-    if let Some(existing) = users.iter().find(|u| u.is_administrator) {
-        // Update existing admin user name/password
-        let hash = if input.password.is_empty() {
-            existing.password_hash.clone()
-        } else {
-            rustyfin_auth::hash_password(&input.password)
-                .map_err(|e| ApiError::Internal(e.to_string()))?
-        };
-        rustyfin_db::repo_user::update_password(&state.db, existing.id, &hash)
-            .await
-            .map_err(|e| ApiError::Internal(e.to_string()))?;
-        return Ok(StatusCode::NO_CONTENT);
+    let claim =
+        rustyfin_db::repo_user::claim_owner(&state.db, &input.name, &hash, leftover.as_ref())
+            .await?;
+    match claim {
+        OwnerClaim::AlreadyOwned => {
+            Err(ApiError::Forbidden("A server owner already exists.".into()))
+        }
+        OwnerClaim::Claimed { leftover_disabled } => {
+            if leftover_disabled {
+                tracing::warn!(
+                    "disabled the leftover account 'admin' whose password was still the default 'admin'; the server owner is now '{}'",
+                    input.name
+                );
+            }
+            Ok(StatusCode::NO_CONTENT)
+        }
     }
-
-    // Create new admin user
-    let hash = if input.password.is_empty() {
-        rustyfin_auth::hash_password("").map_err(|e| ApiError::Internal(e.to_string()))?
-    } else {
-        rustyfin_auth::hash_password(&input.password)
-            .map_err(|e| ApiError::Internal(e.to_string()))?
-    };
-
-    let user = User {
-        id: Uuid::new_v4(),
-        name: input.name,
-        password_hash: hash,
-        is_administrator: true,
-        created_at: Utc::now(),
-        last_login_date: None,
-        configuration: serde_json::Value::Object(serde_json::Map::new()),
-    };
-
-    rustyfin_db::repo_user::create_user(&state.db, &user)
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
-
-    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn complete_startup(State(state): State<AppState>) -> Result<StatusCode, ApiError> {
+    if !rustyfin_db::repo_user::owner_exists(&state.db).await? {
+        return Err(ApiError::BadRequest(
+            "Create the server owner before completing the setup.".into(),
+        ));
+    }
     {
         let mut config = state.config.write().await;
         config.is_startup_wizard_completed = true;

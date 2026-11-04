@@ -54,6 +54,14 @@ log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
+# JSON-Zeichenkette escapen (zuerst Backslashes, dann Anführungszeichen)
+json_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    printf '%s' "$s"
+}
+
 # ------------------------------------------------------------------------------
 # Frontend / Web-Client Bauen
 # ------------------------------------------------------------------------------
@@ -121,7 +129,7 @@ run_foreground() {
     echo -e "${BOLD}Server-Konfiguration:${NC}"
     echo -e "  • Web-Client URL:   ${CYAN}${BOLD}${BASE_URL}/web/index.html${NC}"
     echo -e "  • API Base URL:     ${CYAN}${BASE_URL}/${NC}"
-    echo -e "  • Standard-Login:   Benutzer: ${BOLD}admin${NC} | Passwort: ${BOLD}admin${NC}"
+    echo -e "  • Ersteinrichtung:  Administratorkonto im Einrichtungsassistenten des Web-Clients anlegen"
     echo -e "  • Datenverzeichnis: ${DATA_DIR}"
     echo -e "  • Bind-Adresse:     ${BIND_ADDR}"
     echo ""
@@ -192,7 +200,7 @@ start_background() {
     if [ $is_up -eq 1 ]; then
         log_success "Rustyfin Server erfolgreich gestartet!"
         echo -e "  • Web-Client:       ${CYAN}${BOLD}${BASE_URL}/web/index.html${NC}"
-        echo -e "  • Standard-Login:   Benutzer: ${BOLD}admin${NC} | Passwort: ${BOLD}admin${NC}"
+        echo -e "  • Ersteinrichtung:  Administratorkonto im Einrichtungsassistenten des Web-Clients anlegen"
         echo -e "  • Logs:             tail -f $LOG_FILE"
         echo -e "  • Stoppen mit:      ./start.sh stop"
     else
@@ -286,10 +294,23 @@ run_smoke_test() {
     log_info "Führe Live-System- und HTTP-Smoke-Tests durch..."
 
     local was_running=1
+    local smoke_dir=""
     if [ ! -f "$PID_FILE" ] || ! kill -0 "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null; then
-        was_running=0
-        log_info "Starte temporäre Server-Instanz für Smoke-Tests..."
-        start_background
+        if curl -s -f "${BASE_URL}/System/Ping" >/dev/null 2>&1; then
+            # Fremder Server (z.B. aus cargo run oder einem anderen Checkout): nutzen, aber weder anlegen noch beenden
+            log_warn "Unter $BASE_URL antwortet bereits ein Server, den dieses Skript nicht gestartet hat. Der Test nutzt ihn und legt kein Konto an."
+        else
+            was_running=0
+            # Wegwerf-Datenverzeichnis, damit der Test nie das Entwicklungs-Datenverzeichnis berührt
+            smoke_dir="$(mktemp -d "${TMPDIR:-/tmp}/rustyfin-smoke.XXXXXX")"
+            DATA_DIR="$smoke_dir"
+            # Der Pfad wird beim Setzen der Trap eingesetzt (gewollt), damit auch ein früher Abbruch aufräumt
+            # stop_server nur bei vorhandener PID-Datei aufrufen: ohne sie würde stop_server pkill ausführen
+            # shellcheck disable=SC2064
+            trap "if [ -f '$PID_FILE' ]; then stop_server >/dev/null 2>&1 || true; fi; rm -rf '$smoke_dir'" EXIT
+            log_info "Starte temporäre Server-Instanz für Smoke-Tests (Datenverzeichnis: $smoke_dir)..."
+            start_background
+        fi
     fi
 
     echo ""
@@ -356,21 +377,51 @@ run_smoke_test() {
     fi
 
     # 7. Authentifizierung Test
-    echo -n "  • POST /Users/AuthenticateByName (admin / admin) : "
-    local auth_resp
-    auth_resp=$(curl -s -X POST "$BASE_URL/Users/AuthenticateByName" \
-        -H "Content-Type: application/json" \
-        -d '{"Username":"admin","Pw":"admin"}')
-    if echo "$auth_resp" | grep -q "AccessToken"; then
-        echo -e "${GREEN}200 OK (Authentifizierung erfolgreich)${NC}"
+    # Zugangsdaten: RUSTYFIN_SMOKE_USER hat Vorrang; sonst bekommt nur der eigene Test-Server ein Zufallskonto
+    local smoke_user="" smoke_pw=""
+    if [ -n "${RUSTYFIN_SMOKE_USER-}" ]; then
+        smoke_user="$RUSTYFIN_SMOKE_USER"
+        smoke_pw="${RUSTYFIN_SMOKE_PASSWORD-}"
+    elif [ $was_running -eq 0 ]; then
+        smoke_user="smoke"
+        smoke_pw="smoke-$RANDOM$RANDOM"
+    fi
+
+    if [ $was_running -eq 0 ]; then
+        # Eigener Test-Server: zuerst den Server-Besitzer anlegen
+        echo -n "  • POST /Startup/User (${smoke_user}) : "
+        code=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$BASE_URL/Startup/User" \
+            -H "Content-Type: application/json" \
+            -d "{\"Name\":\"$(json_escape "$smoke_user")\",\"Password\":\"$(json_escape "$smoke_pw")\"}")
+        if [ "$code" == "204" ]; then
+            echo -e "${GREEN}204 OK${NC}"
+        else
+            echo -e "${RED}Fehler ($code)${NC}"; failed=$((failed + 1))
+        fi
+    fi
+
+    if [ -z "$smoke_user" ]; then
+        # Laufender Server ohne Zugangsdaten: weder anlegen noch anmelden, daher kein Fehler
+        echo -e "${YELLOW}  • POST /Users/AuthenticateByName : übersprungen (der laufende Server nutzt eventuell dein Entwicklungs-Datenverzeichnis; setze RUSTYFIN_SMOKE_USER und RUSTYFIN_SMOKE_PASSWORD für diesen Test)${NC}"
     else
-        echo -e "${RED}Authentifizierung fehlgeschlagen: $auth_resp${NC}"; failed=$((failed + 1))
+        echo -n "  • POST /Users/AuthenticateByName (${smoke_user}) : "
+        local auth_resp
+        auth_resp=$(curl -s -X POST "$BASE_URL/Users/AuthenticateByName" \
+            -H "Content-Type: application/json" \
+            -d "{\"Username\":\"$(json_escape "$smoke_user")\",\"Pw\":\"$(json_escape "$smoke_pw")\"}")
+        if echo "$auth_resp" | grep -q "AccessToken"; then
+            echo -e "${GREEN}200 OK (Authentifizierung erfolgreich)${NC}"
+        else
+            echo -e "${RED}Authentifizierung fehlgeschlagen: $auth_resp${NC}"; failed=$((failed + 1))
+        fi
     fi
 
     echo ""
     if [ $was_running -eq 0 ]; then
         log_info "Beende temporäre Server-Instanz..."
         stop_server
+        rm -rf "$smoke_dir"
+        trap - EXIT
     fi
 
     if [ $failed -eq 0 ]; then

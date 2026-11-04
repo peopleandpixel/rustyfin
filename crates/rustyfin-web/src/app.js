@@ -4,6 +4,9 @@ let currentLibraryId = null;
 let currentDetailId = null;
 let libraries = [];
 let wizStep = 0;
+let wizProgress = { configSaved: false, userCreated: false, loggedIn: false, libraryCreated: false };
+let wizCredentials = null;
+let wizFinishing = false;
 let serverVersion = '0.3.0';
 let playerReportInterval = null;
 let playerHideTimeout = null;
@@ -110,7 +113,7 @@ async function checkSetupWizard() {
             hide('main-navbar');
             return true;
         }
-    } catch {}
+    } catch (e) { console.warn('Could not read the server info for the setup wizard:', e); }
     return false;
 }
 
@@ -146,21 +149,14 @@ function wizSetStep(s) {
         }
     }
     if (s === 3) {
-        $('wiz-summary-user').textContent = $('wiz-username').value || 'admin';
+        $('wiz-summary-user').textContent = $('wiz-username').value.trim();
         const langEl = $('wiz-lang');
         $('wiz-summary-lang').textContent = langEl.options[langEl.selectedIndex].text;
     }
 }
 
 async function wizNext() {
-    if (wizStep === 0) {
-        try {
-            await API.updateStartupConfig({
-                PreferredMetadataLanguage: $('wiz-lang').value,
-                MetadataCountryCode: $('wiz-country').value
-            });
-        } catch {}
-    } else if (wizStep === 1) {
+    if (wizStep === 1) {
         const pw = $('wiz-password').value, pw2 = $('wiz-password2').value;
         const user = $('wiz-username').value.trim();
         if (!user) {
@@ -174,20 +170,6 @@ async function wizNext() {
             return;
         }
         hide('wiz-user-error');
-        try { await API.createStartupUser(user, pw || ''); } catch {}
-        try { await API.login(user, pw || ''); } catch (e) { console.warn('Auto-Login im Wizard:', e); }
-    } else if (wizStep === 2) {
-        const name = $('wiz-lib-name').value.trim();
-        const path = $('wiz-lib-path').value.trim();
-        if (name && path) {
-            if (API.isLoggedIn()) {
-                try {
-                    await API.createLibrary(name, $('wiz-lib-type').value, [path]);
-                } catch (e) {
-                    toast(t('wizard.library_create_failed', { message: e.message }), 'error');
-                }
-            }
-        }
     }
     wizSetStep(Math.min(wizStep + 1, 3));
 }
@@ -197,10 +179,82 @@ function wizPrev() {
 }
 
 async function wizComplete() {
-    try { await API.completeStartup(); } catch {}
-    hide('setup-wizard');
-    show('main-navbar');
-    navigate('login');
+    if (wizFinishing) return;
+    wizFinishing = true;
+    const btn = $('wiz-finish-btn');
+    const showFinishError = (message) => {
+        const el = $('wiz-finish-error');
+        el.textContent = message;
+        el.append(document.createElement('br'), t('wizard.retry_hint'));
+        show('wiz-finish-error');
+    };
+    try {
+        btn.disabled = true;
+        hide('wiz-finish-error');
+        if (!wizProgress.configSaved) {
+            try {
+                await API.updateStartupConfig({
+                    PreferredMetadataLanguage: $('wiz-lang').value,
+                    MetadataCountryCode: $('wiz-country').value
+                });
+                wizProgress.configSaved = true;
+            } catch (e) {
+                showFinishError(t('wizard.config_save_failed', { message: e.message }));
+                return;
+            }
+        }
+        if (!wizProgress.userCreated) {
+            const name = $('wiz-username').value.trim();
+            const password = $('wiz-password').value;
+            try {
+                await API.createStartupUser(name, password);
+                wizCredentials = { name, password };
+                wizProgress.userCreated = true;
+                $('wiz-username').disabled = true;
+                $('wiz-password').disabled = true;
+                $('wiz-password2').disabled = true;
+            } catch (e) {
+                showFinishError(t('wizard.user_create_failed', { message: e.message }));
+                return;
+            }
+        }
+        if (!wizProgress.loggedIn) {
+            try {
+                await API.login(wizCredentials.name, wizCredentials.password);
+                wizProgress.loggedIn = true;
+            } catch (e) {
+                showFinishError(t('wizard.login_failed', { name: wizCredentials.name, message: e.message }));
+                return;
+            }
+        }
+        if (!wizProgress.libraryCreated) {
+            const libName = $('wiz-lib-name').value.trim();
+            const libPath = $('wiz-lib-path').value.trim();
+            if (libName && libPath) {
+                try {
+                    await API.createLibrary(libName, $('wiz-lib-type').value, [libPath]);
+                    wizProgress.libraryCreated = true;
+                } catch (e) {
+                    showFinishError(t('wizard.library_create_failed', { message: e.message }));
+                    return;
+                }
+            }
+        }
+        try {
+            await API.completeStartup();
+        } catch (e) {
+            showFinishError(t('wizard.complete_failed', { message: e.message }));
+            return;
+        }
+        hide('setup-wizard');
+        show('main-navbar');
+        updateAuthUI();
+        await loadSidebar();
+        navigate(API.isLoggedIn() ? 'home' : 'login');
+    } finally {
+        wizFinishing = false;
+        btn.disabled = false;
+    }
 }
 
 // --- Navigation & Routing ---

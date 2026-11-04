@@ -137,13 +137,14 @@
                 <p class="text-white/60 text-sm mb-6" data-i18n="wizard.done_intro">Your Rustyfin server is fully configured and ready to use.</p>
                 <div class="bg-black/30 rounded-xl p-4 text-left text-xs space-y-2 border border-white/5">
                     <div class="flex justify-between"><span class="text-white/50" data-i18n="wizard.summary_engine">Server engine:</span> <span class="font-semibold text-[#00a4dc]">Rustyfin Core (Rust Tokio)</span></div>
-                    <div class="flex justify-between"><span class="text-white/50" data-i18n="wizard.summary_admin">Admin account:</span> <span id="wiz-summary-user" class="font-semibold text-white">admin</span></div>
+                    <div class="flex justify-between"><span class="text-white/50" data-i18n="wizard.summary_admin">Admin account:</span> <span id="wiz-summary-user" class="font-semibold text-white"></span></div>
                     <div class="flex justify-between"><span class="text-white/50" data-i18n="wizard.summary_metadata">Metadata:</span> <span id="wiz-summary-lang" class="font-semibold text-white">Deutsch</span></div>
                 </div>
             </div>
+            <div id="wiz-finish-error" class="text-red-400 text-xs mt-2 hidden p-2 rounded bg-red-500/10 border border-red-500/20"></div>
             <div class="flex justify-between mt-6">
                 <button class="jf-btn-ghost" onclick="wizPrev()" data-i18n="wizard.back">← Back</button>
-                <button class="jf-btn-primary" onclick="wizComplete()" data-i18n="wizard.finish">Finish & start</button>
+                <button id="wiz-finish-btn" class="jf-btn-primary" onclick="wizComplete()" data-i18n="wizard.finish">Finish & start</button>
             </div>
         </div>
     </div>

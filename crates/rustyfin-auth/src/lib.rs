@@ -82,6 +82,11 @@ pub async fn authenticate(
         return Err(AuthError::InvalidCredentials);
     }
 
+    // A disabled account gets the same answer as a wrong password, and its last login is not updated.
+    if rustyfin_db::repo_user::is_disabled(pool, user.id).await? {
+        return Err(AuthError::InvalidCredentials);
+    }
+
     rustyfin_db::repo_user::update_last_login(pool, user.id).await?;
 
     let token = create_token(&user, secret)?;

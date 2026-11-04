@@ -222,7 +222,7 @@ systemctl status rustyfin
 
 > **Default**: `http://0.0.0.0:8096` · Data dir: `/var/lib/rustyfin/`  
 > **First run**: Startup wizard guides you through initial setup  
-> **Default login**: `admin` / `admin`
+> **Login**: the administrator account you create in the startup wizard (there is no default account)
 
 #### Build Commands
 

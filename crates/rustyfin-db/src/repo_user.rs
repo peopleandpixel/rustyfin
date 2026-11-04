@@ -50,6 +50,164 @@ pub async fn get_all_users(pool: &SqlitePool) -> Result<Vec<User>, sqlx::Error> 
     Ok(rows.into_iter().map(Into::into).collect())
 }
 
+/// Returns true if a server owner exists.
+pub async fn owner_exists(pool: &SqlitePool) -> Result<bool, sqlx::Error> {
+    let exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM users WHERE is_owner = 1)")
+        .fetch_one(pool)
+        .await?;
+
+    Ok(exists)
+}
+
+/// Returns the server owner, or None if no owner exists yet.
+pub async fn get_owner(pool: &SqlitePool) -> Result<Option<User>, sqlx::Error> {
+    let row = sqlx::query_as::<_, UserRow>("SELECT * FROM users WHERE is_owner = 1")
+        .fetch_optional(pool)
+        .await?;
+
+    Ok(row.map(Into::into))
+}
+
+/// Returns true if the user with this id is the server owner. An unknown id is not an owner.
+pub async fn is_owner(pool: &SqlitePool, id: Uuid) -> Result<bool, sqlx::Error> {
+    let owner: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM users WHERE id = ? AND is_owner = 1)")
+            .bind(id.to_string())
+            .fetch_one(pool)
+            .await?;
+
+    Ok(owner)
+}
+
+/// Returns true if the user with this id is disabled. An unknown id is not disabled.
+pub async fn is_disabled(pool: &SqlitePool, id: Uuid) -> Result<bool, sqlx::Error> {
+    let disabled: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM users WHERE id = ? AND is_disabled = 1)")
+            .bind(id.to_string())
+            .fetch_one(pool)
+            .await?;
+
+    Ok(disabled)
+}
+
+/// Makes the earliest-created enabled administrator the server owner, if no owner exists.
+/// Returns the promoted user, or None if an owner already exists or no enabled admin does.
+/// The check and the update run in one IMMEDIATE transaction, so two callers cannot both promote.
+pub async fn promote_earliest_admin_to_owner(
+    pool: &SqlitePool,
+) -> Result<Option<User>, sqlx::Error> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+
+    let has_owner: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM users WHERE is_owner = 1)")
+            .fetch_one(&mut *tx)
+            .await?;
+    if has_owner {
+        return Ok(None);
+    }
+
+    let candidate = sqlx::query_as::<_, UserRow>(
+        "SELECT * FROM users WHERE is_administrator = 1 AND is_disabled = 0 ORDER BY datetime(created_at), rowid LIMIT 1",
+    )
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(row) = candidate else {
+        return Ok(None);
+    };
+
+    sqlx::query("UPDATE users SET is_owner = 1 WHERE id = ?")
+        .bind(&row.id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+
+    Ok(Some(row.into()))
+}
+
+/// Outcome of `claim_owner`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnerClaim {
+    /// The named user is now the owner. `leftover_disabled` is true if the leftover account was disabled.
+    Claimed { leftover_disabled: bool },
+    /// An owner already existed, or a concurrent claim won. Nothing changed.
+    AlreadyOwned,
+}
+
+/// Makes the user `name` the server owner, creating it if it does not exist. If `leftover` still has
+/// the password hash it had when it was read, it is disabled in the same transaction.
+/// The check and the writes run in one IMMEDIATE transaction, so only one caller can claim ownership.
+pub async fn claim_owner(
+    pool: &SqlitePool,
+    name: &str,
+    password_hash: &str,
+    leftover: Option<&User>,
+) -> Result<OwnerClaim, sqlx::Error> {
+    match claim_owner_in_tx(pool, name, password_hash, leftover).await {
+        Err(sqlx::Error::Database(e)) if e.is_unique_violation() => Ok(OwnerClaim::AlreadyOwned),
+        result => result,
+    }
+}
+
+async fn claim_owner_in_tx(
+    pool: &SqlitePool,
+    name: &str,
+    password_hash: &str,
+    leftover: Option<&User>,
+) -> Result<OwnerClaim, sqlx::Error> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+
+    let has_owner: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM users WHERE is_owner = 1)")
+            .fetch_one(&mut *tx)
+            .await?;
+    if has_owner {
+        return Ok(OwnerClaim::AlreadyOwned);
+    }
+
+    let existing_id: Option<String> = sqlx::query_scalar("SELECT id FROM users WHERE name = ?")
+        .bind(name)
+        .fetch_optional(&mut *tx)
+        .await?;
+    match existing_id {
+        Some(id) => {
+            sqlx::query(
+                "UPDATE users SET password_hash = ?, is_administrator = 1, is_owner = 1, is_disabled = 0 WHERE id = ?",
+            )
+            .bind(password_hash)
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        None => {
+            sqlx::query(
+                "INSERT INTO users (id, name, password_hash, is_administrator, created_at, configuration, is_owner) VALUES (?, ?, ?, 1, ?, ?, 1)",
+            )
+            .bind(Uuid::new_v4().to_string())
+            .bind(name)
+            .bind(password_hash)
+            .bind(Utc::now().to_rfc3339())
+            .bind("{}")
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
+
+    let mut leftover_disabled = false;
+    if let Some(user) = leftover {
+        let result = sqlx::query(
+            "UPDATE users SET is_disabled = 1 WHERE id = ? AND is_owner = 0 AND password_hash = ?",
+        )
+        .bind(user.id.to_string())
+        .bind(&user.password_hash)
+        .execute(&mut *tx)
+        .await?;
+        leftover_disabled = result.rows_affected() == 1;
+    }
+
+    tx.commit().await?;
+    Ok(OwnerClaim::Claimed { leftover_disabled })
+}
+
 pub async fn update_last_login(pool: &SqlitePool, id: Uuid) -> Result<(), sqlx::Error> {
     let now = Utc::now().to_rfc3339();
     sqlx::query("UPDATE users SET last_login_date = ? WHERE id = ?")

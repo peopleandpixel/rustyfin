@@ -111,16 +111,25 @@ async fn main() {
         .await
         .expect("failed to initialize read-only database pool");
 
-    // Create default admin user if no users exist
-    let users = rustyfin_db::repo_user::get_all_users(&pool)
-        .await
-        .expect("failed to query users");
-
-    if users.is_empty() {
-        tracing::info!("no users found, creating default admin user (admin / admin)");
-        rustyfin_auth::create_initial_user(&pool, "admin", "admin")
+    // No user is created at startup. An upgraded server that already finished the setup wizard
+    // gets its earliest administrator promoted to server owner; a fresh one waits for the wizard.
+    if config.is_startup_wizard_completed {
+        let promoted = rustyfin_db::repo_user::promote_earliest_admin_to_owner(&pool)
             .await
-            .expect("failed to create initial user");
+            .expect("failed to promote earliest administrator to server owner");
+        if let Some(user) = promoted {
+            tracing::info!(
+                "promoted earliest administrator '{}' to server owner",
+                user.name
+            );
+        }
+    }
+
+    let owner_exists = rustyfin_db::repo_user::owner_exists(&pool)
+        .await
+        .expect("failed to query server owner");
+    if !owner_exists {
+        tracing::info!("no server owner yet; finish the setup wizard in the web client");
     }
 
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);

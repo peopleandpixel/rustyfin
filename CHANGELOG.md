@@ -12,6 +12,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **Startup wizard metadata settings**: The wizard now saves the chosen metadata language and country. It sent them as `preferred_metadata_language` and `metadata_country_code`, which `POST /Startup/Configuration` ignores because it expects PascalCase fields.
+- **Setup wizard owner account**: The server no longer creates an `admin`/`admin` account at start. The setup wizard creates the first administrator, the server owner, with the typed name and password. Before, the wizard only changed the default admin's password, ignored the typed name and hid sign-in failures. The `/Startup/*` endpoints also stayed anonymous, so anyone could reset the administrator's password. Now:
+  - `POST /Startup/User` works only while no owner exists, and the `/Startup/*` endpoints need an administrator afterwards.
+  - `StartupWizardCompleted` means that an owner exists.
+  - The owner cannot be deleted or demoted.
+  - On upgrade, the earliest administrator of a completed setup becomes the owner.
+  - A leftover `admin` account whose password is still `admin` is disabled once the owner is created under another name.
+  - The wizard shows every failed step and resumes there on retry.
+  - `start.sh smoke` creates a throwaway owner in a temporary data directory.
 
 ## [0.14.0] - 2026-11-03
 

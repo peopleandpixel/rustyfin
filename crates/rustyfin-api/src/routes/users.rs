@@ -131,6 +131,12 @@ async fn delete_user(
         return Err(ApiError::Unauthorized);
     }
 
+    if rustyfin_db::repo_user::is_owner(&state.db, id).await? {
+        return Err(ApiError::Forbidden(
+            "The server owner cannot be deleted.".into(),
+        ));
+    }
+
     if claims.sub == id {
         return Err(ApiError::BadRequest("cannot delete yourself".into()));
     }
@@ -186,6 +192,14 @@ async fn update_policy(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     if !claims.is_admin {
         return Err(ApiError::Unauthorized);
+    }
+
+    if req.is_administrator == Some(false)
+        && rustyfin_db::repo_user::is_owner(&state.db, id).await?
+    {
+        return Err(ApiError::Forbidden(
+            "The server owner must stay an administrator.".into(),
+        ));
     }
 
     if let Some(is_admin) = req.is_administrator {
@@ -440,6 +454,11 @@ async fn delete_user_by_id(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     if !claims.is_admin {
         return Err(ApiError::Unauthorized);
+    }
+    if rustyfin_db::repo_user::is_owner(&state.db, id).await? {
+        return Err(ApiError::Forbidden(
+            "The server owner cannot be deleted.".into(),
+        ));
     }
     rustyfin_db::repo_user::delete_user(&state.db, id)
         .await

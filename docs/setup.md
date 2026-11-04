@@ -46,25 +46,24 @@ Beim ersten Start erstellt Rustyfin automatisch:
 
 1. Das Datenverzeichnis (Standard: `~/.rustyfin/`)
 2. Die SQLite-Datenbank
-3. Einen Standard-Admin-Benutzer
 
-### Standard-Zugangsdaten
+### Administratorkonto
 
-| Feld | Wert |
-|---|---|
-| Benutzername | `admin` |
-| Passwort | `admin` |
-
-> ⚠️ **Ändern Sie das Standard-Passwort sofort nach dem ersten Login!**
+Es wird kein Standardbenutzer angelegt. Das erste Administratorkonto (der Server-Besitzer) erstellen Sie im Setup-Wizard.
 
 ### Setup-Wizard
 
 Rustyfin bietet einen Setup-Wizard für die Ersteinrichtung über die API:
 
-1. **Status prüfen:** `GET /Startup/Configuration`
-2. **Admin-User erstellen:** `POST /Startup/User`
-3. **Konfiguration setzen:** `POST /Startup/Configuration`
-4. **Setup abschließen:** `POST /Startup/Complete`
+1. **Status prüfen:** `GET /System/Info/Public`. `StartupWizardCompleted` ist `false`, solange kein Server-Besitzer existiert.
+2. **Konfiguration setzen:** `POST /Startup/Configuration`
+3. **Server-Besitzer anlegen:** `POST /Startup/User`. Das ist nur einmal möglich.
+4. **Anmelden:** `POST /Users/AuthenticateByName`
+5. **Setup abschließen:** `POST /Startup/Complete`, mit dem Token aus Schritt 4.
+
+Solange kein Server-Besitzer existiert, benötigen die `/Startup/*`-Endpunkte keine Anmeldung; danach können nur Administratoren sie nutzen.
+
+Nach einem Update von einer älteren Version, deren Einrichtung bereits abgeschlossen war, wird der zuerst angelegte Administrator zum Server-Besitzer. Ein verbliebenes Konto `admin` mit dem Passwort `admin` wird deaktiviert, wenn der Server-Besitzer unter einem anderen Namen angelegt wird.
 
 ## Medienbibliothek einrichten
 

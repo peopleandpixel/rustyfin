@@ -62,7 +62,12 @@
         "finish": "Fertigstellen & Starten",
         "username_required": "Benutzername ist erforderlich.",
         "passwords_mismatch": "Passwörter stimmen nicht überein.",
-        "library_create_failed": "Bibliothek konnte nicht erstellt werden: {{message}}"
+        "library_create_failed": "Bibliothek konnte nicht erstellt werden: {{message}}",
+        "config_save_failed": "Die Spracheinstellungen konnten nicht gespeichert werden: {{message}}",
+        "user_create_failed": "Das Administratorkonto konnte nicht erstellt werden: {{message}}",
+        "login_failed": "Die Anmeldung als {{name}} ist fehlgeschlagen: {{message}}",
+        "complete_failed": "Die Einrichtung konnte nicht abgeschlossen werden: {{message}}",
+        "retry_hint": "Behebe das Problem und klicke erneut auf „Fertigstellen & Starten“. Bereits erledigte Schritte werden nicht wiederholt."
     },
     "settings": {
         "display_language_hint": "Gilt für diesen Browser.",
