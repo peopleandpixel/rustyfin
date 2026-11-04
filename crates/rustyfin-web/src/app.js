@@ -78,10 +78,12 @@ function escapeHtml(str) {
 function formatRuntime(ticks) {
     if (!ticks) return '';
     const totalMinutes = Math.round(ticks / 600000000);
-    if (totalMinutes < 60) return `${totalMinutes} Min.`;
+    if (totalMinutes < 60) return t('common.minutes_short', { count: totalMinutes });
     const hours = Math.floor(totalMinutes / 60);
     const mins = totalMinutes % 60;
-    return `${hours} Std. ${mins > 0 ? mins + ' Min.' : ''}`;
+    const hoursText = t('common.hours_short', { count: hours });
+    if (mins === 0) return hoursText;
+    return t('common.hours_minutes_short', { hours: hoursText, minutes: t('common.minutes_short', { count: mins }) });
 }
 
 function formatDurationSeconds(secs) {
@@ -103,12 +105,32 @@ async function checkSetupWizard() {
             if (badge) badge.textContent = serverVersion;
         }
         if (!done) {
+            initWizardLanguage();
             show('setup-wizard');
             hide('main-navbar');
             return true;
         }
     } catch {}
     return false;
+}
+
+// The display language picker of the first step; the metadata language follows it
+function initWizardLanguage() {
+    const select = $('wiz-ui-lang');
+    select.innerHTML = uiLanguageOptions().map(o => `<option value="${o.value}">${escapeHtml(o.label)}</option>`).join('');
+    select.value = getUiLanguage();
+    matchMetadataLanguage();
+}
+
+async function wizSetUiLanguage(lng) {
+    await setUiLanguage(lng);
+    matchMetadataLanguage();
+}
+
+function matchMetadataLanguage() {
+    const metadataSelect = $('wiz-lang');
+    const lng = getUiLanguage().split('-')[0];
+    if ([...metadataSelect.options].some(o => o.value === lng)) metadataSelect.value = lng;
 }
 
 function wizSetStep(s) {
@@ -142,12 +164,12 @@ async function wizNext() {
         const pw = $('wiz-password').value, pw2 = $('wiz-password2').value;
         const user = $('wiz-username').value.trim();
         if (!user) {
-            $('wiz-user-error').textContent = 'Benutzername ist erforderlich.';
+            $('wiz-user-error').textContent = t('wizard.username_required');
             show('wiz-user-error');
             return;
         }
         if (pw && pw !== pw2) {
-            $('wiz-user-error').textContent = 'Passwörter stimmen nicht überein.';
+            $('wiz-user-error').textContent = t('wizard.passwords_mismatch');
             show('wiz-user-error');
             return;
         }
@@ -162,7 +184,7 @@ async function wizNext() {
                 try {
                     await API.createLibrary(name, $('wiz-lib-type').value, [path]);
                 } catch (e) {
-                    toast('Bibliothek konnte nicht erstellt werden: ' + e.message, 'error');
+                    toast(t('wizard.library_create_failed', { message: e.message }), 'error');
                 }
             }
         }
@@ -241,7 +263,9 @@ function toggleSidebar() {
 
 // --- Media Card Renderer (12.x Style) ---
 function itemCard(item, options = {}) {
-    const name = item.Name || item.name || 'Unbekannt';
+    // rawName goes into the onclick code, which translates the fallback itself
+    const rawName = item.Name || item.name || '';
+    const name = rawName || t('common.unknown');
     const year = item.ProductionYear || item.production_year || '';
     const type = item.Type || item.type || '';
     const id = item.Id || item.id;
@@ -297,7 +321,7 @@ function itemCard(item, options = {}) {
 
             <!-- Play Button Hover Overlay -->
             ${canPlay ? `
-            <div class="jf-play-overlay" onclick="event.stopPropagation();playItem('${id}','${streamType}','${escapeHtml(name)}')">
+            <div class="jf-play-overlay" onclick="event.stopPropagation();playItem('${id}','${streamType}','${escapeHtml(rawName)}' || t('common.unknown'))">
                 <div class="jf-play-btn-circle">
                     <svg class="w-7 h-7 text-white ml-1" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
                 </div>
@@ -341,7 +365,7 @@ function sectionRow(title, items, moreAction = null, options = {}) {
             <h2 class="text-lg lg:text-xl font-bold tracking-tight text-white">${escapeHtml(title)}</h2>
             <span class="text-xs text-white/30 font-medium ml-1">(${items.length})</span>
         </div>
-        ${moreAction ? `<button class="text-xs font-semibold text-[#00a4dc] hover:text-[#38bdf8] flex items-center gap-1 transition" onclick="${moreAction}">Alle ansehen →</button>` : ''}
+        ${moreAction ? `<button class="text-xs font-semibold text-[#00a4dc] hover:text-[#38bdf8] flex items-center gap-1 transition" onclick="${moreAction}">${t('common.view_all')}</button>` : ''}
     `;
     row.appendChild(header.firstElementChild);
     if (moreAction) row.appendChild(header.lastElementChild);
@@ -379,28 +403,28 @@ async function renderHome() {
                 </div>
                 <h1 class="text-4xl sm:text-5xl font-black mb-3 tracking-tight text-white">${escapeHtml(sn)}</h1>
                 <p class="text-white/60 text-base max-w-lg mb-8 leading-relaxed">
-                    Ultraschneller, ressourcenschonender Medienserver in Rust mit nativer Jellyfin-Kompatibilität.
+                    ${t('home.tagline')}
                 </p>
                 <div class="grid grid-cols-3 gap-6 mb-10 w-full max-w-md">
                     <div class="p-4 rounded-xl bg-white/5 border border-white/10 text-center">
-                        <p class="text-xl font-bold text-emerald-400">Online</p>
-                        <p class="text-[11px] text-white/40 uppercase tracking-wider mt-1">Status</p>
+                        <p class="text-xl font-bold text-emerald-400">${t('home.online')}</p>
+                        <p class="text-[11px] text-white/40 uppercase tracking-wider mt-1">${t('common.status')}</p>
                     </div>
                     <div class="p-4 rounded-xl bg-white/5 border border-white/10 text-center">
                         <p class="text-xl font-bold text-[#00a4dc]">&lt; 20 MB</p>
-                        <p class="text-[11px] text-white/40 uppercase tracking-wider mt-1">RAM Idle</p>
+                        <p class="text-[11px] text-white/40 uppercase tracking-wider mt-1">${t('home.ram_idle')}</p>
                     </div>
                     <div class="p-4 rounded-xl bg-white/5 border border-white/10 text-center">
                         <p class="text-xl font-bold text-amber-400">v${ver}</p>
-                        <p class="text-[11px] text-white/40 uppercase tracking-wider mt-1">Release</p>
+                        <p class="text-[11px] text-white/40 uppercase tracking-wider mt-1">${t('home.release')}</p>
                     </div>
                 </div>
                 <button class="jf-btn-primary !px-8 !py-3.5 text-base shadow-xl" onclick="navigate('login')">
-                    Jetzt Anmelden →
+                    ${t('home.sign_in_now')}
                 </button>
             </div>`;
         } catch {
-            page.innerHTML = '<div class="p-10 text-center text-red-400 jf-page">Server nicht erreichbar. Bitte Netzwerkverbindung prüfen.</div>';
+            page.innerHTML = `<div class="p-10 text-center text-red-400 jf-page">${t('home.server_unreachable')}</div>`;
         }
         return;
     }
@@ -441,7 +465,7 @@ async function renderHome() {
                 <div class="jf-spotlight-gradient"></div>
                 <div class="relative z-10 p-6 sm:p-10 lg:p-14 flex flex-col justify-end min-h-[420px] max-w-3xl">
                     <div class="flex items-center gap-2 mb-3">
-                        <span class="jf-badge jf-badge-accent uppercase tracking-wider text-[11px]">Highlights</span>
+                        <span class="jf-badge jf-badge-accent uppercase tracking-wider text-[11px]">${t('home.highlights')}</span>
                         <span class="jf-badge jf-badge-primary uppercase tracking-wider text-[11px]">${spType}</span>
                         ${spYear ? `<span class="jf-badge text-[11px]">${spYear}</span>` : ''}
                         ${spRating ? `<span class="jf-badge jf-badge-rating text-[11px]">★ ${spRating.toFixed(1)}</span>` : ''}
@@ -452,10 +476,10 @@ async function renderHome() {
                         ${canPlay ? `
                         <button class="jf-btn-primary !py-2.5 !px-6 text-sm" onclick="playItem('${spId}','${streamType}','${escapeHtml(spName)}')">
                             <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
-                            Abspielen
+                            ${t('common.play')}
                         </button>` : ''}
                         <button class="jf-btn-ghost !py-2.5 !px-5 text-sm" onclick="navigate('detail','${spId}')">
-                            Details & Info
+                            ${t('home.more_info')}
                         </button>
                     </div>
                 </div>
@@ -468,7 +492,7 @@ async function renderHome() {
             <div class="mb-10">
                 <div class="flex items-center gap-2 mb-4">
                     <span class="w-2.5 h-2.5 rounded-full bg-[#00a4dc]"></span>
-                    <h2 class="text-lg lg:text-xl font-bold tracking-tight text-white">Meine Bibliotheken</h2>
+                    <h2 class="text-lg lg:text-xl font-bold tracking-tight text-white">${t('home.my_media')}</h2>
                 </div>
                 <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-4">
                     ${libraries.map(lib => {
@@ -488,8 +512,8 @@ async function renderHome() {
                             <div class="flex items-center justify-between">
                                 <span class="text-3xl">${icons[libType] || '📁'}</span>
                                 <div class="flex items-center gap-1">
-                                    ${scanStatuses[libId] ? `<span class="w-2 h-2 rounded-full bg-amber-400 animate-pulse" title="Scan läuft"></span>` : ''}
-                                    <button type="button" class="w-6 h-6 rounded flex items-center justify-center text-white/40 hover:text-white hover:bg-white/10 transition" onclick="event.stopPropagation();API.scanLibrary('${libId}').then(()=>toast('Scan für ${escapeHtml(libName)} gestartet'))" title="Bibliothek scannen">
+                                    ${scanStatuses[libId] ? `<span class="w-2 h-2 rounded-full bg-amber-400 animate-pulse" title="${escapeHtml(t('library.scan_running'))}"></span>` : ''}
+                                    <button type="button" class="w-6 h-6 rounded flex items-center justify-center text-white/40 hover:text-white hover:bg-white/10 transition" onclick="event.stopPropagation();API.scanLibrary('${libId}').then(()=>toast(t('library.scan_started_for', { name: '${escapeHtml(libName)}' })))" title="${escapeHtml(t('library.scan_library'))}">
                                         <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
                                     </button>
                                 </div>
@@ -504,20 +528,20 @@ async function renderHome() {
         }
 
         // 3. Sections: Continue Watching & Next Up & Latest
-        c += sectionRow('Weiterschauen', resume, null, { backdrop: true });
-        c += sectionRow('Als Nächstes (Serien)', nextUp, null, { backdrop: true });
-        c += sectionRow('Zuletzt hinzugefügt', latest);
+        c += sectionRow(t('home.continue_watching'), resume, null, { backdrop: true });
+        c += sectionRow(t('home.next_up'), nextUp, null, { backdrop: true });
+        c += sectionRow(t('home.recently_added'), latest);
 
         // Empty Library Welcome Banner
         if (!resume.length && !nextUp.length && !latest.length) {
             c += `
             <div class="text-center py-20 px-4 rounded-2xl bg-white/5 border border-white/10 my-8">
                 <img src="/web/assets/logo.png" class="w-20 h-20 mx-auto rounded-2xl opacity-40 mb-4 p-1 bg-white/5">
-                <h3 class="text-xl font-bold text-white mb-2">Deine Bibliothek ist noch leer</h3>
-                <p class="text-white/50 text-sm max-w-md mx-auto mb-6">Füge deine ersten Medienordner hinzu, um Filme, Serien und Musik auf allen Geräten zu streamen.</p>
+                <h3 class="text-xl font-bold text-white mb-2">${t('home.empty_title')}</h3>
+                <p class="text-white/50 text-sm max-w-md mx-auto mb-6">${t('home.empty_hint')}</p>
                 ${API.isAdmin ? `
                 <button class="jf-btn-primary" onclick="openAddLibrary()">
-                    ＋ Erste Bibliothek anlegen
+                    ${t('home.create_first_library')}
                 </button>` : ''}
             </div>`;
         }
@@ -525,7 +549,7 @@ async function renderHome() {
         c += '</div>';
         page.innerHTML = c;
     } catch (e) {
-        page.innerHTML = `<div class="p-6 rounded-xl bg-red-500/10 border border-red-500/20 text-red-400 jf-page">Fehler beim Laden der Startseite: ${escapeHtml(e.message)}</div>`;
+        page.innerHTML = `<div class="p-6 rounded-xl bg-red-500/10 border border-red-500/20 text-red-400 jf-page">${t('home.load_failed', { message: escapeHtml(e.message) })}</div>`;
     }
 }
 
@@ -539,7 +563,7 @@ async function renderFavorites() {
     <div class="jf-page">
         <div class="flex items-center gap-3 mb-6">
             <span class="w-3 h-3 rounded-full bg-rose-500 shadow-md"></span>
-            <h1 class="text-2xl lg:text-3xl font-extrabold text-white tracking-tight">Meine Favoriten</h1>
+            <h1 class="text-2xl lg:text-3xl font-extrabold text-white tracking-tight">${t('favorites.title')}</h1>
         </div>
         <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-7 gap-4">
             ${Array.from({length: 12}, () => `
@@ -564,7 +588,7 @@ async function renderFavorites() {
             <div class="jf-page">
                 <div class="flex items-center gap-3 mb-6">
                     <span class="w-3 h-3 rounded-full bg-rose-500 shadow-md"></span>
-                    <h1 class="text-2xl lg:text-3xl font-extrabold text-white tracking-tight">Meine Favoriten</h1>
+                    <h1 class="text-2xl lg:text-3xl font-extrabold text-white tracking-tight">${t('favorites.title')}</h1>
                     <span class="text-xs text-white/40">(${total})</span>
                 </div>
                 <div id="fav-grid-container"></div>
@@ -584,13 +608,13 @@ async function renderFavorites() {
             <div class="jf-page">
                 <div class="flex items-center gap-3 mb-6">
                     <span class="w-3 h-3 rounded-full bg-rose-500 shadow-md"></span>
-                    <h1 class="text-2xl lg:text-3xl font-extrabold text-white tracking-tight">Meine Favoriten</h1>
+                    <h1 class="text-2xl lg:text-3xl font-extrabold text-white tracking-tight">${t('favorites.title')}</h1>
                     <span class="text-xs text-white/40">(${total})</span>
                 </div>
                 <div class="text-center py-24 text-white/40">
                     <p class="text-4xl mb-3">♡</p>
-                    <p class="text-base font-semibold">Noch keine Favoriten markiert</p>
-                    <p class="text-xs text-white/30 mt-1">Klicke auf das Herz-Symbol bei einem Titel, um ihn hier zu speichern.</p>
+                    <p class="text-base font-semibold">${t('favorites.empty')}</p>
+                    <p class="text-xs text-white/30 mt-1">${t('favorites.empty_hint')}</p>
                 </div>
             </div>`;
         }
@@ -625,7 +649,7 @@ async function loadMoreFavoritesInfinite(initialTotal) {
             if (sentinelContainer) sentinelContainer.remove();
         }
     } catch (e) {
-        toast('Fehler: ' + e.message, 'error');
+        toast(t('common.error_message', { message: e.message }), 'error');
     }
 }
 
@@ -859,7 +883,7 @@ async function renderLibrary(libId) {
     
     // Show skeleton grid immediately for instant visual feedback
     const lib = libraries.find(l => (l.id || l.Id) === libId);
-    const libName = lib ? (lib.name || lib.Name) : 'Bibliothek';
+    const libName = lib ? (lib.name || lib.Name) : t('common.library');
     const contentType = lib?.content_type || lib?.Content_type || lib?.ContentType || '';
     const libIcon = contentType === 'Movies' ? '🎬' : contentType === 'TvShows' ? '📺' : contentType === 'Music' ? '🎵' : '📁';
     
@@ -871,7 +895,7 @@ async function renderLibrary(libId) {
                     <span class="text-2xl">${libIcon}</span>
                     <h1 class="text-2xl lg:text-3xl font-extrabold text-white tracking-tight">${escapeHtml(libName)}</h1>
                 </div>
-                <p class="text-xs text-white/40 mt-1">Wird geladen...</p>
+                <p class="text-xs text-white/40 mt-1">${t('common.loading')}</p>
             </div>
         </div>
         <div class="jf-alpha-bar mb-6 opacity-50">
@@ -932,36 +956,36 @@ async function renderLibrary(libId) {
                         <span class="text-2xl">${lib?.content_type === 'Movies' ? '🎬' : lib?.content_type === 'TvShows' ? '📺' : lib?.content_type === 'Music' ? '🎵' : '📁'}</span>
                         <h1 class="text-2xl lg:text-3xl font-extrabold text-white tracking-tight">${escapeHtml(libName)}</h1>
                     </div>
-                    <p id="lib-count-label" class="text-xs text-white/40 mt-1">${total} Medienobjekte erfasst</p>
+                    <p id="lib-count-label" class="text-xs text-white/40 mt-1">${t('library.item_count', { count: total })}</p>
                 </div>
 
                 <div class="flex flex-wrap items-center gap-2">
                     <!-- Sort selector -->
                     <select id="lib-sort" class="jf-input !py-1.5 text-xs" onchange="filterLibrary('${libId}')">
-                        <option value="SortName:Ascending">Name (A-Z)</option>
-                        <option value="SortName:Descending">Name (Z-A)</option>
-                        <option value="PremiereDate:Descending">Erscheinungsdatum</option>
-                        <option value="DateCreated:Descending">Zuletzt hinzugefügt</option>
-                        <option value="CommunityRating:Descending">Bewertung (★)</option>
+                        <option value="SortName:Ascending">${t('library.sort_name_asc')}</option>
+                        <option value="SortName:Descending">${t('library.sort_name_desc')}</option>
+                        <option value="PremiereDate:Descending">${t('library.sort_release_date')}</option>
+                        <option value="DateCreated:Descending">${t('library.sort_date_added')}</option>
+                        <option value="CommunityRating:Descending">${t('library.sort_rating')}</option>
                     </select>
 
                     <!-- Genre filter -->
                     ${genres.length > 0 ? `
                     <select id="lib-genre" class="jf-input !py-1.5 text-xs max-w-[140px]" onchange="filterLibrary('${libId}')">
-                        <option value="">Alle Genres</option>
+                        <option value="">${t('library.all_genres')}</option>
                         ${genres.map(g => `<option value="${escapeHtml(g)}">${escapeHtml(g)}</option>`).join('')}
                     </select>` : ''}
 
                     <!-- Scan trigger -->
-                    <button class="jf-btn-ghost !py-1.5 !px-3 text-xs" onclick="API.scanLibrary('${libId}').then(()=>{toast('Medienscan für ${escapeHtml(libName)} gestartet');scanStatuses['${libId}']=true;})">
-                        🔄 Scannen
+                    <button class="jf-btn-ghost !py-1.5 !px-3 text-xs" onclick="API.scanLibrary('${libId}').then(()=>{toast(t('library.media_scan_started_for', { name: '${escapeHtml(libName)}' }));scanStatuses['${libId}']=true;})">
+                        ${t('library.scan_button')}
                     </button>
                 </div>
             </div>
 
             <!-- Alphabet Quick Jump Bar -->
             <div class="jf-alpha-bar mb-6">
-                <button class="jf-alpha-btn active" data-letter="" onclick="jumpToLetter('${libId}', '')">Alle</button>
+                <button class="jf-alpha-btn active" data-letter="" onclick="jumpToLetter('${libId}', '')">${t('common.all')}</button>
                 ${'#ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('').map(l => `
                     <button class="jf-alpha-btn" data-letter="${l}" onclick="jumpToLetter('${libId}', '${l}')">${l}</button>
                 `).join('')}
@@ -1033,7 +1057,7 @@ async function loadMoreLibraryItemsInfinite(libId, initialTotal) {
             if (sentinelContainer) sentinelContainer.remove();
         }
     } catch (e) {
-        toast('Fehler beim Laden: ' + e.message, 'error');
+        toast(t('library.load_failed', { message: e.message }), 'error');
     }
 }
 
@@ -1083,7 +1107,7 @@ async function filterLibrary(libId) {
         const total = data.TotalRecordCount || data.total_record_count || items.length;
         const hasMore = items.length >= LIBRARY_PAGE_SIZE;
         const countLabel = $('lib-count-label');
-        if (countLabel) countLabel.textContent = `${total} Medienobjekte erfasst`;
+        if (countLabel) countLabel.textContent = t('library.item_count', { count: total });
 
         if (items.length > 0) {
             // Initialize virtual grid for filtered results
@@ -1106,10 +1130,10 @@ async function filterLibrary(libId) {
                 setupInfiniteScroll(() => loadMoreFilteredLibraryItemsInfinite(libId, total));
             }
         } else {
-            if (container) container.innerHTML = '<div class="text-center py-20 text-white/40">Keine Einträge für diese Filterkombination.</div>';
+            if (container) container.innerHTML = `<div class="text-center py-20 text-white/40">${t('library.no_filter_results')}</div>`;
         }
     } catch (e) {
-        toast('Filterfehler: ' + e.message, 'error');
+        toast(t('library.filter_failed', { message: e.message }), 'error');
     }
 }
 
@@ -1155,7 +1179,7 @@ async function loadMoreFilteredLibraryItemsInfinite(libId, initialTotal) {
             if (sentinelContainer) sentinelContainer.remove();
         }
     } catch (e) {
-        toast('Fehler: ' + e.message, 'error');
+        toast(t('common.error_message', { message: e.message }), 'error');
     }
 }
 
@@ -1233,7 +1257,7 @@ async function renderDetail(itemId) {
                 // Build seasons grid using DocumentFragment
                 const seasonsDiv = document.createElement('div');
                 seasonsDiv.className = 'mb-10';
-                seasonsDiv.innerHTML = `<h2 class="text-xl font-bold mb-4 text-white">Staffeln (${children.length})</h2>`;
+                seasonsDiv.innerHTML = `<h2 class="text-xl font-bold mb-4 text-white">${t('detail.seasons_count', { count: children.length })}</h2>`;
                 const grid = document.createElement('div');
                 grid.className = 'grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-4';
                 const fragment = document.createDocumentFragment();
@@ -1247,11 +1271,13 @@ async function renderDetail(itemId) {
             } else if (type === 'Season') {
                 seasonsOrEpisodesHtml = `
                 <div class="mb-10">
-                    <h2 class="text-xl font-bold mb-4 text-white">Episoden (${children.length})</h2>
+                    <h2 class="text-xl font-bold mb-4 text-white">${t('detail.episodes_count', { count: children.length })}</h2>
                     <div class="space-y-3">
                         ${children.map(ep => {
                             const epId = ep.Id || ep.id;
-                            const epName = ep.Name || ep.name || 'Episode';
+                            // epRawName goes into the onclick code, which translates the fallback itself
+                            const epRawName = ep.Name || ep.name || '';
+                            const epName = epRawName || t('detail.episode');
                             const epIndex = ep.IndexNumber || ep.index_number || '';
                             const epDesc = ep.Overview || ep.overview || '';
                             const epDur = formatRuntime(ep.RunTimeTicks || ep.run_time_ticks);
@@ -1259,7 +1285,7 @@ async function renderDetail(itemId) {
                             const epThumb = API.imageUrl(epId, 'Primary', { maxWidth: 400 });
 
                             return `
-                            <div class="jf-episode-card group" onclick="playItem('${epId}','Videos','${escapeHtml(epName)}')">
+                            <div class="jf-episode-card group" onclick="playItem('${epId}','Videos','${escapeHtml(epRawName)}' || t('detail.episode'))">
                                 <div class="relative w-full sm:w-48 h-28 rounded-lg overflow-hidden bg-white/5 flex-shrink-0">
                                     <img src="${epThumb}" alt="${escapeHtml(epName)}" class="w-full h-full object-cover">
                                     <div class="absolute inset-0 bg-black/40 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
@@ -1271,18 +1297,18 @@ async function renderDetail(itemId) {
                                 </div>
                                 <div class="flex-1 min-w-0">
                                     <div class="flex items-center gap-2 mb-1">
-                                        ${epIndex !== '' ? `<span class="text-xs font-bold text-[#00a4dc]">E${epIndex}</span>` : ''}
+                                        ${epIndex !== '' ? `<span class="text-xs font-bold text-[#00a4dc]">${t('detail.episode_number', { number: epIndex })}</span>` : ''}
                                         <h3 class="text-sm font-bold text-white truncate group-hover:text-[#38bdf8] transition-colors">${escapeHtml(epName)}</h3>
                                         ${epDur ? `<span class="text-[11px] text-white/40 ml-auto flex-shrink-0">${epDur}</span>` : ''}
                                     </div>
-                                    <p class="text-xs text-white/60 line-clamp-2 leading-relaxed">${escapeHtml(epDesc) || 'Keine Beschreibung vorhanden.'}</p>
+                                    <p class="text-xs text-white/60 line-clamp-2 leading-relaxed">${escapeHtml(epDesc) || t('detail.no_overview')}</p>
                                 </div>
                             </div>`;
                         }).join('')}
                     </div>
                 </div>`;
             } else {
-                seasonsOrEpisodesHtml = sectionRow('Titel', children);
+                seasonsOrEpisodesHtml = sectionRow(t('detail.titles'), children);
             }
         }
 
@@ -1290,7 +1316,7 @@ async function renderDetail(itemId) {
         let similarHtml = '';
         const similar = similarData.Items || similarData.items || [];
         if (similar.length > 0) {
-            similarHtml = sectionRow('Ähnliche Empfehlungen', similar.slice(0, 7));
+            similarHtml = sectionRow(t('detail.similar'), similar.slice(0, 7));
         }
 
         // Cast & Crew rail
@@ -1298,12 +1324,12 @@ async function renderDetail(itemId) {
         if (people.length > 0) {
             castHtml = `
             <div class="mb-10">
-                <h2 class="text-xl font-bold mb-4 text-white">Besetzung & Mitwirkende</h2>
+                <h2 class="text-xl font-bold mb-4 text-white">${t('detail.cast_crew')}</h2>
                 <div class="jf-scroll-row pb-2">
                     ${people.slice(0, 15).map(p => {
                         const pId = p.Id || p.id;
                         const pName = p.Name || p.name || '';
-                        const pRole = p.Role || p.role || p.Type || p.type || 'Schauspieler';
+                        const pRole = p.Role || p.role || p.Type || p.type || t('detail.actor');
                         const pImg = pId ? API.imageUrl(pId, 'Primary', { maxWidth: 200 }) : '';
                         return `
                         <div class="w-28 text-center flex-shrink-0 cursor-pointer group" onclick="${pId ? `navigate('person','${pId}')` : ''}">
@@ -1354,20 +1380,20 @@ async function renderDetail(itemId) {
                             ${canPlay ? `
                             <button class="jf-btn-primary !py-3 !px-7 text-sm font-bold shadow-xl" onclick="playItem('${id}','${streamType}','${escapeHtml(name)}')">
                                 <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
-                                Abspielen
+                                ${t('common.play')}
                             </button>` : ''}
 
-                            <button class="jf-btn-ghost !py-3 !px-4 text-sm" title="Favorit umschalten" onclick="toggleFavorite('${id}', ${fav})">
+                            <button class="jf-btn-ghost !py-3 !px-4 text-sm" title="${escapeHtml(t('detail.toggle_favorite'))}" onclick="toggleFavorite('${id}', ${fav})">
                                 <span class="${fav ? 'text-rose-500 font-bold' : 'text-white/60'} text-base">♥</span>
-                                <span class="hidden sm:inline text-xs ml-1">${fav ? 'Favorit' : 'Favorisieren'}</span>
+                                <span class="hidden sm:inline text-xs ml-1">${fav ? t('detail.favorite') : t('detail.add_favorite')}</span>
                             </button>
 
                             <button class="jf-btn-ghost !py-3 !px-4 text-xs font-semibold" onclick="togglePlayed('${id}', ${played})">
-                                ${played ? '<span class="text-emerald-400">✓ Gesehen</span>' : '<span class="text-white/60">○ Ungesehen</span>'}
+                                ${played ? `<span class="text-emerald-400">${t('detail.played')}</span>` : `<span class="text-white/60">${t('detail.unplayed')}</span>`}
                             </button>
 
                             ${API.isAdmin ? `
-                            <button class="jf-btn-ghost !py-3 !px-3 text-xs" title="Metadaten neu laden" onclick="API.refreshItem('${id}').then(()=>toast('Metadaten werden aktualisiert…'))">
+                            <button class="jf-btn-ghost !py-3 !px-3 text-xs" title="${escapeHtml(t('detail.refresh_metadata'))}" onclick="API.refreshItem('${id}').then(()=>toast(t('detail.metadata_refreshing')))">
                                 🔄
                             </button>` : ''}
                         </div>
@@ -1378,7 +1404,7 @@ async function renderDetail(itemId) {
             <!-- Overview section -->
             ${overview ? `
             <div class="mb-10 max-w-4xl">
-                <h2 class="text-lg font-bold mb-2 text-white">Handlung & Übersicht</h2>
+                <h2 class="text-lg font-bold mb-2 text-white">${t('detail.overview')}</h2>
                 <p class="text-white/75 text-sm sm:text-base leading-relaxed">${escapeHtml(overview)}</p>
             </div>` : ''}
 
@@ -1405,7 +1431,7 @@ async function renderPerson(personId) {
             API.getPerson(personId),
             API.getPersonItems(personId).catch(() => ({ Items: [] }))
         ]);
-        const pName = person.Name || person.name || 'Person';
+        const pName = person.Name || person.name || t('person.fallback_name');
         const pOverview = person.Overview || person.overview || '';
         const items = itemsData.Items || itemsData.items || [];
         const pImg = API.imageUrl(personId, 'Primary', { maxWidth: 400 });
@@ -1423,9 +1449,9 @@ async function renderPerson(personId) {
             </div>
             ${items.length > 0 ? `
             <div>
-                <h2 class="text-xl font-bold text-white mb-4">Bekannt für (${items.length})</h2>
+                <h2 class="text-xl font-bold text-white mb-4">${t('person.known_for', { count: items.length })}</h2>
                 <div id="person-known-grid" class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-7 gap-4"></div>
-            </div>` : '<p class="text-white/40">Keine verknüpften Medien gefunden.</p>'}
+            </div>` : `<p class="text-white/40">${t('person.no_items')}</p>`}
         </div>`;
         // Populate KnownFor grid using DocumentFragment
         if (items.length > 0) {
@@ -1456,7 +1482,7 @@ async function renderSearch(term) {
         const data = await API.search(term, 50);
         const hints = data.SearchHints || data.search_hints || [];
         if (!hints.length) {
-            page.innerHTML = `<div class="text-center py-24 text-white/40 jf-page"><p class="text-lg">Keine Treffer für „${escapeHtml(term)}"</p></div>`;
+            page.innerHTML = `<div class="text-center py-24 text-white/40 jf-page"><p class="text-lg">${t('search.no_results', { term: escapeHtml(term) })}</p></div>`;
             return;
         }
         const items = hints.map(h => ({
@@ -1468,7 +1494,7 @@ async function renderSearch(term) {
 
         page.innerHTML = `
         <div class="jf-page">
-            <h1 class="text-2xl font-bold mb-6 text-white">Suchergebnisse für „${escapeHtml(term)}" (${items.length})</h1>
+            <h1 class="text-2xl font-bold mb-6 text-white">${t('search.results_for', { term: escapeHtml(term), count: items.length })}</h1>
             <div id="search-grid" class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-7 gap-4"></div>
         </div>`;
         // Populate search grid using DocumentFragment
@@ -1515,8 +1541,8 @@ async function playItem(itemId, streamType = 'Videos', title = '') {
         hlsInstance = null;
     }
 
-    $('player-title').textContent = title || 'Wiedergabe';
-    $('player-subtitle').textContent = 'Lade...';
+    $('player-title').textContent = title || t('player.playback');
+    $('player-subtitle').textContent = t('player.loading');
 
     // Show modal immediately while loading
     if (typeof modal.showModal === 'function') modal.showModal();
@@ -1537,36 +1563,36 @@ async function playItem(itemId, streamType = 'Videos', title = '') {
                 // which may be stale from the database
                 let method;
                 if (isHls) {
-                    method = 'HLS Transcode';
+                    method = t('player.hls_transcode');
                 } else if (data.url.includes('/stream')) {
                     // Check if it's a static direct play or direct stream
-                    method = data.url.includes('Static=true') ? 'Direct Play' : 'Direct Stream';
+                    method = data.url.includes('Static=true') ? t('player.direct_play') : t('player.direct_stream');
                 } else {
-                    method = 'Stream';
+                    method = t('player.stream');
                 }
                 $('player-subtitle').textContent = method;
             } else {
                 // Fallback: direct stream
                 url = API.streamUrl(itemId, streamType);
-                $('player-subtitle').textContent = 'Video Stream (Fallback)';
+                $('player-subtitle').textContent = t('player.video_stream_fallback');
             }
         } catch (e) {
             console.warn('Universal endpoint failed, using direct stream:', e);
             url = API.streamUrl(itemId, streamType);
-            $('player-subtitle').textContent = 'Video Stream (Fallback)';
+            $('player-subtitle').textContent = t('player.video_stream_fallback');
         }
     } else if (streamType === 'Audio') {
         url = API.streamUrl(itemId, streamType);
-        $('player-subtitle').textContent = 'Audio Stream';
+        $('player-subtitle').textContent = t('player.audio_stream');
     } else {
         url = API.streamUrl(itemId, streamType);
-        $('player-subtitle').textContent = 'Stream';
+        $('player-subtitle').textContent = t('player.stream');
     }
 
     video.onerror = () => {
         console.error('Video playback error:', video.error);
-        const errMsg = video.error ? video.error.message : 'Unbekannter Fehler';
-        $('player-subtitle').textContent = 'Fehler: ' + errMsg;
+        const errMsg = video.error ? video.error.message : t('common.unknown_error');
+        $('player-subtitle').textContent = t('common.error_message', { message: errMsg });
     };
 
     // Handle HLS streams with hls.js
@@ -1583,7 +1609,7 @@ async function playItem(itemId, streamType = 'Videos', title = '') {
         hlsInstance.on(Hls.Events.ERROR, (event, data) => {
             console.error('HLS error:', data);
             if (data.fatal) {
-                $('player-subtitle').textContent = 'HLS Stream Fehler';
+                $('player-subtitle').textContent = t('player.hls_error');
                 if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
                     hlsInstance.startLoad();
                 } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
@@ -1774,7 +1800,7 @@ async function toggleFavorite(id, current) {
     try {
         if (current) await API.unsetFavorite(id);
         else await API.setFavorite(id);
-        toast(current ? 'Favorit entfernt' : 'Zu Favoriten hinzugefügt');
+        toast(current ? t('detail.favorite_removed') : t('detail.favorite_added'));
         if (currentDetailId === id) renderDetail(id);
     } catch (e) {
         toast(e.message, 'error');
@@ -1785,7 +1811,7 @@ async function togglePlayed(id, current) {
     try {
         if (current) await API.markUnplayed(id);
         else await API.markPlayed(id);
-        toast(current ? 'Als ungesehen markiert' : 'Als gesehen markiert');
+        toast(current ? t('detail.marked_unplayed') : t('detail.marked_played'));
         if (currentDetailId === id) renderDetail(id);
     } catch (e) {
         toast(e.message, 'error');
@@ -1799,20 +1825,20 @@ function renderLogin() {
         <div class="w-full max-w-sm p-8 rounded-2xl bg-[#131822] border border-white/10 shadow-2xl">
             <div class="text-center mb-8">
                 <img src="/web/assets/logo.png" alt="Rustyfin" class="w-20 h-20 mx-auto rounded-2xl shadow-xl mb-3 p-1 bg-white/5 border border-white/10">
-                <h2 class="text-2xl font-black text-white tracking-tight">Anmelden</h2>
-                <p class="text-white/40 text-xs mt-1">Verbinde dich mit deinem Medienserver</p>
+                <h2 class="text-2xl font-black text-white tracking-tight">${t('nav.sign_in')}</h2>
+                <p class="text-white/40 text-xs mt-1">${t('login.subtitle')}</p>
             </div>
             <form id="login-form" onsubmit="handleLogin(event)" class="space-y-4">
                 <div>
-                    <label class="block text-xs font-semibold text-white/70 mb-1.5">Benutzername</label>
-                    <input type="text" id="login-user" class="jf-input w-full" placeholder="Benutzername" required autofocus>
+                    <label class="block text-xs font-semibold text-white/70 mb-1.5">${t('common.username')}</label>
+                    <input type="text" id="login-user" class="jf-input w-full" placeholder="${escapeHtml(t('common.username'))}" required autofocus>
                 </div>
                 <div>
-                    <label class="block text-xs font-semibold text-white/70 mb-1.5">Passwort</label>
-                    <input type="password" id="login-pass" class="jf-input w-full" placeholder="Passwort">
+                    <label class="block text-xs font-semibold text-white/70 mb-1.5">${t('common.password')}</label>
+                    <input type="password" id="login-pass" class="jf-input w-full" placeholder="${escapeHtml(t('common.password'))}">
                 </div>
                 <button type="submit" class="jf-btn-primary w-full !py-3 font-bold text-sm shadow-lg mt-2">
-                    Einloggen →
+                    ${t('login.submit')}
                 </button>
                 <div id="login-error" class="text-red-400 text-xs text-center hidden p-2 rounded bg-red-500/10 border border-red-500/20"></div>
             </form>
@@ -1827,7 +1853,7 @@ async function handleLogin(e) {
         updateAuthUI();
         await loadSidebar();
         navigate('home');
-        toast(`Willkommen zurück, ${API.userName}!`);
+        toast(t('login.welcome_back', { name: API.userName }));
     } catch (err) {
         $('login-error').textContent = err.message;
         show('login-error');
@@ -1838,7 +1864,7 @@ function doLogout() {
     API.logout();
     updateAuthUI();
     navigate('home');
-    toast('Erfolgreich abgemeldet');
+    toast(t('login.signed_out'));
 }
 
 // --- Quick Connect Modal Trigger ---
@@ -1852,15 +1878,15 @@ function showQuickConnectModal() {
 async function authorizeQuickConnect() {
     const code = $('qc-code-input')?.value.trim();
     if (!code) {
-        toast('Bitte gültigen Code eingeben', 'error');
+        toast(t('quick_connect.enter_valid_code'), 'error');
         return;
     }
     try {
         await API.post('/QuickConnect/Authorize', { Code: code });
-        toast('Gerät erfolgreich autorisiert!');
+        toast(t('quick_connect.authorized'));
         $('qc-modal')?.close();
     } catch (e) {
-        toast('Autorisierung fehlgeschlagen: ' + e.message, 'error');
+        toast(t('quick_connect.authorize_failed', { message: e.message }), 'error');
     }
 }
 
@@ -1884,39 +1910,39 @@ async function renderSettings() {
             <div class="jf-settings-card">
                 <h3 class="text-base font-bold text-white mb-4 flex items-center gap-2">
                     <span class="w-2 h-2 rounded-full bg-[#00a4dc]"></span>
-                    Server-Konfiguration
+                    ${t('settings.server_config')}
                 </h3>
                 <form onsubmit="handleSaveConfig(event)" class="space-y-4">
                     <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
                         <div>
-                            <label class="block text-xs font-semibold text-white/70 mb-1">Servername</label>
+                            <label class="block text-xs font-semibold text-white/70 mb-1">${t('settings.server_name')}</label>
                             <input id="cfg-server-name" class="jf-input w-full" value="${escapeHtml(config.ServerName || config.server_name || 'Rustyfin')}">
                         </div>
                         <div>
-                            <label class="block text-xs font-semibold text-white/70 mb-1">Metadaten-Sprache</label>
+                            <label class="block text-xs font-semibold text-white/70 mb-1">${t('wizard.metadata_language')}</label>
                             <select id="cfg-meta-lang" class="jf-input w-full">
                                 ${['de', 'en', 'fr', 'es', 'it', 'ja', 'zh'].map(l => `<option value="${l}" ${(config.PreferredMetadataLanguage || config.preferred_metadata_language) === l ? 'selected' : ''}>${l.toUpperCase()}</option>`).join('')}
                             </select>
                         </div>
                         <div>
-                            <label class="block text-xs font-semibold text-white/70 mb-1">HTTP Port</label>
+                            <label class="block text-xs font-semibold text-white/70 mb-1">${t('settings.http_port')}</label>
                             <input id="cfg-port" type="number" class="jf-input w-full" value="${config.PublicPort || config.public_port || 8096}">
                         </div>
                         <div>
-                            <label class="block text-xs font-semibold text-white/70 mb-1">TMDb API Key</label>
-                            <input id="cfg-tmdb" type="text" class="jf-input w-full" value="${escapeHtml(config.TmdbApiKey || config.tmdb_api_key || '')}" placeholder="Optional">
+                            <label class="block text-xs font-semibold text-white/70 mb-1">${t('settings.api_key', { service: 'TMDb' })}</label>
+                            <input id="cfg-tmdb" type="text" class="jf-input w-full" value="${escapeHtml(config.TmdbApiKey || config.tmdb_api_key || '')}" placeholder="${escapeHtml(t('common.optional'))}">
                         </div>
                         <div>
-                            <label class="block text-xs font-semibold text-white/70 mb-1">OMDb API Key</label>
-                            <input id="cfg-omdb" type="text" class="jf-input w-full" value="${escapeHtml(config.OmdbApiKey || config.omdb_api_key || '')}" placeholder="Optional">
+                            <label class="block text-xs font-semibold text-white/70 mb-1">${t('settings.api_key', { service: 'OMDb' })}</label>
+                            <input id="cfg-omdb" type="text" class="jf-input w-full" value="${escapeHtml(config.OmdbApiKey || config.omdb_api_key || '')}" placeholder="${escapeHtml(t('common.optional'))}">
                         </div>
                         <div>
-                            <label class="block text-xs font-semibold text-white/70 mb-1">Fanart.tv API Key</label>
-                            <input id="cfg-fanart" type="text" class="jf-input w-full" value="${escapeHtml(config.FanartApiKey || config.fanart_api_key || '')}" placeholder="Optional">
+                            <label class="block text-xs font-semibold text-white/70 mb-1">${t('settings.api_key', { service: 'Fanart.tv' })}</label>
+                            <input id="cfg-fanart" type="text" class="jf-input w-full" value="${escapeHtml(config.FanartApiKey || config.fanart_api_key || '')}" placeholder="${escapeHtml(t('common.optional'))}">
                         </div>
                     </div>
                     <div class="pt-2">
-                        <button type="submit" class="jf-btn-primary text-xs">Konfiguration speichern</button>
+                        <button type="submit" class="jf-btn-primary text-xs">${t('settings.save_config')}</button>
                     </div>
                 </form>
             </div>`;
@@ -1924,7 +1950,7 @@ async function renderSettings() {
 
         page.innerHTML = `
         <div class="max-w-3xl mx-auto jf-page">
-            <h1 class="text-2xl lg:text-3xl font-extrabold text-white mb-6">Benutzereinstellungen</h1>
+            <h1 class="text-2xl lg:text-3xl font-extrabold text-white mb-6">${t('settings.title')}</h1>
 
             <!-- User Profile card -->
             <div class="jf-settings-card flex items-center gap-4">
@@ -1933,24 +1959,36 @@ async function renderSettings() {
                 </div>
                 <div>
                     <h2 class="text-lg font-bold text-white">${escapeHtml(name)}</h2>
-                    <p class="text-xs text-white/40">Benutzer-ID: ${id}</p>
+                    <p class="text-xs text-white/40">${t('settings.user_id', { id })}</p>
                     <span class="inline-block mt-1 text-[10px] font-bold px-2 py-0.5 rounded bg-[#00a4dc]/20 text-[#38bdf8] uppercase">
-                        ${API.isAdmin ? 'Administrator' : 'Standardbenutzer'}
+                        ${API.isAdmin ? t('common.administrator') : t('settings.standard_user')}
                     </span>
                 </div>
+            </div>
+
+            <!-- Display language card -->
+            <div class="jf-settings-card">
+                <h3 class="text-base font-bold text-white mb-4 flex items-center gap-2">
+                    <span class="w-2 h-2 rounded-full bg-emerald-400"></span>
+                    ${t('common.display_language')}
+                </h3>
+                <select id="pref-ui-lang" class="jf-input w-full sm:w-64" onchange="changeUiLanguage(this.value)">
+                    ${uiLanguageOptions().map(o => `<option value="${o.value}" ${o.value === getUiLanguage() ? 'selected' : ''}>${escapeHtml(o.label)}</option>`).join('')}
+                </select>
+                <p class="text-xs text-white/40 mt-2">${t('settings.display_language_hint')}</p>
             </div>
 
             <!-- Change Password card -->
             <div class="jf-settings-card">
                 <h3 class="text-base font-bold text-white mb-4 flex items-center gap-2">
                     <span class="w-2 h-2 rounded-full bg-amber-400"></span>
-                    Passwort ändern
+                    ${t('settings.change_password')}
                 </h3>
                 <form onsubmit="handleChangePassword(event, '${id}')" class="space-y-3">
-                    <input type="password" id="pw-current" class="jf-input w-full" placeholder="Aktuelles Passwort" required>
-                    <input type="password" id="pw-new" class="jf-input w-full" placeholder="Neues Passwort" required>
-                    <input type="password" id="pw-confirm" class="jf-input w-full" placeholder="Neues Passwort bestätigen" required>
-                    <button type="submit" class="jf-btn-primary text-xs">Passwort speichern</button>
+                    <input type="password" id="pw-current" class="jf-input w-full" placeholder="${escapeHtml(t('settings.current_password'))}" required>
+                    <input type="password" id="pw-new" class="jf-input w-full" placeholder="${escapeHtml(t('settings.new_password'))}" required>
+                    <input type="password" id="pw-confirm" class="jf-input w-full" placeholder="${escapeHtml(t('settings.confirm_new_password'))}" required>
+                    <button type="submit" class="jf-btn-primary text-xs">${t('settings.save_password')}</button>
                     <span id="pw-msg" class="text-xs ml-3 hidden"></span>
                 </form>
             </div>
@@ -1962,18 +2000,24 @@ async function renderSettings() {
     }
 }
 
+// Pages keep the language they were rendered in, so reload to switch all of them
+async function changeUiLanguage(lng) {
+    await setUiLanguage(lng);
+    location.reload();
+}
+
 async function handleChangePassword(e, userId) {
     e.preventDefault();
     const cur = $('pw-current').value;
     const n = $('pw-new').value;
     const c = $('pw-confirm').value;
     if (n !== c) {
-        toast('Passwörter stimmen nicht überein', 'error');
+        toast(t('settings.passwords_mismatch'), 'error');
         return;
     }
     try {
         await API.changePassword(userId, cur, n);
-        toast('Passwort erfolgreich geändert');
+        toast(t('settings.password_changed'));
         $('pw-current').value = '';
         $('pw-new').value = '';
         $('pw-confirm').value = '';
@@ -1994,7 +2038,7 @@ async function handleSaveConfig(e) {
             FanartApiKey: $('cfg-fanart')?.value || null,
             IsStartupWizardCompleted: true
         });
-        toast('Server-Konfiguration aktualisiert');
+        toast(t('settings.server_config_updated'));
     } catch (err) {
         toast(err.message, 'error');
     }
@@ -2004,7 +2048,7 @@ async function handleSaveConfig(e) {
 async function renderAdmin() {
     const page = $('page-admin');
     if (!API.isAdmin) {
-        page.innerHTML = '<div class="p-8 text-center text-yellow-400 jf-page">Zugriff verweigert (Administratorrechte erforderlich).</div>';
+        page.innerHTML = `<div class="p-8 text-center text-yellow-400 jf-page">${t('admin.access_denied')}</div>`;
         return;
     }
 
@@ -2020,31 +2064,31 @@ async function renderAdmin() {
             API.getSessions().catch(() => [])
         ]);
 
-        const tabs = ['Übersicht', 'Benutzer', 'Bibliotheken', 'Aufgaben', 'Sitzungen', 'Aktivitätslog', 'Live-Log'];
+        const tabs = [t('admin.overview'), t('admin.users'), t('admin.libraries'), t('admin.tasks'), t('admin.sessions'), t('admin.activity_log_tab'), t('admin.live_log')];
         const tabIds = ['admin-overview', 'admin-users', 'admin-libs', 'admin-tasks', 'admin-sessions', 'admin-activity', 'admin-livelog'];
 
         page.innerHTML = `
         <div class="max-w-6xl mx-auto jf-page">
             <div class="flex items-center justify-between mb-6">
                 <div>
-                    <h1 class="text-2xl lg:text-3xl font-extrabold text-white">Server Dashboard</h1>
-                    <p class="text-xs text-white/40 mt-1">Status & Verwaltung für ${escapeHtml(info.ServerName || 'Rustyfin')}</p>
+                    <h1 class="text-2xl lg:text-3xl font-extrabold text-white">${t('nav.server_dashboard')}</h1>
+                    <p class="text-xs text-white/40 mt-1">${t('admin.subtitle', { name: escapeHtml(info.ServerName || 'Rustyfin') })}</p>
                 </div>
                 <div class="flex gap-2">
-                    <button class="jf-btn-ghost !py-1.5 !px-3 text-xs" onclick="API.scanAllLibraries().then(()=>toast('Alle Bibliotheken werden gescannt…'))">
-                        📚 Alle scannen
+                    <button class="jf-btn-ghost !py-1.5 !px-3 text-xs" onclick="API.scanAllLibraries().then(()=>toast(t('admin.scanning_all')))">
+                        ${t('admin.scan_all')}
                     </button>
-                    <button class="jf-btn-ghost !py-1.5 !px-3 text-xs text-amber-400 hover:text-amber-300" onclick="if(confirm('Server neustarten?'))API.restart().then(()=>toast('Neustart…'))">
-                        🔄 Neustart
+                    <button class="jf-btn-ghost !py-1.5 !px-3 text-xs text-amber-400 hover:text-amber-300" onclick="if(confirm(t('admin.restart_confirm')))API.restart().then(()=>toast(t('admin.restarting')))">
+                        ${t('admin.restart')}
                     </button>
                 </div>
             </div>
 
             <!-- Tab pills -->
             <div class="flex gap-2 mb-6 overflow-x-auto pb-2">
-                ${tabs.map((t, i) => `
+                ${tabs.map((label, i) => `
                     <button class="px-4 py-2 rounded-xl text-xs font-semibold whitespace-nowrap transition ${i === 0 ? 'bg-[#00a4dc] text-white shadow-lg' : 'bg-white/5 text-white/60 hover:bg-white/10'}"
-                            onclick="showAdminTab(this, '${tabIds[i]}')">${t}</button>
+                            onclick="showAdminTab(this, '${tabIds[i]}')">${label}</button>
                 `).join('')}
             </div>
 
@@ -2053,29 +2097,29 @@ async function renderAdmin() {
                 <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
                     <div class="jf-settings-card text-center">
                         <p class="text-3xl font-black text-[#00a4dc]">${escapeHtml(info.ServerName || 'Rustyfin')}</p>
-                        <p class="text-[11px] text-white/40 uppercase tracking-wider mt-1">Server</p>
+                        <p class="text-[11px] text-white/40 uppercase tracking-wider mt-1">${t('nav.server')}</p>
                     </div>
                     <div class="jf-settings-card text-center">
                         <p class="text-3xl font-black text-white">v${escapeHtml(info.Version || serverVersion)}</p>
-                        <p class="text-[11px] text-white/40 uppercase tracking-wider mt-1">Release Version</p>
+                        <p class="text-[11px] text-white/40 uppercase tracking-wider mt-1">${t('admin.release_version')}</p>
                     </div>
                     <div class="jf-settings-card text-center">
                         <p class="text-3xl font-black text-emerald-400">${users.length}</p>
-                        <p class="text-[11px] text-white/40 uppercase tracking-wider mt-1">Registrierte Benutzer</p>
+                        <p class="text-[11px] text-white/40 uppercase tracking-wider mt-1">${t('admin.registered_users')}</p>
                     </div>
                     <div class="jf-settings-card text-center">
                         <p class="text-3xl font-black text-amber-400">${libs.length}</p>
-                        <p class="text-[11px] text-white/40 uppercase tracking-wider mt-1">Bibliotheken</p>
+                        <p class="text-[11px] text-white/40 uppercase tracking-wider mt-1">${t('admin.libraries')}</p>
                     </div>
                 </div>
 
                 <div class="jf-settings-card">
-                    <h3 class="font-bold text-white text-base mb-4">Systemdetails</h3>
+                    <h3 class="font-bold text-white text-base mb-4">${t('admin.system_details')}</h3>
                     <div class="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
-                        <div class="flex justify-between py-2 border-b border-white/5"><span class="text-white/50">Betriebssystem:</span> <span class="font-mono text-white">${escapeHtml(info.OperatingSystem || 'Linux')}</span></div>
-                        <div class="flex justify-between py-2 border-b border-white/5"><span class="text-white/50">Architektur:</span> <span class="font-mono text-white">${escapeHtml(info.SystemArchitecture || 'x86_64')}</span></div>
-                        <div class="flex justify-between py-2 border-b border-white/5"><span class="text-white/50">Programmdaten:</span> <span class="font-mono text-white truncate max-w-xs">${escapeHtml(info.ProgramDataPath || '/data')}</span></div>
-                        <div class="flex justify-between py-2 border-b border-white/5"><span class="text-white/50">Log-Pfad:</span> <span class="font-mono text-white truncate max-w-xs">${escapeHtml(info.LogPath || '/data/logs')}</span></div>
+                        <div class="flex justify-between py-2 border-b border-white/5"><span class="text-white/50">${t('admin.operating_system')}</span> <span class="font-mono text-white">${escapeHtml(info.OperatingSystem || 'Linux')}</span></div>
+                        <div class="flex justify-between py-2 border-b border-white/5"><span class="text-white/50">${t('admin.architecture')}</span> <span class="font-mono text-white">${escapeHtml(info.SystemArchitecture || 'x86_64')}</span></div>
+                        <div class="flex justify-between py-2 border-b border-white/5"><span class="text-white/50">${t('admin.program_data')}</span> <span class="font-mono text-white truncate max-w-xs">${escapeHtml(info.ProgramDataPath || '/data')}</span></div>
+                        <div class="flex justify-between py-2 border-b border-white/5"><span class="text-white/50">${t('admin.log_path')}</span> <span class="font-mono text-white truncate max-w-xs">${escapeHtml(info.LogPath || '/data/logs')}</span></div>
                     </div>
                 </div>
             </div>
@@ -2083,27 +2127,27 @@ async function renderAdmin() {
             <!-- Tab 1: Users -->
             <div id="admin-users" class="hidden jf-settings-card">
                 <div class="flex justify-between items-center mb-4">
-                    <h3 class="font-bold text-white text-base">Benutzerkonten</h3>
-                    <button class="jf-btn-primary text-xs" onclick="openAddUser()">＋ Neuer Benutzer</button>
+                    <h3 class="font-bold text-white text-base">${t('admin.user_accounts')}</h3>
+                    <button class="jf-btn-primary text-xs" onclick="openAddUser()">${t('admin.new_user')}</button>
                 </div>
                 <div class="overflow-x-auto">
                     <table class="w-full text-left text-xs">
                         <thead>
                             <tr class="text-white/40 border-b border-white/10 pb-2">
-                                <th class="pb-3 font-semibold">Name</th>
-                                <th class="pb-3 font-semibold">Berechtigung</th>
-                                <th class="pb-3 font-semibold">Letzter Login</th>
-                                <th class="pb-3 font-semibold text-right">Aktion</th>
+                                <th class="pb-3 font-semibold">${t('common.name')}</th>
+                                <th class="pb-3 font-semibold">${t('admin.role')}</th>
+                                <th class="pb-3 font-semibold">${t('admin.last_login')}</th>
+                                <th class="pb-3 font-semibold text-right">${t('admin.action')}</th>
                             </tr>
                         </thead>
                         <tbody class="divide-y divide-white/5">
                             ${users.map(u => `
                             <tr>
                                 <td class="py-3 font-bold text-white">${escapeHtml(u.Name || u.name)}</td>
-                                <td class="py-3">${(u.Policy?.IsAdministrator || u.policy?.is_administrator) ? '<span class="px-2 py-0.5 rounded text-[10px] font-bold bg-[#00a4dc]/20 text-[#38bdf8]">Admin</span>' : '<span class="text-white/40">Benutzer</span>'}</td>
+                                <td class="py-3">${(u.Policy?.IsAdministrator || u.policy?.is_administrator) ? `<span class="px-2 py-0.5 rounded text-[10px] font-bold bg-[#00a4dc]/20 text-[#38bdf8]">${t('admin.role_admin')}</span>` : `<span class="text-white/40">${t('admin.role_user')}</span>`}</td>
                                 <td class="py-3 text-white/40">${escapeHtml(u.LastLoginDate || u.last_login_date || '–')}</td>
                                 <td class="py-3 text-right">
-                                    <button class="text-red-400 hover:text-red-300 font-semibold" onclick="if(confirm('Benutzer löschen?'))API.deleteUser('${u.Id || u.id}').then(()=>renderAdmin())">Löschen</button>
+                                    <button class="text-red-400 hover:text-red-300 font-semibold" onclick="if(confirm(t('admin.delete_user_confirm')))API.deleteUser('${u.Id || u.id}').then(()=>renderAdmin())">${t('common.delete')}</button>
                                 </td>
                             </tr>`).join('')}
                         </tbody>
@@ -2114,28 +2158,28 @@ async function renderAdmin() {
             <!-- Tab 2: Libraries -->
             <div id="admin-libs" class="hidden jf-settings-card">
                 <div class="flex justify-between items-center mb-4">
-                    <h3 class="font-bold text-white text-base">Bibliotheken (${libs.length})</h3>
-                    <button class="jf-btn-primary text-xs" onclick="openAddLibrary()">＋ Neue Bibliothek</button>
+                    <h3 class="font-bold text-white text-base">${t('admin.libraries_count', { number: libs.length })}</h3>
+                    <button class="jf-btn-primary text-xs" onclick="openAddLibrary()">${t('admin.new_library')}</button>
                 </div>
                 <div class="overflow-x-auto">
                     <table class="w-full text-left text-xs">
                         <thead>
                             <tr class="text-white/40 border-b border-white/10">
-                                <th class="pb-3 font-semibold">Name</th>
-                                <th class="pb-3 font-semibold">Typ</th>
-                                <th class="pb-3 font-semibold">Pfade</th>
-                                <th class="pb-3 font-semibold text-right">Aktionen</th>
+                                <th class="pb-3 font-semibold">${t('common.name')}</th>
+                                <th class="pb-3 font-semibold">${t('common.type')}</th>
+                                <th class="pb-3 font-semibold">${t('admin.paths')}</th>
+                                <th class="pb-3 font-semibold text-right">${t('admin.actions')}</th>
                             </tr>
                         </thead>
                         <tbody class="divide-y divide-white/5">
                             ${libs.map(l => `
                             <tr>
                                 <td class="py-3 font-bold text-white">${escapeHtml(l.name || l.Name)}</td>
-                                <td class="py-3"><span class="px-2 py-0.5 rounded bg-white/10 text-white/70">${escapeHtml(l.content_type || l.ContentType || 'Mixed')}</span></td>
+                                <td class="py-3"><span class="px-2 py-0.5 rounded bg-white/10 text-white/70">${escapeHtml(l.content_type || l.ContentType || t('admin.mixed'))}</span></td>
                                 <td class="py-3 text-white/40 font-mono">${escapeHtml((l.paths || l.Paths || []).join(', '))}</td>
                                 <td class="py-3 text-right space-x-2">
-                                    <button class="text-[#00a4dc] hover:text-[#38bdf8]" onclick="API.scanLibrary('${l.id || l.Id}').then(()=>toast('Scan gestartet'))">Scannen</button>
-                                    <button class="text-red-400 hover:text-red-300" onclick="if(confirm('Bibliothek wirklich entfernen?'))API.deleteLibrary('${l.id || l.Id}').then(()=>renderAdmin())">Löschen</button>
+                                    <button class="text-[#00a4dc] hover:text-[#38bdf8]" onclick="API.scanLibrary('${l.id || l.Id}').then(()=>toast(t('admin.scan_started')))">${t('admin.scan')}</button>
+                                    <button class="text-red-400 hover:text-red-300" onclick="if(confirm(t('admin.remove_library_confirm')))API.deleteLibrary('${l.id || l.Id}').then(()=>renderAdmin())">${t('common.delete')}</button>
                                 </td>
                             </tr>`).join('')}
                         </tbody>
@@ -2146,32 +2190,32 @@ async function renderAdmin() {
             <!-- Tab 3: Tasks -->
             <div id="admin-tasks" class="hidden">
                 <div class="flex items-center justify-between mb-4">
-                    <h3 class="font-bold text-white text-base">Hintergrundaufgaben</h3>
-                    <button class="jf-btn-ghost !py-1.5 !px-3 text-xs" onclick="refreshTasks()">🔄 Aktualisieren</button>
+                    <h3 class="font-bold text-white text-base">${t('admin.background_tasks')}</h3>
+                    <button class="jf-btn-ghost !py-1.5 !px-3 text-xs" onclick="refreshTasks()">${t('admin.refresh')}</button>
                 </div>
                 <div id="admin-tasks-list" class="grid gap-3">
-                    ${tasks.map(t => renderTaskCard(t)).join('')}
+                    ${tasks.map(task => renderTaskCard(task)).join('')}
                 </div>
             </div>
 
             <!-- Tab 4: Sessions -->
             <div id="admin-sessions" class="hidden jf-settings-card">
-                <h3 class="font-bold text-white text-base mb-4">Aktive Sitzungen</h3>
+                <h3 class="font-bold text-white text-base mb-4">${t('admin.active_sessions')}</h3>
                 <div class="overflow-x-auto">
                     <table class="w-full text-left text-xs">
                         <thead>
                             <tr class="text-white/40 border-b border-white/10">
-                                <th class="pb-3 font-semibold">Benutzer</th>
-                                <th class="pb-3 font-semibold">Gerät</th>
-                                <th class="pb-3 font-semibold">Client</th>
-                                <th class="pb-3 font-semibold">Aktivität</th>
+                                <th class="pb-3 font-semibold">${t('admin.user')}</th>
+                                <th class="pb-3 font-semibold">${t('admin.device')}</th>
+                                <th class="pb-3 font-semibold">${t('admin.client')}</th>
+                                <th class="pb-3 font-semibold">${t('admin.activity')}</th>
                             </tr>
                         </thead>
                         <tbody class="divide-y divide-white/5">
                             ${sessions.map(s => `
                             <tr>
                                 <td class="py-3 font-bold text-white">${escapeHtml(s.UserName || s.user_name || '–')}</td>
-                                <td class="py-3 text-white/70">${escapeHtml(s.DeviceName || s.device_name || 'Browser')}</td>
+                                <td class="py-3 text-white/70">${escapeHtml(s.DeviceName || s.device_name || t('admin.browser'))}</td>
                                 <td class="py-3 text-white/50">${escapeHtml(s.Client || s.client || 'Rustyfin Web')}</td>
                                 <td class="py-3 text-white/40">${escapeHtml(s.LastActivityDate || s.last_activity_date || '–')}</td>
                             </tr>`).join('')}
@@ -2182,35 +2226,35 @@ async function renderAdmin() {
 
             <!-- Tab 5: Activity Log -->
             <div id="admin-activity" class="hidden jf-settings-card">
-                <h3 class="font-bold text-white text-base mb-4">Aktivitätsprotokoll</h3>
-                <div id="activity-content"><p class="text-white/40 text-xs">Lade Aktivitäten…</p></div>
+                <h3 class="font-bold text-white text-base mb-4">${t('admin.activity_log')}</h3>
+                <div id="activity-content"><p class="text-white/40 text-xs">${t('admin.loading_activity')}</p></div>
             </div>
 
             <!-- Tab 6: Live Log -->
             <div id="admin-livelog" class="hidden">
                 <div class="jf-settings-card">
                     <div class="flex items-center justify-between mb-4">
-                        <h3 class="font-bold text-white text-base">Live-Log</h3>
+                        <h3 class="font-bold text-white text-base">${t('admin.live_log')}</h3>
                         <div class="flex items-center gap-3">
-                            <span class="text-xs text-white/40">Verbosity:</span>
+                            <span class="text-xs text-white/40">${t('admin.verbosity')}</span>
                             <select id="livelog-level" class="bg-white/10 text-xs text-white rounded-lg px-3 py-1.5 outline-none border border-white/10 cursor-pointer" onchange="setLogLevel(this.value)">
-                                <option value="error">Error</option>
-                                <option value="warn">Warn</option>
-                                <option value="info" selected>Info</option>
-                                <option value="debug">Debug</option>
-                                <option value="trace">Trace</option>
+                                <option value="error">${t('admin.level_error')}</option>
+                                <option value="warn">${t('admin.level_warn')}</option>
+                                <option value="info" selected>${t('admin.level_info')}</option>
+                                <option value="debug">${t('admin.level_debug')}</option>
+                                <option value="trace">${t('admin.level_trace')}</option>
                             </select>
-                            <button onclick="clearLiveLog()" class="text-xs text-white/40 hover:text-white transition px-2 py-1 rounded hover:bg-white/10">Leeren</button>
+                            <button onclick="clearLiveLog()" class="text-xs text-white/40 hover:text-white transition px-2 py-1 rounded hover:bg-white/10">${t('admin.clear')}</button>
                             <div id="livelog-status" class="flex items-center gap-1.5 text-xs">
                                 <span class="w-2 h-2 rounded-full bg-red-400"></span>
-                                <span class="text-white/40">Getrennt</span>
+                                <span class="text-white/40">${t('admin.disconnected')}</span>
                             </div>
                         </div>
                     </div>
                     <div id="livelog-container" class="bg-black/50 rounded-xl border border-white/5 p-4 h-96 overflow-y-auto font-mono text-xs space-y-0.5">
-                        <p class="text-white/30 italic">Verbinde mit Server…</p>
+                        <p class="text-white/30 italic">${t('admin.connecting_to_server')}</p>
                     </div>
-                    <p class="text-[10px] text-white/20 mt-2">Zeigt die letzten 500 Log-Einträge in Echtzeit. Änderungen der Verbosity werden sofort wirksam.</p>
+                    <p class="text-[10px] text-white/20 mt-2">${t('admin.live_log_hint')}</p>
                 </div>
             </div>
         </div>`;
@@ -2237,11 +2281,11 @@ function showAdminTab(btn, tabId) {
 // --- Scheduled Tasks UI ---
 
 function getTaskStateLabel(state) {
-    if (!state) return { text: 'Bereit', cls: 'bg-emerald-500/20 text-emerald-300' };
+    if (!state) return { text: t('admin.state_ready'), cls: 'bg-emerald-500/20 text-emerald-300' };
     const s = state.toLowerCase();
-    if (s === 'running') return { text: 'Läuft', cls: 'bg-amber-500/20 text-amber-300 animate-pulse' };
-    if (s === 'cancelling') return { text: 'Wird gestoppt', cls: 'bg-red-500/20 text-red-300' };
-    return { text: 'Bereit', cls: 'bg-emerald-500/20 text-emerald-300' };
+    if (s === 'running') return { text: t('admin.state_running'), cls: 'bg-amber-500/20 text-amber-300 animate-pulse' };
+    if (s === 'cancelling') return { text: t('admin.state_stopping'), cls: 'bg-red-500/20 text-red-300' };
+    return { text: t('admin.state_ready'), cls: 'bg-emerald-500/20 text-emerald-300' };
 }
 
 function getTaskCategoryIcon(category) {
@@ -2255,15 +2299,15 @@ function getTaskCategoryIcon(category) {
     return '⚙️';
 }
 
-function renderTaskCard(t) {
-    const id = t.Id || t.id;
-    const name = t.Name || t.name || id;
-    const description = t.Description || t.description || '';
-    const state = t.State || t.state || 'Idle';
-    const progress = t.CurrentProgressPercentage || t.current_progress_percentage;
-    const category = t.Category || t.category || '';
-    const lastResult = t.LastExecutionResult || t.last_execution_result;
-    const triggers = t.Triggers || t.triggers || [];
+function renderTaskCard(task) {
+    const id = task.Id || task.id;
+    const name = task.Name || task.name || id;
+    const description = task.Description || task.description || '';
+    const state = task.State || task.state || 'Idle';
+    const progress = task.CurrentProgressPercentage || task.current_progress_percentage;
+    const category = task.Category || task.category || '';
+    const lastResult = task.LastExecutionResult || task.last_execution_result;
+    const triggers = task.Triggers || task.triggers || [];
     const stateInfo = getTaskStateLabel(state);
     const icon = getTaskCategoryIcon(category);
     const isRunning = state.toLowerCase() === 'running';
@@ -2281,7 +2325,7 @@ function renderTaskCard(t) {
             aborted: 'text-orange-400'
         };
         const statusColor = statusColors[(status || '').toLowerCase()] || 'text-white/40';
-        const timeStr = endTime ? new Date(endTime).toLocaleString('de-DE', { day: '2-digit', month: '2-digit', year: '2-digit', hour: '2-digit', minute: '2-digit' }) : '–';
+        const timeStr = endTime ? new Date(endTime).toLocaleString(uiLocale(), { day: '2-digit', month: '2-digit', year: '2-digit', hour: '2-digit', minute: '2-digit' }) : '–';
         lastExecHtml = `<span class="${statusColor}">${escapeHtml(status || '–')}</span> <span class="text-white/30">(${timeStr})</span>`;
     }
 
@@ -2294,7 +2338,7 @@ function renderTaskCard(t) {
                 const ticks = tr.IntervalTicks || tr.interval_ticks;
                 if (ticks) {
                     const hours = Math.round(ticks / 3600000);
-                    return hours === 1 ? 'Stündlich' : `Alle ${hours}h`;
+                    return t('admin.every_hours', { count: hours });
                 }
             }
             if (type.includes('TimeOfDay')) {
@@ -2316,7 +2360,7 @@ function renderTaskCard(t) {
         progressHtml = `
         <div class="mt-3">
             <div class="flex justify-between text-[10px] text-white/40 mb-1">
-                <span>Fortschritt</span>
+                <span>${t('admin.progress')}</span>
                 <span>${pct}%</span>
             </div>
             <div class="w-full h-1.5 bg-white/10 rounded-full overflow-hidden">
@@ -2338,20 +2382,20 @@ function renderTaskCard(t) {
                 ${description ? `<p class="text-xs text-white/40 mt-1">${escapeHtml(description)}</p>` : ''}
                 <div class="flex items-center gap-3 mt-2 flex-wrap">
                     ${triggerHtml}
-                    <span class="text-[10px] text-white/30">Letzte: ${lastExecHtml}</span>
+                    <span class="text-[10px] text-white/30">${t('admin.last_run', { result: lastExecHtml })}</span>
                 </div>
                 ${progressHtml}
                 <div class="flex items-center gap-2 mt-3">
                     ${isRunning || isCancelling ? `
                         <button class="jf-btn-danger text-xs !py-1.5 !px-3" onclick="stopTaskAction('${escapeHtml(id)}', '${escapeHtml(name)}')">
-                            ⏹ Stoppen
+                            ${t('admin.stop')}
                         </button>
                     ` : `
                         <button class="jf-btn-primary text-xs !py-1.5 !px-3" onclick="startTaskAction('${escapeHtml(id)}', '${escapeHtml(name)}')">
-                            ▶ Starten
+                            ${t('admin.start')}
                         </button>
                     `}
-                    <button class="jf-btn-ghost text-xs !py-1.5 !px-3 text-white/40" onclick="refreshTasks()" title="Status aktualisieren">
+                    <button class="jf-btn-ghost text-xs !py-1.5 !px-3 text-white/40" onclick="refreshTasks()" title="${escapeHtml(t('admin.refresh_status'))}">
                         🔄
                     </button>
                 </div>
@@ -2363,20 +2407,20 @@ function renderTaskCard(t) {
 async function startTaskAction(id, name) {
     try {
         await API.startTask(id);
-        toast(`„${name}" wird gestartet…`);
+        toast(t('admin.starting_task', { name }));
         await refreshTasks();
     } catch (e) {
-        toast(`Fehler: ${e.message}`, 'error');
+        toast(t('common.error_message', { message: e.message }), 'error');
     }
 }
 
 async function stopTaskAction(id, name) {
     try {
         await API.stopTask(id);
-        toast(`„${name}" wird gestoppt…`);
+        toast(t('admin.stopping_task', { name }));
         await refreshTasks();
     } catch (e) {
-        toast(`Fehler: ${e.message}`, 'error');
+        toast(t('common.error_message', { message: e.message }), 'error');
     }
 }
 
@@ -2385,10 +2429,10 @@ async function refreshTasks() {
         const tasks = await API.getTasks();
         const list = $('admin-tasks-list');
         if (list) {
-            list.innerHTML = tasks.map(t => renderTaskCard(t)).join('');
+            list.innerHTML = tasks.map(task => renderTaskCard(task)).join('');
         }
     } catch (e) {
-        toast(`Tasks konnten nicht geladen werden: ${e.message}`, 'error');
+        toast(t('admin.tasks_load_failed', { message: e.message }), 'error');
     }
 }
 
@@ -2397,7 +2441,7 @@ async function loadActivityLog() {
         const data = await API.getActivityLog(0, 50);
         const items = data.Items || data.items || [];
         if (!items.length) {
-            html('activity-content', '<p class="text-white/40 text-xs">Keine Aktivitäten protokolliert.</p>');
+            html('activity-content', `<p class="text-white/40 text-xs">${t('admin.no_activity')}</p>`);
             return;
         }
         html('activity-content', `
@@ -2405,16 +2449,16 @@ async function loadActivityLog() {
             <table class="w-full text-left text-xs">
                 <thead>
                     <tr class="text-white/40 border-b border-white/10">
-                        <th class="pb-2 font-semibold">Zeit</th>
-                        <th class="pb-2 font-semibold">Typ</th>
-                        <th class="pb-2 font-semibold">Details</th>
+                        <th class="pb-2 font-semibold">${t('admin.time')}</th>
+                        <th class="pb-2 font-semibold">${t('common.type')}</th>
+                        <th class="pb-2 font-semibold">${t('admin.details')}</th>
                     </tr>
                 </thead>
                 <tbody class="divide-y divide-white/5">
                     ${items.map(a => `
                     <tr>
                         <td class="py-2.5 text-white/40 whitespace-nowrap font-mono">${escapeHtml(a.Date || a.date || '–')}</td>
-                        <td class="py-2.5"><span class="px-2 py-0.5 rounded bg-white/10 text-white/70">${escapeHtml(a.Type || a.type || 'Info')}</span></td>
+                        <td class="py-2.5"><span class="px-2 py-0.5 rounded bg-white/10 text-white/70">${escapeHtml(a.Type || a.type || t('admin.activity_info'))}</span></td>
                         <td class="py-2.5 text-white">${escapeHtml(a.ShortOverview || a.short_overview || a.Name || a.name || '–')}</td>
                     </tr>`).join('')}
                 </tbody>
@@ -2453,7 +2497,7 @@ async function loadSidebar() {
                     <span class="truncate">${escapeHtml(name)}</span>
                     ${isScanning ? '<span class="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse ml-1 flex-shrink-0"></span>' : ''}
                 </a>
-                <button type="button" class="jf-icon-btn !w-6 !h-6 text-white/20 hover:text-white opacity-0 group-hover:opacity-100 transition flex-shrink-0" onclick="API.scanLibrary('${id}').then(()=>toast('Scan für ${escapeHtml(name)} gestartet'))" title="Bibliothek scannen">
+                <button type="button" class="jf-icon-btn !w-6 !h-6 text-white/20 hover:text-white opacity-0 group-hover:opacity-100 transition flex-shrink-0" onclick="API.scanLibrary('${id}').then(()=>toast(t('library.scan_started_for', { name: '${escapeHtml(name)}' })))" title="${escapeHtml(t('library.scan_library'))}">
                     <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
                 </button>
             </div>`;
@@ -2472,7 +2516,7 @@ async function loadSidebar() {
 // --- Add Library Modal Handlers ---
 function openAddLibrary() {
     if (!API.isLoggedIn()) {
-        toast('Bitte zuerst anmelden', 'error');
+        toast(t('login.sign_in_first'), 'error');
         navigate('login');
         return;
     }
@@ -2515,12 +2559,12 @@ async function submitAddLibrary(e) {
     const paths = [...new Set([...selectedLibraryPaths, ...manualPaths])];
 
     if (!name || !paths.length) {
-        toast('Name und mindestens ein Pfad erforderlich', 'error');
+        toast(t('library.name_and_path_required'), 'error');
         return;
     }
     try {
         const lib = await API.createLibrary(name, type, paths);
-        toast(`Bibliothek „${name}" angelegt – Scan wird gestartet…`);
+        toast(t('library.created', { name }));
         closeAddLibrary();
         // Reset selected paths
         selectedLibraryPaths = [];
@@ -2571,7 +2615,7 @@ async function loadDirectoryList(path) {
     try {
         const dirs = await API.browseDirectories(path);
         if (!dirs.length) {
-            list.innerHTML = '<div class="p-3 text-center text-white/30 text-xs">Keine Unterverzeichnisse</div>';
+            list.innerHTML = `<div class="p-3 text-center text-white/30 text-xs">${t('library.no_subfolders')}</div>`;
             return;
         }
 
@@ -2580,7 +2624,7 @@ async function loadDirectoryList(path) {
         if (path !== '/') {
             const parent = path.split('/').slice(0, -1).join('/') || '/';
             html += `<button type="button" class="w-full text-left px-3 py-2 text-xs text-white/60 hover:bg-white/5 flex items-center gap-2 rounded" onclick="navigateDirectoryPicker('${parent}')">
-                <span>📁</span> <span>…</span> <span class="text-white/30 text-[10px] ml-auto">Elternordner</span>
+                <span>📁</span> <span>…</span> <span class="text-white/30 text-[10px] ml-auto">${t('library.parent_folder')}</span>
             </button>`;
         }
 
@@ -2588,7 +2632,7 @@ async function loadDirectoryList(path) {
             if (!dir.can_read) {
                 html += `<div class="w-full text-left px-3 py-2 text-xs text-white/40 flex items-center gap-2 rounded">
                     <span>📁</span> <span class="truncate">${escapeHtml(dir.name)}</span>
-                    <span class="text-white/30 text-[10px] ml-auto">Kein Zugriff</span>
+                    <span class="text-white/30 text-[10px] ml-auto">${t('library.no_access')}</span>
                 </div>`;
             } else {
                 // Click navigates into the directory, double-click or button selects it
@@ -2597,7 +2641,7 @@ async function loadDirectoryList(path) {
                     <button type="button" class="flex-1 text-left px-3 py-2 text-xs text-white hover:bg-white/5 flex items-center gap-2 rounded" onclick="navigateDirectoryPicker('${escapedPath}')">
                         <span>📁</span> <span class="truncate">${escapeHtml(dir.name)}</span>
                     </button>
-                    <button type="button" class="px-2 py-2 text-[10px] text-[#00a4dc] hover:text-[#38bdf8] rounded" onclick="selectDirectoryPath('${escapedPath}')" title="Diesen Ordner auswählen">✓</button>
+                    <button type="button" class="px-2 py-2 text-[10px] text-[#00a4dc] hover:text-[#38bdf8] rounded" onclick="selectDirectoryPath('${escapedPath}')" title="${escapeHtml(t('library.select_folder'))}">✓</button>
                 </div>`;
             }
         }
@@ -2624,7 +2668,7 @@ function selectDirectoryPath(path) {
     renderSelectedPaths();
     // Close picker
     closeDirectoryPicker();
-    toast(`Pfad hinzugefügt: ${path}`);
+    toast(t('library.path_added', { path }));
 }
 
 function renderSelectedPaths() {
@@ -2703,7 +2747,7 @@ function initScanProgressWebSocket() {
                 try {
                     const data = JSON.parse(event.data);
                     if (data.MessageType === 'ScheduledTaskStarted') {
-                        showScanProgress(data.data.Name || 'Wird verarbeitet…');
+                        showScanProgress(data.data.Name || t('library.processing'));
                         // Track per-library scan status
                         const libId = data.data.ItemId;
                         if (libId) scanStatuses[libId] = true;
@@ -2717,7 +2761,7 @@ function initScanProgressWebSocket() {
                             hideScanProgress();
                         } else if (data.data.State === 'Failed') {
                             hideScanProgress();
-                            toast(`Fehler: ${data.data.Name || 'Aufgabe'} - ${data.data.Error || 'Unbekannter Fehler'}`, 'error');
+                            toast(t('admin.task_failed', { name: data.data.Name || t('admin.task'), error: data.data.Error || t('common.unknown_error') }), 'error');
                         }
                         // Refresh tasks tab if visible
                         if (currentPage === 'admin') refreshTasks();
@@ -2758,7 +2802,7 @@ function initScanProgressWebSocket() {
 // --- Add User Modal Handlers ---
 function openAddUser() {
     if (!API.isLoggedIn() || !API.isAdmin) {
-        toast('Nur Administratoren können Benutzer erstellen', 'error');
+        toast(t('admin.only_admins_create_users'), 'error');
         return;
     }
     const dlg = $('add-user-modal');
@@ -2793,12 +2837,12 @@ async function submitAddUser(e) {
     const isAdmin = f.isAdministrator.checked;
 
     if (!name || !password) {
-        toast('Name und Passwort sind erforderlich', 'error');
+        toast(t('admin.name_and_password_required'), 'error');
         return;
     }
     try {
         await API.createUser(name, password, isAdmin);
-        toast(`Benutzer „${name}" erstellt`);
+        toast(t('admin.user_created', { name }));
         closeAddUser();
         if (currentPage === 'admin') renderAdmin();
     } catch (err) {
@@ -2851,9 +2895,9 @@ function initLiveLog() {
             const statusEl = $('livelog-status');
             if (!statusEl) return;
             if (LiveLog.connected) {
-                statusEl.innerHTML = '<span class="w-2 h-2 rounded-full bg-emerald-400"></span><span class="text-emerald-400">Verbunden</span>';
+                statusEl.innerHTML = `<span class="w-2 h-2 rounded-full bg-emerald-400"></span><span class="text-emerald-400">${t('admin.connected')}</span>`;
             } else {
-                statusEl.innerHTML = '<span class="w-2 h-2 rounded-full bg-amber-400"></span><span class="text-amber-400">Verbinde…</span>';
+                statusEl.innerHTML = `<span class="w-2 h-2 rounded-full bg-amber-400"></span><span class="text-amber-400">${t('admin.connecting')}</span>`;
             }
         };
         const statusInterval = setInterval(() => {
@@ -2888,7 +2932,7 @@ function appendLogEntry(entry, scroll = true) {
     if (entry.Timestamp) {
         try {
             const d = new Date(entry.Timestamp);
-            timeStr = d.toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit', second: '2-digit', fractionalSecondDigits: 3 });
+            timeStr = d.toLocaleTimeString(uiLocale(), { hour: '2-digit', minute: '2-digit', second: '2-digit', fractionalSecondDigits: 3 });
         } catch {
             timeStr = entry.Timestamp;
         }
@@ -2926,7 +2970,7 @@ function appendLogEntry(entry, scroll = true) {
 function clearLiveLog() {
     const container = $('livelog-container');
     if (container) {
-        container.innerHTML = '<p class="text-white/30 italic">Log geleert. Warte auf neue Einträge…</p>';
+        container.innerHTML = `<p class="text-white/30 italic">${t('admin.log_cleared')}</p>`;
     }
     if (typeof LiveLog !== 'undefined') {
         LiveLog.messages = [];
@@ -2936,9 +2980,9 @@ function clearLiveLog() {
 async function setLogLevel(level) {
     try {
         await API.setLogLevel(level);
-        toast(`Log-Level auf "${level}" gesetzt`);
+        toast(t('admin.log_level_set', { level }));
     } catch (e) {
-        toast('Fehler beim Setzen des Log-Levels', 'error');
+        toast(t('admin.log_level_failed'), 'error');
     }
 }
 
