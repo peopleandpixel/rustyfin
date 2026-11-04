@@ -30,6 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - On upgrade, the earliest enabled administrator becomes the owner at the first start.
   - The wizard shows every failed step and resumes there on retry.
   - `start.sh smoke` creates a throwaway owner in a temporary data directory.
+- **Library folders**: Creating a library now checks its folders. Before, `POST /Library/VirtualFolders` stored any path, so the setup wizard and the library dialog accepted a folder that does not exist, and the library's scan found nothing. Now each path must be a full path to a folder that exists on the server and that the server can list. Otherwise the server stores nothing and answers 400 with a message that names each bad path and the reason, for example `The folder "/media/films" was not found on the server.` In Docker, the paths are the ones inside the container.
 - **Password hashing no longer blocks the server (M-15)**: argon2 hashing and verification run on a blocking thread pool, so a burst of logins no longer stalls unrelated requests.
 - **Login response reflects the current login (M-16)**: `AuthenticateByName` now returns the user with the `LastLoginDate` set by that login, not the previous one.
 - **Next Up and Upcoming parameters**: `GET /Shows/NextUp` and `GET /Shows/Upcoming` accept `Limit`, `StartIndex`, `UserId`, `SeriesId` and `ParentId` as well as their camelCase forms, as Jellyfin does. Before, the capitalized forms were ignored, so the web client's Next Up row asked for 12 episodes and got up to 20.

@@ -1095,6 +1095,11 @@ async fn test_create_and_get_library() {
     let app = app(state.clone());
 
     // Create a library
+    let body = serde_json::json!({
+        "Name": "Test Movies",
+        "ContentType": "Movies",
+        "Paths": [media_folder(&state, "movies")],
+    });
     let resp = app
         .clone()
         .oneshot(
@@ -1103,9 +1108,7 @@ async fn test_create_and_get_library() {
                 .uri("/Library/VirtualFolders")
                 .header("Content-Type", "application/json")
                 .header("Authorization", format!("Bearer {token}"))
-                .body(Body::from(
-                    r#"{"Name":"Test Movies","ContentType":"Movies","Paths":["/media/movies"]}"#,
-                ))
+                .body(Body::from(body.to_string()))
                 .unwrap(),
         )
         .await
@@ -1265,9 +1268,17 @@ async fn send_authed(
     (status, json)
 }
 
-/// Creates a library through the API and returns its id.
+/// Creates the folder `media/<name>` in the test's data dir and returns its path.
+fn media_folder(state: &AppState, name: &str) -> String {
+    let dir = state.data_dir.join("media").join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir.to_str().unwrap().to_string()
+}
+
+/// Creates a library on a new folder through the API and returns its id.
 async fn create_library_via_api(
     app: &axum::Router,
+    state: &AppState,
     token: &str,
     name: &str,
     content_type: &str,
@@ -1275,7 +1286,7 @@ async fn create_library_via_api(
     let body = serde_json::json!({
         "Name": name,
         "ContentType": content_type,
-        "Paths": [format!("/media/{}", name.to_lowercase())],
+        "Paths": [media_folder(state, &name.to_lowercase())],
     })
     .to_string();
     let (status, created) =
@@ -1331,12 +1342,12 @@ async fn stored_library_names(state: &AppState) -> Vec<String> {
 async fn test_user_views_show_library_created_after_cached_read() {
     let state = test_state().await;
     let (token, user_id) = admin_session(&state).await;
-    let app = app(state);
+    let app = app(state.clone());
 
     // Clients read the lists before the first library exists (home screen).
     assert_listed_libraries(&app, &token, user_id, &[]).await;
 
-    create_library_via_api(&app, &token, "Films", "Movies").await;
+    create_library_via_api(&app, &state, &token, "Films", "Movies").await;
 
     assert_listed_libraries(&app, &token, user_id, &["Films"]).await;
 }
@@ -1347,10 +1358,10 @@ async fn test_second_library_keeps_first_in_every_list() {
     let (token, user_id) = admin_session(&state).await;
     let app = app(state.clone());
 
-    create_library_via_api(&app, &token, "Films", "Movies").await;
+    create_library_via_api(&app, &state, &token, "Films", "Movies").await;
     assert_listed_libraries(&app, &token, user_id, &["Films"]).await;
 
-    create_library_via_api(&app, &token, "Shows", "TvShows").await;
+    create_library_via_api(&app, &state, &token, "Shows", "TvShows").await;
     assert_listed_libraries(&app, &token, user_id, &["Films", "Shows"]).await;
     assert_eq!(stored_library_names(&state).await, ["Films", "Shows"]);
 }
@@ -1361,8 +1372,8 @@ async fn test_delete_library_updates_every_list_and_keeps_others() {
     let (token, user_id) = admin_session(&state).await;
     let app = app(state.clone());
 
-    let films = create_library_via_api(&app, &token, "Films", "Movies").await;
-    let shows = create_library_via_api(&app, &token, "Shows", "TvShows").await;
+    let films = create_library_via_api(&app, &state, &token, "Films", "Movies").await;
+    let shows = create_library_via_api(&app, &state, &token, "Shows", "TvShows").await;
     for (library_id, item_name) in [(films, "Film item"), (shows, "Show item")] {
         sqlx::query(
             "INSERT INTO media_items (id, library_id, name, media_type, path) VALUES (?, ?, ?, ?, ?)",
@@ -1403,7 +1414,7 @@ async fn test_failed_library_create_changes_no_list() {
     let (token, user_id) = admin_session(&state).await;
     let app = app(state.clone());
 
-    create_library_via_api(&app, &token, "Films", "Movies").await;
+    create_library_via_api(&app, &state, &token, "Films", "Movies").await;
     assert_listed_libraries(&app, &token, user_id, &["Films"]).await;
 
     for bad_body in [
@@ -1427,6 +1438,227 @@ async fn test_failed_library_create_changes_no_list() {
 
     assert_listed_libraries(&app, &token, user_id, &["Films"]).await;
     assert_eq!(stored_library_names(&state).await, ["Films"]);
+}
+
+// ── Library Folder Tests ──
+// `POST /Library/VirtualFolders` stores a library only if every path is a folder
+// the server can list. Otherwise it answers 400, names each bad path in `Detail`
+// and stores nothing.
+
+/// A server with one library, "Films", whose lists have been read and so are cached.
+struct ServerWithFilms {
+    state: AppState,
+    app: axum::Router,
+    token: String,
+    user_id: uuid::Uuid,
+}
+
+async fn server_with_films() -> ServerWithFilms {
+    let state = test_state().await;
+    let (token, user_id) = admin_session(&state).await;
+    let app = app(state.clone());
+    create_library_via_api(&app, &state, &token, "Films", "Movies").await;
+    assert_listed_libraries(&app, &token, user_id, &["Films"]).await;
+    assert!(state.cache.library_views.get("views").is_some());
+    ServerWithFilms {
+        state,
+        app,
+        token,
+        user_id,
+    }
+}
+
+/// Writes the file `media/<name>` in the test's data dir and returns its path.
+fn media_file(state: &AppState, name: &str) -> String {
+    let file = state.data_dir.join("media").join(name);
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, b"not a folder").unwrap();
+    file.to_str().unwrap().to_string()
+}
+
+/// Sends `POST /Library/VirtualFolders` for a TV library called "Shows" on `paths`.
+async fn create_shows(server: &ServerWithFilms, paths: &[&str]) -> (StatusCode, serde_json::Value) {
+    let body = serde_json::json!({ "Name": "Shows", "ContentType": "TvShows", "Paths": paths });
+    send_authed(
+        &server.app,
+        "POST",
+        "/Library/VirtualFolders",
+        &server.token,
+        Some(&body.to_string()),
+    )
+    .await
+}
+
+/// Asserts that creating "Shows" on `paths` fails with 400 and exactly `detail`,
+/// and that it left the cached views, every list and the stored libraries alone.
+async fn assert_shows_rejected(server: &ServerWithFilms, paths: &[&str], detail: &str) {
+    let (status, body) = create_shows(server, paths).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "create on {paths:?}: {body}"
+    );
+    assert_eq!(body["Title"], "Bad Request");
+    assert_eq!(body["Status"], 400);
+    assert_eq!(body["Detail"], detail, "Detail for {paths:?}");
+    assert!(
+        server.state.cache.library_views.get("views").is_some(),
+        "a rejected create must leave the cached views alone"
+    );
+    assert_listed_libraries(&server.app, &server.token, server.user_id, &["Films"]).await;
+    assert_eq!(stored_library_names(&server.state).await, ["Films"]);
+}
+
+#[tokio::test]
+async fn test_create_library_rejects_missing_folder() {
+    let server = server_with_films().await;
+    let missing = server.state.data_dir.join("media").join("shows");
+    let missing = missing.to_str().unwrap();
+    // A path below a file is missing too, though the OS reports "not a directory".
+    let below_file = format!("{}/shows", media_file(&server.state, "shows.mkv"));
+
+    assert_shows_rejected(
+        &server,
+        &[missing, &below_file],
+        &format!(
+            "The folder \"{missing}\" was not found on the server. \
+             The folder \"{below_file}\" was not found on the server."
+        ),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_create_library_rejects_relative_path() {
+    let server = server_with_films().await;
+
+    // "." exists and can be listed, so only the full-path check can refuse it.
+    assert_shows_rejected(
+        &server,
+        &["."],
+        "The folder \".\" is not a full path on the server.",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_create_library_rejects_file_path() {
+    let server = server_with_films().await;
+    let file = media_file(&server.state, "shows.mkv");
+
+    assert_shows_rejected(
+        &server,
+        &[&file],
+        &format!("The path \"{file}\" on the server is not a folder."),
+    )
+    .await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_create_library_rejects_unreadable_folder() {
+    use std::os::unix::fs::PermissionsExt;
+
+    /// Gives the folder its mode back when the test ends, even if it fails, so
+    /// that the test's data dir can be deleted.
+    struct Unlock<'a>(&'a str);
+    impl Drop for Unlock<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    let server = server_with_films().await;
+    let locked = media_folder(&server.state, "shows");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let _unlock = Unlock(&locked);
+    if std::fs::read_dir(&locked).is_ok() {
+        eprintln!("skipped: this process can list a folder with mode 000 (running as root?)");
+        return;
+    }
+
+    assert_shows_rejected(
+        &server,
+        &[&locked],
+        &format!("The server does not have permission to read the folder \"{locked}\"."),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_create_library_with_any_bad_path_stores_nothing() {
+    let server = server_with_films().await;
+    let good = media_folder(&server.state, "shows");
+    let missing = server.state.data_dir.join("media").join("more shows");
+    let missing = missing.to_str().unwrap();
+    let file = media_file(&server.state, "episode.mkv");
+
+    // Only the bad paths are named, in the order they were sent.
+    assert_shows_rejected(
+        &server,
+        &[&good, missing, "shows", &file],
+        &format!(
+            "The folder \"{missing}\" was not found on the server. \
+             The folder \"shows\" is not a full path on the server. \
+             The path \"{file}\" on the server is not a folder."
+        ),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_create_library_accepts_existing_folders() {
+    let server = server_with_films().await;
+    let shows = media_folder(&server.state, "shows");
+    // Paths are stored as sent, trailing slash included.
+    let more_shows = format!("{}/", media_folder(&server.state, "more shows"));
+
+    let (status, created) = create_shows(&server, &[&shows, &more_shows]).await;
+    assert_eq!(status, StatusCode::OK, "create Shows: {created}");
+    assert_eq!(created["Name"], "Shows");
+    assert_eq!(created["Paths"], serde_json::json!([shows, more_shows]));
+
+    assert_listed_libraries(
+        &server.app,
+        &server.token,
+        server.user_id,
+        &["Films", "Shows"],
+    )
+    .await;
+    assert_eq!(
+        stored_library_names(&server.state).await,
+        ["Films", "Shows"]
+    );
+    let id = created["Id"].as_str().unwrap().parse().unwrap();
+    let stored = rustyfin_db::repo_library::get_library_by_id(&server.state.db, id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.paths, [shows, more_shows]);
+}
+
+#[tokio::test]
+async fn test_create_library_with_no_paths_still_works() {
+    let server = server_with_films().await;
+
+    let (status, created) = create_shows(&server, &[]).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "create Shows without paths: {created}"
+    );
+    assert_eq!(created["Paths"], serde_json::json!([]));
+    assert_listed_libraries(
+        &server.app,
+        &server.token,
+        server.user_id,
+        &["Films", "Shows"],
+    )
+    .await;
+    assert_eq!(
+        stored_library_names(&server.state).await,
+        ["Films", "Shows"]
+    );
 }
 
 // ── Search Endpoint Tests ──
@@ -3570,33 +3802,6 @@ async fn test_upgrade_promotes_earliest_admin() {
 // ── G1: authorization ──
 // Admin endpoints answer 401 without a valid token and 403 to a non-admin. Setup endpoints are
 // open only while the server has no users. Names taken from a request stay inside their directory.
-
-/// Creates the folder `media/<name>` in the test's data dir and returns its path.
-fn media_folder(state: &AppState, name: &str) -> String {
-    let dir = state.data_dir.join("media").join(name);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir.to_str().unwrap().to_string()
-}
-
-/// Creates a library on a new folder through the API and returns its id.
-async fn create_library_via_api(
-    app: &axum::Router,
-    state: &AppState,
-    token: &str,
-    name: &str,
-    content_type: &str,
-) -> uuid::Uuid {
-    let body = serde_json::json!({
-        "Name": name,
-        "ContentType": content_type,
-        "Paths": [media_folder(state, &name.to_lowercase())],
-    });
-    let req = request("POST", "/Library/VirtualFolders", Some(token), Some(body));
-    let (status, created) = send(app, req).await;
-    assert_eq!(status, StatusCode::OK, "create {name}: {created}");
-    assert_eq!(created["Name"], name);
-    created["Id"].as_str().unwrap().parse().unwrap()
-}
 
 /// Creates the owner through the wizard and a non-admin "viewer", logs both in and returns
 /// `(owner_token, owner_id, viewer_token, viewer_id)`.

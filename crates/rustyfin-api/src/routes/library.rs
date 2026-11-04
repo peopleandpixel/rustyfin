@@ -5,6 +5,7 @@ use rustyfin_model::library::{CreateLibraryRequest, Library, LibraryOptions};
 use rustyfin_model::ws_event::WsEvent;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::io::{self, ErrorKind};
 use std::path::Path as StdPath;
 use uuid::Uuid;
 
@@ -110,10 +111,52 @@ async fn get_libraries(State(state): State<AppState>) -> Result<Json<Vec<Library
     Ok(Json(libs))
 }
 
+/// Checks each library folder path, in request order. Returns one sentence for
+/// each path the server cannot use as a folder; an empty list means all are usable.
+async fn library_path_problems(paths: &[String]) -> Vec<String> {
+    let mut problems = Vec::new();
+    for p in paths {
+        let problem = if !StdPath::new(p).is_absolute() {
+            Some(format!(
+                "The folder \"{p}\" is not a full path on the server."
+            ))
+        } else {
+            match tokio::fs::metadata(p).await {
+                Ok(meta) if !meta.is_dir() => {
+                    Some(format!("The path \"{p}\" on the server is not a folder."))
+                }
+                Ok(_) => match tokio::fs::read_dir(p).await {
+                    Ok(_) => None,
+                    Err(e) => Some(unreadable_sentence(p, &e)),
+                },
+                Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
+                    Some(format!("The folder \"{p}\" was not found on the server."))
+                }
+                Err(e) => Some(unreadable_sentence(p, &e)),
+            }
+        };
+        problems.extend(problem);
+    }
+    problems
+}
+
+/// The sentence for a folder the server cannot read, given the error it hit.
+fn unreadable_sentence(p: &str, e: &io::Error) -> String {
+    if e.kind() == ErrorKind::PermissionDenied {
+        format!("The server does not have permission to read the folder \"{p}\".")
+    } else {
+        format!("The server cannot read the folder \"{p}\": {e}.")
+    }
+}
+
 async fn create_library(
     State(state): State<AppState>,
     Json(req): Json<CreateLibraryRequest>,
 ) -> Result<Json<Library>, ApiError> {
+    let problems = library_path_problems(&req.paths).await;
+    if !problems.is_empty() {
+        return Err(ApiError::BadRequest(problems.join(" ")));
+    }
     let lib = Library {
         id: Uuid::new_v4(),
         name: req.name,
