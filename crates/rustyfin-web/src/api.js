@@ -94,6 +94,24 @@ const API = {
         return id;
     },
 
+    // Builds the Error for a failed response: the JSON body's Detail or Title if present, else "METHOD path: status".
+    async _requestError(method, path, res) {
+        const fallback = `${method} ${path}: ${res.status}`;
+        let message = fallback;
+        try {
+            const text = await res.text();
+            if (text.startsWith('{')) {
+                const body = JSON.parse(text);
+                message = body.Detail || body.Title || fallback;
+            }
+        } catch (err) {
+            console.warn(`Could not read the error response of ${method} ${path}:`, err);
+        }
+        const error = new Error(message);
+        error.status = res.status;
+        return error;
+    },
+
     async get(path) {
         const res = await fetch(this.base + path, { headers: this.headers() });
         if (!res.ok) {
@@ -101,7 +119,7 @@ const API = {
                 this.logout();
                 window.location.hash = 'login';
             }
-            throw new Error(`GET ${path}: ${res.status}`);
+            throw await this._requestError('GET', path, res);
         }
         return res.json();
     },
@@ -112,7 +130,7 @@ const API = {
             headers: this.headers(),
             body: body ? JSON.stringify(body) : undefined
         });
-        if (!res.ok) throw new Error(`POST ${path}: ${res.status}`);
+        if (!res.ok) throw await this._requestError('POST', path, res);
         const text = await res.text();
         return text ? JSON.parse(text) : {};
     },
@@ -123,7 +141,7 @@ const API = {
             headers: this.headers(),
             body: body ? JSON.stringify(body) : undefined
         });
-        if (!res.ok) throw new Error(`PUT ${path}: ${res.status}`);
+        if (!res.ok) throw await this._requestError('PUT', path, res);
         const text = await res.text();
         return text ? JSON.parse(text) : {};
     },
@@ -133,7 +151,7 @@ const API = {
             method: 'DELETE',
             headers: this.headers()
         });
-        if (!res.ok) throw new Error(`DELETE ${path}: ${res.status}`);
+        if (!res.ok) throw await this._requestError('DELETE', path, res);
         const text = await res.text();
         return text ? JSON.parse(text) : {};
     },
@@ -208,10 +226,10 @@ const API = {
 
     // Libraries
     getLibraries() {
-        if (this.isAdmin) return this.cachedGet('/Library/VirtualFolders', 60000);
+        if (this.isAdmin) return this.get('/Library/VirtualFolders');
         // /Library/VirtualFolders is for administrators; other users get the same libraries from their views.
         const types = { movies: 'Movies', tvshows: 'TvShows', music: 'Music', homevideos: 'Photos' };
-        return this.cachedGet('/UserViews', 60000).then(views => (views.Items || []).map(v => ({
+        return this.get('/UserViews').then(views => (views.Items || []).map(v => ({
             id: v.Id,
             name: v.Name,
             content_type: types[v.CollectionType] || 'Mixed',

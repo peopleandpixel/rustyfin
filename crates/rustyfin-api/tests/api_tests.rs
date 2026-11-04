@@ -1216,6 +1216,219 @@ async fn test_get_user_views_with_library() {
     assert_eq!(items[0]["Type"], "CollectionFolder");
 }
 
+// ── Library List Consistency Tests ──
+//
+// Every list of libraries must show a create or delete as soon as it succeeds,
+// and no request may hide or remove a library it was not asked to remove.
+
+/// Creates an admin user and returns a bearer token and the user's id.
+async fn admin_session(state: &AppState) -> (String, uuid::Uuid) {
+    let username = format!("admin_{}", uuid::Uuid::new_v4().simple());
+    rustyfin_auth::create_initial_user(&state.db, &username, "admin")
+        .await
+        .unwrap();
+    let user = rustyfin_db::repo_user::get_user_by_name(&state.db, &username)
+        .await
+        .unwrap()
+        .unwrap();
+    let token = rustyfin_auth::create_token(&state.db, &user, &Default::default())
+        .await
+        .unwrap();
+    (token, user.id)
+}
+
+/// Sends an authenticated request and returns the status and the JSON body
+/// (`Null` when the body is not JSON).
+async fn send_authed(
+    app: &axum::Router,
+    method: &str,
+    uri: &str,
+    token: &str,
+    json_body: Option<&str>,
+) -> (StatusCode, serde_json::Value) {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("Authorization", format!("Bearer {token}"));
+    if json_body.is_some() {
+        builder = builder.header("Content-Type", "application/json");
+    }
+    let body = Body::from(json_body.unwrap_or_default().to_string());
+    let resp = app
+        .clone()
+        .oneshot(builder.body(body).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, json)
+}
+
+/// Creates a library through the API and returns its id.
+async fn create_library_via_api(
+    app: &axum::Router,
+    token: &str,
+    name: &str,
+    content_type: &str,
+) -> uuid::Uuid {
+    let body = serde_json::json!({
+        "Name": name,
+        "ContentType": content_type,
+        "Paths": [format!("/media/{}", name.to_lowercase())],
+    })
+    .to_string();
+    let (status, created) =
+        send_authed(app, "POST", "/Library/VirtualFolders", token, Some(&body)).await;
+    assert_eq!(status, StatusCode::OK, "create {name}: {created}");
+    assert_eq!(created["Name"], name);
+    created["Id"].as_str().unwrap().parse().unwrap()
+}
+
+/// Asserts that `/Library/VirtualFolders`, `/UserViews` and `/Users/{id}/Views`
+/// each list exactly the libraries named in `expected` (sorted).
+async fn assert_listed_libraries(
+    app: &axum::Router,
+    token: &str,
+    user_id: uuid::Uuid,
+    expected: &[&str],
+) {
+    for uri in [
+        "/Library/VirtualFolders".to_string(),
+        "/UserViews".to_string(),
+        format!("/Users/{user_id}/Views"),
+    ] {
+        let (status, body) = send_authed(app, "GET", &uri, token, None).await;
+        assert_eq!(status, StatusCode::OK, "GET {uri}");
+        // Views wrap the list in a query result; VirtualFolders is a bare array.
+        let entries = body
+            .get("Items")
+            .unwrap_or(&body)
+            .as_array()
+            .unwrap_or_else(|| panic!("GET {uri} returned no list: {body}"));
+        let mut names: Vec<&str> = entries
+            .iter()
+            .map(|e| e["Name"].as_str().unwrap())
+            .collect();
+        names.sort_unstable();
+        assert_eq!(names, expected, "libraries listed by GET {uri}");
+    }
+}
+
+/// Sorted names in the `libraries` table.
+async fn stored_library_names(state: &AppState) -> Vec<String> {
+    let mut names: Vec<String> = rustyfin_db::repo_library::get_all_libraries(&state.db)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|lib| lib.name)
+        .collect();
+    names.sort_unstable();
+    names
+}
+
+#[tokio::test]
+async fn test_user_views_show_library_created_after_cached_read() {
+    let state = test_state().await;
+    let (token, user_id) = admin_session(&state).await;
+    let app = app(state);
+
+    // Clients read the lists before the first library exists (home screen).
+    assert_listed_libraries(&app, &token, user_id, &[]).await;
+
+    create_library_via_api(&app, &token, "Films", "Movies").await;
+
+    assert_listed_libraries(&app, &token, user_id, &["Films"]).await;
+}
+
+#[tokio::test]
+async fn test_second_library_keeps_first_in_every_list() {
+    let state = test_state().await;
+    let (token, user_id) = admin_session(&state).await;
+    let app = app(state.clone());
+
+    create_library_via_api(&app, &token, "Films", "Movies").await;
+    assert_listed_libraries(&app, &token, user_id, &["Films"]).await;
+
+    create_library_via_api(&app, &token, "Shows", "TvShows").await;
+    assert_listed_libraries(&app, &token, user_id, &["Films", "Shows"]).await;
+    assert_eq!(stored_library_names(&state).await, ["Films", "Shows"]);
+}
+
+#[tokio::test]
+async fn test_delete_library_updates_every_list_and_keeps_others() {
+    let state = test_state().await;
+    let (token, user_id) = admin_session(&state).await;
+    let app = app(state.clone());
+
+    let films = create_library_via_api(&app, &token, "Films", "Movies").await;
+    let shows = create_library_via_api(&app, &token, "Shows", "TvShows").await;
+    for (library_id, item_name) in [(films, "Film item"), (shows, "Show item")] {
+        sqlx::query(
+            "INSERT INTO media_items (id, library_id, name, media_type, path) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(library_id.to_string())
+        .bind(item_name)
+        .bind("Movie")
+        .bind(format!("/media/{item_name}.mkv"))
+        .execute(&state.db)
+        .await
+        .unwrap();
+    }
+    assert_listed_libraries(&app, &token, user_id, &["Films", "Shows"]).await;
+
+    let (status, body) = send_authed(
+        &app,
+        "DELETE",
+        &format!("/Library/VirtualFolders/{shows}"),
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "delete Shows: {body}");
+
+    assert_listed_libraries(&app, &token, user_id, &["Films"]).await;
+    assert_eq!(stored_library_names(&state).await, ["Films"]);
+    let remaining_items: Vec<String> = sqlx::query_scalar("SELECT name FROM media_items")
+        .fetch_all(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(remaining_items, ["Film item"]);
+}
+
+#[tokio::test]
+async fn test_failed_library_create_changes_no_list() {
+    let state = test_state().await;
+    let (token, user_id) = admin_session(&state).await;
+    let app = app(state.clone());
+
+    create_library_via_api(&app, &token, "Films", "Movies").await;
+    assert_listed_libraries(&app, &token, user_id, &["Films"]).await;
+
+    for bad_body in [
+        r#"{"Name":"Shows","ContentType":"NoSuchType","Paths":["/media/shows"]}"#,
+        r#"{"Name":"Shows","ContentType":"TvShows"}"#,
+    ] {
+        let (status, _) = send_authed(
+            &app,
+            "POST",
+            "/Library/VirtualFolders",
+            &token,
+            Some(bad_body),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "create with {bad_body}"
+        );
+    }
+
+    assert_listed_libraries(&app, &token, user_id, &["Films"]).await;
+    assert_eq!(stored_library_names(&state).await, ["Films"]);
+}
+
 // ── Search Endpoint Tests ──
 
 #[tokio::test]

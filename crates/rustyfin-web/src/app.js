@@ -486,17 +486,18 @@ async function renderHome() {
     page.innerHTML = '<div class="flex justify-center items-center py-24"><div class="w-10 h-10 border-3 border-[#00a4dc] border-t-transparent rounded-full animate-spin"></div></div>';
 
     try {
+        let libsError = null;
         const [resumeData, nextUpData, latestData, libsData] = await Promise.all([
             (API.getResume ? API.getResume(12) : Promise.resolve({ Items: [] })).catch(() => ({ Items: [] })),
             (API.getNextUp ? API.getNextUp(12) : Promise.resolve({ Items: [] })).catch(() => ({ Items: [] })),
             (API.getLatest ? API.getLatest(20) : Promise.resolve([])).catch(() => []),
-            (API.getLibraries ? API.getLibraries() : Promise.resolve([])).catch(() => [])
+            API.getLibraries().catch(err => { libsError = err; return null; })
         ]);
 
         const resume = resumeData.Items || resumeData.items || [];
         const nextUp = nextUpData.Items || nextUpData.items || [];
         const latest = Array.isArray(latestData) ? latestData : (latestData.Items || latestData.items || []);
-        libraries = libsData || [];
+        if (!libsError) libraries = libsData || [];
 
         let c = '<div class="jf-page space-y-8">';
 
@@ -541,7 +542,16 @@ async function renderHome() {
         }
 
         // 2. "Meine Medien" Library Tiles
-        if (libraries.length > 0) {
+        if (libsError) {
+            c += `
+            <div class="mb-10">
+                <div class="flex items-center gap-2 mb-4">
+                    <span class="w-2.5 h-2.5 rounded-full bg-[#00a4dc]"></span>
+                    <h2 class="text-lg lg:text-xl font-bold tracking-tight text-white">${t('home.my_media')}</h2>
+                </div>
+                <p class="text-sm text-red-400">${t('library.list_failed', { message: escapeHtml(libsError.message) })}</p>
+            </div>`;
+        } else if (libraries.length > 0) {
             c += `
             <div class="mb-10">
                 <div class="flex items-center gap-2 mb-4">
@@ -2109,9 +2119,10 @@ async function renderAdmin() {
     page.innerHTML = '<div class="flex justify-center items-center py-24"><div class="w-10 h-10 border-3 border-[#00a4dc] border-t-transparent rounded-full animate-spin"></div></div>';
 
     try {
+        let libsError = null;
         const [users, libs, tasks, plugins, info, sessions] = await Promise.all([
             API.getUsers().catch(() => []),
-            API.getLibraries().catch(() => []),
+            API.getLibraries().catch(err => { libsError = err; return []; }),
             API.getTasks().catch(() => []),
             API.getPlugins().catch(() => []),
             API.getFullInfo().catch(() => ({})),
@@ -2162,7 +2173,7 @@ async function renderAdmin() {
                         <p class="text-[11px] text-white/40 uppercase tracking-wider mt-1">${t('admin.registered_users')}</p>
                     </div>
                     <div class="jf-settings-card text-center">
-                        <p class="text-3xl font-black text-amber-400">${libs.length}</p>
+                        <p class="text-3xl font-black text-amber-400">${libsError ? '—' : libs.length}</p>
                         <p class="text-[11px] text-white/40 uppercase tracking-wider mt-1">${t('admin.libraries')}</p>
                     </div>
                 </div>
@@ -2224,9 +2235,10 @@ async function renderAdmin() {
             <!-- Tab 2: Libraries -->
             <div id="admin-libs" class="hidden jf-settings-card">
                 <div class="flex justify-between items-center mb-4">
-                    <h3 class="font-bold text-white text-base">${t('admin.libraries_count', { number: libs.length })}</h3>
+                    <h3 class="font-bold text-white text-base">${t('admin.libraries_count', { number: libsError ? '—' : libs.length })}</h3>
                     <button class="jf-btn-primary text-xs" onclick="openAddLibrary()">${t('admin.new_library')}</button>
                 </div>
+                ${libsError ? `<p class="text-xs text-red-400">${t('library.list_failed', { message: escapeHtml(libsError.message) })}</p>` : `
                 <div class="overflow-x-auto">
                     <table class="w-full text-left text-xs">
                         <thead>
@@ -2245,12 +2257,12 @@ async function renderAdmin() {
                                 <td class="py-3 text-white/40 font-mono">${escapeHtml((l.paths || l.Paths || []).join(', '))}</td>
                                 <td class="py-3 text-right space-x-2">
                                     <button class="text-[#00a4dc] hover:text-[#38bdf8]" onclick="API.scanLibrary('${l.id || l.Id}').then(()=>toast(t('admin.scan_started')))">${t('admin.scan')}</button>
-                                    <button class="text-red-400 hover:text-red-300" onclick="if(confirm(t('admin.remove_library_confirm')))API.deleteLibrary('${l.id || l.Id}').then(()=>renderAdmin())">${t('common.delete')}</button>
+                                    <button class="text-red-400 hover:text-red-300" onclick="deleteLibraryFromAdmin('${l.id || l.Id}')">${t('common.delete')}</button>
                                 </td>
                             </tr>`).join('')}
                         </tbody>
                     </table>
-                </div>
+                </div>`}
             </div>
 
             <!-- Tab 3: Tasks -->
@@ -2561,21 +2573,34 @@ async function loadSidebar() {
         return;
     }
     show('sidebar');
+    if (API.isAdmin) {
+        show('sidebar-add-lib');
+        show('sidebar-admin-section');
+    } else {
+        hide('sidebar-add-lib');
+        hide('sidebar-admin-section');
+    }
+    let libs;
     try {
-        libraries = await API.getLibraries();
-        const list = $('sidebar-lib-list');
-        if (!list) return;
-        list.innerHTML = '';
-        const icons = {
-            movies: '🎬', tvshows: '📺', music: '🎵', photos: '🖼️', mixed: '📁',
-            Movies: '🎬', TvShows: '📺', Music: '🎵', Photos: '🖼️', Mixed: '📁'
-        };
-        libraries.forEach(lib => {
-            const id = lib.id || lib.Id;
-            const name = lib.name || lib.Name;
-            const type = lib.content_type || lib.ContentType || 'Mixed';
-            const isScanning = scanStatuses[id];
-            list.innerHTML += `
+        libs = await API.getLibraries();
+    } catch (err) {
+        toast(t('library.list_failed', { message: err.message }), 'error');
+        return;
+    }
+    libraries = libs;
+    const list = $('sidebar-lib-list');
+    if (!list) return;
+    list.innerHTML = '';
+    const icons = {
+        movies: '🎬', tvshows: '📺', music: '🎵', photos: '🖼️', mixed: '📁',
+        Movies: '🎬', TvShows: '📺', Music: '🎵', Photos: '🖼️', Mixed: '📁'
+    };
+    libraries.forEach(lib => {
+        const id = lib.id || lib.Id;
+        const name = lib.name || lib.Name;
+        const type = lib.content_type || lib.ContentType || 'Mixed';
+        const isScanning = scanStatuses[id];
+        list.innerHTML += `
             <div class="flex items-center gap-1 group">
                 <a onclick="navigate('library','${id}')" class="jf-drawer-item ${currentLibraryId === id && currentPage === 'library' ? 'active' : ''} flex-1">
                     <span class="text-base">${icons[type] || '📁'}</span>
@@ -2586,16 +2611,7 @@ async function loadSidebar() {
                     <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
                 </button>
             </div>`;
-        });
-
-        if (API.isAdmin) {
-            show('sidebar-add-lib');
-            show('sidebar-admin-section');
-        } else {
-            hide('sidebar-add-lib');
-            hide('sidebar-admin-section');
-        }
-    } catch {}
+    });
 }
 
 // --- Add Library Modal Handlers ---
@@ -2629,10 +2645,30 @@ function closeAddLibrary() {
     }
 }
 
+async function deleteLibraryFromAdmin(id) {
+    if (!confirm(t('admin.remove_library_confirm'))) return;
+    try {
+        await API.deleteLibrary(id);
+    } catch (err) {
+        toast(t('library.delete_failed', { message: err.message }), 'error');
+        return;
+    }
+    await loadSidebar();
+    renderAdmin();
+}
+
 // Directory picker state
 let directoryPickerPath = '/';
 let directoryPickerHistory = ['/'];
 let selectedLibraryPaths = [];
+
+// Shows a message inside the add-library dialog; an empty message hides the box
+function setAddLibraryError(message) {
+    const el = $('add-lib-error');
+    if (!el) return;
+    el.textContent = message || '';
+    el.classList.toggle('hidden', !message);
+}
 
 async function submitAddLibrary(e) {
     e.preventDefault();
@@ -2642,19 +2678,31 @@ async function submitAddLibrary(e) {
     // Combine selected paths from picker with manual input
     const manualPaths = f.paths.value.split(',').map(p => p.trim()).filter(Boolean);
     const paths = [...new Set([...selectedLibraryPaths, ...manualPaths])];
+    const submitBtn = $('add-lib-submit');
 
+    setAddLibraryError('');
     if (!name || !paths.length) {
-        toast(t('library.name_and_path_required'), 'error');
+        setAddLibraryError(t('library.name_and_path_required'));
         return;
     }
+    let lib;
+    if (submitBtn) submitBtn.disabled = true;
     try {
-        const lib = await API.createLibrary(name, type, paths);
-        toast(t('library.created', { name }));
-        closeAddLibrary();
-        // Reset selected paths
-        selectedLibraryPaths = [];
-        // Auto-start scan after creating library
-        API.scanLibrary(lib.id || lib.Id).catch(() => {});
+        lib = await API.createLibrary(name, type, paths);
+    } catch (err) {
+        setAddLibraryError(t('library.create_failed', { message: err.message }));
+        return;
+    } finally {
+        if (submitBtn) submitBtn.disabled = false;
+    }
+    toast(t('library.created', { name }));
+    closeAddLibrary();
+    // Reset selected paths
+    selectedLibraryPaths = [];
+    // Auto-start scan after creating library
+    API.scanLibrary(lib.id || lib.Id).catch(err => toast(t('library.scan_start_failed', { message: err.message }), 'error'));
+    // The library exists at this point, so a reload error is not a creation failure: toast it as before
+    try {
         await loadSidebar();
         if (currentPage === 'admin') renderAdmin();
         else if (currentPage === 'home') renderHome();
@@ -2782,8 +2830,15 @@ function removeSelectedPath(index) {
 const _origOpenAddLibrary = openAddLibrary;
 openAddLibrary = function() {
     selectedLibraryPaths = [];
+    renderSelectedPaths();
     const picker = $('directory-picker');
     if (picker) picker.classList.add('hidden');
+    // The picker hides the path input; restore it in case the dialog was closed while the picker was open
+    const input = $('add-lib-path-input');
+    if (input) input.classList.remove('hidden');
+    setAddLibraryError('');
+    const submitBtn = $('add-lib-submit');
+    if (submitBtn) submitBtn.disabled = false;
     _origOpenAddLibrary();
 };
 

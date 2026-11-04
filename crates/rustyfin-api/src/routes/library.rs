@@ -121,6 +121,7 @@ async fn create_library(
         paths: req.paths,
     };
     rustyfin_db::repo_library::create_library(&state.db, &lib).await?;
+    state.cache.invalidate_library_lists();
     Ok(Json(lib))
 }
 
@@ -129,6 +130,7 @@ async fn remove_library(
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>, ApiError> {
     rustyfin_db::repo_library::delete_library(&state.db, id).await?;
+    state.cache.invalidate_library_lists();
     Ok(Json(json!({ "status": "ok" })))
 }
 

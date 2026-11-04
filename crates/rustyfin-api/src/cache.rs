@@ -8,7 +8,7 @@ use std::sync::Arc;
 /// Supports L2 SQLite-backed cache for persistence across restarts.
 #[derive(Clone)]
 pub struct ApiCache {
-    /// Library views — change only on scan.
+    /// Library views — change only on scan, library create, and library remove.
     /// Key: "views" (singleton), Value: JSON QueryResult of library views.
     pub library_views: Cache<String, Value>,
 
@@ -16,7 +16,7 @@ pub struct ApiCache {
     /// Key: item UUID string, Value: JSON MediaItem.
     pub item_details: Cache<String, Value>,
 
-    /// Filter lists — change only on scan.
+    /// Filter lists — change only on scan, library create, and library remove.
     /// Key: library_id UUID string or "all", Value: JSON FiltersResult.
     pub filter_lists: Cache<String, Value>,
 
@@ -60,10 +60,16 @@ impl ApiCache {
         }
     }
 
-    /// Invalidate caches when a library scan completes.
-    pub fn invalidate_on_scan(&self) {
+    /// Invalidate caches that list libraries or their items: call after a scan,
+    /// or after a library is created or removed.
+    pub fn invalidate_library_lists(&self) {
         self.library_views.invalidate("views");
         self.filter_lists.invalidate_all();
+    }
+
+    /// Invalidate caches when a library scan completes.
+    pub fn invalidate_on_scan(&self) {
+        self.invalidate_library_lists();
     }
 
     /// Invalidate a specific item's cache when metadata is refreshed.
