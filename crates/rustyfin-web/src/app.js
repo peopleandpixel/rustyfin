@@ -30,12 +30,13 @@ function hide(id) {
     el.style.setProperty('display', 'none', 'important');
 }
 
-function initLazyImages() {
+function initLazyImages(root = document) {
     // Hover-based full-res image loading: swap thumbnail for full-res on card hover
-    document.querySelectorAll('img.jf-thumb-img[data-full-src]').forEach(img => {
-        if (img.dataset.fullLoaded) return;
+    root.querySelectorAll('img.jf-thumb-img[data-full-src]').forEach(img => {
+        if (img.dataset.lazyBound) return;
         const card = img.closest('.jf-card');
         if (!card) return;
+        img.dataset.lazyBound = '1';
 
         card.addEventListener('mouseenter', () => {
             if (img.dataset.fullLoaded) return;
@@ -353,7 +354,7 @@ function itemCard(item, options = {}) {
         <div class="${isBackdrop ? 'jf-poster-backdrop' : 'jf-poster'}">
             <div class="jf-poster-skeleton"></div>
             <!-- Thumbnail loads first for instant visual feedback; full-res swaps on hover -->
-            <img src="${thumbSrc}" alt="${escapeHtml(name)}" decoding="async" class="jf-thumb-img absolute inset-0 w-full h-full object-cover z-[1] opacity-0 blur-sm scale-105 transition-opacity duration-200"
+            <img src="${thumbSrc}" alt="${escapeHtml(name)}" decoding="async" loading="lazy" class="jf-thumb-img absolute inset-0 w-full h-full object-cover z-[1] opacity-0 blur-sm scale-105 transition-opacity duration-200"
                  data-full-src="${fullSrc}"
                  onload="this.style.opacity='0.8';this.classList.remove('blur-sm','scale-105');const sk=this.previousElementSibling;if(sk&&sk.classList.contains('jf-poster-skeleton'))sk.style.display='none';"
                  onerror="this.style.display='none';const sk=this.previousElementSibling;if(sk&&sk.classList.contains('jf-poster-skeleton'))sk.style.display='none';">
@@ -655,18 +656,14 @@ async function renderFavorites() {
                     <h1 class="text-2xl lg:text-3xl font-extrabold text-white tracking-tight">${t('favorites.title')}</h1>
                     <span class="text-xs text-white/40">(${total})</span>
                 </div>
-                <div id="fav-grid-container"></div>
+                <div id="fav-grid" class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-7 gap-4"></div>
                 ${hasMore ? `
                 <div id="fav-infinite-container" class="text-center mt-8">
                     <div id="infinite-scroll-spinner" class="jf-infinite-spinner" style="display:none"><div class="jf-spinner"></div></div>
                     <div id="infinite-scroll-sentinel" class="jf-infinite-sentinel"></div>
                 </div>` : ''}
             </div>`;
-            // Initialize virtual grid for favorites
-            if (virtualGrid) { virtualGrid.destroy(); virtualGrid = null; }
-            virtualGrid = new VirtualGrid('fav-grid-container');
-            virtualGrid.init();
-            virtualGrid.setItems(items);
+            appendFavoriteCards(items);
         } else {
             page.innerHTML = `
             <div class="jf-page">
@@ -693,6 +690,19 @@ async function renderFavorites() {
 
 let favoritesPage = 0;
 
+// Appends one card per item to the favorites grid
+function appendFavoriteCards(items) {
+    const grid = $('fav-grid');
+    if (!grid) return;
+    const frag = document.createDocumentFragment();
+    for (const item of items) {
+        const card = createCardElement(item);
+        if (card) frag.appendChild(card);
+    }
+    grid.appendChild(frag);
+    initLazyImages(grid);
+}
+
 async function loadMoreFavoritesInfinite(initialTotal) {
     try {
         favoritesPage++;
@@ -701,9 +711,7 @@ async function loadMoreFavoritesInfinite(initialTotal) {
         const items = data.Items || data.items || [];
         const total = data.TotalRecordCount || data.total_record_count || initialTotal;
 
-        if (items.length > 0 && virtualGrid) {
-            virtualGrid.appendItems(items);
-        }
+        appendFavoriteCards(items);
 
         // If no more items, destroy infinite scroll and remove sentinel
         const remaining = total - (favoritesPage + 1) * LIBRARY_PAGE_SIZE;
@@ -717,8 +725,13 @@ async function loadMoreFavoritesInfinite(initialTotal) {
     }
 }
 
-let currentLetterFilter = '';
-let libraryPage = 0;
+// Library list state: each load gets a new generation, and responses from older generations are dropped
+let libraryGen = 0;
+let libraryQuery = null;
+let libraryTotal = null;
+let libraryObserver = null;
+let libraryRequested = new Set();
+let letterClicks = 0;
 const LIBRARY_PAGE_SIZE = 50;
 
 // --- Infinite Scroll via IntersectionObserver ---
@@ -797,152 +810,9 @@ function addInfiniteScrollSentinel(container) {
     container.appendChild(sentinel);
 }
 
-// --- Virtual Grid: only render visible cards + buffer ---
-// Replaces the DOM-heavy approach of appending all cards to the grid.
-// With 1500 films, this keeps ~30 DOM cards instead of 1500+.
-class VirtualGrid {
-    constructor(containerId, options = {}) {
-        this.containerId = containerId;
-        this.items = [];
-        this.cardHeight = options.cardHeight || 280; // estimated card height in px
-        this.buffer = options.buffer || 5; // extra cards above/below viewport
-        this.columns = this._getColumns();
-        this.scrollContainer = null;
-        this.gridEl = null;
-        this.spacerTop = null;
-        this.spacerBottom = null;
-        this.cardsContainer = null;
-        this.renderedStart = -1;
-        this.renderedEnd = -1;
-        this.resizeObserver = null;
-        this._onResize = this._onResize.bind(this);
-        this._onScroll = this._onScroll.bind(this);
-        this._rafId = null;
-    }
-
-    _getColumns() {
-        const w = window.innerWidth;
-        if (w >= 1280) return 7;
-        if (w >= 1024) return 5;
-        if (w >= 768) return 4;
-        if (w >= 640) return 3;
-        return 2;
-    }
-
-    init() {
-        this.container = document.getElementById(this.containerId);
-        if (!this.container) return;
-        // Create virtual grid structure
-        this.container.innerHTML = `
-            <div class="jf-virtual-grid" style="position:relative;overflow:auto;max-height:calc(100vh - 280px);">
-                <div class="jf-virtual-spacer" style="height:0"></div>
-                <div class="jf-virtual-cards" style="position:absolute;top:0;left:0;right:0;"></div>
-                <div class="jf-virtual-spacer" style="height:0"></div>
-            </div>`;
-        this.scrollContainer = this.container.querySelector('.jf-virtual-grid');
-        this.spacerTop = this.scrollContainer.children[0];
-        this.cardsContainer = this.scrollContainer.children[1];
-        this.spacerBottom = this.scrollContainer.children[2];
-        this.scrollContainer.addEventListener('scroll', this._onScroll, { passive: true });
-        this.resizeObserver = new ResizeObserver(this._onResize);
-        this.resizeObserver.observe(this.scrollContainer);
-        this._updateTotalHeight();
-    }
-
-    destroy() {
-        if (this.scrollContainer) {
-            this.scrollContainer.removeEventListener('scroll', this._onScroll);
-        }
-        if (this.resizeObserver) {
-            this.resizeObserver.disconnect();
-        }
-        if (this._rafId) {
-            cancelAnimationFrame(this._rafId);
-        }
-    }
-
-    _onResize() {
-        this.columns = this._getColumns();
-        this._renderVisible();
-    }
-
-    _onScroll() {
-        if (this._rafId) return;
-        this._rafId = requestAnimationFrame(() => {
-            this._rafId = null;
-            this._renderVisible();
-        });
-    }
-
-    _updateTotalHeight() {
-        const rows = Math.ceil(this.items.length / this.columns);
-        const totalHeight = rows * this.cardHeight;
-        this.spacerTop.style.height = '0px';
-        this.spacerBottom.style.height = `${Math.max(0, totalHeight)}px`;
-        this.scrollContainer.style.minHeight = `${totalHeight}px`;
-    }
-
-    setItems(newItems) {
-        this.items = newItems;
-        this._updateTotalHeight();
-        this._renderVisible();
-    }
-
-    appendItems(newItems) {
-        this.items.push(...newItems);
-        this._updateTotalHeight();
-        this._renderVisible();
-    }
-
-    _renderVisible() {
-        if (!this.scrollContainer || this.items.length === 0) return;
-        const scrollTop = this.scrollContainer.scrollTop;
-        const viewportHeight = this.scrollContainer.clientHeight;
-        const rowsPerCard = 1; // each card is one row in the grid
-        const cardHeightWithGap = this.cardHeight + 16; // gap-4 = 16px
-
-        const startRow = Math.max(0, Math.floor(scrollTop / cardHeightWithGap) - this.buffer);
-        const endRow = Math.ceil((scrollTop + viewportHeight) / cardHeightWithGap) + this.buffer;
-
-        const startIdx = Math.max(0, startRow * this.columns);
-        const endIdx = Math.min(this.items.length, (endRow + 1) * this.columns);
-
-        if (startIdx === this.renderedStart && endIdx === this.renderedEnd) return;
-        this.renderedStart = startIdx;
-        this.renderedEnd = endIdx;
-
-        // Clear and re-render visible range
-        this.cardsContainer.innerHTML = '';
-        const fragment = document.createDocumentFragment();
-        const grid = document.createElement('div');
-        grid.className = 'grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-7 gap-4';
-        grid.style.paddingTop = `${startIdx * cardHeightWithGap}px`;
-        grid.style.paddingBottom = `${Math.max(0, (this.items.length - endIdx) * cardHeightWithGap)}px`;
-
-        for (let i = startIdx; i < endIdx; i++) {
-            const card = createCardElement(this.items[i]);
-            if (card) grid.appendChild(card);
-        }
-        fragment.appendChild(grid);
-        this.cardsContainer.appendChild(fragment);
-
-        // Update spacers
-        this.spacerTop.style.height = `${startIdx * cardHeightWithGap}px`;
-        const remaining = this.items.length - endIdx;
-        this.spacerBottom.style.height = `${remaining * cardHeightWithGap}px`;
-
-        initLazyImages();
-    }
-}
-
-// Global virtual grid instance
-let virtualGrid = null;
-
 // --- Library Explorer Page Renderer (with pagination) ---
 async function renderLibrary(libId) {
     currentLibraryId = libId;
-    currentLetterFilter = '';
-    libraryPage = 0;
     const page = $('page-library');
     
     // Show skeleton grid immediately for instant visual feedback
@@ -979,37 +849,15 @@ async function renderLibrary(libId) {
         </div>
     </div>`;
 
+    const gen = startLibraryLoad(libId);
     try {
-        // Determine which item types to show based on library content type
-        let includeItemTypes = undefined;
-        if (contentType === 'TvShows') {
-            includeItemTypes = 'Series';
-        } else if (contentType === 'Music') {
-            includeItemTypes = 'MusicAlbum';
-        } else if (contentType === 'Movies') {
-            includeItemTypes = 'Movie';
-        }
-
-        // Fetch first page with pagination + total count
-        const params = { 
-            LibraryId: libId, 
-            SortBy: 'SortName', 
-            SortOrder: 'Ascending', 
-            Fields: 'PrimaryImageAspectRatio',
-            StartIndex: 0,
-            Limit: LIBRARY_PAGE_SIZE
-        };
-        if (includeItemTypes) params.IncludeItemTypes = includeItemTypes;
-
-        const [libData, filterData] = await Promise.all([
-            API.getItems(params),
+        // Fetch first page with pagination + total count, and the genres for the filter
+        const [{ items, total }, filterData] = await Promise.all([
+            fetchLibraryPage(0),
             API.getFilters().catch(() => ({ Genres: [] }))
         ]);
-
-        const items = libData.Items || libData.items || [];
-        const total = libData.TotalRecordCount || libData.total_record_count || items.length;
+        if (gen !== libraryGen) return;
         const genres = filterData.Genres || filterData.genres || [];
-        const hasMore = items.length >= LIBRARY_PAGE_SIZE;
 
         page.innerHTML = `
         <div class="jf-page">
@@ -1025,7 +873,7 @@ async function renderLibrary(libId) {
 
                 <div class="flex flex-wrap items-center gap-2">
                     <!-- Sort selector -->
-                    <select id="lib-sort" class="jf-input !py-1.5 text-xs" onchange="filterLibrary('${libId}')">
+                    <select id="lib-sort" class="jf-input !py-1.5 text-xs" onchange="reloadLibrary('${libId}')">
                         <option value="SortName:Ascending">${t('library.sort_name_asc')}</option>
                         <option value="SortName:Descending">${t('library.sort_name_desc')}</option>
                         <option value="PremiereDate:Descending">${t('library.sort_release_date')}</option>
@@ -1035,7 +883,7 @@ async function renderLibrary(libId) {
 
                     <!-- Genre filter -->
                     ${genres.length > 0 ? `
-                    <select id="lib-genre" class="jf-input !py-1.5 text-xs max-w-[140px]" onchange="filterLibrary('${libId}')">
+                    <select id="lib-genre" class="jf-input !py-1.5 text-xs max-w-[140px]" onchange="reloadLibrary('${libId}')">
                         <option value="">${t('library.all_genres')}</option>
                         ${genres.map(g => `<option value="${escapeHtml(g)}">${escapeHtml(g)}</option>`).join('')}
                     </select>` : ''}
@@ -1049,211 +897,185 @@ async function renderLibrary(libId) {
 
             <!-- Alphabet Quick Jump Bar -->
             <div class="jf-alpha-bar mb-6">
-                <button class="jf-alpha-btn active" data-letter="" onclick="jumpToLetter('${libId}', '')">${t('common.all')}</button>
                 ${'#ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('').map(l => `
                     <button class="jf-alpha-btn" data-letter="${l}" onclick="jumpToLetter('${libId}', '${l}')">${l}</button>
                 `).join('')}
             </div>
 
-            <!-- Media Grid Container (Virtual Scrolling) -->
+            <!-- Media Grid Container -->
             <div id="lib-grid-container"></div>
-
-            <!-- Infinite Scroll Sentinel (replaces Load More button) -->
-            ${hasMore ? `
-            <div id="lib-infinite-container" class="text-center mt-8">
-                <div id="infinite-scroll-spinner" class="jf-infinite-spinner" style="display:none"><div class="jf-spinner"></div></div>
-                <div id="infinite-scroll-sentinel" class="jf-infinite-sentinel"></div>
-            </div>` : ''}
         </div>`;
-        // Initialize virtual grid for library
-        if (virtualGrid) { virtualGrid.destroy(); virtualGrid = null; }
-        virtualGrid = new VirtualGrid('lib-grid-container');
-        virtualGrid.init();
-        if (items.length > 0) {
-            virtualGrid.setItems(items);
-        }
-        // Setup infinite scroll for library
-        if (hasMore) {
-            setupInfiniteScroll(() => loadMoreLibraryItemsInfinite(libId, total));
-        }
+        fillLibraryGrid(items, total);
     } catch (e) {
+        if (gen !== libraryGen) return;
         page.innerHTML = `<div class="p-6 rounded-xl bg-red-500/10 text-red-400">${escapeHtml(e.message)}</div>`;
     }
 }
 
-// --- Load More Library Items (infinite scroll callback) ---
-async function loadMoreLibraryItemsInfinite(libId, initialTotal) {
+// The /Items query for the library list; paging is added per request
+function libraryListQuery(libId) {
+    const lib = libraries.find(l => (l.id || l.Id) === libId);
+    const contentType = lib?.content_type || lib?.Content_type || lib?.ContentType || '';
+
+    let includeItemTypes = undefined;
+    if (contentType === 'TvShows') includeItemTypes = 'Series';
+    else if (contentType === 'Music') includeItemTypes = 'MusicAlbum';
+    else if (contentType === 'Movies') includeItemTypes = 'Movie';
+
+    const [sortBy, sortOrder] = ($('lib-sort')?.value || 'SortName:Ascending').split(':');
+    return {
+        LibraryId: libId,
+        IncludeItemTypes: includeItemTypes,
+        SortBy: sortBy,
+        SortOrder: sortOrder,
+        Fields: 'PrimaryImageAspectRatio',
+        Genres: $('lib-genre')?.value || undefined
+    };
+}
+
+// Starts a load: a new generation, and the observer of the previous load is dropped
+function startLibraryLoad(libId) {
+    libraryObserver?.disconnect();
+    libraryObserver = null;
+    libraryQuery = libraryListQuery(libId);
+    libraryTotal = null;
+    libraryRequested = new Set([0]); // the first page is requested by the load itself
+    return ++libraryGen;
+}
+
+// One page of the current load, with the total record count
+async function fetchLibraryPage(startIndex) {
+    const data = await API.getItems({ ...libraryQuery, StartIndex: startIndex, Limit: LIBRARY_PAGE_SIZE });
+    const items = data.Items || data.items || [];
+    return { items, total: data.TotalRecordCount || data.total_record_count || items.length };
+}
+
+// Fills #lib-grid-container with one child per item: cards for the loaded items, placeholders for the rest
+function fillLibraryGrid(items, total) {
+    const container = $('lib-grid-container');
+    if (!container) return;
+    libraryTotal = total;
+    if (total === 0) {
+        container.innerHTML = `<div class="text-center py-20 text-white/40">${t('library.no_filter_results')}</div>`;
+        return;
+    }
+    container.innerHTML = '<div id="lib-grid" class="jf-lib-grid"></div>';
+    const grid = container.firstElementChild;
+
+    const template = document.createElement('div');
+    template.innerHTML = '<div class="jf-card"><div class="jf-poster"></div><div class="p-3"><p class="text-xs sm:text-sm">&nbsp;</p><div class="text-[11px] mt-0.5">&nbsp;</div></div></div>';
+    const placeholder = template.firstElementChild;
+    const frag = document.createDocumentFragment();
+    for (let i = 0; i < total; i++) {
+        if (i < items.length) {
+            frag.appendChild(createCardElement(items[i]));
+        } else {
+            const ph = placeholder.cloneNode(true);
+            ph.dataset.i = i;
+            frag.appendChild(ph);
+        }
+    }
+    grid.appendChild(frag);
+    initLazyImages(grid);
+
+    // A placeholder that comes near the viewport requests its page, once per load
+    const gen = libraryGen;
+    libraryObserver = new IntersectionObserver(entries => {
+        if (gen !== libraryGen) return; // a newer load has replaced this observer
+        for (const entry of entries) {
+            if (!entry.isIntersecting) continue;
+            const page = Math.floor(Number(entry.target.dataset.i) / LIBRARY_PAGE_SIZE);
+            if (libraryRequested.has(page)) continue;
+            libraryRequested.add(page);
+            loadLibraryPage(gen, page);
+        }
+    }, { rootMargin: '200% 0px' });
+    grid.querySelectorAll('[data-i]').forEach(ph => libraryObserver.observe(ph));
+}
+
+// Puts the cards of one page in place of its placeholders
+async function loadLibraryPage(gen, page) {
     try {
-        const lib = libraries.find(l => (l.id || l.Id) === libId);
-        const contentType = lib?.content_type || lib?.Content_type || lib?.ContentType || '';
-
-        let includeItemTypes = undefined;
-        if (contentType === 'TvShows') includeItemTypes = 'Series';
-        else if (contentType === 'Music') includeItemTypes = 'MusicAlbum';
-        else if (contentType === 'Movies') includeItemTypes = 'Movie';
-
-        libraryPage++;
-        const startIndex = libraryPage * LIBRARY_PAGE_SIZE;
-
-        const params = { 
-            LibraryId: libId, 
-            SortBy: 'SortName', 
-            SortOrder: 'Ascending', 
-            Fields: 'PrimaryImageAspectRatio',
-            StartIndex: startIndex,
-            Limit: LIBRARY_PAGE_SIZE
-        };
-        if (includeItemTypes) params.IncludeItemTypes = includeItemTypes;
-
-        const data = await API.getItems(params);
-        const items = data.Items || data.items || [];
-        const total = data.TotalRecordCount || data.total_record_count || initialTotal;
-
-        if (items.length > 0 && virtualGrid) {
-            virtualGrid.appendItems(items);
-        }
-
-        // If no more items, destroy infinite scroll and remove sentinel
-        const remaining = total - (libraryPage + 1) * LIBRARY_PAGE_SIZE;
-        if (remaining <= 0) {
-            destroyInfiniteScroll();
-            const sentinelContainer = $('lib-infinite-container');
-            if (sentinelContainer) sentinelContainer.remove();
-        }
+        const { items } = await fetchLibraryPage(page * LIBRARY_PAGE_SIZE);
+        if (gen !== libraryGen) return;
+        const grid = $('lib-grid');
+        items.forEach((item, j) => {
+            const placeholder = grid?.children[page * LIBRARY_PAGE_SIZE + j];
+            if (!placeholder) return;
+            const card = createCardElement(item);
+            placeholder.replaceWith(card);
+            libraryObserver.unobserve(placeholder);
+            initLazyImages(card);
+        });
     } catch (e) {
+        if (gen !== libraryGen) return;
+        libraryRequested.delete(page);
         toast(t('library.load_failed', { message: e.message }), 'error');
     }
 }
 
-async function filterLibrary(libId) {
+// A sort or genre change: a new load for the new query, shown from the top of the list
+async function reloadLibrary(libId) {
     const sortVal = $('lib-sort')?.value || 'SortName:Ascending';
-    const [sortBy, sortOrder] = sortVal.split(':');
-    const genre = $('lib-genre')?.value || '';
+    // The letter bar follows name order only, so it is hidden for the other sorts
+    const alphaBar = document.querySelector('#page-library .jf-alpha-bar');
+    if (alphaBar) alphaBar.style.display = sortVal.startsWith('SortName') ? '' : 'none';
 
-    // Remove existing infinite scroll when filtering
-    destroyInfiniteScroll();
-    const existingInfinite = document.getElementById('lib-infinite-container');
-    if (existingInfinite) existingInfinite.remove();
-
-    // Show loading state in virtual grid container
+    window.scrollTo({ top: 0, behavior: 'instant' });
+    const gen = startLibraryLoad(libId);
     const container = $('lib-grid-container');
     if (container) {
         container.innerHTML = '<div class="flex justify-center items-center py-24"><div class="w-10 h-10 border-3 border-[#00a4dc] border-t-transparent rounded-full animate-spin"></div></div>';
     }
 
     try {
-        const lib = libraries.find(l => (l.id || l.Id) === libId);
-        const contentType = lib?.content_type || lib?.Content_type || lib?.ContentType || '';
-
-        let includeItemTypes = undefined;
-        if (contentType === 'TvShows') includeItemTypes = 'Series';
-        else if (contentType === 'Music') includeItemTypes = 'MusicAlbum';
-        else if (contentType === 'Movies') includeItemTypes = 'Movie';
-
-        // Reset pagination on filter change
-        libraryPage = 0;
-
-        // Fetch first page with pagination
-        const params = { 
-            LibraryId: libId, 
-            SortBy: sortBy, 
-            SortOrder: sortOrder, 
-            Fields: 'PrimaryImageAspectRatio',
-            StartIndex: 0,
-            Limit: LIBRARY_PAGE_SIZE
-        };
-        if (includeItemTypes) params.IncludeItemTypes = includeItemTypes;
-        if (genre) params.Genres = genre;
-        if (currentLetterFilter) params.NameStartsWith = currentLetterFilter;
-
-        const data = await API.getItems(params);
-        const items = data.Items || data.items || [];
-        const total = data.TotalRecordCount || data.total_record_count || items.length;
-        const hasMore = items.length >= LIBRARY_PAGE_SIZE;
+        const { items, total } = await fetchLibraryPage(0);
+        if (gen !== libraryGen) return;
+        fillLibraryGrid(items, total);
         const countLabel = $('lib-count-label');
         if (countLabel) countLabel.textContent = t('library.item_count', { count: total });
-
-        if (items.length > 0) {
-            // Initialize virtual grid for filtered results
-            if (virtualGrid) { virtualGrid.destroy(); virtualGrid = null; }
-            virtualGrid = new VirtualGrid('lib-grid-container');
-            virtualGrid.init();
-            virtualGrid.setItems(items);
-            // Setup infinite scroll for filtered library
-            if (hasMore) {
-                const infDiv = document.createElement('div');
-                infDiv.id = 'lib-infinite-container';
-                infDiv.className = 'text-center mt-8';
-                infDiv.innerHTML = `
-                    <div id="infinite-scroll-spinner" class="jf-infinite-spinner" style="display:none"><div class="jf-spinner"></div></div>
-                    <div id="infinite-scroll-sentinel" class="jf-infinite-sentinel"></div>
-                `;
-                // Append sentinel after the virtual grid container
-                const page = $('page-library');
-                if (page) page.querySelector('.jf-page').appendChild(infDiv);
-                setupInfiniteScroll(() => loadMoreFilteredLibraryItemsInfinite(libId, total));
-            }
-        } else {
-            if (container) container.innerHTML = `<div class="text-center py-20 text-white/40">${t('library.no_filter_results')}</div>`;
-        }
     } catch (e) {
+        if (gen !== libraryGen) return;
         toast(t('library.filter_failed', { message: e.message }), 'error');
     }
 }
 
-// --- Load More for Filtered Library (infinite scroll callback) ---
-async function loadMoreFilteredLibraryItemsInfinite(libId, initialTotal) {
+// Scrolls the list to the first item of a letter. Nothing is filtered.
+async function jumpToLetter(libId, letter) {
+    const click = ++letterClicks;
+    const gen = libraryGen;
+    if (libraryTotal === null || !$('lib-grid')) return;
+    const query = libraryQuery;
+    const n = libraryTotal;
+    const desc = query.SortOrder === 'Descending';
+    const stale = () => click !== letterClicks || gen !== libraryGen;
+    // Count of items whose name sorts at or after the bound; Limit 0 fetches no items
+    const countFrom = async (bound) => {
+        const data = await API.getItems({ ...query, NameStartsWithOrGreater: bound, Limit: 0 });
+        return data.TotalRecordCount || data.total_record_count || 0;
+    };
     try {
-        const sortVal = $('lib-sort')?.value || 'SortName:Ascending';
-        const [sortBy, sortOrder] = sortVal.split(':');
-        const genre = $('lib-genre')?.value || '';
-
-        const lib = libraries.find(l => (l.id || l.Id) === libId);
-        const contentType = lib?.content_type || lib?.Content_type || lib?.ContentType || '';
-        let includeItemTypes = undefined;
-        if (contentType === 'TvShows') includeItemTypes = 'Series';
-        else if (contentType === 'Music') includeItemTypes = 'MusicAlbum';
-        else if (contentType === 'Movies') includeItemTypes = 'Movie';
-
-        libraryPage++;
-        const startIndex = libraryPage * LIBRARY_PAGE_SIZE;
-
-        const params = { 
-            LibraryId: libId, SortBy: sortBy, SortOrder: sortOrder, 
-            Fields: 'PrimaryImageAspectRatio',
-            StartIndex: startIndex, Limit: LIBRARY_PAGE_SIZE
-        };
-        if (includeItemTypes) params.IncludeItemTypes = includeItemTypes;
-        if (genre) params.Genres = genre;
-        if (currentLetterFilter) params.NameStartsWith = currentLetterFilter;
-
-        const data = await API.getItems(params);
-        const items = data.Items || data.items || [];
-        const total = data.TotalRecordCount || data.total_record_count || initialTotal;
-
-        if (items.length > 0 && virtualGrid) {
-            virtualGrid.appendItems(items);
+        let k = 0;
+        if (letter !== '#') {
+            const b = letter.toLowerCase();
+            k = desc
+                ? await countFrom(String.fromCharCode(b.charCodeAt(0) + 1))
+                : n - await countFrom(b);
+        } else if (desc) {
+            k = await countFrom('a');
         }
-
-        // If no more items, destroy infinite scroll and remove sentinel
-        const remaining = total - (libraryPage + 1) * LIBRARY_PAGE_SIZE;
-        if (remaining <= 0) {
-            destroyInfiniteScroll();
-            const sentinelContainer = $('lib-infinite-container');
-            if (sentinelContainer) sentinelContainer.remove();
+        if (stale()) return;
+        const grid = $('lib-grid');
+        if (!grid) return;
+        if (k < n) {
+            grid.children[k].scrollIntoView({ block: 'start', behavior: 'instant' });
+        } else {
+            window.scrollTo({ top: document.scrollingElement.scrollHeight, behavior: 'instant' });
         }
     } catch (e) {
-        toast(t('common.error_message', { message: e.message }), 'error');
+        if (stale()) return;
+        toast(t('library.load_failed', { message: e.message }), 'error');
     }
-}
-
-async function jumpToLetter(libId, letter) {
-    currentLetterFilter = letter || '';
-    document.querySelectorAll('.jf-alpha-btn').forEach(b => {
-        const btnLetter = b.getAttribute('data-letter') ?? '';
-        b.classList.toggle('active', btnLetter === currentLetterFilter);
-    });
-    await filterLibrary(libId);
 }
 
 // --- Detail View Renderer (Movies, TV Series, Music) ---

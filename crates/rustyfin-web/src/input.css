@@ -103,13 +103,37 @@ body {
   position: relative;
   cursor: pointer;
   transition: transform 0.25s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.25s ease, border-color 0.25s ease;
-  will-change: transform;
 }
 
 .jf-card:hover {
   transform: translateY(-6px) scale(1.02);
   box-shadow: 0 16px 36px -10px rgba(0, 0, 0, 0.8), 0 0 20px -3px var(--jf-primary-glow);
   border-color: var(--jf-border-hover);
+}
+
+/* Library grid. Columns and gap are set here, not with Tailwind classes, because the card
+   height below is computed from them. Breakpoints are Tailwind's sm, md, lg and xl. */
+.jf-lib-grid {
+  --jf-cols: 2;
+  --jf-card-text: calc(2.625rem + 16.5px);
+  display: grid;
+  grid-template-columns: repeat(var(--jf-cols), minmax(0, 1fr));
+  gap: 1rem;
+  container-type: inline-size;
+}
+@media (width >= 40rem) { .jf-lib-grid { --jf-cols: 3; --jf-card-text: calc(2.875rem + 16.5px); } }
+@media (width >= 48rem) { .jf-lib-grid { --jf-cols: 4; } }
+@media (width >= 64rem) { .jf-lib-grid { --jf-cols: 5; } }
+@media (width >= 80rem) { .jf-lib-grid { --jf-cols: 7; } }
+
+/* Library grid cards: skip off-screen layout, and keep scroll targets clear of the header.
+   A skipped card must be as tall as a rendered one or jump targets move: the content box is
+   the poster ((column width - 2px border) x 1.5) plus the text body (padding, title line at
+   text-xs or sm:text-sm, mt-0.5, 11px type line). */
+.jf-lib-grid > * {
+  content-visibility: auto;
+  contain-intrinsic-height: auto calc(((100cqw - (var(--jf-cols) - 1) * 1rem) / var(--jf-cols) - 2px) * 1.5 + var(--jf-card-text));
+  scroll-margin-top: 4.5rem;
 }
 
 .jf-poster {
@@ -615,7 +639,6 @@ img.jf-lazy-img:not([data-src]) {
 /* Progressive thumbnail image - shown while full-res loads */
 img.jf-thumb-img {
   transition: opacity 0.2s ease;
-  will-change: opacity;
 }
 
 .jf-poster, .jf-poster-backdrop {
@@ -670,26 +693,4 @@ img.jf-thumb-img {
 
 @keyframes jfSpin {
   to { transform: rotate(360deg); }
-}
-
-/* Virtual Grid: scrollable container with custom scrollbar */
-.jf-virtual-grid {
-  scrollbar-width: thin;
-  scrollbar-color: rgba(255, 255, 255, 0.2) transparent;
-}
-.jf-virtual-grid::-webkit-scrollbar {
-  width: 6px;
-}
-.jf-virtual-grid::-webkit-scrollbar-track {
-  background: transparent;
-}
-.jf-virtual-grid::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.2);
-  border-radius: 3px;
-}
-.jf-virtual-grid::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.35);
-}
-.jf-virtual-cards {
-  width: 100%;
 }
