@@ -134,8 +134,8 @@ async function wizNext() {
     if (wizStep === 0) {
         try {
             await API.updateStartupConfig({
-                preferred_metadata_language: $('wiz-lang').value,
-                metadata_country_code: $('wiz-country').value
+                PreferredMetadataLanguage: $('wiz-lang').value,
+                MetadataCountryCode: $('wiz-country').value
             });
         } catch {}
     } else if (wizStep === 1) {
