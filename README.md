@@ -350,7 +350,7 @@ SQLX_OFFLINE=true cargo sqlx prepare --workspace
 cargo doc --workspace --no-deps --open
 
 # Build web frontend
-cd crates/rustyfin-web && npm run build
+cd crates/rustyfin-web && pnpm install && pnpm run build
 ```
 
 ---

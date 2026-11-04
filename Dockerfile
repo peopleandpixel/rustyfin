@@ -5,11 +5,14 @@ FROM --platform=$BUILDPLATFORM node:24-slim AS web
 
 WORKDIR /usr/src/rustyfin-web
 
-COPY crates/rustyfin-web/package.json crates/rustyfin-web/package-lock.json ./
-RUN npm ci
+# Corepack provides the pnpm version pinned in package.json (packageManager)
+RUN corepack enable
+
+COPY crates/rustyfin-web/package.json crates/rustyfin-web/pnpm-lock.yaml ./
+RUN pnpm install --frozen-lockfile
 
 COPY crates/rustyfin-web/ ./
-RUN npm run build
+RUN pnpm run build
 
 # ---- Build Stage ----
 FROM rust:1-trixie AS builder
