@@ -233,13 +233,14 @@ async fn last_activity_date(
 /// PUT /Users/{userId}/Items/{itemId}/Rating – Set user rating for an item
 async fn set_rating(
     State(state): State<AppState>,
-    Path((_user_id, item_id)): Path<(Uuid, Uuid)>,
+    Path((user_id, item_id)): Path<(Uuid, Uuid)>,
     Extension(claims): Extension<Claims>,
     Json(req): Json<SetRatingRequest>,
 ) -> Result<Json<UserItemDataDto>, ApiError> {
+    let user_id = path_user(&state, &claims, user_id).await?;
     let data = rustyfin_db::repo_playback::set_user_rating(
         &state.db,
-        claims.sub,
+        user_id,
         item_id,
         req.likes,
         req.user_rating,
@@ -248,7 +249,7 @@ async fn set_rating(
     tracing::info!(
         "set rating for item {} by user {}: likes={:?}, rating={:?}",
         item_id,
-        claims.sub,
+        user_id,
         req.likes,
         req.user_rating
     );

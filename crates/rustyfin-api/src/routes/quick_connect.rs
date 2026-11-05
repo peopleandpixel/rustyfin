@@ -119,22 +119,7 @@ async fn authorize(
     entry.authenticated = true;
     entry.user_id = Some(claims.sub);
 
-    // Broadcast WebSocket notification that the code has been authorized
-    let secret = entry.secret.clone();
-    drop(store);
-
-    let _ = crate::routes::websocket::broadcast_event(
-        &state,
-        rustyfin_model::ws_event::WsEvent::Command {
-            data: rustyfin_model::ws_event::CommandData {
-                command: "QuickConnectAuthorized".to_string(),
-                arguments: Some(serde_json::json!({
-                    "Secret": secret,
-                })),
-            },
-        },
-    )
-    .await;
+    // No socket message, as in Jellyfin: every socket would see the secret.
 
     Ok(Json(true))
 }

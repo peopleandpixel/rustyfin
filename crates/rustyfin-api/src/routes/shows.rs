@@ -22,15 +22,15 @@ pub fn routes() -> Router<AppState> {
 #[serde(rename_all = "camelCase")]
 #[allow(dead_code)]
 struct NextUpQuery {
-    #[serde(default)]
+    #[serde(default, alias = "UserId")]
     user_id: Option<Uuid>,
-    #[serde(default)]
+    #[serde(default, alias = "SeriesId")]
     series_id: Option<Uuid>,
-    #[serde(default)]
+    #[serde(default, alias = "ParentId")]
     parent_id: Option<Uuid>,
-    #[serde(default)]
+    #[serde(default, alias = "StartIndex")]
     start_index: Option<i64>,
-    #[serde(default)]
+    #[serde(default, alias = "Limit")]
     limit: Option<i64>,
 }
 

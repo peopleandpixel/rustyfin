@@ -104,6 +104,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, token: String) {
 
     // Subscribe to the global broadcast channel for server events
     let mut broadcast_rx = state.ws_broadcast.subscribe();
+    let viewer = socket_viewer(&state, &token).await;
 
     // Create a dedicated channel for targeted command delivery to this session
     let (cmd_tx, mut cmd_rx) = broadcast::channel::<rustyfin_model::ws_event::WsEvent>(16);
@@ -178,6 +179,8 @@ async fn handle_socket(socket: WebSocket, state: AppState, token: String) {
             // Handle broadcast events from the server (global events)
             res = broadcast_rx.recv() => {
                 match res {
+                    // Another user's session and playback events, and logs for non-administrators
+                    Ok(event) if !receives(&viewer, &event) => {}
                     Ok(event) => {
                         if let Ok(json) = serde_json::to_string(&event)
                             && sender.send(Message::Text(json.into())).await.is_err() {
@@ -281,6 +284,53 @@ pub async fn broadcast_event(state: &AppState, event: rustyfin_model::ws_event::
     // Silently ignore broadcast failures - this is normal when no WebSocket clients are connected.
     // The browser player does not require WebSocket for playback; it's only used for notifications.
     let _ = state.ws_broadcast.send(event);
+}
+
+/// Who a socket belongs to, for deciding which broadcast events it receives.
+struct Viewer {
+    user_id: uuid::Uuid,
+    is_admin: bool,
+}
+
+/// The socket's user, from the token it connected with. The API key counts as an administrator.
+async fn socket_viewer(state: &AppState, token: &str) -> Viewer {
+    if state.api_key.as_ref().is_some_and(|key| token == **key) {
+        return Viewer {
+            user_id: uuid::Uuid::nil(),
+            is_admin: true,
+        };
+    }
+    match rustyfin_auth::validate_token(&state.db_ro, token).await {
+        Ok(claims) => Viewer {
+            user_id: claims.sub,
+            is_admin: claims.is_admin,
+        },
+        Err(_) => Viewer {
+            user_id: uuid::Uuid::nil(),
+            is_admin: false,
+        },
+    }
+}
+
+/// Whether a socket gets a broadcast event. Session and playback events go to administrators and
+/// to the user their `UserId` names, as in Jellyfin's SessionInfoWebSocketListener; log lines go
+/// to administrators only. Everything else goes to everyone.
+fn receives(viewer: &Viewer, event: &rustyfin_model::ws_event::WsEvent) -> bool {
+    use rustyfin_model::ws_event::WsEvent;
+    match event {
+        WsEvent::SessionChanged { data }
+        | WsEvent::PlaybackStart { data }
+        | WsEvent::PlaybackStop { data }
+        | WsEvent::PlaybackProgress { data } => {
+            viewer.is_admin
+                || data["UserId"]
+                    .as_str()
+                    .and_then(|id| uuid::Uuid::parse_str(id).ok())
+                    .is_some_and(|id| !id.is_nil() && id == viewer.user_id)
+        }
+        WsEvent::LogMessage { .. } => viewer.is_admin,
+        _ => true,
+    }
 }
 
 #[cfg(test)]

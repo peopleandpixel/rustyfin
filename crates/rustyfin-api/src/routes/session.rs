@@ -78,8 +78,12 @@ struct NowPlayingItemQuery {
 async fn get_now_playing_item(
     State(state): State<AppState>,
     Query(query): Query<NowPlayingItemQuery>,
+    Extension(claims): Extension<Claims>,
 ) -> Result<Json<Option<MediaItem>>, ApiError> {
     if let Some(session_id) = query.session_id {
+        let owner =
+            rustyfin_db::repo_session::get_session_user_id(&state.db_ro, &session_id).await?;
+        check_control(&claims, owner, "Session")?;
         let now_playing =
             rustyfin_db::repo_session::get_now_playing_item(&state.db_ro, &session_id).await?;
         Ok(Json(now_playing))
@@ -135,6 +139,7 @@ async fn send_command(
             data: serde_json::json!({
                 "Id": session_id,
                 "Command": cmd.command,
+                "UserId": owner,
             }),
         },
     )
@@ -212,6 +217,7 @@ async fn send_device_command(
             data: serde_json::json!({
                 "Id": device_id,
                 "Command": cmd.command,
+                "UserId": owner,
             }),
         },
     )
@@ -231,7 +237,7 @@ async fn send_command_by_name(
     let _ = crate::routes::websocket::broadcast_event(
         &state,
         rustyfin_model::ws_event::WsEvent::SessionChanged {
-            data: serde_json::json!({"Id": session_id, "Command": _command}),
+            data: serde_json::json!({"Id": session_id, "Command": _command, "UserId": owner}),
         },
     )
     .await;
@@ -250,7 +256,7 @@ async fn send_message(
     let _ = crate::routes::websocket::broadcast_event(
         &state,
         rustyfin_model::ws_event::WsEvent::SessionChanged {
-            data: serde_json::json!({"Id": session_id, "MessageType": "Notification"}),
+            data: serde_json::json!({"Id": session_id, "MessageType": "Notification", "UserId": owner}),
         },
     )
     .await;
