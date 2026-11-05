@@ -1,7 +1,8 @@
 use axum::Json;
 use axum::Router;
-use axum::extract::{Query, State};
+use axum::extract::{Query, Request, State};
 use axum::http::{StatusCode, header};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use std::collections::HashMap;
@@ -25,6 +26,25 @@ pub fn routes() -> Router<AppState> {
             "/dlna/control/ConnectionManager",
             post(connection_manager_control),
         )
+}
+
+/// While `EnableDlnaServer` is off, the DLNA server's routes answer 404. Checked per request, so
+/// turning it on in the configuration takes effect at once (SSDP discovery starts at the next
+/// restart).
+pub async fn require_dlna_enabled(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    if !state.config.read().await.enable_dlna_server {
+        return Err(ApiError::NotFound("The DLNA server is turned off.".into()));
+    }
+    Ok(next.run(req).await)
+}
+
+/// Administrator-only DLNA profile routes. `routes::build_router` wraps them in `require_admin`.
+pub fn admin_routes() -> Router<AppState> {
+    Router::new()
         .route("/Dlna/Profile", get(get_profile))
         .route("/Dlna/Profile/DeviceDetection", post(device_detection))
         .route("/Dlna/Profile/Device", get(get_device_profile))

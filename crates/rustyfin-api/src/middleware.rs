@@ -93,6 +93,22 @@ pub async fn require_setup_or_admin(
     Ok(next.run(req).await)
 }
 
+/// Guards the administrator routes. It runs after `require_auth`, which inserts the claims, so a
+/// request without claims gets 401. A logged-in user who is not an administrator gets 403. The
+/// configured API key carries administrator claims and passes.
+pub async fn require_admin(req: Request, next: Next) -> Result<Response, ApiError> {
+    let claims = req
+        .extensions()
+        .get::<Claims>()
+        .ok_or(ApiError::Unauthorized)?;
+    if !claims.is_admin {
+        return Err(ApiError::Forbidden(
+            "Administrator access is required.".to_string(),
+        ));
+    }
+    Ok(next.run(req).await)
+}
+
 #[allow(dead_code)]
 pub trait ClaimsExt {
     fn claims(&self) -> Option<&Claims>;

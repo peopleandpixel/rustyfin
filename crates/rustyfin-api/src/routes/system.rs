@@ -1,12 +1,14 @@
 use axum::extract::{ConnectInfo, Path, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
+use rustyfin_model::auth::Claims;
 use rustyfin_model::server_info::{
     EndpointInfo, FullServerInfo, LogFile, ServerConfiguration, ServerInfo,
 };
 use serde::Deserialize;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 use crate::error::ApiError;
 use crate::state::AppState;
@@ -18,6 +20,11 @@ pub fn public_routes() -> Router<AppState> {
         .route("/System/Ping", get(ping).post(ping))
         .route("/System/keys", get(get_keys))
         .route("/health", get(health))
+}
+
+/// Setup-or-admin routes. `routes::build_router` wraps them in `require_setup_or_admin`.
+pub fn setup_routes() -> Router<AppState> {
+    Router::new()
         .route("/Environment/Drives", get(get_drives))
         .route("/Environment/NetworkShares", get(get_network_shares))
 }
@@ -26,13 +33,18 @@ pub fn public_routes() -> Router<AppState> {
 pub fn protected_routes() -> Router<AppState> {
     Router::new()
         .route("/System/Info", get(get_full_info))
-        .route(
-            "/System/Configuration",
-            get(get_configuration).post(update_configuration),
-        )
+        .route("/System/Configuration", get(get_configuration))
+        .route("/System/Configuration/{key}", get(get_configuration_by_key))
+        .route("/System/Endpoint", get(get_endpoint))
+}
+
+/// Administrator-only system routes. `routes::build_router` wraps them in `require_admin`.
+pub fn admin_routes() -> Router<AppState> {
+    Router::new()
+        .route("/System/Configuration", post(update_configuration))
         .route(
             "/System/Configuration/{key}",
-            get(get_configuration_by_key).post(update_configuration_by_key),
+            post(update_configuration_by_key),
         )
         .route(
             "/System/Configuration/Branding",
@@ -40,7 +52,6 @@ pub fn protected_routes() -> Router<AppState> {
         )
         .route("/System/Info/Storage", get(get_storage_info))
         .route("/System/Logs/Log", get(get_logs_log))
-        .route("/System/Endpoint", get(get_endpoint))
         .route("/System/Shutdown", post(shutdown))
         .route("/System/Restart", post(restart))
         .route("/System/Logs", get(get_logs))
@@ -138,9 +149,23 @@ async fn get_endpoint(
     })
 }
 
-async fn get_configuration(State(state): State<AppState>) -> Json<ServerConfiguration> {
-    let config = state.config.read().await;
-    Json(config.clone())
+/// Clears the stored secrets for callers who are not administrators.
+fn hide_secrets(config: &mut ServerConfiguration) {
+    config.tmdb_api_key = None;
+    config.omdb_api_key = None;
+    config.fanart_api_key = None;
+    config.smtp_password = None;
+}
+
+async fn get_configuration(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+) -> Json<ServerConfiguration> {
+    let mut config = state.config.read().await.clone();
+    if !claims.is_admin {
+        hide_secrets(&mut config);
+    }
+    Json(config)
 }
 
 async fn update_configuration(
@@ -191,8 +216,9 @@ async fn get_logs(State(state): State<AppState>) -> Result<Json<Vec<LogFile>>, A
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) == Some("log")
             && let Ok(meta) = entry.metadata().await
+            && let Ok(name) = entry.file_name().into_string()
+            && listed_log_path(&log_dir, &name).await.is_some()
         {
-            let name = entry.file_name().to_string_lossy().to_string();
             let size = meta.len();
             let modified = meta
                 .modified()
@@ -231,12 +257,32 @@ async fn get_keys() -> Json<serde_json::Value> {
     }))
 }
 
+/// Returns the canonical path of `<log_dir>/<name>` when `GET /System/Logs` lists `name`:
+/// a bare `.log` file that is a regular file (not a symlink) whose canonical parent is the
+/// canonical log directory. Otherwise `None`.
+async fn listed_log_path(log_dir: &std::path::Path, name: &str) -> Option<PathBuf> {
+    let bare = !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\', '\0']);
+    let file = log_dir.join(name);
+    if !bare || file.extension().and_then(|e| e.to_str()) != Some("log") {
+        return None;
+    }
+    let meta = tokio::fs::symlink_metadata(&file).await.ok()?;
+    if !meta.file_type().is_file() {
+        return None;
+    }
+    let dir = tokio::fs::canonicalize(log_dir).await.ok()?;
+    let path = tokio::fs::canonicalize(&file).await.ok()?;
+    (path.parent() == Some(dir.as_path())).then_some(path)
+}
+
 async fn get_log_content(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<String, ApiError> {
     let log_dir = state.data_dir.join("logs");
-    let path = log_dir.join(&name);
+    let path = listed_log_path(&log_dir, &name)
+        .await
+        .ok_or_else(|| ApiError::NotFound(format!("Log file not found: {name}")))?;
     let content = tokio::fs::read_to_string(&path)
         .await
         .map_err(|e| ApiError::Internal(format!("Failed to read log file: {}", e)))?;
@@ -474,10 +520,14 @@ fn disk_usage(_path: &str) -> Result<(i64, i64), std::io::Error> {
 /// GET /System/Configuration/{key} - Get configuration by key
 async fn get_configuration_by_key(
     State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
     Path(key): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let config = state.config.read().await;
-    let json = serde_json::to_value(&*config).map_err(|e| ApiError::Internal(e.to_string()))?;
+    let mut config = state.config.read().await.clone();
+    if !claims.is_admin {
+        hide_secrets(&mut config);
+    }
+    let json = serde_json::to_value(&config).map_err(|e| ApiError::Internal(e.to_string()))?;
     Ok(Json(
         json.get(&key).cloned().unwrap_or(serde_json::json!({})),
     ))

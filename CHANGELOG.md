@@ -10,7 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **Web client translations**: The web client is localized with i18next, with English and German translations in `crates/rustyfin-web/src/translations/` (one JSON file per language, English as the source). The display language follows the browser and can be changed in the setup wizard and in the user settings; picking it in the wizard switches the UI immediately. Previously the UI was German only.
 
+### Changed
+- **DLNA server off by default**: The DLNA server, its `/dlna/*` endpoints and its SSDP announcements, runs only when `EnableDlnaServer` is on in the server configuration. Before, it always ran and listed the libraries to anyone on the network without a sign-in. An administrator turns it on with `POST /System/Configuration`; the `/dlna/*` endpoints follow the setting at once, and SSDP starts at the next server start.
+
 ### Fixed
+- **New administrators**: `POST /Users/New` honors `IsAdministrator`. Before, it was ignored, so every new user was created without administrator rights.
+- **Played and favorite marks of another user**: `POST` and `DELETE /Users/{userId}/PlayedItems/{itemId}` and `/Users/{userId}/FavoriteItems/{itemId}` act on `{userId}`. Before, they ignored it and changed the caller's own marks. An administrator can set them for any user; other users get 403 for anyone but themselves.
 - **Startup wizard metadata settings**: The wizard now saves the chosen metadata language and country. It sent them as `preferred_metadata_language` and `metadata_country_code`, which `POST /Startup/Configuration` ignores because it expects PascalCase fields.
 - **Setup wizard owner account**: The server no longer creates an `admin`/`admin` account at start. The setup wizard creates the first administrator, the server owner, with the typed name and password. Before, the wizard only changed the default admin's password, ignored the typed name and hid sign-in failures. The `/Startup/*` endpoints also stayed anonymous, so anyone could reset the administrator's password. Now:
   - `POST /Startup/User` works only while no owner exists, and the `/Startup/*` endpoints need an administrator afterwards.
@@ -20,6 +25,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - A leftover `admin` account whose password is still `admin` is disabled once the owner is created under another name.
   - The wizard shows every failed step and resumes there on retry.
   - `start.sh smoke` creates a throwaway owner in a temporary data directory.
+
+### Security
+- **Administrator endpoints**: Endpoints that change the server or show its internals need an administrator, following Jellyfin's rule for each endpoint. They cover configuration changes, shutdown and restart, logs, scheduled tasks, plugins, packages, backups, devices, the activity log and API keys. They also cover creating and deleting users and setting their policy, library and item refreshes, deleting items, uploading and deleting images, subtitle management, collections, Live TV tuners and listing providers, DLNA profiles, localization providers and the media encoder settings. Before, any signed-in user could call them, and the DLNA profile endpoints needed no sign-in. A request without a valid token gets 401; a signed-in user without the right gets 403, which also replaces the 401 for another user's account settings.
+- **Library setup endpoints**: `/Environment/Drives`, `/Environment/NetworkShares`, `/Library/BrowseDirectories`, `/Library/VirtualFolders` and `/Library/{id}/Options` are open only until the setup wizard creates the server owner, and need an administrator afterwards, as in Jellyfin. Before, the Environment endpoints listed the server's drives to anyone without a sign-in, and every user could browse the server's folders and change the libraries.
+- **Files outside their folders**: `GET /System/Log/{name}` returns only a log file that `GET /System/Logs` lists, and the HLS segment endpoints return only a segment in the item's transcode folder. Other names get 404. Before, a signed-in user could read any file the server could read, with a name such as `..%2Fconfig.json` or `%2Fetc%2Fhostname`.
+- **Media encoder path**: `PUT /System/MediaEncoder/Path` and `POST /System/MediaEncoder/Path/Validate` are removed. They ran the program at the path in the request, so any signed-in user could run any program on the server. As in Jellyfin, the encoder path cannot be changed through the API. `POST /System/MediaEncoder/Test` stops FFmpeg after 10 seconds.
+- **Easy PIN**: `POST /Users/{userId}/EasyPassword` stores the PIN as an Argon2 hash, and no response returns it. Before, it replaced the user's configuration with the PIN in plain text, and `GET /Users` showed it to every user. The upgrade removes PINs stored the old way; set them again.
+- **Configuration secrets**: For users who are not administrators, `GET /System/Configuration` and `GET /System/Configuration/{key}` return `TmdbApiKey`, `OmdbApiKey`, `FanartApiKey` and `SmtpPassword` as null. Before, every signed-in user could read them.
 
 ## [0.14.0] - 2026-11-03
 

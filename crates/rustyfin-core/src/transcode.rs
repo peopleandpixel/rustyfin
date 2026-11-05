@@ -225,8 +225,25 @@ impl TranscodeManager {
     }
 
     /// Get the path to a specific HLS segment file.
-    pub fn get_segment_path(&self, item_id: Uuid, segment_name: &str) -> PathBuf {
-        self.cache_root.join(item_id.to_string()).join(segment_name)
+    ///
+    /// Returns `None` unless `segment_name` is a bare file name whose canonical
+    /// path is a regular file directly inside the item's canonical transcode
+    /// directory. A symlink that points elsewhere fails that check.
+    pub fn get_segment_path(&self, item_id: Uuid, segment_name: &str) -> Option<PathBuf> {
+        if segment_name.is_empty()
+            || segment_name == "."
+            || segment_name == ".."
+            || segment_name.contains(['/', '\\', '\0'])
+        {
+            return None;
+        }
+        let dir = self
+            .cache_root
+            .join(item_id.to_string())
+            .canonicalize()
+            .ok()?;
+        let path = dir.join(segment_name).canonicalize().ok()?;
+        (path.parent() == Some(dir.as_path()) && path.is_file()).then_some(path)
     }
 
     /// Get the playback ID for an active transcode session.

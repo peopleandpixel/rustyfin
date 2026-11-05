@@ -11,9 +11,12 @@ use crate::error::ApiError;
 use crate::state::AppState;
 
 pub fn routes() -> Router<AppState> {
-    Router::new()
-        .route("/System/ActivityLog/Entries", get(get_activity_log))
-        .route("/Notifications/{userId}", get(get_notifications))
+    Router::new().route("/Notifications/{userId}", get(get_notifications))
+}
+
+/// Administrator-only activity log routes. `routes::build_router` wraps them in `require_admin`.
+pub fn admin_routes() -> Router<AppState> {
+    Router::new().route("/System/ActivityLog/Entries", get(get_activity_log))
 }
 
 #[derive(Debug, Deserialize)]

@@ -1086,6 +1086,7 @@ async fn test_dlna_profile_endpoint() {
         .oneshot(
             Request::builder()
                 .uri("/Dlna/Profile")
+                .header("X-Emby-Token", "test-api-key")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1110,6 +1111,7 @@ async fn test_dlna_device_detection() {
             Request::builder()
                 .method("POST")
                 .uri("/Dlna/Profile/DeviceDetection?UserAgent=Jellyfin/10.8.0")
+                .header("X-Emby-Token", "test-api-key")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -2488,6 +2490,1207 @@ async fn test_upgrade_promotes_earliest_admin() {
         owners_and_count(&state).await,
         (vec!["first".to_string()], 3)
     );
+}
+
+// ── G1: authorization ──
+// Admin endpoints answer 401 without a valid token and 403 to a non-admin. Setup endpoints are
+// open only until the server has an owner. Names taken from a request stay inside their directory.
+
+/// Creates the folder `media/<name>` in the test's data dir and returns its path.
+fn media_folder(state: &AppState, name: &str) -> String {
+    let dir = state.data_dir.join("media").join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir.to_str().unwrap().to_string()
+}
+
+/// Creates a library on a new folder through the API and returns its id.
+async fn create_library_via_api(
+    app: &axum::Router,
+    state: &AppState,
+    token: &str,
+    name: &str,
+    content_type: &str,
+) -> uuid::Uuid {
+    let body = serde_json::json!({
+        "Name": name,
+        "ContentType": content_type,
+        "Paths": [media_folder(state, &name.to_lowercase())],
+    });
+    let req = request("POST", "/Library/VirtualFolders", Some(token), Some(body));
+    let (status, created) = send(app, req).await;
+    assert_eq!(status, StatusCode::OK, "create {name}: {created}");
+    assert_eq!(created["Name"], name);
+    created["Id"].as_str().unwrap().parse().unwrap()
+}
+
+/// Creates the owner through the wizard and a non-admin "viewer", logs both in and returns
+/// `(owner_token, owner_id, viewer_token, viewer_id)`.
+async fn g1_owner_and_viewer(
+    state: &AppState,
+    app: &axum::Router,
+) -> (String, String, String, String) {
+    assert_eq!(
+        post_startup_user(app, None, "owner", "ownerpass").await,
+        StatusCode::NO_CONTENT
+    );
+    let (owner_token, owner_id) = login(app, "owner", "ownerpass").await.unwrap();
+    add_user(state, "viewer", "viewerpass", false).await;
+    let (viewer_token, viewer_id) = login(app, "viewer", "viewerpass").await.unwrap();
+    (owner_token, owner_id, viewer_token, viewer_id)
+}
+
+/// Asserts 401 without a token and with a bad one, and 403 for the non-admin `viewer`.
+async fn g1_assert_admin_only(
+    app: &axum::Router,
+    method: &str,
+    uri: &str,
+    body: &Option<serde_json::Value>,
+    viewer: &str,
+) {
+    let callers = [
+        ("anonymous", None, StatusCode::UNAUTHORIZED),
+        ("bad token", Some("not-a-token"), StatusCode::UNAUTHORIZED),
+        ("non-admin", Some(viewer), StatusCode::FORBIDDEN),
+    ];
+    for (who, token, expected) in callers {
+        let status = send(app, request(method, uri, token, body.clone())).await.0;
+        assert_eq!(status, expected, "{who} {method} {uri}");
+    }
+}
+
+/// Asserts that an administrator's request is not refused (neither 401 nor 403).
+async fn g1_assert_not_refused(
+    app: &axum::Router,
+    method: &str,
+    uri: &str,
+    body: &Option<serde_json::Value>,
+    token: &str,
+) {
+    let status = send(app, request(method, uri, Some(token), body.clone()))
+        .await
+        .0;
+    assert!(
+        status != StatusCode::UNAUTHORIZED && status != StatusCode::FORBIDDEN,
+        "admin {method} {uri} was refused: {status}"
+    );
+}
+
+/// Checks a table of `(method, uri, body, check the admin too)`: every route refuses anonymous
+/// callers, bad tokens and the non-admin; marked routes must not refuse the owner or the API key.
+/// The refusals run first, so no admin request changes state before them.
+async fn g1_check_admin_routes(
+    app: &axum::Router,
+    routes: &[(&str, String, Option<serde_json::Value>, bool)],
+    owner: &str,
+    viewer: &str,
+) {
+    for (method, uri, body, _) in routes {
+        g1_assert_admin_only(app, method, uri, body, viewer).await;
+    }
+    for (method, uri, body, check_admin) in routes {
+        if *check_admin {
+            g1_assert_not_refused(app, method, uri, body, owner).await;
+            g1_assert_not_refused(app, method, uri, body, "test-api-key").await;
+        }
+    }
+}
+
+/// Sends a request and returns the status and the body as text.
+async fn g1_send_raw(app: &axum::Router, req: Request<Body>) -> (StatusCode, String) {
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Writes `<data>/g1-secret.txt`, outside every directory the server reads from.
+fn g1_secret_file(state: &AppState) -> std::path::PathBuf {
+    let secret = state.data_dir.join("g1-secret.txt");
+    std::fs::write(&secret, "g1-secret-content").unwrap();
+    secret
+}
+
+/// Percent-encodes every `/` so that an absolute path fits in one path segment.
+fn g1_encode_slashes(path: &std::path::Path) -> String {
+    path.to_str().unwrap().replace('/', "%2F")
+}
+
+/// Stores a library with one movie and returns the movie's id.
+async fn g1_insert_movie(state: &AppState) -> uuid::Uuid {
+    let folder = media_folder(state, "g1-movies");
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: "G1 Movies".to_string(),
+        content_type: rustyfin_model::library::LibraryContentType::Movies,
+        paths: vec![folder.clone()],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    let item_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO media_items (id, library_id, name, media_type, path) VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(item_id.to_string())
+    .bind(lib.id.to_string())
+    .bind("G1 Movie")
+    .bind("Movie")
+    .bind(format!("{folder}/G1 Movie.mkv"))
+    .execute(&state.db)
+    .await
+    .unwrap();
+    item_id
+}
+
+#[tokio::test]
+async fn g1_system_admin_routes() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, viewer, _) = g1_owner_and_viewer(&state, &app).await;
+    let config = serde_json::to_value(&*state.config.read().await).unwrap();
+    let empty = Some(serde_json::json!({}));
+    let routes = [
+        ("GET", "/System/Logs".to_string(), None, true),
+        ("GET", "/System/Logs/Log".to_string(), None, true),
+        ("GET", "/System/Log/rustyfin.log".to_string(), None, true),
+        ("GET", "/System/Info/Storage".to_string(), None, true),
+        ("GET", "/System/LogLevel".to_string(), None, true),
+        ("POST", "/System/LogLevel".to_string(), empty.clone(), false),
+        ("GET", "/System/UpdatePackages".to_string(), None, true),
+        (
+            "POST",
+            "/System/RestartScheduledTasks".to_string(),
+            None,
+            false,
+        ),
+        (
+            "POST",
+            "/System/Configuration".to_string(),
+            Some(config),
+            true,
+        ),
+        (
+            "POST",
+            "/System/Configuration/ServerName".to_string(),
+            Some(serde_json::json!("G1")),
+            true,
+        ),
+        (
+            "POST",
+            "/System/Configuration/Branding".to_string(),
+            empty.clone(),
+            true,
+        ),
+        ("POST", "/System/Shutdown".to_string(), None, false),
+        ("POST", "/System/Restart".to_string(), None, false),
+        (
+            "PUT",
+            "/Configuration/MediaEncoding".to_string(),
+            empty.clone(),
+            true,
+        ),
+        ("PUT", "/Configuration/Networking".to_string(), empty, true),
+        ("GET", "/System/ActivityLog/Entries".to_string(), None, true),
+        ("GET", "/System/MediaEncoder/Path".to_string(), None, true),
+        ("POST", "/System/MediaEncoder/Test".to_string(), None, false),
+    ];
+    g1_check_admin_routes(&app, &routes, &owner, &viewer).await;
+}
+
+#[tokio::test]
+async fn g1_admin_modules_refuse_users() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, viewer, _) = g1_owner_and_viewer(&state, &app).await;
+    let id = uuid::Uuid::new_v4();
+    let empty = Some(serde_json::json!({}));
+    let list = Some(serde_json::json!([]));
+    let routes = [
+        ("GET", "/ScheduledTasks".to_string(), None, true),
+        ("GET", format!("/ScheduledTasks/{id}"), None, true),
+        (
+            "POST",
+            format!("/ScheduledTasks/{id}/Triggers"),
+            list.clone(),
+            false,
+        ),
+        ("POST", format!("/ScheduledTasks/Running/{id}"), None, false),
+        (
+            "DELETE",
+            format!("/ScheduledTasks/Running/{id}"),
+            None,
+            false,
+        ),
+        ("GET", "/Plugins".to_string(), None, true),
+        ("GET", format!("/Plugins/{id}/Configuration"), None, true),
+        (
+            "POST",
+            format!("/Plugins/{id}/Configuration"),
+            empty.clone(),
+            false,
+        ),
+        ("GET", "/Packages".to_string(), None, false),
+        ("GET", "/Packages/Repositories".to_string(), None, true),
+        ("POST", "/Packages/Repositories".to_string(), list, false),
+        (
+            "DELETE",
+            "/Packages/Repositories/g1".to_string(),
+            None,
+            false,
+        ),
+        ("POST", "/Packages/g1/Install".to_string(), None, false),
+        ("POST", "/Packages/g1/Uninstall".to_string(), None, false),
+        ("POST", "/Packages/g1/Enable".to_string(), None, false),
+        ("POST", "/Packages/g1/Disable".to_string(), None, false),
+        (
+            "POST",
+            "/Packages/Restore".to_string(),
+            empty.clone(),
+            false,
+        ),
+        ("GET", "/Backup".to_string(), None, true),
+        ("POST", "/Backup".to_string(), empty.clone(), false),
+        ("DELETE", "/Backup/g1.zip".to_string(), None, false),
+        ("POST", "/Backup/Restore".to_string(), empty.clone(), false),
+        ("GET", "/Devices".to_string(), None, false),
+        ("POST", "/Devices".to_string(), empty.clone(), false),
+        ("GET", "/Devices/g1-device".to_string(), None, true),
+        ("DELETE", "/Devices/g1-device".to_string(), None, false),
+        ("POST", "/Devices/g1-device/Image".to_string(), None, false),
+        ("DELETE", "/Devices?id=g1-device".to_string(), None, false),
+        ("GET", "/Devices/Info?id=g1-device".to_string(), None, true),
+        (
+            "GET",
+            "/Devices/Options?id=g1-device".to_string(),
+            None,
+            true,
+        ),
+        (
+            "POST",
+            "/Devices/Options?id=g1-device".to_string(),
+            empty.clone(),
+            false,
+        ),
+        ("GET", "/Dlna/Streaming/Profiles".to_string(), None, true),
+        (
+            "POST",
+            "/Dlna/Streaming/Profiles".to_string(),
+            empty.clone(),
+            false,
+        ),
+        ("GET", format!("/Dlna/Streaming/Profiles/{id}"), None, true),
+        (
+            "PUT",
+            format!("/Dlna/Streaming/Profiles/{id}"),
+            empty,
+            false,
+        ),
+        (
+            "DELETE",
+            format!("/Dlna/Streaming/Profiles/{id}"),
+            None,
+            false,
+        ),
+        ("GET", "/Auth/Keys".to_string(), None, true),
+        ("DELETE", "/Auth/Keys/g1-key".to_string(), None, false),
+        ("GET", "/Auth/Providers".to_string(), None, true),
+        (
+            "GET",
+            "/Auth/PasswordResetProviders".to_string(),
+            None,
+            true,
+        ),
+    ];
+    g1_check_admin_routes(&app, &routes, &owner, &viewer).await;
+}
+
+#[tokio::test]
+async fn g1_user_admin_routes() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, viewer, _) = g1_owner_and_viewer(&state, &app).await;
+    let other = add_user(&state, "other", "otherpass", false).await;
+    let new_user = serde_json::json!({ "Name": "g1-new", "Password": "g1-pass" });
+    let promote = serde_json::json!({ "IsAdministrator": true });
+    let routes = [
+        ("POST", "/Users/New".to_string(), Some(new_user), false),
+        (
+            "POST",
+            format!("/Users/{other}/Policy"),
+            Some(promote),
+            false,
+        ),
+        ("DELETE", format!("/Users/{other}"), None, false),
+        ("POST", format!("/Users/{other}/Delete"), None, false),
+    ];
+    g1_check_admin_routes(&app, &routes, &owner, &viewer).await;
+    assert_eq!(user_flags(&state, "g1-new").await, None);
+    assert_eq!(
+        user_flags(&state, "other").await,
+        Some((false, false, false))
+    );
+
+    for (method, uri, body, _) in &routes {
+        g1_assert_not_refused(&app, method, uri, body, &owner).await;
+    }
+    assert!(user_flags(&state, "g1-new").await.is_some());
+    assert_eq!(user_flags(&state, "other").await, None);
+}
+
+#[tokio::test]
+async fn g1_item_admin_routes() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, viewer, _) = g1_owner_and_viewer(&state, &app).await;
+    let item = uuid::Uuid::new_v4();
+    let lib = uuid::Uuid::new_v4();
+    let coll = uuid::Uuid::new_v4();
+    let routes = [
+        ("POST", "/Library/Refresh".to_string(), None, true),
+        (
+            "POST",
+            format!("/Library/VirtualFolders/{lib}/Refresh"),
+            None,
+            true,
+        ),
+        ("POST", format!("/Items/{item}/Refresh"), None, false),
+        ("DELETE", format!("/Items?ids={item}"), None, true),
+        ("DELETE", format!("/Items/{item}"), None, true),
+        ("POST", format!("/Items/{item}/Images/Primary"), None, true),
+        (
+            "DELETE",
+            format!("/Items/{item}/Images/Primary"),
+            None,
+            true,
+        ),
+        (
+            "DELETE",
+            format!("/Items/{item}/Images/Primary/0"),
+            None,
+            true,
+        ),
+        (
+            "DELETE",
+            format!("/Items/{item}/AlternateSources"),
+            None,
+            true,
+        ),
+        ("DELETE", format!("/Items/{item}/Subtitles/0"), None, true),
+        (
+            "GET",
+            format!("/Items/{item}/RemoteSearch/Subtitles"),
+            None,
+            false,
+        ),
+        (
+            "POST",
+            format!("/Videos/{item}/Subtitles/0/Download"),
+            None,
+            false,
+        ),
+        ("POST", "/Collections?Name=G1".to_string(), None, true),
+        ("DELETE", format!("/Collections/{coll}"), None, true),
+        (
+            "POST",
+            format!("/Collections/{coll}/Items?ids={item}"),
+            None,
+            true,
+        ),
+        (
+            "DELETE",
+            format!("/Collections/{coll}/Items?ids={item}"),
+            None,
+            true,
+        ),
+        (
+            "POST",
+            format!("/Collections/{coll}/Items/{item}"),
+            None,
+            true,
+        ),
+        (
+            "DELETE",
+            format!("/Collections/{coll}/Items/{item}"),
+            None,
+            true,
+        ),
+    ];
+    g1_check_admin_routes(&app, &routes, &owner, &viewer).await;
+}
+
+#[tokio::test]
+async fn g1_live_tv_dlna_localization_admin_routes() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, viewer, _) = g1_owner_and_viewer(&state, &app).await;
+    let empty = Some(serde_json::json!({}));
+    let routes = [
+        ("GET", "/LiveTv/TunerHosts".to_string(), None, true),
+        (
+            "POST",
+            "/LiveTv/TunerHosts".to_string(),
+            empty.clone(),
+            false,
+        ),
+        (
+            "DELETE",
+            "/LiveTv/TunerHosts?id=g1".to_string(),
+            None,
+            false,
+        ),
+        ("GET", "/LiveTv/TunerHosts/g1".to_string(), None, true),
+        ("DELETE", "/LiveTv/TunerHosts/g1".to_string(), None, false),
+        ("GET", "/LiveTv/Tuners".to_string(), None, true),
+        ("GET", "/LiveTv/Tuners/g1".to_string(), None, true),
+        ("GET", "/LiveTv/ListingProviders".to_string(), None, true),
+        (
+            "POST",
+            "/LiveTv/ListingProviders".to_string(),
+            empty.clone(),
+            false,
+        ),
+        (
+            "DELETE",
+            "/LiveTv/ListingProviders?id=g1".to_string(),
+            None,
+            false,
+        ),
+        ("GET", "/LiveTv/ListingProviders/g1".to_string(), None, true),
+        (
+            "DELETE",
+            "/LiveTv/ListingProviders/g1".to_string(),
+            None,
+            false,
+        ),
+        (
+            "GET",
+            "/LiveTv/ChannelMappingOptions".to_string(),
+            None,
+            true,
+        ),
+        ("GET", "/Dlna/Profile".to_string(), None, true),
+        (
+            "POST",
+            "/Dlna/Profile/DeviceDetection?UserAgent=Jellyfin/10.8.0".to_string(),
+            None,
+            true,
+        ),
+        ("GET", "/Dlna/Profile/Device".to_string(), None, true),
+        (
+            "POST",
+            "/Localization/Providers".to_string(),
+            empty.clone(),
+            false,
+        ),
+        (
+            "PUT",
+            "/Localization/Providers/g1".to_string(),
+            empty,
+            false,
+        ),
+        (
+            "DELETE",
+            "/Localization/Providers/g1".to_string(),
+            None,
+            false,
+        ),
+    ];
+    g1_check_admin_routes(&app, &routes, &owner, &viewer).await;
+}
+
+#[tokio::test]
+async fn g1_user_routes_stay_open() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (_, _, viewer, viewer_id) = g1_owner_and_viewer(&state, &app).await;
+    let uris = [
+        "/System/Info".to_string(),
+        "/System/Configuration".to_string(),
+        "/System/Configuration/ServerName".to_string(),
+        "/Users/Me".to_string(),
+        "/Users".to_string(),
+        format!("/Users/{viewer_id}"),
+        "/UserViews".to_string(),
+        format!("/Users/{viewer_id}/Views"),
+        "/Items".to_string(),
+        "/Sessions".to_string(),
+        "/Localization/Options".to_string(),
+        "/Localization/Providers".to_string(),
+        "/Configuration/MediaEncoding".to_string(),
+        "/Configuration/Networking".to_string(),
+        format!("/DisplayPreferences/usersettings?userId={viewer_id}&client=emby"),
+        "/Collections".to_string(),
+        "/LiveTv/Channels".to_string(),
+        "/LiveTv/Timers".to_string(),
+    ];
+    for uri in &uris {
+        let (status, body) = send(&app, request("GET", uri, Some(&viewer), None)).await;
+        assert_eq!(status, StatusCode::OK, "non-admin GET {uri}: {body}");
+    }
+    // Stream and image URLs carry the token as `api_key`.
+    let uri = format!("/Users/Me?api_key={viewer}");
+    assert_eq!(
+        send(&app, request("GET", &uri, None, None)).await.0,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn g1_setup_routes_open_before_owner() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let parent = state.data_dir.to_str().unwrap().to_string();
+    for uri in [
+        "/Environment/Drives".to_string(),
+        "/Environment/NetworkShares".to_string(),
+        format!("/Library/BrowseDirectories?parent={parent}"),
+        "/Library/VirtualFolders".to_string(),
+    ] {
+        let (status, body) = send(&app, request("GET", &uri, None, None)).await;
+        assert_eq!(status, StatusCode::OK, "anonymous GET {uri}: {body}");
+    }
+    let body = serde_json::json!({
+        "Name": "G1 Setup",
+        "ContentType": "Movies",
+        "Paths": [media_folder(&state, "g1-setup")],
+    });
+    let req = request("POST", "/Library/VirtualFolders", None, Some(body));
+    let (status, created) = send(&app, req).await;
+    assert_eq!(status, StatusCode::OK, "anonymous create: {created}");
+    let uri = format!("/Library/{}/Options", created["Id"].as_str().unwrap());
+    assert_eq!(
+        send(&app, request("GET", &uri, None, None)).await.0,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn g1_setup_routes_admin_after_owner() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, viewer, _) = g1_owner_and_viewer(&state, &app).await;
+    let lib = create_library_via_api(&app, &state, &owner, "G1 Kept", "Movies").await;
+    let kept = media_folder(&state, "g1 kept");
+    let parent = state.data_dir.to_str().unwrap().to_string();
+    let new_library = serde_json::json!({
+        "Name": "G1 Refused",
+        "ContentType": "Movies",
+        "Paths": [media_folder(&state, "g1-refused")],
+    });
+    let remove_path = serde_json::json!({ "LibraryId": lib.to_string(), "Paths": [kept] });
+    let routes = [
+        ("GET", "/Environment/Drives".to_string(), None, true),
+        ("GET", "/Environment/NetworkShares".to_string(), None, true),
+        (
+            "GET",
+            format!("/Library/BrowseDirectories?parent={parent}"),
+            None,
+            true,
+        ),
+        ("GET", "/Library/VirtualFolders".to_string(), None, true),
+        (
+            "POST",
+            "/Library/VirtualFolders".to_string(),
+            Some(new_library),
+            false,
+        ),
+        ("GET", format!("/Library/{lib}/Options"), None, true),
+        (
+            "POST",
+            format!("/Library/{lib}/Options"),
+            Some(serde_json::json!({})),
+            false,
+        ),
+        (
+            "DELETE",
+            "/Library/VirtualFolders/Paths".to_string(),
+            Some(remove_path),
+            false,
+        ),
+        (
+            "DELETE",
+            format!("/Library/VirtualFolders/{lib}"),
+            None,
+            false,
+        ),
+    ];
+    g1_check_admin_routes(&app, &routes, &owner, &viewer).await;
+    let req = request("GET", "/Library/VirtualFolders", Some(&owner), None);
+    let (status, libraries) = send(&app, req).await;
+    assert_eq!(status, StatusCode::OK);
+    let names: Vec<&str> = libraries
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l["Name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["G1 Kept"]);
+}
+
+#[tokio::test]
+async fn g1_log_file_route_reads_only_listed_logs() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let logs = state.data_dir.join("logs");
+    std::fs::write(logs.join("rustyfin.log"), "g1 log line\n").unwrap();
+    let secret = g1_secret_file(&state);
+    std::fs::write(state.data_dir.join("outside.log"), "g1-outside-content").unwrap();
+    std::os::unix::fs::symlink(&secret, logs.join("link.log")).unwrap();
+    std::fs::create_dir_all(logs.join("sub")).unwrap();
+    std::fs::write(logs.join("sub").join("inner.log"), "g1-inner-content").unwrap();
+    let get = |uri: String| request("GET", &uri, Some("test-api-key"), None);
+
+    let (status, text) = g1_send_raw(&app, get("/System/Log/rustyfin.log".into())).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(text.contains("g1 log line"));
+
+    for name in [
+        "..%2Fg1-secret.txt".to_string(),
+        "%2e%2e%2fg1-secret.txt".to_string(),
+        "..%2Foutside.log".to_string(),
+        "..%2Ftest.db".to_string(),
+        g1_encode_slashes(&secret),
+        "link.log".to_string(),
+        "sub%2Finner.log".to_string(),
+        "sub".to_string(),
+        "%2e%2e".to_string(),
+        "missing.log".to_string(),
+    ] {
+        let uri = format!("/System/Log/{name}");
+        let (status, text) = g1_send_raw(&app, get(uri.clone())).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "GET {uri}");
+        for content in [
+            "g1-secret-content",
+            "g1-outside-content",
+            "g1-inner-content",
+        ] {
+            assert!(!text.contains(content), "GET {uri} returned {content}");
+        }
+    }
+
+    let (status, listed) = send(&app, get("/System/Logs".into())).await;
+    assert_eq!(status, StatusCode::OK);
+    let names: Vec<&str> = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["Name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["rustyfin.log"]);
+}
+
+#[tokio::test]
+async fn g1_segment_path_stays_in_item_dir() {
+    let state = test_state().await;
+    let transcodes = state.data_dir.join("transcodes");
+    let item = uuid::Uuid::new_v4();
+    let dir = transcodes.join(item.to_string());
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    std::fs::write(dir.join("segment_0000.ts"), "g1-segment").unwrap();
+    std::fs::write(dir.join("sub").join("inner.ts"), "g1-inner").unwrap();
+    let secret = g1_secret_file(&state);
+    std::os::unix::fs::symlink(&secret, dir.join("evil.ts")).unwrap();
+    let other = uuid::Uuid::new_v4();
+    std::fs::create_dir_all(transcodes.join(other.to_string())).unwrap();
+    std::fs::write(
+        transcodes.join(other.to_string()).join("segment_0000.ts"),
+        "g1-other",
+    )
+    .unwrap();
+    let manager = &state.transcode_manager;
+
+    let found = manager
+        .get_segment_path(item, "segment_0000.ts")
+        .expect("a real segment is found");
+    assert_eq!(std::fs::read_to_string(found).unwrap(), "g1-segment");
+    let absolute = secret.to_str().unwrap().to_string();
+    let other_segment = format!("../{other}/segment_0000.ts");
+    for name in [
+        "",
+        ".",
+        "..",
+        "../../g1-secret.txt",
+        "..\\..\\g1-secret.txt",
+        absolute.as_str(),
+        "evil.ts",
+        "sub",
+        "sub/inner.ts",
+        other_segment.as_str(),
+        "missing.ts",
+        "segment_0000.ts\0",
+    ] {
+        assert_eq!(manager.get_segment_path(item, name), None, "{name:?}");
+    }
+}
+
+#[tokio::test]
+async fn g1_legacy_hls_segment_refuses_traversal() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (_, _, viewer, _) = g1_owner_and_viewer(&state, &app).await;
+    let item = uuid::Uuid::new_v4();
+    let dir = state.data_dir.join("transcodes").join(item.to_string());
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("segment_0000.ts"), "g1-segment").unwrap();
+    let secret = g1_secret_file(&state);
+    std::os::unix::fs::symlink(&secret, dir.join("evil.ts")).unwrap();
+
+    let uri = format!("/Videos/{item}/hls/segment_0000.ts");
+    let (status, text) = g1_send_raw(&app, request("GET", &uri, Some(&viewer), None)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(text, "g1-segment");
+    let uri = format!("{uri}?api_key={viewer}");
+    let (status, text) = g1_send_raw(&app, request("GET", &uri, None, None)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(text, "g1-segment");
+
+    for name in [
+        "..%2F..%2Fg1-secret.txt".to_string(),
+        "%2e%2e%2f%2e%2e%2fg1-secret.txt".to_string(),
+        "..%2F..%2Ftest.db".to_string(),
+        g1_encode_slashes(&secret),
+        "evil.ts".to_string(),
+        "%2e%2e".to_string(),
+        "missing.ts".to_string(),
+    ] {
+        let uri = format!("/Videos/{item}/hls/{name}");
+        let (status, text) = g1_send_raw(&app, request("GET", &uri, Some(&viewer), None)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "GET {uri}");
+        assert!(!text.contains("g1-secret-content"), "GET {uri} leaked");
+    }
+}
+
+#[tokio::test]
+async fn g1_media_encoder_runs_no_request_path() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, viewer, _) = g1_owner_and_viewer(&state, &app).await;
+    let marker = state.data_dir.join("g1-encoder-marker");
+    let probe = state.data_dir.join("g1-probe.sh");
+    std::fs::write(&probe, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
+    std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let body = serde_json::json!({ "Value": probe.to_str().unwrap() });
+
+    for token in [owner.as_str(), "test-api-key", viewer.as_str()] {
+        for (method, uri) in [
+            ("PUT", "/System/MediaEncoder/Path"),
+            ("POST", "/System/MediaEncoder/Path/Validate"),
+        ] {
+            send(&app, request(method, uri, Some(token), Some(body.clone()))).await;
+        }
+    }
+    assert!(!marker.exists(), "an encoder path from a request was run");
+
+    let req = request(
+        "PUT",
+        "/System/MediaEncoder/Path",
+        Some(&owner),
+        Some(body.clone()),
+    );
+    assert_eq!(send(&app, req).await.0, StatusCode::METHOD_NOT_ALLOWED);
+    let req = request(
+        "POST",
+        "/System/MediaEncoder/Path/Validate",
+        Some(&owner),
+        Some(body),
+    );
+    assert_eq!(send(&app, req).await.0, StatusCode::NOT_FOUND);
+    for (method, uri) in [
+        ("GET", "/System/MediaEncoder/Path"),
+        ("POST", "/System/MediaEncoder/Test"),
+    ] {
+        g1_assert_admin_only(&app, method, uri, &None, &viewer).await;
+    }
+    g1_assert_not_refused(&app, "GET", "/System/MediaEncoder/Path", &None, &owner).await;
+}
+
+#[tokio::test]
+async fn g1_easy_pin_is_hashed_and_never_returned() {
+    const PIN: &str = "90817263";
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, owner_id, viewer, viewer_id) = g1_owner_and_viewer(&state, &app).await;
+    let settings = serde_json::json!({ "AudioLanguagePreference": "deu" });
+    let uri = format!("/Users/{viewer_id}/Configuration");
+    let req = request("POST", &uri, Some(&viewer), Some(settings));
+    assert!(send(&app, req).await.0.is_success());
+    let user_uri = format!("/Users/{viewer_id}");
+    let (_, before) = send(&app, request("GET", &user_uri, Some(&viewer), None)).await;
+
+    let uri = format!("/Users/{viewer_id}/EasyPassword");
+    let req = request(
+        "POST",
+        &uri,
+        Some(&viewer),
+        Some(serde_json::json!({ "EasyPassword": PIN })),
+    );
+    let (status, text) = g1_send_raw(&app, req).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!text.contains(PIN), "the call returned the PIN");
+
+    let login_body = serde_json::json!({ "Username": "viewer", "Pw": "viewerpass" });
+    let responses = [
+        request("GET", "/Users", Some(&owner), None),
+        request("GET", &user_uri, Some(&owner), None),
+        request("GET", &user_uri, Some(&viewer), None),
+        request("GET", "/Users/Me", Some(&viewer), None),
+        request("GET", "/Users/Public", None, None),
+        request("POST", "/Users/AuthenticateByName", None, Some(login_body)),
+    ];
+    for req in responses {
+        let uri = req.uri().to_string();
+        let (status, text) = g1_send_raw(&app, req).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert!(!text.contains(PIN), "{uri} returned the PIN");
+    }
+
+    let (_, after) = send(&app, request("GET", &user_uri, Some(&viewer), None)).await;
+    assert_eq!(after["Configuration"], before["Configuration"]);
+    let stored: String = sqlx::query_scalar("SELECT configuration FROM users WHERE name = ?")
+        .bind("viewer")
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert!(
+        !stored.contains(PIN),
+        "the stored configuration holds the PIN"
+    );
+    let pin_hash = |name: &'static str| {
+        let db = state.db.clone();
+        async move {
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT easy_password_hash FROM users WHERE name = ?",
+            )
+            .bind(name)
+            .fetch_one(&db)
+            .await
+            .unwrap()
+        }
+    };
+    let hash = pin_hash("viewer").await.expect("the PIN hash is stored");
+    assert_ne!(hash, PIN);
+    assert!(rustyfin_auth::verify_password(PIN, &hash).unwrap());
+
+    // Only the user and administrators set a PIN; an empty PIN clears it.
+    let uri = format!("/Users/{owner_id}/EasyPassword");
+    let req = request(
+        "POST",
+        &uri,
+        Some(&viewer),
+        Some(serde_json::json!({ "EasyPassword": "1234" })),
+    );
+    assert_eq!(send(&app, req).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(pin_hash("owner").await, None);
+    let uri = format!("/Users/{viewer_id}/EasyPassword");
+    let req = request(
+        "POST",
+        &uri,
+        Some(&owner),
+        Some(serde_json::json!({ "EasyPassword": "" })),
+    );
+    assert_eq!(send(&app, req).await.0, StatusCode::OK);
+    assert_eq!(pin_hash("viewer").await, None);
+}
+
+#[tokio::test]
+async fn g1_create_user_honours_is_administrator() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, _, _) = g1_owner_and_viewer(&state, &app).await;
+    for (name, flag, admin) in [
+        ("g1-admin", Some(true), true),
+        ("g1-plain", Some(false), false),
+        ("g1-default", None, false),
+    ] {
+        let mut body = serde_json::json!({ "Name": name, "Password": "g1-pass" });
+        if let Some(flag) = flag {
+            body["IsAdministrator"] = serde_json::json!(flag);
+        }
+        let (status, created) = send(
+            &app,
+            request("POST", "/Users/New", Some(&owner), Some(body)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "create {name}: {created}");
+        assert_eq!(
+            user_flags(&state, name).await,
+            Some((admin, false, false)),
+            "{name}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn g1_played_and_favorite_follow_user_id() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, owner_id, viewer, viewer_id) = g1_owner_and_viewer(&state, &app).await;
+    let item = g1_insert_movie(&state).await;
+    let data = |user: &str| {
+        let db = state.db.clone();
+        let user: uuid::Uuid = user.parse().unwrap();
+        async move {
+            let data = rustyfin_db::repo_playback::get_user_item_data(&db, user, item)
+                .await
+                .unwrap();
+            (data.is_favorite, data.played)
+        }
+    };
+
+    let uri = format!("/Users/{viewer_id}/FavoriteItems/{item}");
+    assert_eq!(
+        send(&app, request("POST", &uri, Some(&viewer), None))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(data(&viewer_id).await, (true, false));
+
+    for (method, kind) in [
+        ("POST", "FavoriteItems"),
+        ("DELETE", "FavoriteItems"),
+        ("POST", "PlayedItems"),
+        ("DELETE", "PlayedItems"),
+    ] {
+        let uri = format!("/Users/{owner_id}/{kind}/{item}");
+        let status = send(&app, request(method, &uri, Some(&viewer), None))
+            .await
+            .0;
+        assert_eq!(status, StatusCode::FORBIDDEN, "non-admin {method} {uri}");
+    }
+    assert_eq!(data(&owner_id).await, (false, false));
+    assert_eq!(data(&viewer_id).await, (true, false));
+
+    // An administrator acts for the user in the path.
+    let uri = format!("/Users/{viewer_id}/PlayedItems/{item}");
+    assert_eq!(
+        send(&app, request("POST", &uri, Some(&owner), None))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let uri = format!("/Users/{viewer_id}/FavoriteItems/{item}");
+    assert_eq!(
+        send(&app, request("DELETE", &uri, Some(&owner), None))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(data(&viewer_id).await, (false, true));
+    assert_eq!(data(&owner_id).await, (false, false));
+    let uri = format!("/Users/{owner_id}/FavoriteItems/{item}");
+    assert_eq!(
+        send(&app, request("POST", &uri, Some("test-api-key"), None))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(data(&owner_id).await, (true, false));
+
+    let uri = format!("/Users/{}/PlayedItems/{item}", uuid::Uuid::new_v4());
+    assert_eq!(
+        send(&app, request("POST", &uri, Some(&owner), None))
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+}
+
+/// The DLNA server's description, a Browse request and a connection-manager request.
+fn g1_dlna_requests() -> Vec<Request<Body>> {
+    let browse = concat!(
+        r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">"#,
+        r#"<s:Body><u:Browse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1">"#,
+        "<ObjectID>0</ObjectID><BrowseFlag>BrowseDirectChildren</BrowseFlag><Filter>*</Filter>",
+        "<StartingIndex>0</StartingIndex><RequestedCount>10</RequestedCount>",
+        "<SortCriteria></SortCriteria></u:Browse></s:Body></s:Envelope>"
+    );
+    let soap = |uri: &str, action: &str| {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("Content-Type", "text/xml")
+            .header("SOAPACTION", action)
+            .body(Body::from(browse))
+            .unwrap()
+    };
+    let get = |uri: &str| Request::builder().uri(uri).body(Body::empty()).unwrap();
+    vec![
+        get("/dlna/description.xml"),
+        soap(
+            "/dlna/control/ContentDirectory",
+            r#""urn:schemas-upnp-org:service:ContentDirectory:1#Browse""#,
+        ),
+        get("/dlna/ContentDirectory.xml"),
+        get("/dlna/ConnectionManager.xml"),
+        soap(
+            "/dlna/control/ConnectionManager",
+            r#""urn:schemas-upnp-org:service:ConnectionManager:1#GetProtocolInfo""#,
+        ),
+    ]
+}
+
+/// Turns the DLNA server on or off through `POST /System/Configuration`.
+async fn g1_set_dlna(app: &axum::Router, enabled: bool) {
+    let req = request("GET", "/System/Configuration", Some("test-api-key"), None);
+    let (status, mut config) = send(app, req).await;
+    assert_eq!(status, StatusCode::OK);
+    config["EnableDlnaServer"] = serde_json::json!(enabled);
+    let req = request(
+        "POST",
+        "/System/Configuration",
+        Some("test-api-key"),
+        Some(config),
+    );
+    assert!(send(app, req).await.0.is_success());
+}
+
+#[tokio::test]
+async fn g1_dlna_server_off_by_default() {
+    let defaults = serde_json::to_value(ServerConfiguration::default()).unwrap();
+    assert_eq!(defaults["EnableDlnaServer"], serde_json::json!(false));
+    let state = test_state().await;
+    let app = app(state.clone());
+    for i in 0..g1_dlna_requests().len() {
+        let req = g1_dlna_requests().remove(i);
+        let uri = req.uri().to_string();
+        assert_eq!(
+            send(&app, req).await.0,
+            StatusCode::NOT_FOUND,
+            "DLNA off: {uri}"
+        );
+        let mut req = g1_dlna_requests().remove(i);
+        req.headers_mut()
+            .insert("X-Emby-Token", "test-api-key".parse().unwrap());
+        let status = send(&app, req).await.0;
+        assert_eq!(status, StatusCode::NOT_FOUND, "DLNA off, API key: {uri}");
+    }
+
+    g1_set_dlna(&app, true).await;
+    for req in g1_dlna_requests().into_iter().take(2) {
+        let uri = req.uri().to_string();
+        assert_eq!(send(&app, req).await.0, StatusCode::OK, "DLNA on: {uri}");
+    }
+    g1_set_dlna(&app, false).await;
+    let req = g1_dlna_requests().remove(0);
+    assert_eq!(send(&app, req).await.0, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn g1_config_secrets_hidden_from_users() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, viewer, _) = g1_owner_and_viewer(&state, &app).await;
+    let secrets = [
+        ("TmdbApiKey", "g1-tmdb-secret"),
+        ("OmdbApiKey", "g1-omdb-secret"),
+        ("FanartApiKey", "g1-fanart-secret"),
+        ("SmtpPassword", "g1-smtp-secret"),
+    ];
+    let (_, mut config) = send(
+        &app,
+        request("GET", "/System/Configuration", Some(&owner), None),
+    )
+    .await;
+    for (field, value) in secrets {
+        config[field] = serde_json::json!(value);
+    }
+    let req = request("POST", "/System/Configuration", Some(&owner), Some(config));
+    assert!(send(&app, req).await.0.is_success());
+
+    let req = request("GET", "/System/Configuration", Some(&viewer), None);
+    let (status, text) = g1_send_raw(&app, req).await;
+    assert_eq!(status, StatusCode::OK);
+    let seen: serde_json::Value = serde_json::from_str(&text).unwrap();
+    for (field, value) in secrets {
+        assert!(!text.contains(value), "a non-admin saw {field}");
+        assert_eq!(seen.get(field), Some(&serde_json::Value::Null), "{field}");
+        let uri = format!("/System/Configuration/{field}");
+        let (status, text) = g1_send_raw(&app, request("GET", &uri, Some(&viewer), None)).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert!(!text.contains(value), "a non-admin saw {uri}");
+    }
+
+    let req = request("GET", "/System/Configuration", Some(&owner), None);
+    let (_, full) = send(&app, req).await;
+    for (field, value) in secrets {
+        assert_eq!(full[field], value, "the owner reads {field}");
+    }
+    let req = request(
+        "GET",
+        "/System/Configuration/TmdbApiKey",
+        Some(&owner),
+        None,
+    );
+    assert_eq!(send(&app, req).await.1, "g1-tmdb-secret");
+}
+
+#[tokio::test]
+async fn g1_self_or_admin_user_routes() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, owner_id, viewer, viewer_id) = g1_owner_and_viewer(&state, &app).await;
+    let routes = [
+        (
+            "PUT",
+            format!("/Users/{owner_id}"),
+            serde_json::json!({ "Name": "renamed" }),
+        ),
+        (
+            "POST",
+            format!("/Users/{owner_id}/Password"),
+            serde_json::json!({ "CurrentPw": "ownerpass", "NewPw": "g1-taken" }),
+        ),
+        (
+            "POST",
+            format!("/Users/{owner_id}/Configuration"),
+            serde_json::json!({}),
+        ),
+        (
+            "POST",
+            format!("/Users/{owner_id}/EasyPassword"),
+            serde_json::json!({ "EasyPassword": "1234" }),
+        ),
+    ];
+    for (method, uri, body) in &routes {
+        let req = request(method, uri, Some(&viewer), Some(body.clone()));
+        assert_eq!(
+            send(&app, req).await.0,
+            StatusCode::FORBIDDEN,
+            "non-admin {method} {uri}"
+        );
+        let req = request(method, uri, None, Some(body.clone()));
+        assert_eq!(
+            send(&app, req).await.0,
+            StatusCode::UNAUTHORIZED,
+            "anonymous {method} {uri}"
+        );
+    }
+    assert!(login(&app, "owner", "ownerpass").await.is_some());
+    assert_eq!(user_flags(&state, "owner").await, Some((true, true, false)));
+
+    // A wrong current password stays 401.
+    let uri = format!("/Users/{viewer_id}/Password");
+    let body = serde_json::json!({ "CurrentPw": "wrong", "NewPw": "g1-other" });
+    let req = request("POST", &uri, Some(&viewer), Some(body));
+    assert_eq!(send(&app, req).await.0, StatusCode::UNAUTHORIZED);
+
+    // The user and administrators may change the user.
+    let uri = format!("/Users/{viewer_id}/Configuration");
+    for token in [&viewer, &owner] {
+        let req = request("POST", &uri, Some(token), Some(serde_json::json!({})));
+        assert!(send(&app, req).await.0.is_success());
+    }
+    let uri = format!("/Users/{viewer_id}");
+    let req = request(
+        "PUT",
+        &uri,
+        Some(&viewer),
+        Some(serde_json::json!({ "Name": "viewer" })),
+    );
+    assert!(send(&app, req).await.0.is_success());
 }
 
 // ── Packages Tests ──

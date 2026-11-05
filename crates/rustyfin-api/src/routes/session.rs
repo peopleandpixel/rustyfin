@@ -42,6 +42,11 @@ pub fn routes() -> Router<AppState> {
             post(session_capabilities_full),
         )
         .route("/Devices/{deviceId}/Command", post(send_device_command))
+}
+
+/// Administrator-only device routes. `routes::build_router` wraps them in `require_admin`.
+pub fn admin_routes() -> Router<AppState> {
+    Router::new()
         .route("/Devices", delete(delete_device))
         .route("/Devices/Info", get(get_devices_info))
         .route(
@@ -155,7 +160,9 @@ async fn delete_device(
     Query(q): Query<DeviceIdQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     if !claims.is_admin {
-        return Err(ApiError::Unauthorized);
+        return Err(ApiError::Forbidden(
+            "Administrator access is required.".to_string(),
+        ));
     }
     rustyfin_db::repo_session::delete_device(&state.db, &q.id).await?;
     Ok(Json(serde_json::json!({})))

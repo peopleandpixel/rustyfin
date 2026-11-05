@@ -265,6 +265,20 @@ pub async fn update_configuration(
     Ok(result.rows_affected() > 0)
 }
 
+/// Sets the user's Easy PIN hash, or clears it with `None`. Returns false when the user does not exist.
+pub async fn set_easy_password_hash(
+    pool: &SqlitePool,
+    id: Uuid,
+    hash: Option<&str>,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query("UPDATE users SET easy_password_hash = ? WHERE id = ?")
+        .bind(hash)
+        .bind(id.to_string())
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() > 0)
+}
+
 #[derive(sqlx::FromRow)]
 struct UserRow {
     id: String,

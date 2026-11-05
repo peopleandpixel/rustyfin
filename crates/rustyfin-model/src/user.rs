@@ -59,6 +59,8 @@ impl From<User> for PublicUserDto {
 pub struct CreateUserRequest {
     pub name: String,
     pub password: String,
+    /// Optional; the new user is an administrator only when this is true.
+    pub is_administrator: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]

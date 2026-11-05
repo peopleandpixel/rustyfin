@@ -29,12 +29,9 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/Users", get(get_users))
         .route("/Users/Me", get(get_me))
-        .route("/Users/New", post(create_user))
-        .route("/Users/{userId}", get(get_user).delete(delete_user_by_id))
+        .route("/Users/{userId}", get(get_user))
         .route("/Users/{userId}", put(update_user_name))
-        .route("/Users/{userId}/Delete", post(delete_user))
         .route("/Users/{userId}/Password", post(change_password))
-        .route("/Users/{userId}/Policy", post(update_policy))
         .route("/Users/{userId}/Configuration", post(update_configuration))
         .route("/Users/{userId}/Images", get(get_user_images))
         .route("/Users/{userId}/Images/{image_type}", get(get_user_image))
@@ -42,14 +39,6 @@ pub fn routes() -> Router<AppState> {
         .route("/Users/{userId}/EasyPassword", post(set_easy_password))
         .route("/Users/{userId}/Preferences", get(get_preferences))
         .route("/Users/{userId}/Periods", get(get_periods))
-        // Auth endpoints
-        .route("/Auth/Keys", get(get_auth_keys))
-        .route("/Auth/Keys/{key}", delete(delete_auth_key))
-        .route("/Auth/Providers", get(get_auth_providers))
-        .route(
-            "/Auth/PasswordResetProviders",
-            get(get_password_reset_providers),
-        )
         // User played/favorite items (delete variants)
         .route("/UserPlayedItems/{itemId}", delete(delete_user_played_item))
         .route(
@@ -58,6 +47,22 @@ pub fn routes() -> Router<AppState> {
         )
         // User image delete
         .route("/UserImage", delete(delete_user_image))
+}
+
+/// Administrator-only user and auth routes. `routes::build_router` wraps them in `require_admin`.
+pub fn admin_routes() -> Router<AppState> {
+    Router::new()
+        .route("/Users/New", post(create_user))
+        .route("/Users/{userId}", delete(delete_user_by_id))
+        .route("/Users/{userId}/Delete", post(delete_user))
+        .route("/Users/{userId}/Policy", post(update_policy))
+        .route("/Auth/Keys", get(get_auth_keys))
+        .route("/Auth/Keys/{key}", delete(delete_auth_key))
+        .route("/Auth/Providers", get(get_auth_providers))
+        .route(
+            "/Auth/PasswordResetProviders",
+            get(get_password_reset_providers),
+        )
 }
 
 async fn get_users(State(state): State<AppState>) -> Result<Json<Vec<UserDto>>, ApiError> {
@@ -98,7 +103,9 @@ async fn create_user(
     Json(req): Json<CreateUserRequest>,
 ) -> Result<Json<UserDto>, ApiError> {
     if !claims.is_admin {
-        return Err(ApiError::Unauthorized);
+        return Err(ApiError::Forbidden(
+            "Administrator access is required.".to_string(),
+        ));
     }
 
     if req.name.trim().is_empty() {
@@ -116,7 +123,7 @@ async fn create_user(
         id: Uuid::new_v4(),
         name: req.name,
         password_hash: hash,
-        is_administrator: false,
+        is_administrator: req.is_administrator.unwrap_or(false),
         created_at: Utc::now(),
         last_login_date: None,
         configuration: serde_json::Value::Object(Default::default()),
@@ -132,7 +139,9 @@ async fn delete_user(
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     if !claims.is_admin {
-        return Err(ApiError::Unauthorized);
+        return Err(ApiError::Forbidden(
+            "Administrator access is required.".to_string(),
+        ));
     }
 
     if rustyfin_db::repo_user::is_owner(&state.db, id).await? {
@@ -161,7 +170,7 @@ async fn change_password(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // users can change their own password, admins can change any
     if claims.sub != id && !claims.is_admin {
-        return Err(ApiError::Unauthorized);
+        return Err(ApiError::Forbidden("User update not allowed.".to_string()));
     }
 
     // non-admins must verify current password
@@ -195,7 +204,9 @@ async fn update_policy(
     Json(req): Json<UpdatePolicyRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     if !claims.is_admin {
-        return Err(ApiError::Unauthorized);
+        return Err(ApiError::Forbidden(
+            "Administrator access is required.".to_string(),
+        ));
     }
 
     if req.is_administrator == Some(false)
@@ -224,7 +235,7 @@ async fn update_configuration(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // users can update their own config, admins can update any
     if claims.sub != id && !claims.is_admin {
-        return Err(ApiError::Unauthorized);
+        return Err(ApiError::Forbidden("User update not allowed.".to_string()));
     }
 
     let updated = rustyfin_db::repo_user::update_configuration(&state.db, id, &config).await?;
@@ -300,7 +311,7 @@ async fn update_user_name(
     Json(req): Json<UpdateUserNameRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     if claims.sub != id && !claims.is_admin {
-        return Err(ApiError::Unauthorized);
+        return Err(ApiError::Forbidden("User update not allowed.".to_string()));
     }
     if req.name.trim().is_empty() {
         return Err(ApiError::BadRequest("name is required".into()));
@@ -396,13 +407,20 @@ async fn set_easy_password(
     Json(req): Json<EasyPasswordRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     if claims.sub != id && !claims.is_admin {
-        return Err(ApiError::Unauthorized);
+        return Err(ApiError::Forbidden("User update not allowed.".to_string()));
     }
-    // Store easy password in user configuration
-    let config = serde_json::json!({
-        "easyPassword": req.easy_password
-    });
-    let updated = rustyfin_db::repo_user::update_configuration(&state.db, id, &config).await?;
+    // Only an argon2 hash is stored, apart from the configuration, so no response returns the PIN;
+    // an empty PIN clears it.
+    let hash = if req.easy_password.is_empty() {
+        None
+    } else {
+        Some(
+            rustyfin_auth::hash_password(&req.easy_password)
+                .map_err(|e| ApiError::Internal(e.to_string()))?,
+        )
+    };
+    let updated =
+        rustyfin_db::repo_user::set_easy_password_hash(&state.db, id, hash.as_deref()).await?;
     if !updated {
         return Err(ApiError::NotFound("user not found".into()));
     }
@@ -457,7 +475,9 @@ async fn delete_user_by_id(
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     if !claims.is_admin {
-        return Err(ApiError::Unauthorized);
+        return Err(ApiError::Forbidden(
+            "Administrator access is required.".to_string(),
+        ));
     }
     if rustyfin_db::repo_user::is_owner(&state.db, id).await? {
         return Err(ApiError::Forbidden(

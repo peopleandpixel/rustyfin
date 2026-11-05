@@ -14,14 +14,7 @@ struct MediaEncoderPath {
 
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route(
-            "/System/MediaEncoder/Path",
-            get(get_encoder_path).put(set_encoder_path),
-        )
-        .route(
-            "/System/MediaEncoder/Path/Validate",
-            post(validate_encoder_path),
-        )
+        .route("/System/MediaEncoder/Path", get(get_encoder_path))
         .route("/System/MediaEncoder/Test", post(test_encoder))
 }
 
@@ -31,64 +24,17 @@ async fn get_encoder_path() -> Json<MediaEncoderPath> {
     })
 }
 
-async fn set_encoder_path(
-    Json(req): Json<MediaEncoderPath>,
-) -> Result<Json<MediaEncoderPath>, ApiError> {
-    // Validate that the path exists
-    if !req.value.is_empty() {
-        let output = tokio::process::Command::new(&req.value)
-            .arg("-version")
-            .output()
-            .await;
-        if let Err(e) = output {
-            return Err(ApiError::BadRequest(format!(
-                "FFmpeg path is not valid: {}",
-                e
-            )));
-        }
-    }
-    Ok(Json(MediaEncoderPath {
-        value: req.value.clone(),
-    }))
-}
-
-async fn validate_encoder_path(
-    Json(req): Json<MediaEncoderPath>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    if req.value.is_empty() {
-        return Ok(Json(serde_json::json!({
-            "IsValid": false,
-            "ErrorMessage": "FFmpeg path is required"
-        })));
-    }
-
-    let output = tokio::process::Command::new(&req.value)
-        .arg("-version")
-        .output()
-        .await;
-
-    match output {
-        Ok(output) if output.status.success() => Ok(Json(serde_json::json!({
-            "IsValid": true,
-            "ErrorMessage": ""
-        }))),
-        Ok(_) => Ok(Json(serde_json::json!({
-            "IsValid": false,
-            "ErrorMessage": "FFmpeg returned non-zero exit code"
-        }))),
-        Err(e) => Ok(Json(serde_json::json!({
-            "IsValid": false,
-            "ErrorMessage": format!("FFmpeg not found: {}", e)
-        }))),
-    }
-}
-
 async fn test_encoder() -> Result<StatusCode, ApiError> {
-    // Test FFmpeg by running a simple command
-    let output = tokio::process::Command::new("ffmpeg")
-        .arg("-version")
-        .output()
-        .await;
+    // Test FFmpeg by running a simple command. A hung child is killed after 10 seconds.
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::process::Command::new("ffmpeg")
+            .arg("-version")
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| ApiError::Internal("FFmpeg test timed out.".to_string()))?;
 
     match output {
         Ok(output) if output.status.success() => Ok(StatusCode::OK),

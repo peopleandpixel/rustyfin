@@ -170,13 +170,10 @@ async fn hls_segment(
     // and serve the segment file by name
     let _ = segment_type;
 
-    let segment_path = state.transcode_manager.get_segment_path(id, &segment);
-
-    if !segment_path.exists() {
-        return Err(ApiError::NotFound(format!(
-            "Segment {segment} not found for item {id}"
-        )));
-    }
+    let segment_path = state
+        .transcode_manager
+        .get_segment_path(id, &segment)
+        .ok_or_else(|| ApiError::NotFound(format!("Segment {segment} not found for item {id}")))?;
 
     let data = tokio::fs::read(&segment_path)
         .await
@@ -206,13 +203,10 @@ async fn hls_segment_legacy(
     State(state): State<AppState>,
     Path((id, segment)): Path<(Uuid, String)>,
 ) -> Result<Response, ApiError> {
-    let segment_path = state.transcode_manager.get_segment_path(id, &segment);
-
-    if !segment_path.exists() {
-        return Err(ApiError::NotFound(format!(
-            "Segment {segment} not found for item {id}"
-        )));
-    }
+    let segment_path = state
+        .transcode_manager
+        .get_segment_path(id, &segment)
+        .ok_or_else(|| ApiError::NotFound(format!("Segment {segment} not found for item {id}")))?;
 
     let data = tokio::fs::read(&segment_path)
         .await

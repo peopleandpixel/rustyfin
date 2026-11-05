@@ -207,8 +207,8 @@ async fn main() {
         .and_then(|p| p.parse().ok())
         .unwrap_or(8096);
 
-    // Background task: SSDP discovery (DLNA)
-    {
+    // Background task: SSDP discovery (DLNA), only when the DLNA server is on
+    if state.config.read().await.enable_dlna_server {
         let dlna_config = std::sync::Arc::new(rustyfin_core::dlna::DlnaConfig {
             server_name: "Rustyfin".to_string(),
             server_id: state.server_id.to_string(),

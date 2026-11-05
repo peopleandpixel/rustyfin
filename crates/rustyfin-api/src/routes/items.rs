@@ -1203,9 +1203,8 @@ async fn enrich_items(
 
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route("/Items", get(get_items).delete(delete_items))
+        .route("/Items", get(get_items))
         .route("/Items/{id}", get(get_item))
-        .route("/Items/{id}", delete(delete_item))
         .route("/Items/{id}/Children", get(get_children))
         .route("/Items/{id}/Similar", get(get_similar))
         .route("/Items/Latest", get(get_latest))
@@ -1221,16 +1220,6 @@ pub fn routes() -> Router<AppState> {
         // Additional Items endpoints
         .route("/Items/{id}/Ancestors", get(get_ancestors))
         .route("/Items/{id}/Collections", get(get_item_collections))
-        .route("/Items/{id}/Images/{image_type}", delete(delete_item_image))
-        .route(
-            "/Items/{id}/Images/{image_type}/{image_index}",
-            delete(delete_item_image_index),
-        )
-        .route(
-            "/Items/{id}/AlternateSources",
-            delete(delete_alternate_sources),
-        )
-        .route("/Items/{id}/Subtitles/{index}", delete(delete_subtitles))
         .route("/Items/{id}/Attachments/{index}", get(get_attachments))
         // User items with rating
         .route(
@@ -1241,6 +1230,23 @@ pub fn routes() -> Router<AppState> {
         .route("/Channels", get(get_channels))
         .route("/Channels/Items/Latest", get(get_channels_items_latest))
         .route("/Channels/{channelId}/Features", get(get_channel_features))
+}
+
+/// Administrator-only item removal routes. `routes::build_router` wraps them in `require_admin`.
+pub fn admin_routes() -> Router<AppState> {
+    Router::new()
+        .route("/Items", delete(delete_items))
+        .route("/Items/{id}", delete(delete_item))
+        .route("/Items/{id}/Images/{image_type}", delete(delete_item_image))
+        .route(
+            "/Items/{id}/Images/{image_type}/{image_index}",
+            delete(delete_item_image_index),
+        )
+        .route(
+            "/Items/{id}/AlternateSources",
+            delete(delete_alternate_sources),
+        )
+        .route("/Items/{id}/Subtitles/{index}", delete(delete_subtitles))
 }
 
 #[derive(Deserialize)]

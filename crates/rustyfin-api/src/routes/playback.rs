@@ -132,41 +132,56 @@ async fn playing_stopped(
     Ok(Json(serde_json::json!({})))
 }
 
+/// The path's user, when the caller may act for them: that user or an administrator (Jellyfin's
+/// `RequestHelpers.GetUserId`). An unknown user is 404.
+async fn path_user(state: &AppState, claims: &Claims, user_id: Uuid) -> Result<Uuid, ApiError> {
+    if user_id != claims.sub && !claims.is_admin {
+        return Err(ApiError::Forbidden("User update not allowed.".to_string()));
+    }
+    let user = rustyfin_db::repo_user::get_user_by_id(&state.db, user_id).await?;
+    if user.is_none() {
+        return Err(ApiError::NotFound("user not found".into()));
+    }
+    Ok(user_id)
+}
+
 async fn mark_played(
     State(state): State<AppState>,
-    Path((_user_id, item_id)): Path<(Uuid, Uuid)>,
+    Path((user_id, item_id)): Path<(Uuid, Uuid)>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<UserItemDataDto>, ApiError> {
-    let data = rustyfin_db::repo_playback::mark_played(&state.db, claims.sub, item_id).await?;
+    let user_id = path_user(&state, &claims, user_id).await?;
+    let data = rustyfin_db::repo_playback::mark_played(&state.db, user_id, item_id).await?;
     Ok(Json(data))
 }
 
 async fn mark_unplayed(
     State(state): State<AppState>,
-    Path((_user_id, item_id)): Path<(Uuid, Uuid)>,
+    Path((user_id, item_id)): Path<(Uuid, Uuid)>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<UserItemDataDto>, ApiError> {
-    let data = rustyfin_db::repo_playback::mark_unplayed(&state.db, claims.sub, item_id).await?;
+    let user_id = path_user(&state, &claims, user_id).await?;
+    let data = rustyfin_db::repo_playback::mark_unplayed(&state.db, user_id, item_id).await?;
     Ok(Json(data))
 }
 
 async fn set_favorite(
     State(state): State<AppState>,
-    Path((_user_id, item_id)): Path<(Uuid, Uuid)>,
+    Path((user_id, item_id)): Path<(Uuid, Uuid)>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<UserItemDataDto>, ApiError> {
-    let data =
-        rustyfin_db::repo_playback::set_favorite(&state.db, claims.sub, item_id, true).await?;
+    let user_id = path_user(&state, &claims, user_id).await?;
+    let data = rustyfin_db::repo_playback::set_favorite(&state.db, user_id, item_id, true).await?;
     Ok(Json(data))
 }
 
 async fn unset_favorite(
     State(state): State<AppState>,
-    Path((_user_id, item_id)): Path<(Uuid, Uuid)>,
+    Path((user_id, item_id)): Path<(Uuid, Uuid)>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<UserItemDataDto>, ApiError> {
-    let data =
-        rustyfin_db::repo_playback::set_favorite(&state.db, claims.sub, item_id, false).await?;
+    let user_id = path_user(&state, &claims, user_id).await?;
+    let data = rustyfin_db::repo_playback::set_favorite(&state.db, user_id, item_id, false).await?;
     Ok(Json(data))
 }
 
