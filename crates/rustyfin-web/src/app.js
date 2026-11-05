@@ -764,6 +764,9 @@ let libraryTotal = null;
 let libraryObserver = null;
 let libraryRequested = new Set();
 let letterClicks = 0;
+// The letter rail: the anchor of the last jump ({ k, first }) and the pending frame of an update
+let railAnchor = null;
+let railFrame = 0;
 const LIBRARY_PAGE_SIZE = 50;
 
 // --- Infinite Scroll via IntersectionObserver ---
@@ -864,9 +867,6 @@ async function renderLibrary(libId) {
                 <p class="text-xs text-white/40 mt-1">${t('common.loading')}</p>
             </div>
         </div>
-        <div class="jf-alpha-bar mb-6 opacity-50">
-            ${'#ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('').map(l => `<span class="jf-alpha-btn">${l}</span>`).join('')}
-        </div>
         <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-7 gap-4">
             ${Array.from({length: 21}, () => `
             <div class="jf-card">
@@ -880,6 +880,7 @@ async function renderLibrary(libId) {
             </div>`).join('')}
         </div>
     </div>`;
+    renderLetterRail(libId);
 
     const gen = startLibraryLoad(libId);
     try {
@@ -927,13 +928,6 @@ async function renderLibrary(libId) {
                 </div>
             </div>
 
-            <!-- Alphabet Quick Jump Bar -->
-            <div class="jf-alpha-bar mb-6">
-                ${'#ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('').map(l => `
-                    <button class="jf-alpha-btn" data-letter="${l}" data-action="jump-letter" data-id="${escapeHtml(libId)}">${l}</button>
-                `).join('')}
-            </div>
-
             <!-- Media Grid Container -->
             <div id="lib-grid-container"></div>
         </div>`;
@@ -942,6 +936,7 @@ async function renderLibrary(libId) {
         fillLibraryGrid(items, total);
     } catch (e) {
         if (gen !== libraryGen) return;
+        page.classList.remove('jf-with-rail');
         page.innerHTML = `<div class="p-6 rounded-xl bg-red-500/10 text-red-400">${escapeHtml(e.message)}</div>`;
     }
 }
@@ -974,6 +969,7 @@ function startLibraryLoad(libId) {
     libraryQuery = libraryListQuery(libId);
     libraryTotal = null;
     libraryRequested = new Set([0]); // the first page is requested by the load itself
+    railAnchor = null;
     return ++libraryGen;
 }
 
@@ -1002,7 +998,9 @@ function fillLibraryGrid(items, total) {
     const frag = document.createDocumentFragment();
     for (let i = 0; i < total; i++) {
         if (i < items.length) {
-            frag.appendChild(createCardElement(items[i]));
+            const card = createCardElement(items[i]);
+            card.dataset.letter = railLetter(items[i]);
+            frag.appendChild(card);
         } else {
             const ph = placeholder.cloneNode(true);
             ph.dataset.i = i;
@@ -1025,6 +1023,7 @@ function fillLibraryGrid(items, total) {
         }
     }, { rootMargin: '200% 0px' });
     grid.querySelectorAll('[data-i]').forEach(ph => libraryObserver.observe(ph));
+    scheduleRailUpdate();
 }
 
 // Puts the cards of one page in place of its placeholders
@@ -1037,10 +1036,12 @@ async function loadLibraryPage(gen, page) {
             const placeholder = grid?.children[page * LIBRARY_PAGE_SIZE + j];
             if (!placeholder) return;
             const card = createCardElement(item);
+            card.dataset.letter = railLetter(item);
             placeholder.replaceWith(card);
             libraryObserver.unobserve(placeholder);
             initLazyImages(card);
         });
+        scheduleRailUpdate();
     } catch (e) {
         if (gen !== libraryGen) return;
         libraryRequested.delete(page);
@@ -1050,10 +1051,7 @@ async function loadLibraryPage(gen, page) {
 
 // A sort or genre change: a new load for the new query, shown from the top of the list
 async function reloadLibrary(libId) {
-    const sortVal = $('lib-sort')?.value || 'SortName:Ascending';
-    // The letter bar follows name order only, so it is hidden for the other sorts
-    const alphaBar = document.querySelector('#page-library .jf-alpha-bar');
-    if (alphaBar) alphaBar.style.display = sortVal.startsWith('SortName') ? '' : 'none';
+    renderLetterRail(libId);
 
     window.scrollTo({ top: 0, behavior: 'instant' });
     const gen = startLibraryLoad(libId);
@@ -1082,6 +1080,13 @@ async function jumpToLetter(libId, letter) {
     const query = libraryQuery;
     const n = libraryTotal;
     const desc = query.SortOrder === 'Descending';
+    // The rail's first entry goes back to the top of the page, header and controls included; no request
+    if (letter === (desc ? 'Z' : '#')) {
+        railAnchor = null;
+        window.scrollTo({ top: 0, behavior: 'instant' });
+        scheduleRailUpdate();
+        return;
+    }
     const stale = () => click !== letterClicks || gen !== libraryGen;
     // Count of items whose name sorts at or after the bound; Limit 0 fetches no items
     const countFrom = async (bound) => {
@@ -1103,14 +1108,82 @@ async function jumpToLetter(libId, letter) {
         if (!grid) return;
         if (k < n) {
             grid.children[k].scrollIntoView({ block: 'start', behavior: 'instant' });
+            // The clicked section stays lit while its row is the top row (that row often starts with the previous letter)
+            railAnchor = { k, first: firstVisibleIndex(grid) };
+            setRailLetter(letter);
+            updateLetterRail();
         } else {
+            railAnchor = null;
             window.scrollTo({ top: document.scrollingElement.scrollHeight, behavior: 'instant' });
+            scheduleRailUpdate();
         }
     } catch (e) {
         if (stale()) return;
         toast(t('library.load_failed', { message: e.message }), 'error');
     }
 }
+
+// The letter rail (#lib-letter-rail in index.html) shows for the name sorts, in list order
+function renderLetterRail(libId) {
+    const sort = $('lib-sort')?.value || 'SortName:Ascending';
+    $('page-library').classList.toggle('jf-with-rail', sort.startsWith('SortName:'));
+    const letters = ['#', ...'ABCDEFGHIJKLMNOPQRSTUVWXYZ'];
+    if (sort === 'SortName:Descending') letters.reverse();
+    $('lib-letter-rail').innerHTML = letters.map(l =>
+        `<button type="button" data-action="jump-letter" data-letter="${l}" data-id="${escapeHtml(libId)}">${l}</button>`).join('');
+    railAnchor = null;
+}
+
+// An item's rail section: the server sorts by the lowercased name, so its first character decides
+function railLetter(item) {
+    const c = (item.SortName || item.Name || '').toLowerCase().charAt(0);
+    if (c < 'a') return '#';
+    if (c > 'z') return 'Z';
+    return c.toUpperCase();
+}
+
+// Index of the first card whose bottom edge is below the header; cards are in row order, so a binary search works
+function firstVisibleIndex(grid) {
+    const top = $('main-navbar').getBoundingClientRect().bottom;
+    const kids = grid.children;
+    let lo = 0, hi = kids.length;
+    while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (kids[mid].getBoundingClientRect().bottom > top) hi = mid;
+        else lo = mid + 1;
+    }
+    return lo;
+}
+
+function setRailLetter(letter) {
+    for (const b of $('lib-letter-rail').children) {
+        if (b.dataset.letter === letter) b.setAttribute('aria-current', 'true');
+        else b.removeAttribute('aria-current');
+    }
+}
+
+// Lights the section of the first item at the top of the view, or after a jump the clicked one (see jumpToLetter)
+function updateLetterRail() {
+    const page = $('page-library');
+    const grid = $('lib-grid');
+    if (!grid || page.classList.contains('hidden') || !page.classList.contains('jf-with-rail')) return;
+    let i = firstVisibleIndex(grid);
+    if (railAnchor && i === railAnchor.first) i = railAnchor.k;
+    else railAnchor = null;
+    const letter = grid.children[i]?.dataset.letter;
+    if (letter) setRailLetter(letter); // a placeholder keeps the highlight until its page is in
+}
+
+// At most one update per frame
+function scheduleRailUpdate() {
+    if (railFrame) return;
+    railFrame = requestAnimationFrame(() => {
+        railFrame = 0;
+        updateLetterRail();
+    });
+}
+window.addEventListener('scroll', scheduleRailUpdate, { passive: true });
+window.addEventListener('resize', scheduleRailUpdate);
 
 // --- Detail View Renderer (Movies, TV Series, Music) ---
 async function renderDetail(itemId) {

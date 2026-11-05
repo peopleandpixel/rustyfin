@@ -486,33 +486,58 @@ body {
   flex-shrink: 0;
 }
 
-/* Alphabet jump rail */
-.jf-alpha-bar {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.25rem;
-  padding: 0.5rem;
-  background: rgba(255, 255, 255, 0.03);
-  border: 1px solid var(--jf-border);
-  border-radius: 0.75rem;
-  margin-bottom: 1.5rem;
+/* Letter rail of the library page (name sorts). Fixed, not sticky: the document scrolls, not <main>, so a
+   sticky rail inside <main> would scroll away with it. It sits outside #page-library because navigate()
+   gives the page the jf-page fade-up, whose transform would make the page the containing block of a fixed
+   child and slide the rail in with the page. */
+.jf-letter-rail {
+  display: none;
+  position: fixed;
+  top: 4rem; /* below the header */
+  bottom: 0;
+  right: 0.25rem;
+  z-index: 30; /* under the header and the mobile drawer (z-40, z-50) */
+  width: 1.5rem;
+  flex-direction: column;
+  justify-content: center;
 }
 
-.jf-alpha-btn {
-  width: 1.85rem;
-  height: 1.85rem;
+#page-library.jf-with-rail:not(.hidden) + .jf-letter-rail {
+  display: flex;
+}
+
+/* Room for the rail; from lg the content box's 2rem padding is enough */
+#page-library.jf-with-rail {
+  padding-right: 1rem;
+}
+
+@media (width >= 64rem) {
+  #page-library.jf-with-rail {
+    padding-right: 0;
+  }
+}
+
+.jf-letter-rail > button {
+  flex: 0 1 1.25rem;
+  min-height: 0;
   display: flex;
   align-items: center;
   justify-content: center;
-  border-radius: 0.4rem;
-  font-size: 0.75rem;
+  font-size: clamp(0.5rem, (100dvh - 4rem) / 45, 0.75rem);
+  line-height: 1;
   font-weight: 600;
   color: rgba(255, 255, 255, 0.6);
-  transition: all 0.15s ease;
+  border-radius: 0.4rem;
+  transition: background-color 0.15s ease, color 0.15s ease;
   cursor: pointer;
 }
 
-.jf-alpha-btn:hover, .jf-alpha-btn.active {
+.jf-letter-rail > button:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: #fff;
+}
+
+.jf-letter-rail > button[aria-current] {
   background: #00a4dc;
   color: #fff;
   box-shadow: 0 0 10px rgba(0, 164, 220, 0.5);
