@@ -11,6 +11,7 @@ use uuid::Uuid;
 use rustyfin_core::transcode::{HwAccel, TranscodeError, TranscodeProfile};
 use rustyfin_model::media_source::MediaSourceResponse;
 
+use super::streaming::{Version, requested_source_id, select_version};
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -194,24 +195,40 @@ fn stream_copy(query: &TranscodeQuery, source: &SourceInfo) -> (bool, bool) {
     (copy_video, copy_audio)
 }
 
+/// ffmpeg's input for `version` of an item at `item_path`, and the source whose streams decide
+/// stream copy.
+fn hls_input<'a>(
+    item_path: &'a str,
+    sources: &'a [MediaSourceResponse],
+    version: Version,
+) -> (&'a str, Option<&'a MediaSourceResponse>) {
+    match version {
+        Version::Primary => (item_path, sources.first()),
+        Version::Source(index) => (sources[index].path.as_str(), Some(&sources[index])),
+    }
+}
+
 async fn hls_master_playlist(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Query(query): Query<TranscodeQuery>,
+    Query(params): Query<HashMap<String, String>>,
     RawQuery(raw_query): RawQuery,
 ) -> Result<Response, ApiError> {
     let item = rustyfin_db::repo_media::get_item_by_id(&state.db, id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Item {id} not found")))?;
 
-    // Copy only what the client plays; with no source to read, nothing is copied
-    let source =
+    // The version the request names; an id that names none is refused before ffmpeg starts
+    let sources =
         rustyfin_db::repo_media_source::get_media_sources_with_item_check(&state.db_ro, &id)
             .await
-            .and_then(|sources| sources.into_iter().next());
-    let info = source
-        .as_ref()
-        .map_or_else(SourceInfo::default, SourceInfo::from_source);
+            .unwrap_or_default();
+    let version = select_version(id, &sources, requested_source_id(&params))?;
+    let (input_path, source) = hls_input(&item.path, &sources, version);
+
+    // Copy only what the client plays; with no source to read, nothing is copied
+    let info = source.map_or_else(SourceInfo::default, SourceInfo::from_source);
     let (copy_video, copy_audio) = stream_copy(&query, &info);
     // Every playlist reload passes here; the manager logs the ffmpeg command when it starts one
     tracing::debug!(item = %id, copy_video, copy_audio, "HLS playlist requested");
@@ -224,7 +241,7 @@ async fn hls_master_playlist(
 
     let (playlist_path, playback_id) = match state
         .transcode_manager
-        .start_transcode(id, &item.path, &profile, &play_session_id, &device_id)
+        .start_transcode(id, input_path, &profile, &play_session_id, &device_id)
         .await
     {
         Ok(started) => started,
@@ -644,5 +661,55 @@ mod tests {
         );
         assert_eq!(rewrite_playlist(content, &playback_id, None), expected);
         assert_eq!(rewrite_playlist(content, &playback_id, Some("")), expected);
+    }
+
+    // ── B16: the transcode follows the version ──
+
+    #[test]
+    fn test_hls_input_follows_the_version() {
+        use crate::routes::streaming::Version;
+
+        let source = |path: &str, video: &str| -> MediaSourceResponse {
+            serde_json::from_value(serde_json::json!({
+                "Id": Uuid::new_v4().to_string(),
+                "Uid": "source",
+                "Container": "mkv",
+                "Protocol": "File",
+                "Path": path,
+                "MediaStreams": [
+                    { "Index": 0, "CodecType": "Video", "Codec": video,
+                      "Width": 1920, "Height": 1080 },
+                    { "Index": 1, "CodecType": "Audio", "Codec": "aac" },
+                ],
+            }))
+            .unwrap()
+        };
+        // The primary is H.264, which the browser takes as it is; the other version is HEVC
+        let primary = "/films/Film - 1080p.mkv";
+        let sources = vec![
+            source(primary, "h264"),
+            source("/films/Film - 2160p.mkv", "hevc"),
+        ];
+        let query = browser_query();
+
+        let (input, chosen) = hls_input(primary, &sources, Version::Primary);
+        assert_eq!(input, primary);
+        let chosen = chosen.expect("the primary's streams");
+        assert_eq!(chosen.id, sources[0].id);
+        let info = SourceInfo::from_source(chosen);
+        assert_eq!(stream_copy(&query, &info), (true, true));
+
+        let (input, chosen) = hls_input(primary, &sources, Version::Source(1));
+        assert_eq!(input, "/films/Film - 2160p.mkv");
+        let chosen = chosen.expect("the version's streams");
+        assert_eq!(chosen.id, sources[1].id);
+        // The HEVC version's video is encoded, not copied
+        let info = SourceInfo::from_source(chosen);
+        assert_eq!(stream_copy(&query, &info), (false, true));
+
+        // A movie that was never probed: its own file, and no streams to copy
+        let (input, chosen) = hls_input("/films/Bare.mkv", &[], Version::Primary);
+        assert_eq!(input, "/films/Bare.mkv");
+        assert!(chosen.is_none());
     }
 }

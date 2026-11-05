@@ -9681,3 +9681,384 @@ async fn g4_universal_direct_plays_a_probed_mp4() {
     );
     assert_eq!(body["MediaSources"][0]["SupportsDirectPlay"], true);
 }
+
+// ── B16: media source selection ──
+//
+// A movie with two versions, each a media source on its own file. `MediaSourceId` picks the
+// version on every video playback route. No id, a blank one or the item's own id plays the
+// primary, as before; an id that names no version of the item gets 404.
+
+/// Stores an H.264 + AAC source in `container` for `item` at `file` and returns its id.
+async fn b16_insert_source(
+    state: &AppState,
+    item: uuid::Uuid,
+    container: &str,
+    file: &std::path::Path,
+) -> uuid::Uuid {
+    let source: rustyfin_model::media_source::MediaSourceResponse =
+        serde_json::from_value(serde_json::json!({
+            "Id": uuid::Uuid::new_v4().to_string(),
+            "Uid": uuid::Uuid::new_v4().to_string(),
+            "Container": container,
+            "Protocol": "File",
+            "Path": file.to_str().unwrap(),
+            "MediaStreams": [
+                { "Index": 0, "Codec": "h264", "CodecType": "Video" },
+                { "Index": 1, "Codec": "aac", "CodecType": "Audio" },
+            ],
+        }))
+        .unwrap();
+    rustyfin_db::repo_media_source::insert_media_source_with_streams(&state.db, &item, &source)
+        .await
+        .unwrap()
+}
+
+/// A movie in folder `name` with two MP4 versions, each with its own bytes: `B16 Film -
+/// 1080p.mp4` (1000 bytes; the item's path and first source, so the primary) and `B16 Film -
+/// 720p.mp4` (1500 bytes). Returns the item id and each version's source id and bytes, the
+/// primary first.
+async fn b16_two_versions(
+    state: &AppState,
+    name: &str,
+) -> (uuid::Uuid, Vec<(uuid::Uuid, Vec<u8>)>) {
+    let folder = media_folder(state, name);
+    let mut item = None;
+    let mut versions = Vec::new();
+    for (file, len, step) in [
+        ("B16 Film - 1080p.mp4", 1000u32, 7u32),
+        ("B16 Film - 720p.mp4", 1500, 13),
+    ] {
+        let file = std::path::Path::new(&folder).join(file);
+        let content: Vec<u8> = (0..len).map(|i| (i * step % 251) as u8).collect();
+        std::fs::write(&file, &content).unwrap();
+        let id = match item {
+            Some(id) => id,
+            None => *item.insert(g4_insert_item(state, "Movie", &file).await),
+        };
+        versions.push((b16_insert_source(state, id, "mp4", &file).await, content));
+    }
+    (item.unwrap(), versions)
+}
+
+/// Sends `method` to `uri` with a bearer token and an optional `Range`; returns the status, the
+/// `Content-Length` and `Content-Range` headers and the body.
+async fn b16_fetch(
+    app: &axum::Router,
+    method: &str,
+    uri: &str,
+    token: &str,
+    range: Option<&str>,
+) -> (StatusCode, Option<String>, Option<String>, Vec<u8>) {
+    let mut req = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("Authorization", format!("Bearer {token}"));
+    if let Some(range) = range {
+        req = req.header("Range", range);
+    }
+    let resp = app
+        .clone()
+        .oneshot(req.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let header = |name: &str| {
+        resp.headers()
+            .get(name)
+            .map(|v| v.to_str().unwrap().to_string())
+    };
+    let (length, content_range) = (header("content-length"), header("content-range"));
+    let status = resp.status();
+    let body = resp
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .to_vec();
+    (status, length, content_range, body)
+}
+
+#[tokio::test]
+async fn b16_stream_routes_play_the_requested_version() {
+    let state = test_state().await;
+    let _dir = G4Dir(state.data_dir.to_path_buf());
+    let (token, _) = admin_session(&state).await;
+    let (item, versions) = b16_two_versions(&state, "b16-stream").await;
+    let ((a, primary), (b, other)) = (&versions[0], &versions[1]);
+    // A movie that was never probed has no sources; its own id plays its file
+    let bare_file = std::path::Path::new(&media_folder(&state, "b16-bare")).join("B16 Bare.mp4");
+    let bare_content: Vec<u8> = (0..800u32).map(|i| (i % 199) as u8).collect();
+    std::fs::write(&bare_file, &bare_content).unwrap();
+    let bare = g4_insert_item(&state, "Movie", &bare_file).await;
+    let app = app(state);
+
+    for (id, query, content) in [
+        // No id, a blank one or the item's own id: the primary, as before
+        (item, String::new(), primary),
+        (item, "MediaSourceId=&".to_string(), primary),
+        (item, format!("MediaSourceId={item}&"), primary),
+        (item, format!("MediaSourceId={}&", item.simple()), primary),
+        (item, format!("MediaSourceId={a}&"), primary),
+        // The other version's id, in the forms clients send
+        (item, format!("MediaSourceId={b}&"), other),
+        (item, format!("mediaSourceId={b}&"), other),
+        (
+            item,
+            format!("MediaSourceId={}&", b.to_string().to_uppercase()),
+            other,
+        ),
+        (item, format!("MediaSourceId={}&", b.simple()), other),
+        (bare, String::new(), &bare_content),
+        (bare, format!("MediaSourceId={bare}&"), &bare_content),
+    ] {
+        let len = content.len();
+        // The start of the file, and its end through the container route
+        let uri = format!("/Videos/{id}/stream?{query}Static=true");
+        let (status, _, range, body) =
+            b16_fetch(&app, "GET", &uri, &token, Some("bytes=0-99")).await;
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT, "GET {uri}");
+        assert_eq!(range, Some(format!("bytes 0-99/{len}")), "GET {uri}");
+        assert!(body == content[..100], "GET {uri}: other bytes");
+        let uri = format!("/Videos/{id}/stream.mp4?{query}Static=true");
+        let (status, _, range, body) =
+            b16_fetch(&app, "GET", &uri, &token, Some("bytes=-100")).await;
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT, "GET {uri}");
+        let expected = format!("bytes {}-{}/{len}", len - 100, len - 1);
+        assert_eq!(range, Some(expected), "GET {uri}");
+        assert!(body == content[len - 100..], "GET {uri}: other bytes");
+        // Whole files, and their length
+        for route in ["stream", "stream.mp4", "progressive.stream"] {
+            let uri = format!("/Videos/{id}/{route}?{query}Static=true");
+            let (status, _, _, body) = b16_fetch(&app, "GET", &uri, &token, None).await;
+            assert_eq!(status, StatusCode::OK, "GET {uri}");
+            assert!(body == *content, "GET {uri}: {} bytes", body.len());
+            let (status, length, _, _) = b16_fetch(&app, "HEAD", &uri, &token, None).await;
+            assert_eq!(status, StatusCode::OK, "HEAD {uri}");
+            assert_eq!(length, Some(len.to_string()), "HEAD {uri}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn b16_an_id_of_no_version_gets_404() {
+    let state = test_state().await;
+    let _dir = G4Dir(state.data_dir.to_path_buf());
+    let (token, _) = admin_session(&state).await;
+    let (item, _) = b16_two_versions(&state, "b16-unknown").await;
+    let (_, others) = b16_two_versions(&state, "b16-unknown-other").await;
+    let bare_file =
+        std::path::Path::new(&media_folder(&state, "b16-unknown-bare")).join("B16 Bare.mp4");
+    std::fs::write(&bare_file, b"b16").unwrap();
+    let bare = g4_insert_item(&state, "Movie", &bare_file).await;
+    let app = app(state);
+
+    let unknown = uuid::Uuid::new_v4().to_string();
+    for (id, source) in [
+        (item, unknown.clone()),
+        (item, "nope".to_string()),
+        // Another movie's version is no version of this one
+        (item, others[1].0.to_string()),
+        // A movie that was never probed has no version but itself
+        (bare, unknown),
+    ] {
+        for (method, route) in [
+            ("GET", "stream"),
+            ("HEAD", "stream"),
+            ("GET", "stream.mp4"),
+            ("HEAD", "stream.mp4"),
+            ("GET", "progressive.stream"),
+            ("HEAD", "progressive.stream"),
+            ("GET", "Universal"),
+            ("GET", "PlaybackInfo"),
+            // Refused before ffmpeg starts
+            ("GET", "main.m3u8"),
+        ] {
+            let uri =
+                format!("/Videos/{id}/{route}?MediaSourceId={source}&PlaySessionId=b16-unknown");
+            let (status, _, _, _) = b16_fetch(&app, method, &uri, &token, None).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{method} {uri}");
+        }
+    }
+}
+
+/// The values of the `MediaSourceId` parameters in `url`'s query.
+fn b16_url_sources(url: &str) -> Vec<&str> {
+    let query = url.split_once('?').map_or("", |(_, query)| query);
+    query
+        .split('&')
+        .filter_map(|pair| pair.strip_prefix("MediaSourceId="))
+        .collect()
+}
+
+/// Asserts that `body`'s `MediaSources` are `ids` in order and that only `selected` carries the
+/// `Supports*` flags.
+fn b16_assert_flags(body: &serde_json::Value, ids: &[&str], selected: &str, what: &str) {
+    let sources = body["MediaSources"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{what}: {body}"));
+    let listed: Vec<&str> = sources
+        .iter()
+        .map(|s| s["Id"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(listed, ids, "{what}: every version, in order");
+    for source in sources {
+        let chosen = source["Id"] == selected;
+        let id = &source["Id"];
+        assert_eq!(source["SupportsTranscoding"], chosen, "{what}: {id}");
+        if !chosen {
+            assert_eq!(source["SupportsDirectPlay"], false, "{what}: {id}");
+            assert_eq!(source["SupportsDirectStream"], false, "{what}: {id}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn b16_universal_and_playback_info_name_the_requested_version() {
+    let state = test_state().await;
+    let _dir = G4Dir(state.data_dir.to_path_buf());
+    let (token, _) = admin_session(&state).await;
+    let (item, versions) = b16_two_versions(&state, "b16-universal").await;
+    let (a, b) = (versions[0].0.to_string(), versions[1].0.to_string());
+    let ids = [a.as_str(), b.as_str()];
+    let app = app(state);
+
+    let lists = "VideoCodecs=h264,vp8,vp9,av1&AudioCodecs=aac,mp3,opus,flac";
+    for (query, selected) in [
+        (String::new(), &a),
+        ("MediaSourceId=&".to_string(), &a),
+        (format!("MediaSourceId={item}&"), &a),
+        (format!("MediaSourceId={a}&"), &a),
+        (format!("MediaSourceId={b}&"), &b),
+        (format!("mediaSourceId={b}&"), &b),
+        (format!("MediaSourceId={}&", b.to_uppercase()), &b),
+    ] {
+        // Direct play, direct stream and transcode each name the version by its id
+        for (allow, route, is_static) in [
+            ("", "stream", true),
+            ("EnableDirectPlay=false&", "stream", false),
+            (
+                "EnableDirectPlay=false&EnableDirectStream=false&",
+                "main.m3u8",
+                false,
+            ),
+        ] {
+            let uri = format!("/Videos/{item}/Universal?{query}{allow}{lists}");
+            let (status, body) = send(&app, request("GET", &uri, Some(&token), None)).await;
+            assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+            let url = body["Url"].as_str().unwrap_or_default();
+            assert!(
+                url.starts_with(&format!("/Videos/{item}/{route}?")),
+                "{uri}: {url}"
+            );
+            assert_eq!(url.contains("Static=true"), is_static, "{uri}: {url}");
+            assert_eq!(b16_url_sources(url), [selected.as_str()], "{uri}: {url}");
+            b16_assert_flags(&body, &ids, selected, &uri);
+        }
+        let uri = format!("/Videos/{item}/PlaybackInfo?{query}{lists}");
+        let (status, body) = send(&app, request("GET", &uri, Some(&token), None)).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        b16_assert_flags(&body, &ids, selected, &uri);
+        let index = if *selected == a { 0 } else { 1 };
+        assert_eq!(
+            body["MediaSources"][index]["SupportsDirectPlay"], true,
+            "{uri}: {body}"
+        );
+    }
+}
+
+/// Writes `data` to `file` and returns the width of its first video stream. For MPEG-TS, ffprobe
+/// lists the stream under its program too, so the first value is taken.
+fn b16_video_width(file: &std::path::Path, data: &[u8]) -> u64 {
+    std::fs::write(file, data).unwrap();
+    let out = std::process::Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", "v:0", "-of", "csv=p=0"])
+        .args(["-show_entries", "stream=width"])
+        .arg(file)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "ffprobe: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let width = String::from_utf8_lossy(&out.stdout);
+    width
+        .lines()
+        .find_map(|line| line.trim().parse().ok())
+        .unwrap_or_else(|| panic!("ffprobe width: {width:?}"))
+}
+
+#[tokio::test]
+async fn b16_hls_transcodes_the_requested_version() {
+    if !g4_have_ffmpeg("b16_hls_transcodes_the_requested_version") {
+        return;
+    }
+    let state = test_state().await;
+    let _dir = G4Dir(state.data_dir.to_path_buf());
+    let (token, _) = admin_session(&state).await;
+    let folder = media_folder(&state, "b16-hls");
+    // Two versions that differ in width: the primary 320 pixels, the other 160
+    let mut files = Vec::new();
+    for (name, size) in [
+        ("B16 Clip - 240p.mp4", "320x240"),
+        ("B16 Clip - 120p.mp4", "160x120"),
+    ] {
+        let file = std::path::Path::new(&folder).join(name);
+        let video = format!("testsrc=size={size}:rate=25");
+        g4_make_media(&[
+            "-f",
+            "lavfi",
+            "-i",
+            video.as_str(),
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000",
+            "-t",
+            "2",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            file.to_str().unwrap(),
+        ]);
+        files.push(file);
+    }
+    let item = g4_insert_item(&state, "Movie", &files[0]).await;
+    let a = b16_insert_source(&state, item, "mp4", &files[0]).await;
+    let b = b16_insert_source(&state, item, "mp4", &files[1]).await;
+    let probe_file = state.data_dir.join("b16-segment.ts");
+    let app = app(state);
+
+    // One play session asks for the other version, then for the primary
+    let mut transcodes = Vec::new();
+    for (source, width) in [(b, 160), (a, 320)] {
+        let uri = format!(
+            "/Videos/{item}/main.m3u8?MediaSourceId={source}&PlaySessionId=b16-hls&api_key={token}"
+        );
+        let segment = g4_first_segment(&app, item, &uri, &token).await;
+        let (status, _, data) = g4_get(&app, &segment).await;
+        assert_eq!(status, StatusCode::OK, "MediaSourceId={source}");
+        let found = b16_video_width(&probe_file, &data);
+        assert_eq!(found, width, "MediaSourceId={source}");
+        transcodes.push(segment.split('?').next().unwrap().to_string());
+    }
+    assert_ne!(transcodes[0], transcodes[1], "two versions, two transcodes");
+
+    // No id plays the primary, on the primary's transcode
+    let uri = format!("/Videos/{item}/main.m3u8?PlaySessionId=b16-hls&api_key={token}");
+    let segment = g4_first_segment(&app, item, &uri, &token).await;
+    assert_eq!(segment.split('?').next().unwrap(), transcodes[1]);
+
+    // Stopping the play session stops both
+    let uri = "/Videos/ActiveEncodings?PlaySessionId=b16-hls";
+    let (status, _) = send(&app, request("DELETE", uri, Some(&token), None)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    for transcode in &transcodes {
+        let segment = format!("{transcode}?api_key={token}");
+        let (status, _, _) = g4_get(&app, &segment).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{transcode}");
+    }
+}

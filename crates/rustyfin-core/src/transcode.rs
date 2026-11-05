@@ -88,6 +88,8 @@ impl Default for TranscodeProfile {
 struct TranscodeSession {
     item_id: Uuid,
     playback_id: Uuid,
+    /// The file ffmpeg reads: each version of an item has its own.
+    input_path: String,
     play_session_id: String, // "" when the request had none
     device_id: String,       // "" when the request had none
     output_dir: PathBuf,     // cache_root/{playback_id}
@@ -159,9 +161,9 @@ impl TranscodeManager {
     }
 
     /// Start the HLS transcode of `input_path` for a request, or reuse the item's transcode of
-    /// the same play session (else device). Returns the playlist path and the playback id once
-    /// ffmpeg has written the playlist. Fails when ffmpeg exits first, or when no playlist
-    /// appears within `playlist_wait`; ffmpeg then keeps running.
+    /// the same input file and the same play session (else device). Returns the playlist path and
+    /// the playback id once ffmpeg has written the playlist. Fails when ffmpeg exits first, or when
+    /// no playlist appears within `playlist_wait`; ffmpeg then keeps running.
     pub async fn start_transcode(
         &self,
         item_id: Uuid,
@@ -172,7 +174,7 @@ impl TranscodeManager {
     ) -> Result<(PathBuf, Uuid), TranscodeError> {
         let playback_id = {
             let _lock = self.start_lock.lock().await;
-            match self.find_session(item_id, play_session_id, device_id) {
+            match self.find_session(item_id, input_path, play_session_id, device_id) {
                 Some(id) if self.touch_live_session(id) => id,
                 Some(id) => {
                     // ffmpeg exited without a playlist: start again
@@ -207,12 +209,21 @@ impl TranscodeManager {
         }
     }
 
-    /// The item's session that a request with these names reuses.
-    fn find_session(&self, item_id: Uuid, play_session_id: &str, device_id: &str) -> Option<Uuid> {
+    /// The item's session of `input_path` that a request with these names reuses.
+    fn find_session(
+        &self,
+        item_id: Uuid,
+        input_path: &str,
+        play_session_id: &str,
+        device_id: &str,
+    ) -> Option<Uuid> {
         self.sessions
             .iter()
             .find(|e| {
-                e.value().item_id == item_id && same_key(e.value(), play_session_id, device_id)
+                let session = e.value();
+                session.item_id == item_id
+                    && session.input_path == input_path
+                    && same_key(session, play_session_id, device_id)
             })
             .map(|e| *e.key())
     }
@@ -309,6 +320,7 @@ impl TranscodeManager {
             TranscodeSession {
                 item_id,
                 playback_id,
+                input_path: input_path.to_string(),
                 play_session_id: play_session_id.to_string(),
                 device_id: device_id.to_string(),
                 output_dir,
@@ -1189,6 +1201,56 @@ exec sleep 30
         mgr.stop_all().await;
         assert!(!mgr.is_active(item).await);
         assert!(!playlist_b.exists());
+    }
+
+    /// Starts `item`'s transcode of `input` for `play_session_id`, with no device id, and returns
+    /// the playback id.
+    async fn start_on(
+        mgr: &TranscodeManager,
+        item: Uuid,
+        input: &str,
+        play_session_id: &str,
+    ) -> Uuid {
+        let profile = TranscodeProfile::default();
+        let (_, playback_id) = mgr
+            .start_transcode(item, input, &profile, play_session_id, "")
+            .await
+            .unwrap();
+        playback_id
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_another_version_gets_its_own_session() {
+        let (_dir, mgr) = fake_manager("good", Duration::from_secs(10));
+        let item = Uuid::new_v4();
+        let (hd, sd) = ("/films/Film - 1080p.mkv", "/films/Film - 720p.mkv");
+        let a = start_on(&mgr, item, hd, "psid").await;
+        // The same play session asks for another version of the item: a transcode of that file
+        let b = start_on(&mgr, item, sd, "psid").await;
+        assert_ne!(
+            a, b,
+            "another version must not reuse the first version's transcode"
+        );
+        // Each version's own transcode is reused
+        assert_eq!(start_on(&mgr, item, hd, "psid").await, a);
+        assert_eq!(start_on(&mgr, item, sd, "psid").await, b);
+        assert_eq!(mgr.sessions.len(), 2);
+
+        // Requests without a play session or device id are told apart by their file too
+        let c = start_on(&mgr, item, hd, "").await;
+        let d = start_on(&mgr, item, sd, "").await;
+        assert_ne!(c, d);
+        assert_eq!(start_on(&mgr, item, hd, "").await, c);
+
+        // Stopping the play session stops both of its transcodes and nothing else
+        assert_eq!(mgr.stop_play_session(Some(item), "psid", "").await, 2);
+        assert!(mgr.segment_path(item, a, SEGMENT).is_none());
+        assert!(mgr.segment_path(item, b, SEGMENT).is_none());
+        assert!(mgr.segment_path(item, c, SEGMENT).is_some());
+        assert!(mgr.segment_path(item, d, SEGMENT).is_some());
+
+        mgr.stop_all().await;
     }
 
     #[cfg(unix)]

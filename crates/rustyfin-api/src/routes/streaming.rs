@@ -3,6 +3,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path as FilePath;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
@@ -13,10 +14,10 @@ use crate::state::AppState;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route("/Videos/{id}/stream", get(stream_video).head(head_stream))
+        .route("/Videos/{id}/stream", get(stream_video).head(head_video))
         .route(
             "/Videos/{id}/stream.{container}",
-            get(stream_video).head(head_stream),
+            get(stream_video).head(head_video),
         )
         .route(
             "/Videos/{id}/progressive.stream",
@@ -34,12 +35,105 @@ pub fn routes() -> Router<AppState> {
         .route("/Audio/{id}/PlaybackInfo", get(audio_playback_info))
 }
 
+// ---------------------------------------------------------------------------
+// Video versions
+// ---------------------------------------------------------------------------
+
+/// Which version of an item a playback request plays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Version {
+    /// No MediaSourceId, a blank one or the item's own id: the item's file.
+    Primary,
+    /// The source at this index of the item's sources.
+    Source(usize),
+}
+
+/// The request's MediaSourceId (name matched in any ASCII case), trimmed. None when absent or
+/// blank.
+pub(crate) fn requested_source_id(params: &HashMap<String, String>) -> Option<&str> {
+    params
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("MediaSourceId"))
+        .map(|(_, value)| value.trim())
+        .filter(|value| !value.is_empty())
+        // A client sends one name; should several match, the smallest value does not depend on
+        // the map's order
+        .min()
+}
+
+/// The version `requested` names among `sources` of item `item_id`. ApiError::NotFound when it
+/// names none.
+pub(crate) fn select_version(
+    item_id: Uuid,
+    sources: &[rustyfin_model::media_source::MediaSourceResponse],
+    requested: Option<&str>,
+) -> Result<Version, ApiError> {
+    let Some(requested) = requested else {
+        return Ok(Version::Primary);
+    };
+    let wanted = Uuid::parse_str(requested).ok();
+    if wanted == Some(item_id) {
+        return Ok(Version::Primary);
+    }
+    sources
+        .iter()
+        .position(|source| {
+            source.id == requested
+                || (wanted.is_some() && Uuid::parse_str(&source.id).ok() == wanted)
+        })
+        .map(Version::Source)
+        .ok_or_else(|| {
+            ApiError::NotFound(format!(
+                "Media source {requested} not found for item {item_id}"
+            ))
+        })
+}
+
+/// The path of a video route. `stream.{container}` has a second parameter, which serde ignores.
+#[derive(Deserialize)]
+struct VideoPath {
+    id: Uuid,
+}
+
+/// The file that a video request plays: the item's own file, or the file of the version that its
+/// `MediaSourceId` names. The sources are read only when an id is given.
+async fn video_file(
+    state: &AppState,
+    id: Uuid,
+    params: &HashMap<String, String>,
+) -> Result<String, ApiError> {
+    let item = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Item {id} not found")))?;
+    let Some(requested) = requested_source_id(params) else {
+        return Ok(item.path);
+    };
+    let sources = rustyfin_db::repo_media_source::get_media_sources(&state.db_ro, &id).await?;
+    match select_version(id, &sources, Some(requested))? {
+        Version::Primary => Ok(item.path),
+        Version::Source(index) => Ok(sources[index].path.clone()),
+    }
+}
+
+/// `GET /Videos/{id}/stream` and `stream.{container}`: the file of the requested version.
 async fn stream_video(
-    state: State<AppState>,
-    path: Path<Uuid>,
+    State(state): State<AppState>,
+    Path(VideoPath { id }): Path<VideoPath>,
+    Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    stream_file(state, path, headers).await
+    let file_path = video_file(&state, id, &params).await?;
+    serve_file(file_path, &headers).await
+}
+
+/// `HEAD` of `stream` and `stream.{container}`: the headers of the file that `GET` serves.
+async fn head_video(
+    State(state): State<AppState>,
+    Path(VideoPath { id }): Path<VideoPath>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Response, ApiError> {
+    let file_path = video_file(&state, id, &params).await?;
+    head_file(&file_path).await
 }
 
 async fn stream_audio(
@@ -58,7 +152,12 @@ async fn head_stream(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Item {id} not found")))?;
 
-    let file_path = &item.path;
+    head_file(&item.path).await
+}
+
+/// The headers of a `HEAD` for the file at `file_path`: its type, its length, and that byte
+/// ranges are accepted.
+async fn head_file(file_path: &str) -> Result<Response, ApiError> {
     let metadata = tokio::fs::metadata(file_path)
         .await
         .map_err(|e| ApiError::NotFound(format!("File not accessible: {e}")))?;
@@ -86,7 +185,12 @@ async fn stream_file(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Item {id} not found")))?;
 
-    let file_path = item.path.clone();
+    serve_file(item.path, &headers).await
+}
+
+/// Serves the file at `file_path` for a request with `headers`: the whole file, or the byte range,
+/// 304 or 416 that the headers ask for.
+async fn serve_file(file_path: String, headers: &HeaderMap) -> Result<Response, ApiError> {
     let content_type = mime_from_path(&file_path);
 
     // Open file first, then get metadata from the file handle — avoids a separate stat() syscall
@@ -461,12 +565,10 @@ async fn audio_playback_info(
 async fn stream_video_progressive(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    Query(params): Query<HashMap<String, String>>,
 ) -> Result<Response, ApiError> {
-    let item = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, id)
-        .await?
-        .ok_or_else(|| ApiError::NotFound(format!("Video item {id} not found")))?;
+    let file_path = video_file(&state, id, &params).await?;
 
-    let file_path = item.path.clone();
     let metadata = tokio::fs::metadata(&file_path)
         .await
         .map_err(|e| ApiError::NotFound(format!("File not accessible: {e}")))?;
@@ -518,7 +620,6 @@ struct VideoPlaybackInfoQuery {
     subtitle_stream_index: Option<i32>,
     start_time_ticks: Option<i64>,
     is_live: bool,
-    media_source_id: Option<String>,
     device_id: Option<String>,
     video_codec: Option<String>,
     audio_codec: Option<String>,
@@ -549,7 +650,6 @@ impl From<HashMap<String, String>> for VideoPlaybackInfoQuery {
                 .get("IsLive")
                 .map(|v| v.parse().unwrap_or(false))
                 .unwrap_or(false),
-            media_source_id: params.get("MediaSourceId").cloned(),
             device_id: params.get("DeviceId").cloned(),
             // Support both singular (VideoCodec) and plural (VideoCodecs) parameter names
             video_codec: params
@@ -598,23 +698,18 @@ async fn video_universal(
     Path(id): Path<Uuid>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Response, ApiError> {
-    let query = VideoPlaybackInfoQuery::from(params.clone());
-
     // Single query: verify item exists and fetch media sources with streams
     let mut media_sources =
         rustyfin_db::repo_media_source::get_media_sources_with_item_check(&state.db_ro, &id)
             .await
             .ok_or_else(|| ApiError::NotFound(format!("Video item {id} not found")))?;
 
-    // Select the appropriate media source
-    let selected_source_index = if let Some(ref source_id) = query.media_source_id {
-        media_sources
-            .iter()
-            .position(|s| s.id == *source_id)
-            .unwrap_or(0)
-    } else {
-        0
+    // The index of the version the request names; an id that names none is refused
+    let index = match select_version(id, &media_sources, requested_source_id(&params))? {
+        Version::Primary => 0,
+        Version::Source(index) => index,
     };
+    let query = VideoPlaybackInfoQuery::from(params);
 
     // Generate playback session ID
     let play_session_id = uuid::Uuid::new_v4().to_string();
@@ -626,7 +721,7 @@ async fn video_universal(
         // No media sources - fallback to transcoding if possible
         (false, false, true)
     } else {
-        let source = &media_sources[selected_source_index];
+        let source = &media_sources[index];
 
         let can_direct_play = query.enable_direct_play && check_direct_play(source, &query);
         let can_direct_stream = query.enable_direct_stream && check_direct_stream(source, &query);
@@ -639,18 +734,12 @@ async fn video_universal(
     let url = if supports_direct_play {
         Some(format!(
             "/Videos/{}/stream?MediaSourceId={}&Static=true",
-            id,
-            media_sources
-                .first()
-                .map_or("".to_string(), |s| s.id.clone())
+            id, media_sources[index].id
         ))
     } else if supports_direct_stream {
         Some(format!(
             "/Videos/{}/stream?MediaSourceId={}",
-            id,
-            media_sources
-                .first()
-                .map_or("".to_string(), |s| s.id.clone())
+            id, media_sources[index].id
         ))
     } else if supports_transcoding {
         let mut url = format!(
@@ -658,6 +747,9 @@ async fn video_universal(
             id,
             query.device_id.unwrap_or_default()
         );
+        if let Some(source) = media_sources.get(index) {
+            url.push_str(&format!("&MediaSourceId={}", source.id));
+        }
         if let Some(bitrate) = query.max_video_bitrate {
             url.push_str(&format!("&VideoBitrate={}", bitrate));
         }
@@ -690,9 +782,9 @@ async fn video_universal(
 
     // Update media sources with direct play flags based on client capabilities
     for (i, source) in media_sources.iter_mut().enumerate() {
-        source.supports_direct_play = i == selected_source_index && supports_direct_play;
-        source.supports_direct_stream = i == selected_source_index && supports_direct_stream;
-        source.supports_transcoding = i == selected_source_index && supports_transcoding;
+        source.supports_direct_play = i == index && supports_direct_play;
+        source.supports_direct_stream = i == index && supports_direct_stream;
+        source.supports_transcoding = i == index && supports_transcoding;
     }
 
     let response = rustyfin_model::playback_info::StreamingResponse {
@@ -718,23 +810,18 @@ async fn video_playback_info(
     Path(id): Path<Uuid>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Response, ApiError> {
-    let query = VideoPlaybackInfoQuery::from(params);
-
     // Single query: verify item exists and fetch media sources with streams
     let mut media_sources =
         rustyfin_db::repo_media_source::get_media_sources_with_item_check(&state.db_ro, &id)
             .await
             .ok_or_else(|| ApiError::NotFound(format!("Video item {id} not found")))?;
 
-    // Select the appropriate media source
-    let selected_source_index = if let Some(ref source_id) = query.media_source_id {
-        media_sources
-            .iter()
-            .position(|s| s.id == *source_id)
-            .unwrap_or(0)
-    } else {
-        0
+    // The index of the version the request names; an id that names none is refused
+    let index = match select_version(id, &media_sources, requested_source_id(&params))? {
+        Version::Primary => 0,
+        Version::Source(index) => index,
     };
+    let query = VideoPlaybackInfoQuery::from(params);
 
     // Generate playback session ID
     let play_session_id = uuid::Uuid::new_v4().to_string();
@@ -746,7 +833,7 @@ async fn video_playback_info(
         // No media sources - fallback to transcoding if possible
         (false, false, true)
     } else {
-        let source = &media_sources[selected_source_index];
+        let source = &media_sources[index];
 
         // Check if client can direct play
         let can_direct_play = query.enable_direct_play && check_direct_play(source, &query);
@@ -762,9 +849,9 @@ async fn video_playback_info(
 
     // Update media sources with direct play flags based on client capabilities
     for (i, source) in media_sources.iter_mut().enumerate() {
-        source.supports_direct_play = i == selected_source_index && supports_direct_play;
-        source.supports_direct_stream = i == selected_source_index && supports_direct_stream;
-        source.supports_transcoding = i == selected_source_index && supports_transcoding;
+        source.supports_direct_play = i == index && supports_direct_play;
+        source.supports_direct_stream = i == index && supports_direct_stream;
+        source.supports_transcoding = i == index && supports_transcoding;
     }
 
     let response = rustyfin_model::playback_info::VideoPlaybackInfoResponse {
@@ -1431,5 +1518,98 @@ mod tests {
                 "{copy}"
             );
         }
+    }
+
+    // ── B16: version selection ──
+
+    /// One H.264 + AAC MP4 source per id, in this order.
+    fn sources_with_ids(ids: &[&str]) -> Vec<rustyfin_model::media_source::MediaSourceResponse> {
+        ids.iter()
+            .map(|id| {
+                let mut source = source_with("mp4", "h264", "aac");
+                source.id = id.to_string();
+                source.path = format!("/media/{id}.mp4");
+                source
+            })
+            .collect()
+    }
+
+    fn params_of(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn test_requested_source_id() {
+        assert_eq!(requested_source_id(&params_of(&[])), None);
+        assert_eq!(requested_source_id(&params_of(&[("Static", "true")])), None);
+        // A blank id is no id
+        for blank in ["", "  "] {
+            let params = params_of(&[("MediaSourceId", blank)]);
+            assert_eq!(requested_source_id(&params), None, "{blank:?}");
+        }
+        // Clients send the name in either case
+        for name in ["MediaSourceId", "mediaSourceId", "MEDIASOURCEID"] {
+            let params = params_of(&[(name, "abc")]);
+            assert_eq!(requested_source_id(&params), Some("abc"), "{name}");
+        }
+        let params = params_of(&[("MediaSourceId", " abc ")]);
+        assert_eq!(requested_source_id(&params), Some("abc"));
+    }
+
+    #[test]
+    fn test_select_version() {
+        let item = Uuid::new_v4();
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let sources = sources_with_ids(&[&a.to_string(), &b.to_string()]);
+        let select = |requested: Option<&str>| select_version(item, &sources, requested);
+
+        // No id, or the item's own id in any form: the primary
+        for requested in [
+            None,
+            Some(item.to_string()),
+            Some(item.simple().to_string()),
+            Some(item.to_string().to_uppercase()),
+        ] {
+            let version = select(requested.as_deref()).unwrap();
+            assert_eq!(version, Version::Primary, "{requested:?}");
+        }
+        // A version's id, in any form
+        for (id, index) in [(a, 0), (b, 1)] {
+            for requested in [
+                id.to_string(),
+                id.simple().to_string(),
+                id.to_string().to_uppercase(),
+            ] {
+                let version = select(Some(&requested)).unwrap();
+                assert_eq!(version, Version::Source(index), "{requested}");
+            }
+        }
+        // Anything else names no version of this item
+        for requested in [Uuid::new_v4().to_string(), "nope".to_string()] {
+            let selected = select(Some(&requested));
+            assert!(
+                matches!(selected, Err(ApiError::NotFound(_))),
+                "{requested}: {selected:?}"
+            );
+        }
+
+        // A movie that was never probed has no version but itself
+        let version = select_version(item, &[], None).unwrap();
+        assert_eq!(version, Version::Primary);
+        let version = select_version(item, &[], Some(&item.to_string())).unwrap();
+        assert_eq!(version, Version::Primary);
+        let selected = select_version(item, &[], Some(&a.to_string()));
+        assert!(
+            matches!(selected, Err(ApiError::NotFound(_))),
+            "{selected:?}"
+        );
+
+        // A source id that is not a UUID matches as it is
+        let odd = sources_with_ids(&["odd-source"]);
+        let version = select_version(item, &odd, Some("odd-source")).unwrap();
+        assert_eq!(version, Version::Source(0));
     }
 }
