@@ -14,6 +14,7 @@ use rustyfin_api::cache::{ApiCache, ImageCache};
 use rustyfin_api::middleware::RateLimiter;
 use rustyfin_api::routes::build_router;
 use rustyfin_api::state::AppState;
+use rustyfin_core::scan_progress::ScanRegistry;
 use rustyfin_model::server_info::ServerConfiguration;
 use rustyfin_model::ws_event::WsEvent;
 
@@ -9504,6 +9505,223 @@ async fn g1c_next_up_accepts_both_casings() {
             );
         }
     }
+}
+
+// ── B17: library scan progress ──
+// Every signed-in socket gets `RefreshProgress` frames for a library's scan: "0" when it is
+// queued, each higher whole percent, and "100" once its probes have finished. A new socket
+// first gets the scans in progress. A web scan's Completed comes after that end; scheduler
+// scans send no task events, so they raise no toast.
+
+/// Writes `n` empty movie files into the library folder `folder`.
+fn b17_movies(folder: &str, n: usize) {
+    for i in 1..=n {
+        let dir = std::path::Path::new(folder).join(format!("B17 Movie {i} (2000)"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("B17 Movie {i} (2000).mkv")), b"").unwrap();
+    }
+}
+
+/// Serves `app` on a free local port, for sockets.
+async fn b17_serve(app: &axum::Router) -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let served = app.clone();
+    tokio::spawn(async move { axum::serve(listener, served).await.unwrap() });
+    addr
+}
+
+/// The library id and the percent of the socket's next `RefreshProgress` frame.
+async fn b17_next_progress(socket: &mut G1cSocket) -> (String, String) {
+    loop {
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(10), socket.next())
+            .await
+            .expect("no RefreshProgress frame within 10 s");
+        if frame["MessageType"] == "RefreshProgress" {
+            let progress = frame["Data"]["Progress"].as_str();
+            let progress = progress.expect("Progress is a string").to_string();
+            return (
+                frame["Data"]["ItemId"].as_str().unwrap().to_string(),
+                progress,
+            );
+        }
+    }
+}
+
+/// Reads the socket until it has had `RefreshProgress` "100" for `lib` and, with `completed`,
+/// the `ScheduledTaskCompleted` naming `lib`, at which point `scans` must no longer list `lib`.
+/// Returns the percents for `lib`, and each `ScheduledTask*` frame as `MessageType State`, sorted.
+async fn b17_follow_scan(
+    socket: &mut G1cSocket,
+    scans: &ScanRegistry,
+    lib: uuid::Uuid,
+    completed: bool,
+) -> (Vec<String>, Vec<String>) {
+    let id = lib.to_string();
+    let (mut progress, mut tasks) = (Vec::<String>::new(), Vec::new());
+    let mut done = !completed;
+    while progress.last().map(String::as_str) != Some("100") || !done {
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(60), socket.next())
+            .await
+            .unwrap_or_else(|_| panic!("the scan did not end within 60 s: {progress:?} {tasks:?}"));
+        let kind = frame["MessageType"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if kind == "RefreshProgress" {
+            assert_eq!(frame["Data"]["ItemId"], id.as_str(), "{frame}");
+            let percent = frame["Data"]["Progress"].as_str();
+            progress.push(percent.expect("Progress is a string").to_string());
+        } else if kind.starts_with("ScheduledTask") {
+            if kind == "ScheduledTaskCompleted" && frame["ItemId"] == id.as_str() {
+                assert_eq!(
+                    scans.state(lib),
+                    None,
+                    "Completed came before the scan ended"
+                );
+                done = true;
+            }
+            tasks.push(format!(
+                "{kind} {}",
+                frame["State"].as_str().unwrap_or_default()
+            ));
+        }
+    }
+    tasks.sort();
+    (progress, tasks)
+}
+
+/// Asserts that one scan's percents are whole numbers that start at 0, only go up, stay at or
+/// below 99 until the last one, which is 100, and include one between 0 and 100.
+fn b17_assert_progress(progress: &[String]) {
+    let values: Vec<u8> = progress
+        .iter()
+        .map(|p| {
+            p.parse()
+                .unwrap_or_else(|_| panic!("{p:?} in {progress:?}"))
+        })
+        .collect();
+    assert_eq!(values.first(), Some(&0), "{progress:?}");
+    assert_eq!(values.last(), Some(&100), "{progress:?}");
+    assert!(
+        values.windows(2).all(|w| w[0] <= w[1]),
+        "the percent only goes up: {progress:?}"
+    );
+    assert!(
+        values[..values.len() - 1].iter().all(|&p| p <= 99),
+        "{progress:?}"
+    );
+    assert!(
+        values.iter().any(|&p| 0 < p && p < 100),
+        "the probes move the percent: {progress:?}"
+    );
+}
+
+#[tokio::test]
+async fn b17_web_scan_reports_progress_to_every_socket() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, viewer, _) = g1_owner_and_viewer(&state, &app).await;
+    let lib = create_library_via_api(&app, &state, &owner, "B17 Film", "Movies").await;
+    b17_movies(&media_folder(&state, "b17 film"), 4);
+    let addr = b17_serve(&app).await;
+    let mut viewer_socket = G1cSocket::open(addr, &viewer).await;
+    let mut owner_socket = G1cSocket::open(addr, &owner).await;
+
+    let uri = format!("/Library/VirtualFolders/{lib}/Refresh");
+    let (status, body) = send_authed(&app, "POST", &uri, &owner, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["items_scanned"], 4);
+
+    let scans = state.task_scheduler.scans();
+    for (who, socket) in [("viewer", &mut viewer_socket), ("owner", &mut owner_socket)] {
+        let (progress, tasks) = b17_follow_scan(socket, scans, lib, true).await;
+        b17_assert_progress(&progress);
+        assert_eq!(
+            tasks,
+            [
+                "ScheduledTaskCompleted Completed",
+                "ScheduledTaskStarted Running"
+            ],
+            "{who}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn b17_scheduler_scan_reports_progress_without_task_events() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, viewer, _) = g1_owner_and_viewer(&state, &app).await;
+    let lib = create_library_via_api(&app, &state, &owner, "B17 Timer", "Movies").await;
+    b17_movies(&media_folder(&state, "b17 timer"), 3);
+    let addr = b17_serve(&app).await;
+    let mut socket = G1cSocket::open(addr, &viewer).await;
+
+    let uri = "/ScheduledTasks/Running/LibraryScan";
+    let (status, body) = send_authed(&app, "POST", uri, &owner, None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let scans = state.task_scheduler.scans();
+    let (progress, tasks) = b17_follow_scan(&mut socket, scans, lib, false).await;
+    b17_assert_progress(&progress);
+    assert_eq!(scans.state(lib), None);
+
+    // A task event sent at the end would come before this marker.
+    let marker = WsEvent::LibraryChanged {
+        data: serde_json::json!({ "LibraryName": "g1c-end" }),
+    };
+    state.ws_broadcast.send(marker).unwrap();
+    let later = socket.until_end().await;
+    assert!(
+        tasks.is_empty() && !later.iter().any(|f| f.starts_with("ScheduledTask")),
+        "a scheduler scan raises no toast: {tasks:?} {later:?}"
+    );
+}
+
+#[tokio::test]
+async fn b17_new_socket_lists_the_scans_in_progress() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, viewer, _) = g1_owner_and_viewer(&state, &app).await;
+    let lib = create_library_via_api(&app, &state, &owner, "B17 Queued", "Movies").await;
+    let id = lib.to_string();
+    let addr = b17_serve(&app).await;
+    let scans = state.task_scheduler.scans();
+    let at = |percent: &str| (id.clone(), percent.to_string());
+
+    let ticket = scans.queue(lib);
+    let mut first = G1cSocket::open(addr, &viewer).await;
+    assert_eq!(
+        b17_next_progress(&mut first).await,
+        at("0"),
+        "a queued scan is listed at 0"
+    );
+
+    ticket.start();
+    ticket.add_total(4);
+    ticket.advance(1);
+    assert_eq!(b17_next_progress(&mut first).await, at("25"));
+    for (who, token) in [
+        ("viewer", viewer.as_str()),
+        ("owner", owner.as_str()),
+        ("API key", "test-api-key"),
+    ] {
+        let mut socket = G1cSocket::open(addr, token).await;
+        assert_eq!(b17_next_progress(&mut socket).await, at("25"), "{who}");
+    }
+
+    drop(ticket);
+    assert_eq!(b17_next_progress(&mut first).await, at("100"));
+    let mut after = G1cSocket::open(addr, &viewer).await;
+    let marker = WsEvent::LibraryChanged {
+        data: serde_json::json!({ "LibraryName": "g1c-end" }),
+    };
+    state.ws_broadcast.send(marker).unwrap();
+    assert_eq!(
+        after.until_end().await,
+        Vec::<String>::new(),
+        "no scan is in progress"
+    );
 }
 
 // ── G4: transcode pipeline and byte ranges ──

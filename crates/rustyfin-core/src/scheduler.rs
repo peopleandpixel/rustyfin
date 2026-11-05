@@ -9,6 +9,8 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::sync::watch;
 
+use crate::scan_progress::ScanRegistry;
+
 /// Known task IDs
 pub const TASK_LIBRARY_SCAN: &str = "LibraryScan";
 pub const TASK_METADATA_REFRESH: &str = "MetadataRefresh";
@@ -35,6 +37,7 @@ pub struct TaskScheduler {
     tasks: Arc<RwLock<HashMap<String, TaskEntry>>>,
     db: SqlitePool,
     data_dir: Arc<PathBuf>,
+    scans: ScanRegistry,
 }
 
 impl TaskScheduler {
@@ -160,7 +163,13 @@ impl TaskScheduler {
             tasks: Arc::new(RwLock::new(tasks)),
             db,
             data_dir,
+            scans: ScanRegistry::new(),
         }
+    }
+
+    /// The library scans in progress.
+    pub fn scans(&self) -> &ScanRegistry {
+        &self.scans
     }
 
     pub async fn get_all_tasks(&self) -> Vec<ScheduledTaskInfo> {
@@ -285,11 +294,23 @@ impl TaskScheduler {
 
         let result = match rustyfin_db::repo_library::get_all_libraries(&self.db).await {
             Ok(libraries) => {
+                // Every library is listed as queued before the first one starts.
+                let tickets: Vec<_> = libraries
+                    .iter()
+                    .map(|lib| self.scans.queue(lib.id))
+                    .collect();
+                let client = reqwest::Client::new();
                 let mut errors = Vec::new();
-                for lib in &libraries {
-                    if let Err(e) = crate::scanner::scan_library(&self.db, lib).await {
+                for (lib, ticket) in libraries.iter().zip(tickets) {
+                    if let Err(e) = crate::scanner::scan_library_with_metadata(
+                        &self.db, lib, &client, None, None, None, &ticket,
+                    )
+                    .await
+                    {
                         errors.push(format!("{}: {}", lib.name, e));
                     }
+                    // The probes the scan queued keep the library listed until they finish.
+                    drop(ticket);
                 }
                 let end = Utc::now();
                 if errors.is_empty() {

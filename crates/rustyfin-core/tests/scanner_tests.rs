@@ -9,8 +9,11 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use rustyfin_core::scan_progress::{ScanRegistry, ScanState, ScanStatus, ScanTicket, ScanUpdate};
+use rustyfin_core::scheduler::{TASK_LIBRARY_SCAN, TaskScheduler};
 use rustyfin_core::{probe, scanner};
 use rustyfin_model::library::{Library, LibraryContentType};
 use sqlx::SqlitePool;
@@ -2670,5 +2673,184 @@ async fn new_items_skip_known_failures() {
             "{}: a known failure was probed again",
             file.display()
         );
+    }
+}
+
+// B17: scan progress. A library's scan is listed from the moment it is queued until it ends, and
+// its updates go 0, then up to at most 99, then 100 once its probes have finished.
+
+/// The updates sent so far, in order.
+fn b17_sent(rx: &mut tokio::sync::broadcast::Receiver<ScanUpdate>) -> Vec<(Uuid, u8)> {
+    let mut updates = Vec::new();
+    while let Ok(update) = rx.try_recv() {
+        updates.push((update.library_id, update.progress));
+    }
+    updates
+}
+
+fn b17_state(status: ScanStatus, progress: Option<u8>) -> Option<ScanState> {
+    Some(ScanState { status, progress })
+}
+
+#[tokio::test]
+async fn b17_registry_follows_a_scan_from_queue_to_end() {
+    let scans = ScanRegistry::new();
+    let mut rx = scans.subscribe();
+    let lib = Uuid::new_v4();
+    assert_eq!(scans.state(lib), None);
+
+    let ticket = scans.queue(lib);
+    assert_eq!(scans.state(lib), b17_state(ScanStatus::Queued, None));
+    assert_eq!(
+        scans.snapshot(),
+        [(
+            lib,
+            ScanState {
+                status: ScanStatus::Queued,
+                progress: None
+            }
+        )]
+    );
+    ticket.start();
+    assert_eq!(scans.state(lib), b17_state(ScanStatus::Active, None));
+    ticket.add_total(4);
+    assert_eq!(scans.state(lib), b17_state(ScanStatus::Active, Some(0)));
+    ticket.advance(1);
+    assert_eq!(scans.state(lib), b17_state(ScanStatus::Active, Some(25)));
+    ticket.advance(1);
+    ticket.advance(2);
+    assert_eq!(
+        scans.state(lib),
+        b17_state(ScanStatus::Active, Some(99)),
+        "all work done, but the scan has not ended"
+    );
+    ticket.add_total(4);
+    assert_eq!(
+        scans.state(lib),
+        b17_state(ScanStatus::Active, Some(99)),
+        "4 of 8 is 50%, but the percent never goes down"
+    );
+    ticket.advance(4);
+    drop(ticket);
+    assert_eq!(scans.state(lib), None);
+    assert!(scans.snapshot().is_empty());
+    assert_eq!(
+        b17_sent(&mut rx),
+        [(lib, 0), (lib, 25), (lib, 50), (lib, 99), (lib, 100)]
+    );
+}
+
+#[tokio::test]
+async fn b17_tickets_of_one_library_share_its_scan() {
+    let scans = ScanRegistry::new();
+    let mut rx = scans.subscribe();
+    let (lib, other) = (Uuid::new_v4(), Uuid::new_v4());
+    let first = scans.queue(lib);
+    let second = scans.queue(lib);
+    let clone = first.clone();
+    let other_ticket = scans.queue(other);
+
+    drop(first);
+    assert!(scans.state(lib).is_some(), "a clone keeps the scan");
+    drop(clone);
+    assert!(
+        scans.state(lib).is_some(),
+        "the second ticket keeps the scan"
+    );
+    second.start();
+    second.add_total(2);
+    second.advance(1);
+    drop(second);
+    assert_eq!(scans.state(lib), None);
+    assert_eq!(scans.state(other), b17_state(ScanStatus::Queued, None));
+    drop(other_ticket);
+    assert_eq!(
+        b17_sent(&mut rx),
+        [(lib, 0), (other, 0), (lib, 50), (lib, 100), (other, 100)]
+    );
+}
+
+#[tokio::test]
+async fn b17_untracked_ticket_ends_at_once() {
+    let ticket = ScanTicket::untracked();
+    ticket.start();
+    ticket.add_total(2);
+    ticket.advance(1);
+    tokio::time::timeout(Duration::from_secs(5), ticket.clone().wait_end())
+        .await
+        .expect("an untracked ticket has nothing to wait for");
+}
+
+#[tokio::test]
+async fn b17_wait_end_returns_when_the_last_ticket_drops() {
+    let scans = ScanRegistry::new();
+    let lib = Uuid::new_v4();
+    let ticket = scans.queue(lib);
+    let probes = ticket.clone();
+    let waiter = tokio::spawn(ticket.wait_end());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!waiter.is_finished(), "the probes still hold the scan");
+    assert!(scans.state(lib).is_some());
+
+    drop(probes);
+    tokio::time::timeout(Duration::from_secs(5), waiter)
+        .await
+        .expect("wait_end returns once the scan ends")
+        .unwrap();
+    assert_eq!(scans.state(lib), None);
+}
+
+#[tokio::test]
+async fn b17_scheduler_scan_reports_progress_until_its_probes_finish() {
+    let fx = Fixture::new().await;
+    let lib = fx.library("B17 Film", LibraryContentType::Movies).await;
+    let root = root_of(&lib);
+    let files: Vec<PathBuf> = (1..=4)
+        .map(|i| {
+            touch(
+                &root,
+                &format!("B17 Movie {i} (2000)/B17 Movie {i} (2000).mkv"),
+            )
+        })
+        .collect();
+    let sched = TaskScheduler::new(fx.pool.clone(), Arc::new(fx.dir.clone()));
+    let mut rx = sched.scans().subscribe();
+    assert!(sched.start_task(TASK_LIBRARY_SCAN).await);
+
+    // Other tests' scans hold the scan lock now and then, so this one may wait its turn.
+    let mut progress = Vec::new();
+    while progress.last() != Some(&100) {
+        let update = tokio::time::timeout(Duration::from_secs(60), rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("the scan did not end within 60 s: {progress:?}"))
+            .unwrap();
+        assert_eq!(update.library_id, lib.id, "{progress:?}");
+        progress.push(update.progress);
+    }
+    assert_eq!(progress[0], 0, "a queued scan sends 0 first: {progress:?}");
+    assert!(
+        progress.windows(2).all(|w| w[0] <= w[1]),
+        "the percent only goes up: {progress:?}"
+    );
+    assert!(
+        progress[..progress.len() - 1].iter().all(|&p| p <= 99),
+        "{progress:?}"
+    );
+    assert!(
+        progress.iter().any(|&p| 0 < p && p < 100),
+        "the probes move the percent: {progress:?}"
+    );
+    assert_eq!(sched.scans().state(lib.id), None);
+    if have_ffmpeg() {
+        // The empty files fail to probe, and each failure is stored before the scan ends.
+        for file in &files {
+            assert!(
+                failure_of(&fx.pool, file).await.is_some(),
+                "{} was not probed before the scan ended",
+                file.display()
+            );
+        }
+    } else {
+        println!("ffmpeg not found; skipping the probe check");
     }
 }

@@ -185,25 +185,21 @@ async fn scan_library(
         .await?
         .ok_or(ApiError::NotFound("library not found".into()))?;
 
+    // The registry lists the scan from here until it ends, its probes included.
+    let ticket = state.task_scheduler.scans().queue(lib.id);
+
     // Broadcast scan started event
-    {
-        let state_clone = state.clone();
-        let lib_name = lib.name.clone();
-        let lib_id = lib.id;
-        tokio::spawn(async move {
-            broadcast_event(
-                &state_clone,
-                WsEvent::ScheduledTaskStarted {
-                    data: json!({
-                        "Name": format!("Library scan: {}", lib_name),
-                        "State": "Running",
-                        "ItemId": lib_id.to_string(),
-                    }),
-                },
-            )
-            .await;
-        });
-    }
+    broadcast_event(
+        &state,
+        WsEvent::ScheduledTaskStarted {
+            data: json!({
+                "Name": format!("Library scan: {}", lib.name),
+                "State": "Running",
+                "ItemId": lib.id.to_string(),
+            }),
+        },
+    )
+    .await;
 
     // Get API keys from config
     let config = state.config.read().await;
@@ -219,45 +215,44 @@ async fn scan_library(
         tmdb.as_ref(),
         omdb_key.as_deref(),
         fanart_key.as_deref(),
+        &ticket,
     )
     .await
     .map_err(|e| ApiError::Internal(e.to_string()))?;
 
-    // Broadcast scan completed event
-    {
-        let state_clone = state.clone();
-        let lib_name = lib.name.clone();
-        let lib_id = lib.id;
-        let scanned_count = count;
-        tokio::spawn(async move {
-            broadcast_event(
-                &state_clone,
-                WsEvent::ScheduledTaskCompleted {
-                    data: json!({
-                        "Name": format!("Library scan: {}", lib_name),
-                        "State": "Completed",
-                        "ItemId": lib_id.to_string(),
-                        "ItemsScanned": scanned_count,
-                    }),
-                },
-            )
-            .await;
-            broadcast_event(
-                &state_clone,
-                WsEvent::LibraryChanged {
-                    data: json!({
-                        "LibraryId": lib_id.to_string(),
-                        "LibraryName": lib_name,
-                    }),
-                },
-            )
-            .await;
-        });
-    }
-
     // Invalidate caches after scan
     state.cache.invalidate_on_scan();
     state.image_cache.invalidate_all();
+    broadcast_event(
+        &state,
+        WsEvent::LibraryChanged {
+            data: json!({
+                "LibraryId": lib.id.to_string(),
+                "LibraryName": lib.name,
+            }),
+        },
+    )
+    .await;
+
+    // Completed goes out once the scan has ended, which is after its probes.
+    let state_clone = state.clone();
+    let lib_name = lib.name.clone();
+    let lib_id = lib.id;
+    tokio::spawn(async move {
+        ticket.wait_end().await;
+        broadcast_event(
+            &state_clone,
+            WsEvent::ScheduledTaskCompleted {
+                data: json!({
+                    "Name": format!("Library scan: {}", lib_name),
+                    "State": "Completed",
+                    "ItemId": lib_id.to_string(),
+                    "ItemsScanned": count,
+                }),
+            },
+        )
+        .await;
+    });
     Ok(Json(json!({ "items_scanned": count })))
 }
 
@@ -289,8 +284,13 @@ async fn refresh_all(State(state): State<AppState>) -> Result<Json<Value>, ApiEr
         });
     }
 
+    // Every library is listed as queued before the first one starts.
+    let tickets: Vec<_> = libs
+        .iter()
+        .map(|lib| state.task_scheduler.scans().queue(lib.id))
+        .collect();
     let mut total = 0u32;
-    for lib in &libs {
+    for (lib, ticket) in libs.iter().zip(tickets) {
         tracing::info!(
             "refresh_all: scanning library '{}' (id={})",
             lib.name,
@@ -298,35 +298,29 @@ async fn refresh_all(State(state): State<AppState>) -> Result<Json<Value>, ApiEr
         );
 
         // Broadcast individual library scan started
-        {
-            let state_clone = state.clone();
-            let lib_name = lib.name.clone();
-            let lib_id = lib.id;
-            tokio::spawn(async move {
-                broadcast_event(
-                    &state_clone,
-                    WsEvent::ScheduledTaskStarted {
-                        data: json!({
-                            "Name": format!("Library scan: {}", lib_name),
-                            "State": "Running",
-                            "ItemId": lib_id.to_string(),
-                        }),
-                    },
-                )
-                .await;
-            });
-        }
+        broadcast_event(
+            &state,
+            WsEvent::ScheduledTaskStarted {
+                data: json!({
+                    "Name": format!("Library scan: {}", lib.name),
+                    "State": "Running",
+                    "ItemId": lib.id.to_string(),
+                }),
+            },
+        )
+        .await;
 
-        match rustyfin_core::scanner::scan_library_with_metadata(
+        let result = rustyfin_core::scanner::scan_library_with_metadata(
             &state.db,
             lib,
             &state.http_client,
             tmdb.as_ref(),
             omdb_key.as_deref(),
             fanart_key.as_deref(),
+            &ticket,
         )
-        .await
-        {
+        .await;
+        match result {
             Ok(count) => {
                 tracing::info!(
                     "refresh_all: library '{}' scanned, {} items",
@@ -335,37 +329,37 @@ async fn refresh_all(State(state): State<AppState>) -> Result<Json<Value>, ApiEr
                 );
                 total += count;
 
-                // Broadcast individual library scan completed
-                {
-                    let state_clone = state.clone();
-                    let lib_name = lib.name.clone();
-                    let lib_id = lib.id;
-                    let scanned_count = count;
-                    tokio::spawn(async move {
-                        broadcast_event(
-                            &state_clone,
-                            WsEvent::ScheduledTaskCompleted {
-                                data: json!({
-                                    "Name": format!("Library scan: {}", lib_name),
-                                    "State": "Completed",
-                                    "ItemId": lib_id.to_string(),
-                                    "ItemsScanned": scanned_count,
-                                }),
-                            },
-                        )
-                        .await;
-                        broadcast_event(
-                            &state_clone,
-                            WsEvent::LibraryChanged {
-                                data: json!({
-                                    "LibraryId": lib_id.to_string(),
-                                    "LibraryName": lib_name,
-                                }),
-                            },
-                        )
-                        .await;
-                    });
-                }
+                broadcast_event(
+                    &state,
+                    WsEvent::LibraryChanged {
+                        data: json!({
+                            "LibraryId": lib.id.to_string(),
+                            "LibraryName": lib.name,
+                        }),
+                    },
+                )
+                .await;
+
+                // Completed goes out once this library's scan has ended, after its probes.
+                let state_clone = state.clone();
+                let lib_name = lib.name.clone();
+                let lib_id = lib.id;
+                let scanned_count = count;
+                tokio::spawn(async move {
+                    ticket.wait_end().await;
+                    broadcast_event(
+                        &state_clone,
+                        WsEvent::ScheduledTaskCompleted {
+                            data: json!({
+                                "Name": format!("Library scan: {}", lib_name),
+                                "State": "Completed",
+                                "ItemId": lib_id.to_string(),
+                                "ItemsScanned": scanned_count,
+                            }),
+                        },
+                    )
+                    .await;
+                });
             }
             Err(e) => {
                 tracing::error!("failed to scan library '{}': {}", lib.name, e);

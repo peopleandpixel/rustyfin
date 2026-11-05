@@ -11,7 +11,7 @@ let serverVersion = '0.3.0';
 let playerReportInterval = null;
 let playerHideTimeout = null;
 let activeItem = null;
-// Track which libraries are currently scanning (libId -> true/false)
+// Library id -> scan percent while it scans (0 = not known yet, so its ring spins). Absent when not scanning.
 let scanStatuses = {};
 
 // --- DOM & Helper Utilities ---
@@ -77,6 +77,35 @@ function toast(msg, type = 'success') {
 function escapeHtml(str) {
     if (!str) return '';
     return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+// Inner markup of a scan ring: nothing when the library is not scanning, else a progressbar with a track and an arc
+function scanRingInner(libId, name) {
+    const p = scanStatuses[libId];
+    if (p === undefined) return '';
+    const known = p > 0;
+    const label = escapeHtml(known ? t('library.scanning_percent', { name, percent: p }) : t('library.scanning', { name }));
+    const valueNow = known ? ` aria-valuenow="${p}"` : '';
+    const spin = known ? '' : ' motion-safe:animate-spin';
+    const arc = known ? p : 25;
+    return `<span role="progressbar" class="block w-full h-full text-[#00a4dc]" title="${label}" aria-label="${label}" aria-valuemin="0" aria-valuemax="100"${valueNow}>`
+        + `<svg aria-hidden="true" viewBox="0 0 16 16" class="w-full h-full${spin}">`
+        + '<circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" stroke-width="2.5" opacity="0.25"/>'
+        + `<circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" pathLength="100" stroke-dasharray="${arc} 100" transform="rotate(-90 8 8)"/>`
+        + '</svg></span>';
+}
+
+// A ring next to a library name, sized by `size`. The wrapper is hidden by empty:hidden while the library is not scanning.
+function scanRing(libId, name, size = 'w-4 h-4') {
+    return `<span data-scan-ring="${escapeHtml(libId)}" data-name="${escapeHtml(name)}" class="inline-flex flex-shrink-0 ${size} empty:hidden">${scanRingInner(libId, name)}</span>`;
+}
+
+// Redraws the rings of one library, or of every library when called without an id
+function updateScanRings(libId) {
+    const selector = libId === undefined ? '[data-scan-ring]' : `[data-scan-ring="${CSS.escape(libId)}"]`;
+    document.querySelectorAll(selector).forEach(el => {
+        el.innerHTML = scanRingInner(el.dataset.scanRing, el.dataset.name);
+    });
 }
 
 function formatRuntime(ticks) {
@@ -334,11 +363,7 @@ const clickActions = {
         else playWithResumeChoice(id, streamType, title);
     },
     'scan-library': el => startScanWithToast(API.scanLibrary(el.dataset.id), t('library.scan_started_for', { name: el.dataset.name })),
-    'scan-library-page': el => {
-        const id = el.dataset.id;
-        scanStatuses[id] = true;
-        startScanWithToast(API.scanLibrary(id), t('library.media_scan_started_for', { name: el.dataset.name })).finally(() => delete scanStatuses[id]);
-    },
+    'scan-library-page': el => startScanWithToast(API.scanLibrary(el.dataset.id), t('library.media_scan_started_for', { name: el.dataset.name })),
     'scan-library-admin': el => startScanWithToast(API.scanLibrary(el.dataset.id), t('admin.scan_started')),
     'scan-all': () => startScanWithToast(API.scanAllLibraries(), t('admin.scanning_all')),
     'jump-letter': el => jumpToLetter(el.dataset.id, el.dataset.letter),
@@ -637,14 +662,16 @@ async function renderHome() {
                             <div class="flex items-center justify-between">
                                 <span class="text-3xl">${icons[libType] || '📁'}</span>
                                 <div class="flex items-center gap-1">
-                                    ${scanStatuses[libId] ? `<span class="w-2 h-2 rounded-full bg-amber-400 animate-pulse" title="${escapeHtml(t('library.scan_running'))}"></span>` : ''}
                                     <button type="button" class="w-6 h-6 rounded flex items-center justify-center text-white/40 hover:text-white hover:bg-white/10 transition" data-action="scan-library" data-id="${escapeHtml(libId)}" data-name="${escapeHtml(libName)}" title="${escapeHtml(t('library.scan_library'))}">
                                         <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
                                     </button>
                                 </div>
                             </div>
                             <div>
-                                <p class="font-bold text-white text-base truncate">${escapeHtml(libName)}</p>
+                                <div class="flex items-center gap-1.5 min-w-0">
+                                    <p class="font-bold text-white text-base truncate">${escapeHtml(libName)}</p>
+                                    ${scanRing(libId, libName)}
+                                </div>
                             </div>
                         </div>`;
                     }).join('')}
@@ -928,6 +955,7 @@ async function renderLibrary(libId) {
                     <div class="flex items-center gap-2">
                         <span class="text-2xl">${lib?.content_type === 'Movies' ? '🎬' : lib?.content_type === 'TvShows' ? '📺' : lib?.content_type === 'Music' ? '🎵' : '📁'}</span>
                         <h1 class="text-2xl lg:text-3xl font-extrabold text-white tracking-tight">${escapeHtml(libName)}</h1>
+                        ${scanRing(libId, libName, 'w-5 h-5')}
                     </div>
                     <p id="lib-count-label" class="text-xs text-white/40 mt-1">${t('library.item_count', { count: total })}</p>
                 </div>
@@ -2334,7 +2362,7 @@ async function renderAdmin() {
                         <tbody class="divide-y divide-white/5">
                             ${libs.map(l => `
                             <tr>
-                                <td class="py-3 font-bold text-white">${escapeHtml(l.name || l.Name)}</td>
+                                <td class="py-3 font-bold text-white"><span class="inline-flex items-center gap-1.5">${escapeHtml(l.name || l.Name)}${scanRing(l.id || l.Id, l.name || l.Name)}</span></td>
                                 <td class="py-3"><span class="px-2 py-0.5 rounded bg-white/10 text-white/70">${escapeHtml(l.content_type || l.ContentType || t('admin.mixed'))}</span></td>
                                 <td class="py-3 text-white/40 font-mono">${escapeHtml((l.paths || l.Paths || []).join(', '))}</td>
                                 <td class="py-3 text-right space-x-2">
@@ -2681,13 +2709,12 @@ async function loadSidebar() {
         const id = lib.id || lib.Id;
         const name = lib.name || lib.Name;
         const type = lib.content_type || lib.ContentType || 'Mixed';
-        const isScanning = scanStatuses[id];
         list.innerHTML += `
             <div class="flex items-center gap-1 group">
                 <a data-action="navigate" data-page="library" data-id="${escapeHtml(id)}" class="jf-drawer-item ${currentLibraryId === id && currentPage === 'library' ? 'active' : ''} flex-1">
                     <span class="text-base">${icons[type] || '📁'}</span>
                     <span class="truncate">${escapeHtml(name)}</span>
-                    ${isScanning ? '<span class="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse ml-1 flex-shrink-0"></span>' : ''}
+                    ${scanRing(id, name)}
                 </a>
                 <button type="button" class="jf-icon-btn !w-6 !h-6 text-white/20 hover:text-white opacity-0 group-hover:opacity-100 transition flex-shrink-0" data-action="scan-library" data-id="${escapeHtml(id)}" data-name="${escapeHtml(name)}" title="${escapeHtml(t('library.scan_library'))}">
                     <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
@@ -2952,21 +2979,19 @@ function initScanProgressWebSocket() {
     ws.onopen = () => {
         scanSocketDelay = 1000;
         scanSocketWarned = false;
+        // The server then sends one frame per scan in progress, so the map is rebuilt from empty
+        scanStatuses = {};
+        updateScanRings();
     };
 
     ws.onmessage = (event) => {
         try {
             const data = JSON.parse(event.data);
             if (data.MessageType === 'ScheduledTaskStarted') {
-                // Track per-library scan status
-                const libId = data.ItemId;
-                if (libId) scanStatuses[libId] = true;
                 // Refresh tasks tab if visible
                 if (currentPage === 'admin') refreshTasks();
             } else if (data.MessageType === 'ScheduledTaskCompleted') {
-                // Clear per-library scan status
                 const libId = data.ItemId;
-                if (libId) delete scanStatuses[libId];
                 if (data.State === 'Failed') {
                     toast(t('admin.task_failed', { name: data.Name || t('admin.task'), error: data.Error || t('common.unknown_error') }), 'error');
                 } else if (data.State === 'Completed' && libId) {
@@ -2976,6 +3001,15 @@ function initScanProgressWebSocket() {
                 }
                 // Refresh tasks tab if visible
                 if (currentPage === 'admin') refreshTasks();
+            } else if (data.MessageType === 'RefreshProgress') {
+                // Scan progress: "0" when queued, each whole percent, "100" when done
+                const id = data.Data?.ItemId;
+                const p = Number(data.Data?.Progress ?? NaN);
+                if (id && Number.isFinite(p)) {
+                    if (p >= 100) delete scanStatuses[id];
+                    else scanStatuses[id] = Math.max(scanStatuses[id] ?? 0, p);
+                    updateScanRings(id);
+                }
             } else if (data.MessageType === 'LibraryChanged') {
                 // Library changed - refresh current view if on library page
                 // Drop the cached lists first, so the re-render is not served from the 30 s cache

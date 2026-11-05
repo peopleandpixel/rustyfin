@@ -11,6 +11,7 @@ pub mod probe;
 pub mod provider_fanart;
 pub mod provider_omdb;
 pub mod provider_tmdb;
+pub mod scan_progress;
 pub mod scan_sync;
 pub mod scanner;
 pub mod scheduler;

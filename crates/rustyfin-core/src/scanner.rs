@@ -11,6 +11,7 @@ use uuid::Uuid;
 use crate::local_images;
 use crate::naming;
 use crate::probe;
+use crate::scan_progress::ScanTicket;
 use crate::scan_sync;
 use crate::tmdb_client::TmdbApi;
 
@@ -21,9 +22,20 @@ const AUDIO_EXTENSIONS: &[&str] = &["mp3", "flac", "ogg", "wav", "aac", "wma", "
 const PHOTO_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "gif", "bmp", "webp", "tiff"];
 
 pub async fn scan_library(pool: &SqlitePool, library: &Library) -> Result<u32, sqlx::Error> {
-    scan_library_with_metadata(pool, library, &reqwest::Client::new(), None, None, None).await
+    scan_library_with_metadata(
+        pool,
+        library,
+        &reqwest::Client::new(),
+        None,
+        None,
+        None,
+        &ScanTicket::untracked(),
+    )
+    .await
 }
 
+/// Scans the library, then refreshes the metadata of its new items. `ticket` is the caller's
+/// share of the library's scan, which the registry lists until the share and the probes end.
 pub async fn scan_library_with_metadata(
     pool: &SqlitePool,
     library: &Library,
@@ -31,6 +43,7 @@ pub async fn scan_library_with_metadata(
     tmdb: Option<&TmdbApi>,
     omdb_api_key: Option<&str>,
     fanart_api_key: Option<&str>,
+    ticket: &ScanTicket,
 ) -> Result<u32, sqlx::Error> {
     tracing::info!(
         "scanning library '{}' (content_type={:?}, paths={:?})",
@@ -39,9 +52,9 @@ pub async fn scan_library_with_metadata(
         library.paths
     );
     let (count, new_item_ids) = match library.content_type {
-        LibraryContentType::TvShows => scan_tv_library(pool, library).await?,
-        LibraryContentType::Music => scan_music_library(pool, library).await?,
-        _ => scan_flat_library(pool, library).await?,
+        LibraryContentType::TvShows => scan_tv_library(pool, library, ticket).await?,
+        LibraryContentType::Music => scan_music_library(pool, library, ticket).await?,
+        _ => scan_flat_library(pool, library, ticket).await?,
     };
 
     // Refresh metadata only for newly added items, not all items in the library.
@@ -52,6 +65,11 @@ pub async fn scan_library_with_metadata(
             new_item_ids.len(),
             library.name
         );
+        // The refresh shows as progress only when a provider is configured to make API calls.
+        let counted = tmdb.is_some() || omdb_api_key.is_some() || fanart_api_key.is_some();
+        if counted {
+            ticket.add_total(new_item_ids.len());
+        }
         // Increased from 5 to 10 — TMDb rate limits are typically 20-40 req/s, so 10 is safe.
         let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(10));
         let mut handles = Vec::new();
@@ -79,10 +97,16 @@ pub async fn scan_library_with_metadata(
                     }
                 });
                 handles.push(handle);
+            } else if counted {
+                // An item that can't be loaded has nothing to refresh, but it still counts.
+                ticket.advance(1);
             }
         }
         for handle in handles {
             let _ = handle.await;
+            if counted {
+                ticket.advance(1);
+            }
         }
     }
 
@@ -105,13 +129,15 @@ pub async fn wait_for_idle() {
 }
 
 /// Runs the probe plans of a scan in the background. One task owns `guard` until every plan has
-/// finished, so the next scan waits for them.
+/// finished, so the next scan waits for them. The plans are the work of `ticket`'s scan.
 fn spawn_plans_under_lock(
     pool: SqlitePool,
     guard: MutexGuard<'static, ()>,
     library_name: String,
     plans: Vec<(Uuid, Vec<probe::ProbeStep>)>,
+    ticket: ScanTicket,
 ) {
+    ticket.add_total(plans.len());
     tokio::spawn(async move {
         let total_steps: usize = plans.iter().map(|(_, steps)| steps.len()).sum();
         let handles: Vec<_> = plans
@@ -120,12 +146,15 @@ fn spawn_plans_under_lock(
             .collect();
         for handle in handles {
             let _ = handle.await;
+            ticket.advance(1);
         }
         tracing::info!(
             "probes finished for library '{}': {} files",
             library_name,
             total_steps
         );
+        // The ticket goes first, so this scan's share has ended once the next scan holds the lock.
+        drop(ticket);
         drop(guard);
     });
 }
@@ -134,8 +163,10 @@ fn spawn_plans_under_lock(
 async fn scan_flat_library(
     pool: &SqlitePool,
     library: &Library,
+    ticket: &ScanTicket,
 ) -> Result<(u32, Vec<Uuid>), sqlx::Error> {
     let guard = SCAN_LOCK.lock().await;
+    ticket.start();
     let mut count = 0u32;
     let mut existing_count = 0u32;
     let mut new_item_ids: Vec<Uuid> = Vec::new();
@@ -339,7 +370,13 @@ async fn scan_flat_library(
             e
         ),
     }
-    spawn_plans_under_lock(pool.clone(), guard, library.name.clone(), plans);
+    spawn_plans_under_lock(
+        pool.clone(),
+        guard,
+        library.name.clone(),
+        plans,
+        ticket.clone(),
+    );
     Ok((count, new_item_ids))
 }
 
@@ -347,8 +384,10 @@ async fn scan_flat_library(
 async fn scan_tv_library(
     pool: &SqlitePool,
     library: &Library,
+    ticket: &ScanTicket,
 ) -> Result<(u32, Vec<Uuid>), sqlx::Error> {
     let guard = SCAN_LOCK.lock().await;
+    ticket.start();
     let mut count = 0u32;
     let mut plans: Vec<(Uuid, Vec<probe::ProbeStep>)> = Vec::new();
     let mut existing_count = 0u32;
@@ -661,7 +700,13 @@ async fn scan_tv_library(
             e
         ),
     }
-    spawn_plans_under_lock(pool.clone(), guard, library.name.clone(), plans);
+    spawn_plans_under_lock(
+        pool.clone(),
+        guard,
+        library.name.clone(),
+        plans,
+        ticket.clone(),
+    );
     Ok((count, new_item_ids))
 }
 
@@ -670,8 +715,10 @@ async fn scan_tv_library(
 async fn scan_music_library(
     pool: &SqlitePool,
     library: &Library,
+    ticket: &ScanTicket,
 ) -> Result<(u32, Vec<Uuid>), sqlx::Error> {
     let _guard = SCAN_LOCK.lock().await;
+    ticket.start();
     let mut count = 0u32;
     let mut existing_count = 0u32;
     let mut new_item_ids: Vec<Uuid> = Vec::new();
@@ -711,10 +758,13 @@ async fn scan_music_library(
             files.len(),
             lib_path
         );
+        ticket.add_total(files.len());
 
         let mut scanned_files = 0u32;
         let mut skipped_ext = 0u32;
         for file_path_buf in files {
+            // Every file the loop visits counts, skipped ones included.
+            ticket.advance(1);
             let ext = file_path_buf
                 .extension()
                 .and_then(|e| e.to_str())
