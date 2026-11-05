@@ -312,6 +312,33 @@ const API = {
         return `${this.base}/${type}/${itemId}/stream?${q.toString()}`;
     },
     getPlaybackInfo(itemId, type = 'Videos') { return this.get(`/${type}/${itemId}/PlaybackInfo`); },
+    // Codecs this browser can play, probed once: MediaSource or a <video> element saying yes counts
+    _playableCodecs: null,
+    playableCodecs() {
+        if (this._playableCodecs) return this._playableCodecs;
+        const video = document.createElement('video');
+        const canPlay = mime => (typeof MediaSource !== 'undefined' && MediaSource.isTypeSupported(mime))
+            || video.canPlayType(mime) !== '';
+        const probe = mimes => Object.keys(mimes).filter(name => canPlay(mimes[name]));
+        this._playableCodecs = {
+            video: probe({
+                h264: 'video/mp4; codecs="avc1.640028"',
+                hevc: 'video/mp4; codecs="hvc1.1.6.L120.90"',
+                vp8: 'video/webm; codecs="vp8"',
+                vp9: 'video/webm; codecs="vp09.00.10.08"',
+                av1: 'video/mp4; codecs="av01.0.08M.08"',
+            }),
+            audio: probe({
+                aac: 'audio/mp4; codecs="mp4a.40.2"',
+                mp3: 'audio/mpeg',
+                opus: 'audio/webm; codecs="opus"',
+                flac: 'audio/flac',
+                ac3: 'audio/mp4; codecs="ac-3"',
+                eac3: 'audio/mp4; codecs="ec-3"',
+            }),
+        };
+        return this._playableCodecs;
+    },
     // Universal endpoint returns the optimal playback URL
     async getUniversalVideoUrl(itemId, params = {}) {
         const q = new URLSearchParams({
@@ -320,11 +347,12 @@ const API = {
             EnableDirectStream: params.enableDirectStream !== false ? 'true' : 'false',
             PlaySessionId: 'web-' + (localStorage.getItem('rustyfin_device_id') || 'browser'),
         });
-        const defaultCodecs = ['h264', 'hevc', 'vp8', 'vp9', 'av1'];
-        const audioCodecs = ['mp3', 'aac', 'opus', 'ac3', 'flac'];
-        q.set('VideoCodecs', defaultCodecs.join(','));
-        q.set('AudioCodecs', audioCodecs.join(','));
+        const codecs = this.playableCodecs();
+        q.set('VideoCodecs', codecs.video.join(','));
+        q.set('AudioCodecs', codecs.audio.join(','));
         const data = await this.get(`/Videos/${itemId}/Universal?${q.toString()}`);
+        // The player reads `url`; the server sends `Url`
+        if (data && !data.url) data.url = data.Url;
         return data;
     },
 

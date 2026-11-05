@@ -118,13 +118,13 @@ async fn stream_file(
         return Ok((StatusCode::NOT_MODIFIED, ()).into_response());
     }
 
-    let range_header = headers
+    let byte_range = headers
         .get(header::RANGE)
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| parse_range(s, file_size));
+        .map_or(ByteRange::Ignore, |s| parse_range(s, file_size));
 
-    match range_header {
-        Some((start, end)) => {
+    match byte_range {
+        ByteRange::Partial(start, end) => {
             let length = end - start + 1;
 
             // Reopen for range request (need mutable handle for seek)
@@ -156,7 +156,15 @@ async fn stream_file(
             )
                 .into_response())
         }
-        None => {
+        ByteRange::Unsatisfiable => Ok((
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            [
+                (header::CONTENT_RANGE, format!("bytes */{file_size}")),
+                (header::ACCEPT_RANGES, "bytes".to_string()),
+            ],
+        )
+            .into_response()),
+        ByteRange::Ignore => {
             let file = tokio::fs::File::open(&file_path)
                 .await
                 .map_err(|e| ApiError::Internal(format!("Cannot open file: {e}")))?;
@@ -180,30 +188,66 @@ async fn stream_file(
     }
 }
 
-/// Parse a `Range: bytes=START-END` header, returning inclusive (start, end).
-fn parse_range(range: &str, file_size: u64) -> Option<(u64, u64)> {
-    let range = range.strip_prefix("bytes=")?;
-    let mut parts = range.splitn(2, '-');
-    let start_str = parts.next()?.trim();
-    let end_str = parts.next()?.trim();
+/// How to answer a `Range` header (RFC 9110 §14.1.2).
+#[derive(Debug, PartialEq, Eq)]
+enum ByteRange {
+    /// 206 with bytes `start..=end`.
+    Partial(u64, u64),
+    /// 416 with `Content-Range: bytes */<size>`.
+    Unsatisfiable,
+    /// Not a single byte range we serve: 200 with the whole file.
+    Ignore,
+}
+
+/// Parse a `Range: bytes=START-END` header for a file of `file_size` bytes.
+fn parse_range(range: &str, file_size: u64) -> ByteRange {
+    let Some(spec) = range.strip_prefix("bytes=") else {
+        return ByteRange::Ignore;
+    };
+    // Multi-range requests are not served; they get the whole file.
+    if spec.contains(',') {
+        return ByteRange::Ignore;
+    }
+    let Some((start_str, end_str)) = spec.split_once('-') else {
+        return ByteRange::Ignore;
+    };
+    let start_str = start_str.trim();
+    let end_str = end_str.trim();
 
     if start_str.is_empty() {
-        // suffix range: bytes=-500
-        let suffix: u64 = end_str.parse().ok()?;
-        let start = file_size.checked_sub(suffix)?;
-        Some((start, file_size - 1))
-    } else {
-        let start: u64 = start_str.parse().ok()?;
-        let end = if end_str.is_empty() {
-            file_size - 1
-        } else {
-            end_str.parse().ok()?
+        // Suffix range: `bytes=-N` is the last N bytes.
+        return match end_str.parse::<u64>() {
+            Ok(0) => ByteRange::Unsatisfiable,
+            Ok(n) if n > file_size => ByteRange::Ignore,
+            Ok(n) => ByteRange::Partial(file_size - n, file_size - 1),
+            Err(_) => ByteRange::Ignore,
         };
-        if start > end || start >= file_size {
-            return None;
-        }
-        Some((start, end.min(file_size - 1)))
     }
+
+    let Ok(start) = start_str.parse::<u64>() else {
+        return ByteRange::Ignore;
+    };
+    // `A-` has no explicit end and runs to the last byte of the file.
+    let end = if end_str.is_empty() {
+        None
+    } else {
+        let Ok(end) = end_str.parse::<u64>() else {
+            return ByteRange::Ignore;
+        };
+        if end < start {
+            return ByteRange::Ignore;
+        }
+        Some(end)
+    };
+    if start >= file_size {
+        return ByteRange::Unsatisfiable;
+    }
+    // start < file_size here, so file_size >= 1 and `file_size - 1` cannot underflow.
+    let last = match end {
+        Some(end) => end.min(file_size - 1),
+        None => file_size - 1,
+    };
+    ByteRange::Partial(start, last)
 }
 
 fn mime_from_path(path: &str) -> String {
@@ -638,6 +682,7 @@ async fn video_universal(
         if let Some(seg_time) = query.segment_time {
             url.push_str(&format!("&SegmentTime={}", seg_time));
         }
+        url.push_str(&format!("&PlaySessionId={}", play_session_id));
         Some(url)
     } else {
         None
@@ -755,6 +800,49 @@ async fn get_chapters(
         .into_response())
 }
 
+/// Whether the first video and audio streams use a codec from the client's lists.
+/// A list without entries falls back to the codecs a client is assumed to play.
+fn codecs_playable(
+    source: &rustyfin_model::media_source::MediaSourceResponse,
+    query: &VideoPlaybackInfoQuery,
+) -> bool {
+    // Comma-separated, e.g. "h264,hevc,vp9"
+    let codec_list = |list: Option<&str>, fallback: &[&str]| -> Vec<String> {
+        let entries: Vec<String> = list
+            .unwrap_or_default()
+            .split(',')
+            .map(|c| c.trim().to_lowercase())
+            .filter(|c| !c.is_empty())
+            .collect();
+        if entries.is_empty() {
+            fallback.iter().map(|c| c.to_string()).collect()
+        } else {
+            entries
+        }
+    };
+    let video_codecs = codec_list(query.video_codec.as_deref(), &["h264", "avc1"]);
+    let audio_codecs = codec_list(query.audio_codec.as_deref(), &["aac", "mp4a", "mp3"]);
+
+    // A stream without a codec passes
+    let listed = |codec_type: &str, codecs: &[String]| {
+        source
+            .media_streams
+            .iter()
+            .find(|s| is_stream_type(s, codec_type))
+            .and_then(|s| s.codec.as_ref())
+            .is_none_or(|codec| {
+                let codec = codec.to_lowercase();
+                codecs.iter().any(|c| codec.contains(c.as_str()))
+            })
+    };
+    listed("Video", &video_codecs) && listed("Audio", &audio_codecs)
+}
+
+/// Whether `stream` is of `kind` ("Video", "Audio"). The probe stores ffprobe's lowercase types.
+fn is_stream_type(stream: &rustyfin_model::media_source::MediaStream, kind: &str) -> bool {
+    stream.codec_type.eq_ignore_ascii_case(kind)
+}
+
 /// Check if a media source can be directly played by the client.
 /// Direct play requires the client to support all codecs without any transcoding.
 fn check_direct_play(
@@ -763,8 +851,14 @@ fn check_direct_play(
 ) -> bool {
     // If no media streams are available, we cannot verify codec compatibility.
     // Reject direct play to avoid Format errors in the browser.
-    let has_video_stream = source.media_streams.iter().any(|s| s.codec_type == "Video");
-    let has_audio_stream = source.media_streams.iter().any(|s| s.codec_type == "Audio");
+    let has_video_stream = source
+        .media_streams
+        .iter()
+        .any(|s| is_stream_type(s, "Video"));
+    let has_audio_stream = source
+        .media_streams
+        .iter()
+        .any(|s| is_stream_type(s, "Audio"));
     if !has_video_stream && !has_audio_stream {
         // No stream info at all - cannot verify compatibility, reject direct play
         return false;
@@ -807,110 +901,17 @@ fn check_direct_play(
         }
     }
 
-    // Parse codec lists (comma-separated, e.g. "h264,hevc,vp9")
-    let video_codecs: Vec<String> = query
-        .video_codec
-        .as_ref()
-        .map(|s| s.split(',').map(|c| c.trim().to_lowercase()).collect())
-        .unwrap_or_default();
-    let audio_codecs: Vec<String> = query
-        .audio_codec
-        .as_ref()
-        .map(|s| s.split(',').map(|c| c.trim().to_lowercase()).collect())
-        .unwrap_or_default();
-
-    // If no codec preferences are specified, check browser compatibility
-    if video_codecs.is_empty() && audio_codecs.is_empty() {
-        // Check if video codec is browser-compatible (H.264/AVC is the safest)
-        let browser_compatible_video_codecs =
-            ["h264", "avc1", "hevc", "h265", "vp8", "vp9", "av01"];
-        if let Some(video_stream) = source
-            .media_streams
-            .iter()
-            .find(|s| s.codec_type == "Video")
-            && let Some(ref codec) = video_stream.codec
-        {
-            let codec_lower = codec.to_lowercase();
-            if !browser_compatible_video_codecs
-                .iter()
-                .any(|c| codec_lower.contains(c))
-            {
-                return false;
-            }
-        }
-        // Check if audio codec is browser-compatible
-        let browser_compatible_audio_codecs = ["mp3", "aac", "opus", "ac3", "mp4a"];
-        if let Some(audio_stream) = source
-            .media_streams
-            .iter()
-            .find(|s| s.codec_type == "Audio")
-            && let Some(ref codec) = audio_stream.codec
-        {
-            let codec_lower = codec.to_lowercase();
-            if !browser_compatible_audio_codecs
-                .iter()
-                .any(|c| codec_lower.contains(c))
-            {
-                return false;
-            }
-        }
+    // Codecs must be in the client's lists, or in the fallback lists if it sent none
+    if !codecs_playable(source, query) {
+        return false;
+    }
+    // Without any list, the codec check is the whole answer
+    let sent_list = [&query.video_codec, &query.audio_codec]
+        .into_iter()
+        .flatten()
+        .any(|list| list.split(',').any(|c| !c.trim().is_empty()));
+    if !sent_list {
         return true;
-    }
-
-    // Check video codec compatibility
-    if !video_codecs.is_empty() {
-        let video_stream = source
-            .media_streams
-            .iter()
-            .find(|s| s.codec_type == "Video");
-        if let Some(stream) = video_stream
-            && let Some(ref codec) = stream.codec
-        {
-            let codec_lower = codec.to_lowercase();
-            // Video codec must be in the list of supported codecs
-            if !video_codecs
-                .iter()
-                .any(|c| codec_lower.contains(c.as_str()))
-            {
-                return false;
-            }
-        }
-    }
-
-    // Check audio codec compatibility
-    if !audio_codecs.is_empty() {
-        let audio_stream = source
-            .media_streams
-            .iter()
-            .find(|s| s.codec_type == "Audio");
-        if let Some(stream) = audio_stream
-            && let Some(ref codec) = stream.codec
-        {
-            let codec_lower = codec.to_lowercase();
-            // Audio codec must be in the list of supported codecs
-            if !audio_codecs
-                .iter()
-                .any(|c| codec_lower.contains(c.as_str()))
-            {
-                return false;
-            }
-        }
-    } else if let Some(audio_stream) = source
-        .media_streams
-        .iter()
-        .find(|s| s.codec_type == "Audio")
-    {
-        // If no audio codec preference is specified, check if the audio codec is browser-compatible
-        let browser_compatible_audio_codecs = ["mp3", "aac", "opus", "ac3", "mp4a"];
-        if let Some(ref codec) = audio_stream.codec {
-            let codec_lower = codec.to_lowercase();
-            if !browser_compatible_audio_codecs
-                .iter()
-                .any(|c| codec_lower.contains(c))
-            {
-                return false;
-            }
-        }
     }
 
     // Check bitrate constraints
@@ -944,8 +945,14 @@ fn check_direct_stream(
 
     // If no media streams are available, we cannot verify codec compatibility.
     // Reject direct stream to avoid Format errors in the browser.
-    let has_video_stream = source.media_streams.iter().any(|s| s.codec_type == "Video");
-    let has_audio_stream = source.media_streams.iter().any(|s| s.codec_type == "Audio");
+    let has_video_stream = source
+        .media_streams
+        .iter()
+        .any(|s| is_stream_type(s, "Video"));
+    let has_audio_stream = source
+        .media_streams
+        .iter()
+        .any(|s| is_stream_type(s, "Audio"));
     if !has_video_stream && !has_audio_stream {
         return false;
     }
@@ -973,20 +980,19 @@ fn check_direct_stream(
         }
     }
 
+    // Codecs must be in the client's lists, or in the fallback lists if it sent none
+    if !codecs_playable(source, query) {
+        return false;
+    }
+
     // If video stream copy is not enabled and there's a video stream, need transcoding
-    if !query.enable_video_stream_copy {
-        let has_video = source.media_streams.iter().any(|s| s.codec_type == "Video");
-        if has_video {
-            return false;
-        }
+    if !query.enable_video_stream_copy && has_video_stream {
+        return false;
     }
 
     // If audio stream copy is not enabled and there's an audio stream, need transcoding
-    if !query.enable_audio_stream_copy {
-        let has_audio = source.media_streams.iter().any(|s| s.codec_type == "Audio");
-        if has_audio {
-            return false;
-        }
+    if !query.enable_audio_stream_copy && has_audio_stream {
+        return false;
     }
 
     // Check bitrate constraints — direct stream may still need to respect bitrate limits
@@ -1009,57 +1015,148 @@ mod tests {
 
     #[test]
     fn test_parse_range_full_range() {
-        assert_eq!(parse_range("bytes=0-999", 1000), Some((0, 999)));
+        assert_eq!(parse_range("bytes=0-999", 1000), ByteRange::Partial(0, 999));
     }
 
     #[test]
     fn test_parse_range_partial() {
-        assert_eq!(parse_range("bytes=100-199", 1000), Some((100, 199)));
+        assert_eq!(
+            parse_range("bytes=100-199", 1000),
+            ByteRange::Partial(100, 199)
+        );
     }
 
     #[test]
     fn test_parse_range_open_ended() {
-        assert_eq!(parse_range("bytes=500-", 1000), Some((500, 999)));
+        assert_eq!(
+            parse_range("bytes=500-", 1000),
+            ByteRange::Partial(500, 999)
+        );
     }
 
     #[test]
     fn test_parse_range_suffix() {
-        assert_eq!(parse_range("bytes=-100", 1000), Some((900, 999)));
+        assert_eq!(
+            parse_range("bytes=-100", 1000),
+            ByteRange::Partial(900, 999)
+        );
     }
 
     #[test]
     fn test_parse_range_clamp_end_to_file_size() {
-        assert_eq!(parse_range("bytes=0-9999", 1000), Some((0, 999)));
+        assert_eq!(
+            parse_range("bytes=0-9999", 1000),
+            ByteRange::Partial(0, 999)
+        );
     }
 
     #[test]
     fn test_parse_range_invalid_no_bytes_prefix() {
-        assert_eq!(parse_range("0-999", 1000), None);
+        assert_eq!(parse_range("0-999", 1000), ByteRange::Ignore);
     }
 
     #[test]
     fn test_parse_range_start_beyond_file() {
-        assert_eq!(parse_range("bytes=1000-1100", 1000), None);
+        assert_eq!(
+            parse_range("bytes=1000-1100", 1000),
+            ByteRange::Unsatisfiable
+        );
     }
 
     #[test]
     fn test_parse_range_start_greater_than_end() {
-        assert_eq!(parse_range("bytes=500-100", 1000), None);
+        assert_eq!(parse_range("bytes=500-100", 1000), ByteRange::Ignore);
     }
 
     #[test]
     fn test_parse_range_empty_string() {
-        assert_eq!(parse_range("", 1000), None);
+        assert_eq!(parse_range("", 1000), ByteRange::Ignore);
     }
 
     #[test]
     fn test_parse_range_invalid_numbers() {
-        assert_eq!(parse_range("bytes=abc-def", 1000), None);
+        assert_eq!(parse_range("bytes=abc-def", 1000), ByteRange::Ignore);
     }
 
     #[test]
     fn test_parse_range_suffix_larger_than_file() {
-        assert_eq!(parse_range("bytes=-1001", 1000), None);
+        assert_eq!(parse_range("bytes=-1001", 1000), ByteRange::Ignore);
+    }
+
+    // RFC 9110 §14.1.2: a suffix of length 0 and a first byte at or past the end are unsatisfiable (416).
+
+    #[test]
+    fn test_parse_range_zero_suffix_is_unsatisfiable() {
+        assert_eq!(parse_range("bytes=-0", 1000), ByteRange::Unsatisfiable);
+    }
+
+    #[test]
+    fn test_parse_range_start_far_beyond_file_is_unsatisfiable() {
+        assert_eq!(
+            parse_range("bytes=999999999-", 1000),
+            ByteRange::Unsatisfiable
+        );
+    }
+
+    #[test]
+    fn test_parse_range_start_at_file_size_is_unsatisfiable() {
+        assert_eq!(parse_range("bytes=1000-", 1000), ByteRange::Unsatisfiable);
+    }
+
+    #[test]
+    fn test_parse_range_huge_numbers_do_not_overflow() {
+        assert_eq!(
+            parse_range("bytes=18446744073709551615-", 1000),
+            ByteRange::Unsatisfiable
+        );
+        assert_eq!(
+            parse_range("bytes=0-18446744073709551615", 1000),
+            ByteRange::Partial(0, 999)
+        );
+        assert_eq!(
+            parse_range("bytes=-18446744073709551615", 1000),
+            ByteRange::Ignore
+        );
+        assert_eq!(
+            parse_range("bytes=18446744073709551616-", 1000),
+            ByteRange::Ignore
+        );
+    }
+
+    #[test]
+    fn test_parse_range_empty_file() {
+        assert_eq!(parse_range("bytes=0-", 0), ByteRange::Unsatisfiable);
+        assert_eq!(parse_range("bytes=0-0", 0), ByteRange::Unsatisfiable);
+        assert_eq!(parse_range("bytes=-0", 0), ByteRange::Unsatisfiable);
+        assert_eq!(parse_range("bytes=-5", 0), ByteRange::Ignore);
+    }
+
+    #[test]
+    fn test_parse_range_single_bytes() {
+        assert_eq!(parse_range("bytes=0-0", 1000), ByteRange::Partial(0, 0));
+        assert_eq!(
+            parse_range("bytes=999-", 1000),
+            ByteRange::Partial(999, 999)
+        );
+        assert_eq!(parse_range("bytes=-1", 1000), ByteRange::Partial(999, 999));
+    }
+
+    #[test]
+    fn test_parse_range_suffix_of_whole_file() {
+        assert_eq!(parse_range("bytes=-1000", 1000), ByteRange::Partial(0, 999));
+    }
+
+    #[test]
+    fn test_parse_range_multiple_ranges_are_ignored() {
+        assert_eq!(parse_range("bytes=0-0,5-9", 1000), ByteRange::Ignore);
+        assert_eq!(parse_range("bytes=-0,0-9", 1000), ByteRange::Ignore);
+    }
+
+    #[test]
+    fn test_parse_range_without_numbers_is_ignored() {
+        assert_eq!(parse_range("bytes=-", 1000), ByteRange::Ignore);
+        assert_eq!(parse_range("bytes=", 1000), ByteRange::Ignore);
+        assert_eq!(parse_range("bytes=12", 1000), ByteRange::Ignore);
     }
 
     // ── mime_from_path ──
@@ -1185,5 +1282,154 @@ mod tests {
     #[test]
     fn test_mime_3gp() {
         assert_eq!(mime_from_path("/path/to/video.3gp"), "video/3gpp");
+    }
+
+    // ── check_direct_play / check_direct_stream ──
+
+    const LISTS: &str = "VideoCodecs=h264,vp8,vp9,av1&AudioCodecs=aac,mp3,opus,flac";
+
+    /// A source in `container` with one video and one audio stream and a 4 Mbit/s video bitrate.
+    fn source_with(
+        container: &str,
+        video: &str,
+        audio: &str,
+    ) -> rustyfin_model::media_source::MediaSourceResponse {
+        serde_json::from_value(serde_json::json!({
+            "Id": "source",
+            "Uid": "source",
+            "Container": container,
+            "Protocol": "File",
+            "Path": format!("/media/movie.{container}"),
+            "VideoBitrate": 4_000_000,
+            "MediaStreams": [
+                { "Index": 0, "Codec": video, "CodecType": "Video" },
+                { "Index": 1, "Codec": audio, "CodecType": "Audio" },
+            ],
+        }))
+        .unwrap()
+    }
+
+    /// The query of a client that sends `params` (`Key=value&...`).
+    fn query_from(params: &str) -> VideoPlaybackInfoQuery {
+        let params: HashMap<String, String> = params
+            .split('&')
+            .filter_map(|pair| pair.split_once('='))
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect();
+        VideoPlaybackInfoQuery::from(params)
+    }
+
+    #[test]
+    fn test_direct_play_and_stream_need_listed_codecs() {
+        let query = query_from(LISTS);
+        // The browser plays the video but not the AC3 audio, or the audio but not the HEVC video
+        for (video, audio) in [("h264", "ac3"), ("hevc", "aac")] {
+            let source = source_with("mp4", video, audio);
+            assert!(!check_direct_play(&source, &query), "{video} + {audio}");
+            assert!(!check_direct_stream(&source, &query), "{video} + {audio}");
+        }
+        let source = source_with("mp4", "h264", "aac");
+        assert!(check_direct_play(&source, &query));
+        assert!(check_direct_stream(&source, &query));
+    }
+
+    #[test]
+    fn test_direct_play_without_lists_takes_h264_with_aac_or_mp3() {
+        let query = query_from("");
+        for (video, audio, playable) in [
+            ("h264", "aac", true),
+            ("h264", "mp3", true),
+            ("h264", "ac3", false),
+            ("h264", "eac3", false),
+            ("h264", "opus", false),
+            ("hevc", "aac", false),
+            ("vp9", "aac", false),
+        ] {
+            let source = source_with("mp4", video, audio);
+            assert_eq!(
+                check_direct_play(&source, &query),
+                playable,
+                "{video} + {audio}"
+            );
+            assert_eq!(
+                check_direct_stream(&source, &query),
+                playable,
+                "{video} + {audio}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_direct_play_falls_back_for_a_missing_or_empty_list() {
+        // Only an audio list: the video must still be H.264
+        let query = query_from("AudioCodecs=aac,ac3");
+        assert!(!check_direct_play(
+            &source_with("mp4", "hevc", "aac"),
+            &query
+        ));
+        assert!(!check_direct_stream(
+            &source_with("mp4", "hevc", "aac"),
+            &query
+        ));
+        assert!(check_direct_play(
+            &source_with("mp4", "h264", "ac3"),
+            &query
+        ));
+        // Empty lists count as none
+        let query = query_from("VideoCodecs=&AudioCodecs=");
+        assert!(!check_direct_play(
+            &source_with("mp4", "hevc", "aac"),
+            &query
+        ));
+        assert!(!check_direct_play(
+            &source_with("mp4", "h264", "ac3"),
+            &query
+        ));
+        assert!(check_direct_play(
+            &source_with("mp4", "h264", "aac"),
+            &query
+        ));
+    }
+
+    #[test]
+    fn test_direct_play_keeps_container_and_bitrate_rules() {
+        let query = query_from(LISTS);
+        for container in ["mkv", "avi"] {
+            let source = source_with(container, "h264", "aac");
+            assert!(!check_direct_play(&source, &query), "{container}");
+            assert!(!check_direct_stream(&source, &query), "{container}");
+        }
+        let query = query_from(&format!("{LISTS}&MaxVideoBitrate=1000000"));
+        assert!(!check_direct_play(
+            &source_with("mp4", "h264", "aac"),
+            &query
+        ));
+    }
+
+    #[test]
+    fn test_probed_lowercase_stream_types_count() {
+        // The probe stores ffprobe's stream types, "video" and "audio"
+        let probed = |video: &str, audio: &str| {
+            let mut source = source_with("mp4", video, audio);
+            for stream in &mut source.media_streams {
+                stream.codec_type = stream.codec_type.to_lowercase();
+            }
+            source
+        };
+        let query = query_from(LISTS);
+        assert!(check_direct_play(&probed("h264", "aac"), &query));
+        assert!(check_direct_stream(&probed("h264", "aac"), &query));
+        for (video, audio) in [("h264", "ac3"), ("hevc", "aac")] {
+            let source = probed(video, audio);
+            assert!(!check_direct_play(&source, &query), "{video} + {audio}");
+            assert!(!check_direct_stream(&source, &query), "{video} + {audio}");
+        }
+        for copy in ["EnableVideoStreamCopy", "EnableAudioStreamCopy"] {
+            let query = query_from(&format!("{LISTS}&{copy}=false"));
+            assert!(
+                !check_direct_stream(&probed("h264", "aac"), &query),
+                "{copy}"
+            );
+        }
     }
 }

@@ -9056,3 +9056,605 @@ async fn g1c_next_up_accepts_both_casings() {
         }
     }
 }
+
+// ── G4: transcode pipeline and byte ranges ──
+//
+// Unsatisfiable ranges get 416 instead of a panic or the whole file. Tests that need ffmpeg skip
+// with a note when it is not on PATH. Every test removes its data dir, also when it fails.
+
+/// Removes a test's data dir when dropped.
+struct G4Dir(std::path::PathBuf);
+
+impl Drop for G4Dir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Stores a library on `file`'s folder with one item of `media_type` ("Movie" or "Audio") whose
+/// path is `file`, and returns the item's id.
+async fn g4_insert_item(state: &AppState, media_type: &str, file: &std::path::Path) -> uuid::Uuid {
+    let content_type = if media_type == "Audio" {
+        rustyfin_model::library::LibraryContentType::Music
+    } else {
+        rustyfin_model::library::LibraryContentType::Movies
+    };
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: format!("G4 {}", uuid::Uuid::new_v4().simple()),
+        content_type,
+        paths: vec![file.parent().unwrap().to_str().unwrap().to_string()],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    let item_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO media_items (id, library_id, name, media_type, path) VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(item_id.to_string())
+    .bind(lib.id.to_string())
+    .bind(file.file_stem().unwrap().to_str().unwrap())
+    .bind(media_type)
+    .bind(file.to_str().unwrap())
+    .execute(&state.db)
+    .await
+    .unwrap();
+    item_id
+}
+
+/// GETs `uri` with a bearer token and a `Range` header; returns the status, the `Content-Range`
+/// header and the body.
+async fn g4_get_range(
+    app: &axum::Router,
+    uri: &str,
+    token: &str,
+    range: &str,
+) -> (StatusCode, Option<String>, Vec<u8>) {
+    let req = Request::builder()
+        .uri(uri)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Range", range)
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let content_range = resp
+        .headers()
+        .get("content-range")
+        .map(|v| v.to_str().unwrap().to_string());
+    let body = resp
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .to_vec();
+    (status, content_range, body)
+}
+
+#[tokio::test]
+async fn g4_unsatisfiable_ranges_get_416() {
+    let state = test_state().await;
+    let _dir = G4Dir(state.data_dir.to_path_buf());
+    let (token, _) = admin_session(&state).await;
+    let folder = media_folder(&state, "g4-ranges");
+    let file = std::path::Path::new(&folder).join("G4 Range.mp4");
+    let content: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&file, &content).unwrap();
+    let id = g4_insert_item(&state, "Movie", &file).await;
+    let app = app(state);
+
+    for uri in [
+        format!("/Videos/{id}/stream?Static=true"),
+        format!("/Audio/{id}/stream?Static=true"),
+    ] {
+        for range in ["bytes=-0", "bytes=999999999-", "bytes=1000-"] {
+            let (status, content_range, body) = g4_get_range(&app, &uri, &token, range).await;
+            assert_eq!(status, StatusCode::RANGE_NOT_SATISFIABLE, "{uri} {range}");
+            assert_eq!(content_range.as_deref(), Some("bytes */1000"), "{range}");
+            assert!(body.is_empty(), "{range}: 416 must not carry the file");
+        }
+
+        let (status, content_range, body) = g4_get_range(&app, &uri, &token, "bytes=0-99").await;
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(content_range.as_deref(), Some("bytes 0-99/1000"));
+        assert_eq!(body, &content[..100]);
+
+        let (status, content_range, body) = g4_get_range(&app, &uri, &token, "bytes=-100").await;
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(content_range.as_deref(), Some("bytes 900-999/1000"));
+        assert_eq!(body, &content[900..]);
+
+        // A header that is not one byte range is ignored: the whole file.
+        for range in ["abc", "bytes=0-0,5-9"] {
+            let (status, content_range, body) = g4_get_range(&app, &uri, &token, range).await;
+            assert_eq!(status, StatusCode::OK, "{range}");
+            assert_eq!(content_range, None, "{range}");
+            assert_eq!(body, content, "{range}");
+        }
+    }
+}
+
+/// True when ffmpeg and ffprobe are on PATH; otherwise prints that `test` is skipped.
+fn g4_have_ffmpeg(test: &str) -> bool {
+    for tool in ["ffmpeg", "ffprobe"] {
+        let found = std::process::Command::new(tool)
+            .arg("-version")
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !found {
+            println!("{test}: skipped, {tool} is not on PATH");
+            return false;
+        }
+    }
+    true
+}
+
+#[tokio::test]
+async fn g4_ffmpeg_error_is_returned() {
+    if !g4_have_ffmpeg("g4_ffmpeg_error_is_returned") {
+        return;
+    }
+    let state = test_state().await;
+    let _dir = G4Dir(state.data_dir.to_path_buf());
+    let (token, _) = admin_session(&state).await;
+    let folder = media_folder(&state, "g4-garbage");
+    let file = std::path::Path::new(&folder).join("G4 Garbage.mkv");
+    std::fs::write(&file, vec![0x5a_u8; 4096]).unwrap();
+    let id = g4_insert_item(&state, "Movie", &file).await;
+    let manager = state.transcode_manager.clone();
+    let app = app(state);
+
+    let started = std::time::Instant::now();
+    let uri = format!("/Videos/{id}/main.m3u8?PlaySessionId=g4-garbage");
+    let (status, body) = send(&app, request("GET", &uri, Some(&token), None)).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "the error came after {:?}, not when ffmpeg exited",
+        started.elapsed()
+    );
+    let detail = body["Detail"].as_str().unwrap_or_default();
+    assert!(detail.contains("Invalid data found"), "{body}");
+    assert!(!manager.is_active(id).await, "the failed transcode is gone");
+}
+
+#[tokio::test]
+async fn g4_active_encodings_needs_a_name() {
+    let state = test_state().await;
+    let _dir = G4Dir(state.data_dir.to_path_buf());
+    let (token, _) = admin_session(&state).await;
+    let app = app(state);
+    let id = uuid::Uuid::new_v4();
+
+    for (uri, expected) in [
+        (
+            "/Videos/ActiveEncodings".to_string(),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "/Videos/ActiveEncodings?deviceId=g4-dev".to_string(),
+            StatusCode::NO_CONTENT,
+        ),
+        (
+            "/Videos/ActiveEncodings?playSessionId=g4-psid".to_string(),
+            StatusCode::NO_CONTENT,
+        ),
+        (
+            "/Videos/ActiveEncodings?DeviceId=g4-dev&PlaySessionId=g4-psid".to_string(),
+            StatusCode::NO_CONTENT,
+        ),
+        (
+            format!("/Videos/{id}/Transcode?PlaySessionId=g4-psid"),
+            StatusCode::NO_CONTENT,
+        ),
+        (format!("/Videos/{id}/Transcode"), StatusCode::NO_CONTENT),
+    ] {
+        let (status, body) = send(&app, request("DELETE", &uri, Some(&token), None)).await;
+        assert_eq!(status, expected, "DELETE {uri}: {body}");
+    }
+    let uri = "/Videos/ActiveEncodings?playSessionId=g4-psid";
+    let (status, _) = send(&app, request("DELETE", uri, None, None)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+/// Stores a media source for `item` at `file` with one stream per (CodecType, codec) pair.
+async fn g4_insert_source(
+    state: &AppState,
+    item: uuid::Uuid,
+    container: &str,
+    file: &std::path::Path,
+    streams: &[(&str, &str)],
+) {
+    let streams: Vec<serde_json::Value> = streams
+        .iter()
+        .enumerate()
+        .map(|(index, (codec_type, codec))| {
+            serde_json::json!({ "Index": index, "Codec": codec, "CodecType": codec_type })
+        })
+        .collect();
+    let source: rustyfin_model::media_source::MediaSourceResponse =
+        serde_json::from_value(serde_json::json!({
+            "Id": uuid::Uuid::new_v4().to_string(),
+            "Uid": uuid::Uuid::new_v4().to_string(),
+            "Container": container,
+            "Protocol": "File",
+            "Path": file.to_str().unwrap(),
+            "MediaStreams": streams,
+        }))
+        .unwrap();
+    rustyfin_db::repo_media_source::insert_media_source_with_streams(&state.db, &item, &source)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn g4_universal_sends_unplayable_audio_to_transcode() {
+    let state = test_state().await;
+    let _dir = G4Dir(state.data_dir.to_path_buf());
+    let (token, _) = admin_session(&state).await;
+    let folder = media_folder(&state, "g4-universal");
+    let mut items = Vec::new();
+    for (name, video, audio) in [
+        ("G4 AC3.mp4", "h264", "ac3"),
+        ("G4 HEVC.mp4", "hevc", "aac"),
+        ("G4 AAC.mp4", "h264", "aac"),
+    ] {
+        let file = std::path::Path::new(&folder).join(name);
+        std::fs::write(&file, b"g4").unwrap();
+        let id = g4_insert_item(&state, "Movie", &file).await;
+        g4_insert_source(
+            &state,
+            id,
+            "mp4",
+            &file,
+            &[("Video", video), ("Audio", audio)],
+        )
+        .await;
+        items.push(id);
+    }
+    let (ac3, hevc, aac) = (items[0], items[1], items[2]);
+    let app = app(state);
+
+    let lists = "&VideoCodecs=h264,vp8,vp9,av1&AudioCodecs=aac,mp3,opus,flac";
+    for (id, codecs, transcode) in [
+        // The browser plays the video but not the audio, or the audio but not the video
+        (ac3, lists, true),
+        (hevc, lists, true),
+        // A client without lists plays only what every browser plays
+        (ac3, "", true),
+        (hevc, "", true),
+        (aac, lists, false),
+        (aac, "", false),
+    ] {
+        let uri = format!("/Videos/{id}/Universal?MaxStreamingBitrate=100000000{codecs}");
+        let (status, body) = send(&app, request("GET", &uri, Some(&token), None)).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        let url = body["Url"].as_str().unwrap_or_default();
+        let source = &body["MediaSources"][0];
+        if transcode {
+            let play_session = body["PlaySessionId"].as_str().unwrap();
+            assert!(
+                url.starts_with(&format!("/Videos/{id}/main.m3u8?")),
+                "{uri}: {url}"
+            );
+            assert!(
+                url.contains(&format!("PlaySessionId={play_session}")),
+                "{uri}: {url}"
+            );
+            if !codecs.is_empty() {
+                assert!(url.contains("VideoCodec=h264,vp8,vp9,av1"), "{uri}: {url}");
+            }
+            assert_eq!(source["SupportsDirectPlay"], false, "{uri}");
+            assert_eq!(source["SupportsDirectStream"], false, "{uri}");
+        } else {
+            assert!(
+                url.starts_with(&format!("/Videos/{id}/stream?")) && url.contains("Static=true"),
+                "{uri}: {url}"
+            );
+            assert_eq!(source["SupportsDirectPlay"], true, "{uri}");
+        }
+    }
+}
+
+/// Runs ffmpeg with `args` to make a test file.
+fn g4_make_media(args: &[&str]) {
+    let out = std::process::Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-y"])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "ffmpeg {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Writes `data` to `file` and returns the streams ffprobe finds in it.
+fn g4_probe(file: &std::path::Path, data: &[u8]) -> Vec<serde_json::Value> {
+    std::fs::write(file, data).unwrap();
+    let out = std::process::Command::new("ffprobe")
+        .args(["-v", "error", "-of", "json", "-show_entries"])
+        .arg("stream=codec_type,codec_name,profile,channels")
+        .arg(file)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "ffprobe: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let probed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    probed["streams"].as_array().cloned().unwrap_or_default()
+}
+
+/// GETs `uri` without an auth header; returns the status, the content type and the body.
+async fn g4_get(app: &axum::Router, uri: &str) -> (StatusCode, String, Vec<u8>) {
+    let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .map(|v| v.to_str().unwrap().to_string())
+        .unwrap_or_default();
+    let body = resp
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .to_vec();
+    (status, content_type, body)
+}
+
+/// GETs the playlist at `uri` (auth in its query) and returns its first segment as a player
+/// resolves it against the playlist URL `/Videos/{id}/main.m3u8`. Messages hide `token`.
+async fn g4_first_segment(app: &axum::Router, id: uuid::Uuid, uri: &str, token: &str) -> String {
+    let (status, _, body) = g4_get(app, uri).await;
+    let playlist = String::from_utf8_lossy(&body).to_string();
+    let shown = playlist.replace(token, "<token>");
+    assert_eq!(status, StatusCode::OK, "{shown}");
+    assert!(playlist.starts_with("#EXTM3U"), "{shown}");
+    let line = playlist
+        .lines()
+        .find(|l| !l.is_empty() && !l.starts_with('#'))
+        .unwrap_or_else(|| panic!("no segment in {shown}"));
+    if line.starts_with('/') {
+        line.to_string()
+    } else {
+        format!("/Videos/{id}/{line}")
+    }
+}
+
+#[tokio::test]
+async fn g4_transcode_playlist_and_segments_carry_auth() {
+    if !g4_have_ffmpeg("g4_transcode_playlist_and_segments_carry_auth") {
+        return;
+    }
+    let state = test_state().await;
+    let _dir = G4Dir(state.data_dir.to_path_buf());
+    let (token, _) = admin_session(&state).await;
+    let folder = media_folder(&state, "g4-transcode");
+    let file = std::path::Path::new(&folder).join("G4 Clip.mp4");
+    // H.264 that browsers play, with AC3 audio that the client below does not
+    g4_make_media(&[
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc=size=320x240:rate=25",
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=440:sample_rate=48000",
+        "-t",
+        "4",
+        "-c:v",
+        "libx264",
+        "-profile:v",
+        "baseline",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "ac3",
+        "-ac",
+        "1",
+        file.to_str().unwrap(),
+    ]);
+    let id = g4_insert_item(&state, "Movie", &file).await;
+    rustyfin_core::probe::probe_and_save(&state.db, &id, file.to_str().unwrap())
+        .await
+        .unwrap();
+    let probe_file = state.data_dir.join("g4-segment.ts");
+    let app = app(state);
+
+    let uri = format!(
+        "/Videos/{id}/Universal?VideoCodecs=h264,vp8,vp9,av1&AudioCodecs=aac,mp3,opus,flac"
+    );
+    let (status, body) = send(&app, request("GET", &uri, Some(&token), None)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let url = body["Url"].as_str().unwrap_or_default();
+    assert!(url.contains("/main.m3u8?"), "{url}");
+
+    let playlist = format!("{url}&api_key={token}");
+    let segment = g4_first_segment(&app, id, &playlist, &token).await;
+    assert!(
+        segment.starts_with(&format!("/Videos/{id}/hls/"))
+            && segment.contains("/video/segment_")
+            && segment.contains("api_key="),
+        "{}",
+        segment.replace(&token, "<token>")
+    );
+    let (status, content_type, data) = g4_get(&app, &segment).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(content_type, "video/mp2t");
+    assert_eq!(data.first(), Some(&0x47), "MPEG-TS starts with a sync byte");
+    // The video was copied (x264 would have made it High), the audio encoded to AAC stereo
+    let streams = g4_probe(&probe_file, &data);
+    let video = streams.iter().find(|s| s["codec_type"] == "video");
+    assert_eq!(
+        video.map(|s| &s["codec_name"]),
+        Some(&"h264".into()),
+        "{streams:?}"
+    );
+    assert_eq!(
+        video.map(|s| &s["profile"]),
+        Some(&"Constrained Baseline".into()),
+        "{streams:?}"
+    );
+    let audio = streams.iter().find(|s| s["codec_type"] == "audio");
+    assert_eq!(
+        audio.map(|s| &s["codec_name"]),
+        Some(&"aac".into()),
+        "{streams:?}"
+    );
+    assert_eq!(
+        audio.map(|s| &s["channels"]),
+        Some(&2.into()),
+        "{streams:?}"
+    );
+
+    // Without the playlist's query the segment request carries no auth
+    let bare = segment.split('?').next().unwrap();
+    let (status, _, _) = g4_get(&app, bare).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn g4_two_play_sessions_are_separate() {
+    if !g4_have_ffmpeg("g4_two_play_sessions_are_separate") {
+        return;
+    }
+    let state = test_state().await;
+    let _dir = G4Dir(state.data_dir.to_path_buf());
+    let (token, _) = admin_session(&state).await;
+    let folder = media_folder(&state, "g4-viewers");
+    let file = std::path::Path::new(&folder).join("G4 Viewers.mp4");
+    g4_make_media(&[
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc=size=320x240:rate=25",
+        "-t",
+        "4",
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        file.to_str().unwrap(),
+    ]);
+    let id = g4_insert_item(&state, "Movie", &file).await;
+    let app = app(state);
+
+    let mut segments = Vec::new();
+    for play_session in ["g4-a", "g4-b"] {
+        let uri = format!("/Videos/{id}/main.m3u8?PlaySessionId={play_session}&api_key={token}");
+        segments.push(g4_first_segment(&app, id, &uri, &token).await);
+    }
+    let (a, b) = (&segments[0], &segments[1]);
+    assert_ne!(
+        a.split('?').next(),
+        b.split('?').next(),
+        "two play sessions, two transcodes"
+    );
+    assert_eq!(g4_get(&app, a).await.0, StatusCode::OK);
+    assert_eq!(g4_get(&app, b).await.0, StatusCode::OK);
+
+    // Stopping one viewer leaves the other
+    let uri = "/Videos/ActiveEncodings?playSessionId=g4-a";
+    let (status, _) = send(&app, request("DELETE", uri, Some(&token), None)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(g4_get(&app, a).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(g4_get(&app, b).await.0, StatusCode::OK);
+    let uri = format!("/Videos/{id}/Transcode?PlaySessionId=g4-b");
+    let (status, _) = send(&app, request("DELETE", &uri, Some(&token), None)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(g4_get(&app, b).await.0, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn g4_audio_only_transcode_has_audio() {
+    if !g4_have_ffmpeg("g4_audio_only_transcode_has_audio") {
+        return;
+    }
+    let state = test_state().await;
+    let _dir = G4Dir(state.data_dir.to_path_buf());
+    let (token, _) = admin_session(&state).await;
+    let folder = media_folder(&state, "g4-audio");
+    let file = std::path::Path::new(&folder).join("G4 Tone.flac");
+    g4_make_media(&[
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=440:sample_rate=44100",
+        "-t",
+        "4",
+        "-c:a",
+        "flac",
+        file.to_str().unwrap(),
+    ]);
+    let id = g4_insert_item(&state, "Audio", &file).await;
+    let probe_file = state.data_dir.join("g4-audio.ts");
+    let app = app(state);
+
+    let uri =
+        format!("/Videos/{id}/main.m3u8?AudioOnly=true&PlaySessionId=g4-audio&api_key={token}");
+    let segment = g4_first_segment(&app, id, &uri, &token).await;
+    let (status, _, data) = g4_get(&app, &segment).await;
+    assert_eq!(status, StatusCode::OK);
+    let streams = g4_probe(&probe_file, &data);
+    assert_eq!(streams.len(), 1, "{streams:?}");
+    assert_eq!(streams[0]["codec_type"], "audio", "{streams:?}");
+    assert_eq!(streams[0]["codec_name"], "aac", "{streams:?}");
+}
+
+#[tokio::test]
+async fn g4_universal_direct_plays_a_probed_mp4() {
+    if !g4_have_ffmpeg("g4_universal_direct_plays_a_probed_mp4") {
+        return;
+    }
+    let state = test_state().await;
+    let _dir = G4Dir(state.data_dir.to_path_buf());
+    let (token, _) = admin_session(&state).await;
+    let folder = media_folder(&state, "g4-probed");
+    let file = std::path::Path::new(&folder).join("G4 Playable.mp4");
+    g4_make_media(&[
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc=size=320x240:rate=25",
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=440:sample_rate=48000",
+        "-t",
+        "2",
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "aac",
+        file.to_str().unwrap(),
+    ]);
+    let id = g4_insert_item(&state, "Movie", &file).await;
+    // The streams as the scanner stores them, with ffprobe's stream types
+    rustyfin_core::probe::probe_and_save(&state.db, &id, file.to_str().unwrap())
+        .await
+        .unwrap();
+    let app = app(state);
+
+    let uri = format!(
+        "/Videos/{id}/Universal?VideoCodecs=h264,vp8,vp9,av1&AudioCodecs=aac,mp3,opus,flac"
+    );
+    let (status, body) = send(&app, request("GET", &uri, Some(&token), None)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let url = body["Url"].as_str().unwrap_or_default();
+    assert!(
+        url.starts_with(&format!("/Videos/{id}/stream?")) && url.contains("Static=true"),
+        "{url}"
+    );
+    assert_eq!(body["MediaSources"][0]["SupportsDirectPlay"], true);
+}

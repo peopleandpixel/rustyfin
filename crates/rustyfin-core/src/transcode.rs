@@ -1,9 +1,11 @@
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -50,6 +52,10 @@ pub struct TranscodeProfile {
     pub audio_only: bool,
     /// Enable adaptive bitrate transcoding with multiple quality levels
     pub adaptive_bitrate: bool,
+    /// Copy the source video (`-c:v copy`) instead of encoding it.
+    pub copy_video: bool,
+    /// Copy the source audio (`-c:a copy`) instead of encoding it.
+    pub copy_audio: bool,
 }
 
 impl Default for TranscodeProfile {
@@ -68,6 +74,8 @@ impl Default for TranscodeProfile {
             audio_stream_index: None,
             audio_only: false,
             adaptive_bitrate: false,
+            copy_video: false,
+            copy_audio: false,
         }
     }
 }
@@ -76,14 +84,36 @@ impl Default for TranscodeProfile {
 // Transcode session
 // ---------------------------------------------------------------------------
 
+/// One ffmpeg run. Each playback id has its own session, so two viewers of one item get two.
 struct TranscodeSession {
-    _item_id: Uuid,
+    item_id: Uuid,
     playback_id: Uuid,
-    output_dir: PathBuf,
+    play_session_id: String, // "" when the request had none
+    device_id: String,       // "" when the request had none
+    output_dir: PathBuf,     // cache_root/{playback_id}
     child: Option<Child>,
-    started_at: std::time::Instant,
+    stderr_task: Option<tokio::task::JoinHandle<()>>,
+    stderr_tail: Arc<std::sync::Mutex<VecDeque<String>>>,
+    last_access: Instant, // last playlist or segment request
     _profile: TranscodeProfile,
 }
+
+/// What a starting session looked like when it was polled.
+enum StartPoll {
+    /// Its playlist is written.
+    Ready(PathBuf),
+    /// ffmpeg exited without writing a playlist.
+    Exited(ExitStatus),
+    /// ffmpeg is still running and has not written the playlist yet.
+    Running,
+    /// The session was stopped or cleaned up.
+    Gone,
+}
+
+/// A session idle for longer than this (no playlist or segment request) is stopped.
+const IDLE_LIMIT: Duration = Duration::from_secs(30 * 60);
+/// How many of ffmpeg's last stderr lines are kept for error reports.
+const STDERR_TAIL_LINES: usize = 20;
 
 // ---------------------------------------------------------------------------
 // Transcode manager
@@ -91,33 +121,36 @@ struct TranscodeSession {
 
 #[derive(Clone)]
 pub struct TranscodeManager {
-    sessions: Arc<DashMap<Uuid, TranscodeSession>>,
+    sessions: Arc<DashMap<Uuid, TranscodeSession>>, // keyed by playback id
     cache_root: PathBuf,
+    ffmpeg: PathBuf,         // "ffmpeg"; unit tests point it at a fake script
+    playlist_wait: Duration, // 30 s; unit tests shorten it
+    start_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl TranscodeManager {
     pub fn new(data_dir: &Path) -> Self {
-        let cache_root = data_dir.join("transcodes");
         Self {
             sessions: Arc::new(DashMap::new()),
-            cache_root,
+            cache_root: data_dir.join("transcodes"),
+            ffmpeg: PathBuf::from("ffmpeg"),
+            playlist_wait: Duration::from_secs(30),
+            start_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
-    /// Spawn a background task that periodically cleans up stale transcode sessions
-    /// and removes old cache directories. Runs every 15 minutes.
+    /// Spawn a background task that every minute stops idle transcode sessions and removes
+    /// the cache directories of sessions that are no longer active.
     pub fn spawn_cleanup_task(&self) {
         let manager = self.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(900));
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
             interval.tick().await; // skip the first immediate tick
             loop {
                 interval.tick().await;
-                // Clean up stale sessions running longer than 1 hour
                 manager
-                    .cleanup_stale_sessions(Duration::from_secs(3600))
+                    .cleanup_idle_sessions(Instant::now(), IDLE_LIMIT)
                     .await;
-                // Remove cache directories for inactive sessions
                 if let Err(e) = manager.cleanup_cache().await {
                     warn!("transcode cache cleanup failed: {}", e);
                 }
@@ -125,29 +158,108 @@ impl TranscodeManager {
         });
     }
 
-    /// Start an HLS transcode for the given media file.
-    /// Returns the path to the main.m3u8 playlist.
+    /// Start the HLS transcode of `input_path` for a request, or reuse the item's transcode of
+    /// the same play session (else device). Returns the playlist path and the playback id once
+    /// ffmpeg has written the playlist. Fails when ffmpeg exits first, or when no playlist
+    /// appears within `playlist_wait`; ffmpeg then keeps running.
     pub async fn start_transcode(
         &self,
         item_id: Uuid,
         input_path: &str,
         profile: &TranscodeProfile,
+        play_session_id: &str,
+        device_id: &str,
     ) -> Result<(PathBuf, Uuid), TranscodeError> {
-        // Generate a unique playback ID for this session
-        let playback_id = Uuid::new_v4();
-
-        // Check if session already exists
-        if let Some(session) = self.sessions.get(&item_id) {
-            let playlist = session.output_dir.join("main.m3u8");
-            if playlist.exists() {
-                return Ok((playlist, session.playback_id));
+        let playback_id = {
+            let _lock = self.start_lock.lock().await;
+            match self.find_session(item_id, play_session_id, device_id) {
+                Some(id) if self.touch_live_session(id) => id,
+                Some(id) => {
+                    // ffmpeg exited without a playlist: start again
+                    self.stop_session(id).await;
+                    self.spawn_session(item_id, input_path, profile, play_session_id, device_id)
+                        .await?
+                }
+                None => {
+                    self.spawn_session(item_id, input_path, profile, play_session_id, device_id)
+                        .await?
+                }
             }
+        };
+
+        // Poll without the lock, so other requests can start their transcodes meanwhile
+        let deadline = std::time::Instant::now() + self.playlist_wait;
+        loop {
+            match self.poll_session(playback_id) {
+                StartPoll::Ready(playlist) => return Ok((playlist, playback_id)),
+                StartPoll::Exited(status) => {
+                    return Err(self.ffmpeg_exited(playback_id, status).await);
+                }
+                StartPoll::Gone => {
+                    return Err(TranscodeError::FfmpegFailed("transcode stopped".into()));
+                }
+                StartPoll::Running => {}
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(TranscodeError::PlaylistTimeout);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
+    }
 
-        // Stop any existing session for this item
-        self.stop_transcode(item_id).await;
+    /// The item's session that a request with these names reuses.
+    fn find_session(&self, item_id: Uuid, play_session_id: &str, device_id: &str) -> Option<Uuid> {
+        self.sessions
+            .iter()
+            .find(|e| {
+                e.value().item_id == item_id && same_key(e.value(), play_session_id, device_id)
+            })
+            .map(|e| *e.key())
+    }
 
-        let output_dir = self.cache_root.join(item_id.to_string());
+    /// Touch a session that can still serve (its playlist exists or its ffmpeg runs) and
+    /// return true. Returns false for any other session.
+    fn touch_live_session(&self, playback_id: Uuid) -> bool {
+        let Some(mut session) = self.sessions.get_mut(&playback_id) else {
+            return false;
+        };
+        let running = session
+            .child
+            .as_mut()
+            .is_some_and(|child| !matches!(child.try_wait(), Ok(Some(_))));
+        let live = running || session.output_dir.join("main.m3u8").exists();
+        if live {
+            session.last_access = Instant::now();
+        }
+        live
+    }
+
+    /// Look at a starting session without waiting.
+    fn poll_session(&self, playback_id: Uuid) -> StartPoll {
+        let Some(mut session) = self.sessions.get_mut(&playback_id) else {
+            return StartPoll::Gone;
+        };
+        let playlist = session.output_dir.join("main.m3u8");
+        if playlist.exists() {
+            return StartPoll::Ready(playlist);
+        }
+        match session.child.as_mut().map(Child::try_wait) {
+            Some(Ok(Some(status))) => StartPoll::Exited(status),
+            _ => StartPoll::Running,
+        }
+    }
+
+    /// Start ffmpeg for a new session in its own directory. Call with `start_lock` held.
+    async fn spawn_session(
+        &self,
+        item_id: Uuid,
+        input_path: &str,
+        profile: &TranscodeProfile,
+        play_session_id: &str,
+        device_id: &str,
+    ) -> Result<Uuid, TranscodeError> {
+        let playback_id = Uuid::new_v4();
+        let output_dir = self.cache_root.join(playback_id.to_string());
         tokio::fs::create_dir_all(&output_dir)
             .await
             .map_err(|e| TranscodeError::Io(format!("Cannot create output dir: {e}")))?;
@@ -170,57 +282,120 @@ impl TranscodeManager {
             args.join(" ")
         );
 
-        let child = Command::new("ffmpeg")
+        let spawned = Command::new(&self.ffmpeg)
             .args(&args)
             .stdin(Stdio::null())
-            .stdout(Stdio::piped())
+            .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| TranscodeError::FfmpegNotFound(e.to_string()))?;
-
-        let session = TranscodeSession {
-            _item_id: item_id,
-            playback_id,
-            output_dir: output_dir.clone(),
-            child: Some(child),
-            started_at: std::time::Instant::now(),
-            _profile: profile.clone(),
+            .spawn();
+        let mut child = match spawned {
+            Ok(child) => child,
+            Err(e) => {
+                let _ = tokio::fs::remove_dir_all(&output_dir).await;
+                return Err(TranscodeError::FfmpegNotFound(e.to_string()));
+            }
         };
 
-        self.sessions.insert(item_id, session);
+        // Drain stderr from the start: a full pipe would block ffmpeg for good
+        let stderr_tail = Arc::new(std::sync::Mutex::new(VecDeque::new()));
+        let stderr_task = child
+            .stderr
+            .take()
+            .map(|stderr| tokio::spawn(drain_stderr(stderr, playback_id, stderr_tail.clone())));
 
-        // Wait briefly for FFmpeg to create the playlist
-        for _ in 0..30 {
-            if playlist_path.exists() {
-                return Ok((playlist_path, playback_id));
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-
-        Ok((playlist_path, playback_id))
+        self.sessions.insert(
+            playback_id,
+            TranscodeSession {
+                item_id,
+                playback_id,
+                play_session_id: play_session_id.to_string(),
+                device_id: device_id.to_string(),
+                output_dir,
+                child: Some(child),
+                stderr_task,
+                stderr_tail,
+                last_access: Instant::now(),
+                _profile: profile.clone(),
+            },
+        );
+        Ok(playback_id)
     }
 
-    /// Stop a running transcode session and clean up.
-    pub async fn stop_transcode(&self, item_id: Uuid) {
-        if let Some((_key, mut session)) = self.sessions.remove(&item_id)
-            && let Some(mut child) = session.child.take()
-        {
-            let _ = child.kill().await;
-            debug!(item_id = %item_id, "Killed FFmpeg process");
+    /// ffmpeg exited before writing a playlist: drop the session and return its last stderr lines.
+    async fn ffmpeg_exited(&self, playback_id: Uuid, status: ExitStatus) -> TranscodeError {
+        let Some((stderr_task, tail)) = self
+            .sessions
+            .get_mut(&playback_id)
+            .map(|mut s| (s.stderr_task.take(), s.stderr_tail.clone()))
+        else {
+            return TranscodeError::FfmpegFailed("transcode stopped".into());
+        };
+        // The reader ends once ffmpeg has closed stderr; the timeout only bounds a stuck reader
+        if let Some(task) = stderr_task {
+            let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
         }
+        let lines: Vec<String> = tail.lock().unwrap().iter().cloned().collect();
+        self.stop_session(playback_id).await;
+        TranscodeError::FfmpegFailed(format!(
+            "ffmpeg exited with {status}: {}",
+            lines.join(" | ")
+        ))
+    }
+
+    /// Stop the transcodes that a stop request names and delete their files. Names are the
+    /// PlaySessionId, else the DeviceId (whatever the session's PlaySessionId), else, with no
+    /// names, the unnamed sessions. `item_id` restricts the stop to one item; without an item
+    /// and without names nothing stops. Returns how many sessions were stopped.
+    pub async fn stop_play_session(
+        &self,
+        item_id: Option<Uuid>,
+        play_session_id: &str,
+        device_id: &str,
+    ) -> usize {
+        let matching: Vec<Uuid> = self
+            .sessions
+            .iter()
+            .filter(|e| {
+                let s = e.value();
+                if item_id.is_some_and(|id| s.item_id != id) {
+                    false
+                } else if !play_session_id.is_empty() {
+                    s.play_session_id.eq_ignore_ascii_case(play_session_id)
+                } else if !device_id.is_empty() {
+                    s.device_id.eq_ignore_ascii_case(device_id)
+                } else {
+                    item_id.is_some() && s.play_session_id.is_empty() && s.device_id.is_empty()
+                }
+            })
+            .map(|e| *e.key())
+            .collect();
+
+        let mut stopped = 0;
+        for id in matching {
+            if self.stop_session(id).await {
+                stopped += 1;
+            }
+        }
+        stopped
     }
 
     /// Stop all running transcodes.
     pub async fn stop_all(&self) {
         let ids: Vec<Uuid> = self.sessions.iter().map(|e| *e.key()).collect();
         for id in ids {
-            if let Some((_key, mut session)) = self.sessions.remove(&id)
-                && let Some(mut child) = session.child.take()
-            {
-                let _ = child.kill().await;
-                debug!(item_id = %id, "Killed FFmpeg process");
+            self.stop_session(id).await;
+        }
+    }
+
+    /// Remove a session, stop its ffmpeg and delete its files. False when it was already gone.
+    async fn stop_session(&self, playback_id: Uuid) -> bool {
+        match self.sessions.remove(&playback_id) {
+            Some((_, session)) => {
+                end_session(session).await;
+                true
             }
+            None => false,
         }
     }
 
@@ -246,23 +421,52 @@ impl TranscodeManager {
         (path.parent() == Some(dir.as_path()) && path.is_file()).then_some(path)
     }
 
-    /// Get the playback ID for an active transcode session.
-    pub async fn get_playback_id(&self, item_id: Uuid) -> Option<Uuid> {
-        self.sessions.get(&item_id).map(|s| s.playback_id)
+    /// Get the path to a segment of one transcode session of `item_id`. Touches the session.
+    pub fn segment_path(
+        &self,
+        item_id: Uuid,
+        playback_id: Uuid,
+        segment_name: &str,
+    ) -> Option<PathBuf> {
+        {
+            let mut session = self.sessions.get_mut(&playback_id)?;
+            if session.item_id != item_id {
+                return None;
+            }
+            session.last_access = Instant::now();
+        }
+        self.get_segment_path(playback_id, segment_name)
     }
 
-    /// Get the path to the master playlist.
-    pub fn get_playlist_path(&self, item_id: Uuid) -> PathBuf {
-        self.cache_root.join(item_id.to_string()).join("main.m3u8")
+    /// Get the path to a segment for the legacy `/hls/{segment}` route: the item's most recently
+    /// used session if it has the file (touched), else the item's old per-item directory.
+    pub fn legacy_segment_path(&self, item_id: Uuid, segment_name: &str) -> Option<PathBuf> {
+        let latest = self
+            .sessions
+            .iter()
+            .filter(|e| e.value().item_id == item_id)
+            .max_by_key(|e| e.value().last_access)
+            .map(|e| *e.key());
+        if let Some(playback_id) = latest
+            && let Some(path) = self.get_segment_path(playback_id, segment_name)
+        {
+            if let Some(mut session) = self.sessions.get_mut(&playback_id) {
+                session.last_access = Instant::now();
+            }
+            return Some(path);
+        }
+        self.get_segment_path(item_id, segment_name)
     }
 
     /// Check if a transcode session is active for the given item.
     pub async fn is_active(&self, item_id: Uuid) -> bool {
-        self.sessions.contains_key(&item_id)
+        self.sessions.iter().any(|e| e.value().item_id == item_id)
     }
 
     /// Clean up transcode cache: remove directories for sessions that are no longer active.
     pub async fn cleanup_cache(&self) -> Result<(), TranscodeError> {
+        // Under the start lock, so a session that is starting keeps its directory
+        let _lock = self.start_lock.lock().await;
         let active_ids: Vec<Uuid> = self.sessions.iter().map(|e| *e.key()).collect();
 
         if !self.cache_root.exists() {
@@ -282,7 +486,7 @@ impl TranscodeManager {
             if let Ok(id) = Uuid::parse_str(&name)
                 && !active_ids.contains(&id)
             {
-                info!(item_id = %id, "Cleaning up transcode cache");
+                info!(playback_id = %id, "Cleaning up transcode cache");
                 let _ = tokio::fs::remove_dir_all(entry.path()).await;
             }
         }
@@ -290,18 +494,84 @@ impl TranscodeManager {
         Ok(())
     }
 
-    /// Clean up stale sessions (running longer than max_duration).
-    pub async fn cleanup_stale_sessions(&self, max_duration: Duration) {
-        let stale: Vec<Uuid> = self
+    /// Stop the sessions whose last playlist or segment request is older than `max_idle`.
+    /// Returns how many were stopped.
+    pub async fn cleanup_idle_sessions(&self, now: Instant, max_idle: Duration) -> usize {
+        let idle: Vec<Uuid> = self
             .sessions
             .iter()
-            .filter(|e| e.value().started_at.elapsed() > max_duration)
+            .filter(|e| now.saturating_duration_since(e.value().last_access) > max_idle)
             .map(|e| *e.key())
             .collect();
 
-        for id in stale {
-            warn!(item_id = %id, "Stopping stale transcode session");
-            self.stop_transcode(id).await;
+        let mut stopped = 0;
+        for id in idle {
+            // Checked again under the map lock: a request may have touched the session since
+            let removed = self.sessions.remove_if(&id, |_, s| {
+                now.saturating_duration_since(s.last_access) > max_idle
+            });
+            if let Some((_, session)) = removed {
+                warn!(playback_id = %id, "Stopping idle transcode session");
+                end_session(session).await;
+                stopped += 1;
+            }
+        }
+        stopped
+    }
+}
+
+/// Whether a session answers to a request's names: the same PlaySessionId, else the same
+/// DeviceId among sessions without one, else a session with neither. Case-insensitive.
+fn same_key(session: &TranscodeSession, play_session_id: &str, device_id: &str) -> bool {
+    if !play_session_id.is_empty() {
+        session
+            .play_session_id
+            .eq_ignore_ascii_case(play_session_id)
+    } else if !device_id.is_empty() {
+        session.play_session_id.is_empty() && session.device_id.eq_ignore_ascii_case(device_id)
+    } else {
+        session.play_session_id.is_empty() && session.device_id.is_empty()
+    }
+}
+
+/// Kill a removed session's ffmpeg and delete its files.
+async fn end_session(mut session: TranscodeSession) {
+    if let Some(mut child) = session.child.take() {
+        let _ = child.kill().await;
+    }
+    let _ = tokio::fs::remove_dir_all(&session.output_dir).await;
+    debug!(playback_id = %session.playback_id, "Stopped transcode session");
+}
+
+/// Read ffmpeg's stderr until it closes. Each line goes to the debug log, and the last
+/// `STDERR_TAIL_LINES` lines (cut to 300 chars) are kept for error reports.
+async fn drain_stderr<R: tokio::io::AsyncRead + Unpin>(
+    reader: R,
+    playback_id: Uuid,
+    tail: Arc<std::sync::Mutex<VecDeque<String>>>,
+) {
+    let mut reader = BufReader::new(reader);
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        let read = match reader.read_until(b'\n', &mut buf).await {
+            Ok(read) => read,
+            Err(_) => break,
+        };
+        if read == 0 {
+            break;
+        }
+        let text = String::from_utf8_lossy(&buf);
+        let line = text.trim_end();
+        if line.is_empty() {
+            continue;
+        }
+        debug!(playback_id = %playback_id, "ffmpeg: {line}");
+        let kept: String = line.chars().take(300).collect();
+        let mut tail = tail.lock().unwrap();
+        tail.push_back(kept);
+        while tail.len() > STDERR_TAIL_LINES {
+            tail.pop_front();
         }
     }
 }
@@ -318,11 +588,15 @@ fn build_ffmpeg_args(
 ) -> Vec<String> {
     let mut args: Vec<String> = Vec::new();
 
-    // Overwrite output without asking
+    // Overwrite output without asking; keep the banner and progress lines out of stderr
     args.push("-y".to_string());
+    args.extend(["-hide_banner".to_string(), "-nostats".to_string()]);
 
-    // Hardware acceleration input flags (skip for audio-only)
-    if !profile.audio_only {
+    // Burn-in needs a re-encode, so it turns the video copy off
+    let copy_video = profile.copy_video && !profile.audio_only && !profile.burn_subtitles;
+
+    // Hardware acceleration input flags (skip for audio-only and copied video)
+    if !profile.audio_only && !copy_video {
         match profile.hw_accel {
             HwAccel::Vaapi => {
                 args.extend([
@@ -358,11 +632,10 @@ fn build_ffmpeg_args(
     args.extend(["-i".to_string(), input.to_string()]);
 
     if profile.audio_only {
-        // Audio-only transcoding: no video stream
-        args.extend([
-            "-an".to_string(), // no video (redundant with -vn, but explicit)
-            "-vn".to_string(), // disable video
-        ]);
+        // Audio-only transcoding: drop the video only. -an would drop the audio too.
+        args.push("-vn".to_string());
+    } else if copy_video {
+        args.extend(["-c:v".to_string(), "copy".to_string()]);
     } else {
         // Video codec
         let video_codec = match profile.hw_accel {
@@ -436,14 +709,18 @@ fn build_ffmpeg_args(
         args.extend(["-map".to_string(), format!("0:a:{}", audio_idx)]);
     }
 
-    args.extend([
-        "-c:a".to_string(),
-        profile.audio_codec.clone(),
-        "-b:a".to_string(),
-        format!("{}k", profile.max_audio_bitrate_kbps),
-        "-ac".to_string(),
-        "2".to_string(),
-    ]);
+    if profile.copy_audio {
+        args.extend(["-c:a".to_string(), "copy".to_string()]);
+    } else {
+        args.extend([
+            "-c:a".to_string(),
+            profile.audio_codec.clone(),
+            "-b:a".to_string(),
+            format!("{}k", profile.max_audio_bitrate_kbps),
+            "-ac".to_string(),
+            "2".to_string(),
+        ]);
+    }
 
     // HLS output settings
     args.extend([
@@ -465,8 +742,8 @@ fn build_ffmpeg_args(
         "0".to_string(),
     ]);
 
-    // Preset for speed (skip for HW accel)
-    if profile.hw_accel == HwAccel::None && !profile.audio_only {
+    // Preset for speed (skip for HW accel, audio-only and copied video)
+    if profile.hw_accel == HwAccel::None && !profile.audio_only && !copy_video {
         args.extend(["-preset".to_string(), "veryfast".to_string()]);
     }
 
@@ -556,6 +833,12 @@ pub enum TranscodeError {
 
     #[error("Transcode session not found for item {0}")]
     SessionNotFound(Uuid),
+
+    #[error("ffmpeg failed: {0}")]
+    FfmpegFailed(String),
+
+    #[error("ffmpeg has not written a playlist yet")]
+    PlaylistTimeout,
 }
 
 // ---------------------------------------------------------------------------
@@ -639,5 +922,436 @@ mod tests {
     async fn test_transcode_manager_new() {
         let mgr = TranscodeManager::new(Path::new("/tmp/test_rustyfin"));
         assert!(!mgr.is_active(Uuid::new_v4()).await);
+    }
+
+    /// True when `args` holds `flag` directly followed by `value`.
+    fn has_pair(args: &[String], flag: &str, value: &str) -> bool {
+        args.windows(2).any(|w| w[0] == flag && w[1] == value)
+    }
+
+    fn args_for(profile: &TranscodeProfile) -> Vec<String> {
+        build_ffmpeg_args("/input.mkv", "/out/main.m3u8", "/out/seg_%04d.ts", profile)
+    }
+
+    #[test]
+    fn test_build_ffmpeg_args_quiet() {
+        let args = args_for(&TranscodeProfile::default());
+        assert!(args.contains(&"-hide_banner".to_string()), "{args:?}");
+        assert!(args.contains(&"-nostats".to_string()), "{args:?}");
+        assert_eq!(args.last().unwrap(), "/out/main.m3u8");
+    }
+
+    #[test]
+    fn test_build_ffmpeg_args_audio_only_drops_video_only() {
+        for hw_accel in [HwAccel::None, HwAccel::Vaapi] {
+            let profile = TranscodeProfile {
+                audio_only: true,
+                copy_video: true,
+                hw_accel,
+                ..Default::default()
+            };
+            let args = args_for(&profile);
+            assert!(args.contains(&"-vn".to_string()), "{args:?}");
+            assert!(
+                !args.contains(&"-an".to_string()),
+                "-an drops the audio too: {args:?}"
+            );
+            assert!(!args.contains(&"-c:v".to_string()), "{args:?}");
+            assert!(!args.contains(&"-hwaccel".to_string()), "{args:?}");
+            assert!(has_pair(&args, "-c:a", "aac"), "{args:?}");
+            assert_eq!(args.last().unwrap(), "/out/main.m3u8");
+        }
+    }
+
+    #[test]
+    fn test_build_ffmpeg_args_copy_video() {
+        for hw_accel in [HwAccel::None, HwAccel::Vaapi, HwAccel::Nvenc, HwAccel::Qsv] {
+            let profile = TranscodeProfile {
+                copy_video: true,
+                hw_accel,
+                ..Default::default()
+            };
+            let args = args_for(&profile);
+            assert!(has_pair(&args, "-c:v", "copy"), "{hw_accel:?}: {args:?}");
+            for flag in [
+                "-b:v",
+                "-maxrate",
+                "-bufsize",
+                "-vf",
+                "-filter_complex",
+                "-preset",
+                "-hwaccel",
+                "-hwaccel_output_format",
+                "-vaapi_device",
+                "-init_hw_device",
+            ] {
+                assert!(
+                    !args.iter().any(|a| a == flag),
+                    "{hw_accel:?}: {flag} in {args:?}"
+                );
+            }
+            assert!(
+                !args.iter().any(|a| a.starts_with("h264_")),
+                "{hw_accel:?}: {args:?}"
+            );
+            // The audio is still encoded to stereo AAC.
+            assert!(has_pair(&args, "-c:a", "aac"), "{args:?}");
+            assert!(has_pair(&args, "-b:a", "192k"), "{args:?}");
+            assert!(has_pair(&args, "-ac", "2"), "{args:?}");
+            assert_eq!(args.last().unwrap(), "/out/main.m3u8");
+        }
+    }
+
+    #[test]
+    fn test_build_ffmpeg_args_burn_in_overrides_copy_video() {
+        let profile = TranscodeProfile {
+            copy_video: true,
+            burn_subtitles: true,
+            subtitle_stream_index: Some(0),
+            ..Default::default()
+        };
+        let args = args_for(&profile);
+        assert!(has_pair(&args, "-c:v", "libx264"), "{args:?}");
+        assert!(args.contains(&"-vf".to_string()), "{args:?}");
+    }
+
+    #[test]
+    fn test_build_ffmpeg_args_copy_audio() {
+        let profile = TranscodeProfile {
+            copy_audio: true,
+            ..Default::default()
+        };
+        let args = args_for(&profile);
+        assert!(has_pair(&args, "-c:a", "copy"), "{args:?}");
+        assert!(!args.contains(&"-b:a".to_string()), "{args:?}");
+        assert!(!args.contains(&"-ac".to_string()), "{args:?}");
+        assert!(has_pair(&args, "-c:v", "libx264"), "{args:?}");
+    }
+
+    #[tokio::test]
+    async fn test_drain_stderr_survives_long_and_invalid_output() {
+        let mut data = Vec::new();
+        for i in 0..2000 {
+            data.extend_from_slice(format!("frame={i} {}\n", "x".repeat(40)).as_bytes());
+        }
+        data.extend_from_slice(b"bad \xff\xfe bytes\n");
+        data.extend_from_slice(&[b'y'; 1000]);
+        data.extend_from_slice(b"\n\n\r\n");
+        data.extend_from_slice(b"g4 last line");
+        let tail = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+
+        drain_stderr(&data[..], Uuid::new_v4(), tail.clone()).await;
+
+        let tail = tail.lock().unwrap();
+        assert_eq!(tail.len(), STDERR_TAIL_LINES);
+        assert_eq!(tail.back().map(String::as_str), Some("g4 last line"));
+        assert!(
+            tail.iter()
+                .any(|l| l.starts_with("bad ") && l.contains('\u{fffd}')),
+            "{tail:?}"
+        );
+        assert!(
+            tail.iter()
+                .any(|l| l.len() == 300 && l.bytes().all(|b| b == b'y')),
+            "{tail:?}"
+        );
+        assert!(!tail.iter().any(|l| l.trim().is_empty()), "{tail:?}");
+    }
+
+    // ── Sessions, run against fake ffmpeg scripts ──
+
+    const SEGMENT: &str = "segment_0000.ts";
+
+    /// Writes one segment and the playlist next to its last argument, then keeps running.
+    const FAKE_GOOD: &str = r#"#!/bin/sh
+for last; do :; done
+dir=$(dirname "$last")
+printf 'g4' > "$dir/segment_0000.ts"
+printf '#EXTM3U\n#EXTINF:6.0,\nsegment_0000.ts\n' > "$last"
+exec sleep 30
+"#;
+
+    /// Fails the way ffmpeg does on a file it cannot read.
+    const FAKE_FAIL: &str = r#"#!/bin/sh
+echo "fake ffmpeg starting" >&2
+echo "/in.mkv: Invalid data found when processing input" >&2
+exit 1
+"#;
+
+    /// Never writes a playlist.
+    const FAKE_SLOW: &str = "#!/bin/sh\nexec sleep 30\n";
+
+    /// Writes about 260 KiB to stderr before its playlist; with stderr piped and never read it
+    /// blocks for good once the 64 KiB pipe is full.
+    const FAKE_NOISY: &str = r#"#!/bin/sh
+for last; do :; done
+dir=$(dirname "$last")
+i=0
+while [ "$i" -lt 3000 ]; do
+    echo "frame=$i fps=25 q=28.0 size=1024kB time=00:00:01.00 bitrate=8000.0kbits/s speed=1x" >&2
+    i=$((i + 1))
+done
+printf 'g4' > "$dir/segment_0000.ts"
+printf '#EXTM3U\n' > "$last"
+exec sleep 30
+"#;
+
+    /// Returns the path of the fake ffmpeg `name`. The scripts are written once per test
+    /// process, before any test runs one, so no spawn meets a script still open for writing
+    /// (ETXTBSY). They live in one fixed directory that later runs overwrite.
+    #[cfg(unix)]
+    fn fake_ffmpeg(name: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        let dir = DIR.get_or_init(|| {
+            let dir = std::env::temp_dir().join("rustyfin-core-fake-ffmpeg");
+            std::fs::create_dir_all(&dir).unwrap();
+            for (name, script) in [
+                ("good", FAKE_GOOD),
+                ("fail", FAKE_FAIL),
+                ("slow", FAKE_SLOW),
+                ("noisy", FAKE_NOISY),
+            ] {
+                // Rename into place: another test process may be running the old file.
+                let tmp = dir.join(format!("{name}.{}", std::process::id()));
+                std::fs::write(&tmp, script).unwrap();
+                std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
+                std::fs::rename(&tmp, dir.join(name)).unwrap();
+            }
+            dir
+        });
+        dir.join(name)
+    }
+
+    /// Removes a test's data dir when dropped.
+    struct TestDir(PathBuf);
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A manager on a fresh data dir that runs the fake ffmpeg `script` and waits at most `wait`
+    /// for a playlist.
+    #[cfg(unix)]
+    fn fake_manager(script: &str, wait: Duration) -> (TestDir, TranscodeManager) {
+        let dir = TestDir(std::env::temp_dir().join(format!("rustyfin-g4-{}", Uuid::new_v4())));
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let mut mgr = TranscodeManager::new(&dir.0);
+        mgr.ffmpeg = fake_ffmpeg(script);
+        mgr.playlist_wait = wait;
+        (dir, mgr)
+    }
+
+    async fn start(
+        mgr: &TranscodeManager,
+        item: Uuid,
+        play_session_id: &str,
+        device_id: &str,
+    ) -> Result<(PathBuf, Uuid), TranscodeError> {
+        let profile = TranscodeProfile::default();
+        mgr.start_transcode(item, "/in.mkv", &profile, play_session_id, device_id)
+            .await
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_two_play_sessions_do_not_collide() {
+        let (_dir, mgr) = fake_manager("good", Duration::from_secs(10));
+        let item = Uuid::new_v4();
+        let (playlist_a, a) = start(&mgr, item, "psid-a", "dev").await.unwrap();
+        let (playlist_b, b) = start(&mgr, item, "psid-b", "dev").await.unwrap();
+        assert_ne!(a, b);
+        assert_ne!(playlist_a.parent(), playlist_b.parent());
+        assert!(playlist_a.exists() && playlist_b.exists());
+
+        // The same play session, in any case, gets its own transcode back.
+        let (_, again) = start(&mgr, item, "PSID-A", "dev").await.unwrap();
+        assert_eq!(again, a);
+        assert_eq!(mgr.sessions.len(), 2);
+
+        assert!(mgr.segment_path(item, a, SEGMENT).is_some());
+        assert!(mgr.segment_path(item, b, SEGMENT).is_some());
+        // A playback id serves only its own item.
+        assert!(mgr.segment_path(Uuid::new_v4(), b, SEGMENT).is_none());
+
+        // Stopping one viewer leaves the other.
+        assert_eq!(mgr.stop_play_session(Some(item), "psid-a", "").await, 1);
+        assert!(mgr.segment_path(item, a, SEGMENT).is_none());
+        assert!(
+            !playlist_a.exists(),
+            "a stopped session's files are deleted"
+        );
+        assert!(mgr.segment_path(item, b, SEGMENT).is_some());
+        assert!(mgr.is_active(item).await);
+
+        mgr.stop_all().await;
+        assert!(!mgr.is_active(item).await);
+        assert!(!playlist_b.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_stop_by_device_and_keyless() {
+        let (_dir, mgr) = fake_manager("good", Duration::from_secs(10));
+        let item = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let (_, d1) = start(&mgr, item, "", "dev-1").await.unwrap();
+        let (_, d2) = start(&mgr, item, "", "dev-2").await.unwrap();
+        let (_, p2) = start(&mgr, item, "psid-2", "dev-2").await.unwrap();
+        let (_, keyless) = start(&mgr, item, "", "").await.unwrap();
+        let (_, other_keyless) = start(&mgr, other, "", "").await.unwrap();
+        // Without a PlaySessionId the DeviceId names the session; without either, the item's
+        // unnamed session is reused.
+        assert_eq!(start(&mgr, item, "", "DEV-1").await.unwrap().1, d1);
+        assert_eq!(start(&mgr, item, "", "").await.unwrap().1, keyless);
+        assert_eq!(mgr.sessions.len(), 5);
+
+        // A DeviceId stops all of that device's sessions, with a PlaySessionId or without.
+        assert_eq!(mgr.stop_play_session(None, "", "dev-2").await, 2);
+        assert!(mgr.segment_path(item, d2, SEGMENT).is_none());
+        assert!(mgr.segment_path(item, p2, SEGMENT).is_none());
+        assert!(mgr.segment_path(item, d1, SEGMENT).is_some());
+
+        // No names and no item stops nothing.
+        assert_eq!(mgr.stop_play_session(None, "", "").await, 0);
+        // No names with an item stops only that item's unnamed sessions.
+        assert_eq!(mgr.stop_play_session(Some(item), "", "").await, 1);
+        assert!(mgr.segment_path(item, keyless, SEGMENT).is_none());
+        assert!(mgr.segment_path(item, d1, SEGMENT).is_some());
+        assert!(mgr.segment_path(other, other_keyless, SEGMENT).is_some());
+
+        // An item restricts a named stop to that item.
+        assert_eq!(mgr.stop_play_session(Some(other), "", "dev-1").await, 0);
+        assert!(mgr.segment_path(item, d1, SEGMENT).is_some());
+
+        mgr.stop_all().await;
+        assert_eq!(mgr.sessions.len(), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_ffmpeg_exit_error_is_returned() {
+        let (dir, mgr) = fake_manager("fail", Duration::from_secs(20));
+        let item = Uuid::new_v4();
+        let started = std::time::Instant::now();
+        let err = start(&mgr, item, "psid", "").await.unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "waited {:?} for an ffmpeg that had exited",
+            started.elapsed()
+        );
+        match err {
+            TranscodeError::FfmpegFailed(msg) => {
+                assert!(
+                    msg.contains("Invalid data found when processing input"),
+                    "{msg}"
+                )
+            }
+            other => panic!("expected FfmpegFailed, got {other:?}"),
+        }
+        // The failed session is gone, files and all.
+        assert!(!mgr.is_active(item).await);
+        let left: Vec<_> = std::fs::read_dir(dir.0.join("transcodes"))
+            .map(|d| d.flatten().map(|e| e.path()).collect())
+            .unwrap_or_default();
+        assert!(left.is_empty(), "{left:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_playlist_wait_is_bounded() {
+        let (_dir, mgr) = fake_manager("slow", Duration::from_secs(1));
+        let item = Uuid::new_v4();
+        let started = std::time::Instant::now();
+        let err = start(&mgr, item, "psid", "").await.unwrap_err();
+        let waited = started.elapsed();
+        assert!(matches!(err, TranscodeError::PlaylistTimeout), "{err:?}");
+        assert!(
+            waited >= Duration::from_secs(1) && waited < Duration::from_secs(5),
+            "{waited:?}"
+        );
+        // ffmpeg keeps running, and a retry waits on the same transcode.
+        assert!(mgr.is_active(item).await);
+        let retry = start(&mgr, item, "psid", "").await;
+        assert!(
+            matches!(retry, Err(TranscodeError::PlaylistTimeout)),
+            "{retry:?}"
+        );
+        assert_eq!(mgr.sessions.len(), 1);
+        mgr.stop_all().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_noisy_stderr_does_not_stall() {
+        let (_dir, mgr) = fake_manager("noisy", Duration::from_secs(20));
+        let item = Uuid::new_v4();
+        let (playlist, id) = start(&mgr, item, "psid", "")
+            .await
+            .expect("ffmpeg must not block on a full stderr pipe");
+        assert!(playlist.exists());
+        assert!(mgr.segment_path(item, id, SEGMENT).is_some());
+        mgr.stop_all().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_cleanup_uses_last_access() {
+        let (_dir, mgr) = fake_manager("good", Duration::from_secs(10));
+        let item = Uuid::new_v4();
+        let (_, a) = start(&mgr, item, "a", "").await.unwrap();
+        let (playlist_b, b) = start(&mgr, item, "b", "").await.unwrap();
+        // Two hours on: A was requested a minute ago, B not since it started.
+        let now = std::time::Instant::now() + Duration::from_secs(7200);
+        mgr.sessions.get_mut(&a).unwrap().last_access = now - Duration::from_secs(60);
+
+        assert_eq!(
+            mgr.cleanup_idle_sessions(now, Duration::from_secs(600))
+                .await,
+            1
+        );
+        assert!(
+            mgr.segment_path(item, a, SEGMENT).is_some(),
+            "a session that is still requested stays, however old"
+        );
+        assert!(mgr.segment_path(item, b, SEGMENT).is_none());
+        assert!(!playlist_b.exists());
+        mgr.stop_all().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_requests_touch_session() {
+        let (_dir, mgr) = fake_manager("good", Duration::from_secs(10));
+        let item = Uuid::new_v4();
+        let (_, a) = start(&mgr, item, "a", "").await.unwrap();
+        let last_access = |mgr: &TranscodeManager| mgr.sessions.get(&a).unwrap().last_access;
+
+        let before = last_access(&mgr);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(mgr.segment_path(item, a, SEGMENT).is_some());
+        let after_segment = last_access(&mgr);
+        assert!(
+            after_segment > before,
+            "a segment request touches the session"
+        );
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        start(&mgr, item, "a", "").await.unwrap();
+        let after_playlist = last_access(&mgr);
+        assert!(
+            after_playlist > after_segment,
+            "a playlist request touches the session"
+        );
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(mgr.legacy_segment_path(item, SEGMENT).is_some());
+        assert!(
+            last_access(&mgr) > after_playlist,
+            "a legacy segment request touches the session"
+        );
+        mgr.stop_all().await;
     }
 }
