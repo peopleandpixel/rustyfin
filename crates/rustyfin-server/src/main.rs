@@ -1,3 +1,5 @@
+mod credentials;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tower::Service;
@@ -84,8 +86,7 @@ async fn main() {
     let db_url = std::env::var("RUSTYFIN_DB")
         .unwrap_or_else(|_| data_dir.join("rustyfin.db").display().to_string());
 
-    let jwt_secret =
-        std::env::var("RUSTYFIN_SECRET").unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
+    let jwt_secret = credentials::jwt_secret(std::env::var("RUSTYFIN_SECRET").ok());
 
     let server_id =
         std::env::var("RUSTYFIN_SERVER_ID").unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
@@ -96,7 +97,7 @@ async fn main() {
     let tls_cert = std::env::var("RUSTYFIN_TLS_CERT").ok();
     let tls_key = std::env::var("RUSTYFIN_TLS_KEY").ok();
 
-    let api_key = std::env::var("RUSTYFIN_API_KEY").ok();
+    let api_key = credentials::api_key(std::env::var("RUSTYFIN_API_KEY").ok());
 
     // Load or create server configuration
     let config = load_config(&data_dir);

@@ -67,9 +67,11 @@ services:
     environment:
       - RUSTYFIN_DATA=/data
       - RUSTYFIN_BIND=0.0.0.0:8096
-      - RUSTYFIN_SECRET=ein-sicherer-geheimer-schluessel
+      # Eigene Zufallswerte eintragen, z. B. die Ausgabe von: openssl rand -hex 32
+      - RUSTYFIN_SECRET=<zufallswert>
       - RUSTYFIN_SERVER_ID=feste-server-id
-      - RUSTYFIN_API_KEY=mein-api-key
+      # Optional, für Integrationen. Ein leerer Wert schaltet den API-Key ab.
+      - RUSTYFIN_API_KEY=<anderer-zufallswert>
       - RUST_LOG=info
     restart: unless-stopped
     healthcheck:

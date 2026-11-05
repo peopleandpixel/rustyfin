@@ -45,6 +45,11 @@ fn request_claims(state: &AppState, req: &Request) -> Result<Claims, ApiError> {
         })
         .ok_or(ApiError::Unauthorized)?;
 
+    // An empty token never authenticates, whatever the configured key.
+    if token.trim().is_empty() {
+        return Err(ApiError::Unauthorized);
+    }
+
     // Check if the token matches a configured API key
     if let Some(ref api_key) = state.api_key
         && token == **api_key

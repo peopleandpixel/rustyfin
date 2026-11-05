@@ -13,9 +13,9 @@ Rustyfin wird über Umgebungsvariablen konfiguriert. Es sind keine Konfiguration
 | `RUSTYFIN_BIND` | Adresse und Port, auf dem der Server lauscht | `0.0.0.0:8096` |
 | `RUSTYFIN_DATA` | Datenverzeichnis (Datenbank, Cache, Konfiguration, Logs) | `~/.rustyfin` |
 | `RUSTYFIN_DB` | SQLite-Datenbank-URL | `sqlite://<data_dir>/rustyfin.db?mode=rwc` |
-| `RUSTYFIN_SECRET` | JWT-Signierungsschlüssel | Zufällige UUID (bei jedem Start neu generiert) |
+| `RUSTYFIN_SECRET` | JWT-Signierungsschlüssel (ein leerer Wert gilt als nicht gesetzt) | Zufällige UUID (bei jedem Start neu generiert) |
 | `RUSTYFIN_SERVER_ID` | Eindeutige Server-Kennung | Zufällige UUID (bei jedem Start neu generiert) |
-| `RUSTYFIN_API_KEY` | Statischer API-Key für externe Integrationen | *(deaktiviert)* |
+| `RUSTYFIN_API_KEY` | Statischer API-Key für externe Integrationen (ein leerer Wert schaltet ihn ab) | *(deaktiviert)* |
 | `RUST_LOG` | Log-Level-Filter (z.B. `debug`, `info`, `rustyfin=trace`) | `info` |
 
 ## Beispielkonfigurationen
@@ -33,9 +33,10 @@ Startet mit allen Standardwerten. Der Server lauscht auf Port 8096 und speichert
 ```bash
 export RUSTYFIN_BIND=127.0.0.1:8096
 export RUSTYFIN_DATA=/srv/rustyfin
-export RUSTYFIN_SECRET=ein-sicherer-geheimer-schluessel
+# Eigene Zufallswerte eintragen, z. B. die Ausgabe von: openssl rand -hex 32
+export RUSTYFIN_SECRET='<zufallswert>'
 export RUSTYFIN_SERVER_ID=feste-server-id-hier
-export RUSTYFIN_API_KEY=mein-api-key
+export RUSTYFIN_API_KEY='<anderer-zufallswert>'
 export RUST_LOG=info
 
 ./target/release/rustyfin
@@ -112,10 +113,10 @@ Rustyfin verwendet JWT-Token zur Authentifizierung. Der Signierungsschlüssel wi
 
 ### API-Key
 
-Ein statischer API-Key kann über `RUSTYFIN_API_KEY` gesetzt werden. Dieser kann für externe Integrationen verwendet werden:
+Ein statischer API-Key kann über `RUSTYFIN_API_KEY` gesetzt werden, zum Beispiel ein mit `openssl rand -hex 32` erzeugter Zufallswert. Ein leerer Wert schaltet den API-Key ab. Der Key kann für externe Integrationen verwendet werden:
 
 ```bash
-curl -H "Authorization: MediaBrowser Token=mein-api-key" \
+curl -H "Authorization: MediaBrowser Token=<api-key>" \
   http://localhost:8096/System/Info
 ```
 

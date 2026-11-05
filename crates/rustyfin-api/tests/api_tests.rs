@@ -278,6 +278,174 @@ async fn test_protected_endpoint_with_invalid_token() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
+// ── B8: API key ──
+// An empty or blank token never authenticates, whatever the configured API key is, and the
+// websocket accepts the API key or a user token.
+
+/// A copy of `base` with `key` as the configured API key.
+fn b8_with_key(base: &AppState, key: Option<&str>) -> AppState {
+    let mut state = base.clone();
+    state.api_key = key.map(|key| Arc::new(key.to_string()));
+    state
+}
+
+/// The statuses of `GET /System/Configuration` with `key` as the API key and `token` sent as the
+/// `api_key` query value and as `X-Emby-Token`.
+async fn b8_statuses(base: &AppState, key: Option<&str>, token: &str) -> (StatusCode, StatusCode) {
+    let state = b8_with_key(base, key);
+    let query = app(state.clone())
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/System/Configuration?api_key={}",
+                    token.replace(' ', "%20")
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status();
+    let header = app(state)
+        .oneshot(
+            Request::builder()
+                .uri("/System/Configuration")
+                .header("X-Emby-Token", token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status();
+    (query, header)
+}
+
+/// Serves the router on a free local port and returns the status of a websocket upgrade of
+/// `/socket{query}`: 101 when the server accepts it.
+async fn b8_socket_status(state: AppState, query: &str) -> u16 {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app(state)).await.unwrap() });
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let request = format!(
+        "GET /socket{query} HTTP/1.1\r\nHost: {addr}\r\nConnection: Upgrade\r\n\
+         Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\
+         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut reader = tokio::io::BufReader::new(stream);
+    let mut status_line = String::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        reader.read_line(&mut status_line),
+    )
+    .await
+    .expect("no answer to the websocket upgrade")
+    .unwrap();
+    status_line
+        .split(' ')
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .unwrap_or_else(|| panic!("bad status line {status_line:?}"))
+}
+
+#[tokio::test]
+async fn test_b8_empty_token_never_authenticates_http() {
+    let base = test_state().await;
+    let unauthorized = StatusCode::UNAUTHORIZED;
+    // (key, token, expected). For an empty or blank key the right token is the key itself.
+    let cases = [
+        (Some(""), "", unauthorized),
+        (Some(""), "wrong-key", unauthorized),
+        (Some("   "), "", unauthorized),
+        (Some("   "), "   ", unauthorized),
+        (Some("   "), "wrong-key", unauthorized),
+        (Some("b8-key"), "", unauthorized),
+        (Some("b8-key"), "   ", unauthorized),
+        (Some("b8-key"), "wrong-key", unauthorized),
+        (Some("b8-key"), "b8-key", StatusCode::OK),
+        (None, "", unauthorized),
+        (None, "   ", unauthorized),
+        (None, "wrong-key", unauthorized),
+    ];
+    for (key, token, expected) in cases {
+        let (query, header) = b8_statuses(&base, key, token).await;
+        assert_eq!(query, expected, "api_key={token:?} with key {key:?}");
+        assert_eq!(header, expected, "X-Emby-Token {token:?} with key {key:?}");
+    }
+    std::fs::remove_dir_all(base.data_dir.as_path()).ok();
+}
+
+#[tokio::test]
+async fn test_b8_socket_rejects_an_empty_token() {
+    let base = test_state().await;
+    let empty_tokens = [
+        "?api_key=",
+        "?token=",
+        "?authorization=",
+        "?authorization=Bearer%20",
+        "?api_key=%20%20%20",
+    ];
+    for key in [Some(""), Some("   "), Some("b8-key"), None] {
+        for query in empty_tokens {
+            let status = b8_socket_status(b8_with_key(&base, key), query).await;
+            assert_eq!(status, 401, "{query} with key {key:?}");
+        }
+    }
+    // The key still opens the socket
+    let state = b8_with_key(&base, Some("b8-key"));
+    assert_eq!(b8_socket_status(state, "?api_key=b8-key").await, 101);
+    std::fs::remove_dir_all(base.data_dir.as_path()).ok();
+}
+
+#[tokio::test]
+async fn test_b8_socket_accepts_a_user_token_while_an_api_key_is_set() {
+    let base = test_state().await;
+    let user = rustyfin_model::user::User {
+        id: uuid::Uuid::new_v4(),
+        name: "b8-user".to_string(),
+        password_hash: String::new(),
+        is_administrator: false,
+        created_at: chrono::Utc::now(),
+        last_login_date: None,
+        configuration: serde_json::Value::Null,
+    };
+    let token = rustyfin_auth::create_token(&user, &base.jwt_secret).unwrap();
+    let foreign = rustyfin_auth::create_token(&user, "another-secret").unwrap();
+    for key in [Some("b8-key"), None] {
+        let state = b8_with_key(&base, key);
+        // The web client sends `authorization=Bearer <token>`, Jellyfin clients `api_key=<token>`
+        let web = format!("?authorization=Bearer%20{token}");
+        assert_eq!(
+            b8_socket_status(state.clone(), &web).await,
+            101,
+            "key {key:?}"
+        );
+        let jellyfin = format!("?api_key={token}");
+        assert_eq!(
+            b8_socket_status(state.clone(), &jellyfin).await,
+            101,
+            "key {key:?}"
+        );
+        let signed_elsewhere = format!("?api_key={foreign}");
+        assert_eq!(
+            b8_socket_status(state.clone(), &signed_elsewhere).await,
+            401,
+            "key {key:?}"
+        );
+        assert_eq!(
+            b8_socket_status(state, "?api_key=wrong-key").await,
+            401,
+            "key {key:?}"
+        );
+    }
+    let state = b8_with_key(&base, Some("b8-key"));
+    assert_eq!(b8_socket_status(state, "?api_key=b8-key").await, 101);
+    std::fs::remove_dir_all(base.data_dir.as_path()).ok();
+}
+
 // ── Error Response Format Tests ──
 
 #[tokio::test]
