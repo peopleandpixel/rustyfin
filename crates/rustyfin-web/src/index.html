@@ -410,13 +410,17 @@
                 <div id="add-lib-selected-paths" class="mt-2 space-y-1"></div>
                 <p class="text-[11px] text-white/30 mt-1" data-i18n="library.paths_hint">Or separate multiple paths with commas: /media/movies, /srv/movies</p>
             </div>
-            <!-- Directory Picker Modal (inline) -->
+            <!-- Folder picker (inline): the field shows the open folder; type a path and press Enter to open it -->
             <div id="directory-picker" class="hidden">
                 <div class="flex items-center gap-2 mb-2">
                     <button type="button" class="jf-btn-ghost !px-2 !py-1 text-xs" onclick="directoryPickerBack()" data-i18n="wizard.back">← Back</button>
-                    <span id="directory-picker-path" class="text-xs text-white/60 font-mono truncate">/</span>
+                    <input id="directory-picker-path" type="text" value="/" class="jf-input flex-1 !py-1 text-xs font-mono" spellcheck="false" autocomplete="off" aria-label="Folder path" data-i18n-aria-label="library.folder_path" onkeydown="directoryPickerPathKeydown(event)">
+                    <button type="button" class="jf-btn-ghost !px-2 !py-1 text-xs" onclick="closeDirectoryPicker()" data-i18n="common.close">Close</button>
                 </div>
                 <div id="directory-picker-list" class="max-h-48 overflow-y-auto space-y-0.5 border border-white/10 rounded-lg"></div>
+                <div class="flex justify-end mt-2">
+                    <button type="button" class="jf-btn-primary !px-3 !py-1.5 text-xs" onclick="selectCurrentDirectory()" data-i18n="library.select_folder">Select this folder</button>
+                </div>
             </div>
             <p id="add-lib-error" role="alert" class="hidden text-xs text-red-400 bg-red-500/10 rounded-lg px-3 py-2"></p>
             <div class="flex justify-end gap-2 pt-3 border-t border-white/10">
@@ -479,19 +483,20 @@
     </div>
 </dialog>
 
+<!-- Resume or start over, opened by playWithResumeChoice for a video with a resume point -->
+<dialog id="resume-menu" class="modal bg-black/70 backdrop-blur-md">
+    <div class="modal-box max-w-xs jf-menu rounded-2xl p-5">
+        <h3 id="resume-menu-title" class="text-base font-bold text-white mb-4 truncate"></h3>
+        <form method="dialog" class="flex flex-col gap-2">
+            <button id="resume-menu-resume" value="resume" class="jf-btn-primary w-full text-sm" autofocus></button>
+            <button value="start" class="jf-btn-ghost w-full text-sm" data-i18n="player.start_from_beginning">Start from beginning</button>
+        </form>
+    </div>
+    <form method="dialog" class="modal-backdrop"><button data-i18n="common.backdrop_close">close</button></form>
+</dialog>
+
 <!-- Toast notification container -->
 <div id="toast-container" class="fixed bottom-5 right-5 z-[200] space-y-2 pointer-events-none"></div>
-
-<!-- Scan progress overlay -->
-<div id="scan-progress" class="hidden fixed top-0 left-0 right-0 z-[150] bg-[#00a4dc]/20 backdrop-blur-sm border-b border-[#00a4dc]/30">
-    <div class="max-w-4xl mx-auto px-4 py-2 flex items-center gap-3">
-        <svg class="animate-spin w-4 h-4 text-[#00a4dc]" fill="none" viewBox="0 0 24 24">
-            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
-            <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-        </svg>
-        <span id="scan-progress-text" class="text-sm text-white font-medium">Scanning library…</span>
-    </div>
-</div>
 
 <script type="module" src="./main.js"></script>
 <script src="./api.js"></script>

@@ -1665,6 +1665,87 @@ async fn test_create_library_with_no_paths_still_works() {
     );
 }
 
+// ── B14: symlinked folders in the folder picker ──
+// `GET /Library/BrowseDirectories` lists a symlink that resolves to a folder, under
+// the link's own path, as the scanner follows such links. Dangling links and links
+// to files stay hidden. The route lists only allowed roots such as /home, so the
+// test's folders are made under $HOME.
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_browse_directories_lists_symlinked_folders() {
+    /// Removes the test's folder under $HOME when the test ends, even if it fails.
+    struct RemoveDir(std::path::PathBuf);
+    impl Drop for RemoveDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+        eprintln!("skipped: HOME is not set");
+        return;
+    };
+    if !home.starts_with("/home") {
+        eprintln!(
+            "skipped: HOME {} is not under /home, which BrowseDirectories lists",
+            home.display()
+        );
+        return;
+    }
+    let root = home.join(format!(".rustyfin-b14-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir(&root).unwrap();
+    let _remove = RemoveDir(root.clone());
+    let target = root.join("target");
+    let listed = root.join("listed");
+    std::fs::create_dir(&target).unwrap();
+    std::fs::create_dir_all(listed.join("Real Films")).unwrap();
+    std::fs::write(listed.join("film.mkv"), b"not a folder").unwrap();
+    std::os::unix::fs::symlink(&target, listed.join("Linked Films")).unwrap();
+    std::os::unix::fs::symlink(root.join("missing"), listed.join("Dangling Link")).unwrap();
+    std::os::unix::fs::symlink(listed.join("film.mkv"), listed.join("Link To File")).unwrap();
+
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let app = app(state);
+    let parent: String = listed
+        .to_str()
+        .unwrap()
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'.' | b'-' | b'_' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect();
+    let (status, body) = send_authed(
+        &app,
+        "GET",
+        &format!("/Library/BrowseDirectories?parent={parent}"),
+        &token,
+        None,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "browse: {body}");
+    assert_eq!(
+        body,
+        serde_json::json!([
+            {
+                "path": listed.join("Linked Films").to_str().unwrap(),
+                "name": "Linked Films",
+                "can_read": true,
+            },
+            {
+                "path": listed.join("Real Films").to_str().unwrap(),
+                "name": "Real Films",
+                "can_read": true,
+            },
+        ])
+    );
+}
+
 // ── Search Endpoint Tests ──
 
 #[tokio::test]

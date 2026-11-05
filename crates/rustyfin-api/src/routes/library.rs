@@ -590,7 +590,11 @@ async fn browse_directories(
             let Ok(file_type) = entry.file_type() else {
                 continue;
             };
-            if file_type.is_dir() {
+            // Follow links as the library scan does, so linked folders appear in the picker.
+            let is_dir = file_type.is_dir()
+                || (file_type.is_symlink()
+                    && std::fs::metadata(entry.path()).is_ok_and(|m| m.is_dir()));
+            if is_dir {
                 let full_path = entry.path();
                 let name = entry.file_name().into_string().unwrap_or_default();
                 let full_path_str = full_path.to_string_lossy().to_string();

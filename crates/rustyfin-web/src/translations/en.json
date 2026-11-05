@@ -154,12 +154,12 @@
         "delete_failed": "Could not remove the library: {{message}}",
         "list_failed": "Could not load the libraries: {{message}}",
         "scan_start_failed": "Could not start the scan: {{message}}",
+        "scan_failed": "Scan failed: {{message}}",
         "no_subfolders": "No subfolders",
         "parent_folder": "Parent folder",
         "no_access": "No access",
         "select_folder": "Select this folder",
-        "path_added": "Path added: {{path}}",
-        "processing": "Processing…"
+        "folder_path": "Folder path"
     },
     "player": {
         "close_tooltip": "Close (Esc)",
@@ -174,7 +174,9 @@
         "stream": "Stream",
         "video_stream_fallback": "Video stream (fallback)",
         "audio_stream": "Audio stream",
-        "hls_error": "HLS stream error"
+        "hls_error": "HLS stream error",
+        "resume_from": "Resume from {{time}}",
+        "start_from_beginning": "Start from beginning"
     },
     "admin": {
         "new_user_title": "New User",
