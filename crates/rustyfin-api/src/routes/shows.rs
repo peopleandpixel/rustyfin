@@ -1,11 +1,13 @@
 use axum::extract::{Path, Query, State};
 use axum::routing::get;
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
+use rustyfin_model::auth::Claims;
 use rustyfin_model::media::{MediaItem, MediaType, QueryResult};
 use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::error::ApiError;
+use crate::routes::playback::query_user;
 use crate::state::AppState;
 
 pub fn routes() -> Router<AppState> {
@@ -35,8 +37,9 @@ struct NextUpQuery {
 async fn next_up(
     State(state): State<AppState>,
     Query(q): Query<NextUpQuery>,
+    Extension(claims): Extension<Claims>,
 ) -> Result<Json<QueryResult>, ApiError> {
-    let user_id = q.user_id;
+    let user_id = query_user(&state, &claims, q.user_id).await?;
     let series_id = q.series_id;
     let start_index = q.start_index.unwrap_or(0) as usize;
     let limit = q.limit.unwrap_or(20) as usize;
@@ -68,8 +71,9 @@ async fn next_up(
 async fn upcoming(
     State(state): State<AppState>,
     Query(q): Query<NextUpQuery>,
+    Extension(claims): Extension<Claims>,
 ) -> Result<Json<QueryResult>, ApiError> {
-    let user_id = q.user_id;
+    let user_id = query_user(&state, &claims, q.user_id).await?;
     let series_id = q.series_id;
     let start_index = q.start_index.unwrap_or(0) as usize;
     let limit = q.limit.unwrap_or(20) as usize;

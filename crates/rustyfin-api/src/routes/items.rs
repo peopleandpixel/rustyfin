@@ -11,6 +11,7 @@ use sqlx::SqlitePool;
 use uuid::Uuid;
 
 use crate::error::ApiError;
+use crate::routes::playback::path_user;
 use crate::state::AppState;
 
 /// Populate `media_sources` on each item using a single batched query.
@@ -2047,6 +2048,7 @@ async fn get_user_resume(
     Query(query): Query<ResumeQuery>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<QueryResult>, ApiError> {
+    let user_id = path_user(&state, &claims, user_id).await?;
     let limit = query.limit.unwrap_or(10);
     let mut items =
         rustyfin_db::repo_media::get_user_resume_items(&state.db_ro, user_id, limit).await?;
@@ -2058,7 +2060,7 @@ async fn get_user_resume(
     enrich_items(
         &state.db_ro,
         &state.server_id,
-        Some(claims.sub),
+        Some(user_id),
         &mut items,
         &state.http_client,
         tmdb_key,
@@ -2211,9 +2213,11 @@ async fn get_attachments(
 /// DELETE /Users/{userId}/Items/{itemId}/Rating
 async fn delete_rating(
     State(state): State<AppState>,
-    Path((_user_id, item_id)): Path<(Uuid, Uuid)>,
+    Path((user_id, item_id)): Path<(Uuid, Uuid)>,
+    Extension(claims): Extension<Claims>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
-    rustyfin_db::repo_playback::clear_user_rating(&state.db, _user_id, item_id)
+    let user_id = path_user(&state, &claims, user_id).await?;
+    rustyfin_db::repo_playback::clear_user_rating(&state.db, user_id, item_id)
         .await
         .ok();
     Ok((StatusCode::OK, Json(serde_json::json!({}))))

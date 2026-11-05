@@ -311,3 +311,28 @@ pub async fn get_now_playing_item(
         None => Ok(None),
     }
 }
+
+/// The user a session belongs to, or `None` when no session has this id.
+pub async fn get_session_user_id(
+    pool: &SqlitePool,
+    session_id: &str,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    let user_id: Option<String> = sqlx::query_scalar("SELECT user_id FROM sessions WHERE id = ?1")
+        .bind(session_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(user_id.and_then(|id| Uuid::parse_str(&id).ok()))
+}
+
+/// The user a device belongs to (the last one who signed in on it), or `None` when no device
+/// has this id.
+pub async fn get_device_user_id(
+    pool: &SqlitePool,
+    device_id: &str,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    let user_id: Option<String> = sqlx::query_scalar("SELECT user_id FROM devices WHERE id = ?1")
+        .bind(device_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(user_id.and_then(|id| Uuid::parse_str(&id).ok()))
+}

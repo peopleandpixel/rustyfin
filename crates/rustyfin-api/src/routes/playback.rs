@@ -134,7 +134,11 @@ async fn playing_stopped(
 
 /// The path's user, when the caller may act for them: that user or an administrator (Jellyfin's
 /// `RequestHelpers.GetUserId`). An unknown user is 404.
-async fn path_user(state: &AppState, claims: &Claims, user_id: Uuid) -> Result<Uuid, ApiError> {
+pub(crate) async fn path_user(
+    state: &AppState,
+    claims: &Claims,
+    user_id: Uuid,
+) -> Result<Uuid, ApiError> {
     if user_id != claims.sub && !claims.is_admin {
         return Err(ApiError::Forbidden("User update not allowed.".to_string()));
     }
@@ -143,6 +147,20 @@ async fn path_user(state: &AppState, claims: &Claims, user_id: Uuid) -> Result<U
         return Err(ApiError::NotFound("user not found".into()));
     }
     Ok(user_id)
+}
+
+/// The user a query's optional `userId` names, under `path_user`'s rules. None or the nil id means
+/// the caller; for the API key (nil `sub`), which has no user of its own, that is `None`.
+pub(crate) async fn query_user(
+    state: &AppState,
+    claims: &Claims,
+    user_id: Option<Uuid>,
+) -> Result<Option<Uuid>, ApiError> {
+    match user_id.filter(|id| !id.is_nil()) {
+        Some(id) => path_user(state, claims, id).await.map(Some),
+        None if claims.sub.is_nil() => Ok(None),
+        None => Ok(Some(claims.sub)),
+    }
 }
 
 async fn mark_played(
