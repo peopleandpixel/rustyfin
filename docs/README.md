@@ -21,7 +21,7 @@ Rustyfin ist ein performanter, ressourcenschonender Mediaserver, der die Jellyfi
 - **Metadaten-Provider** – TMDb, OMDb und lokale NFO-Dateien
 - **Bildverarbeitung** – Proxy mit Caching und Echtzeit-Skalierung
 - **Direct Play / Direct Stream** – Video- und Audio-Streaming mit Seeking-Unterstützung
-- **Authentifizierung** – JWT-basiert, API-Key-Support und Quick Connect
+- **Authentifizierung** – Opake Zugriffstokens (zufällig, serverseitig nur als Hash gespeichert), API-Key-Support und Quick Connect
 - **Benutzerverwaltung** – Mehrere Benutzer mit individuellen Richtlinien
 - **SQLite-Datenbank** – Konfigurationsfreie, eingebettete Datenbank
 - **Geringer Ressourcenverbrauch** – Gebaut mit async Rust (Tokio + Axum)

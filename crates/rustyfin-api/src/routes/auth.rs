@@ -18,11 +18,16 @@ async fn login(
     headers: HeaderMap,
     Json(req): Json<LoginRequest>,
 ) -> Result<Json<AuthResponse>, ApiError> {
-    let (user, token) =
-        rustyfin_auth::authenticate(&state.db, &req.username, &req.password, &state.jwt_secret)
-            .await?;
-
     let (client, version, device, device_id) = parse_emby_auth(&headers);
+    let token_device = rustyfin_auth::TokenDevice {
+        device_id: device_id.clone(),
+        device_name: device.clone(),
+        app_name: client.clone(),
+        app_version: version.clone(),
+    };
+    let (user, token) =
+        rustyfin_auth::authenticate(&state.db, &req.username, &req.password, &token_device).await?;
+
     let session_id = Uuid::new_v4();
 
     // Create session in database with empty capabilities (will be updated by client)

@@ -11,7 +11,7 @@ Rustyfin implementiert die Jellyfin-API. Alle Endpoints verwenden JSON als Daten
 Die meisten Endpoints erfordern Authentifizierung über den `Authorization`-Header:
 
 ```
-Authorization: MediaBrowser Token=<jwt-token-oder-api-key>
+Authorization: MediaBrowser Token=<zugriffstoken-oder-api-key>
 ```
 
 Alternativ kann der Token als Query-Parameter übergeben werden:

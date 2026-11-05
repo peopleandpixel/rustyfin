@@ -14,7 +14,7 @@ rustyfin/
 ├── crates/
 │   ├── rustyfin-server/        # Einstiegspunkt und Server-Bootstrap
 │   ├── rustyfin-api/           # Axum-Routes und HTTP-Handler
-│   ├── rustyfin-auth/          # Authentifizierung (Argon2, JWT, Quick Connect)
+│   ├── rustyfin-auth/          # Authentifizierung (Argon2, Zugriffstokens, Quick Connect)
 │   ├── rustyfin-core/          # Geschäftslogik (Library-Scan, Metadaten, Bilder)
 │   ├── rustyfin-db/            # Datenbankschicht (SQLite via sqlx)
 │   ├── rustyfin-model/         # Gemeinsame Datenmodelle und DTOs
@@ -58,7 +58,7 @@ Enthält alle HTTP-Routes und Handler, organisiert nach Funktionsbereichen:
 Authentifizierungs-Logik:
 
 - **Argon2** – Passwort-Hashing
-- **JWT** – Token-basierte Authentifizierung
+- **Zugriffstokens** – Zufällige, opake Tokens; der Server speichert nur ihren SHA-256-Hash
 - **Quick Connect** – Code-basierte Anmeldung
 - **API-Key** – Statische Schlüssel für Integrationen
 
@@ -94,7 +94,7 @@ Kommandozeilen-Tools und Hilfsfunktionen.
 | Web Framework | Axum |
 | Datenbank | SQLite (via sqlx) |
 | Passwort-Hashing | Argon2 |
-| JWT | jsonwebtoken |
+| Zugriffstokens | rand_core (OsRng), sha2 |
 | Bildverarbeitung | image crate |
 | HTTP-Client | reqwest |
 | Serialisierung | serde / serde_json |
@@ -116,7 +116,7 @@ Kommandozeilen-Tools und Hilfsfunktionen.
 ├──────────┬──────────────┬───────────────────┤
 │rustyfin- │ rustyfin-    │   rustyfin-       │
 │  auth    │   core       │     db            │
-│(JWT,     │(Scanner,     │(SQLite,           │
+│(Tokens,  │(Scanner,     │(SQLite,           │
 │ Argon2,  │ Metadaten,   │ Repositories,     │
 │ QConnect)│ Bilder)      │ Migrationen)      │
 ├──────────┴──────────────┴───────────────────┤

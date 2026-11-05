@@ -74,7 +74,9 @@ async fn ws_handler(
 
     // The configured API key or a valid user token opens the socket
     let authenticated = state.api_key.as_ref().is_some_and(|key| token == **key)
-        || rustyfin_auth::validate_token(&token, &state.jwt_secret).is_ok();
+        || rustyfin_auth::validate_token(&state.db_ro, &token)
+            .await
+            .is_ok();
 
     if !authenticated {
         tracing::warn!("WebSocket: unauthenticated connection attempt");
@@ -82,10 +84,22 @@ async fn ws_handler(
     }
 
     tracing::info!("WebSocket: authenticated connection");
-    Ok(ws.on_upgrade(move |socket| handle_socket(socket, state)))
+    Ok(ws.on_upgrade(move |socket| handle_socket(socket, state, token)))
 }
 
-async fn handle_socket(socket: WebSocket, state: AppState) {
+/// Seconds between re-checks of an open websocket's user token.
+const WS_TOKEN_RECHECK_SECS: u64 = 5;
+
+/// True only when an API key is configured and the token is that key.
+fn is_api_key(api_key: Option<&str>, token: &str) -> bool {
+    api_key.is_some_and(|key| token == key)
+}
+
+async fn handle_socket(socket: WebSocket, state: AppState, token: String) {
+    // Every token but the configured API key is re-checked, also one revoked since the upgrade
+    // check; only an invalid token closes the socket.
+    let user_token = !is_api_key(state.api_key.as_deref().map(String::as_str), &token);
+
     let (mut sender, mut receiver) = socket.split();
 
     // Subscribe to the global broadcast channel for server events
@@ -118,6 +132,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     if let Ok(json) = serde_json::to_string(&time_sync) {
         let _ = sender.send(Message::Text(json.into())).await;
     }
+
+    let period = std::time::Duration::from_secs(WS_TOKEN_RECHECK_SECS);
+    let mut recheck = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
 
     loop {
         tokio::select! {
@@ -196,6 +213,17 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     }
                 }
             }
+
+            // Close the socket once its user token stops validating
+            _ = recheck.tick(), if user_token => {
+                if let Err(rustyfin_auth::AuthError::InvalidToken) =
+                    rustyfin_auth::validate_token(&state.db_ro, &token).await
+                {
+                    tracing::info!("WebSocket: session {} closed: its token is no longer valid", session_id);
+                    let _ = sender.send(Message::Close(None)).await;
+                    break;
+                }
+            }
         }
     }
 
@@ -253,4 +281,21 @@ pub async fn broadcast_event(state: &AppState, event: rustyfin_model::ws_event::
     // Silently ignore broadcast failures - this is normal when no WebSocket clients are connected.
     // The browser player does not require WebSocket for playback; it's only used for notifications.
     let _ = state.ws_broadcast.send(event);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_api_key;
+
+    #[test]
+    fn g2c_only_the_api_key_skips_the_token_recheck() {
+        // handle_socket re-checks every socket whose token is not the configured API key, also one
+        // revoked since the upgrade check. 9dd5a44 validated the token again at the start and never
+        // re-checked a socket whose token failed there.
+        assert!(is_api_key(Some("the-key"), "the-key"));
+        assert!(!is_api_key(Some("the-key"), "a-revoked-user-token"));
+        assert!(!is_api_key(Some("the-key"), ""));
+        assert!(!is_api_key(None, "a-user-token"));
+        assert!(!is_api_key(None, ""));
+    }
 }

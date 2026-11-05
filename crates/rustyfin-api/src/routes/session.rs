@@ -1,4 +1,5 @@
 use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
 use axum::routing::{delete, get, post};
 use axum::{Extension, Json, Router};
 use rustyfin_model::auth::Claims;
@@ -89,18 +90,12 @@ async fn get_now_playing_item(
 
 async fn logout_session(
     State(state): State<AppState>,
-    Extension(claims): Extension<Claims>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    // Build session id from user + device info (same logic as middleware)
-    // Delete all sessions for this user as fallback
-    let sessions = rustyfin_db::repo_session::get_active_sessions(&state.db).await?;
-    for s in &sessions {
-        if s.user_id == claims.sub {
-            rustyfin_db::repo_session::delete_session(&state.db, &s.id).await?;
-            break;
-        }
+    token: Option<Extension<rustyfin_auth::RequestToken>>,
+) -> Result<StatusCode, ApiError> {
+    if let Some(Extension(rt)) = token {
+        rustyfin_auth::logout(&state.db, &rt.0).await?;
     }
-    Ok(Json(serde_json::json!({})))
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn send_command(

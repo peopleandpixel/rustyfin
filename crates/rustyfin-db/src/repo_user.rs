@@ -134,7 +134,8 @@ pub enum OwnerClaim {
 }
 
 /// Makes the user `name` the server owner, creating it if it does not exist. If `leftover` still has
-/// the password hash it had when it was read, it is disabled in the same transaction.
+/// the password hash it had when it was read, it is disabled in the same transaction. The claimed
+/// account's earlier tokens and a disabled leftover's tokens are deleted in that same transaction.
 /// The check and the writes run in one IMMEDIATE transaction, so only one caller can claim ownership.
 pub async fn claim_owner(
     pool: &SqlitePool,
@@ -177,6 +178,10 @@ async fn claim_owner_in_tx(
             .bind(&id)
             .execute(&mut *tx)
             .await?;
+            sqlx::query("DELETE FROM access_tokens WHERE user_id = ?")
+                .bind(&id)
+                .execute(&mut *tx)
+                .await?;
         }
         None => {
             sqlx::query(
@@ -202,6 +207,12 @@ async fn claim_owner_in_tx(
         .execute(&mut *tx)
         .await?;
         leftover_disabled = result.rows_affected() == 1;
+        if leftover_disabled {
+            sqlx::query("DELETE FROM access_tokens WHERE user_id = ?")
+                .bind(user.id.to_string())
+                .execute(&mut *tx)
+                .await?;
+        }
     }
 
     tx.commit().await?;
@@ -523,84 +534,112 @@ pub async fn get_user_preferences(
     })
 }
 
-/// Generate a password reset PIN for a user and store it in the database.
-/// Returns the 6-digit PIN code.
-pub async fn generate_password_reset_pin(
+/// Wrong PINs a reset allows before it is void. Every query that checks the cap binds this.
+pub const MAX_RESET_PIN_ATTEMPTS: i64 = 5;
+
+/// Store the hash of a freshly generated reset PIN for `user_id`. Expired resets of every user are
+/// deleted first, then a row is inserted only if the user has none (pending or voided), so a new
+/// request never replaces an open reset. `pin_hash` is the SHA-256 hex of the normalized PIN;
+/// `expires_at` is RFC3339. Returns `true` when a row was inserted.
+pub async fn store_reset_pin(
     pool: &SqlitePool,
     user_id: Uuid,
-) -> Result<String, sqlx::Error> {
+    pin_hash: &str,
+    expires_at: &str,
+) -> Result<bool, sqlx::Error> {
     let uid = user_id.to_string();
-    // Delete any existing unused pins for this user
-    sqlx::query("DELETE FROM password_reset_pins WHERE user_id = ?1 AND used = 0")
-        .bind(&uid)
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query("DELETE FROM password_reset_pins WHERE expires_at <= ?1")
+        .bind(&now)
         .execute(pool)
         .await?;
-
-    // Generate a random 6-digit PIN (using std::time for seed, no non-Send dependencies)
-    let seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64;
-    let pin: String = (0..6)
-        .map(|i| {
-            let val = ((seed.wrapping_mul(6364136223846793005) >> 16) + i as u64) % 10;
-            (b'0' + val as u8) as char
-        })
-        .collect();
-
     let id = uuid::Uuid::new_v4().to_string();
-    let expires_at = chrono::Utc::now()
-        .checked_add_days(chrono::Days::new(1))
-        .unwrap()
-        .to_rfc3339();
-
-    sqlx::query(
-        "INSERT INTO password_reset_pins (id, user_id, pin_code, expires_at) VALUES (?1, ?2, ?3, ?4)",
+    let inserted = sqlx::query(
+        "INSERT INTO password_reset_pins (id, user_id, pin_code, expires_at, failed_attempts) \
+         VALUES (?1, ?2, ?3, ?4, 0) ON CONFLICT(user_id) DO NOTHING",
     )
     .bind(&id)
     .bind(&uid)
-    .bind(&pin)
-    .bind(&expires_at)
+    .bind(pin_hash)
+    .bind(expires_at)
     .execute(pool)
     .await?;
-
-    Ok(pin)
+    Ok(inserted.rows_affected() == 1)
 }
 
-/// Validate a password reset PIN and mark it as used.
-/// Returns the user_id if valid, None otherwise.
+/// Validate a reset PIN for one named user (the `/Users/ResetPassword` flow). `pin_hash` is the
+/// SHA-256 hex of the normalized PIN. A PIN is valid only while unexpired and under
+/// `MAX_RESET_PIN_ATTEMPTS` failed attempts. On success the PIN row is deleted and the user id is
+/// returned. On failure this user's failed-attempt counter goes up and `None` is returned. The
+/// check, the delete and the counter update run in one IMMEDIATE transaction, so concurrent
+/// requests cannot both succeed.
 pub async fn validate_password_reset_pin(
     pool: &SqlitePool,
     user_id: Uuid,
-    pin_code: &str,
+    pin_hash: &str,
 ) -> Result<Option<Uuid>, sqlx::Error> {
     let uid = user_id.to_string();
     let now = chrono::Utc::now().to_rfc3339();
-
-    let row: Option<(String,)> = sqlx::query_as(
-        "SELECT user_id FROM password_reset_pins WHERE user_id = ?1 AND pin_code = ?2 AND used = 0 AND expires_at > ?3",
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let deleted: Option<(String,)> = sqlx::query_as(
+        "DELETE FROM password_reset_pins WHERE id = (\
+         SELECT id FROM password_reset_pins \
+         WHERE user_id = ?1 AND pin_code = ?2 AND expires_at > ?3 AND failed_attempts < ?4 LIMIT 1) \
+         RETURNING user_id",
     )
     .bind(&uid)
-    .bind(pin_code)
+    .bind(pin_hash)
     .bind(&now)
-    .fetch_optional(pool)
+    .bind(MAX_RESET_PIN_ATTEMPTS)
+    .fetch_optional(&mut *tx)
     .await?;
-
-    if let Some((db_user_id,)) = row {
-        // Mark the PIN as used
+    if deleted.is_none() {
         sqlx::query(
-            "UPDATE password_reset_pins SET used = 1 WHERE user_id = ?1 AND pin_code = ?2 AND used = 0",
+            "UPDATE password_reset_pins SET failed_attempts = failed_attempts + 1 \
+             WHERE user_id = ?1 AND expires_at > ?2 AND failed_attempts < ?3",
         )
         .bind(&uid)
-        .bind(pin_code)
-        .execute(pool)
+        .bind(&now)
+        .bind(MAX_RESET_PIN_ATTEMPTS)
+        .execute(&mut *tx)
         .await?;
-
-        // Parse the user ID back
-        if let Ok(uid) = db_user_id.parse::<Uuid>() {
-            return Ok(Some(uid));
-        }
     }
+    tx.commit().await?;
+    Ok(deleted.and_then(|(db_user_id,)| db_user_id.parse::<Uuid>().ok()))
+}
 
-    Ok(None)
+/// Redeem a reset PIN with no username (the `/Users/ForgotPassword/Pin` flow). Searches every
+/// active reset for a matching hash. On success deletes that reset and returns the user id. On no
+/// match increments the failed-attempt counter of every active reset still under
+/// `MAX_RESET_PIN_ATTEMPTS` and returns `None`. The delete and the counter update run in one
+/// IMMEDIATE transaction, so concurrent requests cannot both redeem the same PIN.
+pub async fn redeem_reset_pin(
+    pool: &SqlitePool,
+    pin_hash: &str,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let deleted: Option<(String,)> = sqlx::query_as(
+        "DELETE FROM password_reset_pins WHERE id = (\
+         SELECT id FROM password_reset_pins \
+         WHERE pin_code = ?1 AND expires_at > ?2 AND failed_attempts < ?3 LIMIT 1) \
+         RETURNING user_id",
+    )
+    .bind(pin_hash)
+    .bind(&now)
+    .bind(MAX_RESET_PIN_ATTEMPTS)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if deleted.is_none() {
+        sqlx::query(
+            "UPDATE password_reset_pins SET failed_attempts = failed_attempts + 1 \
+             WHERE expires_at > ?1 AND failed_attempts < ?2",
+        )
+        .bind(&now)
+        .bind(MAX_RESET_PIN_ATTEMPTS)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(deleted.and_then(|(db_user_id,)| db_user_id.parse::<Uuid>().ok()))
 }

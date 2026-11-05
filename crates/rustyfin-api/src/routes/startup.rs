@@ -86,7 +86,7 @@ async fn default_admin_leftover(state: &AppState, name: &str) -> Option<User> {
         .ok()
         .flatten()?;
     let has_default_password = matches!(
-        rustyfin_auth::verify_password("admin", &admin.password_hash),
+        rustyfin_auth::verify_password("admin", &admin.password_hash).await,
         Ok(true)
     );
     has_default_password.then_some(admin)
@@ -105,6 +105,7 @@ async fn create_startup_user(
     }
 
     let hash = rustyfin_auth::hash_password(&input.password)
+        .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
     let leftover = default_admin_leftover(&state, &input.name).await;
 

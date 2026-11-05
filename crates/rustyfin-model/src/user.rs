@@ -86,6 +86,15 @@ pub struct ForgotPasswordRequest {
 #[serde(rename_all = "PascalCase")]
 pub struct ForgotPasswordResult {
     pub action: String,
+    pub pin_file: String,
+    pub pin_expiration_date: String,
+}
+
+/// Request to redeem a reset PIN with no username (`/Users/ForgotPassword/Pin`).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ForgotPasswordPinRequest {
+    pub pin: String,
 }
 
 /// Request to validate a password reset PIN code
