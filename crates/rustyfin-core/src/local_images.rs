@@ -289,6 +289,27 @@ mod tests {
     use rustyfin_model::image::ImageType;
     use std::path::PathBuf;
 
+    /// Temp dirs this test made. libtest runs each test on its own thread, so dropping this
+    /// thread-local removes them when the test ends, also when it panics.
+    struct TempDirs(std::cell::RefCell<Vec<std::path::PathBuf>>);
+
+    impl Drop for TempDirs {
+        fn drop(&mut self) {
+            for dir in self.0.get_mut().drain(..) {
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }
+    }
+
+    thread_local! {
+        static TEMP_DIRS: TempDirs = const { TempDirs(std::cell::RefCell::new(Vec::new())) };
+    }
+
+    /// Removes `dir` and everything in it when the current test ends.
+    fn remove_when_test_ends(dir: &std::path::Path) {
+        TEMP_DIRS.with(|dirs| dirs.0.borrow_mut().push(dir.to_path_buf()));
+    }
+
     /// Creates empty `files` (paths relative to a fresh temp dir) and returns `<temp dir>/media`.
     /// Every test path sits at least three levels below the temp dir, so the parent and
     /// grandparent scans never reach the shared system temp directory.
@@ -296,6 +317,7 @@ mod tests {
         let root = std::env::temp_dir()
             .join(format!("rustyfin_local_images_{}", Uuid::new_v4()))
             .join("media");
+        remove_when_test_ends(root.parent().unwrap());
         for file in files {
             let path = root.join(file);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();

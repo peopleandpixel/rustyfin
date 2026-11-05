@@ -17,8 +17,31 @@ use rustyfin_api::state::AppState;
 use rustyfin_model::server_info::ServerConfiguration;
 use rustyfin_model::ws_event::WsEvent;
 
+/// Temp dirs this test made. libtest runs each test on its own thread, so dropping this
+/// thread-local removes them when the test ends, also when it panics. `test_state()` hands out
+/// a plain `AppState`, which tests pass by value, so the guard can't travel with it.
+struct TempDirs(std::cell::RefCell<Vec<std::path::PathBuf>>);
+
+impl Drop for TempDirs {
+    fn drop(&mut self) {
+        for dir in self.0.get_mut().drain(..) {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+}
+
+thread_local! {
+    static TEMP_DIRS: TempDirs = const { TempDirs(std::cell::RefCell::new(Vec::new())) };
+}
+
+/// Removes `dir` and everything in it when the current test ends.
+fn remove_when_test_ends(dir: &std::path::Path) {
+    TEMP_DIRS.with(|dirs| dirs.0.borrow_mut().push(dir.to_path_buf()));
+}
+
 async fn test_state() -> AppState {
     let data_dir = std::env::temp_dir().join(format!("rustyfin_test_{}", uuid::Uuid::new_v4()));
+    remove_when_test_ends(&data_dir);
     std::fs::create_dir_all(&data_dir).ok();
     std::fs::create_dir_all(data_dir.join("logs")).ok();
     std::fs::create_dir_all(data_dir.join("cache")).ok();

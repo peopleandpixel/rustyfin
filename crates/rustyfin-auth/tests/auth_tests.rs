@@ -1,5 +1,27 @@
+/// Temp dirs this test made. libtest runs each test on its own thread, so dropping this
+/// thread-local removes them when the test ends, also when it panics.
+struct TempDirs(std::cell::RefCell<Vec<std::path::PathBuf>>);
+
+impl Drop for TempDirs {
+    fn drop(&mut self) {
+        for dir in self.0.get_mut().drain(..) {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+}
+
+thread_local! {
+    static TEMP_DIRS: TempDirs = const { TempDirs(std::cell::RefCell::new(Vec::new())) };
+}
+
+/// Removes `dir` and everything in it when the current test ends.
+fn remove_when_test_ends(dir: &std::path::Path) {
+    TEMP_DIRS.with(|dirs| dirs.0.borrow_mut().push(dir.to_path_buf()));
+}
+
 async fn test_pool() -> sqlx::SqlitePool {
     let dir = std::env::temp_dir().join(format!("rustyfin_test_auth_{}", uuid::Uuid::new_v4()));
+    remove_when_test_ends(&dir);
     std::fs::create_dir_all(&dir).ok();
     let db_path = dir.join("test.db");
     rustyfin_db::init_db(db_path.to_str().unwrap())

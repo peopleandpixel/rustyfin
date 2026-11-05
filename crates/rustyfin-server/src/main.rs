@@ -501,9 +501,19 @@ fn load_or_create_server_id(data_dir: &std::path::Path) -> String {
 mod tests {
     use super::*;
 
+    /// Removes a test's temp dir when dropped, also when an assertion fails.
+    struct RemoveDir(std::path::PathBuf);
+
+    impl Drop for RemoveDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
     fn server_id_is_generated_once_then_reloaded() {
         let dir = std::env::temp_dir().join(format!("rustyfin_server_id_{}", uuid::Uuid::new_v4()));
+        let _remove = RemoveDir(dir.clone());
         std::fs::create_dir_all(&dir).unwrap();
 
         let first = load_or_create_server_id(&dir);
