@@ -1556,92 +1556,156 @@ impl From<MediaItemRow> for MediaItem {
     }
 }
 
-/// Get "Next Up" episodes: unwatched episodes for series that have been watched
+/// Get "Next Up": at most one episode per series.
+///
+/// A series' entry is its first unplayed regular episode after the user's highest played regular
+/// episode, or its first unplayed regular episode if none is played. Season 0 is never offered
+/// and never sets the position. An episode in progress counts as unplayed. A NULL season or
+/// episode number is regular. After a position a NULL season never qualifies, and a NULL episode
+/// number qualifies only in a later season. A series with nothing unplayed after its position is
+/// left out.
+///
+/// Candidates are the series the user has started: one of their episodes or specials has a
+/// `last_played_date` and is played or has a playback position. With `series_id`, that item alone
+/// is the candidate if it is a Series, started or not. Without a user nothing is played, so
+/// `series_id` gives the first regular episode, and no `series_id` gives an empty list.
+///
+/// Order, newest first: the highest played episode's `last_played_date` (a series whose highest
+/// played episode has no date comes next, then series with no highest played episode), then the
+/// newest qualifying play, then the series id ascending.
 pub async fn get_next_up(
     pool: &SqlitePool,
     user_id: Option<Uuid>,
+    series_id: Option<Uuid>,
 ) -> Result<Vec<MediaItem>, sqlx::Error> {
+    /// A regular episode of a candidate series, with the user's state for it.
+    struct Episode {
+        id: String,
+        season: Option<i64>,
+        number: Option<i64>,
+        played: bool,
+        played_date: Option<String>,
+    }
+    /// A series' entry, with the keys it sorts by.
+    struct Entry {
+        series: String,
+        last_played: Option<Option<String>>,
+        newest_play: Option<String>,
+        episode: String,
+    }
+
     let uid = user_id.map(|u| u.to_string());
 
-    let sql = if uid.is_some() {
-        "SELECT m.id, m.name, m.sort_name, m.overview, m.media_type, m.path, m.parent_id, m.library_id, \
-         m.production_year, m.community_rating, m.official_rating, m.genres, m.date_created, \
-         m.premiere_date, m.runtime_ticks, m.index_number, m.parent_index_number, m.tmdb_id, m.tvdb_id, \
-         m.tags, m.status, m.original_language, m.tagline, m.production_countries, m.budget, m.revenue, \
-         m.homepage, m.end_date, m.vote_count, m.popularity \
-         FROM media_items m
-         WHERE m.media_type = 'Episode'
-         AND m.id NOT IN (
-             SELECT item_id FROM user_item_data
-             WHERE user_id = ? AND played = 1
-         )
-         ORDER BY m.parent_index_number, m.index_number"
-    } else {
-        "SELECT m.id, m.name, m.sort_name, m.overview, m.media_type, m.path, m.parent_id, m.library_id, \
-         m.production_year, m.community_rating, m.official_rating, m.genres, m.date_created, \
-         m.premiere_date, m.runtime_ticks, m.index_number, m.parent_index_number, m.tmdb_id, m.tvdb_id, \
-         m.tags, m.status, m.original_language, m.tagline, m.production_countries, m.budget, m.revenue, \
-         m.homepage, m.end_date, m.vote_count, m.popularity \
-         FROM media_items m
-         WHERE m.media_type = 'Episode'
-         ORDER BY m.parent_index_number, m.index_number"
+    // Candidate series, each with its newest qualifying play.
+    let candidates: Vec<(String, Option<String>)> = match (series_id, uid.as_deref()) {
+        (Some(sid), _) => sqlx::query_scalar::<_, String>(
+            "SELECT id FROM media_items WHERE id = ? AND media_type = 'Series'",
+        )
+        .bind(sid.to_string())
+        .fetch_optional(pool)
+        .await?
+        .map(|id| vec![(id, None)])
+        .unwrap_or_default(),
+        (None, Some(user)) => {
+            sqlx::query_as::<_, (String, Option<String>)>(
+                "SELECT se.parent_id, MAX(ud.last_played_date) \
+                 FROM user_item_data ud \
+                 JOIN media_items e ON e.id = ud.item_id AND e.media_type = 'Episode' \
+                 JOIN media_items se ON se.id = e.parent_id AND se.media_type = 'Season' \
+                 WHERE ud.user_id = ? AND ud.last_played_date IS NOT NULL \
+                 AND (ud.played = 1 OR ud.playback_position_ticks > 0) \
+                 AND se.parent_id IS NOT NULL \
+                 GROUP BY se.parent_id",
+            )
+            .bind(user)
+            .fetch_all(pool)
+            .await?
+        }
+        (None, None) => Vec::new(),
     };
 
-    let mut q = sqlx::query_as::<_, MediaItemRow>(sql);
-    if let Some(ref u) = uid {
-        q = q.bind(u);
+    let mut entries = Vec::new();
+    for (series, newest_play) in candidates {
+        // Season 0 is left out. With no user the LEFT JOIN matches no row, so every
+        // episode is unplayed.
+        let rows: Vec<(
+            String,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+        )> = sqlx::query_as(
+            "SELECT e.id, e.parent_index_number, e.index_number, ud.played, ud.last_played_date \
+             FROM media_items e \
+             JOIN media_items se ON se.id = e.parent_id AND se.media_type = 'Season' \
+             LEFT JOIN user_item_data ud ON ud.item_id = e.id AND ud.user_id = ? \
+             WHERE se.parent_id = ? AND e.media_type = 'Episode' \
+             AND (e.parent_index_number IS NULL OR e.parent_index_number <> 0)",
+        )
+        .bind(uid.as_deref())
+        .bind(&series)
+        .fetch_all(pool)
+        .await?;
+        let episodes: Vec<Episode> = rows
+            .into_iter()
+            .map(|(id, season, number, played, played_date)| Episode {
+                id,
+                season,
+                number,
+                played: played == Some(1),
+                played_date,
+            })
+            .collect();
+
+        // The highest played episode, by (season, episode) with None lowest.
+        let highest = episodes
+            .iter()
+            .filter(|e| e.played)
+            .max_by_key(|e| (e.season, e.number, e.id.as_str()));
+        let last_played = highest.map(|e| e.played_date.clone());
+        // The position needs both numbers.
+        let position = highest.and_then(|e| e.season.zip(e.number));
+
+        let next = episodes
+            .iter()
+            .filter(|e| !e.played)
+            .filter(|e| match position {
+                None => true,
+                // Jellyfin's comparison on the Options: a NULL season never qualifies, and a
+                // NULL episode number qualifies only in a later season.
+                Some((ps, pn)) => {
+                    e.season > Some(ps) || (e.season == Some(ps) && e.number > Some(pn))
+                }
+            })
+            .min_by_key(|e| (e.season, e.number, e.id.as_str()));
+
+        if let Some(next) = next {
+            entries.push(Entry {
+                series,
+                last_played,
+                newest_play,
+                episode: next.id.clone(),
+            });
+        }
     }
-    let rows = q.fetch_all(pool).await?;
-    Ok(rows.into_iter().map(Into::into).collect())
-}
 
-/// Get "Next Up" episodes for a specific series
-pub async fn get_next_up_for_series(
-    pool: &SqlitePool,
-    user_id: Option<Uuid>,
-    series_id: Uuid,
-) -> Result<Vec<MediaItem>, sqlx::Error> {
-    let sid = series_id.to_string();
-    let uid = user_id.map(|u| u.to_string());
+    entries.sort_by(|a, b| {
+        b.last_played
+            .cmp(&a.last_played)
+            .then_with(|| b.newest_play.cmp(&a.newest_play))
+            .then_with(|| a.series.cmp(&b.series))
+    });
 
-    let seasons: Vec<String> = sqlx::query_scalar(
-        "SELECT id FROM media_items WHERE parent_id = ? AND media_type = 'Season'",
-    )
-    .bind(&sid)
-    .fetch_all(pool)
-    .await?;
-
-    if seasons.is_empty() {
-        return Ok(Vec::new());
+    let mut items = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let Ok(id) = Uuid::parse_str(&entry.episode) else {
+            continue;
+        };
+        if let Some(item) = get_item_by_id(pool, id).await? {
+            items.push(item);
+        }
     }
-
-    let season_placeholders: Vec<&str> = seasons.iter().map(|_| "?").collect();
-    let mut sql = format!(
-        "SELECT m.id, m.name, m.sort_name, m.overview, m.media_type, m.path, m.parent_id, m.library_id, \
-         m.production_year, m.community_rating, m.official_rating, m.genres, m.date_created, \
-         m.premiere_date, m.runtime_ticks, m.index_number, m.parent_index_number, m.tmdb_id, m.tvdb_id, \
-         m.tags, m.status, m.original_language, m.tagline, m.production_countries, m.budget, m.revenue, \
-         m.homepage, m.end_date, m.vote_count, m.popularity \
-         FROM media_items m
-         WHERE m.media_type = 'Episode'
-         AND m.parent_id IN ({})",
-        season_placeholders.join(",")
-    );
-
-    if uid.is_some() {
-        sql.push_str(" AND m.id NOT IN (SELECT item_id FROM user_item_data WHERE user_id = ? AND played = 1)");
-    }
-    sql.push_str(" ORDER BY m.parent_index_number, m.index_number");
-
-    let mut q = sqlx::query_as::<_, MediaItemRow>(sqlx::AssertSqlSafe(sql));
-    for s in &seasons {
-        q = q.bind(s);
-    }
-    if let Some(ref u) = uid {
-        q = q.bind(u);
-    }
-    let rows = q.fetch_all(pool).await?;
-    Ok(rows.into_iter().map(Into::into).collect())
+    Ok(items)
 }
 
 /// Get "Upcoming" episodes: episodes with a future air date

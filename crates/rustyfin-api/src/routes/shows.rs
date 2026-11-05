@@ -44,14 +44,8 @@ async fn next_up(
     let start_index = q.start_index.unwrap_or(0) as usize;
     let limit = q.limit.unwrap_or(20) as usize;
 
-    // Get episodes that haven't been fully watched
-    let episodes = if let Some(sid) = series_id {
-        // For a specific series, get unwatched episodes
-        rustyfin_db::repo_media::get_next_up_for_series(&state.db_ro, user_id, sid).await?
-    } else {
-        // Get all unwatched episodes across all series
-        rustyfin_db::repo_media::get_next_up(&state.db_ro, user_id).await?
-    };
+    // One episode per series: its next unplayed episode (see get_next_up)
+    let episodes = rustyfin_db::repo_media::get_next_up(&state.db_ro, user_id, series_id).await?;
 
     let total = episodes.len() as i64;
     let end = start_index.saturating_add(limit).min(episodes.len());

@@ -5811,19 +5811,20 @@ async fn g1f_user_resume_follows_user_id() {
 }
 
 /// Checks `GET {path}` (Next Up or Upcoming), with and without `seriesId`, for every kind of
-/// caller. `users` is what `g1_owner_and_viewer` returns; `all` is the list for a user who has
-/// played nothing and `owners` the owner's list.
+/// caller. `users` is what `g1_owner_and_viewer` returns. `all` holds the list for a user who has
+/// played nothing and `owners` the owner's list, each first without `seriesId` and then with it.
 async fn g1f_assert_episode_list(
     app: &axum::Router,
     path: &str,
     series: uuid::Uuid,
     users: &(String, String, String, String),
-    all: &[uuid::Uuid],
-    owners: &[uuid::Uuid],
+    all: [&[uuid::Uuid]; 2],
+    owners: [&[uuid::Uuid]; 2],
 ) {
     let (owner, owner_id, viewer, viewer_id) = users;
     let random = uuid::Uuid::new_v4();
-    for base in [format!("{path}?"), format!("{path}?seriesId={series}&")] {
+    let bases = [format!("{path}?"), format!("{path}?seriesId={series}&")];
+    for ((base, all), owners) in bases.into_iter().zip(all).zip(owners) {
         assert_eq!(
             g1f_ids(app, base.clone(), None).await.0,
             StatusCode::UNAUTHORIZED,
@@ -5876,7 +5877,8 @@ async fn g1f_assert_episode_list(
             StatusCode::NOT_FOUND,
             "owner {base}userId={random}"
         );
-        // The API key: every episode with no userId (today's answer), a user's list with their id.
+        // The API key: with no userId, the list of a user who has played nothing; with a user's
+        // id, that user's list.
         assert_eq!(
             g1f_ids(app, base.clone(), Some("test-api-key")).await,
             (StatusCode::OK, all.to_vec()),
@@ -5900,17 +5902,19 @@ async fn g1f_next_up_follows_user_id() {
     let state = test_state().await;
     let app = app(state.clone());
     let users = g1_owner_and_viewer(&state, &app).await;
-    let (series, [e1, e2, e3]) = g1f_insert_show(&state).await;
+    let (series, [e1, e2, _]) = g1f_insert_show(&state).await;
     rustyfin_db::repo_playback::mark_played(&state.db, users.1.parse().unwrap(), e1)
         .await
         .unwrap();
+    // The owner has watched E1. Without seriesId only started series are listed; with it, a
+    // user who has played nothing starts at E1.
     g1f_assert_episode_list(
         &app,
         "/Shows/NextUp",
         series,
         &users,
-        &[e1, e2, e3],
-        &[e2, e3],
+        [&[], &[e1]],
+        [&[e2], &[e2]],
     )
     .await;
 }
@@ -5924,7 +5928,15 @@ async fn g1f_upcoming_follows_user_id() {
     rustyfin_db::repo_playback::mark_played(&state.db, users.1.parse().unwrap(), e3)
         .await
         .unwrap();
-    g1f_assert_episode_list(&app, "/Shows/Upcoming", series, &users, &[e3], &[]).await;
+    g1f_assert_episode_list(
+        &app,
+        "/Shows/Upcoming",
+        series,
+        &users,
+        [&[e3], &[e3]],
+        [&[], &[]],
+    )
+    .await;
 }
 
 /// Sends `GET /Notifications/{user}` and returns the status and the notification names.
@@ -6151,6 +6163,424 @@ async fn g1f_sessions_list_own_unless_admin() {
             );
         }
     }
+}
+
+// ── B15: Next Up ──
+// GET /Shows/NextUp lists one episode per series the user has started: the first unplayed episode
+// after their highest played one, outside season 0. Series sort newest first by when that episode
+// was played, and StartIndex, Limit and TotalRecordCount count series (Jellyfin's
+// TVSeriesManager.GetNextUp and NextUpService.GetNextUpEpisodesBatch).
+
+/// A server with three series, each season its own item: Hotel has a special, S00E01, and
+/// S01E01-S01E04; India has S01E01, S01E02 and S02E01; Quiet has S01E01 and S01E02. `ids` maps
+/// "Hotel" to the series and "Hotel S01E02" to that episode.
+struct B15Shows {
+    state: AppState,
+    app: axum::Router,
+    ids: HashMap<String, uuid::Uuid>,
+    owner: String,
+    owner_id: uuid::Uuid,
+    viewer: String,
+    viewer_id: uuid::Uuid,
+}
+
+async fn b15_shows() -> B15Shows {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, owner_id, viewer, viewer_id) = g1_owner_and_viewer(&state, &app).await;
+    let folder = media_folder(&state, "b15-shows");
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: "B15 Shows".to_string(),
+        content_type: rustyfin_model::library::LibraryContentType::TvShows,
+        paths: vec![folder.clone()],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    // (id, name, type, parent, index, season number). The episodes go in out of order, so an
+    // answer in insertion order can't pass.
+    let mut rows = Vec::new();
+    let mut ids = HashMap::new();
+    let shows: [(&str, &[(i32, i32)]); 3] = [
+        ("Hotel", &[(1, 3), (1, 1), (0, 1), (1, 4), (1, 2)]),
+        ("India", &[(2, 1), (1, 2), (1, 1)]),
+        ("Quiet", &[(1, 2), (1, 1)]),
+    ];
+    for (show, episodes) in shows {
+        let series = uuid::Uuid::new_v4();
+        ids.insert(show.to_string(), series);
+        rows.push((series, show.to_string(), "Series", None, None, None));
+        let mut seasons = HashMap::new();
+        for &(season, episode) in episodes {
+            let season_id = *seasons.entry(season).or_insert_with(|| {
+                let id = uuid::Uuid::new_v4();
+                let name = format!("{show} Season {season}");
+                rows.push((id, name, "Season", Some(series), Some(season), None));
+                id
+            });
+            let label = format!("{show} S{season:02}E{episode:02}");
+            let id = uuid::Uuid::new_v4();
+            ids.insert(label.clone(), id);
+            rows.push((
+                id,
+                label,
+                "Episode",
+                Some(season_id),
+                Some(episode),
+                Some(season),
+            ));
+        }
+    }
+    for (id, name, media_type, parent, index, season_number) in rows {
+        sqlx::query(
+            "INSERT INTO media_items (id, library_id, name, media_type, path, parent_id, \
+             index_number, parent_index_number) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(id.to_string())
+        .bind(lib.id.to_string())
+        .bind(&name)
+        .bind(media_type)
+        .bind(format!("{folder}/{name}"))
+        .bind(parent.map(|p: uuid::Uuid| p.to_string()))
+        .bind(index)
+        .bind(season_number)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    }
+    B15Shows {
+        state,
+        app,
+        ids,
+        owner,
+        owner_id: owner_id.parse().unwrap(),
+        viewer,
+        viewer_id: viewer_id.parse().unwrap(),
+    }
+}
+
+impl B15Shows {
+    /// Marks `label` played for `user`, last played on 2026-01-`day`.
+    async fn play(&self, user: uuid::Uuid, label: &str, day: u32) {
+        rustyfin_db::repo_playback::mark_played(&self.state.db, user, self.ids[label])
+            .await
+            .unwrap();
+        self.played_on(user, label, day).await;
+    }
+
+    /// Leaves `label` five minutes in for `user`, last played on 2026-01-`day`.
+    async fn start(&self, user: uuid::Uuid, label: &str, day: u32) {
+        rustyfin_db::repo_playback::update_playback_position(
+            &self.state.db,
+            user,
+            self.ids[label],
+            3_000_000_000,
+        )
+        .await
+        .unwrap();
+        self.played_on(user, label, day).await;
+    }
+
+    /// Sets the `last_played_date` of `user`'s row for `label` to 2026-01-`day`.
+    async fn played_on(&self, user: uuid::Uuid, label: &str, day: u32) {
+        sqlx::query(
+            "UPDATE user_item_data SET last_played_date = ? WHERE user_id = ? AND item_id = ?",
+        )
+        .bind(format!("2026-01-{day:02}T20:00:00+00:00"))
+        .bind(user.to_string())
+        .bind(self.ids[label].to_string())
+        .execute(&self.state.db)
+        .await
+        .unwrap();
+    }
+
+    /// Sends `GET /Shows/NextUp?{query}` as `token` and returns the status, the episodes by label
+    /// and `TotalRecordCount`.
+    async fn next_up(&self, token: &str, query: &str) -> (StatusCode, Vec<String>, i64) {
+        let uri = format!("/Shows/NextUp?{query}");
+        let (status, json) = send(&self.app, request("GET", &uri, Some(token), None)).await;
+        let labels = json["Items"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| {
+                        let id = uuid::Uuid::parse_str(item["Id"].as_str().unwrap()).unwrap();
+                        self.ids
+                            .iter()
+                            .find(|(_, other)| **other == id)
+                            .map_or_else(|| id.to_string(), |(label, _)| label.clone())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        (
+            status,
+            labels,
+            json["TotalRecordCount"].as_i64().unwrap_or(-1),
+        )
+    }
+}
+
+/// What `B15Shows::next_up` returns for a 200 that lists `labels` out of `total`.
+fn b15_ok(labels: &[&str], total: i64) -> (StatusCode, Vec<String>, i64) {
+    (
+        StatusCode::OK,
+        labels.iter().map(|label| label.to_string()).collect(),
+        total,
+    )
+}
+
+// Criterion 1: one entry per started series, the first unplayed episode after the highest played.
+#[tokio::test]
+async fn b15_lists_one_episode_per_series() {
+    let s = b15_shows().await;
+    s.play(s.viewer_id, "Hotel S01E01", 1).await;
+    s.play(s.viewer_id, "India S01E01", 2).await;
+    assert_eq!(
+        s.next_up(&s.viewer, "").await,
+        b15_ok(&["India S01E02", "Hotel S01E02"], 2)
+    );
+    let hotel = s.ids["Hotel"];
+    assert_eq!(
+        s.next_up(&s.viewer, &format!("seriesId={hotel}")).await,
+        b15_ok(&["Hotel S01E02"], 1),
+        "Hotel by SeriesId"
+    );
+}
+
+// Criterion 2: newest first by when the highest played episode was played.
+#[tokio::test]
+async fn b15_orders_series_by_last_watched() {
+    let s = b15_shows().await;
+    let viewer = s.viewer_id;
+    s.play(viewer, "Hotel S01E01", 1).await;
+    s.play(viewer, "India S01E01", 2).await;
+    s.play(viewer, "Hotel S01E02", 3).await;
+    assert_eq!(
+        s.next_up(&s.viewer, "").await,
+        b15_ok(&["Hotel S01E03", "India S01E02"], 2),
+        "Hotel S01E02 played last"
+    );
+    s.play(viewer, "India S01E01", 4).await;
+    assert_eq!(
+        s.next_up(&s.viewer, "").await,
+        b15_ok(&["India S01E02", "Hotel S01E03"], 2),
+        "India S01E01 played again"
+    );
+    // Hotel's highest played episode is still S01E02, played on day 3.
+    s.play(viewer, "Hotel S01E01", 5).await;
+    s.start(viewer, "Hotel S01E03", 6).await;
+    assert_eq!(
+        s.next_up(&s.viewer, "").await,
+        b15_ok(&["India S01E02", "Hotel S01E03"], 2),
+        "Hotel S01E01 played again and Hotel S01E03 in progress"
+    );
+    // Equal dates: the series with the newer play, here an episode in progress, goes first.
+    let owner = s.owner_id;
+    s.play(owner, "Hotel S01E01", 1).await;
+    s.play(owner, "India S01E01", 1).await;
+    s.start(owner, "Hotel S01E02", 2).await;
+    assert_eq!(
+        s.next_up(&s.owner, "").await,
+        b15_ok(&["Hotel S01E02", "India S01E02"], 2),
+        "a tie, Hotel S01E02 in progress"
+    );
+    s.start(owner, "India S01E02", 3).await;
+    assert_eq!(
+        s.next_up(&s.owner, "").await,
+        b15_ok(&["India S01E02", "Hotel S01E02"], 2),
+        "a tie, India S01E02 in progress"
+    );
+}
+
+// Criterion 3: StartIndex, Limit and TotalRecordCount count series; SeriesId names one series.
+#[tokio::test]
+async fn b15_pages_series() {
+    let s = b15_shows().await;
+    s.play(s.viewer_id, "Hotel S01E01", 1).await;
+    s.play(s.viewer_id, "India S01E01", 2).await;
+    s.play(s.viewer_id, "Quiet S01E01", 3).await;
+    let india = s.ids["India"];
+    let cases = [
+        (
+            String::new(),
+            b15_ok(&["Quiet S01E02", "India S01E02", "Hotel S01E02"], 3),
+        ),
+        ("limit=1".to_string(), b15_ok(&["Quiet S01E02"], 3)),
+        (
+            "startIndex=1".to_string(),
+            b15_ok(&["India S01E02", "Hotel S01E02"], 3),
+        ),
+        (
+            "startIndex=1&limit=1".to_string(),
+            b15_ok(&["India S01E02"], 3),
+        ),
+        (
+            "startIndex=2&limit=5".to_string(),
+            b15_ok(&["Hotel S01E02"], 3),
+        ),
+        ("startIndex=3".to_string(), b15_ok(&[], 3)),
+        ("limit=0".to_string(), b15_ok(&[], 3)),
+        (
+            format!("seriesId={india}&limit=1"),
+            b15_ok(&["India S01E02"], 1),
+        ),
+        (format!("seriesId={india}&startIndex=1"), b15_ok(&[], 1)),
+        (format!("seriesId={}", uuid::Uuid::new_v4()), b15_ok(&[], 0)),
+        (
+            format!("seriesId={}", s.ids["India S01E01"]),
+            b15_ok(&[], 0),
+        ),
+    ];
+    for (query, answer) in cases {
+        assert_eq!(s.next_up(&s.viewer, &query).await, answer, "{query}");
+    }
+}
+
+// Criterion 4: season 0 is never offered and never sets the position.
+#[tokio::test]
+async fn b15_leaves_specials_out() {
+    let s = b15_shows().await;
+    s.play(s.viewer_id, "Hotel S01E01", 1).await;
+    s.play(s.viewer_id, "Hotel S00E01", 2).await;
+    assert_eq!(
+        s.next_up(&s.viewer, "").await,
+        b15_ok(&["Hotel S01E02"], 1),
+        "viewer"
+    );
+    // With nothing played the series starts at S01E01, not at the special.
+    let hotel = s.ids["Hotel"];
+    assert_eq!(
+        s.next_up(&s.owner, &format!("seriesId={hotel}")).await,
+        b15_ok(&["Hotel S01E01"], 1),
+        "owner, Hotel by SeriesId"
+    );
+    // A played special starts the series but isn't its highest played episode, so Hotel comes
+    // after India although the special was played later.
+    s.play(s.owner_id, "India S01E01", 3).await;
+    s.play(s.owner_id, "Hotel S00E01", 4).await;
+    assert_eq!(
+        s.next_up(&s.owner, "").await,
+        b15_ok(&["India S01E02", "Hotel S01E01"], 2),
+        "owner"
+    );
+}
+
+// Criterion 5: after a season's last episode comes the next season's first.
+#[tokio::test]
+async fn b15_moves_to_next_season() {
+    let s = b15_shows().await;
+    s.play(s.viewer_id, "India S01E01", 1).await;
+    s.play(s.viewer_id, "India S01E02", 2).await;
+    assert_eq!(s.next_up(&s.viewer, "").await, b15_ok(&["India S02E01"], 1));
+}
+
+// Criterion 6: a series with nothing left after the position drops out.
+#[tokio::test]
+async fn b15_drops_finished_series() {
+    let s = b15_shows().await;
+    s.play(s.viewer_id, "India S01E01", 1).await;
+    s.play(s.viewer_id, "India S01E02", 2).await;
+    s.play(s.viewer_id, "India S02E01", 3).await;
+    s.play(s.viewer_id, "Hotel S01E01", 4).await;
+    assert_eq!(s.next_up(&s.viewer, "").await, b15_ok(&["Hotel S01E02"], 1));
+    let india = s.ids["India"];
+    assert_eq!(
+        s.next_up(&s.viewer, &format!("seriesId={india}")).await,
+        b15_ok(&[], 0),
+        "India by SeriesId"
+    );
+}
+
+// Criterion 7: an episode in progress is unplayed, so it can be next.
+#[tokio::test]
+async fn b15_offers_episode_in_progress() {
+    let s = b15_shows().await;
+    s.play(s.viewer_id, "Hotel S01E01", 1).await;
+    s.play(s.viewer_id, "India S01E01", 2).await;
+    s.start(s.viewer_id, "Hotel S01E02", 3).await;
+    assert_eq!(
+        s.next_up(&s.viewer, "").await,
+        b15_ok(&["India S01E02", "Hotel S01E02"], 2),
+        "Hotel S01E02 in progress"
+    );
+    // A series with only an episode in progress comes after those with a played episode.
+    s.start(s.viewer_id, "Quiet S01E01", 4).await;
+    assert_eq!(
+        s.next_up(&s.viewer, "").await,
+        b15_ok(&["India S01E02", "Hotel S01E02", "Quiet S01E01"], 3),
+        "Quiet S01E01 in progress"
+    );
+}
+
+// Criterion 8: a series the user hasn't played, or has marked unplayed, isn't listed.
+#[tokio::test]
+async fn b15_leaves_unplayed_series_out() {
+    let s = b15_shows().await;
+    assert_eq!(
+        s.next_up(&s.viewer, "").await,
+        b15_ok(&[], 0),
+        "nothing played"
+    );
+    let quiet = s.ids["Quiet"];
+    assert_eq!(
+        s.next_up(&s.viewer, &format!("seriesId={quiet}")).await,
+        b15_ok(&["Quiet S01E01"], 1),
+        "Quiet by SeriesId"
+    );
+    s.play(s.viewer_id, "Hotel S01E01", 1).await;
+    s.play(s.viewer_id, "India S01E01", 2).await;
+    rustyfin_db::repo_playback::mark_unplayed(&s.state.db, s.viewer_id, s.ids["India S01E01"])
+        .await
+        .unwrap();
+    assert_eq!(
+        s.next_up(&s.viewer, "").await,
+        b15_ok(&["Hotel S01E02"], 1),
+        "India S01E01 played, then marked unplayed"
+    );
+}
+
+// Criterion 9: only the user's own plays count.
+#[tokio::test]
+async fn b15_ignores_other_users() {
+    let s = b15_shows().await;
+    let (viewer, owner) = (s.viewer_id, s.owner_id);
+    s.play(viewer, "Hotel S01E01", 1).await;
+    s.play(viewer, "India S01E01", 2).await;
+    s.play(owner, "Hotel S01E01", 3).await;
+    s.play(owner, "Hotel S01E02", 4).await;
+    s.play(owner, "Hotel S01E03", 5).await;
+    s.play(owner, "Quiet S01E01", 6).await;
+    s.start(owner, "India S01E02", 7).await;
+    let viewers = b15_ok(&["India S01E02", "Hotel S01E02"], 2);
+    assert_eq!(s.next_up(&s.viewer, "").await, viewers, "viewer");
+    assert_eq!(
+        s.next_up(&s.owner, "").await,
+        b15_ok(&["Quiet S01E02", "Hotel S01E04", "India S01E01"], 3),
+        "owner"
+    );
+    assert_eq!(
+        s.next_up(&s.owner, &format!("userId={viewer}")).await,
+        viewers,
+        "owner for the viewer"
+    );
+}
+
+// Criterion 10: the highest played episode sets the position, even past unplayed ones.
+#[tokio::test]
+async fn b15_skips_past_gaps() {
+    let s = b15_shows().await;
+    s.play(s.viewer_id, "Hotel S01E01", 1).await;
+    s.play(s.viewer_id, "Hotel S01E03", 2).await;
+    assert_eq!(s.next_up(&s.viewer, "").await, b15_ok(&["Hotel S01E04"], 1));
+    s.play(s.viewer_id, "Hotel S01E04", 3).await;
+    assert_eq!(
+        s.next_up(&s.viewer, "").await,
+        b15_ok(&[], 0),
+        "Hotel S01E02 is still unplayed"
+    );
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -9004,18 +9434,14 @@ async fn g1c_next_up_accepts_both_casings() {
     let (owner, viewer) = (owner.as_str(), viewer.as_str());
     let ok = |ids: &[uuid::Uuid]| (StatusCode::OK, ids.to_vec());
     let forbidden = (StatusCode::FORBIDDEN, Vec::new());
-    // (path, token, camelCase query, answer). The owner has watched E1; E3 airs in 2999.
+    // (path, token, camelCase query, answer). The owner has watched E1, so their Next Up is E2,
+    // and the viewer has played nothing. E3 airs in 2999.
     let cases = [
-        ("/Shows/NextUp", viewer, "limit=1".to_string(), ok(&[e1])),
+        ("/Shows/NextUp", owner, "limit=0".to_string(), ok(&[])),
+        ("/Shows/NextUp", owner, "startIndex=1".to_string(), ok(&[])),
         (
             "/Shows/NextUp",
-            viewer,
-            "startIndex=1&limit=1".to_string(),
-            ok(&[e2]),
-        ),
-        (
-            "/Shows/NextUp",
-            viewer,
+            owner,
             format!("seriesId={random}"),
             ok(&[]),
         ),
@@ -9023,7 +9449,7 @@ async fn g1c_next_up_accepts_both_casings() {
             "/Shows/NextUp",
             viewer,
             format!("seriesId={series}"),
-            ok(&[e1, e2, e3]),
+            ok(&[e1]),
         ),
         (
             "/Shows/NextUp",
@@ -9035,13 +9461,13 @@ async fn g1c_next_up_accepts_both_casings() {
             "/Shows/NextUp",
             owner,
             format!("userId={viewer_id}"),
-            ok(&[e1, e2, e3]),
+            ok(&[]),
         ),
         (
             "/Shows/NextUp",
             "test-api-key",
             format!("userId={owner_id}"),
-            ok(&[e2, e3]),
+            ok(&[e2]),
         ),
         ("/Shows/Upcoming", viewer, "limit=0".to_string(), ok(&[])),
         (
