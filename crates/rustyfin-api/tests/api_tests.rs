@@ -2299,16 +2299,6 @@ async fn test_startup_fresh_state_needs_setup() {
 }
 
 #[tokio::test]
-async fn test_startup_flag_without_owner_still_needs_setup() {
-    let state = test_state().await;
-    add_user(&state, "olduser", "oldpass", true).await;
-    state.config.write().await.is_startup_wizard_completed = true;
-    let app = app(state.clone());
-
-    assert_eq!(wizard_completed(&app).await, (false, false));
-}
-
-#[tokio::test]
 async fn test_startup_user_creates_owner_with_typed_name() {
     let state = test_state().await;
     let app = app(state.clone());
@@ -2364,66 +2354,6 @@ async fn test_startup_user_rejected_once_owner_exists() {
     assert_eq!(
         owners_and_count(&state).await,
         (vec!["karl".to_string()], 1)
-    );
-}
-
-#[tokio::test]
-async fn test_startup_user_with_admin_but_no_owner() {
-    let state = test_state().await;
-    add_user(&state, "olduser", "oldpass", true).await;
-    let app = app(state.clone());
-
-    assert_eq!(wizard_completed(&app).await, (false, false));
-    let (status, body) = send(&app, request("GET", "/Startup/User", None, None)).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        body["Name"], "",
-        "no user name leaks before an owner exists"
-    );
-
-    assert_eq!(
-        post_startup_user(&app, None, "karl", "geheim").await,
-        StatusCode::NO_CONTENT
-    );
-    assert!(login(&app, "karl", "geheim").await.is_some());
-    assert!(
-        login(&app, "olduser", "oldpass").await.is_some(),
-        "existing admin unchanged"
-    );
-    assert_eq!(
-        user_flags(&state, "olduser").await,
-        Some((true, false, false))
-    );
-    assert_eq!(
-        owners_and_count(&state).await,
-        (vec!["karl".to_string()], 2)
-    );
-}
-
-#[tokio::test]
-async fn test_startup_user_takes_over_existing_admin_name() {
-    let state = test_state().await;
-    // A leftover "admin" from an older version, demoted to show that the owner becomes an administrator.
-    let admin_id = add_user(&state, "admin", "admin", false).await;
-    let app = app(state.clone());
-
-    assert_eq!(
-        post_startup_user(&app, None, "admin", "newpass").await,
-        StatusCode::NO_CONTENT
-    );
-    let (_, user_id) = login(&app, "admin", "newpass")
-        .await
-        .expect("the typed name logs in with the new password");
-    assert_eq!(
-        user_id,
-        admin_id.to_string(),
-        "the existing account is reused"
-    );
-    assert!(login(&app, "admin", "admin").await.is_none());
-    assert_eq!(user_flags(&state, "admin").await, Some((true, true, false)));
-    assert_eq!(
-        owners_and_count(&state).await,
-        (vec!["admin".to_string()], 1)
     );
 }
 
@@ -2629,84 +2559,6 @@ async fn test_startup_complete_requires_owner() {
 }
 
 #[tokio::test]
-async fn test_startup_user_disables_leftover_default_admin() {
-    let state = test_state().await;
-    add_user(&state, "admin", "admin", true).await;
-    let app = app(state.clone());
-
-    assert_eq!(
-        post_startup_user(&app, None, "karl", "geheim").await,
-        StatusCode::NO_CONTENT
-    );
-    assert!(
-        login(&app, "karl", "geheim").await.is_some(),
-        "the owner can log in"
-    );
-    assert!(
-        login(&app, "admin", "admin").await.is_none(),
-        "admin/admin is disabled"
-    );
-    assert_eq!(
-        user_flags(&state, "admin").await,
-        Some((true, false, true)),
-        "disabled, not deleted"
-    );
-    assert_eq!(
-        owners_and_count(&state).await,
-        (vec!["karl".to_string()], 2)
-    );
-}
-
-#[tokio::test]
-async fn test_startup_user_keeps_admin_with_changed_password() {
-    let state = test_state().await;
-    add_user(&state, "admin", "secret", true).await;
-    let app = app(state.clone());
-
-    assert_eq!(
-        post_startup_user(&app, None, "karl", "geheim").await,
-        StatusCode::NO_CONTENT
-    );
-    assert!(
-        login(&app, "karl", "geheim").await.is_some(),
-        "the owner can log in"
-    );
-    assert!(
-        login(&app, "admin", "secret").await.is_some(),
-        "admin keeps working"
-    );
-    assert_eq!(
-        user_flags(&state, "admin").await,
-        Some((true, false, false))
-    );
-}
-
-#[tokio::test]
-async fn test_startup_user_name_match_is_exact() {
-    let state = test_state().await;
-    let admin_id = add_user(&state, "admin", "admin", true).await;
-    let app = app(state.clone());
-
-    assert_eq!(
-        post_startup_user(&app, None, "Admin", "geheim").await,
-        StatusCode::NO_CONTENT
-    );
-    let (_, owner_id) = login(&app, "Admin", "geheim")
-        .await
-        .expect("\"Admin\" is a new account");
-    assert_ne!(owner_id, admin_id.to_string());
-    assert!(
-        login(&app, "admin", "admin").await.is_none(),
-        "admin/admin is disabled"
-    );
-    assert_eq!(user_flags(&state, "admin").await, Some((true, false, true)));
-    assert_eq!(
-        owners_and_count(&state).await,
-        (vec!["Admin".to_string()], 2)
-    );
-}
-
-#[tokio::test]
 async fn test_upgrade_promotes_earliest_admin() {
     use rustyfin_db::repo_user::promote_earliest_admin_to_owner;
 
@@ -2743,7 +2595,7 @@ async fn test_upgrade_promotes_earliest_admin() {
 
 // ── G1: authorization ──
 // Admin endpoints answer 401 without a valid token and 403 to a non-admin. Setup endpoints are
-// open only until the server has an owner. Names taken from a request stay inside their directory.
+// open only while the server has no users. Names taken from a request stay inside their directory.
 
 /// Creates the folder `media/<name>` in the test's data dir and returns its path.
 fn media_folder(state: &AppState, name: &str) -> String {
@@ -4941,24 +4793,18 @@ async fn g2_deleted_users_token_is_rejected() {
 }
 
 #[tokio::test]
-async fn g2_disabled_leftover_admin_token_is_rejected() {
+async fn g2_disabled_user_token_is_rejected() {
     let state = test_state().await;
     add_user(&state, "admin", "admin", true).await;
     let app = app(state.clone());
-    // The leftover admin logs in before the wizard runs.
+    // The administrator signs in, then is disabled. Only the database can disable a user.
     let (admin_t, _) = g2_login_device(&app, "admin", "admin", "admin-dev")
         .await
         .expect("admin login");
-    // The wizard creates the real owner, disabling the leftover admin.
-    assert_eq!(
-        post_startup_user(&app, None, "karl", "geheim").await,
-        StatusCode::NO_CONTENT
-    );
-    assert_eq!(
-        user_flags(&state, "admin").await,
-        Some((true, false, true)),
-        "the leftover admin is disabled"
-    );
+    sqlx::query("UPDATE users SET is_disabled = 1 WHERE name = 'admin'")
+        .execute(&state.db)
+        .await
+        .unwrap();
 
     let (me, _) = send(&app, request("GET", "/Users/Me", Some(&admin_t), None)).await;
     assert_eq!(
@@ -5777,65 +5623,6 @@ async fn g2f_reset_password_hides_unknown_users() {
     assert_eq!(
         unknown, known,
         "an unknown user gets the same status and body as a wrong PIN"
-    );
-}
-
-#[tokio::test]
-async fn g2f_wizard_claiming_admin_ends_its_sessions() {
-    // The wizard claims the leftover "admin" by name and sets a new password; the admin/admin
-    // tokens end in the same step. 90c99b5 kept them.
-    let state = test_state().await;
-    add_user(&state, "admin", "admin", true).await;
-    let app = app(state);
-    let (old_t, _) = g2_login_device(&app, "admin", "admin", "admin-dev")
-        .await
-        .expect("admin login");
-    assert_eq!(
-        post_startup_user(&app, None, "admin", "new-secret").await,
-        StatusCode::NO_CONTENT
-    );
-    let (me, _) = send(&app, request("GET", "/Users/Me", Some(&old_t), None)).await;
-    assert_eq!(
-        me,
-        StatusCode::UNAUTHORIZED,
-        "the claimed account's earlier token is revoked"
-    );
-    assert!(
-        g2_login_device(&app, "admin", "new-secret", "d2")
-            .await
-            .is_some(),
-        "the new password works"
-    );
-}
-
-#[tokio::test]
-async fn g2f_disabled_leftover_admin_tokens_are_deleted() {
-    // The wizard creates a new owner and disables the leftover admin. Its tokens are deleted, not
-    // only rejected while disabled, so re-enabling the account does not revive them.
-    let state = test_state().await;
-    add_user(&state, "admin", "admin", true).await;
-    let app = app(state.clone());
-    let (old_t, _) = g2_login_device(&app, "admin", "admin", "admin-dev")
-        .await
-        .expect("admin login");
-    assert_eq!(
-        post_startup_user(&app, None, "karl", "geheim").await,
-        StatusCode::NO_CONTENT
-    );
-    assert_eq!(
-        user_flags(&state, "admin").await,
-        Some((true, false, true)),
-        "the leftover admin is disabled"
-    );
-    sqlx::query("UPDATE users SET is_disabled = 0 WHERE name = 'admin'")
-        .execute(&state.db)
-        .await
-        .unwrap();
-    let (me, _) = send(&app, request("GET", "/Users/Me", Some(&old_t), None)).await;
-    assert_eq!(
-        me,
-        StatusCode::UNAUTHORIZED,
-        "a re-enabled leftover's old token stays revoked"
     );
 }
 

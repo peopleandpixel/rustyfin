@@ -103,7 +103,7 @@ async fn main() {
     let api_key = credentials::api_key(std::env::var("RUSTYFIN_API_KEY").ok());
 
     // Load or create server configuration
-    let config = load_config(&data_dir);
+    let mut config = load_config(&data_dir);
 
     tracing::info!("initializing database at {}", db_url);
     let pool = rustyfin_db::init_db(&db_url)
@@ -115,26 +115,11 @@ async fn main() {
         .await
         .expect("failed to initialize read-only database pool");
 
-    // No user is created at startup. An upgraded server that already finished the setup wizard
-    // gets its earliest administrator promoted to server owner; a fresh one waits for the wizard.
-    if config.is_startup_wizard_completed {
-        let promoted = rustyfin_db::repo_user::promote_earliest_admin_to_owner(&pool)
-            .await
-            .expect("failed to promote earliest administrator to server owner");
-        if let Some(user) = promoted {
-            tracing::info!(
-                "promoted earliest administrator '{}' to server owner",
-                user.name
-            );
-        }
-    }
-
-    let owner_exists = rustyfin_db::repo_user::owner_exists(&pool)
+    // No user is created at startup. A server with users gets an owner, its earliest enabled
+    // administrator, and a closed setup wizard. A fresh one waits for the wizard.
+    rustyfin_api::routes::settle_owner_at_startup(&pool, &mut config, &data_dir)
         .await
-        .expect("failed to query server owner");
-    if !owner_exists {
-        tracing::info!("no server owner yet; finish the setup wizard in the web client");
-    }
+        .expect("failed to settle the server owner");
 
     // Warn about each enabled administrator who still has the default password "admin".
     match rustyfin_auth::admins_with_default_password(&pool).await {

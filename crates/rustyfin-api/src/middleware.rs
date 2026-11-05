@@ -95,14 +95,14 @@ pub async fn require_auth(
     Ok(next.run(req).await)
 }
 
-/// Guards the setup wizard routes. Until an owner exists, anyone may use them. After that, only an
+/// Guards the setup wizard routes. While the server has no users, anyone may use them. After that, only an
 /// administrator may.
 pub async fn require_setup_or_admin(
     State(state): State<AppState>,
     mut req: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
-    if !rustyfin_db::repo_user::owner_exists(&state.db).await? {
+    if !rustyfin_db::repo_user::users_exist(&state.db).await? {
         return Ok(next.run(req).await);
     }
     let (claims, _) = request_claims(&state, req.headers(), req.uri()).await?;

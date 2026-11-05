@@ -73,7 +73,7 @@ async fn ping() -> &'static str {
 }
 
 async fn get_public_info(State(state): State<AppState>) -> Result<Json<ServerInfo>, ApiError> {
-    let startup_wizard_completed = rustyfin_db::repo_user::owner_exists(&state.db_ro).await?;
+    let startup_wizard_completed = rustyfin_db::repo_user::users_exist(&state.db_ro).await?;
     let config = state.config.read().await;
     Ok(Json(ServerInfo {
         server_name: config.server_name.clone(),
@@ -87,7 +87,7 @@ async fn get_full_info(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> Result<Json<FullServerInfo>, ApiError> {
-    let startup_wizard_completed = rustyfin_db::repo_user::owner_exists(&state.db_ro).await?;
+    let startup_wizard_completed = rustyfin_db::repo_user::users_exist(&state.db_ro).await?;
     let config = state.config.read().await;
     let log_path = state.data_dir.join("logs").to_string_lossy().to_string();
     let cache_path = state.data_dir.join("cache").to_string_lossy().to_string();

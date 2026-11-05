@@ -4,10 +4,10 @@ use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use rustyfin_db::repo_user::OwnerClaim;
 use rustyfin_model::auth::Claims;
+use rustyfin_model::server_info::ServerConfiguration;
 use rustyfin_model::setup::{
     StartupConfiguration, StartupConfigurationUpdate, StartupUser, StartupUserCreate,
 };
-use rustyfin_model::user::User;
 
 use crate::error::ApiError;
 use crate::state::AppState;
@@ -58,13 +58,13 @@ async fn get_startup_user(
     claims: Option<Extension<Claims>>,
 ) -> Result<Json<StartupUser>, ApiError> {
     let Some(owner) = rustyfin_db::repo_user::get_owner(&state.db_ro).await? else {
-        // Before an owner exists, the wizard starts empty, even if other administrators exist.
+        // Without an owner the wizard starts empty.
         return Ok(Json(StartupUser {
             name: String::new(),
             password: String::new(),
         }));
     };
-    // The guard already admits only administrators once an owner exists. This check covers a race.
+    // The guard admits only administrators once the server has users. This check covers a race.
     if !claims.is_some_and(|Extension(c)| c.is_admin) {
         return Err(ApiError::Unauthorized);
     }
@@ -74,30 +74,12 @@ async fn get_startup_user(
     }))
 }
 
-/// Returns the account named `admin` if its password is still the default `admin`. The owner claim
-/// disables such an account. The name `admin` itself is not a leftover, because the claim takes over
-/// that account. Any error counts as no leftover.
-async fn default_admin_leftover(state: &AppState, name: &str) -> Option<User> {
-    if name == "admin" {
-        return None;
-    }
-    let admin = rustyfin_db::repo_user::get_user_by_name(&state.db, "admin")
-        .await
-        .ok()
-        .flatten()?;
-    let has_default_password = matches!(
-        rustyfin_auth::verify_password("admin", &admin.password_hash).await,
-        Ok(true)
-    );
-    has_default_password.then_some(admin)
-}
-
 async fn create_startup_user(
     State(state): State<AppState>,
     Json(input): Json<StartupUserCreate>,
 ) -> Result<StatusCode, ApiError> {
-    if rustyfin_db::repo_user::owner_exists(&state.db).await? {
-        return Err(ApiError::Forbidden("A server owner already exists.".into()));
+    if rustyfin_db::repo_user::users_exist(&state.db).await? {
+        return Err(ApiError::Forbidden("The server already has users.".into()));
     }
     // The name is stored exactly as sent. Only this check trims it.
     if input.name.trim().is_empty() {
@@ -107,24 +89,10 @@ async fn create_startup_user(
     let hash = rustyfin_auth::hash_password(&input.password)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
-    let leftover = default_admin_leftover(&state, &input.name).await;
 
-    let claim =
-        rustyfin_db::repo_user::claim_owner(&state.db, &input.name, &hash, leftover.as_ref())
-            .await?;
-    match claim {
-        OwnerClaim::AlreadyOwned => {
-            Err(ApiError::Forbidden("A server owner already exists.".into()))
-        }
-        OwnerClaim::Claimed { leftover_disabled } => {
-            if leftover_disabled {
-                tracing::warn!(
-                    "disabled the leftover account 'admin' whose password was still the default 'admin'; the server owner is now '{}'",
-                    input.name
-                );
-            }
-            Ok(StatusCode::NO_CONTENT)
-        }
+    match rustyfin_db::repo_user::claim_owner(&state.db, &input.name, &hash).await? {
+        OwnerClaim::Claimed => Ok(StatusCode::NO_CONTENT),
+        OwnerClaim::Refused => Err(ApiError::Forbidden("The server already has users.".into())),
     }
 }
 
@@ -172,4 +140,74 @@ async fn setup_remote_access(
     Json(_body): Json<serde_json::Value>,
 ) -> Result<StatusCode, ApiError> {
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// What `settle_owner_at_startup` found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StartupOwner {
+    /// The server has no users, so the setup wizard is open.
+    NoUsers,
+    /// The server already had an owner.
+    Existing,
+    /// The earliest enabled administrator, named here, became the owner.
+    Promoted(String),
+    /// Users exist, but none is an enabled administrator, so the server has no owner.
+    NoEnabledAdmin,
+}
+
+/// Runs at startup, before the server listens. With users, it makes the earliest enabled
+/// administrator the owner if there is none, and marks the setup wizard complete whatever
+/// `config.json` says. Without users it changes nothing, so the setup wizard stays open.
+pub async fn settle_owner_at_startup(
+    db: &sqlx::SqlitePool,
+    config: &mut ServerConfiguration,
+    data_dir: &std::path::Path,
+) -> Result<StartupOwner, sqlx::Error> {
+    if !rustyfin_db::repo_user::users_exist(db).await? {
+        tracing::info!("no server owner yet; finish the setup wizard in the web client");
+        return Ok(StartupOwner::NoUsers);
+    }
+
+    let owner = match rustyfin_db::repo_user::promote_earliest_admin_to_owner(db).await? {
+        Some(user) => {
+            tracing::info!(
+                "promoted earliest administrator '{}' to server owner",
+                user.name
+            );
+            StartupOwner::Promoted(user.name)
+        }
+        None => {
+            if rustyfin_db::repo_user::owner_exists(db).await? {
+                StartupOwner::Existing
+            } else {
+                tracing::error!(
+                    "users exist, but none is an enabled administrator, so the server has no owner \
+                    and the setup wizard stays closed. To recover, start the server with \
+                    RUSTYFIN_API_KEY set, list the users with GET /Users, and make one an \
+                    administrator with POST /Users/<Id>/Policy and the body \
+                    {{\"IsAdministrator\": true}}, sending the key in the X-Emby-Token header. \
+                    After a restart the earliest enabled administrator becomes the owner. A \
+                    disabled user can be enabled again only in the database (users.is_disabled = 0)."
+                );
+                StartupOwner::NoEnabledAdmin
+            }
+        }
+    };
+
+    if !config.is_startup_wizard_completed {
+        config.is_startup_wizard_completed = true;
+        let path = data_dir.join("config.json");
+        let saved = match serde_json::to_string_pretty(&*config) {
+            Ok(json) => tokio::fs::write(&path, json).await,
+            Err(e) => Err(std::io::Error::other(e)),
+        };
+        if let Err(e) = saved {
+            tracing::warn!(
+                "could not save the setup wizard state to {}: {}",
+                path.display(),
+                e
+            );
+        }
+    }
+    Ok(owner)
 }

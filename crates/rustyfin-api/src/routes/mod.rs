@@ -34,6 +34,8 @@ mod transcode;
 mod users;
 mod websocket;
 
+pub use startup::{StartupOwner, settle_owner_at_startup};
+
 use axum::Router;
 use axum::middleware as axum_mw;
 
@@ -41,7 +43,7 @@ use crate::middleware::{rate_limit, require_admin, require_auth, require_setup_o
 use crate::state::AppState;
 
 pub fn build_router(state: AppState) -> Router {
-    // Open until an owner exists, then administrators only (Jellyfin's FirstTimeSetupOrElevated).
+    // Open while the server has no users, then administrators only (Jellyfin's FirstTimeSetupOrElevated).
     let setup = Router::new()
         .merge(startup::routes())
         .merge(system::setup_routes())
