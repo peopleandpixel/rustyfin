@@ -6,6 +6,8 @@ use tokio::process::Command;
 use tokio::sync::Semaphore;
 use tracing::warn;
 
+use crate::scan_sync;
+
 /// Global semaphore to limit concurrent ffprobe process spawns.
 /// Configurable via RUSTYFIN_MAX_PROBES env var; defaults to num_cpus * 2 (min 4, max 16).
 static PROBE_SEMAPHORE: OnceLock<Semaphore> = OnceLock::new();
@@ -754,6 +756,94 @@ pub fn spawn_probe_and_add_source(
             tracing::warn!("failed to probe '{}': {}", path, e);
         }
     })
+}
+
+/// One file of a probe plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeStep {
+    /// Probes the file as the item's primary source: it replaces the item's sources, and sets its runtime and chapters.
+    Primary(String),
+    /// Probes the file and adds it to the item as another source.
+    Alternate(String),
+}
+
+/// Runs `steps` for one item, in order, under one probe permit. A step that fails is logged, and
+/// the next step still runs. A step that succeeds clears the probe failure of its file, and one
+/// that fails with an ffprobe or parse error records it, so that later scans skip the file.
+///
+/// After a failed `Primary` step the item has no primary, so the next step runs as the primary
+/// instead, with `probe_and_save`. If that step succeeds, its file becomes the item's path, and the
+/// steps after it are alternates again.
+pub fn spawn_probe_plan(
+    pool: sqlx::SqlitePool,
+    item_id: uuid::Uuid,
+    steps: Vec<ProbeStep>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        // One permit for the whole plan, so that its steps run in order
+        let _permit = probe_semaphore().acquire().await;
+        // Whether the item has no primary: true from a failed primary step until a step succeeds
+        let mut needs_primary = false;
+        for step in steps {
+            let is_primary = matches!(step, ProbeStep::Primary(_));
+            let (path, result) = match &step {
+                ProbeStep::Primary(path) => (path, probe_and_save(&pool, &item_id, path).await),
+                ProbeStep::Alternate(path) if needs_primary => {
+                    (path, probe_and_save(&pool, &item_id, path).await)
+                }
+                ProbeStep::Alternate(path) => {
+                    (path, probe_and_add_alternate(&pool, &item_id, path).await)
+                }
+            };
+            // Keep the failure record in step with the probe. A DB error here is only logged.
+            let recorded = match &result {
+                Ok(()) => scan_sync::clear_probe_failure(&pool, path).await,
+                Err(ProbeError::FfprobeFailed(_) | ProbeError::ParseError(_)) => {
+                    scan_sync::record_probe_failure(&pool, path).await
+                }
+                Err(_) => Ok(()),
+            };
+            if let Err(e) = recorded {
+                warn!("failed to record the probe of '{}': {}", path, e);
+            }
+            match result {
+                Ok(()) => {
+                    if needs_primary {
+                        let moved = sqlx::query("UPDATE media_items SET path = ?1 WHERE id = ?2")
+                            .bind(path.as_str())
+                            .bind(item_id.to_string())
+                            .execute(&pool)
+                            .await;
+                        if let Err(e) = moved {
+                            warn!("failed to set the path of '{}': {}", path, e);
+                        }
+                        needs_primary = false;
+                    }
+                }
+                Err(e) => {
+                    warn!("failed to probe '{}': {}", path, e);
+                    needs_primary |= is_primary;
+                }
+            }
+        }
+    })
+}
+
+/// Adds `path` to an item as another source: probes the file and inserts it with its streams.
+/// Unlike `probe_and_add_source`, it leaves the item's runtime and chapters alone.
+pub async fn probe_and_add_alternate(
+    pool: &sqlx::SqlitePool,
+    item_id: &uuid::Uuid,
+    path: &str,
+) -> Result<(), ProbeError> {
+    let result = probe_file(path).await?;
+    let _source_id = rustyfin_db::repo_media_source::insert_media_source_with_streams(
+        pool,
+        item_id,
+        &result.source,
+    )
+    .await?;
+    Ok(())
 }
 
 /// Internal: probe a file and insert it as a media source for an item.
