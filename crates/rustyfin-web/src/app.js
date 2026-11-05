@@ -2969,6 +2969,10 @@ function initScanProgressWebSocket() {
                 if (libId) delete scanStatuses[libId];
                 if (data.State === 'Failed') {
                     toast(t('admin.task_failed', { name: data.Name || t('admin.task'), error: data.Error || t('common.unknown_error') }), 'error');
+                } else if (data.State === 'Completed' && libId) {
+                    // Name the library; the event's Name is an English server label
+                    const lib = libraries.find(l => (l.id || l.Id) === libId);
+                    toast(lib ? t('library.scan_finished_for', { name: lib.name || lib.Name }) : t('library.scan_finished'));
                 }
                 // Refresh tasks tab if visible
                 if (currentPage === 'admin') refreshTasks();

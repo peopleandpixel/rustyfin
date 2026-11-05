@@ -155,6 +155,8 @@
         "list_failed": "Bibliotheken konnten nicht geladen werden: {{message}}",
         "scan_start_failed": "Scan konnte nicht gestartet werden: {{message}}",
         "scan_failed": "Scan fehlgeschlagen: {{message}}",
+        "scan_finished_for": "Scan abgeschlossen: {{name}}",
+        "scan_finished": "Scan abgeschlossen",
         "no_subfolders": "Keine Unterverzeichnisse",
         "parent_folder": "Elternordner",
         "no_access": "Kein Zugriff",

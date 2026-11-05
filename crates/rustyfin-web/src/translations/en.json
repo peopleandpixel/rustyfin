@@ -155,6 +155,8 @@
         "list_failed": "Could not load the libraries: {{message}}",
         "scan_start_failed": "Could not start the scan: {{message}}",
         "scan_failed": "Scan failed: {{message}}",
+        "scan_finished_for": "Scan finished: {{name}}",
+        "scan_finished": "Scan finished",
         "no_subfolders": "No subfolders",
         "parent_folder": "Parent folder",
         "no_access": "No access",
