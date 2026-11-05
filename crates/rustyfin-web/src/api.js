@@ -356,7 +356,7 @@ const API = {
     // Scheduled Tasks
     getTasks() { return this.get('/ScheduledTasks'); },
     startTask(id) { return this.post(`/ScheduledTasks/Running/${id}`); },
-    stopTask(id) { return this.delete(`/ScheduledTasks/Running/${id}`); },
+    stopTask(id) { return this.del(`/ScheduledTasks/Running/${id}`); },
 
     // Plugins
     getPlugins() { return this.get('/Plugins'); },

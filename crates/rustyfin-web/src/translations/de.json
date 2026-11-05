@@ -308,6 +308,8 @@
         "empty_hint": "Klicke auf das Herz-Symbol bei einem Titel, um ihn hier zu speichern."
     },
     "detail": {
+        "resume": "Fortsetzen",
+        "play_from_beginning": "Von Beginn abspielen",
         "seasons_count": "Staffeln ({{count}})",
         "episodes_count": "Episoden ({{count}})",
         "episode": "Episode",

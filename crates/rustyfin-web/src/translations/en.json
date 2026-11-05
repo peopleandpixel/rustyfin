@@ -308,6 +308,8 @@
         "empty_hint": "Click the heart icon on a title to save it here."
     },
     "detail": {
+        "resume": "Resume",
+        "play_from_beginning": "Play from beginning",
         "seasons_count": "Seasons ({{count}})",
         "episodes_count": "Episodes ({{count}})",
         "episode": "Episode",

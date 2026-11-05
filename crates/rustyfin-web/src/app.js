@@ -76,7 +76,7 @@ function toast(msg, type = 'success') {
 
 function escapeHtml(str) {
     if (!str) return '';
-    return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
 function formatRuntime(ticks) {
@@ -223,6 +223,9 @@ async function wizComplete() {
             try {
                 await API.login(wizCredentials.name, wizCredentials.password);
                 wizProgress.loggedIn = true;
+                // Replace a socket or retry left from an earlier session, so the new token is used now
+                stopScanProgressWebSocket();
+                initScanProgressWebSocket();
             } catch (e) {
                 showFinishError(t('wizard.login_failed', { name: wizCredentials.name, message: e.message }));
                 return;
@@ -233,8 +236,10 @@ async function wizComplete() {
             const libPath = $('wiz-lib-path').value.trim();
             if (libName && libPath) {
                 try {
-                    await API.createLibrary(libName, $('wiz-lib-type').value, [libPath]);
+                    const lib = await API.createLibrary(libName, $('wiz-lib-type').value, [libPath]);
                     wizProgress.libraryCreated = true;
+                    // Scan it now, as the Add Library dialog does; the scheduler would not scan it for hours.
+                    API.scanLibrary(lib.id || lib.Id).catch(err => toast(t('library.scan_start_failed', { message: err.message }), 'error'));
                 } catch (e) {
                     showFinishError(t('wizard.library_create_failed', { message: e.message }));
                     return;
@@ -299,6 +304,33 @@ function closeUserMenu() { $('user-dropdown')?.classList.add('hidden'); }
 document.addEventListener('click', e => {
     if (!e.target.closest('#nav-user-menu')) closeUserMenu();
 });
+// Clicks on rendered markup are dispatched here from data-action and data-* attributes, so server values never end up inside inline JavaScript.
+const clickActions = {
+    navigate: el => navigate(el.dataset.page, el.dataset.id),
+    play: el => playItem(el.dataset.id, el.dataset.streamType, el.dataset.title, { fromStart: el.dataset.fromStart === 'true' }),
+    'scan-library': el => API.scanLibrary(el.dataset.id).then(() => toast(t('library.scan_started_for', { name: el.dataset.name }))).catch(err => toast(t('library.scan_start_failed', { message: err.message }), 'error')),
+    'scan-library-page': el => API.scanLibrary(el.dataset.id).then(() => { toast(t('library.media_scan_started_for', { name: el.dataset.name })); scanStatuses[el.dataset.id] = true; }).catch(err => toast(t('library.scan_start_failed', { message: err.message }), 'error')),
+    'scan-library-admin': el => API.scanLibrary(el.dataset.id).then(() => toast(t('admin.scan_started'))).catch(err => toast(t('library.scan_start_failed', { message: err.message }), 'error')),
+    'scan-all': () => API.scanAllLibraries().then(() => toast(t('admin.scanning_all'))).catch(err => toast(t('library.scan_start_failed', { message: err.message }), 'error')),
+    'jump-letter': el => jumpToLetter(el.dataset.id, el.dataset.letter),
+    'toggle-favorite': el => toggleFavorite(el.dataset.id, el.dataset.favorite === 'true'),
+    'toggle-played': el => togglePlayed(el.dataset.id, el.dataset.played === 'true'),
+    'refresh-item': el => API.refreshItem(el.dataset.id).then(() => toast(t('detail.metadata_refreshing'))),
+    'admin-tab': el => showAdminTab(el, el.dataset.tab),
+    'delete-user': el => { if (confirm(t('admin.delete_user_confirm'))) API.deleteUser(el.dataset.id).then(() => renderAdmin()); },
+    'set-user-admin': el => setUserPolicy(el, { IsAdministrator: el.checked }),
+    'set-user-disabled': el => setUserPolicy(el, { IsDisabled: el.checked }),
+    'delete-library': el => deleteLibraryFromAdmin(el.dataset.id),
+    'start-task': el => startTaskAction(el.dataset.id, el.dataset.name),
+    'stop-task': el => stopTaskAction(el.dataset.id, el.dataset.name),
+    'dir-open': el => navigateDirectoryPicker(el.dataset.path),
+    'dir-select': el => selectDirectoryPath(el.dataset.path),
+    'remove-path': el => removeSelectedPath(Number(el.dataset.index)),
+};
+document.addEventListener('click', e => {
+    const el = e.target.closest('[data-action]');
+    if (el) clickActions[el.dataset.action]?.(el, e);
+});
 
 function toggleSidebar() {
     const m = $('sidebar-mobile'), o = $('sidebar-overlay');
@@ -350,7 +382,7 @@ function itemCard(item, options = {}) {
     };
 
     return `
-    <div class="jf-card group" onclick="navigate('detail', '${id}')">
+    <div class="jf-card group" data-action="navigate" data-page="detail" data-id="${escapeHtml(id)}">
         <div class="${isBackdrop ? 'jf-poster-backdrop' : 'jf-poster'}">
             <div class="jf-poster-skeleton"></div>
             <!-- Thumbnail loads first for instant visual feedback; full-res swaps on hover -->
@@ -376,7 +408,7 @@ function itemCard(item, options = {}) {
 
             <!-- Play Button Hover Overlay -->
             ${canPlay ? `
-            <div class="jf-play-overlay" onclick="event.stopPropagation();playItem('${id}','${streamType}','${escapeHtml(rawName)}' || t('common.unknown'))">
+            <div class="jf-play-overlay" data-action="play" data-id="${escapeHtml(id)}" data-stream-type="${escapeHtml(streamType)}" data-title="${escapeHtml(rawName || t('common.unknown'))}">
                 <div class="jf-play-btn-circle">
                     <svg class="w-7 h-7 text-white ml-1" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
                 </div>
@@ -394,7 +426,7 @@ function itemCard(item, options = {}) {
             <div class="flex items-center gap-1.5 text-[11px] text-white/40 mt-0.5">
                 ${year ? `<span>${year}</span>` : ''}
                 ${year && type ? `<span>·</span>` : ''}
-                <span class="truncate">${type}</span>
+                <span class="truncate">${escapeHtml(type)}</span>
             </div>
         </div>
     </div>`;
@@ -420,7 +452,7 @@ function sectionRow(title, items, moreAction = null, options = {}) {
             <h2 class="text-lg lg:text-xl font-bold tracking-tight text-white">${escapeHtml(title)}</h2>
             <span class="text-xs text-white/30 font-medium ml-1">(${items.length})</span>
         </div>
-        ${moreAction ? `<button class="text-xs font-semibold text-[#00a4dc] hover:text-[#38bdf8] flex items-center gap-1 transition" onclick="${moreAction}">${t('common.view_all')}</button>` : ''}
+        ${moreAction ? `<button class="text-xs font-semibold text-[#00a4dc] hover:text-[#38bdf8] flex items-center gap-1 transition" data-action="navigate" data-page="${escapeHtml(moreAction.page)}" data-id="${escapeHtml(moreAction.data)}">${t('common.view_all')}</button>` : ''}
     `;
     row.appendChild(header.firstElementChild);
     if (moreAction) row.appendChild(header.lastElementChild);
@@ -454,7 +486,7 @@ async function renderHome() {
             <div class="flex flex-col items-center justify-center min-h-[75vh] text-center jf-page px-4">
                 <div class="relative mb-6">
                     <img src="/web/assets/logo.png" alt="Rustyfin" class="w-32 h-32 rounded-3xl shadow-2xl p-2 bg-gradient-to-tr from-white/10 to-transparent border border-white/10">
-                    <span class="absolute -bottom-2 right-2 px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-[#00a4dc] text-white shadow-lg">v${ver}</span>
+                    <span class="absolute -bottom-2 right-2 px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-[#00a4dc] text-white shadow-lg">v${escapeHtml(ver)}</span>
                 </div>
                 <h1 class="text-4xl sm:text-5xl font-black mb-3 tracking-tight text-white">${escapeHtml(sn)}</h1>
                 <p class="text-white/60 text-base max-w-lg mb-8 leading-relaxed">
@@ -470,7 +502,7 @@ async function renderHome() {
                         <p class="text-[11px] text-white/40 uppercase tracking-wider mt-1">${t('home.ram_idle')}</p>
                     </div>
                     <div class="p-4 rounded-xl bg-white/5 border border-white/10 text-center">
-                        <p class="text-xl font-bold text-amber-400">v${ver}</p>
+                        <p class="text-xl font-bold text-amber-400">v${escapeHtml(ver)}</p>
                         <p class="text-[11px] text-white/40 uppercase tracking-wider mt-1">${t('home.release')}</p>
                     </div>
                 </div>
@@ -522,19 +554,19 @@ async function renderHome() {
                 <div class="relative z-10 p-6 sm:p-10 lg:p-14 flex flex-col justify-end min-h-[420px] max-w-3xl">
                     <div class="flex items-center gap-2 mb-3">
                         <span class="jf-badge jf-badge-accent uppercase tracking-wider text-[11px]">${t('home.highlights')}</span>
-                        <span class="jf-badge jf-badge-primary uppercase tracking-wider text-[11px]">${spType}</span>
-                        ${spYear ? `<span class="jf-badge text-[11px]">${spYear}</span>` : ''}
+                        <span class="jf-badge jf-badge-primary uppercase tracking-wider text-[11px]">${escapeHtml(spType)}</span>
+                        ${spYear ? `<span class="jf-badge text-[11px]">${escapeHtml(spYear)}</span>` : ''}
                         ${spRating ? `<span class="jf-badge jf-badge-rating text-[11px]">★ ${spRating.toFixed(1)}</span>` : ''}
                     </div>
                     <h1 class="text-3xl sm:text-4xl lg:text-5xl font-black text-white tracking-tight mb-3 drop-shadow-md">${escapeHtml(spName)}</h1>
                     ${spOverview ? `<p class="text-white/80 text-xs sm:text-sm line-clamp-3 mb-6 max-w-2xl leading-relaxed">${escapeHtml(spOverview)}</p>` : ''}
                     <div class="flex flex-wrap items-center gap-3">
                         ${canPlay ? `
-                        <button class="jf-btn-primary !py-2.5 !px-6 text-sm" onclick="playItem('${spId}','${streamType}','${escapeHtml(spName)}')">
+                        <button class="jf-btn-primary !py-2.5 !px-6 text-sm" data-action="play" data-id="${escapeHtml(spId)}" data-stream-type="${escapeHtml(streamType)}" data-title="${escapeHtml(spName)}">
                             <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
                             ${t('common.play')}
                         </button>` : ''}
-                        <button class="jf-btn-ghost !py-2.5 !px-5 text-sm" onclick="navigate('detail','${spId}')">
+                        <button class="jf-btn-ghost !py-2.5 !px-5 text-sm" data-action="navigate" data-page="detail" data-id="${escapeHtml(spId)}">
                             ${t('home.more_info')}
                         </button>
                     </div>
@@ -573,12 +605,12 @@ async function renderHome() {
                         };
                         const icons = { Movies: '🎬', TvShows: '📺', Music: '🎵', Photos: '🖼️', Mixed: '📁' };
                         return `
-                        <div class="jf-card p-5 bg-gradient-to-br ${gradients[libType] || gradients.Mixed} flex flex-col justify-between min-h-[120px] relative" onclick="navigate('library','${libId}')">
+                        <div class="jf-card p-5 bg-gradient-to-br ${gradients[libType] || gradients.Mixed} flex flex-col justify-between min-h-[120px] relative" data-action="navigate" data-page="library" data-id="${escapeHtml(libId)}">
                             <div class="flex items-center justify-between">
                                 <span class="text-3xl">${icons[libType] || '📁'}</span>
                                 <div class="flex items-center gap-1">
                                     ${scanStatuses[libId] ? `<span class="w-2 h-2 rounded-full bg-amber-400 animate-pulse" title="${escapeHtml(t('library.scan_running'))}"></span>` : ''}
-                                    <button type="button" class="w-6 h-6 rounded flex items-center justify-center text-white/40 hover:text-white hover:bg-white/10 transition" onclick="event.stopPropagation();API.scanLibrary('${libId}').then(()=>toast(t('library.scan_started_for', { name: '${escapeHtml(libName)}' })))" title="${escapeHtml(t('library.scan_library'))}">
+                                    <button type="button" class="w-6 h-6 rounded flex items-center justify-center text-white/40 hover:text-white hover:bg-white/10 transition" data-action="scan-library" data-id="${escapeHtml(libId)}" data-name="${escapeHtml(libName)}" title="${escapeHtml(t('library.scan_library'))}">
                                         <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
                                     </button>
                                 </div>
@@ -873,7 +905,7 @@ async function renderLibrary(libId) {
 
                 <div class="flex flex-wrap items-center gap-2">
                     <!-- Sort selector -->
-                    <select id="lib-sort" class="jf-input !py-1.5 text-xs" onchange="reloadLibrary('${libId}')">
+                    <select id="lib-sort" class="jf-input !py-1.5 text-xs">
                         <option value="SortName:Ascending">${t('library.sort_name_asc')}</option>
                         <option value="SortName:Descending">${t('library.sort_name_desc')}</option>
                         <option value="PremiereDate:Descending">${t('library.sort_release_date')}</option>
@@ -883,13 +915,13 @@ async function renderLibrary(libId) {
 
                     <!-- Genre filter -->
                     ${genres.length > 0 ? `
-                    <select id="lib-genre" class="jf-input !py-1.5 text-xs max-w-[140px]" onchange="reloadLibrary('${libId}')">
+                    <select id="lib-genre" class="jf-input !py-1.5 text-xs max-w-[140px]">
                         <option value="">${t('library.all_genres')}</option>
                         ${genres.map(g => `<option value="${escapeHtml(g)}">${escapeHtml(g)}</option>`).join('')}
                     </select>` : ''}
 
                     <!-- Scan trigger -->
-                    <button class="jf-btn-ghost !py-1.5 !px-3 text-xs" onclick="API.scanLibrary('${libId}').then(()=>{toast(t('library.media_scan_started_for', { name: '${escapeHtml(libName)}' }));scanStatuses['${libId}']=true;})">
+                    <button class="jf-btn-ghost !py-1.5 !px-3 text-xs" data-action="scan-library-page" data-id="${escapeHtml(libId)}" data-name="${escapeHtml(libName)}">
                         ${t('library.scan_button')}
                     </button>
                 </div>
@@ -898,13 +930,15 @@ async function renderLibrary(libId) {
             <!-- Alphabet Quick Jump Bar -->
             <div class="jf-alpha-bar mb-6">
                 ${'#ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('').map(l => `
-                    <button class="jf-alpha-btn" data-letter="${l}" onclick="jumpToLetter('${libId}', '${l}')">${l}</button>
+                    <button class="jf-alpha-btn" data-letter="${l}" data-action="jump-letter" data-id="${escapeHtml(libId)}">${l}</button>
                 `).join('')}
             </div>
 
             <!-- Media Grid Container -->
             <div id="lib-grid-container"></div>
         </div>`;
+        $('lib-sort')?.addEventListener('change', () => reloadLibrary(libId));
+        $('lib-genre')?.addEventListener('change', () => reloadLibrary(libId));
         fillLibraryGrid(items, total);
     } catch (e) {
         if (gen !== libraryGen) return;
@@ -1126,6 +1160,7 @@ async function renderDetail(itemId) {
         const backdropSrc = API.imageUrl(id, 'Backdrop', { maxWidth: 1920 });
         const canPlay = ['Movie', 'Episode', 'Audio', 'MusicVideo', 'Video'].includes(type);
         const streamType = type === 'Audio' ? 'Audio' : 'Videos';
+        const resumeTicks = streamType === 'Videos' ? resumePositionTicks(item) : 0;
 
         // Parallel fetch: Children/Seasons/Episodes AND Similar media
         // Previously these were sequential, causing a waterfall effect
@@ -1171,7 +1206,7 @@ async function renderDetail(itemId) {
                             const epThumb = API.imageUrl(epId, 'Primary', { maxWidth: 400 });
 
                             return `
-                            <div class="jf-episode-card group" onclick="playItem('${epId}','Videos','${escapeHtml(epRawName)}' || t('detail.episode'))">
+                            <div class="jf-episode-card group" data-action="play" data-id="${escapeHtml(epId)}" data-stream-type="Videos" data-title="${escapeHtml(epRawName || t('detail.episode'))}">
                                 <div class="relative w-full sm:w-48 h-28 rounded-lg overflow-hidden bg-white/5 flex-shrink-0">
                                     <img src="${epThumb}" alt="${escapeHtml(epName)}" class="w-full h-full object-cover">
                                     <div class="absolute inset-0 bg-black/40 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
@@ -1218,7 +1253,7 @@ async function renderDetail(itemId) {
                         const pRole = p.Role || p.role || p.Type || p.type || t('detail.actor');
                         const pImg = pId ? API.imageUrl(pId, 'Primary', { maxWidth: 200 }) : '';
                         return `
-                        <div class="w-28 text-center flex-shrink-0 cursor-pointer group" onclick="${pId ? `navigate('person','${pId}')` : ''}">
+                        <div class="w-28 text-center flex-shrink-0 cursor-pointer group" ${pId ? `data-action="navigate" data-page="person" data-id="${escapeHtml(pId)}"` : ''}>
                             <div class="w-20 h-20 mx-auto rounded-full overflow-hidden bg-white/10 mb-2 border-2 border-transparent group-hover:border-[#00a4dc] transition-all">
                                 <img src="${pImg}" alt="${escapeHtml(pName)}" class="w-full h-full object-cover" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'">
                                 <div class="hidden w-full h-full items-center justify-center text-xs font-bold text-white/40 bg-white/5" style="display:none">
@@ -1247,9 +1282,9 @@ async function renderDetail(itemId) {
                     <!-- Meta & Actions -->
                     <div class="flex-1 min-w-0">
                         <div class="flex flex-wrap items-center gap-2 mb-3">
-                            <span class="jf-badge jf-badge-primary uppercase tracking-wider text-[11px]">${type}</span>
+                            <span class="jf-badge jf-badge-primary uppercase tracking-wider text-[11px]">${escapeHtml(type)}</span>
                             ${year ? `<span class="jf-badge text-[11px] font-bold">${year}</span>` : ''}
-                            ${officialRating ? `<span class="jf-badge text-[11px] font-bold bg-white/15">${officialRating}</span>` : ''}
+                            ${officialRating ? `<span class="jf-badge text-[11px] font-bold bg-white/15">${escapeHtml(officialRating)}</span>` : ''}
                             ${runtime ? `<span class="jf-badge text-[11px]">${formatRuntime(runtime)}</span>` : ''}
                             ${rating ? `<span class="jf-badge jf-badge-rating text-[11px]">★ ${rating.toFixed(1)}</span>` : ''}
                         </div>
@@ -1264,22 +1299,26 @@ async function renderDetail(itemId) {
                         <!-- Action Bar -->
                         <div class="flex flex-wrap items-center gap-3">
                             ${canPlay ? `
-                            <button class="jf-btn-primary !py-3 !px-7 text-sm font-bold shadow-xl" onclick="playItem('${id}','${streamType}','${escapeHtml(name)}')">
+                            <button class="jf-btn-primary !py-3 !px-7 text-sm font-bold shadow-xl" data-action="play" data-id="${escapeHtml(id)}" data-stream-type="${escapeHtml(streamType)}" data-title="${escapeHtml(name)}">
                                 <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
-                                ${t('common.play')}
-                            </button>` : ''}
+                                ${resumeTicks > 0 ? t('detail.resume') : t('common.play')}
+                            </button>
+                            ${resumeTicks > 0 ? `
+                            <button class="jf-btn-ghost !py-3 !px-4 text-sm" data-action="play" data-id="${escapeHtml(id)}" data-stream-type="${escapeHtml(streamType)}" data-title="${escapeHtml(name)}" data-from-start="true">
+                                ${t('detail.play_from_beginning')}
+                            </button>` : ''}` : ''}
 
-                            <button class="jf-btn-ghost !py-3 !px-4 text-sm" title="${escapeHtml(t('detail.toggle_favorite'))}" onclick="toggleFavorite('${id}', ${fav})">
+                            <button class="jf-btn-ghost !py-3 !px-4 text-sm" title="${escapeHtml(t('detail.toggle_favorite'))}" data-action="toggle-favorite" data-id="${escapeHtml(id)}" data-favorite="${fav}">
                                 <span class="${fav ? 'text-rose-500 font-bold' : 'text-white/60'} text-base">♥</span>
                                 <span class="hidden sm:inline text-xs ml-1">${fav ? t('detail.favorite') : t('detail.add_favorite')}</span>
                             </button>
 
-                            <button class="jf-btn-ghost !py-3 !px-4 text-xs font-semibold" onclick="togglePlayed('${id}', ${played})">
+                            <button class="jf-btn-ghost !py-3 !px-4 text-xs font-semibold" data-action="toggle-played" data-id="${escapeHtml(id)}" data-played="${played}">
                                 ${played ? `<span class="text-emerald-400">${t('detail.played')}</span>` : `<span class="text-white/60">${t('detail.unplayed')}</span>`}
                             </button>
 
                             ${API.isAdmin ? `
-                            <button class="jf-btn-ghost !py-3 !px-3 text-xs" title="${escapeHtml(t('detail.refresh_metadata'))}" onclick="API.refreshItem('${id}').then(()=>toast(t('detail.metadata_refreshing')))">
+                            <button class="jf-btn-ghost !py-3 !px-3 text-xs" title="${escapeHtml(t('detail.refresh_metadata'))}" data-action="refresh-item" data-id="${escapeHtml(id)}">
                                 🔄
                             </button>` : ''}
                         </div>
@@ -1414,12 +1453,37 @@ function doSearch(term) {
 
 // HLS.js instance for adaptive streaming
 let hlsInstance = null;
+// The playback session in progress, or null when nothing is playing
+let activePlayback = null;
+// Promise of the last Stopped report; playItem waits for it before reading the resume point
+let pendingStop = Promise.resolve();
+// Incremented by each playItem call, so a call that finishes loading after a newer one gives up
+let playRequest = 0;
+
+// Ticks to resume from. Items at or past 90 % of their runtime count as watched and start over.
+function resumePositionTicks(item) {
+    const pos = item?.UserData?.PlaybackPositionTicks || 0;
+    if (!(pos > 0)) return 0;
+    const runtime = item.RunTimeTicks || 0;
+    if (runtime > 0 && pos >= runtime * 0.9) return 0;
+    return pos;
+}
+
+// Stops the session that is still playing, if any. Returns the promise of its Stopped report.
+function stopPlayback() {
+    if (activePlayback) activePlayback.stop();
+    return pendingStop;
+}
 
 // --- Video Player (Cinema Mode) ---
-async function playItem(itemId, streamType = 'Videos', title = '') {
+async function playItem(itemId, streamType = 'Videos', title = '', { fromStart = false } = {}) {
     const video = $('video-player');
     const modal = $('player-modal');
     if (!video || !modal) return;
+    const request = ++playRequest;
+
+    // Report a session that is still playing as stopped before starting another
+    stopPlayback();
 
     // Destroy any existing HLS instance
     if (hlsInstance) {
@@ -1431,8 +1495,24 @@ async function playItem(itemId, streamType = 'Videos', title = '') {
     $('player-subtitle').textContent = t('player.loading');
 
     // Show modal immediately while loading
-    if (typeof modal.showModal === 'function') modal.showModal();
-    else modal.setAttribute('open', '');
+    if (!modal.open) {
+        if (typeof modal.showModal === 'function') modal.showModal();
+        else modal.setAttribute('open', '');
+    }
+
+    // Read the resume point only after the Stopped report, so it includes the position just saved
+    await pendingStop;
+    let item = null;
+    try {
+        item = await API.get('/Items/' + itemId);
+    } catch (e) {
+        console.warn('Could not load item for resume point:', e);
+    }
+    if (!modal.open || request !== playRequest) return; // closed or replaced while loading
+    if (!title && item?.Name) $('player-title').textContent = item.Name;
+
+    const startTicks = (streamType !== 'Videos' || fromStart) ? 0 : resumePositionTicks(item);
+    const startSeconds = startTicks / 1e7;
 
     let url;
     let isHls = false;
@@ -1475,6 +1555,8 @@ async function playItem(itemId, streamType = 'Videos', title = '') {
         $('player-subtitle').textContent = t('player.stream');
     }
 
+    if (!modal.open || request !== playRequest) return; // closed or replaced while loading
+
     video.onerror = () => {
         console.error('Video playback error:', video.error);
         const errMsg = video.error ? video.error.message : t('common.unknown_error');
@@ -1486,13 +1568,16 @@ async function playItem(itemId, streamType = 'Videos', title = '') {
         hlsInstance = new Hls({
             enableWorker: true,
             lowLatencyMode: false,
+            startPosition: startTicks > 0 ? startSeconds : -1,
         });
         hlsInstance.loadSource(url);
         hlsInstance.attachMedia(video);
         hlsInstance.on(Hls.Events.MANIFEST_PARSED, () => {
+            if (activePlayback !== session) return;
             video.play().catch(e => console.warn('Autoplay block:', e));
         });
         hlsInstance.on(Hls.Events.ERROR, (event, data) => {
+            if (activePlayback !== session) return;
             console.error('HLS error:', data);
             if (data.fatal) {
                 $('player-subtitle').textContent = t('player.hls_error');
@@ -1509,16 +1594,58 @@ async function playItem(itemId, streamType = 'Videos', title = '') {
         // Safari native HLS support
         video.src = url;
         video.addEventListener('loadedmetadata', () => {
+            if (activePlayback !== session) return;
+            if (startTicks > 0) video.currentTime = startSeconds;
             video.play().catch(e => console.warn('Autoplay block:', e));
         }, { once: true });
     } else {
         // Direct play/stream
         video.src = url;
-        video.currentTime = 0;
+        if (startTicks > 0) {
+            video.addEventListener('loadedmetadata', () => {
+                if (activePlayback === session) video.currentTime = startSeconds;
+            }, { once: true });
+        }
         video.play().catch(e => console.warn('Autoplay block:', e));
     }
 
-    API.reportPlaying(itemId).catch(() => {});
+    API.reportPlaying(itemId, startTicks).catch(() => {});
+
+    // The session owns this playback: stop() reports the position once and tears the player down
+    let stopped = false;
+    const session = {
+        stop() {
+            if (stopped) return pendingStop;
+            stopped = true;
+            // Before metadata has loaded currentTime reads 0 even when resuming, so report the start position then
+            const ticks = video.readyState >= HTMLMediaElement.HAVE_METADATA
+                ? Math.round(video.currentTime * 10000000)
+                : startTicks;
+            if (playerReportInterval) {
+                clearInterval(playerReportInterval);
+                playerReportInterval = null;
+            }
+            if (activePlayback === session) activePlayback = null;
+            const reported = API.reportStopped(itemId, ticks).catch(e => console.warn('Reporting playback stop failed:', e));
+            pendingStop = reported;
+            // Once the Stopped report is in, refresh the open view so it shows the new resume point
+            reported.then(() => {
+                API.invalidateCache('/Items');
+                API.invalidateCache('/Shows');
+                if (currentPage === 'home') return renderHome();
+                if (currentPage === 'detail') return renderDetail(currentDetailId);
+            }).catch(e => console.warn('Refreshing views after playback failed:', e));
+            video.pause();
+            if (hlsInstance) {
+                hlsInstance.destroy();
+                hlsInstance = null;
+            }
+            video.removeAttribute('src');
+            video.load();
+            return reported;
+        },
+    };
+    activePlayback = session;
 
     // Periodic progress reporting
     if (playerReportInterval) clearInterval(playerReportInterval);
@@ -1548,26 +1675,9 @@ async function playItem(itemId, streamType = 'Videos', title = '') {
         if (slider) slider.value = video.volume;
     };
 
-    const cleanup = () => {
-        if (playerReportInterval) {
-            clearInterval(playerReportInterval);
-            playerReportInterval = null;
-        }
-        const ticks = Math.round((video.currentTime || 0) * 10000000);
-        API.reportStopped(itemId, ticks).catch(() => {});
+    video.onended = () => {
+        if (activePlayback === session) session.stop();
     };
-
-    video.onended = cleanup;
-    modal.addEventListener('close', () => {
-        video.pause();
-        // Destroy HLS instance if playing HLS
-        if (hlsInstance) {
-            hlsInstance.destroy();
-            hlsInstance = null;
-        }
-        video.src = '';
-        cleanup();
-    }, { once: true });
 }
 
 function closePlayer() {
@@ -1737,6 +1847,9 @@ async function handleLogin(e) {
     try {
         await API.login($('login-user').value, $('login-pass').value);
         updateAuthUI();
+        // Replace a socket or retry left from an earlier session, so the new token is used now
+        stopScanProgressWebSocket();
+        initScanProgressWebSocket();
         await loadSidebar();
         navigate('home');
         toast(t('login.welcome_back', { name: API.userName }));
@@ -1747,6 +1860,7 @@ async function handleLogin(e) {
 }
 
 function doLogout() {
+    stopScanProgressWebSocket();
     API.logout();
     updateAuthUI();
     navigate('home');
@@ -1845,7 +1959,7 @@ async function renderSettings() {
                 </div>
                 <div>
                     <h2 class="text-lg font-bold text-white">${escapeHtml(name)}</h2>
-                    <p class="text-xs text-white/40">${t('settings.user_id', { id })}</p>
+                    <p class="text-xs text-white/40">${t('settings.user_id', { id: escapeHtml(id) })}</p>
                     <span class="inline-block mt-1 text-[10px] font-bold px-2 py-0.5 rounded bg-[#00a4dc]/20 text-[#38bdf8] uppercase">
                         ${API.isAdmin ? t('common.administrator') : t('settings.standard_user')}
                     </span>
@@ -1870,7 +1984,7 @@ async function renderSettings() {
                     <span class="w-2 h-2 rounded-full bg-amber-400"></span>
                     ${t('settings.change_password')}
                 </h3>
-                <form onsubmit="handleChangePassword(event, '${id}')" class="space-y-3">
+                <form id="change-password-form" class="space-y-3">
                     <input type="password" id="pw-current" class="jf-input w-full" placeholder="${escapeHtml(t('settings.current_password'))}" required>
                     <input type="password" id="pw-new" class="jf-input w-full" placeholder="${escapeHtml(t('settings.new_password'))}" required>
                     <input type="password" id="pw-confirm" class="jf-input w-full" placeholder="${escapeHtml(t('settings.confirm_new_password'))}" required>
@@ -1881,6 +1995,7 @@ async function renderSettings() {
 
             ${serverCfgHtml}
         </div>`;
+        $('change-password-form')?.addEventListener('submit', e => handleChangePassword(e, id));
     } catch (e) {
         page.innerHTML = `<div class="p-6 rounded-xl bg-red-500/10 text-red-400">${escapeHtml(e.message)}</div>`;
     }
@@ -1962,7 +2077,7 @@ async function renderAdmin() {
                     <p class="text-xs text-white/40 mt-1">${t('admin.subtitle', { name: escapeHtml(info.ServerName || 'Rustyfin') })}</p>
                 </div>
                 <div class="flex gap-2">
-                    <button class="jf-btn-ghost !py-1.5 !px-3 text-xs" onclick="API.scanAllLibraries().then(()=>toast(t('admin.scanning_all')))">
+                    <button class="jf-btn-ghost !py-1.5 !px-3 text-xs" data-action="scan-all">
                         ${t('admin.scan_all')}
                     </button>
                     <button class="jf-btn-ghost !py-1.5 !px-3 text-xs text-amber-400 hover:text-amber-300" onclick="if(confirm(t('admin.restart_confirm')))API.restart().then(()=>toast(t('admin.restarting')))">
@@ -1975,7 +2090,7 @@ async function renderAdmin() {
             <div class="flex gap-2 mb-6 overflow-x-auto pb-2">
                 ${tabs.map((label, i) => `
                     <button class="px-4 py-2 rounded-xl text-xs font-semibold whitespace-nowrap transition ${i === 0 ? 'bg-[#00a4dc] text-white shadow-lg' : 'bg-white/5 text-white/60 hover:bg-white/10'}"
-                            data-tab="${tabIds[i]}" onclick="showAdminTab(this, '${tabIds[i]}')">${label}</button>
+                            data-action="admin-tab" data-tab="${escapeHtml(tabIds[i])}">${label}</button>
                 `).join('')}
             </div>
 
@@ -2041,11 +2156,11 @@ async function renderAdmin() {
                                 return `
                             <tr>
                                 <td class="py-3 font-bold text-white">${escapeHtml(name)}</td>
-                                <td class="py-3"><label class="inline-flex items-center gap-2 text-white/80"><input type="checkbox" data-id="${escapeHtml(id)}" data-name="${escapeHtml(name)}" onchange="setUserPolicy(this, { IsAdministrator: this.checked })" aria-label="${escapeHtml(t('admin.administrator_for', { name }))}" ${isAdmin ? 'checked' : ''} ${locked || promoteBlocked ? 'disabled' : ''} class="w-4 h-4 rounded bg-white/10 border-white/20 text-[#00a4dc]"><span>${escapeHtml(t('admin.role_admin'))}</span></label>${isOwner ? `<span class="ml-1.5 px-2 py-0.5 rounded text-[10px] font-bold bg-[#00a4dc]/20 text-[#38bdf8]">${escapeHtml(t('admin.role_owner'))}</span>` : ''}${locked ? `<p class="text-[10px] text-white/40 mt-1">${escapeHtml(t(isOwner ? 'admin.owner_locked' : 'admin.self_locked'))}</p>` : ''}${promoteBlocked ? `<p class="text-[10px] text-white/40 mt-1">${escapeHtml(t('admin.promote_disabled_locked'))}</p>` : ''}</td>
-                                <td class="py-3"><input type="checkbox" data-id="${escapeHtml(id)}" data-name="${escapeHtml(name)}" onchange="setUserPolicy(this, { IsDisabled: this.checked })" aria-label="${escapeHtml(t('admin.disabled_for', { name }))}" ${u.IsDisabled ? 'checked' : ''} ${locked || disableBlocked ? 'disabled' : ''} class="w-4 h-4 rounded bg-white/10 border-white/20 text-[#00a4dc]">${disableBlocked ? `<p class="text-[10px] text-white/40 mt-1">${escapeHtml(t('admin.disable_admin_locked'))}</p>` : ''}</td>
+                                <td class="py-3"><label class="inline-flex items-center gap-2 text-white/80"><input type="checkbox" data-action="set-user-admin" data-id="${escapeHtml(id)}" data-name="${escapeHtml(name)}" aria-label="${escapeHtml(t('admin.administrator_for', { name }))}" ${isAdmin ? 'checked' : ''} ${locked || promoteBlocked ? 'disabled' : ''} class="w-4 h-4 rounded bg-white/10 border-white/20 text-[#00a4dc]"><span>${escapeHtml(t('admin.role_admin'))}</span></label>${isOwner ? `<span class="ml-1.5 px-2 py-0.5 rounded text-[10px] font-bold bg-[#00a4dc]/20 text-[#38bdf8]">${escapeHtml(t('admin.role_owner'))}</span>` : ''}${locked ? `<p class="text-[10px] text-white/40 mt-1">${escapeHtml(t(isOwner ? 'admin.owner_locked' : 'admin.self_locked'))}</p>` : ''}${promoteBlocked ? `<p class="text-[10px] text-white/40 mt-1">${escapeHtml(t('admin.promote_disabled_locked'))}</p>` : ''}</td>
+                                <td class="py-3"><input type="checkbox" data-action="set-user-disabled" data-id="${escapeHtml(id)}" data-name="${escapeHtml(name)}" aria-label="${escapeHtml(t('admin.disabled_for', { name }))}" ${u.IsDisabled ? 'checked' : ''} ${locked || disableBlocked ? 'disabled' : ''} class="w-4 h-4 rounded bg-white/10 border-white/20 text-[#00a4dc]">${disableBlocked ? `<p class="text-[10px] text-white/40 mt-1">${escapeHtml(t('admin.disable_admin_locked'))}</p>` : ''}</td>
                                 <td class="py-3 text-white/40">${escapeHtml(u.LastLoginDate || u.last_login_date || '–')}</td>
                                 <td class="py-3 text-right">
-                                    <button class="text-red-400 hover:text-red-300 font-semibold" onclick="if(confirm(t('admin.delete_user_confirm')))API.deleteUser('${u.Id || u.id}').then(()=>renderAdmin())">${t('common.delete')}</button>
+                                    <button class="text-red-400 hover:text-red-300 font-semibold" data-action="delete-user" data-id="${escapeHtml(u.Id || u.id)}">${t('common.delete')}</button>
                                 </td>
                             </tr>`;
                             }).join('')}
@@ -2078,8 +2193,8 @@ async function renderAdmin() {
                                 <td class="py-3"><span class="px-2 py-0.5 rounded bg-white/10 text-white/70">${escapeHtml(l.content_type || l.ContentType || t('admin.mixed'))}</span></td>
                                 <td class="py-3 text-white/40 font-mono">${escapeHtml((l.paths || l.Paths || []).join(', '))}</td>
                                 <td class="py-3 text-right space-x-2">
-                                    <button class="text-[#00a4dc] hover:text-[#38bdf8]" onclick="API.scanLibrary('${l.id || l.Id}').then(()=>toast(t('admin.scan_started')))">${t('admin.scan')}</button>
-                                    <button class="text-red-400 hover:text-red-300" onclick="deleteLibraryFromAdmin('${l.id || l.Id}')">${t('common.delete')}</button>
+                                    <button class="text-[#00a4dc] hover:text-[#38bdf8]" data-action="scan-library-admin" data-id="${escapeHtml(l.id || l.Id)}">${t('admin.scan')}</button>
+                                    <button class="text-red-400 hover:text-red-300" data-action="delete-library" data-id="${escapeHtml(l.id || l.Id)}">${t('common.delete')}</button>
                                 </td>
                             </tr>`).join('')}
                         </tbody>
@@ -2193,7 +2308,7 @@ async function setUserPolicy(el, policy) {
     }
     API.invalidateCache('/Users');
     await renderAdmin();
-    const tab = document.querySelector('[data-tab="admin-users"]');
+    const tab = document.querySelector('[data-action="admin-tab"][data-tab="admin-users"]');
     if (tab) showAdminTab(tab, 'admin-users');
 }
 
@@ -2306,11 +2421,11 @@ function renderTaskCard(task) {
                 ${progressHtml}
                 <div class="flex items-center gap-2 mt-3">
                     ${isRunning || isCancelling ? `
-                        <button class="jf-btn-danger text-xs !py-1.5 !px-3" onclick="stopTaskAction('${escapeHtml(id)}', '${escapeHtml(name)}')">
+                        <button class="jf-btn-danger text-xs !py-1.5 !px-3" data-action="stop-task" data-id="${escapeHtml(id)}" data-name="${escapeHtml(name)}">
                             ${t('admin.stop')}
                         </button>
                     ` : `
-                        <button class="jf-btn-primary text-xs !py-1.5 !px-3" onclick="startTaskAction('${escapeHtml(id)}', '${escapeHtml(name)}')">
+                        <button class="jf-btn-primary text-xs !py-1.5 !px-3" data-action="start-task" data-id="${escapeHtml(id)}" data-name="${escapeHtml(name)}">
                             ${t('admin.start')}
                         </button>
                     `}
@@ -2424,12 +2539,12 @@ async function loadSidebar() {
         const isScanning = scanStatuses[id];
         list.innerHTML += `
             <div class="flex items-center gap-1 group">
-                <a onclick="navigate('library','${id}')" class="jf-drawer-item ${currentLibraryId === id && currentPage === 'library' ? 'active' : ''} flex-1">
+                <a data-action="navigate" data-page="library" data-id="${escapeHtml(id)}" class="jf-drawer-item ${currentLibraryId === id && currentPage === 'library' ? 'active' : ''} flex-1">
                     <span class="text-base">${icons[type] || '📁'}</span>
                     <span class="truncate">${escapeHtml(name)}</span>
                     ${isScanning ? '<span class="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse ml-1 flex-shrink-0"></span>' : ''}
                 </a>
-                <button type="button" class="jf-icon-btn !w-6 !h-6 text-white/20 hover:text-white opacity-0 group-hover:opacity-100 transition flex-shrink-0" onclick="API.scanLibrary('${id}').then(()=>toast(t('library.scan_started_for', { name: '${escapeHtml(name)}' })))" title="${escapeHtml(t('library.scan_library'))}">
+                <button type="button" class="jf-icon-btn !w-6 !h-6 text-white/20 hover:text-white opacity-0 group-hover:opacity-100 transition flex-shrink-0" data-action="scan-library" data-id="${escapeHtml(id)}" data-name="${escapeHtml(name)}" title="${escapeHtml(t('library.scan_library'))}">
                     <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
                 </button>
             </div>`;
@@ -2578,7 +2693,7 @@ async function loadDirectoryList(path) {
         // Parent navigation (unless root)
         if (path !== '/') {
             const parent = path.split('/').slice(0, -1).join('/') || '/';
-            html += `<button type="button" class="w-full text-left px-3 py-2 text-xs text-white/60 hover:bg-white/5 flex items-center gap-2 rounded" onclick="navigateDirectoryPicker('${parent}')">
+            html += `<button type="button" class="w-full text-left px-3 py-2 text-xs text-white/60 hover:bg-white/5 flex items-center gap-2 rounded" data-action="dir-open" data-path="${escapeHtml(parent)}">
                 <span>📁</span> <span>…</span> <span class="text-white/30 text-[10px] ml-auto">${t('library.parent_folder')}</span>
             </button>`;
         }
@@ -2591,12 +2706,11 @@ async function loadDirectoryList(path) {
                 </div>`;
             } else {
                 // Click navigates into the directory, double-click or button selects it
-                const escapedPath = dir.path.replace(/'/g, "\\'");
                 html += `<div class="flex items-center gap-1">
-                    <button type="button" class="flex-1 text-left px-3 py-2 text-xs text-white hover:bg-white/5 flex items-center gap-2 rounded" onclick="navigateDirectoryPicker('${escapedPath}')">
+                    <button type="button" class="flex-1 text-left px-3 py-2 text-xs text-white hover:bg-white/5 flex items-center gap-2 rounded" data-action="dir-open" data-path="${escapeHtml(dir.path)}">
                         <span>📁</span> <span class="truncate">${escapeHtml(dir.name)}</span>
                     </button>
-                    <button type="button" class="px-2 py-2 text-[10px] text-[#00a4dc] hover:text-[#38bdf8] rounded" onclick="selectDirectoryPath('${escapedPath}')" title="${escapeHtml(t('library.select_folder'))}">✓</button>
+                    <button type="button" class="px-2 py-2 text-[10px] text-[#00a4dc] hover:text-[#38bdf8] rounded" data-action="dir-select" data-path="${escapeHtml(dir.path)}" title="${escapeHtml(t('library.select_folder'))}">✓</button>
                 </div>`;
             }
         }
@@ -2636,7 +2750,7 @@ function renderSelectedPaths() {
     container.innerHTML = selectedLibraryPaths.map((p, i) => `
         <div class="flex items-center gap-2 px-2 py-1 rounded bg-[#00a4dc]/10 border border-[#00a4dc]/20">
             <span class="text-xs text-white/70 font-mono truncate flex-1">${escapeHtml(p)}</span>
-            <button type="button" class="text-white/40 hover:text-red-400 text-xs" onclick="removeSelectedPath(${i})">×</button>
+            <button type="button" class="text-white/40 hover:text-red-400 text-xs" data-action="remove-path" data-index="${i}">×</button>
         </div>
     `).join('');
 }
@@ -2692,73 +2806,101 @@ function hideScanProgress() {
 }
 
 // --- WebSocket for scan progress ---
+// The scan progress socket while it connects or is open, or null
+let scanSocket = null;
+// The pending retry timer, or null when no retry is scheduled
+let scanSocketRetry = null;
+// Delay before the next retry in ms; doubles up to 30 s and returns to 1 s when a socket opens
+let scanSocketDelay = 1000;
+// True once the current outage has been logged, so the warning is printed only once
+let scanSocketWarned = false;
+
 function initScanProgressWebSocket() {
     if (typeof WebSocket === 'undefined') return;
-    
+    if (!API.isLoggedIn() || scanSocket || scanSocketRetry) return;
+
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}/websocket?api_key=${API.accessToken}`;
-    
+    const wsUrl = `${protocol}//${window.location.host}/socket?api_key=${encodeURIComponent(API.token)}`;
+
     let ws;
-    let reconnectDelay = 1000;
-    
-    function connect() {
+    try {
+        ws = new WebSocket(wsUrl);
+    } catch (e) {
+        console.error('Opening the scan progress socket failed:', e);
+        return;
+    }
+    scanSocket = ws;
+
+    ws.onopen = () => {
+        scanSocketDelay = 1000;
+        scanSocketWarned = false;
+    };
+
+    ws.onmessage = (event) => {
         try {
-            ws = new WebSocket(wsUrl);
-            
-            ws.onmessage = (event) => {
-                try {
-                    const data = JSON.parse(event.data);
-                    if (data.MessageType === 'ScheduledTaskStarted') {
-                        showScanProgress(data.data.Name || t('library.processing'));
-                        // Track per-library scan status
-                        const libId = data.data.ItemId;
-                        if (libId) scanStatuses[libId] = true;
-                        // Refresh tasks tab if visible
-                        if (currentPage === 'admin') refreshTasks();
-                    } else if (data.MessageType === 'ScheduledTaskCompleted') {
-                        // Clear per-library scan status
-                        const libId = data.data.ItemId;
-                        if (libId) delete scanStatuses[libId];
-                        if (data.data.State === 'Completed') {
-                            hideScanProgress();
-                        } else if (data.data.State === 'Failed') {
-                            hideScanProgress();
-                            toast(t('admin.task_failed', { name: data.data.Name || t('admin.task'), error: data.data.Error || t('common.unknown_error') }), 'error');
-                        }
-                        // Refresh tasks tab if visible
-                        if (currentPage === 'admin') refreshTasks();
-                    } else if (data.MessageType === 'LibraryChanged') {
-                        // Library changed - refresh current view if on library page
-                        if (currentPage === 'library' && currentLibraryId) {
-                            setTimeout(() => renderLibrary(currentLibraryId), 500);
-                        } else if (currentPage === 'home') {
-                            setTimeout(() => renderHome(), 500);
-                        }
-                    }
-                } catch (e) {
-                    // Ignore parse errors
+            const data = JSON.parse(event.data);
+            if (data.MessageType === 'ScheduledTaskStarted') {
+                showScanProgress(data.Name || t('library.processing'));
+                // Track per-library scan status
+                const libId = data.ItemId;
+                if (libId) scanStatuses[libId] = true;
+                // Refresh tasks tab if visible
+                if (currentPage === 'admin') refreshTasks();
+            } else if (data.MessageType === 'ScheduledTaskCompleted') {
+                // Clear per-library scan status
+                const libId = data.ItemId;
+                if (libId) delete scanStatuses[libId];
+                if (data.State === 'Completed') {
+                    hideScanProgress();
+                } else if (data.State === 'Failed') {
+                    hideScanProgress();
+                    toast(t('admin.task_failed', { name: data.Name || t('admin.task'), error: data.Error || t('common.unknown_error') }), 'error');
                 }
-            };
-            
-            ws.onclose = () => {
-                // Reconnect with exponential backoff
-                setTimeout(connect, reconnectDelay);
-                reconnectDelay = Math.min(reconnectDelay * 2, 30000);
-            };
-            
-            ws.onerror = () => {
-                ws.close();
-            };
-            
-            reconnectDelay = 1000;
+                // Refresh tasks tab if visible
+                if (currentPage === 'admin') refreshTasks();
+            } else if (data.MessageType === 'LibraryChanged') {
+                // Library changed - refresh current view if on library page
+                // Drop the cached lists first, so the re-render is not served from the 30 s cache
+                API.invalidateCache('/Items');
+                API.invalidateCache('/Shows');
+                if (currentPage === 'library' && currentLibraryId) {
+                    setTimeout(() => renderLibrary(currentLibraryId), 500);
+                } else if (currentPage === 'home') {
+                    setTimeout(() => renderHome(), 500);
+                }
+            }
         } catch (e) {
-            // WebSocket not available, silently fail
+            console.error('Handling a server event failed:', e);
         }
-    }
-    
-    if (API.isLoggedIn()) {
-        connect();
-    }
+    };
+
+    ws.onclose = () => {
+        // A socket stopped on purpose is no longer the current one
+        if (scanSocket !== ws) return;
+        scanSocket = null;
+        if (!API.isLoggedIn()) return;
+        if (!scanSocketWarned) {
+            console.warn('Scan progress socket closed, retrying with backoff');
+            scanSocketWarned = true;
+        }
+        // Reconnect with exponential backoff
+        scanSocketRetry = setTimeout(() => {
+            scanSocketRetry = null;
+            initScanProgressWebSocket();
+        }, scanSocketDelay);
+        scanSocketDelay = Math.min(scanSocketDelay * 2, 30000);
+    };
+}
+
+// Called on logout and before a login starts a new socket: closes the socket and cancels any pending retry
+function stopScanProgressWebSocket() {
+    clearTimeout(scanSocketRetry);
+    scanSocketRetry = null;
+    scanSocketDelay = 1000;
+    scanSocketWarned = false;
+    const ws = scanSocket;
+    scanSocket = null;
+    if (ws) ws.close();
 }
 
 // --- Add User Modal Handlers ---
@@ -2963,6 +3105,8 @@ function handleHash() {
 window.addEventListener('hashchange', handleHash);
 
 document.addEventListener('DOMContentLoaded', async () => {
+    // Every way of closing the player goes through here, so the session is stopped and its position reported once
+    $('player-modal')?.addEventListener('close', () => stopPlayback());
     updateAuthUI();
     const wizardActive = await checkSetupWizard();
     if (!wizardActive) {
