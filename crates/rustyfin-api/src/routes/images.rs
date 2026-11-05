@@ -219,7 +219,7 @@ async fn refresh_item(
         .ok_or_else(|| ApiError::NotFound("item not found".into()))?;
 
     let config = state.config.read().await;
-    let tmdb_key = config.tmdb_api_key.as_deref();
+    let tmdb = state.tmdb.api(config.tmdb_api_key.as_deref());
     let omdb_key = config.omdb_api_key.as_deref();
     let fanart_key = config.fanart_api_key.as_deref();
 
@@ -227,7 +227,7 @@ async fn refresh_item(
         &state.db,
         &state.http_client,
         &item,
-        tmdb_key,
+        tmdb.as_ref(),
         omdb_key,
         fanart_key,
     )

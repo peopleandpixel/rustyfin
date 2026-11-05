@@ -44,4 +44,6 @@ pub struct AppState {
     pub image_cache: ImageCache,
     /// Shared HTTP client for external API calls (TMDB, etc.)
     pub http_client: Client,
+    /// Shared TMDb client (rate limiter, retries, response cache). Cloning shares them.
+    pub tmdb: rustyfin_core::tmdb_client::TmdbClient,
 }

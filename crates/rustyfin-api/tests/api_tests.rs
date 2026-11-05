@@ -61,6 +61,10 @@ async fn test_state() -> AppState {
         cache,
         image_cache,
         http_client: reqwest::Client::new(),
+        tmdb: rustyfin_core::tmdb_client::TmdbClient::new(
+            reqwest::Client::new(),
+            Default::default(),
+        ),
     }
 }
 
@@ -2279,6 +2283,322 @@ async fn test_configuration() {
         .unwrap();
 
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+// ── G12: TMDb client ──
+//
+// A stub TMDb on 127.0.0.1:0 stands in for the real one. The keys are fake.
+
+const G12_ENV_KEY: &str = "g12-env-fake-key-7777";
+const G12_CONFIG_KEY: &str = "g12-config-fake-key-8888";
+
+#[derive(Clone, Debug)]
+struct G12Hit {
+    /// Without the base URL's `/3`.
+    path: String,
+    api_key: Option<String>,
+    user_agent: String,
+}
+
+type G12Hits = Arc<std::sync::Mutex<Vec<G12Hit>>>;
+
+/// Serves one movie's refresh and trailers. Any other path is a 404. Returns the origin.
+async fn g12_stub() -> (String, G12Hits) {
+    async fn handle(
+        axum::extract::State(hits): axum::extract::State<G12Hits>,
+        uri: axum::http::Uri,
+        axum::extract::Query(query): axum::extract::Query<HashMap<String, String>>,
+        headers: axum::http::HeaderMap,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        let path = match uri.path().strip_prefix("/3") {
+            Some(path) => path.to_string(),
+            None => format!("outside the base URL: {}", uri.path()),
+        };
+        let user_agent = headers
+            .get("user-agent")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        hits.lock().unwrap().push(G12Hit {
+            path: path.clone(),
+            api_key: query.get("api_key").cloned(),
+            user_agent,
+        });
+        let body = match path.as_str() {
+            "/search/movie" => {
+                serde_json::json!({"results": [{"id": 9001, "title": "Alpha Film"}]})
+            }
+            "/movie/9001" => serde_json::json!({
+                "id": 9001,
+                "title": "Alpha Film",
+                "overview": "G12 stub overview",
+                "original_language": "en",
+                "release_date": "2001-05-04"
+            }),
+            "/movie/9001/external_ids" => serde_json::json!({"id": 9001, "imdb_id": "tt9001"}),
+            "/movie/9001/images" => serde_json::json!({
+                "posters": [{"file_path": "/g12-poster.jpg"}],
+                "backdrops": [{"file_path": "/g12-backdrop.jpg"}]
+            }),
+            "/movie/9001/credits" => serde_json::json!({"id": 9001, "cast": [], "crew": []}),
+            "/movie/9001/videos" => serde_json::json!({"results": [
+                {"key": "g12trailer", "name": "G12 Trailer", "type": "Trailer", "site": "YouTube"}
+            ]}),
+            _ => return StatusCode::NOT_FOUND.into_response(),
+        };
+        axum::Json(body).into_response()
+    }
+
+    let hits = G12Hits::default();
+    let stub = axum::Router::new()
+        .fallback(handle)
+        .with_state(hits.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
+    (origin, hits)
+}
+
+/// A server whose TMDb is the stub, with `env_key` as `RUSTYFIN_TMDB_API_KEY` and
+/// `config_key` as the config's `TmdbApiKey`.
+struct G12Server {
+    origin: String,
+    hits: G12Hits,
+    app: axum::Router,
+    token: String,
+    db: sqlx::SqlitePool,
+    data_dir: Arc<std::path::PathBuf>,
+}
+
+async fn g12_server(env_key: Option<&str>, config_key: Option<&str>) -> G12Server {
+    use rustyfin_core::tmdb_client::{TmdbClient, TmdbKey, TmdbSettings};
+
+    let (origin, hits) = g12_stub().await;
+    let mut state = test_state().await;
+    let settings = TmdbSettings {
+        api_base_url: format!("{origin}/3"),
+        image_base_url: format!("{origin}/t/p/original"),
+        env_key: env_key.and_then(TmdbKey::new),
+        min_interval: std::time::Duration::from_millis(1),
+        ..TmdbSettings::default()
+    };
+    let http = reqwest::Client::builder().no_proxy().build().unwrap();
+    state.tmdb = TmdbClient::new(http, settings);
+    state.config.write().await.tmdb_api_key = config_key.map(str::to_string);
+
+    let username = format!("admin_{}", uuid::Uuid::new_v4().simple());
+    rustyfin_auth::create_initial_user(&state.db, &username, "admin")
+        .await
+        .unwrap();
+    let user = rustyfin_db::repo_user::get_user_by_name(&state.db, &username)
+        .await
+        .unwrap()
+        .unwrap();
+    let token = rustyfin_auth::create_token(&state.db, &user, &Default::default())
+        .await
+        .unwrap();
+
+    G12Server {
+        origin,
+        hits,
+        token,
+        db: state.db.clone(),
+        data_dir: state.data_dir.clone(),
+        app: app(state),
+    }
+}
+
+impl G12Server {
+    async fn send(&self, method: &str, uri: &str, json: Option<String>) -> (StatusCode, String) {
+        let request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("Authorization", format!("Bearer {}", self.token));
+        let request = match json {
+            Some(json) => request
+                .header("Content-Type", "application/json")
+                .body(Body::from(json)),
+            None => request.body(Body::empty()),
+        };
+        let resp = self.app.clone().oneshot(request.unwrap()).await.unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    fn hits(&self) -> Vec<G12Hit> {
+        self.hits.lock().unwrap().clone()
+    }
+
+    /// A movie library with one movie whose file does not exist (no NFO, no local images).
+    async fn insert_movie(&self) -> uuid::Uuid {
+        let lib = rustyfin_model::library::Library {
+            id: uuid::Uuid::new_v4(),
+            name: "G12 Movies".to_string(),
+            content_type: rustyfin_model::library::LibraryContentType::Movies,
+            paths: vec!["/nonexistent/G12".to_string()],
+        };
+        rustyfin_db::repo_library::create_library(&self.db, &lib)
+            .await
+            .unwrap();
+        let item_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO media_items (id, library_id, name, media_type, path) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(item_id.to_string())
+        .bind(lib.id.to_string())
+        .bind("Alpha Film")
+        .bind("Movie")
+        .bind("/nonexistent/G12/Alpha Film (2001)/Alpha Film (2001).mkv")
+        .execute(&self.db)
+        .await
+        .unwrap();
+        item_id
+    }
+
+    /// `POST /Items/{id}/Refresh`, which must answer 200 whatever TMDb does. Returns the
+    /// item's TMDb id afterwards.
+    async fn refresh(&self, item_id: uuid::Uuid) -> Option<i64> {
+        let (status, body) = self
+            .send("POST", &format!("/Items/{item_id}/Refresh"), None)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        rustyfin_db::repo_media::get_item_by_id(&self.db, item_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .tmdb_id
+    }
+
+    /// Every request carried `key` as `api_key` and Rustyfin's User-Agent, and there was one.
+    fn assert_all_signed_with(&self, key: &str) {
+        let hits = self.hits();
+        assert!(!hits.is_empty(), "no request reached the stub");
+        for hit in &hits {
+            assert_eq!(hit.api_key.as_deref(), Some(key), "{}", hit.path);
+            assert_eq!(
+                hit.user_agent,
+                rustyfin_core::tmdb_client::USER_AGENT,
+                "{}",
+                hit.path
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_g12_env_tmdb_key_not_in_configuration() {
+    let server = g12_server(Some(G12_ENV_KEY), None).await;
+
+    for uri in ["/System/Configuration", "/System/Configuration/TmdbApiKey"] {
+        let (status, body) = server.send("GET", uri, None).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        assert!(!body.contains(G12_ENV_KEY), "{uri} shows the env key");
+    }
+    assert!(
+        server.hits().is_empty(),
+        "the configuration routes called TMDb"
+    );
+}
+
+#[tokio::test]
+async fn test_g12_configuration_round_trip_never_persists_env_key() {
+    let server = g12_server(Some(G12_ENV_KEY), None).await;
+
+    let (status, config) = server.send("GET", "/System/Configuration", None).await;
+    assert_eq!(status, StatusCode::OK, "{config}");
+    let (status, body) = server
+        .send("POST", "/System/Configuration", Some(config))
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    let saved =
+        std::fs::read_to_string(server.data_dir.join("config.json")).expect("config.json written");
+    assert!(
+        !saved.contains(G12_ENV_KEY),
+        "config.json holds the env key"
+    );
+    let (_, after) = server.send("GET", "/System/Configuration", None).await;
+    assert!(
+        !after.contains(G12_ENV_KEY),
+        "the configuration shows the env key"
+    );
+}
+
+#[tokio::test]
+async fn test_g12_item_refresh_uses_env_key_and_base_urls() {
+    let server = g12_server(Some(G12_ENV_KEY), None).await;
+    let item_id = server.insert_movie().await;
+
+    assert_eq!(server.refresh(item_id).await, Some(9001));
+    let item = rustyfin_db::repo_media::get_item_by_id(&server.db, item_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(item.overview.as_deref(), Some("G12 stub overview"));
+    let images = rustyfin_db::repo_image::get_images_for_item(&server.db, item_id)
+        .await
+        .unwrap();
+    let image_base = format!("{}/t/p/original/", server.origin);
+    let tmdb_images: Vec<_> = images.iter().filter(|i| i.provider == "tmdb").collect();
+    assert!(!tmdb_images.is_empty(), "no TMDb images stored: {images:?}");
+    for image in tmdb_images {
+        assert!(
+            image.path.starts_with(&image_base),
+            "{} is not on the image base",
+            image.path
+        );
+    }
+
+    let (status, body) = server.send("GET", &format!("/Items/{item_id}"), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.contains("https://www.youtube.com/watch?v=g12trailer"),
+        "no trailer in {body}"
+    );
+    assert!(!body.contains(G12_ENV_KEY), "the item shows the env key");
+
+    let hits = server.hits();
+    for path in [
+        "/search/movie",
+        "/movie/9001",
+        "/movie/9001/images",
+        "/movie/9001/videos",
+    ] {
+        assert!(
+            hits.iter().any(|hit| hit.path == path),
+            "{path} not requested: {hits:?}"
+        );
+    }
+    server.assert_all_signed_with(G12_ENV_KEY);
+}
+
+#[tokio::test]
+async fn test_g12_env_tmdb_key_wins_over_config_key() {
+    let server = g12_server(Some(G12_ENV_KEY), Some(G12_CONFIG_KEY)).await;
+    let item_id = server.insert_movie().await;
+
+    assert_eq!(server.refresh(item_id).await, Some(9001));
+    server.assert_all_signed_with(G12_ENV_KEY);
+}
+
+#[tokio::test]
+async fn test_g12_item_refresh_still_uses_config_key() {
+    let server = g12_server(None, Some(G12_CONFIG_KEY)).await;
+    let item_id = server.insert_movie().await;
+
+    assert_eq!(server.refresh(item_id).await, Some(9001));
+    server.assert_all_signed_with(G12_CONFIG_KEY);
+}
+
+#[tokio::test]
+async fn test_g12_no_tmdb_key_sends_nothing() {
+    let server = g12_server(None, Some("  ")).await;
+    let item_id = server.insert_movie().await;
+
+    assert_eq!(server.refresh(item_id).await, None);
+    assert!(server.hits().is_empty(), "TMDb was called without a key");
 }
 
 // ── Live TV Tests ──

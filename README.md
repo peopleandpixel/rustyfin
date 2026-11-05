@@ -288,6 +288,9 @@ Hardening options (ProtectHome, ProtectSystem, NoNewPrivileges) are enabled by d
 | `RUSTYFIN_SECRET` | Deprecated and ignored — access tokens are stored server-side and survive restarts | *(unused)* |
 | `RUSTYFIN_SERVER_ID` | Unique server identifier | Stable; persisted to `<data>/server_id` |
 | `RUSTYFIN_API_KEY` | Static API key for integrations, for example from `openssl rand -hex 32` (an empty value disables it) | Disabled |
+| `RUSTYFIN_TMDB_API_KEY` | TMDb API key (v3 key or v4 read access token). Takes precedence over the key in the server config and is never saved there | Config key, else TMDb off |
+| `RUSTYFIN_TMDB_BASE_URL` | TMDb API base URL (absolute http(s) URL; an invalid value stops startup) | `https://api.themoviedb.org/3` |
+| `RUSTYFIN_TMDB_IMAGE_BASE_URL` | TMDb image base URL (absolute http(s) URL; an invalid value stops startup) | `https://image.tmdb.org/t/p/original` |
 | `RUSTYFIN_KNOWN_PROXIES` | Reverse proxies trusted to set `X-Forwarded-For`, comma-separated IPs or CIDRs. Loopback is trusted only when listed. Behind a reverse proxy, list it here and have it send `X-Forwarded-For`. A peer that is not listed but sends `X-Forwarded-For`, `X-Real-IP` or `Forwarded` is neither local nor exempt from the login limit, and all its clients share one limit. A proxy that sends none of these headers looks like a direct client, which the server cannot detect | *(none)* |
 | `RUSTYFIN_RATE_LIMIT` | Login and password-reset attempts per window, per client IP (`0` disables) | `10` |
 | `RUSTYFIN_RATE_WINDOW` | Rate-limit window, in seconds | `60` |

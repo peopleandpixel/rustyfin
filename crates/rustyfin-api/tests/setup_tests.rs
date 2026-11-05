@@ -75,6 +75,10 @@ async fn test_state() -> (AppState, DataDir) {
         cache: ApiCache::new(),
         image_cache: ImageCache::new(),
         http_client: reqwest::Client::new(),
+        tmdb: rustyfin_core::tmdb_client::TmdbClient::new(
+            reqwest::Client::new(),
+            Default::default(),
+        ),
     };
     (state, DataDir(data_dir))
 }

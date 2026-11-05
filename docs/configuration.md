@@ -16,6 +16,9 @@ Rustyfin wird über Umgebungsvariablen konfiguriert. Es sind keine Konfiguration
 | `RUSTYFIN_SECRET` | Veraltet und ohne Wirkung — Access-Token werden serverseitig gespeichert und überstehen Neustarts | *(ungenutzt)* |
 | `RUSTYFIN_SERVER_ID` | Eindeutige Server-Kennung | Stabil; in `<data_dir>/server_id` gespeichert |
 | `RUSTYFIN_API_KEY` | Statischer API-Key für externe Integrationen (ein leerer Wert schaltet ihn ab) | *(deaktiviert)* |
+| `RUSTYFIN_TMDB_API_KEY` | TMDb-API-Key (v3-Key oder v4-Lesezugriffstoken). Hat Vorrang vor dem Key in der Serverkonfiguration und wird dort nie gespeichert | Key aus der Konfiguration, sonst TMDb aus |
+| `RUSTYFIN_TMDB_BASE_URL` | Basis-URL der TMDb-API (absolute http(s)-URL; ein ungültiger Wert verhindert den Start) | `https://api.themoviedb.org/3` |
+| `RUSTYFIN_TMDB_IMAGE_BASE_URL` | Basis-URL der TMDb-Bilder (absolute http(s)-URL; ein ungültiger Wert verhindert den Start) | `https://image.tmdb.org/t/p/original` |
 | `RUSTYFIN_KNOWN_PROXIES` | Reverse-Proxies, denen beim Setzen von `X-Forwarded-For` vertraut wird, kommagetrennte IPs oder CIDRs (Loopback nur, wenn eingetragen). Hinter einem Reverse Proxy diesen eintragen und ihn `X-Forwarded-For` senden lassen, siehe [Reverse Proxy](#reverse-proxy) | *(keine)* |
 | `RUSTYFIN_RATE_LIMIT` | Erlaubte Anmelde- und Passwort-Reset-Versuche pro Zeitfenster, pro Client-IP (`0` deaktiviert) | `10` |
 | `RUSTYFIN_RATE_WINDOW` | Zeitfenster der Ratenbegrenzung in Sekunden | `60` |

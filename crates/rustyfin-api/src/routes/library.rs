@@ -207,7 +207,7 @@ async fn scan_library(
 
     // Get API keys from config
     let config = state.config.read().await;
-    let tmdb_key = config.tmdb_api_key.clone();
+    let tmdb = state.tmdb.api(config.tmdb_api_key.as_deref());
     let omdb_key = config.omdb_api_key.clone();
     let fanart_key = config.fanart_api_key.clone();
     drop(config);
@@ -216,7 +216,7 @@ async fn scan_library(
         &state.db,
         &lib,
         &state.http_client,
-        tmdb_key.as_deref(),
+        tmdb.as_ref(),
         omdb_key.as_deref(),
         fanart_key.as_deref(),
     )
@@ -267,7 +267,7 @@ async fn refresh_all(State(state): State<AppState>) -> Result<Json<Value>, ApiEr
 
     // Get API keys from config
     let config = state.config.read().await;
-    let tmdb_key = config.tmdb_api_key.clone();
+    let tmdb = state.tmdb.api(config.tmdb_api_key.as_deref());
     let omdb_key = config.omdb_api_key.clone();
     let fanart_key = config.fanart_api_key.clone();
     drop(config);
@@ -321,7 +321,7 @@ async fn refresh_all(State(state): State<AppState>) -> Result<Json<Value>, ApiEr
             &state.db,
             lib,
             &state.http_client,
-            tmdb_key.as_deref(),
+            tmdb.as_ref(),
             omdb_key.as_deref(),
             fanart_key.as_deref(),
         )

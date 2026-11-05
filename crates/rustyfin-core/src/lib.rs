@@ -13,6 +13,7 @@ pub mod provider_tmdb;
 pub mod scanner;
 pub mod scheduler;
 pub mod subtitle;
+pub mod tmdb_client;
 pub mod transcode;
 pub mod trickplay;
 pub mod udp_discovery;

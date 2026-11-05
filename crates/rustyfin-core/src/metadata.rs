@@ -7,13 +7,14 @@ use uuid::Uuid;
 use crate::local_images;
 use crate::nfo_parser;
 use crate::provider_tmdb::PersonPhoto;
+use crate::tmdb_client::TmdbApi;
 
 /// Refresh metadata for a single item: local images, NFO, then optionally remote providers
 pub async fn refresh_item_metadata(
     pool: &SqlitePool,
     client: &reqwest::Client,
     item: &MediaItem,
-    tmdb_api_key: Option<&str>,
+    tmdb: Option<&TmdbApi>,
     omdb_api_key: Option<&str>,
     fanart_api_key: Option<&str>,
 ) -> Result<(), String> {
@@ -51,23 +52,15 @@ pub async fn refresh_item_metadata(
     }
 
     // 3. TMDb provider - use cleaned filename for better search results
-    if let Some(api_key) = tmdb_api_key {
+    if let Some(tmdb) = tmdb {
         // Clean the filename for better TMDB search matching
         let search_name = clean_filename_for_search(&item.path);
 
         let meta = match item.media_type {
             MediaType::Movie => {
-                crate::provider_tmdb::search_movie(
-                    client,
-                    api_key,
-                    &search_name,
-                    item.production_year,
-                )
-                .await
+                crate::provider_tmdb::search_movie(tmdb, &search_name, item.production_year).await
             }
-            MediaType::Series => {
-                crate::provider_tmdb::search_tv(client, api_key, &search_name).await
-            }
+            MediaType::Series => crate::provider_tmdb::search_tv(tmdb, &search_name).await,
             _ => None,
         };
 
@@ -86,12 +79,10 @@ pub async fn refresh_item_metadata(
             // Fetch and store cast/crew photos from TMDb
             if let Some(tmdb_id) = meta.tmdb_id {
                 let people = match item.media_type {
-                    MediaType::Movie => {
-                        crate::provider_tmdb::get_movie_people(client, api_key, tmdb_id).await
-                    }
+                    MediaType::Movie => crate::provider_tmdb::get_movie_people(tmdb, tmdb_id).await,
                     MediaType::Series | MediaType::Episode => {
                         let season = item.parent_index_number.unwrap_or(1);
-                        crate::provider_tmdb::get_tv_people(client, api_key, tmdb_id, season).await
+                        crate::provider_tmdb::get_tv_people(tmdb, tmdb_id, season).await
                     }
                     _ => Vec::new(),
                 };

@@ -22,3 +22,7 @@ libloading = "0.9"
 socket2 = { version = "0.6", features = ["all"] }
 dashmap = "6"
 moka = { workspace = true }
+
+[dev-dependencies]
+axum = { workspace = true }
+tracing-subscriber = { workspace = true }

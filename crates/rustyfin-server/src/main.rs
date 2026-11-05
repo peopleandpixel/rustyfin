@@ -102,6 +102,24 @@ async fn main() {
 
     let api_key = credentials::api_key(std::env::var("RUSTYFIN_API_KEY").ok());
 
+    let tmdb_settings = match rustyfin_core::tmdb_client::TmdbSettings::from_env() {
+        Ok(settings) => settings,
+        Err(e) => {
+            tracing::error!("{e}");
+            std::process::exit(1);
+        }
+    };
+    tracing::info!(
+        "TMDb API at {}, images at {}, key from {}",
+        tmdb_settings.api_base_url,
+        tmdb_settings.image_base_url,
+        if tmdb_settings.env_key.is_some() {
+            "RUSTYFIN_TMDB_API_KEY"
+        } else {
+            "the server config, if set"
+        }
+    );
+
     // Load or create server configuration
     let mut config = load_config(&data_dir);
 
@@ -173,12 +191,13 @@ async fn main() {
 
     // Shared HTTP client for external API calls (TMDB, etc.) - reuse connection pool
     let http_client = reqwest::Client::builder()
-        .user_agent("Rustyfin/1.0")
+        .user_agent(rustyfin_core::tmdb_client::USER_AGENT)
         .pool_max_idle_per_host(10)
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .expect("Failed to build HTTP client");
+    let tmdb = rustyfin_core::tmdb_client::TmdbClient::new(http_client.clone(), tmdb_settings);
 
     let state = AppState {
         db: pool,
@@ -200,6 +219,7 @@ async fn main() {
         cache,
         image_cache,
         http_client,
+        tmdb,
     };
 
     // Background task: scheduled tasks (library scan, metadata refresh, cache cleanup)

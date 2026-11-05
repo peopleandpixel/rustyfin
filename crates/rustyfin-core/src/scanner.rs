@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 use crate::local_images;
 use crate::probe;
+use crate::tmdb_client::TmdbApi;
 
 // ---------------------------------------------------------------------------
 // Multiple version detection
@@ -169,7 +170,7 @@ pub async fn scan_library_with_metadata(
     pool: &SqlitePool,
     library: &Library,
     http_client: &reqwest::Client,
-    tmdb_api_key: Option<&str>,
+    tmdb: Option<&TmdbApi>,
     omdb_api_key: Option<&str>,
     fanart_api_key: Option<&str>,
 ) -> Result<u32, sqlx::Error> {
@@ -201,7 +202,7 @@ pub async fn scan_library_with_metadata(
                 let sem = semaphore.clone();
                 let pool = pool.clone();
                 let client = http_client.clone();
-                let tmdb_key = tmdb_api_key.map(|s| s.to_string());
+                let tmdb = tmdb.cloned();
                 let omdb_key = omdb_api_key.map(|s| s.to_string());
                 let fanart_key = fanart_api_key.map(|s| s.to_string());
                 let handle = tokio::spawn(async move {
@@ -210,7 +211,7 @@ pub async fn scan_library_with_metadata(
                         &pool,
                         &client,
                         &item,
-                        tmdb_key.as_deref(),
+                        tmdb.as_ref(),
                         omdb_key.as_deref(),
                         fanart_key.as_deref(),
                     )

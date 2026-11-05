@@ -2527,6 +2527,7 @@ dependencies = [
 name = "rustyfin-core"
 version = "0.14.0"
 dependencies = [
+ "axum",
  "blurhash",
  "chrono",
  "dashmap",
@@ -2544,6 +2545,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
