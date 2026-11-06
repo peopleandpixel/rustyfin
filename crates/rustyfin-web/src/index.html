@@ -16,10 +16,10 @@
         <div class="text-center mb-8">
             <div class="relative inline-block">
                 <img src="/web/assets/logo.png" alt="Rustyfin" class="w-24 h-24 mx-auto rounded-2xl shadow-xl mb-4 p-1 bg-white/5 border border-white/10">
-                <span class="absolute -bottom-1 -right-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-[#00a4dc] text-white tracking-wider uppercase">Setup</span>
+                <span class="absolute -bottom-1 -right-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-[#00a4dc] text-white tracking-wider uppercase" data-i18n="wizard.setup_badge">Setup</span>
             </div>
-            <h1 class="text-3xl font-extrabold text-white tracking-tight">Willkommen bei Rustyfin</h1>
-            <p class="text-white/50 text-sm mt-1.5">Schneller, ressourcenschonender Medienserver in Rust</p>
+            <h1 class="text-3xl font-extrabold text-white tracking-tight" data-i18n="wizard.welcome">Welcome to Rustyfin</h1>
+            <p class="text-white/50 text-sm mt-1.5" data-i18n="wizard.tagline">A fast, resource-efficient media server written in Rust</p>
         </div>
 
         <!-- Step indicators -->
@@ -33,11 +33,15 @@
         <!-- Step 0: Language & Region -->
         <div id="wiz-step-0" class="jf-wizard-step active">
             <div class="jf-settings-card !bg-[#1a202c]/60">
-                <h2 class="text-lg font-bold text-white mb-2">1. Sprache & Region</h2>
-                <p class="text-white/60 text-xs mb-5">Wähle die bevorzugte Sprache für Filmbeschreibungen und Metadaten-Abrufe.</p>
+                <h2 class="text-lg font-bold text-white mb-2" data-i18n="wizard.language_title">1. Language & Region</h2>
+                <p class="text-white/60 text-xs mb-5" data-i18n="wizard.language_intro">Choose the language of the interface and the preferred language for descriptions and metadata.</p>
                 <div class="space-y-4">
                     <div>
-                        <label class="block text-xs font-medium text-white/70 mb-1.5">Metadaten-Sprache</label>
+                        <label for="wiz-ui-lang" class="block text-xs font-medium text-white/70 mb-1.5" data-i18n="common.display_language">Display language</label>
+                        <select id="wiz-ui-lang" class="jf-input w-full" onchange="wizSetUiLanguage(this.value)"></select>
+                    </div>
+                    <div>
+                        <label class="block text-xs font-medium text-white/70 mb-1.5" data-i18n="wizard.metadata_language">Metadata language</label>
                         <select id="wiz-lang" class="jf-input w-full">
                             <option value="de">Deutsch (DE)</option>
                             <option value="en">English (US)</option>
@@ -49,79 +53,79 @@
                         </select>
                     </div>
                     <div>
-                        <label class="block text-xs font-medium text-white/70 mb-1.5">Altersfreigabe-Land</label>
+                        <label class="block text-xs font-medium text-white/70 mb-1.5" data-i18n="wizard.rating_country">Parental rating country</label>
                         <select id="wiz-country" class="jf-input w-full">
-                            <option value="DE">Deutschland (FSK)</option>
-                            <option value="AT">Österreich</option>
-                            <option value="CH">Schweiz</option>
-                            <option value="US">USA (MPAA)</option>
-                            <option value="GB">Großbritannien (BBFC)</option>
-                            <option value="FR">Frankreich</option>
+                            <option value="DE" data-i18n="wizard.country_de">Germany (FSK)</option>
+                            <option value="AT" data-i18n="wizard.country_at">Austria</option>
+                            <option value="CH" data-i18n="wizard.country_ch">Switzerland</option>
+                            <option value="US" data-i18n="wizard.country_us">USA (MPAA)</option>
+                            <option value="GB" data-i18n="wizard.country_gb">United Kingdom (BBFC)</option>
+                            <option value="FR" data-i18n="wizard.country_fr">France</option>
                         </select>
                     </div>
                 </div>
             </div>
             <div class="flex justify-end mt-6">
-                <button class="jf-btn-primary" onclick="wizNext()">Weiter →</button>
+                <button class="jf-btn-primary" onclick="wizNext()" data-i18n="wizard.next">Next →</button>
             </div>
         </div>
 
         <!-- Step 1: Admin User -->
         <div id="wiz-step-1" class="jf-wizard-step">
             <div class="jf-settings-card !bg-[#1a202c]/60">
-                <h2 class="text-lg font-bold text-white mb-2">2. Administrator-Konto</h2>
-                <p class="text-white/60 text-xs mb-5">Erstelle das primäre Administratorkonto für deinen Server.</p>
+                <h2 class="text-lg font-bold text-white mb-2" data-i18n="wizard.admin_title">2. Administrator Account</h2>
+                <p class="text-white/60 text-xs mb-5" data-i18n="wizard.admin_intro">Create the primary administrator account for your server.</p>
                 <div class="space-y-4">
                     <div>
-                        <label class="block text-xs font-medium text-white/70 mb-1.5">Benutzername</label>
+                        <label class="block text-xs font-medium text-white/70 mb-1.5" data-i18n="common.username">Username</label>
                         <input type="text" id="wiz-username" class="jf-input w-full" placeholder="admin" value="admin">
                     </div>
                     <div>
-                        <label class="block text-xs font-medium text-white/70 mb-1.5">Passwort</label>
-                        <input type="password" id="wiz-password" class="jf-input w-full" placeholder="Sicheres Passwort">
+                        <label class="block text-xs font-medium text-white/70 mb-1.5" data-i18n="common.password">Password</label>
+                        <input type="password" id="wiz-password" class="jf-input w-full" placeholder="Strong password" data-i18n-placeholder="wizard.password_placeholder">
                     </div>
                     <div>
-                        <label class="block text-xs font-medium text-white/70 mb-1.5">Passwort wiederholen</label>
-                        <input type="password" id="wiz-password2" class="jf-input w-full" placeholder="Passwort bestätigen">
+                        <label class="block text-xs font-medium text-white/70 mb-1.5" data-i18n="wizard.confirm_password">Confirm password</label>
+                        <input type="password" id="wiz-password2" class="jf-input w-full" placeholder="Re-enter password" data-i18n-placeholder="wizard.confirm_password_placeholder">
                     </div>
                 </div>
             </div>
             <div id="wiz-user-error" class="text-red-400 text-xs mt-2 hidden p-2 rounded bg-red-500/10 border border-red-500/20"></div>
             <div class="flex justify-between mt-6">
-                <button class="jf-btn-ghost" onclick="wizPrev()">← Zurück</button>
-                <button class="jf-btn-primary" onclick="wizNext()">Weiter →</button>
+                <button class="jf-btn-ghost" onclick="wizPrev()" data-i18n="wizard.back">← Back</button>
+                <button class="jf-btn-primary" onclick="wizNext()" data-i18n="wizard.next">Next →</button>
             </div>
         </div>
 
         <!-- Step 2: Library Setup -->
         <div id="wiz-step-2" class="jf-wizard-step">
             <div class="jf-settings-card !bg-[#1a202c]/60">
-                <h2 class="text-lg font-bold text-white mb-2">3. Medienbibliothek (Optional)</h2>
-                <p class="text-white/60 text-xs mb-5">Füge deinen ersten Medienordner hinzu. Du kannst jederzeit im Admin-Bereich weitere anlegen.</p>
+                <h2 class="text-lg font-bold text-white mb-2" data-i18n="wizard.library_title">3. Media Library (Optional)</h2>
+                <p class="text-white/60 text-xs mb-5" data-i18n="wizard.library_intro">Add your first media folder. You can add more at any time in the admin area.</p>
                 <div class="space-y-4">
                     <div>
-                        <label class="block text-xs font-medium text-white/70 mb-1.5">Name der Bibliothek</label>
-                        <input type="text" id="wiz-lib-name" class="jf-input w-full" placeholder="z. B. Filme">
+                        <label class="block text-xs font-medium text-white/70 mb-1.5" data-i18n="wizard.library_name">Library name</label>
+                        <input type="text" id="wiz-lib-name" class="jf-input w-full" placeholder="e.g. Movies" data-i18n-placeholder="wizard.library_name_placeholder">
                     </div>
                     <div>
-                        <label class="block text-xs font-medium text-white/70 mb-1.5">Inhaltstyp</label>
+                        <label class="block text-xs font-medium text-white/70 mb-1.5" data-i18n="wizard.content_type">Content type</label>
                         <select id="wiz-lib-type" class="jf-input w-full">
-                            <option value="Movies">🎬 Filme</option>
-                            <option value="TvShows">📺 Serien</option>
-                            <option value="Music">🎵 Musik</option>
-                            <option value="Photos">🖼️ Fotos</option>
-                            <option value="Mixed">📁 Gemischt</option>
+                            <option value="Movies" data-i18n="library.type_movies">🎬 Movies</option>
+                            <option value="TvShows" data-i18n="library.type_shows">📺 Shows</option>
+                            <option value="Music" data-i18n="library.type_music">🎵 Music</option>
+                            <option value="Photos" data-i18n="library.type_photos">🖼️ Photos</option>
+                            <option value="Mixed" data-i18n="library.type_mixed">📁 Mixed</option>
                         </select>
                     </div>
                     <div>
-                        <label class="block text-xs font-medium text-white/70 mb-1.5">Ordnerpfad</label>
-                        <input type="text" id="wiz-lib-path" class="jf-input w-full" placeholder="/media/filme">
+                        <label class="block text-xs font-medium text-white/70 mb-1.5" data-i18n="wizard.folder_path">Folder path</label>
+                        <input type="text" id="wiz-lib-path" class="jf-input w-full" placeholder="/media/movies" data-i18n-placeholder="wizard.folder_path_placeholder">
                     </div>
                 </div>
             </div>
             <div class="flex justify-between mt-6">
-                <button class="jf-btn-ghost" onclick="wizPrev()">← Zurück</button>
-                <button class="jf-btn-primary" onclick="wizNext()">Weiter →</button>
+                <button class="jf-btn-ghost" onclick="wizPrev()" data-i18n="wizard.back">← Back</button>
+                <button class="jf-btn-primary" onclick="wizNext()" data-i18n="wizard.next">Next →</button>
             </div>
         </div>
 
@@ -129,17 +133,17 @@
         <div id="wiz-step-3" class="jf-wizard-step">
             <div class="jf-settings-card !bg-[#1a202c]/60 text-center">
                 <div class="w-16 h-16 rounded-full bg-emerald-500/20 text-emerald-400 mx-auto flex items-center justify-center text-3xl mb-4 border border-emerald-500/30">✓</div>
-                <h2 class="text-xl font-bold text-white mb-2">Alles bereit!</h2>
-                <p class="text-white/60 text-sm mb-6">Dein Rustyfin-Server ist vollständig konfiguriert und einsatzbereit.</p>
+                <h2 class="text-xl font-bold text-white mb-2" data-i18n="wizard.done_title">All Set!</h2>
+                <p class="text-white/60 text-sm mb-6" data-i18n="wizard.done_intro">Your Rustyfin server is fully configured and ready to use.</p>
                 <div class="bg-black/30 rounded-xl p-4 text-left text-xs space-y-2 border border-white/5">
-                    <div class="flex justify-between"><span class="text-white/50">Server-Engine:</span> <span class="font-semibold text-[#00a4dc]">Rustyfin Core (Rust Tokio)</span></div>
-                    <div class="flex justify-between"><span class="text-white/50">Admin-Konto:</span> <span id="wiz-summary-user" class="font-semibold text-white">admin</span></div>
-                    <div class="flex justify-between"><span class="text-white/50">Metadaten:</span> <span id="wiz-summary-lang" class="font-semibold text-white">Deutsch</span></div>
+                    <div class="flex justify-between"><span class="text-white/50" data-i18n="wizard.summary_engine">Server engine:</span> <span class="font-semibold text-[#00a4dc]">Rustyfin Core (Rust Tokio)</span></div>
+                    <div class="flex justify-between"><span class="text-white/50" data-i18n="wizard.summary_admin">Admin account:</span> <span id="wiz-summary-user" class="font-semibold text-white">admin</span></div>
+                    <div class="flex justify-between"><span class="text-white/50" data-i18n="wizard.summary_metadata">Metadata:</span> <span id="wiz-summary-lang" class="font-semibold text-white">Deutsch</span></div>
                 </div>
             </div>
             <div class="flex justify-between mt-6">
-                <button class="jf-btn-ghost" onclick="wizPrev()">← Zurück</button>
-                <button class="jf-btn-primary" onclick="wizComplete()">Fertigstellen & Starten</button>
+                <button class="jf-btn-ghost" onclick="wizPrev()" data-i18n="wizard.back">← Back</button>
+                <button class="jf-btn-primary" onclick="wizComplete()" data-i18n="wizard.finish">Finish & start</button>
             </div>
         </div>
     </div>
@@ -149,7 +153,7 @@
 <header id="main-navbar" class="jf-header sticky top-0 z-40 px-3 lg:px-6 h-16 flex items-center justify-between gap-3">
     <!-- Left: Drawer Toggle & Brand -->
     <div class="flex items-center gap-3">
-        <button id="sidebar-btn" class="jf-icon-btn lg:hidden" title="Menü ein-/ausblenden" onclick="toggleSidebar()">
+        <button id="sidebar-btn" class="jf-icon-btn lg:hidden" title="Toggle menu" data-i18n-title="nav.toggle_menu" onclick="toggleSidebar()">
             <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg>
         </button>
         <a class="flex items-center gap-2.5 cursor-pointer select-none group" onclick="navigate('home')">
@@ -165,7 +169,7 @@
     <div class="flex-1 max-w-xl mx-2">
         <div class="relative w-full">
             <svg class="absolute left-3.5 top-1/2 -translate-y-1/2 w-4 h-4 text-white/40 pointer-events-none" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/></svg>
-            <input id="search-input" type="text" placeholder="Filme, Serien, Musik suchen… (Drücke Enter)" class="jf-search w-full text-xs sm:text-sm pl-9 pr-12"
+            <input id="search-input" type="text" placeholder="Search movies, shows, music… (press Enter)" data-i18n-placeholder="nav.search_placeholder" class="jf-search w-full text-xs sm:text-sm pl-9 pr-12"
                    onkeydown="if(event.key==='Enter')doSearch(this.value)">
             <kbd class="hidden sm:inline-block absolute right-3 top-1/2 -translate-y-1/2 text-[10px] px-1.5 py-0.5 rounded bg-white/10 text-white/40 border border-white/10">↵</kbd>
         </div>
@@ -174,14 +178,14 @@
     <!-- Right Actions -->
     <div class="flex items-center gap-2 flex-shrink-0">
         <!-- Quick Connect badge -->
-        <button id="nav-quick-connect" class="hidden sm:inline-flex jf-icon-btn !w-auto px-2.5 text-xs text-white/60 hover:text-white" title="Quick Connect" onclick="showQuickConnectModal()">
+        <button id="nav-quick-connect" class="hidden sm:inline-flex jf-icon-btn !w-auto px-2.5 text-xs text-white/60 hover:text-white" title="Quick Connect" data-i18n-title="quick_connect.title" onclick="showQuickConnectModal()">
             <svg class="w-4 h-4 mr-1 text-[#00a4dc]" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 18h.01M8 21h8a2 2 0 002-2V5a2 2 0 00-2-2H8a2 2 0 00-2 2v14a2 2 0 002 2z"/></svg>
-            <span>Connect</span>
+            <span data-i18n="nav.connect">Connect</span>
         </button>
 
-        <button id="nav-add-lib" class="hidden jf-btn-primary !py-1.5 !px-3 text-xs flex items-center gap-1.5" title="Neue Bibliothek hinzufügen" onclick="openAddLibrary()">
+        <button id="nav-add-lib" class="hidden jf-btn-primary !py-1.5 !px-3 text-xs flex items-center gap-1.5" title="Add a new library" data-i18n-title="nav.add_new_library" onclick="openAddLibrary()">
             <span class="text-sm leading-none font-bold">＋</span>
-            <span class="hidden md:inline">Bibliothek</span>
+            <span class="hidden md:inline" data-i18n="common.library">Library</span>
         </button>
 
         <!-- User Menu -->
@@ -195,28 +199,28 @@
             <div id="user-dropdown" class="hidden absolute right-0 top-12 w-56 rounded-xl shadow-2xl border border-white/10 overflow-hidden jf-menu z-50">
                 <div class="p-3 border-b border-white/10 bg-white/5">
                     <p id="dropdown-username" class="font-bold text-sm text-white truncate"></p>
-                    <p class="text-[11px] text-[#00a4dc] mt-0.5">Angemeldet</p>
+                    <p class="text-[11px] text-[#00a4dc] mt-0.5" data-i18n="nav.signed_in">Signed in</p>
                 </div>
                 <div class="py-1">
                     <a class="jf-menu-item flex items-center gap-2" onclick="navigate('settings');closeUserMenu()">
                         <svg class="w-4 h-4 text-white/50" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
-                        Einstellungen
+                        <span data-i18n="nav.settings">Settings</span>
                     </a>
                     <a id="nav-admin-link" class="hidden jf-menu-item flex items-center gap-2" onclick="navigate('admin');closeUserMenu()">
                         <svg class="w-4 h-4 text-white/50" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/></svg>
-                        Server Dashboard
+                        <span data-i18n="nav.server_dashboard">Server Dashboard</span>
                     </a>
                 </div>
                 <div class="border-t border-white/10 py-1">
                     <a class="jf-menu-item text-red-400 hover:text-red-300 flex items-center gap-2" onclick="doLogout()">
                         <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"/></svg>
-                        Abmelden
+                        <span data-i18n="nav.sign_out">Sign Out</span>
                     </a>
                 </div>
             </div>
         </div>
 
-        <button id="nav-login-btn" class="jf-btn-primary !py-1.5 !px-4 text-xs font-semibold" onclick="navigate('login')">Anmelden</button>
+        <button id="nav-login-btn" class="jf-btn-primary !py-1.5 !px-4 text-xs font-semibold" onclick="navigate('login')" data-i18n="nav.sign_in">Sign In</button>
     </div>
 </header>
 
@@ -227,15 +231,15 @@
         <div class="space-y-6">
             <!-- Main navigation -->
             <div>
-                <p class="px-3 text-[11px] font-bold text-white/40 uppercase tracking-wider mb-2">Entdecken</p>
+                <p class="px-3 text-[11px] font-bold text-white/40 uppercase tracking-wider mb-2" data-i18n="nav.discover">Discover</p>
                 <nav class="space-y-1">
                     <a onclick="navigate('home')" id="side-nav-home" class="jf-drawer-item active">
                         <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6"/></svg>
-                        <span>Startseite</span>
+                        <span data-i18n="nav.home">Home</span>
                     </a>
                     <a onclick="navigate('favorites')" id="side-nav-fav" class="jf-drawer-item">
                         <svg class="w-4 h-4 text-rose-400" fill="currentColor" viewBox="0 0 24 24"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>
-                        <span>Favoriten</span>
+                        <span data-i18n="nav.favorites">Favorites</span>
                     </a>
                 </nav>
             </div>
@@ -243,23 +247,23 @@
             <!-- Media Libraries -->
             <div id="sidebar-libraries">
                 <div class="flex items-center justify-between px-3 mb-2">
-                    <p class="text-[11px] font-bold text-white/40 uppercase tracking-wider">Meine Medien</p>
-                    <button id="sidebar-add-lib" class="hidden w-5 h-5 rounded hover:bg-white/10 text-white/60 hover:text-white transition flex items-center justify-center text-sm" title="Bibliothek hinzufügen" onclick="openAddLibrary()">＋</button>
+                    <p class="text-[11px] font-bold text-white/40 uppercase tracking-wider" data-i18n="nav.my_media">My Media</p>
+                    <button id="sidebar-add-lib" class="hidden w-5 h-5 rounded hover:bg-white/10 text-white/60 hover:text-white transition flex items-center justify-center text-sm" title="Add library" data-i18n-title="nav.add_library" onclick="openAddLibrary()">＋</button>
                 </div>
                 <nav id="sidebar-lib-list" class="space-y-1"></nav>
             </div>
 
             <!-- Server Administration -->
             <div id="sidebar-admin-section" class="hidden">
-                <p class="px-3 text-[11px] font-bold text-white/40 uppercase tracking-wider mb-2">Server</p>
+                <p class="px-3 text-[11px] font-bold text-white/40 uppercase tracking-wider mb-2" data-i18n="nav.server">Server</p>
                 <nav class="space-y-1">
                     <a onclick="navigate('admin')" id="side-nav-admin" class="jf-drawer-item">
                         <svg class="w-4 h-4 text-[#00a4dc]" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zM14 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z"/></svg>
-                        <span>Verwaltung</span>
+                        <span data-i18n="nav.administration">Administration</span>
                     </a>
                     <a onclick="navigate('settings')" id="side-nav-settings" class="jf-drawer-item">
                         <svg class="w-4 h-4 text-white/50" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
-                        <span>Einstellungen</span>
+                        <span data-i18n="nav.settings">Settings</span>
                     </a>
                 </nav>
             </div>
@@ -294,17 +298,17 @@
         <!-- Player Top Bar (autohide) -->
         <div id="player-topbar" class="absolute top-0 left-0 right-0 z-30 p-4 lg:p-6 flex items-center justify-between bg-gradient-to-b from-black/80 to-transparent transition-opacity duration-300">
             <div class="flex items-center gap-3">
-                <button onclick="closePlayer()" class="jf-icon-btn !bg-white/10 hover:!bg-white/20 text-white" title="Schließen (Esc)">
+                <button onclick="closePlayer()" class="jf-icon-btn !bg-white/10 hover:!bg-white/20 text-white" title="Close (Esc)" data-i18n-title="player.close_tooltip">
                     <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/></svg>
                 </button>
                 <div>
-                    <h2 id="player-title" class="text-lg lg:text-xl font-bold text-white tracking-wide">Titel</h2>
+                    <h2 id="player-title" class="text-lg lg:text-xl font-bold text-white tracking-wide">Title</h2>
                     <p id="player-subtitle" class="text-xs text-white/60"></p>
                 </div>
             </div>
             <div class="flex items-center gap-2">
-                <span id="player-quality-tag" class="text-[11px] px-2 py-0.5 rounded bg-white/10 text-white/70 font-semibold uppercase">Direct Play</span>
-                <button onclick="closePlayer()" class="jf-icon-btn !bg-white/10 hover:!bg-white/20 text-white" title="Schließen">
+                <span id="player-quality-tag" class="text-[11px] px-2 py-0.5 rounded bg-white/10 text-white/70 font-semibold uppercase" data-i18n="player.direct_play">Direct Play</span>
+                <button onclick="closePlayer()" class="jf-icon-btn !bg-white/10 hover:!bg-white/20 text-white" title="Close" data-i18n-title="common.close">
                     <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
                 </button>
             </div>
@@ -333,10 +337,10 @@
                     <button id="player-btn-play" class="jf-icon-btn !w-10 !h-10 text-white !bg-[#00a4dc] hover:!bg-[#008fbf]" onclick="togglePlayPause()">
                         <svg id="player-play-icon" class="w-5 h-5 ml-0.5" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
                     </button>
-                    <button class="jf-icon-btn" title="10s zurück (←)" onclick="skipTime(-10)">
+                    <button class="jf-icon-btn" title="Rewind 10s (←)" data-i18n-title="player.rewind_tooltip" onclick="skipTime(-10)">
                         <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12.066 11.2a1 1 0 000 1.6l5.334 4A1 1 0 0019 16V8a1 1 0 00-1.6-.8l-5.334 4zM4.066 11.2a1 1 0 000 1.6l5.334 4A1 1 0 0011 16V8a1 1 0 00-1.6-.8l-5.334 4z"/></svg>
                     </button>
-                    <button class="jf-icon-btn" title="30s vor (→)" onclick="skipTime(30)">
+                    <button class="jf-icon-btn" title="Fast-forward 30s (→)" data-i18n-title="player.forward_tooltip" onclick="skipTime(30)">
                         <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11.934 12.8a1 1 0 000-1.6l-5.334-4A1 1 0 005 8v8a1 1 0 001.6.8l5.334-4zM19.934 12.8a1 1 0 000-1.6l-5.334-4A1 1 0 0013 8v8a1 1 0 001.6.8l5.334-4z"/></svg>
                     </button>
 
@@ -361,7 +365,7 @@
                     </select>
 
                     <!-- Fullscreen -->
-                    <button class="jf-icon-btn" title="Vollbild (F)" onclick="toggleFullscreen()">
+                    <button class="jf-icon-btn" title="Fullscreen (F)" data-i18n-title="player.fullscreen_tooltip" onclick="toggleFullscreen()">
                         <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 8V4m0 0h4M4 4l5 5m11-5h-4m4 0v4m0 0l-5-5M4 16v4m0 0h4m-4 0l5-5m11 5l-5-5m5 5v-4m0 4h-4"/></svg>
                     </button>
                 </div>
@@ -376,49 +380,49 @@
         <div class="flex items-center justify-between mb-4 border-b border-white/10 pb-3">
             <h3 class="text-base font-bold text-white flex items-center gap-2">
                 <span class="w-2 h-2 rounded-full bg-[#00a4dc]"></span>
-                Neue Medienbibliothek anlegen
+                <span data-i18n="library.add_title">Add Media Library</span>
             </h3>
             <button onclick="closeAddLibrary()" class="text-white/40 hover:text-white text-xl leading-none">×</button>
         </div>
         <form id="add-library-form" onsubmit="submitAddLibrary(event)" class="space-y-4">
             <div>
-                <label class="block text-xs font-semibold text-white/70 mb-1">Bibliotheksname</label>
-                <input name="name" required class="jf-input w-full" placeholder="z. B. 4K Filme">
+                <label class="block text-xs font-semibold text-white/70 mb-1" data-i18n="library.name_label">Library name</label>
+                <input name="name" required class="jf-input w-full" placeholder="e.g. 4K Movies" data-i18n-placeholder="library.name_placeholder">
             </div>
             <div>
-                <label class="block text-xs font-semibold text-white/70 mb-1">Medientyp</label>
+                <label class="block text-xs font-semibold text-white/70 mb-1" data-i18n="library.media_type">Media type</label>
                 <select name="type" class="jf-input w-full">
-                    <option value="Movies">🎬 Filme</option>
-                    <option value="TvShows">📺 TV Serien</option>
-                    <option value="Music">🎵 Musiksammlung</option>
-                    <option value="Photos">🖼️ Fotos & Heimvideos</option>
-                    <option value="Mixed">📁 Gemischte Inhalte</option>
+                    <option value="Movies" data-i18n="library.type_movies">🎬 Movies</option>
+                    <option value="TvShows" data-i18n="library.type_tv_shows">📺 TV Shows</option>
+                    <option value="Music" data-i18n="library.type_music_collection">🎵 Music Collection</option>
+                    <option value="Photos" data-i18n="library.type_photos_home_videos">🖼️ Photos & Home Videos</option>
+                    <option value="Mixed" data-i18n="library.type_mixed_content">📁 Mixed Content</option>
                 </select>
             </div>
             <div>
-                <label class="block text-xs font-semibold text-white/70 mb-1">Speicherpfade</label>
+                <label class="block text-xs font-semibold text-white/70 mb-1" data-i18n="library.storage_paths">Storage paths</label>
                 <div class="flex gap-2">
                     <input id="add-lib-path-input" name="paths" required class="jf-input flex-1" placeholder="/media/movies">
-                    <button type="button" class="jf-btn-ghost !px-3 !py-2 text-xs whitespace-nowrap" onclick="openDirectoryPicker()">📁 Durchsuchen</button>
+                    <button type="button" class="jf-btn-ghost !px-3 !py-2 text-xs whitespace-nowrap" onclick="openDirectoryPicker()" data-i18n="library.browse">📁 Browse</button>
                 </div>
                 <div id="add-lib-selected-paths" class="mt-2 space-y-1"></div>
-                <p class="text-[11px] text-white/30 mt-1">Oder mehrere Pfade per Komma trennen: /media/movies, /srv/filme</p>
+                <p class="text-[11px] text-white/30 mt-1" data-i18n="library.paths_hint">Or separate multiple paths with commas: /media/movies, /srv/movies</p>
             </div>
             <!-- Directory Picker Modal (inline) -->
             <div id="directory-picker" class="hidden">
                 <div class="flex items-center gap-2 mb-2">
-                    <button type="button" class="jf-btn-ghost !px-2 !py-1 text-xs" onclick="directoryPickerBack()">← Zurück</button>
+                    <button type="button" class="jf-btn-ghost !px-2 !py-1 text-xs" onclick="directoryPickerBack()" data-i18n="wizard.back">← Back</button>
                     <span id="directory-picker-path" class="text-xs text-white/60 font-mono truncate">/</span>
                 </div>
                 <div id="directory-picker-list" class="max-h-48 overflow-y-auto space-y-0.5 border border-white/10 rounded-lg"></div>
             </div>
             <div class="flex justify-end gap-2 pt-3 border-t border-white/10">
-                <button type="button" onclick="closeAddLibrary()" class="jf-btn-ghost text-xs">Abbrechen</button>
-                <button type="submit" class="jf-btn-primary text-xs">Bibliothek erstellen</button>
+                <button type="button" onclick="closeAddLibrary()" class="jf-btn-ghost text-xs" data-i18n="common.cancel">Cancel</button>
+                <button type="submit" class="jf-btn-primary text-xs" data-i18n="library.create">Create library</button>
             </div>
         </form>
     </div>
-    <form method="dialog" class="modal-backdrop"><button>schließen</button></form>
+    <form method="dialog" class="modal-backdrop"><button data-i18n="common.backdrop_close">close</button></form>
 </dialog>
 
 <!-- Add User Modal -->
@@ -427,30 +431,30 @@
         <div class="flex items-center justify-between mb-4 border-b border-white/10 pb-3">
             <h3 class="text-base font-bold text-white flex items-center gap-2">
                 <span class="w-2 h-2 rounded-full bg-[#00a4dc]"></span>
-                Neuer Benutzer
+                <span data-i18n="admin.new_user_title">New User</span>
             </h3>
             <button onclick="closeAddUser()" class="text-white/40 hover:text-white text-xl leading-none">×</button>
         </div>
         <form id="add-user-form" onsubmit="submitAddUser(event)" class="space-y-4">
             <div>
-                <label class="block text-xs font-semibold text-white/70 mb-1">Benutzername</label>
-                <input name="name" required class="jf-input w-full" placeholder="z. B. Max Mustermann">
+                <label class="block text-xs font-semibold text-white/70 mb-1" data-i18n="common.username">Username</label>
+                <input name="name" required class="jf-input w-full" placeholder="e.g. John Doe" data-i18n-placeholder="admin.username_placeholder">
             </div>
             <div>
-                <label class="block text-xs font-semibold text-white/70 mb-1">Passwort</label>
-                <input name="password" type="password" required class="jf-input w-full" placeholder="Mindestens 6 Zeichen">
+                <label class="block text-xs font-semibold text-white/70 mb-1" data-i18n="common.password">Password</label>
+                <input name="password" type="password" required class="jf-input w-full" placeholder="At least 6 characters" data-i18n-placeholder="admin.password_placeholder">
             </div>
             <div class="flex items-center gap-3">
                 <input type="checkbox" name="isAdministrator" id="new-user-admin" class="w-4 h-4 rounded bg-white/10 border-white/20 text-[#00a4dc]">
-                <label for="new-user-admin" class="text-sm text-white/70">Administrator</label>
+                <label for="new-user-admin" class="text-sm text-white/70" data-i18n="common.administrator">Administrator</label>
             </div>
             <div class="flex justify-end gap-2 pt-3 border-t border-white/10">
-                <button type="button" onclick="closeAddUser()" class="jf-btn-ghost text-xs">Abbrechen</button>
-                <button type="submit" class="jf-btn-primary text-xs">Benutzer erstellen</button>
+                <button type="button" onclick="closeAddUser()" class="jf-btn-ghost text-xs" data-i18n="common.cancel">Cancel</button>
+                <button type="submit" class="jf-btn-primary text-xs" data-i18n="admin.create_user">Create user</button>
             </div>
         </form>
     </div>
-    <form method="dialog" class="modal-backdrop"><button>schließen</button></form>
+    <form method="dialog" class="modal-backdrop"><button data-i18n="common.backdrop_close">close</button></form>
 </dialog>
 
 <!-- Quick Connect Modal -->
@@ -459,15 +463,15 @@
         <div class="w-12 h-12 rounded-2xl bg-[#00a4dc]/20 text-[#00a4dc] flex items-center justify-center mx-auto mb-3 border border-[#00a4dc]/30">
             <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 18h.01M8 21h8a2 2 0 002-2V5a2 2 0 00-2-2H8a2 2 0 00-2 2v14a2 2 0 002 2z"/></svg>
         </div>
-        <h3 class="text-lg font-bold text-white mb-1">Quick Connect</h3>
-        <p class="text-xs text-white/60 mb-5">Verbinde deinen Fernseher oder ein Mobilgerät ohne Passworteingabe.</p>
+        <h3 class="text-lg font-bold text-white mb-1" data-i18n="quick_connect.title">Quick Connect</h3>
+        <p class="text-xs text-white/60 mb-5" data-i18n="quick_connect.intro">Connect your TV or mobile device without entering a password.</p>
         <div class="p-4 rounded-xl bg-white/5 border border-white/10 mb-5">
-            <p class="text-xs text-white/50 mb-1">Code eingeben:</p>
+            <p class="text-xs text-white/50 mb-1" data-i18n="quick_connect.enter_code">Enter code:</p>
             <input id="qc-code-input" type="text" class="jf-input w-full text-center text-xl font-mono tracking-widest uppercase font-bold" placeholder="ABCD-1234">
         </div>
         <div class="flex justify-end gap-2">
-            <button onclick="$('qc-modal').close()" class="jf-btn-ghost text-xs">Schließen</button>
-            <button onclick="authorizeQuickConnect()" class="jf-btn-primary text-xs">Autorisieren</button>
+            <button onclick="$('qc-modal').close()" class="jf-btn-ghost text-xs" data-i18n="common.close">Close</button>
+            <button onclick="authorizeQuickConnect()" class="jf-btn-primary text-xs" data-i18n="quick_connect.authorize">Authorize</button>
         </div>
     </div>
 </dialog>
@@ -482,7 +486,7 @@
             <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
             <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
         </svg>
-        <span id="scan-progress-text" class="text-sm text-white font-medium">Bibliothek wird gescannt…</span>
+        <span id="scan-progress-text" class="text-sm text-white font-medium">Scanning library…</span>
     </div>
 </div>
 
