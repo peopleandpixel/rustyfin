@@ -1,7 +1,7 @@
 import { defineConfig } from 'vite';
 import tailwindcss from '@tailwindcss/vite';
 import { createHash } from 'node:crypto';
-import { readFileSync, writeFileSync, copyFileSync, mkdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, copyFileSync, mkdirSync, readdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -15,6 +15,10 @@ function computeCacheVersion() {
     join(__dirname, 'src', 'api.js'),
     join(__dirname, 'src', 'input.css'),
     join(__dirname, 'src', 'index.html'),
+    join(__dirname, 'src', 'main.js'),
+    join(__dirname, 'src', 'i18n.js'),
+    ...readdirSync(join(__dirname, 'src', 'translations')).sort()
+      .map(f => join(__dirname, 'src', 'translations', f)),
     join(__dirname, 'src', 'assets', 'logo.png'),
     join(__dirname, 'node_modules', 'hls.js', 'dist', 'hls.min.js'),
   ];

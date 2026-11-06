@@ -29,6 +29,10 @@ tasks.md
 .git/
 .gitignore
 
+# Web client build artifacts
+crates/rustyfin-web/node_modules
+crates/rustyfin-web/dist
+
 # OS files
 .DS_Store
 Thumbs.db

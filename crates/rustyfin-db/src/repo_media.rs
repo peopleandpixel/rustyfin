@@ -29,7 +29,7 @@ pub async fn upsert_media_item(pool: &SqlitePool, item: &MediaItem) -> Result<()
           premiere_date, runtime_ticks, index_number, parent_index_number, tmdb_id, tvdb_id, \
           tags, status, original_language, tagline, production_countries, budget, revenue, \
           homepage, end_date, vote_count, popularity) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&item.name)
@@ -108,7 +108,7 @@ pub async fn batch_upsert_media_items(
               premiere_date, runtime_ticks, index_number, parent_index_number, tmdb_id, tvdb_id, \
               tags, status, original_language, tagline, production_countries, budget, revenue, \
               homepage, end_date, vote_count, popularity) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(&item.name)

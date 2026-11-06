@@ -23,9 +23,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **repo_media_segment** (3 tests): Save, get, delete.
   - **repo_notification** (1 test): Empty notifications query.
 - **Test infrastructure**: Added shared test helper functions (`test_pool`, `insert_test_user`, `insert_test_item`, `insert_test_library`) in `lib.rs` for consistent test database setup with proper Foreign Key constraints.
+- **Web client translations**: The web client is localized with i18next, with English and German translations in `crates/rustyfin-web/src/translations/` (one JSON file per language, English as the source). The display language follows the browser and can be changed in the setup wizard and in the user settings; picking it in the wizard switches the UI immediately. Previously the UI was German only.
 
 ### Changed
 - **Test coverage improved**: `rustyfin-db` line coverage increased from 25.7% to 38.8% (+13.1 percentage points). Total test count increased from 148 to 218.
+
+### Fixed
+- **Startup wizard metadata settings**: The wizard now saves the chosen metadata language and country. It sent them as `preferred_metadata_language` and `metadata_country_code`, which `POST /Startup/Configuration` ignores because it expects PascalCase fields.
 
 ## [0.14.0] - 2026-11-03
 

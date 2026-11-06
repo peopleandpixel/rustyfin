@@ -150,7 +150,7 @@ const API = {
         });
         if (!res.ok) {
             const err = await res.json().catch(() => ({}));
-            throw new Error(err.Message || err.message || 'Login fehlgeschlagen. Bitte Zugangsdaten prüfen.');
+            throw new Error(err.Message || err.message || t('login.failed'));
         }
         const data = await res.json();
         this.token = data.AccessToken || data.access_token;
