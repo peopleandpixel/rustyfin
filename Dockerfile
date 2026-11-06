@@ -28,8 +28,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release --locked --bin rustyfin && \
     cp target/release/rustyfin /usr/local/bin/rustyfin
 
-# ---- Runtime Stage ----
-FROM debian:trixie-slim
+# ---- Runtime Base Stage ----
+# Shared by the two images below, so they can't drift apart
+FROM debian:trixie-slim AS runtime
 
 ARG TARGETARCH
 
@@ -46,9 +47,6 @@ RUN set -eux; \
 
 RUN useradd -r -s /bin/false -m -d /data rustyfin
 
-COPY --from=builder /usr/local/bin/rustyfin /usr/local/bin/rustyfin
-COPY --from=web /usr/src/rustyfin-web/dist /usr/local/share/rustyfin/web
-
 USER rustyfin
 WORKDIR /data
 
@@ -63,3 +61,18 @@ HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
     CMD curl -f http://localhost:8096/System/Info/Public || exit 1
 
 ENTRYPOINT ["rustyfin"]
+
+# ---- CI Image (--target prebuilt) ----
+# The binary and web client that CI built, downloaded to prebuilt/. Artifacts lose the
+# executable bit, so the binary gets it back here.
+FROM runtime AS prebuilt
+
+COPY --chmod=755 prebuilt/rustyfin /usr/local/bin/rustyfin
+COPY prebuilt/web /usr/local/share/rustyfin/web
+
+# ---- Runtime Stage ----
+# Built from source. It stays last, so a plain `docker build .` builds it.
+FROM runtime
+
+COPY --from=builder /usr/local/bin/rustyfin /usr/local/bin/rustyfin
+COPY --from=web /usr/src/rustyfin-web/dist /usr/local/share/rustyfin/web
