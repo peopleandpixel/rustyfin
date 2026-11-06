@@ -1266,6 +1266,8 @@ struct ItemsQuery {
     exclude_item_types_lower: Option<String>,
     genres: Option<String>,
     years: Option<String>,
+    #[serde(rename = "years")]
+    years_lower: Option<String>,
     search_term: Option<String>,
     #[serde(rename = "searchTerm")]
     search_term_lower: Option<String>,
@@ -1287,7 +1289,11 @@ struct ItemsQuery {
     name_starts_with_or_greater_lower: Option<String>,
     // --- Items Query Parameters ---
     recursive: Option<bool>,
+    #[serde(rename = "recursive")]
+    recursive_lower: Option<bool>,
     fields: Option<String>,
+    #[serde(rename = "fields")]
+    fields_lower: Option<String>,
     image_types_limit: Option<i32>,
     #[serde(rename = "imageTypesLimit")]
     image_types_limit_lower: Option<i32>,
@@ -1393,6 +1399,9 @@ impl ItemsQuery {
             .as_deref()
             .or(self.include_item_types_lower.as_deref())
     }
+    fn years(&self) -> Option<&str> {
+        self.years.as_deref().or(self.years_lower.as_deref())
+    }
     fn exclude_item_types(&self) -> Option<&str> {
         self.exclude_item_types
             .as_deref()
@@ -1428,10 +1437,10 @@ impl ItemsQuery {
             .or(self.name_starts_with_or_greater_lower.as_deref())
     }
     fn recursive(&self) -> bool {
-        self.recursive.unwrap_or(false)
+        self.recursive.or(self.recursive_lower).unwrap_or(false)
     }
     fn fields(&self) -> Option<&str> {
-        self.fields.as_deref()
+        self.fields.as_deref().or(self.fields_lower.as_deref())
     }
     fn image_types_limit(&self) -> Option<i32> {
         self.image_types_limit.or(self.image_types_limit_lower)
@@ -1583,8 +1592,7 @@ async fn get_items(
         .as_ref()
         .map(|s| s.split(',').map(|g| g.trim().to_string()).collect());
     let years: Option<Vec<i32>> = query
-        .years
-        .as_ref()
+        .years()
         .map(|s| s.split(',').filter_map(|y| y.trim().parse().ok()).collect());
     let official_ratings: Option<Vec<String>> = query
         .official_ratings()

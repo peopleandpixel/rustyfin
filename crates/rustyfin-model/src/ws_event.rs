@@ -91,6 +91,8 @@ pub struct RefreshProgressData {
     pub item_id: String,
     /// The whole percent done, "0" to "100", as text
     pub progress: String,
+    /// The scan's state: "Queued" or "Active" while it runs, "Idle" once it has ended
+    pub state: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

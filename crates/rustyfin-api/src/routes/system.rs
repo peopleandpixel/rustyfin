@@ -183,6 +183,12 @@ async fn update_configuration(
     // Update in-memory
     let mut config = state.config.write().await;
     *config = new_config;
+    state
+        .task_scheduler
+        .changes()
+        .set_delay(std::time::Duration::from_secs(u64::from(
+            config.library_monitor_delay,
+        )));
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -551,6 +557,12 @@ async fn update_configuration_by_key(
         serde_json::from_value(merged).map_err(|e| ApiError::Internal(e.to_string()))?;
 
     *config = new_config;
+    state
+        .task_scheduler
+        .changes()
+        .set_delay(std::time::Duration::from_secs(u64::from(
+            config.library_monitor_delay,
+        )));
     drop(config);
 
     // Persist to disk

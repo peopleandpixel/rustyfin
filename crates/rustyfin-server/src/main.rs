@@ -161,6 +161,11 @@ async fn main() {
     let data_dir_arc = Arc::new(data_dir);
     let task_scheduler =
         rustyfin_core::scheduler::TaskScheduler::new(pool.clone(), data_dir_arc.clone());
+    task_scheduler
+        .changes()
+        .set_delay(std::time::Duration::from_secs(u64::from(
+            config.library_monitor_delay,
+        )));
 
     let plugin_manager = rustyfin_core::plugin_manager::PluginManager::new(&data_dir_arc);
     plugin_manager.load_all().await;
@@ -286,6 +291,7 @@ async fn main() {
     let cleanup_db = state.db.clone();
     let sighup_config = state.config.clone();
     let sighup_data_dir = state.data_dir.clone();
+    let sighup_changes = state.task_scheduler.changes().clone();
     let cache = state.cache.clone();
     let app = build_router(state)
         .layer(CompressionLayer::new())
@@ -331,6 +337,7 @@ async fn main() {
     {
         let config = sighup_config;
         let data_dir = sighup_data_dir;
+        let changes = sighup_changes;
         tokio::spawn(async move {
             #[cfg(unix)]
             {
@@ -343,6 +350,9 @@ async fn main() {
                         let new_config = load_config(&data_dir);
                         let mut cfg = config.write().await;
                         *cfg = new_config;
+                        changes.set_delay(std::time::Duration::from_secs(u64::from(
+                            cfg.library_monitor_delay,
+                        )));
                         tracing::info!("configuration reloaded");
                     }
                 }

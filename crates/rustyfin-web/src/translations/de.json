@@ -133,6 +133,7 @@
         "paths_hint": "Oder mehrere Pfade per Komma trennen: /media/movies, /srv/filme",
         "create": "Bibliothek erstellen",
         "scanning": "{{name}} wird gescannt",
+        "scan_queued": "Scan in der Warteschlange: {{name}}",
         "scanning_percent": "{{name}} wird gescannt: {{percent}} %",
         "scan_library": "Bibliothek scannen",
         "scan_started_for": "Scan für {{name}} gestartet",

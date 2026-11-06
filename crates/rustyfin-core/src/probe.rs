@@ -728,7 +728,8 @@ pub async fn probe_and_add_source(
 }
 
 /// Spawn a bounded probe task that respects the global concurrency limit.
-/// Returns a JoinHandle so the caller can await it if needed.
+/// Returns a JoinHandle so the caller can await it if needed. When the probe succeeds, the file's
+/// stamp, taken before the probe, is stored on the new source.
 pub fn spawn_probe_and_save(
     pool: sqlx::SqlitePool,
     item_id: uuid::Uuid,
@@ -737,8 +738,16 @@ pub fn spawn_probe_and_save(
     tokio::spawn(async move {
         // Acquire a permit from the semaphore to limit concurrent probes
         let _permit = probe_semaphore().acquire().await;
-        if let Err(e) = probe_and_save(&pool, &item_id, &path).await {
-            tracing::warn!("failed to probe '{}': {}", path, e);
+        let stamp = scan_sync::file_stamp(&path);
+        match probe_and_save(&pool, &item_id, &path).await {
+            Ok(()) => {
+                if let Err(e) =
+                    scan_sync::store_stamp(&pool, &item_id.to_string(), &path, stamp).await
+                {
+                    tracing::warn!("failed to store the stamp of '{}': {}", path, e);
+                }
+            }
+            Err(e) => tracing::warn!("failed to probe '{}': {}", path, e),
         }
     })
 }
@@ -768,8 +777,9 @@ pub enum ProbeStep {
 }
 
 /// Runs `steps` for one item, in order, under one probe permit. A step that fails is logged, and
-/// the next step still runs. A step that succeeds clears the probe failure of its file, and one
-/// that fails with an ffprobe or parse error records it, so that later scans skip the file.
+/// the next step still runs. A step that succeeds clears the probe failure of its file and stores the
+/// file's stamp on its source. One that fails with an ffprobe or parse error records the failure, so
+/// that later scans skip the file.
 ///
 /// After a failed `Primary` step the item has no primary, so the next step runs as the primary
 /// instead, with `probe_and_save`. If that step succeeds, its file becomes the item's path, and the
@@ -786,6 +796,10 @@ pub fn spawn_probe_plan(
         let mut needs_primary = false;
         for step in steps {
             let is_primary = matches!(step, ProbeStep::Primary(_));
+            // Taken before the probe, so that a file that changes during it is probed again.
+            let stamp = scan_sync::file_stamp(match &step {
+                ProbeStep::Primary(path) | ProbeStep::Alternate(path) => path,
+            });
             let (path, result) = match &step {
                 ProbeStep::Primary(path) => (path, probe_and_save(&pool, &item_id, path).await),
                 ProbeStep::Alternate(path) if needs_primary => {
@@ -799,7 +813,7 @@ pub fn spawn_probe_plan(
             let recorded = match &result {
                 Ok(()) => scan_sync::clear_probe_failure(&pool, path).await,
                 Err(ProbeError::FfprobeFailed(_) | ProbeError::ParseError(_)) => {
-                    scan_sync::record_probe_failure(&pool, path).await
+                    scan_sync::record_probe_failure(&pool, path, stamp).await
                 }
                 Err(_) => Ok(()),
             };
@@ -808,6 +822,11 @@ pub fn spawn_probe_plan(
             }
             match result {
                 Ok(()) => {
+                    if let Err(e) =
+                        scan_sync::store_stamp(&pool, &item_id.to_string(), path, stamp).await
+                    {
+                        warn!("failed to store the stamp of '{}': {}", path, e);
+                    }
                     if needs_primary {
                         let moved = sqlx::query("UPDATE media_items SET path = ?1 WHERE id = ?2")
                             .bind(path.as_str())

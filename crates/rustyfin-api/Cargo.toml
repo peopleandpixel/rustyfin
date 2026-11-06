@@ -30,6 +30,7 @@ reqwest = { workspace = true }
 futures-util = "0.3"
 dashmap = "6"
 ipnet = "2"
+form_urlencoded = "1"
 
 [dev-dependencies]
 http-body-util = "0.1"

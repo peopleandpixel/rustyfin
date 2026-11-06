@@ -13,6 +13,7 @@ mod encoding_manager;
 mod images;
 mod items;
 mod library;
+mod library_monitor;
 mod live_tv;
 mod localization;
 mod media_segments;
@@ -38,11 +39,17 @@ pub use startup::{StartupOwner, settle_owner_at_startup};
 
 use axum::Router;
 use axum::middleware as axum_mw;
+use std::sync::Arc;
 
 use crate::middleware::{rate_limit, require_admin, require_auth, require_setup_or_admin};
 use crate::state::AppState;
 
 pub fn build_router(state: AppState) -> Router {
+    // The library monitor's rescans clear this router's caches and send its events.
+    state.task_scheduler.changes().set_runner(Arc::new(
+        library_monitor::LibraryMonitorRunner::for_state(&state),
+    ));
+
     // Open while the server has no users, then administrators only (Jellyfin's FirstTimeSetupOrElevated).
     let setup = Router::new()
         .merge(startup::routes())
@@ -73,6 +80,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(session::admin_routes())
         .merge(users::admin_routes())
         .merge(library::admin_routes())
+        .merge(library_monitor::admin_routes())
         .merge(images::admin_routes())
         .merge(items::admin_routes())
         .merge(subtitle::admin_routes())

@@ -61,6 +61,29 @@ pub fn is_ignored_file(name: &str) -> bool {
         || is_sample_file(&lower, "minta")
 }
 
+/// Whether the file at `path` is a trailer or a sample, by Jellyfin's names for them (`ExtraRuleResolver.cs`
+/// and the trailer and sample rules of `NamingOptions.cs`). The file stem is lower-cased and its trailing ASCII
+/// digits are trimmed. The result is a trailer or a sample when it is `trailer` or `sample`, or ends with
+/// `-trailer`, `.trailer`, `_trailer`, `- trailer`, `-sample`, `.sample`, `_sample` or `- sample`.
+pub fn is_trailer_or_sample(path: &Path) -> bool {
+    const ENDINGS: &[&str] = &[
+        "-trailer",
+        ".trailer",
+        "_trailer",
+        "- trailer",
+        "-sample",
+        ".sample",
+        "_sample",
+        "- sample",
+    ];
+    let Some(stem) = path.file_stem() else {
+        return false;
+    };
+    let lower = stem.to_string_lossy().to_lowercase();
+    let base = lower.trim_end_matches(|c: char| c.is_ascii_digit());
+    matches!(base, "trailer" | "sample") || ENDINGS.iter().any(|ending| base.ends_with(ending))
+}
+
 /// Whether the lower-case file name is `word.X` or `*.word.X`, where X is as `is_extension` allows.
 fn is_sample_file(lower: &str, word: &str) -> bool {
     // `word.X`: the whole name.

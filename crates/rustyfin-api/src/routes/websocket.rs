@@ -95,12 +95,22 @@ fn is_api_key(api_key: Option<&str>, token: &str) -> bool {
     api_key.is_some_and(|key| token == key)
 }
 
-/// The `RefreshProgress` frame of one library's scan: its id, and its percent as text.
-fn refresh_progress(library_id: uuid::Uuid, progress: u8) -> rustyfin_model::ws_event::WsEvent {
+/// The `RefreshProgress` frame of one library's scan: its id, its percent as text, and its state.
+fn refresh_progress(
+    library_id: uuid::Uuid,
+    progress: u8,
+    status: rustyfin_core::scan_progress::ScanStatus,
+) -> rustyfin_model::ws_event::WsEvent {
+    let state = match status {
+        rustyfin_core::scan_progress::ScanStatus::Queued => "Queued",
+        rustyfin_core::scan_progress::ScanStatus::Active => "Active",
+        rustyfin_core::scan_progress::ScanStatus::Idle => "Idle",
+    };
     rustyfin_model::ws_event::WsEvent::RefreshProgress {
         data: rustyfin_model::ws_event::RefreshProgressData {
             item_id: library_id.to_string(),
             progress: progress.to_string(),
+            state: state.to_string(),
         },
     }
 }
@@ -148,7 +158,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, token: String) {
 
     // The scans in progress at their current percent, so this socket starts from them
     for (library_id, scan) in scans_now {
-        let frame = refresh_progress(library_id, scan.progress.unwrap_or(0));
+        let frame = refresh_progress(library_id, scan.progress.unwrap_or(0), scan.status);
         if let Ok(json) = serde_json::to_string(&frame) {
             let _ = sender.send(Message::Text(json.into())).await;
         }
@@ -159,6 +169,10 @@ async fn handle_socket(socket: WebSocket, state: AppState, token: String) {
 
     loop {
         tokio::select! {
+            // Polled in the order written: the scan arm comes before the broadcast arm, so a library's
+            // 100 frame goes out before its Completed event.
+            biased;
+
             // Handle incoming messages from the client
             msg = receiver.next() => {
                 match msg {
@@ -196,6 +210,31 @@ async fn handle_socket(socket: WebSocket, state: AppState, token: String) {
                 }
             }
 
+            // Handle scan progress from the registry, sent to every socket. This arm comes before the
+            // broadcast arm, so that a library's 100 frame goes out before its Completed event.
+            res = scans_rx.recv() => {
+                match res {
+                    Ok(update) => {
+                        let frame = refresh_progress(update.library_id, update.progress, update.status);
+                        if let Ok(json) = serde_json::to_string(&frame)
+                            && sender.send(Message::Text(json.into())).await.is_err() {
+                                tracing::debug!("WebSocket: session {} sender closed", session_id);
+                                break;
+                            }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        // Stale percents would stay on screen, so the socket closes and the client
+                        // reconnects for a new snapshot.
+                        tracing::warn!("WebSocket: session {} missed {} scan updates, closing so the client resyncs", session_id, n);
+                        break;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        tracing::warn!("WebSocket: scan progress channel closed");
+                        break;
+                    }
+                }
+            }
+
             // Handle broadcast events from the server (global events)
             res = broadcast_rx.recv() => {
                 match res {
@@ -213,30 +252,6 @@ async fn handle_socket(socket: WebSocket, state: AppState, token: String) {
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         tracing::warn!("WebSocket: broadcast channel closed");
-                        break;
-                    }
-                }
-            }
-
-            // Handle scan progress from the registry, sent to every socket
-            res = scans_rx.recv() => {
-                match res {
-                    Ok(update) => {
-                        let frame = refresh_progress(update.library_id, update.progress);
-                        if let Ok(json) = serde_json::to_string(&frame)
-                            && sender.send(Message::Text(json.into())).await.is_err() {
-                                tracing::debug!("WebSocket: session {} sender closed", session_id);
-                                break;
-                            }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        // Stale percents would stay on screen, so the socket closes and the client
-                        // reconnects for a new snapshot.
-                        tracing::warn!("WebSocket: session {} missed {} scan updates, closing so the client resyncs", session_id, n);
-                        break;
-                    }
-                    Err(broadcast::error::RecvError::Closed) => {
-                        tracing::warn!("WebSocket: scan progress channel closed");
                         break;
                     }
                 }

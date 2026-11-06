@@ -11,7 +11,7 @@ let serverVersion = '0.3.0';
 let playerReportInterval = null;
 let playerHideTimeout = null;
 let activeItem = null;
-// Library id -> scan percent while it scans (0 = not known yet, so its ring spins). Absent when not scanning.
+// Library id -> { percent, queued } while it scans (percent 0 = not known yet, so its ring spins; queued = waiting its turn). Absent when not scanning.
 let scanStatuses = {};
 
 // --- DOM & Helper Utilities ---
@@ -81,17 +81,22 @@ function escapeHtml(str) {
 
 // Inner markup of a scan ring: nothing when the library is not scanning, else a progressbar with a track and an arc
 function scanRingInner(libId, name) {
-    const p = scanStatuses[libId];
-    if (p === undefined) return '';
+    const s = scanStatuses[libId];
+    if (s === undefined) return '';
+    const p = s.percent;
     const known = p > 0;
-    const label = escapeHtml(known ? t('library.scanning_percent', { name, percent: p }) : t('library.scanning', { name }));
-    const valueNow = known ? ` aria-valuenow="${p}"` : '';
-    const spin = known ? '' : ' motion-safe:animate-spin';
+    const label = escapeHtml(s.queued ? t('library.scan_queued', { name }) : known ? t('library.scanning_percent', { name, percent: p }) : t('library.scanning', { name }));
+    const valueNow = known && !s.queued ? ` aria-valuenow="${p}"` : '';
+    const spin = known || s.queued ? '' : ' motion-safe:animate-spin';
     const arc = known ? p : 25;
+    // A queued scan has no arc: only the track, drawn dashed
+    const track = s.queued
+        ? '<circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" stroke-width="2.5" opacity="0.25" pathLength="100" stroke-dasharray="6.25 6.25"/>'
+        : '<circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" stroke-width="2.5" opacity="0.25"/>';
+    const arcCircle = s.queued ? '' : `<circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" pathLength="100" stroke-dasharray="${arc} 100" transform="rotate(-90 8 8)"/>`;
     return `<span role="progressbar" class="block w-full h-full text-[#00a4dc]" title="${label}" aria-label="${label}" aria-valuemin="0" aria-valuemax="100"${valueNow}>`
         + `<svg aria-hidden="true" viewBox="0 0 16 16" class="w-full h-full${spin}">`
-        + '<circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" stroke-width="2.5" opacity="0.25"/>'
-        + `<circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" pathLength="100" stroke-dasharray="${arc} 100" transform="rotate(-90 8 8)"/>`
+        + track + arcCircle
         + '</svg></span>';
 }
 
@@ -3002,12 +3007,14 @@ function initScanProgressWebSocket() {
                 // Refresh tasks tab if visible
                 if (currentPage === 'admin') refreshTasks();
             } else if (data.MessageType === 'RefreshProgress') {
-                // Scan progress: "0" when queued, each whole percent, "100" when done
+                // Scan progress: State "Queued" while it waits its turn, "Active" with each whole percent, "Idle" at "100" when done
                 const id = data.Data?.ItemId;
                 const p = Number(data.Data?.Progress ?? NaN);
+                const state = data.Data?.State;
                 if (id && Number.isFinite(p)) {
-                    if (p >= 100) delete scanStatuses[id];
-                    else scanStatuses[id] = Math.max(scanStatuses[id] ?? 0, p);
+                    // Taken as is, not maxed: a new run of the same library can start lower than the last one
+                    if (state === 'Idle' || p >= 100) delete scanStatuses[id];
+                    else scanStatuses[id] = { percent: p, queued: state === 'Queued' };
                     updateScanRings(id);
                 }
             } else if (data.MessageType === 'LibraryChanged') {

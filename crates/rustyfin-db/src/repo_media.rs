@@ -1254,37 +1254,193 @@ pub async fn get_all_paths(pool: &SqlitePool) -> Result<Vec<String>, sqlx::Error
     Ok(rows)
 }
 
-/// Fetch all existing paths for items in a specific library.
+/// The paths that a query covers. Each variant matches the same paths in Rust ([`PathScope::contains`])
+/// and in SQL ([`PathScope::sql`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathScope {
+    /// Every path.
+    All,
+    /// The folder `u` itself and every path under it. `u` has no trailing `/`.
+    Under(String),
+    /// The paths directly in the folder `r`, not in its subfolders. `r` has no trailing `/`.
+    DirectlyIn(String),
+}
+
+impl PathScope {
+    /// Whether `path` is in the scope.
+    pub fn contains(&self, path: &str) -> bool {
+        match self {
+            PathScope::All => true,
+            PathScope::Under(folder) => {
+                let folder = folder.as_str();
+                path == folder
+                    || path
+                        .strip_prefix(folder)
+                        .is_some_and(|rest| rest.starts_with('/'))
+            }
+            PathScope::DirectlyIn(folder) => path
+                .strip_prefix(folder.as_str())
+                .and_then(|rest| rest.strip_prefix('/'))
+                .is_some_and(|name| !name.contains('/')),
+        }
+    }
+
+    /// The SQL condition on the path column `col`. It reads the folder from the numbered parameter
+    /// `?n`, so a query binds [`PathScope::param`] at `?n` whatever the variant.
+    pub fn sql(&self, col: &str, n: usize) -> String {
+        match self {
+            PathScope::All => format!("(?{n} IS NOT NULL)"),
+            PathScope::Under(_) => {
+                format!("({col} = ?{n} OR ({col} >= ?{n} || '/' AND {col} < ?{n} || '0'))")
+            }
+            PathScope::DirectlyIn(_) => format!(
+                "({col} >= ?{n} || '/' AND {col} < ?{n} || '0' AND instr(substr({col}, length(?{n}) + 2), '/') = 0)"
+            ),
+        }
+    }
+
+    /// The value of the folder parameter of [`PathScope::sql`]: the folder, or `""` for `All`.
+    pub fn param(&self) -> &str {
+        match self {
+            PathScope::All => "",
+            PathScope::Under(folder) | PathScope::DirectlyIn(folder) => folder.as_str(),
+        }
+    }
+}
+
+/// Fetch the paths of the items of a library that are in `scope`.
 pub async fn get_library_paths(
     pool: &SqlitePool,
     library_id: Uuid,
+    scope: &PathScope,
 ) -> Result<Vec<String>, sqlx::Error> {
-    let rows: Vec<String> = sqlx::query_scalar("SELECT path FROM media_items WHERE library_id = ?")
-        .bind(library_id.to_string())
-        .fetch_all(pool)
-        .await?;
+    let rows: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT path FROM media_items WHERE library_id = ?1 AND {}",
+        scope.sql("path", 2)
+    )))
+    .bind(library_id.to_string())
+    .bind(scope.param())
+    .fetch_all(pool)
+    .await?;
     Ok(rows)
 }
 
-/// Fetch all items of a specific media type for a library, returning path -> id mapping.
-/// Used by the scanner to pre-load series/season/artist/album IDs before directory traversal,
+/// Fetch the source of each audio item of a library whose source path is in `scope`, as (item id, path,
+/// size, modified). The size and modification time are the stamp that the source stores, and are `None`
+/// when it has none.
+pub async fn get_library_audio_sources(
+    pool: &SqlitePool,
+    library_id: Uuid,
+    scope: &PathScope,
+) -> Result<Vec<(Uuid, String, Option<i64>, Option<i64>)>, sqlx::Error> {
+    let rows: Vec<(String, String, Option<i64>, Option<i64>)> =
+        sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT m.id, s.path, s.size, s.modified
+         FROM media_sources AS s
+         JOIN media_items AS m ON m.id = s.item_id
+         WHERE m.library_id = ?1 AND m.media_type = 'Audio' AND {}",
+            scope.sql("s.path", 2)
+        )))
+        .bind(library_id.to_string())
+        .bind(scope.param())
+        .fetch_all(pool)
+        .await?;
+    let sources = rows
+        .into_iter()
+        .filter_map(|(id, path, size, modified)| {
+            Uuid::parse_str(&id)
+                .ok()
+                .map(|uid| (uid, path, size, modified))
+        })
+        .collect();
+    Ok(sources)
+}
+
+/// Fetch the items of a specific media type for a library whose path is in `scope`, returning path -> id
+/// mapping. Used by the scanner to pre-load series/season/artist/album IDs before directory traversal,
 /// avoiding per-item database queries during scanning.
 pub async fn get_library_items_by_type(
     pool: &SqlitePool,
     library_id: Uuid,
     media_type: &str,
+    scope: &PathScope,
 ) -> Result<HashMap<String, Uuid>, sqlx::Error> {
-    let rows: Vec<(String, String)> =
-        sqlx::query_as("SELECT path, id FROM media_items WHERE library_id = ? AND media_type = ?")
-            .bind(library_id.to_string())
-            .bind(media_type)
-            .fetch_all(pool)
-            .await?;
+    let rows: Vec<(String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT path, id FROM media_items WHERE library_id = ?1 AND media_type = ?3 AND {}",
+        scope.sql("path", 2)
+    )))
+    .bind(library_id.to_string())
+    .bind(scope.param())
+    .bind(media_type)
+    .fetch_all(pool)
+    .await?;
     let map = rows
         .into_iter()
         .filter_map(|(path, id)| Uuid::parse_str(&id).ok().map(|uid| (path, uid)))
         .collect();
     Ok(map)
+}
+
+/// Fetch the id of the item of a library with a media type and a path, if there is one. Used by the
+/// scanner to look up a container that the preload of its scope did not hold.
+pub async fn get_library_item_id(
+    pool: &SqlitePool,
+    library_id: Uuid,
+    media_type: &str,
+    path: &str,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    let id: Option<String> = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE library_id = ? AND media_type = ? AND path = ?",
+    )
+    .bind(library_id.to_string())
+    .bind(media_type)
+    .bind(path)
+    .fetch_optional(pool)
+    .await?;
+    Ok(id.and_then(|id| Uuid::parse_str(&id).ok()))
+}
+
+/// Fetch the artist rows of a music library (`MusicAlbum` rows with no parent) whose path is in `scope`,
+/// plus every artist keyed by name (path `''`), as (id, path, name) tuples. Used by the scanner to reuse
+/// the artists of earlier scans.
+pub async fn get_library_artists(
+    pool: &SqlitePool,
+    library_id: Uuid,
+    scope: &PathScope,
+) -> Result<Vec<(Uuid, String, String)>, sqlx::Error> {
+    let rows: Vec<(String, String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT id, path, name FROM media_items \
+         WHERE library_id = ?1 AND media_type = 'MusicAlbum' AND parent_id IS NULL \
+         AND (path = '' OR {})",
+        scope.sql("path", 2)
+    )))
+    .bind(library_id.to_string())
+    .bind(scope.param())
+    .fetch_all(pool)
+    .await?;
+    let artists = rows
+        .into_iter()
+        .filter_map(|(id, path, name)| Uuid::parse_str(&id).ok().map(|uid| (uid, path, name)))
+        .collect();
+    Ok(artists)
+}
+
+/// Fetch the id of the artist (a `MusicAlbum` row with no parent) of a library at a path, if there is one.
+/// Used by the scanner to look up an artist that the preload of its scope did not hold.
+pub async fn get_library_artist_id(
+    pool: &SqlitePool,
+    library_id: Uuid,
+    path: &str,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    let id: Option<String> = sqlx::query_scalar(
+        "SELECT id FROM media_items \
+         WHERE library_id = ? AND media_type = 'MusicAlbum' AND parent_id IS NULL AND path = ?",
+    )
+    .bind(library_id.to_string())
+    .bind(path)
+    .fetch_optional(pool)
+    .await?;
+    Ok(id.and_then(|id| Uuid::parse_str(&id).ok()))
 }
 
 /// Fetch all movie items for a library, returning (path, id) pairs.
