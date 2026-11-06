@@ -167,7 +167,9 @@ jobs:
           files: ${{ env.artifact }}
 
   # macOS: native build on macOS runner (cross cannot cross-compile to macOS)
+  # Disabled for now: since 2026-11-05 these jobs get no hosted runner and are cancelled after 15 min. Delete `if: false` to re-enable.
   build-macos:
+    if: false
     name: macOS ${{ matrix.target }}
     runs-on: macos-latest
     strategy:
