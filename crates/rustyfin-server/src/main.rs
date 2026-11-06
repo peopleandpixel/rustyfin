@@ -130,11 +130,15 @@ async fn main() {
     transcode_manager.spawn_cleanup_task();
 
     let data_dir_arc = Arc::new(data_dir);
-    let task_scheduler =
-        rustyfin_core::scheduler::TaskScheduler::new(pool.clone(), data_dir_arc.clone());
-
-    let plugin_manager = rustyfin_core::plugin_manager::PluginManager::new(&data_dir_arc);
+    let plugin_manager = rustyfin_core::plugin_manager::PluginManager::new(&data_dir_arc)
+        .with_database(pool.clone());
     plugin_manager.load_all().await;
+
+    // Register built-in metadata provider plugins (configs loaded from DB)
+    register_builtin_plugins(&plugin_manager).await;
+
+    let task_scheduler =
+        rustyfin_core::scheduler::TaskScheduler::new(pool.clone(), data_dir_arc.clone(), plugin_manager.clone());
 
     // Rate limiter: default 500 requests per 60 seconds per IP (configurable via env, 0 to disable)
     let rate_max: usize = std::env::var("RUSTYFIN_RATE_LIMIT")
@@ -430,4 +434,272 @@ fn data_dir() -> std::path::PathBuf {
                 .map(|h| std::path::PathBuf::from(h).join(".rustyfin"))
         })
         .unwrap_or_else(|| std::path::PathBuf::from("."))
+}
+
+/// Register built-in plugins (TMDB, OMDb, Fanart, TheTVDB, OpenSubtitles, Webhook).
+/// Plugin configurations are loaded from the database via the PluginManager.
+async fn register_builtin_plugins(
+    plugin_manager: &rustyfin_core::plugin_manager::PluginManager,
+) {
+    use rustyfin_core::plugin_manager::BuiltinPluginInfo;
+    use rustyfin_model::plugin::{Plugin, PluginStatus, PluginType};
+
+    // TMDB plugin
+    let tmdb_plugin = plugin_tmdb::TmdbPlugin::default();
+    if let Some(config) = plugin_manager.load_plugin_config_from_db("tmdb").await {
+        let _ = tmdb_plugin.set_configuration(config);
+    }
+    let tmdb_active = plugin_tmdb::register_tmdb_provider(&tmdb_plugin, plugin_manager).await.is_ok();
+    plugin_manager.register_builtin_plugin(BuiltinPluginInfo {
+        name: tmdb_plugin.name().to_string(),
+        version: tmdb_plugin.version().to_string(),
+        id: tmdb_plugin.id().to_string(),
+        description: tmdb_plugin.description().to_string(),
+        plugin_type: PluginType::MetadataProvider,
+        status: if tmdb_active { PluginStatus::Active } else { PluginStatus::Disabled },
+    }).await;
+    if tmdb_active {
+        tracing::info!("registered TMDB metadata provider");
+    } else {
+        tracing::info!("TMDB provider disabled (no API key configured)");
+    }
+
+    // OMDb plugin
+    let omdb_plugin = plugin_omdb::OmdbPlugin::default();
+    if let Some(config) = plugin_manager.load_plugin_config_from_db("omdb").await {
+        let _ = omdb_plugin.set_configuration(config);
+    }
+    let omdb_active = plugin_omdb::register_omdb_provider(&omdb_plugin, plugin_manager).await.is_ok();
+    plugin_manager.register_builtin_plugin(BuiltinPluginInfo {
+        name: omdb_plugin.name().to_string(),
+        version: omdb_plugin.version().to_string(),
+        id: omdb_plugin.id().to_string(),
+        description: omdb_plugin.description().to_string(),
+        plugin_type: PluginType::MetadataProvider,
+        status: if omdb_active { PluginStatus::Active } else { PluginStatus::Disabled },
+    }).await;
+    if omdb_active {
+        tracing::info!("registered OMDb metadata provider");
+    } else {
+        tracing::info!("OMDb provider disabled (no API key configured)");
+    }
+
+    // Fanart plugin
+    let fanart_plugin = plugin_fanart::FanartPlugin::default();
+    if let Some(config) = plugin_manager.load_plugin_config_from_db("fanart").await {
+        let _ = fanart_plugin.set_configuration(config);
+    }
+    let fanart_active = plugin_fanart::register_fanart_provider(&fanart_plugin, plugin_manager).await.is_ok();
+    plugin_manager.register_builtin_plugin(BuiltinPluginInfo {
+        name: fanart_plugin.name().to_string(),
+        version: fanart_plugin.version().to_string(),
+        id: fanart_plugin.id().to_string(),
+        description: fanart_plugin.description().to_string(),
+        plugin_type: PluginType::MetadataProvider,
+        status: if fanart_active { PluginStatus::Active } else { PluginStatus::Disabled },
+    }).await;
+    if fanart_active {
+        tracing::info!("registered Fanart.tv metadata provider");
+    } else {
+        tracing::info!("Fanart provider disabled (no API key configured)");
+    }
+
+    // OpenSubtitles plugin (always registered — no API key required)
+    let os_plugin = plugin_opensubtitles::OpenSubtitlesPlugin::default();
+    plugin_opensubtitles::register_opensubtitles_provider(&os_plugin, plugin_manager).await;
+    plugin_manager.register_builtin_plugin(BuiltinPluginInfo {
+        name: os_plugin.name().to_string(),
+        version: os_plugin.version().to_string(),
+        id: os_plugin.id().to_string(),
+        description: os_plugin.description().to_string(),
+        plugin_type: PluginType::SubtitleProvider,
+        status: PluginStatus::Active,
+    }).await;
+    tracing::info!("registered OpenSubtitles subtitle provider");
+
+    // TheTVDB plugin (always registered — uses free TVMaze API, no API key required)
+    let tvdb_plugin = plugin_tvdb::TvdbPlugin::default();
+    if let Some(config) = plugin_manager.load_plugin_config_from_db("tvdb").await {
+        let _ = tvdb_plugin.set_configuration(config);
+    }
+    plugin_tvdb::register_tvdb_provider(&tvdb_plugin, plugin_manager).await;
+    plugin_manager.register_builtin_plugin(BuiltinPluginInfo {
+        name: tvdb_plugin.name().to_string(),
+        version: tvdb_plugin.version().to_string(),
+        id: tvdb_plugin.id().to_string(),
+        description: tvdb_plugin.description().to_string(),
+        plugin_type: PluginType::MetadataProvider,
+        status: PluginStatus::Active,
+    }).await;
+    tracing::info!("registered TheTVDB metadata provider");
+
+    // Webhook notification plugin (registered if configured)
+    let webhook_plugin = plugin_webhook::WebhookPlugin::default();
+    if let Some(config) = plugin_manager.load_plugin_config_from_db("webhook").await {
+        let _ = webhook_plugin.set_configuration(config.clone());
+        let webhook_active = plugin_webhook::register_webhook_provider(&webhook_plugin, plugin_manager).await.is_ok();
+        plugin_manager.register_builtin_plugin(BuiltinPluginInfo {
+            name: webhook_plugin.name().to_string(),
+            version: webhook_plugin.version().to_string(),
+            id: webhook_plugin.id().to_string(),
+            description: webhook_plugin.description().to_string(),
+            plugin_type: PluginType::NotificationProvider,
+            status: if webhook_active { PluginStatus::Active } else { PluginStatus::Disabled },
+        }).await;
+        if webhook_active {
+            tracing::info!("registered Webhook notification provider");
+        } else {
+            tracing::info!("Webhook provider disabled (configuration error)");
+        }
+    } else {
+        // Register as disabled so it appears in the UI
+        plugin_manager.register_builtin_plugin(BuiltinPluginInfo {
+            name: webhook_plugin.name().to_string(),
+            version: webhook_plugin.version().to_string(),
+            id: webhook_plugin.id().to_string(),
+            description: webhook_plugin.description().to_string(),
+            plugin_type: PluginType::NotificationProvider,
+            status: PluginStatus::Disabled,
+        }).await;
+        tracing::info!("Webhook notification provider not configured — registered as disabled");
+    }
+
+    // ntfy.sh notification plugin (registered if configured)
+    let ntfy_plugin = plugin_ntfy::NtfyPlugin::default();
+    if let Some(config) = plugin_manager.load_plugin_config_from_db("ntfy").await {
+        let _ = ntfy_plugin.set_configuration(config.clone());
+        let ntfy_active = plugin_ntfy::register_ntfy_provider(&ntfy_plugin, plugin_manager).await.is_ok();
+        plugin_manager.register_builtin_plugin(BuiltinPluginInfo {
+            name: ntfy_plugin.name().to_string(),
+            version: ntfy_plugin.version().to_string(),
+            id: ntfy_plugin.id().to_string(),
+            description: ntfy_plugin.description().to_string(),
+            plugin_type: PluginType::NotificationProvider,
+            status: if ntfy_active { PluginStatus::Active } else { PluginStatus::Disabled },
+        }).await;
+        if ntfy_active {
+            tracing::info!("registered ntfy.sh notification provider");
+        } else {
+            tracing::info!("ntfy provider disabled (configuration error)");
+        }
+    } else {
+        plugin_manager.register_builtin_plugin(BuiltinPluginInfo {
+            name: ntfy_plugin.name().to_string(),
+            version: ntfy_plugin.version().to_string(),
+            id: ntfy_plugin.id().to_string(),
+            description: ntfy_plugin.description().to_string(),
+            plugin_type: PluginType::NotificationProvider,
+            status: PluginStatus::Disabled,
+        }).await;
+        tracing::info!("ntfy notification provider not configured — registered as disabled");
+    }
+
+    // MQTT notification plugin (registered if configured)
+    let mqtt_plugin = plugin_mqtt::MqttPlugin::default();
+    if let Some(config) = plugin_manager.load_plugin_config_from_db("mqtt").await {
+        let _ = mqtt_plugin.set_configuration(config.clone());
+        let mqtt_active = plugin_mqtt::register_mqtt_provider(&mqtt_plugin, plugin_manager).await.is_ok();
+        plugin_manager.register_builtin_plugin(BuiltinPluginInfo {
+            name: mqtt_plugin.name().to_string(),
+            version: mqtt_plugin.version().to_string(),
+            id: mqtt_plugin.id().to_string(),
+            description: mqtt_plugin.description().to_string(),
+            plugin_type: PluginType::NotificationProvider,
+            status: if mqtt_active { PluginStatus::Active } else { PluginStatus::Disabled },
+        }).await;
+        if mqtt_active {
+            tracing::info!("registered MQTT notification provider");
+        } else {
+            tracing::info!("MQTT provider disabled (configuration error)");
+        }
+    } else {
+        plugin_manager.register_builtin_plugin(BuiltinPluginInfo {
+            name: mqtt_plugin.name().to_string(),
+            version: mqtt_plugin.version().to_string(),
+            id: mqtt_plugin.id().to_string(),
+            description: mqtt_plugin.description().to_string(),
+            plugin_type: PluginType::NotificationProvider,
+            status: PluginStatus::Disabled,
+        }).await;
+        tracing::info!("MQTT notification provider not configured — registered as disabled");
+    }
+
+    // Pushover notification plugin (registered if configured)
+    let pushover_plugin = plugin_pushover::PushoverPlugin::default();
+    if let Some(config) = plugin_manager.load_plugin_config_from_db("pushover").await {
+        let _ = pushover_plugin.set_configuration(config.clone());
+        let pushover_active = plugin_pushover::register_pushover_provider(&pushover_plugin, plugin_manager).await.is_ok();
+        plugin_manager.register_builtin_plugin(BuiltinPluginInfo {
+            name: pushover_plugin.name().to_string(),
+            version: pushover_plugin.version().to_string(),
+            id: pushover_plugin.id().to_string(),
+            description: pushover_plugin.description().to_string(),
+            plugin_type: PluginType::NotificationProvider,
+            status: if pushover_active { PluginStatus::Active } else { PluginStatus::Disabled },
+        }).await;
+        if pushover_active {
+            tracing::info!("registered Pushover notification provider");
+        } else {
+            tracing::info!("Pushover provider disabled (configuration error)");
+        }
+    } else {
+        plugin_manager.register_builtin_plugin(BuiltinPluginInfo {
+            name: pushover_plugin.name().to_string(),
+            version: pushover_plugin.version().to_string(),
+            id: pushover_plugin.id().to_string(),
+            description: pushover_plugin.description().to_string(),
+            plugin_type: PluginType::NotificationProvider,
+            status: PluginStatus::Disabled,
+        }).await;
+        tracing::info!("Pushover notification provider not configured — registered as disabled");
+    }
+
+    // Trakt.tv metadata plugin (registered if configured)
+    let trakt_plugin = plugin_trakt::TraktPlugin::default();
+    if let Some(config) = plugin_manager.load_plugin_config_from_db("trakt").await {
+        let _ = trakt_plugin.set_configuration(config);
+    }
+    let trakt_active = plugin_trakt::register_trakt_provider(&trakt_plugin, plugin_manager).await.is_ok();
+    plugin_manager.register_builtin_plugin(BuiltinPluginInfo {
+        name: trakt_plugin.name().to_string(),
+        version: trakt_plugin.version().to_string(),
+        id: trakt_plugin.id().to_string(),
+        description: trakt_plugin.description().to_string(),
+        plugin_type: PluginType::MetadataProvider,
+        status: if trakt_active { PluginStatus::Active } else { PluginStatus::Disabled },
+    }).await;
+    if trakt_active {
+        tracing::info!("registered Trakt.tv metadata provider");
+    } else {
+        tracing::info!("Trakt provider disabled (no API key configured)");
+    }
+
+    // Podnapisi subtitle plugin (always registered — no API key required)
+    let podnapisi_plugin = plugin_podnapisi::PodnapisiPlugin::default();
+    plugin_podnapisi::register_podnapisi_provider(&podnapisi_plugin, plugin_manager).await;
+    plugin_manager.register_builtin_plugin(BuiltinPluginInfo {
+        name: podnapisi_plugin.name().to_string(),
+        version: podnapisi_plugin.version().to_string(),
+        id: podnapisi_plugin.id().to_string(),
+        description: podnapisi_plugin.description().to_string(),
+        plugin_type: PluginType::SubtitleProvider,
+        status: PluginStatus::Active,
+    }).await;
+    tracing::info!("registered Podnapisi subtitle provider");
+
+    // Local NFO metadata plugin (always registered — works offline)
+    let local_nfo_plugin = plugin_local_nfo::LocalNfoPlugin::default();
+    if let Some(config) = plugin_manager.load_plugin_config_from_db("local-nfo").await {
+        let _ = local_nfo_plugin.set_configuration(config);
+    }
+    plugin_local_nfo::register_local_nfo_provider(&local_nfo_plugin, plugin_manager).await;
+    plugin_manager.register_builtin_plugin(BuiltinPluginInfo {
+        name: local_nfo_plugin.name().to_string(),
+        version: local_nfo_plugin.version().to_string(),
+        id: local_nfo_plugin.id().to_string(),
+        description: local_nfo_plugin.description().to_string(),
+        plugin_type: PluginType::MetadataProvider,
+        status: PluginStatus::Active,
+    }).await;
+    tracing::info!("registered Local NFO metadata provider");
 }

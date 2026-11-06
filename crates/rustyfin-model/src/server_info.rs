@@ -63,12 +63,8 @@ pub struct ServerConfiguration {
     pub public_https_port: u16,
     #[serde(default = "default_http_port")]
     pub public_port: u16,
-    #[serde(default)]
-    pub tmdb_api_key: Option<String>,
-    #[serde(default)]
-    pub omdb_api_key: Option<String>,
-    #[serde(default)]
-    pub fanart_api_key: Option<String>,
+    // Plugin configurations (TMDB, OMDb, Fanart, etc.) are now stored in the database
+    // via the plugin_config table, not in config.json.
     // SMTP mail server configuration for password reset emails
     #[serde(default)]
     pub smtp_host: Option<String>,
@@ -127,9 +123,6 @@ impl Default for ServerConfiguration {
             quick_connect_available: false,
             public_https_port: 8096,
             public_port: 8096,
-            tmdb_api_key: None,
-            omdb_api_key: None,
-            fanart_api_key: None,
             smtp_host: None,
             smtp_port: default_smtp_port(),
             smtp_username: None,

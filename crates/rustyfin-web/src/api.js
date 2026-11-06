@@ -338,6 +338,10 @@ const API = {
 
     // Plugins
     getPlugins() { return this.get('/Plugins'); },
+    getPluginConfig(id) { return this.get(`/Plugins/${id}/Configuration`); },
+    setPluginConfig(id, config) { return this.post(`/Plugins/${id}/Configuration`, config); },
+    getPluginPriority(id) { return this.get(`/Plugins/${id}/Priority`); },
+    setPluginPriority(id, priority) { return this.put(`/Plugins/${id}/Priority`, { priority }); },
 
     // Genres, Artists, Studios, Persons
     getGenres() { return this.get('/Genres'); },

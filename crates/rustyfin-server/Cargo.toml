@@ -31,3 +31,15 @@ tokio-rustls = "0.26"
 hyper-util = { version = "0.1", features = ["tokio", "server-auto", "http1", "http2"] }
 which = "8"
 reqwest = { workspace = true }
+plugin-tmdb = { workspace = true }
+plugin-omdb = { workspace = true }
+plugin-fanart = { workspace = true }
+plugin-opensubtitles = { workspace = true }
+plugin-tvdb = { workspace = true }
+plugin-webhook = { workspace = true }
+plugin-ntfy = { workspace = true }
+plugin-mqtt = { workspace = true }
+plugin-trakt = { workspace = true }
+plugin-pushover = { workspace = true }
+plugin-podnapisi = { workspace = true }
+plugin-local-nfo = { workspace = true }

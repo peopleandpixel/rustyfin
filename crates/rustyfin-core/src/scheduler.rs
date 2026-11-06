@@ -9,6 +9,8 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::sync::watch;
 
+use crate::plugin_manager::PluginManager;
+
 /// Known task IDs
 pub const TASK_LIBRARY_SCAN: &str = "LibraryScan";
 pub const TASK_METADATA_REFRESH: &str = "MetadataRefresh";
@@ -35,10 +37,11 @@ pub struct TaskScheduler {
     tasks: Arc<RwLock<HashMap<String, TaskEntry>>>,
     db: SqlitePool,
     data_dir: Arc<PathBuf>,
+    plugin_manager: PluginManager,
 }
 
 impl TaskScheduler {
-    pub fn new(db: SqlitePool, data_dir: Arc<PathBuf>) -> Self {
+    pub fn new(db: SqlitePool, data_dir: Arc<PathBuf>, plugin_manager: PluginManager) -> Self {
         let mut tasks = HashMap::new();
 
         // Library Scan
@@ -160,6 +163,7 @@ impl TaskScheduler {
             tasks: Arc::new(RwLock::new(tasks)),
             db,
             data_dir,
+            plugin_manager,
         }
     }
 
@@ -287,7 +291,7 @@ impl TaskScheduler {
             Ok(libraries) => {
                 let mut errors = Vec::new();
                 for lib in &libraries {
-                    if let Err(e) = crate::scanner::scan_library(&self.db, lib).await {
+                    if let Err(e) = crate::scanner::scan_library(&self.db, lib, &self.plugin_manager).await {
                         errors.push(format!("{}: {}", lib.name, e));
                     }
                 }
@@ -372,7 +376,7 @@ impl TaskScheduler {
                             for item in &items {
                                 let client = reqwest::Client::new();
                                 if let Err(e) = crate::metadata::refresh_item_metadata(
-                                    &self.db, &client, item, None, None, None,
+                                    &self.db, &client, item, &self.plugin_manager,
                                 )
                                 .await
                                 {

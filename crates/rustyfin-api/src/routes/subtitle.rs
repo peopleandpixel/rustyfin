@@ -8,9 +8,7 @@ use serde_json::json;
 use std::path::PathBuf;
 use uuid::Uuid;
 
-use rustyfin_core::subtitle::{
-    OpenSubtitlesConfig, discover_external_subtitles, download_subtitle, srt_to_vtt,
-};
+use rustyfin_core::subtitle::{discover_external_subtitles, srt_to_vtt};
 
 use crate::error::ApiError;
 use crate::state::AppState;
@@ -147,20 +145,34 @@ async fn search_remote_subtitles(
     Path(id): Path<Uuid>,
     Query(query): Query<RemoteSubtitleQuery>,
 ) -> Result<Response, ApiError> {
-    // Search for subtitles using OpenSubtitles or local cache
     let item = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Item {id} not found")))?;
 
-    let results = rustyfin_core::subtitle::search_remote_subtitles(
-        &state.db_ro,
-        &item.name,
-        query.language.as_deref(),
-        item.production_year,
-    )
-    .await?;
+    // Use registered subtitle providers from PluginManager
+    let providers = state.plugin_manager.subtitle_providers().await;
+    let mut all_results: Vec<RemoteSubtitleResult> = Vec::new();
 
-    Ok((StatusCode::OK, axum::Json(results)).into_response())
+    let language = query.language.as_deref().unwrap_or("eng");
+    for provider in &providers {
+        let results = (provider.search_subtitles)(
+            &state.http_client,
+            &item,
+            language,
+        ).await;
+
+        for r in results {
+            all_results.push(RemoteSubtitleResult {
+                id: r.id,
+                name: r.name,
+                language: r.language,
+                format: "srt".to_string(),
+                download_count: None,
+            });
+        }
+    }
+
+    Ok((StatusCode::OK, axum::Json(all_results)).into_response())
 }
 
 #[derive(Debug, Deserialize)]
@@ -186,18 +198,27 @@ async fn download_remote_subtitle(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let cache_dir = state.data_dir.join("cache").join("subtitles");
 
-    let config = OpenSubtitlesConfig::default();
-    match download_subtitle(&config, &req.subtitle_id, &cache_dir).await {
-        Ok(path) => {
-            tracing::info!("Subtitle downloaded to {}", path.display());
-            Ok(Json(json!({
-                "status": "ok",
-                "path": path.to_string_lossy().to_string()
-            })))
-        }
-        Err(e) => {
-            tracing::warn!("Subtitle download failed: {}", e);
-            Err(ApiError::Internal(e))
+    // Use registered subtitle providers from PluginManager
+    let providers = state.plugin_manager.subtitle_providers().await;
+    
+    for provider in &providers {
+        match (provider.download_subtitle)(
+            &state.http_client,
+            &req.subtitle_id,
+            &cache_dir,
+        ).await {
+            Ok(()) => {
+                tracing::info!("Subtitle {} downloaded via plugin", req.subtitle_id);
+                return Ok(Json(json!({
+                    "status": "ok",
+                    "message": "Subtitle downloaded successfully"
+                })));
+            }
+            Err(e) => {
+                tracing::warn!("Subtitle download via plugin failed: {}", e);
+            }
         }
     }
+
+    Err(ApiError::Internal("No subtitle providers available".to_string()))
 }

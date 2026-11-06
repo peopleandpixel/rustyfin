@@ -7,6 +7,18 @@ members = [
     "crates/rustyfin-db",
     "crates/rustyfin-auth",
     "crates/rustyfin-cli",
+    "crates/plugin-tmdb",
+    "crates/plugin-omdb",
+    "crates/plugin-fanart",
+    "crates/plugin-opensubtitles",
+    "crates/plugin-tvdb",
+    "crates/plugin-webhook",
+    "crates/plugin-ntfy",
+    "crates/plugin-mqtt",
+    "crates/plugin-trakt",
+    "crates/plugin-pushover",
+    "crates/plugin-podnapisi",
+    "crates/plugin-local-nfo",
 ]
 resolver = "3"
 
@@ -65,3 +77,15 @@ rustyfin-model = { path = "crates/rustyfin-model" }
 rustyfin-core = { path = "crates/rustyfin-core" }
 rustyfin-db = { path = "crates/rustyfin-db" }
 rustyfin-auth = { path = "crates/rustyfin-auth" }
+plugin-tmdb = { path = "crates/plugin-tmdb" }
+plugin-omdb = { path = "crates/plugin-omdb" }
+plugin-fanart = { path = "crates/plugin-fanart" }
+plugin-opensubtitles = { path = "crates/plugin-opensubtitles" }
+plugin-tvdb = { path = "crates/plugin-tvdb" }
+plugin-webhook = { path = "crates/plugin-webhook" }
+plugin-ntfy = { path = "crates/plugin-ntfy" }
+plugin-mqtt = { path = "crates/plugin-mqtt" }
+plugin-trakt = { path = "crates/plugin-trakt" }
+plugin-pushover = { path = "crates/plugin-pushover" }
+plugin-podnapisi = { path = "crates/plugin-podnapisi" }
+plugin-local-nfo = { path = "crates/plugin-local-nfo" }

@@ -1,0 +1,19 @@
+[package]
+name = "plugin-local-nfo"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+rustyfin-model = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+quick-xml = { workspace = true }
+
+[features]
+dynamic = []

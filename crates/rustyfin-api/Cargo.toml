@@ -29,6 +29,7 @@ moka = { workspace = true }
 reqwest = { workspace = true }
 futures-util = "0.3"
 dashmap = "6"
+plugin-tmdb = { workspace = true }
 
 [dev-dependencies]
 http-body-util = "0.1"

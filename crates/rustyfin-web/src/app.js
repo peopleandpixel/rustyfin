@@ -2064,8 +2064,8 @@ async function renderAdmin() {
             API.getSessions().catch(() => [])
         ]);
 
-        const tabs = [t('admin.overview'), t('admin.users'), t('admin.libraries'), t('admin.tasks'), t('admin.sessions'), t('admin.activity_log_tab'), t('admin.live_log')];
-        const tabIds = ['admin-overview', 'admin-users', 'admin-libs', 'admin-tasks', 'admin-sessions', 'admin-activity', 'admin-livelog'];
+        const tabs = [t('admin.overview'), t('admin.users'), t('admin.libraries'), t('admin.tasks'), t('admin.plugins'), t('admin.sessions'), t('admin.activity_log_tab'), t('admin.live_log')];
+        const tabIds = ['admin-overview', 'admin-users', 'admin-libs', 'admin-tasks', 'admin-plugins', 'admin-sessions', 'admin-activity', 'admin-livelog'];
 
         page.innerHTML = `
         <div class="max-w-6xl mx-auto jf-page">
@@ -2198,7 +2198,71 @@ async function renderAdmin() {
                 </div>
             </div>
 
-            <!-- Tab 4: Sessions -->
+            <!-- Tab 4: Plugins -->
+            <div id="admin-plugins" class="hidden">
+                <div class="flex items-center justify-between mb-4">
+                    <h3 class="font-bold text-white text-base">Plugins (${plugins.length})</h3>
+                    <p class="text-[10px] text-white/30">Plugins verwalten und konfigurieren</p>
+                </div>
+                <div class="grid gap-3">
+                    ${plugins.length === 0 ? '<p class="text-white/40 text-xs jf-settings-card p-6">Keine Plugins gefunden.</p>' : ''}
+                    ${plugins.map(p => {
+                        const typeIcons = {
+                            'MetadataProvider': '🏷️',
+                            'SubtitleProvider': '📝',
+                            'NotificationProvider': '🔔',
+                            'ImageProvider': '🖼️',
+                            'AuthenticationProvider': '🔐',
+                            'Task': '⚙️'
+                        };
+                        const typeLabels = {
+                            'MetadataProvider': 'Metadaten',
+                            'SubtitleProvider': 'Untertitel',
+                            'NotificationProvider': 'Benachrichtigung',
+                            'ImageProvider': 'Bilder',
+                            'AuthenticationProvider': 'Authentifizierung',
+                            'Task': 'Aufgabe'
+                        };
+                        const icon = typeIcons[p.PluginType || ''] || '📦';
+                        const typeLabel = typeLabels[p.PluginType || ''] || 'Plugin';
+                        const isActive = p.Status === 'Active';
+                        const isBuiltin = p.IsBuiltin === true;
+                        const priority = p.Priority != null ? p.Priority : 100;
+                        const pluginId = p.Id || p.id;
+                        return `
+                        <div class="jf-settings-card p-4">
+                            <div class="flex items-start gap-4">
+                                <span class="text-3xl flex-shrink-0 mt-0.5">${icon}</span>
+                                <div class="flex-1 min-w-0">
+                                    <div class="flex items-center gap-2 flex-wrap">
+                                        <h4 class="font-bold text-white text-sm">${escapeHtml(p.Name || p.name)}</h4>
+                                        <span class="px-2 py-0.5 rounded text-[10px] font-bold ${isActive ? 'bg-emerald-500/20 text-emerald-300' : 'bg-red-500/20 text-red-300'}">
+                                            ${isActive ? '✓ Aktiv' : '✕ Deaktiviert'}
+                                        </span>
+                                        <span class="px-2 py-0.5 rounded text-[10px] bg-white/5 text-white/40">${typeLabel}</span>
+                                        ${isBuiltin ? '<span class="px-2 py-0.5 rounded text-[10px] bg-[#00a4dc]/10 text-[#38bdf8]">Built-in</span>' : '<span class="px-2 py-0.5 rounded text-[10px] bg-amber-500/10 text-amber-300">Dynamisch</span>'}
+                                        <span class="text-[10px] text-white/30 font-mono">v${escapeHtml(p.Version || p.version || '0')}</span>
+                                    </div>
+                                    <p class="text-xs text-white/40 mt-1">${escapeHtml(p.Description || p.description || '')}</p>
+                                    <div class="flex items-center gap-2 mt-3 flex-wrap">
+                                        <button class="jf-btn-primary text-xs !py-1.5 !px-3" onclick="openPluginConfig('${escapeHtml(pluginId)}')">
+                                            ⚙️ Konfigurieren
+                                        </button>
+                                        <div class="flex items-center gap-1 ml-auto" title="Priorität (niedriger = zuerst verarbeitet)">
+                                            <span class="text-[10px] text-white/40">Prio:</span>
+                                            <button class="w-6 h-6 rounded bg-white/10 hover:bg-white/20 text-white/60 hover:text-white text-xs flex items-center justify-center transition" onclick="changePluginPriority('${escapeHtml(pluginId)}', -10)" title="Priorität erhöhen">▲</button>
+                                            <span id="prio-${escapeHtml(pluginId)}" class="text-xs font-mono text-white/70 w-8 text-center">${priority}</span>
+                                            <button class="w-6 h-6 rounded bg-white/10 hover:bg-white/20 text-white/60 hover:text-white text-xs flex items-center justify-center transition" onclick="changePluginPriority('${escapeHtml(pluginId)}', 10)" title="Priorität verringern">▼</button>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>`;
+                    }).join('')}
+                </div>
+            </div>
+
+            <!-- Tab 5: Sessions -->
             <div id="admin-sessions" class="hidden jf-settings-card">
                 <h3 class="font-bold text-white text-base mb-4">${t('admin.active_sessions')}</h3>
                 <div class="overflow-x-auto">
@@ -2269,13 +2333,84 @@ function showAdminTab(btn, tabId) {
     });
     btn.className = 'px-4 py-2 rounded-xl text-xs font-semibold whitespace-nowrap transition bg-[#00a4dc] text-white shadow-lg';
 
-    ['admin-overview', 'admin-users', 'admin-libs', 'admin-tasks', 'admin-sessions', 'admin-activity', 'admin-livelog'].forEach(id => {
+    ['admin-overview', 'admin-users', 'admin-libs', 'admin-tasks', 'admin-plugins', 'admin-sessions', 'admin-activity', 'admin-livelog'].forEach(id => {
         const el = $(id);
         if (el) el.classList.toggle('hidden', id !== tabId);
     });
 
     if (tabId === 'admin-activity') loadActivityLog();
     if (tabId === 'admin-livelog') initLiveLog();
+}
+
+// --- Plugin Configuration Modal ---
+
+async function openPluginConfig(pluginId) {
+    try {
+        const config = await API.getPluginConfig(pluginId).catch(() => ({ PluginId: pluginId, values: {} }));
+        const plugins = await API.getPlugins().catch(() => []);
+        const plugin = plugins.find(p => (p.Id || p.id) === pluginId);
+        
+        const name = plugin?.Name || plugin?.name || pluginId;
+        const values = config.values || config;
+        
+        // Create modal
+        const modal = document.createElement('dialog');
+        modal.id = 'plugin-config-modal';
+        modal.className = 'bg-[#0f172a] border border-white/10 rounded-2xl p-6 max-w-lg w-full text-white shadow-2xl';
+        modal.innerHTML = `
+            <div class="flex items-center justify-between mb-4">
+                <h3 class="text-lg font-bold text-white">⚙️ ${escapeHtml(name)}</h3>
+                <button onclick="document.getElementById('plugin-config-modal').close()" class="text-white/40 hover:text-white text-xl">✕</button>
+            </div>
+            <div class="mb-4">
+                <label class="block text-xs font-semibold text-white/70 mb-2">Konfiguration (JSON)</label>
+                <textarea id="plugin-config-json" class="jf-input w-full font-mono text-xs" rows="10">${JSON.stringify(values, null, 2)}</textarea>
+                <p class="text-[10px] text-white/30 mt-1">Passwort-Felder werden verschlüsselt in der Datenbank gespeichert.</p>
+            </div>
+            <div class="flex gap-2 justify-end">
+                <button onclick="document.getElementById('plugin-config-modal').close()" class="jf-btn-ghost text-xs">Abbrechen</button>
+                <button onclick="savePluginConfig('${escapeHtml(pluginId)}')" class="jf-btn-primary text-xs">Speichern</button>
+            </div>
+        `;
+        document.body.appendChild(modal);
+        modal.showModal();
+    } catch (e) {
+        toast('Konfiguration konnte nicht geladen werden: ' + e.message, 'error');
+    }
+}
+
+async function savePluginConfig(pluginId) {
+    try {
+        const jsonStr = $('plugin-config-json').value;
+        const config = JSON.parse(jsonStr);
+        await API.setPluginConfig(pluginId, config);
+        toast('Plugin-Konfiguration gespeichert');
+        const modal = $('plugin-config-modal');
+        if (modal) modal.remove();
+        // Refresh admin page to show updated status
+        if (currentPage === 'admin') renderAdmin();
+    } catch (e) {
+        if (e instanceof SyntaxError) {
+            toast('Ungültiges JSON: ' + e.message, 'error');
+        } else {
+            toast('Fehler beim Speichern: ' + e.message, 'error');
+        }
+    }
+}
+
+async function changePluginPriority(pluginId, delta) {
+    try {
+        const resp = await API.getPluginPriority(pluginId);
+        const currentPriority = resp.priority != null ? resp.priority : 100;
+        const newPriority = Math.max(0, currentPriority + delta);
+        await API.setPluginPriority(pluginId, newPriority);
+        // Update the display without full refresh
+        const prioEl = $('prio-' + pluginId);
+        if (prioEl) prioEl.textContent = newPriority;
+        toast('Priorität auf ' + newPriority + ' gesetzt');
+    } catch (e) {
+        toast('Fehler beim Ändern der Priorität: ' + e.message, 'error');
+    }
 }
 
 // --- Scheduled Tasks UI ---

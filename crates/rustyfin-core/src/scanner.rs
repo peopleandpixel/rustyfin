@@ -8,6 +8,7 @@ use tokio::fs;
 use uuid::Uuid;
 
 use crate::local_images;
+use crate::plugin_manager::PluginManager;
 use crate::probe;
 
 // ---------------------------------------------------------------------------
@@ -161,17 +162,15 @@ const VIDEO_EXTENSIONS: &[&str] = &[
 const AUDIO_EXTENSIONS: &[&str] = &["mp3", "flac", "ogg", "wav", "aac", "wma", "m4a", "opus"];
 const PHOTO_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "gif", "bmp", "webp", "tiff"];
 
-pub async fn scan_library(pool: &SqlitePool, library: &Library) -> Result<u32, sqlx::Error> {
-    scan_library_with_metadata(pool, library, &reqwest::Client::new(), None, None, None).await
+pub async fn scan_library(pool: &SqlitePool, library: &Library, plugin_manager: &PluginManager) -> Result<u32, sqlx::Error> {
+    scan_library_with_metadata(pool, library, &reqwest::Client::new(), plugin_manager).await
 }
 
 pub async fn scan_library_with_metadata(
     pool: &SqlitePool,
     library: &Library,
     http_client: &reqwest::Client,
-    tmdb_api_key: Option<&str>,
-    omdb_api_key: Option<&str>,
-    fanart_api_key: Option<&str>,
+    plugin_manager: &PluginManager,
 ) -> Result<u32, sqlx::Error> {
     tracing::info!(
         "scanning library '{}' (content_type={:?}, paths={:?})",
@@ -201,18 +200,14 @@ pub async fn scan_library_with_metadata(
                 let sem = semaphore.clone();
                 let pool = pool.clone();
                 let client = http_client.clone();
-                let tmdb_key = tmdb_api_key.map(|s| s.to_string());
-                let omdb_key = omdb_api_key.map(|s| s.to_string());
-                let fanart_key = fanart_api_key.map(|s| s.to_string());
+                let pm = plugin_manager.clone();
                 let handle = tokio::spawn(async move {
                     let _perm = sem.acquire().await;
                     if let Err(e) = crate::metadata::refresh_item_metadata(
                         &pool,
                         &client,
                         &item,
-                        tmdb_key.as_deref(),
-                        omdb_key.as_deref(),
-                        fanart_key.as_deref(),
+                        &pm,
                     )
                     .await
                     {

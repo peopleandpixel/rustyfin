@@ -13,6 +13,8 @@ pub mod repo_media_segment;
 pub mod repo_media_source;
 pub mod repo_misc;
 pub mod repo_notification;
+pub mod repo_plugin_config;
+pub mod repo_plugin_priority;
 pub mod repo_package;
 pub mod repo_person;
 pub mod repo_playback;
