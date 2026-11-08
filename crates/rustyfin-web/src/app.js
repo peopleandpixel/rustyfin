@@ -1553,13 +1553,21 @@ async function renderSearch(term) {
     term = decodeURIComponent(term || '').trim();
     if ($('search-input')) $('search-input').value = term;
     const page = $('page-search');
+    const showNoResults = () => {
+        page.innerHTML = `<div class="text-center py-24 text-white/40 jf-page"><p class="text-lg">${t('search.no_results', { term: escapeHtml(term) })}</p></div>`;
+    };
+    // A blank term never reaches the server: /Search/Hints answers 400 to it.
+    if (!term) {
+        showNoResults();
+        return;
+    }
     page.innerHTML = '<div class="flex justify-center items-center py-24"><div class="w-10 h-10 border-3 border-[#00a4dc] border-t-transparent rounded-full animate-spin"></div></div>';
 
     try {
         const data = await API.search(term, 50);
         const hints = data.SearchHints || data.search_hints || [];
         if (!hints.length) {
-            page.innerHTML = `<div class="text-center py-24 text-white/40 jf-page"><p class="text-lg">${t('search.no_results', { term: escapeHtml(term) })}</p></div>`;
+            showNoResults();
             return;
         }
         const items = hints.map(h => ({

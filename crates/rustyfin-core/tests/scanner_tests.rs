@@ -3446,10 +3446,10 @@ async fn b28_a_new_year_or_rating_still_moves_the_filter_counts() {
     );
 }
 
-/// The ids of the items a search for `query` finds.
+/// The ids of the items a search for `query` finds, in every library.
 #[cfg(target_os = "linux")]
 async fn b28_found(pool: &SqlitePool, query: &str) -> Vec<Uuid> {
-    rustyfin_db::repo_search::search_hints(pool, query, 10)
+    rustyfin_db::repo_search::hint_candidates(pool, query, None)
         .await
         .unwrap()
         .into_iter()
@@ -3466,6 +3466,15 @@ async fn b28_a_new_name_still_changes_what_search_finds() {
     touch(&root_of(&film), movie);
     scan(&fx.pool, &film).await;
     let id = item_at(&fx.pool, &film, movie).await;
+    // Search matches overviews and genres too. The bare file has neither, so only its name can
+    // match "Alpha".
+    let (overview, genres): (Option<String>, String) =
+        sqlx::query_as("SELECT overview, genres FROM media_items WHERE id = ?1")
+            .bind(id.to_string())
+            .fetch_one(&fx.pool)
+            .await
+            .unwrap();
+    assert_eq!((overview, genres.as_str()), (None, ""));
     assert_eq!(b28_found(&fx.pool, "Alpha").await, [id]);
     let id_text = id.to_string();
     exec(
