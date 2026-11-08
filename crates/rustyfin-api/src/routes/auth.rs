@@ -7,12 +7,18 @@ use rustyfin_model::auth::{AuthResponse, AuthSessionInfo, LoginRequest, SetupCod
 use rustyfin_model::user::{User, UserDto};
 use uuid::Uuid;
 
+use super::quick_connect;
 use crate::error::ApiError;
+use crate::oidc::{PASSWORD_SIGN_IN_OFF, password_allowed};
 use crate::state::AppState;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/Users/AuthenticateByName", post(login))
+        .route(
+            "/Users/AuthenticateWithQuickConnect",
+            post(quick_connect_sign_in),
+        )
         .route(
             "/Users/AuthenticateWithSetupCode",
             post(login_with_setup_code),
@@ -28,24 +34,53 @@ async fn login(
     Json(req): Json<LoginRequest>,
 ) -> Result<Response, ApiError> {
     let device = token_device(&headers);
-    match rustyfin_auth::authenticate(&state.db, &req.username, &req.password, &device).await {
-        Ok((user, token)) => {
-            let answer = start_session(&state, &device, user, token).await;
-            Ok(Json(answer).into_response())
-        }
+    let user = match rustyfin_auth::check_password(&state.db, &req.username, &req.password).await {
+        Ok(user) => user,
         Err(rustyfin_auth::AuthError::InvalidCredentials) => {
             // The password may be a pending user's one-time code: the header says so (B20 3.2).
-            if !rustyfin_auth::setup_code_pending(&state.db, &req.username, &req.password).await? {
+            // It goes only to a user who may use a password, so a refused code gets no header (X1).
+            let config = rustyfin_db::repo_oidc::get_settings(&state.db).await?;
+            let pending =
+                rustyfin_auth::pending_setup_user(&state.db, &req.username, &req.password).await?;
+            let Some(user) = pending else {
+                return Err(ApiError::Unauthorized);
+            };
+            if !password_allowed(&state.db, &config, &user).await? {
                 return Err(ApiError::Unauthorized);
             }
             let mut response = ApiError::Unauthorized.into_response();
             response
                 .headers_mut()
                 .insert(SETUP_REQUIRED_HEADER, HeaderValue::from_static("true"));
-            Ok(response)
+            return Ok(response);
         }
-        Err(e) => Err(ApiError::from(e)),
+        Err(e) => return Err(ApiError::from(e)),
+    };
+    // While password sign-in is off, only an administrator whose rights were given by hand may
+    // sign in with a password (AC21, AC41).
+    let config = rustyfin_db::repo_oidc::get_settings(&state.db).await?;
+    if !password_allowed(&state.db, &config, &user).await? {
+        return Err(ApiError::Forbidden(PASSWORD_SIGN_IN_OFF.to_string()));
     }
+    let (user, token) = rustyfin_auth::issue_login_token(&state.db, user.id, &device).await?;
+    Ok(Json(start_session(&state, &device, user, token).await).into_response())
+}
+
+/// `POST /Users/AuthenticateWithQuickConnect` – signs in with the secret of a Quick Connect request
+/// that a user approved, as that user (AC26). Public, but behind the login rate limit.
+async fn quick_connect_sign_in(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<AuthResponse>, ApiError> {
+    let secret = body
+        .get("Secret")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| ApiError::BadRequest("Secret is required.".to_string()))?;
+    let approver = quick_connect::redeem(&state, secret).await?;
+    let device = token_device(&headers);
+    let (user, token) = rustyfin_auth::authenticate_approved(&state.db, approver, &device).await?;
+    Ok(Json(start_session(&state, &device, user, token).await))
 }
 
 /// `POST /Users/AuthenticateWithSetupCode` (B20 3.3): a pending user's code sets the new password
@@ -59,19 +94,19 @@ async fn login_with_setup_code(
         return Err(ApiError::BadRequest("NewPw is required.".to_string()));
     }
     let device = token_device(&headers);
-    let (user, token) = rustyfin_auth::authenticate_with_setup_code(
-        &state.db,
-        &req.username,
-        &req.code,
-        &req.new_pw,
-        &device,
-    )
-    .await?;
+    let verified = rustyfin_auth::accept_setup_code(&state.db, &req.username, &req.code).await?;
+    // The password switch applies as at login. A refused request leaves the code unused (X1).
+    let config = rustyfin_db::repo_oidc::get_settings(&state.db).await?;
+    if !password_allowed(&state.db, &config, verified.user()).await? {
+        return Err(ApiError::Forbidden(PASSWORD_SIGN_IN_OFF.to_string()));
+    }
+    let (user, token) =
+        rustyfin_auth::redeem_setup_code(&state.db, verified, &req.new_pw, &device).await?;
     Ok(Json(start_session(&state, &device, user, token).await))
 }
 
-/// The token device of a sign-in request, from its Emby authorization headers.
-fn token_device(headers: &HeaderMap) -> rustyfin_auth::TokenDevice {
+/// The device of a sign-in, from its `X-Emby-Authorization` header.
+pub(crate) fn token_device(headers: &HeaderMap) -> rustyfin_auth::TokenDevice {
     let (client, version, device, device_id) = parse_emby_auth(headers);
     rustyfin_auth::TokenDevice {
         device_id,
@@ -81,8 +116,8 @@ fn token_device(headers: &HeaderMap) -> rustyfin_auth::TokenDevice {
     }
 }
 
-/// Records the session of a new sign-in and builds its answer. Both sign-in routes end here.
-async fn start_session(
+/// Starts the session of a sign-in on `device` and builds the answer that every sign-in returns.
+pub(crate) async fn start_session(
     state: &AppState,
     device: &rustyfin_auth::TokenDevice,
     user: User,

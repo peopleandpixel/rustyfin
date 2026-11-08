@@ -27,6 +27,9 @@ thiserror = { workspace = true }
 tower-http = { workspace = true }
 moka = { workspace = true }
 reqwest = { workspace = true }
+openidconnect = { workspace = true }
+# B21: the ID token's claims are read as JSON, so the payload is decoded here.
+base64 = "0.22"
 futures-util = "0.3"
 dashmap = "6"
 ipnet = "2"
@@ -40,4 +43,8 @@ rustyfin-db = { workspace = true }
 rustyfin-auth = { workspace = true }
 rustyfin-core = { workspace = true }
 uuid = { workspace = true }
+# B21: the OIDC tests run a fake provider that signs ID tokens.
+hmac = "0.12"
+p256 = "0.14"
 sha2 = "0.10"
+url = "2"

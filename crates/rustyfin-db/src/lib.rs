@@ -15,6 +15,7 @@ pub mod repo_media_segment;
 pub mod repo_media_source;
 pub mod repo_misc;
 pub mod repo_notification;
+pub mod repo_oidc;
 pub mod repo_package;
 pub mod repo_person;
 pub mod repo_playback;

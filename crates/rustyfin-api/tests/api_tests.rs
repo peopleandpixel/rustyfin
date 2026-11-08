@@ -89,6 +89,7 @@ async fn test_state() -> AppState {
             reqwest::Client::new(),
             Default::default(),
         ),
+        oidc: rustyfin_api::oidc::OidcState::new(),
         jellyfin_import: Default::default(),
     }
 }
@@ -5015,6 +5016,4517 @@ async fn test_quick_connect_generate() {
     assert!(resp.status().is_success() || resp.status() == StatusCode::NOT_FOUND);
 }
 
+// ── B21: OIDC ──
+//
+// Sign-in through one OpenID Connect provider, Quick Connect's token step and the password
+// switch (B21 spec AC1-AC31). A fake provider on 127.0.0.1 signs ID tokens with fixed P-256
+// keys; Rustyfin is driven over HTTP and checked with plain SQL, so these tests compile before
+// the feature exists. Each is ignored until the task that makes it pass.
+
+const B21_CLIENT_ID: &str = "rustyfin-b21";
+/// A test-only value: it never leaves this process.
+const B21_CLIENT_SECRET: &str = "b21-test-client-secret";
+const B21_PUBLIC_URL: &str = "http://rf.test:8121";
+const B21_CALLBACK: &str = "http://rf.test:8121/Auth/Oidc/Callback";
+/// The browser's device header at `Complete`.
+const B21_DEVICE: &str =
+    r#"MediaBrowser Client="B21", Device="web", DeviceId="b21-web", Version="1.0""#;
+
+/// How a token request authenticated the client, as the fake provider saw it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum B21Auth {
+    /// `client_secret_basic`: an `Authorization: Basic` header.
+    Basic,
+    /// `client_secret_post`: the id and the secret in the form.
+    Post,
+    /// A public client: only the id in the form.
+    None,
+    /// Anything else, a wrong secret for example.
+    Bad,
+}
+
+/// How the fake provider signs an ID token.
+#[derive(Clone, Copy, Debug)]
+enum B21Sign {
+    /// With published key n, naming its `kid`.
+    Key(usize),
+    /// Naming published key n's `kid`, signed with a key the provider never published.
+    Forged(usize),
+    /// With published key n, naming another `kid`.
+    Kid(usize, &'static str),
+    /// HS256 with the client secret as the key.
+    Hs256,
+    /// `alg: none` and no signature.
+    Unsigned,
+}
+
+/// An approval at the provider, redeemed once by its code.
+struct B21Grant {
+    redirect_uri: String,
+    challenge: String,
+    claims: serde_json::Value,
+    sign: B21Sign,
+}
+
+/// What the fake provider serves and what it saw.
+struct B21OpState {
+    discovery: serde_json::Map<String, serde_json::Value>,
+    /// Served as the discovery document instead, when set.
+    discovery_text: Option<String>,
+    /// The published keys: `kid` and the private key.
+    keys: Vec<(String, p256::ecdsa::SigningKey)>,
+    /// Served as the JWKS instead, when set.
+    jwks_text: Option<String>,
+    grants: HashMap<String, B21Grant>,
+    /// Access tokens and the claims of their grants, for userinfo.
+    access: HashMap<String, serde_json::Value>,
+    /// The client authentication the token endpoint accepts.
+    expect_auth: B21Auth,
+    token_requests: Vec<(B21Auth, HashMap<String, String>)>,
+    last_id_token: Option<String>,
+    /// Served by userinfo instead of the grant's claims, when set.
+    userinfo: Option<serde_json::Value>,
+    discovery_fetches: usize,
+    jwks_fetches: usize,
+    userinfo_calls: usize,
+    /// When set, the next userinfo request reports through the sender that it arrived, then waits
+    /// until the receiver fires.
+    userinfo_hold: Option<(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
+    /// Every endpoint answers 503.
+    down: bool,
+}
+
+/// A fixed P-256 key.
+fn b21_key(seed: u8) -> p256::ecdsa::SigningKey {
+    p256::ecdsa::SigningKey::from_slice(&[seed; 32]).unwrap()
+}
+
+/// A healthy provider at `base`: ES256, PKCE with S256, one key.
+fn b21_op_state(base: &str) -> B21OpState {
+    let serde_json::Value::Object(discovery) = serde_json::json!({
+        "issuer": base,
+        "authorization_endpoint": format!("{base}/authorize"),
+        "token_endpoint": format!("{base}/token"),
+        "userinfo_endpoint": format!("{base}/userinfo"),
+        "jwks_uri": format!("{base}/jwks"),
+        "response_types_supported": ["code"],
+        "subject_types_supported": ["public"],
+        "id_token_signing_alg_values_supported": ["ES256"],
+        "code_challenge_methods_supported": ["S256"],
+        "token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post"],
+        "scopes_supported": ["openid", "profile", "email", "groups"],
+        "grant_types_supported": ["authorization_code"],
+    }) else {
+        unreachable!()
+    };
+    B21OpState {
+        discovery,
+        discovery_text: None,
+        keys: vec![("b21-key-a".to_string(), b21_key(0x11))],
+        jwks_text: None,
+        grants: HashMap::new(),
+        access: HashMap::new(),
+        expect_auth: B21Auth::Basic,
+        token_requests: Vec::new(),
+        last_id_token: None,
+        userinfo: None,
+        discovery_fetches: 0,
+        jwks_fetches: 0,
+        userinfo_calls: 0,
+        userinfo_hold: None,
+        down: false,
+    }
+}
+
+/// A fake OpenID provider on 127.0.0.1. The browser's visit to its authorization endpoint is
+/// `approve`; discovery, JWKS, token and userinfo are served over HTTP.
+#[derive(Clone)]
+struct B21Op {
+    base: String,
+    st: Arc<std::sync::Mutex<B21OpState>>,
+}
+
+impl B21Op {
+    fn with<R>(&self, f: impl FnOnce(&mut B21OpState) -> R) -> R {
+        f(&mut self.st.lock().unwrap())
+    }
+
+    /// The user approves `flow` with `claims` on top of `iss`, `aud`, `iat`, `exp` and the flow's
+    /// `nonce`; a null claim is left out. Returns the code for the callback.
+    fn approve(&self, flow: &B21Flow, claims: serde_json::Value, sign: B21Sign) -> String {
+        let now = chrono::Utc::now().timestamp();
+        let mut all = serde_json::json!({
+            "iss": self.base,
+            "aud": B21_CLIENT_ID,
+            "iat": now,
+            "exp": now + 300,
+            "nonce": flow.param("nonce"),
+        });
+        let map = all.as_object_mut().unwrap();
+        for (name, value) in claims.as_object().expect("claims are an object") {
+            if value.is_null() {
+                map.remove(name);
+            } else {
+                map.insert(name.clone(), value.clone());
+            }
+        }
+        let code = format!("b21-code-{}", uuid::Uuid::new_v4().simple());
+        let grant = B21Grant {
+            redirect_uri: flow.param("redirect_uri"),
+            challenge: flow.param("code_challenge"),
+            claims: all,
+            sign,
+        };
+        self.with(|st| st.grants.insert(code.clone(), grant));
+        code
+    }
+}
+
+/// Starts a fake provider on a free port.
+async fn b21_op() -> B21Op {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let op = B21Op {
+        st: Arc::new(std::sync::Mutex::new(b21_op_state(&base))),
+        base,
+    };
+    let router = axum::Router::new()
+        .route(
+            "/.well-known/openid-configuration",
+            axum::routing::get(b21_op_discovery),
+        )
+        .route("/jwks", axum::routing::get(b21_op_jwks))
+        .route("/token", axum::routing::post(b21_op_token))
+        .route(
+            "/userinfo",
+            axum::routing::get(b21_op_userinfo).post(b21_op_userinfo),
+        )
+        .with_state(op.clone());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    op
+}
+
+fn b21_down() -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (StatusCode::SERVICE_UNAVAILABLE, "down").into_response()
+}
+
+/// A text the test wrote, valid JSON or not, served as JSON.
+fn b21_json_text(text: String) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        text,
+    )
+        .into_response()
+}
+
+async fn b21_op_discovery(
+    axum::extract::State(op): axum::extract::State<B21Op>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let (down, text, discovery) = op.with(|st| {
+        st.discovery_fetches += 1;
+        (st.down, st.discovery_text.clone(), st.discovery.clone())
+    });
+    if down {
+        return b21_down();
+    }
+    match text {
+        Some(text) => b21_json_text(text),
+        None => axum::Json(serde_json::Value::Object(discovery)).into_response(),
+    }
+}
+
+async fn b21_op_jwks(
+    axum::extract::State(op): axum::extract::State<B21Op>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let (down, text, keys) = op.with(|st| {
+        st.jwks_fetches += 1;
+        let keys: Vec<serde_json::Value> =
+            st.keys.iter().map(|(kid, key)| b21_jwk(kid, key)).collect();
+        (st.down, st.jwks_text.clone(), keys)
+    });
+    if down {
+        return b21_down();
+    }
+    match text {
+        Some(text) => b21_json_text(text),
+        None => axum::Json(serde_json::json!({ "keys": keys })).into_response(),
+    }
+}
+
+/// The public half of a key as a JWK.
+fn b21_jwk(kid: &str, key: &p256::ecdsa::SigningKey) -> serde_json::Value {
+    let point = key.verifying_key().to_sec1_point(false);
+    serde_json::json!({
+        "kty": "EC",
+        "crv": "P-256",
+        "alg": "ES256",
+        "use": "sig",
+        "kid": kid,
+        "x": b21_b64(point.x().unwrap().as_slice()),
+        "y": b21_b64(point.y().unwrap().as_slice()),
+    })
+}
+
+/// The token endpoint: checks the client authentication, the code, the redirect URI and the
+/// PKCE verifier, then signs the grant's ID token.
+async fn b21_op_token(
+    axum::extract::State(op): axum::extract::State<B21Op>,
+    headers: axum::http::HeaderMap,
+    body: String,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    use base64::Engine as _;
+    use sha2::Digest as _;
+
+    let form: HashMap<String, String> = url::form_urlencoded::parse(body.as_bytes())
+        .into_owned()
+        .collect();
+    let basic = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Basic "))
+        .map(|v| {
+            let raw = base64::engine::general_purpose::STANDARD
+                .decode(v)
+                .unwrap_or_default();
+            let raw = String::from_utf8(raw).unwrap_or_default();
+            let (id, secret) = raw.split_once(':').unwrap_or_default();
+            (b21_unescape(id), b21_unescape(secret))
+        });
+    let form_id = form.get("client_id").map(String::as_str);
+    let form_secret = form.get("client_secret").map(String::as_str);
+    let auth = match (&basic, form_secret) {
+        (Some((id, secret)), None)
+            if id == B21_CLIENT_ID
+                && secret == B21_CLIENT_SECRET
+                && form_id.is_none_or(|f| f == B21_CLIENT_ID) =>
+        {
+            B21Auth::Basic
+        }
+        (None, Some(secret)) if secret == B21_CLIENT_SECRET && form_id == Some(B21_CLIENT_ID) => {
+            B21Auth::Post
+        }
+        (None, None) if form_id == Some(B21_CLIENT_ID) => B21Auth::None,
+        _ => B21Auth::Bad,
+    };
+
+    let mut st = op.st.lock().unwrap();
+    if st.down {
+        return b21_down();
+    }
+    st.token_requests.push((auth, form.clone()));
+    if auth != st.expect_auth {
+        let error = serde_json::json!({ "error": "invalid_client" });
+        return (StatusCode::UNAUTHORIZED, axum::Json(error)).into_response();
+    }
+    let invalid_grant = || {
+        let error = serde_json::json!({ "error": "invalid_grant" });
+        (StatusCode::BAD_REQUEST, axum::Json(error)).into_response()
+    };
+    let Some(grant) = form.get("code").and_then(|code| st.grants.remove(code)) else {
+        return invalid_grant();
+    };
+    let verifier = form
+        .get("code_verifier")
+        .map(String::as_str)
+        .unwrap_or_default();
+    if form.get("grant_type").map(String::as_str) != Some("authorization_code")
+        || form.get("redirect_uri") != Some(&grant.redirect_uri)
+        || b21_b64(sha2::Sha256::digest(verifier.as_bytes()).as_slice()) != grant.challenge
+    {
+        return invalid_grant();
+    }
+    let id_token = b21_sign(&st.keys, &grant.claims, grant.sign);
+    let access_token = format!("b21-at-{}", uuid::Uuid::new_v4().simple());
+    st.access.insert(access_token.clone(), grant.claims);
+    st.last_id_token = Some(id_token.clone());
+    axum::Json(serde_json::json!({
+        "access_token": access_token,
+        "token_type": "Bearer",
+        "expires_in": 3600,
+        "id_token": id_token,
+    }))
+    .into_response()
+}
+
+/// Userinfo: the grant's claims without the token-only ones, or `userinfo` when set. It waits first
+/// when `userinfo_hold` is set.
+async fn b21_op_userinfo(
+    axum::extract::State(op): axum::extract::State<B21Op>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let hold = op.st.lock().unwrap().userinfo_hold.take();
+    if let Some((arrived, release)) = hold {
+        let _ = arrived.send(());
+        let _ = release.await;
+    }
+    let mut st = op.st.lock().unwrap();
+    st.userinfo_calls += 1;
+    if st.down {
+        return b21_down();
+    }
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or_default();
+    let Some(claims) = st.access.get(token) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    if let Some(info) = &st.userinfo {
+        return axum::Json(info.clone()).into_response();
+    }
+    let mut claims = claims.clone();
+    let map = claims.as_object_mut().unwrap();
+    for name in ["iss", "aud", "azp", "exp", "iat", "nonce"] {
+        map.remove(name);
+    }
+    axum::Json(claims).into_response()
+}
+
+/// A compact JWS over `claims`.
+fn b21_sign(
+    keys: &[(String, p256::ecdsa::SigningKey)],
+    claims: &serde_json::Value,
+    sign: B21Sign,
+) -> String {
+    use hmac::Mac as _;
+    let (alg, kid) = match sign {
+        B21Sign::Key(n) | B21Sign::Forged(n) => ("ES256", Some(keys[n].0.as_str())),
+        B21Sign::Kid(_, kid) => ("ES256", Some(kid)),
+        B21Sign::Hs256 => ("HS256", None),
+        B21Sign::Unsigned => ("none", None),
+    };
+    let mut header = serde_json::json!({ "alg": alg, "typ": "JWT" });
+    if let Some(kid) = kid {
+        header["kid"] = kid.into();
+    }
+    let input = format!(
+        "{}.{}",
+        b21_b64(header.to_string().as_bytes()),
+        b21_b64(claims.to_string().as_bytes())
+    );
+    let signature = match sign {
+        B21Sign::Key(n) | B21Sign::Kid(n, _) => b21_es256(&keys[n].1, &input),
+        B21Sign::Forged(_) => b21_es256(&b21_key(0x5a), &input),
+        B21Sign::Hs256 => {
+            let mut mac =
+                hmac::Hmac::<sha2::Sha256>::new_from_slice(B21_CLIENT_SECRET.as_bytes()).unwrap();
+            mac.update(input.as_bytes());
+            mac.finalize().into_bytes().as_slice().to_vec()
+        }
+        B21Sign::Unsigned => Vec::new(),
+    };
+    format!("{input}.{}", b21_b64(&signature))
+}
+
+fn b21_es256(key: &p256::ecdsa::SigningKey, input: &str) -> Vec<u8> {
+    use p256::ecdsa::signature::Signer as _;
+    let signature: p256::ecdsa::Signature = key.sign(input.as_bytes());
+    signature.to_bytes().as_slice().to_vec()
+}
+
+fn b21_b64(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// Undoes the form encoding of a client id or secret in a Basic header (RFC 6749 §2.3.1).
+fn b21_unescape(value: &str) -> String {
+    url::form_urlencoded::parse(format!("v={value}").as_bytes())
+        .next()
+        .map(|(_, v)| v.into_owned())
+        .unwrap_or_default()
+}
+
+/// A Rustyfin whose owner is signed in, next to a fake provider.
+struct B21 {
+    state: AppState,
+    app: axum::Router,
+    op: B21Op,
+    /// The owner's token.
+    admin: String,
+    admin_id: String,
+}
+
+async fn b21() -> B21 {
+    let state = test_state().await;
+    let app = app(state.clone());
+    assert_eq!(
+        post_startup_user(&app, None, "owner", "pw-owner").await,
+        StatusCode::NO_CONTENT
+    );
+    let (admin, admin_id) = login(&app, "owner", "pw-owner")
+        .await
+        .expect("owner signs in");
+    B21 {
+        state,
+        app,
+        op: b21_op().await,
+        admin,
+        admin_id,
+    }
+}
+
+/// Settings that turn OIDC on against `op`, with `extra` on top.
+fn b21_settings_body(op: &B21Op, extra: serde_json::Value) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "Enabled": true,
+        "IssuerUrl": op.base,
+        "ClientId": B21_CLIENT_ID,
+        "ClientSecret": B21_CLIENT_SECRET,
+        "PublicUrl": B21_PUBLIC_URL,
+    });
+    for (name, value) in extra.as_object().expect("extra is an object") {
+        body[name] = value.clone();
+    }
+    body
+}
+
+/// A Rustyfin with OIDC on against its fake provider.
+async fn b21_on(extra: serde_json::Value) -> B21 {
+    let t = b21().await;
+    let (status, body) = t.save(b21_settings_body(&t.op, extra)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "saving the OIDC settings: {}",
+        body["Detail"]
+    );
+    t
+}
+
+/// A started flow: the browser's cookie and the authorization URL.
+struct B21Flow {
+    /// `rustyfin_oidc=<flow id>`, as the browser sends it back.
+    cookie: String,
+    /// The whole `Set-Cookie` header.
+    set_cookie: String,
+    url: String,
+    params: HashMap<String, String>,
+}
+
+impl B21Flow {
+    fn param(&self, name: &str) -> String {
+        self.params
+            .get(name)
+            .unwrap_or_else(|| panic!("no {name} in the authorization URL"))
+            .clone()
+    }
+
+    /// The query the provider sends the browser back with after an approval.
+    fn callback_query(&self, code: &str) -> String {
+        b21_query(&[("code", code), ("state", &self.param("state"))])
+    }
+}
+
+fn b21_query(pairs: &[(&str, &str)]) -> String {
+    url::form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(pairs)
+        .finish()
+}
+
+/// A header's value, or "" without one.
+fn b21_header(headers: &axum::http::HeaderMap, name: &str) -> String {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Checks a 200 from Start or Link and reads the flow from it.
+fn b21_flow(status: StatusCode, headers: &axum::http::HeaderMap, body: &str) -> B21Flow {
+    let json: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "starting a flow: {}",
+        json["Detail"]
+    );
+    let url = json["AuthorizationUrl"]
+        .as_str()
+        .expect("an AuthorizationUrl")
+        .to_string();
+    let params = url::Url::parse(&url)
+        .expect("the AuthorizationUrl is a URL")
+        .query_pairs()
+        .into_owned()
+        .collect();
+    let set_cookie = b21_header(headers, "set-cookie");
+    let cookie = set_cookie
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    assert!(
+        cookie.len() > "rustyfin_oidc=".len() && cookie.starts_with("rustyfin_oidc="),
+        "the answer sets the flow cookie"
+    );
+    B21Flow {
+        cookie,
+        set_cookie,
+        url,
+        params,
+    }
+}
+
+/// The attributes of a `Set-Cookie` header, lowercased, without the name and value.
+fn b21_cookie_attrs(set_cookie: &str) -> Vec<String> {
+    set_cookie
+        .split(';')
+        .skip(1)
+        .map(|a| a.trim().to_lowercase())
+        .collect()
+}
+
+fn b21_clears_cookie(set_cookie: &str) -> bool {
+    set_cookie.starts_with("rustyfin_oidc=")
+        && b21_cookie_attrs(set_cookie)
+            .iter()
+            .any(|a| a == "max-age=0")
+}
+
+impl B21 {
+    async fn raw(&self, req: Request<Body>) -> (StatusCode, axum::http::HeaderMap, String) {
+        let resp = self.app.clone().oneshot(req).await.unwrap();
+        let (parts, body) = resp.into_parts();
+        let bytes = body.collect().await.unwrap().to_bytes();
+        (
+            parts.status,
+            parts.headers,
+            String::from_utf8_lossy(&bytes).into_owned(),
+        )
+    }
+
+    async fn save(&self, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+        let req = request("POST", "/Auth/Oidc/Settings", Some(&self.admin), Some(body));
+        send(&self.app, req).await
+    }
+
+    async fn settings(&self) -> serde_json::Value {
+        let req = request("GET", "/Auth/Oidc/Settings", Some(&self.admin), None);
+        let (status, body) = send(&self.app, req).await;
+        assert_eq!(status, StatusCode::OK, "reading the OIDC settings");
+        body
+    }
+
+    async fn start_raw(&self) -> (StatusCode, axum::http::HeaderMap, String) {
+        self.raw(request("POST", "/Auth/Oidc/Start", None, None))
+            .await
+    }
+
+    async fn start(&self) -> B21Flow {
+        let (status, headers, body) = self.start_raw().await;
+        b21_flow(status, &headers, &body)
+    }
+
+    /// Starts linking the token's user from the profile.
+    async fn start_link(&self, token: &str) -> B21Flow {
+        let req = request("POST", "/Auth/Oidc/Link", Some(token), None);
+        let (status, headers, body) = self.raw(req).await;
+        b21_flow(status, &headers, &body)
+    }
+
+    /// The browser comes back from the provider. Returns the Location and the Set-Cookie header.
+    async fn callback(&self, cookie: Option<&str>, query: &str) -> (String, String) {
+        let mut req = Request::builder()
+            .method("GET")
+            .uri(format!("/Auth/Oidc/Callback?{query}"));
+        if let Some(cookie) = cookie {
+            req = req.header("Cookie", cookie);
+        }
+        let (status, headers, _) = self.raw(req.body(Body::empty()).unwrap()).await;
+        assert_eq!(
+            status,
+            StatusCode::SEE_OTHER,
+            "the callback always redirects"
+        );
+        (
+            b21_header(&headers, "location"),
+            b21_header(&headers, "set-cookie"),
+        )
+    }
+
+    /// The user approves `flow` at the provider and the browser comes back. Returns the Location.
+    async fn approve(&self, flow: &B21Flow, claims: serde_json::Value, sign: B21Sign) -> String {
+        let code = self.op.approve(flow, claims, sign);
+        self.callback(Some(&flow.cookie), &flow.callback_query(&code))
+            .await
+            .0
+    }
+
+    /// `POST /Auth/Oidc/Complete` from the browser. Returns the status, the body and Set-Cookie.
+    async fn complete(&self, cookie: Option<&str>) -> (StatusCode, serde_json::Value, String) {
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/Auth/Oidc/Complete")
+            .header("X-Emby-Authorization", B21_DEVICE);
+        if let Some(cookie) = cookie {
+            req = req.header("Cookie", cookie);
+        }
+        let (status, headers, body) = self.raw(req.body(Body::empty()).unwrap()).await;
+        let json = serde_json::from_str(&body).unwrap_or_default();
+        (status, json, b21_header(&headers, "set-cookie"))
+    }
+
+    async fn sign_in(&self, claims: serde_json::Value) -> Result<serde_json::Value, String> {
+        self.sign_in_as(claims, B21Sign::Key(0)).await
+    }
+
+    /// A whole sign-in: Start, approval, callback, Complete. Ok is the `AuthenticationResult`,
+    /// Err the error code of the redirect.
+    async fn sign_in_as(
+        &self,
+        claims: serde_json::Value,
+        sign: B21Sign,
+    ) -> Result<serde_json::Value, String> {
+        let flow = self.start().await;
+        let location = self.approve(&flow, claims, sign).await;
+        let error = format!("{B21_PUBLIC_URL}/web/#login/oidc-error/");
+        if let Some(code) = location.strip_prefix(&error) {
+            return Err(code.to_string());
+        }
+        assert_eq!(location, format!("{B21_PUBLIC_URL}/web/#login/oidc"));
+        let (status, body, _) = self.complete(Some(&flow.cookie)).await;
+        assert_eq!(status, StatusCode::OK, "Complete after a good callback");
+        Ok(body)
+    }
+
+    /// Links the token's user from the profile. Err is the error code of the redirect.
+    async fn link(&self, token: &str, claims: serde_json::Value) -> Result<(), String> {
+        let flow = self.start_link(token).await;
+        let location = self.approve(&flow, claims, B21Sign::Key(0)).await;
+        let error = format!("{B21_PUBLIC_URL}/web/#settings/oidc-error/");
+        if let Some(code) = location.strip_prefix(&error) {
+            return Err(code.to_string());
+        }
+        assert_eq!(
+            location,
+            format!("{B21_PUBLIC_URL}/web/#settings/oidc-linked")
+        );
+        Ok(())
+    }
+
+    async fn user_count(&self) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM users")
+            .fetch_one(&self.state.db)
+            .await
+            .unwrap()
+    }
+
+    async fn link_count(&self) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM user_oidc_links")
+            .fetch_one(&self.state.db)
+            .await
+            .unwrap()
+    }
+
+    /// The named user's link: issuer, subject and provider username.
+    async fn link_row(&self, name: &str) -> Option<(String, String, String)> {
+        sqlx::query_as(
+            "SELECT l.issuer, l.subject, l.username FROM user_oidc_links l \
+             JOIN users u ON u.id = l.user_id WHERE u.name = ?",
+        )
+        .bind(name)
+        .fetch_optional(&self.state.db)
+        .await
+        .unwrap()
+    }
+
+    async fn admin_from_group(&self, name: &str) -> bool {
+        sqlx::query_scalar("SELECT admin_from_group FROM users WHERE name = ?")
+            .bind(name)
+            .fetch_one(&self.state.db)
+            .await
+            .unwrap()
+    }
+
+    async fn is_admin(&self, name: &str) -> bool {
+        user_flags(&self.state, name)
+            .await
+            .expect("the user exists")
+            .0
+    }
+
+    /// The client secret as stored, "" without one.
+    async fn stored_secret(&self) -> String {
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT client_secret FROM oidc_settings WHERE id = 1",
+        )
+        .fetch_optional(&self.state.db)
+        .await
+        .unwrap()
+        .flatten()
+        .unwrap_or_default()
+    }
+}
+
+/// Reads one text column of the named user's row; `sql` binds the name once.
+async fn b21_text(state: &AppState, sql: &'static str, name: &str) -> Option<String> {
+    sqlx::query_scalar::<_, Option<String>>(sql)
+        .bind(name)
+        .fetch_one(&state.db)
+        .await
+        .unwrap()
+}
+
+/// Runs a statement that binds the name once.
+async fn b21_exec(state: &AppState, sql: &'static str, name: &str) {
+    sqlx::query(sql)
+        .bind(name)
+        .execute(&state.db)
+        .await
+        .unwrap();
+}
+
+/// Log output, collected for the secret checks and never printed.
+#[derive(Clone, Default)]
+struct B21Log(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl B21Log {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+impl std::io::Write for B21Log {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for B21Log {
+    type Writer = B21Log;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// Collects this thread's log lines at every level until the guard drops. The tests run on a
+/// current-thread runtime, so this includes Rustyfin's tasks.
+fn b21_capture() -> (B21Log, tracing::subscriber::DefaultGuard) {
+    let log = B21Log::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(log.clone())
+        .with_max_level(tracing::Level::TRACE)
+        .with_ansi(false)
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+    tracing::info!("b21 log capture works");
+    assert!(log.text().contains("b21 log capture works"));
+    (log, guard)
+}
+
+/// A URL on a port nothing listens on.
+fn b21_closed_url() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    format!("http://{addr}")
+}
+
+/// The name of the token's user, or the status when the token doesn't work.
+async fn b21_me(app: &axum::Router, token: &str) -> Result<String, StatusCode> {
+    let (status, body) = send(app, request("GET", "/Users/Me", Some(token), None)).await;
+    if status != StatusCode::OK {
+        return Err(status);
+    }
+    Ok(body["Name"].as_str().unwrap_or_default().to_string())
+}
+
+/// A plain user without a password, as an OIDC sign-in makes them, and a token for them.
+async fn b21_passwordless(state: &AppState, name: &str) -> (uuid::Uuid, String) {
+    let id = add_user(state, name, "temporary-pw", false).await;
+    b21_exec(
+        state,
+        "UPDATE users SET password_hash = '' WHERE name = ?",
+        name,
+    )
+    .await;
+    let user = rustyfin_db::repo_user::get_user_by_id(&state.db, id)
+        .await
+        .unwrap()
+        .unwrap();
+    let device = rustyfin_auth::TokenDevice {
+        device_id: format!("b21-{name}"),
+        device_name: "test".to_string(),
+        app_name: "B21".to_string(),
+        app_version: "1.0".to_string(),
+    };
+    let token = rustyfin_auth::create_token(&state.db, &user, &device)
+        .await
+        .unwrap();
+    (id, token)
+}
+
+/// A Quick Connect request approved by the token's user. Returns its secret.
+async fn b21_qc_approved(app: &axum::Router, token: &str) -> String {
+    let (status, init) = send(app, request("POST", "/QuickConnect/Initiate", None, None)).await;
+    assert_eq!(status, StatusCode::OK);
+    let code = init["Code"].as_str().unwrap();
+    let uri = format!("/QuickConnect/Authorize?code={code}");
+    let (status, _) = send(app, request("POST", &uri, Some(token), None)).await;
+    assert_eq!(status, StatusCode::OK, "approving the Quick Connect code");
+    init["Secret"].as_str().unwrap().to_string()
+}
+
+/// A TV's `POST /Users/AuthenticateWithQuickConnect`, with the secret when given.
+fn b21_qc_sign_in(secret: Option<&str>) -> Request<Body> {
+    let body = match secret {
+        Some(secret) => serde_json::json!({ "Secret": secret }),
+        None => serde_json::json!({}),
+    };
+    Request::builder()
+        .method("POST")
+        .uri("/Users/AuthenticateWithQuickConnect")
+        .header("Content-Type", "application/json")
+        .header(
+            "X-Emby-Authorization",
+            r#"MediaBrowser Client="B21 TV", Device="Living room", DeviceId="b21-tv", Version="2.0""#,
+        )
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+/// Asks for a password reset and reads the PIN from the PIN file; None when none was written within
+/// 2 s. The reset work may finish after the 250 ms answer under load, so the file is awaited.
+async fn b21_reset_pin(app: &axum::Router, name: &str) -> Option<String> {
+    b21_reset_pin_at(app, name).await.1
+}
+
+/// `b21_reset_pin`, with the answer's `PinFile` path.
+async fn b21_reset_pin_at(app: &axum::Router, name: &str) -> (String, Option<String>) {
+    let path = b21_pin_file(app, name).await;
+    for _ in 0..20 {
+        // The file is created before it is written, so an empty or partial file is read again.
+        let file = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+        if let Some(file) = file {
+            let pin = file["Pin"].as_str().map(str::to_string);
+            return (path, pin);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    (path, None)
+}
+
+/// Asks for a password reset and returns the answer's `PinFile` path without waiting for the file.
+async fn b21_pin_file(app: &axum::Router, name: &str) -> String {
+    let body = serde_json::json!({ "EnteredUsername": name });
+    let req = request("POST", "/Users/ForgotPassword", None, Some(body));
+    let (status, answer) = send(app, req).await;
+    assert_eq!(status, StatusCode::OK);
+    answer["PinFile"]
+        .as_str()
+        .expect("a PinFile path")
+        .to_string()
+}
+
+/// Redeems a reset PIN through `POST /Users/ForgotPassword/Pin`.
+async fn b21_redeem_pin(app: &axum::Router, pin: &str) -> (StatusCode, serde_json::Value) {
+    let body = serde_json::json!({ "Pin": pin });
+    send(
+        app,
+        request("POST", "/Users/ForgotPassword/Pin", None, Some(body)),
+    )
+    .await
+}
+
+/// Password sign-in. Returns the status and the Detail.
+async fn b21_password_sign_in(
+    app: &axum::Router,
+    name: &str,
+    password: &str,
+) -> (StatusCode, String) {
+    let body = serde_json::json!({ "Username": name, "Pw": password });
+    let req = request("POST", "/Users/AuthenticateByName", None, Some(body));
+    let (status, answer) = send(app, req).await;
+    (
+        status,
+        answer["Detail"].as_str().unwrap_or_default().to_string(),
+    )
+}
+
+/// Reads one boolean expression about the named user; `sql` binds the name once.
+async fn b21_true(state: &AppState, sql: &'static str, name: &str) -> bool {
+    sqlx::query_scalar::<_, bool>(sql)
+        .bind(name)
+        .fetch_one(&state.db)
+        .await
+        .unwrap()
+}
+
+/// SQL: whether the named user's link has a last sign-in.
+const B21_SIGNED_IN: &str = "SELECT l.last_sign_in_at IS NOT NULL FROM user_oidc_links l \
+     JOIN users u ON u.id = l.user_id WHERE u.name = ?";
+
+/// An unknown Quick Connect secret in the format Rustyfin hands out.
+const B21_UNKNOWN_SECRET: &str = "0123456789abcdef0123456789abcdef";
+
+/// The fake provider on its own: discovery, a code redeemed once for an ES256 ID token over the
+/// grant's claims, and userinfo.
+#[tokio::test]
+async fn b21_fake_provider_works() {
+    use base64::Engine as _;
+    use p256::ecdsa::signature::Verifier as _;
+    use sha2::Digest as _;
+    let op = b21_op().await;
+    let http = reqwest::Client::new();
+    let url = format!("{}/.well-known/openid-configuration", op.base);
+    let text = http.get(url).send().await.unwrap().text().await.unwrap();
+    let discovery: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(discovery["issuer"], op.base);
+
+    let verifier = "b21-verifier-0123456789-0123456789-0123456789";
+    let challenge = b21_b64(sha2::Sha256::digest(verifier.as_bytes()).as_slice());
+    let params = [
+        ("nonce", "b21-nonce"),
+        ("redirect_uri", B21_CALLBACK),
+        ("code_challenge", challenge.as_str()),
+    ];
+    let flow = B21Flow {
+        cookie: String::new(),
+        set_cookie: String::new(),
+        url: String::new(),
+        params: params
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+    };
+    let code = op.approve(&flow, b21_user("pat-sub", "pat"), B21Sign::Key(0));
+    let form = [
+        ("grant_type", "authorization_code"),
+        ("code", code.as_str()),
+        ("redirect_uri", B21_CALLBACK),
+        ("code_verifier", verifier),
+    ];
+    let token = || {
+        http.post(format!("{}/token", op.base))
+            .basic_auth(B21_CLIENT_ID, Some(B21_CLIENT_SECRET))
+            .form(&form)
+    };
+    let resp = token().send().await.unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+
+    let id_token = body["id_token"].as_str().expect("an ID token");
+    let (input, signature) = id_token.rsplit_once('.').unwrap();
+    let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(signature)
+        .unwrap();
+    let signature = p256::ecdsa::Signature::from_slice(&signature).unwrap();
+    b21_key(0x11)
+        .verifying_key()
+        .verify(input.as_bytes(), &signature)
+        .expect("signed with the published key");
+    let decode = |part: &str| -> serde_json::Value {
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(part)
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    };
+    let (header, claims) = input.split_once('.').unwrap();
+    assert_eq!(decode(header)["kid"], "b21-key-a");
+    let claims = decode(claims);
+    assert_eq!(claims["iss"], op.base);
+    assert_eq!(claims["aud"], B21_CLIENT_ID);
+    assert_eq!(claims["nonce"], "b21-nonce");
+    assert_eq!(claims["sub"], "pat-sub");
+
+    let again = token().send().await.unwrap();
+    assert_eq!(again.status().as_u16(), 400, "a code is redeemed once");
+
+    let access = body["access_token"].as_str().unwrap();
+    let url = format!("{}/userinfo", op.base);
+    let text = http
+        .get(url)
+        .bearer_auth(access)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let info: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(info["preferred_username"], "pat");
+    assert!(
+        info.get("nonce").is_none(),
+        "userinfo has no token-only claims"
+    );
+    assert_eq!(
+        op.with(|st| (st.discovery_fetches, st.userinfo_calls)),
+        (1, 1)
+    );
+}
+
+// Task 1: Quick Connect's token step (AC26).
+
+#[tokio::test]
+async fn b21_quick_connect_secret_signs_in_the_approver() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    add_user(&state, "alice", "pw-alice", false).await;
+    let (alice, alice_id) = login(&app, "alice", "pw-alice").await.unwrap();
+    let secret = b21_qc_approved(&app, &alice).await;
+
+    let (status, body) = send(&app, b21_qc_sign_in(Some(&secret))).await;
+    assert_eq!(status, StatusCode::OK, "signing in with an approved secret");
+    assert_eq!(body["User"]["Id"], alice_id.as_str());
+    assert_eq!(body["User"]["Name"], "alice");
+    let session = &body["SessionInfo"];
+    assert_eq!(session["DeviceId"], "b21-tv", "the session is the TV's");
+    assert_eq!(session["DeviceName"], "Living room");
+    assert_eq!(session["Client"], "B21 TV");
+    assert_eq!(session["ApplicationVersion"], "2.0");
+    assert_eq!(body["ServerId"], "test-server-id");
+    let token = body["AccessToken"].as_str().expect("an AccessToken");
+    assert_eq!(b21_me(&app, token).await, Ok("alice".to_string()));
+    assert_eq!(
+        b21_me(&app, &alice).await,
+        Ok("alice".to_string()),
+        "the approving session stays"
+    );
+    assert!(
+        !state.quick_connect.read().await.contains_key(&secret),
+        "the request is used up"
+    );
+
+    let (status, _) = send(&app, b21_qc_sign_in(Some(&secret))).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "a secret signs in once");
+}
+
+#[tokio::test]
+async fn b21_quick_connect_refuses_unknown_unapproved_and_expired() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    add_user(&state, "alice", "pw-alice", false).await;
+    let (alice, _) = login(&app, "alice", "pw-alice").await.unwrap();
+    let approved = b21_qc_approved(&app, &alice).await;
+    let (status, started) = send(&app, request("POST", "/QuickConnect/Initiate", None, None)).await;
+    assert_eq!(status, StatusCode::OK);
+    let waiting = started["Secret"].as_str().unwrap().to_string();
+    let expired = b21_qc_approved(&app, &alice).await;
+    state
+        .quick_connect
+        .write()
+        .await
+        .get_mut(&expired)
+        .expect("the request is stored")
+        .date_added -= chrono::Duration::seconds(301);
+
+    let (status, _) = send(&app, b21_qc_sign_in(Some(&approved))).await;
+    assert_eq!(status, StatusCode::OK, "an approved secret");
+    let refused = [
+        (B21_UNKNOWN_SECRET, "an unknown secret"),
+        (waiting.as_str(), "a secret nobody approved"),
+        (expired.as_str(), "an expired secret"),
+    ];
+    for (secret, what) in refused {
+        let (status, _) = send(&app, b21_qc_sign_in(Some(secret))).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{what}");
+    }
+    let (status, _) = send(&app, b21_qc_sign_in(None)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "no Secret");
+}
+
+#[tokio::test]
+async fn b21_quick_connect_refuses_a_disabled_approver() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    add_user(&state, "alice", "pw-alice", false).await;
+    let (alice, _) = login(&app, "alice", "pw-alice").await.unwrap();
+    let first = b21_qc_approved(&app, &alice).await;
+    let second = b21_qc_approved(&app, &alice).await;
+    let (status, _) = send(&app, b21_qc_sign_in(Some(&first))).await;
+    assert_eq!(status, StatusCode::OK);
+
+    b21_exec(
+        &state,
+        "UPDATE users SET is_disabled = 1 WHERE name = ?",
+        "alice",
+    )
+    .await;
+    let (status, _) = send(&app, b21_qc_sign_in(Some(&second))).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a disabled user's approval signs nobody in"
+    );
+}
+
+#[tokio::test]
+async fn b21_quick_connect_replaces_the_device_token() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    add_user(&state, "alice", "pw-alice", false).await;
+    let (web, _) = login(&app, "alice", "pw-alice").await.unwrap();
+    let (old_tv, _) = g2_login_device(&app, "alice", "pw-alice", "b21-tv")
+        .await
+        .unwrap();
+    let secret = b21_qc_approved(&app, &web).await;
+
+    let (status, body) = send(&app, b21_qc_sign_in(Some(&secret))).await;
+    assert_eq!(status, StatusCode::OK);
+    let new_tv = body["AccessToken"].as_str().unwrap();
+    assert_eq!(
+        b21_me(&app, &old_tv).await,
+        Err(StatusCode::UNAUTHORIZED),
+        "the TV's old token is replaced, like at password sign-in"
+    );
+    assert_eq!(b21_me(&app, new_tv).await, Ok("alice".to_string()));
+    assert_eq!(b21_me(&app, &web).await, Ok("alice".to_string()));
+}
+
+#[tokio::test]
+async fn b21_quick_connect_sign_in_shares_the_login_limit() {
+    let state = test_state().await;
+    add_user(&state, "alice", "pw-alice", false).await;
+    let open = app(state.clone());
+    let (alice, _) = login(&open, "alice", "pw-alice").await.unwrap();
+    let secret = b21_qc_approved(&open, &alice).await;
+
+    let mut limited = state.clone();
+    limited.rate_limiter = RateLimiter::new(3, 60);
+    let remote = remote_app(limited);
+    let (status, _) = send(&remote, b21_qc_sign_in(Some(&secret))).await;
+    assert_eq!(status, StatusCode::OK);
+    for _ in 0..2 {
+        let (status, _) = send(&remote, b21_qc_sign_in(Some(B21_UNKNOWN_SECRET))).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+    let (status, _) = send(&remote, b21_qc_sign_in(Some(B21_UNKNOWN_SECRET))).await;
+    assert_eq!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "the fourth attempt in a minute"
+    );
+    let body = serde_json::json!({ "Username": "alice", "Pw": "pw-alice" });
+    let req = request("POST", "/Users/AuthenticateByName", None, Some(body));
+    assert_eq!(
+        send(&remote, req).await.0,
+        StatusCode::TOO_MANY_REQUESTS,
+        "password sign-in shares the limit"
+    );
+}
+
+// Task 2: settings, the public info and the password switch (AC1-AC5, AC20-AC25, AC28).
+
+#[tokio::test]
+async fn b21_settings_are_admin_only() {
+    let t = b21().await;
+    add_user(&t.state, "bob", "pw-bob", false).await;
+    let (bob, _) = login(&t.app, "bob", "pw-bob").await.unwrap();
+    assert_eq!(t.settings().await["ButtonLabel"], "");
+    for method in ["GET", "POST"] {
+        let body = (method == "POST").then(|| serde_json::json!({ "ButtonLabel": "Hacked" }));
+        let req = request(method, "/Auth/Oidc/Settings", None, body.clone());
+        assert_eq!(
+            send(&t.app, req).await.0,
+            StatusCode::UNAUTHORIZED,
+            "{method} without a token"
+        );
+        let req = request(method, "/Auth/Oidc/Settings", Some(&bob), body);
+        assert_eq!(
+            send(&t.app, req).await.0,
+            StatusCode::FORBIDDEN,
+            "{method} as a plain user"
+        );
+    }
+    assert_eq!(t.settings().await["ButtonLabel"], "", "nothing was saved");
+}
+
+#[tokio::test]
+async fn b21_settings_defaults() {
+    let t = b21().await;
+    assert_eq!(
+        t.settings().await,
+        serde_json::json!({
+            "Enabled": false,
+            "IssuerUrl": "",
+            "ClientId": "",
+            "HasClientSecret": false,
+            "Scopes": "",
+            "EffectiveScopes": "openid profile email",
+            "ButtonLabel": "",
+            "UsernameClaim": "preferred_username",
+            "GroupClaim": "groups",
+            "AllowedGroup": "",
+            "AdminGroup": "",
+            "PublicUrl": "",
+            "CallbackUrl": "",
+            "AllowPasswordSignIn": true,
+        })
+    );
+}
+
+#[tokio::test]
+async fn b21_settings_merge_and_keep_the_secret_write_only() {
+    let t = b21().await;
+    let extra = serde_json::json!({
+        "ClientSecret": "b21-saved-secret",
+        "PublicUrl": "http://rf.test:8121/",
+        "ButtonLabel": "Pocket ID",
+    });
+    let (status, saved) = t.save(b21_settings_body(&t.op, extra)).await;
+    assert_eq!(status, StatusCode::OK, "saving: {}", saved["Detail"]);
+    assert_eq!(saved["Enabled"], true);
+    assert_eq!(saved["IssuerUrl"], t.op.base.as_str());
+    assert_eq!(saved["ClientId"], B21_CLIENT_ID);
+    assert_eq!(saved["HasClientSecret"], true);
+    assert_eq!(saved["ButtonLabel"], "Pocket ID");
+    assert_eq!(
+        saved["PublicUrl"], B21_PUBLIC_URL,
+        "saved without the trailing /"
+    );
+    assert_eq!(saved["CallbackUrl"], B21_CALLBACK);
+    assert!(
+        saved.get("ClientSecret").is_none(),
+        "the secret is write-only"
+    );
+    assert!(
+        !saved.to_string().contains("b21-saved-secret"),
+        "the answer holds the secret"
+    );
+    assert_eq!(t.settings().await, saved, "GET shows what POST answered");
+    assert_eq!(t.stored_secret().await, "b21-saved-secret");
+
+    let keep =
+        serde_json::json!({ "AdminGroup": "admins", "ButtonLabel": null, "ClientSecret": null });
+    let (status, saved) = t.save(keep).await;
+    assert_eq!(status, StatusCode::OK, "saving: {}", saved["Detail"]);
+    assert_eq!(saved["AdminGroup"], "admins");
+    assert_eq!(saved["ButtonLabel"], "Pocket ID", "null keeps a value");
+    assert_eq!(saved["Enabled"], true, "a missing field keeps its value");
+    assert_eq!(saved["HasClientSecret"], true, "null keeps the secret");
+    assert_eq!(t.stored_secret().await, "b21-saved-secret");
+
+    let (status, saved) = t.save(serde_json::json!({ "ClientSecret": "" })).await;
+    assert_eq!(status, StatusCode::OK, "saving: {}", saved["Detail"]);
+    assert_eq!(saved["HasClientSecret"], false, "\"\" removes the secret");
+    assert_eq!(t.stored_secret().await, "");
+}
+
+#[tokio::test]
+async fn b21_settings_scopes() {
+    let t = b21().await;
+    let cases = [
+        (serde_json::json!({}), "", "openid profile email"),
+        (
+            serde_json::json!({ "AdminGroup": "admins" }),
+            "",
+            "openid profile email groups",
+        ),
+        (
+            serde_json::json!({ "Scopes": "profile email" }),
+            "profile email",
+            "openid profile email",
+        ),
+        (
+            serde_json::json!({ "Scopes": "email,openid  groups email" }),
+            "email,openid  groups email",
+            "openid email groups",
+        ),
+        (
+            serde_json::json!({ "Scopes": "", "AdminGroup": "", "AllowedGroup": "family" }),
+            "",
+            "openid profile email groups",
+        ),
+        (
+            serde_json::json!({ "AllowedGroup": "" }),
+            "",
+            "openid profile email",
+        ),
+    ];
+    for (body, scopes, effective) in cases {
+        let (status, saved) = t.save(body.clone()).await;
+        assert_eq!(status, StatusCode::OK, "saving {body}: {}", saved["Detail"]);
+        assert_eq!(saved["Enabled"], false);
+        assert_eq!(saved["Scopes"], scopes, "after {body}");
+        assert_eq!(saved["EffectiveScopes"], effective, "after {body}");
+    }
+}
+
+#[tokio::test]
+async fn b21_settings_refuse_bad_values() {
+    let t = b21().await;
+    let base = t.op.base.clone();
+    let cases = [
+        serde_json::json!({ "IssuerUrl": "" }),
+        serde_json::json!({ "IssuerUrl": "ftp://op.test" }),
+        serde_json::json!({ "IssuerUrl": "op.test" }),
+        serde_json::json!({ "IssuerUrl": format!("{base}?x=1") }),
+        serde_json::json!({ "IssuerUrl": format!("{base}#x") }),
+        serde_json::json!({ "PublicUrl": "" }),
+        serde_json::json!({ "PublicUrl": "rf.test:8121" }),
+        serde_json::json!({ "PublicUrl": "http://rf.test:8121/?x=1" }),
+        serde_json::json!({ "ClientId": "" }),
+        serde_json::json!({ "UsernameClaim": "" }),
+        serde_json::json!({ "GroupClaim": "", "AdminGroup": "admins" }),
+        serde_json::json!({ "GroupClaim": "", "AllowedGroup": "family" }),
+    ];
+    for extra in cases {
+        let (status, body) = t.save(b21_settings_body(&t.op, extra.clone())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "saving with {extra}");
+        let detail = body["Detail"].as_str().unwrap_or_default();
+        assert!(!detail.is_empty(), "the 400 for {extra} says what is wrong");
+        let settings = t.settings().await;
+        assert_eq!(settings["Enabled"], false, "nothing saved after {extra}");
+        assert_eq!(settings["IssuerUrl"], "", "nothing saved after {extra}");
+    }
+    let body = b21_settings_body(&t.op, serde_json::json!({ "GroupClaim": "" }));
+    let (status, body) = t.save(body).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an empty group claim without a group: {}",
+        body["Detail"]
+    );
+}
+
+/// Breaks the fake provider in one way; the second argument is a closed URL.
+type B21Break = fn(&mut B21OpState, &str);
+
+#[tokio::test]
+async fn b21_settings_check_the_provider() {
+    let t = b21().await;
+    let off = serde_json::json!({ "IssuerUrl": t.op.base, "ClientId": B21_CLIENT_ID });
+    let (status, body) = t.save(off).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a save with OIDC off: {}",
+        body["Detail"]
+    );
+    assert_eq!(
+        t.op.with(|st| (st.discovery_fetches, st.jwks_fetches)),
+        (0, 0),
+        "nothing is fetched while OIDC is off"
+    );
+
+    let closed = b21_closed_url();
+    let cases: [(&str, B21Break); 12] = [
+        ("discovery is not JSON", |st, _| {
+            st.discovery_text = Some("<html>not json</html>".to_string())
+        }),
+        ("the provider is down", |st, _| st.down = true),
+        ("no authorization_endpoint", |st, _| {
+            st.discovery.remove("authorization_endpoint");
+        }),
+        ("no token_endpoint", |st, _| {
+            st.discovery.remove("token_endpoint");
+        }),
+        ("no jwks_uri", |st, _| {
+            st.discovery.remove("jwks_uri");
+        }),
+        ("another issuer", |st, _| {
+            st.discovery
+                .insert("issuer".into(), "http://evil.test".into());
+        }),
+        ("no code flow", |st, _| {
+            let types = serde_json::json!(["id_token"]);
+            st.discovery
+                .insert("response_types_supported".into(), types);
+        }),
+        ("PKCE without S256", |st, _| {
+            let methods = serde_json::json!(["plain"]);
+            st.discovery
+                .insert("code_challenge_methods_supported".into(), methods);
+        }),
+        ("no algorithm Rustyfin accepts", |st, _| {
+            let algs = serde_json::json!(["HS256"]);
+            st.discovery
+                .insert("id_token_signing_alg_values_supported".into(), algs);
+        }),
+        ("the JWKS is not JSON", |st, _| {
+            st.jwks_text = Some("not json".to_string())
+        }),
+        ("the JWKS has no keys", |st, _| {
+            st.jwks_text = Some(r#"{"keys":[]}"#.to_string())
+        }),
+        ("the JWKS is unreachable", |st, closed| {
+            st.discovery
+                .insert("jwks_uri".into(), format!("{closed}/jwks").into());
+        }),
+    ];
+    for (what, change) in cases {
+        t.op.with(|st| {
+            *st = b21_op_state(&t.op.base);
+            change(st, &closed);
+        });
+        let (status, body) = t
+            .save(b21_settings_body(&t.op, serde_json::json!({})))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{what}");
+        let detail = body["Detail"].as_str().unwrap_or_default();
+        assert!(!detail.is_empty(), "the 400 says what is wrong when {what}");
+        assert_eq!(
+            t.settings().await["Enabled"],
+            false,
+            "nothing saved when {what}"
+        );
+    }
+
+    t.op.with(|st| *st = b21_op_state(&t.op.base));
+    let body = b21_settings_body(&t.op, serde_json::json!({ "IssuerUrl": closed }));
+    let (status, _) = t.save(body).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an issuer nobody answers at"
+    );
+
+    t.op.with(|st| {
+        st.discovery.remove("code_challenge_methods_supported");
+    });
+    let (status, body) = t
+        .save(b21_settings_body(&t.op, serde_json::json!({})))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a provider that lists no PKCE methods: {}",
+        body["Detail"]
+    );
+    let (discovery, jwks) = t.op.with(|st| (st.discovery_fetches, st.jwks_fetches));
+    assert!(
+        discovery > 0 && jwks > 0,
+        "the save fetched discovery and the JWKS"
+    );
+    assert_eq!(t.settings().await["Enabled"], true);
+}
+
+#[tokio::test]
+async fn b21_info_is_public_and_minimal() {
+    let t = b21().await;
+    let info = || send(&t.app, request("GET", "/Auth/Oidc/Info", None, None));
+    assert_eq!(
+        info().await,
+        (
+            StatusCode::OK,
+            serde_json::json!({ "Enabled": false, "ButtonLabel": "" })
+        )
+    );
+    let body = b21_settings_body(&t.op, serde_json::json!({ "ButtonLabel": "Pocket ID" }));
+    let (status, body) = t.save(body).await;
+    assert_eq!(status, StatusCode::OK, "saving: {}", body["Detail"]);
+    assert_eq!(
+        info().await,
+        (
+            StatusCode::OK,
+            serde_json::json!({ "Enabled": true, "ButtonLabel": "Pocket ID" })
+        )
+    );
+}
+
+#[tokio::test]
+async fn b21_password_switch_refuses_non_admins() {
+    let t = b21().await;
+    add_user(&t.state, "bob", "pw-bob", false).await;
+    add_user(&t.state, "ada", "pw-ada", true).await;
+    let (status, body) = t
+        .save(serde_json::json!({ "AllowPasswordSignIn": false }))
+        .await;
+    assert_eq!(status, StatusCode::OK, "saving: {}", body["Detail"]);
+    assert_eq!(body["AllowPasswordSignIn"], false);
+
+    assert_eq!(
+        b21_password_sign_in(&t.app, "bob", "pw-bob").await,
+        (
+            StatusCode::FORBIDDEN,
+            "Password sign-in is turned off for this account.".to_string()
+        )
+    );
+    assert_eq!(
+        b21_password_sign_in(&t.app, "bob", "wrong").await.0,
+        StatusCode::UNAUTHORIZED,
+        "the password is checked first"
+    );
+    assert_eq!(
+        b21_password_sign_in(&t.app, "ghost", "pw-ghost").await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        b21_password_sign_in(&t.app, "ada", "pw-ada").await.0,
+        StatusCode::OK,
+        "administrators still sign in"
+    );
+    assert_eq!(
+        b21_password_sign_in(&t.app, "owner", "pw-owner").await.0,
+        StatusCode::OK
+    );
+
+    let (status, _) = t
+        .save(serde_json::json!({ "AllowPasswordSignIn": true }))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        b21_password_sign_in(&t.app, "bob", "pw-bob").await.0,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn b21_password_switch_stops_reset_pins_for_non_admins() {
+    let t = b21().await;
+    for name in ["bob", "cy", "dee"] {
+        add_user(&t.state, name, &format!("pw-{name}"), false).await;
+    }
+    add_user(&t.state, "ada", "pw-ada", true).await;
+    let bob_pin = b21_reset_pin(&t.app, "bob").await.expect("a PIN for bob");
+    let cy_pin = b21_reset_pin(&t.app, "cy").await.expect("a PIN for cy");
+
+    let (status, _) = t
+        .save(serde_json::json!({ "AllowPasswordSignIn": false }))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        b21_reset_pin(&t.app, "dee").await,
+        None,
+        "no PIN for a plain user"
+    );
+    let req = request(
+        "POST",
+        "/Users/ForgotPassword/Pin",
+        None,
+        Some(serde_json::json!({ "Pin": bob_pin })),
+    );
+    assert_eq!(
+        send(&t.app, req).await.0,
+        StatusCode::FORBIDDEN,
+        "a plain user's PIN resets nothing"
+    );
+    let reset = |pin: &str| {
+        let body =
+            serde_json::json!({ "Pin": pin, "Username": "cy", "TempPassword": "b21-temp-pw" });
+        request("POST", "/Users/ResetPassword", None, Some(body))
+    };
+    assert_eq!(
+        send(&t.app, reset("ZZ-ZZ-ZZ-ZZ")).await.0,
+        StatusCode::BAD_REQUEST,
+        "the PIN is checked first"
+    );
+    assert_eq!(send(&t.app, reset(&cy_pin)).await.0, StatusCode::FORBIDDEN);
+
+    let (status, _) = t
+        .save(serde_json::json!({ "AllowPasswordSignIn": true }))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        login(&t.app, "bob", "pw-bob").await.is_some(),
+        "bob's password is unchanged"
+    );
+    assert!(
+        login(&t.app, "cy", "pw-cy").await.is_some(),
+        "cy's password is unchanged"
+    );
+    let (status, _) = t
+        .save(serde_json::json!({ "AllowPasswordSignIn": false }))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        b21_reset_pin(&t.app, "ada").await.is_some(),
+        "administrators still get a PIN"
+    );
+}
+
+#[tokio::test]
+async fn b21_passwordless_user_is_refused_at_password_sign_in() {
+    let t = b21().await;
+    b21_passwordless(&t.state, "pat").await;
+    for allow in [true, false] {
+        let (status, _) = t
+            .save(serde_json::json!({ "AllowPasswordSignIn": allow }))
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        for pw in ["", "anything"] {
+            assert_eq!(
+                b21_password_sign_in(&t.app, "pat", pw).await.0,
+                StatusCode::UNAUTHORIZED,
+                "password {pw:?}, password sign-in allowed: {allow}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn b21_passwordless_user_sets_a_first_password() {
+    let t = b21().await;
+    let (pat_id, pat) = b21_passwordless(&t.state, "pat").await;
+    let uri = format!("/Users/{pat_id}/Password");
+    let change =
+        |body: serde_json::Value| send(&t.app, request("POST", &uri, Some(&pat), Some(body)));
+
+    let (status, _) = change(serde_json::json!({ "NewPw": "first-pw" })).await;
+    assert!(
+        status.is_success(),
+        "a first password without CurrentPw: {status}"
+    );
+    assert!(login(&t.app, "pat", "first-pw").await.is_some());
+
+    let (status, _) = change(serde_json::json!({ "NewPw": "second-pw" })).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "CurrentPw is needed once there is a password"
+    );
+    let (status, _) =
+        change(serde_json::json!({ "CurrentPw": "wrong", "NewPw": "second-pw" })).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) =
+        change(serde_json::json!({ "CurrentPw": "first-pw", "NewPw": "second-pw" })).await;
+    assert!(status.is_success(), "changing the password: {status}");
+    assert!(login(&t.app, "pat", "second-pw").await.is_some());
+}
+
+// Task 3: the sign-in flow and the account rules (AC6-AC16).
+
+/// Claims of a provider user with a subject and a username.
+fn b21_user(sub: &str, username: &str) -> serde_json::Value {
+    serde_json::json!({ "sub": sub, "preferred_username": username })
+}
+
+/// The Location of a failed sign-in.
+fn b21_login_error(code: &str) -> String {
+    format!("{B21_PUBLIC_URL}/web/#login/oidc-error/{code}")
+}
+
+#[tokio::test]
+async fn b21_start_needs_oidc_on() {
+    let t = b21().await;
+    let (status, headers, _) = t.start_raw().await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "OIDC was never set up");
+    assert_eq!(b21_header(&headers, "set-cookie"), "");
+    let off =
+        serde_json::json!({ "IssuerUrl": t.op.base, "ClientId": B21_CLIENT_ID, "Enabled": false });
+    let (status, _) = t.save(off).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, headers, _) = t.start_raw().await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "OIDC is off");
+    assert_eq!(b21_header(&headers, "set-cookie"), "");
+}
+
+#[tokio::test]
+async fn b21_start_builds_the_authorization_request() {
+    let t = b21_on(serde_json::json!({ "AdminGroup": "admins" })).await;
+    let flow = t.start().await;
+    assert!(
+        flow.url.starts_with(&format!("{}/authorize?", t.op.base)),
+        "the URL is the provider's authorization endpoint"
+    );
+    assert_eq!(flow.param("response_type"), "code");
+    assert_eq!(flow.param("client_id"), B21_CLIENT_ID);
+    assert_eq!(flow.param("redirect_uri"), B21_CALLBACK);
+    assert_eq!(flow.param("scope"), "openid profile email groups");
+    assert_eq!(flow.param("code_challenge_method"), "S256");
+    assert_eq!(
+        flow.param("code_challenge").len(),
+        43,
+        "a base64url SHA-256"
+    );
+    assert!(
+        flow.param("state").len() >= 22,
+        "a state of 128 bits or more"
+    );
+    assert!(
+        flow.param("nonce").len() >= 22,
+        "a nonce of 128 bits or more"
+    );
+    let attrs = b21_cookie_attrs(&flow.set_cookie);
+    for attr in ["httponly", "samesite=lax", "path=/auth/oidc", "max-age=600"] {
+        assert!(
+            attrs.iter().any(|a| a == attr),
+            "the flow cookie has {attr}"
+        );
+    }
+    assert!(!attrs.iter().any(|a| a == "secure"), "no Secure over http");
+    let id = flow.cookie.trim_start_matches("rustyfin_oidc=");
+    assert!(id.len() >= 22, "the flow id is unguessable");
+    assert_ne!(id, flow.param("state"));
+    assert_ne!(id, flow.param("nonce"));
+    assert!(!flow.url.contains(id), "the flow id stays out of the URL");
+    assert!(!flow.url.contains(B21_CLIENT_SECRET));
+
+    let other = t.start().await;
+    for name in ["state", "nonce", "code_challenge"] {
+        assert_ne!(
+            other.param(name),
+            flow.param(name),
+            "each flow has its own {name}"
+        );
+    }
+    assert_ne!(other.cookie, flow.cookie);
+}
+
+#[tokio::test]
+async fn b21_start_under_an_https_path_prefix() {
+    let t = b21_on(serde_json::json!({ "PublicUrl": "https://media.example/jf/" })).await;
+    let settings = t.settings().await;
+    assert_eq!(settings["PublicUrl"], "https://media.example/jf");
+    assert_eq!(
+        settings["CallbackUrl"],
+        "https://media.example/jf/Auth/Oidc/Callback"
+    );
+    let flow = t.start().await;
+    assert_eq!(
+        flow.param("redirect_uri"),
+        "https://media.example/jf/Auth/Oidc/Callback"
+    );
+    let attrs = b21_cookie_attrs(&flow.set_cookie);
+    assert!(
+        attrs.iter().any(|a| a == "path=/jf/auth/oidc"),
+        "the cookie path has the prefix"
+    );
+    assert!(attrs.iter().any(|a| a == "secure"), "Secure over https");
+    let location = t
+        .approve(&flow, b21_user("pat-sub", "pat"), B21Sign::Key(0))
+        .await;
+    assert_eq!(location, "https://media.example/jf/web/#login/oidc");
+}
+
+#[tokio::test]
+async fn b21_start_reports_a_provider_that_is_down() {
+    let t = b21_on(serde_json::json!({})).await;
+    t.op.with(|st| st.down = true);
+    let (status, headers, body) = t.start_raw().await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        b21_header(&headers, "set-cookie"),
+        "",
+        "no flow without a provider"
+    );
+    assert!(!body.contains(B21_CLIENT_SECRET));
+    t.op.with(|st| st.down = false);
+    t.start().await;
+}
+
+#[tokio::test]
+async fn b21_discovery_is_cached_until_the_settings_change() {
+    let t = b21_on(serde_json::json!({})).await;
+    let fetches = || t.op.with(|st| (st.discovery_fetches, st.jwks_fetches));
+    assert_eq!(fetches(), (1, 1), "the save checked the provider");
+    t.start().await;
+    t.start().await;
+    t.sign_in(b21_user("pat-sub", "pat")).await.unwrap();
+    assert_eq!(
+        fetches(),
+        (2, 2),
+        "fetched once after the save, then cached"
+    );
+    let (status, _) = t
+        .save(serde_json::json!({ "ButtonLabel": "Pocket ID" }))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(fetches(), (3, 3), "the save checked the provider again");
+    t.start().await;
+    assert_eq!(fetches().0, 4, "the save emptied the cache");
+}
+
+#[tokio::test]
+async fn b21_sign_in_creates_a_user() {
+    let t = b21_on(serde_json::json!({})).await;
+    add_user(&t.state, "plain", "pw-plain", false).await;
+    let count = t.user_count().await;
+    let result = t
+        .sign_in(b21_user("pat-sub", "pat"))
+        .await
+        .expect("pat signs in");
+    assert_eq!(result["User"]["Name"], "pat");
+    assert_eq!(result["User"]["IsAdministrator"], false);
+    assert_eq!(
+        result["SessionInfo"]["DeviceId"], "b21-web",
+        "the browser's device"
+    );
+    assert_eq!(result["SessionInfo"]["Client"], "B21");
+    assert_eq!(t.user_count().await, count + 1);
+    let token = result["AccessToken"].as_str().expect("an AccessToken");
+    assert_eq!(b21_me(&t.app, token).await, Ok("pat".to_string()));
+    assert_eq!(
+        user_flags(&t.state, "pat").await,
+        Some((false, false, false)),
+        "not admin, not owner, not disabled"
+    );
+    let hash = "SELECT password_hash FROM users WHERE name = ?";
+    assert_eq!(
+        b21_text(&t.state, hash, "pat").await.as_deref(),
+        Some(""),
+        "no password"
+    );
+    let config = "SELECT configuration FROM users WHERE name = ?";
+    assert_eq!(
+        b21_text(&t.state, config, "pat").await,
+        b21_text(&t.state, config, "plain").await,
+        "the default configuration"
+    );
+    assert_eq!(
+        t.link_row("pat").await,
+        Some((t.op.base.clone(), "pat-sub".to_string(), "pat".to_string()))
+    );
+    let login_date = "SELECT last_login_date IS NOT NULL FROM users WHERE name = ?";
+    assert!(
+        b21_true(&t.state, login_date, "pat").await,
+        "the last login is set"
+    );
+    assert!(
+        b21_true(&t.state, B21_SIGNED_IN, "pat").await,
+        "the link's last sign-in is set"
+    );
+    assert_eq!(
+        t.op.with(|st| st.userinfo_calls),
+        0,
+        "the ID token had every claim"
+    );
+}
+
+#[tokio::test]
+async fn b21_sign_in_again_follows_the_link() {
+    let t = b21_on(serde_json::json!({})).await;
+    let first = t.sign_in(b21_user("pat-sub", "pat")).await.unwrap();
+    let count = t.user_count().await;
+    let second = t.sign_in(b21_user("pat-sub", "patricia")).await.unwrap();
+    assert_eq!(
+        second["User"]["Id"], first["User"]["Id"],
+        "the link wins over the username"
+    );
+    assert_eq!(second["User"]["Name"], "pat", "the Rustyfin name stays");
+    assert_eq!(t.user_count().await, count);
+    let link = t.link_row("pat").await.expect("pat is linked");
+    assert_eq!(link.2, "patricia", "the provider username is updated");
+    let old = first["AccessToken"].as_str().unwrap();
+    let new = second["AccessToken"].as_str().unwrap();
+    assert_eq!(
+        b21_me(&t.app, old).await,
+        Err(StatusCode::UNAUTHORIZED),
+        "the browser's old token is replaced"
+    );
+    assert_eq!(b21_me(&t.app, new).await, Ok("pat".to_string()));
+}
+
+#[tokio::test]
+async fn b21_sign_in_refuses_a_taken_name() {
+    let t = b21_on(serde_json::json!({})).await;
+    add_user(&t.state, "Alice", "pw-alice", false).await;
+    let count = t.user_count().await;
+    for name in ["Alice", "alice", "ALICE", "aLiCe"] {
+        let result = t.sign_in(b21_user("alice-sub", name)).await;
+        assert_eq!(result.err().as_deref(), Some("name_taken"), "{name}");
+    }
+    assert_eq!(t.user_count().await, count, "no new user");
+    assert_eq!(t.link_count().await, 0, "no link");
+
+    let (alice, _) = login(&t.app, "Alice", "pw-alice")
+        .await
+        .expect("the password still works");
+    t.link(&alice, b21_user("alice-sub", "alice"))
+        .await
+        .expect("Alice links from the profile");
+    let result = t
+        .sign_in(b21_user("alice-sub", "alice"))
+        .await
+        .expect("from then on the link signs Alice in");
+    assert_eq!(result["User"]["Name"], "Alice");
+    assert_eq!(t.user_count().await, count);
+}
+
+#[tokio::test]
+async fn b21_sign_in_refuses_taken_names() {
+    let t = b21_on(serde_json::json!({})).await;
+    add_user(&t.state, "ada", "pw-ada", true).await;
+    add_user(&t.state, "linked", "pw-linked", false).await;
+    let (linked, _) = login(&t.app, "linked", "pw-linked").await.unwrap();
+    t.link(&linked, b21_user("first-sub", "linked"))
+        .await
+        .unwrap();
+    add_user(&t.state, "dis", "pw-dis", false).await;
+    b21_exec(
+        &t.state,
+        "UPDATE users SET is_disabled = 1 WHERE name = ?",
+        "dis",
+    )
+    .await;
+    add_user(&t.state, "Sam", "pw-sam", false).await;
+    add_user(&t.state, "sam", "pw-sam", false).await;
+    let count = t.user_count().await;
+
+    let cases = [
+        (b21_user("ada-sub", "ada"), "name_taken"),
+        (b21_user("other-sub", "Linked"), "name_taken"),
+        (b21_user("dis-sub", "dis"), "name_taken_ask_admin"),
+        (b21_user("sam-sub", "SAM"), "name_taken"),
+        (
+            serde_json::json!({ "sub": "anon-sub", "preferred_username": null }),
+            "no_username",
+        ),
+        (b21_user("blank-sub", "  "), "no_username"),
+        (
+            serde_json::json!({ "sub": "num-sub", "preferred_username": 42 }),
+            "no_username",
+        ),
+    ];
+    for (claims, code) in cases {
+        let result = t.sign_in(claims.clone()).await;
+        assert_eq!(result.err().as_deref(), Some(code), "{claims}");
+    }
+    assert_eq!(t.user_count().await, count, "nothing created");
+    assert_eq!(t.link_count().await, 1, "nothing linked");
+
+    let (status, _) = t
+        .save(serde_json::json!({ "UsernameClaim": "email" }))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let claims = serde_json::json!({ "sub": "mail-sub", "preferred_username": "ignored", "email": "mail@x.test" });
+    let result = t
+        .sign_in(claims)
+        .await
+        .expect("the username claim is configurable");
+    assert_eq!(result["User"]["Name"], "mail@x.test");
+}
+
+#[tokio::test]
+async fn b21_linked_user_that_is_disabled_is_refused() {
+    let t = b21_on(serde_json::json!({})).await;
+    t.sign_in(b21_user("pat-sub", "pat")).await.unwrap();
+    b21_exec(
+        &t.state,
+        "UPDATE users SET is_disabled = 1 WHERE name = ?",
+        "pat",
+    )
+    .await;
+    let result = t.sign_in(b21_user("pat-sub", "pat")).await;
+    assert_eq!(result.err().as_deref(), Some("account_disabled"));
+}
+
+#[tokio::test]
+async fn b21_deleting_a_user_removes_the_link() {
+    let t = b21_on(serde_json::json!({})).await;
+    let first = t.sign_in(b21_user("pat-sub", "pat")).await.unwrap();
+    let id = first["User"]["Id"].as_str().unwrap();
+    let req = request("DELETE", &format!("/Users/{id}"), Some(&t.admin), None);
+    let (status, _) = send(&t.app, req).await;
+    assert!(status.is_success(), "deleting pat: {status}");
+    assert_eq!(t.link_count().await, 0, "the link went with the user");
+    let again = t.sign_in(b21_user("pat-sub", "pat")).await.unwrap();
+    assert_ne!(again["User"]["Id"], first["User"]["Id"], "a new user");
+}
+
+#[tokio::test]
+async fn b21_userinfo_fills_missing_claims() {
+    let t = b21_on(serde_json::json!({ "AllowedGroup": "family" })).await;
+    let info =
+        serde_json::json!({ "sub": "uma-sub", "preferred_username": "uma", "groups": ["family"] });
+    t.op.with(|st| st.userinfo = Some(info));
+    let result = t
+        .sign_in(serde_json::json!({ "sub": "uma-sub" }))
+        .await
+        .expect("uma signs in with the claims from userinfo");
+    assert_eq!(result["User"]["Name"], "uma");
+    assert_eq!(
+        t.op.with(|st| st.userinfo_calls),
+        1,
+        "userinfo is read once"
+    );
+
+    let info = serde_json::json!({ "sub": "someone-else", "preferred_username": "uma", "groups": ["family"] });
+    t.op.with(|st| st.userinfo = Some(info));
+    let result = t.sign_in(serde_json::json!({ "sub": "uma-sub" })).await;
+    assert_eq!(
+        result.err().as_deref(),
+        Some("invalid_token"),
+        "userinfo about another subject"
+    );
+
+    let calls = t.op.with(|st| st.userinfo_calls);
+    let claims =
+        serde_json::json!({ "sub": "uma-sub", "preferred_username": "uma", "groups": ["family"] });
+    t.sign_in(claims).await.unwrap();
+    assert_eq!(
+        t.op.with(|st| st.userinfo_calls),
+        calls,
+        "no userinfo call when the ID token has every claim"
+    );
+}
+
+#[tokio::test]
+async fn b21_callback_checks_the_browser_binding() {
+    let t = b21_on(serde_json::json!({})).await;
+    let pat = || b21_user("pat-sub", "pat");
+
+    let flow = t.start().await;
+    let code = t.op.approve(&flow, pat(), B21Sign::Key(0));
+    let (location, _) = t.callback(None, &flow.callback_query(&code)).await;
+    assert_eq!(location, b21_login_error("state_mismatch"), "no cookie");
+
+    let flow = t.start().await;
+    let code = t.op.approve(&flow, pat(), B21Sign::Key(0));
+    let query = b21_query(&[("code", code.as_str()), ("state", "not-the-state")]);
+    let (location, set_cookie) = t.callback(Some(&flow.cookie), &query).await;
+    assert_eq!(location, b21_login_error("state_mismatch"), "another state");
+    assert!(
+        b21_clears_cookie(&set_cookie),
+        "the error clears the cookie"
+    );
+    let (location, _) = t
+        .callback(Some(&flow.cookie), &flow.callback_query(&code))
+        .await;
+    assert_eq!(
+        location,
+        b21_login_error("expired"),
+        "the mismatch ended the flow"
+    );
+
+    let flow = t.start().await;
+    let code = t.op.approve(&flow, pat(), B21Sign::Key(0));
+    let query = flow.callback_query(&code);
+    let (location, _) = t
+        .callback(Some("rustyfin_oidc=unknown-flow-id"), &query)
+        .await;
+    assert_eq!(
+        location,
+        b21_login_error("expired"),
+        "a cookie without a flow"
+    );
+
+    let a = t.start().await;
+    let b = t.start().await;
+    let code = t.op.approve(&b, pat(), B21Sign::Key(0));
+    let (location, _) = t.callback(Some(&a.cookie), &b.callback_query(&code)).await;
+    assert_eq!(
+        location,
+        b21_login_error("state_mismatch"),
+        "flow A's cookie with flow B's state"
+    );
+
+    let flow = t.start().await;
+    let code = t.op.approve(&flow, pat(), B21Sign::Key(0));
+    let query = flow.callback_query(&code);
+    let (location, _) = t.callback(Some(&flow.cookie), &query).await;
+    assert_eq!(location, format!("{B21_PUBLIC_URL}/web/#login/oidc"));
+    let (location, _) = t.callback(Some(&flow.cookie), &query).await;
+    assert_eq!(
+        location,
+        b21_login_error("expired"),
+        "a second callback for the same flow"
+    );
+    assert_eq!(
+        t.complete(Some(&flow.cookie)).await.0,
+        StatusCode::UNAUTHORIZED,
+        "the replay ended the flow"
+    );
+}
+
+#[tokio::test]
+async fn b21_callback_maps_provider_answers() {
+    let t = b21_on(serde_json::json!({})).await;
+    let pat = || b21_user("pat-sub", "pat");
+
+    let flow = t.start().await;
+    let state = flow.param("state");
+    let query = b21_query(&[("error", "access_denied"), ("state", state.as_str())]);
+    let (location, set_cookie) = t.callback(Some(&flow.cookie), &query).await;
+    assert_eq!(location, b21_login_error("cancelled"));
+    assert!(
+        b21_clears_cookie(&set_cookie),
+        "the error clears the cookie"
+    );
+
+    let flow = t.start().await;
+    let state = flow.param("state");
+    let query = b21_query(&[("error", "server_error"), ("state", state.as_str())]);
+    let (location, _) = t.callback(Some(&flow.cookie), &query).await;
+    assert_eq!(location, b21_login_error("provider_error"));
+
+    let flow = t.start().await;
+    let query = flow.callback_query("b21-code-unknown");
+    let (location, _) = t.callback(Some(&flow.cookie), &query).await;
+    assert_eq!(
+        location,
+        b21_login_error("provider_error"),
+        "the provider refuses the code"
+    );
+
+    let flow = t.start().await;
+    let code = t.op.approve(&flow, pat(), B21Sign::Key(0));
+    t.op.with(|st| st.down = true);
+    let (location, _) = t
+        .callback(Some(&flow.cookie), &flow.callback_query(&code))
+        .await;
+    assert_eq!(
+        location,
+        b21_login_error("provider_error"),
+        "the provider is down"
+    );
+    t.op.with(|st| st.down = false);
+
+    let flow = t.start().await;
+    let code = t.op.approve(&flow, pat(), B21Sign::Key(0));
+    let (status, _) = t.save(serde_json::json!({ "Enabled": false })).await;
+    assert_eq!(status, StatusCode::OK);
+    let (location, _) = t
+        .callback(Some(&flow.cookie), &flow.callback_query(&code))
+        .await;
+    assert_eq!(
+        location,
+        b21_login_error("disabled"),
+        "OIDC was turned off during the flow"
+    );
+}
+
+#[tokio::test]
+async fn b21_id_token_checks() {
+    let t = b21_on(serde_json::json!({})).await;
+    let now = chrono::Utc::now().timestamp();
+    let cases = [
+        (
+            "signed by an unpublished key",
+            serde_json::json!({}),
+            B21Sign::Forged(0),
+        ),
+        ("unsigned", serde_json::json!({}), B21Sign::Unsigned),
+        (
+            "HS256 with the client secret",
+            serde_json::json!({}),
+            B21Sign::Hs256,
+        ),
+        (
+            "another issuer",
+            serde_json::json!({ "iss": "http://evil.test" }),
+            B21Sign::Key(0),
+        ),
+        (
+            "another audience",
+            serde_json::json!({ "aud": "other-client" }),
+            B21Sign::Key(0),
+        ),
+        (
+            "an extra audience",
+            serde_json::json!({ "aud": [B21_CLIENT_ID, "other-client"] }),
+            B21Sign::Key(0),
+        ),
+        (
+            "another authorized party",
+            serde_json::json!({ "azp": "other-client" }),
+            B21Sign::Key(0),
+        ),
+        (
+            "expired",
+            serde_json::json!({ "iat": now - 7200, "exp": now - 3600 }),
+            B21Sign::Key(0),
+        ),
+        (
+            "another nonce",
+            serde_json::json!({ "nonce": "not-the-nonce" }),
+            B21Sign::Key(0),
+        ),
+        (
+            "no nonce",
+            serde_json::json!({ "nonce": null }),
+            B21Sign::Key(0),
+        ),
+        (
+            "no subject",
+            serde_json::json!({ "sub": null }),
+            B21Sign::Key(0),
+        ),
+    ];
+    for (what, extra, sign) in cases {
+        let mut claims = b21_user("tok-sub", "tok");
+        for (name, value) in extra.as_object().unwrap() {
+            claims[name] = value.clone();
+        }
+        let result = t.sign_in_as(claims, sign).await;
+        assert_eq!(result.err().as_deref(), Some("invalid_token"), "{what}");
+    }
+    assert_eq!(
+        user_flags(&t.state, "tok").await,
+        None,
+        "no user from a bad token"
+    );
+    t.sign_in(b21_user("tok-sub", "tok"))
+        .await
+        .expect("a good token");
+}
+
+#[tokio::test]
+async fn b21_unknown_kid_triggers_one_jwks_refetch() {
+    let t = b21_on(serde_json::json!({})).await;
+    t.sign_in(b21_user("pat-sub", "pat")).await.unwrap();
+    let before = t.op.with(|st| st.jwks_fetches);
+    let result = t
+        .sign_in_as(b21_user("pat-sub", "pat"), B21Sign::Kid(0, "b21-key-x"))
+        .await;
+    assert_eq!(result.err().as_deref(), Some("invalid_token"));
+    assert_eq!(
+        t.op.with(|st| st.jwks_fetches),
+        before + 1,
+        "one refetch for the unknown kid"
+    );
+}
+
+#[tokio::test]
+async fn b21_rotated_keys_are_refetched_once() {
+    let t = b21_on(serde_json::json!({})).await;
+    t.sign_in(b21_user("pat-sub", "pat")).await.unwrap();
+    let before = t.op.with(|st| st.jwks_fetches);
+    t.op.with(|st| st.keys = vec![("b21-key-b".to_string(), b21_key(0x22))]);
+    t.sign_in(b21_user("pat-sub", "pat"))
+        .await
+        .expect("the new key is fetched");
+    assert_eq!(t.op.with(|st| st.jwks_fetches), before + 1);
+    t.sign_in(b21_user("pat-sub", "pat"))
+        .await
+        .expect("the new key is kept");
+    assert_eq!(
+        t.op.with(|st| st.jwks_fetches),
+        before + 1,
+        "the refetched JWKS is cached"
+    );
+}
+
+#[tokio::test]
+async fn b21_token_request_authenticates_the_client() {
+    let t = b21_on(serde_json::json!({})).await;
+    t.sign_in(b21_user("pat-sub", "pat"))
+        .await
+        .expect("client_secret_basic");
+    let (auth, form) =
+        t.op.with(|st| st.token_requests.last().cloned())
+            .expect("a token request");
+    assert_eq!(auth, B21Auth::Basic);
+    assert_eq!(
+        form.get("grant_type").map(String::as_str),
+        Some("authorization_code")
+    );
+    assert_eq!(
+        form.get("redirect_uri").map(String::as_str),
+        Some(B21_CALLBACK)
+    );
+    let verifier = form.get("code_verifier").cloned().unwrap_or_default();
+    assert!((43..=128).contains(&verifier.len()), "an RFC 7636 verifier");
+    assert!(
+        verifier
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-._~".contains(c)),
+        "an RFC 7636 verifier"
+    );
+    assert!(
+        !form.contains_key("client_secret"),
+        "the secret goes only in the header"
+    );
+
+    t.op.with(|st| {
+        let methods = serde_json::json!(["client_secret_post"]);
+        st.discovery
+            .insert("token_endpoint_auth_methods_supported".into(), methods);
+        st.expect_auth = B21Auth::Post;
+    });
+    let (status, _) = t.save(serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    t.sign_in(b21_user("pat-sub", "pat"))
+        .await
+        .expect("client_secret_post");
+    assert_eq!(
+        t.op.with(|st| st.token_requests.last().unwrap().0),
+        B21Auth::Post
+    );
+
+    t.op.with(|st| st.expect_auth = B21Auth::None);
+    let (status, _) = t.save(serde_json::json!({ "ClientSecret": "" })).await;
+    assert_eq!(status, StatusCode::OK);
+    t.sign_in(b21_user("pat-sub", "pat"))
+        .await
+        .expect("a public client");
+    let (auth, form) = t.op.with(|st| st.token_requests.last().cloned()).unwrap();
+    assert_eq!(auth, B21Auth::None);
+    assert_eq!(
+        form.get("client_id").map(String::as_str),
+        Some(B21_CLIENT_ID)
+    );
+}
+
+#[tokio::test]
+async fn b21_complete_hands_out_the_token_once() {
+    let t = b21_on(serde_json::json!({})).await;
+    let flow = t.start().await;
+    let early = t.complete(Some(&flow.cookie)).await.0;
+    assert_eq!(early, StatusCode::UNAUTHORIZED, "before the callback");
+    assert_eq!(
+        t.complete(None).await.0,
+        StatusCode::UNAUTHORIZED,
+        "no cookie"
+    );
+    let unknown = t.complete(Some("rustyfin_oidc=unknown-flow-id")).await.0;
+    assert_eq!(unknown, StatusCode::UNAUTHORIZED, "an unknown flow");
+    let location = t
+        .approve(&flow, b21_user("comp-sub", "comp"), B21Sign::Key(0))
+        .await;
+    assert_eq!(
+        location,
+        format!("{B21_PUBLIC_URL}/web/#login/oidc"),
+        "the flow survived the early Complete"
+    );
+    let (status, body, set_cookie) = t.complete(Some(&flow.cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["User"]["Name"], "comp");
+    assert!(b21_clears_cookie(&set_cookie), "Complete clears the cookie");
+    assert_eq!(
+        t.complete(Some(&flow.cookie)).await.0,
+        StatusCode::UNAUTHORIZED,
+        "the token is handed out once"
+    );
+}
+
+#[tokio::test]
+async fn b21_allowed_group_gates_every_sign_in() {
+    let t = b21_on(serde_json::json!({ "AllowedGroup": "family" })).await;
+    let count = t.user_count().await;
+    let outsiders = [
+        serde_json::json!({ "sub": "out-sub", "preferred_username": "outsider", "groups": ["friends"] }),
+        b21_user("nog-sub", "nogroups"),
+        serde_json::json!({ "sub": "eve-sub", "preferred_username": "eve", "groups": [] }),
+    ];
+    for claims in outsiders {
+        let result = t.sign_in(claims.clone()).await;
+        assert_eq!(result.err().as_deref(), Some("not_allowed"), "{claims}");
+    }
+    assert_eq!(t.user_count().await, count, "nothing created");
+    assert_eq!(t.link_count().await, 0, "nothing linked");
+
+    let member = |groups: serde_json::Value| serde_json::json!({ "sub": "mem-sub", "preferred_username": "member", "groups": groups });
+    t.sign_in(member(serde_json::json!(["family"])))
+        .await
+        .expect("a member signs in");
+    let result = t.sign_in(member(serde_json::json!(["friends"]))).await;
+    assert_eq!(
+        result.err().as_deref(),
+        Some("not_allowed"),
+        "a linked user who left the group"
+    );
+
+    let (status, _) = t.save(serde_json::json!({ "GroupClaim": "roles" })).await;
+    assert_eq!(status, StatusCode::OK);
+    let claims = serde_json::json!({ "sub": "mem-sub", "preferred_username": "member", "roles": ["family"] });
+    t.sign_in(claims)
+        .await
+        .expect("the group claim is configurable");
+}
+
+#[tokio::test]
+async fn b21_oidc_endpoints_share_the_login_limit() {
+    let t = b21_on(serde_json::json!({})).await;
+    let mut limited = t.state.clone();
+    limited.rate_limiter = RateLimiter::new(3, 60);
+    let remote = remote_app(limited.clone());
+    let start = || request("POST", "/Auth/Oidc/Start", None, None);
+    assert_eq!(send(&remote, start()).await.0, StatusCode::OK);
+    let callback = request("GET", "/Auth/Oidc/Callback?code=x&state=y", None, None);
+    assert_eq!(send(&remote, callback).await.0, StatusCode::SEE_OTHER);
+    let complete = request("POST", "/Auth/Oidc/Complete", None, None);
+    assert_eq!(send(&remote, complete).await.0, StatusCode::UNAUTHORIZED);
+
+    assert_eq!(
+        send(&remote, start()).await.0,
+        StatusCode::TOO_MANY_REQUESTS,
+        "the fourth request in a minute"
+    );
+    let body = serde_json::json!({ "Username": "owner", "Pw": "pw-owner" });
+    let req = request("POST", "/Users/AuthenticateByName", None, Some(body));
+    assert_eq!(
+        send(&remote, req).await.0,
+        StatusCode::TOO_MANY_REQUESTS,
+        "password sign-in shares the limit"
+    );
+    assert_eq!(
+        send(&remote, b21_qc_sign_in(Some(B21_UNKNOWN_SECRET)))
+            .await
+            .0,
+        StatusCode::TOO_MANY_REQUESTS,
+        "so does Quick Connect"
+    );
+    assert_eq!(
+        send(&app(limited), start()).await.0,
+        StatusCode::OK,
+        "loopback is exempt"
+    );
+}
+
+#[tokio::test]
+async fn b21_flows_are_capped() {
+    let t = b21_on(serde_json::json!({})).await;
+    let first = t.start().await;
+    let second = t.start().await;
+    for _ in 0..999 {
+        assert_eq!(t.start_raw().await.0, StatusCode::OK);
+    }
+    let location = t
+        .approve(&first, b21_user("pat-sub", "pat"), B21Sign::Key(0))
+        .await;
+    assert_eq!(
+        location,
+        b21_login_error("expired"),
+        "the oldest of 1001 flows was dropped"
+    );
+    let location = t
+        .approve(&second, b21_user("pat-sub", "pat"), B21Sign::Key(0))
+        .await;
+    assert_eq!(
+        location,
+        format!("{B21_PUBLIC_URL}/web/#login/oidc"),
+        "the 1000 newest flows live"
+    );
+}
+
+#[tokio::test]
+async fn b21_secrets_stay_out_of_answers_and_logs() {
+    use base64::Engine as _;
+    let (log, _guard) = b21_capture();
+    let t = b21_on(serde_json::json!({ "AllowedGroup": "family" })).await;
+    let family = |sub: &str, name: &str, group: &str| serde_json::json!({ "sub": sub, "preferred_username": name, "groups": [group] });
+    let basic = format!("{B21_CLIENT_ID}:{B21_CLIENT_SECRET}");
+    let mut secrets = vec![
+        ("the client secret", B21_CLIENT_SECRET.to_string()),
+        (
+            "the Basic credentials",
+            base64::engine::general_purpose::STANDARD.encode(basic),
+        ),
+    ];
+    let mut flow_ids = Vec::new();
+    let mut answers = vec![t.settings().await.to_string()];
+    let info = send(&t.app, request("GET", "/Auth/Oidc/Info", None, None)).await;
+    answers.push(info.1.to_string());
+
+    let flow = t.start().await;
+    answers.push(flow.url.clone());
+    flow_ids.push(flow.cookie.trim_start_matches("rustyfin_oidc=").to_string());
+    let code =
+        t.op.approve(&flow, family("pat-sub", "pat", "family"), B21Sign::Key(0));
+    let (location, _) = t
+        .callback(Some(&flow.cookie), &flow.callback_query(&code))
+        .await;
+    answers.push(location);
+    secrets.push(("an authorization code", code));
+    secrets.push((
+        "an ID token",
+        t.op.with(|st| st.last_id_token.clone().unwrap()),
+    ));
+    let (status, body, _) = t.complete(Some(&flow.cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    let access_token = body["AccessToken"].as_str().unwrap().to_string();
+
+    let closed = b21_settings_body(&t.op, serde_json::json!({ "IssuerUrl": b21_closed_url() }));
+    let (status, body) = t.save(closed).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    answers.push(body.to_string());
+    let (status, _) = t.save(serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::OK, "a save empties the cache");
+    t.op.with(|st| st.down = true);
+    let (status, _, body) = t.start_raw().await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    answers.push(body);
+    t.op.with(|st| st.down = false);
+
+    let refused = [
+        (family("pat-sub", "pat", "family"), B21Sign::Forged(0)),
+        (family("fr-sub", "fr", "friends"), B21Sign::Key(0)),
+    ];
+    for (claims, sign) in refused {
+        let flow = t.start().await;
+        flow_ids.push(flow.cookie.trim_start_matches("rustyfin_oidc=").to_string());
+        let code = t.op.approve(&flow, claims, sign);
+        let (location, _) = t
+            .callback(Some(&flow.cookie), &flow.callback_query(&code))
+            .await;
+        assert!(
+            location.contains("/web/#login/oidc-error/"),
+            "the sign-in is refused"
+        );
+        answers.push(location);
+        secrets.push(("an authorization code", code));
+        secrets.push((
+            "an ID token",
+            t.op.with(|st| st.last_id_token.clone().unwrap()),
+        ));
+    }
+    for token in
+        t.op.with(|st| st.access.keys().cloned().collect::<Vec<_>>())
+    {
+        secrets.push(("a provider access token", token));
+    }
+
+    let text = log.text();
+    for (what, secret) in &secrets {
+        for answer in &answers {
+            assert!(!answer.contains(secret.as_str()), "an answer holds {what}");
+        }
+        assert!(!text.contains(secret.as_str()), "the log holds {what}");
+    }
+    for id in &flow_ids {
+        assert!(!text.contains(id.as_str()), "the log holds a flow id");
+    }
+    assert!(
+        !text.contains(&access_token),
+        "the log holds Rustyfin's token"
+    );
+}
+
+// Task 4: admin rights from a group, linking and unlinking (AC12, AC17-AC19, AC29-AC31).
+
+/// Claims of gus, a provider user in `groups`.
+fn b21_gus(groups: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({ "sub": "gus-sub", "preferred_username": "gus", "groups": groups })
+}
+
+#[tokio::test]
+async fn b21_admin_group_grants_and_takes_back_admin() {
+    let t = b21_on(serde_json::json!({ "AdminGroup": "admins" })).await;
+    let result = t
+        .sign_in(b21_gus(serde_json::json!(["admins"])))
+        .await
+        .unwrap();
+    assert_eq!(
+        result["User"]["IsAdministrator"], true,
+        "the group grants admin rights"
+    );
+    assert!(t.is_admin("gus").await);
+    assert!(t.admin_from_group("gus").await);
+    let token = result["AccessToken"].as_str().unwrap();
+    let req = request("GET", "/Auth/Oidc/Settings", Some(token), None);
+    assert_eq!(
+        send(&t.app, req).await.0,
+        StatusCode::OK,
+        "gus acts as an admin"
+    );
+
+    let result = t.sign_in(b21_gus(serde_json::json!([]))).await.unwrap();
+    assert_eq!(
+        result["User"]["IsAdministrator"], false,
+        "leaving the group takes the rights back"
+    );
+    assert!(!t.is_admin("gus").await);
+    assert!(!t.admin_from_group("gus").await);
+
+    t.sign_in(b21_gus(serde_json::json!(["admins"])))
+        .await
+        .unwrap();
+    assert!(t.is_admin("gus").await, "rejoining grants them again");
+    assert!(t.admin_from_group("gus").await);
+
+    add_user(&t.state, "lou", "pw-lou", false).await;
+    let (lou, _) = login(&t.app, "lou", "pw-lou").await.unwrap();
+    let claims =
+        serde_json::json!({ "sub": "lou-sub", "preferred_username": "lou", "groups": ["admins"] });
+    t.link(&lou, claims)
+        .await
+        .expect("lou links from the profile");
+    assert!(t.is_admin("lou").await, "a link applies the group too");
+    assert!(t.admin_from_group("lou").await);
+
+    let (status, _) = t.save(serde_json::json!({ "AdminGroup": "" })).await;
+    assert_eq!(status, StatusCode::OK);
+    t.sign_in(b21_gus(serde_json::json!(["admins"])))
+        .await
+        .unwrap();
+    assert!(
+        !t.is_admin("gus").await,
+        "without an admin group the group-granted rights go"
+    );
+    assert!(!t.admin_from_group("gus").await);
+}
+
+#[tokio::test]
+async fn b21_admin_group_keeps_hand_granted_admins() {
+    let t = b21_on(serde_json::json!({ "AdminGroup": "admins" })).await;
+    add_user(&t.state, "ada", "pw-ada", true).await;
+    let (ada, _) = login(&t.app, "ada", "pw-ada").await.unwrap();
+    let claims = |groups: serde_json::Value| serde_json::json!({ "sub": "ada-sub", "preferred_username": "ada", "groups": groups });
+    t.link(&ada, claims(serde_json::json!([])))
+        .await
+        .expect("an admin links from the profile");
+    assert!(
+        t.is_admin("ada").await,
+        "a hand-granted admin outside the group"
+    );
+    assert!(!t.admin_from_group("ada").await);
+    t.sign_in(claims(serde_json::json!(["admins"])))
+        .await
+        .unwrap();
+    assert!(t.is_admin("ada").await);
+    assert!(
+        !t.admin_from_group("ada").await,
+        "the group did not grant the rights"
+    );
+    t.sign_in(claims(serde_json::json!([]))).await.unwrap();
+    assert!(
+        t.is_admin("ada").await,
+        "leaving the group keeps hand-granted rights"
+    );
+}
+
+#[tokio::test]
+async fn b21_admin_group_keeps_the_last_admin() {
+    let (log, _guard) = b21_capture();
+    let t = b21_on(serde_json::json!({ "AdminGroup": "admins" })).await;
+    t.sign_in(b21_gus(serde_json::json!(["admins"])))
+        .await
+        .unwrap();
+    b21_exec(
+        &t.state,
+        "UPDATE users SET is_disabled = 1 WHERE name = ?",
+        "owner",
+    )
+    .await;
+    t.sign_in(b21_gus(serde_json::json!([]))).await.unwrap();
+    assert!(
+        t.is_admin("gus").await,
+        "the last enabled admin keeps the rights"
+    );
+    assert!(t.admin_from_group("gus").await, "and the flag");
+    let warned = log
+        .text()
+        .lines()
+        .any(|line| line.contains("WARN") && line.to_lowercase().contains("admin"));
+    assert!(warned, "a warning says why");
+}
+
+#[tokio::test]
+async fn b21_hand_changes_clear_the_group_flag() {
+    let t = b21_on(serde_json::json!({ "AdminGroup": "admins" })).await;
+    let result = t
+        .sign_in(b21_gus(serde_json::json!(["admins"])))
+        .await
+        .unwrap();
+    let uri = format!("/Users/{}/Policy", result["User"]["Id"].as_str().unwrap());
+    let policy = |admin: bool| {
+        let body = serde_json::json!({ "IsAdministrator": admin });
+        request("POST", &uri, Some(&t.admin), Some(body))
+    };
+    let (status, _) = send(&t.app, policy(false)).await;
+    assert!(status.is_success(), "revoking by hand: {status}");
+    assert!(!t.is_admin("gus").await);
+    assert!(
+        !t.admin_from_group("gus").await,
+        "a hand change clears the flag"
+    );
+
+    t.sign_in(b21_gus(serde_json::json!(["admins"])))
+        .await
+        .unwrap();
+    assert!(t.is_admin("gus").await, "while in the group the group wins");
+    assert!(t.admin_from_group("gus").await);
+
+    // Resending IsAdministrator keeps the flag (AC42), so a revoke and a grant hand the rights over.
+    let (status, _) = send(&t.app, policy(false)).await;
+    assert!(status.is_success(), "revoking by hand: {status}");
+    let (status, _) = send(&t.app, policy(true)).await;
+    assert!(status.is_success(), "granting by hand: {status}");
+    assert!(t.is_admin("gus").await);
+    assert!(
+        !t.admin_from_group("gus").await,
+        "a hand grant clears the flag"
+    );
+    t.sign_in(b21_gus(serde_json::json!([]))).await.unwrap();
+    assert!(
+        t.is_admin("gus").await,
+        "hand-granted rights stay outside the group"
+    );
+}
+
+#[tokio::test]
+async fn b21_link_from_the_profile() {
+    let t = b21().await;
+    add_user(&t.state, "bob", "pw-bob", false).await;
+    let (bob, _) = login(&t.app, "bob", "pw-bob").await.unwrap();
+    let link_req = |token: &str| request("POST", "/Auth/Oidc/Link", Some(token), None);
+    let (status, _) = send(&t.app, link_req(&bob)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "OIDC is off");
+    let (status, _) = t
+        .save(b21_settings_body(&t.op, serde_json::json!({})))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let anonymous = request("POST", "/Auth/Oidc/Link", None, None);
+    assert_eq!(send(&t.app, anonymous).await.0, StatusCode::UNAUTHORIZED);
+
+    let flow = t.start_link(&bob).await;
+    let location = t
+        .approve(&flow, b21_user("bob-sub", "robert"), B21Sign::Key(0))
+        .await;
+    assert_eq!(
+        location,
+        format!("{B21_PUBLIC_URL}/web/#settings/oidc-linked")
+    );
+    assert_eq!(
+        t.complete(Some(&flow.cookie)).await.0,
+        StatusCode::UNAUTHORIZED,
+        "a link hands out no token"
+    );
+    assert_eq!(
+        t.link_row("bob").await,
+        Some((
+            t.op.base.clone(),
+            "bob-sub".to_string(),
+            "robert".to_string()
+        ))
+    );
+    assert!(
+        !b21_true(&t.state, B21_SIGNED_IN, "bob").await,
+        "a link is not a sign-in"
+    );
+    let (status, _) = send(&t.app, link_req(&bob)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "bob is linked already");
+
+    let result = t.sign_in(b21_user("bob-sub", "robert")).await.unwrap();
+    assert_eq!(result["User"]["Name"], "bob", "robert signs in as bob");
+    assert!(b21_true(&t.state, B21_SIGNED_IN, "bob").await);
+
+    add_user(&t.state, "cy", "pw-cy", false).await;
+    let (cy, _) = login(&t.app, "cy", "pw-cy").await.unwrap();
+    let result = t.link(&cy, b21_user("bob-sub", "robert")).await;
+    assert_eq!(
+        result.err().as_deref(),
+        Some("already_linked"),
+        "robert is bob's"
+    );
+    assert_eq!(t.link_row("cy").await, None);
+
+    t.link(&t.admin, b21_user("owner-sub", "owner"))
+        .await
+        .expect("admins may link this way");
+
+    let (status, _) = t
+        .save(serde_json::json!({ "AllowedGroup": "family" }))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    add_user(&t.state, "eve", "pw-eve", false).await;
+    let (eve, _) = login(&t.app, "eve", "pw-eve").await.unwrap();
+    let claims =
+        serde_json::json!({ "sub": "eve-sub", "preferred_username": "eve", "groups": ["friends"] });
+    let result = t.link(&eve, claims).await;
+    assert_eq!(result.err().as_deref(), Some("not_allowed"));
+    assert_eq!(t.link_row("eve").await, None, "nothing linked");
+}
+
+#[tokio::test]
+async fn b21_accounts_show_the_link_status() {
+    let t = b21_on(serde_json::json!({})).await;
+    add_user(&t.state, "bob", "pw-bob", false).await;
+    let (bob, bob_id) = login(&t.app, "bob", "pw-bob").await.unwrap();
+    t.link(&bob, b21_user("bob-sub", "robert")).await.unwrap();
+    let pat = t.sign_in(b21_user("pat-sub", "pat")).await.unwrap();
+    let pat_id = pat["User"]["Id"].as_str().unwrap().to_string();
+    add_user(&t.state, "cy", "pw-cy", false).await;
+    t.link(&t.admin, b21_user("owner-sub", "owner"))
+        .await
+        .unwrap();
+
+    let req = request("GET", "/Auth/Oidc/Accounts", Some(&t.admin), None);
+    let (status, list) = send(&t.app, req).await;
+    assert_eq!(status, StatusCode::OK);
+    let list = list.as_array().expect("an array").clone();
+    assert_eq!(
+        list.len() as i64,
+        t.user_count().await,
+        "one entry per user"
+    );
+    for entry in &list {
+        assert_eq!(entry.as_object().map(|o| o.len()), Some(10), "{entry}");
+    }
+    let find = |name: &str| {
+        list.iter()
+            .find(|e| e["UserName"] == name)
+            .unwrap_or_else(|| panic!("no entry for {name}"))
+            .clone()
+    };
+    let same_id = |value: &serde_json::Value, id: &str| {
+        let parsed = uuid::Uuid::parse_str(value.as_str().unwrap_or_default()).ok();
+        parsed.is_some() && parsed == uuid::Uuid::parse_str(id).ok()
+    };
+    let rfc3339 = |value: &serde_json::Value| {
+        value
+            .as_str()
+            .is_some_and(|s| chrono::DateTime::parse_from_rfc3339(s).is_ok())
+    };
+
+    let b = find("bob");
+    assert!(same_id(&b["UserId"], &bob_id), "{}", b["UserId"]);
+    assert_eq!(b["Linked"], true);
+    assert_eq!(b["HasPassword"], true);
+    assert_eq!(b["ProviderUsername"], "robert");
+    assert_eq!(b["IsAdministrator"], false);
+    assert_eq!(b["AdminFromGroup"], false);
+    assert_eq!(
+        b["CanUnlink"], true,
+        "bob can still sign in with the password"
+    );
+    assert!(rfc3339(&b["LinkedAt"]), "{}", b["LinkedAt"]);
+    assert!(
+        b["LastSignInAt"].is_null(),
+        "bob never signed in through OIDC"
+    );
+
+    let p = find("pat");
+    assert!(same_id(&p["UserId"], &pat_id), "{}", p["UserId"]);
+    assert_eq!(p["Linked"], true);
+    assert_eq!(p["HasPassword"], false);
+    assert_eq!(p["CanUnlink"], false, "pat has no other way in");
+    assert!(rfc3339(&p["LastSignInAt"]), "{}", p["LastSignInAt"]);
+
+    let c = find("cy");
+    assert_eq!(c["Linked"], false);
+    assert_eq!(c["HasPassword"], true);
+    for name in ["ProviderUsername", "LinkedAt", "LastSignInAt"] {
+        assert!(c[name].is_null(), "cy has no {name}");
+    }
+    assert_eq!(c["CanUnlink"], false, "nothing to unlink");
+
+    let o = find("owner");
+    assert_eq!(o["IsAdministrator"], true);
+    assert_eq!(o["CanUnlink"], true);
+
+    let one = |id: &str, token: &str| {
+        request(
+            "GET",
+            &format!("/Auth/Oidc/Accounts/{id}"),
+            Some(token),
+            None,
+        )
+    };
+    let req = request("GET", "/Auth/Oidc/Accounts", Some(&bob), None);
+    assert_eq!(
+        send(&t.app, req).await.0,
+        StatusCode::FORBIDDEN,
+        "the list is for admins"
+    );
+    assert_eq!(
+        send(&t.app, one(&bob_id, &bob)).await,
+        (StatusCode::OK, b.clone()),
+        "a user reads their own entry"
+    );
+    assert_eq!(
+        send(&t.app, one(&pat_id, &bob)).await.0,
+        StatusCode::FORBIDDEN,
+        "not another user's"
+    );
+    assert_eq!(
+        send(&t.app, one(&pat_id, &t.admin)).await,
+        (StatusCode::OK, p.clone())
+    );
+    let unknown = uuid::Uuid::new_v4().to_string();
+    assert_eq!(
+        send(&t.app, one(&unknown, &t.admin)).await.0,
+        StatusCode::NOT_FOUND
+    );
+
+    let (status, _) = t
+        .save(serde_json::json!({ "AllowPasswordSignIn": false }))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, b) = send(&t.app, one(&bob_id, &t.admin)).await;
+    assert_eq!(b["CanUnlink"], false, "bob's password no longer works");
+    let (_, o) = send(&t.app, one(&t.admin_id, &t.admin)).await;
+    assert_eq!(o["CanUnlink"], true, "admins keep password sign-in");
+}
+
+#[tokio::test]
+async fn b21_unlink_needs_another_way_in() {
+    let t = b21_on(serde_json::json!({})).await;
+    add_user(&t.state, "bob", "pw-bob", false).await;
+    let (bob, bob_id) = login(&t.app, "bob", "pw-bob").await.unwrap();
+    t.link(&bob, b21_user("bob-sub", "robert")).await.unwrap();
+    let pat = t.sign_in(b21_user("pat-sub", "pat")).await.unwrap();
+    let pat_id = pat["User"]["Id"].as_str().unwrap().to_string();
+    let pat_token = pat["AccessToken"].as_str().unwrap().to_string();
+    let unlink = |id: &str, token: &str| {
+        request(
+            "DELETE",
+            &format!("/Auth/Oidc/Accounts/{id}/Link"),
+            Some(token),
+            None,
+        )
+    };
+
+    let (status, body) = send(&t.app, unlink(&pat_id, &pat_token)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "pat has no password");
+    let detail = body["Detail"].as_str().unwrap_or_default();
+    assert!(!detail.is_empty(), "the answer says why");
+    assert_eq!(
+        send(&t.app, unlink(&pat_id, &bob)).await.0,
+        StatusCode::FORBIDDEN,
+        "not bob's link"
+    );
+    assert_eq!(
+        send(&t.app, unlink(&bob_id, &bob)).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(t.link_row("bob").await, None);
+    assert_eq!(
+        send(&t.app, unlink(&bob_id, &bob)).await.0,
+        StatusCode::NOT_FOUND,
+        "no link left"
+    );
+
+    t.link(&bob, b21_user("bob-sub", "robert"))
+        .await
+        .expect("bob links again");
+    let (status, _) = t
+        .save(serde_json::json!({ "AllowPasswordSignIn": false }))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = send(&t.app, unlink(&bob_id, &bob)).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "bob's password no longer works"
+    );
+    let detail = body["Detail"].as_str().unwrap_or_default();
+    assert!(!detail.is_empty(), "the answer says why");
+    assert_eq!(
+        send(&t.app, unlink(&bob_id, &t.admin)).await.0,
+        StatusCode::NO_CONTENT,
+        "an admin may"
+    );
+    assert_eq!(
+        send(&t.app, unlink(&pat_id, &t.admin)).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(t.link_count().await, 0);
+    let unknown = uuid::Uuid::new_v4().to_string();
+    assert_eq!(
+        send(&t.app, unlink(&unknown, &t.admin)).await.0,
+        StatusCode::NOT_FOUND
+    );
+}
+
+// Fix round 1: the review of 9cc903a (spec §10, AC37-AC42).
+
+#[tokio::test]
+async fn b21_admin_group_member_links_from_the_profile() {
+    let t = b21_on(serde_json::json!({ "AdminGroup": "admins" })).await;
+    add_user(&t.state, "bob", "pw-bob", false).await;
+    add_user(&t.state, "cy", "pw-cy", false).await;
+    let count = t.user_count().await;
+    let boss =
+        serde_json::json!({ "sub": "boss-sub", "preferred_username": "bob", "groups": ["admins"] });
+
+    assert_eq!(
+        t.sign_in(boss.clone()).await.err().as_deref(),
+        Some("name_taken"),
+        "an admin-group member doesn't get a user by name"
+    );
+    assert_eq!(t.user_count().await, count, "nothing created");
+    assert_eq!(t.link_count().await, 0, "nothing linked");
+    assert!(!t.is_admin("bob").await, "nothing granted");
+
+    let (bob, _) = login(&t.app, "bob", "pw-bob").await.unwrap();
+    t.link(&bob, boss.clone())
+        .await
+        .expect("bob links from the profile");
+    assert!(t.is_admin("bob").await, "the link applies the group");
+    assert!(t.admin_from_group("bob").await);
+    let result = t.sign_in(boss).await.expect("the linked identity signs in");
+    assert_eq!(result["User"]["Name"], "bob");
+
+    let cy =
+        serde_json::json!({ "sub": "cy-sub", "preferred_username": "cy", "groups": ["users"] });
+    assert_eq!(
+        t.sign_in(cy).await.err().as_deref(),
+        Some("name_taken"),
+        "outside the admin group a taken name is refused too"
+    );
+    assert_eq!(t.user_count().await, count);
+
+    let dee =
+        serde_json::json!({ "sub": "dee-sub", "preferred_username": "dee", "groups": ["admins"] });
+    let result = t
+        .sign_in(dee)
+        .await
+        .expect("a new admin-group member gets a new user");
+    assert_eq!(result["User"]["IsAdministrator"], true);
+    assert_eq!(t.user_count().await, count + 1);
+}
+
+#[tokio::test]
+async fn b21_self_rename_works_with_oidc_on() {
+    let t = b21_on(serde_json::json!({})).await;
+    let bob_id = add_user(&t.state, "bob", "pw-bob", false).await;
+    let ada_id = add_user(&t.state, "ada", "pw-ada", true).await;
+    let (bob, _) = login(&t.app, "bob", "pw-bob").await.unwrap();
+    let (ada, _) = login(&t.app, "ada", "pw-ada").await.unwrap();
+    let rename = |id: uuid::Uuid, token: &str, name: &str| {
+        let body = serde_json::json!({ "Name": name });
+        request("PUT", &format!("/Users/{id}"), Some(token), Some(body))
+    };
+
+    let (status, _) = send(&t.app, rename(bob_id, &bob, "gus")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a user renames themselves with OIDC on"
+    );
+    assert_eq!(b21_me(&t.app, &bob).await, Ok("gus".to_string()));
+    let (status, body) = send(&t.app, rename(ada_id, &bob, "bob")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "but nobody else");
+    assert_eq!(body["Detail"], "User update not allowed.");
+
+    let (status, _) = send(&t.app, rename(bob_id, &ada, "robert")).await;
+    assert_eq!(status, StatusCode::OK, "an administrator renames anyone");
+    assert_eq!(b21_me(&t.app, &bob).await, Ok("robert".to_string()));
+}
+
+#[tokio::test]
+async fn b21_quick_connect_initiate_shares_the_login_limit() {
+    let mut state = test_state().await;
+    add_user(&state, "alice", "pw-alice", false).await;
+    state.rate_limiter = RateLimiter::new(3, 60);
+    let remote = remote_app(state);
+    let initiate = || request("POST", "/QuickConnect/Initiate", None, None);
+    let mut secret = String::new();
+    for _ in 0..3 {
+        let (status, body) = send(&remote, initiate()).await;
+        assert_eq!(status, StatusCode::OK);
+        secret = body["Secret"].as_str().unwrap().to_string();
+    }
+    assert_eq!(
+        send(&remote, initiate()).await.0,
+        StatusCode::TOO_MANY_REQUESTS,
+        "the fourth request in a minute"
+    );
+    let body = serde_json::json!({ "Username": "alice", "Pw": "pw-alice" });
+    let req = request("POST", "/Users/AuthenticateByName", None, Some(body));
+    assert_eq!(
+        send(&remote, req).await.0,
+        StatusCode::TOO_MANY_REQUESTS,
+        "password sign-in shares the limit"
+    );
+    let uri = format!("/QuickConnect/Connect?secret={secret}");
+    assert_eq!(
+        send(&remote, request("GET", &uri, None, None)).await.0,
+        StatusCode::OK,
+        "apps keep polling Connect"
+    );
+}
+
+#[tokio::test]
+async fn b21_quick_connect_caps_live_requests() {
+    let state = test_state().await;
+    let initiate = || request("POST", "/QuickConnect/Initiate", None, None);
+    let mut first = String::new();
+    let mut codes = std::collections::HashSet::new();
+    for client in 1..=20 {
+        let app = g2f_app_from(state.clone(), &format!("192.0.2.{client}:40000"));
+        for _ in 0..5 {
+            let (status, body) = send(&app, initiate()).await;
+            assert_eq!(status, StatusCode::OK, "client {client}");
+            if first.is_empty() {
+                first = body["Secret"].as_str().unwrap().to_string();
+            }
+            codes.insert(body["Code"].as_str().unwrap().to_string());
+        }
+    }
+    assert_eq!(codes.len(), 100, "live requests have different codes");
+    let app = g2f_app_from(state.clone(), "192.0.2.21:40000");
+    assert_eq!(
+        send(&app, initiate()).await.0,
+        StatusCode::TOO_MANY_REQUESTS,
+        "a 101st live request, from a new client"
+    );
+    assert_eq!(
+        state.quick_connect.read().await.len(),
+        100,
+        "nothing more is stored"
+    );
+
+    state
+        .quick_connect
+        .write()
+        .await
+        .get_mut(&first)
+        .expect("the request is stored")
+        .date_added -= chrono::Duration::seconds(301);
+    assert_eq!(
+        send(&app, initiate()).await.0,
+        StatusCode::OK,
+        "an expired request makes room"
+    );
+    assert_eq!(
+        send(&app, initiate()).await.0,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+}
+
+#[tokio::test]
+async fn b21_quick_connect_authorize_skips_expired_requests() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    add_user(&state, "alice", "pw-alice", false).await;
+    let (alice, alice_id) = login(&app, "alice", "pw-alice").await.unwrap();
+    let (status, init) = send(&app, request("POST", "/QuickConnect/Initiate", None, None)).await;
+    assert_eq!(status, StatusCode::OK);
+    let code = init["Code"].as_str().unwrap();
+    let live = init["Secret"].as_str().unwrap().to_string();
+    {
+        // Expired requests with the same code, as earlier requests can leave behind.
+        let mut store = state.quick_connect.write().await;
+        let template = store[&live].clone();
+        for n in 0..200 {
+            let mut old = template.clone();
+            old.secret = format!("{n:032x}");
+            old.date_added -= chrono::Duration::seconds(301);
+            store.insert(old.secret.clone(), old);
+        }
+    }
+
+    let uri = format!("/QuickConnect/Authorize?code={code}");
+    let (status, _) = send(&app, request("POST", &uri, Some(&alice), None)).await;
+    assert_eq!(status, StatusCode::OK, "the live request is approved");
+    let (status, body) = send(&app, b21_qc_sign_in(Some(&live))).await;
+    assert_eq!(status, StatusCode::OK, "its secret signs in");
+    assert_eq!(body["User"]["Id"], alice_id.as_str());
+    let (status, _) = send(&app, request("POST", &uri, Some(&alice), None)).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "only expired requests carry the code now"
+    );
+}
+
+#[tokio::test]
+async fn b21_taken_names_fold_case_and_compatibility_forms() {
+    let t = b21_on(serde_json::json!({})).await;
+    add_user(&t.state, "kelvin", "pw-kelvin", false).await;
+    add_user(&t.state, "Änne", "pw-anne", false).await;
+    add_user(&t.state, "strauss", "pw-strauss", false).await;
+    let count = t.user_count().await;
+
+    let variants = [
+        "\u{212A}elvin",
+        "KELVIN",
+        "ｋｅｌｖｉｎ",
+        "änne",
+        "A\u{0308}nne",
+        "ÄNNE",
+        "Strauß",
+        "STRAUß",
+    ];
+    for (i, name) in variants.into_iter().enumerate() {
+        assert_eq!(
+            t.sign_in(b21_user(&format!("variant-{i}-sub"), name))
+                .await
+                .err()
+                .as_deref(),
+            Some("name_taken"),
+            "{name:?} is a form of a taken name"
+        );
+    }
+    assert_eq!(t.user_count().await, count, "no new user");
+    assert_eq!(t.link_count().await, 0, "nobody is linked");
+
+    let result = t
+        .sign_in(b21_user("anne-sub", "anne"))
+        .await
+        .expect("a name without the umlaut is another name");
+    assert_eq!(result["User"]["Name"], "anne");
+    let result = t
+        .sign_in(b21_user("fiona-sub", "\u{FB01}ona"))
+        .await
+        .expect("a free name");
+    assert_eq!(
+        result["User"]["Name"], "\u{FB01}ona",
+        "the account gets the name as sent"
+    );
+    assert_eq!(
+        t.sign_in(b21_user("fiona2-sub", "FIONA"))
+            .await
+            .err()
+            .as_deref(),
+        Some("name_taken_ask_admin"),
+        "a stored name is folded too; that account has no password"
+    );
+    assert_eq!(t.user_count().await, count + 2);
+}
+
+#[tokio::test]
+async fn b21_password_switch_refuses_group_granted_admins() {
+    let t =
+        b21_on(serde_json::json!({ "AdminGroup": "admins", "AllowPasswordSignIn": false })).await;
+    let result = t
+        .sign_in(b21_gus(serde_json::json!(["admins"])))
+        .await
+        .unwrap();
+    assert!(t.admin_from_group("gus").await);
+    let gus_id = result["User"]["Id"].as_str().unwrap().to_string();
+    let gus = result["AccessToken"].as_str().unwrap().to_string();
+    let uri = format!("/Users/{gus_id}/Password");
+    let body = serde_json::json!({ "NewPw": "pw-gus" });
+    let (status, _) = send(&t.app, request("POST", &uri, Some(&gus), Some(body))).await;
+    assert!(
+        status.is_success(),
+        "the password form still works: {status}"
+    );
+
+    assert_eq!(
+        b21_password_sign_in(&t.app, "gus", "pw-gus").await,
+        (
+            StatusCode::FORBIDDEN,
+            "Password sign-in is turned off for this account.".to_string()
+        ),
+        "rights from the group don't pass the switch"
+    );
+    assert_eq!(b21_reset_pin(&t.app, "gus").await, None, "no reset PIN");
+    let uri = format!("/Auth/Oidc/Accounts/{gus_id}");
+    let (status, account) = send(&t.app, request("GET", &uri, Some(&gus), None)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(account["CanUnlink"], false, "the password is no way in");
+    let uri = format!("/Auth/Oidc/Accounts/{gus_id}/Link");
+    assert_eq!(
+        send(&t.app, request("DELETE", &uri, Some(&gus), None))
+            .await
+            .0,
+        StatusCode::CONFLICT,
+        "so the link stays"
+    );
+    assert_eq!(
+        b21_password_sign_in(&t.app, "owner", "pw-owner").await.0,
+        StatusCode::OK,
+        "administrators given rights by hand still sign in"
+    );
+
+    let (status, _) = t
+        .save(serde_json::json!({ "AllowPasswordSignIn": true }))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        b21_password_sign_in(&t.app, "gus", "pw-gus").await.0,
+        StatusCode::OK,
+        "with passwords on, gus's password works"
+    );
+}
+
+#[tokio::test]
+async fn b21_password_switch_stops_reset_pins_for_group_granted_admins() {
+    let t = b21_on(serde_json::json!({ "AdminGroup": "admins" })).await;
+    for name in ["hal", "ivy"] {
+        let claims = serde_json::json!({ "sub": format!("{name}-sub"), "preferred_username": name, "groups": ["admins"] });
+        t.sign_in(claims).await.unwrap();
+        assert!(t.admin_from_group(name).await);
+    }
+    let hal_pin = b21_reset_pin(&t.app, "hal").await.expect("a PIN for hal");
+    let ivy_pin = b21_reset_pin(&t.app, "ivy").await.expect("a PIN for ivy");
+    let (status, _) = t
+        .save(serde_json::json!({ "AllowPasswordSignIn": false }))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let body = serde_json::json!({ "Pin": hal_pin });
+    let req = request("POST", "/Users/ForgotPassword/Pin", None, Some(body));
+    assert_eq!(
+        send(&t.app, req).await.0,
+        StatusCode::FORBIDDEN,
+        "a group-granted admin's PIN resets nothing"
+    );
+    let body =
+        serde_json::json!({ "Pin": ivy_pin, "Username": "ivy", "TempPassword": "b21-temp-pw" });
+    let req = request("POST", "/Users/ResetPassword", None, Some(body));
+    assert_eq!(send(&t.app, req).await.0, StatusCode::FORBIDDEN);
+    for name in ["hal", "ivy"] {
+        let sql = "SELECT password_hash = '' FROM users WHERE name = ?";
+        assert!(
+            b21_true(&t.state, sql, name).await,
+            "{name} still has no password"
+        );
+    }
+}
+
+#[tokio::test]
+async fn b21_resending_the_policy_keeps_the_group_flag() {
+    let t = b21_on(serde_json::json!({ "AdminGroup": "admins" })).await;
+    let result = t
+        .sign_in(b21_gus(serde_json::json!(["admins"])))
+        .await
+        .unwrap();
+    let uri = format!("/Users/{}/Policy", result["User"]["Id"].as_str().unwrap());
+    let body = serde_json::json!({ "IsAdministrator": true, "EnableAllFolders": true });
+    let (status, _) = send(&t.app, request("POST", &uri, Some(&t.admin), Some(body))).await;
+    assert!(status.is_success(), "sending the policy back: {status}");
+    assert!(t.is_admin("gus").await);
+    assert!(
+        t.admin_from_group("gus").await,
+        "the same IsAdministrator keeps the rights group-given"
+    );
+
+    t.sign_in(b21_gus(serde_json::json!([]))).await.unwrap();
+    assert!(
+        !t.is_admin("gus").await,
+        "leaving the group still takes them back"
+    );
+}
+
+// Fix round 2: the re-check of fd5f398 (spec §11, AC44-AC49).
+
+#[tokio::test]
+async fn b21_taken_name_without_a_password_says_ask_an_administrator() {
+    let t = b21_on(serde_json::json!({ "AllowPasswordSignIn": false })).await;
+    add_user(&t.state, "bob", "pw-bob", false).await;
+    add_user(&t.state, "ada", "pw-ada", true).await;
+    add_user(&t.state, "gus", "pw-gus", false).await;
+    b21_exec(
+        &t.state,
+        "UPDATE users SET is_administrator = 1, admin_from_group = 1 WHERE name = ?",
+        "gus",
+    )
+    .await;
+    add_user(&t.state, "nopw", "pw-nopw", false).await;
+    b21_exec(
+        &t.state,
+        "UPDATE users SET password_hash = '' WHERE name = ?",
+        "nopw",
+    )
+    .await;
+    add_user(&t.state, "dis", "pw-dis", true).await;
+    b21_exec(
+        &t.state,
+        "UPDATE users SET is_disabled = 1 WHERE name = ?",
+        "dis",
+    )
+    .await;
+    add_user(&t.state, "Rex", "pw-rex", false).await;
+    add_user(&t.state, "rex", "pw-rex", true).await;
+    let count = t.user_count().await;
+    // The code for each provider name, with passwords off and then on.
+    let cases = [
+        ("bob", "name_taken_ask_admin", "name_taken"),
+        ("gus", "name_taken_ask_admin", "name_taken"),
+        ("ada", "name_taken", "name_taken"),
+        ("nopw", "name_taken_ask_admin", "name_taken_ask_admin"),
+        ("dis", "name_taken_ask_admin", "name_taken_ask_admin"),
+        ("REX", "name_taken", "name_taken"),
+    ];
+
+    for (name, off, _) in cases {
+        let result = t.sign_in(b21_user(&format!("{name}-sub"), name)).await;
+        assert_eq!(result.err().as_deref(), Some(off), "{name}, passwords off");
+    }
+    let (status, _) = t
+        .save(serde_json::json!({ "AllowPasswordSignIn": true }))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    for (name, _, on) in cases {
+        let result = t.sign_in(b21_user(&format!("{name}-sub"), name)).await;
+        assert_eq!(result.err().as_deref(), Some(on), "{name}, passwords on");
+    }
+    assert_eq!(t.user_count().await, count, "nothing created");
+    assert_eq!(t.link_count().await, 0, "nothing linked");
+}
+
+#[tokio::test]
+async fn b21_links_survive_renames() {
+    let t = b21_on(serde_json::json!({})).await;
+    add_user(&t.state, "bob", "pw-bob", false).await;
+    let first = t.sign_in(b21_user("pat-sub", "pat")).await.unwrap();
+    let pat_id = first["User"]["Id"].as_str().unwrap().to_string();
+    let pat = first["AccessToken"].as_str().unwrap().to_string();
+    let rename = |token: &str, name: &str| {
+        let body = serde_json::json!({ "Name": name });
+        request("PUT", &format!("/Users/{pat_id}"), Some(token), Some(body))
+    };
+
+    let (status, _) = send(&t.app, rename(&pat, "patrick")).await;
+    assert_eq!(status, StatusCode::OK, "a linked user renames themselves");
+    let again = t
+        .sign_in(b21_user("pat-sub", "pat"))
+        .await
+        .expect("the link signs the renamed user in");
+    assert_eq!(again["User"]["Id"], first["User"]["Id"]);
+    assert_eq!(again["User"]["Name"], "patrick", "the Rustyfin name stays");
+
+    let again = t
+        .sign_in(b21_user("pat-sub", "bob"))
+        .await
+        .expect("a link wins over a provider name that another user has");
+    assert_eq!(again["User"]["Id"], first["User"]["Id"]);
+    assert_eq!(t.link_row("patrick").await.expect("still linked").2, "bob");
+
+    let count = t.user_count().await;
+    let other = t
+        .sign_in(b21_user("new-sub", "pat"))
+        .await
+        .expect("the old name is free again");
+    assert_ne!(other["User"]["Id"], first["User"]["Id"]);
+    assert_eq!(other["User"]["Name"], "pat");
+    assert_eq!(t.user_count().await, count + 1);
+
+    let (status, _) = send(&t.app, rename(&t.admin, "rick")).await;
+    assert_eq!(status, StatusCode::OK, "an administrator renames the user");
+    let again = t
+        .sign_in(b21_user("pat-sub", "pat"))
+        .await
+        .expect("the link still signs in, though pat is taken now");
+    assert_eq!(again["User"]["Id"], first["User"]["Id"]);
+    assert_eq!(again["User"]["Name"], "rick");
+}
+
+#[tokio::test]
+async fn b21_quick_connect_caps_live_requests_per_client() {
+    let state = test_state().await;
+    let initiate = || request("POST", "/QuickConnect/Initiate", None, None);
+    let one = remote_app(state.clone());
+    let mut secrets = Vec::new();
+    for i in 0..5 {
+        let (status, body) = send(&one, initiate()).await;
+        assert_eq!(status, StatusCode::OK, "request {i}");
+        secrets.push(body["Secret"].as_str().unwrap().to_string());
+    }
+    assert_eq!(
+        send(&one, initiate()).await.0,
+        StatusCode::TOO_MANY_REQUESTS,
+        "a sixth live request from one client"
+    );
+    assert_eq!(
+        state.quick_connect.read().await.len(),
+        5,
+        "the refused request is not stored"
+    );
+    let other = g2f_app_from(state.clone(), "192.0.2.11:40000");
+    assert_eq!(
+        send(&other, initiate()).await.0,
+        StatusCode::OK,
+        "another client has its own five"
+    );
+
+    state
+        .quick_connect
+        .write()
+        .await
+        .get_mut(&secrets[0])
+        .expect("the request is stored")
+        .date_added -= chrono::Duration::seconds(301);
+    assert_eq!(
+        send(&one, initiate()).await.0,
+        StatusCode::OK,
+        "an expired request makes room"
+    );
+    assert_eq!(
+        send(&one, initiate()).await.0,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+
+    for i in 1..=5 {
+        let v6 = g2f_app_from(state.clone(), &format!("[2001:db8:1:1::{i}]:40000"));
+        assert_eq!(send(&v6, initiate()).await.0, StatusCode::OK, "::{i}");
+    }
+    let v6 = g2f_app_from(state.clone(), "[2001:db8:1:2::99]:40000");
+    assert_eq!(
+        send(&v6, initiate()).await.0,
+        StatusCode::TOO_MANY_REQUESTS,
+        "one IPv6 /56 is one client"
+    );
+    let v6 = g2f_app_from(state.clone(), "[2001:db8:1:100::1]:40000");
+    assert_eq!(send(&v6, initiate()).await.0, StatusCode::OK, "another /56");
+
+    let local = app(state.clone());
+    for _ in 0..5 {
+        assert_eq!(send(&local, initiate()).await.0, StatusCode::OK);
+    }
+    assert_eq!(
+        send(&local, initiate()).await.0,
+        StatusCode::TOO_MANY_REQUESTS,
+        "loopback is spared the login limit, not this cap"
+    );
+
+    let mut state = test_state().await;
+    state.rate_limiter = RateLimiter::new(0, 60);
+    let remote = remote_app(state);
+    for _ in 0..5 {
+        assert_eq!(send(&remote, initiate()).await.0, StatusCode::OK);
+    }
+    assert_eq!(
+        send(&remote, initiate()).await.0,
+        StatusCode::TOO_MANY_REQUESTS,
+        "the cap holds with the login limit off"
+    );
+}
+
+#[tokio::test]
+async fn b21_quick_connect_wrong_codes_count_against_the_login_limit() {
+    let mut state = test_state().await;
+    state.rate_limiter = RateLimiter::new(3, 60);
+    add_user(&state, "alice", "pw-alice", false).await;
+    let local = app(state.clone());
+    let (alice, _) = login(&local, "alice", "pw-alice").await.unwrap();
+    let initiate = || request("POST", "/QuickConnect/Initiate", None, None);
+    let (status, init) = send(&local, initiate()).await;
+    assert_eq!(status, StatusCode::OK);
+    let code = init["Code"].as_str().unwrap().to_string();
+    let wrong = if code == "000000" { "000001" } else { "000000" };
+    let authorize = |code: &str| {
+        let uri = format!("/QuickConnect/Authorize?code={code}");
+        request("POST", &uri, Some(alice.as_str()), None)
+    };
+
+    let remote = remote_app(state.clone());
+    for _ in 0..4 {
+        assert_eq!(
+            send(&remote, authorize(&code)).await.0,
+            StatusCode::OK,
+            "a right code doesn't count"
+        );
+    }
+    for i in 0..3 {
+        let (status, body) = send(&remote, authorize(wrong)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "miss {i}");
+        assert_eq!(body["Detail"], "Unknown code");
+    }
+    assert_eq!(
+        send(&remote, authorize(wrong)).await.0,
+        StatusCode::TOO_MANY_REQUESTS,
+        "the fourth miss in a minute"
+    );
+    assert_eq!(
+        send(&remote, authorize(&code)).await.0,
+        StatusCode::TOO_MANY_REQUESTS,
+        "a limited client tries no more codes"
+    );
+    let body = serde_json::json!({ "Username": "alice", "Pw": "pw-alice" });
+    let req = request("POST", "/Users/AuthenticateByName", None, Some(body));
+    assert_eq!(
+        send(&remote, req).await.0,
+        StatusCode::TOO_MANY_REQUESTS,
+        "misses use the sign-in budget"
+    );
+    let other = g2f_app_from(state.clone(), "192.0.2.11:40000");
+    assert_eq!(
+        send(&other, authorize(&code)).await.0,
+        StatusCode::OK,
+        "another client has its own budget"
+    );
+    for _ in 0..5 {
+        assert_eq!(
+            send(&local, authorize(wrong)).await.0,
+            StatusCode::NOT_FOUND,
+            "loopback is exempt"
+        );
+    }
+
+    let third = g2f_app_from(state.clone(), "192.0.2.12:40000");
+    for _ in 0..2 {
+        assert_eq!(send(&third, initiate()).await.0, StatusCode::OK);
+    }
+    assert_eq!(
+        send(&third, authorize(wrong)).await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        send(&third, authorize(wrong)).await.0,
+        StatusCode::TOO_MANY_REQUESTS,
+        "two Initiates and a miss use a budget of 3"
+    );
+    assert_eq!(
+        send(&third, initiate()).await.0,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+
+    let mut state = test_state().await;
+    state.rate_limiter = RateLimiter::new(0, 60);
+    add_user(&state, "alice", "pw-alice", false).await;
+    let (alice, _) = login(&app(state.clone()), "alice", "pw-alice")
+        .await
+        .unwrap();
+    let remote = remote_app(state);
+    let uri = format!("/QuickConnect/Authorize?code={wrong}");
+    for _ in 0..5 {
+        let req = request("POST", &uri, Some(alice.as_str()), None);
+        assert_eq!(
+            send(&remote, req).await.0,
+            StatusCode::NOT_FOUND,
+            "a limit of 0 turns it off"
+        );
+    }
+}
+
+/// The text at the dotted `path` in the web client's `lang` translations, if there is one.
+fn b21_translation(lang: &str, path: &str) -> Option<String> {
+    let file = format!(
+        "{}/../rustyfin-web/src/translations/{lang}.json",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(file).unwrap()).unwrap();
+    path.split('.')
+        .try_fold(&json, |value, key| value.get(key))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
+#[test]
+fn b21_web_explains_taken_names() {
+    let texts = [
+        (
+            "en",
+            "oidc.error.name_taken",
+            "An account with this name already exists. Sign in with your password and link the provider from your profile, or ask an administrator.",
+        ),
+        (
+            "en",
+            "oidc.error.name_taken_ask_admin",
+            "An account with this name already exists. Ask an administrator.",
+        ),
+        (
+            "de",
+            "oidc.error.name_taken",
+            "Ein Konto mit diesem Namen gibt es schon. Bitte mit dem Passwort anmelden und den Anbieter im Profil verknüpfen, oder einen Administrator fragen.",
+        ),
+        (
+            "de",
+            "oidc.error.name_taken_ask_admin",
+            "Ein Konto mit diesem Namen gibt es schon. Bitte einen Administrator fragen.",
+        ),
+    ];
+    for (lang, key, text) in texts {
+        assert_eq!(
+            b21_translation(lang, key).as_deref(),
+            Some(text),
+            "{lang} {key}"
+        );
+    }
+    let gone = ["admin_link_required", "ambiguous_user", "warn_username"];
+    for lang in ["en", "de"] {
+        for key in [
+            "oidc.error.admin_link_required",
+            "oidc.error.ambiguous_user",
+            "oidc.warn_username",
+        ] {
+            assert_eq!(b21_translation(lang, key), None, "{lang} {key} is gone");
+        }
+    }
+    let app_js = std::fs::read_to_string(format!(
+        "{}/../rustyfin-web/src/app.js",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .unwrap();
+    for code in ["name_taken", "name_taken_ask_admin"] {
+        assert!(
+            app_js.contains(&format!("['{code}', 'oidc.error.{code}']")),
+            "app.js shows {code}"
+        );
+    }
+    for word in gone {
+        assert!(!app_js.contains(word), "app.js no longer uses {word}");
+    }
+}
+
+#[test]
+fn b21_web_password_switch_names_hand_granted_admins() {
+    let texts = [
+        (
+            "en",
+            "oidc.allow_password",
+            "Allow password sign-in for users other than administrators given rights by hand",
+        ),
+        (
+            "en",
+            "oidc.warn_password_off",
+            "With password sign-in off, only administrators given rights by hand sign in with a password. Other users, including administrators from the admin group, need a link to sign in.",
+        ),
+        (
+            "de",
+            "oidc.allow_password",
+            "Anmeldung mit Passwort für Benutzer erlauben, die keine von Hand ernannten Administratoren sind",
+        ),
+        (
+            "de",
+            "oidc.warn_password_off",
+            "Ist die Anmeldung mit Passwort ausgeschaltet, melden sich nur von Hand ernannte Administratoren mit Passwort an. Alle anderen, auch Administratoren aus der Administratorgruppe, brauchen zur Anmeldung eine Verknüpfung.",
+        ),
+    ];
+    for (lang, key, text) in texts {
+        assert_eq!(
+            b21_translation(lang, key).as_deref(),
+            Some(text),
+            "{lang} {key}"
+        );
+    }
+}
+
+// Fix round 3: the re-check of 15b3e92 (spec §12, AC50-AC53).
+
+fn b21_unlink(id: &str, token: &str) -> Request<Body> {
+    request(
+        "DELETE",
+        &format!("/Auth/Oidc/Accounts/{id}/Link"),
+        Some(token),
+        None,
+    )
+}
+
+/// The answer to an admin-only request: 200 for an administrator, 403 for a user.
+async fn b21_settings_status(app: &axum::Router, token: &str) -> StatusCode {
+    send(
+        app,
+        request("GET", "/Auth/Oidc/Settings", Some(token), None),
+    )
+    .await
+    .0
+}
+
+/// Gives the token's passwordless user a first password, so that they may unlink (AC31).
+async fn b21_first_password(app: &axum::Router, id: &str, token: &str) {
+    let body = serde_json::json!({ "NewPw": "pw-first" });
+    let req = request(
+        "POST",
+        &format!("/Users/{id}/Password"),
+        Some(token),
+        Some(body),
+    );
+    let status = send(app, req).await.0;
+    assert!(status.is_success(), "a first password: {status}");
+}
+
+/// A first sign-in as a member of the admin group "admins": the new user's id and token.
+async fn b21_group_admin(t: &B21, sub: &str, name: &str) -> (String, String) {
+    let claims =
+        serde_json::json!({ "sub": sub, "preferred_username": name, "groups": ["admins"] });
+    let result = t.sign_in(claims).await.expect("a first sign-in");
+    assert!(
+        t.admin_from_group(name).await,
+        "{name}: admin from the group"
+    );
+    (
+        result["User"]["Id"].as_str().unwrap().to_string(),
+        result["AccessToken"].as_str().unwrap().to_string(),
+    )
+}
+
+#[tokio::test]
+async fn b21_unlinking_takes_back_group_admin() {
+    let t = b21_on(serde_json::json!({ "AdminGroup": "admins" })).await;
+
+    let (gus_id, gus) = b21_group_admin(&t, "gus-sub", "gus").await;
+    b21_first_password(&t.app, &gus_id, &gus).await;
+    assert_eq!(b21_settings_status(&t.app, &gus).await, StatusCode::OK);
+    assert_eq!(
+        send(&t.app, b21_unlink(&gus_id, &gus)).await.0,
+        StatusCode::NO_CONTENT,
+        "gus's own Unlink"
+    );
+    assert_eq!(t.link_row("gus").await, None);
+    assert!(
+        !t.is_admin("gus").await,
+        "the group's rights go with the link"
+    );
+    assert!(!t.admin_from_group("gus").await, "and so does the flag");
+    assert_eq!(
+        b21_settings_status(&t.app, &gus).await,
+        StatusCode::FORBIDDEN,
+        "at once, in the open session"
+    );
+
+    let (lou_id, lou) = b21_group_admin(&t, "lou-sub", "lou").await;
+    assert_eq!(
+        send(&t.app, b21_unlink(&lou_id, &t.admin)).await.0,
+        StatusCode::NO_CONTENT,
+        "an administrator's Remove"
+    );
+    assert!(
+        !t.is_admin("lou").await,
+        "Remove takes the group's rights back too"
+    );
+    assert!(!t.admin_from_group("lou").await);
+    assert_eq!(
+        b21_settings_status(&t.app, &lou).await,
+        StatusCode::FORBIDDEN
+    );
+
+    add_user(&t.state, "ada", "pw-ada", true).await;
+    let (ada, ada_id) = login(&t.app, "ada", "pw-ada").await.unwrap();
+    let claims =
+        serde_json::json!({ "sub": "ada-sub", "preferred_username": "ada", "groups": ["admins"] });
+    t.link(&ada, claims)
+        .await
+        .expect("ada links from the profile");
+    assert!(
+        !t.admin_from_group("ada").await,
+        "ada's rights were given by hand"
+    );
+    assert_eq!(
+        send(&t.app, b21_unlink(&ada_id, &t.admin)).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert!(t.is_admin("ada").await, "rights given by hand stay");
+    assert_eq!(b21_settings_status(&t.app, &ada).await, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn b21_unlinking_keeps_the_last_admin() {
+    let (log, _guard) = b21_capture();
+    let t = b21_on(serde_json::json!({ "AdminGroup": "admins" })).await;
+    let (gus_id, gus) = b21_group_admin(&t, "gus-sub", "gus").await;
+    b21_first_password(&t.app, &gus_id, &gus).await;
+    b21_exec(
+        &t.state,
+        "UPDATE users SET is_disabled = 1 WHERE name = ?",
+        "owner",
+    )
+    .await;
+    let before = log.text().len();
+    assert_eq!(
+        send(&t.app, b21_unlink(&gus_id, &gus)).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(t.link_row("gus").await, None, "the link goes");
+    assert!(
+        t.is_admin("gus").await,
+        "the last enabled admin keeps the rights"
+    );
+    assert!(t.admin_from_group("gus").await, "and the flag");
+    let warned = log.text()[before..]
+        .lines()
+        .any(|line| line.contains("WARN") && line.to_lowercase().contains("admin"));
+    assert!(warned, "a warning says why");
+}
+
+#[tokio::test]
+async fn b21_simultaneous_sign_ins_take_a_name_once() {
+    let t = b21_on(serde_json::json!({})).await;
+    // Sign-ins as "BobN" and "bobN" at the same moment. Both pass the first check whenever both
+    // read `users` before either inserts; then only the check inside the insert's transaction
+    // can refuse one.
+    let mut doubled = Vec::new();
+    for i in 0..10 {
+        let count = t.user_count().await;
+        let (upper, lower) = tokio::join!(
+            t.sign_in(b21_user(&format!("upper-{i}-sub"), &format!("Bob{i}"))),
+            t.sign_in(b21_user(&format!("lower-{i}-sub"), &format!("bob{i}")))
+        );
+        let refused: Vec<String> = [upper, lower].into_iter().filter_map(Result::err).collect();
+        if refused.is_empty() {
+            doubled.push(i);
+            continue;
+        }
+        assert_eq!(refused, ["name_taken_ask_admin"], "pair {i}");
+        assert_eq!(t.user_count().await, count + 1, "pair {i}: one account");
+    }
+    assert_eq!(
+        doubled,
+        Vec::<usize>::new(),
+        "pairs where both sign-ins got an account"
+    );
+    assert_eq!(t.link_count().await, 10, "one link per pair");
+}
+
+#[test]
+fn b21_ipv6_clients_are_keyed_by_their_slash56() {
+    let key = |ip: &str| {
+        rustyfin_api::middleware::resolve_client(
+            ip.parse().unwrap(),
+            &axum::http::HeaderMap::new(),
+            &[],
+        )
+        .limiter_key()
+    };
+    assert_eq!(key("2001:db8:1:2::10"), key("2001:db8:1:2::20"), "one /64");
+    assert_eq!(
+        key("2001:db8:1:2::10"),
+        key("2001:db8:1:3::20"),
+        "two /64s of one /56"
+    );
+    assert_eq!(
+        key("2001:db8:1::1"),
+        key("2001:db8:1:ff:ffff:ffff:ffff:ffff"),
+        "both ends of one /56"
+    );
+    assert_ne!(
+        key("2001:db8:1:2::10"),
+        key("2001:db8:1:100::10"),
+        "another /56"
+    );
+    assert_ne!(
+        key("192.0.2.7"),
+        key("192.0.2.8"),
+        "IPv4 is keyed by address"
+    );
+}
+
+// Fix round 4: the re-check of 7f7caf3 (spec §13, AC55-AC58).
+
+#[tokio::test]
+async fn b21_a_sign_in_cannot_undo_an_unlink() {
+    let t = b21_on(serde_json::json!({ "AdminGroup": "admins" })).await;
+    let (gus_id, gus) = b21_group_admin(&t, "gus-sub", "gus").await;
+    b21_first_password(&t.app, &gus_id, &gus).await;
+
+    // The next ID token has no group claim, so the sign-in asks userinfo after it found the link.
+    // Userinfo answers with the group, but only once gus's Unlink has committed.
+    let (arrived, at_userinfo) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    t.op.with(|st| {
+        st.userinfo = Some(serde_json::json!({
+            "sub": "gus-sub", "preferred_username": "gus", "groups": ["admins"]
+        }));
+        st.userinfo_hold = Some((arrived, released));
+    });
+    let flow = t.start().await;
+    let code =
+        t.op.approve(&flow, b21_user("gus-sub", "gus"), B21Sign::Key(0));
+    let query = flow.callback_query(&code);
+    let ((location, _), ()) = tokio::join!(t.callback(Some(&flow.cookie), &query), async {
+        at_userinfo.await.expect("the sign-in asks userinfo");
+        assert_eq!(
+            send(&t.app, b21_unlink(&gus_id, &gus)).await.0,
+            StatusCode::NO_CONTENT,
+            "gus's Unlink, while the sign-in waits"
+        );
+        release.send(()).unwrap();
+    });
+    assert_eq!(
+        location,
+        b21_login_error("server_error"),
+        "the sign-in whose link went is refused"
+    );
+    assert_eq!(
+        t.complete(Some(&flow.cookie)).await.0,
+        StatusCode::UNAUTHORIZED,
+        "and gets no session"
+    );
+    assert!(!t.is_admin("gus").await, "the group gave no rights back");
+    assert!(!t.admin_from_group("gus").await, "and no flag");
+    assert_eq!(t.link_row("gus").await, None, "and no link");
+
+    let claims =
+        serde_json::json!({ "sub": "gus-sub", "preferred_username": "gus", "groups": ["admins"] });
+    assert_eq!(
+        t.sign_in(claims).await.err().as_deref(),
+        Some("name_taken"),
+        "a new attempt takes the normal path"
+    );
+    assert!(!t.is_admin("gus").await);
+}
+
+/// `POST /Users/AuthenticateByName`: the status and the whole answer.
+async fn b21_password_answer(
+    app: &axum::Router,
+    name: &str,
+    password: &str,
+) -> (StatusCode, serde_json::Value) {
+    let body = serde_json::json!({ "Username": name, "Pw": password });
+    let req = request("POST", "/Users/AuthenticateByName", None, Some(body));
+    send(app, req).await
+}
+
+/// `POST /Users/New` as the token's user.
+async fn b21_new_user(
+    app: &axum::Router,
+    token: &str,
+    name: &str,
+) -> (StatusCode, serde_json::Value) {
+    let body = serde_json::json!({ "Name": name, "Password": "pw-new" });
+    send(app, request("POST", "/Users/New", Some(token), Some(body))).await
+}
+
+/// `PUT /Users/{id}`, a rename, as the token's user.
+async fn b21_rename(
+    app: &axum::Router,
+    token: &str,
+    id: &str,
+    name: &str,
+) -> (StatusCode, serde_json::Value) {
+    let body = serde_json::json!({ "Name": name });
+    let req = request("PUT", &format!("/Users/{id}"), Some(token), Some(body));
+    send(app, req).await
+}
+
+#[tokio::test]
+async fn b21_password_sign_in_finds_names_in_any_case() {
+    let t = b21().await;
+    add_user(&t.state, "alice", "pw-alice", false).await;
+    for name in ["alice", "ALICE", "Alice", "ＡＬＩＣＥ"] {
+        let (status, body) = b21_password_answer(&t.app, name, "pw-alice").await;
+        assert_eq!(status, StatusCode::OK, "{name:?}");
+        assert_eq!(body["User"]["Name"], "alice", "{name:?} signs in as alice");
+    }
+    let wrong = b21_password_answer(&t.app, "alice", "pw-wrong").await;
+    assert_eq!(wrong.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        b21_password_answer(&t.app, "ALICE", "pw-wrong").await,
+        wrong,
+        "a wrong password in another case"
+    );
+    assert_eq!(
+        b21_password_answer(&t.app, "alice2", "pw-alice").await,
+        wrong,
+        "another name"
+    );
+}
+
+#[tokio::test]
+async fn b21_case_variant_accounts_sign_in_by_exact_name() {
+    let t = b21().await;
+    // Two accounts whose names differ only in case, as older servers may hold.
+    add_user(&t.state, "bob", "pw-bob", false).await;
+    add_user(&t.state, "Bob", "pw-Bob", false).await;
+    for (name, password) in [("bob", "pw-bob"), ("Bob", "pw-Bob")] {
+        let (status, body) = b21_password_answer(&t.app, name, password).await;
+        assert_eq!(status, StatusCode::OK, "{name:?}");
+        assert_eq!(body["User"]["Name"], name, "{name:?} signs in as itself");
+    }
+    let wrong = b21_password_answer(&t.app, "bob", "pw-wrong").await;
+    assert_eq!(wrong.0, StatusCode::UNAUTHORIZED);
+    for password in ["pw-bob", "pw-Bob"] {
+        assert_eq!(
+            b21_password_answer(&t.app, "BOB", password).await,
+            wrong,
+            "BOB names neither account"
+        );
+    }
+    assert_eq!(
+        b21_password_answer(&t.app, "Bob", "pw-bob").await,
+        wrong,
+        "Bob is not bob"
+    );
+}
+
+#[tokio::test]
+async fn b21_new_users_refuse_taken_names_in_any_case() {
+    let t = b21().await;
+    add_user(&t.state, "alice", "pw-alice", false).await;
+    let exact = b21_new_user(&t.app, &t.admin, "alice").await;
+    assert_eq!(exact.0, StatusCode::BAD_REQUEST, "{}", exact.1);
+    for name in ["Alice", "ALICE", "ＡＬＩＣＥ", "OWNER"] {
+        assert_eq!(
+            b21_new_user(&t.app, &t.admin, name).await,
+            exact,
+            "{name:?} is taken"
+        );
+    }
+    assert_eq!(t.user_count().await, 2, "no new account");
+    let (status, body) = b21_new_user(&t.app, &t.admin, "alice2").await;
+    assert_eq!(status, StatusCode::OK, "a free name: {body}");
+    assert_eq!(body["Name"], "alice2");
+}
+
+#[tokio::test]
+async fn b21_renames_refuse_other_users_names_in_any_case() {
+    let t = b21().await;
+    add_user(&t.state, "alice", "pw-alice", false).await;
+    let carol_id = add_user(&t.state, "carol", "pw-carol", false)
+        .await
+        .to_string();
+    let (carol, _) = login(&t.app, "carol", "pw-carol").await.unwrap();
+    let taken = b21_new_user(&t.app, &t.admin, "alice").await;
+    assert_eq!(taken.0, StatusCode::BAD_REQUEST, "{}", taken.1);
+    for name in ["alice", "ALICE", "Alice", "ＡＬＩＣＥ", "Owner"] {
+        assert_eq!(
+            b21_rename(&t.app, &carol, &carol_id, name).await,
+            taken,
+            "{name:?}: carol's own rename"
+        );
+        assert_eq!(
+            b21_rename(&t.app, &t.admin, &carol_id, name).await,
+            taken,
+            "{name:?}: an administrator's rename"
+        );
+    }
+    assert!(user_flags(&t.state, "carol").await.is_some(), "still carol");
+
+    let (status, body) = b21_rename(&t.app, &carol, &carol_id, "Carol").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "her own name in another case: {body}"
+    );
+    assert!(user_flags(&t.state, "Carol").await.is_some(), "now Carol");
+    let (status, body) = b21_rename(&t.app, &carol, &carol_id, "Carol").await;
+    assert_eq!(status, StatusCode::OK, "her own name unchanged: {body}");
+    let nobody = uuid::Uuid::new_v4().to_string();
+    assert_eq!(
+        b21_rename(&t.app, &t.admin, &nobody, "nobody").await.0,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn b21_simultaneous_new_users_take_a_name_once() {
+    let t = b21().await;
+    // Users/New as "DanN" and "danN" at the same moment: only a check inside the insert's
+    // transaction can refuse one.
+    let mut doubled = Vec::new();
+    for i in 0..5 {
+        let (upper_name, lower_name) = (format!("Dan{i}"), format!("dan{i}"));
+        let (upper, lower) = tokio::join!(
+            b21_new_user(&t.app, &t.admin, &upper_name),
+            b21_new_user(&t.app, &t.admin, &lower_name)
+        );
+        let mut statuses = [upper.0, lower.0];
+        statuses.sort();
+        if statuses == [StatusCode::OK, StatusCode::OK] {
+            doubled.push(i);
+            continue;
+        }
+        assert_eq!(
+            statuses,
+            [StatusCode::OK, StatusCode::BAD_REQUEST],
+            "pair {i}"
+        );
+    }
+    assert_eq!(
+        doubled,
+        Vec::<usize>::new(),
+        "pairs where both got an account"
+    );
+    assert_eq!(
+        t.user_count().await,
+        6,
+        "the owner and one account per pair"
+    );
+}
+
+#[tokio::test]
+async fn b21_password_resets_find_names_in_any_case() {
+    let t = b21().await;
+    add_user(&t.state, "alice", "pw-alice", false).await;
+    let pin = b21_reset_pin(&t.app, "ALICE")
+        .await
+        .expect("a PIN for alice");
+    let body =
+        serde_json::json!({ "Pin": pin, "Username": "Alice", "TempPassword": "b21-temp-pw" });
+    let (status, answer) = send(
+        &t.app,
+        request("POST", "/Users/ResetPassword", None, Some(body)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert!(
+        login(&t.app, "alice", "b21-temp-pw").await.is_some(),
+        "alice's new password"
+    );
+
+    add_user(&t.state, "bob", "pw-bob", false).await;
+    add_user(&t.state, "Bob", "pw-Bob", false).await;
+    assert_eq!(
+        b21_reset_pin(&t.app, "BOB").await,
+        None,
+        "BOB names neither account"
+    );
+}
+
+#[tokio::test]
+async fn b21_startup_user_refuses_case_variants() {
+    let t = b21().await;
+    for name in ["owner", "OWNER", "Owner"] {
+        assert_eq!(
+            post_startup_user(&t.app, Some(&t.admin), name, "pw-x").await,
+            StatusCode::FORBIDDEN,
+            "{name:?}"
+        );
+    }
+    assert_eq!(t.user_count().await, 1);
+}
+
+/// Names over the limit of 255 UTF-16 code units (AC60): 256 units, 128 surrogate pairs, and 1.8 MB
+/// of U+FDFA, which NFKC grows 18-fold.
+fn b21_over_long_names() -> [String; 3] {
+    [
+        "a".repeat(256),
+        "\u{1F600}".repeat(128),
+        "\u{FDFA}".repeat(600_000),
+    ]
+}
+
+#[tokio::test]
+async fn b21_new_users_refuse_over_long_names() {
+    let t = b21().await;
+    for name in b21_over_long_names() {
+        let units = name.encode_utf16().count();
+        let (status, _) = b21_new_user(&t.app, &t.admin, &name).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{units} units");
+    }
+    assert_eq!(t.user_count().await, 1, "no new account");
+    // 255 units: bytes don't count, a surrogate pair counts twice.
+    let fits = [
+        "a".repeat(255),
+        "\u{e9}".repeat(255),
+        format!("{}a", "\u{1F600}".repeat(127)),
+    ];
+    for name in fits {
+        let (status, body) = b21_new_user(&t.app, &t.admin, &name).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["Name"], name.as_str());
+    }
+}
+
+#[tokio::test]
+async fn b21_renames_refuse_over_long_names() {
+    let t = b21().await;
+    let carol_id = add_user(&t.state, "carol", "pw-carol", false)
+        .await
+        .to_string();
+    let (carol, _) = login(&t.app, "carol", "pw-carol").await.unwrap();
+    for name in b21_over_long_names() {
+        let units = name.encode_utf16().count();
+        let (status, _) = b21_rename(&t.app, &carol, &carol_id, &name).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{units} units: own rename");
+        let (status, _) = b21_rename(&t.app, &t.admin, &carol_id, &name).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{units} units: admin's rename"
+        );
+    }
+    assert!(user_flags(&t.state, "carol").await.is_some(), "still carol");
+    let name = "a".repeat(255);
+    let (status, body) = b21_rename(&t.app, &carol, &carol_id, &name).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(user_flags(&t.state, &name).await.is_some(), "255 units fit");
+}
+
+#[tokio::test]
+async fn b21_startup_user_refuses_an_over_long_name() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    for name in b21_over_long_names() {
+        let units = name.encode_utf16().count();
+        assert_eq!(
+            post_startup_user(&app, None, &name, "pw").await,
+            StatusCode::BAD_REQUEST,
+            "{units} units"
+        );
+    }
+    let users = rustyfin_db::repo_user::get_all_users(&state.db)
+        .await
+        .unwrap();
+    assert!(users.is_empty(), "no owner");
+    assert_eq!(
+        post_startup_user(&app, None, &"a".repeat(255), "pw").await,
+        StatusCode::NO_CONTENT
+    );
+}
+
+#[tokio::test]
+async fn b21_over_long_names_sign_in_only_exactly() {
+    let t = b21().await;
+    // An account an older server let through (AC62): 128 decomposed "é", 256 units.
+    let legacy = "e\u{301}".repeat(128);
+    add_user(&t.state, &legacy, "pw-legacy", false).await;
+    let within = "\u{f6}".repeat(200);
+    add_user(&t.state, &within, "pw-within", false).await;
+    let unknown = b21_password_answer(&t.app, "nobody", "pw-x").await;
+    assert_eq!(unknown.0, StatusCode::UNAUTHORIZED);
+
+    let (status, body) = b21_password_answer(&t.app, &legacy, "pw-legacy").await;
+    assert_eq!(status, StatusCode::OK, "the exact over-long name");
+    assert_eq!(body["User"]["Name"], legacy.as_str());
+    let (status, body) = b21_password_answer(&t.app, &"\u{d6}".repeat(200), "pw-within").await;
+    assert_eq!(status, StatusCode::OK, "within the limit, names still fold");
+    assert_eq!(body["User"]["Name"], within.as_str());
+
+    let refused = [
+        (
+            "E\u{301}".repeat(128),
+            "pw-legacy",
+            "an over-long name is not folded",
+        ),
+        (
+            "\u{e9}".repeat(128),
+            "pw-legacy",
+            "an over-long account is not folded",
+        ),
+        (
+            "o\u{308}".repeat(200),
+            "pw-within",
+            "400 units match only exactly",
+        ),
+    ];
+    for (name, password, why) in refused {
+        let (status, body) = b21_password_answer(&t.app, &name, password).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{why}");
+        assert_eq!(body, unknown.1, "{why}");
+    }
+
+    // ForgotPassword finds over-long names only exactly too (AC61). Ask with the fullwidth spelling
+    // first: an open reset keeps its PIN (`store_reset_pin`), so after the exact request no spelling
+    // could get one, folded or not.
+    assert_eq!(
+        b21_reset_pin(&t.app, &"\u{FF45}\u{301}".repeat(128)).await,
+        None,
+        "no PIN for a folded match"
+    );
+    assert!(b21_reset_pin(&t.app, &legacy).await.is_some(), "exact");
+
+    let huge = "\u{FDFA}".repeat(600_000);
+    let (status, body) = b21_password_answer(&t.app, &huge, "pw-x").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "a 1.8 MB name");
+    assert_eq!(body, unknown.1, "a 1.8 MB name");
+    b21_pin_file(&t.app, &huge).await;
+}
+
+#[tokio::test]
+async fn b21_sign_in_refuses_an_over_long_username() {
+    let t = b21_on(serde_json::json!({})).await;
+    let count = t.user_count().await;
+    // The limit applies to the claim after trimming (AC64).
+    let long = "a".repeat(256);
+    for name in [long.clone(), format!(" {long} ")] {
+        let result = t.sign_in(b21_user("long-sub", &name)).await;
+        assert_eq!(result.err().as_deref(), Some("no_username"));
+    }
+    assert_eq!(t.user_count().await, count, "no new user");
+    assert_eq!(t.link_count().await, 0, "no link");
+
+    let fits = "a".repeat(255);
+    let result = t
+        .sign_in(b21_user("long-sub", &format!("  {fits} ")))
+        .await
+        .expect("255 units after trimming sign in");
+    assert_eq!(result["User"]["Name"], fits.as_str());
+}
+
+#[tokio::test]
+async fn b21_a_redeemed_reset_leaves_no_pin_file() {
+    let t = b21().await;
+    let before = b21_pin_file(&t.app, "ＡＬＩＣＥ").await;
+    // Fullwidth, a Kelvin sign and a decomposed spelling; dee's PIN is refused below.
+    let spellings = [
+        ("alice", "ＡＬＩＣＥ"),
+        ("kim", "\u{212A}IM"),
+        ("jos\u{e9}", "JOSE\u{301}"),
+        ("dee", "ＤＥＥ"),
+    ];
+    let mut resets = Vec::new();
+    for (name, spelling) in spellings {
+        add_user(&t.state, name, "pw-old", false).await;
+        let (path, pin) = b21_reset_pin_at(&t.app, spelling).await;
+        let pin = pin.unwrap_or_else(|| panic!("a PIN for {spelling:?}"));
+        resets.push((name, spelling, path, pin));
+    }
+    assert_eq!(
+        resets[0].2, before,
+        "the path doesn't depend on the account"
+    );
+
+    let (_, dee_spelling, dee_path, dee_pin) = resets.pop().unwrap();
+    for (name, spelling, path, pin) in resets {
+        let (status, answer) = b21_redeem_pin(&t.app, &pin).await;
+        assert_eq!(status, StatusCode::OK, "{spelling:?}");
+        assert_eq!(answer["UsersReset"][0], name);
+        let gone = !std::path::Path::new(&path).exists();
+        assert!(gone, "{spelling:?}: the PIN file is gone");
+    }
+
+    // A PIN the switch refuses is spent, and its file goes too.
+    let (status, _) = t
+        .save(serde_json::json!({ "AllowPasswordSignIn": false }))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = b21_redeem_pin(&t.app, &dee_pin).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "refused");
+    let gone = !std::path::Path::new(&dee_path).exists();
+    assert!(gone, "{dee_spelling:?}: the refused PIN's file is gone");
+}
+
+#[tokio::test]
+async fn b21_a_redeemed_reset_removes_an_older_pin_file() {
+    use sha2::Digest;
+    let t = b21().await;
+    add_user(&t.state, "alice", "pw-alice", false).await;
+    let (path, pin) = b21_reset_pin_at(&t.app, "alice").await;
+    let pin = pin.expect("a PIN for alice");
+    // Before round 5 the file was named after the uppercased name; an older server wrote it so.
+    let hex: String = sha2::Sha256::digest("ALICE".as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let path = std::path::PathBuf::from(path);
+    let old = path.with_file_name(format!("passwordreset-{hex}.json"));
+    if old != path {
+        std::fs::rename(&path, &old).unwrap();
+    }
+    let (status, _) = b21_redeem_pin(&t.app, &pin).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!old.exists(), "the older file is gone");
+    assert!(!path.exists());
+}
+
+#[test]
+fn b21_web_client_follows_a_demotion() {
+    let found = std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !found {
+        println!("b21_web_client_follows_a_demotion: skipped, node is not on PATH");
+        return;
+    }
+    let dir = env!("CARGO_MANIFEST_DIR");
+    let out = std::process::Command::new("node")
+        .arg(format!("{dir}/tests/web/b21_admin_recheck.mjs"))
+        .arg(format!("{dir}/../rustyfin-web/src/api.js"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn b21_dashboard_follows_a_demotion() {
+    let app_js = std::fs::read_to_string(format!(
+        "{}/../rustyfin-web/src/app.js",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .unwrap();
+    // A top-level function of app.js, from its head to its closing brace.
+    let function = |head: &str| -> String {
+        let start = app_js
+            .find(head)
+            .unwrap_or_else(|| panic!("app.js has {head}"));
+        let rest = &app_js[start..];
+        rest[..rest.find("\n}\n").unwrap()].to_string()
+    };
+    let follow = function("function followAdminLoss() {");
+    for part in [
+        "updateAuthUI()",
+        "toast(t('admin.rights_removed')",
+        "currentPage === 'admin'",
+        "navigate('home')",
+    ] {
+        assert!(follow.contains(part), "followAdminLoss: {part}");
+    }
+    assert!(
+        app_js.contains("\nAPI.onAdminLost = followAdminLoss;\n"),
+        "app.js hands followAdminLoss to the API"
+    );
+    let render = function("async function renderAdmin() {");
+    let recheck = render
+        .find("await API.recheckAdmin()")
+        .expect("renderAdmin re-reads the user");
+    let requests = render.find("Promise.all").expect("renderAdmin's requests");
+    assert!(recheck < requests, "the re-read comes before the requests");
+    assert_eq!(
+        b21_translation("en", "admin.rights_removed").as_deref(),
+        Some("This account no longer has administrator rights.")
+    );
+    assert_eq!(
+        b21_translation("de", "admin.rights_removed").as_deref(),
+        Some("Dieses Konto hat keine Administratorrechte mehr.")
+    );
+}
+
 // ── Environment Tests ──
 
 #[tokio::test]
@@ -8726,11 +13238,7 @@ async fn b103_a_sign_in_racing_a_disable_gets_no_token() {
     );
 
     // A sign-in that passed its disabled check just before the disable asks for its token now.
-    let user = rustyfin_db::repo_user::get_user_by_id(&t.state.db, bob)
-        .await
-        .unwrap()
-        .unwrap();
-    let issued = rustyfin_auth::create_token(&t.state.db, &user, &Default::default()).await;
+    let issued = rustyfin_auth::issue_login_token(&t.state.db, bob, &Default::default()).await;
     assert!(
         matches!(issued, Err(rustyfin_auth::AuthError::InvalidCredentials)),
         "a disabled account gets no token"
@@ -8769,6 +13277,73 @@ async fn b103_public_users_leave_out_disabled_accounts() {
         StatusCode::OK
     );
     assert!(b103_public_names(&t.app).await.contains(&"bob".to_string()));
+}
+
+#[tokio::test]
+async fn b103_a_hand_change_meets_the_admin_group_at_the_next_sign_in() {
+    let t = b21_on(serde_json::json!({ "AdminGroup": "admins" })).await;
+    let result = t
+        .sign_in(b21_gus(serde_json::json!(["admins"])))
+        .await
+        .unwrap();
+    let uri = format!("/Users/{}/Policy", result["User"]["Id"].as_str().unwrap());
+    assert!(t.admin_from_group("gus").await);
+
+    // A demote by hand lasts until gus signs in again while in the group.
+    let demote = serde_json::json!({ "IsAdministrator": false });
+    let req = request("POST", &uri, Some(&t.admin), Some(demote.clone()));
+    assert_eq!(send(&t.app, req).await.0, StatusCode::OK);
+    assert!(!t.is_admin("gus").await);
+    t.sign_in(b21_gus(serde_json::json!(["admins"])))
+        .await
+        .unwrap();
+    assert!(t.is_admin("gus").await, "the group gives the rights back");
+    assert!(t.admin_from_group("gus").await);
+
+    // Rights given by hand stay through a sign-in outside the group.
+    let req = request("POST", &uri, Some(&t.admin), Some(demote));
+    assert_eq!(send(&t.app, req).await.0, StatusCode::OK);
+    let promote = serde_json::json!({ "IsAdministrator": true });
+    let req = request("POST", &uri, Some(&t.admin), Some(promote));
+    assert_eq!(send(&t.app, req).await.0, StatusCode::OK);
+    assert!(!t.admin_from_group("gus").await);
+    t.sign_in(b21_gus(serde_json::json!([]))).await.unwrap();
+    assert!(t.is_admin("gus").await, "hand-given rights stay");
+}
+
+#[tokio::test]
+async fn b103_a_group_grant_skips_a_disabled_account() {
+    let t = b103().await;
+    let bob = uuid::Uuid::parse_str(&t.bob_id).unwrap();
+    let disable = serde_json::json!({ "IsDisabled": true });
+    assert_eq!(
+        t.policy(&t.owner, &t.bob_id, disable).await.0,
+        StatusCode::OK
+    );
+
+    // An admin-group sign-in that passed its disabled check just before the disable grants nothing.
+    rustyfin_db::repo_user::grant_group_admin(&t.state.db, bob)
+        .await
+        .unwrap();
+    assert_eq!(
+        user_flags(&t.state, "bob").await,
+        Some((false, false, true)),
+        "no disabled administrator"
+    );
+
+    let enable = serde_json::json!({ "IsDisabled": false });
+    assert_eq!(
+        t.policy(&t.owner, &t.bob_id, enable).await.0,
+        StatusCode::OK
+    );
+    rustyfin_db::repo_user::grant_group_admin(&t.state.db, bob)
+        .await
+        .unwrap();
+    assert_eq!(
+        user_flags(&t.state, "bob").await,
+        Some((true, false, false)),
+        "an enabled account gets the group's rights"
+    );
 }
 
 #[tokio::test]
@@ -11736,494 +16311,6 @@ async fn g2_five_wrong_pin_attempts_void_the_reset() {
     );
 }
 
-// ── B21: user names. A name matches another in any letter case and Unicode compatibility form,
-// so no two accounts differ only by case, and a name is at most 255 UTF-16 code units. ──
-
-/// A server whose owner, "owner", is signed in.
-struct B21 {
-    state: AppState,
-    app: axum::Router,
-    /// The owner's token.
-    admin: String,
-}
-
-async fn b21() -> B21 {
-    let state = test_state().await;
-    let app = app(state.clone());
-    assert_eq!(
-        post_startup_user(&app, None, "owner", "pw-owner").await,
-        StatusCode::NO_CONTENT
-    );
-    let (admin, _) = login(&app, "owner", "pw-owner")
-        .await
-        .expect("owner signs in");
-    B21 { state, app, admin }
-}
-
-impl B21 {
-    async fn user_count(&self) -> i64 {
-        sqlx::query_scalar("SELECT COUNT(*) FROM users")
-            .fetch_one(&self.state.db)
-            .await
-            .unwrap()
-    }
-}
-
-/// Asks for a password reset and reads the PIN from the PIN file; None when none was written within
-/// 2 s. The reset work may finish after the 250 ms answer under load, so the file is awaited.
-async fn b21_reset_pin(app: &axum::Router, name: &str) -> Option<String> {
-    b21_reset_pin_at(app, name).await.1
-}
-
-/// `b21_reset_pin`, with the answer's `PinFile` path.
-async fn b21_reset_pin_at(app: &axum::Router, name: &str) -> (String, Option<String>) {
-    let path = b21_pin_file(app, name).await;
-    for _ in 0..20 {
-        // The file is created before it is written, so an empty or partial file is read again.
-        let file = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
-        if let Some(file) = file {
-            let pin = file["Pin"].as_str().map(str::to_string);
-            return (path, pin);
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-    (path, None)
-}
-
-/// Asks for a password reset and returns the answer's `PinFile` path without waiting for the file.
-async fn b21_pin_file(app: &axum::Router, name: &str) -> String {
-    let body = serde_json::json!({ "EnteredUsername": name });
-    let req = request("POST", "/Users/ForgotPassword", None, Some(body));
-    let (status, answer) = send(app, req).await;
-    assert_eq!(status, StatusCode::OK);
-    answer["PinFile"]
-        .as_str()
-        .expect("a PinFile path")
-        .to_string()
-}
-
-/// Redeems a reset PIN through `POST /Users/ForgotPassword/Pin`.
-async fn b21_redeem_pin(app: &axum::Router, pin: &str) -> (StatusCode, serde_json::Value) {
-    let body = serde_json::json!({ "Pin": pin });
-    send(
-        app,
-        request("POST", "/Users/ForgotPassword/Pin", None, Some(body)),
-    )
-    .await
-}
-
-/// `POST /Users/AuthenticateByName`: the status and the whole answer.
-async fn b21_password_answer(
-    app: &axum::Router,
-    name: &str,
-    password: &str,
-) -> (StatusCode, serde_json::Value) {
-    let body = serde_json::json!({ "Username": name, "Pw": password });
-    let req = request("POST", "/Users/AuthenticateByName", None, Some(body));
-    send(app, req).await
-}
-
-/// `POST /Users/New` as the token's user.
-async fn b21_new_user(
-    app: &axum::Router,
-    token: &str,
-    name: &str,
-) -> (StatusCode, serde_json::Value) {
-    let body = serde_json::json!({ "Name": name, "Password": "pw-new" });
-    send(app, request("POST", "/Users/New", Some(token), Some(body))).await
-}
-
-/// `PUT /Users/{id}`, a rename, as the token's user.
-async fn b21_rename(
-    app: &axum::Router,
-    token: &str,
-    id: &str,
-    name: &str,
-) -> (StatusCode, serde_json::Value) {
-    let body = serde_json::json!({ "Name": name });
-    let req = request("PUT", &format!("/Users/{id}"), Some(token), Some(body));
-    send(app, req).await
-}
-
-#[tokio::test]
-async fn b21_password_sign_in_finds_names_in_any_case() {
-    let t = b21().await;
-    add_user(&t.state, "alice", "pw-alice", false).await;
-    for name in ["alice", "ALICE", "Alice", "ＡＬＩＣＥ"] {
-        let (status, body) = b21_password_answer(&t.app, name, "pw-alice").await;
-        assert_eq!(status, StatusCode::OK, "{name:?}");
-        assert_eq!(body["User"]["Name"], "alice", "{name:?} signs in as alice");
-    }
-    let wrong = b21_password_answer(&t.app, "alice", "pw-wrong").await;
-    assert_eq!(wrong.0, StatusCode::UNAUTHORIZED);
-    assert_eq!(
-        b21_password_answer(&t.app, "ALICE", "pw-wrong").await,
-        wrong,
-        "a wrong password in another case"
-    );
-    assert_eq!(
-        b21_password_answer(&t.app, "alice2", "pw-alice").await,
-        wrong,
-        "another name"
-    );
-}
-
-#[tokio::test]
-async fn b21_case_variant_accounts_sign_in_by_exact_name() {
-    let t = b21().await;
-    // Two accounts whose names differ only in case, as older servers may hold.
-    add_user(&t.state, "bob", "pw-bob", false).await;
-    add_user(&t.state, "Bob", "pw-Bob", false).await;
-    for (name, password) in [("bob", "pw-bob"), ("Bob", "pw-Bob")] {
-        let (status, body) = b21_password_answer(&t.app, name, password).await;
-        assert_eq!(status, StatusCode::OK, "{name:?}");
-        assert_eq!(body["User"]["Name"], name, "{name:?} signs in as itself");
-    }
-    let wrong = b21_password_answer(&t.app, "bob", "pw-wrong").await;
-    assert_eq!(wrong.0, StatusCode::UNAUTHORIZED);
-    for password in ["pw-bob", "pw-Bob"] {
-        assert_eq!(
-            b21_password_answer(&t.app, "BOB", password).await,
-            wrong,
-            "BOB names neither account"
-        );
-    }
-    assert_eq!(
-        b21_password_answer(&t.app, "Bob", "pw-bob").await,
-        wrong,
-        "Bob is not bob"
-    );
-}
-
-#[tokio::test]
-async fn b21_new_users_refuse_taken_names_in_any_case() {
-    let t = b21().await;
-    add_user(&t.state, "alice", "pw-alice", false).await;
-    let exact = b21_new_user(&t.app, &t.admin, "alice").await;
-    assert_eq!(exact.0, StatusCode::BAD_REQUEST, "{}", exact.1);
-    for name in ["Alice", "ALICE", "ＡＬＩＣＥ", "OWNER"] {
-        assert_eq!(
-            b21_new_user(&t.app, &t.admin, name).await,
-            exact,
-            "{name:?} is taken"
-        );
-    }
-    assert_eq!(t.user_count().await, 2, "no new account");
-    let (status, body) = b21_new_user(&t.app, &t.admin, "alice2").await;
-    assert_eq!(status, StatusCode::OK, "a free name: {body}");
-    assert_eq!(body["Name"], "alice2");
-}
-
-#[tokio::test]
-async fn b21_renames_refuse_other_users_names_in_any_case() {
-    let t = b21().await;
-    add_user(&t.state, "alice", "pw-alice", false).await;
-    let carol_id = add_user(&t.state, "carol", "pw-carol", false)
-        .await
-        .to_string();
-    let (carol, _) = login(&t.app, "carol", "pw-carol").await.unwrap();
-    let taken = b21_new_user(&t.app, &t.admin, "alice").await;
-    assert_eq!(taken.0, StatusCode::BAD_REQUEST, "{}", taken.1);
-    for name in ["alice", "ALICE", "Alice", "ＡＬＩＣＥ", "Owner"] {
-        assert_eq!(
-            b21_rename(&t.app, &carol, &carol_id, name).await,
-            taken,
-            "{name:?}: carol's own rename"
-        );
-        assert_eq!(
-            b21_rename(&t.app, &t.admin, &carol_id, name).await,
-            taken,
-            "{name:?}: an administrator's rename"
-        );
-    }
-    assert!(user_flags(&t.state, "carol").await.is_some(), "still carol");
-
-    let (status, body) = b21_rename(&t.app, &carol, &carol_id, "Carol").await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "her own name in another case: {body}"
-    );
-    assert!(user_flags(&t.state, "Carol").await.is_some(), "now Carol");
-    let (status, body) = b21_rename(&t.app, &carol, &carol_id, "Carol").await;
-    assert_eq!(status, StatusCode::OK, "her own name unchanged: {body}");
-    let nobody = uuid::Uuid::new_v4().to_string();
-    assert_eq!(
-        b21_rename(&t.app, &t.admin, &nobody, "nobody").await.0,
-        StatusCode::NOT_FOUND
-    );
-}
-
-#[tokio::test]
-async fn b21_simultaneous_new_users_take_a_name_once() {
-    let t = b21().await;
-    // Users/New as "DanN" and "danN" at the same moment: only a check inside the insert's
-    // transaction can refuse one.
-    let mut doubled = Vec::new();
-    for i in 0..5 {
-        let (upper_name, lower_name) = (format!("Dan{i}"), format!("dan{i}"));
-        let (upper, lower) = tokio::join!(
-            b21_new_user(&t.app, &t.admin, &upper_name),
-            b21_new_user(&t.app, &t.admin, &lower_name)
-        );
-        let mut statuses = [upper.0, lower.0];
-        statuses.sort();
-        if statuses == [StatusCode::OK, StatusCode::OK] {
-            doubled.push(i);
-            continue;
-        }
-        assert_eq!(
-            statuses,
-            [StatusCode::OK, StatusCode::BAD_REQUEST],
-            "pair {i}"
-        );
-    }
-    assert_eq!(
-        doubled,
-        Vec::<usize>::new(),
-        "pairs where both got an account"
-    );
-    assert_eq!(
-        t.user_count().await,
-        6,
-        "the owner and one account per pair"
-    );
-}
-
-#[tokio::test]
-async fn b21_password_resets_find_names_in_any_case() {
-    let t = b21().await;
-    add_user(&t.state, "alice", "pw-alice", false).await;
-    let pin = b21_reset_pin(&t.app, "ALICE")
-        .await
-        .expect("a PIN for alice");
-    let body =
-        serde_json::json!({ "Pin": pin, "Username": "Alice", "TempPassword": "b21-temp-pw" });
-    let (status, answer) = send(
-        &t.app,
-        request("POST", "/Users/ResetPassword", None, Some(body)),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{answer}");
-    assert!(
-        login(&t.app, "alice", "b21-temp-pw").await.is_some(),
-        "alice's new password"
-    );
-
-    add_user(&t.state, "bob", "pw-bob", false).await;
-    add_user(&t.state, "Bob", "pw-Bob", false).await;
-    assert_eq!(
-        b21_reset_pin(&t.app, "BOB").await,
-        None,
-        "BOB names neither account"
-    );
-}
-
-#[tokio::test]
-async fn b21_startup_user_refuses_case_variants() {
-    let t = b21().await;
-    for name in ["owner", "OWNER", "Owner"] {
-        assert_eq!(
-            post_startup_user(&t.app, Some(&t.admin), name, "pw-x").await,
-            StatusCode::FORBIDDEN,
-            "{name:?}"
-        );
-    }
-    assert_eq!(t.user_count().await, 1);
-}
-/// Names over the limit of 255 UTF-16 code units (AC60): 256 units, 128 surrogate pairs, and 1.8 MB
-/// of U+FDFA, which NFKC grows 18-fold.
-fn b21_over_long_names() -> [String; 3] {
-    [
-        "a".repeat(256),
-        "\u{1F600}".repeat(128),
-        "\u{FDFA}".repeat(600_000),
-    ]
-}
-
-#[tokio::test]
-async fn b21_new_users_refuse_over_long_names() {
-    let t = b21().await;
-    for name in b21_over_long_names() {
-        let units = name.encode_utf16().count();
-        let (status, _) = b21_new_user(&t.app, &t.admin, &name).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{units} units");
-    }
-    assert_eq!(t.user_count().await, 1, "no new account");
-    // 255 units: bytes don't count, a surrogate pair counts twice.
-    let fits = [
-        "a".repeat(255),
-        "\u{e9}".repeat(255),
-        format!("{}a", "\u{1F600}".repeat(127)),
-    ];
-    for name in fits {
-        let (status, body) = b21_new_user(&t.app, &t.admin, &name).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body["Name"], name.as_str());
-    }
-}
-
-#[tokio::test]
-async fn b21_renames_refuse_over_long_names() {
-    let t = b21().await;
-    let carol_id = add_user(&t.state, "carol", "pw-carol", false)
-        .await
-        .to_string();
-    let (carol, _) = login(&t.app, "carol", "pw-carol").await.unwrap();
-    for name in b21_over_long_names() {
-        let units = name.encode_utf16().count();
-        let (status, _) = b21_rename(&t.app, &carol, &carol_id, &name).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{units} units: own rename");
-        let (status, _) = b21_rename(&t.app, &t.admin, &carol_id, &name).await;
-        assert_eq!(
-            status,
-            StatusCode::BAD_REQUEST,
-            "{units} units: admin's rename"
-        );
-    }
-    assert!(user_flags(&t.state, "carol").await.is_some(), "still carol");
-    let name = "a".repeat(255);
-    let (status, body) = b21_rename(&t.app, &carol, &carol_id, &name).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert!(user_flags(&t.state, &name).await.is_some(), "255 units fit");
-}
-
-#[tokio::test]
-async fn b21_startup_user_refuses_an_over_long_name() {
-    let state = test_state().await;
-    let app = app(state.clone());
-    for name in b21_over_long_names() {
-        let units = name.encode_utf16().count();
-        assert_eq!(
-            post_startup_user(&app, None, &name, "pw").await,
-            StatusCode::BAD_REQUEST,
-            "{units} units"
-        );
-    }
-    let users = rustyfin_db::repo_user::get_all_users(&state.db)
-        .await
-        .unwrap();
-    assert!(users.is_empty(), "no owner");
-    assert_eq!(
-        post_startup_user(&app, None, &"a".repeat(255), "pw").await,
-        StatusCode::NO_CONTENT
-    );
-}
-
-#[tokio::test]
-async fn b21_over_long_names_sign_in_only_exactly() {
-    let t = b21().await;
-    // An account an older server let through (AC62): 128 decomposed "é", 256 units.
-    let legacy = "e\u{301}".repeat(128);
-    add_user(&t.state, &legacy, "pw-legacy", false).await;
-    let within = "\u{f6}".repeat(200);
-    add_user(&t.state, &within, "pw-within", false).await;
-    let unknown = b21_password_answer(&t.app, "nobody", "pw-x").await;
-    assert_eq!(unknown.0, StatusCode::UNAUTHORIZED);
-
-    let (status, body) = b21_password_answer(&t.app, &legacy, "pw-legacy").await;
-    assert_eq!(status, StatusCode::OK, "the exact over-long name");
-    assert_eq!(body["User"]["Name"], legacy.as_str());
-    let (status, body) = b21_password_answer(&t.app, &"\u{d6}".repeat(200), "pw-within").await;
-    assert_eq!(status, StatusCode::OK, "within the limit, names still fold");
-    assert_eq!(body["User"]["Name"], within.as_str());
-
-    let refused = [
-        (
-            "E\u{301}".repeat(128),
-            "pw-legacy",
-            "an over-long name is not folded",
-        ),
-        (
-            "\u{e9}".repeat(128),
-            "pw-legacy",
-            "an over-long account is not folded",
-        ),
-        (
-            "o\u{308}".repeat(200),
-            "pw-within",
-            "400 units match only exactly",
-        ),
-    ];
-    for (name, password, why) in refused {
-        let (status, body) = b21_password_answer(&t.app, &name, password).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED, "{why}");
-        assert_eq!(body, unknown.1, "{why}");
-    }
-
-    // ForgotPassword finds over-long names only exactly too (AC61). Ask with the fullwidth spelling
-    // first: an open reset keeps its PIN (`store_reset_pin`), so after the exact request no spelling
-    // could get one, folded or not.
-    assert_eq!(
-        b21_reset_pin(&t.app, &"\u{FF45}\u{301}".repeat(128)).await,
-        None,
-        "no PIN for a folded match"
-    );
-    assert!(b21_reset_pin(&t.app, &legacy).await.is_some(), "exact");
-
-    let huge = "\u{FDFA}".repeat(600_000);
-    let (status, body) = b21_password_answer(&t.app, &huge, "pw-x").await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED, "a 1.8 MB name");
-    assert_eq!(body, unknown.1, "a 1.8 MB name");
-    b21_pin_file(&t.app, &huge).await;
-}
-
-#[tokio::test]
-async fn b21_a_redeemed_reset_leaves_no_pin_file() {
-    let t = b21().await;
-    let before = b21_pin_file(&t.app, "ＡＬＩＣＥ").await;
-    // Fullwidth, a Kelvin sign and a decomposed spelling.
-    let spellings = [
-        ("alice", "ＡＬＩＣＥ"),
-        ("kim", "\u{212A}IM"),
-        ("jos\u{e9}", "JOSE\u{301}"),
-    ];
-    let mut resets = Vec::new();
-    for (name, spelling) in spellings {
-        add_user(&t.state, name, "pw-old", false).await;
-        let (path, pin) = b21_reset_pin_at(&t.app, spelling).await;
-        let pin = pin.unwrap_or_else(|| panic!("a PIN for {spelling:?}"));
-        resets.push((name, spelling, path, pin));
-    }
-    assert_eq!(
-        resets[0].2, before,
-        "the path doesn't depend on the account"
-    );
-
-    for (name, spelling, path, pin) in resets {
-        let (status, answer) = b21_redeem_pin(&t.app, &pin).await;
-        assert_eq!(status, StatusCode::OK, "{spelling:?}");
-        assert_eq!(answer["UsersReset"][0], name);
-        let gone = !std::path::Path::new(&path).exists();
-        assert!(gone, "{spelling:?}: the PIN file is gone");
-    }
-}
-
-#[tokio::test]
-async fn b21_a_redeemed_reset_removes_an_older_pin_file() {
-    use sha2::Digest;
-    let t = b21().await;
-    add_user(&t.state, "alice", "pw-alice", false).await;
-    let (path, pin) = b21_reset_pin_at(&t.app, "alice").await;
-    let pin = pin.expect("a PIN for alice");
-    // Earlier builds named the file after the uppercased name.
-    let hex: String = sha2::Sha256::digest("ALICE".as_bytes())
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    let path = std::path::PathBuf::from(path);
-    let old = path.with_file_name(format!("passwordreset-{hex}.json"));
-    if old != path {
-        std::fs::rename(&path, &old).unwrap();
-    }
-    let (status, _) = b21_redeem_pin(&t.app, &pin).await;
-    assert_eq!(status, StatusCode::OK);
-    assert!(!old.exists(), "the older file is gone");
-    assert!(!path.exists());
-}
-
 // ── G2: login limit and proxy trust (XFF) ──
 
 #[tokio::test]
@@ -12638,23 +16725,23 @@ async fn g2f_mapped_proxy_peer_is_trusted() {
 }
 
 #[tokio::test]
-async fn g2f_ipv6_clients_share_a_slash64_budget() {
-    // One host rotating through its /64 must not get a fresh budget per address. 90c99b5 keyed
-    // every full IPv6 address separately.
+async fn g2f_ipv6_clients_share_a_slash56_budget() {
+    // One site rotating through its /56 must not get a fresh budget per address or per /64.
+    // 90c99b5 keyed every full IPv6 address separately, G2f each /64 (B21 round 3: the /56).
     let state = g2f_state("").await;
     let a = g2f_app_from(state.clone(), "[2001:db8:1:2::10]:6116");
-    let b = g2f_app_from(state.clone(), "[2001:db8:1:2::20]:6117");
-    let other = g2f_app_from(state, "[2001:db8:1:3::10]:6118");
+    let b = g2f_app_from(state.clone(), "[2001:db8:1:3::20]:6117");
+    let other = g2f_app_from(state, "[2001:db8:1:100::10]:6118");
     let _ = g2f_limited(&a, 3, &[]).await;
     assert_eq!(
         g2f_limited(&b, 1, &[]).await,
         1,
-        "a second address in the same /64 shares the budget"
+        "another /64 of the same /56 shares the budget"
     );
     assert_eq!(
         g2f_limited(&other, 1, &[]).await,
         0,
-        "a different /64 keeps its own budget"
+        "a different /56 keeps its own budget"
     );
 }
 
@@ -21757,6 +25844,108 @@ async fn b20_setting_a_password_ends_the_code() {
     let (status, _) = b20_reissue(&w, bob).await;
     assert_eq!(status, StatusCode::CONFLICT, "reissue");
     assert!(login(&w.app, "bob", "set by admin").await.is_some());
+}
+
+// B21 merge round 7: the password switch and name matching for setup codes (X1, X2).
+
+/// Turns password sign-in on or off as the B20 world's admin.
+async fn b21_x1_allow_passwords(w: &B20World, allow: bool) {
+    let body = serde_json::json!({ "AllowPasswordSignIn": allow });
+    let req = request("POST", "/Auth/Oidc/Settings", Some(&w.token), Some(body));
+    let (status, answer) = send(&w.app, req).await;
+    assert_eq!(status, StatusCode::OK, "saving: {answer}");
+    assert_eq!(answer["AllowPasswordSignIn"], allow, "{answer}");
+}
+
+#[tokio::test]
+async fn b21_x1_setup_code_obeys_the_password_switch() {
+    let w = b20_world().await;
+    let (bob, code) = b20_pending_bob(&w).await;
+    b21_x1_allow_passwords(&w, false).await;
+
+    // A wrong code is checked first and gets a wrong password's answer.
+    let other = rustyfin_auth::generate_setup_code();
+    let (status, header, _) = b20_redeem(&w.app, "bob", &other, "new pass").await;
+    assert_eq!(
+        (status, header),
+        (StatusCode::UNAUTHORIZED, None),
+        "wrong code"
+    );
+
+    // The right code is refused like a password, gives no token and stays unused.
+    let (status, header, answer) = b20_redeem(&w.app, "bob", &code, "new pass").await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{answer}");
+    assert_eq!(header, None);
+    assert_eq!(
+        answer["Detail"], "Password sign-in is turned off for this account.",
+        "{answer}"
+    );
+    assert!(answer.get("AccessToken").is_none(), "a token: {answer}");
+    assert_eq!(
+        b20_sessions(&w.state, bob).await,
+        (0, 0),
+        "bob got a session"
+    );
+    assert_eq!(
+        b20_code_rows(&w.state).await.len(),
+        1,
+        "the code was used up"
+    );
+    let pending = b20_pending(&w).await;
+    let bob_pending = pending.iter().any(|e| b20_pending_entry(e).0 == bob);
+    assert!(bob_pending, "bob is no longer pending: {pending:?}");
+    assert!(login(&w.app, "bob", "new pass").await.is_none());
+
+    // A sign-in with the code doesn't send bob to the setup-code form.
+    let (status, header, _) = b20_sign_in(&w.app, "bob", &code).await;
+    assert_eq!(
+        (status, header),
+        (StatusCode::UNAUTHORIZED, None),
+        "sign-in"
+    );
+
+    // Once password sign-in is back on, the same code works.
+    b21_x1_allow_passwords(&w, true).await;
+    let (status, header, _) = b20_sign_in(&w.app, "bob", &code).await;
+    assert_eq!(
+        (status, header.as_deref()),
+        (StatusCode::UNAUTHORIZED, Some("true")),
+        "sign-in after the switch"
+    );
+    let (status, _, answer) = b20_redeem(&w.app, "bob", &code, "new pass").await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert!(answer["AccessToken"].is_string(), "{answer}");
+    assert!(login(&w.app, "bob", "new pass").await.is_some());
+    assert!(
+        b20_code_rows(&w.state).await.is_empty(),
+        "the code row stays"
+    );
+}
+
+#[tokio::test]
+async fn b21_x2_setup_code_finds_names_in_any_case() {
+    let w = b20_world().await;
+    let (bob, code) = b20_pending_bob(&w).await;
+
+    // The code typed as a password under another case of the name asks for a new password.
+    let (status, header, _) = b20_sign_in(&w.app, "Bob", &code).await;
+    assert_eq!(
+        (status, header.as_deref()),
+        (StatusCode::UNAUTHORIZED, Some("true")),
+        "sign-in as Bob"
+    );
+
+    // The code signs in as the stored "bob".
+    let (status, _, answer) = b20_redeem(&w.app, "BOB", &code, "new pass").await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    let id = answer["User"]["Id"].as_str().expect("no User.Id");
+    assert_eq!(uuid::Uuid::parse_str(id).unwrap(), bob, "{answer}");
+    assert_eq!(answer["User"]["Name"], "bob", "{answer}");
+    assert!(login(&w.app, "bob", "new pass").await.is_some());
+    assert!(
+        b20_code_rows(&w.state).await.is_empty(),
+        "the code row stays"
+    );
 }
 
 // B20 5: metadata for matched items.

@@ -39,6 +39,9 @@ rand = "0.8"
 # HTTP client
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
+# OpenID Connect sign-in (B21)
+openidconnect = "4.1"
+
 # Image processing
 image = "0.25"
 blurhash = "0.2"

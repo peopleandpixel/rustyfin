@@ -319,12 +319,12 @@ function navigate(page, data) {
     const pages = {
         home: renderHome,
         favorites: renderFavorites,
-        login: renderLogin,
+        login: () => renderLogin(data),
         library: () => renderLibrary(data),
         detail: () => renderDetail(data),
         search: () => renderSearch(data),
         person: () => renderPerson(data),
-        settings: renderSettings,
+        settings: () => renderSettings(data),
         admin: renderAdmin
     };
 
@@ -385,6 +385,12 @@ const clickActions = {
     'stop-task': el => stopTaskAction(el.dataset.id, el.dataset.name),
     'dir-open': el => navigateDirectoryPicker(el.dataset.path),
     'remove-path': el => removeSelectedPath(Number(el.dataset.index)),
+    'oidc-sign-in': () => startOidcSignIn(),
+    'oidc-link': () => startOidcLink(),
+    'oidc-unlink': el => unlinkOidc(el.dataset.id),
+    'oidc-remove-link': el => removeOidcLinkAsAdmin(el),
+    'oidc-copy-callback': () => copyOidcCallbackUrl(),
+    'oidc-save-settings': () => saveOidcAdminSettings(),
 };
 document.addEventListener('click', e => {
     const el = e.target.closest('[data-action]');
@@ -2335,9 +2341,143 @@ async function togglePlayed(id, current) {
     }
 }
 
+// --- OpenID Connect: helpers for the sign-in page and the profile ---
+// The redirect codes of the OIDC flows, each mapped to its translation key. A code not listed here gets the
+// generic message; the code itself never reaches t().
+const OIDC_ERROR_KEYS = new Map([
+    ['cancelled', 'oidc.error.cancelled'],
+    ['state_mismatch', 'oidc.error.state_mismatch'],
+    ['expired', 'oidc.error.expired'],
+    ['disabled', 'oidc.error.disabled'],
+    ['provider_error', 'oidc.error.provider_error'],
+    ['invalid_token', 'oidc.error.invalid_token'],
+    ['no_username', 'oidc.error.no_username'],
+    ['not_allowed', 'oidc.error.not_allowed'],
+    ['name_taken', 'oidc.error.name_taken'],
+    ['name_taken_ask_admin', 'oidc.error.name_taken_ask_admin'],
+    ['already_linked', 'oidc.error.already_linked'],
+    ['account_disabled', 'oidc.error.account_disabled'],
+    ['server_error', 'oidc.error.server_error'],
+]);
+
+// The code of an 'oidc-error/<code>' route, or null for any other route.
+function oidcErrorCode(data) {
+    const match = /^oidc-error\/(.*)$/.exec(data || '');
+    return match ? match[1] : null;
+}
+
+function oidcErrorText(code) {
+    return t(OIDC_ERROR_KEYS.get(code) || 'oidc.error.unknown');
+}
+
+// Sends the browser to the provider. Only http(s) links are followed; anything else is an error.
+function goToOidcProvider(url) {
+    if (!/^https?:\/\//i.test(url || '')) throw new Error(t('oidc.error.provider_error'));
+    window.location.href = url;
+}
+
+function showLoginError(message) {
+    $('login-error').textContent = message;
+    show('login-error');
+}
+
+// Adds the provider button below the sign-in form when OIDC is on. A failed Info call counts as off.
+async function loadOidcSignIn() {
+    const info = await API.oidcInfo().catch(() => null);
+    const box = $('oidc-sign-in');
+    if (!info?.Enabled || !box) return;
+    const label = (info.ButtonLabel || '').trim() || t('oidc.sign_in_default');
+    box.innerHTML = `<button type="button" class="jf-btn-ghost w-full !py-3 !font-semibold text-sm mt-4" data-action="oidc-sign-in">${escapeHtml(label)}</button>`;
+}
+
+async function startOidcSignIn() {
+    try {
+        const { AuthorizationUrl } = await API.oidcStart();
+        goToOidcProvider(AuthorizationUrl);
+    } catch (err) {
+        showLoginError(err.message);
+    }
+}
+
+// The flow is single-use, so the browser's return to #login/oidc is completed once per page load.
+let oidcCompleteStarted = false;
+
+async function completeOidcSignIn() {
+    if (oidcCompleteStarted) return;
+    oidcCompleteStarted = true;
+    const completed = await API.oidcComplete().then(() => true, () => false);
+    if (!completed) {
+        showLoginError(t('oidc.complete_failed'));
+        history.replaceState(null, '', '#login');
+        return;
+    }
+    await finishSignIn();
+}
+
+// Starts linking the signed-in account. The provider's callback returns to #settings.
+async function startOidcLink() {
+    try {
+        const { AuthorizationUrl } = await API.oidcLink();
+        goToOidcProvider(AuthorizationUrl);
+    } catch (err) {
+        toast(err.message, 'error');
+    }
+}
+
+async function unlinkOidc(userId) {
+    if (!confirm(t('oidc.unlink_confirm'))) return;
+    try {
+        await API.oidcUnlink(userId);
+        toast(t('oidc.unlinked'));
+        renderSettings();
+    } catch (err) {
+        toast(err.message, 'error');
+    }
+}
+
+// The profile gets the result of a link as #settings/oidc-linked or #settings/oidc-error/<code>. It is toasted
+// once, then the hash is cleared so that a reload does not repeat it.
+function showOidcLinkResult(data) {
+    const code = oidcErrorCode(data);
+    if (code !== null) toast(oidcErrorText(code), 'error');
+    else if (data === 'oidc-linked') toast(t('oidc.linked'));
+    else return;
+    history.replaceState(null, '', '#settings');
+}
+
+// The profile's "Single sign-on" card. Not linked: a link button, when OIDC is on. Linked: the provider login
+// and Unlink, which is disabled with the reason when the server says CanUnlink is false.
+function oidcCardHtml(enabled, account) {
+    let body;
+    if (account?.Linked) {
+        const linkedAt = account.LinkedAt ? new Date(account.LinkedAt).toLocaleString() : '—';
+        const canUnlink = Boolean(account.CanUnlink);
+        const reason = account.HasPassword ? t('oidc.unlink_password_off') : t('oidc.unlink_needs_password');
+        const linkedAs = t('oidc.linked_as', { name: account.ProviderUsername || '', date: linkedAt });
+        body = `
+            <p class="text-sm text-white/80">${escapeHtml(linkedAs)}</p>
+            <div class="flex flex-wrap items-center gap-3 mt-4">
+                <button type="button" class="jf-btn-ghost !py-2 !px-4 text-xs${canUnlink ? '' : ' !cursor-not-allowed !opacity-50 disabled:pointer-events-none'}" data-action="oidc-unlink" data-id="${escapeHtml(account.UserId)}"${canUnlink ? '' : ' disabled'}>${t('oidc.unlink')}</button>
+                ${canUnlink ? '' : `<span class="text-xs text-white/40">${escapeHtml(reason)}</span>`}
+            </div>`;
+    } else {
+        body = `
+            <p class="text-sm text-white/60">${t('oidc.not_linked')}</p>
+            ${enabled ? `<button type="button" class="jf-btn-primary !py-2 !px-4 text-xs mt-4" data-action="oidc-link">${t('oidc.link')}</button>` : ''}`;
+    }
+    return `
+        <div class="jf-settings-card">
+            <h3 class="text-base font-bold text-white mb-4 flex items-center gap-2">
+                <span class="w-2 h-2 rounded-full bg-[#38bdf8]"></span>
+                ${t('oidc.account_title')}
+            </h3>
+            ${body}
+        </div>`;
+}
+
 // --- Login Page Renderer ---
 let pendingSetup = null; // { username, code } of an imported user's one-time code; memory only
-function renderLogin() {
+function renderLogin(data) {
     pendingSetup = null;
     html('page-login', `
     <div class="flex justify-center items-center min-h-[70vh] jf-page px-4">
@@ -2361,8 +2501,24 @@ function renderLogin() {
                 </button>
                 <div id="login-error" class="text-red-400 text-xs text-center hidden p-2 rounded bg-red-500/10 border border-red-500/20"></div>
             </form>
+            <div id="oidc-sign-in"></div>
         </div>
     </div>`);
+    loadOidcSignIn();
+    const oidcError = oidcErrorCode(data);
+    if (data === 'oidc') completeOidcSignIn();
+    else if (oidcError !== null) showLoginError(oidcErrorText(oidcError));
+}
+
+// The steps after any sign-in: password, setup code or OpenID Connect.
+async function finishSignIn() {
+    updateAuthUI();
+    // Replace a socket or retry left from an earlier session, so the new token is used now
+    stopScanProgressWebSocket();
+    initScanProgressWebSocket();
+    await loadSidebar();
+    navigate('home');
+    toast(t('login.welcome_back', { name: API.userName }));
 }
 
 async function handleLogin(e) {
@@ -2371,26 +2527,15 @@ async function handleLogin(e) {
     const password = $('login-pass').value;
     try {
         await API.login(username, password);
-        await finishLogin();
     } catch (err) {
         if (err.setupRequired) {
             renderSetupPassword(username, password);
             return;
         }
-        $('login-error').textContent = err.message;
-        show('login-error');
+        showLoginError(err.status === 403 ? t('oidc.password_sign_in_off') : err.message);
+        return;
     }
-}
-
-// The steps after any successful sign-in.
-async function finishLogin() {
-    updateAuthUI();
-    // Replace a socket or retry left from an earlier session, so the new token is used now
-    stopScanProgressWebSocket();
-    initScanProgressWebSocket();
-    await loadSidebar();
-    navigate('home');
-    toast(t('login.welcome_back', { name: API.userName }));
+    await finishSignIn();
 }
 
 // Shown when a sign-in answers "setup required" for an imported user. The code is kept in memory only.
@@ -2434,7 +2579,7 @@ async function handleSetupPassword(e) {
     try {
         await API.loginWithSetupCode(pendingSetup.username, pendingSetup.code, pw);
         pendingSetup = null;
-        await finishLogin();
+        await finishSignIn();
     } catch (err) {
         fail(err.status === 401 ? t('jellyfin_import.code_invalid') : err.message);
     }
@@ -2463,7 +2608,7 @@ async function authorizeQuickConnect() {
         return;
     }
     try {
-        await API.post('/QuickConnect/Authorize', { Code: code });
+        await API.post('/QuickConnect/Authorize?code=' + encodeURIComponent(code));
         toast(t('quick_connect.authorized'));
         $('qc-modal')?.close();
     } catch (e) {
@@ -2472,14 +2617,17 @@ async function authorizeQuickConnect() {
 }
 
 // --- Settings Page Renderer ---
-async function renderSettings() {
+async function renderSettings(data) {
+    showOidcLinkResult(data);
     const page = $('page-settings');
     page.innerHTML = '<div class="flex justify-center items-center py-24"><div class="w-10 h-10 border-3 border-[#00a4dc] border-t-transparent rounded-full animate-spin"></div></div>';
 
     try {
-        const [me, config] = await Promise.all([
+        const [me, config, ssoInfo, ssoAccount] = await Promise.all([
             API.getMe().catch(() => ({})),
-            API.getConfig().catch(() => null)
+            API.getConfig().catch(() => null),
+            API.oidcInfo().catch(() => null),
+            API.oidcAccount(API.userId).catch(() => null)
         ]);
 
         const name = me.Name || me.name || API.userName || '';
@@ -2529,6 +2677,10 @@ async function renderSettings() {
             </div>`;
         }
 
+        // Without the account (its request failed) the current password stays required.
+        const hasPassword = ssoAccount?.HasPassword ?? true;
+        const ssoHtml = (ssoInfo?.Enabled || ssoAccount?.Linked) ? oidcCardHtml(Boolean(ssoInfo?.Enabled), ssoAccount) : '';
+
         page.innerHTML = `
         <div class="max-w-3xl mx-auto jf-page">
             <h1 class="text-2xl lg:text-3xl font-extrabold text-white mb-6">${t('settings.title')}</h1>
@@ -2566,13 +2718,16 @@ async function renderSettings() {
                     ${t('settings.change_password')}
                 </h3>
                 <form id="change-password-form" class="space-y-3">
-                    <input type="password" id="pw-current" class="jf-input w-full" placeholder="${escapeHtml(t('settings.current_password'))}" required>
+                    <input type="password" id="pw-current" class="jf-input w-full" placeholder="${escapeHtml(t('settings.current_password'))}" ${hasPassword ? 'required' : ''}>
+                    ${hasPassword ? '' : `<p class="text-xs text-white/40">${t('oidc.no_current_password')}</p>`}
                     <input type="password" id="pw-new" class="jf-input w-full" placeholder="${escapeHtml(t('settings.new_password'))}" required>
                     <input type="password" id="pw-confirm" class="jf-input w-full" placeholder="${escapeHtml(t('settings.confirm_new_password'))}" required>
                     <button type="submit" class="jf-btn-primary text-xs">${t('settings.save_password')}</button>
                     <span id="pw-msg" class="text-xs ml-3 hidden"></span>
                 </form>
             </div>
+
+            ${ssoHtml}
 
             ${serverCfgHtml}
         </div>`;
@@ -2627,6 +2782,9 @@ async function handleSaveConfig(e) {
 }
 
 // --- Admin Dashboard Renderer ---
+// AccountStatus.UserId has hyphens and a user's Id may not, so account ids are compared without case and hyphens.
+function oidcAccountKey(id) { return String(id).toLowerCase().replace(/-/g, ''); }
+
 async function renderAdmin() {
     const page = $('page-admin');
     if (!API.isAdmin) {
@@ -2636,19 +2794,22 @@ async function renderAdmin() {
 
     page.innerHTML = '<div class="flex justify-center items-center py-24"><div class="w-10 h-10 border-3 border-[#00a4dc] border-t-transparent rounded-full animate-spin"></div></div>';
 
+    if (!(await API.recheckAdmin())) return;
     try {
         let libsError = null;
-        const [users, libs, tasks, plugins, info, sessions] = await Promise.all([
+        const [users, libs, tasks, plugins, info, sessions, accounts] = await Promise.all([
             API.getUsers().catch(() => []),
             API.getLibraries().catch(err => { libsError = err; return []; }),
             API.getTasks().catch(() => []),
             API.getPlugins().catch(() => []),
             API.getFullInfo().catch(() => ({})),
-            API.getSessions().catch(() => [])
+            API.getSessions().catch(() => []),
+            API.oidcAccounts().catch(() => [])
         ]);
+        const accountById = new Map(accounts.map(a => [oidcAccountKey(a.UserId), a]));
 
-        const tabs = [t('admin.overview'), t('admin.users'), t('admin.libraries'), t('admin.tasks'), t('admin.sessions'), t('admin.activity_log_tab'), t('admin.live_log'), t('jellyfin_import.tab')];
-        const tabIds = ['admin-overview', 'admin-users', 'admin-libs', 'admin-tasks', 'admin-sessions', 'admin-activity', 'admin-livelog', 'admin-import'];
+        const tabs = [t('admin.overview'), t('admin.users'), t('admin.libraries'), t('admin.tasks'), t('admin.sessions'), t('admin.activity_log_tab'), t('admin.live_log'), t('oidc.admin_tab'), t('jellyfin_import.tab')];
+        const tabIds = ['admin-overview', 'admin-users', 'admin-libs', 'admin-tasks', 'admin-sessions', 'admin-activity', 'admin-livelog', 'admin-signin', 'admin-import'];
 
         page.innerHTML = `
         <div class="max-w-6xl mx-auto jf-page">
@@ -2721,25 +2882,28 @@ async function renderAdmin() {
                                 <th class="pb-3 font-semibold">${t('admin.role')}</th>
                                 <th class="pb-3 font-semibold">${escapeHtml(t('admin.disabled_column'))}</th>
                                 <th class="pb-3 font-semibold">${t('admin.last_login')}</th>
+                                <th class="pb-3 font-semibold">${escapeHtml(t('oidc.provider_column'))}</th>
                                 <th class="pb-3 font-semibold text-right">${t('admin.action')}</th>
                             </tr>
                         </thead>
                         <tbody class="divide-y divide-white/5">
                             ${users.map(u => {
-                                const id = u.Id || u.id;
                                 const name = u.Name || u.name;
                                 const isAdmin = u.IsAdministrator ?? u.Policy?.IsAdministrator ?? u.policy?.is_administrator;
+                                const account = accountById.get(oidcAccountKey(u.Id || u.id));
+                                const id = u.Id || u.id;
                                 const isOwner = u.IsOwner === true;
-                                const isSelf = String(id).toLowerCase().replace(/-/g, '') === String(API.userId).toLowerCase().replace(/-/g, '');
+                                const isSelf = oidcAccountKey(id) === oidcAccountKey(API.userId);
                                 const locked = isOwner || isSelf;
                                 const promoteBlocked = !locked && !isAdmin && u.IsDisabled === true;
                                 const disableBlocked = !locked && isAdmin && u.IsDisabled !== true;
                                 return `
                             <tr>
                                 <td class="py-3 font-bold text-white">${escapeHtml(name)}</td>
-                                <td class="py-3"><label class="inline-flex items-center gap-2 text-white/80"><input type="checkbox" data-action="set-user-admin" data-id="${escapeHtml(id)}" data-name="${escapeHtml(name)}" aria-label="${escapeHtml(t('admin.administrator_for', { name }))}" ${isAdmin ? 'checked' : ''} ${locked || promoteBlocked ? 'disabled' : ''} class="w-4 h-4 rounded bg-white/10 border-white/20 text-[#00a4dc]"><span>${escapeHtml(t('admin.role_admin'))}</span></label>${isOwner ? `<span class="ml-1.5 px-2 py-0.5 rounded text-[10px] font-bold bg-[#00a4dc]/20 text-[#38bdf8]">${escapeHtml(t('admin.role_owner'))}</span>` : ''}${locked ? `<p class="text-[10px] text-white/40 mt-1">${escapeHtml(t(isOwner ? 'admin.owner_locked' : 'admin.self_locked'))}</p>` : ''}${promoteBlocked ? `<p class="text-[10px] text-white/40 mt-1">${escapeHtml(t('admin.promote_disabled_locked'))}</p>` : ''}</td>
+                                <td class="py-3"><label class="inline-flex items-center gap-2 text-white/80"><input type="checkbox" data-action="set-user-admin" data-id="${escapeHtml(id)}" data-name="${escapeHtml(name)}" aria-label="${escapeHtml(t('admin.administrator_for', { name }))}" ${isAdmin ? 'checked' : ''} ${locked || promoteBlocked ? 'disabled' : ''} class="w-4 h-4 rounded bg-white/10 border-white/20 text-[#00a4dc]"><span>${escapeHtml(t('admin.role_admin'))}</span></label>${isOwner ? `<span class="ml-1.5 px-2 py-0.5 rounded text-[10px] font-bold bg-[#00a4dc]/20 text-[#38bdf8]">${escapeHtml(t('admin.role_owner'))}</span>` : ''}${account?.AdminFromGroup ? `<span class="ml-1.5 text-[10px] text-white/40">${escapeHtml(t('oidc.from_group'))}</span><p class="text-[10px] text-white/40 mt-1">${escapeHtml(t('admin.group_admin_hint'))}</p>` : ''}${locked ? `<p class="text-[10px] text-white/40 mt-1">${escapeHtml(t(isOwner ? 'admin.owner_locked' : 'admin.self_locked'))}</p>` : ''}${promoteBlocked ? `<p class="text-[10px] text-white/40 mt-1">${escapeHtml(t('admin.promote_disabled_locked'))}</p>` : ''}</td>
                                 <td class="py-3"><input type="checkbox" data-action="set-user-disabled" data-id="${escapeHtml(id)}" data-name="${escapeHtml(name)}" aria-label="${escapeHtml(t('admin.disabled_for', { name }))}" ${u.IsDisabled ? 'checked' : ''} ${locked || disableBlocked ? 'disabled' : ''} class="w-4 h-4 rounded bg-white/10 border-white/20 text-[#00a4dc]">${disableBlocked ? `<p class="text-[10px] text-white/40 mt-1">${escapeHtml(t('admin.disable_admin_locked'))}</p>` : ''}</td>
                                 <td class="py-3 text-white/40">${escapeHtml(u.LastLoginDate || u.last_login_date || '–')}</td>
+                                <td class="py-3 text-white/60">${account?.Linked ? `${escapeHtml(account.ProviderUsername || '—')} <button type="button" class="ml-2 text-[#00a4dc] hover:text-[#38bdf8] font-semibold" data-action="oidc-remove-link" data-id="${escapeHtml(account.UserId)}" data-name="${escapeHtml(name)}">${escapeHtml(t('oidc.remove_link'))}</button>` : '<span class="text-white/40">—</span>'}</td>
                                 <td class="py-3 text-right">
                                     <button class="text-red-400 hover:text-red-300 font-semibold" data-action="delete-user" data-id="${escapeHtml(u.Id || u.id)}">${t('common.delete')}</button>
                                 </td>
@@ -2856,6 +3020,9 @@ async function renderAdmin() {
                 </div>
             </div>
 
+            <!-- Tab 7: Sign-in (OpenID Connect settings, filled by loadOidcAdminTab) -->
+            <div id="admin-signin" class="hidden jf-settings-card"></div>
+
             ${jiPanelHtml()}
         </div>`;
     } catch (e) {
@@ -2869,14 +3036,199 @@ function showAdminTab(btn, tabId) {
     });
     btn.className = 'px-4 py-2 rounded-xl text-xs font-semibold whitespace-nowrap transition bg-[#00a4dc] text-white shadow-lg';
 
-    ['admin-overview', 'admin-users', 'admin-libs', 'admin-tasks', 'admin-sessions', 'admin-activity', 'admin-livelog', 'admin-import'].forEach(id => {
+    ['admin-overview', 'admin-users', 'admin-libs', 'admin-tasks', 'admin-sessions', 'admin-activity', 'admin-livelog', 'admin-signin', 'admin-import'].forEach(id => {
         const el = $(id);
         if (el) el.classList.toggle('hidden', id !== tabId);
     });
 
     if (tabId === 'admin-activity') loadActivityLog();
     if (tabId === 'admin-livelog') initLiveLog();
+    if (tabId === 'admin-signin') loadOidcAdminTab();
     if (tabId === 'admin-import') loadJellyfinImport();
+}
+
+// An administrator changes another user's role or disabled state. The checkbox is disabled while the request runs, the users list cache is dropped, and the users tab is shown again after the page is rendered.
+async function setUserPolicy(el, policy) {
+    if (policy.IsDisabled && !confirm(t('admin.disable_user_confirm', { name: el.dataset.name }))) {
+        el.checked = false;
+        return;
+    }
+    el.disabled = true;
+    try {
+        await API.updatePolicy(el.dataset.id, policy);
+        toast(t('admin.user_updated'));
+    } catch (err) {
+        toast(err.message, 'error');
+    }
+    API.invalidateCache('/Users');
+    await renderAdmin();
+    const tab = document.querySelector('[data-action="admin-tab"][data-tab="admin-users"]');
+    if (tab) showAdminTab(tab, 'admin-users');
+}
+
+// An administrator removes another user's provider link. The users tab is shown again after the page is rendered.
+async function removeOidcLinkAsAdmin(el) {
+    if (!confirm(t('oidc.remove_link_confirm', { name: el.dataset.name }))) return;
+    try {
+        await API.oidcUnlink(el.dataset.id);
+    } catch (err) {
+        toast(err.message, 'error');
+        return;
+    }
+    toast(t('oidc.unlinked'));
+    await renderAdmin();
+    const tab = document.querySelector('[data-action="admin-tab"][data-tab="admin-users"]');
+    if (tab) showAdminTab(tab, 'admin-users');
+}
+
+// --- OpenID Connect settings (admin "Sign-in" tab) ---
+
+async function loadOidcAdminTab() {
+    let settings;
+    try {
+        settings = await API.oidcSettings();
+    } catch {
+        const box = $('admin-signin');
+        if (box) box.innerHTML = `<p class="text-xs text-red-400">${escapeHtml(t('oidc.load_failed'))}</p>`;
+        return;
+    }
+    renderOidcAdminSettings(settings);
+}
+
+// Renders the form from an OidcSettings object. The client secret field is always empty: a saved secret shows only in the placeholder.
+function renderOidcAdminSettings(s) {
+    const box = $('admin-signin');
+    if (!box) return;
+    const label = (id, key) => `<label for="${id}" class="block text-xs font-semibold text-white/70 mb-1.5">${escapeHtml(t(key))}</label>`;
+    const hint = key => `<p class="text-xs text-white/40 mt-1">${escapeHtml(t(key))}</p>`;
+    const warn = key => `<p class="text-xs text-amber-300/80 mt-1">${escapeHtml(t(key))}</p>`;
+    const check = (id, key, checked = false) => `
+            <div class="flex items-center gap-3">
+                <input type="checkbox" id="${id}" class="w-4 h-4 rounded bg-white/10 border-white/20 text-[#00a4dc]"${checked ? ' checked' : ''}>
+                <label for="${id}" class="text-sm text-white/70">${escapeHtml(t(key))}</label>
+            </div>`;
+    const callbackRow = s.CallbackUrl
+        ? `<div class="flex gap-2">
+                <input id="oidc-callback-url" class="jf-input w-full" value="${escapeHtml(s.CallbackUrl)}" readonly>
+                <button type="button" class="jf-btn-ghost !py-2 !px-4 text-xs whitespace-nowrap" data-action="oidc-copy-callback">${escapeHtml(t('oidc.copy'))}</button>
+            </div>`
+        : hint('oidc.callback_after_save');
+
+    box.innerHTML = `
+        <h3 class="font-bold text-white text-base mb-4">${escapeHtml(t('oidc.settings_title'))}</h3>
+        <div class="space-y-4 max-w-2xl">
+            ${check('oidc-enabled', 'oidc.enabled', s.Enabled)}
+            <div>
+                ${label('oidc-issuer-url', 'oidc.issuer_url')}
+                <input id="oidc-issuer-url" type="text" class="jf-input w-full" value="${escapeHtml(s.IssuerUrl)}" spellcheck="false" autocomplete="off">
+            </div>
+            <div>
+                ${label('oidc-client-id', 'oidc.client_id')}
+                <input id="oidc-client-id" type="text" class="jf-input w-full" value="${escapeHtml(s.ClientId)}" spellcheck="false" autocomplete="off">
+            </div>
+            <div>
+                ${label('oidc-client-secret', 'oidc.client_secret')}
+                <input id="oidc-client-secret" type="password" class="jf-input w-full" autocomplete="new-password" placeholder="${escapeHtml(t(s.HasClientSecret ? 'oidc.secret_saved_placeholder' : 'oidc.secret_none_placeholder'))}">
+                ${s.HasClientSecret ? `<div class="mt-2">${check('oidc-remove-secret', 'oidc.remove_secret')}</div>` : ''}
+            </div>
+            <div>
+                ${label('oidc-scopes', 'oidc.scopes')}
+                <input id="oidc-scopes" type="text" class="jf-input w-full" value="${escapeHtml(s.Scopes)}" spellcheck="false" autocomplete="off">
+                ${hint('oidc.scopes_hint')}
+                <div class="mt-3">
+                    ${label('oidc-effective-scopes', 'oidc.effective_scopes')}
+                    <input id="oidc-effective-scopes" type="text" class="jf-input w-full" value="${escapeHtml(s.EffectiveScopes)}" readonly>
+                </div>
+            </div>
+            <div>
+                ${label('oidc-button-label', 'oidc.button_label')}
+                <input id="oidc-button-label" type="text" class="jf-input w-full" value="${escapeHtml(s.ButtonLabel)}" placeholder="${escapeHtml(t('oidc.sign_in_default'))}">
+            </div>
+            <div>
+                ${label('oidc-username-claim', 'oidc.username_claim')}
+                <input id="oidc-username-claim" type="text" class="jf-input w-full" value="${escapeHtml(s.UsernameClaim)}">
+            </div>
+            <div>
+                ${label('oidc-group-claim', 'oidc.group_claim')}
+                <input id="oidc-group-claim" type="text" class="jf-input w-full" value="${escapeHtml(s.GroupClaim)}">
+            </div>
+            <div>
+                ${label('oidc-allowed-group', 'oidc.allowed_group')}
+                <input id="oidc-allowed-group" type="text" class="jf-input w-full" value="${escapeHtml(s.AllowedGroup)}">
+                ${hint('oidc.allowed_group_hint')}
+            </div>
+            <div>
+                ${label('oidc-admin-group', 'oidc.admin_group')}
+                <input id="oidc-admin-group" type="text" class="jf-input w-full" value="${escapeHtml(s.AdminGroup)}">
+                ${hint('oidc.admin_group_hint')}
+                ${warn('oidc.warn_groups')}
+            </div>
+            <div>
+                ${label('oidc-public-url', 'oidc.public_url')}
+                <input id="oidc-public-url" type="text" class="jf-input w-full" value="${escapeHtml(s.PublicUrl || location.origin)}">
+            </div>
+            <div>
+                ${label('oidc-callback-url', 'oidc.callback_url')}
+                ${callbackRow}
+            </div>
+            <div>
+                ${check('oidc-allow-password', 'oidc.allow_password', s.AllowPasswordSignIn)}
+                ${warn('oidc.warn_password_off')}
+            </div>
+            <div id="oidc-settings-error" class="hidden text-red-400 text-xs p-2 rounded bg-red-500/10 border border-red-500/20"></div>
+            <div class="flex justify-end">
+                <button type="button" class="jf-btn-primary text-xs" data-action="oidc-save-settings">${escapeHtml(t('oidc.save'))}</button>
+            </div>
+        </div>`;
+}
+
+// Copies the callback URL. navigator.clipboard is missing on plain-http LAN addresses, so the field is selected for execCommand.
+async function copyOidcCallbackUrl() {
+    const input = $('oidc-callback-url');
+    if (!input) return;
+    let copied = false;
+    if (navigator.clipboard?.writeText) {
+        copied = await navigator.clipboard.writeText(input.value).then(() => true, () => false);
+    }
+    if (!copied) {
+        input.select();
+        copied = document.execCommand('copy');
+    }
+    if (copied) toast(t('oidc.copied'));
+    else toast(t('oidc.copy_failed'), 'error');
+}
+
+// The form stays as typed when the server refuses the save: the error text goes into the card, not over the form.
+async function saveOidcAdminSettings() {
+    const text = id => $(id).value;
+    const body = {
+        Enabled: $('oidc-enabled').checked,
+        IssuerUrl: text('oidc-issuer-url'),
+        ClientId: text('oidc-client-id'),
+        Scopes: text('oidc-scopes'),
+        ButtonLabel: text('oidc-button-label'),
+        UsernameClaim: text('oidc-username-claim'),
+        GroupClaim: text('oidc-group-claim'),
+        AllowedGroup: text('oidc-allowed-group'),
+        AdminGroup: text('oidc-admin-group'),
+        PublicUrl: text('oidc-public-url'),
+        AllowPasswordSignIn: $('oidc-allow-password').checked,
+    };
+    const secret = text('oidc-client-secret');
+    if ($('oidc-remove-secret')?.checked) body.ClientSecret = '';
+    else if (secret) body.ClientSecret = secret;
+
+    hide('oidc-settings-error');
+    let saved;
+    try {
+        saved = await API.saveOidcSettings(body);
+    } catch (err) {
+        $('oidc-settings-error').textContent = err.message;
+        show('oidc-settings-error');
+        return;
+    }
+    toast(t('oidc.settings_saved'));
+    renderOidcAdminSettings(saved);
 }
 
 // --- Jellyfin import (B20) ---
@@ -3339,25 +3691,6 @@ async function loadJellyfinImport() {
     }
     jiLoadPending();
     if (first) await jiPoll();
-}
-
-// An administrator changes another user's role or disabled state. The checkbox is disabled while the request runs, the users list cache is dropped, and the users tab is shown again after the page is rendered.
-async function setUserPolicy(el, policy) {
-    if (policy.IsDisabled && !confirm(t('admin.disable_user_confirm', { name: el.dataset.name }))) {
-        el.checked = false;
-        return;
-    }
-    el.disabled = true;
-    try {
-        await API.updatePolicy(el.dataset.id, policy);
-        toast(t('admin.user_updated'));
-    } catch (err) {
-        toast(err.message, 'error');
-    }
-    API.invalidateCache('/Users');
-    await renderAdmin();
-    const tab = document.querySelector('[data-action="admin-tab"][data-tab="admin-users"]');
-    if (tab) showAdminTab(tab, 'admin-users');
 }
 
 // --- Scheduled Tasks UI ---
@@ -4023,6 +4356,14 @@ function updateAuthUI() {
         hide('sidebar');
     }
 }
+
+// Reacts to lost administrator rights: hides the admin UI, says so, and leaves the Dashboard.
+function followAdminLoss() {
+    updateAuthUI();
+    toast(t('admin.rights_removed'), 'error');
+    if (currentPage === 'admin') navigate('home');
+}
+API.onAdminLost = followAdminLoss;
 
 // --- Live Log Functions ---
 let liveLogInitialized = false;

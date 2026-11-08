@@ -16,4 +16,7 @@ pub struct QuickConnectResult {
     /// Set once authorized – used internally to issue a token.
     #[serde(skip)]
     pub user_id: Option<Uuid>,
+    /// The login-limiter key of the client that started the request (AC47). Never sent.
+    #[serde(skip)]
+    pub client_key: String,
 }

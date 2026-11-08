@@ -4,6 +4,7 @@ pub mod date_backfill;
 pub mod error;
 pub mod log_stream;
 pub mod middleware;
+pub mod oidc;
 pub mod query;
 pub mod routes;
 pub mod state;
