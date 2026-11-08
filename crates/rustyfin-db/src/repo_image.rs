@@ -108,6 +108,54 @@ pub async fn get_image(
     )
 }
 
+/// The image of a person, from `person_images`; the returned `item_id` is the person's id.
+pub async fn get_person_image(
+    pool: &SqlitePool,
+    person_id: Uuid,
+    image_type: &ImageType,
+    image_index: i32,
+) -> Result<Option<ItemImage>, sqlx::Error> {
+    let id_str = person_id.to_string();
+    let type_str = image_type.as_str();
+    let row = sqlx::query_as::<
+        _,
+        (
+            String,
+            String,
+            i32,
+            String,
+            String,
+            Option<i32>,
+            Option<i32>,
+            Option<String>,
+        ),
+    >(
+        "SELECT person_id, image_type, image_index, path, provider, width, height, blurhash
+         FROM person_images WHERE person_id = ? AND image_type = ? AND image_index = ?",
+    )
+    .bind(&id_str)
+    .bind(type_str)
+    .bind(image_index)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(
+        row.and_then(|(pid, img_type, idx, path, provider, w, h, bh)| {
+            let image_type = ImageType::from_str(&img_type)?;
+            Some(ItemImage {
+                item_id: Uuid::parse_str(&pid).ok()?,
+                image_type,
+                image_index: idx,
+                path,
+                provider,
+                width: w,
+                height: h,
+                blurhash: bh,
+            })
+        }),
+    )
+}
+
 pub async fn upsert_image(pool: &SqlitePool, img: &ItemImage) -> Result<(), sqlx::Error> {
     let id_str = img.item_id.to_string();
     let type_str = img.image_type.as_str();

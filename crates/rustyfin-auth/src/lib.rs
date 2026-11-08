@@ -2,7 +2,7 @@ use argon2::password_hash::SaltString;
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use chrono::Utc;
 use rand_core::{OsRng, RngCore};
-use rustyfin_db::{repo_session, repo_token, repo_user};
+use rustyfin_db::{repo_session, repo_setup_code, repo_token, repo_user};
 use rustyfin_model::auth::Claims;
 use rustyfin_model::user::{User, name_key, name_too_long};
 use sha2::{Digest, Sha256};
@@ -150,6 +150,70 @@ pub async fn redeem_reset_pin(pool: &SqlitePool, pin: &str) -> Result<Option<Uui
     Ok(repo_user::redeem_reset_pin(pool, &reset_pin_hash(pin)).await?)
 }
 
+// ── One-time setup codes (B20) ──
+
+/// Crockford's base32 alphabet: the characters of a setup code (no `I`, `L`, `O` or `U`).
+const SETUP_CODE_ALPHABET: &str = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+/// A new one-time code: 12 characters of Crockford's base32 from `OsRng` (60 bits), shown as
+/// `XXXX-XXXX-XXXX`.
+pub fn generate_setup_code() -> String {
+    let mut bytes = [0u8; 12];
+    OsRng.fill_bytes(&mut bytes);
+    let alphabet = SETUP_CODE_ALPHABET.as_bytes();
+    // 32 characters and `b & 31`: each byte maps to one character with no bias.
+    bytes
+        .chunks(4)
+        .map(|group| {
+            group
+                .iter()
+                .map(|b| char::from(alphabet[usize::from(b & 31)]))
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+/// A code's canonical form: dashes and whitespace dropped, uppercased, `I` and `L` read as `1`,
+/// `O` as `0`. `None` unless exactly 12 Crockford characters remain.
+pub fn normalize_setup_code(code: &str) -> Option<String> {
+    // `to_ascii_uppercase`, not `to_uppercase`: a non-ASCII letter must not fold into `I` or `O`.
+    let canonical: String = code
+        .chars()
+        .filter(|c| *c != '-' && !c.is_whitespace())
+        .map(|c| match c.to_ascii_uppercase() {
+            'I' | 'L' => '1',
+            'O' => '0',
+            other => other,
+        })
+        .collect();
+    let valid = canonical.len() == 12 && canonical.chars().all(|c| SETUP_CODE_ALPHABET.contains(c));
+    valid.then_some(canonical)
+}
+
+/// An argon2 hash of the code's canonical form, on the blocking pool. `HashError` for a non-code.
+pub async fn hash_setup_code(code: &str) -> Result<String, AuthError> {
+    let canonical = normalize_setup_code(code).ok_or(AuthError::HashError)?;
+    hash_password(&canonical).await
+}
+
+/// Whether `code` is the code hashed in `hash`, compared in canonical form. `false` for a
+/// non-code.
+pub async fn verify_setup_code(code: &str, hash: &str) -> Result<bool, AuthError> {
+    match normalize_setup_code(code) {
+        Some(canonical) => verify_password(&canonical, hash).await,
+        None => Ok(false),
+    }
+}
+
+/// A password hash no sign-in can match: argon2 of 32 `OsRng` bytes as hex, a secret then dropped.
+pub async fn unusable_password_hash() -> Result<String, AuthError> {
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    let secret: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    hash_password(&secret).await
+}
+
 // ── Opaque, server-side access tokens ──
 
 /// A bearer token: 16 random bytes as 32 lowercase hex characters.
@@ -277,6 +341,100 @@ pub async fn authenticate(
         return Err(AuthError::InvalidCredentials);
     }
 
+    finish_sign_in(pool, &user, device).await
+}
+
+/// The hash a setup-code check verifies against when there is no code hash: argon2 with the same
+/// parameters as code hashes, made once per process by `unusable_password_hash`.
+static DUMMY_CODE_HASH: tokio::sync::OnceCell<String> = tokio::sync::OnceCell::const_new();
+
+/// Makes the dummy hash now, at startup, so the first setup-code check does not pay for it (B20
+/// fix round 2, finding 4). Calling it again changes nothing.
+pub async fn prepare_setup_code_checks() -> Result<(), AuthError> {
+    DUMMY_CODE_HASH
+        .get_or_try_init(unusable_password_hash)
+        .await
+        .map(|_| ())
+}
+
+/// The check of a setup code (B20 fix 5), shared by `authenticate_with_setup_code` and
+/// `setup_code_pending`. Exactly one argon2 verification runs whoever is asked about: against the
+/// user's code hash when the user exists and has one, else against the dummy hash. A malformed code
+/// counts as wrong. So the answer time does not tell an unknown user, a user without a code or a
+/// disabled user from a wrong code. Returns the user and the code hash only when the user exists,
+/// is enabled, has a code and `code` is that code.
+async fn check_setup_code(
+    pool: &SqlitePool,
+    username: &str,
+    code: &str,
+) -> Result<Option<(User, String)>, AuthError> {
+    let user = repo_user::find_user_for_sign_in(pool, username).await?;
+    let (hash, enabled) = match &user {
+        Some(user) => (
+            repo_setup_code::code_hash(pool, user.id).await?,
+            !repo_user::is_disabled(pool, user.id).await?,
+        ),
+        None => (None, false),
+    };
+    let canonical = normalize_setup_code(code);
+    let verified = match (&hash, &canonical) {
+        (Some(hash), Some(canonical)) => verify_password(canonical, hash).await?,
+        _ => {
+            let dummy = DUMMY_CODE_HASH
+                .get_or_try_init(unusable_password_hash)
+                .await?;
+            verify_password(canonical.as_deref().unwrap_or("000000000000"), dummy).await?;
+            false
+        }
+    };
+    Ok(match (user, hash) {
+        (Some(user), Some(hash)) if verified && enabled => Some((user, hash)),
+        _ => None,
+    })
+}
+
+/// Sets the password of a pending user and signs in (B20 3.3, 3.8). `code` must be the user's
+/// current setup code. `new_password` replaces the unusable password, and the code is used up, so
+/// it fails from then on. A wrong code, an unknown user, a user without a code, a disabled user, a
+/// malformed code or a code that another request used first gives `InvalidCredentials`, at the same
+/// cost (B20 fix 5).
+pub async fn authenticate_with_setup_code(
+    pool: &SqlitePool,
+    username: &str,
+    code: &str,
+    new_password: &str,
+    device: &TokenDevice,
+) -> Result<(User, String), AuthError> {
+    let Some((user, hash)) = check_setup_code(pool, username, code).await? else {
+        return Err(AuthError::InvalidCredentials);
+    };
+
+    let password_hash = hash_password(new_password).await?;
+    if !repo_setup_code::redeem(pool, user.id, &hash, &password_hash).await? {
+        return Err(AuthError::InvalidCredentials);
+    }
+    finish_sign_in(pool, &user, device).await
+}
+
+/// Whether `code` is the current setup code of the enabled user `username` (B20 3.2, 3.8). Nothing
+/// is written; an unknown user, a disabled user, a user without a code or a malformed code gives
+/// `false`, at the same cost (B20 fix 5).
+pub async fn setup_code_pending(
+    pool: &SqlitePool,
+    username: &str,
+    code: &str,
+) -> Result<bool, AuthError> {
+    Ok(check_setup_code(pool, username, code).await?.is_some())
+}
+
+/// The steps of a sign-in after its checks: the last login is recorded, the user is re-read so the
+/// returned LastLoginDate is the new one (M-16), the device's previous token is replaced, and a new
+/// token is issued.
+async fn finish_sign_in(
+    pool: &SqlitePool,
+    user: &User,
+    device: &TokenDevice,
+) -> Result<(User, String), AuthError> {
     repo_user::update_last_login(pool, user.id).await?;
     let user = repo_user::get_user_by_id(pool, user.id)
         .await?
@@ -375,5 +533,103 @@ mod tests {
         let pin = "123456";
         let hash = hash_pin(pin).unwrap();
         assert!(!verify_pin("654321", &hash).unwrap());
+    }
+
+    // ── B20: one-time setup codes ──
+
+    const CROCKFORD: &str = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+    #[test]
+    fn b20_setup_codes_have_the_crockford_shape() {
+        for _ in 0..200 {
+            let code = generate_setup_code();
+            let groups: Vec<&str> = code.split('-').collect();
+            assert_eq!(groups.len(), 3, "{code}");
+            for group in groups {
+                assert_eq!(group.len(), 4, "{code}");
+                assert!(group.chars().all(|c| CROCKFORD.contains(c)), "{code}");
+            }
+        }
+    }
+
+    #[test]
+    fn b20_setup_codes_differ_and_use_the_whole_alphabet() {
+        let codes: std::collections::HashSet<String> =
+            (0..1000).map(|_| generate_setup_code()).collect();
+        assert_eq!(codes.len(), 1000, "repeated codes");
+        let seen: std::collections::HashSet<char> = codes.iter().flat_map(|c| c.chars()).collect();
+        for c in CROCKFORD.chars() {
+            assert!(seen.contains(&c), "{c} never appears in 1000 codes");
+        }
+    }
+
+    #[test]
+    fn b20_normalize_setup_codes() {
+        let canonical = Some("ABCDEFGHJKMN".to_string());
+        assert_eq!(normalize_setup_code("ABCD-EFGH-JKMN"), canonical);
+        assert_eq!(normalize_setup_code(" abcd efgh-jkmn "), canonical);
+        assert_eq!(normalize_setup_code("ABCDEFGHJKMN"), canonical);
+        assert_eq!(
+            normalize_setup_code("IL0O-ilo0-1234"),
+            Some("110011001234".to_string())
+        );
+        for bad in [
+            "",
+            "ABCD-EFGH-JKM",
+            "ABCD-EFGH-JKMNP",
+            "ABCD-EFGH-JKMU",
+            "ABCD_EFGH_JKMN",
+        ] {
+            assert_eq!(normalize_setup_code(bad), None, "{bad:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn b20_setup_code_hashes_verify_in_canonical_form() {
+        let code = generate_setup_code();
+        let hash = hash_setup_code(&code).await.unwrap();
+        assert!(hash.starts_with("$argon2"), "{hash}");
+        assert!(!hash.contains(&code) && !hash.contains(&code.replace('-', "")));
+        assert!(verify_setup_code(&code, &hash).await.unwrap());
+        let loose = code.to_lowercase().replace('-', " ");
+        assert!(verify_setup_code(&loose, &hash).await.unwrap(), "{loose}");
+        let mut other = generate_setup_code();
+        while other == code {
+            other = generate_setup_code();
+        }
+        assert!(!verify_setup_code(&other, &hash).await.unwrap());
+        assert!(!verify_setup_code("not a code", &hash).await.unwrap());
+        assert!(matches!(
+            hash_setup_code("not a code").await,
+            Err(AuthError::HashError)
+        ));
+    }
+
+    #[tokio::test]
+    async fn b20_unusable_password_hash_matches_nothing() {
+        let first = unusable_password_hash().await.unwrap();
+        let second = unusable_password_hash().await.unwrap();
+        assert!(first.starts_with("$argon2"), "{first}");
+        assert_ne!(first, second);
+        for guess in ["", "admin", "password"] {
+            assert!(!verify_password(guess, &first).await.unwrap(), "{guess:?}");
+        }
+    }
+
+    // Fix round 2, 4: the server makes the dummy hash at startup, so the first setup-code check that
+    // needs it runs one verification, like every later one.
+    #[tokio::test]
+    async fn b20_setup_code_checks_are_prepared_before_the_first_sign_in() {
+        prepare_setup_code_checks().await.unwrap();
+        let hash = DUMMY_CODE_HASH
+            .get()
+            .expect("no dummy hash after preparing");
+        assert!(hash.starts_with("$argon2"), "{hash}");
+        prepare_setup_code_checks().await.unwrap();
+        assert_eq!(
+            DUMMY_CODE_HASH.get(),
+            Some(hash),
+            "preparing again made a new hash"
+        );
     }
 }

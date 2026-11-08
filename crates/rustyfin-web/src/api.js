@@ -168,9 +168,18 @@ const API = {
         });
         if (!res.ok) {
             const err = await res.json().catch(() => ({}));
-            throw new Error(err.Message || err.message || t('login.failed'));
+            const error = new Error(err.Message || err.message || t('login.failed'));
+            error.status = res.status;
+            error.setupRequired = res.status === 401 && res.headers.get('X-Rustyfin-Setup-Required') === 'true';
+            throw error;
         }
         const data = await res.json();
+        this._saveSession(data, username);
+        return data;
+    },
+
+    // Keeps a successful sign-in in memory and localStorage.
+    _saveSession(data, username) {
         this.token = data.AccessToken || data.access_token;
         const userObj = data.User || data.user || {};
         this.userId = userObj.Id || userObj.id || '';
@@ -187,6 +196,21 @@ const API = {
         localStorage.setItem('rustyfin_user_id', this.userId);
         localStorage.setItem('rustyfin_user_name', this.userName);
         localStorage.setItem('rustyfin_is_admin', this.isAdmin.toString());
+    },
+
+    // Signs in an imported user with the one-time code and the password chosen now.
+    async loginWithSetupCode(username, code, newPw) {
+        const res = await fetch(this.base + '/Users/AuthenticateWithSetupCode', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Emby-Authorization': this.authHeader()
+            },
+            body: JSON.stringify({ Username: username, Code: code, NewPw: newPw })
+        });
+        if (!res.ok) throw await this._requestError('POST', '/Users/AuthenticateWithSetupCode', res);
+        const data = await res.json();
+        this._saveSession(data, username);
         return data;
     },
 
@@ -414,7 +438,14 @@ const API = {
 
     // Live Log
     getLogLevel() { return this.get('/System/LogLevel'); },
-    setLogLevel(level) { return this.post('/System/LogLevel', { LogLevel: level }); }
+    setLogLevel(level) { return this.post('/System/LogLevel', { LogLevel: level }); },
+
+    // Jellyfin import (B20)
+    jellyfinImportPreview(req) { return this.post('/JellyfinImport/Preview', req); },
+    jellyfinImportRun(req) { return this.post('/JellyfinImport/Run', req); },
+    jellyfinImportStatus() { return this.get('/JellyfinImport/Status'); },
+    jellyfinImportPendingUsers() { return this.get('/JellyfinImport/PendingUsers'); },
+    jellyfinImportNewCode(userId) { return this.post('/JellyfinImport/Users/' + encodeURIComponent(userId) + '/SetupCode'); }
 };
 
 if (typeof window !== 'undefined') {

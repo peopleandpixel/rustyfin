@@ -1,38 +1,106 @@
 use axum::extract::State;
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, HeaderValue};
+use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
-use rustyfin_model::auth::{AuthResponse, AuthSessionInfo, LoginRequest};
-use rustyfin_model::user::UserDto;
+use rustyfin_model::auth::{AuthResponse, AuthSessionInfo, LoginRequest, SetupCodeLoginRequest};
+use rustyfin_model::user::{User, UserDto};
 use uuid::Uuid;
 
 use crate::error::ApiError;
 use crate::state::AppState;
 
 pub fn routes() -> Router<AppState> {
-    Router::new().route("/Users/AuthenticateByName", post(login))
+    Router::new()
+        .route("/Users/AuthenticateByName", post(login))
+        .route(
+            "/Users/AuthenticateWithSetupCode",
+            post(login_with_setup_code),
+        )
 }
+
+/// Set on a failed sign-in whose password is a pending user's one-time code (B20 3.2).
+const SETUP_REQUIRED_HEADER: &str = "x-rustyfin-setup-required";
 
 async fn login(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(req): Json<LoginRequest>,
-) -> Result<Json<AuthResponse>, ApiError> {
-    let (client, version, device, device_id) = parse_emby_auth(&headers);
-    let token_device = rustyfin_auth::TokenDevice {
-        device_id: device_id.clone(),
-        device_name: device.clone(),
-        app_name: client.clone(),
-        app_version: version.clone(),
-    };
-    let (user, token) =
-        rustyfin_auth::authenticate(&state.db, &req.username, &req.password, &token_device).await?;
+) -> Result<Response, ApiError> {
+    let device = token_device(&headers);
+    match rustyfin_auth::authenticate(&state.db, &req.username, &req.password, &device).await {
+        Ok((user, token)) => {
+            let answer = start_session(&state, &device, user, token).await;
+            Ok(Json(answer).into_response())
+        }
+        Err(rustyfin_auth::AuthError::InvalidCredentials) => {
+            // The password may be a pending user's one-time code: the header says so (B20 3.2).
+            if !rustyfin_auth::setup_code_pending(&state.db, &req.username, &req.password).await? {
+                return Err(ApiError::Unauthorized);
+            }
+            let mut response = ApiError::Unauthorized.into_response();
+            response
+                .headers_mut()
+                .insert(SETUP_REQUIRED_HEADER, HeaderValue::from_static("true"));
+            Ok(response)
+        }
+        Err(e) => Err(ApiError::from(e)),
+    }
+}
 
+/// `POST /Users/AuthenticateWithSetupCode` (B20 3.3): a pending user's code sets the new password
+/// and signs in. It is routed with the login endpoints, so the login rate limit covers it.
+async fn login_with_setup_code(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<SetupCodeLoginRequest>,
+) -> Result<Json<AuthResponse>, ApiError> {
+    if req.new_pw.is_empty() {
+        return Err(ApiError::BadRequest("NewPw is required.".to_string()));
+    }
+    let device = token_device(&headers);
+    let (user, token) = rustyfin_auth::authenticate_with_setup_code(
+        &state.db,
+        &req.username,
+        &req.code,
+        &req.new_pw,
+        &device,
+    )
+    .await?;
+    Ok(Json(start_session(&state, &device, user, token).await))
+}
+
+/// The token device of a sign-in request, from its Emby authorization headers.
+fn token_device(headers: &HeaderMap) -> rustyfin_auth::TokenDevice {
+    let (client, version, device, device_id) = parse_emby_auth(headers);
+    rustyfin_auth::TokenDevice {
+        device_id,
+        device_name: device,
+        app_name: client,
+        app_version: version,
+    }
+}
+
+/// Records the session of a new sign-in and builds its answer. Both sign-in routes end here.
+async fn start_session(
+    state: &AppState,
+    device: &rustyfin_auth::TokenDevice,
+    user: User,
+    token: String,
+) -> AuthResponse {
     let session_id = Uuid::new_v4();
 
     // Create session in database with empty capabilities (will be updated by client)
     rustyfin_db::repo_session::create_session(
-        &state.db, session_id, user.id, &user.name, &client, &device, &device_id, &version, "{}",
+        &state.db,
+        session_id,
+        user.id,
+        &user.name,
+        &device.app_name,
+        &device.device_name,
+        &device.device_id,
+        &device.app_version,
+        "{}",
     )
     .await
     .ok();
@@ -41,10 +109,10 @@ async fn login(
         id: session_id.to_string(),
         user_id: user.id,
         user_name: user.name.clone(),
-        client,
-        device_name: device,
-        device_id,
-        application_version: version,
+        client: device.app_name.clone(),
+        device_name: device.device_name.clone(),
+        device_id: device.device_id.clone(),
+        application_version: device.app_version.clone(),
         is_active: true,
         server_id: state.server_id.to_string(),
         supports_media_control: false,
@@ -65,12 +133,12 @@ async fn login(
             Default::default()
         });
 
-    Ok(Json(AuthResponse {
+    AuthResponse {
         user: UserDto::new(user, flags),
         session_info,
         access_token: token,
         server_id: state.server_id.to_string(),
-    }))
+    }
 }
 
 /// Parst den `X-Emby-Authorization`/`Authorization` Header.

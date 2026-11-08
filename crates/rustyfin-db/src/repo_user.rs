@@ -299,17 +299,29 @@ pub async fn delete_user(pool: &SqlitePool, id: Uuid) -> Result<bool, sqlx::Erro
     Ok(result.rows_affected() > 0)
 }
 
+/// Sets a user's password hash and returns whether the user exists. A password write also ends the
+/// user's one-time setup code, in the same transaction (B20 3.6).
 pub async fn update_password(
     pool: &SqlitePool,
     id: Uuid,
     password_hash: &str,
 ) -> Result<bool, sqlx::Error> {
+    let id = id.to_string();
+    let mut tx = pool.begin().await?;
     let result = sqlx::query("UPDATE users SET password_hash = ? WHERE id = ?")
         .bind(password_hash)
-        .bind(id.to_string())
-        .execute(pool)
+        .bind(&id)
+        .execute(&mut *tx)
         .await?;
-    Ok(result.rows_affected() > 0)
+    let updated = result.rows_affected() > 0;
+    if updated {
+        sqlx::query("DELETE FROM user_setup_codes WHERE user_id = ?")
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(updated)
 }
 
 /// Sets the administrator flag by hand.

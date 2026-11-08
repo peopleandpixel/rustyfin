@@ -1,7 +1,9 @@
 use axum::extract::{Path, State};
 use axum::routing::{delete, post, put};
 use axum::{Extension, Json, Router};
+use rustyfin_db::repo_playback::StreamChoice;
 use rustyfin_model::auth::Claims;
+use rustyfin_model::media_source::MediaSourceResponse;
 use rustyfin_model::playback::{
     LastActivityDateRequest, PinEpisodeRequest, PlaybackProgressInfo, PlaybackStartInfo,
     PlaybackStopInfo, SetRatingRequest, UserItemDataDto,
@@ -37,6 +39,64 @@ pub fn routes() -> Router<AppState> {
         .route("/Users/{userId}/Items/{itemId}/Rating", put(set_rating))
 }
 
+/// The remembered tracks a playback report names. Each index is stored with the key of the stream
+/// of its kind at that index: in the source `media_source_id` names, else in the first source listed
+/// that has one. A negative index names no stream and gets no key, so the sources are loaded only
+/// for an index of 0 or more.
+async fn reported_choices(
+    state: &AppState,
+    item_id: Uuid,
+    media_source_id: Option<&str>,
+    audio: Option<i32>,
+    subtitle: Option<i32>,
+) -> Result<(Option<StreamChoice>, Option<StreamChoice>), ApiError> {
+    let named = media_source_id.and_then(|id| Uuid::parse_str(id).ok());
+    let needs_streams =
+        audio.is_some_and(|index| index >= 0) || subtitle.is_some_and(|index| index >= 0);
+    let sources = if needs_streams {
+        rustyfin_db::repo_media_source::get_media_sources(&state.db, &item_id).await?
+    } else {
+        Vec::new()
+    };
+    let choose = |kind: &str, index: Option<i32>| {
+        index.map(|index| StreamChoice {
+            index,
+            key: if index < 0 {
+                None
+            } else {
+                stream_key(&sources, named, kind, index)
+            },
+        })
+    };
+    Ok((choose("Audio", audio), choose("Subtitle", subtitle)))
+}
+
+/// The key of the stream of `kind` ("Audio" or "Subtitle") at `index`: looked up in the source
+/// `named` is, when it is one of `sources`, else in the first source that has such a stream.
+fn stream_key(
+    sources: &[MediaSourceResponse],
+    named: Option<Uuid>,
+    kind: &str,
+    index: i32,
+) -> Option<String> {
+    let key_at = |source: &MediaSourceResponse| {
+        source
+            .media_streams
+            .iter()
+            .find(|stream| stream.index == index && stream.codec_type.eq_ignore_ascii_case(kind))
+            .map(|stream| stream.identity().key())
+    };
+    let named_source = named.and_then(|id| {
+        sources
+            .iter()
+            .find(|source| Uuid::parse_str(&source.id).ok() == Some(id))
+    });
+    match named_source {
+        Some(source) => key_at(source),
+        None => sources.iter().find_map(key_at),
+    }
+}
+
 async fn playing(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
@@ -56,6 +116,23 @@ async fn playing(
         claims.sub,
         req.item_id,
         position,
+    )
+    .await?;
+
+    let (audio, subtitle) = reported_choices(
+        &state,
+        req.item_id,
+        req.media_source_id.as_deref(),
+        req.audio_stream_index,
+        req.subtitle_stream_index,
+    )
+    .await?;
+    rustyfin_db::repo_playback::save_stream_choice(
+        &state.db,
+        claims.sub,
+        req.item_id,
+        audio.as_ref(),
+        subtitle.as_ref(),
     )
     .await?;
 
@@ -100,6 +177,23 @@ async fn playing_progress(
         .await?;
     }
 
+    let (audio, subtitle) = reported_choices(
+        &state,
+        req.item_id,
+        req.media_source_id.as_deref(),
+        req.audio_stream_index,
+        req.subtitle_stream_index,
+    )
+    .await?;
+    rustyfin_db::repo_playback::save_stream_choice(
+        &state.db,
+        claims.sub,
+        req.item_id,
+        audio.as_ref(),
+        subtitle.as_ref(),
+    )
+    .await?;
+
     // Broadcast SessionChanged event with updated playback position
     broadcast_event(
         &state,
@@ -138,6 +232,23 @@ async fn playing_stopped(
         claims.sub,
         req.item_id,
         req.position_ticks,
+    )
+    .await?;
+
+    let (audio, subtitle) = reported_choices(
+        &state,
+        req.item_id,
+        req.media_source_id.as_deref(),
+        req.audio_stream_index,
+        req.subtitle_stream_index,
+    )
+    .await?;
+    rustyfin_db::repo_playback::save_stream_choice(
+        &state.db,
+        claims.sub,
+        req.item_id,
+        audio.as_ref(),
+        subtitle.as_ref(),
     )
     .await?;
 

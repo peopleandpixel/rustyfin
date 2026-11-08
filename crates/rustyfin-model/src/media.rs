@@ -18,6 +18,9 @@ pub struct PersonInfo {
     /// Type of person, e.g. "Actor", "Director"
     #[serde(rename = "Type", skip_serializing_if = "Option::is_none")]
     pub person_type: Option<String>,
+    /// Tag of the person's primary image (e.g. "Primary_0"), when it has one
+    #[serde(rename = "PrimaryImageTag", skip_serializing_if = "Option::is_none")]
+    pub primary_image_tag: Option<String>,
 }
 
 /// Studio entry on a media item.

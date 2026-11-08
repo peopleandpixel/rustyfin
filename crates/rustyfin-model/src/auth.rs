@@ -9,6 +9,16 @@ pub struct LoginRequest {
     pub password: String,
 }
 
+/// `POST /Users/AuthenticateWithSetupCode` (B20 3.3): a pending user's one-time code and the new
+/// password that replaces it. No `Debug`, so neither can reach a log.
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct SetupCodeLoginRequest {
+    pub username: String,
+    pub code: String,
+    pub new_pw: String,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct AuthResponse {

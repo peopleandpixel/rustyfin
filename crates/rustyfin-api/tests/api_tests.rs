@@ -89,6 +89,7 @@ async fn test_state() -> AppState {
             reqwest::Client::new(),
             Default::default(),
         ),
+        jellyfin_import: Default::default(),
     }
 }
 
@@ -17438,4 +17439,4088 @@ async fn b28_backfilled_dates_show_at_once_in_details_lists_and_latest() {
         chrono::DateTime::from_timestamp(1_000_000_100, 0).unwrap(),
         "{photo_uri} after the run"
     );
+}
+
+// ── B20: Jellyfin import ──
+// Remembered tracks: the playback reports store the reported audio and subtitle stream indexes
+// per user and item, and the video PlaybackInfo offers them as each media source's
+// DefaultAudioStreamIndex and DefaultSubtitleStreamIndex while that stream exists.
+
+/// Video 0, audio 1 (eng) and 2 (ger), subtitles 3 (eng) and 4 (ger).
+fn b20_full_streams() -> serde_json::Value {
+    serde_json::json!([
+        { "Index": 0, "Codec": "h264", "CodecType": "Video" },
+        { "Index": 1, "Codec": "aac", "CodecType": "Audio", "Language": "eng" },
+        { "Index": 2, "Codec": "ac3", "CodecType": "Audio", "Language": "ger" },
+        { "Index": 3, "Codec": "subrip", "CodecType": "Subtitle", "Language": "eng" },
+        { "Index": 4, "Codec": "subrip", "CodecType": "Subtitle", "Language": "ger" },
+    ])
+}
+
+/// Stores a Matroska source with `streams` for `item` at `file` and returns its id.
+async fn b20_insert_source(
+    state: &AppState,
+    item: uuid::Uuid,
+    file: &std::path::Path,
+    streams: serde_json::Value,
+) -> uuid::Uuid {
+    let source: rustyfin_model::media_source::MediaSourceResponse =
+        serde_json::from_value(serde_json::json!({
+            "Id": uuid::Uuid::new_v4().to_string(),
+            "Uid": uuid::Uuid::new_v4().to_string(),
+            "Container": "mkv",
+            "Protocol": "File",
+            "Path": file.to_str().unwrap(),
+            "MediaStreams": streams,
+        }))
+        .unwrap();
+    rustyfin_db::repo_media_source::insert_media_source_with_streams(&state.db, &item, &source)
+        .await
+        .unwrap()
+}
+
+/// A movie in folder `name` with one source carrying `streams`; returns its id.
+async fn b20_movie(state: &AppState, name: &str, streams: serde_json::Value) -> uuid::Uuid {
+    let folder = media_folder(state, name);
+    let file = std::path::Path::new(&folder).join(format!("{name}.mkv"));
+    std::fs::write(&file, b"b20").unwrap();
+    let item = g4_insert_item(state, "Movie", &file).await;
+    b20_insert_source(state, item, &file, streams).await;
+    item
+}
+
+/// Sends a playback report to `/Sessions/Playing{route}` and expects success.
+async fn b20_report(app: &axum::Router, token: &str, route: &str, body: serde_json::Value) {
+    let uri = format!("/Sessions/Playing{route}");
+    let (status, _) = send_authed(app, "POST", &uri, token, Some(&body.to_string())).await;
+    assert!(status.is_success(), "{uri}: {status}");
+}
+
+type B20Defaults = (Option<serde_json::Value>, Option<serde_json::Value>);
+
+/// Each media source's stream count with its `DefaultAudioStreamIndex` and
+/// `DefaultSubtitleStreamIndex` from the video PlaybackInfo, `None` where the field is absent.
+async fn b20_track_defaults(
+    app: &axum::Router,
+    token: &str,
+    item: uuid::Uuid,
+) -> Vec<(usize, B20Defaults)> {
+    let uri = format!("/Videos/{item}/PlaybackInfo");
+    let (status, body) = send_authed(app, "GET", &uri, token, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body["MediaSources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|source| {
+            let streams = source["MediaStreams"].as_array().unwrap().len();
+            let audio = source.get("DefaultAudioStreamIndex").cloned();
+            let subtitle = source.get("DefaultSubtitleStreamIndex").cloned();
+            (streams, (audio, subtitle))
+        })
+        .collect()
+}
+
+/// The defaults of the item's only media source.
+async fn b20_only_defaults(app: &axum::Router, token: &str, item: uuid::Uuid) -> B20Defaults {
+    let sources = b20_track_defaults(app, token, item).await;
+    assert_eq!(sources.len(), 1, "{sources:?}");
+    sources[0].1.clone()
+}
+
+/// `(Some(audio), Some(subtitle))` as JSON numbers.
+fn b20_both(audio: i64, subtitle: i64) -> B20Defaults {
+    (
+        Some(serde_json::json!(audio)),
+        Some(serde_json::json!(subtitle)),
+    )
+}
+
+/// The stored `(audio_stream_index, subtitle_stream_index)` of `user` for `item`.
+async fn b20_stored_tracks(
+    state: &AppState,
+    user: &str,
+    item: uuid::Uuid,
+) -> (Option<i64>, Option<i64>) {
+    sqlx::query_as(
+        "SELECT audio_stream_index, subtitle_stream_index FROM user_item_data
+         WHERE user_id = ? AND item_id = ?",
+    )
+    .bind(user)
+    .bind(item.to_string())
+    .fetch_one(&state.db)
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn b20_playback_info_defaults_from_progress_report() {
+    let state = test_state().await;
+    let _dir = G1cDataDir(state.data_dir.to_path_buf());
+    let app = app(state.clone());
+    let (token, user) = admin_session(&state).await;
+    let item = b20_movie(&state, "B20 Progress", b20_full_streams()).await;
+
+    let body = serde_json::json!({
+        "ItemId": item, "PositionTicks": 0, "AudioStreamIndex": 2, "SubtitleStreamIndex": 4,
+    });
+    b20_report(&app, &token, "/Progress", body).await;
+
+    let stored = b20_stored_tracks(&state, &user.to_string(), item).await;
+    assert_eq!(stored, (Some(2), Some(4)));
+    assert_eq!(b20_only_defaults(&app, &token, item).await, b20_both(2, 4));
+}
+
+#[tokio::test]
+async fn b20_playback_info_without_choice_omits_defaults() {
+    let state = test_state().await;
+    let _dir = G1cDataDir(state.data_dir.to_path_buf());
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let item = b20_movie(&state, "B20 Nothing", b20_full_streams()).await;
+    assert_eq!(b20_only_defaults(&app, &token, item).await, (None, None));
+
+    // A report without track indexes remembers none
+    let body = serde_json::json!({ "ItemId": item, "PositionTicks": 50 });
+    b20_report(&app, &token, "/Progress", body).await;
+    assert_eq!(b20_only_defaults(&app, &token, item).await, (None, None));
+}
+
+#[tokio::test]
+async fn b20_start_and_stop_reports_save_tracks() {
+    let state = test_state().await;
+    let _dir = G1cDataDir(state.data_dir.to_path_buf());
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let item = b20_movie(&state, "B20 Start Stop", b20_full_streams()).await;
+
+    let body = serde_json::json!({
+        "ItemId": item, "PositionTicks": 0, "AudioStreamIndex": 1, "SubtitleStreamIndex": 3,
+    });
+    b20_report(&app, &token, "", body).await;
+    assert_eq!(b20_only_defaults(&app, &token, item).await, b20_both(1, 3));
+
+    let body = serde_json::json!({
+        "ItemId": item, "PositionTicks": 10_000_000, "AudioStreamIndex": 2,
+        "SubtitleStreamIndex": 4,
+    });
+    b20_report(&app, &token, "/Stopped", body).await;
+    assert_eq!(b20_only_defaults(&app, &token, item).await, b20_both(2, 4));
+}
+
+#[tokio::test]
+async fn b20_report_without_tracks_keeps_choice() {
+    let state = test_state().await;
+    let _dir = G1cDataDir(state.data_dir.to_path_buf());
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let item = b20_movie(&state, "B20 Keep", b20_full_streams()).await;
+    let body = serde_json::json!({
+        "ItemId": item, "PositionTicks": 0, "AudioStreamIndex": 2, "SubtitleStreamIndex": 4,
+    });
+    b20_report(&app, &token, "/Progress", body).await;
+
+    // Absent and null indexes leave the stored ones alone
+    let body = serde_json::json!({ "ItemId": item, "PositionTicks": 100 });
+    b20_report(&app, &token, "/Progress", body).await;
+    assert_eq!(b20_only_defaults(&app, &token, item).await, b20_both(2, 4));
+    let body = serde_json::json!({
+        "ItemId": item, "PositionTicks": 200, "AudioStreamIndex": null,
+        "SubtitleStreamIndex": null,
+    });
+    b20_report(&app, &token, "/Progress", body).await;
+    assert_eq!(b20_only_defaults(&app, &token, item).await, b20_both(2, 4));
+
+    // One index changes only that one
+    let body = serde_json::json!({ "ItemId": item, "PositionTicks": 300, "AudioStreamIndex": 1 });
+    b20_report(&app, &token, "/Progress", body).await;
+    assert_eq!(b20_only_defaults(&app, &token, item).await, b20_both(1, 4));
+
+    let body = serde_json::json!({ "ItemId": item, "PositionTicks": 400 });
+    b20_report(&app, &token, "/Stopped", body).await;
+    assert_eq!(b20_only_defaults(&app, &token, item).await, b20_both(1, 4));
+}
+
+#[tokio::test]
+async fn b20_subtitle_off_is_remembered() {
+    let state = test_state().await;
+    let _dir = G1cDataDir(state.data_dir.to_path_buf());
+    let app = app(state.clone());
+    let (token, user) = admin_session(&state).await;
+    let item = b20_movie(&state, "B20 Off", b20_full_streams()).await;
+
+    let body = serde_json::json!({
+        "ItemId": item, "PositionTicks": 0, "AudioStreamIndex": 1, "SubtitleStreamIndex": -1,
+    });
+    b20_report(&app, &token, "/Progress", body).await;
+    let stored = b20_stored_tracks(&state, &user.to_string(), item).await;
+    assert_eq!(stored, (Some(1), Some(-1)));
+    assert_eq!(b20_only_defaults(&app, &token, item).await, b20_both(1, -1));
+
+    // "Off" needs no subtitle stream to exist
+    let streams = serde_json::json!([
+        { "Index": 0, "Codec": "h264", "CodecType": "Video" },
+        { "Index": 1, "Codec": "aac", "CodecType": "Audio" },
+    ]);
+    let bare = b20_movie(&state, "B20 Off Bare", streams).await;
+    let body = serde_json::json!({ "ItemId": bare, "PositionTicks": 0, "SubtitleStreamIndex": -1 });
+    b20_report(&app, &token, "/Progress", body).await;
+    let defaults = b20_only_defaults(&app, &token, bare).await;
+    assert_eq!(defaults, (None, Some(serde_json::json!(-1))));
+}
+
+#[tokio::test]
+async fn b20_stale_track_index_is_ignored() {
+    let state = test_state().await;
+    let _dir = G1cDataDir(state.data_dir.to_path_buf());
+    let app = app(state.clone());
+    let (token, user) = admin_session(&state).await;
+    let item = b20_movie(&state, "B20 Stale", b20_full_streams()).await;
+
+    // Indexes the file doesn't have are stored but not offered
+    let body = serde_json::json!({
+        "ItemId": item, "PositionTicks": 0, "AudioStreamIndex": 7, "SubtitleStreamIndex": 9,
+    });
+    b20_report(&app, &token, "/Progress", body).await;
+    let stored = b20_stored_tracks(&state, &user.to_string(), item).await;
+    assert_eq!(stored, (Some(7), Some(9)));
+    assert_eq!(b20_only_defaults(&app, &token, item).await, (None, None));
+
+    // An index naming a stream of the other kind is not offered either
+    let body = serde_json::json!({
+        "ItemId": item, "PositionTicks": 0, "AudioStreamIndex": 3, "SubtitleStreamIndex": 1,
+    });
+    b20_report(&app, &token, "/Progress", body).await;
+    assert_eq!(b20_only_defaults(&app, &token, item).await, (None, None));
+
+    // Audio -1 names no stream
+    let body = serde_json::json!({
+        "ItemId": item, "PositionTicks": 0, "AudioStreamIndex": -1, "SubtitleStreamIndex": 4,
+    });
+    b20_report(&app, &token, "/Progress", body).await;
+    let defaults = b20_only_defaults(&app, &token, item).await;
+    assert_eq!(defaults, (None, Some(serde_json::json!(4))));
+}
+
+#[tokio::test]
+async fn b20_track_choice_is_per_user() {
+    let state = test_state().await;
+    let _dir = G1cDataDir(state.data_dir.to_path_buf());
+    let app = app(state.clone());
+    let (owner, _, viewer, _) = g1_owner_and_viewer(&state, &app).await;
+    let item = b20_movie(&state, "B20 Users", b20_full_streams()).await;
+
+    let body = serde_json::json!({
+        "ItemId": item, "PositionTicks": 0, "AudioStreamIndex": 2, "SubtitleStreamIndex": 4,
+    });
+    b20_report(&app, &owner, "/Progress", body).await;
+    assert_eq!(b20_only_defaults(&app, &viewer, item).await, (None, None));
+
+    let body = serde_json::json!({
+        "ItemId": item, "PositionTicks": 0, "AudioStreamIndex": 1, "SubtitleStreamIndex": 3,
+    });
+    b20_report(&app, &viewer, "/Progress", body).await;
+    assert_eq!(b20_only_defaults(&app, &owner, item).await, b20_both(2, 4));
+    assert_eq!(b20_only_defaults(&app, &viewer, item).await, b20_both(1, 3));
+}
+
+#[tokio::test]
+async fn b20_track_defaults_per_media_source() {
+    let state = test_state().await;
+    let _dir = G1cDataDir(state.data_dir.to_path_buf());
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let item = b20_movie(&state, "B20 Versions", b20_full_streams()).await;
+    let folder = media_folder(&state, "B20 Versions");
+    let file = std::path::Path::new(&folder).join("B20 Versions - 720p.mkv");
+    std::fs::write(&file, b"b20").unwrap();
+    let streams = serde_json::json!([
+        { "Index": 0, "Codec": "h264", "CodecType": "Video" },
+        { "Index": 1, "Codec": "aac", "CodecType": "Audio", "Language": "eng" },
+    ]);
+    b20_insert_source(&state, item, &file, streams).await;
+
+    let body = serde_json::json!({
+        "ItemId": item, "PositionTicks": 0, "AudioStreamIndex": 1, "SubtitleStreamIndex": 3,
+    });
+    b20_report(&app, &token, "/Progress", body).await;
+
+    // Each version offers what it has: the second has no subtitle 3
+    let mut sources = b20_track_defaults(&app, &token, item).await;
+    sources.sort_by_key(|(streams, _)| *streams);
+    let expected = vec![(2, (Some(serde_json::json!(1)), None)), (5, b20_both(1, 3))];
+    assert_eq!(sources, expected);
+}
+
+/// `b20_full_streams` with `edit` applied to the streams at index 2 (ger audio) and 4 (ger
+/// subtitle).
+fn b20_streams_with(edit: impl Fn(&mut serde_json::Value)) -> serde_json::Value {
+    let mut streams = b20_full_streams();
+    for index in [2, 4] {
+        edit(&mut streams[index]);
+    }
+    streams
+}
+
+/// The defaults of `name`, a movie with `before`, after choosing audio 2 and subtitle 4 and a
+/// rescan that finds `after` in the same file.
+async fn b20_defaults_after_rescan(
+    state: &AppState,
+    app: &axum::Router,
+    token: &str,
+    name: &str,
+    before: serde_json::Value,
+    after: serde_json::Value,
+) -> B20Defaults {
+    let item = b20_movie(state, name, before).await;
+    let body = serde_json::json!({
+        "ItemId": item, "PositionTicks": 0, "AudioStreamIndex": 2, "SubtitleStreamIndex": 4,
+    });
+    b20_report(app, token, "/Progress", body).await;
+    assert_eq!(
+        b20_only_defaults(app, token, item).await,
+        b20_both(2, 4),
+        "{name}: before the rescan"
+    );
+    rustyfin_db::repo_media_source::delete_media_sources(&state.db, &item)
+        .await
+        .unwrap();
+    let file = std::path::Path::new(&media_folder(state, name)).join(format!("{name}.mkv"));
+    b20_insert_source(state, item, &file, after).await;
+    b20_only_defaults(app, token, item).await
+}
+
+#[tokio::test]
+async fn b20_rescan_offers_only_the_chosen_streams() {
+    let state = test_state().await;
+    let _dir = G1cDataDir(state.data_dir.to_path_buf());
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let set = |key: &'static str, audio: serde_json::Value, subtitle: serde_json::Value| {
+        b20_streams_with(move |stream| {
+            let kind = stream["CodecType"].as_str().unwrap().to_string();
+            stream[key] = if kind == "Audio" {
+                audio.clone()
+            } else {
+                subtitle.clone()
+            };
+        })
+    };
+    let external = |path: &str| {
+        let mut streams = b20_full_streams();
+        streams[4]["IsExternal"] = serde_json::json!(true);
+        streams[4]["Path"] = serde_json::json!(path);
+        streams
+    };
+    let json = |value: &str| serde_json::json!(value);
+    let kept = b20_both(2, 4);
+    let neither: B20Defaults = (None, None);
+    let cases = [
+        ("Same", b20_full_streams(), b20_full_streams(), kept.clone()),
+        (
+            "Case",
+            b20_full_streams(),
+            b20_streams_with(|stream| {
+                for key in ["Codec", "CodecType", "Language"] {
+                    let upper = stream[key].as_str().unwrap().to_uppercase();
+                    stream[key] = serde_json::json!(upper);
+                }
+            }),
+            kept.clone(),
+        ),
+        (
+            "Codec",
+            b20_full_streams(),
+            set("Codec", json("eac3"), json("ass")),
+            neither.clone(),
+        ),
+        (
+            "Language",
+            b20_full_streams(),
+            set("Language", json("fre"), json("fre")),
+            neither.clone(),
+        ),
+        (
+            "Title",
+            b20_full_streams(),
+            set("Title", json("Commentary"), json("Signs")),
+            neither.clone(),
+        ),
+        (
+            "Default",
+            b20_full_streams(),
+            set(
+                "IsDefault",
+                serde_json::json!(true),
+                serde_json::json!(true),
+            ),
+            neither.clone(),
+        ),
+        (
+            "Forced",
+            b20_full_streams(),
+            set("IsForced", serde_json::json!(true), serde_json::json!(true)),
+            neither.clone(),
+        ),
+        (
+            "External",
+            external("/subs/B20 Ext.ger.srt"),
+            external("/subs/B20 Ext.fre.srt"),
+            (Some(serde_json::json!(2)), None),
+        ),
+        (
+            "External Moved",
+            external("/subs/B20 Ext.ger.srt"),
+            external("/elsewhere/B20 Ext.ger.srt"),
+            kept.clone(),
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (case, before, after, expected) in cases {
+        let name = format!("B20 Rescan {case}");
+        let got = b20_defaults_after_rescan(&state, &app, &token, &name, before, after).await;
+        if got != expected {
+            wrong.push(format!("{case}: {got:?}, expected {expected:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+#[tokio::test]
+async fn b20_track_choice_names_the_reported_source() {
+    let state = test_state().await;
+    let _dir = G1cDataDir(state.data_dir.to_path_buf());
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let item = b20_movie(&state, "B20 Dub", b20_full_streams()).await;
+    let folder = media_folder(&state, "B20 Dub");
+    let file = std::path::Path::new(&folder).join("B20 Dub - French.mkv");
+    std::fs::write(&file, b"b20").unwrap();
+    let streams = serde_json::json!([
+        { "Index": 0, "Codec": "h264", "CodecType": "Video" },
+        { "Index": 1, "Codec": "ac3", "CodecType": "Audio", "Language": "fre" },
+    ]);
+    let dub = b20_insert_source(&state, item, &file, streams).await;
+
+    // Audio 1 of the French version: the first version's audio 1 is another stream.
+    let body = serde_json::json!({
+        "ItemId": item, "MediaSourceId": dub.simple().to_string(), "PositionTicks": 0,
+        "AudioStreamIndex": 1,
+    });
+    b20_report(&app, &token, "/Progress", body).await;
+    let mut sources = b20_track_defaults(&app, &token, item).await;
+    sources.sort_by_key(|(streams, _)| *streams);
+    let audio_1 = (Some(serde_json::json!(1)), None);
+    assert_eq!(sources, vec![(2, audio_1.clone()), (5, (None, None))]);
+
+    // Without MediaSourceId, the first version listed that has an audio 1 names it.
+    let body = serde_json::json!({ "ItemId": item, "PositionTicks": 0, "AudioStreamIndex": 1 });
+    b20_report(&app, &token, "/Progress", body).await;
+    let mut sources = b20_track_defaults(&app, &token, item).await;
+    sources.sort_by_key(|(streams, _)| *streams);
+    assert_eq!(sources, vec![(2, (None, None)), (5, audio_1)]);
+}
+
+// Import from Jellyfin: the importer reads a Jellyfin data folder read-only (synthetic databases
+// in both layouts, written by `jellyfin_fixture`), matches users by name and items by path pair or
+// provider id, and its preview reports what an import would do without writing anything.
+
+mod jellyfin_fixture;
+use jellyfin_fixture as jf;
+
+/// A server with an admin, the user "alice", the libraries "Movies" (`media/movies`: Alpha, Beta
+/// with TMDB 222) and "Shows" (`media/tv`: Show with TVDB 333, its Season 1 and S01E01-S01E03),
+/// and the Jellyfin install `source` (`b20_source`), which each test writes where it needs it.
+struct B20World {
+    state: AppState,
+    app: axum::Router,
+    token: String,
+    alice: uuid::Uuid,
+    movies: String,
+    tv: String,
+    source: jf::JfSource,
+    /// An empty folder for Jellyfin installs, removed when the test ends.
+    jf_root: std::path::PathBuf,
+}
+
+/// A Rustyfin item row for the B20 import tests.
+#[derive(Default)]
+struct B20Row {
+    media_type: &'static str,
+    name: String,
+    path: String,
+    parent: Option<uuid::Uuid>,
+    parent_index: Option<i32>,
+    index: Option<i32>,
+    tmdb: Option<i64>,
+    tvdb: Option<i64>,
+}
+
+/// Stores `row` in `library` and returns the new item's id.
+async fn b20_insert(state: &AppState, library: uuid::Uuid, row: B20Row) -> uuid::Uuid {
+    let id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO media_items (id, library_id, name, media_type, path, parent_id, \
+         parent_index_number, index_number, tmdb_id, tvdb_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(id.to_string())
+    .bind(library.to_string())
+    .bind(&row.name)
+    .bind(row.media_type)
+    .bind(&row.path)
+    .bind(row.parent.map(|p| p.to_string()))
+    .bind(row.parent_index)
+    .bind(row.index)
+    .bind(row.tmdb)
+    .bind(row.tvdb)
+    .execute(&state.db)
+    .await
+    .unwrap();
+    id
+}
+
+/// Stores the library `name` of `content_type` on `path` and returns its id.
+async fn b20_library(
+    state: &AppState,
+    name: &str,
+    content_type: rustyfin_model::library::LibraryContentType,
+    path: &str,
+) -> uuid::Uuid {
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: name.to_string(),
+        content_type,
+        paths: vec![path.to_string()],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    lib.id
+}
+
+/// Stores the user `name` without hashing a password (nobody signs in as them); returns the id.
+async fn b20_plain_user(state: &AppState, name: &str) -> uuid::Uuid {
+    let user = rustyfin_model::user::User {
+        id: uuid::Uuid::new_v4(),
+        name: name.to_string(),
+        password_hash: "unused".to_string(),
+        is_administrator: false,
+        created_at: chrono::Utc::now(),
+        last_login_date: None,
+        configuration: serde_json::json!({}),
+    };
+    rustyfin_db::repo_user::create_user(&state.db, &user)
+        .await
+        .unwrap();
+    user.id
+}
+
+/// Jellyfin's side: "Alice" (admin; Rustyfin has "alice") and "bob" (new); the libraries Movies
+/// (`/data/movies`), Music (`/data/music`, no Rustyfin library) and Shows (`/data/tvshows`);
+/// items matched by path (Alpha, Show, Season 1, S01E01, S01E02), by id (Beta by TMDB, the episode
+/// 1x03 under an old path by its series and numbers) or not at all (Gamma, Song), and a folder,
+/// which is not imported. User data: Alice has Alpha, S01E01, Gamma and a detached row; bob has
+/// Beta and 1x03.
+fn b20_source() -> jf::JfSource {
+    let alice = jf::JfUser::new(1, "Alice", true);
+    let bob = jf::JfUser::new(2, "bob", false);
+    let folder = jf::JfItem::new("Folder", "Movies", Some("/data/movies"));
+    let alpha = jf::JfItem::new(
+        "Movie",
+        "Alpha",
+        Some("/data/movies/Alpha (2001)/Alpha.mkv"),
+    );
+    let beta = jf::JfItem::new("Movie", "Beta", Some("/data/movies/Beta (old)/Beta.avi"))
+        .provider("Tmdb", "222");
+    let gamma = jf::JfItem::new(
+        "Movie",
+        "Gamma",
+        Some("/data/movies/Gamma (2003)/Gamma.mkv"),
+    )
+    .provider("Tmdb", "999");
+    let show =
+        jf::JfItem::new("Series", "Show", Some("/data/tvshows/Show")).provider("Tvdb", "333");
+    let season = jf::JfItem::new("Season", "Season 1", Some("/data/tvshows/Show/Season 01"))
+        .in_series(show.id)
+        .numbers(None, Some(1));
+    let episode = |name: &str, path: &str, number: i32| {
+        jf::JfItem::new("Episode", name, Some(path))
+            .in_season(show.id, season.id)
+            .numbers(Some(1), Some(number))
+    };
+    let e1 = episode(
+        "Show S01E01",
+        "/data/tvshows/Show/Season 01/Show S01E01.mkv",
+        1,
+    );
+    let e2 = episode(
+        "Show S01E02",
+        "/data/tvshows/Show/Season 01/Show S01E02.mkv",
+        2,
+    );
+    let e3 = episode(
+        "Show 1x03",
+        "/data/tvshows/Show/Season 1/Show - 1x03.mkv",
+        3,
+    );
+    let song = jf::JfItem::new("Audio", "Song", Some("/data/music/Song.flac"));
+    let played = |user: &jf::JfUser, item: uuid::Uuid, last: &'static str| jf::JfUserData {
+        user: user.id,
+        item,
+        played: true,
+        play_count: 1,
+        last_played: Some(last),
+        ..Default::default()
+    };
+    let user_data = vec![
+        jf::JfUserData {
+            play_count: 2,
+            favorite: true,
+            rating: Some(7.6),
+            ..played(&alice, alpha.id, "2025-01-02 03:04:05.1234567")
+        },
+        jf::JfUserData {
+            played: false,
+            play_count: 0,
+            position: 6_000_000_000,
+            ..played(&alice, e1.id, "2025-02-01 10:00:00")
+        },
+        played(&alice, gamma.id, "2025-01-05 12:00:00"),
+        played(&alice, jf::DETACHED, "2024-12-01 00:00:00"),
+        jf::JfUserData {
+            rating: Some(9.5),
+            ..played(&bob, beta.id, "2025-03-01 20:00:00")
+        },
+        played(&bob, e3.id, "2025-03-02 21:00:00"),
+    ];
+    let library = |name, collection_type, path| jf::JfLibrary {
+        name,
+        collection_type,
+        paths: vec![path],
+    };
+    jf::JfSource {
+        users: vec![alice, bob],
+        items: vec![folder, alpha, beta, gamma, show, season, e1, e2, e3, song],
+        user_data,
+        streams: Vec::new(),
+        libraries: vec![
+            library("Movies", "movies", "/data/movies"),
+            library("Music", "music", "/data/music"),
+            library("Shows", "tvshows", "/data/tvshows"),
+        ],
+    }
+}
+
+async fn b20_world() -> B20World {
+    use rustyfin_model::library::LibraryContentType as Kind;
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let alice = add_user(&state, "alice", "alicepass", false).await;
+    let movies = media_folder(&state, "movies");
+    let tv = media_folder(&state, "tv");
+    let movie_lib = b20_library(&state, "Movies", Kind::Movies, &movies).await;
+    let show_lib = b20_library(&state, "Shows", Kind::TvShows, &tv).await;
+    let row = |media_type: &'static str, name: &str, path: String| B20Row {
+        media_type,
+        name: name.to_string(),
+        path,
+        ..Default::default()
+    };
+    let alpha_path = format!("{movies}/Alpha (2001)/Alpha.mkv");
+    b20_insert(&state, movie_lib, row("Movie", "Alpha", alpha_path)).await;
+    let beta_row = B20Row {
+        tmdb: Some(222),
+        ..row("Movie", "Beta", format!("{movies}/Beta (2002)/Beta.mkv"))
+    };
+    b20_insert(&state, movie_lib, beta_row).await;
+    let show_row = B20Row {
+        tvdb: Some(333),
+        ..row("Series", "Show", format!("{tv}/Show"))
+    };
+    let show = b20_insert(&state, show_lib, show_row).await;
+    let season_row = B20Row {
+        parent: Some(show),
+        index: Some(1),
+        ..row("Season", "Season 1", format!("{tv}/Show/Season 01"))
+    };
+    let season = b20_insert(&state, show_lib, season_row).await;
+    for n in 1..=3 {
+        let name = format!("Show S01E0{n}");
+        let episode = B20Row {
+            parent: Some(season),
+            parent_index: Some(1),
+            index: Some(n),
+            ..row("Episode", &name, format!("{tv}/Show/Season 01/{name}.mkv"))
+        };
+        b20_insert(&state, show_lib, episode).await;
+    }
+    let jf_root =
+        std::env::temp_dir().join(format!("rustyfin_b20_jf_{}", uuid::Uuid::new_v4().simple()));
+    remove_when_test_ends(&jf_root);
+    std::fs::create_dir_all(&jf_root).unwrap();
+    B20World {
+        state,
+        app,
+        token,
+        alice,
+        movies,
+        tv,
+        source: b20_source(),
+        jf_root,
+    }
+}
+
+/// Writes the world's Jellyfin install in `layout` into the folder `name` and returns that folder
+/// (Jellyfin's program data folder, the official image's `/config`).
+async fn b20_install(w: &B20World, name: &str, layout: jf::Layout) -> std::path::PathBuf {
+    let dir = w.jf_root.join(name);
+    w.source.write(&dir, layout).await;
+    dir
+}
+
+/// POSTs `body` to `/JellyfinImport/{route}` as the admin.
+async fn b20_post(
+    w: &B20World,
+    route: &str,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let uri = format!("/JellyfinImport/{route}");
+    send_authed(&w.app, "POST", &uri, &w.token, Some(&body.to_string())).await
+}
+
+/// Previews an import with `body` and expects 200; returns the report.
+async fn b20_preview(w: &B20World, body: serde_json::Value) -> serde_json::Value {
+    let (status, report) = b20_post(w, "Preview", body).await;
+    assert_eq!(status, StatusCode::OK, "{report}");
+    report
+}
+
+/// A report's item counts: (Total, MatchedByPath, MatchedById, Unmatched).
+fn b20_item_counts(report: &serde_json::Value) -> (i64, i64, i64, i64) {
+    let count = |key: &str| report["Items"][key].as_i64().unwrap_or(-1);
+    (
+        count("Total"),
+        count("MatchedByPath"),
+        count("MatchedById"),
+        count("Unmatched"),
+    )
+}
+
+/// A report's path pairs under `key` as (From, To).
+fn b20_pairs(report: &serde_json::Value, key: &str) -> Vec<(String, String)> {
+    let pairs = report[key].as_array();
+    pairs
+        .unwrap_or_else(|| panic!("no {key}: {report}"))
+        .iter()
+        .map(|p| {
+            (
+                p["From"].as_str().unwrap().into(),
+                p["To"].as_str().unwrap().into(),
+            )
+        })
+        .collect()
+}
+
+/// A report's `UnmatchedSamples` as (Type, Name, Path).
+fn b20_samples(report: &serde_json::Value) -> Vec<(String, String, String)> {
+    let samples = report["Items"]["UnmatchedSamples"].as_array();
+    let text = |v: &serde_json::Value| v.as_str().unwrap().to_string();
+    samples
+        .unwrap_or_else(|| panic!("no UnmatchedSamples: {report}"))
+        .iter()
+        .map(|s| (text(&s["Type"]), text(&s["Name"]), text(&s["Path"])))
+        .collect()
+}
+
+/// One entry of a report's `Users`.
+#[derive(Debug, PartialEq)]
+struct B20User {
+    jellyfin_id: uuid::Uuid,
+    name: String,
+    was_admin: bool,
+    action: String,
+    reason: Option<String>,
+    user_id: Option<uuid::Uuid>,
+    code: Option<String>,
+    /// `SuggestedMatch` as (UserId, Name).
+    suggested: Option<(uuid::Uuid, String)>,
+}
+
+fn b20_users(report: &serde_json::Value) -> Vec<B20User> {
+    let id = |v: &serde_json::Value| v.as_str().map(|s| uuid::Uuid::parse_str(s).unwrap());
+    let users = report["Users"].as_array();
+    users
+        .unwrap_or_else(|| panic!("no Users: {report}"))
+        .iter()
+        .map(|u| B20User {
+            jellyfin_id: id(&u["JellyfinId"]).unwrap_or_else(|| panic!("JellyfinId: {u}")),
+            name: u["Name"].as_str().unwrap().to_string(),
+            was_admin: u["WasAdministrator"].as_bool().unwrap(),
+            action: u["Action"].as_str().unwrap().to_string(),
+            reason: u["Reason"].as_str().map(str::to_string),
+            user_id: id(&u["UserId"]),
+            code: u["Code"].as_str().map(str::to_string),
+            suggested: id(&u["SuggestedMatch"]["UserId"]).map(|user| {
+                let name = u["SuggestedMatch"]["Name"].as_str().unwrap();
+                (user, name.to_string())
+            }),
+        })
+        .collect()
+}
+
+/// The report entry expected for the Jellyfin user `name` (no code).
+fn b20_user(
+    w: &B20World,
+    name: &str,
+    action: &str,
+    reason: Option<&str>,
+    user_id: Option<uuid::Uuid>,
+) -> B20User {
+    let jf_user = w.source.user(name);
+    B20User {
+        jellyfin_id: jf_user.id,
+        name: name.to_string(),
+        was_admin: jf_user.admin,
+        action: action.to_string(),
+        reason: reason.map(str::to_string),
+        user_id,
+        code: None,
+        suggested: None,
+    }
+}
+
+/// The report entry expected for the Jellyfin user `name` whose name suggests the Rustyfin
+/// account `account` (id, name): skipped as not confirmed, or matched to it when `confirmed`.
+fn b20_suggested(
+    w: &B20World,
+    name: &str,
+    account: (uuid::Uuid, &str),
+    confirmed: bool,
+) -> B20User {
+    let entry = if confirmed {
+        b20_user(w, name, "Match", None, Some(account.0))
+    } else {
+        b20_user(w, name, "Skip", Some("NotConfirmed"), None)
+    };
+    B20User {
+        suggested: Some((account.0, account.1.to_string())),
+        ..entry
+    }
+}
+
+/// `ConfirmedMatches` pairing each Jellyfin user (by name) with a Rustyfin account id.
+fn b20_confirm(w: &B20World, pairs: &[(&str, uuid::Uuid)]) -> serde_json::Value {
+    let confirm = |(name, user): &(&str, uuid::Uuid)| serde_json::json!({ "JellyfinId": w.source.user(name).id, "UserId": user });
+    pairs.iter().map(confirm).collect()
+}
+
+/// A request for `install` that confirms the world's suggested match, Alice with alice.
+fn b20_body(w: &B20World, install: &std::path::Path) -> serde_json::Value {
+    serde_json::json!({
+        "SourcePath": install,
+        "ConfirmedMatches": b20_confirm(w, &[("Alice", w.alice)]),
+    })
+}
+
+/// Row counts of the tables an import may write, then every user and user-data row.
+async fn b20_db_digest(state: &AppState) -> Vec<String> {
+    let mut digest = Vec::new();
+    for table in [
+        "users",
+        "user_item_data",
+        "media_items",
+        "media_sources",
+        "media_streams",
+        "item_images",
+        "people",
+        "item_people",
+        "libraries",
+    ] {
+        let sql = format!("SELECT COUNT(*) FROM {table}");
+        let n: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        digest.push(format!("{table} {n}"));
+    }
+    let users: Vec<String> = sqlx::query_scalar(
+        "SELECT id || ' ' || name || ' ' || password_hash || ' ' || is_administrator FROM users \
+         ORDER BY id",
+    )
+    .fetch_all(&state.db)
+    .await
+    .unwrap();
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT quote(user_id) || quote(item_id) || quote(played) || quote(play_count) || \
+         quote(playback_position_ticks) || quote(last_played_date) || quote(is_favorite) || \
+         quote(user_rating) || quote(likes) || quote(audio_stream_index) || \
+         quote(subtitle_stream_index) FROM user_item_data ORDER BY user_id, item_id",
+    )
+    .fetch_all(&state.db)
+    .await
+    .unwrap();
+    digest.extend(users);
+    digest.extend(rows);
+    digest
+}
+
+#[tokio::test]
+async fn b20_import_preview_is_admin_only() {
+    let w = b20_world().await;
+    add_user(&w.state, "viewer", "viewerpass", false).await;
+    let (viewer, _) = login(&w.app, "viewer", "viewerpass").await.unwrap();
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+    let body = Some(serde_json::json!({ "SourcePath": install }));
+    g1_assert_admin_only(&w.app, "POST", "/JellyfinImport/Preview", &body, &viewer).await;
+}
+
+#[tokio::test]
+async fn b20_import_preview_rejects_bad_sources() {
+    let w = b20_world().await;
+    let new = b20_install(&w, "new", jf::Layout::New).await;
+    let old = b20_install(&w, "old", jf::Layout::Old).await;
+    let junk = w.jf_root.join("junk");
+    std::fs::create_dir_all(&junk).unwrap();
+    std::fs::write(junk.join("jellyfin.db"), b"not a database").unwrap();
+    let missing = w.jf_root.join("missing");
+    let cases = [
+        ("empty", serde_json::json!({ "SourcePath": "" })),
+        (
+            "relative",
+            serde_json::json!({ "SourcePath": "relative/config" }),
+        ),
+        ("missing", serde_json::json!({ "SourcePath": missing })),
+        ("not a database", serde_json::json!({ "SourcePath": junk })),
+        (
+            "Old without library.db",
+            serde_json::json!({ "SourcePath": new, "Layout": "Old" }),
+        ),
+        (
+            "New without BaseItems",
+            serde_json::json!({ "SourcePath": old, "Layout": "New" }),
+        ),
+    ];
+    for (case, body) in cases {
+        let (status, answer) = b20_post(&w, "Preview", body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{case}: {answer}");
+    }
+
+    // A missing database names the three places searched, and nothing is created.
+    let body = serde_json::json!({ "SourcePath": missing });
+    let (_, answer) = b20_post(&w, "Preview", body).await;
+    let detail = answer["Detail"].as_str().unwrap_or_default();
+    for place in ["jellyfin.db", "data/jellyfin.db", "data/data/jellyfin.db"] {
+        let path = missing.join(place);
+        assert!(detail.contains(path.to_str().unwrap()), "{place}: {detail}");
+    }
+    assert!(!missing.exists());
+}
+
+#[tokio::test]
+async fn b20_import_preview_finds_the_database_in_three_places() {
+    let w = b20_world().await;
+    // linuxserver's image: /config/data/data/jellyfin.db
+    let config = w.jf_root.join("config");
+    w.source.write(&config.join("data"), jf::Layout::New).await;
+    let data = config.join("data").join("data");
+    for source in [config.clone(), config.join("data"), data.clone()] {
+        let report = b20_preview(&w, serde_json::json!({ "SourcePath": source })).await;
+        let shown = source.display();
+        assert_eq!(report["DataPath"], serde_json::json!(data), "{shown}");
+        assert_eq!(b20_item_counts(&report), (9, 5, 2, 2), "{shown}");
+    }
+}
+
+#[tokio::test]
+async fn b20_import_preview_reports_without_writing() {
+    let w = b20_world().await;
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+    let before = b20_db_digest(&w.state).await;
+    let report = b20_preview(&w, b20_body(&w, &install)).await;
+    assert_eq!(
+        b20_db_digest(&w.state).await,
+        before,
+        "a preview writes nothing"
+    );
+
+    assert_eq!(report["Layout"], "New");
+    assert_eq!(report["DataPath"], serde_json::json!(install.join("data")));
+    let text = |p: std::path::PathBuf| p.to_str().unwrap().to_string();
+    let suggested = vec![
+        ("/data/movies".to_string(), w.movies.clone()),
+        ("/data/tvshows".to_string(), w.tv.clone()),
+        ("%MetadataPath%".to_string(), text(install.join("metadata"))),
+        ("%AppDataPath%".to_string(), text(install.join("data"))),
+    ];
+    assert_eq!(b20_pairs(&report, "SuggestedPathMappings"), suggested);
+    assert_eq!(
+        b20_pairs(&report, "PathMappings"),
+        suggested,
+        "absent = suggested"
+    );
+    assert_eq!(
+        report["UnpairedLibraryPaths"],
+        serde_json::json!(["/data/music"])
+    );
+    let users = vec![
+        b20_suggested(&w, "Alice", (w.alice, "alice"), true),
+        b20_user(&w, "bob", "Create", None, None),
+    ];
+    assert_eq!(b20_users(&report), users);
+    assert_eq!(b20_item_counts(&report), (9, 5, 2, 2));
+    let gamma = "/data/movies/Gamma (2003)/Gamma.mkv";
+    let samples = vec![("Movie".to_string(), "Gamma".to_string(), gamma.to_string())];
+    assert_eq!(b20_samples(&report), samples);
+}
+
+#[tokio::test]
+async fn b20_import_preview_reads_the_old_layout() {
+    let w = b20_world().await;
+    let old = b20_install(&w, "old", jf::Layout::Old).await;
+    let report = b20_preview(&w, b20_body(&w, &old)).await;
+    assert_eq!(report["Layout"], "Old");
+    assert_eq!(b20_item_counts(&report), (9, 5, 2, 2));
+    let users = vec![
+        b20_suggested(&w, "Alice", (w.alice, "alice"), true),
+        b20_user(&w, "bob", "Create", None, None),
+    ];
+    assert_eq!(b20_users(&report), users);
+    let names: Vec<String> = b20_samples(&report).into_iter().map(|s| s.1).collect();
+    assert_eq!(names, ["Gamma"]);
+
+    // An upgrade renamed library.db to library.db.old
+    let renamed = b20_install(&w, "renamed", jf::Layout::Old).await;
+    let data = renamed.join("data");
+    std::fs::rename(data.join("library.db"), data.join("library.db.old")).unwrap();
+    let report = b20_preview(&w, serde_json::json!({ "SourcePath": renamed })).await;
+    assert_eq!(report["Layout"], "Old");
+    assert_eq!(b20_item_counts(&report), (9, 5, 2, 2));
+
+    // A migrated install reads the new layout unless Old is asked for
+    let migrated = b20_install(&w, "migrated", jf::Layout::New).await;
+    let old_db = migrated.join("data").join("library.db.old");
+    w.source.write_library_db(&old_db).await;
+    let report = b20_preview(&w, serde_json::json!({ "SourcePath": migrated })).await;
+    assert_eq!(report["Layout"], "New");
+    let body = serde_json::json!({ "SourcePath": migrated, "Layout": "Old" });
+    let report = b20_preview(&w, body).await;
+    assert_eq!(report["Layout"], "Old");
+    assert_eq!(b20_item_counts(&report), (9, 5, 2, 2));
+}
+
+#[tokio::test]
+async fn b20_import_preview_uses_given_path_pairs() {
+    let w = b20_world().await;
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+
+    // No pairs: only provider ids match (Beta; the show, its season and its episodes)
+    let mut body = b20_body(&w, &install);
+    body["PathMappings"] = serde_json::json!([]);
+    let report = b20_preview(&w, body).await;
+    assert_eq!(
+        b20_pairs(&report, "PathMappings"),
+        Vec::<(String, String)>::new()
+    );
+    assert_eq!(b20_pairs(&report, "SuggestedPathMappings").len(), 4);
+    assert_eq!(b20_item_counts(&report), (9, 0, 6, 3));
+    let names: Vec<String> = b20_samples(&report).into_iter().map(|s| s.1).collect();
+    assert_eq!(names, ["Alpha", "Gamma"]);
+
+    // One pair, with trailing slashes
+    let mut body = b20_body(&w, &install);
+    body["PathMappings"] =
+        serde_json::json!([{ "From": "/data/movies/", "To": format!("{}/", w.movies) }]);
+    let report = b20_preview(&w, body).await;
+    assert_eq!(b20_item_counts(&report), (9, 1, 6, 2));
+}
+
+#[tokio::test]
+async fn b20_import_preview_matches_and_picks_users() {
+    let mut w = b20_world().await;
+    let mut ids = HashMap::new();
+    for name in ["Dave", "DAVE", "Erin", "ERIN"] {
+        ids.insert(name, b20_plain_user(&w.state, name).await);
+    }
+    w.source.users.push(jf::JfUser::new(3, "dave", false));
+    w.source.users.push(jf::JfUser::new(4, "Erin", true));
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+
+    // A name match is a suggestion, unconfirmed: the exact-case one wins over ERIN
+    let report = b20_preview(&w, serde_json::json!({ "SourcePath": install })).await;
+    let users = vec![
+        b20_suggested(&w, "Alice", (w.alice, "alice"), false),
+        b20_user(&w, "bob", "Create", None, None),
+        b20_user(&w, "dave", "Skip", Some("Ambiguous"), None),
+        b20_suggested(&w, "Erin", (ids["Erin"], "Erin"), false),
+    ];
+    assert_eq!(b20_users(&report), users);
+
+    // Only picked users count; unknown ids are ignored
+    let bob = w
+        .source
+        .user("bob")
+        .id
+        .hyphenated()
+        .to_string()
+        .to_uppercase();
+    let picks = serde_json::json!([bob, uuid::Uuid::new_v4()]);
+    let body = serde_json::json!({ "SourcePath": install, "UserIds": picks });
+    let report = b20_preview(&w, body).await;
+    let users = vec![
+        b20_user(&w, "Alice", "Skip", Some("NotSelected"), None),
+        b20_user(&w, "bob", "Create", None, None),
+        b20_user(&w, "dave", "Skip", Some("NotSelected"), None),
+        b20_user(&w, "Erin", "Skip", Some("NotSelected"), None),
+    ];
+    assert_eq!(b20_users(&report), users);
+    assert_eq!(b20_samples(&report), Vec::new(), "bob's items all match");
+}
+
+#[tokio::test]
+async fn b20_import_preview_leaves_the_source_and_its_secrets_alone() {
+    let w = b20_world().await;
+    for (name, layout) in [("new", jf::Layout::New), ("old", jf::Layout::Old)] {
+        let install = b20_install(&w, name, layout).await;
+        let before = jf::listing(&install);
+        let log = jf::LogCapture::start();
+        let body = serde_json::json!({ "SourcePath": install });
+        let (status, answer) = b20_post(&w, "Preview", body).await;
+        let text = log.text();
+        drop(log);
+        assert_eq!(status, StatusCode::OK, "{answer}");
+        assert_eq!(jf::listing(&install), before, "{name}: the source changed");
+        assert!(
+            !answer.to_string().contains(jf::CANARY),
+            "{name}: secret in the answer"
+        );
+        assert!(!text.contains(jf::CANARY), "{name}: secret in the log");
+        let info = |l: &str| l.contains("INFO") && l.contains("jellyfin import");
+        assert!(text.lines().any(info), "{name}: no INFO line in {text}");
+    }
+    let db = w.state.data_dir.join("test.db");
+    let files = [
+        db.clone(),
+        db.with_extension("db-wal"),
+        db.with_extension("db-shm"),
+    ];
+    assert!(
+        !jf::files_hold_canary(&files),
+        "secret in Rustyfin's database"
+    );
+}
+
+// B20 2b: the import run, its status and the created users' one-time codes.
+
+/// `GET /JellyfinImport/Status` as the admin; expects 200.
+async fn b20_status(w: &B20World) -> serde_json::Value {
+    let uri = "/JellyfinImport/Status";
+    let (status, answer) = send_authed(&w.app, "GET", uri, &w.token, None).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    answer
+}
+
+/// Starts an import run with `body`; expects 202 `{"State":"Running"}`.
+async fn b20_start(w: &B20World, body: serde_json::Value) {
+    let (status, answer) = b20_post(w, "Run", body).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{answer}");
+    assert_eq!(answer, serde_json::json!({ "State": "Running" }));
+}
+
+/// Polls the status until the run no longer runs (two minutes at most) and returns that first
+/// answer, the only one that shows the codes.
+async fn b20_wait(w: &B20World) -> serde_json::Value {
+    for _ in 0..2400 {
+        let answer = b20_status(w).await;
+        if answer["State"] != "Running" {
+            return answer;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("the import still runs after two minutes");
+}
+
+/// Runs an import with `body` to its end, expects it to complete and returns the report.
+async fn b20_run(w: &B20World, body: serde_json::Value) -> serde_json::Value {
+    b20_start(w, body).await;
+    let answer = b20_wait(w).await;
+    assert_eq!(answer["State"], "Completed", "{answer}");
+    answer["Result"].clone()
+}
+
+/// Whether `code` has the shape of a one-time code: `XXXX-XXXX-XXXX` in Crockford's base32.
+fn b20_is_code(code: &str) -> bool {
+    let groups: Vec<&str> = code.split('-').collect();
+    let crockford = |c: char| "0123456789ABCDEFGHJKMNPQRSTVWXYZ".contains(c);
+    groups.len() == 3
+        && groups
+            .iter()
+            .all(|group| group.len() == 4 && group.chars().all(crockford))
+}
+
+/// Every stored setup code: user id, hash and date.
+async fn b20_code_rows(state: &AppState) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT user_id || ' ' || code_hash || ' ' || created_at FROM user_setup_codes \
+         ORDER BY user_id",
+    )
+    .fetch_all(&state.db)
+    .await
+    .unwrap()
+}
+
+/// The report entry of the Jellyfin user `name`.
+fn b20_entry(report: &serde_json::Value, name: &str) -> B20User {
+    b20_users(report)
+        .into_iter()
+        .find(|user| user.name == name)
+        .unwrap_or_else(|| panic!("no {name} in {report}"))
+}
+
+async fn b20_user_count(state: &AppState) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM users")
+        .fetch_one(&state.db)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn b20_import_run_and_status_are_admin_only() {
+    let w = b20_world().await;
+    add_user(&w.state, "viewer", "viewerpass", false).await;
+    let (viewer, _) = login(&w.app, "viewer", "viewerpass").await.unwrap();
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+    let body = Some(serde_json::json!({ "SourcePath": install }));
+    g1_assert_admin_only(&w.app, "POST", "/JellyfinImport/Run", &body, &viewer).await;
+    g1_assert_admin_only(&w.app, "GET", "/JellyfinImport/Status", &None, &viewer).await;
+    assert_eq!(
+        b20_status(&w).await["State"],
+        "Idle",
+        "a refused run started"
+    );
+}
+
+#[tokio::test]
+async fn b20_import_status_is_idle_before_a_run() {
+    let w = b20_world().await;
+    let idle = serde_json::json!({
+        "State": "Idle",
+        "Stage": null,
+        "Done": 0,
+        "Total": 0,
+        "Result": null,
+        "Error": null,
+    });
+    assert_eq!(b20_status(&w).await, idle);
+}
+
+#[tokio::test]
+async fn b20_import_run_rejects_bad_sources() {
+    let w = b20_world().await;
+    let new = b20_install(&w, "new", jf::Layout::New).await;
+    let old = b20_install(&w, "old", jf::Layout::Old).await;
+    let junk = w.jf_root.join("junk");
+    std::fs::create_dir_all(&junk).unwrap();
+    std::fs::write(junk.join("jellyfin.db"), b"not a database").unwrap();
+    let missing = w.jf_root.join("missing");
+    let before = b20_db_digest(&w.state).await;
+    let cases = [
+        ("empty", serde_json::json!({ "SourcePath": "" })),
+        (
+            "relative",
+            serde_json::json!({ "SourcePath": "relative/config" }),
+        ),
+        ("missing", serde_json::json!({ "SourcePath": missing })),
+        ("not a database", serde_json::json!({ "SourcePath": junk })),
+        (
+            "Old without library.db",
+            serde_json::json!({ "SourcePath": new, "Layout": "Old" }),
+        ),
+        (
+            "New without BaseItems",
+            serde_json::json!({ "SourcePath": old, "Layout": "New" }),
+        ),
+    ];
+    for (case, body) in cases {
+        let (status, answer) = b20_post(&w, "Run", body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{case}: {answer}");
+    }
+    assert_eq!(
+        b20_status(&w).await["State"],
+        "Idle",
+        "a refused run started"
+    );
+    assert_eq!(b20_db_digest(&w.state).await, before, "a refused run wrote");
+    assert!(!missing.exists());
+}
+
+#[tokio::test]
+async fn b20_import_run_creates_picked_users_with_codes() {
+    let mut w = b20_world().await;
+    w.source.users.push(jf::JfUser::new(3, "Carol", true));
+    w.source.users.push(jf::JfUser::new(4, "dave", false));
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+    let picked: Vec<uuid::Uuid> = ["Alice", "bob", "Carol"]
+        .into_iter()
+        .map(|name| w.source.user(name).id)
+        .collect();
+    let users_before = b20_user_count(&w.state).await;
+    let listing = jf::listing(&install);
+    let log = jf::LogCapture::start();
+    let mut body = b20_body(&w, &install);
+    body["UserIds"] = serde_json::json!(picked);
+    let report = b20_run(&w, body).await;
+    let text = log.text();
+    drop(log);
+    assert_eq!(jf::listing(&install), listing, "the source changed");
+
+    // Alice matches alice, confirmed; bob and Carol are created with codes; dave is not picked.
+    let bob = b20_entry(&report, "bob");
+    let carol = b20_entry(&report, "Carol");
+    let (Some(bob_id), Some(bob_code)) = (bob.user_id, bob.code) else {
+        panic!("bob: no UserId or Code in {report}");
+    };
+    let (Some(carol_id), Some(carol_code)) = (carol.user_id, carol.code) else {
+        panic!("Carol: no UserId or Code in {report}");
+    };
+    let created = |name: &str, id: uuid::Uuid, code: &str| B20User {
+        user_id: Some(id),
+        code: Some(code.to_string()),
+        ..b20_user(&w, name, "Create", None, None)
+    };
+    let expected = vec![
+        b20_suggested(&w, "Alice", (w.alice, "alice"), true),
+        created("bob", bob_id, &bob_code),
+        created("Carol", carol_id, &carol_code),
+        b20_user(&w, "dave", "Skip", Some("NotSelected"), None),
+    ];
+    assert_eq!(b20_users(&report), expected);
+    assert!(carol.was_admin, "the report names Jellyfin's admins");
+    assert_ne!(bob_code, carol_code);
+    assert_eq!(
+        b20_user_count(&w.state).await,
+        users_before + 2,
+        "only bob and Carol are created"
+    );
+
+    for (name, id, code) in [("bob", bob_id, &bob_code), ("Carol", carol_id, &carol_code)] {
+        assert!(b20_is_code(code), "{name}: {code}");
+        let (admin, password): (bool, String) = sqlx::query_as(
+            "SELECT is_administrator, password_hash FROM users WHERE id = ? AND name = ?",
+        )
+        .bind(id.to_string())
+        .bind(name)
+        .fetch_one(&w.state.db)
+        .await
+        .unwrap();
+        assert!(!admin, "{name}: created as an administrator");
+        assert!(
+            password.starts_with("$argon2"),
+            "{name}: password {password}"
+        );
+        let code_hash: String =
+            sqlx::query_scalar("SELECT code_hash FROM user_setup_codes WHERE user_id = ?")
+                .bind(id.to_string())
+                .fetch_one(&w.state.db)
+                .await
+                .unwrap();
+        let plain = code.replace('-', "");
+        assert!(code_hash.starts_with("$argon2"), "{name}: code hash");
+        assert!(!code_hash.contains(&plain), "{name}: the code is stored");
+        let verified = rustyfin_auth::verify_setup_code(code, &code_hash).await;
+        assert!(verified.unwrap(), "{name}: the hash is not the code's");
+        assert!(
+            login(&w.app, name, code).await.is_none(),
+            "{name}: the code signed in"
+        );
+        assert!(
+            login(&w.app, name, "").await.is_none(),
+            "{name}: no password signed in"
+        );
+        assert!(
+            !text.contains(code.as_str()) && !text.contains(&plain),
+            "{name}: the code is in the log"
+        );
+    }
+
+    let info = |l: &str| l.contains("INFO") && l.contains("jellyfin import run");
+    assert!(text.lines().any(info), "no INFO line in {text}");
+    assert!(!text.contains(jf::CANARY), "secret in the log");
+    assert!(
+        !report.to_string().contains(jf::CANARY),
+        "secret in the report"
+    );
+}
+
+#[tokio::test]
+async fn b20_import_run_creates_one_user_per_name() {
+    // Jellyfin users whose names differ only in case: the one created first matches the other.
+    let mut w = b20_world().await;
+    w.source.users.push(jf::JfUser::new(3, "Erin", false));
+    w.source.users.push(jf::JfUser::new(4, "erin", false));
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+    let report = b20_run(&w, serde_json::json!({ "SourcePath": install })).await;
+    let erins: Vec<B20User> = b20_users(&report)
+        .into_iter()
+        .filter(|user| user.name.eq_ignore_ascii_case("erin"))
+        .collect();
+    let [first, second] = erins.as_slice() else {
+        panic!("{report}");
+    };
+    let actions = (first.action.as_str(), second.action.as_str());
+    assert_eq!(actions, ("Create", "Match"), "{report}");
+    assert!(first.code.is_some() && second.code.is_none(), "{report}");
+    assert!(first.user_id.is_some(), "{report}");
+    assert_eq!(second.user_id, first.user_id, "{report}");
+    let erin_users: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE lower(name) = 'erin'")
+            .fetch_one(&w.state.db)
+            .await
+            .unwrap();
+    assert_eq!(erin_users, 1);
+}
+
+#[tokio::test]
+async fn b20_import_run_shows_codes_once() {
+    let w = b20_world().await;
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+    let report = b20_run(&w, serde_json::json!({ "SourcePath": install })).await;
+    assert!(
+        b20_entry(&report, "bob").code.is_some(),
+        "the first answer has no code"
+    );
+
+    let again = b20_status(&w).await;
+    assert_eq!(again["State"], "Completed", "{again}");
+    let mut expected = report.clone();
+    for user in expected["Users"].as_array_mut().unwrap() {
+        user["Code"] = serde_json::Value::Null;
+    }
+    assert_eq!(again["Result"], expected, "only the codes go");
+}
+
+/// Nothing records an earlier run's pairings: a second run suggests the accounts the first one
+/// created or confirmed, and imports into them only when they're confirmed again. Either way it
+/// creates and writes nothing.
+#[tokio::test]
+async fn b20_import_second_run_creates_nothing() {
+    for (name, layout) in [("new", jf::Layout::New), ("old", jf::Layout::Old)] {
+        let w = b20_world().await;
+        let install = b20_install(&w, name, layout).await;
+        let first = b20_run(&w, b20_body(&w, &install)).await;
+        let bob = b20_entry(&first, "bob").user_id.unwrap();
+        let digest = b20_db_digest(&w.state).await;
+        let codes = b20_code_rows(&w.state).await;
+        assert_eq!(codes.len(), 1, "{name}: one code, bob's");
+
+        let mut confirmed = serde_json::json!({ "SourcePath": install });
+        confirmed["ConfirmedMatches"] = b20_confirm(&w, &[("Alice", w.alice), ("bob", bob)]);
+        let unconfirmed = serde_json::json!({ "SourcePath": install });
+        for (confirm, body) in [(true, confirmed), (false, unconfirmed)] {
+            let again = b20_run(&w, body).await;
+            let users = vec![
+                b20_suggested(&w, "Alice", (w.alice, "alice"), confirm),
+                b20_suggested(&w, "bob", (bob, "bob"), confirm),
+            ];
+            assert_eq!(b20_users(&again), users, "{name} {confirm}");
+            assert_eq!(
+                b20_db_digest(&w.state).await,
+                digest,
+                "{name} {confirm}: the run wrote"
+            );
+            assert_eq!(
+                b20_code_rows(&w.state).await,
+                codes,
+                "{name} {confirm}: the codes changed"
+            );
+        }
+        let alice = login(&w.app, "alice", "alicepass").await;
+        assert!(alice.is_some(), "{name}: alice's password changed");
+    }
+}
+
+#[tokio::test]
+async fn b20_import_run_conflicts_while_running() {
+    let w = b20_world().await;
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+    let body = serde_json::json!({ "SourcePath": install });
+    let held = w
+        .state
+        .jellyfin_import
+        .try_start()
+        .expect("an idle job starts");
+    let (status, answer) = b20_post(&w, "Run", body.clone()).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{answer}");
+    assert_eq!(answer["Status"], 409, "{answer}");
+    let running = b20_status(&w).await;
+    assert_eq!(running["State"], "Running", "{running}");
+    assert_eq!(running["Stage"], "Reading", "{running}");
+
+    // A run that ends without a result has failed, and the next run starts.
+    drop(held);
+    let failed = b20_status(&w).await;
+    assert_eq!(failed["State"], "Failed", "{failed}");
+    assert!(failed["Error"].is_string(), "{failed}");
+    assert!(failed["Result"].is_null(), "{failed}");
+    let report = b20_run(&w, body).await;
+    assert_eq!(b20_entry(&report, "bob").action, "Create");
+}
+
+/// Fix round 10 (R2): a non-admin who renames themselves to a Jellyfin user's name gets nothing
+/// from a run that doesn't confirm the pairing. That Jellyfin user is skipped, not created, and the
+/// report names the account as the suggested match. Confirmed by the account's id, the data lands.
+/// At 20c0f3f the name alone put bob's watch data into the account.
+#[tokio::test]
+async fn b20_import_name_match_needs_confirmation() {
+    let w = b20_world().await;
+    let mallory = add_user(&w.state, "mallory", "mallorypass", false).await;
+    let (token, _) = login(&w.app, "mallory", "mallorypass").await.unwrap();
+    let rename = serde_json::json!({ "Name": "bob" }).to_string();
+    let uri = format!("/Users/{mallory}");
+    let (status, answer) = send_authed(&w.app, "PUT", &uri, &token, Some(&rename)).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+    let beta = b20_item(&w.state, "Beta").await;
+    let e3 = b20_item(&w.state, "Show S01E03").await;
+    let users_before = b20_user_count(&w.state).await;
+
+    let mut body = serde_json::json!({ "SourcePath": install });
+    let report = b20_run(&w, body.clone()).await;
+    let expected = b20_suggested(&w, "bob", (mallory, "bob"), false);
+    assert_eq!(b20_entry(&report, "bob"), expected, "{report}");
+    assert_eq!(b20_data(&w.state, mallory, beta).await, None);
+    assert_eq!(b20_data(&w.state, mallory, e3).await, None);
+    assert_eq!(b20_user_count(&w.state).await, users_before, "{report}");
+    assert_eq!(b20_code_rows(&w.state).await, Vec::<String>::new());
+
+    body["ConfirmedMatches"] = b20_confirm(&w, &[("bob", mallory)]);
+    let report = b20_run(&w, body).await;
+    let expected = b20_suggested(&w, "bob", (mallory, "bob"), true);
+    assert_eq!(b20_entry(&report, "bob"), expected, "{report}");
+    assert!(
+        b20_data(&w.state, mallory, beta).await.is_some(),
+        "{report}"
+    );
+    assert!(b20_data(&w.state, mallory, e3).await.is_some(), "{report}");
+}
+
+/// Fix round 10 (R2): a confirmation names the account by id and holds only for the suggested
+/// match. One naming another account is refused, and so is the admin's confirmation once a rename
+/// between Preview and Run gives the name to another account: Alice is skipped with the reason
+/// `ConfirmedOtherAccount`, and neither account gets her data. At 20c0f3f the name alone decided.
+#[tokio::test]
+async fn b20_import_refuses_a_confirmation_of_another_account() {
+    let w = b20_world().await;
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+    let erin = b20_plain_user(&w.state, "erin").await;
+    let alpha = b20_item(&w.state, "Alpha").await;
+    let refused = |account: (uuid::Uuid, &str)| B20User {
+        suggested: Some((account.0, account.1.to_string())),
+        ..b20_user(&w, "Alice", "Skip", Some("ConfirmedOtherAccount"), None)
+    };
+
+    let mut body = serde_json::json!({ "SourcePath": install });
+    body["ConfirmedMatches"] = b20_confirm(&w, &[("Alice", erin)]);
+    let report = b20_run(&w, body).await;
+    assert_eq!(b20_entry(&report, "Alice"), refused((w.alice, "alice")));
+    assert_eq!(b20_data(&w.state, w.alice, alpha).await, None);
+    assert_eq!(b20_data(&w.state, erin, alpha).await, None);
+
+    let body = b20_body(&w, &install);
+    let preview = b20_preview(&w, body.clone()).await;
+    let confirmed = b20_suggested(&w, "Alice", (w.alice, "alice"), true);
+    assert_eq!(b20_entry(&preview, "Alice"), confirmed);
+    let db = &w.state.db;
+    let renamed = rustyfin_db::repo_user::rename_user_unless_taken(db, w.alice, "alice2").await;
+    assert_eq!(renamed.unwrap(), rustyfin_db::repo_user::Renamed::Done);
+    let renamed = rustyfin_db::repo_user::rename_user_unless_taken(db, erin, "alice").await;
+    assert_eq!(renamed.unwrap(), rustyfin_db::repo_user::Renamed::Done);
+    let report = b20_run(&w, body).await;
+    assert_eq!(b20_entry(&report, "Alice"), refused((erin, "alice")));
+    assert_eq!(b20_data(&w.state, w.alice, alpha).await, None);
+    assert_eq!(b20_data(&w.state, erin, alpha).await, None);
+}
+
+/// Fix round 10 (R2): users without a match are created as before, whether or not the request
+/// confirms another user's match, and an unconfirmed match is skipped, not created.
+#[tokio::test]
+async fn b20_import_creates_unmatched_users_as_before() {
+    for confirmed in [false, true] {
+        let w = b20_world().await;
+        let install = b20_install(&w, "jf", jf::Layout::New).await;
+        let users_before = b20_user_count(&w.state).await;
+        let body = if confirmed {
+            b20_body(&w, &install)
+        } else {
+            serde_json::json!({ "SourcePath": install })
+        };
+        let alice = || b20_suggested(&w, "Alice", (w.alice, "alice"), confirmed);
+        let preview = b20_preview(&w, body.clone()).await;
+        let bob = b20_user(&w, "bob", "Create", None, None);
+        assert_eq!(b20_users(&preview), [alice(), bob], "{confirmed}");
+
+        let report = b20_run(&w, body).await;
+        let bob = b20_entry(&report, "bob");
+        let (Some(bob_id), Some(code)) = (bob.user_id, bob.code) else {
+            panic!("{confirmed}: bob has no UserId or Code in {report}");
+        };
+        let bob = B20User {
+            user_id: Some(bob_id),
+            code: Some(code),
+            ..b20_user(&w, "bob", "Create", None, None)
+        };
+        assert_eq!(b20_users(&report), [alice(), bob], "{confirmed}");
+        let count = b20_user_count(&w.state).await;
+        assert_eq!(count, users_before + 1, "{confirmed}: only bob is created");
+        let beta = b20_item(&w.state, "Beta").await;
+        assert!(
+            b20_data(&w.state, bob_id, beta).await.is_some(),
+            "{confirmed}"
+        );
+        let alpha = b20_item(&w.state, "Alpha").await;
+        let alices = b20_data(&w.state, w.alice, alpha).await;
+        assert_eq!(alices.is_some(), confirmed, "{confirmed}: {report}");
+    }
+}
+
+// B20 2c: watch data and track choices.
+
+/// A `user_item_data` row as the B20 import tests read and write it.
+#[derive(Debug, Default, PartialEq)]
+struct B20Data {
+    played: bool,
+    play_count: i64,
+    position: i64,
+    last_played: Option<chrono::DateTime<chrono::Utc>>,
+    favorite: bool,
+    rating: Option<i64>,
+    likes: Option<bool>,
+    audio: Option<i64>,
+    subtitle: Option<i64>,
+}
+
+type B20DataRow = (
+    bool,
+    i64,
+    i64,
+    Option<String>,
+    bool,
+    Option<i64>,
+    Option<bool>,
+    Option<i64>,
+    Option<i64>,
+);
+
+/// The instant `rfc3339`.
+fn b20_at(rfc3339: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    let instant =
+        chrono::DateTime::parse_from_rfc3339(rfc3339).unwrap_or_else(|e| panic!("{rfc3339}: {e}"));
+    Some(instant.with_timezone(&chrono::Utc))
+}
+
+/// The id of the Rustyfin item `name`.
+async fn b20_item(state: &AppState, name: &str) -> uuid::Uuid {
+    let id: String = sqlx::query_scalar("SELECT id FROM media_items WHERE name = ?")
+        .bind(name)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    uuid::Uuid::parse_str(&id).unwrap()
+}
+
+/// The stored row of `user` for `item`; a stored date must be RFC 3339.
+async fn b20_data(state: &AppState, user: uuid::Uuid, item: uuid::Uuid) -> Option<B20Data> {
+    let row: Option<B20DataRow> = sqlx::query_as(
+        "SELECT played, play_count, playback_position_ticks, last_played_date, is_favorite, \
+         user_rating, likes, audio_stream_index, subtitle_stream_index FROM user_item_data \
+         WHERE user_id = ? AND item_id = ?",
+    )
+    .bind(user.to_string())
+    .bind(item.to_string())
+    .fetch_optional(&state.db)
+    .await
+    .unwrap();
+    row.map(|r| B20Data {
+        played: r.0,
+        play_count: r.1,
+        position: r.2,
+        last_played: r.3.and_then(|date| b20_at(&date)),
+        favorite: r.4,
+        rating: r.5,
+        likes: r.6,
+        audio: r.7,
+        subtitle: r.8,
+    })
+}
+
+/// Stores `data` as the row of `user` for `item`, its date written with `Z`.
+async fn b20_put_data(state: &AppState, user: uuid::Uuid, item: uuid::Uuid, data: &B20Data) {
+    let date = data
+        .last_played
+        .map(|date| date.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true));
+    sqlx::query(
+        "INSERT INTO user_item_data (user_id, item_id, played, play_count, \
+         playback_position_ticks, last_played_date, is_favorite, user_rating, likes, \
+         audio_stream_index, subtitle_stream_index) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(user.to_string())
+    .bind(item.to_string())
+    .bind(data.played)
+    .bind(data.play_count)
+    .bind(data.position)
+    .bind(date)
+    .bind(data.favorite)
+    .bind(data.rating)
+    .bind(data.likes)
+    .bind(data.audio)
+    .bind(data.subtitle)
+    .execute(&state.db)
+    .await
+    .unwrap();
+}
+
+/// A report's `WatchData` as (Rows, Imported, Unchanged, Unmatched).
+fn b20_watch_counts(report: &serde_json::Value) -> (i64, i64, i64, i64) {
+    let count = |key: &str| report["WatchData"][key].as_i64().unwrap_or(-1);
+    (
+        count("Rows"),
+        count("Imported"),
+        count("Unchanged"),
+        count("Unmatched"),
+    )
+}
+
+/// A report's `Tracks` as (Audio, Subtitle, SubtitleOff, Unmapped).
+fn b20_track_counts(report: &serde_json::Value) -> (i64, i64, i64, i64) {
+    let count = |key: &str| report["Tracks"][key].as_i64().unwrap_or(-1);
+    (
+        count("Audio"),
+        count("Subtitle"),
+        count("SubtitleOff"),
+        count("Unmapped"),
+    )
+}
+
+/// The watch-data part of the INFO lines for `counts` (Rows, Imported, Unchanged, Unmatched).
+fn b20_watch_line(counts: (i64, i64, i64, i64)) -> String {
+    let (rows, imported, unchanged, unmatched) = counts;
+    format!("{rows} watch rows ({imported} imported, {unchanged} unchanged, {unmatched} unmatched)")
+}
+
+#[tokio::test]
+async fn b20_import_preview_counts_watch_data() {
+    // Alice: Alpha and S01E01 match; Gamma and the new layout's detached row don't (the old
+    // layout's detached row has a key no item has, so it is no row). bob: Beta and 1x03 match.
+    for (name, layout, all, alice_only) in [
+        ("new", jf::Layout::New, (6, 4, 0, 2), (4, 2, 0, 2)),
+        ("old", jf::Layout::Old, (5, 4, 0, 1), (3, 2, 0, 1)),
+    ] {
+        let w = b20_world().await;
+        let install = b20_install(&w, name, layout).await;
+        let before = b20_db_digest(&w.state).await;
+        let log = jf::LogCapture::start();
+        let report = b20_preview(&w, b20_body(&w, &install)).await;
+        let text = log.text();
+        drop(log);
+        assert_eq!(b20_watch_counts(&report), all, "{name}: {report}");
+        assert_eq!(b20_track_counts(&report), (0, 0, 0, 0), "{name}: {report}");
+        let line = b20_watch_line(all);
+        let info = |l: &str| {
+            l.contains("INFO") && l.contains("jellyfin import preview") && l.contains(&line)
+        };
+        assert!(
+            text.lines().any(info),
+            "{name}: no INFO line with {line} in {text}"
+        );
+
+        let alice = w.source.user("Alice").id;
+        let mut body = b20_body(&w, &install);
+        body["UserIds"] = serde_json::json!([alice]);
+        let report = b20_preview(&w, body).await;
+        assert_eq!(
+            b20_watch_counts(&report),
+            alice_only,
+            "{name}: only the picked users' rows: {report}"
+        );
+        assert_eq!(
+            b20_db_digest(&w.state).await,
+            before,
+            "{name}: a preview writes nothing"
+        );
+    }
+}
+
+#[tokio::test]
+async fn b20_import_run_writes_watch_data() {
+    for (name, layout, counts) in [
+        ("new", jf::Layout::New, (6, 4, 0, 2)),
+        ("old", jf::Layout::Old, (5, 4, 0, 1)),
+    ] {
+        let mut w = b20_world().await;
+        // Alice likes Alpha; only the new layout has likes.
+        w.source.user_data[0].likes = Some(true);
+        let install = b20_install(&w, name, layout).await;
+        let report = b20_run(&w, b20_body(&w, &install)).await;
+        assert_eq!(b20_watch_counts(&report), counts, "{name}: {report}");
+        assert_eq!(b20_track_counts(&report), (0, 0, 0, 0), "{name}: {report}");
+
+        let alpha = b20_item(&w.state, "Alpha").await;
+        let expected = B20Data {
+            played: true,
+            play_count: 2,
+            last_played: b20_at("2025-01-02T03:04:05.1234567Z"),
+            favorite: true,
+            rating: Some(8),
+            likes: (layout == jf::Layout::New).then_some(true),
+            ..Default::default()
+        };
+        let stored = b20_data(&w.state, w.alice, alpha).await;
+        assert_eq!(stored, Some(expected), "{name}: Alpha");
+        let e1 = b20_item(&w.state, "Show S01E01").await;
+        let expected = B20Data {
+            position: 6_000_000_000,
+            last_played: b20_at("2025-02-01T10:00:00Z"),
+            ..Default::default()
+        };
+        let stored = b20_data(&w.state, w.alice, e1).await;
+        assert_eq!(stored, Some(expected), "{name}: S01E01");
+
+        let bob = b20_entry(&report, "bob").user_id.unwrap();
+        let played = |date: &str| B20Data {
+            played: true,
+            play_count: 1,
+            last_played: b20_at(date),
+            ..Default::default()
+        };
+        let beta = b20_item(&w.state, "Beta").await;
+        let expected = B20Data {
+            rating: Some(10),
+            ..played("2025-03-01T20:00:00Z")
+        };
+        let stored = b20_data(&w.state, bob, beta).await;
+        assert_eq!(stored, Some(expected), "{name}: Beta, rated 9.5");
+        let e3 = b20_item(&w.state, "Show S01E03").await;
+        let stored = b20_data(&w.state, bob, e3).await;
+        assert_eq!(stored, Some(played("2025-03-02T21:00:00Z")), "{name}: 1x03");
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM user_item_data")
+            .fetch_one(&w.state.db)
+            .await
+            .unwrap();
+        assert_eq!(rows, 4, "{name}: only the matched rows are written");
+    }
+}
+
+#[tokio::test]
+async fn b20_import_merges_with_rustyfin_watch_data() {
+    let w = b20_world().await;
+    let bob = b20_plain_user(&w.state, "bob").await;
+    let alpha = b20_item(&w.state, "Alpha").await;
+    let beta = b20_item(&w.state, "Beta").await;
+    let e1 = b20_item(&w.state, "Show S01E01").await;
+    let e3 = b20_item(&w.state, "Show S01E03").await;
+    // Alpha: Rustyfin's row is newer. S01E01: Jellyfin's is. Beta: the same instant, and
+    // already what the import makes of Jellyfin's row.
+    let alpha_row = B20Data {
+        play_count: 5,
+        position: 100,
+        last_played: b20_at("2025-06-01T00:00:00Z"),
+        rating: Some(3),
+        likes: Some(true),
+        audio: Some(7),
+        ..Default::default()
+    };
+    let e1_row = B20Data {
+        play_count: 1,
+        position: 50,
+        last_played: b20_at("2025-01-01T00:00:00Z"),
+        audio: Some(7),
+        ..Default::default()
+    };
+    let beta_row = B20Data {
+        played: true,
+        play_count: 1,
+        last_played: b20_at("2025-03-01T20:00:00Z"),
+        rating: Some(10),
+        ..Default::default()
+    };
+    b20_put_data(&w.state, w.alice, alpha, &alpha_row).await;
+    b20_put_data(&w.state, w.alice, e1, &e1_row).await;
+    b20_put_data(&w.state, bob, beta, &beta_row).await;
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+    let mut body = serde_json::json!({ "SourcePath": install });
+    body["ConfirmedMatches"] = b20_confirm(&w, &[("Alice", w.alice), ("bob", bob)]);
+
+    let preview = b20_preview(&w, body.clone()).await;
+    assert_eq!(b20_watch_counts(&preview), (6, 3, 1, 2), "{preview}");
+    let report = b20_run(&w, body.clone()).await;
+    assert_eq!(b20_watch_counts(&report), (6, 3, 1, 2), "{report}");
+    assert_eq!(b20_entry(&report, "bob").user_id, Some(bob));
+
+    // Played and favorite if either side; Rustyfin's count, date, position, rating, likes and
+    // track stay on Alpha. S01E01 takes Jellyfin's date and position and keeps its track.
+    let expected = B20Data {
+        played: true,
+        favorite: true,
+        ..alpha_row
+    };
+    assert_eq!(b20_data(&w.state, w.alice, alpha).await, Some(expected));
+    let expected = B20Data {
+        position: 6_000_000_000,
+        last_played: b20_at("2025-02-01T10:00:00Z"),
+        ..e1_row
+    };
+    assert_eq!(b20_data(&w.state, w.alice, e1).await, Some(expected));
+    let beta_date: Option<String> = sqlx::query_scalar(
+        "SELECT last_played_date FROM user_item_data WHERE user_id = ? AND item_id = ?",
+    )
+    .bind(bob.to_string())
+    .bind(beta.to_string())
+    .fetch_one(&w.state.db)
+    .await
+    .unwrap();
+    assert_eq!(
+        beta_date.as_deref(),
+        Some("2025-03-01T20:00:00Z"),
+        "an unchanged row is not written"
+    );
+    assert!(b20_data(&w.state, bob, e3).await.is_some(), "1x03");
+
+    let digest = b20_db_digest(&w.state).await;
+    let again = b20_run(&w, body).await;
+    assert_eq!(b20_watch_counts(&again), (6, 0, 4, 2), "{again}");
+    assert_eq!(
+        b20_db_digest(&w.state).await,
+        digest,
+        "the second run wrote"
+    );
+}
+
+#[tokio::test]
+async fn b20_import_keeps_the_newest_of_several_rows() {
+    // The new layout: a second, older row of Alice's Alpha (another CustomDataKey) with more
+    // plays loses to the newer one.
+    let mut w = b20_world().await;
+    let alice = w.source.user("Alice").id;
+    w.source.user_data.push(jf::JfUserData {
+        user: alice,
+        item: w.source.item("Alpha").id,
+        custom_key: Some("b20-older-key".to_string()),
+        played: true,
+        play_count: 7,
+        position: 1234,
+        last_played: Some("2024-01-01 00:00:00"),
+        ..Default::default()
+    });
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+    let report = b20_run(&w, b20_body(&w, &install)).await;
+    assert_eq!(b20_watch_counts(&report), (6, 4, 0, 2), "{report}");
+    let alpha = b20_item(&w.state, "Alpha").await;
+    let stored = b20_data(&w.state, w.alice, alpha).await.unwrap();
+    assert_eq!((stored.play_count, stored.position), (2, 0));
+    assert_eq!(stored.last_played, b20_at("2025-01-02T03:04:05.1234567Z"));
+}
+
+#[tokio::test]
+async fn b20_import_old_rows_apply_to_each_item_of_their_key() {
+    // The old layout keys rows by UserDataKey: S01E02 shares S01E01's key, so Alice's S01E01
+    // row is S01E02's too.
+    let mut w = b20_world().await;
+    let key = w.source.item("Show S01E01").user_data_key.clone();
+    let e2 = w
+        .source
+        .items
+        .iter_mut()
+        .find(|item| item.name == "Show S01E02");
+    e2.unwrap().user_data_key = key;
+    let install = b20_install(&w, "jf", jf::Layout::Old).await;
+    let report = b20_run(&w, b20_body(&w, &install)).await;
+    assert_eq!(b20_watch_counts(&report), (6, 5, 0, 1), "{report}");
+    let e2 = b20_item(&w.state, "Show S01E02").await;
+    let stored = b20_data(&w.state, w.alice, e2).await.unwrap();
+    assert_eq!(stored.position, 6_000_000_000);
+}
+
+#[tokio::test]
+async fn b20_import_maps_track_choices() {
+    for (name, layout) in [("new", jf::Layout::New), ("old", jf::Layout::Old)] {
+        let mut w = b20_world().await;
+        let jf_alpha = w.source.item("Alpha").id;
+        let jf_beta = w.source.item("Beta").id;
+        let jf_e1 = w.source.item("Show S01E01").id;
+        let jf_e3 = w.source.item("Show 1x03").id;
+        let stream = jf::JfStream::new;
+        w.source.streams = vec![
+            stream(jf_alpha, 0, "Video", "h264"),
+            stream(jf_alpha, 1, "Audio", "aac").language("eng"),
+            stream(jf_alpha, 2, "Audio", "ac3").language("ger"),
+            stream(jf_alpha, 3, "Subtitle", "srt").language("eng"),
+            stream(jf_alpha, 4, "Subtitle", "PGSSUB")
+                .language("ger")
+                .flags(false, true),
+            stream(jf_beta, 0, "Video", "mpeg4"),
+            stream(jf_beta, 1, "Audio", "mp3"),
+            stream(jf_e1, 0, "Video", "h264"),
+            stream(jf_e1, 1, "Audio", "aac"),
+            stream(jf_e1, 2, "Audio", "ac3"),
+            stream(jf_e3, 0, "Video", "h264"),
+            stream(jf_e3, 1, "Audio", "aac"),
+        ];
+        // Alice: Alpha's aac and forced PGS subtitles, S01E01's ac3. bob: Beta with subtitles
+        // off and an audio stream Jellyfin doesn't have; 1x03's aac, which has no Rustyfin source.
+        for row in &mut w.source.user_data {
+            let choice = [
+                (jf_alpha, (Some(1), Some(4))),
+                (jf_e1, (Some(2), None)),
+                (jf_beta, (Some(9), Some(-1))),
+                (jf_e3, (Some(1), None)),
+            ]
+            .into_iter()
+            .find(|(item, _)| *item == row.item);
+            if let Some((_, (audio, subtitle))) = choice {
+                row.audio = audio;
+                row.subtitle = subtitle;
+            }
+        }
+
+        // Rustyfin numbers Alpha's streams its own way.
+        let alpha = b20_item(&w.state, "Alpha").await;
+        let alpha_file = std::path::PathBuf::from(format!("{}/Alpha (2001)/Alpha.mkv", w.movies));
+        std::fs::create_dir_all(alpha_file.parent().unwrap()).unwrap();
+        std::fs::write(&alpha_file, b"b20").unwrap();
+        let streams = serde_json::json!([
+            { "Index": 0, "Codec": "h264", "CodecType": "Video" },
+            { "Index": 1, "Codec": "hdmv_pgs_subtitle", "CodecType": "Subtitle", "IsForced": true },
+            { "Index": 2, "Codec": "ac3", "CodecType": "Audio" },
+            { "Index": 3, "Codec": "aac", "CodecType": "Audio" },
+            { "Index": 4, "Codec": "subrip", "CodecType": "Subtitle" },
+        ]);
+        b20_insert_source(&w.state, alpha, &alpha_file, streams).await;
+        let beta = b20_item(&w.state, "Beta").await;
+        let beta_file = std::path::PathBuf::from(format!("{}/Beta (2002)/Beta.mkv", w.movies));
+        let streams = serde_json::json!([
+            { "Index": 0, "Codec": "mpeg4", "CodecType": "Video" },
+            { "Index": 1, "Codec": "mp3", "CodecType": "Audio" },
+        ]);
+        b20_insert_source(&w.state, beta, &beta_file, streams).await;
+        // S01E01's first source is an older file; the import uses the one at the translated path.
+        let e1 = b20_item(&w.state, "Show S01E01").await;
+        let season = format!("{}/Show/Season 01", w.tv);
+        let old_file = std::path::PathBuf::from(format!("{season}/Show S01E01.old.mkv"));
+        let streams = serde_json::json!([
+            { "Index": 0, "Codec": "h264", "CodecType": "Video" },
+            { "Index": 1, "Codec": "ac3", "CodecType": "Audio" },
+        ]);
+        let old_source = b20_insert_source(&w.state, e1, &old_file, streams).await;
+        sqlx::query("UPDATE media_sources SET created_at = '2000-01-01 00:00:00' WHERE id = ?")
+            .bind(old_source.to_string())
+            .execute(&w.state.db)
+            .await
+            .unwrap();
+        let e1_file = std::path::PathBuf::from(format!("{season}/Show S01E01.mkv"));
+        let streams = serde_json::json!([
+            { "Index": 0, "Codec": "h264", "CodecType": "Video" },
+            { "Index": 1, "Codec": "aac", "CodecType": "Audio" },
+            { "Index": 2, "Codec": "ac3", "CodecType": "Audio" },
+        ]);
+        b20_insert_source(&w.state, e1, &e1_file, streams).await;
+
+        let install = b20_install(&w, name, layout).await;
+        let body = b20_body(&w, &install);
+        let preview = b20_preview(&w, body.clone()).await;
+        let report = b20_run(&w, body).await;
+        // Audio: Alpha and S01E01. Subtitle: Alpha. Off: Beta. Unmapped: Beta's audio 9 and
+        // 1x03's audio.
+        assert_eq!(b20_track_counts(&report), (2, 1, 1, 2), "{name}: {report}");
+        assert_eq!(
+            b20_track_counts(&preview),
+            (2, 1, 1, 2),
+            "{name}: the preview: {preview}"
+        );
+        let alice = w.alice.to_string();
+        let tracks = b20_stored_tracks(&w.state, &alice, alpha).await;
+        assert_eq!(tracks, (Some(3), Some(1)), "{name}: Alpha");
+        let tracks = b20_stored_tracks(&w.state, &alice, e1).await;
+        assert_eq!(tracks, (Some(2), None), "{name}: S01E01");
+        let bob = b20_entry(&report, "bob").user_id.unwrap().to_string();
+        let tracks = b20_stored_tracks(&w.state, &bob, beta).await;
+        assert_eq!(tracks, (None, Some(-1)), "{name}: Beta");
+        let e3 = b20_item(&w.state, "Show S01E03").await;
+        let tracks = b20_stored_tracks(&w.state, &bob, e3).await;
+        assert_eq!(tracks, (None, None), "{name}: 1x03");
+
+        // Alice's player offers the imported tracks first.
+        let (token, _) = login(&w.app, "alice", "alicepass").await.unwrap();
+        let defaults = b20_only_defaults(&w.app, &token, alpha).await;
+        assert_eq!(defaults, b20_both(3, 1), "{name}");
+    }
+}
+
+#[tokio::test]
+async fn b20_import_run_leaves_the_source_and_its_secrets_alone() {
+    for (name, layout, counts) in [
+        ("new", jf::Layout::New, (6, 4, 0, 2)),
+        ("old", jf::Layout::Old, (5, 4, 0, 1)),
+    ] {
+        let w = b20_world().await;
+        let install = b20_install(&w, name, layout).await;
+        let before = jf::listing(&install);
+        let log = jf::LogCapture::start();
+        let report = b20_run(&w, b20_body(&w, &install)).await;
+        let status = b20_status(&w).await;
+        let text = log.text();
+        drop(log);
+        assert_eq!(jf::listing(&install), before, "{name}: the source changed");
+        for answer in [&report, &status] {
+            assert!(
+                !answer.to_string().contains(jf::CANARY),
+                "{name}: secret in an answer"
+            );
+        }
+        assert!(!text.contains(jf::CANARY), "{name}: secret in the log");
+        let line = b20_watch_line(counts);
+        let info =
+            |l: &str| l.contains("INFO") && l.contains("jellyfin import run") && l.contains(&line);
+        assert!(
+            text.lines().any(info),
+            "{name}: no INFO line with {line} in {text}"
+        );
+        let db = w.state.data_dir.join("test.db");
+        let files = [
+            db.clone(),
+            db.with_extension("db-wal"),
+            db.with_extension("db-shm"),
+        ];
+        assert!(
+            !jf::files_hold_canary(&files),
+            "{name}: secret in Rustyfin's database"
+        );
+    }
+}
+
+/// Fix 4: a run reads, merges and writes each user's rows in one write transaction, so progress a
+/// client saves while the run works isn't overwritten with the rows the run read before.
+#[tokio::test]
+async fn b20_import_keeps_progress_saved_during_the_run() {
+    use sqlx::ConnectOptions;
+    let w = b20_world().await;
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+    let alpha = b20_item(&w.state, "Alpha").await;
+    // A progress report's write, open from before the run starts until the run reads.
+    let mut writer = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(w.state.data_dir.join("test.db"))
+        .busy_timeout(std::time::Duration::from_secs(30))
+        .connect()
+        .await
+        .unwrap();
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut writer)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO user_item_data (user_id, item_id, played, play_count, \
+         playback_position_ticks, last_played_date, is_favorite) \
+         VALUES (?, ?, 0, 0, 7777, '2026-01-01T00:00:00Z', 0)",
+    )
+    .bind(w.alice.to_string())
+    .bind(alpha.to_string())
+    .execute(&mut writer)
+    .await
+    .unwrap();
+    let alice = w.source.user("Alice").id;
+    let body = serde_json::json!({
+        "SourcePath": install,
+        "UserIds": [alice],
+        "ConfirmedMatches": b20_confirm(&w, &[("Alice", w.alice)]),
+        "MetadataMode": "None",
+    });
+    b20_start(&w, body).await;
+    // The job itself, not `/JellyfinImport/Status`: the pool shares its cache, so a request made
+    // while a pool connection waits for the write lock waits with it.
+    let watch_data = Some(rustyfin_core::jellyfin_import::ImportStage::WatchData);
+    let mut stage = None;
+    for _ in 0..1000 {
+        stage = w.state.jellyfin_import.status().stage;
+        if stage == watch_data {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(stage, watch_data, "the run never reached its watch data");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    sqlx::query("COMMIT").execute(&mut writer).await.unwrap();
+    let answer = b20_wait(&w).await;
+    assert_eq!(answer["State"], "Completed", "{answer}");
+    let row = b20_data(&w.state, w.alice, alpha)
+        .await
+        .expect("alice's Alpha row");
+    assert_eq!(
+        row.position, 7777,
+        "the progress saved during the run was lost"
+    );
+    assert_eq!(row.last_played, b20_at("2026-01-01T00:00:00Z"));
+    assert!(
+        row.played && row.favorite,
+        "Jellyfin's played and favorite merge in"
+    );
+    assert_eq!(row.play_count, 2);
+}
+
+/// Runs `statements` on a WAL-mode copy of `file` made outside the install folder, then puts the
+/// copy and its `-wal` (no checkpoint ran, so the changes are only there) in place of `file`: a
+/// source as a running Jellyfin leaves it.
+async fn b20_change_in_wal(w: &B20World, file: &std::path::Path, statements: &[&'static str]) {
+    use sqlx::{ConnectOptions, Connection};
+    let wal = |db: &std::path::Path| {
+        let mut name = db.as_os_str().to_owned();
+        name.push("-wal");
+        std::path::PathBuf::from(name)
+    };
+    let scratch = w
+        .jf_root
+        .join(format!("wal_{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&scratch).unwrap();
+    let copy = scratch.join(file.file_name().unwrap());
+    std::fs::copy(file, &copy).unwrap();
+    let mut conn = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(&copy)
+        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+        .connect()
+        .await
+        .unwrap();
+    sqlx::query("PRAGMA wal_autocheckpoint = 0")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    for &statement in statements {
+        sqlx::query(statement).execute(&mut conn).await.unwrap();
+    }
+    let frames = std::fs::metadata(wal(&copy)).unwrap().len();
+    assert!(frames > 32, "no frames in {}", wal(&copy).display());
+    std::fs::copy(&copy, file).unwrap();
+    std::fs::copy(wal(&copy), wal(file)).unwrap();
+    conn.close().await.unwrap();
+}
+
+const B20_RENAME_BOB: &str = r#"UPDATE "Users" SET "Username" = 'carol' WHERE "Username" = 'bob'"#;
+const B20_RENAME_GAMMA_NEW: &str =
+    r#"UPDATE "BaseItems" SET "Name" = 'Gamma WAL' WHERE "Name" = 'Gamma'"#;
+const B20_RENAME_GAMMA_OLD: &str =
+    "UPDATE TypedBaseItems SET Name = 'Gamma WAL' WHERE Name = 'Gamma'";
+
+/// Fix 7: a source whose `-wal` holds changes is read with them, and nothing appears or changes
+/// under the source folder (no `-shm` either).
+#[tokio::test]
+async fn b20_import_reads_the_wal_and_leaves_the_source_folder_alone() {
+    for (name, layout) in [("new", jf::Layout::New), ("old", jf::Layout::Old)] {
+        let w = b20_world().await;
+        let install = b20_install(&w, name, layout).await;
+        let data = install.join("data");
+        match layout {
+            jf::Layout::New => {
+                let changes = [B20_RENAME_BOB, B20_RENAME_GAMMA_NEW];
+                b20_change_in_wal(&w, &data.join("jellyfin.db"), &changes).await;
+            }
+            jf::Layout::Old => {
+                b20_change_in_wal(&w, &data.join("jellyfin.db"), &[B20_RENAME_BOB]).await;
+                let library = data.join("library.db");
+                b20_change_in_wal(&w, &library, &[B20_RENAME_GAMMA_OLD]).await;
+            }
+        }
+        let before = jf::listing(&install);
+        let report = b20_preview(&w, b20_body(&w, &install)).await;
+        assert_eq!(
+            jf::listing(&install),
+            before,
+            "{name}: the preview changed the source folder"
+        );
+        let names: Vec<String> = b20_users(&report).into_iter().map(|u| u.name).collect();
+        assert!(
+            names.iter().any(|n| n == "carol") && !names.iter().any(|n| n == "bob"),
+            "{name}: users {names:?}"
+        );
+        let samples = b20_samples(&report);
+        assert!(
+            samples.iter().any(|(_, item, _)| item == "Gamma WAL"),
+            "{name}: samples {samples:?}"
+        );
+        let alice = w.source.user("Alice").id;
+        let mut body = b20_body(&w, &install);
+        body["UserIds"] = serde_json::json!([alice]);
+        b20_run(&w, body).await;
+        assert_eq!(
+            jf::listing(&install),
+            before,
+            "{name}: the run changed the source folder"
+        );
+    }
+}
+
+/// One state of the flipping writer: Gamma's name (read with the items) and Alpha's tagline (read
+/// with the metadata), changed together.
+const B20_FLIPS_NEW: [&str; 2] = [
+    r#"BEGIN; UPDATE "BaseItems" SET "Name" = 'Gamma' WHERE "Name" = 'Gamma Y';
+       UPDATE "BaseItems" SET "Tagline" = NULL WHERE "Name" = 'Alpha'; COMMIT;"#,
+    r#"BEGIN; UPDATE "BaseItems" SET "Name" = 'Gamma Y' WHERE "Name" = 'Gamma';
+       UPDATE "BaseItems" SET "Tagline" = 'one' WHERE "Name" = 'Alpha'; COMMIT;"#,
+];
+const B20_FLIPS_OLD: [&str; 2] = [
+    "BEGIN; UPDATE TypedBaseItems SET Name = 'Gamma' WHERE Name = 'Gamma Y';
+     UPDATE TypedBaseItems SET Tagline = NULL WHERE Name = 'Alpha'; COMMIT;",
+    "BEGIN; UPDATE TypedBaseItems SET Name = 'Gamma Y' WHERE Name = 'Gamma';
+     UPDATE TypedBaseItems SET Tagline = 'one' WHERE Name = 'Alpha'; COMMIT;",
+];
+
+/// What a FillEmpty preview saw: Gamma's name and the metadata's `Fields` count.
+fn b20_seen(report: &serde_json::Value) -> (String, i64) {
+    let gamma = b20_samples(report)
+        .into_iter()
+        .map(|(_, name, _)| name)
+        .find(|name| name.starts_with("Gamma"))
+        .unwrap_or_else(|| panic!("no Gamma sample: {report}"));
+    (gamma, report["Metadata"]["Fields"].as_i64().unwrap_or(-1))
+}
+
+/// Fix 8: while Jellyfin writes, a preview reads one state of each file: everything it reports
+/// from a file comes from the same commit, or it fails as changing. The writer gets a worker
+/// thread of its own, so it flips while a preview runs, not only when the preview yields.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn b20_import_reads_one_state_while_jellyfin_writes() {
+    use sqlx::{ConnectOptions, Connection};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    for (name, layout, file, flips) in [
+        ("new", jf::Layout::New, "jellyfin.db", B20_FLIPS_NEW),
+        ("old", jf::Layout::Old, "library.db", B20_FLIPS_OLD),
+    ] {
+        let w = b20_world().await;
+        let install = b20_install(&w, name, layout).await;
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(install.join("data").join(file))
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .busy_timeout(std::time::Duration::from_secs(30));
+        let mut body = b20_body(&w, &install);
+        body["MetadataMode"] = serde_json::json!("FillEmpty");
+        let mut states = Vec::new();
+        for flip in flips {
+            let mut conn = options.connect().await.unwrap();
+            sqlx::raw_sql(flip).execute(&mut conn).await.unwrap();
+            conn.close().await.unwrap();
+            states.push(b20_seen(&b20_preview(&w, body.clone()).await));
+        }
+        assert!(
+            states[0].0 != states[1].0 && states[0].1 != states[1].1,
+            "{name}: the two states look alike: {states:?}"
+        );
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let flipped = Arc::new(AtomicUsize::new(0));
+        // No fsync per commit: the writer flips often, as a busy Jellyfin would.
+        let mut conn = options
+            .clone()
+            .synchronous(sqlx::sqlite::SqliteSynchronous::Off)
+            .connect()
+            .await
+            .unwrap();
+        let writer = tokio::spawn({
+            let (stop, flipped) = (stop.clone(), flipped.clone());
+            async move {
+                let mut n = 0;
+                while !stop.load(Ordering::Relaxed) {
+                    sqlx::raw_sql(flips[n % 2])
+                        .execute(&mut conn)
+                        .await
+                        .unwrap();
+                    n += 1;
+                    flipped.store(n, Ordering::Relaxed);
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+                conn.close().await.unwrap();
+            }
+        });
+        let (mut read, mut overlapped) = (0, 0);
+        for attempt in 0..30 {
+            let before = flipped.load(Ordering::Relaxed);
+            let (status, report) = b20_post(&w, "Preview", body.clone()).await;
+            if flipped.load(Ordering::Relaxed) > before {
+                overlapped += 1;
+            }
+            if status == StatusCode::OK {
+                let seen = b20_seen(&report);
+                assert!(
+                    states.contains(&seen),
+                    "{name}: preview {attempt} mixed two states: {seen:?}, states {states:?}"
+                );
+                read += 1;
+            } else {
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{name}: {report}");
+                assert!(
+                    report.to_string().contains("kept changing"),
+                    "{name}: {report}"
+                );
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        writer.await.unwrap();
+        assert!(read > 0, "{name}: no preview read the source");
+        assert!(
+            overlapped >= 10,
+            "{name}: the writer flipped during only {overlapped} of 30 previews"
+        );
+    }
+}
+
+// B20 3: one-time codes and first sign-in.
+
+type B20Answer = (StatusCode, Option<String>, serde_json::Value);
+
+/// Runs an import that creates bob and returns his id and one-time code.
+async fn b20_pending_bob(w: &B20World) -> (uuid::Uuid, String) {
+    let install = b20_install(w, "jf", jf::Layout::New).await;
+    let report = b20_run(w, serde_json::json!({ "SourcePath": install })).await;
+    let bob = b20_entry(&report, "bob");
+    match (bob.user_id, bob.code) {
+        (Some(id), Some(code)) => (id, code),
+        _ => panic!("the run created no bob with a code"),
+    }
+}
+
+/// Sends `req`; returns the status, the `X-Rustyfin-Setup-Required` header and the JSON body.
+async fn b20_send(app: &axum::Router, req: Request<Body>) -> B20Answer {
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let header = resp
+        .headers()
+        .get("X-Rustyfin-Setup-Required")
+        .map(|value| value.to_str().unwrap().to_string());
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, header, json)
+}
+
+/// `POST /Users/AuthenticateByName` with `name` and `password`.
+async fn b20_sign_in(app: &axum::Router, name: &str, password: &str) -> B20Answer {
+    let body = serde_json::json!({ "Username": name, "Pw": password });
+    let req = request("POST", "/Users/AuthenticateByName", None, Some(body));
+    b20_send(app, req).await
+}
+
+/// `POST /Users/AuthenticateWithSetupCode` with `name`, `code` and the new password.
+async fn b20_redeem(app: &axum::Router, name: &str, code: &str, new_password: &str) -> B20Answer {
+    let body = serde_json::json!({ "Username": name, "Code": code, "NewPw": new_password });
+    let req = request("POST", "/Users/AuthenticateWithSetupCode", None, Some(body));
+    b20_send(app, req).await
+}
+
+/// `POST /JellyfinImport/Users/{user}/SetupCode` as the admin.
+async fn b20_reissue(w: &B20World, user: uuid::Uuid) -> (StatusCode, serde_json::Value) {
+    let uri = format!("/JellyfinImport/Users/{user}/SetupCode");
+    send(&w.app, request("POST", &uri, Some(&w.token), None)).await
+}
+
+/// `GET /JellyfinImport/PendingUsers` as the admin; expects 200 and a JSON array.
+async fn b20_pending(w: &B20World) -> Vec<serde_json::Value> {
+    let uri = "/JellyfinImport/PendingUsers";
+    let (status, answer) = send(&w.app, request("GET", uri, Some(&w.token), None)).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    answer.as_array().expect("PendingUsers is no array").clone()
+}
+
+/// A pending user's entry: its id, name and date.
+fn b20_pending_entry(
+    entry: &serde_json::Value,
+) -> (uuid::Uuid, String, chrono::DateTime<chrono::Utc>) {
+    assert_eq!(entry.as_object().map(|o| o.len()), Some(3), "{entry}");
+    let id = uuid::Uuid::parse_str(entry["UserId"].as_str().unwrap()).unwrap();
+    let name = entry["Name"].as_str().unwrap().to_string();
+    let at = chrono::DateTime::parse_from_rfc3339(entry["CreatedAt"].as_str().unwrap()).unwrap();
+    (id, name, at.with_timezone(&chrono::Utc))
+}
+
+/// How many tokens and sessions `user` has.
+async fn b20_sessions(state: &AppState, user: uuid::Uuid) -> (i64, i64) {
+    let mut counts = Vec::new();
+    for sql in [
+        "SELECT COUNT(*) FROM access_tokens WHERE user_id = ?",
+        "SELECT COUNT(*) FROM sessions WHERE user_id = ?",
+    ] {
+        let n: i64 = sqlx::query_scalar(sql)
+            .bind(user.to_string())
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        counts.push(n);
+    }
+    (counts[0], counts[1])
+}
+
+/// Whether `text` holds `code` in any form a client may send.
+fn b20_holds_code(text: &str, code: &str) -> bool {
+    let bare = code.replace('-', "");
+    [
+        code.to_string(),
+        code.to_lowercase(),
+        bare.clone(),
+        bare.to_lowercase(),
+    ]
+    .iter()
+    .any(|form| text.contains(form.as_str()))
+}
+
+#[tokio::test]
+async fn b20_code_sign_in_asks_for_a_new_password() {
+    let w = b20_world().await;
+    let (bob, code) = b20_pending_bob(&w).await;
+    let (failed, header, failed_body) = b20_sign_in(&w.app, "bob", "wrong password").await;
+    assert_eq!(failed, StatusCode::UNAUTHORIZED);
+    assert_eq!(header, None, "a wrong password asks for a new password");
+
+    let log = jf::LogCapture::start();
+    let lower = code.to_lowercase();
+    let bare = code.replace('-', "");
+    let spaced = format!(" {} ", code.replace('-', " "));
+    for (form, typed) in [
+        ("as shown", code.as_str()),
+        ("lowercase", lower.as_str()),
+        ("without dashes", bare.as_str()),
+        ("with spaces", spaced.as_str()),
+    ] {
+        let (status, header, body) = b20_sign_in(&w.app, "bob", typed).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{form}");
+        assert_eq!(header.as_deref(), Some("true"), "{form}: no setup header");
+        assert_eq!(body, failed_body, "{form}: not a failed sign-in's body");
+    }
+    let text = log.text();
+    drop(log);
+    assert!(!b20_holds_code(&text, &code), "the code is in the log");
+
+    // Only bob's own code asks for a new password, and it gives no session.
+    let other = rustyfin_auth::generate_setup_code();
+    for (case, name, typed) in [
+        ("another code", "bob", other.as_str()),
+        ("unknown user", "nobody", code.as_str()),
+        ("a user without a code", "alice", code.as_str()),
+    ] {
+        let (status, header, body) = b20_sign_in(&w.app, name, typed).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{case}");
+        assert_eq!(header, None, "{case}: setup header");
+        assert_eq!(body, failed_body, "{case}");
+    }
+    assert_eq!(
+        b20_sessions(&w.state, bob).await,
+        (0, 0),
+        "bob got a session"
+    );
+    assert_eq!(
+        b20_code_rows(&w.state).await.len(),
+        1,
+        "a sign-in used the code"
+    );
+    assert!(login(&w.app, "alice", "alicepass").await.is_some());
+}
+
+#[tokio::test]
+async fn b20_setup_code_sets_the_password_and_signs_in() {
+    let w = b20_world().await;
+    let (bob, code) = b20_pending_bob(&w).await;
+    let log = jf::LogCapture::start();
+    let (status, header, answer) =
+        b20_redeem(&w.app, "bob", &code.to_lowercase(), "new pass").await;
+    let text = log.text();
+    drop(log);
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(header, None);
+    let id = answer["User"]["Id"].as_str().expect("no User.Id");
+    assert_eq!(uuid::Uuid::parse_str(id).unwrap(), bob, "{answer}");
+    assert_eq!(answer["User"]["Name"], "bob", "{answer}");
+    assert!(answer["SessionInfo"]["Id"].is_string(), "{answer}");
+    assert!(answer["ServerId"].is_string(), "{answer}");
+    let token = answer["AccessToken"].as_str().expect("no AccessToken");
+    assert!(
+        !b20_holds_code(&answer.to_string(), &code),
+        "the code is in the answer"
+    );
+    assert!(!b20_holds_code(&text, &code), "the code is in the log");
+    assert!(!text.contains("new pass"), "the password is in the log");
+
+    let (status, me) = send_authed(&w.app, "GET", "/Users/Me", token, None).await;
+    assert_eq!(status, StatusCode::OK, "{me}");
+    assert_eq!(me["Name"], "bob");
+    assert_eq!(b20_sessions(&w.state, bob).await, (1, 1));
+
+    // The new password signs in; the code is used up everywhere.
+    assert!(login(&w.app, "bob", "new pass").await.is_some());
+    let (status, header, _) = b20_sign_in(&w.app, "bob", &code).await;
+    assert_eq!(
+        (status, header),
+        (StatusCode::UNAUTHORIZED, None),
+        "sign-in"
+    );
+    let (status, _, _) = b20_redeem(&w.app, "bob", &code, "another").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "the code worked twice");
+    assert!(login(&w.app, "bob", "another").await.is_none());
+    assert!(
+        b20_code_rows(&w.state).await.is_empty(),
+        "the code row stays"
+    );
+    assert!(b20_pending(&w).await.is_empty(), "bob is still pending");
+}
+
+#[tokio::test]
+async fn b20_setup_code_refuses_bad_requests() {
+    let w = b20_world().await;
+    let (_, code) = b20_pending_bob(&w).await;
+    let (_, _, failed_body) = b20_sign_in(&w.app, "bob", "wrong password").await;
+    let (status, _, answer) = b20_redeem(&w.app, "bob", &code, "").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "empty NewPw: {answer}");
+
+    let other = rustyfin_auth::generate_setup_code();
+    for (case, name, typed) in [
+        ("another code", "bob", other.as_str()),
+        ("not a code", "bob", "letmein"),
+        ("unknown user", "nobody", code.as_str()),
+        ("a user without a code", "alice", code.as_str()),
+    ] {
+        let (status, header, body) = b20_redeem(&w.app, name, typed, "new pass").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{case}");
+        assert_eq!(header, None, "{case}");
+        assert_eq!(body, failed_body, "{case}");
+    }
+    assert!(
+        login(&w.app, "alice", "alicepass").await.is_some(),
+        "alice's password changed"
+    );
+    assert!(login(&w.app, "alice", "new pass").await.is_none());
+    assert!(login(&w.app, "bob", "new pass").await.is_none());
+    assert_eq!(
+        b20_code_rows(&w.state).await.len(),
+        1,
+        "a refusal used the code"
+    );
+    let (status, _, _) = b20_redeem(&w.app, "bob", &code, "new pass").await;
+    assert_eq!(status, StatusCode::OK, "the code no longer works");
+}
+
+#[tokio::test]
+async fn b20_disabled_pending_user_cannot_use_the_code() {
+    let w = b20_world().await;
+    let (bob, code) = b20_pending_bob(&w).await;
+    sqlx::query("UPDATE users SET is_disabled = 1 WHERE id = ?")
+        .bind(bob.to_string())
+        .execute(&w.state.db)
+        .await
+        .unwrap();
+    let (status, header, _) = b20_sign_in(&w.app, "bob", &code).await;
+    assert_eq!(
+        (status, header),
+        (StatusCode::UNAUTHORIZED, None),
+        "sign-in"
+    );
+    let (status, _, _) = b20_redeem(&w.app, "bob", &code, "new pass").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "redeem");
+    assert_eq!(
+        b20_code_rows(&w.state).await.len(),
+        1,
+        "a disabled user used the code"
+    );
+    assert_eq!(b20_sessions(&w.state, bob).await, (0, 0));
+}
+
+#[tokio::test]
+async fn b20_setup_code_checks_cost_the_same_for_everyone() {
+    use std::time::{Duration, Instant};
+    // carol is a second pending user, disabled below.
+    let mut w = b20_world().await;
+    w.source.users.push(jf::JfUser::new(3, "carol", false));
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+    let report = b20_run(&w, serde_json::json!({ "SourcePath": install })).await;
+    assert!(b20_entry(&report, "bob").code.is_some(), "bob has no code");
+    let carol = b20_entry(&report, "carol").user_id.unwrap();
+    sqlx::query("UPDATE users SET is_disabled = 1 WHERE id = ?")
+        .bind(carol.to_string())
+        .execute(&w.state.db)
+        .await
+        .unwrap();
+
+    // bob with a wrong code is the measure: his code hash is verified. Then a user that doesn't
+    // exist, alice (no code), carol (disabled) and bob with a code of the wrong shape.
+    let wrong = "0000-0000-0000";
+    let cases = [
+        ("bob", wrong),
+        ("nobody", wrong),
+        ("alice", wrong),
+        ("carol", wrong),
+        ("bob", "not a code"),
+    ];
+    let device = rustyfin_auth::TokenDevice {
+        device_id: "b20-timing".to_string(),
+        device_name: "test".to_string(),
+        app_name: "test".to_string(),
+        app_version: "1".to_string(),
+    };
+    let mut redeem = [Duration::MAX; 5];
+    let mut pending = [Duration::MAX; 5];
+    let mut errors = Vec::new();
+    // The fastest of two tries, the cases in turn.
+    for _ in 0..2 {
+        for (n, (name, code)) in cases.iter().enumerate() {
+            let start = Instant::now();
+            let result = rustyfin_auth::authenticate_with_setup_code(
+                &w.state.db,
+                name,
+                code,
+                "new pass",
+                &device,
+            )
+            .await;
+            redeem[n] = redeem[n].min(start.elapsed());
+            errors.push((*name, *code, result.err().map(|e| format!("{e:?}"))));
+            let start = Instant::now();
+            let found = rustyfin_auth::setup_code_pending(&w.state.db, name, code)
+                .await
+                .unwrap();
+            pending[n] = pending[n].min(start.elapsed());
+            assert!(!found, "{name} with {code:?} is pending");
+        }
+    }
+    for (check, times) in [
+        ("AuthenticateWithSetupCode", redeem),
+        ("the code check of a sign-in", pending),
+    ] {
+        for (n, (name, code)) in cases.iter().enumerate().skip(1) {
+            assert!(
+                times[n] * 4 >= times[0],
+                "{check}: {name} with {code:?} took {:?}, bob with a wrong code {:?}",
+                times[n],
+                times[0]
+            );
+        }
+    }
+    for (name, code, error) in errors {
+        assert_eq!(
+            error.as_deref(),
+            Some("InvalidCredentials"),
+            "{name} with {code:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn b20_setup_code_sign_in_is_rate_limited() {
+    let mut state = test_state().await;
+    state.rate_limiter = RateLimiter::new(3, 60);
+    let app = remote_app(state);
+    let body = serde_json::json!({ "Username": "nobody", "Code": "AAAA-AAAA-AAAA", "NewPw": "x" });
+    let attempt = || {
+        request(
+            "POST",
+            "/Users/AuthenticateWithSetupCode",
+            None,
+            Some(body.clone()),
+        )
+    };
+    for n in 1..=3 {
+        let status = send(&app, attempt()).await.0;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "attempt {n}");
+    }
+    let status = send(&app, attempt()).await.0;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn b20_pending_users_and_reissue_are_admin_only() {
+    let w = b20_world().await;
+    let (bob, _) = b20_pending_bob(&w).await;
+    let codes = b20_code_rows(&w.state).await;
+    add_user(&w.state, "viewer", "viewerpass", false).await;
+    let (viewer, _) = login(&w.app, "viewer", "viewerpass").await.unwrap();
+    let pending = "/JellyfinImport/PendingUsers";
+    g1_assert_admin_only(&w.app, "GET", pending, &None, &viewer).await;
+    let reissue = format!("/JellyfinImport/Users/{bob}/SetupCode");
+    g1_assert_admin_only(&w.app, "POST", &reissue, &None, &viewer).await;
+    assert_eq!(
+        b20_code_rows(&w.state).await,
+        codes,
+        "a refused reissue wrote"
+    );
+}
+
+#[tokio::test]
+async fn b20_pending_users_lists_users_with_a_code() {
+    let mut w = b20_world().await;
+    w.source.users.push(jf::JfUser::new(3, "Carol", false));
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+    let started = chrono::Utc::now();
+    let report = b20_run(&w, serde_json::json!({ "SourcePath": install })).await;
+    let ended = chrono::Utc::now();
+    let bob = b20_entry(&report, "bob").user_id.unwrap();
+    let carol = b20_entry(&report, "Carol").user_id.unwrap();
+
+    // Sorted by name, case-insensitively; alice (matched) and the admin are not pending.
+    let listed: Vec<_> = b20_pending(&w)
+        .await
+        .iter()
+        .map(b20_pending_entry)
+        .collect();
+    let names: Vec<(uuid::Uuid, &str)> = listed
+        .iter()
+        .map(|(id, name, _)| (*id, name.as_str()))
+        .collect();
+    assert_eq!(names, vec![(bob, "bob"), (carol, "Carol")]);
+    for (_, name, at) in &listed {
+        let window = started - chrono::Duration::seconds(1)..=ended + chrono::Duration::seconds(1);
+        assert!(window.contains(at), "{name}: CreatedAt {at}");
+    }
+}
+
+#[tokio::test]
+async fn b20_reissue_replaces_the_code() {
+    let w = b20_world().await;
+    let (bob, old) = b20_pending_bob(&w).await;
+    let before = b20_pending_entry(&b20_pending(&w).await[0]);
+    let log = jf::LogCapture::start();
+    let (status, answer) = b20_reissue(&w, bob).await;
+    let text = log.text();
+    drop(log);
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        answer.as_object().map(|o| o.len()),
+        Some(3),
+        "not UserId, Name and Code"
+    );
+    let id = uuid::Uuid::parse_str(answer["UserId"].as_str().unwrap()).unwrap();
+    assert_eq!(id, bob);
+    assert_eq!(answer["Name"], "bob");
+    let new = answer["Code"].as_str().expect("no Code").to_string();
+    assert!(b20_is_code(&new), "not a code");
+    assert_ne!(new, old);
+    assert!(!b20_holds_code(&text, &new), "the code is in the log");
+    let info = |l: &str| l.contains("INFO") && l.contains("jellyfin import: new setup code");
+    assert!(text.lines().any(info), "no INFO line");
+
+    let hash: String =
+        sqlx::query_scalar("SELECT code_hash FROM user_setup_codes WHERE user_id = ?")
+            .bind(bob.to_string())
+            .fetch_one(&w.state.db)
+            .await
+            .unwrap();
+    assert!(!b20_holds_code(&hash, &new), "the code is stored");
+    let verified = rustyfin_auth::verify_setup_code(&new, &hash).await.unwrap();
+    assert!(verified, "the hash is not the new code's");
+    assert!(
+        !b20_holds_code(&b20_status(&w).await.to_string(), &new),
+        "in the status"
+    );
+    let after = b20_pending_entry(&b20_pending(&w).await[0]);
+    assert_eq!((after.0, &after.1), (before.0, &before.1));
+    assert!(after.2 >= before.2, "CreatedAt went back");
+
+    // The old code is dead; the new one asks for a new password and redeems.
+    let (status, header, _) = b20_sign_in(&w.app, "bob", &old).await;
+    assert_eq!(
+        (status, header),
+        (StatusCode::UNAUTHORIZED, None),
+        "old code"
+    );
+    let (status, _, _) = b20_redeem(&w.app, "bob", &old, "new pass").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "the old code redeemed");
+    let (status, header, _) = b20_sign_in(&w.app, "bob", &new).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(header.as_deref(), Some("true"), "new code");
+    let (status, _, _) = b20_redeem(&w.app, "bob", &new, "new pass").await;
+    assert_eq!(status, StatusCode::OK, "the new code");
+}
+
+#[tokio::test]
+async fn b20_reissue_refuses_users_without_a_code() {
+    let w = b20_world().await;
+    let (bob, code) = b20_pending_bob(&w).await;
+    let (status, answer) = b20_reissue(&w, uuid::Uuid::new_v4()).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "unknown user: {answer}");
+    let (status, answer) = b20_reissue(&w, w.alice).await;
+    assert_eq!(status, StatusCode::CONFLICT, "alice: {answer}");
+    let (status, _, _) = b20_redeem(&w.app, "bob", &code, "new pass").await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, answer) = b20_reissue(&w, bob).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "bob after his sign-in: {answer}"
+    );
+    assert!(
+        b20_code_rows(&w.state).await.is_empty(),
+        "a refused reissue wrote"
+    );
+    assert!(b20_pending(&w).await.is_empty());
+    assert!(login(&w.app, "bob", "new pass").await.is_some());
+    assert!(login(&w.app, "alice", "alicepass").await.is_some());
+}
+
+#[tokio::test]
+async fn b20_setting_a_password_ends_the_code() {
+    let w = b20_world().await;
+    let (bob, code) = b20_pending_bob(&w).await;
+    let uri = format!("/Users/{bob}/Password");
+    let body = serde_json::json!({ "CurrentPw": "", "NewPw": "set by admin" });
+    let (status, answer) = send(&w.app, request("POST", &uri, Some(&w.token), Some(body))).await;
+    assert!(status.is_success(), "{status} {answer}");
+    assert!(
+        b20_code_rows(&w.state).await.is_empty(),
+        "the code row stays"
+    );
+    assert!(b20_pending(&w).await.is_empty(), "bob is still pending");
+    let (status, header, _) = b20_sign_in(&w.app, "bob", &code).await;
+    assert_eq!(
+        (status, header),
+        (StatusCode::UNAUTHORIZED, None),
+        "sign-in"
+    );
+    let (status, _, _) = b20_redeem(&w.app, "bob", &code, "mine").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "redeem");
+    let (status, _) = b20_reissue(&w, bob).await;
+    assert_eq!(status, StatusCode::CONFLICT, "reissue");
+    assert!(login(&w.app, "bob", "set by admin").await.is_some());
+}
+
+// B20 5: metadata for matched items.
+
+/// Replaces the world's Jellyfin item `name` with `edit` of it.
+fn b20_edit(w: &mut B20World, name: &str, edit: impl FnOnce(jf::JfItem) -> jf::JfItem) {
+    let at = w.source.items.iter().position(|i| i.name == name);
+    let at = at.unwrap_or_else(|| panic!("no Jellyfin item {name}"));
+    w.source.items[at] = edit(w.source.items[at].clone());
+}
+
+/// The metadata world's install, Rustyfin's item ids (taken before an import renames anything)
+/// and the bytes of the usable Jellyfin images.
+struct B20Meta {
+    install: std::path::PathBuf,
+    alpha: uuid::Uuid,
+    beta: uuid::Uuid,
+    show: uuid::Uuid,
+    e1: uuid::Uuid,
+    e3: uuid::Uuid,
+    poster: Vec<u8>,
+    backdrop: Vec<u8>,
+    logo: Vec<u8>,
+    show_poster: Vec<u8>,
+    ann: Vec<u8>,
+}
+
+/// The B20 world with Jellyfin metadata, installed into the folder `name` in `layout`.
+///
+/// Jellyfin's Alpha, renamed "Alpha: Jellyfin Cut", has every field, TMDB and IMDb ids, four
+/// credits (Ann twice) and ten image rows: a poster; a missing backdrop before a usable one, so
+/// indexes have no gap; a logo beside the media; a Box (ignored); and five unusable rows: a `..`
+/// path to a JPEG, a URL, a text file, a symlink to a JPEG outside the metadata folder, and the
+/// database through `%AppDataPath%`. Beta has some fields, an IMDb id and a credit; Rustyfin's
+/// Beta already has an overview, genres and a rating. The Show has an overview, a studio, a
+/// creator and a poster; Rustyfin's Show already has a person and a local poster. S01E01 has an
+/// overview and a date. Jellyfin's Ann (with a portrait) and Dan (whose portrait file is missing)
+/// are Person items.
+async fn b20_meta_world(name: &str, layout: jf::Layout) -> (B20World, B20Meta) {
+    let mut w = b20_world().await;
+    let dir = "/config/metadata/library/a1/alpha";
+    b20_edit(&mut w, "Alpha", |i| {
+        let mut alpha = i
+            .provider("Tmdb", "111")
+            .provider("Imdb", "tt0000111")
+            .meta(jf::JfMeta {
+                forced_sort_name: Some("Alpha, The"),
+                original_title: Some("Alfa"),
+                overview: Some("Jellyfin overview of Alpha."),
+                tagline: Some("First of all."),
+                official_rating: Some("PG-13"),
+                community_rating: Some(7.5),
+                critic_rating: Some(88.0),
+                premiere_date: Some("2001-05-04 00:00:00"),
+                production_year: Some(2001),
+                genres: Some("Drama| Comedy |Drama"),
+                studios: Some("Acme Pictures|Big Studio"),
+                tags: Some("favourite"),
+                ..Default::default()
+            })
+            .credit("Ann Actor", Some("Actor"), "Hero", Some(1))
+            .credit("Dan Director", Some("Director"), "", Some(0))
+            .credit("Ann Actor", Some("Actor"), "Cameo", Some(2))
+            .credit("Nora Nobody", None, "", None)
+            .image(
+                &format!("{dir}/poster.jpg"),
+                0,
+                (1000, 1500),
+                Some("LEHV*nWB|yk8"),
+            )
+            .image(&format!("{dir}/backdrop1.jpg"), 2, (1920, 1080), None)
+            .image(
+                "%MetadataPath%/library/a1/alpha/backdrop.png",
+                2,
+                (1920, 1080),
+                None,
+            )
+            .image("/data/movies/Alpha (2001)/logo.png", 4, (0, 0), None)
+            .image(&format!("{dir}/box.jpg"), 7, (100, 100), None)
+            .image("/config/metadata/../outside.jpg", 5, (100, 100), None)
+            .image("https://image.example/banner.jpg", 3, (100, 100), None)
+            .image(&format!("{dir}/notimage.jpg"), 1, (100, 100), None)
+            .image(&format!("{dir}/disc.jpg"), 6, (100, 100), None)
+            .image("%AppDataPath%/jellyfin.db", 8, (100, 100), None);
+        alpha.name = "Alpha: Jellyfin Cut".to_string();
+        alpha
+    });
+    b20_edit(&mut w, "Beta", |i| {
+        i.provider("Imdb", "tt0000222")
+            .meta(jf::JfMeta {
+                overview: Some("Jellyfin overview of Beta."),
+                community_rating: Some(6.0),
+                production_year: Some(2002),
+                genres: Some("Thriller"),
+                ..Default::default()
+            })
+            .credit("Bea Star", Some("Actor"), "Lead", Some(0))
+    });
+    b20_edit(&mut w, "Show", |i| {
+        i.meta(jf::JfMeta {
+            overview: Some("A show."),
+            studios: Some("Acme TV"),
+            ..Default::default()
+        })
+        .credit("Sam Showrunner", Some("Creator"), "", Some(0))
+        .image(
+            "%MetadataPath%/library/b2/show/poster.jpg",
+            0,
+            (680, 1000),
+            None,
+        )
+    });
+    b20_edit(&mut w, "Show S01E01", |i| {
+        i.meta(jf::JfMeta {
+            overview: Some("Pilot."),
+            premiere_date: Some("2025-01-10 00:00:00"),
+            ..Default::default()
+        })
+    });
+    let ann_dir = "%MetadataPath%/People/A/Ann Actor";
+    let ann = jf::JfItem::new("Person", "Ann Actor", Some(ann_dir)).image(
+        &format!("{ann_dir}/folder.jpg"),
+        0,
+        (300, 450),
+        Some("LKO2?U%2Tw=w"),
+    );
+    let dan = jf::JfItem::new("Person", "Dan Director", None).image(
+        "/config/metadata/People/D/Dan Director/folder.jpg",
+        0,
+        (300, 450),
+        None,
+    );
+    w.source.items.extend([ann, dan]);
+    let install = b20_install(&w, name, layout).await;
+
+    let library = install.join("metadata/library");
+    let alpha_dir = library.join("a1/alpha");
+    let poster = jf::write_image(&alpha_dir.join("poster.jpg"), jf::JPEG_HEAD, "alpha poster");
+    let backdrop = jf::write_image(&alpha_dir.join("backdrop.png"), jf::PNG_HEAD, "backdrop");
+    jf::write_image(&alpha_dir.join("box.jpg"), jf::JPEG_HEAD, "alpha box");
+    std::fs::write(alpha_dir.join("notimage.jpg"), "not an image").unwrap();
+    jf::write_image(&install.join("outside.jpg"), jf::JPEG_HEAD, "outside");
+    let escaped = w.jf_root.join("escaped.jpg");
+    jf::write_image(&escaped, jf::JPEG_HEAD, "escaped");
+    std::os::unix::fs::symlink(&escaped, alpha_dir.join("disc.jpg")).unwrap();
+    let logo_path = format!("{}/Alpha (2001)/logo.png", w.movies);
+    let logo = jf::write_image(std::path::Path::new(&logo_path), jf::PNG_HEAD, "alpha logo");
+    let show_poster = jf::write_image(&library.join("b2/show/poster.jpg"), jf::JPEG_HEAD, "show");
+    let ann_file = install.join("metadata/People/A/Ann Actor/folder.jpg");
+    let ann_bytes = jf::write_image(&ann_file, jf::JPEG_HEAD, "ann portrait");
+
+    let alpha = b20_item(&w.state, "Alpha").await;
+    let beta = b20_item(&w.state, "Beta").await;
+    let show = b20_item(&w.state, "Show").await;
+    let e1 = b20_item(&w.state, "Show S01E01").await;
+    let e3 = b20_item(&w.state, "Show S01E03").await;
+    sqlx::query(
+        "UPDATE media_items SET overview = 'Rustyfin overview', genres = 'Action', \
+         official_rating = 'R' WHERE id = ?",
+    )
+    .bind(beta.to_string())
+    .execute(&w.state.db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO item_images (item_id, image_type, image_index, path, provider) \
+         VALUES (?, 'Primary', 0, '/nowhere/show.jpg', 'local')",
+    )
+    .bind(show.to_string())
+    .execute(&w.state.db)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO people (id, name, type) VALUES ('old-actor', 'Old Actor', 'Actor')")
+        .execute(&w.state.db)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO item_people (item_id, person_id, type) VALUES (?, 'old-actor', 'Actor')",
+    )
+    .bind(show.to_string())
+    .execute(&w.state.db)
+    .await
+    .unwrap();
+    let meta = B20Meta {
+        install,
+        alpha,
+        beta,
+        show,
+        e1,
+        e3,
+        poster,
+        backdrop,
+        logo,
+        show_poster,
+        ann: ann_bytes,
+    };
+    (w, meta)
+}
+
+/// A report's metadata counts: [Items, Fields, People, Images, ImagesMissing, Locked].
+fn b20_meta_counts(report: &serde_json::Value) -> [i64; 6] {
+    [
+        "Items",
+        "Fields",
+        "People",
+        "Images",
+        "ImagesMissing",
+        "Locked",
+    ]
+    .map(|key| report["Metadata"][key].as_i64().unwrap_or(-1))
+}
+
+/// The metadata of `item`: its fields, its extras and its studios (names sorted, joined by `|`).
+async fn b20_fields(state: &AppState, item: uuid::Uuid) -> serde_json::Value {
+    let text: String = sqlx::query_scalar(
+        "SELECT json_object('name', m.name, 'sort_name', m.sort_name, 'overview', m.overview, \
+         'tagline', m.tagline, 'official_rating', m.official_rating, \
+         'community_rating', m.community_rating, 'premiere_date', m.premiere_date, \
+         'end_date', m.end_date, 'production_year', m.production_year, 'genres', m.genres, \
+         'tags', m.tags, 'tmdb_id', m.tmdb_id, 'tvdb_id', m.tvdb_id, \
+         'original_title', x.original_title, 'critic_rating', x.critic_rating, \
+         'imdb_id', x.imdb_id, 'studios', (SELECT group_concat(name, '|') FROM \
+         (SELECT s.name FROM item_studios i JOIN studios s ON s.id = i.studio_id \
+         WHERE i.item_id = m.id ORDER BY s.name))) \
+         FROM media_items m LEFT JOIN item_metadata_extras x ON x.item_id = m.id WHERE m.id = ?",
+    )
+    .bind(item.to_string())
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    serde_json::from_str(&text).unwrap()
+}
+
+/// What `b20_fields` gives for an item named `name` with no metadata, with `changes` applied.
+fn b20_expect(name: &str, changes: serde_json::Value) -> serde_json::Value {
+    let mut fields = serde_json::json!({
+        "name": name,
+        "sort_name": null,
+        "overview": null,
+        "tagline": null,
+        "official_rating": null,
+        "community_rating": null,
+        "premiere_date": null,
+        "end_date": null,
+        "production_year": null,
+        "genres": "[]",
+        "tags": "",
+        "tmdb_id": null,
+        "tvdb_id": null,
+        "original_title": null,
+        "critic_rating": null,
+        "imdb_id": null,
+        "studios": null,
+    });
+    for (key, value) in changes.as_object().unwrap() {
+        assert!(fields.get(key).is_some(), "no field {key}");
+        fields[key] = value.clone();
+    }
+    fields
+}
+
+/// Alpha's fields after an import of the metadata world, where Rustyfin names it `name`.
+fn b20_alpha_fields(name: &str) -> serde_json::Value {
+    let changes = serde_json::json!({
+        "sort_name": "alpha, the",
+        "overview": "Jellyfin overview of Alpha.",
+        "tagline": "First of all.",
+        "official_rating": "PG-13",
+        "community_rating": 7.5,
+        "premiere_date": "2001-05-04T00:00:00+00:00",
+        "production_year": 2001,
+        "genres": "Drama|Comedy",
+        "tags": "favourite",
+        "tmdb_id": 111,
+        "original_title": "Alfa",
+        "critic_rating": 88.0,
+        "imdb_id": "tt0000111",
+        "studios": "Acme Pictures|Big Studio",
+    });
+    b20_expect(name, changes)
+}
+
+/// The Show's fields after an import of the metadata world.
+fn b20_show_fields() -> serde_json::Value {
+    let changes =
+        serde_json::json!({ "overview": "A show.", "tvdb_id": 333, "studios": "Acme TV" });
+    b20_expect("Show", changes)
+}
+
+/// S01E01's fields after an import of the metadata world.
+fn b20_e1_fields() -> serde_json::Value {
+    let changes = serde_json::json!({
+        "overview": "Pilot.",
+        "premiere_date": "2025-01-10T00:00:00+00:00",
+    });
+    b20_expect("Show S01E01", changes)
+}
+
+/// Beta's fields after an import of the metadata world, with the overview and genres given.
+fn b20_beta_fields(overview: &str, genres: &str) -> serde_json::Value {
+    let changes = serde_json::json!({
+        "overview": overview,
+        "official_rating": "R",
+        "genres": genres,
+        "community_rating": 6.0,
+        "production_year": 2002,
+        "tmdb_id": 222,
+        "imdb_id": "tt0000222",
+    });
+    b20_expect("Beta", changes)
+}
+
+/// `GET /Items/{id}` as the admin; expects 200.
+async fn b20_get_item(w: &B20World, id: uuid::Uuid) -> serde_json::Value {
+    let uri = format!("/Items/{id}");
+    let (status, item) = send_authed(&w.app, "GET", &uri, &w.token, None).await;
+    assert_eq!(status, StatusCode::OK, "{item}");
+    item
+}
+
+/// A person of an item answer: (Name, Type, Role, PrimaryImageTag).
+type B20Person = (String, String, Option<String>, Option<String>);
+
+fn b20_person(name: &str, kind: &str, role: Option<&str>, tag: Option<&str>) -> B20Person {
+    let text = |s: Option<&str>| s.map(str::to_string);
+    (name.to_string(), kind.to_string(), text(role), text(tag))
+}
+
+/// The `People` of an item answer, in order.
+fn b20_people(item: &serde_json::Value) -> Vec<B20Person> {
+    let text = |p: &serde_json::Value, key: &str| p[key].as_str().map(str::to_string);
+    let people = item["People"].as_array().cloned().unwrap_or_default();
+    people
+        .iter()
+        .map(|p| {
+            (
+                text(p, "Name").unwrap_or_default(),
+                text(p, "Type").unwrap_or_default(),
+                text(p, "Role"),
+                text(p, "PrimaryImageTag"),
+            )
+        })
+        .collect()
+}
+
+/// Alpha's people after an import of the metadata world: in Jellyfin's list order, Ann once (her
+/// first credit), Nora without a kind, and only Ann with a portrait.
+fn b20_alpha_people() -> Vec<B20Person> {
+    vec![
+        b20_person("Dan Director", "Director", None, None),
+        b20_person("Ann Actor", "Actor", Some("Hero"), Some("Primary_0")),
+        b20_person("Nora Nobody", "Unknown", None, None),
+    ]
+}
+
+/// The id of the Rustyfin person `name`.
+async fn b20_person_id(state: &AppState, name: &str) -> String {
+    sqlx::query_scalar("SELECT id FROM people WHERE name = ?")
+        .bind(name)
+        .fetch_one(&state.db)
+        .await
+        .unwrap()
+}
+
+/// An image row: (type, index, path, provider, width, height, blurhash).
+type B20Image = (
+    String,
+    i64,
+    String,
+    String,
+    Option<i64>,
+    Option<i64>,
+    Option<String>,
+);
+
+/// The image rows of the item `id` (`person`: of the person `id`), by type and index.
+async fn b20_images(state: &AppState, id: &str, person: bool) -> Vec<B20Image> {
+    let sql = if person {
+        "SELECT image_type, image_index, path, provider, width, height, blurhash \
+         FROM person_images WHERE person_id = ? ORDER BY image_type, image_index"
+    } else {
+        "SELECT image_type, image_index, path, provider, width, height, blurhash \
+         FROM item_images WHERE item_id = ? ORDER BY image_type, image_index"
+    };
+    sqlx::query_as(sql)
+        .bind(id)
+        .fetch_all(&state.db)
+        .await
+        .unwrap()
+}
+
+/// Image rows without their path and provider: (type, index, width, height, blurhash).
+/// An image row without its path and provider: type, index, width, height, blurhash.
+type B20ImageShape<'a> = (&'a str, i64, Option<i64>, Option<i64>, Option<&'a str>);
+
+fn b20_image_shapes(rows: &[B20Image]) -> Vec<B20ImageShape<'_>> {
+    rows.iter()
+        .map(|(kind, index, _, _, width, height, hash)| {
+            (kind.as_str(), *index, *width, *height, hash.as_deref())
+        })
+        .collect()
+}
+
+/// Rustyfin's own poster of the Show in the metadata world.
+fn b20_local_poster() -> B20Image {
+    let path = "/nowhere/show.jpg".to_string();
+    (
+        "Primary".to_string(),
+        0,
+        path,
+        "local".to_string(),
+        None,
+        None,
+        None,
+    )
+}
+
+/// Checks that `row` is an imported copy `<data_dir>/images/<folder>/jf-<Type>-<index>-<16 hex>.<ext>`
+/// and returns the copy's bytes.
+fn b20_copy(state: &AppState, folder: &str, row: &B20Image, ext: &str) -> Vec<u8> {
+    let (kind, index, path, provider, ..) = row;
+    assert_eq!(provider, "jellyfin", "{row:?}");
+    let path = std::path::Path::new(path);
+    let parent = state.data_dir.join("images").join(folder);
+    assert_eq!(path.parent(), Some(parent.as_path()), "{row:?}");
+    let file = path.file_name().unwrap().to_str().unwrap();
+    let hex = file
+        .strip_prefix(&format!("jf-{kind}-{index}-"))
+        .and_then(|rest| rest.strip_suffix(&format!(".{ext}")));
+    let lower_hex = |h: &str| h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    assert!(
+        hex.is_some_and(|h| h.len() == 16 && lower_hex(h)),
+        "copy name {file}"
+    );
+    std::fs::read(path).unwrap()
+}
+
+/// GETs `uri` as the admin; returns the status and the body.
+async fn b20_get_bytes(w: &B20World, uri: &str) -> (StatusCode, Vec<u8>) {
+    let req = Request::builder()
+        .uri(uri)
+        .header("Authorization", format!("Bearer {}", w.token))
+        .body(Body::empty())
+        .unwrap();
+    let resp = w.app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, bytes.to_vec())
+}
+
+/// The regular files under `dir`, recursively, sorted; none when `dir` doesn't exist.
+fn b20_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut files = Vec::new();
+    let mut dirs = vec![dir.to_path_buf()];
+    while let Some(d) = dirs.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let kind = entry.file_type().unwrap();
+            if kind.is_dir() {
+                dirs.push(entry.path());
+            } else if kind.is_file() {
+                files.push(entry.path());
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+/// The rows of the tables the metadata import writes, as JSON arrays, sorted per table.
+async fn b20_meta_rows(state: &AppState) -> Vec<String> {
+    let image = "image_type, image_index, path, provider, width, height, blurhash";
+    let tables = [
+        ("item_images", format!("item_id, {image}")),
+        ("people", "id, name, type".to_string()),
+        (
+            "item_people",
+            "item_id, person_id, type, role, sort_order".to_string(),
+        ),
+        ("studios", "id, name".to_string()),
+        ("item_studios", "item_id, studio_id".to_string()),
+        (
+            "item_metadata_extras",
+            "item_id, original_title, critic_rating, imdb_id, lock_data, locked_fields".to_string(),
+        ),
+        ("person_images", format!("person_id, {image}")),
+    ];
+    let mut rows = Vec::new();
+    for (table, columns) in tables {
+        let sql = format!("SELECT json_array({columns}) FROM {table} ORDER BY 1");
+        let found: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+            .fetch_all(&state.db)
+            .await
+            .unwrap();
+        rows.push(format!("{table}: {}", found.join(" ")));
+    }
+    rows
+}
+
+/// The fields of every item, then `b20_meta_rows`.
+async fn b20_meta_digest(state: &AppState) -> Vec<String> {
+    let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM media_items ORDER BY id")
+        .fetch_all(&state.db)
+        .await
+        .unwrap();
+    let mut digest = Vec::new();
+    for id in ids {
+        let id = uuid::Uuid::parse_str(&id).unwrap();
+        digest.push(b20_fields(state, id).await.to_string());
+    }
+    digest.extend(b20_meta_rows(state).await);
+    digest
+}
+
+#[tokio::test]
+async fn b20_import_metadata_fills_empty_fields() {
+    for (name, layout) in [("new", jf::Layout::New), ("old", jf::Layout::Old)] {
+        let (w, m) = b20_meta_world(name, layout).await;
+        let before = jf::listing(&m.install);
+        let body = serde_json::json!({ "SourcePath": m.install });
+        let log = jf::LogCapture::start();
+        let preview = b20_preview(&w, body.clone()).await;
+        let report = b20_run(&w, body.clone()).await;
+        let status = b20_status(&w).await;
+        let text = log.text();
+        drop(log);
+        let counts = [4, 21, 4, 4, 7, 0];
+        assert_eq!(
+            b20_meta_counts(&preview),
+            counts,
+            "{name}: preview {preview}"
+        );
+        assert_eq!(b20_meta_counts(&report), counts, "{name}: {report}");
+        assert_eq!(report["Metadata"]["Mode"], "FillEmpty", "{name}");
+
+        assert_eq!(
+            b20_fields(&w.state, m.alpha).await,
+            b20_alpha_fields("Alpha"),
+            "{name}: Alpha"
+        );
+        assert_eq!(
+            b20_fields(&w.state, m.beta).await,
+            b20_beta_fields("Rustyfin overview", "Action"),
+            "{name}: Beta keeps its own"
+        );
+        let show_fields = b20_fields(&w.state, m.show).await;
+        assert_eq!(show_fields, b20_show_fields(), "{name}: Show");
+        assert_eq!(b20_fields(&w.state, m.e1).await, b20_e1_fields(), "{name}");
+        assert_eq!(
+            b20_fields(&w.state, m.e3).await,
+            b20_expect("Show S01E03", serde_json::json!({})),
+            "{name}: a name is never empty"
+        );
+
+        let alpha = b20_get_item(&w, m.alpha).await;
+        assert_eq!(b20_people(&alpha), b20_alpha_people(), "{name}");
+        assert_eq!(alpha["OriginalTitle"], "Alfa", "{name}");
+        assert_eq!(alpha["CriticRating"], 88.0, "{name}");
+        assert_eq!(alpha["ProviderIds"]["tmdb"], "111", "{name}");
+        assert_eq!(alpha["ProviderIds"]["imdb"], "tt0000111", "{name}");
+        assert_eq!(alpha["LockData"], false, "{name}");
+        assert_eq!(alpha["LockedFields"], serde_json::json!([]), "{name}");
+        let beta = b20_get_item(&w, m.beta).await;
+        let bea = b20_person("Bea Star", "Actor", Some("Lead"), None);
+        assert_eq!(b20_people(&beta), vec![bea], "{name}");
+        let show = b20_get_item(&w, m.show).await;
+        let old = b20_person("Old Actor", "Actor", None, None);
+        assert_eq!(
+            b20_people(&show),
+            vec![old],
+            "{name}: the Show keeps its people"
+        );
+        assert_eq!(
+            b20_images(&w.state, &m.show.to_string(), false).await,
+            vec![b20_local_poster()],
+            "{name}: the Show keeps its poster"
+        );
+
+        for answer in [&preview, &report, &status] {
+            assert!(
+                !answer.to_string().contains(jf::CANARY),
+                "{name}: secret in an answer"
+            );
+        }
+        assert!(!text.contains(jf::CANARY), "{name}: secret in the log");
+        let db = w.state.data_dir.join("test.db");
+        let mut files = vec![
+            db.clone(),
+            db.with_extension("db-wal"),
+            db.with_extension("db-shm"),
+        ];
+        files.extend(b20_files(&w.state.data_dir.join("images")));
+        assert!(
+            !jf::files_hold_canary(&files),
+            "{name}: secret in Rustyfin's files"
+        );
+        assert_eq!(
+            jf::listing(&m.install),
+            before,
+            "{name}: the source changed"
+        );
+
+        let digest = b20_meta_digest(&w.state).await;
+        let again = b20_run(&w, body).await;
+        assert_eq!(
+            b20_meta_counts(&again)[..4],
+            [0, 0, 0, 0],
+            "{name}: {again}"
+        );
+        assert_eq!(
+            b20_meta_digest(&w.state).await,
+            digest,
+            "{name}: the second run wrote"
+        );
+    }
+}
+
+/// Fix round 9 (re-check 8, N1): a run that writes metadata clears the cached item details and
+/// search answers. The Show's details, read before the run, show the imported overview right after
+/// it; at 60efa3f the cached copy without it was served for up to 300 s. Movie and episode details
+/// are never cached, so a Series shows it.
+#[tokio::test]
+async fn b20_import_metadata_clears_cached_details() {
+    let (w, m) = b20_meta_world("cached", jf::Layout::New).await;
+    let before = b20_get_item(&w, m.show).await;
+    assert_ne!(before["Overview"], "A show.", "{before}");
+    b20_run(&w, serde_json::json!({ "SourcePath": m.install })).await;
+    let after = b20_get_item(&w, m.show).await;
+    assert_eq!(after["Overview"], "A show.", "{after}");
+}
+
+#[tokio::test]
+async fn b20_import_metadata_copies_images() {
+    for (name, layout) in [("new", jf::Layout::New), ("old", jf::Layout::Old)] {
+        let (w, m) = b20_meta_world(name, layout).await;
+        let report = b20_run(&w, serde_json::json!({ "SourcePath": m.install })).await;
+        assert_eq!(b20_meta_counts(&report)[3..5], [4, 7], "{name}: {report}");
+        let alpha = m.alpha.to_string();
+        let rows = b20_images(&w.state, &alpha, false).await;
+        let shapes = vec![
+            ("Backdrop", 0, Some(1920), Some(1080), None),
+            ("Logo", 0, None, None, None),
+            ("Primary", 0, Some(1000), Some(1500), Some("LEHV*nWB|yk8")),
+        ];
+        assert_eq!(b20_image_shapes(&rows), shapes, "{name}: Alpha's rows");
+        assert_eq!(
+            b20_copy(&w.state, &alpha, &rows[0], "png"),
+            m.backdrop,
+            "{name}"
+        );
+        assert_eq!(
+            b20_copy(&w.state, &alpha, &rows[1], "png"),
+            m.logo,
+            "{name}"
+        );
+        assert_eq!(
+            b20_copy(&w.state, &alpha, &rows[2], "jpg"),
+            m.poster,
+            "{name}"
+        );
+
+        let ann = b20_person_id(&w.state, "Ann Actor").await;
+        let rows = b20_images(&w.state, &ann, true).await;
+        let shapes = vec![("Primary", 0, Some(300), Some(450), Some("LKO2?U%2Tw=w"))];
+        assert_eq!(b20_image_shapes(&rows), shapes, "{name}: Ann's rows");
+        let folder = format!("people/{ann}");
+        assert_eq!(
+            b20_copy(&w.state, &folder, &rows[0], "jpg"),
+            m.ann,
+            "{name}"
+        );
+        let dan = b20_person_id(&w.state, "Dan Director").await;
+        assert!(
+            b20_images(&w.state, &dan, true).await.is_empty(),
+            "{name}: Dan's portrait is missing"
+        );
+        let copies = b20_files(&w.state.data_dir.join("images"));
+        assert_eq!(copies.len(), 4, "{name}: {copies:?}");
+
+        for (uri, bytes) in [
+            (format!("/Items/{alpha}/Images/Primary"), &m.poster),
+            (format!("/Items/{alpha}/Images/Backdrop/0"), &m.backdrop),
+            (format!("/Items/{ann}/Images/Primary"), &m.ann),
+        ] {
+            let (status, body) = b20_get_bytes(&w, &uri).await;
+            assert_eq!(status, StatusCode::OK, "{name}: {uri}");
+            assert_eq!(&body, bytes, "{name}: {uri}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn b20_import_metadata_replaces_with_jellyfins() {
+    let (w, m) = b20_meta_world("jf", jf::Layout::New).await;
+    let body = serde_json::json!({ "SourcePath": m.install, "MetadataMode": "Replace" });
+    let report = b20_run(&w, body.clone()).await;
+    assert_eq!(b20_meta_counts(&report), [5, 25, 5, 5, 7, 0], "{report}");
+    assert_eq!(report["Metadata"]["Mode"], "Replace");
+    assert_eq!(
+        b20_fields(&w.state, m.alpha).await,
+        b20_alpha_fields("Alpha: Jellyfin Cut")
+    );
+    assert_eq!(
+        b20_fields(&w.state, m.beta).await,
+        b20_beta_fields("Jellyfin overview of Beta.", "Thriller"),
+        "Jellyfin has no rating for Beta, so its R stays"
+    );
+    assert_eq!(b20_fields(&w.state, m.show).await, b20_show_fields());
+    assert_eq!(b20_fields(&w.state, m.e1).await, b20_e1_fields());
+    let e3 = serde_json::json!({ "sort_name": "show 1x03" });
+    assert_eq!(
+        b20_fields(&w.state, m.e3).await,
+        b20_expect("Show 1x03", e3),
+        "the sort name follows a new name"
+    );
+
+    let alpha = b20_get_item(&w, m.alpha).await;
+    assert_eq!(b20_people(&alpha), b20_alpha_people());
+    let show = b20_get_item(&w, m.show).await;
+    let sam = b20_person("Sam Showrunner", "Creator", None, None);
+    assert_eq!(
+        b20_people(&show),
+        vec![sam],
+        "Jellyfin's people replace the Show's"
+    );
+    let show = m.show.to_string();
+    let rows = b20_images(&w.state, &show, false).await;
+    let shapes = vec![("Primary", 0, Some(680), Some(1000), None)];
+    assert_eq!(
+        b20_image_shapes(&rows),
+        shapes,
+        "Jellyfin's poster replaces the Show's"
+    );
+    assert_eq!(b20_copy(&w.state, &show, &rows[0], "jpg"), m.show_poster);
+    let images = w.state.data_dir.join("images");
+    assert_eq!(b20_files(&images).len(), 5);
+
+    let digest = b20_meta_digest(&w.state).await;
+    let again = b20_run(&w, body).await;
+    assert_eq!(b20_meta_counts(&again)[..4], [0, 0, 0, 0], "{again}");
+    assert_eq!(
+        b20_meta_digest(&w.state).await,
+        digest,
+        "the second run wrote"
+    );
+    assert_eq!(b20_files(&images).len(), 5, "the second run copied");
+}
+
+#[tokio::test]
+async fn b20_import_metadata_skips_locked_items_and_fields() {
+    let (w, m) = b20_meta_world("jf", jf::Layout::New).await;
+    for (item, lock_data, locked_fields) in [(m.show, 1, ""), (m.beta, 0, "Overview|Genres|Cast")] {
+        sqlx::query(
+            "INSERT INTO item_metadata_extras (item_id, lock_data, locked_fields) VALUES (?, ?, ?)",
+        )
+        .bind(item.to_string())
+        .bind(lock_data)
+        .bind(locked_fields)
+        .execute(&w.state.db)
+        .await
+        .unwrap();
+    }
+    let show_fields = b20_fields(&w.state, m.show).await;
+    let body = serde_json::json!({ "SourcePath": m.install, "MetadataMode": "Replace" });
+    let report = b20_run(&w, body).await;
+    assert_eq!(b20_meta_counts(&report), [4, 21, 3, 4, 7, 1], "{report}");
+
+    assert_eq!(
+        b20_fields(&w.state, m.beta).await,
+        b20_beta_fields("Rustyfin overview", "Action"),
+        "Beta's locked fields changed"
+    );
+    let beta = b20_get_item(&w, m.beta).await;
+    assert!(b20_people(&beta).is_empty(), "Beta's cast is locked");
+    assert_eq!(beta["LockData"], false);
+    let locked = serde_json::json!(["Overview", "Genres", "Cast"]);
+    assert_eq!(beta["LockedFields"], locked);
+
+    assert_eq!(
+        b20_fields(&w.state, m.show).await,
+        show_fields,
+        "the locked Show changed"
+    );
+    let show = b20_get_item(&w, m.show).await;
+    let old = b20_person("Old Actor", "Actor", None, None);
+    assert_eq!(b20_people(&show), vec![old]);
+    assert_eq!(show["LockData"], true);
+    assert_eq!(show["LockedFields"], serde_json::json!([]));
+    assert_eq!(
+        b20_images(&w.state, &m.show.to_string(), false).await,
+        vec![b20_local_poster()]
+    );
+    let created: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM people WHERE name IN ('Sam Showrunner', 'Bea Star')",
+    )
+    .fetch_one(&w.state.db)
+    .await
+    .unwrap();
+    assert_eq!(created, 0, "people of locked casts were created");
+    assert_eq!(
+        b20_fields(&w.state, m.alpha).await,
+        b20_alpha_fields("Alpha: Jellyfin Cut")
+    );
+}
+
+#[tokio::test]
+async fn b20_import_metadata_preview_and_mode_none_write_nothing() {
+    let (w, m) = b20_meta_world("jf", jf::Layout::New).await;
+    let before = b20_db_digest(&w.state).await;
+    let meta = b20_meta_digest(&w.state).await;
+    let fill = b20_preview(&w, serde_json::json!({ "SourcePath": m.install })).await;
+    assert_eq!(b20_meta_counts(&fill), [4, 21, 4, 4, 7, 0], "{fill}");
+    assert_eq!(fill["Metadata"]["Mode"], "FillEmpty");
+    let body = serde_json::json!({ "SourcePath": m.install, "MetadataMode": "Replace" });
+    let replace = b20_preview(&w, body).await;
+    assert_eq!(b20_meta_counts(&replace), [5, 25, 5, 5, 7, 0], "{replace}");
+    assert_eq!(replace["Metadata"]["Mode"], "Replace");
+    let pair = (
+        "/config/metadata".to_string(),
+        m.install.join("metadata").display().to_string(),
+    );
+    let pairs = b20_pairs(&fill, "SuggestedPathMappings");
+    assert_eq!(pairs.last(), Some(&pair), "{pairs:?}");
+    assert_eq!(b20_db_digest(&w.state).await, before, "the preview wrote");
+    assert_eq!(
+        b20_meta_digest(&w.state).await,
+        meta,
+        "the preview wrote metadata"
+    );
+    let images = w.state.data_dir.join("images");
+    assert!(!images.exists(), "the preview copied images");
+
+    let body = serde_json::json!({ "SourcePath": m.install, "MetadataMode": "None" });
+    let none = b20_run(&w, body).await;
+    assert_eq!(b20_meta_counts(&none), [0; 6], "{none}");
+    assert_eq!(none["Metadata"]["Mode"], "None");
+    assert_eq!(
+        b20_meta_digest(&w.state).await,
+        meta,
+        "mode None wrote metadata"
+    );
+    assert!(!images.exists(), "mode None copied images");
+}
+
+/// What a rescan must keep after a Replace import of the metadata world: Alpha's fields, the
+/// imported fields of the others (a rescan may give Beta and the Show the sort name they lack)
+/// and the metadata rows.
+async fn b20_imported(state: &AppState, m: &B20Meta) -> Vec<String> {
+    let picks: [(uuid::Uuid, &[&str]); 4] = [
+        (
+            m.beta,
+            &[
+                "overview",
+                "community_rating",
+                "production_year",
+                "genres",
+                "imdb_id",
+            ],
+        ),
+        (m.show, &["overview", "studios"]),
+        (m.e1, &["overview", "premiere_date"]),
+        (m.e3, &["name", "sort_name"]),
+    ];
+    let mut kept = vec![b20_fields(state, m.alpha).await.to_string()];
+    for (item, keys) in picks {
+        let fields = b20_fields(state, item).await;
+        kept.extend(keys.iter().map(|k| format!("{item} {k} {}", fields[*k])));
+    }
+    kept.extend(b20_meta_rows(state).await);
+    kept
+}
+
+#[tokio::test]
+async fn b20_import_metadata_survives_a_rescan() {
+    let (w, m) = b20_meta_world("jf", jf::Layout::New).await;
+    let paths: Vec<String> =
+        sqlx::query_scalar("SELECT path FROM media_items WHERE media_type IN ('Movie', 'Episode')")
+            .fetch_all(&w.state.db)
+            .await
+            .unwrap();
+    assert_eq!(paths.len(), 5);
+    for path in &paths {
+        let path = std::path::Path::new(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"").unwrap();
+    }
+    let body = serde_json::json!({ "SourcePath": m.install, "MetadataMode": "Replace" });
+    let report = b20_run(&w, body).await;
+    assert_eq!(b20_meta_counts(&report), [5, 25, 5, 5, 7, 0], "{report}");
+    let imported = b20_imported(&w.state, &m).await;
+
+    let libraries = rustyfin_db::repo_library::get_all_libraries(&w.state.db)
+        .await
+        .unwrap();
+    assert_eq!(libraries.len(), 2);
+    for library in &libraries {
+        rustyfin_core::scanner::scan_library(&w.state.db, library)
+            .await
+            .unwrap();
+    }
+    rustyfin_core::scanner::wait_for_idle().await;
+    assert_eq!(
+        b20_imported(&w.state, &m).await,
+        imported,
+        "the rescan lost imported data"
+    );
+}
+
+/// The B20 world with a stale Jellyfin entry of Alpha, installed into the folder `name` in
+/// `layout`. Jellyfin's Alpha gets TMDB 111 and an overview; "Alpha (stale)", listed before it, is
+/// a Movie at an old path in Alpha's folder with TMDB 111, its own overview and bob's played row.
+/// Rustyfin's Alpha has no TMDB id, so only an id the import writes can match the stale entry.
+/// `edit` gets the world and the stale entry's id before the install.
+async fn b20_stale_world_with(
+    name: &str,
+    layout: jf::Layout,
+    edit: impl FnOnce(&mut B20World, uuid::Uuid),
+) -> (B20World, std::path::PathBuf) {
+    let mut w = b20_world().await;
+    b20_edit(&mut w, "Alpha", |i| {
+        i.provider("Tmdb", "111").meta(jf::JfMeta {
+            overview: Some("Jellyfin overview of Alpha."),
+            ..Default::default()
+        })
+    });
+    let stale = jf::JfItem::new(
+        "Movie",
+        "Alpha (stale)",
+        Some("/data/movies/Alpha (2001)/Alpha.old.avi"),
+    )
+    .provider("Tmdb", "111")
+    .meta(jf::JfMeta {
+        overview: Some("Stale overview."),
+        ..Default::default()
+    });
+    let bob = w.source.user("bob").id;
+    w.source.user_data.push(jf::JfUserData {
+        user: bob,
+        item: stale.id,
+        played: true,
+        play_count: 1,
+        last_played: Some("2025-04-01 08:00:00"),
+        ..Default::default()
+    });
+    let stale_id = stale.id;
+    let at = w.source.items.iter().position(|i| i.name == "Alpha");
+    w.source.items.insert(at.unwrap(), stale);
+    edit(&mut w, stale_id);
+    let install = b20_install(&w, name, layout).await;
+    (w, install)
+}
+
+/// The stale world, as installed.
+async fn b20_stale_world(name: &str, layout: jf::Layout) -> (B20World, std::path::PathBuf) {
+    b20_stale_world_with(name, layout, |_, _| {}).await
+}
+
+#[tokio::test]
+async fn b20_import_maps_tracks_only_at_the_jellyfin_path() {
+    for (name, layout) in [("new", jf::Layout::New), ("old", jf::Layout::Old)] {
+        // bob chose the stale file's aac and German subtitles; Rustyfin's Alpha has streams of
+        // the same kinds and codecs, but at its own path, not the stale entry's.
+        let (w, install) = b20_stale_world_with(name, layout, |w, stale| {
+            let stream = jf::JfStream::new;
+            w.source.streams.extend([
+                stream(stale, 0, "Video", "h264"),
+                stream(stale, 1, "Audio", "aac"),
+                stream(stale, 2, "Subtitle", "srt").language("ger"),
+            ]);
+            let bob = w.source.user("bob").id;
+            let mut rows = w.source.user_data.iter_mut();
+            let row = rows
+                .find(|row| row.user == bob && row.item == stale)
+                .unwrap();
+            row.audio = Some(1);
+            row.subtitle = Some(2);
+        })
+        .await;
+        let alpha = b20_item(&w.state, "Alpha").await;
+        let alpha_file = std::path::PathBuf::from(format!("{}/Alpha (2001)/Alpha.mkv", w.movies));
+        let streams = serde_json::json!([
+            { "Index": 0, "Codec": "h264", "CodecType": "Video" },
+            { "Index": 1, "Codec": "aac", "CodecType": "Audio" },
+            { "Index": 2, "Codec": "subrip", "CodecType": "Subtitle" },
+        ]);
+        b20_insert_source(&w.state, alpha, &alpha_file, streams).await;
+
+        let body = serde_json::json!({ "SourcePath": install });
+        let preview = b20_preview(&w, body.clone()).await;
+        let report = b20_run(&w, body).await;
+        for report in [&preview, &report] {
+            assert_eq!(b20_track_counts(report), (0, 0, 0, 2), "{name}: {report}");
+        }
+        let bob = b20_entry(&report, "bob").user_id.unwrap().to_string();
+        let tracks = b20_stored_tracks(&w.state, &bob, alpha).await;
+        assert_eq!(tracks, (None, None), "{name}: choices of another file");
+    }
+}
+
+#[tokio::test]
+async fn b20_import_metadata_ids_count_for_matching() {
+    // The watch counts of the first run and of the second.
+    for (name, layout, first_watch, second_watch) in [
+        ("new", jf::Layout::New, (7, 5, 0, 2), (7, 0, 5, 2)),
+        ("old", jf::Layout::Old, (6, 5, 0, 1), (6, 0, 5, 1)),
+    ] {
+        let (w, install) = b20_stale_world(name, layout).await;
+        let mut body = b20_body(&w, &install);
+        let preview = b20_preview(&w, body.clone()).await;
+        let first = b20_run(&w, body.clone()).await;
+        for report in [&preview, &first] {
+            assert_eq!(b20_item_counts(report), (10, 5, 3, 2), "{name}: {report}");
+            assert_eq!(b20_watch_counts(report), first_watch, "{name}: {report}");
+            assert_eq!(
+                b20_meta_counts(report),
+                [1, 2, 0, 0, 0, 0],
+                "{name}: {report}"
+            );
+        }
+        let alpha = b20_item(&w.state, "Alpha").await;
+        let fields = b20_fields(&w.state, alpha).await;
+        assert_eq!(fields["tmdb_id"], 111, "{name}: {fields}");
+        assert_eq!(
+            fields["overview"], "Jellyfin overview of Alpha.",
+            "{name}: the path match is the source"
+        );
+        let bob = b20_entry(&first, "bob").user_id.unwrap();
+        let expected = B20Data {
+            played: true,
+            play_count: 1,
+            last_played: b20_at("2025-04-01T08:00:00Z"),
+            ..Default::default()
+        };
+        let stored = b20_data(&w.state, bob, alpha).await;
+        assert_eq!(
+            stored,
+            Some(expected),
+            "{name}: bob's row of the stale entry"
+        );
+
+        let rows = b20_db_digest(&w.state).await;
+        let meta = b20_meta_digest(&w.state).await;
+        body["ConfirmedMatches"] = b20_confirm(&w, &[("Alice", w.alice), ("bob", bob)]);
+        let second = b20_run(&w, body).await;
+        assert_eq!(b20_item_counts(&second), (10, 5, 3, 2), "{name}: {second}");
+        assert_eq!(b20_watch_counts(&second), second_watch, "{name}: {second}");
+        assert_eq!(b20_meta_counts(&second), [0; 6], "{name}: {second}");
+        assert_eq!(b20_db_digest(&w.state).await, rows, "{name}: second run");
+        assert_eq!(b20_meta_digest(&w.state).await, meta, "{name}: second run");
+    }
+}
+
+#[tokio::test]
+async fn b20_import_metadata_none_matches_on_stored_ids() {
+    // The watch counts of the first run and of the second.
+    for (name, layout, first_watch, second_watch) in [
+        ("new", jf::Layout::New, (7, 4, 0, 3), (7, 0, 4, 3)),
+        ("old", jf::Layout::Old, (6, 4, 0, 2), (6, 0, 4, 2)),
+    ] {
+        let (w, install) = b20_stale_world(name, layout).await;
+        let mut body = b20_body(&w, &install);
+        body["MetadataMode"] = serde_json::json!("None");
+        let first = b20_run(&w, body.clone()).await;
+        assert_eq!(b20_item_counts(&first), (10, 5, 2, 3), "{name}: {first}");
+        assert_eq!(b20_watch_counts(&first), first_watch, "{name}: {first}");
+        let alpha = b20_item(&w.state, "Alpha").await;
+        let fields = b20_fields(&w.state, alpha).await;
+        assert_eq!(
+            fields["tmdb_id"],
+            serde_json::Value::Null,
+            "{name}: {fields}"
+        );
+        let bob = b20_entry(&first, "bob").user_id.unwrap();
+        let stored = b20_data(&w.state, bob, alpha).await;
+        assert_eq!(stored, None, "{name}: the stale entry matched");
+        body["ConfirmedMatches"] = b20_confirm(&w, &[("Alice", w.alice), ("bob", bob)]);
+        let second = b20_run(&w, body).await;
+        assert_eq!(b20_item_counts(&second), (10, 5, 2, 3), "{name}: {second}");
+        assert_eq!(b20_watch_counts(&second), second_watch, "{name}: {second}");
+    }
+}
+
+#[tokio::test]
+async fn b20_import_metadata_replace_keeps_rustyfins_ids() {
+    for (name, layout) in [("new", jf::Layout::New), ("old", jf::Layout::Old)] {
+        let (w, install) = b20_stale_world(name, layout).await;
+        let alpha = b20_item(&w.state, "Alpha").await;
+        let show = b20_item(&w.state, "Show").await;
+        // Rustyfin's own ids, which differ from Jellyfin's (TMDB 111 for Alpha, TVDB 333).
+        for (sql, id) in [
+            ("UPDATE media_items SET tmdb_id = 555 WHERE id = ?", alpha),
+            ("UPDATE media_items SET tvdb_id = 444 WHERE id = ?", show),
+        ] {
+            sqlx::query(sql)
+                .bind(id.to_string())
+                .execute(&w.state.db)
+                .await
+                .unwrap();
+        }
+        // Filling keeps Rustyfin's TMDB id, so the stale entry stays unmatched.
+        let fill = b20_preview(&w, serde_json::json!({ "SourcePath": install })).await;
+        assert_eq!(b20_item_counts(&fill), (10, 5, 2, 3), "{name}: {fill}");
+
+        // Replacing keeps them too: the ids decide what matches.
+        let body = serde_json::json!({ "SourcePath": install, "MetadataMode": "Replace" });
+        let preview = b20_preview(&w, body.clone()).await;
+        let first = b20_run(&w, body.clone()).await;
+        for report in [&preview, &first] {
+            assert_eq!(b20_item_counts(report), (10, 5, 2, 3), "{name}: {report}");
+        }
+        let fields = b20_fields(&w.state, alpha).await;
+        assert_eq!(fields["tmdb_id"], 555, "{name}: {fields}");
+        assert_eq!(
+            fields["name"], "Alpha",
+            "{name}: the stale entry renamed Alpha"
+        );
+        assert_eq!(
+            fields["overview"], "Jellyfin overview of Alpha.",
+            "{name}: Replace still replaces the other fields"
+        );
+        let fields = b20_fields(&w.state, show).await;
+        assert_eq!(fields["tvdb_id"], 444, "{name}: {fields}");
+        let bob = b20_entry(&first, "bob").user_id.unwrap();
+        let stored = b20_data(&w.state, bob, alpha).await;
+        assert_eq!(stored, None, "{name}: the stale entry's row was imported");
+
+        let rows = b20_db_digest(&w.state).await;
+        let meta = b20_meta_digest(&w.state).await;
+        let second = b20_run(&w, body).await;
+        assert_eq!(b20_item_counts(&second), (10, 5, 2, 3), "{name}: {second}");
+        assert_eq!(b20_watch_counts(&second).1, 0, "{name}: {second}");
+        assert_eq!(b20_meta_counts(&second), [0; 6], "{name}: {second}");
+        assert_eq!(
+            b20_db_digest(&w.state).await,
+            rows,
+            "{name}: the second run changed rows"
+        );
+        assert_eq!(
+            b20_meta_digest(&w.state).await,
+            meta,
+            "{name}: the second run changed metadata"
+        );
+    }
 }

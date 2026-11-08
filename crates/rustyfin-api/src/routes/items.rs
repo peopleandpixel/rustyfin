@@ -110,6 +110,26 @@ async fn enrich_item(
     }
     item.provider_ids = provider_ids;
 
+    // Jellyfin import: metadata columns that live outside media_items
+    if let Ok(Some(extras)) = rustyfin_db::repo_jellyfin_import::item_extras(pool, item.id).await {
+        if let Some(title) = extras.original_title {
+            item.original_title = Some(title);
+        }
+        if let Some(rating) = extras.critic_rating {
+            item.critic_rating = Some(rating);
+        }
+        if let Some(imdb) = extras.imdb_id {
+            item.provider_ids.set("imdb".to_string(), imdb);
+        }
+        item.lock_data = extras.lock_data;
+        item.locked_fields = extras
+            .locked_fields
+            .split('|')
+            .filter(|field| !field.is_empty())
+            .map(str::to_string)
+            .collect();
+    }
+
     // ExternalUrls from provider_ids
     let mut external_urls = Vec::new();
     if let Some(tmdb) = item.tmdb_id {
@@ -379,12 +399,15 @@ async fn enrich_item(
         if let Ok(artists) = &people_result {
             item.artists = artists
                 .iter()
-                .map(|(pid, name, role)| rustyfin_model::media::PersonInfo {
-                    id: pid.clone(),
-                    name: name.clone(),
-                    role: role.clone(),
-                    person_type: Some("Artist".to_string()),
-                })
+                .map(
+                    |(pid, name, role, _, has_image)| rustyfin_model::media::PersonInfo {
+                        id: pid.clone(),
+                        name: name.clone(),
+                        role: role.clone(),
+                        person_type: Some("Artist".to_string()),
+                        primary_image_tag: has_image.then(|| "Primary_0".to_string()),
+                    },
+                )
                 .collect();
             item.album_artists = item.artists.clone();
             // Also populate People for audio items
@@ -399,21 +422,15 @@ async fn enrich_item(
     {
         item.people = people_rows
             .iter()
-            .map(|(pid, name, role)| rustyfin_model::media::PersonInfo {
-                id: pid.clone(),
-                name: name.clone(),
-                role: role.clone(),
-                person_type: role
-                    .as_deref()
-                    .map(|r| {
-                        if r == "Actor" || r == "Actress" {
-                            "Actor".to_string()
-                        } else {
-                            "Creator".to_string()
-                        }
-                    })
-                    .or_else(|| Some("Actor".to_string())),
-            })
+            .map(
+                |(pid, name, role, kind, has_image)| rustyfin_model::media::PersonInfo {
+                    id: pid.clone(),
+                    name: name.clone(),
+                    role: role.clone(),
+                    person_type: Some(kind.clone()),
+                    primary_image_tag: has_image.then(|| "Primary_0".to_string()),
+                },
+            )
             .collect();
     }
 
@@ -690,25 +707,28 @@ async fn enrich_items(
     };
 
     // Batch query 8: People for all items
-    let people_map: std::collections::HashMap<String, Vec<(String, String, Option<String>)>> = {
-        let mut map: std::collections::HashMap<String, Vec<(String, String, Option<String>)>> =
+    let people_map: std::collections::HashMap<String, Vec<rustyfin_db::repo_media::PersonRow>> = {
+        let mut map: std::collections::HashMap<String, Vec<rustyfin_db::repo_media::PersonRow>> =
             std::collections::HashMap::new();
         for chunk_ids in item_ids.chunks(100) {
             let placeholders: Vec<String> =
                 (1..=chunk_ids.len()).map(|i| format!("?{}", i)).collect();
             let query = format!(
-                "SELECT ip.item_id, p.id, p.name, ip.role FROM item_people ip JOIN people p ON p.id = ip.person_id WHERE ip.item_id IN ({})",
+                "SELECT ip.item_id, p.id, p.name, ip.role, ip.type, EXISTS(SELECT 1 FROM person_images pi WHERE pi.person_id = p.id AND pi.image_type = 'Primary' AND pi.image_index = 0) FROM item_people ip JOIN people p ON p.id = ip.person_id WHERE ip.item_id IN ({}) ORDER BY ip.item_id, ip.sort_order IS NULL, ip.sort_order, ip.rowid",
                 placeholders.join(",")
             );
-            let mut query_builder = sqlx::query_as::<_, (String, String, String, Option<String>)>(
-                sqlx::AssertSqlSafe(query.clone()),
-            );
+            let mut query_builder = sqlx::query_as::<
+                _,
+                (String, String, String, Option<String>, String, bool),
+            >(sqlx::AssertSqlSafe(query.clone()));
             for id in chunk_ids {
                 query_builder = query_builder.bind(id.to_string());
             }
             if let Ok(rows) = query_builder.fetch_all(pool).await {
-                for (item_id, pid, pname, role) in rows {
-                    map.entry(item_id).or_default().push((pid, pname, role));
+                for (item_id, pid, pname, role, kind, has_image) in rows {
+                    map.entry(item_id)
+                        .or_default()
+                        .push((pid, pname, role, kind, has_image));
                 }
             }
         }
@@ -1160,21 +1180,15 @@ async fn enrich_items(
         {
             item.people = people_rows
                 .iter()
-                .map(|(pid, name, role)| rustyfin_model::media::PersonInfo {
-                    id: pid.clone(),
-                    name: name.clone(),
-                    role: role.clone(),
-                    person_type: role
-                        .as_deref()
-                        .map(|r| {
-                            if r == "Actor" || r == "Actress" {
-                                "Actor".to_string()
-                            } else {
-                                "Creator".to_string()
-                            }
-                        })
-                        .or_else(|| Some("Actor".to_string())),
-                })
+                .map(
+                    |(pid, name, role, kind, has_image)| rustyfin_model::media::PersonInfo {
+                        id: pid.clone(),
+                        name: name.clone(),
+                        role: role.clone(),
+                        person_type: Some(kind.clone()),
+                        primary_image_tag: has_image.then(|| "Primary_0".to_string()),
+                    },
+                )
                 .collect();
             // For audio items, also populate artists
             if item.media_type == rustyfin_model::media::MediaType::Audio {

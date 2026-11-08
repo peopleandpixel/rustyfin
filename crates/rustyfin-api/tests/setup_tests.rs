@@ -79,6 +79,7 @@ async fn test_state() -> (AppState, DataDir) {
             reqwest::Client::new(),
             Default::default(),
         ),
+        jellyfin_import: Default::default(),
     };
     (state, DataDir(data_dir))
 }

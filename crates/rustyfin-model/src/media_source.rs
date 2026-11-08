@@ -146,3 +146,56 @@ pub struct MediaStream {
     #[serde(default)]
     pub embedded_bitmaps: bool,
 }
+
+/// What identifies a media stream across rescans. A remembered track choice is offered only where
+/// the stream at its index has the same key, so a replaced file whose index now names another
+/// stream (a commentary, a dub) does not hand the choice to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamIdentity<'a> {
+    pub codec_type: &'a str,
+    pub codec: Option<&'a str>,
+    pub language: Option<&'a str>,
+    pub title: Option<&'a str>,
+    pub is_external: bool,
+    pub path: Option<&'a str>,
+    pub is_default: bool,
+    pub is_forced: bool,
+}
+
+impl StreamIdentity<'_> {
+    /// The key as canonical JSON: the codec type, codec and language lowercased; the title; the
+    /// external flag; an external stream's file name (else null); the default and forced flags.
+    pub fn key(&self) -> String {
+        let file_name = self
+            .path
+            .filter(|_| self.is_external)
+            .and_then(|path| path.rsplit(['/', '\\']).next());
+        serde_json::json!([
+            self.codec_type.to_ascii_lowercase(),
+            self.codec.map(str::to_ascii_lowercase),
+            self.language.map(str::to_ascii_lowercase),
+            self.title,
+            self.is_external,
+            file_name,
+            self.is_default,
+            self.is_forced,
+        ])
+        .to_string()
+    }
+}
+
+impl MediaStream {
+    /// This stream's identity (see `StreamIdentity`).
+    pub fn identity(&self) -> StreamIdentity<'_> {
+        StreamIdentity {
+            codec_type: &self.codec_type,
+            codec: self.codec.as_deref(),
+            language: self.language.as_deref(),
+            title: self.title.as_deref(),
+            is_external: self.is_external,
+            path: self.path.as_deref(),
+            is_default: self.is_default,
+            is_forced: self.is_forced,
+        }
+    }
+}

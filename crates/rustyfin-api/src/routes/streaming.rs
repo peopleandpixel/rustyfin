@@ -1,8 +1,11 @@
+use axum::Extension;
 use axum::Router;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use rustyfin_db::repo_playback::StreamChoice;
+use rustyfin_model::auth::Claims;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path as FilePath;
@@ -880,9 +883,11 @@ async fn video_universal(
 }
 
 /// `GET /Videos/{id}/PlaybackInfo` — Returns playback info for a video item.
-/// Includes direct play detection based on client codec support.
+/// Includes direct play detection based on client codec support. Each source's default tracks
+/// are the caller's remembered tracks, where the source has them.
 async fn video_playback_info(
     State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
     Path(id): Path<Uuid>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Response, ApiError> {
@@ -935,6 +940,30 @@ async fn video_playback_info(
         source.supports_direct_stream = i == index && supports_direct_stream;
         source.supports_transcoding = i == index && supports_transcoding;
     }
+
+    // The caller's remembered tracks become each source's defaults, where the source has them
+    let (remembered_audio, remembered_subtitle) =
+        rustyfin_db::repo_playback::get_stream_choice(&state.db_ro, claims.sub, id).await?;
+    let media_sources: Vec<rustyfin_model::playback_info::PlaybackMediaSource> = media_sources
+        .into_iter()
+        .map(|source| {
+            let default_audio_stream_index = remembered_audio
+                .as_ref()
+                .filter(|choice| has_remembered_stream(&source, "Audio", choice))
+                .map(|choice| choice.index);
+            let default_subtitle_stream_index = remembered_subtitle
+                .as_ref()
+                .filter(|choice| {
+                    choice.index == -1 || has_remembered_stream(&source, "Subtitle", choice)
+                })
+                .map(|choice| choice.index);
+            rustyfin_model::playback_info::PlaybackMediaSource {
+                source,
+                default_audio_stream_index,
+                default_subtitle_stream_index,
+            }
+        })
+        .collect();
 
     let response = rustyfin_model::playback_info::VideoPlaybackInfoResponse {
         media_sources,
@@ -1043,6 +1072,22 @@ fn client_takes_h264_video(
         h264_video_bit_depth: query.h264_video_bit_depth.as_deref(),
     };
     client_takes_h264(request, video.profile.as_deref(), video.bit_depth)
+}
+
+/// Whether `source` has a stream of `kind` ("Audio", "Subtitle") at the choice's index whose key is
+/// the one stored with the choice. A choice with no stored key never matches.
+fn has_remembered_stream(
+    source: &rustyfin_model::media_source::MediaSourceResponse,
+    kind: &str,
+    choice: &StreamChoice,
+) -> bool {
+    let Some(key) = choice.key.as_deref() else {
+        return false;
+    };
+    source
+        .media_streams
+        .iter()
+        .any(|s| s.index == choice.index && is_stream_type(s, kind) && s.identity().key() == key)
 }
 
 /// Check if a media source can be directly played by the client.

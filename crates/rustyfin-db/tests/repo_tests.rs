@@ -1374,3 +1374,112 @@ async fn test_save_chapters_keeps_the_old_ones_when_it_fails() {
         "the failed save left part of its chapters"
     );
 }
+
+// ── B20: one-time setup codes ──
+
+async fn b20_password(pool: &SqlitePool, user: Uuid) -> String {
+    rustyfin_db::repo_user::get_user_by_id(pool, user)
+        .await
+        .unwrap()
+        .unwrap()
+        .password_hash
+}
+
+#[tokio::test]
+async fn b20_redeem_needs_the_current_code() {
+    use rustyfin_db::repo_setup_code::{code_hash, create_user_with_code, redeem, replace_code};
+    let temp_db = test_pool().await;
+    let pool = temp_db.pool.clone();
+    let user = make_user("pending", false);
+    create_user_with_code(&pool, &user, "hash-1").await.unwrap();
+    assert_eq!(
+        code_hash(&pool, user.id).await.unwrap().as_deref(),
+        Some("hash-1")
+    );
+    assert_eq!(code_hash(&pool, Uuid::new_v4()).await.unwrap(), None);
+
+    // A reissue replaces the hash; the old one then redeems nothing.
+    assert!(
+        replace_code(&pool, user.id, "hash-2", Utc::now())
+            .await
+            .unwrap()
+    );
+    assert!(!redeem(&pool, user.id, "hash-1", "pw-1").await.unwrap());
+    assert_eq!(b20_password(&pool, user.id).await, user.password_hash);
+    assert_eq!(
+        code_hash(&pool, user.id).await.unwrap().as_deref(),
+        Some("hash-2")
+    );
+
+    // The current hash sets the password and removes the code, once.
+    assert!(redeem(&pool, user.id, "hash-2", "pw-2").await.unwrap());
+    assert_eq!(b20_password(&pool, user.id).await, "pw-2");
+    assert_eq!(code_hash(&pool, user.id).await.unwrap(), None);
+    assert!(!redeem(&pool, user.id, "hash-2", "pw-3").await.unwrap());
+    assert_eq!(b20_password(&pool, user.id).await, "pw-2");
+    assert!(
+        !replace_code(&pool, user.id, "hash-3", Utc::now())
+            .await
+            .unwrap()
+    );
+    assert_eq!(code_hash(&pool, user.id).await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn b20_pending_users_are_sorted_by_name() {
+    use rustyfin_db::repo_setup_code::{PendingUser, create_user_with_code, pending_users};
+    let temp_db = test_pool().await;
+    let pool = temp_db.pool.clone();
+    assert!(pending_users(&pool).await.unwrap().is_empty());
+    let carol = make_user("Carol", false);
+    let bob = make_user("bob", false);
+    let alice = make_user("alice", false);
+    for user in [&carol, &bob, &alice] {
+        create_user_with_code(&pool, user, "hash").await.unwrap();
+    }
+    let dave = make_user("dave", false);
+    rustyfin_db::repo_user::create_user(&pool, &dave)
+        .await
+        .unwrap();
+
+    let pending = |user: &User| PendingUser {
+        user_id: user.id,
+        name: user.name.clone(),
+        created_at: user.created_at,
+    };
+    let expected = vec![pending(&alice), pending(&bob), pending(&carol)];
+    assert_eq!(pending_users(&pool).await.unwrap(), expected);
+
+    let later = Utc::now() + chrono::Duration::seconds(5);
+    let replaced = rustyfin_db::repo_setup_code::replace_code(&pool, bob.id, "hash-2", later);
+    assert!(replaced.await.unwrap());
+    let listed = pending_users(&pool).await.unwrap();
+    assert_eq!(listed[1].user_id, bob.id);
+    assert_eq!(listed[1].created_at, later);
+}
+
+#[tokio::test]
+async fn b20_password_writes_end_the_code() {
+    use rustyfin_db::repo_setup_code::{code_hash, create_user_with_code};
+    let temp_db = test_pool().await;
+    let pool = temp_db.pool.clone();
+    let bob = make_user("bob", false);
+    let carol = make_user("carol", false);
+    for user in [&bob, &carol] {
+        create_user_with_code(&pool, user, "hash").await.unwrap();
+    }
+    let updated = rustyfin_db::repo_user::update_password(&pool, bob.id, "newhash");
+    assert!(updated.await.unwrap());
+    assert_eq!(b20_password(&pool, bob.id).await, "newhash");
+    assert_eq!(code_hash(&pool, bob.id).await.unwrap(), None);
+    assert_eq!(
+        code_hash(&pool, carol.id).await.unwrap().as_deref(),
+        Some("hash")
+    );
+    let unknown = rustyfin_db::repo_user::update_password(&pool, Uuid::new_v4(), "x");
+    assert!(!unknown.await.unwrap());
+    assert_eq!(
+        code_hash(&pool, carol.id).await.unwrap().as_deref(),
+        Some("hash")
+    );
+}

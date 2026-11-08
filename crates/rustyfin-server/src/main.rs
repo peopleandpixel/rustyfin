@@ -152,6 +152,12 @@ async fn main() {
         Err(e) => tracing::warn!("could not check for default admin passwords: {}", e),
     }
 
+    // Makes the setup-code dummy hash now, so the first setup-code check after a start
+    // is not slower.
+    if let Err(e) = rustyfin_auth::prepare_setup_code_checks().await {
+        tracing::warn!("could not prepare setup-code checks: {e}");
+    }
+
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
 
     let transcode_manager = rustyfin_core::transcode::TranscodeManager::new(&data_dir);
@@ -176,7 +182,8 @@ async fn main() {
     plugin_manager.load_all().await;
 
     // Rate limiter: default 10 requests per 60 seconds per resolved client IP, for the login
-    // endpoints only (AuthenticateByName, ForgotPassword, ForgotPassword/Pin, ResetPassword).
+    // endpoints only (AuthenticateByName, AuthenticateWithSetupCode, ForgotPassword,
+    // ForgotPassword/Pin, ResetPassword).
     // Configurable via env; 0 disables.
     let rate_max: usize = std::env::var("RUSTYFIN_RATE_LIMIT")
         .ok()
@@ -230,6 +237,7 @@ async fn main() {
         image_cache,
         http_client,
         tmdb,
+        jellyfin_import: Default::default(),
     };
 
     // Background task: scheduled tasks (library scan, metadata refresh, cache cleanup)
