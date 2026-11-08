@@ -792,22 +792,24 @@ fn build_ffmpeg_args(
             format!("{}k", profile.max_video_bitrate_kbps * 2),
         ]);
 
-        // Scale filter
+        // Scale filter. Its last step makes the frames 8-bit 4:2:0 (NV12 on the hardware
+        // encoders): libx264 would keep a 10-bit or 4:2:2 source's format, which browsers
+        // can't decode
         let scale_filter = match hw_accel {
             HwAccel::Vaapi => format!(
-                "scale_vaapi=w='min({},iw)':h='min({},ih)':force_original_aspect_ratio=decrease",
+                "scale_vaapi=w='min({},iw)':h='min({},ih)':force_original_aspect_ratio=decrease:format=nv12",
                 profile.max_width, profile.max_height
             ),
             HwAccel::Nvenc => format!(
-                "scale_cuda=w='min({},iw)':h='min({},ih)':force_original_aspect_ratio=decrease",
+                "scale_cuda=w='min({},iw)':h='min({},ih)':force_original_aspect_ratio=decrease:format=nv12",
                 profile.max_width, profile.max_height
             ),
             HwAccel::Qsv => format!(
-                "scale_qsv=w='min({},iw)':h='min({},ih)'",
+                "scale_qsv=w='min({},iw)':h='min({},ih)':format=nv12",
                 profile.max_width, profile.max_height
             ),
             HwAccel::None => format!(
-                "scale='min({},iw)':'min({},ih)':force_original_aspect_ratio=decrease",
+                "scale='min({},iw)':'min({},ih)':force_original_aspect_ratio=decrease,format=yuv420p",
                 profile.max_width, profile.max_height
             ),
         };
@@ -833,11 +835,7 @@ fn build_ffmpeg_args(
             let burn = subtitles_filter(input, sub_idx, profile.start_time_ticks);
             if hw_accel == HwAccel::None {
                 // Software: combine scale + subtitles in one filter chain
-                let sw_scale = format!(
-                    "scale='min({},iw)':'min({},ih)':force_original_aspect_ratio=decrease",
-                    profile.max_width, profile.max_height
-                );
-                args.extend(["-vf".to_string(), format!("{sw_scale},{burn}")]);
+                args.extend(["-vf".to_string(), format!("{scale_filter},{burn}")]);
             } else {
                 // HW accel: need to download → burn subs → upload (complex, use sw fallback for subs)
                 args.extend([
@@ -1324,7 +1322,7 @@ mod tests {
                     &args,
                     "-filter_complex",
                     &format!(
-                        "[0:5]scale=1440:1080[sub];[0:V:0][sub]overlay=eof_action=pass:repeatlast=0,{sw_scale}[v]"
+                        "[0:5]scale=1440:1080[sub];[0:V:0][sub]overlay=eof_action=pass:repeatlast=0,{sw_scale},format=yuv420p[v]"
                     )
                 ),
                 "{hw_accel:?}: {args:?}"
@@ -1351,7 +1349,7 @@ mod tests {
             has_pair(
                 &args,
                 "-filter_complex",
-                "[0:V:0][0:3]overlay=eof_action=pass:repeatlast=0,scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_ratio=decrease[v]"
+                "[0:V:0][0:3]overlay=eof_action=pass:repeatlast=0,scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_ratio=decrease,format=yuv420p[v]"
             ),
             "{args:?}"
         );
@@ -1502,6 +1500,307 @@ mod tests {
             let vf = &args[position(&args, "-vf") + 1];
             let burn = subtitles_filter(input, 1, start_time_ticks);
             assert!(vf.contains(&burn), "{vf}");
+        }
+    }
+
+    // B25: 10-bit video
+
+    /// The software scale for the default 1920x1080 limit.
+    const SW_SCALE: &str =
+        "scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_ratio=decrease";
+
+    /// Each hardware encoder with its scale for the default limit, ending in the 8-bit 4:2:0
+    /// format the encoder takes.
+    const HW_SCALES: [(HwAccel, &str, &str); 3] = [
+        (
+            HwAccel::Vaapi,
+            "h264_vaapi",
+            "scale_vaapi=w='min(1920,iw)':h='min(1080,ih)':force_original_aspect_ratio=decrease:format=nv12",
+        ),
+        (
+            HwAccel::Nvenc,
+            "h264_nvenc",
+            "scale_cuda=w='min(1920,iw)':h='min(1080,ih)':force_original_aspect_ratio=decrease:format=nv12",
+        ),
+        (
+            HwAccel::Qsv,
+            "h264_qsv",
+            "scale_qsv=w='min(1920,iw)':h='min(1080,ih)':format=nv12",
+        ),
+    ];
+
+    #[test]
+    fn test_build_ffmpeg_args_encode_8bit_420_in_software() {
+        // libx264 keeps the decoder's format, so a 10-bit or 4:2:2 source would come out as
+        // High 10 or High 4:2:2, which browsers don't decode
+        let args = args_for(&TranscodeProfile::default());
+        assert!(has_pair(&args, "-c:v", "libx264"), "{args:?}");
+        assert!(
+            has_pair(&args, "-vf", &format!("{SW_SCALE},format=yuv420p")),
+            "{args:?}"
+        );
+        assert!(!args.contains(&"-pix_fmt".to_string()), "{args:?}");
+        let profile = TranscodeProfile {
+            max_width: 1280,
+            max_height: 720,
+            ..Default::default()
+        };
+        let args = args_for(&profile);
+        assert!(
+            has_pair(
+                &args,
+                "-vf",
+                "scale='min(1280,iw)':'min(720,ih)':force_original_aspect_ratio=decrease,format=yuv420p"
+            ),
+            "{args:?}"
+        );
+    }
+
+    #[test]
+    fn test_build_ffmpeg_args_encode_8bit_420_on_hardware() {
+        // The hardware H.264 encoders take 8-bit frames only: the scale converts P010 to NV12
+        for (hw_accel, encoder, scale) in HW_SCALES {
+            let profile = TranscodeProfile {
+                hw_accel,
+                ..Default::default()
+            };
+            let args = args_for(&profile);
+            assert!(has_pair(&args, "-c:v", encoder), "{hw_accel:?}: {args:?}");
+            assert!(has_pair(&args, "-vf", scale), "{hw_accel:?}: {args:?}");
+            assert!(
+                !args.contains(&"-pix_fmt".to_string()),
+                "{hw_accel:?}: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_ffmpeg_args_burn_in_draws_on_8bit_420() {
+        let burn = "subtitles=f='/input.mkv':si=1";
+        let profile = TranscodeProfile {
+            burn_subtitles: true,
+            subtitle_stream_index: Some(1),
+            ..Default::default()
+        };
+        let args = args_for(&profile);
+        assert!(
+            has_pair(&args, "-vf", &format!("{SW_SCALE},format=yuv420p,{burn}")),
+            "{args:?}"
+        );
+        // On hardware the scale makes the frames NV12, which the download keeps
+        for (hw_accel, _, scale) in HW_SCALES {
+            let profile = TranscodeProfile {
+                hw_accel,
+                ..profile.clone()
+            };
+            let args = args_for(&profile);
+            assert!(
+                has_pair(
+                    &args,
+                    "-vf",
+                    &format!("{scale},hwdownload,format=nv12,{burn}")
+                ),
+                "{hw_accel:?}: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_ffmpeg_args_copy_and_audio_only_have_no_format_step() {
+        let profiles = [
+            TranscodeProfile {
+                copy_video: true,
+                ..Default::default()
+            },
+            TranscodeProfile {
+                audio_only: true,
+                ..Default::default()
+            },
+        ];
+        for profile in profiles {
+            let args = args_for(&profile);
+            assert!(
+                !args
+                    .iter()
+                    .any(|a| a == "-vf" || a == "-filter_complex" || a.contains("format=")),
+                "{args:?}"
+            );
+        }
+    }
+
+    /// The args the base built for the default profile, before the format step.
+    fn base_args(input: &str, playlist: &str, segments: &str) -> Vec<String> {
+        "-y -hide_banner -nostats -i INPUT -c:v libx264 -b:v 8000k -maxrate 8000k -bufsize 16000k \
+         -vf SCALE -map 0:V:0? -map 0:a:0? -c:a aac -b:a 192k -ac 2 -f hls -hls_time 6 \
+         -hls_list_size 0 -hls_flags independent_segments -hls_segment_type mpegts \
+         -hls_segment_filename SEGMENTS -hls_playlist_type event -start_number 0 \
+         -preset veryfast PLAYLIST"
+            .split_whitespace()
+            .map(|arg| match arg {
+                "INPUT" => input,
+                "SCALE" => SW_SCALE,
+                "SEGMENTS" => segments,
+                "PLAYLIST" => playlist,
+                arg => arg,
+            })
+            .map(String::from)
+            .collect()
+    }
+
+    /// Whether ffmpeg and ffprobe run. When they don't, says that `test` is skipped.
+    fn have_ffmpeg(test: &str) -> bool {
+        for tool in ["ffmpeg", "ffprobe"] {
+            let found = std::process::Command::new(tool)
+                .arg("-version")
+                .output()
+                .is_ok_and(|o| o.status.success());
+            if !found {
+                println!("{test}: skipped, {tool} is not on PATH");
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Runs ffmpeg with `args`, quiet when `quiet`; panics with its errors when it fails.
+    fn run_ffmpeg(args: &[String], quiet: bool) {
+        let mut cmd = std::process::Command::new("ffmpeg");
+        if quiet {
+            cmd.args(["-hide_banner", "-loglevel", "error", "-y"]);
+        }
+        let out = cmd.args(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "ffmpeg {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Transcodes `input` with the args of `profile` into a new directory `name` under `dir`;
+    /// returns that directory.
+    fn transcode_into(dir: &Path, name: &str, input: &Path, profile: &TranscodeProfile) -> PathBuf {
+        let out = dir.join(name);
+        std::fs::create_dir_all(&out).unwrap();
+        let args = build_ffmpeg_args(
+            input.to_str().unwrap(),
+            out.join("main.m3u8").to_str().unwrap(),
+            out.join("seg_%04d.ts").to_str().unwrap(),
+            profile,
+        );
+        run_ffmpeg(&args, false);
+        out
+    }
+
+    /// The segments in `dir` by name, with their bytes.
+    fn segments_in(dir: &Path) -> Vec<(String, Vec<u8>)> {
+        let mut segments: Vec<(String, Vec<u8>)> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "ts"))
+            .map(|path| {
+                let name = path.file_name().unwrap().to_string_lossy().to_string();
+                (name, std::fs::read(&path).unwrap())
+            })
+            .collect();
+        segments.sort();
+        segments
+    }
+
+    #[test]
+    fn test_build_ffmpeg_args_8bit_source_encodes_as_before() {
+        // The args are the base's with the format step added
+        let mut expected = base_args("/input.mkv", "/out/main.m3u8", "/out/seg_%04d.ts");
+        let vf = position(&expected, "-vf") + 1;
+        expected[vf].push_str(",format=yuv420p");
+        assert_eq!(args_for(&TranscodeProfile::default()), expected);
+
+        // For an 8-bit 4:2:0 source the step changes nothing: the segments are the same bytes
+        if !have_ffmpeg("test_build_ffmpeg_args_8bit_source_encodes_as_before") {
+            return;
+        }
+        let dir = TestDir(std::env::temp_dir().join(format!("rustyfin-b25-{}", Uuid::new_v4())));
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let input = dir.0.join("8bit.mp4");
+        let make = "-f lavfi -i testsrc2=size=320x240:rate=25 -f lavfi -i sine=frequency=440 -t 3 \
+                    -c:v libx264 -pix_fmt yuv420p -c:a aac";
+        let mut args: Vec<String> = make.split_whitespace().map(String::from).collect();
+        args.push(input.to_str().unwrap().to_string());
+        run_ffmpeg(&args, true);
+
+        let after = transcode_into(&dir.0, "after", &input, &TranscodeProfile::default());
+        let before = dir.0.join("before");
+        std::fs::create_dir_all(&before).unwrap();
+        run_ffmpeg(
+            &base_args(
+                input.to_str().unwrap(),
+                before.join("main.m3u8").to_str().unwrap(),
+                before.join("seg_%04d.ts").to_str().unwrap(),
+            ),
+            false,
+        );
+        let (after, before) = (segments_in(&after), segments_in(&before));
+        assert!(!before.is_empty());
+        let names = |segments: &[(String, Vec<u8>)]| -> Vec<String> {
+            segments.iter().map(|(name, _)| name.clone()).collect()
+        };
+        assert_eq!(names(&after), names(&before));
+        assert!(after == before, "the segments differ from the base's");
+    }
+
+    #[test]
+    fn test_build_ffmpeg_args_deep_sources_encode_as_8bit_high() {
+        if !have_ffmpeg("test_build_ffmpeg_args_deep_sources_encode_as_8bit_high") {
+            return;
+        }
+        let dir = TestDir(std::env::temp_dir().join(format!("rustyfin-b25-{}", Uuid::new_v4())));
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let srt = dir.0.join("sub.srt");
+        std::fs::write(&srt, "1\n00:00:00,000 --> 00:00:02,000\nB25\n").unwrap();
+        // 10-bit HEVC (x265), 10-bit H.264 (Hi10P anime), 4:2:2 and 4:4:4 H.264, each with a
+        // text subtitle
+        for (name, codec, pix_fmt) in [
+            ("hevc10", "libx265", "yuv420p10le"),
+            ("hi10", "libx264", "yuv420p10le"),
+            ("422", "libx264", "yuv422p"),
+            ("444", "libx264", "yuv444p"),
+        ] {
+            let input = dir.0.join(format!("{name}.mkv"));
+            let make = "-f lavfi -i testsrc2=size=320x240:rate=25 -i SRT -t 2 -map 0:v -map 1:s \
+                        -c:s srt -c:v CODEC -pix_fmt PIX_FMT";
+            let mut args: Vec<String> = make
+                .split_whitespace()
+                .map(|arg| match arg {
+                    "SRT" => srt.to_str().unwrap(),
+                    "CODEC" => codec,
+                    "PIX_FMT" => pix_fmt,
+                    arg => arg,
+                })
+                .map(String::from)
+                .collect();
+            if codec == "libx265" {
+                args.extend(["-x265-params".to_string(), "log-level=error".to_string()]);
+            }
+            args.push(input.to_str().unwrap().to_string());
+            run_ffmpeg(&args, true);
+
+            for burn in [false, true] {
+                let profile = TranscodeProfile {
+                    burn_subtitles: burn,
+                    subtitle_stream_index: burn.then_some(0),
+                    ..Default::default()
+                };
+                let out = transcode_into(&dir.0, &format!("{name}-{burn}"), &input, &profile);
+                let probe = std::process::Command::new("ffprobe")
+                    .args(["-v", "error", "-select_streams", "v:0", "-show_entries"])
+                    .args(["stream=profile,pix_fmt", "-of", "compact=p=0:nk=1"])
+                    .arg(out.join("seg_0000.ts"))
+                    .output()
+                    .unwrap();
+                // MPEG-TS lists the stream again under its program: the first line is enough
+                let found = String::from_utf8_lossy(&probe.stdout);
+                let found = found.lines().next().unwrap_or_default();
+                assert_eq!(found, "High|yuv420p", "{name}, burn-in {burn}");
+            }
         }
     }
 

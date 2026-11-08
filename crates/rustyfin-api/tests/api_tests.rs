@@ -12759,6 +12759,211 @@ async fn g4_universal_direct_plays_a_probed_mp4() {
     assert_eq!(body["MediaSources"][0]["SupportsDirectPlay"], true);
 }
 
+// ── B25: 10-bit video ──
+
+/// Makes a 2 s 320x240 clip with AAC audio at `file`, its video encoded by `codec` in
+/// `pix_fmt`.
+fn b25_make_clip(file: &std::path::Path, codec: &str, pix_fmt: &str) {
+    let mut args = vec![
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=320x240:rate=25",
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=440:sample_rate=48000",
+        "-t",
+        "2",
+        "-c:v",
+        codec,
+        "-pix_fmt",
+        pix_fmt,
+        "-c:a",
+        "aac",
+    ];
+    if codec == "libx265" {
+        args.extend(["-x265-params", "log-level=error"]);
+    }
+    args.push(file.to_str().unwrap());
+    g4_make_media(&args);
+}
+
+/// The stored bit depth of the video stream of `item`.
+async fn b25_bit_depth(state: &AppState, item: uuid::Uuid) -> Option<i64> {
+    sqlx::query_scalar(
+        "SELECT bit_depth FROM media_streams WHERE codec_type = 'video' \
+         AND source_id IN (SELECT id FROM media_sources WHERE item_id = ?)",
+    )
+    .bind(item.to_string())
+    .fetch_one(&state.db)
+    .await
+    .unwrap()
+}
+
+/// Drops the stored bit depth of the streams of `item`, as for a file probed before the probe
+/// stored it, or one whose ffprobe output has none.
+async fn b25_forget_bit_depth(state: &AppState, item: uuid::Uuid) {
+    sqlx::query(
+        "UPDATE media_streams SET bit_depth = NULL \
+         WHERE source_id IN (SELECT id FROM media_sources WHERE item_id = ?)",
+    )
+    .bind(item.to_string())
+    .execute(&state.db)
+    .await
+    .unwrap();
+}
+
+/// The profile and pixel format of the first video stream in `data`, written to `file`, as
+/// "High|yuv420p".
+fn b25_video_format(file: &std::path::Path, data: &[u8]) -> String {
+    std::fs::write(file, data).unwrap();
+    let out = std::process::Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", "v:0", "-show_entries"])
+        .args(["stream=profile,pix_fmt", "-of", "compact=p=0:nk=1"])
+        .arg(file)
+        .output()
+        .unwrap();
+    // MPEG-TS lists the stream again under its program: the first line is enough
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// What Universal answers the web client's lists plus `extra` for `id`, and the video format
+/// of the first segment when the answer is a transcode ("" when it is not).
+async fn b25_web_client_gets(
+    app: &axum::Router,
+    id: uuid::Uuid,
+    token: &str,
+    extra: &str,
+    probe_file: &std::path::Path,
+) -> (serde_json::Value, String) {
+    let uri = format!(
+        "/Videos/{id}/Universal?VideoCodecs=h264,vp8,vp9,av1&AudioCodecs=aac,mp3,opus,flac{extra}"
+    );
+    let (status, body) = send(app, request("GET", &uri, Some(token), None)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let url = body["Url"].as_str().unwrap_or_default().to_string();
+    if !url.contains("/main.m3u8?") {
+        return (body, String::new());
+    }
+    let playlist = format!("{url}&api_key={token}");
+    let segment = g4_first_segment(app, id, &playlist, token).await;
+    let (status, _, data) = g4_get(app, &segment).await;
+    assert_eq!(status, StatusCode::OK);
+    (body, b25_video_format(probe_file, &data))
+}
+
+#[tokio::test]
+async fn b25_universal_transcodes_10bit_mkv_to_8bit_h264() {
+    if !g4_have_ffmpeg("b25_universal_transcodes_10bit_mkv_to_8bit_h264") {
+        return;
+    }
+    let state = test_state().await;
+    let _dir = G4Dir(state.data_dir.to_path_buf());
+    let (token, _) = admin_session(&state).await;
+    // x265 Main 10 without a stored bit depth (as the probe stores it today); Hi10P H.264 with
+    // its bit depth stored, and the same file without it
+    let mut items = Vec::new();
+    for (name, codec, depth) in [
+        ("B25 HEVC10", "libx265", None),
+        ("B25 Hi10", "libx264", Some(10)),
+        ("B25 Hi10 Unstored", "libx264", None),
+    ] {
+        let folder = std::path::PathBuf::from(media_folder(&state, name));
+        let file = folder.join(format!("{name}.mkv"));
+        b25_make_clip(&file, codec, "yuv420p10le");
+        let id = g4_insert_item(&state, "Movie", &file).await;
+        rustyfin_core::probe::probe_and_save(&state.db, &id, file.to_str().unwrap())
+            .await
+            .unwrap();
+        if depth.is_none() {
+            b25_forget_bit_depth(&state, id).await;
+        }
+        assert_eq!(b25_bit_depth(&state, id).await, depth, "{name}");
+        items.push((name, id));
+    }
+    let probe_file = state.data_dir.join("b25-segment.ts");
+    let app = app(state);
+
+    // MKV goes to HLS, where the video is encoded: as 8-bit 4:2:0 High, which browsers decode
+    for (name, id) in items {
+        let (body, video) = b25_web_client_gets(&app, id, &token, "", &probe_file).await;
+        assert_eq!(
+            body["MediaSources"][0]["SupportsDirectPlay"], false,
+            "{name}"
+        );
+        assert_eq!(video, "High|yuv420p", "{name}");
+    }
+}
+
+#[tokio::test]
+async fn b25_universal_sends_deep_h264_mp4_to_an_8bit_transcode() {
+    if !g4_have_ffmpeg("b25_universal_sends_deep_h264_mp4_to_an_8bit_transcode") {
+        return;
+    }
+    let state = test_state().await;
+    let _dir = G4Dir(state.data_dir.to_path_buf());
+    let (token, _) = admin_session(&state).await;
+    // Hi10P H.264 with its bit depth stored and without it, and 8-bit High 4:2:2
+    let mut items = Vec::new();
+    for (name, pix_fmt, depth) in [
+        ("B25 Hi10 MP4", "yuv420p10le", Some(10)),
+        ("B25 Hi10 MP4 Unstored", "yuv420p10le", None),
+        ("B25 422 MP4", "yuv422p", Some(8)),
+    ] {
+        let folder = std::path::PathBuf::from(media_folder(&state, name));
+        let file = folder.join(format!("{name}.mp4"));
+        b25_make_clip(&file, "libx264", pix_fmt);
+        let id = g4_insert_item(&state, "Movie", &file).await;
+        rustyfin_core::probe::probe_and_save(&state.db, &id, file.to_str().unwrap())
+            .await
+            .unwrap();
+        if depth.is_none() {
+            b25_forget_bit_depth(&state, id).await;
+        }
+        assert_eq!(b25_bit_depth(&state, id).await, depth, "{name}");
+        items.push((name, id));
+    }
+    let probe_file = state.data_dir.join("b25-segment.ts");
+    let app = app(state);
+
+    // The web client states no profile or bit depth: the MP4 is not sent as it is but
+    // transcoded, from the start and from a resume point, to 8-bit 4:2:0 High
+    for (name, id) in &items {
+        for extra in ["", "&StartTimeTicks=10000000"] {
+            let (body, video) = b25_web_client_gets(&app, *id, &token, extra, &probe_file).await;
+            let source = &body["MediaSources"][0];
+            assert_eq!(source["SupportsDirectPlay"], false, "{name} {extra}");
+            assert_eq!(source["SupportsDirectStream"], false, "{name} {extra}");
+            assert_eq!(video, "High|yuv420p", "{name} {extra}");
+        }
+    }
+
+    // A client that states it takes 10-bit H.264 gets the 10-bit file as it is
+    for (name, id) in &items[..2] {
+        for extra in [
+            "&MaxVideoBitDepth=10",
+            "&h264-profile=high,main,baseline,constrainedbaseline,high10",
+        ] {
+            let (body, video) = b25_web_client_gets(&app, *id, &token, extra, &probe_file).await;
+            assert_eq!(
+                body["MediaSources"][0]["SupportsDirectPlay"], true,
+                "{name} {extra}"
+            );
+            let url = body["Url"].as_str().unwrap_or_default();
+            assert!(
+                url.starts_with(&format!("/Videos/{id}/stream?")) && url.contains("Static=true"),
+                "{name} {extra}: {url}"
+            );
+            assert_eq!(video, "", "{name} {extra}");
+        }
+    }
+}
+
 // ── B22: player tracks ──
 //
 // Subtitles reach the player as WebVTT through Jellyfin's

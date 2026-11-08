@@ -60,6 +60,17 @@ pub struct TranscodeQuery {
     pub device_id: Option<String>,
     /// Where to start, in ticks: the resume or seek point Universal forwards
     pub start_time_ticks: Option<i64>,
+    /// Jellyfin's Profile: the H.264 profiles the client takes, split on commas or pipes
+    pub profile: Option<String>,
+    /// Jellyfin's MaxVideoBitDepth: the deepest video bit depth the client takes
+    pub max_video_bit_depth: Option<u32>,
+    /// Jellyfin's h264-profile: the profiles read when Profile is absent or lists none
+    #[serde(rename = "h264-profile")]
+    pub h264_profile: Option<String>,
+    /// Jellyfin's h264-videobitdepth: read when MaxVideoBitDepth is absent. A string, so a value
+    /// that is not a number does not fail the whole query.
+    #[serde(rename = "h264-videobitdepth")]
+    pub h264_video_bit_depth: Option<String>,
 }
 
 impl TranscodeQuery {
@@ -205,6 +216,92 @@ fn is_deep_profile(profile: &str) -> bool {
         .any(|mark| profile.contains(mark))
 }
 
+/// What a request states about the H.264 a client takes, in Jellyfin's parameters.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct H264Request<'a> {
+    pub profile: Option<&'a str>,
+    pub h264_profile: Option<&'a str>,
+    pub max_video_bit_depth: Option<u32>,
+    pub h264_video_bit_depth: Option<&'a str>,
+}
+
+/// The profiles a request lists: those of the first of `profile` and `h264_profile` that lists any,
+/// split on commas and pipes, trimmed, without the empty entries.
+fn listed_profiles(request: H264Request<'_>) -> Vec<&str> {
+    [request.profile, request.h264_profile]
+        .into_iter()
+        .flatten()
+        .map(|list| {
+            list.split([',', '|'])
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .find(|entries| !entries.is_empty())
+        .unwrap_or_default()
+}
+
+/// Whether two profile names are the same, ignoring spaces and ASCII case ("High 10" is "high10").
+fn same_profile(a: &str, b: &str) -> bool {
+    let key = |name: &str| {
+        name.chars()
+            .filter(|c| !c.is_whitespace())
+            .map(|c| c.to_ascii_lowercase())
+            .collect::<String>()
+    };
+    key(a) == key(b)
+}
+
+/// The place of an H.264 profile in Jellyfin's order of profiles, or None for one it does not name.
+fn h264_score(profile: &str) -> Option<usize> {
+    const ORDER: [&str; 8] = [
+        "ConstrainedBaseline",
+        "Baseline",
+        "Extended",
+        "Main",
+        "High",
+        "ProgressiveHigh",
+        "ConstrainedHigh",
+        "High10",
+    ];
+    ORDER.iter().position(|known| same_profile(known, profile))
+}
+
+/// Whether a client that makes `request` takes an H.264 stream with `profile` and `bit_depth` as it
+/// is. A request that states no profile list and no depth limit (the web client) takes only 8-bit
+/// H.264 with a profile that is not deep. Otherwise (Jellyfin's CanStreamCopyVideo) the profile must
+/// be listed, or score no higher than the first listed one, and the depth must be within the limit.
+/// A profile or depth that is not known passes.
+pub(crate) fn client_takes_h264(
+    request: H264Request<'_>,
+    profile: Option<&str>,
+    bit_depth: Option<u32>,
+) -> bool {
+    // The stored depth, else 10 when the profile name says so ("High 10")
+    let depth = bit_depth.or_else(|| profile.filter(|name| name.contains("10")).map(|_| 10));
+    let listed = listed_profiles(request);
+    let limit = request.max_video_bit_depth.or_else(|| {
+        request
+            .h264_video_bit_depth
+            .and_then(|bits| bits.parse().ok())
+    });
+    if listed.is_empty() && limit.is_none() {
+        return depth.is_none_or(|bits| bits <= 8) && !profile.is_some_and(is_deep_profile);
+    }
+    // A profile that the list does not name must score no higher than the list's first entry
+    let profile_taken = match (profile, listed.first()) {
+        (Some(name), Some(first)) if !listed.iter().any(|entry| same_profile(entry, name)) => {
+            matches!((h264_score(name), h264_score(first)), (Some(s), Some(top)) if s <= top)
+        }
+        _ => true,
+    };
+    let depth_taken = match (limit, depth) {
+        (Some(max), Some(bits)) => bits <= max,
+        _ => true,
+    };
+    profile_taken && depth_taken
+}
+
 /// What is burned into the picture: a picture subtitle overlaid by its absolute stream index, or a
 /// text subtitle drawn by the subtitles filter at its place among the source's subtitles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -279,8 +376,16 @@ fn stream_copy(query: &TranscodeQuery, source: &SourceInfo) -> (bool, bool) {
         && tracks.burn_in.is_none()
         && matches!(source.video_codec.as_deref(), Some("h264" | "avc" | "avc1"))
         && client_takes(query.video_codec.as_deref(), &["h264", "avc", "avc1"])
-        && !source.video_profile.as_deref().is_some_and(is_deep_profile)
-        && source.video_bit_depth.is_none_or(|bits| bits <= 8)
+        && client_takes_h264(
+            H264Request {
+                profile: query.profile.as_deref(),
+                h264_profile: query.h264_profile.as_deref(),
+                max_video_bit_depth: query.max_video_bit_depth,
+                h264_video_bit_depth: query.h264_video_bit_depth.as_deref(),
+            },
+            source.video_profile.as_deref(),
+            source.video_bit_depth,
+        )
         && size_fits(query.max_width, source.width)
         && size_fits(query.max_height, source.height)
         && bitrate_fits(query.video_bitrate, source.video_bitrate);
@@ -1120,5 +1225,122 @@ mod tests {
         let (input, chosen) = hls_input("/films/Bare.mkv", &[], Version::Primary);
         assert_eq!(input, "/films/Bare.mkv");
         assert!(chosen.is_none());
+    }
+
+    // ── B25: 10-bit video ──
+
+    /// `h264_with(&["aac"])` whose video has `profile` and `bit_depth` (None: not stored).
+    fn h264_as(profile: Option<&str>, bit_depth: Option<u32>) -> SourceInfo {
+        SourceInfo {
+            video_profile: profile.map(Into::into),
+            video_bit_depth: bit_depth,
+            ..h264_with(&["aac"])
+        }
+    }
+
+    /// Whether a browser's playlist request with `params` (`&Key=value...`) added copies the
+    /// video of `source`.
+    fn copies_video(params: &str, source: &SourceInfo) -> bool {
+        let lists = "VideoCodec=h264,vp8,vp9,av1&AudioCodec=aac,mp3,opus,flac";
+        stream_copy(&query(&format!("{lists}{params}")), source).0
+    }
+
+    #[test]
+    fn test_deep_h264_is_encoded_for_a_client_that_states_nothing() {
+        // With or without a stored bit depth: the profile tells
+        for (profile, bits) in [
+            (Some("High 10"), Some(10)),
+            (Some("High 10"), None),
+            (Some("High 10 Intra"), None),
+            (Some("High 4:2:2"), Some(8)),
+            (Some("High 4:2:2"), None),
+            (Some("High 4:4:4 Predictive"), None),
+            (Some("High"), Some(10)),
+            (None, Some(10)),
+        ] {
+            let source = h264_as(profile, bits);
+            assert!(!copies_video("", &source), "{profile:?} {bits:?}");
+        }
+        // An empty profile list or an unparsable depth states nothing
+        for params in [
+            "&Profile=&h264-profile=",
+            "&h264-profile=,",
+            "&h264-videobitdepth=x",
+        ] {
+            let source = h264_as(Some("High 10"), None);
+            assert!(!copies_video(params, &source), "{params}");
+        }
+        // 8-bit H.264 is copied as before
+        for (profile, bits) in [
+            (Some("High"), Some(8)),
+            (Some("Main"), None),
+            (Some("Constrained Baseline"), Some(8)),
+            (None, None),
+        ] {
+            let source = h264_as(profile, bits);
+            assert!(copies_video("", &source), "{profile:?} {bits:?}");
+        }
+    }
+
+    #[test]
+    fn test_deep_h264_is_copied_for_a_client_that_states_it_takes_it() {
+        for bits in [Some(10), None] {
+            let hi10 = h264_as(Some("High 10"), bits);
+            // A depth limit: MaxVideoBitDepth, else h264-videobitdepth; the stored depth, else
+            // the profile's
+            for params in [
+                "&MaxVideoBitDepth=10",
+                "&MaxVideoBitDepth=12",
+                "&h264-videobitdepth=10",
+                "&h264-videobitdepth=x&MaxVideoBitDepth=10",
+            ] {
+                assert!(copies_video(params, &hi10), "{params} {bits:?}");
+            }
+            for params in [
+                "&MaxVideoBitDepth=8",
+                "&h264-videobitdepth=8",
+                "&MaxVideoBitDepth=8&h264-videobitdepth=10",
+            ] {
+                assert!(!copies_video(params, &hi10), "{params} {bits:?}");
+            }
+            // A profile list: Profile, else h264-profile; split on commas and pipes, matched
+            // without case or spaces
+            for params in [
+                "&Profile=high,main,high10",
+                "&h264-profile=high%7Cmain%7CHigh%2010",
+                "&Profile=%20High%2010%20",
+                "&Profile=&h264-profile=high10",
+            ] {
+                assert!(copies_video(params, &hi10), "{params} {bits:?}");
+            }
+            for params in [
+                "&Profile=high,main",
+                "&Profile=high&h264-profile=high10",
+                "&Profile=high,high10&MaxVideoBitDepth=8",
+            ] {
+                assert!(!copies_video(params, &hi10), "{params} {bits:?}");
+            }
+        }
+        // A profile not listed passes when it scores no higher than the first one listed
+        let high = h264_as(Some("High"), Some(8));
+        assert!(copies_video("&Profile=high10", &high));
+        assert!(!copies_video("&Profile=main", &high));
+        let constrained = h264_as(Some("Constrained Baseline"), Some(8));
+        assert!(copies_video("&Profile=baseline", &constrained));
+        // A profile without a score never passes unlisted
+        for profile in ["High 10 Intra", "High 4:2:2", "High 4:4:4 Predictive"] {
+            let source = h264_as(Some(profile), Some(8));
+            assert!(!copies_video("&Profile=high10", &source), "{profile}");
+        }
+        // A depth limit alone takes 4:2:2 within it, and what is not known passes a statement
+        assert!(copies_video(
+            "&MaxVideoBitDepth=10",
+            &h264_as(Some("High 4:2:2"), Some(8))
+        ));
+        assert!(copies_video("&MaxVideoBitDepth=8", &h264_as(None, None)));
+        assert!(copies_video("&Profile=high", &h264_as(None, Some(8))));
+        // The other rules still hold: a client that does not list H.264 gets it encoded
+        let query = query("VideoCodec=hevc&AudioCodec=aac&MaxVideoBitDepth=10");
+        assert!(!stream_copy(&query, &h264_as(Some("High 10"), Some(10))).0);
     }
 }

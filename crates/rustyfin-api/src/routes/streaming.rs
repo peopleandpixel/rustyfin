@@ -633,6 +633,10 @@ struct VideoPlaybackInfoQuery {
     height: Option<i32>,
     max_streaming_bitrate: Option<u32>,
     segment_time: Option<u32>,
+    profile: Option<String>,
+    max_video_bit_depth: Option<u32>,
+    h264_profile: Option<String>,
+    h264_video_bit_depth: Option<String>,
 }
 
 impl From<HashMap<String, String>> for VideoPlaybackInfoQuery {
@@ -687,6 +691,10 @@ impl From<HashMap<String, String>> for VideoPlaybackInfoQuery {
                 .get("MaxStreamingBitrate")
                 .and_then(|v| v.parse().ok()),
             segment_time: params.get("SegmentTime").and_then(|v| v.parse().ok()),
+            profile: params.get("Profile").cloned(),
+            max_video_bit_depth: params.get("MaxVideoBitDepth").and_then(|v| v.parse().ok()),
+            h264_profile: params.get("h264-profile").cloned(),
+            h264_video_bit_depth: params.get("h264-videobitdepth").cloned(),
         }
     }
 }
@@ -1004,6 +1012,39 @@ fn is_stream_type(stream: &rustyfin_model::media_source::MediaStream, kind: &str
     stream.codec_type.eq_ignore_ascii_case(kind)
 }
 
+/// Whether the client takes the first video stream of `source` as it is, by the rule in
+/// `transcode::client_takes_h264`. That is the stream `codecs_playable` checks; one that isn't
+/// H.264, or no video at all, has nothing to refuse.
+fn client_takes_h264_video(
+    source: &rustyfin_model::media_source::MediaSourceResponse,
+    query: &VideoPlaybackInfoQuery,
+) -> bool {
+    use super::transcode::{H264Request, client_takes_h264};
+
+    let Some(video) = source
+        .media_streams
+        .iter()
+        .find(|s| is_stream_type(s, "Video"))
+    else {
+        return true;
+    };
+    let is_h264 = video.codec.as_deref().is_some_and(|codec| {
+        ["h264", "avc", "avc1"]
+            .iter()
+            .any(|name| codec.eq_ignore_ascii_case(name))
+    });
+    if !is_h264 {
+        return true;
+    }
+    let request = H264Request {
+        profile: query.profile.as_deref(),
+        h264_profile: query.h264_profile.as_deref(),
+        max_video_bit_depth: query.max_video_bit_depth,
+        h264_video_bit_depth: query.h264_video_bit_depth.as_deref(),
+    };
+    client_takes_h264(request, video.profile.as_deref(), video.bit_depth)
+}
+
 /// Check if a media source can be directly played by the client.
 /// Direct play requires the client to support all codecs without any transcoding.
 fn check_direct_play(
@@ -1064,6 +1105,10 @@ fn check_direct_play(
 
     // Codecs must be in the client's lists, or in the fallback lists if it sent none
     if !codecs_playable(source, query) {
+        return false;
+    }
+    // The client must take H.264 video as it is, even when it sent no list
+    if !client_takes_h264_video(source, query) {
         return false;
     }
     // Without any list, the codec check is the whole answer
@@ -1143,6 +1188,10 @@ fn check_direct_stream(
 
     // Codecs must be in the client's lists, or in the fallback lists if it sent none
     if !codecs_playable(source, query) {
+        return false;
+    }
+    // The client must take H.264 video as it is
+    if !client_takes_h264_video(source, query) {
         return false;
     }
 
@@ -1592,6 +1641,181 @@ mod tests {
                 "{copy}"
             );
         }
+    }
+
+    // ── B25: 10-bit video ──
+
+    /// An H.264 + AAC source in `container` whose video has `profile` and `bit_depth` (None: not
+    /// stored).
+    fn h264_source(
+        container: &str,
+        profile: Option<&str>,
+        bit_depth: Option<u32>,
+    ) -> rustyfin_model::media_source::MediaSourceResponse {
+        let mut source = source_with(container, "h264", "aac");
+        source.media_streams[0].profile = profile.map(Into::into);
+        source.media_streams[0].bit_depth = bit_depth;
+        source
+    }
+
+    /// Whether `source` is direct played and direct streamed for a client that sends `params`.
+    fn direct(
+        params: &str,
+        source: &rustyfin_model::media_source::MediaSourceResponse,
+    ) -> [bool; 2] {
+        let query = query_from(params);
+        [
+            check_direct_play(source, &query),
+            check_direct_stream(source, &query),
+        ]
+    }
+
+    #[test]
+    fn test_deep_h264_is_not_direct_for_a_client_that_states_nothing() {
+        // The web client's lists, no lists, or only an audio list; the stored bit depth, else
+        // the profile's
+        for params in [LISTS, "", "AudioCodecs=aac"] {
+            for (profile, bits) in [
+                (Some("High 10"), Some(10)),
+                (Some("High 10"), None),
+                (Some("High 10 Intra"), None),
+                (Some("High 4:2:2"), Some(8)),
+                (Some("High 4:2:2"), None),
+                (Some("High 4:4:4 Predictive"), None),
+                (Some("High"), Some(10)),
+                (None, Some(10)),
+            ] {
+                for container in ["mp4", "m4v", "mkv"] {
+                    let source = h264_source(container, profile, bits);
+                    assert_eq!(
+                        direct(params, &source),
+                        [false, false],
+                        "{params} {container} {profile:?} {bits:?}"
+                    );
+                }
+            }
+        }
+        // An empty profile list or an unparsable depth states nothing
+        for params in [
+            "Profile=",
+            "h264-profile=,",
+            "MaxVideoBitDepth=ten",
+            "h264-videobitdepth=x",
+        ] {
+            let source = h264_source("mp4", Some("High 10"), None);
+            assert_eq!(
+                direct(&format!("{LISTS}&{params}"), &source),
+                [false, false],
+                "{params}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_8bit_h264_is_direct_as_before() {
+        for params in [LISTS, "", "AudioCodecs=aac"] {
+            for (profile, bits) in [
+                (Some("High"), Some(8)),
+                (Some("Main"), None),
+                (Some("Baseline"), Some(8)),
+                (Some("Constrained Baseline"), None),
+                (None, None),
+            ] {
+                let source = h264_source("mp4", profile, bits);
+                assert_eq!(
+                    direct(params, &source),
+                    [true, true],
+                    "{params} {profile:?} {bits:?}"
+                );
+                // MKV never is
+                let source = h264_source("mkv", profile, bits);
+                assert_eq!(direct(params, &source), [false, false], "{params} mkv");
+            }
+        }
+    }
+
+    #[test]
+    fn test_deep_h264_is_direct_for_a_client_that_states_it_takes_it() {
+        for bits in [Some(10), None] {
+            let hi10 = h264_source("mp4", Some("High 10"), bits);
+            for params in [
+                "MaxVideoBitDepth=10",
+                "MaxVideoBitDepth=12",
+                "h264-videobitdepth=10",
+                "Profile=high,main,high10",
+                "h264-profile=high|main|High 10",
+                "Profile= High 10 ",
+                "Profile=&h264-profile=high10",
+            ] {
+                let params = format!("{LISTS}&{params}");
+                assert_eq!(direct(&params, &hi10), [true, true], "{params} {bits:?}");
+            }
+            for params in [
+                "MaxVideoBitDepth=8",
+                "h264-videobitdepth=8",
+                "MaxVideoBitDepth=8&h264-videobitdepth=10",
+                "Profile=high,main",
+                "Profile=high&h264-profile=high10",
+                "Profile=high,high10&MaxVideoBitDepth=8",
+            ] {
+                let params = format!("{LISTS}&{params}");
+                assert_eq!(direct(&params, &hi10), [false, false], "{params} {bits:?}");
+            }
+            // A statement doesn't make MKV direct
+            let source = h264_source("mkv", Some("High 10"), bits);
+            let params = format!("{LISTS}&MaxVideoBitDepth=10");
+            assert_eq!(direct(&params, &source), [false, false], "mkv {bits:?}");
+        }
+        // A profile not listed passes when it scores no higher than the first one listed, and
+        // one without a score never does
+        let high = h264_source("mp4", Some("High"), Some(8));
+        assert_eq!(direct("Profile=high10", &high), [true, true]);
+        assert_eq!(direct("Profile=main", &high), [false, false]);
+        let constrained = h264_source("mp4", Some("Constrained Baseline"), Some(8));
+        assert_eq!(direct("Profile=baseline", &constrained), [true, true]);
+        for profile in ["High 10 Intra", "High 4:2:2", "High 4:4:4 Predictive"] {
+            let source = h264_source("mp4", Some(profile), Some(8));
+            assert_eq!(
+                direct("Profile=high10", &source),
+                [false, false],
+                "{profile}"
+            );
+        }
+        // A depth limit alone takes 4:2:2 within it, and what is not known passes a statement
+        let source = h264_source("mp4", Some("High 4:2:2"), Some(8));
+        assert_eq!(direct("MaxVideoBitDepth=10", &source), [true, true]);
+        let source = h264_source("mp4", None, None);
+        assert_eq!(direct("MaxVideoBitDepth=8", &source), [true, true]);
+        let source = h264_source("mp4", None, Some(8));
+        assert_eq!(direct("Profile=high", &source), [true, true]);
+        // Other codecs are unchanged: the rule is for H.264
+        let mut source = source_with("mp4", "vp9", "opus");
+        source.media_streams[0].profile = Some("Profile 2".into());
+        source.media_streams[0].bit_depth = Some(10);
+        assert_eq!(direct(LISTS, &source), [true, true]);
+    }
+
+    #[test]
+    fn test_deep_h264_is_direct_when_it_is_not_the_first_video_stream() {
+        // The rule reads the first video stream, as the codec lists do: here HEVC Main 10, which
+        // the client lists
+        let mut source = source_with("mp4", "hevc", "aac");
+        source.media_streams[0].profile = Some("Main 10".into());
+        source.media_streams[0].bit_depth = Some(10);
+        source.media_streams[1].index = 2;
+        source.media_streams.insert(
+            1,
+            rustyfin_model::media_source::MediaStream {
+                index: 1,
+                codec: Some("h264".into()),
+                codec_type: "Video".into(),
+                profile: Some("High 10".into()),
+                bit_depth: Some(10),
+                ..Default::default()
+            },
+        );
+        let params = "VideoCodecs=hevc,h264&AudioCodecs=aac";
+        assert_eq!(direct(params, &source), [true, true]);
     }
 
     // ── B16: version selection ──
