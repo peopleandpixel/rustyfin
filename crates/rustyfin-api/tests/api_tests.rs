@@ -14392,3 +14392,134 @@ async fn b16_hls_transcodes_the_requested_version() {
         assert_eq!(status, StatusCode::NOT_FOUND, "{transcode}");
     }
 }
+
+// ── B28: date added backfill ──
+// Once after the update, items already in a library get their file's date. Item details and search
+// cache answers that hold DateCreated, so the run drops both; lists and the Latest rows read the
+// database each time. Either way the new date shows at once, without a restart.
+
+/// The DateCreated of the item `id` in `uri`'s answer: the item itself, or one in a list.
+#[cfg(target_os = "linux")]
+async fn b28_date_created(
+    app: &axum::Router,
+    token: &str,
+    uri: &str,
+    id: uuid::Uuid,
+) -> chrono::DateTime<chrono::Utc> {
+    let (status, json) = send_authed(app, "GET", uri, token, None).await;
+    assert_eq!(status, StatusCode::OK, "{uri}: {json}");
+    let items = match &json {
+        serde_json::Value::Array(items) => items.clone(),
+        _ if json.get("Items").is_some() => json["Items"].as_array().cloned().unwrap_or_default(),
+        _ => vec![json.clone()],
+    };
+    let item = items
+        .iter()
+        .find(|item| item["Id"].as_str().and_then(|s| s.parse().ok()) == Some(id))
+        .unwrap_or_else(|| panic!("{uri}: no item {id} in {json}"));
+    let date = item["DateCreated"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{uri}: no DateCreated in {item}"));
+    chrono::DateTime::parse_from_rfc3339(date)
+        .unwrap_or_else(|e| panic!("{uri}: DateCreated {date}: {e}"))
+        .with_timezone(&chrono::Utc)
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn b28_backfilled_dates_show_at_once_in_details_lists_and_latest() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let folder = media_folder(&state, "b28");
+    let file = std::path::Path::new(&folder).join("B28 Film (2001)/B28 Film (2001).mkv");
+    let photo_file = std::path::Path::new(&folder).join("B28 Photo.jpg");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    for (path, secs) in [(&file, 1_000_000_000), (&photo_file, 1_000_000_100)] {
+        std::fs::write(path, b"").unwrap();
+        std::fs::File::open(path)
+            .and_then(|f| {
+                f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+            })
+            .unwrap();
+    }
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: "B28".to_string(),
+        content_type: rustyfin_model::library::LibraryContentType::Movies,
+        paths: vec![folder.clone()],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    // A movie and a photo a scan before B23 dated by the time of the scan, in whole seconds.
+    let scanned = chrono::DateTime::from_timestamp(chrono::Utc::now().timestamp(), 0).unwrap();
+    let id = uuid::Uuid::new_v4();
+    let photo = uuid::Uuid::new_v4();
+    for (item, name, kind, path) in [
+        (id, "B28 Film", "Movie", &file),
+        (photo, "B28 Photo", "Photo", &photo_file),
+    ] {
+        sqlx::query(
+            "INSERT INTO media_items (id, library_id, name, sort_name, media_type, path, date_created) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(item.to_string())
+        .bind(lib.id.to_string())
+        .bind(name)
+        .bind(name.to_lowercase())
+        .bind(kind)
+        .bind(path.to_str().unwrap())
+        .bind(scanned.to_rfc3339())
+        .execute(&state.db)
+        .await
+        .unwrap();
+    }
+    let (token, user_id) = admin_session(&state).await;
+    let sorted = "Recursive=true&IncludeItemTypes=Movie&SortBy=DateCreated&SortOrder=Descending";
+    let uris = [
+        // Cached for 300 s.
+        format!("/Items/{id}?userId={user_id}"),
+        // Read from the database each time.
+        format!("/Items?{sorted}"),
+        format!("/Users/{user_id}/Items?{sorted}"),
+        "/Items/Latest?Limit=20".to_string(),
+        format!("/Users/{user_id}/Items/Latest?Limit=20"),
+    ];
+    // The photo's details, which the cache serves again until the run drops them.
+    let photo_uri = format!("/Items/{photo}?userId={user_id}");
+    // Before the run every answer, cached ones included, has the scan's date.
+    for uri in &uris {
+        assert_eq!(
+            b28_date_created(&app, &token, uri, id).await,
+            scanned,
+            "{uri} before the run"
+        );
+    }
+    for _ in 0..2 {
+        assert_eq!(
+            b28_date_created(&app, &token, &photo_uri, photo).await,
+            scanned,
+            "{photo_uri} before the run"
+        );
+    }
+    assert!(
+        state.cache.item_details.contains_key(&photo.to_string()),
+        "the photo's details are cached before the run"
+    );
+
+    rustyfin_api::date_backfill::run(&state).await;
+
+    let file_date = chrono::DateTime::from_timestamp(1_000_000_000, 0).unwrap();
+    for uri in &uris {
+        assert_eq!(
+            b28_date_created(&app, &token, uri, id).await,
+            file_date,
+            "{uri} after the run"
+        );
+    }
+    assert_eq!(
+        b28_date_created(&app, &token, &photo_uri, photo).await,
+        chrono::DateTime::from_timestamp(1_000_000_100, 0).unwrap(),
+        "{photo_uri} after the run"
+    );
+}

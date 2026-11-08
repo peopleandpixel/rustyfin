@@ -1422,33 +1422,33 @@ async fn date_metadata(path: &Path) -> Option<std::fs::Metadata> {
 
 /// When the item at `path` was added, as Jellyfin dates it. On Linux .NET has no birth time, so its
 /// creation time is the older of the modification and status-change times, from `date_metadata`, so
-/// a file link is dated by its final target and a folder link by its own times. Now, if they
-/// can't be read.
+/// a file link is dated by its final target and a folder link by its own times. None if they can't
+/// be read, or the time is out of range.
 #[cfg(target_os = "linux")]
-async fn date_added(path: &Path) -> DateTime<Utc> {
+pub(crate) async fn path_date(path: &Path) -> Option<DateTime<Utc>> {
     use std::os::unix::fs::MetadataExt;
-    let Some(meta) = date_metadata(path).await else {
-        return Utc::now();
-    };
+    let meta = date_metadata(path).await?;
     let modified = (meta.mtime(), meta.mtime_nsec());
     let changed = (meta.ctime(), meta.ctime_nsec());
     let (secs, nsecs) = modified.min(changed);
-    DateTime::<Utc>::from_timestamp(secs, nsecs as u32).unwrap_or_else(Utc::now)
+    DateTime::<Utc>::from_timestamp(secs, nsecs as u32)
 }
 
 /// When the item at `path` was added, as Jellyfin dates it: its creation time, else its
 /// modification time, from `date_metadata`, so a file link is dated by its final target and a
-/// folder link by its own times. Now, if they can't be read.
+/// folder link by its own times. None if they can't be read.
 #[cfg(not(target_os = "linux"))]
+pub(crate) async fn path_date(path: &Path) -> Option<DateTime<Utc>> {
+    let meta = date_metadata(path).await?;
+    meta.created()
+        .or_else(|_| meta.modified())
+        .map(DateTime::<Utc>::from)
+        .ok()
+}
+
+/// When the item at `path` was added, as `path_date` gives it. Now, if that is None.
 async fn date_added(path: &Path) -> DateTime<Utc> {
-    match date_metadata(path).await {
-        Some(meta) => meta
-            .created()
-            .or_else(|_| meta.modified())
-            .map(DateTime::<Utc>::from)
-            .unwrap_or_else(|_| Utc::now()),
-        None => Utc::now(),
-    }
+    path_date(path).await.unwrap_or_else(Utc::now)
 }
 
 /// What a scan makes of one entry of a folder.

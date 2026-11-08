@@ -2802,6 +2802,868 @@ async fn b23_new_items_are_dated_by_their_files() {
     }
 }
 
+// B28: date added backfill. Once after the update, an item already in a library gets the earlier
+// of its stored date and its path's date by B23's rules, since a scan before B23 stored the time of
+// the scan. An earlier or equal stored date is kept, and so is the date of an item whose path can't
+// be read. Once done it doesn't run again, and a run that stops part way goes on at the next start.
+
+/// The date_created stored for the item at `rel`, as stored.
+#[cfg(target_os = "linux")]
+async fn b28_stored(pool: &SqlitePool, lib: &Library, rel: &str) -> String {
+    let id = item_at(pool, lib, rel).await;
+    sqlx::query_scalar("SELECT date_created FROM media_items WHERE id = ?1")
+        .bind(id.to_string())
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// The date_created stored for the item at `rel`.
+#[cfg(target_os = "linux")]
+async fn b28_date(pool: &SqlitePool, lib: &Library, rel: &str) -> chrono::DateTime<chrono::Utc> {
+    let stored = b28_stored(pool, lib, rel).await;
+    chrono::DateTime::parse_from_rfc3339(&stored)
+        .unwrap_or_else(|e| panic!("date_created of {rel} is {stored}: {e}"))
+        .with_timezone(&chrono::Utc)
+}
+
+/// `secs` seconds after the epoch.
+#[cfg(target_os = "linux")]
+fn b28_at(secs: u64) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::from_timestamp(secs as i64, 0).unwrap()
+}
+
+/// Stores `date` for every item in the library, as a scan before B23 stored the time of the scan.
+#[cfg(target_os = "linux")]
+async fn b28_date_all(pool: &SqlitePool, lib: &Library, date: chrono::DateTime<chrono::Utc>) {
+    sqlx::query("UPDATE media_items SET date_created = ?1 WHERE library_id = ?2")
+        .bind(date.to_rfc3339())
+        .bind(lib.id.to_string())
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+/// Stores `date`, as given, for the item at `rel`.
+#[cfg(target_os = "linux")]
+async fn b28_set_date(pool: &SqlitePool, lib: &Library, rel: &str, date: &str) {
+    let id = item_at(pool, lib, rel).await;
+    sqlx::query("UPDATE media_items SET date_created = ?1 WHERE id = ?2")
+        .bind(date)
+        .bind(id.to_string())
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+/// B23's date for a path that isn't a link to a file: the older of its own modification and
+/// status-change times.
+#[cfg(target_os = "linux")]
+fn b28_own_date(path: &Path) -> chrono::DateTime<chrono::Utc> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::symlink_metadata(path).unwrap();
+    let (secs, nanos) = std::cmp::min(
+        (meta.mtime(), meta.mtime_nsec()),
+        (meta.ctime(), meta.ctime_nsec()),
+    );
+    chrono::DateTime::from_timestamp(secs, nanos as u32).unwrap()
+}
+
+/// Makes the backfill pending again from the start, as the update's migration does.
+#[cfg(target_os = "linux")]
+async fn b28_arm(pool: &SqlitePool) {
+    sqlx::query(
+        "INSERT OR REPLACE INTO configuration (key, value) VALUES ('date_added_backfill', '')",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// Runs the whole backfill, which must be pending.
+#[cfg(target_os = "linux")]
+async fn b28_run(pool: &SqlitePool) -> rustyfin_core::date_backfill::BackfillRun {
+    rustyfin_core::date_backfill::run_pending(pool, |_| {})
+        .await
+        .unwrap()
+        .expect("a pending backfill")
+}
+
+/// What a run did: (checked, moved, unreadable, finished).
+#[cfg(target_os = "linux")]
+fn b28_counts(run: rustyfin_core::date_backfill::BackfillRun) -> (u64, u64, u64, bool) {
+    (run.checked, run.moved, run.unreadable, run.finished)
+}
+
+/// How many of `films` have their file's date, film n's being 1_000_000_000 + n seconds after the
+/// epoch; the others must still have `scanned`.
+#[cfg(target_os = "linux")]
+async fn b28_dated(
+    pool: &SqlitePool,
+    lib: &Library,
+    films: &[String],
+    scanned: chrono::DateTime<chrono::Utc>,
+) -> usize {
+    let mut dated = 0;
+    for (n, rel) in films.iter().enumerate() {
+        let date = b28_date(pool, lib, rel).await;
+        if date == b28_at(1_000_000_000 + n as u64) {
+            dated += 1;
+        } else {
+            assert_eq!(date, scanned, "{rel}");
+        }
+    }
+    dated
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn b28_items_dated_by_their_scan_move_to_their_paths_dates() {
+    let fx = Fixture::new().await;
+    let film = fx.library("film", LibraryContentType::Movies).await;
+    let tv = fx.library("tv", LibraryContentType::TvShows).await;
+    let music = fx.library("music", LibraryContentType::Music).await;
+    let photos = fx.library("photos", LibraryContentType::Photos).await;
+    let movie = "Old Film (1999)/Old Film (1999).mkv";
+    let episode = "Show/Season 1/Show S01E01.mkv";
+    let track = "Artist A/Album A/01 Song.mp3";
+    touch(&root_of(&film), movie);
+    touch(&root_of(&tv), episode);
+    touch(&root_of(&music), track);
+    touch(&root_of(&photos), "Beach.jpg");
+    // Old modification times, set once every file exists, since a new file changes its folder's.
+    let dated = [
+        (&film, movie, 1_000_000_000),
+        (&tv, episode, 1_000_000_100),
+        (&tv, "Show/Season 1", 1_000_000_200),
+        (&tv, "Show", 1_000_000_300),
+        (&music, track, 1_000_000_400),
+        (&music, "Artist A/Album A", 1_000_000_500),
+        (&music, "Artist A", 1_000_000_600),
+        (&photos, "Beach.jpg", 1_000_000_700),
+    ];
+    for (lib, rel, secs) in dated {
+        b23_set_mtime(&root_of(lib).join(rel), secs);
+    }
+    for lib in [&film, &tv, &music, &photos] {
+        scan(&fx.pool, lib).await;
+        b28_date_all(&fx.pool, lib, chrono::Utc::now()).await;
+    }
+
+    let run = b28_run(&fx.pool).await;
+    assert_eq!(b28_counts(run), (8, 8, 0, true));
+    for (lib, rel, secs) in dated {
+        assert_eq!(b28_date(&fx.pool, lib, rel).await, b28_at(secs), "{rel}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn b28_an_earlier_or_equal_stored_date_is_kept() {
+    let fx = Fixture::new().await;
+    let film = fx.library("film", LibraryContentType::Movies).await;
+    let earlier = "Earlier (2000)/Earlier (2000).mkv";
+    let equal = "Equal (2001)/Equal (2001).mkv";
+    let later = "Later (2002)/Later (2002).mkv";
+    let unparsed = "Unparsed (2003)/Unparsed (2003).mkv";
+    let films = [earlier, equal, later, unparsed];
+    for rel in films {
+        touch(&root_of(&film), rel);
+    }
+    for rel in films {
+        b23_set_mtime(&root_of(&film).join(rel), 1_000_000_000);
+    }
+    scan(&fx.pool, &film).await;
+    // Dates an import or an older server could have stored: before the file's, the file's own,
+    // after it (the time of a scan before B23), and one in the column's default format, which has
+    // no offset, so the server reads it as the epoch.
+    b28_set_date(&fx.pool, &film, earlier, "2000-01-01T00:00:00+00:00").await;
+    b28_set_date(&fx.pool, &film, equal, "2001-09-09T01:46:40+00:00").await;
+    b28_set_date(&fx.pool, &film, later, &chrono::Utc::now().to_rfc3339()).await;
+    b28_set_date(&fx.pool, &film, unparsed, "2024-01-01 00:00:00").await;
+
+    let run = b28_run(&fx.pool).await;
+    assert_eq!(b28_counts(run), (4, 1, 0, true));
+    assert_eq!(
+        b28_date(&fx.pool, &film, earlier).await,
+        b28_at(946_684_800)
+    );
+    assert_eq!(
+        b28_date(&fx.pool, &film, equal).await,
+        b28_at(1_000_000_000)
+    );
+    assert_eq!(
+        b28_date(&fx.pool, &film, later).await,
+        b28_at(1_000_000_000)
+    );
+    assert_eq!(
+        b28_stored(&fx.pool, &film, unparsed).await,
+        "2024-01-01 00:00:00"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn b28_a_stored_date_with_an_offset_is_compared_as_a_time() {
+    let fx = Fixture::new().await;
+    let film = fx.library("film", LibraryContentType::Movies).await;
+    let rel = "Old Film (1999)/Old Film (1999).mkv";
+    touch(&root_of(&film), rel);
+    b23_set_mtime(&root_of(&film).join(rel), 1_000_000_000);
+    scan(&fx.pool, &film).await;
+    // An hour before the file's date, written with +02:00: earlier as a time, later as text.
+    let stored = "2001-09-09T02:46:40+02:00";
+    assert!(stored > b28_at(1_000_000_000).to_rfc3339().as_str());
+    b28_set_date(&fx.pool, &film, rel, stored).await;
+
+    let run = b28_run(&fx.pool).await;
+    assert_eq!(b28_counts(run), (1, 0, 0, true));
+    assert_eq!(b28_stored(&fx.pool, &film, rel).await, stored);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn b28_a_path_that_cant_be_read_keeps_its_date() {
+    let fx = Fixture::new().await;
+    let film = fx.library("film", LibraryContentType::Movies).await;
+    let tv = fx.library("tv", LibraryContentType::TvShows).await;
+    let gone = "Gone (1999)/Gone (1999).mkv";
+    let kept = "Kept (2001)/Kept (2001).mkv";
+    // An episode outside a season folder: the scanner makes up "Flat Show/Season 1", which has no
+    // folder.
+    let episode = "Flat Show/Flat Show S01E01.mkv";
+    touch(&root_of(&film), gone);
+    touch(&root_of(&film), kept);
+    touch(&root_of(&tv), episode);
+    let dated = [
+        (&film, kept, 1_000_000_000),
+        (&tv, episode, 1_000_000_100),
+        (&tv, "Flat Show", 1_000_000_300),
+    ];
+    for (lib, rel, secs) in dated {
+        b23_set_mtime(&root_of(lib).join(rel), secs);
+    }
+    scan(&fx.pool, &film).await;
+    scan(&fx.pool, &tv).await;
+    let scanned = chrono::Utc::now();
+    b28_date_all(&fx.pool, &film, scanned).await;
+    b28_date_all(&fx.pool, &tv, scanned).await;
+    // A file gone since the scan, as on a share that's offline or a drive that's unplugged.
+    std::fs::remove_file(root_of(&film).join(gone)).unwrap();
+
+    let run = b28_run(&fx.pool).await;
+    assert_eq!(b28_counts(run), (5, 3, 2, true));
+    for (lib, rel) in [(&film, gone), (&tv, "Flat Show/Season 1")] {
+        assert_eq!(b28_date(&fx.pool, lib, rel).await, scanned, "{rel}");
+    }
+    for (lib, rel, secs) in dated {
+        assert_eq!(b28_date(&fx.pool, lib, rel).await, b28_at(secs), "{rel}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn b28_a_second_run_changes_nothing_and_a_stopped_run_finishes_on_the_next_start() {
+    let fx = Fixture::new().await;
+    let film = fx.library("film", LibraryContentType::Movies).await;
+    let films: Vec<String> = (0..5)
+        .map(|n| format!("Film {n} (200{n})/Film {n} (200{n}).mkv"))
+        .collect();
+    for rel in &films {
+        touch(&root_of(&film), rel);
+    }
+    for (n, rel) in films.iter().enumerate() {
+        b23_set_mtime(&root_of(&film).join(rel), 1_000_000_000 + n as u64);
+    }
+    scan(&fx.pool, &film).await;
+    let scanned = chrono::Utc::now();
+    b28_date_all(&fx.pool, &film, scanned).await;
+
+    // A run stopped after its first batch, as by a shutdown, has dated that batch only.
+    let stopped = rustyfin_core::date_backfill::run_some(&fx.pool, 2, 1, |_| {})
+        .await
+        .unwrap()
+        .expect("a pending backfill");
+    assert_eq!(b28_counts(stopped), (2, 2, 0, false));
+    assert_eq!(b28_dated(&fx.pool, &film, &films, scanned).await, 2);
+    // The next start goes on from there.
+    let next = b28_run(&fx.pool).await;
+    assert_eq!(b28_counts(next), (3, 3, 0, true));
+    assert_eq!(b28_dated(&fx.pool, &film, &films, scanned).await, 5);
+    // Done: later starts and scans don't run it.
+    assert_eq!(
+        rustyfin_core::date_backfill::run_pending(&fx.pool, |_| {})
+            .await
+            .unwrap(),
+        None
+    );
+    scan(&fx.pool, &film).await;
+    assert_eq!(
+        rustyfin_core::date_backfill::run_pending(&fx.pool, |_| {})
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(b28_dated(&fx.pool, &film, &films, scanned).await, 5);
+    // Run again over items already done, it changes nothing.
+    b28_arm(&fx.pool).await;
+    let again = b28_run(&fx.pool).await;
+    assert_eq!(b28_counts(again), (5, 0, 0, true));
+    assert_eq!(b28_dated(&fx.pool, &film, &films, scanned).await, 5);
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Default)]
+struct B28Logs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+#[cfg(target_os = "linux")]
+impl std::io::Write for B28Logs {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The backfill's log lines, from every test in this binary since the first call. A subscriber
+/// for one thread misses events from a place another thread logged from first.
+#[cfg(target_os = "linux")]
+fn b28_logged() -> Vec<String> {
+    static LOGS: std::sync::OnceLock<B28Logs> = std::sync::OnceLock::new();
+    let logs = LOGS.get_or_init(|| {
+        let logs = B28Logs::default();
+        let sink = logs.clone();
+        tracing::subscriber::set_global_default(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || sink.clone())
+                .finish(),
+        )
+        .expect("no other global subscriber in this test binary");
+        logs
+    });
+    let text = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    text.lines()
+        .filter(|line| line.contains("date added backfill: "))
+        .map(str::to_owned)
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn b28_a_run_stopped_by_an_error_logs_its_end() {
+    b28_logged();
+    let fx = Fixture::new().await;
+    let film = fx.library("film", LibraryContentType::Movies).await;
+    let films: Vec<String> = (0..4)
+        .map(|n| format!("Film {n} (200{n})/Film {n} (200{n}).mkv"))
+        .collect();
+    for rel in &films {
+        touch(&root_of(&film), rel);
+    }
+    for (n, rel) in films.iter().enumerate() {
+        b23_set_mtime(&root_of(&film).join(rel), 1_000_000_000 + n as u64);
+    }
+    scan(&fx.pool, &film).await;
+    let scanned = chrono::Utc::now();
+    b28_date_all(&fx.pool, &film, scanned).await;
+    // The run goes in id order, two items a batch. The last item's move fails after the second
+    // batch has moved the item before it, so that whole batch is undone.
+    let last: String = sqlx::query_scalar(
+        "SELECT MAX(id) FROM media_items WHERE library_id = ?1 AND media_type = 'Movie'",
+    )
+    .bind(film.id.to_string())
+    .fetch_one(&fx.pool)
+    .await
+    .unwrap();
+    let fail = format!(
+        "CREATE TRIGGER b28_fail BEFORE UPDATE OF date_created ON media_items \
+         WHEN OLD.id = '{last}' BEGIN SELECT RAISE(ABORT, 'b28: a failed write'); END"
+    );
+    sqlx::query(sqlx::AssertSqlSafe(fail))
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+
+    let stopped = rustyfin_core::date_backfill::run_some(&fx.pool, 2, u32::MAX, |_| {}).await;
+    assert!(stopped.is_err(), "{stopped:?}");
+    assert_eq!(b28_dated(&fx.pool, &film, &films, scanned).await, 2);
+    let logged = b28_logged();
+    assert!(
+        logged
+            .iter()
+            .any(|line| line.ends_with("date added backfill: started")),
+        "{logged:#?}"
+    );
+    let end = logged
+        .iter()
+        .find(|line| line.contains("date added backfill: stopped by an error in "))
+        .unwrap_or_else(|| panic!("no end line in {logged:#?}"));
+    assert!(
+        end.ends_with("; 4 items checked, 2 moved to their path's date, 0 unreadable"),
+        "{end}"
+    );
+
+    // The next start redoes the batch that failed.
+    exec(&fx.pool, "DROP TRIGGER b28_fail", &[]).await;
+    let next = b28_run(&fx.pool).await;
+    assert_eq!(b28_counts(next), (2, 2, 0, true));
+    assert_eq!(b28_dated(&fx.pool, &film, &films, scanned).await, 4);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn b28_each_batch_is_reported_once_it_has_committed() {
+    let fx = Fixture::new().await;
+    let film = fx.library("film", LibraryContentType::Movies).await;
+    let films: Vec<String> = (0..5)
+        .map(|n| format!("Film {n} (200{n})/Film {n} (200{n}).mkv"))
+        .collect();
+    for rel in &films {
+        touch(&root_of(&film), rel);
+    }
+    for (n, rel) in films.iter().enumerate() {
+        b23_set_mtime(&root_of(&film).join(rel), 1_000_000_000 + n as u64);
+    }
+    scan(&fx.pool, &film).await;
+    let scanned = chrono::Utc::now();
+    b28_date_all(&fx.pool, &film, scanned).await;
+
+    // At each report: the run so far, and how many films another connection sees moved. A report
+    // made before its batch commits would wait on the batch's lock, so that read gives up at 10 s.
+    let mut reports = Vec::new();
+    let run = rustyfin_core::date_backfill::run_some(&fx.pool, 2, u32::MAX, |run| {
+        let seen = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                let read = sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM media_items WHERE library_id = ?1 \
+                     AND media_type = 'Movie' AND date_created <> ?2",
+                )
+                .bind(film.id.to_string())
+                .bind(scanned.to_rfc3339())
+                .fetch_one(&fx.pool);
+                match tokio::time::timeout(Duration::from_secs(10), read).await {
+                    Ok(count) => count.unwrap(),
+                    Err(_) => -1,
+                }
+            })
+        });
+        reports.push((run.checked, run.moved, seen));
+    })
+    .await
+    .unwrap()
+    .expect("a pending backfill");
+    assert_eq!(b28_counts(run), (5, 5, 0, true));
+    assert_eq!(reports, [(2, 2, 2), (4, 4, 4), (5, 5, 5)]);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn b28_a_file_link_is_dated_by_its_target_and_a_folder_link_by_its_own_times() {
+    let fx = Fixture::new().await;
+    let film = fx.library("film", LibraryContentType::Movies).await;
+    let tv = fx.library("tv", LibraryContentType::TvShows).await;
+    // As in B23's test: a series folder outside the library, linked in, and a film whose video
+    // file is a link to a link to a file outside the library.
+    touch(
+        &fx.path("elsewhere"),
+        "Linked Show/Season 1/Linked Show S01E01.mkv",
+    );
+    std::os::unix::fs::symlink(
+        fx.path("elsewhere/Linked Show"),
+        root_of(&tv).join("Linked Show"),
+    )
+    .unwrap();
+    let linked_film = "Linked Film (2003)/Linked Film (2003).mkv";
+    touch(&fx.path("elsewhere"), "Linked Film.mkv");
+    std::os::unix::fs::symlink(
+        fx.path("elsewhere/Linked Film.mkv"),
+        fx.path("elsewhere/hop.mkv"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(root_of(&film).join("Linked Film (2003)")).unwrap();
+    std::os::unix::fs::symlink(
+        fx.path("elsewhere/hop.mkv"),
+        root_of(&film).join(linked_film),
+    )
+    .unwrap();
+    b23_set_mtime(&fx.path("elsewhere/Linked Show"), 1_000_000_800);
+    b23_set_mtime(&fx.path("elsewhere/Linked Film.mkv"), 1_000_000_900);
+    scan(&fx.pool, &film).await;
+    scan(&fx.pool, &tv).await;
+    let scanned = chrono::Utc::now();
+    b28_date_all(&fx.pool, &film, scanned).await;
+    b28_date_all(&fx.pool, &tv, scanned).await;
+
+    b28_run(&fx.pool).await;
+    assert_eq!(
+        b28_date(&fx.pool, &film, linked_film).await,
+        b28_at(1_000_000_900)
+    );
+    assert_eq!(
+        b28_date(&fx.pool, &tv, "Linked Show").await,
+        b28_own_date(&root_of(&tv).join("Linked Show"))
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn b28_saving_an_item_read_before_the_backfill_keeps_its_new_date() {
+    let fx = Fixture::new().await;
+    let film = fx.library("film", LibraryContentType::Movies).await;
+    let movie = "Old Film (1999)/Old Film (1999).mkv";
+    touch(&root_of(&film), movie);
+    b23_set_mtime(&root_of(&film).join(movie), 1_000_000_000);
+    scan(&fx.pool, &film).await;
+    b28_date_all(&fx.pool, &film, chrono::Utc::now()).await;
+    // A metadata refresh reads its items, then saves each whole item once it has new metadata. By
+    // then the copy it read can hold the date the backfill has replaced.
+    let id = item_at(&fx.pool, &film, movie).await;
+    let mut refreshed = rustyfin_db::repo_media::get_item_by_id(&fx.pool, id)
+        .await
+        .unwrap()
+        .expect("the film");
+    b28_run(&fx.pool).await;
+    refreshed.overview = Some("Found by the refresh.".to_string());
+    rustyfin_db::repo_media::upsert_media_item(&fx.pool, &refreshed)
+        .await
+        .unwrap();
+    assert_eq!(
+        b28_date(&fx.pool, &film, movie).await,
+        b28_at(1_000_000_000)
+    );
+    let saved = rustyfin_db::repo_media::get_item_by_id(&fx.pool, id)
+        .await
+        .unwrap()
+        .expect("the film");
+    assert_eq!(saved.overview.as_deref(), Some("Found by the refresh."));
+    // A new item still gets the date it's saved with.
+    let mut new = refreshed.clone();
+    new.id = Uuid::new_v4();
+    new.path = root_of(&film)
+        .join("New Film (2005)/New Film (2005).mkv")
+        .to_str()
+        .unwrap()
+        .to_string();
+    new.date_created = b28_at(1_100_000_000);
+    rustyfin_db::repo_media::upsert_media_item(&fx.pool, &new)
+        .await
+        .unwrap();
+    let stored = rustyfin_db::repo_media::get_item_by_id(&fx.pool, new.id)
+        .await
+        .unwrap()
+        .expect("the new film");
+    assert_eq!(stored.date_created, b28_at(1_100_000_000));
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn b28_a_new_date_fires_no_trigger() {
+    let fx = Fixture::new().await;
+    let film = fx.library("film", LibraryContentType::Movies).await;
+    let movie = "Alpha/Alpha.mkv";
+    touch(&root_of(&film), movie);
+    scan(&fx.pool, &film).await;
+    let id = item_at(&fx.pool, &film, movie).await.to_string();
+    // A year and a rating, which the filter tables count.
+    exec(
+        &fx.pool,
+        "UPDATE media_items SET production_year = 1999, official_rating = 'PG' WHERE id = ?1",
+        &[id.as_str()],
+    )
+    .await;
+    // Each item the backfill moves is one UPDATE of date_created. Before migration 061 that also
+    // fired the filter trigger, which recounted the item's year and rating over the whole table,
+    // and the search trigger, which rewrote the item's search entry.
+    let mut conn = fx.pool.acquire().await.unwrap();
+    let before: i64 = sqlx::query_scalar("SELECT total_changes()")
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE media_items SET date_created = ?1 WHERE id = ?2")
+        .bind(b28_at(1_000_000_000).to_rfc3339())
+        .bind(&id)
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    let after: i64 = sqlx::query_scalar("SELECT total_changes()")
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+    // The item's own row, and no row written by a trigger.
+    assert_eq!(after - before, 1);
+}
+
+/// The rows of the rating filter table, as (rating, item count), by rating.
+#[cfg(target_os = "linux")]
+async fn b28_filter_ratings(pool: &SqlitePool) -> Vec<(String, i64)> {
+    sqlx::query_as("SELECT rating, item_count FROM filter_rating_index ORDER BY rating")
+        .fetch_all(pool)
+        .await
+        .unwrap()
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn b28_a_new_year_or_rating_still_moves_the_filter_counts() {
+    let fx = Fixture::new().await;
+    let film = fx.library("film", LibraryContentType::Movies).await;
+    let films = ["Alpha/Alpha.mkv", "Bravo/Bravo.mkv", "Charlie/Charlie.mkv"];
+    for rel in films {
+        touch(&root_of(&film), rel);
+    }
+    scan(&fx.pool, &film).await;
+    let mut ids = Vec::new();
+    for rel in films {
+        ids.push(item_at(&fx.pool, &film, rel).await.to_string());
+    }
+    let year = "UPDATE media_items SET production_year = ?1 WHERE id = ?2";
+    let rating = "UPDATE media_items SET official_rating = ?1 WHERE id = ?2";
+    for id in &ids {
+        exec(&fx.pool, year, &["1999", id.as_str()]).await;
+        exec(&fx.pool, rating, &["PG", id.as_str()]).await;
+    }
+    // No year or rating loses its last item here. When one does, the trigger keeps that value's
+    // old count until the filter tables are rebuilt.
+    assert_eq!(b18_filter_years(&fx.pool).await, [(1999, 3)]);
+    assert_eq!(b28_filter_ratings(&fx.pool).await, [("PG".to_string(), 3)]);
+    exec(&fx.pool, year, &["2001", ids[0].as_str()]).await;
+    assert_eq!(b18_filter_years(&fx.pool).await, [(1999, 2), (2001, 1)]);
+    exec(&fx.pool, year, &["2001", ids[1].as_str()]).await;
+    assert_eq!(b18_filter_years(&fx.pool).await, [(1999, 1), (2001, 2)]);
+    exec(&fx.pool, rating, &["R", ids[0].as_str()]).await;
+    assert_eq!(
+        b28_filter_ratings(&fx.pool).await,
+        [("PG".to_string(), 2), ("R".to_string(), 1)]
+    );
+    exec(&fx.pool, rating, &["R", ids[1].as_str()]).await;
+    assert_eq!(
+        b28_filter_ratings(&fx.pool).await,
+        [("PG".to_string(), 1), ("R".to_string(), 2)]
+    );
+}
+
+/// The ids of the items a search for `query` finds.
+#[cfg(target_os = "linux")]
+async fn b28_found(pool: &SqlitePool, query: &str) -> Vec<Uuid> {
+    rustyfin_db::repo_search::search_hints(pool, query, 10)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|hint| hint.id)
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn b28_a_new_name_still_changes_what_search_finds() {
+    let fx = Fixture::new().await;
+    let film = fx.library("film", LibraryContentType::Movies).await;
+    let movie = "Alpha/Alpha.mkv";
+    touch(&root_of(&film), movie);
+    scan(&fx.pool, &film).await;
+    let id = item_at(&fx.pool, &film, movie).await;
+    assert_eq!(b28_found(&fx.pool, "Alpha").await, [id]);
+    let id_text = id.to_string();
+    exec(
+        &fx.pool,
+        "UPDATE media_items SET name = ?1 WHERE id = ?2",
+        &["Zulu", id_text.as_str()],
+    )
+    .await;
+    assert_eq!(b28_found(&fx.pool, "Zulu").await, [id]);
+    assert_eq!(b28_found(&fx.pool, "Alpha").await, Vec::<Uuid>::new());
+}
+
+/// The backfill over `count` generated films, each stored with a date a day after its file's, as
+/// by a scan before B23, so that every one moves. Prints the time of the first batch (and of its
+/// read and its write transaction alone) and of the whole run, the UPDATE triggers on media_items,
+/// and the query plans of the statements each moved item runs, its triggers' included.
+#[cfg(target_os = "linux")]
+async fn b28_bench(count: u32) {
+    use rustyfin_core::date_backfill::{BATCH_SIZE, run_some};
+    let fx = Fixture::new().await;
+    let film = fx.library("film", LibraryContentType::Movies).await;
+    let root = root_of(&film);
+    for n in 0..count {
+        let folder = root.join(format!("{:03}", n / 1000));
+        if n % 1000 == 0 {
+            std::fs::create_dir_all(&folder).unwrap();
+        }
+        std::fs::File::create(folder.join(format!("Film {n}.mkv"))).unwrap();
+    }
+    // The rows go in without the INSERT triggers, which recount a year and a rating over the whole
+    // table for each row. The search index and the filter tables are then built once.
+    let inserts: Vec<(String, String)> = sqlx::query_as(
+        "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' \
+         AND name IN ('trg_media_items_insert', 'media_items_ai')",
+    )
+    .fetch_all(&fx.pool)
+    .await
+    .unwrap();
+    assert_eq!(inserts.len(), 2);
+    for (name, _) in &inserts {
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP TRIGGER {name}")))
+            .execute(&fx.pool)
+            .await
+            .unwrap();
+    }
+    let scanned = (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339();
+    sqlx::query(
+        "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i + 1 < ?1) \
+         INSERT INTO media_items (id, name, media_type, path, library_id, production_year, \
+         official_rating, genres, date_created) \
+         SELECT printf('%08x-0000-4000-8000-000000000000', i), 'Film ' || i, 'Movie', \
+         printf('%s/%03d/Film %d.mkv', ?2, i / 1000, i), ?3, 1950 + i % 75, \
+         CASE i % 5 WHEN 0 THEN NULL WHEN 1 THEN 'PG' WHEN 2 THEN 'PG-13' WHEN 3 THEN 'R' \
+         ELSE 'TV-MA' END, 'Drama|Thriller', ?4 FROM n",
+    )
+    .bind(i64::from(count))
+    .bind(root.to_str().unwrap())
+    .bind(film.id.to_string())
+    .bind(&scanned)
+    .execute(&fx.pool)
+    .await
+    .unwrap();
+    for (_, sql) in &inserts {
+        sqlx::query(sqlx::AssertSqlSafe(sql.clone()))
+            .execute(&fx.pool)
+            .await
+            .unwrap();
+    }
+    exec(
+        &fx.pool,
+        "INSERT INTO media_items_fts(media_items_fts) VALUES ('rebuild')",
+        &[],
+    )
+    .await;
+    rustyfin_db::repo_media::rebuild_filter_indexes(&fx.pool)
+        .await
+        .unwrap();
+    // The setup's writes leave the WAL first, so no commit timed below copies them back.
+    exec(&fx.pool, "PRAGMA wal_checkpoint(TRUNCATE)", &[]).await;
+
+    // The first batch's read alone, then its write transaction alone: each row's guarded UPDATE
+    // sets the date it already has, which fires what a move fires.
+    let batch_sql = "SELECT id, path, date_created FROM media_items WHERE id > ?1 AND media_type IN \
+         ('Movie','Series','Season','Episode','Audio','MusicAlbum','Photo') ORDER BY id LIMIT ?2";
+    let started = std::time::Instant::now();
+    let rows: Vec<(String, String, String)> = sqlx::query_as(batch_sql)
+        .bind("")
+        .bind(i64::from(BATCH_SIZE))
+        .fetch_all(&fx.pool)
+        .await
+        .unwrap();
+    let read = started.elapsed();
+    let started = std::time::Instant::now();
+    let mut tx = fx.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+    for (id, path, stored) in &rows {
+        sqlx::query(
+            "UPDATE media_items SET date_created = ?1 \
+             WHERE id = ?2 AND path = ?3 AND date_created = ?4",
+        )
+        .bind(stored)
+        .bind(id)
+        .bind(path)
+        .bind(stored)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    }
+    tx.commit().await.unwrap();
+    let write = started.elapsed();
+
+    let started = std::time::Instant::now();
+    let first = run_some(&fx.pool, BATCH_SIZE, 1, |_| {})
+        .await
+        .unwrap()
+        .expect("a pending backfill");
+    let batch = started.elapsed();
+    let rest = b28_run(&fx.pool).await;
+    let run = started.elapsed();
+    assert_eq!(first.moved, u64::from(BATCH_SIZE));
+    assert_eq!(first.moved + rest.moved, u64::from(count));
+    println!(
+        "b28 bench, {count} items: the first batch of {BATCH_SIZE} in {batch:.2?} (its read alone \
+         in {read:.2?}, its write transaction alone in {write:.2?}), the whole run in {run:.2?}"
+    );
+    let triggers: Vec<(String, String)> = sqlx::query_as(
+        "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' \
+         AND tbl_name = 'media_items' AND sql LIKE '%AFTER UPDATE%' ORDER BY name",
+    )
+    .fetch_all(&fx.pool)
+    .await
+    .unwrap();
+    for (name, sql) in triggers {
+        let head = sql.split("BEGIN").next().unwrap_or_default();
+        println!(
+            "  trigger {name}: {}",
+            head.split_whitespace().collect::<Vec<_>>().join(" ")
+        );
+    }
+    // The backfill's statements, and those the filter trigger runs for the old and the new year
+    // and rating of each item it fires for.
+    let statements = [
+        ("batch", batch_sql, 2),
+        (
+            "move",
+            "UPDATE media_items SET date_created = ?1 \
+             WHERE id = ?2 AND path = ?3 AND date_created = ?4",
+            4,
+        ),
+        (
+            "year recount",
+            "INSERT OR REPLACE INTO filter_year_index (year, item_count) \
+             SELECT ?1, COUNT(*) FROM media_items WHERE production_year = ?1 GROUP BY ?1",
+            1,
+        ),
+        (
+            "year delete",
+            "DELETE FROM filter_year_index WHERE year = ?1 AND item_count = 0",
+            1,
+        ),
+        (
+            "rating recount",
+            "INSERT OR REPLACE INTO filter_rating_index (rating, item_count) \
+             SELECT ?1, COUNT(*) FROM media_items WHERE official_rating = ?1 GROUP BY ?1",
+            1,
+        ),
+        (
+            "rating delete",
+            "DELETE FROM filter_rating_index WHERE rating = ?1 AND item_count = 0",
+            1,
+        ),
+    ];
+    for (what, sql, params) in statements {
+        let mut query = sqlx::query_as::<_, (i64, i64, i64, String)>(sqlx::AssertSqlSafe(format!(
+            "EXPLAIN QUERY PLAN {sql}"
+        )));
+        for _ in 0..params {
+            query = query.bind("PG");
+        }
+        let plan = query.fetch_all(&fx.pool).await.unwrap();
+        let steps: Vec<&str> = plan.iter().map(|step| step.3.as_str()).collect();
+        println!("  plan, {what}: {}", steps.join("; "));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "a bench: run it by name, with --ignored --nocapture"]
+async fn b28_bench_10k_items() {
+    b28_bench(10_000).await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "a bench: run it by name, with --ignored --nocapture"]
+async fn b28_bench_50k_items() {
+    b28_bench(50_000).await;
+}
+
 // B17: scan progress. A library's scan is listed from the moment it is queued until it ends, and
 // its updates go 0, then up to at most 99, then 100 once its probes have finished. B18 adds the
 // state to each update: Queued, Active from the start, and Idle with the 100.

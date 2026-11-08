@@ -242,6 +242,12 @@ async fn main() {
         task_scheduler.start(shutdown_rx);
     }
 
+    // Background task: once after an update, dates the items older versions stored by their files
+    {
+        let state = state.clone();
+        tokio::spawn(async move { rustyfin_api::date_backfill::run(&state).await });
+    }
+
     // Extract HTTP port for discovery services
     let http_port: u16 = bind_addr
         .rsplit(':')

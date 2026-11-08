@@ -11,6 +11,8 @@ use std::collections::HashMap;
 use std::sync::LazyLock;
 use uuid::Uuid;
 
+/// Saves an item. Saving an existing item keeps its stored date added (`date_created`),
+/// because callers such as the metadata refresh save copies they read earlier.
 pub async fn upsert_media_item(pool: &SqlitePool, item: &MediaItem) -> Result<(), sqlx::Error> {
     let id = item.id.to_string();
     let parent_id = item.parent_id.map(|p| p.to_string());
@@ -29,7 +31,10 @@ pub async fn upsert_media_item(pool: &SqlitePool, item: &MediaItem) -> Result<()
           premiere_date, runtime_ticks, index_number, parent_index_number, tmdb_id, tvdb_id, \
           tags, status, original_language, tagline, production_countries, budget, revenue, \
           homepage, end_date, vote_count, popularity) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, \
+          COALESCE((SELECT date_created FROM media_items WHERE id = ?1), ?13), \
+          ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, \
+          ?28, ?29, ?30)",
     )
     .bind(&id)
     .bind(&item.name)
