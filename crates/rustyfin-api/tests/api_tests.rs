@@ -482,6 +482,691 @@ async fn test_b8_socket_accepts_a_user_token_while_an_api_key_is_set() {
     std::fs::remove_dir_all(base.data_dir.as_path()).ok();
 }
 
+// ── J1: Jellyfin credentials ──
+// Jellyfin's apps send the token as `Authorization: MediaBrowser …, Token="…"` (older ones in
+// `X-Emby-Authorization`) and as `?ApiKey=` in URLs; master's styles keep working. The first
+// source that holds a token decides.
+
+/// jellyfin-web's credentials header for `token`, under `scheme`.
+fn j1_mb(scheme: &str, token: &str) -> String {
+    format!(
+        r#"{scheme} Client="Jellyfin Web", Device="Firefox", DeviceId="j1-device", Version="10.10.0", Token="{token}""#
+    )
+}
+
+/// A user who is not an administrator, and a token for them.
+async fn j1_user(state: &AppState) -> (String, uuid::Uuid) {
+    let user = rustyfin_model::user::User {
+        id: uuid::Uuid::new_v4(),
+        name: "j1-user".to_string(),
+        password_hash: String::new(),
+        is_administrator: false,
+        created_at: chrono::Utc::now(),
+        last_login_date: None,
+        configuration: serde_json::Value::Null,
+    };
+    rustyfin_db::repo_user::create_user(&state.db, &user)
+        .await
+        .unwrap();
+    let token = rustyfin_auth::create_token(&state.db, &user, &Default::default())
+        .await
+        .unwrap();
+    (token, user.id)
+}
+
+/// A `GET path` request with `credentials`: (header, value) pairs, where the header `?` adds the
+/// value to the query string instead.
+fn j1_request(path: &str, credentials: &[(&str, &str)]) -> axum::http::request::Builder {
+    let query: Vec<&str> = credentials
+        .iter()
+        .filter(|(name, _)| *name == "?")
+        .map(|(_, value)| *value)
+        .collect();
+    let uri = if query.is_empty() {
+        path.to_string()
+    } else {
+        format!("{path}?{}", query.join("&"))
+    };
+    let mut builder = Request::builder().uri(uri);
+    for (name, value) in credentials.iter().filter(|(name, _)| *name != "?") {
+        builder = builder.header(*name, *value);
+    }
+    builder
+}
+
+/// The status and body of the answer to `request`.
+async fn j1_send(state: &AppState, request: axum::http::request::Builder) -> (StatusCode, String) {
+    let resp = app(state.clone())
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8_lossy(&body).into_owned())
+}
+
+/// The status and body of `GET path` with `credentials` (see `j1_request`).
+async fn j1_get(
+    state: &AppState,
+    path: &str,
+    credentials: &[(&str, &str)],
+) -> (StatusCode, String) {
+    j1_send(state, j1_request(path, credentials)).await
+}
+
+/// The id of the user `GET /Users/Me` returns for `credentials`, or the status when it isn't 200.
+async fn j1_me(state: &AppState, credentials: &[(&str, &str)]) -> Result<uuid::Uuid, StatusCode> {
+    let (status, body) = j1_get(state, "/Users/Me", credentials).await;
+    if status != StatusCode::OK {
+        return Err(status);
+    }
+    let user: serde_json::Value = serde_json::from_str(&body).unwrap();
+    Ok(uuid::Uuid::parse_str(user["Id"].as_str().unwrap()).unwrap())
+}
+
+/// Checks that the credential `(name, style)`, with `<t>` in place of the token, gives a user
+/// token that user's claims and the configured API key an administrator's.
+async fn j1_assert_style(state: &AppState, user: &(String, uuid::Uuid), name: &str, style: &str) {
+    let (token, user_id) = user;
+    let value = style.replace("<t>", token);
+    let me = j1_me(state, &[(name, value.as_str())]).await;
+    assert_eq!(me, Ok(*user_id), "user token, {name}: {style}");
+    let (status, _) = j1_get(state, "/System/Info/Storage", &[(name, value.as_str())]).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "user token, {name}: {style}");
+    let value = style.replace("<t>", state.api_key.as_deref().unwrap());
+    let (status, _) = j1_get(state, "/System/Info/Storage", &[(name, value.as_str())]).await;
+    assert_eq!(status, StatusCode::OK, "API key, {name}: {style}");
+}
+
+#[tokio::test]
+async fn test_j1_jellyfin_styles_authenticate_a_user_token_and_the_api_key() {
+    let state = test_state().await;
+    let user = j1_user(&state).await;
+    let styles = [
+        ("Authorization", j1_mb("MediaBrowser", "<t>")),
+        ("Authorization", j1_mb("mediabrowser", "<t>")),
+        ("Authorization", j1_mb("Emby", "<t>")),
+        ("Authorization", j1_mb("EMBY", "<t>")),
+        // rustyfin-cli's header
+        ("Authorization", r#"MediaBrowser Token="<t>""#.to_string()),
+        ("X-Emby-Authorization", j1_mb("MediaBrowser", "<t>")),
+        ("X-Emby-Authorization", j1_mb("emby", "<t>")),
+        ("?", "ApiKey=<t>".to_string()),
+        ("?", "apikey=<t>".to_string()),
+        ("?", "static=true&APIKEY=<t>&DeviceId=j1-device".to_string()),
+    ];
+    for (name, style) in &styles {
+        j1_assert_style(&state, &user, name, style).await;
+    }
+}
+
+#[tokio::test]
+async fn test_j1_master_styles_keep_working() {
+    let state = test_state().await;
+    let user = j1_user(&state).await;
+    let styles = [
+        ("Authorization", "Bearer <t>"),
+        ("X-Emby-Token", "<t>"),
+        ("X-MediaBrowser-Token", "<t>"),
+        ("?", "api_key=<t>"),
+        ("?", "static=true&api_key=<t>"),
+    ];
+    for (name, style) in styles {
+        j1_assert_style(&state, &user, name, style).await;
+    }
+}
+
+#[tokio::test]
+async fn test_j1_percent_encoded_values_and_a_quoted_comma() {
+    let mut state = test_state().await;
+    // The configured key may hold any character but surrounding whitespace
+    let key = "j1 key+,100%";
+    state.api_key = Some(Arc::new(key.to_string()));
+    // Values in the MediaBrowser header and the query are decoded like Jellyfin's
+    // `WebUtility.UrlDecode`: `+` is a space, `%XX` a byte, and a `%` without two hex digits stays.
+    // Token headers are used as sent. The configured key also matches a MediaBrowser token and
+    // `api_key` as sent (J1 re-check R1, review F1).
+    let accepted = [
+        ("Authorization", r#"MediaBrowser Token="j1 key+,100%""#),
+        (
+            "Authorization",
+            r#"MediaBrowser Token="j1%20key%2B%2C100%25""#,
+        ),
+        ("Authorization", r#"MediaBrowser Token="j1+key%2b,100%""#),
+        (
+            "X-Emby-Authorization",
+            r#"Emby Token="j1%20key%2B%2C100%25""#,
+        ),
+        ("?", "ApiKey=j1%20key%2B%2C100%25"),
+        ("?", "apikey=j1+key%2b%2c100%25"),
+        ("?", "api_key=j1%20key%2B%2C100%25"),
+        ("?", "Api%4Bey=j1%20key%2B%2C100%25"),
+        ("Authorization", "Bearer j1 key+,100%"),
+        ("X-Emby-Token", key),
+        ("X-MediaBrowser-Token", key),
+    ];
+    for (name, value) in accepted {
+        let (status, _) = j1_get(&state, "/System/Info/Storage", &[(name, value)]).await;
+        assert_eq!(status, StatusCode::OK, "{name}: {value}");
+    }
+    let refused = [
+        // A raw `+` is a space, and these spellings aren't the key as sent either
+        ("Authorization", r#"MediaBrowser Token="j1+key+,100%""#),
+        ("?", "ApiKey=j1+key+,100%25"),
+        // Token headers are not decoded
+        ("Authorization", "Bearer j1%20key%2B%2C100%25"),
+        ("X-Emby-Token", "j1%20key%2B%2C100%25"),
+    ];
+    for (name, value) in refused {
+        let (status, _) = j1_get(&state, "/System/Info/Storage", &[(name, value)]).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{name}: {value}");
+    }
+
+    // A user token sent percent-encoded, and quoted commas in the other values
+    let (token, user_id) = j1_user(&state).await;
+    let encoded: String = token.bytes().map(|b| format!("%{b:02X}")).collect();
+    let styles = [
+        (
+            "Authorization",
+            format!(r#"MediaBrowser Token="{encoded}""#),
+        ),
+        ("?", format!("ApiKey={encoded}")),
+        (
+            "Authorization",
+            format!(
+                r#"MediaBrowser Client="Jellyfin Android", Device="Phone, 2", DeviceId="j1", Version="2.6.0", Token="{token}""#
+            ),
+        ),
+        (
+            "Authorization",
+            format!(r#"MediaBrowser Token="{token}", Device="Phone, 2""#),
+        ),
+        // jellyfin-web encodes the device name
+        (
+            "Authorization",
+            format!(r#"MediaBrowser Device="T%C3%A9l%C3%A9phone", Token="{token}""#),
+        ),
+        // Quoted text that looks like a key is part of the value
+        (
+            "Authorization",
+            format!(r#"MediaBrowser Device="Phone, Token=j1-bad", Token="{token}""#),
+        ),
+        (
+            "Authorization",
+            format!(r#"MediaBrowser Token="{token}", Client="a, Token=j1-bad""#),
+        ),
+    ];
+    for (i, (name, value)) in styles.iter().enumerate() {
+        let me = j1_me(&state, &[(*name, value.as_str())]).await;
+        assert_eq!(me, Ok(user_id), "style {i}, {name}");
+    }
+}
+
+#[tokio::test]
+async fn test_j1_the_first_source_with_a_token_decides() {
+    let state = test_state().await;
+    let (good, _) = j1_user(&state).await;
+    let key = state.api_key.clone().unwrap();
+    // A well-formed token that this server never issued
+    let bad = "0123456789abcdef0123456789abcdef";
+    let mb_good = r#"MediaBrowser Client="Jellyfin Web", Token="<good>""#;
+    let mb_bad = r#"MediaBrowser Client="Jellyfin Web", Token="<bad>""#;
+    let ok = StatusCode::OK;
+    let unauthorized = StatusCode::UNAUTHORIZED;
+    // (credentials, expected), with <good> a user token, <key> the configured key and <bad> a
+    // token nobody issued
+    let cases: Vec<(Vec<(&str, &str)>, StatusCode)> = vec![
+        // An invalid first token is refused, whatever a later source holds
+        (
+            vec![("Authorization", mb_bad), ("?", "api_key=<good>")],
+            unauthorized,
+        ),
+        (
+            vec![("Authorization", mb_bad), ("?", "api_key=<key>")],
+            unauthorized,
+        ),
+        (
+            vec![("Authorization", mb_bad), ("?", "ApiKey=<good>")],
+            unauthorized,
+        ),
+        (
+            vec![("Authorization", mb_bad), ("X-Emby-Token", "<good>")],
+            unauthorized,
+        ),
+        (
+            vec![("Authorization", mb_bad), ("X-Emby-Authorization", mb_good)],
+            unauthorized,
+        ),
+        (
+            vec![
+                ("Authorization", "Bearer <bad>"),
+                ("X-Emby-Authorization", mb_good),
+            ],
+            unauthorized,
+        ),
+        (
+            vec![("X-Emby-Authorization", mb_bad), ("X-Emby-Token", "<good>")],
+            unauthorized,
+        ),
+        (
+            vec![("X-Emby-Token", "<bad>"), ("X-MediaBrowser-Token", "<key>")],
+            unauthorized,
+        ),
+        (
+            vec![("X-MediaBrowser-Token", "<bad>"), ("?", "ApiKey=<good>")],
+            unauthorized,
+        ),
+        (vec![("?", "ApiKey=<bad>&api_key=<good>")], unauthorized),
+        (vec![("?", "api_key=<key>&ApiKey=<bad>")], unauthorized),
+        (vec![("?", "ApiKey=<bad>&ApiKey=<good>")], unauthorized),
+        // A valid first token is used, whatever a later source holds
+        (
+            vec![
+                ("Authorization", mb_good),
+                ("X-Emby-Token", "<bad>"),
+                ("?", "ApiKey=<bad>"),
+            ],
+            ok,
+        ),
+        (
+            vec![
+                ("Authorization", "Bearer <good>"),
+                ("X-Emby-Authorization", mb_bad),
+            ],
+            ok,
+        ),
+        (
+            vec![("X-Emby-Authorization", mb_good), ("X-Emby-Token", "<bad>")],
+            ok,
+        ),
+        (vec![("X-Emby-Token", "<key>"), ("?", "ApiKey=<bad>")], ok),
+        (vec![("?", "api_key=<bad>&ApiKey=<good>")], ok),
+        // An empty, blank or missing token is no token: the next source decides
+        (
+            vec![
+                (
+                    "Authorization",
+                    r#"MediaBrowser Client="Jellyfin Web", Token="""#,
+                ),
+                ("X-Emby-Token", "<good>"),
+            ],
+            ok,
+        ),
+        (
+            vec![
+                ("Authorization", r#"MediaBrowser Token="  ""#),
+                ("?", "ApiKey=<good>"),
+            ],
+            ok,
+        ),
+        (
+            vec![
+                (
+                    "Authorization",
+                    r#"MediaBrowser Client="Jellyfin Web", Device="Firefox""#,
+                ),
+                ("?", "ApiKey=<good>"),
+            ],
+            ok,
+        ),
+        (
+            vec![
+                ("Authorization", "Bearer "),
+                ("X-Emby-Authorization", mb_good),
+            ],
+            ok,
+        ),
+        (
+            vec![
+                ("Authorization", "Basic ZHVtbXk6cHc="),
+                ("X-Emby-Token", "<good>"),
+            ],
+            ok,
+        ),
+        (
+            vec![
+                ("X-Emby-Authorization", r#"Emby Token="""#),
+                ("X-MediaBrowser-Token", "<key>"),
+            ],
+            ok,
+        ),
+        (
+            vec![("X-Emby-Token", ""), ("X-MediaBrowser-Token", "<good>")],
+            ok,
+        ),
+        (
+            vec![("X-MediaBrowser-Token", "  "), ("?", "ApiKey=<good>")],
+            ok,
+        ),
+        (vec![("?", "ApiKey=&api_key=<good>")], ok),
+        (vec![("?", "ApiKey=%20&api_key=<key>")], ok),
+        // Blank tokens alone
+        (
+            vec![
+                ("Authorization", r#"MediaBrowser Token="""#),
+                ("X-Emby-Authorization", r#"MediaBrowser Token=" ""#),
+                ("X-Emby-Token", " "),
+                ("X-MediaBrowser-Token", ""),
+                ("?", "ApiKey=&api_key=+"),
+            ],
+            unauthorized,
+        ),
+    ];
+    for (credentials, expected) in &cases {
+        let values: Vec<String> = credentials
+            .iter()
+            .map(|(_, value)| {
+                value
+                    .replace("<good>", &good)
+                    .replace("<key>", &key)
+                    .replace("<bad>", bad)
+            })
+            .collect();
+        let sent: Vec<(&str, &str)> = credentials
+            .iter()
+            .zip(&values)
+            .map(|((name, _), value)| (*name, value.as_str()))
+            .collect();
+        let (status, body) = j1_get(&state, "/System/Info", &sent).await;
+        assert_eq!(status, *expected, "{credentials:?}");
+        for token in [good.as_str(), key.as_str(), bad] {
+            assert!(
+                !body.contains(token),
+                "the answer to {credentials:?} holds a token"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_j1_malformed_credentials_never_authenticate() {
+    let state = test_state().await;
+    let (good, _) = j1_user(&state).await;
+    let key = state.api_key.clone().unwrap();
+    for t in [good.as_str(), key.as_str()] {
+        // The well-formed header is accepted
+        let well_formed = format!(r#"MediaBrowser Token="{t}""#);
+        let credentials = [("Authorization", well_formed.as_str())];
+        let (status, _) = j1_get(&state, "/System/Info", &credentials).await;
+        assert_eq!(status, StatusCode::OK);
+        let cases = [
+            // Other schemes, or no space after the scheme
+            ("Authorization", format!("Basic {t}")),
+            ("Authorization", format!("bearer {t}")),
+            ("Authorization", format!(r#"Digest Token="{t}""#)),
+            ("Authorization", format!(r#"MediaBrowserToken="{t}""#)),
+            ("Authorization", format!(r#"Token="{t}""#)),
+            // No Token key; keys are case-sensitive, like Jellyfin's
+            (
+                "Authorization",
+                j1_mb("MediaBrowser", t).replace("Token=", "Tok="),
+            ),
+            ("Authorization", format!(r#"MediaBrowser token="{t}""#)),
+            ("Authorization", format!(r#"MediaBrowser TOKEN="{t}""#)),
+            // Unbalanced quotes
+            ("Authorization", format!(r#"MediaBrowser Token="{t}"#)),
+            ("Authorization", format!(r#"MediaBrowser Token={t}""#)),
+            (
+                "Authorization",
+                format!(r#"MediaBrowser Client="a, Token="{t}""#),
+            ),
+            (
+                "X-Emby-Authorization",
+                format!(r#"MediaBrowser Token="{t}"#),
+            ),
+            // Text around the value
+            ("Authorization", format!(r#"MediaBrowser Token="{t}"x"#)),
+            ("Authorization", format!(r#"MediaBrowser Token=" {t}""#)),
+            // Bad escapes and bytes that are not ASCII
+            ("Authorization", format!(r#"MediaBrowser Token="{t}%""#)),
+            ("Authorization", format!(r#"MediaBrowser Token="{t}%zz""#)),
+            ("Authorization", format!(r#"MediaBrowser Token="{t}%FF""#)),
+            (
+                "Authorization",
+                format!(r#"MediaBrowser Token="{t}%C3%A9""#),
+            ),
+            (
+                "Authorization",
+                format!(r#"MediaBrowser Device="Téléphone", Token="{t}""#),
+            ),
+            ("X-Emby-Token", format!("{t}é")),
+            ("?", format!("ApiKey={t}%")),
+            ("?", format!("ApiKey=%zz{t}")),
+            ("?", format!("ApiKey={t}%FF")),
+            ("?", format!("ApiKey={t}%C3%A9")),
+            // Fragments
+            ("Authorization", "MediaBrowser".to_string()),
+            ("Authorization", "MediaBrowser ".to_string()),
+            ("Authorization", r#"MediaBrowser ,,=,"",=="""#.to_string()),
+            ("Authorization", "Emby".to_string()),
+            ("Authorization", String::new()),
+        ];
+        for (i, (name, value)) in cases.iter().enumerate() {
+            let (status, body) = j1_get(&state, "/System/Info", &[(*name, value.as_str())]).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "case {i}, {name}");
+            assert!(!body.contains(t), "the answer to case {i} holds the token");
+        }
+    }
+    // A byte that is not UTF-8
+    let raw = [
+        b"MediaBrowser Device=\"Phone\xff\", Token=\"".as_slice(),
+        good.as_bytes(),
+        b"\"",
+    ]
+    .concat();
+    let request = j1_request("/System/Info", &[]).header(
+        "Authorization",
+        axum::http::HeaderValue::from_bytes(&raw).unwrap(),
+    );
+    let (status, _) = j1_send(&state, request).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_j1_a_repeated_token_takes_the_last_value_like_jellyfin() {
+    // Jellyfin's `GetParts` stores each pair with `result[key] = …`, so the last Token wins
+    // (Jellyfin.Server.Implementations/Security/AuthorizationContext.cs:296, 313 at v12.4), and
+    // it reads the first value of a repeated header (`auth[0]`, line 238).
+    let state = test_state().await;
+    let (good, _) = j1_user(&state).await;
+    let bad = "0123456789abcdef0123456789abcdef";
+    let mb_good = format!(r#"MediaBrowser Token="{good}""#);
+    let mb_bad = format!(r#"MediaBrowser Token="{bad}""#);
+    let cases = [
+        (
+            format!(r#"MediaBrowser Token="{bad}", Token="{good}""#),
+            StatusCode::OK,
+        ),
+        (
+            format!(r#"MediaBrowser Token="{good}", Token="{bad}""#),
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            format!(r#"MediaBrowser Token="{good}", Client="a", Token="""#),
+            StatusCode::UNAUTHORIZED,
+        ),
+    ];
+    for (i, (value, expected)) in cases.iter().enumerate() {
+        let credentials = [("Authorization", value.as_str())];
+        let (status, _) = j1_get(&state, "/System/Info", &credentials).await;
+        assert_eq!(status, *expected, "case {i}");
+    }
+    let repeated = [
+        ([mb_good.as_str(), mb_bad.as_str()], StatusCode::OK),
+        (
+            [mb_bad.as_str(), mb_good.as_str()],
+            StatusCode::UNAUTHORIZED,
+        ),
+    ];
+    for (i, (values, expected)) in repeated.iter().enumerate() {
+        let credentials = values.map(|value| ("Authorization", value));
+        let (status, _) = j1_get(&state, "/System/Info", &credentials).await;
+        assert_eq!(status, *expected, "repeated header, case {i}");
+    }
+}
+
+// J1 review F1: master compared `api_key` as sent, and URLs such as an *arr Webhook's carry the
+// configured key as typed. A key that holds `+` or `%XX` keeps working there, and works
+// percent-encoded too. `ApiKey` is decoded only, as in Jellyfin.
+
+#[tokio::test]
+async fn test_j1_a_configured_key_with_plus_or_percent_works_raw_and_encoded_in_api_key() {
+    let mut state = test_state().await;
+    let (token, user_id) = j1_user(&state).await;
+    let bad = "0123456789abcdef0123456789abcdef";
+    // (key, as typed, percent-encoded)
+    for (key, typed, encoded) in [
+        ("j1+key/A=", "j1+key/A=", "j1%2Bkey%2FA%3D"),
+        ("j1%41key", "j1%41key", "j1%2541key"),
+    ] {
+        state.api_key = Some(Arc::new(key.to_string()));
+        // `/System/Info/Storage` needs administrator claims.
+        let accepted = [
+            format!("api_key={typed}"),
+            format!("api_key={encoded}"),
+            format!("static=true&API_KEY={typed}&DeviceId=j1-device"),
+            format!("ApiKey=&api_key={typed}"),
+            format!("ApiKey={encoded}"),
+        ];
+        for query in &accepted {
+            let (status, _) =
+                j1_get(&state, "/System/Info/Storage", &[("?", query.as_str())]).await;
+            assert_eq!(status, StatusCode::OK, "{key}: {query}");
+        }
+        let refused = [
+            // `ApiKey` is decoded only
+            vec![("?", format!("ApiKey={typed}"))],
+            // Either spelling must hold the whole key
+            vec![("?", format!("api_key={}", &typed[..typed.len() - 1]))],
+            // An invalid earlier token still decides
+            vec![
+                ("X-Emby-Token", bad.to_string()),
+                ("?", format!("api_key={typed}")),
+            ],
+            vec![("?", format!("ApiKey={bad}&api_key={typed}"))],
+        ];
+        for (i, credentials) in refused.iter().enumerate() {
+            let credentials: Vec<(&str, &str)> = credentials
+                .iter()
+                .map(|(name, value)| (*name, value.as_str()))
+                .collect();
+            let (status, body) = j1_get(&state, "/System/Info/Storage", &credentials).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{key}: refused case {i}");
+            assert!(!body.contains(typed), "{key}: refused case {i}: {body}");
+        }
+    }
+
+    // A user token still counts in its decoded spelling.
+    let encoded: String = token.bytes().map(|b| format!("%{b:02X}")).collect();
+    let query = format!("api_key={encoded}");
+    assert_eq!(j1_me(&state, &[("?", query.as_str())]).await, Ok(user_id));
+}
+
+#[tokio::test]
+async fn test_j1_basic_authorization_next_to_api_key_is_not_refused() {
+    // An *arr Webhook URL with a user name and password: the app sends them as Basic, next to the
+    // URL's `api_key`. Basic gives no token, so `api_key` decides. The test guards that
+    // fall-through and doesn't reproduce a failure: Basic next to `api_key` was never refused, and
+    // before review F1's fix only the plus-sign key failed here, because `api_key` was decoded.
+    let mut state = test_state().await;
+    let headers = [
+        ("Authorization", "Basic YXJyOnNlY3JldA=="),
+        ("Content-Type", "application/json"),
+    ];
+    for key in ["test-api-key", "j1+key/A="] {
+        state.api_key = Some(Arc::new(key.to_string()));
+        let uri = format!("/Library/Media/Webhook?api_key={key}");
+        for method in ["POST", "PUT"] {
+            let body = Some(r#"{"eventType":"Test"}"#);
+            let (status, text) = b18_send(&app(state.clone()), method, &uri, &headers, body).await;
+            assert_eq!(status, StatusCode::NO_CONTENT, "{key}, {method}: {text}");
+        }
+    }
+}
+
+// J1 re-check R1: Sonarr's and Radarr's Emby / Jellyfin connection sends the configured key as typed
+// in `X-MediaBrowser-Token` and in `Authorization: MediaBrowser Token="…"` (`B18_ARR_AUTH`'s shape).
+// On master the raw `X-MediaBrowser-Token` decided; now the `MediaBrowser` token does, so its
+// `Token` matches the key as typed or decoded, like `api_key`. User tokens count decoded only.
+
+#[tokio::test]
+async fn test_j1_a_configured_key_with_plus_or_percent_works_as_typed_in_media_browser_headers() {
+    let mut state = test_state().await;
+    let (token, user_id) = j1_user(&state).await;
+    let bad = "0123456789abcdef0123456789abcdef";
+    let body = serde_json::json!({ "updates": [
+        { "path": "/elsewhere/Other (2001)/Other (2001).mkv", "updateType": "Modified" },
+    ]})
+    .to_string();
+    // (key, percent-encoded)
+    for (key, encoded) in [("j1+key/A=", "j1%2Bkey%2FA%3D"), ("j1%41key", "j1%2541key")] {
+        state.api_key = Some(Arc::new(key.to_string()));
+        let arr = format!("MediaBrowser Token=\"{key}\"");
+        let headers = [
+            ("X-MediaBrowser-Token", key),
+            ("Authorization", arr.as_str()),
+            ("Content-Type", "application/json"),
+        ];
+        let uri = "/Library/Media/Updated";
+        let (status, text) =
+            b18_send(&app(state.clone()), "POST", uri, &headers, Some(&body)).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{key}: {text}");
+
+        // `/System/Info/Storage` needs administrator claims.
+        let accepted = [
+            vec![
+                ("X-MediaBrowser-Token", key.to_string()),
+                ("Authorization", arr.clone()),
+            ],
+            vec![("Authorization", j1_mb("MediaBrowser", key))],
+            vec![("X-Emby-Authorization", j1_mb("Emby", key))],
+            vec![
+                ("X-Emby-Token", key.to_string()),
+                ("X-Emby-Authorization", j1_mb("MediaBrowser", key)),
+            ],
+            vec![("Authorization", j1_mb("MediaBrowser", encoded))],
+        ];
+        let refused = [
+            // An invalid `MediaBrowser` token still decides over a valid token header.
+            vec![
+                ("Authorization", j1_mb("MediaBrowser", bad)),
+                ("X-MediaBrowser-Token", key.to_string()),
+            ],
+            vec![
+                ("X-Emby-Authorization", j1_mb("MediaBrowser", bad)),
+                ("X-Emby-Token", key.to_string()),
+            ],
+            // Either spelling must hold the whole key.
+            vec![(
+                "Authorization",
+                j1_mb("MediaBrowser", &key[..key.len() - 1]),
+            )],
+        ];
+        for (expected, cases) in [
+            (StatusCode::OK, &accepted[..]),
+            (StatusCode::UNAUTHORIZED, &refused[..]),
+        ] {
+            for (i, credentials) in cases.iter().enumerate() {
+                let credentials: Vec<(&str, &str)> = credentials
+                    .iter()
+                    .map(|(name, value)| (*name, value.as_str()))
+                    .collect();
+                let (status, text) = j1_get(&state, "/System/Info/Storage", &credentials).await;
+                assert_eq!(status, expected, "{key}: case {i}");
+                assert!(!text.contains(key), "{key}: case {i}: {text}");
+            }
+        }
+    }
+
+    // A user token still counts in its decoded spelling.
+    let encoded: String = token.bytes().map(|b| format!("%{b:02X}")).collect();
+    let credentials = j1_mb("MediaBrowser", &encoded);
+    assert_eq!(
+        j1_me(&state, &[("Authorization", credentials.as_str())]).await,
+        Ok(user_id)
+    );
+}
+
 // ── Error Response Format Tests ──
 
 #[tokio::test]
