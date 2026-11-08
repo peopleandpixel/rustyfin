@@ -2586,10 +2586,12 @@ dependencies = [
  "rand 0.8.8",
  "rustyfin-model",
  "serde_json",
+ "sha1 0.10.7",
  "sqlx",
  "thiserror",
  "tokio",
  "tracing",
+ "unicode-normalization",
  "uuid",
 ]
 

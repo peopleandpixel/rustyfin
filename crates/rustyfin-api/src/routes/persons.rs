@@ -9,14 +9,15 @@ use rustyfin_model::person::{NameIdPair, PersonDto};
 use crate::error::ApiError;
 use crate::state::AppState;
 
+mod by_name;
+
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/Persons", get(get_persons))
         .route("/Persons/{id}", get(get_person))
         .route("/Persons/{id}/Items", get(get_person_items))
-        .route("/Genres", get(get_genres))
-        .route("/Studios", get(get_studios))
         .route("/Artists", get(get_artists))
+        .merge(by_name::routes())
 }
 
 async fn get_persons(State(state): State<AppState>) -> Result<Json<Vec<NameIdPair>>, ApiError> {
@@ -64,16 +65,6 @@ async fn get_person_items(
         total_record_count: total,
         start_index: 0,
     }))
-}
-
-async fn get_genres(State(state): State<AppState>) -> Result<Json<Vec<NameIdPair>>, ApiError> {
-    let genres = rustyfin_db::repo_person::get_genres(&state.db).await?;
-    Ok(Json(genres))
-}
-
-async fn get_studios(State(state): State<AppState>) -> Result<Json<Vec<NameIdPair>>, ApiError> {
-    let studios = rustyfin_db::repo_person::get_studios(&state.db).await?;
-    Ok(Json(studios))
 }
 
 async fn get_artists(State(state): State<AppState>) -> Result<Json<Vec<NameIdPair>>, ApiError> {

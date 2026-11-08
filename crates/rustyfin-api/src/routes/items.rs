@@ -434,14 +434,15 @@ async fn enrich_item(
             .collect();
     }
 
-    // --- Studios from item_studios table ---
+    // --- Studios from item_studios table, with the ids that /Studios lists ---
     if item.studios.is_empty()
         && let Ok(studio_rows) = studios_result
     {
+        let studio = rustyfin_db::repo_by_name::ByNameKind::Studio;
         item.studios = studio_rows
             .into_iter()
-            .map(|(sid, sname)| rustyfin_model::media::StudioInfo {
-                id: sid,
+            .map(|(_, sname)| rustyfin_model::media::StudioInfo {
+                id: rustyfin_db::repo_by_name::by_name_id(studio, &sname).to_string(),
                 name: sname,
             })
             .collect();
@@ -602,12 +603,13 @@ async fn enrich_item(
         }
     }
 
-    // --- GenreItems from genres ---
+    // --- GenreItems from genres, with the ids that /Genres or /MusicGenres lists ---
     if item.genre_items.is_empty() && !item.genres.is_empty() {
+        let kind = rustyfin_db::repo_by_name::genre_kind_of(item.media_type);
         for genre in &item.genres {
             item.genre_items.push(rustyfin_model::media::GenreItem {
                 name: genre.clone(),
-                id: genre.to_lowercase().replace(' ', "-"),
+                id: rustyfin_db::repo_by_name::by_name_id(kind, genre).to_string(),
             });
         }
     }
@@ -1164,12 +1166,13 @@ async fn enrich_items(
             }
         }
 
-        // --- GenreItems from genres ---
+        // --- GenreItems from genres, with the ids that /Genres or /MusicGenres lists ---
         if item.genre_items.is_empty() && !item.genres.is_empty() {
+            let kind = rustyfin_db::repo_by_name::genre_kind_of(item.media_type);
             for genre in &item.genres {
                 item.genre_items.push(rustyfin_model::media::GenreItem {
                     name: genre.clone(),
-                    id: genre.to_lowercase().replace(' ', "-"),
+                    id: rustyfin_db::repo_by_name::by_name_id(kind, genre).to_string(),
                 });
             }
         }
@@ -1595,6 +1598,16 @@ impl ItemsQuery {
     }
 }
 
+/// The UUIDs in a comma-separated id list. A value that isn't a UUID is dropped, as Jellyfin's
+/// comma-delimited binder drops it (`CommaDelimitedCollectionModelBinder.cs:65-73`).
+fn parse_ids(value: Option<&str>) -> Vec<Uuid> {
+    value
+        .into_iter()
+        .flat_map(|ids| ids.split(','))
+        .filter_map(|id| Uuid::parse_str(id.trim()).ok())
+        .collect()
+}
+
 async fn get_items(
     State(state): State<AppState>,
     Query(query): Query<ItemsQuery>,
@@ -1647,6 +1660,14 @@ async fn get_items(
         media_types
     };
 
+    // GenreIds and StudioIds keep the items with one of those genres and one of those studios.
+    let item_ids = rustyfin_db::repo_by_name::item_ids_with(
+        &state.db_ro,
+        &parse_ids(query.genre_ids()),
+        &parse_ids(query.studio_ids()),
+    )
+    .await?;
+
     let (items, total) = rustyfin_db::repo_media::get_items_filtered(
         &state.db_ro,
         query.parent_id(),
@@ -1675,6 +1696,7 @@ async fn get_items(
         query.date_created(),
         runtime_parts,
         Some(claims.sub),
+        item_ids.as_deref(),
     )
     .await?;
 
