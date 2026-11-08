@@ -85,10 +85,7 @@ pub async fn search_items(
     limit: i64,
 ) -> Result<Vec<MediaItem>, sqlx::Error> {
     // Build media type filter
-    let type_filters: Vec<String> = item_types
-        .iter()
-        .map(|t| serde_json::to_string(t).unwrap_or_default())
-        .collect();
+    let type_filters: Vec<&'static str> = item_types.iter().map(|t| t.item_kind()).collect();
 
     // Try FTS5 first for full-text search
     let fts_query = normalize_fts_query(query);
@@ -110,7 +107,8 @@ pub async fn search_items(
         .fetch_all(pool)
         .await
     } else {
-        // Search with media type filter via FTS5
+        // Search with media type filter via FTS5. All placeholders are bare `?`, bound in
+        // order: mixing `?N` with `?` makes SQLite reuse ?2 for LIMIT.
         let placeholders: Vec<&str> = type_filters.iter().map(|_| "?").collect();
         let sql = format!(
             "SELECT m.id, m.name, m.sort_name, m.overview, m.media_type, m.path, m.parent_id, m.library_id, \
@@ -120,8 +118,8 @@ pub async fn search_items(
              m.homepage, m.end_date, m.vote_count, m.popularity \
              FROM media_items m \
              JOIN media_items_fts f ON f.rowid = m.rowid \
-             WHERE media_items_fts MATCH ?1 AND m.media_type IN ({}) \
-             LIMIT ?2",
+             WHERE media_items_fts MATCH ? AND m.media_type IN ({}) \
+             LIMIT ?",
             placeholders.join(",")
         );
         let mut q = sqlx::query_as::<_, super::repo_media::MediaItemRow>(sqlx::AssertSqlSafe(sql));
@@ -163,7 +161,7 @@ pub async fn search_items(
                      premiere_date, runtime_ticks, index_number, parent_index_number, tmdb_id, tvdb_id, \
                      tags, status, original_language, tagline, production_countries, budget, revenue, \
                      homepage, end_date, vote_count, popularity \
-                     FROM media_items WHERE name LIKE ?1 AND media_type IN ({}) LIMIT ?2",
+                     FROM media_items WHERE name LIKE ? AND media_type IN ({}) LIMIT ?",
                     placeholders.join(",")
                 );
                 let mut q =

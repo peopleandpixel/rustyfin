@@ -1840,6 +1840,428 @@ async fn test_full_search_empty_term() {
     assert_eq!(result["TotalRecordCount"], 0);
 }
 
+// ── B27: cache keys ──
+//
+// A search answers only the item types asked for, and a cached answer goes only to a request
+// that gets the same answer.
+
+/// Seeds a movie library with the movie "Comet Night", the series "Comet Hunters", its season
+/// "Comet Hunters Season 1" and its episode "Comet Hunters S01E01". Returns an admin token and
+/// the library's id.
+async fn b27_seed(state: &AppState) -> (String, uuid::Uuid) {
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: "B27 Library".to_string(),
+        content_type: rustyfin_model::library::LibraryContentType::Movies,
+        paths: vec![media_folder(state, "b27")],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    for (name, media_type) in [
+        ("Comet Night", "Movie"),
+        ("Comet Hunters", "Series"),
+        ("Comet Hunters Season 1", "Season"),
+        ("Comet Hunters S01E01", "Episode"),
+    ] {
+        b27_add_item(state, lib.id, name, media_type).await;
+    }
+    (admin_session(state).await.0, lib.id)
+}
+
+/// Adds an item to the database as a scan stores it, without touching any cache.
+async fn b27_add_item(state: &AppState, library_id: uuid::Uuid, name: &str, media_type: &str) {
+    let id = uuid::Uuid::new_v4();
+    let path = state
+        .data_dir
+        .join("media")
+        .join("b27")
+        .join(format!("{id}.mkv"));
+    sqlx::query(
+        "INSERT INTO media_items (id, library_id, name, media_type, path) VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(id.to_string())
+    .bind(library_id.to_string())
+    .bind(name)
+    .bind(media_type)
+    .bind(path.to_string_lossy().to_string())
+    .execute(&state.db)
+    .await
+    .unwrap();
+}
+
+/// The items a `/Search` or `/Search/Hints` request answers, as sorted "Name (Type)" strings.
+/// Panics unless the answer is 200.
+async fn b27_found(app: &axum::Router, uri: &str, token: &str) -> Vec<String> {
+    let (status, body) = send_authed(app, "GET", uri, token, None).await;
+    assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+    let items = body
+        .get("Items")
+        .or_else(|| body.get("SearchHints"))
+        .and_then(|items| items.as_array())
+        .unwrap_or_else(|| panic!("{uri}: no Items or SearchHints in {body}"));
+    let mut found: Vec<String> = items
+        .iter()
+        .map(|item| {
+            let name = item["Name"].as_str().unwrap_or("?");
+            let item_type = item["Type"].as_str().unwrap_or("?");
+            format!("{name} ({item_type})")
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+#[tokio::test]
+async fn b27_typed_search_finds_only_the_listed_types() {
+    let state = test_state().await;
+    let (token, _) = b27_seed(&state).await;
+    let app = app(state);
+
+    // Each request has its own term, so none can get another's cached answer.
+    assert_eq!(
+        b27_found(&app, "/Search?Term=comet&IncludeItemTypes=Movie", &token).await,
+        ["Comet Night (Movie)"]
+    );
+    assert_eq!(
+        b27_found(
+            &app,
+            "/Search?Term=comet%20hunters&IncludeItemTypes=Episode",
+            &token
+        )
+        .await,
+        ["Comet Hunters S01E01 (Episode)"]
+    );
+    assert_eq!(
+        b27_found(
+            &app,
+            "/Search?Term=comet%20h&IncludeItemTypes=Series,%20Episode",
+            &token
+        )
+        .await,
+        ["Comet Hunters (Series)", "Comet Hunters S01E01 (Episode)"]
+    );
+    // Without IncludeItemTypes, the default types: Movie, Series, Episode and Audio.
+    assert_eq!(
+        b27_found(&app, "/Search?Term=com", &token).await,
+        [
+            "Comet Hunters (Series)",
+            "Comet Hunters S01E01 (Episode)",
+            "Comet Night (Movie)"
+        ]
+    );
+}
+
+/// The same server after a restart with the L2 copy on: a fresh `ApiCache` on the same
+/// database, loaded from its `api_cache` table.
+async fn b27_restarted(state: &AppState) -> AppState {
+    let cache = ApiCache::new().with_db(state.db.clone());
+    cache.load_l2_cache().await;
+    AppState {
+        cache,
+        ..state.clone()
+    }
+}
+
+/// Waits until the `api_cache` table holds `rows` search answers, which are saved in the
+/// background. Gives up after 45 s, since a busy host can stall the saves for seconds.
+async fn b27_wait_for_l2_rows(state: &AppState, rows: i64) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+    loop {
+        let (saved,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM api_cache WHERE cache_key LIKE 'search:%'")
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        if saved >= rows {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "fewer than {rows} search answers reached the api_cache table in 45 s"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+/// The number of answers in the search cache.
+fn b27_cached_answers(state: &AppState) -> u64 {
+    state.cache.search_results.run_pending_tasks();
+    state.cache.search_results.entry_count()
+}
+
+#[tokio::test]
+async fn b27_movie_then_series_search_each_get_their_own_items() {
+    let state = test_state().await;
+    let (token, _) = b27_seed(&state).await;
+    let app = app(state.clone());
+
+    // Movie first, then Series, for one term; then the reverse for another. The same when the
+    // first search finds nothing, since an empty answer is cached too.
+    for (uri, expected) in [
+        (
+            "/Search?Term=comet&IncludeItemTypes=Movie",
+            vec!["Comet Night (Movie)"],
+        ),
+        (
+            "/Search?Term=comet&IncludeItemTypes=Series",
+            vec!["Comet Hunters (Series)"],
+        ),
+        (
+            "/Search?Term=come&IncludeItemTypes=Series",
+            vec!["Comet Hunters (Series)"],
+        ),
+        (
+            "/Search?Term=come&IncludeItemTypes=Movie",
+            vec!["Comet Night (Movie)"],
+        ),
+        ("/Search?Term=hunters&IncludeItemTypes=Movie", vec![]),
+        (
+            "/Search?Term=hunters&IncludeItemTypes=Series",
+            vec!["Comet Hunters (Series)"],
+        ),
+        ("/Search?Term=night&IncludeItemTypes=Series", vec![]),
+        (
+            "/Search?Term=night&IncludeItemTypes=Movie",
+            vec!["Comet Night (Movie)"],
+        ),
+    ] {
+        assert_eq!(b27_found(&app, uri, &token).await, expected, "{uri}");
+    }
+
+    // Type names in another order or case, or repeated, name the same types: one cached answer.
+    let before = b27_cached_answers(&state);
+    for types in ["Movie,Series", "Series,movie", "SERIES,%20Movie,series"] {
+        let uri = format!("/Search?Term=comet&IncludeItemTypes={types}");
+        assert_eq!(
+            b27_found(&app, &uri, &token).await,
+            ["Comet Hunters (Series)", "Comet Night (Movie)"],
+            "{uri}"
+        );
+    }
+    assert_eq!(b27_cached_answers(&state), before + 1);
+}
+
+#[tokio::test]
+async fn b27_search_after_a_restart_through_l2_gets_its_own_items() {
+    let state = b27_restarted(&test_state().await).await;
+    let (token, _) = b27_seed(&state).await;
+
+    // Before the restart: Movie first for "comet" and "hunters", Series first for "come" and
+    // "night".
+    let before_restart = app(state.clone());
+    for (uri, expected) in [
+        (
+            "/Search?Term=comet&IncludeItemTypes=Movie",
+            vec!["Comet Night (Movie)"],
+        ),
+        ("/Search?Term=hunters&IncludeItemTypes=Movie", vec![]),
+        (
+            "/Search?Term=come&IncludeItemTypes=Series",
+            vec!["Comet Hunters (Series)"],
+        ),
+        ("/Search?Term=night&IncludeItemTypes=Series", vec![]),
+    ] {
+        assert_eq!(
+            b27_found(&before_restart, uri, &token).await,
+            expected,
+            "{uri}"
+        );
+    }
+    b27_wait_for_l2_rows(&state, 4).await;
+
+    // After it, the four answers are back from the L2 copy, and the other type for each term
+    // gets its own items.
+    let state = b27_restarted(&state).await;
+    assert_eq!(b27_cached_answers(&state), 4);
+    let after_restart = app(state);
+    for (uri, expected) in [
+        (
+            "/Search?Term=comet&IncludeItemTypes=Series",
+            vec!["Comet Hunters (Series)"],
+        ),
+        (
+            "/Search?Term=hunters&IncludeItemTypes=Series",
+            vec!["Comet Hunters (Series)"],
+        ),
+        (
+            "/Search?Term=come&IncludeItemTypes=Movie",
+            vec!["Comet Night (Movie)"],
+        ),
+        (
+            "/Search?Term=night&IncludeItemTypes=Movie",
+            vec!["Comet Night (Movie)"],
+        ),
+    ] {
+        assert_eq!(
+            b27_found(&after_restart, uri, &token).await,
+            expected,
+            "{uri}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn b27_old_format_l2_search_rows_are_never_served() {
+    let state = test_state().await;
+    let (token, _) = b27_seed(&state).await;
+    // Rows an older build saved under its key format, with answers that found nothing.
+    for (key, answer) in [
+        // /Search/Hints?SearchTerm=comet
+        (
+            "search:hints:comet:20",
+            r#"{"SearchHints":[],"TotalRecordCount":0}"#,
+        ),
+        // /Search?Term=comet&IncludeItemTypes=Movie
+        (
+            "search:search:comet:1:0:100",
+            r#"{"Items":[],"TotalRecordCount":0,"StartIndex":0}"#,
+        ),
+        // /Search?Term=comet, with its four default types
+        (
+            "search:search:comet:4:0:100",
+            r#"{"Items":[],"TotalRecordCount":0,"StartIndex":0}"#,
+        ),
+    ] {
+        sqlx::query("INSERT INTO api_cache (cache_key, cache_value, expires_at) VALUES (?, ?, ?)")
+            .bind(key)
+            .bind(answer)
+            .bind("2999-01-01T00:00:00+00:00")
+            .execute(&state.db)
+            .await
+            .unwrap();
+    }
+
+    // The rows are loaded, but no request finds them under its key.
+    let state = b27_restarted(&state).await;
+    assert_eq!(b27_cached_answers(&state), 3);
+    let app = app(state);
+    assert_eq!(
+        b27_found(&app, "/Search/Hints?SearchTerm=comet", &token).await,
+        [
+            "Comet Hunters (Series)",
+            "Comet Hunters S01E01 (Episode)",
+            "Comet Hunters Season 1 (Season)",
+            "Comet Night (Movie)"
+        ]
+    );
+    assert_eq!(
+        b27_found(&app, "/Search?Term=comet&IncludeItemTypes=Movie", &token).await,
+        ["Comet Night (Movie)"]
+    );
+    assert_eq!(
+        b27_found(&app, "/Search?Term=comet", &token).await,
+        [
+            "Comet Hunters (Series)",
+            "Comet Hunters S01E01 (Episode)",
+            "Comet Night (Movie)"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn b27_search_keys_keep_the_terms_case() {
+    let state = test_state().await;
+    let (token, library_id) = b27_seed(&state).await;
+    b27_add_item(&state, library_id, "été-sud", "Movie").await;
+    let app = app(state);
+
+    // FTS rejects a term with this "-", so these searches take the LIKE fallback, which matches
+    // letters outside ASCII only in their own case: "été-" (%C3%A9t%C3%A9-) finds "été-sud",
+    // "Été-" (%C3%89t%C3%A9-) finds nothing. Each gets its own answer, in either order.
+    for path in ["/Search/Hints?SearchTerm=", "/Search?Term="] {
+        for (term, expected) in [
+            ("%C3%89t%C3%A9-", vec![]),
+            ("%C3%A9t%C3%A9-", vec!["été-sud (Movie)"]),
+            ("%C3%A9t%C3%A9-s", vec!["été-sud (Movie)"]),
+            ("%C3%89t%C3%A9-s", vec![]),
+        ] {
+            let uri = format!("{path}{term}");
+            assert_eq!(b27_found(&app, &uri, &token).await, expected, "{uri}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn b27_search_pages_each_get_their_own_items() {
+    let state = test_state().await;
+    let (token, _) = b27_seed(&state).await;
+    let app = app(state);
+
+    let uri = "/Search?Term=comet&IncludeItemTypes=Movie,Series";
+    let both = b27_found(&app, &format!("{uri}&Limit=2"), &token).await;
+    assert_eq!(both, ["Comet Hunters (Series)", "Comet Night (Movie)"]);
+    let first = b27_found(&app, &format!("{uri}&Limit=1"), &token).await;
+    let second = b27_found(&app, &format!("{uri}&StartIndex=1&Limit=1"), &token).await;
+    assert_eq!(first.len(), 1, "{first:?}");
+    assert_eq!(second.len(), 1, "{second:?}");
+    let mut pages = [first, second].concat();
+    pages.sort();
+    assert_eq!(pages, both);
+}
+
+/// The answer to a request, which must be 200.
+async fn b27_answer(app: &axum::Router, uri: &str, token: &str) -> serde_json::Value {
+    let (status, body) = send_authed(app, "GET", uri, token, None).await;
+    assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+    body
+}
+
+/// Name, Type and IsFolder of each item in a `/Search` answer.
+fn b27_kinds(answer: &serde_json::Value) -> Vec<(&str, &str, bool)> {
+    answer["Items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no Items in {answer}"))
+        .iter()
+        .map(|item| {
+            (
+                item["Name"].as_str().unwrap_or("?"),
+                item["Type"].as_str().unwrap_or("?"),
+                item["IsFolder"].as_bool().unwrap_or(false),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn b27_a_repeated_search_gets_the_first_answer_again() {
+    let state = b27_restarted(&test_state().await).await;
+    let (token, _) = b27_seed(&state).await;
+    sqlx::query("UPDATE media_items SET runtime_ticks = 27000000000 WHERE name = 'Comet Hunters'")
+        .execute(&state.db)
+        .await
+        .unwrap();
+    let series = "/Search?Term=comet&IncludeItemTypes=Series";
+    let movie = "/Search?Term=comet&IncludeItemTypes=Movie";
+
+    let app_before = app(state.clone());
+    let first_series = b27_answer(&app_before, series, &token).await;
+    assert_eq!(
+        b27_kinds(&first_series),
+        [("Comet Hunters", "Series", true)]
+    );
+    assert_eq!(first_series["Items"][0]["RunTimeTicks"], 27_000_000_000i64);
+    let first_movie = b27_answer(&app_before, movie, &token).await;
+    assert_eq!(b27_kinds(&first_movie), [("Comet Night", "Movie", false)]);
+
+    // Asked again, the cache gives back the same answers.
+    let again = b27_answer(&app_before, series, &token).await;
+    assert_eq!(b27_kinds(&again), [("Comet Hunters", "Series", true)]);
+    assert_eq!(again, first_series);
+    assert_eq!(b27_answer(&app_before, movie, &token).await, first_movie);
+    assert_eq!(b27_cached_answers(&state), 2);
+
+    // So does the L2 copy after a restart.
+    b27_wait_for_l2_rows(&state, 2).await;
+    let state = b27_restarted(&state).await;
+    assert_eq!(b27_cached_answers(&state), 2);
+    let app_after = app(state);
+    let again = b27_answer(&app_after, series, &token).await;
+    assert_eq!(b27_kinds(&again), [("Comet Hunters", "Series", true)]);
+    assert_eq!(again, first_series);
+    assert_eq!(b27_answer(&app_after, movie, &token).await, first_movie);
+}
+
 // ── System Endpoint Tests ──
 
 #[tokio::test]
