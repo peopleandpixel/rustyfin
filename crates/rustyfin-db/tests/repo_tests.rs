@@ -2082,6 +2082,155 @@ async fn test_save_chapters_keeps_the_old_ones_when_it_fails() {
     );
 }
 
+// ── B34: the filter trigger's rating recounts use an index ──
+
+const B34_ITEMS: i64 = 20_000;
+const B34_RATINGS: [&str; 8] = ["G", "PG", "PG-13", "R", "NC-17", "TV-14", "TV-MA", "NR"];
+
+/// The details of `EXPLAIN QUERY PLAN <sql>` with `R` bound to `?1`.
+async fn b34_plan(pool: &SqlitePool, sql: &'static str) -> Vec<String> {
+    let rows: Vec<(i64, i64, i64, String)> =
+        sqlx::query_as(sql).bind("R").fetch_all(pool).await.unwrap();
+    rows.into_iter().map(|(_, _, _, detail)| detail).collect()
+}
+
+/// Stores `B34_ITEMS` movies with no year or rating, as a first import finds them. A helper index
+/// keeps the insert trigger's recounts from scanning the table while they are stored, whatever the
+/// migrations made; it is dropped again before anything is timed. Returns their ids.
+async fn b34_items(pool: &SqlitePool) -> Vec<String> {
+    let library = make_library("Film", LibraryContentType::Movies);
+    rustyfin_db::repo_library::create_library(pool, &library)
+        .await
+        .unwrap();
+    sqlx::query("CREATE INDEX b34_insert_helper ON media_items(official_rating)")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i + 1 < ?1) \
+         INSERT INTO media_items \
+         (id, name, sort_name, media_type, path, library_id, genres, production_countries) \
+         SELECT printf('b34-%05d', i), printf('Film %05d', i), printf('film %05d', i), 'Movie', \
+          printf('/media/film/%05d.mkv', i), ?2, '', '' FROM n",
+    )
+    .bind(B34_ITEMS)
+    .bind(library.id.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query("DROP INDEX b34_insert_helper")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query_scalar("SELECT id FROM media_items ORDER BY id")
+        .fetch_all(pool)
+        .await
+        .unwrap()
+}
+
+/// Writes every item once with the Jellyfin import's UPDATE (`repo_jellyfin_import.rs`,
+/// `write_metadata`) in one transaction, giving each a year and a rating. Stops once `limit` has
+/// passed. Returns how many items it wrote and how long it took.
+async fn b34_import_update(
+    pool: &SqlitePool,
+    ids: &[String],
+    limit: std::time::Duration,
+) -> (usize, std::time::Duration) {
+    let start = std::time::Instant::now();
+    let mut tx = pool.begin().await.unwrap();
+    let mut written = 0;
+    for (i, id) in ids.iter().enumerate() {
+        if start.elapsed() > limit {
+            break;
+        }
+        sqlx::query(
+            "UPDATE media_items SET name = ?, sort_name = ?, overview = ?, tagline = ?, \
+             official_rating = ?, community_rating = ?, premiere_date = ?, end_date = ?, \
+             production_year = ?, genres = ?, tags = ?, tmdb_id = ?, tvdb_id = ? WHERE id = ?",
+        )
+        .bind(format!("Film {i:05}"))
+        .bind(format!("film {i:05}"))
+        .bind("Imported overview")
+        .bind(None::<String>)
+        .bind(B34_RATINGS[i % B34_RATINGS.len()])
+        .bind(7.0_f64)
+        .bind(None::<String>)
+        .bind(None::<String>)
+        .bind(1950 + (i % 70) as i64)
+        .bind("Drama")
+        .bind("")
+        .bind(None::<i64>)
+        .bind(None::<i64>)
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        written += 1;
+    }
+    tx.commit().await.unwrap();
+    (written, start.elapsed())
+}
+
+/// The update trigger recounts the old and new rating of every item whose rating is written,
+/// with these two statements. Both look the rating up in its index instead of scanning the table.
+#[tokio::test]
+async fn b34_rating_recounts_use_the_index() {
+    let db = test_pool().await;
+    for sql in [
+        "EXPLAIN QUERY PLAN \
+         SELECT ?1, COUNT(*) FROM media_items WHERE official_rating = ?1 GROUP BY ?1",
+        "EXPLAIN QUERY PLAN SELECT 1 FROM media_items WHERE official_rating = ?1",
+    ] {
+        let plan = b34_plan(&db.pool, sql).await;
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("idx_media_items_official_rating")),
+            "{sql}: {plan:?}"
+        );
+    }
+}
+
+/// An import that writes 20,000 items in one transaction holds the write lock for well under the
+/// 30 s busy timeout other writers wait. Without the index each item's recounts scanned the table
+/// twice, about 35-43 s in all (B20's re-check 9). It times the debug build's SQLite, and its time
+/// grows several times over on a loaded machine, so like the timing without the index below it only
+/// runs when asked; `b34_rating_recounts_use_the_index` guards the index on every run.
+#[tokio::test]
+#[ignore]
+async fn b34_import_update_of_20000_items_is_quick() {
+    let db = test_pool().await;
+    let ids = b34_items(&db.pool).await;
+    let limit = std::time::Duration::from_secs(15);
+
+    let (written, took) = b34_import_update(&db.pool, &ids, limit).await;
+
+    eprintln!("b34: import UPDATE of {written} items took {took:?}");
+    assert_eq!(written, ids.len(), "stopped after {limit:?}");
+    let ratings: i64 = sqlx::query_scalar("SELECT SUM(item_count) FROM filter_rating_index")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(ratings, B34_ITEMS, "every item counted under its rating");
+}
+
+/// The same import with the rating index dropped, for the before timing. It takes minutes. Run both
+/// timings with `cargo test -p rustyfin-db --test repo_tests b34_import -- --ignored --nocapture`.
+#[tokio::test]
+#[ignore]
+async fn b34_import_update_of_20000_items_without_the_index() {
+    let db = test_pool().await;
+    let ids = b34_items(&db.pool).await;
+    sqlx::query("DROP INDEX IF EXISTS idx_media_items_official_rating")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    let (written, took) =
+        b34_import_update(&db.pool, &ids, std::time::Duration::from_secs(1800)).await;
+
+    eprintln!("b34: import UPDATE of {written} items without the index took {took:?}");
+}
+
 // ── B20: one-time setup codes ──
 
 async fn b20_password(pool: &SqlitePool, user: Uuid) -> String {

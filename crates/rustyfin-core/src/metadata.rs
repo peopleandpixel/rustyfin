@@ -19,6 +19,8 @@ pub async fn refresh_item_metadata(
     fanart_api_key: Option<&str>,
 ) -> Result<(), String> {
     let media_path = Path::new(&item.path);
+    // Each source fills this copy, so a later source keeps what an earlier one filled
+    let mut working = item.clone();
 
     // 1. Scan for local images and compute blurhash for each
     let mut local_images = local_images::find_local_images(media_path, item.id);
@@ -45,7 +47,7 @@ pub async fn refresh_item_metadata(
         && let Some(meta) = nfo_parser::parse_nfo(&nfo_path).await
     {
         // Update media item metadata from NFO
-        apply_metadata_to_item(pool, item, &meta).await?;
+        apply_metadata_to_item(pool, &mut working, &meta).await?;
 
         // Batch-store image URLs from NFO, skipping types that already exist
         store_images_batch(pool, item.id, &meta.image_urls, "nfo").await?;
@@ -73,7 +75,7 @@ pub async fn refresh_item_metadata(
         }
 
         if let Some(meta) = meta {
-            apply_metadata_to_item(pool, item, &meta).await?;
+            apply_metadata_to_item(pool, &mut working, &meta).await?;
             store_images_batch(pool, item.id, &meta.image_urls, "tmdb").await?;
 
             // Fetch and store cast/crew photos from TMDb
@@ -97,7 +99,7 @@ pub async fn refresh_item_metadata(
         && let Some(meta) =
             crate::provider_omdb::search(api_key, &item.name, item.production_year).await
     {
-        apply_metadata_to_item(pool, item, &meta).await?;
+        apply_metadata_to_item(pool, &mut working, &meta).await?;
         store_images_batch(pool, item.id, &meta.image_urls, "omdb").await?;
     }
 
@@ -129,11 +131,11 @@ pub async fn refresh_item_metadata(
 
 async fn apply_metadata_to_item(
     pool: &SqlitePool,
-    item: &MediaItem,
+    updated: &mut MediaItem,
     meta: &rustyfin_model::metadata::ExternalMetadata,
 ) -> Result<(), String> {
     // Update fields from external metadata
-    let mut updated = item.clone();
+    let before = updated.clone();
     let mut changed = false;
 
     // Update name from TMDB if it looks like a filename (contains dots, underscores, or release tags)
@@ -158,7 +160,7 @@ async fn apply_metadata_to_item(
                 changed = true;
                 tracing::info!(
                     "updated name from filename '{}' to TMDB name '{}'",
-                    item.name,
+                    before.name,
                     tmdb_name
                 );
             }
@@ -284,16 +286,17 @@ async fn apply_metadata_to_item(
     }
 
     if changed {
-        rustyfin_db::repo_media::upsert_media_item(pool, &updated)
+        let written = rustyfin_db::repo_media::save_refresh_changes(pool, &before, updated)
             .await
             .map_err(|e| e.to_string())?;
+        tracing::debug!("metadata refresh wrote columns {:?}", written);
     }
 
     // Store studios from metadata
     if let Some(ref studios) = meta.studios
         && !studios.is_empty()
     {
-        store_studios(pool, item.id, studios).await?;
+        store_studios(pool, updated.id, studios).await?;
     }
 
     Ok(())

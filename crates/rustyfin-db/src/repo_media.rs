@@ -14,7 +14,7 @@ use uuid::Uuid;
 /// Saves an item. An existing item is updated in place, so it keeps its rowid, which the search
 /// index is keyed on, and the rows that reference it; `INSERT OR REPLACE` deleted it first, and
 /// the delete cascaded to them. It also keeps its stored date added (`date_created`), because
-/// callers such as the metadata refresh save copies they read earlier.
+/// callers can save copies they read earlier.
 pub async fn upsert_media_item(pool: &SqlitePool, item: &MediaItem) -> Result<(), sqlx::Error> {
     let id = item.id.to_string();
     let parent_id = item.parent_id.map(|p| p.to_string());
@@ -87,6 +87,229 @@ pub async fn upsert_media_item(pool: &SqlitePool, item: &MediaItem) -> Result<()
     .await?;
 
     Ok(())
+}
+
+/// Writes one scalar column of a refresh save, only while its stored value is still `$held`.
+macro_rules! save_scalar_column {
+    ($tx:ident, $written:ident, $id:ident, $col:literal, $held:expr, $new:expr) => {{
+        let (held, new) = ($held, $new);
+        if held != new {
+            let has_held = held.is_some();
+            let sql = if has_held {
+                concat!(
+                    "UPDATE media_items SET ",
+                    $col,
+                    " = ? WHERE id = ? AND ",
+                    $col,
+                    " IS ?"
+                )
+            } else {
+                concat!(
+                    "UPDATE media_items SET ",
+                    $col,
+                    " = ? WHERE id = ? AND ",
+                    $col,
+                    " IS NULL"
+                )
+            };
+            let mut query = sqlx::query(sql).bind(new).bind(&$id);
+            if has_held {
+                query = query.bind(held);
+            }
+            if query.execute(&mut *$tx).await?.rows_affected() == 1 {
+                $written.push($col);
+            }
+        }
+    }};
+}
+
+/// Writes one text column of a refresh save, only while its stored value is still `$held`.
+/// A blank stored value (NULL or empty) counts as the same as an empty read.
+macro_rules! save_text_column {
+    ($tx:ident, $written:ident, $id:ident, $col:literal, $held:expr, $new:expr) => {{
+        let (held, new) = ($held, $new);
+        if held != new {
+            let has_held = !matches!(held.as_deref(), None | Some(""));
+            let sql = if has_held {
+                concat!(
+                    "UPDATE media_items SET ",
+                    $col,
+                    " = ? WHERE id = ? AND ",
+                    $col,
+                    " IS ?"
+                )
+            } else {
+                concat!(
+                    "UPDATE media_items SET ",
+                    $col,
+                    " = ? WHERE id = ? AND (",
+                    $col,
+                    " IS NULL OR ",
+                    $col,
+                    " = '')"
+                )
+            };
+            let mut query = sqlx::query(sql).bind(new).bind(&$id);
+            if has_held {
+                query = query.bind(held);
+            }
+            if query.execute(&mut *$tx).await?.rows_affected() == 1 {
+                $written.push($col);
+            }
+        }
+    }};
+}
+
+/// Saves the columns a metadata refresh changed between `read` and `updated`, each only while its
+/// stored value is still the one in `read`, so a write that landed since the read wins. Returns
+/// the names of the columns written.
+pub async fn save_refresh_changes(
+    pool: &SqlitePool,
+    read: &MediaItem,
+    updated: &MediaItem,
+) -> Result<Vec<&'static str>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let id = read.id.to_string();
+    let mut written = Vec::new();
+
+    save_scalar_column!(
+        tx,
+        written,
+        id,
+        "overview",
+        read.overview.clone(),
+        updated.overview.clone()
+    );
+    save_scalar_column!(
+        tx,
+        written,
+        id,
+        "production_year",
+        read.production_year,
+        updated.production_year
+    );
+    save_scalar_column!(
+        tx,
+        written,
+        id,
+        "community_rating",
+        read.community_rating,
+        updated.community_rating
+    );
+    save_scalar_column!(
+        tx,
+        written,
+        id,
+        "official_rating",
+        read.official_rating.clone(),
+        updated.official_rating.clone()
+    );
+    save_text_column!(
+        tx,
+        written,
+        id,
+        "genres",
+        Some(read.genres.join("|")),
+        Some(updated.genres.join("|"))
+    );
+    save_scalar_column!(
+        tx,
+        written,
+        id,
+        "runtime_ticks",
+        read.runtime_ticks,
+        updated.runtime_ticks
+    );
+    save_scalar_column!(tx, written, id, "tmdb_id", read.tmdb_id, updated.tmdb_id);
+    save_scalar_column!(tx, written, id, "tvdb_id", read.tvdb_id, updated.tvdb_id);
+    save_scalar_column!(
+        tx,
+        written,
+        id,
+        "status",
+        read.status.clone(),
+        updated.status.clone()
+    );
+    save_scalar_column!(
+        tx,
+        written,
+        id,
+        "original_language",
+        read.original_language.clone(),
+        updated.original_language.clone()
+    );
+    save_text_column!(
+        tx,
+        written,
+        id,
+        "tagline",
+        read.taglines.first().cloned(),
+        updated.taglines.first().cloned()
+    );
+    save_text_column!(
+        tx,
+        written,
+        id,
+        "production_countries",
+        Some(read.production_locations.join("|")),
+        Some(updated.production_locations.join("|"))
+    );
+    save_scalar_column!(
+        tx,
+        written,
+        id,
+        "end_date",
+        read.end_date.map(|d| d.to_rfc3339()),
+        updated.end_date.map(|d| d.to_rfc3339())
+    );
+    save_scalar_column!(tx, written, id, "budget", read.budget, updated.budget);
+    save_scalar_column!(tx, written, id, "revenue", read.revenue, updated.revenue);
+    save_scalar_column!(
+        tx,
+        written,
+        id,
+        "homepage",
+        read.homepage.clone(),
+        updated.homepage.clone()
+    );
+    // The column is NOT NULL DEFAULT 0, so a missing count is stored as 0.
+    save_scalar_column!(
+        tx,
+        written,
+        id,
+        "vote_count",
+        Some(read.vote_count.unwrap_or(0)),
+        Some(updated.vote_count.unwrap_or(0))
+    );
+    save_scalar_column!(
+        tx,
+        written,
+        id,
+        "popularity",
+        read.popularity,
+        updated.popularity
+    );
+
+    if read.name != updated.name || read.sort_name != updated.sort_name {
+        let result = sqlx::query(
+            "UPDATE media_items SET name = ?, sort_name = ? \
+             WHERE id = ? AND name IS ? AND sort_name IS ?",
+        )
+        .bind(&updated.name)
+        .bind(&updated.sort_name)
+        .bind(&id)
+        .bind(&read.name)
+        .bind(&read.sort_name)
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() == 1 {
+            written.push("name");
+            written.push("sort_name");
+        }
+    }
+
+    tx.commit().await?;
+    Ok(written)
 }
 
 /// Batch-insert multiple media items in a single transaction.

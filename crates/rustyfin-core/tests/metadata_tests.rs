@@ -335,3 +335,164 @@ async fn refresh_renames_the_item_in_search() {
             .unwrap();
     assert_eq!(ratings, [("R".to_string(), 2)]);
 }
+
+// B34: a refresh saves only the fields it changed, and only while they still hold what it read
+
+/// The stored item, read again.
+async fn stored(pool: &SqlitePool, id: Uuid) -> MediaItem {
+    rustyfin_db::repo_media::get_item_by_id(pool, id)
+        .await
+        .unwrap()
+        .expect("the item is stored")
+}
+
+/// A rescan renames the item and changes its year after the refresh read it (`scan_sync.rs`).
+/// The refresh still fills the empty fields from the NFO, but writes back neither the old name
+/// nor the old year.
+#[tokio::test]
+async fn b34_refresh_keeps_a_rename_made_while_it_ran() {
+    let fx = Fixture::new().await;
+    let pool = &fx.pool;
+    let read = fx.movie("Quiet Title", Some(NFO)).await;
+
+    exec(
+        pool,
+        "UPDATE media_items SET name = 'Renamed Title', sort_name = 'renamed title', \
+         production_year = 2002 WHERE id = ?1",
+        &[&read.id.to_string()],
+    )
+    .await;
+    refresh(pool, &read).await;
+
+    let after = stored(pool, read.id).await;
+    assert_eq!(after.name, "Renamed Title");
+    assert_eq!(after.sort_name.as_deref(), Some("renamed title"));
+    assert_eq!(after.production_year, Some(2002));
+    assert_eq!(
+        after.overview.as_deref(),
+        Some("A plot from the NFO."),
+        "the refresh still filled the empty overview"
+    );
+    assert_eq!(after.genres, ["Drama"]);
+    let years: Vec<(i64, i64)> = sqlx::query_as("SELECT year, item_count FROM filter_year_index")
+        .fetch_all(pool)
+        .await
+        .unwrap();
+    assert_eq!(years, [(2002, 1)]);
+}
+
+/// The Jellyfin import writes the overview and genres after the refresh read the item
+/// (`repo_jellyfin_import.rs`). The NFO's values don't replace them.
+#[tokio::test]
+async fn b34_refresh_keeps_an_import_written_while_it_ran() {
+    let fx = Fixture::new().await;
+    let pool = &fx.pool;
+    let read = fx.movie("Quiet Title", Some(NFO)).await;
+
+    exec(
+        pool,
+        "UPDATE media_items SET overview = 'Imported overview', genres = 'Imported' WHERE id = ?1",
+        &[&read.id.to_string()],
+    )
+    .await;
+    refresh(pool, &read).await;
+
+    let after = stored(pool, read.id).await;
+    assert_eq!(after.overview.as_deref(), Some("Imported overview"));
+    assert_eq!(after.genres, ["Imported"]);
+    assert_eq!(after.name, "Quiet Title");
+}
+
+/// The probe moves the item's path and sets its runtime after the refresh read it
+/// (`probe.rs`). The refresh, whose NFO has no runtime, writes back neither.
+#[tokio::test]
+async fn b34_refresh_keeps_a_probe_written_while_it_ran() {
+    let fx = Fixture::new().await;
+    let pool = &fx.pool;
+    let read = fx.movie("Quiet Title", Some(NFO)).await;
+    let moved = fx
+        .dir
+        .join("film")
+        .join("Quiet Title.mp4")
+        .to_string_lossy()
+        .into_owned();
+
+    exec(
+        pool,
+        "UPDATE media_items SET path = ?1, runtime_ticks = 72000000000 WHERE id = ?2",
+        &[&moved, &read.id.to_string()],
+    )
+    .await;
+    refresh(pool, &read).await;
+
+    let after = stored(pool, read.id).await;
+    assert_eq!(after.path, moved);
+    assert_eq!(after.runtime_ticks, Some(72_000_000_000));
+    assert_eq!(after.overview.as_deref(), Some("A plot from the NFO."));
+}
+
+/// A TMDb stand-in on 127.0.0.1:0 that finds one movie with a tagline and no overview or
+/// genres. Every other path is a 404.
+async fn b34_tmdb() -> rustyfin_core::tmdb_client::TmdbApi {
+    use axum::response::IntoResponse;
+    use rustyfin_core::tmdb_client::{TmdbClient, TmdbKey, TmdbSettings};
+
+    async fn handle(uri: axum::http::Uri) -> axum::response::Response {
+        let body = match uri.path() {
+            "/3/search/movie" => {
+                serde_json::json!({"results": [{"id": 9034, "title": "Quiet Title"}]})
+            }
+            "/3/movie/9034" => serde_json::json!({
+                "id": 9034,
+                "title": "Quiet Title",
+                "original_language": "en",
+                "tagline": "A tagline from TMDb"
+            }),
+            _ => return axum::http::StatusCode::NOT_FOUND.into_response(),
+        };
+        axum::Json(body).into_response()
+    }
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let app = axum::Router::new().fallback(handle);
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let settings = TmdbSettings {
+        api_base_url: format!("{origin}/3"),
+        image_base_url: format!("{origin}/t/p/original"),
+        env_key: TmdbKey::new("b34-fake-key"),
+        min_interval: std::time::Duration::from_millis(1),
+        initial_backoff: std::time::Duration::from_millis(5),
+        ..TmdbSettings::default()
+    };
+    let http = reqwest::Client::builder().no_proxy().build().unwrap();
+    TmdbClient::new(http, settings)
+        .api(None)
+        .expect("the env key is set")
+}
+
+/// The NFO fills the overview and genres, then TMDb, which has neither, fills the tagline. Each
+/// source applies to what the sources before it filled, so TMDb's save doesn't empty them again.
+#[tokio::test]
+async fn b34_a_later_source_keeps_an_earlier_one_s_fills() {
+    let fx = Fixture::new().await;
+    let pool = &fx.pool;
+    let read = fx.movie("Quiet Title", Some(NFO)).await;
+    let tmdb = b34_tmdb().await;
+
+    rustyfin_core::metadata::refresh_item_metadata(
+        pool,
+        &reqwest::Client::new(),
+        &read,
+        Some(&tmdb),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let after = stored(pool, read.id).await;
+    assert_eq!(after.taglines, ["A tagline from TMDb"], "TMDb applied");
+    assert_eq!(after.overview.as_deref(), Some("A plot from the NFO."));
+    assert_eq!(after.genres, ["Drama"]);
+}
