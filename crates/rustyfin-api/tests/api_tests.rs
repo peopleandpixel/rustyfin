@@ -11600,6 +11600,323 @@ async fn g1c_next_up_accepts_both_casings() {
     }
 }
 
+// ── B29: item details per user ──
+// GET /Items/{id} caches only what every user sees and adds the requester's watch data to each
+// answer, so no user gets another's UserData or CompletionPercentage, a change shows on the next
+// request, and a cached answer equals a fresh one, Type included. Item details never reach the L2
+// table. Movies and episodes are built fresh each time.
+
+/// Stores one item of each kind that item details cover, a series with a season and an episode
+/// and an album with a track among them, and returns `(kind, id, runtime ticks)` for each.
+async fn b29_items(state: &AppState) -> Vec<(&'static str, uuid::Uuid, Option<i64>)> {
+    let folder = media_folder(state, "b29");
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: "B29".to_string(),
+        content_type: rustyfin_model::library::LibraryContentType::Mixed,
+        paths: vec![folder.clone()],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    let id = |n: usize| uuid::Uuid::from_u128(0xb290_0000 + n as u128);
+    // (kind, name, parent, runtime, season number, index number)
+    let rows = [
+        ("Movie", "B29 Movie", None, Some(72_000_000_000), None, None),
+        ("Series", "B29 Series", None, None, None, None),
+        ("Season", "Season 1", Some(id(1)), None, None, Some(1)),
+        (
+            "Episode",
+            "B29 Episode",
+            Some(id(2)),
+            Some(27_000_000_000),
+            Some(1),
+            Some(2),
+        ),
+        ("MusicAlbum", "B29 Album", None, None, None, None),
+        (
+            "Audio",
+            "B29 Track",
+            Some(id(4)),
+            Some(2_400_000_000),
+            None,
+            Some(1),
+        ),
+        ("Genre", "B29 Genre", None, None, None, None),
+        ("Photo", "B29 Photo", None, None, None, None),
+    ];
+    let mut items = Vec::new();
+    for (n, (kind, name, parent, runtime, season, index)) in rows.into_iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO media_items (id, library_id, name, sort_name, media_type, path, \
+             parent_id, runtime_ticks, parent_index_number, index_number, date_created) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(id(n).to_string())
+        .bind(lib.id.to_string())
+        .bind(name)
+        .bind(name.to_lowercase())
+        .bind(kind)
+        .bind(format!("{folder}/{n}"))
+        .bind(parent.map(|p: uuid::Uuid| p.to_string()))
+        .bind(runtime)
+        .bind(season)
+        .bind(index)
+        .bind("2024-01-01T00:00:00+00:00")
+        .execute(&state.db)
+        .await
+        .unwrap();
+        items.push((kind, id(n), runtime));
+    }
+    items
+}
+
+/// Sends a request as the token's user and asserts a 2xx answer.
+async fn b29_ok(
+    app: &axum::Router,
+    token: &str,
+    method: &str,
+    uri: &str,
+    body: Option<serde_json::Value>,
+) {
+    let (status, json) = send(app, request(method, uri, Some(token), body)).await;
+    assert!(status.is_success(), "{method} {uri}: {status} {json}");
+}
+
+/// The user saves a resume point at `ticks` on the item.
+async fn b29_progress(app: &axum::Router, token: &str, item: uuid::Uuid, ticks: i64) {
+    let body = serde_json::json!({ "ItemId": item, "PositionTicks": ticks });
+    b29_ok(app, token, "POST", "/Sessions/Playing/Progress", Some(body)).await;
+}
+
+/// The user saves a resume point at `ticks` on the item, then marks it played and favorite.
+async fn b29_watch(app: &axum::Router, token: &str, user_id: &str, item: uuid::Uuid, ticks: i64) {
+    b29_progress(app, token, item, ticks).await;
+    for route in ["PlayedItems", "FavoriteItems"] {
+        let uri = format!("/Users/{user_id}/{route}/{item}");
+        b29_ok(app, token, "POST", &uri, None).await;
+    }
+}
+
+/// `GET /Items/{id}?userId=` as the token's user: asserts a 200 and returns the details.
+async fn b29_details(
+    app: &axum::Router,
+    token: &str,
+    user_id: &str,
+    item: uuid::Uuid,
+) -> serde_json::Value {
+    let uri = format!("/Items/{item}?userId={user_id}");
+    let (status, json) = send(app, request("GET", &uri, Some(token), None)).await;
+    assert_eq!(status, StatusCode::OK, "{uri}: {json}");
+    json
+}
+
+/// The user's watch data on the item as the database holds it, serialized as `UserData` is.
+async fn b29_stored(state: &AppState, user_id: &str, item: uuid::Uuid) -> serde_json::Value {
+    let user = user_id.parse().unwrap();
+    let data = rustyfin_db::repo_playback::get_user_item_data(&state.db, user, item)
+        .await
+        .unwrap();
+    serde_json::to_value(data).unwrap()
+}
+
+/// `value` as an answer brings it: written as text and read back, since serde_json can read a
+/// float back 1 ulp off.
+fn b29_as_sent(value: serde_json::Value) -> serde_json::Value {
+    serde_json::from_str(&value.to_string()).unwrap()
+}
+
+/// Whether item details of this kind are cached.
+fn b29_cached_kind(kind: &str) -> bool {
+    kind != "Movie" && kind != "Episode"
+}
+
+#[tokio::test]
+async fn b29_each_user_gets_their_own_watch_data_in_item_details() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (a, a_id, b, b_id) = g1_owner_and_viewer(&state, &app).await;
+    for (kind, item, runtime) in b29_items(&state).await {
+        // A watched it; B saved a resume point of its own.
+        b29_watch(&app, &a, &a_id, item, 1234).await;
+        b29_progress(&app, &b, item, 5000).await;
+        let first = b29_details(&app, &a, &a_id, item).await;
+        assert_eq!(
+            g1c_user_data(&first),
+            Some((true, true, 1234)),
+            "{kind}: A's first request"
+        );
+        // Within the cache's 300 s.
+        let details = b29_details(&app, &b, &b_id, item).await;
+        assert_eq!(
+            g1c_user_data(&details),
+            Some((false, false, 5000)),
+            "{kind}: B gets A's watch data"
+        );
+        assert_eq!(
+            details["UserData"],
+            b29_stored(&state, &b_id, item).await,
+            "{kind}: B's UserData"
+        );
+        assert_eq!(
+            details["CompletionPercentage"],
+            b29_as_sent(serde_json::json!(
+                runtime.map(|r| 5000.0 / r as f64 * 100.0)
+            )),
+            "{kind}: B's CompletionPercentage"
+        );
+        let details = b29_details(&app, &a, &a_id, item).await;
+        assert_eq!(
+            details["UserData"],
+            b29_stored(&state, &a_id, item).await,
+            "{kind}: A's UserData"
+        );
+        assert_eq!(
+            details["CompletionPercentage"],
+            serde_json::json!(runtime.map(|_| 100.0)),
+            "{kind}: A's CompletionPercentage"
+        );
+        if b29_cached_kind(kind) {
+            // The entry A's request made holds nothing of A's.
+            let entry = state.cache.item_details.get(&item.to_string());
+            let entry = serde_json::to_value(entry.expect("cached")).unwrap();
+            assert!(
+                entry["UserData"].is_null() && entry["CompletionPercentage"].is_null(),
+                "{kind}: the cache holds watch data: {} {}",
+                entry["UserData"],
+                entry["CompletionPercentage"]
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn b29_a_change_to_watch_data_shows_on_the_next_request() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (a, a_id, _, _) = g1_owner_and_viewer(&state, &app).await;
+    for (kind, item, _) in b29_items(&state).await {
+        let details = b29_details(&app, &a, &a_id, item).await;
+        assert_eq!(
+            g1c_user_data(&details),
+            Some((false, false, 0)),
+            "{kind}: before"
+        );
+        let played = format!("/Users/{a_id}/PlayedItems/{item}");
+        let favorite = format!("/Users/{a_id}/FavoriteItems/{item}");
+        // (change, method, uri, then (Played, IsFavorite, PlaybackPositionTicks))
+        let changes = [
+            ("marked played", "POST", &played, (true, false, 0)),
+            ("favorite", "POST", &favorite, (true, true, 0)),
+            ("marked unplayed", "DELETE", &played, (false, true, 0)),
+            ("not favorite", "DELETE", &favorite, (false, false, 0)),
+        ];
+        for (change, method, uri, expected) in changes {
+            b29_ok(&app, &a, method, uri, None).await;
+            let details = b29_details(&app, &a, &a_id, item).await;
+            assert_eq!(
+                g1c_user_data(&details),
+                Some(expected),
+                "{kind}: after {change}"
+            );
+        }
+        b29_progress(&app, &a, item, 4321).await;
+        let details = b29_details(&app, &a, &a_id, item).await;
+        assert_eq!(
+            g1c_user_data(&details),
+            Some((false, false, 4321)),
+            "{kind}: after a resume point"
+        );
+        // Written straight into the database, as an import does.
+        rustyfin_db::repo_playback::set_favorite(&state.db, a_id.parse().unwrap(), item, true)
+            .await
+            .unwrap();
+        let details = b29_details(&app, &a, &a_id, item).await;
+        assert_eq!(
+            g1c_user_data(&details),
+            Some((false, true, 4321)),
+            "{kind}: after a write to the database"
+        );
+        if b29_cached_kind(kind) {
+            assert!(
+                state.cache.item_details.contains_key(&item.to_string()),
+                "{kind}: the details stay cached"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn b29_cached_item_details_equal_fresh_ones() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (a, a_id, b, b_id) = g1_owner_and_viewer(&state, &app).await;
+    let mut cached = Vec::new();
+    for (kind, item, _) in b29_items(&state).await {
+        b29_watch(&app, &a, &a_id, item, 1234).await;
+        b29_progress(&app, &b, item, 5000).await;
+        let key = item.to_string();
+        state.cache.item_details.invalidate(&key);
+        let a_fresh = b29_details(&app, &a, &a_id, item).await;
+        cached.push((kind, state.cache.item_details.contains_key(&key)));
+        let b_cached = b29_details(&app, &b, &b_id, item).await;
+        let a_cached = b29_details(&app, &a, &a_id, item).await;
+        state.cache.item_details.invalidate(&key);
+        let b_fresh = b29_details(&app, &b, &b_id, item).await;
+        assert_eq!(a_fresh["Type"], kind, "{kind}: Type");
+        assert_eq!(b_fresh["Type"], kind, "{kind}: Type");
+        assert_eq!(a_cached, a_fresh, "{kind}: A's cached answer");
+        assert_eq!(b_cached, b_fresh, "{kind}: B's cached answer");
+    }
+    // Movies and episodes are built fresh each time; the other kinds come from the cache.
+    for (kind, cached) in cached {
+        assert_eq!(cached, b29_cached_kind(kind), "{kind}: cached");
+    }
+}
+
+#[tokio::test]
+async fn b29_item_details_never_reach_the_l2_table() {
+    // The L2 copy on.
+    let state = b27_restarted(&test_state().await).await;
+    let before_restart = app(state.clone());
+    let (a, a_id, b, b_id) = g1_owner_and_viewer(&state, &before_restart).await;
+    let items = b29_items(&state).await;
+    let photo = items.iter().find(|(kind, ..)| *kind == "Photo").unwrap().1;
+    b29_watch(&before_restart, &a, &a_id, photo, 1234).await;
+    let details = b29_details(&before_restart, &a, &a_id, photo).await;
+    // The L2 copy is saved in the background.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let (rows,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM api_cache WHERE cache_key LIKE 'item:%'")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+    assert_eq!(rows, 0, "item details reached the L2 table");
+    // A row that an older build saved, with A's watch data, is not served after a restart.
+    sqlx::query("INSERT INTO api_cache (cache_key, cache_value, expires_at) VALUES (?, ?, ?)")
+        .bind(format!("item:{photo}"))
+        .bind(details.to_string())
+        .bind((chrono::Utc::now() + chrono::TimeDelta::seconds(3600)).to_rfc3339())
+        .execute(&state.db)
+        .await
+        .unwrap();
+    let restarted = b27_restarted(&state).await;
+    assert!(
+        !restarted
+            .cache
+            .item_details
+            .contains_key(&photo.to_string()),
+        "a restart loaded item details from the L2 table"
+    );
+    let after_restart = app(restarted);
+    let details = b29_details(&after_restart, &b, &b_id, photo).await;
+    assert_eq!(
+        g1c_user_data(&details),
+        Some((false, false, 0)),
+        "B after a restart"
+    );
+}
+
 // ── B17: library scan progress ──
 // Every signed-in socket gets `RefreshProgress` frames for a library's scan: "0" when it is
 // queued, each higher whole percent, and "100" once its probes have finished. A new socket
