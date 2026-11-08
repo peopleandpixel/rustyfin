@@ -1139,6 +1139,175 @@ async fn test_batch_upsert_media_items_round_trip() {
     }
 }
 
+/// A batch that saves a stored item again updates it in place (B31): the rows that reference it
+/// and its date added stay, and the year and rating counts follow its new values.
+#[tokio::test]
+async fn test_batch_upsert_updates_a_stored_item_in_place() {
+    let temp_db = test_pool().await;
+    let pool = temp_db.pool.clone();
+
+    let lib = make_library("Movies", LibraryContentType::Movies);
+    rustyfin_db::repo_library::create_library(&pool, &lib)
+        .await
+        .unwrap();
+    let added: chrono::DateTime<Utc> = "2020-01-02T03:04:05Z".parse().unwrap();
+    let movie = MediaItem {
+        official_rating: Some("R".to_string()),
+        date_created: added,
+        ..make_movie(lib.id, "Stored")
+    };
+    let other = MediaItem {
+        official_rating: Some("R".to_string()),
+        ..make_movie(lib.id, "Other")
+    };
+    rustyfin_db::repo_media::batch_upsert_media_items(&pool, &[movie.clone(), other])
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO item_images (item_id, image_type, path) VALUES (?1, 'Primary', ?2)")
+        .bind(movie.id.to_string())
+        .bind("/media/movies/Stored.jpg")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO media_sources (id, item_id, uid, path) VALUES (?1, ?2, ?1, ?3)")
+        .bind(Uuid::new_v4().to_string())
+        .bind(movie.id.to_string())
+        .bind(&movie.path)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let changed = MediaItem {
+        name: "Renamed".to_string(),
+        production_year: Some(2021),
+        official_rating: Some("PG".to_string()),
+        date_created: Utc::now(),
+        ..movie.clone()
+    };
+    rustyfin_db::repo_media::batch_upsert_media_items(&pool, &[changed])
+        .await
+        .unwrap();
+
+    let stored = rustyfin_db::repo_media::get_item_by_id(&pool, movie.id)
+        .await
+        .unwrap()
+        .expect("the item is still stored under its id");
+    assert_eq!(stored.name, "Renamed");
+    let kept: (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM item_images WHERE item_id = ?1), \
+                (SELECT COUNT(*) FROM media_sources WHERE item_id = ?1)",
+    )
+    .bind(movie.id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(kept, (1, 1), "the image and the media source stay");
+    assert_eq!(stored.date_created, added);
+    let years: Vec<(i64, i64)> =
+        sqlx::query_as("SELECT year, item_count FROM filter_year_index ORDER BY year")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(years, [(2020, 1), (2021, 1)]);
+    let ratings: Vec<(String, i64)> =
+        sqlx::query_as("SELECT rating, item_count FROM filter_rating_index ORDER BY rating")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(ratings, [("PG".to_string(), 1), ("R".to_string(), 1)]);
+}
+
+/// The year filter's values with their item counts.
+async fn filter_years(pool: &SqlitePool) -> Vec<(i64, i64)> {
+    sqlx::query_as("SELECT year, item_count FROM filter_year_index ORDER BY year")
+        .fetch_all(pool)
+        .await
+        .unwrap()
+}
+
+/// The rating filter's values with their item counts.
+async fn filter_ratings(pool: &SqlitePool) -> Vec<(String, i64)> {
+    sqlx::query_as("SELECT rating, item_count FROM filter_rating_index ORDER BY rating")
+        .fetch_all(pool)
+        .await
+        .unwrap()
+}
+
+/// Stores a 2020, R movie and a 2021, PG one, and returns the first.
+async fn store_two_rated_movies(pool: &SqlitePool) -> MediaItem {
+    let lib = make_library("Movies", LibraryContentType::Movies);
+    rustyfin_db::repo_library::create_library(pool, &lib)
+        .await
+        .unwrap();
+    let movie = MediaItem {
+        official_rating: Some("R".to_string()),
+        ..make_movie(lib.id, "Last")
+    };
+    let other = MediaItem {
+        production_year: Some(2021),
+        official_rating: Some("PG".to_string()),
+        ..make_movie(lib.id, "Other")
+    };
+    for item in [&movie, &other] {
+        rustyfin_db::repo_media::upsert_media_item(pool, item)
+            .await
+            .unwrap();
+    }
+    assert_eq!(filter_years(pool).await, [(2020, 1), (2021, 1)]);
+    assert_eq!(
+        filter_ratings(pool).await,
+        [("PG".to_string(), 1), ("R".to_string(), 1)]
+    );
+    movie
+}
+
+/// B31 review 1, finding 4: a year or rating leaves the filters once no item has it. Here the only
+/// 2020, R movie is saved as 2022, PG-13.
+#[tokio::test]
+async fn test_filters_drop_a_value_when_its_last_item_moves_off_it() {
+    let temp_db = test_pool().await;
+    let pool = temp_db.pool.clone();
+
+    let movie = store_two_rated_movies(&pool).await;
+    let moved = MediaItem {
+        production_year: Some(2022),
+        official_rating: Some("PG-13".to_string()),
+        ..movie
+    };
+    rustyfin_db::repo_media::upsert_media_item(&pool, &moved)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        (filter_years(&pool).await, filter_ratings(&pool).await),
+        (
+            vec![(2021, 1), (2022, 1)],
+            vec![("PG".to_string(), 1), ("PG-13".to_string(), 1)]
+        ),
+        "no item has 2020 or R any more"
+    );
+}
+
+/// B31 review 1, finding 4: the same when the only 2020, R movie is deleted.
+#[tokio::test]
+async fn test_filters_drop_a_value_when_its_last_item_is_deleted() {
+    let temp_db = test_pool().await;
+    let pool = temp_db.pool.clone();
+
+    let movie = store_two_rated_movies(&pool).await;
+    assert!(
+        rustyfin_db::repo_media::delete_item(&pool, movie.id)
+            .await
+            .unwrap()
+    );
+
+    assert_eq!(
+        (filter_years(&pool).await, filter_ratings(&pool).await),
+        (vec![(2021, 1)], vec![("PG".to_string(), 1)]),
+        "no item has 2020 or R any more"
+    );
+}
+
 /// B26 review 1, finding 2: `save_chapters` saves all of an item's chapters or none of them. A save
 /// that fails part way, here at a second chapter with the first one's id, leaves the chapters that
 /// the item had before.
