@@ -1,5 +1,5 @@
 use axum::extract::{ConnectInfo, Path, State};
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{delete, get, post, put};
 use axum::{Extension, Json, Router};
 use chrono::Utc;
@@ -154,11 +154,8 @@ async fn create_user(
     Ok(Json(UserDto::new(user, UserFlags::default())))
 }
 
-async fn delete_user(
-    State(state): State<AppState>,
-    Extension(claims): Extension<Claims>,
-    Path(id): Path<Uuid>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+/// Checks the caller may delete user `id`, then deletes the user and their data.
+async fn remove_user(state: &AppState, claims: &Claims, id: Uuid) -> Result<(), ApiError> {
     if !claims.is_admin {
         return Err(ApiError::Forbidden(
             "Administrator access is required.".to_string(),
@@ -180,6 +177,16 @@ async fn delete_user(
         return Err(ApiError::NotFound("user not found".into()));
     }
 
+    Ok(())
+}
+
+/// POST /Users/{id}/Delete - Delete a user (the web client's contract)
+async fn delete_user(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    remove_user(&state, &claims, id).await?;
     Ok(Json(serde_json::json!({})))
 }
 
@@ -696,26 +703,14 @@ async fn get_periods(
     Ok(Json(periods))
 }
 
-/// DELETE /Users/{id} - Delete user by ID
+/// DELETE /Users/{id} - Delete user by ID (204, as Jellyfin's UserController.DeleteUser)
 async fn delete_user_by_id(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Extension(claims): Extension<Claims>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    if !claims.is_admin {
-        return Err(ApiError::Forbidden(
-            "Administrator access is required.".to_string(),
-        ));
-    }
-    if rustyfin_db::repo_user::is_owner(&state.db, id).await? {
-        return Err(ApiError::Forbidden(
-            "The server owner cannot be deleted.".into(),
-        ));
-    }
-    rustyfin_db::repo_user::delete_user(&state.db, id)
-        .await
-        .ok();
-    Ok(Json(serde_json::json!({})))
+) -> Result<StatusCode, ApiError> {
+    remove_user(&state, &claims, id).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// GET /Auth/Keys - List API keys

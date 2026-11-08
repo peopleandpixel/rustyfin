@@ -42,27 +42,7 @@ pub async fn delete_item_in(conn: &mut SqliteConnection, id: &str) -> Result<boo
         tracing::warn!("not removing item {id}: it has {children} child items");
         return Ok(false);
     }
-    // These references to media_items have no ON DELETE CASCADE, so they go first.
-    sqlx::query("DELETE FROM pinned_episodes WHERE series_id=?1 OR episode_id=?1 OR season_id=?1")
-        .bind(id)
-        .execute(&mut *conn)
-        .await?;
-    sqlx::query("DELETE FROM user_item_data WHERE item_id=?1")
-        .bind(id)
-        .execute(&mut *conn)
-        .await?;
-    sqlx::query("DELETE FROM item_people WHERE item_id=?1")
-        .bind(id)
-        .execute(&mut *conn)
-        .await?;
-    sqlx::query("DELETE FROM item_studios WHERE item_id=?1")
-        .bind(id)
-        .execute(&mut *conn)
-        .await?;
-    sqlx::query("DELETE FROM media_items WHERE id=?1")
-        .bind(id)
-        .execute(&mut *conn)
-        .await?;
+    rustyfin_db::repo_media::delete_item_rows_in(conn, id).await?;
     Ok(true)
 }
 

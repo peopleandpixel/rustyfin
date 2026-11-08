@@ -6,7 +6,7 @@
 
 use chrono::{DateTime, Utc};
 use rustyfin_model::media::{MediaItem, MediaType};
-use sqlx::SqlitePool;
+use sqlx::{SqliteConnection, SqlitePool};
 use std::collections::HashMap;
 use std::sync::LazyLock;
 use uuid::Uuid;
@@ -281,17 +281,62 @@ pub async fn count_children(pool: &SqlitePool, parent_id: Uuid) -> Result<i64, s
     Ok(row.0)
 }
 
-pub async fn delete_item(pool: &SqlitePool, id: Uuid) -> Result<bool, sqlx::Error> {
-    // Delete children first (recursive via foreign key would be nice, but let's be explicit)
-    sqlx::query("DELETE FROM media_items WHERE parent_id = ?")
-        .bind(id.to_string())
-        .execute(pool)
+/// Deletes the item `id` on `conn`, which the caller holds in a write transaction. It does not
+/// check for child items. These references to media_items have no ON DELETE CASCADE, so they go
+/// first. Returns whether the media_items row existed.
+pub async fn delete_item_rows_in(
+    conn: &mut SqliteConnection,
+    id: &str,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query("DELETE FROM pinned_episodes WHERE series_id=?1 OR episode_id=?1 OR season_id=?1")
+        .bind(id)
+        .execute(&mut *conn)
         .await?;
-    let result = sqlx::query("DELETE FROM media_items WHERE id = ?")
-        .bind(id.to_string())
-        .execute(pool)
+    sqlx::query("DELETE FROM user_item_data WHERE item_id=?1")
+        .bind(id)
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query("DELETE FROM item_people WHERE item_id=?1")
+        .bind(id)
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query("DELETE FROM item_studios WHERE item_id=?1")
+        .bind(id)
+        .execute(&mut *conn)
+        .await?;
+    let result = sqlx::query("DELETE FROM media_items WHERE id=?1")
+        .bind(id)
+        .execute(&mut *conn)
         .await?;
     Ok(result.rows_affected() > 0)
+}
+
+/// Deletes the item `id` and all its descendants, deepest first, in one write transaction.
+/// Returns whether the item itself existed.
+pub async fn delete_item(pool: &SqlitePool, id: Uuid) -> Result<bool, sqlx::Error> {
+    let root = id.to_string();
+    // The write lock is taken first, as in scan_sync::delete_item.
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let tree: Vec<(String, i64)> = sqlx::query_as(
+        "WITH RECURSIVE tree(id, depth) AS (
+            SELECT id, 0 FROM media_items WHERE id = ?1
+            UNION ALL
+            SELECT m.id, t.depth + 1 FROM media_items m JOIN tree t ON m.parent_id = t.id
+        )
+        SELECT id, MAX(depth) AS depth FROM tree GROUP BY id ORDER BY depth DESC",
+    )
+    .bind(&root)
+    .fetch_all(&mut *tx)
+    .await?;
+    let mut root_deleted = false;
+    for (item_id, _) in &tree {
+        let deleted = delete_item_rows_in(&mut tx, item_id).await?;
+        if *item_id == root {
+            root_deleted = deleted;
+        }
+    }
+    tx.commit().await?;
+    Ok(root_deleted)
 }
 
 /// Get latest items using a single static SQL query for plan reuse.

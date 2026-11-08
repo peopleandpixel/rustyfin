@@ -15835,6 +15835,652 @@ async fn b15_skips_past_gaps() {
     );
 }
 
+// B35: deletes with user data
+// Deleting an item or a user clears every row that names it, in one transaction, so a favourite,
+// a play, a resume point, a pinned episode or a playlist never makes the delete fail (B35, B37).
+// DELETE /Users/{id} answers 204 like Jellyfin's UserController.DeleteUser, and 404 for an
+// unknown user; POST /Users/{id}/Delete keeps its 200.
+
+/// Counts, for each `table.column` that names `id`, the rows naming it: every column with a
+/// foreign key to `target` (`media_items` or `users`), `target.id` itself, and the keyless
+/// columns in `extra`. Zero counts are included, so two calls can be compared.
+async fn b35_rows(
+    state: &AppState,
+    target: &str,
+    extra: &[(&str, &str)],
+    id: impl ToString,
+) -> std::collections::BTreeMap<String, i64> {
+    let id = id.to_string();
+    let mut columns: Vec<(String, String)> = vec![(target.to_string(), "id".to_string())];
+    columns.extend(extra.iter().map(|(t, c)| (t.to_string(), c.to_string())));
+    let tables: Vec<(String,)> =
+        sqlx::query_as("SELECT name FROM sqlite_master WHERE type = 'table'")
+            .fetch_all(&state.db)
+            .await
+            .unwrap();
+    for (table,) in tables {
+        let keys: Vec<(String, String)> =
+            sqlx::query_as("SELECT \"table\", \"from\" FROM pragma_foreign_key_list(?1)")
+                .bind(&table)
+                .fetch_all(&state.db)
+                .await
+                .unwrap();
+        for (to, from) in keys {
+            if to == target {
+                columns.push((table.clone(), from));
+            }
+        }
+    }
+    let mut counts = std::collections::BTreeMap::new();
+    for (table, column) in columns {
+        // The names come from sqlite_master and the constants above, not from input.
+        let n: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM \"{table}\" WHERE \"{column}\" = ?1"
+        )))
+        .bind(&id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        counts.insert(format!("{table}.{column}"), n);
+    }
+    counts
+}
+
+/// The rows naming the item `id`, as [`b35_rows`] counts them.
+async fn b35_item_rows(
+    state: &AppState,
+    id: uuid::Uuid,
+) -> std::collections::BTreeMap<String, i64> {
+    b35_rows(
+        state,
+        "media_items",
+        &[("item_metadata_extras", "item_id")],
+        id,
+    )
+    .await
+}
+
+/// The rows naming the user `id`, as [`b35_rows`] counts them.
+async fn b35_user_rows(
+    state: &AppState,
+    id: uuid::Uuid,
+) -> std::collections::BTreeMap<String, i64> {
+    b35_rows(state, "users", &[("password_reset_pins", "user_id")], id).await
+}
+
+/// The entries of `counts` above zero.
+fn b35_left(counts: &std::collections::BTreeMap<String, i64>) -> Vec<(&String, &i64)> {
+    counts.iter().filter(|(_, n)| **n > 0).collect()
+}
+
+/// Creates the owner and a user `bob` through the API, and returns
+/// `(owner_token, owner_id, bob_token, bob_id)`.
+async fn b35_users(app: &axum::Router) -> (String, uuid::Uuid, String, uuid::Uuid) {
+    assert_eq!(
+        post_startup_user(app, None, "owner", "pw-owner").await,
+        StatusCode::NO_CONTENT
+    );
+    let (owner_t, owner_id) = g2_login_device(app, "owner", "pw-owner", "owner-dev")
+        .await
+        .expect("owner signs in");
+    let bob_t = b35_new_user(app, &owner_t, "bob").await;
+    let (_, me) = send(app, request("GET", "/Users/Me", Some(&bob_t), None)).await;
+    let bob_id = me["Id"].as_str().expect("bob's id").parse().unwrap();
+    (owner_t, owner_id.parse().unwrap(), bob_t, bob_id)
+}
+
+/// Creates the user `name` with the password `pw-<name>` as `admin_t`, signs them in and returns
+/// their token.
+async fn b35_new_user(app: &axum::Router, admin_t: &str, name: &str) -> String {
+    let (status, _) = send(
+        app,
+        request(
+            "POST",
+            "/Users/New",
+            Some(admin_t),
+            Some(serde_json::json!({ "Name": name, "Password": format!("pw-{name}") })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "creating {name}");
+    g2_login_device(app, name, &format!("pw-{name}"), &format!("{name}-dev"))
+        .await
+        .expect("the new user signs in")
+        .0
+}
+
+/// Stores a movies library and returns its id and folder.
+async fn b35_movie_library(state: &AppState) -> (uuid::Uuid, String) {
+    let folder = media_folder(state, "b35-movies");
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: "B35 Movies".to_string(),
+        content_type: rustyfin_model::library::LibraryContentType::Movies,
+        paths: vec![folder.clone()],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    (lib.id, folder)
+}
+
+/// Stores the movie `name` in the library and returns its id.
+async fn b35_insert_movie(
+    state: &AppState,
+    (lib, folder): &(uuid::Uuid, String),
+    name: &str,
+) -> uuid::Uuid {
+    let id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO media_items (id, library_id, name, media_type, path) VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(id.to_string())
+    .bind(lib.to_string())
+    .bind(name)
+    .bind("Movie")
+    .bind(format!("{folder}/{name}.mkv"))
+    .execute(&state.db)
+    .await
+    .unwrap();
+    id
+}
+
+/// Marks `item` as `user`'s favourite and as played through the API.
+async fn b35_favourite_and_play(
+    app: &axum::Router,
+    token: &str,
+    user: uuid::Uuid,
+    item: uuid::Uuid,
+) {
+    for kind in ["FavoriteItems", "PlayedItems"] {
+        let (status, _) = send(
+            app,
+            request(
+                "POST",
+                &format!("/Users/{user}/{kind}/{item}"),
+                Some(token),
+                None,
+            ),
+        )
+        .await;
+        assert!(status.is_success(), "{kind} on {item}: {status}");
+    }
+}
+
+/// Stores a resume point for `user` on `item`.
+async fn b35_resume(state: &AppState, user: uuid::Uuid, item: uuid::Uuid) {
+    sqlx::query(
+        "INSERT INTO user_item_data (user_id, item_id, playback_position_ticks) VALUES (?, ?, ?) \
+         ON CONFLICT (user_id, item_id) DO UPDATE SET playback_position_ticks = excluded.playback_position_ticks",
+    )
+    .bind(user.to_string())
+    .bind(item.to_string())
+    .bind(6_000_000_000_i64)
+    .execute(&state.db)
+    .await
+    .unwrap();
+}
+
+/// Links `item` to a new person and a new studio, and stores metadata extras for it, as a scan does.
+async fn b35_metadata(state: &AppState, item: uuid::Uuid) {
+    let person = uuid::Uuid::new_v4().to_string();
+    let studio = uuid::Uuid::new_v4().to_string();
+    for (sql, a, b) in [
+        (
+            "INSERT INTO people (id, name) VALUES (?, ?)",
+            person.clone(),
+            format!("P {person}"),
+        ),
+        (
+            "INSERT INTO item_people (item_id, person_id) VALUES (?, ?)",
+            item.to_string(),
+            person,
+        ),
+        (
+            "INSERT INTO studios (id, name) VALUES (?, ?)",
+            studio.clone(),
+            format!("S {studio}"),
+        ),
+        (
+            "INSERT INTO item_studios (item_id, studio_id) VALUES (?, ?)",
+            item.to_string(),
+            studio,
+        ),
+        (
+            "INSERT INTO item_metadata_extras (item_id, imdb_id) VALUES (?, ?)",
+            item.to_string(),
+            "tt0000001".into(),
+        ),
+    ] {
+        sqlx::query(sql)
+            .bind(a)
+            .bind(b)
+            .execute(&state.db)
+            .await
+            .unwrap();
+    }
+}
+
+/// Pins `episode` of `series` (in `season`) for `user`.
+async fn b35_pin(
+    state: &AppState,
+    user: uuid::Uuid,
+    series: uuid::Uuid,
+    season: uuid::Uuid,
+    episode: uuid::Uuid,
+) {
+    sqlx::query(
+        "INSERT INTO pinned_episodes (user_id, series_id, episode_id, season_id, season_index, \
+         episode_index, created_date) VALUES (?, ?, ?, ?, 1, 2, '2026-11-08T00:00:00Z')",
+    )
+    .bind(user.to_string())
+    .bind(series.to_string())
+    .bind(episode.to_string())
+    .bind(season.to_string())
+    .execute(&state.db)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn b35_deleting_a_movie_with_user_data_clears_its_rows() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner_t, owner, bob_t, bob) = b35_users(&app).await;
+    let lib = b35_movie_library(&state).await;
+    let movie = b35_insert_movie(&state, &lib, "B35 Doomed").await;
+    let other = b35_insert_movie(&state, &lib, "B35 Kept").await;
+    for item in [movie, other] {
+        b35_favourite_and_play(&app, &bob_t, bob, item).await;
+        b35_resume(&state, owner, item).await;
+        b35_metadata(&state, item).await;
+    }
+    let other_before = b35_item_rows(&state, other).await;
+    assert!(b35_left(&other_before).len() >= 5, "{other_before:?}");
+
+    let (status, body) = send(
+        &app,
+        request("DELETE", &format!("/Items/{movie}"), Some(&owner_t), None),
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "deleting a movie with user data: {status} {body}"
+    );
+
+    let left = b35_item_rows(&state, movie).await;
+    assert!(
+        b35_left(&left).is_empty(),
+        "rows left for the deleted movie: {left:?}"
+    );
+    assert_eq!(
+        b35_item_rows(&state, other).await,
+        other_before,
+        "the other movie's rows"
+    );
+}
+
+#[tokio::test]
+async fn b35_deleting_a_series_clears_its_seasons_episodes_and_their_data() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner_t, owner, bob_t, bob) = b35_users(&app).await;
+    let (series, episodes) = g1f_insert_show(&state).await;
+    let season: uuid::Uuid =
+        sqlx::query_scalar::<_, String>("SELECT id FROM media_items WHERE parent_id = ?")
+            .bind(series.to_string())
+            .fetch_one(&state.db)
+            .await
+            .unwrap()
+            .parse()
+            .unwrap();
+    let lib = b35_movie_library(&state).await;
+    let other = b35_insert_movie(&state, &lib, "B35 Kept").await;
+    b35_favourite_and_play(&app, &bob_t, bob, series).await;
+    b35_favourite_and_play(&app, &bob_t, bob, episodes[0]).await;
+    b35_resume(&state, bob, episodes[1]).await;
+    b35_resume(&state, owner, episodes[2]).await;
+    b35_metadata(&state, series).await;
+    b35_metadata(&state, episodes[0]).await;
+    b35_pin(&state, bob, series, season, episodes[1]).await;
+    b35_favourite_and_play(&app, &bob_t, bob, other).await;
+    b35_metadata(&state, other).await;
+    let other_before = b35_item_rows(&state, other).await;
+
+    let (status, body) = send(
+        &app,
+        request("DELETE", &format!("/Items/{series}"), Some(&owner_t), None),
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "deleting a series with user data: {status} {body}"
+    );
+
+    for id in [series, season, episodes[0], episodes[1], episodes[2]] {
+        let left = b35_item_rows(&state, id).await;
+        assert!(b35_left(&left).is_empty(), "rows left for {id}: {left:?}");
+    }
+    assert_eq!(
+        b35_item_rows(&state, other).await,
+        other_before,
+        "the other movie's rows"
+    );
+}
+
+#[tokio::test]
+async fn b35_deleting_items_under_a_parent_clears_their_data() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner_t, _, bob_t, bob) = b35_users(&app).await;
+    let (series, episodes) = g1f_insert_show(&state).await;
+    let season: uuid::Uuid =
+        sqlx::query_scalar::<_, String>("SELECT id FROM media_items WHERE parent_id = ?")
+            .bind(series.to_string())
+            .fetch_one(&state.db)
+            .await
+            .unwrap()
+            .parse()
+            .unwrap();
+    b35_favourite_and_play(&app, &bob_t, bob, episodes[0]).await;
+    b35_pin(&state, bob, series, season, episodes[1]).await;
+
+    let (status, body) = send(
+        &app,
+        request(
+            "DELETE",
+            &format!("/Items?ParentId={series}"),
+            Some(&owner_t),
+            None,
+        ),
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "deleting the series' children: {status} {body}"
+    );
+
+    for id in [season, episodes[0], episodes[1], episodes[2]] {
+        let left = b35_item_rows(&state, id).await;
+        assert!(b35_left(&left).is_empty(), "rows left for {id}: {left:?}");
+    }
+    assert_eq!(
+        b35_item_rows(&state, series).await["media_items.id"],
+        1,
+        "the series stays"
+    );
+}
+
+/// Gives `user` (signed in as `token`) a favourite, a play mark, a resume point, a pinned
+/// episode, a playlist with two entries, a collection with an entry, display preferences and a
+/// reset PIN.
+async fn b37_give_data(
+    state: &AppState,
+    app: &axum::Router,
+    token: &str,
+    user: uuid::Uuid,
+    movies: &[uuid::Uuid; 2],
+    show: (uuid::Uuid, uuid::Uuid, uuid::Uuid),
+) {
+    b35_favourite_and_play(app, token, user, movies[0]).await;
+    b35_resume(state, user, movies[1]).await;
+    let (series, season, episode) = show;
+    b35_pin(state, user, series, season, episode).await;
+    let (status, body) = send(
+        app,
+        request(
+            "POST",
+            "/Playlists",
+            Some(token),
+            Some(serde_json::json!({ "Name": format!("list {user}"), "Ids": movies })),
+        ),
+    )
+    .await;
+    assert!(status.is_success(), "creating a playlist: {status} {body}");
+    let collection = uuid::Uuid::new_v4().to_string();
+    for (sql, a, b) in [
+        (
+            "INSERT INTO collections (id, name, user_id) VALUES (?, 'set', ?)",
+            collection.clone(),
+            user.to_string(),
+        ),
+        (
+            "INSERT INTO collection_items (collection_id, item_id) VALUES (?, ?)",
+            collection,
+            movies[0].to_string(),
+        ),
+        (
+            "INSERT INTO display_preferences (user_id, key, value) VALUES (?, 'usersettings', ?)",
+            user.to_string(),
+            "{}".into(),
+        ),
+        (
+            "INSERT INTO password_reset_pins (id, user_id, pin_code, expires_at) VALUES (?, ?, '1234', '2999-01-01T00:00:00Z')",
+            uuid::Uuid::new_v4().to_string(),
+            user.to_string(),
+        ),
+    ] {
+        sqlx::query(sql)
+            .bind(a)
+            .bind(b)
+            .execute(&state.db)
+            .await
+            .unwrap();
+    }
+}
+
+/// The number of playlist entries in playlists `user` owns.
+async fn b37_playlist_entries(state: &AppState, user: uuid::Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM playlist_items WHERE playlist_id IN (SELECT id FROM playlists WHERE user_id = ?)",
+    )
+    .bind(user.to_string())
+    .fetch_one(&state.db)
+    .await
+    .unwrap()
+}
+
+/// Sets up the owner, bob and carol, each with data; returns
+/// `(owner_token, bob_token, bob_id, carol_id)`.
+async fn b37_setup(
+    state: &AppState,
+    app: &axum::Router,
+) -> (String, String, uuid::Uuid, uuid::Uuid) {
+    let (owner_t, _, bob_t, bob) = b35_users(app).await;
+    let carol_t = b35_new_user(app, &owner_t, "carol").await;
+    let (_, me) = send(app, request("GET", "/Users/Me", Some(&carol_t), None)).await;
+    let carol: uuid::Uuid = me["Id"].as_str().unwrap().parse().unwrap();
+    let lib = b35_movie_library(state).await;
+    let movies = [
+        b35_insert_movie(state, &lib, "B37 One").await,
+        b35_insert_movie(state, &lib, "B37 Two").await,
+    ];
+    let (series, episodes) = g1f_insert_show(state).await;
+    let season: uuid::Uuid =
+        sqlx::query_scalar::<_, String>("SELECT id FROM media_items WHERE parent_id = ?")
+            .bind(series.to_string())
+            .fetch_one(&state.db)
+            .await
+            .unwrap()
+            .parse()
+            .unwrap();
+    b37_give_data(
+        state,
+        app,
+        &bob_t,
+        bob,
+        &movies,
+        (series, season, episodes[1]),
+    )
+    .await;
+    b37_give_data(
+        state,
+        app,
+        &carol_t,
+        carol,
+        &movies,
+        (series, season, episodes[0]),
+    )
+    .await;
+    (owner_t, bob_t, bob, carol)
+}
+
+/// Checks that bob and all his rows are gone, his token is refused, and carol's rows are as before.
+async fn b37_assert_bob_gone(
+    state: &AppState,
+    app: &axum::Router,
+    owner_t: &str,
+    bob_t: &str,
+    bob: uuid::Uuid,
+    carol: uuid::Uuid,
+    carol_before: &std::collections::BTreeMap<String, i64>,
+) {
+    let left = b35_user_rows(state, bob).await;
+    assert!(
+        b35_left(&left).is_empty(),
+        "rows left for the deleted user: {left:?}"
+    );
+    assert_eq!(b37_playlist_entries(state, bob).await, 0);
+    let (status, _) = send(app, request("GET", "/Users/Me", Some(bob_t), None)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "the deleted user's token");
+    assert!(
+        g2_login_device(app, "bob", "pw-bob", "bob-dev-2")
+            .await
+            .is_none(),
+        "the deleted user's password still signs in"
+    );
+    let (_, users) = send(app, request("GET", "/Users", Some(owner_t), None)).await;
+    let names: Vec<&str> = users
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|u| u["Name"].as_str())
+        .collect();
+    assert!(!names.contains(&"bob"), "bob is still listed: {names:?}");
+    assert_eq!(
+        &b35_user_rows(state, carol).await,
+        carol_before,
+        "carol's rows"
+    );
+    assert_eq!(
+        b37_playlist_entries(state, carol).await,
+        2,
+        "carol's playlist entries"
+    );
+}
+
+#[tokio::test]
+async fn b37_delete_user_with_data_answers_204_and_removes_everything() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner_t, bob_t, bob, carol) = b37_setup(&state, &app).await;
+    let before = b35_user_rows(&state, bob).await;
+    for table in [
+        "user_item_data.user_id",
+        "pinned_episodes.user_id",
+        "playlists.user_id",
+        "collections.user_id",
+        "display_preferences.user_id",
+        "password_reset_pins.user_id",
+        "access_tokens.user_id",
+    ] {
+        assert!(
+            before[table] > 0,
+            "the setup gave bob no {table} row: {before:?}"
+        );
+    }
+    assert_eq!(b37_playlist_entries(&state, bob).await, 2);
+    let carol_before = b35_user_rows(&state, carol).await;
+
+    let resp = app
+        .clone()
+        .oneshot(request(
+            "DELETE",
+            &format!("/Users/{bob}"),
+            Some(&owner_t),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NO_CONTENT,
+        "DELETE /Users/{{id}}"
+    );
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    assert!(bytes.is_empty(), "a 204 has no body");
+
+    b37_assert_bob_gone(&state, &app, &owner_t, &bob_t, bob, carol, &carol_before).await;
+}
+
+#[tokio::test]
+async fn b37_post_delete_removes_a_user_with_data() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner_t, bob_t, bob, carol) = b37_setup(&state, &app).await;
+    let carol_before = b35_user_rows(&state, carol).await;
+
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            &format!("/Users/{bob}/Delete"),
+            Some(&owner_t),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "POST /Users/{{id}}/Delete: {body}");
+
+    b37_assert_bob_gone(&state, &app, &owner_t, &bob_t, bob, carol, &carol_before).await;
+}
+
+#[tokio::test]
+async fn b37_delete_user_refusals() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner_t, owner, bob_t, bob) = b35_users(&app).await;
+    // Dana is a second administrator who is not the owner.
+    let dana_t = b35_new_user(&app, &owner_t, "dana").await;
+    let (_, me) = send(&app, request("GET", "/Users/Me", Some(&dana_t), None)).await;
+    let dana: uuid::Uuid = me["Id"].as_str().unwrap().parse().unwrap();
+    sqlx::query("UPDATE users SET is_administrator = 1 WHERE id = ?")
+        .bind(dana.to_string())
+        .execute(&state.db)
+        .await
+        .unwrap();
+    let unknown = uuid::Uuid::new_v4();
+
+    for (method, suffix) in [("DELETE", ""), ("POST", "/Delete")] {
+        let cases = [
+            ("an unknown id", &dana_t, unknown, StatusCode::NOT_FOUND),
+            ("the owner", &dana_t, owner, StatusCode::FORBIDDEN),
+            ("the caller", &dana_t, dana, StatusCode::BAD_REQUEST),
+            ("a non-admin caller", &bob_t, dana, StatusCode::FORBIDDEN),
+        ];
+        for (what, token, id, expected) in cases {
+            let (status, body) = send(
+                &app,
+                request(method, &format!("/Users/{id}{suffix}"), Some(token), None),
+            )
+            .await;
+            assert_eq!(
+                status, expected,
+                "{method} /Users/{{id}}{suffix} on {what}: {body}"
+            );
+        }
+    }
+    for (id, who) in [(owner, "owner"), (bob, "bob"), (dana, "dana")] {
+        assert_eq!(
+            b35_user_rows(&state, id).await["users.id"],
+            1,
+            "{who} still exists"
+        );
+    }
+    let (status, _) = send(&app, request("GET", "/Users/Me", Some(&dana_t), None)).await;
+    assert_eq!(status, StatusCode::OK, "the caller's token still works");
+}
+
 // ══════════════════════════════════════════════════════════════════════════
 // G2: sessions, reset PIN, login limit (R1-01, R1-08, R1-09, M-15, M-16, M-17)
 // These drive the HTTP surface and so compile on the base build; they fail at

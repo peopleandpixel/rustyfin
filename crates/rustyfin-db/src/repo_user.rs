@@ -291,11 +291,27 @@ pub async fn update_last_login(pool: &SqlitePool, id: Uuid) -> Result<(), sqlx::
     Ok(())
 }
 
+/// Deletes the user and every row of theirs in one transaction. The listed keys have no ON DELETE
+/// action, so the rows that reference the user go first. Returns whether the users row existed.
 pub async fn delete_user(pool: &SqlitePool, id: Uuid) -> Result<bool, sqlx::Error> {
+    let id = id.to_string();
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    for sql in [
+        "DELETE FROM user_item_data WHERE user_id = ?",
+        "DELETE FROM pinned_episodes WHERE user_id = ?",
+        "DELETE FROM display_preferences WHERE user_id = ?",
+        "DELETE FROM playlists WHERE user_id = ?",
+        "DELETE FROM collections WHERE user_id = ?",
+        "DELETE FROM password_reset_pins WHERE user_id = ?",
+        "DELETE FROM access_tokens WHERE user_id = ?",
+    ] {
+        sqlx::query(sql).bind(&id).execute(&mut *tx).await?;
+    }
     let result = sqlx::query("DELETE FROM users WHERE id = ?")
-        .bind(id.to_string())
-        .execute(pool)
+        .bind(&id)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
     Ok(result.rows_affected() > 0)
 }
 
