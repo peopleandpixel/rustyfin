@@ -55,7 +55,8 @@ pub struct ScanChanges {
     pub added: u32,
     /// Items that the scan no longer collected, and deleted.
     pub removed: u32,
-    /// Existing items that got probe steps again, because their files changed.
+    /// Existing items that got probe steps again, because their files changed or an older probe
+    /// read them.
     pub reread: u32,
 }
 
@@ -367,6 +368,10 @@ async fn scan_flat_library(
             .into_iter()
             .collect();
 
+    // The audio sources that an older probe wrote, by path. Their files are read again, once.
+    let outdated = scan_sync::outdated_audio_sources(pool, library.id, &filter).await?;
+    let rereads = scan_sync::RereadGate::new();
+
     // Collect new items for batch insert in a single transaction
     let mut new_items: Vec<MediaItem> = Vec::new();
     // Probe plans. The plans of new items wait in `new_plans` until their rows are inserted.
@@ -425,6 +430,14 @@ async fn scan_flat_library(
             // Skip if this exact file path already exists (in-memory check)
             if existing_paths.contains(&file_path) {
                 existing_count += 1;
+                // An audio file that an older probe wrote is read again, once, when
+                // `rereads` opens.
+                if let Some(&item_id) = outdated.get(&file_path)
+                    && rereads.open().await
+                {
+                    reread += 1;
+                    plans.push((item_id, vec![probe::ProbeStep::Primary(file_path.clone())]));
+                }
                 continue;
             }
 
@@ -473,8 +486,15 @@ async fn scan_flat_library(
     // The items whose file is gone are read first: a group with no owner may take one over.
     let gone =
         scan_sync::gone_items(pool, library, &filter, &collected, &unreadable, &loops).await?;
-    let outcomes =
-        scan_sync::reconcile_movie_groups(pool, library.id, &filter, &movie_groups, &gone).await?;
+    let outcomes = scan_sync::reconcile_movie_groups(
+        pool,
+        library.id,
+        &filter,
+        &movie_groups,
+        &gone,
+        &rereads,
+    )
+    .await?;
     for (group, outcome) in movie_groups.iter().zip(outcomes) {
         match outcome {
             scan_sync::GroupOutcome::Existing { item_id, steps } => {
@@ -583,6 +603,7 @@ async fn scan_tv_library(
     let mut plans: Vec<(Uuid, Vec<probe::ProbeStep>)> = Vec::new();
     let mut existing_count = 0u32;
     let mut reread = 0u32;
+    let rereads = scan_sync::RereadGate::new();
     let mut new_item_ids: Vec<Uuid> = Vec::new();
 
     // Load all existing paths into a HashSet for O(1) existence checks.
@@ -834,9 +855,15 @@ async fn scan_tv_library(
     // The items whose file is gone are read first: a group with no owner may take one over.
     let gone =
         scan_sync::gone_items(pool, library, &filter, &collected, &unreadable, &loops).await?;
-    let outcomes =
-        scan_sync::reconcile_episode_groups(pool, library.id, &filter, &episode_groups, &gone)
-            .await?;
+    let outcomes = scan_sync::reconcile_episode_groups(
+        pool,
+        library.id,
+        &filter,
+        &episode_groups,
+        &gone,
+        &rereads,
+    )
+    .await?;
     let mut new_episodes: Vec<MediaItem> = Vec::new();
     let mut new_episode_plans: Vec<(Uuid, Vec<probe::ProbeStep>)> = Vec::new();
     for (group, outcome) in episode_groups.iter().zip(outcomes) {
@@ -928,13 +955,16 @@ async fn scan_music_library(
     ticket: &ScanTicket,
     counted: bool,
 ) -> Result<(ScanChanges, Vec<Uuid>), sqlx::Error> {
-    let _guard = SCAN_LOCK.lock().await;
+    let guard = SCAN_LOCK.lock().await;
     ticket.start();
     let filter = path_scope(scope);
     let mut count = 0u32;
     let mut existing_count = 0u32;
     let mut reread = 0u32;
+    let rereads = scan_sync::RereadGate::new();
     let mut new_item_ids: Vec<Uuid> = Vec::new();
+    // Probe plans of the old tracks, read again under the scan lock, see the end of the scan.
+    let mut plans: Vec<(Uuid, Vec<probe::ProbeStep>)> = Vec::new();
 
     // Load all existing paths into a HashSet for O(1) existence checks.
     let existing_paths: HashSet<String> =
@@ -942,6 +972,9 @@ async fn scan_music_library(
             .await?
             .into_iter()
             .collect();
+
+    // The audio sources that an older probe wrote, by path. Their tracks are read again, once.
+    let outdated = scan_sync::outdated_audio_sources(pool, library.id, &filter).await?;
 
     // The source of each known track, by path: its item, and the stamp that it stores.
     let known_tracks: HashMap<String, (Uuid, Option<i64>, Option<i64>)> =
@@ -1030,9 +1063,16 @@ async fn scan_music_library(
             // Skip if already exists (in-memory check)
             if existing_paths.contains(&file_path) {
                 existing_count += 1;
-                // A track whose file changed since it was stamped is probed again, under the same item.
-                // A track that was never stamped is stamped now, without a probe.
-                if let Some(&(item_id, size, modified)) = known_tracks.get(&file_path) {
+                // A track whose source an older probe wrote is read again by this scan's probe
+                // plans, which hold the scan lock until they end, when `rereads` opens. A track
+                // whose file changed since it was stamped is probed again, under the same item. A
+                // track that was never stamped is stamped now, without a probe.
+                if let Some(&item_id) = outdated.get(&file_path)
+                    && rereads.open().await
+                {
+                    reread += 1;
+                    plans.push((item_id, vec![probe::ProbeStep::Primary(file_path.clone())]));
+                } else if let Some(&(item_id, size, modified)) = known_tracks.get(&file_path) {
                     if modified.is_none() {
                         let stamp = scan_sync::file_stamp(&file_path);
                         scan_sync::store_stamp(pool, &item_id.to_string(), &file_path, stamp)
@@ -1334,6 +1374,13 @@ async fn scan_music_library(
         library.name,
         count,
         existing_count
+    );
+    spawn_plans_under_lock(
+        pool.clone(),
+        guard,
+        library.name.clone(),
+        plans,
+        ticket.clone(),
     );
     let changes = ScanChanges {
         added: count,

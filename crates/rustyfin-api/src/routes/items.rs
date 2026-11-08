@@ -1710,8 +1710,21 @@ async fn get_item(
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<MediaItem>, ApiError> {
     let id_str = id.to_string();
-    // The details every user sees; the requester's watch data is added below.
-    let mut item = match state.cache.item_details.get(&id_str) {
+    // The details every user sees; the requester's watch data is added below. A scan that reads
+    // a file again replaces the item's sources, with new ids, so a cached copy is served only
+    // while its source ids are still the stored ones.
+    let cached = match state.cache.item_details.get(&id_str) {
+        Some(cached) => {
+            let mut cached_ids: Vec<String> =
+                cached.media_sources.iter().map(|s| s.id.clone()).collect();
+            cached_ids.sort();
+            let stored =
+                rustyfin_db::repo_media_source::get_media_source_ids(&state.db_ro, &id).await;
+            stored.is_ok_and(|ids| ids == cached_ids).then_some(cached)
+        }
+        None => None,
+    };
+    let mut item = match cached {
         Some(cached) => cached,
         None => {
             let mut item = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, id)

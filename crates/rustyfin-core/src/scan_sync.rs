@@ -9,6 +9,7 @@ use std::time::UNIX_EPOCH;
 
 use chrono::{DateTime, FixedOffset, Utc};
 use rustyfin_db::repo_media::PathScope;
+use rustyfin_db::repo_media_source::PROBE_VERSION;
 use rustyfin_model::library::{Library, LibraryContentType};
 use sqlx::{SqliteConnection, SqlitePool};
 use uuid::Uuid;
@@ -606,6 +607,63 @@ pub(crate) async fn store_stamp(
     Ok(())
 }
 
+/// Whether a scan may read the files of older probes again. It runs `ffprobe -version` once, before
+/// the scan's first re-read; when ffprobe does not run, the scan reads no file again for its
+/// version, so that no re-read fails and every old source stays.
+#[derive(Default)]
+pub struct RereadGate(tokio::sync::OnceCell<bool>);
+
+impl RereadGate {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether the scan may read a file of an older probe again. Logs one warning when it may not.
+    pub async fn open(&self) -> bool {
+        *self
+            .0
+            .get_or_init(|| async {
+                let runs = crate::probe::ffprobe_runs().await;
+                if !runs {
+                    tracing::warn!(
+                        "ffprobe does not run, so this scan reads no file of an older probe again"
+                    );
+                }
+                runs
+            })
+            .await
+    }
+}
+
+/// The audio sources in `scope` that an older probe wrote, as source path -> item id. A scan
+/// reads each such file again, once: the probe stores the current [`PROBE_VERSION`]. A source whose
+/// file failed to probe with the stamp it stores is left out: that file is read again only once it
+/// changes, as the stamp check of a scan finds it.
+pub(crate) async fn outdated_audio_sources(
+    pool: &SqlitePool,
+    library_id: Uuid,
+    scope: &PathScope,
+) -> Result<HashMap<String, Uuid>, sqlx::Error> {
+    let rows: Vec<(String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT s.path, s.item_id FROM media_sources AS s
+         JOIN media_items AS m ON m.id = s.item_id
+         WHERE m.library_id = ?1 AND m.media_type = 'Audio' AND s.probe_version < ?2
+           AND NOT EXISTS (SELECT 1 FROM probe_failures AS f
+                           WHERE f.path = s.path AND f.size = s.size AND f.modified = s.modified)
+           AND {}",
+        scope.sql("s.path", 3)
+    )))
+    .bind(library_id.to_string())
+    .bind(PROBE_VERSION)
+    .bind(scope.param())
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(path, id)| Uuid::parse_str(&id).ok().map(|id| (path, id)))
+        .collect())
+}
+
 /// An item of the library, as [`reconcile_groups`] reads it.
 #[derive(sqlx::FromRow)]
 struct ItemRow {
@@ -632,6 +690,8 @@ struct SourceRow {
     /// The size and modification time of the file when the source was stamped.
     size: Option<i64>,
     modified: Option<i64>,
+    /// The [`PROBE_VERSION`] of the probe that wrote the source.
+    probe_version: i64,
 }
 
 /// The fields that a group gives its item, by media type.
@@ -680,6 +740,7 @@ pub async fn reconcile_movie_groups(
     scope: &PathScope,
     groups: &[VersionGroup],
     gone: &HashSet<String>,
+    rereads: &RereadGate,
 ) -> Result<Vec<GroupOutcome>, sqlx::Error> {
     let wanted: Vec<WantedGroup> = groups
         .iter()
@@ -691,7 +752,7 @@ pub async fn reconcile_movie_groups(
             },
         })
         .collect();
-    reconcile_groups(pool, library_id, "Movie", scope, &wanted, gone).await
+    reconcile_groups(pool, library_id, "Movie", scope, &wanted, gone, rereads).await
 }
 
 /// One episode's files in version order, and the fields that the episode gives its item. `series_id` is the
@@ -717,6 +778,7 @@ pub async fn reconcile_episode_groups(
     scope: &PathScope,
     groups: &[EpisodeGroup],
     gone: &HashSet<String>,
+    rereads: &RereadGate,
 ) -> Result<Vec<GroupOutcome>, sqlx::Error> {
     let wanted: Vec<WantedGroup> = groups
         .iter()
@@ -736,7 +798,7 @@ pub async fn reconcile_episode_groups(
             },
         })
         .collect();
-    reconcile_groups(pool, library_id, "Episode", scope, &wanted, gone).await
+    reconcile_groups(pool, library_id, "Episode", scope, &wanted, gone, rereads).await
 }
 
 /// Settles the groups of one media type in the library. The outcomes are in the order of `groups`.
@@ -755,6 +817,7 @@ async fn reconcile_groups(
     scope: &PathScope,
     groups: &[WantedGroup],
     gone: &HashSet<String>,
+    rereads: &RereadGate,
 ) -> Result<Vec<GroupOutcome>, sqlx::Error> {
     let library = library_id.to_string();
     // An item is loaded when its path is in `scope`, or when one of its sources is.
@@ -776,7 +839,7 @@ async fn reconcile_groups(
     .fetch_all(pool)
     .await?;
     let sources: Vec<SourceRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT s.item_id, s.path, s.run_time_ticks, s.size, s.modified
+        "SELECT s.item_id, s.path, s.run_time_ticks, s.size, s.modified, s.probe_version
          FROM media_sources AS s
          JOIN media_items AS m ON m.id = s.item_id
          WHERE m.library_id = ?1 AND m.media_type = ?2 AND {loaded}
@@ -839,12 +902,15 @@ async fn reconcile_groups(
     let mut unowned: Vec<(usize, Vec<String>)> = Vec::new();
     for idx in order {
         let group = &groups[idx];
-        // The files that are not known failures, in order. The primary is the first of them, or the
-        // group's first file when none is left.
+        // The files that are not known failures, in order, and the known failures that an item
+        // still has a source at: a failed re-read keeps the source of an unchanged file. The
+        // primary is the first of them, or the group's first file when none is left.
         let probeable: Vec<String> = group
             .files
             .iter()
-            .filter(|file| !is_known_failure(file, &failures))
+            .filter(|file| {
+                by_source.contains_key(file.as_str()) || !is_known_failure(file, &failures)
+            })
             .cloned()
             .collect();
         let primary = probeable.first().unwrap_or(&group.files[0]);
@@ -873,6 +939,8 @@ async fn reconcile_groups(
             survivor,
             others,
             survivor_sources,
+            &failures,
+            rereads,
         )
         .await?;
         outcomes.push((idx, outcome));
@@ -922,7 +990,18 @@ async fn reconcile_groups(
                         survivor.id
                     );
                 }
-                settle_group(pool, group, &probeable, primary, survivor, others, &[]).await?
+                settle_group(
+                    pool,
+                    group,
+                    &probeable,
+                    primary,
+                    survivor,
+                    others,
+                    &[],
+                    &failures,
+                    rereads,
+                )
+                .await?
             }
             None => GroupOutcome::New {
                 path: primary.clone(),
@@ -1022,6 +1101,7 @@ fn episode_season(path: &str, stored: Option<i32>) -> Option<i32> {
 /// Settles one group whose owners are known. Merges the other owners into the survivor, writes the
 /// survivor's fields that changed (its path becomes `primary`), stamps the sources that have no
 /// stamp yet, and works out what to probe: the `probeable` files, when the group is not steady.
+#[allow(clippy::too_many_arguments)]
 async fn settle_group(
     pool: &SqlitePool,
     group: &WantedGroup,
@@ -1030,6 +1110,8 @@ async fn settle_group(
     survivor: &ItemRow,
     others: &[&ItemRow],
     sources: &[&SourceRow],
+    failures: &HashMap<String, (i64, i64)>,
+    rereads: &RereadGate,
 ) -> Result<GroupOutcome, sqlx::Error> {
     // The survivor's path and names before this scan. A name that the old code made from the file
     // stem is rewritten; a name that metadata set is kept.
@@ -1134,10 +1216,13 @@ async fn settle_group(
         )
         .await?;
     }
-    // Steady state: nothing else owns the group, the survivor is at the primary, its sources are the
-    // probeable files, in order, with the right duration, and none of their files changed. Otherwise
-    // they are probed again. A changed file makes the whole group probe again, so that its versions
-    // stay in step. A primary with no duration cannot be fixed by probing, so it counts as right.
+    // Steady state: nothing else owns the group, the survivor is at the primary, its sources are
+    // the probeable files, in order, with the right duration, and none of their files changed.
+    // Otherwise they are probed again. A changed file makes the whole group probe again, so that
+    // its versions stay in step. A primary with no duration cannot be fixed by probing, so it
+    // counts as right. A source that an older probe wrote also makes the group probe again, but
+    // only while the scan's gate is open: the gate is asked only for a group that is otherwise
+    // settled, and a closed gate keeps it steady.
     let source_paths_match = sources
         .iter()
         .map(|source| source.path.as_str())
@@ -1148,11 +1233,17 @@ async fn settle_group(
     let changed = sources
         .iter()
         .any(|source| source_changed(&source.path, source.size, source.modified));
-    let steady = others.is_empty()
+    // A source that an older probe wrote is read again, once, for the fields that probe missed. A
+    // file that failed to probe is not: it is read again only once it changes.
+    let outdated = sources.iter().any(|source| {
+        source.probe_version < PROBE_VERSION && !is_known_failure(&source.path, failures)
+    });
+    let settled = others.is_empty()
         && survivor.path == primary
         && source_paths_match
         && !changed
         && (probeable.is_empty() || runtime_match);
+    let steady = settled && !(outdated && rereads.open().await);
     let steps = if steady {
         Vec::new()
     } else {

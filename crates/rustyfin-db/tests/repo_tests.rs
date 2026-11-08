@@ -1138,3 +1138,70 @@ async fn test_batch_upsert_media_items_round_trip() {
         assert_eq!(stored.popularity, Some(12.5));
     }
 }
+
+/// B26 review 1, finding 2: `save_chapters` saves all of an item's chapters or none of them. A save
+/// that fails part way, here at a second chapter with the first one's id, leaves the chapters that
+/// the item had before.
+#[tokio::test]
+async fn test_save_chapters_keeps_the_old_ones_when_it_fails() {
+    let temp_db = test_pool().await;
+    let pool = temp_db.pool.clone();
+    let lib = make_library("Movies", LibraryContentType::Movies);
+    rustyfin_db::repo_library::create_library(&pool, &lib)
+        .await
+        .unwrap();
+    let item_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO media_items (id, library_id, name, media_type, path) VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(item_id.to_string())
+    .bind(lib.id.to_string())
+    .bind("Sample Movie")
+    .bind("Movie")
+    .bind("/media/movies/sample.mkv")
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let chapter = |id: &str, number: i32| rustyfin_model::chapter::Chapter {
+        id: id.to_string(),
+        item_id: item_id.to_string(),
+        chapter_number: number,
+        name: format!("Chapter {number}"),
+        start_position_ticks: i64::from(number - 1) * 10_000_000,
+        end_position_ticks: i64::from(number) * 10_000_000,
+        image_path: None,
+    };
+    rustyfin_db::repo_chapter::save_chapters(
+        &pool,
+        item_id,
+        vec![chapter("c1", 1), chapter("c2", 2)],
+    )
+    .await
+    .unwrap();
+
+    let failed = rustyfin_db::repo_chapter::save_chapters(
+        &pool,
+        item_id,
+        vec![chapter("c3", 1), chapter("c3", 2)],
+    )
+    .await;
+    assert!(
+        failed.is_err(),
+        "two chapters with one id were saved: {failed:?}"
+    );
+    let kept: Vec<(String, String)> = rustyfin_db::repo_chapter::get_chapters(&pool, item_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|chapter| (chapter.id, chapter.name))
+        .collect();
+    assert_eq!(
+        kept,
+        [
+            ("c1".to_string(), "Chapter 1".to_string()),
+            ("c2".to_string(), "Chapter 2".to_string())
+        ],
+        "the failed save left part of its chapters"
+    );
+}

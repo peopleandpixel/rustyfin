@@ -15014,6 +15014,228 @@ async fn b22_playback_info_lists_external_subtitles() {
     }
 }
 
+// ── B26: re-read old streams ──
+//
+// A scan that reads a file again replaces the item's sources. Item details show the new source
+// and the languages and titles of its streams, though they were cached.
+
+/// (Index, Language, Title) of each stream of a `MediaStreams` array.
+fn b26_labels(streams: &serde_json::Value) -> Vec<(i64, Option<String>, Option<String>)> {
+    streams
+        .as_array()
+        .unwrap_or_else(|| panic!("MediaStreams is not an array: {streams}"))
+        .iter()
+        .map(|stream| {
+            let text = |key: &str| stream[key].as_str().map(str::to_string);
+            (
+                stream["Index"].as_i64().expect("a stream has an Index"),
+                text("Language"),
+                text("Title"),
+            )
+        })
+        .collect()
+}
+
+/// ffmpeg. B26 criteria 4 and 11 for a video: once a scan has read the file again, `GET
+/// /Items/{id}` shows the new source and the languages and titles of its streams, and so does
+/// PlaybackInfo for that source. A video's details never come from the cache, because their
+/// `MediaType` ("Video") does not read back, so this passed before B26 too.
+#[tokio::test]
+async fn b26_item_details_show_the_streams_of_a_reread() {
+    if !g4_have_ffmpeg("b26_item_details_show_the_streams_of_a_reread") {
+        return;
+    }
+    let state = test_state().await;
+    let _dir = G4Dir(state.data_dir.to_path_buf());
+    let (token, _) = admin_session(&state).await;
+    let folder = media_folder(&state, "b26-reread");
+    let srt = state.data_dir.join("b26.srt");
+    std::fs::write(&srt, "1\n00:00:00,000 --> 00:00:01,500\nHello\n").unwrap();
+    let file = format!("{folder}/Tracks (2001).mkv");
+    g4_make_media(&[
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc=size=64x48:rate=5:duration=2",
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=duration=2",
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=880:duration=2",
+        "-i",
+        srt.to_str().unwrap(),
+        "-map",
+        "0:v",
+        "-map",
+        "1:a",
+        "-map",
+        "2:a",
+        "-map",
+        "3:s",
+        "-c:v",
+        "mpeg4",
+        "-c:a",
+        "aac",
+        "-c:s",
+        "srt",
+        "-metadata:s:a:0",
+        "language=eng",
+        "-metadata:s:a:0",
+        "title=Main",
+        "-metadata:s:a:1",
+        "language=spa",
+        "-metadata:s:a:1",
+        "title=Commentary",
+        "-metadata:s:s:0",
+        "language=ita",
+        "-metadata:s:s:0",
+        "title=Signs",
+        &file,
+    ]);
+    let id = g4_insert_item(&state, "Movie", std::path::Path::new(&file)).await;
+    rustyfin_core::probe::probe_and_save(&state.db, &id, &file)
+        .await
+        .unwrap();
+    // The streams as the probe before 06fda0d stored them
+    sqlx::query("UPDATE media_streams SET language = NULL, title = NULL")
+        .execute(&state.db)
+        .await
+        .unwrap();
+    let app = app(state.clone());
+    let uri = format!("/Items/{id}");
+    let (status, old) = send(&app, request("GET", &uri, Some(&token), None)).await;
+    assert_eq!(status, StatusCode::OK, "{old}");
+    let bare: Vec<(i64, Option<String>, Option<String>)> =
+        (0..4).map(|index| (index, None, None)).collect();
+    assert_eq!(b26_labels(&old["MediaStreams"]), bare);
+
+    // A scan reads the file again
+    rustyfin_core::probe::probe_and_save(&state.db, &id, &file)
+        .await
+        .unwrap();
+    let source: String = sqlx::query_scalar("SELECT id FROM media_sources WHERE item_id = ?1")
+        .bind(id.to_string())
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_ne!(
+        old["MediaSources"][0]["Id"],
+        source.as_str(),
+        "the re-read kept the source id, which tells the cache that its copy is old"
+    );
+    let label = |index: i64, language: &str, title: &str| {
+        (index, Some(language.to_string()), Some(title.to_string()))
+    };
+    let labelled = vec![
+        (0, None, None),
+        label(1, "eng", "Main"),
+        label(2, "spa", "Commentary"),
+        label(3, "ita", "Signs"),
+    ];
+
+    let (status, item) = send(&app, request("GET", &uri, Some(&token), None)).await;
+    assert_eq!(status, StatusCode::OK, "{item}");
+    assert_eq!(
+        item["MediaSources"][0]["Id"],
+        source.as_str(),
+        "the details show a source that is gone"
+    );
+    assert_eq!(b26_labels(&item["MediaStreams"]), labelled);
+    assert_eq!(
+        b26_labels(&item["MediaSources"][0]["MediaStreams"]),
+        labelled
+    );
+
+    let uri = format!("/Videos/{id}/PlaybackInfo?MediaSourceId={source}");
+    let (status, info) = send(&app, request("GET", &uri, Some(&token), None)).await;
+    assert_eq!(status, StatusCode::OK, "{info}");
+    assert_eq!(info["MediaSources"][0]["Id"], source.as_str());
+    assert_eq!(
+        b26_labels(&info["MediaSources"][0]["MediaStreams"]),
+        labelled
+    );
+}
+
+/// ffmpeg. B26 criterion 11: a music track's details read back from the cache, which
+/// `GET /Items/{id}` filled with the track's old source. Once a scan has read the track again,
+/// the details show the new source and the language and title of its stream, and so does
+/// PlaybackInfo for that source.
+#[tokio::test]
+async fn b26_cached_track_details_show_the_stream_of_a_reread() {
+    if !g4_have_ffmpeg("b26_cached_track_details_show_the_stream_of_a_reread") {
+        return;
+    }
+    let state = test_state().await;
+    let _dir = G4Dir(state.data_dir.to_path_buf());
+    let (token, _) = admin_session(&state).await;
+    let folder = media_folder(&state, "b26-track");
+    let file = format!("{folder}/01 Song.ogg");
+    g4_make_media(&[
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=duration=1",
+        "-c:a",
+        "flac",
+        "-metadata:s:a:0",
+        "language=ita",
+        "-metadata:s:a:0",
+        "title=Song",
+        &file,
+    ]);
+    let id = g4_insert_item(&state, "Audio", std::path::Path::new(&file)).await;
+    rustyfin_core::probe::probe_and_save(&state.db, &id, &file)
+        .await
+        .unwrap();
+    // The stream as the probe before 06fda0d stored it
+    sqlx::query("UPDATE media_streams SET language = NULL, title = NULL")
+        .execute(&state.db)
+        .await
+        .unwrap();
+    let app = app(state.clone());
+    let uri = format!("/Items/{id}");
+    let (status, old) = send(&app, request("GET", &uri, Some(&token), None)).await;
+    assert_eq!(status, StatusCode::OK, "{old}");
+    assert_eq!(b26_labels(&old["MediaStreams"]), [(0, None, None)]);
+
+    // A scan reads the track again
+    rustyfin_core::probe::probe_and_save(&state.db, &id, &file)
+        .await
+        .unwrap();
+    let source: String = sqlx::query_scalar("SELECT id FROM media_sources WHERE item_id = ?1")
+        .bind(id.to_string())
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_ne!(old["MediaSources"][0]["Id"], source.as_str());
+    let labelled = [(0, Some("ita".to_string()), Some("Song".to_string()))];
+
+    let (status, item) = send(&app, request("GET", &uri, Some(&token), None)).await;
+    assert_eq!(status, StatusCode::OK, "{item}");
+    assert_eq!(
+        item["MediaSources"][0]["Id"],
+        source.as_str(),
+        "the details show a source that is gone"
+    );
+    assert_eq!(b26_labels(&item["MediaStreams"]), labelled);
+    assert_eq!(
+        b26_labels(&item["MediaSources"][0]["MediaStreams"]),
+        labelled
+    );
+
+    let uri = format!("/Audio/{id}/PlaybackInfo?MediaSourceId={source}");
+    let (status, info) = send(&app, request("GET", &uri, Some(&token), None)).await;
+    assert_eq!(status, StatusCode::OK, "{info}");
+    assert_eq!(info["MediaSources"][0]["Id"], source.as_str());
+    assert_eq!(
+        b26_labels(&info["MediaSources"][0]["MediaStreams"]),
+        labelled
+    );
+}
+
 // ── B16: media source selection ──
 //
 // A movie with two versions, each a media source on its own file. `MediaSourceId` picks the
