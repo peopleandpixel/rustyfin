@@ -110,42 +110,54 @@ async fn playing(
         subtitle = ?req.subtitle_stream_index,
         "Playback started"
     );
-    let position = req.position_ticks.unwrap_or(0);
-    rustyfin_db::repo_playback::update_playback_position(
-        &state.db,
-        claims.sub,
-        req.item_id,
-        position,
-    )
-    .await?;
+    // Jellyfin writes user data only for an item it finds, and has no now-playing item for one it
+    // does not (SessionManager.OnPlaybackStart), so a non-media id stores nothing and reports null.
+    let is_media = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, req.item_id)
+        .await?
+        .is_some();
+    if is_media {
+        let position = req.position_ticks.unwrap_or(0);
+        rustyfin_db::repo_playback::update_playback_position(
+            &state.db,
+            claims.sub,
+            req.item_id,
+            position,
+        )
+        .await?;
 
-    let (audio, subtitle) = reported_choices(
-        &state,
-        req.item_id,
-        req.media_source_id.as_deref(),
-        req.audio_stream_index,
-        req.subtitle_stream_index,
-    )
-    .await?;
-    rustyfin_db::repo_playback::save_stream_choice(
-        &state.db,
-        claims.sub,
-        req.item_id,
-        audio.as_ref(),
-        subtitle.as_ref(),
-    )
-    .await?;
+        let (audio, subtitle) = reported_choices(
+            &state,
+            req.item_id,
+            req.media_source_id.as_deref(),
+            req.audio_stream_index,
+            req.subtitle_stream_index,
+        )
+        .await?;
+        rustyfin_db::repo_playback::save_stream_choice(
+            &state.db,
+            claims.sub,
+            req.item_id,
+            audio.as_ref(),
+            subtitle.as_ref(),
+        )
+        .await?;
+    }
 
+    let now_playing = if is_media {
+        serde_json::json!({
+            "Id": req.item_id.to_string(),
+            "Name": req.item_name.as_deref().unwrap_or(""),
+        })
+    } else {
+        serde_json::Value::Null
+    };
     // Broadcast SessionChanged event so clients see the now-playing item update
     broadcast_event(
         &state,
         WsEvent::SessionChanged {
             data: serde_json::json!({
                 "UserId": claims.sub.to_string(),
-                "NowPlayingItem": {
-                    "Id": req.item_id.to_string(),
-                    "Name": req.item_name.as_deref().unwrap_or(""),
-                }
+                "NowPlayingItem": now_playing,
             }),
         },
     )
@@ -167,44 +179,55 @@ async fn playing_progress(
         subtitle = ?req.subtitle_stream_index,
         "Playback progress"
     );
-    if let Some(position) = req.position_ticks {
-        rustyfin_db::repo_playback::update_playback_position(
+    // Same as `playing`: a non-media id stores nothing and reports a null now-playing item.
+    let is_media = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, req.item_id)
+        .await?
+        .is_some();
+    if is_media {
+        if let Some(position) = req.position_ticks {
+            rustyfin_db::repo_playback::update_playback_position(
+                &state.db,
+                claims.sub,
+                req.item_id,
+                position,
+            )
+            .await?;
+        }
+
+        let (audio, subtitle) = reported_choices(
+            &state,
+            req.item_id,
+            req.media_source_id.as_deref(),
+            req.audio_stream_index,
+            req.subtitle_stream_index,
+        )
+        .await?;
+        rustyfin_db::repo_playback::save_stream_choice(
             &state.db,
             claims.sub,
             req.item_id,
-            position,
+            audio.as_ref(),
+            subtitle.as_ref(),
         )
         .await?;
     }
 
-    let (audio, subtitle) = reported_choices(
-        &state,
-        req.item_id,
-        req.media_source_id.as_deref(),
-        req.audio_stream_index,
-        req.subtitle_stream_index,
-    )
-    .await?;
-    rustyfin_db::repo_playback::save_stream_choice(
-        &state.db,
-        claims.sub,
-        req.item_id,
-        audio.as_ref(),
-        subtitle.as_ref(),
-    )
-    .await?;
-
+    let now_playing = if is_media {
+        serde_json::json!({
+            "Id": req.item_id.to_string(),
+            "Name": req.item_name.as_deref().unwrap_or(""),
+            "PositionTicks": req.position_ticks,
+        })
+    } else {
+        serde_json::Value::Null
+    };
     // Broadcast SessionChanged event with updated playback position
     broadcast_event(
         &state,
         WsEvent::SessionChanged {
             data: serde_json::json!({
                 "UserId": claims.sub.to_string(),
-                "NowPlayingItem": {
-                    "Id": req.item_id.to_string(),
-                    "Name": req.item_name.as_deref().unwrap_or(""),
-                    "PositionTicks": req.position_ticks,
-                },
+                "NowPlayingItem": now_playing,
                 "IsPaused": req.is_paused.unwrap_or(false),
             }),
         },
@@ -227,30 +250,36 @@ async fn playing_stopped(
         subtitle = ?req.subtitle_stream_index,
         "Playback stopped"
     );
-    rustyfin_db::repo_playback::on_playback_stopped(
-        &state.db,
-        claims.sub,
-        req.item_id,
-        req.position_ticks,
-    )
-    .await?;
+    // Same as `playing`: a non-media id stores nothing.
+    let is_media = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, req.item_id)
+        .await?
+        .is_some();
+    if is_media {
+        rustyfin_db::repo_playback::on_playback_stopped(
+            &state.db,
+            claims.sub,
+            req.item_id,
+            req.position_ticks,
+        )
+        .await?;
 
-    let (audio, subtitle) = reported_choices(
-        &state,
-        req.item_id,
-        req.media_source_id.as_deref(),
-        req.audio_stream_index,
-        req.subtitle_stream_index,
-    )
-    .await?;
-    rustyfin_db::repo_playback::save_stream_choice(
-        &state.db,
-        claims.sub,
-        req.item_id,
-        audio.as_ref(),
-        subtitle.as_ref(),
-    )
-    .await?;
+        let (audio, subtitle) = reported_choices(
+            &state,
+            req.item_id,
+            req.media_source_id.as_deref(),
+            req.audio_stream_index,
+            req.subtitle_stream_index,
+        )
+        .await?;
+        rustyfin_db::repo_playback::save_stream_choice(
+            &state.db,
+            claims.sub,
+            req.item_id,
+            audio.as_ref(),
+            subtitle.as_ref(),
+        )
+        .await?;
+    }
 
     // Broadcast SessionChanged event to clear now-playing item
     broadcast_event(

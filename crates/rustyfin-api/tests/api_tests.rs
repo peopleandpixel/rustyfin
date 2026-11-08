@@ -11465,6 +11465,235 @@ async fn j5_user_data_on_a_real_item_still_works() {
     assert_eq!(actual, expected);
 }
 
+// B40: playback reports on a non-media id
+
+/// A library with one film (genre "Drama") whose source has two audio and two subtitle streams,
+/// and an administrator. Jellyfin writes user data for a playback report only when the item is
+/// found (SessionManager.cs `OnPlaybackStart`, `OnPlaybackProgress`, `OnPlaybackStopped`).
+struct B40 {
+    state: AppState,
+    app: axum::Router,
+    token: String,
+    user: uuid::Uuid,
+    library: uuid::Uuid,
+    film: uuid::Uuid,
+    _dir: G1cDataDir,
+}
+
+impl B40 {
+    async fn new() -> Self {
+        use rustyfin_model::library::LibraryContentType;
+        let state = test_state().await;
+        let _dir = G1cDataDir(state.data_dir.to_path_buf());
+        let (token, user) = admin_session(&state).await;
+        let library = j5_library(&state, "B40 Films", LibraryContentType::Movies).await;
+        let film = j5_item(&state, library, None, "B40 Film", "Movie", "Drama", None).await;
+        let folder = media_folder(&state, "B40 Film");
+        let file = std::path::Path::new(&folder).join("B40 Film.mkv");
+        std::fs::write(&file, b"b40").unwrap();
+        b20_insert_source(&state, film, &file, b20_full_streams()).await;
+        B40 {
+            app: app(state.clone()),
+            state,
+            token,
+            user,
+            library,
+            film,
+            _dir,
+        }
+    }
+
+    async fn post(&self, uri: &str, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+        send_authed(&self.app, "POST", uri, &self.token, Some(&body.to_string())).await
+    }
+
+    /// The id `/Genres` gives the film's genre.
+    async fn genre_id(&self) -> String {
+        let (status, genres) = send_authed(&self.app, "GET", "/Genres", &self.token, None).await;
+        assert_eq!(status, StatusCode::OK, "{genres}");
+        j5_id(&genres, "Drama")
+    }
+
+    /// How many user data rows the database holds.
+    async fn user_data_rows(&self) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM user_item_data")
+            .fetch_one(&self.state.db)
+            .await
+            .unwrap()
+    }
+
+    /// The film's stored position, played flag, audio and subtitle index, and whether it has a
+    /// last played date.
+    async fn film_data(&self) -> (i64, bool, Option<i64>, Option<i64>, bool) {
+        sqlx::query_as(
+            "SELECT playback_position_ticks, played, audio_stream_index, subtitle_stream_index, \
+             last_played_date IS NOT NULL FROM user_item_data WHERE user_id = ? AND item_id = ?",
+        )
+        .bind(self.user.to_string())
+        .bind(self.film.to_string())
+        .fetch_one(&self.state.db)
+        .await
+        .unwrap()
+    }
+}
+
+/// The `UserId` and `NowPlayingItem` of each `SessionChanged` event waiting in `events`.
+fn b40_session_changes(
+    events: &mut broadcast::Receiver<WsEvent>,
+) -> Vec<(serde_json::Value, serde_json::Value)> {
+    let mut changes = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let WsEvent::SessionChanged { data } = event {
+            changes.push((data["UserId"].clone(), data["NowPlayingItem"].clone()));
+        }
+    }
+    changes
+}
+
+#[tokio::test]
+async fn b40_session_reports_on_a_non_media_id_answer_200_and_store_nothing() {
+    let b = B40::new().await;
+    let mut events = b.state.ws_broadcast.subscribe();
+    let user = serde_json::json!(b.user.to_string());
+    // Jellyfin answers 204 and writes no user data when the item isn't found, and its session then
+    // has no now-playing item (SessionManager.cs:401, :429, :787, :1137). Rustyfin answers a real
+    // item's report with 200 `{}`, so these get the same.
+    let ids = [
+        ("genre", b.genre_id().await),
+        ("library", b.library.to_string()),
+        ("random", uuid::Uuid::new_v4().to_string()),
+        ("nil", uuid::Uuid::nil().to_string()),
+    ];
+    let mut actual = Vec::new();
+    let mut expected = Vec::new();
+    for (name, id) in &ids {
+        let reports = [
+            (
+                "/Sessions/Playing",
+                serde_json::json!({
+                    "ItemId": id, "ItemName": "Not media", "PositionTicks": 100,
+                    "AudioStreamIndex": 1, "SubtitleStreamIndex": 3,
+                }),
+            ),
+            (
+                "/Sessions/Playing/Progress",
+                serde_json::json!({
+                    "ItemId": id, "ItemName": "Not media", "PositionTicks": 200,
+                    "IsPaused": true, "AudioStreamIndex": 2, "SubtitleStreamIndex": 4,
+                }),
+            ),
+            (
+                "/Sessions/Playing/Stopped",
+                serde_json::json!({
+                    "ItemId": id, "PositionTicks": 300,
+                    "AudioStreamIndex": 1, "SubtitleStreamIndex": -1,
+                }),
+            ),
+        ];
+        for (uri, body) in reports {
+            let (status, answer) = b.post(uri, body).await;
+            let changes = b40_session_changes(&mut events);
+            actual.push((*name, uri, status, answer, changes));
+            expected.push((
+                *name,
+                uri,
+                StatusCode::OK,
+                serde_json::json!({}),
+                vec![(user.clone(), serde_json::Value::Null)],
+            ));
+        }
+    }
+    assert_eq!(actual, expected);
+    assert_eq!(b.user_data_rows().await, 0);
+}
+
+#[tokio::test]
+async fn b40_session_reports_on_a_movie_work_as_before() {
+    let b = B40::new().await;
+    let film = b.film.to_string();
+    let user = serde_json::json!(b.user.to_string());
+    let (status, _) = b
+        .post(
+            &format!("/Users/{}/PlayedItems/{film}", b.user),
+            serde_json::json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let mut events = b.state.ws_broadcast.subscribe();
+
+    // Start with no position stores 0 and the reported tracks; the film stays played.
+    let body = serde_json::json!({
+        "ItemId": film, "ItemName": "B40 Film", "AudioStreamIndex": 1, "SubtitleStreamIndex": 3,
+    });
+    let (status, answer) = b.post("/Sessions/Playing", body).await;
+    assert_eq!((status, answer), (StatusCode::OK, serde_json::json!({})));
+    assert_eq!(b.film_data().await, (0, true, Some(1), Some(3), true));
+    let now_playing = serde_json::json!({ "Id": film, "Name": "B40 Film" });
+    assert_eq!(
+        b40_session_changes(&mut events),
+        [(user.clone(), now_playing)]
+    );
+
+    // Progress stores the position; a missing subtitle index keeps the stored one.
+    let body = serde_json::json!({
+        "ItemId": film, "ItemName": "B40 Film", "PositionTicks": 5000, "IsPaused": true,
+        "AudioStreamIndex": 2,
+    });
+    let (status, answer) = b.post("/Sessions/Playing/Progress", body).await;
+    assert_eq!((status, answer), (StatusCode::OK, serde_json::json!({})));
+    assert_eq!(b.film_data().await, (5000, true, Some(2), Some(3), true));
+    let now_playing = serde_json::json!({ "Id": film, "Name": "B40 Film", "PositionTicks": 5000 });
+    assert_eq!(
+        b40_session_changes(&mut events),
+        [(user.clone(), now_playing)]
+    );
+
+    // Stop stores the stop position and subtitles off, and clears now playing.
+    let body = serde_json::json!({
+        "ItemId": film, "PositionTicks": 7000, "SubtitleStreamIndex": -1,
+    });
+    let (status, answer) = b.post("/Sessions/Playing/Stopped", body).await;
+    assert_eq!((status, answer), (StatusCode::OK, serde_json::json!({})));
+    assert_eq!(b.film_data().await, (7000, true, Some(2), Some(-1), true));
+    assert_eq!(
+        b40_session_changes(&mut events),
+        [(user, serde_json::Value::Null)]
+    );
+    assert_eq!(b.user_data_rows().await, 1);
+}
+
+#[tokio::test]
+async fn b40_last_activity_date_skips_ids_that_are_not_media_items() {
+    let b = B40::new().await;
+    // Jellyfin has no such route. It takes a list, so ids that aren't media items are skipped
+    // rather than failing the request for the real ones.
+    let ids = [
+        b.genre_id().await,
+        uuid::Uuid::new_v4().to_string(),
+        b.film.to_string(),
+        b.library.to_string(),
+    ];
+    let (status, answer) = b
+        .post(
+            "/Playstate/LastActivityDate",
+            serde_json::json!({ "ItemIds": ids }),
+        )
+        .await;
+    assert_eq!((status, answer), (StatusCode::OK, serde_json::json!({})));
+    assert_eq!(b.film_data().await, (0, false, None, None, true));
+    assert_eq!(b.user_data_rows().await, 1);
+
+    let ids = [ids[0].clone(), ids[1].clone()];
+    let (status, answer) = b
+        .post(
+            "/Playstate/LastActivityDate",
+            serde_json::json!({ "ItemIds": ids }),
+        )
+        .await;
+    assert_eq!((status, answer), (StatusCode::OK, serde_json::json!({})));
+    assert_eq!(b.user_data_rows().await, 1);
+}
+
 // ── Shows Tests ──
 
 #[tokio::test]

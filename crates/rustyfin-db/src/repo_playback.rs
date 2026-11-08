@@ -397,7 +397,7 @@ pub async fn pin_episode(
     Ok(())
 }
 
-/// Update last activity date for multiple items
+/// Update last activity date for multiple items. Ids that are not media items are skipped.
 pub async fn update_last_activity_date(
     pool: &SqlitePool,
     user_id: Uuid,
@@ -414,13 +414,13 @@ pub async fn update_last_activity_date(
         let iid = item_id.to_string();
         sqlx::query(
             "INSERT INTO user_item_data (user_id, item_id, last_played_date) \
-             VALUES (?, ?, ?) \
+             SELECT ?, id, ? FROM media_items WHERE id = ? \
              ON CONFLICT(user_id, item_id) DO UPDATE SET \
              last_played_date = excluded.last_played_date",
         )
         .bind(&uid)
-        .bind(&iid)
         .bind(&now)
+        .bind(&iid)
         .execute(pool)
         .await?;
     }
