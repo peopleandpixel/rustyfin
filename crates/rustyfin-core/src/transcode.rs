@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
@@ -34,7 +34,17 @@ impl HwAccel {
     }
 }
 
-#[derive(Debug, Clone)]
+/// An image subtitle (PGS, VobSub, DVB) to burn in with an overlay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageSubtitle {
+    /// The subtitle's absolute stream index in the input (MediaStream.Index)
+    pub stream_index: u32,
+    /// The source video's width and height, which the subtitle is scaled to first; None
+    /// leaves it at its own size
+    pub video_size: Option<(u32, u32)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranscodeProfile {
     pub max_video_bitrate_kbps: u32,
     pub max_audio_bitrate_kbps: u32,
@@ -46,7 +56,8 @@ pub struct TranscodeProfile {
     pub segment_duration: u32,
     pub burn_subtitles: bool,
     pub subtitle_stream_index: Option<u32>,
-    /// Audio stream index to transcode (for multi-audio support)
+    /// The audio stream to transcode: its absolute stream index (MediaStream.Index), not its
+    /// place among the audio streams. None takes the first audio stream.
     pub audio_stream_index: Option<u32>,
     /// Whether to transcode audio only (no video)
     pub audio_only: bool,
@@ -56,6 +67,12 @@ pub struct TranscodeProfile {
     pub copy_video: bool,
     /// Copy the source audio (`-c:a copy`) instead of encoding it.
     pub copy_audio: bool,
+    /// Where the transcode starts, in ticks; 0 or less starts at the beginning.
+    /// Output time 0 is this point.
+    pub start_time_ticks: i64,
+    /// An image subtitle burned in with an overlay. It wins over the text burn-in, and it turns
+    /// the video copy and hardware acceleration off.
+    pub image_subtitle: Option<ImageSubtitle>,
 }
 
 impl Default for TranscodeProfile {
@@ -76,6 +93,8 @@ impl Default for TranscodeProfile {
             adaptive_bitrate: false,
             copy_video: false,
             copy_audio: false,
+            start_time_ticks: 0,
+            image_subtitle: None,
         }
     }
 }
@@ -97,7 +116,7 @@ struct TranscodeSession {
     stderr_task: Option<tokio::task::JoinHandle<()>>,
     stderr_tail: Arc<std::sync::Mutex<VecDeque<String>>>,
     last_access: Instant, // last playlist or segment request
-    _profile: TranscodeProfile,
+    profile: TranscodeProfile,
 }
 
 /// What a starting session looked like when it was polled.
@@ -128,6 +147,9 @@ pub struct TranscodeManager {
     ffmpeg: PathBuf,         // "ffmpeg"; unit tests point it at a fake script
     playlist_wait: Duration, // 30 s; unit tests shorten it
     start_lock: Arc<tokio::sync::Mutex<()>>,
+    /// The PlaySessionIds stopped lately (in ASCII lower case) and when each was stopped
+    stopped: Arc<std::sync::Mutex<HashMap<String, Instant>>>,
+    stop_memory: Duration, // 60 s; unit tests shorten it
 }
 
 impl TranscodeManager {
@@ -138,6 +160,8 @@ impl TranscodeManager {
             ffmpeg: PathBuf::from("ffmpeg"),
             playlist_wait: Duration::from_secs(30),
             start_lock: Arc::new(tokio::sync::Mutex::new(())),
+            stopped: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            stop_memory: Duration::from_secs(60),
         }
     }
 
@@ -161,9 +185,10 @@ impl TranscodeManager {
     }
 
     /// Start the HLS transcode of `input_path` for a request, or reuse the item's transcode of
-    /// the same input file and the same play session (else device). Returns the playlist path and
-    /// the playback id once ffmpeg has written the playlist. Fails when ffmpeg exits first, or when
-    /// no playlist appears within `playlist_wait`; ffmpeg then keeps running.
+    /// the same input file, the same play session (else device) and the same profile. Returns the
+    /// playlist path and the playback id once ffmpeg has written the playlist. Fails when ffmpeg
+    /// exits first, or when no playlist appears within `playlist_wait`; ffmpeg then keeps running.
+    /// A play session stopped less than `stop_memory` ago fails at once with `Stopped`.
     pub async fn start_transcode(
         &self,
         item_id: Uuid,
@@ -174,7 +199,16 @@ impl TranscodeManager {
     ) -> Result<(PathBuf, Uuid), TranscodeError> {
         let playback_id = {
             let _lock = self.start_lock.lock().await;
+            if !play_session_id.is_empty() && self.recently_stopped(play_session_id) {
+                return Err(TranscodeError::Stopped);
+            }
             match self.find_session(item_id, input_path, play_session_id, device_id) {
+                Some(id) if !self.same_profile(id, profile) => {
+                    // Other tracks, another start or other limits: the transcode is replaced
+                    self.stop_session(id).await;
+                    self.spawn_session(item_id, input_path, profile, play_session_id, device_id)
+                        .await?
+                }
                 Some(id) if self.touch_live_session(id) => id,
                 Some(id) => {
                     // ffmpeg exited without a playlist: start again
@@ -226,6 +260,15 @@ impl TranscodeManager {
                     && same_key(session, play_session_id, device_id)
             })
             .map(|e| *e.key())
+    }
+
+    /// Whether the session `playback_id` runs the transcode of `profile`. A request of the same
+    /// play session (else device) with other tracks, another start or other limits replaces the
+    /// transcode: its client has moved on from the old one.
+    fn same_profile(&self, playback_id: Uuid, profile: &TranscodeProfile) -> bool {
+        self.sessions
+            .get(&playback_id)
+            .is_some_and(|session| session.profile == *profile)
     }
 
     /// Touch a session that can still serve (its playlist exists or its ffmpeg runs) and
@@ -328,7 +371,7 @@ impl TranscodeManager {
                 stderr_task,
                 stderr_tail,
                 last_access: Instant::now(),
-                _profile: profile.clone(),
+                profile: profile.clone(),
             },
         );
         Ok(playback_id)
@@ -358,13 +401,23 @@ impl TranscodeManager {
     /// Stop the transcodes that a stop request names and delete their files. Names are the
     /// PlaySessionId, else the DeviceId (whatever the session's PlaySessionId), else, with no
     /// names, the unnamed sessions. `item_id` restricts the stop to one item; without an item
-    /// and without names nothing stops. Returns how many sessions were stopped.
+    /// and without names nothing stops. Returns how many sessions were stopped. A stop by
+    /// PlaySessionId also refuses that play session's starts for `stop_memory`.
     pub async fn stop_play_session(
         &self,
         item_id: Option<Uuid>,
         play_session_id: &str,
         device_id: &str,
     ) -> usize {
+        // Under the start lock, a start either sees the stop or has its new session collected
+        let start_lock = match play_session_id {
+            "" => None,
+            id => {
+                let guard = self.start_lock.lock().await;
+                self.remember_stop(id);
+                Some(guard)
+            }
+        };
         let matching: Vec<Uuid> = self
             .sessions
             .iter()
@@ -382,6 +435,7 @@ impl TranscodeManager {
             })
             .map(|e| *e.key())
             .collect();
+        drop(start_lock);
 
         let mut stopped = 0;
         for id in matching {
@@ -390,6 +444,22 @@ impl TranscodeManager {
             }
         }
         stopped
+    }
+
+    /// Record a stop by PlaySessionId, and forget the stops older than `stop_memory`
+    fn remember_stop(&self, play_session_id: &str) {
+        let mut stopped = self.stopped.lock().unwrap();
+        stopped.retain(|_, at| at.elapsed() < self.stop_memory);
+        stopped.insert(play_session_id.to_ascii_lowercase(), Instant::now());
+    }
+
+    /// Whether a play session was stopped less than `stop_memory` ago
+    fn recently_stopped(&self, play_session_id: &str) -> bool {
+        self.stopped
+            .lock()
+            .unwrap()
+            .get(&play_session_id.to_ascii_lowercase())
+            .is_some_and(|at| at.elapsed() < self.stop_memory)
     }
 
     /// Stop all running transcodes.
@@ -592,6 +662,44 @@ async fn drain_stderr<R: tokio::io::AsyncRead + Unpin>(
 // FFmpeg argument builder
 // ---------------------------------------------------------------------------
 
+/// Ticks as seconds with milliseconds truncated, in integer math (`600.000`)
+fn seconds_text(ticks: i64) -> String {
+    format!(
+        "{}.{:03}",
+        ticks / 10_000_000,
+        (ticks % 10_000_000) / 10_000
+    )
+}
+
+/// Escapes a path for the single quotes of a `subtitles` option, as Jellyfin's
+/// `EscapeSubtitleFilterPath` does. Jellyfin turns `\` into `/` (Windows separators); here `\` is
+/// a file name character, so it is escaped like the others. The path sits in single quotes in a
+/// filter option, and ffmpeg unquotes it twice: for the graph (`'...'` is literal, `\x` is `x`,
+/// and an unquoted `[],;` ends the filter) and for the options (`\x` is `x`, and an unquoted `:`
+/// ends the value). Inside the quotes `[],;=` are plain. `:`, `\` and `"` get a backslash for the
+/// option level. `'` closes the quote, adds `\\\'` (the graph level leaves `\'`, the option level
+/// `'`) and opens the quote again.
+fn escape_filter_path(path: &str) -> String {
+    path.replace('\\', r"\\")
+        .replace(':', r"\:")
+        .replace('\'', r"'\\\''")
+        .replace('"', r#"\""#)
+}
+
+/// The text subtitle filter. After an input seek the frames start at 0, but the filter reads
+/// the file from its start, so the frames move to the file's time for it and back after.
+fn subtitles_filter(input: &str, sub_idx: u32, start_time_ticks: i64) -> String {
+    // The f= key keeps a path with `=` from being read as an option name
+    let escaped = escape_filter_path(input);
+    let subtitles = format!("subtitles=f='{escaped}':si={sub_idx}");
+    if start_time_ticks > 0 {
+        let secs = seconds_text(start_time_ticks);
+        format!("setpts=PTS+{secs}/TB,{subtitles},setpts=PTS-{secs}/TB")
+    } else {
+        subtitles
+    }
+}
+
 fn build_ffmpeg_args(
     input: &str,
     playlist_output: &str,
@@ -604,12 +712,23 @@ fn build_ffmpeg_args(
     args.push("-y".to_string());
     args.extend(["-hide_banner".to_string(), "-nostats".to_string()]);
 
-    // Burn-in needs a re-encode, so it turns the video copy off
-    let copy_video = profile.copy_video && !profile.audio_only && !profile.burn_subtitles;
+    // An image subtitle is overlaid in software, so it turns hardware acceleration off
+    let image_subtitle = profile.image_subtitle.filter(|_| !profile.audio_only);
+    let hw_accel = if image_subtitle.is_some() {
+        HwAccel::None
+    } else {
+        profile.hw_accel
+    };
+
+    // Burn-in and the overlay need a re-encode, so they turn the video copy off
+    let copy_video = profile.copy_video
+        && !profile.audio_only
+        && !profile.burn_subtitles
+        && image_subtitle.is_none();
 
     // Hardware acceleration input flags (skip for audio-only and copied video)
     if !profile.audio_only && !copy_video {
-        match profile.hw_accel {
+        match hw_accel {
             HwAccel::Vaapi => {
                 args.extend([
                     "-hwaccel".to_string(),
@@ -640,6 +759,11 @@ fn build_ffmpeg_args(
         }
     }
 
+    // Resume or seek point: an input seek, so output time 0 is the start point
+    if profile.start_time_ticks > 0 {
+        args.extend(["-ss".to_string(), seconds_text(profile.start_time_ticks)]);
+    }
+
     // Input
     args.extend(["-i".to_string(), input.to_string()]);
 
@@ -650,7 +774,7 @@ fn build_ffmpeg_args(
         args.extend(["-c:v".to_string(), "copy".to_string()]);
     } else {
         // Video codec
-        let video_codec = match profile.hw_accel {
+        let video_codec = match hw_accel {
             HwAccel::Vaapi => "h264_vaapi".to_string(),
             HwAccel::Nvenc => "h264_nvenc".to_string(),
             HwAccel::Qsv => "h264_qsv".to_string(),
@@ -669,7 +793,7 @@ fn build_ffmpeg_args(
         ]);
 
         // Scale filter
-        let scale_filter = match profile.hw_accel {
+        let scale_filter = match hw_accel {
             HwAccel::Vaapi => format!(
                 "scale_vaapi=w='min({},iw)':h='min({},ih)':force_original_aspect_ratio=decrease",
                 profile.max_width, profile.max_height
@@ -688,26 +812,37 @@ fn build_ffmpeg_args(
             ),
         };
 
-        // Subtitle burn-in
-        if profile.burn_subtitles {
+        // Subtitle burn-in: an image subtitle is overlaid, and it wins over a text burn-in
+        if let Some(sub) = image_subtitle {
+            // The subtitle is scaled to the video's size first when that is known, laid over the
+            // video, and the result is scaled like any video. hw_accel is None here, so
+            // scale_filter is the software scale.
+            let graph = match sub.video_size {
+                Some((w, h)) => format!(
+                    "[0:{}]scale={w}:{h}[sub];[0:V:0][sub]overlay=eof_action=pass:repeatlast=0,{scale_filter}[v]",
+                    sub.stream_index
+                ),
+                None => format!(
+                    "[0:V:0][0:{}]overlay=eof_action=pass:repeatlast=0,{scale_filter}[v]",
+                    sub.stream_index
+                ),
+            };
+            args.extend(["-filter_complex".to_string(), graph]);
+        } else if profile.burn_subtitles {
             let sub_idx = profile.subtitle_stream_index.unwrap_or(0);
-            if profile.hw_accel == HwAccel::None {
+            let burn = subtitles_filter(input, sub_idx, profile.start_time_ticks);
+            if hw_accel == HwAccel::None {
                 // Software: combine scale + subtitles in one filter chain
                 let sw_scale = format!(
                     "scale='min({},iw)':'min({},ih)':force_original_aspect_ratio=decrease",
                     profile.max_width, profile.max_height
                 );
-                args.extend([
-                    "-vf".to_string(),
-                    format!("{sw_scale},subtitles='{input}':si={sub_idx}"),
-                ]);
+                args.extend(["-vf".to_string(), format!("{sw_scale},{burn}")]);
             } else {
                 // HW accel: need to download → burn subs → upload (complex, use sw fallback for subs)
                 args.extend([
                     "-vf".to_string(),
-                    format!(
-                        "{scale_filter},hwdownload,format=nv12,subtitles='{input}':si={sub_idx}",
-                    ),
+                    format!("{scale_filter},hwdownload,format=nv12,{burn}"),
                 ]);
             }
         } else {
@@ -715,11 +850,19 @@ fn build_ffmpeg_args(
         }
     }
 
-    // Audio stream selection and encoding
-    if let Some(audio_idx) = profile.audio_stream_index {
-        // Select specific audio stream for multi-audio support
-        args.extend(["-map".to_string(), format!("0:a:{}", audio_idx)]);
+    // Maps: the video first, then the audio. The overlay's output is the video; audio-only has none.
+    if image_subtitle.is_some() {
+        args.extend(["-map".to_string(), "[v]".to_string()]);
+    } else if !profile.audio_only {
+        args.extend(["-map".to_string(), "0:V:0?".to_string()]);
     }
+    let audio_map = match profile.audio_stream_index {
+        Some(idx) => format!("0:{idx}"),
+        None => "0:a:0?".to_string(),
+    };
+    args.extend(["-map".to_string(), audio_map]);
+
+    // Audio encoding
 
     if profile.copy_audio {
         args.extend(["-c:a".to_string(), "copy".to_string()]);
@@ -755,8 +898,13 @@ fn build_ffmpeg_args(
     ]);
 
     // Preset for speed (skip for HW accel, audio-only and copied video)
-    if profile.hw_accel == HwAccel::None && !profile.audio_only && !copy_video {
+    if hw_accel == HwAccel::None && !profile.audio_only && !copy_video {
         args.extend(["-preset".to_string(), "veryfast".to_string()]);
+    }
+
+    // A copied stream would start with packets from before the start: drop those
+    if profile.start_time_ticks > 0 && (copy_video || profile.copy_audio) {
+        args.extend(["-copypriorss".to_string(), "0".to_string()]);
     }
 
     // Output playlist
@@ -851,6 +999,9 @@ pub enum TranscodeError {
 
     #[error("ffmpeg has not written a playlist yet")]
     PlaylistTimeout,
+
+    #[error("the play session was stopped")]
+    Stopped,
 }
 
 // ---------------------------------------------------------------------------
@@ -1038,6 +1189,320 @@ mod tests {
         assert!(!args.contains(&"-b:a".to_string()), "{args:?}");
         assert!(!args.contains(&"-ac".to_string()), "{args:?}");
         assert!(has_pair(&args, "-c:v", "libx264"), "{args:?}");
+    }
+
+    fn position(args: &[String], flag: &str) -> usize {
+        args.iter()
+            .position(|a| a == flag)
+            .unwrap_or_else(|| panic!("no {flag} in {args:?}"))
+    }
+
+    #[test]
+    fn test_build_ffmpeg_args_start_time_seeks_the_input() {
+        let profile = TranscodeProfile {
+            start_time_ticks: 6_000_000_000,
+            ..Default::default()
+        };
+        let args = args_for(&profile);
+        // An input option: ffmpeg seeks the input, and output time 0 is the start time
+        assert!(has_pair(&args, "-ss", "600.000"), "{args:?}");
+        assert!(position(&args, "-ss") < position(&args, "-i"), "{args:?}");
+        // Nothing is copied, so nothing before the start can reach the output
+        assert!(!args.contains(&"-copypriorss".to_string()), "{args:?}");
+
+        let profile = TranscodeProfile {
+            start_time_ticks: 12_345_678_901,
+            ..Default::default()
+        };
+        assert!(has_pair(&args_for(&profile), "-ss", "1234.567"));
+    }
+
+    #[test]
+    fn test_build_ffmpeg_args_start_time_with_a_copy_drops_earlier_packets() {
+        for (copy_video, copy_audio) in [(true, false), (false, true), (true, true)] {
+            let profile = TranscodeProfile {
+                start_time_ticks: 300_000_000,
+                copy_video,
+                copy_audio,
+                ..Default::default()
+            };
+            let args = args_for(&profile);
+            assert!(has_pair(&args, "-ss", "30.000"), "{args:?}");
+            // Copied packets before the start would start the output before the start time
+            assert!(has_pair(&args, "-copypriorss", "0"), "{args:?}");
+            assert!(
+                position(&args, "-copypriorss") > position(&args, "-i"),
+                "an output option: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_ffmpeg_args_without_start_time_does_not_seek() {
+        for start_time_ticks in [0, -10_000_000] {
+            let profile = TranscodeProfile {
+                start_time_ticks,
+                copy_video: true,
+                copy_audio: true,
+                ..Default::default()
+            };
+            let args = args_for(&profile);
+            assert!(!args.contains(&"-ss".to_string()), "{args:?}");
+            assert!(!args.contains(&"-copypriorss".to_string()), "{args:?}");
+        }
+        assert_eq!(TranscodeProfile::default().start_time_ticks, 0);
+    }
+
+    /// The values of every `-map` in `args`, in order.
+    fn maps(args: &[String]) -> Vec<&str> {
+        args.windows(2)
+            .filter(|w| w[0] == "-map")
+            .map(|w| w[1].as_str())
+            .collect()
+    }
+
+    #[test]
+    fn test_build_ffmpeg_args_maps_the_video_and_the_chosen_audio() {
+        // The audio index is the stream's absolute index (MediaStream.Index), not its place
+        // among the audio streams; an explicit map must not drop the video either
+        let profile = TranscodeProfile {
+            audio_stream_index: Some(2),
+            ..Default::default()
+        };
+        assert_eq!(maps(&args_for(&profile)), ["0:V:0?", "0:2"]);
+        // No choice: the first audio stream, if there is one
+        assert_eq!(
+            maps(&args_for(&TranscodeProfile::default())),
+            ["0:V:0?", "0:a:0?"]
+        );
+        let profile = TranscodeProfile {
+            copy_video: true,
+            copy_audio: true,
+            audio_stream_index: Some(1),
+            ..Default::default()
+        };
+        assert_eq!(maps(&args_for(&profile)), ["0:V:0?", "0:1"]);
+    }
+
+    #[test]
+    fn test_build_ffmpeg_args_audio_only_maps_only_the_audio() {
+        let profile = TranscodeProfile {
+            audio_only: true,
+            audio_stream_index: Some(3),
+            ..Default::default()
+        };
+        let args = args_for(&profile);
+        assert_eq!(maps(&args), ["0:3"]);
+        assert!(args.contains(&"-vn".to_string()), "{args:?}");
+        let profile = TranscodeProfile {
+            audio_only: true,
+            ..Default::default()
+        };
+        assert_eq!(maps(&args_for(&profile)), ["0:a:0?"]);
+    }
+
+    #[test]
+    fn test_build_ffmpeg_args_image_subtitle_is_overlaid() {
+        let sw_scale = "scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_ratio=decrease";
+        // Hardware acceleration and a video copy give way to the software overlay
+        for hw_accel in [HwAccel::None, HwAccel::Vaapi, HwAccel::Nvenc, HwAccel::Qsv] {
+            let profile = TranscodeProfile {
+                image_subtitle: Some(ImageSubtitle {
+                    stream_index: 5,
+                    video_size: Some((1440, 1080)),
+                }),
+                audio_stream_index: Some(1),
+                copy_video: true,
+                hw_accel,
+                ..Default::default()
+            };
+            let args = args_for(&profile);
+            // The subtitle is scaled to the source video's size, laid over it, then the
+            // result is scaled like any encoded video
+            assert!(
+                has_pair(
+                    &args,
+                    "-filter_complex",
+                    &format!(
+                        "[0:5]scale=1440:1080[sub];[0:V:0][sub]overlay=eof_action=pass:repeatlast=0,{sw_scale}[v]"
+                    )
+                ),
+                "{hw_accel:?}: {args:?}"
+            );
+            assert_eq!(maps(&args), ["[v]", "0:1"], "{hw_accel:?}");
+            assert!(has_pair(&args, "-c:v", "libx264"), "{hw_accel:?}: {args:?}");
+            for flag in ["-vf", "-hwaccel", "-vaapi_device"] {
+                assert!(!args.contains(&flag.to_string()), "{hw_accel:?}: {args:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_build_ffmpeg_args_image_subtitle_of_unknown_size_is_not_scaled() {
+        let profile = TranscodeProfile {
+            image_subtitle: Some(ImageSubtitle {
+                stream_index: 3,
+                video_size: None,
+            }),
+            ..Default::default()
+        };
+        let args = args_for(&profile);
+        assert!(
+            has_pair(
+                &args,
+                "-filter_complex",
+                "[0:V:0][0:3]overlay=eof_action=pass:repeatlast=0,scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_ratio=decrease[v]"
+            ),
+            "{args:?}"
+        );
+        assert_eq!(maps(&args), ["[v]", "0:a:0?"]);
+        // The image subtitle wins over a text burn-in asked for at the same time
+        let profile = TranscodeProfile {
+            burn_subtitles: true,
+            subtitle_stream_index: Some(0),
+            ..profile
+        };
+        let args = args_for(&profile);
+        assert!(!args.iter().any(|a| a.contains("subtitles=")), "{args:?}");
+    }
+
+    #[test]
+    fn test_build_ffmpeg_args_text_burn_in_after_a_seek_keeps_the_subtitle_times() {
+        // After an input seek the frames start at 0, but the subtitle filter reads the file
+        // from its start: shift the frames to the file's time for the filter and back
+        let profile = TranscodeProfile {
+            burn_subtitles: true,
+            subtitle_stream_index: Some(1),
+            start_time_ticks: 6_000_000_000,
+            ..Default::default()
+        };
+        let args = args_for(&profile);
+        let vf = &args[position(&args, "-vf") + 1];
+        assert!(
+            vf.ends_with(
+                ",setpts=PTS+600.000/TB,subtitles=f='/input.mkv':si=1,setpts=PTS-600.000/TB"
+            ),
+            "{vf}"
+        );
+        // From the start there is nothing to shift
+        let profile = TranscodeProfile {
+            start_time_ticks: 0,
+            ..profile
+        };
+        let args = args_for(&profile);
+        let vf = &args[position(&args, "-vf") + 1];
+        assert!(vf.ends_with(",subtitles=f='/input.mkv':si=1"), "{vf}");
+        assert!(!vf.contains("setpts"), "{vf}");
+    }
+
+    /// A port of libavutil's `av_get_token` (avstring.c), the parser ffmpeg reads a filter's
+    /// options with: the token up to an unquoted char of `term`, and the rest from that char.
+    /// Leading whitespace is skipped, `\x` is `x`, text in `'...'` is literal with the quotes
+    /// dropped, and whitespace outside quotes at the token's end is trimmed.
+    fn ff_token<'a>(s: &'a str, term: &str) -> (String, &'a str) {
+        let s = s.trim_start_matches([' ', '\n', '\t', '\r']);
+        let mut out = String::new();
+        let mut end = 0;
+        let mut rest = s;
+        while let Some(c) = rest.chars().next() {
+            if term.contains(c) {
+                break;
+            }
+            rest = &rest[c.len_utf8()..];
+            match (c, rest.chars().next()) {
+                ('\\', Some(next)) => {
+                    out.push(next);
+                    rest = &rest[next.len_utf8()..];
+                    end = out.len();
+                }
+                ('\'', _) => {
+                    let close = rest.find('\'').unwrap_or(rest.len());
+                    out.push_str(&rest[..close]);
+                    rest = &rest[close..];
+                    if let Some(after) = rest.strip_prefix('\'') {
+                        rest = after;
+                        end = out.len();
+                    }
+                }
+                _ => out.push(c),
+            }
+        }
+        let kept = out.trim_end_matches([' ', '\n', '\t', '\r']).len().max(end);
+        out.truncate(kept);
+        (out, rest)
+    }
+
+    /// The options of a graph's `subtitles=` filter as ffmpeg reads them: the graph level, where
+    /// `[],;` end the filter and its quotes and escapes are undone, then `key=value` pairs split
+    /// by `:`, with the option level's quotes and escapes undone.
+    fn ff_subtitles_options(graph: &str) -> Vec<(String, String)> {
+        let (_, after) = graph
+            .split_once("subtitles=")
+            .expect("no subtitles= in the graph");
+        let (options, _) = ff_token(after, "[],;");
+        let mut pairs = Vec::new();
+        let mut rest = options.as_str();
+        while !rest.is_empty() {
+            let (key, value_text) = rest.split_once('=').expect("an option without =");
+            let (value, next) = ff_token(value_text, ":");
+            pairs.push((key.to_string(), value));
+            rest = next.strip_prefix(':').unwrap_or(next);
+        }
+        pairs
+    }
+
+    #[test]
+    fn test_subtitles_filter_escapes_like_jellyfin() {
+        assert_eq!(
+            subtitles_filter("/m/Ocean's Eleven: Redux.mkv", 2, 0),
+            r"subtitles=f='/m/Ocean'\\\''s Eleven\: Redux.mkv':si=2"
+        );
+        assert_eq!(
+            subtitles_filter("/m/Film.mkv", 2, 0),
+            "subtitles=f='/m/Film.mkv':si=2"
+        );
+    }
+
+    #[test]
+    fn test_subtitles_filter_paths_reach_ffmpeg_intact() {
+        let paths = [
+            "/m/Movies/Ocean's Eleven: Redux (2001).mkv",
+            r"/m/Movies/back\slash.mkv",
+            "/m/Movies/[Group] Show - 01 [1080p].mkv",
+            "/m/Movies/Hello, World; Again.mkv",
+            "/m/Movies/a=b.mkv",
+            r#"/m/Movies/"Quoted" Title.mkv"#,
+            r#"/m/Movies/It's: [all], of; them\ = "x".mkv"#,
+            "/m/Movies/''two''.mkv",
+            "/m/Movies/end'",
+        ];
+        for path in paths {
+            for ticks in [0, 125_000_000] {
+                let graph = subtitles_filter(path, 3, ticks);
+                let want = vec![
+                    ("f".to_string(), path.to_string()),
+                    ("si".to_string(), "3".to_string()),
+                ];
+                assert_eq!(ff_subtitles_options(&graph), want, "{graph}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_build_ffmpeg_args_text_burn_in_escapes_the_input() {
+        let input = "/m/Ocean's Eleven: Redux.mkv";
+        for start_time_ticks in [0, 6_000_000_000] {
+            let profile = TranscodeProfile {
+                burn_subtitles: true,
+                subtitle_stream_index: Some(1),
+                start_time_ticks,
+                ..Default::default()
+            };
+            let args = build_ffmpeg_args(input, "/out/main.m3u8", "/out/seg_%04d.ts", &profile);
+            let vf = &args[position(&args, "-vf") + 1];
+            let burn = subtitles_filter(input, 1, start_time_ticks);
+            assert!(vf.contains(&burn), "{vf}");
+        }
     }
 
     #[tokio::test]
@@ -1253,6 +1718,73 @@ exec sleep 30
         mgr.stop_all().await;
     }
 
+    /// The playback id of a start of `/in.mkv` with `profile` on a play session, from device "d"
+    async fn start_profile(
+        mgr: &TranscodeManager,
+        item: Uuid,
+        profile: &TranscodeProfile,
+        play_session_id: &str,
+    ) -> Uuid {
+        let (_, playback_id) = mgr
+            .start_transcode(item, "/in.mkv", profile, play_session_id, "d")
+            .await
+            .unwrap();
+        playback_id
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_another_profile_replaces_the_session() {
+        let (_dir, mgr) = fake_manager("good", Duration::from_secs(5));
+        let item = Uuid::new_v4();
+        let a = TranscodeProfile {
+            audio_stream_index: Some(1),
+            ..Default::default()
+        };
+        let b = TranscodeProfile {
+            audio_stream_index: Some(2),
+            ..Default::default()
+        };
+        let c = TranscodeProfile {
+            start_time_ticks: 600_000_000,
+            ..a.clone()
+        };
+        let id1 = start_profile(&mgr, item, &a, "p").await;
+        // The same profile reuses the transcode
+        assert_eq!(start_profile(&mgr, item, &a, "p").await, id1);
+        // Other tracks replace it: the client of the play session has moved on from the old one
+        let id2 = start_profile(&mgr, item, &b, "p").await;
+        assert_ne!(id2, id1, "other tracks must not reuse the old transcode");
+        assert_eq!(mgr.sessions.len(), 1);
+        // Another start replaces it too
+        let id3 = start_profile(&mgr, item, &c, "p").await;
+        assert_ne!(id3, id2, "another start must not reuse the old transcode");
+        assert_eq!(mgr.sessions.len(), 1);
+
+        mgr.stop_all().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_other_profiles_on_two_play_sessions_keep_both() {
+        let (_dir, mgr) = fake_manager("good", Duration::from_secs(5));
+        let item = Uuid::new_v4();
+        let a = TranscodeProfile {
+            audio_stream_index: Some(1),
+            ..Default::default()
+        };
+        let b = TranscodeProfile {
+            audio_stream_index: Some(2),
+            ..Default::default()
+        };
+        let on_p = start_profile(&mgr, item, &a, "p").await;
+        let on_q = start_profile(&mgr, item, &b, "q").await;
+        assert_ne!(on_p, on_q);
+        assert_eq!(mgr.sessions.len(), 2);
+
+        mgr.stop_all().await;
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn test_stop_by_device_and_keyless() {
@@ -1290,6 +1822,67 @@ exec sleep 30
 
         mgr.stop_all().await;
         assert_eq!(mgr.sessions.len(), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_a_stopped_play_session_does_not_start_again() {
+        let (_dir, mgr) = fake_manager("good", Duration::from_secs(5));
+        let item = Uuid::new_v4();
+        start(&mgr, item, "p", "").await.unwrap();
+        assert_eq!(mgr.stop_play_session(None, "p", "").await, 1);
+        // A request still on its way when the player closed must not start a transcode
+        assert!(matches!(
+            start(&mgr, item, "p", "").await,
+            Err(TranscodeError::Stopped)
+        ));
+        assert_eq!(mgr.sessions.len(), 0);
+        // Another play session still plays
+        start(&mgr, item, "q", "").await.unwrap();
+
+        mgr.stop_all().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_a_stop_before_the_first_request_holds() {
+        let (_dir, mgr) = fake_manager("good", Duration::from_secs(5));
+        let item = Uuid::new_v4();
+        // The player closed before its first request arrived; the stop ignores case, as a
+        // start's lookup does
+        assert_eq!(mgr.stop_play_session(None, "P", "").await, 0);
+        assert!(matches!(
+            start(&mgr, item, "p", "").await,
+            Err(TranscodeError::Stopped)
+        ));
+        assert_eq!(mgr.sessions.len(), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_a_device_stop_does_not_block_the_next_play() {
+        let (_dir, mgr) = fake_manager("good", Duration::from_secs(5));
+        let item = Uuid::new_v4();
+        start(&mgr, item, "", "d").await.unwrap();
+        assert_eq!(mgr.stop_play_session(None, "", "d").await, 1);
+        // A client without a PlaySessionId can play again at once
+        start(&mgr, item, "", "d").await.unwrap();
+
+        mgr.stop_all().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_a_stop_is_forgotten_after_a_while() {
+        let (_dir, mut mgr) = fake_manager("good", Duration::from_secs(5));
+        mgr.stop_memory = Duration::from_millis(200);
+        let item = Uuid::new_v4();
+        start(&mgr, item, "p", "").await.unwrap();
+        assert_eq!(mgr.stop_play_session(None, "p", "").await, 1);
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        start(&mgr, item, "p", "").await.unwrap();
+
+        mgr.stop_all().await;
     }
 
     #[cfg(unix)]

@@ -329,12 +329,12 @@
             <div class="flex items-center gap-3 mb-3">
                 <span id="player-cur-time" class="text-xs font-mono text-white/70 w-12 text-right">0:00</span>
                 <input id="player-seek" type="range" min="0" max="100" value="0" step="0.1" class="w-full range range-xs range-primary accent-[#00a4dc] cursor-pointer"
-                       oninput="seekVideo(this.value)">
+                       oninput="previewSeek(this.value)" onchange="seekVideo(this.value)" onpointerup="seekDragging = false" onpointercancel="seekDragging = false">
                 <span id="player-duration" class="text-xs font-mono text-white/70 w-12">0:00</span>
             </div>
 
             <!-- Controls row -->
-            <div class="flex items-center justify-between">
+            <div class="flex flex-wrap items-center justify-between gap-y-2">
                 <div class="flex items-center gap-3">
                     <button id="player-btn-play" class="jf-icon-btn !w-10 !h-10 text-white !bg-[#00a4dc] hover:!bg-[#008fbf]" onclick="togglePlayPause()">
                         <svg id="player-play-icon" class="w-5 h-5 ml-0.5" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
@@ -356,7 +356,15 @@
                 </div>
 
                 <!-- Right player actions -->
-                <div class="flex items-center gap-2">
+                <div class="flex items-center gap-2 ml-auto">
+                    <label id="player-audio-wrap" class="relative flex items-center justify-center gap-1 rounded text-white/70 max-sm:w-8 max-sm:h-8 max-sm:has-[:focus-visible]:ring-2 max-sm:has-[:focus-visible]:ring-[#00a4dc]" hidden>
+                        <svg class="w-4 h-4 shrink-0" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
+                        <select id="player-audio" class="bg-white/10 text-xs text-white rounded px-2 py-1 outline-none border border-white/10 focus-visible:ring-2 focus-visible:ring-[#00a4dc] max-sm:absolute max-sm:inset-0 max-sm:w-full max-sm:opacity-0 sm:max-w-56" title="Choose audio track" aria-label="Choose audio track" data-i18n-title="player.choose_audio" data-i18n-aria-label="player.choose_audio" onchange="changeAudioTrack(this.value)"></select>
+                    </label>
+                    <label id="player-subs-wrap" class="relative flex items-center justify-center gap-1 rounded text-white/70 max-sm:w-8 max-sm:h-8 max-sm:has-[:focus-visible]:ring-2 max-sm:has-[:focus-visible]:ring-[#00a4dc]" hidden>
+                        <svg class="w-4 h-4 shrink-0" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M7 15h4M14 15h3M7 11h2M12 11h5"/></svg>
+                        <select id="player-subs" class="bg-white/10 text-xs text-white rounded px-2 py-1 outline-none border border-white/10 focus-visible:ring-2 focus-visible:ring-[#00a4dc] max-sm:absolute max-sm:inset-0 max-sm:w-full max-sm:opacity-0 sm:max-w-56" title="Choose subtitles" aria-label="Choose subtitles" data-i18n-title="player.choose_subtitles" data-i18n-aria-label="player.choose_subtitles" onchange="changeSubtitleTrack(this.value)"></select>
+                    </label>
                     <!-- Playback Speed -->
                     <select id="player-speed" class="bg-white/10 text-xs text-white rounded px-2 py-1 outline-none border border-white/10" onchange="setPlaybackRate(this.value)">
                         <option value="0.75">0.75x</option>

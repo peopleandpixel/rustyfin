@@ -108,6 +108,9 @@ struct FfprobeStream {
     external: Option<bool>,
     path: Option<String>,
     title: Option<String>,
+    /// Tags such as `language` and `title`. ffprobe nests a stream's language and title here.
+    #[serde(default)]
+    tags: Option<HashMap<String, String>>,
     color_space: Option<String>,
     color_transfer: Option<String>,
     color_primaries: Option<String>,
@@ -608,9 +611,30 @@ fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
     Ok(output)
 }
 
+/// Looks up an ffprobe tag by key, ignoring ASCII case in the key. An exact match wins over a
+/// case-insensitive one.
+fn tag<'a>(tags: Option<&'a HashMap<String, String>>, key: &str) -> Option<&'a str> {
+    let tags = tags?;
+    tags.get(key)
+        .or_else(|| {
+            tags.iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(key))
+                .map(|(_, v)| v)
+        })
+        .map(String::as_str)
+}
+
 fn stream_to_model(s: FfprobeStream) -> MediaStream {
     let is_default = s.disposition.as_ref().and_then(|d| d.default).unwrap_or(0) > 0;
     let is_forced = s.disposition.as_ref().and_then(|d| d.forced).unwrap_or(0) > 0;
+
+    // ffprobe nests language and title under `tags`; the top-level fields are the fallback
+    let language = tag(s.tags.as_ref(), "language")
+        .map(str::to_string)
+        .or(s.language);
+    let title = tag(s.tags.as_ref(), "title")
+        .map(str::to_string)
+        .or(s.title);
 
     // Determine subtitle type
     let subtitle_type = if s.codec_type.as_deref() == Some("subtitle") {
@@ -630,7 +654,7 @@ fn stream_to_model(s: FfprobeStream) -> MediaStream {
                 .as_ref()
                 .map(|c| c.contains("forced"))
                 .unwrap_or(false)
-            || s.title
+            || title
                 .as_ref()
                 .map(|t| t.contains("forced"))
                 .unwrap_or(false)
@@ -642,7 +666,7 @@ fn stream_to_model(s: FfprobeStream) -> MediaStream {
         index: s.index,
         codec: s.codec_name,
         codec_type: s.codec_type.unwrap_or_default(),
-        language: s.language,
+        language,
         time_base: s.time_base,
         codec_time_base: s.codec_time_base,
         codec_tag: s.codec_tag,
@@ -664,7 +688,7 @@ fn stream_to_model(s: FfprobeStream) -> MediaStream {
         r#type: subtitle_type,
         aspect_ratio_text: None,
         aspect_ratio: None,
-        title: s.title,
+        title,
         color_space: s.color_space,
         color_transfer: s.color_transfer,
         color_primaries: s.color_primaries,
@@ -996,5 +1020,114 @@ mod tests {
         );
 
         assert_eq!(parsed.streams[2].bit_rate, None);
+    }
+
+    /// `ffprobe -show_streams -of json` output (ffprobe 7.1) for an MKV episode, trimmed to the
+    /// fields that matter here. ffprobe gives a stream's language and title under `tags`.
+    const TAGGED_STREAMS_JSON: &str = r#"{
+        "streams": [
+            {
+                "index": 1,
+                "codec_name": "flac",
+                "codec_type": "audio",
+                "channels": 2,
+                "channel_layout": "stereo",
+                "sample_rate": "48000",
+                "disposition": { "default": 1, "forced": 0, "hearing_impaired": 0 },
+                "tags": { "language": "jpn" }
+            },
+            {
+                "index": 2,
+                "codec_name": "flac",
+                "codec_type": "audio",
+                "channels": 2,
+                "channel_layout": "stereo",
+                "sample_rate": "48000",
+                "disposition": { "default": 0, "forced": 0, "hearing_impaired": 0 },
+                "tags": { "language": "eng" }
+            },
+            {
+                "index": 3,
+                "codec_name": "hdmv_pgs_subtitle",
+                "codec_type": "subtitle",
+                "disposition": { "default": 0, "forced": 0, "hearing_impaired": 0 },
+                "tags": { "language": "eng", "title": "English PGS" }
+            },
+            {
+                "index": 6,
+                "codec_name": "subrip",
+                "codec_type": "subtitle",
+                "disposition": { "default": 1, "forced": 1, "hearing_impaired": 0 },
+                "tags": { "language": "eng", "title": "English Subrip" }
+            }
+        ]
+    }"#;
+
+    /// Each stream's (index, language, title) after `stream_to_model`.
+    fn languages_and_titles(json: &str) -> Vec<(i32, Option<String>, Option<String>)> {
+        let parsed: FfprobeOutput = serde_json::from_str(json).expect("should parse");
+        parsed
+            .streams
+            .into_iter()
+            .map(stream_to_model)
+            .map(|s| (s.index, s.language, s.title))
+            .collect()
+    }
+
+    fn some(value: &str) -> Option<String> {
+        Some(value.to_string())
+    }
+
+    #[test]
+    fn test_stream_language_and_title_come_from_tags() {
+        assert_eq!(
+            languages_and_titles(TAGGED_STREAMS_JSON),
+            vec![
+                (1, some("jpn"), None),
+                (2, some("eng"), None),
+                (3, some("eng"), some("English PGS")),
+                (6, some("eng"), some("English Subrip")),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_stream_tag_keys_match_without_case() {
+        // Some muxers write the tag keys in capitals
+        let json = r#"{"streams": [{"index": 0, "codec_name": "ac3", "codec_type": "audio",
+            "tags": {"LANGUAGE": "ger", "Title": "Deutsch"}}]}"#;
+        assert_eq!(
+            languages_and_titles(json),
+            vec![(0, some("ger"), some("Deutsch"))]
+        );
+    }
+
+    #[test]
+    fn test_stream_top_level_language_and_title_are_the_fallback() {
+        let json = r#"{"streams": [
+            {"index": 0, "codec_name": "aac", "codec_type": "audio",
+                "language": "fre", "title": "Commentaire"},
+            {"index": 1, "codec_name": "aac", "codec_type": "audio",
+                "language": "fre", "title": "Commentaire", "tags": {"language": "eng"}},
+            {"index": 2, "codec_name": "aac", "codec_type": "audio", "tags": {}}
+        ]}"#;
+        assert_eq!(
+            languages_and_titles(json),
+            vec![
+                (0, some("fre"), some("Commentaire")),
+                (1, some("eng"), some("Commentaire")),
+                (2, None, None),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_forced_subtitle_title_comes_from_tags() {
+        let json = r#"{"streams": [{"index": 4, "codec_name": "subrip", "codec_type": "subtitle",
+            "disposition": {"default": 0, "forced": 0},
+            "tags": {"language": "eng", "title": "english forced"}}]}"#;
+        let parsed: FfprobeOutput = serde_json::from_str(json).expect("should parse");
+        let stream = stream_to_model(parsed.streams.into_iter().next().unwrap());
+        assert!(stream.is_forced, "{stream:?}");
     }
 }

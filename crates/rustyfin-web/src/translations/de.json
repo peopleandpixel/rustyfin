@@ -180,7 +180,17 @@
         "audio_stream": "Audio Stream",
         "hls_error": "HLS Stream Fehler",
         "resume_from": "Fortsetzen ab {{time}}",
-        "start_from_beginning": "Von vorn beginnen"
+        "start_from_beginning": "Von vorn beginnen",
+        "choose_audio": "Tonspur wählen",
+        "choose_subtitles": "Untertitel wählen",
+        "subtitles_off": "Aus",
+        "track_default": "Standard",
+        "track_forced": "Erzwungen",
+        "track_external": "Extern",
+        "track_undefined": "Undefiniert",
+        "track_channels_one": "{{count}} Kanal",
+        "track_channels_other": "{{count}} Kanäle",
+        "subtitles_error": "Untertitel konnten nicht geladen werden"
     },
     "admin": {
         "new_user_title": "Neuer Benutzer",

@@ -691,6 +691,54 @@ impl From<HashMap<String, String>> for VideoPlaybackInfoQuery {
     }
 }
 
+/// What a transcode must carry for a source, beyond what a direct play or stream would
+#[derive(Debug, Default, PartialEq, Eq)]
+struct TrackNeeds {
+    /// The request names an audio stream other than the default one
+    other_audio: bool,
+    /// The request names a picture subtitle that the transcode burns in
+    burn_in: bool,
+}
+
+/// The tracks that `query` names on `source` and that a direct play or stream would not carry
+fn track_needs(
+    source: &rustyfin_model::media_source::MediaSourceResponse,
+    query: &VideoPlaybackInfoQuery,
+) -> TrackNeeds {
+    let audio: Vec<_> = source
+        .media_streams
+        .iter()
+        .filter(|s| is_stream_type(s, "Audio"))
+        .collect();
+    // The default audio is the first flagged one, else the first one
+    let default_audio = audio
+        .iter()
+        .find(|s| s.is_default)
+        .or_else(|| audio.first());
+    let other_audio = match (query.audio_stream_index, default_audio) {
+        (Some(wanted), Some(default)) => {
+            let wanted = i64::from(wanted);
+            audio.iter().any(|s| i64::from(s.index) == wanted) && i64::from(default.index) != wanted
+        }
+        _ => false,
+    };
+    // Picture subtitles are burned in by the transcode, text ones are drawn by the browser
+    let burn_in = match query.subtitle_stream_index {
+        Some(wanted) if wanted >= 0 => source.media_streams.iter().any(|s| {
+            s.index == wanted
+                && is_stream_type(s, "Subtitle")
+                && s.codec
+                    .as_deref()
+                    .is_some_and(rustyfin_core::subtitle::is_image_subtitle)
+        }),
+        _ => false,
+    };
+    TrackNeeds {
+        other_audio,
+        burn_in,
+    }
+}
+
 /// `GET /Videos/{id}/Universal` — Primary video playback endpoint.
 /// Returns a StreamingResponse with media sources and direct play/transcode URLs.
 async fn video_universal(
@@ -714,21 +762,32 @@ async fn video_universal(
     // Generate playback session ID
     let play_session_id = uuid::Uuid::new_v4().to_string();
 
-    // Determine direct play/stream/transcode capability
-    let (supports_direct_play, supports_direct_stream, supports_transcoding) = if media_sources
-        .is_empty()
-    {
-        // No media sources - fallback to transcoding if possible
-        (false, false, true)
-    } else {
-        let source = &media_sources[index];
-
-        let can_direct_play = query.enable_direct_play && check_direct_play(source, &query);
-        let can_direct_stream = query.enable_direct_stream && check_direct_stream(source, &query);
-        let can_transcode = true;
-
-        (can_direct_play, can_direct_stream, can_transcode)
+    // The tracks the request names that a direct play or stream would not carry
+    let needs = match media_sources.get(index) {
+        Some(source) => track_needs(source, &query),
+        None => TrackNeeds::default(),
     };
+
+    // Determine direct play/stream/transcode capability
+    let (supports_direct_play, supports_direct_stream, supports_transcoding) =
+        if media_sources.is_empty() {
+            // No media sources - fallback to transcoding if possible
+            (false, false, true)
+        } else {
+            let source = &media_sources[index];
+
+            let can_direct_play = query.enable_direct_play
+                && !needs.other_audio
+                && !needs.burn_in
+                && check_direct_play(source, &query);
+            let can_direct_stream = query.enable_direct_stream
+                && !needs.other_audio
+                && !needs.burn_in
+                && check_direct_stream(source, &query);
+            let can_transcode = true;
+
+            (can_direct_play, can_direct_stream, can_transcode)
+        };
 
     // Build the URL based on playback method
     let url = if supports_direct_play {
@@ -770,6 +829,15 @@ async fn video_universal(
         }
         if let Some(ticks) = query.start_time_ticks {
             url.push_str(&format!("&StartTimeTicks={}", ticks));
+        }
+        if let Some(audio) = query.audio_stream_index {
+            url.push_str(&format!("&AudioStreamIndex={}", audio));
+        }
+        if let Some(subtitle) = query.subtitle_stream_index.filter(|&i| i >= 0) {
+            url.push_str(&format!("&SubtitleStreamIndex={}", subtitle));
+        }
+        if needs.burn_in {
+            url.push_str("&SubtitleMethod=Encode");
         }
         if let Some(seg_time) = query.segment_time {
             url.push_str(&format!("&SegmentTime={}", seg_time));
@@ -815,6 +883,12 @@ async fn video_playback_info(
         rustyfin_db::repo_media_source::get_media_sources_with_item_check(&state.db_ro, &id)
             .await
             .ok_or_else(|| ApiError::NotFound(format!("Video item {id} not found")))?;
+
+    // The subtitle files beside each video are listed after its streams
+    for source in media_sources.iter_mut() {
+        let external = crate::routes::subtitle::external_streams(source).await;
+        source.media_streams.extend(external);
+    }
 
     // The index of the version the request names; an id that names none is refused
     let index = match select_version(id, &media_sources, requested_source_id(&params))? {

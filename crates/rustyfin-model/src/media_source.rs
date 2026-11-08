@@ -65,7 +65,7 @@ fn default_source_type() -> String {
 }
 
 /// Represents a single media stream (video, audio, or subtitle track), matching Jellyfin's `MediaStream`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct MediaStream {
     /// Index of the stream within the media source

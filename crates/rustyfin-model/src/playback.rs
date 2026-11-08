@@ -11,6 +11,10 @@ pub struct PlaybackStartInfo {
     pub position_ticks: Option<i64>,
     #[serde(default)]
     pub media_source_id: Option<String>,
+    #[serde(default)]
+    pub audio_stream_index: Option<i32>,
+    #[serde(default)]
+    pub subtitle_stream_index: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,6 +29,10 @@ pub struct PlaybackProgressInfo {
     pub is_paused: Option<bool>,
     #[serde(default)]
     pub media_source_id: Option<String>,
+    #[serde(default)]
+    pub audio_stream_index: Option<i32>,
+    #[serde(default)]
+    pub subtitle_stream_index: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +45,10 @@ pub struct PlaybackStopInfo {
     pub position_ticks: Option<i64>,
     #[serde(default)]
     pub media_source_id: Option<String>,
+    #[serde(default)]
+    pub audio_stream_index: Option<i32>,
+    #[serde(default)]
+    pub subtitle_stream_index: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -42,6 +42,14 @@ async fn playing(
     Extension(claims): Extension<Claims>,
     Json(req): Json<PlaybackStartInfo>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    tracing::debug!(
+        item = %req.item_id,
+        media_source = ?req.media_source_id,
+        position = ?req.position_ticks,
+        audio = ?req.audio_stream_index,
+        subtitle = ?req.subtitle_stream_index,
+        "Playback started"
+    );
     let position = req.position_ticks.unwrap_or(0);
     rustyfin_db::repo_playback::update_playback_position(
         &state.db,
@@ -74,6 +82,14 @@ async fn playing_progress(
     Extension(claims): Extension<Claims>,
     Json(req): Json<PlaybackProgressInfo>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    tracing::debug!(
+        item = %req.item_id,
+        media_source = ?req.media_source_id,
+        position = ?req.position_ticks,
+        audio = ?req.audio_stream_index,
+        subtitle = ?req.subtitle_stream_index,
+        "Playback progress"
+    );
     if let Some(position) = req.position_ticks {
         rustyfin_db::repo_playback::update_playback_position(
             &state.db,
@@ -109,6 +125,14 @@ async fn playing_stopped(
     Extension(claims): Extension<Claims>,
     Json(req): Json<PlaybackStopInfo>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    tracing::debug!(
+        item = %req.item_id,
+        media_source = ?req.media_source_id,
+        position = ?req.position_ticks,
+        audio = ?req.audio_stream_index,
+        subtitle = ?req.subtitle_stream_index,
+        "Playback stopped"
+    );
     rustyfin_db::repo_playback::on_playback_stopped(
         &state.db,
         claims.sub,

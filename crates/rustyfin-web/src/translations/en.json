@@ -180,7 +180,17 @@
         "audio_stream": "Audio stream",
         "hls_error": "HLS stream error",
         "resume_from": "Resume from {{time}}",
-        "start_from_beginning": "Start from beginning"
+        "start_from_beginning": "Start from beginning",
+        "choose_audio": "Choose audio track",
+        "choose_subtitles": "Choose subtitles",
+        "subtitles_off": "Off",
+        "track_default": "Default",
+        "track_forced": "Forced",
+        "track_external": "External",
+        "track_undefined": "Undefined",
+        "track_channels_one": "{{count}} ch",
+        "track_channels_other": "{{count}} ch",
+        "subtitles_error": "Subtitles could not be loaded"
     },
     "admin": {
         "new_user_title": "New User",
