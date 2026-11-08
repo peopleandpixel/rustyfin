@@ -967,14 +967,18 @@ async function renderLibrary(libId) {
                 </div>
 
                 <div class="flex flex-wrap items-center gap-2">
-                    <!-- Sort selector -->
-                    <select id="lib-sort" class="jf-input !py-1.5 text-xs">
-                        <option value="SortName:Ascending">${t('library.sort_name_asc')}</option>
-                        <option value="SortName:Descending">${t('library.sort_name_desc')}</option>
-                        <option value="PremiereDate:Descending">${t('library.sort_release_date')}</option>
-                        <option value="DateCreated:Descending">${t('library.sort_date_added')}</option>
-                        <option value="CommunityRating:Descending">${t('library.sort_rating')}</option>
-                    </select>
+                    <!-- Sort selector, with a toggle that reverses its order -->
+                    <div class="flex items-center gap-1">
+                        <select id="lib-sort" class="jf-input !py-1.5 text-xs">
+                            <option value="SortName,ProductionYear:Ascending">${t('library.sort_name')}</option>
+                            <option value="PremiereDate,SortName,ProductionYear:Descending">${t('library.sort_release_date')}</option>
+                            <option value="DateCreated,SortName,ProductionYear:Descending">${t('library.sort_date_added')}</option>
+                            <option value="CommunityRating,SortName,ProductionYear:Descending">${t('library.sort_rating')}</option>
+                        </select>
+                        <button id="lib-sort-reverse" type="button" class="jf-btn-ghost self-stretch !py-1.5 !px-2 text-xs" aria-pressed="false" title="${escapeHtml(t('library.sort_reverse'))}" aria-label="${escapeHtml(t('library.sort_reverse'))}">
+                            <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M3 7.5 7.5 3m0 0L12 7.5M7.5 3v13.5m13.5 0L16.5 21m0 0L12 16.5m4.5 4.5V7.5"/></svg>
+                        </button>
+                    </div>
 
                     <!-- Genre filter -->
                     ${genres.length > 0 ? `
@@ -994,6 +998,11 @@ async function renderLibrary(libId) {
             <div id="lib-grid-container"></div>
         </div>`;
         $('lib-sort')?.addEventListener('change', () => reloadLibrary(libId));
+        $('lib-sort-reverse')?.addEventListener('click', e => {
+            const btn = e.currentTarget;
+            btn.setAttribute('aria-pressed', btn.getAttribute('aria-pressed') === 'true' ? 'false' : 'true');
+            reloadLibrary(libId);
+        });
         $('lib-genre')?.addEventListener('change', () => reloadLibrary(libId));
         fillLibraryGrid(items, total);
     } catch (e) {
@@ -1001,6 +1010,14 @@ async function renderLibrary(libId) {
         page.classList.remove('jf-with-rail');
         page.innerHTML = `<div class="p-6 rounded-xl bg-red-500/10 text-red-400">${escapeHtml(e.message)}</div>`;
     }
+}
+
+// The library list's sort: the select's value, with the order flipped while the reverse toggle is pressed
+function librarySort() {
+    const [sortBy, sortOrder] = ($('lib-sort')?.value || 'SortName,ProductionYear:Ascending').split(':');
+    const reversed = $('lib-sort-reverse')?.getAttribute('aria-pressed') === 'true';
+    if (!reversed) return { sortBy, sortOrder };
+    return { sortBy, sortOrder: sortOrder === 'Ascending' ? 'Descending' : 'Ascending' };
 }
 
 // The /Items query for the library list; paging is added per request
@@ -1013,7 +1030,7 @@ function libraryListQuery(libId) {
     else if (contentType === 'Music') includeItemTypes = 'MusicAlbum';
     else if (contentType === 'Movies') includeItemTypes = 'Movie';
 
-    const [sortBy, sortOrder] = ($('lib-sort')?.value || 'SortName:Ascending').split(':');
+    const { sortBy, sortOrder } = librarySort();
     return {
         LibraryId: libId,
         IncludeItemTypes: includeItemTypes,
@@ -1185,12 +1202,12 @@ async function jumpToLetter(libId, letter) {
     }
 }
 
-// The letter rail (#lib-letter-rail in index.html) shows for the name sorts, in list order
+// The letter rail (#lib-letter-rail in index.html) shows for the name sorts, its letters reversed for a descending order
 function renderLetterRail(libId) {
-    const sort = $('lib-sort')?.value || 'SortName:Ascending';
-    $('page-library').classList.toggle('jf-with-rail', sort.startsWith('SortName:'));
+    const { sortBy, sortOrder } = librarySort();
+    $('page-library').classList.toggle('jf-with-rail', sortBy.startsWith('SortName'));
     const letters = ['#', ...'ABCDEFGHIJKLMNOPQRSTUVWXYZ'];
-    if (sort === 'SortName:Descending') letters.reverse();
+    if (sortOrder === 'Descending') letters.reverse();
     $('lib-letter-rail').innerHTML = letters.map(l =>
         `<button type="button" data-action="jump-letter" data-letter="${l}" data-id="${escapeHtml(libId)}">${l}</button>`).join('');
     railAnchor = null;

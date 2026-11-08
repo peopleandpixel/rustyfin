@@ -8946,6 +8946,495 @@ async fn g2c_forgot_password_time_does_not_depend_on_the_name() {
     assert!(!files[1].exists(), "an unknown name gets no file");
 }
 
+// ── B23: sort order ──
+// GET /Items and /Users/{id}/Items order by each SortBy key in turn, as Jellyfin 12.4 does: SortBy
+// and SortOrder are comma lists paired by position (keys past the orders take the first one), a
+// missing value sorts first ascending and last descending, SortName ascending breaks ties unless a
+// key is SortName or Name, and the item id comes last, so pages are stable and a flipped SortOrder
+// gives the exact reverse of the web client's lists.
+
+/// One stored item for the B23 tests; an empty `added` stores 2024-01-01T00:00:00+00:00.
+#[derive(Default)]
+struct B23Item {
+    name: &'static str,
+    sort_name: &'static str,
+    media_type: &'static str,
+    year: Option<i64>,
+    premiere: Option<&'static str>,
+    rating: Option<f64>,
+    added: &'static str,
+    runtime: Option<i64>,
+    season: Option<i64>,
+    episode: Option<i64>,
+}
+
+/// Stores `items` in a new library, with ids that rise in the order given, and returns an admin's
+/// token, the admin's id and the items' ids.
+async fn b23_library(
+    state: &AppState,
+    content_type: rustyfin_model::library::LibraryContentType,
+    items: &[B23Item],
+) -> (String, uuid::Uuid, Vec<uuid::Uuid>) {
+    let folder = media_folder(state, "b23");
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: "B23".to_string(),
+        content_type,
+        paths: vec![folder.clone()],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    let mut ids = Vec::new();
+    for (n, item) in items.iter().enumerate() {
+        let id = uuid::Uuid::from_u128(0xb230_0000 + n as u128);
+        let added = if item.added.is_empty() {
+            "2024-01-01T00:00:00+00:00"
+        } else {
+            item.added
+        };
+        sqlx::query(
+            "INSERT INTO media_items (id, library_id, name, sort_name, media_type, path, \
+             production_year, premiere_date, community_rating, date_created, runtime_ticks, \
+             parent_index_number, index_number) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(id.to_string())
+        .bind(lib.id.to_string())
+        .bind(item.name)
+        .bind(item.sort_name)
+        .bind(item.media_type)
+        .bind(format!("{folder}/{n}.mkv"))
+        .bind(item.year)
+        .bind(item.premiere)
+        .bind(item.rating)
+        .bind(added)
+        .bind(item.runtime)
+        .bind(item.season)
+        .bind(item.episode)
+        .execute(&state.db)
+        .await
+        .unwrap();
+        ids.push(id);
+    }
+    let (token, user_id) = admin_session(state).await;
+    (token, user_id, ids)
+}
+
+/// Lists `uri`, asserts a 200 and returns the answer's `Items`.
+async fn b23_items(app: &axum::Router, token: &str, uri: &str) -> Vec<serde_json::Value> {
+    let (status, json) = send_authed(app, "GET", uri, token, None).await;
+    assert_eq!(status, StatusCode::OK, "{uri}: {json}");
+    json["Items"].as_array().cloned().unwrap_or_default()
+}
+
+/// The names of `uri`'s items, in the order listed.
+async fn b23_names(app: &axum::Router, token: &str, uri: &str) -> Vec<String> {
+    b23_items(app, token, uri)
+        .await
+        .iter()
+        .map(|item| item["Name"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// The positions in `ids` of `uri`'s items, in the order listed.
+async fn b23_order(app: &axum::Router, token: &str, uri: &str, ids: &[uuid::Uuid]) -> Vec<usize> {
+    b23_items(app, token, uri)
+        .await
+        .iter()
+        .map(|item| {
+            let id: uuid::Uuid = item["Id"].as_str().unwrap().parse().unwrap();
+            ids.iter().position(|stored| *stored == id).unwrap()
+        })
+        .collect()
+}
+
+/// Six movies with gaps and ties in every field the library toolbar sorts by, and names whose order
+/// differs from their sort names'.
+fn b23_movies() -> Vec<B23Item> {
+    let movie = |name, sort_name, year, premiere, rating, added, runtime| B23Item {
+        name,
+        sort_name,
+        media_type: "Movie",
+        year,
+        premiere,
+        rating,
+        added,
+        runtime,
+        ..Default::default()
+    };
+    vec![
+        movie(
+            "Echo",
+            "echo",
+            Some(2010),
+            None,
+            Some(6.5),
+            "2021-03-01T10:00:00+00:00",
+            Some(6000),
+        ),
+        movie(
+            "The Delta",
+            "delta",
+            None,
+            Some("2012-05-04T00:00:00+00:00"),
+            None,
+            "2023-07-01T08:00:00+00:00",
+            None,
+        ),
+        movie(
+            "Charlie",
+            "charlie",
+            Some(2012),
+            None,
+            Some(8.1),
+            "2021-03-01T10:00:00+00:00",
+            Some(9000),
+        ),
+        movie(
+            "Bravo",
+            "bravo",
+            None,
+            None,
+            Some(6.5),
+            "2019-11-30T23:59:59+00:00",
+            Some(6000),
+        ),
+        movie(
+            "Alpha",
+            "alpha",
+            Some(2008),
+            Some("2008-09-12T00:00:00+00:00"),
+            None,
+            "2024-01-15T12:00:00+00:00",
+            Some(3000),
+        ),
+        movie(
+            "Foxtrot",
+            "foxtrot",
+            Some(2012),
+            None,
+            Some(8.1),
+            "2022-02-02T00:00:00+00:00",
+            None,
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn b23_each_key_sorts_both_ways_with_missing_values_and_ties_as_in_jellyfin() {
+    let state = test_state().await;
+    let movies = rustyfin_model::library::LibraryContentType::Movies;
+    let (token, _, _) = b23_library(&state, movies, &b23_movies()).await;
+    let app = app(state);
+    // (key, ascending, descending). Release date falls back to January 1 of the year; ties go by
+    // SortName ascending in both directions.
+    let cases: [(&str, [&str; 6], [&str; 6]); 7] = [
+        (
+            "SortName",
+            ["Alpha", "Bravo", "Charlie", "The Delta", "Echo", "Foxtrot"],
+            ["Foxtrot", "Echo", "The Delta", "Charlie", "Bravo", "Alpha"],
+        ),
+        // By the name itself, so The Delta comes last.
+        (
+            "Name",
+            ["Alpha", "Bravo", "Charlie", "Echo", "Foxtrot", "The Delta"],
+            ["The Delta", "Foxtrot", "Echo", "Charlie", "Bravo", "Alpha"],
+        ),
+        (
+            "DateCreated",
+            ["Bravo", "Charlie", "Echo", "Foxtrot", "The Delta", "Alpha"],
+            ["Alpha", "The Delta", "Foxtrot", "Charlie", "Echo", "Bravo"],
+        ),
+        (
+            "PremiereDate",
+            ["Bravo", "Alpha", "Echo", "Charlie", "Foxtrot", "The Delta"],
+            ["The Delta", "Charlie", "Foxtrot", "Echo", "Alpha", "Bravo"],
+        ),
+        (
+            "ProductionYear",
+            ["Bravo", "The Delta", "Alpha", "Echo", "Charlie", "Foxtrot"],
+            ["Charlie", "Foxtrot", "Echo", "Alpha", "Bravo", "The Delta"],
+        ),
+        (
+            "CommunityRating",
+            ["Alpha", "The Delta", "Bravo", "Echo", "Charlie", "Foxtrot"],
+            ["Charlie", "Foxtrot", "Bravo", "Echo", "Alpha", "The Delta"],
+        ),
+        (
+            "Runtime",
+            ["The Delta", "Foxtrot", "Alpha", "Bravo", "Echo", "Charlie"],
+            ["Charlie", "Bravo", "Echo", "Alpha", "The Delta", "Foxtrot"],
+        ),
+    ];
+    // The data must tell Name from SortName.
+    assert_ne!(cases[0].1, cases[1].1);
+    for (key, ascending, descending) in cases {
+        for (order, expected) in [("Ascending", ascending), ("Descending", descending)] {
+            let uri = format!(
+                "/Items?Recursive=true&IncludeItemTypes=Movie&SortBy={key}&SortOrder={order}"
+            );
+            assert_eq!(b23_names(&app, &token, &uri).await, expected, "{uri}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn b23_comma_lists_apply_in_order_on_both_item_lists() {
+    let state = test_state().await;
+    let movies = rustyfin_model::library::LibraryContentType::Movies;
+    let (token, user_id, _) = b23_library(&state, movies, &b23_movies()).await;
+    let app = app(state);
+    let rating_down_year_up = ["Charlie", "Foxtrot", "Bravo", "Echo", "The Delta", "Alpha"];
+    let cases = [
+        // Each key takes the order at its position.
+        (
+            "SortBy=CommunityRating,ProductionYear&SortOrder=Descending,Ascending",
+            rating_down_year_up,
+        ),
+        // Names match without case; blanks are trimmed and empty entries dropped.
+        (
+            "sortBy=communityrating,%20productionyear,&sortOrder=descending,%20ascending",
+            rating_down_year_up,
+        ),
+        // Keys past the orders take the first one...
+        (
+            "SortBy=CommunityRating,ProductionYear&SortOrder=Descending",
+            ["Charlie", "Foxtrot", "Echo", "Bravo", "Alpha", "The Delta"],
+        ),
+        // ...or Ascending when there is none.
+        (
+            "SortBy=CommunityRating,ProductionYear",
+            ["The Delta", "Alpha", "Bravo", "Echo", "Charlie", "Foxtrot"],
+        ),
+        // Orders past the keys are ignored.
+        (
+            "SortBy=ProductionYear&SortOrder=Descending,Ascending",
+            ["Charlie", "Foxtrot", "Echo", "Alpha", "Bravo", "The Delta"],
+        ),
+        // An order that isn't one is dropped, so the next one is the first.
+        (
+            "SortBy=ProductionYear,SortName&SortOrder=Sideways,Descending",
+            ["Foxtrot", "Charlie", "Echo", "Alpha", "The Delta", "Bravo"],
+        ),
+        // Default, and Random after the first key, order nothing but keep their order's place, as
+        // Jellyfin pairs keys with orders before it drops them.
+        (
+            "SortBy=Default,ProductionYear&SortOrder=Ascending,Descending",
+            ["Charlie", "Foxtrot", "Echo", "Alpha", "Bravo", "The Delta"],
+        ),
+        (
+            "SortBy=ProductionYear,Random,CommunityRating&SortOrder=Ascending,Ascending,Descending",
+            ["Bravo", "The Delta", "Alpha", "Echo", "Charlie", "Foxtrot"],
+        ),
+        // jellyfin-web's "Date added", newest first.
+        (
+            "SortBy=DateCreated,SortName,ProductionYear&SortOrder=Descending",
+            ["Alpha", "The Delta", "Foxtrot", "Echo", "Charlie", "Bravo"],
+        ),
+    ];
+    for (query, expected) in cases {
+        for list in ["/Items".to_string(), format!("/Users/{user_id}/Items")] {
+            let uri = format!("{list}?Recursive=true&IncludeItemTypes=Movie&{query}");
+            assert_eq!(b23_names(&app, &token, &uri).await, expected, "{uri}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn b23_toolbar_sorts_reverse_exactly_and_page_stably() {
+    let state = test_state().await;
+    let dune = |name, year| B23Item {
+        name,
+        sort_name: "dune",
+        media_type: "Movie",
+        year,
+        added: "2021-03-01T10:00:00+00:00",
+        ..Default::default()
+    };
+    let mut items = b23_movies();
+    items.extend([
+        dune("Dune", Some(2021)),
+        dune("Dune", Some(2021)),
+        dune("DUNE", None),
+        dune("Dune", Some(1984)),
+    ]);
+    let movies = rustyfin_model::library::LibraryContentType::Movies;
+    let (token, _, ids) = b23_library(&state, movies, &items).await;
+    let app = app(state);
+    // The web client's lists and their ascending orders, as positions in `items`. Each key takes
+    // the one SortOrder, so Descending must give the exact reverse.
+    let cases: [(&str, [usize; 10]); 4] = [
+        ("SortName,ProductionYear", [4, 3, 2, 1, 8, 9, 6, 7, 0, 5]),
+        (
+            "PremiereDate,SortName,ProductionYear",
+            [3, 8, 9, 4, 0, 2, 5, 1, 6, 7],
+        ),
+        (
+            "DateCreated,SortName,ProductionYear",
+            [3, 2, 8, 9, 6, 7, 0, 5, 1, 4],
+        ),
+        (
+            "CommunityRating,SortName,ProductionYear",
+            [4, 1, 8, 9, 6, 7, 3, 0, 2, 5],
+        ),
+    ];
+    for (sort_by, ascending) in cases {
+        let mut descending = ascending;
+        descending.reverse();
+        for (order, expected) in [("Ascending", ascending), ("Descending", descending)] {
+            let uri = format!(
+                "/Items?Recursive=true&IncludeItemTypes=Movie&SortBy={sort_by}&SortOrder={order}"
+            );
+            assert_eq!(b23_order(&app, &token, &uri, &ids).await, expected, "{uri}");
+            let mut paged = Vec::new();
+            for start in [0, 3, 6, 9] {
+                let page = format!("{uri}&StartIndex={start}&Limit=3");
+                paged.extend(b23_order(&app, &token, &page, &ids).await);
+            }
+            assert_eq!(paged, expected, "{uri} in pages of 3");
+        }
+    }
+}
+
+#[tokio::test]
+async fn b23_episode_numbers_sort_in_order() {
+    let state = test_state().await;
+    let ep = |name, sort_name, season, episode| B23Item {
+        name,
+        sort_name,
+        media_type: "Episode",
+        season,
+        episode,
+        ..Default::default()
+    };
+    let items = [
+        ep("Winter", "winter", Some(2), Some(1)),
+        ep("Spring", "spring", Some(1), Some(2)),
+        ep("Pilot", "pilot", Some(1), Some(1)),
+        ep("Special", "special", None, None),
+        ep("Behind", "behind", Some(2), None),
+    ];
+    let tv = rustyfin_model::library::LibraryContentType::TvShows;
+    let (token, _, _) = b23_library(&state, tv, &items).await;
+    let app = app(state);
+    let list = "/Items?Recursive=true&IncludeItemTypes=Episode";
+    let uri = format!("{list}&SortBy=ParentIndexNumber,IndexNumber,SortName&SortOrder=Ascending");
+    assert_eq!(
+        b23_names(&app, &token, &uri).await,
+        ["Special", "Pilot", "Spring", "Behind", "Winter"]
+    );
+    let uri = format!("{list}&SortBy=ParentIndexNumber,IndexNumber&SortOrder=Descending");
+    assert_eq!(
+        b23_names(&app, &token, &uri).await,
+        ["Winter", "Behind", "Spring", "Pilot", "Special"]
+    );
+}
+
+#[tokio::test]
+async fn b23_a_sort_list_of_any_length_answers_as_its_distinct_keys() {
+    let state = test_state().await;
+    let movies = rustyfin_model::library::LibraryContentType::Movies;
+    let (token, user_id, _) = b23_library(&state, movies, &b23_movies()).await;
+    let app = app(state);
+    // SQLite allows 2,000 ORDER BY terms. Jellyfin's EF Core adds a repeated expression only once,
+    // and so does Rustyfin, so a list of any length sorts as its distinct keys do.
+    let names = ["Name"; 2000].join(",");
+    for list in ["/Items".to_string(), format!("/Users/{user_id}/Items")] {
+        let list = format!("{list}?Recursive=true&IncludeItemTypes=Movie&SortOrder=Descending");
+        let once = b23_names(&app, &token, &format!("{list}&SortBy=Name")).await;
+        assert_eq!(once.len(), 6, "{list}");
+        // Not through b23_names, whose message would print all 2,000 keys.
+        let uri = format!("{list}&SortBy={names}");
+        let (status, json) = send_authed(&app, "GET", &uri, &token, None).await;
+        assert_eq!(status, StatusCode::OK, "{list}&SortBy=Name x2000: {json}");
+        let repeated: Vec<&str> = json["Items"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| item["Name"].as_str().unwrap_or_default())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(repeated, once, "{list}");
+    }
+}
+
+/// A request to send: what it is, its URI, the token it is sent with, and the names it answers
+/// with an empty query cache.
+type B23Request = (&'static str, String, String, &'static [&'static str]);
+
+/// Two requests whose filters gave the same 64-bit query-cache key: the owner's favorite movies, and
+/// the viewer's favorites less 63 excluded item types, the owner's id second, which run through the
+/// owner's cached query listed the owner's favorites. The owner's favorite is "G1c Movie 1"; the
+/// viewer's are "G1c Movie 2" and "B23 Series".
+async fn b23_colliding_requests() -> (axum::Router, [B23Request; 2]) {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, owner_id, viewer, viewer_id) = g1_owner_and_viewer(&state, &app).await;
+    let movies = g1c_insert_movies(&state, 2).await;
+    let series = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO media_items (id, library_id, name, sort_name, media_type, path) \
+         SELECT ?, library_id, 'B23 Series', 'B23 Series', 'Series', path || '.series' \
+         FROM media_items WHERE id = ?",
+    )
+    .bind(series.to_string())
+    .bind(movies[0].to_string())
+    .execute(&state.db)
+    .await
+    .unwrap();
+    let favorites = [
+        (&owner_id, movies[0]),
+        (&viewer_id, movies[1]),
+        (&viewer_id, series),
+    ];
+    for (user, item) in favorites {
+        rustyfin_db::repo_playback::set_favorite(&state.db, user.parse().unwrap(), item, true)
+            .await
+            .unwrap();
+    }
+    let mut excluded = vec!["Movie".to_string(), owner_id, "100".into(), "0".into()];
+    excluded.extend((4..63).map(|i| format!("Type{i}")));
+    let excluded = excluded.join(",");
+    let owners = "/Items?Recursive=true&IncludeItemTypes=Movie&IsFavorite=true".to_string();
+    let crafted = format!("/Items?Recursive=true&ExcludeItemTypes={excluded}&IsFavorite=true");
+    let (owner_sees, viewer_sees): (&[&str], &[&str]) = (&["G1c Movie 1"], &["B23 Series"]);
+    let requests = [
+        ("the owner's favorite movies", owners, owner, owner_sees),
+        ("the viewer's crafted list", crafted, viewer, viewer_sees),
+    ];
+    (app, requests)
+}
+
+/// Sends each request in turn and asserts that it answers as with an empty query cache.
+async fn b23_assert_answers(app: &axum::Router, requests: &[B23Request]) {
+    for (what, uri, token, expected) in requests {
+        let (status, items, total) = g1c_list(app, uri, token).await;
+        assert_eq!(status, StatusCode::OK, "{what}");
+        let mut names: Vec<&str> = items
+            .iter()
+            .map(|item| item["Name"].as_str().unwrap_or_default())
+            .collect();
+        names.sort_unstable();
+        assert_eq!(names, *expected, "{what}");
+        assert_eq!(total, expected.len() as i64, "{what}: TotalRecordCount");
+    }
+}
+
+#[tokio::test]
+async fn b23_a_cached_query_serves_only_its_own_shape() {
+    // The owner's query is in the cache when the viewer's crafted request comes.
+    let (app, requests) = b23_colliding_requests().await;
+    b23_assert_answers(&app, &requests).await;
+}
+
+#[tokio::test]
+async fn b23_a_crafted_query_cached_first_does_not_break_the_view() {
+    let (app, [owners, crafted]) = b23_colliding_requests().await;
+    b23_assert_answers(&app, &[crafted, owners]).await;
+}
+
 // ── G1c ──
 // One user's data stays theirs: GET /Items/Resume lists only the caller's items (or those of the
 // user a userId names, under path_user's rules), IsFavorite/IsPlayed/IsUnplayed match only the

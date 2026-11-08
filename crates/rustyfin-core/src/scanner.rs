@@ -1,4 +1,4 @@
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use rustyfin_db::repo_media::PathScope;
 use rustyfin_model::library::{Library, LibraryContentType};
 use rustyfin_model::media::{MediaItem, MediaType};
@@ -447,7 +447,7 @@ async fn scan_flat_library(
                 community_rating: None,
                 official_rating: None,
                 genres: vec![],
-                date_created: Utc::now(),
+                date_created: date_added(&file_path_buf).await,
                 premiere_date: None,
                 runtime_ticks: None,
                 index_number: None,
@@ -484,6 +484,7 @@ async fn scan_flat_library(
                 }
             }
             scan_sync::GroupOutcome::New { path, steps } => {
+                let date_created = date_added(Path::new(&path)).await;
                 let item = MediaItem {
                     id: Uuid::new_v4(),
                     name: group.title.clone(),
@@ -497,7 +498,7 @@ async fn scan_flat_library(
                     community_rating: None,
                     official_rating: None,
                     genres: vec![],
-                    date_created: Utc::now(),
+                    date_created,
                     premiere_date: None,
                     runtime_ticks: None,
                     index_number: None,
@@ -713,7 +714,7 @@ async fn scan_tv_library(
                     community_rating: None,
                     official_rating: None,
                     genres: vec![],
-                    date_created: Utc::now(),
+                    date_created: date_added(Path::new(&series_dir)).await,
                     premiere_date: None,
                     runtime_ticks: None,
                     index_number: None,
@@ -751,7 +752,7 @@ async fn scan_tv_library(
                     community_rating: None,
                     official_rating: None,
                     genres: vec![],
-                    date_created: Utc::now(),
+                    date_created: date_added(Path::new(&season_path)).await,
                     premiere_date: None,
                     runtime_ticks: None,
                     index_number: season_index,
@@ -852,6 +853,7 @@ async fn scan_tv_library(
                     .and_then(|s| s.to_str())
                     .unwrap_or("Unknown")
                     .to_string();
+                let date_created = date_added(Path::new(&path)).await;
                 let item = MediaItem {
                     id: Uuid::new_v4(),
                     name: name.clone(),
@@ -865,7 +867,7 @@ async fn scan_tv_library(
                     community_rating: None,
                     official_rating: None,
                     genres: vec![],
-                    date_created: Utc::now(),
+                    date_created,
                     premiere_date: None,
                     runtime_ticks: None,
                     index_number: group.index_number,
@@ -1148,7 +1150,7 @@ async fn scan_music_library(
                         community_rating: None,
                         official_rating: None,
                         genres: vec![],
-                        date_created: Utc::now(),
+                        date_created: date_added(Path::new(&artist_dir)).await,
                         premiere_date: None,
                         runtime_ticks: None,
                         index_number: None,
@@ -1190,7 +1192,7 @@ async fn scan_music_library(
                     community_rating: None,
                     official_rating: None,
                     genres: genre.clone().map_or(vec![], |g| vec![g]),
-                    date_created: Utc::now(),
+                    date_created: date_added(Path::new(&album_dir)).await,
                     premiere_date: None,
                     runtime_ticks: None,
                     index_number: None,
@@ -1247,7 +1249,7 @@ async fn scan_music_library(
                 community_rating: None,
                 official_rating: None,
                 genres: genre.clone().map_or(vec![], |g| vec![g]),
-                date_created: Utc::now(),
+                date_created: date_added(&file_path_buf).await,
                 premiere_date: None,
                 runtime_ticks: None,
                 index_number: track_number,
@@ -1402,6 +1404,51 @@ pub(crate) async fn dir_id(path: &Path) -> std::io::Result<DirId> {
 #[cfg(not(unix))]
 pub(crate) async fn dir_id(path: &Path) -> std::io::Result<DirId> {
     fs::canonicalize(path).await
+}
+
+/// The metadata `date_added` reads for `path`. A file link gives its final target's, every hop
+/// followed, as Jellyfin resolves one; anything else, a folder link, and a link whose target can't be
+/// read give the entry's own, from `lstat`. None if even that can't be read.
+async fn date_metadata(path: &Path) -> Option<std::fs::Metadata> {
+    let own = fs::symlink_metadata(path).await.ok()?;
+    if own.file_type().is_symlink()
+        && let Ok(target) = fs::metadata(path).await
+        && target.is_file()
+    {
+        return Some(target);
+    }
+    Some(own)
+}
+
+/// When the item at `path` was added, as Jellyfin dates it. On Linux .NET has no birth time, so its
+/// creation time is the older of the modification and status-change times, from `date_metadata`, so
+/// a file link is dated by its final target and a folder link by its own times. Now, if they
+/// can't be read.
+#[cfg(target_os = "linux")]
+async fn date_added(path: &Path) -> DateTime<Utc> {
+    use std::os::unix::fs::MetadataExt;
+    let Some(meta) = date_metadata(path).await else {
+        return Utc::now();
+    };
+    let modified = (meta.mtime(), meta.mtime_nsec());
+    let changed = (meta.ctime(), meta.ctime_nsec());
+    let (secs, nsecs) = modified.min(changed);
+    DateTime::<Utc>::from_timestamp(secs, nsecs as u32).unwrap_or_else(Utc::now)
+}
+
+/// When the item at `path` was added, as Jellyfin dates it: its creation time, else its
+/// modification time, from `date_metadata`, so a file link is dated by its final target and a
+/// folder link by its own times. Now, if they can't be read.
+#[cfg(not(target_os = "linux"))]
+async fn date_added(path: &Path) -> DateTime<Utc> {
+    match date_metadata(path).await {
+        Some(meta) => meta
+            .created()
+            .or_else(|_| meta.modified())
+            .map(DateTime::<Utc>::from)
+            .unwrap_or_else(|_| Utc::now()),
+        None => Utc::now(),
+    }
 }
 
 /// What a scan makes of one entry of a folder.

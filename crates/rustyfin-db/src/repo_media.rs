@@ -284,36 +284,48 @@ pub async fn get_latest_items(
 }
 
 /// Query plan cache for `get_items_filtered`.
-/// Maps a query signature (hash of the SQL structure) to a cached SQL string,
-/// so repeated calls with the same filter shape reuse the same query plan.
+/// Maps a request's shape to its SQL, so repeated calls with the same filter shape reuse the same
+/// query plan.
 ///
-/// The signature is built from the number of array elements in each filter,
-/// not the actual values, so different values with the same shape share a plan.
+/// The shape holds the number of array elements in each filter, the flags and the parsed sort
+/// terms, not the actual values, so different values with the same shape share a plan. The map is
+/// keyed by the shape itself, so a lookup finds only an entry whose shape equals the request's: two
+/// shapes whose hashes collide never share SQL, whose binds would not fit.
+/// It holds at most `FILTER_QUERY_CACHE_CAP` shapes, and a query longer than
+/// `FILTER_QUERY_MAX_CACHED_SQL` bytes is never stored.
 /// Uses parking_lot::Mutex instead of std::sync::Mutex to avoid blocking Tokio threads.
-type QueryCache = parking_lot::Mutex<HashMap<u64, (String, String)>>;
+type QueryCache = parking_lot::Mutex<HashMap<FilterShape, (String, String)>>;
 
 static FILTER_QUERY_CACHE: LazyLock<QueryCache> =
     LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
 
-/// Simple hash combiner for building a cache key from multiple u64 values.
-pub(crate) fn hash_combine(mut hash: u64, key: u64) -> u64 {
-    hash ^= key
-        .wrapping_add(0x9e3779b97f4a7c15)
-        .wrapping_add(hash << 6)
-        .wrapping_add(hash >> 2);
-    hash
+/// At most this many query shapes are cached. Once it is full a new shape is built for each request
+/// and not stored, so no request can push out the shapes in use.
+const FILTER_QUERY_CACHE_CAP: usize = 256;
+/// A query whose SQL (count and data together) is longer than this is never cached: each genre or
+/// tag adds a clause, so the size follows the request.
+const FILTER_QUERY_MAX_CACHED_SQL: usize = 16 * 1024;
+
+/// What a `get_items_filtered` request's SQL is built from: the length of each array filter, the
+/// flags and the parsed sort terms. Equal shapes build the same SQL.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct FilterShape {
+    media_types_len: usize,
+    exclude_media_types_len: usize,
+    genres_len: usize,
+    years_len: usize,
+    official_ratings_len: usize,
+    tags_len: usize,
+    media_types_filter_len: usize,
+    recursive: bool,
+    is_favorite: Option<bool>,
+    is_unplayed: Option<bool>,
+    is_played: Option<bool>,
+    sort: Vec<SortTerm>,
 }
 
-fn opt_bool_to_u64(v: Option<bool>) -> u64 {
-    match v {
-        None => 0,
-        Some(true) => 1,
-        Some(false) => 2,
-    }
-}
-
-/// Build a cache key from the filter array sizes and options.
-/// Same filter shape and sorting → same key → same cached query plan.
+/// Build the cache key: the request's shape. Lists that parse to the same sort terms have equal
+/// shapes, so the same cached query plan serves them.
 pub(crate) fn filter_cache_key(
     media_types_len: usize,
     exclude_media_types_len: usize,
@@ -328,35 +340,192 @@ pub(crate) fn filter_cache_key(
     is_played: Option<bool>,
     sort_by: &str,
     sort_order: &str,
-) -> u64 {
-    let mut h = 0u64;
-    h = hash_combine(h, media_types_len as u64);
-    h = hash_combine(h, exclude_media_types_len as u64);
-    h = hash_combine(h, genres_len as u64);
-    h = hash_combine(h, years_len as u64);
-    h = hash_combine(h, official_ratings_len as u64);
-    h = hash_combine(h, tags_len as u64);
-    h = hash_combine(h, media_types_filter_len as u64);
-    h = hash_combine(h, recursive as u64);
-    h = hash_combine(h, opt_bool_to_u64(is_favorite));
-    h = hash_combine(h, opt_bool_to_u64(is_unplayed));
-    h = hash_combine(h, opt_bool_to_u64(is_played));
-    for b in sort_by.as_bytes() {
-        h = hash_combine(h, *b as u64);
+) -> FilterShape {
+    FilterShape {
+        media_types_len,
+        exclude_media_types_len,
+        genres_len,
+        years_len,
+        official_ratings_len,
+        tags_len,
+        media_types_filter_len,
+        recursive,
+        is_favorite,
+        is_unplayed,
+        is_played,
+        sort: parse_sort(sort_by, sort_order),
     }
-    for b in sort_order.as_bytes() {
-        h = hash_combine(h, *b as u64);
+}
+
+/// A SortBy key as Jellyfin names it. Keys match without case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum SortKey {
+    SortName,
+    Name,
+    DateCreated,
+    PremiereDate,
+    ProductionYear,
+    CommunityRating,
+    Runtime,
+    ParentIndexNumber,
+    IndexNumber,
+    Random,
+    /// Dropped after the keys are paired with the orders, so it never reaches a clause.
+    Default,
+    /// Any other key; it orders by `sort_name`.
+    Other,
+}
+
+impl SortKey {
+    /// Reads one SortBy entry, matched without case.
+    fn parse(entry: &str) -> SortKey {
+        match entry.to_ascii_lowercase().as_str() {
+            "default" => SortKey::Default,
+            "sortname" => SortKey::SortName,
+            "name" => SortKey::Name,
+            "datecreated" | "dateadded" => SortKey::DateCreated,
+            "premieredate" => SortKey::PremiereDate,
+            "productionyear" => SortKey::ProductionYear,
+            "communityrating" | "criticrating" => SortKey::CommunityRating,
+            "runtime" => SortKey::Runtime,
+            "parentindexnumber" => SortKey::ParentIndexNumber,
+            "indexnumber" => SortKey::IndexNumber,
+            "random" => SortKey::Random,
+            _ => SortKey::Other,
+        }
     }
-    h
+
+    /// The SQL expression this key orders by.
+    fn expr(self) -> &'static str {
+        match self {
+            SortKey::SortName | SortKey::Other | SortKey::Default => "sort_name",
+            SortKey::Name => "name",
+            SortKey::DateCreated => "date_created",
+            SortKey::PremiereDate => concat!(
+                "COALESCE(substr(premiere_date, 1, 10), ",
+                "CASE WHEN production_year IS NOT NULL THEN printf('%04d-01-01', production_year) END)"
+            ),
+            SortKey::ProductionYear => "production_year",
+            SortKey::CommunityRating => "community_rating",
+            SortKey::Runtime => "runtime_ticks",
+            SortKey::ParentIndexNumber => "parent_index_number",
+            SortKey::IndexNumber => "index_number",
+            SortKey::Random => "ROWID",
+        }
+    }
+}
+
+/// One sort key with its direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct SortTerm {
+    key: SortKey,
+    descending: bool,
+}
+
+/// Reads SortBy and SortOrder as Jellyfin does. Both are comma lists, and blank entries and orders
+/// other than Ascending and Descending are dropped. Every key takes the order at its position, with
+/// keys past the orders taking the first order (Ascending when there is none). Only after pairing
+/// do Default and a Random that isn't first go, so later keys keep their orders. A repeated SQL
+/// expression keeps only its first term, as EF Core does for Jellyfin. With no keys left,
+/// SortName applies with the first order. The result is never empty.
+fn parse_sort(sort_by: &str, sort_order: &str) -> Vec<SortTerm> {
+    let orders: Vec<bool> = sort_order
+        .split(',')
+        .map(str::trim)
+        .filter_map(|order| {
+            if order.eq_ignore_ascii_case("Ascending") {
+                Some(false)
+            } else if order.eq_ignore_ascii_case("Descending") {
+                Some(true)
+            } else {
+                None
+            }
+        })
+        .collect();
+    let first_order = orders.first().copied().unwrap_or(false);
+    // Every non-blank key takes the order at its position, Default and Random included.
+    let paired = sort_by
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .enumerate()
+        .map(|(i, entry)| SortTerm {
+            key: SortKey::parse(entry),
+            descending: orders.get(i).copied().unwrap_or(first_order),
+        });
+    // Only then does Default go, and a Random that isn't first of what is left, and a term whose
+    // expression is already kept.
+    let mut terms: Vec<SortTerm> = Vec::new();
+    for term in paired {
+        match term.key {
+            SortKey::Default => {}
+            SortKey::Random if !terms.is_empty() => {}
+            _ if terms.iter().any(|kept| kept.key.expr() == term.key.expr()) => {}
+            _ => terms.push(term),
+        }
+    }
+    if terms.is_empty() {
+        return vec![SortTerm {
+            key: SortKey::SortName,
+            descending: first_order,
+        }];
+    }
+    terms
+}
+
+/// Whether `terms` sort randomly, which holds only when the first key is Random.
+fn is_random_sort(terms: &[SortTerm]) -> bool {
+    terms
+        .first()
+        .is_some_and(|term| term.key == SortKey::Random)
+}
+
+/// The ORDER BY clause for `terms`: each key in its own direction. A first SortName key brings Name
+/// along right after it, in the same direction. Without a SortName or Name key, ties go by
+/// sort_name ascending. The id comes last, in the first key's direction, so every order is total
+/// and pages stay stable. An expression already in the clause is never added again, so its first
+/// part keeps its direction.
+fn order_by_clause(terms: &[SortTerm]) -> String {
+    let mut parts: Vec<(&'static str, &'static str)> = Vec::new();
+    // Adds one (expr, dir) part unless its expression is already in the clause.
+    let mut add = |expr: &'static str, dir: &'static str| {
+        if !parts.iter().any(|(seen, _)| *seen == expr) {
+            parts.push((expr, dir));
+        }
+    };
+    for (i, term) in terms.iter().enumerate() {
+        let dir = if term.descending { "DESC" } else { "ASC" };
+        add(term.key.expr(), dir);
+        if i == 0 && term.key == SortKey::SortName {
+            add("name", dir);
+        }
+    }
+    let has_name_key = terms
+        .iter()
+        .any(|term| matches!(term.key, SortKey::SortName | SortKey::Name));
+    if !has_name_key {
+        add("sort_name", "ASC");
+    }
+    let id_dir = if terms.first().is_some_and(|term| term.descending) {
+        "DESC"
+    } else {
+        "ASC"
+    };
+    add("id", id_dir);
+    let clause: Vec<String> = parts
+        .iter()
+        .map(|(expr, dir)| format!("{expr} {dir}"))
+        .collect();
+    format!("ORDER BY {}", clause.join(", "))
 }
 
 /// Build the SQL query with a static base for single-value params and dynamic
-/// parts only for array filters. Uses the cache to reuse query plans when the
-/// filter array sizes match a previous call.
+/// parts only for array filters. Reuses the SQL cached for an earlier call of the same shape.
+/// The key is built here, from the filter this call renders, so no caller can pair a key with a
+/// different filter.
 #[allow(clippy::too_many_arguments)]
 fn build_filtered_query(
-    cache_key: u64,
-    _recursive: bool,
+    recursive: bool,
     media_types: Option<&[String]>,
     exclude_media_types: Option<&[String]>,
     genres: Option<&[String]>,
@@ -370,7 +539,23 @@ fn build_filtered_query(
     sort_by: &str,
     sort_order: &str,
 ) -> (String, String) {
-    // Check cache first
+    let cache_key = filter_cache_key(
+        media_types.map(|t| t.len()).unwrap_or(0),
+        exclude_media_types.map(|t| t.len()).unwrap_or(0),
+        genres.map(|g| g.len()).unwrap_or(0),
+        years.map(|y| y.len()).unwrap_or(0),
+        official_ratings.map(|r| r.len()).unwrap_or(0),
+        tags.map(|t| t.len()).unwrap_or(0),
+        media_types_filter.map(|t| t.len()).unwrap_or(0),
+        recursive,
+        is_favorite,
+        is_unplayed,
+        is_played,
+        sort_by,
+        sort_order,
+    );
+
+    // Check cache first: a hit needs a stored shape equal to this one, not just an equal hash.
     {
         let cache = FILTER_QUERY_CACHE.lock();
         if let Some((count_sql, data_sql)) = cache.get(&cache_key) {
@@ -506,27 +691,11 @@ fn build_filtered_query(
         format!(" AND {}", where_parts.join(" AND "))
     };
 
-    let is_random = sort_by == "Random";
-    let order_col = match sort_by {
-        "DateCreated" | "DateAdded" => "date_created",
-        "PremiereDate" => "premiere_date",
-        "ProductionYear" => "production_year",
-        "CommunityRating" | "CriticRating" => "community_rating",
-        "Name" => "name",
-        "Random" => "ROWID",
-        "Runtime" => "runtime_ticks",
-        _ => "sort_name",
-    };
-    let dir = if sort_order == "Descending" {
-        "DESC"
-    } else {
-        "ASC"
-    };
-
-    let order_clause = if is_random {
+    let terms = parse_sort(sort_by, sort_order);
+    let order_clause = if is_random_sort(&terms) {
         "ORDER BY ROWID".to_string()
     } else {
-        format!("ORDER BY {} {}", order_col, dir)
+        order_by_clause(&terms)
     };
 
     let count_sql = format!(
@@ -543,10 +712,14 @@ fn build_filtered_query(
         base_where, array_where, order_clause
     );
 
-    // Cache the result
+    // Cache the result, unless the SQL is too long to keep or the cache is full.
     {
         let mut cache = FILTER_QUERY_CACHE.lock();
-        cache.insert(cache_key, (count_sql.clone(), data_sql.clone()));
+        if count_sql.len() + data_sql.len() <= FILTER_QUERY_MAX_CACHED_SQL
+            && cache.len() < FILTER_QUERY_CACHE_CAP
+        {
+            cache.insert(cache_key, (count_sql.clone(), data_sql.clone()));
+        }
     }
 
     (count_sql, data_sql)
@@ -608,26 +781,8 @@ pub async fn get_items_filtered(
     let sort_by_str = sort_by.unwrap_or("SortName");
     let sort_order_str = sort_order.unwrap_or("Ascending");
 
-    // Build cache key from array filter sizes and options
-    let cache_key = filter_cache_key(
-        media_types.map(|t| t.len()).unwrap_or(0),
-        exclude_media_types.map(|t| t.len()).unwrap_or(0),
-        genres.map(|g| g.len()).unwrap_or(0),
-        years.map(|y| y.len()).unwrap_or(0),
-        official_ratings.map(|r| r.len()).unwrap_or(0),
-        tags.map(|t| t.len()).unwrap_or(0),
-        media_types_filter.map(|t| t.len()).unwrap_or(0),
-        recursive,
-        is_favorite,
-        is_unplayed,
-        is_played,
-        sort_by_str,
-        sort_order_str,
-    );
-
     // Get cached query strings — same array sizes → same plan
     let (count_sql, data_sql) = build_filtered_query(
-        cache_key,
         recursive,
         media_types,
         exclude_media_types,
@@ -874,7 +1029,7 @@ pub async fn get_items_filtered(
     }
 
     // Pagination
-    let is_random = sort_by_str == "Random";
+    let is_random = is_random_sort(&parse_sort(sort_by_str, sort_order_str));
     if is_random {
         let random_offset = if total > 0 {
             fastrand::u64(0..total as u64) as i64
@@ -2464,46 +2619,452 @@ pub async fn get_folder_counts_batch(
 
 mod tests {
 
+    /// Serializes the tests that empty or fill the process-wide query cache.
+    #[cfg(test)]
+    static QUERY_CACHE_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
-    fn test_hash_combine_no_overflow() {
-        let mut h = 0u64;
-        for i in 0..100 {
-            h = super::hash_combine(h, i);
+    fn test_filter_cache_key_tells_flags_apart() {
+        let (sort_by, sort_order) = ("SortName", "Ascending");
+        let key = |fav| {
+            super::filter_cache_key(
+                1, 0, 2, 1, 0, 0, 0, false, fav, None, None, sort_by, sort_order,
+            )
+        };
+        assert_eq!(key(None), key(None));
+        assert_ne!(key(None), key(Some(true)));
+    }
+
+    #[test]
+    fn test_order_by_follows_jellyfin_sort_rules() {
+        let order_by = |sort_by: &str, sort_order: &str| -> String {
+            super::order_by_clause(&super::parse_sort(sort_by, sort_order))
+        };
+        assert_eq!(
+            order_by("DateCreated,SortName,ProductionYear", "Descending"),
+            "ORDER BY date_created DESC, sort_name DESC, production_year DESC, id DESC"
+        );
+        assert_eq!(
+            order_by("SortName,ProductionYear", "Ascending"),
+            "ORDER BY sort_name ASC, name ASC, production_year ASC, id ASC"
+        );
+        assert_eq!(
+            order_by("CommunityRating", "Descending"),
+            "ORDER BY community_rating DESC, sort_name ASC, id DESC"
+        );
+        assert_eq!(
+            order_by("ProductionYear,SortName", "Sideways,Descending"),
+            "ORDER BY production_year DESC, sort_name DESC, id DESC"
+        );
+        // Blank entries and Default are dropped, which leaves the default SortName.
+        assert_eq!(
+            order_by(" Default, ,", ""),
+            "ORDER BY sort_name ASC, name ASC, id ASC"
+        );
+        // Default takes a place when the orders are paired, then goes, so ProductionYear is
+        // Descending. A Random that isn't first is dropped after pairing, so CommunityRating keeps
+        // its own order.
+        assert_eq!(
+            order_by("Default,ProductionYear", "Ascending,Descending"),
+            "ORDER BY production_year DESC, sort_name ASC, id DESC"
+        );
+        assert_eq!(
+            order_by(
+                "ProductionYear,Random,CommunityRating",
+                "Ascending,Ascending,Descending"
+            ),
+            "ORDER BY production_year ASC, community_rating DESC, sort_name ASC, id ASC"
+        );
+        // Once Default is gone, Random is first, so the page is random.
+        assert!(super::is_random_sort(&super::parse_sort(
+            "Default,Random",
+            ""
+        )));
+        // Default alone leaves nothing, so SortName takes the first order.
+        assert_eq!(
+            order_by("Default", "Descending"),
+            "ORDER BY sort_name DESC, name DESC, id DESC"
+        );
+        // Random sorts only as the first key.
+        assert!(super::is_random_sort(&super::parse_sort(
+            "random,SortName",
+            ""
+        )));
+        assert!(!super::is_random_sort(&super::parse_sort(
+            "SortName,Random",
+            ""
+        )));
+    }
+
+    #[test]
+    fn test_order_by_adds_each_expression_once() {
+        let order_by = |sort_by: &str, sort_order: &str| -> String {
+            super::order_by_clause(&super::parse_sort(sort_by, sort_order))
+        };
+        // As EF Core does for Jellyfin, a term whose expression is already in the clause is
+        // skipped, and the first one keeps its order. SQLite allows 2,000 terms.
+        assert_eq!(
+            order_by(&["Name"; 2000].join(","), "Ascending"),
+            "ORDER BY name ASC, id ASC"
+        );
+        assert_eq!(
+            order_by(
+                "ProductionYear,DateAdded,productionyear,DateCreated",
+                "Ascending,Descending,Descending"
+            ),
+            "ORDER BY production_year ASC, date_created DESC, sort_name ASC, id ASC"
+        );
+        // Nor are the Name that a first SortName brings along and the sort_name tie-break added
+        // again.
+        assert_eq!(
+            order_by("SortName,Name,CommunityRating", "Descending"),
+            "ORDER BY sort_name DESC, name DESC, community_rating DESC, id DESC"
+        );
+        assert_eq!(
+            order_by("Album,ProductionYear", "Descending"),
+            "ORDER BY sort_name DESC, production_year DESC, id DESC"
+        );
+        // So a list repeated any number of times sorts as the list itself.
+        let keys = [
+            "SortName",
+            "Name",
+            "DateCreated",
+            "PremiereDate",
+            "ProductionYear",
+            "CommunityRating",
+            "Runtime",
+            "ParentIndexNumber",
+            "IndexNumber",
+            "Random",
+            "Album",
+        ];
+        assert_eq!(
+            order_by(&keys.repeat(500).join(","), "Descending"),
+            order_by(&keys.join(","), "Descending")
+        );
+    }
+
+    #[test]
+    fn test_filter_query_cache_is_keyed_on_parsed_terms_and_bounded() {
+        let _serial = QUERY_CACHE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let key = |sort_by: &str, sort_order: &str| {
+            super::filter_cache_key(
+                0, 0, 0, 0, 0, 0, 0, true, None, None, None, sort_by, sort_order,
+            )
+        };
+        let build = |genres: Option<&[String]>, sort_by: &str, sort_order: &str| {
+            super::build_filtered_query(
+                true, None, None, genres, None, None, None, None, None, None, None, sort_by,
+                sort_order,
+            )
+        };
+        // Lists that parse to the same terms share an entry. Different terms never do, even when
+        // their raw strings run together alike.
+        assert_eq!(
+            key("Name,name, Name", "Ascending"),
+            key("Name", "ascending,")
+        );
+        assert_ne!(key("SortName", "Ascending"), key("SortNameA", "scending"));
+        // A shape is stored while there is room.
+        let sort_by = "DateCreated,SortName,ProductionYear";
+        let built = build(None, sort_by, "Descending");
+        assert_eq!(
+            super::FILTER_QUERY_CACHE
+                .lock()
+                .get(&key(sort_by, "Descending")),
+            Some(&built)
+        );
+        // A query over 16 KiB is not: each genre adds a clause.
+        let genres = vec!["Drama".to_string(); 1000];
+        let big = || {
+            super::filter_cache_key(
+                0,
+                0,
+                genres.len(),
+                0,
+                0,
+                0,
+                0,
+                true,
+                None,
+                None,
+                None,
+                "SortName",
+                "Ascending",
+            )
+        };
+        let (count_sql, data_sql) = build(Some(genres.as_slice()), "SortName", "Ascending");
+        assert!(count_sql.len() + data_sql.len() > 16 * 1024);
+        assert!(!super::FILTER_QUERY_CACHE.lock().contains_key(&big()));
+        // However many distinct lists come, at most 256 entries are kept.
+        let keys = [
+            "SortName",
+            "Name",
+            "DateCreated",
+            "PremiereDate",
+            "ProductionYear",
+            "CommunityRating",
+            "Runtime",
+            "ParentIndexNumber",
+            "IndexNumber",
+        ];
+        let mut lists = 0;
+        for a in keys {
+            for b in keys {
+                for c in keys {
+                    if a == b || b == c || a == c {
+                        continue;
+                    }
+                    for order in ["Ascending", "Descending"] {
+                        let sort_by = format!("{a},{b},{c}");
+                        build(None, &sort_by, order);
+                        lists += 1;
+                    }
+                }
+            }
         }
-        assert_ne!(h, 0);
+        assert_eq!(lists, 1008);
+        assert!(super::FILTER_QUERY_CACHE.lock().len() <= 256);
+    }
 
-        let key = super::filter_cache_key(
-            1,
-            0,
-            2,
-            1,
-            0,
-            0,
-            0,
-            false,
-            None,
-            None,
-            None,
-            "SortName",
-            "Ascending",
-        );
-        assert_ne!(key, 0);
+    /// One included type and 63 excluded types, all else alike, gave the same 64-bit key, so the
+    /// shape stored first served its SQL to the other. Each gets its own, in either order.
+    #[test]
+    fn test_filter_query_cache_serves_each_shape_its_own_sql() {
+        let _serial = QUERY_CACHE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let included = ["Movie".to_string()];
+        let excluded: Vec<String> = (0..63).map(|i| format!("Type{i}")).collect();
+        let (fav, sort_by, sort_order) = (Some(true), "SortName", "Ascending");
+        let build = |include: Option<&[String]>, exclude: Option<&[String]>| {
+            super::build_filtered_query(
+                true, include, exclude, None, None, None, None, None, fav, None, None, sort_by,
+                sort_order,
+            )
+        };
+        let one = || build(Some(included.as_slice()), None);
+        let many = || build(None, Some(excluded.as_slice()));
+        // What each gets from an empty cache.
+        super::FILTER_QUERY_CACHE.lock().clear();
+        let one_sql = one();
+        super::FILTER_QUERY_CACHE.lock().clear();
+        let many_sql = many();
+        assert!(one_sql.1.contains("media_type IN (?)"));
+        let not_in = format!("media_type NOT IN ({})", ["?"; 63].join(","));
+        assert!(many_sql.1.contains(&not_in));
+        // Whichever is stored first, each still gets its own.
+        super::FILTER_QUERY_CACHE.lock().clear();
+        assert_eq!(one(), one_sql);
+        assert_eq!(many(), many_sql, "after one included type");
+        assert_eq!(one(), one_sql);
+        super::FILTER_QUERY_CACHE.lock().clear();
+        assert_eq!(many(), many_sql);
+        assert_eq!(one(), one_sql, "after 63 excluded types");
+        assert_eq!(many(), many_sql);
+    }
 
-        let key2 = super::filter_cache_key(
-            1,
-            0,
-            2,
-            1,
-            0,
-            0,
-            0,
-            false,
-            Some(true),
-            None,
-            None,
-            "SortName",
-            "Ascending",
+    /// Each input the cache key holds tells two requests apart. Each pair differs in one input, in
+    /// which of two lists holds a value, or in the order or directions of the sort terms. The two
+    /// get different keys, and whichever is stored first, both get the SQL they get from an empty
+    /// cache. A key that lost an input or merged two would serve one the other's SQL, with its
+    /// rows in the wrong order or its binds in the wrong places.
+    #[test]
+    fn test_filter_query_cache_tells_every_shape_input_apart() {
+        /// The inputs `build_filtered_query` renders, for one request.
+        #[derive(Clone)]
+        struct FilterRequest {
+            media_types: Option<Vec<String>>,
+            exclude_media_types: Option<Vec<String>>,
+            genres: Option<Vec<String>>,
+            years: Option<Vec<i32>>,
+            official_ratings: Option<Vec<String>>,
+            tags: Option<Vec<String>>,
+            media_types_filter: Option<Vec<String>>,
+            is_favorite: Option<bool>,
+            is_unplayed: Option<bool>,
+            is_played: Option<bool>,
+            sort_by: &'static str,
+            sort_order: &'static str,
+        }
+        /// A list of `n` values, or no list for 0.
+        fn words(n: usize) -> Option<Vec<String>> {
+            (n > 0).then(|| (0..n).map(|i| format!("w{i}")).collect())
+        }
+        fn years(n: usize) -> Option<Vec<i32>> {
+            (n > 0).then(|| (0..n).map(|i| 2000 + i as i32).collect())
+        }
+        /// `r`'s SQL through the cache.
+        fn cached_sql(r: &FilterRequest) -> (String, String) {
+            super::build_filtered_query(
+                true,
+                r.media_types.as_deref(),
+                r.exclude_media_types.as_deref(),
+                r.genres.as_deref(),
+                r.years.as_deref(),
+                r.official_ratings.as_deref(),
+                r.tags.as_deref(),
+                r.media_types_filter.as_deref(),
+                r.is_favorite,
+                r.is_unplayed,
+                r.is_played,
+                r.sort_by,
+                r.sort_order,
+            )
+        }
+        /// The length of a list, or 0 for no list.
+        fn len<T>(list: Option<&[T]>) -> usize {
+            list.map_or(0, <[T]>::len)
+        }
+        /// `r`'s cache key.
+        fn key(r: &FilterRequest) -> super::FilterShape {
+            super::filter_cache_key(
+                len(r.media_types.as_deref()),
+                len(r.exclude_media_types.as_deref()),
+                len(r.genres.as_deref()),
+                len(r.years.as_deref()),
+                len(r.official_ratings.as_deref()),
+                len(r.tags.as_deref()),
+                len(r.media_types_filter.as_deref()),
+                true,
+                r.is_favorite,
+                r.is_unplayed,
+                r.is_played,
+                r.sort_by,
+                r.sort_order,
+            )
+        }
+
+        let _serial = QUERY_CACHE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let base = FilterRequest {
+            media_types: None,
+            exclude_media_types: None,
+            genres: None,
+            years: None,
+            official_ratings: None,
+            tags: None,
+            media_types_filter: None,
+            is_favorite: None,
+            is_unplayed: None,
+            is_played: None,
+            sort_by: "SortName",
+            sort_order: "Ascending",
+        };
+        let mut pairs = Vec::new();
+        let lists: [(&str, fn(&mut FilterRequest, usize)); 7] = [
+            ("media_types_len", |r, n| r.media_types = words(n)),
+            ("exclude_media_types_len", |r, n| {
+                r.exclude_media_types = words(n)
+            }),
+            ("genres_len", |r, n| r.genres = words(n)),
+            ("years_len", |r, n| r.years = years(n)),
+            ("official_ratings_len", |r, n| r.official_ratings = words(n)),
+            ("tags_len", |r, n| r.tags = words(n)),
+            ("media_types_filter_len", |r, n| {
+                r.media_types_filter = words(n)
+            }),
+        ];
+        for (field, set) in lists {
+            for (a, b) in [(0, 1), (1, 2)] {
+                let (mut x, mut y) = (base.clone(), base.clone());
+                set(&mut x, a);
+                set(&mut y, b);
+                pairs.push((format!("{field} {a} vs {b}"), x, y, false));
+            }
+        }
+        // One value in one list vs one in another, for each two lists. A key that merged two
+        // lengths would give both the same key.
+        for (i, &(x_field, set_x)) in lists.iter().enumerate() {
+            for &(y_field, set_y) in &lists[i + 1..] {
+                let (mut x, mut y) = (base.clone(), base.clone());
+                set_x(&mut x, 1);
+                set_y(&mut y, 1);
+                // IncludeItemTypes and MediaTypes both render `media_type IN (?)`, so only their
+                // keys tell these two apart.
+                let same_sql = (x_field, y_field) == ("media_types_len", "media_types_filter_len");
+                pairs.push((format!("{x_field} vs {y_field}"), x, y, same_sql));
+            }
+        }
+        let flags: [(&str, fn(&mut FilterRequest, Option<bool>)); 3] = [
+            ("is_favorite", |r, v| r.is_favorite = v),
+            ("is_unplayed", |r, v| r.is_unplayed = v),
+            ("is_played", |r, v| r.is_played = v),
+        ];
+        for (field, set) in flags {
+            for (a, b) in [
+                (None, Some(true)),
+                (None, Some(false)),
+                (Some(true), Some(false)),
+            ] {
+                let (mut x, mut y) = (base.clone(), base.clone());
+                set(&mut x, a);
+                set(&mut y, b);
+                pairs.push((format!("{field} {a:?} vs {b:?}"), x, y, false));
+            }
+        }
+        for (a, b) in [
+            (("SortName", "Ascending"), ("DateCreated", "Ascending")),
+            (("SortName", "Ascending"), ("SortName", "Descending")),
+            (
+                ("SortName", "Ascending"),
+                ("SortName,DateCreated", "Ascending"),
+            ),
+            // The order of the terms, and a later term's own direction.
+            (
+                ("SortName,DateCreated", "Ascending"),
+                ("DateCreated,SortName", "Ascending"),
+            ),
+            (
+                ("SortName,DateCreated", "Ascending,Ascending"),
+                ("SortName,DateCreated", "Ascending,Descending"),
+            ),
+        ] {
+            let x = FilterRequest {
+                sort_by: a.0,
+                sort_order: a.1,
+                ..base.clone()
+            };
+            let y = FilterRequest {
+                sort_by: b.0,
+                sort_order: b.1,
+                ..base.clone()
+            };
+            pairs.push((format!("sort {a:?} vs {b:?}"), x, y, false));
+        }
+        assert_eq!(
+            pairs.len(),
+            49,
+            "7 lists at 2 pairs, 21 list swaps, 3 flags at 3 and 5 sorts"
         );
-        assert_ne!(key, key2);
+
+        let clear = || super::FILTER_QUERY_CACHE.lock().clear();
+        let (mut same_key, mut shared) = (Vec::new(), Vec::new());
+        for (case, x, y, same_sql) in &pairs {
+            // The keys themselves: through the cache, equal keys that hash apart rarely meet.
+            if key(x) == key(y) {
+                same_key.push(case.as_str());
+            }
+            // What each gets from an empty cache. The pair must render different SQL, except the
+            // two lists that render the same clause.
+            clear();
+            let x_sql = cached_sql(x);
+            clear();
+            let y_sql = cached_sql(y);
+            if *same_sql {
+                assert_eq!(x_sql, y_sql, "{case}: expected the same SQL");
+            } else {
+                assert_ne!(x_sql, y_sql, "{case}: both render the same SQL");
+            }
+            // Each order, from an empty cache.
+            clear();
+            let x_first = (cached_sql(x), cached_sql(y));
+            clear();
+            let y_first = (cached_sql(y), cached_sql(x));
+            if x_first != (x_sql.clone(), y_sql.clone()) || y_first != (y_sql, x_sql) {
+                shared.push(case.as_str());
+            }
+        }
+        assert!(
+            same_key.is_empty() && shared.is_empty(),
+            "these pairs got the same key: {same_key:?}; these shared SQL: {shared:?}"
+        );
     }
 }

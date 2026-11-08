@@ -2684,6 +2684,124 @@ async fn new_items_skip_known_failures() {
     }
 }
 
+// B23: date added. A new item is dated the way Jellyfin dates it on Linux: by its path's creation
+// time, which .NET reads there as the older of the modification and status-change times. A file
+// that is a symlink is dated by its final target, as Jellyfin resolves one; a folder link keeps its
+// own times. A movie by its video file; a series, season, artist or album by its folder; an
+// episode, track or photo by its file.
+
+/// Sets the modification time of a file or folder to `secs` after the epoch (which sets its
+/// status-change time to now).
+#[cfg(target_os = "linux")]
+fn b23_set_mtime(path: &Path, secs: u64) {
+    std::fs::File::open(path)
+        .and_then(|f| f.set_modified(UNIX_EPOCH + Duration::from_secs(secs)))
+        .unwrap_or_else(|e| panic!("set the time of {}: {e}", path.display()));
+}
+
+/// The stored date_created of the item at `rel`, in whole seconds since the epoch.
+#[cfg(target_os = "linux")]
+async fn b23_date_created(pool: &SqlitePool, lib: &Library, rel: &str) -> i64 {
+    let id = item_at(pool, lib, rel).await;
+    let stored: String = sqlx::query_scalar("SELECT date_created FROM media_items WHERE id = ?1")
+        .bind(id.to_string())
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    chrono::DateTime::parse_from_rfc3339(&stored)
+        .unwrap_or_else(|e| panic!("date_created of {rel} is {stored}: {e}"))
+        .timestamp()
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn b23_new_items_are_dated_by_their_files() {
+    // A second early: file times come from the kernel's coarse clock, which can lag a few ms.
+    let before = chrono::Utc::now().timestamp() - 1;
+    let fx = Fixture::new().await;
+    let film = fx.library("film", LibraryContentType::Movies).await;
+    let tv = fx.library("tv", LibraryContentType::TvShows).await;
+    let music = fx.library("music", LibraryContentType::Music).await;
+    let photos = fx.library("photos", LibraryContentType::Photos).await;
+    let old_film = "Old Film (1999)/Old Film (1999).mkv";
+    let new_film = "New Film (2001)/New Film (2001).mkv";
+    let episode = "Show/Season 1/Show S01E01.mkv";
+    let track = "Artist A/Album A/01 Song.mp3";
+    touch(&root_of(&film), old_film);
+    touch(&root_of(&film), new_film);
+    touch(&root_of(&tv), episode);
+    touch(&root_of(&music), track);
+    touch(&root_of(&photos), "Beach.jpg");
+    // A series folder outside the library, linked in: the link's own times count.
+    touch(
+        &fx.path("elsewhere"),
+        "Linked Show/Season 1/Linked Show S01E01.mkv",
+    );
+    std::os::unix::fs::symlink(
+        fx.path("elsewhere/Linked Show"),
+        root_of(&tv).join("Linked Show"),
+    )
+    .unwrap();
+    // A film whose video file is a link to a link to a file outside the library: the final file's
+    // times count.
+    let linked_film = "Linked Film (2003)/Linked Film (2003).mkv";
+    touch(&fx.path("elsewhere"), "Linked Film.mkv");
+    std::os::unix::fs::symlink(
+        fx.path("elsewhere/Linked Film.mkv"),
+        fx.path("elsewhere/hop.mkv"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(root_of(&film).join("Linked Film (2003)")).unwrap();
+    std::os::unix::fs::symlink(
+        fx.path("elsewhere/hop.mkv"),
+        root_of(&film).join(linked_film),
+    )
+    .unwrap();
+    // Old modification times, set once every file exists, since a new file changes its folder's.
+    let old = [
+        (root_of(&film).join(old_film), 1_000_000_000),
+        (root_of(&tv).join(episode), 1_000_000_100),
+        (root_of(&tv).join("Show/Season 1"), 1_000_000_200),
+        (root_of(&tv).join("Show"), 1_000_000_300),
+        (root_of(&music).join(track), 1_000_000_400),
+        (root_of(&music).join("Artist A/Album A"), 1_000_000_500),
+        (root_of(&music).join("Artist A"), 1_000_000_600),
+        (root_of(&photos).join("Beach.jpg"), 1_000_000_700),
+        (fx.path("elsewhere/Linked Show"), 1_000_000_800),
+        (fx.path("elsewhere/Linked Film.mkv"), 1_000_000_900),
+    ];
+    for (path, secs) in &old {
+        b23_set_mtime(path, *secs);
+    }
+    // A modification time in the future: the status-change time, now, is the older one.
+    b23_set_mtime(&root_of(&film).join(new_film), 4_000_000_000);
+    for lib in [&film, &tv, &music, &photos] {
+        scan(&fx.pool, lib).await;
+    }
+    let after = chrono::Utc::now().timestamp();
+
+    for (lib, rel, secs) in [
+        (&film, old_film, 1_000_000_000),
+        (&tv, episode, 1_000_000_100),
+        (&tv, "Show/Season 1", 1_000_000_200),
+        (&tv, "Show", 1_000_000_300),
+        (&music, track, 1_000_000_400),
+        (&music, "Artist A/Album A", 1_000_000_500),
+        (&music, "Artist A", 1_000_000_600),
+        (&photos, "Beach.jpg", 1_000_000_700),
+        (&film, linked_film, 1_000_000_900),
+    ] {
+        assert_eq!(b23_date_created(&fx.pool, lib, rel).await, secs, "{rel}");
+    }
+    for (lib, rel) in [(&film, new_film), (&tv, "Linked Show")] {
+        let date = b23_date_created(&fx.pool, lib, rel).await;
+        assert!(
+            (before..=after).contains(&date),
+            "{rel}: {date} is not in {before}..={after}"
+        );
+    }
+}
+
 // B17: scan progress. A library's scan is listed from the moment it is queued until it ends, and
 // its updates go 0, then up to at most 99, then 100 once its probes have finished. B18 adds the
 // state to each update: Queued, Active from the start, and Idle with the 100.
