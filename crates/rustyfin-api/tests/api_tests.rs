@@ -3070,6 +3070,503 @@ async fn test_library_options_not_found() {
     assert!(resp.status().is_success() || resp.status() == StatusCode::NOT_FOUND);
 }
 
+// ── B18 part 2: EnableRealtimeMonitor and LibraryMonitorPollInterval ──
+// Real-time monitoring is on by default, also in options saved without the field. It is saved
+// through /Library/{id}/Options and when a library is added, and listed with each library. It
+// doesn't affect the push sources. LibraryMonitorPollInterval is the poll interval in seconds.
+
+/// `EnableRealtimeMonitor` in `GET /Library/{id}/Options`.
+async fn b18p2_realtime_monitor(
+    app: &axum::Router,
+    token: &str,
+    library: uuid::Uuid,
+) -> serde_json::Value {
+    let uri = format!("/Library/{library}/Options");
+    let (status, options) = send_authed(app, "GET", &uri, token, None).await;
+    assert_eq!(status, StatusCode::OK, "{options}");
+    options["EnableRealtimeMonitor"].clone()
+}
+
+/// Saves `options` (JSON) through `POST /Library/{id}/Options`.
+async fn b18p2_save_options(app: &axum::Router, token: &str, library: uuid::Uuid, options: &str) {
+    let uri = format!("/Library/{library}/Options");
+    let (status, body) = send_authed(app, "POST", &uri, token, Some(options)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
+async fn b18p2_realtime_monitor_is_on_by_default_and_when_saved_without_the_field() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let library = create_library_via_api(&app, &state, &token, "B18p2 Default", "Movies").await;
+    assert!(rustyfin_model::library::LibraryOptions::default().enable_realtime_monitor);
+    assert_eq!(
+        b18p2_realtime_monitor(&app, &token, library).await,
+        true,
+        "no options stored"
+    );
+
+    // A client that doesn't know the field.
+    b18p2_save_options(&app, &token, library, r#"{"EnableTrickplay":true}"#).await;
+    assert_eq!(b18p2_realtime_monitor(&app, &token, library).await, true);
+
+    // A row stored before the field existed.
+    let updated = sqlx::query("UPDATE configuration SET value = ?1 WHERE key = ?2")
+        .bind(r#"{"MetadataProvider":"","ImageProvider":"","SkipSubfolders":false}"#)
+        .bind(format!("library_options_{library}"))
+        .execute(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        updated.rows_affected(),
+        1,
+        "the saved options are in one row"
+    );
+    assert_eq!(b18p2_realtime_monitor(&app, &token, library).await, true);
+    let stored = rustyfin_db::repo_library::get_library_options(&state.db, library)
+        .await
+        .unwrap();
+    assert!(stored.enable_realtime_monitor);
+    let unknown = rustyfin_db::repo_library::get_library_options(&state.db, uuid::Uuid::new_v4())
+        .await
+        .unwrap();
+    assert!(unknown.enable_realtime_monitor, "defaults without a row");
+}
+
+#[tokio::test]
+async fn b18p2_realtime_monitor_is_saved_and_listed_with_each_library() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let on = create_library_via_api(&app, &state, &token, "B18p2 On", "Movies").await;
+    let off = create_library_via_api(&app, &state, &token, "B18p2 Off", "TvShows").await;
+
+    let options = r#"{"EnableRealtimeMonitor":false,"EnableTrickplay":true}"#;
+    b18p2_save_options(&app, &token, off, options).await;
+    assert_eq!(b18p2_realtime_monitor(&app, &token, off).await, false);
+    assert_eq!(b18p2_realtime_monitor(&app, &token, on).await, true);
+    let stored = rustyfin_db::repo_library::get_library_options(&state.db, off)
+        .await
+        .unwrap();
+    assert!(!stored.enable_realtime_monitor);
+    assert!(stored.enable_trickplay, "the other options are kept");
+
+    let (status, list) = send_authed(&app, "GET", "/Library/VirtualFolders", &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let item = |id: uuid::Uuid| {
+        list.as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["Id"] == id.to_string())
+            .cloned()
+            .unwrap_or_else(|| panic!("{id} is not listed: {list}"))
+    };
+    assert_eq!(
+        item(off)["LibraryOptions"]["EnableRealtimeMonitor"],
+        false,
+        "{list}"
+    );
+    assert_eq!(
+        item(off)["LibraryOptions"]["EnableTrickplay"],
+        true,
+        "{list}"
+    );
+    assert_eq!(
+        item(on)["LibraryOptions"]["EnableRealtimeMonitor"],
+        true,
+        "{list}"
+    );
+    assert_eq!(item(on)["Name"], "B18p2 On", "{list}");
+    assert_eq!(item(on)["ContentType"], "Movies", "{list}");
+    assert_eq!(
+        item(on)["Paths"],
+        serde_json::json!([media_folder(&state, "b18p2 on")]),
+        "{list}"
+    );
+
+    b18p2_save_options(&app, &token, off, r#"{"EnableRealtimeMonitor":true}"#).await;
+    assert_eq!(b18p2_realtime_monitor(&app, &token, off).await, true);
+}
+
+#[tokio::test]
+async fn b18p2_a_library_can_be_added_with_realtime_monitoring_off() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let add = |name: &str, options: serde_json::Value| {
+        let mut body = serde_json::json!({
+            "Name": name,
+            "ContentType": "Movies",
+            "Paths": [media_folder(&state, &name.to_lowercase())],
+        });
+        if !options.is_null() {
+            body["LibraryOptions"] = options;
+        }
+        body.to_string()
+    };
+    let mut ids = Vec::new();
+    for (name, options) in [
+        (
+            "B18p2 Added Off",
+            serde_json::json!({ "EnableRealtimeMonitor": false }),
+        ),
+        (
+            "B18p2 Added Trickplay",
+            serde_json::json!({ "EnableTrickplay": true }),
+        ),
+        ("B18p2 Added Plain", serde_json::Value::Null),
+    ] {
+        let body = add(name, options);
+        let (status, created) =
+            send_authed(&app, "POST", "/Library/VirtualFolders", &token, Some(&body)).await;
+        assert_eq!(status, StatusCode::OK, "{name}: {created}");
+        assert_eq!(created["Name"], name, "{created}");
+        ids.push(
+            created["Id"]
+                .as_str()
+                .unwrap()
+                .parse::<uuid::Uuid>()
+                .unwrap(),
+        );
+    }
+    assert_eq!(b18p2_realtime_monitor(&app, &token, ids[0]).await, false);
+    assert_eq!(b18p2_realtime_monitor(&app, &token, ids[1]).await, true);
+    assert_eq!(b18p2_realtime_monitor(&app, &token, ids[2]).await, true);
+    let uri = format!("/Library/{}/Options", ids[1]);
+    let (_, options) = send_authed(&app, "GET", &uri, &token, None).await;
+    assert_eq!(options["EnableTrickplay"], true, "{options}");
+
+    // A refused library stores no options.
+    let count_options = || async {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM configuration WHERE key LIKE 'library_options_%'",
+        )
+        .fetch_one(&state.db)
+        .await
+        .unwrap()
+    };
+    let before = count_options().await;
+    let body = serde_json::json!({
+        "Name": "B18p2 Nowhere",
+        "ContentType": "Movies",
+        "Paths": ["/b18p2/does/not/exist"],
+        "LibraryOptions": { "EnableRealtimeMonitor": false },
+    })
+    .to_string();
+    let (status, body) =
+        send_authed(&app, "POST", "/Library/VirtualFolders", &token, Some(&body)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(count_options().await, before);
+}
+
+#[tokio::test]
+async fn b18p2_library_monitor_poll_interval_defaults_to_60_and_round_trips() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let (status, config) = send_authed(&app, "GET", "/System/Configuration", &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{config}");
+    assert_eq!(config["LibraryMonitorPollInterval"], 60, "{config}");
+
+    let mut changed = config.clone();
+    changed["LibraryMonitorPollInterval"] = 15.into();
+    let body = changed.to_string();
+    let (status, body) =
+        send_authed(&app, "POST", "/System/Configuration", &token, Some(&body)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let (_, body) = send_authed(&app, "GET", "/System/Configuration", &token, None).await;
+    assert_eq!(body["LibraryMonitorPollInterval"], 15, "{body}");
+
+    let uri = "/System/Configuration/LibraryMonitorPollInterval";
+    let (status, body) = send_authed(&app, "POST", uri, &token, Some("120")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let (_, body) = send_authed(&app, "GET", uri, &token, None).await;
+    assert_eq!(body, 120);
+
+    // A config.json from before the setting existed gets the default.
+    let mut old = serde_json::to_value(ServerConfiguration::default()).unwrap();
+    assert_eq!(old["LibraryMonitorPollInterval"], 60, "{old}");
+    old.as_object_mut()
+        .unwrap()
+        .remove("LibraryMonitorPollInterval");
+    let old: ServerConfiguration = serde_json::from_value(old).unwrap();
+    assert_eq!(old.library_monitor_poll_interval, 60);
+}
+
+/// `LibraryMonitorPollInterval` in `GET /System/Configuration`.
+async fn b18p2_poll_interval(app: &axum::Router, token: &str) -> serde_json::Value {
+    let (status, config) = send_authed(app, "GET", "/System/Configuration", token, None).await;
+    assert_eq!(status, StatusCode::OK, "{config}");
+    config["LibraryMonitorPollInterval"].clone()
+}
+
+#[tokio::test]
+async fn b18p2_a_user_who_is_not_an_administrator_changes_no_monitor_setting() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let library = create_library_via_api(&app, &state, &token, "B18p2 Viewer", "Movies").await;
+    add_user(&state, "b18p2_viewer", "viewerpass", false).await;
+    let (viewer, _) = login(&app, "b18p2_viewer", "viewerpass").await.unwrap();
+    let interval = state.task_scheduler.watcher().poll_interval();
+
+    let uri = format!("/Library/{library}/Options");
+    let off = r#"{"EnableRealtimeMonitor":false}"#;
+    let (status, body) = send_authed(&app, "POST", &uri, &viewer, Some(off)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "library options: {body}");
+    assert_eq!(b18p2_realtime_monitor(&app, &token, library).await, true);
+
+    let (_, config) = send_authed(&app, "GET", "/System/Configuration", &token, None).await;
+    let mut changed = config.clone();
+    changed["LibraryMonitorPollInterval"] = 5.into();
+    let changed = changed.to_string();
+    let (status, body) = send_authed(
+        &app,
+        "POST",
+        "/System/Configuration",
+        &viewer,
+        Some(&changed),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "configuration: {body}");
+    let uri = "/System/Configuration/LibraryMonitorPollInterval";
+    let (status, body) = send_authed(&app, "POST", uri, &viewer, Some("5")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "poll interval key: {body}");
+    assert_eq!(b18p2_poll_interval(&app, &token).await, 60);
+    assert_eq!(state.task_scheduler.watcher().poll_interval(), interval);
+}
+
+#[tokio::test]
+async fn b18p2_wrongly_typed_monitor_settings_are_refused_and_change_nothing() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let library = create_library_via_api(&app, &state, &token, "B18p2 Typed", "Movies").await;
+    b18p2_save_options(&app, &token, library, r#"{"EnableRealtimeMonitor":false}"#).await;
+    let interval = state.task_scheduler.watcher().poll_interval();
+    // A value that does not fit is the client's mistake: 400 or 422, never a server error.
+    let refused = [StatusCode::BAD_REQUEST, StatusCode::UNPROCESSABLE_ENTITY];
+
+    let uri = format!("/Library/{library}/Options");
+    let yes = r#"{"EnableRealtimeMonitor":"yes"}"#;
+    let (status, body) = send_authed(&app, "POST", &uri, &token, Some(yes)).await;
+    assert!(
+        refused.contains(&status),
+        "library options: {status} {body}"
+    );
+    assert_eq!(b18p2_realtime_monitor(&app, &token, library).await, false);
+
+    let (_, config) = send_authed(&app, "GET", "/System/Configuration", &token, None).await;
+    for value in [serde_json::json!("abc"), serde_json::json!(-1)] {
+        let mut changed = config.clone();
+        changed["LibraryMonitorPollInterval"] = value.clone();
+        let changed = changed.to_string();
+        let (status, body) = send_authed(
+            &app,
+            "POST",
+            "/System/Configuration",
+            &token,
+            Some(&changed),
+        )
+        .await;
+        assert!(
+            refused.contains(&status),
+            "configuration with {value}: {status} {body}"
+        );
+
+        let uri = "/System/Configuration/LibraryMonitorPollInterval";
+        let (status, body) = send_authed(&app, "POST", uri, &token, Some(&value.to_string())).await;
+        assert!(
+            refused.contains(&status),
+            "poll interval key {value}: {status} {body}"
+        );
+        assert_eq!(b18p2_poll_interval(&app, &token).await, 60, "after {value}");
+    }
+    assert_eq!(state.task_scheduler.watcher().poll_interval(), interval);
+}
+
+#[tokio::test]
+async fn b18p2_monitoring_off_keeps_media_updated_and_webhook_reports() {
+    use rustyfin_core::scanner::ScanScope;
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let films = create_library_via_api(&app, &state, &token, "B18p2 Pushed", "Movies").await;
+    let music = create_library_via_api(&app, &state, &token, "B18p2 Hooked", "Music").await;
+    let films_dir = std::path::PathBuf::from(media_folder(&state, "b18p2 pushed"));
+    let music_dir = std::path::PathBuf::from(media_folder(&state, "b18p2 hooked"));
+    for library in [films, music] {
+        b18p2_save_options(&app, &token, library, r#"{"EnableRealtimeMonitor":false}"#).await;
+    }
+    let changes = state.task_scheduler.changes();
+    changes.set_delay(std::time::Duration::from_secs(3600));
+    let json = ("Content-Type", "application/json");
+
+    let film = films_dir.join("Pushed (2001)");
+    let body = serde_json::json!({ "Updates": [{ "Path": film.join("Pushed (2001).mkv") }] });
+    let uri = "/Library/Media/Updated";
+    let headers = [B18_ARR_AUTH[0], json];
+    let (status, text) = b18_send(&app, "POST", uri, &headers, Some(&body.to_string())).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{text}");
+
+    let artist = music_dir.join("Artist");
+    let body = serde_json::json!({
+        "eventType": "Download",
+        "trackFiles": [{ "path": artist.join("Album/01 Song.flac") }],
+    });
+    let uri = "/Library/Media/Webhook?api_key=test-api-key";
+    let (status, text) = b18_send(&app, "POST", uri, &[json], Some(&body.to_string())).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{text}");
+
+    assert_eq!(
+        b18_sorted(changes.pending()),
+        b18_sorted(vec![
+            (films, ScanScope::Folder(film)),
+            (music, ScanScope::Folder(artist)),
+        ])
+    );
+}
+
+/// The library paths the library monitor monitors, as (library, path), sorted.
+fn b18p2_monitored(state: &AppState) -> Vec<(uuid::Uuid, String)> {
+    let mut monitored: Vec<(uuid::Uuid, String)> = state
+        .task_scheduler
+        .watcher()
+        .monitored()
+        .into_iter()
+        .map(|path| (path.library_id, path.path.to_string_lossy().into_owned()))
+        .collect();
+    monitored.sort();
+    monitored
+}
+
+/// Waits up to 5 s until the library monitor monitors `expected`, and nothing else.
+async fn b18p2_wait_monitored(state: &AppState, what: &str, mut expected: Vec<(uuid::Uuid, &str)>) {
+    expected.sort();
+    let expected: Vec<(uuid::Uuid, String)> = expected
+        .into_iter()
+        .map(|(library, path)| (library, path.to_string()))
+        .collect();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let monitored = b18p2_monitored(state);
+        if monitored == expected {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what}: monitored {monitored:?}, expected {expected:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn b18p2_the_library_monitor_follows_the_setting_and_the_libraries() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let films = create_library_via_api(&app, &state, &token, "B18p2 Watched Films", "Movies").await;
+    let films_dir = media_folder(&state, "b18p2 watched films");
+    // The scheduler starts it at startup; this state's scheduler is never started.
+    state.task_scheduler.watcher().start();
+    b18p2_wait_monitored(&state, "at start", vec![(films, &films_dir)]).await;
+
+    // Added with monitoring off: not monitored. Added with it on: monitored at once.
+    let shows_a = media_folder(&state, "b18p2 watched shows a");
+    let shows_b = media_folder(&state, "b18p2 watched shows b");
+    let body = serde_json::json!({
+        "Name": "B18p2 Watched Shows",
+        "ContentType": "TvShows",
+        "Paths": [shows_a, shows_b],
+        "LibraryOptions": { "EnableRealtimeMonitor": false },
+    })
+    .to_string();
+    let (status, created) =
+        send_authed(&app, "POST", "/Library/VirtualFolders", &token, Some(&body)).await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let shows: uuid::Uuid = created["Id"].as_str().unwrap().parse().unwrap();
+    let music = create_library_via_api(&app, &state, &token, "B18p2 Watched Music", "Music").await;
+    let music_dir = media_folder(&state, "b18p2 watched music");
+    b18p2_wait_monitored(
+        &state,
+        "libraries added",
+        vec![(films, &films_dir), (music, &music_dir)],
+    )
+    .await;
+
+    // Switched on and off in the library's options.
+    b18p2_save_options(&app, &token, shows, r#"{"EnableRealtimeMonitor":true}"#).await;
+    b18p2_wait_monitored(
+        &state,
+        "switched on",
+        vec![
+            (films, &films_dir),
+            (music, &music_dir),
+            (shows, &shows_a),
+            (shows, &shows_b),
+        ],
+    )
+    .await;
+    b18p2_save_options(&app, &token, films, r#"{"EnableRealtimeMonitor":false}"#).await;
+    b18p2_wait_monitored(
+        &state,
+        "switched off",
+        vec![(music, &music_dir), (shows, &shows_a), (shows, &shows_b)],
+    )
+    .await;
+
+    // A path removed from a library, then a library removed.
+    let body = serde_json::json!({ "LibraryId": shows, "Paths": [shows_b] }).to_string();
+    let uri = "/Library/VirtualFolders/Paths";
+    let (status, removed) = send_authed(&app, "DELETE", uri, &token, Some(&body)).await;
+    assert_eq!(status, StatusCode::OK, "{removed}");
+    b18p2_wait_monitored(
+        &state,
+        "path removed",
+        vec![(music, &music_dir), (shows, &shows_a)],
+    )
+    .await;
+    let uri = format!("/Library/VirtualFolders/{music}");
+    let (status, removed) = send_authed(&app, "DELETE", &uri, &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{removed}");
+    b18p2_wait_monitored(&state, "library removed", vec![(shows, &shows_a)]).await;
+    state.task_scheduler.watcher().stop();
+}
+
+#[tokio::test]
+async fn b18p2_the_poll_interval_follows_the_server_configuration() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let interval = || state.task_scheduler.watcher().poll_interval();
+    let (status, mut config) =
+        send_authed(&app, "GET", "/System/Configuration", &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{config}");
+
+    config["LibraryMonitorPollInterval"] = 15.into();
+    let body = config.to_string();
+    let (status, body) =
+        send_authed(&app, "POST", "/System/Configuration", &token, Some(&body)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert_eq!(interval(), std::time::Duration::from_secs(15));
+
+    // Zero polls every second.
+    config["LibraryMonitorPollInterval"] = 0.into();
+    let body = config.to_string();
+    let (status, body) =
+        send_authed(&app, "POST", "/System/Configuration", &token, Some(&body)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert_eq!(interval(), std::time::Duration::from_secs(1));
+
+    // Saved as a single key.
+    let uri = "/System/Configuration/LibraryMonitorPollInterval";
+    let (status, body) = send_authed(&app, "POST", uri, &token, Some("120")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert_eq!(interval(), std::time::Duration::from_secs(120));
+}
+
 // ── Library Modified Volumes Tests ──
 
 #[tokio::test]

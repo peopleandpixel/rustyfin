@@ -380,6 +380,7 @@ const clickActions = {
     'set-user-admin': el => setUserPolicy(el, { IsAdministrator: el.checked }),
     'set-user-disabled': el => setUserPolicy(el, { IsDisabled: el.checked }),
     'delete-library': el => deleteLibraryFromAdmin(el.dataset.id),
+    'toggle-realtime-monitor': el => toggleRealtimeMonitor(el),
     'start-task': el => startTaskAction(el.dataset.id, el.dataset.name),
     'stop-task': el => stopTaskAction(el.dataset.id, el.dataset.name),
     'dir-open': el => navigateDirectoryPicker(el.dataset.path),
@@ -2678,6 +2679,7 @@ async function renderAdmin() {
                                 <th class="pb-3 font-semibold">${t('common.name')}</th>
                                 <th class="pb-3 font-semibold">${t('common.type')}</th>
                                 <th class="pb-3 font-semibold">${t('admin.paths')}</th>
+                                <th class="pb-3 font-semibold">${t('admin.realtime_monitor')}</th>
                                 <th class="pb-3 font-semibold text-right">${t('admin.actions')}</th>
                             </tr>
                         </thead>
@@ -2687,6 +2689,7 @@ async function renderAdmin() {
                                 <td class="py-3 font-bold text-white"><span class="inline-flex items-center gap-1.5">${escapeHtml(l.name || l.Name)}${scanRing(l.id || l.Id, l.name || l.Name)}</span></td>
                                 <td class="py-3"><span class="px-2 py-0.5 rounded bg-white/10 text-white/70">${escapeHtml(l.content_type || l.ContentType || t('admin.mixed'))}</span></td>
                                 <td class="py-3 text-white/40 font-mono">${escapeHtml((l.paths || l.Paths || []).join(', '))}</td>
+                                <td class="py-3"><input type="checkbox" data-action="toggle-realtime-monitor" data-id="${escapeHtml(l.id || l.Id)}" aria-label="${escapeHtml(t('admin.realtime_monitor_for', { name: l.name || l.Name }))}" ${(l.LibraryOptions || {}).EnableRealtimeMonitor === false ? '' : 'checked'} class="w-4 h-4 rounded bg-white/10 border-white/20 text-[#00a4dc]"></td>
                                 <td class="py-3 text-right space-x-2">
                                     <button class="text-[#00a4dc] hover:text-[#38bdf8]" data-action="scan-library-admin" data-id="${escapeHtml(l.id || l.Id)}">${t('admin.scan')}</button>
                                     <button class="text-red-400 hover:text-red-300" data-action="delete-library" data-id="${escapeHtml(l.id || l.Id)}">${t('common.delete')}</button>
@@ -3088,6 +3091,21 @@ async function deleteLibraryFromAdmin(id) {
     renderAdmin();
 }
 
+// Saves the checkbox's new state; a failure puts the checkbox back and shows a toast
+async function toggleRealtimeMonitor(el) {
+    const enabled = el.checked;
+    el.disabled = true;
+    try {
+        const options = await API.getLibraryOptions(el.dataset.id);
+        await API.saveLibraryOptions(el.dataset.id, { ...options, EnableRealtimeMonitor: enabled });
+    } catch (err) {
+        el.checked = !enabled;
+        toast(t('admin.realtime_monitor_failed', { message: err.message }), 'error');
+    } finally {
+        el.disabled = false;
+    }
+}
+
 // Directory picker state
 let directoryPickerPath = '/';
 let directoryPickerHistory = ['/'];
@@ -3122,7 +3140,7 @@ async function submitAddLibrary(e) {
     let lib;
     if (submitBtn) submitBtn.disabled = true;
     try {
-        lib = await API.createLibrary(name, type, paths);
+        lib = await API.createLibrary(name, type, paths, { EnableRealtimeMonitor: f.realtimeMonitor.checked });
     } catch (err) {
         setAddLibraryError(t('library.create_failed', { message: err.message }));
         return;

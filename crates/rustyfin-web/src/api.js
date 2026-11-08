@@ -235,10 +235,14 @@ const API = {
             content_type: types[v.CollectionType] || 'Mixed',
         })));
     },
-    createLibrary(name, contentType, paths) {
-        return this.post('/Library/VirtualFolders', { Name: name, ContentType: contentType, Paths: paths });
+    createLibrary(name, contentType, paths, libraryOptions) {
+        const body = { Name: name, ContentType: contentType, Paths: paths };
+        if (libraryOptions) body.LibraryOptions = libraryOptions;
+        return this.post('/Library/VirtualFolders', body);
     },
     deleteLibrary(id) { return this.del(`/Library/VirtualFolders/${id}`); },
+    getLibraryOptions(id) { return this.get(`/Library/${id}/Options`); },
+    saveLibraryOptions(id, options) { return this.post(`/Library/${id}/Options`, options); },
     scanLibrary(id) { 
         this.invalidateCache('/Items');
         return this.post(`/Library/VirtualFolders/${id}/Refresh`); 

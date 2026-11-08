@@ -90,6 +90,10 @@ pub struct ServerConfiguration {
     /// rescans it.
     #[serde(default = "default_library_monitor_delay")]
     pub library_monitor_delay: u32,
+    /// How often polled library paths (network shares) are checked for changes, in seconds.
+    /// Values below 1 count as 1.
+    #[serde(default = "default_library_monitor_poll_interval")]
+    pub library_monitor_poll_interval: u32,
 }
 
 fn default_smtp_port() -> u16 {
@@ -124,6 +128,10 @@ fn default_library_monitor_delay() -> u32 {
     60
 }
 
+fn default_library_monitor_poll_interval() -> u32 {
+    60
+}
+
 impl Default for ServerConfiguration {
     fn default() -> Self {
         Self {
@@ -150,6 +158,7 @@ impl Default for ServerConfiguration {
             smtp_enable_ssl: false,
             smtp_from_address: None,
             library_monitor_delay: 60,
+            library_monitor_poll_interval: 60,
         }
     }
 }

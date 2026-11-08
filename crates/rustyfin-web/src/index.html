@@ -430,6 +430,13 @@
                     <button type="button" class="jf-btn-primary !px-3 !py-1.5 text-xs" onclick="selectCurrentDirectory()" data-i18n="library.select_folder">Select this folder</button>
                 </div>
             </div>
+            <div>
+                <div class="flex items-center gap-3">
+                    <input type="checkbox" name="realtimeMonitor" id="add-lib-realtime" checked aria-describedby="add-lib-realtime-hint" class="w-4 h-4 rounded bg-white/10 border-white/20 text-[#00a4dc]">
+                    <label for="add-lib-realtime" class="text-sm text-white/70" data-i18n="library.realtime_monitor">Enable real-time monitoring</label>
+                </div>
+                <p id="add-lib-realtime-hint" class="text-[11px] text-white/30 mt-1" data-i18n="library.realtime_monitor_hint">Picks up added, changed and removed files without a scan. Local disks are watched; network shares are checked at regular intervals.</p>
+            </div>
             <p id="add-lib-error" role="alert" class="hidden text-xs text-red-400 bg-red-500/10 rounded-lg px-3 py-2"></p>
             <div class="flex justify-end gap-2 pt-3 border-t border-white/10">
                 <button type="button" onclick="closeAddLibrary()" class="jf-btn-ghost text-xs" data-i18n="common.cancel">Cancel</button>

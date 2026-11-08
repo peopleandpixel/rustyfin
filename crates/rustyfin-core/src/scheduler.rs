@@ -10,6 +10,7 @@ use tokio::sync::RwLock;
 use tokio::sync::watch;
 
 use crate::library_monitor::ChangeQueue;
+use crate::library_watch::LibraryWatcher;
 use crate::scan_progress::ScanRegistry;
 
 /// Known task IDs
@@ -40,6 +41,7 @@ pub struct TaskScheduler {
     data_dir: Arc<PathBuf>,
     scans: ScanRegistry,
     changes: ChangeQueue,
+    watcher: LibraryWatcher,
 }
 
 impl TaskScheduler {
@@ -162,12 +164,14 @@ impl TaskScheduler {
         );
 
         let changes = ChangeQueue::new(db.clone());
+        let watcher = LibraryWatcher::new(db.clone(), changes.clone(), (*data_dir).clone());
         Self {
             tasks: Arc::new(RwLock::new(tasks)),
             db,
             data_dir,
             scans: ScanRegistry::new(),
             changes,
+            watcher,
         }
     }
 
@@ -179,6 +183,11 @@ impl TaskScheduler {
     /// The queue of changed library paths, which the library monitor rescans.
     pub fn changes(&self) -> &ChangeQueue {
         &self.changes
+    }
+
+    /// The library monitor, which reports changed library paths to `changes()`.
+    pub fn watcher(&self) -> &LibraryWatcher {
+        &self.watcher
     }
 
     pub async fn get_all_tasks(&self) -> Vec<ScheduledTaskInfo> {
@@ -501,6 +510,9 @@ impl TaskScheduler {
 
     /// Start all scheduled task loops. Call once at startup.
     pub fn start(self, shutdown_rx: watch::Receiver<bool>) {
+        // The library monitor starts its monitors in the background and returns at once.
+        self.watcher.start();
+
         // Library scan loop
         let sched = self.clone();
         let mut rx = shutdown_rx.clone();
