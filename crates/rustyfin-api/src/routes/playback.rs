@@ -1,4 +1,5 @@
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
 use axum::routing::{delete, post, put};
 use axum::{Extension, Json, Router};
 use rustyfin_db::repo_playback::StreamChoice;
@@ -10,6 +11,7 @@ use rustyfin_model::playback::{
     PlaybackStopInfo, SetRatingRequest, UserItemDataDto,
 };
 use rustyfin_model::ws_event::WsEvent;
+use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::error::ApiError;
@@ -21,6 +23,25 @@ pub fn routes() -> Router<AppState> {
         .route("/Sessions/Playing", post(playing))
         .route("/Sessions/Playing/Progress", post(playing_progress))
         .route("/Sessions/Playing/Stopped", post(playing_stopped))
+        // Playstate Controller's query-string forms; the legacy /Users/{userId} ones act for the caller.
+        .route("/PlayingItems/{itemId}", post(playing_item_start))
+        .route("/PlayingItems/{itemId}", delete(playing_item_stop))
+        .route(
+            "/PlayingItems/{itemId}/Progress",
+            post(playing_item_progress),
+        )
+        .route(
+            "/Users/{userId}/PlayingItems/{itemId}",
+            post(legacy_playing_item_start),
+        )
+        .route(
+            "/Users/{userId}/PlayingItems/{itemId}",
+            delete(legacy_playing_item_stop),
+        )
+        .route(
+            "/Users/{userId}/PlayingItems/{itemId}/Progress",
+            post(legacy_playing_item_progress),
+        )
         .route("/Users/{userId}/PlayedItems/{itemId}", post(mark_played))
         .route(
             "/Users/{userId}/PlayedItems/{itemId}",
@@ -122,6 +143,16 @@ async fn playing(
     Extension(claims): Extension<Claims>,
     Json(req): Json<PlaybackStartInfo>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    report_start(state, claims, req).await?;
+    Ok(Json(serde_json::json!({})))
+}
+
+/// Records a playback start for the caller (`POST /Sessions/Playing` and `POST /PlayingItems/{id}`).
+async fn report_start(
+    state: AppState,
+    claims: Claims,
+    req: PlaybackStartInfo,
+) -> Result<(), ApiError> {
     tracing::debug!(
         item = %req.item_id,
         media_source = ?req.media_source_id,
@@ -185,7 +216,7 @@ async fn playing(
     )
     .await;
 
-    Ok(Json(serde_json::json!({})))
+    Ok(())
 }
 
 async fn playing_progress(
@@ -193,6 +224,17 @@ async fn playing_progress(
     Extension(claims): Extension<Claims>,
     Json(req): Json<PlaybackProgressInfo>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    report_progress(state, claims, req).await?;
+    Ok(Json(serde_json::json!({})))
+}
+
+/// Records a playback progress report for the caller (`/Sessions/Playing/Progress` and
+/// `POST /PlayingItems/{id}/Progress`).
+async fn report_progress(
+    state: AppState,
+    claims: Claims,
+    req: PlaybackProgressInfo,
+) -> Result<(), ApiError> {
     tracing::debug!(
         item = %req.item_id,
         media_source = ?req.media_source_id,
@@ -260,7 +302,7 @@ async fn playing_progress(
     )
     .await;
 
-    Ok(Json(serde_json::json!({})))
+    Ok(())
 }
 
 async fn playing_stopped(
@@ -268,6 +310,17 @@ async fn playing_stopped(
     Extension(claims): Extension<Claims>,
     Json(req): Json<PlaybackStopInfo>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    report_stop(state, claims, req).await?;
+    Ok(Json(serde_json::json!({})))
+}
+
+/// Records a playback stop for the caller (`/Sessions/Playing/Stopped` and
+/// `DELETE /PlayingItems/{id}`).
+async fn report_stop(
+    state: AppState,
+    claims: Claims,
+    req: PlaybackStopInfo,
+) -> Result<(), ApiError> {
     tracing::debug!(
         item = %req.item_id,
         media_source = ?req.media_source_id,
@@ -326,7 +379,124 @@ async fn playing_stopped(
     )
     .await;
 
-    Ok(Json(serde_json::json!({})))
+    Ok(())
+}
+
+/// Query form of the playback reports (`/PlayingItems/{itemId}` and its `/Progress` and legacy
+/// `/Users/{userId}/...` forms). Each handler reads only the fields Jellyfin reads for it.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PlayingItemQuery {
+    #[serde(default, alias = "PositionTicks")]
+    position_ticks: Option<i64>,
+    #[serde(default, alias = "IsPaused")]
+    is_paused: Option<bool>,
+    #[serde(default, alias = "MediaSourceId")]
+    media_source_id: Option<String>,
+    #[serde(default, alias = "AudioStreamIndex")]
+    audio_stream_index: Option<i32>,
+    #[serde(default, alias = "SubtitleStreamIndex")]
+    subtitle_stream_index: Option<i32>,
+}
+
+/// POST /PlayingItems/{itemId} and POST /Users/{userId}/PlayingItems/{itemId}: report a start.
+/// The start takes no position, as Jellyfin's does not.
+async fn playing_item_start(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Path(item_id): Path<Uuid>,
+    Query(query): Query<PlayingItemQuery>,
+) -> Result<StatusCode, ApiError> {
+    report_start(
+        state,
+        claims,
+        PlaybackStartInfo {
+            item_id,
+            item_name: None,
+            position_ticks: None,
+            media_source_id: query.media_source_id,
+            audio_stream_index: query.audio_stream_index,
+            subtitle_stream_index: query.subtitle_stream_index,
+        },
+    )
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// POST /PlayingItems/{itemId}/Progress and POST /Users/{userId}/PlayingItems/{itemId}/Progress.
+async fn playing_item_progress(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Path(item_id): Path<Uuid>,
+    Query(query): Query<PlayingItemQuery>,
+) -> Result<StatusCode, ApiError> {
+    report_progress(
+        state,
+        claims,
+        PlaybackProgressInfo {
+            item_id,
+            item_name: None,
+            position_ticks: query.position_ticks,
+            is_paused: query.is_paused,
+            media_source_id: query.media_source_id,
+            audio_stream_index: query.audio_stream_index,
+            subtitle_stream_index: query.subtitle_stream_index,
+        },
+    )
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// DELETE /PlayingItems/{itemId} and DELETE /Users/{userId}/PlayingItems/{itemId}: report a stop.
+async fn playing_item_stop(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Path(item_id): Path<Uuid>,
+    Query(query): Query<PlayingItemQuery>,
+) -> Result<StatusCode, ApiError> {
+    report_stop(
+        state,
+        claims,
+        PlaybackStopInfo {
+            item_id,
+            item_name: None,
+            position_ticks: query.position_ticks,
+            media_source_id: query.media_source_id,
+            audio_stream_index: query.audio_stream_index,
+            subtitle_stream_index: query.subtitle_stream_index,
+            failed: None,
+        },
+    )
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// The legacy forms name a user in the path; Jellyfin ignores it and reports for the caller.
+async fn legacy_playing_item_start(
+    state: State<AppState>,
+    claims: Extension<Claims>,
+    Path((_user_id, item_id)): Path<(String, Uuid)>,
+    query: Query<PlayingItemQuery>,
+) -> Result<StatusCode, ApiError> {
+    playing_item_start(state, claims, Path(item_id), query).await
+}
+
+async fn legacy_playing_item_progress(
+    state: State<AppState>,
+    claims: Extension<Claims>,
+    Path((_user_id, item_id)): Path<(String, Uuid)>,
+    query: Query<PlayingItemQuery>,
+) -> Result<StatusCode, ApiError> {
+    playing_item_progress(state, claims, Path(item_id), query).await
+}
+
+async fn legacy_playing_item_stop(
+    state: State<AppState>,
+    claims: Extension<Claims>,
+    Path((_user_id, item_id)): Path<(String, Uuid)>,
+    query: Query<PlayingItemQuery>,
+) -> Result<StatusCode, ApiError> {
+    playing_item_stop(state, claims, Path(item_id), query).await
 }
 
 /// The path's user, when the caller may act for them: that user or an administrator (Jellyfin's

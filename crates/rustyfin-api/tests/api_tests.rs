@@ -12907,6 +12907,103 @@ async fn b110_played_items_leave_continue_watching_and_next_up_moves_on() {
     assert_eq!(b.ids(&next_up).await, [e2.to_string()], "played");
 }
 
+#[tokio::test]
+async fn b110_playing_items_routes_report_like_sessions_playing() {
+    let b = B110::new().await;
+    let [e1, e2, e3] = b.episodes;
+    let half = B110_HOUR / 4;
+    let near_end = B110_HOUR / 2 * 95 / 100;
+    // Jellyfin's PlaystateController: /PlayingItems/{itemId}, and the obsolete
+    // /Users/{userId}/PlayingItems/{itemId} forms, which act for the caller like the new ones.
+    // Query names are camelCase; the PascalCase forms work too. Each answers 204.
+    let prefixes = [
+        ("new", "/PlayingItems".to_string(), e1, "positionTicks"),
+        (
+            "legacy",
+            format!("/Users/{}/PlayingItems", b.user),
+            e2,
+            "PositionTicks",
+        ),
+        (
+            "other user",
+            format!("/Users/{}/PlayingItems", uuid::Uuid::new_v4()),
+            e3,
+            "positionTicks",
+        ),
+    ];
+    let mut actual = Vec::new();
+    let mut expected = Vec::new();
+    for (name, prefix, item, ticks) in prefixes {
+        let calls = [
+            (
+                "POST",
+                format!("{prefix}/{item}?mediaSourceId={item}&canSeek=true"),
+            ),
+            (
+                "POST",
+                format!("{prefix}/{item}/Progress?{ticks}={half}&isPaused=false"),
+            ),
+            ("DELETE", format!("{prefix}/{item}?{ticks}={near_end}")),
+        ];
+        let mut states = Vec::new();
+        for (method, uri) in calls {
+            let (status, _) = send_authed(&b.app, method, &uri, &b.token, None).await;
+            states.push((method, status, b.stored(item).await));
+        }
+        actual.push((name, states));
+        expected.push((
+            name,
+            vec![
+                ("POST", StatusCode::NO_CONTENT, (false, 1, 0, true)),
+                ("POST", StatusCode::NO_CONTENT, (false, 1, half, true)),
+                ("DELETE", StatusCode::NO_CONTENT, (true, 1, 0, true)),
+            ],
+        ));
+    }
+    assert_eq!(actual, expected);
+    // A stop without positionTicks counts as played to the end, as on /Sessions/Playing/Stopped.
+    let uri = format!("/PlayingItems/{}", b.film);
+    let (status, _) = send_authed(&b.app, "DELETE", &uri, &b.token, None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(b.stored(b.film).await, (true, 1, 0, true));
+}
+
+#[tokio::test]
+async fn b110_playing_items_routes_need_a_session_and_store_nothing_for_non_media() {
+    let b = B110::new().await;
+    let item = b.film;
+    let response = b
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/PlayingItems/{item}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let random = uuid::Uuid::new_v4();
+    for (method, uri) in [
+        ("POST", format!("/PlayingItems/{random}")),
+        (
+            "POST",
+            format!("/PlayingItems/{random}/Progress?positionTicks=5"),
+        ),
+        ("DELETE", format!("/PlayingItems/{random}?positionTicks=5")),
+    ] {
+        let (status, _) = send_authed(&b.app, method, &uri, &b.token, None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{method} {uri}");
+    }
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM user_item_data")
+        .fetch_one(&b.state.db)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0);
+}
+
 // ── Shows Tests ──
 
 #[tokio::test]
