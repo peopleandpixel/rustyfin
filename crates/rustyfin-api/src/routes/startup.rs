@@ -188,10 +188,10 @@ pub async fn settle_owner_at_startup(
                     "users exist, but none is an enabled administrator, so the server has no owner \
                     and the setup wizard stays closed. To recover, start the server with \
                     RUSTYFIN_API_KEY set, list the users with GET /Users, and make one an \
-                    administrator with POST /Users/<Id>/Policy and the body \
-                    {{\"IsAdministrator\": true}}, sending the key in the X-Emby-Token header. \
-                    After a restart the earliest enabled administrator becomes the owner. A \
-                    disabled user can be enabled again only in the database (users.is_disabled = 0)."
+                    enabled administrator with POST /Users/<Id>/Policy and the body \
+                    {{\"IsAdministrator\": true, \"IsDisabled\": false}}, sending the key in the \
+                    X-Emby-Token header. After a restart the earliest enabled administrator \
+                    becomes the owner."
                 );
                 StartupOwner::NoEnabledAdmin
             }

@@ -18,22 +18,33 @@ pub struct User {
     pub configuration: serde_json::Value,
 }
 
+/// The account flags `User` doesn't carry.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UserFlags {
+    pub is_owner: bool,
+    pub is_disabled: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct UserDto {
     pub id: Uuid,
     pub name: String,
     pub is_administrator: bool,
+    pub is_owner: bool,
+    pub is_disabled: bool,
     pub last_login_date: Option<DateTime<Utc>>,
     pub configuration: serde_json::Value,
 }
 
-impl From<User> for UserDto {
-    fn from(u: User) -> Self {
+impl UserDto {
+    pub fn new(u: User, flags: UserFlags) -> Self {
         Self {
             id: u.id,
             name: u.name,
             is_administrator: u.is_administrator,
+            is_owner: flags.is_owner,
+            is_disabled: flags.is_disabled,
             last_login_date: u.last_login_date,
             configuration: u.configuration,
         }
@@ -76,6 +87,7 @@ pub struct ChangePasswordRequest {
 #[serde(rename_all = "PascalCase")]
 pub struct UpdatePolicyRequest {
     pub is_administrator: Option<bool>,
+    pub is_disabled: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]

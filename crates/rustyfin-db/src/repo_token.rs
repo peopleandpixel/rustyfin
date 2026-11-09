@@ -3,7 +3,9 @@ use uuid::Uuid;
 
 // Tokens are keyed by their hash. The hashing happens in rustyfin-auth; this layer only stores it.
 
-/// Stores a new token row. `token_hash` is the hex SHA-256 of the bearer token.
+/// Stores a new token row, only while the user exists and is enabled, so a sign-in that races a
+/// disable gets no token. `token_hash` is the hex SHA-256 of the bearer token. Returns whether the
+/// row was stored.
 pub async fn insert_token(
     pool: &SqlitePool,
     token_hash: &str,
@@ -12,11 +14,11 @@ pub async fn insert_token(
     device_name: &str,
     app_name: &str,
     app_version: &str,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
         "INSERT INTO access_tokens
             (token_hash, user_id, device_id, device_name, app_name, app_version)
-         VALUES (?, ?, ?, ?, ?, ?)",
+         SELECT ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM users WHERE id = ? AND is_disabled = 0)",
     )
     .bind(token_hash)
     .bind(user_id.to_string())
@@ -24,9 +26,10 @@ pub async fn insert_token(
     .bind(device_name)
     .bind(app_name)
     .bind(app_version)
+    .bind(user_id.to_string())
     .execute(pool)
     .await?;
-    Ok(())
+    Ok(result.rows_affected() > 0)
 }
 
 /// Looks up a token by hash, returning its user and device id.

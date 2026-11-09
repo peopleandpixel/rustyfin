@@ -183,13 +183,14 @@ pub struct TokenDevice {
 pub struct RequestToken(pub String);
 
 /// Issues a token for `user` and returns the plaintext once. Only its hash is stored.
+/// A disabled or deleted user gets no token, with the answer of a wrong password.
 pub async fn create_token(
     pool: &SqlitePool,
     user: &User,
     device: &TokenDevice,
 ) -> Result<String, AuthError> {
     let token = generate_token();
-    repo_token::insert_token(
+    let stored = repo_token::insert_token(
         pool,
         &token_hash(&token),
         user.id,
@@ -199,6 +200,9 @@ pub async fn create_token(
         &device.app_version,
     )
     .await?;
+    if !stored {
+        return Err(AuthError::InvalidCredentials);
+    }
     Ok(token)
 }
 

@@ -3,12 +3,13 @@ use axum::http::HeaderMap;
 use axum::routing::{delete, get, post, put};
 use axum::{Extension, Json, Router};
 use chrono::Utc;
+use rustyfin_db::repo_user::PolicyChange;
 use rustyfin_model::auth::Claims;
 use rustyfin_model::user::{
     ChangePasswordRequest, CreateUserRequest, EasyPasswordRequest, ForgotPasswordPinRequest,
     ForgotPasswordRequest, ForgotPasswordResult, PublicUserDto, ResetPasswordRequest,
-    UpdatePolicyRequest, UpdateUserNameRequest, UserAccessSchedule, UserDto, UserImageInfo,
-    UserPreferences, UserSecurityInfo, name_too_long,
+    UpdatePolicyRequest, UpdateUserNameRequest, UserAccessSchedule, UserDto, UserFlags,
+    UserImageInfo, UserPreferences, UserSecurityInfo, name_too_long,
 };
 use sqlx::SqlitePool;
 use std::net::SocketAddr;
@@ -73,7 +74,16 @@ pub fn admin_routes() -> Router<AppState> {
 
 async fn get_users(State(state): State<AppState>) -> Result<Json<Vec<UserDto>>, ApiError> {
     let users = rustyfin_db::repo_user::get_all_users(&state.db_ro).await?;
-    Ok(Json(users.into_iter().map(UserDto::from).collect()))
+    let flags = rustyfin_db::repo_user::all_user_flags(&state.db_ro).await?;
+    Ok(Json(
+        users
+            .into_iter()
+            .map(|u| {
+                let f = flags.get(&u.id).copied().unwrap_or_default();
+                UserDto::new(u, f)
+            })
+            .collect(),
+    ))
 }
 
 async fn get_me(
@@ -83,7 +93,8 @@ async fn get_me(
     let user = rustyfin_db::repo_user::get_user_by_id(&state.db_ro, claims.sub)
         .await?
         .ok_or(ApiError::NotFound("user not found".into()))?;
-    Ok(Json(UserDto::from(user)))
+    let flags = rustyfin_db::repo_user::user_flags(&state.db_ro, user.id).await?;
+    Ok(Json(UserDto::new(user, flags)))
 }
 
 async fn get_user(
@@ -93,13 +104,14 @@ async fn get_user(
     let user = rustyfin_db::repo_user::get_user_by_id(&state.db_ro, id)
         .await?
         .ok_or(ApiError::NotFound("user not found".into()))?;
-    Ok(Json(UserDto::from(user)))
+    let flags = rustyfin_db::repo_user::user_flags(&state.db_ro, user.id).await?;
+    Ok(Json(UserDto::new(user, flags)))
 }
 
 async fn get_public_users(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<PublicUserDto>>, ApiError> {
-    let users = rustyfin_db::repo_user::get_all_users(&state.db_ro).await?;
+    let users = rustyfin_db::repo_user::get_public_users(&state.db_ro).await?;
     Ok(Json(users.into_iter().map(PublicUserDto::from).collect()))
 }
 
@@ -138,7 +150,7 @@ async fn create_user(
     if !rustyfin_db::repo_user::create_user_unless_taken(&state.db, &user).await? {
         return Err(ApiError::BadRequest("user already exists".into()));
     }
-    Ok(Json(UserDto::from(user)))
+    Ok(Json(UserDto::new(user, UserFlags::default())))
 }
 
 async fn delete_user(
@@ -219,6 +231,10 @@ async fn change_password(
     Ok(Json(serde_json::json!({})))
 }
 
+/// Sets an account's administrator and disabled flags. Administrators only. Refuses, with 403, to
+/// change the owner's role or state, to remove or disable one's own administrator rights or account,
+/// to disable an administrator, and to leave no enabled administrator. Disabling an account deletes its
+/// tokens, sessions and devices.
 async fn update_policy(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
@@ -231,18 +247,59 @@ async fn update_policy(
         ));
     }
 
-    if req.is_administrator == Some(false)
-        && rustyfin_db::repo_user::is_owner(&state.db, id).await?
+    if rustyfin_db::repo_user::get_user_by_id(&state.db, id)
+        .await?
+        .is_none()
     {
-        return Err(ApiError::Forbidden(
-            "The server owner must stay an administrator.".into(),
-        ));
+        return Err(ApiError::NotFound("user not found".into()));
     }
 
-    if let Some(is_admin) = req.is_administrator {
-        let updated = rustyfin_db::repo_user::update_policy(&state.db, id, is_admin).await?;
-        if !updated {
-            return Err(ApiError::NotFound("user not found".into()));
+    if rustyfin_db::repo_user::is_owner(&state.db, id).await? {
+        if req.is_administrator == Some(false) {
+            return Err(ApiError::Forbidden(
+                "The server owner must stay an administrator.".into(),
+            ));
+        }
+        if req.is_disabled == Some(true) {
+            return Err(ApiError::Forbidden(
+                "The server owner cannot be disabled.".into(),
+            ));
+        }
+    }
+
+    if claims.sub == id {
+        if req.is_administrator == Some(false) {
+            return Err(ApiError::Forbidden(
+                "You cannot remove your own administrator rights.".into(),
+            ));
+        }
+        if req.is_disabled == Some(true) {
+            return Err(ApiError::Forbidden(
+                "You cannot disable your own account.".into(),
+            ));
+        }
+    }
+
+    let change =
+        rustyfin_db::repo_user::set_policy(&state.db, id, req.is_administrator, req.is_disabled)
+            .await?;
+    match change {
+        PolicyChange::Done => {}
+        PolicyChange::NotFound => return Err(ApiError::NotFound("user not found".into())),
+        PolicyChange::AdminDisabled => {
+            return Err(ApiError::Forbidden(
+                "Administrators cannot be disabled. Remove the administrator rights first.".into(),
+            ));
+        }
+        PolicyChange::PromoteDisabled => {
+            return Err(ApiError::Forbidden(
+                "A disabled account cannot be made an administrator. Enable it first.".into(),
+            ));
+        }
+        PolicyChange::LastAdmin => {
+            return Err(ApiError::Forbidden(
+                "There must be at least one enabled administrator.".into(),
+            ));
         }
     }
 

@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use rustyfin_model::user::{NameMatch, User, UserPreferences, name_too_long};
+use rustyfin_model::user::{NameMatch, User, UserFlags, UserPreferences, name_too_long};
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
@@ -97,6 +97,15 @@ pub async fn get_all_users(pool: &SqlitePool) -> Result<Vec<User>, sqlx::Error> 
     Ok(rows.into_iter().map(Into::into).collect())
 }
 
+/// Users a sign-in screen may list: the enabled ones, as Jellyfin's GetPublicUsers.
+pub async fn get_public_users(pool: &SqlitePool) -> Result<Vec<User>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, UserRow>("SELECT * FROM users WHERE is_disabled = 0")
+        .fetch_all(pool)
+        .await?;
+
+    Ok(rows.into_iter().map(Into::into).collect())
+}
+
 /// Returns true if a server owner exists.
 pub async fn owner_exists(pool: &SqlitePool) -> Result<bool, sqlx::Error> {
     let exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM users WHERE is_owner = 1)")
@@ -144,6 +153,46 @@ pub async fn is_disabled(pool: &SqlitePool, id: Uuid) -> Result<bool, sqlx::Erro
             .await?;
 
     Ok(disabled)
+}
+
+/// Reads the owner and disabled flags for one user. An unknown id gives the default flags.
+pub async fn user_flags(pool: &SqlitePool, id: Uuid) -> Result<UserFlags, sqlx::Error> {
+    let row: Option<(bool, bool)> =
+        sqlx::query_as("SELECT is_owner, is_disabled FROM users WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_optional(pool)
+            .await?;
+
+    Ok(row
+        .map(|(is_owner, is_disabled)| UserFlags {
+            is_owner,
+            is_disabled,
+        })
+        .unwrap_or_default())
+}
+
+/// Reads the owner and disabled flags for every user, keyed by id. Rows whose id doesn't parse are skipped.
+pub async fn all_user_flags(
+    pool: &SqlitePool,
+) -> Result<std::collections::HashMap<Uuid, UserFlags>, sqlx::Error> {
+    let rows: Vec<(String, bool, bool)> =
+        sqlx::query_as("SELECT id, is_owner, is_disabled FROM users")
+            .fetch_all(pool)
+            .await?;
+
+    Ok(rows
+        .into_iter()
+        .filter_map(|(id, is_owner, is_disabled)| {
+            let id = Uuid::parse_str(&id).ok()?;
+            Some((
+                id,
+                UserFlags {
+                    is_owner,
+                    is_disabled,
+                },
+            ))
+        })
+        .collect())
 }
 
 /// Makes the earliest-created enabled administrator the server owner, if no owner exists.
@@ -263,6 +312,9 @@ pub async fn update_password(
     Ok(result.rows_affected() > 0)
 }
 
+/// Sets the administrator flag by hand.
+/// Unguarded: no owner, self, disabled or last-administrator check. Only tests call it; the Policy
+/// endpoint uses `set_policy`.
 pub async fn update_policy(
     pool: &SqlitePool,
     id: Uuid,
@@ -274,6 +326,96 @@ pub async fn update_policy(
         .execute(pool)
         .await?;
     Ok(result.rows_affected() > 0)
+}
+
+/// Outcome of `set_policy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyChange {
+    /// The policy was changed.
+    Done,
+    /// No user has that id. Nothing changed.
+    NotFound,
+    /// The change would disable an account that is, or would become, an administrator. Nothing changed.
+    AdminDisabled,
+    /// The change would make a disabled account an administrator. Nothing changed.
+    PromoteDisabled,
+    /// The change would leave no enabled administrator. Nothing changed.
+    LastAdmin,
+}
+
+/// Sets the administrator and disabled flags. `None` leaves a flag as it is. The checks and the update
+/// run in one IMMEDIATE transaction, so two callers cannot both demote the last enabled administrator.
+/// Disabling deletes the user's tokens, sessions and devices in the same transaction, as Jellyfin's
+/// RevokeUserTokens logs each device out.
+pub async fn set_policy(
+    pool: &SqlitePool,
+    id: Uuid,
+    is_administrator: Option<bool>,
+    is_disabled: Option<bool>,
+) -> Result<PolicyChange, sqlx::Error> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+
+    let current: Option<(bool, bool)> =
+        sqlx::query_as("SELECT is_administrator, is_disabled FROM users WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some((cur_admin, cur_disabled)) = current else {
+        tx.rollback().await?;
+        return Ok(PolicyChange::NotFound);
+    };
+
+    let new_admin = is_administrator.unwrap_or(cur_admin);
+    let new_disabled = is_disabled.unwrap_or(cur_disabled);
+
+    // As in Jellyfin, which checks the current administrator flag, so demote and disable in one
+    // request is refused.
+    if new_disabled && !cur_disabled && (cur_admin || new_admin) {
+        tx.rollback().await?;
+        return Ok(PolicyChange::AdminDisabled);
+    }
+    if new_admin && !cur_admin && new_disabled {
+        tx.rollback().await?;
+        return Ok(PolicyChange::PromoteDisabled);
+    }
+
+    if cur_admin && !cur_disabled && !(new_admin && !new_disabled) {
+        let others: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM users WHERE is_administrator = 1 AND is_disabled = 0 AND id <> ?)",
+        )
+        .bind(id.to_string())
+        .fetch_one(&mut *tx)
+        .await?;
+        if !others {
+            tx.rollback().await?;
+            return Ok(PolicyChange::LastAdmin);
+        }
+    }
+
+    sqlx::query("UPDATE users SET is_administrator = ?1, is_disabled = ?2 WHERE id = ?3")
+        .bind(new_admin as i32)
+        .bind(new_disabled as i32)
+        .bind(id.to_string())
+        .execute(&mut *tx)
+        .await?;
+
+    if is_disabled == Some(true) {
+        sqlx::query("DELETE FROM access_tokens WHERE user_id = ?")
+            .bind(id.to_string())
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM sessions WHERE user_id = ?")
+            .bind(id.to_string())
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM devices WHERE user_id = ?")
+            .bind(id.to_string())
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+
+    Ok(PolicyChange::Done)
 }
 
 pub async fn update_configuration(
