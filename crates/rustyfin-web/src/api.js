@@ -14,9 +14,10 @@ const API = {
     _cache: new Map(),
     _cacheTTL: 30000, // 30 seconds default TTL
     _pendingRequests: new Map(), // Request deduplication: merge identical in-flight requests
-    _cacheGeneration: 0, // Bumped when admin rights are lost, so responses already in flight are not cached
+    _cacheGen: 0, // Bumped by clearUserCache(); answers from an older generation are not stored
     _adminCheck: null, // The running /Users/Me re-read, shared by concurrent callers
     onAdminLost: null, // Set by app.js; called when this account loses administrator rights
+    onSignedOut: null, // Set by app.js; called after every sign-out, the user's or a 401's
 
     /**
      * Get cached response or fetch from server with deduplication.
@@ -35,20 +36,34 @@ const API = {
         }
 
         // Fetch and cache
-        const generation = this._cacheGeneration;
+        const gen = this._cacheGen;
         const promise = this.get(path).then(data => {
-            if (this._cacheGeneration === generation) {
+            if (gen === this._cacheGen) {
                 this._cache.set(path, { data, time: Date.now() });
             }
-            if (this._pendingRequests.get(path) === promise) this._pendingRequests.delete(path);
+            if (this._pendingRequests.get(path) === promise) {
+                this._pendingRequests.delete(path);
+            }
             return data;
         }).catch(err => {
-            if (this._pendingRequests.get(path) === promise) this._pendingRequests.delete(path);
+            if (this._pendingRequests.get(path) === promise) {
+                this._pendingRequests.delete(path);
+            }
             throw err;
         });
 
         this._pendingRequests.set(path, promise);
         return promise;
+    },
+
+    /**
+     * Forget every cached answer and in-flight request, so nothing one user loaded is served to the next.
+     * Every sign-in path and sign-out call this.
+     */
+    clearUserCache() {
+        this._cache.clear();
+        this._pendingRequests.clear();
+        this._cacheGen++;
     },
 
     /**
@@ -119,9 +134,11 @@ const API = {
     },
 
     async get(path) {
+        const sent = this.token;
         const res = await fetch(this.base + path, { headers: this.headers() });
         if (!res.ok) {
-            if (res.status === 401 && this.token) {
+            // A late 401 for an older token must not sign out the user who signed in since.
+            if (res.status === 401 && sent && this.token === sent) {
                 this.logout();
                 window.location.hash = 'login';
             }
@@ -201,14 +218,13 @@ const API = {
     _loseAdmin() {
         this.isAdmin = false;
         localStorage.setItem('rustyfin_is_admin', 'false');
-        this._cacheGeneration++;
-        this._cache.clear();
-        this._pendingRequests.clear();
+        this.clearUserCache();
         if (this.onAdminLost) this.onAdminLost();
     },
 
     // Auth
     async login(username, password) {
+        this.clearUserCache();
         const res = await fetch(this.base + '/Users/AuthenticateByName', {
             method: 'POST',
             headers: {
@@ -230,8 +246,10 @@ const API = {
     },
 
     // Keeps the session that an AuthenticateByName-style answer carries (password, setup-code or OpenID Connect sign-in).
+    // Clears the cache again once the token has changed, so nothing loaded with the old token is served to the new user.
     _storeSession(data, fallbackName = '') {
         this.token = data.AccessToken || data.access_token;
+        this.clearUserCache();
         const userObj = data.User || data.user || {};
         this.userId = userObj.Id || userObj.id || '';
         this.userName = userObj.Name || userObj.name || fallbackName;
@@ -264,6 +282,7 @@ const API = {
 
     // Signs in an imported user with the one-time code and the password chosen now.
     async loginWithSetupCode(username, code, newPw) {
+        this.clearUserCache();
         const res = await fetch(this.base + '/Users/AuthenticateWithSetupCode', {
             method: 'POST',
             headers: {
@@ -279,6 +298,7 @@ const API = {
     },
 
     logout() {
+        this.clearUserCache();
         if (this.token) {
             this.post('/Sessions/Logout').catch(() => {});
         }
@@ -287,6 +307,7 @@ const API = {
         this.userName = null;
         this.isAdmin = false;
         ['rustyfin_token', 'rustyfin_user_id', 'rustyfin_user_name', 'rustyfin_is_admin'].forEach(k => localStorage.removeItem(k));
+        if (this.onSignedOut) this.onSignedOut();
     },
 
     isLoggedIn() {

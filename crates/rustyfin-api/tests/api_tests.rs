@@ -18576,6 +18576,363 @@ async fn b23_a_crafted_query_cached_first_does_not_break_the_view() {
     b23_assert_answers(&app, &[crafted, owners]).await;
 }
 
+// B38: playlist owner checks
+// A user who neither owns a playlist nor is an administrator gets 404 from every playlist route,
+// as for an unknown id, so an id doesn't reveal that a playlist exists, and the playlist stays as
+// it was. The owner, administrators and the API key keep full access.
+
+/// A signed-in user: `(token, id)`.
+async fn b38_user(state: &AppState, name: &str, admin: bool) -> (String, uuid::Uuid) {
+    let id = add_user(state, name, "b38-password", admin).await;
+    let user = rustyfin_db::repo_user::get_user_by_id(&state.db, id)
+        .await
+        .unwrap()
+        .unwrap();
+    let token = rustyfin_auth::create_token(&state.db, &user, &Default::default())
+        .await
+        .unwrap();
+    (token, id)
+}
+
+/// The app, a non-admin "alice" who owns the playlist "A private" (MediaType "Video", the first
+/// two of three movies), a non-admin "bob" and an admin. Returns the app, the three sessions,
+/// the playlist id and the movie ids.
+struct B38World {
+    app: axum::Router,
+    alice: (String, uuid::Uuid),
+    bob: (String, uuid::Uuid),
+    admin: (String, uuid::Uuid),
+    playlist: String,
+    movies: Vec<String>,
+}
+
+async fn b38_world() -> B38World {
+    let state = test_state().await;
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: "B38 Library".to_string(),
+        content_type: rustyfin_model::library::LibraryContentType::Movies,
+        paths: vec![media_folder(&state, "b38")],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    let mut movies = Vec::new();
+    for name in ["B38 One", "B38 Two", "B38 Three"] {
+        let id = uuid::Uuid::new_v4();
+        let path = state
+            .data_dir
+            .join("media")
+            .join("b38")
+            .join(format!("{id}.mkv"));
+        sqlx::query(
+            "INSERT INTO media_items (id, library_id, name, media_type, path) VALUES (?, ?, ?, 'Movie', ?)",
+        )
+        .bind(id.to_string())
+        .bind(lib.id.to_string())
+        .bind(name)
+        .bind(path.to_string_lossy().to_string())
+        .execute(&state.db)
+        .await
+        .unwrap();
+        movies.push(id.to_string());
+    }
+    let alice = b38_user(&state, "alice", false).await;
+    let bob = b38_user(&state, "bob", false).await;
+    let admin = b38_user(&state, "b38admin", true).await;
+    let app = app(state);
+    let body = format!(
+        r#"{{"Name":"A private","MediaType":"Video","Ids":["{}","{}"]}}"#,
+        movies[0], movies[1]
+    );
+    let (status, created) = send_authed(&app, "POST", "/Playlists", &alice.0, Some(&body)).await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let playlist = created["Id"].as_str().unwrap().to_string();
+    B38World {
+        app,
+        alice,
+        bob,
+        admin,
+        playlist,
+        movies,
+    }
+}
+
+/// What `token` sees of a playlist: the GET status, its name, MediaType and ChildCount, and the
+/// item ids in order.
+async fn b38_view(
+    app: &axum::Router,
+    token: &str,
+    playlist: &str,
+) -> (
+    StatusCode,
+    serde_json::Value,
+    serde_json::Value,
+    serde_json::Value,
+    Vec<String>,
+) {
+    let (status, pl) =
+        send_authed(app, "GET", &format!("/Playlists/{playlist}"), token, None).await;
+    let (_, items) = send_authed(
+        app,
+        "GET",
+        &format!("/Playlists/{playlist}/Items"),
+        token,
+        None,
+    )
+    .await;
+    let ids = items["Items"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|i| i["Id"].as_str().unwrap_or_default().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    (
+        status,
+        pl["Name"].clone(),
+        pl["MediaType"].clone(),
+        pl["ChildCount"].clone(),
+        ids,
+    )
+}
+
+/// Every playlist route that takes an id, with a JSON body where it takes one:
+/// `(method, uri, body)`.
+fn b38_routes(
+    playlist: &str,
+    item: &str,
+    user: uuid::Uuid,
+) -> Vec<(&'static str, String, Option<String>)> {
+    let ids = format!(r#"{{"Ids":["{item}"]}}"#);
+    vec![
+        ("GET", format!("/Playlists/{playlist}"), None),
+        ("GET", format!("/Playlists/{playlist}/Items"), None),
+        (
+            "POST",
+            format!("/Playlists/{playlist}"),
+            Some(r#"{"Name":"x","MediaType":"Audio"}"#.to_string()),
+        ),
+        (
+            "POST",
+            format!("/Playlists/{playlist}/Items"),
+            Some(ids.clone()),
+        ),
+        (
+            "POST",
+            format!("/Playlists/{playlist}/Items"),
+            Some(r#"{"Ids":[]}"#.to_string()),
+        ),
+        ("DELETE", format!("/Playlists/{playlist}/Items"), Some(ids)),
+        ("GET", format!("/Playlists/{playlist}/Users"), None),
+        ("GET", format!("/Playlists/{playlist}/Users/{user}"), None),
+        (
+            "DELETE",
+            format!("/Playlists/{playlist}/Users/{user}"),
+            None,
+        ),
+        ("DELETE", format!("/Playlists/{playlist}"), None),
+    ]
+}
+
+/// The ids of the playlists `GET /Playlists` lists for `token`.
+async fn b38_listed(app: &axum::Router, token: &str) -> Vec<String> {
+    let (status, list) = send_authed(app, "GET", "/Playlists", token, None).await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    list.as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["Id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn b38_another_user_gets_404_from_every_playlist_route_and_changes_nothing() {
+    let w = b38_world().await;
+    let before = b38_view(&w.app, &w.alice.0, &w.playlist).await;
+    assert_eq!(before.0, StatusCode::OK);
+    assert_eq!(before.1, "A private");
+    assert_eq!(before.2, "Video");
+    assert_eq!(before.3, 2);
+    assert_eq!(before.4, w.movies[..2].to_vec());
+
+    let unknown = uuid::Uuid::new_v4().to_string();
+    for playlist in [w.playlist.as_str(), unknown.as_str()] {
+        for (method, uri, body) in b38_routes(playlist, &w.movies[0], w.alice.1) {
+            let (status, answer) =
+                send_authed(&w.app, method, &uri, &w.bob.0, body.as_deref()).await;
+            assert_eq!(
+                status,
+                StatusCode::NOT_FOUND,
+                "bob {method} {uri}: {answer}"
+            );
+        }
+    }
+    // Adding a movie that isn't in the playlist yet is refused too.
+    let add = format!(r#"{{"Ids":["{}"]}}"#, w.movies[2]);
+    let uri = format!("/Playlists/{}/Items", w.playlist);
+    let (status, _) = send_authed(&w.app, "POST", &uri, &w.bob.0, Some(&add)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "bob POST {uri}");
+
+    assert_eq!(b38_view(&w.app, &w.alice.0, &w.playlist).await, before);
+    assert_eq!(
+        b38_listed(&w.app, &w.alice.0).await,
+        vec![w.playlist.clone()]
+    );
+    assert!(b38_listed(&w.app, &w.bob.0).await.is_empty());
+}
+
+#[tokio::test]
+async fn b38_the_owner_keeps_full_access() {
+    let w = b38_world().await;
+    let (app, token, pl) = (&w.app, w.alice.0.as_str(), w.playlist.as_str());
+
+    let (status, users) =
+        send_authed(app, "GET", &format!("/Playlists/{pl}/Users"), token, None).await;
+    assert_eq!((status, users), (StatusCode::OK, serde_json::json!([])));
+    let uri = format!("/Playlists/{pl}/Users/{}", w.alice.1);
+    assert_eq!(
+        send_authed(app, "GET", &uri, token, None).await.0,
+        StatusCode::OK
+    );
+    let uri = format!("/Playlists/{pl}/Users/{}", w.bob.1);
+    assert_eq!(
+        send_authed(app, "DELETE", &uri, token, None).await.0,
+        StatusCode::NO_CONTENT
+    );
+
+    let uri = format!("/Playlists/{pl}");
+    let (status, _) = send_authed(app, "POST", &uri, token, Some(r#"{"Name":"Renamed"}"#)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let items = format!("/Playlists/{pl}/Items");
+    let add = format!(r#"{{"Ids":["{}"]}}"#, w.movies[2]);
+    assert_eq!(
+        send_authed(app, "POST", &items, token, Some(&add)).await.0,
+        StatusCode::NO_CONTENT
+    );
+    let remove = format!(r#"{{"Ids":["{}"]}}"#, w.movies[0]);
+    assert_eq!(
+        send_authed(app, "DELETE", &items, token, Some(&remove))
+            .await
+            .0,
+        StatusCode::NO_CONTENT
+    );
+
+    let view = b38_view(app, token, pl).await;
+    assert_eq!(view.0, StatusCode::OK);
+    assert_eq!(view.1, "Renamed");
+    assert_eq!(view.3, 2);
+    let mut ids = view.4;
+    ids.sort();
+    let mut expected = vec![w.movies[1].clone(), w.movies[2].clone()];
+    expected.sort();
+    assert_eq!(ids, expected);
+
+    assert_eq!(
+        send_authed(app, "DELETE", &uri, token, None).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        send_authed(app, "GET", &uri, token, None).await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert!(b38_listed(app, token).await.is_empty());
+}
+
+#[tokio::test]
+async fn b38_an_admin_and_the_api_key_reach_any_playlist() {
+    let w = b38_world().await;
+    let (app, admin, pl) = (&w.app, w.admin.0.as_str(), w.playlist.as_str());
+
+    let view = b38_view(app, "test-api-key", pl).await;
+    assert_eq!(view.0, StatusCode::OK);
+    assert_eq!(view.1, "A private");
+    assert_eq!(view.4, w.movies[..2].to_vec());
+
+    let view = b38_view(app, admin, pl).await;
+    assert_eq!(view.0, StatusCode::OK);
+    assert_eq!(view.4, w.movies[..2].to_vec());
+    let (status, _) = send_authed(app, "GET", &format!("/Playlists/{pl}/Users"), admin, None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let uri = format!("/Playlists/{pl}");
+    let (status, _) = send_authed(app, "POST", &uri, admin, Some(r#"{"Name":"By admin"}"#)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(b38_view(app, &w.alice.0, pl).await.1, "By admin");
+
+    let items = format!("/Playlists/{pl}/Items");
+    let third = format!(r#"{{"Ids":["{}"]}}"#, w.movies[2]);
+    assert_eq!(
+        send_authed(app, "POST", &items, admin, Some(&third))
+            .await
+            .0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(b38_view(app, &w.alice.0, pl).await.3, 3);
+    assert_eq!(
+        send_authed(app, "DELETE", &items, admin, Some(&third))
+            .await
+            .0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        b38_view(app, &w.alice.0, pl).await.4,
+        w.movies[..2].to_vec()
+    );
+
+    assert_eq!(
+        send_authed(app, "DELETE", &uri, admin, None).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(b38_view(app, &w.alice.0, pl).await.0, StatusCode::NOT_FOUND);
+    assert!(b38_listed(app, &w.alice.0).await.is_empty());
+}
+
+#[tokio::test]
+async fn b38_a_users_own_playlist_works_and_is_hidden_from_others() {
+    let w = b38_world().await;
+    let (app, bob) = (&w.app, w.bob.0.as_str());
+    let body = format!(r#"{{"Name":"B own","Ids":["{}"]}}"#, w.movies[2]);
+    let (status, created) = send_authed(app, "POST", "/Playlists", bob, Some(&body)).await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let pl = created["Id"].as_str().unwrap().to_string();
+
+    let add = format!(r#"{{"Ids":["{}"]}}"#, w.movies[0]);
+    let items = format!("/Playlists/{pl}/Items");
+    assert_eq!(
+        send_authed(app, "POST", &items, bob, Some(&add)).await.0,
+        StatusCode::NO_CONTENT
+    );
+    let view = b38_view(app, bob, &pl).await;
+    assert_eq!(
+        (view.0, &view.1, &view.3),
+        (StatusCode::OK, &"B own".into(), &2.into())
+    );
+    assert_eq!(b38_listed(app, bob).await, vec![pl.clone()]);
+
+    // Alice, a non-admin too, can't see or touch it.
+    for (method, uri, body) in b38_routes(&pl, &w.movies[2], w.bob.1) {
+        let (status, answer) = send_authed(app, method, &uri, &w.alice.0, body.as_deref()).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "alice {method} {uri}: {answer}"
+        );
+    }
+    assert_eq!(b38_view(app, bob, &pl).await, view);
+
+    let uri = format!("/Playlists/{pl}");
+    assert_eq!(
+        send_authed(app, "DELETE", &uri, bob, None).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        send_authed(app, "GET", &uri, bob, None).await.0,
+        StatusCode::NOT_FOUND
+    );
+}
+
 // ── G1c ──
 // One user's data stays theirs: GET /Items/Resume lists only the caller's items (or those of the
 // user a userId names, under path_user's rules), IsFavorite/IsPlayed/IsUnplayed match only the

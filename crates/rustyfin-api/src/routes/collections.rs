@@ -2,6 +2,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{delete, get, post};
 use axum::{Extension, Json, Router};
+use rustyfin_db::repo_playlist::PlaylistCaller;
 use rustyfin_model::auth::Claims;
 use rustyfin_model::collection::{CollectionDto, CreateCollectionRequest};
 use rustyfin_model::media::QueryResult;
@@ -137,21 +138,40 @@ async fn get_playlists(
     Ok(Json(playlists))
 }
 
+/// Administrators reach any playlist; everyone else only their own.
+fn playlist_caller(claims: &Claims) -> PlaylistCaller {
+    if claims.is_admin {
+        PlaylistCaller::Admin
+    } else {
+        PlaylistCaller::Owner(claims.sub)
+    }
+}
+
+fn playlist_not_found() -> ApiError {
+    ApiError::NotFound("Playlist not found".to_string())
+}
+
 async fn get_playlist(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    Extension(claims): Extension<Claims>,
 ) -> Result<Json<PlaylistDto>, ApiError> {
-    let playlist = rustyfin_db::repo_playlist::get_playlist(&state.db_ro, id)
+    let caller = playlist_caller(&claims);
+    let playlist = rustyfin_db::repo_playlist::get_playlist(&state.db_ro, id, caller)
         .await?
-        .ok_or_else(|| ApiError::NotFound("Playlist not found".to_string()))?;
+        .ok_or_else(playlist_not_found)?;
     Ok(Json(playlist))
 }
 
 async fn delete_playlist(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    Extension(claims): Extension<Claims>,
 ) -> Result<StatusCode, ApiError> {
-    rustyfin_db::repo_playlist::delete_playlist(&state.db, id).await?;
+    let caller = playlist_caller(&claims);
+    if !rustyfin_db::repo_playlist::delete_playlist(&state.db, id, caller).await? {
+        return Err(playlist_not_found());
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -186,8 +206,11 @@ async fn create_playlist(
 async fn get_playlist_items(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    Extension(claims): Extension<Claims>,
 ) -> Result<Json<QueryResult>, ApiError> {
-    let items = rustyfin_db::repo_playlist::get_playlist_items(&state.db_ro, id).await?;
+    ensure_playlist_visible(&state, id, &claims).await?;
+    let caller = playlist_caller(&claims);
+    let items = rustyfin_db::repo_playlist::get_playlist_items(&state.db_ro, id, caller).await?;
     let count = items.len() as i64;
     Ok(Json(QueryResult {
         items,
@@ -200,6 +223,7 @@ async fn get_playlist_items(
 async fn update_playlist(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    Extension(claims): Extension<Claims>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<StatusCode, ApiError> {
     let name = body
@@ -211,14 +235,18 @@ async fn update_playlist(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    rustyfin_db::repo_playlist::update_playlist(
+    let found = rustyfin_db::repo_playlist::update_playlist(
         &state.db,
         id,
         name.as_deref(),
         media_type.as_deref(),
+        playlist_caller(&claims),
     )
     .await
     .map_err(|e| ApiError::Internal(e.to_string()))?;
+    if !found {
+        return Err(playlist_not_found());
+    }
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -227,16 +255,24 @@ async fn update_playlist(
 async fn add_items_to_playlist(
     State(state): State<AppState>,
     Path(playlist_id): Path<Uuid>,
-    Json(_body): Json<serde_json::Value>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<serde_json::Value>,
 ) -> Result<StatusCode, ApiError> {
-    if let Some(ids) = _body.get("Ids").and_then(|v| v.as_array()) {
+    ensure_playlist_visible(&state, playlist_id, &claims).await?;
+    let caller = playlist_caller(&claims);
+    if let Some(ids) = body.get("Ids").and_then(|v| v.as_array()) {
         for id_val in ids {
             if let Some(id_str) = id_val.as_str()
                 && let Ok(item_id) = id_str.parse::<Uuid>()
             {
-                rustyfin_db::repo_playlist::add_item_to_playlist(&state.db, playlist_id, item_id)
-                    .await
-                    .ok();
+                rustyfin_db::repo_playlist::add_item_to_playlist(
+                    &state.db,
+                    playlist_id,
+                    item_id,
+                    caller,
+                )
+                .await
+                .ok();
             }
         }
     }
@@ -247,9 +283,12 @@ async fn add_items_to_playlist(
 async fn remove_items_from_playlist(
     State(state): State<AppState>,
     Path(playlist_id): Path<Uuid>,
-    Json(_body): Json<serde_json::Value>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<serde_json::Value>,
 ) -> Result<StatusCode, ApiError> {
-    if let Some(ids) = _body.get("Ids").and_then(|v| v.as_array()) {
+    ensure_playlist_visible(&state, playlist_id, &claims).await?;
+    let caller = playlist_caller(&claims);
+    if let Some(ids) = body.get("Ids").and_then(|v| v.as_array()) {
         for id_val in ids {
             if let Some(id_str) = id_val.as_str()
                 && let Ok(item_id) = id_str.parse::<Uuid>()
@@ -258,6 +297,7 @@ async fn remove_items_from_playlist(
                     &state.db,
                     playlist_id,
                     item_id,
+                    caller,
                 )
                 .await
                 .ok();
@@ -267,27 +307,45 @@ async fn remove_items_from_playlist(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Shared visibility check for the playlist routes: 404 unless the caller can see the playlist.
+async fn ensure_playlist_visible(
+    state: &AppState,
+    id: Uuid,
+    claims: &Claims,
+) -> Result<(), ApiError> {
+    rustyfin_db::repo_playlist::get_playlist(&state.db_ro, id, playlist_caller(claims))
+        .await?
+        .map(|_| ())
+        .ok_or_else(playlist_not_found)
+}
+
 /// GET /Playlists/{id}/Users - Get playlist users
 async fn get_playlist_users(
-    State(_state): State<AppState>,
-    Path(_id): Path<Uuid>,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Extension(claims): Extension<Claims>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    ensure_playlist_visible(&state, id, &claims).await?;
     Ok(Json(serde_json::json!([])))
 }
 
 /// GET /Playlists/{id}/Users/{userId}
 async fn get_playlist_user(
-    State(_state): State<AppState>,
-    Path((_id, _user_id)): Path<(Uuid, Uuid)>,
+    State(state): State<AppState>,
+    Path((id, _user_id)): Path<(Uuid, Uuid)>,
+    Extension(claims): Extension<Claims>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    ensure_playlist_visible(&state, id, &claims).await?;
     Ok(Json(serde_json::json!({})))
 }
 
 /// DELETE /Playlists/{id}/Users/{userId}
 async fn remove_playlist_user(
-    State(_state): State<AppState>,
-    Path((_id, _user_id)): Path<(Uuid, Uuid)>,
+    State(state): State<AppState>,
+    Path((id, _user_id)): Path<(Uuid, Uuid)>,
+    Extension(claims): Extension<Claims>,
 ) -> Result<StatusCode, ApiError> {
+    ensure_playlist_visible(&state, id, &claims).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
