@@ -1,4 +1,5 @@
 use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use rustyfin_model::library::{CreateLibraryRequest, Library, LibraryOptions};
@@ -26,6 +27,7 @@ pub fn setup_routes() -> Router<AppState> {
         .route("/Library/BrowseDirectories", get(browse_directories))
         .route("/Library/VirtualFolders", get(get_libraries))
         .route("/Library/VirtualFolders", post(create_library))
+        .route("/Environment/ValidatePath", post(validate_path))
         .route("/Library/VirtualFolders/{id}", delete(remove_library))
         .route(
             "/Library/VirtualFolders/Paths",
@@ -131,31 +133,38 @@ async fn get_libraries(
     Ok(Json(items))
 }
 
+/// Checks one library folder path. Returns the sentence for a path the server cannot use as a
+/// folder, with `true` when the path is absolute but not an existing folder (not found, or a file).
+async fn path_problem(p: &str) -> Option<(bool, String)> {
+    if !StdPath::new(p).is_absolute() {
+        return Some((
+            false,
+            format!("The folder \"{p}\" is not a full path on the server."),
+        ));
+    }
+    match tokio::fs::metadata(p).await {
+        Ok(meta) if !meta.is_dir() => Some((
+            true,
+            format!("The path \"{p}\" on the server is not a folder."),
+        )),
+        Ok(_) => match tokio::fs::read_dir(p).await {
+            Ok(_) => None,
+            Err(e) => Some((false, unreadable_sentence(p, &e))),
+        },
+        Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => Some((
+            true,
+            format!("The folder \"{p}\" was not found on the server."),
+        )),
+        Err(e) => Some((false, unreadable_sentence(p, &e))),
+    }
+}
+
 /// Checks each library folder path, in request order. Returns one sentence for
 /// each path the server cannot use as a folder; an empty list means all are usable.
 async fn library_path_problems(paths: &[String]) -> Vec<String> {
     let mut problems = Vec::new();
     for p in paths {
-        let problem = if !StdPath::new(p).is_absolute() {
-            Some(format!(
-                "The folder \"{p}\" is not a full path on the server."
-            ))
-        } else {
-            match tokio::fs::metadata(p).await {
-                Ok(meta) if !meta.is_dir() => {
-                    Some(format!("The path \"{p}\" on the server is not a folder."))
-                }
-                Ok(_) => match tokio::fs::read_dir(p).await {
-                    Ok(_) => None,
-                    Err(e) => Some(unreadable_sentence(p, &e)),
-                },
-                Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
-                    Some(format!("The folder \"{p}\" was not found on the server."))
-                }
-                Err(e) => Some(unreadable_sentence(p, &e)),
-            }
-        };
-        problems.extend(problem);
+        problems.extend(path_problem(p).await.map(|(_, sentence)| sentence));
     }
     problems
 }
@@ -190,6 +199,23 @@ async fn create_library(
     }
     state.task_scheduler.watcher().libraries_changed();
     Ok(Json(lib))
+}
+
+/// The body of POST /Environment/ValidatePath. Jellyfin's ValidateWritable and IsFile are ignored.
+#[derive(Deserialize)]
+struct ValidatePathRequest {
+    #[serde(rename = "Path")]
+    path: String,
+}
+
+/// POST /Environment/ValidatePath - checks one folder path with the same sentences as create; stores nothing.
+/// An absolute path that is not an existing folder answers 404; other problems answer 400.
+async fn validate_path(Json(req): Json<ValidatePathRequest>) -> Result<StatusCode, ApiError> {
+    match path_problem(&req.path).await {
+        None => Ok(StatusCode::NO_CONTENT),
+        Some((true, sentence)) => Err(ApiError::NotFound(sentence)),
+        Some((false, sentence)) => Err(ApiError::BadRequest(sentence)),
+    }
 }
 
 async fn remove_library(

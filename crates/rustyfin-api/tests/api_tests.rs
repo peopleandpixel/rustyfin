@@ -2354,6 +2354,104 @@ async fn test_create_library_accepts_existing_folders() {
     assert_eq!(stored.paths, [shows, more_shows]);
 }
 
+// B118: wizard library
+
+/// Sends `POST /Environment/ValidatePath` for `path`, with `token` if given.
+async fn b118_validate(
+    app: &axum::Router,
+    token: Option<&str>,
+    path: &str,
+) -> (StatusCode, serde_json::Value) {
+    let body = serde_json::json!({ "Path": path, "ValidateWritable": false });
+    send(
+        app,
+        request("POST", "/Environment/ValidatePath", token, Some(body)),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn b118_validate_path_accepts_folder_before_owner() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let folder = media_folder(&state, "b118 shows");
+    // Paths are checked as sent, trailing slash included.
+    for path in [folder.clone(), format!("{folder}/")] {
+        let (status, body) = b118_validate(&app, None, &path).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "validate {path}: {body}");
+    }
+    assert!(
+        stored_library_names(&state).await.is_empty(),
+        "a path check must store no library"
+    );
+}
+
+#[tokio::test]
+async fn b118_validate_path_rejects_with_create_sentences() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let missing = state.data_dir.join("media").join("b118 missing");
+    let missing = missing.to_str().unwrap().to_string();
+    let file = media_file(&state, "b118 episode.mkv");
+    let below_file = format!("{file}/shows");
+    // Like Jellyfin, a path that is not an existing folder answers 404; other problems answer 400.
+    let cases = [
+        (
+            missing.clone(),
+            StatusCode::NOT_FOUND,
+            format!("The folder \"{missing}\" was not found on the server."),
+        ),
+        (
+            below_file.clone(),
+            StatusCode::NOT_FOUND,
+            format!("The folder \"{below_file}\" was not found on the server."),
+        ),
+        (
+            ".".to_string(),
+            StatusCode::BAD_REQUEST,
+            "The folder \".\" is not a full path on the server.".to_string(),
+        ),
+        (
+            String::new(),
+            StatusCode::BAD_REQUEST,
+            "The folder \"\" is not a full path on the server.".to_string(),
+        ),
+        (
+            file.clone(),
+            StatusCode::NOT_FOUND,
+            format!("The path \"{file}\" on the server is not a folder."),
+        ),
+    ];
+    for (path, expected, detail) in cases {
+        let (status, body) = b118_validate(&app, None, &path).await;
+        assert_eq!(status, expected, "validate {path:?}: {body}");
+        assert_eq!(body["Status"], expected.as_u16());
+        assert_eq!(body["Detail"], detail.as_str(), "Detail for {path:?}");
+    }
+    assert!(stored_library_names(&state).await.is_empty());
+}
+
+#[tokio::test]
+async fn b118_validate_path_admin_only_after_owner() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, viewer, _) = g1_owner_and_viewer(&state, &app).await;
+    let body = serde_json::json!({ "Path": media_folder(&state, "b118 owner") });
+    let routes = [(
+        "POST",
+        "/Environment/ValidatePath".to_string(),
+        Some(body),
+        true,
+    )];
+    g1_check_admin_routes(&app, &routes, &owner, &viewer).await;
+    let missing = state.data_dir.join("media").join("b118 gone");
+    let (status, body) = b118_validate(&app, Some(&owner), missing.to_str().unwrap()).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "owner, missing path: {body}");
+    let (status, body) =
+        b118_validate(&app, Some(&owner), &media_folder(&state, "b118 owner")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "owner, folder: {body}");
+}
+
 #[tokio::test]
 async fn test_create_library_with_no_paths_still_works() {
     let server = server_with_films().await;
