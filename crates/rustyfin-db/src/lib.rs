@@ -249,6 +249,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn b33_a_9d9cfb2_db_applies_072_and_keeps_its_items() {
+        // Master 9d9cfb2 ships 001-035 and 061. At the next start its episodes get an empty end,
+        // and its items the FileSystem location type that a scan corrects for seasons with no folder.
+        let dir = temp_dir();
+        let master = dir.join("9d9cfb2.db");
+        let pool = plain_pool(&master).await;
+        subset(61).run(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO libraries (id, name, content_type) VALUES ('lib', 'TV', 'tvshows')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO media_items (id, name, media_type, path, library_id, index_number) \
+             VALUES ('ep', 'Hotel Series - S01E03-E04', 'Episode', '/tv/ep.mkv', 'lib', 3)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        let upgraded = init_db(master.to_str().unwrap()).await.unwrap();
+        let applied: Vec<i64> =
+            sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
+                .fetch_all(&upgraded)
+                .await
+                .unwrap();
+        assert!(applied.contains(&72), "072 is applied: {applied:?}");
+        let episode: (Option<i64>, Option<i64>, String) = sqlx::query_as(
+            "SELECT index_number, index_number_end, location_type FROM media_items WHERE id = 'ep'",
+        )
+        .fetch_one(&upgraded)
+        .await
+        .unwrap();
+        assert_eq!(episode, (Some(3), None, "FileSystem".to_string()));
+        let fresh = init_db(dir.join("fresh.db").to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            schema(&upgraded).await,
+            schema(&fresh).await,
+            "a 9d9cfb2 DB and a fresh DB end with the same schema"
+        );
+        upgraded.close().await;
+        fresh.close().await;
+    }
+
+    #[tokio::test]
     async fn g2c_a_latest_db_without_032_upgrades_to_the_fresh_schema() {
         // The :latest image (master 75fea9a) shipped 001-031 and G1's 033 but not 032. SQLx applies
         // the missing 032 after 033 at the next start.

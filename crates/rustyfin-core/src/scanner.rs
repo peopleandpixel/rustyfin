@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use rustyfin_db::repo_media::PathScope;
 use rustyfin_model::library::{Library, LibraryContentType};
-use rustyfin_model::media::{MediaItem, MediaType};
+use rustyfin_model::media::{LocationType, MediaItem, MediaType};
 use sqlx::SqlitePool;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -11,14 +11,40 @@ use uuid::Uuid;
 
 use crate::local_images;
 use crate::naming;
+use crate::nfo_parser;
 use crate::probe;
 use crate::scan_progress::ScanTicket;
 use crate::scan_sync;
 use crate::tmdb_client::TmdbApi;
 
+/// Jellyfin's video extensions (`NamingOptions.cs:24-79`) without `001`, `asx`, `bin`, `ifo`, `img`, `iso`,
+/// `nrg` and `strm`: split parts, playlists, disc images and links, which ffmpeg can't play as one title.
+/// `bin` counts in TV libraries only when it is named as an episode (`is_episode_file`).
 pub(crate) const VIDEO_EXTENSIONS: &[&str] = &[
-    "mkv", "mp4", "avi", "mov", "wmv", "flv", "webm", "m4v", "ts", "mpg", "mpeg",
+    "mkv", "mp4", "avi", "mov", "wmv", "flv", "webm", "m4v", "ts", "mpg", "mpeg", "3g2", "3gp",
+    "amv", "asf", "bivx", "divx", "dv", "dvr-ms", "f4v", "fli", "m2t", "m2ts", "m2v", "mk3d",
+    "mpe", "mts", "mxf", "nsv", "nuv", "ogm", "ogv", "pva", "qt", "rec", "rm", "rmvb", "svq3",
+    "tp", "ty", "viv", "vob", "vp3", "wtv", "xvid",
 ];
+
+/// Whether `path` is an episode file in a TV library. Jellyfin lists every `.bin` (`NamingOptions.cs:24-79`);
+/// most are disc images or data, so a `.bin` counts only when its stem parses as an episode.
+pub(crate) fn is_episode_file(path: &Path) -> bool {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    if VIDEO_EXTENSIONS.contains(&ext.as_str()) {
+        return true;
+    }
+    ext == "bin"
+        && path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .is_some_and(|stem| naming::parse_episode(stem).is_some())
+}
+
 pub(crate) const AUDIO_EXTENSIONS: &[&str] =
     &["mp3", "flac", "ogg", "wav", "aac", "wma", "m4a", "opus"];
 const PHOTO_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "gif", "bmp", "webp", "tiff"];
@@ -589,6 +615,16 @@ async fn scan_flat_library(
     Ok((changes, new_item_ids))
 }
 
+/// A series folder that a TV scan walked.
+struct SeriesWalk {
+    /// The folder's path.
+    dir: String,
+    /// The folder's name.
+    folder: String,
+    /// Its seasons, by id: the name of each one's folder, or the one made for its loose files, and its number.
+    seasons: BTreeMap<Uuid, (String, Option<i32>)>,
+}
+
 /// Recursive scan for TV Shows: path/ShowName/Season XX/episode files
 async fn scan_tv_library(
     pool: &SqlitePool,
@@ -622,9 +658,12 @@ async fn scan_tv_library(
     let existing_seasons: HashMap<String, Uuid> =
         rustyfin_db::repo_media::get_library_items_by_type(pool, library.id, "Season", &filter)
             .await?;
-    // The episode files of each season, by season id: the id of its series, the season's name, then its
+    // The episode files of each season, by season id: the id of its series, the season's number, then its
     // files in walk order. The episodes are reconciled once every path has been walked.
-    let mut episode_files: BTreeMap<Uuid, (Uuid, String, Vec<PathBuf>)> = BTreeMap::new();
+    let mut episode_files: BTreeMap<Uuid, (Uuid, Option<i32>, Vec<PathBuf>)> = BTreeMap::new();
+    // Each series that the walks met, by id: its folder's path and name, and its seasons with their
+    // folder's name and number. Series and seasons stored under older rules are settled from these.
+    let mut series_folders: BTreeMap<Uuid, SeriesWalk> = BTreeMap::new();
 
     // Every file that the walks returned, every folder they could not list, and every symlink
     // loop they skipped. The removal at the end of the scan needs all three.
@@ -662,14 +701,8 @@ async fn scan_tv_library(
         let mut scanned_files = 0u32;
         let mut skipped_ext = 0u32;
         for file_path_buf in files {
-            let ext = file_path_buf
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("")
-                .to_lowercase();
-
             scanned_files += 1;
-            if !VIDEO_EXTENSIONS.contains(&ext.as_str()) {
+            if !is_episode_file(&file_path_buf) {
                 skipped_ext += 1;
                 continue;
             }
@@ -722,16 +755,20 @@ async fn scan_tv_library(
                 id
             } else {
                 let id = Uuid::new_v4();
+                let (name, year) = match naming::series_title_and_year(&series_name) {
+                    Some((title, year)) => (title.to_string(), Some(year)),
+                    None => (series_name.clone(), None),
+                };
                 let series_item = MediaItem {
                     id,
-                    name: series_name.clone(),
-                    sort_name: Some(series_name.to_lowercase()),
+                    sort_name: Some(name.to_lowercase()),
+                    name,
                     overview: None,
                     media_type: MediaType::Series,
                     path: series_dir.clone(),
                     parent_id: None,
                     library_id: library.id,
-                    production_year: None,
+                    production_year: year,
                     community_rating: None,
                     official_rating: None,
                     genres: vec![],
@@ -750,6 +787,7 @@ async fn scan_tv_library(
 
             // Ensure season item exists — use pre-loaded HashMap first, then create new
             let season_path = format!("{}/{}", series_dir, season_name);
+            let season_number = parse_season_number(&season_name, &series_name);
             let season_id = if let Some(id) = season_map.get(&season_path) {
                 *id
             } else if let Some(id) =
@@ -759,11 +797,10 @@ async fn scan_tv_library(
                 id
             } else {
                 let id = Uuid::new_v4();
-                let season_index = parse_season_number(&season_name);
                 let season_item = MediaItem {
                     id,
                     name: season_name.clone(),
-                    sort_name: Some(format!("season {:04}", season_index.unwrap_or(1))),
+                    sort_name: Some(season_sort_name(season_number)),
                     overview: None,
                     media_type: MediaType::Season,
                     path: season_path.clone(),
@@ -776,9 +813,11 @@ async fn scan_tv_library(
                     date_created: date_added(Path::new(&season_path)).await,
                     premiere_date: None,
                     runtime_ticks: None,
-                    index_number: season_index,
+                    index_number: season_number,
                     parent_index_number: None,
                     media_sources: Vec::new(),
+                    // A new season with no stat result is a folder; the next scan settles it.
+                    location_type: season_location(&season_path).await.unwrap_or_default(),
                     ..MediaItem::default_dto_fields()
                 };
                 new_items.push(season_item);
@@ -786,9 +825,19 @@ async fn scan_tv_library(
                 id
             };
 
+            series_folders
+                .entry(series_id)
+                .or_insert_with(|| SeriesWalk {
+                    dir: series_dir.clone(),
+                    folder: series_name.clone(),
+                    seasons: BTreeMap::new(),
+                })
+                .seasons
+                .entry(season_id)
+                .or_insert_with(|| (season_name.clone(), season_number));
             episode_files
                 .entry(season_id)
-                .or_insert_with(|| (series_id, season_name, Vec::new()))
+                .or_insert_with(|| (series_id, season_number, Vec::new()))
                 .2
                 .push(file_path_buf);
         }
@@ -831,12 +880,95 @@ async fn scan_tv_library(
         }
     }
 
+    // A season stored under an older rule gets the number that its folder gives now.
+    let season_numbers: Vec<(Uuid, Option<i32>)> = episode_files
+        .iter()
+        .map(|(&season_id, &(_, season_number, _))| (season_id, season_number))
+        .collect();
+    let settled = scan_sync::settle_season_numbers(pool, library.id, &season_numbers).await?;
+    if settled > 0 {
+        tracing::info!(
+            "TV library '{}': set the number of {} stored seasons",
+            library.name,
+            settled
+        );
+    }
+    // A season stored under an older rule loses the Path of a folder that it doesn't have, and a season whose
+    // folder has appeared since gets its Path. A season whose stat fails is left out, so it keeps its location.
+    let mut season_folders: Vec<(Uuid, LocationType)> = Vec::new();
+    for walk in series_folders.values() {
+        for (&id, (name, _)) in &walk.seasons {
+            if let Some(location) = season_location(&format!("{}/{}", walk.dir, name)).await {
+                season_folders.push((id, location));
+            }
+        }
+    }
+    let settled = scan_sync::settle_season_folders(pool, library.id, &season_folders).await?;
+    if settled > 0 {
+        tracing::info!(
+            "TV library '{}': set whether {} stored seasons have a folder",
+            library.name,
+            settled
+        );
+    }
+    // A series stored under an older rule gets the name and year that its folder gives now, and what its
+    // own tvshow.nfo gives; its seasons and the episode files directly in its folder lose what they took
+    // from that file, and the images that it gave them.
+    let mut folders = Vec::with_capacity(series_folders.len());
+    for (&id, walk) in &series_folders {
+        let nfo = match nfo_parser::find_series_nfo(Path::new(&walk.dir)) {
+            Some(nfo_path) => nfo_parser::parse_nfo(&nfo_path).await,
+            None => None,
+        };
+        // Under the older rule, a season and a loose episode read the series' tvshow.nfo when
+        // `find_nfo_for_media` found no other `.nfo` for them.
+        let (nfo_seasons, nfo_episodes) = match nfo {
+            Some(_) => {
+                let series_dir = Path::new(&walk.dir);
+                let seasons = walk
+                    .seasons
+                    .iter()
+                    .filter(|(_, (name, _))| {
+                        nfo_parser::find_nfo_for_media(&series_dir.join(name)).is_none()
+                    })
+                    .map(|(&season_id, (name, number))| (season_id, name.clone(), *number))
+                    .collect();
+                let episodes = episode_files
+                    .values()
+                    .filter(|(series_id, _, _)| *series_id == id)
+                    .flat_map(|(_, _, files)| files)
+                    .filter(|file| file.parent() == Some(series_dir))
+                    .filter(|file| nfo_parser::find_nfo_for_media(file).is_none())
+                    .map(|file| file.to_string_lossy().into_owned())
+                    .collect();
+                (seasons, episodes)
+            }
+            None => (Vec::new(), Vec::new()),
+        };
+        folders.push(scan_sync::SeriesFolder {
+            id,
+            folder: walk.folder.clone(),
+            nfo,
+            nfo_seasons,
+            nfo_episodes,
+        });
+    }
+    let settled = scan_sync::settle_series(pool, library.id, &folders).await?;
+    if settled > 0 {
+        tracing::info!(
+            "TV library '{}': settled the names and metadata of {} stored series and seasons",
+            library.name,
+            settled
+        );
+    }
+
     // Group the files of each season into episodes, then reconcile the episodes with the items.
-    // The numbers of an episode come from its primary file, the first of its versions.
+    // The numbers of an episode come from its primary file, the first of its versions. The last
+    // episode of a file that holds several is Jellyfin's IndexNumberEnd (12.4
+    // `Library/LibraryManager.cs:3391-3398`).
     let mut episode_groups: Vec<scan_sync::EpisodeGroup> = Vec::new();
-    for (&season_id, (series_id, season_name, season_files)) in &episode_files {
-        for versions in naming::group_episode_files(season_files, parse_season_number(season_name))
-        {
+    for (&season_id, &(series_id, season_number, ref season_files)) in &episode_files {
+        for versions in naming::group_episode_files(season_files, season_number) {
             let stem = versions[0]
                 .file_stem()
                 .and_then(|s| s.to_str())
@@ -845,10 +977,15 @@ async fn scan_tv_library(
             episode_groups.push(scan_sync::EpisodeGroup {
                 files: versions,
                 season_id,
-                series_id: *series_id,
+                series_id,
                 index_number: parsed.map(|n| n.episode),
-                parent_index_number: parse_season_number(season_name)
-                    .or_else(|| parsed.and_then(|n| n.season)),
+                index_number_end: parsed.and_then(|n| n.ending),
+                // In a specials folder the file name's season wins (Jellyfin 12.4 `LibraryManager.cs:3400-3423`).
+                parent_index_number: if season_number == Some(0) {
+                    parsed.and_then(|n| n.season).or(season_number)
+                } else {
+                    season_number.or_else(|| parsed.and_then(|n| n.season))
+                },
             });
         }
     }
@@ -899,6 +1036,7 @@ async fn scan_tv_library(
                     runtime_ticks: None,
                     index_number: group.index_number,
                     parent_index_number: group.parent_index_number,
+                    index_number_end: group.index_number_end,
                     media_sources: Vec::new(),
                     ..MediaItem::default_dto_fields()
                 };
@@ -1739,7 +1877,29 @@ async fn list_root_files(root: &Path) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBu
     (result, unreadable, Vec::new())
 }
 
-fn parse_season_number(name: &str) -> Option<i32> {
+/// The location type of the season stored at `path`: Virtual where that folder doesn't exist, as for a season
+/// made for the episode files in its series' folder, and FileSystem where it does. Jellyfin 12.4 gives such a
+/// season no Path (`Resolvers/TV/SeasonResolver.cs:63`), which makes it Virtual (`Entities/BaseItem.cs:348-365`).
+/// None when the stat fails for another reason, so the caller keeps the stored location.
+async fn season_location(path: &str) -> Option<LocationType> {
+    match tokio::fs::metadata(path).await {
+        Ok(m) if m.is_dir() => Some(LocationType::FileSystem),
+        Ok(_) => Some(LocationType::Virtual),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Some(LocationType::Virtual)
+        }
+        Err(_) => None,
+    }
+}
+
+/// The number of the season folder called `name` in the series folder called `series_folder`: the number
+/// after `Season `, `S` or `Staffel `, or 0 for a specials folder (`naming::is_specials_folder`).
+fn parse_season_number(name: &str, series_folder: &str) -> Option<i32> {
     let lower = name.to_lowercase();
     // "Season 02", "Season 2", "S02", "Staffel 2"
     for prefix in &["season ", "s", "staffel "] {
@@ -1749,5 +1909,41 @@ fn parse_season_number(name: &str) -> Option<i32> {
             return Some(n);
         }
     }
-    None
+    naming::is_specials_folder(name, series_folder).then_some(0)
+}
+
+/// The sort name that the scan gives a season numbered `number`.
+pub(crate) fn season_sort_name(number: Option<i32>) -> String {
+    format!("season {:04}", number.unwrap_or(1))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn b32_f6_a_failed_stat_keeps_a_seasons_stored_location() {
+        let dir = std::env::temp_dir().join(format!("b32-f6-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("Season 1")).unwrap();
+        std::fs::write(dir.join("file"), b"").unwrap();
+        std::os::unix::fs::symlink("loop", dir.join("loop")).unwrap();
+        let at = |rel: &str| dir.join(rel).to_string_lossy().into_owned();
+
+        assert_eq!(
+            season_location(&at("Season 1")).await,
+            Some(LocationType::FileSystem)
+        );
+        // No folder: nothing there, a file, or a path under a file.
+        for rel in ["Season 2", "file", "file/Season 1"] {
+            assert_eq!(
+                season_location(&at(rel)).await,
+                Some(LocationType::Virtual),
+                "{rel}"
+            );
+        }
+        // Any other error, here a symlink loop, says nothing about the folder.
+        assert_eq!(season_location(&at("loop")).await, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

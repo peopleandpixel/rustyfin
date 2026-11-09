@@ -43,7 +43,11 @@ pub async fn refresh_item_metadata(
     );
 
     // 2. Parse NFO file if present
-    if let Some(nfo_path) = nfo_parser::find_nfo_for_media(media_path)
+    let nfo_path = match item.media_type {
+        MediaType::Series => nfo_parser::find_series_nfo(media_path),
+        _ => nfo_parser::find_nfo_for_media(media_path),
+    };
+    if let Some(nfo_path) = nfo_path
         && let Some(meta) = nfo_parser::parse_nfo(&nfo_path).await
     {
         // Update media item metadata from NFO

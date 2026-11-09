@@ -28,6 +28,11 @@ const IGNORED_DIR_NAMES: &[&str] = &[
     "minta",
 ];
 
+/// Blu-ray and DVD folders, in lower case. Jellyfin plays the folder that holds one as a single title
+/// (`BaseVideoResolver.cs:261-286`); Rustyfin can't, so it skips them, and their `.m2ts` and `.vob` streams
+/// don't become titles of their own.
+const DISC_DIR_NAMES: &[&str] = &["bdmv", "video_ts"];
+
 /// File names that are skipped whole, in lower case.
 const IGNORED_FILE_NAMES: &[&str] = &["small.jpg", "albumart.jpg", "thumbs.db"];
 
@@ -36,12 +41,13 @@ const IGNORED_FILE_SUFFIXES: &[&str] = &[".bts", ".sync", ".trickplay"];
 
 /// Whether the scanner must not enter the folder called `name`.
 ///
-/// Skipped: names that start with `.` or `@`, names in `IGNORED_DIR_NAMES`, and names that end
-/// with `.trickplay`.
+/// Skipped: names that start with `.` or `@`, names in `IGNORED_DIR_NAMES` and `DISC_DIR_NAMES`, and
+/// names that end with `.trickplay`.
 pub fn is_ignored_dir(name: &str) -> bool {
     let lower = name.to_lowercase();
     lower.starts_with(['.', '@'])
         || IGNORED_DIR_NAMES.contains(&lower.as_str())
+        || DISC_DIR_NAMES.contains(&lower.as_str())
         || lower.ends_with(".trickplay")
 }
 
@@ -127,16 +133,24 @@ type EpisodeRule = fn(&[u8]) -> Option<EpisodeNumbers>;
 ///
 /// 1. `S01E02`: `s`, digits, any run of `[ ] space . _ -`, `e`, digits. Season and episode.
 /// 2. `ep05`: one of `. _ space -`, `ep`, an optional `_`, digits. Episode only.
-/// 3. `1x02`: at the start or after one of `. _ space [ ( -`, 1 to 4 digits, `x`, 1 to 3 digits.
+/// 3. `foo.E01.`: `e`, digits, then `.` or the end of the stem. Episode only. Jellyfin 12.4 has it
+///    third (`NamingOptions.cs:330-331`).
+/// 4. `1x02`: at the start or after one of `. _ space [ ( -`, 1 to 4 digits, `x`, 1 to 3 digits.
 ///    Season and episode.
-/// 4. `Episode 7`: `episode`, optional spaces, digits, and optionally `-M` as the ending. Episode
+/// 5. `Episode 7`: `episode`, optional spaces, digits, and optionally `-M` as the ending. Episode
 ///    only.
 ///
-/// A rule whose season is invalid gives nothing (see `is_valid_season`). Rules 1 and 3 also read
-/// a multi-episode ending (see `repeated_ending`), and rule 4 reads `-M`.
+/// A rule whose season is invalid gives nothing (see `is_valid_season`). Rules 1 and 4 also read
+/// a multi-episode ending (see `repeated_ending`), and rule 5 reads `-M`.
 pub fn parse_episode(stem: &str) -> Option<EpisodeNumbers> {
     let bytes = stem.as_bytes();
-    let rules: [EpisodeRule; 4] = [rule_season_episode, rule_ep, rule_nxnn, rule_episode_word];
+    let rules: [EpisodeRule; 5] = [
+        rule_season_episode,
+        rule_ep,
+        rule_e_dot,
+        rule_nxnn,
+        rule_episode_word,
+    ];
     rules
         .into_iter()
         .find_map(|rule| rule(bytes).filter(|found| found.season.is_none_or(is_valid_season)))
@@ -188,7 +202,28 @@ fn rule_ep(bytes: &[u8]) -> Option<EpisodeNumbers> {
     })
 }
 
-/// Rule 3, `1x02`: at the start or after one of `. _ space [ ( -`, 1 to 4 digits, `x`, 1 to 3
+/// Rule 3, `foo.E01.`: `e`, 1+ digits, then `.` or the end of the stem. Jellyfin's expression
+/// `[^\\/]*?()\.?[Ee]([0-9]+)\.([^\\/]*)$` runs on the file name with its extension, whose dot can be
+/// the one after the digits. Nothing need come before the `e`.
+fn rule_e_dot(bytes: &[u8]) -> Option<EpisodeNumbers> {
+    (0..bytes.len()).find_map(|at| {
+        if !is_ci_at(bytes, at, b'e') {
+            return None;
+        }
+        let end = digits_end(bytes, at + 1);
+        if !matches!(bytes.get(end), None | Some(b'.')) {
+            return None;
+        }
+        let episode = parse_digits(&bytes[at + 1..end])?;
+        Some(EpisodeNumbers {
+            season: None,
+            episode,
+            ending: None,
+        })
+    })
+}
+
+/// Rule 4, `1x02`: at the start or after one of `. _ space [ ( -`, 1 to 4 digits, `x`, 1 to 3
 /// digits. The digit runs are whole: `1x1080` is no match, since 1080 has four digits.
 fn rule_nxnn(bytes: &[u8]) -> Option<EpisodeNumbers> {
     (0..bytes.len()).find_map(|at| {
@@ -215,7 +250,7 @@ fn rule_nxnn(bytes: &[u8]) -> Option<EpisodeNumbers> {
     })
 }
 
-/// Rule 4, `Episode 7`: `episode`, optional spaces, 1+ digits, and optionally `-M` as the ending.
+/// Rule 5, `Episode 7`: `episode`, optional spaces, 1+ digits, and optionally `-M` as the ending.
 fn rule_episode_word(bytes: &[u8]) -> Option<EpisodeNumbers> {
     (0..bytes.len()).find_map(|at| {
         if !bytes.get(at..at + 7)?.eq_ignore_ascii_case(b"episode") {
@@ -359,6 +394,51 @@ fn parse_digits(digits: &[u8]) -> Option<i32> {
 /// Whether the byte at `at` is `c`, ignoring ASCII case. Non-ASCII bytes never match.
 fn is_ci_at(bytes: &[u8], at: usize, c: u8) -> bool {
     bytes.get(at).is_some_and(|b| b.eq_ignore_ascii_case(&c))
+}
+
+/// Whether the season folder called `name`, in the series folder called `series_folder`, holds the specials
+/// (season 0), as Jellyfin 12.4 reads it (`SeasonPathParser.cs:81-94`). Spaces, `.`, `_`, `-`, `[` and `]` are
+/// removed from both names (`SeasonPathParser.cs:18`), then every occurrence of the series folder's name, in any
+/// case. What is left must be `specials` or `extras`, in any case. So `Specials`, `SPECIALS`, `[Specials]`,
+/// `Show - Specials` and `Show Extras` hold the specials of `Show`, and `Specials 2` doesn't.
+pub fn is_specials_folder(name: &str, series_folder: &str) -> bool {
+    let clean = |s: &str| -> String {
+        s.chars()
+            .filter(|c| !matches!(c, ' ' | '.' | '_' | '-' | '[' | ']'))
+            .flat_map(char::to_lowercase)
+            .collect()
+    };
+    let mut rest = clean(name);
+    let series = clean(series_folder);
+    // Jellyfin throws on an empty series name; nothing is removed here.
+    if !series.is_empty() {
+        rest = rest.replace(&series, "");
+    }
+    rest == "specials" || rest == "extras"
+}
+
+/// The title and year of a series folder called `folder`, when it is named like "Title (Year)", as Jellyfin
+/// 12.4 reads them (`Emby.Naming/TV/SeriesResolver.cs:27-28`, `43-51`). The year is the first `(dddd)`, four
+/// ASCII digits, that follows at least one character; the title is the text before it, trimmed, and what
+/// follows is dropped. So `1923 (2022)` is `1923` from 2022, and `Show (US) (2010) [1080p]` is `Show (US)`
+/// from 2010. Jellyfin would give an empty title to ` (2010)`; that is `None` here, so the series keeps its
+/// folder's name.
+pub fn series_title_and_year(folder: &str) -> Option<(&str, i32)> {
+    // `(?<title>.+?)\s*\((?<year>[0-9]{4})\)`, unanchored: the first match starts the name.
+    let (at, year) = folder.char_indices().skip(1).find_map(|(at, _)| {
+        let rest = folder[at..].trim_start().as_bytes();
+        match rest.get(..6)? {
+            [b'(', digits @ .., b')'] if digits.iter().all(u8::is_ascii_digit) => {
+                let year = digits
+                    .iter()
+                    .fold(0, |year, d| year * 10 + i32::from(d - b'0'));
+                Some((at, year))
+            }
+            _ => None,
+        }
+    })?;
+    let title = folder[..at].trim();
+    (!title.is_empty()).then_some((title, year))
 }
 
 /// A title and year read from a movie file name, as Jellyfin's `CleanDateTime` and `CleanString` leave them
@@ -771,10 +851,12 @@ impl Entry {
     }
 }
 
-/// Higher resolution first, files without one last, then by file name in byte order (`VideoListResolver.cs:283-300`).
+/// Higher resolution first, files without one last, then by file name without its extension in byte order
+/// (`VideoListResolver.cs:282`, `:296-300`), then by file name.
 fn version_order(a: &Entry, b: &Entry) -> Ordering {
     b.resolution
         .cmp(&a.resolution)
+        .then_with(|| a.stem.cmp(&b.stem))
         .then_with(|| a.name.cmp(&b.name))
 }
 

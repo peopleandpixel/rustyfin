@@ -30,13 +30,13 @@ pub async fn upsert_media_item(pool: &SqlitePool, item: &MediaItem) -> Result<()
         "INSERT INTO media_items \
          (id, name, sort_name, overview, media_type, path, parent_id, library_id, \
           production_year, community_rating, official_rating, genres, date_created, \
-          premiere_date, runtime_ticks, index_number, parent_index_number, tmdb_id, tvdb_id, \
+          premiere_date, runtime_ticks, index_number, parent_index_number, index_number_end, location_type, tmdb_id, tvdb_id, \
           tags, status, original_language, tagline, production_countries, budget, revenue, \
           homepage, end_date, vote_count, popularity) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, \
           COALESCE((SELECT date_created FROM media_items WHERE id = ?1), ?13), \
           ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, \
-          ?28, ?29, ?30) \
+          ?28, ?29, ?30, ?31, ?32) \
          ON CONFLICT(id) DO UPDATE SET \
           name = excluded.name, sort_name = excluded.sort_name, overview = excluded.overview, \
           media_type = excluded.media_type, path = excluded.path, parent_id = excluded.parent_id, \
@@ -45,6 +45,7 @@ pub async fn upsert_media_item(pool: &SqlitePool, item: &MediaItem) -> Result<()
           official_rating = excluded.official_rating, genres = excluded.genres, \
           premiere_date = excluded.premiere_date, runtime_ticks = excluded.runtime_ticks, \
           index_number = excluded.index_number, \
+          index_number_end = excluded.index_number_end, location_type = excluded.location_type, \
           parent_index_number = excluded.parent_index_number, tmdb_id = excluded.tmdb_id, \
           tvdb_id = excluded.tvdb_id, tags = excluded.tags, status = excluded.status, \
           original_language = excluded.original_language, tagline = excluded.tagline, \
@@ -69,6 +70,8 @@ pub async fn upsert_media_item(pool: &SqlitePool, item: &MediaItem) -> Result<()
     .bind(item.runtime_ticks)
     .bind(item.index_number)
     .bind(item.parent_index_number)
+    .bind(item.index_number_end)
+    .bind(item.location_type.as_str())
     .bind(item.tmdb_id)
     .bind(item.tvdb_id)
     .bind(&tags)
@@ -351,10 +354,10 @@ pub async fn batch_upsert_media_items(
             "INSERT INTO media_items \
              (id, name, sort_name, overview, media_type, path, parent_id, library_id, \
               production_year, community_rating, official_rating, genres, date_created, \
-              premiere_date, runtime_ticks, index_number, parent_index_number, tmdb_id, tvdb_id, \
+              premiere_date, runtime_ticks, index_number, parent_index_number, index_number_end, location_type, tmdb_id, tvdb_id, \
               tags, status, original_language, tagline, production_countries, budget, revenue, \
               homepage, end_date, vote_count, popularity) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT(id) DO UPDATE SET \
               name = excluded.name, sort_name = excluded.sort_name, overview = excluded.overview, \
               media_type = excluded.media_type, path = excluded.path, \
@@ -364,6 +367,7 @@ pub async fn batch_upsert_media_items(
               official_rating = excluded.official_rating, genres = excluded.genres, \
               premiere_date = excluded.premiere_date, runtime_ticks = excluded.runtime_ticks, \
               index_number = excluded.index_number, \
+              index_number_end = excluded.index_number_end, location_type = excluded.location_type, \
               parent_index_number = excluded.parent_index_number, tmdb_id = excluded.tmdb_id, \
               tvdb_id = excluded.tvdb_id, tags = excluded.tags, status = excluded.status, \
               original_language = excluded.original_language, tagline = excluded.tagline, \
@@ -389,6 +393,8 @@ pub async fn batch_upsert_media_items(
         .bind(item.runtime_ticks)
         .bind(item.index_number)
         .bind(item.parent_index_number)
+        .bind(item.index_number_end)
+        .bind(item.location_type.as_str())
         .bind(item.tmdb_id)
         .bind(item.tvdb_id)
         .bind(&tags)
@@ -426,7 +432,7 @@ pub async fn get_items_by_library(
     let rows = sqlx::query_as::<_, MediaItemRow>(
         "SELECT id, name, sort_name, overview, media_type, path, parent_id, library_id, \
          production_year, community_rating, official_rating, genres, date_created, \
-         premiere_date, runtime_ticks, index_number, parent_index_number, tmdb_id, tvdb_id, \
+         premiere_date, runtime_ticks, index_number, parent_index_number, index_number_end, location_type, tmdb_id, tvdb_id, \
          tags, status, original_language, tagline, production_countries, budget, revenue, \
          homepage, end_date, vote_count, popularity \
          FROM media_items WHERE library_id = ? ORDER BY sort_name, name",
@@ -442,7 +448,7 @@ pub async fn get_item_by_id(pool: &SqlitePool, id: Uuid) -> Result<Option<MediaI
     let row = sqlx::query_as::<_, MediaItemRow>(
         "SELECT id, name, sort_name, overview, media_type, path, parent_id, library_id, \
          production_year, community_rating, official_rating, genres, date_created, \
-         premiere_date, runtime_ticks, index_number, parent_index_number, tmdb_id, tvdb_id, \
+         premiere_date, runtime_ticks, index_number, parent_index_number, index_number_end, location_type, tmdb_id, tvdb_id, \
          tags, status, original_language, tagline, production_countries, budget, revenue, \
          homepage, end_date, vote_count, popularity \
          FROM media_items WHERE id = ?",
@@ -461,7 +467,7 @@ pub async fn get_children(
     let rows = sqlx::query_as::<_, MediaItemRow>(
         "SELECT id, name, sort_name, overview, media_type, path, parent_id, library_id, \
          production_year, community_rating, official_rating, genres, date_created, \
-         premiere_date, runtime_ticks, index_number, parent_index_number, tmdb_id, tvdb_id, \
+         premiere_date, runtime_ticks, index_number, parent_index_number, index_number_end, location_type, tmdb_id, tvdb_id, \
          tags, status, original_language, tagline, production_countries, budget, revenue, \
          homepage, end_date, vote_count, popularity \
          FROM media_items WHERE parent_id = ? ORDER BY index_number, sort_name, name",
@@ -482,7 +488,7 @@ pub async fn get_children_paged(
     let rows = sqlx::query_as::<_, MediaItemRow>(
         "SELECT id, name, sort_name, overview, media_type, path, parent_id, library_id, \
          production_year, community_rating, official_rating, genres, date_created, \
-         premiere_date, runtime_ticks, index_number, parent_index_number, tmdb_id, tvdb_id, \
+         premiere_date, runtime_ticks, index_number, parent_index_number, index_number_end, location_type, tmdb_id, tvdb_id, \
          tags, status, original_language, tagline, production_countries, budget, revenue, \
          homepage, end_date, vote_count, popularity \
          FROM media_items WHERE parent_id = ? ORDER BY index_number, sort_name, name LIMIT ? OFFSET ?",
@@ -574,7 +580,7 @@ pub async fn get_latest_items(
     let rows = sqlx::query_as::<_, MediaItemRow>(
         "SELECT id, name, sort_name, overview, media_type, path, parent_id, library_id, \
          production_year, community_rating, official_rating, genres, date_created, \
-         premiere_date, runtime_ticks, index_number, parent_index_number, tmdb_id, tvdb_id, \
+         premiere_date, runtime_ticks, index_number, parent_index_number, index_number_end, location_type, tmdb_id, tvdb_id, \
          tags, status, original_language, tagline, production_countries, budget, revenue, \
          homepage, end_date, vote_count, popularity \
          FROM media_items \
@@ -1014,7 +1020,7 @@ fn build_filtered_query(
     let data_sql = format!(
         "SELECT id, name, sort_name, overview, media_type, path, parent_id, library_id, \
          production_year, community_rating, official_rating, genres, date_created, \
-         premiere_date, runtime_ticks, index_number, parent_index_number, tmdb_id, tvdb_id, \
+         premiere_date, runtime_ticks, index_number, parent_index_number, index_number_end, location_type, tmdb_id, tvdb_id, \
          tags, status, original_language, tagline, production_countries, budget, revenue, \
          homepage, end_date, vote_count, popularity \
          FROM media_items WHERE {}{} {} LIMIT ? OFFSET ?",
@@ -1378,7 +1384,7 @@ pub async fn get_similar_items(
     let candidates = sqlx::query_as::<_, MediaItemRow>(
         "SELECT id, name, sort_name, overview, media_type, path, parent_id, library_id, \
          production_year, community_rating, official_rating, genres, date_created, \
-         premiere_date, runtime_ticks, index_number, parent_index_number, tmdb_id, tvdb_id, \
+         premiere_date, runtime_ticks, index_number, parent_index_number, index_number_end, location_type, tmdb_id, tvdb_id, \
          tags, status, original_language, tagline, production_countries, budget, revenue, \
          homepage, end_date, vote_count, popularity \
          FROM media_items \
@@ -1502,7 +1508,7 @@ pub async fn get_similar_items(
         let rows = sqlx::query_as::<_, MediaItemRow>(
             "SELECT id, name, sort_name, overview, media_type, path, parent_id, library_id, \
              production_year, community_rating, official_rating, genres, date_created, \
-             premiere_date, runtime_ticks, index_number, parent_index_number, tmdb_id, tvdb_id, \
+             premiere_date, runtime_ticks, index_number, parent_index_number, index_number_end, location_type, tmdb_id, tvdb_id, \
              tags, status, original_language, tagline, production_countries, budget, revenue, \
              homepage, end_date, vote_count, popularity \
              FROM media_items WHERE media_type = ? AND id != ? AND library_id = ? \
@@ -1704,7 +1710,7 @@ pub async fn get_item_by_path(
     let row = sqlx::query_as::<_, MediaItemRow>(
         "SELECT id, name, sort_name, overview, media_type, path, parent_id, library_id, \
          production_year, community_rating, official_rating, genres, date_created, \
-         premiere_date, runtime_ticks, index_number, parent_index_number, tmdb_id, tvdb_id, \
+         premiere_date, runtime_ticks, index_number, parent_index_number, index_number_end, location_type, tmdb_id, tvdb_id, \
          tags, status, original_language, tagline, production_countries, budget, revenue, \
          homepage, end_date, vote_count, popularity \
          FROM media_items WHERE path = ?",
@@ -1958,7 +1964,7 @@ pub async fn get_user_resume_items(
     let rows = sqlx::query_as::<_, MediaItemRow>(
         "SELECT m.id, m.name, m.sort_name, m.overview, m.media_type, m.path, m.parent_id, m.library_id, \
          m.production_year, m.community_rating, m.official_rating, m.genres, m.date_created, \
-         m.premiere_date, m.runtime_ticks, m.index_number, m.parent_index_number, m.tmdb_id, m.tvdb_id, \
+         m.premiere_date, m.runtime_ticks, m.index_number, m.parent_index_number, m.index_number_end, m.location_type, m.tmdb_id, m.tvdb_id, \
          m.tags, m.status, m.original_language, m.tagline, m.production_countries, m.budget, m.revenue, \
          m.homepage, m.end_date, m.vote_count, m.popularity \
          FROM media_items m \
@@ -1992,6 +1998,8 @@ pub struct MediaItemRow {
     runtime_ticks: Option<i64>,
     index_number: Option<i32>,
     parent_index_number: Option<i32>,
+    index_number_end: Option<i32>,
+    location_type: String,
     tmdb_id: Option<i64>,
     tvdb_id: Option<i64>,
     tags: String,
@@ -2037,6 +2045,7 @@ impl From<MediaItemRow> for MediaItem {
             runtime_ticks: r.runtime_ticks,
             index_number: r.index_number,
             parent_index_number: r.parent_index_number,
+            index_number_end: r.index_number_end,
             tmdb_id: r.tmdb_id,
             tvdb_id: r.tvdb_id,
             media_sources: Vec::new(),
@@ -2077,7 +2086,12 @@ impl From<MediaItemRow> for MediaItem {
             aspect_ratio: None,
             chapter_count: 0,
             media_source_count: 0,
-            location_type: rustyfin_model::media::LocationType::FileSystem,
+            // 'Virtual' marks a season with no folder (migration 072).
+            location_type: match r.location_type.as_str() {
+                "Virtual" => rustyfin_model::media::LocationType::Virtual,
+                "Remote" => rustyfin_model::media::LocationType::Remote,
+                _ => rustyfin_model::media::LocationType::FileSystem,
+            },
             intro_start_time_ticks: None,
             intro_end_time_ticks: None,
             is_hd: false,
@@ -2346,7 +2360,7 @@ pub async fn get_upcoming(
     let sql = if uid.is_some() {
         "SELECT m.id, m.name, m.sort_name, m.overview, m.media_type, m.path, m.parent_id, m.library_id, \
          m.production_year, m.community_rating, m.official_rating, m.genres, m.date_created, \
-         m.premiere_date, m.runtime_ticks, m.index_number, m.parent_index_number, m.tmdb_id, m.tvdb_id, \
+         m.premiere_date, m.runtime_ticks, m.index_number, m.parent_index_number, m.index_number_end, m.location_type, m.tmdb_id, m.tvdb_id, \
          m.tags, m.status, m.original_language, m.tagline, m.production_countries, m.budget, m.revenue, \
          m.homepage, m.end_date, m.vote_count, m.popularity \
          FROM media_items m
@@ -2360,7 +2374,7 @@ pub async fn get_upcoming(
     } else {
         "SELECT m.id, m.name, m.sort_name, m.overview, m.media_type, m.path, m.parent_id, m.library_id, \
          m.production_year, m.community_rating, m.official_rating, m.genres, m.date_created, \
-         m.premiere_date, m.runtime_ticks, m.index_number, m.parent_index_number, m.tmdb_id, m.tvdb_id, \
+         m.premiere_date, m.runtime_ticks, m.index_number, m.parent_index_number, m.index_number_end, m.location_type, m.tmdb_id, m.tvdb_id, \
          m.tags, m.status, m.original_language, m.tagline, m.production_countries, m.budget, m.revenue, \
          m.homepage, m.end_date, m.vote_count, m.popularity \
          FROM media_items m
@@ -2403,7 +2417,7 @@ pub async fn get_upcoming_for_series(
     let mut sql = format!(
         "SELECT m.id, m.name, m.sort_name, m.overview, m.media_type, m.path, m.parent_id, m.library_id, \
          m.production_year, m.community_rating, m.official_rating, m.genres, m.date_created, \
-         m.premiere_date, m.runtime_ticks, m.index_number, m.parent_index_number, m.tmdb_id, m.tvdb_id, \
+         m.premiere_date, m.runtime_ticks, m.index_number, m.parent_index_number, m.index_number_end, m.location_type, m.tmdb_id, m.tvdb_id, \
          m.tags, m.status, m.original_language, m.tagline, m.production_countries, m.budget, m.revenue, \
          m.homepage, m.end_date, m.vote_count, m.popularity \
          FROM media_items m
@@ -2443,7 +2457,7 @@ pub async fn get_episodes_for_series(
     let sql = if season_number.is_some() {
         "SELECT m.id, m.name, m.sort_name, m.overview, m.media_type, m.path, m.parent_id, m.library_id, \
          m.production_year, m.community_rating, m.official_rating, m.genres, m.date_created, \
-         m.premiere_date, m.runtime_ticks, m.index_number, m.parent_index_number, m.tmdb_id, m.tvdb_id, \
+         m.premiere_date, m.runtime_ticks, m.index_number, m.parent_index_number, m.index_number_end, m.location_type, m.tmdb_id, m.tvdb_id, \
          m.tags, m.status, m.original_language, m.tagline, m.production_countries, m.budget, m.revenue, \
          m.homepage, m.end_date, m.vote_count, m.popularity \
          FROM media_items m
@@ -2456,7 +2470,7 @@ pub async fn get_episodes_for_series(
     } else {
         "SELECT m.id, m.name, m.sort_name, m.overview, m.media_type, m.path, m.parent_id, m.library_id, \
          m.production_year, m.community_rating, m.official_rating, m.genres, m.date_created, \
-         m.premiere_date, m.runtime_ticks, m.index_number, m.parent_index_number, m.tmdb_id, m.tvdb_id, \
+         m.premiere_date, m.runtime_ticks, m.index_number, m.parent_index_number, m.index_number_end, m.location_type, m.tmdb_id, m.tvdb_id, \
          m.tags, m.status, m.original_language, m.tagline, m.production_countries, m.budget, m.revenue, \
          m.homepage, m.end_date, m.vote_count, m.popularity \
          FROM media_items m
@@ -2485,7 +2499,7 @@ pub async fn get_recommendations(
     let rows = sqlx::query_as::<_, MediaItemRow>(
         "SELECT id, name, sort_name, overview, media_type, path, parent_id, library_id, \
          production_year, community_rating, official_rating, genres, date_created, \
-         premiere_date, runtime_ticks, index_number, parent_index_number, tmdb_id, tvdb_id, \
+         premiere_date, runtime_ticks, index_number, parent_index_number, index_number_end, location_type, tmdb_id, tvdb_id, \
          tags, status, original_language, tagline, production_countries, budget, revenue, \
          homepage, end_date, vote_count, popularity \
          FROM media_items
@@ -2510,7 +2524,7 @@ pub async fn get_featured_movies(
     let rows = sqlx::query_as::<_, MediaItemRow>(
         "SELECT id, name, sort_name, overview, media_type, path, parent_id, library_id, \
          production_year, community_rating, official_rating, genres, date_created, \
-         premiere_date, runtime_ticks, index_number, parent_index_number, tmdb_id, tvdb_id, \
+         premiere_date, runtime_ticks, index_number, parent_index_number, index_number_end, location_type, tmdb_id, tvdb_id, \
          tags, status, original_language, tagline, production_countries, budget, revenue, \
          homepage, end_date, vote_count, popularity \
          FROM media_items
@@ -2676,7 +2690,7 @@ pub async fn get_items_by_parent(
     let rows = sqlx::query_as::<_, MediaItemRow>(
         "SELECT id, name, sort_name, overview, media_type, path, parent_id, library_id, \
          production_year, community_rating, official_rating, genres, date_created, \
-         premiere_date, runtime_ticks, index_number, parent_index_number, tmdb_id, tvdb_id, \
+         premiere_date, runtime_ticks, index_number, parent_index_number, index_number_end, location_type, tmdb_id, tvdb_id, \
          tags, status, original_language, tagline, production_countries, budget, revenue, \
          homepage, end_date, vote_count, popularity \
          FROM media_items WHERE parent_id = ?",

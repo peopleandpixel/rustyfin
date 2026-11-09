@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use rustyfin_core::naming::{
     CleanName, VersionGroup, clean_name, group_episode_files, group_movie_files, resolution,
-    title_key,
+    series_title_and_year, title_key,
 };
 
 /// Runs `f` on every input of `table` and reports all wrong rows at once.
@@ -419,4 +419,57 @@ fn group_episode_file_season_in_key() {
             vec!["Show S02E05.mkv"],
         ]
     );
+}
+
+#[test]
+fn b32_f2_versions_without_a_resolution_sort_by_stem() {
+    // Jellyfin orders them by FileNameWithoutExtension (12.4 `VideoListResolver.cs:282`, `:296-300`).
+    // By whole name, "Big Eyes (" would sort before "Big Eyes.", as a space is below a dot.
+    assert_eq!(
+        movie_groups(
+            "Big Eyes (2014)",
+            &["Big Eyes (2014) BR-DISK.m2ts", "Big Eyes.mkv"]
+        ),
+        [group(
+            "Big Eyes",
+            Some(2014),
+            &["Big Eyes.mkv", "Big Eyes (2014) BR-DISK.m2ts"]
+        )]
+    );
+}
+
+#[test]
+fn b32_series_title_and_year() {
+    // Jellyfin's TitleWithYearRegex: the text before the first "(dddd)", trimmed, and that year.
+    let table: &[(&str, Option<(&str, i32)>)] = &[
+        ("One Night (2023)", Some(("One Night", 2023))),
+        ("Hotel Series (2015)", Some(("Hotel Series", 2015))),
+        ("1923 (2022)", Some(("1923", 2022))),
+        ("Show(2010)", Some(("Show", 2010))),
+        ("Show  (2010)", Some(("Show", 2010))),
+        ("x(2010)", Some(("x", 2010))),
+        ("Show (US) (2010)", Some(("Show (US)", 2010))),
+        ("Show (2010) [1080p]", Some(("Show", 2010))),
+        ("Show (2010) (2011)", Some(("Show", 2010))),
+        ("Show - (2010)", Some(("Show -", 2010))),
+        ("Émission (2010)", Some(("Émission", 2010))),
+        ("Show", None),
+        ("Show 2010", None),
+        ("Show [2010]", None),
+        ("Show (201)", None),
+        ("Show (20100)", None),
+        ("Show (２０１０)", None),
+        ("(2010)", None),
+        ("(2010) Show", None),
+        // Jellyfin would give an empty title; the folder's name is kept instead.
+        (" (2010)", None),
+    ];
+    let wrong: Vec<String> = table
+        .iter()
+        .filter_map(|&(folder, want)| {
+            let got = series_title_and_year(folder);
+            (got != want).then(|| format!("{folder:?}: got {got:?}, want {want:?}"))
+        })
+        .collect();
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }

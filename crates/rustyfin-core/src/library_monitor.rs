@@ -22,7 +22,7 @@ use uuid::Uuid;
 
 use crate::naming;
 use crate::scan_progress::ScanTicket;
-use crate::scanner::{self, AUDIO_EXTENSIONS, DirId, ScanChanges, ScanScope, VIDEO_EXTENSIONS};
+use crate::scanner::{self, AUDIO_EXTENSIONS, DirId, ScanChanges, ScanScope};
 
 /// How many pending units one library keeps. One more of them becomes a full scan of the library.
 pub const FULL_SCAN_LIMIT: usize = 50;
@@ -463,11 +463,11 @@ pub fn unit_for(library_paths: &[String], path: &Path) -> Option<ScanScope> {
 
 /// Whether `name` ends in a video or an audio extension, in any case.
 fn is_media_name(name: &OsStr) -> bool {
-    Path::new(name)
-        .extension()
-        .and_then(OsStr::to_str)
-        .map(str::to_lowercase)
-        .is_some_and(|ext| {
-            VIDEO_EXTENSIONS.contains(&ext.as_str()) || AUDIO_EXTENSIONS.contains(&ext.as_str())
-        })
+    // A `.bin` counts only when it is named as an episode (`scanner::is_episode_file`).
+    scanner::is_episode_file(Path::new(name))
+        || Path::new(name)
+            .extension()
+            .and_then(OsStr::to_str)
+            .map(str::to_lowercase)
+            .is_some_and(|ext| AUDIO_EXTENSIONS.contains(&ext.as_str()))
 }

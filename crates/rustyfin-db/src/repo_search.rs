@@ -224,7 +224,7 @@ pub async fn search_items(
         sqlx::query_as::<_, super::repo_media::MediaItemRow>(
             "SELECT m.id, m.name, m.sort_name, m.overview, m.media_type, m.path, m.parent_id, m.library_id, \
              m.production_year, m.community_rating, m.official_rating, m.genres, m.date_created, \
-             m.premiere_date, m.runtime_ticks, m.index_number, m.parent_index_number, m.tmdb_id, m.tvdb_id, \
+             m.premiere_date, m.runtime_ticks, m.index_number, m.parent_index_number, m.index_number_end, m.location_type, m.tmdb_id, m.tvdb_id, \
              m.tags, m.status, m.original_language, m.tagline, m.production_countries, m.budget, m.revenue, \
              m.homepage, m.end_date, m.vote_count, m.popularity \
              FROM media_items m \
@@ -243,7 +243,7 @@ pub async fn search_items(
         let sql = format!(
             "SELECT m.id, m.name, m.sort_name, m.overview, m.media_type, m.path, m.parent_id, m.library_id, \
              m.production_year, m.community_rating, m.official_rating, m.genres, m.date_created, \
-             m.premiere_date, m.runtime_ticks, m.index_number, m.parent_index_number, m.tmdb_id, m.tvdb_id, \
+             m.premiere_date, m.runtime_ticks, m.index_number, m.parent_index_number, m.index_number_end, m.location_type, m.tmdb_id, m.tvdb_id, \
              m.tags, m.status, m.original_language, m.tagline, m.production_countries, m.budget, m.revenue, \
              m.homepage, m.end_date, m.vote_count, m.popularity \
              FROM media_items m \
@@ -273,7 +273,7 @@ pub async fn search_items(
                 let rows = sqlx::query_as::<_, super::repo_media::MediaItemRow>(
                     "SELECT id, name, sort_name, overview, media_type, path, parent_id, library_id, \
                      production_year, community_rating, official_rating, genres, date_created, \
-                     premiere_date, runtime_ticks, index_number, parent_index_number, tmdb_id, tvdb_id, \
+                     premiere_date, runtime_ticks, index_number, parent_index_number, index_number_end, location_type, tmdb_id, tvdb_id, \
                      tags, status, original_language, tagline, production_countries, budget, revenue, \
                      homepage, end_date, vote_count, popularity \
                      FROM media_items WHERE name LIKE ?1 LIMIT ?2",
@@ -288,7 +288,7 @@ pub async fn search_items(
                 let sql = format!(
                     "SELECT id, name, sort_name, overview, media_type, path, parent_id, library_id, \
                      production_year, community_rating, official_rating, genres, date_created, \
-                     premiere_date, runtime_ticks, index_number, parent_index_number, tmdb_id, tvdb_id, \
+                     premiere_date, runtime_ticks, index_number, parent_index_number, index_number_end, location_type, tmdb_id, tvdb_id, \
                      tags, status, original_language, tagline, production_countries, budget, revenue, \
                      homepage, end_date, vote_count, popularity \
                      FROM media_items WHERE name LIKE ? AND media_type IN ({}) LIMIT ?",

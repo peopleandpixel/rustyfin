@@ -11,12 +11,14 @@ use chrono::{DateTime, FixedOffset, Utc};
 use rustyfin_db::repo_media::PathScope;
 use rustyfin_db::repo_media_source::PROBE_VERSION;
 use rustyfin_model::library::{Library, LibraryContentType};
+use rustyfin_model::media::LocationType;
+use rustyfin_model::metadata::ExternalMetadata;
 use sqlx::{SqliteConnection, SqlitePool};
 use uuid::Uuid;
 
 use crate::naming::{self, VersionGroup, is_ignored_dir, is_ignored_file};
 use crate::probe::ProbeStep;
-use crate::scanner::parse_year;
+use crate::scanner::{parse_year, season_sort_name};
 
 /// Deletes the item `id` and the rows that refer to it, in one transaction.
 ///
@@ -655,6 +657,7 @@ struct ItemRow {
     runtime_ticks: Option<i64>,
     date_created: String,
     index_number: Option<i32>,
+    index_number_end: Option<i32>,
     parent_index_number: Option<i32>,
     parent_id: Option<String>,
     /// The series of the item's season, when the item is an episode.
@@ -682,6 +685,7 @@ enum Wanted {
     Episode {
         name: String,
         index_number: Option<i32>,
+        index_number_end: Option<i32>,
         parent_index_number: Option<i32>,
         parent_id: Uuid,
         series_id: Uuid,
@@ -739,11 +743,13 @@ pub async fn reconcile_movie_groups(
 /// series that holds `season_id`. With a season number, the episode takes over a gone episode of that series
 /// with the same numbers, whatever the name of its season folder was. The season of each is the one in its
 /// file name, else its folder's, so a special in a season folder is no episode of that season.
+/// `index_number_end` is the last episode of a file that holds several, as in `S01E03-E04`.
 pub struct EpisodeGroup {
     pub files: Vec<PathBuf>,
     pub season_id: Uuid,
     pub series_id: Uuid,
     pub index_number: Option<i32>,
+    pub index_number_end: Option<i32>,
     pub parent_index_number: Option<i32>,
 }
 
@@ -772,6 +778,7 @@ pub async fn reconcile_episode_groups(
                     .map(|stem| stem.to_string_lossy().into_owned())
                     .unwrap_or_default(),
                 index_number: group.index_number,
+                index_number_end: group.index_number_end,
                 parent_index_number: group.parent_index_number,
                 parent_id: group.season_id,
                 series_id: group.series_id,
@@ -779,6 +786,373 @@ pub async fn reconcile_episode_groups(
         })
         .collect();
     reconcile_groups(pool, library_id, "Episode", scope, &wanted, gone, rereads).await
+}
+
+/// Gives each season of `seasons`, (id, number), the number that the scan read from its folder, where the stored
+/// one differs: a `Specials` folder stored with no number before it was read as season 0, say. A sort name that
+/// the scan made from the stored number is made again from the new one; any other is kept. Only the seasons
+/// that differ are written, in one transaction. Returns how many changed.
+pub async fn settle_season_numbers(
+    pool: &SqlitePool,
+    library_id: Uuid,
+    seasons: &[(Uuid, Option<i32>)],
+) -> Result<u64, sqlx::Error> {
+    let stored: Vec<(String, Option<i32>, Option<String>)> = sqlx::query_as(
+        "SELECT id, index_number, sort_name FROM media_items
+         WHERE library_id = ?1 AND media_type = 'Season'",
+    )
+    .bind(library_id.to_string())
+    .fetch_all(pool)
+    .await?;
+    let stored: HashMap<String, (Option<i32>, Option<String>)> = stored
+        .into_iter()
+        .map(|(id, number, sort_name)| (id, (number, sort_name)))
+        .collect();
+
+    let mut changes = Vec::new();
+    for &(id, number) in seasons {
+        let id = id.to_string();
+        let Some((old_number, old_sort_name)) = stored.get(&id) else {
+            continue;
+        };
+        if *old_number == number {
+            continue;
+        }
+        let sort_name = if old_sort_name.as_deref() == Some(&season_sort_name(*old_number)) {
+            Some(season_sort_name(number))
+        } else {
+            old_sort_name.clone()
+        };
+        changes.push((id, number, sort_name, *old_number, old_sort_name.as_deref()));
+    }
+    if changes.is_empty() {
+        return Ok(0);
+    }
+
+    let mut changed = 0;
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    for (id, number, sort_name, old_number, old_sort_name) in changes {
+        // A season that another writer changed since it was read is left to the next scan.
+        changed += sqlx::query(
+            "UPDATE media_items SET index_number = ?1, sort_name = ?2
+             WHERE id = ?3 AND index_number IS ?4 AND sort_name IS ?5",
+        )
+        .bind(number)
+        .bind(sort_name)
+        .bind(id)
+        .bind(old_number)
+        .bind(old_sort_name)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    }
+    tx.commit().await?;
+    Ok(changed)
+}
+
+/// Gives each season of `seasons`, (id, location type), the location type that the scan found for it, where
+/// the stored one differs: a season with no folder of its own, made for the episode files in its series'
+/// folder, is Virtual and gives no Path, as in Jellyfin; one with a folder is FileSystem. A season keeps the
+/// path that the scan finds it by, so it keeps its id. Only the seasons that differ are written, in one
+/// transaction. Returns how many changed.
+pub async fn settle_season_folders(
+    pool: &SqlitePool,
+    library_id: Uuid,
+    seasons: &[(Uuid, LocationType)],
+) -> Result<u64, sqlx::Error> {
+    let stored: Vec<(String, String)> = sqlx::query_as(
+        "SELECT id, location_type FROM media_items
+         WHERE library_id = ?1 AND media_type = 'Season'",
+    )
+    .bind(library_id.to_string())
+    .fetch_all(pool)
+    .await?;
+    let stored: HashMap<String, String> = stored.into_iter().collect();
+
+    let changes: Vec<(String, &str, &str)> = seasons
+        .iter()
+        .filter_map(|&(id, location)| {
+            let id = id.to_string();
+            let old = stored.get(&id)?.as_str();
+            (old != location.as_str()).then_some((id, location.as_str(), old))
+        })
+        .collect();
+    if changes.is_empty() {
+        return Ok(0);
+    }
+
+    let mut changed = 0;
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    for (id, location, old) in changes {
+        // A season that another writer changed since it was read is left to the next scan.
+        changed += sqlx::query(
+            "UPDATE media_items SET location_type = ?1 WHERE id = ?2 AND location_type = ?3",
+        )
+        .bind(location)
+        .bind(id)
+        .bind(old)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    }
+    tx.commit().await?;
+    Ok(changed)
+}
+
+/// A series folder that a scan walked, for `settle_series`.
+pub struct SeriesFolder {
+    /// The id of the series.
+    pub id: Uuid,
+    /// The name of its folder.
+    pub folder: String,
+    /// What its `tvshow.nfo` gives, if it has one.
+    pub nfo: Option<ExternalMetadata>,
+    /// With `nfo`, its seasons that read that file under the older rule, as they found no `.nfo` of their own
+    /// beside their folder: id, folder name and number.
+    pub nfo_seasons: Vec<(Uuid, String, Option<i32>)>,
+    /// With `nfo`, the paths of its video files directly in its folder that read that file under the older
+    /// rule, as they found no `.nfo` of their own.
+    pub nfo_episodes: Vec<String>,
+}
+
+/// The fields of a series or a season that `settle_series` settles.
+#[derive(Clone, PartialEq, sqlx::FromRow)]
+struct Shown {
+    id: String,
+    name: String,
+    sort_name: Option<String>,
+    overview: Option<String>,
+    production_year: Option<i32>,
+    community_rating: Option<f64>,
+    official_rating: Option<String>,
+    genres: String,
+    runtime_ticks: Option<i64>,
+}
+
+/// Gives each series of `series`, and its seasons, what a new one gets now, where the stored values came from
+/// older rules:
+/// - A name and a sort name that are a folder's like `Title (Year)` become the title's, and a missing year
+///   becomes the folder's (`naming::series_title_and_year`). Any other name is kept.
+/// - Each field that the series' own `tvshow.nfo` fills, and that is still empty, gets the file's value, as a
+///   metadata refresh fills it (`metadata::apply_metadata_to_item`).
+/// - A season that read that file under the older rule loses each value that is still the file's. A name that
+///   took the show's title gets the season's folder name back.
+/// - A loose episode that read that file under the older rule does the same, and a name that took the show's
+///   title gets the file's stem back, as a new episode gets it.
+/// - The seasons and loose episodes lose the images that the file gave them, with the provider `nfo`. The
+///   series keeps its own.
+///
+/// Only the items that differ are written, in one transaction, with the image rows that go. Returns how many
+/// changed, images included.
+pub async fn settle_series(
+    pool: &SqlitePool,
+    library_id: Uuid,
+    series: &[SeriesFolder],
+) -> Result<u64, sqlx::Error> {
+    let stored: Vec<Shown> = sqlx::query_as(
+        "SELECT id, name, sort_name, overview, production_year, community_rating, official_rating,
+                genres, runtime_ticks
+         FROM media_items WHERE library_id = ?1 AND media_type IN ('Series', 'Season')",
+    )
+    .bind(library_id.to_string())
+    .fetch_all(pool)
+    .await?;
+    let stored: HashMap<String, Shown> = stored.into_iter().map(|s| (s.id.clone(), s)).collect();
+
+    // The changes, as (new, old). The items that read the file under the older rule, with the file, lose
+    // its images too.
+    let mut changes: Vec<(Shown, Shown)> = Vec::new();
+    let mut image_items: Vec<(String, &ExternalMetadata)> = Vec::new();
+    for folder in series {
+        if let Some(old) = stored.get(&folder.id.to_string()) {
+            let mut new = old.clone();
+            if let Some((title, year)) = naming::series_title_and_year(&folder.folder) {
+                if new.name == folder.folder {
+                    new.name = title.to_string();
+                }
+                if new.sort_name.as_deref() == Some(&folder.folder.to_lowercase()) {
+                    new.sort_name = Some(title.to_lowercase());
+                }
+                new.production_year = new.production_year.or(Some(year));
+            }
+            if let Some(nfo) = &folder.nfo {
+                fill_from_nfo(&mut new, nfo);
+            }
+            if new != *old {
+                changes.push((new, old.clone()));
+            }
+        }
+        let Some(nfo) = &folder.nfo else {
+            continue;
+        };
+        for (id, season_folder, number) in &folder.nfo_seasons {
+            let Some(old) = stored.get(&id.to_string()) else {
+                continue;
+            };
+            let mut new = old.clone();
+            clear_show_nfo(&mut new, nfo, season_folder, &season_sort_name(*number));
+            if new != *old {
+                changes.push((new, old.clone()));
+            }
+            image_items.push((id.to_string(), nfo));
+        }
+        for path in &folder.nfo_episodes {
+            let Some(stem) = Path::new(path).file_stem() else {
+                continue;
+            };
+            let stem = stem.to_string_lossy();
+            let Some(old) = stored_episode(pool, library_id, path).await? else {
+                continue;
+            };
+            let mut new = old.clone();
+            clear_show_nfo(&mut new, nfo, &stem, &stem.to_lowercase());
+            if new != old {
+                changes.push((new, old.clone()));
+            }
+            image_items.push((old.id, nfo));
+        }
+    }
+    // The stored `nfo` image rows of these items that the file still names. Read before the write lock, so a
+    // scan with nothing to delete takes no transaction.
+    let nfo_items: HashMap<&str, &ExternalMetadata> = image_items
+        .iter()
+        .map(|(id, nfo)| (id.as_str(), *nfo))
+        .collect();
+    let stored_images: Vec<(String, String, i64, String)> = sqlx::query_as(
+        "SELECT i.item_id, i.image_type, i.image_index, i.path
+         FROM item_images AS i JOIN media_items AS m ON m.id = i.item_id
+         WHERE m.library_id = ?1 AND m.media_type IN ('Season', 'Episode') AND i.provider = 'nfo'",
+    )
+    .bind(library_id.to_string())
+    .fetch_all(pool)
+    .await?;
+    let images: Vec<(String, String, i64, String)> = stored_images
+        .into_iter()
+        .filter(|(item_id, _, _, path)| {
+            nfo_items
+                .get(item_id.as_str())
+                .is_some_and(|nfo| nfo.image_urls.iter().any(|image| image.url == *path))
+        })
+        .collect();
+    if changes.is_empty() && images.is_empty() {
+        return Ok(0);
+    }
+
+    let mut changed = 0;
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    for (new, old) in changes {
+        // An item that another writer changed since it was read is left to the next scan. Its images are
+        // deleted below either way.
+        changed += sqlx::query(
+            "UPDATE media_items SET name = ?1, sort_name = ?2, overview = ?3, production_year = ?4,
+                 community_rating = ?5, official_rating = ?6, genres = ?7, runtime_ticks = ?8
+             WHERE id = ?9 AND name IS ?10 AND sort_name IS ?11 AND overview IS ?12
+                 AND production_year IS ?13 AND community_rating IS ?14 AND official_rating IS ?15
+                 AND genres IS ?16 AND runtime_ticks IS ?17",
+        )
+        .bind(&new.name)
+        .bind(&new.sort_name)
+        .bind(&new.overview)
+        .bind(new.production_year)
+        .bind(new.community_rating)
+        .bind(&new.official_rating)
+        .bind(&new.genres)
+        .bind(new.runtime_ticks)
+        .bind(&old.id)
+        .bind(&old.name)
+        .bind(&old.sort_name)
+        .bind(&old.overview)
+        .bind(old.production_year)
+        .bind(old.community_rating)
+        .bind(&old.official_rating)
+        .bind(&old.genres)
+        .bind(old.runtime_ticks)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    }
+    // The images that the file gave a season or an episode, under the provider `nfo`, by primary key. A
+    // series' own images are never in `image_items`.
+    for (item_id, image_type, image_index, path) in &images {
+        changed += sqlx::query(
+            "DELETE FROM item_images WHERE item_id = ?1 AND image_type = ?2 AND image_index = ?3
+                 AND provider = 'nfo' AND path = ?4",
+        )
+        .bind(item_id)
+        .bind(image_type)
+        .bind(image_index)
+        .bind(path)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    }
+    tx.commit().await?;
+    Ok(changed)
+}
+
+/// Fills each field of `shown` that is still empty with the value of `nfo`, as
+/// `metadata::apply_metadata_to_item` does with an NFO.
+fn fill_from_nfo(shown: &mut Shown, nfo: &ExternalMetadata) {
+    shown.overview = shown.overview.take().or_else(|| nfo.overview.clone());
+    shown.production_year = shown.production_year.or(nfo.production_year);
+    shown.community_rating = shown.community_rating.or(nfo.community_rating);
+    shown.official_rating = shown
+        .official_rating
+        .take()
+        .or_else(|| nfo.official_rating.clone());
+    // Genres are stored joined with `|`; an item reads none from blank ones.
+    if shown.genres.split('|').all(|g| g.trim().is_empty())
+        && let Some(genres) = nfo.genres.as_ref().filter(|g| !g.is_empty())
+    {
+        shown.genres = genres.join("|");
+    }
+    shown.runtime_ticks = shown.runtime_ticks.or(nfo.runtime_ticks);
+}
+
+/// The stored episode whose primary file is at `path`, if an item of the library has that path.
+async fn stored_episode(
+    pool: &SqlitePool,
+    library_id: Uuid,
+    path: &str,
+) -> Result<Option<Shown>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT id, name, sort_name, overview, production_year, community_rating, official_rating,
+                genres, runtime_ticks
+         FROM media_items WHERE library_id = ?1 AND media_type = 'Episode' AND path = ?2",
+    )
+    .bind(library_id.to_string())
+    .bind(path)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Clears each field of a season's or an episode's `shown` that still holds the value of its series'
+/// `tvshow.nfo`, `nfo`. A name that took the show's title, with its sort name, becomes `name` and `sort_name`:
+/// a season's folder name and number give them, and an episode's file stem does.
+fn clear_show_nfo(shown: &mut Shown, nfo: &ExternalMetadata, name: &str, sort_name: &str) {
+    fn clear<T: PartialEq>(field: &mut Option<T>, nfo: &Option<T>) {
+        if *field == *nfo {
+            *field = None;
+        }
+    }
+    if let Some(title) = &nfo.name
+        && shown.name == *title
+        && title != name
+        && shown.sort_name.as_deref() == Some(&title.to_lowercase())
+    {
+        shown.name = name.to_string();
+        shown.sort_name = Some(sort_name.to_string());
+    }
+    clear(&mut shown.overview, &nfo.overview);
+    clear(&mut shown.production_year, &nfo.production_year);
+    clear(&mut shown.community_rating, &nfo.community_rating);
+    clear(&mut shown.official_rating, &nfo.official_rating);
+    if let Some(genres) = nfo.genres.as_ref().filter(|g| !g.is_empty())
+        && shown.genres == genres.join("|")
+    {
+        shown.genres = String::new();
+    }
+    clear(&mut shown.runtime_ticks, &nfo.runtime_ticks);
 }
 
 /// Settles the groups of one media type in the library. The outcomes are in the order of `groups`.
@@ -808,7 +1182,7 @@ async fn reconcile_groups(
     );
     let items: Vec<ItemRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT id, path, name, sort_name, production_year, runtime_ticks, date_created,
-                index_number, parent_index_number, parent_id,
+                index_number, index_number_end, parent_index_number, parent_id,
                 (SELECT s.parent_id FROM media_items AS s WHERE s.id = m.parent_id) AS series_id
          FROM media_items AS m
          WHERE m.library_id = ?1 AND m.media_type = ?2 AND {loaded}"
@@ -1117,34 +1491,39 @@ async fn settle_group(
     };
     // A movie takes its year and keeps its episode fields. An episode keeps its year and takes the
     // group's numbers and season.
-    let (production_year, index_number, parent_index_number, parent_id) = match &group.wanted {
-        Wanted::Movie { year, .. } => (
-            if survivor.production_year.is_none() || survivor.production_year == old_year {
-                *year
-            } else {
-                survivor.production_year
-            },
-            survivor.index_number,
-            survivor.parent_index_number,
-            survivor.parent_id.clone(),
-        ),
-        Wanted::Episode {
-            index_number,
-            parent_index_number,
-            parent_id: season,
-            ..
-        } => (
-            survivor.production_year,
-            *index_number,
-            *parent_index_number,
-            Some(season.to_string()),
-        ),
-    };
+    let (production_year, index_number, index_number_end, parent_index_number, parent_id) =
+        match &group.wanted {
+            Wanted::Movie { year, .. } => (
+                if survivor.production_year.is_none() || survivor.production_year == old_year {
+                    *year
+                } else {
+                    survivor.production_year
+                },
+                survivor.index_number,
+                survivor.index_number_end,
+                survivor.parent_index_number,
+                survivor.parent_id.clone(),
+            ),
+            Wanted::Episode {
+                index_number,
+                index_number_end,
+                parent_index_number,
+                parent_id: season,
+                ..
+            } => (
+                survivor.production_year,
+                *index_number,
+                *index_number_end,
+                *parent_index_number,
+                Some(season.to_string()),
+            ),
+        };
     let fields_changed = survivor.path != primary
         || name != survivor.name
         || sort_name != survivor.sort_name
         || production_year != survivor.production_year
         || index_number != survivor.index_number
+        || index_number_end != survivor.index_number_end
         || parent_index_number != survivor.parent_index_number
         || parent_id != survivor.parent_id;
 
@@ -1157,8 +1536,8 @@ async fn settle_group(
         if fields_changed {
             sqlx::query(
                 "UPDATE media_items SET path = ?1, name = ?2, sort_name = ?3, production_year = ?4,
-                 index_number = ?5, parent_index_number = ?6, parent_id = ?7
-                 WHERE id = ?8",
+                 index_number = ?5, parent_index_number = ?6, parent_id = ?7, index_number_end = ?8
+                 WHERE id = ?9",
             )
             .bind(primary)
             .bind(name.as_str())
@@ -1167,6 +1546,7 @@ async fn settle_group(
             .bind(index_number)
             .bind(parent_index_number)
             .bind(parent_id.as_deref())
+            .bind(index_number_end)
             .bind(survivor.id.as_str())
             .execute(&mut *tx)
             .await?;

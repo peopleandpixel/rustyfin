@@ -88,3 +88,14 @@ fn ignored_file_names() {
         assert!(!is_ignored_file(name), "{name:?} should not be ignored");
     }
 }
+
+#[test]
+fn b32_disc_folders_are_ignored() {
+    // The streams of a Blu-ray or DVD folder are no titles of their own (BaseVideoResolver.cs:261-286).
+    for name in ["BDMV", "bdmv", "VIDEO_TS", "Video_TS"] {
+        assert!(is_ignored_dir(name), "{name:?} should be ignored");
+    }
+    for name in ["BDMV Rips", "VIDEO_TS2", "STREAM", "AUDIO_TS"] {
+        assert!(!is_ignored_dir(name), "{name:?} should not be ignored");
+    }
+}

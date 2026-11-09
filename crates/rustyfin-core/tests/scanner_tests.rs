@@ -7596,3 +7596,960 @@ async fn b26_photos_are_not_read_again() {
     assert_eq!(b18_source_ids(pool, &lib).await, before);
     assert_eq!(b26_versions(pool, &lib).await, [(photo.to_string(), 0)]);
 }
+
+#[tokio::test]
+async fn b32_scans_collect_jellyfins_video_extensions() {
+    let fx = Fixture::new().await;
+    let film = fx.library("film", LibraryContentType::Movies).await;
+    let root = root_of(&film);
+    for rel in [
+        "Chinatown (1974)/Chinatown (1974) BR-DISK.m2ts",
+        "Camcorder (2009)/Camcorder (2009).MTS",
+        "Dvd (2007)/Dvd (2007).vob",
+        "Recorded (2008)/Recorded (2008).dvr-ms",
+        "Ogg (2010)/Ogg (2010).ogv",
+        "Imaged (2011)/Imaged (2011) BR-DISK.iso",
+        "Linked (2012)/Linked (2012).strm",
+        "Upstream Color (2013)/BDMV/STREAM/00000.m2ts",
+        "Upstream Color (2013)/BDMV/STREAM/00001.m2ts",
+        "Anchorman 2 (2013)/VIDEO_TS/VTS_01_1.VOB",
+        "Anchorman 2 (2013)/VIDEO_TS/VIDEO_TS.IFO",
+    ] {
+        touch(&root, rel);
+    }
+    let tv = fx.library("tv", LibraryContentType::TvShows).await;
+    touch(&root_of(&tv), "Show/Season 1/Show S01E01.m2ts");
+
+    scan(&fx.pool, &film).await;
+    scan(&fx.pool, &tv).await;
+
+    assert_eq!(
+        paths(&fx.pool, &film, "Movie").await,
+        [
+            "Camcorder (2009)/Camcorder (2009).MTS",
+            "Chinatown (1974)/Chinatown (1974) BR-DISK.m2ts",
+            "Dvd (2007)/Dvd (2007).vob",
+            "Ogg (2010)/Ogg (2010).ogv",
+            "Recorded (2008)/Recorded (2008).dvr-ms",
+        ]
+    );
+    assert_eq!(
+        paths(&fx.pool, &tv, "Episode").await,
+        ["Show/Season 1/Show S01E01.m2ts"]
+    );
+}
+
+#[tokio::test]
+async fn b32_f5_bin_files_count_only_when_named_as_episodes() {
+    // Jellyfin lists every `.bin` as a video (12.4 `NamingOptions.cs:24-79`). Most are disc images or data, so
+    // a scan takes one only when its name parses as an episode, like this one, the only file of S09E10.
+    const EPISODE: &str = "Rick and Morty/Season 9/Rick.and.Morty.S09E10.1080p.WEB.H264.bin";
+    let fx = Fixture::new().await;
+    let tv = fx.library("tv", LibraryContentType::TvShows).await;
+    touch(&root_of(&tv), EPISODE);
+    touch(&root_of(&tv), "Rick and Morty/Season 9/firmware.bin");
+    let film = fx.library("film", LibraryContentType::Movies).await;
+    touch(&root_of(&film), "Imaged (2011)/Imaged (2011).bin");
+
+    scan(&fx.pool, &tv).await;
+    scan(&fx.pool, &film).await;
+
+    let numbered: Vec<(String, Option<i64>, Option<i64>)> = episodes(&fx.pool, &tv)
+        .await
+        .into_iter()
+        .map(|(path, index, season, _)| (path, index, season))
+        .collect();
+    assert_eq!(numbered, [(EPISODE.to_string(), Some(10), Some(9))]);
+    assert!(paths(&fx.pool, &film, "Movie").await.is_empty());
+}
+
+/// ffmpeg.
+#[tokio::test]
+async fn b32_an_m2ts_joins_its_movie_as_a_version() {
+    if !have_ffmpeg() {
+        eprintln!("skipped: needs ffmpeg and ffprobe");
+        return;
+    }
+    const MKV: &str = "Chinatown (1974)/Chinatown (1974) Bluray-1080p.mkv";
+    const M2TS: &str = "Chinatown (1974)/Chinatown (1974) BR-DISK.m2ts";
+    let fx = Fixture::new().await;
+    let lib = fx.library("film", LibraryContentType::Movies).await;
+    let root = root_of(&lib);
+    clip(&fx, &root, MKV, 2);
+    scan_idle(&fx.pool, &lib).await;
+    let movie = item_at(&fx.pool, &lib, MKV).await;
+    let user = insert_user(&fx.pool).await;
+    let marks = at(600_000_000, Some(EARLY));
+    insert_marks(&fx.pool, &user, movie, &marks).await;
+
+    clip(&fx, &root, M2TS, 2);
+    scan_idle(&fx.pool, &lib).await;
+
+    assert_groups(&fx.pool, &lib, &[(MKV, &[MKV, M2TS])]).await;
+    assert_eq!(
+        item_at(&fx.pool, &lib, MKV).await,
+        movie,
+        "the movie keeps its id"
+    );
+    assert_eq!(marks_of(&fx.pool, &user, movie).await, Some(marks));
+}
+
+#[tokio::test]
+async fn b32_rescans_read_e_dot_episode_numbers() {
+    const E02: &str = "Dekalog/Season 1/Dekalog.E02.1989.720p.BluRay.mkv";
+    let fx = Fixture::new().await;
+    let lib = fx.library("tv", LibraryContentType::TvShows).await;
+    touch(&root_of(&lib), E02);
+    scan(&fx.pool, &lib).await;
+    let episode = item_at(&fx.pool, &lib, E02).await;
+    // 3afba21's rules left the number empty.
+    exec(
+        &fx.pool,
+        "UPDATE media_items SET index_number = NULL WHERE id = ?1",
+        &[&episode.to_string()],
+    )
+    .await;
+    let user = insert_user(&fx.pool).await;
+    let marks = at(600_000_000, Some(EARLY));
+    insert_marks(&fx.pool, &user, episode, &marks).await;
+
+    scan(&fx.pool, &lib).await;
+
+    assert_eq!(
+        episodes(&fx.pool, &lib).await,
+        [(E02.to_string(), Some(2), Some(1), "Season 1".to_string())]
+    );
+    assert_eq!(item_at(&fx.pool, &lib, E02).await, episode);
+    assert_eq!(marks_of(&fx.pool, &user, episode).await, Some(marks));
+}
+
+/// (path, number, sort name) of each season of the library, sorted by path.
+async fn b32_seasons(
+    pool: &SqlitePool,
+    lib: &Library,
+) -> Vec<(String, Option<i32>, Option<String>)> {
+    let root = root_of(lib);
+    let rows: Vec<(String, Option<i32>, Option<String>)> = sqlx::query_as(
+        "SELECT path, index_number, sort_name FROM media_items
+         WHERE library_id = ?1 AND media_type = 'Season'",
+    )
+    .bind(lib.id.to_string())
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    let mut rows: Vec<_> = rows
+        .into_iter()
+        .map(|(path, number, sort_name)| (rel(&root, &path), number, sort_name))
+        .collect();
+    rows.sort();
+    rows
+}
+
+/// The season numbers of the library's episodes, sorted by path.
+async fn b32_episode_seasons(pool: &SqlitePool, lib: &Library) -> Vec<Option<i64>> {
+    let rows = episodes(pool, lib).await;
+    rows.into_iter().map(|(_, _, season, _)| season).collect()
+}
+
+#[tokio::test]
+async fn b32_specials_folders_are_season_0() {
+    let fx = Fixture::new().await;
+    let lib = fx.library("tv", LibraryContentType::TvShows).await;
+    for rel in [
+        "Alpha/Specials/Alpha.ep01.mkv",
+        "Bravo/SPECIALS/Bravo.ep01.mkv",
+        "Charlie/[Specials]/Charlie.ep01.mkv",
+        "Delta/Delta - Specials/Delta.ep01.mkv",
+        "Echo/Echo Extras/Echo.ep01.mkv",
+        "Foxtrot/Specials 2/Foxtrot.ep01.mkv",
+    ] {
+        touch(&root_of(&lib), rel);
+    }
+
+    scan(&fx.pool, &lib).await;
+
+    let special = |path: &str| (path.to_string(), Some(0), Some("season 0000".to_string()));
+    assert_eq!(
+        b32_seasons(&fx.pool, &lib).await,
+        [
+            special("Alpha/Specials"),
+            special("Bravo/SPECIALS"),
+            special("Charlie/[Specials]"),
+            special("Delta/Delta - Specials"),
+            special("Echo/Echo Extras"),
+            (
+                "Foxtrot/Specials 2".to_string(),
+                None,
+                Some("season 0001".to_string())
+            ),
+        ]
+    );
+    assert_eq!(
+        b32_episode_seasons(&fx.pool, &lib).await,
+        [Some(0), Some(0), Some(0), Some(0), Some(0), None]
+    );
+}
+
+#[tokio::test]
+async fn b32_rescans_make_stored_specials_folders_season_0() {
+    const ALPHA: &str = "Alpha/Specials/Alpha.ep01.mkv";
+    const BRAVO: &str = "Bravo/Specials/Bravo.ep01.mkv";
+    let fx = Fixture::new().await;
+    let lib = fx.library("tv", LibraryContentType::TvShows).await;
+    touch(&root_of(&lib), ALPHA);
+    touch(&root_of(&lib), BRAVO);
+    scan(&fx.pool, &lib).await;
+    let alpha = item_at(&fx.pool, &lib, "Alpha/Specials").await;
+    let bravo = item_at(&fx.pool, &lib, "Bravo/Specials").await;
+    let episode = item_at(&fx.pool, &lib, ALPHA).await;
+    // 3afba21 stored them with no number. Bravo's sort name is not one that the scan made.
+    exec(
+        &fx.pool,
+        "UPDATE media_items SET index_number = NULL, sort_name = 'season 0001' WHERE id = ?1",
+        &[&alpha.to_string()],
+    )
+    .await;
+    exec(
+        &fx.pool,
+        "UPDATE media_items SET index_number = NULL, sort_name = 'bravo specials' WHERE id = ?1",
+        &[&bravo.to_string()],
+    )
+    .await;
+    exec(
+        &fx.pool,
+        "UPDATE media_items SET parent_index_number = NULL WHERE media_type = 'Episode'",
+        &[],
+    )
+    .await;
+    let user = insert_user(&fx.pool).await;
+    let marks = at(600_000_000, Some(EARLY));
+    insert_marks(&fx.pool, &user, episode, &marks).await;
+    let favorite = Marks {
+        favorite: true,
+        ..Marks::default()
+    };
+    insert_marks(&fx.pool, &user, alpha, &favorite).await;
+
+    scan(&fx.pool, &lib).await;
+
+    assert_eq!(
+        b32_seasons(&fx.pool, &lib).await,
+        [
+            (
+                "Alpha/Specials".to_string(),
+                Some(0),
+                Some("season 0000".to_string())
+            ),
+            (
+                "Bravo/Specials".to_string(),
+                Some(0),
+                Some("bravo specials".to_string())
+            ),
+        ]
+    );
+    assert_eq!(
+        b32_episode_seasons(&fx.pool, &lib).await,
+        [Some(0), Some(0)]
+    );
+    assert_eq!(item_at(&fx.pool, &lib, "Alpha/Specials").await, alpha);
+    assert_eq!(item_at(&fx.pool, &lib, "Bravo/Specials").await, bravo);
+    assert_eq!(item_at(&fx.pool, &lib, ALPHA).await, episode);
+    assert_eq!(marks_of(&fx.pool, &user, episode).await, Some(marks));
+    assert_eq!(marks_of(&fx.pool, &user, alpha).await, Some(favorite));
+}
+
+#[tokio::test]
+async fn b32_f1_specials_folders_keep_the_season_of_a_file_name() {
+    // Jellyfin takes an episode's season from its file name first, and the folder's only when the name
+    // gives none (12.4 `Library/LibraryManager.cs:3400-3423`).
+    const S01E05: &str = "Golf/Specials/Golf S01E05.mkv";
+    let fx = Fixture::new().await;
+    let lib = fx.library("tv", LibraryContentType::TvShows).await;
+    for rel in [
+        S01E05,
+        "Golf/Specials/Golf S00E01.mkv",
+        "Golf/Specials/Golf.ep02.mkv",
+    ] {
+        touch(&root_of(&lib), rel);
+    }
+
+    scan(&fx.pool, &lib).await;
+    // By path: S00E01, S01E05, then the unnumbered file.
+    assert_eq!(
+        b32_episode_seasons(&fx.pool, &lib).await,
+        [Some(0), Some(1), Some(0)]
+    );
+
+    // 1a575b4 stored the folder's 0. A rescan gives the file name's 1 back, under the same id.
+    let episode = item_at(&fx.pool, &lib, S01E05).await;
+    exec(
+        &fx.pool,
+        "UPDATE media_items SET parent_index_number = 0 WHERE id = ?1",
+        &[&episode.to_string()],
+    )
+    .await;
+    scan(&fx.pool, &lib).await;
+    assert_eq!(
+        b32_episode_seasons(&fx.pool, &lib).await,
+        [Some(0), Some(1), Some(0)]
+    );
+    assert_eq!(item_at(&fx.pool, &lib, S01E05).await, episode);
+}
+
+/// A `tvshow.nfo` with a value for each field that an NFO fills.
+const B32_TVSHOW_NFO: &str = "<tvshow><title>Hotel Series</title><year>2015</year>\
+    <plot>Synthetic test show.</plot><rating>7.5</rating><mpaa>TV-14</mpaa>\
+    <genre>Drama</genre><genre>Comedy</genre><runtime>45</runtime></tvshow>";
+
+/// The name, sort name, and the fields that an NFO fills, of a series or a season.
+#[derive(Debug, Default, PartialEq)]
+struct B32Shown {
+    name: String,
+    sort_name: Option<String>,
+    year: Option<i64>,
+    overview: Option<String>,
+    rating: Option<f64>,
+    official_rating: Option<String>,
+    genres: String,
+    runtime_ticks: Option<i64>,
+}
+
+impl B32Shown {
+    /// A name, a sort name and a year, and nothing that an NFO fills.
+    fn plain(name: &str, sort_name: &str, year: Option<i64>) -> Self {
+        Self {
+            name: name.to_string(),
+            sort_name: Some(sort_name.to_string()),
+            year,
+            ..Self::default()
+        }
+    }
+
+    /// What Hotel Series (2015) shows with its folder's name and year, and `B32_TVSHOW_NFO`.
+    fn hotel_series() -> Self {
+        Self {
+            overview: Some("Synthetic test show.".to_string()),
+            rating: Some(7.5),
+            official_rating: Some("TV-14".to_string()),
+            genres: "Drama|Comedy".to_string(),
+            runtime_ticks: Some(45 * 600_000_000),
+            ..Self::plain("Hotel Series", "hotel series", Some(2015))
+        }
+    }
+}
+
+/// The item at `rel`, relative to the library root, as `B32Shown`.
+async fn b32_shown(pool: &SqlitePool, lib: &Library, rel: &str) -> B32Shown {
+    type Row = (
+        String,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+        Option<f64>,
+        Option<String>,
+        String,
+        Option<i64>,
+    );
+    let path = root_of(lib).join(rel);
+    let (name, sort_name, year, overview, rating, official_rating, genres, runtime_ticks): Row =
+        sqlx::query_as(
+            "SELECT name, sort_name, production_year, overview, community_rating, official_rating,
+                    genres, runtime_ticks
+             FROM media_items WHERE library_id = ?1 AND path = ?2",
+        )
+        .bind(lib.id.to_string())
+        .bind(path.to_str().unwrap())
+        .fetch_one(pool)
+        .await
+        .unwrap_or_else(|e| panic!("{rel}: {e}"));
+    B32Shown {
+        name,
+        sort_name,
+        year,
+        overview,
+        rating,
+        official_rating,
+        genres,
+        runtime_ticks,
+    }
+}
+
+#[tokio::test]
+async fn b32_series_folders_give_a_name_a_year_and_their_tvshow_nfo() {
+    let fx = Fixture::new().await;
+    let lib = fx.library("tv", LibraryContentType::TvShows).await;
+    let root = root_of(&lib);
+    for rel in [
+        "One Night (2023)/Season 01/One Night S01E01.mkv",
+        "1923 (2022)/Season 01/1923 S01E01.mkv",
+        "Plain Show/Season 01/Plain Show S01E01.mkv",
+        "Hotel Series (2015)/Season 01/Hotel Series S01E01.mkv",
+        "Hotel Series (2015)/Hotel Series S02E01.mkv",
+    ] {
+        touch(&root, rel);
+    }
+    std::fs::write(root.join("Hotel Series (2015)/tvshow.nfo"), B32_TVSHOW_NFO).unwrap();
+
+    scan(&fx.pool, &lib).await;
+
+    let shown = |rel| b32_shown(&fx.pool, &lib, rel);
+    assert_eq!(
+        shown("One Night (2023)").await,
+        B32Shown::plain("One Night", "one night", Some(2023))
+    );
+    assert_eq!(
+        shown("1923 (2022)").await,
+        B32Shown::plain("1923", "1923", Some(2022))
+    );
+    assert_eq!(
+        shown("Plain Show").await,
+        B32Shown::plain("Plain Show", "plain show", None)
+    );
+    assert_eq!(shown("Hotel Series (2015)").await, B32Shown::hotel_series());
+    // The seasons, the one with no folder too, don't read the series' tvshow.nfo.
+    assert_eq!(
+        shown("Hotel Series (2015)/Season 01").await,
+        B32Shown::plain("Season 01", "season 0001", None)
+    );
+    assert_eq!(
+        shown("Hotel Series (2015)/Season 2").await,
+        B32Shown::plain("Season 2", "season 0002", None)
+    );
+}
+
+#[tokio::test]
+async fn b32_metadata_refreshes_read_tvshow_nfo_for_the_series_only() {
+    let fx = Fixture::new().await;
+    let lib = fx.library("tv", LibraryContentType::TvShows).await;
+    let root = root_of(&lib);
+    touch(
+        &root,
+        "Hotel Series (2015)/Season 01/Hotel Series S01E01.mkv",
+    );
+    scan(&fx.pool, &lib).await;
+    // The show gets its tvshow.nfo after the scan; the scheduled refresh reads it.
+    std::fs::write(root.join("Hotel Series (2015)/tvshow.nfo"), B32_TVSHOW_NFO).unwrap();
+    let client = reqwest::Client::new();
+    for rel in ["Hotel Series (2015)", "Hotel Series (2015)/Season 01"] {
+        let id = item_at(&fx.pool, &lib, rel).await;
+        let item = rustyfin_db::repo_media::get_item_by_id(&fx.pool, id)
+            .await
+            .unwrap()
+            .unwrap();
+        rustyfin_core::metadata::refresh_item_metadata(&fx.pool, &client, &item, None, None, None)
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(
+        b32_shown(&fx.pool, &lib, "Hotel Series (2015)").await,
+        B32Shown::hotel_series()
+    );
+    assert_eq!(
+        b32_shown(&fx.pool, &lib, "Hotel Series (2015)/Season 01").await,
+        B32Shown::plain("Season 01", "season 0001", None)
+    );
+}
+
+#[tokio::test]
+async fn b32_rescans_settle_series_folders_and_tvshow_nfo() {
+    const EPISODE: &str = "Hotel Series (2015)/Season 01/Hotel Series S01E01.mkv";
+    const SCENE: &str = "Hotel Series (2015)/Hotel.Series.S03.1080p";
+    let fx = Fixture::new().await;
+    let lib = fx.library("tv", LibraryContentType::TvShows).await;
+    let root = root_of(&lib);
+    for rel in [
+        EPISODE,
+        "Hotel Series (2015)/Hotel.Series.S03.1080p/Hotel Series S03E01.mkv",
+        "One Night (2023)/Season 01/One Night S01E01.mkv",
+        "1923 (2022)/Season 01/1923 S01E01.mkv",
+        "Kilo/Season 01/Kilo S01E01.mkv",
+    ] {
+        touch(&root, rel);
+    }
+    std::fs::write(root.join("Hotel Series (2015)/tvshow.nfo"), B32_TVSHOW_NFO).unwrap();
+    // Kilo's seasons read movie.nfo before tvshow.nfo under the older rule, so they keep its plot.
+    std::fs::write(
+        root.join("Kilo/tvshow.nfo"),
+        "<tvshow><plot>Kilo.</plot></tvshow>",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("Kilo/movie.nfo"),
+        "<movie><plot>Kilo.</plot></movie>",
+    )
+    .unwrap();
+    scan(&fx.pool, &lib).await;
+    let hotel = item_at(&fx.pool, &lib, "Hotel Series (2015)").await;
+    let season = item_at(&fx.pool, &lib, "Hotel Series (2015)/Season 01").await;
+    let scene = item_at(&fx.pool, &lib, SCENE).await;
+    let one_night = item_at(&fx.pool, &lib, "One Night (2023)").await;
+    let nineteen = item_at(&fx.pool, &lib, "1923 (2022)").await;
+    let kilo_season = item_at(&fx.pool, &lib, "Kilo/Season 01").await;
+    let episode = item_at(&fx.pool, &lib, EPISODE).await;
+    // 3afba21 named a series after its folder, with no year, and gave the series' tvshow.nfo to its
+    // seasons instead. A season folder's name that looks like a file's took the show's title.
+    exec(
+        &fx.pool,
+        "UPDATE media_items SET name = 'Hotel Series (2015)', sort_name = 'hotel series (2015)',
+             production_year = NULL, overview = NULL, community_rating = NULL,
+             official_rating = NULL, genres = '', runtime_ticks = NULL
+         WHERE id = ?1",
+        &[&hotel.to_string()],
+    )
+    .await;
+    exec(
+        &fx.pool,
+        "UPDATE media_items SET name = 'One Night (2023)', sort_name = 'one night (2023)',
+             production_year = NULL
+         WHERE id = ?1",
+        &[&one_night.to_string()],
+    )
+    .await;
+    // A name that isn't the folder's stays.
+    exec(
+        &fx.pool,
+        "UPDATE media_items SET name = 'Nineteen Twenty-Three',
+             sort_name = 'nineteen twenty-three', production_year = NULL
+         WHERE id = ?1",
+        &[&nineteen.to_string()],
+    )
+    .await;
+    // An overview that isn't the show's stays.
+    exec(
+        &fx.pool,
+        "UPDATE media_items SET overview = 'Its own overview.', production_year = 2015,
+             community_rating = 7.5, official_rating = 'TV-14', genres = 'Drama|Comedy',
+             runtime_ticks = 27000000000
+         WHERE id = ?1",
+        &[&season.to_string()],
+    )
+    .await;
+    exec(
+        &fx.pool,
+        "UPDATE media_items SET name = 'Hotel Series', sort_name = 'hotel series',
+             overview = 'Synthetic test show.', production_year = 2015, community_rating = 7.5,
+             official_rating = 'TV-14', genres = 'Drama|Comedy', runtime_ticks = 27000000000
+         WHERE id = ?1",
+        &[&scene.to_string()],
+    )
+    .await;
+    let user = insert_user(&fx.pool).await;
+    let marks = at(600_000_000, Some(EARLY));
+    insert_marks(&fx.pool, &user, episode, &marks).await;
+    let favorite = Marks {
+        favorite: true,
+        ..Marks::default()
+    };
+    insert_marks(&fx.pool, &user, hotel, &favorite).await;
+    insert_marks(&fx.pool, &user, season, &favorite).await;
+
+    scan(&fx.pool, &lib).await;
+
+    let shown = |rel| b32_shown(&fx.pool, &lib, rel);
+    assert_eq!(shown("Hotel Series (2015)").await, B32Shown::hotel_series());
+    assert_eq!(
+        shown("One Night (2023)").await,
+        B32Shown::plain("One Night", "one night", Some(2023))
+    );
+    assert_eq!(
+        shown("1923 (2022)").await,
+        B32Shown::plain("Nineteen Twenty-Three", "nineteen twenty-three", Some(2022))
+    );
+    assert_eq!(
+        shown("Hotel Series (2015)/Season 01").await,
+        B32Shown {
+            overview: Some("Its own overview.".to_string()),
+            ..B32Shown::plain("Season 01", "season 0001", None)
+        }
+    );
+    assert_eq!(
+        shown(SCENE).await,
+        B32Shown::plain("Hotel.Series.S03.1080p", "season 0001", None)
+    );
+    assert_eq!(
+        shown("Kilo/Season 01").await.overview.as_deref(),
+        Some("Kilo.")
+    );
+    for (rel, id) in [
+        ("Hotel Series (2015)", hotel),
+        ("Hotel Series (2015)/Season 01", season),
+        (SCENE, scene),
+        ("One Night (2023)", one_night),
+        ("1923 (2022)", nineteen),
+        ("Kilo/Season 01", kilo_season),
+        (EPISODE, episode),
+    ] {
+        assert_eq!(item_at(&fx.pool, &lib, rel).await, id, "{rel}");
+    }
+    assert_eq!(marks_of(&fx.pool, &user, episode).await, Some(marks));
+    assert_eq!(
+        marks_of(&fx.pool, &user, hotel).await,
+        Some(favorite.clone())
+    );
+    assert_eq!(marks_of(&fx.pool, &user, season).await, Some(favorite));
+}
+
+/// (item path relative to the library root, image path, provider) of each image of the library, sorted.
+async fn b32_images(pool: &SqlitePool, lib: &Library) -> Vec<(String, String, String)> {
+    let root = root_of(lib);
+    let rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT m.path, i.path, i.provider FROM item_images AS i
+         JOIN media_items AS m ON m.id = i.item_id WHERE m.library_id = ?1",
+    )
+    .bind(lib.id.to_string())
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    let mut rows: Vec<_> = rows
+        .into_iter()
+        .map(|(item, image, provider)| (rel(&root, &item), image, provider))
+        .collect();
+    rows.sort();
+    rows
+}
+
+#[tokio::test]
+async fn b32_f4_rescans_clear_tvshow_nfo_from_loose_episodes_and_images() {
+    // Under 9d9cfb2's lookup, the metadata pass gave a series folder's tvshow.nfo to the seasons and to the
+    // episode files beside it that have no `.nfo` of their own, with the file's images under the provider `nfo`.
+    const POSTER: &str = "https://example.com/hotel-poster.jpg";
+    const OTHER: &str = "https://example.com/other.jpg";
+    const SERIES: &str = "Hotel Series (2015)";
+    const LOOSE: &str = "Hotel Series (2015)/Hotel.Series.S01E01.mkv";
+    const OWN_NFO: &str = "Hotel Series (2015)/Hotel Series S01E02.mkv";
+    const LOOSE_SEASON: &str = "Hotel Series (2015)/Season 1";
+    const SEASON_2: &str = "Hotel Series (2015)/Season 02";
+    const IN_SEASON: &str = "Hotel Series (2015)/Season 02/Hotel Series S02E01.mkv";
+    let fx = Fixture::new().await;
+    let lib = fx.library("tv", LibraryContentType::TvShows).await;
+    let root = root_of(&lib);
+    for rel in [LOOSE, OWN_NFO, IN_SEASON] {
+        touch(&root, rel);
+    }
+    let nfo = B32_TVSHOW_NFO.replace(
+        "</tvshow>",
+        &format!("<thumb aspect=\"poster\">{POSTER}</thumb></tvshow>"),
+    );
+    std::fs::write(root.join(SERIES).join("tvshow.nfo"), nfo).unwrap();
+    // Its own NFO came before tvshow.nfo under the older rule too.
+    std::fs::write(
+        root.join(SERIES).join("Hotel Series S01E02.nfo"),
+        "<episodedetails><plot>Synthetic test show.</plot></episodedetails>",
+    )
+    .unwrap();
+    scan(&fx.pool, &lib).await;
+    let shown = |rel| b32_shown(&fx.pool, &lib, rel);
+    let fresh_loose = shown(LOOSE).await;
+    let fresh_season = shown(LOOSE_SEASON).await;
+    let fresh_season_2 = shown(SEASON_2).await;
+    let loose = item_at(&fx.pool, &lib, LOOSE).await;
+    let ids: Vec<(&str, Uuid)> = {
+        let mut ids = Vec::new();
+        for rel in [SERIES, LOOSE, OWN_NFO, LOOSE_SEASON, SEASON_2, IN_SEASON] {
+            ids.push((rel, item_at(&fx.pool, &lib, rel).await));
+        }
+        ids
+    };
+    // 9d9cfb2's pass. A name that looks like a file's took the show's title.
+    exec(
+        &fx.pool,
+        "UPDATE media_items SET name = 'Hotel Series', sort_name = 'hotel series',
+             overview = 'Synthetic test show.', production_year = 2015, community_rating = 7.5,
+             official_rating = 'TV-14', genres = 'Drama|Comedy', runtime_ticks = 27000000000
+         WHERE id = ?1",
+        &[&loose.to_string()],
+    )
+    .await;
+    // So did the seasons. The other episodes didn't read the file: their values came from elsewhere, and stay.
+    for &(rel, id) in &ids[1..] {
+        if rel != SERIES && rel != LOOSE {
+            exec(
+                &fx.pool,
+                "UPDATE media_items SET overview = 'Synthetic test show.', community_rating = 7.5,
+                     genres = 'Drama|Comedy'
+                 WHERE id = ?1",
+                &[&id.to_string()],
+            )
+            .await;
+        }
+        exec(
+            &fx.pool,
+            "INSERT OR REPLACE INTO item_images (item_id, image_type, image_index, path, provider)
+             VALUES (?1, 'Primary', 0, ?2, 'nfo')",
+            &[&id.to_string(), POSTER],
+        )
+        .await;
+    }
+    // Images that aren't the show NFO's, or that came from another provider, stay.
+    exec(
+        &fx.pool,
+        "INSERT OR REPLACE INTO item_images (item_id, image_type, image_index, path, provider)
+         VALUES (?1, 'Backdrop', 0, ?2, 'nfo')",
+        &[&loose.to_string(), OTHER],
+    )
+    .await;
+    exec(
+        &fx.pool,
+        "INSERT OR REPLACE INTO item_images (item_id, image_type, image_index, path, provider)
+         VALUES (?1, 'Thumb', 0, ?2, 'tmdb')",
+        &[&loose.to_string(), POSTER],
+    )
+    .await;
+    exec(
+        &fx.pool,
+        "INSERT OR REPLACE INTO item_images (item_id, image_type, image_index, path, provider)
+         VALUES (?1, 'Primary', 0, ?2, 'nfo')",
+        &[&ids[0].1.to_string(), POSTER],
+    )
+    .await;
+    let user = insert_user(&fx.pool).await;
+    let marks = at(600_000_000, Some(EARLY));
+    insert_marks(&fx.pool, &user, loose, &marks).await;
+
+    scan(&fx.pool, &lib).await;
+
+    assert_eq!(shown(LOOSE).await, fresh_loose);
+    assert_eq!(shown(LOOSE_SEASON).await, fresh_season);
+    assert_eq!(shown(SEASON_2).await, fresh_season_2);
+    let kept = B32Shown {
+        overview: Some("Synthetic test show.".to_string()),
+        rating: Some(7.5),
+        genres: "Drama|Comedy".to_string(),
+        ..B32Shown::default()
+    };
+    for rel in [OWN_NFO, IN_SEASON] {
+        let got = shown(rel).await;
+        assert_eq!(
+            (got.overview, got.rating, got.genres),
+            (kept.overview.clone(), kept.rating, kept.genres.clone()),
+            "{rel}"
+        );
+    }
+    let image = |rel: &str, path: &str, provider: &str| {
+        (rel.to_string(), path.to_string(), provider.to_string())
+    };
+    assert_eq!(
+        b32_images(&fx.pool, &lib).await,
+        [
+            image(SERIES, POSTER, "nfo"),
+            image(OWN_NFO, POSTER, "nfo"),
+            image(LOOSE, POSTER, "tmdb"),
+            image(LOOSE, OTHER, "nfo"),
+            image(IN_SEASON, POSTER, "nfo"),
+        ]
+    );
+    for (rel, id) in ids {
+        assert_eq!(item_at(&fx.pool, &lib, rel).await, id, "{rel}");
+    }
+    assert_eq!(marks_of(&fx.pool, &user, loose).await, Some(marks));
+}
+
+// B33: multi-episode files keep their last episode
+
+/// (path, episode, last episode) of each episode of the library, sorted by path.
+async fn b33_episode_ends(
+    pool: &SqlitePool,
+    lib: &Library,
+) -> Vec<(String, Option<i64>, Option<i64>)> {
+    let root = root_of(lib);
+    let rows: Vec<(String, Option<i64>, Option<i64>)> = sqlx::query_as(
+        "SELECT path, index_number, index_number_end FROM media_items
+         WHERE library_id = ?1 AND media_type = 'Episode'",
+    )
+    .bind(lib.id.to_string())
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    let mut rows: Vec<_> = rows
+        .into_iter()
+        .map(|(path, number, end)| (rel(&root, &path), number, end))
+        .collect();
+    rows.sort();
+    rows
+}
+
+const B33_DOUBLE: &str = "Hotel Series/Season 01/Hotel Series - S01E03-E04 - Double Booking.mkv";
+const B33_SINGLE: &str = "Hotel Series/Season 01/Hotel Series - S01E05.mkv";
+
+#[tokio::test]
+async fn b33_multi_episode_files_store_their_last_episode() {
+    const SPECIAL: &str = "Mushi-Shi/Specials/Mushi-Shi - S00E02-03 - Path of Thorns.mkv";
+    let fx = Fixture::new().await;
+    let lib = fx.library("tv", LibraryContentType::TvShows).await;
+    for rel in [B33_DOUBLE, B33_SINGLE, SPECIAL] {
+        touch(&root_of(&lib), rel);
+    }
+
+    scan(&fx.pool, &lib).await;
+
+    assert_eq!(
+        b33_episode_ends(&fx.pool, &lib).await,
+        [
+            (B33_DOUBLE.to_string(), Some(3), Some(4)),
+            (B33_SINGLE.to_string(), Some(5), None),
+            (SPECIAL.to_string(), Some(2), Some(3)),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn b33_rescans_give_stored_episodes_their_last_episode() {
+    const RENAMED: &str = "Hotel Series/Season 01/Hotel Series - S01E05-E06.mkv";
+    let fx = Fixture::new().await;
+    let lib = fx.library("tv", LibraryContentType::TvShows).await;
+    let root = root_of(&lib);
+    touch(&root, B33_DOUBLE);
+    touch(&root, B33_SINGLE);
+    scan(&fx.pool, &lib).await;
+    let double = item_at(&fx.pool, &lib, B33_DOUBLE).await;
+    let single = item_at(&fx.pool, &lib, B33_SINGLE).await;
+    // 9d9cfb2 stored no end, so 070 leaves its episodes with none.
+    exec(
+        &fx.pool,
+        "UPDATE media_items SET index_number_end = NULL WHERE media_type = 'Episode'",
+        &[],
+    )
+    .await;
+    let user = insert_user(&fx.pool).await;
+    let marks = at(600_000_000, Some(EARLY));
+    insert_marks(&fx.pool, &user, double, &marks).await;
+    let favorite = Marks {
+        favorite: true,
+        ..Marks::default()
+    };
+    insert_marks(&fx.pool, &user, single, &favorite).await;
+    // The single episode's file is replaced by a double one.
+    std::fs::rename(root.join(B33_SINGLE), root.join(RENAMED)).unwrap();
+
+    scan(&fx.pool, &lib).await;
+
+    assert_eq!(
+        b33_episode_ends(&fx.pool, &lib).await,
+        [
+            (B33_DOUBLE.to_string(), Some(3), Some(4)),
+            (RENAMED.to_string(), Some(5), Some(6)),
+        ]
+    );
+    assert_eq!(item_at(&fx.pool, &lib, B33_DOUBLE).await, double);
+    assert_eq!(item_at(&fx.pool, &lib, RENAMED).await, single);
+    assert_eq!(marks_of(&fx.pool, &user, double).await, Some(marks));
+    assert_eq!(marks_of(&fx.pool, &user, single).await, Some(favorite));
+}
+
+// B32 (e): a season with no folder has no Path
+
+/// The LocationType and the Path that items give for the item at `rel`.
+async fn b32_location(
+    pool: &SqlitePool,
+    lib: &Library,
+    rel: &str,
+) -> (serde_json::Value, serde_json::Value) {
+    let id = item_at(pool, lib, rel).await;
+    let item = rustyfin_db::repo_media::get_item_by_id(pool, id)
+        .await
+        .unwrap()
+        .expect("the item is stored");
+    let json = serde_json::to_value(&item).unwrap();
+    (json["LocationType"].clone(), json["Path"].clone())
+}
+
+/// What items give for a season with a folder at `rel`.
+fn b32_folder(lib: &Library, rel: &str) -> (serde_json::Value, serde_json::Value) {
+    let folder = root_of(lib).join(rel);
+    (
+        serde_json::json!("FileSystem"),
+        serde_json::json!(folder.to_str().unwrap()),
+    )
+}
+
+/// What items give for a season with no folder.
+fn b32_virtual() -> (serde_json::Value, serde_json::Value) {
+    (serde_json::json!("Virtual"), serde_json::Value::Null)
+}
+
+const B32_LOOSE: &str = "Lima Series/Lima Series - S01E01.mkv";
+/// The path that the season of `B32_LOOSE` is stored and found by, though it has no folder.
+const B32_LOOSE_SEASON: &str = "Lima Series/Season 1";
+
+#[tokio::test]
+async fn b32_seasons_with_no_folder_have_no_path() {
+    // A loose file of a season that has a folder joins that season, as Dekalog's does.
+    const IN_FOLDER: &str = "Mike Series/Season 1/Mike Series - S01E01.mkv";
+    const JOINS: &str = "Mike Series/Mike Series - S01E02.mkv";
+    let fx = Fixture::new().await;
+    let lib = fx.library("tv", LibraryContentType::TvShows).await;
+    for rel in [B32_LOOSE, JOINS, IN_FOLDER] {
+        touch(&root_of(&lib), rel);
+    }
+
+    scan(&fx.pool, &lib).await;
+
+    assert_eq!(
+        b32_location(&fx.pool, &lib, B32_LOOSE_SEASON).await,
+        b32_virtual()
+    );
+    assert_eq!(
+        b32_location(&fx.pool, &lib, "Mike Series/Season 1").await,
+        b32_folder(&lib, "Mike Series/Season 1")
+    );
+    let seasons: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_items WHERE library_id = ?1 AND media_type = 'Season'",
+    )
+    .bind(lib.id.to_string())
+    .fetch_one(&fx.pool)
+    .await
+    .unwrap();
+    assert_eq!(seasons, 2);
+}
+
+#[tokio::test]
+async fn b32_rescans_settle_whether_a_season_has_a_folder() {
+    const MOVED: &str = "Lima Series/Season 1/Lima Series - S01E01.mkv";
+    let fx = Fixture::new().await;
+    let lib = fx.library("tv", LibraryContentType::TvShows).await;
+    let root = root_of(&lib);
+    touch(&root, B32_LOOSE);
+    scan(&fx.pool, &lib).await;
+    let season = item_at(&fx.pool, &lib, B32_LOOSE_SEASON).await;
+    let episode = item_at(&fx.pool, &lib, B32_LOOSE).await;
+    // 9d9cfb2 gave each season the made-up path, so 070 leaves its seasons FileSystem.
+    exec(
+        &fx.pool,
+        "UPDATE media_items SET location_type = 'FileSystem'",
+        &[],
+    )
+    .await;
+    let user = insert_user(&fx.pool).await;
+    let favorite = Marks {
+        favorite: true,
+        ..Marks::default()
+    };
+    insert_marks(&fx.pool, &user, season, &favorite).await;
+
+    scan(&fx.pool, &lib).await;
+
+    assert_eq!(
+        b32_location(&fx.pool, &lib, B32_LOOSE_SEASON).await,
+        b32_virtual()
+    );
+    assert_eq!(item_at(&fx.pool, &lib, B32_LOOSE_SEASON).await, season);
+    assert_eq!(
+        marks_of(&fx.pool, &user, season).await,
+        Some(favorite.clone())
+    );
+
+    // The episode moves into a folder for its season.
+    std::fs::create_dir(root.join(B32_LOOSE_SEASON)).unwrap();
+    std::fs::rename(root.join(B32_LOOSE), root.join(MOVED)).unwrap();
+
+    scan(&fx.pool, &lib).await;
+
+    assert_eq!(
+        b32_location(&fx.pool, &lib, B32_LOOSE_SEASON).await,
+        b32_folder(&lib, B32_LOOSE_SEASON)
+    );
+    assert_eq!(item_at(&fx.pool, &lib, B32_LOOSE_SEASON).await, season);
+    assert_eq!(item_at(&fx.pool, &lib, MOVED).await, episode);
+    assert_eq!(marks_of(&fx.pool, &user, season).await, Some(favorite));
+}

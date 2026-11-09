@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use uuid::Uuid;
 
 use rustyfin_model::library::{Library, LibraryContentType};
-use rustyfin_model::media::{MediaItem, MediaType};
+use rustyfin_model::media::{LocationType, MediaItem, MediaType};
 use rustyfin_model::user::User;
 
 /// Create a temporary file-based SQLite database for proper test isolation.
@@ -2338,4 +2338,257 @@ async fn b20_password_writes_end_the_code() {
         code_hash(&pool, carol.id).await.unwrap().as_deref(),
         Some("hash")
     );
+}
+
+/// An episode of `season` with the numbers `index` to `end`.
+fn b33_episode(library_id: Uuid, season: Uuid, index: i32, end: Option<i32>) -> MediaItem {
+    MediaItem {
+        id: Uuid::new_v4(),
+        name: format!("Hotel Series - S01E{index:02}"),
+        media_type: MediaType::Episode,
+        path: format!("/media/tv/Hotel Series/Season 01/S01E{index:02}.mkv"),
+        parent_id: Some(season),
+        library_id,
+        index_number: Some(index),
+        parent_index_number: Some(1),
+        index_number_end: end,
+        ..MediaItem::default_dto_fields()
+    }
+}
+
+#[tokio::test]
+async fn b33_both_upserts_and_the_item_reads_keep_the_last_episode() {
+    let temp_db = test_pool().await;
+    let pool = temp_db.pool.clone();
+    let lib = make_library("TV", LibraryContentType::TvShows);
+    rustyfin_db::repo_library::create_library(&pool, &lib)
+        .await
+        .unwrap();
+    let series = MediaItem {
+        id: Uuid::new_v4(),
+        name: "Hotel Series".to_string(),
+        media_type: MediaType::Series,
+        path: "/media/tv/Hotel Series".to_string(),
+        library_id: lib.id,
+        ..MediaItem::default_dto_fields()
+    };
+    let season = MediaItem {
+        id: Uuid::new_v4(),
+        name: "Season 01".to_string(),
+        media_type: MediaType::Season,
+        path: "/media/tv/Hotel Series/Season 01".to_string(),
+        parent_id: Some(series.id),
+        library_id: lib.id,
+        index_number: Some(1),
+        ..MediaItem::default_dto_fields()
+    };
+    for folder in [&series, &season] {
+        rustyfin_db::repo_media::upsert_media_item(&pool, folder)
+            .await
+            .unwrap();
+    }
+    let double = b33_episode(lib.id, season.id, 3, Some(4));
+    rustyfin_db::repo_media::upsert_media_item(&pool, &double)
+        .await
+        .unwrap();
+    let batch = [
+        b33_episode(lib.id, season.id, 5, Some(6)),
+        b33_episode(lib.id, season.id, 7, None),
+    ];
+    rustyfin_db::repo_media::batch_upsert_media_items(&pool, &batch)
+        .await
+        .unwrap();
+
+    let expected = [(3, Some(4)), (5, Some(6)), (7, None)];
+    for (item, want) in [&double, &batch[0], &batch[1]].into_iter().zip(expected) {
+        let stored = rustyfin_db::repo_media::get_item_by_id(&pool, item.id)
+            .await
+            .unwrap()
+            .expect("the episode is stored");
+        assert_eq!(
+            (stored.index_number.unwrap(), stored.index_number_end),
+            want
+        );
+    }
+    let children = rustyfin_db::repo_media::get_children(&pool, season.id)
+        .await
+        .unwrap();
+    let episodes = rustyfin_db::repo_media::get_episodes_for_series(&pool, series.id, Some(1))
+        .await
+        .unwrap();
+    for read in [children, episodes] {
+        let mut ends: Vec<_> = read
+            .iter()
+            .map(|episode| (episode.index_number.unwrap(), episode.index_number_end))
+            .collect();
+        ends.sort();
+        assert_eq!(ends, expected);
+    }
+}
+
+/// Season `index` of `series`, with `location_type`: Virtual for one made for loose files.
+fn b32_season(series: &MediaItem, index: i32, location_type: LocationType) -> MediaItem {
+    MediaItem {
+        id: Uuid::new_v4(),
+        name: format!("Season {index}"),
+        media_type: MediaType::Season,
+        path: format!("{}/Season {index}", series.path),
+        parent_id: Some(series.id),
+        library_id: series.library_id,
+        index_number: Some(index),
+        tmdb_id: Some(4000 + i64::from(index)),
+        location_type,
+        ..MediaItem::default_dto_fields()
+    }
+}
+
+#[tokio::test]
+async fn b32_both_upserts_and_the_item_reads_keep_a_season_virtual() {
+    let temp_db = test_pool().await;
+    let pool = temp_db.pool.clone();
+    let lib = make_library("TV", LibraryContentType::TvShows);
+    rustyfin_db::repo_library::create_library(&pool, &lib)
+        .await
+        .unwrap();
+    let series = MediaItem {
+        id: Uuid::new_v4(),
+        name: "One Night".to_string(),
+        media_type: MediaType::Series,
+        path: "/media/tv/One Night (2023)".to_string(),
+        library_id: lib.id,
+        ..MediaItem::default_dto_fields()
+    };
+    rustyfin_db::repo_media::upsert_media_item(&pool, &series)
+        .await
+        .unwrap();
+    let one = b32_season(&series, 1, LocationType::Virtual);
+    rustyfin_db::repo_media::upsert_media_item(&pool, &one)
+        .await
+        .unwrap();
+    let batch = [
+        b32_season(&series, 2, LocationType::Virtual),
+        b32_season(&series, 3, LocationType::FileSystem),
+    ];
+    rustyfin_db::repo_media::batch_upsert_media_items(&pool, &batch)
+        .await
+        .unwrap();
+
+    // The TMDB id is bound beside the location type, so a misplaced bind would show in it.
+    let expected = [
+        (1, Some(4001), LocationType::Virtual),
+        (2, Some(4002), LocationType::Virtual),
+        (3, Some(4003), LocationType::FileSystem),
+    ];
+    for (season, want) in [&one, &batch[0], &batch[1]].into_iter().zip(expected) {
+        let stored = rustyfin_db::repo_media::get_item_by_id(&pool, season.id)
+            .await
+            .unwrap()
+            .expect("the season is stored");
+        assert_eq!(
+            (
+                stored.index_number.unwrap(),
+                stored.tmdb_id,
+                stored.location_type
+            ),
+            want
+        );
+    }
+    let mut seasons: Vec<_> = rustyfin_db::repo_media::get_children(&pool, series.id)
+        .await
+        .unwrap()
+        .iter()
+        .map(|season| {
+            (
+                season.index_number.unwrap(),
+                season.tmdb_id,
+                season.location_type,
+            )
+        })
+        .collect();
+    seasons.sort_by_key(|season| season.0);
+    assert_eq!(seasons, expected);
+}
+
+#[tokio::test]
+async fn b32_f9_both_upserts_update_the_last_episode_and_the_location_type() {
+    // B31 made both upserts ON CONFLICT(id) DO UPDATE, so each SET list must name both columns.
+    let temp_db = test_pool().await;
+    let pool = temp_db.pool.clone();
+    let lib = make_library("TV", LibraryContentType::TvShows);
+    rustyfin_db::repo_library::create_library(&pool, &lib)
+        .await
+        .unwrap();
+    let series = MediaItem {
+        id: Uuid::new_v4(),
+        name: "Hotel Series".to_string(),
+        media_type: MediaType::Series,
+        path: "/media/tv/Hotel Series".to_string(),
+        library_id: lib.id,
+        ..MediaItem::default_dto_fields()
+    };
+    rustyfin_db::repo_media::upsert_media_item(&pool, &series)
+        .await
+        .unwrap();
+    let single = b32_season(&series, 1, LocationType::Virtual);
+    let batched = b32_season(&series, 2, LocationType::Virtual);
+    let single_episode = b33_episode(lib.id, single.id, 3, Some(4));
+    let batched_episode = b33_episode(lib.id, batched.id, 5, Some(6));
+    for item in [&single, &single_episode] {
+        rustyfin_db::repo_media::upsert_media_item(&pool, item)
+            .await
+            .unwrap();
+    }
+    rustyfin_db::repo_media::batch_upsert_media_items(
+        &pool,
+        &[batched.clone(), batched_episode.clone()],
+    )
+    .await
+    .unwrap();
+
+    // Each one again, with new values.
+    let single = MediaItem {
+        location_type: LocationType::FileSystem,
+        ..single
+    };
+    let batched = MediaItem {
+        location_type: LocationType::FileSystem,
+        ..batched
+    };
+    let single_episode = MediaItem {
+        index_number_end: None,
+        ..single_episode
+    };
+    let batched_episode = MediaItem {
+        index_number_end: Some(7),
+        ..batched_episode
+    };
+    for item in [&single, &single_episode] {
+        rustyfin_db::repo_media::upsert_media_item(&pool, item)
+            .await
+            .unwrap();
+    }
+    rustyfin_db::repo_media::batch_upsert_media_items(
+        &pool,
+        &[batched.clone(), batched_episode.clone()],
+    )
+    .await
+    .unwrap();
+
+    for (item, want) in [
+        (&single, (None, LocationType::FileSystem)),
+        (&batched, (None, LocationType::FileSystem)),
+        (&single_episode, (None, LocationType::FileSystem)),
+        (&batched_episode, (Some(7), LocationType::FileSystem)),
+    ] {
+        let stored = rustyfin_db::repo_media::get_item_by_id(&pool, item.id)
+            .await
+            .unwrap()
+            .expect("the item is stored");
+        assert_eq!(
+            (stored.index_number_end, stored.location_type),
+            want,
+            "{}",
+            item.name
+        );
+    }
 }
