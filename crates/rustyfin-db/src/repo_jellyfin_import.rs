@@ -125,18 +125,6 @@ type TargetRow = (
     Option<i64>,    // tvdb_id
 );
 
-/// Rustyfin's users as (id, name).
-pub async fn user_names(pool: &SqlitePool) -> Result<Vec<(Uuid, String)>, sqlx::Error> {
-    let rows = sqlx::query_as::<_, (String, String)>("SELECT id, name FROM users")
-        .fetch_all(pool)
-        .await?;
-    let mut users = Vec::with_capacity(rows.len());
-    for (id, name) in rows {
-        users.push((parse_id(&id)?, name));
-    }
-    Ok(users)
-}
-
 /// The Rustyfin items a Jellyfin item can match: movies, series, seasons, episodes and music.
 pub async fn import_targets(pool: &SqlitePool) -> Result<Vec<ImportTarget>, sqlx::Error> {
     let rows = sqlx::query_as::<_, TargetRow>(

@@ -25781,6 +25781,123 @@ async fn b20_import_creates_unmatched_users_as_before() {
     }
 }
 
+// B36: import polish
+
+/// The facts a report gives about `name`'s suggested account: (UserId, IsAdministrator,
+/// LastLoginDate is set, SetupCodePending, OtherCaseNames), after checking that `CreatedAt` is an
+/// RFC 3339 time between `since` and now.
+fn b36_facts(
+    report: &serde_json::Value,
+    name: &str,
+    since: chrono::DateTime<chrono::Utc>,
+) -> (uuid::Uuid, bool, bool, bool, Vec<String>) {
+    let users = report["Users"].as_array().expect("Users");
+    let user = users.iter().find(|u| u["Name"] == name).expect(name);
+    let s = &user["SuggestedMatch"];
+    let created = s["CreatedAt"]
+        .as_str()
+        .unwrap_or_else(|| panic!("CreatedAt: {s}"));
+    let created =
+        chrono::DateTime::parse_from_rfc3339(created).unwrap_or_else(|e| panic!("{e}: {s}"));
+    let window = chrono::Duration::seconds(2);
+    assert!(
+        created >= since - window && created <= chrono::Utc::now() + window,
+        "{s}"
+    );
+    let last_login = &s["LastLoginDate"];
+    if let Some(at) = last_login.as_str() {
+        chrono::DateTime::parse_from_rfc3339(at).unwrap_or_else(|e| panic!("{e}: {s}"));
+    } else {
+        assert!(last_login.is_null(), "LastLoginDate: {s}");
+    }
+    let others = s["OtherCaseNames"]
+        .as_array()
+        .unwrap_or_else(|| panic!("OtherCaseNames: {s}"));
+    (
+        uuid::Uuid::parse_str(s["UserId"].as_str().unwrap()).unwrap(),
+        s["IsAdministrator"]
+            .as_bool()
+            .unwrap_or_else(|| panic!("IsAdministrator: {s}")),
+        last_login.is_string(),
+        s["SetupCodePending"]
+            .as_bool()
+            .unwrap_or_else(|| panic!("SetupCodePending: {s}")),
+        others
+            .iter()
+            .map(|n| n.as_str().unwrap().to_string())
+            .collect(),
+    )
+}
+
+/// C1: an exact-case suggestion names the other accounts that differ from it only in case, and
+/// carries facts its holder can't choose: administrator or not, creation and last sign-in. Here a
+/// non-admin renamed itself `bob` to take the Jellyfin user bob's suggestion from the admin `Bob`.
+#[tokio::test]
+async fn b36_import_flags_case_variant_accounts() {
+    let since = chrono::Utc::now();
+    let w = b20_world().await;
+    let mallory = add_user(&w.state, "mallory", "mallorypass", false).await;
+    let (token, _) = login(&w.app, "mallory", "mallorypass").await.unwrap();
+    let rename = serde_json::json!({ "Name": "bob" }).to_string();
+    let uri = format!("/Users/{mallory}");
+    let (status, answer) = send_authed(&w.app, "PUT", &uri, &token, Some(&rename)).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    let big_bob = add_user(&w.state, "Bob", "bobpass", true).await;
+    let shouting = b20_plain_user(&w.state, "BOB").await;
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+    let body = serde_json::json!({ "SourcePath": install });
+
+    let preview = b20_preview(&w, body.clone()).await;
+    let others = vec!["BOB".to_string(), "Bob".to_string()];
+    assert_eq!(
+        b36_facts(&preview, "bob", since),
+        (mallory, false, true, false, others)
+    );
+    let alice = b36_facts(&preview, "Alice", since);
+    assert_eq!(alice, (w.alice, false, false, false, vec![]), "{preview}");
+
+    let db = &w.state.db;
+    let renamed = rustyfin_db::repo_user::rename_user_unless_taken(db, mallory, "mallory").await;
+    assert_eq!(renamed.unwrap(), rustyfin_db::repo_user::Renamed::Done);
+    let renamed = rustyfin_db::repo_user::rename_user_unless_taken(db, shouting, "robert").await;
+    assert_eq!(renamed.unwrap(), rustyfin_db::repo_user::Renamed::Done);
+    let preview = b20_preview(&w, body).await;
+    assert_eq!(
+        b36_facts(&preview, "bob", since),
+        (big_bob, true, false, false, vec![])
+    );
+}
+
+/// C1: an account an earlier run created is marked while its setup code is unused; once a password
+/// is set the code row is gone and nothing records the import any more (spec, "created by an
+/// import").
+#[tokio::test]
+async fn b36_import_marks_accounts_an_earlier_run_created() {
+    let since = chrono::Utc::now();
+    let w = b20_world().await;
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+    let body = serde_json::json!({ "SourcePath": install });
+    let report = b20_run(&w, body.clone()).await;
+    let created = b20_entry(&report, "bob").user_id.expect("bob is created");
+
+    let preview = b20_preview(&w, body.clone()).await;
+    assert_eq!(
+        b36_facts(&preview, "bob", since),
+        (created, false, false, true, vec![])
+    );
+    let alice = b36_facts(&preview, "Alice", since);
+    assert_eq!(alice, (w.alice, false, false, false, vec![]), "{preview}");
+
+    rustyfin_db::repo_user::update_password(&w.state.db, created, "set")
+        .await
+        .unwrap();
+    let preview = b20_preview(&w, body).await;
+    assert_eq!(
+        b36_facts(&preview, "bob", since),
+        (created, false, false, false, vec![])
+    );
+}
+
 // B20 2c: watch data and track choices.
 
 /// A `user_item_data` row as the B20 import tests read and write it.

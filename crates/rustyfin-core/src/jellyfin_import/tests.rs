@@ -1,10 +1,12 @@
 //! B20: unit tests for the Jellyfin importer's pure parts (written with the spec, before the code).
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, TimeZone, Utc};
 use rustyfin_db::repo_jellyfin_import::{SourceStreams, StreamRow, UserDataRow};
 use rustyfin_model::image::ImageType;
+use rustyfin_model::user::User;
 use uuid::Uuid;
 
 use super::images::{resolve, signature};
@@ -22,7 +24,7 @@ use super::source::{
 use super::tracks::{choose_source, map_track, normalize_codec};
 use super::{
     ConfirmedMatch, ImportError, ImportReport, ItemReport, Layout, LayoutChoice, SkipReason,
-    TrackReport, UserAction, UserRow, WatchDataReport,
+    TrackReport, UserAction, UserRow, WatchDataReport, fill_suggested_facts,
 };
 
 /// A temp folder removed when the test ends.
@@ -361,6 +363,135 @@ fn b20_plan_users_needs_confirmed_matches() {
     ];
     assert_eq!(got, expected);
     assert!(rows.iter().all(|row| row.user_id.is_none()));
+}
+
+// B36: import polish
+
+/// Jellyfin users with these names, ids 100, 101, ...
+fn b36_jf_users(names: &[&str]) -> Vec<JfUser> {
+    (0..)
+        .zip(names)
+        .map(|(n, name)| JfUser {
+            id: Uuid::from_u128(100 + n as u128),
+            name: name.to_string(),
+            internal_id: n,
+            is_admin: false,
+        })
+        .collect()
+}
+
+// F3: the warning flags every name that sign-in treats as the same (`names_match`: full case
+// folding, composed or decomposed accents, compatibility forms), not only `to_lowercase` variants.
+// Which account is suggested doesn't change: each Jellyfin name has an exact-case match.
+#[test]
+fn b36_case_variant_names_fold_like_sign_in() {
+    let [
+        strauss,
+        strauss_upper,
+        jose_nfc,
+        jose_nfd,
+        bob,
+        bob_wide,
+        odos,
+        odos_lower,
+        strausz,
+    ] = [1, 2, 3, 4, 5, 6, 7, 8, 9].map(Uuid::from_u128);
+    let rustyfin = vec![
+        (strauss, "Strauß".to_string()),
+        (strauss_upper, "STRAUSS".to_string()),
+        (jose_nfc, "Jos\u{e9}".to_string()),
+        (jose_nfd, "Jose\u{301}".to_string()),
+        (bob, "bob".to_string()),
+        (bob_wide, "\u{ff42}\u{ff4f}\u{ff42}".to_string()),
+        (odos, "ΟΔΟΣ".to_string()),
+        (odos_lower, "οδοσ".to_string()),
+        (strausz, "Strausz".to_string()),
+    ];
+    let jf_users = b36_jf_users(&["Strauß", "STRAUSS", "Jose\u{301}", "bob", "ΟΔΟΣ"]);
+    let rows = plan_users(&jf_users, None, &[], &rustyfin);
+    let got: Vec<_> = rows
+        .iter()
+        .map(|row| {
+            let suggested = row.suggested_match.as_ref().expect("an exact-case match");
+            (
+                row.name.as_str(),
+                suggested.user_id,
+                suggested.other_case_names.clone(),
+            )
+        })
+        .collect();
+    let names = |names: &[&str]| {
+        names
+            .iter()
+            .map(|name| name.to_string())
+            .collect::<Vec<_>>()
+    };
+    let expected = [
+        ("bob", bob, names(&["\u{ff42}\u{ff4f}\u{ff42}"])),
+        ("Jose\u{301}", jose_nfd, names(&["Jos\u{e9}"])),
+        ("STRAUSS", strauss_upper, names(&["Strauß"])),
+        ("Strauß", strauss, names(&["STRAUSS"])),
+        ("ΟΔΟΣ", odos, names(&["οδοσ"])),
+    ];
+    assert_eq!(got, expected);
+}
+
+// F4: the facts come from the users the plan read, once. A suggestion whose account isn't among
+// them is dropped, never sent with placeholder facts.
+#[test]
+fn b36_suggested_facts_come_from_the_planning_read() {
+    let [kept, gone, plain] = [1, 2, 3].map(Uuid::from_u128);
+    let created = Utc.with_ymd_and_hms(2026, 3, 4, 5, 6, 7).unwrap();
+    let login = Utc.with_ymd_and_hms(2026, 5, 6, 7, 8, 9).unwrap();
+    let account = |id, name: &str, is_administrator, last_login_date| User {
+        id,
+        name: name.to_string(),
+        password_hash: String::new(),
+        is_administrator,
+        created_at: created,
+        last_login_date,
+        configuration: serde_json::Value::Null,
+    };
+    let rustyfin = vec![
+        (kept, "kept".to_string()),
+        (gone, "gone".to_string()),
+        (plain, "plain".to_string()),
+    ];
+    let mut rows = plan_users(
+        &b36_jf_users(&["kept", "gone", "plain"]),
+        None,
+        &[],
+        &rustyfin,
+    );
+    assert!(rows.iter().all(|row| row.suggested_match.is_some()));
+
+    let accounts = [
+        account(kept, "kept", true, Some(login)),
+        account(plain, "plain", false, None),
+    ];
+    let pending = HashSet::from([kept, gone]);
+    fill_suggested_facts(&accounts, &pending, &mut rows);
+    let got: Vec<_> = rows
+        .iter()
+        .map(|row| {
+            let facts = row.suggested_match.as_ref().map(|s| {
+                (
+                    s.user_id,
+                    s.is_administrator,
+                    s.created_at,
+                    s.last_login_date,
+                    s.setup_code_pending,
+                )
+            });
+            (row.name.as_str(), facts)
+        })
+        .collect();
+    let expected = [
+        ("gone", None),
+        ("kept", Some((kept, true, created, Some(login), true))),
+        ("plain", Some((plain, false, created, None, false))),
+    ];
+    assert_eq!(got, expected);
 }
 
 // ── 2b: the import job (spec 2.19, 2.21, 2.25) ──
