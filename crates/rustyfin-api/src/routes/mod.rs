@@ -43,7 +43,6 @@ use crate::state::AppState;
 pub fn build_router(state: AppState) -> Router {
     let public = Router::new()
         .merge(system::public_routes())
-        .merge(auth::routes())
         .merge(users::public_routes())
         .merge(quick_connect::public_routes())
         .merge(dlna::routes())
@@ -87,11 +86,15 @@ pub fn build_router(state: AppState) -> Router {
         .merge(sync_play::routes())
         .layer(axum_mw::from_fn_with_state(state.clone(), require_auth));
 
+    // Rate limit only the endpoints that check a password or PIN. route_layer applies the
+    // limiter to matched routes only, so every other route is unlimited.
+    let login = Router::new()
+        .merge(auth::routes())
+        .merge(users::login_routes())
+        .route_layer(axum_mw::from_fn_with_state(state.clone(), rate_limit));
+
     #[allow(unused_mut)]
-    let mut router = Router::new()
-        .merge(public)
-        .merge(protected)
-        .layer(axum_mw::from_fn_with_state(state.clone(), rate_limit));
+    let mut router = Router::new().merge(public).merge(protected).merge(login);
 
     // Optionally serve the static web client (enabled via "webclient" feature)
     #[cfg(feature = "webclient")]

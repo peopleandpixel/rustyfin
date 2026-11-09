@@ -416,6 +416,237 @@ async fn test_rate_limiter_loopback_bypass() {
     }
 }
 
+/// Router whose requests come from a non-loopback peer, so the rate limiter applies to them.
+fn remote_app(state: AppState) -> axum::Router {
+    build_router(state).layer(MockConnectInfo(SocketAddr::from(([192, 0, 2, 10], 40000))))
+}
+
+/// A valid 2x2 RGB PNG.
+const TINY_PNG: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02, 0x08, 0x02, 0x00, 0x00, 0x00, 0xfd, 0xd4, 0x9a,
+    0x73, 0x00, 0x00, 0x00, 0x10, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0x38, 0x61, 0x64, 0x04,
+    0x44, 0x0c, 0x10, 0x0a, 0x00, 0x23, 0x36, 0x04, 0xb1, 0xae, 0x7d, 0xb9, 0xbc, 0x00, 0x00, 0x00,
+    0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+];
+
+#[tokio::test]
+async fn test_remote_browsing_burst_is_not_rate_limited() {
+    let mut state = test_state().await;
+    // The shipped default budget: RUSTYFIN_RATE_LIMIT=500 per RUSTYFIN_RATE_WINDOW=60 s
+    state.rate_limiter = RateLimiter::new(500, 60);
+
+    let username = format!("admin_{}", uuid::Uuid::new_v4().simple());
+    rustyfin_auth::create_initial_user(&state.db, &username, "admin")
+        .await
+        .unwrap();
+    let user = rustyfin_db::repo_user::get_user_by_name(&state.db, &username)
+        .await
+        .unwrap()
+        .unwrap();
+    let token = rustyfin_auth::create_token(&user, "test-secret").unwrap();
+
+    let media_dir = state.data_dir.join("movies");
+    std::fs::create_dir_all(&media_dir).unwrap();
+    let poster = media_dir.join("Burst Movie-poster.png");
+    std::fs::write(&poster, TINY_PNG).unwrap();
+
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: "Burst Movies".to_string(),
+        content_type: rustyfin_model::library::LibraryContentType::Movies,
+        paths: vec![media_dir.to_string_lossy().to_string()],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+
+    let item_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO media_items (id, library_id, name, media_type, path) VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(item_id.to_string())
+    .bind(lib.id.to_string())
+    .bind("Burst Movie")
+    .bind("Movie")
+    .bind(
+        media_dir
+            .join("Burst Movie.mkv")
+            .to_string_lossy()
+            .to_string(),
+    )
+    .execute(&state.db)
+    .await
+    .unwrap();
+
+    let img = rustyfin_model::image::ItemImage {
+        item_id,
+        image_type: rustyfin_model::image::ImageType::Primary,
+        image_index: 0,
+        path: poster.to_string_lossy().to_string(),
+        provider: "local".to_string(),
+        width: None,
+        height: None,
+        blurhash: None,
+    };
+    rustyfin_db::repo_image::upsert_image(&state.db, &img)
+        .await
+        .unwrap();
+
+    let app = remote_app(state);
+
+    // A grid page is one listing plus a thumbnail per card; mix in the other calls a
+    // browsing, searching and playing client makes. 600 requests is above the budget.
+    for i in 1..=600 {
+        let (method, uri, body, must_be_ok) = match i % 10 {
+            0 => (
+                "GET",
+                "/Items?IncludeItemTypes=Movie&Recursive=true&SortBy=SortName&StartIndex=0&Limit=50"
+                    .to_string(),
+                String::new(),
+                true,
+            ),
+            1 => ("GET", format!("/Items/{item_id}"), String::new(), false),
+            2 => (
+                "GET",
+                "/Search/Hints?searchTerm=burst".to_string(),
+                String::new(),
+                false,
+            ),
+            3 => ("GET", "/UserViews".to_string(), String::new(), false),
+            4 => (
+                "POST",
+                "/Sessions/Playing/Progress".to_string(),
+                format!(r#"{{"ItemId":"{item_id}","PositionTicks":10000000}}"#),
+                false,
+            ),
+            _ => (
+                "GET",
+                format!("/Items/{item_id}/Images/Primary?maxWidth=150&format=webp"),
+                String::new(),
+                true,
+            ),
+        };
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(&uri)
+                    .header("Authorization", format!("Bearer {token}"))
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let status = resp.status();
+        assert_ne!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "request #{i} {method} {uri} was rate limited"
+        );
+        if must_be_ok {
+            assert_eq!(status, StatusCode::OK, "request #{i} {method} {uri}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_public_non_login_endpoints_are_not_rate_limited() {
+    let mut state = test_state().await;
+    state.rate_limiter = RateLimiter::new(3, 60);
+    let app = remote_app(state);
+
+    for uri in [
+        "/System/Info/Public",
+        "/QuickConnect/Enabled",
+        "/Users/Public",
+    ] {
+        for attempt in 1..=10 {
+            let resp = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{uri} attempt {attempt}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_failed_logins_from_remote_client_are_rate_limited() {
+    let mut state = test_state().await;
+    state.rate_limiter = RateLimiter::new(3, 60);
+    let username = format!("admin_{}", uuid::Uuid::new_v4().simple());
+    rustyfin_auth::create_initial_user(&state.db, &username, "admin")
+        .await
+        .unwrap();
+    let app = remote_app(state);
+
+    let wrong_login = || {
+        Request::builder()
+            .method("POST")
+            .uri("/Users/AuthenticateByName")
+            .header("Content-Type", "application/json")
+            .body(Body::from(format!(
+                r#"{{"Username":"{}","Pw":"wrong"}}"#,
+                username
+            )))
+            .unwrap()
+    };
+
+    for attempt in 1..=3 {
+        let resp = app.clone().oneshot(wrong_login()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "attempt {attempt}");
+    }
+    let resp = app.clone().oneshot(wrong_login()).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn test_password_reset_endpoints_share_the_login_rate_limit() {
+    let mut state = test_state().await;
+    state.rate_limiter = RateLimiter::new(3, 60);
+    let app = remote_app(state);
+
+    let post = |uri: &str, body: &str| {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("Content-Type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    let login = || {
+        post(
+            "/Users/AuthenticateByName",
+            r#"{"Username":"nobody","Pw":"x"}"#,
+        )
+    };
+    let forgot = || post("/Users/ForgotPassword", r#"{"EnteredUsername":"nobody"}"#);
+    let reset = || {
+        post(
+            "/Users/ResetPassword",
+            r#"{"Pin":"123456","Username":"nobody","TempPassword":"x"}"#,
+        )
+    };
+
+    let resp = app.clone().oneshot(login()).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let resp = app.clone().oneshot(forgot()).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let resp = app.clone().oneshot(reset()).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // The three endpoints draw on one budget per client
+    for (name, req) in [("login", login()), ("forgot", forgot()), ("reset", reset())] {
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS, "{name}");
+    }
+}
+
 // ── Image Route Tests ──
 
 #[tokio::test]

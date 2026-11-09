@@ -15,8 +15,12 @@ use crate::error::ApiError;
 use crate::state::AppState;
 
 pub fn public_routes() -> Router<AppState> {
+    Router::new().route("/Users/Public", get(get_public_users))
+}
+
+/// Endpoints that check a password or reset PIN. Only these are rate limited.
+pub fn login_routes() -> Router<AppState> {
     Router::new()
-        .route("/Users/Public", get(get_public_users))
         .route("/Users/ForgotPassword", post(forgot_password))
         .route("/Users/ResetPassword", post(reset_password))
 }

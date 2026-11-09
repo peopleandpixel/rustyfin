@@ -145,7 +145,9 @@ async fn main() {
     let plugin_manager = rustyfin_core::plugin_manager::PluginManager::new(&data_dir_arc);
     plugin_manager.load_all().await;
 
-    // Rate limiter: default 500 requests per 60 seconds per IP (configurable via env, 0 to disable)
+    // Rate limiter: default 500 requests per 60 seconds per client IP, for the login endpoints
+    // only (AuthenticateByName, ForgotPassword, ResetPassword). Configurable via env,
+    // 0 to disable.
     let rate_max: usize = std::env::var("RUSTYFIN_RATE_LIMIT")
         .ok()
         .and_then(|v| v.parse().ok())

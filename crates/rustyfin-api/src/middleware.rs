@@ -159,6 +159,9 @@ impl RateLimiter {
     }
 }
 
+/// Per-client-IP budget for the login endpoints only (AuthenticateByName, ForgotPassword,
+/// ResetPassword), mounted on those routes in `routes::build_router`. Loopback clients are
+/// exempt, and a budget of 0 disables the limit.
 pub async fn rate_limit(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
