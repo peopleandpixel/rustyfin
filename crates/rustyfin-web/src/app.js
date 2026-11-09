@@ -2417,6 +2417,9 @@ async function togglePlayed(id, current) {
     try {
         if (current) await API.markUnplayed(id);
         else await API.markPlayed(id);
+        // Marking changes the item's (and a show's episodes') watch data, so drop the cached lists before re-rendering
+        API.invalidateCache('/Items');
+        API.invalidateCache('/Shows');
         toast(current ? t('detail.marked_unplayed') : t('detail.marked_played'));
         if (currentDetailId === id) renderDetail(id);
     } catch (e) {
