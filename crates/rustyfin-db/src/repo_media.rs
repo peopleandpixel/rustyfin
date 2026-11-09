@@ -6,7 +6,7 @@
 
 use chrono::{DateTime, Utc};
 use rustyfin_model::media::{MediaItem, MediaType};
-use sqlx::{SqliteConnection, SqlitePool};
+use sqlx::{QueryBuilder, Row, Sqlite, SqliteConnection, SqlitePool};
 use std::collections::HashMap;
 use std::sync::LazyLock;
 use uuid::Uuid;
@@ -92,226 +92,320 @@ pub async fn upsert_media_item(pool: &SqlitePool, item: &MediaItem) -> Result<()
     Ok(())
 }
 
-/// Writes one scalar column of a refresh save, only while its stored value is still `$held`.
-macro_rules! save_scalar_column {
-    ($tx:ident, $written:ident, $id:ident, $col:literal, $held:expr, $new:expr) => {{
-        let (held, new) = ($held, $new);
-        if held != new {
-            let has_held = held.is_some();
-            let sql = if has_held {
-                concat!(
-                    "UPDATE media_items SET ",
-                    $col,
-                    " = ? WHERE id = ? AND ",
-                    $col,
-                    " IS ?"
-                )
-            } else {
-                concat!(
-                    "UPDATE media_items SET ",
-                    $col,
-                    " = ? WHERE id = ? AND ",
-                    $col,
-                    " IS NULL"
-                )
-            };
-            let mut query = sqlx::query(sql).bind(new).bind(&$id);
-            if has_held {
-                query = query.bind(held);
-            }
-            if query.execute(&mut *$tx).await?.rows_affected() == 1 {
-                $written.push($col);
-            }
-        }
-    }};
+/// A value bound into a refresh save's UPDATE. Each value is bound once in the SET list, once in
+/// the WHERE guards, and once in the RETURNING flags, so it is cloned on every bind.
+#[derive(Clone, PartialEq)]
+enum RefreshValue {
+    Text(Option<String>),
+    Int(Option<i64>),
+    Real(Option<f64>),
 }
 
-/// Writes one text column of a refresh save, only while its stored value is still `$held`.
-/// A blank stored value (NULL or empty) counts as the same as an empty read.
-macro_rules! save_text_column {
-    ($tx:ident, $written:ident, $id:ident, $col:literal, $held:expr, $new:expr) => {{
-        let (held, new) = ($held, $new);
-        if held != new {
-            let has_held = !matches!(held.as_deref(), None | Some(""));
-            let sql = if has_held {
-                concat!(
-                    "UPDATE media_items SET ",
-                    $col,
-                    " = ? WHERE id = ? AND ",
-                    $col,
-                    " IS ?"
-                )
-            } else {
-                concat!(
-                    "UPDATE media_items SET ",
-                    $col,
-                    " = ? WHERE id = ? AND (",
-                    $col,
-                    " IS NULL OR ",
-                    $col,
-                    " = '')"
-                )
-            };
-            let mut query = sqlx::query(sql).bind(new).bind(&$id);
-            if has_held {
-                query = query.bind(held);
-            }
-            if query.execute(&mut *$tx).await?.rows_affected() == 1 {
-                $written.push($col);
-            }
-        }
-    }};
+impl From<Option<String>> for RefreshValue {
+    fn from(v: Option<String>) -> Self {
+        Self::Text(v)
+    }
 }
 
-/// Saves the columns a metadata refresh changed between `read` and `updated`, each only while its
-/// stored value is still the one in `read`, so a write that landed since the read wins. Returns
-/// the names of the columns written.
+impl From<Option<i32>> for RefreshValue {
+    fn from(v: Option<i32>) -> Self {
+        Self::Int(v.map(i64::from))
+    }
+}
+
+impl From<Option<i64>> for RefreshValue {
+    fn from(v: Option<i64>) -> Self {
+        Self::Int(v)
+    }
+}
+
+impl From<Option<f64>> for RefreshValue {
+    fn from(v: Option<f64>) -> Self {
+        Self::Real(v)
+    }
+}
+
+/// One change a refresh save makes, for a column whose held value differs from the new one.
+enum RefreshChange {
+    /// A column guarded by `col IS ?held`, or by `(col IS NULL OR col = '')` when `blank` is set.
+    Column {
+        col: &'static str,
+        blank: bool,
+        held: RefreshValue,
+        new: RefreshValue,
+    },
+    /// name and sort_name, guarded together by `name IS ? AND sort_name IS ?`.
+    Names {
+        held: (RefreshValue, RefreshValue),
+        new: (RefreshValue, RefreshValue),
+    },
+}
+
+/// Records a scalar column's change, if its held value differs from the new one.
+fn scalar_change(
+    changes: &mut Vec<RefreshChange>,
+    col: &'static str,
+    held: impl Into<RefreshValue>,
+    new: impl Into<RefreshValue>,
+) {
+    let (held, new) = (held.into(), new.into());
+    if held != new {
+        changes.push(RefreshChange::Column {
+            col,
+            blank: false,
+            held,
+            new,
+        });
+    }
+}
+
+/// Records a text column's change, if its held value differs from the new one. A held value that
+/// is NULL or empty is guarded as blank, so a stored blank still matches.
+fn text_change(
+    changes: &mut Vec<RefreshChange>,
+    col: &'static str,
+    held: Option<String>,
+    new: Option<String>,
+) {
+    if held != new {
+        let blank = held.as_deref().unwrap_or("").is_empty();
+        changes.push(RefreshChange::Column {
+            col,
+            blank,
+            held: RefreshValue::Text(held),
+            new: RefreshValue::Text(new),
+        });
+    }
+}
+
+fn bind_value(qb: &mut QueryBuilder<Sqlite>, value: &RefreshValue) {
+    match value.clone() {
+        RefreshValue::Text(v) => qb.push_bind(v),
+        RefreshValue::Int(v) => qb.push_bind(v),
+        RefreshValue::Real(v) => qb.push_bind(v),
+    };
+}
+
+/// Pushes the guard of one change, without the surrounding AND or OR.
+fn push_guard(qb: &mut QueryBuilder<Sqlite>, change: &RefreshChange) {
+    match change {
+        RefreshChange::Column {
+            col, blank: true, ..
+        } => {
+            qb.push("(")
+                .push(*col)
+                .push(" IS NULL OR ")
+                .push(*col)
+                .push(" = '')");
+        }
+        RefreshChange::Column { col, held, .. } => {
+            qb.push(*col).push(" IS ");
+            bind_value(qb, held);
+        }
+        RefreshChange::Names { held, .. } => {
+            qb.push("(name IS ");
+            bind_value(qb, &held.0);
+            qb.push(" AND sort_name IS ");
+            bind_value(qb, &held.1);
+            qb.push(")");
+        }
+    }
+}
+
+/// Saves the columns a metadata refresh changed between `read` and `updated` as one autocommit
+/// UPDATE on the pool, with no transaction. The statement sets only the changed columns, and each
+/// one only while its stored value is still the one in `read`, so a write that landed since the
+/// read wins. Returns the columns that hold the refresh's value after the save; an empty list
+/// when no column changed or the row no longer passes any guard.
 pub async fn save_refresh_changes(
     pool: &SqlitePool,
     read: &MediaItem,
     updated: &MediaItem,
 ) -> Result<Vec<&'static str>, sqlx::Error> {
-    let mut tx = pool.begin().await?;
-    let id = read.id.to_string();
-    let mut written = Vec::new();
+    let mut changes = Vec::new();
 
-    save_scalar_column!(
-        tx,
-        written,
-        id,
+    scalar_change(
+        &mut changes,
         "overview",
         read.overview.clone(),
-        updated.overview.clone()
+        updated.overview.clone(),
     );
-    save_scalar_column!(
-        tx,
-        written,
-        id,
+    scalar_change(
+        &mut changes,
         "production_year",
         read.production_year,
-        updated.production_year
+        updated.production_year,
     );
-    save_scalar_column!(
-        tx,
-        written,
-        id,
+    scalar_change(
+        &mut changes,
         "community_rating",
         read.community_rating,
-        updated.community_rating
+        updated.community_rating,
     );
-    save_scalar_column!(
-        tx,
-        written,
-        id,
+    scalar_change(
+        &mut changes,
         "official_rating",
         read.official_rating.clone(),
-        updated.official_rating.clone()
+        updated.official_rating.clone(),
     );
-    save_text_column!(
-        tx,
-        written,
-        id,
+    text_change(
+        &mut changes,
         "genres",
         Some(read.genres.join("|")),
-        Some(updated.genres.join("|"))
+        Some(updated.genres.join("|")),
     );
-    save_scalar_column!(
-        tx,
-        written,
-        id,
+    scalar_change(
+        &mut changes,
         "runtime_ticks",
         read.runtime_ticks,
-        updated.runtime_ticks
+        updated.runtime_ticks,
     );
-    save_scalar_column!(tx, written, id, "tmdb_id", read.tmdb_id, updated.tmdb_id);
-    save_scalar_column!(tx, written, id, "tvdb_id", read.tvdb_id, updated.tvdb_id);
-    save_scalar_column!(
-        tx,
-        written,
-        id,
+    scalar_change(&mut changes, "tmdb_id", read.tmdb_id, updated.tmdb_id);
+    scalar_change(&mut changes, "tvdb_id", read.tvdb_id, updated.tvdb_id);
+    scalar_change(
+        &mut changes,
         "status",
         read.status.clone(),
-        updated.status.clone()
+        updated.status.clone(),
     );
-    save_scalar_column!(
-        tx,
-        written,
-        id,
+    scalar_change(
+        &mut changes,
         "original_language",
         read.original_language.clone(),
-        updated.original_language.clone()
+        updated.original_language.clone(),
     );
-    save_text_column!(
-        tx,
-        written,
-        id,
+    text_change(
+        &mut changes,
         "tagline",
         read.taglines.first().cloned(),
-        updated.taglines.first().cloned()
+        updated.taglines.first().cloned(),
     );
-    save_text_column!(
-        tx,
-        written,
-        id,
+    text_change(
+        &mut changes,
         "production_countries",
         Some(read.production_locations.join("|")),
-        Some(updated.production_locations.join("|"))
+        Some(updated.production_locations.join("|")),
     );
-    save_scalar_column!(
-        tx,
-        written,
-        id,
+    scalar_change(
+        &mut changes,
         "end_date",
         read.end_date.map(|d| d.to_rfc3339()),
-        updated.end_date.map(|d| d.to_rfc3339())
+        updated.end_date.map(|d| d.to_rfc3339()),
     );
-    save_scalar_column!(tx, written, id, "budget", read.budget, updated.budget);
-    save_scalar_column!(tx, written, id, "revenue", read.revenue, updated.revenue);
-    save_scalar_column!(
-        tx,
-        written,
-        id,
+    scalar_change(&mut changes, "budget", read.budget, updated.budget);
+    scalar_change(&mut changes, "revenue", read.revenue, updated.revenue);
+    scalar_change(
+        &mut changes,
         "homepage",
         read.homepage.clone(),
-        updated.homepage.clone()
+        updated.homepage.clone(),
     );
     // The column is NOT NULL DEFAULT 0, so a missing count is stored as 0.
-    save_scalar_column!(
-        tx,
-        written,
-        id,
+    scalar_change(
+        &mut changes,
         "vote_count",
         Some(read.vote_count.unwrap_or(0)),
-        Some(updated.vote_count.unwrap_or(0))
+        Some(updated.vote_count.unwrap_or(0)),
     );
-    save_scalar_column!(
-        tx,
-        written,
-        id,
+    scalar_change(
+        &mut changes,
         "popularity",
         read.popularity,
-        updated.popularity
+        updated.popularity,
     );
 
     if read.name != updated.name || read.sort_name != updated.sort_name {
-        let result = sqlx::query(
-            "UPDATE media_items SET name = ?, sort_name = ? \
-             WHERE id = ? AND name IS ? AND sort_name IS ?",
-        )
-        .bind(&updated.name)
-        .bind(&updated.sort_name)
-        .bind(&id)
-        .bind(&read.name)
-        .bind(&read.sort_name)
-        .execute(&mut *tx)
-        .await?;
-        if result.rows_affected() == 1 {
-            written.push("name");
-            written.push("sort_name");
+        changes.push(RefreshChange::Names {
+            held: (
+                RefreshValue::Text(Some(read.name.clone())),
+                RefreshValue::Text(read.sort_name.clone()),
+            ),
+            new: (
+                RefreshValue::Text(Some(updated.name.clone())),
+                RefreshValue::Text(updated.sort_name.clone()),
+            ),
+        });
+    }
+
+    if changes.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut qb = QueryBuilder::<Sqlite>::new("UPDATE media_items SET ");
+    for (i, change) in changes.iter().enumerate() {
+        if i > 0 {
+            qb.push(", ");
+        }
+        match change {
+            RefreshChange::Column { col, new, .. } => {
+                qb.push(*col).push(" = CASE WHEN ");
+                push_guard(&mut qb, change);
+                qb.push(" THEN ");
+                bind_value(&mut qb, new);
+                qb.push(" ELSE ").push(*col).push(" END");
+            }
+            RefreshChange::Names { new, .. } => {
+                qb.push("name = CASE WHEN ");
+                push_guard(&mut qb, change);
+                qb.push(" THEN ");
+                bind_value(&mut qb, &new.0);
+                qb.push(" ELSE name END, sort_name = CASE WHEN ");
+                push_guard(&mut qb, change);
+                qb.push(" THEN ");
+                bind_value(&mut qb, &new.1);
+                qb.push(" ELSE sort_name END");
+            }
         }
     }
 
-    tx.commit().await?;
+    qb.push(" WHERE id = ");
+    qb.push_bind(read.id.to_string());
+    qb.push(" AND (");
+    for (i, change) in changes.iter().enumerate() {
+        if i > 0 {
+            qb.push(" OR ");
+        }
+        push_guard(&mut qb, change);
+    }
+    qb.push(")");
+
+    // One flag per change, 1 when the column holds the refresh's value after the save.
+    qb.push(" RETURNING ");
+    for (i, change) in changes.iter().enumerate() {
+        if i > 0 {
+            qb.push(", ");
+        }
+        match change {
+            RefreshChange::Column { col, new, .. } => {
+                qb.push(*col).push(" IS ");
+                bind_value(&mut qb, new);
+            }
+            RefreshChange::Names { new, .. } => {
+                qb.push("(name IS ");
+                bind_value(&mut qb, &new.0);
+                qb.push(" AND sort_name IS ");
+                bind_value(&mut qb, &new.1);
+                qb.push(")");
+            }
+        }
+    }
+
+    // fetch_all steps the statement to completion, so a commit error is returned here.
+    let rows = qb.build().fetch_all(pool).await?;
+    let mut written = Vec::new();
+    if let Some(row) = rows.first() {
+        for (i, change) in changes.iter().enumerate() {
+            if row.try_get::<bool, _>(i)? {
+                match change {
+                    RefreshChange::Column { col, .. } => written.push(*col),
+                    RefreshChange::Names { .. } => {
+                        written.push("name");
+                        written.push("sort_name");
+                    }
+                }
+            }
+        }
+    }
     Ok(written)
 }
 

@@ -2231,6 +2231,128 @@ async fn b34_import_update_of_20000_items_without_the_index() {
     eprintln!("b34: import UPDATE of {written} items without the index took {took:?}");
 }
 
+// ── B34: refresh saves under the scan's concurrency (F9) ──
+
+const B34_SCAN_ITEMS: usize = 400;
+
+/// What one of the scan's refresh tasks does to the database for a new item (metadata.rs): it
+/// reads the item, stores its local poster, then saves the fields its NFO filled. A failure names
+/// its step.
+async fn b34_refresh_like_the_scan(pool: &SqlitePool, id: Uuid, n: usize) -> Result<(), String> {
+    use rustyfin_model::image::{ImageType, ItemImage};
+    let read = rustyfin_db::repo_media::get_item_by_id(pool, id)
+        .await
+        .map_err(|e| format!("read: {e}"))?
+        .expect("stored");
+    let poster = ItemImage {
+        item_id: id,
+        image_type: ImageType::Primary,
+        image_index: 0,
+        path: format!("/media/movies/Film {n}/poster.jpg"),
+        provider: "local".to_string(),
+        width: None,
+        height: None,
+        blurhash: None,
+    };
+    rustyfin_db::repo_image::batch_upsert_images(pool, &[poster])
+        .await
+        .map_err(|e| format!("images: {e}"))?;
+    let mut updated = read.clone();
+    updated.overview = Some(format!("Overview {n}"));
+    updated.genres = vec!["Drama".to_string(), format!("Genre {}", n % 7)];
+    updated.official_rating = Some(B34_RATINGS[n % B34_RATINGS.len()].to_string());
+    updated.production_year = Some(1990 + (n % 30) as i32);
+    updated.taglines = vec![format!("Tagline {n}")];
+    rustyfin_db::repo_media::save_refresh_changes(pool, &read, &updated)
+        .await
+        .map_err(|e| format!("save: {e}"))?;
+    Ok(())
+}
+
+/// The scan refreshes its new items ten at a time (scanner.rs) on the shared-cache pool while
+/// clients search. A lock conflict there is SQLITE_LOCKED, which the busy timeout never waits for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn b34_concurrent_refresh_saves_hit_no_lock_errors() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let db = test_pool().await;
+    let lib = make_library("Movies", LibraryContentType::Movies);
+    rustyfin_db::repo_library::create_library(&db.pool, &lib)
+        .await
+        .unwrap();
+    let items: Vec<MediaItem> = (0..B34_SCAN_ITEMS)
+        .map(|n| make_movie(lib.id, &format!("Film {n}")))
+        .collect();
+    rustyfin_db::repo_media::batch_upsert_media_items(&db.pool, &items)
+        .await
+        .unwrap();
+
+    let done = Arc::new(AtomicBool::new(false));
+    let readers: Vec<_> = (0..2)
+        .map(|_| {
+            let (pool, done) = (db.pool.clone(), done.clone());
+            tokio::spawn(async move {
+                let mut failures = Vec::new();
+                while !done.load(Ordering::Relaxed) {
+                    let found = rustyfin_db::repo_search::search_items(&pool, "Film", &[], 20);
+                    if let Err(e) = found.await {
+                        failures.push(format!("search: {e}"));
+                    }
+                }
+                failures
+            })
+        })
+        .collect();
+
+    let started = std::time::Instant::now();
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(10));
+    let tasks: Vec<_> = items
+        .iter()
+        .enumerate()
+        .map(|(n, item)| {
+            let (pool, semaphore, id) = (db.pool.clone(), semaphore.clone(), item.id);
+            tokio::spawn(async move {
+                let _permit = semaphore.acquire_owned().await.unwrap();
+                b34_refresh_like_the_scan(&pool, id, n).await.err()
+            })
+        })
+        .collect();
+    // A lock cycle the deadlock check misses leaves every connection waiting for good.
+    let joined = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        let mut failures = Vec::new();
+        for task in tasks {
+            failures.extend(task.await.unwrap());
+        }
+        failures
+    });
+    let failures = joined.await.expect("the refreshes finish within 60 s");
+    done.store(true, Ordering::Relaxed);
+    let mut reader_failures = Vec::new();
+    for reader in readers {
+        reader_failures.extend(reader.await.unwrap());
+    }
+
+    let saves = failures.iter().filter(|e| e.starts_with("save:")).count();
+    eprintln!(
+        "b34: {B34_SCAN_ITEMS} refreshes in {:?}: {saves} saves, {} other steps and {} searches failed; first: {:?}",
+        started.elapsed(),
+        failures.len() - saves,
+        reader_failures.len(),
+        failures.first().or(reader_failures.first())
+    );
+    assert!(failures.is_empty(), "refresh steps failed: {failures:?}");
+    let saved: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM media_items WHERE overview LIKE 'Overview %'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(saved, B34_SCAN_ITEMS as i64, "every refresh saved");
+    sqlx::query("INSERT INTO media_items_fts(media_items_fts, rank) VALUES('integrity-check', 1)")
+        .execute(&db.pool)
+        .await
+        .expect("the search index matches the items");
+}
+
 // ── B20: one-time setup codes ──
 
 async fn b20_password(pool: &SqlitePool, user: Uuid) -> String {
