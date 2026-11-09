@@ -19732,6 +19732,291 @@ async fn b38_a_users_own_playlist_works_and_is_hidden_from_others() {
     );
 }
 
+// B93: home row cards
+// The web client's Continue Watching and Next Up cards pick a landscape picture by tag, so the
+// items must carry what it falls back to. Next Up items are enriched for the caller as Resume items
+// are (Jellyfin's TvShowsController.GetNextUp returns full BaseItemDtos), and an episode takes its
+// parent images as DtoService.AddInheritedImages gives them: the series' Thumb wins over the
+// season's, and the season's Backdrop wins over the series'.
+
+/// The id of an episode's season (its parent).
+async fn b93_season_of(state: &AppState, episode: uuid::Uuid) -> uuid::Uuid {
+    let season: String = sqlx::query_scalar("SELECT parent_id FROM media_items WHERE id = ?")
+        .bind(episode.to_string())
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    season.parse().unwrap()
+}
+
+/// Inserts the G1f show (series, one season, E1-E3) and gives the series a Primary, a Thumb and a
+/// Backdrop. Returns `(series_id, season_id, [e1, e2, e3])`.
+async fn b93_show_with_series_art(state: &AppState) -> (uuid::Uuid, uuid::Uuid, [uuid::Uuid; 3]) {
+    use rustyfin_model::image::ImageType;
+    let (series, episodes) = g1f_insert_show(state).await;
+    let images = [
+        (ImageType::Primary, "/b93/series/poster.jpg"),
+        (ImageType::Thumb, "/b93/series/landscape.jpg"),
+        (ImageType::Backdrop, "/b93/series/fanart.jpg"),
+    ];
+    for (image_type, path) in images {
+        b30_set_image(state, series, image_type, path, Some(1)).await;
+    }
+    (series, b93_season_of(state, episodes[0]).await, episodes)
+}
+
+/// An item's own Primary tag, Thumb tag and backdrop tags, as `GET /Items/{id}` reports them.
+async fn b93_own_tags(
+    app: &axum::Router,
+    token: &str,
+    id: uuid::Uuid,
+) -> (Option<String>, Option<String>, Vec<String>) {
+    let (status, body) = send(
+        app,
+        request("GET", &format!("/Items/{id}"), Some(token), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "GET /Items/{id}");
+    let tag = |kind: &str| body["ImageTags"][kind].as_str().map(str::to_string);
+    let backdrops = body["BackdropImageTags"]
+        .as_array()
+        .map(|tags| {
+            tags.iter()
+                .filter_map(|t| t.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    (tag("Primary"), tag("Thumb"), backdrops)
+}
+
+/// The entry for `id` in a list answer's `Items`.
+fn b93_entry(body: &serde_json::Value, id: uuid::Uuid, what: &str) -> serde_json::Value {
+    body["Items"]
+        .as_array()
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| item["Id"].as_str() == Some(id.to_string().as_str()))
+        })
+        .cloned()
+        .unwrap_or_else(|| panic!("{what}: no item {id} in {body}"))
+}
+
+/// Asserts that an episode's parent Thumb comes from `from`, whose own Thumb tag is `thumb`.
+fn b93_assert_parent_thumb(item: &serde_json::Value, from: uuid::Uuid, thumb: &str, what: &str) {
+    assert_eq!(
+        item["ParentThumbItemId"].as_str(),
+        Some(from.to_string().as_str()),
+        "{what}: ParentThumbItemId"
+    );
+    assert_eq!(
+        item["ParentThumbImageTag"].as_str(),
+        Some(thumb),
+        "{what}: ParentThumbImageTag"
+    );
+}
+
+/// Asserts that an episode's parent Backdrop comes from `from`, whose own backdrop tags are
+/// `backdrops`.
+fn b93_assert_parent_backdrop(
+    item: &serde_json::Value,
+    from: uuid::Uuid,
+    backdrops: &[String],
+    what: &str,
+) {
+    assert_eq!(
+        item["ParentBackdropItemId"].as_str(),
+        Some(from.to_string().as_str()),
+        "{what}: ParentBackdropItemId"
+    );
+    assert_eq!(
+        item["ParentBackdropImageTags"],
+        serde_json::json!(backdrops),
+        "{what}: ParentBackdropImageTags"
+    );
+}
+
+/// Asserts that an episode's parent Thumb and Backdrop come from `from`, whose own tags are `thumb`
+/// and `backdrops`.
+fn b93_assert_parent_art(
+    item: &serde_json::Value,
+    from: uuid::Uuid,
+    thumb: &str,
+    backdrops: &[String],
+    what: &str,
+) {
+    b93_assert_parent_thumb(item, from, thumb, what);
+    b93_assert_parent_backdrop(item, from, backdrops, what);
+}
+
+/// Gives `episode` a resume point, then returns it as `GET /Items/Resume` (the batch path) and
+/// `GET /Items/{id}` (the single-item path) answer it.
+async fn b93_resume_and_details(
+    state: &AppState,
+    app: &axum::Router,
+    token: &str,
+    user: uuid::Uuid,
+    episode: uuid::Uuid,
+) -> [(&'static str, serde_json::Value); 2] {
+    rustyfin_db::repo_playback::update_playback_position(&state.db, user, episode, 1000)
+        .await
+        .unwrap();
+    let (status, body) = send(app, request("GET", "/Items/Resume", Some(token), None)).await;
+    assert_eq!(status, StatusCode::OK, "GET /Items/Resume");
+    let resume = b93_entry(&body, episode, "Resume");
+    let uri = format!("/Items/{episode}?userId={user}");
+    let (status, details) = send(app, request("GET", &uri, Some(token), None)).await;
+    assert_eq!(status, StatusCode::OK, "GET {uri}");
+    [("Resume", resume), ("details", details)]
+}
+
+#[tokio::test]
+async fn b93_next_up_items_carry_series_name_art_and_user_data() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, user) = admin_session(&state).await;
+    let (series, _season, [e1, e2, _]) = b93_show_with_series_art(&state).await;
+    rustyfin_db::repo_playback::mark_played(&state.db, user, e1)
+        .await
+        .unwrap();
+    rustyfin_db::repo_playback::set_favorite(&state.db, user, e2, true)
+        .await
+        .unwrap();
+    let (primary, thumb, backdrops) = b93_own_tags(&app, &token, series).await;
+    let (primary, thumb) = (primary.unwrap(), thumb.unwrap());
+    assert_eq!(backdrops.len(), 1, "the series' backdrop tags");
+
+    let (status, body) = send(&app, request("GET", "/Shows/NextUp", Some(&token), None)).await;
+    assert_eq!(status, StatusCode::OK);
+    let item = b93_entry(&body, e2, "Next Up");
+    assert_eq!(item["SeriesName"].as_str(), Some("G1 Show"), "SeriesName");
+    assert_eq!(
+        item["SeriesId"].as_str(),
+        Some(series.to_string().as_str()),
+        "SeriesId"
+    );
+    assert_eq!(
+        item["SeriesPrimaryImageTag"].as_str(),
+        Some(primary.as_str()),
+        "SeriesPrimaryImageTag"
+    );
+    assert_eq!(
+        item["SeriesThumbImageTag"].as_str(),
+        Some(thumb.as_str()),
+        "SeriesThumbImageTag"
+    );
+    b93_assert_parent_art(&item, series, &thumb, &backdrops, "Next Up");
+    assert_eq!(
+        item["UserData"]["IsFavorite"],
+        serde_json::json!(true),
+        "Next Up items carry the caller's UserData: {item}"
+    );
+}
+
+#[tokio::test]
+async fn b93_resume_episode_inherits_series_thumb_and_backdrop() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, user) = admin_session(&state).await;
+    let (series, _season, [e1, ..]) = b93_show_with_series_art(&state).await;
+    rustyfin_db::repo_playback::update_playback_position(&state.db, user, e1, 1000)
+        .await
+        .unwrap();
+    let (_, thumb, backdrops) = b93_own_tags(&app, &token, series).await;
+
+    let (status, body) = send(&app, request("GET", "/Items/Resume", Some(&token), None)).await;
+    assert_eq!(status, StatusCode::OK);
+    let item = b93_entry(&body, e1, "Resume");
+    b93_assert_parent_art(&item, series, &thumb.unwrap(), &backdrops, "Resume");
+}
+
+#[tokio::test]
+async fn b93_episode_details_inherit_series_thumb_and_backdrop() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, user) = admin_session(&state).await;
+    let (series, _season, [e1, ..]) = b93_show_with_series_art(&state).await;
+    let (_, thumb, backdrops) = b93_own_tags(&app, &token, series).await;
+
+    let uri = format!("/Items/{e1}?userId={user}");
+    let (status, item) = send(&app, request("GET", &uri, Some(&token), None)).await;
+    assert_eq!(status, StatusCode::OK);
+    b93_assert_parent_art(&item, series, &thumb.unwrap(), &backdrops, "details");
+}
+
+// Jellyfin's AddInheritedImages walks up from the episode. The first ancestor with a Backdrop gives
+// ParentBackdrop*, but a Series' Thumb replaces a Season's as ParentThumb*
+// (`dto.ParentThumbItemId is null || parent is Series`).
+#[tokio::test]
+async fn b93_episode_parent_thumb_prefers_series_and_backdrop_prefers_season() {
+    use rustyfin_model::image::ImageType;
+    // Series and season both have a Thumb and a Backdrop: the series' Thumb, the season's Backdrop.
+    {
+        let state = test_state().await;
+        let app = app(state.clone());
+        let (token, user) = admin_session(&state).await;
+        let (series, season, [e1, ..]) = b93_show_with_series_art(&state).await;
+        b30_set_image(
+            &state,
+            season,
+            ImageType::Thumb,
+            "/b93/s1/thumb.jpg",
+            Some(1),
+        )
+        .await;
+        b30_set_image(
+            &state,
+            season,
+            ImageType::Backdrop,
+            "/b93/s1/back.jpg",
+            Some(1),
+        )
+        .await;
+        let (_, series_thumb, _) = b93_own_tags(&app, &token, series).await;
+        let (_, season_thumb, season_backdrops) = b93_own_tags(&app, &token, season).await;
+        let series_thumb = series_thumb.unwrap();
+        assert!(season_thumb.is_some(), "the season's Thumb tag");
+        assert_eq!(season_backdrops.len(), 1, "the season's backdrop tags");
+        for (what, item) in b93_resume_and_details(&state, &app, &token, user, e1).await {
+            b93_assert_parent_thumb(&item, series, &series_thumb, what);
+            b93_assert_parent_backdrop(&item, season, &season_backdrops, what);
+        }
+    }
+    // Only the season has a Thumb and only the series a Backdrop: each one is used.
+    {
+        let state = test_state().await;
+        let app = app(state.clone());
+        let (token, user) = admin_session(&state).await;
+        let (series, [e1, ..]) = g1f_insert_show(&state).await;
+        let season = b93_season_of(&state, e1).await;
+        b30_set_image(
+            &state,
+            series,
+            ImageType::Backdrop,
+            "/b93/sr/back.jpg",
+            Some(1),
+        )
+        .await;
+        b30_set_image(
+            &state,
+            season,
+            ImageType::Thumb,
+            "/b93/s1/thumb.jpg",
+            Some(1),
+        )
+        .await;
+        let (_, series_thumb, series_backdrops) = b93_own_tags(&app, &token, series).await;
+        let (_, season_thumb, _) = b93_own_tags(&app, &token, season).await;
+        let season_thumb = season_thumb.unwrap();
+        assert!(series_thumb.is_none(), "the series has no Thumb");
+        assert_eq!(series_backdrops.len(), 1, "the series' backdrop tags");
+        for (what, item) in b93_resume_and_details(&state, &app, &token, user, e1).await {
+            b93_assert_parent_thumb(&item, season, &season_thumb, what);
+            b93_assert_parent_backdrop(&item, series, &series_backdrops, what);
+        }
+    }
+}
+
 // ── G1c ──
 // One user's data stays theirs: GET /Items/Resume lists only the caller's items (or those of the
 // user a userId names, under path_user's rules), IsFavorite/IsPlayed/IsUnplayed match only the

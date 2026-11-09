@@ -7,6 +7,7 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::error::ApiError;
+use crate::routes::items::enrich_items;
 use crate::routes::playback::query_user;
 use crate::state::AppState;
 
@@ -49,11 +50,27 @@ async fn next_up(
 
     let total = episodes.len() as i64;
     let end = start_index.saturating_add(limit).min(episodes.len());
-    let items: Vec<MediaItem> = if start_index < episodes.len() {
+    let mut items: Vec<MediaItem> = if start_index < episodes.len() {
         episodes[start_index..end].to_vec()
     } else {
         Vec::new()
     };
+
+    // Enrich the page for the caller, as Resume items are (skip blurhash for list views)
+    let config = state.config.read().await;
+    let tmdb = state.tmdb.api(config.tmdb_api_key.as_deref());
+    enrich_items(
+        &state.db_ro,
+        &state.server_id,
+        user_id,
+        &mut items,
+        &state.http_client,
+        tmdb.as_ref(),
+        &state.data_dir,
+        true,
+    )
+    .await;
+    drop(config);
 
     Ok(Json(QueryResult {
         items,

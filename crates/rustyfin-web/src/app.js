@@ -415,6 +415,35 @@ function toggleSidebar() {
 }
 
 // --- Media Card Renderer (12.x Style) ---
+// Picks card artwork from tags the item carries, so no image is requested that doesn't exist.
+// Returns { id, type, tag, contain } or null (null means the type icon is shown).
+function cardImage(item, landscape) {
+    const id = item.Id || item.id;
+    const pick = (imgId, type, tag, contain = false) => (imgId && tag ? { id: imgId, type, tag, contain } : null);
+    if (!landscape) return pick(id, 'Primary', item.ImageTags?.Primary);
+    const isEpisode = (item.Type || item.type) === 'Episode';
+    return pick(id, 'Thumb', item.ImageTags?.Thumb)
+        || pick(id, 'Backdrop', item.BackdropImageTags?.[0])
+        || (isEpisode ? pick(id, 'Primary', item.ImageTags?.Primary) : null)
+        || pick(item.ParentThumbItemId, 'Thumb', item.ParentThumbImageTag)
+        || pick(item.SeriesId, 'Thumb', item.SeriesThumbImageTag)
+        || pick(item.ParentBackdropItemId, 'Backdrop', item.ParentBackdropImageTags?.[0])
+        || pick(id, 'Primary', item.ImageTags?.Primary, true)
+        || pick(item.SeriesId, 'Primary', item.SeriesPrimaryImageTag, true)
+        || null;
+}
+
+// Own backdrop URL, else the parent's (series or season); '' when neither is tagged.
+function backdropUrl(item, maxWidth) {
+    if (item.BackdropImageTags?.[0]) {
+        return API.imageUrl(item.Id || item.id, 'Backdrop', { maxWidth, tag: item.BackdropImageTags[0] });
+    }
+    if (item.ParentBackdropItemId && item.ParentBackdropImageTags?.[0]) {
+        return API.imageUrl(item.ParentBackdropItemId, 'Backdrop', { maxWidth, tag: item.ParentBackdropImageTags[0] });
+    }
+    return '';
+}
+
 function itemCard(item, options = {}) {
     // rawName goes into the onclick code, which translates the fallback itself
     const rawName = item.Name || item.name || '';
@@ -424,19 +453,29 @@ function itemCard(item, options = {}) {
     const id = item.Id || item.id;
     const played = item.UserData?.Played || item.user_data?.played || false;
     const fav = item.UserData?.IsFavorite || item.user_data?.is_favorite || false;
-    const progress = item.UserData?.PlayedPercentage || item.user_data?.played_percentage || 0;
+    const progress = item.UserData?.PlayedPercentage || item.user_data?.played_percentage || item.CompletionPercentage || 0;
     const rating = item.CommunityRating || item.community_rating;
     // Use explicit backdrop option if provided; otherwise derive from type
     const isBackdrop = options.backdrop !== undefined ? options.backdrop : type === 'Episode';
 
     // Progressive image loading: thumbnail for fast first paint,
     // full-res loaded on hover only to save bandwidth
-    const thumbSrc = isBackdrop
-        ? API.imageUrl(id, 'Backdrop', { maxWidth: 150, format: 'webp', tag: item.BackdropImageTags?.[0] })
-        : API.imageUrl(id, 'Primary', { maxWidth: 150, format: 'webp', tag: item.ImageTags?.Primary });
-    const fullSrc = isBackdrop
-        ? API.imageUrl(id, 'Backdrop', { maxWidth: 250, tag: item.BackdropImageTags?.[0] })
-        : API.imageUrl(id, 'Primary', { maxWidth: 250, tag: item.ImageTags?.Primary });
+    const picture = cardImage(item, isBackdrop);
+    const thumbSrc = picture ? API.imageUrl(picture.id, picture.type, { maxWidth: 150, format: 'webp', tag: picture.tag }) : '';
+    const fullSrc = picture ? API.imageUrl(picture.id, picture.type, { maxWidth: 250, tag: picture.tag }) : '';
+    // Episode landscape cards: series name on the title line, "S1:E2 · name" on the second line
+    const hasNumbers = item.ParentIndexNumber != null && item.IndexNumber != null;
+    const isEpisodeCard = isBackdrop && type === 'Episode' && !!item.SeriesName && hasNumbers;
+    const cardTitle = isEpisodeCard ? item.SeriesName : name;
+    const episodeLine = isEpisodeCard
+        ? t('home.episode_line', {
+            season: item.ParentIndexNumber,
+            episode: item.IndexNumberEnd != null && item.IndexNumberEnd !== item.IndexNumber
+                ? `${item.IndexNumber}-${item.IndexNumberEnd}`
+                : item.IndexNumber,
+            name,
+        })
+        : '';
 
     const canPlay = ['Movie', 'Episode', 'Audio', 'MusicVideo', 'Video'].includes(type);
     const streamType = type === 'Audio' ? 'Audio' : 'Videos';
@@ -450,13 +489,14 @@ function itemCard(item, options = {}) {
     return `
     <div class="jf-card group" data-action="navigate" data-page="detail" data-id="${escapeHtml(id)}">
         <div class="${isBackdrop ? 'jf-poster-backdrop' : 'jf-poster'}">
+            ${picture ? `
             <div class="jf-poster-skeleton"></div>
             <!-- Thumbnail loads first for instant visual feedback; full-res swaps on hover -->
-            <img src="${thumbSrc}" alt="${escapeHtml(name)}" decoding="async" loading="lazy" class="jf-thumb-img absolute inset-0 w-full h-full object-cover z-[1] opacity-0 blur-sm scale-105 transition-opacity duration-200"
+            <img src="${thumbSrc}" alt="${escapeHtml(cardTitle)}" decoding="async" loading="lazy" class="jf-thumb-img absolute inset-0 w-full h-full object-cover z-[1] opacity-0 blur-sm scale-105 transition-opacity duration-200${picture.contain ? ' jf-img-contain' : ''}"
                  data-full-src="${fullSrc}"
                  onload="this.style.opacity='0.8';this.classList.remove('blur-sm','scale-105');const sk=this.previousElementSibling;if(sk&&sk.classList.contains('jf-poster-skeleton'))sk.style.display='none';"
-                 onerror="this.style.display='none';const sk=this.previousElementSibling;if(sk&&sk.classList.contains('jf-poster-skeleton'))sk.style.display='none';">
-            <div class="hidden items-center justify-center h-full text-4xl text-white/20 absolute inset-0 bg-white/5 z-[3]" style="display:none">
+                 onerror="this.style.display='none';const sk=this.previousElementSibling;if(sk&&sk.classList.contains('jf-poster-skeleton'))sk.style.display='none';const ic=this.nextElementSibling;if(ic)ic.style.display='flex';">` : ''}
+            <div class="${picture ? 'hidden' : 'flex'} items-center justify-center h-full text-4xl text-white/20 absolute inset-0 bg-white/5"${picture ? ' style="display:none"' : ''}>
                 ${typeIcons[type] || '📁'}
             </div>
 
@@ -488,11 +528,12 @@ function itemCard(item, options = {}) {
         </div>
 
         <div class="p-3">
-            <p class="text-xs sm:text-sm font-semibold truncate text-white group-hover:text-[#38bdf8] transition-colors" title="${escapeHtml(name)}">${escapeHtml(name)}</p>
+            <p class="text-xs sm:text-sm font-semibold truncate text-white group-hover:text-[#38bdf8] transition-colors" title="${escapeHtml(cardTitle)}">${escapeHtml(cardTitle)}</p>
             <div class="flex items-center gap-1.5 text-[11px] text-white/40 mt-0.5">
+                ${isEpisodeCard ? `<span class="truncate">${escapeHtml(episodeLine)}</span>` : `
                 ${year ? `<span>${year}</span>` : ''}
                 ${year && type ? `<span>·</span>` : ''}
-                <span class="truncate">${escapeHtml(type)}</span>
+                <span class="truncate">${escapeHtml(type)}</span>`}
             </div>
         </div>
     </div>`;
@@ -501,9 +542,10 @@ function itemCard(item, options = {}) {
 // --- Create a single card DOM element (avoids innerHTML parsing overhead) ---
 function createCardElement(item, wrapperClass = '', cardOptions = {}) {
     const wrapper = document.createElement('div');
-    wrapper.className = wrapperClass;
     wrapper.innerHTML = itemCard(item, cardOptions);
-    return wrapper.firstElementChild;
+    const card = wrapper.firstElementChild;
+    if (card && wrapperClass) card.classList.add(...wrapperClass.split(/\s+/).filter(Boolean));
+    return card;
 }
 
 function sectionRow(title, items, moreAction = null, options = {}) {
@@ -613,13 +655,13 @@ async function renderHome() {
             const spYear = spotlightItem.ProductionYear || spotlightItem.production_year || '';
             const spRating = spotlightItem.CommunityRating || spotlightItem.community_rating;
             const spType = spotlightItem.Type || spotlightItem.type || 'Movie';
-            const spBackdrop = API.imageUrl(spId, 'Backdrop', { maxWidth: 1920, tag: spotlightItem.BackdropImageTags?.[0] });
+            const spBackdrop = backdropUrl(spotlightItem, 1920);
             const canPlay = ['Movie', 'Episode', 'Audio', 'MusicVideo', 'Video'].includes(spType);
             const streamType = spType === 'Audio' ? 'Audio' : 'Videos';
 
             c += `
             <div class="jf-spotlight mb-10">
-                <img src="${spBackdrop}" class="jf-spotlight-backdrop" onerror="this.style.display='none'">
+                ${spBackdrop ? `<img src="${spBackdrop}" class="jf-spotlight-backdrop" onerror="this.style.display='none'">` : ''}
                 <div class="jf-spotlight-gradient"></div>
                 <div class="relative z-10 p-6 sm:p-10 lg:p-14 flex flex-col justify-end min-h-[420px] max-w-3xl">
                     <div class="flex items-center gap-2 mb-3">
@@ -1326,8 +1368,8 @@ async function renderDetail(itemId) {
         const people = item.People || item.people || [];
         const id = item.Id || item.id;
 
-        const imgSrc = API.imageUrl(id, 'Primary', { maxWidth: 500, tag: item.ImageTags?.Primary });
-        const backdropSrc = API.imageUrl(id, 'Backdrop', { maxWidth: 1920, tag: item.BackdropImageTags?.[0] });
+        const imgSrc = item.ImageTags?.Primary ? API.imageUrl(id, 'Primary', { maxWidth: 500, tag: item.ImageTags.Primary }) : '';
+        const backdropSrc = backdropUrl(item, 1920);
         const canPlay = ['Movie', 'Episode', 'Audio', 'MusicVideo', 'Video'].includes(type);
         const streamType = type === 'Audio' ? 'Audio' : 'Videos';
         const resumeTicks = streamType === 'Videos' ? resumePositionTicks(item) : 0;
@@ -1374,12 +1416,12 @@ async function renderDetail(itemId) {
                             const epDesc = ep.Overview || ep.overview || '';
                             const epDur = formatRuntime(ep.RunTimeTicks || ep.run_time_ticks);
                             const epPlayed = ep.UserData?.Played || ep.user_data?.played || false;
-                            const epThumb = API.imageUrl(epId, 'Primary', { maxWidth: 400, tag: ep.ImageTags?.Primary });
+                            const epThumb = ep.ImageTags?.Primary ? API.imageUrl(epId, 'Primary', { maxWidth: 400, tag: ep.ImageTags.Primary }) : '';
 
                             return `
                             <div class="jf-episode-card group" data-action="play" data-id="${escapeHtml(epId)}" data-stream-type="Videos" data-title="${escapeHtml(epRawName || t('detail.episode'))}">
                                 <div class="relative w-full sm:w-48 h-28 rounded-lg overflow-hidden bg-white/5 flex-shrink-0">
-                                    <img src="${epThumb}" alt="${escapeHtml(epName)}" class="w-full h-full object-cover">
+                                    ${epThumb ? `<img src="${epThumb}" alt="${escapeHtml(epName)}" class="w-full h-full object-cover">` : ''}
                                     <div class="absolute inset-0 bg-black/40 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
                                         <div class="w-10 h-10 rounded-full bg-[#00a4dc] text-white flex items-center justify-center shadow-lg">
                                             <svg class="w-5 h-5 ml-0.5" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
@@ -1443,11 +1485,11 @@ async function renderDetail(itemId) {
         <div class="jf-page">
             <!-- Full Hero Backdrop Banner -->
             <div class="jf-detail-hero -mx-4 lg:-mx-8 -mt-6">
-                <img src="${backdropSrc}" class="w-full h-[460px] object-cover opacity-35" onerror="this.style.display='none'">
+                ${backdropSrc ? `<img src="${backdropSrc}" class="w-full h-[460px] object-cover opacity-35" onerror="this.style.display='none'">` : ''}
                 <div class="absolute bottom-0 left-0 right-0 p-6 sm:p-10 lg:p-12 z-10 flex flex-col md:flex-row gap-8 items-end">
                     <!-- Poster Box -->
                     <div class="w-44 sm:w-56 rounded-2xl overflow-hidden shadow-2xl border border-white/10 flex-shrink-0 hidden md:block bg-black/60">
-                        <img src="${imgSrc}" alt="${escapeHtml(name)}" class="w-full h-auto object-cover" onerror="this.style.display='none'">
+                        ${imgSrc ? `<img src="${imgSrc}" alt="${escapeHtml(name)}" class="w-full h-auto object-cover" onerror="this.style.display='none'">` : ''}
                     </div>
 
                     <!-- Meta & Actions -->
@@ -1594,7 +1636,8 @@ async function renderSearch(term) {
             Id: h.Id || h.id || h.ItemId,
             Name: h.Name || h.name,
             Type: h.Type || h.type,
-            ProductionYear: h.ProductionYear || h.production_year
+            ProductionYear: h.ProductionYear || h.production_year,
+            ...(h.PrimaryImageTag ? { ImageTags: { Primary: h.PrimaryImageTag } } : {})
         }));
 
         page.innerHTML = `

@@ -323,7 +323,8 @@
         "empty_title": "Your library is empty",
         "empty_hint": "Add your first media folders to stream movies, shows, and music on all your devices.",
         "create_first_library": "＋ Add your first library",
-        "load_failed": "Failed to load the home page: {{message}}"
+        "load_failed": "Failed to load the home page: {{message}}",
+        "episode_line": "S{{season}}:E{{episode}} · {{name}}"
     },
     "favorites": {
         "title": "My Favorites",

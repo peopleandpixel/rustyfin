@@ -11,6 +11,8 @@
   --rf-ember: #f97316;
   --rf-ember-glow: rgba(249, 115, 22, 0.4);
   --jf-bg-darkest: #07090e;
+  /* daisyUI paints the page with --root-bg; below the one-viewport body it would show its grey */
+  --root-bg: var(--jf-bg-darkest);
   --jf-bg-dark: #0d1117;
   --jf-bg-card: #151a23;
   --jf-bg-surface: #1e2430;
@@ -163,6 +165,12 @@ body {
   transform: scale(1.06);
 }
 
+/* Letterboxed artwork (no cropping) */
+.jf-card img.jf-img-contain {
+  object-fit: contain;
+  background: var(--jf-bg-darkest);
+}
+
 /* Play button overlay */
 .jf-play-overlay {
   position: absolute;
@@ -172,6 +180,8 @@ body {
   justify-content: center;
   background: radial-gradient(circle, rgba(0, 0, 0, 0.6) 0%, rgba(0, 0, 0, 0.3) 100%);
   opacity: 0;
+  z-index: 2;
+  pointer-events: none;
   transition: opacity 0.25s ease, backdrop-filter 0.25s ease;
 }
 
@@ -191,6 +201,13 @@ body {
   transition: transform 0.2s cubic-bezier(0.175, 0.885, 0.32, 1.275);
 }
 
+/* Only the button plays; a click elsewhere on the picture opens the item */
+@media (hover: hover) {
+  .jf-play-btn-circle {
+    pointer-events: auto;
+  }
+}
+
 .jf-card:hover .jf-play-btn-circle:hover {
   transform: scale(1.15);
 }
@@ -202,6 +219,7 @@ body {
   left: 0;
   right: 0;
   height: 4px;
+  z-index: 2;
   background: rgba(0, 0, 0, 0.6);
   backdrop-filter: blur(4px);
 }

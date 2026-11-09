@@ -323,7 +323,8 @@
         "empty_title": "Deine Bibliothek ist noch leer",
         "empty_hint": "Füge deine ersten Medienordner hinzu, um Filme, Serien und Musik auf allen Geräten zu streamen.",
         "create_first_library": "＋ Erste Bibliothek anlegen",
-        "load_failed": "Fehler beim Laden der Startseite: {{message}}"
+        "load_failed": "Fehler beim Laden der Startseite: {{message}}",
+        "episode_line": "S{{season}}:E{{episode}} · {{name}}"
     },
     "favorites": {
         "title": "Meine Favoriten",

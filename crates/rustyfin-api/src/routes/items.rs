@@ -376,6 +376,21 @@ async fn enrich_item(
                 {
                     item.series_thumb_image_tag = Some(tag.clone());
                 }
+                // The series' Thumb replaces the season's, as in Jellyfin's AddInheritedImages.
+                // The parent Backdrop falls back to the series when the season has none.
+                if let Some(tag) = series_item
+                    .image_tags
+                    .get(&rustyfin_model::image::ImageType::Thumb)
+                {
+                    item.parent_thumb_image_tag = Some(tag.clone());
+                    item.parent_thumb_item_id = Some(series_item.id);
+                }
+                if item.parent_backdrop_image_tags.is_empty()
+                    && !series_item.backdrop_image_tags.is_empty()
+                {
+                    item.parent_backdrop_image_tags = series_item.backdrop_image_tags.clone();
+                    item.parent_backdrop_item_id = Some(series_item.id);
+                }
             } else if let Some(series_id) = season_item.parent_id {
                 item.series_id = Some(series_id);
             }
@@ -653,7 +668,7 @@ async fn enrich_item(
 /// and blurhashes in bulk to avoid N+1 query problems.
 /// If `skip_blurhash` is true, blurhash computation is skipped (useful for list views).
 #[allow(clippy::too_many_arguments)]
-async fn enrich_items(
+pub(crate) async fn enrich_items(
     pool: &SqlitePool,
     server_id: &str,
     user_id: Option<Uuid>,
@@ -1031,6 +1046,26 @@ async fn enrich_items(
                     if !parent.backdrop_image_tags.is_empty() {
                         item.parent_backdrop_image_tags = parent.backdrop_image_tags.clone();
                         item.parent_backdrop_item_id = Some(parent.id);
+                    }
+                    // The series' Thumb replaces the season's, as in Jellyfin's AddInheritedImages.
+                    // The parent Backdrop falls back to the series when the season has none.
+                    if let Some(series) = parent
+                        .parent_id
+                        .and_then(|sid| parent_map.get(&sid.to_string()))
+                    {
+                        if let Some(tag) = series
+                            .image_tags
+                            .get(&rustyfin_model::image::ImageType::Thumb)
+                        {
+                            item.parent_thumb_image_tag = Some(tag.clone());
+                            item.parent_thumb_item_id = Some(series.id);
+                        }
+                        if item.parent_backdrop_image_tags.is_empty()
+                            && !series.backdrop_image_tags.is_empty()
+                        {
+                            item.parent_backdrop_image_tags = series.backdrop_image_tags.clone();
+                            item.parent_backdrop_item_id = Some(series.id);
+                        }
                     }
                 }
             }
