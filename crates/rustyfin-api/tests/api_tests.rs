@@ -12860,7 +12860,7 @@ async fn test_owner_cannot_be_deleted_or_demoted() {
         Some(&owner_token),
         None,
     );
-    assert_eq!(send(&app, req).await.0, StatusCode::OK);
+    assert_eq!(send(&app, req).await.0, StatusCode::NO_CONTENT);
     assert_eq!(user_flags(&state, "bob").await, None);
 }
 
