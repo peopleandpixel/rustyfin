@@ -2142,7 +2142,7 @@ async function renderAdmin() {
             <div class="flex gap-2 mb-6 overflow-x-auto pb-2">
                 ${tabs.map((label, i) => `
                     <button class="px-4 py-2 rounded-xl text-xs font-semibold whitespace-nowrap transition ${i === 0 ? 'bg-[#00a4dc] text-white shadow-lg' : 'bg-white/5 text-white/60 hover:bg-white/10'}"
-                            onclick="showAdminTab(this, '${tabIds[i]}')">${label}</button>
+                            data-tab="${tabIds[i]}" onclick="showAdminTab(this, '${tabIds[i]}')">${label}</button>
                 `).join('')}
             </div>
 
@@ -2190,20 +2190,32 @@ async function renderAdmin() {
                             <tr class="text-white/40 border-b border-white/10 pb-2">
                                 <th class="pb-3 font-semibold">${t('common.name')}</th>
                                 <th class="pb-3 font-semibold">${t('admin.role')}</th>
+                                <th class="pb-3 font-semibold">${escapeHtml(t('admin.disabled_column'))}</th>
                                 <th class="pb-3 font-semibold">${t('admin.last_login')}</th>
                                 <th class="pb-3 font-semibold text-right">${t('admin.action')}</th>
                             </tr>
                         </thead>
                         <tbody class="divide-y divide-white/5">
-                            ${users.map(u => `
+                            ${users.map(u => {
+                                const id = u.Id || u.id;
+                                const name = u.Name || u.name;
+                                const isAdmin = u.IsAdministrator ?? u.Policy?.IsAdministrator ?? u.policy?.is_administrator;
+                                const isOwner = u.IsOwner === true;
+                                const isSelf = String(id).toLowerCase().replace(/-/g, '') === String(API.userId).toLowerCase().replace(/-/g, '');
+                                const locked = isOwner || isSelf;
+                                const promoteBlocked = !locked && !isAdmin && u.IsDisabled === true;
+                                const disableBlocked = !locked && isAdmin && u.IsDisabled !== true;
+                                return `
                             <tr>
-                                <td class="py-3 font-bold text-white">${escapeHtml(u.Name || u.name)}</td>
-                                <td class="py-3">${(u.Policy?.IsAdministrator || u.policy?.is_administrator) ? `<span class="px-2 py-0.5 rounded text-[10px] font-bold bg-[#00a4dc]/20 text-[#38bdf8]">${t('admin.role_admin')}</span>` : `<span class="text-white/40">${t('admin.role_user')}</span>`}</td>
+                                <td class="py-3 font-bold text-white">${escapeHtml(name)}</td>
+                                <td class="py-3"><label class="inline-flex items-center gap-2 text-white/80"><input type="checkbox" data-id="${escapeHtml(id)}" data-name="${escapeHtml(name)}" onchange="setUserPolicy(this, { IsAdministrator: this.checked })" aria-label="${escapeHtml(t('admin.administrator_for', { name }))}" ${isAdmin ? 'checked' : ''} ${locked || promoteBlocked ? 'disabled' : ''} class="w-4 h-4 rounded bg-white/10 border-white/20 text-[#00a4dc]"><span>${escapeHtml(t('admin.role_admin'))}</span></label>${isOwner ? `<span class="ml-1.5 px-2 py-0.5 rounded text-[10px] font-bold bg-[#00a4dc]/20 text-[#38bdf8]">${escapeHtml(t('admin.role_owner'))}</span>` : ''}${locked ? `<p class="text-[10px] text-white/40 mt-1">${escapeHtml(t(isOwner ? 'admin.owner_locked' : 'admin.self_locked'))}</p>` : ''}${promoteBlocked ? `<p class="text-[10px] text-white/40 mt-1">${escapeHtml(t('admin.promote_disabled_locked'))}</p>` : ''}</td>
+                                <td class="py-3"><input type="checkbox" data-id="${escapeHtml(id)}" data-name="${escapeHtml(name)}" onchange="setUserPolicy(this, { IsDisabled: this.checked })" aria-label="${escapeHtml(t('admin.disabled_for', { name }))}" ${u.IsDisabled ? 'checked' : ''} ${locked || disableBlocked ? 'disabled' : ''} class="w-4 h-4 rounded bg-white/10 border-white/20 text-[#00a4dc]">${disableBlocked ? `<p class="text-[10px] text-white/40 mt-1">${escapeHtml(t('admin.disable_admin_locked'))}</p>` : ''}</td>
                                 <td class="py-3 text-white/40">${escapeHtml(u.LastLoginDate || u.last_login_date || '–')}</td>
                                 <td class="py-3 text-right">
                                     <button class="text-red-400 hover:text-red-300 font-semibold" onclick="if(confirm(t('admin.delete_user_confirm')))API.deleteUser('${u.Id || u.id}').then(()=>renderAdmin())">${t('common.delete')}</button>
                                 </td>
-                            </tr>`).join('')}
+                            </tr>`;
+                            }).join('')}
                         </tbody>
                     </table>
                 </div>
@@ -2330,6 +2342,25 @@ function showAdminTab(btn, tabId) {
 
     if (tabId === 'admin-activity') loadActivityLog();
     if (tabId === 'admin-livelog') initLiveLog();
+}
+
+// An administrator changes another user's role or disabled state. The checkbox is disabled while the request runs, the users list cache is dropped, and the users tab is shown again after the page is rendered.
+async function setUserPolicy(el, policy) {
+    if (policy.IsDisabled && !confirm(t('admin.disable_user_confirm', { name: el.dataset.name }))) {
+        el.checked = false;
+        return;
+    }
+    el.disabled = true;
+    try {
+        await API.updatePolicy(el.dataset.id, policy);
+        toast(t('admin.user_updated'));
+    } catch (err) {
+        toast(err.message, 'error');
+    }
+    API.invalidateCache('/Users');
+    await renderAdmin();
+    const tab = document.querySelector('[data-tab="admin-users"]');
+    if (tab) showAdminTab(tab, 'admin-users');
 }
 
 // --- Scheduled Tasks UI ---
