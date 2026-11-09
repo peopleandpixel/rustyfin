@@ -6,11 +6,15 @@
 
 use chrono::{DateTime, Utc};
 use rustyfin_model::media::{MediaItem, MediaType};
-use sqlx::SqlitePool;
+use sqlx::{QueryBuilder, Row, Sqlite, SqliteConnection, SqlitePool};
 use std::collections::HashMap;
 use std::sync::LazyLock;
 use uuid::Uuid;
 
+/// Saves an item. An existing item is updated in place, so it keeps its rowid, which the search
+/// index is keyed on, and the rows that reference it; `INSERT OR REPLACE` deleted it first, and
+/// the delete cascaded to them. It also keeps its stored date added (`date_created`), because
+/// callers can save copies they read earlier.
 pub async fn upsert_media_item(pool: &SqlitePool, item: &MediaItem) -> Result<(), sqlx::Error> {
     let id = item.id.to_string();
     let parent_id = item.parent_id.map(|p| p.to_string());
@@ -23,13 +27,31 @@ pub async fn upsert_media_item(pool: &SqlitePool, item: &MediaItem) -> Result<()
     let tags = item.tags.join("|");
 
     sqlx::query(
-        "INSERT OR REPLACE INTO media_items \
+        "INSERT INTO media_items \
          (id, name, sort_name, overview, media_type, path, parent_id, library_id, \
           production_year, community_rating, official_rating, genres, date_created, \
-          premiere_date, runtime_ticks, index_number, parent_index_number, tmdb_id, tvdb_id, \
+          premiere_date, runtime_ticks, index_number, parent_index_number, index_number_end, location_type, tmdb_id, tvdb_id, \
           tags, status, original_language, tagline, production_countries, budget, revenue, \
           homepage, end_date, vote_count, popularity) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, \
+          COALESCE((SELECT date_created FROM media_items WHERE id = ?1), ?13), \
+          ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, \
+          ?28, ?29, ?30, ?31, ?32) \
+         ON CONFLICT(id) DO UPDATE SET \
+          name = excluded.name, sort_name = excluded.sort_name, overview = excluded.overview, \
+          media_type = excluded.media_type, path = excluded.path, parent_id = excluded.parent_id, \
+          library_id = excluded.library_id, production_year = excluded.production_year, \
+          community_rating = excluded.community_rating, \
+          official_rating = excluded.official_rating, genres = excluded.genres, \
+          premiere_date = excluded.premiere_date, runtime_ticks = excluded.runtime_ticks, \
+          index_number = excluded.index_number, \
+          index_number_end = excluded.index_number_end, location_type = excluded.location_type, \
+          parent_index_number = excluded.parent_index_number, tmdb_id = excluded.tmdb_id, \
+          tvdb_id = excluded.tvdb_id, tags = excluded.tags, status = excluded.status, \
+          original_language = excluded.original_language, tagline = excluded.tagline, \
+          production_countries = excluded.production_countries, budget = excluded.budget, \
+          revenue = excluded.revenue, homepage = excluded.homepage, end_date = excluded.end_date, \
+          vote_count = excluded.vote_count, popularity = excluded.popularity",
     )
     .bind(&id)
     .bind(&item.name)
@@ -48,6 +70,8 @@ pub async fn upsert_media_item(pool: &SqlitePool, item: &MediaItem) -> Result<()
     .bind(item.runtime_ticks)
     .bind(item.index_number)
     .bind(item.parent_index_number)
+    .bind(item.index_number_end)
+    .bind(item.location_type.as_str())
     .bind(item.tmdb_id)
     .bind(item.tvdb_id)
     .bind(&tags)
@@ -59,7 +83,8 @@ pub async fn upsert_media_item(pool: &SqlitePool, item: &MediaItem) -> Result<()
     .bind(item.revenue)
     .bind(&item.homepage)
     .bind(&end_date)
-    .bind(item.vote_count)
+    // The column is NOT NULL DEFAULT 0, which INSERT OR REPLACE filled in for a missing count.
+    .bind(item.vote_count.unwrap_or(0))
     .bind(item.popularity)
     .execute(pool)
     .await?;
@@ -67,8 +92,326 @@ pub async fn upsert_media_item(pool: &SqlitePool, item: &MediaItem) -> Result<()
     Ok(())
 }
 
+/// A value bound into a refresh save's UPDATE. Each value is bound once in the SET list, once in
+/// the WHERE guards, and once in the RETURNING flags, so it is cloned on every bind.
+#[derive(Clone, PartialEq)]
+enum RefreshValue {
+    Text(Option<String>),
+    Int(Option<i64>),
+    Real(Option<f64>),
+}
+
+impl From<Option<String>> for RefreshValue {
+    fn from(v: Option<String>) -> Self {
+        Self::Text(v)
+    }
+}
+
+impl From<Option<i32>> for RefreshValue {
+    fn from(v: Option<i32>) -> Self {
+        Self::Int(v.map(i64::from))
+    }
+}
+
+impl From<Option<i64>> for RefreshValue {
+    fn from(v: Option<i64>) -> Self {
+        Self::Int(v)
+    }
+}
+
+impl From<Option<f64>> for RefreshValue {
+    fn from(v: Option<f64>) -> Self {
+        Self::Real(v)
+    }
+}
+
+/// One change a refresh save makes, for a column whose held value differs from the new one.
+enum RefreshChange {
+    /// A column guarded by `col IS ?held`, or by `(col IS NULL OR col = '')` when `blank` is set.
+    Column {
+        col: &'static str,
+        blank: bool,
+        held: RefreshValue,
+        new: RefreshValue,
+    },
+    /// name and sort_name, guarded together by `name IS ? AND sort_name IS ?`.
+    Names {
+        held: (RefreshValue, RefreshValue),
+        new: (RefreshValue, RefreshValue),
+    },
+}
+
+/// Records a scalar column's change, if its held value differs from the new one.
+fn scalar_change(
+    changes: &mut Vec<RefreshChange>,
+    col: &'static str,
+    held: impl Into<RefreshValue>,
+    new: impl Into<RefreshValue>,
+) {
+    let (held, new) = (held.into(), new.into());
+    if held != new {
+        changes.push(RefreshChange::Column {
+            col,
+            blank: false,
+            held,
+            new,
+        });
+    }
+}
+
+/// Records a text column's change, if its held value differs from the new one. A held value that
+/// is NULL or empty is guarded as blank, so a stored blank still matches.
+fn text_change(
+    changes: &mut Vec<RefreshChange>,
+    col: &'static str,
+    held: Option<String>,
+    new: Option<String>,
+) {
+    if held != new {
+        let blank = held.as_deref().unwrap_or("").is_empty();
+        changes.push(RefreshChange::Column {
+            col,
+            blank,
+            held: RefreshValue::Text(held),
+            new: RefreshValue::Text(new),
+        });
+    }
+}
+
+fn bind_value(qb: &mut QueryBuilder<Sqlite>, value: &RefreshValue) {
+    match value.clone() {
+        RefreshValue::Text(v) => qb.push_bind(v),
+        RefreshValue::Int(v) => qb.push_bind(v),
+        RefreshValue::Real(v) => qb.push_bind(v),
+    };
+}
+
+/// Pushes the guard of one change, without the surrounding AND or OR.
+fn push_guard(qb: &mut QueryBuilder<Sqlite>, change: &RefreshChange) {
+    match change {
+        RefreshChange::Column {
+            col, blank: true, ..
+        } => {
+            qb.push("(")
+                .push(*col)
+                .push(" IS NULL OR ")
+                .push(*col)
+                .push(" = '')");
+        }
+        RefreshChange::Column { col, held, .. } => {
+            qb.push(*col).push(" IS ");
+            bind_value(qb, held);
+        }
+        RefreshChange::Names { held, .. } => {
+            qb.push("(name IS ");
+            bind_value(qb, &held.0);
+            qb.push(" AND sort_name IS ");
+            bind_value(qb, &held.1);
+            qb.push(")");
+        }
+    }
+}
+
+/// Saves the columns a metadata refresh changed between `read` and `updated` as one autocommit
+/// UPDATE on the pool, with no transaction. The statement sets only the changed columns, and each
+/// one only while its stored value is still the one in `read`, so a write that landed since the
+/// read wins. Returns the columns that hold the refresh's value after the save; an empty list
+/// when no column changed or the row no longer passes any guard.
+pub async fn save_refresh_changes(
+    pool: &SqlitePool,
+    read: &MediaItem,
+    updated: &MediaItem,
+) -> Result<Vec<&'static str>, sqlx::Error> {
+    let mut changes = Vec::new();
+
+    scalar_change(
+        &mut changes,
+        "overview",
+        read.overview.clone(),
+        updated.overview.clone(),
+    );
+    scalar_change(
+        &mut changes,
+        "production_year",
+        read.production_year,
+        updated.production_year,
+    );
+    scalar_change(
+        &mut changes,
+        "community_rating",
+        read.community_rating,
+        updated.community_rating,
+    );
+    scalar_change(
+        &mut changes,
+        "official_rating",
+        read.official_rating.clone(),
+        updated.official_rating.clone(),
+    );
+    text_change(
+        &mut changes,
+        "genres",
+        Some(read.genres.join("|")),
+        Some(updated.genres.join("|")),
+    );
+    scalar_change(
+        &mut changes,
+        "runtime_ticks",
+        read.runtime_ticks,
+        updated.runtime_ticks,
+    );
+    scalar_change(&mut changes, "tmdb_id", read.tmdb_id, updated.tmdb_id);
+    scalar_change(&mut changes, "tvdb_id", read.tvdb_id, updated.tvdb_id);
+    scalar_change(
+        &mut changes,
+        "status",
+        read.status.clone(),
+        updated.status.clone(),
+    );
+    scalar_change(
+        &mut changes,
+        "original_language",
+        read.original_language.clone(),
+        updated.original_language.clone(),
+    );
+    text_change(
+        &mut changes,
+        "tagline",
+        read.taglines.first().cloned(),
+        updated.taglines.first().cloned(),
+    );
+    text_change(
+        &mut changes,
+        "production_countries",
+        Some(read.production_locations.join("|")),
+        Some(updated.production_locations.join("|")),
+    );
+    scalar_change(
+        &mut changes,
+        "end_date",
+        read.end_date.map(|d| d.to_rfc3339()),
+        updated.end_date.map(|d| d.to_rfc3339()),
+    );
+    scalar_change(&mut changes, "budget", read.budget, updated.budget);
+    scalar_change(&mut changes, "revenue", read.revenue, updated.revenue);
+    scalar_change(
+        &mut changes,
+        "homepage",
+        read.homepage.clone(),
+        updated.homepage.clone(),
+    );
+    // The column is NOT NULL DEFAULT 0, so a missing count is stored as 0.
+    scalar_change(
+        &mut changes,
+        "vote_count",
+        Some(read.vote_count.unwrap_or(0)),
+        Some(updated.vote_count.unwrap_or(0)),
+    );
+    scalar_change(
+        &mut changes,
+        "popularity",
+        read.popularity,
+        updated.popularity,
+    );
+
+    if read.name != updated.name || read.sort_name != updated.sort_name {
+        changes.push(RefreshChange::Names {
+            held: (
+                RefreshValue::Text(Some(read.name.clone())),
+                RefreshValue::Text(read.sort_name.clone()),
+            ),
+            new: (
+                RefreshValue::Text(Some(updated.name.clone())),
+                RefreshValue::Text(updated.sort_name.clone()),
+            ),
+        });
+    }
+
+    if changes.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut qb = QueryBuilder::<Sqlite>::new("UPDATE media_items SET ");
+    for (i, change) in changes.iter().enumerate() {
+        if i > 0 {
+            qb.push(", ");
+        }
+        match change {
+            RefreshChange::Column { col, new, .. } => {
+                qb.push(*col).push(" = CASE WHEN ");
+                push_guard(&mut qb, change);
+                qb.push(" THEN ");
+                bind_value(&mut qb, new);
+                qb.push(" ELSE ").push(*col).push(" END");
+            }
+            RefreshChange::Names { new, .. } => {
+                qb.push("name = CASE WHEN ");
+                push_guard(&mut qb, change);
+                qb.push(" THEN ");
+                bind_value(&mut qb, &new.0);
+                qb.push(" ELSE name END, sort_name = CASE WHEN ");
+                push_guard(&mut qb, change);
+                qb.push(" THEN ");
+                bind_value(&mut qb, &new.1);
+                qb.push(" ELSE sort_name END");
+            }
+        }
+    }
+
+    qb.push(" WHERE id = ");
+    qb.push_bind(read.id.to_string());
+    qb.push(" AND (");
+    for (i, change) in changes.iter().enumerate() {
+        if i > 0 {
+            qb.push(" OR ");
+        }
+        push_guard(&mut qb, change);
+    }
+    qb.push(")");
+
+    // One flag per change, 1 when the column holds the refresh's value after the save.
+    qb.push(" RETURNING ");
+    for (i, change) in changes.iter().enumerate() {
+        if i > 0 {
+            qb.push(", ");
+        }
+        match change {
+            RefreshChange::Column { col, new, .. } => {
+                qb.push(*col).push(" IS ");
+                bind_value(&mut qb, new);
+            }
+            RefreshChange::Names { new, .. } => {
+                qb.push("(name IS ");
+                bind_value(&mut qb, &new.0);
+                qb.push(" AND sort_name IS ");
+                bind_value(&mut qb, &new.1);
+                qb.push(")");
+            }
+        }
+    }
+
+    // fetch_all steps the statement to completion, so a commit error is returned here.
+    let rows = qb.build().fetch_all(pool).await?;
+    let mut written = Vec::new();
+    if let Some(row) = rows.first() {
+        for (i, change) in changes.iter().enumerate() {
+            if row.try_get::<bool, _>(i)? {
+                match change {
+                    RefreshChange::Column { col, .. } => written.push(*col),
+                    RefreshChange::Names { .. } => {
+                        written.push("name");
+                        written.push("sort_name");
+                    }
+                }
+            }
+        }
+    }
+    Ok(written)
+}
+
 /// Batch-insert multiple media items in a single transaction.
 /// Dramatically reduces WAL contention compared to per-item inserts.
+/// A stored item is updated in place and keeps its stored date added, as in `upsert_media_item`.
 /// Disables filter triggers during insert to avoid write amplification,
 /// then rebuilds filter indexes after the transaction completes.
 pub async fn batch_upsert_media_items(
@@ -102,13 +445,30 @@ pub async fn batch_upsert_media_items(
         let tags = item.tags.join("|");
 
         sqlx::query(
-            "INSERT OR REPLACE INTO media_items \
+            "INSERT INTO media_items \
              (id, name, sort_name, overview, media_type, path, parent_id, library_id, \
               production_year, community_rating, official_rating, genres, date_created, \
-              premiere_date, runtime_ticks, index_number, parent_index_number, tmdb_id, tvdb_id, \
+              premiere_date, runtime_ticks, index_number, parent_index_number, index_number_end, location_type, tmdb_id, tvdb_id, \
               tags, status, original_language, tagline, production_countries, budget, revenue, \
               homepage, end_date, vote_count, popularity) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(id) DO UPDATE SET \
+              name = excluded.name, sort_name = excluded.sort_name, overview = excluded.overview, \
+              media_type = excluded.media_type, path = excluded.path, \
+              parent_id = excluded.parent_id, library_id = excluded.library_id, \
+              production_year = excluded.production_year, \
+              community_rating = excluded.community_rating, \
+              official_rating = excluded.official_rating, genres = excluded.genres, \
+              premiere_date = excluded.premiere_date, runtime_ticks = excluded.runtime_ticks, \
+              index_number = excluded.index_number, \
+              index_number_end = excluded.index_number_end, location_type = excluded.location_type, \
+              parent_index_number = excluded.parent_index_number, tmdb_id = excluded.tmdb_id, \
+              tvdb_id = excluded.tvdb_id, tags = excluded.tags, status = excluded.status, \
+              original_language = excluded.original_language, tagline = excluded.tagline, \
+              production_countries = excluded.production_countries, budget = excluded.budget, \
+              revenue = excluded.revenue, homepage = excluded.homepage, \
+              end_date = excluded.end_date, vote_count = excluded.vote_count, \
+              popularity = excluded.popularity",
         )
         .bind(&id)
         .bind(&item.name)
@@ -127,6 +487,8 @@ pub async fn batch_upsert_media_items(
         .bind(item.runtime_ticks)
         .bind(item.index_number)
         .bind(item.parent_index_number)
+        .bind(item.index_number_end)
+        .bind(item.location_type.as_str())
         .bind(item.tmdb_id)
         .bind(item.tvdb_id)
         .bind(&tags)
@@ -138,7 +500,8 @@ pub async fn batch_upsert_media_items(
         .bind(item.revenue)
         .bind(&item.homepage)
         .bind(item.end_date.map(|d| d.to_rfc3339()))
-        .bind(item.vote_count)
+        // NOT NULL DEFAULT 0, as in `upsert_media_item`.
+        .bind(item.vote_count.unwrap_or(0))
         .bind(item.popularity)
         .execute(&mut *tx)
         .await?;
@@ -163,7 +526,7 @@ pub async fn get_items_by_library(
     let rows = sqlx::query_as::<_, MediaItemRow>(
         "SELECT id, name, sort_name, overview, media_type, path, parent_id, library_id, \
          production_year, community_rating, official_rating, genres, date_created, \
-         premiere_date, runtime_ticks, index_number, parent_index_number, tmdb_id, tvdb_id, \
+         premiere_date, runtime_ticks, index_number, parent_index_number, index_number_end, location_type, tmdb_id, tvdb_id, \
          tags, status, original_language, tagline, production_countries, budget, revenue, \
          homepage, end_date, vote_count, popularity \
          FROM media_items WHERE library_id = ? ORDER BY sort_name, name",
@@ -179,7 +542,7 @@ pub async fn get_item_by_id(pool: &SqlitePool, id: Uuid) -> Result<Option<MediaI
     let row = sqlx::query_as::<_, MediaItemRow>(
         "SELECT id, name, sort_name, overview, media_type, path, parent_id, library_id, \
          production_year, community_rating, official_rating, genres, date_created, \
-         premiere_date, runtime_ticks, index_number, parent_index_number, tmdb_id, tvdb_id, \
+         premiere_date, runtime_ticks, index_number, parent_index_number, index_number_end, location_type, tmdb_id, tvdb_id, \
          tags, status, original_language, tagline, production_countries, budget, revenue, \
          homepage, end_date, vote_count, popularity \
          FROM media_items WHERE id = ?",
@@ -198,7 +561,7 @@ pub async fn get_children(
     let rows = sqlx::query_as::<_, MediaItemRow>(
         "SELECT id, name, sort_name, overview, media_type, path, parent_id, library_id, \
          production_year, community_rating, official_rating, genres, date_created, \
-         premiere_date, runtime_ticks, index_number, parent_index_number, tmdb_id, tvdb_id, \
+         premiere_date, runtime_ticks, index_number, parent_index_number, index_number_end, location_type, tmdb_id, tvdb_id, \
          tags, status, original_language, tagline, production_countries, budget, revenue, \
          homepage, end_date, vote_count, popularity \
          FROM media_items WHERE parent_id = ? ORDER BY index_number, sort_name, name",
@@ -219,7 +582,7 @@ pub async fn get_children_paged(
     let rows = sqlx::query_as::<_, MediaItemRow>(
         "SELECT id, name, sort_name, overview, media_type, path, parent_id, library_id, \
          production_year, community_rating, official_rating, genres, date_created, \
-         premiere_date, runtime_ticks, index_number, parent_index_number, tmdb_id, tvdb_id, \
+         premiere_date, runtime_ticks, index_number, parent_index_number, index_number_end, location_type, tmdb_id, tvdb_id, \
          tags, status, original_language, tagline, production_countries, budget, revenue, \
          homepage, end_date, vote_count, popularity \
          FROM media_items WHERE parent_id = ? ORDER BY index_number, sort_name, name LIMIT ? OFFSET ?",
@@ -241,17 +604,62 @@ pub async fn count_children(pool: &SqlitePool, parent_id: Uuid) -> Result<i64, s
     Ok(row.0)
 }
 
-pub async fn delete_item(pool: &SqlitePool, id: Uuid) -> Result<bool, sqlx::Error> {
-    // Delete children first (recursive via foreign key would be nice, but let's be explicit)
-    sqlx::query("DELETE FROM media_items WHERE parent_id = ?")
-        .bind(id.to_string())
-        .execute(pool)
+/// Deletes the item `id` on `conn`, which the caller holds in a write transaction. It does not
+/// check for child items. These references to media_items have no ON DELETE CASCADE, so they go
+/// first. Returns whether the media_items row existed.
+pub async fn delete_item_rows_in(
+    conn: &mut SqliteConnection,
+    id: &str,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query("DELETE FROM pinned_episodes WHERE series_id=?1 OR episode_id=?1 OR season_id=?1")
+        .bind(id)
+        .execute(&mut *conn)
         .await?;
-    let result = sqlx::query("DELETE FROM media_items WHERE id = ?")
-        .bind(id.to_string())
-        .execute(pool)
+    sqlx::query("DELETE FROM user_item_data WHERE item_id=?1")
+        .bind(id)
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query("DELETE FROM item_people WHERE item_id=?1")
+        .bind(id)
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query("DELETE FROM item_studios WHERE item_id=?1")
+        .bind(id)
+        .execute(&mut *conn)
+        .await?;
+    let result = sqlx::query("DELETE FROM media_items WHERE id=?1")
+        .bind(id)
+        .execute(&mut *conn)
         .await?;
     Ok(result.rows_affected() > 0)
+}
+
+/// Deletes the item `id` and all its descendants, deepest first, in one write transaction.
+/// Returns whether the item itself existed.
+pub async fn delete_item(pool: &SqlitePool, id: Uuid) -> Result<bool, sqlx::Error> {
+    let root = id.to_string();
+    // The write lock is taken first, as in scan_sync::delete_item.
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let tree: Vec<(String, i64)> = sqlx::query_as(
+        "WITH RECURSIVE tree(id, depth) AS (
+            SELECT id, 0 FROM media_items WHERE id = ?1
+            UNION ALL
+            SELECT m.id, t.depth + 1 FROM media_items m JOIN tree t ON m.parent_id = t.id
+        )
+        SELECT id, MAX(depth) AS depth FROM tree GROUP BY id ORDER BY depth DESC",
+    )
+    .bind(&root)
+    .fetch_all(&mut *tx)
+    .await?;
+    let mut root_deleted = false;
+    for (item_id, _) in &tree {
+        let deleted = delete_item_rows_in(&mut tx, item_id).await?;
+        if *item_id == root {
+            root_deleted = deleted;
+        }
+    }
+    tx.commit().await?;
+    Ok(root_deleted)
 }
 
 /// Get latest items using a single static SQL query for plan reuse.
@@ -266,7 +674,7 @@ pub async fn get_latest_items(
     let rows = sqlx::query_as::<_, MediaItemRow>(
         "SELECT id, name, sort_name, overview, media_type, path, parent_id, library_id, \
          production_year, community_rating, official_rating, genres, date_created, \
-         premiere_date, runtime_ticks, index_number, parent_index_number, tmdb_id, tvdb_id, \
+         premiere_date, runtime_ticks, index_number, parent_index_number, index_number_end, location_type, tmdb_id, tvdb_id, \
          tags, status, original_language, tagline, production_countries, budget, revenue, \
          homepage, end_date, vote_count, popularity \
          FROM media_items \
@@ -284,36 +692,48 @@ pub async fn get_latest_items(
 }
 
 /// Query plan cache for `get_items_filtered`.
-/// Maps a query signature (hash of the SQL structure) to a cached SQL string,
-/// so repeated calls with the same filter shape reuse the same query plan.
+/// Maps a request's shape to its SQL, so repeated calls with the same filter shape reuse the same
+/// query plan.
 ///
-/// The signature is built from the number of array elements in each filter,
-/// not the actual values, so different values with the same shape share a plan.
+/// The shape holds the number of array elements in each filter, the flags and the parsed sort
+/// terms, not the actual values, so different values with the same shape share a plan. The map is
+/// keyed by the shape itself, so a lookup finds only an entry whose shape equals the request's: two
+/// shapes whose hashes collide never share SQL, whose binds would not fit.
+/// It holds at most `FILTER_QUERY_CACHE_CAP` shapes, and a query longer than
+/// `FILTER_QUERY_MAX_CACHED_SQL` bytes is never stored.
 /// Uses parking_lot::Mutex instead of std::sync::Mutex to avoid blocking Tokio threads.
-type QueryCache = parking_lot::Mutex<HashMap<u64, (String, String)>>;
+type QueryCache = parking_lot::Mutex<HashMap<FilterShape, (String, String)>>;
 
 static FILTER_QUERY_CACHE: LazyLock<QueryCache> =
     LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
 
-/// Simple hash combiner for building a cache key from multiple u64 values.
-pub(crate) fn hash_combine(mut hash: u64, key: u64) -> u64 {
-    hash ^= key
-        .wrapping_add(0x9e3779b97f4a7c15)
-        .wrapping_add(hash << 6)
-        .wrapping_add(hash >> 2);
-    hash
+/// At most this many query shapes are cached. Once it is full a new shape is built for each request
+/// and not stored, so no request can push out the shapes in use.
+const FILTER_QUERY_CACHE_CAP: usize = 256;
+/// A query whose SQL (count and data together) is longer than this is never cached: each genre or
+/// tag adds a clause, so the size follows the request.
+const FILTER_QUERY_MAX_CACHED_SQL: usize = 16 * 1024;
+
+/// What a `get_items_filtered` request's SQL is built from: the length of each array filter, the
+/// flags and the parsed sort terms. Equal shapes build the same SQL.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct FilterShape {
+    media_types_len: usize,
+    exclude_media_types_len: usize,
+    genres_len: usize,
+    years_len: usize,
+    official_ratings_len: usize,
+    tags_len: usize,
+    media_types_filter_len: usize,
+    recursive: bool,
+    is_favorite: Option<bool>,
+    is_unplayed: Option<bool>,
+    is_played: Option<bool>,
+    sort: Vec<SortTerm>,
 }
 
-fn opt_bool_to_u64(v: Option<bool>) -> u64 {
-    match v {
-        None => 0,
-        Some(true) => 1,
-        Some(false) => 2,
-    }
-}
-
-/// Build a cache key from the filter array sizes and options.
-/// Same filter shape and sorting → same key → same cached query plan.
+/// Build the cache key: the request's shape. Lists that parse to the same sort terms have equal
+/// shapes, so the same cached query plan serves them.
 pub(crate) fn filter_cache_key(
     media_types_len: usize,
     exclude_media_types_len: usize,
@@ -328,35 +748,192 @@ pub(crate) fn filter_cache_key(
     is_played: Option<bool>,
     sort_by: &str,
     sort_order: &str,
-) -> u64 {
-    let mut h = 0u64;
-    h = hash_combine(h, media_types_len as u64);
-    h = hash_combine(h, exclude_media_types_len as u64);
-    h = hash_combine(h, genres_len as u64);
-    h = hash_combine(h, years_len as u64);
-    h = hash_combine(h, official_ratings_len as u64);
-    h = hash_combine(h, tags_len as u64);
-    h = hash_combine(h, media_types_filter_len as u64);
-    h = hash_combine(h, recursive as u64);
-    h = hash_combine(h, opt_bool_to_u64(is_favorite));
-    h = hash_combine(h, opt_bool_to_u64(is_unplayed));
-    h = hash_combine(h, opt_bool_to_u64(is_played));
-    for b in sort_by.as_bytes() {
-        h = hash_combine(h, *b as u64);
+) -> FilterShape {
+    FilterShape {
+        media_types_len,
+        exclude_media_types_len,
+        genres_len,
+        years_len,
+        official_ratings_len,
+        tags_len,
+        media_types_filter_len,
+        recursive,
+        is_favorite,
+        is_unplayed,
+        is_played,
+        sort: parse_sort(sort_by, sort_order),
     }
-    for b in sort_order.as_bytes() {
-        h = hash_combine(h, *b as u64);
+}
+
+/// A SortBy key as Jellyfin names it. Keys match without case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum SortKey {
+    SortName,
+    Name,
+    DateCreated,
+    PremiereDate,
+    ProductionYear,
+    CommunityRating,
+    Runtime,
+    ParentIndexNumber,
+    IndexNumber,
+    Random,
+    /// Dropped after the keys are paired with the orders, so it never reaches a clause.
+    Default,
+    /// Any other key; it orders by `sort_name`.
+    Other,
+}
+
+impl SortKey {
+    /// Reads one SortBy entry, matched without case.
+    fn parse(entry: &str) -> SortKey {
+        match entry.to_ascii_lowercase().as_str() {
+            "default" => SortKey::Default,
+            "sortname" => SortKey::SortName,
+            "name" => SortKey::Name,
+            "datecreated" | "dateadded" => SortKey::DateCreated,
+            "premieredate" => SortKey::PremiereDate,
+            "productionyear" => SortKey::ProductionYear,
+            "communityrating" | "criticrating" => SortKey::CommunityRating,
+            "runtime" => SortKey::Runtime,
+            "parentindexnumber" => SortKey::ParentIndexNumber,
+            "indexnumber" => SortKey::IndexNumber,
+            "random" => SortKey::Random,
+            _ => SortKey::Other,
+        }
     }
-    h
+
+    /// The SQL expression this key orders by.
+    fn expr(self) -> &'static str {
+        match self {
+            SortKey::SortName | SortKey::Other | SortKey::Default => "sort_name",
+            SortKey::Name => "name",
+            SortKey::DateCreated => "date_created",
+            SortKey::PremiereDate => concat!(
+                "COALESCE(substr(premiere_date, 1, 10), ",
+                "CASE WHEN production_year IS NOT NULL THEN printf('%04d-01-01', production_year) END)"
+            ),
+            SortKey::ProductionYear => "production_year",
+            SortKey::CommunityRating => "community_rating",
+            SortKey::Runtime => "runtime_ticks",
+            SortKey::ParentIndexNumber => "parent_index_number",
+            SortKey::IndexNumber => "index_number",
+            SortKey::Random => "ROWID",
+        }
+    }
+}
+
+/// One sort key with its direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct SortTerm {
+    key: SortKey,
+    descending: bool,
+}
+
+/// Reads SortBy and SortOrder as Jellyfin does. Both are comma lists, and blank entries and orders
+/// other than Ascending and Descending are dropped. Every key takes the order at its position, with
+/// keys past the orders taking the first order (Ascending when there is none). Only after pairing
+/// do Default and a Random that isn't first go, so later keys keep their orders. A repeated SQL
+/// expression keeps only its first term, as EF Core does for Jellyfin. With no keys left,
+/// SortName applies with the first order. The result is never empty.
+fn parse_sort(sort_by: &str, sort_order: &str) -> Vec<SortTerm> {
+    let orders: Vec<bool> = sort_order
+        .split(',')
+        .map(str::trim)
+        .filter_map(|order| {
+            if order.eq_ignore_ascii_case("Ascending") {
+                Some(false)
+            } else if order.eq_ignore_ascii_case("Descending") {
+                Some(true)
+            } else {
+                None
+            }
+        })
+        .collect();
+    let first_order = orders.first().copied().unwrap_or(false);
+    // Every non-blank key takes the order at its position, Default and Random included.
+    let paired = sort_by
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .enumerate()
+        .map(|(i, entry)| SortTerm {
+            key: SortKey::parse(entry),
+            descending: orders.get(i).copied().unwrap_or(first_order),
+        });
+    // Only then does Default go, and a Random that isn't first of what is left, and a term whose
+    // expression is already kept.
+    let mut terms: Vec<SortTerm> = Vec::new();
+    for term in paired {
+        match term.key {
+            SortKey::Default => {}
+            SortKey::Random if !terms.is_empty() => {}
+            _ if terms.iter().any(|kept| kept.key.expr() == term.key.expr()) => {}
+            _ => terms.push(term),
+        }
+    }
+    if terms.is_empty() {
+        return vec![SortTerm {
+            key: SortKey::SortName,
+            descending: first_order,
+        }];
+    }
+    terms
+}
+
+/// Whether `terms` sort randomly, which holds only when the first key is Random.
+fn is_random_sort(terms: &[SortTerm]) -> bool {
+    terms
+        .first()
+        .is_some_and(|term| term.key == SortKey::Random)
+}
+
+/// The ORDER BY clause for `terms`: each key in its own direction. A first SortName key brings Name
+/// along right after it, in the same direction. Without a SortName or Name key, ties go by
+/// sort_name ascending. The id comes last, in the first key's direction, so every order is total
+/// and pages stay stable. An expression already in the clause is never added again, so its first
+/// part keeps its direction.
+fn order_by_clause(terms: &[SortTerm]) -> String {
+    let mut parts: Vec<(&'static str, &'static str)> = Vec::new();
+    // Adds one (expr, dir) part unless its expression is already in the clause.
+    let mut add = |expr: &'static str, dir: &'static str| {
+        if !parts.iter().any(|(seen, _)| *seen == expr) {
+            parts.push((expr, dir));
+        }
+    };
+    for (i, term) in terms.iter().enumerate() {
+        let dir = if term.descending { "DESC" } else { "ASC" };
+        add(term.key.expr(), dir);
+        if i == 0 && term.key == SortKey::SortName {
+            add("name", dir);
+        }
+    }
+    let has_name_key = terms
+        .iter()
+        .any(|term| matches!(term.key, SortKey::SortName | SortKey::Name));
+    if !has_name_key {
+        add("sort_name", "ASC");
+    }
+    let id_dir = if terms.first().is_some_and(|term| term.descending) {
+        "DESC"
+    } else {
+        "ASC"
+    };
+    add("id", id_dir);
+    let clause: Vec<String> = parts
+        .iter()
+        .map(|(expr, dir)| format!("{expr} {dir}"))
+        .collect();
+    format!("ORDER BY {}", clause.join(", "))
 }
 
 /// Build the SQL query with a static base for single-value params and dynamic
-/// parts only for array filters. Uses the cache to reuse query plans when the
-/// filter array sizes match a previous call.
+/// parts only for array filters. Reuses the SQL cached for an earlier call of the same shape.
+/// The key is built here, from the filter this call renders, so no caller can pair a key with a
+/// different filter.
 #[allow(clippy::too_many_arguments)]
 fn build_filtered_query(
-    cache_key: u64,
-    _recursive: bool,
+    recursive: bool,
     media_types: Option<&[String]>,
     exclude_media_types: Option<&[String]>,
     genres: Option<&[String]>,
@@ -370,7 +947,23 @@ fn build_filtered_query(
     sort_by: &str,
     sort_order: &str,
 ) -> (String, String) {
-    // Check cache first
+    let cache_key = filter_cache_key(
+        media_types.map(|t| t.len()).unwrap_or(0),
+        exclude_media_types.map(|t| t.len()).unwrap_or(0),
+        genres.map(|g| g.len()).unwrap_or(0),
+        years.map(|y| y.len()).unwrap_or(0),
+        official_ratings.map(|r| r.len()).unwrap_or(0),
+        tags.map(|t| t.len()).unwrap_or(0),
+        media_types_filter.map(|t| t.len()).unwrap_or(0),
+        recursive,
+        is_favorite,
+        is_unplayed,
+        is_played,
+        sort_by,
+        sort_order,
+    );
+
+    // Check cache first: a hit needs a stored shape equal to this one, not just an equal hash.
     {
         let cache = FILTER_QUERY_CACHE.lock();
         if let Some((count_sql, data_sql)) = cache.get(&cache_key) {
@@ -497,6 +1090,7 @@ fn build_filtered_query(
         AND (? IS NULL OR ? = '' OR date_created >= ?)
         AND (? IS NULL OR runtime_ticks >= ?)
         AND (? IS NULL OR runtime_ticks <= ?)
+        AND (? IS NULL OR id IN (SELECT value FROM json_each(?)))
     ";
 
     // Combine base WHERE with array filter WHERE parts
@@ -506,27 +1100,11 @@ fn build_filtered_query(
         format!(" AND {}", where_parts.join(" AND "))
     };
 
-    let is_random = sort_by == "Random";
-    let order_col = match sort_by {
-        "DateCreated" | "DateAdded" => "date_created",
-        "PremiereDate" => "premiere_date",
-        "ProductionYear" => "production_year",
-        "CommunityRating" | "CriticRating" => "community_rating",
-        "Name" => "name",
-        "Random" => "ROWID",
-        "Runtime" => "runtime_ticks",
-        _ => "sort_name",
-    };
-    let dir = if sort_order == "Descending" {
-        "DESC"
-    } else {
-        "ASC"
-    };
-
-    let order_clause = if is_random {
+    let terms = parse_sort(sort_by, sort_order);
+    let order_clause = if is_random_sort(&terms) {
         "ORDER BY ROWID".to_string()
     } else {
-        format!("ORDER BY {} {}", order_col, dir)
+        order_by_clause(&terms)
     };
 
     let count_sql = format!(
@@ -536,17 +1114,21 @@ fn build_filtered_query(
     let data_sql = format!(
         "SELECT id, name, sort_name, overview, media_type, path, parent_id, library_id, \
          production_year, community_rating, official_rating, genres, date_created, \
-         premiere_date, runtime_ticks, index_number, parent_index_number, tmdb_id, tvdb_id, \
+         premiere_date, runtime_ticks, index_number, parent_index_number, index_number_end, location_type, tmdb_id, tvdb_id, \
          tags, status, original_language, tagline, production_countries, budget, revenue, \
          homepage, end_date, vote_count, popularity \
          FROM media_items WHERE {}{} {} LIMIT ? OFFSET ?",
         base_where, array_where, order_clause
     );
 
-    // Cache the result
+    // Cache the result, unless the SQL is too long to keep or the cache is full.
     {
         let mut cache = FILTER_QUERY_CACHE.lock();
-        cache.insert(cache_key, (count_sql.clone(), data_sql.clone()));
+        if count_sql.len() + data_sql.len() <= FILTER_QUERY_MAX_CACHED_SQL
+            && cache.len() < FILTER_QUERY_CACHE_CAP
+        {
+            cache.insert(cache_key, (count_sql.clone(), data_sql.clone()));
+        }
     }
 
     (count_sql, data_sql)
@@ -581,6 +1163,7 @@ pub async fn get_items_filtered(
     date_created: Option<&str>,
     runtime: Option<(i32, i32)>,
     user_id: Option<Uuid>,
+    item_ids: Option<&[String]>,
 ) -> Result<(Vec<MediaItem>, i64), sqlx::Error> {
     // Convert options to strings for the (? IS NULL OR ? = '' OR col = ?) pattern
     let pid_str = parent_id.map(|u| u.to_string()).unwrap_or_default();
@@ -604,30 +1187,14 @@ pub async fn get_items_filtered(
             )
         })
         .unwrap_or((None, None));
+    // The ids an item must be one of, as a JSON array for json_each, or NULL for any item.
+    let item_ids_json = item_ids.map(|ids| serde_json::Value::from(ids.to_vec()).to_string());
 
     let sort_by_str = sort_by.unwrap_or("SortName");
     let sort_order_str = sort_order.unwrap_or("Ascending");
 
-    // Build cache key from array filter sizes and options
-    let cache_key = filter_cache_key(
-        media_types.map(|t| t.len()).unwrap_or(0),
-        exclude_media_types.map(|t| t.len()).unwrap_or(0),
-        genres.map(|g| g.len()).unwrap_or(0),
-        years.map(|y| y.len()).unwrap_or(0),
-        official_ratings.map(|r| r.len()).unwrap_or(0),
-        tags.map(|t| t.len()).unwrap_or(0),
-        media_types_filter.map(|t| t.len()).unwrap_or(0),
-        recursive,
-        is_favorite,
-        is_unplayed,
-        is_played,
-        sort_by_str,
-        sort_order_str,
-    );
-
     // Get cached query strings — same array sizes → same plan
     let (count_sql, data_sql) = build_filtered_query(
-        cache_key,
         recursive,
         media_types,
         exclude_media_types,
@@ -690,7 +1257,9 @@ pub async fn get_items_filtered(
         .bind(&min_ticks)
         .bind(&min_ticks)
         .bind(&max_ticks)
-        .bind(&max_ticks);
+        .bind(&max_ticks)
+        .bind(&item_ids_json)
+        .bind(&item_ids_json);
 
     // Array filter params
     if let Some(types) = media_types {
@@ -804,7 +1373,9 @@ pub async fn get_items_filtered(
         .bind(&min_ticks)
         .bind(&min_ticks)
         .bind(&max_ticks)
-        .bind(&max_ticks);
+        .bind(&max_ticks)
+        .bind(&item_ids_json)
+        .bind(&item_ids_json);
 
     // Array filter params (same order as count query)
     if let Some(types) = media_types {
@@ -874,7 +1445,7 @@ pub async fn get_items_filtered(
     }
 
     // Pagination
-    let is_random = sort_by_str == "Random";
+    let is_random = is_random_sort(&parse_sort(sort_by_str, sort_order_str));
     if is_random {
         let random_offset = if total > 0 {
             fastrand::u64(0..total as u64) as i64
@@ -907,7 +1478,7 @@ pub async fn get_similar_items(
     let candidates = sqlx::query_as::<_, MediaItemRow>(
         "SELECT id, name, sort_name, overview, media_type, path, parent_id, library_id, \
          production_year, community_rating, official_rating, genres, date_created, \
-         premiere_date, runtime_ticks, index_number, parent_index_number, tmdb_id, tvdb_id, \
+         premiere_date, runtime_ticks, index_number, parent_index_number, index_number_end, location_type, tmdb_id, tvdb_id, \
          tags, status, original_language, tagline, production_countries, budget, revenue, \
          homepage, end_date, vote_count, popularity \
          FROM media_items \
@@ -1031,7 +1602,7 @@ pub async fn get_similar_items(
         let rows = sqlx::query_as::<_, MediaItemRow>(
             "SELECT id, name, sort_name, overview, media_type, path, parent_id, library_id, \
              production_year, community_rating, official_rating, genres, date_created, \
-             premiere_date, runtime_ticks, index_number, parent_index_number, tmdb_id, tvdb_id, \
+             premiere_date, runtime_ticks, index_number, parent_index_number, index_number_end, location_type, tmdb_id, tvdb_id, \
              tags, status, original_language, tagline, production_countries, budget, revenue, \
              homepage, end_date, vote_count, popularity \
              FROM media_items WHERE media_type = ? AND id != ? AND library_id = ? \
@@ -1233,7 +1804,7 @@ pub async fn get_item_by_path(
     let row = sqlx::query_as::<_, MediaItemRow>(
         "SELECT id, name, sort_name, overview, media_type, path, parent_id, library_id, \
          production_year, community_rating, official_rating, genres, date_created, \
-         premiere_date, runtime_ticks, index_number, parent_index_number, tmdb_id, tvdb_id, \
+         premiere_date, runtime_ticks, index_number, parent_index_number, index_number_end, location_type, tmdb_id, tvdb_id, \
          tags, status, original_language, tagline, production_countries, budget, revenue, \
          homepage, end_date, vote_count, popularity \
          FROM media_items WHERE path = ?",
@@ -1254,37 +1825,193 @@ pub async fn get_all_paths(pool: &SqlitePool) -> Result<Vec<String>, sqlx::Error
     Ok(rows)
 }
 
-/// Fetch all existing paths for items in a specific library.
+/// The paths that a query covers. Each variant matches the same paths in Rust ([`PathScope::contains`])
+/// and in SQL ([`PathScope::sql`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathScope {
+    /// Every path.
+    All,
+    /// The folder `u` itself and every path under it. `u` has no trailing `/`.
+    Under(String),
+    /// The paths directly in the folder `r`, not in its subfolders. `r` has no trailing `/`.
+    DirectlyIn(String),
+}
+
+impl PathScope {
+    /// Whether `path` is in the scope.
+    pub fn contains(&self, path: &str) -> bool {
+        match self {
+            PathScope::All => true,
+            PathScope::Under(folder) => {
+                let folder = folder.as_str();
+                path == folder
+                    || path
+                        .strip_prefix(folder)
+                        .is_some_and(|rest| rest.starts_with('/'))
+            }
+            PathScope::DirectlyIn(folder) => path
+                .strip_prefix(folder.as_str())
+                .and_then(|rest| rest.strip_prefix('/'))
+                .is_some_and(|name| !name.contains('/')),
+        }
+    }
+
+    /// The SQL condition on the path column `col`. It reads the folder from the numbered parameter
+    /// `?n`, so a query binds [`PathScope::param`] at `?n` whatever the variant.
+    pub fn sql(&self, col: &str, n: usize) -> String {
+        match self {
+            PathScope::All => format!("(?{n} IS NOT NULL)"),
+            PathScope::Under(_) => {
+                format!("({col} = ?{n} OR ({col} >= ?{n} || '/' AND {col} < ?{n} || '0'))")
+            }
+            PathScope::DirectlyIn(_) => format!(
+                "({col} >= ?{n} || '/' AND {col} < ?{n} || '0' AND instr(substr({col}, length(?{n}) + 2), '/') = 0)"
+            ),
+        }
+    }
+
+    /// The value of the folder parameter of [`PathScope::sql`]: the folder, or `""` for `All`.
+    pub fn param(&self) -> &str {
+        match self {
+            PathScope::All => "",
+            PathScope::Under(folder) | PathScope::DirectlyIn(folder) => folder.as_str(),
+        }
+    }
+}
+
+/// Fetch the paths of the items of a library that are in `scope`.
 pub async fn get_library_paths(
     pool: &SqlitePool,
     library_id: Uuid,
+    scope: &PathScope,
 ) -> Result<Vec<String>, sqlx::Error> {
-    let rows: Vec<String> = sqlx::query_scalar("SELECT path FROM media_items WHERE library_id = ?")
-        .bind(library_id.to_string())
-        .fetch_all(pool)
-        .await?;
+    let rows: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT path FROM media_items WHERE library_id = ?1 AND {}",
+        scope.sql("path", 2)
+    )))
+    .bind(library_id.to_string())
+    .bind(scope.param())
+    .fetch_all(pool)
+    .await?;
     Ok(rows)
 }
 
-/// Fetch all items of a specific media type for a library, returning path -> id mapping.
-/// Used by the scanner to pre-load series/season/artist/album IDs before directory traversal,
+/// Fetch the source of each audio item of a library whose source path is in `scope`, as (item id, path,
+/// size, modified). The size and modification time are the stamp that the source stores, and are `None`
+/// when it has none.
+pub async fn get_library_audio_sources(
+    pool: &SqlitePool,
+    library_id: Uuid,
+    scope: &PathScope,
+) -> Result<Vec<(Uuid, String, Option<i64>, Option<i64>)>, sqlx::Error> {
+    let rows: Vec<(String, String, Option<i64>, Option<i64>)> =
+        sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT m.id, s.path, s.size, s.modified
+         FROM media_sources AS s
+         JOIN media_items AS m ON m.id = s.item_id
+         WHERE m.library_id = ?1 AND m.media_type = 'Audio' AND {}",
+            scope.sql("s.path", 2)
+        )))
+        .bind(library_id.to_string())
+        .bind(scope.param())
+        .fetch_all(pool)
+        .await?;
+    let sources = rows
+        .into_iter()
+        .filter_map(|(id, path, size, modified)| {
+            Uuid::parse_str(&id)
+                .ok()
+                .map(|uid| (uid, path, size, modified))
+        })
+        .collect();
+    Ok(sources)
+}
+
+/// Fetch the items of a specific media type for a library whose path is in `scope`, returning path -> id
+/// mapping. Used by the scanner to pre-load series/season/artist/album IDs before directory traversal,
 /// avoiding per-item database queries during scanning.
 pub async fn get_library_items_by_type(
     pool: &SqlitePool,
     library_id: Uuid,
     media_type: &str,
+    scope: &PathScope,
 ) -> Result<HashMap<String, Uuid>, sqlx::Error> {
-    let rows: Vec<(String, String)> =
-        sqlx::query_as("SELECT path, id FROM media_items WHERE library_id = ? AND media_type = ?")
-            .bind(library_id.to_string())
-            .bind(media_type)
-            .fetch_all(pool)
-            .await?;
+    let rows: Vec<(String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT path, id FROM media_items WHERE library_id = ?1 AND media_type = ?3 AND {}",
+        scope.sql("path", 2)
+    )))
+    .bind(library_id.to_string())
+    .bind(scope.param())
+    .bind(media_type)
+    .fetch_all(pool)
+    .await?;
     let map = rows
         .into_iter()
         .filter_map(|(path, id)| Uuid::parse_str(&id).ok().map(|uid| (path, uid)))
         .collect();
     Ok(map)
+}
+
+/// Fetch the id of the item of a library with a media type and a path, if there is one. Used by the
+/// scanner to look up a container that the preload of its scope did not hold.
+pub async fn get_library_item_id(
+    pool: &SqlitePool,
+    library_id: Uuid,
+    media_type: &str,
+    path: &str,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    let id: Option<String> = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE library_id = ? AND media_type = ? AND path = ?",
+    )
+    .bind(library_id.to_string())
+    .bind(media_type)
+    .bind(path)
+    .fetch_optional(pool)
+    .await?;
+    Ok(id.and_then(|id| Uuid::parse_str(&id).ok()))
+}
+
+/// Fetch the artist rows of a music library (`MusicAlbum` rows with no parent) whose path is in `scope`,
+/// plus every artist keyed by name (path `''`), as (id, path, name) tuples. Used by the scanner to reuse
+/// the artists of earlier scans.
+pub async fn get_library_artists(
+    pool: &SqlitePool,
+    library_id: Uuid,
+    scope: &PathScope,
+) -> Result<Vec<(Uuid, String, String)>, sqlx::Error> {
+    let rows: Vec<(String, String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT id, path, name FROM media_items \
+         WHERE library_id = ?1 AND media_type = 'MusicAlbum' AND parent_id IS NULL \
+         AND (path = '' OR {})",
+        scope.sql("path", 2)
+    )))
+    .bind(library_id.to_string())
+    .bind(scope.param())
+    .fetch_all(pool)
+    .await?;
+    let artists = rows
+        .into_iter()
+        .filter_map(|(id, path, name)| Uuid::parse_str(&id).ok().map(|uid| (uid, path, name)))
+        .collect();
+    Ok(artists)
+}
+
+/// Fetch the id of the artist (a `MusicAlbum` row with no parent) of a library at a path, if there is one.
+/// Used by the scanner to look up an artist that the preload of its scope did not hold.
+pub async fn get_library_artist_id(
+    pool: &SqlitePool,
+    library_id: Uuid,
+    path: &str,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    let id: Option<String> = sqlx::query_scalar(
+        "SELECT id FROM media_items \
+         WHERE library_id = ? AND media_type = 'MusicAlbum' AND parent_id IS NULL AND path = ?",
+    )
+    .bind(library_id.to_string())
+    .bind(path)
+    .fetch_optional(pool)
+    .await?;
+    Ok(id.and_then(|id| Uuid::parse_str(&id).ok()))
 }
 
 /// Fetch all movie items for a library, returning (path, id) pairs.
@@ -1331,7 +2058,7 @@ pub async fn get_user_resume_items(
     let rows = sqlx::query_as::<_, MediaItemRow>(
         "SELECT m.id, m.name, m.sort_name, m.overview, m.media_type, m.path, m.parent_id, m.library_id, \
          m.production_year, m.community_rating, m.official_rating, m.genres, m.date_created, \
-         m.premiere_date, m.runtime_ticks, m.index_number, m.parent_index_number, m.tmdb_id, m.tvdb_id, \
+         m.premiere_date, m.runtime_ticks, m.index_number, m.parent_index_number, m.index_number_end, m.location_type, m.tmdb_id, m.tvdb_id, \
          m.tags, m.status, m.original_language, m.tagline, m.production_countries, m.budget, m.revenue, \
          m.homepage, m.end_date, m.vote_count, m.popularity \
          FROM media_items m \
@@ -1365,6 +2092,8 @@ pub struct MediaItemRow {
     runtime_ticks: Option<i64>,
     index_number: Option<i32>,
     parent_index_number: Option<i32>,
+    index_number_end: Option<i32>,
+    location_type: String,
     tmdb_id: Option<i64>,
     tvdb_id: Option<i64>,
     tags: String,
@@ -1410,6 +2139,7 @@ impl From<MediaItemRow> for MediaItem {
             runtime_ticks: r.runtime_ticks,
             index_number: r.index_number,
             parent_index_number: r.parent_index_number,
+            index_number_end: r.index_number_end,
             tmdb_id: r.tmdb_id,
             tvdb_id: r.tvdb_id,
             media_sources: Vec::new(),
@@ -1450,7 +2180,12 @@ impl From<MediaItemRow> for MediaItem {
             aspect_ratio: None,
             chapter_count: 0,
             media_source_count: 0,
-            location_type: rustyfin_model::media::LocationType::FileSystem,
+            // 'Virtual' marks a season with no folder (migration 072).
+            location_type: match r.location_type.as_str() {
+                "Virtual" => rustyfin_model::media::LocationType::Virtual,
+                "Remote" => rustyfin_model::media::LocationType::Remote,
+                _ => rustyfin_model::media::LocationType::FileSystem,
+            },
             intro_start_time_ticks: None,
             intro_end_time_ticks: None,
             is_hd: false,
@@ -1556,92 +2291,156 @@ impl From<MediaItemRow> for MediaItem {
     }
 }
 
-/// Get "Next Up" episodes: unwatched episodes for series that have been watched
+/// Get "Next Up": at most one episode per series.
+///
+/// A series' entry is its first unplayed regular episode after the user's highest played regular
+/// episode, or its first unplayed regular episode if none is played. Season 0 is never offered
+/// and never sets the position. An episode in progress counts as unplayed. A NULL season or
+/// episode number is regular. After a position a NULL season never qualifies, and a NULL episode
+/// number qualifies only in a later season. A series with nothing unplayed after its position is
+/// left out.
+///
+/// Candidates are the series the user has started: one of their episodes or specials has a
+/// `last_played_date` and is played or has a playback position. With `series_id`, that item alone
+/// is the candidate if it is a Series, started or not. Without a user nothing is played, so
+/// `series_id` gives the first regular episode, and no `series_id` gives an empty list.
+///
+/// Order, newest first: the highest played episode's `last_played_date` (a series whose highest
+/// played episode has no date comes next, then series with no highest played episode), then the
+/// newest qualifying play, then the series id ascending.
 pub async fn get_next_up(
     pool: &SqlitePool,
     user_id: Option<Uuid>,
+    series_id: Option<Uuid>,
 ) -> Result<Vec<MediaItem>, sqlx::Error> {
+    /// A regular episode of a candidate series, with the user's state for it.
+    struct Episode {
+        id: String,
+        season: Option<i64>,
+        number: Option<i64>,
+        played: bool,
+        played_date: Option<String>,
+    }
+    /// A series' entry, with the keys it sorts by.
+    struct Entry {
+        series: String,
+        last_played: Option<Option<String>>,
+        newest_play: Option<String>,
+        episode: String,
+    }
+
     let uid = user_id.map(|u| u.to_string());
 
-    let sql = if uid.is_some() {
-        "SELECT m.id, m.name, m.sort_name, m.overview, m.media_type, m.path, m.parent_id, m.library_id, \
-         m.production_year, m.community_rating, m.official_rating, m.genres, m.date_created, \
-         m.premiere_date, m.runtime_ticks, m.index_number, m.parent_index_number, m.tmdb_id, m.tvdb_id, \
-         m.tags, m.status, m.original_language, m.tagline, m.production_countries, m.budget, m.revenue, \
-         m.homepage, m.end_date, m.vote_count, m.popularity \
-         FROM media_items m
-         WHERE m.media_type = 'Episode'
-         AND m.id NOT IN (
-             SELECT item_id FROM user_item_data
-             WHERE user_id = ? AND played = 1
-         )
-         ORDER BY m.parent_index_number, m.index_number"
-    } else {
-        "SELECT m.id, m.name, m.sort_name, m.overview, m.media_type, m.path, m.parent_id, m.library_id, \
-         m.production_year, m.community_rating, m.official_rating, m.genres, m.date_created, \
-         m.premiere_date, m.runtime_ticks, m.index_number, m.parent_index_number, m.tmdb_id, m.tvdb_id, \
-         m.tags, m.status, m.original_language, m.tagline, m.production_countries, m.budget, m.revenue, \
-         m.homepage, m.end_date, m.vote_count, m.popularity \
-         FROM media_items m
-         WHERE m.media_type = 'Episode'
-         ORDER BY m.parent_index_number, m.index_number"
+    // Candidate series, each with its newest qualifying play.
+    let candidates: Vec<(String, Option<String>)> = match (series_id, uid.as_deref()) {
+        (Some(sid), _) => sqlx::query_scalar::<_, String>(
+            "SELECT id FROM media_items WHERE id = ? AND media_type = 'Series'",
+        )
+        .bind(sid.to_string())
+        .fetch_optional(pool)
+        .await?
+        .map(|id| vec![(id, None)])
+        .unwrap_or_default(),
+        (None, Some(user)) => {
+            sqlx::query_as::<_, (String, Option<String>)>(
+                "SELECT se.parent_id, MAX(ud.last_played_date) \
+                 FROM user_item_data ud \
+                 JOIN media_items e ON e.id = ud.item_id AND e.media_type = 'Episode' \
+                 JOIN media_items se ON se.id = e.parent_id AND se.media_type = 'Season' \
+                 WHERE ud.user_id = ? AND ud.last_played_date IS NOT NULL \
+                 AND (ud.played = 1 OR ud.playback_position_ticks > 0) \
+                 AND se.parent_id IS NOT NULL \
+                 GROUP BY se.parent_id",
+            )
+            .bind(user)
+            .fetch_all(pool)
+            .await?
+        }
+        (None, None) => Vec::new(),
     };
 
-    let mut q = sqlx::query_as::<_, MediaItemRow>(sql);
-    if let Some(ref u) = uid {
-        q = q.bind(u);
+    let mut entries = Vec::new();
+    for (series, newest_play) in candidates {
+        // Season 0 is left out. With no user the LEFT JOIN matches no row, so every
+        // episode is unplayed.
+        let rows: Vec<(
+            String,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+        )> = sqlx::query_as(
+            "SELECT e.id, e.parent_index_number, e.index_number, ud.played, ud.last_played_date \
+             FROM media_items e \
+             JOIN media_items se ON se.id = e.parent_id AND se.media_type = 'Season' \
+             LEFT JOIN user_item_data ud ON ud.item_id = e.id AND ud.user_id = ? \
+             WHERE se.parent_id = ? AND e.media_type = 'Episode' \
+             AND (e.parent_index_number IS NULL OR e.parent_index_number <> 0)",
+        )
+        .bind(uid.as_deref())
+        .bind(&series)
+        .fetch_all(pool)
+        .await?;
+        let episodes: Vec<Episode> = rows
+            .into_iter()
+            .map(|(id, season, number, played, played_date)| Episode {
+                id,
+                season,
+                number,
+                played: played == Some(1),
+                played_date,
+            })
+            .collect();
+
+        // The highest played episode, by (season, episode) with None lowest.
+        let highest = episodes
+            .iter()
+            .filter(|e| e.played)
+            .max_by_key(|e| (e.season, e.number, e.id.as_str()));
+        let last_played = highest.map(|e| e.played_date.clone());
+        // The position needs both numbers.
+        let position = highest.and_then(|e| e.season.zip(e.number));
+
+        let next = episodes
+            .iter()
+            .filter(|e| !e.played)
+            .filter(|e| match position {
+                None => true,
+                // Jellyfin's comparison on the Options: a NULL season never qualifies, and a
+                // NULL episode number qualifies only in a later season.
+                Some((ps, pn)) => {
+                    e.season > Some(ps) || (e.season == Some(ps) && e.number > Some(pn))
+                }
+            })
+            .min_by_key(|e| (e.season, e.number, e.id.as_str()));
+
+        if let Some(next) = next {
+            entries.push(Entry {
+                series,
+                last_played,
+                newest_play,
+                episode: next.id.clone(),
+            });
+        }
     }
-    let rows = q.fetch_all(pool).await?;
-    Ok(rows.into_iter().map(Into::into).collect())
-}
 
-/// Get "Next Up" episodes for a specific series
-pub async fn get_next_up_for_series(
-    pool: &SqlitePool,
-    user_id: Option<Uuid>,
-    series_id: Uuid,
-) -> Result<Vec<MediaItem>, sqlx::Error> {
-    let sid = series_id.to_string();
-    let uid = user_id.map(|u| u.to_string());
+    entries.sort_by(|a, b| {
+        b.last_played
+            .cmp(&a.last_played)
+            .then_with(|| b.newest_play.cmp(&a.newest_play))
+            .then_with(|| a.series.cmp(&b.series))
+    });
 
-    let seasons: Vec<String> = sqlx::query_scalar(
-        "SELECT id FROM media_items WHERE parent_id = ? AND media_type = 'Season'",
-    )
-    .bind(&sid)
-    .fetch_all(pool)
-    .await?;
-
-    if seasons.is_empty() {
-        return Ok(Vec::new());
+    let mut items = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let Ok(id) = Uuid::parse_str(&entry.episode) else {
+            continue;
+        };
+        if let Some(item) = get_item_by_id(pool, id).await? {
+            items.push(item);
+        }
     }
-
-    let season_placeholders: Vec<&str> = seasons.iter().map(|_| "?").collect();
-    let mut sql = format!(
-        "SELECT m.id, m.name, m.sort_name, m.overview, m.media_type, m.path, m.parent_id, m.library_id, \
-         m.production_year, m.community_rating, m.official_rating, m.genres, m.date_created, \
-         m.premiere_date, m.runtime_ticks, m.index_number, m.parent_index_number, m.tmdb_id, m.tvdb_id, \
-         m.tags, m.status, m.original_language, m.tagline, m.production_countries, m.budget, m.revenue, \
-         m.homepage, m.end_date, m.vote_count, m.popularity \
-         FROM media_items m
-         WHERE m.media_type = 'Episode'
-         AND m.parent_id IN ({})",
-        season_placeholders.join(",")
-    );
-
-    if uid.is_some() {
-        sql.push_str(" AND m.id NOT IN (SELECT item_id FROM user_item_data WHERE user_id = ? AND played = 1)");
-    }
-    sql.push_str(" ORDER BY m.parent_index_number, m.index_number");
-
-    let mut q = sqlx::query_as::<_, MediaItemRow>(sqlx::AssertSqlSafe(sql));
-    for s in &seasons {
-        q = q.bind(s);
-    }
-    if let Some(ref u) = uid {
-        q = q.bind(u);
-    }
-    let rows = q.fetch_all(pool).await?;
-    Ok(rows.into_iter().map(Into::into).collect())
+    Ok(items)
 }
 
 /// Get "Upcoming" episodes: episodes with a future air date
@@ -1655,7 +2454,7 @@ pub async fn get_upcoming(
     let sql = if uid.is_some() {
         "SELECT m.id, m.name, m.sort_name, m.overview, m.media_type, m.path, m.parent_id, m.library_id, \
          m.production_year, m.community_rating, m.official_rating, m.genres, m.date_created, \
-         m.premiere_date, m.runtime_ticks, m.index_number, m.parent_index_number, m.tmdb_id, m.tvdb_id, \
+         m.premiere_date, m.runtime_ticks, m.index_number, m.parent_index_number, m.index_number_end, m.location_type, m.tmdb_id, m.tvdb_id, \
          m.tags, m.status, m.original_language, m.tagline, m.production_countries, m.budget, m.revenue, \
          m.homepage, m.end_date, m.vote_count, m.popularity \
          FROM media_items m
@@ -1669,7 +2468,7 @@ pub async fn get_upcoming(
     } else {
         "SELECT m.id, m.name, m.sort_name, m.overview, m.media_type, m.path, m.parent_id, m.library_id, \
          m.production_year, m.community_rating, m.official_rating, m.genres, m.date_created, \
-         m.premiere_date, m.runtime_ticks, m.index_number, m.parent_index_number, m.tmdb_id, m.tvdb_id, \
+         m.premiere_date, m.runtime_ticks, m.index_number, m.parent_index_number, m.index_number_end, m.location_type, m.tmdb_id, m.tvdb_id, \
          m.tags, m.status, m.original_language, m.tagline, m.production_countries, m.budget, m.revenue, \
          m.homepage, m.end_date, m.vote_count, m.popularity \
          FROM media_items m
@@ -1712,7 +2511,7 @@ pub async fn get_upcoming_for_series(
     let mut sql = format!(
         "SELECT m.id, m.name, m.sort_name, m.overview, m.media_type, m.path, m.parent_id, m.library_id, \
          m.production_year, m.community_rating, m.official_rating, m.genres, m.date_created, \
-         m.premiere_date, m.runtime_ticks, m.index_number, m.parent_index_number, m.tmdb_id, m.tvdb_id, \
+         m.premiere_date, m.runtime_ticks, m.index_number, m.parent_index_number, m.index_number_end, m.location_type, m.tmdb_id, m.tvdb_id, \
          m.tags, m.status, m.original_language, m.tagline, m.production_countries, m.budget, m.revenue, \
          m.homepage, m.end_date, m.vote_count, m.popularity \
          FROM media_items m
@@ -1752,7 +2551,7 @@ pub async fn get_episodes_for_series(
     let sql = if season_number.is_some() {
         "SELECT m.id, m.name, m.sort_name, m.overview, m.media_type, m.path, m.parent_id, m.library_id, \
          m.production_year, m.community_rating, m.official_rating, m.genres, m.date_created, \
-         m.premiere_date, m.runtime_ticks, m.index_number, m.parent_index_number, m.tmdb_id, m.tvdb_id, \
+         m.premiere_date, m.runtime_ticks, m.index_number, m.parent_index_number, m.index_number_end, m.location_type, m.tmdb_id, m.tvdb_id, \
          m.tags, m.status, m.original_language, m.tagline, m.production_countries, m.budget, m.revenue, \
          m.homepage, m.end_date, m.vote_count, m.popularity \
          FROM media_items m
@@ -1765,7 +2564,7 @@ pub async fn get_episodes_for_series(
     } else {
         "SELECT m.id, m.name, m.sort_name, m.overview, m.media_type, m.path, m.parent_id, m.library_id, \
          m.production_year, m.community_rating, m.official_rating, m.genres, m.date_created, \
-         m.premiere_date, m.runtime_ticks, m.index_number, m.parent_index_number, m.tmdb_id, m.tvdb_id, \
+         m.premiere_date, m.runtime_ticks, m.index_number, m.parent_index_number, m.index_number_end, m.location_type, m.tmdb_id, m.tvdb_id, \
          m.tags, m.status, m.original_language, m.tagline, m.production_countries, m.budget, m.revenue, \
          m.homepage, m.end_date, m.vote_count, m.popularity \
          FROM media_items m
@@ -1794,7 +2593,7 @@ pub async fn get_recommendations(
     let rows = sqlx::query_as::<_, MediaItemRow>(
         "SELECT id, name, sort_name, overview, media_type, path, parent_id, library_id, \
          production_year, community_rating, official_rating, genres, date_created, \
-         premiere_date, runtime_ticks, index_number, parent_index_number, tmdb_id, tvdb_id, \
+         premiere_date, runtime_ticks, index_number, parent_index_number, index_number_end, location_type, tmdb_id, tvdb_id, \
          tags, status, original_language, tagline, production_countries, budget, revenue, \
          homepage, end_date, vote_count, popularity \
          FROM media_items
@@ -1819,7 +2618,7 @@ pub async fn get_featured_movies(
     let rows = sqlx::query_as::<_, MediaItemRow>(
         "SELECT id, name, sort_name, overview, media_type, path, parent_id, library_id, \
          production_year, community_rating, official_rating, genres, date_created, \
-         premiere_date, runtime_ticks, index_number, parent_index_number, tmdb_id, tvdb_id, \
+         premiere_date, runtime_ticks, index_number, parent_index_number, index_number_end, location_type, tmdb_id, tvdb_id, \
          tags, status, original_language, tagline, production_countries, budget, revenue, \
          homepage, end_date, vote_count, popularity \
          FROM media_items
@@ -1985,7 +2784,7 @@ pub async fn get_items_by_parent(
     let rows = sqlx::query_as::<_, MediaItemRow>(
         "SELECT id, name, sort_name, overview, media_type, path, parent_id, library_id, \
          production_year, community_rating, official_rating, genres, date_created, \
-         premiere_date, runtime_ticks, index_number, parent_index_number, tmdb_id, tvdb_id, \
+         premiere_date, runtime_ticks, index_number, parent_index_number, index_number_end, location_type, tmdb_id, tvdb_id, \
          tags, status, original_language, tagline, production_countries, budget, revenue, \
          homepage, end_date, vote_count, popularity \
          FROM media_items WHERE parent_id = ?",
@@ -2176,15 +2975,18 @@ pub async fn get_album_for_audio(
     }
 }
 
-/// Get artists (people) for an audio item.
-/// Returns (person_id, person_name, role) tuples.
+/// A person credited on an item: (person_id, person_name, role, type, path of the primary
+/// image at index 0, if any).
+pub type PersonRow = (String, String, Option<String>, String, Option<String>);
+
+/// Get artists (people) for an audio item, in credit order.
 pub async fn get_artists_for_audio(
     pool: &SqlitePool,
     item_id: uuid::Uuid,
-) -> Result<Vec<(String, String, Option<String>)>, sqlx::Error> {
+) -> Result<Vec<PersonRow>, sqlx::Error> {
     let iid = item_id.to_string();
-    sqlx::query_as::<_, (String, String, Option<String>)>(
-        "SELECT p.id, p.name, ip.role FROM item_people ip JOIN people p ON p.id = ip.person_id WHERE ip.item_id = ?",
+    sqlx::query_as::<_, PersonRow>(
+        "SELECT p.id, p.name, ip.role, ip.type, (SELECT pi.path FROM person_images pi WHERE pi.person_id = p.id AND pi.image_type = 'Primary' AND pi.image_index = 0) FROM item_people ip JOIN people p ON p.id = ip.person_id WHERE ip.item_id = ? ORDER BY ip.sort_order IS NULL, ip.sort_order, ip.rowid",
     )
     .bind(&iid)
     .fetch_all(pool)
@@ -2244,46 +3046,452 @@ pub async fn get_folder_counts_batch(
 
 mod tests {
 
+    /// Serializes the tests that empty or fill the process-wide query cache.
+    #[cfg(test)]
+    static QUERY_CACHE_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
-    fn test_hash_combine_no_overflow() {
-        let mut h = 0u64;
-        for i in 0..100 {
-            h = super::hash_combine(h, i);
+    fn test_filter_cache_key_tells_flags_apart() {
+        let (sort_by, sort_order) = ("SortName", "Ascending");
+        let key = |fav| {
+            super::filter_cache_key(
+                1, 0, 2, 1, 0, 0, 0, false, fav, None, None, sort_by, sort_order,
+            )
+        };
+        assert_eq!(key(None), key(None));
+        assert_ne!(key(None), key(Some(true)));
+    }
+
+    #[test]
+    fn test_order_by_follows_jellyfin_sort_rules() {
+        let order_by = |sort_by: &str, sort_order: &str| -> String {
+            super::order_by_clause(&super::parse_sort(sort_by, sort_order))
+        };
+        assert_eq!(
+            order_by("DateCreated,SortName,ProductionYear", "Descending"),
+            "ORDER BY date_created DESC, sort_name DESC, production_year DESC, id DESC"
+        );
+        assert_eq!(
+            order_by("SortName,ProductionYear", "Ascending"),
+            "ORDER BY sort_name ASC, name ASC, production_year ASC, id ASC"
+        );
+        assert_eq!(
+            order_by("CommunityRating", "Descending"),
+            "ORDER BY community_rating DESC, sort_name ASC, id DESC"
+        );
+        assert_eq!(
+            order_by("ProductionYear,SortName", "Sideways,Descending"),
+            "ORDER BY production_year DESC, sort_name DESC, id DESC"
+        );
+        // Blank entries and Default are dropped, which leaves the default SortName.
+        assert_eq!(
+            order_by(" Default, ,", ""),
+            "ORDER BY sort_name ASC, name ASC, id ASC"
+        );
+        // Default takes a place when the orders are paired, then goes, so ProductionYear is
+        // Descending. A Random that isn't first is dropped after pairing, so CommunityRating keeps
+        // its own order.
+        assert_eq!(
+            order_by("Default,ProductionYear", "Ascending,Descending"),
+            "ORDER BY production_year DESC, sort_name ASC, id DESC"
+        );
+        assert_eq!(
+            order_by(
+                "ProductionYear,Random,CommunityRating",
+                "Ascending,Ascending,Descending"
+            ),
+            "ORDER BY production_year ASC, community_rating DESC, sort_name ASC, id ASC"
+        );
+        // Once Default is gone, Random is first, so the page is random.
+        assert!(super::is_random_sort(&super::parse_sort(
+            "Default,Random",
+            ""
+        )));
+        // Default alone leaves nothing, so SortName takes the first order.
+        assert_eq!(
+            order_by("Default", "Descending"),
+            "ORDER BY sort_name DESC, name DESC, id DESC"
+        );
+        // Random sorts only as the first key.
+        assert!(super::is_random_sort(&super::parse_sort(
+            "random,SortName",
+            ""
+        )));
+        assert!(!super::is_random_sort(&super::parse_sort(
+            "SortName,Random",
+            ""
+        )));
+    }
+
+    #[test]
+    fn test_order_by_adds_each_expression_once() {
+        let order_by = |sort_by: &str, sort_order: &str| -> String {
+            super::order_by_clause(&super::parse_sort(sort_by, sort_order))
+        };
+        // As EF Core does for Jellyfin, a term whose expression is already in the clause is
+        // skipped, and the first one keeps its order. SQLite allows 2,000 terms.
+        assert_eq!(
+            order_by(&["Name"; 2000].join(","), "Ascending"),
+            "ORDER BY name ASC, id ASC"
+        );
+        assert_eq!(
+            order_by(
+                "ProductionYear,DateAdded,productionyear,DateCreated",
+                "Ascending,Descending,Descending"
+            ),
+            "ORDER BY production_year ASC, date_created DESC, sort_name ASC, id ASC"
+        );
+        // Nor are the Name that a first SortName brings along and the sort_name tie-break added
+        // again.
+        assert_eq!(
+            order_by("SortName,Name,CommunityRating", "Descending"),
+            "ORDER BY sort_name DESC, name DESC, community_rating DESC, id DESC"
+        );
+        assert_eq!(
+            order_by("Album,ProductionYear", "Descending"),
+            "ORDER BY sort_name DESC, production_year DESC, id DESC"
+        );
+        // So a list repeated any number of times sorts as the list itself.
+        let keys = [
+            "SortName",
+            "Name",
+            "DateCreated",
+            "PremiereDate",
+            "ProductionYear",
+            "CommunityRating",
+            "Runtime",
+            "ParentIndexNumber",
+            "IndexNumber",
+            "Random",
+            "Album",
+        ];
+        assert_eq!(
+            order_by(&keys.repeat(500).join(","), "Descending"),
+            order_by(&keys.join(","), "Descending")
+        );
+    }
+
+    #[test]
+    fn test_filter_query_cache_is_keyed_on_parsed_terms_and_bounded() {
+        let _serial = QUERY_CACHE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let key = |sort_by: &str, sort_order: &str| {
+            super::filter_cache_key(
+                0, 0, 0, 0, 0, 0, 0, true, None, None, None, sort_by, sort_order,
+            )
+        };
+        let build = |genres: Option<&[String]>, sort_by: &str, sort_order: &str| {
+            super::build_filtered_query(
+                true, None, None, genres, None, None, None, None, None, None, None, sort_by,
+                sort_order,
+            )
+        };
+        // Lists that parse to the same terms share an entry. Different terms never do, even when
+        // their raw strings run together alike.
+        assert_eq!(
+            key("Name,name, Name", "Ascending"),
+            key("Name", "ascending,")
+        );
+        assert_ne!(key("SortName", "Ascending"), key("SortNameA", "scending"));
+        // A shape is stored while there is room.
+        let sort_by = "DateCreated,SortName,ProductionYear";
+        let built = build(None, sort_by, "Descending");
+        assert_eq!(
+            super::FILTER_QUERY_CACHE
+                .lock()
+                .get(&key(sort_by, "Descending")),
+            Some(&built)
+        );
+        // A query over 16 KiB is not: each genre adds a clause.
+        let genres = vec!["Drama".to_string(); 1000];
+        let big = || {
+            super::filter_cache_key(
+                0,
+                0,
+                genres.len(),
+                0,
+                0,
+                0,
+                0,
+                true,
+                None,
+                None,
+                None,
+                "SortName",
+                "Ascending",
+            )
+        };
+        let (count_sql, data_sql) = build(Some(genres.as_slice()), "SortName", "Ascending");
+        assert!(count_sql.len() + data_sql.len() > 16 * 1024);
+        assert!(!super::FILTER_QUERY_CACHE.lock().contains_key(&big()));
+        // However many distinct lists come, at most 256 entries are kept.
+        let keys = [
+            "SortName",
+            "Name",
+            "DateCreated",
+            "PremiereDate",
+            "ProductionYear",
+            "CommunityRating",
+            "Runtime",
+            "ParentIndexNumber",
+            "IndexNumber",
+        ];
+        let mut lists = 0;
+        for a in keys {
+            for b in keys {
+                for c in keys {
+                    if a == b || b == c || a == c {
+                        continue;
+                    }
+                    for order in ["Ascending", "Descending"] {
+                        let sort_by = format!("{a},{b},{c}");
+                        build(None, &sort_by, order);
+                        lists += 1;
+                    }
+                }
+            }
         }
-        assert_ne!(h, 0);
+        assert_eq!(lists, 1008);
+        assert!(super::FILTER_QUERY_CACHE.lock().len() <= 256);
+    }
 
-        let key = super::filter_cache_key(
-            1,
-            0,
-            2,
-            1,
-            0,
-            0,
-            0,
-            false,
-            None,
-            None,
-            None,
-            "SortName",
-            "Ascending",
-        );
-        assert_ne!(key, 0);
+    /// One included type and 63 excluded types, all else alike, gave the same 64-bit key, so the
+    /// shape stored first served its SQL to the other. Each gets its own, in either order.
+    #[test]
+    fn test_filter_query_cache_serves_each_shape_its_own_sql() {
+        let _serial = QUERY_CACHE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let included = ["Movie".to_string()];
+        let excluded: Vec<String> = (0..63).map(|i| format!("Type{i}")).collect();
+        let (fav, sort_by, sort_order) = (Some(true), "SortName", "Ascending");
+        let build = |include: Option<&[String]>, exclude: Option<&[String]>| {
+            super::build_filtered_query(
+                true, include, exclude, None, None, None, None, None, fav, None, None, sort_by,
+                sort_order,
+            )
+        };
+        let one = || build(Some(included.as_slice()), None);
+        let many = || build(None, Some(excluded.as_slice()));
+        // What each gets from an empty cache.
+        super::FILTER_QUERY_CACHE.lock().clear();
+        let one_sql = one();
+        super::FILTER_QUERY_CACHE.lock().clear();
+        let many_sql = many();
+        assert!(one_sql.1.contains("media_type IN (?)"));
+        let not_in = format!("media_type NOT IN ({})", ["?"; 63].join(","));
+        assert!(many_sql.1.contains(&not_in));
+        // Whichever is stored first, each still gets its own.
+        super::FILTER_QUERY_CACHE.lock().clear();
+        assert_eq!(one(), one_sql);
+        assert_eq!(many(), many_sql, "after one included type");
+        assert_eq!(one(), one_sql);
+        super::FILTER_QUERY_CACHE.lock().clear();
+        assert_eq!(many(), many_sql);
+        assert_eq!(one(), one_sql, "after 63 excluded types");
+        assert_eq!(many(), many_sql);
+    }
 
-        let key2 = super::filter_cache_key(
-            1,
-            0,
-            2,
-            1,
-            0,
-            0,
-            0,
-            false,
-            Some(true),
-            None,
-            None,
-            "SortName",
-            "Ascending",
+    /// Each input the cache key holds tells two requests apart. Each pair differs in one input, in
+    /// which of two lists holds a value, or in the order or directions of the sort terms. The two
+    /// get different keys, and whichever is stored first, both get the SQL they get from an empty
+    /// cache. A key that lost an input or merged two would serve one the other's SQL, with its
+    /// rows in the wrong order or its binds in the wrong places.
+    #[test]
+    fn test_filter_query_cache_tells_every_shape_input_apart() {
+        /// The inputs `build_filtered_query` renders, for one request.
+        #[derive(Clone)]
+        struct FilterRequest {
+            media_types: Option<Vec<String>>,
+            exclude_media_types: Option<Vec<String>>,
+            genres: Option<Vec<String>>,
+            years: Option<Vec<i32>>,
+            official_ratings: Option<Vec<String>>,
+            tags: Option<Vec<String>>,
+            media_types_filter: Option<Vec<String>>,
+            is_favorite: Option<bool>,
+            is_unplayed: Option<bool>,
+            is_played: Option<bool>,
+            sort_by: &'static str,
+            sort_order: &'static str,
+        }
+        /// A list of `n` values, or no list for 0.
+        fn words(n: usize) -> Option<Vec<String>> {
+            (n > 0).then(|| (0..n).map(|i| format!("w{i}")).collect())
+        }
+        fn years(n: usize) -> Option<Vec<i32>> {
+            (n > 0).then(|| (0..n).map(|i| 2000 + i as i32).collect())
+        }
+        /// `r`'s SQL through the cache.
+        fn cached_sql(r: &FilterRequest) -> (String, String) {
+            super::build_filtered_query(
+                true,
+                r.media_types.as_deref(),
+                r.exclude_media_types.as_deref(),
+                r.genres.as_deref(),
+                r.years.as_deref(),
+                r.official_ratings.as_deref(),
+                r.tags.as_deref(),
+                r.media_types_filter.as_deref(),
+                r.is_favorite,
+                r.is_unplayed,
+                r.is_played,
+                r.sort_by,
+                r.sort_order,
+            )
+        }
+        /// The length of a list, or 0 for no list.
+        fn len<T>(list: Option<&[T]>) -> usize {
+            list.map_or(0, <[T]>::len)
+        }
+        /// `r`'s cache key.
+        fn key(r: &FilterRequest) -> super::FilterShape {
+            super::filter_cache_key(
+                len(r.media_types.as_deref()),
+                len(r.exclude_media_types.as_deref()),
+                len(r.genres.as_deref()),
+                len(r.years.as_deref()),
+                len(r.official_ratings.as_deref()),
+                len(r.tags.as_deref()),
+                len(r.media_types_filter.as_deref()),
+                true,
+                r.is_favorite,
+                r.is_unplayed,
+                r.is_played,
+                r.sort_by,
+                r.sort_order,
+            )
+        }
+
+        let _serial = QUERY_CACHE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let base = FilterRequest {
+            media_types: None,
+            exclude_media_types: None,
+            genres: None,
+            years: None,
+            official_ratings: None,
+            tags: None,
+            media_types_filter: None,
+            is_favorite: None,
+            is_unplayed: None,
+            is_played: None,
+            sort_by: "SortName",
+            sort_order: "Ascending",
+        };
+        let mut pairs = Vec::new();
+        let lists: [(&str, fn(&mut FilterRequest, usize)); 7] = [
+            ("media_types_len", |r, n| r.media_types = words(n)),
+            ("exclude_media_types_len", |r, n| {
+                r.exclude_media_types = words(n)
+            }),
+            ("genres_len", |r, n| r.genres = words(n)),
+            ("years_len", |r, n| r.years = years(n)),
+            ("official_ratings_len", |r, n| r.official_ratings = words(n)),
+            ("tags_len", |r, n| r.tags = words(n)),
+            ("media_types_filter_len", |r, n| {
+                r.media_types_filter = words(n)
+            }),
+        ];
+        for (field, set) in lists {
+            for (a, b) in [(0, 1), (1, 2)] {
+                let (mut x, mut y) = (base.clone(), base.clone());
+                set(&mut x, a);
+                set(&mut y, b);
+                pairs.push((format!("{field} {a} vs {b}"), x, y, false));
+            }
+        }
+        // One value in one list vs one in another, for each two lists. A key that merged two
+        // lengths would give both the same key.
+        for (i, &(x_field, set_x)) in lists.iter().enumerate() {
+            for &(y_field, set_y) in &lists[i + 1..] {
+                let (mut x, mut y) = (base.clone(), base.clone());
+                set_x(&mut x, 1);
+                set_y(&mut y, 1);
+                // IncludeItemTypes and MediaTypes both render `media_type IN (?)`, so only their
+                // keys tell these two apart.
+                let same_sql = (x_field, y_field) == ("media_types_len", "media_types_filter_len");
+                pairs.push((format!("{x_field} vs {y_field}"), x, y, same_sql));
+            }
+        }
+        let flags: [(&str, fn(&mut FilterRequest, Option<bool>)); 3] = [
+            ("is_favorite", |r, v| r.is_favorite = v),
+            ("is_unplayed", |r, v| r.is_unplayed = v),
+            ("is_played", |r, v| r.is_played = v),
+        ];
+        for (field, set) in flags {
+            for (a, b) in [
+                (None, Some(true)),
+                (None, Some(false)),
+                (Some(true), Some(false)),
+            ] {
+                let (mut x, mut y) = (base.clone(), base.clone());
+                set(&mut x, a);
+                set(&mut y, b);
+                pairs.push((format!("{field} {a:?} vs {b:?}"), x, y, false));
+            }
+        }
+        for (a, b) in [
+            (("SortName", "Ascending"), ("DateCreated", "Ascending")),
+            (("SortName", "Ascending"), ("SortName", "Descending")),
+            (
+                ("SortName", "Ascending"),
+                ("SortName,DateCreated", "Ascending"),
+            ),
+            // The order of the terms, and a later term's own direction.
+            (
+                ("SortName,DateCreated", "Ascending"),
+                ("DateCreated,SortName", "Ascending"),
+            ),
+            (
+                ("SortName,DateCreated", "Ascending,Ascending"),
+                ("SortName,DateCreated", "Ascending,Descending"),
+            ),
+        ] {
+            let x = FilterRequest {
+                sort_by: a.0,
+                sort_order: a.1,
+                ..base.clone()
+            };
+            let y = FilterRequest {
+                sort_by: b.0,
+                sort_order: b.1,
+                ..base.clone()
+            };
+            pairs.push((format!("sort {a:?} vs {b:?}"), x, y, false));
+        }
+        assert_eq!(
+            pairs.len(),
+            49,
+            "7 lists at 2 pairs, 21 list swaps, 3 flags at 3 and 5 sorts"
         );
-        assert_ne!(key, key2);
+
+        let clear = || super::FILTER_QUERY_CACHE.lock().clear();
+        let (mut same_key, mut shared) = (Vec::new(), Vec::new());
+        for (case, x, y, same_sql) in &pairs {
+            // The keys themselves: through the cache, equal keys that hash apart rarely meet.
+            if key(x) == key(y) {
+                same_key.push(case.as_str());
+            }
+            // What each gets from an empty cache. The pair must render different SQL, except the
+            // two lists that render the same clause.
+            clear();
+            let x_sql = cached_sql(x);
+            clear();
+            let y_sql = cached_sql(y);
+            if *same_sql {
+                assert_eq!(x_sql, y_sql, "{case}: expected the same SQL");
+            } else {
+                assert_ne!(x_sql, y_sql, "{case}: both render the same SQL");
+            }
+            // Each order, from an empty cache.
+            clear();
+            let x_first = (cached_sql(x), cached_sql(y));
+            clear();
+            let y_first = (cached_sql(y), cached_sql(x));
+            if x_first != (x_sql.clone(), y_sql.clone()) || y_first != (y_sql, x_sql) {
+                shared.push(case.as_str());
+            }
+        }
+        assert!(
+            same_key.is_empty() && shared.is_empty(),
+            "these pairs got the same key: {same_key:?}; these shared SQL: {shared:?}"
+        );
     }
 }

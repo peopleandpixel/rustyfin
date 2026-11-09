@@ -111,7 +111,7 @@ pub async fn parse_nfo(nfo_path: &Path) -> Option<ExternalMetadata> {
     None
 }
 
-/// Find a .nfo file next to a media file
+/// Find a .nfo file next to a media file. A series reads its own with `find_series_nfo` instead.
 pub fn find_nfo_for_media(media_path: &Path) -> Option<std::path::PathBuf> {
     let stem = media_path.file_stem()?;
     let parent = media_path.parent()?;
@@ -122,13 +122,18 @@ pub fn find_nfo_for_media(media_path: &Path) -> Option<std::path::PathBuf> {
         return Some(nfo);
     }
 
-    // Try movie.nfo or tvshow.nfo in same directory
-    for name in &["movie.nfo", "tvshow.nfo"] {
-        let p = parent.join(name);
-        if p.exists() {
-            return Some(p);
-        }
+    // Try movie.nfo in same directory. A tvshow.nfo there belongs to the series, not to its seasons.
+    let p = parent.join("movie.nfo");
+    if p.exists() {
+        return Some(p);
     }
 
     None
+}
+
+/// The `tvshow.nfo` inside the series folder `series_dir`, where Jellyfin 12.4 reads it
+/// (`MediaBrowser.XbmcMetadata/Providers/SeriesNfoProvider.cs:61`).
+pub fn find_series_nfo(series_dir: &Path) -> Option<std::path::PathBuf> {
+    let p = series_dir.join("tvshow.nfo");
+    p.exists().then_some(p)
 }

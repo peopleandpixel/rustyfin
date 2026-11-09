@@ -44,4 +44,10 @@ pub struct AppState {
     pub image_cache: ImageCache,
     /// Shared HTTP client for external API calls (TMDB, etc.)
     pub http_client: Client,
+    /// Shared TMDb client (rate limiter, retries, response cache). Cloning shares them.
+    pub tmdb: rustyfin_core::tmdb_client::TmdbClient,
+    /// OIDC provider cache and HTTP client (discovery and JWKS are fetched through it).
+    pub oidc: crate::oidc::OidcState,
+    /// The one import from Jellyfin this server runs at a time, and its status.
+    pub jellyfin_import: rustyfin_core::jellyfin_import::ImportJob,
 }

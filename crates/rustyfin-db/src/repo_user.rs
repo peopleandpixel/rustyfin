@@ -291,28 +291,57 @@ pub async fn update_last_login(pool: &SqlitePool, id: Uuid) -> Result<(), sqlx::
     Ok(())
 }
 
+/// Deletes the user and every row of theirs in one transaction. The listed keys have no ON DELETE
+/// action, so the rows that reference the user go first. Returns whether the users row existed.
 pub async fn delete_user(pool: &SqlitePool, id: Uuid) -> Result<bool, sqlx::Error> {
+    let id = id.to_string();
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    for sql in [
+        "DELETE FROM user_item_data WHERE user_id = ?",
+        "DELETE FROM pinned_episodes WHERE user_id = ?",
+        "DELETE FROM display_preferences WHERE user_id = ?",
+        "DELETE FROM playlists WHERE user_id = ?",
+        "DELETE FROM collections WHERE user_id = ?",
+        "DELETE FROM password_reset_pins WHERE user_id = ?",
+        "DELETE FROM access_tokens WHERE user_id = ?",
+    ] {
+        sqlx::query(sql).bind(&id).execute(&mut *tx).await?;
+    }
     let result = sqlx::query("DELETE FROM users WHERE id = ?")
-        .bind(id.to_string())
-        .execute(pool)
+        .bind(&id)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
     Ok(result.rows_affected() > 0)
 }
 
+/// Sets a user's password hash and returns whether the user exists. A password write also ends the
+/// user's one-time setup code, in the same transaction (B20 3.6).
 pub async fn update_password(
     pool: &SqlitePool,
     id: Uuid,
     password_hash: &str,
 ) -> Result<bool, sqlx::Error> {
+    let id = id.to_string();
+    let mut tx = pool.begin().await?;
     let result = sqlx::query("UPDATE users SET password_hash = ? WHERE id = ?")
         .bind(password_hash)
-        .bind(id.to_string())
-        .execute(pool)
+        .bind(&id)
+        .execute(&mut *tx)
         .await?;
-    Ok(result.rows_affected() > 0)
+    let updated = result.rows_affected() > 0;
+    if updated {
+        sqlx::query("DELETE FROM user_setup_codes WHERE user_id = ?")
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(updated)
 }
 
-/// Sets the administrator flag by hand.
+/// Sets the administrator flag by hand. A hand change clears the flag the admin group set (AC19);
+/// sending the current value keeps it (AC42).
 /// Unguarded: no owner, self, disabled or last-administrator check. Only tests call it; the Policy
 /// endpoint uses `set_policy`.
 pub async fn update_policy(
@@ -320,11 +349,15 @@ pub async fn update_policy(
     id: Uuid,
     is_administrator: bool,
 ) -> Result<bool, sqlx::Error> {
-    let result = sqlx::query("UPDATE users SET is_administrator = ? WHERE id = ?")
-        .bind(is_administrator as i32)
-        .bind(id.to_string())
-        .execute(pool)
-        .await?;
+    let result = sqlx::query(
+        "UPDATE users SET admin_from_group = \
+         CASE WHEN is_administrator = ?1 THEN admin_from_group ELSE 0 END, \
+         is_administrator = ?1 WHERE id = ?2",
+    )
+    .bind(is_administrator as i32)
+    .bind(id.to_string())
+    .execute(pool)
+    .await?;
     Ok(result.rows_affected() > 0)
 }
 
@@ -392,12 +425,16 @@ pub async fn set_policy(
         }
     }
 
-    sqlx::query("UPDATE users SET is_administrator = ?1, is_disabled = ?2 WHERE id = ?3")
-        .bind(new_admin as i32)
-        .bind(new_disabled as i32)
-        .bind(id.to_string())
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query(
+        "UPDATE users SET admin_from_group = \
+         CASE WHEN is_administrator = ?1 THEN admin_from_group ELSE 0 END, \
+         is_administrator = ?1, is_disabled = ?2 WHERE id = ?3",
+    )
+    .bind(new_admin as i32)
+    .bind(new_disabled as i32)
+    .bind(id.to_string())
+    .execute(&mut *tx)
+    .await?;
 
     if is_disabled == Some(true) {
         sqlx::query("DELETE FROM access_tokens WHERE user_id = ?")
@@ -416,6 +453,59 @@ pub async fn set_policy(
     tx.commit().await?;
 
     Ok(PolicyChange::Done)
+}
+
+/// Makes the user an administrator through the admin group (AC17). The flag records that the group
+/// gave the rights. An existing administrator is left as it is, flag and all.
+/// A disabled account is left as it is, so a sign-in that races a disable can't make a disabled
+/// administrator.
+/// The executor is a pool, or a transaction the caller holds.
+pub async fn grant_group_admin<'e, E>(executor: E, id: Uuid) -> Result<(), sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    sqlx::query(
+        "UPDATE users SET is_administrator = 1, admin_from_group = 1 \
+         WHERE id = ? AND is_administrator = 0 AND is_disabled = 0",
+    )
+    .bind(id.to_string())
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
+/// Takes back the administrator rights the admin group gave the user (AC18). They stay when the user
+/// is the owner, or when no other enabled administrator would be left. Returns whether they went.
+/// The executor is a pool, or a transaction the caller holds.
+pub async fn revoke_group_admin<'e, E>(executor: E, id: Uuid) -> Result<bool, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    let done = sqlx::query(
+        "UPDATE users SET is_administrator = 0, admin_from_group = 0 \
+         WHERE id = ?1 AND admin_from_group = 1 AND is_owner = 0 \
+         AND EXISTS (SELECT 1 FROM users AS other \
+         WHERE other.is_administrator = 1 AND other.is_disabled = 0 AND other.id <> ?1)",
+    )
+    .bind(id.to_string())
+    .execute(executor)
+    .await?;
+    Ok(done.rows_affected() > 0)
+}
+
+/// Whether the admin group gave the user its administrator rights (AC17).
+/// The executor is a pool, or a transaction the caller holds.
+pub async fn admin_from_group<'e, E>(executor: E, id: Uuid) -> Result<bool, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    let flagged: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM users WHERE id = ? AND admin_from_group = 1)",
+    )
+    .bind(id.to_string())
+    .fetch_one(executor)
+    .await?;
+    Ok(flagged)
 }
 
 pub async fn update_configuration(

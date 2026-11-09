@@ -1,0 +1,10 @@
+{
+  "quality": "FLAC",
+  "qualityVersion": 1,
+  "releaseTitle": "Velvet_Static-Paper_Moons-CD-FLAC-2001-ECHOLAB",
+  "downloadClient": "qBittorrent",
+  "downloadId": "A91F0C7D3E5B48269D1C7F4B02E8A5D63C19B7E4",
+  "eventType": "DownloadFailure",
+  "instanceName": "Lidarr",
+  "applicationUrl": "http://lidarr.lan:8686"
+}

@@ -1,8 +1,12 @@
+use axum::Extension;
 use axum::Router;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use rustyfin_db::repo_playback::StreamChoice;
+use rustyfin_model::auth::Claims;
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path as FilePath;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
@@ -11,12 +15,15 @@ use uuid::Uuid;
 use crate::error::ApiError;
 use crate::state::AppState;
 
+mod media_info;
+
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route("/Videos/{id}/stream", get(stream_video).head(head_stream))
+        .merge(media_info::routes())
+        .route("/Videos/{id}/stream", get(stream_video).head(head_video))
         .route(
             "/Videos/{id}/stream.{container}",
-            get(stream_video).head(head_stream),
+            get(stream_video).head(head_video),
         )
         .route(
             "/Videos/{id}/progressive.stream",
@@ -34,12 +41,105 @@ pub fn routes() -> Router<AppState> {
         .route("/Audio/{id}/PlaybackInfo", get(audio_playback_info))
 }
 
+// ---------------------------------------------------------------------------
+// Video versions
+// ---------------------------------------------------------------------------
+
+/// Which version of an item a playback request plays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Version {
+    /// No MediaSourceId, a blank one or the item's own id: the item's file.
+    Primary,
+    /// The source at this index of the item's sources.
+    Source(usize),
+}
+
+/// The request's MediaSourceId (name matched in any ASCII case), trimmed. None when absent or
+/// blank.
+pub(crate) fn requested_source_id(params: &HashMap<String, String>) -> Option<&str> {
+    params
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("MediaSourceId"))
+        .map(|(_, value)| value.trim())
+        .filter(|value| !value.is_empty())
+        // A client sends one name; should several match, the smallest value does not depend on
+        // the map's order
+        .min()
+}
+
+/// The version `requested` names among `sources` of item `item_id`. ApiError::NotFound when it
+/// names none.
+pub(crate) fn select_version(
+    item_id: Uuid,
+    sources: &[rustyfin_model::media_source::MediaSourceResponse],
+    requested: Option<&str>,
+) -> Result<Version, ApiError> {
+    let Some(requested) = requested else {
+        return Ok(Version::Primary);
+    };
+    let wanted = Uuid::parse_str(requested).ok();
+    if wanted == Some(item_id) {
+        return Ok(Version::Primary);
+    }
+    sources
+        .iter()
+        .position(|source| {
+            source.id == requested
+                || (wanted.is_some() && Uuid::parse_str(&source.id).ok() == wanted)
+        })
+        .map(Version::Source)
+        .ok_or_else(|| {
+            ApiError::NotFound(format!(
+                "Media source {requested} not found for item {item_id}"
+            ))
+        })
+}
+
+/// The path of a video route. `stream.{container}` has a second parameter, which serde ignores.
+#[derive(Deserialize)]
+struct VideoPath {
+    id: Uuid,
+}
+
+/// The file that a video request plays: the item's own file, or the file of the version that its
+/// `MediaSourceId` names. The sources are read only when an id is given.
+async fn video_file(
+    state: &AppState,
+    id: Uuid,
+    params: &HashMap<String, String>,
+) -> Result<String, ApiError> {
+    let item = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Item {id} not found")))?;
+    let Some(requested) = requested_source_id(params) else {
+        return Ok(item.path);
+    };
+    let sources = rustyfin_db::repo_media_source::get_media_sources(&state.db_ro, &id).await?;
+    match select_version(id, &sources, Some(requested))? {
+        Version::Primary => Ok(item.path),
+        Version::Source(index) => Ok(sources[index].path.clone()),
+    }
+}
+
+/// `GET /Videos/{id}/stream` and `stream.{container}`: the file of the requested version.
 async fn stream_video(
-    state: State<AppState>,
-    path: Path<Uuid>,
+    State(state): State<AppState>,
+    Path(VideoPath { id }): Path<VideoPath>,
+    Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    stream_file(state, path, headers).await
+    let file_path = video_file(&state, id, &params).await?;
+    serve_file(file_path, &headers).await
+}
+
+/// `HEAD` of `stream` and `stream.{container}`: the headers of the file that `GET` serves.
+async fn head_video(
+    State(state): State<AppState>,
+    Path(VideoPath { id }): Path<VideoPath>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Response, ApiError> {
+    let file_path = video_file(&state, id, &params).await?;
+    head_file(&file_path).await
 }
 
 async fn stream_audio(
@@ -58,7 +158,12 @@ async fn head_stream(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Item {id} not found")))?;
 
-    let file_path = &item.path;
+    head_file(&item.path).await
+}
+
+/// The headers of a `HEAD` for the file at `file_path`: its type, its length, and that byte
+/// ranges are accepted.
+async fn head_file(file_path: &str) -> Result<Response, ApiError> {
     let metadata = tokio::fs::metadata(file_path)
         .await
         .map_err(|e| ApiError::NotFound(format!("File not accessible: {e}")))?;
@@ -86,7 +191,12 @@ async fn stream_file(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Item {id} not found")))?;
 
-    let file_path = item.path.clone();
+    serve_file(item.path, &headers).await
+}
+
+/// Serves the file at `file_path` for a request with `headers`: the whole file, or the byte range,
+/// 304 or 416 that the headers ask for.
+async fn serve_file(file_path: String, headers: &HeaderMap) -> Result<Response, ApiError> {
     let content_type = mime_from_path(&file_path);
 
     // Open file first, then get metadata from the file handle — avoids a separate stat() syscall
@@ -118,13 +228,13 @@ async fn stream_file(
         return Ok((StatusCode::NOT_MODIFIED, ()).into_response());
     }
 
-    let range_header = headers
+    let byte_range = headers
         .get(header::RANGE)
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| parse_range(s, file_size));
+        .map_or(ByteRange::Ignore, |s| parse_range(s, file_size));
 
-    match range_header {
-        Some((start, end)) => {
+    match byte_range {
+        ByteRange::Partial(start, end) => {
             let length = end - start + 1;
 
             // Reopen for range request (need mutable handle for seek)
@@ -156,7 +266,15 @@ async fn stream_file(
             )
                 .into_response())
         }
-        None => {
+        ByteRange::Unsatisfiable => Ok((
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            [
+                (header::CONTENT_RANGE, format!("bytes */{file_size}")),
+                (header::ACCEPT_RANGES, "bytes".to_string()),
+            ],
+        )
+            .into_response()),
+        ByteRange::Ignore => {
             let file = tokio::fs::File::open(&file_path)
                 .await
                 .map_err(|e| ApiError::Internal(format!("Cannot open file: {e}")))?;
@@ -180,30 +298,66 @@ async fn stream_file(
     }
 }
 
-/// Parse a `Range: bytes=START-END` header, returning inclusive (start, end).
-fn parse_range(range: &str, file_size: u64) -> Option<(u64, u64)> {
-    let range = range.strip_prefix("bytes=")?;
-    let mut parts = range.splitn(2, '-');
-    let start_str = parts.next()?.trim();
-    let end_str = parts.next()?.trim();
+/// How to answer a `Range` header (RFC 9110 §14.1.2).
+#[derive(Debug, PartialEq, Eq)]
+enum ByteRange {
+    /// 206 with bytes `start..=end`.
+    Partial(u64, u64),
+    /// 416 with `Content-Range: bytes */<size>`.
+    Unsatisfiable,
+    /// Not a single byte range we serve: 200 with the whole file.
+    Ignore,
+}
+
+/// Parse a `Range: bytes=START-END` header for a file of `file_size` bytes.
+fn parse_range(range: &str, file_size: u64) -> ByteRange {
+    let Some(spec) = range.strip_prefix("bytes=") else {
+        return ByteRange::Ignore;
+    };
+    // Multi-range requests are not served; they get the whole file.
+    if spec.contains(',') {
+        return ByteRange::Ignore;
+    }
+    let Some((start_str, end_str)) = spec.split_once('-') else {
+        return ByteRange::Ignore;
+    };
+    let start_str = start_str.trim();
+    let end_str = end_str.trim();
 
     if start_str.is_empty() {
-        // suffix range: bytes=-500
-        let suffix: u64 = end_str.parse().ok()?;
-        let start = file_size.checked_sub(suffix)?;
-        Some((start, file_size - 1))
-    } else {
-        let start: u64 = start_str.parse().ok()?;
-        let end = if end_str.is_empty() {
-            file_size - 1
-        } else {
-            end_str.parse().ok()?
+        // Suffix range: `bytes=-N` is the last N bytes.
+        return match end_str.parse::<u64>() {
+            Ok(0) => ByteRange::Unsatisfiable,
+            Ok(n) if n > file_size => ByteRange::Ignore,
+            Ok(n) => ByteRange::Partial(file_size - n, file_size - 1),
+            Err(_) => ByteRange::Ignore,
         };
-        if start > end || start >= file_size {
-            return None;
-        }
-        Some((start, end.min(file_size - 1)))
     }
+
+    let Ok(start) = start_str.parse::<u64>() else {
+        return ByteRange::Ignore;
+    };
+    // `A-` has no explicit end and runs to the last byte of the file.
+    let end = if end_str.is_empty() {
+        None
+    } else {
+        let Ok(end) = end_str.parse::<u64>() else {
+            return ByteRange::Ignore;
+        };
+        if end < start {
+            return ByteRange::Ignore;
+        }
+        Some(end)
+    };
+    if start >= file_size {
+        return ByteRange::Unsatisfiable;
+    }
+    // start < file_size here, so file_size >= 1 and `file_size - 1` cannot underflow.
+    let last = match end {
+        Some(end) => end.min(file_size - 1),
+        None => file_size - 1,
+    };
+    ByteRange::Partial(start, last)
 }
 
 fn mime_from_path(path: &str) -> String {
@@ -417,12 +571,10 @@ async fn audio_playback_info(
 async fn stream_video_progressive(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    Query(params): Query<HashMap<String, String>>,
 ) -> Result<Response, ApiError> {
-    let item = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, id)
-        .await?
-        .ok_or_else(|| ApiError::NotFound(format!("Video item {id} not found")))?;
+    let file_path = video_file(&state, id, &params).await?;
 
-    let file_path = item.path.clone();
     let metadata = tokio::fs::metadata(&file_path)
         .await
         .map_err(|e| ApiError::NotFound(format!("File not accessible: {e}")))?;
@@ -474,7 +626,6 @@ struct VideoPlaybackInfoQuery {
     subtitle_stream_index: Option<i32>,
     start_time_ticks: Option<i64>,
     is_live: bool,
-    media_source_id: Option<String>,
     device_id: Option<String>,
     video_codec: Option<String>,
     audio_codec: Option<String>,
@@ -488,6 +639,10 @@ struct VideoPlaybackInfoQuery {
     height: Option<i32>,
     max_streaming_bitrate: Option<u32>,
     segment_time: Option<u32>,
+    profile: Option<String>,
+    max_video_bit_depth: Option<u32>,
+    h264_profile: Option<String>,
+    h264_video_bit_depth: Option<String>,
 }
 
 impl From<HashMap<String, String>> for VideoPlaybackInfoQuery {
@@ -505,7 +660,6 @@ impl From<HashMap<String, String>> for VideoPlaybackInfoQuery {
                 .get("IsLive")
                 .map(|v| v.parse().unwrap_or(false))
                 .unwrap_or(false),
-            media_source_id: params.get("MediaSourceId").cloned(),
             device_id: params.get("DeviceId").cloned(),
             // Support both singular (VideoCodec) and plural (VideoCodecs) parameter names
             video_codec: params
@@ -543,7 +697,59 @@ impl From<HashMap<String, String>> for VideoPlaybackInfoQuery {
                 .get("MaxStreamingBitrate")
                 .and_then(|v| v.parse().ok()),
             segment_time: params.get("SegmentTime").and_then(|v| v.parse().ok()),
+            profile: params.get("Profile").cloned(),
+            max_video_bit_depth: params.get("MaxVideoBitDepth").and_then(|v| v.parse().ok()),
+            h264_profile: params.get("h264-profile").cloned(),
+            h264_video_bit_depth: params.get("h264-videobitdepth").cloned(),
         }
+    }
+}
+
+/// What a transcode must carry for a source, beyond what a direct play or stream would
+#[derive(Debug, Default, PartialEq, Eq)]
+struct TrackNeeds {
+    /// The request names an audio stream other than the default one
+    other_audio: bool,
+    /// The request names a picture subtitle that the transcode burns in
+    burn_in: bool,
+}
+
+/// The tracks that `query` names on `source` and that a direct play or stream would not carry
+fn track_needs(
+    source: &rustyfin_model::media_source::MediaSourceResponse,
+    query: &VideoPlaybackInfoQuery,
+) -> TrackNeeds {
+    let audio: Vec<_> = source
+        .media_streams
+        .iter()
+        .filter(|s| is_stream_type(s, "Audio"))
+        .collect();
+    // The default audio is the first flagged one, else the first one
+    let default_audio = audio
+        .iter()
+        .find(|s| s.is_default)
+        .or_else(|| audio.first());
+    let other_audio = match (query.audio_stream_index, default_audio) {
+        (Some(wanted), Some(default)) => {
+            let wanted = i64::from(wanted);
+            audio.iter().any(|s| i64::from(s.index) == wanted) && i64::from(default.index) != wanted
+        }
+        _ => false,
+    };
+    // Picture subtitles are burned in by the transcode, text ones are drawn by the browser
+    let burn_in = match query.subtitle_stream_index {
+        Some(wanted) if wanted >= 0 => source.media_streams.iter().any(|s| {
+            s.index == wanted
+                && is_stream_type(s, "Subtitle")
+                && s.codec
+                    .as_deref()
+                    .is_some_and(rustyfin_core::subtitle::is_image_subtitle)
+        }),
+        _ => false,
+    };
+    TrackNeeds {
+        other_audio,
+        burn_in,
     }
 }
 
@@ -554,59 +760,59 @@ async fn video_universal(
     Path(id): Path<Uuid>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Response, ApiError> {
-    let query = VideoPlaybackInfoQuery::from(params.clone());
-
     // Single query: verify item exists and fetch media sources with streams
     let mut media_sources =
         rustyfin_db::repo_media_source::get_media_sources_with_item_check(&state.db_ro, &id)
             .await
             .ok_or_else(|| ApiError::NotFound(format!("Video item {id} not found")))?;
 
-    // Select the appropriate media source
-    let selected_source_index = if let Some(ref source_id) = query.media_source_id {
-        media_sources
-            .iter()
-            .position(|s| s.id == *source_id)
-            .unwrap_or(0)
-    } else {
-        0
+    // The index of the version the request names; an id that names none is refused
+    let index = match select_version(id, &media_sources, requested_source_id(&params))? {
+        Version::Primary => 0,
+        Version::Source(index) => index,
     };
+    let query = VideoPlaybackInfoQuery::from(params);
 
     // Generate playback session ID
     let play_session_id = uuid::Uuid::new_v4().to_string();
 
-    // Determine direct play/stream/transcode capability
-    let (supports_direct_play, supports_direct_stream, supports_transcoding) = if media_sources
-        .is_empty()
-    {
-        // No media sources - fallback to transcoding if possible
-        (false, false, true)
-    } else {
-        let source = &media_sources[selected_source_index];
-
-        let can_direct_play = query.enable_direct_play && check_direct_play(source, &query);
-        let can_direct_stream = query.enable_direct_stream && check_direct_stream(source, &query);
-        let can_transcode = true;
-
-        (can_direct_play, can_direct_stream, can_transcode)
+    // The tracks the request names that a direct play or stream would not carry
+    let needs = match media_sources.get(index) {
+        Some(source) => track_needs(source, &query),
+        None => TrackNeeds::default(),
     };
+
+    // Determine direct play/stream/transcode capability
+    let (supports_direct_play, supports_direct_stream, supports_transcoding) =
+        if media_sources.is_empty() {
+            // No media sources - fallback to transcoding if possible
+            (false, false, true)
+        } else {
+            let source = &media_sources[index];
+
+            let can_direct_play = query.enable_direct_play
+                && !needs.other_audio
+                && !needs.burn_in
+                && check_direct_play(source, &query);
+            let can_direct_stream = query.enable_direct_stream
+                && !needs.other_audio
+                && !needs.burn_in
+                && check_direct_stream(source, &query);
+            let can_transcode = true;
+
+            (can_direct_play, can_direct_stream, can_transcode)
+        };
 
     // Build the URL based on playback method
     let url = if supports_direct_play {
         Some(format!(
             "/Videos/{}/stream?MediaSourceId={}&Static=true",
-            id,
-            media_sources
-                .first()
-                .map_or("".to_string(), |s| s.id.clone())
+            id, media_sources[index].id
         ))
     } else if supports_direct_stream {
         Some(format!(
             "/Videos/{}/stream?MediaSourceId={}",
-            id,
-            media_sources
-                .first()
-                .map_or("".to_string(), |s| s.id.clone())
+            id, media_sources[index].id
         ))
     } else if supports_transcoding {
         let mut url = format!(
@@ -614,6 +820,9 @@ async fn video_universal(
             id,
             query.device_id.unwrap_or_default()
         );
+        if let Some(source) = media_sources.get(index) {
+            url.push_str(&format!("&MediaSourceId={}", source.id));
+        }
         if let Some(bitrate) = query.max_video_bitrate {
             url.push_str(&format!("&VideoBitrate={}", bitrate));
         }
@@ -635,9 +844,19 @@ async fn video_universal(
         if let Some(ticks) = query.start_time_ticks {
             url.push_str(&format!("&StartTimeTicks={}", ticks));
         }
+        if let Some(audio) = query.audio_stream_index {
+            url.push_str(&format!("&AudioStreamIndex={}", audio));
+        }
+        if let Some(subtitle) = query.subtitle_stream_index.filter(|&i| i >= 0) {
+            url.push_str(&format!("&SubtitleStreamIndex={}", subtitle));
+        }
+        if needs.burn_in {
+            url.push_str("&SubtitleMethod=Encode");
+        }
         if let Some(seg_time) = query.segment_time {
             url.push_str(&format!("&SegmentTime={}", seg_time));
         }
+        url.push_str(&format!("&PlaySessionId={}", play_session_id));
         Some(url)
     } else {
         None
@@ -645,9 +864,9 @@ async fn video_universal(
 
     // Update media sources with direct play flags based on client capabilities
     for (i, source) in media_sources.iter_mut().enumerate() {
-        source.supports_direct_play = i == selected_source_index && supports_direct_play;
-        source.supports_direct_stream = i == selected_source_index && supports_direct_stream;
-        source.supports_transcoding = i == selected_source_index && supports_transcoding;
+        source.supports_direct_play = i == index && supports_direct_play;
+        source.supports_direct_stream = i == index && supports_direct_stream;
+        source.supports_transcoding = i == index && supports_transcoding;
     }
 
     let response = rustyfin_model::playback_info::StreamingResponse {
@@ -667,29 +886,32 @@ async fn video_universal(
 }
 
 /// `GET /Videos/{id}/PlaybackInfo` — Returns playback info for a video item.
-/// Includes direct play detection based on client codec support.
+/// Includes direct play detection based on client codec support. Each source's default tracks
+/// are the caller's remembered tracks, where the source has them.
 async fn video_playback_info(
     State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
     Path(id): Path<Uuid>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Response, ApiError> {
-    let query = VideoPlaybackInfoQuery::from(params);
-
     // Single query: verify item exists and fetch media sources with streams
     let mut media_sources =
         rustyfin_db::repo_media_source::get_media_sources_with_item_check(&state.db_ro, &id)
             .await
             .ok_or_else(|| ApiError::NotFound(format!("Video item {id} not found")))?;
 
-    // Select the appropriate media source
-    let selected_source_index = if let Some(ref source_id) = query.media_source_id {
-        media_sources
-            .iter()
-            .position(|s| s.id == *source_id)
-            .unwrap_or(0)
-    } else {
-        0
+    // The subtitle files beside each video are listed after its streams
+    for source in media_sources.iter_mut() {
+        let external = crate::routes::subtitle::external_streams(source).await;
+        source.media_streams.extend(external);
+    }
+
+    // The index of the version the request names; an id that names none is refused
+    let index = match select_version(id, &media_sources, requested_source_id(&params))? {
+        Version::Primary => 0,
+        Version::Source(index) => index,
     };
+    let query = VideoPlaybackInfoQuery::from(params);
 
     // Generate playback session ID
     let play_session_id = uuid::Uuid::new_v4().to_string();
@@ -701,7 +923,7 @@ async fn video_playback_info(
         // No media sources - fallback to transcoding if possible
         (false, false, true)
     } else {
-        let source = &media_sources[selected_source_index];
+        let source = &media_sources[index];
 
         // Check if client can direct play
         let can_direct_play = query.enable_direct_play && check_direct_play(source, &query);
@@ -717,10 +939,34 @@ async fn video_playback_info(
 
     // Update media sources with direct play flags based on client capabilities
     for (i, source) in media_sources.iter_mut().enumerate() {
-        source.supports_direct_play = i == selected_source_index && supports_direct_play;
-        source.supports_direct_stream = i == selected_source_index && supports_direct_stream;
-        source.supports_transcoding = i == selected_source_index && supports_transcoding;
+        source.supports_direct_play = i == index && supports_direct_play;
+        source.supports_direct_stream = i == index && supports_direct_stream;
+        source.supports_transcoding = i == index && supports_transcoding;
     }
+
+    // The caller's remembered tracks become each source's defaults, where the source has them
+    let (remembered_audio, remembered_subtitle) =
+        rustyfin_db::repo_playback::get_stream_choice(&state.db_ro, claims.sub, id).await?;
+    let media_sources: Vec<rustyfin_model::playback_info::PlaybackMediaSource> = media_sources
+        .into_iter()
+        .map(|source| {
+            let default_audio_stream_index = remembered_audio
+                .as_ref()
+                .filter(|choice| has_remembered_stream(&source, "Audio", choice))
+                .map(|choice| choice.index);
+            let default_subtitle_stream_index = remembered_subtitle
+                .as_ref()
+                .filter(|choice| {
+                    choice.index == -1 || has_remembered_stream(&source, "Subtitle", choice)
+                })
+                .map(|choice| choice.index);
+            rustyfin_model::playback_info::PlaybackMediaSource {
+                source,
+                default_audio_stream_index,
+                default_subtitle_stream_index,
+            }
+        })
+        .collect();
 
     let response = rustyfin_model::playback_info::VideoPlaybackInfoResponse {
         media_sources,
@@ -755,6 +1001,98 @@ async fn get_chapters(
         .into_response())
 }
 
+/// Whether the first video and audio streams use a codec from the client's lists.
+/// A list without entries falls back to the codecs a client is assumed to play.
+fn codecs_playable(
+    source: &rustyfin_model::media_source::MediaSourceResponse,
+    query: &VideoPlaybackInfoQuery,
+) -> bool {
+    // Comma-separated, e.g. "h264,hevc,vp9"
+    let codec_list = |list: Option<&str>, fallback: &[&str]| -> Vec<String> {
+        let entries: Vec<String> = list
+            .unwrap_or_default()
+            .split(',')
+            .map(|c| c.trim().to_lowercase())
+            .filter(|c| !c.is_empty())
+            .collect();
+        if entries.is_empty() {
+            fallback.iter().map(|c| c.to_string()).collect()
+        } else {
+            entries
+        }
+    };
+    let video_codecs = codec_list(query.video_codec.as_deref(), &["h264", "avc1"]);
+    let audio_codecs = codec_list(query.audio_codec.as_deref(), &["aac", "mp4a", "mp3"]);
+
+    // A stream without a codec passes
+    let listed = |codec_type: &str, codecs: &[String]| {
+        source
+            .media_streams
+            .iter()
+            .find(|s| is_stream_type(s, codec_type))
+            .and_then(|s| s.codec.as_ref())
+            .is_none_or(|codec| {
+                let codec = codec.to_lowercase();
+                codecs.iter().any(|c| codec.contains(c.as_str()))
+            })
+    };
+    listed("Video", &video_codecs) && listed("Audio", &audio_codecs)
+}
+
+/// Whether `stream` is of `kind` ("Video", "Audio"). The probe stores ffprobe's lowercase types.
+fn is_stream_type(stream: &rustyfin_model::media_source::MediaStream, kind: &str) -> bool {
+    stream.codec_type.eq_ignore_ascii_case(kind)
+}
+
+/// Whether the client takes the first video stream of `source` as it is, by the rule in
+/// `transcode::client_takes_h264`. That is the stream `codecs_playable` checks; one that isn't
+/// H.264, or no video at all, has nothing to refuse.
+fn client_takes_h264_video(
+    source: &rustyfin_model::media_source::MediaSourceResponse,
+    query: &VideoPlaybackInfoQuery,
+) -> bool {
+    use super::transcode::{H264Request, client_takes_h264};
+
+    let Some(video) = source
+        .media_streams
+        .iter()
+        .find(|s| is_stream_type(s, "Video"))
+    else {
+        return true;
+    };
+    let is_h264 = video.codec.as_deref().is_some_and(|codec| {
+        ["h264", "avc", "avc1"]
+            .iter()
+            .any(|name| codec.eq_ignore_ascii_case(name))
+    });
+    if !is_h264 {
+        return true;
+    }
+    let request = H264Request {
+        profile: query.profile.as_deref(),
+        h264_profile: query.h264_profile.as_deref(),
+        max_video_bit_depth: query.max_video_bit_depth,
+        h264_video_bit_depth: query.h264_video_bit_depth.as_deref(),
+    };
+    client_takes_h264(request, video.profile.as_deref(), video.bit_depth)
+}
+
+/// Whether `source` has a stream of `kind` ("Audio", "Subtitle") at the choice's index whose key is
+/// the one stored with the choice. A choice with no stored key never matches.
+fn has_remembered_stream(
+    source: &rustyfin_model::media_source::MediaSourceResponse,
+    kind: &str,
+    choice: &StreamChoice,
+) -> bool {
+    let Some(key) = choice.key.as_deref() else {
+        return false;
+    };
+    source
+        .media_streams
+        .iter()
+        .any(|s| s.index == choice.index && is_stream_type(s, kind) && s.identity().key() == key)
+}
+
 /// Check if a media source can be directly played by the client.
 /// Direct play requires the client to support all codecs without any transcoding.
 fn check_direct_play(
@@ -763,8 +1101,14 @@ fn check_direct_play(
 ) -> bool {
     // If no media streams are available, we cannot verify codec compatibility.
     // Reject direct play to avoid Format errors in the browser.
-    let has_video_stream = source.media_streams.iter().any(|s| s.codec_type == "Video");
-    let has_audio_stream = source.media_streams.iter().any(|s| s.codec_type == "Audio");
+    let has_video_stream = source
+        .media_streams
+        .iter()
+        .any(|s| is_stream_type(s, "Video"));
+    let has_audio_stream = source
+        .media_streams
+        .iter()
+        .any(|s| is_stream_type(s, "Audio"));
     if !has_video_stream && !has_audio_stream {
         // No stream info at all - cannot verify compatibility, reject direct play
         return false;
@@ -807,110 +1151,21 @@ fn check_direct_play(
         }
     }
 
-    // Parse codec lists (comma-separated, e.g. "h264,hevc,vp9")
-    let video_codecs: Vec<String> = query
-        .video_codec
-        .as_ref()
-        .map(|s| s.split(',').map(|c| c.trim().to_lowercase()).collect())
-        .unwrap_or_default();
-    let audio_codecs: Vec<String> = query
-        .audio_codec
-        .as_ref()
-        .map(|s| s.split(',').map(|c| c.trim().to_lowercase()).collect())
-        .unwrap_or_default();
-
-    // If no codec preferences are specified, check browser compatibility
-    if video_codecs.is_empty() && audio_codecs.is_empty() {
-        // Check if video codec is browser-compatible (H.264/AVC is the safest)
-        let browser_compatible_video_codecs =
-            ["h264", "avc1", "hevc", "h265", "vp8", "vp9", "av01"];
-        if let Some(video_stream) = source
-            .media_streams
-            .iter()
-            .find(|s| s.codec_type == "Video")
-            && let Some(ref codec) = video_stream.codec
-        {
-            let codec_lower = codec.to_lowercase();
-            if !browser_compatible_video_codecs
-                .iter()
-                .any(|c| codec_lower.contains(c))
-            {
-                return false;
-            }
-        }
-        // Check if audio codec is browser-compatible
-        let browser_compatible_audio_codecs = ["mp3", "aac", "opus", "ac3", "mp4a"];
-        if let Some(audio_stream) = source
-            .media_streams
-            .iter()
-            .find(|s| s.codec_type == "Audio")
-            && let Some(ref codec) = audio_stream.codec
-        {
-            let codec_lower = codec.to_lowercase();
-            if !browser_compatible_audio_codecs
-                .iter()
-                .any(|c| codec_lower.contains(c))
-            {
-                return false;
-            }
-        }
+    // Codecs must be in the client's lists, or in the fallback lists if it sent none
+    if !codecs_playable(source, query) {
+        return false;
+    }
+    // The client must take H.264 video as it is, even when it sent no list
+    if !client_takes_h264_video(source, query) {
+        return false;
+    }
+    // Without any list, the codec check is the whole answer
+    let sent_list = [&query.video_codec, &query.audio_codec]
+        .into_iter()
+        .flatten()
+        .any(|list| list.split(',').any(|c| !c.trim().is_empty()));
+    if !sent_list {
         return true;
-    }
-
-    // Check video codec compatibility
-    if !video_codecs.is_empty() {
-        let video_stream = source
-            .media_streams
-            .iter()
-            .find(|s| s.codec_type == "Video");
-        if let Some(stream) = video_stream
-            && let Some(ref codec) = stream.codec
-        {
-            let codec_lower = codec.to_lowercase();
-            // Video codec must be in the list of supported codecs
-            if !video_codecs
-                .iter()
-                .any(|c| codec_lower.contains(c.as_str()))
-            {
-                return false;
-            }
-        }
-    }
-
-    // Check audio codec compatibility
-    if !audio_codecs.is_empty() {
-        let audio_stream = source
-            .media_streams
-            .iter()
-            .find(|s| s.codec_type == "Audio");
-        if let Some(stream) = audio_stream
-            && let Some(ref codec) = stream.codec
-        {
-            let codec_lower = codec.to_lowercase();
-            // Audio codec must be in the list of supported codecs
-            if !audio_codecs
-                .iter()
-                .any(|c| codec_lower.contains(c.as_str()))
-            {
-                return false;
-            }
-        }
-    } else if let Some(audio_stream) = source
-        .media_streams
-        .iter()
-        .find(|s| s.codec_type == "Audio")
-    {
-        // If no audio codec preference is specified, check if the audio codec is browser-compatible
-        let browser_compatible_audio_codecs = ["mp3", "aac", "opus", "ac3", "mp4a"];
-        if let Some(ref codec) = audio_stream.codec {
-            let codec_lower = codec.to_lowercase();
-            if !browser_compatible_audio_codecs
-                .iter()
-                .any(|c| codec_lower.contains(c))
-            {
-                return false;
-            }
-        }
     }
 
     // Check bitrate constraints
@@ -944,8 +1199,14 @@ fn check_direct_stream(
 
     // If no media streams are available, we cannot verify codec compatibility.
     // Reject direct stream to avoid Format errors in the browser.
-    let has_video_stream = source.media_streams.iter().any(|s| s.codec_type == "Video");
-    let has_audio_stream = source.media_streams.iter().any(|s| s.codec_type == "Audio");
+    let has_video_stream = source
+        .media_streams
+        .iter()
+        .any(|s| is_stream_type(s, "Video"));
+    let has_audio_stream = source
+        .media_streams
+        .iter()
+        .any(|s| is_stream_type(s, "Audio"));
     if !has_video_stream && !has_audio_stream {
         return false;
     }
@@ -973,20 +1234,23 @@ fn check_direct_stream(
         }
     }
 
+    // Codecs must be in the client's lists, or in the fallback lists if it sent none
+    if !codecs_playable(source, query) {
+        return false;
+    }
+    // The client must take H.264 video as it is
+    if !client_takes_h264_video(source, query) {
+        return false;
+    }
+
     // If video stream copy is not enabled and there's a video stream, need transcoding
-    if !query.enable_video_stream_copy {
-        let has_video = source.media_streams.iter().any(|s| s.codec_type == "Video");
-        if has_video {
-            return false;
-        }
+    if !query.enable_video_stream_copy && has_video_stream {
+        return false;
     }
 
     // If audio stream copy is not enabled and there's an audio stream, need transcoding
-    if !query.enable_audio_stream_copy {
-        let has_audio = source.media_streams.iter().any(|s| s.codec_type == "Audio");
-        if has_audio {
-            return false;
-        }
+    if !query.enable_audio_stream_copy && has_audio_stream {
+        return false;
     }
 
     // Check bitrate constraints — direct stream may still need to respect bitrate limits
@@ -1009,57 +1273,148 @@ mod tests {
 
     #[test]
     fn test_parse_range_full_range() {
-        assert_eq!(parse_range("bytes=0-999", 1000), Some((0, 999)));
+        assert_eq!(parse_range("bytes=0-999", 1000), ByteRange::Partial(0, 999));
     }
 
     #[test]
     fn test_parse_range_partial() {
-        assert_eq!(parse_range("bytes=100-199", 1000), Some((100, 199)));
+        assert_eq!(
+            parse_range("bytes=100-199", 1000),
+            ByteRange::Partial(100, 199)
+        );
     }
 
     #[test]
     fn test_parse_range_open_ended() {
-        assert_eq!(parse_range("bytes=500-", 1000), Some((500, 999)));
+        assert_eq!(
+            parse_range("bytes=500-", 1000),
+            ByteRange::Partial(500, 999)
+        );
     }
 
     #[test]
     fn test_parse_range_suffix() {
-        assert_eq!(parse_range("bytes=-100", 1000), Some((900, 999)));
+        assert_eq!(
+            parse_range("bytes=-100", 1000),
+            ByteRange::Partial(900, 999)
+        );
     }
 
     #[test]
     fn test_parse_range_clamp_end_to_file_size() {
-        assert_eq!(parse_range("bytes=0-9999", 1000), Some((0, 999)));
+        assert_eq!(
+            parse_range("bytes=0-9999", 1000),
+            ByteRange::Partial(0, 999)
+        );
     }
 
     #[test]
     fn test_parse_range_invalid_no_bytes_prefix() {
-        assert_eq!(parse_range("0-999", 1000), None);
+        assert_eq!(parse_range("0-999", 1000), ByteRange::Ignore);
     }
 
     #[test]
     fn test_parse_range_start_beyond_file() {
-        assert_eq!(parse_range("bytes=1000-1100", 1000), None);
+        assert_eq!(
+            parse_range("bytes=1000-1100", 1000),
+            ByteRange::Unsatisfiable
+        );
     }
 
     #[test]
     fn test_parse_range_start_greater_than_end() {
-        assert_eq!(parse_range("bytes=500-100", 1000), None);
+        assert_eq!(parse_range("bytes=500-100", 1000), ByteRange::Ignore);
     }
 
     #[test]
     fn test_parse_range_empty_string() {
-        assert_eq!(parse_range("", 1000), None);
+        assert_eq!(parse_range("", 1000), ByteRange::Ignore);
     }
 
     #[test]
     fn test_parse_range_invalid_numbers() {
-        assert_eq!(parse_range("bytes=abc-def", 1000), None);
+        assert_eq!(parse_range("bytes=abc-def", 1000), ByteRange::Ignore);
     }
 
     #[test]
     fn test_parse_range_suffix_larger_than_file() {
-        assert_eq!(parse_range("bytes=-1001", 1000), None);
+        assert_eq!(parse_range("bytes=-1001", 1000), ByteRange::Ignore);
+    }
+
+    // RFC 9110 §14.1.2: a suffix of length 0 and a first byte at or past the end are unsatisfiable (416).
+
+    #[test]
+    fn test_parse_range_zero_suffix_is_unsatisfiable() {
+        assert_eq!(parse_range("bytes=-0", 1000), ByteRange::Unsatisfiable);
+    }
+
+    #[test]
+    fn test_parse_range_start_far_beyond_file_is_unsatisfiable() {
+        assert_eq!(
+            parse_range("bytes=999999999-", 1000),
+            ByteRange::Unsatisfiable
+        );
+    }
+
+    #[test]
+    fn test_parse_range_start_at_file_size_is_unsatisfiable() {
+        assert_eq!(parse_range("bytes=1000-", 1000), ByteRange::Unsatisfiable);
+    }
+
+    #[test]
+    fn test_parse_range_huge_numbers_do_not_overflow() {
+        assert_eq!(
+            parse_range("bytes=18446744073709551615-", 1000),
+            ByteRange::Unsatisfiable
+        );
+        assert_eq!(
+            parse_range("bytes=0-18446744073709551615", 1000),
+            ByteRange::Partial(0, 999)
+        );
+        assert_eq!(
+            parse_range("bytes=-18446744073709551615", 1000),
+            ByteRange::Ignore
+        );
+        assert_eq!(
+            parse_range("bytes=18446744073709551616-", 1000),
+            ByteRange::Ignore
+        );
+    }
+
+    #[test]
+    fn test_parse_range_empty_file() {
+        assert_eq!(parse_range("bytes=0-", 0), ByteRange::Unsatisfiable);
+        assert_eq!(parse_range("bytes=0-0", 0), ByteRange::Unsatisfiable);
+        assert_eq!(parse_range("bytes=-0", 0), ByteRange::Unsatisfiable);
+        assert_eq!(parse_range("bytes=-5", 0), ByteRange::Ignore);
+    }
+
+    #[test]
+    fn test_parse_range_single_bytes() {
+        assert_eq!(parse_range("bytes=0-0", 1000), ByteRange::Partial(0, 0));
+        assert_eq!(
+            parse_range("bytes=999-", 1000),
+            ByteRange::Partial(999, 999)
+        );
+        assert_eq!(parse_range("bytes=-1", 1000), ByteRange::Partial(999, 999));
+    }
+
+    #[test]
+    fn test_parse_range_suffix_of_whole_file() {
+        assert_eq!(parse_range("bytes=-1000", 1000), ByteRange::Partial(0, 999));
+    }
+
+    #[test]
+    fn test_parse_range_multiple_ranges_are_ignored() {
+        assert_eq!(parse_range("bytes=0-0,5-9", 1000), ByteRange::Ignore);
+        assert_eq!(parse_range("bytes=-0,0-9", 1000), ByteRange::Ignore);
+    }
+
+    #[test]
+    fn test_parse_range_without_numbers_is_ignored() {
+        assert_eq!(parse_range("bytes=-", 1000), ByteRange::Ignore);
+        assert_eq!(parse_range("bytes=", 1000), ByteRange::Ignore);
+        assert_eq!(parse_range("bytes=12", 1000), ByteRange::Ignore);
     }
 
     // ── mime_from_path ──
@@ -1185,5 +1540,422 @@ mod tests {
     #[test]
     fn test_mime_3gp() {
         assert_eq!(mime_from_path("/path/to/video.3gp"), "video/3gpp");
+    }
+
+    // ── check_direct_play / check_direct_stream ──
+
+    const LISTS: &str = "VideoCodecs=h264,vp8,vp9,av1&AudioCodecs=aac,mp3,opus,flac";
+
+    /// A source in `container` with one video and one audio stream and a 4 Mbit/s video bitrate.
+    fn source_with(
+        container: &str,
+        video: &str,
+        audio: &str,
+    ) -> rustyfin_model::media_source::MediaSourceResponse {
+        serde_json::from_value(serde_json::json!({
+            "Id": "source",
+            "Uid": "source",
+            "Container": container,
+            "Protocol": "File",
+            "Path": format!("/media/movie.{container}"),
+            "VideoBitrate": 4_000_000,
+            "MediaStreams": [
+                { "Index": 0, "Codec": video, "CodecType": "Video" },
+                { "Index": 1, "Codec": audio, "CodecType": "Audio" },
+            ],
+        }))
+        .unwrap()
+    }
+
+    /// The query of a client that sends `params` (`Key=value&...`).
+    fn query_from(params: &str) -> VideoPlaybackInfoQuery {
+        let params: HashMap<String, String> = params
+            .split('&')
+            .filter_map(|pair| pair.split_once('='))
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect();
+        VideoPlaybackInfoQuery::from(params)
+    }
+
+    #[test]
+    fn test_direct_play_and_stream_need_listed_codecs() {
+        let query = query_from(LISTS);
+        // The browser plays the video but not the AC3 audio, or the audio but not the HEVC video
+        for (video, audio) in [("h264", "ac3"), ("hevc", "aac")] {
+            let source = source_with("mp4", video, audio);
+            assert!(!check_direct_play(&source, &query), "{video} + {audio}");
+            assert!(!check_direct_stream(&source, &query), "{video} + {audio}");
+        }
+        let source = source_with("mp4", "h264", "aac");
+        assert!(check_direct_play(&source, &query));
+        assert!(check_direct_stream(&source, &query));
+    }
+
+    #[test]
+    fn test_direct_play_without_lists_takes_h264_with_aac_or_mp3() {
+        let query = query_from("");
+        for (video, audio, playable) in [
+            ("h264", "aac", true),
+            ("h264", "mp3", true),
+            ("h264", "ac3", false),
+            ("h264", "eac3", false),
+            ("h264", "opus", false),
+            ("hevc", "aac", false),
+            ("vp9", "aac", false),
+        ] {
+            let source = source_with("mp4", video, audio);
+            assert_eq!(
+                check_direct_play(&source, &query),
+                playable,
+                "{video} + {audio}"
+            );
+            assert_eq!(
+                check_direct_stream(&source, &query),
+                playable,
+                "{video} + {audio}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_direct_play_falls_back_for_a_missing_or_empty_list() {
+        // Only an audio list: the video must still be H.264
+        let query = query_from("AudioCodecs=aac,ac3");
+        assert!(!check_direct_play(
+            &source_with("mp4", "hevc", "aac"),
+            &query
+        ));
+        assert!(!check_direct_stream(
+            &source_with("mp4", "hevc", "aac"),
+            &query
+        ));
+        assert!(check_direct_play(
+            &source_with("mp4", "h264", "ac3"),
+            &query
+        ));
+        // Empty lists count as none
+        let query = query_from("VideoCodecs=&AudioCodecs=");
+        assert!(!check_direct_play(
+            &source_with("mp4", "hevc", "aac"),
+            &query
+        ));
+        assert!(!check_direct_play(
+            &source_with("mp4", "h264", "ac3"),
+            &query
+        ));
+        assert!(check_direct_play(
+            &source_with("mp4", "h264", "aac"),
+            &query
+        ));
+    }
+
+    #[test]
+    fn test_direct_play_keeps_container_and_bitrate_rules() {
+        let query = query_from(LISTS);
+        for container in ["mkv", "avi"] {
+            let source = source_with(container, "h264", "aac");
+            assert!(!check_direct_play(&source, &query), "{container}");
+            assert!(!check_direct_stream(&source, &query), "{container}");
+        }
+        let query = query_from(&format!("{LISTS}&MaxVideoBitrate=1000000"));
+        assert!(!check_direct_play(
+            &source_with("mp4", "h264", "aac"),
+            &query
+        ));
+    }
+
+    #[test]
+    fn test_probed_lowercase_stream_types_count() {
+        // The probe stores ffprobe's stream types, "video" and "audio"
+        let probed = |video: &str, audio: &str| {
+            let mut source = source_with("mp4", video, audio);
+            for stream in &mut source.media_streams {
+                stream.codec_type = stream.codec_type.to_lowercase();
+            }
+            source
+        };
+        let query = query_from(LISTS);
+        assert!(check_direct_play(&probed("h264", "aac"), &query));
+        assert!(check_direct_stream(&probed("h264", "aac"), &query));
+        for (video, audio) in [("h264", "ac3"), ("hevc", "aac")] {
+            let source = probed(video, audio);
+            assert!(!check_direct_play(&source, &query), "{video} + {audio}");
+            assert!(!check_direct_stream(&source, &query), "{video} + {audio}");
+        }
+        for copy in ["EnableVideoStreamCopy", "EnableAudioStreamCopy"] {
+            let query = query_from(&format!("{LISTS}&{copy}=false"));
+            assert!(
+                !check_direct_stream(&probed("h264", "aac"), &query),
+                "{copy}"
+            );
+        }
+    }
+
+    // ── B25: 10-bit video ──
+
+    /// An H.264 + AAC source in `container` whose video has `profile` and `bit_depth` (None: not
+    /// stored).
+    fn h264_source(
+        container: &str,
+        profile: Option<&str>,
+        bit_depth: Option<u32>,
+    ) -> rustyfin_model::media_source::MediaSourceResponse {
+        let mut source = source_with(container, "h264", "aac");
+        source.media_streams[0].profile = profile.map(Into::into);
+        source.media_streams[0].bit_depth = bit_depth;
+        source
+    }
+
+    /// Whether `source` is direct played and direct streamed for a client that sends `params`.
+    fn direct(
+        params: &str,
+        source: &rustyfin_model::media_source::MediaSourceResponse,
+    ) -> [bool; 2] {
+        let query = query_from(params);
+        [
+            check_direct_play(source, &query),
+            check_direct_stream(source, &query),
+        ]
+    }
+
+    #[test]
+    fn test_deep_h264_is_not_direct_for_a_client_that_states_nothing() {
+        // The web client's lists, no lists, or only an audio list; the stored bit depth, else
+        // the profile's
+        for params in [LISTS, "", "AudioCodecs=aac"] {
+            for (profile, bits) in [
+                (Some("High 10"), Some(10)),
+                (Some("High 10"), None),
+                (Some("High 10 Intra"), None),
+                (Some("High 4:2:2"), Some(8)),
+                (Some("High 4:2:2"), None),
+                (Some("High 4:4:4 Predictive"), None),
+                (Some("High"), Some(10)),
+                (None, Some(10)),
+            ] {
+                for container in ["mp4", "m4v", "mkv"] {
+                    let source = h264_source(container, profile, bits);
+                    assert_eq!(
+                        direct(params, &source),
+                        [false, false],
+                        "{params} {container} {profile:?} {bits:?}"
+                    );
+                }
+            }
+        }
+        // An empty profile list or an unparsable depth states nothing
+        for params in [
+            "Profile=",
+            "h264-profile=,",
+            "MaxVideoBitDepth=ten",
+            "h264-videobitdepth=x",
+        ] {
+            let source = h264_source("mp4", Some("High 10"), None);
+            assert_eq!(
+                direct(&format!("{LISTS}&{params}"), &source),
+                [false, false],
+                "{params}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_8bit_h264_is_direct_as_before() {
+        for params in [LISTS, "", "AudioCodecs=aac"] {
+            for (profile, bits) in [
+                (Some("High"), Some(8)),
+                (Some("Main"), None),
+                (Some("Baseline"), Some(8)),
+                (Some("Constrained Baseline"), None),
+                (None, None),
+            ] {
+                let source = h264_source("mp4", profile, bits);
+                assert_eq!(
+                    direct(params, &source),
+                    [true, true],
+                    "{params} {profile:?} {bits:?}"
+                );
+                // MKV never is
+                let source = h264_source("mkv", profile, bits);
+                assert_eq!(direct(params, &source), [false, false], "{params} mkv");
+            }
+        }
+    }
+
+    #[test]
+    fn test_deep_h264_is_direct_for_a_client_that_states_it_takes_it() {
+        for bits in [Some(10), None] {
+            let hi10 = h264_source("mp4", Some("High 10"), bits);
+            for params in [
+                "MaxVideoBitDepth=10",
+                "MaxVideoBitDepth=12",
+                "h264-videobitdepth=10",
+                "Profile=high,main,high10",
+                "h264-profile=high|main|High 10",
+                "Profile= High 10 ",
+                "Profile=&h264-profile=high10",
+            ] {
+                let params = format!("{LISTS}&{params}");
+                assert_eq!(direct(&params, &hi10), [true, true], "{params} {bits:?}");
+            }
+            for params in [
+                "MaxVideoBitDepth=8",
+                "h264-videobitdepth=8",
+                "MaxVideoBitDepth=8&h264-videobitdepth=10",
+                "Profile=high,main",
+                "Profile=high&h264-profile=high10",
+                "Profile=high,high10&MaxVideoBitDepth=8",
+            ] {
+                let params = format!("{LISTS}&{params}");
+                assert_eq!(direct(&params, &hi10), [false, false], "{params} {bits:?}");
+            }
+            // A statement doesn't make MKV direct
+            let source = h264_source("mkv", Some("High 10"), bits);
+            let params = format!("{LISTS}&MaxVideoBitDepth=10");
+            assert_eq!(direct(&params, &source), [false, false], "mkv {bits:?}");
+        }
+        // A profile not listed passes when it scores no higher than the first one listed, and
+        // one without a score never does
+        let high = h264_source("mp4", Some("High"), Some(8));
+        assert_eq!(direct("Profile=high10", &high), [true, true]);
+        assert_eq!(direct("Profile=main", &high), [false, false]);
+        let constrained = h264_source("mp4", Some("Constrained Baseline"), Some(8));
+        assert_eq!(direct("Profile=baseline", &constrained), [true, true]);
+        for profile in ["High 10 Intra", "High 4:2:2", "High 4:4:4 Predictive"] {
+            let source = h264_source("mp4", Some(profile), Some(8));
+            assert_eq!(
+                direct("Profile=high10", &source),
+                [false, false],
+                "{profile}"
+            );
+        }
+        // A depth limit alone takes 4:2:2 within it, and what is not known passes a statement
+        let source = h264_source("mp4", Some("High 4:2:2"), Some(8));
+        assert_eq!(direct("MaxVideoBitDepth=10", &source), [true, true]);
+        let source = h264_source("mp4", None, None);
+        assert_eq!(direct("MaxVideoBitDepth=8", &source), [true, true]);
+        let source = h264_source("mp4", None, Some(8));
+        assert_eq!(direct("Profile=high", &source), [true, true]);
+        // Other codecs are unchanged: the rule is for H.264
+        let mut source = source_with("mp4", "vp9", "opus");
+        source.media_streams[0].profile = Some("Profile 2".into());
+        source.media_streams[0].bit_depth = Some(10);
+        assert_eq!(direct(LISTS, &source), [true, true]);
+    }
+
+    #[test]
+    fn test_deep_h264_is_direct_when_it_is_not_the_first_video_stream() {
+        // The rule reads the first video stream, as the codec lists do: here HEVC Main 10, which
+        // the client lists
+        let mut source = source_with("mp4", "hevc", "aac");
+        source.media_streams[0].profile = Some("Main 10".into());
+        source.media_streams[0].bit_depth = Some(10);
+        source.media_streams[1].index = 2;
+        source.media_streams.insert(
+            1,
+            rustyfin_model::media_source::MediaStream {
+                index: 1,
+                codec: Some("h264".into()),
+                codec_type: "Video".into(),
+                profile: Some("High 10".into()),
+                bit_depth: Some(10),
+                ..Default::default()
+            },
+        );
+        let params = "VideoCodecs=hevc,h264&AudioCodecs=aac";
+        assert_eq!(direct(params, &source), [true, true]);
+    }
+
+    // ── B16: version selection ──
+
+    /// One H.264 + AAC MP4 source per id, in this order.
+    fn sources_with_ids(ids: &[&str]) -> Vec<rustyfin_model::media_source::MediaSourceResponse> {
+        ids.iter()
+            .map(|id| {
+                let mut source = source_with("mp4", "h264", "aac");
+                source.id = id.to_string();
+                source.path = format!("/media/{id}.mp4");
+                source
+            })
+            .collect()
+    }
+
+    fn params_of(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn test_requested_source_id() {
+        assert_eq!(requested_source_id(&params_of(&[])), None);
+        assert_eq!(requested_source_id(&params_of(&[("Static", "true")])), None);
+        // A blank id is no id
+        for blank in ["", "  "] {
+            let params = params_of(&[("MediaSourceId", blank)]);
+            assert_eq!(requested_source_id(&params), None, "{blank:?}");
+        }
+        // Clients send the name in either case
+        for name in ["MediaSourceId", "mediaSourceId", "MEDIASOURCEID"] {
+            let params = params_of(&[(name, "abc")]);
+            assert_eq!(requested_source_id(&params), Some("abc"), "{name}");
+        }
+        let params = params_of(&[("MediaSourceId", " abc ")]);
+        assert_eq!(requested_source_id(&params), Some("abc"));
+    }
+
+    #[test]
+    fn test_select_version() {
+        let item = Uuid::new_v4();
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let sources = sources_with_ids(&[&a.to_string(), &b.to_string()]);
+        let select = |requested: Option<&str>| select_version(item, &sources, requested);
+
+        // No id, or the item's own id in any form: the primary
+        for requested in [
+            None,
+            Some(item.to_string()),
+            Some(item.simple().to_string()),
+            Some(item.to_string().to_uppercase()),
+        ] {
+            let version = select(requested.as_deref()).unwrap();
+            assert_eq!(version, Version::Primary, "{requested:?}");
+        }
+        // A version's id, in any form
+        for (id, index) in [(a, 0), (b, 1)] {
+            for requested in [
+                id.to_string(),
+                id.simple().to_string(),
+                id.to_string().to_uppercase(),
+            ] {
+                let version = select(Some(&requested)).unwrap();
+                assert_eq!(version, Version::Source(index), "{requested}");
+            }
+        }
+        // Anything else names no version of this item
+        for requested in [Uuid::new_v4().to_string(), "nope".to_string()] {
+            let selected = select(Some(&requested));
+            assert!(
+                matches!(selected, Err(ApiError::NotFound(_))),
+                "{requested}: {selected:?}"
+            );
+        }
+
+        // A movie that was never probed has no version but itself
+        let version = select_version(item, &[], None).unwrap();
+        assert_eq!(version, Version::Primary);
+        let version = select_version(item, &[], Some(&item.to_string())).unwrap();
+        assert_eq!(version, Version::Primary);
+        let selected = select_version(item, &[], Some(&a.to_string()));
+        assert!(
+            matches!(selected, Err(ApiError::NotFound(_))),
+            "{selected:?}"
+        );
+
+        // A source id that is not a UUID matches as it is
+        let odd = sources_with_ids(&["odd-source"]);
+        let version = select_version(item, &odd, Some("odd-source")).unwrap();
+        assert_eq!(version, Version::Source(0));
     }
 }

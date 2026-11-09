@@ -108,6 +108,21 @@ pub struct VideoPlaybackInfoQuery {
     pub segment_time: Option<u32>,
 }
 
+/// A media source in the video PlaybackInfo response, with the caller's remembered tracks as its
+/// defaults where the source has them.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct PlaybackMediaSource {
+    #[serde(flatten)]
+    pub source: MediaSourceResponse,
+    /// The remembered audio stream, when this source has it
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub default_audio_stream_index: Option<i32>,
+    /// The remembered subtitle stream, when this source has it or subtitles are off (-1)
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub default_subtitle_stream_index: Option<i32>,
+}
+
 /// Response from `GET /Videos/{id}/PlaybackInfo`.
 /// Matches Jellyfin's `PlaybackInfoResponse` for video playback.
 #[derive(Debug, Clone, Serialize)]
@@ -115,7 +130,7 @@ pub struct VideoPlaybackInfoQuery {
 pub struct VideoPlaybackInfoResponse {
     /// Media sources for this item
     #[serde(default)]
-    pub media_sources: Vec<MediaSourceResponse>,
+    pub media_sources: Vec<PlaybackMediaSource>,
     /// PlaySessionId for tracking
     #[serde(skip_serializing_if = "Option::is_none")]
     pub play_session_id: Option<String>,

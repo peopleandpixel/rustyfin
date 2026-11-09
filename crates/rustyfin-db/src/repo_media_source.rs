@@ -2,6 +2,18 @@ use rustyfin_model::media_source::{MediaSourceResponse, MediaStream};
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
+/// The version of the probe code whose results a source holds. A scan reads the file of a movie,
+/// an episode or an audio track again, once, when its source has an older version. Bump it when
+/// the probe starts storing a field that it read wrong or not at all, so that the next scan reads
+/// those files again. Photos are never read again for it, so a field that photos need takes a
+/// change to the scans as well. A file whose probe failed is read again only once it changes.
+///
+/// 1: the language and title of each stream, which ffprobe nests under the stream's tags, and a
+/// subtitle's forced flag from its disposition alone, as in Jellyfin. That rule changed before
+/// version 1 shipped, so it kept version 1: every source that a title made forced is older, and
+/// is read again anyway.
+pub const PROBE_VERSION: i64 = 1;
+
 // ---------------------------------------------------------------------------
 // MediaSource DB row
 // ---------------------------------------------------------------------------
@@ -273,6 +285,18 @@ pub async fn get_media_sources(
     Ok(result)
 }
 
+/// Get the IDs of an item's media sources, in ID order. A scan that reads a file again
+/// replaces its sources with new IDs.
+pub async fn get_media_source_ids(
+    pool: &SqlitePool,
+    item_id: &Uuid,
+) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar("SELECT id FROM media_sources WHERE item_id = ? ORDER BY id")
+        .bind(item_id.to_string())
+        .fetch_all(pool)
+        .await
+}
+
 /// Verify that a media item exists and fetch its media sources with streams in a single round-trip.
 /// Returns None if the item does not exist.
 /// Eliminates the N+1 pattern in streaming endpoints where get_item_by_id and get_media_sources
@@ -442,10 +466,9 @@ pub async fn delete_media_source(pool: &SqlitePool, source_id: &Uuid) -> Result<
     Ok(())
 }
 
-/// Insert a media source and all its streams in a single transaction.
-/// Returns the source ID.
-pub async fn insert_media_source_with_streams(
-    pool: &SqlitePool,
+/// Insert one media source and all its streams on an open connection. Returns the source ID.
+async fn insert_source_with_streams(
+    conn: &mut sqlx::SqliteConnection,
     item_id: &Uuid,
     source: &MediaSourceResponse,
 ) -> Result<Uuid, sqlx::Error> {
@@ -453,14 +476,12 @@ pub async fn insert_media_source_with_streams(
     let uid = source.uid.clone();
     let item_id_str = item_id.to_string();
 
-    let mut tx = pool.begin().await?;
-
     // Insert the source
     sqlx::query(
         "INSERT INTO media_sources \
          (id, item_id, uid, container, protocol, path, type, run_time_ticks, size, \
-          bitrate, video_bitrate, audio_bitrate, width, height, aspect_ratio, is_remote, media_state) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          bitrate, video_bitrate, audio_bitrate, width, height, aspect_ratio, is_remote, media_state, probe_version) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&item_id_str)
@@ -479,7 +500,8 @@ pub async fn insert_media_source_with_streams(
     .bind(&source.aspect_ratio)
     .bind(source.is_remote)
     .bind(&source.media_state)
-    .execute(&mut *tx)
+    .bind(PROBE_VERSION)
+    .execute(&mut *conn)
     .await?;
 
     // Insert all streams
@@ -528,12 +550,138 @@ pub async fn insert_media_source_with_streams(
         .bind(stream.is_interlaced)
         .bind(stream.embedded_bitmaps)
         .bind(stream.index)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
     }
 
-    tx.commit().await?;
     Ok(Uuid::parse_str(&id).unwrap())
+}
+
+/// Insert a media source and all its streams in a single transaction.
+/// Returns the source ID.
+pub async fn insert_media_source_with_streams(
+    pool: &SqlitePool,
+    item_id: &Uuid,
+    source: &MediaSourceResponse,
+) -> Result<Uuid, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let id = insert_source_with_streams(&mut tx, item_id, source).await?;
+    tx.commit().await?;
+    Ok(id)
+}
+
+/// What the probe of one file of an item's probe plan gave, for [`write_probe_outcome`].
+pub enum ProbeOutcome<'a> {
+    /// The probe read the file: this source replaces the item's source at the file.
+    Probed(&'a MediaSourceResponse),
+    /// The probe failed. `stamp` is the file's (size, modification time) from before the probe.
+    Failed { stamp: Option<(i64, i64)> },
+}
+
+/// Writes what the probe of `path` gave to the item's sources, in one transaction. `files` are the
+/// files of the item's probe plan, in order, and `path` is one of them. A probe that read the file
+/// replaces the item's source at `path`. A failed probe keeps that source unless the file changed
+/// since `stamp`, so a file that went bad but kept its size and time keeps its streams. The sources
+/// at files outside `files` are deleted. The rest are put back in the order of `files`, so the
+/// item's first source is still the primary's. Returns whether the item has a source at `path`.
+pub async fn write_probe_outcome(
+    pool: &SqlitePool,
+    item_id: &Uuid,
+    files: &[String],
+    path: &str,
+    outcome: ProbeOutcome<'_>,
+) -> Result<bool, sqlx::Error> {
+    let item = item_id.to_string();
+    // The write lock is taken first. A deferred transaction that reads and then writes fails at
+    // once with "database is deadlocked" when another plan commits meanwhile, and busy_timeout
+    // does not retry it.
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let sources: Vec<(String, String, Option<i64>, Option<i64>)> = sqlx::query_as(
+        "SELECT id, path, size, modified FROM media_sources WHERE item_id = ?1 ORDER BY rowid",
+    )
+    .bind(&item)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    // The sources at files that are not in the plan go.
+    for (id, source_path, _, _) in &sources {
+        if !files.contains(source_path) {
+            sqlx::query("DELETE FROM media_sources WHERE id = ?1")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+    }
+
+    // The sources at `path` that a failed probe keeps. They move to the end first.
+    let mut kept: Vec<String> = Vec::new();
+    let has_source = match outcome {
+        ProbeOutcome::Probed(source) => {
+            sqlx::query("DELETE FROM media_sources WHERE item_id = ?1 AND path = ?2")
+                .bind(&item)
+                .bind(path)
+                .execute(&mut *tx)
+                .await?;
+            insert_source_with_streams(&mut tx, item_id, source).await?;
+            true
+        }
+        ProbeOutcome::Failed { stamp } => {
+            for (id, source_path, size, modified) in &sources {
+                if source_path.as_str() != path {
+                    continue;
+                }
+                // Changed: the file's stamp is known, the source has a stored time, and they
+                // differ.
+                let changed = match stamp {
+                    Some((file_size, file_modified)) if modified.is_some() => {
+                        (*size, *modified) != (Some(file_size), Some(file_modified))
+                    }
+                    _ => false,
+                };
+                if changed {
+                    sqlx::query("DELETE FROM media_sources WHERE id = ?1")
+                        .bind(id)
+                        .execute(&mut *tx)
+                        .await?;
+                } else {
+                    kept.push(id.clone());
+                }
+            }
+            !kept.is_empty()
+        }
+    };
+
+    // Then the sources at each file after `path`, file by file. Each row moves to the end on its
+    // own. Only its rowid changes, so every source keeps its id.
+    let current: Vec<(String, String)> =
+        sqlx::query_as("SELECT id, path FROM media_sources WHERE item_id = ?1 ORDER BY rowid")
+            .bind(&item)
+            .fetch_all(&mut *tx)
+            .await?;
+    let mut order = kept;
+    for file in files
+        .iter()
+        .skip_while(|file| file.as_str() != path)
+        .skip(1)
+    {
+        order.extend(
+            current
+                .iter()
+                .filter(|(_, source_path)| source_path == file)
+                .map(|(id, _)| id.clone()),
+        );
+    }
+    for id in &order {
+        sqlx::query(
+            "UPDATE media_sources SET rowid = (SELECT MAX(rowid) FROM media_sources) + 1 \
+             WHERE id = ?1",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(has_source)
 }
 
 /// Batch fetch all media sources and streams for multiple items in a single query.

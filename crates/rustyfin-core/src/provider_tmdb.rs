@@ -1,43 +1,7 @@
-use moka::sync::Cache;
+use crate::tmdb_client::TmdbApi;
 use rustyfin_model::metadata::{ExternalMetadata, MetadataImage};
 use serde::Deserialize;
 use serde_json;
-use std::sync::LazyLock;
-
-const TMDB_BASE: &str = "https://api.themoviedb.org/3";
-const TMDB_IMAGE_BASE: &str = "https://image.tmdb.org/t/p/original";
-
-/// L1 in-memory cache for TMDb API responses.
-/// Key format: "<endpoint>:<id>" or "<endpoint>:<query>"
-/// TTL: 24 hours — metadata changes rarely, so caching aggressively saves API calls.
-static TMDB_CACHE: LazyLock<Cache<String, String>> = LazyLock::new(|| {
-    Cache::builder()
-        .max_capacity(10_000)
-        .time_to_live(std::time::Duration::from_secs(24 * 3600))
-        .build()
-});
-
-/// Fetch JSON from TMDb with caching.
-/// Checks the cache first; on miss, performs the HTTP request and caches the raw JSON.
-async fn fetch_tmdb_json(
-    client: &reqwest::Client,
-    cache_key: &str,
-    url: &str,
-) -> Option<serde_json::Value> {
-    // Check cache first
-    if let Some(cached) = TMDB_CACHE.get(cache_key) {
-        return serde_json::from_str(&cached).ok();
-    }
-
-    // Fetch from API
-    let resp = client.get(url).send().await.ok()?;
-    let text = resp.text().await.ok()?;
-
-    // Parse and cache
-    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
-    TMDB_CACHE.insert(cache_key.to_string(), text);
-    Some(json)
-}
 
 /// TMDb person details with photo
 #[derive(Debug, Deserialize)]
@@ -99,49 +63,33 @@ pub struct PersonPhoto {
 }
 
 /// Fetch a person's details from TMDb by TMDb ID, returning photo URL if available
-pub async fn get_person_photo(
-    client: &reqwest::Client,
-    api_key: &str,
-    tmdb_person_id: i64,
-) -> Option<PersonPhoto> {
-    let url = format!(
-        "{}/person/{}?api_key={}",
-        TMDB_BASE, tmdb_person_id, api_key
-    );
-    let cache_key = format!("person:{}", tmdb_person_id);
+pub async fn get_person_photo(tmdb: &TmdbApi, tmdb_person_id: i64) -> Option<PersonPhoto> {
+    let endpoint = format!("/person/{}", tmdb_person_id);
 
-    let details: TmdbPersonDetails = match fetch_tmdb_json(client, &cache_key, &url).await {
-        Some(json) => serde_json::from_value(json).ok()?,
-        None => return None,
+    let details: TmdbPersonDetails = match tmdb.get_json(&endpoint, &[]).await {
+        Ok(json) => serde_json::from_value(json).ok()?,
+        Err(_) => return None,
     };
 
     details.profile_path.map(|path| PersonPhoto {
         person_id: details.id.to_string(),
         name: details.name,
-        photo_url: format!("{}{}", TMDB_IMAGE_BASE, path),
+        photo_url: tmdb.image_url(&path),
     })
 }
 
 /// Fetch cast and crew for a movie from TMDb, returning person info with photos
-pub async fn get_movie_people(
-    client: &reqwest::Client,
-    api_key: &str,
-    tmdb_movie_id: i64,
-) -> Vec<PersonPhoto> {
-    let url = format!(
-        "{}/movie/{}/credits?api_key={}",
-        TMDB_BASE, tmdb_movie_id, api_key
-    );
-    let cache_key = format!("movie_credits:{}", tmdb_movie_id);
+pub async fn get_movie_people(tmdb: &TmdbApi, tmdb_movie_id: i64) -> Vec<PersonPhoto> {
+    let endpoint = format!("/movie/{}/credits", tmdb_movie_id);
 
     let mut result = Vec::new();
 
-    let details: TmdbDetails = match fetch_tmdb_json(client, &cache_key, &url).await {
-        Some(json) => match serde_json::from_value::<TmdbDetails>(json) {
+    let details: TmdbDetails = match tmdb.get_json(&endpoint, &[]).await {
+        Ok(json) => match serde_json::from_value::<TmdbDetails>(json) {
             Ok(d) => d,
             Err(_) => return result,
         },
-        None => return result,
+        Err(_) => return result,
     };
 
     if let Some(credits) = details.credits {
@@ -151,7 +99,7 @@ pub async fn get_movie_people(
                     result.push(PersonPhoto {
                         person_id: member.id.to_string(),
                         name: member.name,
-                        photo_url: format!("{}{}", TMDB_IMAGE_BASE, path),
+                        photo_url: tmdb.image_url(&path),
                     });
                 }
             }
@@ -165,7 +113,7 @@ pub async fn get_movie_people(
                     result.push(PersonPhoto {
                         person_id: member.id.to_string(),
                         name: member.name,
-                        photo_url: format!("{}{}", TMDB_IMAGE_BASE, path),
+                        photo_url: tmdb.image_url(&path),
                     });
                 }
             }
@@ -177,25 +125,20 @@ pub async fn get_movie_people(
 
 /// Fetch cast and crew for a TV show season from TMDb, returning person info with photos
 pub async fn get_tv_people(
-    client: &reqwest::Client,
-    api_key: &str,
+    tmdb: &TmdbApi,
     tmdb_tv_id: i64,
     season_number: i32,
 ) -> Vec<PersonPhoto> {
-    let url = format!(
-        "{}/tv/{}/season/{}/credits?api_key={}",
-        TMDB_BASE, tmdb_tv_id, season_number, api_key
-    );
-    let cache_key = format!("tv_credits:{}:{}", tmdb_tv_id, season_number);
+    let endpoint = format!("/tv/{}/season/{}/credits", tmdb_tv_id, season_number);
 
     let mut result = Vec::new();
 
-    let details: TmdbDetails = match fetch_tmdb_json(client, &cache_key, &url).await {
-        Some(json) => match serde_json::from_value::<TmdbDetails>(json) {
+    let details: TmdbDetails = match tmdb.get_json(&endpoint, &[]).await {
+        Ok(json) => match serde_json::from_value::<TmdbDetails>(json) {
             Ok(d) => d,
             Err(_) => return result,
         },
-        None => return result,
+        Err(_) => return result,
     };
 
     if let Some(credits) = details.credits {
@@ -205,7 +148,7 @@ pub async fn get_tv_people(
                     result.push(PersonPhoto {
                         person_id: member.id.to_string(),
                         name: member.name,
-                        photo_url: format!("{}{}", TMDB_IMAGE_BASE, path),
+                        photo_url: tmdb.image_url(&path),
                     });
                 }
             }
@@ -219,7 +162,7 @@ pub async fn get_tv_people(
                     result.push(PersonPhoto {
                         person_id: member.id.to_string(),
                         name: member.name,
-                        photo_url: format!("{}{}", TMDB_IMAGE_BASE, path),
+                        photo_url: tmdb.image_url(&path),
                     });
                 }
             }
@@ -355,57 +298,43 @@ struct TmdbImage {
 
 /// Search TMDb for a movie and return full metadata from details endpoint
 pub async fn search_movie(
-    client: &reqwest::Client,
-    api_key: &str,
+    tmdb: &TmdbApi,
     name: &str,
     year: Option<i32>,
 ) -> Option<ExternalMetadata> {
-    // Step 1: Search to find the TMDb ID (with caching)
-    let mut url = format!(
-        "{}/search/movie?api_key={}&query={}",
-        TMDB_BASE,
-        api_key,
-        urlencoded(name)
-    );
-    let cache_key_search = format!("search_movie:{}:{}", name, year.unwrap_or(0));
-    if let Some(y) = year {
-        url.push_str(&format!("&year={}", y));
+    // Step 1: Search to find the TMDb ID
+    let year_text = year.map(|y| y.to_string());
+    let mut query = vec![("query", name)];
+    if let Some(y) = year_text.as_deref() {
+        query.push(("year", y));
     }
 
-    let resp: TmdbSearchResult = match fetch_tmdb_json(client, &cache_key_search, &url).await {
-        Some(json) => serde_json::from_value(json).ok()?,
-        None => return None,
+    let resp: TmdbSearchResult = match tmdb.get_json("/search/movie", &query).await {
+        Ok(json) => serde_json::from_value(json).ok()?,
+        Err(_) => return None,
     };
     let search_item = resp.results.into_iter().next()?;
     let tmdb_id = search_item.id;
 
-    // Step 2: Fetch full details from the details endpoint (with caching)
-    let details_url = format!(
-        "{}/movie/{}?api_key={}&append_to_response=credits,external_ids",
-        TMDB_BASE, tmdb_id, api_key
-    );
-    let cache_key_details = format!("movie_details:{}", tmdb_id);
-    let details: TmdbMovieDetails =
-        match fetch_tmdb_json(client, &cache_key_details, &details_url).await {
-            Some(json) => serde_json::from_value(json).ok()?,
-            None => return None,
-        };
+    // Step 2: Fetch full details from the details endpoint
+    let details_endpoint = format!("/movie/{}", tmdb_id);
+    let details_query = [("append_to_response", "credits,external_ids")];
+    let details: TmdbMovieDetails = match tmdb.get_json(&details_endpoint, &details_query).await {
+        Ok(json) => serde_json::from_value(json).ok()?,
+        Err(_) => return None,
+    };
 
-    // Step 3: Fetch external IDs (IMDb, TVDb) (with caching)
+    // Step 3: Fetch external IDs (IMDb, TVDb)
     let external_ids: Option<TmdbExternalIds> = {
-        let external_ids_url = format!(
-            "{}/movie/{}/external_ids?api_key={}",
-            TMDB_BASE, tmdb_id, api_key
-        );
-        let cache_key_ext = format!("movie_external_ids:{}", tmdb_id);
-        match fetch_tmdb_json(client, &cache_key_ext, &external_ids_url).await {
-            Some(json) => serde_json::from_value(json).ok(),
-            None => None,
+        let endpoint = format!("/movie/{}/external_ids", tmdb_id);
+        match tmdb.get_json(&endpoint, &[]).await {
+            Ok(json) => serde_json::from_value(json).ok(),
+            Err(_) => None,
         }
     };
 
-    // Step 4: Fetch images (with caching)
-    let images = fetch_images(client, api_key, "movie", tmdb_id).await;
+    // Step 4: Fetch images
+    let images = fetch_images(tmdb, "movie", tmdb_id).await;
 
     // Parse production year from release_date
     let production_year = details
@@ -476,54 +405,35 @@ pub async fn search_movie(
 }
 
 /// Search TMDb for a TV show and return full metadata from details endpoint
-pub async fn search_tv(
-    client: &reqwest::Client,
-    api_key: &str,
-    name: &str,
-) -> Option<ExternalMetadata> {
-    // Step 1: Search to find the TMDb ID (with caching)
-    let url = format!(
-        "{}/search/tv?api_key={}&query={}",
-        TMDB_BASE,
-        api_key,
-        urlencoded(name)
-    );
-    let cache_key_search = format!("search_tv:{}", name);
-
-    let resp: TmdbSearchResult = match fetch_tmdb_json(client, &cache_key_search, &url).await {
-        Some(json) => serde_json::from_value(json).ok()?,
-        None => return None,
+pub async fn search_tv(tmdb: &TmdbApi, name: &str) -> Option<ExternalMetadata> {
+    // Step 1: Search to find the TMDb ID
+    let query = [("query", name)];
+    let resp: TmdbSearchResult = match tmdb.get_json("/search/tv", &query).await {
+        Ok(json) => serde_json::from_value(json).ok()?,
+        Err(_) => return None,
     };
     let search_item = resp.results.into_iter().next()?;
     let tmdb_id = search_item.id;
 
-    // Step 2: Fetch full details from the details endpoint (with caching)
-    let details_url = format!(
-        "{}/tv/{}?api_key={}&append_to_response=credits,external_ids",
-        TMDB_BASE, tmdb_id, api_key
-    );
-    let cache_key_details = format!("tv_details:{}", tmdb_id);
-    let details: TmdbTvDetails =
-        match fetch_tmdb_json(client, &cache_key_details, &details_url).await {
-            Some(json) => serde_json::from_value(json).ok()?,
-            None => return None,
-        };
+    // Step 2: Fetch full details from the details endpoint
+    let details_endpoint = format!("/tv/{}", tmdb_id);
+    let details_query = [("append_to_response", "credits,external_ids")];
+    let details: TmdbTvDetails = match tmdb.get_json(&details_endpoint, &details_query).await {
+        Ok(json) => serde_json::from_value(json).ok()?,
+        Err(_) => return None,
+    };
 
-    // Step 3: Fetch external IDs (IMDb, TVDb) (with caching)
+    // Step 3: Fetch external IDs (IMDb, TVDb)
     let external_ids: Option<TmdbExternalIds> = {
-        let external_ids_url = format!(
-            "{}/tv/{}/external_ids?api_key={}",
-            TMDB_BASE, tmdb_id, api_key
-        );
-        let cache_key_ext = format!("tv_external_ids:{}", tmdb_id);
-        match fetch_tmdb_json(client, &cache_key_ext, &external_ids_url).await {
-            Some(json) => serde_json::from_value(json).ok(),
-            None => None,
+        let endpoint = format!("/tv/{}/external_ids", tmdb_id);
+        match tmdb.get_json(&endpoint, &[]).await {
+            Ok(json) => serde_json::from_value(json).ok(),
+            Err(_) => None,
         }
     };
 
-    // Step 4: Fetch images (with caching)
-    let images = fetch_images(client, api_key, "tv", tmdb_id).await;
+    // Step 4: Fetch images
+    let images = fetch_images(tmdb, "tv", tmdb_id).await;
 
     // Parse production year from first_air_date
     let production_year = details
@@ -625,20 +535,11 @@ fn tmdb_genre_name(id: i32) -> Option<&'static str> {
     }
 }
 
-async fn fetch_images(
-    client: &reqwest::Client,
-    api_key: &str,
-    media_type: &str,
-    id: i64,
-) -> Vec<MetadataImage> {
-    let url = format!(
-        "{}/{}/{}/images?api_key={}",
-        TMDB_BASE, media_type, id, api_key
-    );
-    let cache_key = format!("images:{}:{}", media_type, id);
+async fn fetch_images(tmdb: &TmdbApi, media_type: &str, id: i64) -> Vec<MetadataImage> {
+    let endpoint = format!("/{}/{}/images", media_type, id);
     let mut result = Vec::new();
 
-    if let Some(json) = fetch_tmdb_json(client, &cache_key, &url).await
+    if let Ok(json) = tmdb.get_json(&endpoint, &[]).await
         && let Ok(imgs) = serde_json::from_value::<TmdbImages>(json)
     {
         if let Some(posters) = imgs.posters {
@@ -649,7 +550,7 @@ async fn fetch_images(
                     } else {
                         format!("Primary_{}", i)
                     },
-                    url: format!("{}{}", TMDB_IMAGE_BASE, p.file_path),
+                    url: tmdb.image_url(&p.file_path),
                 });
             }
         }
@@ -661,7 +562,7 @@ async fn fetch_images(
                     } else {
                         format!("Backdrop_{}", i)
                     },
-                    url: format!("{}{}", TMDB_IMAGE_BASE, b.file_path),
+                    url: tmdb.image_url(&b.file_path),
                 });
             }
         }
@@ -670,7 +571,7 @@ async fn fetch_images(
         {
             result.push(MetadataImage {
                 image_type: "Logo".to_string(),
-                url: format!("{}{}", TMDB_IMAGE_BASE, l.file_path),
+                url: tmdb.image_url(&l.file_path),
             });
         }
     }
@@ -679,39 +580,13 @@ async fn fetch_images(
 }
 
 /// Fetch TheTVDB ID for a TV show from TMDb external_ids endpoint
-pub async fn get_tvdb_id(client: &reqwest::Client, api_key: &str, tmdb_tv_id: i64) -> Option<i64> {
-    let url = format!(
-        "{}/tv/{}/external_ids?api_key={}",
-        TMDB_BASE, tmdb_tv_id, api_key
-    );
-    let cache_key = format!("tv_external_ids:{}", tmdb_tv_id);
-    let ids: TmdbExternalIds = match fetch_tmdb_json(client, &cache_key, &url).await {
-        Some(json) => serde_json::from_value(json).ok()?,
-        None => return None,
+pub async fn get_tvdb_id(tmdb: &TmdbApi, tmdb_tv_id: i64) -> Option<i64> {
+    let endpoint = format!("/tv/{}/external_ids", tmdb_tv_id);
+    let ids: TmdbExternalIds = match tmdb.get_json(&endpoint, &[]).await {
+        Ok(json) => serde_json::from_value(json).ok()?,
+        Err(_) => return None,
     };
     ids.tvdb_id
-}
-
-fn urlencoded(s: &str) -> String {
-    // Properly URL-encode a search query: percent-encode non-ASCII and special chars
-    let mut encoded = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => {
-                encoded.push(c);
-            }
-            ' ' => {
-                encoded.push('+');
-            }
-            _ => {
-                // Percent-encode everything else (including UTF-8 multibyte)
-                for byte in c.to_string().as_bytes() {
-                    encoded.push_str(&format!("%{:02X}", byte));
-                }
-            }
-        }
-    }
-    encoded
 }
 
 /// TMDb video result for trailers
@@ -732,19 +607,14 @@ struct TmdbVideo {
 /// Fetch trailers (videos) from TMDb for a movie or TV show.
 /// Returns a list of (name, url) pairs for YouTube trailers.
 pub async fn get_trailers(
-    client: &reqwest::Client,
-    api_key: &str,
+    tmdb: &TmdbApi,
     media_type: &str, // "movie" or "tv"
     tmdb_id: i64,
 ) -> Vec<(String, String)> {
-    let url = format!(
-        "{}/{}/{}/videos?api_key={}",
-        TMDB_BASE, media_type, tmdb_id, api_key
-    );
-    let cache_key = format!("videos:{}:{}", media_type, tmdb_id);
+    let endpoint = format!("/{}/{}/videos", media_type, tmdb_id);
     let mut result = Vec::new();
 
-    if let Some(json) = fetch_tmdb_json(client, &cache_key, &url).await
+    if let Ok(json) = tmdb.get_json(&endpoint, &[]).await
         && let Ok(videos) = serde_json::from_value::<TmdbVideos>(json)
     {
         // Filter for YouTube trailers, prefer "Teaser" or "Trailer" type
@@ -786,19 +656,14 @@ struct TmdbSimilarItem {
 /// Fetch similar items from TMDb for a movie or TV show.
 /// Returns a list of (tmdb_id, name) pairs for similar items.
 pub async fn get_similar(
-    client: &reqwest::Client,
-    api_key: &str,
+    tmdb: &TmdbApi,
     media_type: &str, // "movie" or "tv"
     tmdb_id: i64,
 ) -> Vec<(i64, String)> {
-    let url = format!(
-        "{}/{}/{}/similar?api_key={}",
-        TMDB_BASE, media_type, tmdb_id, api_key
-    );
-    let cache_key = format!("similar:{}:{}", media_type, tmdb_id);
+    let endpoint = format!("/{}/{}/similar", media_type, tmdb_id);
     let mut result = Vec::new();
 
-    if let Some(json) = fetch_tmdb_json(client, &cache_key, &url).await
+    if let Ok(json) = tmdb.get_json(&endpoint, &[]).await
         && let Ok(similar) = serde_json::from_value::<TmdbSimilarResult>(json)
     {
         for item in similar.results {

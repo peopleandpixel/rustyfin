@@ -183,6 +183,18 @@ async fn update_configuration(
     // Update in-memory
     let mut config = state.config.write().await;
     *config = new_config;
+    state
+        .task_scheduler
+        .changes()
+        .set_delay(std::time::Duration::from_secs(u64::from(
+            config.library_monitor_delay,
+        )));
+    state
+        .task_scheduler
+        .watcher()
+        .set_poll_interval(std::time::Duration::from_secs(u64::from(
+            config.library_monitor_poll_interval.max(1),
+        )));
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -548,9 +560,21 @@ async fn update_configuration_by_key(
 
     // Parse back into ServerConfiguration
     let new_config: ServerConfiguration =
-        serde_json::from_value(merged).map_err(|e| ApiError::Internal(e.to_string()))?;
+        serde_json::from_value(merged).map_err(|e| ApiError::BadRequest(format!("{key}: {e}")))?;
 
     *config = new_config;
+    state
+        .task_scheduler
+        .changes()
+        .set_delay(std::time::Duration::from_secs(u64::from(
+            config.library_monitor_delay,
+        )));
+    state
+        .task_scheduler
+        .watcher()
+        .set_poll_interval(std::time::Duration::from_secs(u64::from(
+            config.library_monitor_poll_interval.max(1),
+        )));
     drop(config);
 
     // Persist to disk

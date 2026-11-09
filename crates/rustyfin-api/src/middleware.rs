@@ -1,5 +1,4 @@
 use axum::extract::{ConnectInfo, Request, State};
-use axum::http::header::AUTHORIZATION;
 use axum::http::{HeaderMap, Uri};
 use axum::middleware::Next;
 use axum::response::Response;
@@ -14,53 +13,37 @@ use std::time::Instant;
 use crate::error::ApiError;
 use crate::state::AppState;
 
+mod credentials;
+pub use credentials::{MediaBrowserAuth, parse_media_browser};
+
 /// Reads the credentials of a request and returns the claims they prove, plus the user token
 /// (`None` for the configured API key, which has no token to revoke).
 ///
-/// The token comes from the Bearer header, `X-Emby-Token`, `X-MediaBrowser-Token` or the `api_key`
-/// query parameter. The configured API key gives administrator claims. Any other token must be a
-/// live user token. Takes the request's headers and URI rather than the request: axum's `Body` is
-/// not `Sync`, so a `&Request` cannot be held across the await.
+/// The token is the first non-blank one from these sources, in order: the `Authorization` header
+/// (`Bearer <token>`, otherwise a `MediaBrowser` token), the `MediaBrowser` token of the
+/// `X-Emby-Authorization` header, the `X-Emby-Token` header, the `X-MediaBrowser-Token` header,
+/// then the `ApiKey` and `api_key` query parameters (see `credentials::request_token`). The
+/// configured API key gives administrator claims. The `api_key` value and a `MediaBrowser` token
+/// also count as sent when they are compared with that key, because *arr's Webhook URLs and its
+/// Emby / Jellyfin connection carry the key as typed. Any other token must be a live user token.
+/// Takes the request's headers and URI rather than the request: axum's `Body` is not `Sync`, so a
+/// `&Request` cannot be held across the await.
 async fn request_claims(
     state: &AppState,
     headers: &HeaderMap,
     uri: &Uri,
 ) -> Result<(Claims, Option<String>), ApiError> {
-    let token = headers
-        .get(AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .map(|s| s.to_string())
-        .or_else(|| {
-            // Jellyfin clients also send token via X-Emby-Token
-            headers
-                .get("X-Emby-Token")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string())
-        })
-        .or_else(|| {
-            // Also check X-MediaBrowser-Token
-            headers
-                .get("X-MediaBrowser-Token")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string())
-        })
-        .or_else(|| {
-            // Check query parameter api_key
-            uri.query()
-                .and_then(|q| q.split('&').find_map(|pair| pair.strip_prefix("api_key=")))
-                .map(|s| s.to_string())
-        })
-        .ok_or(ApiError::Unauthorized)?;
+    let presented = credentials::request_token(headers, uri).ok_or(ApiError::Unauthorized)?;
 
     // An empty token never authenticates, whatever the configured key.
-    if token.trim().is_empty() {
+    if presented.token.trim().is_empty() {
         return Err(ApiError::Unauthorized);
     }
 
-    // Check if the token matches a configured API key
+    // Check if the token, or the value as sent (`api_key` or a `MediaBrowser` token), matches a
+    // configured API key
     if let Some(ref api_key) = state.api_key
-        && token == **api_key
+        && (presented.token == **api_key || presented.as_sent.as_deref() == Some(api_key.as_str()))
     {
         // API key auth: create admin claims
         return Ok((
@@ -76,10 +59,10 @@ async fn request_claims(
     }
 
     // Otherwise the token must be a live user token
-    let claims = rustyfin_auth::validate_token(&state.db_ro, &token)
+    let claims = rustyfin_auth::validate_token(&state.db_ro, &presented.token)
         .await
         .map_err(|_| ApiError::Unauthorized)?;
-    Ok((claims, Some(token)))
+    Ok((claims, Some(presented.token)))
 }
 
 pub async fn require_auth(
@@ -211,6 +194,35 @@ impl RateLimiter {
         entry.push(now);
         true
     }
+
+    /// Whether the key's budget is used up. Prunes its expired timestamps, creates no entry for an
+    /// unknown key and records nothing. A budget of 0 never limits.
+    pub async fn is_limited(&self, key: &str) -> bool {
+        if self.max_requests == 0 {
+            return false;
+        }
+
+        let now = Instant::now();
+        match self.state.get_mut(key) {
+            Some(mut entry) => {
+                entry.retain(|t| now.duration_since(*t) < self.window);
+                entry.len() >= self.max_requests
+            }
+            None => false,
+        }
+    }
+
+    /// Counts one request against the key without refusing it. A budget of 0 counts nothing.
+    pub async fn record(&self, key: &str) {
+        if self.max_requests == 0 {
+            return;
+        }
+
+        let now = Instant::now();
+        let mut entry = self.state.entry(key.to_string()).or_default();
+        entry.retain(|t| now.duration_since(*t) < self.window);
+        entry.push(now);
+    }
 }
 
 /// Default login-endpoint budget: requests per window, per resolved client IP.
@@ -273,13 +285,13 @@ impl ClientAddr {
         self.resolved && is_exempt_loopback(self.ip) && is_exempt_loopback(self.peer)
     }
 
-    /// The login-limiter key: the IPv4 address (no port), or the IPv6 /64 network, so one host that
-    /// rotates addresses within its /64 shares one budget.
+    /// The login-limiter key: the IPv4 address (no port), or the IPv6 /56 network, so one site that
+    /// rotates addresses or /64 subnets within its /56 shares one budget.
     pub fn limiter_key(&self) -> String {
         match self.ip {
             IpAddr::V4(v4) => v4.to_string(),
             IpAddr::V6(v6) => {
-                Ipv6Net::new(v6, 64).map_or_else(|_| v6.to_string(), |net| net.trunc().to_string())
+                Ipv6Net::new(v6, 56).map_or_else(|_| v6.to_string(), |net| net.trunc().to_string())
             }
         }
     }
@@ -383,7 +395,7 @@ pub async fn rate_limit(
 ) -> Result<Response, ApiError> {
     let client = resolve_client(addr.ip(), req.headers(), &state.known_proxies);
 
-    // Every client that is not exempt draws on its limiter key: the IPv4 address, or the IPv6 /64.
+    // Every client that is not exempt draws on its limiter key: the IPv4 address, or the IPv6 /56.
     if !client.is_exempt() && !state.rate_limiter.check(&client.limiter_key()).await {
         tracing::warn!(ip = %client.ip, "rate limit exceeded");
         return Err(ApiError::RateLimited);

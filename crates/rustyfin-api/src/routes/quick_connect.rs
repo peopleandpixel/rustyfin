@@ -1,23 +1,43 @@
-use axum::extract::{Query, State};
+use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
+
+use axum::extract::{ConnectInfo, Query, State};
+use axum::http::HeaderMap;
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use rustyfin_model::auth::Claims;
 use rustyfin_model::quick_connect::QuickConnectResult;
 use uuid::Uuid;
 
 use crate::error::ApiError;
+use crate::middleware::resolve_client;
 use crate::state::AppState;
 
 /// Expiry duration for quick connect codes (5 minutes).
 const EXPIRY_SECS: i64 = 300;
 
+/// Most live requests stored at once. Initiate answers 429 beyond it.
+const MAX_PENDING: usize = 100;
+
+/// Most live requests one client (limiter key) has at once. Initiate answers 429 beyond it.
+const MAX_PENDING_PER_CLIENT: usize = 5;
+
+/// Whether a request is live at `now`: younger than `EXPIRY_SECS`.
+fn is_live(request: &QuickConnectResult, now: DateTime<Utc>) -> bool {
+    (now - request.date_added).num_seconds() < EXPIRY_SECS
+}
+
 /// Public routes (no auth required).
 pub fn public_routes() -> Router<AppState> {
     Router::new()
         .route("/QuickConnect/Enabled", get(quick_connect_enabled))
-        .route("/QuickConnect/Initiate", post(initiate))
         .route("/QuickConnect/Connect", get(connect))
+}
+
+/// Initiate, which is rate limited with the sign-in endpoints (no auth required).
+pub fn login_routes() -> Router<AppState> {
+    Router::new().route("/QuickConnect/Initiate", post(initiate))
 }
 
 /// Protected routes (auth required).
@@ -30,11 +50,33 @@ async fn quick_connect_enabled() -> Json<bool> {
     Json(true)
 }
 
-/// `POST /QuickConnect/Initiate` – create a new quick connect request.
-async fn initiate(State(state): State<AppState>) -> Result<Json<QuickConnectResult>, ApiError> {
+/// `POST /QuickConnect/Initiate` – create a new quick connect request. Answers 429 when
+/// `MAX_PENDING` live requests are stored, when `MAX_PENDING_PER_CLIENT` are stored for the
+/// caller's limiter key (AC47), or when no code is free.
+async fn initiate(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Json<QuickConnectResult>, ApiError> {
     let secret = Uuid::new_v4().to_string().replace("-", "");
-    // Generate a short 6-digit numeric code for the user to enter.
-    let code: String = format!("{:06}", rand_code());
+    let client_key = resolve_client(peer.ip(), &headers, &state.known_proxies).limiter_key();
+
+    // Purge expired entries while holding the lock. A refused request stores nothing.
+    let mut store = state.quick_connect.write().await;
+    let now = Utc::now();
+    store.retain(|_, v| is_live(v, now));
+    if store.len() >= MAX_PENDING {
+        return Err(ApiError::RateLimited);
+    }
+    let pending_for_client = store
+        .values()
+        .filter(|v| v.client_key == client_key)
+        .count();
+    if pending_for_client >= MAX_PENDING_PER_CLIENT {
+        return Err(ApiError::RateLimited);
+    }
+    // A short 6-digit code for the user to enter, unique among live requests.
+    let code = free_code(&store, rand_code(), now).ok_or(ApiError::RateLimited)?;
 
     let result = QuickConnectResult {
         authenticated: false,
@@ -44,14 +86,10 @@ async fn initiate(State(state): State<AppState>) -> Result<Json<QuickConnectResu
         device_name: String::new(),
         app_name: String::new(),
         app_version: String::new(),
-        date_added: Utc::now(),
+        date_added: now,
         user_id: None,
+        client_key,
     };
-
-    // Purge expired entries while holding the lock.
-    let mut store = state.quick_connect.write().await;
-    let now = Utc::now();
-    store.retain(|_, v| (now - v.date_added).num_seconds() < EXPIRY_SECS);
     store.insert(secret, result.clone());
 
     Ok(Json(result))
@@ -73,7 +111,7 @@ async fn connect(
         .ok_or_else(|| ApiError::NotFound("Unknown secret".to_string()))?;
 
     // Check expiry.
-    if (Utc::now() - result.date_added).num_seconds() >= EXPIRY_SECS {
+    if !is_live(result, Utc::now()) {
         drop(store);
         state.quick_connect.write().await.remove(&q.secret);
         return Err(ApiError::NotFound(
@@ -97,24 +135,37 @@ struct AuthorizeQuery {
 }
 
 /// `POST /QuickConnect/Authorize?code=` – authorize a pending quick connect request (authenticated).
+/// Wrong codes count against the sign-in rate limit, and a client over that limit gets 429
+/// before its code is looked at.
 async fn authorize(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Extension(claims): Extension<Claims>,
     Query(q): Query<AuthorizeQuery>,
 ) -> Result<Json<bool>, ApiError> {
+    let client = resolve_client(peer.ip(), &headers, &state.known_proxies);
+    let counted = !client.is_exempt();
+    let key = client.limiter_key();
+
+    // AC49: the limit check, the code lookup and any miss record share this one store lock.
     let mut store = state.quick_connect.write().await;
-
-    // Find the entry by code.
-    let entry = store
-        .values_mut()
-        .find(|v| v.code == q.code)
-        .ok_or_else(|| ApiError::NotFound("Unknown code".to_string()))?;
-
-    if (Utc::now() - entry.date_added).num_seconds() >= EXPIRY_SECS {
-        return Err(ApiError::NotFound(
-            "Quick connect request expired".to_string(),
-        ));
+    if counted && state.rate_limiter.is_limited(&key).await {
+        tracing::warn!(ip = %client.ip, "rate limit exceeded");
+        return Err(ApiError::RateLimited);
     }
+    let now = Utc::now();
+
+    // Approve the live request with the code. An expired one counts as unknown.
+    let Some(entry) = store
+        .values_mut()
+        .find(|v| v.code == q.code && is_live(v, now))
+    else {
+        if counted {
+            state.rate_limiter.record(&key).await;
+        }
+        return Err(ApiError::NotFound("Unknown code".to_string()));
+    };
 
     entry.authenticated = true;
     entry.user_id = Some(claims.sub);
@@ -122,6 +173,42 @@ async fn authorize(
     // No socket message, as in Jellyfin: every socket would see the secret.
 
     Ok(Json(true))
+}
+
+/// Takes an approved Quick Connect request for a sign-in (AC26) and returns the id of the user who
+/// approved it. The request is removed as it is taken, so a secret signs in once. An unknown,
+/// unapproved or expired request is refused; an expired one is also removed.
+pub(super) async fn redeem(state: &AppState, secret: &str) -> Result<Uuid, ApiError> {
+    let mut store = state.quick_connect.write().await;
+    let entry = store.get(secret).ok_or(ApiError::Unauthorized)?;
+    if !is_live(entry, Utc::now()) {
+        store.remove(secret);
+        return Err(ApiError::Unauthorized);
+    }
+    if !entry.authenticated {
+        return Err(ApiError::Unauthorized);
+    }
+    let user_id = entry.user_id.ok_or(ApiError::Unauthorized)?;
+    store.remove(secret);
+    Ok(user_id)
+}
+
+/// The first code from `start % 1_000_000` on, wrapping after 999999, that no live request
+/// carries, as six digits. `None` when all 1,000,000 codes are taken.
+fn free_code(
+    store: &HashMap<String, QuickConnectResult>,
+    start: u32,
+    now: DateTime<Utc>,
+) -> Option<String> {
+    let taken: HashSet<&str> = store
+        .values()
+        .filter(|request| is_live(request, now))
+        .map(|request| request.code.as_str())
+        .collect();
+    let start = start % 1_000_000;
+    (0..1_000_000u32)
+        .map(|step| format!("{:06}", (start + step) % 1_000_000))
+        .find(|code| !taken.contains(code.as_str()))
 }
 
 /// Generate a random 6-digit code using basic means (no extra crate needed).
@@ -132,3 +219,6 @@ fn rand_code() -> u32 {
     let n = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
     n % 1_000_000
 }
+
+#[cfg(test)]
+mod tests;

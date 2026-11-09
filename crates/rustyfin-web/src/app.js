@@ -11,7 +11,7 @@ let serverVersion = '0.3.0';
 let playerReportInterval = null;
 let playerHideTimeout = null;
 let activeItem = null;
-// Track which libraries are currently scanning (libId -> true/false)
+// Library id -> { percent, queued } while it scans (percent 0 = not known yet, so its ring spins; queued = waiting its turn). Absent when not scanning.
 let scanStatuses = {};
 
 // --- DOM & Helper Utilities ---
@@ -30,12 +30,13 @@ function hide(id) {
     el.style.setProperty('display', 'none', 'important');
 }
 
-function initLazyImages() {
+function initLazyImages(root = document) {
     // Hover-based full-res image loading: swap thumbnail for full-res on card hover
-    document.querySelectorAll('img.jf-thumb-img[data-full-src]').forEach(img => {
-        if (img.dataset.fullLoaded) return;
+    root.querySelectorAll('img.jf-thumb-img[data-full-src]').forEach(img => {
+        if (img.dataset.lazyBound) return;
         const card = img.closest('.jf-card');
         if (!card) return;
+        img.dataset.lazyBound = '1';
 
         card.addEventListener('mouseenter', () => {
             if (img.dataset.fullLoaded) return;
@@ -75,7 +76,41 @@ function toast(msg, type = 'success') {
 
 function escapeHtml(str) {
     if (!str) return '';
-    return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+// Inner markup of a scan ring: nothing when the library is not scanning, else a progressbar with a track and an arc
+function scanRingInner(libId, name) {
+    const s = scanStatuses[libId];
+    if (s === undefined) return '';
+    const p = s.percent;
+    const known = p > 0;
+    const label = escapeHtml(s.queued ? t('library.scan_queued', { name }) : known ? t('library.scanning_percent', { name, percent: p }) : t('library.scanning', { name }));
+    const valueNow = known && !s.queued ? ` aria-valuenow="${p}"` : '';
+    const spin = known || s.queued ? '' : ' motion-safe:animate-spin';
+    const arc = known ? p : 25;
+    // A queued scan has no arc: only the track, drawn dashed
+    const track = s.queued
+        ? '<circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" stroke-width="2.5" opacity="0.25" pathLength="100" stroke-dasharray="6.25 6.25"/>'
+        : '<circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" stroke-width="2.5" opacity="0.25"/>';
+    const arcCircle = s.queued ? '' : `<circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" pathLength="100" stroke-dasharray="${arc} 100" transform="rotate(-90 8 8)"/>`;
+    return `<span role="progressbar" class="block w-full h-full text-[#00a4dc]" title="${label}" aria-label="${label}" aria-valuemin="0" aria-valuemax="100"${valueNow}>`
+        + `<svg aria-hidden="true" viewBox="0 0 16 16" class="w-full h-full${spin}">`
+        + track + arcCircle
+        + '</svg></span>';
+}
+
+// A ring next to a library name, sized by `size`. The wrapper is hidden by empty:hidden while the library is not scanning.
+function scanRing(libId, name, size = 'w-4 h-4') {
+    return `<span data-scan-ring="${escapeHtml(libId)}" data-name="${escapeHtml(name)}" class="inline-flex flex-shrink-0 ${size} empty:hidden">${scanRingInner(libId, name)}</span>`;
+}
+
+// Redraws the rings of one library, or of every library when called without an id
+function updateScanRings(libId) {
+    const selector = libId === undefined ? '[data-scan-ring]' : `[data-scan-ring="${CSS.escape(libId)}"]`;
+    document.querySelectorAll(selector).forEach(el => {
+        el.innerHTML = scanRingInner(el.dataset.scanRing, el.dataset.name);
+    });
 }
 
 function formatRuntime(ticks) {
@@ -222,6 +257,10 @@ async function wizComplete() {
             try {
                 await API.login(wizCredentials.name, wizCredentials.password);
                 wizProgress.loggedIn = true;
+                wizCredentials = null; // the password isn't needed after the sign-in
+                // Replace a socket or retry left from an earlier session, so the new token is used now
+                stopScanProgressWebSocket();
+                initScanProgressWebSocket();
             } catch (e) {
                 showFinishError(t('wizard.login_failed', { name: wizCredentials.name, message: e.message }));
                 return;
@@ -232,8 +271,11 @@ async function wizComplete() {
             const libPath = $('wiz-lib-path').value.trim();
             if (libName && libPath) {
                 try {
-                    await API.createLibrary(libName, $('wiz-lib-type').value, [libPath]);
+                    const lib = await API.createLibrary(libName, $('wiz-lib-type').value, [libPath]);
                     wizProgress.libraryCreated = true;
+                    // Scan it now, as the Add Library dialog does; the scheduler would not scan it for hours.
+                    toast(t('library.created', { name: libName }));
+                    API.scanLibrary(lib.id || lib.Id).catch(err => toast(t('library.scan_start_failed', { message: err.message }), 'error'));
                 } catch (e) {
                     showFinishError(t('wizard.library_create_failed', { message: e.message }));
                     return;
@@ -278,12 +320,12 @@ function navigate(page, data) {
     const pages = {
         home: renderHome,
         favorites: renderFavorites,
-        login: renderLogin,
+        login: () => renderLogin(data),
         library: () => renderLibrary(data),
         detail: () => renderDetail(data),
         search: () => renderSearch(data),
         person: () => renderPerson(data),
-        settings: renderSettings,
+        settings: () => renderSettings(data),
         admin: renderAdmin
     };
 
@@ -297,6 +339,63 @@ function toggleUserMenu() { $('user-dropdown')?.classList.toggle('hidden'); }
 function closeUserMenu() { $('user-dropdown')?.classList.add('hidden'); }
 document.addEventListener('click', e => {
     if (!e.target.closest('#nav-user-menu')) closeUserMenu();
+});
+
+// Toasts that a scan started, once. Refresh answers only when the scan ends, so the toast shows 300 ms after
+// sending, or when the request ends if sooner; a request that fails before then, such as a 404 for a deleted
+// library, shows only the error.
+function startScanWithToast(request, startedMessage) {
+    let started = false;
+    const showStarted = () => {
+        if (started) return;
+        started = true;
+        toast(startedMessage);
+    };
+    const timer = setTimeout(showStarted, 300);
+    return request.then(showStarted, err => {
+        clearTimeout(timer);
+        toast(t(started ? 'library.scan_failed' : 'library.scan_start_failed', { message: err.message }), 'error');
+    }).finally(() => clearTimeout(timer));
+}
+
+// Clicks on rendered markup are dispatched here from data-action and data-* attributes, so server values never end up inside inline JavaScript.
+const clickActions = {
+    navigate: el => navigate(el.dataset.page, el.dataset.id),
+    // A video with a resume point asks first; the detail page's Resume and Play from beginning buttons are that choice
+    play: el => {
+        const { id, streamType, title } = el.dataset;
+        if (el.dataset.resume === 'true') playItem(id, streamType, title);
+        else if (el.dataset.fromStart === 'true') playItem(id, streamType, title, { fromStart: true });
+        else playWithResumeChoice(id, streamType, title);
+    },
+    'scan-library': el => startScanWithToast(API.scanLibrary(el.dataset.id), t('library.scan_started_for', { name: el.dataset.name })),
+    'scan-library-page': el => startScanWithToast(API.scanLibrary(el.dataset.id), t('library.media_scan_started_for', { name: el.dataset.name })),
+    'scan-library-admin': el => startScanWithToast(API.scanLibrary(el.dataset.id), t('admin.scan_started')),
+    'scan-all': () => startScanWithToast(API.scanAllLibraries(), t('admin.scanning_all')),
+    'jump-letter': el => jumpToLetter(el.dataset.id, el.dataset.letter),
+    'toggle-favorite': el => toggleFavorite(el.dataset.id, el.dataset.favorite === 'true'),
+    'toggle-played': el => togglePlayed(el.dataset.id, el.dataset.played === 'true'),
+    'refresh-item': el => API.refreshItem(el.dataset.id).then(() => toast(t('detail.metadata_refreshing'))),
+    'admin-tab': el => showAdminTab(el, el.dataset.tab),
+    'delete-user': el => { if (confirm(t('admin.delete_user_confirm'))) API.deleteUser(el.dataset.id).then(() => renderAdmin()); },
+    'set-user-admin': el => setUserPolicy(el, { IsAdministrator: el.checked }),
+    'set-user-disabled': el => setUserPolicy(el, { IsDisabled: el.checked }),
+    'delete-library': el => deleteLibraryFromAdmin(el.dataset.id),
+    'toggle-realtime-monitor': el => toggleRealtimeMonitor(el),
+    'start-task': el => startTaskAction(el.dataset.id, el.dataset.name),
+    'stop-task': el => stopTaskAction(el.dataset.id, el.dataset.name),
+    'dir-open': el => navigateDirectoryPicker(el.dataset.path),
+    'remove-path': el => removeSelectedPath(Number(el.dataset.index)),
+    'oidc-sign-in': () => startOidcSignIn(),
+    'oidc-link': () => startOidcLink(),
+    'oidc-unlink': el => unlinkOidc(el.dataset.id),
+    'oidc-remove-link': el => removeOidcLinkAsAdmin(el),
+    'oidc-copy-callback': () => copyOidcCallbackUrl(),
+    'oidc-save-settings': () => saveOidcAdminSettings(),
+};
+document.addEventListener('click', e => {
+    const el = e.target.closest('[data-action]');
+    if (el) clickActions[el.dataset.action]?.(el, e);
 });
 
 function toggleSidebar() {
@@ -316,6 +415,35 @@ function toggleSidebar() {
 }
 
 // --- Media Card Renderer (12.x Style) ---
+// Picks card artwork from tags the item carries, so no image is requested that doesn't exist.
+// Returns { id, type, tag, contain } or null (null means the type icon is shown).
+function cardImage(item, landscape) {
+    const id = item.Id || item.id;
+    const pick = (imgId, type, tag, contain = false) => (imgId && tag ? { id: imgId, type, tag, contain } : null);
+    if (!landscape) return pick(id, 'Primary', item.ImageTags?.Primary);
+    const isEpisode = (item.Type || item.type) === 'Episode';
+    return pick(id, 'Thumb', item.ImageTags?.Thumb)
+        || pick(id, 'Backdrop', item.BackdropImageTags?.[0])
+        || (isEpisode ? pick(id, 'Primary', item.ImageTags?.Primary) : null)
+        || pick(item.ParentThumbItemId, 'Thumb', item.ParentThumbImageTag)
+        || pick(item.SeriesId, 'Thumb', item.SeriesThumbImageTag)
+        || pick(item.ParentBackdropItemId, 'Backdrop', item.ParentBackdropImageTags?.[0])
+        || pick(id, 'Primary', item.ImageTags?.Primary, true)
+        || pick(item.SeriesId, 'Primary', item.SeriesPrimaryImageTag, true)
+        || null;
+}
+
+// Own backdrop URL, else the parent's (series or season); '' when neither is tagged.
+function backdropUrl(item, maxWidth) {
+    if (item.BackdropImageTags?.[0]) {
+        return API.imageUrl(item.Id || item.id, 'Backdrop', { maxWidth, tag: item.BackdropImageTags[0] });
+    }
+    if (item.ParentBackdropItemId && item.ParentBackdropImageTags?.[0]) {
+        return API.imageUrl(item.ParentBackdropItemId, 'Backdrop', { maxWidth, tag: item.ParentBackdropImageTags[0] });
+    }
+    return '';
+}
+
 function itemCard(item, options = {}) {
     // rawName goes into the onclick code, which translates the fallback itself
     const rawName = item.Name || item.name || '';
@@ -325,19 +453,29 @@ function itemCard(item, options = {}) {
     const id = item.Id || item.id;
     const played = item.UserData?.Played || item.user_data?.played || false;
     const fav = item.UserData?.IsFavorite || item.user_data?.is_favorite || false;
-    const progress = item.UserData?.PlayedPercentage || item.user_data?.played_percentage || 0;
+    const progress = item.UserData?.PlayedPercentage || item.user_data?.played_percentage || item.CompletionPercentage || 0;
     const rating = item.CommunityRating || item.community_rating;
     // Use explicit backdrop option if provided; otherwise derive from type
     const isBackdrop = options.backdrop !== undefined ? options.backdrop : type === 'Episode';
 
     // Progressive image loading: thumbnail for fast first paint,
     // full-res loaded on hover only to save bandwidth
-    const thumbSrc = isBackdrop
-        ? API.imageUrl(id, 'Backdrop', { maxWidth: 150, format: 'webp' })
-        : API.imageUrl(id, 'Primary', { maxWidth: 150, format: 'webp' });
-    const fullSrc = isBackdrop
-        ? API.imageUrl(id, 'Backdrop', { maxWidth: 250 })
-        : API.imageUrl(id, 'Primary', { maxWidth: 250 });
+    const picture = cardImage(item, isBackdrop);
+    const thumbSrc = picture ? API.imageUrl(picture.id, picture.type, { maxWidth: 150, format: 'webp', tag: picture.tag }) : '';
+    const fullSrc = picture ? API.imageUrl(picture.id, picture.type, { maxWidth: 250, tag: picture.tag }) : '';
+    // Episode landscape cards: series name on the title line, "S1:E2 · name" on the second line
+    const hasNumbers = item.ParentIndexNumber != null && item.IndexNumber != null;
+    const isEpisodeCard = isBackdrop && type === 'Episode' && !!item.SeriesName && hasNumbers;
+    const cardTitle = isEpisodeCard ? item.SeriesName : name;
+    const episodeLine = isEpisodeCard
+        ? t('home.episode_line', {
+            season: item.ParentIndexNumber,
+            episode: item.IndexNumberEnd != null && item.IndexNumberEnd !== item.IndexNumber
+                ? `${item.IndexNumber}-${item.IndexNumberEnd}`
+                : item.IndexNumber,
+            name,
+        })
+        : '';
 
     const canPlay = ['Movie', 'Episode', 'Audio', 'MusicVideo', 'Video'].includes(type);
     const streamType = type === 'Audio' ? 'Audio' : 'Videos';
@@ -349,15 +487,16 @@ function itemCard(item, options = {}) {
     };
 
     return `
-    <div class="jf-card group" onclick="navigate('detail', '${id}')">
+    <div class="jf-card group" data-action="navigate" data-page="detail" data-id="${escapeHtml(id)}">
         <div class="${isBackdrop ? 'jf-poster-backdrop' : 'jf-poster'}">
+            ${picture ? `
             <div class="jf-poster-skeleton"></div>
             <!-- Thumbnail loads first for instant visual feedback; full-res swaps on hover -->
-            <img src="${thumbSrc}" alt="${escapeHtml(name)}" decoding="async" class="jf-thumb-img absolute inset-0 w-full h-full object-cover z-[1] opacity-0 blur-sm scale-105 transition-opacity duration-200"
+            <img src="${thumbSrc}" alt="${escapeHtml(cardTitle)}" decoding="async" loading="lazy" class="jf-thumb-img absolute inset-0 w-full h-full object-cover z-[1] opacity-0 blur-sm scale-105 transition-opacity duration-200${picture.contain ? ' jf-img-contain' : ''}"
                  data-full-src="${fullSrc}"
                  onload="this.style.opacity='0.8';this.classList.remove('blur-sm','scale-105');const sk=this.previousElementSibling;if(sk&&sk.classList.contains('jf-poster-skeleton'))sk.style.display='none';"
-                 onerror="this.style.display='none';const sk=this.previousElementSibling;if(sk&&sk.classList.contains('jf-poster-skeleton'))sk.style.display='none';">
-            <div class="hidden items-center justify-center h-full text-4xl text-white/20 absolute inset-0 bg-white/5 z-[3]" style="display:none">
+                 onerror="this.style.display='none';const sk=this.previousElementSibling;if(sk&&sk.classList.contains('jf-poster-skeleton'))sk.style.display='none';const ic=this.nextElementSibling;if(ic)ic.style.display='flex';">` : ''}
+            <div class="${picture ? 'hidden' : 'flex'} items-center justify-center h-full text-4xl text-white/20 absolute inset-0 bg-white/5"${picture ? ' style="display:none"' : ''}>
                 ${typeIcons[type] || '📁'}
             </div>
 
@@ -375,7 +514,7 @@ function itemCard(item, options = {}) {
 
             <!-- Play Button Hover Overlay -->
             ${canPlay ? `
-            <div class="jf-play-overlay" onclick="event.stopPropagation();playItem('${id}','${streamType}','${escapeHtml(rawName)}' || t('common.unknown'))">
+            <div class="jf-play-overlay" data-action="play" data-id="${escapeHtml(id)}" data-stream-type="${escapeHtml(streamType)}" data-title="${escapeHtml(rawName || t('common.unknown'))}">
                 <div class="jf-play-btn-circle">
                     <svg class="w-7 h-7 text-white ml-1" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
                 </div>
@@ -389,11 +528,12 @@ function itemCard(item, options = {}) {
         </div>
 
         <div class="p-3">
-            <p class="text-xs sm:text-sm font-semibold truncate text-white group-hover:text-[#38bdf8] transition-colors" title="${escapeHtml(name)}">${escapeHtml(name)}</p>
+            <p class="text-xs sm:text-sm font-semibold truncate text-white group-hover:text-[#38bdf8] transition-colors" title="${escapeHtml(cardTitle)}">${escapeHtml(cardTitle)}</p>
             <div class="flex items-center gap-1.5 text-[11px] text-white/40 mt-0.5">
+                ${isEpisodeCard ? `<span class="truncate">${escapeHtml(episodeLine)}</span>` : `
                 ${year ? `<span>${year}</span>` : ''}
                 ${year && type ? `<span>·</span>` : ''}
-                <span class="truncate">${type}</span>
+                <span class="truncate">${escapeHtml(type)}</span>`}
             </div>
         </div>
     </div>`;
@@ -402,9 +542,10 @@ function itemCard(item, options = {}) {
 // --- Create a single card DOM element (avoids innerHTML parsing overhead) ---
 function createCardElement(item, wrapperClass = '', cardOptions = {}) {
     const wrapper = document.createElement('div');
-    wrapper.className = wrapperClass;
     wrapper.innerHTML = itemCard(item, cardOptions);
-    return wrapper.firstElementChild;
+    const card = wrapper.firstElementChild;
+    if (card && wrapperClass) card.classList.add(...wrapperClass.split(/\s+/).filter(Boolean));
+    return card;
 }
 
 function sectionRow(title, items, moreAction = null, options = {}) {
@@ -419,7 +560,7 @@ function sectionRow(title, items, moreAction = null, options = {}) {
             <h2 class="text-lg lg:text-xl font-bold tracking-tight text-white">${escapeHtml(title)}</h2>
             <span class="text-xs text-white/30 font-medium ml-1">(${items.length})</span>
         </div>
-        ${moreAction ? `<button class="text-xs font-semibold text-[#00a4dc] hover:text-[#38bdf8] flex items-center gap-1 transition" onclick="${moreAction}">${t('common.view_all')}</button>` : ''}
+        ${moreAction ? `<button class="text-xs font-semibold text-[#00a4dc] hover:text-[#38bdf8] flex items-center gap-1 transition" data-action="navigate" data-page="${escapeHtml(moreAction.page)}" data-id="${escapeHtml(moreAction.data)}">${t('common.view_all')}</button>` : ''}
     `;
     row.appendChild(header.firstElementChild);
     if (moreAction) row.appendChild(header.lastElementChild);
@@ -443,17 +584,19 @@ function sectionRow(title, items, moreAction = null, options = {}) {
 
 // --- Home Page Renderer ---
 async function renderHome() {
+    const session = API.token; // stop drawing if this session ends meanwhile
     const page = $('page-home');
     if (!API.isLoggedIn()) {
         try {
             const info = await API.getPublicInfo();
+            if (API.token !== session) return;
             const sn = info.ServerName || info.server_name || 'Rustyfin';
             const ver = info.Version || info.version || serverVersion;
             page.innerHTML = `
             <div class="flex flex-col items-center justify-center min-h-[75vh] text-center jf-page px-4">
                 <div class="relative mb-6">
                     <img src="/web/assets/logo.png" alt="Rustyfin" class="w-32 h-32 rounded-3xl shadow-2xl p-2 bg-gradient-to-tr from-white/10 to-transparent border border-white/10">
-                    <span class="absolute -bottom-2 right-2 px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-[#00a4dc] text-white shadow-lg">v${ver}</span>
+                    <span class="absolute -bottom-2 right-2 px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-[#00a4dc] text-white shadow-lg">v${escapeHtml(ver)}</span>
                 </div>
                 <h1 class="text-4xl sm:text-5xl font-black mb-3 tracking-tight text-white">${escapeHtml(sn)}</h1>
                 <p class="text-white/60 text-base max-w-lg mb-8 leading-relaxed">
@@ -469,7 +612,7 @@ async function renderHome() {
                         <p class="text-[11px] text-white/40 uppercase tracking-wider mt-1">${t('home.ram_idle')}</p>
                     </div>
                     <div class="p-4 rounded-xl bg-white/5 border border-white/10 text-center">
-                        <p class="text-xl font-bold text-amber-400">v${ver}</p>
+                        <p class="text-xl font-bold text-amber-400">v${escapeHtml(ver)}</p>
                         <p class="text-[11px] text-white/40 uppercase tracking-wider mt-1">${t('home.release')}</p>
                     </div>
                 </div>
@@ -478,6 +621,7 @@ async function renderHome() {
                 </button>
             </div>`;
         } catch {
+            if (API.token !== session) return;
             page.innerHTML = `<div class="p-10 text-center text-red-400 jf-page">${t('home.server_unreachable')}</div>`;
         }
         return;
@@ -486,17 +630,19 @@ async function renderHome() {
     page.innerHTML = '<div class="flex justify-center items-center py-24"><div class="w-10 h-10 border-3 border-[#00a4dc] border-t-transparent rounded-full animate-spin"></div></div>';
 
     try {
+        let libsError = null;
         const [resumeData, nextUpData, latestData, libsData] = await Promise.all([
             (API.getResume ? API.getResume(12) : Promise.resolve({ Items: [] })).catch(() => ({ Items: [] })),
             (API.getNextUp ? API.getNextUp(12) : Promise.resolve({ Items: [] })).catch(() => ({ Items: [] })),
             (API.getLatest ? API.getLatest(20) : Promise.resolve([])).catch(() => []),
-            (API.getLibraries ? API.getLibraries() : Promise.resolve([])).catch(() => [])
+            API.getLibraries().catch(err => { libsError = err; return null; })
         ]);
+        if (API.token !== session) return;
 
         const resume = resumeData.Items || resumeData.items || [];
         const nextUp = nextUpData.Items || nextUpData.items || [];
         const latest = Array.isArray(latestData) ? latestData : (latestData.Items || latestData.items || []);
-        libraries = libsData || [];
+        if (!libsError) libraries = libsData || [];
 
         let c = '<div class="jf-page space-y-8">';
 
@@ -509,30 +655,30 @@ async function renderHome() {
             const spYear = spotlightItem.ProductionYear || spotlightItem.production_year || '';
             const spRating = spotlightItem.CommunityRating || spotlightItem.community_rating;
             const spType = spotlightItem.Type || spotlightItem.type || 'Movie';
-            const spBackdrop = API.imageUrl(spId, 'Backdrop', { maxWidth: 1920 });
+            const spBackdrop = backdropUrl(spotlightItem, 1920);
             const canPlay = ['Movie', 'Episode', 'Audio', 'MusicVideo', 'Video'].includes(spType);
             const streamType = spType === 'Audio' ? 'Audio' : 'Videos';
 
             c += `
             <div class="jf-spotlight mb-10">
-                <img src="${spBackdrop}" class="jf-spotlight-backdrop" onerror="this.style.display='none'">
+                ${spBackdrop ? `<img src="${spBackdrop}" class="jf-spotlight-backdrop" onerror="this.style.display='none'">` : ''}
                 <div class="jf-spotlight-gradient"></div>
                 <div class="relative z-10 p-6 sm:p-10 lg:p-14 flex flex-col justify-end min-h-[420px] max-w-3xl">
                     <div class="flex items-center gap-2 mb-3">
                         <span class="jf-badge jf-badge-accent uppercase tracking-wider text-[11px]">${t('home.highlights')}</span>
-                        <span class="jf-badge jf-badge-primary uppercase tracking-wider text-[11px]">${spType}</span>
-                        ${spYear ? `<span class="jf-badge text-[11px]">${spYear}</span>` : ''}
+                        <span class="jf-badge jf-badge-primary uppercase tracking-wider text-[11px]">${escapeHtml(spType)}</span>
+                        ${spYear ? `<span class="jf-badge text-[11px]">${escapeHtml(spYear)}</span>` : ''}
                         ${spRating ? `<span class="jf-badge jf-badge-rating text-[11px]">★ ${spRating.toFixed(1)}</span>` : ''}
                     </div>
                     <h1 class="text-3xl sm:text-4xl lg:text-5xl font-black text-white tracking-tight mb-3 drop-shadow-md">${escapeHtml(spName)}</h1>
                     ${spOverview ? `<p class="text-white/80 text-xs sm:text-sm line-clamp-3 mb-6 max-w-2xl leading-relaxed">${escapeHtml(spOverview)}</p>` : ''}
                     <div class="flex flex-wrap items-center gap-3">
                         ${canPlay ? `
-                        <button class="jf-btn-primary !py-2.5 !px-6 text-sm" onclick="playItem('${spId}','${streamType}','${escapeHtml(spName)}')">
+                        <button class="jf-btn-primary !py-2.5 !px-6 text-sm" data-action="play" data-id="${escapeHtml(spId)}" data-stream-type="${escapeHtml(streamType)}" data-title="${escapeHtml(spName)}">
                             <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
                             ${t('common.play')}
                         </button>` : ''}
-                        <button class="jf-btn-ghost !py-2.5 !px-5 text-sm" onclick="navigate('detail','${spId}')">
+                        <button class="jf-btn-ghost !py-2.5 !px-5 text-sm" data-action="navigate" data-page="detail" data-id="${escapeHtml(spId)}">
                             ${t('home.more_info')}
                         </button>
                     </div>
@@ -541,7 +687,16 @@ async function renderHome() {
         }
 
         // 2. "Meine Medien" Library Tiles
-        if (libraries.length > 0) {
+        if (libsError) {
+            c += `
+            <div class="mb-10">
+                <div class="flex items-center gap-2 mb-4">
+                    <span class="w-2.5 h-2.5 rounded-full bg-[#00a4dc]"></span>
+                    <h2 class="text-lg lg:text-xl font-bold tracking-tight text-white">${t('home.my_media')}</h2>
+                </div>
+                <p class="text-sm text-red-400">${t('library.list_failed', { message: escapeHtml(libsError.message) })}</p>
+            </div>`;
+        } else if (libraries.length > 0) {
             c += `
             <div class="mb-10">
                 <div class="flex items-center gap-2 mb-4">
@@ -562,18 +717,20 @@ async function renderHome() {
                         };
                         const icons = { Movies: '🎬', TvShows: '📺', Music: '🎵', Photos: '🖼️', Mixed: '📁' };
                         return `
-                        <div class="jf-card p-5 bg-gradient-to-br ${gradients[libType] || gradients.Mixed} flex flex-col justify-between min-h-[120px] relative" onclick="navigate('library','${libId}')">
+                        <div class="jf-card p-5 bg-gradient-to-br ${gradients[libType] || gradients.Mixed} flex flex-col justify-between min-h-[120px] relative" data-action="navigate" data-page="library" data-id="${escapeHtml(libId)}">
                             <div class="flex items-center justify-between">
                                 <span class="text-3xl">${icons[libType] || '📁'}</span>
                                 <div class="flex items-center gap-1">
-                                    ${scanStatuses[libId] ? `<span class="w-2 h-2 rounded-full bg-amber-400 animate-pulse" title="${escapeHtml(t('library.scan_running'))}"></span>` : ''}
-                                    <button type="button" class="w-6 h-6 rounded flex items-center justify-center text-white/40 hover:text-white hover:bg-white/10 transition" onclick="event.stopPropagation();API.scanLibrary('${libId}').then(()=>toast(t('library.scan_started_for', { name: '${escapeHtml(libName)}' })))" title="${escapeHtml(t('library.scan_library'))}">
+                                    <button type="button" class="w-6 h-6 rounded flex items-center justify-center text-white/40 hover:text-white hover:bg-white/10 transition" data-action="scan-library" data-id="${escapeHtml(libId)}" data-name="${escapeHtml(libName)}" title="${escapeHtml(t('library.scan_library'))}">
                                         <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
                                     </button>
                                 </div>
                             </div>
                             <div>
-                                <p class="font-bold text-white text-base truncate">${escapeHtml(libName)}</p>
+                                <div class="flex items-center gap-1.5 min-w-0">
+                                    <p class="font-bold text-white text-base truncate">${escapeHtml(libName)}</p>
+                                    ${scanRing(libId, libName)}
+                                </div>
                             </div>
                         </div>`;
                     }).join('')}
@@ -603,12 +760,14 @@ async function renderHome() {
         c += '</div>';
         page.innerHTML = c;
     } catch (e) {
+        if (API.token !== session) return;
         page.innerHTML = `<div class="p-6 rounded-xl bg-red-500/10 border border-red-500/20 text-red-400 jf-page">${t('home.load_failed', { message: escapeHtml(e.message) })}</div>`;
     }
 }
 
 // --- Favorites Page Renderer (with pagination) ---
 async function renderFavorites() {
+    const session = API.token;
     favoritesPage = 0;
     destroyInfiniteScroll();
     const page = $('page-favorites');
@@ -633,6 +792,7 @@ async function renderFavorites() {
     try {
         // Use pagination to avoid loading all favorites at once
         const data = await API.getUserItems({ IsFavorite: true, StartIndex: 0, Limit: LIBRARY_PAGE_SIZE });
+        if (API.token !== session) return;
         const items = data.Items || data.items || [];
         const total = data.TotalRecordCount || data.total_record_count || items.length;
         const hasMore = items.length >= LIBRARY_PAGE_SIZE;
@@ -645,18 +805,14 @@ async function renderFavorites() {
                     <h1 class="text-2xl lg:text-3xl font-extrabold text-white tracking-tight">${t('favorites.title')}</h1>
                     <span class="text-xs text-white/40">(${total})</span>
                 </div>
-                <div id="fav-grid-container"></div>
+                <div id="fav-grid" class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-7 gap-4"></div>
                 ${hasMore ? `
                 <div id="fav-infinite-container" class="text-center mt-8">
                     <div id="infinite-scroll-spinner" class="jf-infinite-spinner" style="display:none"><div class="jf-spinner"></div></div>
                     <div id="infinite-scroll-sentinel" class="jf-infinite-sentinel"></div>
                 </div>` : ''}
             </div>`;
-            // Initialize virtual grid for favorites
-            if (virtualGrid) { virtualGrid.destroy(); virtualGrid = null; }
-            virtualGrid = new VirtualGrid('fav-grid-container');
-            virtualGrid.init();
-            virtualGrid.setItems(items);
+            appendFavoriteCards(items);
         } else {
             page.innerHTML = `
             <div class="jf-page">
@@ -677,11 +833,25 @@ async function renderFavorites() {
             setupInfiniteScroll(() => loadMoreFavoritesInfinite(total));
         }
     } catch (e) {
+        if (API.token !== session) return;
         page.innerHTML = `<div class="p-6 rounded-xl bg-red-500/10 text-red-400">${escapeHtml(e.message)}</div>`;
     }
 }
 
 let favoritesPage = 0;
+
+// Appends one card per item to the favorites grid
+function appendFavoriteCards(items) {
+    const grid = $('fav-grid');
+    if (!grid) return;
+    const frag = document.createDocumentFragment();
+    for (const item of items) {
+        const card = createCardElement(item);
+        if (card) frag.appendChild(card);
+    }
+    grid.appendChild(frag);
+    initLazyImages(grid);
+}
 
 async function loadMoreFavoritesInfinite(initialTotal) {
     try {
@@ -691,9 +861,7 @@ async function loadMoreFavoritesInfinite(initialTotal) {
         const items = data.Items || data.items || [];
         const total = data.TotalRecordCount || data.total_record_count || initialTotal;
 
-        if (items.length > 0 && virtualGrid) {
-            virtualGrid.appendItems(items);
-        }
+        appendFavoriteCards(items);
 
         // If no more items, destroy infinite scroll and remove sentinel
         const remaining = total - (favoritesPage + 1) * LIBRARY_PAGE_SIZE;
@@ -707,8 +875,16 @@ async function loadMoreFavoritesInfinite(initialTotal) {
     }
 }
 
-let currentLetterFilter = '';
-let libraryPage = 0;
+// Library list state: each load gets a new generation, and responses from older generations are dropped
+let libraryGen = 0;
+let libraryQuery = null;
+let libraryTotal = null;
+let libraryObserver = null;
+let libraryRequested = new Set();
+let letterClicks = 0;
+// The letter rail: the anchor of the last jump ({ k, first }) and the pending frame of an update
+let railAnchor = null;
+let railFrame = 0;
 const LIBRARY_PAGE_SIZE = 50;
 
 // --- Infinite Scroll via IntersectionObserver ---
@@ -787,152 +963,10 @@ function addInfiniteScrollSentinel(container) {
     container.appendChild(sentinel);
 }
 
-// --- Virtual Grid: only render visible cards + buffer ---
-// Replaces the DOM-heavy approach of appending all cards to the grid.
-// With 1500 films, this keeps ~30 DOM cards instead of 1500+.
-class VirtualGrid {
-    constructor(containerId, options = {}) {
-        this.containerId = containerId;
-        this.items = [];
-        this.cardHeight = options.cardHeight || 280; // estimated card height in px
-        this.buffer = options.buffer || 5; // extra cards above/below viewport
-        this.columns = this._getColumns();
-        this.scrollContainer = null;
-        this.gridEl = null;
-        this.spacerTop = null;
-        this.spacerBottom = null;
-        this.cardsContainer = null;
-        this.renderedStart = -1;
-        this.renderedEnd = -1;
-        this.resizeObserver = null;
-        this._onResize = this._onResize.bind(this);
-        this._onScroll = this._onScroll.bind(this);
-        this._rafId = null;
-    }
-
-    _getColumns() {
-        const w = window.innerWidth;
-        if (w >= 1280) return 7;
-        if (w >= 1024) return 5;
-        if (w >= 768) return 4;
-        if (w >= 640) return 3;
-        return 2;
-    }
-
-    init() {
-        this.container = document.getElementById(this.containerId);
-        if (!this.container) return;
-        // Create virtual grid structure
-        this.container.innerHTML = `
-            <div class="jf-virtual-grid" style="position:relative;overflow:auto;max-height:calc(100vh - 280px);">
-                <div class="jf-virtual-spacer" style="height:0"></div>
-                <div class="jf-virtual-cards" style="position:absolute;top:0;left:0;right:0;"></div>
-                <div class="jf-virtual-spacer" style="height:0"></div>
-            </div>`;
-        this.scrollContainer = this.container.querySelector('.jf-virtual-grid');
-        this.spacerTop = this.scrollContainer.children[0];
-        this.cardsContainer = this.scrollContainer.children[1];
-        this.spacerBottom = this.scrollContainer.children[2];
-        this.scrollContainer.addEventListener('scroll', this._onScroll, { passive: true });
-        this.resizeObserver = new ResizeObserver(this._onResize);
-        this.resizeObserver.observe(this.scrollContainer);
-        this._updateTotalHeight();
-    }
-
-    destroy() {
-        if (this.scrollContainer) {
-            this.scrollContainer.removeEventListener('scroll', this._onScroll);
-        }
-        if (this.resizeObserver) {
-            this.resizeObserver.disconnect();
-        }
-        if (this._rafId) {
-            cancelAnimationFrame(this._rafId);
-        }
-    }
-
-    _onResize() {
-        this.columns = this._getColumns();
-        this._renderVisible();
-    }
-
-    _onScroll() {
-        if (this._rafId) return;
-        this._rafId = requestAnimationFrame(() => {
-            this._rafId = null;
-            this._renderVisible();
-        });
-    }
-
-    _updateTotalHeight() {
-        const rows = Math.ceil(this.items.length / this.columns);
-        const totalHeight = rows * this.cardHeight;
-        this.spacerTop.style.height = '0px';
-        this.spacerBottom.style.height = `${Math.max(0, totalHeight)}px`;
-        this.scrollContainer.style.minHeight = `${totalHeight}px`;
-    }
-
-    setItems(newItems) {
-        this.items = newItems;
-        this._updateTotalHeight();
-        this._renderVisible();
-    }
-
-    appendItems(newItems) {
-        this.items.push(...newItems);
-        this._updateTotalHeight();
-        this._renderVisible();
-    }
-
-    _renderVisible() {
-        if (!this.scrollContainer || this.items.length === 0) return;
-        const scrollTop = this.scrollContainer.scrollTop;
-        const viewportHeight = this.scrollContainer.clientHeight;
-        const rowsPerCard = 1; // each card is one row in the grid
-        const cardHeightWithGap = this.cardHeight + 16; // gap-4 = 16px
-
-        const startRow = Math.max(0, Math.floor(scrollTop / cardHeightWithGap) - this.buffer);
-        const endRow = Math.ceil((scrollTop + viewportHeight) / cardHeightWithGap) + this.buffer;
-
-        const startIdx = Math.max(0, startRow * this.columns);
-        const endIdx = Math.min(this.items.length, (endRow + 1) * this.columns);
-
-        if (startIdx === this.renderedStart && endIdx === this.renderedEnd) return;
-        this.renderedStart = startIdx;
-        this.renderedEnd = endIdx;
-
-        // Clear and re-render visible range
-        this.cardsContainer.innerHTML = '';
-        const fragment = document.createDocumentFragment();
-        const grid = document.createElement('div');
-        grid.className = 'grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-7 gap-4';
-        grid.style.paddingTop = `${startIdx * cardHeightWithGap}px`;
-        grid.style.paddingBottom = `${Math.max(0, (this.items.length - endIdx) * cardHeightWithGap)}px`;
-
-        for (let i = startIdx; i < endIdx; i++) {
-            const card = createCardElement(this.items[i]);
-            if (card) grid.appendChild(card);
-        }
-        fragment.appendChild(grid);
-        this.cardsContainer.appendChild(fragment);
-
-        // Update spacers
-        this.spacerTop.style.height = `${startIdx * cardHeightWithGap}px`;
-        const remaining = this.items.length - endIdx;
-        this.spacerBottom.style.height = `${remaining * cardHeightWithGap}px`;
-
-        initLazyImages();
-    }
-}
-
-// Global virtual grid instance
-let virtualGrid = null;
-
 // --- Library Explorer Page Renderer (with pagination) ---
 async function renderLibrary(libId) {
+    const session = API.token;
     currentLibraryId = libId;
-    currentLetterFilter = '';
-    libraryPage = 0;
     const page = $('page-library');
     
     // Show skeleton grid immediately for instant visual feedback
@@ -952,9 +986,6 @@ async function renderLibrary(libId) {
                 <p class="text-xs text-white/40 mt-1">${t('common.loading')}</p>
             </div>
         </div>
-        <div class="jf-alpha-bar mb-6 opacity-50">
-            ${'#ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('').map(l => `<span class="jf-alpha-btn">${l}</span>`).join('')}
-        </div>
         <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-7 gap-4">
             ${Array.from({length: 21}, () => `
             <div class="jf-card">
@@ -968,38 +999,17 @@ async function renderLibrary(libId) {
             </div>`).join('')}
         </div>
     </div>`;
+    renderLetterRail(libId);
 
+    const gen = startLibraryLoad(libId);
     try {
-        // Determine which item types to show based on library content type
-        let includeItemTypes = undefined;
-        if (contentType === 'TvShows') {
-            includeItemTypes = 'Series';
-        } else if (contentType === 'Music') {
-            includeItemTypes = 'MusicAlbum';
-        } else if (contentType === 'Movies') {
-            includeItemTypes = 'Movie';
-        }
-
-        // Fetch first page with pagination + total count
-        const params = { 
-            LibraryId: libId, 
-            SortBy: 'SortName', 
-            SortOrder: 'Ascending', 
-            Fields: 'PrimaryImageAspectRatio',
-            StartIndex: 0,
-            Limit: LIBRARY_PAGE_SIZE
-        };
-        if (includeItemTypes) params.IncludeItemTypes = includeItemTypes;
-
-        const [libData, filterData] = await Promise.all([
-            API.getItems(params),
+        // Fetch first page with pagination + total count, and the genres for the filter
+        const [{ items, total }, filterData] = await Promise.all([
+            fetchLibraryPage(0),
             API.getFilters().catch(() => ({ Genres: [] }))
         ]);
-
-        const items = libData.Items || libData.items || [];
-        const total = libData.TotalRecordCount || libData.total_record_count || items.length;
+        if (gen !== libraryGen || API.token !== session) return;
         const genres = filterData.Genres || filterData.genres || [];
-        const hasMore = items.length >= LIBRARY_PAGE_SIZE;
 
         page.innerHTML = `
         <div class="jf-page">
@@ -1009,245 +1019,312 @@ async function renderLibrary(libId) {
                     <div class="flex items-center gap-2">
                         <span class="text-2xl">${lib?.content_type === 'Movies' ? '🎬' : lib?.content_type === 'TvShows' ? '📺' : lib?.content_type === 'Music' ? '🎵' : '📁'}</span>
                         <h1 class="text-2xl lg:text-3xl font-extrabold text-white tracking-tight">${escapeHtml(libName)}</h1>
+                        ${scanRing(libId, libName, 'w-5 h-5')}
                     </div>
                     <p id="lib-count-label" class="text-xs text-white/40 mt-1">${t('library.item_count', { count: total })}</p>
                 </div>
 
                 <div class="flex flex-wrap items-center gap-2">
-                    <!-- Sort selector -->
-                    <select id="lib-sort" class="jf-input !py-1.5 text-xs" onchange="filterLibrary('${libId}')">
-                        <option value="SortName:Ascending">${t('library.sort_name_asc')}</option>
-                        <option value="SortName:Descending">${t('library.sort_name_desc')}</option>
-                        <option value="PremiereDate:Descending">${t('library.sort_release_date')}</option>
-                        <option value="DateCreated:Descending">${t('library.sort_date_added')}</option>
-                        <option value="CommunityRating:Descending">${t('library.sort_rating')}</option>
-                    </select>
+                    <!-- Sort selector, with a toggle that reverses its order -->
+                    <div class="flex items-center gap-1">
+                        <select id="lib-sort" class="jf-input !py-1.5 text-xs">
+                            <option value="SortName,ProductionYear:Ascending">${t('library.sort_name')}</option>
+                            <option value="PremiereDate,SortName,ProductionYear:Descending">${t('library.sort_release_date')}</option>
+                            <option value="DateCreated,SortName,ProductionYear:Descending">${t('library.sort_date_added')}</option>
+                            <option value="CommunityRating,SortName,ProductionYear:Descending">${t('library.sort_rating')}</option>
+                        </select>
+                        <button id="lib-sort-reverse" type="button" class="jf-btn-ghost self-stretch !py-1.5 !px-2 text-xs" aria-pressed="false" title="${escapeHtml(t('library.sort_reverse'))}" aria-label="${escapeHtml(t('library.sort_reverse'))}">
+                            <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M3 7.5 7.5 3m0 0L12 7.5M7.5 3v13.5m13.5 0L16.5 21m0 0L12 16.5m4.5 4.5V7.5"/></svg>
+                        </button>
+                    </div>
 
                     <!-- Genre filter -->
                     ${genres.length > 0 ? `
-                    <select id="lib-genre" class="jf-input !py-1.5 text-xs max-w-[140px]" onchange="filterLibrary('${libId}')">
+                    <select id="lib-genre" class="jf-input !py-1.5 text-xs max-w-[140px]">
                         <option value="">${t('library.all_genres')}</option>
                         ${genres.map(g => `<option value="${escapeHtml(g)}">${escapeHtml(g)}</option>`).join('')}
                     </select>` : ''}
 
                     <!-- Scan trigger -->
-                    <button class="jf-btn-ghost !py-1.5 !px-3 text-xs" onclick="API.scanLibrary('${libId}').then(()=>{toast(t('library.media_scan_started_for', { name: '${escapeHtml(libName)}' }));scanStatuses['${libId}']=true;})">
+                    <button class="jf-btn-ghost !py-1.5 !px-3 text-xs" data-action="scan-library-page" data-id="${escapeHtml(libId)}" data-name="${escapeHtml(libName)}">
                         ${t('library.scan_button')}
                     </button>
                 </div>
             </div>
 
-            <!-- Alphabet Quick Jump Bar -->
-            <div class="jf-alpha-bar mb-6">
-                <button class="jf-alpha-btn active" data-letter="" onclick="jumpToLetter('${libId}', '')">${t('common.all')}</button>
-                ${'#ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('').map(l => `
-                    <button class="jf-alpha-btn" data-letter="${l}" onclick="jumpToLetter('${libId}', '${l}')">${l}</button>
-                `).join('')}
-            </div>
-
-            <!-- Media Grid Container (Virtual Scrolling) -->
+            <!-- Media Grid Container -->
             <div id="lib-grid-container"></div>
-
-            <!-- Infinite Scroll Sentinel (replaces Load More button) -->
-            ${hasMore ? `
-            <div id="lib-infinite-container" class="text-center mt-8">
-                <div id="infinite-scroll-spinner" class="jf-infinite-spinner" style="display:none"><div class="jf-spinner"></div></div>
-                <div id="infinite-scroll-sentinel" class="jf-infinite-sentinel"></div>
-            </div>` : ''}
         </div>`;
-        // Initialize virtual grid for library
-        if (virtualGrid) { virtualGrid.destroy(); virtualGrid = null; }
-        virtualGrid = new VirtualGrid('lib-grid-container');
-        virtualGrid.init();
-        if (items.length > 0) {
-            virtualGrid.setItems(items);
-        }
-        // Setup infinite scroll for library
-        if (hasMore) {
-            setupInfiniteScroll(() => loadMoreLibraryItemsInfinite(libId, total));
-        }
+        $('lib-sort')?.addEventListener('change', () => reloadLibrary(libId));
+        $('lib-sort-reverse')?.addEventListener('click', e => {
+            const btn = e.currentTarget;
+            btn.setAttribute('aria-pressed', btn.getAttribute('aria-pressed') === 'true' ? 'false' : 'true');
+            reloadLibrary(libId);
+        });
+        $('lib-genre')?.addEventListener('change', () => reloadLibrary(libId));
+        fillLibraryGrid(items, total);
     } catch (e) {
+        if (gen !== libraryGen || API.token !== session) return;
+        page.classList.remove('jf-with-rail');
         page.innerHTML = `<div class="p-6 rounded-xl bg-red-500/10 text-red-400">${escapeHtml(e.message)}</div>`;
     }
 }
 
-// --- Load More Library Items (infinite scroll callback) ---
-async function loadMoreLibraryItemsInfinite(libId, initialTotal) {
+// The library list's sort: the select's value, with the order flipped while the reverse toggle is pressed
+function librarySort() {
+    const [sortBy, sortOrder] = ($('lib-sort')?.value || 'SortName,ProductionYear:Ascending').split(':');
+    const reversed = $('lib-sort-reverse')?.getAttribute('aria-pressed') === 'true';
+    if (!reversed) return { sortBy, sortOrder };
+    return { sortBy, sortOrder: sortOrder === 'Ascending' ? 'Descending' : 'Ascending' };
+}
+
+// The /Items query for the library list; paging is added per request
+function libraryListQuery(libId) {
+    const lib = libraries.find(l => (l.id || l.Id) === libId);
+    const contentType = lib?.content_type || lib?.Content_type || lib?.ContentType || '';
+
+    let includeItemTypes = undefined;
+    if (contentType === 'TvShows') includeItemTypes = 'Series';
+    else if (contentType === 'Music') includeItemTypes = 'MusicAlbum';
+    else if (contentType === 'Movies') includeItemTypes = 'Movie';
+
+    const { sortBy, sortOrder } = librarySort();
+    return {
+        LibraryId: libId,
+        IncludeItemTypes: includeItemTypes,
+        SortBy: sortBy,
+        SortOrder: sortOrder,
+        Fields: 'PrimaryImageAspectRatio',
+        Genres: $('lib-genre')?.value || undefined
+    };
+}
+
+// Starts a load: a new generation, and the observer of the previous load is dropped
+function startLibraryLoad(libId) {
+    libraryObserver?.disconnect();
+    libraryObserver = null;
+    libraryQuery = libraryListQuery(libId);
+    libraryTotal = null;
+    libraryRequested = new Set([0]); // the first page is requested by the load itself
+    railAnchor = null;
+    return ++libraryGen;
+}
+
+// One page of the current load, with the total record count
+async function fetchLibraryPage(startIndex) {
+    const data = await API.getItems({ ...libraryQuery, StartIndex: startIndex, Limit: LIBRARY_PAGE_SIZE });
+    const items = data.Items || data.items || [];
+    return { items, total: data.TotalRecordCount || data.total_record_count || items.length };
+}
+
+// Fills #lib-grid-container with one child per item: cards for the loaded items, placeholders for the rest
+function fillLibraryGrid(items, total) {
+    const container = $('lib-grid-container');
+    if (!container) return;
+    libraryTotal = total;
+    if (total === 0) {
+        container.innerHTML = `<div class="text-center py-20 text-white/40">${t('library.no_filter_results')}</div>`;
+        return;
+    }
+    container.innerHTML = '<div id="lib-grid" class="jf-lib-grid"></div>';
+    const grid = container.firstElementChild;
+
+    const template = document.createElement('div');
+    template.innerHTML = '<div class="jf-card"><div class="jf-poster"></div><div class="p-3"><p class="text-xs sm:text-sm">&nbsp;</p><div class="text-[11px] mt-0.5">&nbsp;</div></div></div>';
+    const placeholder = template.firstElementChild;
+    const frag = document.createDocumentFragment();
+    for (let i = 0; i < total; i++) {
+        if (i < items.length) {
+            const card = createCardElement(items[i]);
+            card.dataset.letter = railLetter(items[i]);
+            frag.appendChild(card);
+        } else {
+            const ph = placeholder.cloneNode(true);
+            ph.dataset.i = i;
+            frag.appendChild(ph);
+        }
+    }
+    grid.appendChild(frag);
+    initLazyImages(grid);
+
+    // A placeholder that comes near the viewport requests its page, once per load
+    const gen = libraryGen;
+    libraryObserver = new IntersectionObserver(entries => {
+        if (gen !== libraryGen) return; // a newer load has replaced this observer
+        for (const entry of entries) {
+            if (!entry.isIntersecting) continue;
+            const page = Math.floor(Number(entry.target.dataset.i) / LIBRARY_PAGE_SIZE);
+            if (libraryRequested.has(page)) continue;
+            libraryRequested.add(page);
+            loadLibraryPage(gen, page);
+        }
+    }, { rootMargin: '200% 0px' });
+    grid.querySelectorAll('[data-i]').forEach(ph => libraryObserver.observe(ph));
+    scheduleRailUpdate();
+}
+
+// Puts the cards of one page in place of its placeholders
+async function loadLibraryPage(gen, page) {
     try {
-        const lib = libraries.find(l => (l.id || l.Id) === libId);
-        const contentType = lib?.content_type || lib?.Content_type || lib?.ContentType || '';
-
-        let includeItemTypes = undefined;
-        if (contentType === 'TvShows') includeItemTypes = 'Series';
-        else if (contentType === 'Music') includeItemTypes = 'MusicAlbum';
-        else if (contentType === 'Movies') includeItemTypes = 'Movie';
-
-        libraryPage++;
-        const startIndex = libraryPage * LIBRARY_PAGE_SIZE;
-
-        const params = { 
-            LibraryId: libId, 
-            SortBy: 'SortName', 
-            SortOrder: 'Ascending', 
-            Fields: 'PrimaryImageAspectRatio',
-            StartIndex: startIndex,
-            Limit: LIBRARY_PAGE_SIZE
-        };
-        if (includeItemTypes) params.IncludeItemTypes = includeItemTypes;
-
-        const data = await API.getItems(params);
-        const items = data.Items || data.items || [];
-        const total = data.TotalRecordCount || data.total_record_count || initialTotal;
-
-        if (items.length > 0 && virtualGrid) {
-            virtualGrid.appendItems(items);
-        }
-
-        // If no more items, destroy infinite scroll and remove sentinel
-        const remaining = total - (libraryPage + 1) * LIBRARY_PAGE_SIZE;
-        if (remaining <= 0) {
-            destroyInfiniteScroll();
-            const sentinelContainer = $('lib-infinite-container');
-            if (sentinelContainer) sentinelContainer.remove();
-        }
+        const { items } = await fetchLibraryPage(page * LIBRARY_PAGE_SIZE);
+        if (gen !== libraryGen) return;
+        const grid = $('lib-grid');
+        items.forEach((item, j) => {
+            const placeholder = grid?.children[page * LIBRARY_PAGE_SIZE + j];
+            if (!placeholder) return;
+            const card = createCardElement(item);
+            card.dataset.letter = railLetter(item);
+            placeholder.replaceWith(card);
+            libraryObserver.unobserve(placeholder);
+            initLazyImages(card);
+        });
+        scheduleRailUpdate();
     } catch (e) {
+        if (gen !== libraryGen) return;
+        libraryRequested.delete(page);
         toast(t('library.load_failed', { message: e.message }), 'error');
     }
 }
 
-async function filterLibrary(libId) {
-    const sortVal = $('lib-sort')?.value || 'SortName:Ascending';
-    const [sortBy, sortOrder] = sortVal.split(':');
-    const genre = $('lib-genre')?.value || '';
+// A sort or genre change: a new load for the new query, shown from the top of the list
+async function reloadLibrary(libId) {
+    renderLetterRail(libId);
 
-    // Remove existing infinite scroll when filtering
-    destroyInfiniteScroll();
-    const existingInfinite = document.getElementById('lib-infinite-container');
-    if (existingInfinite) existingInfinite.remove();
-
-    // Show loading state in virtual grid container
+    window.scrollTo({ top: 0, behavior: 'instant' });
+    const gen = startLibraryLoad(libId);
     const container = $('lib-grid-container');
     if (container) {
         container.innerHTML = '<div class="flex justify-center items-center py-24"><div class="w-10 h-10 border-3 border-[#00a4dc] border-t-transparent rounded-full animate-spin"></div></div>';
     }
 
     try {
-        const lib = libraries.find(l => (l.id || l.Id) === libId);
-        const contentType = lib?.content_type || lib?.Content_type || lib?.ContentType || '';
-
-        let includeItemTypes = undefined;
-        if (contentType === 'TvShows') includeItemTypes = 'Series';
-        else if (contentType === 'Music') includeItemTypes = 'MusicAlbum';
-        else if (contentType === 'Movies') includeItemTypes = 'Movie';
-
-        // Reset pagination on filter change
-        libraryPage = 0;
-
-        // Fetch first page with pagination
-        const params = { 
-            LibraryId: libId, 
-            SortBy: sortBy, 
-            SortOrder: sortOrder, 
-            Fields: 'PrimaryImageAspectRatio',
-            StartIndex: 0,
-            Limit: LIBRARY_PAGE_SIZE
-        };
-        if (includeItemTypes) params.IncludeItemTypes = includeItemTypes;
-        if (genre) params.Genres = genre;
-        if (currentLetterFilter) params.NameStartsWith = currentLetterFilter;
-
-        const data = await API.getItems(params);
-        const items = data.Items || data.items || [];
-        const total = data.TotalRecordCount || data.total_record_count || items.length;
-        const hasMore = items.length >= LIBRARY_PAGE_SIZE;
+        const { items, total } = await fetchLibraryPage(0);
+        if (gen !== libraryGen) return;
+        fillLibraryGrid(items, total);
         const countLabel = $('lib-count-label');
         if (countLabel) countLabel.textContent = t('library.item_count', { count: total });
-
-        if (items.length > 0) {
-            // Initialize virtual grid for filtered results
-            if (virtualGrid) { virtualGrid.destroy(); virtualGrid = null; }
-            virtualGrid = new VirtualGrid('lib-grid-container');
-            virtualGrid.init();
-            virtualGrid.setItems(items);
-            // Setup infinite scroll for filtered library
-            if (hasMore) {
-                const infDiv = document.createElement('div');
-                infDiv.id = 'lib-infinite-container';
-                infDiv.className = 'text-center mt-8';
-                infDiv.innerHTML = `
-                    <div id="infinite-scroll-spinner" class="jf-infinite-spinner" style="display:none"><div class="jf-spinner"></div></div>
-                    <div id="infinite-scroll-sentinel" class="jf-infinite-sentinel"></div>
-                `;
-                // Append sentinel after the virtual grid container
-                const page = $('page-library');
-                if (page) page.querySelector('.jf-page').appendChild(infDiv);
-                setupInfiniteScroll(() => loadMoreFilteredLibraryItemsInfinite(libId, total));
-            }
-        } else {
-            if (container) container.innerHTML = `<div class="text-center py-20 text-white/40">${t('library.no_filter_results')}</div>`;
-        }
     } catch (e) {
+        if (gen !== libraryGen) return;
         toast(t('library.filter_failed', { message: e.message }), 'error');
     }
 }
 
-// --- Load More for Filtered Library (infinite scroll callback) ---
-async function loadMoreFilteredLibraryItemsInfinite(libId, initialTotal) {
+// Scrolls the list to the first item of a letter. Nothing is filtered.
+async function jumpToLetter(libId, letter) {
+    const click = ++letterClicks;
+    const gen = libraryGen;
+    if (libraryTotal === null || !$('lib-grid')) return;
+    const query = libraryQuery;
+    const n = libraryTotal;
+    const desc = query.SortOrder === 'Descending';
+    // The rail's first entry goes back to the top of the page, header and controls included; no request
+    if (letter === (desc ? 'Z' : '#')) {
+        railAnchor = null;
+        window.scrollTo({ top: 0, behavior: 'instant' });
+        scheduleRailUpdate();
+        return;
+    }
+    const stale = () => click !== letterClicks || gen !== libraryGen;
+    // Count of items whose name sorts at or after the bound; Limit 0 fetches no items
+    const countFrom = async (bound) => {
+        const data = await API.getItems({ ...query, NameStartsWithOrGreater: bound, Limit: 0 });
+        return data.TotalRecordCount || data.total_record_count || 0;
+    };
     try {
-        const sortVal = $('lib-sort')?.value || 'SortName:Ascending';
-        const [sortBy, sortOrder] = sortVal.split(':');
-        const genre = $('lib-genre')?.value || '';
-
-        const lib = libraries.find(l => (l.id || l.Id) === libId);
-        const contentType = lib?.content_type || lib?.Content_type || lib?.ContentType || '';
-        let includeItemTypes = undefined;
-        if (contentType === 'TvShows') includeItemTypes = 'Series';
-        else if (contentType === 'Music') includeItemTypes = 'MusicAlbum';
-        else if (contentType === 'Movies') includeItemTypes = 'Movie';
-
-        libraryPage++;
-        const startIndex = libraryPage * LIBRARY_PAGE_SIZE;
-
-        const params = { 
-            LibraryId: libId, SortBy: sortBy, SortOrder: sortOrder, 
-            Fields: 'PrimaryImageAspectRatio',
-            StartIndex: startIndex, Limit: LIBRARY_PAGE_SIZE
-        };
-        if (includeItemTypes) params.IncludeItemTypes = includeItemTypes;
-        if (genre) params.Genres = genre;
-        if (currentLetterFilter) params.NameStartsWith = currentLetterFilter;
-
-        const data = await API.getItems(params);
-        const items = data.Items || data.items || [];
-        const total = data.TotalRecordCount || data.total_record_count || initialTotal;
-
-        if (items.length > 0 && virtualGrid) {
-            virtualGrid.appendItems(items);
+        let k = 0;
+        if (letter !== '#') {
+            const b = letter.toLowerCase();
+            k = desc
+                ? await countFrom(String.fromCharCode(b.charCodeAt(0) + 1))
+                : n - await countFrom(b);
+        } else if (desc) {
+            k = await countFrom('a');
         }
-
-        // If no more items, destroy infinite scroll and remove sentinel
-        const remaining = total - (libraryPage + 1) * LIBRARY_PAGE_SIZE;
-        if (remaining <= 0) {
-            destroyInfiniteScroll();
-            const sentinelContainer = $('lib-infinite-container');
-            if (sentinelContainer) sentinelContainer.remove();
+        if (stale()) return;
+        const grid = $('lib-grid');
+        if (!grid) return;
+        if (k < n) {
+            grid.children[k].scrollIntoView({ block: 'start', behavior: 'instant' });
+            // The clicked section stays lit while its row is the top row (that row often starts with the previous letter)
+            railAnchor = { k, first: firstVisibleIndex(grid) };
+            setRailLetter(letter);
+            updateLetterRail();
+        } else {
+            railAnchor = null;
+            window.scrollTo({ top: document.scrollingElement.scrollHeight, behavior: 'instant' });
+            scheduleRailUpdate();
         }
     } catch (e) {
-        toast(t('common.error_message', { message: e.message }), 'error');
+        if (stale()) return;
+        toast(t('library.load_failed', { message: e.message }), 'error');
     }
 }
 
-async function jumpToLetter(libId, letter) {
-    currentLetterFilter = letter || '';
-    document.querySelectorAll('.jf-alpha-btn').forEach(b => {
-        const btnLetter = b.getAttribute('data-letter') ?? '';
-        b.classList.toggle('active', btnLetter === currentLetterFilter);
-    });
-    await filterLibrary(libId);
+// The letter rail (#lib-letter-rail in index.html) shows for the name sorts, its letters reversed for a descending order
+function renderLetterRail(libId) {
+    const { sortBy, sortOrder } = librarySort();
+    $('page-library').classList.toggle('jf-with-rail', sortBy.startsWith('SortName'));
+    const letters = ['#', ...'ABCDEFGHIJKLMNOPQRSTUVWXYZ'];
+    if (sortOrder === 'Descending') letters.reverse();
+    $('lib-letter-rail').innerHTML = letters.map(l =>
+        `<button type="button" data-action="jump-letter" data-letter="${l}" data-id="${escapeHtml(libId)}">${l}</button>`).join('');
+    railAnchor = null;
 }
+
+// An item's rail section: the server sorts by the lowercased name, so its first character decides
+function railLetter(item) {
+    const c = (item.SortName || item.Name || '').toLowerCase().charAt(0);
+    if (c < 'a') return '#';
+    if (c > 'z') return 'Z';
+    return c.toUpperCase();
+}
+
+// Index of the first card whose bottom edge is below the header; cards are in row order, so a binary search works
+function firstVisibleIndex(grid) {
+    const top = $('main-navbar').getBoundingClientRect().bottom;
+    const kids = grid.children;
+    let lo = 0, hi = kids.length;
+    while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (kids[mid].getBoundingClientRect().bottom > top) hi = mid;
+        else lo = mid + 1;
+    }
+    return lo;
+}
+
+function setRailLetter(letter) {
+    for (const b of $('lib-letter-rail').children) {
+        if (b.dataset.letter === letter) b.setAttribute('aria-current', 'true');
+        else b.removeAttribute('aria-current');
+    }
+}
+
+// Lights the section of the first item at the top of the view, or after a jump the clicked one (see jumpToLetter)
+function updateLetterRail() {
+    const page = $('page-library');
+    const grid = $('lib-grid');
+    if (!grid || page.classList.contains('hidden') || !page.classList.contains('jf-with-rail')) return;
+    let i = firstVisibleIndex(grid);
+    if (railAnchor && i === railAnchor.first) i = railAnchor.k;
+    else railAnchor = null;
+    const letter = grid.children[i]?.dataset.letter;
+    if (letter) setRailLetter(letter); // a placeholder keeps the highlight until its page is in
+}
+
+// At most one update per frame
+function scheduleRailUpdate() {
+    if (railFrame) return;
+    railFrame = requestAnimationFrame(() => {
+        railFrame = 0;
+        updateLetterRail();
+    });
+}
+window.addEventListener('scroll', scheduleRailUpdate, { passive: true });
+window.addEventListener('resize', scheduleRailUpdate);
 
 // --- Detail View Renderer (Movies, TV Series, Music) ---
 async function renderDetail(itemId) {
+    const session = API.token;
     currentDetailId = itemId;
     const page = $('page-detail');
     // Show skeleton for detail view
@@ -1276,6 +1353,7 @@ async function renderDetail(itemId) {
 
     try {
         const item = await API.getItem(itemId);
+        if (API.token !== session) return;
         activeItem = item;
         const name = item.Name || item.name || '';
         const overview = item.Overview || item.overview || '';
@@ -1290,10 +1368,11 @@ async function renderDetail(itemId) {
         const people = item.People || item.people || [];
         const id = item.Id || item.id;
 
-        const imgSrc = API.imageUrl(id, 'Primary', { maxWidth: 500 });
-        const backdropSrc = API.imageUrl(id, 'Backdrop', { maxWidth: 1920 });
+        const imgSrc = item.ImageTags?.Primary ? API.imageUrl(id, 'Primary', { maxWidth: 500, tag: item.ImageTags.Primary }) : '';
+        const backdropSrc = backdropUrl(item, 1920);
         const canPlay = ['Movie', 'Episode', 'Audio', 'MusicVideo', 'Video'].includes(type);
         const streamType = type === 'Audio' ? 'Audio' : 'Videos';
+        const resumeTicks = streamType === 'Videos' ? resumePositionTicks(item) : 0;
 
         // Parallel fetch: Children/Seasons/Episodes AND Similar media
         // Previously these were sequential, causing a waterfall effect
@@ -1302,6 +1381,7 @@ async function renderDetail(itemId) {
             isContainer ? API.getChildren(id).catch(() => ({ Items: [] })) : Promise.resolve({ Items: [] }),
             API.getSimilar(id).catch(() => ({ Items: [] }))
         ]);
+        if (API.token !== session) return;
 
         // Children / Seasons / Episodes
         let seasonsOrEpisodesHtml = '';
@@ -1336,12 +1416,12 @@ async function renderDetail(itemId) {
                             const epDesc = ep.Overview || ep.overview || '';
                             const epDur = formatRuntime(ep.RunTimeTicks || ep.run_time_ticks);
                             const epPlayed = ep.UserData?.Played || ep.user_data?.played || false;
-                            const epThumb = API.imageUrl(epId, 'Primary', { maxWidth: 400 });
+                            const epThumb = ep.ImageTags?.Primary ? API.imageUrl(epId, 'Primary', { maxWidth: 400, tag: ep.ImageTags.Primary }) : '';
 
                             return `
-                            <div class="jf-episode-card group" onclick="playItem('${epId}','Videos','${escapeHtml(epRawName)}' || t('detail.episode'))">
+                            <div class="jf-episode-card group" data-action="play" data-id="${escapeHtml(epId)}" data-stream-type="Videos" data-title="${escapeHtml(epRawName || t('detail.episode'))}">
                                 <div class="relative w-full sm:w-48 h-28 rounded-lg overflow-hidden bg-white/5 flex-shrink-0">
-                                    <img src="${epThumb}" alt="${escapeHtml(epName)}" class="w-full h-full object-cover">
+                                    ${epThumb ? `<img src="${epThumb}" alt="${escapeHtml(epName)}" class="w-full h-full object-cover">` : ''}
                                     <div class="absolute inset-0 bg-black/40 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
                                         <div class="w-10 h-10 rounded-full bg-[#00a4dc] text-white flex items-center justify-center shadow-lg">
                                             <svg class="w-5 h-5 ml-0.5" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
@@ -1384,9 +1464,9 @@ async function renderDetail(itemId) {
                         const pId = p.Id || p.id;
                         const pName = p.Name || p.name || '';
                         const pRole = p.Role || p.role || p.Type || p.type || t('detail.actor');
-                        const pImg = pId ? API.imageUrl(pId, 'Primary', { maxWidth: 200 }) : '';
+                        const pImg = pId ? API.imageUrl(pId, 'Primary', { maxWidth: 200, tag: p.PrimaryImageTag }) : '';
                         return `
-                        <div class="w-28 text-center flex-shrink-0 cursor-pointer group" onclick="${pId ? `navigate('person','${pId}')` : ''}">
+                        <div class="w-28 text-center flex-shrink-0 cursor-pointer group" ${pId ? `data-action="navigate" data-page="person" data-id="${escapeHtml(pId)}"` : ''}>
                             <div class="w-20 h-20 mx-auto rounded-full overflow-hidden bg-white/10 mb-2 border-2 border-transparent group-hover:border-[#00a4dc] transition-all">
                                 <img src="${pImg}" alt="${escapeHtml(pName)}" class="w-full h-full object-cover" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'">
                                 <div class="hidden w-full h-full items-center justify-center text-xs font-bold text-white/40 bg-white/5" style="display:none">
@@ -1405,19 +1485,19 @@ async function renderDetail(itemId) {
         <div class="jf-page">
             <!-- Full Hero Backdrop Banner -->
             <div class="jf-detail-hero -mx-4 lg:-mx-8 -mt-6">
-                <img src="${backdropSrc}" class="w-full h-[460px] object-cover opacity-35" onerror="this.style.display='none'">
+                ${backdropSrc ? `<img src="${backdropSrc}" class="w-full h-[460px] object-cover opacity-35" onerror="this.style.display='none'">` : ''}
                 <div class="absolute bottom-0 left-0 right-0 p-6 sm:p-10 lg:p-12 z-10 flex flex-col md:flex-row gap-8 items-end">
                     <!-- Poster Box -->
                     <div class="w-44 sm:w-56 rounded-2xl overflow-hidden shadow-2xl border border-white/10 flex-shrink-0 hidden md:block bg-black/60">
-                        <img src="${imgSrc}" alt="${escapeHtml(name)}" class="w-full h-auto object-cover" onerror="this.style.display='none'">
+                        ${imgSrc ? `<img src="${imgSrc}" alt="${escapeHtml(name)}" class="w-full h-auto object-cover" onerror="this.style.display='none'">` : ''}
                     </div>
 
                     <!-- Meta & Actions -->
                     <div class="flex-1 min-w-0">
                         <div class="flex flex-wrap items-center gap-2 mb-3">
-                            <span class="jf-badge jf-badge-primary uppercase tracking-wider text-[11px]">${type}</span>
+                            <span class="jf-badge jf-badge-primary uppercase tracking-wider text-[11px]">${escapeHtml(type)}</span>
                             ${year ? `<span class="jf-badge text-[11px] font-bold">${year}</span>` : ''}
-                            ${officialRating ? `<span class="jf-badge text-[11px] font-bold bg-white/15">${officialRating}</span>` : ''}
+                            ${officialRating ? `<span class="jf-badge text-[11px] font-bold bg-white/15">${escapeHtml(officialRating)}</span>` : ''}
                             ${runtime ? `<span class="jf-badge text-[11px]">${formatRuntime(runtime)}</span>` : ''}
                             ${rating ? `<span class="jf-badge jf-badge-rating text-[11px]">★ ${rating.toFixed(1)}</span>` : ''}
                         </div>
@@ -1432,22 +1512,26 @@ async function renderDetail(itemId) {
                         <!-- Action Bar -->
                         <div class="flex flex-wrap items-center gap-3">
                             ${canPlay ? `
-                            <button class="jf-btn-primary !py-3 !px-7 text-sm font-bold shadow-xl" onclick="playItem('${id}','${streamType}','${escapeHtml(name)}')">
+                            <button class="jf-btn-primary !py-3 !px-7 text-sm font-bold shadow-xl" data-action="play" data-id="${escapeHtml(id)}" data-stream-type="${escapeHtml(streamType)}" data-title="${escapeHtml(name)}"${resumeTicks > 0 ? ' data-resume="true"' : ''}>
                                 <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
-                                ${t('common.play')}
-                            </button>` : ''}
+                                ${resumeTicks > 0 ? t('detail.resume') : t('common.play')}
+                            </button>
+                            ${resumeTicks > 0 ? `
+                            <button class="jf-btn-ghost !py-3 !px-4 text-sm" data-action="play" data-id="${escapeHtml(id)}" data-stream-type="${escapeHtml(streamType)}" data-title="${escapeHtml(name)}" data-from-start="true">
+                                ${t('detail.play_from_beginning')}
+                            </button>` : ''}` : ''}
 
-                            <button class="jf-btn-ghost !py-3 !px-4 text-sm" title="${escapeHtml(t('detail.toggle_favorite'))}" onclick="toggleFavorite('${id}', ${fav})">
+                            <button class="jf-btn-ghost !py-3 !px-4 text-sm" title="${escapeHtml(t('detail.toggle_favorite'))}" data-action="toggle-favorite" data-id="${escapeHtml(id)}" data-favorite="${fav}">
                                 <span class="${fav ? 'text-rose-500 font-bold' : 'text-white/60'} text-base">♥</span>
                                 <span class="hidden sm:inline text-xs ml-1">${fav ? t('detail.favorite') : t('detail.add_favorite')}</span>
                             </button>
 
-                            <button class="jf-btn-ghost !py-3 !px-4 text-xs font-semibold" onclick="togglePlayed('${id}', ${played})">
+                            <button class="jf-btn-ghost !py-3 !px-4 text-xs font-semibold" data-action="toggle-played" data-id="${escapeHtml(id)}" data-played="${played}">
                                 ${played ? `<span class="text-emerald-400">${t('detail.played')}</span>` : `<span class="text-white/60">${t('detail.unplayed')}</span>`}
                             </button>
 
                             ${API.isAdmin ? `
-                            <button class="jf-btn-ghost !py-3 !px-3 text-xs" title="${escapeHtml(t('detail.refresh_metadata'))}" onclick="API.refreshItem('${id}').then(()=>toast(t('detail.metadata_refreshing')))">
+                            <button class="jf-btn-ghost !py-3 !px-3 text-xs" title="${escapeHtml(t('detail.refresh_metadata'))}" data-action="refresh-item" data-id="${escapeHtml(id)}">
                                 🔄
                             </button>` : ''}
                         </div>
@@ -1472,6 +1556,7 @@ async function renderDetail(itemId) {
             ${similarHtml}
         </div>`;
     } catch (e) {
+        if (API.token !== session) return;
         page.innerHTML = `<div class="p-6 rounded-xl bg-red-500/10 text-red-400">${escapeHtml(e.message)}</div>`;
     }
 }
@@ -1530,20 +1615,29 @@ async function renderSearch(term) {
     term = decodeURIComponent(term || '').trim();
     if ($('search-input')) $('search-input').value = term;
     const page = $('page-search');
+    const showNoResults = () => {
+        page.innerHTML = `<div class="text-center py-24 text-white/40 jf-page"><p class="text-lg">${t('search.no_results', { term: escapeHtml(term) })}</p></div>`;
+    };
+    // A blank term never reaches the server: /Search/Hints answers 400 to it.
+    if (!term) {
+        showNoResults();
+        return;
+    }
     page.innerHTML = '<div class="flex justify-center items-center py-24"><div class="w-10 h-10 border-3 border-[#00a4dc] border-t-transparent rounded-full animate-spin"></div></div>';
 
     try {
         const data = await API.search(term, 50);
         const hints = data.SearchHints || data.search_hints || [];
         if (!hints.length) {
-            page.innerHTML = `<div class="text-center py-24 text-white/40 jf-page"><p class="text-lg">${t('search.no_results', { term: escapeHtml(term) })}</p></div>`;
+            showNoResults();
             return;
         }
         const items = hints.map(h => ({
             Id: h.Id || h.id || h.ItemId,
             Name: h.Name || h.name,
             Type: h.Type || h.type,
-            ProductionYear: h.ProductionYear || h.production_year
+            ProductionYear: h.ProductionYear || h.production_year,
+            ...(h.PrimaryImageTag ? { ImageTags: { Primary: h.PrimaryImageTag } } : {})
         }));
 
         page.innerHTML = `
@@ -1582,32 +1676,100 @@ function doSearch(term) {
 
 // HLS.js instance for adaptive streaming
 let hlsInstance = null;
+// The playback session in progress, or null when nothing is playing
+let activePlayback = null;
+// Promise of the last Stopped report; playItem waits for it before reading the resume point
+let pendingStop = Promise.resolve();
+// Incremented by each playItem call, so a call that finishes loading after a newer one gives up
+let playRequest = 0;
+// True while the seek bar is being dragged, so the timeline does not move the thumb
+let seekDragging = false;
 
-// --- Video Player (Cinema Mode) ---
-async function playItem(itemId, streamType = 'Videos', title = '') {
-    const video = $('video-player');
-    const modal = $('player-modal');
-    if (!video || !modal) return;
+// Ticks to resume from. Items at or past 90 % of their runtime count as watched and start over.
+function resumePositionTicks(item) {
+    const pos = item?.UserData?.PlaybackPositionTicks || 0;
+    if (!(pos > 0)) return 0;
+    const runtime = item.RunTimeTicks || 0;
+    if (runtime > 0 && pos >= runtime * 0.9) return 0;
+    return pos;
+}
 
-    // Destroy any existing HLS instance
-    if (hlsInstance) {
-        hlsInstance.destroy();
-        hlsInstance = null;
+// The resume point as m:ss under an hour and h:mm:ss from an hour on
+function formatResumeTime(ticks) {
+    const total = Math.floor(ticks / 1e7);
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    const s = String(total % 60).padStart(2, '0');
+    return h > 0 ? `${h}:${String(m).padStart(2, '0')}:${s}` : `${m}:${s}`;
+}
+
+// Asks whether to resume at ticks or start over. Resolves 'resume' or 'start', or '' when the menu is cancelled
+// (Escape, a click outside) or already open. Escape keeps the old returnValue, so it is cleared before opening.
+function askResumeOrStart(title, ticks) {
+    const menu = $('resume-menu');
+    if (!menu || menu.open) return Promise.resolve('');
+    $('resume-menu-title').textContent = title;
+    $('resume-menu-resume').textContent = t('player.resume_from', { time: formatResumeTime(ticks) });
+    menu.returnValue = '';
+    return new Promise(resolve => {
+        menu.addEventListener('close', () => resolve(menu.returnValue), { once: true });
+        menu.showModal();
+        // The buttons fade in with the dialog (input.css transitions all their properties, visibility too), so
+        // autofocus finds Resume still hidden and focuses the backdrop; focus Resume once the fade is done
+        setTimeout(() => { if (menu.open) $('resume-menu-resume').focus(); }, 250);
+    });
+}
+
+// Starts an item from a card or a Play button. A video with a resume point asks first whether to resume.
+async function playWithResumeChoice(itemId, streamType = 'Videos', title = '') {
+    if (streamType !== 'Videos') return playItem(itemId, streamType, title);
+    // Read the point after the last Stopped report and uncached, so it includes the position just saved
+    await pendingStop;
+    let item = null;
+    try {
+        item = await API.get('/Items/' + itemId);
+    } catch (e) {
+        console.warn('Could not load item for resume point:', e);
     }
+    const ticks = resumePositionTicks(item);
+    if (ticks <= 0) return playItem(itemId, streamType, title);
+    const choice = await askResumeOrStart(title || item?.Name || '', ticks);
+    if (choice === 'resume') playItem(itemId, streamType, title);
+    else if (choice === 'start') playItem(itemId, streamType, title, { fromStart: true });
+}
 
-    $('player-title').textContent = title || t('player.playback');
-    $('player-subtitle').textContent = t('player.loading');
+// Stops the session that is still playing, if any. Returns the promise of its Stopped report.
+function stopPlayback() {
+    if (activePlayback) activePlayback.stop();
+    return pendingStop;
+}
 
-    // Show modal immediately while loading
-    if (typeof modal.showModal === 'function') modal.showModal();
-    else modal.setAttribute('open', '');
+// Loads the stream of a session from startTicks (item ticks) and attaches it to the video element
+async function openStream(session, startTicks) {
+    const video = $('video-player');
+    const { itemId, streamType } = session;
+    const load = ++session.loads;
+    // This load stays current until the session stops or a newer load starts
+    const current = () => activePlayback === session && session.loads === load;
+    const startSeconds = startTicks / 1e7;
+    // Capture the subtitle before the request so a change made during it sees this load's burn-in
+    const requestedSubtitle = session.subtitleIndex;
+    session.burnedIn = streamType === 'Videos' && isImageSubtitle(findStream(session, 'subtitle', requestedSubtitle)?.Codec);
 
     let url;
     let isHls = false;
+    let playSessionId = null;
+    let mediaSourceId = null;
     if (streamType === 'Videos') {
         // Use Universal endpoint to get the optimal playback URL
         try {
-            const data = await API.getUniversalVideoUrl(itemId);
+            const data = await API.getUniversalVideoUrl(itemId, {
+                startTimeTicks: startTicks,
+                mediaSourceId: session.mediaSourceId,
+                audioStreamIndex: session.audioIndex,
+                subtitleStreamIndex: session.subtitleIndex,
+            });
+            if (!current()) return;
             if (data && data.url) {
                 // Add auth token to the stream URL so the video element can authenticate
                 const sep = data.url.includes('?') ? '&' : '?';
@@ -1625,12 +1787,15 @@ async function playItem(itemId, streamType = 'Videos', title = '') {
                     method = t('player.stream');
                 }
                 $('player-subtitle').textContent = method;
+                playSessionId = isHls ? data.PlaySessionId : null;
+                mediaSourceId = data.MediaSources?.[0]?.Id || null;
             } else {
                 // Fallback: direct stream
                 url = API.streamUrl(itemId, streamType);
                 $('player-subtitle').textContent = t('player.video_stream_fallback');
             }
         } catch (e) {
+            if (!current()) return;
             console.warn('Universal endpoint failed, using direct stream:', e);
             url = API.streamUrl(itemId, streamType);
             $('player-subtitle').textContent = t('player.video_stream_fallback');
@@ -1643,7 +1808,15 @@ async function playItem(itemId, streamType = 'Videos', title = '') {
         $('player-subtitle').textContent = t('player.stream');
     }
 
+    session.offset = isHls ? startSeconds : 0;
+    session.startAt = startSeconds;
+    session.isHls = isHls;
+    session.playSessionId = playSessionId;
+    session.mediaSourceId = mediaSourceId || session.mediaSourceId;
+    session.burnedIn = isHls && isImageSubtitle(findStream(session, 'subtitle', requestedSubtitle)?.Codec);
+
     video.onerror = () => {
+        if (!current()) return;
         console.error('Video playback error:', video.error);
         const errMsg = video.error ? video.error.message : t('common.unknown_error');
         $('player-subtitle').textContent = t('common.error_message', { message: errMsg });
@@ -1651,16 +1824,23 @@ async function playItem(itemId, streamType = 'Videos', title = '') {
 
     // Handle HLS streams with hls.js
     if (isHls && typeof Hls !== 'undefined' && Hls.isSupported()) {
+        // The transcode already starts at startTicks, so its playlist starts at 0
         hlsInstance = new Hls({
             enableWorker: true,
             lowLatencyMode: false,
+            startPosition: 0,
         });
         hlsInstance.loadSource(url);
         hlsInstance.attachMedia(video);
         hlsInstance.on(Hls.Events.MANIFEST_PARSED, () => {
+            if (!current()) return;
             video.play().catch(e => console.warn('Autoplay block:', e));
         });
+        // A transcode that starts after the last keyframe of copied video lists no time: nothing is left
+        // to play, so end the playback as the stream's end does
+        hlsInstance.on(Hls.Events.LEVEL_LOADED, (event, data) => { if (current() && session.offset > 0 && data.details.totalduration === 0) session.stop(); });
         hlsInstance.on(Hls.Events.ERROR, (event, data) => {
+            if (!current()) return;
             console.error('HLS error:', data);
             if (data.fatal) {
                 $('player-subtitle').textContent = t('player.hls_error');
@@ -1674,38 +1854,410 @@ async function playItem(itemId, streamType = 'Videos', title = '') {
             }
         });
     } else if (isHls && video.canPlayType('application/vnd.apple.mpegurl')) {
-        // Safari native HLS support
+        // Safari native HLS support; its playlist also starts at startTicks, so it needs no seek
         video.src = url;
         video.addEventListener('loadedmetadata', () => {
+            if (!current()) return;
             video.play().catch(e => console.warn('Autoplay block:', e));
         }, { once: true });
     } else {
         // Direct play/stream
         video.src = url;
-        video.currentTime = 0;
+        if (startSeconds > 0) {
+            video.addEventListener('loadedmetadata', () => {
+                if (current()) video.currentTime = startSeconds;
+            }, { once: true });
+        }
         video.play().catch(e => console.warn('Autoplay block:', e));
     }
+    if (streamType === 'Videos') showTextSubtitle(session);
+    updatePlayerControls(session);
+}
 
-    API.reportPlaying(itemId).catch(() => {});
+// Shows the item time and the bar; the bar stays still while the thumb is being dragged
+function updatePlayerControls(session) {
+    const pos = session.position();
+    const total = session.total();
+    $('player-duration').textContent = formatDurationSeconds(total);
+    // previewSeek owns the elapsed time and the bar during a drag
+    if (seekDragging) return;
+    $('player-cur-time').textContent = formatDurationSeconds(pos);
+    $('player-seek').value = total > 0 ? Math.min(100, pos / total * 100) : 0;
+}
+
+// Moves within the transcoded range in place; any other HLS point restarts the transcode after a pause
+function seekTo(session, seconds) {
+    const video = $('video-player');
+    const total = session.total();
+    if (total > 0) seconds = Math.min(seconds, total);
+    seconds = Math.max(0, seconds);
+    // A waiting track change restarts at the new point instead
+    if (session.tracksChanged) return scheduleRestart(session, seconds);
+    if (!session.isHls) {
+        video.currentTime = seconds;
+        return;
+    }
+    const rel = seconds - session.offset;
+    const seekable = video.seekable;
+    const end = seekable.length ? seekable.end(seekable.length - 1) : 0;
+    if (rel >= 0 && rel <= end) {
+        clearTimeout(session.seekTimer);
+        session.seekTimer = null;
+        session.pendingSeek = null;
+        video.currentTime = rel;
+        return;
+    }
+    scheduleRestart(session, seconds);
+}
+
+// Waits 400 ms after the last seek, then restarts the transcode at that point
+function scheduleRestart(session, seconds) {
+    session.pendingSeek = seconds;
+    updatePlayerControls(session);
+    clearTimeout(session.seekTimer);
+    session.seekTimer = setTimeout(() => { session.seekTimer = null; restartStream(session, seconds); }, 400);
+}
+
+// Starts the transcode again at seconds of item time, stopping the old transcode first
+async function restartStream(session, seconds) {
+    const total = session.total();
+    // The last second holds nothing to transcode, so end the playback as the stream's end does
+    // (pendingSeek makes the Stopped report say the end)
+    if (total > 0 && seconds > total - 1) {
+        session.pendingSeek = total;
+        session.stop();
+        return;
+    }
+    session.tracksChanged = false;
+    session.pendingSeek = seconds;
+    if (hlsInstance) {
+        hlsInstance.destroy();
+        hlsInstance = null;
+    }
+    if (session.isHls && session.playSessionId) API.stopActiveEncodings(session.playSessionId).catch(() => {});
+    await openStream(session, Math.round(seconds * 1e7));
+    // A newer seek keeps its own target
+    if (activePlayback === session && session.pendingSeek === seconds && !session.seekTimer) session.pendingSeek = null;
+}
+
+// Seeks to a point on the bar once the drag ends
+function seekVideo(percent) {
+    seekDragging = false;
+    if (!activePlayback) return;
+    seekTo(activePlayback, percent / 100 * activePlayback.total());
+}
+
+// Skips relative to the current item time
+function skipTime(deltaSeconds) {
+    if (!activePlayback) return;
+    seekTo(activePlayback, activePlayback.position() + deltaSeconds);
+}
+
+// Shows the elapsed time under the thumb while the bar is being dragged
+function previewSeek(percent) {
+    if (!activePlayback) return;
+    seekDragging = true;
+    $('player-cur-time').textContent = formatDurationSeconds(percent / 100 * activePlayback.total());
+}
+
+// Picks another audio track and restarts the transcode at the current point
+function changeAudioTrack(value) {
+    const session = activePlayback;
+    if (!session) return;
+    session.audioIndex = Number(value);
+    session.tracksChanged = true;
+    scheduleRestart(session, session.position());
+}
+
+// A text subtitle is added to the player; a picture one is burned in, so it restarts the transcode
+function changeSubtitleTrack(value) {
+    const session = activePlayback;
+    if (!session) return;
+    session.subtitleIndex = Number(value);
+    if (session.burnedIn || isImageSubtitle(findStream(session, 'subtitle', session.subtitleIndex)?.Codec)) {
+        clearTextSubtitle();
+        session.tracksChanged = true;
+        scheduleRestart(session, session.position());
+    } else {
+        showTextSubtitle(session);
+    }
+}
+
+// CodecType comes lower case from the server: 'audio', 'subtitle' or 'video'
+function isStreamType(s, type) {
+    return (s.CodecType || '').toLowerCase() === type;
+}
+
+// The stream of this type with this index, if the session has one
+function findStream(session, type, index) {
+    return session.streams.find(s => s.Index === index && isStreamType(s, type));
+}
+
+// Picture subtitles are burned in by the transcode (the server's codec names)
+function isImageSubtitle(codec) {
+    const c = (codec || '').toLowerCase();
+    return c.includes('pgs') || ['dvd_subtitle', 'dvdsub', 'vobsub', 'dvb_subtitle', 'dvbsub', 'xsub', 'sup'].includes(c);
+}
+
+// Removes the text subtitle track that showTextSubtitle added
+function clearTextSubtitle() {
+    $('video-player').querySelectorAll('track[data-player-subtitle]').forEach(track => track.remove());
+}
+
+// Adds the chosen text subtitle as WebVTT; without a label, hls.js leaves the track alone
+function showTextSubtitle(session) {
+    clearTextSubtitle();
+    const stream = findStream(session, 'subtitle', session.subtitleIndex);
+    if (!session.mediaSourceId || !stream || isImageSubtitle(stream.Codec)) return;
+    const track = document.createElement('track');
+    track.kind = 'subtitles';
+    track.dataset.playerSubtitle = '1';
+    // The route takes the start in ticks: the transcode's offset, or 0 for direct play
+    track.src = API.base + '/Videos/' + session.itemId + '/' + encodeURIComponent(session.mediaSourceId) +
+        '/Subtitles/' + stream.Index + '/' + Math.round(session.offset * 1e7) + '/Stream.vtt?api_key=' +
+        encodeURIComponent(API.token);
+    track.addEventListener('error', () => {
+        if (activePlayback === session) $('player-subtitle').textContent = t('player.subtitles_error');
+    });
+    $('video-player').appendChild(track);
+    track.track.mode = 'showing';
+}
+
+// Language name in the page's language; und, mis, mul and zxx name no language
+function trackLanguageName(code) {
+    if (!code || ['und', 'mis', 'mul', 'zxx'].includes(code.toLowerCase())) return '';
+    let name = code;
+    try {
+        name = new Intl.DisplayNames([document.documentElement.lang || 'en'], { type: 'language' }).of(code) || code;
+    } catch (e) {
+        // Not a code Intl knows: the code stays as it is
+    }
+    return name.charAt(0).toUpperCase() + name.slice(1);
+}
+
+// The title, then each tag the title does not already contain (Jellyfin's DisplayTitle)
+function trackTitle(title, tags) {
+    const parts = tags.filter(Boolean);
+    if (!title) return parts.join(' - ');
+    const extra = parts.filter(tag => !title.toLowerCase().includes(tag.toLowerCase()));
+    return [title, ...extra].join(' - ');
+}
+
+// Audio menu label: language, profile or codec, channel layout or count, then the flags
+function audioTrackLabel(s) {
+    const codec = (s.Codec || '').toLowerCase();
+    const codecNames = { ac3: 'Dolby Digital', eac3: 'Dolby Digital+', dca: 'DTS' };
+    const profile = s.Profile || '';
+    const layout = s.ChannelLayout ? s.ChannelLayout.charAt(0).toUpperCase() + s.ChannelLayout.slice(1) : '';
+    const tags = [
+        trackLanguageName(s.Language),
+        (profile && profile.toLowerCase() !== 'lc') ? profile : (codecNames[codec] || codec.toUpperCase()),
+        layout || (s.Channels ? t('player.track_channels', { count: s.Channels }) : ''),
+        s.IsDefault ? t('player.track_default') : '',
+        s.IsExternal ? t('player.track_external') : '',
+    ];
+    return trackTitle(s.Title, tags) || t('player.track_undefined');
+}
+
+// Subtitle menu label: language, default and forced flags, codec name, then external
+function subtitleTrackLabel(s) {
+    const codec = (s.Codec || '').toLowerCase();
+    const codecNames = { dvb_subtitle: 'DVBSUB', dvb_teletext: 'DVBTXT', dvd_subtitle: 'DVDSUB', hdmv_pgs_subtitle: 'PGSSUB' };
+    const tags = [
+        trackLanguageName(s.Language) || t('player.track_undefined'),
+        s.IsDefault ? t('player.track_default') : '',
+        s.IsForced ? t('player.track_forced') : '',
+        codecNames[codec] || codec.toUpperCase(),
+        s.IsExternal ? t('player.track_external') : '',
+    ];
+    return trackTitle(s.Title, tags) || t('player.track_undefined');
+}
+
+// Jellyfin's Default mode: external first, then forced in the audio's language, forced, default
+function defaultSubtitleIndex(subs, chosenAudio) {
+    const audioLang = (chosenAudio?.Language || '').toLowerCase();
+    let best = null;
+    let bestKey = 0;
+    for (const s of subs) {
+        const sameLanguage = (s.Language || '').toLowerCase() === audioLang;
+        const key = (s.IsExternal ? 8 : 0) + (s.IsForced && sameLanguage ? 4 : 0) + (s.IsForced ? 2 : 0) + (s.IsDefault ? 1 : 0);
+        if (key > bestKey) {
+            best = s;
+            bestKey = key;
+        }
+    }
+    return best ? best.Index : -1;
+}
+
+// Fills the audio and subtitle menus from the session; null hides both
+function renderTrackMenus(session) {
+    const audio = session ? session.streams.filter(s => isStreamType(s, 'audio')) : [];
+    const subs = session ? session.streams.filter(s => isStreamType(s, 'subtitle')) : [];
+    $('player-audio').replaceChildren(...audio.map(s => new Option(audioTrackLabel(s), s.Index)));
+    $('player-subs').replaceChildren(new Option(t('player.subtitles_off'), -1), ...subs.map(s => new Option(subtitleTrackLabel(s), s.Index)));
+    $('player-audio').value = String(session?.audioIndex ?? '');
+    $('player-subs').value = String(session?.subtitleIndex ?? '');
+    $('player-audio-wrap').hidden = audio.length < 2;
+    $('player-subs-wrap').hidden = subs.length < 1;
+}
+
+// --- Video Player (Cinema Mode) ---
+async function playItem(itemId, streamType = 'Videos', title = '', { fromStart = false } = {}) {
+    const video = $('video-player');
+    const modal = $('player-modal');
+    if (!video || !modal) return;
+    const request = ++playRequest;
+
+    // Report a session that is still playing as stopped before starting another
+    stopPlayback();
+
+    // Destroy any existing HLS instance
+    if (hlsInstance) {
+        hlsInstance.destroy();
+        hlsInstance = null;
+    }
+
+    $('player-title').textContent = title || t('player.playback');
+    $('player-subtitle').textContent = t('player.loading');
+    // Clear the times and the bar so the previous item's values never show
+    $('player-cur-time').textContent = '0:00';
+    $('player-duration').textContent = '0:00';
+    $('player-seek').value = 0;
+    seekDragging = false;
+    clearTextSubtitle();
+    renderTrackMenus(null);
+
+    // Show modal immediately while loading
+    if (!modal.open) {
+        if (typeof modal.showModal === 'function') modal.showModal();
+        else modal.setAttribute('open', '');
+    }
+
+    // Read the resume point only after the Stopped report, so it includes the position just saved
+    await pendingStop;
+    // The item gives the resume point and PlaybackInfo the tracks; a failed PlaybackInfo leaves no menus
+    const [item, info] = await Promise.all([
+        API.get('/Items/' + itemId).catch(e => {
+            console.warn('Could not load item for resume point:', e);
+            return null;
+        }),
+        streamType === 'Videos'
+            ? API.getPlaybackInfo(itemId).catch(e => {
+                console.warn('Could not load playback info:', e);
+                return null;
+            })
+            : null,
+    ]);
+    if (!modal.open || request !== playRequest) return; // closed or replaced while loading
+    if (!title && item?.Name) $('player-title').textContent = item.Name;
+
+    const startTicks = (streamType !== 'Videos' || fromStart) ? 0 : resumePositionTicks(item);
+    const runtimeTicks = item?.RunTimeTicks || 0;
+
+    // Track choices as Jellyfin's defaults pick them; with no PlaybackInfo there are none
+    const source = info?.MediaSources?.[0];
+    const streams = source?.MediaStreams || [];
+    const audioStreams = streams.filter(s => isStreamType(s, 'audio'));
+    const subStreams = streams.filter(s => isStreamType(s, 'subtitle'));
+    const defaultAudio = source?.DefaultAudioStreamIndex;
+    const chosenAudio = audioStreams.find(s => s.Index === defaultAudio) || audioStreams.find(s => s.IsDefault) || audioStreams[0] || null;
+    let audioIndex = null;
+    let subtitleIndex = null;
+    if (source) {
+        audioIndex = chosenAudio ? chosenAudio.Index : null;
+        const defaultSub = source.DefaultSubtitleStreamIndex;
+        subtitleIndex = (defaultSub === -1 || subStreams.some(s => s.Index === defaultSub))
+            ? defaultSub
+            : defaultSubtitleIndex(subStreams, chosenAudio);
+    }
+
+    // The session owns this playback: stop() reports the position once and tears the player down
+    let stopped = false;
+    const session = {
+        itemId,
+        streamType,
+        runtime: runtimeTicks > 0 ? runtimeTicks / 1e7 : null,
+        offset: 0,
+        startAt: startTicks / 1e7,
+        isHls: false,
+        playSessionId: null,
+        mediaSourceId: source?.Id || null,
+        streams,
+        audioIndex,
+        subtitleIndex,
+        burnedIn: false,
+        tracksChanged: false,
+        loads: 0,
+        pendingSeek: null,
+        seekTimer: null,
+        // Item time in seconds: the pending seek target, else where the stream is
+        position() {
+            if (this.pendingSeek !== null) return this.pendingSeek;
+            const video = $('video-player');
+            // Before metadata has loaded currentTime reads 0 even when resuming, so use the start position
+            if (video.readyState < HTMLMediaElement.HAVE_METADATA) return this.startAt;
+            return this.offset + video.currentTime;
+        },
+        // The item's runtime when known, else the stream's length
+        total() {
+            if (this.runtime) return this.runtime;
+            const duration = $('video-player').duration;
+            return Number.isFinite(duration) && duration > 0 ? this.offset + duration : 0;
+        },
+        // The track ids the playback reports carry; a null one is left out
+        reportFields() {
+            const fields = {};
+            if (this.mediaSourceId !== null) fields.MediaSourceId = this.mediaSourceId;
+            if (this.audioIndex !== null) fields.AudioStreamIndex = this.audioIndex;
+            if (this.subtitleIndex !== null) fields.SubtitleStreamIndex = this.subtitleIndex;
+            return fields;
+        },
+        stop() {
+            if (stopped) return pendingStop;
+            stopped = true;
+            clearTimeout(session.seekTimer);
+            const ticks = Math.round(session.position() * 1e7);
+            if (playerReportInterval) {
+                clearInterval(playerReportInterval);
+                playerReportInterval = null;
+            }
+            if (activePlayback === session) activePlayback = null;
+            const reported = API.reportStopped(itemId, ticks, session.reportFields()).catch(e => console.warn('Reporting playback stop failed:', e));
+            pendingStop = reported;
+            // Once the Stopped report is in, refresh the open view so it shows the new resume point
+            reported.then(() => {
+                API.invalidateCache('/Items');
+                API.invalidateCache('/Shows');
+                if (currentPage === 'home') return renderHome();
+                if (currentPage === 'detail') return renderDetail(currentDetailId);
+            }).catch(e => console.warn('Refreshing views after playback failed:', e));
+            video.pause();
+            if (hlsInstance) {
+                hlsInstance.destroy();
+                hlsInstance = null;
+            }
+            if (session.isHls && session.playSessionId) API.stopActiveEncodings(session.playSessionId).catch(e => console.warn('Stopping the transcode failed:', e));
+            video.removeAttribute('src');
+            video.load();
+            clearTextSubtitle();
+            return reported;
+        },
+    };
+    activePlayback = session;
+    renderTrackMenus(session);
 
     // Periodic progress reporting
     if (playerReportInterval) clearInterval(playerReportInterval);
     playerReportInterval = setInterval(() => {
         if (!video.paused && !video.ended) {
-            const ticks = Math.round(video.currentTime * 10000000);
-            API.reportProgress(itemId, ticks, false).catch(() => {});
+            const ticks = Math.round(session.position() * 1e7);
+            API.reportProgress(itemId, ticks, false, session.reportFields()).catch(() => {});
         }
     }, 8000);
 
     // Video events for custom UI
     video.ontimeupdate = () => {
-        const cur = video.currentTime;
-        const dur = video.duration || 0;
-        $('player-cur-time').textContent = formatDurationSeconds(cur);
-        $('player-duration').textContent = formatDurationSeconds(dur);
-        if (dur > 0) {
-            $('player-seek').value = (cur / dur) * 100;
-        }
+        if (activePlayback === session) updatePlayerControls(session);
     };
 
     video.onplay = () => updatePlayIcon(true);
@@ -1716,26 +2268,12 @@ async function playItem(itemId, streamType = 'Videos', title = '') {
         if (slider) slider.value = video.volume;
     };
 
-    const cleanup = () => {
-        if (playerReportInterval) {
-            clearInterval(playerReportInterval);
-            playerReportInterval = null;
-        }
-        const ticks = Math.round((video.currentTime || 0) * 10000000);
-        API.reportStopped(itemId, ticks).catch(() => {});
+    video.onended = () => {
+        if (activePlayback === session) session.stop();
     };
 
-    video.onended = cleanup;
-    modal.addEventListener('close', () => {
-        video.pause();
-        // Destroy HLS instance if playing HLS
-        if (hlsInstance) {
-            hlsInstance.destroy();
-            hlsInstance = null;
-        }
-        video.src = '';
-        cleanup();
-    }, { once: true });
+    await openStream(session, startTicks);
+    if (activePlayback === session) API.reportPlaying(itemId, startTicks, session.reportFields()).catch(() => {});
 }
 
 function closePlayer() {
@@ -1760,18 +2298,6 @@ function updatePlayIcon(isPlaying) {
             ? '<path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/>'
             : '<path d="M8 5v14l11-7z"/>';
     }
-}
-
-function seekVideo(percent) {
-    const v = $('video-player');
-    if (!v || !v.duration) return;
-    v.currentTime = (percent / 100) * v.duration;
-}
-
-function skipTime(deltaSeconds) {
-    const v = $('video-player');
-    if (!v) return;
-    v.currentTime = Math.max(0, Math.min(v.duration || 0, v.currentTime + deltaSeconds));
 }
 
 function setVolume(val) {
@@ -1872,8 +2398,144 @@ async function togglePlayed(id, current) {
     }
 }
 
+// --- OpenID Connect: helpers for the sign-in page and the profile ---
+// The redirect codes of the OIDC flows, each mapped to its translation key. A code not listed here gets the
+// generic message; the code itself never reaches t().
+const OIDC_ERROR_KEYS = new Map([
+    ['cancelled', 'oidc.error.cancelled'],
+    ['state_mismatch', 'oidc.error.state_mismatch'],
+    ['expired', 'oidc.error.expired'],
+    ['disabled', 'oidc.error.disabled'],
+    ['provider_error', 'oidc.error.provider_error'],
+    ['invalid_token', 'oidc.error.invalid_token'],
+    ['no_username', 'oidc.error.no_username'],
+    ['not_allowed', 'oidc.error.not_allowed'],
+    ['name_taken', 'oidc.error.name_taken'],
+    ['name_taken_ask_admin', 'oidc.error.name_taken_ask_admin'],
+    ['already_linked', 'oidc.error.already_linked'],
+    ['account_disabled', 'oidc.error.account_disabled'],
+    ['server_error', 'oidc.error.server_error'],
+]);
+
+// The code of an 'oidc-error/<code>' route, or null for any other route.
+function oidcErrorCode(data) {
+    const match = /^oidc-error\/(.*)$/.exec(data || '');
+    return match ? match[1] : null;
+}
+
+function oidcErrorText(code) {
+    return t(OIDC_ERROR_KEYS.get(code) || 'oidc.error.unknown');
+}
+
+// Sends the browser to the provider. Only http(s) links are followed; anything else is an error.
+function goToOidcProvider(url) {
+    if (!/^https?:\/\//i.test(url || '')) throw new Error(t('oidc.error.provider_error'));
+    window.location.href = url;
+}
+
+function showLoginError(message) {
+    $('login-error').textContent = message;
+    show('login-error');
+}
+
+// Adds the provider button below the sign-in form when OIDC is on. A failed Info call counts as off.
+async function loadOidcSignIn() {
+    const info = await API.oidcInfo().catch(() => null);
+    const box = $('oidc-sign-in');
+    if (!info?.Enabled || !box) return;
+    const label = (info.ButtonLabel || '').trim() || t('oidc.sign_in_default');
+    box.innerHTML = `<button type="button" class="jf-btn-ghost w-full !py-3 !font-semibold text-sm mt-4" data-action="oidc-sign-in">${escapeHtml(label)}</button>`;
+}
+
+async function startOidcSignIn() {
+    try {
+        const { AuthorizationUrl } = await API.oidcStart();
+        goToOidcProvider(AuthorizationUrl);
+    } catch (err) {
+        showLoginError(err.message);
+    }
+}
+
+// The flow is single-use, so the browser's return to #login/oidc is completed once per page load.
+let oidcCompleteStarted = false;
+
+async function completeOidcSignIn() {
+    if (oidcCompleteStarted) return;
+    oidcCompleteStarted = true;
+    const completed = await API.oidcComplete().then(() => true, () => false);
+    if (!completed) {
+        showLoginError(t('oidc.complete_failed'));
+        history.replaceState(null, '', '#login');
+        return;
+    }
+    await finishSignIn();
+}
+
+// Starts linking the signed-in account. The provider's callback returns to #settings.
+async function startOidcLink() {
+    try {
+        const { AuthorizationUrl } = await API.oidcLink();
+        goToOidcProvider(AuthorizationUrl);
+    } catch (err) {
+        toast(err.message, 'error');
+    }
+}
+
+async function unlinkOidc(userId) {
+    if (!confirm(t('oidc.unlink_confirm'))) return;
+    try {
+        await API.oidcUnlink(userId);
+        toast(t('oidc.unlinked'));
+        renderSettings();
+    } catch (err) {
+        toast(err.message, 'error');
+    }
+}
+
+// The profile gets the result of a link as #settings/oidc-linked or #settings/oidc-error/<code>. It is toasted
+// once, then the hash is cleared so that a reload does not repeat it.
+function showOidcLinkResult(data) {
+    const code = oidcErrorCode(data);
+    if (code !== null) toast(oidcErrorText(code), 'error');
+    else if (data === 'oidc-linked') toast(t('oidc.linked'));
+    else return;
+    history.replaceState(null, '', '#settings');
+}
+
+// The profile's "Single sign-on" card. Not linked: a link button, when OIDC is on. Linked: the provider login
+// and Unlink, which is disabled with the reason when the server says CanUnlink is false.
+function oidcCardHtml(enabled, account) {
+    let body;
+    if (account?.Linked) {
+        const linkedAt = account.LinkedAt ? new Date(account.LinkedAt).toLocaleString() : '—';
+        const canUnlink = Boolean(account.CanUnlink);
+        const reason = account.HasPassword ? t('oidc.unlink_password_off') : t('oidc.unlink_needs_password');
+        const linkedAs = t('oidc.linked_as', { name: account.ProviderUsername || '', date: linkedAt });
+        body = `
+            <p class="text-sm text-white/80">${escapeHtml(linkedAs)}</p>
+            <div class="flex flex-wrap items-center gap-3 mt-4">
+                <button type="button" class="jf-btn-ghost !py-2 !px-4 text-xs${canUnlink ? '' : ' !cursor-not-allowed !opacity-50 disabled:pointer-events-none'}" data-action="oidc-unlink" data-id="${escapeHtml(account.UserId)}"${canUnlink ? '' : ' disabled'}>${t('oidc.unlink')}</button>
+                ${canUnlink ? '' : `<span class="text-xs text-white/40">${escapeHtml(reason)}</span>`}
+            </div>`;
+    } else {
+        body = `
+            <p class="text-sm text-white/60">${t('oidc.not_linked')}</p>
+            ${enabled ? `<button type="button" class="jf-btn-primary !py-2 !px-4 text-xs mt-4" data-action="oidc-link">${t('oidc.link')}</button>` : ''}`;
+    }
+    return `
+        <div class="jf-settings-card">
+            <h3 class="text-base font-bold text-white mb-4 flex items-center gap-2">
+                <span class="w-2 h-2 rounded-full bg-[#38bdf8]"></span>
+                ${t('oidc.account_title')}
+            </h3>
+            ${body}
+        </div>`;
+}
+
 // --- Login Page Renderer ---
-function renderLogin() {
+let pendingSetup = null; // { username, code } of an imported user's one-time code; memory only
+function renderLogin(data) {
+    pendingSetup = null;
     html('page-login', `
     <div class="flex justify-center items-center min-h-[70vh] jf-page px-4">
         <div class="w-full max-w-sm p-8 rounded-2xl bg-[#131822] border border-white/10 shadow-2xl">
@@ -1896,27 +2558,92 @@ function renderLogin() {
                 </button>
                 <div id="login-error" class="text-red-400 text-xs text-center hidden p-2 rounded bg-red-500/10 border border-red-500/20"></div>
             </form>
+            <div id="oidc-sign-in"></div>
         </div>
     </div>`);
+    loadOidcSignIn();
+    const oidcError = oidcErrorCode(data);
+    if (data === 'oidc') completeOidcSignIn();
+    else if (oidcError !== null) showLoginError(oidcErrorText(oidcError));
+}
+
+// The steps after any sign-in: password, setup code or OpenID Connect.
+async function finishSignIn() {
+    updateAuthUI();
+    // Replace a socket or retry left from an earlier session, so the new token is used now
+    stopScanProgressWebSocket();
+    initScanProgressWebSocket();
+    await loadSidebar();
+    navigate('home');
+    toast(t('login.welcome_back', { name: API.userName }));
 }
 
 async function handleLogin(e) {
     e.preventDefault();
+    const username = $('login-user').value;
+    const password = $('login-pass').value;
     try {
-        await API.login($('login-user').value, $('login-pass').value);
-        updateAuthUI();
-        await loadSidebar();
-        navigate('home');
-        toast(t('login.welcome_back', { name: API.userName }));
+        await API.login(username, password);
     } catch (err) {
-        $('login-error').textContent = err.message;
-        show('login-error');
+        if (err.setupRequired) {
+            renderSetupPassword(username, password);
+            return;
+        }
+        showLoginError(err.status === 403 ? t('oidc.password_sign_in_off') : err.message);
+        return;
+    }
+    await finishSignIn();
+}
+
+// Shown when a sign-in answers "setup required" for an imported user. The code is kept in memory only.
+function renderSetupPassword(username, code) {
+    pendingSetup = { username, code };
+    html('page-login', `
+    <div class="flex justify-center items-center min-h-[70vh] jf-page px-4">
+        <div class="w-full max-w-sm p-8 rounded-2xl bg-[#131822] border border-white/10 shadow-2xl">
+            <div class="text-center mb-8">
+                <img src="/web/assets/logo.png" alt="Rustyfin" class="w-20 h-20 mx-auto rounded-2xl shadow-xl mb-3 p-1 bg-white/5 border border-white/10">
+                <h2 class="text-2xl font-black text-white tracking-tight">${t('jellyfin_import.setup_title')}</h2>
+                <p class="text-white/40 text-xs mt-1">${t('jellyfin_import.setup_text', { name: escapeHtml(username) })}</p>
+            </div>
+            <form id="setup-form" onsubmit="handleSetupPassword(event)" class="space-y-4">
+                <div>
+                    <label class="block text-xs font-semibold text-white/70 mb-1.5">${t('jellyfin_import.new_password')}</label>
+                    <input type="password" id="setup-pass" class="jf-input w-full" autocomplete="new-password" autofocus>
+                </div>
+                <div>
+                    <label class="block text-xs font-semibold text-white/70 mb-1.5">${t('jellyfin_import.confirm_password')}</label>
+                    <input type="password" id="setup-pass2" class="jf-input w-full" autocomplete="new-password">
+                </div>
+                <button type="submit" class="jf-btn-primary w-full !py-3 font-bold text-sm shadow-lg mt-2">
+                    ${t('jellyfin_import.setup_submit')}
+                </button>
+                <div id="setup-error" class="text-red-400 text-xs text-center hidden p-2 rounded bg-red-500/10 border border-red-500/20"></div>
+                <button type="button" id="setup-back" class="w-full text-xs text-white/50 hover:text-white transition py-2" onclick="pendingSetup = null; renderLogin()">${t('jellyfin_import.back')}</button>
+            </form>
+        </div>
+    </div>`);
+}
+
+async function handleSetupPassword(e) {
+    e.preventDefault();
+    const pw = $('setup-pass').value;
+    const pw2 = $('setup-pass2').value;
+    const fail = message => { $('setup-error').textContent = message; show('setup-error'); };
+    if (!pw) return fail(t('jellyfin_import.password_required'));
+    if (pw !== pw2) return fail(t('jellyfin_import.password_mismatch'));
+    if (!pendingSetup) { renderLogin(); return; }
+    try {
+        await API.loginWithSetupCode(pendingSetup.username, pendingSetup.code, pw);
+        pendingSetup = null;
+        await finishSignIn();
+    } catch (err) {
+        fail(err.status === 401 ? t('jellyfin_import.code_invalid') : err.message);
     }
 }
 
 function doLogout() {
     API.logout();
-    updateAuthUI();
     navigate('home');
     toast(t('login.signed_out'));
 }
@@ -1936,7 +2663,7 @@ async function authorizeQuickConnect() {
         return;
     }
     try {
-        await API.post('/QuickConnect/Authorize', { Code: code });
+        await API.post('/QuickConnect/Authorize?code=' + encodeURIComponent(code));
         toast(t('quick_connect.authorized'));
         $('qc-modal')?.close();
     } catch (e) {
@@ -1945,14 +2672,17 @@ async function authorizeQuickConnect() {
 }
 
 // --- Settings Page Renderer ---
-async function renderSettings() {
+async function renderSettings(data) {
+    showOidcLinkResult(data);
     const page = $('page-settings');
     page.innerHTML = '<div class="flex justify-center items-center py-24"><div class="w-10 h-10 border-3 border-[#00a4dc] border-t-transparent rounded-full animate-spin"></div></div>';
 
     try {
-        const [me, config] = await Promise.all([
+        const [me, config, ssoInfo, ssoAccount] = await Promise.all([
             API.getMe().catch(() => ({})),
-            API.getConfig().catch(() => null)
+            API.getConfig().catch(() => null),
+            API.oidcInfo().catch(() => null),
+            API.oidcAccount(API.userId).catch(() => null)
         ]);
 
         const name = me.Name || me.name || API.userName || '';
@@ -2002,6 +2732,10 @@ async function renderSettings() {
             </div>`;
         }
 
+        // Without the account (its request failed) the current password stays required.
+        const hasPassword = ssoAccount?.HasPassword ?? true;
+        const ssoHtml = (ssoInfo?.Enabled || ssoAccount?.Linked) ? oidcCardHtml(Boolean(ssoInfo?.Enabled), ssoAccount) : '';
+
         page.innerHTML = `
         <div class="max-w-3xl mx-auto jf-page">
             <h1 class="text-2xl lg:text-3xl font-extrabold text-white mb-6">${t('settings.title')}</h1>
@@ -2013,7 +2747,7 @@ async function renderSettings() {
                 </div>
                 <div>
                     <h2 class="text-lg font-bold text-white">${escapeHtml(name)}</h2>
-                    <p class="text-xs text-white/40">${t('settings.user_id', { id })}</p>
+                    <p class="text-xs text-white/40">${t('settings.user_id', { id: escapeHtml(id) })}</p>
                     <span class="inline-block mt-1 text-[10px] font-bold px-2 py-0.5 rounded bg-[#00a4dc]/20 text-[#38bdf8] uppercase">
                         ${API.isAdmin ? t('common.administrator') : t('settings.standard_user')}
                     </span>
@@ -2038,8 +2772,9 @@ async function renderSettings() {
                     <span class="w-2 h-2 rounded-full bg-amber-400"></span>
                     ${t('settings.change_password')}
                 </h3>
-                <form onsubmit="handleChangePassword(event, '${id}')" class="space-y-3">
-                    <input type="password" id="pw-current" class="jf-input w-full" placeholder="${escapeHtml(t('settings.current_password'))}" required>
+                <form id="change-password-form" class="space-y-3">
+                    <input type="password" id="pw-current" class="jf-input w-full" placeholder="${escapeHtml(t('settings.current_password'))}" ${hasPassword ? 'required' : ''}>
+                    ${hasPassword ? '' : `<p class="text-xs text-white/40">${t('oidc.no_current_password')}</p>`}
                     <input type="password" id="pw-new" class="jf-input w-full" placeholder="${escapeHtml(t('settings.new_password'))}" required>
                     <input type="password" id="pw-confirm" class="jf-input w-full" placeholder="${escapeHtml(t('settings.confirm_new_password'))}" required>
                     <button type="submit" class="jf-btn-primary text-xs">${t('settings.save_password')}</button>
@@ -2047,8 +2782,11 @@ async function renderSettings() {
                 </form>
             </div>
 
+            ${ssoHtml}
+
             ${serverCfgHtml}
         </div>`;
+        $('change-password-form')?.addEventListener('submit', e => handleChangePassword(e, id));
     } catch (e) {
         page.innerHTML = `<div class="p-6 rounded-xl bg-red-500/10 text-red-400">${escapeHtml(e.message)}</div>`;
     }
@@ -2099,6 +2837,9 @@ async function handleSaveConfig(e) {
 }
 
 // --- Admin Dashboard Renderer ---
+// AccountStatus.UserId has hyphens and a user's Id may not, so account ids are compared without case and hyphens.
+function oidcAccountKey(id) { return String(id).toLowerCase().replace(/-/g, ''); }
+
 async function renderAdmin() {
     const page = $('page-admin');
     if (!API.isAdmin) {
@@ -2108,18 +2849,22 @@ async function renderAdmin() {
 
     page.innerHTML = '<div class="flex justify-center items-center py-24"><div class="w-10 h-10 border-3 border-[#00a4dc] border-t-transparent rounded-full animate-spin"></div></div>';
 
+    if (!(await API.recheckAdmin())) return;
     try {
-        const [users, libs, tasks, plugins, info, sessions] = await Promise.all([
+        let libsError = null;
+        const [users, libs, tasks, plugins, info, sessions, accounts] = await Promise.all([
             API.getUsers().catch(() => []),
-            API.getLibraries().catch(() => []),
+            API.getLibraries().catch(err => { libsError = err; return []; }),
             API.getTasks().catch(() => []),
             API.getPlugins().catch(() => []),
             API.getFullInfo().catch(() => ({})),
-            API.getSessions().catch(() => [])
+            API.getSessions().catch(() => []),
+            API.oidcAccounts().catch(() => [])
         ]);
+        const accountById = new Map(accounts.map(a => [oidcAccountKey(a.UserId), a]));
 
-        const tabs = [t('admin.overview'), t('admin.users'), t('admin.libraries'), t('admin.tasks'), t('admin.sessions'), t('admin.activity_log_tab'), t('admin.live_log')];
-        const tabIds = ['admin-overview', 'admin-users', 'admin-libs', 'admin-tasks', 'admin-sessions', 'admin-activity', 'admin-livelog'];
+        const tabs = [t('admin.overview'), t('admin.users'), t('admin.libraries'), t('admin.tasks'), t('admin.sessions'), t('admin.activity_log_tab'), t('admin.live_log'), t('oidc.admin_tab'), t('jellyfin_import.tab')];
+        const tabIds = ['admin-overview', 'admin-users', 'admin-libs', 'admin-tasks', 'admin-sessions', 'admin-activity', 'admin-livelog', 'admin-signin', 'admin-import'];
 
         page.innerHTML = `
         <div class="max-w-6xl mx-auto jf-page">
@@ -2129,7 +2874,7 @@ async function renderAdmin() {
                     <p class="text-xs text-white/40 mt-1">${t('admin.subtitle', { name: escapeHtml(info.ServerName || 'Rustyfin') })}</p>
                 </div>
                 <div class="flex gap-2">
-                    <button class="jf-btn-ghost !py-1.5 !px-3 text-xs" onclick="API.scanAllLibraries().then(()=>toast(t('admin.scanning_all')))">
+                    <button class="jf-btn-ghost !py-1.5 !px-3 text-xs" data-action="scan-all">
                         ${t('admin.scan_all')}
                     </button>
                     <button class="jf-btn-ghost !py-1.5 !px-3 text-xs text-amber-400 hover:text-amber-300" onclick="if(confirm(t('admin.restart_confirm')))API.restart().then(()=>toast(t('admin.restarting')))">
@@ -2142,7 +2887,7 @@ async function renderAdmin() {
             <div class="flex gap-2 mb-6 overflow-x-auto pb-2">
                 ${tabs.map((label, i) => `
                     <button class="px-4 py-2 rounded-xl text-xs font-semibold whitespace-nowrap transition ${i === 0 ? 'bg-[#00a4dc] text-white shadow-lg' : 'bg-white/5 text-white/60 hover:bg-white/10'}"
-                            data-tab="${tabIds[i]}" onclick="showAdminTab(this, '${tabIds[i]}')">${label}</button>
+                            data-action="admin-tab" data-tab="${escapeHtml(tabIds[i])}">${label}</button>
                 `).join('')}
             </div>
 
@@ -2162,7 +2907,7 @@ async function renderAdmin() {
                         <p class="text-[11px] text-white/40 uppercase tracking-wider mt-1">${t('admin.registered_users')}</p>
                     </div>
                     <div class="jf-settings-card text-center">
-                        <p class="text-3xl font-black text-amber-400">${libs.length}</p>
+                        <p class="text-3xl font-black text-amber-400">${libsError ? '—' : libs.length}</p>
                         <p class="text-[11px] text-white/40 uppercase tracking-wider mt-1">${t('admin.libraries')}</p>
                     </div>
                 </div>
@@ -2192,27 +2937,30 @@ async function renderAdmin() {
                                 <th class="pb-3 font-semibold">${t('admin.role')}</th>
                                 <th class="pb-3 font-semibold">${escapeHtml(t('admin.disabled_column'))}</th>
                                 <th class="pb-3 font-semibold">${t('admin.last_login')}</th>
+                                <th class="pb-3 font-semibold">${escapeHtml(t('oidc.provider_column'))}</th>
                                 <th class="pb-3 font-semibold text-right">${t('admin.action')}</th>
                             </tr>
                         </thead>
                         <tbody class="divide-y divide-white/5">
                             ${users.map(u => {
-                                const id = u.Id || u.id;
                                 const name = u.Name || u.name;
                                 const isAdmin = u.IsAdministrator ?? u.Policy?.IsAdministrator ?? u.policy?.is_administrator;
+                                const account = accountById.get(oidcAccountKey(u.Id || u.id));
+                                const id = u.Id || u.id;
                                 const isOwner = u.IsOwner === true;
-                                const isSelf = String(id).toLowerCase().replace(/-/g, '') === String(API.userId).toLowerCase().replace(/-/g, '');
+                                const isSelf = oidcAccountKey(id) === oidcAccountKey(API.userId);
                                 const locked = isOwner || isSelf;
                                 const promoteBlocked = !locked && !isAdmin && u.IsDisabled === true;
                                 const disableBlocked = !locked && isAdmin && u.IsDisabled !== true;
                                 return `
                             <tr>
                                 <td class="py-3 font-bold text-white">${escapeHtml(name)}</td>
-                                <td class="py-3"><label class="inline-flex items-center gap-2 text-white/80"><input type="checkbox" data-id="${escapeHtml(id)}" data-name="${escapeHtml(name)}" onchange="setUserPolicy(this, { IsAdministrator: this.checked })" aria-label="${escapeHtml(t('admin.administrator_for', { name }))}" ${isAdmin ? 'checked' : ''} ${locked || promoteBlocked ? 'disabled' : ''} class="w-4 h-4 rounded bg-white/10 border-white/20 text-[#00a4dc]"><span>${escapeHtml(t('admin.role_admin'))}</span></label>${isOwner ? `<span class="ml-1.5 px-2 py-0.5 rounded text-[10px] font-bold bg-[#00a4dc]/20 text-[#38bdf8]">${escapeHtml(t('admin.role_owner'))}</span>` : ''}${locked ? `<p class="text-[10px] text-white/40 mt-1">${escapeHtml(t(isOwner ? 'admin.owner_locked' : 'admin.self_locked'))}</p>` : ''}${promoteBlocked ? `<p class="text-[10px] text-white/40 mt-1">${escapeHtml(t('admin.promote_disabled_locked'))}</p>` : ''}</td>
-                                <td class="py-3"><input type="checkbox" data-id="${escapeHtml(id)}" data-name="${escapeHtml(name)}" onchange="setUserPolicy(this, { IsDisabled: this.checked })" aria-label="${escapeHtml(t('admin.disabled_for', { name }))}" ${u.IsDisabled ? 'checked' : ''} ${locked || disableBlocked ? 'disabled' : ''} class="w-4 h-4 rounded bg-white/10 border-white/20 text-[#00a4dc]">${disableBlocked ? `<p class="text-[10px] text-white/40 mt-1">${escapeHtml(t('admin.disable_admin_locked'))}</p>` : ''}</td>
+                                <td class="py-3"><label class="inline-flex items-center gap-2 text-white/80"><input type="checkbox" data-action="set-user-admin" data-id="${escapeHtml(id)}" data-name="${escapeHtml(name)}" aria-label="${escapeHtml(t('admin.administrator_for', { name }))}" ${isAdmin ? 'checked' : ''} ${locked || promoteBlocked ? 'disabled' : ''} class="w-4 h-4 rounded bg-white/10 border-white/20 text-[#00a4dc]"><span>${escapeHtml(t('admin.role_admin'))}</span></label>${isOwner ? `<span class="ml-1.5 px-2 py-0.5 rounded text-[10px] font-bold bg-[#00a4dc]/20 text-[#38bdf8]">${escapeHtml(t('admin.role_owner'))}</span>` : ''}${account?.AdminFromGroup ? `<span class="ml-1.5 text-[10px] text-white/40">${escapeHtml(t('oidc.from_group'))}</span><p class="text-[10px] text-white/40 mt-1">${escapeHtml(t('admin.group_admin_hint'))}</p>` : ''}${locked ? `<p class="text-[10px] text-white/40 mt-1">${escapeHtml(t(isOwner ? 'admin.owner_locked' : 'admin.self_locked'))}</p>` : ''}${promoteBlocked ? `<p class="text-[10px] text-white/40 mt-1">${escapeHtml(t('admin.promote_disabled_locked'))}</p>` : ''}</td>
+                                <td class="py-3"><input type="checkbox" data-action="set-user-disabled" data-id="${escapeHtml(id)}" data-name="${escapeHtml(name)}" aria-label="${escapeHtml(t('admin.disabled_for', { name }))}" ${u.IsDisabled ? 'checked' : ''} ${locked || disableBlocked ? 'disabled' : ''} class="w-4 h-4 rounded bg-white/10 border-white/20 text-[#00a4dc]">${disableBlocked ? `<p class="text-[10px] text-white/40 mt-1">${escapeHtml(t('admin.disable_admin_locked'))}</p>` : ''}</td>
                                 <td class="py-3 text-white/40">${escapeHtml(u.LastLoginDate || u.last_login_date || '–')}</td>
+                                <td class="py-3 text-white/60">${account?.Linked ? `${escapeHtml(account.ProviderUsername || '—')} <button type="button" class="ml-2 text-[#00a4dc] hover:text-[#38bdf8] font-semibold" data-action="oidc-remove-link" data-id="${escapeHtml(account.UserId)}" data-name="${escapeHtml(name)}">${escapeHtml(t('oidc.remove_link'))}</button>` : '<span class="text-white/40">—</span>'}</td>
                                 <td class="py-3 text-right">
-                                    <button class="text-red-400 hover:text-red-300 font-semibold" onclick="if(confirm(t('admin.delete_user_confirm')))API.deleteUser('${u.Id || u.id}').then(()=>renderAdmin())">${t('common.delete')}</button>
+                                    <button class="text-red-400 hover:text-red-300 font-semibold" data-action="delete-user" data-id="${escapeHtml(u.Id || u.id)}">${t('common.delete')}</button>
                                 </td>
                             </tr>`;
                             }).join('')}
@@ -2224,9 +2972,10 @@ async function renderAdmin() {
             <!-- Tab 2: Libraries -->
             <div id="admin-libs" class="hidden jf-settings-card">
                 <div class="flex justify-between items-center mb-4">
-                    <h3 class="font-bold text-white text-base">${t('admin.libraries_count', { number: libs.length })}</h3>
+                    <h3 class="font-bold text-white text-base">${t('admin.libraries_count', { number: libsError ? '—' : libs.length })}</h3>
                     <button class="jf-btn-primary text-xs" onclick="openAddLibrary()">${t('admin.new_library')}</button>
                 </div>
+                ${libsError ? `<p class="text-xs text-red-400">${t('library.list_failed', { message: escapeHtml(libsError.message) })}</p>` : `
                 <div class="overflow-x-auto">
                     <table class="w-full text-left text-xs">
                         <thead>
@@ -2234,23 +2983,25 @@ async function renderAdmin() {
                                 <th class="pb-3 font-semibold">${t('common.name')}</th>
                                 <th class="pb-3 font-semibold">${t('common.type')}</th>
                                 <th class="pb-3 font-semibold">${t('admin.paths')}</th>
+                                <th class="pb-3 font-semibold">${t('admin.realtime_monitor')}</th>
                                 <th class="pb-3 font-semibold text-right">${t('admin.actions')}</th>
                             </tr>
                         </thead>
                         <tbody class="divide-y divide-white/5">
                             ${libs.map(l => `
                             <tr>
-                                <td class="py-3 font-bold text-white">${escapeHtml(l.name || l.Name)}</td>
+                                <td class="py-3 font-bold text-white"><span class="inline-flex items-center gap-1.5">${escapeHtml(l.name || l.Name)}${scanRing(l.id || l.Id, l.name || l.Name)}</span></td>
                                 <td class="py-3"><span class="px-2 py-0.5 rounded bg-white/10 text-white/70">${escapeHtml(l.content_type || l.ContentType || t('admin.mixed'))}</span></td>
                                 <td class="py-3 text-white/40 font-mono">${escapeHtml((l.paths || l.Paths || []).join(', '))}</td>
+                                <td class="py-3"><input type="checkbox" data-action="toggle-realtime-monitor" data-id="${escapeHtml(l.id || l.Id)}" aria-label="${escapeHtml(t('admin.realtime_monitor_for', { name: l.name || l.Name }))}" ${(l.LibraryOptions || {}).EnableRealtimeMonitor === false ? '' : 'checked'} class="w-4 h-4 rounded bg-white/10 border-white/20 text-[#00a4dc]"></td>
                                 <td class="py-3 text-right space-x-2">
-                                    <button class="text-[#00a4dc] hover:text-[#38bdf8]" onclick="API.scanLibrary('${l.id || l.Id}').then(()=>toast(t('admin.scan_started')))">${t('admin.scan')}</button>
-                                    <button class="text-red-400 hover:text-red-300" onclick="if(confirm(t('admin.remove_library_confirm')))API.deleteLibrary('${l.id || l.Id}').then(()=>renderAdmin())">${t('common.delete')}</button>
+                                    <button class="text-[#00a4dc] hover:text-[#38bdf8]" data-action="scan-library-admin" data-id="${escapeHtml(l.id || l.Id)}">${t('admin.scan')}</button>
+                                    <button class="text-red-400 hover:text-red-300" data-action="delete-library" data-id="${escapeHtml(l.id || l.Id)}">${t('common.delete')}</button>
                                 </td>
                             </tr>`).join('')}
                         </tbody>
                     </table>
-                </div>
+                </div>`}
             </div>
 
             <!-- Tab 3: Tasks -->
@@ -2323,6 +3074,11 @@ async function renderAdmin() {
                     <p class="text-[10px] text-white/20 mt-2">${t('admin.live_log_hint')}</p>
                 </div>
             </div>
+
+            <!-- Tab 7: Sign-in (OpenID Connect settings, filled by loadOidcAdminTab) -->
+            <div id="admin-signin" class="hidden jf-settings-card"></div>
+
+            ${jiPanelHtml()}
         </div>`;
     } catch (e) {
         page.innerHTML = `<div class="p-6 rounded-xl bg-red-500/10 text-red-400">${escapeHtml(e.message)}</div>`;
@@ -2335,13 +3091,15 @@ function showAdminTab(btn, tabId) {
     });
     btn.className = 'px-4 py-2 rounded-xl text-xs font-semibold whitespace-nowrap transition bg-[#00a4dc] text-white shadow-lg';
 
-    ['admin-overview', 'admin-users', 'admin-libs', 'admin-tasks', 'admin-sessions', 'admin-activity', 'admin-livelog'].forEach(id => {
+    ['admin-overview', 'admin-users', 'admin-libs', 'admin-tasks', 'admin-sessions', 'admin-activity', 'admin-livelog', 'admin-signin', 'admin-import'].forEach(id => {
         const el = $(id);
         if (el) el.classList.toggle('hidden', id !== tabId);
     });
 
     if (tabId === 'admin-activity') loadActivityLog();
     if (tabId === 'admin-livelog') initLiveLog();
+    if (tabId === 'admin-signin') loadOidcAdminTab();
+    if (tabId === 'admin-import') loadJellyfinImport();
 }
 
 // An administrator changes another user's role or disabled state. The checkbox is disabled while the request runs, the users list cache is dropped, and the users tab is shown again after the page is rendered.
@@ -2359,8 +3117,733 @@ async function setUserPolicy(el, policy) {
     }
     API.invalidateCache('/Users');
     await renderAdmin();
-    const tab = document.querySelector('[data-tab="admin-users"]');
+    const tab = document.querySelector('[data-action="admin-tab"][data-tab="admin-users"]');
     if (tab) showAdminTab(tab, 'admin-users');
+}
+
+// An administrator removes another user's provider link. The users tab is shown again after the page is rendered.
+async function removeOidcLinkAsAdmin(el) {
+    if (!confirm(t('oidc.remove_link_confirm', { name: el.dataset.name }))) return;
+    try {
+        await API.oidcUnlink(el.dataset.id);
+    } catch (err) {
+        toast(err.message, 'error');
+        return;
+    }
+    toast(t('oidc.unlinked'));
+    await renderAdmin();
+    const tab = document.querySelector('[data-action="admin-tab"][data-tab="admin-users"]');
+    if (tab) showAdminTab(tab, 'admin-users');
+}
+
+// --- OpenID Connect settings (admin "Sign-in" tab) ---
+
+async function loadOidcAdminTab() {
+    let settings;
+    try {
+        settings = await API.oidcSettings();
+    } catch {
+        const box = $('admin-signin');
+        if (box) box.innerHTML = `<p class="text-xs text-red-400">${escapeHtml(t('oidc.load_failed'))}</p>`;
+        return;
+    }
+    renderOidcAdminSettings(settings);
+}
+
+// Renders the form from an OidcSettings object. The client secret field is always empty: a saved secret shows only in the placeholder.
+function renderOidcAdminSettings(s) {
+    const box = $('admin-signin');
+    if (!box) return;
+    const label = (id, key) => `<label for="${id}" class="block text-xs font-semibold text-white/70 mb-1.5">${escapeHtml(t(key))}</label>`;
+    const hint = key => `<p class="text-xs text-white/40 mt-1">${escapeHtml(t(key))}</p>`;
+    const warn = key => `<p class="text-xs text-amber-300/80 mt-1">${escapeHtml(t(key))}</p>`;
+    const check = (id, key, checked = false) => `
+            <div class="flex items-center gap-3">
+                <input type="checkbox" id="${id}" class="w-4 h-4 rounded bg-white/10 border-white/20 text-[#00a4dc]"${checked ? ' checked' : ''}>
+                <label for="${id}" class="text-sm text-white/70">${escapeHtml(t(key))}</label>
+            </div>`;
+    const callbackRow = s.CallbackUrl
+        ? `<div class="flex gap-2">
+                <input id="oidc-callback-url" class="jf-input w-full" value="${escapeHtml(s.CallbackUrl)}" readonly>
+                <button type="button" class="jf-btn-ghost !py-2 !px-4 text-xs whitespace-nowrap" data-action="oidc-copy-callback">${escapeHtml(t('oidc.copy'))}</button>
+            </div>`
+        : hint('oidc.callback_after_save');
+
+    box.innerHTML = `
+        <h3 class="font-bold text-white text-base mb-4">${escapeHtml(t('oidc.settings_title'))}</h3>
+        <div class="space-y-4 max-w-2xl">
+            ${check('oidc-enabled', 'oidc.enabled', s.Enabled)}
+            <div>
+                ${label('oidc-issuer-url', 'oidc.issuer_url')}
+                <input id="oidc-issuer-url" type="text" class="jf-input w-full" value="${escapeHtml(s.IssuerUrl)}" spellcheck="false" autocomplete="off">
+            </div>
+            <div>
+                ${label('oidc-client-id', 'oidc.client_id')}
+                <input id="oidc-client-id" type="text" class="jf-input w-full" value="${escapeHtml(s.ClientId)}" spellcheck="false" autocomplete="off">
+            </div>
+            <div>
+                ${label('oidc-client-secret', 'oidc.client_secret')}
+                <input id="oidc-client-secret" type="password" class="jf-input w-full" autocomplete="new-password" placeholder="${escapeHtml(t(s.HasClientSecret ? 'oidc.secret_saved_placeholder' : 'oidc.secret_none_placeholder'))}">
+                ${s.HasClientSecret ? `<div class="mt-2">${check('oidc-remove-secret', 'oidc.remove_secret')}</div>` : ''}
+            </div>
+            <div>
+                ${label('oidc-scopes', 'oidc.scopes')}
+                <input id="oidc-scopes" type="text" class="jf-input w-full" value="${escapeHtml(s.Scopes)}" spellcheck="false" autocomplete="off">
+                ${hint('oidc.scopes_hint')}
+                <div class="mt-3">
+                    ${label('oidc-effective-scopes', 'oidc.effective_scopes')}
+                    <input id="oidc-effective-scopes" type="text" class="jf-input w-full" value="${escapeHtml(s.EffectiveScopes)}" readonly>
+                </div>
+            </div>
+            <div>
+                ${label('oidc-button-label', 'oidc.button_label')}
+                <input id="oidc-button-label" type="text" class="jf-input w-full" value="${escapeHtml(s.ButtonLabel)}" placeholder="${escapeHtml(t('oidc.sign_in_default'))}">
+            </div>
+            <div>
+                ${label('oidc-username-claim', 'oidc.username_claim')}
+                <input id="oidc-username-claim" type="text" class="jf-input w-full" value="${escapeHtml(s.UsernameClaim)}">
+            </div>
+            <div>
+                ${label('oidc-group-claim', 'oidc.group_claim')}
+                <input id="oidc-group-claim" type="text" class="jf-input w-full" value="${escapeHtml(s.GroupClaim)}">
+            </div>
+            <div>
+                ${label('oidc-allowed-group', 'oidc.allowed_group')}
+                <input id="oidc-allowed-group" type="text" class="jf-input w-full" value="${escapeHtml(s.AllowedGroup)}">
+                ${hint('oidc.allowed_group_hint')}
+            </div>
+            <div>
+                ${label('oidc-admin-group', 'oidc.admin_group')}
+                <input id="oidc-admin-group" type="text" class="jf-input w-full" value="${escapeHtml(s.AdminGroup)}">
+                ${hint('oidc.admin_group_hint')}
+                ${warn('oidc.warn_groups')}
+            </div>
+            <div>
+                ${label('oidc-public-url', 'oidc.public_url')}
+                <input id="oidc-public-url" type="text" class="jf-input w-full" value="${escapeHtml(s.PublicUrl || location.origin)}">
+            </div>
+            <div>
+                ${label('oidc-callback-url', 'oidc.callback_url')}
+                ${callbackRow}
+            </div>
+            <div>
+                ${check('oidc-allow-password', 'oidc.allow_password', s.AllowPasswordSignIn)}
+                ${warn('oidc.warn_password_off')}
+            </div>
+            <div id="oidc-settings-error" class="hidden text-red-400 text-xs p-2 rounded bg-red-500/10 border border-red-500/20"></div>
+            <div class="flex justify-end">
+                <button type="button" class="jf-btn-primary text-xs" data-action="oidc-save-settings">${escapeHtml(t('oidc.save'))}</button>
+            </div>
+        </div>`;
+}
+
+// Copies the callback URL. navigator.clipboard is missing on plain-http LAN addresses, so the field is selected for execCommand.
+async function copyOidcCallbackUrl() {
+    const input = $('oidc-callback-url');
+    if (!input) return;
+    let copied = false;
+    if (navigator.clipboard?.writeText) {
+        copied = await navigator.clipboard.writeText(input.value).then(() => true, () => false);
+    }
+    if (!copied) {
+        input.select();
+        copied = document.execCommand('copy');
+    }
+    if (copied) toast(t('oidc.copied'));
+    else toast(t('oidc.copy_failed'), 'error');
+}
+
+// The form stays as typed when the server refuses the save: the error text goes into the card, not over the form.
+async function saveOidcAdminSettings() {
+    const text = id => $(id).value;
+    const body = {
+        Enabled: $('oidc-enabled').checked,
+        IssuerUrl: text('oidc-issuer-url'),
+        ClientId: text('oidc-client-id'),
+        Scopes: text('oidc-scopes'),
+        ButtonLabel: text('oidc-button-label'),
+        UsernameClaim: text('oidc-username-claim'),
+        GroupClaim: text('oidc-group-claim'),
+        AllowedGroup: text('oidc-allowed-group'),
+        AdminGroup: text('oidc-admin-group'),
+        PublicUrl: text('oidc-public-url'),
+        AllowPasswordSignIn: $('oidc-allow-password').checked,
+    };
+    const secret = text('oidc-client-secret');
+    if ($('oidc-remove-secret')?.checked) body.ClientSecret = '';
+    else if (secret) body.ClientSecret = secret;
+
+    hide('oidc-settings-error');
+    let saved;
+    try {
+        saved = await API.saveOidcSettings(body);
+    } catch (err) {
+        $('oidc-settings-error').textContent = err.message;
+        show('oidc-settings-error');
+        return;
+    }
+    toast(t('oidc.settings_saved'));
+    renderOidcAdminSettings(saved);
+}
+
+// --- Jellyfin import (B20) ---
+// Admin tab: imports users, watch data and track choices from a Jellyfin data folder.
+let jiPreviewed = false; // a preview is on screen; from then on the request carries the pairs and the checked users
+let jiRunning = false;   // the last status read said Running
+let jiTimer = null;      // the one status poll loop
+const jiChoice = new Map();     // JellyfinId -> checked; kept across previews of the same folder and layout
+const jiConfirm = new Map();    // JellyfinId -> UserId of a ticked suggested match; kept like jiChoice
+let jiMine = '';                // JellyfinId picked for "Import into my account"; '' = no one
+let jiPendingNames = new Map(); // UserId -> Name of the pending users (names stay out of onclick attributes)
+const jiShownCodes = new Map(); // UserId -> { name, code } of a new code shown in the pending list
+const jiLayoutKeys = { New: 'jellyfin_import.layout_new', Old: 'jellyfin_import.layout_old' };
+const jiMetadataModeKeys = { FillEmpty: 'jellyfin_import.metadata_fill_empty', Replace: 'jellyfin_import.metadata_replace', None: 'jellyfin_import.metadata_none' };
+const jiStageKeys = {
+    Reading: 'jellyfin_import.stage_reading',
+    Matching: 'jellyfin_import.stage_matching',
+    Users: 'jellyfin_import.stage_users',
+    WatchData: 'jellyfin_import.stage_watch_data',
+    Metadata: 'jellyfin_import.stage_metadata'
+};
+const jiActionKeys = {
+    Match: 'jellyfin_import.action_match',
+    Create: 'jellyfin_import.action_create',
+    Skip: 'jellyfin_import.action_skip'
+};
+const jiReasonKeys = {
+    Ambiguous: 'jellyfin_import.reason_ambiguous',
+    NotSelected: 'jellyfin_import.reason_not_selected',
+    NotConfirmed: 'jellyfin_import.reason_not_confirmed',
+    ConfirmedOtherAccount: 'jellyfin_import.reason_confirmed_other',
+    AccountTakenByIntoMyAccount: 'jellyfin_import.reason_taken_by_mine'
+};
+
+function jiPanelHtml() {
+    return `
+    <div id="admin-import" class="hidden space-y-6">
+        <div class="jf-settings-card">
+            <h3 class="font-bold text-white text-base mb-2">${t('jellyfin_import.title')}</h3>
+            <p class="text-xs text-white/60 mb-3">${t('jellyfin_import.help_intro')}</p>
+            <p class="text-xs text-white/60 mb-2">${t('jellyfin_import.help_mount')}</p>
+            <pre class="text-[11px] font-mono bg-black/50 border border-white/10 rounded-lg p-3 text-white/80 overflow-x-auto">-v /path/to/jellyfin/config:/import/jellyfin:ro</pre>
+            <p class="text-xs text-white/60 mt-3">${t('jellyfin_import.help_path')}</p>
+            <div class="grid gap-4 sm:grid-cols-2 mt-5">
+                <label class="block">
+                    <span class="block text-xs font-semibold text-white/70 mb-1.5">${t('jellyfin_import.folder')}</span>
+                    <input type="text" id="ji-source" class="jf-input w-full" placeholder="/import/jellyfin" oninput="jiForget()">
+                </label>
+                <label class="block">
+                    <span class="block text-xs font-semibold text-white/70 mb-1.5">${t('jellyfin_import.layout')}</span>
+                    <select id="ji-layout" class="jf-input w-full" onchange="jiForget()">
+                        <option value="Auto">${t('jellyfin_import.layout_auto')}</option>
+                        <option value="New">${t('jellyfin_import.layout_new')}</option>
+                        <option value="Old">${t('jellyfin_import.layout_old')}</option>
+                    </select>
+                </label>
+                <label class="block">
+                    <span class="block text-xs font-semibold text-white/70 mb-1.5">${t('jellyfin_import.metadata')}</span>
+                    <select id="ji-metadata" class="jf-input w-full">
+                        <option value="FillEmpty">${t('jellyfin_import.metadata_fill_empty')}</option>
+                        <option value="Replace">${t('jellyfin_import.metadata_replace')}</option>
+                        <option value="None">${t('jellyfin_import.metadata_none')}</option>
+                    </select>
+                    <span class="block text-xs text-white/50 mt-1.5">${t('jellyfin_import.metadata_help')}</span>
+                </label>
+            </div>
+            <button id="ji-preview-btn" class="jf-btn-primary !py-2 !px-4 text-sm mt-5" onclick="jiPreview()">${t('jellyfin_import.preview')}</button>
+        </div>
+
+        <div id="ji-error" class="hidden text-red-400 text-xs p-2 rounded bg-red-500/10 border border-red-500/20"></div>
+
+        <div id="ji-preview" class="hidden jf-settings-card space-y-5">
+            <p id="ji-found" class="text-xs text-white/70"></p>
+            <div>
+                <h4 class="font-semibold text-white text-sm">${t('jellyfin_import.pairs_title')}</h4>
+                <p class="text-xs text-white/50 mb-3">${t('jellyfin_import.pairs_help')}</p>
+                <div id="ji-pairs" class="space-y-2"></div>
+                <button id="ji-add-pair" class="jf-btn-ghost !py-1.5 !px-3 text-xs mt-3" onclick="jiAddPair()">${t('jellyfin_import.add_pair')}</button>
+                <div id="ji-unpaired" class="mt-3 space-y-1"></div>
+            </div>
+            <div>
+                <h4 class="font-semibold text-white text-sm mb-2">${t('jellyfin_import.users_title')}</h4>
+                <div id="ji-users" class="space-y-2"></div>
+            </div>
+            <div id="ji-counts" class="space-y-1 text-xs text-white/70"></div>
+            <div id="ji-samples" class="space-y-1"></div>
+            <button id="ji-run-btn" class="jf-btn-primary !py-2 !px-4 text-sm" onclick="jiRun()">${t('jellyfin_import.run')}</button>
+        </div>
+
+        <div id="ji-progress" class="hidden jf-settings-card space-y-3">
+            <p id="ji-progress-text" class="text-sm text-white"></p>
+            <div id="ji-progress-detail">
+                <div class="h-2 rounded-full bg-white/10 overflow-hidden"><div id="ji-bar" class="h-2 bg-[#00a4dc]" style="width: 0%"></div></div>
+                <p id="ji-progress-count" class="text-xs text-white/50 mt-2"></p>
+            </div>
+        </div>
+
+        <div id="ji-result" class="hidden jf-settings-card space-y-4">
+            <p id="ji-result-text" class="text-sm font-semibold text-white"></p>
+            <div id="ji-result-report" class="space-y-2 text-xs text-white/70"></div>
+            <div id="ji-codes-box" class="hidden rounded-xl border border-amber-400/40 bg-amber-500/10 p-4 space-y-3">
+                <h4 class="font-bold text-amber-300 text-sm">${t('jellyfin_import.codes_title')}</h4>
+                <p class="text-xs font-semibold text-amber-200">${t('jellyfin_import.codes_warning')}</p>
+                <table id="ji-codes" class="w-full text-sm"></table>
+                <button id="ji-copy-codes" class="jf-btn-primary !py-2 !px-4 text-sm" onclick="jiCopyCodes()">${t('jellyfin_import.copy_codes')}</button>
+            </div>
+            <p id="ji-former-admins" class="hidden text-xs text-amber-300"></p>
+        </div>
+
+        <div id="ji-pending" class="jf-settings-card">
+            <h4 class="font-semibold text-white text-sm">${t('jellyfin_import.pending_title')}</h4>
+            <p class="text-xs text-white/50 mb-3">${t('jellyfin_import.pending_help')}</p>
+            <div id="ji-pending-list"></div>
+        </div>
+    </div>`;
+}
+
+function jiPairRowHtml(from, to) {
+    return `
+    <div class="ji-pair flex items-center gap-2">
+        <input type="text" class="ji-from jf-input flex-1 font-mono text-xs" placeholder="${escapeHtml(t('jellyfin_import.pair_from'))}" value="${escapeHtml(from)}">
+        <span class="text-white/40 text-xs">→</span>
+        <input type="text" class="ji-to jf-input flex-1 font-mono text-xs" placeholder="${escapeHtml(t('jellyfin_import.pair_to'))}" value="${escapeHtml(to)}">
+        <button type="button" class="ji-pair-remove jf-btn-ghost !py-1 !px-2 text-xs" title="${escapeHtml(t('jellyfin_import.remove_pair'))}" onclick="this.closest('.ji-pair').remove()">×</button>
+    </div>`;
+}
+
+function jiAddPair() {
+    $('ji-pairs').insertAdjacentHTML('beforeend', jiPairRowHtml('', ''));
+}
+
+// The pairs with both sides filled, trimmed.
+function jiPairs() {
+    return [...document.querySelectorAll('#ji-pairs .ji-pair')]
+        .map(row => ({ From: row.querySelector('.ji-from').value.trim(), To: row.querySelector('.ji-to').value.trim() }))
+        .filter(p => p.From && p.To);
+}
+
+// Preview and Run send the folder, layout and metadata mode; once a preview is on screen they also send the pairs, the checked users, the ticked matches and the "Import into my account" pick (IntoMyAccount).
+function jiRequest() {
+    const req = { SourcePath: $('ji-source').value.trim(), Layout: $('ji-layout').value, MetadataMode: $('ji-metadata').value };
+    if (jiPreviewed) {
+        req.PathMappings = jiPairs();
+        req.UserIds = [...document.querySelectorAll('#ji-users .ji-user:checked:not(:disabled)')].map(el => el.value);
+        req.ConfirmedMatches = [...document.querySelectorAll('#ji-users .ji-confirm:checked:not(:disabled)')]
+            .map(el => ({ JellyfinId: el.value, UserId: el.dataset.userId }));
+        if (jiMine) req.IntoMyAccount = jiMine;
+    }
+    return req;
+}
+
+function jiBusy(busy) {
+    ['ji-preview-btn', 'ji-run-btn'].forEach(id => { const b = $(id); if (b) b.disabled = busy; });
+}
+
+function jiShowError(message) {
+    $('ji-error').textContent = message;
+    show('ji-error');
+}
+
+// A changed folder or layout forgets the preview, its pairs and the checkbox choices.
+function jiForget() {
+    jiPreviewed = false;
+    jiChoice.clear();
+    jiConfirm.clear();
+    jiMine = '';
+    $('ji-pairs').innerHTML = '';
+    $('ji-users').innerHTML = '';
+    hide('ji-preview');
+}
+
+// Same JellyfinId, ignoring hyphens and case (user ids come both ways). Empty ids never match.
+function jiSameId(a, b) {
+    return !!a && !!b && oidcAccountKey(a) === oidcAccountKey(b);
+}
+
+// A row's action as Run will see it. An unpicked row is skipped; the "Import into my account" row
+// is Import into your account; a row whose name matches the caller's account is skipped while
+// jiMine is set (that account takes the other user's data); a name match goes in only when ticked;
+// other rows keep the last Preview's text.
+function jiRowText(row) {
+    const action = row.querySelector('.ji-action');
+    const user = row.querySelector('.ji-user');
+    const confirm = row.querySelector('.ji-confirm');
+    if (confirm) confirm.disabled = jiSameId(user.value, jiMine);
+    if (!user.checked) action.textContent = jiActionText({ Action: 'Skip', Reason: 'NotSelected' });
+    else if (jiSameId(user.value, jiMine)) action.textContent = t('jellyfin_import.action_into_mine');
+    else if (jiMine && confirm && jiSameId(confirm.dataset.userId, API.userId)) action.textContent = jiActionText({ Action: 'Skip', Reason: 'AccountTakenByIntoMyAccount' });
+    else if (!confirm) action.textContent = action.dataset.text;
+    else action.textContent = jiActionText(confirm.checked ? { Action: 'Match' } : { Action: 'Skip', Reason: 'NotConfirmed' });
+}
+
+// Re-runs the text only of rows the pick changes: the old pick's row, the new pick's row and rows
+// whose confirm box names the caller. Other rows keep the server's text.
+function jiRefreshMine(old) {
+    document.querySelectorAll('#ji-users .ji-user').forEach(el => {
+        const row = el.closest('div');
+        const confirm = row.querySelector('.ji-confirm');
+        if (jiSameId(el.value, old) || jiSameId(el.value, jiMine) || (confirm && jiSameId(confirm.dataset.userId, API.userId))) jiRowText(row);
+    });
+}
+
+function jiSetMine(id) {
+    const old = jiMine;
+    jiMine = id;
+    if (id) {
+        const box = [...document.querySelectorAll('#ji-users .ji-user')].find(el => el.value === id);
+        if (box) box.checked = true;
+        jiChoice.set(id, true);
+    }
+    jiRefreshMine(old);
+}
+
+function jiSetChoice(el) {
+    jiChoice.set(el.value, el.checked);
+    if (!el.checked && jiSameId(el.value, jiMine)) {
+        const old = jiMine;
+        jiMine = '';
+        $('ji-mine').value = '';
+        jiRefreshMine(old);
+    } else {
+        jiRowText(el.closest('div'));
+    }
+}
+
+function jiSetConfirm(el) {
+    if (el.checked) jiConfirm.set(el.value, el.dataset.userId);
+    else jiConfirm.delete(el.value);
+    jiRowText(el.closest('div'));
+}
+
+async function jiPreview() {
+    const btn = $('ji-preview-btn');
+    btn.disabled = true;
+    btn.textContent = t('jellyfin_import.previewing');
+    hide('ji-error');
+    try {
+        jiRenderPreview(await API.jellyfinImportPreview(jiRequest()));
+    } catch (err) {
+        jiShowError(err.message);
+    } finally {
+        btn.disabled = jiRunning;
+        btn.textContent = t('jellyfin_import.preview');
+    }
+}
+
+function jiRenderPreview(r) {
+    jiPreviewed = true;
+    $('ji-found').innerHTML = t('jellyfin_import.found', { layout: t(jiLayoutKeys[r.Layout]), path: escapeHtml(r.DataPath) });
+    $('ji-pairs').innerHTML = (r.PathMappings || []).map(m => jiPairRowHtml(m.From, m.To)).join('');
+    $('ji-unpaired').innerHTML = jiUnpairedHtml(r);
+    $('ji-users').innerHTML = jiUsersHtml(r.Users || []);
+    $('ji-counts').innerHTML = jiCountsHtml(r);
+    $('ji-samples').innerHTML = jiSamplesHtml(r);
+    show('ji-preview');
+}
+
+// The "Import into my account" picker sits above the rows; its hint shows only when no selected row
+// is name-matched to the caller's own account.
+function jiUsersHtml(users) {
+    if (!users.length) return '';
+    const ownNameMatched = users.some(u => u.SuggestedMatch && jiSameId(u.SuggestedMatch.UserId, API.userId));
+    const picker = `
+    <div class="flex flex-wrap items-center gap-2 text-sm text-white">
+        <label for="ji-mine" class="text-xs font-semibold text-white/70">${t('jellyfin_import.into_mine')}</label>
+        <select id="ji-mine" class="jf-input text-xs" onchange="jiSetMine(this.value)">
+            <option value="">${t('jellyfin_import.into_mine_none')}</option>
+            ${users.filter(u => u.Reason !== 'Ambiguous').map(u => `<option value="${escapeHtml(u.JellyfinId)}" ${jiSameId(u.JellyfinId, jiMine) ? 'selected' : ''}>${escapeHtml(u.Name)}</option>`).join('')}
+        </select>
+    </div>${ownNameMatched ? '' : `
+    <p class="text-xs text-white/50">${t('jellyfin_import.into_mine_hint')}</p>`}`;
+    return picker + users.map(u => {
+        const ambiguous = u.Reason === 'Ambiguous';
+        const checked = !ambiguous && (jiChoice.has(u.JellyfinId) ? jiChoice.get(u.JellyfinId) : true);
+        // The row's text without the choice: an "Import into my account" row without a name match is a Create.
+        const plainText = u.MatchKind === 'IntoMyAccount' && !u.SuggestedMatch ? jiActionText({ Action: 'Create' }) : jiActionText(u);
+        return `
+        <div>
+            <label class="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm text-white">
+                <input type="checkbox" class="ji-user" value="${escapeHtml(u.JellyfinId)}" onchange="jiSetChoice(this)" ${checked ? 'checked' : ''} ${ambiguous ? 'disabled' : ''}>
+                <span class="font-semibold">${escapeHtml(u.Name)}</span>
+                ${u.WasAdministrator ? `<span class="jf-badge text-[10px]">${t('jellyfin_import.was_admin')}</span>` : ''}
+                <span class="ji-action text-xs text-white/50" data-text="${escapeHtml(plainText)}">${jiActionText(u)}</span>
+            </label>${jiConfirmHtml(u)}
+        </div>`;
+    }).join('');
+}
+
+// The import page's one date style, with the time, escaped.
+function jiDate(iso) {
+    return escapeHtml(new Date(iso).toLocaleString(uiLocale(), { dateStyle: 'medium', timeStyle: 'short' }));
+}
+
+// A name match goes into the existing account only when its box is ticked. It starts unticked, and
+// stays ticked only while the suggestion names the same account. Account names are escaped.
+function jiConfirmHtml(u) {
+    const s = u.SuggestedMatch;
+    if (!s) return '';
+    const checked = jiConfirm.get(u.JellyfinId) === s.UserId;
+    const facts = [
+        s.IsAdministrator ? t('jellyfin_import.match_admin') : '',
+        t('jellyfin_import.match_created', { date: jiDate(s.CreatedAt) }),
+        s.LastLoginDate ? t('jellyfin_import.match_last_login', { date: jiDate(s.LastLoginDate) }) : t('jellyfin_import.match_never_signed_in'),
+        s.SetupCodePending ? t('jellyfin_import.match_setup_pending') : '',
+    ].filter(Boolean).join(' · ');
+    const others = s.OtherCaseNames || [];
+    return `
+            <label class="flex items-center gap-2 ml-7 mt-1 text-xs text-white/70">
+                <input type="checkbox" class="ji-confirm" value="${escapeHtml(u.JellyfinId)}" data-user-id="${escapeHtml(s.UserId)}" onchange="jiSetConfirm(this)" ${checked ? 'checked' : ''} ${jiSameId(u.JellyfinId, jiMine) ? 'disabled' : ''}>
+                <span>${t('jellyfin_import.confirm_match', { name: escapeHtml(s.Name) })}</span>
+            </label>
+            <p class="ml-7 text-xs text-white/40">${facts}</p>${others.length > 0 ? `
+            <p class="ml-7 text-xs text-amber-400">${t('jellyfin_import.match_other_case', { names: others.map(escapeHtml).join(', ') })}</p>` : ''}`;
+}
+
+// "Action", or "Action: reason" when there is a reason. The translations are static text.
+function jiActionText(u) {
+    if (u.MatchKind === 'IntoMyAccount') return t('jellyfin_import.action_into_mine');
+    const action = t(jiActionKeys[u.Action]);
+    return u.Reason ? `${action}: ${t(jiReasonKeys[u.Reason])}` : action;
+}
+
+// Counts are numbers and are not escaped: escapeHtml(0) would be ''.
+function jiCountsHtml(r) {
+    const { Items: i, WatchData: w, Tracks: k, Metadata: m } = r;
+    let metadata = '';
+    if (m && m.Mode === 'None') {
+        metadata = `<p>${t('jellyfin_import.metadata_summary_none')}</p>`;
+    } else if (m) {
+        metadata = `<p>${t('jellyfin_import.metadata_summary', { mode: t(jiMetadataModeKeys[m.Mode]), items: m.Items, fields: m.Fields, people: m.People, images: m.Images, missing: m.ImagesMissing, locked: m.Locked })}</p>`;
+    }
+    return `
+        <p class="text-white/40">${t('jellyfin_import.counts_from_preview')}</p>
+        <p>${t('jellyfin_import.items_summary', { total: i.Total, by_path: i.MatchedByPath, by_id: i.MatchedById, unmatched: i.Unmatched })}</p>
+        <p>${t('jellyfin_import.watch_summary', { rows: w.Rows, imported: w.Imported, unchanged: w.Unchanged, unmatched: w.Unmatched })}</p>
+        <p>${t('jellyfin_import.tracks_summary', { audio: k.Audio, subtitle: k.Subtitle, off: k.SubtitleOff, unmapped: k.Unmapped })}</p>${metadata}`;
+}
+
+function jiUnpairedHtml(r) {
+    const paths = r.UnpairedLibraryPaths || [];
+    if (!paths.length) return '';
+    return `
+        <p class="text-xs text-amber-300">${t('jellyfin_import.unpaired')}</p>
+        <ul class="font-mono text-[11px] text-white/60 space-y-0.5">${paths.map(p => `<li>${escapeHtml(p)}</li>`).join('')}</ul>`;
+}
+
+function jiSamplesHtml(r) {
+    const samples = r.Items.UnmatchedSamples || [];
+    if (!samples.length) return '';
+    return `
+        <p class="text-xs font-semibold text-white/70 mt-2">${t('jellyfin_import.samples_title')}</p>
+        <ul class="text-xs text-white/60 space-y-0.5">${samples.map(s => `<li>${escapeHtml(s.Type)} · ${escapeHtml(s.Name)} · <span class="font-mono text-[11px]">${escapeHtml(s.Path)}</span></li>`).join('')}</ul>`;
+}
+
+// A finished run's action. Any administrator may read it, so another administrator's "Import into my
+// account" names the account (`name`, escaped); otherwise it is jiActionText.
+function jiResultText(u, name) {
+    if (!name) return jiActionText(u);
+    if (u.MatchKind === 'IntoMyAccount') return t('jellyfin_import.action_into_account', { name });
+    if (u.Reason === 'AccountTakenByIntoMyAccount') return `${t(jiActionKeys.Skip)}: ${t('jellyfin_import.reason_taken_by_account', { name })}`;
+    return jiActionText(u);
+}
+
+function jiUserActionsHtml(users) {
+    if (!users.length) return '';
+    const pick = users.find(u => u.MatchKind === 'IntoMyAccount' && u.TargetAccount);
+    const name = pick && !jiSameId(pick.TargetAccount.UserId, API.userId) ? escapeHtml(pick.TargetAccount.Name) : '';
+    return `
+        <p class="font-semibold text-white/80">${t('jellyfin_import.users_title')}</p>
+        <ul class="space-y-0.5">${users.map(u => `<li><span class="text-white">${escapeHtml(u.Name)}</span>${u.WasAdministrator ? ` <span class="jf-badge text-[10px]">${t('jellyfin_import.was_admin')}</span>` : ''} · ${jiResultText(u, name)}</li>`).join('')}</ul>`;
+}
+
+async function jiRun() {
+    const req = jiRequest();
+    jiBusy(true);
+    hide('ji-error');
+    try {
+        await API.jellyfinImportRun(req);
+    } catch (err) {
+        jiShowError(err.message);
+        jiBusy(false);
+        return;
+    }
+    jiRunning = true;
+    jiShowProgress({ Stage: null, Done: 0, Total: 0 });
+    jiPoll();
+}
+
+// Running: the stage, or "starting" before the first one; a bar and a count when the total is known.
+function jiShowProgress(st) {
+    show('ji-progress');
+    hide('ji-result');
+    $('ji-progress-text').innerHTML = st.Stage
+        ? t('jellyfin_import.running', { stage: t(jiStageKeys[st.Stage]) })
+        : t('jellyfin_import.starting');
+    if (st.Total > 0) {
+        $('ji-bar').style.width = `${Math.min(100, Math.round(100 * st.Done / st.Total))}%`;
+        $('ji-progress-count').innerHTML = t('jellyfin_import.progress', { done: st.Done, total: st.Total });
+        show('ji-progress-detail');
+    } else {
+        hide('ji-progress-detail');
+    }
+}
+
+// Completed: the report and the new users' codes (the first read after completion carries them). Failed: the error.
+function jiShowResult(st) {
+    hide('ji-progress');
+    if (st.State === 'Failed') {
+        show('ji-result');
+        $('ji-result-text').innerHTML = t('jellyfin_import.failed', { error: escapeHtml(st.Error) });
+        $('ji-result-report').innerHTML = '';
+        hide('ji-codes-box');
+        hide('ji-former-admins');
+        return;
+    }
+    if (st.State !== 'Completed' || !st.Result) {
+        hide('ji-result');
+        return;
+    }
+    const r = st.Result;
+    const users = r.Users || [];
+    show('ji-result');
+    $('ji-result-text').innerHTML = t('jellyfin_import.done');
+    $('ji-result-report').innerHTML = jiCountsHtml(r) + jiUnpairedHtml(r) + jiSamplesHtml(r) + jiUserActionsHtml(users);
+    const coded = users.filter(u => u.Code);
+    $('ji-codes').innerHTML = coded.map(u => `
+        <tr><td class="py-1 pr-4 text-white">${escapeHtml(u.Name)}</td><td class="ji-code py-1 font-mono select-all text-amber-200">${escapeHtml(u.Code)}</td></tr>`).join('');
+    if (coded.length) show('ji-codes-box');
+    else hide('ji-codes-box');
+    const admins = users.filter(u => u.Action === 'Create' && u.WasAdministrator);
+    $('ji-former-admins').innerHTML = t('jellyfin_import.former_admins', { names: admins.map(u => escapeHtml(u.Name)).join(', ') });
+    if (admins.length) show('ji-former-admins');
+    else hide('ji-former-admins');
+}
+
+// One loop: read the status and show it; while it runs, the next read follows in one second.
+async function jiPoll() {
+    clearTimeout(jiTimer);
+    jiTimer = null;
+    if (!$('admin-import')) return; // the panel left the page
+    let st;
+    try {
+        st = await API.jellyfinImportStatus();
+    } catch (err) {
+        jiShowError(err.message);
+        if (jiRunning) jiSchedule();
+        return;
+    }
+    hide('ji-error');
+    const wasRunning = jiRunning;
+    jiRunning = st.State === 'Running';
+    if (jiRunning) {
+        jiBusy(true);
+        jiShowProgress(st);
+        jiSchedule();
+        return;
+    }
+    jiBusy(false);
+    jiShowResult(st);
+    if (wasRunning) jiLoadPending();
+}
+
+function jiSchedule() {
+    clearTimeout(jiTimer);
+    jiTimer = $('admin-import') ? setTimeout(jiPoll, 1000) : null;
+}
+
+async function jiLoadPending() {
+    try {
+        jiRenderPending(await API.jellyfinImportPendingUsers());
+    } catch (err) {
+        jiShowError(err.message);
+    }
+}
+
+function jiRenderPending(users) {
+    const list = $('ji-pending-list');
+    if (!list) return;
+    jiPendingNames = new Map(users.map(u => [u.UserId, u.Name]));
+    for (const id of [...jiShownCodes.keys()]) {
+        if (!jiPendingNames.has(id)) jiShownCodes.delete(id);
+    }
+    list.innerHTML = users.length
+        ? users.map(u => jiPendingRowHtml(u)).join('')
+        : `<p class="text-xs text-white/50">${t('jellyfin_import.pending_none')}</p>`;
+}
+
+function jiPendingRowHtml(u) {
+    const shown = jiShownCodes.get(u.UserId);
+    const action = shown
+        ? jiCodeLineHtml(shown.name, shown.code)
+        : `<button class="jf-btn-ghost !py-1.5 !px-3 text-xs ji-new-code" data-user-id="${escapeHtml(u.UserId)}" onclick="jiNewCode(this)">${t('jellyfin_import.new_code')}</button>`;
+    return `
+        <div class="ji-pending-row flex flex-wrap items-center justify-between gap-3 py-3 border-b border-white/5">
+            <div>
+                <p class="text-sm font-semibold text-white">${escapeHtml(u.Name)}</p>
+                <p class="text-xs text-white/40">${t('jellyfin_import.pending_since', { date: jiDate(u.CreatedAt) })}</p>
+            </div>
+            <div class="ji-row-action">${action}</div>
+        </div>`;
+}
+
+function jiCodeLineHtml(name, code) {
+    return `
+        <p class="text-xs text-amber-300">${t('jellyfin_import.new_code_shown', { name: escapeHtml(name) })}</p>
+        <div class="ji-code font-mono text-sm text-amber-200 select-all">${escapeHtml(code)}</div>`;
+}
+
+async function jiNewCode(btn) {
+    const id = btn.dataset.userId;
+    const name = jiPendingNames.get(id) || '';
+    if (!confirm(t('jellyfin_import.new_code_confirm', { name }))) return;
+    try {
+        const res = await API.jellyfinImportNewCode(id);
+        const shownName = res.Name || name;
+        jiShownCodes.set(id, { name: shownName, code: res.Code });
+        const cell = btn.closest('.ji-row-action');
+        if (cell) cell.innerHTML = jiCodeLineHtml(shownName, res.Code);
+    } catch (err) {
+        toast(err.message, 'error');
+        if (err.status === 409) {
+            jiShownCodes.delete(id);
+            jiLoadPending();
+        }
+    }
+}
+
+async function jiCopyCodes() {
+    const table = $('ji-codes');
+    if (window.isSecureContext && navigator.clipboard) {
+        try {
+            const text = [...table.rows].map(row => `${row.cells[0].textContent}\t${row.cells[1].textContent}`).join('\n');
+            await navigator.clipboard.writeText(text);
+            toast(t('jellyfin_import.copied'));
+            return;
+        } catch (err) {
+            // Not allowed here: fall through and select the codes.
+        }
+    }
+    window.getSelection().selectAllChildren(table);
+    toast(t('jellyfin_import.copy_manually'));
+}
+
+// Opening the tab reloads the pending users. The status is read once per rendered panel, so
+// switching tabs never re-renders a result or drops a code on screen.
+async function loadJellyfinImport() {
+    const panel = $('admin-import');
+    if (!panel) return;
+    const first = !panel.dataset.loaded;
+    panel.dataset.loaded = '1';
+    if (first) {
+        // A new panel has no preview on screen, so the old pairs, choices and codes go.
+        jiPreviewed = false;
+        jiChoice.clear();
+        jiConfirm.clear();
+        jiMine = '';
+        jiShownCodes.clear();
+    }
+    jiLoadPending();
+    if (first) await jiPoll();
 }
 
 // --- Scheduled Tasks UI ---
@@ -2472,11 +3955,11 @@ function renderTaskCard(task) {
                 ${progressHtml}
                 <div class="flex items-center gap-2 mt-3">
                     ${isRunning || isCancelling ? `
-                        <button class="jf-btn-danger text-xs !py-1.5 !px-3" onclick="stopTaskAction('${escapeHtml(id)}', '${escapeHtml(name)}')">
+                        <button class="jf-btn-danger text-xs !py-1.5 !px-3" data-action="stop-task" data-id="${escapeHtml(id)}" data-name="${escapeHtml(name)}">
                             ${t('admin.stop')}
                         </button>
                     ` : `
-                        <button class="jf-btn-primary text-xs !py-1.5 !px-3" onclick="startTaskAction('${escapeHtml(id)}', '${escapeHtml(name)}')">
+                        <button class="jf-btn-primary text-xs !py-1.5 !px-3" data-action="start-task" data-id="${escapeHtml(id)}" data-name="${escapeHtml(name)}">
                             ${t('admin.start')}
                         </button>
                     `}
@@ -2561,41 +4044,44 @@ async function loadSidebar() {
         return;
     }
     show('sidebar');
+    if (API.isAdmin) {
+        show('sidebar-add-lib');
+        show('sidebar-admin-section');
+    } else {
+        hide('sidebar-add-lib');
+        hide('sidebar-admin-section');
+    }
+    let libs;
     try {
-        libraries = await API.getLibraries();
-        const list = $('sidebar-lib-list');
-        if (!list) return;
-        list.innerHTML = '';
-        const icons = {
-            movies: '🎬', tvshows: '📺', music: '🎵', photos: '🖼️', mixed: '📁',
-            Movies: '🎬', TvShows: '📺', Music: '🎵', Photos: '🖼️', Mixed: '📁'
-        };
-        libraries.forEach(lib => {
-            const id = lib.id || lib.Id;
-            const name = lib.name || lib.Name;
-            const type = lib.content_type || lib.ContentType || 'Mixed';
-            const isScanning = scanStatuses[id];
-            list.innerHTML += `
+        libs = await API.getLibraries();
+    } catch (err) {
+        toast(t('library.list_failed', { message: err.message }), 'error');
+        return;
+    }
+    libraries = libs;
+    const list = $('sidebar-lib-list');
+    if (!list) return;
+    list.innerHTML = '';
+    const icons = {
+        movies: '🎬', tvshows: '📺', music: '🎵', photos: '🖼️', mixed: '📁',
+        Movies: '🎬', TvShows: '📺', Music: '🎵', Photos: '🖼️', Mixed: '📁'
+    };
+    libraries.forEach(lib => {
+        const id = lib.id || lib.Id;
+        const name = lib.name || lib.Name;
+        const type = lib.content_type || lib.ContentType || 'Mixed';
+        list.innerHTML += `
             <div class="flex items-center gap-1 group">
-                <a onclick="navigate('library','${id}')" class="jf-drawer-item ${currentLibraryId === id && currentPage === 'library' ? 'active' : ''} flex-1">
+                <a data-action="navigate" data-page="library" data-id="${escapeHtml(id)}" class="jf-drawer-item ${currentLibraryId === id && currentPage === 'library' ? 'active' : ''} flex-1">
                     <span class="text-base">${icons[type] || '📁'}</span>
                     <span class="truncate">${escapeHtml(name)}</span>
-                    ${isScanning ? '<span class="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse ml-1 flex-shrink-0"></span>' : ''}
+                    ${scanRing(id, name)}
                 </a>
-                <button type="button" class="jf-icon-btn !w-6 !h-6 text-white/20 hover:text-white opacity-0 group-hover:opacity-100 transition flex-shrink-0" onclick="API.scanLibrary('${id}').then(()=>toast(t('library.scan_started_for', { name: '${escapeHtml(name)}' })))" title="${escapeHtml(t('library.scan_library'))}">
+                <button type="button" class="jf-icon-btn !w-6 !h-6 text-white/20 hover:text-white opacity-0 group-hover:opacity-100 transition flex-shrink-0" data-action="scan-library" data-id="${escapeHtml(id)}" data-name="${escapeHtml(name)}" title="${escapeHtml(t('library.scan_library'))}">
                     <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
                 </button>
             </div>`;
-        });
-
-        if (API.isAdmin) {
-            show('sidebar-add-lib');
-            show('sidebar-admin-section');
-        } else {
-            hide('sidebar-add-lib');
-            hide('sidebar-admin-section');
-        }
-    } catch {}
+    });
 }
 
 // --- Add Library Modal Handlers ---
@@ -2629,32 +4115,82 @@ function closeAddLibrary() {
     }
 }
 
+async function deleteLibraryFromAdmin(id) {
+    if (!confirm(t('admin.remove_library_confirm'))) return;
+    try {
+        await API.deleteLibrary(id);
+    } catch (err) {
+        toast(t('library.delete_failed', { message: err.message }), 'error');
+        return;
+    }
+    await loadSidebar();
+    renderAdmin();
+}
+
+// Saves the checkbox's new state; a failure puts the checkbox back and shows a toast
+async function toggleRealtimeMonitor(el) {
+    const enabled = el.checked;
+    el.disabled = true;
+    try {
+        const options = await API.getLibraryOptions(el.dataset.id);
+        await API.saveLibraryOptions(el.dataset.id, { ...options, EnableRealtimeMonitor: enabled });
+    } catch (err) {
+        el.checked = !enabled;
+        toast(t('admin.realtime_monitor_failed', { message: err.message }), 'error');
+    } finally {
+        el.disabled = false;
+    }
+}
+
 // Directory picker state
 let directoryPickerPath = '/';
 let directoryPickerHistory = ['/'];
 let selectedLibraryPaths = [];
+
+// Shows a message inside the add-library dialog; an empty message hides the box
+function setAddLibraryError(message) {
+    const el = $('add-lib-error');
+    if (!el) return;
+    el.textContent = message || '';
+    el.classList.toggle('hidden', !message);
+}
 
 async function submitAddLibrary(e) {
     e.preventDefault();
     const f = e.target;
     const name = f.name.value.trim();
     const type = f.type.value;
-    // Combine selected paths from picker with manual input
+    // The chosen folders, the typed paths and, while the picker is open, the folder it shows (unless it is still at "/")
     const manualPaths = f.paths.value.split(',').map(p => p.trim()).filter(Boolean);
     const paths = [...new Set([...selectedLibraryPaths, ...manualPaths])];
+    const picker = $('directory-picker');
+    const pickerPath = picker && !picker.classList.contains('hidden') ? directoryPickerFieldPath() : '';
+    if (pickerPath && pickerPath !== '/' && !paths.includes(pickerPath)) paths.push(pickerPath);
+    const submitBtn = $('add-lib-submit');
 
+    setAddLibraryError('');
     if (!name || !paths.length) {
-        toast(t('library.name_and_path_required'), 'error');
+        setAddLibraryError(t('library.name_and_path_required'));
         return;
     }
+    let lib;
+    if (submitBtn) submitBtn.disabled = true;
     try {
-        const lib = await API.createLibrary(name, type, paths);
-        toast(t('library.created', { name }));
-        closeAddLibrary();
-        // Reset selected paths
-        selectedLibraryPaths = [];
-        // Auto-start scan after creating library
-        API.scanLibrary(lib.id || lib.Id).catch(() => {});
+        lib = await API.createLibrary(name, type, paths, { EnableRealtimeMonitor: f.realtimeMonitor.checked });
+    } catch (err) {
+        setAddLibraryError(t('library.create_failed', { message: err.message }));
+        return;
+    } finally {
+        if (submitBtn) submitBtn.disabled = false;
+    }
+    toast(t('library.created', { name }));
+    closeAddLibrary();
+    // Reset selected paths
+    selectedLibraryPaths = [];
+    // Auto-start scan after creating library
+    API.scanLibrary(lib.id || lib.Id).catch(err => toast(t('library.scan_start_failed', { message: err.message }), 'error'));
+    // The library exists at this point, so a reload error is not a creation failure: toast it as before
+    try {
         await loadSidebar();
         if (currentPage === 'admin') renderAdmin();
         else if (currentPage === 'home') renderHome();
@@ -2668,17 +4204,13 @@ async function openDirectoryPicker() {
     directoryPickerPath = '/';
     directoryPickerHistory = ['/'];
     const picker = $('directory-picker');
-    const input = $('add-lib-path-input');
     if (picker) picker.classList.remove('hidden');
-    if (input) input.classList.add('hidden');
     await loadDirectoryList('/');
 }
 
 function closeDirectoryPicker() {
     const picker = $('directory-picker');
-    const input = $('add-lib-path-input');
     if (picker) picker.classList.add('hidden');
-    if (input) input.classList.remove('hidden');
 }
 
 function directoryPickerBack() {
@@ -2691,8 +4223,8 @@ function directoryPickerBack() {
 
 async function loadDirectoryList(path) {
     const list = $('directory-picker-list');
-    const pathLabel = $('directory-picker-path');
-    if (pathLabel) pathLabel.textContent = path;
+    const pathField = $('directory-picker-path');
+    if (pathField) pathField.value = path;
     if (!list) return;
 
     list.innerHTML = '<div class="p-3 text-center text-white/40 text-xs"><div class="w-4 h-4 border-2 border-[#00a4dc] border-t-transparent rounded-full animate-spin mx-auto"></div></div>';
@@ -2708,7 +4240,7 @@ async function loadDirectoryList(path) {
         // Parent navigation (unless root)
         if (path !== '/') {
             const parent = path.split('/').slice(0, -1).join('/') || '/';
-            html += `<button type="button" class="w-full text-left px-3 py-2 text-xs text-white/60 hover:bg-white/5 flex items-center gap-2 rounded" onclick="navigateDirectoryPicker('${parent}')">
+            html += `<button type="button" class="w-full text-left px-3 py-2 text-xs text-white/60 hover:bg-white/5 flex items-center gap-2 rounded" data-action="dir-open" data-path="${escapeHtml(parent)}">
                 <span>📁</span> <span>…</span> <span class="text-white/30 text-[10px] ml-auto">${t('library.parent_folder')}</span>
             </button>`;
         }
@@ -2720,14 +4252,10 @@ async function loadDirectoryList(path) {
                     <span class="text-white/30 text-[10px] ml-auto">${t('library.no_access')}</span>
                 </div>`;
             } else {
-                // Click navigates into the directory, double-click or button selects it
-                const escapedPath = dir.path.replace(/'/g, "\\'");
-                html += `<div class="flex items-center gap-1">
-                    <button type="button" class="flex-1 text-left px-3 py-2 text-xs text-white hover:bg-white/5 flex items-center gap-2 rounded" onclick="navigateDirectoryPicker('${escapedPath}')">
-                        <span>📁</span> <span class="truncate">${escapeHtml(dir.name)}</span>
-                    </button>
-                    <button type="button" class="px-2 py-2 text-[10px] text-[#00a4dc] hover:text-[#38bdf8] rounded" onclick="selectDirectoryPath('${escapedPath}')" title="${escapeHtml(t('library.select_folder'))}">✓</button>
-                </div>`;
+                // A click opens the folder; "Select this folder" below the list takes the open one
+                html += `<button type="button" class="w-full text-left px-3 py-2 text-xs text-white hover:bg-white/5 flex items-center gap-2 rounded" data-action="dir-open" data-path="${escapeHtml(dir.path)}">
+                    <span>📁</span> <span class="truncate">${escapeHtml(dir.name)}</span>
+                </button>`;
             }
         }
         list.innerHTML = html;
@@ -2742,18 +4270,27 @@ function navigateDirectoryPicker(path) {
     loadDirectoryList(path);
 }
 
-function selectDirectoryPath(path) {
-    if (!selectedLibraryPaths.includes(path)) {
-        selectedLibraryPaths.push(path);
-    }
-    // Update the input field with all selected paths
-    const input = $('add-lib-path-input');
-    if (input) input.value = selectedLibraryPaths.join(', ');
-    // Show selected paths
+// The folder path in the picker's field, without trailing slashes ("/" stays "/")
+function directoryPickerFieldPath() {
+    const value = ($('directory-picker-path')?.value || '').trim();
+    return value.replace(/\/+$/, '') || (value ? '/' : '');
+}
+
+// Enter in the picker's field opens the typed folder instead of submitting the form
+function directoryPickerPathKeydown(e) {
+    if (e.key !== 'Enter') return;
+    e.preventDefault();
+    const path = directoryPickerFieldPath();
+    if (path) navigateDirectoryPicker(path);
+}
+
+// Adds the folder in the picker's field to the chosen paths and closes the picker
+function selectCurrentDirectory() {
+    const path = directoryPickerFieldPath();
+    if (!path) return;
+    if (!selectedLibraryPaths.includes(path)) selectedLibraryPaths.push(path);
     renderSelectedPaths();
-    // Close picker
     closeDirectoryPicker();
-    toast(t('library.path_added', { path }));
 }
 
 function renderSelectedPaths() {
@@ -2766,15 +4303,13 @@ function renderSelectedPaths() {
     container.innerHTML = selectedLibraryPaths.map((p, i) => `
         <div class="flex items-center gap-2 px-2 py-1 rounded bg-[#00a4dc]/10 border border-[#00a4dc]/20">
             <span class="text-xs text-white/70 font-mono truncate flex-1">${escapeHtml(p)}</span>
-            <button type="button" class="text-white/40 hover:text-red-400 text-xs" onclick="removeSelectedPath(${i})">×</button>
+            <button type="button" class="text-white/40 hover:text-red-400 text-xs" data-action="remove-path" data-index="${i}">×</button>
         </div>
     `).join('');
 }
 
 function removeSelectedPath(index) {
     selectedLibraryPaths.splice(index, 1);
-    const input = $('add-lib-path-input');
-    if (input) input.value = selectedLibraryPaths.join(', ');
     renderSelectedPaths();
 }
 
@@ -2782,106 +4317,120 @@ function removeSelectedPath(index) {
 const _origOpenAddLibrary = openAddLibrary;
 openAddLibrary = function() {
     selectedLibraryPaths = [];
+    renderSelectedPaths();
     const picker = $('directory-picker');
     if (picker) picker.classList.add('hidden');
+    setAddLibraryError('');
+    const submitBtn = $('add-lib-submit');
+    if (submitBtn) submitBtn.disabled = false;
     _origOpenAddLibrary();
 };
 
-// --- Scan Progress ---
-let scanProgressTimeout = null;
-
-function showScanProgress(message) {
-    const el = $('scan-progress');
-    const textEl = $('scan-progress-text');
-    if (el) el.classList.remove('hidden');
-    if (textEl) textEl.textContent = message;
-    
-    // Clear any existing timeout
-    if (scanProgressTimeout) {
-        clearTimeout(scanProgressTimeout);
-        scanProgressTimeout = null;
-    }
-}
-
-function hideScanProgress() {
-    const el = $('scan-progress');
-    if (el) el.classList.add('hidden');
-    
-    // Auto-hide after 3 seconds
-    scanProgressTimeout = setTimeout(() => {
-        if (el) el.classList.add('hidden');
-        scanProgressTimeout = null;
-    }, 3000);
-}
-
 // --- WebSocket for scan progress ---
+// The scan progress socket while it connects or is open, or null
+let scanSocket = null;
+// The pending retry timer, or null when no retry is scheduled
+let scanSocketRetry = null;
+// Delay before the next retry in ms; doubles up to 30 s and returns to 1 s when a socket opens
+let scanSocketDelay = 1000;
+// True once the current outage has been logged, so the warning is printed only once
+let scanSocketWarned = false;
+
 function initScanProgressWebSocket() {
     if (typeof WebSocket === 'undefined') return;
-    
+    if (!API.isLoggedIn() || scanSocket || scanSocketRetry) return;
+
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}/websocket?api_key=${API.accessToken}`;
-    
+    const wsUrl = `${protocol}//${window.location.host}/socket?api_key=${encodeURIComponent(API.token)}`;
+
     let ws;
-    let reconnectDelay = 1000;
-    
-    function connect() {
+    try {
+        ws = new WebSocket(wsUrl);
+    } catch (e) {
+        console.error('Opening the scan progress socket failed:', e);
+        return;
+    }
+    scanSocket = ws;
+
+    ws.onopen = () => {
+        scanSocketDelay = 1000;
+        scanSocketWarned = false;
+        // The server then sends one frame per scan in progress, so the map is rebuilt from empty
+        scanStatuses = {};
+        updateScanRings();
+    };
+
+    ws.onmessage = (event) => {
         try {
-            ws = new WebSocket(wsUrl);
-            
-            ws.onmessage = (event) => {
-                try {
-                    const data = JSON.parse(event.data);
-                    if (data.MessageType === 'ScheduledTaskStarted') {
-                        showScanProgress(data.data.Name || t('library.processing'));
-                        // Track per-library scan status
-                        const libId = data.data.ItemId;
-                        if (libId) scanStatuses[libId] = true;
-                        // Refresh tasks tab if visible
-                        if (currentPage === 'admin') refreshTasks();
-                    } else if (data.MessageType === 'ScheduledTaskCompleted') {
-                        // Clear per-library scan status
-                        const libId = data.data.ItemId;
-                        if (libId) delete scanStatuses[libId];
-                        if (data.data.State === 'Completed') {
-                            hideScanProgress();
-                        } else if (data.data.State === 'Failed') {
-                            hideScanProgress();
-                            toast(t('admin.task_failed', { name: data.data.Name || t('admin.task'), error: data.data.Error || t('common.unknown_error') }), 'error');
-                        }
-                        // Refresh tasks tab if visible
-                        if (currentPage === 'admin') refreshTasks();
-                    } else if (data.MessageType === 'LibraryChanged') {
-                        // Library changed - refresh current view if on library page
-                        if (currentPage === 'library' && currentLibraryId) {
-                            setTimeout(() => renderLibrary(currentLibraryId), 500);
-                        } else if (currentPage === 'home') {
-                            setTimeout(() => renderHome(), 500);
-                        }
-                    }
-                } catch (e) {
-                    // Ignore parse errors
+            const data = JSON.parse(event.data);
+            if (data.MessageType === 'ScheduledTaskStarted') {
+                // Refresh tasks tab if visible
+                if (currentPage === 'admin') refreshTasks();
+            } else if (data.MessageType === 'ScheduledTaskCompleted') {
+                const libId = data.ItemId;
+                if (data.State === 'Failed') {
+                    toast(t('admin.task_failed', { name: data.Name || t('admin.task'), error: data.Error || t('common.unknown_error') }), 'error');
+                } else if (data.State === 'Completed' && libId) {
+                    // Name the library; the event's Name is an English server label
+                    const lib = libraries.find(l => (l.id || l.Id) === libId);
+                    toast(lib ? t('library.scan_finished_for', { name: lib.name || lib.Name }) : t('library.scan_finished'));
                 }
-            };
-            
-            ws.onclose = () => {
-                // Reconnect with exponential backoff
-                setTimeout(connect, reconnectDelay);
-                reconnectDelay = Math.min(reconnectDelay * 2, 30000);
-            };
-            
-            ws.onerror = () => {
-                ws.close();
-            };
-            
-            reconnectDelay = 1000;
+                // Refresh tasks tab if visible
+                if (currentPage === 'admin') refreshTasks();
+            } else if (data.MessageType === 'RefreshProgress') {
+                // Scan progress: State "Queued" while it waits its turn, "Active" with each whole percent, "Idle" at "100" when done
+                const id = data.Data?.ItemId;
+                const p = Number(data.Data?.Progress ?? NaN);
+                const state = data.Data?.State;
+                if (id && Number.isFinite(p)) {
+                    // Taken as is, not maxed: a new run of the same library can start lower than the last one
+                    if (state === 'Idle' || p >= 100) delete scanStatuses[id];
+                    else scanStatuses[id] = { percent: p, queued: state === 'Queued' };
+                    updateScanRings(id);
+                }
+            } else if (data.MessageType === 'LibraryChanged') {
+                // Library changed - refresh current view if on library page
+                // Drop the cached lists first, so the re-render is not served from the 30 s cache
+                API.invalidateCache('/Items');
+                API.invalidateCache('/Shows');
+                if (currentPage === 'library' && currentLibraryId) {
+                    setTimeout(() => renderLibrary(currentLibraryId), 500);
+                } else if (currentPage === 'home') {
+                    setTimeout(() => renderHome(), 500);
+                }
+            }
         } catch (e) {
-            // WebSocket not available, silently fail
+            console.error('Handling a server event failed:', e);
         }
-    }
-    
-    if (API.isLoggedIn()) {
-        connect();
-    }
+    };
+
+    ws.onclose = () => {
+        // A socket stopped on purpose is no longer the current one
+        if (scanSocket !== ws) return;
+        scanSocket = null;
+        if (!API.isLoggedIn()) return;
+        if (!scanSocketWarned) {
+            console.warn('Scan progress socket closed, retrying with backoff');
+            scanSocketWarned = true;
+        }
+        // Reconnect with exponential backoff
+        scanSocketRetry = setTimeout(() => {
+            scanSocketRetry = null;
+            initScanProgressWebSocket();
+        }, scanSocketDelay);
+        scanSocketDelay = Math.min(scanSocketDelay * 2, 30000);
+    };
+}
+
+// Called on logout and before a login starts a new socket: closes the socket and cancels any pending retry
+function stopScanProgressWebSocket() {
+    clearTimeout(scanSocketRetry);
+    scanSocketRetry = null;
+    scanSocketDelay = 1000;
+    scanSocketWarned = false;
+    const ws = scanSocket;
+    scanSocket = null;
+    if (ws) ws.close();
 }
 
 // --- Add User Modal Handlers ---
@@ -2960,6 +4509,36 @@ function updateAuthUI() {
         hide('sidebar');
     }
 }
+
+// Reacts to lost administrator rights: hides the admin UI, says so, and leaves the Dashboard.
+function followAdminLoss() {
+    updateAuthUI();
+    toast(t('admin.rights_removed'), 'error');
+    if (currentPage === 'admin') navigate('home');
+}
+API.onAdminLost = followAdminLoss;
+
+// Runs after every sign-out, the user's or a 401's: drops what the signed-out user left in this tab, such as the
+// import page's setup codes and the server log, so the next user can't read them.
+function afterSignOut() {
+    stopScanProgressWebSocket();
+    LiveLog.disconnect();
+    LiveLog.messages = [];
+    jiShownCodes.clear();
+    jiPendingNames = new Map();
+    jiChoice.clear();
+    jiConfirm.clear();
+    jiMine = '';
+    $('page-admin').innerHTML = ''; // the import preview (#ji-users), its codes box and the live log
+    libraries = [];
+    updateAuthUI();
+}
+API.onSignedOut = afterSignOut;
+
+// Another tab signed in or out: reload, so this tab drops the old session's token, cache and pages.
+window.addEventListener('storage', e => {
+    if (e.key === 'rustyfin_token') location.reload();
+});
 
 // --- Live Log Functions ---
 let liveLogInitialized = false;
@@ -3086,6 +4665,9 @@ function handleHash() {
 window.addEventListener('hashchange', handleHash);
 
 document.addEventListener('DOMContentLoaded', async () => {
+    // Every way of closing the player goes through here, so the session is stopped and its position reported once
+    $('player-modal')?.addEventListener('close', () => stopPlayback());
+    window.addEventListener('pagehide', () => stopPlayback());
     updateAuthUI();
     const wizardActive = await checkSetupWizard();
     if (!wizardActive) {

@@ -1,0 +1,8 @@
+{
+  "tracks": [],
+  "trackFiles": [],
+  "isUpgrade": false,
+  "eventType": "ImportFailure",
+  "instanceName": "Lidarr",
+  "applicationUrl": "http://lidarr.lan:8686"
+}
