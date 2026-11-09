@@ -4,9 +4,11 @@ let currentLibraryId = null;
 let currentDetailId = null;
 let libraries = [];
 let wizStep = 0;
-let wizProgress = { configSaved: false, userCreated: false, loggedIn: false, libraryCreated: false };
+let wizProgress = { configSaved: false, userCreated: false, loggedIn: false };
 let wizCredentials = null;
 let wizFinishing = false;
+let wizLibrary = null; // { id, name, type, path } of the library this page created
+let wizListening = false;
 let serverVersion = '0.3.0';
 let playerReportInterval = null;
 let playerHideTimeout = null;
@@ -146,6 +148,12 @@ async function checkSetupWizard() {
             initWizardLanguage();
             show('setup-wizard');
             hide('main-navbar');
+            if (!wizListening) {
+                // Another tab or device may finish the setup while this page waits
+                wizListening = true;
+                window.addEventListener('focus', () => wizLeaveIfDone());
+                document.addEventListener('visibilitychange', () => { if (!document.hidden) wizLeaveIfDone(); });
+            }
             return true;
         }
     } catch (e) { console.warn('Could not read the server info for the setup wizard:', e); }
@@ -171,9 +179,17 @@ function matchMetadataLanguage() {
     if ([...metadataSelect.options].some(o => o.value === lng)) metadataSelect.value = lng;
 }
 
+// The last step index, counted from the DOM so a step added later needs no change here
+function wizLastStep() { return document.querySelectorAll('#setup-wizard .jf-wizard-step').length - 1; }
+
+function wizStepIndexOf(id) {
+    const step = $(id).closest('.jf-wizard-step');
+    return [...document.querySelectorAll('#setup-wizard .jf-wizard-step')].indexOf(step);
+}
+
 function wizSetStep(s) {
     wizStep = s;
-    for (let i = 0; i < 4; i++) {
+    for (let i = 0; i <= wizLastStep(); i++) {
         const el = $('wiz-step-' + i);
         if (el) el.classList.toggle('active', i === s);
         const dot = $('wiz-dot-' + i);
@@ -183,14 +199,61 @@ function wizSetStep(s) {
                 : (i < s ? 'h-2 rounded-full transition-all duration-300 w-4 bg-[#00a4dc]/50' : 'h-2 rounded-full transition-all duration-300 w-2 bg-white/20');
         }
     }
-    if (s === 3) {
+    if (s === wizLastStep()) {
         $('wiz-summary-user').textContent = $('wiz-username').value.trim();
         const langEl = $('wiz-lang');
         $('wiz-summary-lang').textContent = langEl.options[langEl.selectedIndex].text;
+        const libName = $('wiz-lib-name').value.trim(), libPath = $('wiz-lib-path').value.trim();
+        $('wiz-summary-library').textContent = libName && libPath ? `${libName}: ${libPath}` : t('wizard.summary_no_library');
     }
 }
 
+// Closes the wizard when the server reports the setup complete and this page did not create the owner
+// (another tab or device finished it, or this page was loaded before). Answers whether it closed.
+async function wizLeaveIfDone(force = false) {
+    if (wizProgress.userCreated || (wizFinishing && !force) || $('setup-wizard').classList.contains('hidden')) return false;
+    let info;
+    try { info = await API.getPublicInfo(); } catch (e) { return false; }
+    const done = info.StartupWizardCompleted ?? info.startup_wizard_completed ?? false;
+    if (!done) return false;
+    hide('setup-wizard');
+    show('main-navbar');
+    updateAuthUI();
+    toast(t('wizard.already_complete'));
+    if (API.isLoggedIn()) await loadSidebar();
+    navigate(API.isLoggedIn() ? 'home' : 'login');
+    return true;
+}
+
 async function wizNext() {
+    if (await wizLeaveIfDone()) return;
+    if (wizStep === wizStepIndexOf('wiz-lib-path')) {
+        const name = $('wiz-lib-name').value.trim(), path = $('wiz-lib-path').value.trim();
+        if (!name && !path) {
+            hide('wiz-lib-error');
+        } else if (!name || !path) {
+            $('wiz-lib-error').textContent = t('wizard.library_incomplete');
+            show('wiz-lib-error');
+            return;
+        } else if (wizProgress.userCreated && !wizProgress.loggedIn) {
+            // The owner exists but this page has no token, so ValidatePath would answer 401.
+            // Skip the check; Finish's library create checks the path anyway.
+            hide('wiz-lib-error');
+        } else {
+            const nextBtn = document.querySelector('#wiz-step-' + wizStep + ' .jf-btn-primary');
+            nextBtn.disabled = true;
+            try {
+                await API.validatePath(path);
+                hide('wiz-lib-error');
+            } catch (e) {
+                $('wiz-lib-error').textContent = e.message;
+                show('wiz-lib-error');
+                return;
+            } finally {
+                nextBtn.disabled = false;
+            }
+        }
+    }
     if (wizStep === 1) {
         const pw = $('wiz-password').value, pw2 = $('wiz-password2').value;
         const user = $('wiz-username').value.trim();
@@ -206,11 +269,19 @@ async function wizNext() {
         }
         hide('wiz-user-error');
     }
-    wizSetStep(Math.min(wizStep + 1, 3));
+    wizSetStep(Math.min(wizStep + 1, wizLastStep()));
 }
 
-function wizPrev() {
+async function wizPrev() {
+    if (await wizLeaveIfDone()) return;
     wizSetStep(Math.max(wizStep - 1, 0));
+}
+
+function wizSkipLibrary() {
+    $('wiz-lib-name').value = '';
+    $('wiz-lib-path').value = '';
+    hide('wiz-lib-error');
+    wizNext();
 }
 
 async function wizComplete() {
@@ -226,6 +297,7 @@ async function wizComplete() {
     try {
         btn.disabled = true;
         hide('wiz-finish-error');
+        if (await wizLeaveIfDone(true)) return;
         if (!wizProgress.configSaved) {
             try {
                 await API.updateStartupConfig({
@@ -249,6 +321,7 @@ async function wizComplete() {
                 $('wiz-password').disabled = true;
                 $('wiz-password2').disabled = true;
             } catch (e) {
+                if (e.status === 403 && await wizLeaveIfDone(true)) return;
                 showFinishError(t('wizard.user_create_failed', { message: e.message }));
                 return;
             }
@@ -266,20 +339,31 @@ async function wizComplete() {
                 return;
             }
         }
-        if (!wizProgress.libraryCreated) {
-            const libName = $('wiz-lib-name').value.trim();
-            const libPath = $('wiz-lib-path').value.trim();
-            if (libName && libPath) {
-                try {
-                    const lib = await API.createLibrary(libName, $('wiz-lib-type').value, [libPath]);
-                    wizProgress.libraryCreated = true;
-                    // Scan it now, as the Add Library dialog does; the scheduler would not scan it for hours.
-                    toast(t('library.created', { name: libName }));
-                    API.scanLibrary(lib.id || lib.Id).catch(err => toast(t('library.scan_start_failed', { message: err.message }), 'error'));
-                } catch (e) {
-                    showFinishError(t('wizard.library_create_failed', { message: e.message }));
-                    return;
-                }
+        // The library step may have changed since this page created its library; the page's last choice wins
+        const libName = $('wiz-lib-name').value.trim(), libPath = $('wiz-lib-path').value.trim();
+        const libType = $('wiz-lib-type').value;
+        const want = libName && libPath ? { name: libName, type: libType, path: libPath } : null;
+        if (wizLibrary && (!want || wizLibrary.name !== want.name || wizLibrary.type !== want.type || wizLibrary.path !== want.path)) {
+            try {
+                await API.deleteLibrary(wizLibrary.id);
+                wizLibrary = null;
+            } catch (e) {
+                showFinishError(t('wizard.library_replace_failed', { message: e.message }));
+                return;
+            }
+        }
+        if (want && !wizLibrary) {
+            try {
+                const lib = await API.createLibrary(want.name, want.type, [want.path]);
+                wizLibrary = { id: lib.Id || lib.id, ...want };
+                // Scan it now, as the Add Library dialog does; the scheduler would not scan it for hours.
+                toast(t('library.created', { name: want.name }));
+                API.scanLibrary(wizLibrary.id).catch(err => toast(t('library.scan_start_failed', { message: err.message }), 'error'));
+            } catch (e) {
+                wizSetStep(wizStepIndexOf('wiz-lib-path'));
+                $('wiz-lib-error').textContent = e.message;
+                show('wiz-lib-error');
+                return;
             }
         }
         try {

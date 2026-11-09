@@ -359,6 +359,7 @@ const API = {
         if (libraryOptions) body.LibraryOptions = libraryOptions;
         return this.post('/Library/VirtualFolders', body);
     },
+    validatePath(path) { return this.post('/Environment/ValidatePath', { Path: path, ValidateWritable: false }); },
     deleteLibrary(id) { return this.del(`/Library/VirtualFolders/${id}`); },
     getLibraryOptions(id) { return this.get(`/Library/${id}/Options`); },
     saveLibraryOptions(id, options) { return this.post(`/Library/${id}/Options`, options); },

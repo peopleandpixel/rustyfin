@@ -101,7 +101,7 @@
         <div id="wiz-step-2" class="jf-wizard-step">
             <div class="jf-settings-card !bg-[#1a202c]/60">
                 <h2 class="text-lg font-bold text-white mb-2" data-i18n="wizard.library_title">3. Media Library (Optional)</h2>
-                <p class="text-white/60 text-xs mb-5" data-i18n="wizard.library_intro">Add your first media folder. You can add more at any time in the admin area.</p>
+                <p class="text-white/60 text-xs mb-5" data-i18n="wizard.library_intro">Add your first media folder, or skip this step. You can add libraries at any time in the dashboard.</p>
                 <div class="space-y-4">
                     <div>
                         <label class="block text-xs font-medium text-white/70 mb-1.5" data-i18n="wizard.library_name">Library name</label>
@@ -123,9 +123,13 @@
                     </div>
                 </div>
             </div>
+            <div id="wiz-lib-error" class="text-red-400 text-xs mt-2 hidden p-2 rounded bg-red-500/10 border border-red-500/20"></div>
             <div class="flex justify-between mt-6">
                 <button class="jf-btn-ghost" onclick="wizPrev()" data-i18n="wizard.back">← Back</button>
-                <button class="jf-btn-primary" onclick="wizNext()" data-i18n="wizard.next">Next →</button>
+                <div class="flex gap-2">
+                    <button class="jf-btn-ghost" onclick="wizSkipLibrary()" data-i18n="wizard.skip">Skip</button>
+                    <button class="jf-btn-primary" onclick="wizNext()" data-i18n="wizard.next">Next →</button>
+                </div>
             </div>
         </div>
 
@@ -139,6 +143,7 @@
                     <div class="flex justify-between"><span class="text-white/50" data-i18n="wizard.summary_engine">Server engine:</span> <span class="font-semibold text-[#00a4dc]">Rustyfin Core (Rust Tokio)</span></div>
                     <div class="flex justify-between"><span class="text-white/50" data-i18n="wizard.summary_admin">Admin account:</span> <span id="wiz-summary-user" class="font-semibold text-white"></span></div>
                     <div class="flex justify-between"><span class="text-white/50" data-i18n="wizard.summary_metadata">Metadata:</span> <span id="wiz-summary-lang" class="font-semibold text-white">Deutsch</span></div>
+                    <div class="flex justify-between"><span class="text-white/50" data-i18n="wizard.summary_library">Library:</span> <span id="wiz-summary-library" class="font-semibold text-white"></span></div>
                 </div>
             </div>
             <div id="wiz-finish-error" class="text-red-400 text-xs mt-2 hidden p-2 rounded bg-red-500/10 border border-red-500/20"></div>
