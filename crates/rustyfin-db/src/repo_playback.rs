@@ -1,3 +1,4 @@
+use rustyfin_model::media::MediaType;
 use rustyfin_model::playback::UserItemDataDto;
 use sqlx::SqlitePool;
 use std::collections::HashMap;
@@ -75,6 +76,172 @@ pub async fn update_playback_position(
     .await?;
 
     Ok(())
+}
+
+/// Jellyfin's default resume rules (MinResumePct, MaxResumePct, MinResumeDurationSeconds). Fixed,
+/// not settings.
+const MIN_RESUME_PCT: i128 = 5;
+const MAX_RESUME_PCT: i128 = 90;
+const MIN_RESUME_DURATION_TICKS: i128 = 300 * 10_000_000;
+
+/// Whether a position is past `MaxResumePct` of the runtime, or at its end. Needs a runtime above 0.
+fn past_resume_end(position: i64, runtime: i64) -> bool {
+    let pos = position as i128;
+    let rt = runtime as i128;
+    pos * 100 > MAX_RESUME_PCT * rt || pos >= rt
+}
+
+/// The resume position and played flag after a client reports playback stopped at `position`.
+/// Follows Jellyfin's UserDataManager.UpdatePlayState: past `MaxResumePct` (or at the end) the item
+/// is played with no resume point; before `MinResumePct` the resume point is cleared and the played
+/// flag kept; a short item (under `MinResumeDuration`) stopped in the middle counts as played;
+/// otherwise the position is kept. An item with no runtime above 0 counts as played.
+pub fn play_state_after_stop(runtime: Option<i64>, position: i64) -> (i64, bool) {
+    match runtime.filter(|rt| *rt > 0) {
+        None => (0, true),
+        Some(rt) if past_resume_end(position, rt) => (0, true),
+        Some(rt) if (position as i128) * 100 < MIN_RESUME_PCT * rt as i128 => (0, false),
+        Some(rt) if (rt as i128) < MIN_RESUME_DURATION_TICKS => (0, true),
+        Some(_) => (position, false),
+    }
+}
+
+/// The resume position and played flag after a progress report. Only playing past `MaxResumePct`
+/// (or to the end) changes anything: the item is played with no resume point. Otherwise the reported
+/// position is kept and the played flag is left alone.
+fn play_state_after_progress(runtime: Option<i64>, position: i64) -> (i64, bool) {
+    match runtime.filter(|rt| *rt > 0) {
+        Some(rt) if past_resume_end(position, rt) => (0, true),
+        _ => (position, false),
+    }
+}
+
+/// How a report sets the played flag: `Assign` sets it, `Keep` only raises it and never clears it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlayedUpdate {
+    Assign(bool),
+    Keep(bool),
+}
+
+/// The played flag a start sets, as Jellyfin's OnPlaybackStart does: an item that resumes starts
+/// unplayed, one that does not (Audio, Photo) starts played, and folders are left alone.
+fn played_on_start(media_type: MediaType) -> PlayedUpdate {
+    match media_type {
+        MediaType::Series | MediaType::Season | MediaType::MusicAlbum | MediaType::Genre => {
+            PlayedUpdate::Keep(false)
+        }
+        MediaType::Audio | MediaType::Photo => PlayedUpdate::Assign(true),
+        _ => PlayedUpdate::Assign(false),
+    }
+}
+
+/// One upsert for a playback report: sets the resume position, updates the played flag as `played`
+/// says, adds `play_count_delta` to the count and stamps the last played date.
+async fn write_playback_state(
+    pool: &SqlitePool,
+    user_id: Uuid,
+    item_id: Uuid,
+    position_ticks: i64,
+    played: PlayedUpdate,
+    play_count_delta: i64,
+) -> Result<(), sqlx::Error> {
+    let uid = user_id.to_string();
+    let iid = item_id.to_string();
+    let now = chrono::Utc::now().to_rfc3339();
+    let (assign, flag) = match played {
+        PlayedUpdate::Assign(flag) => (true, flag),
+        PlayedUpdate::Keep(flag) => (false, flag),
+    };
+
+    sqlx::query(
+        "INSERT INTO user_item_data (user_id, item_id, playback_position_ticks, played, play_count, last_played_date) \
+         VALUES (?, ?, ?, ?, ?, ?) \
+         ON CONFLICT(user_id, item_id) DO UPDATE SET \
+         playback_position_ticks = excluded.playback_position_ticks, \
+         played = CASE WHEN ? THEN excluded.played ELSE MAX(user_item_data.played, excluded.played) END, \
+         play_count = user_item_data.play_count + excluded.play_count, \
+         last_played_date = excluded.last_played_date",
+    )
+    .bind(&uid)
+    .bind(&iid)
+    .bind(position_ticks)
+    .bind(flag)
+    .bind(play_count_delta)
+    .bind(&now)
+    .bind(assign)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+/// A client reported playback started: counts a play, sets the played flag as Jellyfin's
+/// OnPlaybackStart does for the item's media type, and stores the reported position (0 when the
+/// client sends none).
+pub async fn record_playback_start(
+    pool: &SqlitePool,
+    user_id: Uuid,
+    item_id: Uuid,
+    position_ticks: i64,
+    media_type: MediaType,
+) -> Result<(), sqlx::Error> {
+    write_playback_state(
+        pool,
+        user_id,
+        item_id,
+        position_ticks,
+        played_on_start(media_type),
+        1,
+    )
+    .await
+}
+
+/// A client reported progress: stores the position, or marks the item played with no resume point
+/// once it is past `MaxResumePct`.
+pub async fn record_playback_progress(
+    pool: &SqlitePool,
+    user_id: Uuid,
+    item_id: Uuid,
+    position_ticks: i64,
+    runtime_ticks: Option<i64>,
+) -> Result<(), sqlx::Error> {
+    let (position, played) = play_state_after_progress(runtime_ticks, position_ticks);
+    write_playback_state(
+        pool,
+        user_id,
+        item_id,
+        position,
+        PlayedUpdate::Keep(played),
+        0,
+    )
+    .await
+}
+
+/// A client reported playback stopped. With a position, `play_state_after_stop` decides. Without
+/// one, Jellyfin assumes the item was played to the end: the item is played and the play counted.
+pub async fn record_playback_stop(
+    pool: &SqlitePool,
+    user_id: Uuid,
+    item_id: Uuid,
+    position_ticks: Option<i64>,
+    runtime_ticks: Option<i64>,
+) -> Result<(), sqlx::Error> {
+    let (position, played, play_count_delta) = match position_ticks {
+        Some(position) => {
+            let (position, played) = play_state_after_stop(runtime_ticks, position);
+            (position, played, 0)
+        }
+        None => (0, true, 1),
+    };
+    write_playback_state(
+        pool,
+        user_id,
+        item_id,
+        position,
+        PlayedUpdate::Keep(played),
+        play_count_delta,
+    )
+    .await
 }
 
 /// A remembered track: the index of the stream a user chose, with the key of that stream when it
@@ -226,34 +393,6 @@ pub async fn set_favorite(
     .await?;
 
     get_user_item_data(pool, user_id, item_id).await
-}
-
-pub async fn on_playback_stopped(
-    pool: &SqlitePool,
-    user_id: Uuid,
-    item_id: Uuid,
-    position_ticks: Option<i64>,
-) -> Result<(), sqlx::Error> {
-    let uid = user_id.to_string();
-    let iid = item_id.to_string();
-    let now = chrono::Utc::now().to_rfc3339();
-    let pos = position_ticks.unwrap_or(0);
-
-    sqlx::query(
-        "INSERT INTO user_item_data (user_id, item_id, playback_position_ticks, last_played_date) \
-         VALUES (?, ?, ?, ?) \
-         ON CONFLICT(user_id, item_id) DO UPDATE SET \
-         playback_position_ticks = excluded.playback_position_ticks, \
-         last_played_date = excluded.last_played_date",
-    )
-    .bind(&uid)
-    .bind(&iid)
-    .bind(pos)
-    .bind(&now)
-    .execute(pool)
-    .await?;
-
-    Ok(())
 }
 
 /// Set user rating (likes and/or 1-5 star rating) for an item
@@ -546,4 +685,61 @@ pub async fn clear_user_rating(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HOUR: i64 = 36_000_000_000;
+
+    #[test]
+    fn stop_past_the_end_marks_played_without_a_resume_point() {
+        assert_eq!(play_state_after_stop(Some(HOUR), HOUR), (0, true));
+        assert_eq!(
+            play_state_after_stop(Some(HOUR), HOUR * 91 / 100),
+            (0, true)
+        );
+        assert_eq!(
+            play_state_after_stop(Some(HOUR), HOUR * 90 / 100),
+            (HOUR * 90 / 100, false)
+        );
+    }
+
+    #[test]
+    fn stop_before_five_percent_clears_the_resume_point() {
+        assert_eq!(play_state_after_stop(Some(HOUR), 0), (0, false));
+        assert_eq!(play_state_after_stop(Some(HOUR), -5), (0, false));
+        assert_eq!(play_state_after_stop(Some(HOUR), HOUR / 100), (0, false));
+    }
+
+    #[test]
+    fn short_item_stopped_midway_counts_as_played() {
+        let short = 299 * 10_000_000;
+        assert_eq!(play_state_after_stop(Some(short), short / 2), (0, true));
+        let exact = 300 * 10_000_000;
+        assert_eq!(
+            play_state_after_stop(Some(exact), exact / 2),
+            (exact / 2, false)
+        );
+    }
+
+    #[test]
+    fn unknown_runtime_counts_as_played() {
+        assert_eq!(play_state_after_stop(None, 5_000), (0, true));
+        assert_eq!(play_state_after_stop(Some(0), 5_000), (0, true));
+    }
+
+    #[test]
+    fn progress_only_marks_played_past_the_end() {
+        assert_eq!(
+            play_state_after_progress(Some(HOUR), HOUR / 2),
+            (HOUR / 2, false)
+        );
+        assert_eq!(
+            play_state_after_progress(Some(HOUR), HOUR * 95 / 100),
+            (0, true)
+        );
+        assert_eq!(play_state_after_progress(None, HOUR), (HOUR, false));
+    }
 }

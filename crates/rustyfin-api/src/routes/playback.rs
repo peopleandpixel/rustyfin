@@ -3,6 +3,7 @@ use axum::routing::{delete, post, put};
 use axum::{Extension, Json, Router};
 use rustyfin_db::repo_playback::StreamChoice;
 use rustyfin_model::auth::Claims;
+use rustyfin_model::media::MediaItem;
 use rustyfin_model::media_source::MediaSourceResponse;
 use rustyfin_model::playback::{
     LastActivityDateRequest, PinEpisodeRequest, PlaybackProgressInfo, PlaybackStartInfo,
@@ -97,6 +98,25 @@ fn stream_key(
     }
 }
 
+/// The runtime the play state rules use for a report: the `run_time_ticks` of the version
+/// `media_source_id` names when it is a known version with a runtime above 0, else the item's own.
+async fn reported_runtime(
+    state: &AppState,
+    item: &MediaItem,
+    media_source_id: Option<&str>,
+) -> Result<Option<i64>, ApiError> {
+    let Some(wanted) = media_source_id.and_then(|id| Uuid::parse_str(id).ok()) else {
+        return Ok(item.runtime_ticks);
+    };
+    let sources = rustyfin_db::repo_media_source::get_media_sources(&state.db, &item.id).await?;
+    let version = sources
+        .iter()
+        .find(|source| Uuid::parse_str(&source.id).ok() == Some(wanted))
+        .and_then(|source| source.run_time_ticks)
+        .filter(|ticks| *ticks > 0);
+    Ok(version.or(item.runtime_ticks))
+}
+
 async fn playing(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
@@ -112,16 +132,18 @@ async fn playing(
     );
     // Jellyfin writes user data only for an item it finds, and has no now-playing item for one it
     // does not (SessionManager.OnPlaybackStart), so a non-media id stores nothing and reports null.
-    let is_media = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, req.item_id)
+    let media_type = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, req.item_id)
         .await?
-        .is_some();
-    if is_media {
+        .map(|item| item.media_type);
+    let is_media = media_type.is_some();
+    if let Some(media_type) = media_type {
         let position = req.position_ticks.unwrap_or(0);
-        rustyfin_db::repo_playback::update_playback_position(
+        rustyfin_db::repo_playback::record_playback_start(
             &state.db,
             claims.sub,
             req.item_id,
             position,
+            media_type,
         )
         .await?;
 
@@ -180,16 +202,20 @@ async fn playing_progress(
         "Playback progress"
     );
     // Same as `playing`: a non-media id stores nothing and reports a null now-playing item.
-    let is_media = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, req.item_id)
-        .await?
-        .is_some();
+    let item = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, req.item_id).await?;
+    let is_media = item.is_some();
+    let runtime = match &item {
+        Some(item) => reported_runtime(&state, item, req.media_source_id.as_deref()).await?,
+        None => None,
+    };
     if is_media {
         if let Some(position) = req.position_ticks {
-            rustyfin_db::repo_playback::update_playback_position(
+            rustyfin_db::repo_playback::record_playback_progress(
                 &state.db,
                 claims.sub,
                 req.item_id,
                 position,
+                runtime,
             )
             .await?;
         }
@@ -251,17 +277,24 @@ async fn playing_stopped(
         "Playback stopped"
     );
     // Same as `playing`: a non-media id stores nothing.
-    let is_media = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, req.item_id)
-        .await?
-        .is_some();
+    let item = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, req.item_id).await?;
+    let is_media = item.is_some();
+    let runtime = match &item {
+        Some(item) => reported_runtime(&state, item, req.media_source_id.as_deref()).await?,
+        None => None,
+    };
     if is_media {
-        rustyfin_db::repo_playback::on_playback_stopped(
-            &state.db,
-            claims.sub,
-            req.item_id,
-            req.position_ticks,
-        )
-        .await?;
+        // Jellyfin's OnPlaybackStopped returns before touching user data for a failed playback.
+        if req.failed != Some(true) {
+            rustyfin_db::repo_playback::record_playback_stop(
+                &state.db,
+                claims.sub,
+                req.item_id,
+                req.position_ticks,
+                runtime,
+            )
+            .await?;
+        }
 
         let (audio, subtitle) = reported_choices(
             &state,

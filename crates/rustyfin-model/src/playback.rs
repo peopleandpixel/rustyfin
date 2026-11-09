@@ -49,6 +49,9 @@ pub struct PlaybackStopInfo {
     pub audio_stream_index: Option<i32>,
     #[serde(default)]
     pub subtitle_stream_index: Option<i32>,
+    /// The playback errored out; Jellyfin then leaves the item's user data alone.
+    #[serde(default)]
+    pub failed: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
