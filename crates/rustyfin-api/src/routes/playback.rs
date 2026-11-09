@@ -547,7 +547,7 @@ async fn mark_played(
     let user_id = path_user(&state, &claims, user_id).await?;
     require_item(&state, item_id).await?;
     let data = rustyfin_db::repo_playback::mark_played(&state.db, user_id, item_id).await?;
-    Ok(Json(data))
+    Ok(Json(folder_answer(&state, user_id, item_id, data).await?))
 }
 
 async fn mark_unplayed(
@@ -558,7 +558,36 @@ async fn mark_unplayed(
     let user_id = path_user(&state, &claims, user_id).await?;
     require_item(&state, item_id).await?;
     let data = rustyfin_db::repo_playback::mark_unplayed(&state.db, user_id, item_id).await?;
-    Ok(Json(data))
+    Ok(Json(folder_answer(&state, user_id, item_id, data).await?))
+}
+
+/// After a mark, a Series or Season answers with its Played and UnplayedItemCount derived from its
+/// episodes, as items answer them. Other items answer as stored.
+async fn folder_answer(
+    state: &AppState,
+    user_id: Uuid,
+    item_id: Uuid,
+    mut data: UserItemDataDto,
+) -> Result<UserItemDataDto, ApiError> {
+    let is_folder = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, item_id)
+        .await?
+        .is_some_and(|item| {
+            matches!(
+                item.media_type,
+                rustyfin_model::media::MediaType::Series | rustyfin_model::media::MediaType::Season
+            )
+        });
+    if is_folder {
+        let counts =
+            rustyfin_db::repo_playback::get_unplayed_counts(&state.db, user_id, &[item_id])
+                .await?
+                .get(&item_id.to_string())
+                .copied()
+                .unwrap_or((0, 0));
+        data.played = rustyfin_db::repo_playback::folder_played(counts);
+        data.unplayed_item_count = Some(counts.1 as i32);
+    }
+    Ok(data)
 }
 
 async fn set_favorite(

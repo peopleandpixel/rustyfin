@@ -13190,6 +13190,117 @@ async fn b110_series_and_seasons_count_unplayed_episodes() {
     );
 }
 
+impl B110 {
+    /// Sends `method` to `uri` as the administrator and returns the status and the answer.
+    async fn send(&self, method: &str, uri: &str) -> (StatusCode, serde_json::Value) {
+        send_authed(&self.app, method, uri, &self.token, None).await
+    }
+
+    /// Whether each of the show's episodes is stored as played.
+    async fn episodes_played(&self) -> Vec<bool> {
+        let mut played = Vec::new();
+        for episode in self.episodes {
+            played.push(self.stored(episode).await.0);
+        }
+        played
+    }
+}
+
+#[tokio::test]
+async fn b110_marking_a_series_or_season_carries_to_its_episodes() {
+    let b = B110::new().await;
+    let [s1, s2] = b.seasons;
+    let id = |item: uuid::Uuid| item.to_string();
+    let series_played = format!("/Users/{}/PlayedItems/{}", b.user, b.series);
+    // Jellyfin's Folder.MarkPlayed/MarkUnplayed mark every episode under the folder, and a
+    // folder's Played comes from its episodes.
+    let (status, answer) = b.send("POST", &series_played).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(
+        (
+            answer["Played"].as_bool(),
+            answer["UnplayedItemCount"].as_i64()
+        ),
+        (Some(true), Some(0)),
+        "{answer}"
+    );
+    assert_eq!(b.episodes_played().await, [true, true, true]);
+    assert_eq!(
+        b.details_fields(b.series).await,
+        (id(b.series), Some(true), Some(0), None)
+    );
+    assert_eq!(
+        b.details_fields(s2).await,
+        (id(s2), Some(true), Some(0), None)
+    );
+
+    let (status, answer) = b.send("DELETE", &series_played).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(
+        (
+            answer["Played"].as_bool(),
+            answer["UnplayedItemCount"].as_i64()
+        ),
+        (Some(false), Some(3)),
+        "{answer}"
+    );
+    assert_eq!(b.episodes_played().await, [false, false, false]);
+    assert_eq!(
+        b.details_fields(b.series).await,
+        (id(b.series), Some(false), Some(3), None)
+    );
+
+    // A season: only its episodes.
+    let (status, _) = b
+        .send("POST", &format!("/Users/{}/PlayedItems/{s1}", b.user))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(b.episodes_played().await, [true, true, false]);
+    assert_eq!(
+        b.details_fields(b.series).await,
+        (id(b.series), Some(false), Some(1), None)
+    );
+    assert_eq!(
+        b.details_fields(s1).await,
+        (id(s1), Some(true), Some(0), None)
+    );
+    // The newer form unmarks it too.
+    let (status, _) = b.send("DELETE", &format!("/UserPlayedItems/{s1}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(b.episodes_played().await, [false, false, false]);
+
+    // A folder's own stored flag no longer decides: a row saying played, with no episode played,
+    // shows unplayed.
+    sqlx::query(
+        "INSERT INTO user_item_data (user_id, item_id, played) VALUES (?, ?, 1) \
+         ON CONFLICT(user_id, item_id) DO UPDATE SET played = 1",
+    )
+    .bind(b.user.to_string())
+    .bind(b.series.to_string())
+    .execute(&b.state.db)
+    .await
+    .unwrap();
+    assert_eq!(
+        b.details_fields(b.series).await,
+        (id(b.series), Some(false), Some(3), None)
+    );
+    let series_list = format!(
+        "/Users/{}/Items?Recursive=true&IncludeItemTypes=Series",
+        b.user
+    );
+    assert_eq!(
+        b.list_fields(&series_list).await,
+        [(id(b.series), Some(false), Some(3), None)]
+    );
+
+    // Another user's episodes are left alone.
+    let (other_token, other) = admin_session(&b.state).await;
+    let uri = format!("/Users/{other}/PlayedItems/{}", b.series);
+    let (status, _) = send_authed(&b.app, "POST", &uri, &other_token, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(b.episodes_played().await, [false, false, false]);
+}
+
 // ── Shows Tests ──
 
 #[tokio::test]
@@ -21999,8 +22110,8 @@ async fn b29_stored(state: &AppState, user_id: &str, item: uuid::Uuid) -> serde_
 }
 
 /// An answer's `UserData` without the fields worked out from the item's runtime and episodes
-/// (B110). A folder's `Played` is also true once all its episodes are played; B29's single episode
-/// is watched after its folders are checked, so there it is the stored flag.
+/// (B110). A folder's `Played` comes from its episodes, and marking a folder marks them too, so
+/// in B29 it matches the stored flag.
 fn b110_without_derived(user_data: &serde_json::Value) -> serde_json::Value {
     let mut data = user_data.clone();
     let object = data.as_object_mut().unwrap();

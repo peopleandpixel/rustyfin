@@ -89,6 +89,13 @@ pub async fn get_unplayed_counts(
         .collect())
 }
 
+/// Whether a Series or Season counts as played from its `(episodes, unplayed)` counts: it has
+/// episodes and all of them are played. Its stored flag does not decide.
+pub fn folder_played(counts: (i64, i64)) -> bool {
+    let (episodes, unplayed) = counts;
+    episodes > 0 && unplayed == 0
+}
+
 pub async fn update_playback_position(
     pool: &SqlitePool,
     user_id: Uuid,
@@ -359,6 +366,20 @@ pub async fn get_stream_choice(
     ))
 }
 
+/// The episodes under a Series (through its seasons) or a Season, as a CTE `eps(id)` over `?1`.
+/// Other items have none. Jellyfin's Folder.MarkPlayed/MarkUnplayed reach these episodes.
+const EPISODES_UNDER_FOLDER: &str = "WITH eps(id) AS ( \
+     SELECT e.id FROM media_items f \
+     JOIN media_items s ON s.parent_id = f.id AND s.media_type = 'Season' \
+     JOIN media_items e ON e.parent_id = s.id AND e.media_type = 'Episode' \
+     WHERE f.id = ?1 AND f.media_type = 'Series' \
+     UNION \
+     SELECT e.id FROM media_items f \
+     JOIN media_items e ON e.parent_id = f.id AND e.media_type = 'Episode' \
+     WHERE f.id = ?1 AND f.media_type = 'Season' ) ";
+
+/// Marks an item played for the user. A Series or Season also marks each of its episodes played,
+/// as an episode is marked alone, and the folder's own row is written too; all in one transaction.
 pub async fn mark_played(
     pool: &SqlitePool,
     user_id: Uuid,
@@ -367,6 +388,7 @@ pub async fn mark_played(
     let uid = user_id.to_string();
     let iid = item_id.to_string();
     let now = chrono::Utc::now().to_rfc3339();
+    let mut tx = pool.begin().await?;
 
     sqlx::query(
         "INSERT INTO user_item_data (user_id, item_id, played, play_count, last_played_date) \
@@ -379,12 +401,31 @@ pub async fn mark_played(
     .bind(&uid)
     .bind(&iid)
     .bind(&now)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
+    let episodes = format!(
+        "{EPISODES_UNDER_FOLDER} INSERT INTO user_item_data (user_id, item_id, played, play_count, last_played_date) \
+         SELECT ?2, id, 1, 1, ?3 FROM eps WHERE true \
+         ON CONFLICT(user_id, item_id) DO UPDATE SET \
+         played = 1, \
+         play_count = user_item_data.play_count + 1, \
+         last_played_date = excluded.last_played_date"
+    );
+    sqlx::query(sqlx::AssertSqlSafe(episodes))
+        .bind(&iid)
+        .bind(&uid)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+
+    tx.commit().await?;
     get_user_item_data(pool, user_id, item_id).await
 }
 
+/// Marks an item unplayed for the user. A Series or Season also marks each of its episodes
+/// unplayed, as an episode is marked alone, and the folder's own row is written too; all in one
+/// transaction.
 pub async fn mark_unplayed(
     pool: &SqlitePool,
     user_id: Uuid,
@@ -392,6 +433,7 @@ pub async fn mark_unplayed(
 ) -> Result<UserItemDataDto, sqlx::Error> {
     let uid = user_id.to_string();
     let iid = item_id.to_string();
+    let mut tx = pool.begin().await?;
 
     sqlx::query(
         "INSERT INTO user_item_data (user_id, item_id, played, play_count) \
@@ -403,9 +445,24 @@ pub async fn mark_unplayed(
     )
     .bind(&uid)
     .bind(&iid)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
+    let episodes = format!(
+        "{EPISODES_UNDER_FOLDER} INSERT INTO user_item_data (user_id, item_id, played, play_count) \
+         SELECT ?2, id, 0, 0 FROM eps WHERE true \
+         ON CONFLICT(user_id, item_id) DO UPDATE SET \
+         played = 0, \
+         play_count = 0, \
+         playback_position_ticks = 0"
+    );
+    sqlx::query(sqlx::AssertSqlSafe(episodes))
+        .bind(&iid)
+        .bind(&uid)
+        .execute(&mut *tx)
+        .await?;
+
+    tx.commit().await?;
     get_user_item_data(pool, user_id, item_id).await
 }
 

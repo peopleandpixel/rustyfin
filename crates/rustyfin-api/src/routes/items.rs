@@ -87,15 +87,12 @@ fn is_episode_folder(item: &MediaItem) -> bool {
     )
 }
 
-/// Sets a Series or Season's UnplayedItemCount from its `(episodes, unplayed)` counts, and marks
-/// it Played once it has episodes and all of them are played. Call after `apply_user_data`.
+/// Sets a Series or Season's UnplayedItemCount from its `(episodes, unplayed)` counts, and its
+/// Played from the same counts (overriding the stored flag). Call after `apply_user_data`.
 fn apply_unplayed_counts(item: &mut MediaItem, counts: (i64, i64)) {
-    let (episodes, unplayed) = counts;
     let data = item.user_data.get_or_insert_with(Default::default);
-    data.unplayed_item_count = Some(unplayed as i32);
-    if episodes > 0 && unplayed == 0 {
-        data.played = true;
-    }
+    data.unplayed_item_count = Some(counts.1 as i32);
+    data.played = rustyfin_db::repo_playback::folder_played(counts);
 }
 
 /// Set an item's image tags (the first image of each type) and backdrop tags (every backdrop, in
