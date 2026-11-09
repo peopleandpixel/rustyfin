@@ -207,7 +207,16 @@ const API = {
     completeStartup() { return this.post('/Startup/Complete'); },
 
     // Libraries
-    getLibraries() { return this.cachedGet('/Library/VirtualFolders', 60000); },
+    getLibraries() {
+        if (this.isAdmin) return this.cachedGet('/Library/VirtualFolders', 60000);
+        // /Library/VirtualFolders is for administrators; other users get the same libraries from their views.
+        const types = { movies: 'Movies', tvshows: 'TvShows', music: 'Music', homevideos: 'Photos' };
+        return this.cachedGet('/UserViews', 60000).then(views => (views.Items || []).map(v => ({
+            id: v.Id,
+            name: v.Name,
+            content_type: types[v.CollectionType] || 'Mixed',
+        })));
+    },
     createLibrary(name, contentType, paths) {
         return this.post('/Library/VirtualFolders', { Name: name, ContentType: contentType, Paths: paths });
     },
@@ -224,13 +233,6 @@ const API = {
         const q = parent ? `?parent=${encodeURIComponent(parent)}` : '';
         return this.get(`/Library/BrowseDirectories${q}`);
     },
-
-    // Users
-    getUsers() { return this.cachedGet('/Users', 60000); },
-    createUser(name, password, isAdministrator = false) {
-        return this.post('/Users/New', { Name: name, Password: password, IsAdministrator: isAdministrator });
-    },
-    deleteUser(id) { return this.post(`/Users/${id}/Delete`); },
 
     // Items
     getItems(params = {}) {
@@ -316,7 +318,9 @@ const API = {
     // Users (admin)
     getUsers() { return this.get('/Users'); },
     getMe() { return this.get('/Users/Me'); },
-    createUser(name, password) { return this.post('/Users/New', { Name: name, Password: password }); },
+    createUser(name, password, isAdministrator = false) {
+        return this.post('/Users/New', { Name: name, Password: password, IsAdministrator: isAdministrator });
+    },
     deleteUser(id) { return this.post(`/Users/${id}/Delete`); },
     changePassword(id, current, newPw) { return this.post(`/Users/${id}/Password`, { CurrentPw: current, NewPw: newPw }); },
     updatePolicy(id, policy) { return this.post(`/Users/${id}/Policy`, policy); },

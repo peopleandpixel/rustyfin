@@ -145,6 +145,19 @@ pub async fn delete_sessions_by_device(
     Ok(())
 }
 
+pub async fn delete_sessions_by_user_device(
+    pool: &SqlitePool,
+    user_id: Uuid,
+    device_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM sessions WHERE user_id = ? AND device_id = ?")
+        .bind(user_id.to_string())
+        .bind(device_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 pub async fn cleanup_expired_sessions(
     pool: &SqlitePool,
     timeout_minutes: i64,
@@ -212,8 +225,9 @@ pub async fn get_all_devices(pool: &SqlitePool) -> Result<Vec<DeviceInfo>, sqlx:
 }
 
 pub async fn delete_device(pool: &SqlitePool, device_id: &str) -> Result<(), sqlx::Error> {
-    // Also remove sessions for this device
+    // Remove the device's sessions and the tokens issued to it, so the device is signed out
     delete_sessions_by_device(pool, device_id).await?;
+    super::repo_token::delete_device_tokens(pool, device_id).await?;
     sqlx::query("DELETE FROM devices WHERE id = ?1")
         .bind(device_id)
         .execute(pool)
@@ -310,4 +324,29 @@ pub async fn get_now_playing_item(
         }
         None => Ok(None),
     }
+}
+
+/// The user a session belongs to, or `None` when no session has this id.
+pub async fn get_session_user_id(
+    pool: &SqlitePool,
+    session_id: &str,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    let user_id: Option<String> = sqlx::query_scalar("SELECT user_id FROM sessions WHERE id = ?1")
+        .bind(session_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(user_id.and_then(|id| Uuid::parse_str(&id).ok()))
+}
+
+/// The user a device belongs to (the last one who signed in on it), or `None` when no device
+/// has this id.
+pub async fn get_device_user_id(
+    pool: &SqlitePool,
+    device_id: &str,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    let user_id: Option<String> = sqlx::query_scalar("SELECT user_id FROM devices WHERE id = ?1")
+        .bind(device_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(user_id.and_then(|id| Uuid::parse_str(&id).ok()))
 }

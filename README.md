@@ -46,9 +46,8 @@
 - ✅ **Error responses** — Jellyfin's exact error format with `Error` object (Code, Message, StackTrace)
 
 ### Authentication & Users
-- ✅ **User Auth** — JWT tokens, API keys, Quick Connect, Argon2 password hashing
+- ✅ **User Auth** — Opaque access tokens (random, stored hashed on the server), API keys, Quick Connect, Argon2 password hashing
 - ✅ **Device registration** — First-login device tracking
-- ✅ **JWT token refresh** — Automatic token renewal mechanism
 - ✅ **Password reset PIN flow** — Easy PIN password support
 - ✅ **User preferences** — Display preferences, parental controls
 - ✅ **User images** — Avatar upload and retrieval
@@ -150,7 +149,7 @@ rustyfin/
 ├── crates/
 │   ├── rustyfin-server   # Entry point, config, server bootstrap, middleware
 │   ├── rustyfin-api      # Axum routes, handlers, WebSocket, OpenAPI docs
-│   ├── rustyfin-auth     # Argon2, JWT, API keys, Quick Connect, device registration
+│   ├── rustyfin-auth     # Argon2, access tokens, API keys, Quick Connect, device registration
 │   ├── rustyfin-core     # Business logic: scanning, metadata, images, transcoding
 │   ├── rustyfin-db       # SQLx + SQLite, migrations, repositories, connection pools
 │   ├── rustyfin-model    # Shared DTOs, entities, Jellyfin API types
@@ -222,7 +221,7 @@ systemctl status rustyfin
 
 > **Default**: `http://0.0.0.0:8096` · Data dir: `/var/lib/rustyfin/`  
 > **First run**: Startup wizard guides you through initial setup  
-> **Default login**: `admin` / `admin`
+> **Login**: the administrator account you create in the startup wizard (there is no default account)
 
 #### Build Commands
 
@@ -286,17 +285,19 @@ Hardening options (ProtectHome, ProtectSystem, NoNewPrivileges) are enabled by d
 | `RUSTYFIN_BIND` | Bind address:port | `0.0.0.0:8096` |
 | `RUSTYFIN_DATA` | Data directory (DB, cache, config, logs) | `~/.rustyfin` |
 | `RUSTYFIN_DB` | SQLite connection string | `sqlite://<data>/rustyfin.db?mode=rwc` |
-| `RUSTYFIN_SECRET` | JWT signing secret | Random UUID (regenerated each start!) |
-| `RUSTYFIN_SERVER_ID` | Unique server identifier | Random UUID |
-| `RUSTYFIN_API_KEY` | Static API key for integrations | Disabled |
+| `RUSTYFIN_SECRET` | Deprecated and ignored — access tokens are stored server-side and survive restarts | *(unused)* |
+| `RUSTYFIN_SERVER_ID` | Unique server identifier | Stable; persisted to `<data>/server_id` |
+| `RUSTYFIN_API_KEY` | Static API key for integrations, for example from `openssl rand -hex 32` (an empty value disables it) | Disabled |
+| `RUSTYFIN_KNOWN_PROXIES` | Reverse proxies trusted to set `X-Forwarded-For`, comma-separated IPs or CIDRs. Loopback is trusted only when listed. Behind a reverse proxy, list it here and have it send `X-Forwarded-For`. A peer that is not listed but sends `X-Forwarded-For`, `X-Real-IP` or `Forwarded` is neither local nor exempt from the login limit, and all its clients share one limit. A proxy that sends none of these headers looks like a direct client, which the server cannot detect | *(none)* |
+| `RUSTYFIN_RATE_LIMIT` | Login and password-reset attempts per window, per client IP (`0` disables) | `10` |
+| `RUSTYFIN_RATE_WINDOW` | Rate-limit window, in seconds | `60` |
 | `RUST_LOG` | Log level (`debug`, `info`, `rustyfin=trace`) | `info` |
 
 **Example (production):**
 ```bash
 RUSTYFIN_BIND=127.0.0.1:8096 \
 RUSTYFIN_DATA=/srv/rustyfin \
-RUSTYFIN_SECRET="$(openssl rand -base64 32)" \
-RUSTYFIN_API_KEY="my-integration-key" \
+RUSTYFIN_API_KEY="<output of openssl rand -hex 32>" \
 ./target/release/rustyfin
 ```
 

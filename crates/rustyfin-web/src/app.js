@@ -4,6 +4,9 @@ let currentLibraryId = null;
 let currentDetailId = null;
 let libraries = [];
 let wizStep = 0;
+let wizProgress = { configSaved: false, userCreated: false, loggedIn: false, libraryCreated: false };
+let wizCredentials = null;
+let wizFinishing = false;
 let serverVersion = '0.3.0';
 let playerReportInterval = null;
 let playerHideTimeout = null;
@@ -110,7 +113,7 @@ async function checkSetupWizard() {
             hide('main-navbar');
             return true;
         }
-    } catch {}
+    } catch (e) { console.warn('Could not read the server info for the setup wizard:', e); }
     return false;
 }
 
@@ -146,21 +149,14 @@ function wizSetStep(s) {
         }
     }
     if (s === 3) {
-        $('wiz-summary-user').textContent = $('wiz-username').value || 'admin';
+        $('wiz-summary-user').textContent = $('wiz-username').value.trim();
         const langEl = $('wiz-lang');
         $('wiz-summary-lang').textContent = langEl.options[langEl.selectedIndex].text;
     }
 }
 
 async function wizNext() {
-    if (wizStep === 0) {
-        try {
-            await API.updateStartupConfig({
-                PreferredMetadataLanguage: $('wiz-lang').value,
-                MetadataCountryCode: $('wiz-country').value
-            });
-        } catch {}
-    } else if (wizStep === 1) {
+    if (wizStep === 1) {
         const pw = $('wiz-password').value, pw2 = $('wiz-password2').value;
         const user = $('wiz-username').value.trim();
         if (!user) {
@@ -174,20 +170,6 @@ async function wizNext() {
             return;
         }
         hide('wiz-user-error');
-        try { await API.createStartupUser(user, pw || ''); } catch {}
-        try { await API.login(user, pw || ''); } catch (e) { console.warn('Auto-Login im Wizard:', e); }
-    } else if (wizStep === 2) {
-        const name = $('wiz-lib-name').value.trim();
-        const path = $('wiz-lib-path').value.trim();
-        if (name && path) {
-            if (API.isLoggedIn()) {
-                try {
-                    await API.createLibrary(name, $('wiz-lib-type').value, [path]);
-                } catch (e) {
-                    toast(t('wizard.library_create_failed', { message: e.message }), 'error');
-                }
-            }
-        }
     }
     wizSetStep(Math.min(wizStep + 1, 3));
 }
@@ -197,10 +179,82 @@ function wizPrev() {
 }
 
 async function wizComplete() {
-    try { await API.completeStartup(); } catch {}
-    hide('setup-wizard');
-    show('main-navbar');
-    navigate('login');
+    if (wizFinishing) return;
+    wizFinishing = true;
+    const btn = $('wiz-finish-btn');
+    const showFinishError = (message) => {
+        const el = $('wiz-finish-error');
+        el.textContent = message;
+        el.append(document.createElement('br'), t('wizard.retry_hint'));
+        show('wiz-finish-error');
+    };
+    try {
+        btn.disabled = true;
+        hide('wiz-finish-error');
+        if (!wizProgress.configSaved) {
+            try {
+                await API.updateStartupConfig({
+                    PreferredMetadataLanguage: $('wiz-lang').value,
+                    MetadataCountryCode: $('wiz-country').value
+                });
+                wizProgress.configSaved = true;
+            } catch (e) {
+                showFinishError(t('wizard.config_save_failed', { message: e.message }));
+                return;
+            }
+        }
+        if (!wizProgress.userCreated) {
+            const name = $('wiz-username').value.trim();
+            const password = $('wiz-password').value;
+            try {
+                await API.createStartupUser(name, password);
+                wizCredentials = { name, password };
+                wizProgress.userCreated = true;
+                $('wiz-username').disabled = true;
+                $('wiz-password').disabled = true;
+                $('wiz-password2').disabled = true;
+            } catch (e) {
+                showFinishError(t('wizard.user_create_failed', { message: e.message }));
+                return;
+            }
+        }
+        if (!wizProgress.loggedIn) {
+            try {
+                await API.login(wizCredentials.name, wizCredentials.password);
+                wizProgress.loggedIn = true;
+            } catch (e) {
+                showFinishError(t('wizard.login_failed', { name: wizCredentials.name, message: e.message }));
+                return;
+            }
+        }
+        if (!wizProgress.libraryCreated) {
+            const libName = $('wiz-lib-name').value.trim();
+            const libPath = $('wiz-lib-path').value.trim();
+            if (libName && libPath) {
+                try {
+                    await API.createLibrary(libName, $('wiz-lib-type').value, [libPath]);
+                    wizProgress.libraryCreated = true;
+                } catch (e) {
+                    showFinishError(t('wizard.library_create_failed', { message: e.message }));
+                    return;
+                }
+            }
+        }
+        try {
+            await API.completeStartup();
+        } catch (e) {
+            showFinishError(t('wizard.complete_failed', { message: e.message }));
+            return;
+        }
+        hide('setup-wizard');
+        show('main-navbar');
+        updateAuthUI();
+        await loadSidebar();
+        navigate(API.isLoggedIn() ? 'home' : 'login');
+    } finally {
+        wizFinishing = false;
+        btn.disabled = false;
+    }
 }
 
 // --- Navigation & Routing ---
@@ -2064,8 +2118,8 @@ async function renderAdmin() {
             API.getSessions().catch(() => [])
         ]);
 
-        const tabs = [t('admin.overview'), t('admin.users'), t('admin.libraries'), t('admin.tasks'), t('admin.plugins'), t('admin.sessions'), t('admin.activity_log_tab'), t('admin.live_log')];
-        const tabIds = ['admin-overview', 'admin-users', 'admin-libs', 'admin-tasks', 'admin-plugins', 'admin-sessions', 'admin-activity', 'admin-livelog'];
+        const tabs = [t('admin.overview'), t('admin.users'), t('admin.libraries'), t('admin.tasks'), t('admin.sessions'), t('admin.activity_log_tab'), t('admin.live_log')];
+        const tabIds = ['admin-overview', 'admin-users', 'admin-libs', 'admin-tasks', 'admin-sessions', 'admin-activity', 'admin-livelog'];
 
         page.innerHTML = `
         <div class="max-w-6xl mx-auto jf-page">
@@ -2088,7 +2142,7 @@ async function renderAdmin() {
             <div class="flex gap-2 mb-6 overflow-x-auto pb-2">
                 ${tabs.map((label, i) => `
                     <button class="px-4 py-2 rounded-xl text-xs font-semibold whitespace-nowrap transition ${i === 0 ? 'bg-[#00a4dc] text-white shadow-lg' : 'bg-white/5 text-white/60 hover:bg-white/10'}"
-                            onclick="showAdminTab(this, '${tabIds[i]}')">${label}</button>
+                            data-tab="${tabIds[i]}" onclick="showAdminTab(this, '${tabIds[i]}')">${label}</button>
                 `).join('')}
             </div>
 
@@ -2136,20 +2190,32 @@ async function renderAdmin() {
                             <tr class="text-white/40 border-b border-white/10 pb-2">
                                 <th class="pb-3 font-semibold">${t('common.name')}</th>
                                 <th class="pb-3 font-semibold">${t('admin.role')}</th>
+                                <th class="pb-3 font-semibold">${escapeHtml(t('admin.disabled_column'))}</th>
                                 <th class="pb-3 font-semibold">${t('admin.last_login')}</th>
                                 <th class="pb-3 font-semibold text-right">${t('admin.action')}</th>
                             </tr>
                         </thead>
                         <tbody class="divide-y divide-white/5">
-                            ${users.map(u => `
+                            ${users.map(u => {
+                                const id = u.Id || u.id;
+                                const name = u.Name || u.name;
+                                const isAdmin = u.IsAdministrator ?? u.Policy?.IsAdministrator ?? u.policy?.is_administrator;
+                                const isOwner = u.IsOwner === true;
+                                const isSelf = String(id).toLowerCase().replace(/-/g, '') === String(API.userId).toLowerCase().replace(/-/g, '');
+                                const locked = isOwner || isSelf;
+                                const promoteBlocked = !locked && !isAdmin && u.IsDisabled === true;
+                                const disableBlocked = !locked && isAdmin && u.IsDisabled !== true;
+                                return `
                             <tr>
-                                <td class="py-3 font-bold text-white">${escapeHtml(u.Name || u.name)}</td>
-                                <td class="py-3">${(u.Policy?.IsAdministrator || u.policy?.is_administrator) ? `<span class="px-2 py-0.5 rounded text-[10px] font-bold bg-[#00a4dc]/20 text-[#38bdf8]">${t('admin.role_admin')}</span>` : `<span class="text-white/40">${t('admin.role_user')}</span>`}</td>
+                                <td class="py-3 font-bold text-white">${escapeHtml(name)}</td>
+                                <td class="py-3"><label class="inline-flex items-center gap-2 text-white/80"><input type="checkbox" data-id="${escapeHtml(id)}" data-name="${escapeHtml(name)}" onchange="setUserPolicy(this, { IsAdministrator: this.checked })" aria-label="${escapeHtml(t('admin.administrator_for', { name }))}" ${isAdmin ? 'checked' : ''} ${locked || promoteBlocked ? 'disabled' : ''} class="w-4 h-4 rounded bg-white/10 border-white/20 text-[#00a4dc]"><span>${escapeHtml(t('admin.role_admin'))}</span></label>${isOwner ? `<span class="ml-1.5 px-2 py-0.5 rounded text-[10px] font-bold bg-[#00a4dc]/20 text-[#38bdf8]">${escapeHtml(t('admin.role_owner'))}</span>` : ''}${locked ? `<p class="text-[10px] text-white/40 mt-1">${escapeHtml(t(isOwner ? 'admin.owner_locked' : 'admin.self_locked'))}</p>` : ''}${promoteBlocked ? `<p class="text-[10px] text-white/40 mt-1">${escapeHtml(t('admin.promote_disabled_locked'))}</p>` : ''}</td>
+                                <td class="py-3"><input type="checkbox" data-id="${escapeHtml(id)}" data-name="${escapeHtml(name)}" onchange="setUserPolicy(this, { IsDisabled: this.checked })" aria-label="${escapeHtml(t('admin.disabled_for', { name }))}" ${u.IsDisabled ? 'checked' : ''} ${locked || disableBlocked ? 'disabled' : ''} class="w-4 h-4 rounded bg-white/10 border-white/20 text-[#00a4dc]">${disableBlocked ? `<p class="text-[10px] text-white/40 mt-1">${escapeHtml(t('admin.disable_admin_locked'))}</p>` : ''}</td>
                                 <td class="py-3 text-white/40">${escapeHtml(u.LastLoginDate || u.last_login_date || '–')}</td>
                                 <td class="py-3 text-right">
                                     <button class="text-red-400 hover:text-red-300 font-semibold" onclick="if(confirm(t('admin.delete_user_confirm')))API.deleteUser('${u.Id || u.id}').then(()=>renderAdmin())">${t('common.delete')}</button>
                                 </td>
-                            </tr>`).join('')}
+                            </tr>`;
+                            }).join('')}
                         </tbody>
                     </table>
                 </div>
@@ -2198,71 +2264,7 @@ async function renderAdmin() {
                 </div>
             </div>
 
-            <!-- Tab 4: Plugins -->
-            <div id="admin-plugins" class="hidden">
-                <div class="flex items-center justify-between mb-4">
-                    <h3 class="font-bold text-white text-base">Plugins (${plugins.length})</h3>
-                    <p class="text-[10px] text-white/30">Plugins verwalten und konfigurieren</p>
-                </div>
-                <div class="grid gap-3">
-                    ${plugins.length === 0 ? '<p class="text-white/40 text-xs jf-settings-card p-6">Keine Plugins gefunden.</p>' : ''}
-                    ${plugins.map(p => {
-                        const typeIcons = {
-                            'MetadataProvider': '🏷️',
-                            'SubtitleProvider': '📝',
-                            'NotificationProvider': '🔔',
-                            'ImageProvider': '🖼️',
-                            'AuthenticationProvider': '🔐',
-                            'Task': '⚙️'
-                        };
-                        const typeLabels = {
-                            'MetadataProvider': 'Metadaten',
-                            'SubtitleProvider': 'Untertitel',
-                            'NotificationProvider': 'Benachrichtigung',
-                            'ImageProvider': 'Bilder',
-                            'AuthenticationProvider': 'Authentifizierung',
-                            'Task': 'Aufgabe'
-                        };
-                        const icon = typeIcons[p.PluginType || ''] || '📦';
-                        const typeLabel = typeLabels[p.PluginType || ''] || 'Plugin';
-                        const isActive = p.Status === 'Active';
-                        const isBuiltin = p.IsBuiltin === true;
-                        const priority = p.Priority != null ? p.Priority : 100;
-                        const pluginId = p.Id || p.id;
-                        return `
-                        <div class="jf-settings-card p-4">
-                            <div class="flex items-start gap-4">
-                                <span class="text-3xl flex-shrink-0 mt-0.5">${icon}</span>
-                                <div class="flex-1 min-w-0">
-                                    <div class="flex items-center gap-2 flex-wrap">
-                                        <h4 class="font-bold text-white text-sm">${escapeHtml(p.Name || p.name)}</h4>
-                                        <span class="px-2 py-0.5 rounded text-[10px] font-bold ${isActive ? 'bg-emerald-500/20 text-emerald-300' : 'bg-red-500/20 text-red-300'}">
-                                            ${isActive ? '✓ Aktiv' : '✕ Deaktiviert'}
-                                        </span>
-                                        <span class="px-2 py-0.5 rounded text-[10px] bg-white/5 text-white/40">${typeLabel}</span>
-                                        ${isBuiltin ? '<span class="px-2 py-0.5 rounded text-[10px] bg-[#00a4dc]/10 text-[#38bdf8]">Built-in</span>' : '<span class="px-2 py-0.5 rounded text-[10px] bg-amber-500/10 text-amber-300">Dynamisch</span>'}
-                                        <span class="text-[10px] text-white/30 font-mono">v${escapeHtml(p.Version || p.version || '0')}</span>
-                                    </div>
-                                    <p class="text-xs text-white/40 mt-1">${escapeHtml(p.Description || p.description || '')}</p>
-                                    <div class="flex items-center gap-2 mt-3 flex-wrap">
-                                        <button class="jf-btn-primary text-xs !py-1.5 !px-3" onclick="openPluginConfig('${escapeHtml(pluginId)}')">
-                                            ⚙️ Konfigurieren
-                                        </button>
-                                        <div class="flex items-center gap-1 ml-auto" title="Priorität (niedriger = zuerst verarbeitet)">
-                                            <span class="text-[10px] text-white/40">Prio:</span>
-                                            <button class="w-6 h-6 rounded bg-white/10 hover:bg-white/20 text-white/60 hover:text-white text-xs flex items-center justify-center transition" onclick="changePluginPriority('${escapeHtml(pluginId)}', -10)" title="Priorität erhöhen">▲</button>
-                                            <span id="prio-${escapeHtml(pluginId)}" class="text-xs font-mono text-white/70 w-8 text-center">${priority}</span>
-                                            <button class="w-6 h-6 rounded bg-white/10 hover:bg-white/20 text-white/60 hover:text-white text-xs flex items-center justify-center transition" onclick="changePluginPriority('${escapeHtml(pluginId)}', 10)" title="Priorität verringern">▼</button>
-                                        </div>
-                                    </div>
-                                </div>
-                            </div>
-                        </div>`;
-                    }).join('')}
-                </div>
-            </div>
-
-            <!-- Tab 5: Sessions -->
+            <!-- Tab 4: Sessions -->
             <div id="admin-sessions" class="hidden jf-settings-card">
                 <h3 class="font-bold text-white text-base mb-4">${t('admin.active_sessions')}</h3>
                 <div class="overflow-x-auto">
@@ -2333,7 +2335,7 @@ function showAdminTab(btn, tabId) {
     });
     btn.className = 'px-4 py-2 rounded-xl text-xs font-semibold whitespace-nowrap transition bg-[#00a4dc] text-white shadow-lg';
 
-    ['admin-overview', 'admin-users', 'admin-libs', 'admin-tasks', 'admin-plugins', 'admin-sessions', 'admin-activity', 'admin-livelog'].forEach(id => {
+    ['admin-overview', 'admin-users', 'admin-libs', 'admin-tasks', 'admin-sessions', 'admin-activity', 'admin-livelog'].forEach(id => {
         const el = $(id);
         if (el) el.classList.toggle('hidden', id !== tabId);
     });
@@ -2342,75 +2344,23 @@ function showAdminTab(btn, tabId) {
     if (tabId === 'admin-livelog') initLiveLog();
 }
 
-// --- Plugin Configuration Modal ---
-
-async function openPluginConfig(pluginId) {
-    try {
-        const config = await API.getPluginConfig(pluginId).catch(() => ({ PluginId: pluginId, values: {} }));
-        const plugins = await API.getPlugins().catch(() => []);
-        const plugin = plugins.find(p => (p.Id || p.id) === pluginId);
-        
-        const name = plugin?.Name || plugin?.name || pluginId;
-        const values = config.values || config;
-        
-        // Create modal
-        const modal = document.createElement('dialog');
-        modal.id = 'plugin-config-modal';
-        modal.className = 'bg-[#0f172a] border border-white/10 rounded-2xl p-6 max-w-lg w-full text-white shadow-2xl';
-        modal.innerHTML = `
-            <div class="flex items-center justify-between mb-4">
-                <h3 class="text-lg font-bold text-white">⚙️ ${escapeHtml(name)}</h3>
-                <button onclick="document.getElementById('plugin-config-modal').close()" class="text-white/40 hover:text-white text-xl">✕</button>
-            </div>
-            <div class="mb-4">
-                <label class="block text-xs font-semibold text-white/70 mb-2">Konfiguration (JSON)</label>
-                <textarea id="plugin-config-json" class="jf-input w-full font-mono text-xs" rows="10">${JSON.stringify(values, null, 2)}</textarea>
-                <p class="text-[10px] text-white/30 mt-1">Passwort-Felder werden verschlüsselt in der Datenbank gespeichert.</p>
-            </div>
-            <div class="flex gap-2 justify-end">
-                <button onclick="document.getElementById('plugin-config-modal').close()" class="jf-btn-ghost text-xs">Abbrechen</button>
-                <button onclick="savePluginConfig('${escapeHtml(pluginId)}')" class="jf-btn-primary text-xs">Speichern</button>
-            </div>
-        `;
-        document.body.appendChild(modal);
-        modal.showModal();
-    } catch (e) {
-        toast('Konfiguration konnte nicht geladen werden: ' + e.message, 'error');
+// An administrator changes another user's role or disabled state. The checkbox is disabled while the request runs, the users list cache is dropped, and the users tab is shown again after the page is rendered.
+async function setUserPolicy(el, policy) {
+    if (policy.IsDisabled && !confirm(t('admin.disable_user_confirm', { name: el.dataset.name }))) {
+        el.checked = false;
+        return;
     }
-}
-
-async function savePluginConfig(pluginId) {
+    el.disabled = true;
     try {
-        const jsonStr = $('plugin-config-json').value;
-        const config = JSON.parse(jsonStr);
-        await API.setPluginConfig(pluginId, config);
-        toast('Plugin-Konfiguration gespeichert');
-        const modal = $('plugin-config-modal');
-        if (modal) modal.remove();
-        // Refresh admin page to show updated status
-        if (currentPage === 'admin') renderAdmin();
-    } catch (e) {
-        if (e instanceof SyntaxError) {
-            toast('Ungültiges JSON: ' + e.message, 'error');
-        } else {
-            toast('Fehler beim Speichern: ' + e.message, 'error');
-        }
+        await API.updatePolicy(el.dataset.id, policy);
+        toast(t('admin.user_updated'));
+    } catch (err) {
+        toast(err.message, 'error');
     }
-}
-
-async function changePluginPriority(pluginId, delta) {
-    try {
-        const resp = await API.getPluginPriority(pluginId);
-        const currentPriority = resp.priority != null ? resp.priority : 100;
-        const newPriority = Math.max(0, currentPriority + delta);
-        await API.setPluginPriority(pluginId, newPriority);
-        // Update the display without full refresh
-        const prioEl = $('prio-' + pluginId);
-        if (prioEl) prioEl.textContent = newPriority;
-        toast('Priorität auf ' + newPriority + ' gesetzt');
-    } catch (e) {
-        toast('Fehler beim Ändern der Priorität: ' + e.message, 'error');
-    }
+    API.invalidateCache('/Users');
+    await renderAdmin();
+    const tab = document.querySelector('[data-tab="admin-users"]');
+    if (tab) showAdminTab(tab, 'admin-users');
 }
 
 // --- Scheduled Tasks UI ---

@@ -20,6 +20,11 @@ pub fn routes() -> Router<AppState> {
             "/Videos/{id}/Subtitles/{index}/Stream",
             get(get_subtitle_stream),
         )
+}
+
+/// Administrator-only subtitle routes. `routes::build_router` wraps them in `require_admin`.
+pub fn admin_routes() -> Router<AppState> {
+    Router::new()
         .route(
             "/Items/{id}/RemoteSearch/Subtitles",
             get(search_remote_subtitles),

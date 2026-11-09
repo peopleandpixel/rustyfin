@@ -1,5 +1,5 @@
 use axum::extract::State;
-use axum::routing::get;
+use axum::routing::{get, put};
 use axum::{Json, Router};
 
 use rustyfin_model::configuration::{
@@ -11,20 +11,21 @@ use crate::state::AppState;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route(
-            "/Configuration/MediaEncoding",
-            get(get_media_encoding).put(update_media_encoding),
-        )
-        .route(
-            "/Configuration/Networking",
-            get(get_networking).put(update_networking),
-        )
+        .route("/Configuration/MediaEncoding", get(get_media_encoding))
+        .route("/Configuration/Networking", get(get_networking))
         .route("/Configuration/ServerRecording", get(get_server_recording))
         .route("/Configuration/Display", get(get_display))
         .route(
             "/Configuration/ParentalControls",
             get(get_parental_controls),
         )
+}
+
+/// Administrator-only configuration routes. `routes::build_router` wraps them in `require_admin`.
+pub fn admin_routes() -> Router<AppState> {
+    Router::new()
+        .route("/Configuration/MediaEncoding", put(update_media_encoding))
+        .route("/Configuration/Networking", put(update_networking))
 }
 
 async fn get_media_encoding() -> Json<MediaEncodingConfiguration> {

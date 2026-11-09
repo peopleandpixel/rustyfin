@@ -1,4 +1,5 @@
 use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
 use axum::routing::{delete, get, post};
 use axum::{Extension, Json, Router};
 use rustyfin_model::auth::Claims;
@@ -42,6 +43,11 @@ pub fn routes() -> Router<AppState> {
             post(session_capabilities_full),
         )
         .route("/Devices/{deviceId}/Command", post(send_device_command))
+}
+
+/// Administrator-only device routes. `routes::build_router` wraps them in `require_admin`.
+pub fn admin_routes() -> Router<AppState> {
+    Router::new()
         .route("/Devices", delete(delete_device))
         .route("/Devices/Info", get(get_devices_info))
         .route(
@@ -50,8 +56,15 @@ pub fn routes() -> Router<AppState> {
         )
 }
 
-async fn get_sessions(State(state): State<AppState>) -> Result<Json<Vec<SessionInfo>>, ApiError> {
-    let sessions = rustyfin_db::repo_session::get_active_sessions(&state.db_ro).await?;
+async fn get_sessions(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<Vec<SessionInfo>>, ApiError> {
+    let mut sessions = rustyfin_db::repo_session::get_active_sessions(&state.db_ro).await?;
+    // A non-admin sees only their own sessions, as in Jellyfin.
+    if !claims.is_admin {
+        sessions.retain(|s| s.user_id == claims.sub);
+    }
     Ok(Json(sessions))
 }
 
@@ -65,8 +78,12 @@ struct NowPlayingItemQuery {
 async fn get_now_playing_item(
     State(state): State<AppState>,
     Query(query): Query<NowPlayingItemQuery>,
+    Extension(claims): Extension<Claims>,
 ) -> Result<Json<Option<MediaItem>>, ApiError> {
     if let Some(session_id) = query.session_id {
+        let owner =
+            rustyfin_db::repo_session::get_session_user_id(&state.db_ro, &session_id).await?;
+        check_control(&claims, owner, "Session")?;
         let now_playing =
             rustyfin_db::repo_session::get_now_playing_item(&state.db_ro, &session_id).await?;
         Ok(Json(now_playing))
@@ -77,25 +94,22 @@ async fn get_now_playing_item(
 
 async fn logout_session(
     State(state): State<AppState>,
-    Extension(claims): Extension<Claims>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    // Build session id from user + device info (same logic as middleware)
-    // Delete all sessions for this user as fallback
-    let sessions = rustyfin_db::repo_session::get_active_sessions(&state.db).await?;
-    for s in &sessions {
-        if s.user_id == claims.sub {
-            rustyfin_db::repo_session::delete_session(&state.db, &s.id).await?;
-            break;
-        }
+    token: Option<Extension<rustyfin_auth::RequestToken>>,
+) -> Result<StatusCode, ApiError> {
+    if let Some(Extension(rt)) = token {
+        rustyfin_auth::logout(&state.db, &rt.0).await?;
     }
-    Ok(Json(serde_json::json!({})))
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn send_command(
     Path(session_id): Path<String>,
     State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
     Json(cmd): Json<SessionCommand>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let owner = rustyfin_db::repo_session::get_session_user_id(&state.db_ro, &session_id).await?;
+    check_control(&claims, owner, "Session")?;
     // Try to deliver the command via WebSocket
     let delivered = crate::routes::websocket::send_command_to_session(
         &session_id,
@@ -125,6 +139,7 @@ async fn send_command(
             data: serde_json::json!({
                 "Id": session_id,
                 "Command": cmd.command,
+                "UserId": owner,
             }),
         },
     )
@@ -155,7 +170,9 @@ async fn delete_device(
     Query(q): Query<DeviceIdQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     if !claims.is_admin {
-        return Err(ApiError::Unauthorized);
+        return Err(ApiError::Forbidden(
+            "Administrator access is required.".to_string(),
+        ));
     }
     rustyfin_db::repo_session::delete_device(&state.db, &q.id).await?;
     Ok(Json(serde_json::json!({})))
@@ -166,8 +183,11 @@ async fn delete_device(
 async fn send_device_command(
     Path(device_id): Path<String>,
     State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
     Json(cmd): Json<SessionCommand>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let owner = rustyfin_db::repo_session::get_device_user_id(&state.db_ro, &device_id).await?;
+    check_control(&claims, owner, "Device")?;
     // Try to deliver via WebSocket using device ID as session ID
     let delivered = crate::routes::websocket::send_command_to_session(
         &device_id,
@@ -197,6 +217,7 @@ async fn send_device_command(
             data: serde_json::json!({
                 "Id": device_id,
                 "Command": cmd.command,
+                "UserId": owner,
             }),
         },
     )
@@ -209,11 +230,14 @@ async fn send_device_command(
 async fn send_command_by_name(
     Path((session_id, _command)): Path<(String, String)>,
     State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let owner = rustyfin_db::repo_session::get_session_user_id(&state.db_ro, &session_id).await?;
+    check_control(&claims, owner, "Session")?;
     let _ = crate::routes::websocket::broadcast_event(
         &state,
         rustyfin_model::ws_event::WsEvent::SessionChanged {
-            data: serde_json::json!({"Id": session_id, "Command": _command}),
+            data: serde_json::json!({"Id": session_id, "Command": _command, "UserId": owner}),
         },
     )
     .await;
@@ -224,16 +248,33 @@ async fn send_command_by_name(
 async fn send_message(
     Path(session_id): Path<String>,
     State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
     Json(_body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let owner = rustyfin_db::repo_session::get_session_user_id(&state.db_ro, &session_id).await?;
+    check_control(&claims, owner, "Session")?;
     let _ = crate::routes::websocket::broadcast_event(
         &state,
         rustyfin_model::ws_event::WsEvent::SessionChanged {
-            data: serde_json::json!({"Id": session_id, "MessageType": "Notification"}),
+            data: serde_json::json!({"Id": session_id, "MessageType": "Notification", "UserId": owner}),
         },
     )
     .await;
     Ok(Json(serde_json::json!({})))
+}
+
+/// Remote control of a session or device needs its owner or an administrator (Jellyfin's
+/// `SessionManager.AssertCanControl`; Rustyfin has no `EnableRemoteControlOfOtherUsers` policy).
+/// `owner` is `None` when the target does not exist: 404 for an administrator, and 403 for
+/// anyone else, so other users' ids cannot be probed.
+fn check_control(claims: &Claims, owner: Option<uuid::Uuid>, target: &str) -> Result<(), ApiError> {
+    match owner {
+        Some(owner) if owner == claims.sub || claims.is_admin => Ok(()),
+        None if claims.is_admin => Err(ApiError::NotFound(format!("{target} not found"))),
+        _ => Err(ApiError::Forbidden(
+            "The current user does not have permission to remote control other users.".to_string(),
+        )),
+    }
 }
 
 /// POST /Sessions/{sessionId}/Playing

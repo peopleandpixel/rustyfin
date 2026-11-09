@@ -389,7 +389,10 @@ pub async fn get_user_item_data_batch(
     }
 
     let uid = user_id.to_string();
-    let placeholders: Vec<String> = (1..=item_ids.len()).map(|i| format!("?{}", i)).collect();
+    // ?1 is the user, so the item ids start at ?2.
+    let placeholders: Vec<String> = (2..=item_ids.len() + 1)
+        .map(|i| format!("?{}", i))
+        .collect();
     let placeholder_str = placeholders.join(",");
     let sql = format!(
         "SELECT item_id, playback_position_ticks, play_count, is_favorite, played, \

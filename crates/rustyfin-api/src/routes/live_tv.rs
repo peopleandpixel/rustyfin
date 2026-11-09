@@ -293,6 +293,28 @@ pub fn routes() -> Router<AppState> {
         .route("/LiveTv/LiveStream", post(start_live_stream))
         .route("/LiveTv/VirtualChannels", get(get_virtual_channels))
         .route(
+            "/LiveTv/RecommendedProgramsPtr",
+            get(get_recommended_programs),
+        )
+        .route("/LiveTv/RecordingsFolders", get(get_recordings_folders))
+        .route(
+            "/LiveTv/NextLiveMediaSource",
+            get(get_next_live_media_source),
+        )
+        .route(
+            "/LiveTv/Programs/{programId}/MediaSources",
+            get(get_program_media_sources),
+        )
+        .route(
+            "/LiveTv/Programs/{programId}/MediaSources/{mediaSourceId}/stream",
+            get(get_program_stream),
+        )
+}
+
+/// Administrator-only Live TV routes. `routes::build_router` wraps them in `require_admin`.
+pub fn admin_routes() -> Router<AppState> {
+    Router::new()
+        .route(
             "/LiveTv/TunerHosts",
             get(get_tuner_hosts)
                 .post(create_tuner_host)
@@ -317,23 +339,6 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/LiveTv/ChannelMappingOptions",
             get(get_channel_mapping_options),
-        )
-        .route(
-            "/LiveTv/RecommendedProgramsPtr",
-            get(get_recommended_programs),
-        )
-        .route("/LiveTv/RecordingsFolders", get(get_recordings_folders))
-        .route(
-            "/LiveTv/NextLiveMediaSource",
-            get(get_next_live_media_source),
-        )
-        .route(
-            "/LiveTv/Programs/{programId}/MediaSources",
-            get(get_program_media_sources),
-        )
-        .route(
-            "/LiveTv/Programs/{programId}/MediaSources/{mediaSourceId}/stream",
-            get(get_program_stream),
         )
 }
 

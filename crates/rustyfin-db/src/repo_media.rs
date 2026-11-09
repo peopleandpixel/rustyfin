@@ -446,26 +446,40 @@ fn build_filtered_query(
         }
     }
 
-    // IsFavorite / IsPlayed / IsUnplayed — static subqueries
+    // IsFavorite / IsPlayed / IsUnplayed — subqueries scoped to the caller's user_id, which
+    // get_items_filtered binds once per clause present, in this same order.
     if is_favorite == Some(true) {
-        where_parts
-            .push("id IN (SELECT item_id FROM user_item_data WHERE is_favorite = 1)".to_string());
+        where_parts.push(
+            "id IN (SELECT item_id FROM user_item_data WHERE user_id = ? AND is_favorite = 1)"
+                .to_string(),
+        );
     } else if is_favorite == Some(false) {
         where_parts.push(
-            "id NOT IN (SELECT item_id FROM user_item_data WHERE is_favorite = 1)".to_string(),
+            "id NOT IN (SELECT item_id FROM user_item_data WHERE user_id = ? AND is_favorite = 1)"
+                .to_string(),
         );
     }
     if is_played == Some(true) {
-        where_parts.push("id IN (SELECT item_id FROM user_item_data WHERE played = 1)".to_string());
+        where_parts.push(
+            "id IN (SELECT item_id FROM user_item_data WHERE user_id = ? AND played = 1)"
+                .to_string(),
+        );
     } else if is_played == Some(false) {
-        where_parts
-            .push("id NOT IN (SELECT item_id FROM user_item_data WHERE played = 1)".to_string());
+        where_parts.push(
+            "id NOT IN (SELECT item_id FROM user_item_data WHERE user_id = ? AND played = 1)"
+                .to_string(),
+        );
     }
     if is_unplayed == Some(true) {
-        where_parts
-            .push("id NOT IN (SELECT item_id FROM user_item_data WHERE played = 1)".to_string());
+        where_parts.push(
+            "id NOT IN (SELECT item_id FROM user_item_data WHERE user_id = ? AND played = 1)"
+                .to_string(),
+        );
     } else if is_unplayed == Some(false) {
-        where_parts.push("id IN (SELECT item_id FROM user_item_data WHERE played = 1)".to_string());
+        where_parts.push(
+            "id IN (SELECT item_id FROM user_item_data WHERE user_id = ? AND played = 1)"
+                .to_string(),
+        );
     }
 
     // Build the static base WHERE clause for single-value params.
@@ -566,6 +580,7 @@ pub async fn get_items_filtered(
     premiere_date: Option<&str>,
     date_created: Option<&str>,
     runtime: Option<(i32, i32)>,
+    user_id: Option<Uuid>,
 ) -> Result<(Vec<MediaItem>, i64), sqlx::Error> {
     // Convert options to strings for the (? IS NULL OR ? = '' OR col = ?) pattern
     let pid_str = parent_id.map(|u| u.to_string()).unwrap_or_default();
@@ -580,6 +595,7 @@ pub async fn get_items_filtered(
     let ed_str = end_date.unwrap_or_default();
     let pd_str = premiere_date.unwrap_or_default();
     let dc_str = date_created.unwrap_or_default();
+    let uid_str = user_id.unwrap_or(Uuid::nil()).to_string();
     let (min_ticks, max_ticks) = runtime
         .map(|(min, max)| {
             (
@@ -732,6 +748,16 @@ pub async fn get_items_filtered(
             }
         }
     }
+    // One user_id per IsFavorite / IsPlayed / IsUnplayed clause, in build_filtered_query's order.
+    if is_favorite.is_some() {
+        count_q = count_q.bind(&uid_str);
+    }
+    if is_played.is_some() {
+        count_q = count_q.bind(&uid_str);
+    }
+    if is_unplayed.is_some() {
+        count_q = count_q.bind(&uid_str);
+    }
 
     let total: i64 = count_q.fetch_one(pool).await.unwrap_or(0);
 
@@ -835,6 +861,16 @@ pub async fn get_items_filtered(
                 data_q = data_q.bind(mt);
             }
         }
+    }
+    // Same user_id binds as the count query, for the same clauses.
+    if is_favorite.is_some() {
+        data_q = data_q.bind(&uid_str);
+    }
+    if is_played.is_some() {
+        data_q = data_q.bind(&uid_str);
+    }
+    if is_unplayed.is_some() {
+        data_q = data_q.bind(&uid_str);
     }
 
     // Pagination
@@ -1283,28 +1319,6 @@ pub async fn get_library_episodes(
     .fetch_all(pool)
     .await?;
     Ok(rows)
-}
-
-/// Get items with playback position > 0 (resume items) for all users
-pub async fn get_resume_items(
-    pool: &SqlitePool,
-    limit: i64,
-) -> Result<Vec<MediaItem>, sqlx::Error> {
-    let rows = sqlx::query_as::<_, MediaItemRow>(
-        "SELECT m.id, m.name, m.sort_name, m.overview, m.media_type, m.path, m.parent_id, m.library_id, \
-         m.production_year, m.community_rating, m.official_rating, m.genres, m.date_created, \
-         m.premiere_date, m.runtime_ticks, m.index_number, m.parent_index_number, m.tmdb_id, m.tvdb_id, \
-         m.tags, m.status, m.original_language, m.tagline, m.production_countries, m.budget, m.revenue, \
-         m.homepage, m.end_date, m.vote_count, m.popularity \
-         FROM media_items m \
-         INNER JOIN user_item_data u ON u.item_id = m.id \
-         WHERE u.playback_position_ticks > 0 \
-         ORDER BY u.last_played_date DESC LIMIT ?",
-    )
-    .bind(limit)
-    .fetch_all(pool)
-    .await?;
-    Ok(rows.into_iter().map(Into::into).collect())
 }
 
 /// Get items with playback position > 0 (resume items) for a specific user

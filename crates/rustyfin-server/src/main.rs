@@ -1,3 +1,5 @@
+mod credentials;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tower::Service;
@@ -11,7 +13,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
 use rustyfin_api::log_stream::LogStreamLayer;
-use rustyfin_api::middleware::RateLimiter;
+use rustyfin_api::middleware::{DEFAULT_LOGIN_LIMIT, DEFAULT_LOGIN_WINDOW_SECS, RateLimiter};
 use rustyfin_api::routes::build_router;
 use rustyfin_api::state::AppState;
 use rustyfin_model::server_info::ServerConfiguration;
@@ -84,11 +86,13 @@ async fn main() {
     let db_url = std::env::var("RUSTYFIN_DB")
         .unwrap_or_else(|_| data_dir.join("rustyfin.db").display().to_string());
 
-    let jwt_secret =
-        std::env::var("RUSTYFIN_SECRET").unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
+    if std::env::var("RUSTYFIN_SECRET").is_ok() {
+        tracing::info!(
+            "RUSTYFIN_SECRET is set but no longer used; access tokens are stored server-side and survive restarts"
+        );
+    }
 
-    let server_id =
-        std::env::var("RUSTYFIN_SERVER_ID").unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
+    let server_id = load_or_create_server_id(&data_dir);
 
     // IPv6 dual-stack: use [::]:8096 to listen on both IPv4 and IPv6
     let bind_addr = std::env::var("RUSTYFIN_BIND").unwrap_or_else(|_| "0.0.0.0:8096".to_string());
@@ -96,10 +100,10 @@ async fn main() {
     let tls_cert = std::env::var("RUSTYFIN_TLS_CERT").ok();
     let tls_key = std::env::var("RUSTYFIN_TLS_KEY").ok();
 
-    let api_key = std::env::var("RUSTYFIN_API_KEY").ok();
+    let api_key = credentials::api_key(std::env::var("RUSTYFIN_API_KEY").ok());
 
     // Load or create server configuration
-    let config = load_config(&data_dir);
+    let mut config = load_config(&data_dir);
 
     tracing::info!("initializing database at {}", db_url);
     let pool = rustyfin_db::init_db(&db_url)
@@ -111,16 +115,23 @@ async fn main() {
         .await
         .expect("failed to initialize read-only database pool");
 
-    // Create default admin user if no users exist
-    let users = rustyfin_db::repo_user::get_all_users(&pool)
+    // No user is created at startup. A server with users gets an owner, its earliest enabled
+    // administrator, and a closed setup wizard. A fresh one waits for the wizard.
+    rustyfin_api::routes::settle_owner_at_startup(&pool, &mut config, &data_dir)
         .await
-        .expect("failed to query users");
+        .expect("failed to settle the server owner");
 
-    if users.is_empty() {
-        tracing::info!("no users found, creating default admin user (admin / admin)");
-        rustyfin_auth::create_initial_user(&pool, "admin", "admin")
-            .await
-            .expect("failed to create initial user");
+    // Warn about each enabled administrator who still has the default password "admin".
+    match rustyfin_auth::admins_with_default_password(&pool).await {
+        Ok(names) => {
+            for n in names {
+                tracing::warn!(
+                    "administrator account '{}' still uses the default password 'admin'; please change it",
+                    n
+                );
+            }
+        }
+        Err(e) => tracing::warn!("could not check for default admin passwords: {}", e),
     }
 
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
@@ -130,27 +141,31 @@ async fn main() {
     transcode_manager.spawn_cleanup_task();
 
     let data_dir_arc = Arc::new(data_dir);
-    let plugin_manager = rustyfin_core::plugin_manager::PluginManager::new(&data_dir_arc)
-        .with_database(pool.clone());
+    let task_scheduler =
+        rustyfin_core::scheduler::TaskScheduler::new(pool.clone(), data_dir_arc.clone());
+
+    let plugin_manager = rustyfin_core::plugin_manager::PluginManager::new(&data_dir_arc);
     plugin_manager.load_all().await;
 
-    // Register built-in metadata provider plugins (configs loaded from DB)
-    register_builtin_plugins(&plugin_manager).await;
-
-    let task_scheduler =
-        rustyfin_core::scheduler::TaskScheduler::new(pool.clone(), data_dir_arc.clone(), plugin_manager.clone());
-
-    // Rate limiter: default 500 requests per 60 seconds per IP (configurable via env, 0 to disable)
+    // Rate limiter: default 10 requests per 60 seconds per resolved client IP, for the login
+    // endpoints only (AuthenticateByName, ForgotPassword, ForgotPassword/Pin, ResetPassword).
+    // Configurable via env; 0 disables.
     let rate_max: usize = std::env::var("RUSTYFIN_RATE_LIMIT")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(500);
+        .unwrap_or(DEFAULT_LOGIN_LIMIT);
     let rate_window: u64 = std::env::var("RUSTYFIN_RATE_WINDOW")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(60);
+        .unwrap_or(DEFAULT_LOGIN_WINDOW_SECS);
     let rate_limiter = RateLimiter::new(rate_max, rate_window);
     rate_limiter.start_cleanup();
+
+    // Reverse proxies we trust to set X-Forwarded-For (comma-separated CIDRs or IPs). Loopback is
+    // trusted only when listed.
+    let known_proxies = Arc::new(rustyfin_api::middleware::parse_known_proxies(
+        &std::env::var("RUSTYFIN_KNOWN_PROXIES").unwrap_or_default(),
+    ));
 
     // In-memory response caches
     let cache = rustyfin_api::cache::ApiCache::new();
@@ -168,7 +183,6 @@ async fn main() {
     let state = AppState {
         db: pool,
         db_ro: pool_ro,
-        jwt_secret: Arc::new(jwt_secret),
         server_id: Arc::new(server_id),
         data_dir: data_dir_arc,
         config: Arc::new(RwLock::new(config)),
@@ -180,6 +194,7 @@ async fn main() {
         task_scheduler: task_scheduler.clone(),
         plugin_manager,
         rate_limiter,
+        known_proxies,
         ws_broadcast,
         log_level_tx,
         cache,
@@ -200,8 +215,8 @@ async fn main() {
         .and_then(|p| p.parse().ok())
         .unwrap_or(8096);
 
-    // Background task: SSDP discovery (DLNA)
-    {
+    // Background task: SSDP discovery (DLNA), only when the DLNA server is on
+    if state.config.read().await.enable_dlna_server {
         let dlna_config = std::sync::Arc::new(rustyfin_core::dlna::DlnaConfig {
             server_name: "Rustyfin".to_string(),
             server_id: state.server_id.to_string(),
@@ -210,11 +225,11 @@ async fn main() {
         });
         let shutdown_rx = state.shutdown_tx.subscribe();
         let cfg = dlna_config.clone();
-        let _ = tokio::spawn(async move {
+        tokio::spawn(async move {
             rustyfin_core::dlna::run_ssdp_responder(cfg, shutdown_rx).await;
         });
         let shutdown_rx = state.shutdown_tx.subscribe();
-        let _ = tokio::spawn(async move {
+        tokio::spawn(async move {
             rustyfin_core::dlna::run_ssdp_advertiser(dlna_config, shutdown_rx).await;
         });
     }
@@ -229,7 +244,7 @@ async fn main() {
             endpoint_address: std::env::var("RUSTYFIN_PUBLISHED_URL").ok(),
         });
         let shutdown_rx = state.shutdown_tx.subscribe();
-        let _ = tokio::spawn(async move {
+        tokio::spawn(async move {
             rustyfin_core::udp_discovery::run_udp_discovery(udp_config, shutdown_rx).await;
         });
     }
@@ -243,7 +258,7 @@ async fn main() {
             bind_ip: std::net::Ipv4Addr::UNSPECIFIED,
         });
         let shutdown_rx = state.shutdown_tx.subscribe();
-        let _ = tokio::spawn(async move {
+        tokio::spawn(async move {
             rustyfin_core::mdns::run_mdns_responder(mdns_config, shutdown_rx).await;
         });
     }
@@ -268,7 +283,7 @@ async fn main() {
     // Background task: cleanup expired sessions every 5 minutes
     {
         let db = cleanup_db;
-        let _ = tokio::spawn(async move {
+        tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
             loop {
                 interval.tick().await;
@@ -283,7 +298,7 @@ async fn main() {
 
     // Background task: cleanup expired L2 cache entries every 6 hours
     {
-        let _ = tokio::spawn(async move {
+        tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600 * 6));
             loop {
                 interval.tick().await;
@@ -296,7 +311,7 @@ async fn main() {
     {
         let config = sighup_config;
         let data_dir = sighup_data_dir;
-        let _ = tokio::spawn(async move {
+        tokio::spawn(async move {
             #[cfg(unix)]
             {
                 let mut sig =
@@ -436,270 +451,53 @@ fn data_dir() -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from("."))
 }
 
-/// Register built-in plugins (TMDB, OMDb, Fanart, TheTVDB, OpenSubtitles, Webhook).
-/// Plugin configurations are loaded from the database via the PluginManager.
-async fn register_builtin_plugins(
-    plugin_manager: &rustyfin_core::plugin_manager::PluginManager,
-) {
-    use rustyfin_core::plugin_manager::BuiltinPluginInfo;
-    use rustyfin_model::plugin::{Plugin, PluginStatus, PluginType};
-
-    // TMDB plugin
-    let tmdb_plugin = plugin_tmdb::TmdbPlugin::default();
-    if let Some(config) = plugin_manager.load_plugin_config_from_db("tmdb").await {
-        let _ = tmdb_plugin.set_configuration(config);
-    }
-    let tmdb_active = plugin_tmdb::register_tmdb_provider(&tmdb_plugin, plugin_manager).await.is_ok();
-    plugin_manager.register_builtin_plugin(BuiltinPluginInfo {
-        name: tmdb_plugin.name().to_string(),
-        version: tmdb_plugin.version().to_string(),
-        id: tmdb_plugin.id().to_string(),
-        description: tmdb_plugin.description().to_string(),
-        plugin_type: PluginType::MetadataProvider,
-        status: if tmdb_active { PluginStatus::Active } else { PluginStatus::Disabled },
-    }).await;
-    if tmdb_active {
-        tracing::info!("registered TMDB metadata provider");
-    } else {
-        tracing::info!("TMDB provider disabled (no API key configured)");
+/// The server id is stable across restarts. `RUSTYFIN_SERVER_ID` wins. Otherwise the id is read
+/// from `<data_dir>/server_id`, or on first start generated and written there.
+fn load_or_create_server_id(data_dir: &std::path::Path) -> String {
+    if let Ok(id) = std::env::var("RUSTYFIN_SERVER_ID")
+        && !id.is_empty()
+    {
+        return id;
     }
 
-    // OMDb plugin
-    let omdb_plugin = plugin_omdb::OmdbPlugin::default();
-    if let Some(config) = plugin_manager.load_plugin_config_from_db("omdb").await {
-        let _ = omdb_plugin.set_configuration(config);
-    }
-    let omdb_active = plugin_omdb::register_omdb_provider(&omdb_plugin, plugin_manager).await.is_ok();
-    plugin_manager.register_builtin_plugin(BuiltinPluginInfo {
-        name: omdb_plugin.name().to_string(),
-        version: omdb_plugin.version().to_string(),
-        id: omdb_plugin.id().to_string(),
-        description: omdb_plugin.description().to_string(),
-        plugin_type: PluginType::MetadataProvider,
-        status: if omdb_active { PluginStatus::Active } else { PluginStatus::Disabled },
-    }).await;
-    if omdb_active {
-        tracing::info!("registered OMDb metadata provider");
-    } else {
-        tracing::info!("OMDb provider disabled (no API key configured)");
-    }
-
-    // Fanart plugin
-    let fanart_plugin = plugin_fanart::FanartPlugin::default();
-    if let Some(config) = plugin_manager.load_plugin_config_from_db("fanart").await {
-        let _ = fanart_plugin.set_configuration(config);
-    }
-    let fanart_active = plugin_fanart::register_fanart_provider(&fanart_plugin, plugin_manager).await.is_ok();
-    plugin_manager.register_builtin_plugin(BuiltinPluginInfo {
-        name: fanart_plugin.name().to_string(),
-        version: fanart_plugin.version().to_string(),
-        id: fanart_plugin.id().to_string(),
-        description: fanart_plugin.description().to_string(),
-        plugin_type: PluginType::MetadataProvider,
-        status: if fanart_active { PluginStatus::Active } else { PluginStatus::Disabled },
-    }).await;
-    if fanart_active {
-        tracing::info!("registered Fanart.tv metadata provider");
-    } else {
-        tracing::info!("Fanart provider disabled (no API key configured)");
-    }
-
-    // OpenSubtitles plugin (always registered — no API key required)
-    let os_plugin = plugin_opensubtitles::OpenSubtitlesPlugin::default();
-    plugin_opensubtitles::register_opensubtitles_provider(&os_plugin, plugin_manager).await;
-    plugin_manager.register_builtin_plugin(BuiltinPluginInfo {
-        name: os_plugin.name().to_string(),
-        version: os_plugin.version().to_string(),
-        id: os_plugin.id().to_string(),
-        description: os_plugin.description().to_string(),
-        plugin_type: PluginType::SubtitleProvider,
-        status: PluginStatus::Active,
-    }).await;
-    tracing::info!("registered OpenSubtitles subtitle provider");
-
-    // TheTVDB plugin (always registered — uses free TVMaze API, no API key required)
-    let tvdb_plugin = plugin_tvdb::TvdbPlugin::default();
-    if let Some(config) = plugin_manager.load_plugin_config_from_db("tvdb").await {
-        let _ = tvdb_plugin.set_configuration(config);
-    }
-    plugin_tvdb::register_tvdb_provider(&tvdb_plugin, plugin_manager).await;
-    plugin_manager.register_builtin_plugin(BuiltinPluginInfo {
-        name: tvdb_plugin.name().to_string(),
-        version: tvdb_plugin.version().to_string(),
-        id: tvdb_plugin.id().to_string(),
-        description: tvdb_plugin.description().to_string(),
-        plugin_type: PluginType::MetadataProvider,
-        status: PluginStatus::Active,
-    }).await;
-    tracing::info!("registered TheTVDB metadata provider");
-
-    // Webhook notification plugin (registered if configured)
-    let webhook_plugin = plugin_webhook::WebhookPlugin::default();
-    if let Some(config) = plugin_manager.load_plugin_config_from_db("webhook").await {
-        let _ = webhook_plugin.set_configuration(config.clone());
-        let webhook_active = plugin_webhook::register_webhook_provider(&webhook_plugin, plugin_manager).await.is_ok();
-        plugin_manager.register_builtin_plugin(BuiltinPluginInfo {
-            name: webhook_plugin.name().to_string(),
-            version: webhook_plugin.version().to_string(),
-            id: webhook_plugin.id().to_string(),
-            description: webhook_plugin.description().to_string(),
-            plugin_type: PluginType::NotificationProvider,
-            status: if webhook_active { PluginStatus::Active } else { PluginStatus::Disabled },
-        }).await;
-        if webhook_active {
-            tracing::info!("registered Webhook notification provider");
-        } else {
-            tracing::info!("Webhook provider disabled (configuration error)");
+    let path = data_dir.join("server_id");
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let existing = existing.trim();
+        if !existing.is_empty() {
+            return existing.to_string();
         }
-    } else {
-        // Register as disabled so it appears in the UI
-        plugin_manager.register_builtin_plugin(BuiltinPluginInfo {
-            name: webhook_plugin.name().to_string(),
-            version: webhook_plugin.version().to_string(),
-            id: webhook_plugin.id().to_string(),
-            description: webhook_plugin.description().to_string(),
-            plugin_type: PluginType::NotificationProvider,
-            status: PluginStatus::Disabled,
-        }).await;
-        tracing::info!("Webhook notification provider not configured — registered as disabled");
     }
 
-    // ntfy.sh notification plugin (registered if configured)
-    let ntfy_plugin = plugin_ntfy::NtfyPlugin::default();
-    if let Some(config) = plugin_manager.load_plugin_config_from_db("ntfy").await {
-        let _ = ntfy_plugin.set_configuration(config.clone());
-        let ntfy_active = plugin_ntfy::register_ntfy_provider(&ntfy_plugin, plugin_manager).await.is_ok();
-        plugin_manager.register_builtin_plugin(BuiltinPluginInfo {
-            name: ntfy_plugin.name().to_string(),
-            version: ntfy_plugin.version().to_string(),
-            id: ntfy_plugin.id().to_string(),
-            description: ntfy_plugin.description().to_string(),
-            plugin_type: PluginType::NotificationProvider,
-            status: if ntfy_active { PluginStatus::Active } else { PluginStatus::Disabled },
-        }).await;
-        if ntfy_active {
-            tracing::info!("registered ntfy.sh notification provider");
-        } else {
-            tracing::info!("ntfy provider disabled (configuration error)");
-        }
-    } else {
-        plugin_manager.register_builtin_plugin(BuiltinPluginInfo {
-            name: ntfy_plugin.name().to_string(),
-            version: ntfy_plugin.version().to_string(),
-            id: ntfy_plugin.id().to_string(),
-            description: ntfy_plugin.description().to_string(),
-            plugin_type: PluginType::NotificationProvider,
-            status: PluginStatus::Disabled,
-        }).await;
-        tracing::info!("ntfy notification provider not configured — registered as disabled");
+    let id = uuid::Uuid::new_v4().to_string();
+    // Write a temp file and rename it into place, so a crash cannot leave a partial id behind.
+    let tmp = data_dir.join("server_id.tmp");
+    if std::fs::write(&tmp, &id).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
     }
+    id
+}
 
-    // MQTT notification plugin (registered if configured)
-    let mqtt_plugin = plugin_mqtt::MqttPlugin::default();
-    if let Some(config) = plugin_manager.load_plugin_config_from_db("mqtt").await {
-        let _ = mqtt_plugin.set_configuration(config.clone());
-        let mqtt_active = plugin_mqtt::register_mqtt_provider(&mqtt_plugin, plugin_manager).await.is_ok();
-        plugin_manager.register_builtin_plugin(BuiltinPluginInfo {
-            name: mqtt_plugin.name().to_string(),
-            version: mqtt_plugin.version().to_string(),
-            id: mqtt_plugin.id().to_string(),
-            description: mqtt_plugin.description().to_string(),
-            plugin_type: PluginType::NotificationProvider,
-            status: if mqtt_active { PluginStatus::Active } else { PluginStatus::Disabled },
-        }).await;
-        if mqtt_active {
-            tracing::info!("registered MQTT notification provider");
-        } else {
-            tracing::info!("MQTT provider disabled (configuration error)");
-        }
-    } else {
-        plugin_manager.register_builtin_plugin(BuiltinPluginInfo {
-            name: mqtt_plugin.name().to_string(),
-            version: mqtt_plugin.version().to_string(),
-            id: mqtt_plugin.id().to_string(),
-            description: mqtt_plugin.description().to_string(),
-            plugin_type: PluginType::NotificationProvider,
-            status: PluginStatus::Disabled,
-        }).await;
-        tracing::info!("MQTT notification provider not configured — registered as disabled");
-    }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    // Pushover notification plugin (registered if configured)
-    let pushover_plugin = plugin_pushover::PushoverPlugin::default();
-    if let Some(config) = plugin_manager.load_plugin_config_from_db("pushover").await {
-        let _ = pushover_plugin.set_configuration(config.clone());
-        let pushover_active = plugin_pushover::register_pushover_provider(&pushover_plugin, plugin_manager).await.is_ok();
-        plugin_manager.register_builtin_plugin(BuiltinPluginInfo {
-            name: pushover_plugin.name().to_string(),
-            version: pushover_plugin.version().to_string(),
-            id: pushover_plugin.id().to_string(),
-            description: pushover_plugin.description().to_string(),
-            plugin_type: PluginType::NotificationProvider,
-            status: if pushover_active { PluginStatus::Active } else { PluginStatus::Disabled },
-        }).await;
-        if pushover_active {
-            tracing::info!("registered Pushover notification provider");
-        } else {
-            tracing::info!("Pushover provider disabled (configuration error)");
-        }
-    } else {
-        plugin_manager.register_builtin_plugin(BuiltinPluginInfo {
-            name: pushover_plugin.name().to_string(),
-            version: pushover_plugin.version().to_string(),
-            id: pushover_plugin.id().to_string(),
-            description: pushover_plugin.description().to_string(),
-            plugin_type: PluginType::NotificationProvider,
-            status: PluginStatus::Disabled,
-        }).await;
-        tracing::info!("Pushover notification provider not configured — registered as disabled");
-    }
+    #[test]
+    fn server_id_is_generated_once_then_reloaded() {
+        let dir = std::env::temp_dir().join(format!("rustyfin_server_id_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
 
-    // Trakt.tv metadata plugin (registered if configured)
-    let trakt_plugin = plugin_trakt::TraktPlugin::default();
-    if let Some(config) = plugin_manager.load_plugin_config_from_db("trakt").await {
-        let _ = trakt_plugin.set_configuration(config);
-    }
-    let trakt_active = plugin_trakt::register_trakt_provider(&trakt_plugin, plugin_manager).await.is_ok();
-    plugin_manager.register_builtin_plugin(BuiltinPluginInfo {
-        name: trakt_plugin.name().to_string(),
-        version: trakt_plugin.version().to_string(),
-        id: trakt_plugin.id().to_string(),
-        description: trakt_plugin.description().to_string(),
-        plugin_type: PluginType::MetadataProvider,
-        status: if trakt_active { PluginStatus::Active } else { PluginStatus::Disabled },
-    }).await;
-    if trakt_active {
-        tracing::info!("registered Trakt.tv metadata provider");
-    } else {
-        tracing::info!("Trakt provider disabled (no API key configured)");
-    }
+        let first = load_or_create_server_id(&dir);
+        let second = load_or_create_server_id(&dir);
 
-    // Podnapisi subtitle plugin (always registered — no API key required)
-    let podnapisi_plugin = plugin_podnapisi::PodnapisiPlugin::default();
-    plugin_podnapisi::register_podnapisi_provider(&podnapisi_plugin, plugin_manager).await;
-    plugin_manager.register_builtin_plugin(BuiltinPluginInfo {
-        name: podnapisi_plugin.name().to_string(),
-        version: podnapisi_plugin.version().to_string(),
-        id: podnapisi_plugin.id().to_string(),
-        description: podnapisi_plugin.description().to_string(),
-        plugin_type: PluginType::SubtitleProvider,
-        status: PluginStatus::Active,
-    }).await;
-    tracing::info!("registered Podnapisi subtitle provider");
-
-    // Local NFO metadata plugin (always registered — works offline)
-    let local_nfo_plugin = plugin_local_nfo::LocalNfoPlugin::default();
-    if let Some(config) = plugin_manager.load_plugin_config_from_db("local-nfo").await {
-        let _ = local_nfo_plugin.set_configuration(config);
+        assert!(!first.is_empty());
+        assert_eq!(first, second, "a later start reloads the same id");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("server_id"))
+                .unwrap()
+                .trim(),
+            first,
+            "the id is persisted in server_id"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
-    plugin_local_nfo::register_local_nfo_provider(&local_nfo_plugin, plugin_manager).await;
-    plugin_manager.register_builtin_plugin(BuiltinPluginInfo {
-        name: local_nfo_plugin.name().to_string(),
-        version: local_nfo_plugin.version().to_string(),
-        id: local_nfo_plugin.id().to_string(),
-        description: local_nfo_plugin.description().to_string(),
-        plugin_type: PluginType::MetadataProvider,
-        status: PluginStatus::Active,
-    }).await;
-    tracing::info!("registered Local NFO metadata provider");
 }

@@ -14,23 +14,33 @@ use crate::state::AppState;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
+        .route("/Users/{userId}/Views", get(get_user_views))
+        .route("/UserViews", get(get_user_views_no_user))
+        .route("/Library/ModifiedVolumes", get(get_modified_volumes))
+}
+
+/// Setup-or-admin library routes. `routes::build_router` wraps them in `require_setup_or_admin`.
+pub fn setup_routes() -> Router<AppState> {
+    Router::new()
+        .route("/Library/BrowseDirectories", get(browse_directories))
         .route("/Library/VirtualFolders", get(get_libraries))
         .route("/Library/VirtualFolders", post(create_library))
         .route("/Library/VirtualFolders/{id}", delete(remove_library))
-        .route("/Library/VirtualFolders/{id}/Refresh", post(scan_library))
         .route(
             "/Library/VirtualFolders/Paths",
             delete(remove_library_paths),
         )
-        .route("/Library/Refresh", post(refresh_all))
         .route(
             "/Library/{id}/Options",
             get(get_library_options).post(update_library_options),
         )
-        .route("/Users/{userId}/Views", get(get_user_views))
-        .route("/UserViews", get(get_user_views_no_user))
-        .route("/Library/ModifiedVolumes", get(get_modified_volumes))
-        .route("/Library/BrowseDirectories", get(browse_directories))
+}
+
+/// Administrator-only library refresh routes. `routes::build_router` wraps them in `require_admin`.
+pub fn admin_routes() -> Router<AppState> {
+    Router::new()
+        .route("/Library/VirtualFolders/{id}/Refresh", post(scan_library))
+        .route("/Library/Refresh", post(refresh_all))
 }
 
 pub(crate) fn libraries_to_views(libs: &[Library]) -> Value {

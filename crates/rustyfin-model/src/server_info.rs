@@ -59,6 +59,10 @@ pub struct ServerConfiguration {
     pub is_port_authorized: bool,
     #[serde(default)]
     pub quick_connect_available: bool,
+    /// The DLNA server: the `/dlna/*` routes and SSDP discovery. Off by default, as in Jellyfin,
+    /// where DLNA is an optional plugin.
+    #[serde(default)]
+    pub enable_dlna_server: bool,
     #[serde(default = "default_http_port")]
     pub public_https_port: u16,
     #[serde(default = "default_http_port")]
@@ -121,6 +125,7 @@ impl Default for ServerConfiguration {
             enable_normalized_item_by_name_ids: true,
             is_port_authorized: true,
             quick_connect_available: false,
+            enable_dlna_server: false,
             public_https_port: 8096,
             public_port: 8096,
             smtp_host: None,

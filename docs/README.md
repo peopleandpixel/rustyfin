@@ -21,7 +21,7 @@ Rustyfin ist ein performanter, ressourcenschonender Mediaserver, der die Jellyfi
 - **Metadaten-Provider** – TMDb, OMDb und lokale NFO-Dateien
 - **Bildverarbeitung** – Proxy mit Caching und Echtzeit-Skalierung
 - **Direct Play / Direct Stream** – Video- und Audio-Streaming mit Seeking-Unterstützung
-- **Authentifizierung** – JWT-basiert, API-Key-Support und Quick Connect
+- **Authentifizierung** – Opake Zugriffstokens (zufällig, serverseitig nur als Hash gespeichert), API-Key-Support und Quick Connect
 - **Benutzerverwaltung** – Mehrere Benutzer mit individuellen Richtlinien
 - **SQLite-Datenbank** – Konfigurationsfreie, eingebettete Datenbank
 - **Geringer Ressourcenverbrauch** – Gebaut mit async Rust (Tokio + Axum)
@@ -47,12 +47,7 @@ cd rustyfin
 cargo run --release
 ```
 
-Rustyfin lauscht standardmäßig auf `0.0.0.0:8096`. Beim ersten Start wird ein Admin-Benutzer erstellt:
-
-- **Benutzername:** `admin`
-- **Passwort:** `admin`
-
-> ⚠️ **Das Standard-Passwort sofort nach dem ersten Login ändern!**
+Rustyfin lauscht standardmäßig auf `0.0.0.0:8096`. Beim ersten Aufruf des Web-Clients führt der Setup-Wizard durch die Ersteinrichtung. Dabei legt er das Administratorkonto an, den Server-Besitzer, mit dem gewählten Namen und Passwort. Es gibt kein Standardkonto.
 
 ## Lizenz
 
