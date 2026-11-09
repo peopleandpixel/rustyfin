@@ -148,11 +148,12 @@ const API = {
         return res.json();
     },
 
-    async post(path, body) {
+    async post(path, body, init = {}) {
         const res = await fetch(this.base + path, {
             method: 'POST',
             headers: this.headers(),
-            body: body ? JSON.stringify(body) : undefined
+            body: body ? JSON.stringify(body) : undefined,
+            ...init
         });
         if (!res.ok) {
             if (res.status === 403 && this.isAdmin) this.recheckAdmin();
@@ -423,8 +424,9 @@ const API = {
     reportProgress(itemId, positionTicks, isPaused = false, fields = {}) {
         return this.post('/Sessions/Playing/Progress', { ItemId: itemId, PositionTicks: positionTicks, IsPaused: isPaused, ...fields });
     },
+    // keepalive lets the report outlive the page (it is sent on pagehide)
     reportStopped(itemId, positionTicks, fields = {}) {
-        return this.post('/Sessions/Playing/Stopped', { ItemId: itemId, PositionTicks: positionTicks, ...fields });
+        return this.post('/Sessions/Playing/Stopped', { ItemId: itemId, PositionTicks: positionTicks, ...fields }, { keepalive: true });
     },
     markPlayed(itemId) { return this.post(`/Users/${this.userId}/PlayedItems/${itemId}`); },
     markUnplayed(itemId) { return this.del(`/Users/${this.userId}/PlayedItems/${itemId}`); },
