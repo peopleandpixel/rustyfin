@@ -43,6 +43,9 @@ pub enum ImportError {
     /// Hashing a password or a setup code failed (a 500; the text names no secret).
     #[error("hashing a password or code failed")]
     Hash,
+    /// A request the source can't satisfy (a 400 naming the field).
+    #[error("{0}")]
+    BadRequest(String),
 }
 
 /// The layout a request asks for (spec 2.2).
@@ -76,6 +79,10 @@ pub struct ImportRequest {
     /// existing account only when its pairing with that account's id is here.
     #[serde(default)]
     pub confirmed_matches: Vec<ConfirmedMatch>,
+    /// The Jellyfin user whose data goes into the calling administrator's own account, whatever the
+    /// names (B102). The account is always the caller's, from the request's sign-in, never the body's.
+    #[serde(default)]
+    pub into_my_account: Option<Uuid>,
     /// How existing metadata is treated (spec 5.1); absent means `FillEmpty`.
     #[serde(default)]
     pub metadata_mode: MetadataMode,
@@ -149,6 +156,11 @@ pub struct UserRow {
     pub suggested_match: Option<SuggestedMatch>,
     /// The one-time code of a created user; only a run has codes.
     pub code: Option<String>,
+    /// How the row's account was chosen: `IntoMyAccount` for the user the request imports into the
+    /// caller's account; null otherwise.
+    pub match_kind: Option<MatchKind>,
+    /// The caller's account facts on the `IntoMyAccount` row; null otherwise.
+    pub target_account: Option<SuggestedMatch>,
 }
 
 /// The existing account a Jellyfin user's name matches.
@@ -178,6 +190,12 @@ pub enum UserAction {
     Skip,
 }
 
+/// How a row's account was chosen (B102).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum MatchKind {
+    IntoMyAccount,
+}
+
 /// Why a Jellyfin user is skipped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum SkipReason {
@@ -187,6 +205,9 @@ pub enum SkipReason {
     NotConfirmed,
     /// The request confirms a pairing with an account that isn't the suggested match.
     ConfirmedOtherAccount,
+    /// The name matches the caller's account, which this request fills from another Jellyfin user
+    /// (`IntoMyAccount`).
+    AccountTakenByIntoMyAccount,
 }
 
 /// The item counts of the report (spec 2.11, 2.20). The three counts add up to `total`.
@@ -215,9 +236,10 @@ pub struct UnmatchedSample {
 pub async fn preview(
     db: &SqlitePool,
     req: &ImportRequest,
+    caller: Uuid,
     data_dir: &Path,
 ) -> Result<ImportReport, ImportError> {
-    let prepared = prepare(req, data_dir).await?;
+    let prepared = prepare(req, caller, data_dir).await?;
     let report = plan_report(db, req, &prepared, data_dir, None).await?;
 
     let layout = report.layout;
@@ -255,42 +277,93 @@ pub struct Prepared {
     pub location: source::SourceLocation,
     pub snapshot: source::Snapshot,
     pub folders: Vec<source::LibraryFolder>,
+    /// The administrator the request came from.
+    pub caller: Uuid,
 }
 
 /// Locates and reads the source of `req`, with the preview's errors (spec 2.17, 2.18, 2.26). A
 /// database too big for memory is copied into `data_dir` while it is read (`source::read_snapshot`).
-pub async fn prepare(req: &ImportRequest, data_dir: &Path) -> Result<Prepared, ImportError> {
+pub async fn prepare(
+    req: &ImportRequest,
+    caller: Uuid,
+    data_dir: &Path,
+) -> Result<Prepared, ImportError> {
+    if req.into_my_account.is_some() && caller.is_nil() {
+        return Err(ImportError::BadRequest(
+            "IntoMyAccount needs a signed-in administrator; the API key has no account.".into(),
+        ));
+    }
     let location = source::locate(Path::new(&req.source_path))?;
     let snapshot = source::read_snapshot(&location, req.layout, data_dir).await?;
     let folders = source::read_library_folders(&location.program_data_path)?;
+    if let Some(id) = req.into_my_account {
+        if !snapshot.users.iter().any(|user| user.id == id) {
+            return Err(ImportError::BadRequest(
+                "IntoMyAccount names no Jellyfin user in the source.".into(),
+            ));
+        }
+        if req.user_ids.as_ref().is_some_and(|ids| !ids.contains(&id)) {
+            return Err(ImportError::BadRequest(
+                "The IntoMyAccount user must be among UserIds.".into(),
+            ));
+        }
+        if req
+            .confirmed_matches
+            .iter()
+            .any(|pair| pair.jellyfin_id == id && pair.user_id != caller)
+        {
+            return Err(ImportError::BadRequest(
+                "ConfirmedMatches pairs the IntoMyAccount user with another account.".into(),
+            ));
+        }
+    }
     Ok(Prepared {
         location,
         snapshot,
         folders,
+        caller,
     })
 }
 
-/// Fills the account facts of each suggested match from the users the plan read (B36), so the
-/// report shows the accounts as they are before the import creates any. A suggestion whose
-/// account isn't among `accounts` is dropped, never sent with placeholder facts.
+/// Fills the account facts of each suggested match, and of each `target_account` (B102), from the
+/// users the plan read (B36), so the report shows the accounts as they are before the import
+/// creates any. A suggestion or target whose account isn't among `accounts` is dropped, never sent
+/// with placeholder facts.
 fn fill_suggested_facts(accounts: &[User], pending: &HashSet<Uuid>, users: &mut [UserRow]) {
     for user in users.iter_mut() {
-        let Some(suggested) = user.suggested_match.as_mut() else {
-            continue;
-        };
-        match accounts
-            .iter()
-            .find(|account| account.id == suggested.user_id)
+        if user
+            .suggested_match
+            .as_mut()
+            .is_some_and(|suggested| !fill_account_facts(suggested, accounts, pending))
         {
-            Some(account) => {
-                suggested.is_administrator = account.is_administrator;
-                suggested.created_at = account.created_at;
-                suggested.last_login_date = account.last_login_date;
-                suggested.setup_code_pending = pending.contains(&suggested.user_id);
-            }
-            None => user.suggested_match = None,
+            user.suggested_match = None;
+        }
+        if user
+            .target_account
+            .as_mut()
+            .is_some_and(|target| !fill_account_facts(target, accounts, pending))
+        {
+            user.target_account = None;
         }
     }
+}
+
+/// Copies the account facts of the account `facts.user_id` names from `accounts`, and sets
+/// `setup_code_pending` from `pending`. Returns false, leaving `facts` unchanged, when that
+/// account isn't among `accounts`.
+fn fill_account_facts(
+    facts: &mut SuggestedMatch,
+    accounts: &[User],
+    pending: &HashSet<Uuid>,
+) -> bool {
+    let Some(account) = accounts.iter().find(|account| account.id == facts.user_id) else {
+        return false;
+    };
+    facts.is_administrator = account.is_administrator;
+    facts.created_at = account.created_at;
+    facts.last_login_date = account.last_login_date;
+    facts.setup_code_pending = pending.contains(&facts.user_id);
+    true
 }
 
 /// The planning `preview` and `run` share (spec 2.20, 2.26). A run passes its handle: it then
@@ -345,7 +418,13 @@ async fn plan_report(
         &req.confirmed_matches,
         &rustyfin_users,
     );
-    if users.iter().any(|user| user.suggested_match.is_some()) {
+    if let Some(jellyfin_id) = req.into_my_account {
+        plan::apply_into_my_account(&mut users, jellyfin_id, prepared.caller, &rustyfin_users)?;
+    }
+    if users
+        .iter()
+        .any(|user| user.suggested_match.is_some() || user.target_account.is_some())
+    {
         let pending: HashSet<Uuid> = rustyfin_db::repo_setup_code::pending_users(db)
             .await
             .map_err(ImportError::Db)?

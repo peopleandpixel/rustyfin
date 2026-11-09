@@ -11,7 +11,8 @@ use uuid::Uuid;
 use super::paths::{PathMapping, translate_path};
 use super::source::{JfItem, JfUser};
 use super::{
-    ConfirmedMatch, ItemReport, SkipReason, SuggestedMatch, UnmatchedSample, UserAction, UserRow,
+    ConfirmedMatch, ImportError, ItemReport, MatchKind, SkipReason, SuggestedMatch,
+    UnmatchedSample, UserAction, UserRow,
 };
 
 /// The most unmatched items the report samples (spec 2.20).
@@ -90,11 +91,60 @@ pub fn plan_users(
                 user_id,
                 suggested_match,
                 code: None,
+                match_kind: None,
+                target_account: None,
             }
         })
         .collect();
     rows.sort_by_cached_key(|row| (row.name.to_lowercase(), row.jellyfin_id));
     rows
+}
+
+/// Points the picked Jellyfin user `jellyfin_id` at the caller's account (B102): its data goes
+/// into `caller` as a merge, whatever the names. Another picked user whose name matches the
+/// caller is skipped, so no second user merges into the same account. Every other row is left as
+/// planned. The caller's facts are filled later by `fill_suggested_facts`, like `plan_users` does.
+pub fn apply_into_my_account(
+    rows: &mut [UserRow],
+    jellyfin_id: Uuid,
+    caller: Uuid,
+    rustyfin_users: &[(Uuid, String)],
+) -> Result<(), ImportError> {
+    let Some((_, caller_name)) = rustyfin_users
+        .iter()
+        .find(|(account, _)| *account == caller)
+    else {
+        return Err(ImportError::BadRequest(
+            "Your account no longer exists.".into(),
+        ));
+    };
+    for row in rows.iter_mut() {
+        if row.jellyfin_id == jellyfin_id {
+            row.action = UserAction::Match;
+            row.reason = None;
+            row.user_id = Some(caller);
+            row.match_kind = Some(MatchKind::IntoMyAccount);
+            row.target_account = Some(SuggestedMatch {
+                user_id: caller,
+                name: caller_name.clone(),
+                // The caller fills these in from the accounts it read.
+                is_administrator: false,
+                created_at: DateTime::<Utc>::UNIX_EPOCH,
+                last_login_date: None,
+                setup_code_pending: false,
+                other_case_names: case_variant_names(caller, caller_name, rustyfin_users),
+            });
+        } else if row
+            .suggested_match
+            .as_ref()
+            .is_some_and(|suggested| suggested.user_id == caller)
+        {
+            row.action = UserAction::Skip;
+            row.reason = Some(SkipReason::AccountTakenByIntoMyAccount);
+            row.user_id = None;
+        }
+    }
+    Ok(())
 }
 
 /// The names of the other accounts whose names sign-in treats as `account`'s name (`names_match`)

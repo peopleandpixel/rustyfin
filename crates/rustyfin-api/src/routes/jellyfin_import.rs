@@ -5,12 +5,13 @@
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use chrono::{DateTime, Utc};
 use rustyfin_core::jellyfin_import::{
     ImportError, ImportReport, ImportRequest, ImportStatus, prepare, preview, run,
 };
 use rustyfin_db::{repo_setup_code, repo_user};
+use rustyfin_model::auth::Claims;
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -29,10 +30,11 @@ pub fn routes() -> Router<AppState> {
         )
 }
 
-/// A bad source is a 400 naming the file; a failed write or hash is a 500.
+/// A bad source or a request the source can't satisfy is a 400 naming the field; a failed write or
+/// hash is a 500.
 fn import_error(error: ImportError) -> ApiError {
     match error {
-        ImportError::BadSource(msg) => ApiError::BadRequest(msg),
+        ImportError::BadSource(msg) | ImportError::BadRequest(msg) => ApiError::BadRequest(msg),
         ImportError::Db(e) => ApiError::from(e),
         ImportError::Hash => ApiError::Internal("An internal error occurred.".to_string()),
     }
@@ -40,9 +42,10 @@ fn import_error(error: ImportError) -> ApiError {
 
 async fn preview_route(
     State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
     Json(req): Json<ImportRequest>,
 ) -> Result<Json<ImportReport>, ApiError> {
-    let report = preview(&state.db_ro, &req, &state.data_dir)
+    let report = preview(&state.db_ro, &req, claims.sub, &state.data_dir)
         .await
         .map_err(import_error)?;
     Ok(Json(report))
@@ -52,9 +55,12 @@ async fn preview_route(
 /// source is read first, so a bad source is refused before any run starts.
 async fn run_route(
     State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
     Json(req): Json<ImportRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
-    let prepared = prepare(&req, &state.data_dir).await.map_err(import_error)?;
+    let prepared = prepare(&req, claims.sub, &state.data_dir)
+        .await
+        .map_err(import_error)?;
     let handle = state
         .jellyfin_import
         .try_start()

@@ -513,6 +513,8 @@ fn b20_report_with_code(code: &str) -> ImportReport {
             user_id: Some(Uuid::from_u128(8)),
             suggested_match: None,
             code: Some(code.to_string()),
+            match_kind: None,
+            target_account: None,
         }],
         items: ItemReport {
             total: 0,

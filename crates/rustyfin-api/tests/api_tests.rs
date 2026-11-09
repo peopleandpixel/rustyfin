@@ -26982,6 +26982,607 @@ async fn b36_import_marks_accounts_an_earlier_run_created() {
     );
 }
 
+// B102: import into my account
+
+/// The signed-in user of `token` as (id, name), from `GET /Users/Me`.
+async fn b102_me(app: &axum::Router, token: &str) -> (uuid::Uuid, String) {
+    let (status, me) = send_authed(app, "GET", "/Users/Me", token, None).await;
+    assert_eq!(status, StatusCode::OK, "{me}");
+    let id = me["Id"].as_str().unwrap_or_else(|| panic!("Id: {me}"));
+    let name = me["Name"].as_str().unwrap_or_else(|| panic!("Name: {me}"));
+    (uuid::Uuid::parse_str(id).unwrap(), name.to_string())
+}
+
+/// The raw report row of the Jellyfin user `name`.
+fn b102_row<'a>(report: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+    let users = report["Users"].as_array();
+    users
+        .unwrap_or_else(|| panic!("no Users: {report}"))
+        .iter()
+        .find(|u| u["Name"] == name)
+        .unwrap_or_else(|| panic!("no {name} in {report}"))
+}
+
+/// An account's name, password hash and administrator flag.
+async fn b102_account(state: &AppState, id: uuid::Uuid) -> (String, String, bool) {
+    sqlx::query_as("SELECT name, password_hash, is_administrator FROM users WHERE id = ?")
+        .bind(id.to_string())
+        .fetch_one(&state.db)
+        .await
+        .unwrap()
+}
+
+/// Asserts that `report` imports the Jellyfin user `name` into the administrator account `me`
+/// (id, name): a `Match` into `me` with `MatchKind` `IntoMyAccount` and `me`'s facts as
+/// `TargetAccount`, while `SuggestedMatch` stays the account the name matches (`suggested`).
+fn b102_assert_into_mine(
+    w: &B20World,
+    report: &serde_json::Value,
+    name: &str,
+    me: (uuid::Uuid, &str),
+    suggested: Option<(uuid::Uuid, &str)>,
+) {
+    let expected = B20User {
+        suggested: suggested.map(|(id, account)| (id, account.to_string())),
+        ..b20_user(w, name, "Match", None, Some(me.0))
+    };
+    assert_eq!(b20_entry(report, name), expected, "{report}");
+    let row = b102_row(report, name);
+    assert_eq!(row["MatchKind"], "IntoMyAccount", "{row}");
+    let target = &row["TargetAccount"];
+    let id = target["UserId"]
+        .as_str()
+        .map(|s| uuid::Uuid::parse_str(s).unwrap());
+    assert_eq!(id, Some(me.0), "{row}");
+    assert_eq!(target["Name"], me.1, "{row}");
+    assert_eq!(target["IsAdministrator"], true, "{row}");
+    assert_eq!(target["SetupCodePending"], false, "{row}");
+    assert!(target["CreatedAt"].is_string(), "{row}");
+    let others = target["OtherCaseNames"].as_array();
+    assert!(others.is_some_and(|names| names.is_empty()), "{row}");
+}
+
+/// AC1, AC7: an owner whose name matches no Jellyfin user picks Alice. Preview and Run agree, her
+/// watch data goes into the owner's account and none into alice, whose name she matches; no account
+/// is created, no code is issued, and the owner's name, password and rights stay.
+#[tokio::test]
+async fn b102_import_into_my_account_brings_the_users_data() {
+    let w = b20_world().await;
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+    let (me, my_name) = b102_me(&w.app, &w.token).await;
+    let account = b102_account(&w.state, me).await;
+    let users_before = b20_user_count(&w.state).await;
+    let alice = w.source.user("Alice").id;
+    let body = serde_json::json!({
+        "SourcePath": install,
+        "UserIds": [alice],
+        "IntoMyAccount": alice,
+    });
+    let suggested = Some((w.alice, "alice"));
+
+    let preview = b20_preview(&w, body.clone()).await;
+    b102_assert_into_mine(&w, &preview, "Alice", (me, &my_name), suggested);
+    let bob = b20_user(&w, "bob", "Skip", Some("NotSelected"), None);
+    assert_eq!(b20_entry(&preview, "bob"), bob, "{preview}");
+    assert_eq!(b20_watch_counts(&preview), (4, 2, 0, 2), "{preview}");
+
+    let report = b20_run(&w, body).await;
+    b102_assert_into_mine(&w, &report, "Alice", (me, &my_name), suggested);
+    assert_eq!(
+        b20_users(&report),
+        b20_users(&preview),
+        "Preview and Run agree"
+    );
+    assert_eq!(b102_row(&report, "Alice"), b102_row(&preview, "Alice"));
+    assert_eq!(b20_watch_counts(&report), b20_watch_counts(&preview));
+
+    let alpha = b20_item(&w.state, "Alpha").await;
+    let expected = B20Data {
+        played: true,
+        play_count: 2,
+        last_played: b20_at("2025-01-02T03:04:05.1234567Z"),
+        favorite: true,
+        rating: Some(8),
+        ..Default::default()
+    };
+    assert_eq!(b20_data(&w.state, me, alpha).await, Some(expected), "Alpha");
+    let e1 = b20_item(&w.state, "Show S01E01").await;
+    let expected = B20Data {
+        position: 6_000_000_000,
+        last_played: b20_at("2025-02-01T10:00:00Z"),
+        ..Default::default()
+    };
+    assert_eq!(b20_data(&w.state, me, e1).await, Some(expected), "S01E01");
+    assert_eq!(b20_data(&w.state, w.alice, alpha).await, None, "alice");
+    assert_eq!(b20_data(&w.state, w.alice, e1).await, None, "alice");
+    let count = b20_user_count(&w.state).await;
+    assert_eq!(count, users_before, "no account is created");
+    assert_eq!(
+        b20_code_rows(&w.state).await,
+        Vec::<String>::new(),
+        "no code"
+    );
+    assert_eq!(b102_account(&w.state, me).await, account, "the owner stays");
+}
+
+/// AC2: the data goes to the caller whatever else the body names. A second administrator whose
+/// body names the first one and alice in other fields, and confirms Alice with themselves, gets
+/// Alice's data in their own account; neither the first admin nor alice gets any.
+#[tokio::test]
+async fn b102_import_into_my_account_targets_the_caller() {
+    let w = b20_world().await;
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+    let (first, _) = b102_me(&w.app, &w.token).await;
+    let second = add_user(&w.state, "second", "secondpass", true).await;
+    let (token, _) = login(&w.app, "second", "secondpass").await.unwrap();
+    let alice = w.source.user("Alice").id;
+    let body = serde_json::json!({
+        "SourcePath": install,
+        "UserIds": [alice],
+        "IntoMyAccount": alice,
+        "UserId": first,
+        "TargetAccount": { "UserId": w.alice },
+        "ConfirmedMatches": [{ "JellyfinId": alice, "UserId": second }],
+    })
+    .to_string();
+    let suggested = Some((w.alice, "alice"));
+
+    let uri = "/JellyfinImport/Preview";
+    let (status, preview) = send_authed(&w.app, "POST", uri, &token, Some(&body)).await;
+    assert_eq!(status, StatusCode::OK, "{preview}");
+    b102_assert_into_mine(&w, &preview, "Alice", (second, "second"), suggested);
+    let uri = "/JellyfinImport/Run";
+    let (status, answer) = send_authed(&w.app, "POST", uri, &token, Some(&body)).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{answer}");
+    let done = b20_wait(&w).await;
+    assert_eq!(done["State"], "Completed", "{done}");
+    let report = &done["Result"];
+    b102_assert_into_mine(&w, report, "Alice", (second, "second"), suggested);
+
+    let alpha = b20_item(&w.state, "Alpha").await;
+    assert!(
+        b20_data(&w.state, second, alpha).await.is_some(),
+        "{report}"
+    );
+    assert_eq!(b20_data(&w.state, first, alpha).await, None, "first admin");
+    assert_eq!(b20_data(&w.state, w.alice, alpha).await, None, "alice");
+}
+
+/// AC3: the field adds no caller: Preview and Run stay administrator-only, and a refused request
+/// writes nothing and starts nothing.
+#[tokio::test]
+async fn b102_import_into_my_account_is_admin_only() {
+    let w = b20_world().await;
+    let viewer = add_user(&w.state, "viewer", "viewerpass", false).await;
+    let (token, _) = login(&w.app, "viewer", "viewerpass").await.unwrap();
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+    let alice = w.source.user("Alice").id;
+    let body = Some(serde_json::json!({ "SourcePath": install, "IntoMyAccount": alice }));
+    let before = b20_db_digest(&w.state).await;
+    for route in ["Preview", "Run"] {
+        let uri = format!("/JellyfinImport/{route}");
+        g1_assert_admin_only(&w.app, "POST", &uri, &body, &token).await;
+    }
+    assert_eq!(
+        b20_status(&w).await["State"],
+        "Idle",
+        "a refused run started"
+    );
+    assert_eq!(
+        b20_db_digest(&w.state).await,
+        before,
+        "a refused request wrote"
+    );
+    let alpha = b20_item(&w.state, "Alpha").await;
+    assert_eq!(b20_data(&w.state, viewer, alpha).await, None);
+}
+
+/// AC4: a pick the source lacks, a pick outside `UserIds`, or a confirmation pairing the pick with
+/// another account is a 400 naming `IntoMyAccount` on Preview and Run; nothing is written or started.
+#[tokio::test]
+async fn b102_import_into_my_account_refuses_bad_picks() {
+    let w = b20_world().await;
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+    let alice = w.source.user("Alice").id;
+    let bob = w.source.user("bob").id;
+    let before = b20_db_digest(&w.state).await;
+    let unknown = uuid::Uuid::new_v4();
+    let cases = [
+        (
+            "unknown",
+            serde_json::json!({ "SourcePath": install, "IntoMyAccount": unknown }),
+        ),
+        (
+            "not picked",
+            serde_json::json!({ "SourcePath": install, "UserIds": [bob], "IntoMyAccount": alice }),
+        ),
+        (
+            "confirmed with another account",
+            serde_json::json!({
+                "SourcePath": install,
+                "IntoMyAccount": alice,
+                "ConfirmedMatches": b20_confirm(&w, &[("Alice", w.alice)]),
+            }),
+        ),
+    ];
+    for (case, body) in cases {
+        for route in ["Preview", "Run"] {
+            let (status, answer) = b20_post(&w, route, body.clone()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{case} {route}: {answer}");
+            let named = answer.to_string().contains("IntoMyAccount");
+            assert!(named, "{case} {route}: {answer}");
+        }
+    }
+    assert_eq!(
+        b20_status(&w).await["State"],
+        "Idle",
+        "a refused run started"
+    );
+    assert_eq!(
+        b20_db_digest(&w.state).await,
+        before,
+        "a refused request wrote"
+    );
+}
+
+/// AC5: a Jellyfin user with the caller's own name is skipped as `AccountTakenByIntoMyAccount`
+/// while Alice goes into the caller's account, even with its own pairing confirmed: it is neither
+/// created nor merged into the caller. bob is created as before.
+#[tokio::test]
+async fn b102_import_into_my_account_skips_the_callers_name_match() {
+    let mut w = b20_world().await;
+    let (me, my_name) = b102_me(&w.app, &w.token).await;
+    let twin = jf::JfUser::new(3, &my_name, true);
+    let e2 = w.source.item("Show S01E02").id;
+    w.source.user_data.push(jf::JfUserData {
+        user: twin.id,
+        item: e2,
+        played: true,
+        play_count: 1,
+        last_played: Some("2025-04-01 08:00:00"),
+        ..Default::default()
+    });
+    w.source.users.push(twin);
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+    let users_before = b20_user_count(&w.state).await;
+    let body = serde_json::json!({
+        "SourcePath": install,
+        "IntoMyAccount": w.source.user("Alice").id,
+        "ConfirmedMatches": b20_confirm(&w, &[(my_name.as_str(), me)]),
+    });
+    let taken = B20User {
+        suggested: Some((me, my_name.clone())),
+        ..b20_user(
+            &w,
+            &my_name,
+            "Skip",
+            Some("AccountTakenByIntoMyAccount"),
+            None,
+        )
+    };
+    let suggested = Some((w.alice, "alice"));
+
+    let preview = b20_preview(&w, body.clone()).await;
+    assert_eq!(b20_entry(&preview, &my_name), taken, "{preview}");
+    b102_assert_into_mine(&w, &preview, "Alice", (me, &my_name), suggested);
+    let bob = b20_user(&w, "bob", "Create", None, None);
+    assert_eq!(b20_entry(&preview, "bob"), bob, "{preview}");
+
+    let report = b20_run(&w, body).await;
+    assert_eq!(b20_entry(&report, &my_name), taken, "{report}");
+    b102_assert_into_mine(&w, &report, "Alice", (me, &my_name), suggested);
+    let count = b20_user_count(&w.state).await;
+    assert_eq!(count, users_before + 1, "only bob is created: {report}");
+    let e2 = b20_item(&w.state, "Show S01E02").await;
+    assert_eq!(b20_data(&w.state, me, e2).await, None, "the twin's data");
+    let alpha = b20_item(&w.state, "Alpha").await;
+    assert!(b20_data(&w.state, me, alpha).await.is_some(), "{report}");
+}
+
+/// AC6: every row but the picked one is exactly what the request without `IntoMyAccount` gives,
+/// R2 included: Alice unconfirmed (`NotConfirmed`), confirmed with alice (`Match`) or with another
+/// account (`ConfirmedOtherAccount`), while bob goes into the caller's account; carol is created.
+#[tokio::test]
+async fn b102_import_into_my_account_leaves_other_users_as_before() {
+    let mut w = b20_world().await;
+    w.source.users.push(jf::JfUser::new(3, "carol", false));
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+    let erin = b20_plain_user(&w.state, "erin").await;
+    let (me, my_name) = b102_me(&w.app, &w.token).await;
+    let bob = w.source.user("bob").id;
+    let refused = B20User {
+        suggested: Some((w.alice, "alice".to_string())),
+        ..b20_user(&w, "Alice", "Skip", Some("ConfirmedOtherAccount"), None)
+    };
+    let cases = [
+        (
+            vec![],
+            b20_suggested(&w, "Alice", (w.alice, "alice"), false),
+        ),
+        (
+            vec![("Alice", w.alice)],
+            b20_suggested(&w, "Alice", (w.alice, "alice"), true),
+        ),
+        (vec![("Alice", erin)], refused),
+    ];
+    let mut last = serde_json::Value::Null;
+    for (confirmed, alice) in cases {
+        let plain = serde_json::json!({
+            "SourcePath": install,
+            "ConfirmedMatches": b20_confirm(&w, &confirmed),
+        });
+        let mut mine = plain.clone();
+        mine["IntoMyAccount"] = serde_json::json!(bob);
+        let without = b20_preview(&w, plain).await;
+        let with = b20_preview(&w, mine.clone()).await;
+        b102_assert_into_mine(&w, &with, "bob", (me, &my_name), None);
+        assert_eq!(b20_entry(&with, "Alice"), alice, "{confirmed:?}: {with}");
+        for name in ["Alice", "carol"] {
+            let row = b102_row(&with, name);
+            assert_eq!(row, b102_row(&without, name), "{confirmed:?} {name}");
+            assert!(row["MatchKind"].is_null(), "{row}");
+            assert!(row["TargetAccount"].is_null(), "{row}");
+        }
+        last = mine;
+    }
+
+    // The last case run: bob's data goes to the caller, Alice's to no one, carol is created.
+    let users_before = b20_user_count(&w.state).await;
+    let report = b20_run(&w, last).await;
+    b102_assert_into_mine(&w, &report, "bob", (me, &my_name), None);
+    let beta = b20_item(&w.state, "Beta").await;
+    assert!(b20_data(&w.state, me, beta).await.is_some(), "{report}");
+    let alpha = b20_item(&w.state, "Alpha").await;
+    assert_eq!(b20_data(&w.state, w.alice, alpha).await, None, "alice");
+    assert_eq!(b20_data(&w.state, erin, alpha).await, None, "erin");
+    let count = b20_user_count(&w.state).await;
+    assert_eq!(count, users_before + 1, "only carol is created: {report}");
+}
+
+/// AC8: nothing is recorded. After a run into the caller's account, a run without the field treats
+/// Alice as before (her name match unconfirmed) and brings the caller nothing, though Jellyfin has
+/// new watch data for her by then.
+#[tokio::test]
+async fn b102_import_rerun_without_the_field_does_not_use_it() {
+    let mut w = b20_world().await;
+    let (me, _) = b102_me(&w.app, &w.token).await;
+    let alice = w.source.user("Alice").id;
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+    let body = serde_json::json!({
+        "SourcePath": install,
+        "UserIds": [alice],
+        "IntoMyAccount": alice,
+    });
+    let report = b20_run(&w, body).await;
+    let alpha = b20_item(&w.state, "Alpha").await;
+    assert!(b20_data(&w.state, me, alpha).await.is_some(), "{report}");
+
+    let e2 = w.source.item("Show S01E02").id;
+    w.source.user_data.push(jf::JfUserData {
+        user: alice,
+        item: e2,
+        played: true,
+        play_count: 1,
+        last_played: Some("2025-05-01 09:00:00"),
+        ..Default::default()
+    });
+    let install = b20_install(&w, "jf2", jf::Layout::New).await;
+    let users_before = b20_user_count(&w.state).await;
+    let body = serde_json::json!({ "SourcePath": install, "UserIds": [alice] });
+    let unconfirmed = b20_suggested(&w, "Alice", (w.alice, "alice"), false);
+    let preview = b20_preview(&w, body.clone()).await;
+    assert_eq!(b20_entry(&preview, "Alice"), unconfirmed, "{preview}");
+    let report = b20_run(&w, body).await;
+    assert_eq!(b20_entry(&report, "Alice"), unconfirmed, "{report}");
+    for row in [b102_row(&preview, "Alice"), b102_row(&report, "Alice")] {
+        assert!(row["MatchKind"].is_null(), "{row}");
+        assert!(row["TargetAccount"].is_null(), "{row}");
+    }
+    let e2 = b20_item(&w.state, "Show S01E02").await;
+    assert_eq!(b20_data(&w.state, me, e2).await, None, "the caller");
+    assert_eq!(b20_data(&w.state, w.alice, e2).await, None, "alice");
+    assert_eq!(b20_user_count(&w.state).await, users_before);
+}
+
+/// Adds a Jellyfin user `name` (id `n`) who played Show S01E02, and returns its Jellyfin id.
+fn b102_add_jf_user(w: &mut B20World, n: i64, name: &str) -> uuid::Uuid {
+    let user = jf::JfUser::new(n, name, false);
+    let id = user.id;
+    let e2 = w.source.item("Show S01E02").id;
+    w.source.user_data.push(jf::JfUserData {
+        user: id,
+        item: e2,
+        played: true,
+        play_count: 1,
+        last_played: Some("2025-04-01 08:00:00"),
+        ..Default::default()
+    });
+    w.source.users.push(user);
+    id
+}
+
+/// F1, F5 (a): the configured API key signs in with no account, so `IntoMyAccount` from it is a
+/// 400 naming the field and the API key on Preview and Run; nothing is written or started. Without
+/// the field, its Preview works as before.
+#[tokio::test]
+async fn b102_import_into_my_account_refuses_the_api_key() {
+    let w = b20_world().await;
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+    let alice = w.source.user("Alice").id;
+    let before = b20_db_digest(&w.state).await;
+    let body = serde_json::json!({ "SourcePath": install, "IntoMyAccount": alice }).to_string();
+    for route in ["Preview", "Run"] {
+        let uri = format!("/JellyfinImport/{route}");
+        let (status, answer) = send_authed(&w.app, "POST", &uri, "test-api-key", Some(&body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{route}: {answer}");
+        let text = answer.to_string();
+        let named = text.contains("IntoMyAccount") && text.contains("API key");
+        assert!(named, "{route}: {answer}");
+    }
+    assert_eq!(
+        b20_status(&w).await["State"],
+        "Idle",
+        "a refused run started"
+    );
+    assert_eq!(
+        b20_db_digest(&w.state).await,
+        before,
+        "a refused request wrote"
+    );
+
+    let body = serde_json::json!({ "SourcePath": install }).to_string();
+    let uri = "/JellyfinImport/Preview";
+    let (status, answer) = send_authed(&w.app, "POST", uri, "test-api-key", Some(&body)).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+}
+
+/// F5 (b): a Jellyfin user whose name is a case variant of the caller's, and matches no other
+/// account, is skipped as `AccountTakenByIntoMyAccount` too and brings the caller nothing.
+#[tokio::test]
+async fn b102_import_into_my_account_skips_a_case_variant_of_the_callers_name() {
+    let mut w = b20_world().await;
+    let (me, my_name) = b102_me(&w.app, &w.token).await;
+    let upper = my_name.to_uppercase();
+    b102_add_jf_user(&mut w, 3, &upper);
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+    let body = serde_json::json!({
+        "SourcePath": install,
+        "IntoMyAccount": w.source.user("Alice").id,
+    });
+    let taken = B20User {
+        suggested: Some((me, my_name.clone())),
+        ..b20_user(
+            &w,
+            &upper,
+            "Skip",
+            Some("AccountTakenByIntoMyAccount"),
+            None,
+        )
+    };
+    let suggested = Some((w.alice, "alice"));
+
+    let preview = b20_preview(&w, body.clone()).await;
+    assert_eq!(b20_entry(&preview, &upper), taken, "{preview}");
+    b102_assert_into_mine(&w, &preview, "Alice", (me, &my_name), suggested);
+    let report = b20_run(&w, body).await;
+    assert_eq!(b20_entry(&report, &upper), taken, "{report}");
+    b102_assert_into_mine(&w, &report, "Alice", (me, &my_name), suggested);
+    let e2 = b20_item(&w.state, "Show S01E02").await;
+    assert_eq!(b20_data(&w.state, me, e2).await, None, "the twin's data");
+}
+
+/// F5 (c): a Jellyfin user whose name matches the caller and another account only by case stays
+/// `Ambiguous` and gets nothing. Alice still goes into the caller, whose `TargetAccount` names the
+/// other account as a case variant.
+#[tokio::test]
+async fn b102_import_into_my_account_leaves_an_ambiguous_name_alone() {
+    let mut w = b20_world().await;
+    let (me, my_name) = b102_me(&w.app, &w.token).await;
+    let upper = my_name.to_uppercase();
+    let other = b20_plain_user(&w.state, &upper).await;
+    let title = my_name.replacen("admin", "Admin", 1);
+    b102_add_jf_user(&mut w, 3, &title);
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+    let alice = w.source.user("Alice").id;
+    let body = serde_json::json!({ "SourcePath": install, "IntoMyAccount": alice });
+    let ambiguous = b20_user(&w, &title, "Skip", Some("Ambiguous"), None);
+
+    let preview = b20_preview(&w, body.clone()).await;
+    let report = b20_run(&w, body).await;
+    for (route, report) in [("Preview", &preview), ("Run", &report)] {
+        assert_eq!(b20_entry(report, &title), ambiguous, "{route}: {report}");
+        let row = b102_row(report, &title);
+        assert!(row["MatchKind"].is_null(), "{route}: {row}");
+        assert!(row["TargetAccount"].is_null(), "{route}: {row}");
+        let pick = b102_row(report, "Alice");
+        assert_eq!(pick["Action"], "Match", "{route}: {pick}");
+        assert_eq!(pick["MatchKind"], "IntoMyAccount", "{route}: {pick}");
+        assert_eq!(pick["UserId"], me.to_string(), "{route}: {pick}");
+        let others = &pick["TargetAccount"]["OtherCaseNames"];
+        assert_eq!(others, &serde_json::json!([upper]), "{route}: {pick}");
+    }
+    let e2 = b20_item(&w.state, "Show S01E02").await;
+    assert_eq!(b20_data(&w.state, me, e2).await, None, "the caller");
+    assert_eq!(
+        b20_data(&w.state, other, e2).await,
+        None,
+        "the other account"
+    );
+}
+
+/// F5 (d): picking the Jellyfin user whose name matches the caller needs no confirmation: the row
+/// is a `Match` into the caller with the caller as `SuggestedMatch`, and its data goes there.
+#[tokio::test]
+async fn b102_import_into_my_account_takes_the_callers_own_name_match() {
+    let mut w = b20_world().await;
+    let (me, my_name) = b102_me(&w.app, &w.token).await;
+    let own = b102_add_jf_user(&mut w, 3, &my_name);
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+    let users_before = b20_user_count(&w.state).await;
+    let body = serde_json::json!({
+        "SourcePath": install,
+        "UserIds": [own],
+        "IntoMyAccount": own,
+    });
+    let mine = Some((me, my_name.as_str()));
+
+    let preview = b20_preview(&w, body.clone()).await;
+    b102_assert_into_mine(&w, &preview, &my_name, (me, &my_name), mine);
+    let report = b20_run(&w, body).await;
+    b102_assert_into_mine(&w, &report, &my_name, (me, &my_name), mine);
+    let e2 = b20_item(&w.state, "Show S01E02").await;
+    assert!(b20_data(&w.state, me, e2).await.is_some(), "{report}");
+    assert_eq!(b20_user_count(&w.state).await, users_before);
+}
+
+/// F5 (e): a second run with the field finds the caller's data already there: all of it is
+/// `Unchanged` and nothing is written.
+#[tokio::test]
+async fn b102_import_into_my_account_repeat_run_writes_nothing() {
+    let w = b20_world().await;
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+    let alice = w.source.user("Alice").id;
+    let body = serde_json::json!({
+        "SourcePath": install,
+        "UserIds": [alice],
+        "IntoMyAccount": alice,
+    });
+    let report = b20_run(&w, body.clone()).await;
+    assert_eq!(b20_watch_counts(&report), (4, 2, 0, 2), "{report}");
+    let before = b20_db_digest(&w.state).await;
+    let report = b20_run(&w, body).await;
+    assert_eq!(b20_watch_counts(&report), (4, 0, 2, 2), "{report}");
+    assert_eq!(
+        b20_db_digest(&w.state).await,
+        before,
+        "the repeat run wrote"
+    );
+}
+
+/// F5 (f): the old layout (`library.db`) imports into the caller the same way.
+#[tokio::test]
+async fn b102_import_into_my_account_reads_the_old_layout() {
+    let w = b20_world().await;
+    let install = b20_install(&w, "jf", jf::Layout::Old).await;
+    let (me, my_name) = b102_me(&w.app, &w.token).await;
+    let alice = w.source.user("Alice").id;
+    let body = serde_json::json!({
+        "SourcePath": install,
+        "UserIds": [alice],
+        "IntoMyAccount": alice,
+    });
+    let suggested = Some((w.alice, "alice"));
+
+    let preview = b20_preview(&w, body.clone()).await;
+    b102_assert_into_mine(&w, &preview, "Alice", (me, &my_name), suggested);
+    let report = b20_run(&w, body).await;
+    b102_assert_into_mine(&w, &report, "Alice", (me, &my_name), suggested);
+    assert_eq!(b20_watch_counts(&report), (3, 2, 0, 1), "{report}");
+    let alpha = b20_item(&w.state, "Alpha").await;
+    assert!(b20_data(&w.state, me, alpha).await.is_some(), "{report}");
+    assert_eq!(b20_data(&w.state, w.alice, alpha).await, None, "alice");
+}
+
 // B20 2c: watch data and track choices.
 
 /// A `user_item_data` row as the B20 import tests read and write it.
