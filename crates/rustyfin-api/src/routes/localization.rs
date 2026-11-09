@@ -1,6 +1,6 @@
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::routing::{get, put};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -42,15 +42,18 @@ struct UpdateProviderRequest {
 
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route(
-            "/Localization/Providers",
-            get(get_providers).post(add_provider),
-        )
+        .route("/Localization/Providers", get(get_providers))
+        .route("/Localization/Options", get(get_options))
+}
+
+/// Administrator-only localization routes. `routes::build_router` wraps them in `require_admin`.
+pub fn admin_routes() -> Router<AppState> {
+    Router::new()
+        .route("/Localization/Providers", post(add_provider))
         .route(
             "/Localization/Providers/{providerId}",
             put(update_provider).delete(delete_provider),
         )
-        .route("/Localization/Options", get(get_options))
 }
 
 async fn get_providers(

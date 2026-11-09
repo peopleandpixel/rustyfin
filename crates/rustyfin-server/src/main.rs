@@ -1,3 +1,5 @@
+mod credentials;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tower::Service;
@@ -11,7 +13,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
 use rustyfin_api::log_stream::LogStreamLayer;
-use rustyfin_api::middleware::RateLimiter;
+use rustyfin_api::middleware::{DEFAULT_LOGIN_LIMIT, DEFAULT_LOGIN_WINDOW_SECS, RateLimiter};
 use rustyfin_api::routes::build_router;
 use rustyfin_api::state::AppState;
 use rustyfin_model::server_info::ServerConfiguration;
@@ -84,11 +86,13 @@ async fn main() {
     let db_url = std::env::var("RUSTYFIN_DB")
         .unwrap_or_else(|_| data_dir.join("rustyfin.db").display().to_string());
 
-    let jwt_secret =
-        std::env::var("RUSTYFIN_SECRET").unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
+    if std::env::var("RUSTYFIN_SECRET").is_ok() {
+        tracing::info!(
+            "RUSTYFIN_SECRET is set but no longer used; access tokens are stored server-side and survive restarts"
+        );
+    }
 
-    let server_id =
-        std::env::var("RUSTYFIN_SERVER_ID").unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
+    let server_id = load_or_create_server_id(&data_dir);
 
     // IPv6 dual-stack: use [::]:8096 to listen on both IPv4 and IPv6
     let bind_addr = std::env::var("RUSTYFIN_BIND").unwrap_or_else(|_| "0.0.0.0:8096".to_string());
@@ -96,10 +100,10 @@ async fn main() {
     let tls_cert = std::env::var("RUSTYFIN_TLS_CERT").ok();
     let tls_key = std::env::var("RUSTYFIN_TLS_KEY").ok();
 
-    let api_key = std::env::var("RUSTYFIN_API_KEY").ok();
+    let api_key = credentials::api_key(std::env::var("RUSTYFIN_API_KEY").ok());
 
     // Load or create server configuration
-    let config = load_config(&data_dir);
+    let mut config = load_config(&data_dir);
 
     tracing::info!("initializing database at {}", db_url);
     let pool = rustyfin_db::init_db(&db_url)
@@ -111,16 +115,23 @@ async fn main() {
         .await
         .expect("failed to initialize read-only database pool");
 
-    // Create default admin user if no users exist
-    let users = rustyfin_db::repo_user::get_all_users(&pool)
+    // No user is created at startup. A server with users gets an owner, its earliest enabled
+    // administrator, and a closed setup wizard. A fresh one waits for the wizard.
+    rustyfin_api::routes::settle_owner_at_startup(&pool, &mut config, &data_dir)
         .await
-        .expect("failed to query users");
+        .expect("failed to settle the server owner");
 
-    if users.is_empty() {
-        tracing::info!("no users found, creating default admin user (admin / admin)");
-        rustyfin_auth::create_initial_user(&pool, "admin", "admin")
-            .await
-            .expect("failed to create initial user");
+    // Warn about each enabled administrator who still has the default password "admin".
+    match rustyfin_auth::admins_with_default_password(&pool).await {
+        Ok(names) => {
+            for n in names {
+                tracing::warn!(
+                    "administrator account '{}' still uses the default password 'admin'; please change it",
+                    n
+                );
+            }
+        }
+        Err(e) => tracing::warn!("could not check for default admin passwords: {}", e),
     }
 
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
@@ -136,17 +147,25 @@ async fn main() {
     let plugin_manager = rustyfin_core::plugin_manager::PluginManager::new(&data_dir_arc);
     plugin_manager.load_all().await;
 
-    // Rate limiter: default 500 requests per 60 seconds per IP (configurable via env, 0 to disable)
+    // Rate limiter: default 10 requests per 60 seconds per resolved client IP, for the login
+    // endpoints only (AuthenticateByName, ForgotPassword, ForgotPassword/Pin, ResetPassword).
+    // Configurable via env; 0 disables.
     let rate_max: usize = std::env::var("RUSTYFIN_RATE_LIMIT")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(500);
+        .unwrap_or(DEFAULT_LOGIN_LIMIT);
     let rate_window: u64 = std::env::var("RUSTYFIN_RATE_WINDOW")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(60);
+        .unwrap_or(DEFAULT_LOGIN_WINDOW_SECS);
     let rate_limiter = RateLimiter::new(rate_max, rate_window);
     rate_limiter.start_cleanup();
+
+    // Reverse proxies we trust to set X-Forwarded-For (comma-separated CIDRs or IPs). Loopback is
+    // trusted only when listed.
+    let known_proxies = Arc::new(rustyfin_api::middleware::parse_known_proxies(
+        &std::env::var("RUSTYFIN_KNOWN_PROXIES").unwrap_or_default(),
+    ));
 
     // In-memory response caches
     let cache = rustyfin_api::cache::ApiCache::new();
@@ -164,7 +183,6 @@ async fn main() {
     let state = AppState {
         db: pool,
         db_ro: pool_ro,
-        jwt_secret: Arc::new(jwt_secret),
         server_id: Arc::new(server_id),
         data_dir: data_dir_arc,
         config: Arc::new(RwLock::new(config)),
@@ -176,6 +194,7 @@ async fn main() {
         task_scheduler: task_scheduler.clone(),
         plugin_manager,
         rate_limiter,
+        known_proxies,
         ws_broadcast,
         log_level_tx,
         cache,
@@ -196,8 +215,8 @@ async fn main() {
         .and_then(|p| p.parse().ok())
         .unwrap_or(8096);
 
-    // Background task: SSDP discovery (DLNA)
-    {
+    // Background task: SSDP discovery (DLNA), only when the DLNA server is on
+    if state.config.read().await.enable_dlna_server {
         let dlna_config = std::sync::Arc::new(rustyfin_core::dlna::DlnaConfig {
             server_name: "Rustyfin".to_string(),
             server_id: state.server_id.to_string(),
@@ -430,4 +449,55 @@ fn data_dir() -> std::path::PathBuf {
                 .map(|h| std::path::PathBuf::from(h).join(".rustyfin"))
         })
         .unwrap_or_else(|| std::path::PathBuf::from("."))
+}
+
+/// The server id is stable across restarts. `RUSTYFIN_SERVER_ID` wins. Otherwise the id is read
+/// from `<data_dir>/server_id`, or on first start generated and written there.
+fn load_or_create_server_id(data_dir: &std::path::Path) -> String {
+    if let Ok(id) = std::env::var("RUSTYFIN_SERVER_ID")
+        && !id.is_empty()
+    {
+        return id;
+    }
+
+    let path = data_dir.join("server_id");
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let existing = existing.trim();
+        if !existing.is_empty() {
+            return existing.to_string();
+        }
+    }
+
+    let id = uuid::Uuid::new_v4().to_string();
+    // Write a temp file and rename it into place, so a crash cannot leave a partial id behind.
+    let tmp = data_dir.join("server_id.tmp");
+    if std::fs::write(&tmp, &id).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
+    id
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_id_is_generated_once_then_reloaded() {
+        let dir = std::env::temp_dir().join(format!("rustyfin_server_id_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let first = load_or_create_server_id(&dir);
+        let second = load_or_create_server_id(&dir);
+
+        assert!(!first.is_empty());
+        assert_eq!(first, second, "a later start reloads the same id");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("server_id"))
+                .unwrap()
+                .trim(),
+            first,
+            "the id is persisted in server_id"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

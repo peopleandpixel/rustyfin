@@ -14,18 +14,8 @@ use crate::state::AppState;
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/Collections", get(get_collections))
-        .route("/Collections", post(create_collection))
         .route("/Collections/{id}", get(get_collection))
-        .route("/Collections/{id}", delete(delete_collection))
         .route("/Collections/{id}/Items", get(get_collection_items))
-        .route(
-            "/Collections/{id}/Items/{item_id}",
-            post(add_item_to_collection),
-        )
-        .route(
-            "/Collections/{id}/Items/{item_id}",
-            delete(remove_item_from_collection),
-        )
         .route("/Playlists", get(get_playlists))
         .route("/Playlists", post(create_playlist))
         .route("/Playlists/{id}", get(get_playlist).post(update_playlist))
@@ -41,9 +31,20 @@ pub fn routes() -> Router<AppState> {
             "/Playlists/{id}/Users/{userId}",
             get(get_playlist_user).delete(remove_playlist_user),
         )
+}
+
+/// Administrator-only collection routes. `routes::build_router` wraps them in `require_admin`.
+pub fn admin_routes() -> Router<AppState> {
+    Router::new()
+        .route("/Collections", post(create_collection))
+        .route("/Collections/{id}", delete(delete_collection))
         .route(
             "/Collections/{id}/Items",
             post(add_items_to_collection).delete(remove_items_from_collection),
+        )
+        .route(
+            "/Collections/{id}/Items/{item_id}",
+            post(add_item_to_collection).delete(remove_item_from_collection),
         )
 }
 

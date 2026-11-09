@@ -34,25 +34,63 @@ mod transcode;
 mod users;
 mod websocket;
 
+pub use startup::{StartupOwner, settle_owner_at_startup};
+
 use axum::Router;
 use axum::middleware as axum_mw;
 
-use crate::middleware::{rate_limit, require_auth};
+use crate::middleware::{rate_limit, require_admin, require_auth, require_setup_or_admin};
 use crate::state::AppState;
 
 pub fn build_router(state: AppState) -> Router {
+    // Open while the server has no users, then administrators only (Jellyfin's FirstTimeSetupOrElevated).
+    let setup = Router::new()
+        .merge(startup::routes())
+        .merge(system::setup_routes())
+        .merge(library::setup_routes())
+        .route_layer(axum_mw::from_fn_with_state(
+            state.clone(),
+            require_setup_or_admin,
+        ));
+
     let public = Router::new()
         .merge(system::public_routes())
-        .merge(auth::routes())
         .merge(users::public_routes())
         .merge(quick_connect::public_routes())
-        .merge(dlna::routes())
-        .merge(startup::routes())
+        .merge(dlna::routes().route_layer(axum_mw::from_fn_with_state(
+            state.clone(),
+            dlna::require_dlna_enabled,
+        )))
+        .merge(setup)
         .merge(websocket::routes());
+
+    // Administrator routes. `require_auth` answers 401 without a valid token. `require_admin`
+    // then answers 403 to a logged-in user who is not an administrator.
+    let admin = Router::new()
+        .merge(system::admin_routes())
+        .merge(configuration::admin_routes())
+        .merge(activity::admin_routes())
+        .merge(session::admin_routes())
+        .merge(users::admin_routes())
+        .merge(library::admin_routes())
+        .merge(images::admin_routes())
+        .merge(items::admin_routes())
+        .merge(subtitle::admin_routes())
+        .merge(collections::admin_routes())
+        .merge(live_tv::admin_routes())
+        .merge(dlna::admin_routes())
+        .merge(localization::admin_routes())
+        .merge(encoding_manager::routes())
+        .merge(scheduled_tasks::routes())
+        .merge(plugins::routes())
+        .merge(packages::routes())
+        .merge(backup::routes())
+        .merge(devices::routes())
+        .merge(dlna_streaming::routes())
+        .route_layer(axum_mw::from_fn(require_admin));
 
     let protected = Router::new()
         .merge(system::protected_routes())
-        .merge(encoding_manager::routes())
         .merge(users::routes())
         .merge(library::routes())
         .merge(items::routes())
@@ -67,28 +105,27 @@ pub fn build_router(state: AppState) -> Router {
         .merge(collections::routes())
         .merge(persons::routes())
         .merge(activity::routes())
-        .merge(scheduled_tasks::routes())
-        .merge(plugins::routes())
         .merge(display_preferences::routes())
         .merge(configuration::routes())
         .merge(shows::routes())
         .merge(live_tv::routes())
         .merge(additional::routes())
         .merge(media_segments::routes())
-        .merge(devices::routes())
         .merge(dynamic_hls::routes())
         .merge(localization::routes())
-        .merge(packages::routes())
-        .merge(dlna_streaming::routes())
-        .merge(backup::routes())
         .merge(sync_play::routes())
+        .merge(admin)
         .layer(axum_mw::from_fn_with_state(state.clone(), require_auth));
 
+    // Rate limit only the endpoints that check a password or PIN. route_layer applies the
+    // limiter to matched routes only, so every other route is unlimited.
+    let login = Router::new()
+        .merge(auth::routes())
+        .merge(users::login_routes())
+        .route_layer(axum_mw::from_fn_with_state(state.clone(), rate_limit));
+
     #[allow(unused_mut)]
-    let mut router = Router::new()
-        .merge(public)
-        .merge(protected)
-        .layer(axum_mw::from_fn_with_state(state.clone(), rate_limit));
+    let mut router = Router::new().merge(public).merge(protected).merge(login);
 
     // Optionally serve the static web client (enabled via "webclient" feature)
     #[cfg(feature = "webclient")]

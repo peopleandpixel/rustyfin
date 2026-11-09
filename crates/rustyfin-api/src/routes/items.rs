@@ -11,6 +11,7 @@ use sqlx::SqlitePool;
 use uuid::Uuid;
 
 use crate::error::ApiError;
+use crate::routes::playback::{path_user, query_user};
 use crate::state::AppState;
 
 /// Populate `media_sources` on each item using a single batched query.
@@ -1203,9 +1204,8 @@ async fn enrich_items(
 
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route("/Items", get(get_items).delete(delete_items))
+        .route("/Items", get(get_items))
         .route("/Items/{id}", get(get_item))
-        .route("/Items/{id}", delete(delete_item))
         .route("/Items/{id}/Children", get(get_children))
         .route("/Items/{id}/Similar", get(get_similar))
         .route("/Items/Latest", get(get_latest))
@@ -1221,16 +1221,6 @@ pub fn routes() -> Router<AppState> {
         // Additional Items endpoints
         .route("/Items/{id}/Ancestors", get(get_ancestors))
         .route("/Items/{id}/Collections", get(get_item_collections))
-        .route("/Items/{id}/Images/{image_type}", delete(delete_item_image))
-        .route(
-            "/Items/{id}/Images/{image_type}/{image_index}",
-            delete(delete_item_image_index),
-        )
-        .route(
-            "/Items/{id}/AlternateSources",
-            delete(delete_alternate_sources),
-        )
-        .route("/Items/{id}/Subtitles/{index}", delete(delete_subtitles))
         .route("/Items/{id}/Attachments/{index}", get(get_attachments))
         // User items with rating
         .route(
@@ -1241,6 +1231,23 @@ pub fn routes() -> Router<AppState> {
         .route("/Channels", get(get_channels))
         .route("/Channels/Items/Latest", get(get_channels_items_latest))
         .route("/Channels/{channelId}/Features", get(get_channel_features))
+}
+
+/// Administrator-only item removal routes. `routes::build_router` wraps them in `require_admin`.
+pub fn admin_routes() -> Router<AppState> {
+    Router::new()
+        .route("/Items", delete(delete_items))
+        .route("/Items/{id}", delete(delete_item))
+        .route("/Items/{id}/Images/{image_type}", delete(delete_item_image))
+        .route(
+            "/Items/{id}/Images/{image_type}/{image_index}",
+            delete(delete_item_image_index),
+        )
+        .route(
+            "/Items/{id}/AlternateSources",
+            delete(delete_alternate_sources),
+        )
+        .route("/Items/{id}/Subtitles/{index}", delete(delete_subtitles))
 }
 
 #[derive(Deserialize)]
@@ -1642,6 +1649,7 @@ async fn get_items(
         query.premiere_date(),
         query.date_created(),
         runtime_parts,
+        Some(claims.sub),
     )
     .await?;
 
@@ -1949,8 +1957,12 @@ async fn get_resume(
     Query(query): Query<ResumeQuery>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<QueryResult>, ApiError> {
+    let user = query_user(&state, &claims, query.user_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("user not found".into()))?;
     let limit = query.limit.unwrap_or(10);
-    let mut items = rustyfin_db::repo_media::get_resume_items(&state.db_ro, limit).await?;
+    let mut items =
+        rustyfin_db::repo_media::get_user_resume_items(&state.db_ro, user, limit).await?;
     let total = items.len() as i64;
     // Enrich resume items using batch queries
     // Skip blurhash for list views to avoid per-item disk I/O
@@ -1959,7 +1971,7 @@ async fn get_resume(
     enrich_items(
         &state.db_ro,
         &state.server_id,
-        Some(claims.sub),
+        Some(user),
         &mut items,
         &state.http_client,
         tmdb_key,
@@ -1979,6 +1991,8 @@ async fn get_resume(
 #[serde(rename_all = "PascalCase")]
 struct ResumeQuery {
     limit: Option<i64>,
+    #[serde(alias = "userId")]
+    user_id: Option<Uuid>,
 }
 
 #[derive(Deserialize)]
@@ -2041,6 +2055,7 @@ async fn get_user_resume(
     Query(query): Query<ResumeQuery>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<QueryResult>, ApiError> {
+    let user_id = path_user(&state, &claims, user_id).await?;
     let limit = query.limit.unwrap_or(10);
     let mut items =
         rustyfin_db::repo_media::get_user_resume_items(&state.db_ro, user_id, limit).await?;
@@ -2052,7 +2067,7 @@ async fn get_user_resume(
     enrich_items(
         &state.db_ro,
         &state.server_id,
-        Some(claims.sub),
+        Some(user_id),
         &mut items,
         &state.http_client,
         tmdb_key,
@@ -2205,9 +2220,14 @@ async fn get_attachments(
 /// DELETE /Users/{userId}/Items/{itemId}/Rating
 async fn delete_rating(
     State(state): State<AppState>,
-    Path((_user_id, item_id)): Path<(Uuid, Uuid)>,
+    Path((user_id, item_id)): Path<(Uuid, Uuid)>,
+    Extension(claims): Extension<Claims>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
-    rustyfin_db::repo_playback::clear_user_rating(&state.db, _user_id, item_id)
+    let user_id = path_user(&state, &claims, user_id).await?;
+    rustyfin_db::repo_media::get_item_by_id(&state.db_ro, item_id)
+        .await?
+        .ok_or(ApiError::NotFound("item not found".into()))?;
+    rustyfin_db::repo_playback::clear_user_rating(&state.db, user_id, item_id)
         .await
         .ok();
     Ok((StatusCode::OK, Json(serde_json::json!({}))))

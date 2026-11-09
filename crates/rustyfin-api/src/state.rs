@@ -1,5 +1,6 @@
 use crate::cache::{ApiCache, ImageCache};
 use crate::middleware::RateLimiter;
+use ipnet::IpNet;
 use reqwest::Client;
 use rustyfin_core::plugin_manager::PluginManager;
 use rustyfin_core::scheduler::TaskScheduler;
@@ -18,7 +19,6 @@ pub struct AppState {
     pub db: SqlitePool,
     /// Read-only connection pool for query-heavy operations (PRAGMA query_only = ON).
     pub db_ro: SqlitePool,
-    pub jwt_secret: Arc<String>,
     pub server_id: Arc<String>,
     pub data_dir: Arc<PathBuf>,
     pub config: Arc<RwLock<ServerConfiguration>>,
@@ -31,6 +31,9 @@ pub struct AppState {
     pub task_scheduler: TaskScheduler,
     pub plugin_manager: PluginManager,
     pub rate_limiter: RateLimiter,
+    /// Reverse-proxy networks we trust to set `X-Forwarded-For`. Empty = trust no proxy (loopback is
+    /// always implicitly trusted). Configured from `RUSTYFIN_KNOWN_PROXIES`.
+    pub known_proxies: Arc<Vec<IpNet>>,
     /// Broadcast channel for WebSocket real-time events
     pub ws_broadcast: broadcast::Sender<WsEvent>,
     /// Watch channel to control live log verbosity level (e.g. "info", "debug", "trace")

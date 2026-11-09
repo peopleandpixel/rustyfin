@@ -1,19 +1,24 @@
 use axum::extract::{Path, Query, State};
 use axum::routing::get;
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use serde::Deserialize;
 use uuid::Uuid;
 
 use rustyfin_model::activity::ActivityLogResult;
+use rustyfin_model::auth::Claims;
 use rustyfin_model::notification::NotificationResult;
 
 use crate::error::ApiError;
+use crate::routes::playback::path_user;
 use crate::state::AppState;
 
 pub fn routes() -> Router<AppState> {
-    Router::new()
-        .route("/System/ActivityLog/Entries", get(get_activity_log))
-        .route("/Notifications/{userId}", get(get_notifications))
+    Router::new().route("/Notifications/{userId}", get(get_notifications))
+}
+
+/// Administrator-only activity log routes. `routes::build_router` wraps them in `require_admin`.
+pub fn admin_routes() -> Router<AppState> {
+    Router::new().route("/System/ActivityLog/Entries", get(get_activity_log))
 }
 
 #[derive(Debug, Deserialize)]
@@ -45,7 +50,9 @@ async fn get_activity_log(
 async fn get_notifications(
     State(state): State<AppState>,
     Path(user_id): Path<Uuid>,
+    Extension(claims): Extension<Claims>,
 ) -> Result<Json<NotificationResult>, ApiError> {
+    let user_id = path_user(&state, &claims, user_id).await?;
     let result = rustyfin_db::repo_notification::get_notifications(&state.db_ro, user_id).await?;
     Ok(Json(result))
 }

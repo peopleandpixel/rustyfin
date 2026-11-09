@@ -20,6 +20,7 @@ pub mod repo_playlist;
 pub mod repo_search;
 pub mod repo_session;
 pub mod repo_sync_play;
+pub mod repo_token;
 pub mod repo_trickplay;
 pub mod repo_user;
 
@@ -111,4 +112,156 @@ pub async fn init_read_only_db(database_url: &str) -> Result<SqlitePool, sqlx::E
         .await?;
 
     Ok(pool)
+}
+
+#[cfg(test)]
+mod tests {
+    // G2 follow-up: master 2099567 ships migrations 001-031 and G1's 033_user_easy_password.sql
+    // takes version 33, so every schema change on this branch must live in 032. These run the real
+    // MIGRATOR, or the part of it that a master build had already applied.
+    use super::*;
+    use sqlx::migrate::Migrator;
+
+    /// The last migration version on master 2099567.
+    const MASTER_LAST_VERSION: i64 = 31;
+
+    fn subset(max_version: i64) -> Migrator {
+        Migrator::with_migrations(
+            MIGRATOR
+                .iter()
+                .filter(|m| m.version <= max_version)
+                .cloned()
+                .collect(),
+        )
+    }
+
+    fn temp_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("rustyfin_test_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    async fn plain_pool(path: &std::path::Path) -> SqlitePool {
+        SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(path)
+                    .create_if_missing(true),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// Every table, index, trigger and view, without SQLite's and sqlx's own bookkeeping.
+    async fn schema(pool: &SqlitePool) -> Vec<(String, String, String, Option<String>)> {
+        sqlx::query_as(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master \
+             WHERE name NOT LIKE 'sqlite_%' AND name != '_sqlx_migrations' ORDER BY type, name",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn assert_reset_pins_hardened(pool: &SqlitePool) {
+        let cols: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('password_reset_pins')")
+                .fetch_all(pool)
+                .await
+                .unwrap();
+        assert!(
+            cols.iter().any(|c| c == "failed_attempts"),
+            "password_reset_pins.failed_attempts exists: {cols:?}"
+        );
+        let unique: Option<i64> = sqlx::query_scalar(
+            "SELECT \"unique\" FROM pragma_index_list('password_reset_pins') \
+             WHERE name = 'idx_password_reset_pins_user'",
+        )
+        .fetch_optional(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            unique,
+            Some(1),
+            "the unique index idx_password_reset_pins_user exists"
+        );
+    }
+
+    #[tokio::test]
+    async fn migrations_through_032_harden_reset_pins() {
+        let dir = temp_dir();
+        let pool = plain_pool(&dir.join("v32.db")).await;
+        subset(32).run(&pool).await.unwrap();
+        assert_reset_pins_hardened(&pool).await;
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_master_db_upgrades_to_the_fresh_schema() {
+        let dir = temp_dir();
+        let master = dir.join("master.db");
+        let pool = plain_pool(&master).await;
+        subset(MASTER_LAST_VERSION).run(&pool).await.unwrap();
+        pool.close().await;
+
+        let upgraded = init_db(master.to_str().unwrap()).await.unwrap();
+        let fresh = init_db(dir.join("fresh.db").to_str().unwrap())
+            .await
+            .unwrap();
+        assert_reset_pins_hardened(&fresh).await;
+        assert_reset_pins_hardened(&upgraded).await;
+        assert_eq!(
+            schema(&upgraded).await,
+            schema(&fresh).await,
+            "a 2099567 DB and a fresh DB end with the same schema"
+        );
+        upgraded.close().await;
+        fresh.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn g2c_a_latest_db_without_032_upgrades_to_the_fresh_schema() {
+        // The :latest image (master 75fea9a) shipped 001-031 and G1's 033 but not 032. SQLx applies
+        // the missing 032 after 033 at the next start.
+        let dir = temp_dir();
+        let latest = dir.join("latest.db");
+        let pool = plain_pool(&latest).await;
+        Migrator::with_migrations(
+            MIGRATOR
+                .iter()
+                .filter(|m| m.version <= MASTER_LAST_VERSION || m.version == 33)
+                .cloned()
+                .collect(),
+        )
+        .run(&pool)
+        .await
+        .unwrap();
+        let applied: Vec<i64> =
+            sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert!(
+            applied.contains(&33) && !applied.contains(&32),
+            "the :latest DB has 033 and no 032: {applied:?}"
+        );
+        pool.close().await;
+
+        let upgraded = init_db(latest.to_str().unwrap()).await.unwrap();
+        let fresh = init_db(dir.join("fresh.db").to_str().unwrap())
+            .await
+            .unwrap();
+        assert_reset_pins_hardened(&upgraded).await;
+        assert_eq!(
+            schema(&upgraded).await,
+            schema(&fresh).await,
+            "a :latest DB and a fresh DB end with the same schema"
+        );
+        upgraded.close().await;
+        fresh.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

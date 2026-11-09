@@ -18,11 +18,16 @@ async fn login(
     headers: HeaderMap,
     Json(req): Json<LoginRequest>,
 ) -> Result<Json<AuthResponse>, ApiError> {
-    let (user, token) =
-        rustyfin_auth::authenticate(&state.db, &req.username, &req.password, &state.jwt_secret)
-            .await?;
-
     let (client, version, device, device_id) = parse_emby_auth(&headers);
+    let token_device = rustyfin_auth::TokenDevice {
+        device_id: device_id.clone(),
+        device_name: device.clone(),
+        app_name: client.clone(),
+        app_version: version.clone(),
+    };
+    let (user, token) =
+        rustyfin_auth::authenticate(&state.db, &req.username, &req.password, &token_device).await?;
+
     let session_id = Uuid::new_v4();
 
     // Create session in database with empty capabilities (will be updated by client)
@@ -53,8 +58,15 @@ async fn login(
         capabilities: serde_json::json!({}),
     };
 
+    let flags = rustyfin_db::repo_user::user_flags(&state.db, user.id)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "could not read the user's flags for the sign-in answer");
+            Default::default()
+        });
+
     Ok(Json(AuthResponse {
-        user: UserDto::from(user),
+        user: UserDto::new(user, flags),
         session_info,
         access_token: token,
         server_id: state.server_id.to_string(),

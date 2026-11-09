@@ -29,6 +29,7 @@ moka = { workspace = true }
 reqwest = { workspace = true }
 futures-util = "0.3"
 dashmap = "6"
+ipnet = "2"
 
 [dev-dependencies]
 http-body-util = "0.1"
@@ -37,3 +38,4 @@ rustyfin-db = { workspace = true }
 rustyfin-auth = { workspace = true }
 rustyfin-core = { workspace = true }
 uuid = { workspace = true }
+sha2 = "0.10"

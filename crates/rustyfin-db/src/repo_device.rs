@@ -71,14 +71,6 @@ pub async fn create_device(
     Ok(())
 }
 
-pub async fn delete_device(pool: &SqlitePool, device_id: &str) -> Result<(), sqlx::Error> {
-    sqlx::query("DELETE FROM devices WHERE id = ?1")
-        .bind(device_id)
-        .execute(pool)
-        .await?;
-    Ok(())
-}
-
 pub async fn update_device_image(
     pool: &SqlitePool,
     device_id: &str,

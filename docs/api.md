@@ -11,7 +11,7 @@ Rustyfin implementiert die Jellyfin-API. Alle Endpoints verwenden JSON als Daten
 Die meisten Endpoints erfordern Authentifizierung über den `Authorization`-Header:
 
 ```
-Authorization: MediaBrowser Token=<jwt-token-oder-api-key>
+Authorization: MediaBrowser Token=<zugriffstoken-oder-api-key>
 ```
 
 Alternativ kann der Token als Query-Parameter übergeben werden:
@@ -52,9 +52,11 @@ GET /System/Info?api_key=<token>
 |---|---|---|
 | `GET` | `/Startup/Configuration` | Setup-Status abfragen |
 | `POST` | `/Startup/Configuration` | Setup-Konfiguration setzen |
-| `GET` | `/Startup/User` | Initialen Admin-User abfragen |
-| `POST` | `/Startup/User` | Admin-User erstellen |
+| `GET` | `/Startup/User` | Namen des Server-Besitzers abfragen (leer, solange keiner existiert) |
+| `POST` | `/Startup/User` | Server-Besitzer anlegen (nur solange der Server keine Benutzer hat) |
 | `POST` | `/Startup/Complete` | Setup abschließen |
+
+Solange der Server keine Benutzer hat, sind die `/Startup/*`-Endpunkte ohne Anmeldung erreichbar, danach nur für Administratoren.
 
 ---
 

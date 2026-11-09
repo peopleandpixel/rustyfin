@@ -1,23 +1,34 @@
-use axum::extract::{Path, State};
+use axum::extract::{ConnectInfo, Path, State};
+use axum::http::HeaderMap;
 use axum::routing::{delete, get, post, put};
 use axum::{Extension, Json, Router};
 use chrono::Utc;
+use rustyfin_db::repo_user::PolicyChange;
 use rustyfin_model::auth::Claims;
 use rustyfin_model::user::{
-    ChangePasswordRequest, CreateUserRequest, EasyPasswordRequest, ForgotPasswordRequest,
-    ForgotPasswordResult, PublicUserDto, ResetPasswordRequest, UpdatePolicyRequest,
-    UpdateUserNameRequest, UserAccessSchedule, UserDto, UserImageInfo, UserPreferences,
-    UserSecurityInfo,
+    ChangePasswordRequest, CreateUserRequest, EasyPasswordRequest, ForgotPasswordPinRequest,
+    ForgotPasswordRequest, ForgotPasswordResult, PublicUserDto, ResetPasswordRequest,
+    UpdatePolicyRequest, UpdateUserNameRequest, UserAccessSchedule, UserDto, UserFlags,
+    UserImageInfo, UserPreferences, UserSecurityInfo, name_too_long,
 };
+use sqlx::SqlitePool;
+use std::net::SocketAddr;
+use std::path::PathBuf;
 use uuid::Uuid;
 
 use crate::error::ApiError;
+use crate::middleware::resolve_client;
 use crate::state::AppState;
 
 pub fn public_routes() -> Router<AppState> {
+    Router::new().route("/Users/Public", get(get_public_users))
+}
+
+/// Endpoints that check a password or reset PIN. Only these are rate limited.
+pub fn login_routes() -> Router<AppState> {
     Router::new()
-        .route("/Users/Public", get(get_public_users))
         .route("/Users/ForgotPassword", post(forgot_password))
+        .route("/Users/ForgotPassword/Pin", post(reset_password_pin))
         .route("/Users/ResetPassword", post(reset_password))
 }
 
@@ -25,12 +36,9 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/Users", get(get_users))
         .route("/Users/Me", get(get_me))
-        .route("/Users/New", post(create_user))
-        .route("/Users/{userId}", get(get_user).delete(delete_user_by_id))
+        .route("/Users/{userId}", get(get_user))
         .route("/Users/{userId}", put(update_user_name))
-        .route("/Users/{userId}/Delete", post(delete_user))
         .route("/Users/{userId}/Password", post(change_password))
-        .route("/Users/{userId}/Policy", post(update_policy))
         .route("/Users/{userId}/Configuration", post(update_configuration))
         .route("/Users/{userId}/Images", get(get_user_images))
         .route("/Users/{userId}/Images/{image_type}", get(get_user_image))
@@ -38,14 +46,6 @@ pub fn routes() -> Router<AppState> {
         .route("/Users/{userId}/EasyPassword", post(set_easy_password))
         .route("/Users/{userId}/Preferences", get(get_preferences))
         .route("/Users/{userId}/Periods", get(get_periods))
-        // Auth endpoints
-        .route("/Auth/Keys", get(get_auth_keys))
-        .route("/Auth/Keys/{key}", delete(delete_auth_key))
-        .route("/Auth/Providers", get(get_auth_providers))
-        .route(
-            "/Auth/PasswordResetProviders",
-            get(get_password_reset_providers),
-        )
         // User played/favorite items (delete variants)
         .route("/UserPlayedItems/{itemId}", delete(delete_user_played_item))
         .route(
@@ -56,9 +56,34 @@ pub fn routes() -> Router<AppState> {
         .route("/UserImage", delete(delete_user_image))
 }
 
+/// Administrator-only user and auth routes. `routes::build_router` wraps them in `require_admin`.
+pub fn admin_routes() -> Router<AppState> {
+    Router::new()
+        .route("/Users/New", post(create_user))
+        .route("/Users/{userId}", delete(delete_user_by_id))
+        .route("/Users/{userId}/Delete", post(delete_user))
+        .route("/Users/{userId}/Policy", post(update_policy))
+        .route("/Auth/Keys", get(get_auth_keys))
+        .route("/Auth/Keys/{key}", delete(delete_auth_key))
+        .route("/Auth/Providers", get(get_auth_providers))
+        .route(
+            "/Auth/PasswordResetProviders",
+            get(get_password_reset_providers),
+        )
+}
+
 async fn get_users(State(state): State<AppState>) -> Result<Json<Vec<UserDto>>, ApiError> {
     let users = rustyfin_db::repo_user::get_all_users(&state.db_ro).await?;
-    Ok(Json(users.into_iter().map(UserDto::from).collect()))
+    let flags = rustyfin_db::repo_user::all_user_flags(&state.db_ro).await?;
+    Ok(Json(
+        users
+            .into_iter()
+            .map(|u| {
+                let f = flags.get(&u.id).copied().unwrap_or_default();
+                UserDto::new(u, f)
+            })
+            .collect(),
+    ))
 }
 
 async fn get_me(
@@ -68,7 +93,8 @@ async fn get_me(
     let user = rustyfin_db::repo_user::get_user_by_id(&state.db_ro, claims.sub)
         .await?
         .ok_or(ApiError::NotFound("user not found".into()))?;
-    Ok(Json(UserDto::from(user)))
+    let flags = rustyfin_db::repo_user::user_flags(&state.db_ro, user.id).await?;
+    Ok(Json(UserDto::new(user, flags)))
 }
 
 async fn get_user(
@@ -78,13 +104,14 @@ async fn get_user(
     let user = rustyfin_db::repo_user::get_user_by_id(&state.db_ro, id)
         .await?
         .ok_or(ApiError::NotFound("user not found".into()))?;
-    Ok(Json(UserDto::from(user)))
+    let flags = rustyfin_db::repo_user::user_flags(&state.db_ro, user.id).await?;
+    Ok(Json(UserDto::new(user, flags)))
 }
 
 async fn get_public_users(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<PublicUserDto>>, ApiError> {
-    let users = rustyfin_db::repo_user::get_all_users(&state.db_ro).await?;
+    let users = rustyfin_db::repo_user::get_public_users(&state.db_ro).await?;
     Ok(Json(users.into_iter().map(PublicUserDto::from).collect()))
 }
 
@@ -94,32 +121,36 @@ async fn create_user(
     Json(req): Json<CreateUserRequest>,
 ) -> Result<Json<UserDto>, ApiError> {
     if !claims.is_admin {
-        return Err(ApiError::Unauthorized);
+        return Err(ApiError::Forbidden(
+            "Administrator access is required.".to_string(),
+        ));
     }
 
     if req.name.trim().is_empty() {
         return Err(ApiError::BadRequest("name is required".into()));
     }
-
-    if let Some(_existing) = rustyfin_db::repo_user::get_user_by_name(&state.db, &req.name).await? {
-        return Err(ApiError::BadRequest("user already exists".into()));
+    if name_too_long(&req.name) {
+        return Err(ApiError::BadRequest("name is too long".into()));
     }
 
     let hash = rustyfin_auth::hash_password(&req.password)
+        .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     let user = rustyfin_model::user::User {
         id: Uuid::new_v4(),
         name: req.name,
         password_hash: hash,
-        is_administrator: false,
+        is_administrator: req.is_administrator.unwrap_or(false),
         created_at: Utc::now(),
         last_login_date: None,
         configuration: serde_json::Value::Object(Default::default()),
     };
 
-    rustyfin_db::repo_user::create_user(&state.db, &user).await?;
-    Ok(Json(UserDto::from(user)))
+    if !rustyfin_db::repo_user::create_user_unless_taken(&state.db, &user).await? {
+        return Err(ApiError::BadRequest("user already exists".into()));
+    }
+    Ok(Json(UserDto::new(user, UserFlags::default())))
 }
 
 async fn delete_user(
@@ -128,7 +159,15 @@ async fn delete_user(
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     if !claims.is_admin {
-        return Err(ApiError::Unauthorized);
+        return Err(ApiError::Forbidden(
+            "Administrator access is required.".to_string(),
+        ));
+    }
+
+    if rustyfin_db::repo_user::is_owner(&state.db, id).await? {
+        return Err(ApiError::Forbidden(
+            "The server owner cannot be deleted.".into(),
+        ));
     }
 
     if claims.sub == id {
@@ -147,11 +186,12 @@ async fn change_password(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
     Path(id): Path<Uuid>,
+    token: Option<Extension<rustyfin_auth::RequestToken>>,
     Json(req): Json<ChangePasswordRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // users can change their own password, admins can change any
     if claims.sub != id && !claims.is_admin {
-        return Err(ApiError::Unauthorized);
+        return Err(ApiError::Forbidden("User update not allowed.".to_string()));
     }
 
     // non-admins must verify current password
@@ -161,23 +201,40 @@ async fn change_password(
             .ok_or(ApiError::NotFound("user not found".into()))?;
 
         let valid = rustyfin_auth::verify_password(&req.current_pw, &user.password_hash)
+            .await
             .map_err(|e| ApiError::Internal(e.to_string()))?;
         if !valid {
             return Err(ApiError::Unauthorized);
         }
     }
 
-    let hash =
-        rustyfin_auth::hash_password(&req.new_pw).map_err(|e| ApiError::Internal(e.to_string()))?;
+    let hash = rustyfin_auth::hash_password(&req.new_pw)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     let updated = rustyfin_db::repo_user::update_password(&state.db, id, &hash).await?;
     if !updated {
         return Err(ApiError::NotFound("user not found".into()));
     }
 
+    // Revoke the user's other tokens. A self-change keeps the caller's own session; an admin
+    // changing another user's password revokes all of that user's tokens.
+    let keep: Option<String> = if claims.sub == id {
+        token.map(|Extension(rt)| rt.0)
+    } else {
+        None
+    };
+    rustyfin_auth::revoke_user_tokens(&state.db, id, keep.as_deref())
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
     Ok(Json(serde_json::json!({})))
 }
 
+/// Sets an account's administrator and disabled flags. Administrators only. Refuses, with 403, to
+/// change the owner's role or state, to remove or disable one's own administrator rights or account,
+/// to disable an administrator, and to leave no enabled administrator. Disabling an account deletes its
+/// tokens, sessions and devices.
 async fn update_policy(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
@@ -185,13 +242,64 @@ async fn update_policy(
     Json(req): Json<UpdatePolicyRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     if !claims.is_admin {
-        return Err(ApiError::Unauthorized);
+        return Err(ApiError::Forbidden(
+            "Administrator access is required.".to_string(),
+        ));
     }
 
-    if let Some(is_admin) = req.is_administrator {
-        let updated = rustyfin_db::repo_user::update_policy(&state.db, id, is_admin).await?;
-        if !updated {
-            return Err(ApiError::NotFound("user not found".into()));
+    if rustyfin_db::repo_user::get_user_by_id(&state.db, id)
+        .await?
+        .is_none()
+    {
+        return Err(ApiError::NotFound("user not found".into()));
+    }
+
+    if rustyfin_db::repo_user::is_owner(&state.db, id).await? {
+        if req.is_administrator == Some(false) {
+            return Err(ApiError::Forbidden(
+                "The server owner must stay an administrator.".into(),
+            ));
+        }
+        if req.is_disabled == Some(true) {
+            return Err(ApiError::Forbidden(
+                "The server owner cannot be disabled.".into(),
+            ));
+        }
+    }
+
+    if claims.sub == id {
+        if req.is_administrator == Some(false) {
+            return Err(ApiError::Forbidden(
+                "You cannot remove your own administrator rights.".into(),
+            ));
+        }
+        if req.is_disabled == Some(true) {
+            return Err(ApiError::Forbidden(
+                "You cannot disable your own account.".into(),
+            ));
+        }
+    }
+
+    let change =
+        rustyfin_db::repo_user::set_policy(&state.db, id, req.is_administrator, req.is_disabled)
+            .await?;
+    match change {
+        PolicyChange::Done => {}
+        PolicyChange::NotFound => return Err(ApiError::NotFound("user not found".into())),
+        PolicyChange::AdminDisabled => {
+            return Err(ApiError::Forbidden(
+                "Administrators cannot be disabled. Remove the administrator rights first.".into(),
+            ));
+        }
+        PolicyChange::PromoteDisabled => {
+            return Err(ApiError::Forbidden(
+                "A disabled account cannot be made an administrator. Enable it first.".into(),
+            ));
+        }
+        PolicyChange::LastAdmin => {
+            return Err(ApiError::Forbidden(
+                "There must be at least one enabled administrator.".into(),
+            ));
         }
     }
 
@@ -206,7 +314,7 @@ async fn update_configuration(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // users can update their own config, admins can update any
     if claims.sub != id && !claims.is_admin {
-        return Err(ApiError::Unauthorized);
+        return Err(ApiError::Forbidden("User update not allowed.".to_string()));
     }
 
     let updated = rustyfin_db::repo_user::update_configuration(&state.db, id, &config).await?;
@@ -217,50 +325,156 @@ async fn update_configuration(
     Ok(Json(serde_json::json!({})))
 }
 
+/// Every ForgotPassword answer waits until this long after the request reached the handler, so its
+/// timing reveals neither whether the name exists nor whether the reset work was slow.
+const FORGOT_PASSWORD_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Start a password reset. The response is uniform whether or not the user exists, so it never
+/// reveals account existence, and it never contains the PIN. The PIN is written (mode 0600 on Unix)
+/// to a file under the data dir ONLY when the user exists AND the resolved client (see
+/// `resolve_client`) is on the local network AND the user has no pending or voided reset, since a
+/// new request never replaces an open reset. Every other request gets the same 200 with a file path
+/// that is not created. Every answer comes `FORGOT_PASSWORD_DELAY` (250 ms) after the request
+/// reached the handler. The reset work runs in its own task: it finishes before the answer when it
+/// is quick, and in the background when it takes longer.
 async fn forgot_password(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(req): Json<ForgotPasswordRequest>,
 ) -> Result<Json<ForgotPasswordResult>, ApiError> {
-    // Look up the user by username
-    let user = rustyfin_db::repo_user::get_user_by_name(&state.db, &req.entered_username)
-        .await?
-        .ok_or_else(|| ApiError::BadRequest("user not found".to_string()))?;
+    let deadline = tokio::time::Instant::now() + FORGOT_PASSWORD_DELAY;
+    let pin_path = state
+        .data_dir
+        .join(rustyfin_auth::reset_pin_filename(&req.entered_username));
+    let expires_at = (Utc::now() + chrono::Duration::minutes(30)).to_rfc3339();
 
-    // Generate a PIN code
-    let pin = rustyfin_db::repo_user::generate_password_reset_pin(&state.db, user.id)
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
-
-    // Log the PIN (in production with SMTP configured, email would be sent)
-    tracing::info!(
-        user = %user.name,
-        pin = %pin,
-        "Password reset PIN generated for user"
-    );
+    if resolve_client(peer.ip(), &headers, &state.known_proxies).is_local() {
+        let handle = tokio::spawn(issue_reset_pin(
+            state.db.clone(),
+            req.entered_username.clone(),
+            pin_path.clone(),
+            expires_at.clone(),
+        ));
+        // Waited for only until the deadline; a slower task is detached and finishes alone.
+        let _ = tokio::time::timeout_at(deadline, handle).await;
+    }
+    tokio::time::sleep_until(deadline).await;
 
     Ok(Json(ForgotPasswordResult {
         action: "PinCode".to_string(),
+        pin_file: pin_path.to_string_lossy().into_owned(),
+        pin_expiration_date: expires_at,
     }))
+}
+
+/// The reset work for a local ForgotPassword, run in its own task (see `forgot_password`). Nothing
+/// is returned to the client; a failure is logged without the PIN.
+async fn issue_reset_pin(db: SqlitePool, name: String, pin_path: PathBuf, expires_at: String) {
+    let user = match rustyfin_db::repo_user::find_user_for_sign_in(&db, &name).await {
+        Ok(Some(user)) => user,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(error = %e, "reset PIN: user lookup failed");
+            return;
+        }
+    };
+    let pin = match rustyfin_auth::create_reset_pin(&db, user.id, &expires_at).await {
+        Ok(Some(pin)) => pin,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(error = %e, "reset PIN: could not store the PIN");
+            return;
+        }
+    };
+    // The PIN lives only in this file. Never log it.
+    let contents = serde_json::json!({
+        "Pin": pin,
+        "ExpirationDate": expires_at,
+        "UserName": user.name,
+    })
+    .to_string();
+    if let Err(e) = write_reset_file(&pin_path, &contents) {
+        tracing::warn!(error = %e, "reset PIN: could not write the reset file");
+    }
+}
+
+/// Write the reset file, truncating any prior file. On Unix it is created owner-only (mode 0600).
+fn write_reset_file(path: &std::path::Path, contents: &str) -> Result<(), ApiError> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts
+        .open(path)
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    f.write_all(contents.as_bytes())
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    Ok(())
+}
+
+/// Redeem a reset PIN (no username). Success: set the user's password to the PIN itself, revoke all
+/// their tokens, delete the reset file, return `{Success:true, UsersReset:[name]}`. No match → 404.
+async fn reset_password_pin(
+    State(state): State<AppState>,
+    Json(req): Json<ForgotPasswordPinRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let uid = rustyfin_auth::redeem_reset_pin(&state.db, &req.pin)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?
+        .ok_or_else(|| ApiError::NotFound("invalid or expired PIN".to_string()))?;
+
+    let user = rustyfin_db::repo_user::get_user_by_id(&state.db, uid)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("user not found".to_string()))?;
+
+    let norm = rustyfin_auth::normalize_reset_pin(&req.pin);
+    let hash = rustyfin_auth::hash_password(&norm)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    rustyfin_db::repo_user::update_password(&state.db, uid, &hash).await?;
+    rustyfin_auth::revoke_user_tokens(&state.db, uid, None)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    remove_reset_pin_files(&state.data_dir, &user.name);
+
+    Ok(Json(serde_json::json!({
+        "Success": true,
+        "UsersReset": [user.name],
+    })))
+}
+
+/// Removes the reset PIN files of `name`: the one named from its name key, and the one an older
+/// server named from the uppercased name (AC65). The redeem calls it on both of its paths.
+fn remove_reset_pin_files(data_dir: &std::path::Path, name: &str) {
+    let _ = std::fs::remove_file(data_dir.join(rustyfin_auth::reset_pin_filename(name)));
+    let _ = std::fs::remove_file(data_dir.join(rustyfin_auth::legacy_reset_pin_filename(name)));
 }
 
 async fn reset_password(
     State(state): State<AppState>,
     Json(req): Json<ResetPasswordRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // Look up the user by username
-    let user = rustyfin_db::repo_user::get_user_by_name(&state.db, &req.username)
+    // Look up the user by username. An unknown user gets the wrong-PIN error, so the response does
+    // not reveal whether the account exists.
+    let user = rustyfin_db::repo_user::find_user_for_sign_in(&state.db, &req.username)
         .await?
-        .ok_or_else(|| ApiError::BadRequest("user not found".to_string()))?;
+        .ok_or_else(|| ApiError::BadRequest("invalid or expired PIN".to_string()))?;
 
     // Validate the PIN
-    let validated =
-        rustyfin_db::repo_user::validate_password_reset_pin(&state.db, user.id, &req.pin)
-            .await
-            .map_err(|e| ApiError::Internal(e.to_string()))?
-            .ok_or_else(|| ApiError::BadRequest("invalid or expired PIN".to_string()))?;
+    let validated = rustyfin_auth::validate_reset_pin(&state.db, user.id, &req.pin)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?
+        .ok_or_else(|| ApiError::BadRequest("invalid or expired PIN".to_string()))?;
 
     // Hash the new password
     let hash = rustyfin_auth::hash_password(&req.temp_password)
+        .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     // Update the user's password
@@ -272,6 +486,10 @@ async fn reset_password(
         return Err(ApiError::NotFound("user not found".into()));
     }
 
+    rustyfin_auth::revoke_user_tokens(&state.db, validated, None)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
     Ok(Json(serde_json::json!({})))
 }
 
@@ -282,16 +500,23 @@ async fn update_user_name(
     Json(req): Json<UpdateUserNameRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     if claims.sub != id && !claims.is_admin {
-        return Err(ApiError::Unauthorized);
+        return Err(ApiError::Forbidden("User update not allowed.".to_string()));
     }
     if req.name.trim().is_empty() {
         return Err(ApiError::BadRequest("name is required".into()));
     }
-    let updated = rustyfin_db::repo_user::update_user_name(&state.db, id, &req.name).await?;
-    if !updated {
-        return Err(ApiError::NotFound("user not found".into()));
+    if name_too_long(&req.name) {
+        return Err(ApiError::BadRequest("name is too long".into()));
     }
-    Ok(Json(serde_json::json!({})))
+    match rustyfin_db::repo_user::rename_user_unless_taken(&state.db, id, &req.name).await? {
+        rustyfin_db::repo_user::Renamed::Done => Ok(Json(serde_json::json!({}))),
+        rustyfin_db::repo_user::Renamed::Taken => {
+            Err(ApiError::BadRequest("user already exists".into()))
+        }
+        rustyfin_db::repo_user::Renamed::NotFound => {
+            Err(ApiError::NotFound("user not found".into()))
+        }
+    }
 }
 
 async fn get_user_images(
@@ -378,13 +603,21 @@ async fn set_easy_password(
     Json(req): Json<EasyPasswordRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     if claims.sub != id && !claims.is_admin {
-        return Err(ApiError::Unauthorized);
+        return Err(ApiError::Forbidden("User update not allowed.".to_string()));
     }
-    // Store easy password in user configuration
-    let config = serde_json::json!({
-        "easyPassword": req.easy_password
-    });
-    let updated = rustyfin_db::repo_user::update_configuration(&state.db, id, &config).await?;
+    // Only an argon2 hash is stored, apart from the configuration, so no response returns the PIN;
+    // an empty PIN clears it.
+    let hash = if req.easy_password.is_empty() {
+        None
+    } else {
+        Some(
+            rustyfin_auth::hash_password(&req.easy_password)
+                .await
+                .map_err(|e| ApiError::Internal(e.to_string()))?,
+        )
+    };
+    let updated =
+        rustyfin_db::repo_user::set_easy_password_hash(&state.db, id, hash.as_deref()).await?;
     if !updated {
         return Err(ApiError::NotFound("user not found".into()));
     }
@@ -439,7 +672,14 @@ async fn delete_user_by_id(
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     if !claims.is_admin {
-        return Err(ApiError::Unauthorized);
+        return Err(ApiError::Forbidden(
+            "Administrator access is required.".to_string(),
+        ));
+    }
+    if rustyfin_db::repo_user::is_owner(&state.db, id).await? {
+        return Err(ApiError::Forbidden(
+            "The server owner cannot be deleted.".into(),
+        ));
     }
     rustyfin_db::repo_user::delete_user(&state.db, id)
         .await

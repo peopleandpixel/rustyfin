@@ -15,14 +15,17 @@ use crate::state::AppState;
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/Items/{id}/Images", get(get_item_images))
-        .route(
-            "/Items/{id}/Images/{image_type}",
-            get(get_item_image).post(upload_item_image),
-        )
+        .route("/Items/{id}/Images/{image_type}", get(get_item_image))
         .route(
             "/Items/{id}/Images/{image_type}/{image_index}",
             get(get_item_image_indexed),
         )
+}
+
+/// Administrator-only image/refresh routes. `routes::build_router` wraps them in `require_admin`.
+pub fn admin_routes() -> Router<AppState> {
+    Router::new()
+        .route("/Items/{id}/Images/{image_type}", post(upload_item_image))
         .route("/Items/{id}/Refresh", post(refresh_item))
 }
 

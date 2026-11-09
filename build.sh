@@ -296,7 +296,7 @@ setup_systemd() {
     log_info "  Datenverzeichnis:"
     echo "    ${CYAN}${DATA_DIR}${NC}"
     echo ""
-    log_info "  Standard-Login: Benutzer ${BOLD}admin${NC} / Passwort ${BOLD}admin${NC}"
+    log_info "  Ersteinrichtung: Administratorkonto im Einrichtungsassistenten des Web-Clients anlegen"
     log_info "  Web-Interface: http://localhost:8096/web/index.html"
     log_info "═══════════════════════════════════════════════════════════════"
 }
