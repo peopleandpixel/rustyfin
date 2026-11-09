@@ -19,6 +19,7 @@ pub mod scan_progress;
 pub mod scan_sync;
 pub mod scanner;
 pub mod scheduler;
+pub mod stream_builder;
 pub mod subtitle;
 pub mod tmdb_client;
 pub mod transcode;

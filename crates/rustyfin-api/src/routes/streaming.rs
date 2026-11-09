@@ -15,8 +15,11 @@ use uuid::Uuid;
 use crate::error::ApiError;
 use crate::state::AppState;
 
+mod media_info;
+
 pub fn routes() -> Router<AppState> {
     Router::new()
+        .merge(media_info::routes())
         .route("/Videos/{id}/stream", get(stream_video).head(head_video))
         .route(
             "/Videos/{id}/stream.{container}",

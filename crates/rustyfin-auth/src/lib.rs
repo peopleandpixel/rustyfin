@@ -291,6 +291,15 @@ pub async fn validate_token(pool: &SqlitePool, token: &str) -> Result<Claims, Au
     })
 }
 
+/// The device id stored with a token. `None` for an unknown token or an empty device id.
+pub async fn token_device_id(pool: &SqlitePool, token: &str) -> Result<Option<String>, AuthError> {
+    let device = repo_token::get_token(pool, &token_hash(token))
+        .await?
+        .map(|(_, device_id)| device_id)
+        .filter(|device_id| !device_id.is_empty());
+    Ok(device)
+}
+
 /// Revokes a single token.
 pub async fn revoke_token(pool: &SqlitePool, token: &str) -> Result<(), AuthError> {
     repo_token::delete_token(pool, &token_hash(token)).await?;

@@ -28441,3 +28441,1355 @@ async fn b20_import_metadata_replace_keeps_rustyfins_ids() {
         );
     }
 }
+
+// ── J2: Items PlaybackInfo ──
+//
+// GET and POST /Items/{id}/PlaybackInfo answer with the item's sources and a play session. With a
+// device profile (the body's, else the one the caller's device posted with its capabilities),
+// each source also says what that device can do with it: the Supports flags, the transcode URL and
+// its reasons, the default stream indexes and how each subtitle is delivered.
+
+/// Chrome on Linux as jellyfin-web describes it, on a machine that can't decode High 10.
+fn j2_chrome_profile() -> serde_json::Value {
+    serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../rustyfin-core/tests/fixtures/device_profiles/chrome-linux.json"
+    )))
+    .unwrap()
+}
+
+/// A progressive 1080p video stream at index 0, 24 fps, flagged default.
+fn j2_video(codec: &str, profile: &str, bit_depth: u32) -> serde_json::Value {
+    serde_json::json!({
+        "Index": 0,
+        "Codec": codec,
+        "CodecType": "Video",
+        "Profile": profile,
+        "BitDepth": bit_depth,
+        "Width": 1920,
+        "Height": 1080,
+        "AverageFrameRate": "24/1",
+        "RealFrameRate": "24/1",
+        "IsDefault": true,
+    })
+}
+
+/// An English stereo AAC LC stream at `index`, 128 kbps and 48 kHz, flagged default.
+fn j2_aac(index: i32) -> serde_json::Value {
+    serde_json::json!({
+        "Index": index,
+        "Codec": "aac",
+        "CodecType": "Audio",
+        "Profile": "LC",
+        "Channels": 2,
+        "SampleRate": 48000,
+        "BitRate": 128000,
+        "Language": "eng",
+        "IsDefault": true,
+    })
+}
+
+/// The streams of a 1080p H.264 file in `profile` at `bit_depth`, with AAC at index 1.
+fn j2_h264(profile: &str, bit_depth: u32) -> serde_json::Value {
+    serde_json::json!([j2_video("h264", profile, bit_depth), j2_aac(1)])
+}
+
+/// The stream of a song: stereo `codec` at `bit_rate` and 48 kHz, flagged default.
+fn j2_song(codec: &str, bit_rate: u32) -> serde_json::Value {
+    serde_json::json!([{
+        "Index": 0,
+        "Codec": codec,
+        "CodecType": "Audio",
+        "Channels": 2,
+        "SampleRate": 48000,
+        "BitRate": bit_rate,
+        "IsDefault": true,
+    }])
+}
+
+/// An item of `media_type` ("Movie" or "Audio") in its own media folder `name`: the 1000-byte file
+/// `name.container` with one 10 Mbps source in `container` of `streams`. Returns the item id, the
+/// source id and the file.
+async fn j2_item(
+    state: &AppState,
+    name: &str,
+    media_type: &str,
+    container: &str,
+    streams: serde_json::Value,
+) -> (uuid::Uuid, String, std::path::PathBuf) {
+    let folder = media_folder(state, name);
+    let file = std::path::Path::new(&folder).join(format!("{name}.{container}"));
+    std::fs::write(&file, [0u8; 1000]).unwrap();
+    let item = g4_insert_item(state, media_type, &file).await;
+    let source: rustyfin_model::media_source::MediaSourceResponse =
+        serde_json::from_value(serde_json::json!({
+            "Id": uuid::Uuid::new_v4().to_string(),
+            "Uid": uuid::Uuid::new_v4().to_string(),
+            "Container": container,
+            "Protocol": "File",
+            "Path": file.to_str().unwrap(),
+            "Bitrate": 10_000_000,
+            "MediaStreams": streams,
+        }))
+        .unwrap();
+    let source =
+        rustyfin_db::repo_media_source::insert_media_source_with_streams(&state.db, &item, &source)
+            .await
+            .unwrap();
+    (item, source.to_string(), file)
+}
+
+/// `text` with `token` hidden, for messages.
+fn j2_hide(text: &str, token: &str) -> String {
+    text.replace(token, "<token>")
+}
+
+/// Checks that a PlaybackInfo answer is a 200 with a play session id of 32 lowercase hex digits
+/// and no error code, and returns its sources and play session id. Messages hide `token`.
+fn j2_answer(
+    status: StatusCode,
+    answer: &serde_json::Value,
+    what: &str,
+    token: &str,
+) -> (Vec<serde_json::Value>, String) {
+    let shown = j2_hide(&answer.to_string(), token);
+    assert_eq!(status, StatusCode::OK, "{what}: {shown}");
+    let ps = answer["PlaySessionId"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let hex = ps
+        .bytes()
+        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    assert!(ps.len() == 32 && hex, "{what}: {shown}");
+    assert!(answer.get("ErrorCode").is_none(), "{what}: {shown}");
+    let sources = answer["MediaSources"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    (sources, ps)
+}
+
+/// Sends `method` to `uri` with `token` and an optional JSON body, and checks the answer as
+/// `j2_answer` does.
+async fn j2_play(
+    app: &axum::Router,
+    method: &str,
+    uri: &str,
+    token: &str,
+    body: Option<serde_json::Value>,
+) -> (Vec<serde_json::Value>, String) {
+    let (status, answer) = send(app, request(method, uri, Some(token), body)).await;
+    j2_answer(status, &answer, &format!("{method} {uri}"), token)
+}
+
+/// POSTs `body` as it is to `uri` with a bearer token; returns the status and the JSON answer.
+async fn j2_post_raw(
+    app: &axum::Router,
+    uri: &str,
+    token: &str,
+    body: impl Into<Body>,
+) -> (StatusCode, serde_json::Value) {
+    let req = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Content-Type", "application/json")
+        .body(body.into())
+        .unwrap();
+    send(app, req).await
+}
+
+/// The ids of `sources`, in order.
+fn j2_ids(sources: &[serde_json::Value]) -> Vec<String> {
+    sources
+        .iter()
+        .map(|s| s["Id"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// Checks that `source` is as stored: every Supports flag true and no device data.
+fn j2_assert_stored(source: &serde_json::Value, what: &str) {
+    for flag in [
+        "SupportsDirectPlay",
+        "SupportsDirectStream",
+        "SupportsTranscoding",
+    ] {
+        assert_eq!(source[flag], true, "{what}: {flag}");
+    }
+    for key in [
+        "TranscodingUrl",
+        "TranscodingSubProtocol",
+        "TranscodingContainer",
+        "TranscodeReasons",
+        "DefaultAudioStreamIndex",
+        "DefaultSubtitleStreamIndex",
+    ] {
+        assert!(source.get(key).is_none(), "{what}: {key}");
+    }
+}
+
+/// The transcode reasons of `source`, sorted. The source must have the list.
+fn j2_reasons(source: &serde_json::Value) -> Vec<String> {
+    let list = source["TranscodeReasons"].as_array();
+    assert!(
+        list.is_some(),
+        "no TranscodeReasons in source {}",
+        source["Id"]
+    );
+    let mut reasons: Vec<String> = list
+        .unwrap()
+        .iter()
+        .map(|r| r.as_str().unwrap_or_default().to_string())
+        .collect();
+    reasons.sort();
+    reasons
+}
+
+/// Replaces every play session id in `value`, as a key's value or as a URL parameter, with `<ps>`.
+fn j2_mask(value: &mut serde_json::Value) {
+    const PARAM: &str = "PlaySessionId=";
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, v) in map.iter_mut() {
+                if key.eq_ignore_ascii_case("PlaySessionId") {
+                    *v = serde_json::Value::from("<ps>");
+                } else {
+                    j2_mask(v);
+                }
+            }
+        }
+        serde_json::Value::Array(list) => list.iter_mut().for_each(j2_mask),
+        serde_json::Value::String(text) => {
+            let mut masked = String::new();
+            let mut rest = text.as_str();
+            while let Some(at) = rest.find(PARAM) {
+                let start = at + PARAM.len();
+                masked.push_str(&rest[..start]);
+                masked.push_str("<ps>");
+                rest = &rest[start..];
+                rest = &rest[rest.find('&').unwrap_or(rest.len())..];
+            }
+            masked.push_str(rest);
+            *text = masked;
+        }
+        _ => {}
+    }
+}
+
+/// GETs each of `routes` with `token`; returns each status and JSON answer, play sessions masked.
+async fn j2_answers(
+    app: &axum::Router,
+    routes: &[String],
+    token: &str,
+) -> Vec<(StatusCode, serde_json::Value)> {
+    let mut answers = Vec::new();
+    for uri in routes {
+        let (status, mut answer) = send(app, request("GET", uri, Some(token), None)).await;
+        j2_mask(&mut answer);
+        answers.push((status, answer));
+    }
+    answers
+}
+
+/// Writes `data` to `file` and returns the streams ffprobe finds in it, with their pixel formats.
+fn j2_probe(file: &std::path::Path, data: &[u8]) -> Vec<serde_json::Value> {
+    std::fs::write(file, data).unwrap();
+    let out = std::process::Command::new("ffprobe")
+        .args(["-v", "error", "-of", "json", "-show_entries"])
+        .arg("stream=codec_type,codec_name,profile,pix_fmt,channels")
+        .arg(file)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "ffprobe: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let probed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    probed["streams"].as_array().cloned().unwrap_or_default()
+}
+
+/// GETs `uri` with a `Range` header and no auth header; returns the status and the body.
+async fn j2_get_range(app: &axum::Router, uri: &str, range: &str) -> (StatusCode, Vec<u8>) {
+    let req = Request::builder()
+        .uri(uri)
+        .header("Range", range)
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = resp
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .to_vec();
+    (status, body)
+}
+
+#[tokio::test]
+async fn j2_playback_info_needs_a_token() {
+    let state = test_state().await;
+    let (item, _, _) = j2_item(&state, "j2-auth", "Movie", "mp4", j2_h264("High", 8)).await;
+    let app = app(state);
+    let uri = format!("/Items/{item}/PlaybackInfo");
+    for method in ["GET", "POST"] {
+        for token in [None, Some("not-a-token")] {
+            let (status, _) = send(&app, request(method, &uri, token, None)).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} with {token:?}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn j2_get_lists_every_source() {
+    let state = test_state().await;
+    let (token, admin) = admin_session(&state).await;
+    let (item, versions) = b16_two_versions(&state, "j2-get").await;
+    let ids: Vec<String> = versions.iter().map(|(id, _)| id.to_string()).collect();
+    let app = app(state);
+    // GET reads only userId: a source id and a bad bitrate are ignored
+    let queries = [
+        String::new(),
+        format!("?userId={admin}"),
+        format!("?USERID={}", admin.simple()),
+        format!("?MediaSourceId={}&maxStreamingBitrate=fast", ids[1]),
+    ];
+    let mut sessions = std::collections::HashSet::new();
+    for query in &queries {
+        let uri = format!("/Items/{item}/PlaybackInfo{query}");
+        let (sources, ps) = j2_play(&app, "GET", &uri, &token, None).await;
+        assert_eq!(j2_ids(&sources), ids, "GET {uri}");
+        for source in &sources {
+            j2_assert_stored(source, &format!("GET {uri}"));
+        }
+        sessions.insert(ps);
+    }
+    assert_eq!(
+        sessions.len(),
+        queries.len(),
+        "each answer has its own play session"
+    );
+}
+
+#[tokio::test]
+async fn j2_post_without_a_profile_lists_every_source() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let (item, versions) = b16_two_versions(&state, "j2-post").await;
+    let ids: Vec<String> = versions.iter().map(|(id, _)| id.to_string()).collect();
+    let app = app(state);
+    let uri = format!("/Items/{item}/PlaybackInfo");
+    // Without a profile, the request's limits and switches change nothing
+    for body in [
+        "",
+        " \n ",
+        "{}",
+        "null",
+        r#"{"DeviceProfile":null,"MediaSourceId":null}"#,
+        r#"{"EnableDirectPlay":false}"#,
+        r#"{"MaxStreamingBitrate":1}"#,
+    ] {
+        let what = format!("POST {uri} with {body:?}");
+        let (status, answer) = j2_post_raw(&app, &uri, &token, body).await;
+        let (sources, _) = j2_answer(status, &answer, &what, &token);
+        assert_eq!(j2_ids(&sources), ids, "{what}");
+        for source in &sources {
+            j2_assert_stored(source, &what);
+        }
+    }
+}
+
+#[tokio::test]
+async fn j2_bad_input_is_a_client_error() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let (item, _, _) = j2_item(&state, "j2-bad", "Movie", "mp4", j2_h264("High", 8)).await;
+    let app = app(state);
+    let uri = format!("/Items/{item}/PlaybackInfo");
+    let bodies: [&[u8]; 13] = [
+        b"[]",
+        b"5",
+        b"\"x\"",
+        b"{",
+        b"not json",
+        b"\xff\xfe",
+        br#"{"MaxStreamingBitrate":"fast"}"#,
+        br#"{"StartTimeTicks":1.5}"#,
+        br#"{"UserId":"nope"}"#,
+        br#"{"DeviceProfile":5}"#,
+        br#"{"DeviceProfile":[]}"#,
+        br#"{"EnableDirectPlay":"maybe"}"#,
+        br#"{"DeviceProfile":{"DirectPlayProfiles":3}}"#,
+    ];
+    for body in bodies {
+        let (status, _) = j2_post_raw(&app, &uri, &token, body.to_vec()).await;
+        let shown = String::from_utf8_lossy(body);
+        assert_eq!(status, StatusCode::BAD_REQUEST, "POST {uri} with {shown}");
+    }
+    for query in [
+        "MaxStreamingBitrate=fast",
+        "maxStreamingBitrate=1.5",
+        "MaxStreamingBitrate=3000000000",
+        "StartTimeTicks=soon",
+        "AudioStreamIndex=x",
+        "SubtitleStreamIndex=1e3",
+        "MaxAudioChannels=two",
+        "EnableDirectPlay=1",
+        "enableTranscoding=yes",
+        "AllowAudioStreamCopy=on",
+        "UserId=nope",
+    ] {
+        let uri = format!("{uri}?{query}");
+        let (status, _) = j2_post_raw(&app, &uri, &token, "").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "POST {uri}");
+    }
+    let uri = format!("{uri}?userId=nope");
+    let (status, _) = send(&app, request("GET", &uri, Some(&token), None)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "GET {uri}");
+}
+
+#[tokio::test]
+async fn j2_unknown_items_are_not_found() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let (item, _, _) = j2_item(&state, "j2-known", "Movie", "mp4", j2_h264("High", 8)).await;
+    let app = app(state);
+    let unknown = uuid::Uuid::new_v4().to_string();
+    for method in ["GET", "POST"] {
+        let uri = format!("/Items/{item}/PlaybackInfo");
+        j2_play(&app, method, &uri, &token, None).await;
+        for id in [unknown.as_str(), "not-a-uuid", "12345"] {
+            let uri = format!("/Items/{id}/PlaybackInfo");
+            let (status, _) = send(&app, request(method, &uri, Some(&token), None)).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{method} {uri}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn j2_user_id_follows_the_user_rules() {
+    let state = test_state().await;
+    let (admin_token, admin) = admin_session(&state).await;
+    let viewer = add_user(&state, "j2-viewer", "j2-pass", false).await;
+    let (item, _, _) = j2_item(&state, "j2-users", "Movie", "mp4", j2_h264("High", 8)).await;
+    let app = app(state);
+    let (viewer_token, _) = login(&app, "j2-viewer", "j2-pass").await.unwrap();
+    let stranger = uuid::Uuid::new_v4();
+    let names = |id: uuid::Uuid| Some(serde_json::json!({ "UserId": id.to_string() }));
+    // (caller, query, body, status); a case without a body is sent as GET and as POST
+    let cases = [
+        (
+            &viewer_token,
+            format!("?userId={admin}"),
+            None,
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            &admin_token,
+            format!("?userId={stranger}"),
+            None,
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            &viewer_token,
+            format!("?userId={viewer}"),
+            None,
+            StatusCode::OK,
+        ),
+        (
+            &viewer_token,
+            format!("?UserId={}", viewer.simple()),
+            None,
+            StatusCode::OK,
+        ),
+        (
+            &admin_token,
+            format!("?userId={viewer}"),
+            None,
+            StatusCode::OK,
+        ),
+        (
+            &viewer_token,
+            String::new(),
+            names(admin),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            &viewer_token,
+            String::new(),
+            Some(serde_json::json!({ "userId": admin.to_string() })),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            &admin_token,
+            String::new(),
+            names(stranger),
+            StatusCode::NOT_FOUND,
+        ),
+        (&admin_token, String::new(), names(viewer), StatusCode::OK),
+        // The query's userId wins over the body's
+        (
+            &viewer_token,
+            format!("?userId={viewer}"),
+            names(admin),
+            StatusCode::OK,
+        ),
+        (
+            &viewer_token,
+            format!("?userId={admin}"),
+            names(viewer),
+            StatusCode::FORBIDDEN,
+        ),
+    ];
+    for (token, query, body, expected) in cases {
+        let uri = format!("/Items/{item}/PlaybackInfo{query}");
+        let methods: &[&str] = if body.is_some() {
+            &["POST"]
+        } else {
+            &["GET", "POST"]
+        };
+        for method in methods {
+            let req = request(method, &uri, Some(token), body.clone());
+            let (status, _) = send(&app, req).await;
+            assert_eq!(status, expected, "{method} {uri} with {body:?}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn j2_no_source_is_no_compatible_stream() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let folder = media_folder(&state, "j2-bare");
+    let file = std::path::Path::new(&folder).join("j2-bare.mp4");
+    std::fs::write(&file, [0u8; 1000]).unwrap();
+    let bare = g4_insert_item(&state, "Movie", &file).await;
+    let (item, _, _) = j2_item(&state, "j2-one", "Movie", "mp4", j2_h264("High", 8)).await;
+    let app = app(state);
+    let expected = serde_json::json!({ "MediaSources": [], "ErrorCode": "NoCompatibleStream" });
+    // An item without a source
+    let uri = format!("/Items/{bare}/PlaybackInfo");
+    for method in ["GET", "POST"] {
+        let (status, answer) = send(&app, request(method, &uri, Some(&token), None)).await;
+        assert_eq!(status, StatusCode::OK, "{method} {uri}");
+        assert_eq!(answer, expected, "{method} {uri}");
+    }
+    // A source id that names no version of the item
+    let none = uuid::Uuid::new_v4().to_string();
+    let chrome = j2_chrome_profile();
+    for (query, body) in [
+        ("?MediaSourceId=nope".to_string(), None),
+        (
+            String::new(),
+            Some(serde_json::json!({ "MediaSourceId": none })),
+        ),
+        (
+            format!("?mediaSourceId={none}"),
+            Some(serde_json::json!({ "DeviceProfile": chrome })),
+        ),
+    ] {
+        let uri = format!("/Items/{item}/PlaybackInfo{query}");
+        let what = format!("POST {uri} with {}", body.is_some());
+        let (status, answer) = send(&app, request("POST", &uri, Some(&token), body)).await;
+        assert_eq!(status, StatusCode::OK, "{what}");
+        assert_eq!(answer, expected, "{what}");
+    }
+}
+
+#[tokio::test]
+async fn j2_media_source_id_picks_a_version() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let (item, versions) = b16_two_versions(&state, "j2-versions").await;
+    let (a, b) = (versions[0].0, versions[1].0);
+    let app = app(state);
+    let names = |id: uuid::Uuid| Some(serde_json::json!({ "MediaSourceId": id.to_string() }));
+    let cases = [
+        // The item's own id names the primary version, as Jellyfin clients send it
+        (format!("?MediaSourceId={item}"), None, vec![a]),
+        (
+            format!("?mediasourceid={}", b.to_string().to_uppercase()),
+            None,
+            vec![b],
+        ),
+        (format!("?MediaSourceId={}", b.simple()), None, vec![b]),
+        (String::new(), names(b), vec![b]),
+        (
+            String::new(),
+            Some(serde_json::json!({ "mediaSourceId": b.to_string() })),
+            vec![b],
+        ),
+        // The query wins over the body; an empty or blank value is no value
+        (format!("?MediaSourceId={a}"), names(b), vec![a]),
+        ("?MediaSourceId=".to_string(), names(b), vec![b]),
+        ("?MediaSourceId=%20%20".to_string(), None, vec![a, b]),
+    ];
+    for (query, body, expected) in cases {
+        let uri = format!("/Items/{item}/PlaybackInfo{query}");
+        let what = format!("POST {uri} with {body:?}");
+        let (status, answer) = send(&app, request("POST", &uri, Some(&token), body)).await;
+        let (sources, _) = j2_answer(status, &answer, &what, &token);
+        let expected: Vec<String> = expected.iter().map(|id| id.to_string()).collect();
+        assert_eq!(j2_ids(&sources), expected, "{what}");
+    }
+}
+
+#[tokio::test]
+async fn j2_chrome_profile_sets_the_device_data() {
+    let state = test_state().await;
+    add_user(&state, "j2-chrome", "j2-pass", true).await;
+    let (hi10, hi10_source, _) =
+        j2_item(&state, "j2-hi10", "Movie", "mp4", j2_h264("High 10", 10)).await;
+    let (p422, _, _) = j2_item(&state, "j2-422", "Movie", "mp4", j2_h264("High 4:2:2", 8)).await;
+    let (avc, _, _) = j2_item(&state, "j2-avc", "Movie", "mp4", j2_h264("High", 8)).await;
+    let app = app(state);
+    let (token, _) = g2_login_device(&app, "j2-chrome", "j2-pass", "j2-device")
+        .await
+        .unwrap();
+    let chrome = serde_json::json!({ "DeviceProfile": j2_chrome_profile() });
+
+    // High 10, which this Chrome can't decode: an HLS transcode to 8-bit H.264
+    let uri = format!("/Items/{hi10}/PlaybackInfo");
+    let (sources, ps) = j2_play(&app, "POST", &uri, &token, Some(chrome.clone())).await;
+    assert_eq!(sources.len(), 1);
+    let source = &sources[0];
+    assert_eq!(source["Id"], hi10_source.as_str());
+    assert_eq!(source["SupportsDirectPlay"], false);
+    assert_eq!(source["SupportsDirectStream"], false);
+    assert_eq!(source["SupportsTranscoding"], true);
+    assert_eq!(source["TranscodingSubProtocol"], "hls");
+    assert_eq!(source["TranscodingContainer"], "ts");
+    assert_eq!(j2_reasons(source), ["VideoProfileNotSupported"]);
+    assert_eq!(source["DefaultAudioStreamIndex"], 1);
+    assert!(source.get("DefaultSubtitleStreamIndex").is_none());
+    assert_eq!(source["Container"], "mp4");
+    assert_eq!(source["MediaStreams"].as_array().map(Vec::len), Some(2));
+    let url = j2_hide(
+        source["TranscodingUrl"].as_str().unwrap_or_default(),
+        &token,
+    );
+    let expected = format!(
+        "/Videos/{hi10}/main.m3u8?DeviceId=j2-device&MediaSourceId={hi10_source}&VideoCodec=h264\
+         &AudioCodec=aac&AudioStreamIndex=1&VideoBitrate=119872&AudioBitrate=128\
+         &AudioSampleRate=48000&MaxFramerate=24&SegmentContainer=ts&MinSegments=1\
+         &PlaySessionId={ps}&api_key=<token>&TranscodingMaxAudioChannels=2&RequireAvc=false\
+         &EnableAudioVbrEncoding=true&h264-videobitdepth=10\
+         &h264-profile=high,main,baseline,constrainedbaseline&h264-audiochannels=2\
+         &aac-profile=lc&h264-rangetype=SDR&h264-level=52&h264-deinterlace=true\
+         &TranscodeReasons=VideoProfileNotSupported"
+    );
+    assert_eq!(url, expected);
+
+    // High 4:2:2 is no profile Chrome plays either
+    let uri = format!("/Items/{p422}/PlaybackInfo");
+    let (sources, _) = j2_play(&app, "POST", &uri, &token, Some(chrome.clone())).await;
+    assert_eq!(sources[0]["SupportsDirectPlay"], false, "4:2:2");
+    assert_eq!(
+        j2_reasons(&sources[0]),
+        ["VideoProfileNotSupported"],
+        "4:2:2"
+    );
+    let url = j2_hide(
+        sources[0]["TranscodingUrl"].as_str().unwrap_or_default(),
+        &token,
+    );
+    assert!(
+        url.starts_with(&format!("/Videos/{p422}/main.m3u8?")),
+        "{url}"
+    );
+
+    // 8-bit High plays directly
+    let uri = format!("/Items/{avc}/PlaybackInfo");
+    let (sources, _) = j2_play(&app, "POST", &uri, &token, Some(chrome)).await;
+    let source = &sources[0];
+    for flag in [
+        "SupportsDirectPlay",
+        "SupportsDirectStream",
+        "SupportsTranscoding",
+    ] {
+        assert_eq!(source[flag], true, "8-bit: {flag}");
+    }
+    assert_eq!(source["TranscodingSubProtocol"], "http");
+    assert!(source.get("TranscodingUrl").is_none());
+    assert!(source.get("TranscodingContainer").is_none());
+    assert_eq!(j2_reasons(source), Vec::<String>::new());
+    assert_eq!(source["DefaultAudioStreamIndex"], 1);
+    assert_eq!(source["Container"], "mp4");
+}
+
+#[tokio::test]
+async fn j2_request_fields_reach_the_device_data() {
+    let state = test_state().await;
+    add_user(&state, "j2-fields", "j2-pass", true).await;
+    let (avc, _, _) = j2_item(&state, "j2-avc", "Movie", "mp4", j2_h264("High", 8)).await;
+    let (hi10, _, _) = j2_item(&state, "j2-hi10", "Movie", "mp4", j2_h264("High 10", 10)).await;
+    let mut german = j2_aac(2);
+    german["Language"] = "ger".into();
+    german["IsDefault"] = false.into();
+    let streams = serde_json::json!([j2_video("h264", "High", 8), j2_aac(1), german]);
+    let (dub, _, _) = j2_item(&state, "j2-dub", "Movie", "mp4", streams).await;
+    let app = app(state);
+    let (token, _) = g2_login_device(&app, "j2-fields", "j2-pass", "j2-device")
+        .await
+        .unwrap();
+    let chrome = j2_chrome_profile();
+    let with_chrome = serde_json::json!({ "DeviceProfile": chrome });
+    let url_of = |source: &serde_json::Value| {
+        j2_hide(
+            source["TranscodingUrl"].as_str().unwrap_or_default(),
+            &token,
+        )
+    };
+
+    // Direct play switched off
+    let uri = format!("/Items/{avc}/PlaybackInfo?enableDirectPlay=false");
+    let (sources, _) = j2_play(&app, "POST", &uri, &token, Some(with_chrome.clone())).await;
+    assert_eq!(sources[0]["SupportsDirectPlay"], false, "{uri}");
+    assert_eq!(j2_reasons(&sources[0]), ["DirectPlayError"], "{uri}");
+    let url = url_of(&sources[0]);
+    assert!(url.ends_with("&TranscodeReasons=DirectPlayError"), "{url}");
+
+    // Stream copy switched off in the query, burn-in asked in the body
+    let uri =
+        format!("/Items/{hi10}/PlaybackInfo?allowVideoStreamCopy=false&AllowAudioStreamCopy=false");
+    let body = serde_json::json!({
+        "DeviceProfile": chrome,
+        "AlwaysBurnInSubtitleWhenTranscoding": true,
+    });
+    let (sources, _) = j2_play(&app, "POST", &uri, &token, Some(body)).await;
+    let url = url_of(&sources[0]);
+    let suffix = "&TranscodeReasons=VideoProfileNotSupported&allowVideoStreamCopy=false\
+                  &allowAudioStreamCopy=false&alwaysBurnInSubtitleWhenTranscoding=true";
+    assert!(url.ends_with(suffix), "{url}");
+
+    // The query's bitrate limit wins over the body's
+    let body = serde_json::json!({ "DeviceProfile": chrome, "MaxStreamingBitrate": 120_000_000 });
+    let uri = format!("/Items/{avc}/PlaybackInfo?maxStreamingBitrate=1000000");
+    let (sources, _) = j2_play(&app, "POST", &uri, &token, Some(body.clone())).await;
+    assert_eq!(sources[0]["SupportsDirectPlay"], false, "{uri}");
+    let reasons = j2_reasons(&sources[0]);
+    assert!(
+        reasons.contains(&"ContainerBitrateExceedsLimit".to_string()),
+        "{uri}: {reasons:?}"
+    );
+    let uri = format!("/Items/{avc}/PlaybackInfo");
+    let (sources, _) = j2_play(&app, "POST", &uri, &token, Some(body)).await;
+    assert_eq!(sources[0]["SupportsDirectPlay"], true, "{uri}");
+
+    // A start position goes into the transcode URL
+    let uri = format!("/Items/{hi10}/PlaybackInfo?startTimeTicks=50000000");
+    let (sources, ps) = j2_play(&app, "POST", &uri, &token, Some(with_chrome.clone())).await;
+    let url = url_of(&sources[0]);
+    let part = format!("&MinSegments=1&StartTimeTicks=50000000&PlaySessionId={ps}&");
+    assert!(url.contains(&part), "{url}");
+
+    // An audio index counts only for the source MediaSourceId names (here the item's own id, which
+    // names the primary version). This Chrome plays only the first audio track directly.
+    let uri = format!("/Items/{dub}/PlaybackInfo?MediaSourceId={dub}&AudioStreamIndex=2");
+    let (sources, _) = j2_play(&app, "POST", &uri, &token, Some(with_chrome.clone())).await;
+    assert_eq!(
+        j2_reasons(&sources[0]),
+        ["SecondaryAudioNotSupported"],
+        "{uri}"
+    );
+    assert_eq!(sources[0]["DefaultAudioStreamIndex"], 2, "{uri}");
+    let url = url_of(&sources[0]);
+    assert!(url.contains("&AudioStreamIndex=2&"), "{url}");
+    let uri = format!("/Items/{dub}/PlaybackInfo?AudioStreamIndex=2");
+    let (sources, _) = j2_play(&app, "POST", &uri, &token, Some(with_chrome)).await;
+    assert_eq!(sources[0]["SupportsDirectPlay"], true, "{uri}");
+    assert_eq!(sources[0]["DefaultAudioStreamIndex"], 1, "{uri}");
+
+    // The body's keys in camelCase
+    let uri = format!("/Items/{hi10}/PlaybackInfo");
+    let body = serde_json::json!({ "deviceProfile": chrome });
+    let (sources, _) = j2_play(&app, "POST", &uri, &token, Some(body)).await;
+    assert_eq!(
+        j2_reasons(&sources[0]),
+        ["VideoProfileNotSupported"],
+        "camelCase"
+    );
+}
+
+#[tokio::test]
+async fn j2_subtitles_get_deliveries() {
+    let state = test_state().await;
+    add_user(&state, "j2-subs", "j2-pass", true).await;
+    let embedded = serde_json::json!({
+        "Index": 2,
+        "Codec": "subrip",
+        "CodecType": "Subtitle",
+        "Language": "eng",
+    });
+    let streams = serde_json::json!([j2_video("h264", "High", 8), j2_aac(1), embedded]);
+    let (item, source_id, file) = j2_item(&state, "j2-subs", "Movie", "mkv", streams).await;
+    std::fs::write(
+        file.with_file_name("j2-subs.eng.srt"),
+        "1\n00:00:01,000 --> 00:00:02,000\nJ2 cue\n",
+    )
+    .unwrap();
+    let app = app(state);
+    let (token, _) = g2_login_device(&app, "j2-subs", "j2-pass", "j2-device")
+        .await
+        .unwrap();
+    let uri = format!("/Items/{item}/PlaybackInfo");
+    let body = serde_json::json!({ "DeviceProfile": j2_chrome_profile() });
+    let (sources, _) = j2_play(&app, "POST", &uri, &token, Some(body)).await;
+    let source = &sources[0];
+
+    // The file beside the video is the default subtitle; Chrome shows it over the direct play
+    assert_eq!(source["SupportsDirectPlay"], true);
+    assert_eq!(source["DefaultSubtitleStreamIndex"], 3);
+    let streams = source["MediaStreams"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let stream = |index: i32| {
+        streams
+            .iter()
+            .find(|s| s["Index"] == index)
+            .unwrap_or_else(|| panic!("no stream {index}"))
+    };
+    for index in [2, 3] {
+        let subtitle = stream(index);
+        assert_eq!(subtitle["DeliveryMethod"], "External", "stream {index}");
+        assert_eq!(subtitle["IsExternalUrl"], false, "stream {index}");
+        let url = j2_hide(subtitle["DeliveryUrl"].as_str().unwrap_or_default(), &token);
+        let expected =
+            format!("/Videos/{item}/{source_id}/Subtitles/{index}/0/Stream.vtt?api_key=<token>");
+        assert_eq!(url, expected, "stream {index}");
+    }
+    for index in [0, 1] {
+        assert!(
+            stream(index).get("DeliveryMethod").is_none(),
+            "stream {index}"
+        );
+    }
+
+    // The external file loads as WebVTT without a header
+    let url = stream(3)["DeliveryUrl"].as_str().unwrap_or_default();
+    let (status, _, data) = g4_get(&app, url).await;
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8_lossy(&data);
+    assert!(
+        text.starts_with("WEBVTT") && text.contains("J2 cue"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn j2_audio_items_use_the_audio_profiles() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let (flac, _, _) = j2_item(&state, "j2-flac", "Audio", "flac", j2_song("flac", 900_000)).await;
+    let (ac3, _, _) = j2_item(&state, "j2-ac3", "Audio", "ac3", j2_song("ac3", 192_000)).await;
+    let app = app(state);
+    let body = serde_json::json!({ "DeviceProfile": j2_chrome_profile() });
+
+    // Chrome plays FLAC
+    let uri = format!("/Items/{flac}/PlaybackInfo");
+    let (sources, _) = j2_play(&app, "POST", &uri, &token, Some(body.clone())).await;
+    let source = &sources[0];
+    assert_eq!(source["SupportsDirectPlay"], true);
+    assert_eq!(source["TranscodingSubProtocol"], "http");
+    assert!(source.get("TranscodingUrl").is_none());
+    assert_eq!(j2_reasons(source), Vec::<String>::new());
+    assert_eq!(source["Container"], "flac");
+
+    // Not AC3: an audio-only HLS transcode to AAC
+    let uri = format!("/Items/{ac3}/PlaybackInfo");
+    let (sources, _) = j2_play(&app, "POST", &uri, &token, Some(body)).await;
+    let source = &sources[0];
+    assert_eq!(source["SupportsDirectPlay"], false);
+    assert_eq!(source["SupportsTranscoding"], true);
+    assert_eq!(source["TranscodingSubProtocol"], "hls");
+    assert_eq!(source["TranscodingContainer"], "ts");
+    let expected = [
+        "AudioCodecNotSupported",
+        "ContainerNotSupported",
+        "VideoCodecNotSupported",
+    ];
+    assert_eq!(j2_reasons(source), expected);
+    let url = j2_hide(
+        source["TranscodingUrl"].as_str().unwrap_or_default(),
+        &token,
+    );
+    assert!(
+        url.starts_with(&format!("/Videos/{ac3}/main.m3u8?")),
+        "{url}"
+    );
+    assert!(url.contains("&AudioCodec=aac&"), "{url}");
+    assert!(url.ends_with("&AudioOnly=true"), "{url}");
+}
+
+#[tokio::test]
+async fn j2_profile_comes_from_the_device_capabilities() {
+    let state = test_state().await;
+    add_user(&state, "j2-caps", "j2-pass", false).await;
+    let (item, _, _) = j2_item(&state, "j2-caps", "Movie", "mp4", j2_h264("High 10", 10)).await;
+    let app = app(state);
+    let (token, _) = g2_login_device(&app, "j2-caps", "j2-pass", "j2-caps-device")
+        .await
+        .unwrap();
+    let uri = format!("/Items/{item}/PlaybackInfo");
+    let capabilities = |profile: serde_json::Value| {
+        let body = serde_json::json!({
+            "PlayableMediaTypes": ["Video", "Audio"],
+            "DeviceProfile": profile,
+        });
+        request(
+            "POST",
+            "/Sessions/Capabilities/Full",
+            Some(&token),
+            Some(body),
+        )
+    };
+
+    // Nothing posted yet: the sources as stored
+    let (sources, _) = j2_play(&app, "POST", &uri, &token, None).await;
+    j2_assert_stored(&sources[0], "before the capabilities");
+
+    // The device posts Chrome's profile; a request without one gets it
+    let (status, _) = send(&app, capabilities(j2_chrome_profile())).await;
+    assert!(status.is_success(), "capabilities: {status}");
+    let (sources, ps) = j2_play(&app, "POST", &uri, &token, None).await;
+    assert_eq!(j2_reasons(&sources[0]), ["VideoProfileNotSupported"]);
+    let url = j2_hide(
+        sources[0]["TranscodingUrl"].as_str().unwrap_or_default(),
+        &token,
+    );
+    let start = format!("/Videos/{item}/main.m3u8?DeviceId=j2-caps-device&");
+    assert!(url.starts_with(&start), "{url}");
+    assert!(
+        url.contains(&format!("&PlaySessionId={ps}&api_key=<token>&")),
+        "{url}"
+    );
+    let body = serde_json::json!({ "MaxStreamingBitrate": 120_000_000 });
+    let (sources, _) = j2_play(&app, "POST", &uri, &token, Some(body)).await;
+    assert_eq!(j2_reasons(&sources[0]), ["VideoProfileNotSupported"]);
+
+    // A profile in the body wins: an empty one plays nothing
+    let body = serde_json::json!({ "DeviceProfile": {} });
+    let (sources, _) = j2_play(&app, "POST", &uri, &token, Some(body)).await;
+    assert_eq!(sources[0]["SupportsDirectPlay"], false);
+    assert!(sources[0]["TranscodeReasons"].is_array());
+    assert!(sources[0].get("TranscodingUrl").is_none());
+
+    // GET takes no profile
+    let (sources, _) = j2_play(&app, "GET", &uri, &token, None).await;
+    j2_assert_stored(&sources[0], "GET");
+
+    // A stored profile that doesn't parse is no profile
+    let (status, _) = send(
+        &app,
+        capabilities(serde_json::json!({ "DirectPlayProfiles": 3 })),
+    )
+    .await;
+    assert!(status.is_success(), "capabilities: {status}");
+    let (sources, _) = j2_play(&app, "POST", &uri, &token, None).await;
+    j2_assert_stored(&sources[0], "after an unreadable profile");
+}
+
+#[tokio::test]
+async fn j2_each_device_sees_its_own_capabilities() {
+    let state = test_state().await;
+    add_user(&state, "j2-devices", "j2-pass", false).await;
+    let (item, _, _) = j2_item(&state, "j2-devices", "Movie", "mp4", j2_h264("High 10", 10)).await;
+    let app = app(state);
+    let uri = format!("/Items/{item}/PlaybackInfo");
+    let capabilities = |token: &str, profile: serde_json::Value| {
+        let body = serde_json::json!({
+            "PlayableMediaTypes": ["Video", "Audio"],
+            "DeviceProfile": profile,
+        });
+        request(
+            "POST",
+            "/Sessions/Capabilities/Full",
+            Some(token),
+            Some(body),
+        )
+    };
+
+    // Two devices of one user sign in before either posts: Chrome, and one whose profile plays
+    // nothing
+    let (chrome, _) = g2_login_device(&app, "j2-devices", "j2-pass", "j2-devices-chrome")
+        .await
+        .unwrap();
+    let (bare, _) = g2_login_device(&app, "j2-devices", "j2-pass", "j2-devices-bare")
+        .await
+        .unwrap();
+    let (status, _) = send(&app, capabilities(&chrome, j2_chrome_profile())).await;
+    assert!(status.is_success(), "Chrome's capabilities: {status}");
+    let (status, _) = send(&app, capabilities(&bare, serde_json::json!({}))).await;
+    assert!(
+        status.is_success(),
+        "the other device's capabilities: {status}"
+    );
+
+    // A request without a profile gets the one its own device posted
+    let (sources, _) = j2_play(&app, "POST", &uri, &chrome, None).await;
+    assert_eq!(
+        j2_reasons(&sources[0]),
+        ["VideoProfileNotSupported"],
+        "Chrome"
+    );
+    assert!(sources[0]["TranscodingUrl"].is_string(), "Chrome");
+    let (sources, _) = j2_play(&app, "POST", &uri, &bare, None).await;
+    assert!(
+        sources[0]["TranscodeReasons"].is_array(),
+        "the other device"
+    );
+    assert_eq!(sources[0]["SupportsDirectPlay"], false, "the other device");
+    assert!(
+        sources[0].get("TranscodingUrl").is_none(),
+        "the other device"
+    );
+
+    // Chrome posting again leaves the other device's profile alone
+    let (status, _) = send(&app, capabilities(&chrome, j2_chrome_profile())).await;
+    assert!(status.is_success(), "Chrome's capabilities again: {status}");
+    let (sources, _) = j2_play(&app, "POST", &uri, &bare, None).await;
+    assert!(
+        sources[0].get("TranscodingUrl").is_none(),
+        "the other device, later"
+    );
+    let (sources, _) = j2_play(&app, "POST", &uri, &chrome, None).await;
+    assert!(sources[0]["TranscodingUrl"].is_string(), "Chrome, later");
+}
+
+#[tokio::test]
+async fn j2_odd_requests_never_fail_the_server() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let subtitle = serde_json::json!({ "Index": 2, "Codec": "subrip", "CodecType": "Subtitle" });
+    let streams = serde_json::json!([j2_video("h264", "High 10", 10), j2_aac(1), subtitle]);
+    let (item, source, _) = j2_item(&state, "j2-odd", "Movie", "mkv", streams).await;
+    let (song, _, _) = j2_item(
+        &state,
+        "j2-odd-song",
+        "Audio",
+        "ac3",
+        j2_song("ac3", 192_000),
+    )
+    .await;
+    let app = app(state);
+    let chrome = j2_chrome_profile();
+    let odd_profiles = [
+        serde_json::json!({}),
+        serde_json::json!({
+            "DirectPlayProfiles": [],
+            "TranscodingProfiles": [],
+            "CodecProfiles": [],
+            "SubtitleProfiles": [],
+            "ContainerProfiles": [],
+        }),
+        serde_json::json!({
+            "MaxStreamingBitrate": i32::MIN,
+            "DirectPlayProfiles": [
+                { "Container": "mp4,,mkv", "Type": "Hologram", "VideoCodec": ",", "AudioCodec": "" },
+                { "Container": "", "Type": "Audio" },
+            ],
+            "TranscodingProfiles": [
+                { "Container": "ts", "Type": "Video", "Protocol": "carrier-pigeon", "Context": "Streaming" },
+                { "Container": "", "Type": "Audio", "Protocol": "hls", "Context": "Streaming" },
+                { "Container": "", "Type": "Video", "Protocol": "hls", "Context": "Streaming" },
+            ],
+            "CodecProfiles": [{
+                "Type": "Video",
+                "Codec": "h264",
+                "Conditions": [
+                    { "Condition": "Resembles", "Property": "Width", "Value": "1920" },
+                    { "Condition": "Equals", "Property": "Smell", "Value": "x", "IsRequired": true },
+                    { "Condition": "LessThanEqual", "Property": "VideoBitDepth", "Value": "deep" },
+                ],
+            }],
+            "SubtitleProfiles": [
+                { "Format": "vtt", "Method": "Telepathy" },
+                { "Format": "", "Method": "Encode" },
+            ],
+        }),
+    ];
+    let extremes = [
+        serde_json::json!({ "MaxStreamingBitrate": i32::MAX }),
+        serde_json::json!({ "MaxStreamingBitrate": 0 }),
+        serde_json::json!({ "MaxStreamingBitrate": -1 }),
+        serde_json::json!({ "MaxStreamingBitrate": i32::MIN }),
+        serde_json::json!({ "StartTimeTicks": i64::MAX }),
+        serde_json::json!({ "StartTimeTicks": i64::MIN }),
+        serde_json::json!({
+            "AudioStreamIndex": i32::MAX,
+            "SubtitleStreamIndex": i32::MIN,
+            "MediaSourceId": item.to_string(),
+        }),
+        serde_json::json!({ "AudioStreamIndex": -1, "SubtitleStreamIndex": -1, "MediaSourceId": source }),
+        serde_json::json!({
+            "SubtitleStreamIndex": 2,
+            "MediaSourceId": source,
+            "AlwaysBurnInSubtitleWhenTranscoding": true,
+        }),
+        serde_json::json!({ "MaxAudioChannels": 0 }),
+        serde_json::json!({ "MaxAudioChannels": i32::MIN }),
+        serde_json::json!({ "MediaSourceId": "" }),
+        serde_json::json!({ "MediaSourceId": "x".repeat(10_000) }),
+        serde_json::json!({
+            "EnableDirectPlay": false,
+            "EnableDirectStream": false,
+            "EnableTranscoding": false,
+        }),
+        serde_json::json!({ "LiveStreamId": "live", "AutoOpenLiveStream": true }),
+    ];
+    let queries = [
+        String::new(),
+        "?StartTimeTicks=9223372036854775807&AudioStreamIndex=-2147483648&MaxAudioChannels=0"
+            .to_string(),
+        "?maxStreamingBitrate=2147483647&subtitleStreamIndex=2147483647".to_string(),
+    ];
+    for id in [item, song] {
+        for query in &queries {
+            let uri = format!("/Items/{id}/PlaybackInfo{query}");
+            let mut bodies: Vec<serde_json::Value> = odd_profiles
+                .iter()
+                .map(|p| serde_json::json!({ "DeviceProfile": p }))
+                .collect();
+            for extreme in &extremes {
+                let mut body = extreme.clone();
+                body["DeviceProfile"] = chrome.clone();
+                bodies.push(body);
+            }
+            for body in bodies {
+                let shown = body.to_string();
+                let shown = &shown[..shown.len().min(200)];
+                let (status, _) = send(&app, request("POST", &uri, Some(&token), Some(body))).await;
+                assert_eq!(status, StatusCode::OK, "POST {uri} with {shown}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn j2_old_routes_answer_as_before() {
+    let state = test_state().await;
+    add_user(&state, "j2-old", "j2-pass", true).await;
+    let (video, _, _) = j2_item(&state, "j2-old-video", "Movie", "mp4", j2_h264("High", 8)).await;
+    let (song, _, _) = j2_item(
+        &state,
+        "j2-old-song",
+        "Audio",
+        "flac",
+        j2_song("flac", 900_000),
+    )
+    .await;
+    let app = app(state);
+    let (token, _) = g2_login_device(&app, "j2-old", "j2-pass", "j2-old-device")
+        .await
+        .unwrap();
+    let routes = [
+        format!("/Videos/{video}/PlaybackInfo"),
+        format!("/Videos/{video}/Universal?VideoCodecs=h264&AudioCodecs=aac"),
+        format!("/Audio/{song}/PlaybackInfo"),
+        format!("/Audio/{song}/universal?Container=mp3,flac"),
+    ];
+    let before = j2_answers(&app, &routes, &token).await;
+    for (uri, (status, _)) in routes.iter().zip(&before) {
+        assert!(status.is_success(), "GET {uri}: {status}");
+    }
+
+    // The device posts Chrome's profile and asks the new route about both items
+    let chrome = j2_chrome_profile();
+    let body = serde_json::json!({
+        "PlayableMediaTypes": ["Video", "Audio"],
+        "DeviceProfile": chrome,
+    });
+    let req = request(
+        "POST",
+        "/Sessions/Capabilities/Full",
+        Some(&token),
+        Some(body),
+    );
+    let (status, _) = send(&app, req).await;
+    assert!(status.is_success(), "capabilities: {status}");
+    for id in [video, song] {
+        let uri = format!("/Items/{id}/PlaybackInfo");
+        for body in [None, Some(serde_json::json!({ "DeviceProfile": chrome }))] {
+            send(&app, request("POST", &uri, Some(&token), body)).await;
+        }
+        send(&app, request("GET", &uri, Some(&token), None)).await;
+    }
+
+    // The old routes answer as they did
+    let after = j2_answers(&app, &routes, &token).await;
+    for ((uri, before), after) in routes.iter().zip(&before).zip(&after) {
+        let shown =
+            |answer: &(StatusCode, serde_json::Value)| j2_hide(&format!("{answer:?}"), &token);
+        assert!(
+            before == after,
+            "GET {uri}: {} became {}",
+            shown(before),
+            shown(after)
+        );
+    }
+}
+
+#[tokio::test]
+async fn j2_chrome_transcodes_play_without_a_header() {
+    if !g4_have_ffmpeg("j2_chrome_transcodes_play_without_a_header") {
+        return;
+    }
+    let state = test_state().await;
+    add_user(&state, "j2-play", "j2-pass", true).await;
+    // Two seconds of 320x240 H.264 in three profiles, with stereo AAC
+    let mut clips = Vec::new();
+    for (name, profile, pix_fmt) in [
+        ("j2-hi10", "high10", "yuv420p10le"),
+        ("j2-422", "high422", "yuv422p"),
+        ("j2-high", "high", "yuv420p"),
+    ] {
+        let folder = media_folder(&state, name);
+        let file = std::path::Path::new(&folder).join(format!("{name}.mp4"));
+        g4_make_media(&[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=320x240:rate=24",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000",
+            "-t",
+            "2",
+            "-c:v",
+            "libx264",
+            "-profile:v",
+            profile,
+            "-pix_fmt",
+            pix_fmt,
+            "-c:a",
+            "aac",
+            "-ac",
+            "2",
+            file.to_str().unwrap(),
+        ]);
+        let id = g4_insert_item(&state, "Movie", &file).await;
+        rustyfin_core::probe::probe_and_save(&state.db, &id, file.to_str().unwrap())
+            .await
+            .unwrap();
+        clips.push((name, id, file));
+    }
+    let probe_file = state.data_dir.join("j2-segment.ts");
+    let app = app(state);
+    let (token, _) = g2_login_device(&app, "j2-play", "j2-pass", "j2-device")
+        .await
+        .unwrap();
+    let chrome = serde_json::json!({ "DeviceProfile": j2_chrome_profile() });
+
+    for (name, id, file) in &clips {
+        let uri = format!("/Items/{id}/PlaybackInfo");
+        let (sources, ps) = j2_play(&app, "POST", &uri, &token, Some(chrome.clone())).await;
+        let source = &sources[0];
+        if *name == "j2-high" {
+            // 8-bit High plays directly, from the URL jellyfin-web builds, without a header
+            assert_eq!(source["SupportsDirectPlay"], true, "{name}");
+            let stream = format!(
+                "/Videos/{id}/stream.{}?Static=true&mediaSourceId={}&deviceId=j2-device\
+                 &api_key={token}&Tag=j2",
+                source["Container"].as_str().unwrap_or_default(),
+                source["Id"].as_str().unwrap_or_default(),
+            );
+            let (status, data) = j2_get_range(&app, &stream, "bytes=0-99").await;
+            let shown = j2_hide(&stream, &token);
+            assert_eq!(status, StatusCode::PARTIAL_CONTENT, "{shown}");
+            assert!(
+                data == std::fs::read(file).unwrap()[..100],
+                "{shown}: other bytes"
+            );
+            continue;
+        }
+        // High 10 and 4:2:2 become 8-bit 4:2:0 H.264 whose playlist and segments load without
+        // a header
+        let reasons = j2_reasons(source);
+        assert!(
+            reasons.contains(&"VideoProfileNotSupported".to_string()),
+            "{name}: {reasons:?}"
+        );
+        let url = source["TranscodingUrl"].as_str().unwrap_or_default();
+        let segment = g4_first_segment(&app, *id, url, &token).await;
+        let (status, content_type, data) = g4_get(&app, &segment).await;
+        assert_eq!(status, StatusCode::OK, "{name}");
+        assert_eq!(content_type, "video/mp2t", "{name}");
+        let streams = j2_probe(&probe_file, &data);
+        let video = streams
+            .iter()
+            .find(|s| s["codec_type"] == "video")
+            .unwrap_or_else(|| panic!("{name}: no video in {streams:?}"));
+        assert_eq!(video["codec_name"], "h264", "{name}");
+        assert_eq!(video["pix_fmt"], "yuv420p", "{name}");
+        let profile = video["profile"].as_str().unwrap_or_default();
+        assert!(
+            !profile.contains("10") && !profile.contains("4:2:2"),
+            "{name}: {profile}"
+        );
+        let stop = format!("/Videos/ActiveEncodings?PlaySessionId={ps}");
+        let (status, _) = send(&app, request("DELETE", &stop, Some(&token), None)).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{name}");
+    }
+}
+
+#[tokio::test]
+async fn j2_audio_transcode_plays_without_a_header() {
+    if !g4_have_ffmpeg("j2_audio_transcode_plays_without_a_header") {
+        return;
+    }
+    let state = test_state().await;
+    add_user(&state, "j2-song", "j2-pass", true).await;
+    let folder = media_folder(&state, "j2-ac3");
+    let file = std::path::Path::new(&folder).join("j2-ac3.ac3");
+    g4_make_media(&[
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=440:sample_rate=48000",
+        "-t",
+        "2",
+        "-c:a",
+        "ac3",
+        "-ac",
+        "2",
+        file.to_str().unwrap(),
+    ]);
+    let id = g4_insert_item(&state, "Audio", &file).await;
+    rustyfin_core::probe::probe_and_save(&state.db, &id, file.to_str().unwrap())
+        .await
+        .unwrap();
+    let probe_file = state.data_dir.join("j2-audio.ts");
+    let app = app(state);
+    let (token, _) = g2_login_device(&app, "j2-song", "j2-pass", "j2-device")
+        .await
+        .unwrap();
+
+    // Chrome plays no AC3: an audio-only HLS transcode to AAC that loads without a header
+    let uri = format!("/Items/{id}/PlaybackInfo");
+    let body = serde_json::json!({ "DeviceProfile": j2_chrome_profile() });
+    let (sources, ps) = j2_play(&app, "POST", &uri, &token, Some(body)).await;
+    let url = sources[0]["TranscodingUrl"].as_str().unwrap_or_default();
+    assert!(url.ends_with("&AudioOnly=true"), "{}", j2_hide(url, &token));
+    let segment = g4_first_segment(&app, id, url, &token).await;
+    let (status, _, data) = g4_get(&app, &segment).await;
+    assert_eq!(status, StatusCode::OK);
+    let streams = j2_probe(&probe_file, &data);
+    let kinds: Vec<(&str, &str)> = streams
+        .iter()
+        .map(|s| {
+            (
+                s["codec_type"].as_str().unwrap_or_default(),
+                s["codec_name"].as_str().unwrap_or_default(),
+            )
+        })
+        .collect();
+    assert_eq!(kinds, [("audio", "aac")]);
+    let stop = format!("/Videos/ActiveEncodings?PlaySessionId={ps}");
+    let (status, _) = send(&app, request("DELETE", &stop, Some(&token), None)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}
