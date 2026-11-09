@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::state::AppState;
 
-/// Additional Jellyfin-compatible controllers: recommendations, featured, instant mix, music genres.
+/// Additional Jellyfin-compatible controllers: recommendations, featured, instant mix.
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/Movies/Recommendations", get(get_recommendations))
@@ -17,7 +17,6 @@ pub fn routes() -> Router<AppState> {
             "/Users/{userId}/Items/{itemId}/InstantMix",
             get(get_instant_mix),
         )
-        .route("/Genres/Music", get(get_music_genres))
         // Audio/Music similar endpoints
         .route("/Albums/{id}/InstantMix", get(get_albums_instant_mix))
         .route("/Albums/{id}/Similar", get(get_albums_similar))
@@ -26,10 +25,6 @@ pub fn routes() -> Router<AppState> {
         .route("/Artists/AlbumArtists", get(get_album_artists))
         // Artists by name
         .route("/Artists/{name}", get(get_artists_by_name))
-        // Genres by name
-        .route("/Genres/{genreName}", get(get_genres_by_name))
-        // Studios by name
-        .route("/Studios/{name}", get(get_studios_by_name))
         // Movies similar
         .route("/Movies/{id}/Similar", get(get_movies_similar))
         // Shows similar
@@ -131,31 +126,6 @@ async fn get_instant_mix(
         StatusCode::OK,
         Json(QueryResult {
             items,
-            total_record_count: total,
-            start_index: None,
-        }),
-    ))
-}
-
-/// GET /Genres/Music — Returns all music genres from the library.
-async fn get_music_genres(
-    State(state): State<AppState>,
-) -> Result<
-    (
-        StatusCode,
-        Json<QueryResult<rustyfin_model::media::MediaItem>>,
-    ),
-    crate::error::ApiError,
-> {
-    let genres = rustyfin_db::repo_media::get_music_genres(&state.db_ro)
-        .await
-        .map_err(|e| crate::error::ApiError::Internal(e.to_string()))?;
-
-    let total = genres.len() as i64;
-    Ok((
-        StatusCode::OK,
-        Json(QueryResult {
-            items: genres,
             total_record_count: total,
             start_index: None,
         }),
@@ -314,56 +284,6 @@ async fn get_artists_by_name(
     crate::error::ApiError,
 > {
     let items = rustyfin_db::repo_person::search_persons(&state.db_ro, &name, 20)
-        .await
-        .map_err(|e| crate::error::ApiError::Internal(e.to_string()))?;
-    let total = items.len() as i64;
-    Ok((
-        StatusCode::OK,
-        Json(QueryResult {
-            items,
-            total_record_count: total,
-            start_index: None,
-        }),
-    ))
-}
-
-/// GET /Genres/{genreName} — Search genres by name
-async fn get_genres_by_name(
-    State(state): State<AppState>,
-    Path(genre_name): Path<String>,
-) -> Result<
-    (
-        StatusCode,
-        Json<QueryResult<rustyfin_model::media::MediaItem>>,
-    ),
-    crate::error::ApiError,
-> {
-    let items = rustyfin_db::repo_media::get_genres_by_name(&state.db_ro, &genre_name)
-        .await
-        .map_err(|e| crate::error::ApiError::Internal(e.to_string()))?;
-    let total = items.len() as i64;
-    Ok((
-        StatusCode::OK,
-        Json(QueryResult {
-            items,
-            total_record_count: total,
-            start_index: None,
-        }),
-    ))
-}
-
-/// GET /Studios/{name} — Search studios by name
-async fn get_studios_by_name(
-    State(state): State<AppState>,
-    Path(name): Path<String>,
-) -> Result<
-    (
-        StatusCode,
-        Json<QueryResult<rustyfin_model::media::MediaItem>>,
-    ),
-    crate::error::ApiError,
-> {
-    let items = rustyfin_db::repo_media::get_studios_by_name(&state.db_ro, &name)
         .await
         .map_err(|e| crate::error::ApiError::Internal(e.to_string()))?;
     let total = items.len() as i64;

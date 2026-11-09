@@ -39,17 +39,19 @@ pub async fn get_chapters(pool: &SqlitePool, item_id: Uuid) -> Result<Vec<Chapte
     Ok(rows)
 }
 
-/// Save chapters for a video item, deleting existing ones first.
+/// Save chapters for a video item, replacing the existing ones in one transaction,
+/// so a save that fails keeps the old chapters.
 pub async fn save_chapters(
     pool: &SqlitePool,
     item_id: Uuid,
     chapters: Vec<Chapter>,
 ) -> Result<(), sqlx::Error> {
     let item_id_str = item_id.to_string();
+    let mut tx = pool.begin().await?;
     // Delete existing chapters
     sqlx::query("DELETE FROM chapters WHERE item_id = ?1")
         .bind(&item_id_str)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
 
     // Insert new chapters
@@ -65,9 +67,11 @@ pub async fn save_chapters(
         .bind(chapter.start_position_ticks)
         .bind(chapter.end_position_ticks)
         .bind(&chapter.image_path)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
     }
+
+    tx.commit().await?;
 
     Ok(())
 }

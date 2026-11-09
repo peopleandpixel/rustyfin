@@ -68,22 +68,22 @@ json_escape() {
 build_web() {
     log_info "Prüfe und erstelle Web-Client (crates/rustyfin-web)..."
     if [ -f "$SCRIPT_DIR/crates/rustyfin-web/package.json" ]; then
-        if command -v npm >/dev/null 2>&1; then
+        if command -v pnpm >/dev/null 2>&1; then
             (
                 cd "$SCRIPT_DIR/crates/rustyfin-web"
                 if [ ! -d "node_modules" ]; then
-                    log_info "Installiere Web-Abhängigkeiten (npm install)..."
-                    npm install --silent
+                    log_info "Installiere Web-Abhängigkeiten (pnpm install)..."
+                    pnpm install --silent
                 fi
-                log_info "Kompiliere Frontend-Assets (npm run build)..."
-                npm run build --silent
+                log_info "Kompiliere Frontend-Assets (pnpm run build)..."
+                pnpm --silent run build
             )
             log_success "Web-Client erfolgreich gebaut (dist/ vorhanden)."
         else
             if [ -f "$SCRIPT_DIR/crates/rustyfin-web/dist/index.html" ]; then
-                log_warn "npm nicht gefunden, verwende vorhandenes dist/-Verzeichnis."
+                log_warn "pnpm nicht gefunden, verwende vorhandenes dist/-Verzeichnis."
             else
-                log_error "npm ist nicht installiert und kein dist/-Verzeichnis vorhanden!"
+                log_error "pnpm ist nicht installiert und kein dist/-Verzeichnis vorhanden!"
                 return 1
             fi
         fi
@@ -515,7 +515,7 @@ show_help() {
     echo -e "  ${GREEN}test${NC}           Führt alle Unit- und Integrationstests (cargo test) aus"
     echo -e "  ${GREEN}smoke${NC}          Führt Live-HTTP-Smoke-Tests gegen alle Haupt-Endpunkte durch"
     echo -e "  ${GREEN}build${NC}          Baut den Web-Client und den Rust-Workspace"
-    echo -e "  ${GREEN}web${NC}            Baut ausschließlich das Web-Frontend (npm run build)"
+    echo -e "  ${GREEN}web${NC}            Baut ausschließlich das Web-Frontend (pnpm run build)"
     echo -e "  ${GREEN}open${NC}           Öffnet die Web-Oberfläche im Browser"
     echo -e "  ${GREEN}clean${NC}          Stoppt den Server und löscht temporäre Entwicklungsdaten"
     echo -e "  ${GREEN}help, -h${NC}       Zeigt diese Hilfeseite an"

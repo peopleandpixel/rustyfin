@@ -1,0 +1,8 @@
+{
+  "level": "error",
+  "message": "Missing root folder: /tv",
+  "type": "RootFolderCheck",
+  "wikiUrl": "https://wiki.servarr.com/sonarr/system#missing-root-folder",
+  "eventType": "Health",
+  "instanceName": "Sonarr"
+}

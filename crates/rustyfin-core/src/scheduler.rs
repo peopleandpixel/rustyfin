@@ -9,7 +9,9 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::sync::watch;
 
-use crate::plugin_manager::PluginManager;
+use crate::library_monitor::ChangeQueue;
+use crate::library_watch::LibraryWatcher;
+use crate::scan_progress::ScanRegistry;
 
 /// Known task IDs
 pub const TASK_LIBRARY_SCAN: &str = "LibraryScan";
@@ -27,6 +29,9 @@ fn ticks_to_duration(ticks: u64) -> std::time::Duration {
     std::time::Duration::from_nanos(ticks * 100)
 }
 
+/// The callback that runs when a scheduled library scan ends.
+type OnScan = Arc<dyn Fn() + Send + Sync>;
+
 #[derive(Clone)]
 struct TaskEntry {
     info: ScheduledTaskInfo,
@@ -37,11 +42,14 @@ pub struct TaskScheduler {
     tasks: Arc<RwLock<HashMap<String, TaskEntry>>>,
     db: SqlitePool,
     data_dir: Arc<PathBuf>,
-    plugin_manager: PluginManager,
+    scans: ScanRegistry,
+    changes: ChangeQueue,
+    watcher: LibraryWatcher,
+    on_scan: Arc<std::sync::RwLock<Option<OnScan>>>,
 }
 
 impl TaskScheduler {
-    pub fn new(db: SqlitePool, data_dir: Arc<PathBuf>, plugin_manager: PluginManager) -> Self {
+    pub fn new(db: SqlitePool, data_dir: Arc<PathBuf>) -> Self {
         let mut tasks = HashMap::new();
 
         // Library Scan
@@ -159,12 +167,42 @@ impl TaskScheduler {
             },
         );
 
+        let changes = ChangeQueue::new(db.clone());
+        let watcher = LibraryWatcher::new(db.clone(), changes.clone(), (*data_dir).clone());
         Self {
             tasks: Arc::new(RwLock::new(tasks)),
             db,
             data_dir,
-            plugin_manager,
+            scans: ScanRegistry::new(),
+            changes,
+            watcher,
+            on_scan: Arc::new(std::sync::RwLock::new(None)),
         }
+    }
+
+    /// Sets the callback that runs once each time the scheduled library scan ends, whether or
+    /// not a library failed. The server uses it to clear the caches a scan can change.
+    pub fn set_on_scan(&self, f: impl Fn() + Send + Sync + 'static) {
+        let mut slot = self
+            .on_scan
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *slot = Some(Arc::new(f));
+    }
+
+    /// The library scans in progress.
+    pub fn scans(&self) -> &ScanRegistry {
+        &self.scans
+    }
+
+    /// The queue of changed library paths, which the library monitor rescans.
+    pub fn changes(&self) -> &ChangeQueue {
+        &self.changes
+    }
+
+    /// The library monitor, which reports changed library paths to `changes()`.
+    pub fn watcher(&self) -> &LibraryWatcher {
+        &self.watcher
     }
 
     pub async fn get_all_tasks(&self) -> Vec<ScheduledTaskInfo> {
@@ -289,11 +327,27 @@ impl TaskScheduler {
 
         let result = match rustyfin_db::repo_library::get_all_libraries(&self.db).await {
             Ok(libraries) => {
+                // Every library is listed as queued before the first one starts.
+                let tickets: Vec<_> = libraries
+                    .iter()
+                    .map(|lib| self.scans.queue(lib.id))
+                    .collect();
+                let client = reqwest::Client::new();
                 let mut errors = Vec::new();
-                for lib in &libraries {
-                    if let Err(e) = crate::scanner::scan_library(&self.db, lib, &self.plugin_manager).await {
+                for (lib, ticket) in libraries.iter().zip(tickets) {
+                    // Only the caller that claimed the library's run scans it.
+                    if !ticket.claim() {
+                        continue;
+                    }
+                    if let Err(e) = crate::scanner::scan_library_with_metadata(
+                        &self.db, lib, &client, None, None, None, &ticket,
+                    )
+                    .await
+                    {
                         errors.push(format!("{}: {}", lib.name, e));
                     }
+                    // The probes the scan queued keep the library listed until they finish.
+                    drop(ticket);
                 }
                 let end = Utc::now();
                 if errors.is_empty() {
@@ -322,6 +376,16 @@ impl TaskScheduler {
                 }
             }
         };
+
+        // Cloned out of the lock so the callback never runs while the lock is held.
+        let on_scan = self
+            .on_scan
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(f) = on_scan {
+            f();
+        }
 
         self.set_task_result(TASK_LIBRARY_SCAN, result).await;
         self.set_task_state(TASK_LIBRARY_SCAN, TaskState::Idle)
@@ -376,7 +440,7 @@ impl TaskScheduler {
                             for item in &items {
                                 let client = reqwest::Client::new();
                                 if let Err(e) = crate::metadata::refresh_item_metadata(
-                                    &self.db, &client, item, &self.plugin_manager,
+                                    &self.db, &client, item, None, None, None,
                                 )
                                 .await
                                 {
@@ -471,6 +535,9 @@ impl TaskScheduler {
 
     /// Start all scheduled task loops. Call once at startup.
     pub fn start(self, shutdown_rx: watch::Receiver<bool>) {
+        // The library monitor starts its monitors in the background and returns at once.
+        self.watcher.start();
+
         // Library scan loop
         let sched = self.clone();
         let mut rx = shutdown_rx.clone();

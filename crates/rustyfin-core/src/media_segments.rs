@@ -248,15 +248,28 @@ pub async fn detect_segments(
     Ok((intro, outro))
 }
 
+/// FFmpeg arguments for the silencedetect pass over `path`, one element per argument.
+pub fn silence_detect_args(path: &str, config: &DetectionConfig) -> Vec<String> {
+    vec![
+        "-i".to_string(),
+        path.to_string(),
+        "-af".to_string(),
+        format!(
+            "silencedetect=noise={}dB:d={},ametadata=mode=print",
+            config.silence_noise_threshold, config.min_silence_duration
+        ),
+        "-f".to_string(),
+        "null".to_string(),
+        "-".to_string(),
+    ]
+}
+
 /// Run FFmpeg silencedetect filter and parse the output.
 async fn detect_silence(path: &str, config: &DetectionConfig) -> Result<Vec<SilenceEvent>, String> {
-    let args = format!(
-        "-i {} -af \"silencedetect=noise={}dB:d={},ametadata=mode=print\" -f null -",
-        path, config.silence_noise_threshold, config.min_silence_duration
-    );
+    let args = silence_detect_args(path, config);
 
     let output = Command::new("ffmpeg")
-        .args(args.split_whitespace())
+        .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -324,18 +337,32 @@ fn parse_silence_line(line: &str) -> Option<SilenceEvent> {
     })
 }
 
+/// FFmpeg arguments for the blackdetect pass over `path`, one element per argument.
+pub fn black_detect_args(path: &str, config: &DetectionConfig) -> Vec<String> {
+    vec![
+        "-i".to_string(),
+        path.to_string(),
+        "-vf".to_string(),
+        format!(
+            "blackdetect=d={}:pix_th={}",
+            config.min_black_duration, config.black_pixel_threshold
+        ),
+        "-an".to_string(),
+        "-f".to_string(),
+        "null".to_string(),
+        "-".to_string(),
+    ]
+}
+
 /// Run FFmpeg blackdetect filter and parse the output.
 async fn detect_black_frames(
     path: &str,
     config: &DetectionConfig,
 ) -> Result<Vec<DetectedSegment>, String> {
-    let args = format!(
-        "-i {} -vf \"blackdetect=d={}:pix_th={}\" -an -f null -",
-        path, config.min_black_duration, config.black_pixel_threshold
-    );
+    let args = black_detect_args(path, config);
 
     let output = Command::new("ffmpeg")
-        .args(args.split_whitespace())
+        .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -480,6 +507,15 @@ pub async fn detect_and_save(
 
     let (intro, outro) = detect_segments(path, duration_seconds, &config).await?;
 
+    // Drop results from earlier runs now that detection has succeeded.
+    sqlx::query(
+        "DELETE FROM media_segments WHERE item_id = ?1 AND segment_type IN ('Intro', 'Outro')",
+    )
+    .bind(item_id.to_string())
+    .execute(pool)
+    .await
+    .map_err(|e| format!("Failed to clear old segments: {}", e))?;
+
     // Save intro if detected
     if let Some(seg) = intro {
         let start_ticks = (seg.start * 10_000_000.0) as i64;
@@ -493,17 +529,6 @@ pub async fn detect_and_save(
         )
         .await
         .map_err(|e| format!("Failed to save intro segment: {}", e))?;
-
-        // Also update the MediaItem's intro fields
-        sqlx::query(
-            "UPDATE media_items SET intro_start_time_ticks = ?1, intro_end_time_ticks = ?2 WHERE id = ?3",
-        )
-        .bind(start_ticks)
-        .bind(end_ticks)
-        .bind(item_id.to_string())
-        .execute(pool)
-        .await
-        .map_err(|e| format!("Failed to update intro ticks: {}", e))?;
 
         info!(
             "Item {}: Intro detected {:.1}s - {:.1}s",

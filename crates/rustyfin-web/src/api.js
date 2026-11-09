@@ -14,6 +14,10 @@ const API = {
     _cache: new Map(),
     _cacheTTL: 30000, // 30 seconds default TTL
     _pendingRequests: new Map(), // Request deduplication: merge identical in-flight requests
+    _cacheGen: 0, // Bumped by clearUserCache(); answers from an older generation are not stored
+    _adminCheck: null, // The running /Users/Me re-read, shared by concurrent callers
+    onAdminLost: null, // Set by app.js; called when this account loses administrator rights
+    onSignedOut: null, // Set by app.js; called after every sign-out, the user's or a 401's
 
     /**
      * Get cached response or fetch from server with deduplication.
@@ -32,17 +36,34 @@ const API = {
         }
 
         // Fetch and cache
+        const gen = this._cacheGen;
         const promise = this.get(path).then(data => {
-            this._cache.set(path, { data, time: Date.now() });
-            this._pendingRequests.delete(path);
+            if (gen === this._cacheGen) {
+                this._cache.set(path, { data, time: Date.now() });
+            }
+            if (this._pendingRequests.get(path) === promise) {
+                this._pendingRequests.delete(path);
+            }
             return data;
         }).catch(err => {
-            this._pendingRequests.delete(path);
+            if (this._pendingRequests.get(path) === promise) {
+                this._pendingRequests.delete(path);
+            }
             throw err;
         });
 
         this._pendingRequests.set(path, promise);
         return promise;
+    },
+
+    /**
+     * Forget every cached answer and in-flight request, so nothing one user loaded is served to the next.
+     * Every sign-in path and sign-out call this.
+     */
+    clearUserCache() {
+        this._cache.clear();
+        this._pendingRequests.clear();
+        this._cacheGen++;
     },
 
     /**
@@ -94,14 +115,35 @@ const API = {
         return id;
     },
 
+    // Builds the Error for a failed response: the JSON body's Detail or Title if present, else "METHOD path: status".
+    async _requestError(method, path, res) {
+        const fallback = `${method} ${path}: ${res.status}`;
+        let message = fallback;
+        try {
+            const text = await res.text();
+            if (text.startsWith('{')) {
+                const body = JSON.parse(text);
+                message = body.Detail || body.Title || fallback;
+            }
+        } catch (err) {
+            console.warn(`Could not read the error response of ${method} ${path}:`, err);
+        }
+        const error = new Error(message);
+        error.status = res.status;
+        return error;
+    },
+
     async get(path) {
+        const sent = this.token;
         const res = await fetch(this.base + path, { headers: this.headers() });
         if (!res.ok) {
-            if (res.status === 401 && this.token) {
+            // A late 401 for an older token must not sign out the user who signed in since.
+            if (res.status === 401 && sent && this.token === sent) {
                 this.logout();
                 window.location.hash = 'login';
             }
-            throw new Error(`GET ${path}: ${res.status}`);
+            if (res.status === 403 && this.isAdmin) this.recheckAdmin();
+            throw await this._requestError('GET', path, res);
         }
         return res.json();
     },
@@ -112,7 +154,10 @@ const API = {
             headers: this.headers(),
             body: body ? JSON.stringify(body) : undefined
         });
-        if (!res.ok) throw new Error(`POST ${path}: ${res.status}`);
+        if (!res.ok) {
+            if (res.status === 403 && this.isAdmin) this.recheckAdmin();
+            throw await this._requestError('POST', path, res);
+        }
         const text = await res.text();
         return text ? JSON.parse(text) : {};
     },
@@ -123,7 +168,10 @@ const API = {
             headers: this.headers(),
             body: body ? JSON.stringify(body) : undefined
         });
-        if (!res.ok) throw new Error(`PUT ${path}: ${res.status}`);
+        if (!res.ok) {
+            if (res.status === 403 && this.isAdmin) this.recheckAdmin();
+            throw await this._requestError('PUT', path, res);
+        }
         const text = await res.text();
         return text ? JSON.parse(text) : {};
     },
@@ -133,13 +181,50 @@ const API = {
             method: 'DELETE',
             headers: this.headers()
         });
-        if (!res.ok) throw new Error(`DELETE ${path}: ${res.status}`);
+        if (!res.ok) {
+            if (res.status === 403 && this.isAdmin) this.recheckAdmin();
+            throw await this._requestError('DELETE', path, res);
+        }
         const text = await res.text();
         return text ? JSON.parse(text) : {};
     },
 
+    // Re-reads /Users/Me without the cache; drops administrator rights if the account no longer has them.
+    recheckAdmin() {
+        if (this._adminCheck) return this._adminCheck;
+        this._adminCheck = (async () => {
+            try {
+                const res = await fetch(this.base + '/Users/Me', { headers: this.headers(), cache: 'no-store' });
+                if (res.ok) {
+                    const user = await res.json();
+                    const isAdmin = Boolean(
+                        user.IsAdministrator ??
+                        user.is_administrator ??
+                        user.Policy?.IsAdministrator ??
+                        user.policy?.is_administrator ??
+                        false
+                    );
+                    if (!isAdmin && this.isAdmin) this._loseAdmin();
+                }
+            } catch (err) {
+                console.warn('Admin re-check failed:', err);
+            }
+            return this.isAdmin;
+        })().finally(() => { this._adminCheck = null; });
+        return this._adminCheck;
+    },
+
+    // Drops administrator rights locally and forgets cached and in-flight responses, then tells the UI.
+    _loseAdmin() {
+        this.isAdmin = false;
+        localStorage.setItem('rustyfin_is_admin', 'false');
+        this.clearUserCache();
+        if (this.onAdminLost) this.onAdminLost();
+    },
+
     // Auth
     async login(username, password) {
+        this.clearUserCache();
         const res = await fetch(this.base + '/Users/AuthenticateByName', {
             method: 'POST',
             headers: {
@@ -150,13 +235,24 @@ const API = {
         });
         if (!res.ok) {
             const err = await res.json().catch(() => ({}));
-            throw new Error(err.Message || err.message || t('login.failed'));
+            const error = new Error(err.Message || err.message || t('login.failed'));
+            error.status = res.status;
+            error.setupRequired = res.status === 401 && res.headers.get('X-Rustyfin-Setup-Required') === 'true';
+            throw error;
         }
         const data = await res.json();
+        this._storeSession(data, username);
+        return data;
+    },
+
+    // Keeps the session that an AuthenticateByName-style answer carries (password, setup-code or OpenID Connect sign-in).
+    // Clears the cache again once the token has changed, so nothing loaded with the old token is served to the new user.
+    _storeSession(data, fallbackName = '') {
         this.token = data.AccessToken || data.access_token;
+        this.clearUserCache();
         const userObj = data.User || data.user || {};
         this.userId = userObj.Id || userObj.id || '';
-        this.userName = userObj.Name || userObj.name || username;
+        this.userName = userObj.Name || userObj.name || fallbackName;
         this.isAdmin = Boolean(
             userObj.IsAdministrator ??
             userObj.is_administrator ??
@@ -169,10 +265,40 @@ const API = {
         localStorage.setItem('rustyfin_user_id', this.userId);
         localStorage.setItem('rustyfin_user_name', this.userName);
         localStorage.setItem('rustyfin_is_admin', this.isAdmin.toString());
+    },
+
+    // Ends an OpenID Connect sign-in. The flow cookie from oidcStart() picks the flow. The device header is sent as login() sends it, so the token belongs to this browser.
+    async oidcComplete() {
+        const res = await fetch(this.base + '/Auth/Oidc/Complete', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Emby-Authorization': this.authHeader()
+            }
+        });
+        if (!res.ok) throw await this._requestError('POST', '/Auth/Oidc/Complete', res);
+        this._storeSession(await res.json());
+    },
+
+    // Signs in an imported user with the one-time code and the password chosen now.
+    async loginWithSetupCode(username, code, newPw) {
+        this.clearUserCache();
+        const res = await fetch(this.base + '/Users/AuthenticateWithSetupCode', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Emby-Authorization': this.authHeader()
+            },
+            body: JSON.stringify({ Username: username, Code: code, NewPw: newPw })
+        });
+        if (!res.ok) throw await this._requestError('POST', '/Users/AuthenticateWithSetupCode', res);
+        const data = await res.json();
+        this._storeSession(data, username);
         return data;
     },
 
     logout() {
+        this.clearUserCache();
         if (this.token) {
             this.post('/Sessions/Logout').catch(() => {});
         }
@@ -181,11 +307,22 @@ const API = {
         this.userName = null;
         this.isAdmin = false;
         ['rustyfin_token', 'rustyfin_user_id', 'rustyfin_user_name', 'rustyfin_is_admin'].forEach(k => localStorage.removeItem(k));
+        if (this.onSignedOut) this.onSignedOut();
     },
 
     isLoggedIn() {
         return !!this.token;
     },
+
+    // OpenID Connect. Start and Link answer with the provider's AuthorizationUrl.
+    oidcInfo() { return this.get('/Auth/Oidc/Info'); },
+    oidcStart() { return this.post('/Auth/Oidc/Start'); },
+    oidcLink() { return this.post('/Auth/Oidc/Link'); },
+    oidcAccount(userId) { return this.get(`/Auth/Oidc/Accounts/${encodeURIComponent(userId)}`); },
+    oidcAccounts() { return this.get('/Auth/Oidc/Accounts'); },
+    oidcUnlink(userId) { return this.del(`/Auth/Oidc/Accounts/${encodeURIComponent(userId)}/Link`); },
+    oidcSettings() { return this.get('/Auth/Oidc/Settings'); },
+    saveOidcSettings(body) { return this.post('/Auth/Oidc/Settings', body); },
 
     // System
     getPublicInfo() { return this.get('/System/Info/Public'); },
@@ -208,19 +345,23 @@ const API = {
 
     // Libraries
     getLibraries() {
-        if (this.isAdmin) return this.cachedGet('/Library/VirtualFolders', 60000);
+        if (this.isAdmin) return this.get('/Library/VirtualFolders');
         // /Library/VirtualFolders is for administrators; other users get the same libraries from their views.
         const types = { movies: 'Movies', tvshows: 'TvShows', music: 'Music', homevideos: 'Photos' };
-        return this.cachedGet('/UserViews', 60000).then(views => (views.Items || []).map(v => ({
+        return this.get('/UserViews').then(views => (views.Items || []).map(v => ({
             id: v.Id,
             name: v.Name,
             content_type: types[v.CollectionType] || 'Mixed',
         })));
     },
-    createLibrary(name, contentType, paths) {
-        return this.post('/Library/VirtualFolders', { Name: name, ContentType: contentType, Paths: paths });
+    createLibrary(name, contentType, paths, libraryOptions) {
+        const body = { Name: name, ContentType: contentType, Paths: paths };
+        if (libraryOptions) body.LibraryOptions = libraryOptions;
+        return this.post('/Library/VirtualFolders', body);
     },
     deleteLibrary(id) { return this.del(`/Library/VirtualFolders/${id}`); },
+    getLibraryOptions(id) { return this.get(`/Library/${id}/Options`); },
+    saveLibraryOptions(id, options) { return this.post(`/Library/${id}/Options`, options); },
     scanLibrary(id) { 
         this.invalidateCache('/Items');
         return this.post(`/Library/VirtualFolders/${id}/Refresh`); 
@@ -266,20 +407,24 @@ const API = {
 
     // Images
     imageUrl(itemId, type = 'Primary', opts = {}) {
-        const q = new URLSearchParams(opts);
+        const q = new URLSearchParams();
+        // Options left unset (undefined, null or '') are not sent, so callers can pass a tag that may be missing
+        for (const [k, v] of Object.entries(opts)) {
+            if (v !== undefined && v !== null && v !== '') q.set(k, v);
+        }
         if (this.token) q.set('api_key', this.token);
         return `${this.base}/Items/${itemId}/Images/${type}?${q.toString()}`;
     },
 
     // Playback
-    reportPlaying(itemId, positionTicks = 0) {
-        return this.post('/Sessions/Playing', { ItemId: itemId, PositionTicks: positionTicks });
+    reportPlaying(itemId, positionTicks = 0, fields = {}) {
+        return this.post('/Sessions/Playing', { ItemId: itemId, PositionTicks: positionTicks, ...fields });
     },
-    reportProgress(itemId, positionTicks, isPaused = false) {
-        return this.post('/Sessions/Playing/Progress', { ItemId: itemId, PositionTicks: positionTicks, IsPaused: isPaused });
+    reportProgress(itemId, positionTicks, isPaused = false, fields = {}) {
+        return this.post('/Sessions/Playing/Progress', { ItemId: itemId, PositionTicks: positionTicks, IsPaused: isPaused, ...fields });
     },
-    reportStopped(itemId, positionTicks) {
-        return this.post('/Sessions/Playing/Stopped', { ItemId: itemId, PositionTicks: positionTicks });
+    reportStopped(itemId, positionTicks, fields = {}) {
+        return this.post('/Sessions/Playing/Stopped', { ItemId: itemId, PositionTicks: positionTicks, ...fields });
     },
     markPlayed(itemId) { return this.post(`/Users/${this.userId}/PlayedItems/${itemId}`); },
     markUnplayed(itemId) { return this.del(`/Users/${this.userId}/PlayedItems/${itemId}`); },
@@ -294,6 +439,33 @@ const API = {
         return `${this.base}/${type}/${itemId}/stream?${q.toString()}`;
     },
     getPlaybackInfo(itemId, type = 'Videos') { return this.get(`/${type}/${itemId}/PlaybackInfo`); },
+    // Codecs this browser can play, probed once: MediaSource or a <video> element saying yes counts
+    _playableCodecs: null,
+    playableCodecs() {
+        if (this._playableCodecs) return this._playableCodecs;
+        const video = document.createElement('video');
+        const canPlay = mime => (typeof MediaSource !== 'undefined' && MediaSource.isTypeSupported(mime))
+            || video.canPlayType(mime) !== '';
+        const probe = mimes => Object.keys(mimes).filter(name => canPlay(mimes[name]));
+        this._playableCodecs = {
+            video: probe({
+                h264: 'video/mp4; codecs="avc1.640028"',
+                hevc: 'video/mp4; codecs="hvc1.1.6.L120.90"',
+                vp8: 'video/webm; codecs="vp8"',
+                vp9: 'video/webm; codecs="vp09.00.10.08"',
+                av1: 'video/mp4; codecs="av01.0.08M.08"',
+            }),
+            audio: probe({
+                aac: 'audio/mp4; codecs="mp4a.40.2"',
+                mp3: 'audio/mpeg',
+                opus: 'audio/webm; codecs="opus"',
+                flac: 'audio/flac',
+                ac3: 'audio/mp4; codecs="ac-3"',
+                eac3: 'audio/mp4; codecs="ec-3"',
+            }),
+        };
+        return this._playableCodecs;
+    },
     // Universal endpoint returns the optimal playback URL
     async getUniversalVideoUrl(itemId, params = {}) {
         const q = new URLSearchParams({
@@ -302,12 +474,24 @@ const API = {
             EnableDirectStream: params.enableDirectStream !== false ? 'true' : 'false',
             PlaySessionId: 'web-' + (localStorage.getItem('rustyfin_device_id') || 'browser'),
         });
-        const defaultCodecs = ['h264', 'hevc', 'vp8', 'vp9', 'av1'];
-        const audioCodecs = ['mp3', 'aac', 'opus', 'ac3', 'flac'];
-        q.set('VideoCodecs', defaultCodecs.join(','));
-        q.set('AudioCodecs', audioCodecs.join(','));
+        const codecs = this.playableCodecs();
+        q.set('VideoCodecs', codecs.video.join(','));
+        q.set('AudioCodecs', codecs.audio.join(','));
+        if (params.startTimeTicks > 0) q.set('StartTimeTicks', params.startTimeTicks);
+        if (params.mediaSourceId) q.set('MediaSourceId', params.mediaSourceId);
+        if (params.audioStreamIndex != null) q.set('AudioStreamIndex', params.audioStreamIndex);
+        if (params.subtitleStreamIndex != null) q.set('SubtitleStreamIndex', params.subtitleStreamIndex);
         const data = await this.get(`/Videos/${itemId}/Universal?${q.toString()}`);
+        // The player reads `url`; the server sends `Url`
+        if (data && !data.url) data.url = data.Url;
         return data;
+    },
+
+    // Stops the transcode of one play session; keepalive lets the request outlive the page
+    async stopActiveEncodings(playSessionId) {
+        const path = `/Videos/ActiveEncodings?PlaySessionId=${encodeURIComponent(playSessionId)}`;
+        const res = await fetch(this.base + path, { method: 'DELETE', headers: this.headers(), keepalive: true });
+        if (!res.ok) throw await this._requestError('DELETE', path, res);
     },
 
     // Search
@@ -338,7 +522,7 @@ const API = {
     // Scheduled Tasks
     getTasks() { return this.get('/ScheduledTasks'); },
     startTask(id) { return this.post(`/ScheduledTasks/Running/${id}`); },
-    stopTask(id) { return this.delete(`/ScheduledTasks/Running/${id}`); },
+    stopTask(id) { return this.del(`/ScheduledTasks/Running/${id}`); },
 
     // Plugins
     getPlugins() { return this.get('/Plugins'); },
@@ -357,7 +541,14 @@ const API = {
 
     // Live Log
     getLogLevel() { return this.get('/System/LogLevel'); },
-    setLogLevel(level) { return this.post('/System/LogLevel', { LogLevel: level }); }
+    setLogLevel(level) { return this.post('/System/LogLevel', { LogLevel: level }); },
+
+    // Jellyfin import (B20)
+    jellyfinImportPreview(req) { return this.post('/JellyfinImport/Preview', req); },
+    jellyfinImportRun(req) { return this.post('/JellyfinImport/Run', req); },
+    jellyfinImportStatus() { return this.get('/JellyfinImport/Status'); },
+    jellyfinImportPendingUsers() { return this.get('/JellyfinImport/PendingUsers'); },
+    jellyfinImportNewCode(userId) { return this.post('/JellyfinImport/Users/' + encodeURIComponent(userId) + '/SetupCode'); }
 };
 
 if (typeof window !== 'undefined') {

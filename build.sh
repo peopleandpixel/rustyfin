@@ -87,11 +87,11 @@ check_prerequisites() {
         log_success "Rust: $(cargo --version | awk '{print $2}')"
     fi
 
-    if ! command -v npm &>/dev/null; then
-        log_error "npm (Node.js) ist nicht installiert."
+    if ! command -v node &>/dev/null || ! command -v pnpm &>/dev/null; then
+        log_error "Node.js und pnpm müssen installiert sein (pnpm: npm install -g pnpm oder corepack enable)."
         missing=1
     else
-        log_success "Node.js: $(node --version), npm: $(npm --version)"
+        log_success "Node.js: $(node --version), pnpm: $(pnpm --version)"
     fi
 
     if [ $missing -eq 1 ]; then
@@ -148,17 +148,17 @@ build_web() {
 
     cd "$WEB_DIR"
 
-    # npm install wenn nötig
+    # pnpm install wenn nötig
     if [ ! -d "node_modules" ]; then
-        log_info "Installiere Web-Abhängigkeiten (npm install)..."
-        npm install --silent
-        log_success "npm install abgeschlossen."
+        log_info "Installiere Web-Abhängigkeiten (pnpm install)..."
+        pnpm install --silent
+        log_success "pnpm install abgeschlossen."
     fi
 
     # Vite build
     local start=$SECONDS
-    log_info "Kompiliere Frontend (npm run build)..."
-    if npm run build --silent 2>&1; then
+    log_info "Kompiliere Frontend (pnpm run build)..."
+    if pnpm --silent run build 2>&1; then
         log_success "WebUI gebaut ($(($SECONDS - start))s)"
     else
         log_error "WebUI-Build fehlgeschlagen!"

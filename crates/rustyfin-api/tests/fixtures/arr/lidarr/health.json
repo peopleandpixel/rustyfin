@@ -1,0 +1,9 @@
+{
+  "level": "warning",
+  "message": "Download clients unavailable due to failures: qBittorrent",
+  "type": "DownloadClientStatusCheck",
+  "wikiUrl": "https://wiki.servarr.com/lidarr/system#download-clients-are-unavailable-due-to-failures",
+  "eventType": "Health",
+  "instanceName": "Lidarr",
+  "applicationUrl": "http://lidarr.lan:8686"
+}

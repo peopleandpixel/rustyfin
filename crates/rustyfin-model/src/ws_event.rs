@@ -62,6 +62,11 @@ pub enum WsEvent {
         #[serde(rename = "Data")]
         data: LogMessageData,
     },
+    /// A library scan's progress: "0" when it is queued, each whole percent, then "100" at its end
+    RefreshProgress {
+        #[serde(rename = "Data")]
+        data: RefreshProgressData,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,6 +81,18 @@ pub struct LogMessageData {
     /// Target module (optional)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
+}
+
+/// The `Data` of a `RefreshProgress` event: one library's scan.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct RefreshProgressData {
+    /// The library's id, hyphenated
+    pub item_id: String,
+    /// The whole percent done, "0" to "100", as text
+    pub progress: String,
+    /// The scan's state: "Queued" or "Active" while it runs, "Idle" once it has ended
+    pub state: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

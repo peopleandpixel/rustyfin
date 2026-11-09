@@ -16,6 +16,7 @@ use rustyfin_api::log_stream::LogStreamLayer;
 use rustyfin_api::middleware::{DEFAULT_LOGIN_LIMIT, DEFAULT_LOGIN_WINDOW_SECS, RateLimiter};
 use rustyfin_api::routes::build_router;
 use rustyfin_api::state::AppState;
+use rustyfin_core::image_proxy::{IMAGE_CACHE_MAX_BYTES, sweep_image_cache};
 use rustyfin_model::server_info::ServerConfiguration;
 
 #[tokio::main]
@@ -102,6 +103,24 @@ async fn main() {
 
     let api_key = credentials::api_key(std::env::var("RUSTYFIN_API_KEY").ok());
 
+    let tmdb_settings = match rustyfin_core::tmdb_client::TmdbSettings::from_env() {
+        Ok(settings) => settings,
+        Err(e) => {
+            tracing::error!("{e}");
+            std::process::exit(1);
+        }
+    };
+    tracing::info!(
+        "TMDb API at {}, images at {}, key from {}",
+        tmdb_settings.api_base_url,
+        tmdb_settings.image_base_url,
+        if tmdb_settings.env_key.is_some() {
+            "RUSTYFIN_TMDB_API_KEY"
+        } else {
+            "the server config, if set"
+        }
+    );
+
     // Load or create server configuration
     let mut config = load_config(&data_dir);
 
@@ -134,6 +153,12 @@ async fn main() {
         Err(e) => tracing::warn!("could not check for default admin passwords: {}", e),
     }
 
+    // Makes the setup-code dummy hash now, so the first setup-code check after a start
+    // is not slower.
+    if let Err(e) = rustyfin_auth::prepare_setup_code_checks().await {
+        tracing::warn!("could not prepare setup-code checks: {e}");
+    }
+
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
 
     let transcode_manager = rustyfin_core::transcode::TranscodeManager::new(&data_dir);
@@ -143,12 +168,23 @@ async fn main() {
     let data_dir_arc = Arc::new(data_dir);
     let task_scheduler =
         rustyfin_core::scheduler::TaskScheduler::new(pool.clone(), data_dir_arc.clone());
+    task_scheduler
+        .changes()
+        .set_delay(std::time::Duration::from_secs(u64::from(
+            config.library_monitor_delay,
+        )));
+    task_scheduler
+        .watcher()
+        .set_poll_interval(std::time::Duration::from_secs(u64::from(
+            config.library_monitor_poll_interval.max(1),
+        )));
 
     let plugin_manager = rustyfin_core::plugin_manager::PluginManager::new(&data_dir_arc);
     plugin_manager.load_all().await;
 
     // Rate limiter: default 10 requests per 60 seconds per resolved client IP, for the login
-    // endpoints only (AuthenticateByName, ForgotPassword, ForgotPassword/Pin, ResetPassword).
+    // endpoints only (AuthenticateByName, AuthenticateWithSetupCode, ForgotPassword,
+    // ForgotPassword/Pin, ResetPassword).
     // Configurable via env; 0 disables.
     let rate_max: usize = std::env::var("RUSTYFIN_RATE_LIMIT")
         .ok()
@@ -173,12 +209,13 @@ async fn main() {
 
     // Shared HTTP client for external API calls (TMDB, etc.) - reuse connection pool
     let http_client = reqwest::Client::builder()
-        .user_agent("Rustyfin/1.0")
+        .user_agent(rustyfin_core::tmdb_client::USER_AGENT)
         .pool_max_idle_per_host(10)
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .expect("Failed to build HTTP client");
+    let tmdb = rustyfin_core::tmdb_client::TmdbClient::new(http_client.clone(), tmdb_settings);
 
     let state = AppState {
         db: pool,
@@ -200,12 +237,35 @@ async fn main() {
         cache,
         image_cache,
         http_client,
+        tmdb,
+        oidc: rustyfin_api::oidc::OidcState::new(),
+        jellyfin_import: Default::default(),
     };
+
+    // A scheduled library scan clears the same caches as a scan from the API or the monitor.
+    {
+        let cache = state.cache.clone();
+        let image_cache = state.image_cache.clone();
+        task_scheduler.set_on_scan(move || {
+            cache.invalidate_on_scan();
+            image_cache.invalidate_all();
+        });
+    }
 
     // Background task: scheduled tasks (library scan, metadata refresh, cache cleanup)
     {
         let shutdown_rx = state.shutdown_tx.subscribe();
+        // Test switch: poll every library path, even on a local disk.
+        if std::env::var("RUSTYFIN_MONITOR_FORCE_POLL").is_ok_and(|v| v == "1") {
+            task_scheduler.watcher().set_force_poll(true);
+        }
         task_scheduler.start(shutdown_rx);
+    }
+
+    // Background task: once after an update, dates the items older versions stored by their files
+    {
+        let state = state.clone();
+        tokio::spawn(async move { rustyfin_api::date_backfill::run(&state).await });
     }
 
     // Extract HTTP port for discovery services
@@ -266,11 +326,13 @@ async fn main() {
     let cleanup_db = state.db.clone();
     let sighup_config = state.config.clone();
     let sighup_data_dir = state.data_dir.clone();
+    let sighup_changes = state.task_scheduler.changes().clone();
+    let sighup_watcher = state.task_scheduler.watcher().clone();
     let cache = state.cache.clone();
     let app = build_router(state)
         .layer(CompressionLayer::new())
         .layer(CorsLayer::permissive())
-        .layer(TraceLayer::new_for_http());
+        .layer(TraceLayer::new_for_http().make_span_with(request_span));
 
     let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await
@@ -296,13 +358,31 @@ async fn main() {
         });
     }
 
-    // Background task: cleanup expired L2 cache entries every 6 hours
+    // Background task: cleanup expired L2 cache entries every 6 hours, and trim the image copies
     {
+        // `state` has gone into the router by now; this is the same data directory
+        let data_dir = sighup_data_dir.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600 * 6));
             loop {
                 interval.tick().await;
                 cache.cleanup_l2_cache().await;
+                let data_dir = data_dir.clone();
+                match tokio::task::spawn_blocking(move || {
+                    sweep_image_cache(
+                        &data_dir.join("cache").join("images"),
+                        IMAGE_CACHE_MAX_BYTES,
+                    )
+                })
+                .await
+                {
+                    Ok(Ok(report)) if report.removed > 0 => {
+                        tracing::info!("image cache sweep: {report:?}")
+                    }
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => tracing::warn!("image cache sweep error: {e}"),
+                    Err(e) => tracing::warn!("image cache sweep task failed: {e}"),
+                }
             }
         });
     }
@@ -311,6 +391,8 @@ async fn main() {
     {
         let config = sighup_config;
         let data_dir = sighup_data_dir;
+        let changes = sighup_changes;
+        let watcher = sighup_watcher;
         tokio::spawn(async move {
             #[cfg(unix)]
             {
@@ -323,6 +405,13 @@ async fn main() {
                         let new_config = load_config(&data_dir);
                         let mut cfg = config.write().await;
                         *cfg = new_config;
+                        changes.set_delay(std::time::Duration::from_secs(u64::from(
+                            cfg.library_monitor_delay,
+                        )));
+                        watcher.set_poll_interval(std::time::Duration::from_secs(u64::from(
+                            cfg.library_monitor_poll_interval.max(1),
+                        )));
+                        watcher.libraries_changed();
                         tracing::info!("configuration reloaded");
                     }
                 }
@@ -477,13 +566,34 @@ fn load_or_create_server_id(data_dir: &std::path::Path) -> String {
     id
 }
 
+/// The span of one request: the method, the path without the query string, and the HTTP version.
+/// Query strings carry `api_key` tokens and the OIDC callback's `code` and `state` (AC43).
+fn request_span<B>(request: &axum::http::Request<B>) -> tracing::Span {
+    tracing::debug_span!(
+        "request",
+        method = %request.method(),
+        uri = %request.uri().path(),
+        version = ?request.version(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Removes a test's temp dir when dropped, also when an assertion fails.
+    struct RemoveDir(std::path::PathBuf);
+
+    impl Drop for RemoveDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
     fn server_id_is_generated_once_then_reloaded() {
         let dir = std::env::temp_dir().join(format!("rustyfin_server_id_{}", uuid::Uuid::new_v4()));
+        let _remove = RemoveDir(dir.clone());
         std::fs::create_dir_all(&dir).unwrap();
 
         let first = load_or_create_server_id(&dir);
@@ -501,3 +611,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 }
+
+#[cfg(test)]
+mod request_log_tests;

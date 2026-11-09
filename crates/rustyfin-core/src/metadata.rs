@@ -1,24 +1,26 @@
 use rustyfin_model::image::{ImageType, ItemImage};
 use rustyfin_model::media::{MediaItem, MediaType};
-use plugin_tmdb::PersonPhoto;
 use sqlx::SqlitePool;
 use std::path::Path;
 use uuid::Uuid;
 
 use crate::local_images;
 use crate::nfo_parser;
-use crate::plugin_manager::PluginManager;
+use crate::provider_tmdb::PersonPhoto;
+use crate::tmdb_client::TmdbApi;
 
-/// Refresh metadata for a single item: local images, NFO, then plugin providers.
-///
-/// API keys are no longer passed directly — providers are registered via PluginManager.
+/// Refresh metadata for a single item: local images, NFO, then optionally remote providers
 pub async fn refresh_item_metadata(
     pool: &SqlitePool,
     client: &reqwest::Client,
     item: &MediaItem,
-    plugin_manager: &PluginManager,
+    tmdb: Option<&TmdbApi>,
+    omdb_api_key: Option<&str>,
+    fanart_api_key: Option<&str>,
 ) -> Result<(), String> {
     let media_path = Path::new(&item.path);
+    // Each source fills this copy, so a later source keeps what an earlier one filled
+    let mut working = item.clone();
 
     // 1. Scan for local images and compute blurhash for each
     let mut local_images = local_images::find_local_images(media_path, item.id);
@@ -41,90 +43,103 @@ pub async fn refresh_item_metadata(
     );
 
     // 2. Parse NFO file if present
-    if let Some(nfo_path) = nfo_parser::find_nfo_for_media(media_path)
+    let nfo_path = match item.media_type {
+        MediaType::Series => nfo_parser::find_series_nfo(media_path),
+        _ => nfo_parser::find_nfo_for_media(media_path),
+    };
+    if let Some(nfo_path) = nfo_path
         && let Some(meta) = nfo_parser::parse_nfo(&nfo_path).await
     {
         // Update media item metadata from NFO
-        apply_metadata_to_item(pool, item, &meta).await?;
+        apply_metadata_to_item(pool, &mut working, &meta).await?;
 
         // Batch-store image URLs from NFO, skipping types that already exist
         store_images_batch(pool, item.id, &meta.image_urls, "nfo").await?;
     }
 
-    // 3. Registered MetadataProvider plugins (TMDB, OMDb, Fanart, etc.)
-    let providers = plugin_manager.metadata_providers().await;
-    for provider in &providers {
-        let name = &provider.provider_name;
-        tracing::debug!("querying plugin metadata provider: {}", name);
-
-        // Use cleaned filename for better search results
+    // 3. TMDb provider - use cleaned filename for better search results
+    if let Some(tmdb) = tmdb {
+        // Clean the filename for better TMDB search matching
         let search_name = clean_filename_for_search(&item.path);
 
         let meta = match item.media_type {
-            MediaType::Movie => (provider.search_movie)(client, &search_name, item.production_year).await,
-            MediaType::Series => (provider.search_tv)(client, &search_name).await,
+            MediaType::Movie => {
+                crate::provider_tmdb::search_movie(tmdb, &search_name, item.production_year).await
+            }
+            MediaType::Series => crate::provider_tmdb::search_tv(tmdb, &search_name).await,
             _ => None,
         };
 
-        if let Some(meta) = meta {
-            apply_metadata_to_item(pool, item, &meta).await?;
-            store_images_batch(pool, item.id, &meta.image_urls, name).await?;
-
-            // For TMDB provider, also fetch cast/crew photos
-            if name == "tmdb" {
-                if let Some(tmdb_id) = meta.tmdb_id {
-                    let people = match item.media_type {
-                        MediaType::Movie => {
-                            plugin_tmdb::get_movie_people(client, &get_tmdb_api_key(plugin_manager).await?, tmdb_id).await
-                        }
-                        MediaType::Series | MediaType::Episode => {
-                            let season = item.parent_index_number.unwrap_or(1);
-                            plugin_tmdb::get_tv_people(client, &get_tmdb_api_key(plugin_manager).await?, tmdb_id, season).await
-                        }
-                        _ => Vec::new(),
-                    };
-                    store_people(pool, item.id, &people).await?;
-                }
-            }
+        if !search_name.is_empty() && search_name != item.name {
+            tracing::debug!(
+                "searching TMDB for '{}' (cleaned from '{}')",
+                search_name,
+                item.name
+            );
         }
 
-        // Also fetch images if we have provider IDs
-        let images = (provider.get_images)(client, item.tmdb_id, item.tvdb_id, item.media_type).await;
-        if !images.is_empty() {
-            store_images_batch(pool, item.id, &images, name).await?;
+        if let Some(meta) = meta {
+            apply_metadata_to_item(pool, &mut working, &meta).await?;
+            store_images_batch(pool, item.id, &meta.image_urls, "tmdb").await?;
+
+            // Fetch and store cast/crew photos from TMDb
+            if let Some(tmdb_id) = meta.tmdb_id {
+                let people = match item.media_type {
+                    MediaType::Movie => crate::provider_tmdb::get_movie_people(tmdb, tmdb_id).await,
+                    MediaType::Series | MediaType::Episode => {
+                        let season = item.parent_index_number.unwrap_or(1);
+                        crate::provider_tmdb::get_tv_people(tmdb, tmdb_id, season).await
+                    }
+                    _ => Vec::new(),
+                };
+                store_people(pool, item.id, &people).await?;
+            }
+        }
+    }
+
+    // 4. OMDb provider
+    if let Some(api_key) = omdb_api_key
+        && matches!(item.media_type, MediaType::Movie | MediaType::Series)
+        && let Some(meta) =
+            crate::provider_omdb::search(api_key, &item.name, item.production_year).await
+    {
+        apply_metadata_to_item(pool, &mut working, &meta).await?;
+        store_images_batch(pool, item.id, &meta.image_urls, "omdb").await?;
+    }
+
+    // 5. Fanart.tv provider - enriches images from TMDb/TheTVDB
+    if let Some(api_key) = fanart_api_key {
+        match item.media_type {
+            MediaType::Movie => {
+                if let Some(tmdb_id) = item.tmdb_id {
+                    let images = crate::provider_fanart::get_movie_images(api_key, tmdb_id).await;
+                    if !images.is_empty() {
+                        store_images_batch(pool, item.id, &images, "fanart").await?;
+                    }
+                }
+            }
+            MediaType::Series => {
+                if let Some(tvdb_id) = item.tvdb_id {
+                    let images = crate::provider_fanart::get_tv_show_images(api_key, tvdb_id).await;
+                    if !images.is_empty() {
+                        store_images_batch(pool, item.id, &images, "fanart").await?;
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
     Ok(())
 }
 
-/// Helper to extract the TMDB API key from the registered plugin configuration.
-async fn get_tmdb_api_key(plugin_manager: &PluginManager) -> Result<String, String> {
-    let plugins = plugin_manager.list_plugins().await;
-    for plugin in &plugins {
-        if plugin.id == "tmdb" {
-            let config = plugin_manager
-                .get_configuration(&plugin.id)
-                .await
-                .ok_or("TMDB plugin config not found".to_string())?;
-            return config
-                .values
-                .get("api_key")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-                .ok_or("TMDB API key not found in plugin config".to_string());
-        }
-    }
-    Err("TMDB plugin not found".to_string())
-}
-
 async fn apply_metadata_to_item(
     pool: &SqlitePool,
-    item: &MediaItem,
+    updated: &mut MediaItem,
     meta: &rustyfin_model::metadata::ExternalMetadata,
 ) -> Result<(), String> {
     // Update fields from external metadata
-    let mut updated = item.clone();
+    let before = updated.clone();
     let mut changed = false;
 
     // Update name from TMDB if it looks like a filename (contains dots, underscores, or release tags)
@@ -149,7 +164,7 @@ async fn apply_metadata_to_item(
                 changed = true;
                 tracing::info!(
                     "updated name from filename '{}' to TMDB name '{}'",
-                    item.name,
+                    before.name,
                     tmdb_name
                 );
             }
@@ -275,16 +290,17 @@ async fn apply_metadata_to_item(
     }
 
     if changed {
-        rustyfin_db::repo_media::upsert_media_item(pool, &updated)
+        let written = rustyfin_db::repo_media::save_refresh_changes(pool, &before, updated)
             .await
             .map_err(|e| e.to_string())?;
+        tracing::debug!("metadata refresh wrote columns {:?}", written);
     }
 
     // Store studios from metadata
     if let Some(ref studios) = meta.studios
         && !studios.is_empty()
     {
-        store_studios(pool, item.id, studios).await?;
+        store_studios(pool, updated.id, studios).await?;
     }
 
     Ok(())
@@ -454,6 +470,7 @@ async fn store_images_batch(
                     width: None,
                     height: None,
                     blurhash: None,
+                    stamp: None,
                 });
             }
         }

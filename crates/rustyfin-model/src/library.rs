@@ -27,10 +27,13 @@ pub struct CreateLibraryRequest {
     pub name: String,
     pub content_type: LibraryContentType,
     pub paths: Vec<String>,
+    /// Options to save for the new library; the defaults when absent.
+    #[serde(default)]
+    pub library_options: Option<LibraryOptions>,
 }
 
 /// Library options for per-library metadata and image providers.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct LibraryOptions {
     /// Metadata provider (e.g., "TMDb", "TheMovieDb", "TheOpenMovieDatabase")
@@ -51,6 +54,27 @@ pub struct LibraryOptions {
     /// Enable intro detection
     #[serde(default)]
     pub enable_intro_detection: bool,
+    /// Watch the library folders for changes in real time
+    #[serde(default = "default_true")]
+    pub enable_realtime_monitor: bool,
+}
+
+impl Default for LibraryOptions {
+    fn default() -> Self {
+        Self {
+            metadata_provider: String::new(),
+            image_provider: String::new(),
+            skip_subfolders: false,
+            enable_chapter_extraction: false,
+            enable_trickplay: false,
+            enable_intro_detection: false,
+            enable_realtime_monitor: true,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl LibraryContentType {

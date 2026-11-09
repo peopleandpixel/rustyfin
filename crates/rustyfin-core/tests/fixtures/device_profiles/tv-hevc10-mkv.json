@@ -1,0 +1,70 @@
+{
+  "Name": "TV HEVC10 MKV",
+  "MaxStreamingBitrate": 40000000,
+  "MaxStaticBitrate": 100000000,
+  "MusicStreamingTranscodingBitrate": 192000,
+  "DirectPlayProfiles": [
+    {
+      "Container": "mkv,mp4",
+      "Type": "Video",
+      "VideoCodec": "hevc,h264",
+      "AudioCodec": "aac,ac3,eac3,flac"
+    },
+    {
+      "Container": "mp3,flac,aac",
+      "Type": "Audio"
+    }
+  ],
+  "TranscodingProfiles": [
+    {
+      "Container": "ts",
+      "Type": "Video",
+      "VideoCodec": "hevc,h264",
+      "AudioCodec": "aac,ac3",
+      "Protocol": "hls",
+      "Context": "Streaming",
+      "MaxAudioChannels": "6",
+      "MinSegments": 2,
+      "BreakOnNonKeyFrames": false
+    },
+    {
+      "Container": "mp3",
+      "Type": "Audio",
+      "AudioCodec": "mp3",
+      "Protocol": "http",
+      "Context": "Streaming"
+    }
+  ],
+  "CodecProfiles": [
+    {
+      "Type": "Video",
+      "Codec": "hevc",
+      "Conditions": [
+        { "Condition": "EqualsAny", "Property": "VideoProfile", "Value": "main|main 10", "IsRequired": false },
+        { "Condition": "LessThanEqual", "Property": "VideoBitDepth", "Value": "10", "IsRequired": false },
+        { "Condition": "EqualsAny", "Property": "VideoRangeType", "Value": "SDR|HDR10|HLG", "IsRequired": false }
+      ]
+    },
+    {
+      "Type": "Video",
+      "Codec": "h264",
+      "Conditions": [
+        { "Condition": "EqualsAny", "Property": "VideoProfile", "Value": "high|main|baseline|constrained baseline", "IsRequired": false },
+        { "Condition": "LessThanEqual", "Property": "VideoBitDepth", "Value": "8", "IsRequired": false }
+      ]
+    },
+    {
+      "Type": "VideoAudio",
+      "Codec": "ac3,eac3",
+      "Conditions": [
+        { "Condition": "LessThanEqual", "Property": "AudioChannels", "Value": "6", "IsRequired": false }
+      ]
+    }
+  ],
+  "SubtitleProfiles": [
+    { "Format": "srt", "Method": "Embed" },
+    { "Format": "ass", "Method": "Embed" },
+    { "Format": "pgssub", "Method": "Embed" },
+    { "Format": "vtt", "Method": "External" }
+  ]
+}

@@ -8,15 +8,16 @@ use std::sync::Arc;
 /// Supports L2 SQLite-backed cache for persistence across restarts.
 #[derive(Clone)]
 pub struct ApiCache {
-    /// Library views — change only on scan.
+    /// Library views — change only on scan, library create, and library remove.
     /// Key: "views" (singleton), Value: JSON QueryResult of library views.
     pub library_views: Cache<String, Value>,
 
-    /// Item details — change only on metadata refresh.
-    /// Key: item UUID string, Value: JSON MediaItem.
-    pub item_details: Cache<String, Value>,
+    /// Item details as every user sees them: without any user's watch data (UserData,
+    /// CompletionPercentage), which get_item adds on each request. Movies and episodes are
+    /// not cached. Key: item UUID string, Value: MediaItem.
+    pub item_details: Cache<String, rustyfin_model::media::MediaItem>,
 
-    /// Filter lists — change only on scan.
+    /// Filter lists — change only on scan, library create, and library remove.
     /// Key: library_id UUID string or "all", Value: JSON FiltersResult.
     pub filter_lists: Cache<String, Value>,
 
@@ -60,10 +61,17 @@ impl ApiCache {
         }
     }
 
-    /// Invalidate caches when a library scan completes.
-    pub fn invalidate_on_scan(&self) {
+    /// Invalidate caches that list libraries or their items: call after a scan,
+    /// or after a library is created or removed.
+    pub fn invalidate_library_lists(&self) {
         self.library_views.invalidate("views");
         self.filter_lists.invalidate_all();
+    }
+
+    /// Invalidate caches when a library scan completes.
+    pub fn invalidate_on_scan(&self) {
+        self.invalidate_library_lists();
+        self.item_details.invalidate_all();
     }
 
     /// Invalidate a specific item's cache when metadata is refreshed.
@@ -135,28 +143,6 @@ impl ApiCache {
             }
         }
 
-        // Load item details
-        match sqlx::query_as::<_, (String, String)>(
-            "SELECT cache_key, cache_value FROM api_cache WHERE cache_key LIKE 'item:%'",
-        )
-        .fetch_all(pool)
-        .await
-        {
-            Ok(rows) => {
-                let count = rows.len();
-                for (key, value) in rows {
-                    if let Ok(json) = serde_json::from_str(&value) {
-                        let cache_key = key.strip_prefix("item:").unwrap_or(&key).to_string();
-                        self.item_details.insert(cache_key, json);
-                    }
-                }
-                tracing::info!("Loaded {} item entries from L2 cache", count);
-            }
-            Err(e) => {
-                tracing::warn!("Failed to load L2 item cache: {}", e);
-            }
-        }
-
         // Load search results
         match sqlx::query_as::<_, (String, String)>(
             "SELECT cache_key, cache_value FROM api_cache WHERE cache_key LIKE 'search:%'",
@@ -203,30 +189,6 @@ impl ApiCache {
         .await
         {
             tracing::warn!("Failed to save L2 cache: {}", e);
-        }
-    }
-
-    /// Save item details to L2 cache for persistence across restarts.
-    pub async fn save_item_to_l2(&self, item_id: &str, item: &Value) {
-        let Some(pool) = &self.db else { return };
-        let key = format!("item:{}", item_id);
-        let value = serde_json::to_string(item).unwrap_or_default();
-        // 1 hour TTL
-        let expires_at = chrono::Utc::now()
-            .checked_add_signed(chrono::TimeDelta::seconds(3600))
-            .unwrap()
-            .to_rfc3339();
-
-        if let Err(e) = sqlx::query(
-            "INSERT OR REPLACE INTO api_cache (cache_key, cache_value, expires_at) VALUES (?, ?, ?)",
-        )
-        .bind(&key)
-        .bind(&value)
-        .bind(&expires_at)
-        .execute(pool)
-        .await
-        {
-            tracing::warn!("Failed to save L2 item cache: {}", e);
         }
     }
 
@@ -316,7 +278,7 @@ pub struct ImageCache {
 
 impl ImageCache {
     /// Maximum size of a single cached image (1MB).
-    const MAX_ENTRY_SIZE: usize = 1024 * 1024;
+    pub const MAX_ENTRY_SIZE: usize = 1024 * 1024;
 
     pub fn new() -> Self {
         Self {

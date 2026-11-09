@@ -1,4 +1,4 @@
-use rustyfin_model::library::{Library, LibraryContentType};
+use rustyfin_model::library::{Library, LibraryContentType, LibraryOptions};
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
@@ -61,6 +61,41 @@ pub async fn update_library_paths(
         .bind(id.to_string())
         .execute(pool)
         .await?;
+    Ok(())
+}
+
+/// The options saved for a library, or the defaults when none are saved.
+pub async fn get_library_options(
+    pool: &SqlitePool,
+    id: Uuid,
+) -> Result<LibraryOptions, sqlx::Error> {
+    let value: Option<String> =
+        sqlx::query_scalar("SELECT value FROM configuration WHERE key = ?1")
+            .bind(format!("library_options_{id}"))
+            .fetch_optional(pool)
+            .await?;
+
+    match value {
+        Some(json) => serde_json::from_str(&json).map_err(|e| sqlx::Error::Decode(Box::new(e))),
+        None => Ok(LibraryOptions::default()),
+    }
+}
+
+/// Saves the options of a library, replacing the ones saved before.
+pub async fn set_library_options(
+    pool: &SqlitePool,
+    id: Uuid,
+    options: &LibraryOptions,
+) -> Result<(), sqlx::Error> {
+    let json = serde_json::to_string(options).map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+    sqlx::query(
+        "INSERT INTO configuration (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(format!("library_options_{id}"))
+    .bind(&json)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 

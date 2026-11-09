@@ -1,5 +1,5 @@
 use axum::extract::{ConnectInfo, Path, State};
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{delete, get, post, put};
 use axum::{Extension, Json, Router};
 use chrono::Utc;
@@ -18,6 +18,7 @@ use uuid::Uuid;
 
 use crate::error::ApiError;
 use crate::middleware::resolve_client;
+use crate::oidc::{PASSWORD_RESET_OFF, password_allowed};
 use crate::state::AppState;
 
 pub fn public_routes() -> Router<AppState> {
@@ -153,11 +154,8 @@ async fn create_user(
     Ok(Json(UserDto::new(user, UserFlags::default())))
 }
 
-async fn delete_user(
-    State(state): State<AppState>,
-    Extension(claims): Extension<Claims>,
-    Path(id): Path<Uuid>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+/// Checks the caller may delete user `id`, then deletes the user and their data.
+async fn remove_user(state: &AppState, claims: &Claims, id: Uuid) -> Result<(), ApiError> {
     if !claims.is_admin {
         return Err(ApiError::Forbidden(
             "Administrator access is required.".to_string(),
@@ -179,6 +177,16 @@ async fn delete_user(
         return Err(ApiError::NotFound("user not found".into()));
     }
 
+    Ok(())
+}
+
+/// POST /Users/{id}/Delete - Delete a user (the web client's contract)
+async fn delete_user(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    remove_user(&state, &claims, id).await?;
     Ok(Json(serde_json::json!({})))
 }
 
@@ -194,13 +202,15 @@ async fn change_password(
         return Err(ApiError::Forbidden("User update not allowed.".to_string()));
     }
 
-    // non-admins must verify current password
-    if !claims.is_admin {
-        let user = rustyfin_db::repo_user::get_user_by_id(&state.db, id)
-            .await?
-            .ok_or(ApiError::NotFound("user not found".into()))?;
-
-        let valid = rustyfin_auth::verify_password(&req.current_pw, &user.password_hash)
+    // The current password is required, except when an admin changes someone else's. A user with
+    // no password yet (empty stored hash) may set the first one without it.
+    let user = rustyfin_db::repo_user::get_user_by_id(&state.db, id)
+        .await?
+        .ok_or(ApiError::NotFound("user not found".into()))?;
+    let admin_for_other = claims.is_admin && claims.sub != id;
+    if !admin_for_other && !user.password_hash.is_empty() {
+        let current = req.current_pw.as_deref().unwrap_or("");
+        let valid = rustyfin_auth::verify_password(current, &user.password_hash)
             .await
             .map_err(|e| ApiError::Internal(e.to_string()))?;
         if !valid {
@@ -379,6 +389,19 @@ async fn issue_reset_pin(db: SqlitePool, name: String, pin_path: PathBuf, expire
             return;
         }
     };
+    // While password sign-in is off, only a user the switch allows gets a reset PIN (AC22, AC41).
+    let allowed = match rustyfin_db::repo_oidc::get_settings(&db).await {
+        Ok(config) => password_allowed(&db, &config, &user).await,
+        Err(e) => Err(e),
+    };
+    match allowed {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(e) => {
+            tracing::warn!(error = %e, "reset PIN: could not read the sign-in settings");
+            return;
+        }
+    }
     let pin = match rustyfin_auth::create_reset_pin(&db, user.id, &expires_at).await {
         Ok(Some(pin)) => pin,
         Ok(None) => return,
@@ -432,6 +455,14 @@ async fn reset_password_pin(
         .await?
         .ok_or_else(|| ApiError::NotFound("user not found".to_string()))?;
 
+    // While password sign-in is off, only a user the switch allows may reset a password by PIN
+    // (AC22, AC41). The PIN is already spent here, so its file goes too.
+    let config = rustyfin_db::repo_oidc::get_settings(&state.db).await?;
+    if !password_allowed(&state.db, &config, &user).await? {
+        remove_reset_pin_files(&state.data_dir, &user.name);
+        return Err(ApiError::Forbidden(PASSWORD_RESET_OFF.to_string()));
+    }
+
     let norm = rustyfin_auth::normalize_reset_pin(&req.pin);
     let hash = rustyfin_auth::hash_password(&norm)
         .await
@@ -471,6 +502,13 @@ async fn reset_password(
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?
         .ok_or_else(|| ApiError::BadRequest("invalid or expired PIN".to_string()))?;
+
+    // While password sign-in is off, only a user the switch allows may reset a password
+    // (AC22, AC41).
+    let config = rustyfin_db::repo_oidc::get_settings(&state.db).await?;
+    if !password_allowed(&state.db, &config, &user).await? {
+        return Err(ApiError::Forbidden(PASSWORD_RESET_OFF.to_string()));
+    }
 
     // Hash the new password
     let hash = rustyfin_auth::hash_password(&req.temp_password)
@@ -665,26 +703,14 @@ async fn get_periods(
     Ok(Json(periods))
 }
 
-/// DELETE /Users/{id} - Delete user by ID
+/// DELETE /Users/{id} - Delete user by ID (204, as Jellyfin's UserController.DeleteUser)
 async fn delete_user_by_id(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Extension(claims): Extension<Claims>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    if !claims.is_admin {
-        return Err(ApiError::Forbidden(
-            "Administrator access is required.".to_string(),
-        ));
-    }
-    if rustyfin_db::repo_user::is_owner(&state.db, id).await? {
-        return Err(ApiError::Forbidden(
-            "The server owner cannot be deleted.".into(),
-        ));
-    }
-    rustyfin_db::repo_user::delete_user(&state.db, id)
-        .await
-        .ok();
-    Ok(Json(serde_json::json!({})))
+) -> Result<StatusCode, ApiError> {
+    remove_user(&state, &claims, id).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// GET /Auth/Keys - List API keys
@@ -730,6 +756,7 @@ async fn delete_user_played_item(
     Path(item_id): Path<Uuid>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    crate::routes::playback::require_item(&state, item_id).await?;
     rustyfin_db::repo_playback::mark_unplayed(&state.db, claims.sub, item_id)
         .await
         .ok();
@@ -742,6 +769,7 @@ async fn delete_user_favorite_item(
     Path(item_id): Path<Uuid>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    crate::routes::playback::require_item(&state, item_id).await?;
     rustyfin_db::repo_playback::set_favorite(&state.db, claims.sub, item_id, false)
         .await
         .ok();

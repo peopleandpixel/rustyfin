@@ -12,10 +12,13 @@ mod dynamic_hls;
 mod encoding_manager;
 mod images;
 mod items;
+mod jellyfin_import;
 mod library;
+mod library_monitor;
 mod live_tv;
 mod localization;
 mod media_segments;
+mod oidc;
 mod packages;
 mod persons;
 mod playback;
@@ -38,11 +41,17 @@ pub use startup::{StartupOwner, settle_owner_at_startup};
 
 use axum::Router;
 use axum::middleware as axum_mw;
+use std::sync::Arc;
 
 use crate::middleware::{rate_limit, require_admin, require_auth, require_setup_or_admin};
 use crate::state::AppState;
 
 pub fn build_router(state: AppState) -> Router {
+    // The library monitor's rescans clear this router's caches and send its events.
+    state.task_scheduler.changes().set_runner(Arc::new(
+        library_monitor::LibraryMonitorRunner::for_state(&state),
+    ));
+
     // Open while the server has no users, then administrators only (Jellyfin's FirstTimeSetupOrElevated).
     let setup = Router::new()
         .merge(startup::routes())
@@ -56,6 +65,7 @@ pub fn build_router(state: AppState) -> Router {
     let public = Router::new()
         .merge(system::public_routes())
         .merge(users::public_routes())
+        .merge(oidc::public_routes())
         .merge(quick_connect::public_routes())
         .merge(dlna::routes().route_layer(axum_mw::from_fn_with_state(
             state.clone(),
@@ -72,7 +82,9 @@ pub fn build_router(state: AppState) -> Router {
         .merge(activity::admin_routes())
         .merge(session::admin_routes())
         .merge(users::admin_routes())
+        .merge(oidc::admin_routes())
         .merge(library::admin_routes())
+        .merge(library_monitor::admin_routes())
         .merge(images::admin_routes())
         .merge(items::admin_routes())
         .merge(subtitle::admin_routes())
@@ -87,6 +99,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(backup::routes())
         .merge(devices::routes())
         .merge(dlna_streaming::routes())
+        .merge(jellyfin_import::routes())
         .route_layer(axum_mw::from_fn(require_admin));
 
     let protected = Router::new()
@@ -114,14 +127,18 @@ pub fn build_router(state: AppState) -> Router {
         .merge(dynamic_hls::routes())
         .merge(localization::routes())
         .merge(sync_play::routes())
+        .merge(oidc::protected_routes())
         .merge(admin)
         .layer(axum_mw::from_fn_with_state(state.clone(), require_auth));
 
-    // Rate limit only the endpoints that check a password or PIN. route_layer applies the
-    // limiter to matched routes only, so every other route is unlimited.
+    // Rate limit only the endpoints that check a password or PIN, and Quick Connect's Initiate,
+    // which starts a sign-in. route_layer applies the limiter to matched routes only, so every
+    // other route is unlimited.
     let login = Router::new()
         .merge(auth::routes())
         .merge(users::login_routes())
+        .merge(oidc::login_routes())
+        .merge(quick_connect::login_routes())
         .route_layer(axum_mw::from_fn_with_state(state.clone(), rate_limit));
 
     #[allow(unused_mut)]

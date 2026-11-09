@@ -1,0 +1,58 @@
+{
+  "artist": {
+    "id": 12,
+    "name": "Velvet Static",
+    "disambiguation": "",
+    "path": "/music/Velvet Static",
+    "mbId": "6f1d3a52-9c47-4e08-b3a1-5d7e2c9f0a84",
+    "type": "Group",
+    "overview": "Velvet Static is an American indie rock band formed in Portland, Oregon in 1997, known for layered guitars and analog synthesizers.",
+    "genres": [
+      "Indie Rock",
+      "Dream Pop"
+    ],
+    "images": [
+      {
+        "coverType": "poster",
+        "url": "/MediaCover/12/poster.jpg?lastWrite=639190001234567890",
+        "remoteUrl": "https://imagecache.lidarr.audio/v1/tadb/artist/6f1d3a52-9c47-4e08-b3a1-5d7e2c9f0a84/poster.jpg"
+      },
+      {
+        "coverType": "fanart",
+        "url": "/MediaCover/12/fanart.jpg?lastWrite=639190001237891234",
+        "remoteUrl": "https://imagecache.lidarr.audio/v1/tadb/artist/6f1d3a52-9c47-4e08-b3a1-5d7e2c9f0a84/fanart.jpg"
+      },
+      {
+        "coverType": "logo",
+        "url": "/MediaCover/12/logo.png?lastWrite=639190001239012345",
+        "remoteUrl": "https://imagecache.lidarr.audio/v1/tadb/artist/6f1d3a52-9c47-4e08-b3a1-5d7e2c9f0a84/logo.png"
+      }
+    ],
+    "tags": []
+  },
+  "album": {
+    "id": 31,
+    "mbId": "2b8c4f6a-17d3-4a95-8e60-9c1d5b7a3e42",
+    "title": "Paper Moons",
+    "disambiguation": "",
+    "overview": "",
+    "albumType": "Album",
+    "secondaryAlbumTypes": [],
+    "releaseDate": "2001-03-13T00:00:00Z",
+    "genres": [
+      "Indie Rock",
+      "Dream Pop"
+    ],
+    "images": [
+      {
+        "coverType": "cover",
+        "url": "/MediaCover/Albums/31/cover.jpg?lastWrite=639190001251234567",
+        "remoteUrl": "https://imagecache.lidarr.audio/v1/caa/2b8c4f6a-17d3-4a95-8e60-9c1d5b7a3e42/front.jpg"
+      }
+    ]
+  },
+  "deletedFiles": false,
+  "eventType": "AlbumDelete",
+  "instanceName": "Lidarr",
+  "applicationUrl": "http://lidarr.lan:8686"
+}

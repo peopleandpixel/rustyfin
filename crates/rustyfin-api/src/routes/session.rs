@@ -357,13 +357,26 @@ fn build_capabilities_from_request(req: &SessionCapabilitiesRequest) -> ClientCa
     }
 }
 
-/// Update session capabilities for the given user.
+/// Store the capabilities on the requesting device's sessions when the request's token
+/// names a device. Otherwise store them on the user's most recently active session.
 async fn update_user_capabilities(
     state: &AppState,
     user_id: uuid::Uuid,
+    token: Option<&str>,
     caps: &ClientCapabilities,
 ) -> Result<(), ApiError> {
     let caps_json = serde_json::to_string(caps).map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    if let Some(token) = token
+        && let Some(device_id) = rustyfin_auth::token_device_id(&state.db, token).await?
+    {
+        rustyfin_db::repo_session::update_device_capabilities(
+            &state.db, user_id, &device_id, &caps_json,
+        )
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+        return Ok(());
+    }
 
     let sessions = rustyfin_db::repo_session::get_active_sessions(&state.db).await?;
     for s in &sessions {
@@ -382,10 +395,12 @@ async fn update_user_capabilities(
 async fn session_capabilities(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
+    token: Option<Extension<rustyfin_auth::RequestToken>>,
     Json(req): Json<SessionCapabilitiesRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let caps = build_capabilities_from_request(&req);
-    update_user_capabilities(&state, claims.sub, &caps).await?;
+    let token = token.as_ref().map(|Extension(rt)| rt.0.as_str());
+    update_user_capabilities(&state, claims.sub, token, &caps).await?;
     Ok(Json(serde_json::json!({})))
 }
 
@@ -394,10 +409,12 @@ async fn session_capabilities(
 async fn session_capabilities_full(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
+    token: Option<Extension<rustyfin_auth::RequestToken>>,
     Json(req): Json<SessionCapabilitiesRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let caps = build_capabilities_from_request(&req);
-    update_user_capabilities(&state, claims.sub, &caps).await?;
+    let token = token.as_ref().map(|Extension(rt)| rt.0.as_str());
+    update_user_capabilities(&state, claims.sub, token, &caps).await?;
     Ok(Json(serde_json::json!({})))
 }
 

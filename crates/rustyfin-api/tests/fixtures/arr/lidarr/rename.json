@@ -1,0 +1,68 @@
+{
+  "artist": {
+    "id": 12,
+    "name": "Velvet Static",
+    "disambiguation": "",
+    "path": "/music/Velvet Static",
+    "mbId": "6f1d3a52-9c47-4e08-b3a1-5d7e2c9f0a84",
+    "type": "Group",
+    "overview": "Velvet Static is an American indie rock band formed in Portland, Oregon in 1997, known for layered guitars and analog synthesizers.",
+    "genres": [
+      "Indie Rock",
+      "Dream Pop"
+    ],
+    "images": [
+      {
+        "coverType": "poster",
+        "url": "/MediaCover/12/poster.jpg?lastWrite=639190001234567890",
+        "remoteUrl": "https://imagecache.lidarr.audio/v1/tadb/artist/6f1d3a52-9c47-4e08-b3a1-5d7e2c9f0a84/poster.jpg"
+      },
+      {
+        "coverType": "fanart",
+        "url": "/MediaCover/12/fanart.jpg?lastWrite=639190001237891234",
+        "remoteUrl": "https://imagecache.lidarr.audio/v1/tadb/artist/6f1d3a52-9c47-4e08-b3a1-5d7e2c9f0a84/fanart.jpg"
+      },
+      {
+        "coverType": "logo",
+        "url": "/MediaCover/12/logo.png?lastWrite=639190001239012345",
+        "remoteUrl": "https://imagecache.lidarr.audio/v1/tadb/artist/6f1d3a52-9c47-4e08-b3a1-5d7e2c9f0a84/logo.png"
+      }
+    ],
+    "tags": []
+  },
+  "renamedTrackFiles": [
+    {
+      "previousPath": "/music/Velvet Static/Paper Moons (2001)/01 - Opening Night.flac",
+      "id": 211,
+      "path": "/music/Velvet Static/Paper Moons (2001)/Velvet Static - Paper Moons - 01 - Opening Night.flac",
+      "quality": "FLAC",
+      "qualityVersion": 1,
+      "releaseGroup": "ECHOLAB",
+      "size": 33482219,
+      "dateAdded": "2026-11-04T21:02:31.1204837Z"
+    },
+    {
+      "previousPath": "/music/Velvet Static/Paper Moons (2001)/02 - Paper Moons.flac",
+      "id": 212,
+      "path": "/music/Velvet Static/Paper Moons (2001)/Velvet Static - Paper Moons - 02 - Paper Moons.flac",
+      "quality": "FLAC",
+      "qualityVersion": 1,
+      "releaseGroup": "ECHOLAB",
+      "size": 41903764,
+      "dateAdded": "2026-11-04T21:02:33.4417209Z"
+    },
+    {
+      "previousPath": "/music/Velvet Static/Paper Moons (2001)/03 - Static Hearts.flac",
+      "id": 213,
+      "path": "/music/Velvet Static/Paper Moons (2001)/Velvet Static - Paper Moons - 03 - Static Hearts.flac",
+      "quality": "FLAC",
+      "qualityVersion": 1,
+      "releaseGroup": "ECHOLAB",
+      "size": 29187305,
+      "dateAdded": "2026-11-04T21:02:35.9082316Z"
+    }
+  ],
+  "eventType": "Rename",
+  "instanceName": "Lidarr",
+  "applicationUrl": "http://lidarr.lan:8686"
+}

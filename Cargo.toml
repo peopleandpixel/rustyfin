@@ -42,7 +42,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # Database
-sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite", "migrate", "chrono", "uuid"] }
+sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite", "sqlite-deserialize", "migrate", "chrono", "uuid"] }
 
 # Auth
 argon2 = { version = "0.5", features = ["std"] }
@@ -51,6 +51,9 @@ rand = "0.8"
 
 # HTTP client
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# OpenID Connect sign-in (B21)
+openidconnect = "4.1"
 
 # Image processing
 image = "0.25"
@@ -61,6 +64,8 @@ quick-xml = { version = "0.37", features = ["serialize"] }
 
 # Utilities
 uuid = { version = "1", features = ["v4", "serde"] }
+sha1 = "0.10"
+unicode-normalization = "0.1.26"
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

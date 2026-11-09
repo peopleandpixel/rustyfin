@@ -40,7 +40,7 @@ async fn get_item_images(
         .map(|img| ImageInfo {
             image_type: img.image_type,
             image_index: img.image_index,
-            image_tag: format!("{}_{}", img.image_type.as_str(), img.image_index),
+            image_tag: rustyfin_core::image_proxy::image_tag(&img.path, img.stamp),
             path: img.path,
             width: img.width,
             height: img.height,
@@ -82,22 +82,82 @@ async fn serve_image(
     index: i32,
     max_width: Option<u32>,
     max_height: Option<u32>,
+    tagged: bool,
 ) -> Result<Response, ApiError> {
     let image_type = ImageType::from_str(image_type_str)
         .ok_or_else(|| ApiError::BadRequest(format!("unknown image type: {}", image_type_str)))?;
+    // A tag names one version of the picture, so a tagged URL can be kept long. An untagged URL
+    // can change under the same address when the picture is replaced, so it is kept only briefly.
+    let cache_control = if tagged {
+        "public, max-age=86400"
+    } else {
+        "public, max-age=300"
+    };
 
-    let img = rustyfin_db::repo_image::get_image(&state.db_ro, id, &image_type, index)
-        .await?
-        .ok_or_else(|| ApiError::NotFound("image not found".into()))?;
+    let found = rustyfin_db::repo_image::get_image(&state.db_ro, id, &image_type, index).await?;
+    // Imported people keep their images in `person_images`; try those before giving up.
+    let img = match found {
+        Some(img) => img,
+        None => rustyfin_db::repo_image::get_person_image(&state.db_ro, id, &image_type, index)
+            .await?
+            .ok_or_else(|| ApiError::NotFound("image not found".into()))?,
+    };
 
-    // Build cache key for in-memory image cache
+    // A stored size spares the header read, but counts only when both sides are known.
+    let stored_size = match (img.width, img.height) {
+        (Some(w), Some(h)) if w > 0 && h > 0 => Some((w as u32, h as u32)),
+        _ => None,
+    };
+    let rendition = match rustyfin_core::image_proxy::plan_rendition(
+        &img.path,
+        stored_size,
+        max_width,
+        max_height,
+    )
+    .await
+    {
+        Ok(rendition) => rendition,
+        Err(e) => {
+            tracing::warn!(error = %e, path = %img.path, "image could not be read or resized");
+            return Err(ApiError::NotFound(format!("image not found: {}", e)));
+        }
+    };
+
+    // A local original too big for the memory cache is streamed from its file, not held in memory
+    let is_remote = img.path.starts_with("http://") || img.path.starts_with("https://");
+    if rendition == rustyfin_core::image_proxy::Rendition::Original
+        && !is_remote
+        && let Ok(meta) = tokio::fs::metadata(&img.path).await
+        && meta.len() > crate::cache::ImageCache::MAX_ENTRY_SIZE as u64
+    {
+        let file = match tokio::fs::File::open(&img.path).await {
+            Ok(file) => file,
+            Err(e) => {
+                tracing::warn!(error = %e, path = %img.path, "image could not be read or resized");
+                return Err(ApiError::NotFound(format!(
+                    "image not found: failed to read local image: {}",
+                    e
+                )));
+            }
+        };
+        return Ok(Response::builder()
+            .header(header::CONTENT_TYPE, guess_content_type(&img.path, false))
+            .header(header::CACHE_CONTROL, cache_control)
+            .header(header::CONTENT_LENGTH, meta.len().to_string())
+            .body(Body::from_stream(tokio_util::io::ReaderStream::new(file)))
+            .unwrap());
+    }
+
+    // Build cache key for in-memory image cache. The stamp changes with the file, so a replaced
+    // picture is not served from the old one.
+    let stamp = img.stamp.unwrap_or(0);
     let cache_key = format!(
         "{}:{}:{}:{}:{}",
         id,
         image_type_str,
         index,
-        max_width.unwrap_or(0),
-        max_height.unwrap_or(0)
+        stamp,
+        rendition.key()
     );
 
     // Check in-memory cache first
@@ -105,10 +165,10 @@ async fn serve_image(
         cached
     } else {
         let cache_dir = state.data_dir.join("cache").join("images");
-        let bytes = match rustyfin_core::image_proxy::get_or_resize_image(
+        let bytes = match rustyfin_core::image_proxy::render_image(
             &img.path,
-            max_width,
-            max_height,
+            img.stamp,
+            rendition,
             &cache_dir,
             Some(&state.http_client),
         )
@@ -125,11 +185,14 @@ async fn serve_image(
         bytes
     };
 
-    let content_type = guess_content_type(&img.path, max_width.is_some() || max_height.is_some());
+    let content_type = guess_content_type(
+        &img.path,
+        rendition != rustyfin_core::image_proxy::Rendition::Original,
+    );
 
     Ok(Response::builder()
         .header(header::CONTENT_TYPE, content_type)
-        .header(header::CACHE_CONTROL, "public, max-age=86400")
+        .header(header::CACHE_CONTROL, cache_control)
         .body(Body::from(bytes))
         .unwrap())
 }
@@ -147,6 +210,7 @@ async fn get_item_image(
         index,
         query.max_width,
         query.max_height,
+        query.tag.as_deref().is_some_and(|t| !t.is_empty()),
     )
     .await
 }
@@ -163,6 +227,7 @@ async fn get_item_image_indexed(
         image_index,
         query.max_width,
         query.max_height,
+        query.tag.as_deref().is_some_and(|t| !t.is_empty()),
     )
     .await
 }
@@ -194,18 +259,24 @@ async fn upload_item_image(
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
 
+    // The file's stamp and size, so that the new picture has its own tag and copies
+    let (stamp, width, height) = rustyfin_core::local_images::local_image_version(&file_path);
     let img = ItemImage {
         item_id: id,
         image_type,
         image_index: 0,
         path: file_path.to_string_lossy().to_string(),
         provider: "upload".to_string(),
-        width: None,
-        height: None,
+        width,
+        height,
         blurhash: None,
+        stamp,
     };
 
     rustyfin_db::repo_image::upsert_image(&state.db, &img).await?;
+    // Drop the answers and the pictures that name the old one
+    state.cache.invalidate_item(&id.to_string());
+    state.image_cache.invalidate_item(&id.to_string());
 
     Ok(Json(json!({ "status": "ok" })))
 }
@@ -218,11 +289,18 @@ async fn refresh_item(
         .await?
         .ok_or_else(|| ApiError::NotFound("item not found".into()))?;
 
+    let config = state.config.read().await;
+    let tmdb = state.tmdb.api(config.tmdb_api_key.as_deref());
+    let omdb_key = config.omdb_api_key.as_deref();
+    let fanart_key = config.fanart_api_key.as_deref();
+
     rustyfin_core::metadata::refresh_item_metadata(
         &state.db,
         &state.http_client,
         &item,
-        &state.plugin_manager,
+        tmdb.as_ref(),
+        omdb_key,
+        fanart_key,
     )
     .await
     .map_err(ApiError::Internal)?;

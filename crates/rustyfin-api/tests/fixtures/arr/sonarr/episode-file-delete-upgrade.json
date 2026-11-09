@@ -1,0 +1,92 @@
+{
+  "series": {
+    "id": 7,
+    "title": "Harbor Lights",
+    "titleSlug": "harbor-lights",
+    "path": "/tv/Harbor Lights (2020)",
+    "tvdbId": 380112,
+    "tvMazeId": 51234,
+    "tmdbId": 112233,
+    "imdbId": "tt11223344",
+    "type": "standard",
+    "year": 2020,
+    "genres": [
+      "Drama",
+      "Mystery"
+    ],
+    "images": [
+      {
+        "coverType": "banner",
+        "url": "/MediaCover/7/banner.jpg?lastWrite=639274106071234567",
+        "remoteUrl": "https://artworks.thetvdb.com/banners/v4/series/380112/banners/5f8c2a1b3d4e5.jpg"
+      },
+      {
+        "coverType": "poster",
+        "url": "/MediaCover/7/poster.jpg?lastWrite=639274106072345678",
+        "remoteUrl": "https://artworks.thetvdb.com/banners/v4/series/380112/posters/5f8c2a1b3d4f6.jpg"
+      },
+      {
+        "coverType": "fanart",
+        "url": "/MediaCover/7/fanart.jpg?lastWrite=639274106073456789",
+        "remoteUrl": "https://artworks.thetvdb.com/banners/v4/series/380112/backgrounds/5f8c2a1b3d507.jpg"
+      },
+      {
+        "coverType": "clearlogo",
+        "url": "/MediaCover/7/clearlogo.png?lastWrite=639274106074567890",
+        "remoteUrl": "https://artworks.thetvdb.com/banners/v4/series/380112/clearlogo/5f8c2a1b3d618.png"
+      }
+    ],
+    "tags": [],
+    "originalLanguage": {
+      "id": 1,
+      "name": "English"
+    }
+  },
+  "episodes": [
+    {
+      "id": 1204,
+      "episodeNumber": 3,
+      "seasonNumber": 1,
+      "title": "The Tide Turns",
+      "overview": "A storm cuts the harbor off from the mainland, and the lighthouse keeper's logbook goes missing.",
+      "airDate": "2020-10-18",
+      "airDateUtc": "2020-10-19T01:00:00Z",
+      "seriesId": 7,
+      "tvdbId": 7788903
+    }
+  ],
+  "episodeFile": {
+    "id": 97,
+    "relativePath": "Season 01/Harbor Lights (2020) - S01E03 - The Tide Turns [HDTV-720p][AAC 2.0][x264]-LANTERN.mkv",
+    "path": "/tv/Harbor Lights (2020)/Season 01/Harbor Lights (2020) - S01E03 - The Tide Turns [HDTV-720p][AAC 2.0][x264]-LANTERN.mkv",
+    "quality": "HDTV-720p",
+    "qualityVersion": 1,
+    "releaseGroup": "LANTERN",
+    "sceneName": "Harbor.Lights.S01E03.The.Tide.Turns.720p.HDTV.x264-LANTERN",
+    "size": 912261120,
+    "dateAdded": "2026-10-21T02:41:55.2209871Z",
+    "languages": [
+      {
+        "id": 1,
+        "name": "English"
+      }
+    ],
+    "mediaInfo": {
+      "audioChannels": 2.0,
+      "audioCodec": "AAC",
+      "audioLanguages": [
+        "eng"
+      ],
+      "height": 720,
+      "width": 1280,
+      "subtitles": [],
+      "videoCodec": "x264",
+      "videoDynamicRange": "",
+      "videoDynamicRangeType": ""
+    }
+  },
+  "deleteReason": "upgrade",
+  "eventType": "EpisodeFileDelete",
+  "instanceName": "Sonarr",
+  "applicationUrl": "http://sonarr.lan:8989"
+}

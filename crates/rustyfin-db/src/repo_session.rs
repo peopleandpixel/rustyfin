@@ -292,6 +292,27 @@ pub async fn update_session_capabilities(
     Ok(())
 }
 
+/// Update the capabilities of every session that `user_id` has on `device_id`.
+///
+/// Sessions on the user's other devices are left alone. Returns the number of
+/// sessions changed, which is zero when the device has no session.
+pub async fn update_device_capabilities(
+    pool: &SqlitePool,
+    user_id: Uuid,
+    device_id: &str,
+    capabilities: &str,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE sessions SET capabilities = ?1, last_activity = datetime('now') WHERE user_id = ?2 AND device_id = ?3",
+    )
+    .bind(capabilities)
+    .bind(user_id.to_string())
+    .bind(device_id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
 /// Get the capabilities JSON for a session.
 pub async fn get_session_capabilities(
     pool: &SqlitePool,
@@ -301,6 +322,25 @@ pub async fn get_session_capabilities(
         .bind(session_id)
         .fetch_optional(pool)
         .await?;
+    Ok(row.map(|r| r.0))
+}
+
+/// The capabilities JSON of the most recently active session of `user_id` on `device_id`, skipping
+/// sessions whose capabilities are empty or `{}`.
+pub async fn get_device_capabilities(
+    pool: &SqlitePool,
+    user_id: Uuid,
+    device_id: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT capabilities FROM sessions \
+         WHERE user_id = ?1 AND device_id = ?2 AND capabilities NOT IN ('', '{}') \
+         ORDER BY last_activity DESC, rowid DESC LIMIT 1",
+    )
+    .bind(user_id.to_string())
+    .bind(device_id)
+    .fetch_optional(pool)
+    .await?;
     Ok(row.map(|r| r.0))
 }
 
