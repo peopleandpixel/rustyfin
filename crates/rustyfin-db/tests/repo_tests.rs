@@ -2253,6 +2253,7 @@ async fn b34_refresh_like_the_scan(pool: &SqlitePool, id: Uuid, n: usize) -> Res
         width: None,
         height: None,
         blurhash: None,
+        stamp: None,
     };
     rustyfin_db::repo_image::batch_upsert_images(pool, &[poster])
         .await

@@ -2975,8 +2975,9 @@ pub async fn get_album_for_audio(
     }
 }
 
-/// A person credited on an item: (person_id, person_name, role, type, has a primary image).
-pub type PersonRow = (String, String, Option<String>, String, bool);
+/// A person credited on an item: (person_id, person_name, role, type, path of the primary
+/// image at index 0, if any).
+pub type PersonRow = (String, String, Option<String>, String, Option<String>);
 
 /// Get artists (people) for an audio item, in credit order.
 pub async fn get_artists_for_audio(
@@ -2985,7 +2986,7 @@ pub async fn get_artists_for_audio(
 ) -> Result<Vec<PersonRow>, sqlx::Error> {
     let iid = item_id.to_string();
     sqlx::query_as::<_, PersonRow>(
-        "SELECT p.id, p.name, ip.role, ip.type, EXISTS(SELECT 1 FROM person_images pi WHERE pi.person_id = p.id AND pi.image_type = 'Primary' AND pi.image_index = 0) FROM item_people ip JOIN people p ON p.id = ip.person_id WHERE ip.item_id = ? ORDER BY ip.sort_order IS NULL, ip.sort_order, ip.rowid",
+        "SELECT p.id, p.name, ip.role, ip.type, (SELECT pi.path FROM person_images pi WHERE pi.person_id = p.id AND pi.image_type = 'Primary' AND pi.image_index = 0) FROM item_people ip JOIN people p ON p.id = ip.person_id WHERE ip.item_id = ? ORDER BY ip.sort_order IS NULL, ip.sort_order, ip.rowid",
     )
     .bind(&iid)
     .fetch_all(pool)

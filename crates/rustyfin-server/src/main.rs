@@ -16,6 +16,7 @@ use rustyfin_api::log_stream::LogStreamLayer;
 use rustyfin_api::middleware::{DEFAULT_LOGIN_LIMIT, DEFAULT_LOGIN_WINDOW_SECS, RateLimiter};
 use rustyfin_api::routes::build_router;
 use rustyfin_api::state::AppState;
+use rustyfin_core::image_proxy::{IMAGE_CACHE_MAX_BYTES, sweep_image_cache};
 use rustyfin_model::server_info::ServerConfiguration;
 
 #[tokio::main]
@@ -241,6 +242,16 @@ async fn main() {
         jellyfin_import: Default::default(),
     };
 
+    // A scheduled library scan clears the same caches as a scan from the API or the monitor.
+    {
+        let cache = state.cache.clone();
+        let image_cache = state.image_cache.clone();
+        task_scheduler.set_on_scan(move || {
+            cache.invalidate_on_scan();
+            image_cache.invalidate_all();
+        });
+    }
+
     // Background task: scheduled tasks (library scan, metadata refresh, cache cleanup)
     {
         let shutdown_rx = state.shutdown_tx.subscribe();
@@ -347,13 +358,31 @@ async fn main() {
         });
     }
 
-    // Background task: cleanup expired L2 cache entries every 6 hours
+    // Background task: cleanup expired L2 cache entries every 6 hours, and trim the image copies
     {
+        // `state` has gone into the router by now; this is the same data directory
+        let data_dir = sighup_data_dir.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600 * 6));
             loop {
                 interval.tick().await;
                 cache.cleanup_l2_cache().await;
+                let data_dir = data_dir.clone();
+                match tokio::task::spawn_blocking(move || {
+                    sweep_image_cache(
+                        &data_dir.join("cache").join("images"),
+                        IMAGE_CACHE_MAX_BYTES,
+                    )
+                })
+                .await
+                {
+                    Ok(Ok(report)) if report.removed > 0 => {
+                        tracing::info!("image cache sweep: {report:?}")
+                    }
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => tracing::warn!("image cache sweep error: {e}"),
+                    Err(e) => tracing::warn!("image cache sweep task failed: {e}"),
+                }
             }
         });
     }

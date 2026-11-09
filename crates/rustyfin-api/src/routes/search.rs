@@ -351,7 +351,7 @@ fn music_album(ancestors: &[HintAncestor], level: usize) -> Option<&HintAncestor
 
 /// The tag of an image: its type and its index, as Jellyfin's image tags are formed.
 fn image_tag(image: &ItemImage) -> String {
-    format!("{}_{}", image.image_type.as_str(), image.image_index)
+    rustyfin_core::image_proxy::image_tag(&image.path, image.stamp)
 }
 
 /// The width over the height of an image, when both are known and above zero.

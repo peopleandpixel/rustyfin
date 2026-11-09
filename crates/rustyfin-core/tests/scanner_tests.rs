@@ -3869,6 +3869,37 @@ async fn b17_scheduler_scan_reports_progress_until_its_probes_finish() {
     }
 }
 
+// B30: a scheduled scan tells the server, so that it can drop what it cached from before.
+#[tokio::test]
+async fn b30_f8_a_scheduled_scan_calls_back_once_it_ends() {
+    let fx = Fixture::new().await;
+    let lib = fx.library("B30 Film", LibraryContentType::Movies).await;
+    let root = root_of(&lib);
+    touch(&root, "B30 Movie (2000)/B30 Movie (2000).mkv");
+    let sched = TaskScheduler::new(fx.pool.clone(), Arc::new(fx.dir.clone()));
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (done, mut ended) = tokio::sync::mpsc::unbounded_channel();
+    let counted = calls.clone();
+    sched.set_on_scan(move || {
+        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let _ = done.send(());
+    });
+
+    assert!(sched.start_task(TASK_LIBRARY_SCAN).await);
+    tokio::time::timeout(Duration::from_secs(60), ended.recv())
+        .await
+        .expect("no call back within 60 s of the scheduled scan");
+    // Once per run, after every library is scanned.
+    let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM media_items WHERE library_id = ?")
+        .bind(lib.id.to_string())
+        .fetch_one(&fx.pool)
+        .await
+        .unwrap();
+    assert!(stored > 0, "called back before the scan stored anything");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
 // B18: a library's scans are runs. A scan queued while a run of the library waits joins that run,
 // and one of the run's tickets claims it, so that only one caller scans; a scan queued while the
 // run is going makes a new run. The registry and its updates follow the library's oldest run.

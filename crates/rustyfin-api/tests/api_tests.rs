@@ -1381,6 +1381,7 @@ async fn test_remote_browsing_burst_is_not_rate_limited() {
         width: None,
         height: None,
         blurhash: None,
+        stamp: None,
     };
     rustyfin_db::repo_image::upsert_image(&state.db, &img)
         .await
@@ -1623,6 +1624,7 @@ async fn test_item_image_missing_file_returns_404_not_500() {
         width: None,
         height: None,
         blurhash: None,
+        stamp: None,
     };
     rustyfin_db::repo_image::upsert_image(&state.db, &img)
         .await
@@ -2946,6 +2948,770 @@ async fn b27_a_repeated_search_gets_the_first_answer_again() {
     assert_eq!(b27_answer(&app_after, movie, &token).await, first_movie);
 }
 
+// ── B30: image and search bounds ──
+
+/// A `width`x`height` JPEG of one colour.
+fn b30_jpeg(width: u32, height: u32, rgb: [u8; 3]) -> Vec<u8> {
+    let mut out = std::io::Cursor::new(Vec::new());
+    image::RgbImage::from_pixel(width, height, image::Rgb(rgb))
+        .write_to(&mut out, image::ImageFormat::Jpeg)
+        .unwrap();
+    out.into_inner()
+}
+
+/// A `width`x`height` PNG of one colour.
+fn b30_png(width: u32, height: u32, rgb: [u8; 3]) -> Vec<u8> {
+    let mut out = std::io::Cursor::new(Vec::new());
+    image::RgbImage::from_pixel(width, height, image::Rgb(rgb))
+        .write_to(&mut out, image::ImageFormat::Png)
+        .unwrap();
+    out.into_inner()
+}
+
+/// The size of a picture and its colour: "red", "blue", or the mean colour when neither.
+fn b30_picture(bytes: &[u8]) -> ((u32, u32), String) {
+    let img = image::load_from_memory(bytes).unwrap().to_rgb8();
+    let mut sum = [0u64; 3];
+    for pixel in img.pixels() {
+        for (total, channel) in sum.iter_mut().zip(pixel.0) {
+            *total += u64::from(channel);
+        }
+    }
+    let pixels = u64::from(img.width()) * u64::from(img.height());
+    let [r, g, b] = sum.map(|total| total / pixels);
+    let colour = match (r, g, b) {
+        (200.., ..60, ..60) => "red".to_string(),
+        (..60, ..60, 200..) => "blue".to_string(),
+        _ => format!("{r},{g},{b}"),
+    };
+    (img.dimensions(), colour)
+}
+
+/// Sends a GET and returns the status, the content type and the body.
+async fn b30_get(app: &axum::Router, uri: &str, token: &str) -> (StatusCode, String, Vec<u8>) {
+    let request = Request::builder()
+        .uri(uri)
+        .header("Authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(request).await.unwrap();
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .map(|value| value.to_str().unwrap().to_string())
+        .unwrap_or_default();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, content_type, bytes.to_vec())
+}
+
+/// Uploads `bytes` as the item's Primary image.
+async fn b30_upload(app: &axum::Router, token: &str, id: uuid::Uuid, bytes: &[u8]) {
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("/Items/{id}/Images/Primary"))
+        .header("Authorization", format!("Bearer {token}"))
+        .body(Body::from(bytes.to_vec()))
+        .unwrap();
+    let resp = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+/// Adds a photo library holding one Photo item, with no image yet, and returns the item's id.
+async fn b30_photo(state: &AppState) -> uuid::Uuid {
+    let folder = media_folder(state, "b30 photos");
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: "B30 Photos".to_string(),
+        content_type: rustyfin_model::library::LibraryContentType::Photos,
+        paths: vec![folder.clone()],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    let id = uuid::Uuid::new_v4();
+    let path = std::path::Path::new(&folder).join("B30 Photo.jpg");
+    sqlx::query(
+        "INSERT INTO media_items (id, library_id, name, media_type, path) VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(id.to_string())
+    .bind(lib.id.to_string())
+    .bind("B30 Photo")
+    .bind("Photo")
+    .bind(path.to_string_lossy().to_string())
+    .execute(&state.db)
+    .await
+    .unwrap();
+    id
+}
+
+/// The names of the files in the folder of resized copies, sorted; none when it is missing.
+fn b30_copies(state: &AppState) -> Vec<String> {
+    let dir = state.data_dir.join("cache").join("images");
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+#[tokio::test]
+async fn b30_f3_a_tiff_comes_back_as_a_jpeg() {
+    use rustyfin_model::image::ImageType::Primary;
+
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let id = b30_photo(&state).await;
+    let tiff = state.data_dir.join("b30-poster.tiff");
+    image::RgbImage::from_pixel(60, 90, image::Rgb([255, 0, 0]))
+        .save(&tiff)
+        .unwrap();
+    b30_set_image(&state, id, Primary, &tiff.to_string_lossy(), Some(1)).await;
+    let app = app(state);
+
+    // At its own size, above it, and with no bounds.
+    for bounds in ["maxWidth=60", "maxWidth=1000&maxHeight=1000", ""] {
+        let uri = format!("/Items/{id}/Images/Primary?{bounds}");
+        let (status, content_type, bytes) = b30_get(&app, &uri, &token).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert_eq!(content_type, "image/jpeg", "{uri}");
+        assert!(bytes.starts_with(&[0xFF, 0xD8]), "{uri}: not a JPEG");
+        assert_eq!(b30_picture(&bytes), ((60, 90), "red".to_string()), "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn b30_f5_a_large_original_comes_back_whole() {
+    use rustyfin_model::image::ImageType::Primary;
+
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let id = b30_photo(&state).await;
+    // Noise, so that the PNG is over the 1 MiB that the memory cache holds.
+    let mut seed = 0x2545_f491_u32;
+    let noise = image::RgbImage::from_fn(700, 700, |_, _| {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        let [r, g, b, _] = seed.to_le_bytes();
+        image::Rgb([r, g, b])
+    });
+    let path = state.data_dir.join("b30-noise.png");
+    noise.save(&path).unwrap();
+    let original = std::fs::read(&path).unwrap();
+    assert!(original.len() > 1024 * 1024, "{}", original.len());
+    b30_set_image(&state, id, Primary, &path.to_string_lossy(), Some(1)).await;
+    let app = app(state);
+
+    for bounds in ["", "maxWidth=700"] {
+        let uri = format!("/Items/{id}/Images/Primary?{bounds}");
+        let (status, content_type, bytes) = b30_get(&app, &uri, &token).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert_eq!(content_type, "image/png", "{uri}");
+        assert!(bytes == original, "{uri}: not the original's bytes");
+    }
+}
+
+#[tokio::test]
+async fn b30_p1_bounds_at_or_above_the_source_return_the_original() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let id = b30_photo(&state).await;
+    let app = app(state.clone());
+    let png = b30_png(16, 24, [0, 160, 0]);
+    b30_upload(&app, &token, id, &png).await;
+
+    for bounds in [
+        "maxWidth=64",
+        "maxHeight=100",
+        "maxWidth=64&maxHeight=100",
+        "maxWidth=16",
+        "maxWidth=16&maxHeight=24",
+    ] {
+        let uri = format!("/Items/{id}/Images/Primary?{bounds}");
+        let (status, content_type, bytes) = b30_get(&app, &uri, &token).await;
+        assert_eq!(status, StatusCode::OK, "{bounds}");
+        assert_eq!(content_type, "image/png", "{bounds}");
+        assert!(bytes == png, "{bounds}: not the uploaded file's own bytes");
+    }
+    assert_eq!(b30_copies(&state), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn b30_p1_bounds_that_give_one_size_share_one_copy() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let id = b30_photo(&state).await;
+    let app = app(state.clone());
+    b30_upload(&app, &token, id, &b30_jpeg(64, 96, [255, 0, 0])).await;
+
+    let mut answers = Vec::new();
+    for bounds in ["maxWidth=32", "maxHeight=48", "maxWidth=32&maxHeight=48"] {
+        let uri = format!("/Items/{id}/Images/Primary?{bounds}");
+        let (status, content_type, bytes) = b30_get(&app, &uri, &token).await;
+        assert_eq!(status, StatusCode::OK, "{bounds}");
+        assert_eq!(content_type, "image/jpeg", "{bounds}");
+        assert_eq!(
+            b30_picture(&bytes),
+            ((32, 48), "red".to_string()),
+            "{bounds}"
+        );
+        answers.push(bytes);
+    }
+    assert!(
+        answers.iter().all(|bytes| *bytes == answers[0]),
+        "the three answers differ"
+    );
+    let copies = b30_copies(&state);
+    assert_eq!(copies.len(), 1, "{copies:?}");
+}
+
+/// The item's Primary image at `bounds` (a query string), which must be served.
+async fn b30_image(app: &axum::Router, token: &str, id: uuid::Uuid, bounds: &str) -> Vec<u8> {
+    let uri = format!("/Items/{id}/Images/Primary?{bounds}");
+    let (status, _, bytes) = b30_get(app, &uri, token).await;
+    assert_eq!(status, StatusCode::OK, "{uri}");
+    bytes
+}
+
+/// The item's Primary image tag in its details, which the list of `item_type` items and the
+/// item's image list must give too.
+async fn b30_primary_tag(
+    app: &axum::Router,
+    token: &str,
+    id: uuid::Uuid,
+    item_type: &str,
+) -> String {
+    let (status, details) = send_authed(app, "GET", &format!("/Items/{id}"), token, None).await;
+    assert_eq!(status, StatusCode::OK, "{details}");
+    let tag = details["ImageTags"]["Primary"].clone();
+    let uri = format!("/Items?IncludeItemTypes={item_type}&Recursive=true");
+    let (status, list) = send_authed(app, "GET", &uri, token, None).await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let listed = list["Items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no Items in {list}"))
+        .iter()
+        .find(|item| item["Id"] == id.to_string())
+        .unwrap_or_else(|| panic!("{id} is not in {list}"));
+    assert_eq!(
+        listed["ImageTags"]["Primary"], tag,
+        "the list and the details differ"
+    );
+    let uri = format!("/Items/{id}/Images");
+    let (status, images) = send_authed(app, "GET", &uri, token, None).await;
+    assert_eq!(status, StatusCode::OK, "{images}");
+    let primary = images
+        .as_array()
+        .unwrap_or_else(|| panic!("no image list: {images}"))
+        .iter()
+        .find(|image| image["ImageType"] == "Primary")
+        .unwrap_or_else(|| panic!("no Primary in {images}"));
+    assert_eq!(
+        primary["ImageTag"], tag,
+        "the image list and the details differ"
+    );
+    tag.as_str()
+        .unwrap_or_else(|| panic!("no Primary tag in {details}"))
+        .to_string()
+}
+
+/// Whether `tag` is 32 lower-case hex digits.
+fn b30_is_tag(tag: &str) -> bool {
+    tag.len() == 32 && tag.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// The id of the one `item_type` item in the item list.
+async fn b30_only(app: &axum::Router, token: &str, item_type: &str) -> uuid::Uuid {
+    let uri = format!("/Items?IncludeItemTypes={item_type}&Recursive=true");
+    let (status, list) = send_authed(app, "GET", &uri, token, None).await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let items = list["Items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no Items in {list}"));
+    assert_eq!(items.len(), 1, "{list}");
+    items[0]["Id"].as_str().unwrap().parse().unwrap()
+}
+
+#[tokio::test]
+async fn b30_p2_an_upload_changes_the_picture_and_every_tag() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let id = b30_photo(&state).await;
+    let app = app(state);
+    let red = b30_jpeg(64, 96, [255, 0, 0]);
+    let blue = b30_jpeg(48, 72, [0, 0, 255]);
+    // Their lengths differ too, so their stamps differ even within one tick of the clock.
+    assert_ne!(red.len(), blue.len());
+
+    b30_upload(&app, &token, id, &red).await;
+    let before = b30_primary_tag(&app, &token, id, "Photo").await;
+    let small = b30_image(&app, &token, id, "maxWidth=32").await;
+    assert_eq!(b30_picture(&small), ((32, 48), "red".to_string()));
+    assert!(
+        b30_image(&app, &token, id, "").await == red,
+        "not the upload"
+    );
+
+    b30_upload(&app, &token, id, &blue).await;
+    let small = b30_image(&app, &token, id, "maxWidth=32").await;
+    assert_eq!(
+        b30_picture(&small),
+        ((32, 48), "blue".to_string()),
+        "the old picture's copy came back"
+    );
+    assert!(
+        b30_image(&app, &token, id, "").await == blue,
+        "not the new upload"
+    );
+    let after = b30_primary_tag(&app, &token, id, "Photo").await;
+    assert!(
+        b30_is_tag(&before) && b30_is_tag(&after),
+        "{before}, {after}"
+    );
+    assert_ne!(after, before, "the tag did not change with the picture");
+}
+
+/// Sends a GET and returns the status, the `Cache-Control` header and the body.
+async fn b30_get_cached(
+    app: &axum::Router,
+    uri: &str,
+    token: &str,
+) -> (StatusCode, String, Vec<u8>) {
+    let request = Request::builder()
+        .uri(uri)
+        .header("Authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(request).await.unwrap();
+    let status = resp.status();
+    let cache_control = resp
+        .headers()
+        .get("cache-control")
+        .map(|value| value.to_str().unwrap().to_string())
+        .unwrap_or_default();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, cache_control, bytes.to_vec())
+}
+
+#[tokio::test]
+async fn b30_f6_only_a_tagged_request_is_cached_for_long() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let id = b30_photo(&state).await;
+    let app = app(state);
+    b30_upload(&app, &token, id, &b30_jpeg(64, 96, [255, 0, 0])).await;
+    let tag = b30_primary_tag(&app, &token, id, "Photo").await;
+
+    for bounds in ["", "maxWidth=32&"] {
+        let uri = format!("/Items/{id}/Images/Primary?{bounds}tag={tag}");
+        let (status, cache_control, _) = b30_get_cached(&app, &uri, &token).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert_eq!(cache_control, "public, max-age=86400", "{uri}");
+        // Without the tag, the answer may not be kept long: the picture can change under its URL.
+        let uri = format!("/Items/{id}/Images/Primary?{bounds}");
+        let (status, cache_control, _) = b30_get_cached(&app, &uri, &token).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert_eq!(cache_control, "public, max-age=300", "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn b30_p2_a_rescan_finds_a_poster_replaced_in_place() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let lib = create_library_via_api(&app, &state, &token, "B30 Shows", "TvShows").await;
+    let show = std::path::Path::new(&media_folder(&state, "b30 shows")).join("B30 Show");
+    std::fs::create_dir_all(show.join("Season 1")).unwrap();
+    std::fs::write(show.join("Season 1").join("B30 Show - S01E01.mkv"), b"").unwrap();
+    let poster = show.join("poster.jpg");
+    std::fs::write(&poster, b30_jpeg(64, 96, [255, 0, 0])).unwrap();
+    let refresh = format!("/Library/VirtualFolders/{lib}/Refresh");
+    let (status, body) = send_authed(&app, "POST", &refresh, &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    rustyfin_core::scanner::wait_for_idle().await;
+    let series = b30_only(&app, &token, "Series").await;
+    // This also leaves the series' details in the cache.
+    let before = b30_primary_tag(&app, &token, series, "Series").await;
+    let small = b30_image(&app, &token, series, "maxWidth=32").await;
+    assert_eq!(b30_picture(&small), ((32, 48), "red".to_string()));
+
+    // The poster is replaced in place by a smaller one, written later.
+    std::fs::write(&poster, b30_jpeg(48, 72, [0, 0, 255])).unwrap();
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(10);
+    std::fs::File::options()
+        .write(true)
+        .open(&poster)
+        .unwrap()
+        .set_modified(later)
+        .unwrap();
+    let (status, body) = send_authed(&app, "POST", &refresh, &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    rustyfin_core::scanner::wait_for_idle().await;
+
+    let small = b30_image(&app, &token, series, "maxWidth=32").await;
+    assert_eq!(
+        b30_picture(&small),
+        ((32, 48), "blue".to_string()),
+        "the old poster's copy came back"
+    );
+    let after = b30_primary_tag(&app, &token, series, "Series").await;
+    assert!(
+        b30_is_tag(&before) && b30_is_tag(&after),
+        "{before}, {after}"
+    );
+    assert_ne!(after, before, "the tag did not change with the poster");
+    // The season list copies the series' tag. (No path gives an episode the series' tag, on
+    // 3afba21 either: a separate bug.)
+    let uri = "/Items?IncludeItemTypes=Season&Recursive=true";
+    let (status, list) = send_authed(&app, "GET", uri, &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    assert_eq!(
+        list["Items"][0]["SeriesPrimaryImageTag"],
+        after.as_str(),
+        "{list}"
+    );
+}
+
+/// An item's details, as the caller gets them from `/Items/{id}`.
+async fn b30_details(app: &axum::Router, token: &str, id: uuid::Uuid) -> serde_json::Value {
+    let (status, details) = send_authed(app, "GET", &format!("/Items/{id}"), token, None).await;
+    assert_eq!(status, StatusCode::OK, "{details}");
+    details
+}
+
+/// Stores a local image row for `item_id` at `path` with `stamp`.
+async fn b30_set_image(
+    state: &AppState,
+    item_id: uuid::Uuid,
+    image_type: rustyfin_model::image::ImageType,
+    path: &str,
+    stamp: Option<i64>,
+) {
+    let image = rustyfin_model::image::ItemImage {
+        item_id,
+        image_type,
+        image_index: 0,
+        path: path.to_string(),
+        provider: "local".to_string(),
+        width: None,
+        height: None,
+        blurhash: None,
+        stamp,
+    };
+    rustyfin_db::repo_image::upsert_image(&state.db, &image)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn b30_f2_hint_tags_change_with_the_image() {
+    use rustyfin_core::image_proxy::image_tag;
+    use rustyfin_model::image::ImageType::Primary;
+
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    let app = app(state.clone());
+    let path = state.data_dir.join("b30-hint.jpg");
+    let path = path.to_string_lossy();
+
+    // Each search has its own paging, so neither answer comes from the search cache.
+    b30_set_image(&state, lib.movie, Primary, &path, Some(1)).await;
+    let body = b27_answer(&app, "/Search/Hints?searchTerm=comet&Limit=50", &lib.token).await;
+    let first = j6_hint(&body, lib.movie)["PrimaryImageTag"].clone();
+    assert_eq!(first, image_tag(&path, Some(1)), "{body}");
+
+    // The file is replaced: a scan or an upload stores a new stamp.
+    b30_set_image(&state, lib.movie, Primary, &path, Some(2)).await;
+    let body = b27_answer(&app, "/Search/Hints?searchTerm=comet&Limit=49", &lib.token).await;
+    let second = j6_hint(&body, lib.movie)["PrimaryImageTag"].clone();
+    assert_ne!(
+        second, first,
+        "the hint's tag did not change with the image"
+    );
+    let details = b30_details(&app, &lib.token, lib.movie).await;
+    assert_eq!(second, details["ImageTags"]["Primary"], "{details}");
+}
+
+#[tokio::test]
+async fn b30_f14_an_episodes_details_carry_its_series_tags() {
+    use rustyfin_core::image_proxy::image_tag;
+    use rustyfin_model::image::ImageType::{Primary, Thumb};
+
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    let app = app(state.clone());
+    let primary = state.data_dir.join("b30-series-primary.jpg");
+    let primary = primary.to_string_lossy();
+    let thumb = state.data_dir.join("b30-series-thumb.jpg");
+    let thumb = thumb.to_string_lossy();
+    b30_set_image(&state, lib.series, Primary, &primary, Some(5)).await;
+    b30_set_image(&state, lib.series, Thumb, &thumb, Some(6)).await;
+
+    let episode = b30_details(&app, &lib.token, lib.episode).await;
+    assert_eq!(
+        episode["SeriesId"],
+        serde_json::json!(lib.series),
+        "{episode}"
+    );
+    assert_eq!(
+        episode["SeriesPrimaryImageTag"],
+        image_tag(&primary, Some(5)),
+        "{episode}"
+    );
+    assert_eq!(
+        episode["SeriesThumbImageTag"],
+        image_tag(&thumb, Some(6)),
+        "{episode}"
+    );
+    // The episode list gives the same tag.
+    let uri = "/Items?IncludeItemTypes=Episode&Recursive=true";
+    let (status, list) = send_authed(&app, "GET", uri, &lib.token, None).await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let listed = list["Items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no Items in {list}"))
+        .iter()
+        .find(|item| item["Id"] == serde_json::json!(lib.episode))
+        .unwrap_or_else(|| panic!("no episode in {list}"));
+    assert_eq!(
+        listed["SeriesPrimaryImageTag"], episode["SeriesPrimaryImageTag"],
+        "{list}"
+    );
+}
+
+#[tokio::test]
+async fn b30_f15_a_persons_tag_follows_the_image_path() {
+    use rustyfin_core::image_proxy::image_tag;
+
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    let app = app(state.clone());
+    let mut paths = Vec::new();
+    for (n, name) in ["B30 Actor One", "B30 Actor Two"].into_iter().enumerate() {
+        let person = uuid::Uuid::new_v4().to_string();
+        let path = state.data_dir.join(format!("people/jf-Primary-0-{n}.jpg"));
+        let path = path.to_string_lossy().to_string();
+        sqlx::query("INSERT INTO people (id, name, type) VALUES (?, ?, 'Actor')")
+            .bind(&person)
+            .bind(name)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO item_people (item_id, person_id, type) VALUES (?, ?, 'Actor')")
+            .bind(lib.movie.to_string())
+            .bind(&person)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO person_images (person_id, image_type, image_index, path) \
+             VALUES (?, 'Primary', 0, ?)",
+        )
+        .bind(&person)
+        .bind(&path)
+        .execute(&state.db)
+        .await
+        .unwrap();
+        paths.push((name, path));
+    }
+
+    let details = b30_details(&app, &lib.token, lib.movie).await;
+    let uri = "/Items?IncludeItemTypes=Movie&Recursive=true&Fields=People";
+    let (status, list) = send_authed(&app, "GET", uri, &lib.token, None).await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let listed = list["Items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no Items in {list}"))
+        .iter()
+        .find(|item| item["Id"] == serde_json::json!(lib.movie))
+        .unwrap_or_else(|| panic!("no movie in {list}"));
+    for answer in [&details, listed] {
+        for (name, path) in &paths {
+            let person = answer["People"]
+                .as_array()
+                .unwrap_or_else(|| panic!("no People in {answer}"))
+                .iter()
+                .find(|person| person["Name"] == *name)
+                .unwrap_or_else(|| panic!("no {name} in {answer}"));
+            assert_eq!(person["PrimaryImageTag"], image_tag(path, None), "{answer}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn b30_p5_search_rejects_negative_and_oversized_paging() {
+    let state = test_state().await;
+    let (token, _) = b27_seed(&state).await;
+    let app = app(state);
+
+    // Negative values were cast to huge ones: Limit=-1 read as no limit, and StartIndex=-1
+    // overflowed where it met the limit. The 400 names the parameter as J6's `count_param` does.
+    for (query, parameter) in [
+        ("Term=comet&Limit=-1", "Limit"),
+        ("Term=comet&Limit=2147483648", "Limit"),
+        ("Term=comet&Limit=9223372036854775807", "Limit"),
+        ("Term=comet&StartIndex=2147483648", "StartIndex"),
+        ("Term=&Limit=-1", "Limit"),
+        ("Term=&StartIndex=-1", "StartIndex"),
+        ("Term=comet&StartIndex=-1", "StartIndex"),
+    ] {
+        let uri = format!("/Search?{query}");
+        let (status, body) = send_authed(&app, "GET", &uri, &token, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {body}");
+        assert!(body.to_string().contains(parameter), "{uri}: {body}");
+    }
+
+    let uri = "/Search?Term=comet&StartIndex=2147483647&Limit=2147483647";
+    let (status, body) = send_authed(&app, "GET", uri, &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+    assert_eq!(body["Items"], serde_json::json!([]), "{body}");
+    let page = b27_found(&app, "/Search?Term=comet&StartIndex=1&Limit=2", &token).await;
+    assert_eq!(page.len(), 2, "{page:?}");
+}
+
+#[tokio::test]
+async fn b30_p5_items_reads_negative_paging_as_jellyfin_does() {
+    let state = test_state().await;
+    let (token, _) = b27_seed(&state).await;
+    let app = app(state);
+    let uri = "/Items?searchTerm=comet&IncludeItemTypes=Movie,Series&Recursive=true";
+    let (status, all) = send_authed(&app, "GET", uri, &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{all}");
+    assert_eq!(all["Items"].as_array().map(Vec::len), Some(2), "{all}");
+
+    // Jellyfin skips only for a positive StartIndex, so a negative one reads from the start, and
+    // the answer echoes the request's value as Jellyfin's `QueryResult` does.
+    let (status, body) =
+        send_authed(&app, "GET", &format!("{uri}&StartIndex=-1"), &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["StartIndex"], -1, "{body}");
+    assert_eq!(body["Items"], all["Items"]);
+    // A negative Limit is no limit.
+    let (status, body) = send_authed(&app, "GET", &format!("{uri}&Limit=-1"), &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["Items"], all["Items"]);
+    let page = format!("{uri}&StartIndex=1&Limit=1");
+    let (status, body) = send_authed(&app, "GET", &page, &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["StartIndex"], 1, "{body}");
+    assert_eq!(
+        body["Items"],
+        serde_json::json!([all["Items"][1]]),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn b30_f12_similar_reads_a_negative_limit_as_none() {
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    for n in 0..13 {
+        j6_add_item(
+            &state,
+            lib.library,
+            None,
+            &format!("B30 Similar {n}"),
+            "Movie",
+        )
+        .await;
+    }
+    let app = app(state);
+    let count = |body: &serde_json::Value| body["Items"].as_array().map(Vec::len);
+
+    let uri = format!("/Items/{}/Similar", lib.movie);
+    let (status, plain) = send_authed(&app, "GET", &uri, &lib.token, None).await;
+    assert_eq!(status, StatusCode::OK, "{plain}");
+    assert_eq!(count(&plain), Some(12), "the default limit: {plain}");
+    // Limit=-1 was cast to a huge count, so every one of the 13 others came back.
+    let (status, body) =
+        send_authed(&app, "GET", &format!("{uri}?Limit=-1"), &lib.token, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(count(&body), Some(12), "{body}");
+    let (status, body) =
+        send_authed(&app, "GET", &format!("{uri}?Limit=3"), &lib.token, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(count(&body), Some(3), "{body}");
+}
+
+/// Makes the search index again after a test dropped it, as migration 006 made it.
+async fn b30_rebuild_search_index(state: &AppState) {
+    for statement in [
+        "CREATE VIRTUAL TABLE media_items_fts USING fts5(
+            name,
+            overview,
+            genres,
+            content='media_items',
+            content_rowid='rowid'
+        )",
+        "INSERT INTO media_items_fts(media_items_fts) VALUES('rebuild')",
+    ] {
+        sqlx::query(statement).execute(&state.db).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn b30_p6_a_broken_search_index_is_an_error_and_is_not_cached() {
+    let state = test_state().await;
+    let (token, lib) = b27_seed(&state).await;
+    b27_add_item(&state, lib, "Nebula Run", "Movie").await;
+    sqlx::query(
+        "UPDATE media_items SET overview = 'A nebula drifts by.' WHERE name = 'Comet Night'",
+    )
+    .execute(&state.db)
+    .await
+    .unwrap();
+    let app = app(state.clone());
+    let search = "/Search?Term=nebula&IncludeItemTypes=Movie";
+    let hints = "/Search/Hints?SearchTerm=nebula";
+
+    // Without the index, no narrower answer from names alone, and nothing kept.
+    // (No item is written meanwhile: the index's triggers would fail.)
+    sqlx::query("DROP TABLE media_items_fts")
+        .execute(&state.db)
+        .await
+        .unwrap();
+    for uri in [search, hints] {
+        let (status, body) = send_authed(&app, "GET", uri, &token, None).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{uri}: {body}");
+    }
+    assert_eq!(b27_cached_answers(&state), 0);
+
+    // Once the index is back, its answer: by name and by overview.
+    b30_rebuild_search_index(&state).await;
+    let found = ["Comet Night (Movie)", "Nebula Run (Movie)"];
+    assert_eq!(b27_found(&app, search, &token).await, found);
+    assert_eq!(b27_found(&app, hints, &token).await, found);
+}
+
+#[tokio::test]
+async fn b30_p6_terms_the_index_cannot_parse_still_find_by_name() {
+    let state = test_state().await;
+    let (token, lib) = b27_seed(&state).await;
+    b27_add_item(&state, lib, "Star Trek: Discovery", "Series").await;
+    b27_add_item(&state, lib, "Mr. Robot", "Series").await;
+    let app = app(state);
+
+    // The index reads "Trek:" as a column and rejects "Mr.", so these go by name.
+    for (term, found) in [
+        (
+            "Star%20Trek%3A%20Discovery",
+            "Star Trek: Discovery (Series)",
+        ),
+        ("Mr.%20Robot", "Mr. Robot (Series)"),
+    ] {
+        let search = format!("/Search?Term={term}&IncludeItemTypes=Series");
+        assert_eq!(b27_found(&app, &search, &token).await, [found]);
+        let hints = format!("/Search/Hints?SearchTerm={term}");
+        assert_eq!(b27_found(&app, &hints, &token).await, [found]);
+    }
+}
+
 // ── J6: search parity ──
 
 /// The J6 library and the ids of its items, with an administrator's token and id.
@@ -3156,6 +3922,7 @@ async fn j6_add_image(
         width: size.map(|(width, _)| width),
         height: size.map(|(_, height)| height),
         blurhash: None,
+        stamp: None,
     };
     rustyfin_db::repo_image::upsert_image(&state.db, &image)
         .await
@@ -4172,26 +4939,51 @@ async fn j6_hint_images_follow_jellyfin() {
     let app = app(state);
 
     let body = b27_answer(&app, "/Search/Hints?searchTerm=comet", &lib.token).await;
+    // B30: a hint's tags are the image's own, as the item's details give them.
+    let movie_tags = b30_details(&app, &lib.token, lib.movie).await;
+    let primary = movie_tags["ImageTags"]["Primary"].as_str().unwrap_or("");
+    assert!(b30_is_tag(primary), "{movie_tags}");
+    let series_tags = b30_details(&app, &lib.token, lib.series).await;
     // An item's own images, the lowest index of each type; the aspect ratio of the primary image
     // when its size is known.
     let movie = j6_hint(&body, lib.movie);
-    assert_eq!(movie["PrimaryImageTag"], "Primary_0", "{movie}");
+    assert_eq!(
+        movie["PrimaryImageTag"], movie_tags["ImageTags"]["Primary"],
+        "{movie}"
+    );
     let ratio = movie["PrimaryImageAspectRatio"]
         .as_f64()
         .unwrap_or_else(|| panic!("no PrimaryImageAspectRatio in {movie}"));
     assert!((ratio - 1000.0 / 1500.0).abs() < 1e-9, "{movie}");
-    assert_eq!(movie["ThumbImageTag"], "Thumb_0", "{movie}");
+    assert_eq!(
+        movie["ThumbImageTag"], movie_tags["ImageTags"]["Thumb"],
+        "{movie}"
+    );
     assert_eq!(movie["ThumbImageItemId"], lib.movie.simple().to_string());
-    assert_eq!(movie["BackdropImageTag"], "Backdrop_1", "{movie}");
+    // Backdrops 1 and 2: the hint takes index 1, the details' first.
+    assert_eq!(
+        movie["BackdropImageTag"], movie_tags["BackdropImageTags"][0],
+        "{movie}"
+    );
     assert_eq!(movie["BackdropImageItemId"], lib.movie.simple().to_string());
     // An episode without a thumb takes its series' thumb before its season's, and the backdrop of
     // the nearest parent that has one.
     let episode = j6_hint(&body, lib.episode);
-    assert_eq!(episode["PrimaryImageTag"], "Primary_0", "{episode}");
+    assert_eq!(
+        episode["PrimaryImageTag"],
+        b30_details(&app, &lib.token, lib.episode).await["ImageTags"]["Primary"],
+        "{episode}"
+    );
     j6_assert_absent(episode, &["PrimaryImageAspectRatio"]);
-    assert_eq!(episode["ThumbImageTag"], "Thumb_0", "{episode}");
+    assert_eq!(
+        episode["ThumbImageTag"], series_tags["ImageTags"]["Thumb"],
+        "{episode}"
+    );
     assert_eq!(episode["ThumbImageItemId"], lib.series.simple().to_string());
-    assert_eq!(episode["BackdropImageTag"], "Backdrop_0", "{episode}");
+    assert_eq!(
+        episode["BackdropImageTag"], series_tags["BackdropImageTags"][0],
+        "{episode}"
+    );
     assert_eq!(
         episode["BackdropImageItemId"],
         lib.series.simple().to_string()
@@ -4213,7 +5005,10 @@ async fn j6_hint_images_follow_jellyfin() {
     // A size of zero gives a tag but no aspect ratio. Without a series thumb, an episode takes
     // the thumb of its nearest parent that has one.
     let watch_season_hint = j6_hint(&body, watch_season);
-    assert_eq!(watch_season_hint["PrimaryImageTag"], "Primary_0");
+    assert_eq!(
+        watch_season_hint["PrimaryImageTag"],
+        b30_details(&app, &lib.token, watch_season).await["ImageTags"]["Primary"]
+    );
     j6_assert_absent(watch_season_hint, &["PrimaryImageAspectRatio"]);
     let watch_episode_hint = j6_hint(&body, watch_episode);
     assert_eq!(
@@ -4231,7 +5026,11 @@ async fn j6_hint_images_follow_jellyfin() {
     );
     // A track does not take its album's primary image.
     let album = j6_hint(&body, lib.album);
-    assert_eq!(album["PrimaryImageTag"], "Primary_0", "{album}");
+    assert_eq!(
+        album["PrimaryImageTag"],
+        b30_details(&app, &lib.token, lib.album).await["ImageTags"]["Primary"],
+        "{album}"
+    );
     j6_assert_absent(
         j6_hint(&body, lib.track),
         &[
@@ -27641,11 +28440,21 @@ fn b20_people(item: &serde_json::Value) -> Vec<B20Person> {
 }
 
 /// Alpha's people after an import of the metadata world: in Jellyfin's list order, Ann once (her
-/// first credit), Nora without a kind, and only Ann with a portrait.
-fn b20_alpha_people() -> Vec<B20Person> {
+/// first credit), Nora without a kind, and only Ann with a portrait, tagged by its stored path.
+async fn b20_alpha_people(state: &AppState) -> Vec<B20Person> {
+    let ann = b20_person_id(state, "Ann Actor").await;
+    let path: String = sqlx::query_scalar(
+        "SELECT path FROM person_images \
+         WHERE person_id = ? AND image_type = 'Primary' AND image_index = 0",
+    )
+    .bind(&ann)
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    let tag = rustyfin_core::image_proxy::image_tag(&path, None);
     vec![
         b20_person("Dan Director", "Director", None, None),
-        b20_person("Ann Actor", "Actor", Some("Hero"), Some("Primary_0")),
+        b20_person("Ann Actor", "Actor", Some("Hero"), Some(&tag)),
         b20_person("Nora Nobody", "Unknown", None, None),
     ]
 }
@@ -27852,7 +28661,11 @@ async fn b20_import_metadata_fills_empty_fields() {
         );
 
         let alpha = b20_get_item(&w, m.alpha).await;
-        assert_eq!(b20_people(&alpha), b20_alpha_people(), "{name}");
+        assert_eq!(
+            b20_people(&alpha),
+            b20_alpha_people(&w.state).await,
+            "{name}"
+        );
         assert_eq!(alpha["OriginalTitle"], "Alfa", "{name}");
         assert_eq!(alpha["CriticRating"], 88.0, "{name}");
         assert_eq!(alpha["ProviderIds"]["tmdb"], "111", "{name}");
@@ -28014,7 +28827,7 @@ async fn b20_import_metadata_replaces_with_jellyfins() {
     );
 
     let alpha = b20_get_item(&w, m.alpha).await;
-    assert_eq!(b20_people(&alpha), b20_alpha_people());
+    assert_eq!(b20_people(&alpha), b20_alpha_people(&w.state).await);
     let show = b20_get_item(&w, m.show).await;
     let sam = b20_person("Sam Showrunner", "Creator", None, None);
     assert_eq!(

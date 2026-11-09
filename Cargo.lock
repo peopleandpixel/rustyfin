@@ -3135,6 +3135,7 @@ dependencies = [
  "futures-util",
  "hmac 0.12.1",
  "http-body-util",
+ "image",
  "ipnet",
  "moka",
  "openidconnect",

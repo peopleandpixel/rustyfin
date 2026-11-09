@@ -470,6 +470,7 @@ async fn store_images_batch(
                     width: None,
                     height: None,
                     blurhash: None,
+                    stamp: None,
                 });
             }
         }

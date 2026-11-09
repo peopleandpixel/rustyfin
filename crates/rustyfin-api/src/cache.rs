@@ -71,6 +71,7 @@ impl ApiCache {
     /// Invalidate caches when a library scan completes.
     pub fn invalidate_on_scan(&self) {
         self.invalidate_library_lists();
+        self.item_details.invalidate_all();
     }
 
     /// Invalidate a specific item's cache when metadata is refreshed.
@@ -277,7 +278,7 @@ pub struct ImageCache {
 
 impl ImageCache {
     /// Maximum size of a single cached image (1MB).
-    const MAX_ENTRY_SIZE: usize = 1024 * 1024;
+    pub const MAX_ENTRY_SIZE: usize = 1024 * 1024;
 
     pub fn new() -> Self {
         Self {

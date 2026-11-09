@@ -1,3 +1,4 @@
+use crate::image_proxy::read_image_stamp;
 use rustyfin_model::image::{ItemImage, detect_image_type_from_filename};
 use std::collections::HashMap;
 use std::path::Path;
@@ -54,15 +55,17 @@ fn scan_directory(
             let type_key = image_type.as_str().to_string();
             let index = type_indices.entry(type_key).or_insert(0);
 
+            let (stamp, width, height) = local_image_version(&path);
             images.push(ItemImage {
                 item_id,
                 image_type,
                 image_index: *index,
                 path: path.to_string_lossy().to_string(),
                 provider: "local".to_string(),
-                width: None,
-                height: None,
+                width,
+                height,
                 blurhash: None,
+                stamp,
             });
 
             *index += 1;
@@ -70,6 +73,19 @@ fn scan_directory(
     }
 
     images
+}
+
+/// The stamp, width and height that a local image's row stores, read from its file. They are all
+/// `None` when the file's metadata cannot be read, and the size is `None` when its header cannot.
+pub fn local_image_version(path: &Path) -> (Option<i64>, Option<i32>, Option<i32>) {
+    let Ok(read) = read_image_stamp(path) else {
+        return (None, None, None);
+    };
+    let (width, height) = match read.size {
+        Some((w, h)) => (i32::try_from(w).ok(), i32::try_from(h).ok()),
+        None => (None, None),
+    };
+    (Some(read.stamp), width, height)
 }
 
 /// Check if an image filename matches the media file's stem name.
@@ -188,15 +204,17 @@ fn scan_folder_item_images(
         let index = type_indices
             .entry(image_type.as_str().to_string())
             .or_insert(0);
+        let (stamp, width, height) = local_image_version(&path);
         images.push(ItemImage {
             item_id,
             image_type,
             image_index: *index,
             path: path.to_string_lossy().to_string(),
             provider: "local".to_string(),
-            width: None,
-            height: None,
+            width,
+            height,
             blurhash: None,
+            stamp,
         });
         *index += 1;
     }

@@ -432,11 +432,11 @@ function itemCard(item, options = {}) {
     // Progressive image loading: thumbnail for fast first paint,
     // full-res loaded on hover only to save bandwidth
     const thumbSrc = isBackdrop
-        ? API.imageUrl(id, 'Backdrop', { maxWidth: 150, format: 'webp' })
-        : API.imageUrl(id, 'Primary', { maxWidth: 150, format: 'webp' });
+        ? API.imageUrl(id, 'Backdrop', { maxWidth: 150, format: 'webp', tag: item.BackdropImageTags?.[0] })
+        : API.imageUrl(id, 'Primary', { maxWidth: 150, format: 'webp', tag: item.ImageTags?.Primary });
     const fullSrc = isBackdrop
-        ? API.imageUrl(id, 'Backdrop', { maxWidth: 250 })
-        : API.imageUrl(id, 'Primary', { maxWidth: 250 });
+        ? API.imageUrl(id, 'Backdrop', { maxWidth: 250, tag: item.BackdropImageTags?.[0] })
+        : API.imageUrl(id, 'Primary', { maxWidth: 250, tag: item.ImageTags?.Primary });
 
     const canPlay = ['Movie', 'Episode', 'Audio', 'MusicVideo', 'Video'].includes(type);
     const streamType = type === 'Audio' ? 'Audio' : 'Videos';
@@ -613,7 +613,7 @@ async function renderHome() {
             const spYear = spotlightItem.ProductionYear || spotlightItem.production_year || '';
             const spRating = spotlightItem.CommunityRating || spotlightItem.community_rating;
             const spType = spotlightItem.Type || spotlightItem.type || 'Movie';
-            const spBackdrop = API.imageUrl(spId, 'Backdrop', { maxWidth: 1920 });
+            const spBackdrop = API.imageUrl(spId, 'Backdrop', { maxWidth: 1920, tag: spotlightItem.BackdropImageTags?.[0] });
             const canPlay = ['Movie', 'Episode', 'Audio', 'MusicVideo', 'Video'].includes(spType);
             const streamType = spType === 'Audio' ? 'Audio' : 'Videos';
 
@@ -1326,8 +1326,8 @@ async function renderDetail(itemId) {
         const people = item.People || item.people || [];
         const id = item.Id || item.id;
 
-        const imgSrc = API.imageUrl(id, 'Primary', { maxWidth: 500 });
-        const backdropSrc = API.imageUrl(id, 'Backdrop', { maxWidth: 1920 });
+        const imgSrc = API.imageUrl(id, 'Primary', { maxWidth: 500, tag: item.ImageTags?.Primary });
+        const backdropSrc = API.imageUrl(id, 'Backdrop', { maxWidth: 1920, tag: item.BackdropImageTags?.[0] });
         const canPlay = ['Movie', 'Episode', 'Audio', 'MusicVideo', 'Video'].includes(type);
         const streamType = type === 'Audio' ? 'Audio' : 'Videos';
         const resumeTicks = streamType === 'Videos' ? resumePositionTicks(item) : 0;
@@ -1374,7 +1374,7 @@ async function renderDetail(itemId) {
                             const epDesc = ep.Overview || ep.overview || '';
                             const epDur = formatRuntime(ep.RunTimeTicks || ep.run_time_ticks);
                             const epPlayed = ep.UserData?.Played || ep.user_data?.played || false;
-                            const epThumb = API.imageUrl(epId, 'Primary', { maxWidth: 400 });
+                            const epThumb = API.imageUrl(epId, 'Primary', { maxWidth: 400, tag: ep.ImageTags?.Primary });
 
                             return `
                             <div class="jf-episode-card group" data-action="play" data-id="${escapeHtml(epId)}" data-stream-type="Videos" data-title="${escapeHtml(epRawName || t('detail.episode'))}">
@@ -1422,7 +1422,7 @@ async function renderDetail(itemId) {
                         const pId = p.Id || p.id;
                         const pName = p.Name || p.name || '';
                         const pRole = p.Role || p.role || p.Type || p.type || t('detail.actor');
-                        const pImg = pId ? API.imageUrl(pId, 'Primary', { maxWidth: 200 }) : '';
+                        const pImg = pId ? API.imageUrl(pId, 'Primary', { maxWidth: 200, tag: p.PrimaryImageTag }) : '';
                         return `
                         <div class="w-28 text-center flex-shrink-0 cursor-pointer group" ${pId ? `data-action="navigate" data-page="person" data-id="${escapeHtml(pId)}"` : ''}>
                             <div class="w-20 h-20 mx-auto rounded-full overflow-hidden bg-white/10 mb-2 border-2 border-transparent group-hover:border-[#00a4dc] transition-all">

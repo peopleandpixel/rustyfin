@@ -115,6 +115,10 @@ pub struct ItemImage {
     pub height: Option<i32>,
     /// Pre-computed blurhash string for progressive image loading
     pub blurhash: Option<String>,
+    /// The version of a local file (`image_proxy::file_stamp`); `None` for remote URLs and for
+    /// rows not stamped yet
+    #[serde(default)]
+    pub stamp: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

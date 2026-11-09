@@ -407,7 +407,11 @@ const API = {
 
     // Images
     imageUrl(itemId, type = 'Primary', opts = {}) {
-        const q = new URLSearchParams(opts);
+        const q = new URLSearchParams();
+        // Options left unset (undefined, null or '') are not sent, so callers can pass a tag that may be missing
+        for (const [k, v] of Object.entries(opts)) {
+            if (v !== undefined && v !== null && v !== '') q.set(k, v);
+        }
         if (this.token) q.set('api_key', this.token);
         return `${this.base}/Items/${itemId}/Images/${type}?${q.toString()}`;
     },

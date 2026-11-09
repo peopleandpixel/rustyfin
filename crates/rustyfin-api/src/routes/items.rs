@@ -68,6 +68,31 @@ fn apply_user_data(item: &mut MediaItem, user_data: rustyfin_model::playback::Us
     item.user_data = Some(user_data);
 }
 
+/// Set an item's image tags (the first image of each type) and backdrop tags (every backdrop, in
+/// order) from its image rows.
+fn set_image_tags(item: &mut MediaItem, images: &[rustyfin_model::image::ItemImage]) {
+    let mut tags: std::collections::HashMap<rustyfin_model::image::ImageType, String> =
+        std::collections::HashMap::new();
+    let mut backdrop_tags: Vec<String> = Vec::new();
+    for img in images {
+        let tag = rustyfin_core::image_proxy::image_tag(&img.path, img.stamp);
+        if img.image_type == rustyfin_model::image::ImageType::Backdrop {
+            backdrop_tags.push(tag.clone());
+        }
+        tags.entry(img.image_type).or_insert_with(|| tag);
+    }
+    item.image_tags = tags;
+    item.backdrop_image_tags = backdrop_tags;
+}
+
+/// Load the image tags of an item read with `get_parent_item` or `get_album_for_audio`, which
+/// leave them empty.
+async fn load_image_tags(pool: &SqlitePool, item: &mut MediaItem) {
+    if let Ok(images) = rustyfin_db::repo_image::get_images_for_item(pool, item.id).await {
+        set_image_tags(item, &images);
+    }
+}
+
 /// Enrich a single MediaItem with all response fields: server_id, provider_ids, chapters,
 /// trickplay screenshots, etag, completion_percentage, external_urls, type flags,
 /// album/artist info, folder counts, inherited images, episode numbers, series branding,
@@ -198,18 +223,7 @@ async fn enrich_item(
 
     // ImageTags from images table
     if let Ok(images) = images_result {
-        let mut tags: std::collections::HashMap<rustyfin_model::image::ImageType, String> =
-            std::collections::HashMap::new();
-        let mut backdrop_tags: Vec<String> = Vec::new();
-        for img in &images {
-            let tag = format!("{}_{}", img.image_type.as_str(), img.image_index);
-            if img.image_type == rustyfin_model::image::ImageType::Backdrop {
-                backdrop_tags.push(tag.clone());
-            }
-            tags.entry(img.image_type).or_insert_with(|| tag);
-        }
-        item.image_tags = tags;
-        item.backdrop_image_tags = backdrop_tags;
+        set_image_tags(item, &images);
 
         // ImageBlurHashes: prefer stored values, fall back to on-demand computation
         for img in images {
@@ -301,9 +315,10 @@ async fn enrich_item(
         // Load Season once and reuse for both series info and parent image tags.
         // Season and Series are loaded in parallel to reduce latency.
         if let Some(parent_id) = item.parent_id
-            && let Ok(Some(season_item)) =
+            && let Ok(Some(mut season_item)) =
                 rustyfin_db::repo_media::get_parent_item(pool, parent_id).await
         {
+            load_image_tags(pool, &mut season_item).await;
             item.season_name = Some(season_item.name.clone());
 
             // Fill parent image tags from Season (reuses the already-loaded season_item)
@@ -343,9 +358,10 @@ async fn enrich_item(
 
             // SeriesPrimaryImageTag from the Series (grandparent)
             if let Some(series_id) = season_item.parent_id
-                && let Ok(Some(series_item)) =
+                && let Ok(Some(mut series_item)) =
                     rustyfin_db::repo_media::get_parent_item(pool, series_id).await
             {
+                load_image_tags(pool, &mut series_item).await;
                 item.series_name = Some(series_item.name.clone());
                 item.series_id = Some(series_item.id);
                 if let Some(tag) = series_item
@@ -370,9 +386,10 @@ async fn enrich_item(
     if item.media_type == rustyfin_model::media::MediaType::Audio {
         // Album info from parent (MusicAlbum)
         if let Some(parent_id) = item.parent_id
-            && let Ok(Some(album)) =
+            && let Ok(Some(mut album)) =
                 rustyfin_db::repo_media::get_album_for_audio(pool, parent_id).await
         {
+            load_image_tags(pool, &mut album).await;
             item.album = Some(album.name.clone());
             item.album_id = Some(album.id);
             // Parent image tags from album
@@ -400,12 +417,14 @@ async fn enrich_item(
             item.artists = artists
                 .iter()
                 .map(
-                    |(pid, name, role, _, has_image)| rustyfin_model::media::PersonInfo {
+                    |(pid, name, role, _, primary_path)| rustyfin_model::media::PersonInfo {
                         id: pid.clone(),
                         name: name.clone(),
                         role: role.clone(),
                         person_type: Some("Artist".to_string()),
-                        primary_image_tag: has_image.then(|| "Primary_0".to_string()),
+                        primary_image_tag: primary_path
+                            .as_deref()
+                            .map(|path| rustyfin_core::image_proxy::image_tag(path, None)),
                     },
                 )
                 .collect();
@@ -423,12 +442,14 @@ async fn enrich_item(
         item.people = people_rows
             .iter()
             .map(
-                |(pid, name, role, kind, has_image)| rustyfin_model::media::PersonInfo {
+                |(pid, name, role, kind, primary_path)| rustyfin_model::media::PersonInfo {
                     id: pid.clone(),
                     name: name.clone(),
                     role: role.clone(),
                     person_type: Some(kind.clone()),
-                    primary_image_tag: has_image.then(|| "Primary_0".to_string()),
+                    primary_image_tag: primary_path
+                        .as_deref()
+                        .map(|path| rustyfin_core::image_proxy::image_tag(path, None)),
                 },
             )
             .collect();
@@ -509,8 +530,10 @@ async fn enrich_item(
     // --- Parent image tags for non-episode items ---
     if item.media_type != rustyfin_model::media::MediaType::Episode
         && let Some(parent_id) = item.parent_id
-        && let Ok(Some(parent)) = rustyfin_db::repo_media::get_parent_item(pool, parent_id).await
+        && let Ok(Some(mut parent)) =
+            rustyfin_db::repo_media::get_parent_item(pool, parent_id).await
     {
+        load_image_tags(pool, &mut parent).await;
         if item.parent_primary_image_tag.is_none()
             && let Some(tag) = parent
                 .image_tags
@@ -552,8 +575,10 @@ async fn enrich_item(
     // --- Series branding for Seasons ---
     if item.media_type == rustyfin_model::media::MediaType::Season
         && let Some(series_id) = item.parent_id
-        && let Ok(Some(series)) = rustyfin_db::repo_media::get_parent_item(pool, series_id).await
+        && let Ok(Some(mut series)) =
+            rustyfin_db::repo_media::get_parent_item(pool, series_id).await
     {
+        load_image_tags(pool, &mut series).await;
         item.series_name = Some(series.name.clone());
         item.series_id = Some(series.id);
         if let Some(tag) = series
@@ -678,6 +703,21 @@ async fn enrich_items(
             .await
             .unwrap_or_default()
     };
+    // Grandparents (an episode's series is its season's parent), so their images load too
+    let grandparent_ids: Vec<Uuid> = parent_map
+        .values()
+        .filter_map(|parent| parent.parent_id)
+        .filter(|id| !parent_map.contains_key(&id.to_string()))
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    if !grandparent_ids.is_empty() {
+        parent_map.extend(
+            rustyfin_db::repo_media::get_parent_items_batch(pool, &grandparent_ids)
+                .await
+                .unwrap_or_default(),
+        );
+    }
 
     // Batch query 5: Folder counts for folder items
     let folder_ids: Vec<Uuid> = items
@@ -716,21 +756,28 @@ async fn enrich_items(
             let placeholders: Vec<String> =
                 (1..=chunk_ids.len()).map(|i| format!("?{}", i)).collect();
             let query = format!(
-                "SELECT ip.item_id, p.id, p.name, ip.role, ip.type, EXISTS(SELECT 1 FROM person_images pi WHERE pi.person_id = p.id AND pi.image_type = 'Primary' AND pi.image_index = 0) FROM item_people ip JOIN people p ON p.id = ip.person_id WHERE ip.item_id IN ({}) ORDER BY ip.item_id, ip.sort_order IS NULL, ip.sort_order, ip.rowid",
+                "SELECT ip.item_id, p.id, p.name, ip.role, ip.type, (SELECT pi.path FROM person_images pi WHERE pi.person_id = p.id AND pi.image_type = 'Primary' AND pi.image_index = 0) FROM item_people ip JOIN people p ON p.id = ip.person_id WHERE ip.item_id IN ({}) ORDER BY ip.item_id, ip.sort_order IS NULL, ip.sort_order, ip.rowid",
                 placeholders.join(",")
             );
             let mut query_builder = sqlx::query_as::<
                 _,
-                (String, String, String, Option<String>, String, bool),
+                (
+                    String,
+                    String,
+                    String,
+                    Option<String>,
+                    String,
+                    Option<String>,
+                ),
             >(sqlx::AssertSqlSafe(query.clone()));
             for id in chunk_ids {
                 query_builder = query_builder.bind(id.to_string());
             }
             if let Ok(rows) = query_builder.fetch_all(pool).await {
-                for (item_id, pid, pname, role, kind, has_image) in rows {
+                for (item_id, pid, pname, role, kind, primary_path) in rows {
                     map.entry(item_id)
                         .or_default()
-                        .push((pid, pname, role, kind, has_image));
+                        .push((pid, pname, role, kind, primary_path));
                 }
             }
         }
@@ -744,7 +791,7 @@ async fn enrich_items(
                 std::collections::HashMap::new();
             let mut backdrop_tags: Vec<String> = Vec::new();
             for img in images {
-                let tag = format!("{}_{}", img.image_type.as_str(), img.image_index);
+                let tag = rustyfin_core::image_proxy::image_tag(&img.path, img.stamp);
                 if img.image_type == rustyfin_model::image::ImageType::Backdrop {
                     backdrop_tags.push(tag.clone());
                 }
@@ -815,7 +862,7 @@ async fn enrich_items(
                 std::collections::HashMap::new();
             let mut backdrop_tags: Vec<String> = Vec::new();
             for img in images {
-                let tag = format!("{}_{}", img.image_type.as_str(), img.image_index);
+                let tag = rustyfin_core::image_proxy::image_tag(&img.path, img.stamp);
                 if img.image_type == rustyfin_model::image::ImageType::Backdrop {
                     backdrop_tags.push(tag.clone());
                 }
@@ -1184,12 +1231,14 @@ async fn enrich_items(
             item.people = people_rows
                 .iter()
                 .map(
-                    |(pid, name, role, kind, has_image)| rustyfin_model::media::PersonInfo {
+                    |(pid, name, role, kind, primary_path)| rustyfin_model::media::PersonInfo {
                         id: pid.clone(),
                         name: name.clone(),
                         role: role.clone(),
                         person_type: Some(kind.clone()),
-                        primary_image_tag: has_image.then(|| "Primary_0".to_string()),
+                        primary_image_tag: primary_path
+                            .as_deref()
+                            .map(|path| rustyfin_core::image_proxy::image_tag(path, None)),
                     },
                 )
                 .collect();
@@ -1443,10 +1492,17 @@ impl ItemsQuery {
             .or(self.sort_order_lower.as_deref())
     }
     fn start_index(&self) -> i64 {
+        self.start_index
+            .or(self.start_index_lower)
+            .unwrap_or(0)
+            .max(0)
+    }
+    /// The StartIndex as sent, before `start_index` clamps negatives to 0.
+    fn start_index_requested(&self) -> i64 {
         self.start_index.or(self.start_index_lower).unwrap_or(0)
     }
     fn limit(&self) -> i64 {
-        self.limit.unwrap_or(10_000)
+        self.limit.filter(|&limit| limit >= 0).unwrap_or(10_000)
     }
     fn name_starts_with(&self) -> Option<&str> {
         self.name_starts_with
@@ -1736,7 +1792,7 @@ async fn get_items(
     Ok(Json(QueryResult {
         items,
         total_record_count: total,
-        start_index,
+        start_index: query.start_index_requested(),
     }))
 }
 
@@ -1869,7 +1925,8 @@ async fn get_similar(
     let item = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, id)
         .await?
         .ok_or(ApiError::NotFound("item not found".into()))?;
-    let limit = query.limit.unwrap_or(12);
+    let limit = query.limit.filter(|&limit| limit >= 0).unwrap_or(12);
+    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
 
     let config = state.config.read().await;
     let tmdb = state.tmdb.api(config.tmdb_api_key.as_deref());
@@ -1883,7 +1940,7 @@ async fn get_similar(
 
         // For each TMDb similar item, find the local item by tmdb_id
         for (similar_tmdb_id, _name) in tmdb_similar {
-            if similar.len() >= limit as usize {
+            if similar.len() >= limit {
                 break;
             }
             // Find local item by tmdb_id
@@ -1907,8 +1964,8 @@ async fn get_similar(
     }
 
     // Priority 2: Local algorithm fills remaining slots
-    if similar.len() < limit as usize {
-        let remaining = limit - similar.len() as i64;
+    if similar.len() < limit {
+        let remaining = i64::try_from(limit - similar.len()).unwrap_or(i64::MAX);
         let local_similar =
             rustyfin_db::repo_media::get_similar_items(&state.db_ro, &item, remaining).await?;
 
@@ -1916,7 +1973,7 @@ async fn get_similar(
         let existing_ids: std::collections::HashSet<String> =
             similar.iter().map(|i| i.id.to_string()).collect();
         for local_item in local_similar {
-            if similar.len() >= limit as usize {
+            if similar.len() >= limit {
                 break;
             }
             if !existing_ids.contains(&local_item.id.to_string()) {

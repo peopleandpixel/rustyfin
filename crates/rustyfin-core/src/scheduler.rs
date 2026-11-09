@@ -29,6 +29,9 @@ fn ticks_to_duration(ticks: u64) -> std::time::Duration {
     std::time::Duration::from_nanos(ticks * 100)
 }
 
+/// The callback that runs when a scheduled library scan ends.
+type OnScan = Arc<dyn Fn() + Send + Sync>;
+
 #[derive(Clone)]
 struct TaskEntry {
     info: ScheduledTaskInfo,
@@ -42,6 +45,7 @@ pub struct TaskScheduler {
     scans: ScanRegistry,
     changes: ChangeQueue,
     watcher: LibraryWatcher,
+    on_scan: Arc<std::sync::RwLock<Option<OnScan>>>,
 }
 
 impl TaskScheduler {
@@ -172,7 +176,18 @@ impl TaskScheduler {
             scans: ScanRegistry::new(),
             changes,
             watcher,
+            on_scan: Arc::new(std::sync::RwLock::new(None)),
         }
+    }
+
+    /// Sets the callback that runs once each time the scheduled library scan ends, whether or
+    /// not a library failed. The server uses it to clear the caches a scan can change.
+    pub fn set_on_scan(&self, f: impl Fn() + Send + Sync + 'static) {
+        let mut slot = self
+            .on_scan
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *slot = Some(Arc::new(f));
     }
 
     /// The library scans in progress.
@@ -361,6 +376,16 @@ impl TaskScheduler {
                 }
             }
         };
+
+        // Cloned out of the lock so the callback never runs while the lock is held.
+        let on_scan = self
+            .on_scan
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(f) = on_scan {
+            f();
+        }
 
         self.set_task_result(TASK_LIBRARY_SCAN, result).await;
         self.set_task_state(TASK_LIBRARY_SCAN, TaskState::Idle)
