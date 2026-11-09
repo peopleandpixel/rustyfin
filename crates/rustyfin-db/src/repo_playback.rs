@@ -34,21 +34,59 @@ pub async fn get_user_item_data(
             rating: None,
             unplayed_item_count: None,
             favorite: Some(fav),
+            played_percentage: None,
         },
-        None => UserItemDataDto {
-            playback_position_ticks: 0,
-            play_count: 0,
-            is_favorite: false,
-            played: false,
-            last_played_date: None,
-            likes: None,
-            user_rating: None,
-            key: None,
-            rating: None,
-            unplayed_item_count: None,
-            favorite: None,
-        },
+        None => UserItemDataDto::default(),
     })
+}
+
+/// For each Series or Season in `folder_ids`, counts its episodes and the ones `user_id` has not
+/// played, as `(episodes, unplayed)`. A season's episodes are its children; a series' episodes
+/// are those of its seasons, specials included. Folders with no episodes have no entry.
+pub async fn get_unplayed_counts(
+    pool: &SqlitePool,
+    user_id: Uuid,
+    folder_ids: &[Uuid],
+) -> Result<HashMap<String, (i64, i64)>, sqlx::Error> {
+    if folder_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let uid = user_id.to_string();
+    // ?1 is the user, so the folder ids start at ?2. Both branches reuse the same placeholders.
+    let placeholders: Vec<String> = (2..=folder_ids.len() + 1)
+        .map(|i| format!("?{}", i))
+        .collect();
+    let placeholder_str = placeholders.join(",");
+    let sql = format!(
+        "SELECT ef.folder_id, COUNT(*), SUM(CASE WHEN ud.played = 1 THEN 0 ELSE 1 END) \
+         FROM ( \
+             SELECT e.id AS episode_id, p.id AS folder_id \
+             FROM media_items e JOIN media_items p ON p.id = e.parent_id \
+             WHERE e.media_type = 'Episode' AND p.media_type = 'Season' AND p.id IN ({ph}) \
+             UNION ALL \
+             SELECT e.id, g.id \
+             FROM media_items e \
+             JOIN media_items p ON p.id = e.parent_id AND p.media_type = 'Season' \
+             JOIN media_items g ON g.id = p.parent_id \
+             WHERE e.media_type = 'Episode' AND g.media_type = 'Series' AND g.id IN ({ph}) \
+         ) ef \
+         LEFT JOIN user_item_data ud ON ud.item_id = ef.episode_id AND ud.user_id = ?1 \
+         GROUP BY ef.folder_id",
+        ph = placeholder_str
+    );
+
+    let mut query = sqlx::query_as::<_, (String, i64, i64)>(sqlx::AssertSqlSafe(sql));
+    query = query.bind(&uid);
+    for id in folder_ids {
+        query = query.bind(id.to_string());
+    }
+    let rows = query.fetch_all(pool).await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(folder_id, episodes, unplayed)| (folder_id, (episodes, unplayed)))
+        .collect())
 }
 
 pub async fn update_playback_position(
@@ -663,6 +701,7 @@ pub async fn get_user_item_data_batch(
                 rating: None,
                 unplayed_item_count: None,
                 favorite: Some(is_favorite),
+                played_percentage: None,
             },
         );
     }

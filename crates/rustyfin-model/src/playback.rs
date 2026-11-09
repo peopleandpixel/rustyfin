@@ -54,7 +54,7 @@ pub struct PlaybackStopInfo {
     pub failed: Option<bool>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct UserItemDataDto {
     pub playback_position_ticks: i64,
@@ -78,6 +78,9 @@ pub struct UserItemDataDto {
     /// Favorite flag (alias for is_favorite)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub favorite: Option<bool>,
+    /// 100 * position / runtime, when there is a position and a known runtime
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub played_percentage: Option<f64>,
 }
 
 /// Request body for PinEpisode endpoint

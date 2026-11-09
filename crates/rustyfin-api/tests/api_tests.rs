@@ -12519,6 +12519,7 @@ struct B110 {
     /// A film without a runtime.
     unknown: uuid::Uuid,
     series: uuid::Uuid,
+    seasons: [uuid::Uuid; 2],
     /// S01E01, S01E02 and S02E01, each of 30 min.
     episodes: [uuid::Uuid; 3],
     _dir: G1cDataDir,
@@ -12562,6 +12563,7 @@ impl B110 {
             short,
             unknown,
             series,
+            seasons,
             episodes: episodes.try_into().unwrap(),
             _dir,
         }
@@ -13002,6 +13004,190 @@ async fn b110_playing_items_routes_need_a_session_and_store_nothing_for_non_medi
         .await
         .unwrap();
     assert_eq!(rows, 0);
+}
+
+/// An item's `(Id, UserData.Played, UserData.UnplayedItemCount, UserData.PlayedPercentage)`;
+/// a missing field is None.
+fn b110_watch_fields(item: &serde_json::Value) -> (String, Option<bool>, Option<i64>, Option<f64>) {
+    let data = &item["UserData"];
+    (
+        item["Id"].as_str().unwrap().to_string(),
+        data["Played"].as_bool(),
+        data["UnplayedItemCount"].as_i64(),
+        data["PlayedPercentage"].as_f64(),
+    )
+}
+
+impl B110 {
+    /// `b110_watch_fields` of each item a list answer gives.
+    async fn list_fields(
+        &self,
+        uri: &str,
+    ) -> Vec<(String, Option<bool>, Option<i64>, Option<f64>)> {
+        let body = self.get(uri).await;
+        body["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(b110_watch_fields)
+            .collect()
+    }
+
+    /// `b110_watch_fields` of an item's details.
+    async fn details_fields(
+        &self,
+        item: uuid::Uuid,
+    ) -> (String, Option<bool>, Option<i64>, Option<f64>) {
+        let uri = format!("/Items/{item}?userId={}", self.user);
+        b110_watch_fields(&self.get(&uri).await)
+    }
+}
+
+#[tokio::test]
+async fn b110_videos_carry_their_played_percentage() {
+    let b = B110::new().await;
+    let film = b.film.to_string();
+    // Jellyfin's BaseItem.FillUserDataDtoValues: 100 * position / runtime, only with a position.
+    assert_eq!(
+        b.details_fields(b.film).await,
+        (film.clone(), Some(false), None, None)
+    );
+    b.start(b.film).await;
+    b.progress(b.film, B110_HOUR / 4).await;
+    let quarter = (film.clone(), Some(false), None, Some(25.0));
+    assert_eq!(b.details_fields(b.film).await, quarter);
+    let resume = format!("/Users/{}/Items/Resume", b.user);
+    assert_eq!(b.list_fields(&resume).await, [quarter]);
+    b.stop(b.film, Some(B110_HOUR)).await;
+    assert_eq!(
+        b.details_fields(b.film).await,
+        (film, Some(true), None, None)
+    );
+}
+
+#[tokio::test]
+async fn b110_series_and_seasons_count_unplayed_episodes() {
+    let b = B110::new().await;
+    let [e1, e2, e3] = b.episodes;
+    let [s1, s2] = b.seasons;
+    let id = |item: uuid::Uuid| item.to_string();
+    let seasons_uri = format!("/Shows/{}/Seasons?userId={}", b.series, b.user);
+    let episodes_uri = format!("/Shows/{}/Episodes?userId={}", b.series, b.user);
+    let series_list = format!(
+        "/Users/{}/Items?Recursive=true&IncludeItemTypes=Series",
+        b.user
+    );
+
+    // Nothing watched yet.
+    let series = (id(b.series), Some(false), Some(3), None);
+    assert_eq!(b.details_fields(b.series).await, series);
+    assert_eq!(b.list_fields(&series_list).await, [series]);
+    assert_eq!(
+        b.list_fields(&seasons_uri).await,
+        [
+            (id(s1), Some(false), Some(2), None),
+            (id(s2), Some(false), Some(1), None),
+        ]
+    );
+    let unwatched = |e| (id(e), Some(false), None, None);
+    assert_eq!(
+        b.list_fields(&episodes_uri).await,
+        [unwatched(e1), unwatched(e2), unwatched(e3)]
+    );
+
+    // S02E01 played to the end, S01E01 half watched.
+    b.start(e3).await;
+    b.stop(e3, Some(B110_HOUR / 2)).await;
+    b.start(e1).await;
+    b.stop(e1, Some(B110_HOUR / 4)).await;
+    let series = (id(b.series), Some(false), Some(2), None);
+    assert_eq!(b.details_fields(b.series).await, series);
+    assert_eq!(b.list_fields(&series_list).await, [series]);
+    assert_eq!(
+        b.details_fields(s2).await,
+        (id(s2), Some(true), Some(0), None)
+    );
+    assert_eq!(
+        b.list_fields(&seasons_uri).await,
+        [
+            (id(s1), Some(false), Some(2), None),
+            (id(s2), Some(true), Some(0), None),
+        ]
+    );
+    assert_eq!(
+        b.list_fields(&episodes_uri).await,
+        [
+            (id(e1), Some(false), None, Some(50.0)),
+            unwatched(e2),
+            (id(e3), Some(true), None, None),
+        ]
+    );
+
+    // Without userId the lists are the caller's.
+    let seasons_uri = format!("/Shows/{}/Seasons", b.series);
+    assert_eq!(
+        b.list_fields(&seasons_uri).await[1],
+        (id(s2), Some(true), Some(0), None)
+    );
+
+    // Everything played: the series is played too.
+    for e in [e1, e2] {
+        b.start(e).await;
+        b.stop(e, None).await;
+    }
+    assert_eq!(
+        b.details_fields(b.series).await,
+        (id(b.series), Some(true), Some(0), None)
+    );
+
+    // A second user's counts and Played are their own: they watched S02E01 only.
+    let (other_token, other) = admin_session(&b.state).await;
+    let report = serde_json::json!({ "ItemId": e3 }).to_string();
+    let (status, _) = send_authed(
+        &b.app,
+        "POST",
+        "/Sessions/Playing/Stopped",
+        &other_token,
+        Some(&report),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let mut seen = Vec::new();
+    for item in [b.series, s1, s2] {
+        let uri = format!("/Items/{item}?userId={other}");
+        let (status, body) = send_authed(&b.app, "GET", &uri, &other_token, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        seen.push(b110_watch_fields(&body));
+    }
+    assert_eq!(
+        seen,
+        [
+            (id(b.series), Some(false), Some(2), None),
+            (id(s1), Some(false), Some(2), None),
+            (id(s2), Some(true), Some(0), None),
+        ]
+    );
+    let uri = format!("/Shows/{}/Seasons?userId={other}", b.series);
+    let (status, body) = send_authed(&b.app, "GET", &uri, &other_token, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let seasons: Vec<_> = body["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(b110_watch_fields)
+        .collect();
+    assert_eq!(
+        seasons,
+        [
+            (id(s1), Some(false), Some(2), None),
+            (id(s2), Some(true), Some(0), None),
+        ]
+    );
+    // The first user's are unchanged.
+    assert_eq!(
+        b.details_fields(b.series).await,
+        (id(b.series), Some(true), Some(0), None)
+    );
 }
 
 // ── Shows Tests ──
@@ -21812,6 +21998,17 @@ async fn b29_stored(state: &AppState, user_id: &str, item: uuid::Uuid) -> serde_
     serde_json::to_value(data).unwrap()
 }
 
+/// An answer's `UserData` without the fields worked out from the item's runtime and episodes
+/// (B110). A folder's `Played` is also true once all its episodes are played; B29's single episode
+/// is watched after its folders are checked, so there it is the stored flag.
+fn b110_without_derived(user_data: &serde_json::Value) -> serde_json::Value {
+    let mut data = user_data.clone();
+    let object = data.as_object_mut().unwrap();
+    object.remove("PlayedPercentage");
+    object.remove("UnplayedItemCount");
+    data
+}
+
 /// `value` as an answer brings it: written as text and read back, since serde_json can read a
 /// float back 1 ulp off.
 fn b29_as_sent(value: serde_json::Value) -> serde_json::Value {
@@ -21846,7 +22043,7 @@ async fn b29_each_user_gets_their_own_watch_data_in_item_details() {
             "{kind}: B gets A's watch data"
         );
         assert_eq!(
-            details["UserData"],
+            b110_without_derived(&details["UserData"]),
             b29_stored(&state, &b_id, item).await,
             "{kind}: B's UserData"
         );
@@ -21859,7 +22056,7 @@ async fn b29_each_user_gets_their_own_watch_data_in_item_details() {
         );
         let details = b29_details(&app, &a, &a_id, item).await;
         assert_eq!(
-            details["UserData"],
+            b110_without_derived(&details["UserData"]),
             b29_stored(&state, &a_id, item).await,
             "{kind}: A's UserData"
         );
