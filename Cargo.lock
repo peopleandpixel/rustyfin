@@ -2480,6 +2480,7 @@ dependencies = [
  "rustyfin-model",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "sqlx",
  "thiserror",
  "tokio",
@@ -2570,6 +2571,8 @@ dependencies = [
  "chrono",
  "serde",
  "serde_json",
+ "unicase",
+ "unicode-normalization",
  "uuid",
 ]
 

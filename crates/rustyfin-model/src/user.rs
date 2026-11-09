@@ -1,5 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use unicase::UniCase;
+use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -176,4 +178,94 @@ pub struct UserImageInfo {
     pub user_id: Uuid,
     pub image_type: String,
     pub id: String,
+}
+
+/// The form a username is compared by (Unicode D146): NFD, full case folding, NFKC, then folding
+/// and NFKC again. It is only for comparing, never stored or shown.
+pub fn name_key(name: &str) -> String {
+    let nfd: String = name.nfd().collect();
+    let folded = UniCase::new(nfd.as_str()).to_folded_case();
+    let nfkc: String = folded.as_str().nfkc().collect();
+    let refolded = UniCase::new(nfkc.as_str()).to_folded_case();
+    refolded.as_str().nfkc().collect()
+}
+
+/// The longest user name, in UTF-16 code units as .NET counts string lengths. Jellyfin declares
+/// the same limit for its `User.Username`. Bytes don't count.
+pub const MAX_NAME_UNITS: usize = 255;
+
+/// Whether a name is over `MAX_NAME_UNITS`. It reads at most 256 units, so a huge name costs no
+/// more to check than one just over the limit.
+pub fn name_too_long(name: &str) -> bool {
+    name.encode_utf16().nth(MAX_NAME_UNITS).is_some()
+}
+
+/// An entered name, folded once, to match against stored names (`names_match`, AC63). A name over
+/// the limit has no key, so it is never folded and matches only an exactly equal name (AC61, AC62).
+pub struct NameMatch<'a> {
+    name: &'a str,
+    key: Option<String>,
+}
+
+impl<'a> NameMatch<'a> {
+    /// Folds `name`, unless it is over the limit.
+    pub fn new(name: &'a str) -> Self {
+        let key = (!name_too_long(name)).then(|| name_key(name));
+        Self { name, key }
+    }
+
+    /// Whether `stored` matches the entered name: exactly equal, or both within the limit with
+    /// equal keys. A stored name over the limit is never folded.
+    pub fn matches(&self, stored: &str) -> bool {
+        if self.name == stored {
+            return true;
+        }
+        match &self.key {
+            Some(key) => !name_too_long(stored) && name_key(stored) == *key,
+            None => false,
+        }
+    }
+}
+
+/// Whether two usernames match under Unicode caseless matching (D146): any case, full case
+/// folding (ß matches ss), compatibility forms and composed or decomposed accents all match.
+/// Accents, spaces and digits still count. Over the limit (`MAX_NAME_UNITS`) names match only
+/// exactly.
+pub fn names_match(a: &str, b: &str) -> bool {
+    NameMatch::new(a).matches(b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn names_match_folds_case_and_compatibility_forms() {
+        let same = [
+            ("Alice", "alice"),
+            ("Änne", "änne"),
+            ("Änne", "A\u{0308}nne"),
+            ("ÄNNE", "änne"),
+            ("kelvin", "KELVIN"),
+            ("kelvin", "\u{212A}elvin"),
+            ("kelvin", "ｋｅｌｖｉｎ"),
+            ("strauss", "Strauß"),
+            ("strauss", "STRAUß"),
+            ("ΟΔΟ\u{03A3}", "οδο\u{03C2}"),
+            ("\u{FB01}ona", "FIONA"),
+            ("\u{3392}", "mhz"),
+        ];
+        for (a, b) in same {
+            assert!(names_match(a, b), "{a:?} and {b:?} are one name");
+            assert!(names_match(b, a), "{b:?} and {a:?} are one name");
+        }
+        for (a, b) in [
+            ("alice", "alice2"),
+            ("alice", " alice"),
+            ("alice", "alíce"),
+            ("anne", "Änne"),
+        ] {
+            assert!(!names_match(a, b), "{a:?} and {b:?} are two names");
+        }
+    }
 }

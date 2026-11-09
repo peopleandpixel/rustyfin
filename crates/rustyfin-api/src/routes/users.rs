@@ -8,7 +8,7 @@ use rustyfin_model::user::{
     ChangePasswordRequest, CreateUserRequest, EasyPasswordRequest, ForgotPasswordPinRequest,
     ForgotPasswordRequest, ForgotPasswordResult, PublicUserDto, ResetPasswordRequest,
     UpdatePolicyRequest, UpdateUserNameRequest, UserAccessSchedule, UserDto, UserImageInfo,
-    UserPreferences, UserSecurityInfo,
+    UserPreferences, UserSecurityInfo, name_too_long,
 };
 use sqlx::SqlitePool;
 use std::net::SocketAddr;
@@ -117,9 +117,8 @@ async fn create_user(
     if req.name.trim().is_empty() {
         return Err(ApiError::BadRequest("name is required".into()));
     }
-
-    if let Some(_existing) = rustyfin_db::repo_user::get_user_by_name(&state.db, &req.name).await? {
-        return Err(ApiError::BadRequest("user already exists".into()));
+    if name_too_long(&req.name) {
+        return Err(ApiError::BadRequest("name is too long".into()));
     }
 
     let hash = rustyfin_auth::hash_password(&req.password)
@@ -136,7 +135,9 @@ async fn create_user(
         configuration: serde_json::Value::Object(Default::default()),
     };
 
-    rustyfin_db::repo_user::create_user(&state.db, &user).await?;
+    if !rustyfin_db::repo_user::create_user_unless_taken(&state.db, &user).await? {
+        return Err(ApiError::BadRequest("user already exists".into()));
+    }
     Ok(Json(UserDto::from(user)))
 }
 
@@ -313,7 +314,7 @@ async fn forgot_password(
 /// The reset work for a local ForgotPassword, run in its own task (see `forgot_password`). Nothing
 /// is returned to the client; a failure is logged without the PIN.
 async fn issue_reset_pin(db: SqlitePool, name: String, pin_path: PathBuf, expires_at: String) {
-    let user = match rustyfin_db::repo_user::get_user_by_name(&db, &name).await {
+    let user = match rustyfin_db::repo_user::find_user_for_sign_in(&db, &name).await {
         Ok(Some(user)) => user,
         Ok(None) => return,
         Err(e) => {
@@ -383,16 +384,19 @@ async fn reset_password_pin(
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
 
-    let _ = std::fs::remove_file(
-        state
-            .data_dir
-            .join(rustyfin_auth::reset_pin_filename(&user.name)),
-    );
+    remove_reset_pin_files(&state.data_dir, &user.name);
 
     Ok(Json(serde_json::json!({
         "Success": true,
         "UsersReset": [user.name],
     })))
+}
+
+/// Removes the reset PIN files of `name`: the one named from its name key, and the one an older
+/// server named from the uppercased name (AC65). The redeem calls it on both of its paths.
+fn remove_reset_pin_files(data_dir: &std::path::Path, name: &str) {
+    let _ = std::fs::remove_file(data_dir.join(rustyfin_auth::reset_pin_filename(name)));
+    let _ = std::fs::remove_file(data_dir.join(rustyfin_auth::legacy_reset_pin_filename(name)));
 }
 
 async fn reset_password(
@@ -401,7 +405,7 @@ async fn reset_password(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // Look up the user by username. An unknown user gets the wrong-PIN error, so the response does
     // not reveal whether the account exists.
-    let user = rustyfin_db::repo_user::get_user_by_name(&state.db, &req.username)
+    let user = rustyfin_db::repo_user::find_user_for_sign_in(&state.db, &req.username)
         .await?
         .ok_or_else(|| ApiError::BadRequest("invalid or expired PIN".to_string()))?;
 
@@ -444,11 +448,18 @@ async fn update_user_name(
     if req.name.trim().is_empty() {
         return Err(ApiError::BadRequest("name is required".into()));
     }
-    let updated = rustyfin_db::repo_user::update_user_name(&state.db, id, &req.name).await?;
-    if !updated {
-        return Err(ApiError::NotFound("user not found".into()));
+    if name_too_long(&req.name) {
+        return Err(ApiError::BadRequest("name is too long".into()));
     }
-    Ok(Json(serde_json::json!({})))
+    match rustyfin_db::repo_user::rename_user_unless_taken(&state.db, id, &req.name).await? {
+        rustyfin_db::repo_user::Renamed::Done => Ok(Json(serde_json::json!({}))),
+        rustyfin_db::repo_user::Renamed::Taken => {
+            Err(ApiError::BadRequest("user already exists".into()))
+        }
+        rustyfin_db::repo_user::Renamed::NotFound => {
+            Err(ApiError::NotFound("user not found".into()))
+        }
+    }
 }
 
 async fn get_user_images(

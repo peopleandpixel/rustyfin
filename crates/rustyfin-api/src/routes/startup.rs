@@ -8,6 +8,7 @@ use rustyfin_model::server_info::ServerConfiguration;
 use rustyfin_model::setup::{
     StartupConfiguration, StartupConfigurationUpdate, StartupUser, StartupUserCreate,
 };
+use rustyfin_model::user::name_too_long;
 
 use crate::error::ApiError;
 use crate::state::AppState;
@@ -84,6 +85,9 @@ async fn create_startup_user(
     // The name is stored exactly as sent. Only this check trims it.
     if input.name.trim().is_empty() {
         return Err(ApiError::BadRequest("Name is required".into()));
+    }
+    if name_too_long(&input.name) {
+        return Err(ApiError::BadRequest("Name is too long".into()));
     }
 
     let hash = rustyfin_auth::hash_password(&input.password)

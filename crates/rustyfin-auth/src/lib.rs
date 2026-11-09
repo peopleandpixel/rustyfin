@@ -4,7 +4,7 @@ use chrono::Utc;
 use rand_core::{OsRng, RngCore};
 use rustyfin_db::{repo_session, repo_token, repo_user};
 use rustyfin_model::auth::Claims;
-use rustyfin_model::user::User;
+use rustyfin_model::user::{User, name_key, name_too_long};
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 use thiserror::Error;
@@ -91,11 +91,30 @@ fn reset_pin_hash(pin: &str) -> String {
         .collect()
 }
 
-/// File name that holds the plaintext reset PIN for `username`:
-/// `passwordreset-<hex sha256(UPPERCASE name)>.json`. The name is hashed so the file name leaks no
-/// username. Both the writer (forgot) and the remover (redeem) compute it the same way.
+/// File name that holds the plaintext reset PIN for `username`,
+/// `passwordreset-<hex sha256(t)>.json` (AC65). `t` is `key:` and the name key for a name within
+/// the limit, so names that match share one file. A longer name gives `name:` and its exact
+/// spelling, so it matches only itself. The name is hashed so the file name leaks no username.
+/// ForgotPassword names the file from the name it was asked with; the redeem removes the file
+/// named from the stored name.
 pub fn reset_pin_filename(username: &str) -> String {
-    let h: String = Sha256::digest(username.to_uppercase().as_bytes())
+    let t = if name_too_long(username) {
+        format!("name:{username}")
+    } else {
+        format!("key:{}", name_key(username))
+    };
+    pin_file_named(&t)
+}
+
+/// The file name older servers used: `passwordreset-<hex sha256(UPPERCASE name)>.json`. Nothing
+/// writes it now; the redeem also removes it, so a reset asked before the upgrade leaves no file.
+pub fn legacy_reset_pin_filename(username: &str) -> String {
+    pin_file_named(&username.to_uppercase())
+}
+
+/// `passwordreset-<hex sha256(t)>.json`, the PIN file name for the text `t`.
+fn pin_file_named(t: &str) -> String {
+    let h: String = Sha256::digest(t.as_bytes())
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
@@ -232,15 +251,16 @@ pub async fn logout(pool: &SqlitePool, token: &str) -> Result<(), AuthError> {
     Ok(())
 }
 
-/// Checks a login and, if it succeeds, issues a token for `device`. The returned user is re-read
-/// after the login, so its LastLoginDate is the new one (M-16).
+/// Checks a login and, if it succeeds, issues a token for `device`. The name is found exactly, else
+/// by the one name that matches it caselessly (`repo_user::find_user_for_sign_in`). The returned
+/// user is re-read after the login, so its LastLoginDate is the new one (M-16).
 pub async fn authenticate(
     pool: &SqlitePool,
     username: &str,
     password: &str,
     device: &TokenDevice,
 ) -> Result<(User, String), AuthError> {
-    let user = repo_user::get_user_by_name(pool, username)
+    let user = repo_user::find_user_for_sign_in(pool, username)
         .await?
         .ok_or(AuthError::UserNotFound)?;
 
@@ -254,7 +274,7 @@ pub async fn authenticate(
     }
 
     repo_user::update_last_login(pool, user.id).await?;
-    let user = repo_user::get_user_by_name(pool, username)
+    let user = repo_user::get_user_by_id(pool, user.id)
         .await?
         .ok_or(AuthError::UserNotFound)?;
 

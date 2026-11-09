@@ -5026,6 +5026,494 @@ async fn g2_five_wrong_pin_attempts_void_the_reset() {
     );
 }
 
+// ── B21: user names. A name matches another in any letter case and Unicode compatibility form,
+// so no two accounts differ only by case, and a name is at most 255 UTF-16 code units. ──
+
+/// A server whose owner, "owner", is signed in.
+struct B21 {
+    state: AppState,
+    app: axum::Router,
+    /// The owner's token.
+    admin: String,
+}
+
+async fn b21() -> B21 {
+    let state = test_state().await;
+    let app = app(state.clone());
+    assert_eq!(
+        post_startup_user(&app, None, "owner", "pw-owner").await,
+        StatusCode::NO_CONTENT
+    );
+    let (admin, _) = login(&app, "owner", "pw-owner")
+        .await
+        .expect("owner signs in");
+    B21 { state, app, admin }
+}
+
+impl B21 {
+    async fn user_count(&self) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM users")
+            .fetch_one(&self.state.db)
+            .await
+            .unwrap()
+    }
+}
+
+/// Asks for a password reset and reads the PIN from the PIN file; None when none was written within
+/// 2 s. The reset work may finish after the 250 ms answer under load, so the file is awaited.
+async fn b21_reset_pin(app: &axum::Router, name: &str) -> Option<String> {
+    b21_reset_pin_at(app, name).await.1
+}
+
+/// `b21_reset_pin`, with the answer's `PinFile` path.
+async fn b21_reset_pin_at(app: &axum::Router, name: &str) -> (String, Option<String>) {
+    let path = b21_pin_file(app, name).await;
+    for _ in 0..20 {
+        // The file is created before it is written, so an empty or partial file is read again.
+        let file = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+        if let Some(file) = file {
+            let pin = file["Pin"].as_str().map(str::to_string);
+            return (path, pin);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    (path, None)
+}
+
+/// Asks for a password reset and returns the answer's `PinFile` path without waiting for the file.
+async fn b21_pin_file(app: &axum::Router, name: &str) -> String {
+    let body = serde_json::json!({ "EnteredUsername": name });
+    let req = request("POST", "/Users/ForgotPassword", None, Some(body));
+    let (status, answer) = send(app, req).await;
+    assert_eq!(status, StatusCode::OK);
+    answer["PinFile"]
+        .as_str()
+        .expect("a PinFile path")
+        .to_string()
+}
+
+/// Redeems a reset PIN through `POST /Users/ForgotPassword/Pin`.
+async fn b21_redeem_pin(app: &axum::Router, pin: &str) -> (StatusCode, serde_json::Value) {
+    let body = serde_json::json!({ "Pin": pin });
+    send(
+        app,
+        request("POST", "/Users/ForgotPassword/Pin", None, Some(body)),
+    )
+    .await
+}
+
+/// `POST /Users/AuthenticateByName`: the status and the whole answer.
+async fn b21_password_answer(
+    app: &axum::Router,
+    name: &str,
+    password: &str,
+) -> (StatusCode, serde_json::Value) {
+    let body = serde_json::json!({ "Username": name, "Pw": password });
+    let req = request("POST", "/Users/AuthenticateByName", None, Some(body));
+    send(app, req).await
+}
+
+/// `POST /Users/New` as the token's user.
+async fn b21_new_user(
+    app: &axum::Router,
+    token: &str,
+    name: &str,
+) -> (StatusCode, serde_json::Value) {
+    let body = serde_json::json!({ "Name": name, "Password": "pw-new" });
+    send(app, request("POST", "/Users/New", Some(token), Some(body))).await
+}
+
+/// `PUT /Users/{id}`, a rename, as the token's user.
+async fn b21_rename(
+    app: &axum::Router,
+    token: &str,
+    id: &str,
+    name: &str,
+) -> (StatusCode, serde_json::Value) {
+    let body = serde_json::json!({ "Name": name });
+    let req = request("PUT", &format!("/Users/{id}"), Some(token), Some(body));
+    send(app, req).await
+}
+
+#[tokio::test]
+async fn b21_password_sign_in_finds_names_in_any_case() {
+    let t = b21().await;
+    add_user(&t.state, "alice", "pw-alice", false).await;
+    for name in ["alice", "ALICE", "Alice", "ＡＬＩＣＥ"] {
+        let (status, body) = b21_password_answer(&t.app, name, "pw-alice").await;
+        assert_eq!(status, StatusCode::OK, "{name:?}");
+        assert_eq!(body["User"]["Name"], "alice", "{name:?} signs in as alice");
+    }
+    let wrong = b21_password_answer(&t.app, "alice", "pw-wrong").await;
+    assert_eq!(wrong.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        b21_password_answer(&t.app, "ALICE", "pw-wrong").await,
+        wrong,
+        "a wrong password in another case"
+    );
+    assert_eq!(
+        b21_password_answer(&t.app, "alice2", "pw-alice").await,
+        wrong,
+        "another name"
+    );
+}
+
+#[tokio::test]
+async fn b21_case_variant_accounts_sign_in_by_exact_name() {
+    let t = b21().await;
+    // Two accounts whose names differ only in case, as older servers may hold.
+    add_user(&t.state, "bob", "pw-bob", false).await;
+    add_user(&t.state, "Bob", "pw-Bob", false).await;
+    for (name, password) in [("bob", "pw-bob"), ("Bob", "pw-Bob")] {
+        let (status, body) = b21_password_answer(&t.app, name, password).await;
+        assert_eq!(status, StatusCode::OK, "{name:?}");
+        assert_eq!(body["User"]["Name"], name, "{name:?} signs in as itself");
+    }
+    let wrong = b21_password_answer(&t.app, "bob", "pw-wrong").await;
+    assert_eq!(wrong.0, StatusCode::UNAUTHORIZED);
+    for password in ["pw-bob", "pw-Bob"] {
+        assert_eq!(
+            b21_password_answer(&t.app, "BOB", password).await,
+            wrong,
+            "BOB names neither account"
+        );
+    }
+    assert_eq!(
+        b21_password_answer(&t.app, "Bob", "pw-bob").await,
+        wrong,
+        "Bob is not bob"
+    );
+}
+
+#[tokio::test]
+async fn b21_new_users_refuse_taken_names_in_any_case() {
+    let t = b21().await;
+    add_user(&t.state, "alice", "pw-alice", false).await;
+    let exact = b21_new_user(&t.app, &t.admin, "alice").await;
+    assert_eq!(exact.0, StatusCode::BAD_REQUEST, "{}", exact.1);
+    for name in ["Alice", "ALICE", "ＡＬＩＣＥ", "OWNER"] {
+        assert_eq!(
+            b21_new_user(&t.app, &t.admin, name).await,
+            exact,
+            "{name:?} is taken"
+        );
+    }
+    assert_eq!(t.user_count().await, 2, "no new account");
+    let (status, body) = b21_new_user(&t.app, &t.admin, "alice2").await;
+    assert_eq!(status, StatusCode::OK, "a free name: {body}");
+    assert_eq!(body["Name"], "alice2");
+}
+
+#[tokio::test]
+async fn b21_renames_refuse_other_users_names_in_any_case() {
+    let t = b21().await;
+    add_user(&t.state, "alice", "pw-alice", false).await;
+    let carol_id = add_user(&t.state, "carol", "pw-carol", false)
+        .await
+        .to_string();
+    let (carol, _) = login(&t.app, "carol", "pw-carol").await.unwrap();
+    let taken = b21_new_user(&t.app, &t.admin, "alice").await;
+    assert_eq!(taken.0, StatusCode::BAD_REQUEST, "{}", taken.1);
+    for name in ["alice", "ALICE", "Alice", "ＡＬＩＣＥ", "Owner"] {
+        assert_eq!(
+            b21_rename(&t.app, &carol, &carol_id, name).await,
+            taken,
+            "{name:?}: carol's own rename"
+        );
+        assert_eq!(
+            b21_rename(&t.app, &t.admin, &carol_id, name).await,
+            taken,
+            "{name:?}: an administrator's rename"
+        );
+    }
+    assert!(user_flags(&t.state, "carol").await.is_some(), "still carol");
+
+    let (status, body) = b21_rename(&t.app, &carol, &carol_id, "Carol").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "her own name in another case: {body}"
+    );
+    assert!(user_flags(&t.state, "Carol").await.is_some(), "now Carol");
+    let (status, body) = b21_rename(&t.app, &carol, &carol_id, "Carol").await;
+    assert_eq!(status, StatusCode::OK, "her own name unchanged: {body}");
+    let nobody = uuid::Uuid::new_v4().to_string();
+    assert_eq!(
+        b21_rename(&t.app, &t.admin, &nobody, "nobody").await.0,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn b21_simultaneous_new_users_take_a_name_once() {
+    let t = b21().await;
+    // Users/New as "DanN" and "danN" at the same moment: only a check inside the insert's
+    // transaction can refuse one.
+    let mut doubled = Vec::new();
+    for i in 0..5 {
+        let (upper_name, lower_name) = (format!("Dan{i}"), format!("dan{i}"));
+        let (upper, lower) = tokio::join!(
+            b21_new_user(&t.app, &t.admin, &upper_name),
+            b21_new_user(&t.app, &t.admin, &lower_name)
+        );
+        let mut statuses = [upper.0, lower.0];
+        statuses.sort();
+        if statuses == [StatusCode::OK, StatusCode::OK] {
+            doubled.push(i);
+            continue;
+        }
+        assert_eq!(
+            statuses,
+            [StatusCode::OK, StatusCode::BAD_REQUEST],
+            "pair {i}"
+        );
+    }
+    assert_eq!(
+        doubled,
+        Vec::<usize>::new(),
+        "pairs where both got an account"
+    );
+    assert_eq!(
+        t.user_count().await,
+        6,
+        "the owner and one account per pair"
+    );
+}
+
+#[tokio::test]
+async fn b21_password_resets_find_names_in_any_case() {
+    let t = b21().await;
+    add_user(&t.state, "alice", "pw-alice", false).await;
+    let pin = b21_reset_pin(&t.app, "ALICE")
+        .await
+        .expect("a PIN for alice");
+    let body =
+        serde_json::json!({ "Pin": pin, "Username": "Alice", "TempPassword": "b21-temp-pw" });
+    let (status, answer) = send(
+        &t.app,
+        request("POST", "/Users/ResetPassword", None, Some(body)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert!(
+        login(&t.app, "alice", "b21-temp-pw").await.is_some(),
+        "alice's new password"
+    );
+
+    add_user(&t.state, "bob", "pw-bob", false).await;
+    add_user(&t.state, "Bob", "pw-Bob", false).await;
+    assert_eq!(
+        b21_reset_pin(&t.app, "BOB").await,
+        None,
+        "BOB names neither account"
+    );
+}
+
+#[tokio::test]
+async fn b21_startup_user_refuses_case_variants() {
+    let t = b21().await;
+    for name in ["owner", "OWNER", "Owner"] {
+        assert_eq!(
+            post_startup_user(&t.app, Some(&t.admin), name, "pw-x").await,
+            StatusCode::FORBIDDEN,
+            "{name:?}"
+        );
+    }
+    assert_eq!(t.user_count().await, 1);
+}
+/// Names over the limit of 255 UTF-16 code units (AC60): 256 units, 128 surrogate pairs, and 1.8 MB
+/// of U+FDFA, which NFKC grows 18-fold.
+fn b21_over_long_names() -> [String; 3] {
+    [
+        "a".repeat(256),
+        "\u{1F600}".repeat(128),
+        "\u{FDFA}".repeat(600_000),
+    ]
+}
+
+#[tokio::test]
+async fn b21_new_users_refuse_over_long_names() {
+    let t = b21().await;
+    for name in b21_over_long_names() {
+        let units = name.encode_utf16().count();
+        let (status, _) = b21_new_user(&t.app, &t.admin, &name).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{units} units");
+    }
+    assert_eq!(t.user_count().await, 1, "no new account");
+    // 255 units: bytes don't count, a surrogate pair counts twice.
+    let fits = [
+        "a".repeat(255),
+        "\u{e9}".repeat(255),
+        format!("{}a", "\u{1F600}".repeat(127)),
+    ];
+    for name in fits {
+        let (status, body) = b21_new_user(&t.app, &t.admin, &name).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["Name"], name.as_str());
+    }
+}
+
+#[tokio::test]
+async fn b21_renames_refuse_over_long_names() {
+    let t = b21().await;
+    let carol_id = add_user(&t.state, "carol", "pw-carol", false)
+        .await
+        .to_string();
+    let (carol, _) = login(&t.app, "carol", "pw-carol").await.unwrap();
+    for name in b21_over_long_names() {
+        let units = name.encode_utf16().count();
+        let (status, _) = b21_rename(&t.app, &carol, &carol_id, &name).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{units} units: own rename");
+        let (status, _) = b21_rename(&t.app, &t.admin, &carol_id, &name).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{units} units: admin's rename"
+        );
+    }
+    assert!(user_flags(&t.state, "carol").await.is_some(), "still carol");
+    let name = "a".repeat(255);
+    let (status, body) = b21_rename(&t.app, &carol, &carol_id, &name).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(user_flags(&t.state, &name).await.is_some(), "255 units fit");
+}
+
+#[tokio::test]
+async fn b21_startup_user_refuses_an_over_long_name() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    for name in b21_over_long_names() {
+        let units = name.encode_utf16().count();
+        assert_eq!(
+            post_startup_user(&app, None, &name, "pw").await,
+            StatusCode::BAD_REQUEST,
+            "{units} units"
+        );
+    }
+    let users = rustyfin_db::repo_user::get_all_users(&state.db)
+        .await
+        .unwrap();
+    assert!(users.is_empty(), "no owner");
+    assert_eq!(
+        post_startup_user(&app, None, &"a".repeat(255), "pw").await,
+        StatusCode::NO_CONTENT
+    );
+}
+
+#[tokio::test]
+async fn b21_over_long_names_sign_in_only_exactly() {
+    let t = b21().await;
+    // An account an older server let through (AC62): 128 decomposed "é", 256 units.
+    let legacy = "e\u{301}".repeat(128);
+    add_user(&t.state, &legacy, "pw-legacy", false).await;
+    let within = "\u{f6}".repeat(200);
+    add_user(&t.state, &within, "pw-within", false).await;
+    let unknown = b21_password_answer(&t.app, "nobody", "pw-x").await;
+    assert_eq!(unknown.0, StatusCode::UNAUTHORIZED);
+
+    let (status, body) = b21_password_answer(&t.app, &legacy, "pw-legacy").await;
+    assert_eq!(status, StatusCode::OK, "the exact over-long name");
+    assert_eq!(body["User"]["Name"], legacy.as_str());
+    let (status, body) = b21_password_answer(&t.app, &"\u{d6}".repeat(200), "pw-within").await;
+    assert_eq!(status, StatusCode::OK, "within the limit, names still fold");
+    assert_eq!(body["User"]["Name"], within.as_str());
+
+    let refused = [
+        (
+            "E\u{301}".repeat(128),
+            "pw-legacy",
+            "an over-long name is not folded",
+        ),
+        (
+            "\u{e9}".repeat(128),
+            "pw-legacy",
+            "an over-long account is not folded",
+        ),
+        (
+            "o\u{308}".repeat(200),
+            "pw-within",
+            "400 units match only exactly",
+        ),
+    ];
+    for (name, password, why) in refused {
+        let (status, body) = b21_password_answer(&t.app, &name, password).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{why}");
+        assert_eq!(body, unknown.1, "{why}");
+    }
+
+    // ForgotPassword finds over-long names only exactly too (AC61). Ask with the fullwidth spelling
+    // first: an open reset keeps its PIN (`store_reset_pin`), so after the exact request no spelling
+    // could get one, folded or not.
+    assert_eq!(
+        b21_reset_pin(&t.app, &"\u{FF45}\u{301}".repeat(128)).await,
+        None,
+        "no PIN for a folded match"
+    );
+    assert!(b21_reset_pin(&t.app, &legacy).await.is_some(), "exact");
+
+    let huge = "\u{FDFA}".repeat(600_000);
+    let (status, body) = b21_password_answer(&t.app, &huge, "pw-x").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "a 1.8 MB name");
+    assert_eq!(body, unknown.1, "a 1.8 MB name");
+    b21_pin_file(&t.app, &huge).await;
+}
+
+#[tokio::test]
+async fn b21_a_redeemed_reset_leaves_no_pin_file() {
+    let t = b21().await;
+    let before = b21_pin_file(&t.app, "ＡＬＩＣＥ").await;
+    // Fullwidth, a Kelvin sign and a decomposed spelling.
+    let spellings = [
+        ("alice", "ＡＬＩＣＥ"),
+        ("kim", "\u{212A}IM"),
+        ("jos\u{e9}", "JOSE\u{301}"),
+    ];
+    let mut resets = Vec::new();
+    for (name, spelling) in spellings {
+        add_user(&t.state, name, "pw-old", false).await;
+        let (path, pin) = b21_reset_pin_at(&t.app, spelling).await;
+        let pin = pin.unwrap_or_else(|| panic!("a PIN for {spelling:?}"));
+        resets.push((name, spelling, path, pin));
+    }
+    assert_eq!(
+        resets[0].2, before,
+        "the path doesn't depend on the account"
+    );
+
+    for (name, spelling, path, pin) in resets {
+        let (status, answer) = b21_redeem_pin(&t.app, &pin).await;
+        assert_eq!(status, StatusCode::OK, "{spelling:?}");
+        assert_eq!(answer["UsersReset"][0], name);
+        let gone = !std::path::Path::new(&path).exists();
+        assert!(gone, "{spelling:?}: the PIN file is gone");
+    }
+}
+
+#[tokio::test]
+async fn b21_a_redeemed_reset_removes_an_older_pin_file() {
+    use sha2::Digest;
+    let t = b21().await;
+    add_user(&t.state, "alice", "pw-alice", false).await;
+    let (path, pin) = b21_reset_pin_at(&t.app, "alice").await;
+    let pin = pin.expect("a PIN for alice");
+    // Earlier builds named the file after the uppercased name.
+    let hex: String = sha2::Sha256::digest("ALICE".as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let path = std::path::PathBuf::from(path);
+    let old = path.with_file_name(format!("passwordreset-{hex}.json"));
+    if old != path {
+        std::fs::rename(&path, &old).unwrap();
+    }
+    let (status, _) = b21_redeem_pin(&t.app, &pin).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!old.exists(), "the older file is gone");
+    assert!(!path.exists());
+}
+
 // ── G2: login limit and proxy trust (XFF) ──
 
 #[tokio::test]
