@@ -26,6 +26,8 @@ pub enum ApiError {
     Forbidden(String),
     Internal(String),
     BadGateway(String),
+    ServiceUnavailable(String),
+    GatewayTimeout(String),
     RateLimited,
 }
 
@@ -52,6 +54,16 @@ impl IntoResponse for ApiError {
                 msg,
             ),
             Self::BadGateway(msg) => (StatusCode::BAD_GATEWAY, "Bad Gateway".to_string(), msg),
+            Self::ServiceUnavailable(msg) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Service Unavailable".to_string(),
+                msg,
+            ),
+            Self::GatewayTimeout(msg) => (
+                StatusCode::GATEWAY_TIMEOUT,
+                "Gateway Timeout".to_string(),
+                msg,
+            ),
             Self::RateLimited => (
                 StatusCode::TOO_MANY_REQUESTS,
                 "Too Many Requests".to_string(),
@@ -101,6 +113,8 @@ impl std::fmt::Display for ApiError {
             Self::Forbidden(msg) => write!(f, "Forbidden: {msg}"),
             Self::Internal(msg) => write!(f, "Internal: {msg}"),
             Self::BadGateway(msg) => write!(f, "Bad Gateway: {msg}"),
+            Self::ServiceUnavailable(msg) => write!(f, "Service Unavailable: {msg}"),
+            Self::GatewayTimeout(msg) => write!(f, "Gateway Timeout: {msg}"),
             Self::RateLimited => write!(f, "Rate Limited"),
         }
     }

@@ -1,12 +1,13 @@
-use axum::extract::{ConnectInfo, Path, State};
-use axum::http::StatusCode;
+use axum::extract::{ConnectInfo, Path, Query, State};
+use axum::http::{StatusCode, header};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use rustyfin_model::auth::Claims;
 use rustyfin_model::server_info::{
     EndpointInfo, FullServerInfo, LogFile, ServerConfiguration, ServerInfo,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -27,6 +28,11 @@ pub fn setup_routes() -> Router<AppState> {
     Router::new()
         .route("/Environment/Drives", get(get_drives))
         .route("/Environment/NetworkShares", get(get_network_shares))
+        .route(
+            "/Environment/DirectoryContents",
+            get(get_directory_contents),
+        )
+        .route("/Environment/ParentPath", get(get_parent_path))
 }
 
 /// Protected (authenticated) system routes
@@ -343,6 +349,186 @@ async fn get_drives() -> Result<Json<Vec<rustyfin_model::environment::DriveInfo>
     Ok(Json(drives))
 }
 
+/// Query for GET /Environment/DirectoryContents.
+#[derive(Deserialize)]
+struct DirectoryContentsQuery {
+    path: String,
+    #[serde(rename = "includeFiles")]
+    include_files: Option<bool>,
+    #[serde(rename = "includeDirectories")]
+    include_directories: Option<bool>,
+    prefix: Option<String>,
+}
+
+/// One entry in a DirectoryContents answer.
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct FileSystemEntryInfo {
+    name: String,
+    path: String,
+    #[serde(rename = "Type")]
+    entry_type: &'static str,
+}
+
+/// Cap on the entries one DirectoryContents answer returns, after sorting and filtering.
+const MAX_DIRECTORY_ENTRIES: usize = 1000;
+
+/// Query for GET /Environment/ParentPath.
+#[derive(Deserialize)]
+struct ParentPathQuery {
+    path: String,
+}
+
+/// How long a folder listing may run before the answer is 504. The read keeps its thread and its
+/// permit, so a hung mount can't hold more than `DirectoryListings::MAX` threads.
+const DIRECTORY_LISTING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Normalises an absolute path lexically: drops `.` and empty components (`//`) and trailing
+/// slashes, and lets `..` pop the previous component (never above `/`). Other paths are returned as given.
+fn normalise_absolute_path(p: &str) -> String {
+    if !p.starts_with('/') {
+        return p.to_string();
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    for comp in p.split('/') {
+        match comp {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            c => parts.push(c),
+        }
+    }
+    format!("/{}", parts.join("/"))
+}
+
+/// GET /Environment/DirectoryContents - lists the folders (and optionally files) directly inside a server path.
+/// Defaults match Jellyfin: folders are off unless `includeDirectories=true`, files off unless
+/// `includeFiles=true`. Hidden names need a `prefix` starting with '.', and the prefix match ignores case.
+/// Names that aren't UTF-8 are skipped. Paths are normalised first (`.`, `..`, `//`, trailing `/`).
+/// At most 1,000 entries are returned, in name order (case-insensitive, then exact).
+/// Missing or non-folder paths answer 404; relative or unreadable paths answer 400.
+/// When `DirectoryListings::MAX` listings already run, the answer is 503 at once. A listing that
+/// takes longer than 10 s answers 504.
+async fn get_directory_contents(
+    State(state): State<AppState>,
+    Query(q): Query<DirectoryContentsQuery>,
+) -> Result<Json<Vec<FileSystemEntryInfo>>, ApiError> {
+    let dir = normalise_absolute_path(&q.path);
+    let permit = state
+        .directory_listings
+        .0
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| {
+            ApiError::ServiceUnavailable(
+                "The server is busy reading other folders; try again.".into(),
+            )
+        })?;
+    let include_files = q.include_files.unwrap_or(false);
+    let include_directories = q.include_directories.unwrap_or(false);
+    let prefix = q.prefix.unwrap_or_default();
+    let show_hidden = prefix.starts_with('.');
+    let prefix_lower = prefix.to_lowercase();
+    let work_dir = dir.clone();
+    let work = tokio::task::spawn_blocking(move || {
+        // The permit lives until this thread finishes, even if the caller has timed out.
+        let _permit = permit;
+        match crate::routes::library::path_problem_blocking(&work_dir) {
+            None => {}
+            Some((true, sentence)) => return Err(ApiError::NotFound(sentence)),
+            Some((false, sentence)) => return Err(ApiError::BadRequest(sentence)),
+        }
+        let Ok(read) = std::fs::read_dir(&work_dir) else {
+            return Ok(Vec::new());
+        };
+        // The largest kept key sits on top, so each new smaller key can replace it.
+        let mut kept: std::collections::BinaryHeap<((String, String), bool)> =
+            std::collections::BinaryHeap::new();
+        for entry in read.flatten() {
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let is_dir = if file_type.is_symlink() {
+                match std::fs::metadata(entry.path()) {
+                    Ok(meta) => meta.is_dir(),
+                    Err(_) => continue,
+                }
+            } else {
+                file_type.is_dir()
+            };
+            let wanted = if is_dir {
+                include_directories
+            } else {
+                include_files
+            };
+            if !wanted {
+                continue;
+            }
+            if name.starts_with('.') && !show_hidden {
+                continue;
+            }
+            if !name.to_lowercase().starts_with(&prefix_lower) {
+                continue;
+            }
+            let key = (name.to_lowercase(), name);
+            if kept.len() < MAX_DIRECTORY_ENTRIES {
+                kept.push((key, is_dir));
+            } else if kept.peek().is_some_and(|(max, _)| key < *max) {
+                kept.pop();
+                kept.push((key, is_dir));
+            }
+        }
+        Ok(kept
+            .into_sorted_vec()
+            .into_iter()
+            .map(|((_, name), is_dir)| FileSystemEntryInfo {
+                path: std::path::Path::new(&work_dir)
+                    .join(&name)
+                    .to_string_lossy()
+                    .into_owned(),
+                name,
+                entry_type: if is_dir { "Directory" } else { "File" },
+            })
+            .collect())
+    });
+    let entries = match tokio::time::timeout(DIRECTORY_LISTING_TIMEOUT, work).await {
+        Err(_elapsed) => {
+            return Err(ApiError::GatewayTimeout(format!(
+                "The server took too long to read the folder \"{dir}\"."
+            )));
+        }
+        Ok(joined) => joined.map_err(|e| ApiError::Internal(e.to_string()))??,
+    };
+    Ok(Json(entries))
+}
+
+/// GET /Environment/ParentPath - the parent of a server path, from the text alone (no disk access).
+/// Relative paths answer 400; the root answers 204 with no parent.
+async fn get_parent_path(Query(q): Query<ParentPathQuery>) -> Result<Response, ApiError> {
+    if !q.path.starts_with('/') {
+        return Err(ApiError::BadRequest(format!(
+            "The folder \"{}\" is not a full path on the server.",
+            q.path
+        )));
+    }
+    let trimmed = q.path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    }
+    // `trimmed` starts with '/', so the last '/' always exists.
+    let cut = trimmed.rfind('/').unwrap_or(0);
+    let parent = if cut == 0 { "/" } else { &trimmed[..cut] };
+    Ok((
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        parent.to_string(),
+    )
+        .into_response())
+}
+
 /// GET /Environment/NetworkShares — Returns list of network shares detected on Linux.
 async fn get_network_shares()
 -> Result<Json<Vec<rustyfin_model::environment::NetworkShare>>, ApiError> {
@@ -493,7 +679,7 @@ fn list_drives() -> Vec<rustyfin_model::environment::DriveInfo> {
 
         drives.push(DriveInfo {
             name: mp.to_string(),
-            drive_type: "Local".to_string(),
+            drive_type: "Directory".to_string(),
             total_size,
             available_free_space: available,
             path: mp.to_string(),
