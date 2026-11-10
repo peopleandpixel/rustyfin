@@ -4,12 +4,18 @@ let currentLibraryId = null;
 let currentDetailId = null;
 let libraries = [];
 let wizStep = 0;
-let wizProgress = { configSaved: false, userCreated: false, loggedIn: false };
+let wizProgress = { configSaved: false, userCreated: false, loggedIn: false, queued: false };
 let wizCredentials = null;
 let wizFinishing = false;
+let wizSkipImport = false; // set by "Finish without importing" for one run of wizComplete
 let wizLibrary = null; // { id, name, type, path } of the library this page created
 let wizListening = false;
+let wizPreview = null; // { path, data } of the last Jellyfin preview that succeeded
+let wizNameDefault = 'admin'; // the account name the wizard last filled in (or the markup's default)
+let wizOthersFor = null; // the Jellyfin user the other-users list was built for
 let wizBusy = false; // true while wizNext runs, so a second Next or Enter is ignored
+// The wizard's step numbers (DOM order, ids wiz-step-N)
+const WIZ = { choice: 1, folder: 2, user: 3, libs: 4, others: 5, account: 6, library: 7, finish: 8 };
 let serverVersion = '0.3.0';
 let playerReportInterval = null;
 let playerHideTimeout = null;
@@ -147,6 +153,7 @@ async function checkSetupWizard() {
         }
         if (!done) {
             initWizardLanguage();
+            wizSetStep(0);
             show('setup-wizard');
             wizFocusStep(wizStep);
             hide('main-navbar');
@@ -189,24 +196,60 @@ function wizStepIndexOf(id) {
     return [...document.querySelectorAll('#setup-wizard .jf-wizard-step')].indexOf(step);
 }
 
+// The choice on step 1: 'yes' imports from Jellyfin; no choice yet counts as the manual path
+function wizChoice() { return document.querySelector('input[name="wiz-import"]:checked')?.value ?? ''; }
+function wizPath() { return wizChoice() === 'yes' ? 'import' : 'manual'; }
+
+// Hides the wizard's steps, rows and dots that belong to the other path
+function wizApplyPath() {
+    // Picking either option clears the "choose one" error from the choice step
+    wizSetError($('wiz-choice-error'), '');
+    const path = wizPath();
+    document.querySelectorAll('#setup-wizard [data-wiz-path]').forEach(el => el.classList.toggle('hidden', el.dataset.wizPath !== path));
+}
+
+// DOM indexes of the steps the chosen path shows
+function wizActiveIndexes() {
+    return [...document.querySelectorAll('#setup-wizard .jf-wizard-step')].flatMap((el, i) => el.classList.contains('hidden') ? [] : [i]);
+}
+
+// The step Next (delta 1) or Back (delta -1) goes to, counted within the chosen path
+function wizMove(delta) {
+    wizApplyPath();
+    const steps = wizActiveIndexes();
+    const at = steps.indexOf(wizStep);
+    return steps[Math.min(steps.length - 1, Math.max(0, at + delta))];
+}
+
 function wizSetStep(s) {
     wizStep = s;
+    wizApplyPath();
+    const steps = wizActiveIndexes(), pos = steps.indexOf(s);
+    document.querySelectorAll('#setup-wizard .jf-wizard-step').forEach((el, i) => el.classList.toggle('active', i === s));
     for (let i = 0; i <= wizLastStep(); i++) {
-        const el = $('wiz-step-' + i);
-        if (el) el.classList.toggle('active', i === s);
         const dot = $('wiz-dot-' + i);
-        if (dot) {
-            dot.className = i === s
-                ? 'h-2 rounded-full transition-all duration-300 w-8 bg-[#00a4dc]'
-                : (i < s ? 'h-2 rounded-full transition-all duration-300 w-4 bg-[#00a4dc]/50' : 'h-2 rounded-full transition-all duration-300 w-2 bg-white/20');
-        }
+        if (!dot) continue;
+        const j = steps.indexOf(i);
+        dot.className = j === pos
+            ? 'h-2 rounded-full transition-all duration-300 w-8 bg-[#00a4dc]'
+            : (j >= 0 && j < pos ? 'h-2 rounded-full transition-all duration-300 w-4 bg-[#00a4dc]/50' : 'h-2 rounded-full transition-all duration-300 w-2 bg-white/20');
+        dot.classList.toggle('hidden', j < 0);
     }
+    if (s === WIZ.account && wizPath() === 'import') prefillAccountName();
+    if (s === WIZ.others) fillOtherUsers();
     if (s === wizLastStep()) {
         $('wiz-summary-user').textContent = $('wiz-username').value.trim();
         const langEl = $('wiz-lang');
         $('wiz-summary-lang').textContent = langEl.options[langEl.selectedIndex].text;
         const libName = $('wiz-lib-name').value.trim(), libPath = $('wiz-lib-path').value.trim();
         $('wiz-summary-library').textContent = libName && libPath ? `${libName}: ${libPath}` : t('wizard.summary_no_library');
+        if (wizPath() === 'import') {
+            const names = (list) => list.length ? list.join(', ') : t('wizard.summary_none');
+            $('wiz-summary-jf-folder').textContent = wizPreview.path;
+            $('wiz-summary-jf-user').textContent = wizPickedUser().Name;
+            $('wiz-summary-jf-libraries').textContent = names(wizCheckedLibRows().map(r => r.querySelector('.wiz-lib-name').value.trim()));
+            $('wiz-summary-jf-users').textContent = names([...document.querySelectorAll('.wiz-other-user:checked')].map(c => c.parentElement.textContent.trim()));
+        }
     }
     wizFocusStep(s);
 }
@@ -238,6 +281,166 @@ function wizEnterKey(e) {
 }
 document.addEventListener('keydown', wizEnterKey);
 
+// --- Jellyfin import in the wizard (helpers for the steps) ---
+function wizClone(id) { return $(id).content.cloneNode(true); }
+
+// Shows or hides an error line under a field; an empty message hides it
+function wizSetError(el, message) {
+    el.textContent = message;
+    el.classList.toggle('hidden', !message);
+    return !message;
+}
+
+function wizPickedUser() {
+    const id = document.querySelector('input[name="wiz-jf-user"]:checked')?.value;
+    return wizPreview?.data.Users.find(u => u.JellyfinId === id) ?? null;
+}
+
+// The account name follows the picked Jellyfin user until the admin types another name
+function prefillAccountName() {
+    const picked = wizPickedUser();
+    if (!picked) return;
+    const name = $('wiz-username');
+    if (!name.value.trim() || name.value === wizNameDefault) name.value = picked.Name;
+    wizNameDefault = picked.Name;
+}
+
+// One checkbox per Jellyfin user except the picked one, all checked; rebuilt only when the pick changes
+function fillOtherUsers() {
+    const picked = wizPickedUser();
+    if (!picked || wizOthersFor === picked.JellyfinId) return;
+    wizOthersFor = picked.JellyfinId;
+    $('wiz-jf-others').replaceChildren(...wizPreview.data.Users.filter(u => u !== picked).map(u => {
+        const frag = wizClone('wiz-tpl-other');
+        frag.querySelector('.wiz-name').textContent = u.Name;
+        frag.querySelector('.wiz-other-user').value = u.JellyfinId;
+        return frag;
+    }));
+}
+
+// The user and library lists of steps 3 and 4 for a new preview
+function wizFillLists(data) {
+    $('wiz-jf-users').replaceChildren(...data.Users.map(u => {
+        const frag = wizClone('wiz-tpl-user');
+        frag.querySelector('input').value = u.JellyfinId;
+        frag.querySelector('.wiz-name').textContent = u.Name;
+        const tag = frag.querySelector('.wiz-admin-tag');
+        tag.hidden = !u.WasAdministrator;
+        tag.textContent = t('wizard.user_admin_tag');
+        frag.querySelector('.wiz-played').textContent = t('wizard.user_played', { count: u.PlayedItems });
+        return frag;
+    }));
+    $('wiz-jf-libs').replaceChildren(...data.Libraries.map(wizLibraryRow));
+    wizOthersFor = null;
+}
+
+const WIZ_LIB_TYPES = { Movies: 'library.type_movies', TvShows: 'library.type_shows', Music: 'library.type_music', Photos: 'library.type_photos', Mixed: 'library.type_mixed' };
+
+function wizLibraryRow(lib) {
+    const frag = wizClone('wiz-tpl-lib');
+    const row = frag.querySelector('.wiz-lib-row');
+    const supported = lib.ContentType !== null;
+    const check = row.querySelector('.wiz-lib-check');
+    check.checked = supported;
+    check.disabled = !supported;
+    row.querySelector('.wiz-lib-jf-name').textContent = lib.Name;
+    const note = row.querySelector('.wiz-lib-unsupported');
+    note.textContent = t('wizard.lib_unsupported');
+    note.classList.toggle('hidden', supported);
+    row.querySelector('.wiz-lib-name').value = lib.Name;
+    row.querySelector('.wiz-lib-name-label').textContent = t('wizard.library_name');
+    row.querySelector('.wiz-lib-type-label').textContent = t('wizard.content_type');
+    const type = row.querySelector('.wiz-lib-type');
+    type.replaceChildren(...Object.entries(WIZ_LIB_TYPES).map(([value, key]) => new Option(t(key), value)));
+    type.value = lib.ContentType ?? 'Mixed';
+    // A library without Jellyfin paths gets one empty field: the admin must enter a path for it
+    row.querySelector('.wiz-lib-paths').replaceChildren(...(lib.Paths.length ? lib.Paths : ['']).map(wizPathRow));
+    // A library whose type can't be created stays read-only: its name, type and paths are disabled too
+    row.querySelectorAll('.wiz-lib-name, .wiz-lib-type, .wiz-path-input').forEach(i => { i.disabled = !supported; });
+    return frag;
+}
+
+// One path of a library: the field holds the Jellyfin path until the admin changes it
+function wizPathRow(from) {
+    const frag = wizClone('wiz-tpl-path');
+    const el = frag.querySelector('.wiz-path');
+    el.dataset.from = from;
+    el.querySelector('.wiz-path-label').textContent = t('wizard.path_on_server');
+    el.querySelector('.wiz-path-input').value = from;
+    el.querySelector('.wiz-jf-path-label').textContent = t('wizard.jellyfin_path');
+    el.querySelector('.wiz-jf-path').textContent = from;
+    return frag;
+}
+
+function wizCheckedLibRows() {
+    return [...document.querySelectorAll('.wiz-lib-row')].filter(r => r.querySelector('.wiz-lib-check').checked);
+}
+
+// Checked libraries need unique names, and every path of them must exist on this server
+async function wizCheckLibraries() {
+    const rows = wizCheckedLibRows();
+    const seen = new Set();
+    let ok = true;
+    for (const row of rows) {
+        const key = row.querySelector('.wiz-lib-name').value.trim().toLowerCase();
+        const msg = !key ? t('wizard.lib_name_required') : seen.has(key) ? t('wizard.lib_name_duplicate') : '';
+        seen.add(key);
+        if (!wizSetError(row.querySelector('.wiz-lib-error'), msg)) ok = false;
+    }
+    // Without a token (owner created, not signed in) ValidatePath would answer 401; the queue checks the paths then
+    const canCheck = !wizProgress.userCreated || wizProgress.loggedIn;
+    for (const input of rows.flatMap(r => [...r.querySelectorAll('.wiz-path-input')])) {
+        const value = input.value.trim();
+        let msg = value ? '' : t('wizard.lib_path_required');
+        if (!msg && canCheck) {
+            try { await API.validatePath(value); } catch (e) { msg = e.message; }
+        }
+        if (!wizSetError(input.closest('.wiz-path').querySelector('.wiz-path-error'), msg)) ok = false;
+    }
+    return ok;
+}
+
+// Reads the Jellyfin folder when its path is new; answers whether the step may close
+async function wizReadJellyfin() {
+    const path = $('wiz-jf-path').value.trim();
+    const err = $('wiz-jf-error');
+    if (!path) return wizSetError(err, t('wizard.jf_folder_required'));
+    if (wizPreview?.path === path) return wizSetError(err, '');
+    const btn = document.querySelector('#wiz-step-2 .jf-btn-primary');
+    btn.disabled = true;
+    try {
+        const data = await API.setupJellyfinPreview(path);
+        wizPreview = { path, data };
+        wizFillLists(data);
+        return wizSetError(err, '');
+    } catch (e) {
+        wizPreview = null;
+        return wizSetError(err, e.message);
+    } finally {
+        btn.disabled = false;
+    }
+}
+
+// The body of POST /JellyfinImport/Queue: the picked user, the checked users and libraries
+function wizQueueBody() {
+    return {
+        SourcePath: wizPreview.path,
+        Layout: wizPreview.data.Layout,
+        IntoMyAccount: wizPickedUser().JellyfinId,
+        UserIds: [...document.querySelectorAll('.wiz-other-user:checked')].map(c => c.value),
+        Libraries: wizCheckedLibRows().map(row => ({
+            Name: row.querySelector('.wiz-lib-name').value.trim(),
+            ContentType: row.querySelector('.wiz-lib-type').value,
+            Paths: [...row.querySelectorAll('.wiz-path')].map(p => ({ From: p.dataset.from, To: p.querySelector('.wiz-path-input').value.trim() }))
+        }))
+    };
+}
+
+// Once the import is queued the Jellyfin choices are fixed: the queue is built from them
+function wizLockImport() {
+    document.querySelectorAll('#setup-wizard input[name="wiz-import"], #setup-wizard [data-wiz-path="import"] input').forEach(i => { i.disabled = true; });
+}
+
 // Closes the wizard when the server reports the setup complete and this page did not create the owner
 // (another tab or device finished it, or this page was loaded before). Answers whether it closed.
 async function wizLeaveIfDone(force = false) {
@@ -262,59 +465,71 @@ async function wizNext() {
     if (primary) primary.disabled = true;
     try {
         if (await wizLeaveIfDone()) return;
-        if (wizStep === wizStepIndexOf('wiz-lib-path')) {
-            const name = $('wiz-lib-name').value.trim(), path = $('wiz-lib-path').value.trim();
-            if (!name && !path) {
-                hide('wiz-lib-error');
-            } else if (!name || !path) {
-                $('wiz-lib-error').textContent = t('wizard.library_incomplete');
-                show('wiz-lib-error');
-                return;
-            } else if (wizProgress.userCreated && !wizProgress.loggedIn) {
-                // The owner exists but this page has no token, so ValidatePath would answer 401.
-                // Skip the check; Finish's library create checks the path anyway.
-                hide('wiz-lib-error');
-            } else {
-                const nextBtn = document.querySelector('#wiz-step-' + wizStep + ' .jf-btn-primary');
-                nextBtn.disabled = true;
-                try {
-                    await API.validatePath(path);
-                    hide('wiz-lib-error');
-                } catch (e) {
-                    $('wiz-lib-error').textContent = e.message;
-                    show('wiz-lib-error');
-                    return;
-                } finally {
-                    nextBtn.disabled = false;
-                }
-            }
-        }
-        if (wizStep === 1) {
-            const pw = $('wiz-password').value, pw2 = $('wiz-password2').value;
-            const user = $('wiz-username').value.trim();
-            if (!user) {
-                $('wiz-user-error').textContent = t('wizard.username_required');
-                show('wiz-user-error');
-                return;
-            }
-            if (pw && pw !== pw2) {
-                $('wiz-user-error').textContent = t('wizard.passwords_mismatch');
-                show('wiz-user-error');
-                return;
-            }
-            hide('wiz-user-error');
-        }
-        wizSetStep(Math.min(wizStep + 1, wizLastStep()));
+        if (await wizCheckStep()) wizSetStep(wizMove(1));
     } finally {
         wizBusy = false;
         if (primary) primary.disabled = false;
     }
 }
 
+// Checks the current step before Next leaves it. Answers true to move on; a false or an early return stays.
+async function wizCheckStep() {
+    if (wizStep === WIZ.choice) {
+        const ok = !!wizChoice();
+        return wizSetError($('wiz-choice-error'), ok ? '' : t('wizard.import_choice_required'));
+    }
+    if (wizStep === WIZ.folder) return wizReadJellyfin();
+    if (wizStep === WIZ.user) return wizSetError($('wiz-user-pick-error'), wizPickedUser() ? '' : t('wizard.user_required'));
+    if (wizStep === WIZ.libs) return wizCheckLibraries();
+    if (wizStep === wizStepIndexOf('wiz-lib-path')) {
+        const name = $('wiz-lib-name').value.trim(), path = $('wiz-lib-path').value.trim();
+        if (!name && !path) {
+            hide('wiz-lib-error');
+        } else if (!name || !path) {
+            $('wiz-lib-error').textContent = t('wizard.library_incomplete');
+            show('wiz-lib-error');
+            return;
+        } else if (wizProgress.userCreated && !wizProgress.loggedIn) {
+            // The owner exists but this page has no token, so ValidatePath would answer 401.
+            // Skip the check; Finish's library create checks the path anyway.
+            hide('wiz-lib-error');
+        } else {
+            const nextBtn = document.querySelector('#wiz-step-' + wizStep + ' .jf-btn-primary');
+            nextBtn.disabled = true;
+            try {
+                await API.validatePath(path);
+                hide('wiz-lib-error');
+            } catch (e) {
+                $('wiz-lib-error').textContent = e.message;
+                show('wiz-lib-error');
+                return;
+            } finally {
+                nextBtn.disabled = false;
+            }
+        }
+    }
+    if (wizStep === WIZ.account) {
+        const pw = $('wiz-password').value, pw2 = $('wiz-password2').value;
+        const user = $('wiz-username').value.trim();
+        if (!user) {
+            $('wiz-user-error').textContent = t('wizard.username_required');
+            show('wiz-user-error');
+            return;
+        }
+        if (pw && pw !== pw2) {
+            $('wiz-user-error').textContent = t('wizard.passwords_mismatch');
+            show('wiz-user-error');
+            return;
+        }
+        hide('wiz-user-error');
+    }
+    return true;
+}
+
 async function wizPrev() {
     if (wizFinishing) return;
     if (await wizLeaveIfDone()) return;
-    wizSetStep(Math.max(wizStep - 1, 0));
+    wizSetStep(wizMove(-1));
 }
 
 function wizSkipLibrary() {
@@ -324,21 +539,36 @@ function wizSkipLibrary() {
     wizNext();
 }
 
+// After a Queue error the finish button retries the queue, and "Finish without importing" appears
+function wizShowQueueError(failed) {
+    $('wiz-skip-import-btn').classList.toggle('hidden', !failed);
+    $('wiz-finish-btn').textContent = t(failed ? 'wizard.retry' : 'wizard.finish');
+}
+
+function wizFinishWithoutImport() {
+    if (wizFinishing) return;
+    wizSkipImport = true;
+    return wizComplete();
+}
+
 async function wizComplete() {
     if (wizFinishing) return;
     wizFinishing = true;
+    const skipImport = wizSkipImport;
+    wizSkipImport = false;
     const btn = $('wiz-finish-btn');
     const back = document.querySelector('#wiz-step-' + wizStep + ' [onclick="wizPrev()"]');
-    const showFinishError = (message) => {
+    const showFinishError = (message, hint = t('wizard.retry_hint')) => {
         const el = $('wiz-finish-error');
         el.textContent = message;
-        el.append(document.createElement('br'), t('wizard.retry_hint'));
+        el.append(document.createElement('br'), hint);
         show('wiz-finish-error');
     };
     try {
         btn.disabled = true;
         if (back) back.disabled = true;
         hide('wiz-finish-error');
+        wizShowQueueError(false);
         if (await wizLeaveIfDone(true)) return;
         if (!wizProgress.configSaved) {
             try {
@@ -381,10 +611,25 @@ async function wizComplete() {
                 return;
             }
         }
+        // The import runs in the background: Queue creates its libraries and the other users' accounts
+        // Queue answers 409 when a queue from an earlier try is already there: that counts as queued
+        if (wizPath() === 'import' && !wizProgress.queued && !skipImport) {
+            try {
+                await API.queueJellyfinImport(wizQueueBody());
+            } catch (e) {
+                if (e.status !== 409) {
+                    showFinishError(e.message, t('wizard.queue_failed_hint'));
+                    wizShowQueueError(true);
+                    return;
+                }
+            }
+            wizProgress.queued = true;
+            wizLockImport();
+        }
         // The library step may have changed since this page created its library; the page's last choice wins
         const libName = $('wiz-lib-name').value.trim(), libPath = $('wiz-lib-path').value.trim();
         const libType = $('wiz-lib-type').value;
-        const want = libName && libPath ? { name: libName, type: libType, path: libPath } : null;
+        const want = wizPath() !== 'import' && libName && libPath ? { name: libName, type: libType, path: libPath } : null;
         if (wizLibrary && (!want || wizLibrary.name !== want.name || wizLibrary.type !== want.type || wizLibrary.path !== want.path)) {
             try {
                 await API.deleteLibrary(wizLibrary.id);
@@ -419,7 +664,8 @@ async function wizComplete() {
         show('main-navbar');
         updateAuthUI();
         await loadSidebar();
-        navigate(API.isLoggedIn() ? 'home' : 'login');
+        if (wizPath() === 'import' && !skipImport) navigate('admin', 'import');
+        else navigate(API.isLoggedIn() ? 'home' : 'login');
     } finally {
         wizFinishing = false;
         btn.disabled = false;
@@ -454,7 +700,7 @@ function navigate(page, data) {
         search: () => renderSearch(data),
         person: () => renderPerson(data),
         settings: () => renderSettings(data),
-        admin: renderAdmin
+        admin: () => renderAdmin(data)
     };
 
     if (pages[page]) pages[page]();
@@ -2968,7 +3214,7 @@ async function handleSaveConfig(e) {
 // AccountStatus.UserId has hyphens and a user's Id may not, so account ids are compared without case and hyphens.
 function oidcAccountKey(id) { return String(id).toLowerCase().replace(/-/g, ''); }
 
-async function renderAdmin() {
+async function renderAdmin(tab) {
     const page = $('page-admin');
     if (!API.isAdmin) {
         page.innerHTML = `<div class="p-8 text-center text-yellow-400 jf-page">${t('admin.access_denied')}</div>`;
@@ -3208,6 +3454,8 @@ async function renderAdmin() {
 
             ${jiPanelHtml()}
         </div>`;
+        // #admin/import opens the import tab (the wizard's last step sends the admin there)
+        if (tab === 'import') showAdminTab(page.querySelector('[data-tab="admin-import"]'), 'admin-import');
     } catch (e) {
         page.innerHTML = `<div class="p-6 rounded-xl bg-red-500/10 text-red-400">${escapeHtml(e.message)}</div>`;
     }
@@ -3431,7 +3679,8 @@ const jiStageKeys = {
     Matching: 'jellyfin_import.stage_matching',
     Users: 'jellyfin_import.stage_users',
     WatchData: 'jellyfin_import.stage_watch_data',
-    Metadata: 'jellyfin_import.stage_metadata'
+    Metadata: 'jellyfin_import.stage_metadata',
+    Scanning: 'jellyfin_import.stage_scanning'
 };
 const jiActionKeys = {
     Match: 'jellyfin_import.action_match',
