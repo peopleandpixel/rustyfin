@@ -104,7 +104,10 @@
                 <h2 class="text-lg font-bold text-white mb-2" data-i18n="wizard.jf_folder_title">Jellyfin data folder</h2>
                 <p class="text-white/60 text-xs mb-5" data-i18n="wizard.jf_folder_intro">Enter the folder that holds data/jellyfin.db. In the official Docker image that is /config.</p>
                 <label for="wiz-jf-path" class="block text-xs font-medium text-white/70 mb-1.5" data-i18n="wizard.folder_path">Folder path</label>
-                <input type="text" id="wiz-jf-path" class="jf-input w-full" placeholder="/config" autocomplete="off">
+                <div class="path-field flex gap-2">
+                    <input type="text" id="wiz-jf-path" class="jf-input flex-1 min-w-0" placeholder="/config" autocomplete="off" data-path-field list="path-suggestions" spellcheck="false">
+                    <button type="button" class="jf-btn-ghost !px-3 !py-2 text-xs whitespace-nowrap" data-action="browse-path" data-i18n="library.browse">📁 Browse</button>
+                </div>
             </div>
             <div id="wiz-jf-error" class="text-red-400 text-xs mt-2 hidden p-2 rounded bg-red-500/10 border border-red-500/20"></div>
             <div class="flex justify-between mt-6">
@@ -193,7 +196,10 @@
         <template id="wiz-tpl-path">
             <div class="wiz-path">
                 <label class="wiz-path-label block text-xs font-medium text-white/70 mb-1.5"></label>
-                <input type="text" class="wiz-path-input jf-input w-full">
+                <div class="path-field flex gap-2">
+                    <input type="text" class="wiz-path-input jf-input flex-1 min-w-0" data-path-field list="path-suggestions" autocomplete="off" spellcheck="false">
+                    <button type="button" class="jf-btn-ghost !px-3 !py-2 text-xs whitespace-nowrap" data-action="browse-path" data-i18n="library.browse">📁 Browse</button>
+                </div>
                 <p class="text-xs text-white/40 mt-1"><span class="wiz-jf-path-label"></span> <span class="wiz-jf-path font-mono break-all"></span></p>
                 <div class="wiz-path-error hidden text-red-400 text-xs mt-1"></div>
             </div>
@@ -249,7 +255,10 @@
                     </div>
                     <div>
                         <label class="block text-xs font-medium text-white/70 mb-1.5" data-i18n="wizard.folder_path">Folder path</label>
-                        <input type="text" id="wiz-lib-path" class="jf-input w-full" placeholder="/media/movies" data-i18n-placeholder="wizard.folder_path_placeholder">
+                        <div class="path-field flex gap-2">
+                            <input type="text" id="wiz-lib-path" class="jf-input flex-1 min-w-0" placeholder="/media/movies" data-i18n-placeholder="wizard.folder_path_placeholder" data-path-field list="path-suggestions" autocomplete="off" spellcheck="false">
+                            <button type="button" class="jf-btn-ghost !px-3 !py-2 text-xs whitespace-nowrap" data-action="browse-path" data-i18n="library.browse">📁 Browse</button>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -554,24 +563,14 @@
             </div>
             <div>
                 <label class="block text-xs font-semibold text-white/70 mb-1" data-i18n="library.storage_paths">Storage paths</label>
-                <div class="flex gap-2">
-                    <input id="add-lib-path-input" name="paths" class="jf-input flex-1" placeholder="/media/movies">
-                    <button type="button" class="jf-btn-ghost !px-3 !py-2 text-xs whitespace-nowrap" onclick="openDirectoryPicker()" data-i18n="library.browse">📁 Browse</button>
+                <div id="add-lib-paths" class="space-y-2">
+                    <div class="path-field flex gap-2">
+                        <input id="add-lib-path-input" name="paths" class="jf-input flex-1 min-w-0" placeholder="/media/movies" data-path-field list="path-suggestions" autocomplete="off" spellcheck="false">
+                        <button type="button" class="jf-btn-ghost !px-3 !py-2 text-xs whitespace-nowrap" data-action="browse-path" data-i18n="library.browse">📁 Browse</button>
+                    </div>
                 </div>
-                <div id="add-lib-selected-paths" class="mt-2 space-y-1"></div>
-                <p class="text-[11px] text-white/30 mt-1" data-i18n="library.paths_hint">Or separate multiple paths with commas: /media/movies, /srv/movies</p>
-            </div>
-            <!-- Folder picker (inline): the field shows the open folder; type a path and press Enter to open it -->
-            <div id="directory-picker" class="hidden">
-                <div class="flex items-center gap-2 mb-2">
-                    <button type="button" class="jf-btn-ghost !px-2 !py-1 text-xs" onclick="directoryPickerBack()" data-i18n="wizard.back">← Back</button>
-                    <input id="directory-picker-path" type="text" value="/" class="jf-input flex-1 !py-1 text-xs font-mono" spellcheck="false" autocomplete="off" aria-label="Folder path" data-i18n-aria-label="library.folder_path" onkeydown="directoryPickerPathKeydown(event)">
-                    <button type="button" class="jf-btn-ghost !px-2 !py-1 text-xs" onclick="closeDirectoryPicker()" data-i18n="common.close">Close</button>
-                </div>
-                <div id="directory-picker-list" class="max-h-48 overflow-y-auto space-y-0.5 border border-white/10 rounded-lg"></div>
-                <div class="flex justify-end mt-2">
-                    <button type="button" class="jf-btn-primary !px-3 !py-1.5 text-xs" onclick="selectCurrentDirectory()" data-i18n="library.select_folder">Select this folder</button>
-                </div>
+                <button type="button" class="jf-btn-ghost !px-3 !py-1.5 text-xs mt-2" data-action="add-lib-path" data-i18n="library.add_path">+ Add path</button>
+                <p class="text-[11px] text-white/30 mt-1" data-i18n="library.paths_hint">Add more folders with “Add path”.</p>
             </div>
             <div>
                 <div class="flex items-center gap-3">
@@ -663,5 +662,19 @@
 <script>
 if('serviceWorker' in navigator){window.addEventListener('load',()=>{navigator.serviceWorker.register('/web/sw.js').catch(()=>{});});}
 </script>
+<datalist id="path-suggestions"></datalist>
+<dialog id="folder-browser" class="modal folder-browser bg-black/70 backdrop-blur-md" aria-labelledby="folder-browser-path">
+    <div class="modal-box jf-menu rounded-2xl p-6" style="width:min(28rem, calc(100vw - 2rem))">
+        <p id="folder-browser-path" class="font-mono text-xs break-all mb-3" aria-live="polite"></p>
+        <div class="flex flex-wrap items-center gap-2 mb-2">
+            <button type="button" class="jf-btn-ghost !px-3 !py-1.5 text-xs" data-action="folder-up" data-i18n="library.parent_folder">Parent folder</button>
+            <div class="flex gap-2 ml-auto">
+                <button type="button" class="jf-btn-ghost !px-3 !py-1.5 text-xs" data-action="folder-cancel" data-i18n="common.cancel">Cancel</button>
+                <button type="button" class="jf-btn-primary !px-3 !py-1.5 text-xs" data-action="folder-select" data-i18n="library.select_folder">Select this folder</button>
+            </div>
+        </div>
+        <div id="folder-browser-list" class="overflow-y-auto space-y-0.5 border border-white/10 rounded-lg" style="max-height:50vh"></div>
+    </div>
+</dialog>
 </body>
 </html>
