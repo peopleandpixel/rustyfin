@@ -6,17 +6,23 @@ use tower::Service;
 
 use tokio::sync::{RwLock, broadcast, watch};
 use tower_http::compression::CompressionLayer;
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
+use tower_http::limit::RequestBodyLimitLayer;
+use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
 use rustyfin_api::log_stream::LogStreamLayer;
-use rustyfin_api::middleware::{DEFAULT_LOGIN_LIMIT, DEFAULT_LOGIN_WINDOW_SECS, RateLimiter};
+use rustyfin_api::middleware::{
+    DEFAULT_LOGIN_LIMIT, DEFAULT_LOGIN_WINDOW_SECS, DEFAULT_RESOURCE_LIMIT,
+    DEFAULT_RESOURCE_WINDOW_SECS, RateLimiter,
+};
 use rustyfin_api::routes::build_router;
 use rustyfin_api::state::AppState;
 use rustyfin_core::image_proxy::{IMAGE_CACHE_MAX_BYTES, sweep_image_cache};
+use rustyfin_model::plugin::Plugin;
 use rustyfin_model::server_info::ServerConfiguration;
 
 #[tokio::main]
@@ -104,22 +110,27 @@ async fn main() {
     let api_key = credentials::api_key(std::env::var("RUSTYFIN_API_KEY").ok());
 
     let tmdb_settings = match rustyfin_core::tmdb_client::TmdbSettings::from_env() {
-        Ok(settings) => settings,
+        Ok(settings) => {
+            tracing::info!(
+                "TMDb API at {}, images at {}, key from {}",
+                settings.api_base_url,
+                settings.image_base_url,
+                if settings.env_key.is_some() {
+                    "RUSTYFIN_TMDB_API_KEY"
+                } else {
+                    "the server config, if set"
+                }
+            );
+            settings
+        }
         Err(e) => {
-            tracing::error!("{e}");
-            std::process::exit(1);
+            tracing::warn!(
+                "TMDb settings not loaded ({}) — TMDb plugin will use defaults; set RUSTYFIN_TMDB_API_KEY to enable",
+                e
+            );
+            rustyfin_core::tmdb_client::TmdbSettings::default()
         }
     };
-    tracing::info!(
-        "TMDb API at {}, images at {}, key from {}",
-        tmdb_settings.api_base_url,
-        tmdb_settings.image_base_url,
-        if tmdb_settings.env_key.is_some() {
-            "RUSTYFIN_TMDB_API_KEY"
-        } else {
-            "the server config, if set"
-        }
-    );
 
     // Load or create server configuration
     let mut config = load_config(&data_dir);
@@ -166,8 +177,21 @@ async fn main() {
     transcode_manager.spawn_cleanup_task();
 
     let data_dir_arc = Arc::new(data_dir);
-    let task_scheduler =
-        rustyfin_core::scheduler::TaskScheduler::new(pool.clone(), data_dir_arc.clone());
+
+    // Shared HTTP client for external API calls (TMDB, etc.) - reuse connection pool
+    let http_client = reqwest::Client::builder()
+        .user_agent(rustyfin_core::tmdb_client::USER_AGENT)
+        .pool_max_idle_per_host(10)
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("Failed to build HTTP client");
+
+    let task_scheduler = rustyfin_core::scheduler::TaskScheduler::with_http_client(
+        pool.clone(),
+        data_dir_arc.clone(),
+        http_client.clone(),
+    );
     task_scheduler
         .changes()
         .set_delay(std::time::Duration::from_secs(u64::from(
@@ -181,6 +205,92 @@ async fn main() {
 
     let plugin_manager = rustyfin_core::plugin_manager::PluginManager::new(&data_dir_arc);
     plugin_manager.load_all().await;
+
+    // Register built-in plugins with database-backed configuration
+    let plugin_manager_with_db = plugin_manager.with_database(pool.clone());
+
+    // Helper: register a built-in plugin, loading config and status from DB if available.
+    // Plugins are DISABLED by default — they must be explicitly enabled via the API or by
+    // storing an Active status in the database. This ensures fast scans without external API calls.
+    async fn register_builtin_plugin<P: rustyfin_model::plugin::Plugin>(
+        plugin: &P,
+        pm: &rustyfin_core::plugin_manager::PluginManager,
+    ) {
+        // Try to load saved config from DB
+        let mut status = rustyfin_model::plugin::PluginStatus::Disabled;
+        if let Some(saved_config) = pm.load_plugin_config_from_db(plugin.id()).await {
+            if let Err(e) = plugin.set_configuration(saved_config.clone()) {
+                tracing::warn!("failed to apply saved config for {}: {}", plugin.id(), e);
+            }
+            // Check if status was saved
+            if let Some(status_str) = saved_config.get("status").and_then(|v| v.as_str()) {
+                status = match status_str {
+                    "Active" => rustyfin_model::plugin::PluginStatus::Active,
+                    "Disabled" => rustyfin_model::plugin::PluginStatus::Disabled,
+                    "Malfunctioned" => rustyfin_model::plugin::PluginStatus::Malfunctioned,
+                    _ => rustyfin_model::plugin::PluginStatus::Disabled,
+                };
+            }
+        }
+        if status == rustyfin_model::plugin::PluginStatus::Active {
+            tracing::info!("plugin {} enabled (from saved config)", plugin.id());
+        }
+        pm.register_builtin_plugin(rustyfin_core::plugin_manager::BuiltinPluginInfo {
+            name: plugin.name().to_string(),
+            version: plugin.version().to_string(),
+            id: plugin.id().to_string(),
+            description: plugin.description().to_string(),
+            plugin_type: plugin.plugin_type(),
+            status,
+        })
+        .await;
+    }
+
+    // Register TMDb plugin (disabled by default)
+    {
+        let tmdb_plugin = plugin_tmdb::TmdbPlugin::default();
+        // Check env var for API key (configuration only; plugin is still disabled by default)
+        if let Ok(key) = std::env::var("RUSTYFIN_TMDB_API_KEY")
+            && !key.trim().is_empty()
+        {
+            let _ = tmdb_plugin.set_configuration(serde_json::json!({ "api_key": key }));
+        }
+        register_builtin_plugin(&tmdb_plugin, &plugin_manager_with_db).await;
+        // Register as metadata provider — will be active only if the plugin is enabled
+        if let Err(e) =
+            plugin_tmdb::register_tmdb_provider(&tmdb_plugin, &plugin_manager_with_db).await
+        {
+            tracing::debug!("TMDb plugin not registered as provider (no API key): {}", e);
+        }
+    }
+
+    // Register OMDb plugin (disabled by default)
+    {
+        let omdb_plugin = plugin_omdb::OmdbPlugin::default();
+        register_builtin_plugin(&omdb_plugin, &plugin_manager_with_db).await;
+        if let Err(e) =
+            plugin_omdb::register_omdb_provider(&omdb_plugin, &plugin_manager_with_db).await
+        {
+            tracing::debug!("OMDb plugin not registered as provider (no API key): {}", e);
+        }
+    }
+
+    // Register Fanart.tv plugin (disabled by default)
+    {
+        let fanart_plugin = plugin_fanart::FanartPlugin::default();
+        register_builtin_plugin(&fanart_plugin, &plugin_manager_with_db).await;
+        if let Err(e) =
+            plugin_fanart::register_fanart_provider(&fanart_plugin, &plugin_manager_with_db).await
+        {
+            tracing::debug!(
+                "Fanart.tv plugin not registered as provider (no API key): {}",
+                e
+            );
+        }
+    }
+
+    // Use the DB-backed plugin manager for the app state
+    let plugin_manager = plugin_manager_with_db;
 
     // Rate limiter: default 10 requests per 60 seconds per resolved client IP, for the login
     // endpoints only (AuthenticateByName, AuthenticateWithSetupCode, ForgotPassword,
@@ -197,6 +307,18 @@ async fn main() {
     let rate_limiter = RateLimiter::new(rate_max, rate_window);
     rate_limiter.start_cleanup();
 
+    // Resource-intensive endpoint rate limiter (transcoding, streaming start)
+    let resource_rate_max: usize = std::env::var("RUSTYFIN_RESOURCE_LIMIT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_RESOURCE_LIMIT);
+    let resource_rate_window: u64 = std::env::var("RUSTYFIN_RESOURCE_WINDOW")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_RESOURCE_WINDOW_SECS);
+    let resource_limiter = RateLimiter::new(resource_rate_max, resource_rate_window);
+    resource_limiter.start_cleanup();
+
     // Reverse proxies we trust to set X-Forwarded-For (comma-separated CIDRs or IPs). Loopback is
     // trusted only when listed.
     let known_proxies = Arc::new(rustyfin_api::middleware::parse_known_proxies(
@@ -207,14 +329,6 @@ async fn main() {
     let cache = rustyfin_api::cache::ApiCache::new();
     let image_cache = rustyfin_api::cache::ImageCache::new();
 
-    // Shared HTTP client for external API calls (TMDB, etc.) - reuse connection pool
-    let http_client = reqwest::Client::builder()
-        .user_agent(rustyfin_core::tmdb_client::USER_AGENT)
-        .pool_max_idle_per_host(10)
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .expect("Failed to build HTTP client");
     let tmdb = rustyfin_core::tmdb_client::TmdbClient::new(http_client.clone(), tmdb_settings);
 
     let state = AppState {
@@ -231,6 +345,7 @@ async fn main() {
         task_scheduler: task_scheduler.clone(),
         plugin_manager,
         rate_limiter,
+        resource_limiter,
         known_proxies,
         ws_broadcast,
         log_level_tx,
@@ -329,9 +444,74 @@ async fn main() {
     let sighup_changes = state.task_scheduler.changes().clone();
     let sighup_watcher = state.task_scheduler.watcher().clone();
     let cache = state.cache.clone();
+    // Security headers: prevent clickjacking, MIME-sniffing, and restrict content sources
+    use axum::http::header;
+    let x_frame_options = header::HeaderValue::from_static("SAMEORIGIN");
+    let x_content_type_options = header::HeaderValue::from_static("nosniff");
+    let x_xss_protection = header::HeaderValue::from_static("0");
+    let referrer_policy = header::HeaderValue::from_static("strict-origin-when-cross-origin");
+
+    // CORS: configurable origins via RUSTYFIN_CORS_ORIGINS (comma-separated).
+    // Defaults to a permissive-mirror mode so the web client works from any origin.
+    // Set to a comma-separated list to restrict (e.g. "https://app.example.com").
+    let cors_origins = std::env::var("RUSTYFIN_CORS_ORIGINS").unwrap_or_default();
+    let cors_layer = if cors_origins.is_empty() {
+        // Default: mirror the request origin (reflects back whatever Origin the browser sends).
+        // This is safer than wildcard (*) when credentials are involved, and still allows
+        // any origin. For production, set RUSTYFIN_CORS_ORIGINS to restrict.
+        CorsLayer::new()
+            .allow_origin(AllowOrigin::mirror_request())
+            .allow_methods(AllowMethods::any())
+            .allow_headers(AllowHeaders::any())
+            .max_age(std::time::Duration::from_secs(86400))
+    } else {
+        // Parse comma-separated origins into a fixed list
+        let origins: Vec<header::HeaderValue> = cors_origins
+            .split(',')
+            .filter_map(|s| header::HeaderValue::from_str(s.trim()).ok())
+            .collect();
+        if origins.is_empty() {
+            tracing::warn!(
+                "RUSTYFIN_CORS_ORIGINS contains no valid origins — falling back to mirror mode"
+            );
+            CorsLayer::new()
+                .allow_origin(AllowOrigin::mirror_request())
+                .allow_methods(AllowMethods::any())
+                .allow_headers(AllowHeaders::any())
+                .max_age(std::time::Duration::from_secs(86400))
+        } else {
+            tracing::info!("CORS origins restricted to: {:?}", origins);
+            CorsLayer::new()
+                .allow_origin(AllowOrigin::list(origins))
+                .allow_methods(AllowMethods::any())
+                .allow_headers(AllowHeaders::any())
+                .max_age(std::time::Duration::from_secs(86400))
+        }
+    };
+
+    // Request body size limit: 50 MB for API requests (uploads use separate endpoints)
+    const MAX_BODY_SIZE: usize = 50 * 1024 * 1024;
+
     let app = build_router(state)
         .layer(CompressionLayer::new())
-        .layer(CorsLayer::permissive())
+        .layer(cors_layer)
+        .layer(SetResponseHeaderLayer::<_>::if_not_present(
+            header::X_FRAME_OPTIONS,
+            x_frame_options,
+        ))
+        .layer(SetResponseHeaderLayer::<_>::if_not_present(
+            header::X_CONTENT_TYPE_OPTIONS,
+            x_content_type_options,
+        ))
+        .layer(SetResponseHeaderLayer::<_>::if_not_present(
+            header::HeaderName::from_static("x-xss-protection"),
+            x_xss_protection,
+        ))
+        .layer(SetResponseHeaderLayer::<_>::if_not_present(
+            header::REFERRER_POLICY,
+            referrer_policy,
+        ))
+        .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .layer(TraceLayer::new_for_http().make_span_with(request_span));
 
     let listener = tokio::net::TcpListener::bind(&bind_addr)

@@ -78,8 +78,9 @@ function cacheVersionPlugin() {
       htmlContent = htmlContent
         .replace(/__CACHE_VERSION__/g, cacheVersion)
         // Vite keeps relative paths for non-module scripts; fix them to absolute
-        .replace(/src="\.\/api\.js"/g, 'src="/web/assets/api.js"')
-        .replace(/src="\.\/app\.js"/g, 'src="/web/assets/app.js"');
+        // Add cache-busting version query so the service worker always fetches fresh content
+        .replace(/src="\.\/api\.js"/g, `src="/web/assets/api.js?v=${cacheVersion}"`)
+        .replace(/src="\.\/app\.js"/g, `src="/web/assets/app.js?v=${cacheVersion}"`);
       writeFileSync(htmlPath, htmlContent);
 
       console.log(`[vite:cache-version] Done — version ${cacheVersion}`);

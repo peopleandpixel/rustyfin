@@ -1,7 +1,196 @@
+pub mod tmdb_client;
+
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Mutex;
+
 use crate::tmdb_client::TmdbApi;
+use rustyfin_model::media::MediaType;
 use rustyfin_model::metadata::{ExternalMetadata, MetadataImage};
+use rustyfin_model::plugin::{Plugin, PluginType};
 use serde::Deserialize;
-use serde_json;
+
+/// Trait for types that can register metadata providers.
+#[allow(async_fn_in_trait)]
+pub trait MetadataProviderRegistrar {
+    async fn register_metadata_provider<F1, F2, F3>(
+        &self,
+        plugin_id: String,
+        provider_name: String,
+        search_movie: F1,
+        search_tv: F2,
+        get_images: F3,
+    ) where
+        F1: Fn(
+                &reqwest::Client,
+                &str,
+                Option<i32>,
+            ) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>>
+            + Send
+            + Sync
+            + 'static,
+        F2: Fn(
+                &reqwest::Client,
+                &str,
+            ) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>>
+            + Send
+            + Sync
+            + 'static,
+        F3: Fn(
+                &reqwest::Client,
+                Option<i64>,
+                Option<i64>,
+                MediaType,
+            ) -> Pin<Box<dyn Future<Output = Vec<MetadataImage>> + Send>>
+            + Send
+            + Sync
+            + 'static;
+}
+
+// ── Plugin implementation ──
+
+/// TMDb plugin that registers itself as a metadata provider.
+pub struct TmdbPlugin {
+    api_key: Mutex<Option<String>>,
+}
+
+impl Default for TmdbPlugin {
+    fn default() -> Self {
+        Self {
+            api_key: Mutex::new(None),
+        }
+    }
+}
+
+impl Plugin for TmdbPlugin {
+    fn id(&self) -> &str {
+        "tmdb"
+    }
+
+    fn name(&self) -> &str {
+        "The Movie Database (TMDb)"
+    }
+
+    fn version(&self) -> &str {
+        env!("CARGO_PKG_VERSION")
+    }
+
+    fn description(&self) -> &str {
+        "Fetches metadata, images, and cast information from The Movie Database (TMDb)."
+    }
+
+    fn plugin_type(&self) -> PluginType {
+        PluginType::MetadataProvider
+    }
+
+    fn set_configuration(&self, config: serde_json::Value) -> Result<(), String> {
+        *self.api_key.lock().unwrap() = config
+            .get("api_key")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        Ok(())
+    }
+
+    fn get_configuration(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!({
+            "api_key": self.api_key.lock().unwrap().as_deref()
+        }))
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
+impl TmdbPlugin {
+    fn api_key(&self) -> Option<String> {
+        self.api_key.lock().unwrap().clone()
+    }
+}
+
+/// Create a new TMDb plugin instance (FFI entry point for dynamic loading).
+/// Only compiled when building as a dynamic library (`cdylib`).
+#[cfg(feature = "dynamic")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rustyfin_plugin_create() -> Box<dyn Plugin> {
+    Box::new(TmdbPlugin {
+        api_key: Mutex::new(None),
+    })
+}
+
+/// Register the TMDb plugin as a metadata provider with the given PluginManager.
+pub async fn register_tmdb_provider<P>(
+    plugin: &TmdbPlugin,
+    plugin_manager: &P,
+) -> Result<(), String>
+where
+    P: MetadataProviderRegistrar,
+{
+    let api_key = plugin.api_key().ok_or("TMDb API key not configured")?;
+    let api_key1 = api_key.clone();
+    let api_key2 = api_key.clone();
+    let api_key3 = api_key.clone();
+
+    let plugin_id = plugin.id().to_string();
+    plugin_manager
+        .register_metadata_provider(
+            plugin_id,
+            "tmdb".to_string(),
+            move |_client: &reqwest::Client,
+                  name: &str,
+                  year: Option<i32>|
+                  -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>> {
+                let api_key = api_key1.clone();
+                let name = name.to_string();
+                Box::pin(async move {
+                    let tmdb = TmdbApi::new(&api_key);
+                    search_movie(&tmdb, &name, year).await
+                })
+            },
+            move |_client: &reqwest::Client,
+                  name: &str|
+                  -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>> {
+                let api_key = api_key2.clone();
+                let name = name.to_string();
+                Box::pin(async move {
+                    let tmdb = TmdbApi::new(&api_key);
+                    search_tv(&tmdb, &name).await
+                })
+            },
+            move |_client: &reqwest::Client,
+                  tmdb_id: Option<i64>,
+                  _tvdb_id: Option<i64>,
+                  _media_type: MediaType|
+                  -> Pin<Box<dyn Future<Output = Vec<MetadataImage>> + Send>> {
+                let api_key = api_key3.clone();
+                Box::pin(async move {
+                    if let Some(id) = tmdb_id {
+                        let tmdb = TmdbApi::new(&api_key);
+                        fetch_images_for_tmdb(&tmdb, id).await
+                    } else {
+                        Vec::new()
+                    }
+                })
+            },
+        )
+        .await;
+
+    Ok(())
+}
+
+/// Fetch images for a TMDb ID (used by the registration closure).
+async fn fetch_images_for_tmdb(tmdb: &TmdbApi, tmdb_id: i64) -> Vec<MetadataImage> {
+    // Try movie first, then TV
+    let movie_images = fetch_images(tmdb, "movie", tmdb_id).await;
+    if !movie_images.is_empty() {
+        return movie_images;
+    }
+    fetch_images(tmdb, "tv", tmdb_id).await
+}
 
 /// TMDb person details with photo
 #[derive(Debug, Deserialize)]

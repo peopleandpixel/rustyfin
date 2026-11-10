@@ -151,9 +151,6 @@ async fn get_endpoint(
 
 /// Clears the stored secrets for callers who are not administrators.
 fn hide_secrets(config: &mut ServerConfiguration) {
-    config.tmdb_api_key = None;
-    config.omdb_api_key = None;
-    config.fanart_api_key = None;
     config.smtp_password = None;
 }
 

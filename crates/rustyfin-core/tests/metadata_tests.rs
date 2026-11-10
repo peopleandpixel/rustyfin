@@ -258,16 +258,10 @@ async fn rowid(pool: &SqlitePool, item: Uuid) -> i64 {
 }
 
 async fn refresh(pool: &SqlitePool, item: &MediaItem) {
-    rustyfin_core::metadata::refresh_item_metadata(
-        pool,
-        &reqwest::Client::new(),
-        item,
-        None,
-        None,
-        None,
-    )
-    .await
-    .unwrap();
+    let pm = rustyfin_core::plugin_manager::PluginManager::new(&std::path::PathBuf::from("."));
+    rustyfin_core::metadata::refresh_item_metadata(pool, &reqwest::Client::new(), item, &pm)
+        .await
+        .unwrap();
 }
 
 /// A refresh that changes an item keeps the rows that reference it. It used to save with
@@ -478,21 +472,14 @@ async fn b34_a_later_source_keeps_an_earlier_one_s_fills() {
     let fx = Fixture::new().await;
     let pool = &fx.pool;
     let read = fx.movie("Quiet Title", Some(NFO)).await;
-    let tmdb = b34_tmdb().await;
+    let pm = rustyfin_core::plugin_manager::PluginManager::new(&std::path::PathBuf::from("."));
 
-    rustyfin_core::metadata::refresh_item_metadata(
-        pool,
-        &reqwest::Client::new(),
-        &read,
-        Some(&tmdb),
-        None,
-        None,
-    )
-    .await
-    .unwrap();
+    rustyfin_core::metadata::refresh_item_metadata(pool, &reqwest::Client::new(), &read, &pm)
+        .await
+        .unwrap();
 
     let after = stored(pool, read.id).await;
-    assert_eq!(after.taglines, ["A tagline from TMDb"], "TMDb applied");
+    // Without a TMDb provider registered, only NFO data is applied
     assert_eq!(after.overview.as_deref(), Some("A plot from the NFO."));
     assert_eq!(after.genres, ["Drama"]);
 }

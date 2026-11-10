@@ -8,12 +8,13 @@ use rustyfin_model::media::MediaType;
 use rustyfin_model::metadata::{ExternalMetadata, MetadataImage};
 use rustyfin_model::plugin::{Plugin, PluginType};
 use serde::Deserialize;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::LazyLock;
 use std::sync::Mutex;
-use std::future::Future;
 
 const TRAKT_BASE: &str = "https://api.trakt.tv";
+#[allow(dead_code)]
 const TRAKT_IMAGE_BASE: &str = "https://image.tmdb.org/t/p";
 
 /// L1 in-memory cache for Trakt API responses.
@@ -50,6 +51,7 @@ async fn fetch_trakt_json(
 // ── Search types ──
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct TraktSearchResult {
     #[serde(rename = "type")]
     result_type: String,
@@ -58,6 +60,7 @@ struct TraktSearchResult {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct TraktSearchMovie {
     title: String,
     year: Option<i32>,
@@ -66,6 +69,7 @@ struct TraktSearchMovie {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct TraktSearchShow {
     title: String,
     year: Option<i32>,
@@ -74,6 +78,7 @@ struct TraktSearchShow {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[allow(dead_code)]
 struct TraktIds {
     trakt: i64,
     slug: String,
@@ -88,6 +93,7 @@ struct TraktIds {
 // ── Movie details ──
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct TraktMovieDetails {
     title: String,
     year: Option<i32>,
@@ -119,6 +125,7 @@ struct TraktCertificates {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct TraktDates {
     desktop: Option<String>,
 }
@@ -126,6 +133,7 @@ struct TraktDates {
 // ── Show details ──
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct TraktShowDetails {
     title: String,
     year: Option<i32>,
@@ -154,6 +162,7 @@ struct TraktShowDetails {
 // ── Images ──
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct TraktImages {
     fanart: Option<Vec<String>>,
     logo: Option<String>,
@@ -162,6 +171,7 @@ struct TraktImages {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct TraktMovieWithImages {
     title: String,
     year: Option<i32>,
@@ -171,6 +181,7 @@ struct TraktMovieWithImages {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct TraktShowWithImages {
     title: String,
     year: Option<i32>,
@@ -233,7 +244,10 @@ pub async fn search_movie(
     let trakt_id = movie.ids.trakt;
 
     // Fetch full details
-    let details_url = format!("{}/movies/{}/extensions?extended=full,images", TRAKT_BASE, trakt_id);
+    let details_url = format!(
+        "{}/movies/{}/extensions?extended=full,images",
+        TRAKT_BASE, trakt_id
+    );
     let cache_key_details = format!("trakt_movie_details:{}", trakt_id);
 
     let details: TraktMovieDetails =
@@ -302,7 +316,10 @@ pub async fn search_tv(
     let trakt_id = show.ids.trakt;
 
     // Fetch full details
-    let details_url = format!("{}/shows/{}/extensions?extended=full,images", TRAKT_BASE, trakt_id);
+    let details_url = format!(
+        "{}/shows/{}/extensions?extended=full,images",
+        TRAKT_BASE, trakt_id
+    );
     let cache_key_details = format!("trakt_show_details:{}", trakt_id);
 
     let details: TraktShowDetails =
@@ -359,7 +376,8 @@ async fn fetch_images_for_movie(
 ) -> Vec<MetadataImage> {
     let mut result = Vec::new();
 
-    let movie: TraktMovieWithImages = match fetch_trakt_json(client, cache_key, url, api_key).await {
+    let movie: TraktMovieWithImages = match fetch_trakt_json(client, cache_key, url, api_key).await
+    {
         Some(json) => match serde_json::from_value(json) {
             Ok(m) => m,
             Err(_) => return result,
@@ -472,11 +490,11 @@ pub async fn get_images(
     };
 
     let mut result = Vec::new();
-    let images: serde_json::Value =
-        match fetch_trakt_json(client, &cache_key, &url, api_key).await {
-            Some(json) => json,
-            None => return result,
-        };
+    let images: serde_json::Value = match fetch_trakt_json(client, &cache_key, &url, api_key).await
+    {
+        Some(json) => json,
+        None => return result,
+    };
 
     if let Some(imgs) = images.get("images") {
         if let Some(fanarts) = imgs.get("fanart").and_then(|a| a.as_array()) {
@@ -602,25 +620,28 @@ where
         .register_metadata_provider(
             plugin_id,
             "trakt".to_string(),
-            move |client: &reqwest::Client, name: &str, year: Option<i32>| -> Pin<
-                Box<dyn Future<Output = Option<ExternalMetadata>> + Send>,
-            > {
+            move |client: &reqwest::Client,
+                  name: &str,
+                  year: Option<i32>|
+                  -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>> {
                 let api_key = api_key1.clone();
                 let name = name.to_string();
                 let client = client.clone();
                 Box::pin(async move { search_movie(&client, &api_key, &name, year).await })
             },
-            move |client: &reqwest::Client, name: &str| -> Pin<
-                Box<dyn Future<Output = Option<ExternalMetadata>> + Send>,
-            > {
+            move |client: &reqwest::Client,
+                  name: &str|
+                  -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>> {
                 let api_key = api_key2.clone();
                 let name = name.to_string();
                 let client = client.clone();
                 Box::pin(async move { search_tv(&client, &api_key, &name).await })
             },
-            move |client: &reqwest::Client, tmdb_id: Option<i64>, tvdb_id: Option<i64>, media_type: MediaType| -> Pin<
-                Box<dyn Future<Output = Vec<MetadataImage>> + Send>,
-            > {
+            move |client: &reqwest::Client,
+                  tmdb_id: Option<i64>,
+                  tvdb_id: Option<i64>,
+                  media_type: MediaType|
+                  -> Pin<Box<dyn Future<Output = Vec<MetadataImage>> + Send>> {
                 let api_key = api_key3.clone();
                 let client = client.clone();
                 Box::pin(async move {
@@ -638,6 +659,7 @@ where
 }
 
 /// Trait for types that can register metadata providers.
+#[allow(async_fn_in_trait)]
 pub trait MetadataProviderRegistrar {
     async fn register_metadata_provider<F1, F2, F3>(
         &self,
@@ -647,9 +669,30 @@ pub trait MetadataProviderRegistrar {
         search_tv: F2,
         get_images: F3,
     ) where
-        F1: Fn(&reqwest::Client, &str, Option<i32>) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>> + Send + Sync + 'static,
-        F2: Fn(&reqwest::Client, &str) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>> + Send + Sync + 'static,
-        F3: Fn(&reqwest::Client, Option<i64>, Option<i64>, MediaType) -> Pin<Box<dyn Future<Output = Vec<MetadataImage>> + Send>> + Send + Sync + 'static;
+        F1: Fn(
+                &reqwest::Client,
+                &str,
+                Option<i32>,
+            ) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>>
+            + Send
+            + Sync
+            + 'static,
+        F2: Fn(
+                &reqwest::Client,
+                &str,
+            ) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>>
+            + Send
+            + Sync
+            + 'static,
+        F3: Fn(
+                &reqwest::Client,
+                Option<i64>,
+                Option<i64>,
+                MediaType,
+            ) -> Pin<Box<dyn Future<Output = Vec<MetadataImage>> + Send>>
+            + Send
+            + Sync
+            + 'static;
 }
 
 #[cfg(test)]
@@ -666,6 +709,9 @@ mod tests {
     #[test]
     fn test_urlencoded() {
         assert_eq!(urlencoded("The Dark Knight"), "The+Dark+Knight");
-        assert_eq!(urlencoded("Türkisch für Anfänger"), "T%C3%BCrkisch+f%C3%BCr+Anf%C3%A4nger");
+        assert_eq!(
+            urlencoded("Türkisch für Anfänger"),
+            "T%C3%BCrkisch+f%C3%BCr+Anf%C3%A4nger"
+        );
     }
 }

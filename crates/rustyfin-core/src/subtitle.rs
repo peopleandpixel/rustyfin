@@ -343,24 +343,24 @@ pub struct RemoteSubtitleResult {
 
 /// Search for remote subtitles using OpenSubtitles API
 pub async fn search_remote_subtitles(
+    client: &reqwest::Client,
     _pool: &SqlitePool,
     name: &str,
     language: Option<&str>,
     production_year: Option<i32>,
 ) -> Result<Vec<RemoteSubtitleResult>, sqlx::Error> {
     let config = OpenSubtitlesConfig::default();
-    search_open_subtitles(&config, name, language, production_year).await
+    search_open_subtitles(client, &config, name, language, production_year).await
 }
 
 /// Search OpenSubtitles API for subtitles
 async fn search_open_subtitles(
+    client: &reqwest::Client,
     config: &OpenSubtitlesConfig,
     name: &str,
     language: Option<&str>,
     year: Option<i32>,
 ) -> Result<Vec<RemoteSubtitleResult>, sqlx::Error> {
-    let client = reqwest::Client::new();
-
     // Build search query
     let mut query = serde_json::Map::new();
     query.insert("query".to_string(), serde_json::json!(name));
@@ -446,12 +446,11 @@ async fn search_open_subtitles(
 
 /// Download a subtitle from OpenSubtitles by ID and save it to the cache directory
 pub async fn download_subtitle(
+    client: &reqwest::Client,
     config: &OpenSubtitlesConfig,
     subtitle_id: &str,
     cache_dir: &Path,
 ) -> Result<PathBuf, String> {
-    let client = reqwest::Client::new();
-
     // Ensure cache directory exists
     tokio::fs::create_dir_all(cache_dir)
         .await

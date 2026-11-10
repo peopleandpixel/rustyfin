@@ -57,8 +57,7 @@ async fn next_up(
     };
 
     // Enrich the page for the caller, as Resume items are (skip blurhash for list views)
-    let config = state.config.read().await;
-    let tmdb = state.tmdb.api(config.tmdb_api_key.as_deref());
+    let tmdb = state.tmdb.api(None);
     enrich_items(
         &state.db_ro,
         &state.server_id,
@@ -70,7 +69,6 @@ async fn next_up(
         true,
     )
     .await;
-    drop(config);
 
     Ok(Json(QueryResult {
         items,

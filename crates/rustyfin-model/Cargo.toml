@@ -10,3 +10,4 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 unicode-normalization = "0.1.26"
 unicase = "2.10"
+reqwest = { workspace = true }

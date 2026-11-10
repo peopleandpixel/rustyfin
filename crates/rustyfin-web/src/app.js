@@ -132,6 +132,138 @@ function formatDurationSeconds(secs) {
 }
 
 // --- Setup Wizard ---
+
+// Custom dropdown component for wizard selects — replaces native select popups
+// with fully styled dark-themed dropdowns
+var wizardSelectsInitialized = false;
+
+// Refresh a custom dropdown's display after its underlying select's options/values changed programmatically
+function refreshWizardSelect(selectId) {
+    var select = $(selectId);
+    if (!select) return;
+    var wrapper = select.closest('.jf-select-wrapper');
+    if (!wrapper) return;
+    var trigger = wrapper.querySelector('.jf-select-trigger');
+    var dropdown = wrapper.querySelector('.jf-select-dropdown');
+    if (!trigger || !dropdown) return;
+
+    // Update trigger text
+    var selectedOpt = select.options[select.selectedIndex];
+    trigger.textContent = selectedOpt ? selectedOpt.text : '';
+
+    // Rebuild dropdown options
+    dropdown.innerHTML = '';
+    for (var i = 0; i < select.options.length; i++) {
+        var opt = select.options[i];
+        var div = document.createElement('div');
+        div.className = 'jf-select-option' + (opt.selected ? ' selected' : '');
+        div.textContent = opt.text;
+        (function(optValue) {
+            div.addEventListener('click', function() {
+                select.value = optValue;
+                select.dispatchEvent(new Event('change'));
+                wrapper.classList.remove('open');
+                refreshWizardSelect(select.id);
+            });
+        })(opt.value);
+        dropdown.appendChild(div);
+    }
+}
+
+function initWizardSelects() {
+    // Only attach the global click handler once
+    if (!wizardSelectsInitialized) {
+        document.addEventListener('click', function(e) {
+            document.querySelectorAll('.jf-select-wrapper.open').forEach(function(wrapper) {
+                if (!wrapper.contains(e.target)) {
+                    wrapper.classList.remove('open');
+                }
+            });
+        });
+        wizardSelectsInitialized = true;
+    }
+
+    // Convert each wizard select to a custom dropdown
+    var wizard = $('setup-wizard');
+    if (!wizard) return;
+    
+    wizard.querySelectorAll('select.jf-input').forEach(function(select) {
+        // Skip if already converted
+        if (select.closest('.jf-select-wrapper')) return;
+        
+        // Create wrapper
+        var wrapper = document.createElement('div');
+        wrapper.className = 'jf-select-wrapper';
+        
+        // Create trigger button
+        var trigger = document.createElement('div');
+        trigger.className = 'jf-select-trigger';
+        
+        // Create dropdown container
+        var dropdown = document.createElement('div');
+        dropdown.className = 'jf-select-dropdown';
+        
+        // Populate dropdown options
+        function updateDropdown() {
+            trigger.textContent = '';
+            dropdown.innerHTML = '';
+            for (var i = 0; i < select.options.length; i++) {
+                var opt = select.options[i];
+                var div = document.createElement('div');
+                div.className = 'jf-select-option' + (opt.selected ? ' selected' : '');
+                div.textContent = opt.text;
+                // Capture the option value in a closure
+                (function(optValue) {
+                    div.addEventListener('click', function() {
+                        select.value = optValue;
+                        select.dispatchEvent(new Event('change'));
+                        wrapper.classList.remove('open');
+                        updateDropdown();
+                    });
+                })(opt.value);
+                dropdown.appendChild(div);
+            }
+            // Show selected option text in trigger
+            var selectedOpt = select.options[select.selectedIndex];
+            if (selectedOpt) {
+                trigger.textContent = selectedOpt.text;
+            }
+        }
+        
+        // Toggle dropdown on trigger click
+        trigger.addEventListener('click', function(e) {
+            e.stopPropagation();
+            var wasOpen = wrapper.classList.contains('open');
+            // Close all other dropdowns
+            document.querySelectorAll('.jf-select-wrapper.open').forEach(function(w) {
+                w.classList.remove('open');
+            });
+            if (!wasOpen) {
+                wrapper.classList.add('open');
+            }
+        });
+        
+        // Update when native select changes (e.g., from JS setting value)
+        select.addEventListener('change', function() {
+            updateDropdown();
+        });
+        
+        // Assemble wrapper with trigger and dropdown (not the select yet)
+        wrapper.appendChild(trigger);
+        wrapper.appendChild(dropdown);
+        
+        // Replace the select with the wrapper in the DOM
+        var parent = select.parentNode;
+        parent.replaceChild(wrapper, select);
+        
+        // Move the select into the wrapper (now it's safe - wrapper is no longer a child of select)
+        wrapper.appendChild(select);
+        
+        // Initial population
+        updateDropdown();
+    });
+}
+
 async function checkSetupWizard() {
     try {
         const info = await API.getPublicInfo();
@@ -143,9 +275,10 @@ async function checkSetupWizard() {
             if (badge) badge.textContent = serverVersion;
         }
         if (!done) {
-            initWizardLanguage();
             show('setup-wizard');
             hide('main-navbar');
+            initWizardLanguage();
+            initWizardSelects();
             return true;
         }
     } catch (e) { console.warn('Could not read the server info for the setup wizard:', e); }
@@ -162,13 +295,17 @@ function initWizardLanguage() {
 
 async function wizSetUiLanguage(lng) {
     await setUiLanguage(lng);
-    matchMetadataLanguage();
+    initWizardLanguage();
+    // Refresh custom dropdowns after language change
+    refreshWizardSelect('wiz-ui-lang');
 }
 
 function matchMetadataLanguage() {
     const metadataSelect = $('wiz-lang');
     const lng = getUiLanguage().split('-')[0];
-    if ([...metadataSelect.options].some(o => o.value === lng)) metadataSelect.value = lng;
+    if ([...metadataSelect.options].some(o => o.value === lng)) {
+        metadataSelect.value = lng;
+    }
 }
 
 function wizSetStep(s) {
@@ -4665,6 +4802,12 @@ function handleHash() {
 window.addEventListener('hashchange', handleHash);
 
 document.addEventListener('DOMContentLoaded', async () => {
+    // Wait for the i18n module to finish loading (main.js is type="module" and defers)
+    if (typeof uiLanguageOptions === 'undefined') {
+        await new Promise(resolve => {
+            window.addEventListener('i18n-ready', resolve, { once: true });
+        });
+    }
     // Every way of closing the player goes through here, so the session is stopped and its position reported once
     $('player-modal')?.addEventListener('close', () => stopPlayback());
     window.addEventListener('pagehide', () => stopPlayback());

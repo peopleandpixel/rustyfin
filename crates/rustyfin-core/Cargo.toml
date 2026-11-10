@@ -29,6 +29,20 @@ dashmap = "6"
 moka = { workspace = true }
 sha2 = "0.10"
 
+# Plugin crates
+plugin-tmdb = { workspace = true }
+plugin-omdb = { workspace = true }
+plugin-fanart = { workspace = true }
+plugin-opensubtitles = { workspace = true }
+plugin-tvdb = { workspace = true }
+plugin-webhook = { workspace = true }
+plugin-ntfy = { workspace = true }
+plugin-mqtt = { workspace = true }
+plugin-trakt = { workspace = true }
+plugin-pushover = { workspace = true }
+plugin-podnapisi = { workspace = true }
+plugin-local-nfo = { workspace = true }
+
 [dev-dependencies]
 axum = { workspace = true }
 tracing-subscriber = { workspace = true }

@@ -450,6 +450,7 @@ init_fresh() {
     rm -f "$PID_FILE" "$LOG_FILE"
     mkdir -p "$DATA_DIR"
     log_success "Datenverzeichnis ($DATA_DIR) und temporäre Dateien vollständig zurückgesetzt."
+    build_web
 }
 
 # ------------------------------------------------------------------------------

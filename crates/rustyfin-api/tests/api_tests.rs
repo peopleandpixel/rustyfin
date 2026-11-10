@@ -10601,7 +10601,8 @@ async fn g12_server(env_key: Option<&str>, config_key: Option<&str>) -> G12Serve
     };
     let http = reqwest::Client::builder().no_proxy().build().unwrap();
     state.tmdb = TmdbClient::new(http, settings);
-    state.config.write().await.tmdb_api_key = config_key.map(str::to_string);
+    // API keys are now managed via the plugin system, not ServerConfiguration
+    let _ = config_key;
 
     let username = format!("admin_{}", uuid::Uuid::new_v4().simple());
     rustyfin_auth::create_initial_user(&state.db, &username, "admin")

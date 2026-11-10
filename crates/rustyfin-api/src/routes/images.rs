@@ -289,18 +289,11 @@ async fn refresh_item(
         .await?
         .ok_or_else(|| ApiError::NotFound("item not found".into()))?;
 
-    let config = state.config.read().await;
-    let tmdb = state.tmdb.api(config.tmdb_api_key.as_deref());
-    let omdb_key = config.omdb_api_key.as_deref();
-    let fanart_key = config.fanart_api_key.as_deref();
-
     rustyfin_core::metadata::refresh_item_metadata(
         &state.db,
         &state.http_client,
         &item,
-        tmdb.as_ref(),
-        omdb_key,
-        fanart_key,
+        &state.plugin_manager,
     )
     .await
     .map_err(ApiError::Internal)?;

@@ -12,10 +12,10 @@ use uuid::Uuid;
 use crate::local_images;
 use crate::naming;
 use crate::nfo_parser;
+use crate::plugin_manager::PluginManager;
 use crate::probe;
 use crate::scan_progress::ScanTicket;
 use crate::scan_sync;
-use crate::tmdb_client::TmdbApi;
 
 /// Jellyfin's video extensions (`NamingOptions.cs:24-79`) without `001`, `asx`, `bin`, `ifo`, `img`, `iso`,
 /// `nrg` and `strm`: split parts, playlists, disc images and links, which ffmpeg can't play as one title.
@@ -50,13 +50,15 @@ pub(crate) const AUDIO_EXTENSIONS: &[&str] =
 const PHOTO_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "gif", "bmp", "webp", "tiff"];
 
 pub async fn scan_library(pool: &SqlitePool, library: &Library) -> Result<u32, sqlx::Error> {
+    let pm = PluginManager::new(&std::path::PathBuf::from("."));
     scan_library_with_metadata(
         pool,
         library,
-        &reqwest::Client::new(),
-        None,
-        None,
-        None,
+        &reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new()),
+        &pm,
         &ScanTicket::untracked(),
     )
     .await
@@ -102,9 +104,7 @@ pub async fn scan_library_with_metadata(
     pool: &SqlitePool,
     library: &Library,
     http_client: &reqwest::Client,
-    tmdb: Option<&TmdbApi>,
-    omdb_api_key: Option<&str>,
-    fanart_api_key: Option<&str>,
+    plugin_manager: &PluginManager,
     ticket: &ScanTicket,
 ) -> Result<u32, sqlx::Error> {
     scan_with_metadata(
@@ -112,9 +112,7 @@ pub async fn scan_library_with_metadata(
         library,
         &ScanScope::Library,
         http_client,
-        tmdb,
-        omdb_api_key,
-        fanart_api_key,
+        plugin_manager,
         ticket,
     )
     .await
@@ -130,9 +128,7 @@ pub async fn scan_with_metadata(
     library: &Library,
     scope: &ScanScope,
     http_client: &reqwest::Client,
-    tmdb: Option<&TmdbApi>,
-    omdb_api_key: Option<&str>,
-    fanart_api_key: Option<&str>,
+    plugin_manager: &PluginManager,
     ticket: &ScanTicket,
 ) -> Result<ScanChanges, sqlx::Error> {
     if *scope == ScanScope::Library {
@@ -154,8 +150,9 @@ pub async fn scan_with_metadata(
         );
         return Ok(ScanChanges::default());
     }
-    // The refresh shows as progress only when a provider is configured to make API calls.
-    let counted = tmdb.is_some() || omdb_api_key.is_some() || fanart_api_key.is_some();
+    // The refresh shows as progress only when metadata providers are registered.
+    let providers = plugin_manager.metadata_providers().await;
+    let counted = !providers.is_empty();
     let (mut changes, new_item_ids) = match library.content_type {
         LibraryContentType::TvShows => scan_tv_library(pool, library, scope, ticket).await?,
         LibraryContentType::Music => {
@@ -184,20 +181,11 @@ pub async fn scan_with_metadata(
                 let sem = semaphore.clone();
                 let pool = pool.clone();
                 let client = http_client.clone();
-                let tmdb = tmdb.cloned();
-                let omdb_key = omdb_api_key.map(|s| s.to_string());
-                let fanart_key = fanart_api_key.map(|s| s.to_string());
+                let pm = plugin_manager.clone();
                 let handle = tokio::spawn(async move {
                     let _perm = sem.acquire().await;
-                    if let Err(e) = crate::metadata::refresh_item_metadata(
-                        &pool,
-                        &client,
-                        &item,
-                        tmdb.as_ref(),
-                        omdb_key.as_deref(),
-                        fanart_key.as_deref(),
-                    )
-                    .await
+                    if let Err(e) =
+                        crate::metadata::refresh_item_metadata(&pool, &client, &item, &pm).await
                     {
                         tracing::warn!("metadata refresh failed for '{}': {}", item.name, e);
                     }

@@ -6,9 +6,9 @@
 
 use rustyfin_model::plugin::{NotificationPriority, Plugin, PluginType};
 use serde::{Deserialize, Serialize};
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Mutex;
-use std::future::Future;
 
 /// A single webhook endpoint configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,7 +98,11 @@ impl Plugin for WebhookPlugin {
     }
 
     fn get_configuration(&self) -> Option<serde_json::Value> {
-        self.config.lock().unwrap().clone().map(|c| serde_json::to_value(c).unwrap())
+        self.config
+            .lock()
+            .unwrap()
+            .clone()
+            .map(|c| serde_json::to_value(c).unwrap())
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -138,10 +142,7 @@ async fn send_to_endpoint(
     priority: &str,
     timeout_secs: u64,
 ) -> Result<(), String> {
-    let template = endpoint
-        .template
-        .as_deref()
-        .unwrap_or(DEFAULT_TEMPLATE);
+    let template = endpoint.template.as_deref().unwrap_or(DEFAULT_TEMPLATE);
     let body = fill_template(template, title, message, priority);
 
     let mut request = match endpoint.method.as_str() {
@@ -193,7 +194,10 @@ pub async fn send_notification(
         NotificationPriority::Emergency => "emergency",
     };
 
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
 
     let mut last_error = None;
     for endpoint in &config.endpoints {
@@ -229,13 +233,18 @@ pub unsafe extern "C" fn rustyfin_plugin_create() -> Box<dyn Plugin> {
 }
 
 /// Trait for registering a notification provider with a PluginManager.
+#[allow(async_fn_in_trait)]
 pub trait NotificationProviderRegistrar {
-    async fn register_notification_provider<F>(
-        &self,
-        plugin_id: String,
-        send_notification: F,
-    ) where
-        F: Fn(&str, &str, NotificationPriority) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>> + Send + Sync + 'static;
+    async fn register_notification_provider<F>(&self, plugin_id: String, send_notification: F)
+    where
+        F: Fn(
+                &str,
+                &str,
+                NotificationPriority,
+            ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
+            + Send
+            + Sync
+            + 'static;
 }
 
 /// Register the Webhook plugin as a notification provider with the given PluginManager.
@@ -251,16 +260,20 @@ where
     let plugin_id = plugin.id().to_string();
 
     plugin_manager
-        .register_notification_provider(plugin_id, move |title: &str, message: &str, priority: NotificationPriority| -> Pin<
-            Box<dyn Future<Output = Result<(), String>> + Send>,
-        > {
-            let config = config1.clone();
-            let title = title.to_string();
-            let message = message.to_string();
-            Box::pin(async move {
-                send_notification(&config, &title, &message, priority).await
-            })
-        })
+        .register_notification_provider(
+            plugin_id,
+            move |title: &str,
+                  message: &str,
+                  priority: NotificationPriority|
+                  -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>> {
+                let config = config1.clone();
+                let title = title.to_string();
+                let message = message.to_string();
+                Box::pin(
+                    async move { send_notification(&config, &title, &message, priority).await },
+                )
+            },
+        )
         .await;
 
     Ok(())
@@ -314,6 +327,9 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: WebhookPluginConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.endpoints.len(), 1);
-        assert_eq!(deserialized.endpoints[0].url, "http://localhost:8080/webhook");
+        assert_eq!(
+            deserialized.endpoints[0].url,
+            "http://localhost:8080/webhook"
+        );
     }
 }

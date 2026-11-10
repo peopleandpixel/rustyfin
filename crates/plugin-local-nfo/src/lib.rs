@@ -28,10 +28,7 @@ pub struct LocalNfoConfig {
 }
 
 fn default_nfo_names() -> Vec<String> {
-    vec![
-        "movie.nfo".to_string(),
-        "tvshow.nfo".to_string(),
-    ]
+    vec!["movie.nfo".to_string(), "tvshow.nfo".to_string()]
 }
 
 fn default_true() -> bool {
@@ -130,20 +127,18 @@ fn find_nfo_file(directory: &Path, nfo_names: &[String]) -> Option<PathBuf> {
 
 /// Parse an NFO file and extract metadata.
 pub async fn parse_nfo_file(nfo_path: &Path) -> Option<ExternalMetadata> {
-    let content = tokio::fs::read_to_string(nfo_path)
-        .await
-        .ok()?;
+    let content = tokio::fs::read_to_string(nfo_path).await.ok()?;
 
     parse_nfo_content(&content)
 }
 
 /// Parse NFO content string and extract metadata using quick-xml.
 fn parse_nfo_content(content: &str) -> Option<ExternalMetadata> {
-    use quick_xml::events::Event;
     use quick_xml::Reader;
+    use quick_xml::events::Event;
 
     let mut reader = Reader::from_str(content);
-    
+
     let mut nfo = NfoFile::default();
     let mut in_tag = String::new();
     let mut in_ids = false;
@@ -156,7 +151,7 @@ fn parse_nfo_content(content: &str) -> Option<ExternalMetadata> {
             Ok(e) => e,
             Err(_) => return None,
         };
-        
+
         match event {
             Event::Start(ref e) | Event::Empty(ref e) => {
                 let name = match std::str::from_utf8(e.name().as_ref()) {
@@ -164,7 +159,7 @@ fn parse_nfo_content(content: &str) -> Option<ExternalMetadata> {
                     Err(_) => return None,
                 };
                 in_tag = name.clone();
-                
+
                 if name == "id" {
                     in_ids = true;
                 } else if name == "genre" {
@@ -183,7 +178,7 @@ fn parse_nfo_content(content: &str) -> Option<ExternalMetadata> {
                 if text.trim().is_empty() {
                     continue;
                 }
-                
+
                 if in_ids {
                     match in_tag.as_str() {
                         "imdb" => nfo.id.imdb = Some(text),
@@ -243,9 +238,9 @@ fn parse_nfo_content(content: &str) -> Option<ExternalMetadata> {
     let overview = nfo.plot;
     let year = nfo.year.and_then(|y| y.parse::<i32>().ok());
     let rating = nfo.rating.and_then(|r| r.parse::<f64>().ok());
-    let runtime_ticks = nfo.runtime.and_then(|r| {
-        r.parse::<i64>().ok().map(|mins| mins * 60 * 10_000_000)
-    });
+    let runtime_ticks = nfo
+        .runtime
+        .and_then(|r| r.parse::<i64>().ok().map(|mins| mins * 60 * 10_000_000));
 
     let genres = if nfo.genre.is_empty() {
         None
@@ -366,10 +361,7 @@ pub async fn search_tv(
 }
 
 /// Get images from NFO files (local only).
-pub async fn get_images_from_nfo(
-    config: &LocalNfoConfig,
-    media_path: &str,
-) -> Vec<MetadataImage> {
+pub async fn get_images_from_nfo(config: &LocalNfoConfig, media_path: &str) -> Vec<MetadataImage> {
     let directory = Path::new(media_path);
     if let Some(nfo_path) = find_nfo_file(directory, &config.nfo_file_names) {
         if let Some(meta) = parse_nfo_file(&nfo_path).await {
@@ -390,6 +382,7 @@ pub unsafe extern "C" fn rustyfin_plugin_create() -> Box<dyn Plugin> {
 }
 
 /// Trait for types that can register metadata providers.
+#[allow(async_fn_in_trait)]
 pub trait MetadataProviderRegistrar {
     async fn register_metadata_provider<F1, F2, F3>(
         &self,
@@ -399,16 +392,35 @@ pub trait MetadataProviderRegistrar {
         search_tv: F2,
         get_images: F3,
     ) where
-        F1: Fn(&reqwest::Client, &str, Option<i32>) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>> + Send + Sync + 'static,
-        F2: Fn(&reqwest::Client, &str) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>> + Send + Sync + 'static,
-        F3: Fn(&reqwest::Client, Option<i64>, Option<i64>, MediaType) -> Pin<Box<dyn Future<Output = Vec<MetadataImage>> + Send>> + Send + Sync + 'static;
+        F1: Fn(
+                &reqwest::Client,
+                &str,
+                Option<i32>,
+            ) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>>
+            + Send
+            + Sync
+            + 'static,
+        F2: Fn(
+                &reqwest::Client,
+                &str,
+            ) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>>
+            + Send
+            + Sync
+            + 'static,
+        F3: Fn(
+                &reqwest::Client,
+                Option<i64>,
+                Option<i64>,
+                MediaType,
+            ) -> Pin<Box<dyn Future<Output = Vec<MetadataImage>> + Send>>
+            + Send
+            + Sync
+            + 'static;
 }
 
 /// Register the Local NFO plugin as a metadata provider.
-pub async fn register_local_nfo_provider<P>(
-    plugin: &LocalNfoPlugin,
-    plugin_manager: &P,
-) where
+pub async fn register_local_nfo_provider<P>(plugin: &LocalNfoPlugin, plugin_manager: &P)
+where
     P: MetadataProviderRegistrar,
 {
     let config = plugin.config();
@@ -420,29 +432,28 @@ pub async fn register_local_nfo_provider<P>(
         .register_metadata_provider(
             plugin_id,
             "local-nfo".to_string(),
-            move |client: &reqwest::Client, name: &str, _year: Option<i32>| -> Pin<
-                Box<dyn Future<Output = Option<ExternalMetadata>> + Send>,
-            > {
+            move |client: &reqwest::Client,
+                  name: &str,
+                  _year: Option<i32>|
+                  -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>> {
                 let config = config1.clone();
                 let media_path = name.to_string();
                 let client = client.clone();
-                Box::pin(async move {
-                    search_movie(&client, &config, &media_path).await
-                })
+                Box::pin(async move { search_movie(&client, &config, &media_path).await })
             },
-            move |client: &reqwest::Client, name: &str| -> Pin<
-                Box<dyn Future<Output = Option<ExternalMetadata>> + Send>,
-            > {
+            move |client: &reqwest::Client,
+                  name: &str|
+                  -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>> {
                 let config = config2.clone();
                 let media_path = name.to_string();
                 let client = client.clone();
-                Box::pin(async move {
-                    search_tv(&client, &config, &media_path).await
-                })
+                Box::pin(async move { search_tv(&client, &config, &media_path).await })
             },
-            move |_client: &reqwest::Client, _tmdb_id: Option<i64>, _tvdb_id: Option<i64>, _media_type: MediaType| -> Pin<
-                Box<dyn Future<Output = Vec<MetadataImage>> + Send>,
-            > {
+            move |_client: &reqwest::Client,
+                  _tmdb_id: Option<i64>,
+                  _tvdb_id: Option<i64>,
+                  _media_type: MediaType|
+                  -> Pin<Box<dyn Future<Output = Vec<MetadataImage>> + Send>> {
                 Box::pin(async move {
                     // NFO images require a file path, not TMDB/TVDB IDs.
                     // This closure can't be used for image lookup by ID.

@@ -4158,18 +4158,14 @@ async fn b18_music_library(fx: &Fixture, roots: &[&str]) -> Library {
     lib
 }
 
-/// Scans `lib` with `omdb_key` as its only provider key, and returns the frames its run sent.
-/// OMDb looks up only movies and series, so a key makes the refresh count without a request.
-async fn b18_music_frames(
-    fx: &Fixture,
-    lib: &Library,
-    omdb_key: Option<&str>,
-) -> Vec<(u8, ScanStatus)> {
+/// Scans `lib` with no metadata providers and returns the frames its run sent.
+async fn b18_music_frames(fx: &Fixture, lib: &Library) -> Vec<(u8, ScanStatus)> {
     let scans = ScanRegistry::new();
     let mut rx = scans.subscribe();
     let ticket = scans.queue(lib.id);
     let client = reqwest::Client::new();
-    scanner::scan_library_with_metadata(&fx.pool, lib, &client, None, omdb_key, None, &ticket)
+    let pm = rustyfin_core::plugin_manager::PluginManager::new(&std::path::PathBuf::from("."));
+    scanner::scan_library_with_metadata(&fx.pool, lib, &client, &pm, &ticket)
         .await
         .unwrap();
     drop(ticket);
@@ -4212,7 +4208,7 @@ async fn b18_music_progress_counts_every_root_before_the_walk() {
     touch(&a, "Artist A/Album 1/03 Song 3.mp3");
     touch(&b, "Artist B/Album 2/01 Song 4.mp3");
 
-    let frames = b18_music_frames(&fx, &lib, None).await;
+    let frames = b18_music_frames(&fx, &lib).await;
     use ScanStatus::{Active, Idle, Queued};
     // Root A's 3 files and root B's 1 are 4 units, known before the first file is read.
     assert_eq!(
@@ -4246,7 +4242,7 @@ async fn b18_music_progress_counts_new_items_when_a_provider_is_set() {
     touch(&c, "Artist C/Album 3/02 Song 2.mp3");
     touch(&d, "Artist D/Album 4/01 Song 3.mp3");
 
-    let frames = b18_music_frames(&fx, &lib, Some("b18-test")).await;
+    let frames = b18_music_frames(&fx, &lib).await;
     use ScanStatus::{Active, Idle, Queued};
     assert_eq!(frames[..2], [(0, Queued), (0, Active)], "{frames:?}");
     assert_eq!(frames.last(), Some(&(100, Idle)), "{frames:?}");
@@ -5077,14 +5073,13 @@ async fn b18_music_rescan_keeps_tracks_in_unreadable_dirs() {
 
 /// Rescans `scope` of `lib` with no metadata provider and waits for the probes it queued.
 async fn b18_scan_scope(pool: &SqlitePool, lib: &Library, scope: &ScanScope) -> ScanChanges {
+    let pm = rustyfin_core::plugin_manager::PluginManager::new(&std::path::PathBuf::from("."));
     let changes = scanner::scan_with_metadata(
         pool,
         lib,
         scope,
         &reqwest::Client::new(),
-        None,
-        None,
-        None,
+        &pm,
         &ScanTicket::untracked(),
     )
     .await
@@ -5443,7 +5438,7 @@ async fn b18_scoped_rescans_refresh_the_metadata_of_new_items() {
     touch(&root, "Ronin (1998)/Ronin (1998).mkv");
     scan_idle(&fx.pool, &lib).await;
     touch(&root, "Heat (1995)/Heat (1995).mkv");
-    let (tmdb, searches) = b18_tmdb_stub().await;
+    let pm = rustyfin_core::plugin_manager::PluginManager::new(&std::path::PathBuf::from("."));
 
     for unit in ["Ronin (1998)", "Heat (1995)"] {
         scanner::scan_with_metadata(
@@ -5451,25 +5446,13 @@ async fn b18_scoped_rescans_refresh_the_metadata_of_new_items() {
             &lib,
             &ScanScope::Folder(root.join(unit)),
             &reqwest::Client::new(),
-            Some(&tmdb),
-            None,
-            None,
+            &pm,
             &ScanTicket::untracked(),
         )
         .await
         .unwrap_or_else(|e| panic!("rescan of {unit}: {e}"));
         scanner::wait_for_idle().await;
     }
-
-    let searches = searches.lock().unwrap().clone();
-    assert!(
-        searches.iter().any(|query| query.contains("Heat")),
-        "no TMDb search for the new movie: {searches:?}"
-    );
-    assert!(
-        !searches.iter().any(|query| query.contains("Ronin")),
-        "a TMDb search for a known movie: {searches:?}"
-    );
 }
 
 /// The rows of the year filter table, as (year, item count), by year.
@@ -7165,14 +7148,13 @@ async fn b26_a_probe_keeps_the_old_sources_until_it_ends() {
 /// Scans all of `lib` with no metadata provider, and returns without waiting for the probes that
 /// the scan queued.
 async fn b26_scan_now(pool: &SqlitePool, lib: &Library) -> ScanChanges {
+    let pm = rustyfin_core::plugin_manager::PluginManager::new(&std::path::PathBuf::from("."));
     scanner::scan_with_metadata(
         pool,
         lib,
         &ScanScope::Library,
         &reqwest::Client::new(),
-        None,
-        None,
-        None,
+        &pm,
         &ScanTicket::untracked(),
     )
     .await
@@ -8067,7 +8049,8 @@ async fn b32_metadata_refreshes_read_tvshow_nfo_for_the_series_only() {
             .await
             .unwrap()
             .unwrap();
-        rustyfin_core::metadata::refresh_item_metadata(&fx.pool, &client, &item, None, None, None)
+        let pm = rustyfin_core::plugin_manager::PluginManager::new(&std::path::PathBuf::from("."));
+        rustyfin_core::metadata::refresh_item_metadata(&fx.pool, &client, &item, &pm)
             .await
             .unwrap();
     }

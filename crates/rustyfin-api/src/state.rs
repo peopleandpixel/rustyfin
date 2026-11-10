@@ -31,6 +31,8 @@ pub struct AppState {
     pub task_scheduler: TaskScheduler,
     pub plugin_manager: PluginManager,
     pub rate_limiter: RateLimiter,
+    /// Rate limiter for resource-intensive endpoints (transcoding, streaming start).
+    pub resource_limiter: RateLimiter,
     /// Reverse-proxy networks we trust to set `X-Forwarded-For`. Empty = trust no proxy (loopback is
     /// always implicitly trusted). Configured from `RUSTYFIN_KNOWN_PROXIES`.
     pub known_proxies: Arc<Vec<IpNet>>,

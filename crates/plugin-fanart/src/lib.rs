@@ -6,9 +6,9 @@ use rustyfin_model::media::MediaType;
 use rustyfin_model::metadata::{ExternalMetadata, MetadataImage};
 use rustyfin_model::plugin::{Plugin, PluginType};
 use serde::Deserialize;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Mutex;
-use std::future::Future;
 
 const FANART_BASE: &str = "https://webservice.fanart.tv/v3";
 
@@ -61,8 +61,11 @@ fn image_type_str(base: &str, index: usize) -> String {
 }
 
 /// Fetch fanart.tv images for a movie by TMDB ID
-pub async fn get_movie_images(api_key: &str, tmdb_movie_id: i64) -> Vec<MetadataImage> {
-    let client = reqwest::Client::new();
+pub async fn get_movie_images(
+    client: &reqwest::Client,
+    api_key: &str,
+    tmdb_movie_id: i64,
+) -> Vec<MetadataImage> {
     let url = format!(
         "{}/movie/{}?api_key={}",
         FANART_BASE, tmdb_movie_id, api_key
@@ -145,8 +148,11 @@ pub async fn get_movie_images(api_key: &str, tmdb_movie_id: i64) -> Vec<Metadata
 }
 
 /// Fetch fanart.tv images for a TV show by TheTVDB ID
-pub async fn get_tv_show_images(api_key: &str, tvdb_id: i64) -> Vec<MetadataImage> {
-    let client = reqwest::Client::new();
+pub async fn get_tv_show_images(
+    client: &reqwest::Client,
+    api_key: &str,
+    tvdb_id: i64,
+) -> Vec<MetadataImage> {
     let url = format!("{}/tv/{}?api_key={}", FANART_BASE, tvdb_id, api_key);
 
     let mut result = Vec::new();
@@ -318,32 +324,36 @@ where
         .register_metadata_provider(
             plugin_id,
             "fanart".to_string(),
-            move |_client: &reqwest::Client, _name: &str, _year: Option<i32>| -> Pin<
-                Box<dyn Future<Output = Option<ExternalMetadata>> + Send>,
-            > {
+            move |_client: &reqwest::Client,
+                  _name: &str,
+                  _year: Option<i32>|
+                  -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>> {
                 Box::pin(async move { None })
             },
-            move |_client: &reqwest::Client, _name: &str| -> Pin<
-                Box<dyn Future<Output = Option<ExternalMetadata>> + Send>,
-            > {
+            move |_client: &reqwest::Client,
+                  _name: &str|
+                  -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>> {
                 Box::pin(async move { None })
             },
-            move |_client: &reqwest::Client, tmdb_id: Option<i64>, tvdb_id: Option<i64>, media_type: MediaType| -> Pin<
-                Box<dyn Future<Output = Vec<MetadataImage>> + Send>,
-            > {
+            move |client: &reqwest::Client,
+                  tmdb_id: Option<i64>,
+                  tvdb_id: Option<i64>,
+                  media_type: MediaType|
+                  -> Pin<Box<dyn Future<Output = Vec<MetadataImage>> + Send>> {
                 let api_key = api_key.clone();
+                let client = client.clone();
                 Box::pin(async move {
                     match media_type {
                         MediaType::Movie => {
                             if let Some(id) = tmdb_id {
-                                get_movie_images(&api_key, id).await
+                                get_movie_images(&client, &api_key, id).await
                             } else {
                                 Vec::new()
                             }
                         }
                         MediaType::Series | MediaType::Episode => {
                             if let Some(id) = tvdb_id {
-                                get_tv_show_images(&api_key, id).await
+                                get_tv_show_images(&client, &api_key, id).await
                             } else {
                                 Vec::new()
                             }
@@ -359,6 +369,7 @@ where
 }
 
 /// Trait for types that can register metadata providers.
+#[allow(async_fn_in_trait)]
 pub trait MetadataProviderRegistrar {
     async fn register_metadata_provider<F1, F2, F3>(
         &self,
@@ -368,7 +379,28 @@ pub trait MetadataProviderRegistrar {
         search_tv: F2,
         get_images: F3,
     ) where
-        F1: Fn(&reqwest::Client, &str, Option<i32>) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>> + Send + Sync + 'static,
-        F2: Fn(&reqwest::Client, &str) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>> + Send + Sync + 'static,
-        F3: Fn(&reqwest::Client, Option<i64>, Option<i64>, MediaType) -> Pin<Box<dyn Future<Output = Vec<MetadataImage>> + Send>> + Send + Sync + 'static;
+        F1: Fn(
+                &reqwest::Client,
+                &str,
+                Option<i32>,
+            ) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>>
+            + Send
+            + Sync
+            + 'static,
+        F2: Fn(
+                &reqwest::Client,
+                &str,
+            ) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>>
+            + Send
+            + Sync
+            + 'static,
+        F3: Fn(
+                &reqwest::Client,
+                Option<i64>,
+                Option<i64>,
+                MediaType,
+            ) -> Pin<Box<dyn Future<Output = Vec<MetadataImage>> + Send>>
+            + Send
+            + Sync
+            + 'static;
 }

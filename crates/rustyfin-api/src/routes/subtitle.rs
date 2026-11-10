@@ -752,6 +752,7 @@ async fn search_remote_subtitles(
         .ok_or_else(|| ApiError::NotFound(format!("Item {id} not found")))?;
 
     let results = rustyfin_core::subtitle::search_remote_subtitles(
+        &state.http_client,
         &state.db_ro,
         &item.name,
         query.language.as_deref(),
@@ -786,7 +787,7 @@ async fn download_remote_subtitle(
     let cache_dir = state.data_dir.join("cache").join("subtitles");
 
     let config = OpenSubtitlesConfig::default();
-    match download_subtitle(&config, &req.subtitle_id, &cache_dir).await {
+    match download_subtitle(&state.http_client, &config, &req.subtitle_id, &cache_dir).await {
         Ok(path) => {
             tracing::info!("Subtitle downloaded to {}", path.display());
             Ok(Json(json!({

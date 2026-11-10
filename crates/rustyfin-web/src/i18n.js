@@ -44,6 +44,10 @@ function applyTranslations(root = document) {
     root.querySelectorAll('[data-i18n]').forEach(el => {
         el.textContent = t(el.dataset.i18n);
     });
+    // Also translate option elements inside selects (wizard dropdowns)
+    root.querySelectorAll('option[data-i18n]').forEach(el => {
+        el.textContent = t(el.dataset.i18n);
+    });
     for (const attr of TRANSLATED_ATTRIBUTES) {
         root.querySelectorAll(`[data-i18n-${attr}]`).forEach(el => {
             el.setAttribute(attr, t(el.getAttribute(`data-i18n-${attr}`)));

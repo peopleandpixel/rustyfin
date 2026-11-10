@@ -430,6 +430,131 @@ body {
   box-shadow: 0 0 0 3px rgba(0, 164, 220, 0.2);
 }
 
+/* Dark theme select dropdown — color-scheme for browsers that support it */
+select.jf-input {
+  color-scheme: dark;
+}
+
+/* Custom dropdown component for wizard selects — full dark theme control */
+.jf-select-wrapper {
+  position: relative;
+  display: inline-block;
+  width: 100%;
+}
+
+.jf-select-wrapper .jf-input {
+  /* Hide the native select visually but keep it accessible */
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 0;
+  pointer-events: none;
+  z-index: 0;
+}
+
+.jf-select-trigger {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--jf-border);
+  border-radius: 0.65rem;
+  padding: 0.65rem 2.5rem 0.65rem 1rem;
+  color: #fff;
+  font-size: 0.875rem;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  user-select: none;
+  z-index: 1;
+}
+
+.jf-select-trigger:hover {
+  background: rgba(255, 255, 255, 0.09);
+  border-color: rgba(0, 164, 220, 0.35);
+}
+
+.jf-select-wrapper.open .jf-select-trigger {
+  background: rgba(255, 255, 255, 0.09);
+  border-color: #00a4dc;
+  box-shadow: 0 0 0 3px rgba(0, 164, 220, 0.2);
+}
+
+.jf-select-trigger::after {
+  content: '';
+  position: absolute;
+  right: 0.75rem;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 0;
+  height: 0;
+  border-left: 5px solid transparent;
+  border-right: 5px solid transparent;
+  border-top: 6px solid #a1a1aa;
+  transition: transform 0.2s ease;
+}
+
+.jf-select-wrapper.open .jf-select-trigger::after {
+  transform: translateY(-50%) rotate(180deg);
+}
+
+.jf-select-dropdown {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  width: 100%;
+  max-height: 240px;
+  overflow-y: auto;
+  background: #1a202c;
+  border: 1px solid var(--jf-border);
+  border-radius: 0.65rem;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+  z-index: 1000;
+  display: none;
+}
+
+.jf-select-wrapper.open .jf-select-dropdown {
+  display: block;
+}
+
+.jf-select-option {
+  padding: 0.65rem 1rem;
+  color: #f0f3f8;
+  font-size: 0.875rem;
+  cursor: pointer;
+  transition: background 0.15s ease;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.jf-select-option:hover {
+  background: rgba(0, 164, 220, 0.15);
+}
+
+.jf-select-option.selected {
+  background: rgba(0, 164, 220, 0.3);
+  color: #38bdf8;
+}
+
+/* Custom scrollbar for dropdown */
+.jf-select-dropdown::-webkit-scrollbar {
+  width: 6px;
+}
+.jf-select-dropdown::-webkit-scrollbar-track {
+  background: transparent;
+}
+.jf-select-dropdown::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.15);
+  border-radius: 3px;
+}
+.jf-select-dropdown::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.3);
+}
+
 .jf-search {
   background: rgba(255, 255, 255, 0.06);
   border: 1px solid var(--jf-border);

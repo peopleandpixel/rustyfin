@@ -59,14 +59,21 @@ pub async fn verify_password(password: &str, hash: &str) -> Result<bool, AuthErr
         .map_err(|_| AuthError::HashError)?
 }
 
-/// Hash a PIN for storage.
-pub fn hash_pin(pin: &str) -> Result<String, AuthError> {
-    argon2_hash(pin)
+/// Hash a PIN for storage. Runs on the blocking pool to avoid blocking the async runtime.
+pub async fn hash_pin(pin: &str) -> Result<String, AuthError> {
+    let p = pin.to_owned();
+    tokio::task::spawn_blocking(move || argon2_hash(&p))
+        .await
+        .map_err(|_| AuthError::HashError)?
 }
 
-/// Verify a PIN against its hash.
-pub fn verify_pin(pin: &str, hash: &str) -> Result<bool, AuthError> {
-    argon2_verify(pin, hash)
+/// Verify a PIN against its hash. Runs on the blocking pool to avoid blocking the async runtime.
+pub async fn verify_pin(pin: &str, hash: &str) -> Result<bool, AuthError> {
+    let p = pin.to_owned();
+    let h = hash.to_owned();
+    tokio::task::spawn_blocking(move || argon2_verify(&p, &h))
+        .await
+        .map_err(|_| AuthError::HashError)?
 }
 
 // ── Password-reset PINs (R1-01, M-17) ──
@@ -603,18 +610,18 @@ mod tests {
 
     // ── hash_pin / verify_pin ──
 
-    #[test]
-    fn test_hash_and_verify_pin() {
+    #[tokio::test]
+    async fn test_hash_and_verify_pin() {
         let pin = "123456";
-        let hash = hash_pin(pin).unwrap();
-        assert!(verify_pin(pin, &hash).unwrap());
+        let hash = hash_pin(pin).await.unwrap();
+        assert!(verify_pin(pin, &hash).await.unwrap());
     }
 
-    #[test]
-    fn test_verify_wrong_pin() {
+    #[tokio::test]
+    async fn test_verify_wrong_pin() {
         let pin = "123456";
-        let hash = hash_pin(pin).unwrap();
-        assert!(!verify_pin("654321", &hash).unwrap());
+        let hash = hash_pin(pin).await.unwrap();
+        assert!(!verify_pin("654321", &hash).await.unwrap());
     }
 
     // ── B20: one-time setup codes ──

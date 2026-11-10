@@ -12,6 +12,7 @@ rustyfin-model = { workspace = true }
 rustyfin-db = { workspace = true }
 rustyfin-auth = { workspace = true }
 rustyfin-core = { workspace = true }
+plugin-tmdb = { workspace = true }
 axum = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

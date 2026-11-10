@@ -20,6 +20,8 @@ pub mod repo_package;
 pub mod repo_person;
 pub mod repo_playback;
 pub mod repo_playlist;
+pub mod repo_plugin_config;
+pub mod repo_plugin_priority;
 pub mod repo_search;
 pub mod repo_session;
 pub mod repo_setup_code;

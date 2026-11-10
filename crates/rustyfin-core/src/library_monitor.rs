@@ -21,6 +21,7 @@ use tokio::time::Instant;
 use uuid::Uuid;
 
 use crate::naming;
+use crate::plugin_manager::PluginManager;
 use crate::scan_progress::ScanTicket;
 use crate::scanner::{self, AUDIO_EXTENSIONS, DirId, ScanChanges, ScanScope};
 
@@ -65,7 +66,11 @@ impl ChangeQueue {
     pub fn new(pool: SqlitePool) -> Self {
         let runner: Arc<dyn RescanRunner> = Arc::new(DefaultRunner {
             pool: pool.clone(),
-            http_client: reqwest::Client::new(),
+            http_client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
+            plugin_manager: PluginManager::new(&std::path::PathBuf::from(".")),
         });
         Self {
             inner: Arc::new(Inner {
@@ -286,6 +291,7 @@ async fn on_disk(scope: ScanScope) -> ScanScope {
 struct DefaultRunner {
     pool: SqlitePool,
     http_client: reqwest::Client,
+    plugin_manager: PluginManager,
 }
 
 impl RescanRunner for DefaultRunner {
@@ -296,15 +302,14 @@ impl RescanRunner for DefaultRunner {
     ) -> Pin<Box<dyn Future<Output = Result<ScanChanges, String>> + Send>> {
         let pool = self.pool.clone();
         let http_client = self.http_client.clone();
+        let plugin_manager = self.plugin_manager.clone();
         Box::pin(async move {
             scanner::scan_with_metadata(
                 &pool,
                 &library,
                 &scope,
                 &http_client,
-                None,
-                None,
-                None,
+                &plugin_manager,
                 &ScanTicket::untracked(),
             )
             .await

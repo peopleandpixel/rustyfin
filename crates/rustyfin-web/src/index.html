@@ -3,6 +3,9 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
     <title>Rustyfin Media</title>
     <link rel="icon" type="image/png" href="/web/assets/logo.png">
     <meta name="theme-color" content="#07090e">
@@ -518,7 +521,27 @@
 <script src="./api.js"></script>
 <script src="./app.js"></script>
 <script>
-if('serviceWorker' in navigator){window.addEventListener('load',()=>{navigator.serviceWorker.register('/web/sw.js').catch(()=>{});});}
+if('serviceWorker' in navigator){
+  window.addEventListener('load',()=>{
+    navigator.serviceWorker.register('/web/sw.js?v=__CACHE_VERSION__').then(function(reg){
+      // Check for updates on every load
+      reg.update();
+      // If a new worker is waiting, reload to activate it
+      if(reg.waiting){
+        window.location.reload();
+      }
+      reg.addEventListener('updatefound', function(){
+        var newWorker = reg.installing;
+        newWorker.addEventListener('statechange', function(){
+          if(newWorker.state === 'installed' && navigator.serviceWorker.controller){
+            // New worker is installed but not yet active — reload to activate
+            window.location.reload();
+          }
+        });
+      });
+    }).catch(function(){});
+  });
+}
 </script>
 </body>
 </html>

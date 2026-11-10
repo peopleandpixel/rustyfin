@@ -173,11 +173,11 @@ async fn enrich_item(
     item.external_urls = external_urls;
 
     // RemoteTrailers from TMDb API (real YouTube trailer URLs)
-    if let Some(tmdb) = item.tmdb_id
+    if let Some(tmdb_id) = item.tmdb_id
         && let Some(api) = tmdb_api
     {
         let kind = if item.is_movie { "movie" } else { "tv" };
-        let trailers = rustyfin_core::provider_tmdb::get_trailers(api, kind, tmdb).await;
+        let trailers = rustyfin_core::tmdb_client::get_trailers(api, kind, tmdb_id).await;
         item.remote_trailers = trailers
             .into_iter()
             .map(|(name, url)| rustyfin_model::media::ExternalUrl { name, url })
@@ -1295,7 +1295,7 @@ pub(crate) async fn enrich_items(
 
         for (idx, tmdb_id, is_movie) in trailer_items {
             let kind = if is_movie { "movie" } else { "tv" };
-            let trailers = rustyfin_core::provider_tmdb::get_trailers(api, kind, tmdb_id).await;
+            let trailers = rustyfin_core::tmdb_client::get_trailers(api, kind, tmdb_id).await;
             let item = &mut items[idx];
             item.remote_trailers = trailers
                 .into_iter()
@@ -1809,8 +1809,7 @@ async fn get_items(
 
     // Enrich items with all response fields using batch queries
     // Skip blurhash for list views to avoid per-item disk I/O
-    let config = state.config.read().await;
-    let tmdb = state.tmdb.api(config.tmdb_api_key.as_deref());
+    let tmdb = state.tmdb.api(None);
     enrich_items(
         &state.db_ro,
         &state.server_id,
@@ -1822,7 +1821,6 @@ async fn get_items(
         true, // skip_blurhash for list views
     )
     .await;
-    drop(config);
 
     Ok(Json(QueryResult {
         items,
@@ -1859,8 +1857,7 @@ async fn get_item(
                 .ok_or(ApiError::NotFound("item not found".into()))?;
             let _ = populate_media_source_single(&state.db_ro, &mut item).await;
             // Enrich with all response fields, without any user's watch data
-            let config = state.config.read().await;
-            let tmdb = state.tmdb.api(config.tmdb_api_key.as_deref());
+            let tmdb = state.tmdb.api(None);
             enrich_item(
                 &state.db_ro,
                 &state.server_id,
@@ -1871,7 +1868,6 @@ async fn get_item(
                 &state.data_dir,
             )
             .await;
-            drop(config);
             // Movies and episodes are not cached: their sources, streams, chapters and
             // trickplay change on rescans, re-probes and extraction, and none of those
             // clear this cache.
@@ -1929,8 +1925,7 @@ async fn get_children(
 
     // Enrich items using batch queries
     // Skip blurhash for list views to avoid per-item disk I/O
-    let config = state.config.read().await;
-    let tmdb = state.tmdb.api(config.tmdb_api_key.as_deref());
+    let tmdb = state.tmdb.api(None);
     enrich_items(
         &state.db_ro,
         &state.server_id,
@@ -1942,7 +1937,6 @@ async fn get_children(
         true, // skip_blurhash for list views
     )
     .await;
-    drop(config);
 
     Ok(Json(QueryResult {
         items,
@@ -1963,15 +1957,13 @@ async fn get_similar(
     let limit = query.limit.filter(|&limit| limit >= 0).unwrap_or(12);
     let limit = usize::try_from(limit).unwrap_or(usize::MAX);
 
-    let config = state.config.read().await;
-    let tmdb = state.tmdb.api(config.tmdb_api_key.as_deref());
+    let tmdb = state.tmdb.api(None);
     let mut similar: Vec<MediaItem> = Vec::new();
 
     // Priority 1: TMDb Similar API (highest weight)
     if let (Some(tmdb_id), Some(api)) = (item.tmdb_id, tmdb.as_ref()) {
         let media_type = if item.is_movie { "movie" } else { "tv" };
-        let tmdb_similar =
-            rustyfin_core::provider_tmdb::get_similar(api, media_type, tmdb_id).await;
+        let tmdb_similar = rustyfin_core::tmdb_client::get_similar(api, media_type, tmdb_id).await;
 
         // For each TMDb similar item, find the local item by tmdb_id
         for (similar_tmdb_id, _name) in tmdb_similar {
@@ -2017,13 +2009,11 @@ async fn get_similar(
         }
     }
 
-    drop(config);
     let total = similar.len() as i64;
 
     // Enrich similar items using batch queries
     // Skip blurhash for list views to avoid per-item disk I/O
-    let config = state.config.read().await;
-    let tmdb = state.tmdb.api(config.tmdb_api_key.as_deref());
+    let tmdb = state.tmdb.api(None);
     enrich_items(
         &state.db_ro,
         &state.server_id,
@@ -2035,7 +2025,6 @@ async fn get_similar(
         true, // skip_blurhash for list views
     )
     .await;
-    drop(config);
 
     Ok(Json(QueryResult {
         items: similar,
@@ -2083,8 +2072,7 @@ async fn get_latest(
     .await?;
     // Enrich latest items using batch queries
     // Skip blurhash for list views to avoid per-item disk I/O
-    let config = state.config.read().await;
-    let tmdb = state.tmdb.api(config.tmdb_api_key.as_deref());
+    let tmdb = state.tmdb.api(None);
     enrich_items(
         &state.db_ro,
         &state.server_id,
@@ -2096,7 +2084,6 @@ async fn get_latest(
         true, // skip_blurhash for list views
     )
     .await;
-    drop(config);
     Ok(Json(items))
 }
 
@@ -2114,8 +2101,7 @@ async fn get_resume(
     let total = items.len() as i64;
     // Enrich resume items using batch queries
     // Skip blurhash for list views to avoid per-item disk I/O
-    let config = state.config.read().await;
-    let tmdb = state.tmdb.api(config.tmdb_api_key.as_deref());
+    let tmdb = state.tmdb.api(None);
     enrich_items(
         &state.db_ro,
         &state.server_id,
@@ -2127,7 +2113,6 @@ async fn get_resume(
         true, // skip_blurhash for list views
     )
     .await;
-    drop(config);
     Ok(Json(QueryResult {
         items,
         total_record_count: total,
@@ -2210,8 +2195,7 @@ async fn get_user_resume(
     let total = items.len() as i64;
     // Enrich user resume items using batch queries
     // Skip blurhash for list views to avoid per-item disk I/O
-    let config = state.config.read().await;
-    let tmdb = state.tmdb.api(config.tmdb_api_key.as_deref());
+    let tmdb = state.tmdb.api(None);
     enrich_items(
         &state.db_ro,
         &state.server_id,
@@ -2223,7 +2207,6 @@ async fn get_user_resume(
         true, // skip_blurhash for list views
     )
     .await;
-    drop(config);
     Ok(Json(QueryResult {
         items,
         total_record_count: total,

@@ -21,6 +21,7 @@ pub struct PodnapisiConfig {
 
 /// Podnapisi subtitle provider plugin.
 pub struct PodnapisiPlugin {
+    #[allow(dead_code)]
     config: Mutex<PodnapisiConfig>,
 }
 
@@ -70,13 +71,14 @@ impl Plugin for PodnapisiPlugin {
 // ── Podnapisi API types ──
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct PodnapisiSearchResponse {
     status: Option<String>,
     subtitles: Option<Vec<PodnapisiSubtitle>>,
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(non_snake_case)]
+#[allow(non_snake_case, dead_code)]
 struct PodnapisiSubtitle {
     id: String,
     movie_title: String,
@@ -216,6 +218,7 @@ pub unsafe extern "C" fn rustyfin_plugin_create() -> Box<dyn Plugin> {
 }
 
 /// Trait for registering a subtitle provider with a PluginManager.
+#[allow(async_fn_in_trait)]
 pub trait SubtitleProviderRegistrar {
     async fn register_subtitle_provider<F1, F2>(
         &self,
@@ -223,41 +226,51 @@ pub trait SubtitleProviderRegistrar {
         search_subtitles: F1,
         download_subtitle: F2,
     ) where
-        F1: Fn(&reqwest::Client, &MediaItem, &str) -> Pin<Box<dyn Future<Output = Vec<SubtitleResult>> + Send>> + Send + Sync + 'static,
-        F2: Fn(&reqwest::Client, &str, &Path) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>> + Send + Sync + 'static;
+        F1: Fn(
+                &reqwest::Client,
+                &MediaItem,
+                &str,
+            ) -> Pin<Box<dyn Future<Output = Vec<SubtitleResult>> + Send>>
+            + Send
+            + Sync
+            + 'static,
+        F2: Fn(
+                &reqwest::Client,
+                &str,
+                &Path,
+            ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
+            + Send
+            + Sync
+            + 'static;
 }
 
 /// Register the Podnapisi plugin with a PluginManager.
-pub async fn register_podnapisi_provider<P>(
-    plugin: &PodnapisiPlugin,
-    registrar: &P,
-) where
+pub async fn register_podnapisi_provider<P>(plugin: &PodnapisiPlugin, registrar: &P)
+where
     P: SubtitleProviderRegistrar,
 {
     let plugin_id = plugin.id().to_string();
     registrar
         .register_subtitle_provider(
             plugin_id,
-            move |client: &reqwest::Client, item: &MediaItem, lang: &str| -> Pin<
-                Box<dyn Future<Output = Vec<SubtitleResult>> + Send>,
-            > {
+            move |client: &reqwest::Client,
+                  item: &MediaItem,
+                  lang: &str|
+                  -> Pin<Box<dyn Future<Output = Vec<SubtitleResult>> + Send>> {
                 let name = item.name.clone();
                 let year = item.production_year;
                 let lang = lang.to_string();
                 let client = client.clone();
-                Box::pin(async move {
-                    search_subtitles(&client, &name, &lang, year).await
-                })
+                Box::pin(async move { search_subtitles(&client, &name, &lang, year).await })
             },
-            move |client: &reqwest::Client, id: &str, path: &Path| -> Pin<
-                Box<dyn Future<Output = Result<(), String>> + Send>,
-            > {
+            move |client: &reqwest::Client,
+                  id: &str,
+                  path: &Path|
+                  -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>> {
                 let id = id.to_string();
                 let path = path.to_path_buf();
                 let client = client.clone();
-                Box::pin(async move {
-                    download_subtitle(&client, &id, &path).await
-                })
+                Box::pin(async move { download_subtitle(&client, &id, &path).await })
             },
         )
         .await;

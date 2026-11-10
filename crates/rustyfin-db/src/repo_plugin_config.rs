@@ -10,12 +10,11 @@ pub async fn get_plugin_config(
     pool: &SqlitePool,
     plugin_id: &str,
 ) -> Result<Option<serde_json::Value>, sqlx::Error> {
-    let row: Option<(String,)> = sqlx::query_as(
-        "SELECT config_json FROM plugin_config WHERE plugin_id = ?1",
-    )
-    .bind(plugin_id)
-    .fetch_optional(pool)
-    .await?;
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT config_json FROM plugin_config WHERE plugin_id = ?1")
+            .bind(plugin_id)
+            .fetch_optional(pool)
+            .await?;
 
     match row {
         Some((json_str,)) => {
@@ -33,8 +32,8 @@ pub async fn set_plugin_config(
     plugin_id: &str,
     config: &serde_json::Value,
 ) -> Result<(), sqlx::Error> {
-    let json_str = serde_json::to_string(config)
-        .map_err(|e| sqlx::Error::Protocol(e.to_string().into()))?;
+    let json_str =
+        serde_json::to_string(config).map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
 
     sqlx::query(
         "INSERT INTO plugin_config (plugin_id, config_json, updated_at)
@@ -52,10 +51,7 @@ pub async fn set_plugin_config(
 }
 
 /// Delete the configuration for a plugin.
-pub async fn delete_plugin_config(
-    pool: &SqlitePool,
-    plugin_id: &str,
-) -> Result<(), sqlx::Error> {
+pub async fn delete_plugin_config(pool: &SqlitePool, plugin_id: &str) -> Result<(), sqlx::Error> {
     sqlx::query("DELETE FROM plugin_config WHERE plugin_id = ?1")
         .bind(plugin_id)
         .execute(pool)
@@ -65,14 +61,11 @@ pub async fn delete_plugin_config(
 }
 
 /// List all plugin IDs that have stored configurations.
-pub async fn list_plugin_configs(
-    pool: &SqlitePool,
-) -> Result<Vec<String>, sqlx::Error> {
-    let rows: Vec<(String,)> = sqlx::query_as(
-        "SELECT plugin_id FROM plugin_config ORDER BY plugin_id",
-    )
-    .fetch_all(pool)
-    .await?;
+pub async fn list_plugin_configs(pool: &SqlitePool) -> Result<Vec<String>, sqlx::Error> {
+    let rows: Vec<(String,)> =
+        sqlx::query_as("SELECT plugin_id FROM plugin_config ORDER BY plugin_id")
+            .fetch_all(pool)
+            .await?;
 
     Ok(rows.into_iter().map(|(id,)| id).collect())
 }

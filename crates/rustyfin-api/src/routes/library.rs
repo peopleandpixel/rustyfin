@@ -261,20 +261,11 @@ async fn scan_library(
     )
     .await;
 
-    // Get API keys from config
-    let config = state.config.read().await;
-    let tmdb = state.tmdb.api(config.tmdb_api_key.as_deref());
-    let omdb_key = config.omdb_api_key.clone();
-    let fanart_key = config.fanart_api_key.clone();
-    drop(config);
-
     let count = rustyfin_core::scanner::scan_library_with_metadata(
         &state.db,
         &lib,
         &state.http_client,
-        tmdb.as_ref(),
-        omdb_key.as_deref(),
-        fanart_key.as_deref(),
+        &state.plugin_manager,
         &ticket,
     )
     .await
@@ -316,13 +307,6 @@ async fn scan_library(
 async fn refresh_all(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let libs = rustyfin_db::repo_library::get_all_libraries(&state.db_ro).await?;
     tracing::info!("refresh_all: found {} libraries to scan", libs.len());
-
-    // Get API keys from config
-    let config = state.config.read().await;
-    let tmdb = state.tmdb.api(config.tmdb_api_key.as_deref());
-    let omdb_key = config.omdb_api_key.clone();
-    let fanart_key = config.fanart_api_key.clone();
-    drop(config);
 
     // Broadcast scan started event
     {
@@ -381,9 +365,7 @@ async fn refresh_all(State(state): State<AppState>) -> Result<Json<Value>, ApiEr
             &state.db,
             lib,
             &state.http_client,
-            tmdb.as_ref(),
-            omdb_key.as_deref(),
-            fanart_key.as_deref(),
+            &state.plugin_manager,
             &ticket,
         )
         .await;

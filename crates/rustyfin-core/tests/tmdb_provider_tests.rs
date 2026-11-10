@@ -9,8 +9,12 @@ use std::time::Duration;
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
-use rustyfin_core::provider_tmdb;
-use rustyfin_core::tmdb_client::{TmdbApi, TmdbClient, TmdbKey, TmdbSettings, USER_AGENT};
+use plugin_tmdb::tmdb_client::TmdbApi;
+use plugin_tmdb::{
+    PersonPhoto, get_movie_people, get_person_photo, get_similar, get_trailers, get_tv_people,
+    get_tvdb_id, search_movie, search_tv,
+};
+use rustyfin_core::tmdb_client::USER_AGENT;
 use serde_json::{Value, json};
 
 const KEY: &str = "g12-provider-fake-key-4444";
@@ -68,20 +72,9 @@ impl Stub {
         format!("{}/t/p/original", self.origin)
     }
 
-    /// A client of its own (its own limiter and cache) with `KEY` as the env key.
+    /// A simple TMDb API client with `KEY` as the API key.
     fn api(&self) -> TmdbApi {
-        let settings = TmdbSettings {
-            api_base_url: format!("{}/3", self.origin),
-            image_base_url: self.image_base(),
-            env_key: TmdbKey::new(KEY),
-            min_interval: Duration::from_millis(1),
-            initial_backoff: Duration::from_millis(5),
-            ..TmdbSettings::default()
-        };
-        let http = reqwest::Client::builder().no_proxy().build().unwrap();
-        TmdbClient::new(http, settings)
-            .api(None)
-            .expect("the env key is set")
+        TmdbApi::new(KEY)
     }
 
     fn hits(&self) -> Vec<Hit> {
@@ -234,7 +227,7 @@ fn assert_on_image_base<'a>(stub: &Stub, urls: impl IntoIterator<Item = &'a str>
 async fn search_movie_goes_through_the_client() {
     let stub = Stub::start(Mode::Canned).await;
 
-    let meta = provider_tmdb::search_movie(&stub.api(), "Alpha Film", Some(2001))
+    let meta = search_movie(&stub.api(), "Alpha Film", Some(2001))
         .await
         .expect("movie metadata");
 
@@ -270,7 +263,7 @@ async fn search_movie_goes_through_the_client() {
 async fn search_tv_goes_through_the_client() {
     let stub = Stub::start(Mode::Canned).await;
 
-    let meta = provider_tmdb::search_tv(&stub.api(), "Gamma Show")
+    let meta = search_tv(&stub.api(), "Gamma Show")
         .await
         .expect("show metadata");
 
@@ -300,18 +293,16 @@ async fn people_photos_use_the_image_base() {
     let stub = Stub::start(Mode::Canned).await;
     let api = stub.api();
 
-    let photo = provider_tmdb::get_person_photo(&api, 77)
-        .await
-        .expect("person photo");
+    let photo = get_person_photo(&api, 77).await.expect("person photo");
     assert_eq!(photo.person_id, "77");
     assert_eq!(
         photo.photo_url,
         format!("{}/g12-dana.jpg", stub.image_base())
     );
 
-    let movie_people = provider_tmdb::get_movie_people(&api, 9001).await;
+    let movie_people = get_movie_people(&api, 9001).await;
     assert_on_image_base(&stub, movie_people.iter().map(|p| p.photo_url.as_str()));
-    let tv_people = provider_tmdb::get_tv_people(&api, 9101, 1).await;
+    let tv_people = get_tv_people(&api, 9101, 1).await;
     assert_on_image_base(&stub, tv_people.iter().map(|p| p.photo_url.as_str()));
 
     stub.requested("/person/77");
@@ -326,17 +317,17 @@ async fn trailers_similar_and_tvdb_id_go_through_the_client() {
     let api = stub.api();
 
     assert_eq!(
-        provider_tmdb::get_trailers(&api, "movie", 9001).await,
+        get_trailers(&api, "movie", 9001).await,
         vec![(
             "G12 Trailer".to_string(),
             "https://www.youtube.com/watch?v=g12trailer".to_string()
         )]
     );
     assert_eq!(
-        provider_tmdb::get_similar(&api, "movie", 9001).await,
+        get_similar(&api, "movie", 9001).await,
         vec![(9002, "Beta Film".to_string())]
     );
-    assert_eq!(provider_tmdb::get_tvdb_id(&api, 9101).await, Some(79101));
+    assert_eq!(get_tvdb_id(&api, 9101).await, Some(79101));
 
     stub.requested("/movie/9001/videos");
     stub.requested("/movie/9001/similar");
@@ -354,7 +345,7 @@ async fn each_client_has_its_own_cache() {
     let second = Stub::start(Mode::Canned).await;
 
     for stub in [&first, &second] {
-        let trailers = provider_tmdb::get_trailers(&stub.api(), "movie", 9001).await;
+        let trailers = get_trailers(&stub.api(), "movie", 9001).await;
         assert_eq!(trailers.len(), 1);
         stub.requested("/movie/9001/videos");
     }
@@ -369,26 +360,20 @@ async fn failures_give_none_or_nothing() {
         let stub = Stub::start(Mode::Status(status)).await;
         let api = stub.api();
 
-        let movie = provider_tmdb::search_movie(&api, "Alpha Film", None).await;
+        let movie = search_movie(&api, "Alpha Film", None).await;
         assert!(movie.is_none(), "{status}");
-        assert!(
-            provider_tmdb::search_tv(&api, "Gamma Show").await.is_none(),
-            "{status}"
-        );
-        let photo = provider_tmdb::get_person_photo(&api, 77).await;
+        assert!(search_tv(&api, "Gamma Show").await.is_none(), "{status}");
+        let photo = get_person_photo(&api, 77).await;
         assert!(photo.is_none(), "{status}");
-        let movie_people = provider_tmdb::get_movie_people(&api, 9001).await;
+        let movie_people = get_movie_people(&api, 9001).await;
         assert!(movie_people.is_empty(), "{status}");
-        let tv_people = provider_tmdb::get_tv_people(&api, 9101, 1).await;
+        let tv_people = get_tv_people(&api, 9101, 1).await;
         assert!(tv_people.is_empty(), "{status}");
-        let trailers = provider_tmdb::get_trailers(&api, "movie", 9001).await;
+        let trailers = get_trailers(&api, "movie", 9001).await;
         assert!(trailers.is_empty(), "{status}");
-        let similar = provider_tmdb::get_similar(&api, "movie", 9001).await;
+        let similar = get_similar(&api, "movie", 9001).await;
         assert!(similar.is_empty(), "{status}");
-        assert!(
-            provider_tmdb::get_tvdb_id(&api, 9101).await.is_none(),
-            "{status}"
-        );
+        assert!(get_tvdb_id(&api, 9101).await.is_none(), "{status}");
         stub.assert_all_signed();
     }
 }

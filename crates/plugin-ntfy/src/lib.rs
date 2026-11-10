@@ -79,7 +79,11 @@ impl Plugin for NtfyPlugin {
     }
 
     fn get_configuration(&self) -> Option<serde_json::Value> {
-        self.config.lock().unwrap().clone().map(|c| serde_json::to_value(c).unwrap())
+        self.config
+            .lock()
+            .unwrap()
+            .clone()
+            .map(|c| serde_json::to_value(c).unwrap())
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -114,7 +118,10 @@ pub async fn send_notification(
     message: &str,
     priority: NotificationPriority,
 ) -> Result<(), String> {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
     let publish_url = format!("{}/{}", config.url.trim_end_matches('/'), config.topic);
 
     let mut request = client.post(&publish_url);
@@ -152,10 +159,7 @@ pub async fn send_notification(
                 tracing::debug!("ntfy notification sent to topic '{}'", config.topic);
                 Ok(())
             } else {
-                Err(format!(
-                    "ntfy request failed with status: {}",
-                    r.status()
-                ))
+                Err(format!("ntfy request failed with status: {}", r.status()))
             }
         }
         Err(e) => Err(format!("ntfy request error: {}", e)),
@@ -172,13 +176,18 @@ pub unsafe extern "C" fn rustyfin_plugin_create() -> Box<dyn Plugin> {
 }
 
 /// Trait for registering a notification provider with a PluginManager.
+#[allow(async_fn_in_trait)]
 pub trait NotificationProviderRegistrar {
-    async fn register_notification_provider<F>(
-        &self,
-        plugin_id: String,
-        send_notification: F,
-    ) where
-        F: Fn(&str, &str, NotificationPriority) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>> + Send + Sync + 'static;
+    async fn register_notification_provider<F>(&self, plugin_id: String, send_notification: F)
+    where
+        F: Fn(
+                &str,
+                &str,
+                NotificationPriority,
+            ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
+            + Send
+            + Sync
+            + 'static;
 }
 
 /// Register the ntfy plugin as a notification provider.
@@ -194,16 +203,20 @@ where
     let plugin_id = plugin.id().to_string();
 
     plugin_manager
-        .register_notification_provider(plugin_id, move |title: &str, message: &str, priority: NotificationPriority| -> Pin<
-            Box<dyn Future<Output = Result<(), String>> + Send>,
-        > {
-            let config = config1.clone();
-            let title = title.to_string();
-            let message = message.to_string();
-            Box::pin(async move {
-                send_notification(&config, &title, &message, priority).await
-            })
-        })
+        .register_notification_provider(
+            plugin_id,
+            move |title: &str,
+                  message: &str,
+                  priority: NotificationPriority|
+                  -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>> {
+                let config = config1.clone();
+                let title = title.to_string();
+                let message = message.to_string();
+                Box::pin(
+                    async move { send_notification(&config, &title, &message, priority).await },
+                )
+            },
+        )
         .await;
 
     Ok(())

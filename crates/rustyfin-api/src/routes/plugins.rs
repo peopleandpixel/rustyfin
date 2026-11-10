@@ -66,7 +66,9 @@ async fn set_plugin_priority(
         .get("priority")
         .and_then(|v| v.as_i64())
         .and_then(|v| i32::try_from(v).ok())
-        .ok_or_else(|| crate::error::ApiError::BadRequest("missing or invalid 'priority' field".into()))?;
+        .ok_or_else(|| {
+            crate::error::ApiError::BadRequest("missing or invalid 'priority' field".into())
+        })?;
 
     state
         .plugin_manager

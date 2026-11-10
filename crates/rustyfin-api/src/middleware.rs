@@ -5,6 +5,7 @@ use axum::response::Response;
 use dashmap::DashMap;
 use ipnet::{IpNet, Ipv6Net};
 use rustyfin_model::auth::Claims;
+use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -143,10 +144,11 @@ pub fn is_local_network(ip: IpAddr) -> bool {
 
 /// Simple in-memory rate limiter using a sliding window per IP.
 /// Uses DashMap for lock-striping to reduce contention under high concurrency.
+/// Uses VecDeque for O(1) expired-entry pruning from the front.
 #[derive(Clone)]
 pub struct RateLimiter {
-    /// Map of IP → list of request timestamps
-    state: Arc<DashMap<String, Vec<Instant>>>,
+    /// Map of IP → deque of request timestamps (oldest first)
+    state: Arc<DashMap<String, VecDeque<Instant>>>,
     /// Maximum requests allowed within the window
     max_requests: usize,
     /// Time window duration
@@ -172,11 +174,28 @@ impl RateLimiter {
                 interval.tick().await;
                 let now = Instant::now();
                 state.retain(|_, timestamps| {
-                    timestamps.retain(|t| now.duration_since(*t) < window);
+                    while let Some(front) = timestamps.front() {
+                        if now.duration_since(*front) >= window {
+                            timestamps.pop_front();
+                        } else {
+                            break;
+                        }
+                    }
                     !timestamps.is_empty()
                 });
             }
         });
+    }
+
+    /// Prune expired timestamps from the front of the deque (oldest first, O(1) per pop).
+    fn prune(entry: &mut VecDeque<Instant>, now: Instant, window: std::time::Duration) {
+        while let Some(front) = entry.front() {
+            if now.duration_since(*front) >= window {
+                entry.pop_front();
+            } else {
+                break;
+            }
+        }
     }
 
     pub async fn check(&self, key: &str) -> bool {
@@ -187,11 +206,11 @@ impl RateLimiter {
 
         let now = Instant::now();
         let mut entry = self.state.entry(key.to_string()).or_default();
-        entry.retain(|t| now.duration_since(*t) < self.window);
+        Self::prune(&mut entry, now, self.window);
         if entry.len() >= self.max_requests {
             return false;
         }
-        entry.push(now);
+        entry.push_back(now);
         true
     }
 
@@ -205,7 +224,7 @@ impl RateLimiter {
         let now = Instant::now();
         match self.state.get_mut(key) {
             Some(mut entry) => {
-                entry.retain(|t| now.duration_since(*t) < self.window);
+                Self::prune(&mut entry, now, self.window);
                 entry.len() >= self.max_requests
             }
             None => false,
@@ -220,8 +239,8 @@ impl RateLimiter {
 
         let now = Instant::now();
         let mut entry = self.state.entry(key.to_string()).or_default();
-        entry.retain(|t| now.duration_since(*t) < self.window);
-        entry.push(now);
+        Self::prune(&mut entry, now, self.window);
+        entry.push_back(now);
     }
 }
 
@@ -229,6 +248,10 @@ impl RateLimiter {
 pub const DEFAULT_LOGIN_LIMIT: usize = 10;
 /// Default login-endpoint window, in seconds.
 pub const DEFAULT_LOGIN_WINDOW_SECS: u64 = 60;
+/// Default resource-intensive endpoint budget (transcoding, streaming start): requests per window.
+pub const DEFAULT_RESOURCE_LIMIT: usize = 30;
+/// Default resource-intensive endpoint window, in seconds.
+pub const DEFAULT_RESOURCE_WINDOW_SECS: u64 = 60;
 
 /// Parse a comma-separated `RUSTYFIN_KNOWN_PROXIES` value into networks. Accepts CIDR blocks
 /// (`10.0.0.0/8`) and bare host IPs (`192.168.1.1` → a /32 or /128). A bare IPv4-mapped IPv6 host
@@ -380,6 +403,24 @@ pub fn resolve_client(peer: IpAddr, headers: &HeaderMap, known: &[IpNet]) -> Cli
         }
     }
     unresolved
+}
+
+/// Per-client budget for resource-intensive endpoints (transcoding, streaming start).
+/// Configurable via `RUSTYFIN_RESOURCE_LIMIT` and `RUSTYFIN_RESOURCE_WINDOW`.
+pub async fn rate_limit_resource(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let client = resolve_client(addr.ip(), req.headers(), &state.known_proxies);
+
+    if !client.is_exempt() && !state.resource_limiter.check(&client.limiter_key()).await {
+        tracing::warn!(ip = %client.ip, "resource rate limit exceeded");
+        return Err(ApiError::RateLimited);
+    }
+
+    Ok(next.run(req).await)
 }
 
 /// Per-client budget for the login endpoints only (AuthenticateByName, ForgotPassword,

@@ -23,7 +23,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.15.0"
+version = "0.16.0"
 edition = "2024"
 
 [workspace.dependencies]
@@ -35,7 +35,7 @@ tokio-util = { version = "0.7", features = ["io"] }
 axum = { version = "0.8", features = ["macros", "ws"] }
 tower = "0.5"
 # tower-http - select only needed compression algorithms (gzip, br)
-tower-http = { version = "0.7", features = ["cors", "trace", "fs", "compression-gzip", "compression-br"] }
+tower-http = { version = "0.7", features = ["cors", "trace", "fs", "compression-gzip", "compression-br", "set-header", "limit"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

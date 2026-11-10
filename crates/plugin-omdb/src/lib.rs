@@ -6,9 +6,9 @@ use rustyfin_model::media::MediaType;
 use rustyfin_model::metadata::{ExternalMetadata, MetadataImage};
 use rustyfin_model::plugin::{Plugin, PluginType};
 use serde::Deserialize;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Mutex;
-use std::future::Future;
 
 const OMDB_BASE: &str = "https://www.omdbapi.com";
 
@@ -42,8 +42,12 @@ fn urlencoded(s: &str) -> String {
 }
 
 /// Search OMDb for a title and return metadata
-pub async fn search(api_key: &str, name: &str, year: Option<i32>) -> Option<ExternalMetadata> {
-    let client = reqwest::Client::new();
+pub async fn search(
+    client: &reqwest::Client,
+    api_key: &str,
+    name: &str,
+    year: Option<i32>,
+) -> Option<ExternalMetadata> {
     let mut url = format!("{}/?apikey={}&t={}", OMDB_BASE, api_key, urlencoded(name));
     if let Some(y) = year {
         url.push_str(&format!("&y={}", y));
@@ -208,23 +212,28 @@ where
         .register_metadata_provider(
             plugin_id,
             "omdb".to_string(),
-            move |_client: &reqwest::Client, name: &str, year: Option<i32>| -> Pin<
-                Box<dyn Future<Output = Option<ExternalMetadata>> + Send>,
-            > {
+            move |client: &reqwest::Client,
+                  name: &str,
+                  year: Option<i32>|
+                  -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>> {
                 let api_key = api_key1.clone();
                 let name = name.to_string();
-                Box::pin(async move { search(&api_key, &name, year).await })
+                let client = client.clone();
+                Box::pin(async move { search(&client, &api_key, &name, year).await })
             },
-            move |_client: &reqwest::Client, name: &str| -> Pin<
-                Box<dyn Future<Output = Option<ExternalMetadata>> + Send>,
-            > {
+            move |client: &reqwest::Client,
+                  name: &str|
+                  -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>> {
                 let api_key = api_key2.clone();
                 let name = name.to_string();
-                Box::pin(async move { search(&api_key, &name, None).await })
+                let client = client.clone();
+                Box::pin(async move { search(&client, &api_key, &name, None).await })
             },
-            move |_client: &reqwest::Client, _tmdb_id: Option<i64>, _tvdb_id: Option<i64>, _media_type: MediaType| -> Pin<
-                Box<dyn Future<Output = Vec<MetadataImage>> + Send>,
-            > {
+            move |_client: &reqwest::Client,
+                  _tmdb_id: Option<i64>,
+                  _tvdb_id: Option<i64>,
+                  _media_type: MediaType|
+                  -> Pin<Box<dyn Future<Output = Vec<MetadataImage>> + Send>> {
                 Box::pin(async move { Vec::new() })
             },
         )
@@ -234,6 +243,7 @@ where
 }
 
 /// Trait for types that can register metadata providers.
+#[allow(async_fn_in_trait)]
 pub trait MetadataProviderRegistrar {
     async fn register_metadata_provider<F1, F2, F3>(
         &self,
@@ -243,7 +253,28 @@ pub trait MetadataProviderRegistrar {
         search_tv: F2,
         get_images: F3,
     ) where
-        F1: Fn(&reqwest::Client, &str, Option<i32>) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>> + Send + Sync + 'static,
-        F2: Fn(&reqwest::Client, &str) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>> + Send + Sync + 'static,
-        F3: Fn(&reqwest::Client, Option<i64>, Option<i64>, MediaType) -> Pin<Box<dyn Future<Output = Vec<MetadataImage>> + Send>> + Send + Sync + 'static;
+        F1: Fn(
+                &reqwest::Client,
+                &str,
+                Option<i32>,
+            ) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>>
+            + Send
+            + Sync
+            + 'static,
+        F2: Fn(
+                &reqwest::Client,
+                &str,
+            ) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>>
+            + Send
+            + Sync
+            + 'static,
+        F3: Fn(
+                &reqwest::Client,
+                Option<i64>,
+                Option<i64>,
+                MediaType,
+            ) -> Pin<Box<dyn Future<Output = Vec<MetadataImage>> + Send>>
+            + Send
+            + Sync
+            + 'static;
 }

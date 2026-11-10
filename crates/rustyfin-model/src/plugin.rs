@@ -141,6 +141,7 @@ pub trait MetadataProviderPlugin: Plugin {
 
 /// Trait for registering a metadata provider with PluginManager.
 /// Used by plugin crates to register their provider closures.
+#[allow(async_fn_in_trait)]
 pub trait MetadataProviderRegistrar {
     async fn register_metadata_provider<F1, F2, F3>(
         &self,
@@ -150,9 +151,30 @@ pub trait MetadataProviderRegistrar {
         search_tv: F2,
         get_images: F3,
     ) where
-        F1: Fn(&reqwest::Client, &str, Option<i32>) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>> + Send + Sync + 'static,
-        F2: Fn(&reqwest::Client, &str) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>> + Send + Sync + 'static,
-        F3: Fn(&reqwest::Client, Option<i64>, Option<i64>, MediaType) -> Pin<Box<dyn Future<Output = Vec<MetadataImage>> + Send>> + Send + Sync + 'static;
+        F1: Fn(
+                &reqwest::Client,
+                &str,
+                Option<i32>,
+            ) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>>
+            + Send
+            + Sync
+            + 'static,
+        F2: Fn(
+                &reqwest::Client,
+                &str,
+            ) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>>
+            + Send
+            + Sync
+            + 'static,
+        F3: Fn(
+                &reqwest::Client,
+                Option<i64>,
+                Option<i64>,
+                MediaType,
+            ) -> Pin<Box<dyn Future<Output = Vec<MetadataImage>> + Send>>
+            + Send
+            + Sync
+            + 'static;
 }
 
 /// Subtitle provider plugin — searches and downloads subtitles.
@@ -177,6 +199,7 @@ pub trait SubtitleProviderPlugin: Plugin {
 }
 
 /// Trait for registering a subtitle provider with PluginManager.
+#[allow(async_fn_in_trait)]
 pub trait SubtitleProviderRegistrar {
     async fn register_subtitle_provider<F1, F2>(
         &self,
@@ -184,8 +207,22 @@ pub trait SubtitleProviderRegistrar {
         search_subtitles: F1,
         download_subtitle: F2,
     ) where
-        F1: Fn(&reqwest::Client, &MediaItem, &str) -> Pin<Box<dyn Future<Output = Vec<SubtitleResult>> + Send>> + Send + Sync + 'static,
-        F2: Fn(&reqwest::Client, &str, &std::path::Path) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>> + Send + Sync + 'static;
+        F1: Fn(
+                &reqwest::Client,
+                &MediaItem,
+                &str,
+            ) -> Pin<Box<dyn Future<Output = Vec<SubtitleResult>> + Send>>
+            + Send
+            + Sync
+            + 'static,
+        F2: Fn(
+                &reqwest::Client,
+                &str,
+                &std::path::Path,
+            ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
+            + Send
+            + Sync
+            + 'static;
 }
 
 /// Notification provider plugin — sends push notifications.
@@ -202,13 +239,18 @@ pub trait NotificationProviderPlugin: Plugin {
 }
 
 /// Trait for registering a notification provider with PluginManager.
+#[allow(async_fn_in_trait)]
 pub trait NotificationProviderRegistrar {
-    async fn register_notification_provider<F>(
-        &self,
-        plugin_id: String,
-        send_notification: F,
-    ) where
-        F: Fn(&str, &str, NotificationPriority) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>> + Send + Sync + 'static;
+    async fn register_notification_provider<F>(&self, plugin_id: String, send_notification: F)
+    where
+        F: Fn(
+                &str,
+                &str,
+                NotificationPriority,
+            ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
+            + Send
+            + Sync
+            + 'static;
 }
 
 // ── Supporting types for plugin traits ──

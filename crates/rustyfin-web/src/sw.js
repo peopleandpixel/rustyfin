@@ -1,13 +1,12 @@
 // Rustyfin Service Worker — Cache-First für statische Assets
-// Vite generates: index.css (bundled styles), api.js & app.js (global scripts), hls.min.js, logo.png
+// Vite generates: index.css (bundled styles), hls.min.js, logo.png
+// api.js & app.js are loaded with cache-busting query params, not pre-cached
+// index.html is NOT cached — always fetched from server to get latest script references
 const CACHE_NAME = 'rustyfin-v__CACHE_VERSION__';
 const ASSETS = [
-  '/web/assets/api.js',
-  '/web/assets/app.js',
   '/web/assets/index.css',
   '/web/assets/hls.min.js',
-  '/web/assets/logo.png',
-  '/web/index.html'
+  '/web/assets/logo.png'
 ];
 
 self.addEventListener('install', (event) => {
@@ -31,8 +30,8 @@ self.addEventListener('activate', (event) => {
 self.addEventListener('fetch', (event) => {
   const { request } = event;
 
-  // Cache-First für statische Assets
-  if (request.url.startsWith('/web/') && !request.url.includes('/api/')) {
+  // Cache-First für statische Assets (aber nicht für index.html, api.js/app.js mit Cache-Busting)
+  if (request.url.startsWith('/web/') && !request.url.includes('/api/') && !request.url.includes('?v=') && !request.url.endsWith('/index.html')) {
     event.respondWith(
       caches.match(request).then((cached) => {
         const fetchPromise = fetch(request).then((response) => {

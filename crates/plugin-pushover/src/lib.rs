@@ -64,14 +64,18 @@ impl Plugin for PushoverPlugin {
     }
 
     fn set_configuration(&self, config: serde_json::Value) -> Result<(), String> {
-        let plugin_config: PushoverConfig =
-            serde_json::from_value(config).map_err(|e| format!("Invalid Pushover config: {}", e))?;
+        let plugin_config: PushoverConfig = serde_json::from_value(config)
+            .map_err(|e| format!("Invalid Pushover config: {}", e))?;
         *self.config.lock().unwrap() = Some(plugin_config);
         Ok(())
     }
 
     fn get_configuration(&self) -> Option<serde_json::Value> {
-        self.config.lock().unwrap().clone().map(|c| serde_json::to_value(c).unwrap())
+        self.config
+            .lock()
+            .unwrap()
+            .clone()
+            .map(|c| serde_json::to_value(c).unwrap())
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -127,7 +131,10 @@ pub async fn send_notification(
     message: &str,
     priority: NotificationPriority,
 ) -> Result<(), String> {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
 
     let mut body = format!(
         "token={}&user={}&title={}&message={}&priority={}",
@@ -183,13 +190,18 @@ pub unsafe extern "C" fn rustyfin_plugin_create() -> Box<dyn Plugin> {
 }
 
 /// Trait for registering a notification provider with a PluginManager.
+#[allow(async_fn_in_trait)]
 pub trait NotificationProviderRegistrar {
-    async fn register_notification_provider<F>(
-        &self,
-        plugin_id: String,
-        send_notification: F,
-    ) where
-        F: Fn(&str, &str, NotificationPriority) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>> + Send + Sync + 'static;
+    async fn register_notification_provider<F>(&self, plugin_id: String, send_notification: F)
+    where
+        F: Fn(
+                &str,
+                &str,
+                NotificationPriority,
+            ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
+            + Send
+            + Sync
+            + 'static;
 }
 
 /// Register the Pushover plugin as a notification provider.
@@ -205,16 +217,20 @@ where
     let plugin_id = plugin.id().to_string();
 
     plugin_manager
-        .register_notification_provider(plugin_id, move |title: &str, message: &str, priority: NotificationPriority| -> Pin<
-            Box<dyn Future<Output = Result<(), String>> + Send>,
-        > {
-            let config = config1.clone();
-            let title = title.to_string();
-            let message = message.to_string();
-            Box::pin(async move {
-                send_notification(&config, &title, &message, priority).await
-            })
-        })
+        .register_notification_provider(
+            plugin_id,
+            move |title: &str,
+                  message: &str,
+                  priority: NotificationPriority|
+                  -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>> {
+                let config = config1.clone();
+                let title = title.to_string();
+                let message = message.to_string();
+                Box::pin(
+                    async move { send_notification(&config, &title, &message, priority).await },
+                )
+            },
+        )
         .await;
 
     Ok(())

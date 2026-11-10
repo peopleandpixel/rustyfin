@@ -8,10 +8,10 @@ use rustyfin_model::media::MediaType;
 use rustyfin_model::metadata::{ExternalMetadata, MetadataImage};
 use rustyfin_model::plugin::{Plugin, PluginType};
 use serde::Deserialize;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::LazyLock;
 use std::sync::Mutex;
-use std::future::Future;
 
 const TVDB_BASE: &str = "https://api.tvmaze.com";
 
@@ -187,25 +187,22 @@ pub struct PersonPhoto {
 }
 
 /// Fetch cast for a TV show from TVMaze, returning person info with photos
-pub async fn get_tv_people(
-    client: &reqwest::Client,
-    tvdb_id: i64,
-) -> Vec<PersonPhoto> {
+pub async fn get_tv_people(client: &reqwest::Client, tvdb_id: i64) -> Vec<PersonPhoto> {
     let url = format!("{}/shows/{}/cast", TVDB_BASE, tvdb_id);
     let cache_key = format!("tvdb_cast:{}", tvdb_id);
 
     let mut result = Vec::new();
 
-    if let Some(json) = fetch_tvdb_json(client, &cache_key, &url).await {
-        if let Ok(cast) = serde_json::from_value::<Vec<TvmazeCastMember>>(json) {
-            for member in cast.into_iter().take(20) {
-                if let Some(ref image) = member.person.image {
-                    result.push(PersonPhoto {
-                        person_id: member.person.id.to_string(),
-                        name: member.person.name,
-                        photo_url: image.original.clone(),
-                    });
-                }
+    if let Some(json) = fetch_tvdb_json(client, &cache_key, &url).await
+        && let Ok(cast) = serde_json::from_value::<Vec<TvmazeCastMember>>(json)
+    {
+        for member in cast.into_iter().take(20) {
+            if let Some(ref image) = member.person.image {
+                result.push(PersonPhoto {
+                    person_id: member.person.id.to_string(),
+                    name: member.person.name,
+                    photo_url: image.original.clone(),
+                });
             }
         }
     }
@@ -221,16 +218,15 @@ pub async fn get_person_photo(
     let url = format!("{}/people/{}", TVDB_BASE, tvdb_person_id);
     let cache_key = format!("tvdb_person:{}", tvdb_person_id);
 
-    if let Some(json) = fetch_tvdb_json(client, &cache_key, &url).await {
-        if let Ok(person) = serde_json::from_value::<TvmazePerson>(json) {
-            if let Some(ref image) = person.image {
-                return Some(PersonPhoto {
-                    person_id: person.id.to_string(),
-                    name: person.name,
-                    photo_url: image.original.clone(),
-                });
-            }
-        }
+    if let Some(json) = fetch_tvdb_json(client, &cache_key, &url).await
+        && let Ok(person) = serde_json::from_value::<TvmazePerson>(json)
+        && let Some(ref image) = person.image
+    {
+        return Some(PersonPhoto {
+            person_id: person.id.to_string(),
+            name: person.name,
+            photo_url: image.original.clone(),
+        });
     }
     None
 }
@@ -256,10 +252,7 @@ fn urlencoded(s: &str) -> String {
 }
 
 /// Fetch images for a TV show from TVMaze
-async fn fetch_images(
-    client: &reqwest::Client,
-    tvdb_id: i64,
-) -> Vec<MetadataImage> {
+async fn fetch_images(client: &reqwest::Client, tvdb_id: i64) -> Vec<MetadataImage> {
     let url = format!("{}/shows/{}/images", TVDB_BASE, tvdb_id);
     let cache_key = format!("tvdb_images:{}", tvdb_id);
     let mut result = Vec::new();
@@ -310,15 +303,8 @@ struct TvmazeImageItem {
 }
 
 /// Search TVMaze for a TV show and return full metadata
-pub async fn search_tv(
-    client: &reqwest::Client,
-    name: &str,
-) -> Option<ExternalMetadata> {
-    let url = format!(
-        "{}/shows?q={}",
-        TVDB_BASE,
-        urlencoded(name)
-    );
+pub async fn search_tv(client: &reqwest::Client, name: &str) -> Option<ExternalMetadata> {
+    let url = format!("{}/shows?q={}", TVDB_BASE, urlencoded(name));
     let cache_key = format!("tvdb_search:{}", name);
 
     let resp: Vec<TvmazeSearchResult> = match fetch_tvdb_json(client, &cache_key, &url).await {
@@ -327,7 +313,11 @@ pub async fn search_tv(
     };
 
     // Pick the best result (highest score)
-    let best = resp.into_iter().max_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal))?;
+    let best = resp.into_iter().max_by(|a, b| {
+        a.score
+            .partial_cmp(&b.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    })?;
     let show = best.show;
     let tvdb_id = show.externals.tvdb?;
 
@@ -354,10 +344,7 @@ pub async fn search_tv(
 
     let genres = show.genres.clone();
 
-    let studios = show
-        .network
-        .as_ref()
-        .map(|n| vec![n.name.clone()]);
+    let studios = show.network.as_ref().map(|n| vec![n.name.clone()]);
 
     let production_countries = show
         .country
@@ -365,9 +352,7 @@ pub async fn search_tv(
         .and_then(|c| c.code.clone())
         .map(|code| vec![code]);
 
-    let runtime_ticks = show
-        .runtime
-        .map(|mins| (mins as i64) * 60_i64 * 10_000_000);
+    let runtime_ticks = show.runtime.map(|mins| (mins as i64) * 60_i64 * 10_000_000);
 
     Some(ExternalMetadata {
         name: Some(show.name),
@@ -387,7 +372,7 @@ pub async fn search_tv(
         production_countries,
         budget: None,
         revenue: None,
-        homepage: show.web_channel.as_ref().and_then(|wc| Some(wc.name.clone())),
+        homepage: show.web_channel.as_ref().map(|wc| wc.name.clone()),
         end_date: show.ended,
         vote_count: show.rating_count,
         popularity: show.weight.map(|w| w as f64),
@@ -409,10 +394,7 @@ pub async fn search_movie(
 }
 
 /// Get TheTVDB ID for a TV show by name
-pub async fn get_tvdb_id_by_name(
-    client: &reqwest::Client,
-    name: &str,
-) -> Option<i64> {
+pub async fn get_tvdb_id_by_name(client: &reqwest::Client, name: &str) -> Option<i64> {
     let result = search_tv(client, name).await?;
     result.tvdb_id
 }
@@ -496,10 +478,8 @@ pub unsafe extern "C" fn rustyfin_plugin_create() -> Box<dyn Plugin> {
 }
 
 /// Register the TheTVDB plugin as a metadata provider with the given PluginManager.
-pub async fn register_tvdb_provider<P>(
-    plugin: &TvdbPlugin,
-    plugin_manager: &P,
-) where
+pub async fn register_tvdb_provider<P>(plugin: &TvdbPlugin, plugin_manager: &P)
+where
     P: MetadataProviderRegistrar,
 {
     let plugin_id = plugin.id().to_string();
@@ -507,23 +487,26 @@ pub async fn register_tvdb_provider<P>(
         .register_metadata_provider(
             plugin_id,
             "tvdb".to_string(),
-            move |_client: &reqwest::Client, name: &str, year: Option<i32>| -> Pin<
-                Box<dyn Future<Output = Option<ExternalMetadata>> + Send>,
-            > {
+            move |_client: &reqwest::Client,
+                  name: &str,
+                  year: Option<i32>|
+                  -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>> {
                 let name = name.to_string();
                 let client = _client.clone();
                 Box::pin(async move { search_movie(&client, &name, year).await })
             },
-            move |_client: &reqwest::Client, name: &str| -> Pin<
-                Box<dyn Future<Output = Option<ExternalMetadata>> + Send>,
-            > {
+            move |_client: &reqwest::Client,
+                  name: &str|
+                  -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>> {
                 let name = name.to_string();
                 let client = _client.clone();
                 Box::pin(async move { search_tv(&client, &name).await })
             },
-            move |_client: &reqwest::Client, _tmdb_id: Option<i64>, tvdb_id: Option<i64>, _media_type: MediaType| -> Pin<
-                Box<dyn Future<Output = Vec<MetadataImage>> + Send>,
-            > {
+            move |_client: &reqwest::Client,
+                  _tmdb_id: Option<i64>,
+                  tvdb_id: Option<i64>,
+                  _media_type: MediaType|
+                  -> Pin<Box<dyn Future<Output = Vec<MetadataImage>> + Send>> {
                 let client = _client.clone();
                 Box::pin(async move {
                     if let Some(id) = tvdb_id {
@@ -538,6 +521,7 @@ pub async fn register_tvdb_provider<P>(
 }
 
 /// Trait for types that can register metadata providers.
+#[allow(async_fn_in_trait)]
 pub trait MetadataProviderRegistrar {
     async fn register_metadata_provider<F1, F2, F3>(
         &self,
@@ -547,9 +531,30 @@ pub trait MetadataProviderRegistrar {
         search_tv: F2,
         get_images: F3,
     ) where
-        F1: Fn(&reqwest::Client, &str, Option<i32>) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>> + Send + Sync + 'static,
-        F2: Fn(&reqwest::Client, &str) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>> + Send + Sync + 'static,
-        F3: Fn(&reqwest::Client, Option<i64>, Option<i64>, MediaType) -> Pin<Box<dyn Future<Output = Vec<MetadataImage>> + Send>> + Send + Sync + 'static;
+        F1: Fn(
+                &reqwest::Client,
+                &str,
+                Option<i32>,
+            ) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>>
+            + Send
+            + Sync
+            + 'static,
+        F2: Fn(
+                &reqwest::Client,
+                &str,
+            ) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>>
+            + Send
+            + Sync
+            + 'static,
+        F3: Fn(
+                &reqwest::Client,
+                Option<i64>,
+                Option<i64>,
+                MediaType,
+            ) -> Pin<Box<dyn Future<Output = Vec<MetadataImage>> + Send>>
+            + Send
+            + Sync
+            + 'static;
 }
 
 #[cfg(test)]

@@ -103,7 +103,11 @@ impl Plugin for MqttPlugin {
     }
 
     fn get_configuration(&self) -> Option<serde_json::Value> {
-        self.config.lock().unwrap().clone().map(|c| serde_json::to_value(c).unwrap())
+        self.config
+            .lock()
+            .unwrap()
+            .clone()
+            .map(|c| serde_json::to_value(c).unwrap())
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -160,10 +164,15 @@ pub async fn send_notification(
     });
     let payload_str = payload.to_string();
 
-    // Connect and publish using sync client for simplicity
-    let (mut client, _eventloop) = rumqttc::AsyncClient::new(mqtt_options, 10);
+    // Connect and publish using async client
+    let (client, _eventloop) = rumqttc::AsyncClient::new(mqtt_options, 10);
     client
-        .publish(&config.topic, rumqttc::QoS::AtLeastOnce, false, payload_str.as_bytes())
+        .publish(
+            &config.topic,
+            rumqttc::QoS::AtLeastOnce,
+            false,
+            payload_str.as_bytes(),
+        )
         .await
         .map_err(|e| format!("MQTT publish failed: {}", e))?;
 
@@ -188,13 +197,18 @@ pub unsafe extern "C" fn rustyfin_plugin_create() -> Box<dyn Plugin> {
 }
 
 /// Trait for registering a notification provider with a PluginManager.
+#[allow(async_fn_in_trait)]
 pub trait NotificationProviderRegistrar {
-    async fn register_notification_provider<F>(
-        &self,
-        plugin_id: String,
-        send_notification: F,
-    ) where
-        F: Fn(&str, &str, NotificationPriority) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>> + Send + Sync + 'static;
+    async fn register_notification_provider<F>(&self, plugin_id: String, send_notification: F)
+    where
+        F: Fn(
+                &str,
+                &str,
+                NotificationPriority,
+            ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
+            + Send
+            + Sync
+            + 'static;
 }
 
 /// Register the MQTT plugin as a notification provider.
@@ -210,16 +224,20 @@ where
     let plugin_id = plugin.id().to_string();
 
     plugin_manager
-        .register_notification_provider(plugin_id, move |title: &str, message: &str, priority: NotificationPriority| -> Pin<
-            Box<dyn Future<Output = Result<(), String>> + Send>,
-        > {
-            let config = config1.clone();
-            let title = title.to_string();
-            let message = message.to_string();
-            Box::pin(async move {
-                send_notification(&config, &title, &message, priority).await
-            })
-        })
+        .register_notification_provider(
+            plugin_id,
+            move |title: &str,
+                  message: &str,
+                  priority: NotificationPriority|
+                  -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>> {
+                let config = config1.clone();
+                let title = title.to_string();
+                let message = message.to_string();
+                Box::pin(
+                    async move { send_notification(&config, &title, &message, priority).await },
+                )
+            },
+        )
         .await;
 
     Ok(())
@@ -241,7 +259,10 @@ mod tests {
         assert_eq!(priority_to_string(NotificationPriority::Low), "low");
         assert_eq!(priority_to_string(NotificationPriority::Normal), "normal");
         assert_eq!(priority_to_string(NotificationPriority::High), "high");
-        assert_eq!(priority_to_string(NotificationPriority::Emergency), "emergency");
+        assert_eq!(
+            priority_to_string(NotificationPriority::Emergency),
+            "emergency"
+        );
     }
 
     #[test]

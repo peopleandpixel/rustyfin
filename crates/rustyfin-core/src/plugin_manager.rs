@@ -1,30 +1,30 @@
+use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
-use sqlx::SqlitePool;
 use tokio::sync::RwLock;
 use tracing;
 
+use plugin_fanart::MetadataProviderRegistrar as FanartRegistrar;
+use plugin_local_nfo::MetadataProviderRegistrar as LocalNfoRegistrar;
+use plugin_mqtt::NotificationProviderRegistrar as MqttRegistrar;
+use plugin_ntfy::NotificationProviderRegistrar as NtfyRegistrar;
+use plugin_omdb::MetadataProviderRegistrar as OmdbRegistrar;
+use plugin_opensubtitles::SubtitleProviderRegistrar as OpenSubtitlesRegistrar;
+use plugin_podnapisi::SubtitleProviderRegistrar as PodnapisiRegistrar;
+use plugin_pushover::NotificationProviderRegistrar as PushoverRegistrar;
+use plugin_tmdb::MetadataProviderRegistrar as TmdbRegistrar;
+use plugin_trakt::MetadataProviderRegistrar as TraktRegistrar;
+use plugin_tvdb::MetadataProviderRegistrar as TvdbRegistrar;
+use plugin_webhook::NotificationProviderRegistrar as WebhookRegistrar;
 use rustyfin_model::media::{MediaItem, MediaType};
 use rustyfin_model::metadata::{ExternalMetadata, MetadataImage};
 use rustyfin_model::plugin::{
     NotificationPriority, Plugin, PluginConfiguration, PluginInfo, PluginStatus, PluginType,
     SubtitleResult,
 };
-use plugin_tmdb::MetadataProviderRegistrar as TmdbRegistrar;
-use plugin_omdb::MetadataProviderRegistrar as OmdbRegistrar;
-use plugin_fanart::MetadataProviderRegistrar as FanartRegistrar;
-use plugin_opensubtitles::SubtitleProviderRegistrar as OpenSubtitlesRegistrar;
-use plugin_tvdb::MetadataProviderRegistrar as TvdbRegistrar;
-use plugin_webhook::NotificationProviderRegistrar as WebhookRegistrar;
-use plugin_ntfy::NotificationProviderRegistrar as NtfyRegistrar;
-use plugin_mqtt::NotificationProviderRegistrar as MqttRegistrar;
-use plugin_trakt::MetadataProviderRegistrar as TraktRegistrar;
-use plugin_pushover::NotificationProviderRegistrar as PushoverRegistrar;
-use plugin_podnapisi::SubtitleProviderRegistrar as PodnapisiRegistrar;
-use plugin_local_nfo::MetadataProviderRegistrar as LocalNfoRegistrar;
 
 /// A loaded plugin with its dynamic library handle.
 struct LoadedPlugin {
@@ -35,6 +35,62 @@ struct LoadedPlugin {
     /// True if this is a built-in (statically registered) plugin.
     is_builtin: bool,
 }
+
+// Type aliases for complex async closure types (avoids clippy type_complexity)
+type SearchMovieFn = Arc<
+    dyn Fn(
+            &reqwest::Client,
+            &str,
+            Option<i32>,
+        ) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>>
+        + Send
+        + Sync,
+>;
+type SearchTvFn = Arc<
+    dyn Fn(
+            &reqwest::Client,
+            &str,
+        ) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>>
+        + Send
+        + Sync,
+>;
+type GetImagesFn = Arc<
+    dyn Fn(
+            &reqwest::Client,
+            Option<i64>,
+            Option<i64>,
+            MediaType,
+        ) -> Pin<Box<dyn Future<Output = Vec<MetadataImage>> + Send>>
+        + Send
+        + Sync,
+>;
+type SearchSubtitlesFn = Arc<
+    dyn Fn(
+            &reqwest::Client,
+            &MediaItem,
+            &str,
+        ) -> Pin<Box<dyn Future<Output = Vec<SubtitleResult>> + Send>>
+        + Send
+        + Sync,
+>;
+type DownloadSubtitleFn = Arc<
+    dyn Fn(
+            &reqwest::Client,
+            &str,
+            &std::path::Path,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
+        + Send
+        + Sync,
+>;
+type SendNotificationFn = Arc<
+    dyn Fn(
+            &str,
+            &str,
+            NotificationPriority,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
+        + Send
+        + Sync,
+>;
 
 /// A built-in plugin registered via registrar traits (no dynamic library).
 #[derive(Clone)]
@@ -53,9 +109,10 @@ pub struct MetadataProviderHandle {
     pub plugin_id: String,
     pub provider_name: String,
     pub priority: i32,
-    pub search_movie: Arc<dyn Fn(&reqwest::Client, &str, Option<i32>) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>> + Send + Sync>,
-    pub search_tv: Arc<dyn Fn(&reqwest::Client, &str) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>> + Send + Sync>,
-    pub get_images: Arc<dyn Fn(&reqwest::Client, Option<i64>, Option<i64>, MediaType) -> Pin<Box<dyn Future<Output = Vec<MetadataImage>> + Send>> + Send + Sync>,
+    pub status: PluginStatus,
+    pub search_movie: SearchMovieFn,
+    pub search_tv: SearchTvFn,
+    pub get_images: GetImagesFn,
 }
 
 /// Subtitle provider handle stored in the plugin manager.
@@ -63,8 +120,9 @@ pub struct MetadataProviderHandle {
 pub struct SubtitleProviderHandle {
     pub plugin_id: String,
     pub priority: i32,
-    pub search_subtitles: Arc<dyn Fn(&reqwest::Client, &MediaItem, &str) -> Pin<Box<dyn Future<Output = Vec<SubtitleResult>> + Send>> + Send + Sync>,
-    pub download_subtitle: Arc<dyn Fn(&reqwest::Client, &str, &std::path::Path) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>> + Send + Sync>,
+    pub status: PluginStatus,
+    pub search_subtitles: SearchSubtitlesFn,
+    pub download_subtitle: DownloadSubtitleFn,
 }
 
 /// Notification provider handle stored in the plugin manager.
@@ -72,7 +130,9 @@ pub struct SubtitleProviderHandle {
 pub struct NotificationProviderHandle {
     pub plugin_id: String,
     pub priority: i32,
-    send_notification: Arc<dyn Fn(&str, &str, NotificationPriority) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>> + Send + Sync>,
+    pub status: PluginStatus,
+    #[allow(dead_code)]
+    send_notification: SendNotificationFn,
 }
 
 /// Manages loading, unloading, and querying plugins.
@@ -137,7 +197,11 @@ impl PluginManager {
             }
             Ok(None) => None,
             Err(e) => {
-                tracing::warn!("failed to load plugin config from DB for {}: {}", plugin_id, e);
+                tracing::warn!(
+                    "failed to load plugin config from DB for {}: {}",
+                    plugin_id,
+                    e
+                );
                 None
             }
         }
@@ -219,17 +283,40 @@ impl PluginManager {
     /// Register a metadata provider plugin.
     /// Call this from a plugin's `on_load` or during initialization to make the provider available.
     /// `plugin_id` is used to look up the priority from the database.
+    /// `status` determines whether the provider is active; only active providers are returned by `metadata_providers()`.
     pub async fn register_metadata_provider<F1, F2, F3>(
         &self,
         plugin_id: String,
         provider_name: String,
+        status: PluginStatus,
         search_movie: F1,
         search_tv: F2,
         get_images: F3,
     ) where
-        F1: Fn(&reqwest::Client, &str, Option<i32>) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>> + Send + Sync + 'static,
-        F2: Fn(&reqwest::Client, &str) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>> + Send + Sync + 'static,
-        F3: Fn(&reqwest::Client, Option<i64>, Option<i64>, MediaType) -> Pin<Box<dyn Future<Output = Vec<MetadataImage>> + Send>> + Send + Sync + 'static,
+        F1: Fn(
+                &reqwest::Client,
+                &str,
+                Option<i32>,
+            ) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>>
+            + Send
+            + Sync
+            + 'static,
+        F2: Fn(
+                &reqwest::Client,
+                &str,
+            ) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>>
+            + Send
+            + Sync
+            + 'static,
+        F3: Fn(
+                &reqwest::Client,
+                Option<i64>,
+                Option<i64>,
+                MediaType,
+            ) -> Pin<Box<dyn Future<Output = Vec<MetadataImage>> + Send>>
+            + Send
+            + Sync
+            + 'static,
     {
         let priority = self.get_plugin_priority_from_db(&plugin_id).await;
         let mut inner = self.inner.write().await;
@@ -237,55 +324,100 @@ impl PluginManager {
             plugin_id: plugin_id.clone(),
             provider_name: provider_name.clone(),
             priority,
+            status: status.clone(),
             search_movie: Arc::new(search_movie),
             search_tv: Arc::new(search_tv),
             get_images: Arc::new(get_images),
         });
         inner.metadata_providers.sort_by_key(|h| h.priority);
-        tracing::info!("registered metadata provider: {} (priority: {})", provider_name, priority);
+        tracing::info!(
+            "registered metadata provider: {} (priority: {}, status: {:?})",
+            provider_name,
+            priority,
+            status
+        );
     }
 
     /// Register a subtitle provider plugin.
     /// `plugin_id` is used to look up the priority from the database.
+    /// `status` determines whether the provider is active; only active providers are returned by `subtitle_providers()`.
     pub async fn register_subtitle_provider<F1, F2>(
         &self,
         plugin_id: String,
+        status: PluginStatus,
         search_subtitles: F1,
         download_subtitle: F2,
     ) where
-        F1: Fn(&reqwest::Client, &MediaItem, &str) -> Pin<Box<dyn Future<Output = Vec<SubtitleResult>> + Send>> + Send + Sync + 'static,
-        F2: Fn(&reqwest::Client, &str, &std::path::Path) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>> + Send + Sync + 'static,
+        F1: Fn(
+                &reqwest::Client,
+                &MediaItem,
+                &str,
+            ) -> Pin<Box<dyn Future<Output = Vec<SubtitleResult>> + Send>>
+            + Send
+            + Sync
+            + 'static,
+        F2: Fn(
+                &reqwest::Client,
+                &str,
+                &std::path::Path,
+            ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
+            + Send
+            + Sync
+            + 'static,
     {
         let priority = self.get_plugin_priority_from_db(&plugin_id).await;
         let mut inner = self.inner.write().await;
         inner.subtitle_providers.push(SubtitleProviderHandle {
             plugin_id: plugin_id.clone(),
             priority,
+            status: status.clone(),
             search_subtitles: Arc::new(search_subtitles),
             download_subtitle: Arc::new(download_subtitle),
         });
         inner.subtitle_providers.sort_by_key(|h| h.priority);
-        tracing::info!("registered subtitle provider: {} (priority: {})", plugin_id, priority);
+        tracing::info!(
+            "registered subtitle provider: {} (priority: {}, status: {:?})",
+            plugin_id,
+            priority,
+            status
+        );
     }
 
     /// Register a notification provider plugin.
     /// `plugin_id` is used to look up the priority from the database.
+    /// `status` determines whether the provider is active; only active providers are returned by `notification_providers()`.
     pub async fn register_notification_provider<F>(
         &self,
         plugin_id: String,
+        status: PluginStatus,
         send_notification: F,
     ) where
-        F: Fn(&str, &str, NotificationPriority) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>> + Send + Sync + 'static,
+        F: Fn(
+                &str,
+                &str,
+                NotificationPriority,
+            ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
+            + Send
+            + Sync
+            + 'static,
     {
         let priority = self.get_plugin_priority_from_db(&plugin_id).await;
         let mut inner = self.inner.write().await;
-        inner.notification_providers.push(NotificationProviderHandle {
-            plugin_id: plugin_id.clone(),
-            priority,
-            send_notification: Arc::new(send_notification),
-        });
+        inner
+            .notification_providers
+            .push(NotificationProviderHandle {
+                plugin_id: plugin_id.clone(),
+                priority,
+                status: status.clone(),
+                send_notification: Arc::new(send_notification),
+            });
         inner.notification_providers.sort_by_key(|h| h.priority);
-        tracing::info!("registered notification provider: {} (priority: {})", plugin_id, priority);
+        tracing::info!(
+            "registered notification provider: {} (priority: {}, status: {:?})",
+            plugin_id,
+            priority,
+            status
+        );
     }
 
     // ── Priority management ──
@@ -342,13 +474,7 @@ impl PluginManager {
             }
         }
 
-        // Update BuiltinPluginInfo priority if it exists
-        {
-            let mut inner = self.inner.write().await;
-            if let Some(info) = inner.builtin_plugins.get_mut(plugin_id) {
-                // Priority is stored in DB, not in BuiltinPluginInfo directly
-            }
-        }
+        // Priority is stored in DB, not in BuiltinPluginInfo directly
 
         tracing::info!("updated plugin priority: {} -> {}", plugin_id, priority);
         Ok(())
@@ -379,7 +505,7 @@ impl PluginManager {
         drop(inner);
 
         // Load priorities for all plugins
-        let priorities: std::collections::HashMap<String, i32> = if let Some(db) = &self.db {
+        let priorities: std::collections::HashMap<String, i32> = if let Some(_db) = &self.db {
             let mut map = std::collections::HashMap::new();
             for id in &all_ids {
                 map.insert(id.clone(), self.get_plugin_priority_from_db(id).await);
@@ -436,10 +562,13 @@ impl PluginManager {
         all.extend(builtin);
         // Sort by plugin_type (as string), then by priority, then by id
         all.sort_by(|a, b| {
-            let type_cmp = a.plugin_type
+            let type_cmp = a
+                .plugin_type
                 .map(|t| t.to_string())
                 .cmp(&b.plugin_type.map(|t| t.to_string()));
-            type_cmp.then(a.priority.cmp(&b.priority)).then(a.id.cmp(&b.id))
+            type_cmp
+                .then(a.priority.cmp(&b.priority))
+                .then(a.id.cmp(&b.id))
         });
         all
     }
@@ -456,13 +585,13 @@ impl PluginManager {
         }
         // Fall back to in-memory dynamic plugin
         let inner = self.inner.read().await;
-        if let Some(lp) = inner.plugins.get(plugin_id) {
-            if let Some(values) = lp.plugin.get_configuration() {
-                return Some(PluginConfiguration {
-                    plugin_id: plugin_id.to_string(),
-                    values,
-                });
-            }
+        if let Some(lp) = inner.plugins.get(plugin_id)
+            && let Some(values) = lp.plugin.get_configuration()
+        {
+            return Some(PluginConfiguration {
+                plugin_id: plugin_id.to_string(),
+                values,
+            });
         }
         // Built-in plugins without DB config return empty config
         if inner.builtin_plugins.contains_key(plugin_id) {
@@ -486,24 +615,24 @@ impl PluginManager {
             let inner = self.inner.read().await;
             let is_dynamic = inner.plugins.contains_key(plugin_id);
             let is_builtin = inner.builtin_plugins.contains_key(plugin_id);
-            
+
             if !is_dynamic && !is_builtin {
                 return Err("plugin not found".to_string());
             }
-            
+
             // Update in-memory dynamic plugin if it exists
-            if is_dynamic {
-                if let Some(lp) = inner.plugins.get(plugin_id) {
-                    lp.plugin.set_configuration(config.clone())?;
-                }
+            if is_dynamic
+                && let Some(lp) = inner.plugins.get(plugin_id)
+            {
+                lp.plugin.set_configuration(config.clone())?;
             }
         }
-        
+
         // Persist to database (built-in plugins rely solely on DB)
         if let Err(e) = self.save_plugin_config_to_db(plugin_id, &config).await {
             tracing::warn!("failed to persist plugin config to DB: {}", e);
         }
-        
+
         Ok(())
     }
 
@@ -512,27 +641,104 @@ impl PluginManager {
     /// Returns the count of plugins of a specific type.
     pub async fn plugin_count_by_type(&self, plugin_type: PluginType) -> usize {
         let inner = self.inner.read().await;
-        inner.plugins.values()
+        inner
+            .plugins
+            .values()
             .filter(|lp| lp.plugin.plugin_type() == plugin_type)
             .count()
     }
 
-    /// Returns the list of registered metadata providers.
+    /// Returns the list of registered metadata providers that are currently active.
+    /// Disabled providers are excluded so scans run fast without external API calls.
     pub async fn metadata_providers(&self) -> Vec<MetadataProviderHandle> {
         let inner = self.inner.read().await;
-        inner.metadata_providers.clone()
+        inner
+            .metadata_providers
+            .iter()
+            .filter(|h| h.status == PluginStatus::Active)
+            .cloned()
+            .collect()
     }
 
-    /// Returns the list of registered subtitle providers.
+    /// Returns the list of registered subtitle providers that are currently active.
     pub async fn subtitle_providers(&self) -> Vec<SubtitleProviderHandle> {
         let inner = self.inner.read().await;
-        inner.subtitle_providers.clone()
+        inner
+            .subtitle_providers
+            .iter()
+            .filter(|h| h.status == PluginStatus::Active)
+            .cloned()
+            .collect()
     }
 
-    /// Returns the list of registered notification providers.
+    /// Returns the list of registered notification providers that are currently active.
     pub async fn notification_providers(&self) -> Vec<NotificationProviderHandle> {
         let inner = self.inner.read().await;
-        inner.notification_providers.clone()
+        inner
+            .notification_providers
+            .iter()
+            .filter(|h| h.status == PluginStatus::Active)
+            .cloned()
+            .collect()
+    }
+
+    // ── Plugin status management ──
+
+    /// Enable or disable a plugin by ID. Updates both the built-in plugin info and all associated
+    /// provider handles, then persists the status to the database so it survives restarts.
+    pub async fn set_plugin_status(
+        &self,
+        plugin_id: &str,
+        status: PluginStatus,
+    ) -> Result<(), String> {
+        // Update built-in plugin info
+        {
+            let mut inner = self.inner.write().await;
+            if let Some(info) = inner.builtin_plugins.get_mut(plugin_id) {
+                info.status = status.clone();
+            }
+            // Update all provider handles for this plugin
+            for handle in &mut inner.metadata_providers {
+                if handle.plugin_id == plugin_id {
+                    handle.status = status.clone();
+                }
+            }
+            for handle in &mut inner.subtitle_providers {
+                if handle.plugin_id == plugin_id {
+                    handle.status = status.clone();
+                }
+            }
+            for handle in &mut inner.notification_providers {
+                if handle.plugin_id == plugin_id {
+                    handle.status = status.clone();
+                }
+            }
+        }
+
+        // Persist to database
+        if let Some(_db) = &self.db {
+            let status_str = match status {
+                PluginStatus::Active => "Active",
+                PluginStatus::Disabled => "Disabled",
+                PluginStatus::Malfunctioned => "Malfunctioned",
+            };
+            let config = serde_json::json!({ "status": status_str });
+            if let Err(e) = self.save_plugin_config_to_db(plugin_id, &config).await {
+                tracing::warn!("failed to persist plugin status to DB: {}", e);
+            }
+        }
+
+        tracing::info!("plugin {} status changed to {:?}", plugin_id, status);
+        Ok(())
+    }
+
+    /// Get the current status of a plugin.
+    pub async fn get_plugin_status(&self, plugin_id: &str) -> Option<PluginStatus> {
+        let inner = self.inner.read().await;
+        inner
+            .builtin_plugins
+            .get(plugin_id)
+            .map(|info| info.status.clone())
     }
 }
 
@@ -547,11 +753,44 @@ impl TmdbRegistrar for PluginManager {
         search_tv: F2,
         get_images: F3,
     ) where
-        F1: Fn(&reqwest::Client, &str, Option<i32>) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>> + Send + Sync + 'static,
-        F2: Fn(&reqwest::Client, &str) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>> + Send + Sync + 'static,
-        F3: Fn(&reqwest::Client, Option<i64>, Option<i64>, MediaType) -> Pin<Box<dyn Future<Output = Vec<MetadataImage>> + Send>> + Send + Sync + 'static,
+        F1: Fn(
+                &reqwest::Client,
+                &str,
+                Option<i32>,
+            ) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>>
+            + Send
+            + Sync
+            + 'static,
+        F2: Fn(
+                &reqwest::Client,
+                &str,
+            ) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>>
+            + Send
+            + Sync
+            + 'static,
+        F3: Fn(
+                &reqwest::Client,
+                Option<i64>,
+                Option<i64>,
+                MediaType,
+            ) -> Pin<Box<dyn Future<Output = Vec<MetadataImage>> + Send>>
+            + Send
+            + Sync
+            + 'static,
     {
-        self.register_metadata_provider(plugin_id, provider_name, search_movie, search_tv, get_images).await;
+        let status = self
+            .get_plugin_status(&plugin_id)
+            .await
+            .unwrap_or(PluginStatus::Disabled);
+        self.register_metadata_provider(
+            plugin_id,
+            provider_name,
+            status,
+            search_movie,
+            search_tv,
+            get_images,
+        )
+        .await;
     }
 }
 
@@ -564,11 +803,44 @@ impl OmdbRegistrar for PluginManager {
         search_tv: F2,
         get_images: F3,
     ) where
-        F1: Fn(&reqwest::Client, &str, Option<i32>) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>> + Send + Sync + 'static,
-        F2: Fn(&reqwest::Client, &str) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>> + Send + Sync + 'static,
-        F3: Fn(&reqwest::Client, Option<i64>, Option<i64>, MediaType) -> Pin<Box<dyn Future<Output = Vec<MetadataImage>> + Send>> + Send + Sync + 'static,
+        F1: Fn(
+                &reqwest::Client,
+                &str,
+                Option<i32>,
+            ) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>>
+            + Send
+            + Sync
+            + 'static,
+        F2: Fn(
+                &reqwest::Client,
+                &str,
+            ) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>>
+            + Send
+            + Sync
+            + 'static,
+        F3: Fn(
+                &reqwest::Client,
+                Option<i64>,
+                Option<i64>,
+                MediaType,
+            ) -> Pin<Box<dyn Future<Output = Vec<MetadataImage>> + Send>>
+            + Send
+            + Sync
+            + 'static,
     {
-        self.register_metadata_provider(plugin_id, provider_name, search_movie, search_tv, get_images).await;
+        let status = self
+            .get_plugin_status(&plugin_id)
+            .await
+            .unwrap_or(PluginStatus::Disabled);
+        self.register_metadata_provider(
+            plugin_id,
+            provider_name,
+            status,
+            search_movie,
+            search_tv,
+            get_images,
+        )
+        .await;
     }
 }
 
@@ -581,11 +853,44 @@ impl FanartRegistrar for PluginManager {
         search_tv: F2,
         get_images: F3,
     ) where
-        F1: Fn(&reqwest::Client, &str, Option<i32>) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>> + Send + Sync + 'static,
-        F2: Fn(&reqwest::Client, &str) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>> + Send + Sync + 'static,
-        F3: Fn(&reqwest::Client, Option<i64>, Option<i64>, MediaType) -> Pin<Box<dyn Future<Output = Vec<MetadataImage>> + Send>> + Send + Sync + 'static,
+        F1: Fn(
+                &reqwest::Client,
+                &str,
+                Option<i32>,
+            ) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>>
+            + Send
+            + Sync
+            + 'static,
+        F2: Fn(
+                &reqwest::Client,
+                &str,
+            ) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>>
+            + Send
+            + Sync
+            + 'static,
+        F3: Fn(
+                &reqwest::Client,
+                Option<i64>,
+                Option<i64>,
+                MediaType,
+            ) -> Pin<Box<dyn Future<Output = Vec<MetadataImage>> + Send>>
+            + Send
+            + Sync
+            + 'static,
     {
-        self.register_metadata_provider(plugin_id, provider_name, search_movie, search_tv, get_images).await;
+        let status = self
+            .get_plugin_status(&plugin_id)
+            .await
+            .unwrap_or(PluginStatus::Disabled);
+        self.register_metadata_provider(
+            plugin_id,
+            provider_name,
+            status,
+            search_movie,
+            search_tv,
+            get_images,
+        )
+        .await;
     }
 }
 
@@ -596,10 +901,29 @@ impl OpenSubtitlesRegistrar for PluginManager {
         search_subtitles: F1,
         download_subtitle: F2,
     ) where
-        F1: Fn(&reqwest::Client, &MediaItem, &str) -> Pin<Box<dyn Future<Output = Vec<SubtitleResult>> + Send>> + Send + Sync + 'static,
-        F2: Fn(&reqwest::Client, &str, &std::path::Path) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>> + Send + Sync + 'static,
+        F1: Fn(
+                &reqwest::Client,
+                &MediaItem,
+                &str,
+            ) -> Pin<Box<dyn Future<Output = Vec<SubtitleResult>> + Send>>
+            + Send
+            + Sync
+            + 'static,
+        F2: Fn(
+                &reqwest::Client,
+                &str,
+                &std::path::Path,
+            ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
+            + Send
+            + Sync
+            + 'static,
     {
-        self.register_subtitle_provider(plugin_id, search_subtitles, download_subtitle).await;
+        let status = self
+            .get_plugin_status(&plugin_id)
+            .await
+            .unwrap_or(PluginStatus::Disabled);
+        self.register_subtitle_provider(plugin_id, status, search_subtitles, download_subtitle)
+            .await;
     }
 }
 
@@ -612,59 +936,128 @@ impl TvdbRegistrar for PluginManager {
         search_tv: F2,
         get_images: F3,
     ) where
-        F1: Fn(&reqwest::Client, &str, Option<i32>) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>> + Send + Sync + 'static,
-        F2: Fn(&reqwest::Client, &str) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>> + Send + Sync + 'static,
-        F3: Fn(&reqwest::Client, Option<i64>, Option<i64>, MediaType) -> Pin<Box<dyn Future<Output = Vec<MetadataImage>> + Send>> + Send + Sync + 'static,
+        F1: Fn(
+                &reqwest::Client,
+                &str,
+                Option<i32>,
+            ) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>>
+            + Send
+            + Sync
+            + 'static,
+        F2: Fn(
+                &reqwest::Client,
+                &str,
+            ) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>>
+            + Send
+            + Sync
+            + 'static,
+        F3: Fn(
+                &reqwest::Client,
+                Option<i64>,
+                Option<i64>,
+                MediaType,
+            ) -> Pin<Box<dyn Future<Output = Vec<MetadataImage>> + Send>>
+            + Send
+            + Sync
+            + 'static,
     {
-        self.register_metadata_provider(plugin_id, provider_name, search_movie, search_tv, get_images).await;
+        let status = self
+            .get_plugin_status(&plugin_id)
+            .await
+            .unwrap_or(PluginStatus::Disabled);
+        self.register_metadata_provider(
+            plugin_id,
+            provider_name,
+            status,
+            search_movie,
+            search_tv,
+            get_images,
+        )
+        .await;
     }
 }
 
 impl WebhookRegistrar for PluginManager {
-    async fn register_notification_provider<F>(
-        &self,
-        plugin_id: String,
-        send_notification: F,
-    ) where
-        F: Fn(&str, &str, NotificationPriority) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>> + Send + Sync + 'static,
+    async fn register_notification_provider<F>(&self, plugin_id: String, send_notification: F)
+    where
+        F: Fn(
+                &str,
+                &str,
+                NotificationPriority,
+            ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
+            + Send
+            + Sync
+            + 'static,
     {
-        self.register_notification_provider(plugin_id, send_notification).await;
+        let status = self
+            .get_plugin_status(&plugin_id)
+            .await
+            .unwrap_or(PluginStatus::Disabled);
+        self.register_notification_provider(plugin_id, status, send_notification)
+            .await;
     }
 }
 
 impl NtfyRegistrar for PluginManager {
-    async fn register_notification_provider<F>(
-        &self,
-        plugin_id: String,
-        send_notification: F,
-    ) where
-        F: Fn(&str, &str, NotificationPriority) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>> + Send + Sync + 'static,
+    async fn register_notification_provider<F>(&self, plugin_id: String, send_notification: F)
+    where
+        F: Fn(
+                &str,
+                &str,
+                NotificationPriority,
+            ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
+            + Send
+            + Sync
+            + 'static,
     {
-        self.register_notification_provider(plugin_id, send_notification).await;
+        let status = self
+            .get_plugin_status(&plugin_id)
+            .await
+            .unwrap_or(PluginStatus::Disabled);
+        self.register_notification_provider(plugin_id, status, send_notification)
+            .await;
     }
 }
 
 impl MqttRegistrar for PluginManager {
-    async fn register_notification_provider<F>(
-        &self,
-        plugin_id: String,
-        send_notification: F,
-    ) where
-        F: Fn(&str, &str, NotificationPriority) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>> + Send + Sync + 'static,
+    async fn register_notification_provider<F>(&self, plugin_id: String, send_notification: F)
+    where
+        F: Fn(
+                &str,
+                &str,
+                NotificationPriority,
+            ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
+            + Send
+            + Sync
+            + 'static,
     {
-        self.register_notification_provider(plugin_id, send_notification).await;
+        let status = self
+            .get_plugin_status(&plugin_id)
+            .await
+            .unwrap_or(PluginStatus::Disabled);
+        self.register_notification_provider(plugin_id, status, send_notification)
+            .await;
     }
 }
 
 impl PushoverRegistrar for PluginManager {
-    async fn register_notification_provider<F>(
-        &self,
-        plugin_id: String,
-        send_notification: F,
-    ) where
-        F: Fn(&str, &str, NotificationPriority) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>> + Send + Sync + 'static,
+    async fn register_notification_provider<F>(&self, plugin_id: String, send_notification: F)
+    where
+        F: Fn(
+                &str,
+                &str,
+                NotificationPriority,
+            ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
+            + Send
+            + Sync
+            + 'static,
     {
-        self.register_notification_provider(plugin_id, send_notification).await;
+        let status = self
+            .get_plugin_status(&plugin_id)
+            .await
+            .unwrap_or(PluginStatus::Disabled);
+        self.register_notification_provider(plugin_id, status, send_notification)
+            .await;
     }
 }
 
@@ -677,11 +1070,44 @@ impl TraktRegistrar for PluginManager {
         search_tv: F2,
         get_images: F3,
     ) where
-        F1: Fn(&reqwest::Client, &str, Option<i32>) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>> + Send + Sync + 'static,
-        F2: Fn(&reqwest::Client, &str) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>> + Send + Sync + 'static,
-        F3: Fn(&reqwest::Client, Option<i64>, Option<i64>, MediaType) -> Pin<Box<dyn Future<Output = Vec<MetadataImage>> + Send>> + Send + Sync + 'static,
+        F1: Fn(
+                &reqwest::Client,
+                &str,
+                Option<i32>,
+            ) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>>
+            + Send
+            + Sync
+            + 'static,
+        F2: Fn(
+                &reqwest::Client,
+                &str,
+            ) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>>
+            + Send
+            + Sync
+            + 'static,
+        F3: Fn(
+                &reqwest::Client,
+                Option<i64>,
+                Option<i64>,
+                MediaType,
+            ) -> Pin<Box<dyn Future<Output = Vec<MetadataImage>> + Send>>
+            + Send
+            + Sync
+            + 'static,
     {
-        self.register_metadata_provider(plugin_id, provider_name, search_movie, search_tv, get_images).await;
+        let status = self
+            .get_plugin_status(&plugin_id)
+            .await
+            .unwrap_or(PluginStatus::Disabled);
+        self.register_metadata_provider(
+            plugin_id,
+            provider_name,
+            status,
+            search_movie,
+            search_tv,
+            get_images,
+        )
+        .await;
     }
 }
 
@@ -692,10 +1118,29 @@ impl PodnapisiRegistrar for PluginManager {
         search_subtitles: F1,
         download_subtitle: F2,
     ) where
-        F1: Fn(&reqwest::Client, &MediaItem, &str) -> Pin<Box<dyn Future<Output = Vec<SubtitleResult>> + Send>> + Send + Sync + 'static,
-        F2: Fn(&reqwest::Client, &str, &std::path::Path) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>> + Send + Sync + 'static,
+        F1: Fn(
+                &reqwest::Client,
+                &MediaItem,
+                &str,
+            ) -> Pin<Box<dyn Future<Output = Vec<SubtitleResult>> + Send>>
+            + Send
+            + Sync
+            + 'static,
+        F2: Fn(
+                &reqwest::Client,
+                &str,
+                &std::path::Path,
+            ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
+            + Send
+            + Sync
+            + 'static,
     {
-        self.register_subtitle_provider(plugin_id, search_subtitles, download_subtitle).await;
+        let status = self
+            .get_plugin_status(&plugin_id)
+            .await
+            .unwrap_or(PluginStatus::Disabled);
+        self.register_subtitle_provider(plugin_id, status, search_subtitles, download_subtitle)
+            .await;
     }
 }
 
@@ -708,10 +1153,43 @@ impl LocalNfoRegistrar for PluginManager {
         search_tv: F2,
         get_images: F3,
     ) where
-        F1: Fn(&reqwest::Client, &str, Option<i32>) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>> + Send + Sync + 'static,
-        F2: Fn(&reqwest::Client, &str) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>> + Send + Sync + 'static,
-        F3: Fn(&reqwest::Client, Option<i64>, Option<i64>, MediaType) -> Pin<Box<dyn Future<Output = Vec<MetadataImage>> + Send>> + Send + Sync + 'static,
+        F1: Fn(
+                &reqwest::Client,
+                &str,
+                Option<i32>,
+            ) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>>
+            + Send
+            + Sync
+            + 'static,
+        F2: Fn(
+                &reqwest::Client,
+                &str,
+            ) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>>
+            + Send
+            + Sync
+            + 'static,
+        F3: Fn(
+                &reqwest::Client,
+                Option<i64>,
+                Option<i64>,
+                MediaType,
+            ) -> Pin<Box<dyn Future<Output = Vec<MetadataImage>> + Send>>
+            + Send
+            + Sync
+            + 'static,
     {
-        self.register_metadata_provider(plugin_id, provider_name, search_movie, search_tv, get_images).await;
+        let status = self
+            .get_plugin_status(&plugin_id)
+            .await
+            .unwrap_or(PluginStatus::Disabled);
+        self.register_metadata_provider(
+            plugin_id,
+            provider_name,
+            status,
+            search_movie,
+            search_tv,
+            get_images,
+        )
+        .await;
     }
 }

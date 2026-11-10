@@ -621,8 +621,6 @@ dependencies = [
  "compression-core",
  "flate2",
  "memchr",
- "zstd",
- "zstd-safe",
 ]
 
 [[package]]
@@ -642,6 +640,16 @@ name = "const-oid"
 version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
+
+[[package]]
+name = "core-foundation"
+version = "0.9.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "91e195e091a93c46f7102ec7818a2aa394e1e1771c3ab4825963fa03e45afb8f"
+dependencies = [
+ "core-foundation-sys",
+ "libc",
+]
 
 [[package]]
 name = "core-foundation-sys"
@@ -1198,6 +1206,17 @@ dependencies = [
 
 [[package]]
 name = "flume"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da0e4dd2a88388a1f4ccc7c9ce104604dab68d9f408dc34cd45823d5a9069095"
+dependencies = [
+ "futures-core",
+ "futures-sink",
+ "spin",
+]
+
+[[package]]
+name = "flume"
 version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e139bc46ca777eb5efaf62df0ab8cc5fd400866427e56c68b22e414e53bd3be"
@@ -1587,9 +1606,9 @@ dependencies = [
  "http",
  "hyper",
  "hyper-util",
- "rustls",
+ "rustls 0.23.46",
  "tokio",
- "tokio-rustls",
+ "tokio-rustls 0.26.6",
  "tower-service",
  "webpki-roots",
 ]
@@ -2357,6 +2376,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "openssl-probe"
+version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d05e27ee213611ffe7d6348b942e8f942b37114c00cc03cec254295a4a17852e"
+
+[[package]]
 name = "ordered-float"
 version = "2.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2510,6 +2535,150 @@ name = "pkg-config"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
+
+[[package]]
+name = "plugin-fanart"
+version = "0.16.0"
+dependencies = [
+ "reqwest",
+ "rustyfin-model",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
+name = "plugin-local-nfo"
+version = "0.16.0"
+dependencies = [
+ "quick-xml",
+ "reqwest",
+ "rustyfin-model",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "plugin-mqtt"
+version = "0.16.0"
+dependencies = [
+ "chrono",
+ "rumqttc",
+ "rustyfin-model",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "plugin-ntfy"
+version = "0.16.0"
+dependencies = [
+ "reqwest",
+ "rustyfin-model",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
+name = "plugin-omdb"
+version = "0.16.0"
+dependencies = [
+ "reqwest",
+ "rustyfin-model",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
+name = "plugin-opensubtitles"
+version = "0.16.0"
+dependencies = [
+ "reqwest",
+ "rustyfin-model",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "plugin-podnapisi"
+version = "0.16.0"
+dependencies = [
+ "reqwest",
+ "rustyfin-model",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "plugin-pushover"
+version = "0.16.0"
+dependencies = [
+ "reqwest",
+ "rustyfin-model",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
+name = "plugin-tmdb"
+version = "0.16.0"
+dependencies = [
+ "moka",
+ "reqwest",
+ "rustyfin-model",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
+name = "plugin-trakt"
+version = "0.16.0"
+dependencies = [
+ "chrono",
+ "moka",
+ "reqwest",
+ "rustyfin-model",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
+name = "plugin-tvdb"
+version = "0.16.0"
+dependencies = [
+ "moka",
+ "reqwest",
+ "rustyfin-model",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
+name = "plugin-webhook"
+version = "0.16.0"
+dependencies = [
+ "chrono",
+ "reqwest",
+ "rustyfin-model",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "png"
@@ -2684,7 +2853,7 @@ dependencies = [
  "quinn-proto",
  "quinn-udp",
  "rustc-hash",
- "rustls",
+ "rustls 0.23.46",
  "socket2",
  "thiserror 2.0.21",
  "tokio",
@@ -2705,7 +2874,7 @@ dependencies = [
  "rand_pcg",
  "ring",
  "rustc-hash",
- "rustls",
+ "rustls 0.23.46",
  "rustls-pki-types",
  "slab",
  "thiserror 2.0.21",
@@ -2987,14 +3156,14 @@ dependencies = [
  "percent-encoding",
  "pin-project-lite",
  "quinn",
- "rustls",
+ "rustls 0.23.46",
  "rustls-pki-types",
  "serde",
  "serde_json",
  "serde_urlencoded",
  "sync_wrapper",
  "tokio",
- "tokio-rustls",
+ "tokio-rustls 0.26.6",
  "tower",
  "tower-http 0.6.11",
  "tower-service",
@@ -3056,6 +3225,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "rumqttc"
+version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1568e15fab2d546f940ed3a21f48bbbd1c494c90c99c4481339364a497f94a9"
+dependencies = [
+ "bytes",
+ "flume 0.11.1",
+ "futures-util",
+ "log",
+ "rustls-native-certs",
+ "rustls-pemfile",
+ "rustls-webpki 0.102.8",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-rustls 0.25.0",
+]
+
+[[package]]
 name = "rustc-hash"
 version = "2.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3072,6 +3259,20 @@ dependencies = [
 
 [[package]]
 name = "rustls"
+version = "0.22.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf4ef73721ac7bcd79b2b315da7779d8fc09718c6b3d2d1b2d94850eb8c18432"
+dependencies = [
+ "log",
+ "ring",
+ "rustls-pki-types",
+ "rustls-webpki 0.102.8",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
+name = "rustls"
 version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
@@ -3081,9 +3282,22 @@ dependencies = [
  "once_cell",
  "ring",
  "rustls-pki-types",
- "rustls-webpki",
+ "rustls-webpki 0.103.16",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "rustls-native-certs"
+version = "0.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e5bfb394eeed242e909609f56089eecfe5fda225042e8b171791b9c95f5931e5"
+dependencies = [
+ "openssl-probe",
+ "rustls-pemfile",
+ "rustls-pki-types",
+ "schannel",
+ "security-framework",
 ]
 
 [[package]]
@@ -3107,6 +3321,17 @@ dependencies = [
 
 [[package]]
 name = "rustls-webpki"
+version = "0.102.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "64ca1bc8749bd4cf37b5ce386cc146580777b4e8572c7b97baf22c83f444bee9"
+dependencies = [
+ "ring",
+ "rustls-pki-types",
+ "untrusted",
+]
+
+[[package]]
+name = "rustls-webpki"
 version = "0.103.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281"
@@ -3125,7 +3350,7 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "rustyfin-api"
-version = "0.14.0"
+version = "0.16.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -3140,6 +3365,7 @@ dependencies = [
  "moka",
  "openidconnect",
  "p256",
+ "plugin-tmdb",
  "reqwest",
  "rustyfin-auth",
  "rustyfin-core",
@@ -3164,7 +3390,7 @@ dependencies = [
 
 [[package]]
 name = "rustyfin-auth"
-version = "0.14.0"
+version = "0.16.0"
 dependencies = [
  "argon2",
  "chrono",
@@ -3183,7 +3409,7 @@ dependencies = [
 
 [[package]]
 name = "rustyfin-cli"
-version = "0.14.0"
+version = "0.16.0"
 dependencies = [
  "clap",
  "reqwest",
@@ -3194,7 +3420,7 @@ dependencies = [
 
 [[package]]
 name = "rustyfin-core"
-version = "0.14.0"
+version = "0.16.0"
 dependencies = [
  "axum",
  "blurhash",
@@ -3206,6 +3432,18 @@ dependencies = [
  "libloading",
  "libsqlite3-sys",
  "moka",
+ "plugin-fanart",
+ "plugin-local-nfo",
+ "plugin-mqtt",
+ "plugin-ntfy",
+ "plugin-omdb",
+ "plugin-opensubtitles",
+ "plugin-podnapisi",
+ "plugin-pushover",
+ "plugin-tmdb",
+ "plugin-trakt",
+ "plugin-tvdb",
+ "plugin-webhook",
  "quick-xml",
  "reqwest",
  "rustyfin-auth",
@@ -3225,7 +3463,7 @@ dependencies = [
 
 [[package]]
 name = "rustyfin-db"
-version = "0.14.0"
+version = "0.16.0"
 dependencies = [
  "chrono",
  "fastrand",
@@ -3244,9 +3482,10 @@ dependencies = [
 
 [[package]]
 name = "rustyfin-model"
-version = "0.14.0"
+version = "0.16.0"
 dependencies = [
  "chrono",
+ "reqwest",
  "serde",
  "serde_json",
  "unicase",
@@ -3256,12 +3495,24 @@ dependencies = [
 
 [[package]]
 name = "rustyfin-server"
-version = "0.14.0"
+version = "0.16.0"
 dependencies = [
  "axum",
  "hyper-util",
+ "plugin-fanart",
+ "plugin-local-nfo",
+ "plugin-mqtt",
+ "plugin-ntfy",
+ "plugin-omdb",
+ "plugin-opensubtitles",
+ "plugin-podnapisi",
+ "plugin-pushover",
+ "plugin-tmdb",
+ "plugin-trakt",
+ "plugin-tvdb",
+ "plugin-webhook",
  "reqwest",
- "rustls",
+ "rustls 0.23.46",
  "rustls-pemfile",
  "rustyfin-api",
  "rustyfin-auth",
@@ -3270,7 +3521,7 @@ dependencies = [
  "rustyfin-model",
  "serde_json",
  "tokio",
- "tokio-rustls",
+ "tokio-rustls 0.26.6",
  "tower",
  "tower-http 0.7.1",
  "tracing",
@@ -3284,6 +3535,15 @@ name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
+
+[[package]]
+name = "schannel"
+version = "0.1.30"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9cb23c424d8ee841bb4d813677ca237e2a610067d594fec130f87d6093495ab5"
+dependencies = [
+ "windows-sys 0.61.2",
+]
 
 [[package]]
 name = "schemars"
@@ -3327,6 +3587,29 @@ dependencies = [
  "hybrid-array",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "security-framework"
+version = "2.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "897b2245f0b511c87893af39b033e5ca9cce68824c4d7e7630b5a1d339658d02"
+dependencies = [
+ "bitflags 2.13.2",
+ "core-foundation",
+ "core-foundation-sys",
+ "libc",
+ "security-framework-sys",
+]
+
+[[package]]
+name = "security-framework-sys"
+version = "2.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ce2691df843ecc5d231c0b14ece2acc3efb62c0a398c7e1d875f3983ce020e3"
+dependencies = [
+ "core-foundation-sys",
+ "libc",
 ]
 
 [[package]]
@@ -3782,7 +4065,7 @@ checksum = "488e99c397a62007e4229aec669a179816339afc6d2620ca6fa420dbee2e982c"
 dependencies = [
  "atoi",
  "chrono",
- "flume",
+ "flume 0.12.0",
  "form_urlencoded",
  "futures-channel",
  "futures-core",
@@ -4016,11 +4299,22 @@ dependencies = [
 
 [[package]]
 name = "tokio-rustls"
+version = "0.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "775e0c0f0adb3a2f22a00c4745d728b479985fc15ee7ca6a2608388c5569860f"
+dependencies = [
+ "rustls 0.22.4",
+ "rustls-pki-types",
+ "tokio",
+]
+
+[[package]]
+name = "tokio-rustls"
 version = "0.26.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c9cc2678c2cdd569ef8215e2afd7954ada2ae20b4fdd2c5fe6139a3b02d105db"
 dependencies = [
- "rustls",
+ "rustls 0.23.46",
  "tokio",
 ]
 
@@ -4757,34 +5051,6 @@ name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
-
-[[package]]
-name = "zstd"
-version = "0.14.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "db3ae9bf90af6e40197bef767eeefc46ad6397420fe873830bd85e5fbbfb3c70"
-dependencies = [
- "zstd-safe",
-]
-
-[[package]]
-name = "zstd-safe"
-version = "8.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ded520f16b29e1a9b771c722221b2b0a0398c2316d9bb3c42b458a5414d7434b"
-dependencies = [
- "zstd-sys",
-]
-
-[[package]]
-name = "zstd-sys"
-version = "2.1.2+zstd.1.5.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "481ada9c543b2323cbb7bbdbb5249177fbf0188ed959ed2c15e4b22421c84ed3"
-dependencies = [
- "cc",
- "pkg-config",
-]
 
 [[package]]
 name = "zune-core"

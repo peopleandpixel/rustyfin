@@ -112,13 +112,66 @@ async fn video_file(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Item {id} not found")))?;
     let Some(requested) = requested_source_id(params) else {
+        validate_path_against_library(&state.db_ro, &item.library_id, &item.path).await?;
         return Ok(item.path);
     };
     let sources = rustyfin_db::repo_media_source::get_media_sources(&state.db_ro, &id).await?;
     match select_version(id, &sources, Some(requested))? {
-        Version::Primary => Ok(item.path),
-        Version::Source(index) => Ok(sources[index].path.clone()),
+        Version::Primary => {
+            validate_path_against_library(&state.db_ro, &item.library_id, &item.path).await?;
+            Ok(item.path)
+        }
+        Version::Source(index) => {
+            validate_path_against_library(&state.db_ro, &item.library_id, &sources[index].path)
+                .await?;
+            Ok(sources[index].path.clone())
+        }
     }
+}
+
+/// Validates that `file_path` is inside one of the library's configured paths.
+/// This prevents path traversal if the database is compromised.
+async fn validate_path_against_library(
+    pool: &sqlx::SqlitePool,
+    library_id: &uuid::Uuid,
+    file_path: &str,
+) -> Result<(), ApiError> {
+    let canonical = std::path::Path::new(file_path)
+        .canonicalize()
+        .ok()
+        .or_else(|| Some(std::path::Path::new(file_path).to_path_buf()));
+
+    let Some(canonical) = canonical else {
+        tracing::debug!("could not resolve path '{}' for validation", file_path);
+        return Ok(());
+    };
+
+    if let Ok(Some(library)) = rustyfin_db::repo_library::get_library_by_id(pool, *library_id).await
+    {
+        for lib_path in &library.paths {
+            if let Ok(canonical_lib) = std::path::Path::new(lib_path).canonicalize()
+                && canonical.starts_with(&canonical_lib)
+            {
+                return Ok(());
+            }
+        }
+        // Path not under any library path — log and reject
+        tracing::warn!(
+            "streaming path '{}' is outside library paths for library {}",
+            file_path,
+            library_id
+        );
+        return Err(ApiError::NotFound(
+            "File is outside configured library paths".to_string(),
+        ));
+    }
+    // If we can't find the library, we still allow the stream (backward compatibility)
+    // but log a warning
+    tracing::debug!(
+        "could not find library {} for path validation, allowing stream",
+        library_id
+    );
+    Ok(())
 }
 
 /// `GET /Videos/{id}/stream` and `stream.{container}`: the file of the requested version.
@@ -158,6 +211,7 @@ async fn head_stream(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Item {id} not found")))?;
 
+    validate_path_against_library(&state.db_ro, &item.library_id, &item.path).await?;
     head_file(&item.path).await
 }
 
@@ -191,6 +245,7 @@ async fn stream_file(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Item {id} not found")))?;
 
+    validate_path_against_library(&state.db_ro, &item.library_id, &item.path).await?;
     serve_file(item.path, &headers).await
 }
 

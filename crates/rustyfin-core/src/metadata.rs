@@ -6,17 +6,14 @@ use uuid::Uuid;
 
 use crate::local_images;
 use crate::nfo_parser;
-use crate::provider_tmdb::PersonPhoto;
-use crate::tmdb_client::TmdbApi;
+use crate::plugin_manager::PluginManager;
 
 /// Refresh metadata for a single item: local images, NFO, then optionally remote providers
 pub async fn refresh_item_metadata(
     pool: &SqlitePool,
     client: &reqwest::Client,
     item: &MediaItem,
-    tmdb: Option<&TmdbApi>,
-    omdb_api_key: Option<&str>,
-    fanart_api_key: Option<&str>,
+    plugin_manager: &PluginManager,
 ) -> Result<(), String> {
     let media_path = Path::new(&item.path);
     // Each source fills this copy, so a later source keeps what an earlier one filled
@@ -57,76 +54,52 @@ pub async fn refresh_item_metadata(
         store_images_batch(pool, item.id, &meta.image_urls, "nfo").await?;
     }
 
-    // 3. TMDb provider - use cleaned filename for better search results
-    if let Some(tmdb) = tmdb {
-        // Clean the filename for better TMDB search matching
-        let search_name = clean_filename_for_search(&item.path);
+    // 3. Use registered metadata providers (TMDb, OMDb, Fanart, etc.)
+    // Only active/enabled providers are returned; if none are enabled, this is a fast scan
+    // that relies solely on local images and NFO files.
+    let providers = plugin_manager.metadata_providers().await;
+    if providers.is_empty() {
+        tracing::debug!(
+            "no active metadata providers for '{}' (fast scan mode)",
+            item.name
+        );
+        return Ok(());
+    }
+    let search_name = clean_filename_for_search(&item.path);
 
+    if !search_name.is_empty() && search_name != item.name {
+        tracing::debug!(
+            "searching metadata for '{}' (cleaned from '{}')",
+            search_name,
+            item.name
+        );
+    }
+
+    for provider in &providers {
+        // Search for metadata
         let meta = match item.media_type {
             MediaType::Movie => {
-                crate::provider_tmdb::search_movie(tmdb, &search_name, item.production_year).await
+                (provider.search_movie)(client, &search_name, item.production_year).await
             }
-            MediaType::Series => crate::provider_tmdb::search_tv(tmdb, &search_name).await,
+            MediaType::Series => (provider.search_tv)(client, &search_name).await,
             _ => None,
         };
 
-        if !search_name.is_empty() && search_name != item.name {
-            tracing::debug!(
-                "searching TMDB for '{}' (cleaned from '{}')",
-                search_name,
-                item.name
-            );
-        }
-
         if let Some(meta) = meta {
             apply_metadata_to_item(pool, &mut working, &meta).await?;
-            store_images_batch(pool, item.id, &meta.image_urls, "tmdb").await?;
-
-            // Fetch and store cast/crew photos from TMDb
-            if let Some(tmdb_id) = meta.tmdb_id {
-                let people = match item.media_type {
-                    MediaType::Movie => crate::provider_tmdb::get_movie_people(tmdb, tmdb_id).await,
-                    MediaType::Series | MediaType::Episode => {
-                        let season = item.parent_index_number.unwrap_or(1);
-                        crate::provider_tmdb::get_tv_people(tmdb, tmdb_id, season).await
-                    }
-                    _ => Vec::new(),
-                };
-                store_people(pool, item.id, &people).await?;
-            }
+            store_images_batch(pool, item.id, &meta.image_urls, &provider.provider_name).await?;
         }
-    }
 
-    // 4. OMDb provider
-    if let Some(api_key) = omdb_api_key
-        && matches!(item.media_type, MediaType::Movie | MediaType::Series)
-        && let Some(meta) =
-            crate::provider_omdb::search(api_key, &item.name, item.production_year).await
-    {
-        apply_metadata_to_item(pool, &mut working, &meta).await?;
-        store_images_batch(pool, item.id, &meta.image_urls, "omdb").await?;
-    }
-
-    // 5. Fanart.tv provider - enriches images from TMDb/TheTVDB
-    if let Some(api_key) = fanart_api_key {
-        match item.media_type {
-            MediaType::Movie => {
-                if let Some(tmdb_id) = item.tmdb_id {
-                    let images = crate::provider_fanart::get_movie_images(api_key, tmdb_id).await;
-                    if !images.is_empty() {
-                        store_images_batch(pool, item.id, &images, "fanart").await?;
-                    }
-                }
-            }
-            MediaType::Series => {
-                if let Some(tvdb_id) = item.tvdb_id {
-                    let images = crate::provider_fanart::get_tv_show_images(api_key, tvdb_id).await;
-                    if !images.is_empty() {
-                        store_images_batch(pool, item.id, &images, "fanart").await?;
-                    }
-                }
-            }
-            _ => {}
+        // Fetch additional images from this provider
+        let images = (provider.get_images)(
+            client,
+            working.tmdb_id,
+            working.tvdb_id,
+            item.media_type,
+        )
+        .await;
+        if !images.is_empty() {
+            store_images_batch(pool, item.id, &images, &provider.provider_name).await?;
         }
     }
 
@@ -488,44 +461,6 @@ async fn store_images_batch(
             item_id
         );
     }
-    Ok(())
-}
-
-/// Store people (cast/crew) from TMDb into the people and item_people tables
-async fn store_people(
-    pool: &SqlitePool,
-    item_id: Uuid,
-    people: &[PersonPhoto],
-) -> Result<(), String> {
-    let item_id_str = item_id.to_string();
-    for person in people {
-        // Upsert person into people table with photo URL as image_hash
-        sqlx::query(
-            "INSERT INTO people (id, name, type, image_hash)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(id) DO UPDATE SET image_hash = COALESCE(excluded.image_hash, people.image_hash)",
-        )
-        .bind(&person.person_id)
-        .bind(&person.name)
-        .bind("Actor")
-        .bind(&person.photo_url)
-        .execute(pool)
-        .await
-        .map_err(|e| e.to_string())?;
-
-        // Link person to item
-        sqlx::query(
-            "INSERT OR IGNORE INTO item_people (item_id, person_id, type)
-             VALUES (?1, ?2, ?3)",
-        )
-        .bind(&item_id_str)
-        .bind(&person.person_id)
-        .bind("Actor")
-        .execute(pool)
-        .await
-        .map_err(|e| e.to_string())?;
-    }
-    tracing::debug!("stored {} people for item {}", people.len(), item_id);
     Ok(())
 }
 

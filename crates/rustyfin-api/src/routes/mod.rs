@@ -43,7 +43,9 @@ use axum::Router;
 use axum::middleware as axum_mw;
 use std::sync::Arc;
 
-use crate::middleware::{rate_limit, require_admin, require_auth, require_setup_or_admin};
+use crate::middleware::{
+    rate_limit, rate_limit_resource, require_admin, require_auth, require_setup_or_admin,
+};
 use crate::state::AppState;
 
 pub fn build_router(state: AppState) -> Router {
@@ -109,8 +111,14 @@ pub fn build_router(state: AppState) -> Router {
         .merge(items::routes())
         .merge(images::routes())
         .merge(quick_connect::routes())
-        .merge(streaming::routes())
-        .merge(transcode::routes())
+        .merge(streaming::routes().route_layer(axum_mw::from_fn_with_state(
+            state.clone(),
+            rate_limit_resource,
+        )))
+        .merge(transcode::routes().route_layer(axum_mw::from_fn_with_state(
+            state.clone(),
+            rate_limit_resource,
+        )))
         .merge(playback::routes())
         .merge(subtitle::routes())
         .merge(session::routes())

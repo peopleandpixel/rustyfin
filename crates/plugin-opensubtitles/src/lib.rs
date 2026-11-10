@@ -242,6 +242,7 @@ pub async fn download_subtitle(
 // ── Registrar trait for PluginManager integration ──
 
 /// Trait for registering a subtitle provider with a PluginManager.
+#[allow(async_fn_in_trait)]
 pub trait SubtitleProviderRegistrar {
     async fn register_subtitle_provider<F1, F2>(
         &self,
@@ -249,15 +250,27 @@ pub trait SubtitleProviderRegistrar {
         search_subtitles: F1,
         download_subtitle: F2,
     ) where
-        F1: Fn(&reqwest::Client, &MediaItem, &str) -> Pin<Box<dyn Future<Output = Vec<SubtitleResult>> + Send>> + Send + Sync + 'static,
-        F2: Fn(&reqwest::Client, &str, &Path) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>> + Send + Sync + 'static;
+        F1: Fn(
+                &reqwest::Client,
+                &MediaItem,
+                &str,
+            ) -> Pin<Box<dyn Future<Output = Vec<SubtitleResult>> + Send>>
+            + Send
+            + Sync
+            + 'static,
+        F2: Fn(
+                &reqwest::Client,
+                &str,
+                &Path,
+            ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
+            + Send
+            + Sync
+            + 'static;
 }
 
 /// Register the OpenSubtitles plugin with a PluginManager.
-pub async fn register_opensubtitles_provider<P>(
-    plugin: &OpenSubtitlesPlugin,
-    registrar: &P,
-) where
+pub async fn register_opensubtitles_provider<P>(plugin: &OpenSubtitlesPlugin, registrar: &P)
+where
     P: SubtitleProviderRegistrar,
 {
     let user_agent = plugin.user_agent();
@@ -265,32 +278,34 @@ pub async fn register_opensubtitles_provider<P>(
     let user_agent2 = user_agent.clone();
 
     let plugin_id = plugin.id().to_string();
-    registrar.register_subtitle_provider(
-        plugin_id,
-        move |client: &reqwest::Client, item: &MediaItem, lang: &str| -> Pin<
-            Box<dyn Future<Output = Vec<SubtitleResult>> + Send>,
-        > {
-            let user_agent = user_agent1.clone();
-            let name = item.name.clone();
-            let year = item.production_year;
-            let lang = lang.to_string();
-            let client = client.clone();
-            Box::pin(async move {
-                search_subtitles(&client, &user_agent, &name, &lang, year).await
-            })
-        },
-        move |client: &reqwest::Client, id: &str, path: &Path| -> Pin<
-            Box<dyn Future<Output = Result<(), String>> + Send>,
-        > {
-            let user_agent = user_agent2.clone();
-            let id = id.to_string();
-            let path = path.to_path_buf();
-            let client = client.clone();
-            Box::pin(async move {
-                download_subtitle(&client, &user_agent, &id, &path).await
-            })
-        },
-    ).await;
+    registrar
+        .register_subtitle_provider(
+            plugin_id,
+            move |client: &reqwest::Client,
+                  item: &MediaItem,
+                  lang: &str|
+                  -> Pin<Box<dyn Future<Output = Vec<SubtitleResult>> + Send>> {
+                let user_agent = user_agent1.clone();
+                let name = item.name.clone();
+                let year = item.production_year;
+                let lang = lang.to_string();
+                let client = client.clone();
+                Box::pin(
+                    async move { search_subtitles(&client, &user_agent, &name, &lang, year).await },
+                )
+            },
+            move |client: &reqwest::Client,
+                  id: &str,
+                  path: &Path|
+                  -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>> {
+                let user_agent = user_agent2.clone();
+                let id = id.to_string();
+                let path = path.to_path_buf();
+                let client = client.clone();
+                Box::pin(async move { download_subtitle(&client, &user_agent, &id, &path).await })
+            },
+        )
+        .await;
 }
 
 #[cfg(test)]

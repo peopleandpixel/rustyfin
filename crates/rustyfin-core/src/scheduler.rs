@@ -11,6 +11,7 @@ use tokio::sync::watch;
 
 use crate::library_monitor::ChangeQueue;
 use crate::library_watch::LibraryWatcher;
+use crate::plugin_manager::PluginManager;
 use crate::scan_progress::ScanRegistry;
 
 /// Known task IDs
@@ -46,10 +47,32 @@ pub struct TaskScheduler {
     changes: ChangeQueue,
     watcher: LibraryWatcher,
     on_scan: Arc<std::sync::RwLock<Option<OnScan>>>,
+    plugin_manager: crate::plugin_manager::PluginManager,
+    http_client: reqwest::Client,
 }
 
 impl TaskScheduler {
     pub fn new(db: SqlitePool, data_dir: Arc<PathBuf>) -> Self {
+        Self::with_http_client(
+            db,
+            data_dir,
+            reqwest::Client::builder()
+                .user_agent(crate::tmdb_client::USER_AGENT)
+                .pool_max_idle_per_host(10)
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
+        )
+    }
+
+    /// Create a scheduler with a shared HTTP client (connection pool reuse).
+    pub fn with_http_client(
+        db: SqlitePool,
+        data_dir: Arc<PathBuf>,
+        http_client: reqwest::Client,
+    ) -> Self {
+        let plugin_manager = PluginManager::new(&data_dir);
         let mut tasks = HashMap::new();
 
         // Library Scan
@@ -177,6 +200,8 @@ impl TaskScheduler {
             changes,
             watcher,
             on_scan: Arc::new(std::sync::RwLock::new(None)),
+            plugin_manager,
+            http_client,
         }
     }
 
@@ -332,7 +357,7 @@ impl TaskScheduler {
                     .iter()
                     .map(|lib| self.scans.queue(lib.id))
                     .collect();
-                let client = reqwest::Client::new();
+                let client = &self.http_client;
                 let mut errors = Vec::new();
                 for (lib, ticket) in libraries.iter().zip(tickets) {
                     // Only the caller that claimed the library's run scans it.
@@ -340,7 +365,11 @@ impl TaskScheduler {
                         continue;
                     }
                     if let Err(e) = crate::scanner::scan_library_with_metadata(
-                        &self.db, lib, &client, None, None, None, &ticket,
+                        &self.db,
+                        lib,
+                        client,
+                        &self.plugin_manager,
+                        &ticket,
                     )
                     .await
                     {
@@ -434,18 +463,15 @@ impl TaskScheduler {
         let result = match rustyfin_db::repo_library::get_all_libraries(&self.db).await {
             Ok(libraries) => {
                 let mut errors = Vec::new();
+                let http = &self.http_client;
+
+                // Collect all items from all libraries first
+                let mut all_items = Vec::new();
                 for lib in &libraries {
                     match rustyfin_db::repo_media::get_items_by_library(&self.db, lib.id).await {
                         Ok(items) => {
-                            for item in &items {
-                                let client = reqwest::Client::new();
-                                if let Err(e) = crate::metadata::refresh_item_metadata(
-                                    &self.db, &client, item, None, None, None,
-                                )
-                                .await
-                                {
-                                    errors.push(format!("{}: {}", item.name, e));
-                                }
+                            for item in items {
+                                all_items.push((lib.name.clone(), item));
                             }
                         }
                         Err(e) => {
@@ -453,6 +479,39 @@ impl TaskScheduler {
                         }
                     }
                 }
+
+                // Process items concurrently with a semaphore (10 concurrent)
+                let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(10));
+                let mut handles = Vec::new();
+                for (lib_name, item) in all_items {
+                    let sem = semaphore.clone();
+                    let db = self.db.clone();
+                    let http_client = http.clone();
+                    let item_name = item.name.clone();
+                    let pm = self.plugin_manager.clone();
+                    let handle = tokio::spawn(async move {
+                        let _permit = sem.acquire().await;
+                        if let Err(e) =
+                            crate::metadata::refresh_item_metadata(&db, &http_client, &item, &pm)
+                                .await
+                        {
+                            Some(format!("{}: {}", item_name, e))
+                        } else {
+                            None
+                        }
+                    });
+                    handles.push((lib_name, handle));
+                }
+
+                // Await all concurrent refresh tasks
+                for (lib_name, handle) in handles {
+                    match handle.await {
+                        Ok(Some(e)) => errors.push(e),
+                        Ok(None) => {}
+                        Err(e) => errors.push(format!("{}: task failed: {}", lib_name, e)),
+                    }
+                }
+
                 let end = Utc::now();
                 if errors.is_empty() {
                     TaskResult {
