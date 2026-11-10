@@ -10508,7 +10508,8 @@ fn b21_dashboard_follows_a_demotion() {
         app_js.contains("\nAPI.onAdminLost = followAdminLoss;\n"),
         "app.js hands followAdminLoss to the API"
     );
-    let render = function("async function renderAdmin() {");
+    // Any parameters: B119's `renderAdmin(tab)` opens a tab from the hash.
+    let render = function("async function renderAdmin(");
     let recheck = render
         .find("await API.recheckAdmin()")
         .expect("renderAdmin re-reads the user");
@@ -26636,6 +26637,610 @@ fn b20_is_code(code: &str) -> bool {
         && groups
             .iter()
             .all(|group| group.len() == 4 && group.chars().all(crockford))
+}
+
+// B119: wizard import. The setup wizard reads a Jellyfin install before the owner exists
+// (`/Startup/JellyfinImport/Preview`), and after signing in queues one background job
+// (`/JellyfinImport/Queue`) that creates the libraries, scans them, then imports. The job survives a
+// restart through `<data dir>/jellyfin-import-queue.json`, or reports that it didn't run.
+
+/// A server without users or libraries, the B20 Jellyfin install written at `<jf>/config`, and
+/// media folders `movies` (Alpha) and `tv` (Show S01E01) that Jellyfin's `/data/movies` and
+/// `/data/tvshows` map to.
+struct B119World {
+    state: AppState,
+    app: axum::Router,
+    source: jf::JfSource,
+    config: std::path::PathBuf,
+    movies: String,
+    tv: String,
+}
+
+async fn b119_world() -> B119World {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let source = b20_source();
+    let jf_root = std::env::temp_dir().join(format!(
+        "rustyfin_b119_jf_{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    remove_when_test_ends(&jf_root);
+    let config = jf_root.join("config");
+    source.write(&config, jf::Layout::New).await;
+    let movies = media_folder(&state, "movies");
+    let tv = media_folder(&state, "tv");
+    let alpha = std::path::Path::new(&movies).join("Alpha (2001)");
+    std::fs::create_dir_all(&alpha).unwrap();
+    std::fs::write(alpha.join("Alpha.mkv"), b"").unwrap();
+    let season = std::path::Path::new(&tv).join("Show").join("Season 01");
+    std::fs::create_dir_all(&season).unwrap();
+    std::fs::write(season.join("Show S01E01.mkv"), b"").unwrap();
+    B119World {
+        state,
+        app,
+        source,
+        config,
+        movies,
+        tv,
+    }
+}
+
+fn b119_queue_file(state: &AppState) -> std::path::PathBuf {
+    state.data_dir.join("jellyfin-import-queue.json")
+}
+
+async fn b119_library_count(state: &AppState) -> usize {
+    rustyfin_db::repo_library::get_all_libraries(&state.db)
+        .await
+        .unwrap()
+        .len()
+}
+
+/// The Queue body for the world: Movies and Shows mapped to the media folders, Alice into the
+/// caller's account, bob imported.
+fn b119_queue_body(w: &B119World) -> serde_json::Value {
+    serde_json::json!({
+        "SourcePath": w.config.to_str().unwrap(),
+        "IntoMyAccount": w.source.user("Alice").id,
+        "UserIds": [w.source.user("bob").id],
+        "Libraries": [
+            {"Name": "Movies", "ContentType": "Movies",
+             "Paths": [{"From": "/data/movies", "To": w.movies}]},
+            {"Name": "Shows", "ContentType": "TvShows",
+             "Paths": [{"From": "/data/tvshows", "To": w.tv}]},
+        ],
+    })
+}
+
+async fn b119_status(app: &axum::Router, token: &str) -> serde_json::Value {
+    let (status, answer) = send_authed(app, "GET", "/JellyfinImport/Status", token, None).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    answer
+}
+
+/// Polls the status until the job no longer runs (two minutes at most); returns that answer.
+async fn b119_wait(app: &axum::Router, token: &str) -> serde_json::Value {
+    for _ in 0..2400 {
+        let answer = b119_status(app, token).await;
+        if answer["State"] != "Running" {
+            return answer;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("the wizard import still runs after two minutes");
+}
+
+/// Whether `user` has played the movie `name`, through the API as that user.
+async fn b119_played(app: &axum::Router, token: &str, user: uuid::Uuid, name: &str) -> bool {
+    let uri = format!("/Items?Recursive=true&IncludeItemTypes=Movie&userId={user}");
+    let (status, list) = send_authed(app, "GET", &uri, token, None).await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let item = list["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["Name"] == name)
+        .unwrap_or_else(|| panic!("no movie {name}: {list}"));
+    item["UserData"]["Played"].as_bool().unwrap_or(false)
+}
+
+#[tokio::test]
+async fn b119_setup_preview_lists_users_and_libraries_before_the_owner() {
+    let w = b119_world().await;
+    let body = serde_json::json!({ "SourcePath": w.config.to_str().unwrap() });
+    let req = request("POST", "/Startup/JellyfinImport/Preview", None, Some(body));
+    let (status, answer) = send(&w.app, req).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+
+    let users: Vec<(String, bool, i64)> = answer["Users"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|u| {
+            (
+                u["Name"].as_str().unwrap().to_string(),
+                u["WasAdministrator"].as_bool().unwrap(),
+                u["PlayedItems"].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        users,
+        vec![
+            // Alice's resume point on S01E01 isn't a played item (F5).
+            ("Alice".to_string(), true, 2),
+            ("bob".to_string(), false, 2)
+        ]
+    );
+    let alice = w.source.user("Alice").id.to_string();
+    assert_eq!(answer["Users"][0]["JellyfinId"], alice.as_str());
+    let libraries: Vec<serde_json::Value> = answer["Libraries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| serde_json::json!([l["Name"], l["CollectionType"], l["ContentType"], l["Paths"]]))
+        .collect();
+    assert_eq!(
+        libraries,
+        vec![
+            serde_json::json!(["Movies", "movies", "Movies", ["/data/movies"]]),
+            serde_json::json!(["Music", "music", "Music", ["/data/music"]]),
+            serde_json::json!(["Shows", "tvshows", "TvShows", ["/data/tvshows"]]),
+        ]
+    );
+    // The ten items less the folder, which the import doesn't read.
+    assert_eq!(answer["Items"], 9, "{answer}");
+    assert_eq!(answer["Layout"], "New");
+
+    // Names and counts only: no secret, no item path, no user data.
+    let text = answer.to_string();
+    assert!(!text.contains(jf::CANARY), "secret in the answer: {text}");
+    assert!(!text.contains("Alpha"), "item data in the answer: {text}");
+    for key in ["Password", "Hash", "Token", "ApiKey", "UserData"] {
+        assert!(!text.contains(key), "{key} in the answer: {text}");
+    }
+    // Nothing written.
+    assert!(
+        !rustyfin_db::repo_user::users_exist(&w.state.db)
+            .await
+            .unwrap()
+    );
+    assert_eq!(b119_library_count(&w.state).await, 0);
+    assert!(!b119_queue_file(&w.state).exists());
+}
+
+#[tokio::test]
+async fn b119_setup_preview_closes_once_a_user_exists() {
+    let w = b119_world().await;
+    let (token, _) = admin_session(&w.state).await;
+    let body = serde_json::json!({ "SourcePath": w.config.to_str().unwrap() });
+    let uri = "/Startup/JellyfinImport/Preview";
+    let (status, _) = send(&w.app, request("POST", uri, None, Some(body.clone()))).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "anonymous after setup");
+    let (status, answer) = send(&w.app, request("POST", uri, Some(&token), Some(body))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "admin after setup: {answer}");
+}
+
+#[tokio::test]
+async fn b119_setup_preview_refuses_a_bad_source() {
+    let w = b119_world().await;
+    let missing = w.config.join("nowhere");
+    for source in ["relative/path", missing.to_str().unwrap()] {
+        let body = serde_json::json!({ "SourcePath": source });
+        let req = request("POST", "/Startup/JellyfinImport/Preview", None, Some(body));
+        let (status, answer) = send(&w.app, req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{source}: {answer}");
+    }
+}
+
+#[tokio::test]
+async fn b119_queue_creates_libraries_scans_then_imports() {
+    let w = b119_world().await;
+    let (token, owner) = admin_session(&w.state).await;
+    let body = b119_queue_body(&w).to_string();
+    let (status, answer) =
+        send_authed(&w.app, "POST", "/JellyfinImport/Queue", &token, Some(&body)).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{answer}");
+    assert_eq!(answer["State"], "Running");
+    let ids: Vec<uuid::Uuid> = answer["LibraryIds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|id| id.as_str().unwrap().parse().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 2, "{answer}");
+
+    let done = b119_wait(&w.app, &token).await;
+    assert_eq!(done["State"], "Completed", "{done}");
+
+    // The libraries, as the request named them.
+    for (id, name, kind, path) in [
+        (ids[0], "Movies", "Movies", &w.movies),
+        (ids[1], "Shows", "TvShows", &w.tv),
+    ] {
+        let library = rustyfin_db::repo_library::get_library_by_id(&w.state.db, id)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("library {name} missing"));
+        assert_eq!(library.name, name);
+        assert_eq!(format!("{:?}", library.content_type), kind);
+        assert_eq!(library.paths, vec![path.clone()]);
+    }
+
+    // Alice went into the caller's account; bob was created with a code, shown on this read only.
+    let users = done["Result"]["Users"].as_array().unwrap();
+    let row = |name: &str| {
+        users
+            .iter()
+            .find(|u| u["Name"] == name)
+            .unwrap_or_else(|| panic!("no row {name}: {done}"))
+            .clone()
+    };
+    let alice = row("Alice");
+    assert_eq!(alice["MatchKind"], "IntoMyAccount", "{alice}");
+    assert_eq!(alice["UserId"], owner.to_string().as_str(), "{alice}");
+    let bob = row("bob");
+    assert_eq!(bob["Action"], "Create", "{bob}");
+    assert!(
+        b20_is_code(bob["Code"].as_str().unwrap_or_default()),
+        "{bob}"
+    );
+    let again = b119_status(&w.app, &token).await;
+    assert!(
+        !again.to_string().contains(bob["Code"].as_str().unwrap()),
+        "the code was shown twice"
+    );
+
+    // The scan ran before matching: the owner has Alice's play of Alpha.
+    assert!(b119_played(&w.app, &token, owner, "Alpha").await);
+    assert!(
+        rustyfin_db::repo_user::get_user_by_name(&w.state.db, "bob")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(!b119_queue_file(&w.state).exists(), "queue file left");
+}
+
+#[tokio::test]
+async fn b119_queue_is_admin_only() {
+    let w = b119_world().await;
+    let _ = admin_session(&w.state).await;
+    add_user(&w.state, "viewer", "viewerpass", false).await;
+    let (viewer, _) = login(&w.app, "viewer", "viewerpass").await.unwrap();
+    let body = Some(b119_queue_body(&w));
+    g1_assert_admin_only(&w.app, "POST", "/JellyfinImport/Queue", &body, &viewer).await;
+    assert_eq!(b119_library_count(&w.state).await, 0);
+}
+
+#[tokio::test]
+async fn b119_queue_checks_everything_before_writing() {
+    let w = b119_world().await;
+    let (token, _) = admin_session(&w.state).await;
+    let existing = media_folder(&w.state, "existing");
+    b20_library(
+        &w.state,
+        "Old",
+        rustyfin_model::library::LibraryContentType::Movies,
+        &existing,
+    )
+    .await;
+    let good = b119_queue_body(&w);
+    let with = |edit: &dyn Fn(&mut serde_json::Value)| {
+        let mut body = good.clone();
+        edit(&mut body);
+        body
+    };
+    let cases = [
+        (
+            "missing path",
+            with(&|b| b["Libraries"][0]["Paths"][0]["To"] = "/nowhere/b119".into()),
+        ),
+        (
+            "relative path",
+            with(&|b| b["Libraries"][0]["Paths"][0]["To"] = "movies".into()),
+        ),
+        (
+            "blank name",
+            with(&|b| b["Libraries"][0]["Name"] = " ".into()),
+        ),
+        (
+            "duplicate name",
+            with(&|b| b["Libraries"][1]["Name"] = "movies".into()),
+        ),
+        (
+            "existing name",
+            with(&|b| b["Libraries"][1]["Name"] = "OLD".into()),
+        ),
+        (
+            "no paths",
+            with(&|b| b["Libraries"][1]["Paths"] = serde_json::json!([])),
+        ),
+        (
+            "unknown IntoMyAccount",
+            with(&|b| b["IntoMyAccount"] = uuid::Uuid::new_v4().to_string().into()),
+        ),
+        (
+            "bad source",
+            with(&|b| b["SourcePath"] = "/nowhere/b119-jf".into()),
+        ),
+    ];
+    for (case, body) in cases {
+        let body = body.to_string();
+        let (status, answer) =
+            send_authed(&w.app, "POST", "/JellyfinImport/Queue", &token, Some(&body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{case}: {answer}");
+    }
+
+    // The API key has no account to import into.
+    let body = good.to_string();
+    let (status, answer) = send_authed(
+        &w.app,
+        "POST",
+        "/JellyfinImport/Queue",
+        "test-api-key",
+        Some(&body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "API key: {answer}");
+
+    // While an import runs.
+    let held = w.state.jellyfin_import.try_start().unwrap();
+    let (status, answer) =
+        send_authed(&w.app, "POST", "/JellyfinImport/Queue", &token, Some(&body)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{answer}");
+    held.fail("test".to_string());
+
+    assert_eq!(
+        b119_library_count(&w.state).await,
+        1,
+        "a library was created"
+    );
+    assert!(!b119_queue_file(&w.state).exists(), "queue file written");
+}
+
+/// Writes the queue file a stopped server would leave, with `state` and one Movies library.
+async fn b119_leave_queue(w: &B119World, owner: uuid::Uuid, state: &str) -> uuid::Uuid {
+    let library = b20_library(
+        &w.state,
+        "Movies",
+        rustyfin_model::library::LibraryContentType::Movies,
+        &w.movies,
+    )
+    .await;
+    let file = serde_json::json!({
+        "State": state,
+        "Caller": owner,
+        "LibraryIds": [library],
+        "Request": {
+            "SourcePath": w.config.to_str().unwrap(),
+            "PathMappings": [{"From": "/data/movies", "To": w.movies}],
+            "UserIds": [w.source.user("Alice").id, w.source.user("bob").id],
+            "IntoMyAccount": w.source.user("Alice").id,
+        },
+    });
+    std::fs::write(b119_queue_file(&w.state), file.to_string()).unwrap();
+    library
+}
+
+#[tokio::test]
+async fn b119_resume_runs_a_job_still_waiting_for_scans() {
+    let w = b119_world().await;
+    let (token, owner) = admin_session(&w.state).await;
+    b119_leave_queue(&w, owner, "WaitingForScans").await;
+    rustyfin_api::wizard_import::resume(&w.state).await;
+    let done = b119_wait(&w.app, &token).await;
+    assert_eq!(done["State"], "Completed", "{done}");
+    assert!(b119_played(&w.app, &token, owner, "Alpha").await);
+    assert!(!b119_queue_file(&w.state).exists(), "queue file left");
+}
+
+#[tokio::test]
+async fn b119_resume_reports_an_interrupted_import() {
+    let w = b119_world().await;
+    let (token, owner) = admin_session(&w.state).await;
+    b119_leave_queue(&w, owner, "Importing").await;
+    rustyfin_api::wizard_import::resume(&w.state).await;
+    let done = b119_wait(&w.app, &token).await;
+    assert_eq!(done["State"], "Failed", "{done}");
+    let error = done["Error"].as_str().unwrap_or_default();
+    assert!(error.contains("server stopped"), "{done}");
+    assert!(!b119_queue_file(&w.state).exists(), "queue file left");
+    assert!(
+        rustyfin_db::repo_user::get_user_by_name(&w.state.db, "bob")
+            .await
+            .unwrap()
+            .is_none(),
+        "an interrupted import was run again"
+    );
+}
+
+#[tokio::test]
+async fn b119_resume_reports_an_unreadable_queue_file() {
+    let w = b119_world().await;
+    let (token, _) = admin_session(&w.state).await;
+    std::fs::write(b119_queue_file(&w.state), "not json").unwrap();
+    rustyfin_api::wizard_import::resume(&w.state).await;
+    let done = b119_wait(&w.app, &token).await;
+    assert_eq!(done["State"], "Failed", "{done}");
+    let error = done["Error"].as_str().unwrap_or_default();
+    assert!(error.contains("could not be read"), "{done}");
+    assert!(!b119_queue_file(&w.state).exists(), "queue file left");
+}
+
+#[tokio::test]
+async fn b119_resume_without_a_file_does_nothing() {
+    let w = b119_world().await;
+    let (token, _) = admin_session(&w.state).await;
+    rustyfin_api::wizard_import::resume(&w.state).await;
+    assert_eq!(b119_status(&w.app, &token).await["State"], "Idle");
+}
+
+/// Fix round 1, test gap: resume reads the file as Queue's own type serializes it, every field set.
+#[tokio::test]
+async fn b119_resume_reads_the_file_queue_writes() {
+    use rustyfin_api::wizard_import::{QueueFile, QueueState};
+    use rustyfin_core::jellyfin_import::ImportRequest;
+    let w = b119_world().await;
+    let (token, owner) = admin_session(&w.state).await;
+    let library = b20_library(
+        &w.state,
+        "Movies",
+        rustyfin_model::library::LibraryContentType::Movies,
+        &w.movies,
+    )
+    .await;
+    let alice = w.source.user("Alice").id;
+    let request: ImportRequest = serde_json::from_value(serde_json::json!({
+        "SourcePath": w.config.to_str().unwrap(),
+        "Layout": "New",
+        "PathMappings": [{"From": "/data/movies", "To": w.movies}],
+        "UserIds": [alice, w.source.user("bob").id],
+        "ConfirmedMatches": [],
+        "IntoMyAccount": alice,
+        "MetadataMode": "Replace",
+    }))
+    .unwrap();
+    let file = QueueFile {
+        state: QueueState::WaitingForScans,
+        caller: owner,
+        library_ids: vec![library],
+        request,
+    };
+    let text = serde_json::to_string(&file).unwrap();
+    let back: QueueFile = serde_json::from_str(&text).unwrap();
+    assert_eq!(serde_json::to_string(&back).unwrap(), text, "round trip");
+    std::fs::write(b119_queue_file(&w.state), text).unwrap();
+    rustyfin_api::wizard_import::resume(&w.state).await;
+    let done = b119_wait(&w.app, &token).await;
+    assert_eq!(done["State"], "Completed", "{done}");
+    assert!(b119_played(&w.app, &token, owner, "Alpha").await);
+}
+
+/// F1: a second Queue while a queued job's file exists (or the job runs) is refused, writing nothing.
+#[tokio::test]
+async fn b119_queue_refuses_while_one_is_queued() {
+    let w = b119_world().await;
+    let (token, _) = admin_session(&w.state).await;
+    std::fs::write(b119_queue_file(&w.state), "{}").unwrap();
+    let body = b119_queue_body(&w).to_string();
+    let (status, answer) =
+        send_authed(&w.app, "POST", "/JellyfinImport/Queue", &token, Some(&body)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{answer}");
+    assert_eq!(b119_library_count(&w.state).await, 0);
+    assert_eq!(
+        std::fs::read_to_string(b119_queue_file(&w.state)).unwrap(),
+        "{}",
+        "the queued file was replaced"
+    );
+}
+
+/// F2: Queue creates its libraries together or not at all; a retry then succeeds.
+#[tokio::test]
+async fn b119_queue_creates_no_library_when_one_insert_fails() {
+    let w = b119_world().await;
+    let (token, _) = admin_session(&w.state).await;
+    sqlx::query(
+        "CREATE TRIGGER b119_fail BEFORE INSERT ON libraries WHEN NEW.name = 'Shows' \
+         BEGIN SELECT RAISE(ABORT, 'b119 forced failure'); END",
+    )
+    .execute(&w.state.db)
+    .await
+    .unwrap();
+    let body = b119_queue_body(&w).to_string();
+    let (status, answer) =
+        send_authed(&w.app, "POST", "/JellyfinImport/Queue", &token, Some(&body)).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{answer}");
+    assert_eq!(
+        b119_library_count(&w.state).await,
+        0,
+        "half the libraries stayed"
+    );
+    assert!(!b119_queue_file(&w.state).exists(), "queue file left");
+    assert_ne!(b119_status(&w.app, &token).await["State"], "Running");
+
+    sqlx::query("DROP TRIGGER b119_fail")
+        .execute(&w.state.db)
+        .await
+        .unwrap();
+    let (status, answer) =
+        send_authed(&w.app, "POST", "/JellyfinImport/Queue", &token, Some(&body)).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "retry: {answer}");
+    let done = b119_wait(&w.app, &token).await;
+    assert_eq!(done["State"], "Completed", "{done}");
+    assert_eq!(b119_library_count(&w.state).await, 2);
+}
+
+/// F3: Jellyfin's home videos become a Mixed library, which keeps their videos (Photos would not).
+#[tokio::test]
+async fn b119_home_videos_map_to_mixed() {
+    let w = b119_world().await;
+    let mut source = b20_source();
+    source.libraries.push(jf::JfLibrary {
+        name: "Home",
+        collection_type: "homevideos",
+        paths: vec!["/data/home"],
+    });
+    let config = w.config.with_file_name("config-home");
+    source.write(&config, jf::Layout::New).await;
+    let body = serde_json::json!({ "SourcePath": config.to_str().unwrap() });
+    let req = request("POST", "/Startup/JellyfinImport/Preview", None, Some(body));
+    let (status, answer) = send(&w.app, req).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    let home = answer["Libraries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|l| l["Name"] == "Home")
+        .unwrap_or_else(|| panic!("no Home library: {answer}"))
+        .clone();
+    assert_eq!(home["CollectionType"], "homevideos");
+    assert_eq!(home["ContentType"], "Mixed", "{home}");
+
+    // Created as the wizard sends it, the library's scan keeps the video.
+    let (token, _) = admin_session(&w.state).await;
+    let folder = media_folder(&w.state, "home");
+    std::fs::write(std::path::Path::new(&folder).join("Birthday.mkv"), b"").unwrap();
+    let body = serde_json::json!({
+        "SourcePath": config.to_str().unwrap(),
+        "Libraries": [{"Name": "Home", "ContentType": home["ContentType"],
+                       "Paths": [{"From": "/data/home", "To": folder}]}],
+    })
+    .to_string();
+    let (status, answer) =
+        send_authed(&w.app, "POST", "/JellyfinImport/Queue", &token, Some(&body)).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{answer}");
+    let done = b119_wait(&w.app, &token).await;
+    assert_eq!(done["State"], "Completed", "{done}");
+    let library = answer["LibraryIds"][0].as_str().unwrap().to_string();
+    let videos: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM media_items WHERE library_id = ?")
+        .bind(&library)
+        .fetch_one(&w.state.db)
+        .await
+        .unwrap();
+    assert_eq!(videos, 1, "the home video was not scanned");
+}
+
+/// F4: one setup preview at a time; the next waits for none and answers 409.
+#[tokio::test]
+async fn b119_setup_preview_runs_one_at_a_time() {
+    let w = b119_world().await;
+    let body = serde_json::json!({ "SourcePath": w.config.to_str().unwrap() });
+    let uri = "/Startup/JellyfinImport/Preview";
+    let busy = w
+        .state
+        .jellyfin_import
+        .try_preview()
+        .expect("the gate is free");
+    assert!(
+        w.state.jellyfin_import.try_preview().is_none(),
+        "a second preview got in"
+    );
+    let (status, answer) = send(&w.app, request("POST", uri, None, Some(body.clone()))).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{answer}");
+    drop(busy);
+    let (status, answer) = send(&w.app, request("POST", uri, None, Some(body))).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
 }
 
 /// Every stored setup code: user id, hash and date.
