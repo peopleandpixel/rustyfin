@@ -73,6 +73,8 @@ Der Wizard im Web-Client fragt nach der Sprache, ob Sie aus Jellyfin importieren
 4. **Weitere Benutzer:** Jeder ausgewählte Benutzer bekommt ein Konto und einen Einmal-Code für die Kontoeinrichtung.
 5. **Konto:** Der Name ist mit dem Jellyfin-Benutzer vorbelegt. Jellyfin-Passwörter werden nicht übernommen; wählen Sie ein neues.
 
+Mit „Nein“ legen Sie im Bibliotheksschritt beliebig viele Bibliotheken an oder keine, jede mit Name, Typ und einem oder mehreren Ordnern; jeder Ordner wird bei „Weiter“ geprüft. Beim Abschließen legt der Wizard sie an. Schlägt eine fehl, bleiben die übrigen angelegt, und ein erneutes Abschließen legt nur die fehlenden an.
+
 Jede ausgewählte Bibliothek braucht einen Pfad auf diesem Server. Jellyfins Heimvideos werden zu einer gemischten Bibliothek, da Rustyfins Foto-Bibliotheken nur Bilder einlesen.
 
 Beim Abschließen legt der Wizard den Server-Besitzer an, meldet sich an und stellt den Import mit `POST /JellyfinImport/Queue` ein. Schlägt das fehl, nachdem das Konto angelegt wurde, zeigt der Wizard den Fehler: Sie können die Import-Schritte korrigieren und es erneut versuchen, oder die Einrichtung mit „Ohne Import abschließen“ beenden und den Import später im Dashboard ausführen. Der Server legt die Bibliotheken an, scannt sie und importiert danach im Hintergrund. Der Wizard öffnet die Import-Seite im Dashboard, die den Fortschritt, das Ergebnis und die Einmal-Codes zeigt; die Codes erscheinen nur einmal und lassen sich dort für noch nicht eingerichtete Benutzer neu ausstellen.

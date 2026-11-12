@@ -2554,6 +2554,84 @@ fn b124_wizard_next_runs_once() {
     b124_node_test("b124_wizard_next.mjs");
 }
 
+// B125: wizard libraries. The manual path's library step holds several libraries.
+#[test]
+fn b125_wizard_library_rules() {
+    b124_node_test("b125_wizard_libraries.mjs");
+}
+
+#[test]
+fn b125_wizard_failure_and_new_path() {
+    let app_js = b124_web_source("app.js");
+    // A create that fails part-way sends the user back to the library step: the message shows there
+    let complete = b124_function(&app_js, "async function wizComplete() {");
+    assert!(
+        complete.contains("wizSetError($('wiz-lib-error'), t('wizard.libraries_create_failed'))"),
+        "the part-way failure shows on the library step"
+    );
+    assert!(
+        !complete.contains("showFinishError(t('wizard.libraries_create_failed'))"),
+        "not on the summary step the user left"
+    );
+    // A new path field starts clean, not marked like the field it was copied from
+    let add = b124_function(&app_js, "function addLibraryPathRow(list) {");
+    assert!(add.contains("removeAttribute('aria-invalid')"), "{add}");
+    assert!(add.contains("'ring-1', 'ring-red-500'"), "{add}");
+}
+
+#[test]
+fn b125_wizard_library_strings() {
+    for key in [
+        "wizard.add_library",
+        "wizard.remove_library",
+        "wizard.library_name_duplicate",
+        "wizard.libraries_create_failed",
+    ] {
+        let en = b21_translation("en", key).unwrap_or_else(|| panic!("en has {key}"));
+        let de = b21_translation("de", key).unwrap_or_else(|| panic!("de has {key}"));
+        assert_ne!(en, de, "{key} is translated");
+    }
+    for lang in ["en", "de"] {
+        let replace = b21_translation(lang, "wizard.library_replace_failed").unwrap();
+        assert!(replace.contains("{{name}}"), "{lang}: {replace}");
+        assert!(replace.contains("{{message}}"), "{lang}: {replace}");
+    }
+    assert_eq!(
+        b21_translation("en", "wizard.summary_library").as_deref(),
+        Some("Libraries:")
+    );
+}
+
+#[test]
+fn b125_wizard_library_markup() {
+    let html = b124_web_source("index.html");
+    for part in [
+        "id=\"wiz-man-libs\"",
+        "id=\"wiz-tpl-man-lib\"",
+        "data-action=\"wiz-add-lib\"",
+        "data-action=\"wiz-remove-lib\"",
+    ] {
+        assert!(html.contains(part), "index.html has {part}");
+    }
+    assert!(
+        !html.contains("id=\"wiz-lib-path\""),
+        "the single path field is gone"
+    );
+    let app_js = b124_web_source("app.js");
+    assert!(
+        app_js.contains("\nlet wizLibraries = [];"),
+        "app.js keeps a list"
+    );
+    for single in [
+        "wizLibrary ",
+        "wizLibrary=",
+        "wizLibrary.",
+        "'wiz-lib-path'",
+    ] {
+        assert!(!app_js.contains(single), "app.js no longer uses {single}");
+    }
+}
+
 // B121: path browse
 
 /// `GET /Environment/DirectoryContents` with `path` and extra query text such as `&prefix=me`.

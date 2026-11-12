@@ -8,7 +8,7 @@ let wizProgress = { configSaved: false, userCreated: false, loggedIn: false, que
 let wizCredentials = null;
 let wizFinishing = false;
 let wizSkipImport = false; // set by "Finish without importing" for one run of wizComplete
-let wizLibrary = null; // { id, name, type, path } of the library this page created
+let wizLibraries = []; // { id, name, type, paths } of the libraries this page created
 let wizListening = false;
 let wizPreview = null; // { path, data } of the last Jellyfin preview that succeeded
 let wizNameDefault = 'admin'; // the account name the wizard last filled in (or the markup's default)
@@ -153,6 +153,7 @@ async function checkSetupWizard() {
         }
         if (!done) {
             initWizardLanguage();
+            if (!document.querySelector('#wiz-man-libs .wiz-man-lib')) wizAddManualLibrary(false);
             wizSetStep(0);
             show('setup-wizard');
             wizFocusStep(wizStep);
@@ -241,8 +242,12 @@ function wizSetStep(s) {
         $('wiz-summary-user').textContent = $('wiz-username').value.trim();
         const langEl = $('wiz-lang');
         $('wiz-summary-lang').textContent = langEl.options[langEl.selectedIndex].text;
-        const libName = $('wiz-lib-name').value.trim(), libPath = $('wiz-lib-path').value.trim();
-        $('wiz-summary-library').textContent = libName && libPath ? `${libName}: ${libPath}` : t('wizard.summary_no_library');
+        const libs = wizManualRowsCheck(wizManualRows()).map(r => r.library).filter(Boolean);
+        const summary = $('wiz-summary-library');
+        summary.classList.add('whitespace-pre-line');
+        summary.textContent = libs.length
+            ? libs.map(l => `${l.name} (${t(WIZ_LIB_TYPES[l.type])}): ${l.paths.join(', ')}`).join('\n')
+            : t('wizard.summary_no_library');
         if (wizPath() === 'import') {
             const names = (list) => list.length ? list.join(', ') : t('wizard.summary_none');
             $('wiz-summary-jf-folder').textContent = wizPreview.path;
@@ -373,8 +378,49 @@ function wizPathRow(from) {
     return frag;
 }
 
+// Appends one empty library row to the manual step, focusing its name input when asked
+function wizAddManualLibrary(focus = true) {
+    const row = wizClone('wiz-tpl-man-lib').querySelector('.wiz-man-lib');
+    applyTranslations(row);
+    $('wiz-man-libs').appendChild(row);
+    if (focus) row.querySelector('.wiz-man-name').focus();
+}
+
 function wizCheckedLibRows() {
     return [...document.querySelectorAll('.wiz-lib-row')].filter(r => r.querySelector('.wiz-lib-check').checked);
+}
+
+// Answers one { library, error } per manual row: trimmed name, paths trimmed and deduplicated, empty rows skipped
+function wizManualRowsCheck(rows) {
+    const names = new Set();
+    return rows.map(({ name, type, paths }) => {
+        const trimmed = name.trim();
+        const key = trimmed.toLowerCase();
+        const duplicate = trimmed !== '' && names.has(key);
+        if (trimmed) names.add(key);
+        const list = [...new Set(paths.map(p => p.trim()).filter(Boolean))];
+        if (!trimmed && !list.length) return { library: null, error: '' };
+        if (!trimmed || !list.length) return { library: null, error: 'wizard.library_incomplete' };
+        if (duplicate) return { library: null, error: 'wizard.library_name_duplicate' };
+        return { library: { name: trimmed, type, paths: list }, error: '' };
+    });
+}
+
+// Matches created libraries to wanted ones (name, type, ordered paths) and answers what to keep, remove and create
+function wizLibraryPlan(created, wanted) {
+    // Two libraries are the same when name, type and the ordered paths are equal
+    const same = (a, b) => a.name === b.name && a.type === b.type
+        && a.paths.length === b.paths.length && a.paths.every((p, i) => p === b.paths[i]);
+    const unmatched = [...wanted];
+    const keep = [];
+    const remove = [];
+    for (const lib of created) {
+        // Each wanted library matches at most one created library
+        const i = unmatched.findIndex(w => same(lib, w));
+        if (i < 0) remove.push(lib);
+        else { keep.push(lib); unmatched.splice(i, 1); }
+    }
+    return { keep, remove, create: unmatched };
 }
 
 // Checked libraries need unique names, and every path of them must exist on this server
@@ -399,6 +445,54 @@ async function wizCheckLibraries() {
         if (!wizSetError(input.closest('.wiz-path').querySelector('.wiz-path-error'), msg)) ok = false;
     }
     return ok;
+}
+
+// The manual step's rows as typed: { row, name, type, paths, inputs } (inputs are the .wiz-man-path fields)
+function wizManualRows() {
+    return [...document.querySelectorAll('#wiz-man-libs .wiz-man-lib')].map(row => {
+        const inputs = [...row.querySelectorAll('.wiz-man-path')];
+        return {
+            row,
+            name: row.querySelector('.wiz-man-name').value,
+            type: row.querySelector('.wiz-man-type').value,
+            paths: inputs.map(input => input.value),
+            inputs,
+        };
+    });
+}
+
+// Checks every manual row, then each path of the rows without an error; answers true only with no error anywhere
+async function wizCheckManualLibraries() {
+    const rows = wizManualRows();
+    const checked = wizManualRowsCheck(rows);
+    for (const input of rows.flatMap(r => r.inputs)) {
+        input.removeAttribute('aria-invalid');
+        input.classList.remove('ring-1', 'ring-red-500');
+    }
+    const messages = checked.map(c => c.error ? [t(c.error)] : []);
+    // Without a token (owner created, not signed in) ValidatePath would answer 401; the create at Finish checks the paths then
+    const canCheck = !(wizProgress.userCreated && !wizProgress.loggedIn);
+    for (const [i, row] of rows.entries()) {
+        if (checked[i].error || !canCheck) continue;
+        for (const input of row.inputs) {
+            const value = input.value.trim();
+            if (!value) continue;
+            try {
+                await API.validatePath(value);
+            } catch (e) {
+                input.setAttribute('aria-invalid', 'true');
+                input.classList.add('ring-1', 'ring-red-500');
+                messages[i].push(`${value}: ${e.message}`);
+            }
+        }
+    }
+    rows.forEach((row, i) => {
+        const el = row.row.querySelector('.wiz-man-error');
+        el.classList.add('whitespace-pre-line');
+        wizSetError(el, messages[i].join('\n'));
+    });
+    hide('wiz-lib-error');
+    return messages.every(m => m.length === 0);
 }
 
 // Reads the Jellyfin folder when its path is new; answers whether the step may close
@@ -482,33 +576,7 @@ async function wizCheckStep() {
     if (wizStep === WIZ.folder) return wizReadJellyfin();
     if (wizStep === WIZ.user) return wizSetError($('wiz-user-pick-error'), wizPickedUser() ? '' : t('wizard.user_required'));
     if (wizStep === WIZ.libs) return wizCheckLibraries();
-    if (wizStep === wizStepIndexOf('wiz-lib-path')) {
-        const name = $('wiz-lib-name').value.trim(), path = $('wiz-lib-path').value.trim();
-        if (!name && !path) {
-            hide('wiz-lib-error');
-        } else if (!name || !path) {
-            $('wiz-lib-error').textContent = t('wizard.library_incomplete');
-            show('wiz-lib-error');
-            return;
-        } else if (wizProgress.userCreated && !wizProgress.loggedIn) {
-            // The owner exists but this page has no token, so ValidatePath would answer 401.
-            // Skip the check; Finish's library create checks the path anyway.
-            hide('wiz-lib-error');
-        } else {
-            const nextBtn = document.querySelector('#wiz-step-' + wizStep + ' .jf-btn-primary');
-            nextBtn.disabled = true;
-            try {
-                await API.validatePath(path);
-                hide('wiz-lib-error');
-            } catch (e) {
-                $('wiz-lib-error').textContent = e.message;
-                show('wiz-lib-error');
-                return;
-            } finally {
-                nextBtn.disabled = false;
-            }
-        }
-    }
+    if (wizStep === WIZ.library) return wizCheckManualLibraries();
     if (wizStep === WIZ.account) {
         const pw = $('wiz-password').value, pw2 = $('wiz-password2').value;
         const user = $('wiz-username').value.trim();
@@ -534,8 +602,8 @@ async function wizPrev() {
 }
 
 function wizSkipLibrary() {
-    $('wiz-lib-name').value = '';
-    $('wiz-lib-path').value = '';
+    document.querySelectorAll('#wiz-man-libs .wiz-man-lib').forEach(row => row.remove());
+    wizAddManualLibrary(false);
     hide('wiz-lib-error');
     wizNext();
 }
@@ -628,30 +696,39 @@ async function wizComplete() {
             wizLockImport();
         }
         // The library step may have changed since this page created its library; the page's last choice wins
-        const libName = $('wiz-lib-name').value.trim(), libPath = $('wiz-lib-path').value.trim();
-        const libType = $('wiz-lib-type').value;
-        const want = wizPath() !== 'import' && libName && libPath ? { name: libName, type: libType, path: libPath } : null;
-        if (wizLibrary && (!want || wizLibrary.name !== want.name || wizLibrary.type !== want.type || wizLibrary.path !== want.path)) {
+        const rows = wizPath() !== 'import' ? wizManualRows() : []; // the import path creates its libraries itself
+        const checked = wizManualRowsCheck(rows);
+        const wanted = [];
+        const rowOf = new Map(); // the wanted library object -> its row element
+        checked.forEach((c, i) => { if (c.library) { wanted.push(c.library); rowOf.set(c.library, rows[i].row); } });
+        const plan = wizLibraryPlan(wizLibraries, wanted);
+        for (const lib of plan.remove) {
             try {
-                await API.deleteLibrary(wizLibrary.id);
-                wizLibrary = null;
+                await API.deleteLibrary(lib.id);
+                wizLibraries = wizLibraries.filter(l => l !== lib);
             } catch (e) {
-                showFinishError(t('wizard.library_replace_failed', { message: e.message }));
+                showFinishError(t('wizard.library_replace_failed', { name: lib.name, message: e.message }));
                 return;
             }
         }
-        if (want && !wizLibrary) {
+        let createFailed = false;
+        for (const want of plan.create) {
+            const { name, type, paths } = want;
             try {
-                const lib = await API.createLibrary(want.name, want.type, [want.path]);
-                wizLibrary = { id: lib.Id || lib.id, ...want };
+                const lib = await API.createLibrary(name, type, paths);
+                wizLibraries.push({ id: lib.Id || lib.id, name, type, paths });
                 // Scanned once setup completes (below), so a Back-edit Finish can't replace it mid-scan
-                toast(t('library.created', { name: want.name }));
+                toast(t('library.created', { name }));
             } catch (e) {
-                wizSetStep(wizStepIndexOf('wiz-lib-path'));
-                $('wiz-lib-error').textContent = e.message;
-                show('wiz-lib-error');
-                return;
+                createFailed = true;
+                wizSetError(rowOf.get(want).querySelector('.wiz-man-error'), e.message);
             }
+        }
+        if (createFailed) {
+            wizSetStep(WIZ.library);
+            hide('wiz-finish-error');
+            wizSetError($('wiz-lib-error'), t('wizard.libraries_create_failed'));
+            return;
         }
         try {
             await API.completeStartup();
@@ -659,8 +736,8 @@ async function wizComplete() {
             showFinishError(t('wizard.complete_failed', { message: e.message }));
             return;
         }
-        // Scan the library now that setup is done: before, a retry could replace it mid-scan
-        if (wizLibrary) API.scanLibrary(wizLibrary.id).catch(err => toast(t('library.scan_start_failed', { message: err.message }), 'error'));
+        // Scan the libraries now that setup is done: before, a retry could replace one mid-scan
+        for (const lib of wizLibraries) API.scanLibrary(lib.id).catch(err => toast(t('library.scan_start_failed', { message: err.message }), 'error'));
         hide('setup-wizard');
         show('main-navbar');
         updateAuthUI();
@@ -760,8 +837,10 @@ const clickActions = {
     'start-task': el => startTaskAction(el.dataset.id, el.dataset.name),
     'stop-task': el => stopTaskAction(el.dataset.id, el.dataset.name),
     'browse-path': el => openFolderBrowser(el.closest('.path-field').querySelector('[data-path-field]')),
-    'add-lib-path': () => addLibraryPathRow(),
+    'add-lib-path': el => addLibraryPathRow(el.closest('.wiz-man-lib')?.querySelector('.wiz-man-paths') || $('add-lib-paths')),
     'remove-lib-path': el => removeLibraryPathRow(el),
+    'wiz-add-lib': () => wizAddManualLibrary(),
+    'wiz-remove-lib': el => { el.closest('.wiz-man-lib').remove(); document.querySelector('[data-action="wiz-add-lib"]').focus(); },
     'folder-open': el => folderBrowserLoad(el.dataset.path),
     'folder-up': () => folderBrowserUp(),
     'folder-cancel': () => closeFolderBrowser(),
@@ -4799,14 +4878,15 @@ document.addEventListener('close', e => {
 }, true);
 
 // Adds a path row to Add Library: a copy of the first row (its Browse button included) with a remove button
-function addLibraryPathRow() {
-    const list = $('add-lib-paths');
+function addLibraryPathRow(list) {
     const first = list?.querySelector('.path-field');
     if (!first) return;
     const row = first.cloneNode(true);
     const input = row.querySelector('input');
     input.value = '';
     input.removeAttribute('id');
+    input.removeAttribute('aria-invalid');
+    input.classList.remove('ring-1', 'ring-red-500');
     const remove = document.createElement('button');
     remove.type = 'button';
     remove.className = 'jf-btn-ghost !px-3 !py-2 text-xs';
