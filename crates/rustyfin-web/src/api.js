@@ -378,6 +378,12 @@ const API = {
         return this.get(`/Library/BrowseDirectories${q}`);
     },
 
+    // Folders inside an absolute path; prefix filters names case-insensitively
+    directoryContents(path, prefix) {
+        const p = prefix ? `&prefix=${encodeURIComponent(prefix)}` : '';
+        return this.get(`/Environment/DirectoryContents?path=${encodeURIComponent(path)}&includeDirectories=true${p}`);
+    },
+
     // Items
     getItems(params = {}) {
         const q = new URLSearchParams();

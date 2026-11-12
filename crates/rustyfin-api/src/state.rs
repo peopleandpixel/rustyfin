@@ -14,6 +14,21 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{RwLock, broadcast, watch};
 
+/// Caps the folder listings (GET /Environment/DirectoryContents) that run at once, so a hung mount
+/// can't take every blocking thread. Each listing holds one permit until its read ends.
+#[derive(Clone)]
+pub struct DirectoryListings(pub Arc<tokio::sync::Semaphore>);
+
+impl DirectoryListings {
+    pub const MAX: usize = 4;
+}
+
+impl Default for DirectoryListings {
+    fn default() -> Self {
+        Self(Arc::new(tokio::sync::Semaphore::new(Self::MAX)))
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub db: SqlitePool,
@@ -50,4 +65,6 @@ pub struct AppState {
     pub oidc: crate::oidc::OidcState,
     /// The one import from Jellyfin this server runs at a time, and its status.
     pub jellyfin_import: rustyfin_core::jellyfin_import::ImportJob,
+    /// Permits for the folder listings that run at once (see `DirectoryListings`).
+    pub directory_listings: DirectoryListings,
 }

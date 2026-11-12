@@ -137,18 +137,27 @@ async fn get_libraries(
 /// Checks one library folder path. Returns the sentence for a path the server cannot use as a
 /// folder, with `true` when the path is absolute but not an existing folder (not found, or a file).
 pub(crate) async fn path_problem(p: &str) -> Option<(bool, String)> {
+    let owned = p.to_string();
+    match tokio::task::spawn_blocking(move || path_problem_blocking(&owned)).await {
+        Ok(problem) => problem,
+        Err(_) => Some((false, format!("The server cannot read the folder \"{p}\"."))),
+    }
+}
+
+/// The blocking check behind `path_problem`; call it from a blocking thread.
+pub(crate) fn path_problem_blocking(p: &str) -> Option<(bool, String)> {
     if !StdPath::new(p).is_absolute() {
         return Some((
             false,
             format!("The folder \"{p}\" is not a full path on the server."),
         ));
     }
-    match tokio::fs::metadata(p).await {
+    match std::fs::metadata(p) {
         Ok(meta) if !meta.is_dir() => Some((
             true,
             format!("The path \"{p}\" on the server is not a folder."),
         )),
-        Ok(_) => match tokio::fs::read_dir(p).await {
+        Ok(_) => match std::fs::read_dir(p) {
             Ok(_) => None,
             Err(e) => Some((false, unreadable_sentence(p, &e))),
         },

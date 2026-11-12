@@ -367,6 +367,7 @@ function wizPathRow(from) {
     el.dataset.from = from;
     el.querySelector('.wiz-path-label').textContent = t('wizard.path_on_server');
     el.querySelector('.wiz-path-input').value = from;
+    el.querySelector('.path-field button').textContent = t('library.browse');
     el.querySelector('.wiz-jf-path-label').textContent = t('wizard.jellyfin_path');
     el.querySelector('.wiz-jf-path').textContent = from;
     return frag;
@@ -758,8 +759,13 @@ const clickActions = {
     'toggle-realtime-monitor': el => toggleRealtimeMonitor(el),
     'start-task': el => startTaskAction(el.dataset.id, el.dataset.name),
     'stop-task': el => stopTaskAction(el.dataset.id, el.dataset.name),
-    'dir-open': el => navigateDirectoryPicker(el.dataset.path),
-    'remove-path': el => removeSelectedPath(Number(el.dataset.index)),
+    'browse-path': el => openFolderBrowser(el.closest('.path-field').querySelector('[data-path-field]')),
+    'add-lib-path': () => addLibraryPathRow(),
+    'remove-lib-path': el => removeLibraryPathRow(el),
+    'folder-open': el => folderBrowserLoad(el.dataset.path),
+    'folder-up': () => folderBrowserUp(),
+    'folder-cancel': () => closeFolderBrowser(),
+    'folder-select': () => folderBrowserSelect(),
     'oidc-sign-in': () => startOidcSignIn(),
     'oidc-link': () => startOidcLink(),
     'oidc-unlink': el => unlinkOidc(el.dataset.id),
@@ -3736,7 +3742,10 @@ function jiPanelHtml() {
             <div class="grid gap-4 sm:grid-cols-2 mt-5">
                 <label class="block">
                     <span class="block text-xs font-semibold text-white/70 mb-1.5">${t('jellyfin_import.folder')}</span>
-                    <input type="text" id="ji-source" class="jf-input w-full" placeholder="/import/jellyfin" oninput="jiForget()">
+                    <div class="path-field flex gap-2">
+                        <input type="text" id="ji-source" class="jf-input flex-1 min-w-0" placeholder="/import/jellyfin" oninput="jiForget()" data-path-field list="path-suggestions" autocomplete="off" spellcheck="false">
+                        <button type="button" class="jf-btn-ghost !px-3 !py-2 text-xs whitespace-nowrap" data-action="browse-path">${t('library.browse')}</button>
+                    </div>
                 </label>
                 <label class="block">
                     <span class="block text-xs font-semibold text-white/70 mb-1.5">${t('jellyfin_import.layout')}</span>
@@ -4548,11 +4557,6 @@ async function toggleRealtimeMonitor(el) {
     }
 }
 
-// Directory picker state
-let directoryPickerPath = '/';
-let directoryPickerHistory = ['/'];
-let selectedLibraryPaths = [];
-
 // Shows a message inside the add-library dialog; an empty message hides the box
 function setAddLibraryError(message) {
     const el = $('add-lib-error');
@@ -4566,12 +4570,7 @@ async function submitAddLibrary(e) {
     const f = e.target;
     const name = f.name.value.trim();
     const type = f.type.value;
-    // The chosen folders, the typed paths and, while the picker is open, the folder it shows (unless it is still at "/")
-    const manualPaths = f.paths.value.split(',').map(p => p.trim()).filter(Boolean);
-    const paths = [...new Set([...selectedLibraryPaths, ...manualPaths])];
-    const picker = $('directory-picker');
-    const pickerPath = picker && !picker.classList.contains('hidden') ? directoryPickerFieldPath() : '';
-    if (pickerPath && pickerPath !== '/' && !paths.includes(pickerPath)) paths.push(pickerPath);
+    const paths = [...new Set([...f.querySelectorAll('[name="paths"]')].map(i => i.value.trim()).filter(Boolean))];
     const submitBtn = $('add-lib-submit');
 
     setAddLibraryError('');
@@ -4591,8 +4590,6 @@ async function submitAddLibrary(e) {
     }
     toast(t('library.created', { name }));
     closeAddLibrary();
-    // Reset selected paths
-    selectedLibraryPaths = [];
     // Auto-start scan after creating library
     API.scanLibrary(lib.id || lib.Id).catch(err => toast(t('library.scan_start_failed', { message: err.message }), 'error'));
     // The library exists at this point, so a reload error is not a creation failure: toast it as before
@@ -4605,130 +4602,203 @@ async function submitAddLibrary(e) {
     }
 }
 
-// --- Directory Picker ---
-async function openDirectoryPicker() {
-    directoryPickerPath = '/';
-    directoryPickerHistory = ['/'];
-    const picker = $('directory-picker');
-    if (picker) picker.classList.remove('hidden');
-    await loadDirectoryList('/');
+// --- Server path fields: autofill and Browse ---
+// The parent of an absolute path ("/" for top-level folders and for "/" itself)
+function folderParent(path) {
+    const trimmed = path.replace(/\/+$/, '');
+    return trimmed.slice(0, trimmed.lastIndexOf('/')) || '/';
 }
 
-function closeDirectoryPicker() {
-    const picker = $('directory-picker');
-    if (picker) picker.classList.add('hidden');
-}
+// Suggestions: one shared timer, so only the last field typed in gets its suggestions
+let pathSuggestTimer = null;
+document.addEventListener('input', e => {
+    if (!e.target.matches?.('[data-path-field]')) return;
+    const input = e.target;
+    clearTimeout(pathSuggestTimer);
+    pathSuggestTimer = setTimeout(() => suggestPaths(input), 200);
+});
 
-function directoryPickerBack() {
-    if (directoryPickerHistory.length > 1) {
-        directoryPickerHistory.pop();
-        directoryPickerPath = directoryPickerHistory[directoryPickerHistory.length - 1];
-        loadDirectoryList(directoryPickerPath);
-    }
-}
+// Per field: busy while a suggestion request is in flight, again when the field changed meanwhile
+const pathSuggestStates = new WeakMap();
 
-async function loadDirectoryList(path) {
-    const list = $('directory-picker-list');
-    const pathField = $('directory-picker-path');
-    if (pathField) pathField.value = path;
-    if (!list) return;
-
-    list.innerHTML = '<div class="p-3 text-center text-white/40 text-xs"><div class="w-4 h-4 border-2 border-[#00a4dc] border-t-transparent rounded-full animate-spin mx-auto"></div></div>';
-
-    try {
-        const dirs = await API.browseDirectories(path);
-        if (!dirs.length) {
-            list.innerHTML = `<div class="p-3 text-center text-white/30 text-xs">${t('library.no_subfolders')}</div>`;
-            return;
-        }
-
-        let html = '';
-        // Parent navigation (unless root)
-        if (path !== '/') {
-            const parent = path.split('/').slice(0, -1).join('/') || '/';
-            html += `<button type="button" class="w-full text-left px-3 py-2 text-xs text-white/60 hover:bg-white/5 flex items-center gap-2 rounded" data-action="dir-open" data-path="${escapeHtml(parent)}">
-                <span>📁</span> <span>…</span> <span class="text-white/30 text-[10px] ml-auto">${t('library.parent_folder')}</span>
-            </button>`;
-        }
-
-        for (const dir of dirs) {
-            if (!dir.can_read) {
-                html += `<div class="w-full text-left px-3 py-2 text-xs text-white/40 flex items-center gap-2 rounded">
-                    <span>📁</span> <span class="truncate">${escapeHtml(dir.name)}</span>
-                    <span class="text-white/30 text-[10px] ml-auto">${t('library.no_access')}</span>
-                </div>`;
-            } else {
-                // A click opens the folder; "Select this folder" below the list takes the open one
-                html += `<button type="button" class="w-full text-left px-3 py-2 text-xs text-white hover:bg-white/5 flex items-center gap-2 rounded" data-action="dir-open" data-path="${escapeHtml(dir.path)}">
-                    <span>📁</span> <span class="truncate">${escapeHtml(dir.name)}</span>
-                </button>`;
-            }
-        }
-        list.innerHTML = html;
-    } catch (e) {
-        list.innerHTML = `<div class="p-3 text-center text-red-400 text-xs">${escapeHtml(e.message)}</div>`;
-    }
-}
-
-function navigateDirectoryPicker(path) {
-    directoryPickerHistory.push(path);
-    directoryPickerPath = path;
-    loadDirectoryList(path);
-}
-
-// The folder path in the picker's field, without trailing slashes ("/" stays "/")
-function directoryPickerFieldPath() {
-    const value = ($('directory-picker-path')?.value || '').trim();
-    return value.replace(/\/+$/, '') || (value ? '/' : '');
-}
-
-// Enter in the picker's field opens the typed folder instead of submitting the form
-function directoryPickerPathKeydown(e) {
-    if (e.key !== 'Enter') return;
-    e.preventDefault();
-    const path = directoryPickerFieldPath();
-    if (path) navigateDirectoryPicker(path);
-}
-
-// Adds the folder in the picker's field to the chosen paths and closes the picker
-function selectCurrentDirectory() {
-    const path = directoryPickerFieldPath();
-    if (!path) return;
-    if (!selectedLibraryPaths.includes(path)) selectedLibraryPaths.push(path);
-    renderSelectedPaths();
-    closeDirectoryPicker();
-}
-
-function renderSelectedPaths() {
-    const container = $('add-lib-selected-paths');
-    if (!container) return;
-    if (!selectedLibraryPaths.length) {
-        container.innerHTML = '';
+// At most one request per field: a change during a request queues one more run after it
+async function suggestPaths(input) {
+    const state = pathSuggestStates.get(input) || { busy: false, again: false };
+    pathSuggestStates.set(input, state);
+    if (state.busy) {
+        state.again = true;
         return;
     }
-    container.innerHTML = selectedLibraryPaths.map((p, i) => `
-        <div class="flex items-center gap-2 px-2 py-1 rounded bg-[#00a4dc]/10 border border-[#00a4dc]/20">
-            <span class="text-xs text-white/70 font-mono truncate flex-1">${escapeHtml(p)}</span>
-            <button type="button" class="text-white/40 hover:text-red-400 text-xs" data-action="remove-path" data-index="${i}">×</button>
-        </div>
-    `).join('');
+    state.busy = true;
+    try {
+        await loadPathSuggestions(input);
+    } finally {
+        state.busy = false;
+    }
+    if (state.again) {
+        state.again = false;
+        suggestPaths(input);
+    }
 }
 
-function removeSelectedPath(index) {
-    selectedLibraryPaths.splice(index, 1);
-    renderSelectedPaths();
+async function loadPathSuggestions(input) {
+    const list = $('path-suggestions');
+    if (!list) return;
+    const path = input.value.trim();
+    const raw = input.value;
+    if (!path.startsWith('/')) {
+        list.replaceChildren();
+        return;
+    }
+    const cut = path.lastIndexOf('/');
+    let entries;
+    try {
+        entries = await API.directoryContents(cut === 0 ? '/' : path.slice(0, cut), path.slice(cut + 1));
+    } catch {
+        entries = [];
+    }
+    if (input.value !== raw) return; // the field changed while the request ran
+    list.replaceChildren(...entries.slice(0, 50).map(entry => {
+        const option = document.createElement('option');
+        option.value = entry.Path;
+        return option;
+    }));
+}
+
+// The folder browser dialog fills the field it was opened from
+let folderBrowserInput = null;
+// The folder the dialog lists; '' until a listing succeeds
+let folderBrowserPath = '';
+// Numbers each listing request; only the latest may touch the dialog
+let folderBrowserSeq = 0;
+
+async function openFolderBrowser(input) {
+    const dlg = $('folder-browser');
+    if (!dlg || !input) return;
+    folderBrowserInput = input;
+    folderBrowserPath = '';
+    dlg.classList.add('modal-open');
+    if (typeof dlg.showModal === 'function') {
+        try { dlg.showModal(); } catch { dlg.setAttribute('open', ''); }
+    } else {
+        dlg.setAttribute('open', '');
+    }
+    // Start at the typed folder, else its parent, else the root; stops when the dialog closes or another load starts
+    let start = input.value.trim();
+    if (!start.startsWith('/')) start = '/';
+    for (const path of new Set([start, folderParent(start), '/'])) {
+        const load = folderBrowserLoad(path);
+        const seq = folderBrowserSeq; // folderBrowserLoad takes its number synchronously
+        if (await load) return;
+        if (seq !== folderBrowserSeq || !dlg.open) return;
+    }
+}
+
+// Lists the folders in path; false if it cannot be read (the error is shown in the list) or a newer load superseded it
+async function folderBrowserLoad(path) {
+    const list = $('folder-browser-list');
+    const dlg = $('folder-browser');
+    if (!list || !dlg) return false;
+    const seq = ++folderBrowserSeq;
+    const isCurrent = () => seq === folderBrowserSeq && dlg.open;
+    const upBtn = dlg.querySelector('[data-action="folder-up"]');
+    const selectBtn = dlg.querySelector('[data-action="folder-select"]');
+    list.innerHTML = '<div class="p-3 text-center text-white/40 text-xs"><div class="w-4 h-4 border-2 border-[#00a4dc] border-t-transparent rounded-full animate-spin mx-auto"></div></div>';
+    let entries;
+    try {
+        entries = await API.directoryContents(path);
+    } catch (e) {
+        if (!isCurrent()) return false;
+        // The failed path becomes the dialog's path, so Up goes to its parent and Select stays off
+        folderBrowserPath = path;
+        $('folder-browser-path').textContent = path;
+        upBtn.disabled = path === '/';
+        selectBtn.disabled = true;
+        list.innerHTML = `<div class="p-3 text-center text-red-400 text-xs">${escapeHtml(e.message)}</div>`;
+        (upBtn.disabled ? dlg.querySelector('[data-action="folder-cancel"]') : upBtn).focus();
+        return false;
+    }
+    if (!isCurrent()) return false;
+    folderBrowserPath = path;
+    $('folder-browser-path').textContent = path;
+    upBtn.disabled = path === '/';
+    selectBtn.disabled = false;
+    if (!entries.length) {
+        list.innerHTML = `<div class="p-3 text-center text-white/30 text-xs">${t('library.no_subfolders')}</div>`;
+    } else {
+        list.innerHTML = entries.map(entry => `<button type="button" class="w-full text-left px-3 py-2 text-xs text-white hover:bg-white/5 flex items-center gap-2 rounded" data-action="folder-open" data-path="${escapeHtml(entry.Path)}">📁 <span class="truncate min-w-0">${escapeHtml(entry.Name)}</span></button>`).join('');
+    }
+    const first = list.querySelector('[data-action="folder-open"]');
+    (first || $('folder-browser').querySelector('[data-action="folder-up"]')).focus();
+    return true;
+}
+
+function folderBrowserUp() {
+    if (folderBrowserPath) folderBrowserLoad(folderParent(folderBrowserPath));
+}
+
+// Puts the listed folder into the field and closes the dialog
+function folderBrowserSelect() {
+    const input = folderBrowserInput;
+    if (input && folderBrowserPath) {
+        input.value = folderBrowserPath;
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+    closeFolderBrowser();
+}
+
+function closeFolderBrowser() {
+    const dlg = $('folder-browser');
+    if (dlg?.open) dlg.close();
+}
+
+// However the dialog closes (Cancel, Select or Escape), focus returns to the field it filled
+document.addEventListener('close', e => {
+    if (e.target.id !== 'folder-browser') return;
+    e.target.classList.remove('modal-open');
+    folderBrowserInput?.focus();
+}, true);
+
+// Adds a path row to Add Library: a copy of the first row (its Browse button included) with a remove button
+function addLibraryPathRow() {
+    const list = $('add-lib-paths');
+    const first = list?.querySelector('.path-field');
+    if (!first) return;
+    const row = first.cloneNode(true);
+    const input = row.querySelector('input');
+    input.value = '';
+    input.removeAttribute('id');
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'jf-btn-ghost !px-3 !py-2 text-xs';
+    remove.dataset.action = 'remove-lib-path';
+    remove.setAttribute('aria-label', t('library.remove_path'));
+    remove.textContent = '×';
+    row.appendChild(remove);
+    list.appendChild(row);
+    input.focus();
+}
+
+function removeLibraryPathRow(el) {
+    el.closest('.path-field')?.remove();
+}
+
+// Leaves only the first path row, empty
+function resetAddLibraryPaths() {
+    const rows = $('add-lib-paths')?.querySelectorAll('.path-field') || [];
+    rows.forEach((row, i) => {
+        if (i) row.remove();
+        else row.querySelector('input').value = '';
+    });
 }
 
 // Override openAddLibrary to reset state
 const _origOpenAddLibrary = openAddLibrary;
 openAddLibrary = function() {
-    selectedLibraryPaths = [];
-    renderSelectedPaths();
-    const picker = $('directory-picker');
-    if (picker) picker.classList.add('hidden');
     setAddLibraryError('');
     const submitBtn = $('add-lib-submit');
     if (submitBtn) submitBtn.disabled = false;
+    resetAddLibraryPaths();
     _origOpenAddLibrary();
 };
 
