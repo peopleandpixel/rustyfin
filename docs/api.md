@@ -56,6 +56,8 @@ GET /System/Info?api_key=<token>
 | `POST` | `/Startup/User` | Server-Besitzer anlegen (nur solange der Server keine Benutzer hat) |
 | `POST` | `/Startup/Complete` | Setup abschließen |
 | `POST` | `/Environment/ValidatePath` | Ordnerpfad prüfen (`{"Path"}`): 204, 404 wenn kein vorhandener Ordner, sonst 400; die Meldung steht in `Detail` |
+| `POST` | `/Startup/JellyfinImport/Preview` | Jellyfin-Datenordner für den Wizard lesen (`{"SourcePath"}`): Benutzer, Bibliotheken und Zahlen; nur solange der Server keine Benutzer hat, danach 403 |
+| `POST` | `/JellyfinImport/Queue` | Import des Wizards einstellen (Administrator, angemeldet): legt die Bibliotheken an, scannt sie und importiert danach im Hintergrund; 202 mit `LibraryIds`, 400 bei ungültigem Pfad, Namen oder Datenordner, 409 während eines Imports. Fortschritt über `GET /JellyfinImport/Status` (Stufe `Scanning`) |
 
 Solange der Server keine Benutzer hat, sind die `/Startup/*`-Endpunkte und `/Environment/ValidatePath` ohne Anmeldung erreichbar, danach nur für Administratoren.
 

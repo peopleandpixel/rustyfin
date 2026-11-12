@@ -2,6 +2,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use rustyfin_core::scan_progress::ScanTicket;
 use rustyfin_model::library::{CreateLibraryRequest, Library, LibraryOptions};
 use rustyfin_model::ws_event::WsEvent;
 use serde::{Deserialize, Serialize};
@@ -135,7 +136,7 @@ async fn get_libraries(
 
 /// Checks one library folder path. Returns the sentence for a path the server cannot use as a
 /// folder, with `true` when the path is absolute but not an existing folder (not found, or a file).
-async fn path_problem(p: &str) -> Option<(bool, String)> {
+pub(crate) async fn path_problem(p: &str) -> Option<(bool, String)> {
     if !StdPath::new(p).is_absolute() {
         return Some((
             false,
@@ -161,7 +162,7 @@ async fn path_problem(p: &str) -> Option<(bool, String)> {
 
 /// Checks each library folder path, in request order. Returns one sentence for
 /// each path the server cannot use as a folder; an empty list means all are usable.
-async fn library_path_problems(paths: &[String]) -> Vec<String> {
+pub(crate) async fn library_path_problems(paths: &[String]) -> Vec<String> {
     let mut problems = Vec::new();
     for p in paths {
         problems.extend(path_problem(p).await.map(|(_, sentence)| sentence));
@@ -255,28 +256,50 @@ async fn scan_library(
                 },
             )
             .await;
-            let ws_broadcast = state.ws_broadcast.clone();
-            let lib_name = lib.name.clone();
-            let lib_id = lib.id;
-            tokio::spawn(ticket.wait_end_then(move || {
-                // A send fails only when no socket is listening, which is fine.
-                let _ = ws_broadcast.send(WsEvent::ScheduledTaskCompleted {
-                    data: json!({
-                        "Name": format!("Library scan: {}", lib_name),
-                        "State": "Completed",
-                        "ItemId": lib_id.to_string(),
-                        "ItemsScanned": 0,
-                    }),
-                });
-            }));
+            let state = state.clone();
+            let lib = lib.clone();
+            tokio::spawn(ticket.wait_end_then(move || send_scan_completed(&state, &lib, 0)));
         }
         // Otherwise this request drops its ticket here, and does not wait for the run.
         return Ok(Json(json!({ "items_scanned": 0 })));
     }
 
+    let count = run_claimed_scan(&state, &lib, &ticket).await?;
+
+    // Completed goes out once the scan has ended, which is after its probes. The registry sends it
+    // before the run's waiters wake, so a Scan all waiting on this run completes after it.
+    let state_end = state.clone();
+    let lib_end = lib.clone();
+    tokio::spawn(ticket.wait_end_then(move || send_scan_completed(&state_end, &lib_end, count)));
+    Ok(Json(json!({ "items_scanned": count })))
+}
+
+/// Sends the Completed event for a library scan that has ended, with its item count (0 when the
+/// scan failed). The caller sends it once the run ends, after `ticket.wait_end`.
+pub(crate) fn send_scan_completed(state: &AppState, lib: &Library, count: u32) {
+    // A send fails only when no socket is listening, which is fine.
+    let _ = state.ws_broadcast.send(WsEvent::ScheduledTaskCompleted {
+        data: json!({
+            "Name": format!("Library scan: {}", lib.name),
+            "State": "Completed",
+            "ItemId": lib.id.to_string(),
+            "ItemsScanned": count,
+        }),
+    });
+}
+
+/// Runs a library scan that the caller has claimed on `ticket` (B119 shares it with the wizard's
+/// import job): the Started event, the scan with the server's metadata keys, the cache clears and
+/// LibraryChanged. The caller sends Completed once the run ends, as the Refresh route does. Returns
+/// the scan's item count; a failed scan sends no LibraryChanged.
+pub(crate) async fn run_claimed_scan(
+    state: &AppState,
+    lib: &Library,
+    ticket: &ScanTicket,
+) -> Result<u32, ApiError> {
     // Broadcast scan started event
     broadcast_event(
-        &state,
+        state,
         WsEvent::ScheduledTaskStarted {
             data: json!({
                 "Name": format!("Library scan: {}", lib.name),
@@ -296,12 +319,12 @@ async fn scan_library(
 
     let count = rustyfin_core::scanner::scan_library_with_metadata(
         &state.db,
-        &lib,
+        lib,
         &state.http_client,
         tmdb.as_ref(),
         omdb_key.as_deref(),
         fanart_key.as_deref(),
-        &ticket,
+        ticket,
     )
     .await
     .map_err(|e| ApiError::Internal(e.to_string()))?;
@@ -310,7 +333,7 @@ async fn scan_library(
     state.cache.invalidate_on_scan();
     state.image_cache.invalidate_all();
     broadcast_event(
-        &state,
+        state,
         WsEvent::LibraryChanged {
             data: json!({
                 "LibraryId": lib.id.to_string(),
@@ -319,24 +342,7 @@ async fn scan_library(
         },
     )
     .await;
-
-    // Completed goes out once the scan has ended, which is after its probes. The registry sends it
-    // before the run's waiters wake, so a Scan all waiting on this run completes after it.
-    let ws_broadcast = state.ws_broadcast.clone();
-    let lib_name = lib.name.clone();
-    let lib_id = lib.id;
-    tokio::spawn(ticket.wait_end_then(move || {
-        // A send fails only when no socket is listening, which is fine.
-        let _ = ws_broadcast.send(WsEvent::ScheduledTaskCompleted {
-            data: json!({
-                "Name": format!("Library scan: {}", lib_name),
-                "State": "Completed",
-                "ItemId": lib_id.to_string(),
-                "ItemsScanned": count,
-            }),
-        });
-    }));
-    Ok(Json(json!({ "items_scanned": count })))
+    Ok(count)
 }
 
 async fn refresh_all(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {

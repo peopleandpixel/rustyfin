@@ -7,6 +7,7 @@ pub mod merge;
 pub mod metadata;
 pub mod paths;
 pub mod plan;
+pub mod setup;
 pub mod source;
 pub mod tracks;
 
@@ -17,7 +18,7 @@ use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
-pub use job::{ImportJob, ImportStage, ImportStatus, JobHandle, JobState};
+pub use job::{ImportJob, ImportStage, ImportStatus, JobHandle, JobState, PreviewGuard};
 pub use metadata::{MetadataMode, MetadataReport};
 use paths::PathMapping;
 use rustyfin_auth::{generate_setup_code, hash_setup_code, unusable_password_hash};
@@ -49,7 +50,7 @@ pub enum ImportError {
 }
 
 /// The layout a request asks for (spec 2.2).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LayoutChoice {
     #[default]
     Auto,
@@ -65,7 +66,7 @@ pub enum Layout {
 }
 
 /// An import request (spec 2.17). Unknown fields are ignored.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct ImportRequest {
     pub source_path: String,
@@ -89,7 +90,7 @@ pub struct ImportRequest {
 }
 
 /// A pairing the admin confirmed: the Jellyfin user and the existing account it goes into.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct ConfirmedMatch {
     pub jellyfin_id: Uuid,

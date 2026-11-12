@@ -262,6 +262,9 @@ async fn main() {
         task_scheduler.start(shutdown_rx);
     }
 
+    // A wizard import queued before a restart resumes here; the job runs in its own task (B119).
+    rustyfin_api::wizard_import::resume(&state).await;
+
     // Background task: once after an update, dates the items older versions stored by their files
     {
         let state = state.clone();

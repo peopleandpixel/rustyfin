@@ -148,11 +148,12 @@ const API = {
         return res.json();
     },
 
-    async post(path, body) {
+    async post(path, body, init = {}) {
         const res = await fetch(this.base + path, {
             method: 'POST',
             headers: this.headers(),
-            body: body ? JSON.stringify(body) : undefined
+            body: body ? JSON.stringify(body) : undefined,
+            ...init
         });
         if (!res.ok) {
             if (res.status === 403 && this.isAdmin) this.recheckAdmin();
@@ -342,6 +343,7 @@ const API = {
     getStartupUser() { return this.get('/Startup/User'); },
     createStartupUser(name, password) { return this.post('/Startup/User', { Name: name, Password: password }); },
     completeStartup() { return this.post('/Startup/Complete'); },
+    setupJellyfinPreview(sourcePath) { return this.post('/Startup/JellyfinImport/Preview', { SourcePath: sourcePath }); },
 
     // Libraries
     getLibraries() {
@@ -424,8 +426,9 @@ const API = {
     reportProgress(itemId, positionTicks, isPaused = false, fields = {}) {
         return this.post('/Sessions/Playing/Progress', { ItemId: itemId, PositionTicks: positionTicks, IsPaused: isPaused, ...fields });
     },
+    // keepalive lets the report outlive the page (it is sent on pagehide)
     reportStopped(itemId, positionTicks, fields = {}) {
-        return this.post('/Sessions/Playing/Stopped', { ItemId: itemId, PositionTicks: positionTicks, ...fields });
+        return this.post('/Sessions/Playing/Stopped', { ItemId: itemId, PositionTicks: positionTicks, ...fields }, { keepalive: true });
     },
     markPlayed(itemId) { return this.post(`/Users/${this.userId}/PlayedItems/${itemId}`); },
     markUnplayed(itemId) { return this.del(`/Users/${this.userId}/PlayedItems/${itemId}`); },
@@ -543,6 +546,7 @@ const API = {
     // Jellyfin import (B20)
     jellyfinImportPreview(req) { return this.post('/JellyfinImport/Preview', req); },
     jellyfinImportRun(req) { return this.post('/JellyfinImport/Run', req); },
+    queueJellyfinImport(req) { return this.post('/JellyfinImport/Queue', req); },
     jellyfinImportStatus() { return this.get('/JellyfinImport/Status'); },
     jellyfinImportPendingUsers() { return this.get('/JellyfinImport/PendingUsers'); },
     jellyfinImportNewCode(userId) { return this.post('/JellyfinImport/Users/' + encodeURIComponent(userId) + '/SetupCode'); }
