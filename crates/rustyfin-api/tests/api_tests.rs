@@ -91,6 +91,7 @@ async fn test_state() -> AppState {
         ),
         oidc: rustyfin_api::oidc::OidcState::new(),
         jellyfin_import: Default::default(),
+        directory_listings: Default::default(),
     }
 }
 
@@ -2550,6 +2551,301 @@ fn b124_every_wizard_step_has_one_primary_button() {
 #[test]
 fn b124_wizard_next_runs_once() {
     b124_node_test("b124_wizard_next.mjs");
+}
+
+// B121: path browse
+
+/// `GET /Environment/DirectoryContents` with `path` and extra query text such as `&prefix=me`.
+/// Like Jellyfin's client it asks for folders (`includeDirectories=true`) unless `extra` names that flag.
+async fn b121_contents(
+    app: &axum::Router,
+    token: Option<&str>,
+    path: &str,
+    extra: &str,
+) -> (StatusCode, serde_json::Value) {
+    let path: String = url::form_urlencoded::byte_serialize(path.as_bytes()).collect();
+    let folders = if extra.contains("includeDirectories") {
+        ""
+    } else {
+        "&includeDirectories=true"
+    };
+    let uri = format!("/Environment/DirectoryContents?path={path}{folders}{extra}");
+    send(app, request("GET", &uri, token, None)).await
+}
+
+/// `GET /Environment/ParentPath` for `path`; returns the status and the body as text.
+async fn b121_parent(app: &axum::Router, token: Option<&str>, path: &str) -> (StatusCode, String) {
+    let path: String = url::form_urlencoded::byte_serialize(path.as_bytes()).collect();
+    let uri = format!("/Environment/ParentPath?path={path}");
+    g1_send_raw(app, request("GET", &uri, token, None)).await
+}
+
+/// The `Name` of each entry in a DirectoryContents answer.
+fn b121_names(body: &serde_json::Value) -> Vec<String> {
+    body.as_array()
+        .unwrap_or_else(|| panic!("an array: {body}"))
+        .iter()
+        .map(|e| e["Name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn b121_directory_contents_lists_folders_sorted() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let root = media_folder(&state, "b121 root");
+    for name in ["beta", "Alpha", "gamma", ".hidden", ".config"] {
+        media_folder(&state, &format!("b121 root/{name}"));
+    }
+    media_file(&state, "b121 root/movie.mkv");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(format!("{root}/gamma"), format!("{root}/linked")).unwrap();
+
+    // Jellyfin's defaults: no folders and no files unless asked.
+    let enc: String = url::form_urlencoded::byte_serialize(root.as_bytes()).collect();
+    let uri = format!("/Environment/DirectoryContents?path={enc}");
+    let (status, body) = send(&app, request("GET", &uri, None, None)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, serde_json::json!([]), "a bare call lists nothing");
+
+    let (status, body) = b121_contents(&app, None, &root, "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(b121_names(&body), ["Alpha", "beta", "gamma", "linked"]);
+    assert_eq!(
+        body[0],
+        serde_json::json!({ "Name": "Alpha", "Path": format!("{root}/Alpha"), "Type": "Directory" })
+    );
+
+    // Jellyfin's client sends both flags; files are names only.
+    let (status, body) = b121_contents(
+        &app,
+        None,
+        &root,
+        "&includeFiles=true&includeDirectories=true",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        b121_names(&body),
+        ["Alpha", "beta", "gamma", "linked", "movie.mkv"]
+    );
+    assert_eq!(body[4]["Type"], "File");
+    assert_eq!(body[4]["Path"], format!("{root}/movie.mkv"));
+    let (_, body) = b121_contents(
+        &app,
+        None,
+        &root,
+        "&includeFiles=true&includeDirectories=false",
+    )
+    .await;
+    assert_eq!(b121_names(&body), ["movie.mkv"]);
+
+    // A trailing slash, `//`, `.` and `..` list the same folder with clean paths.
+    for path in [
+        format!("{root}/"),
+        format!("{root}//"),
+        format!("{root}/./gamma/.."),
+        format!("{root}/beta/../"),
+    ] {
+        let (status, body) = b121_contents(&app, None, &path, "").await;
+        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+        assert_eq!(body[0]["Path"], format!("{root}/Alpha"), "{path}");
+        assert_eq!(b121_names(&body).len(), 4, "{path}");
+    }
+}
+
+/// Names that aren't UTF-8 are left out, not returned garbled.
+#[cfg(unix)]
+#[tokio::test]
+async fn b121_directory_contents_skips_non_utf8_names() {
+    use std::os::unix::ffi::OsStrExt;
+    let state = test_state().await;
+    let app = app(state.clone());
+    let root = media_folder(&state, "b121 bytes");
+    media_folder(&state, "b121 bytes/plain");
+    let odd = std::path::Path::new(&root).join(std::ffi::OsStr::from_bytes(b"caf\xe9"));
+    if std::fs::create_dir(&odd).is_err() {
+        eprintln!("skipped: this file system refuses non-UTF-8 names");
+        return;
+    }
+    let (status, body) = b121_contents(&app, None, &root, "&includeFiles=true").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(b121_names(&body), ["plain"]);
+}
+
+/// Over the cap on concurrent listings, a call answers 503 at once; with a permit free it lists again.
+#[tokio::test]
+async fn b121_directory_contents_busy_answers_503() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let root = media_folder(&state, "b121 busy");
+    media_folder(&state, "b121 busy/inside");
+    let held = state
+        .directory_listings
+        .0
+        .clone()
+        .try_acquire_many_owned(rustyfin_api::state::DirectoryListings::MAX as u32)
+        .expect("all listing permits");
+    let started = std::time::Instant::now();
+    let (status, body) = b121_contents(&app, None, &root, "").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "503 comes at once, not after a wait"
+    );
+    drop(held);
+    let (status, body) = b121_contents(&app, None, &root, "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(b121_names(&body), ["inside"]);
+}
+
+#[tokio::test]
+async fn b121_directory_contents_prefix_and_hidden() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let root = media_folder(&state, "b121 prefix");
+    for name in ["media", "Music", "movies", ".hidden", ".hold", "other"] {
+        media_folder(&state, &format!("b121 prefix/{name}"));
+    }
+    let (status, body) = b121_contents(&app, None, &root, "&prefix=m").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(b121_names(&body), ["media", "movies", "Music"]);
+    let (_, body) = b121_contents(&app, None, &root, "&prefix=MU").await;
+    assert_eq!(b121_names(&body), ["Music"]);
+    let (_, body) = b121_contents(&app, None, &root, "&prefix=.").await;
+    assert_eq!(b121_names(&body), [".hidden", ".hold"]);
+    let (_, body) = b121_contents(&app, None, &root, "&prefix=.hi").await;
+    assert_eq!(b121_names(&body), [".hidden"]);
+    let (_, body) = b121_contents(&app, None, &root, "&prefix=zz").await;
+    assert_eq!(b121_names(&body), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn b121_directory_contents_caps_at_1000() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let root = media_folder(&state, "b121 many");
+    for i in 0..1500 {
+        std::fs::create_dir(format!("{root}/d{i:04}")).unwrap();
+    }
+    let (status, body) = b121_contents(&app, None, &root, "").await;
+    assert_eq!(status, StatusCode::OK);
+    let names = b121_names(&body);
+    assert_eq!(names.len(), 1000, "the cap");
+    assert_eq!(names.first().unwrap(), "d0000");
+    assert_eq!(names.last().unwrap(), "d0999");
+    // The prefix filters before the cap, so a match past the first 1,000 is found.
+    let (_, body) = b121_contents(&app, None, &root, "&prefix=d149").await;
+    assert_eq!(b121_names(&body).len(), 10);
+}
+
+#[tokio::test]
+async fn b121_directory_contents_errors() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let missing = state.data_dir.join("media").join("b121 missing");
+    let missing = missing.to_str().unwrap().to_string();
+    let file = media_file(&state, "b121 file.mkv");
+    let cases = [
+        (
+            missing.clone(),
+            StatusCode::NOT_FOUND,
+            format!("The folder \"{missing}\" was not found on the server."),
+        ),
+        (
+            file.clone(),
+            StatusCode::NOT_FOUND,
+            format!("The path \"{file}\" on the server is not a folder."),
+        ),
+        (
+            "media".to_string(),
+            StatusCode::BAD_REQUEST,
+            "The folder \"media\" is not a full path on the server.".to_string(),
+        ),
+        (
+            String::new(),
+            StatusCode::BAD_REQUEST,
+            "The folder \"\" is not a full path on the server.".to_string(),
+        ),
+    ];
+    for (path, expected, detail) in cases {
+        let (status, body) = b121_contents(&app, None, &path, "").await;
+        assert_eq!(status, expected, "contents {path:?}: {body}");
+        assert_eq!(body["Detail"], detail.as_str(), "Detail for {path:?}");
+    }
+}
+
+#[tokio::test]
+async fn b121_parent_path() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    for (path, parent) in [
+        ("/mnt/media", "/mnt"),
+        ("/mnt/media/", "/mnt"),
+        ("/mnt", "/"),
+        ("/b121/does not exist", "/b121"),
+    ] {
+        let (status, body) = b121_parent(&app, None, path).await;
+        assert_eq!(status, StatusCode::OK, "parent of {path}");
+        assert_eq!(body, parent, "parent of {path}");
+    }
+    let (status, body) = b121_parent(&app, None, "/").await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "parent of /: {body}");
+    for path in ["mnt/media", ""] {
+        let (status, _) = b121_parent(&app, None, path).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "parent of {path:?}");
+    }
+}
+
+#[tokio::test]
+async fn b121_drives_list_root_as_directory() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (status, body) = send(&app, request("GET", "/Environment/Drives", None, None)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body[0]["Path"], "/", "{body}");
+    assert_eq!(body[0]["Name"], "/");
+    assert_eq!(body[0]["Type"], "Directory");
+}
+
+#[tokio::test]
+async fn b121_browse_routes_admin_only_after_owner() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let folder = media_folder(&state, "b121 guarded");
+    media_folder(&state, "b121 guarded/inside");
+    let enc: String = url::form_urlencoded::byte_serialize(folder.as_bytes()).collect();
+    // Open while no user exists.
+    let (status, body) = b121_contents(&app, None, &folder, "").await;
+    assert_eq!(status, StatusCode::OK, "before the owner: {body}");
+    assert_eq!(b121_names(&body), ["inside"]);
+    let (status, _) = b121_parent(&app, None, &folder).await;
+    assert_eq!(status, StatusCode::OK, "parent before the owner");
+
+    let (owner, _, viewer, _) = g1_owner_and_viewer(&state, &app).await;
+    let routes = [
+        (
+            "GET",
+            format!("/Environment/DirectoryContents?path={enc}"),
+            None,
+            true,
+        ),
+        (
+            "GET",
+            format!("/Environment/ParentPath?path={enc}"),
+            None,
+            true,
+        ),
+        ("GET", "/Environment/Drives".to_string(), None, true),
+    ];
+    g1_check_admin_routes(&app, &routes, &owner, &viewer).await;
+    // The guard comes before the disk: a missing path is 401 anonymous, not 404.
+    let missing = state.data_dir.join("media").join("b121 gone");
+    let (status, _) = b121_contents(&app, None, missing.to_str().unwrap(), "").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, body) = b121_contents(&app, Some(&owner), &folder, "").await;
+    assert_eq!(status, StatusCode::OK, "owner: {body}");
+    assert_eq!(b121_names(&body), ["inside"]);
 }
 
 #[tokio::test]

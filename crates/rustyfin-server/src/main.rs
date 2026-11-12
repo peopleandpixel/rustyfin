@@ -454,6 +454,7 @@ async fn main() {
         tmdb,
         oidc: rustyfin_api::oidc::OidcState::new(),
         jellyfin_import: Default::default(),
+        directory_listings: Default::default(),
     };
 
     // A scheduled library scan clears the same caches as a scan from the API or the monitor.
