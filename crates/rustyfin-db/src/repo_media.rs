@@ -2158,6 +2158,7 @@ impl From<MediaItemRow> for MediaItem {
             series_name: None,
             series_id: None,
             season_name: None,
+            season_id: None,
             status: r.status,
             custom_rating: None,
             critic_rating: None,

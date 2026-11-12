@@ -21570,6 +21570,112 @@ async fn g1c_next_up_accepts_both_casings() {
     }
 }
 
+/// B111: a show's season and episode lists carry the UserData of the user they are asked for, in
+/// either query casing, and a non-admin asking for another user gets 403, as Next Up does.
+#[tokio::test]
+async fn g1c_show_lists_accept_both_casings() {
+    let state = test_state().await;
+    let _dir = G1cDataDir(state.data_dir.to_path_buf());
+    let app = app(state.clone());
+    let (owner, owner_id, viewer, viewer_id) = g1_owner_and_viewer(&state, &app).await;
+    let (series, [e1, _, _]) = g1f_insert_show(&state).await;
+    let season = b93_season_of(&state, e1).await;
+    let owner_uuid: uuid::Uuid = owner_id.parse().unwrap();
+    rustyfin_db::repo_playback::mark_played(&state.db, owner_uuid, e1)
+        .await
+        .unwrap();
+    rustyfin_db::repo_playback::set_favorite(&state.db, owner_uuid, season, true)
+        .await
+        .unwrap();
+    let (owner, viewer) = (owner.as_str(), viewer.as_str());
+    let seasons = format!("/Shows/{series}/Seasons");
+    let episodes = format!("/Shows/{series}/Episodes");
+    // (path, token, camelCase query, status, whether the owner's mark shows). The owner has
+    // favourited the season and played E1; the viewer has neither, and items without stored user
+    // data carry no UserData.
+    let cases = [
+        (&seasons, owner, String::new(), StatusCode::OK, true),
+        (&seasons, viewer, String::new(), StatusCode::OK, false),
+        (
+            &seasons,
+            viewer,
+            format!("userId={owner_id}"),
+            StatusCode::FORBIDDEN,
+            false,
+        ),
+        (
+            &seasons,
+            owner,
+            format!("userId={viewer_id}"),
+            StatusCode::OK,
+            false,
+        ),
+        (
+            &seasons,
+            "test-api-key",
+            format!("userId={owner_id}"),
+            StatusCode::OK,
+            true,
+        ),
+        (&episodes, owner, String::new(), StatusCode::OK, true),
+        (&episodes, viewer, String::new(), StatusCode::OK, false),
+        (
+            &episodes,
+            viewer,
+            format!("userId={owner_id}"),
+            StatusCode::FORBIDDEN,
+            false,
+        ),
+        (
+            &episodes,
+            owner,
+            format!("userId={viewer_id}"),
+            StatusCode::OK,
+            false,
+        ),
+        (
+            &episodes,
+            "test-api-key",
+            format!("userId={owner_id}"),
+            StatusCode::OK,
+            true,
+        ),
+        (
+            &episodes,
+            "test-api-key",
+            format!("userId={owner_id}&seasonId={season}&startIndex=0&limit=1"),
+            StatusCode::OK,
+            true,
+        ),
+    ];
+    for (path, token, query, status, marked) in cases {
+        for query in [query.clone(), g1c_pascal(&query)] {
+            let uri = format!("{path}?{query}");
+            let (got, body) = send(&app, request("GET", &uri, Some(token), None)).await;
+            assert_eq!(got, status, "{uri}");
+            if status != StatusCode::OK {
+                continue;
+            }
+            let items = body["Items"].as_array().cloned().unwrap_or_default();
+            let (id, field) = if path == &seasons {
+                (season, "IsFavorite")
+            } else {
+                (e1, "Played")
+            };
+            let item = b93_entry(&body, id, &uri);
+            assert_eq!(
+                item["UserData"][field].as_bool() == Some(true),
+                marked,
+                "{uri}: {field} in {}",
+                item["UserData"]
+            );
+            if query.contains("imit=1") {
+                assert_eq!(items.len(), 1, "{uri}: limit");
+            }
+        }
+    }
+}
+
 // ── B29: item details per user ──
 // GET /Items/{id} caches only what every user sees and adds the requester's watch data to each
 // answer, so no user gets another's UserData or CompletionPercentage, a change shows on the next
@@ -27961,6 +28067,127 @@ async fn b20_import_creates_unmatched_users_as_before() {
         let alpha = b20_item(&w.state, "Alpha").await;
         let alices = b20_data(&w.state, w.alice, alpha).await;
         assert_eq!(alices.is_some(), confirmed, "{confirmed}: {report}");
+    }
+}
+
+// B111: episode parents
+// An episode names its series and its season so a client can link back to both, as Jellyfin's
+// DtoService.AttachBasicFields sets SeriesId, SeriesName, SeasonId and SeasonName on episodes and
+// SeriesId and SeriesName on seasons. Both the single-item path and the list path must say so.
+
+/// Asserts that `item` names the G1f show's series and its season 1, with episode number `index`.
+fn b111_assert_parents(
+    item: &serde_json::Value,
+    series: uuid::Uuid,
+    season: uuid::Uuid,
+    index: i64,
+    what: &str,
+) {
+    assert_eq!(
+        item["SeriesId"].as_str(),
+        Some(series.to_string().as_str()),
+        "{what}: SeriesId in {item}"
+    );
+    assert_eq!(
+        item["SeriesName"].as_str(),
+        Some("G1 Show"),
+        "{what}: SeriesName"
+    );
+    assert_eq!(
+        item["SeasonId"].as_str(),
+        Some(season.to_string().as_str()),
+        "{what}: SeasonId in {item}"
+    );
+    assert_eq!(
+        item["SeasonName"].as_str(),
+        Some("Season 1"),
+        "{what}: SeasonName"
+    );
+    assert_eq!(
+        item["ParentIndexNumber"].as_i64(),
+        Some(1),
+        "{what}: ParentIndexNumber"
+    );
+    assert_eq!(
+        item["IndexNumber"].as_i64(),
+        Some(index),
+        "{what}: IndexNumber"
+    );
+}
+
+#[tokio::test]
+async fn b111_episode_details_name_series_and_season() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, user) = admin_session(&state).await;
+    let (series, episodes) = g1f_insert_show(&state).await;
+    let season = b93_season_of(&state, episodes[0]).await;
+    for (i, episode) in episodes.iter().enumerate() {
+        let uri = format!("/Items/{episode}?userId={user}");
+        let (status, body) = send(&app, request("GET", &uri, Some(&token), None)).await;
+        assert_eq!(status, StatusCode::OK, "GET {uri}");
+        b111_assert_parents(&body, series, season, i as i64 + 1, &uri);
+    }
+}
+
+#[tokio::test]
+async fn b111_episode_lists_name_series_and_season() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, user) = admin_session(&state).await;
+    let (series, episodes) = g1f_insert_show(&state).await;
+    let season = b93_season_of(&state, episodes[0]).await;
+    for uri in [
+        format!("/Items?ParentId={season}&userId={user}"),
+        format!("/Items?ParentId={series}&Recursive=true&IncludeItemTypes=Episode&userId={user}"),
+        format!("/Shows/{series}/Episodes?userId={user}"),
+        format!("/Shows/{series}/Episodes?seasonId={season}&userId={user}"),
+    ] {
+        let (status, body) = send(&app, request("GET", &uri, Some(&token), None)).await;
+        assert_eq!(status, StatusCode::OK, "GET {uri}");
+        for (i, episode) in episodes.iter().enumerate() {
+            let item = b93_entry(&body, *episode, &uri);
+            b111_assert_parents(&item, series, season, i as i64 + 1, &uri);
+        }
+    }
+}
+
+#[tokio::test]
+async fn b111_season_names_its_series() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, user) = admin_session(&state).await;
+    let (series, episodes) = g1f_insert_show(&state).await;
+    let season = b93_season_of(&state, episodes[0]).await;
+    let (status, details) = send(
+        &app,
+        request(
+            "GET",
+            &format!("/Items/{season}?userId={user}"),
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let uri = format!("/Shows/{series}/Seasons?userId={user}");
+    let (status, list) = send(&app, request("GET", &uri, Some(&token), None)).await;
+    assert_eq!(status, StatusCode::OK, "GET {uri}");
+    for (what, item) in [
+        ("details", details),
+        ("Seasons", b93_entry(&list, season, &uri)),
+    ] {
+        assert_eq!(
+            item["SeriesId"].as_str(),
+            Some(series.to_string().as_str()),
+            "{what}: SeriesId"
+        );
+        assert_eq!(
+            item["SeriesName"].as_str(),
+            Some("G1 Show"),
+            "{what}: SeriesName"
+        );
+        assert_eq!(item["IndexNumber"].as_i64(), Some(1), "{what}: IndexNumber");
     }
 }
 

@@ -380,6 +380,8 @@
         "episodes_count": "Episoden ({{count}})",
         "episode": "Episode",
         "episode_number": "E{{number}}",
+        "season_number": "Staffel {{number}}",
+        "breadcrumb": "Navigationspfad",
         "no_overview": "Keine Beschreibung vorhanden.",
         "titles": "Titel",
         "similar": "Ähnliche Empfehlungen",

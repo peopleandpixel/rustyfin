@@ -1861,6 +1861,25 @@ async function renderDetail(itemId) {
             </div>`;
         }
 
+        // Breadcrumb above the title: series, then season, then episode number (episodes); series only for seasons.
+        let breadcrumbHtml = '';
+        if (type === 'Episode' || type === 'Season') {
+            const crumbs = [];
+            const crumbLink = (id, text) => `<a href="#detail/${escapeHtml(id)}" class="text-[#00a4dc] hover:text-[#38bdf8] hover:underline transition">${escapeHtml(text)}</a>`;
+            if (item.SeriesId && item.SeriesName) crumbs.push(crumbLink(item.SeriesId, item.SeriesName));
+            if (type === 'Episode') {
+                if (item.SeasonId && (item.SeasonName || item.ParentIndexNumber != null)) {
+                    crumbs.push(crumbLink(item.SeasonId, item.SeasonName || t('detail.season_number', { number: item.ParentIndexNumber })));
+                }
+                if (item.IndexNumber != null) {
+                    crumbs.push(`<span class="text-white/70">${t('detail.episode_number', { number: item.IndexNumber })}</span>`);
+                }
+            }
+            if (crumbs.length > 0) {
+                breadcrumbHtml = `<nav aria-label="${escapeHtml(t('detail.breadcrumb'))}" class="flex flex-wrap items-center gap-x-2 gap-y-1 mb-2 text-sm sm:text-base font-semibold min-w-0 break-words">${crumbs.join('<span aria-hidden="true" class="text-white/40">›</span>')}</nav>`;
+            }
+        }
+
         page.innerHTML = `
         <div class="jf-page">
             <!-- Full Hero Backdrop Banner -->
@@ -1882,6 +1901,7 @@ async function renderDetail(itemId) {
                             ${rating ? `<span class="jf-badge jf-badge-rating text-[11px]">★ ${rating.toFixed(1)}</span>` : ''}
                         </div>
 
+                        ${breadcrumbHtml}
                         <h1 class="text-3xl sm:text-4xl lg:text-5xl font-black text-white tracking-tight mb-4 drop-shadow-lg">${escapeHtml(name)}</h1>
 
                         ${genres.length > 0 ? `
