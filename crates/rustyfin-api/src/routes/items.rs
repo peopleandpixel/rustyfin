@@ -320,6 +320,7 @@ async fn enrich_item(
         {
             load_image_tags(pool, &mut season_item).await;
             item.season_name = Some(season_item.name.clone());
+            item.season_id = Some(season_item.id);
 
             // Fill parent image tags from Season (reuses the already-loaded season_item)
             if let Some(tag) = season_item
@@ -991,9 +992,8 @@ pub(crate) async fn enrich_items(
             // Series info from grandparent
             if let Some(parent_id) = item.parent_id {
                 if let Some(season_item) = parent_map.get(&parent_id.to_string()) {
-                    item.series_name = Some(season_item.name.clone());
-                    item.series_id = season_item.parent_id;
                     item.season_name = Some(season_item.name.clone());
+                    item.season_id = Some(season_item.id);
                     if let Some(series_id) = season_item.parent_id
                         && let Some(series_item) = parent_map.get(&series_id.to_string())
                     {
@@ -1011,6 +1011,8 @@ pub(crate) async fn enrich_items(
                         {
                             item.series_thumb_image_tag = Some(tag.clone());
                         }
+                    } else if let Some(series_id) = season_item.parent_id {
+                        item.series_id = Some(series_id);
                     }
                 }
                 // Parent image tags from Season
