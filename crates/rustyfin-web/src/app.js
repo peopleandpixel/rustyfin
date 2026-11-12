@@ -312,6 +312,7 @@ async function wizNext() {
 }
 
 async function wizPrev() {
+    if (wizFinishing) return;
     if (await wizLeaveIfDone()) return;
     wizSetStep(Math.max(wizStep - 1, 0));
 }
@@ -327,6 +328,7 @@ async function wizComplete() {
     if (wizFinishing) return;
     wizFinishing = true;
     const btn = $('wiz-finish-btn');
+    const back = document.querySelector('#wiz-step-' + wizStep + ' [onclick="wizPrev()"]');
     const showFinishError = (message) => {
         const el = $('wiz-finish-error');
         el.textContent = message;
@@ -335,6 +337,7 @@ async function wizComplete() {
     };
     try {
         btn.disabled = true;
+        if (back) back.disabled = true;
         hide('wiz-finish-error');
         if (await wizLeaveIfDone(true)) return;
         if (!wizProgress.configSaved) {
@@ -395,9 +398,8 @@ async function wizComplete() {
             try {
                 const lib = await API.createLibrary(want.name, want.type, [want.path]);
                 wizLibrary = { id: lib.Id || lib.id, ...want };
-                // Scan it now, as the Add Library dialog does; the scheduler would not scan it for hours.
+                // Scanned once setup completes (below), so a Back-edit Finish can't replace it mid-scan
                 toast(t('library.created', { name: want.name }));
-                API.scanLibrary(wizLibrary.id).catch(err => toast(t('library.scan_start_failed', { message: err.message }), 'error'));
             } catch (e) {
                 wizSetStep(wizStepIndexOf('wiz-lib-path'));
                 $('wiz-lib-error').textContent = e.message;
@@ -411,6 +413,8 @@ async function wizComplete() {
             showFinishError(t('wizard.complete_failed', { message: e.message }));
             return;
         }
+        // Scan the library now that setup is done: before, a retry could replace it mid-scan
+        if (wizLibrary) API.scanLibrary(wizLibrary.id).catch(err => toast(t('library.scan_start_failed', { message: err.message }), 'error'));
         hide('setup-wizard');
         show('main-navbar');
         updateAuthUI();
@@ -419,6 +423,7 @@ async function wizComplete() {
     } finally {
         wizFinishing = false;
         btn.disabled = false;
+        if (back) back.disabled = false;
     }
 }
 

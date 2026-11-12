@@ -2514,6 +2514,23 @@ fn b124_wizard_focus() {
 }
 
 #[test]
+fn b124_wizard_finish_holds_back_and_scans() {
+    let app_js = b124_web_source("app.js");
+    // Back waits for a running Finish
+    let prev = b124_function(&app_js, "async function wizPrev() {");
+    assert!(prev.contains("wizFinishing"), "wizPrev waits for Finish");
+    // Library scans start once the setup is complete, so a replaced library is never mid-scan
+    let complete = b124_function(&app_js, "async function wizComplete() {");
+    let done = complete
+        .find("await API.completeStartup()")
+        .expect("wizComplete completes the setup");
+    let scan = complete
+        .find("API.scanLibrary(")
+        .expect("wizComplete starts the scans");
+    assert!(done < scan, "the scans start after completeStartup");
+}
+
+#[test]
 fn b124_every_wizard_step_has_one_primary_button() {
     let html = b124_web_source("index.html");
     let mut n = 0;
