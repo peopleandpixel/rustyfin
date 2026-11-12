@@ -2452,6 +2452,89 @@ async fn b118_validate_path_admin_only_after_owner() {
     assert_eq!(status, StatusCode::NO_CONTENT, "owner, folder: {body}");
 }
 
+// B124: wizard Enter. Enter in a wizard field does what the step's primary button does.
+fn b124_web_source(file: &str) -> String {
+    std::fs::read_to_string(format!(
+        "{}/../rustyfin-web/src/{file}",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .unwrap()
+}
+
+// A top-level function of app.js, from its head to its closing brace.
+fn b124_function(app_js: &str, head: &str) -> String {
+    let start = app_js
+        .find(head)
+        .unwrap_or_else(|| panic!("app.js has {head}"));
+    let rest = &app_js[start..];
+    rest[..rest.find("\n}\n").unwrap()].to_string()
+}
+
+// Runs a node test of tests/web/ against app.js. Without node it fails rather than skip:
+// CI's Check job installs nodejs so that these tests run there.
+fn b124_node_test(script: &str) {
+    let dir = env!("CARGO_MANIFEST_DIR");
+    let out = std::process::Command::new("node")
+        .arg(format!("{dir}/tests/web/{script}"))
+        .arg(format!("{dir}/../rustyfin-web/src/app.js"))
+        .output()
+        .unwrap_or_else(|e| panic!("{script} needs node on PATH: {e}"));
+    assert!(
+        out.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn b124_wizard_enter_listener() {
+    b124_node_test("b124_wizard_enter.mjs");
+}
+
+#[test]
+fn b124_wizard_focus() {
+    let app_js = b124_web_source("app.js");
+    let set_step = b124_function(&app_js, "function wizSetStep(");
+    assert!(
+        set_step.contains("wizFocusStep(s)"),
+        "wizSetStep focuses the new step"
+    );
+    let focus = b124_function(&app_js, "function wizFocusStep(s) {");
+    assert!(focus.contains(".focus()"), "wizFocusStep focuses");
+    // The wizard opens with the focus in its step: focus needs the wizard shown first
+    let check = b124_function(&app_js, "async function checkSetupWizard() {");
+    let shown = check
+        .find("show('setup-wizard');")
+        .expect("checkSetupWizard shows the wizard");
+    assert!(
+        check[shown..].contains("wizFocusStep(wizStep)"),
+        "checkSetupWizard focuses the step once the wizard is shown"
+    );
+}
+
+#[test]
+fn b124_every_wizard_step_has_one_primary_button() {
+    let html = b124_web_source("index.html");
+    let mut n = 0;
+    while let Some(start) = html.find(&format!("id=\"wiz-step-{n}\"")) {
+        let rest = &html[start..];
+        let end = rest
+            .find(&format!("id=\"wiz-step-{}\"", n + 1))
+            .or_else(|| rest.find("\n</div>\n"))
+            .unwrap();
+        let primaries = rest[..end].matches("class=\"jf-btn-primary\"").count();
+        assert_eq!(primaries, 1, "wiz-step-{n} has one primary button");
+        n += 1;
+    }
+    assert!(n >= 4, "found {n} wizard steps");
+}
+
+#[test]
+fn b124_wizard_next_runs_once() {
+    b124_node_test("b124_wizard_next.mjs");
+}
+
 #[tokio::test]
 async fn test_create_library_with_no_paths_still_works() {
     let server = server_with_films().await;

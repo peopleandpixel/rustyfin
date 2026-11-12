@@ -9,6 +9,7 @@ let wizCredentials = null;
 let wizFinishing = false;
 let wizLibrary = null; // { id, name, type, path } of the library this page created
 let wizListening = false;
+let wizBusy = false; // true while wizNext runs, so a second Next or Enter is ignored
 let serverVersion = '0.3.0';
 let playerReportInterval = null;
 let playerHideTimeout = null;
@@ -147,6 +148,7 @@ async function checkSetupWizard() {
         if (!done) {
             initWizardLanguage();
             show('setup-wizard');
+            wizFocusStep(wizStep);
             hide('main-navbar');
             if (!wizListening) {
                 // Another tab or device may finish the setup while this page waits
@@ -206,7 +208,35 @@ function wizSetStep(s) {
         const libName = $('wiz-lib-name').value.trim(), libPath = $('wiz-lib-path').value.trim();
         $('wiz-summary-library').textContent = libName && libPath ? `${libName}: ${libPath}` : t('wizard.summary_no_library');
     }
+    wizFocusStep(s);
 }
+
+// Focuses the step's first visible, enabled field, else its primary button (Enter then clicks it).
+function wizFocusStep(s) {
+    const target = [...document.querySelectorAll('#wiz-step-' + s + ' input, #wiz-step-' + s + ' select')]
+        .find(el => el.type !== 'hidden' && !el.disabled && el.offsetParent !== null)
+        || document.querySelector('#wiz-step-' + s + ' .jf-btn-primary');
+    if (target) target.focus();
+}
+
+// Enter in a wizard field clicks the active step's primary button (the wizard has no <form>).
+function wizEnterKey(e) {
+    if (e.key !== 'Enter') return;
+    // A held-down Enter repeats: swallow it in the wizard, so a step's newly focused button isn't pressed
+    if (e.repeat) { if (e.target?.closest?.('#setup-wizard')) e.preventDefault(); return; }
+    if (e.defaultPrevented || e.isComposing || e.keyCode === 229) return;
+    if (e.shiftKey || e.ctrlKey || e.altKey || e.metaKey) return;
+    const el = e.target;
+    if (!el || (el.tagName !== 'INPUT' && el.tagName !== 'SELECT')) return;
+    if (el.tagName === 'INPUT' && ['button', 'submit', 'reset', 'image', 'file'].includes(el.type)) return;
+    const step = el.closest('#setup-wizard .jf-wizard-step.active');
+    if (!step) return;
+    const btn = step.querySelector('.jf-btn-primary');
+    if (!btn) return;
+    e.preventDefault();
+    btn.click();
+}
+document.addEventListener('keydown', wizEnterKey);
 
 // Closes the wizard when the server reports the setup complete and this page did not create the owner
 // (another tab or device finished it, or this page was loaded before). Answers whether it closed.
@@ -226,50 +256,59 @@ async function wizLeaveIfDone(force = false) {
 }
 
 async function wizNext() {
-    if (await wizLeaveIfDone()) return;
-    if (wizStep === wizStepIndexOf('wiz-lib-path')) {
-        const name = $('wiz-lib-name').value.trim(), path = $('wiz-lib-path').value.trim();
-        if (!name && !path) {
-            hide('wiz-lib-error');
-        } else if (!name || !path) {
-            $('wiz-lib-error').textContent = t('wizard.library_incomplete');
-            show('wiz-lib-error');
-            return;
-        } else if (wizProgress.userCreated && !wizProgress.loggedIn) {
-            // The owner exists but this page has no token, so ValidatePath would answer 401.
-            // Skip the check; Finish's library create checks the path anyway.
-            hide('wiz-lib-error');
-        } else {
-            const nextBtn = document.querySelector('#wiz-step-' + wizStep + ' .jf-btn-primary');
-            nextBtn.disabled = true;
-            try {
-                await API.validatePath(path);
+    if (wizBusy) return;
+    wizBusy = true;
+    const primary = document.querySelector('#wiz-step-' + wizStep + ' .jf-btn-primary');
+    if (primary) primary.disabled = true;
+    try {
+        if (await wizLeaveIfDone()) return;
+        if (wizStep === wizStepIndexOf('wiz-lib-path')) {
+            const name = $('wiz-lib-name').value.trim(), path = $('wiz-lib-path').value.trim();
+            if (!name && !path) {
                 hide('wiz-lib-error');
-            } catch (e) {
-                $('wiz-lib-error').textContent = e.message;
+            } else if (!name || !path) {
+                $('wiz-lib-error').textContent = t('wizard.library_incomplete');
                 show('wiz-lib-error');
                 return;
-            } finally {
-                nextBtn.disabled = false;
+            } else if (wizProgress.userCreated && !wizProgress.loggedIn) {
+                // The owner exists but this page has no token, so ValidatePath would answer 401.
+                // Skip the check; Finish's library create checks the path anyway.
+                hide('wiz-lib-error');
+            } else {
+                const nextBtn = document.querySelector('#wiz-step-' + wizStep + ' .jf-btn-primary');
+                nextBtn.disabled = true;
+                try {
+                    await API.validatePath(path);
+                    hide('wiz-lib-error');
+                } catch (e) {
+                    $('wiz-lib-error').textContent = e.message;
+                    show('wiz-lib-error');
+                    return;
+                } finally {
+                    nextBtn.disabled = false;
+                }
             }
         }
-    }
-    if (wizStep === 1) {
-        const pw = $('wiz-password').value, pw2 = $('wiz-password2').value;
-        const user = $('wiz-username').value.trim();
-        if (!user) {
-            $('wiz-user-error').textContent = t('wizard.username_required');
-            show('wiz-user-error');
-            return;
+        if (wizStep === 1) {
+            const pw = $('wiz-password').value, pw2 = $('wiz-password2').value;
+            const user = $('wiz-username').value.trim();
+            if (!user) {
+                $('wiz-user-error').textContent = t('wizard.username_required');
+                show('wiz-user-error');
+                return;
+            }
+            if (pw && pw !== pw2) {
+                $('wiz-user-error').textContent = t('wizard.passwords_mismatch');
+                show('wiz-user-error');
+                return;
+            }
+            hide('wiz-user-error');
         }
-        if (pw && pw !== pw2) {
-            $('wiz-user-error').textContent = t('wizard.passwords_mismatch');
-            show('wiz-user-error');
-            return;
-        }
-        hide('wiz-user-error');
+        wizSetStep(Math.min(wizStep + 1, wizLastStep()));
+    } finally {
+        wizBusy = false;
+        if (primary) primary.disabled = false;
     }
-    wizSetStep(Math.min(wizStep + 1, wizLastStep()));
 }
 
 async function wizPrev() {
