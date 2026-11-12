@@ -289,6 +289,105 @@ async fn main() {
         }
     }
 
+    // Register Trakt plugin (disabled by default)
+    {
+        let trakt_plugin = plugin_trakt::TraktPlugin::default();
+        register_builtin_plugin(&trakt_plugin, &plugin_manager_with_db).await;
+        if let Err(e) =
+            plugin_trakt::register_trakt_provider(&trakt_plugin, &plugin_manager_with_db).await
+        {
+            tracing::debug!("Trakt plugin not registered as provider (no API key): {}", e);
+        }
+    }
+
+    // Register TheTVDB plugin (disabled by default)
+    {
+        let tvdb_plugin = plugin_tvdb::TvdbPlugin::default();
+        register_builtin_plugin(&tvdb_plugin, &plugin_manager_with_db).await;
+        if let Err(e) =
+            plugin_tvdb::register_tvdb_provider(&tvdb_plugin, &plugin_manager_with_db).await
+        {
+            tracing::debug!("TheTVDB plugin not registered as provider (no API key): {}", e);
+        }
+    }
+
+    // Register Local NFO plugin (disabled by default)
+    {
+        let local_nfo_plugin = plugin_local_nfo::LocalNfoPlugin::default();
+        register_builtin_plugin(&local_nfo_plugin, &plugin_manager_with_db).await;
+        if let Err(e) =
+            plugin_local_nfo::register_local_nfo_provider(&local_nfo_plugin, &plugin_manager_with_db).await
+        {
+            tracing::debug!("Local NFO plugin not registered as provider: {}", e);
+        }
+    }
+
+    // Register OpenSubtitles plugin (disabled by default)
+    {
+        let opensubtitles_plugin = plugin_opensubtitles::OpenSubtitlesPlugin::default();
+        register_builtin_plugin(&opensubtitles_plugin, &plugin_manager_with_db).await;
+        if let Err(e) =
+            plugin_opensubtitles::register_opensubtitles_provider(&opensubtitles_plugin, &plugin_manager_with_db).await
+        {
+            tracing::debug!("OpenSubtitles plugin not registered as provider: {}", e);
+        }
+    }
+
+    // Register Podnapisi plugin (disabled by default)
+    {
+        let podnapisi_plugin = plugin_podnapisi::PodnapisiPlugin::default();
+        register_builtin_plugin(&podnapisi_plugin, &plugin_manager_with_db).await;
+        if let Err(e) =
+            plugin_podnapisi::register_podnapisi_provider(&podnapisi_plugin, &plugin_manager_with_db).await
+        {
+            tracing::debug!("Podnapisi plugin not registered as provider: {}", e);
+        }
+    }
+
+    // Register MQTT plugin (disabled by default)
+    {
+        let mqtt_plugin = plugin_mqtt::MqttPlugin::default();
+        register_builtin_plugin(&mqtt_plugin, &plugin_manager_with_db).await;
+        if let Err(e) =
+            plugin_mqtt::register_mqtt_provider(&mqtt_plugin, &plugin_manager_with_db).await
+        {
+            tracing::debug!("MQTT plugin not registered as provider: {}", e);
+        }
+    }
+
+    // Register Ntfy plugin (disabled by default)
+    {
+        let ntfy_plugin = plugin_ntfy::NtfyPlugin::default();
+        register_builtin_plugin(&ntfy_plugin, &plugin_manager_with_db).await;
+        if let Err(e) =
+            plugin_ntfy::register_ntfy_provider(&ntfy_plugin, &plugin_manager_with_db).await
+        {
+            tracing::debug!("Ntfy plugin not registered as provider: {}", e);
+        }
+    }
+
+    // Register Pushover plugin (disabled by default)
+    {
+        let pushover_plugin = plugin_pushover::PushoverPlugin::default();
+        register_builtin_plugin(&pushover_plugin, &plugin_manager_with_db).await;
+        if let Err(e) =
+            plugin_pushover::register_pushover_provider(&pushover_plugin, &plugin_manager_with_db).await
+        {
+            tracing::debug!("Pushover plugin not registered as provider: {}", e);
+        }
+    }
+
+    // Register Webhook plugin (disabled by default)
+    {
+        let webhook_plugin = plugin_webhook::WebhookPlugin::default();
+        register_builtin_plugin(&webhook_plugin, &plugin_manager_with_db).await;
+        if let Err(e) =
+            plugin_webhook::register_webhook_provider(&webhook_plugin, &plugin_manager_with_db).await
+        {
+            tracing::debug!("Webhook plugin not registered as provider: {}", e);
+        }
+    }
+
     // Use the DB-backed plugin manager for the app state
     let plugin_manager = plugin_manager_with_db;
 

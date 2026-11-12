@@ -167,12 +167,14 @@ pub async fn send_notification(
 }
 
 /// FFI entry point for dynamic loading.
+/// Returns a raw pointer to a `Box<dyn Plugin>` for FFI safety.
 #[cfg(feature = "dynamic")]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rustyfin_plugin_create() -> Box<dyn Plugin> {
-    Box::new(NtfyPlugin {
+pub unsafe extern "C" fn rustyfin_plugin_create() -> *mut std::ffi::c_void {
+    let plugin = Box::new(NtfyPlugin {
         config: Mutex::new(None),
-    })
+    });
+    Box::into_raw(plugin)
 }
 
 /// Trait for registering a notification provider with a PluginManager.

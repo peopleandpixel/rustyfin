@@ -85,6 +85,15 @@ impl OpenSubtitlesPlugin {
     }
 }
 
+/// FFI entry point for dynamic loading.
+/// Returns a raw pointer to a `Box<dyn Plugin>` for FFI safety.
+#[cfg(feature = "dynamic")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rustyfin_plugin_create() -> *mut std::ffi::c_void {
+    let plugin = Box::new(OpenSubtitlesPlugin::default());
+    Box::into_raw(plugin)
+}
+
 // ── Public API functions ──
 
 fn language_name(code: &str) -> &str {

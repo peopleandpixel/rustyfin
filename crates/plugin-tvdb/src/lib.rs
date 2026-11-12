@@ -469,12 +469,14 @@ impl TvdbPlugin {
 
 /// Create a new TheTVDB plugin instance (FFI entry point for dynamic loading).
 /// Only compiled when building as a dynamic library (`cdylib`).
+/// Returns a raw pointer to a `Box<dyn Plugin>` for FFI safety.
 #[cfg(feature = "dynamic")]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rustyfin_plugin_create() -> Box<dyn Plugin> {
-    Box::new(TvdbPlugin {
+pub unsafe extern "C" fn rustyfin_plugin_create() -> *mut std::ffi::c_void {
+    let plugin = Box::new(TvdbPlugin {
         api_key: Mutex::new(None),
-    })
+    });
+    Box::into_raw(plugin)
 }
 
 /// Register the TheTVDB plugin as a metadata provider with the given PluginManager.

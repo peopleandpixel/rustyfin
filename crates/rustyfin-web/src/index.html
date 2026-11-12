@@ -644,6 +644,54 @@
     </div>
 </dialog>
 
+<!-- Plugin Configuration Modal -->
+<dialog id="plugin-config-modal" class="modal bg-black/70 backdrop-blur-md">
+    <div class="modal-box max-w-lg jf-menu rounded-2xl p-6">
+        <div class="flex items-center justify-between mb-4 border-b border-white/10 pb-3">
+            <h3 class="text-base font-bold text-white flex items-center gap-2">
+                <span class="w-2 h-2 rounded-full bg-[#00a4dc]"></span>
+                <span id="plugin-config-title" data-i18n="admin.plugin_config">Configuration</span>
+            </h3>
+            <button onclick="closePluginConfig()" class="text-white/40 hover:text-white text-xl leading-none">×</button>
+        </div>
+        <div class="space-y-4">
+            <div>
+                <label class="block text-xs font-semibold text-white/70 mb-1.5" data-i18n="admin.plugin_config_json">Configuration (JSON)</label>
+                <textarea id="plugin-config-textarea" class="jf-input w-full min-h-[200px] font-mono text-xs" spellcheck="false"></textarea>
+            </div>
+            <p id="plugin-config-error" role="alert" class="hidden text-xs text-red-400 bg-red-500/10 rounded-lg px-3 py-2"></p>
+            <div class="flex justify-end gap-2 pt-3 border-t border-white/10">
+                <button type="button" onclick="closePluginConfig()" class="jf-btn-ghost text-xs" data-i18n="admin.plugin_cancel">Cancel</button>
+                <button type="button" onclick="savePluginConfig()" class="jf-btn-primary text-xs" data-i18n="admin.plugin_save_config">Save</button>
+            </div>
+        </div>
+    </div>
+    <form method="dialog" class="modal-backdrop"><button data-i18n="common.backdrop_close">close</button></form>
+</dialog>
+
+<!-- Plugin Priority Modal -->
+<dialog id="plugin-priority-modal" class="modal bg-black/70 backdrop-blur-md">
+    <div class="modal-box max-w-md jf-menu rounded-2xl p-6">
+        <div class="flex items-center justify-between mb-4 border-b border-white/10 pb-3">
+            <h3 class="text-base font-bold text-white flex items-center gap-2">
+                <span class="w-2 h-2 rounded-full bg-[#00a4dc]"></span>
+                <span data-i18n="admin.plugin_priority">Priority</span>
+            </h3>
+            <button onclick="closePluginPriority()" class="text-white/40 hover:text-white text-xl leading-none">×</button>
+        </div>
+        <div class="space-y-4">
+            <p class="text-xs text-white/50" data-i18n="admin.plugin_priority_label">Priority (lower = higher priority)</p>
+            <input id="plugin-priority-input" type="number" class="jf-input w-full text-center text-2xl font-mono font-bold" min="0" max="999">
+            <p id="plugin-priority-error" role="alert" class="hidden text-xs text-red-400 bg-red-500/10 rounded-lg px-3 py-2"></p>
+            <div class="flex justify-end gap-2 pt-3 border-t border-white/10">
+                <button type="button" onclick="closePluginPriority()" class="jf-btn-ghost text-xs" data-i18n="admin.plugin_cancel">Cancel</button>
+                <button type="button" onclick="savePluginPriority()" class="jf-btn-primary text-xs" data-i18n="admin.plugin_save_config">Save</button>
+            </div>
+        </div>
+    </div>
+    <form method="dialog" class="modal-backdrop"><button data-i18n="common.backdrop_close">close</button></form>
+</dialog>
+
 <!-- Resume or start over, opened by playWithResumeChoice for a video with a resume point -->
 <dialog id="resume-menu" class="modal bg-black/70 backdrop-blur-md">
     <div class="modal-box max-w-xs jf-menu rounded-2xl p-5">

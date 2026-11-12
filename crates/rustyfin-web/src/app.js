@@ -766,6 +766,8 @@ const clickActions = {
     'oidc-remove-link': el => removeOidcLinkAsAdmin(el),
     'oidc-copy-callback': () => copyOidcCallbackUrl(),
     'oidc-save-settings': () => saveOidcAdminSettings(),
+    'plugin-edit-config': el => openPluginConfig(el.dataset.pluginId),
+    'plugin-edit-priority': el => openPluginPriority(el.dataset.pluginId),
 };
 document.addEventListener('click', e => {
     const el = e.target.closest('[data-action]');
@@ -3266,8 +3268,8 @@ async function renderAdmin(tab) {
         ]);
         const accountById = new Map(accounts.map(a => [oidcAccountKey(a.UserId), a]));
 
-        const tabs = [t('admin.overview'), t('admin.users'), t('admin.libraries'), t('admin.tasks'), t('admin.sessions'), t('admin.activity_log_tab'), t('admin.live_log'), t('oidc.admin_tab'), t('jellyfin_import.tab')];
-        const tabIds = ['admin-overview', 'admin-users', 'admin-libs', 'admin-tasks', 'admin-sessions', 'admin-activity', 'admin-livelog', 'admin-signin', 'admin-import'];
+        const tabs = [t('admin.overview'), t('admin.users'), t('admin.libraries'), t('admin.tasks'), t('admin.plugins'), t('admin.sessions'), t('admin.activity_log_tab'), t('admin.live_log'), t('oidc.admin_tab'), t('jellyfin_import.tab')];
+        const tabIds = ['admin-overview', 'admin-users', 'admin-libs', 'admin-tasks', 'admin-plugins', 'admin-sessions', 'admin-activity', 'admin-livelog', 'admin-signin', 'admin-import'];
 
         page.innerHTML = `
         <div class="max-w-6xl mx-auto jf-page">
@@ -3418,7 +3420,44 @@ async function renderAdmin(tab) {
                 </div>
             </div>
 
-            <!-- Tab 4: Sessions -->
+            <!-- Tab 4: Plugins -->
+            <div id="admin-plugins" class="hidden jf-settings-card">
+                <div class="flex justify-between items-center mb-4">
+                    <h3 class="font-bold text-white text-base">${t('admin.plugin_list')}</h3>
+                </div>
+                ${plugins.length === 0 ? `<p class="text-xs text-white/40">${t('admin.plugin_no_plugins')}</p>` :
+                `<div class="space-y-3">
+                    ${plugins.map(p => {
+                        const statusClass = p.Status === 'Active' ? 'bg-emerald-500/20 text-emerald-400' : p.Status === 'Disabled' ? 'bg-red-500/20 text-red-400' : 'bg-amber-500/20 text-amber-400';
+                        const statusLabel = p.Status === 'Active' ? t('admin.plugin_status_active') : p.Status === 'Disabled' ? t('admin.plugin_status_disabled') : t('admin.plugin_status_malfunctioned');
+                        const typeLabel = p.PluginType === 'MetadataProvider' ? t('admin.plugin_type_metadata') : p.PluginType === 'ImageProvider' ? t('admin.plugin_type_image') : p.PluginType === 'SubtitleProvider' ? t('admin.plugin_type_subtitle') : p.PluginType === 'NotificationProvider' ? t('admin.plugin_type_notification') : p.PluginType === 'AuthenticationProvider' ? t('admin.plugin_type_auth') : p.PluginType === 'Task' ? t('admin.plugin_type_task') : (p.PluginType || '—');
+                        return `
+                    <div class="rounded-xl border border-white/10 bg-white/5 p-4">
+                        <div class="flex items-start justify-between gap-4">
+                            <div class="flex-1 min-w-0">
+                                <div class="flex items-center gap-2 flex-wrap">
+                                    <h4 class="font-bold text-white">${escapeHtml(p.Name)}</h4>
+                                    <span class="px-2 py-0.5 rounded text-[10px] font-semibold ${statusClass}">${escapeHtml(statusLabel)}</span>
+                                    ${p.IsBuiltin ? `<span class="px-2 py-0.5 rounded text-[10px] font-semibold bg-blue-500/20 text-blue-400">${t('admin.plugin_builtin')}</span>` : ''}
+                                </div>
+                                <p class="text-xs text-white/40 mt-1">${escapeHtml(p.Description || '')}</p>
+                                <div class="flex gap-4 mt-2 text-[11px] text-white/30">
+                                    <span>${t('admin.plugin_version')}: ${escapeHtml(p.Version || '—')}</span>
+                                    <span>${t('admin.plugin_type')}: ${escapeHtml(typeLabel)}</span>
+                                    <span>${t('admin.plugin_priority')}: <span class="plugin-priority-display" data-plugin-id="${escapeHtml(p.Id)}">${escapeHtml(String(p.Priority || 100))}</span></span>
+                                </div>
+                            </div>
+                            <div class="flex gap-2 shrink-0">
+                                <button class="jf-btn-ghost !py-1.5 !px-3 text-xs" data-action="plugin-edit-priority" data-plugin-id="${escapeHtml(p.Id)}">${t('admin.plugin_priority')}</button>
+                                <button class="jf-btn-ghost !py-1.5 !px-3 text-xs" data-action="plugin-edit-config" data-plugin-id="${escapeHtml(p.Id)}">${t('admin.plugin_config')}</button>
+                            </div>
+                        </div>
+                    </div>`;
+                    }).join('')}
+                </div>`}
+            </div>
+
+            <!-- Tab 5: Sessions -->
             <div id="admin-sessions" class="hidden jf-settings-card">
                 <h3 class="font-bold text-white text-base mb-4">${t('admin.active_sessions')}</h3>
                 <div class="overflow-x-auto">
@@ -3496,7 +3535,7 @@ function showAdminTab(btn, tabId) {
     });
     btn.className = 'px-4 py-2 rounded-xl text-xs font-semibold whitespace-nowrap transition bg-[#00a4dc] text-white shadow-lg';
 
-    ['admin-overview', 'admin-users', 'admin-libs', 'admin-tasks', 'admin-sessions', 'admin-activity', 'admin-livelog', 'admin-signin', 'admin-import'].forEach(id => {
+    ['admin-overview', 'admin-users', 'admin-libs', 'admin-tasks', 'admin-plugins', 'admin-sessions', 'admin-activity', 'admin-livelog', 'admin-signin', 'admin-import'].forEach(id => {
         const el = $(id);
         if (el) el.classList.toggle('hidden', id !== tabId);
     });
@@ -5053,6 +5092,128 @@ async function setLogLevel(level) {
         toast(t('admin.log_level_set', { level }));
     } catch (e) {
         toast(t('admin.log_level_failed'), 'error');
+    }
+}
+
+// --- Plugin Configuration Modal ---
+let currentPluginConfigId = null;
+let currentPluginConfigOriginal = null;
+let currentPluginPriorityId = null;
+
+async function openPluginConfig(pluginId) {
+    currentPluginConfigId = pluginId;
+    const dlg = $('plugin-config-modal');
+    const err = $('plugin-config-error');
+    if (!dlg) return;
+    hide(err);
+    try {
+        const config = await API.getPluginConfig(pluginId);
+        currentPluginConfigOriginal = JSON.stringify(config, null, 2);
+        $('plugin-config-textarea').value = currentPluginConfigOriginal;
+    } catch {
+        $('plugin-config-textarea').value = '{}';
+        currentPluginConfigOriginal = '{}';
+    }
+    dlg.classList.add('modal-open');
+    if (typeof dlg.showModal === 'function') {
+        try { dlg.showModal(); } catch { dlg.setAttribute('open', ''); }
+    } else {
+        dlg.setAttribute('open', '');
+    }
+}
+
+function closePluginConfig() {
+    const dlg = $('plugin-config-modal');
+    if (dlg) {
+        dlg.classList.remove('modal-open');
+        if (typeof dlg.close === 'function') {
+            try { dlg.close(); } catch { dlg.removeAttribute('open'); }
+        } else {
+            dlg.removeAttribute('open');
+        }
+    }
+    currentPluginConfigId = null;
+    currentPluginConfigOriginal = null;
+}
+
+async function savePluginConfig() {
+    const err = $('plugin-config-error');
+    const textarea = $('plugin-config-textarea');
+    let parsed;
+    try {
+        parsed = JSON.parse(textarea.value);
+    } catch (e) {
+        err.textContent = t('admin.plugin_config_failed', { message: 'Invalid JSON' });
+        show(err);
+        return;
+    }
+    hide(err);
+    try {
+        await API.setPluginConfig(currentPluginConfigId, parsed);
+        toast(t('admin.plugin_config_saved'));
+        closePluginConfig();
+        API.invalidateCache('/Plugins');
+        await renderAdmin();
+        const tab = document.querySelector('[data-action="admin-tab"][data-tab="admin-plugins"]');
+        if (tab) showAdminTab(tab, 'admin-plugins');
+    } catch (e) {
+        err.textContent = t('admin.plugin_config_failed', { message: e.message });
+        show(err);
+    }
+}
+
+// --- Plugin Priority Modal ---
+function openPluginPriority(pluginId) {
+    currentPluginPriorityId = pluginId;
+    const dlg = $('plugin-priority-modal');
+    const err = $('plugin-priority-error');
+    if (!dlg) return;
+    hide(err);
+    // Find the current priority from the plugin list
+    const display = document.querySelector(`.plugin-priority-display[data-plugin-id="${pluginId}"]`);
+    $('plugin-priority-input').value = display ? display.textContent : '100';
+    dlg.classList.add('modal-open');
+    if (typeof dlg.showModal === 'function') {
+        try { dlg.showModal(); } catch { dlg.setAttribute('open', ''); }
+    } else {
+        dlg.setAttribute('open', '');
+    }
+}
+
+function closePluginPriority() {
+    const dlg = $('plugin-priority-modal');
+    if (dlg) {
+        dlg.classList.remove('modal-open');
+        if (typeof dlg.close === 'function') {
+            try { dlg.close(); } catch { dlg.removeAttribute('open'); }
+        } else {
+            dlg.removeAttribute('open');
+        }
+    }
+    currentPluginPriorityId = null;
+}
+
+async function savePluginPriority() {
+    const err = $('plugin-priority-error');
+    const input = $('plugin-priority-input');
+    const priority = parseInt(input.value, 10);
+    if (isNaN(priority) || priority < 0 || priority > 999) {
+        err.textContent = t('admin.plugin_priority_failed', { message: 'Value must be 0–999' });
+        show(err);
+        return;
+    }
+    hide(err);
+    try {
+        await API.setPluginPriority(currentPluginPriorityId, priority);
+        toast(t('admin.plugin_priority_saved'));
+        closePluginPriority();
+        API.invalidateCache('/Plugins');
+        await renderAdmin();
+        const tab = document.querySelector('[data-action="admin-tab"][data-tab="admin-plugins"]');
+        if (tab) showAdminTab(tab, 'admin-plugins');
+    } catch (e) {
+        err.textContent = t('admin.plugin_priority_failed', { message: e.message });
+        show(err);
     }
 }
 

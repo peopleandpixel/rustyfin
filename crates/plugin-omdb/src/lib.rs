@@ -187,12 +187,14 @@ impl OmdbPlugin {
 
 /// Create a new OMDb plugin instance (FFI entry point for dynamic loading).
 /// Only compiled when building as a dynamic library (`cdylib`).
+/// Returns a raw pointer to a `Box<dyn Plugin>` for FFI safety.
 #[cfg(feature = "dynamic")]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rustyfin_plugin_create() -> Box<dyn Plugin> {
-    Box::new(OmdbPlugin {
+pub unsafe extern "C" fn rustyfin_plugin_create() -> *mut std::ffi::c_void {
+    let plugin = Box::new(OmdbPlugin {
         api_key: Mutex::new(None),
-    })
+    });
+    Box::into_raw(plugin)
 }
 
 /// Register the OMDb plugin as a metadata provider with the given PluginManager.

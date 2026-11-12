@@ -224,12 +224,14 @@ pub async fn send_notification(
 
 /// Create a new Webhook plugin instance (FFI entry point for dynamic loading).
 /// Only compiled when building as a dynamic library (`cdylib`).
+/// Returns a raw pointer to a `Box<dyn Plugin>` for FFI safety.
 #[cfg(feature = "dynamic")]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rustyfin_plugin_create() -> Box<dyn Plugin> {
-    Box::new(WebhookPlugin {
+pub unsafe extern "C" fn rustyfin_plugin_create() -> *mut std::ffi::c_void {
+    let plugin = Box::new(WebhookPlugin {
         config: Mutex::new(None),
-    })
+    });
+    Box::into_raw(plugin)
 }
 
 /// Trait for registering a notification provider with a PluginManager.

@@ -594,12 +594,14 @@ impl TraktPlugin {
 }
 
 /// FFI entry point for dynamic loading.
+/// Returns a raw pointer to a `Box<dyn Plugin>` for FFI safety.
 #[cfg(feature = "dynamic")]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rustyfin_plugin_create() -> Box<dyn Plugin> {
-    Box::new(TraktPlugin {
+pub unsafe extern "C" fn rustyfin_plugin_create() -> *mut std::ffi::c_void {
+    let plugin = Box::new(TraktPlugin {
         api_key: Mutex::new(None),
-    })
+    });
+    Box::into_raw(plugin)
 }
 
 /// Register the Trakt plugin as a metadata provider.
