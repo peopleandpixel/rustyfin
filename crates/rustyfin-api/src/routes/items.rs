@@ -53,7 +53,7 @@ async fn populate_media_source_single(
 }
 
 /// Sets a user's watch data on an item, with its CompletionPercentage if the runtime is known.
-fn apply_user_data(item: &mut MediaItem, user_data: rustyfin_model::playback::UserItemDataDto) {
+fn apply_user_data(item: &mut MediaItem, mut user_data: rustyfin_model::playback::UserItemDataDto) {
     if let Some(runtime) = item.runtime_ticks
         && runtime > 0
     {
@@ -65,7 +65,34 @@ fn apply_user_data(item: &mut MediaItem, user_data: rustyfin_model::playback::Us
             item.completion_percentage = Some((pos / run * 100.0).min(100.0));
         }
     }
+    user_data.played_percentage = played_percentage(&user_data, item.runtime_ticks);
     item.user_data = Some(user_data);
+}
+
+/// Jellyfin's PlayedPercentage: 100 * position / runtime, only with a position and a known runtime.
+fn played_percentage(
+    user_data: &rustyfin_model::playback::UserItemDataDto,
+    runtime_ticks: Option<i64>,
+) -> Option<f64> {
+    let runtime = runtime_ticks.filter(|r| *r > 0)?;
+    (user_data.playback_position_ticks > 0)
+        .then(|| 100.0 * user_data.playback_position_ticks as f64 / runtime as f64)
+}
+
+/// Whether an item's watch data counts its episodes (Series and Season).
+fn is_episode_folder(item: &MediaItem) -> bool {
+    matches!(
+        item.media_type,
+        rustyfin_model::media::MediaType::Series | rustyfin_model::media::MediaType::Season
+    )
+}
+
+/// Sets a Series or Season's UnplayedItemCount from its `(episodes, unplayed)` counts, and its
+/// Played from the same counts (overriding the stored flag). Call after `apply_user_data`.
+fn apply_unplayed_counts(item: &mut MediaItem, counts: (i64, i64)) {
+    let data = item.user_data.get_or_insert_with(Default::default);
+    data.unplayed_item_count = Some(counts.1 as i32);
+    data.played = rustyfin_db::repo_playback::folder_played(counts);
 }
 
 /// Set an item's image tags (the first image of each type) and backdrop tags (every backdrop, in
@@ -320,6 +347,7 @@ async fn enrich_item(
         {
             load_image_tags(pool, &mut season_item).await;
             item.season_name = Some(season_item.name.clone());
+            item.season_id = Some(season_item.id);
 
             // Fill parent image tags from Season (reuses the already-loaded season_item)
             if let Some(tag) = season_item
@@ -704,6 +732,21 @@ pub(crate) async fn enrich_items(
         std::collections::HashMap::new()
     };
 
+    // Batch query 3b: unplayed episode counts for the Series and Seasons in the batch
+    let folder_ids: Vec<Uuid> = items
+        .iter()
+        .filter(|item| is_episode_folder(item))
+        .map(|item| item.id)
+        .collect();
+    let unplayed_map = match user_id {
+        Some(uid) if !folder_ids.is_empty() => {
+            rustyfin_db::repo_playback::get_unplayed_counts(pool, uid, &folder_ids)
+                .await
+                .unwrap_or_default()
+        }
+        _ => std::collections::HashMap::new(),
+    };
+
     // Batch query 4: Collect unique parent IDs and fetch them
     let parent_ids: Vec<Uuid> = items
         .iter()
@@ -945,19 +988,25 @@ pub(crate) async fn enrich_items(
         // Etag from date_created
         item.etag = Some(item.date_created.to_rfc3339());
 
-        // CompletionPercentage from user_data batch map
-        if let Some(user_data) = user_data_map.get(&item.id.to_string()) {
-            item.user_data = Some(user_data.clone());
-            if let Some(runtime) = item.runtime_ticks
-                && runtime > 0
-            {
-                let pos = user_data.playback_position_ticks.max(0) as f64;
-                let run = runtime as f64;
-                if user_data.played {
-                    item.completion_percentage = Some(100.0);
-                } else {
-                    item.completion_percentage = Some((pos / run * 100.0).min(100.0));
-                }
+        // CompletionPercentage and PlayedPercentage from user_data batch map. Series, seasons and
+        // episodes always have user data when the user is known (defaults without a row), and a
+        // Series or Season counts its unplayed episodes.
+        let stored = user_data_map.get(&item.id.to_string()).cloned();
+        let folder = is_episode_folder(item);
+        let in_show = folder || item.media_type == rustyfin_model::media::MediaType::Episode;
+        let user_data = match stored {
+            Some(data) => Some(data),
+            None if in_show && user_id.is_some() => Some(Default::default()),
+            None => None,
+        };
+        if let Some(user_data) = user_data {
+            apply_user_data(item, user_data);
+            if folder {
+                let counts = unplayed_map
+                    .get(&item.id.to_string())
+                    .copied()
+                    .unwrap_or((0, 0));
+                apply_unplayed_counts(item, counts);
             }
         }
 
@@ -991,9 +1040,8 @@ pub(crate) async fn enrich_items(
             // Series info from grandparent
             if let Some(parent_id) = item.parent_id {
                 if let Some(season_item) = parent_map.get(&parent_id.to_string()) {
-                    item.series_name = Some(season_item.name.clone());
-                    item.series_id = season_item.parent_id;
                     item.season_name = Some(season_item.name.clone());
+                    item.season_id = Some(season_item.id);
                     if let Some(series_id) = season_item.parent_id
                         && let Some(series_item) = parent_map.get(&series_id.to_string())
                     {
@@ -1011,6 +1059,8 @@ pub(crate) async fn enrich_items(
                         {
                             item.series_thumb_image_tag = Some(tag.clone());
                         }
+                    } else if let Some(series_id) = season_item.parent_id {
+                        item.series_id = Some(series_id);
                     }
                 }
                 // Parent image tags from Season
@@ -1880,10 +1930,20 @@ async fn get_item(
             item
         }
     };
-    if let Ok(user_data) =
-        rustyfin_db::repo_playback::get_user_item_data(&state.db_ro, claims.sub, id).await
-    {
+    let folder = is_episode_folder(&item);
+    let stored = rustyfin_db::repo_playback::get_user_item_data(&state.db_ro, claims.sub, id)
+        .await
+        .ok();
+    if let Some(user_data) = stored.or_else(|| folder.then(Default::default)) {
         apply_user_data(&mut item, user_data);
+        if folder {
+            let counts =
+                rustyfin_db::repo_playback::get_unplayed_counts(&state.db_ro, claims.sub, &[id])
+                    .await
+                    .unwrap_or_default();
+            let key = id.to_string();
+            apply_unplayed_counts(&mut item, counts.get(&key).copied().unwrap_or((0, 0)));
+        }
     }
     Ok(Json(item))
 }

@@ -18,14 +18,15 @@ jobs:
     container: rust:1-trixie
     steps:
       - uses: actions/checkout@v4
-      # ffmpeg as the image installs it, zstd so the Rust cache isn't gzipped, and rustfmt
-      # and clippy, which the image's minimal rustup profile leaves out
-      - name: Install ffmpeg, zstd, rustfmt and clippy
+      # ffmpeg as the image installs it, zstd so the Rust cache isn't gzipped, nodejs for the
+      # web client's logic tests that api_tests runs, and rustfmt and clippy, which the image's
+      # minimal rustup profile leaves out
+      - name: Install ffmpeg, zstd, nodejs, rustfmt and clippy
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends ffmpeg zstd
+          apt-get install -y --no-install-recommends ffmpeg zstd nodejs
           rustup component add rustfmt clippy
       - uses: Swatinem/rust-cache@v2
         with:
@@ -34,7 +35,7 @@ jobs:
       # A test that can't run here skips itself and passes, and libtest hides a passing test's
       # output. Tests that lock a folder skip if they can still read it, as root can;
       # BrowseDirectories lists only roots such as /home; the media tests need ffmpeg and
-      # ffprobe. So cargo runs as ci, with its home in /home/ci, and this step fails unless ci
+      # ffprobe, and the web client tests node. So cargo runs as ci, with its home in /home/ci, and this step fails unless ci
       # meets all of that. runuser lowers the soft limit on open files to 1024 before its PAM
       # session, whose pam_limits then applies ci.conf, so cargo gets 65536 as on a bare runner.
       - name: Add a user that isn't root and check what the tests need
@@ -57,8 +58,9 @@ jobs:
           for tool in ffmpeg ffprobe; do
             "$tool" -version </dev/null >/dev/null || { echo "::error::$tool -version fails, so tests would skip"; exit 1; }
           done
+          node --version </dev/null >/dev/null || { echo "::error::node --version fails, so the web client tests would fail"; exit 1; }
           [ "$(ulimit -n)" -ge 65536 ] || { echo "::error::ci may open only $(ulimit -n) files, not 65536"; exit 1; }
-          echo "ci: HOME $HOME, $(ulimit -n) open files, $(command -v ffmpeg), $(command -v ffprobe)"
+          echo "ci: HOME $HOME, $(ulimit -n) open files, $(command -v ffmpeg), $(command -v ffprobe), node $(node --version)"
           EOF
           rm -r /tmp/locked
       - name: Format check

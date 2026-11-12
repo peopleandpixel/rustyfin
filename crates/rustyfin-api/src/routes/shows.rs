@@ -110,23 +110,40 @@ async fn upcoming(
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[allow(dead_code)]
 struct SeasonsQuery {
-    #[serde(default)]
+    #[serde(default, alias = "UserId")]
     user_id: Option<Uuid>,
 }
 
 async fn get_seasons(
     State(state): State<AppState>,
     Path(series_id): Path<Uuid>,
-    Query(_q): Query<SeasonsQuery>,
+    Query(q): Query<SeasonsQuery>,
+    Extension(claims): Extension<Claims>,
 ) -> Result<Json<QueryResult>, ApiError> {
+    let user_id = query_user(&state, &claims, q.user_id).await?;
     let children = rustyfin_db::repo_media::get_children(&state.db_ro, series_id).await?;
-    let seasons: Vec<MediaItem> = children
+    let mut seasons: Vec<MediaItem> = children
         .into_iter()
         .filter(|c| c.media_type == MediaType::Season)
         .collect();
     let total = seasons.len() as i64;
+
+    let config = state.config.read().await;
+    let tmdb = state.tmdb.api(config.tmdb_api_key.as_deref());
+    enrich_items(
+        &state.db_ro,
+        &state.server_id,
+        user_id,
+        &mut seasons,
+        &state.http_client,
+        tmdb.as_ref(),
+        &state.data_dir,
+        true,
+    )
+    .await;
+    drop(config);
+
     Ok(Json(QueryResult {
         items: seasons,
         total_record_count: total,
@@ -136,17 +153,16 @@ async fn get_seasons(
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[allow(dead_code)]
 struct EpisodesQuery {
-    #[serde(default)]
+    #[serde(default, alias = "SeasonId")]
     season_id: Option<Uuid>,
-    #[serde(default)]
+    #[serde(default, alias = "Season")]
     season: Option<i32>,
-    #[serde(default)]
+    #[serde(default, alias = "UserId")]
     user_id: Option<Uuid>,
-    #[serde(default)]
+    #[serde(default, alias = "StartIndex")]
     start_index: Option<i64>,
-    #[serde(default)]
+    #[serde(default, alias = "Limit")]
     limit: Option<i64>,
 }
 
@@ -154,7 +170,9 @@ async fn get_episodes(
     State(state): State<AppState>,
     Path(series_id): Path<Uuid>,
     Query(q): Query<EpisodesQuery>,
+    Extension(claims): Extension<Claims>,
 ) -> Result<Json<QueryResult>, ApiError> {
+    let user_id = query_user(&state, &claims, q.user_id).await?;
     // Single-query fetch: get all episodes for the series using a subquery
     let episodes = if let Some(season_id) = q.season_id {
         // If season_id is specified, fetch children of that season directly
@@ -172,11 +190,26 @@ async fn get_episodes(
     let start = q.start_index.unwrap_or(0).max(0) as usize;
     let limit = q.limit.unwrap_or(i64::MAX).max(0) as usize;
     let end = start.saturating_add(limit).min(episodes.len());
-    let page: Vec<MediaItem> = if start < episodes.len() {
+    let mut page: Vec<MediaItem> = if start < episodes.len() {
         episodes[start..end].to_vec()
     } else {
         Vec::new()
     };
+
+    let config = state.config.read().await;
+    let tmdb = state.tmdb.api(config.tmdb_api_key.as_deref());
+    enrich_items(
+        &state.db_ro,
+        &state.server_id,
+        user_id,
+        &mut page,
+        &state.http_client,
+        tmdb.as_ref(),
+        &state.data_dir,
+        true,
+    )
+    .await;
+    drop(config);
 
     Ok(Json(QueryResult {
         items: page,

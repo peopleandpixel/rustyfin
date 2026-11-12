@@ -8,3 +8,4 @@ pub mod oidc;
 pub mod query;
 pub mod routes;
 pub mod state;
+pub mod wizard_import;
