@@ -2,7 +2,25 @@ use rustyfin_model::library::{Library, LibraryContentType, LibraryOptions};
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
+/// Creates one library.
 pub async fn create_library(pool: &SqlitePool, lib: &Library) -> Result<(), sqlx::Error> {
+    insert_library(pool, lib).await
+}
+
+/// Creates all of `libs` in one transaction (B119): a failed insert creates none of them.
+pub async fn create_libraries(pool: &SqlitePool, libs: &[Library]) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    for lib in libs {
+        insert_library(&mut *tx, lib).await?;
+    }
+    tx.commit().await
+}
+
+/// The one INSERT both create functions run, on a pool or inside a transaction.
+async fn insert_library<'c, E>(executor: E, lib: &Library) -> Result<(), sqlx::Error>
+where
+    E: sqlx::Executor<'c, Database = sqlx::Sqlite>,
+{
     let id = lib.id.to_string();
     let ct = serde_json::to_string(&lib.content_type).unwrap_or_default();
     let paths = serde_json::to_string(&lib.paths).unwrap_or_default();
@@ -12,7 +30,7 @@ pub async fn create_library(pool: &SqlitePool, lib: &Library) -> Result<(), sqlx
         .bind(&lib.name)
         .bind(&ct)
         .bind(&paths)
-        .execute(pool)
+        .execute(executor)
         .await?;
 
     Ok(())

@@ -342,6 +342,7 @@ const API = {
     getStartupUser() { return this.get('/Startup/User'); },
     createStartupUser(name, password) { return this.post('/Startup/User', { Name: name, Password: password }); },
     completeStartup() { return this.post('/Startup/Complete'); },
+    setupJellyfinPreview(sourcePath) { return this.post('/Startup/JellyfinImport/Preview', { SourcePath: sourcePath }); },
 
     // Libraries
     getLibraries() {
@@ -359,6 +360,7 @@ const API = {
         if (libraryOptions) body.LibraryOptions = libraryOptions;
         return this.post('/Library/VirtualFolders', body);
     },
+    validatePath(path) { return this.post('/Environment/ValidatePath', { Path: path, ValidateWritable: false }); },
     deleteLibrary(id) { return this.del(`/Library/VirtualFolders/${id}`); },
     getLibraryOptions(id) { return this.get(`/Library/${id}/Options`); },
     saveLibraryOptions(id, options) { return this.post(`/Library/${id}/Options`, options); },
@@ -542,6 +544,7 @@ const API = {
     // Jellyfin import (B20)
     jellyfinImportPreview(req) { return this.post('/JellyfinImport/Preview', req); },
     jellyfinImportRun(req) { return this.post('/JellyfinImport/Run', req); },
+    queueJellyfinImport(req) { return this.post('/JellyfinImport/Queue', req); },
     jellyfinImportStatus() { return this.get('/JellyfinImport/Status'); },
     jellyfinImportPendingUsers() { return this.get('/JellyfinImport/PendingUsers'); },
     jellyfinImportNewCode(userId) { return this.post('/JellyfinImport/Users/' + encodeURIComponent(userId) + '/SetupCode'); }

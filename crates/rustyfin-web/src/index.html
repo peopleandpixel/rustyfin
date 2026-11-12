@@ -28,12 +28,17 @@
             <div id="wiz-dot-1" class="h-2 rounded-full transition-all duration-300 w-2 bg-white/20"></div>
             <div id="wiz-dot-2" class="h-2 rounded-full transition-all duration-300 w-2 bg-white/20"></div>
             <div id="wiz-dot-3" class="h-2 rounded-full transition-all duration-300 w-2 bg-white/20"></div>
+            <div id="wiz-dot-4" class="h-2 rounded-full transition-all duration-300 w-2 bg-white/20"></div>
+            <div id="wiz-dot-5" class="h-2 rounded-full transition-all duration-300 w-2 bg-white/20"></div>
+            <div id="wiz-dot-6" class="h-2 rounded-full transition-all duration-300 w-2 bg-white/20"></div>
+            <div id="wiz-dot-7" class="h-2 rounded-full transition-all duration-300 w-2 bg-white/20"></div>
+            <div id="wiz-dot-8" class="h-2 rounded-full transition-all duration-300 w-2 bg-white/20"></div>
         </div>
 
         <!-- Step 0: Language & Region -->
         <div id="wiz-step-0" class="jf-wizard-step active">
             <div class="jf-settings-card !bg-[#1a202c]/60">
-                <h2 class="text-lg font-bold text-white mb-2" data-i18n="wizard.language_title">1. Language & Region</h2>
+                <h2 class="text-lg font-bold text-white mb-2" data-i18n="wizard.language_title">Language & Region</h2>
                 <p class="text-white/60 text-xs mb-5" data-i18n="wizard.language_intro">Choose the language of the interface and the preferred language for descriptions and metadata.</p>
                 <div class="space-y-4">
                     <div>
@@ -70,11 +75,136 @@
             </div>
         </div>
 
-        <!-- Step 1: Admin User -->
+        <!-- Step 1: Import from Jellyfin? (both paths) -->
         <div id="wiz-step-1" class="jf-wizard-step">
             <div class="jf-settings-card !bg-[#1a202c]/60">
-                <h2 class="text-lg font-bold text-white mb-2" data-i18n="wizard.admin_title">2. Administrator Account</h2>
+                <h2 class="text-lg font-bold text-white mb-2" data-i18n="wizard.import_question_title">Import from Jellyfin?</h2>
+                <p class="text-white/60 text-xs mb-5" data-i18n="wizard.import_question_intro">Bring over users, libraries and watch history from an existing Jellyfin server, or start fresh.</p>
+                <div class="space-y-3">
+                    <label class="flex items-center gap-3 p-4 rounded-xl bg-white/5 border border-white/10 cursor-pointer">
+                        <input type="radio" name="wiz-import" value="yes" onchange="wizApplyPath()">
+                        <span class="text-sm text-white" data-i18n="wizard.import_yes">Yes, import from Jellyfin</span>
+                    </label>
+                    <label class="flex items-center gap-3 p-4 rounded-xl bg-white/5 border border-white/10 cursor-pointer">
+                        <input type="radio" name="wiz-import" value="no" onchange="wizApplyPath()">
+                        <span class="text-sm text-white" data-i18n="wizard.import_no">No, start fresh</span>
+                    </label>
+                </div>
+            </div>
+            <div id="wiz-choice-error" class="text-red-400 text-xs mt-2 hidden p-2 rounded bg-red-500/10 border border-red-500/20"></div>
+            <div class="flex justify-between mt-6">
+                <button class="jf-btn-ghost" onclick="wizPrev()" data-i18n="wizard.back">← Back</button>
+                <button class="jf-btn-primary" onclick="wizNext()" data-i18n="wizard.next">Next →</button>
+            </div>
+        </div>
+
+        <!-- Step 2 (import): Jellyfin data folder -->
+        <div id="wiz-step-2" class="jf-wizard-step" data-wiz-path="import">
+            <div class="jf-settings-card !bg-[#1a202c]/60">
+                <h2 class="text-lg font-bold text-white mb-2" data-i18n="wizard.jf_folder_title">Jellyfin data folder</h2>
+                <p class="text-white/60 text-xs mb-5" data-i18n="wizard.jf_folder_intro">Enter the folder that holds data/jellyfin.db. In the official Docker image that is /config.</p>
+                <label for="wiz-jf-path" class="block text-xs font-medium text-white/70 mb-1.5" data-i18n="wizard.folder_path">Folder path</label>
+                <input type="text" id="wiz-jf-path" class="jf-input w-full" placeholder="/config" autocomplete="off">
+            </div>
+            <div id="wiz-jf-error" class="text-red-400 text-xs mt-2 hidden p-2 rounded bg-red-500/10 border border-red-500/20"></div>
+            <div class="flex justify-between mt-6">
+                <button class="jf-btn-ghost" onclick="wizPrev()" data-i18n="wizard.back">← Back</button>
+                <button class="jf-btn-primary" onclick="wizNext()" data-i18n="wizard.next">Next →</button>
+            </div>
+        </div>
+
+        <!-- Step 3 (import): which Jellyfin user are you -->
+        <div id="wiz-step-3" class="jf-wizard-step" data-wiz-path="import">
+            <div class="jf-settings-card !bg-[#1a202c]/60">
+                <h2 class="text-lg font-bold text-white mb-2" data-i18n="wizard.user_title">Which Jellyfin user are you?</h2>
+                <p class="text-white/60 text-xs mb-5" data-i18n="wizard.user_intro">Their watch history goes into your new account.</p>
+                <div id="wiz-jf-users" class="space-y-2"></div>
+            </div>
+            <div id="wiz-user-pick-error" class="text-red-400 text-xs mt-2 hidden p-2 rounded bg-red-500/10 border border-red-500/20"></div>
+            <div class="flex justify-between mt-6">
+                <button class="jf-btn-ghost" onclick="wizPrev()" data-i18n="wizard.back">← Back</button>
+                <button class="jf-btn-primary" onclick="wizNext()" data-i18n="wizard.next">Next →</button>
+            </div>
+        </div>
+
+        <!-- Step 4 (import): libraries -->
+        <div id="wiz-step-4" class="jf-wizard-step" data-wiz-path="import">
+            <div class="jf-settings-card !bg-[#1a202c]/60">
+                <h2 class="text-lg font-bold text-white mb-2" data-i18n="wizard.libs_title">Libraries</h2>
+                <p class="text-white/60 text-xs mb-5" data-i18n="wizard.libs_intro">Choose which Jellyfin libraries to create here. Each path must exist on this server.</p>
+                <div id="wiz-jf-libs" class="space-y-4"></div>
+            </div>
+            <div class="flex justify-between mt-6">
+                <button class="jf-btn-ghost" onclick="wizPrev()" data-i18n="wizard.back">← Back</button>
+                <button class="jf-btn-primary" onclick="wizNext()" data-i18n="wizard.next">Next →</button>
+            </div>
+        </div>
+
+        <!-- Step 5 (import): other users -->
+        <div id="wiz-step-5" class="jf-wizard-step" data-wiz-path="import">
+            <div class="jf-settings-card !bg-[#1a202c]/60">
+                <h2 class="text-lg font-bold text-white mb-2" data-i18n="wizard.others_title">Other users</h2>
+                <p class="text-white/60 text-xs mb-5" data-i18n="wizard.others_intro">Each gets an account and a one-time setup code, shown on the import page after setup.</p>
+                <div id="wiz-jf-others" class="space-y-2"></div>
+            </div>
+            <div class="flex justify-between mt-6">
+                <button class="jf-btn-ghost" onclick="wizPrev()" data-i18n="wizard.back">← Back</button>
+                <button class="jf-btn-primary" onclick="wizNext()" data-i18n="wizard.next">Next →</button>
+            </div>
+        </div>
+
+        <template id="wiz-tpl-user">
+            <label class="flex items-start gap-3 p-3 rounded-xl bg-white/5 border border-white/10 cursor-pointer">
+                <input type="radio" name="wiz-jf-user" class="mt-1">
+                <span class="flex-1 text-sm text-white">
+                    <span class="wiz-name font-semibold"></span>
+                    <span class="wiz-admin-tag ml-2 text-[10px] px-1.5 py-0.5 rounded bg-[#00a4dc]/20 text-[#00a4dc]" hidden></span>
+                    <span class="wiz-played block text-xs text-white/50"></span>
+                </span>
+            </label>
+        </template>
+        <template id="wiz-tpl-other">
+            <label class="flex items-center gap-3 p-3 rounded-xl bg-white/5 border border-white/10 cursor-pointer">
+                <input type="checkbox" class="wiz-other-user" checked>
+                <span class="wiz-name text-sm text-white"></span>
+            </label>
+        </template>
+        <template id="wiz-tpl-lib">
+            <div class="wiz-lib-row p-4 rounded-xl bg-white/5 border border-white/10 space-y-3">
+                <label class="flex items-center gap-2 text-sm text-white">
+                    <input type="checkbox" class="wiz-lib-check" checked>
+                    <span class="wiz-lib-jf-name font-semibold"></span>
+                </label>
+                <p class="wiz-lib-unsupported hidden text-amber-300 text-xs"></p>
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div>
+                        <label class="wiz-lib-name-label block text-xs font-medium text-white/70 mb-1.5"></label>
+                        <input type="text" class="wiz-lib-name jf-input w-full">
+                    </div>
+                    <div>
+                        <label class="wiz-lib-type-label block text-xs font-medium text-white/70 mb-1.5"></label>
+                        <select class="wiz-lib-type jf-input w-full"></select>
+                    </div>
+                </div>
+                <div class="wiz-lib-error hidden text-red-400 text-xs p-2 rounded bg-red-500/10 border border-red-500/20"></div>
+                <div class="wiz-lib-paths space-y-3"></div>
+            </div>
+        </template>
+        <template id="wiz-tpl-path">
+            <div class="wiz-path">
+                <label class="wiz-path-label block text-xs font-medium text-white/70 mb-1.5"></label>
+                <input type="text" class="wiz-path-input jf-input w-full">
+                <p class="text-xs text-white/40 mt-1"><span class="wiz-jf-path-label"></span> <span class="wiz-jf-path font-mono break-all"></span></p>
+                <div class="wiz-path-error hidden text-red-400 text-xs mt-1"></div>
+            </div>
+        </template>
+
+        <!-- Step 6: Admin account (both paths) -->
+        <div id="wiz-step-6" class="jf-wizard-step">
+            <div class="jf-settings-card !bg-[#1a202c]/60">
+                <h2 class="text-lg font-bold text-white mb-2" data-i18n="wizard.admin_title">Administrator Account</h2>
                 <p class="text-white/60 text-xs mb-5" data-i18n="wizard.admin_intro">Create the primary administrator account for your server.</p>
+                <p data-wiz-path="import" class="hidden text-white/60 text-xs mb-5" data-i18n="wizard.account_import_note">Jellyfin passwords aren't carried over; choose a new one.</p>
                 <div class="space-y-4">
                     <div>
                         <label class="block text-xs font-medium text-white/70 mb-1.5" data-i18n="common.username">Username</label>
@@ -98,10 +228,10 @@
         </div>
 
         <!-- Step 2: Library Setup -->
-        <div id="wiz-step-2" class="jf-wizard-step">
+        <div id="wiz-step-7" class="jf-wizard-step" data-wiz-path="manual">
             <div class="jf-settings-card !bg-[#1a202c]/60">
-                <h2 class="text-lg font-bold text-white mb-2" data-i18n="wizard.library_title">3. Media Library (Optional)</h2>
-                <p class="text-white/60 text-xs mb-5" data-i18n="wizard.library_intro">Add your first media folder. You can add more at any time in the admin area.</p>
+                <h2 class="text-lg font-bold text-white mb-2" data-i18n="wizard.library_title">Media Library (Optional)</h2>
+                <p class="text-white/60 text-xs mb-5" data-i18n="wizard.library_intro">Add your first media folder, or skip this step. You can add libraries at any time in the dashboard.</p>
                 <div class="space-y-4">
                     <div>
                         <label class="block text-xs font-medium text-white/70 mb-1.5" data-i18n="wizard.library_name">Library name</label>
@@ -123,14 +253,18 @@
                     </div>
                 </div>
             </div>
+            <div id="wiz-lib-error" class="text-red-400 text-xs mt-2 hidden p-2 rounded bg-red-500/10 border border-red-500/20"></div>
             <div class="flex justify-between mt-6">
                 <button class="jf-btn-ghost" onclick="wizPrev()" data-i18n="wizard.back">← Back</button>
-                <button class="jf-btn-primary" onclick="wizNext()" data-i18n="wizard.next">Next →</button>
+                <div class="flex gap-2">
+                    <button class="jf-btn-ghost" onclick="wizSkipLibrary()" data-i18n="wizard.skip">Skip</button>
+                    <button class="jf-btn-primary" onclick="wizNext()" data-i18n="wizard.next">Next →</button>
+                </div>
             </div>
         </div>
 
         <!-- Step 3: Complete -->
-        <div id="wiz-step-3" class="jf-wizard-step">
+        <div id="wiz-step-8" class="jf-wizard-step">
             <div class="jf-settings-card !bg-[#1a202c]/60 text-center">
                 <div class="w-16 h-16 rounded-full bg-emerald-500/20 text-emerald-400 mx-auto flex items-center justify-center text-3xl mb-4 border border-emerald-500/30">✓</div>
                 <h2 class="text-xl font-bold text-white mb-2" data-i18n="wizard.done_title">All Set!</h2>
@@ -139,12 +273,21 @@
                     <div class="flex justify-between"><span class="text-white/50" data-i18n="wizard.summary_engine">Server engine:</span> <span class="font-semibold text-[#00a4dc]">Rustyfin Core (Rust Tokio)</span></div>
                     <div class="flex justify-between"><span class="text-white/50" data-i18n="wizard.summary_admin">Admin account:</span> <span id="wiz-summary-user" class="font-semibold text-white"></span></div>
                     <div class="flex justify-between"><span class="text-white/50" data-i18n="wizard.summary_metadata">Metadata:</span> <span id="wiz-summary-lang" class="font-semibold text-white">Deutsch</span></div>
+                    <div data-wiz-path="manual" class="flex justify-between"><span class="text-white/50" data-i18n="wizard.summary_library">Library:</span> <span id="wiz-summary-library" class="font-semibold text-white"></span></div>
+                    <div data-wiz-path="import" class="flex justify-between gap-4"><span class="text-white/50" data-i18n="wizard.summary_jf_folder">Jellyfin data folder:</span> <span id="wiz-summary-jf-folder" class="font-semibold text-white text-right break-all"></span></div>
+                    <div data-wiz-path="import" class="flex justify-between gap-4"><span class="text-white/50" data-i18n="wizard.summary_jf_user">Your Jellyfin user:</span> <span id="wiz-summary-jf-user" class="font-semibold text-white text-right"></span></div>
+                    <div data-wiz-path="import" class="flex justify-between gap-4"><span class="text-white/50" data-i18n="wizard.summary_jf_libraries">Libraries to create:</span> <span id="wiz-summary-jf-libraries" class="font-semibold text-white text-right"></span></div>
+                    <div data-wiz-path="import" class="flex justify-between gap-4"><span class="text-white/50" data-i18n="wizard.summary_jf_users">Users to import:</span> <span id="wiz-summary-jf-users" class="font-semibold text-white text-right"></span></div>
                 </div>
+                <p data-wiz-path="import" class="text-white/60 text-xs mt-4" data-i18n="wizard.summary_jf_background">The import runs in the background after setup. Its progress is on the Jellyfin import page.</p>
             </div>
             <div id="wiz-finish-error" class="text-red-400 text-xs mt-2 hidden p-2 rounded bg-red-500/10 border border-red-500/20"></div>
             <div class="flex justify-between mt-6">
                 <button class="jf-btn-ghost" onclick="wizPrev()" data-i18n="wizard.back">← Back</button>
-                <button id="wiz-finish-btn" class="jf-btn-primary" onclick="wizComplete()" data-i18n="wizard.finish">Finish & start</button>
+                <div class="flex gap-2">
+                    <button id="wiz-skip-import-btn" class="jf-btn-ghost hidden" onclick="wizFinishWithoutImport()" data-i18n="wizard.skip_import">Finish without importing</button>
+                    <button id="wiz-finish-btn" class="jf-btn-primary" onclick="wizComplete()" data-i18n="wizard.finish">Finish & start</button>
+                </div>
             </div>
         </div>
     </div>

@@ -13,7 +13,7 @@ mod encoding_manager;
 mod images;
 mod items;
 mod jellyfin_import;
-mod library;
+pub(crate) mod library;
 mod library_monitor;
 mod live_tv;
 mod localization;
@@ -57,6 +57,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(startup::routes())
         .merge(system::setup_routes())
         .merge(library::setup_routes())
+        .merge(jellyfin_import::setup_routes())
         .route_layer(axum_mw::from_fn_with_state(
             state.clone(),
             require_setup_or_admin,
