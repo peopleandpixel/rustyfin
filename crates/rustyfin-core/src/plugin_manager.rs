@@ -46,7 +46,7 @@ pub struct PluginRegistrarCallbacks {
     /// The plugin passes function pointers for search_movie, search_tv, and get_images.
     register_metadata_provider: Option<
         unsafe extern "C" fn(
-            *mut std::ffi::c_void, // manager handle (reserved)
+            *mut std::ffi::c_void,   // manager handle (reserved)
             *const std::ffi::c_char, // plugin_id
             *const std::ffi::c_char, // provider_name
             MetadataSearchMovieFn,
@@ -57,7 +57,7 @@ pub struct PluginRegistrarCallbacks {
     /// Register this plugin as a subtitle provider.
     register_subtitle_provider: Option<
         unsafe extern "C" fn(
-            *mut std::ffi::c_void, // manager handle (reserved)
+            *mut std::ffi::c_void,   // manager handle (reserved)
             *const std::ffi::c_char, // plugin_id
             SubtitleSearchFn,
             SubtitleDownloadFn,
@@ -66,7 +66,7 @@ pub struct PluginRegistrarCallbacks {
     /// Register this plugin as a notification provider.
     register_notification_provider: Option<
         unsafe extern "C" fn(
-            *mut std::ffi::c_void, // manager handle (reserved)
+            *mut std::ffi::c_void,   // manager handle (reserved)
             *const std::ffi::c_char, // plugin_id
             NotificationSendFn,
         ),
@@ -74,10 +74,17 @@ pub struct PluginRegistrarCallbacks {
 }
 
 // FFI function pointer types for metadata providers
-type MetadataSearchMovieFn =
-    Option<unsafe extern "C" fn(*const std::ffi::c_void, *const std::ffi::c_char, i32, i8) -> *mut std::ffi::c_void>;
-type MetadataSearchTvFn =
-    Option<unsafe extern "C" fn(*const std::ffi::c_void, *const std::ffi::c_char) -> *mut std::ffi::c_void>;
+type MetadataSearchMovieFn = Option<
+    unsafe extern "C" fn(
+        *const std::ffi::c_void,
+        *const std::ffi::c_char,
+        i32,
+        i8,
+    ) -> *mut std::ffi::c_void,
+>;
+type MetadataSearchTvFn = Option<
+    unsafe extern "C" fn(*const std::ffi::c_void, *const std::ffi::c_char) -> *mut std::ffi::c_void,
+>;
 type MetadataGetImagesFn = Option<
     unsafe extern "C" fn(
         *const std::ffi::c_void,
@@ -111,7 +118,7 @@ type NotificationSendFn = Option<
         *const std::ffi::c_void,
         *const std::ffi::c_char, // title
         *const std::ffi::c_char, // message
-        i32, // priority: 0=Low, 1=Normal, 2=High, 3=Emergency
+        i32,                     // priority: 0=Low, 1=Normal, 2=High, 3=Emergency
     ) -> *mut std::ffi::c_void,
 >;
 
@@ -143,10 +150,7 @@ type SearchMovieFn = Arc<
         + Sync,
 >;
 type SearchTvFn = Arc<
-    dyn Fn(
-            &reqwest::Client,
-            &str,
-        ) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>>
+    dyn Fn(&reqwest::Client, &str) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>>
         + Send
         + Sync,
 >;
@@ -359,9 +363,10 @@ impl PluginManager {
             let library = libloading::Library::new(path)
                 .map_err(|e| format!("failed to load library: {}", e))?;
 
-            let create_fn: libloading::Symbol<unsafe extern "C" fn() -> *mut std::ffi::c_void> = library
-                .get(b"rustyfin_plugin_create")
-                .map_err(|e| format!("missing rustyfin_plugin_create symbol: {}", e))?;
+            let create_fn: libloading::Symbol<unsafe extern "C" fn() -> *mut std::ffi::c_void> =
+                library
+                    .get(b"rustyfin_plugin_create")
+                    .map_err(|e| format!("missing rustyfin_plugin_create symbol: {}", e))?;
 
             // The FFI returns a raw pointer; we transmute it to Box<dyn Plugin>.
             // SAFETY: The plugin crate guarantees the pointer is a valid Box<dyn Plugin>
@@ -372,9 +377,10 @@ impl PluginManager {
 
             // Optionally call rustyfin_plugin_register so the plugin can register itself
             // as a provider (metadata / subtitle / notification).
-            if let Ok(register_fn_sym) = library.get::<
-                unsafe extern "C" fn(*const std::ffi::c_void, PluginRegistrarCallbacks),
-            >(b"rustyfin_plugin_register")
+            if let Ok(register_fn_sym) = library
+                .get::<unsafe extern "C" fn(*const std::ffi::c_void, PluginRegistrarCallbacks)>(
+                    b"rustyfin_plugin_register",
+                )
             {
                 let callbacks = PluginRegistrarCallbacks::new(manager);
                 register_fn_sym(std::ptr::null(), callbacks);
@@ -744,9 +750,7 @@ impl PluginManager {
             }
 
             // Update in-memory dynamic plugin if it exists
-            if is_dynamic
-                && let Some(lp) = inner.plugins.get(plugin_id)
-            {
+            if is_dynamic && let Some(lp) = inner.plugins.get(plugin_id) {
                 lp.plugin.set_configuration(config.clone())?;
             }
         }

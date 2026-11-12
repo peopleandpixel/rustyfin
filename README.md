@@ -80,7 +80,7 @@
 - ✅ **Trickplay** — Thumbnail strips for scrubbing preview
 
 ### Metadata
-- ✅ **Metadata Providers** — TMDb, OMDb, local Kodi-compatible NFO files
+- ✅ **Metadata Providers** — TMDb, OMDb, Fanart, Trakt, TheTVDB, local NFO (all via plugin system)
 - ✅ **Backdrop images** — Downloaded from TMDb
 - ✅ **Theme song detection** — Automatic theme identification
 - ✅ **Image Proxy** — In-memory + disk caching, on-the-fly resize, format conversion
@@ -108,7 +108,7 @@
 - ✅ **DLNA** — UPnP/SSDP discovery, DLNA media server
 - ✅ **HTTPS/TLS** — rustls-based secure connections
 - ✅ **Reverse proxy** — X-Forwarded-For, IPv6 support
-- ✅ **Plugin system** — Trait-based plugin API with dynamic loading
+- ✅ **Plugin system** — 12 built-in plugins (TMDb, OMDb, Fanart, Trakt, TheTVDB, Local NFO, OpenSubtitles, Podnapisi, MQTT, Ntfy, Pushover, Webhook) with admin UI for enable/disable, configuration, and priority ordering. External plugins load dynamically via FFI from shared libraries.
 
 ### Performance Optimizations
 - ✅ **In-memory caching** — moka LRU cache for items, libraries, filters, search results
@@ -142,7 +142,7 @@
 
 ---
 
-## 🏗 Architecture: Cargo Workspace (8 Crates)
+## 🏗 Architecture: Cargo Workspace (20 Crates)
 
 ```
 rustyfin/
@@ -154,7 +154,19 @@ rustyfin/
 │   ├── rustyfin-db       # SQLx + SQLite, migrations, repositories, connection pools
 │   ├── rustyfin-model    # Shared DTOs, entities, Jellyfin API types
 │   ├── rustyfin-cli      # CLI utilities (migrate, admin, benchmark)
-│   └── rustyfin-web      # Web frontend (Tailwind CSS + DaisyUI)
+│   ├── rustyfin-web      # Web frontend (Tailwind CSS + DaisyUI)
+│   ├── plugin-tmdb       # TMDb metadata provider
+│   ├── plugin-omdb       # OMDb metadata provider
+│   ├── plugin-fanart     # Fanart.tv image provider
+│   ├── plugin-trakt      # Trakt metadata provider
+│   ├── plugin-tvdb       # TheTVDB metadata provider
+│   ├── plugin-local-nfo  # Local NFO metadata provider
+│   ├── plugin-opensubtitles  # OpenSubtitles subtitle provider
+│   ├── plugin-podnapisi  # Podnapisi subtitle provider
+│   ├── plugin-mqtt       # MQTT notification provider
+│   ├── plugin-ntfy       # Ntfy notification provider
+│   ├── plugin-pushover   # Pushover notification provider
+│   └── plugin-webhook    # Webhook notification provider
 ├── docs/
 │   ├── architecture.md
 │   ├── api.md

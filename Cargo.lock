@@ -2538,7 +2538,7 @@ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
 name = "plugin-fanart"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "reqwest",
  "rustyfin-model",
@@ -2549,7 +2549,7 @@ dependencies = [
 
 [[package]]
 name = "plugin-local-nfo"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "quick-xml",
  "reqwest",
@@ -2562,7 +2562,7 @@ dependencies = [
 
 [[package]]
 name = "plugin-mqtt"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "chrono",
  "rumqttc",
@@ -2575,7 +2575,7 @@ dependencies = [
 
 [[package]]
 name = "plugin-ntfy"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "reqwest",
  "rustyfin-model",
@@ -2586,7 +2586,7 @@ dependencies = [
 
 [[package]]
 name = "plugin-omdb"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "reqwest",
  "rustyfin-model",
@@ -2597,7 +2597,7 @@ dependencies = [
 
 [[package]]
 name = "plugin-opensubtitles"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "reqwest",
  "rustyfin-model",
@@ -2609,7 +2609,7 @@ dependencies = [
 
 [[package]]
 name = "plugin-podnapisi"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "reqwest",
  "rustyfin-model",
@@ -2621,7 +2621,7 @@ dependencies = [
 
 [[package]]
 name = "plugin-pushover"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "reqwest",
  "rustyfin-model",
@@ -2632,7 +2632,7 @@ dependencies = [
 
 [[package]]
 name = "plugin-tmdb"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "moka",
  "reqwest",
@@ -2644,7 +2644,7 @@ dependencies = [
 
 [[package]]
 name = "plugin-trakt"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "chrono",
  "moka",
@@ -2657,7 +2657,7 @@ dependencies = [
 
 [[package]]
 name = "plugin-tvdb"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "moka",
  "reqwest",
@@ -2669,7 +2669,7 @@ dependencies = [
 
 [[package]]
 name = "plugin-webhook"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "chrono",
  "reqwest",
@@ -3350,7 +3350,7 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "rustyfin-api"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -3390,7 +3390,7 @@ dependencies = [
 
 [[package]]
 name = "rustyfin-auth"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "argon2",
  "chrono",
@@ -3409,7 +3409,7 @@ dependencies = [
 
 [[package]]
 name = "rustyfin-cli"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "clap",
  "reqwest",
@@ -3420,7 +3420,7 @@ dependencies = [
 
 [[package]]
 name = "rustyfin-core"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "axum",
  "blurhash",
@@ -3463,7 +3463,7 @@ dependencies = [
 
 [[package]]
 name = "rustyfin-db"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "chrono",
  "fastrand",
@@ -3482,7 +3482,7 @@ dependencies = [
 
 [[package]]
 name = "rustyfin-model"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "chrono",
  "reqwest",
@@ -3495,7 +3495,7 @@ dependencies = [
 
 [[package]]
 name = "rustyfin-server"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "axum",
  "hyper-util",

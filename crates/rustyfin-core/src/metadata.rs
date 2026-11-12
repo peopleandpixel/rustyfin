@@ -91,13 +91,8 @@ pub async fn refresh_item_metadata(
         }
 
         // Fetch additional images from this provider
-        let images = (provider.get_images)(
-            client,
-            working.tmdb_id,
-            working.tvdb_id,
-            item.media_type,
-        )
-        .await;
+        let images =
+            (provider.get_images)(client, working.tmdb_id, working.tvdb_id, item.media_type).await;
         if !images.is_empty() {
             store_images_batch(pool, item.id, &images, &provider.provider_name).await?;
         }

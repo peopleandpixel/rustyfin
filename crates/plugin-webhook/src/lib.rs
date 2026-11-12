@@ -294,7 +294,7 @@ mod tests {
 
     #[test]
     fn test_fill_template() {
-        let template = r#"{"title":"{title}","message":"{message}"}"#;
+        let template = r#"{"title":"{title}","message":"{message}","priority":"{priority}"}"#;
         let result = fill_template(template, "Test", "Hello", "high");
         assert!(result.contains("\"title\":\"Test\""));
         assert!(result.contains("\"message\":\"Hello\""));

@@ -129,20 +129,20 @@ async fn get_seasons(
         .collect();
     let total = seasons.len() as i64;
 
-    let config = state.config.read().await;
-    let tmdb = state.tmdb.api(config.tmdb_api_key.as_deref());
+    let tmdb_key = state.plugin_manager.get_configuration("tmdb").await
+        .and_then(|c| c.values.get("api_key").and_then(|v| v.as_str()).map(|s| s.to_string()));
+    let tmdb = tmdb_key.as_deref();
     enrich_items(
         &state.db_ro,
         &state.server_id,
         user_id,
         &mut seasons,
         &state.http_client,
-        tmdb.as_ref(),
+        state.tmdb.api(tmdb).as_ref(),
         &state.data_dir,
         true,
     )
     .await;
-    drop(config);
 
     Ok(Json(QueryResult {
         items: seasons,
@@ -196,20 +196,20 @@ async fn get_episodes(
         Vec::new()
     };
 
-    let config = state.config.read().await;
-    let tmdb = state.tmdb.api(config.tmdb_api_key.as_deref());
+    let tmdb_key = state.plugin_manager.get_configuration("tmdb").await
+        .and_then(|c| c.values.get("api_key").and_then(|v| v.as_str()).map(|s| s.to_string()));
+    let tmdb = tmdb_key.as_deref();
     enrich_items(
         &state.db_ro,
         &state.server_id,
         user_id,
         &mut page,
         &state.http_client,
-        tmdb.as_ref(),
+        state.tmdb.api(tmdb).as_ref(),
         &state.data_dir,
         true,
     )
     .await;
-    drop(config);
 
     Ok(Json(QueryResult {
         items: page,
