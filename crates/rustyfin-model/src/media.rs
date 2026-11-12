@@ -265,6 +265,9 @@ pub struct MediaItem {
     /// Season name for episodes
     #[serde(default)]
     pub season_name: Option<String>,
+    /// Season ID for episodes
+    #[serde(default)]
+    pub season_id: Option<Uuid>,
     /// Series status (Continuing, Ended, etc.)
     #[serde(default)]
     pub status: Option<String>,
@@ -620,6 +623,7 @@ impl MediaItem {
             series_name: None,
             series_id: None,
             season_name: None,
+            season_id: None,
             status: None,
             custom_rating: None,
             critic_rating: None,
@@ -730,7 +734,7 @@ impl MediaItem {
 
 impl Serialize for MediaItem {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut s = serializer.serialize_struct("MediaItem", 160)?;
+        let mut s = serializer.serialize_struct("MediaItem", 161)?;
         s.serialize_field("Id", &self.id)?;
         s.serialize_field("Name", &self.name)?;
         s.serialize_field("SortName", &self.sort_name)?;
@@ -782,6 +786,7 @@ impl Serialize for MediaItem {
         s.serialize_field("SeriesName", &self.series_name)?;
         s.serialize_field("SeriesId", &self.series_id)?;
         s.serialize_field("SeasonName", &self.season_name)?;
+        s.serialize_field("SeasonId", &self.season_id)?;
         s.serialize_field("Status", &self.status)?;
         s.serialize_field("CustomRating", &self.custom_rating)?;
         s.serialize_field("CriticRating", &self.critic_rating)?;

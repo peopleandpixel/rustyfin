@@ -378,6 +378,8 @@
         "episodes_count": "Episodes ({{count}})",
         "episode": "Episode",
         "episode_number": "E{{number}}",
+        "season_number": "Season {{number}}",
+        "breadcrumb": "Breadcrumb",
         "no_overview": "No description available.",
         "titles": "Titles",
         "similar": "More Like This",
