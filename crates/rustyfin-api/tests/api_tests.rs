@@ -12619,13 +12619,14 @@ async fn b40_session_reports_on_a_movie_work_as_before() {
     assert_eq!(status, StatusCode::OK);
     let mut events = b.state.ws_broadcast.subscribe();
 
-    // Start with no position stores 0 and the reported tracks; the film stays played.
+    // Start with no position stores 0 and the reported tracks; the film is unplayed again, as a
+    // start leaves a resumable item in Jellyfin (B110).
     let body = serde_json::json!({
         "ItemId": film, "ItemName": "B40 Film", "AudioStreamIndex": 1, "SubtitleStreamIndex": 3,
     });
     let (status, answer) = b.post("/Sessions/Playing", body).await;
     assert_eq!((status, answer), (StatusCode::OK, serde_json::json!({})));
-    assert_eq!(b.film_data().await, (0, true, Some(1), Some(3), true));
+    assert_eq!(b.film_data().await, (0, false, Some(1), Some(3), true));
     let now_playing = serde_json::json!({ "Id": film, "Name": "B40 Film" });
     assert_eq!(
         b40_session_changes(&mut events),
@@ -12639,20 +12640,25 @@ async fn b40_session_reports_on_a_movie_work_as_before() {
     });
     let (status, answer) = b.post("/Sessions/Playing/Progress", body).await;
     assert_eq!((status, answer), (StatusCode::OK, serde_json::json!({})));
-    assert_eq!(b.film_data().await, (5000, true, Some(2), Some(3), true));
+    assert_eq!(b.film_data().await, (5000, false, Some(2), Some(3), true));
     let now_playing = serde_json::json!({ "Id": film, "Name": "B40 Film", "PositionTicks": 5000 });
     assert_eq!(
         b40_session_changes(&mut events),
         [(user.clone(), now_playing)]
     );
 
-    // Stop stores the stop position and subtitles off, and clears now playing.
+    // Stop midway through the film's hour stores the stop position (B110: without a runtime it
+    // would count as played to the end) and subtitles off, and clears now playing.
+    b110_set(&b.state, b.film, Some(B110_HOUR), None, None).await;
     let body = serde_json::json!({
-        "ItemId": film, "PositionTicks": 7000, "SubtitleStreamIndex": -1,
+        "ItemId": film, "PositionTicks": B110_HOUR / 2, "SubtitleStreamIndex": -1,
     });
     let (status, answer) = b.post("/Sessions/Playing/Stopped", body).await;
     assert_eq!((status, answer), (StatusCode::OK, serde_json::json!({})));
-    assert_eq!(b.film_data().await, (7000, true, Some(2), Some(-1), true));
+    assert_eq!(
+        b.film_data().await,
+        (B110_HOUR / 2, false, Some(2), Some(-1), true)
+    );
     assert_eq!(
         b40_session_changes(&mut events),
         [(user, serde_json::Value::Null)]
@@ -12690,6 +12696,808 @@ async fn b40_last_activity_date_skips_ids_that_are_not_media_items() {
         .await;
     assert_eq!((status, answer), (StatusCode::OK, serde_json::json!({})));
     assert_eq!(b.user_data_rows().await, 1);
+}
+
+// B110: watched status
+
+/// One hour in ticks.
+const B110_HOUR: i64 = 36_000_000_000;
+
+/// Films of known runtimes, a show with two seasons, and an administrator. Jellyfin's play state
+/// rules (UserDataManager.UpdatePlayState, SessionManager.OnPlaybackStart/Stopped) with the default
+/// MinResumePct 5, MaxResumePct 90 and MinResumeDurationSeconds 300.
+struct B110 {
+    state: AppState,
+    app: axum::Router,
+    token: String,
+    user: uuid::Uuid,
+    /// A film of 1 h.
+    film: uuid::Uuid,
+    /// A film of 60 s, under the 300 s minimum resume duration.
+    short: uuid::Uuid,
+    /// A film without a runtime.
+    unknown: uuid::Uuid,
+    series: uuid::Uuid,
+    seasons: [uuid::Uuid; 2],
+    /// S01E01, S01E02 and S02E01, each of 30 min.
+    episodes: [uuid::Uuid; 3],
+    _dir: G1cDataDir,
+}
+
+impl B110 {
+    async fn new() -> Self {
+        use rustyfin_model::library::LibraryContentType;
+        let state = test_state().await;
+        let _dir = G1cDataDir(state.data_dir.to_path_buf());
+        let (token, user) = admin_session(&state).await;
+        let films = j5_library(&state, "B110 Films", LibraryContentType::Movies).await;
+        let shows = j5_library(&state, "B110 Shows", LibraryContentType::TvShows).await;
+        let film = j5_item(&state, films, None, "B110 Film", "Movie", "", None).await;
+        let short = j5_item(&state, films, None, "B110 Short", "Movie", "", None).await;
+        let unknown = j5_item(&state, films, None, "B110 Unknown", "Movie", "", None).await;
+        let series = j5_item(&state, shows, None, "B110 Show", "Series", "", None).await;
+        let mut seasons = [uuid::Uuid::nil(); 2];
+        let mut episodes = Vec::new();
+        for (s, season) in seasons.iter_mut().enumerate() {
+            let name = format!("Season {}", s + 1);
+            *season = j5_item(&state, shows, Some(series), &name, "Season", "", None).await;
+            b110_set(&state, *season, None, Some(s as i64 + 1), None).await;
+            for e in 0..(2 - s) {
+                let name = format!("B110 S{}E{}", s + 1, e + 1);
+                let episode =
+                    j5_item(&state, shows, Some(*season), &name, "Episode", "", None).await;
+                let numbers = (Some(e as i64 + 1), Some(s as i64 + 1));
+                b110_set(&state, episode, Some(B110_HOUR / 2), numbers.0, numbers.1).await;
+                episodes.push(episode);
+            }
+        }
+        b110_set(&state, film, Some(B110_HOUR), None, None).await;
+        b110_set(&state, short, Some(600_000_000), None, None).await;
+        B110 {
+            app: app(state.clone()),
+            state,
+            token,
+            user,
+            film,
+            short,
+            unknown,
+            series,
+            seasons,
+            episodes: episodes.try_into().unwrap(),
+            _dir,
+        }
+    }
+
+    async fn post(&self, uri: &str, body: serde_json::Value) {
+        let (status, answer) =
+            send_authed(&self.app, "POST", uri, &self.token, Some(&body.to_string())).await;
+        assert_eq!(
+            (status, answer),
+            (StatusCode::OK, serde_json::json!({})),
+            "{uri}"
+        );
+    }
+
+    async fn start(&self, item: uuid::Uuid) {
+        let body = serde_json::json!({ "ItemId": item, "PositionTicks": 0 });
+        self.post("/Sessions/Playing", body).await;
+    }
+
+    async fn progress(&self, item: uuid::Uuid, ticks: i64) {
+        let body = serde_json::json!({ "ItemId": item, "PositionTicks": ticks });
+        self.post("/Sessions/Playing/Progress", body).await;
+    }
+
+    /// A stop report, with `PositionTicks` only when `ticks` is Some.
+    async fn stop(&self, item: uuid::Uuid, ticks: Option<i64>) {
+        let mut body = serde_json::json!({ "ItemId": item });
+        if let Some(ticks) = ticks {
+            body["PositionTicks"] = serde_json::json!(ticks);
+        }
+        self.post("/Sessions/Playing/Stopped", body).await;
+    }
+
+    /// The stored `(played, play_count, playback_position_ticks, has last_played_date)`, or
+    /// `(false, 0, 0, false)` without a row.
+    async fn stored(&self, item: uuid::Uuid) -> (bool, i64, i64, bool) {
+        sqlx::query_as(
+            "SELECT played, play_count, playback_position_ticks, last_played_date IS NOT NULL \
+             FROM user_item_data WHERE user_id = ? AND item_id = ?",
+        )
+        .bind(self.user.to_string())
+        .bind(item.to_string())
+        .fetch_optional(&self.state.db)
+        .await
+        .unwrap()
+        .unwrap_or((false, 0, 0, false))
+    }
+
+    async fn get(&self, uri: &str) -> serde_json::Value {
+        let (status, body) = send_authed(&self.app, "GET", uri, &self.token, None).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        body
+    }
+
+    /// The ids of a list answer's `Items`.
+    async fn ids(&self, uri: &str) -> Vec<String> {
+        let body = self.get(uri).await;
+        body["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["Id"].as_str().unwrap().to_string())
+            .collect()
+    }
+}
+
+/// Sets an item's runtime and index numbers.
+async fn b110_set(
+    state: &AppState,
+    item: uuid::Uuid,
+    runtime: Option<i64>,
+    index: Option<i64>,
+    parent_index: Option<i64>,
+) {
+    sqlx::query(
+        "UPDATE media_items SET runtime_ticks = ?, index_number = ?, parent_index_number = ? \
+         WHERE id = ?",
+    )
+    .bind(runtime)
+    .bind(index)
+    .bind(parent_index)
+    .bind(item.to_string())
+    .execute(&state.db)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn b110_start_counts_a_play() {
+    let b = B110::new().await;
+    b.start(b.film).await;
+    assert_eq!(b.stored(b.film).await, (false, 1, 0, true));
+    b.start(b.film).await;
+    assert_eq!(b.stored(b.film).await, (false, 2, 0, true));
+}
+
+#[tokio::test]
+async fn b110_stop_applies_jellyfins_play_state_rules() {
+    let b = B110::new().await;
+    let hour = B110_HOUR;
+    // (case, item, stop position, then (played, position)); each case starts on a fresh item
+    // state with one start report.
+    let cases = [
+        ("over 90%", b.film, Some(hour * 95 / 100), (true, 0)),
+        ("at the end", b.film, Some(hour), (true, 0)),
+        ("past the end", b.film, Some(hour + 1), (true, 0)),
+        (
+            "exactly 90%",
+            b.film,
+            Some(hour * 90 / 100),
+            (false, hour * 90 / 100),
+        ),
+        ("midway", b.film, Some(hour / 2), (false, hour / 2)),
+        (
+            "exactly 5%",
+            b.film,
+            Some(hour * 5 / 100),
+            (false, hour * 5 / 100),
+        ),
+        ("under 5%", b.film, Some(hour * 4 / 100), (false, 0)),
+        ("at 0", b.film, Some(0), (false, 0)),
+        ("short item midway", b.short, Some(300_000_000), (true, 0)),
+        ("short item under 5%", b.short, Some(20_000_000), (false, 0)),
+        ("no runtime", b.unknown, Some(5_000), (true, 0)),
+        ("no runtime at 0", b.unknown, Some(0), (true, 0)),
+    ];
+    let mut actual = Vec::new();
+    let mut expected = Vec::new();
+    for (case, item, ticks, (played, position)) in cases {
+        sqlx::query("DELETE FROM user_item_data")
+            .execute(&b.state.db)
+            .await
+            .unwrap();
+        b.start(item).await;
+        b.stop(item, ticks).await;
+        actual.push((case, b.stored(item).await));
+        expected.push((case, (played, 1, position, true)));
+    }
+    assert_eq!(actual, expected);
+}
+
+#[tokio::test]
+async fn b110_a_rewatch_starts_unplayed_like_jellyfin() {
+    let b = B110::new().await;
+    b.start(b.film).await;
+    b.stop(b.film, Some(B110_HOUR)).await;
+    assert_eq!(b.stored(b.film).await, (true, 1, 0, true));
+    // Jellyfin's OnPlaybackStart clears Played on an item that resumes, so a rewatch stopped
+    // midway is unplayed with a resume point.
+    b.start(b.film).await;
+    assert_eq!(b.stored(b.film).await, (false, 2, 0, true));
+    b.stop(b.film, Some(B110_HOUR / 2)).await;
+    assert_eq!(b.stored(b.film).await, (false, 2, B110_HOUR / 2, true));
+    // Played to the end again, it is played again.
+    b.start(b.film).await;
+    b.stop(b.film, Some(B110_HOUR)).await;
+    assert_eq!(b.stored(b.film).await, (true, 3, 0, true));
+}
+
+#[tokio::test]
+async fn b110_a_start_marks_an_item_that_does_not_resume_played() {
+    let b = B110::new().await;
+    // Jellyfin's Audio does not resume (SupportsPositionTicksResume), so its start marks it
+    // played.
+    let library = j5_library(
+        &b.state,
+        "B110 Music",
+        rustyfin_model::library::LibraryContentType::Music,
+    )
+    .await;
+    let track = j5_item(&b.state, library, None, "B110 Track", "Audio", "", None).await;
+    b110_set(&b.state, track, Some(2_400_000_000), None, None).await;
+    b.start(track).await;
+    assert_eq!(b.stored(track).await, (true, 1, 0, true));
+}
+
+#[tokio::test]
+async fn b110_stop_without_a_position_counts_as_played_to_the_end() {
+    let b = B110::new().await;
+    b.progress(b.film, B110_HOUR / 2).await;
+    b.stop(b.film, None).await;
+    // Jellyfin assumes completion and counts the play here.
+    assert_eq!(b.stored(b.film).await, (true, 1, 0, true));
+}
+
+#[tokio::test]
+async fn b110_a_failed_stop_leaves_the_watch_data_alone() {
+    let b = B110::new().await;
+    // Jellyfin's OnPlaybackStopped returns before touching user data when the report says
+    // Failed, so a playback that errored out is neither played nor counted.
+    for (item, ticks) in [
+        (b.unknown, Some(0)),
+        (b.unknown, None),
+        (b.film, Some(B110_HOUR)),
+    ] {
+        sqlx::query("DELETE FROM user_item_data")
+            .execute(&b.state.db)
+            .await
+            .unwrap();
+        b.start(item).await;
+        b.progress(item, 5_000).await;
+        let mut body = serde_json::json!({ "ItemId": item, "Failed": true });
+        if let Some(ticks) = ticks {
+            body["PositionTicks"] = serde_json::json!(ticks);
+        }
+        b.post("/Sessions/Playing/Stopped", body).await;
+        assert_eq!(
+            b.stored(item).await,
+            (false, 1, 5_000, true),
+            "{item} {ticks:?}"
+        );
+    }
+    // `Failed: false` is an ordinary stop.
+    let body = serde_json::json!({ "ItemId": b.unknown, "PositionTicks": 0, "Failed": false });
+    b.post("/Sessions/Playing/Stopped", body).await;
+    assert_eq!(b.stored(b.unknown).await, (true, 0, 0, true));
+}
+
+/// Adds a media source (a version) of `runtime` ticks to `item` and returns its id.
+async fn b110_source(state: &AppState, item: uuid::Uuid, runtime: i64) -> uuid::Uuid {
+    let id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO media_sources (id, item_id, uid, container, path, run_time_ticks) \
+         VALUES (?, ?, ?, 'mkv', ?, ?)",
+    )
+    .bind(id.to_string())
+    .bind(item.to_string())
+    .bind(id.simple().to_string())
+    .bind(format!("/nonexistent/b110/{id}.mkv"))
+    .bind(runtime)
+    .execute(&state.db)
+    .await
+    .unwrap();
+    id
+}
+
+#[tokio::test]
+async fn b110_the_reported_versions_runtime_decides() {
+    let b = B110::new().await;
+    // The film's hour is its primary version; a second version runs two hours.
+    let primary = b110_source(&b.state, b.film, B110_HOUR).await;
+    let long = b110_source(&b.state, b.film, 2 * B110_HOUR).await;
+    let near_hour = B110_HOUR * 95 / 100;
+    // (version reported, stop position, then (played, position))
+    let cases = [
+        (
+            "long version at 47%",
+            Some(long.to_string()),
+            near_hour,
+            (false, near_hour),
+        ),
+        (
+            "long version, dashless id",
+            Some(long.simple().to_string()),
+            near_hour,
+            (false, near_hour),
+        ),
+        (
+            "primary version at 95%",
+            Some(primary.to_string()),
+            near_hour,
+            (true, 0),
+        ),
+        ("no version: the item's runtime", None, near_hour, (true, 0)),
+        (
+            "unknown version: the item's runtime",
+            Some(uuid::Uuid::new_v4().to_string()),
+            near_hour,
+            (true, 0),
+        ),
+        (
+            "long version at 95%",
+            Some(long.to_string()),
+            2 * near_hour,
+            (true, 0),
+        ),
+    ];
+    let mut actual = Vec::new();
+    let mut expected = Vec::new();
+    for (case, source, ticks, (played, position)) in cases {
+        sqlx::query("DELETE FROM user_item_data")
+            .execute(&b.state.db)
+            .await
+            .unwrap();
+        let mut body = serde_json::json!({ "ItemId": b.film, "PositionTicks": ticks });
+        if let Some(source) = &source {
+            body["MediaSourceId"] = serde_json::json!(source);
+        }
+        b.post("/Sessions/Playing/Stopped", body.clone()).await;
+        let stop = b.stored(b.film).await;
+        // Progress past 90% follows the same runtime.
+        sqlx::query("DELETE FROM user_item_data")
+            .execute(&b.state.db)
+            .await
+            .unwrap();
+        b.post("/Sessions/Playing/Progress", body).await;
+        let progress = b.stored(b.film).await;
+        actual.push((case, (stop.0, stop.2), (progress.0, progress.2)));
+        let progress_position = if played { 0 } else { ticks };
+        expected.push((case, (played, position), (played, progress_position)));
+    }
+    assert_eq!(actual, expected);
+}
+
+#[tokio::test]
+async fn b110_progress_near_the_end_marks_played() {
+    let b = B110::new().await;
+    b.start(b.film).await;
+    // A resume point during play is kept as reported, even under 5%.
+    b.progress(b.film, 1_000).await;
+    assert_eq!(b.stored(b.film).await, (false, 1, 1_000, true));
+    b.progress(b.film, B110_HOUR / 2).await;
+    assert_eq!(b.stored(b.film).await, (false, 1, B110_HOUR / 2, true));
+    // Past 90% the item is played and leaves no resume point, as if the client never stops.
+    b.progress(b.film, B110_HOUR * 95 / 100).await;
+    assert_eq!(b.stored(b.film).await, (true, 1, 0, true));
+    // Progress on an item with no runtime stores the position and leaves it unplayed.
+    b.progress(b.unknown, 5_000).await;
+    assert_eq!(b.stored(b.unknown).await, (false, 0, 5_000, true));
+}
+
+#[tokio::test]
+async fn b110_played_items_leave_continue_watching_and_next_up_moves_on() {
+    let b = B110::new().await;
+    let [e1, e2, _] = b.episodes;
+    let resume = format!("/Users/{}/Items/Resume", b.user);
+    let next_up = format!("/Shows/NextUp?userId={}&seriesId={}", b.user, b.series);
+    for item in [b.film, e1] {
+        b.start(item).await;
+        b.progress(item, 1_000_000_000).await;
+    }
+    let mut listed = b.ids(&resume).await;
+    listed.sort();
+    let mut both = vec![b.film.to_string(), e1.to_string()];
+    both.sort();
+    assert_eq!(listed, both, "in progress");
+    assert_eq!(b.ids(&next_up).await, [e1.to_string()], "in progress");
+
+    b.stop(b.film, Some(B110_HOUR * 95 / 100)).await;
+    b.stop(e1, Some(B110_HOUR / 2 * 95 / 100)).await;
+    assert_eq!(b.ids(&resume).await, Vec::<String>::new(), "played");
+    assert_eq!(b.ids(&next_up).await, [e2.to_string()], "played");
+}
+
+#[tokio::test]
+async fn b110_playing_items_routes_report_like_sessions_playing() {
+    let b = B110::new().await;
+    let [e1, e2, e3] = b.episodes;
+    let half = B110_HOUR / 4;
+    let near_end = B110_HOUR / 2 * 95 / 100;
+    // Jellyfin's PlaystateController: /PlayingItems/{itemId}, and the obsolete
+    // /Users/{userId}/PlayingItems/{itemId} forms, which act for the caller like the new ones.
+    // Query names are camelCase; the PascalCase forms work too. Each answers 204.
+    let prefixes = [
+        ("new", "/PlayingItems".to_string(), e1, "positionTicks"),
+        (
+            "legacy",
+            format!("/Users/{}/PlayingItems", b.user),
+            e2,
+            "PositionTicks",
+        ),
+        (
+            "other user",
+            format!("/Users/{}/PlayingItems", uuid::Uuid::new_v4()),
+            e3,
+            "positionTicks",
+        ),
+    ];
+    let mut actual = Vec::new();
+    let mut expected = Vec::new();
+    for (name, prefix, item, ticks) in prefixes {
+        let calls = [
+            (
+                "POST",
+                format!("{prefix}/{item}?mediaSourceId={item}&canSeek=true"),
+            ),
+            (
+                "POST",
+                format!("{prefix}/{item}/Progress?{ticks}={half}&isPaused=false"),
+            ),
+            ("DELETE", format!("{prefix}/{item}?{ticks}={near_end}")),
+        ];
+        let mut states = Vec::new();
+        for (method, uri) in calls {
+            let (status, _) = send_authed(&b.app, method, &uri, &b.token, None).await;
+            states.push((method, status, b.stored(item).await));
+        }
+        actual.push((name, states));
+        expected.push((
+            name,
+            vec![
+                ("POST", StatusCode::NO_CONTENT, (false, 1, 0, true)),
+                ("POST", StatusCode::NO_CONTENT, (false, 1, half, true)),
+                ("DELETE", StatusCode::NO_CONTENT, (true, 1, 0, true)),
+            ],
+        ));
+    }
+    assert_eq!(actual, expected);
+    // A stop without positionTicks counts as played to the end, as on /Sessions/Playing/Stopped.
+    let uri = format!("/PlayingItems/{}", b.film);
+    let (status, _) = send_authed(&b.app, "DELETE", &uri, &b.token, None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(b.stored(b.film).await, (true, 1, 0, true));
+}
+
+#[tokio::test]
+async fn b110_playing_items_routes_need_a_session_and_store_nothing_for_non_media() {
+    let b = B110::new().await;
+    let item = b.film;
+    let response = b
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/PlayingItems/{item}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let random = uuid::Uuid::new_v4();
+    for (method, uri) in [
+        ("POST", format!("/PlayingItems/{random}")),
+        (
+            "POST",
+            format!("/PlayingItems/{random}/Progress?positionTicks=5"),
+        ),
+        ("DELETE", format!("/PlayingItems/{random}?positionTicks=5")),
+    ] {
+        let (status, _) = send_authed(&b.app, method, &uri, &b.token, None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{method} {uri}");
+    }
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM user_item_data")
+        .fetch_one(&b.state.db)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0);
+}
+
+/// An item's `(Id, UserData.Played, UserData.UnplayedItemCount, UserData.PlayedPercentage)`;
+/// a missing field is None.
+fn b110_watch_fields(item: &serde_json::Value) -> (String, Option<bool>, Option<i64>, Option<f64>) {
+    let data = &item["UserData"];
+    (
+        item["Id"].as_str().unwrap().to_string(),
+        data["Played"].as_bool(),
+        data["UnplayedItemCount"].as_i64(),
+        data["PlayedPercentage"].as_f64(),
+    )
+}
+
+impl B110 {
+    /// `b110_watch_fields` of each item a list answer gives.
+    async fn list_fields(
+        &self,
+        uri: &str,
+    ) -> Vec<(String, Option<bool>, Option<i64>, Option<f64>)> {
+        let body = self.get(uri).await;
+        body["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(b110_watch_fields)
+            .collect()
+    }
+
+    /// `b110_watch_fields` of an item's details.
+    async fn details_fields(
+        &self,
+        item: uuid::Uuid,
+    ) -> (String, Option<bool>, Option<i64>, Option<f64>) {
+        let uri = format!("/Items/{item}?userId={}", self.user);
+        b110_watch_fields(&self.get(&uri).await)
+    }
+}
+
+#[tokio::test]
+async fn b110_videos_carry_their_played_percentage() {
+    let b = B110::new().await;
+    let film = b.film.to_string();
+    // Jellyfin's BaseItem.FillUserDataDtoValues: 100 * position / runtime, only with a position.
+    assert_eq!(
+        b.details_fields(b.film).await,
+        (film.clone(), Some(false), None, None)
+    );
+    b.start(b.film).await;
+    b.progress(b.film, B110_HOUR / 4).await;
+    let quarter = (film.clone(), Some(false), None, Some(25.0));
+    assert_eq!(b.details_fields(b.film).await, quarter);
+    let resume = format!("/Users/{}/Items/Resume", b.user);
+    assert_eq!(b.list_fields(&resume).await, [quarter]);
+    b.stop(b.film, Some(B110_HOUR)).await;
+    assert_eq!(
+        b.details_fields(b.film).await,
+        (film, Some(true), None, None)
+    );
+}
+
+#[tokio::test]
+async fn b110_series_and_seasons_count_unplayed_episodes() {
+    let b = B110::new().await;
+    let [e1, e2, e3] = b.episodes;
+    let [s1, s2] = b.seasons;
+    let id = |item: uuid::Uuid| item.to_string();
+    let seasons_uri = format!("/Shows/{}/Seasons?userId={}", b.series, b.user);
+    let episodes_uri = format!("/Shows/{}/Episodes?userId={}", b.series, b.user);
+    let series_list = format!(
+        "/Users/{}/Items?Recursive=true&IncludeItemTypes=Series",
+        b.user
+    );
+
+    // Nothing watched yet.
+    let series = (id(b.series), Some(false), Some(3), None);
+    assert_eq!(b.details_fields(b.series).await, series);
+    assert_eq!(b.list_fields(&series_list).await, [series]);
+    assert_eq!(
+        b.list_fields(&seasons_uri).await,
+        [
+            (id(s1), Some(false), Some(2), None),
+            (id(s2), Some(false), Some(1), None),
+        ]
+    );
+    let unwatched = |e| (id(e), Some(false), None, None);
+    assert_eq!(
+        b.list_fields(&episodes_uri).await,
+        [unwatched(e1), unwatched(e2), unwatched(e3)]
+    );
+
+    // S02E01 played to the end, S01E01 half watched.
+    b.start(e3).await;
+    b.stop(e3, Some(B110_HOUR / 2)).await;
+    b.start(e1).await;
+    b.stop(e1, Some(B110_HOUR / 4)).await;
+    let series = (id(b.series), Some(false), Some(2), None);
+    assert_eq!(b.details_fields(b.series).await, series);
+    assert_eq!(b.list_fields(&series_list).await, [series]);
+    assert_eq!(
+        b.details_fields(s2).await,
+        (id(s2), Some(true), Some(0), None)
+    );
+    assert_eq!(
+        b.list_fields(&seasons_uri).await,
+        [
+            (id(s1), Some(false), Some(2), None),
+            (id(s2), Some(true), Some(0), None),
+        ]
+    );
+    assert_eq!(
+        b.list_fields(&episodes_uri).await,
+        [
+            (id(e1), Some(false), None, Some(50.0)),
+            unwatched(e2),
+            (id(e3), Some(true), None, None),
+        ]
+    );
+
+    // Without userId the lists are the caller's.
+    let seasons_uri = format!("/Shows/{}/Seasons", b.series);
+    assert_eq!(
+        b.list_fields(&seasons_uri).await[1],
+        (id(s2), Some(true), Some(0), None)
+    );
+
+    // Everything played: the series is played too.
+    for e in [e1, e2] {
+        b.start(e).await;
+        b.stop(e, None).await;
+    }
+    assert_eq!(
+        b.details_fields(b.series).await,
+        (id(b.series), Some(true), Some(0), None)
+    );
+
+    // A second user's counts and Played are their own: they watched S02E01 only.
+    let (other_token, other) = admin_session(&b.state).await;
+    let report = serde_json::json!({ "ItemId": e3 }).to_string();
+    let (status, _) = send_authed(
+        &b.app,
+        "POST",
+        "/Sessions/Playing/Stopped",
+        &other_token,
+        Some(&report),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let mut seen = Vec::new();
+    for item in [b.series, s1, s2] {
+        let uri = format!("/Items/{item}?userId={other}");
+        let (status, body) = send_authed(&b.app, "GET", &uri, &other_token, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        seen.push(b110_watch_fields(&body));
+    }
+    assert_eq!(
+        seen,
+        [
+            (id(b.series), Some(false), Some(2), None),
+            (id(s1), Some(false), Some(2), None),
+            (id(s2), Some(true), Some(0), None),
+        ]
+    );
+    let uri = format!("/Shows/{}/Seasons?userId={other}", b.series);
+    let (status, body) = send_authed(&b.app, "GET", &uri, &other_token, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let seasons: Vec<_> = body["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(b110_watch_fields)
+        .collect();
+    assert_eq!(
+        seasons,
+        [
+            (id(s1), Some(false), Some(2), None),
+            (id(s2), Some(true), Some(0), None),
+        ]
+    );
+    // The first user's are unchanged.
+    assert_eq!(
+        b.details_fields(b.series).await,
+        (id(b.series), Some(true), Some(0), None)
+    );
+}
+
+impl B110 {
+    /// Sends `method` to `uri` as the administrator and returns the status and the answer.
+    async fn send(&self, method: &str, uri: &str) -> (StatusCode, serde_json::Value) {
+        send_authed(&self.app, method, uri, &self.token, None).await
+    }
+
+    /// Whether each of the show's episodes is stored as played.
+    async fn episodes_played(&self) -> Vec<bool> {
+        let mut played = Vec::new();
+        for episode in self.episodes {
+            played.push(self.stored(episode).await.0);
+        }
+        played
+    }
+}
+
+#[tokio::test]
+async fn b110_marking_a_series_or_season_carries_to_its_episodes() {
+    let b = B110::new().await;
+    let [s1, s2] = b.seasons;
+    let id = |item: uuid::Uuid| item.to_string();
+    let series_played = format!("/Users/{}/PlayedItems/{}", b.user, b.series);
+    // Jellyfin's Folder.MarkPlayed/MarkUnplayed mark every episode under the folder, and a
+    // folder's Played comes from its episodes.
+    let (status, answer) = b.send("POST", &series_played).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(
+        (
+            answer["Played"].as_bool(),
+            answer["UnplayedItemCount"].as_i64()
+        ),
+        (Some(true), Some(0)),
+        "{answer}"
+    );
+    assert_eq!(b.episodes_played().await, [true, true, true]);
+    assert_eq!(
+        b.details_fields(b.series).await,
+        (id(b.series), Some(true), Some(0), None)
+    );
+    assert_eq!(
+        b.details_fields(s2).await,
+        (id(s2), Some(true), Some(0), None)
+    );
+
+    let (status, answer) = b.send("DELETE", &series_played).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(
+        (
+            answer["Played"].as_bool(),
+            answer["UnplayedItemCount"].as_i64()
+        ),
+        (Some(false), Some(3)),
+        "{answer}"
+    );
+    assert_eq!(b.episodes_played().await, [false, false, false]);
+    assert_eq!(
+        b.details_fields(b.series).await,
+        (id(b.series), Some(false), Some(3), None)
+    );
+
+    // A season: only its episodes.
+    let (status, _) = b
+        .send("POST", &format!("/Users/{}/PlayedItems/{s1}", b.user))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(b.episodes_played().await, [true, true, false]);
+    assert_eq!(
+        b.details_fields(b.series).await,
+        (id(b.series), Some(false), Some(1), None)
+    );
+    assert_eq!(
+        b.details_fields(s1).await,
+        (id(s1), Some(true), Some(0), None)
+    );
+    // The newer form unmarks it too.
+    let (status, _) = b.send("DELETE", &format!("/UserPlayedItems/{s1}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(b.episodes_played().await, [false, false, false]);
+
+    // A folder's own stored flag no longer decides: a row saying played, with no episode played,
+    // shows unplayed.
+    sqlx::query(
+        "INSERT INTO user_item_data (user_id, item_id, played) VALUES (?, ?, 1) \
+         ON CONFLICT(user_id, item_id) DO UPDATE SET played = 1",
+    )
+    .bind(b.user.to_string())
+    .bind(b.series.to_string())
+    .execute(&b.state.db)
+    .await
+    .unwrap();
+    assert_eq!(
+        b.details_fields(b.series).await,
+        (id(b.series), Some(false), Some(3), None)
+    );
+    let series_list = format!(
+        "/Users/{}/Items?Recursive=true&IncludeItemTypes=Series",
+        b.user
+    );
+    assert_eq!(
+        b.list_fields(&series_list).await,
+        [(id(b.series), Some(false), Some(3), None)]
+    );
+
+    // Another user's episodes are left alone.
+    let (other_token, other) = admin_session(&b.state).await;
+    let uri = format!("/Users/{other}/PlayedItems/{}", b.series);
+    let (status, _) = send_authed(&b.app, "POST", &uri, &other_token, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(b.episodes_played().await, [false, false, false]);
 }
 
 // ── Shows Tests ──
@@ -21500,6 +22308,17 @@ async fn b29_stored(state: &AppState, user_id: &str, item: uuid::Uuid) -> serde_
     serde_json::to_value(data).unwrap()
 }
 
+/// An answer's `UserData` without the fields worked out from the item's runtime and episodes
+/// (B110). A folder's `Played` comes from its episodes, and marking a folder marks them too, so
+/// in B29 it matches the stored flag.
+fn b110_without_derived(user_data: &serde_json::Value) -> serde_json::Value {
+    let mut data = user_data.clone();
+    let object = data.as_object_mut().unwrap();
+    object.remove("PlayedPercentage");
+    object.remove("UnplayedItemCount");
+    data
+}
+
 /// `value` as an answer brings it: written as text and read back, since serde_json can read a
 /// float back 1 ulp off.
 fn b29_as_sent(value: serde_json::Value) -> serde_json::Value {
@@ -21534,7 +22353,7 @@ async fn b29_each_user_gets_their_own_watch_data_in_item_details() {
             "{kind}: B gets A's watch data"
         );
         assert_eq!(
-            details["UserData"],
+            b110_without_derived(&details["UserData"]),
             b29_stored(&state, &b_id, item).await,
             "{kind}: B's UserData"
         );
@@ -21547,7 +22366,7 @@ async fn b29_each_user_gets_their_own_watch_data_in_item_details() {
         );
         let details = b29_details(&app, &a, &a_id, item).await;
         assert_eq!(
-            details["UserData"],
+            b110_without_derived(&details["UserData"]),
             b29_stored(&state, &a_id, item).await,
             "{kind}: A's UserData"
         );

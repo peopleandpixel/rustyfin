@@ -2212,6 +2212,7 @@ async function openStream(session, startTicks) {
     video.onerror = () => {
         if (!current()) return;
         console.error('Video playback error:', video.error);
+        session.failed = true;
         const errMsg = video.error ? video.error.message : t('common.unknown_error');
         $('player-subtitle').textContent = t('common.error_message', { message: errMsg });
     };
@@ -2243,6 +2244,8 @@ async function openStream(session, startTicks) {
                 } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
                     hlsInstance.recoverMediaError();
                 } else {
+                    // Playback that can't recover is reported as failed, which leaves the watched state alone
+                    session.failed = true;
                     hlsInstance.destroy();
                 }
             }
@@ -2582,6 +2585,7 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
         burnedIn: false,
         tracksChanged: false,
         loads: 0,
+        failed: false,
         pendingSeek: null,
         seekTimer: null,
         // Item time in seconds: the pending seek target, else where the stream is
@@ -2616,7 +2620,8 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
                 playerReportInterval = null;
             }
             if (activePlayback === session) activePlayback = null;
-            const reported = API.reportStopped(itemId, ticks, session.reportFields()).catch(e => console.warn('Reporting playback stop failed:', e));
+            // A failed playback leaves the watched state alone, as in Jellyfin
+            const reported = API.reportStopped(itemId, ticks, { ...session.reportFields(), ...(session.failed ? { Failed: true } : {}) }).catch(e => console.warn('Reporting playback stop failed:', e));
             pendingStop = reported;
             // Once the Stopped report is in, refresh the open view so it shows the new resume point
             reported.then(() => {
@@ -2655,6 +2660,7 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
     };
 
     video.onplay = () => updatePlayIcon(true);
+    video.onplaying = () => { session.failed = false; };
     video.onpause = () => updatePlayIcon(false);
     video.onvolumechange = () => {
         updateVolumeIcon();
@@ -2785,6 +2791,9 @@ async function togglePlayed(id, current) {
     try {
         if (current) await API.markUnplayed(id);
         else await API.markPlayed(id);
+        // Marking changes the item's (and a show's episodes') watch data, so drop the cached lists before re-rendering
+        API.invalidateCache('/Items');
+        API.invalidateCache('/Shows');
         toast(current ? t('detail.marked_unplayed') : t('detail.marked_played'));
         if (currentDetailId === id) renderDetail(id);
     } catch (e) {
