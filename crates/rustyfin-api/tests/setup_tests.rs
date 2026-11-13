@@ -69,6 +69,7 @@ async fn test_state() -> (AppState, DataDir) {
         task_scheduler,
         plugin_manager,
         rate_limiter: RateLimiter::new(1000, 60),
+        resource_limiter: RateLimiter::new(1000, 60),
         known_proxies: Arc::new(Vec::new()),
         ws_broadcast: ws_tx,
         log_level_tx,
