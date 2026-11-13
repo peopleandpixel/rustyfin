@@ -5396,6 +5396,10 @@ async fn b18_scoped_rescans_reread_only_their_scope() {
 }
 
 /// A stub TMDb on 127.0.0.1:0 that finds nothing, and the `query` of each movie search it got.
+#[allow(
+    dead_code,
+    reason = "unused since the scoped rescan test runs without a TMDb provider"
+)]
 async fn b18_tmdb_stub() -> (TmdbApi, Arc<std::sync::Mutex<Vec<String>>>) {
     let searches = Arc::new(std::sync::Mutex::new(Vec::new()));
     let seen = searches.clone();

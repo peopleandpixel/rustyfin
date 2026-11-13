@@ -4,15 +4,14 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use plugin_tmdb::tmdb_client::TmdbApi;
 use plugin_tmdb::{
-    PersonPhoto, get_movie_people, get_person_photo, get_similar, get_trailers, get_tv_people,
-    get_tvdb_id, search_movie, search_tv,
+    get_movie_people, get_person_photo, get_similar, get_trailers, get_tv_people, get_tvdb_id,
+    search_movie, search_tv,
 };
 use rustyfin_core::tmdb_client::USER_AGENT;
 use serde_json::{Value, json};
