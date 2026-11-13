@@ -376,11 +376,15 @@ pub async fn get_images_from_nfo(config: &LocalNfoConfig, media_path: &str) -> V
 
 /// FFI entry point for dynamic loading.
 /// Returns a raw pointer to a `Box<dyn Plugin>` for FFI safety.
+///
+/// # Safety
+///
+/// The caller takes ownership of the returned `Box<dyn Plugin>` and must free it exactly once.
 #[cfg(feature = "dynamic")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rustyfin_plugin_create() -> *mut std::ffi::c_void {
-    let plugin = Box::new(LocalNfoPlugin::default());
-    Box::into_raw(plugin)
+    let plugin: Box<dyn Plugin> = Box::new(LocalNfoPlugin::default());
+    Box::into_raw(Box::new(plugin)).cast()
 }
 
 /// Trait for types that can register metadata providers.
