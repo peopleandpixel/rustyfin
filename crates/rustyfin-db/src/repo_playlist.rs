@@ -300,7 +300,9 @@ mod tests {
         create_playlist(&pool, id, "My Playlist", user, Some("Movie"), &[item])
             .await
             .unwrap();
-        let playlist = get_playlist(&pool, id).await.unwrap();
+        let playlist = get_playlist(&pool, id, PlaylistCaller::Owner(user))
+            .await
+            .unwrap();
         assert!(playlist.is_some());
         let playlist = playlist.unwrap();
         assert_eq!(playlist.name, "My Playlist");
@@ -310,7 +312,12 @@ mod tests {
     #[tokio::test]
     async fn test_get_playlist_not_found() {
         let pool = test_pool().await;
-        assert!(get_playlist(&pool, Uuid::new_v4()).await.unwrap().is_none());
+        assert!(
+            get_playlist(&pool, Uuid::new_v4(), PlaylistCaller::Admin)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -342,8 +349,15 @@ mod tests {
         create_playlist(&pool, pid, "To Delete", user, None, &[])
             .await
             .unwrap();
-        delete_playlist(&pool, pid).await.unwrap();
-        assert!(get_playlist(&pool, pid).await.unwrap().is_none());
+        delete_playlist(&pool, pid, PlaylistCaller::Owner(user))
+            .await
+            .unwrap();
+        assert!(
+            get_playlist(&pool, pid, PlaylistCaller::Owner(user))
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -353,11 +367,16 @@ mod tests {
         create_playlist(&pool, pid, "Test", user, None, &[])
             .await
             .unwrap();
-        add_item_to_playlist(&pool, pid, item).await.unwrap();
-        let playlist = get_playlist(&pool, pid).await.unwrap().unwrap();
+        let caller = PlaylistCaller::Owner(user);
+        add_item_to_playlist(&pool, pid, item, caller)
+            .await
+            .unwrap();
+        let playlist = get_playlist(&pool, pid, caller).await.unwrap().unwrap();
         assert_eq!(playlist.child_count, 1);
-        remove_item_from_playlist(&pool, pid, item).await.unwrap();
-        let playlist = get_playlist(&pool, pid).await.unwrap().unwrap();
+        remove_item_from_playlist(&pool, pid, item, caller)
+            .await
+            .unwrap();
+        let playlist = get_playlist(&pool, pid, caller).await.unwrap().unwrap();
         assert_eq!(playlist.child_count, 0);
     }
 
@@ -368,17 +387,20 @@ mod tests {
         create_playlist(&pool, pid, "Old", user, None, &[])
             .await
             .unwrap();
-        update_playlist(&pool, pid, Some("New"), None)
+        let caller = PlaylistCaller::Owner(user);
+        update_playlist(&pool, pid, Some("New"), None, caller)
             .await
             .unwrap();
-        let playlist = get_playlist(&pool, pid).await.unwrap().unwrap();
+        let playlist = get_playlist(&pool, pid, caller).await.unwrap().unwrap();
         assert_eq!(playlist.name, "New");
     }
 
     #[tokio::test]
     async fn test_get_playlist_items_empty() {
         let pool = test_pool().await;
-        let items = get_playlist_items(&pool, Uuid::new_v4()).await.unwrap();
+        let items = get_playlist_items(&pool, Uuid::new_v4(), PlaylistCaller::Admin)
+            .await
+            .unwrap();
         assert!(items.is_empty());
     }
 }

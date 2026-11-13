@@ -427,6 +427,10 @@ async fn b34_refresh_keeps_a_probe_written_while_it_ran() {
 
 /// A TMDb stand-in on 127.0.0.1:0 that finds one movie with a tagline and no overview or
 /// genres. Every other path is a 404.
+#[allow(
+    dead_code,
+    reason = "unused since the refresh test runs without a TMDb provider"
+)]
 async fn b34_tmdb() -> rustyfin_core::tmdb_client::TmdbApi {
     use axum::response::IntoResponse;
     use rustyfin_core::tmdb_client::{TmdbClient, TmdbKey, TmdbSettings};

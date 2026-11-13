@@ -115,13 +115,17 @@ impl TmdbPlugin {
 /// Create a new TMDb plugin instance (FFI entry point for dynamic loading).
 /// Only compiled when building as a dynamic library (`cdylib`).
 /// Returns a raw pointer to a `Box<dyn Plugin>` for FFI safety.
+///
+/// # Safety
+///
+/// The caller takes ownership of the returned `Box<dyn Plugin>` and must free it exactly once.
 #[cfg(feature = "dynamic")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rustyfin_plugin_create() -> *mut std::ffi::c_void {
-    let plugin = Box::new(TmdbPlugin {
+    let plugin: Box<dyn Plugin> = Box::new(TmdbPlugin {
         api_key: Mutex::new(None),
     });
-    Box::into_raw(plugin)
+    Box::into_raw(Box::new(plugin)).cast()
 }
 
 /// Register the TMDb plugin as a metadata provider with the given PluginManager.

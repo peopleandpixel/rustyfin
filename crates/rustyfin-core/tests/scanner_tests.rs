@@ -4158,13 +4158,29 @@ async fn b18_music_library(fx: &Fixture, roots: &[&str]) -> Library {
     lib
 }
 
-/// Scans `lib` with no metadata providers and returns the frames its run sent.
-async fn b18_music_frames(fx: &Fixture, lib: &Library) -> Vec<(u8, ScanStatus)> {
+/// Scans `lib` and returns the frames its run sent. With `with_provider`, an active metadata
+/// provider that finds nothing is registered, so the refresh counts without a request.
+async fn b18_music_frames(
+    fx: &Fixture,
+    lib: &Library,
+    with_provider: bool,
+) -> Vec<(u8, ScanStatus)> {
     let scans = ScanRegistry::new();
     let mut rx = scans.subscribe();
     let ticket = scans.queue(lib.id);
     let client = reqwest::Client::new();
     let pm = rustyfin_core::plugin_manager::PluginManager::new(&std::path::PathBuf::from("."));
+    if with_provider {
+        pm.register_metadata_provider(
+            "b18-noop".to_string(),
+            "B18 no-op".to_string(),
+            rustyfin_model::plugin::PluginStatus::Active,
+            |_, _, _| Box::pin(async { None }),
+            |_, _| Box::pin(async { None }),
+            |_, _, _, _| Box::pin(async { Vec::new() }),
+        )
+        .await;
+    }
     scanner::scan_library_with_metadata(&fx.pool, lib, &client, &pm, &ticket)
         .await
         .unwrap();
@@ -4208,7 +4224,7 @@ async fn b18_music_progress_counts_every_root_before_the_walk() {
     touch(&a, "Artist A/Album 1/03 Song 3.mp3");
     touch(&b, "Artist B/Album 2/01 Song 4.mp3");
 
-    let frames = b18_music_frames(&fx, &lib).await;
+    let frames = b18_music_frames(&fx, &lib, false).await;
     use ScanStatus::{Active, Idle, Queued};
     // Root A's 3 files and root B's 1 are 4 units, known before the first file is read.
     assert_eq!(
@@ -4242,7 +4258,7 @@ async fn b18_music_progress_counts_new_items_when_a_provider_is_set() {
     touch(&c, "Artist C/Album 3/02 Song 2.mp3");
     touch(&d, "Artist D/Album 4/01 Song 3.mp3");
 
-    let frames = b18_music_frames(&fx, &lib).await;
+    let frames = b18_music_frames(&fx, &lib, true).await;
     use ScanStatus::{Active, Idle, Queued};
     assert_eq!(frames[..2], [(0, Queued), (0, Active)], "{frames:?}");
     assert_eq!(frames.last(), Some(&(100, Idle)), "{frames:?}");
@@ -5396,6 +5412,10 @@ async fn b18_scoped_rescans_reread_only_their_scope() {
 }
 
 /// A stub TMDb on 127.0.0.1:0 that finds nothing, and the `query` of each movie search it got.
+#[allow(
+    dead_code,
+    reason = "unused since the scoped rescan test runs without a TMDb provider"
+)]
 async fn b18_tmdb_stub() -> (TmdbApi, Arc<std::sync::Mutex<Vec<String>>>) {
     let searches = Arc::new(std::sync::Mutex::new(Vec::new()));
     let seen = searches.clone();

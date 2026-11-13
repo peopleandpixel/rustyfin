@@ -361,7 +361,7 @@ mod tests {
     #[tokio::test]
     async fn test_search_hints_empty() {
         let pool = crate::test_pool().await;
-        let hints = search_hints(&pool, "nonexistent", 10).await.unwrap();
+        let hints = hint_candidates(&pool, "nonexistent", None).await.unwrap();
         assert!(hints.is_empty());
     }
 
