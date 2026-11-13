@@ -129,8 +129,16 @@ async fn get_seasons(
         .collect();
     let total = seasons.len() as i64;
 
-    let tmdb_key = state.plugin_manager.get_configuration("tmdb").await
-        .and_then(|c| c.values.get("api_key").and_then(|v| v.as_str()).map(|s| s.to_string()));
+    let tmdb_key = state
+        .plugin_manager
+        .get_configuration("tmdb")
+        .await
+        .and_then(|c| {
+            c.values
+                .get("api_key")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        });
     let tmdb = tmdb_key.as_deref();
     enrich_items(
         &state.db_ro,
@@ -196,8 +204,16 @@ async fn get_episodes(
         Vec::new()
     };
 
-    let tmdb_key = state.plugin_manager.get_configuration("tmdb").await
-        .and_then(|c| c.values.get("api_key").and_then(|v| v.as_str()).map(|s| s.to_string()));
+    let tmdb_key = state
+        .plugin_manager
+        .get_configuration("tmdb")
+        .await
+        .and_then(|c| {
+            c.values
+                .get("api_key")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        });
     let tmdb = tmdb_key.as_deref();
     enrich_items(
         &state.db_ro,
