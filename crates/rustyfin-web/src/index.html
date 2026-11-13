@@ -196,6 +196,40 @@
                 <div class="wiz-lib-paths space-y-3"></div>
             </div>
         </template>
+        <template id="wiz-tpl-man-lib">
+            <div class="wiz-man-lib p-4 rounded-xl bg-white/5 border border-white/10 space-y-3">
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div>
+                        <label class="block text-xs font-medium text-white/70 mb-1.5" data-i18n="wizard.library_name">Library name</label>
+                        <input type="text" class="wiz-man-name jf-input w-full" placeholder="e.g. Movies" data-i18n-placeholder="wizard.library_name_placeholder">
+                    </div>
+                    <div>
+                        <label class="block text-xs font-medium text-white/70 mb-1.5" data-i18n="wizard.content_type">Content type</label>
+                        <select class="wiz-man-type jf-input w-full">
+                            <option value="Movies" data-i18n="library.type_movies">🎬 Movies</option>
+                            <option value="TvShows" data-i18n="library.type_shows">📺 Shows</option>
+                            <option value="Music" data-i18n="library.type_music">🎵 Music</option>
+                            <option value="Photos" data-i18n="library.type_photos">🖼️ Photos</option>
+                            <option value="Mixed" data-i18n="library.type_mixed">📁 Mixed</option>
+                        </select>
+                    </div>
+                </div>
+                <div>
+                    <label class="block text-xs font-medium text-white/70 mb-1.5" data-i18n="wizard.folder_path">Folder path</label>
+                    <div class="wiz-man-paths space-y-2">
+                        <div class="path-field flex gap-2">
+                            <input type="text" class="wiz-man-path jf-input flex-1 min-w-0" placeholder="/media/movies" data-i18n-placeholder="wizard.folder_path_placeholder" data-path-field list="path-suggestions" autocomplete="off" spellcheck="false">
+                            <button type="button" class="jf-btn-ghost !px-3 !py-2 text-xs whitespace-nowrap" data-action="browse-path" data-i18n="library.browse">📁 Browse</button>
+                        </div>
+                    </div>
+                    <button type="button" class="jf-btn-ghost !px-3 !py-1.5 text-xs mt-2" data-action="add-lib-path" data-i18n="library.add_path">+ Add path</button>
+                </div>
+                <div class="wiz-man-error hidden text-red-400 text-xs p-2 rounded bg-red-500/10 border border-red-500/20"></div>
+                <div class="flex justify-end">
+                    <button type="button" class="jf-btn-ghost !px-3 !py-1.5 text-xs" data-action="wiz-remove-lib" data-i18n="wizard.remove_library">Remove library</button>
+                </div>
+            </div>
+        </template>
         <template id="wiz-tpl-path">
             <div class="wiz-path">
                 <label class="wiz-path-label block text-xs font-medium text-white/70 mb-1.5"></label>
@@ -241,29 +275,8 @@
             <div class="jf-settings-card !bg-[#1a202c]/60">
                 <h2 class="text-lg font-bold text-white mb-2" data-i18n="wizard.library_title">Media Library (Optional)</h2>
                 <p class="text-white/60 text-xs mb-5" data-i18n="wizard.library_intro">Add your first media folder, or skip this step. You can add libraries at any time in the dashboard.</p>
-                <div class="space-y-4">
-                    <div>
-                        <label class="block text-xs font-medium text-white/70 mb-1.5" data-i18n="wizard.library_name">Library name</label>
-                        <input type="text" id="wiz-lib-name" class="jf-input w-full" placeholder="e.g. Movies" data-i18n-placeholder="wizard.library_name_placeholder">
-                    </div>
-                    <div>
-                        <label class="block text-xs font-medium text-white/70 mb-1.5" data-i18n="wizard.content_type">Content type</label>
-                        <select id="wiz-lib-type" class="jf-input w-full">
-                            <option value="Movies" data-i18n="library.type_movies">🎬 Movies</option>
-                            <option value="TvShows" data-i18n="library.type_shows">📺 Shows</option>
-                            <option value="Music" data-i18n="library.type_music">🎵 Music</option>
-                            <option value="Photos" data-i18n="library.type_photos">🖼️ Photos</option>
-                            <option value="Mixed" data-i18n="library.type_mixed">📁 Mixed</option>
-                        </select>
-                    </div>
-                    <div>
-                        <label class="block text-xs font-medium text-white/70 mb-1.5" data-i18n="wizard.folder_path">Folder path</label>
-                        <div class="path-field flex gap-2">
-                            <input type="text" id="wiz-lib-path" class="jf-input flex-1 min-w-0" placeholder="/media/movies" data-i18n-placeholder="wizard.folder_path_placeholder" data-path-field list="path-suggestions" autocomplete="off" spellcheck="false">
-                            <button type="button" class="jf-btn-ghost !px-3 !py-2 text-xs whitespace-nowrap" data-action="browse-path" data-i18n="library.browse">📁 Browse</button>
-                        </div>
-                    </div>
-                </div>
+                <div id="wiz-man-libs" class="space-y-3"></div>
+                <button type="button" class="jf-btn-ghost !px-3 !py-1.5 text-xs mt-3" data-action="wiz-add-lib" data-i18n="wizard.add_library">+ Add another library</button>
             </div>
             <div id="wiz-lib-error" class="text-red-400 text-xs mt-2 hidden p-2 rounded bg-red-500/10 border border-red-500/20"></div>
             <div class="flex justify-between mt-6">
