@@ -155,10 +155,10 @@ async fn enrich_item(
     // ProviderIds from tmdb_id/tvdb_id
     let mut provider_ids = rustyfin_model::media::ProviderIds::default();
     if let Some(tmdb) = item.tmdb_id {
-        provider_ids.set("tmdb".to_string(), tmdb.to_string());
+        provider_ids.set("Tmdb".to_string(), tmdb.to_string());
     }
     if let Some(tvdb) = item.tvdb_id {
-        provider_ids.set("tvdb".to_string(), tvdb.to_string());
+        provider_ids.set("Tvdb".to_string(), tvdb.to_string());
     }
     item.provider_ids = provider_ids;
 
@@ -171,7 +171,7 @@ async fn enrich_item(
             item.critic_rating = Some(rating);
         }
         if let Some(imdb) = extras.imdb_id {
-            item.provider_ids.set("imdb".to_string(), imdb);
+            item.provider_ids.set("Imdb".to_string(), imdb);
         }
         item.lock_data = extras.lock_data;
         item.locked_fields = extras
@@ -806,6 +806,14 @@ pub(crate) async fn enrich_items(
             .unwrap_or_default()
     };
 
+    // Batch query: studios and IMDb ids for all items
+    let studios_map = rustyfin_db::repo_media::get_studios_for_items(pool, &item_ids)
+        .await
+        .unwrap_or_default();
+    let imdb_map = rustyfin_db::repo_media::get_imdb_ids_for_items(pool, &item_ids)
+        .await
+        .unwrap_or_default();
+
     // Batch query 8: People for all items
     let people_map: std::collections::HashMap<String, Vec<rustyfin_db::repo_media::PersonRow>> = {
         let mut map: std::collections::HashMap<String, Vec<rustyfin_db::repo_media::PersonRow>> =
@@ -884,10 +892,13 @@ pub(crate) async fn enrich_items(
         // ProviderIds from tmdb_id/tvdb_id
         let mut provider_ids = rustyfin_model::media::ProviderIds::default();
         if let Some(tmdb) = item.tmdb_id {
-            provider_ids.set("tmdb".to_string(), tmdb.to_string());
+            provider_ids.set("Tmdb".to_string(), tmdb.to_string());
         }
         if let Some(tvdb) = item.tvdb_id {
-            provider_ids.set("tvdb".to_string(), tvdb.to_string());
+            provider_ids.set("Tvdb".to_string(), tvdb.to_string());
+        }
+        if let Some(imdb) = imdb_map.get(&item.id.to_string()) {
+            provider_ids.set("Imdb".to_string(), imdb.clone());
         }
         item.provider_ids = provider_ids;
 
@@ -1332,6 +1343,20 @@ pub(crate) async fn enrich_items(
                 item.artists = item.people.clone();
                 item.album_artists = item.people.clone();
             }
+        }
+
+        // --- Studios from batch map, with the ids that /Studios lists (as enrich_item) ---
+        if item.studios.is_empty()
+            && let Some(studio_rows) = studios_map.get(&item.id.to_string())
+        {
+            let studio = rustyfin_db::repo_by_name::ByNameKind::Studio;
+            item.studios = studio_rows
+                .iter()
+                .map(|(_, sname)| rustyfin_model::media::StudioInfo {
+                    id: rustyfin_db::repo_by_name::by_name_id(studio, sname).to_string(),
+                    name: sname.clone(),
+                })
+                .collect();
         }
     }
 

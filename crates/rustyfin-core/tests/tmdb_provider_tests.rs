@@ -169,7 +169,14 @@ fn canned(path: &str) -> Option<Value> {
             "release_date": "2001-05-04",
             "genres": [{"id": 18, "name": "Drama"}],
             "credits": people(),
-            "external_ids": {"imdb_id": "tt9001"}
+            "imdb_id": "tt9001",
+            "production_companies": [{"id": 5, "name": "G12 Pictures"}],
+            "images": images(),
+            "releases": {"countries": [
+                {"iso_3166_1": "DE", "certification": "12"},
+                {"iso_3166_1": "US", "certification": ""},
+                {"iso_3166_1": "US", "certification": "R"}
+            ]}
         }),
         "/movie/9001/external_ids" => json!({"id": 9001, "imdb_id": "tt9001"}),
         "/movie/9001/images" | "/tv/9101/images" => json!({
@@ -190,13 +197,57 @@ fn canned(path: &str) -> Option<Value> {
             "name": "Gamma Show",
             "overview": "G12 stub show overview",
             "original_language": "en",
-            "first_air_date": "2003-01-01"
+            "first_air_date": "2003-01-01",
+            "credits": people(),
+            "images": images(),
+            "external_ids": {"tvdb_id": 79101, "imdb_id": "tt9101"},
+            "content_ratings": {"results": [
+                {"iso_3166_1": "GB", "rating": "15"},
+                {"iso_3166_1": "US", "rating": "TV-MA"}
+            ]},
+            "networks": [{"id": 4, "name": "G12 Network"}],
+            "production_companies": [{"id": 5, "name": "G12 Pictures"}]
+        }),
+        "/tv/9101/season/1" => json!({
+            "id": 5101,
+            "name": "Season 1",
+            "overview": "R1 season overview",
+            "air_date": "2003-01-01",
+            "poster_path": "/r1-season-poster.jpg",
+            "episodes": [
+                {
+                    "id": 6101, "episode_number": 1, "name": "Pilot: One",
+                    "overview": "R1 episode one", "air_date": "2003-01-01", "vote_average": 7.5,
+                    "still_path": "/r1-still-1.jpg",
+                    "crew": [{"id": 78, "name": "Eli Director", "job": "Director",
+                              "department": "Directing", "profile_path": null}],
+                    "guest_stars": [{"id": 79, "name": "Gus Guest", "character": "Mailman",
+                                     "profile_path": "/r1-gus.jpg"}]
+                },
+                {"id": 6102, "episode_number": 2, "name": "Two", "air_date": "2003-01-08"}
+            ]
         }),
         "/tv/9101/external_ids" => json!({"id": 9101, "tvdb_id": 79101, "imdb_id": "tt9101"}),
         "/person/77" => json!({"id": 77, "name": "Dana Actor", "profile_path": "/g12-dana.jpg"}),
         _ => return None,
     };
     Some(body)
+}
+
+/// Posters, backdrops (one with English text, a Thumb) and a logo, as `images` appends them.
+fn images() -> Value {
+    json!({
+        "posters": [
+            {"file_path": "/g12-poster-fr.jpg", "iso_639_1": "fr", "vote_average": 9.0},
+            {"file_path": "/g12-poster-1.jpg", "iso_639_1": "en", "vote_average": 5.0},
+            {"file_path": "/g12-poster-2.jpg", "iso_639_1": null, "vote_average": 8.0}
+        ],
+        "backdrops": [
+            {"file_path": "/g12-thumb.jpg", "iso_639_1": "en", "vote_average": 9.0},
+            {"file_path": "/g12-backdrop.jpg", "iso_639_1": null, "vote_average": 1.0}
+        ],
+        "logos": [{"file_path": "/g12-logo.png", "iso_639_1": "en"}]
+    })
 }
 
 /// A cast and crew list, each person with a photo.
@@ -267,10 +318,10 @@ async fn search_movie_goes_through_the_client() {
     let details = stub.requested("/movie/9001");
     assert_eq!(
         details.param("append_to_response"),
-        Some("credits,external_ids")
+        Some("credits,images,keywords,releases,videos")
     );
-    stub.requested("/movie/9001/external_ids");
-    stub.requested("/movie/9001/images");
+    // R1: the details call carries the IMDb id and images; nothing else is asked
+    assert_eq!(r1scan_paths(&stub), ["/search/movie", "/movie/9001"]);
     stub.assert_all_signed();
 }
 
@@ -279,7 +330,7 @@ async fn search_movie_goes_through_the_client() {
 async fn search_tv_goes_through_the_client() {
     let stub = Stub::start(Mode::Canned).await;
 
-    let meta = search_tv(&stub.api(), "Gamma Show")
+    let meta = search_tv(&stub.api(), "Gamma Show", None)
         .await
         .expect("show metadata");
 
@@ -297,11 +348,126 @@ async fn search_tv_goes_through_the_client() {
     );
     assert_eq!(
         stub.requested("/tv/9101").param("append_to_response"),
-        Some("credits,external_ids")
+        Some(
+            "credits,images,external_ids,content_ratings,keywords,videos,episode_groups,aggregate_credits"
+        )
     );
-    stub.requested("/tv/9101/external_ids");
-    stub.requested("/tv/9101/images");
+    assert_eq!(r1scan_paths(&stub), ["/search/tv", "/tv/9101"]);
     stub.assert_all_signed();
+}
+
+/// The paths the stub was asked for, in order.
+fn r1scan_paths(stub: &Stub) -> Vec<String> {
+    stub.hits().into_iter().map(|hit| hit.path).collect()
+}
+
+/// R1 scan: a movie's one details call gives the IMDb id, the US certification, studios, people
+/// (cast as Actor, the director as Director, with photos), the premiere date and the images,
+/// English posters first and a backdrop with text as Thumb.
+#[tokio::test]
+async fn r1scan_movie_details_fill_everything_from_one_call() {
+    let stub = Stub::start(Mode::Canned).await;
+    let meta = plugin_tmdb::movie_by_id(&stub.api(), 9001)
+        .await
+        .expect("movie metadata");
+
+    assert_eq!(meta.imdb_id.as_deref(), Some("tt9001"));
+    assert_eq!(meta.official_rating.as_deref(), Some("R"));
+    assert_eq!(meta.premiere_date.as_deref(), Some("2001-05-04"));
+    assert_eq!(meta.studios, Some(vec!["G12 Pictures".to_string()]));
+    let people = meta.people.expect("people");
+    let kinds: Vec<(&str, &str)> = people
+        .iter()
+        .map(|p| (p.name.as_str(), p.kind.as_str()))
+        .collect();
+    assert_eq!(
+        kinds,
+        [("Dana Actor", "Actor"), ("Eli Director", "Director")]
+    );
+    assert_eq!(people[0].role.as_deref(), Some("Self"));
+    assert_eq!(
+        people[0].image_url,
+        Some(format!("{}/g12-dana.jpg", stub.image_base()))
+    );
+    let url = |kind: &str| {
+        meta.image_urls
+            .iter()
+            .find(|i| i.image_type == kind)
+            .map(|i| i.url.clone())
+    };
+    let base = stub.image_base();
+    assert_eq!(url("Primary"), Some(format!("{base}/g12-poster-1.jpg")));
+    assert_eq!(url("Thumb"), Some(format!("{base}/g12-thumb.jpg")));
+    assert_eq!(url("Backdrop"), Some(format!("{base}/g12-backdrop.jpg")));
+    assert_eq!(url("Logo"), Some(format!("{base}/g12-logo.png")));
+    assert_eq!(r1scan_paths(&stub), ["/movie/9001"]);
+}
+
+/// R1 scan: a series' details call gives the TVDb and IMDb ids, the US content rating and the
+/// networks as studios; a series search sends the first-air year.
+#[tokio::test]
+async fn r1scan_series_details_and_year_search() {
+    let stub = Stub::start(Mode::Canned).await;
+    let meta = search_tv(&stub.api(), "Gamma Show", Some(2003))
+        .await
+        .expect("show metadata");
+
+    assert_eq!(
+        stub.requested("/search/tv").param("first_air_date_year"),
+        Some("2003")
+    );
+    assert_eq!(meta.tvdb_id, Some(79101));
+    assert_eq!(meta.imdb_id.as_deref(), Some("tt9101"));
+    assert_eq!(meta.official_rating.as_deref(), Some("TV-MA"));
+    assert_eq!(meta.studios, Some(vec!["G12 Network".to_string()]));
+    assert_eq!(meta.premiere_date.as_deref(), Some("2003-01-01"));
+    assert!(meta.people.is_some_and(|p| !p.is_empty()));
+}
+
+/// R1 scan (B147): one season call gives the season and every episode it lists.
+#[tokio::test]
+async fn r1scan_season_lists_its_episodes() {
+    let stub = Stub::start(Mode::Canned).await;
+    let season = plugin_tmdb::season(&stub.api(), 9101, 1)
+        .await
+        .expect("season");
+
+    assert_eq!(
+        stub.requested("/tv/9101/season/1")
+            .param("append_to_response"),
+        Some("credits,images,external_ids,videos")
+    );
+    assert_eq!(r1scan_paths(&stub), ["/tv/9101/season/1"]);
+    let base = stub.image_base();
+    assert_eq!(season.meta.overview.as_deref(), Some("R1 season overview"));
+    assert_eq!(season.meta.tmdb_id, Some(5101));
+    assert_eq!(
+        season.meta.image_urls[0].url,
+        format!("{base}/r1-season-poster.jpg")
+    );
+    assert_eq!(season.episodes.len(), 2);
+    let (number, one) = &season.episodes[0];
+    assert_eq!(*number, 1);
+    assert_eq!(one.name.as_deref(), Some("Pilot: One"));
+    assert_eq!(one.tmdb_id, Some(6101));
+    assert_eq!(one.community_rating, Some(7.5));
+    assert_eq!(one.premiere_date.as_deref(), Some("2003-01-01"));
+    assert_eq!(one.image_urls[0].image_type, "Primary");
+    assert_eq!(one.image_urls[0].url, format!("{base}/r1-still-1.jpg"));
+    let people: Vec<(&str, &str)> = one
+        .people
+        .iter()
+        .flatten()
+        .map(|p| (p.name.as_str(), p.kind.as_str()))
+        .collect();
+    assert_eq!(
+        people,
+        [("Gus Guest", "GuestStar"), ("Eli Director", "Director")]
+    );
+    // An episode without a rating or still has none
+    let (_, two) = &season.episodes[1];
+    assert_eq!(two.community_rating, None);
+    assert!(two.image_urls.is_empty());
 }
 
 #[tokio::test]
@@ -440,7 +606,14 @@ async fn failures_give_none_or_nothing() {
 
         let movie = search_movie(&api, "Alpha Film", None).await;
         assert!(movie.is_none(), "{status}");
-        assert!(search_tv(&api, "Gamma Show").await.is_none(), "{status}");
+        assert!(
+            search_tv(&api, "Gamma Show", None).await.is_none(),
+            "{status}"
+        );
+        assert!(
+            plugin_tmdb::season(&api, 9101, 1).await.is_none(),
+            "{status}"
+        );
         let photo = get_person_photo(&api, 77).await;
         assert!(photo.is_none(), "{status}");
         let movie_people = get_movie_people(&api, 9001).await;

@@ -6,7 +6,9 @@ use std::sync::{Arc, Mutex};
 
 use crate::tmdb_client::{TmdbApi, TmdbClient};
 use rustyfin_model::media::MediaType;
-use rustyfin_model::metadata::{ExternalMetadata, MetadataImage};
+use rustyfin_model::metadata::{
+    ExternalMetadata, MetadataImage, MetadataLookups, MetadataPerson, SeasonMetadata,
+};
 use rustyfin_model::plugin::{Plugin, PluginStatus, PluginType};
 use serde::Deserialize;
 
@@ -45,6 +47,60 @@ pub trait MetadataProviderRegistrar {
             + Send
             + Sync
             + 'static;
+
+    /// Attach id, year-aware and season lookups to the provider registered as `provider_name`.
+    async fn register_metadata_lookups(
+        &self,
+        _provider_name: String,
+        _lookups: Arc<dyn MetadataLookups>,
+    ) {
+    }
+}
+
+/// The TMDb lookups behind `MetadataLookups`, sharing the provider's key and client.
+struct TmdbLookups {
+    key: Arc<Mutex<Option<String>>>,
+    client: TmdbClient,
+}
+
+impl TmdbLookups {
+    fn api(&self) -> Option<TmdbApi> {
+        let current = self.key.lock().unwrap().clone();
+        self.client.api(current.as_deref())
+    }
+}
+
+impl MetadataLookups for TmdbLookups {
+    fn movie_by_id(
+        &self,
+        id: i64,
+    ) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send + '_>> {
+        Box::pin(async move { movie_by_id(&self.api()?, id).await })
+    }
+
+    fn series_by_id(
+        &self,
+        id: i64,
+    ) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send + '_>> {
+        Box::pin(async move { series_by_id(&self.api()?, id).await })
+    }
+
+    fn search_series(
+        &self,
+        name: &str,
+        year: Option<i32>,
+    ) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send + '_>> {
+        let name = name.to_string();
+        Box::pin(async move { search_tv(&self.api()?, &name, year).await })
+    }
+
+    fn season(
+        &self,
+        series_id: i64,
+        season_number: i32,
+    ) -> Pin<Box<dyn Future<Output = Option<SeasonMetadata>> + Send + '_>> {
+        Box::pin(async move { season(&self.api()?, series_id, season_number).await })
+    }
 }
 
 // ── Plugin implementation ──
@@ -147,7 +203,11 @@ where
     let key3 = plugin.api_key.clone();
     let client1 = client.clone();
     let client2 = client.clone();
-    let client3 = client;
+    let client3 = client.clone();
+    let lookups = Arc::new(TmdbLookups {
+        key: plugin.api_key.clone(),
+        client,
+    });
 
     let plugin_id = plugin.id().to_string();
     plugin_manager
@@ -176,13 +236,13 @@ where
                 Box::pin(async move {
                     let current = key.lock().unwrap().clone();
                     let tmdb = client.api(current.as_deref())?;
-                    search_tv(&tmdb, &name).await
+                    search_tv(&tmdb, &name, None).await
                 })
             },
             move |_client: &reqwest::Client,
                   tmdb_id: Option<i64>,
                   _tvdb_id: Option<i64>,
-                  _media_type: MediaType|
+                  media_type: MediaType|
                   -> Pin<Box<dyn Future<Output = Vec<MetadataImage>> + Send>> {
                 let key = key3.clone();
                 let client = client3.clone();
@@ -194,23 +254,32 @@ where
                     let Some(tmdb) = client.api(current.as_deref()) else {
                         return Vec::new();
                     };
-                    fetch_images_for_tmdb(&tmdb, id).await
+                    fetch_images_for_tmdb(&tmdb, id, media_type).await
                 })
             },
         )
+        .await;
+    plugin_manager
+        .register_metadata_lookups("tmdb".to_string(), lookups)
         .await;
 
     Ok(())
 }
 
-/// Fetch images for a TMDb ID (used by the registration closure).
-async fn fetch_images_for_tmdb(tmdb: &TmdbApi, tmdb_id: i64) -> Vec<MetadataImage> {
-    // Try movie first, then TV
-    let movie_images = fetch_images(tmdb, "movie", tmdb_id).await;
-    if !movie_images.is_empty() {
-        return movie_images;
-    }
-    fetch_images(tmdb, "tv", tmdb_id).await
+/// The images of a movie's or series' TMDb id. They come with the details call, which the client
+/// has cached from the identification, so this adds no request. A TMDb id is a movie's or a
+/// series' by the item's type; other types have none here.
+async fn fetch_images_for_tmdb(
+    tmdb: &TmdbApi,
+    tmdb_id: i64,
+    media_type: MediaType,
+) -> Vec<MetadataImage> {
+    let meta = match media_type {
+        MediaType::Movie => movie_by_id(tmdb, tmdb_id).await,
+        MediaType::Series => series_by_id(tmdb, tmdb_id).await,
+        _ => None,
+    };
+    meta.map(|m| m.image_urls).unwrap_or_default()
 }
 
 /// TMDb person details with photo
@@ -236,7 +305,6 @@ struct TmdbPersonDetails {
 struct TmdbCastMember {
     id: i64,
     name: String,
-    #[allow(dead_code)]
     character: Option<String>,
     profile_path: Option<String>,
 }
@@ -246,7 +314,6 @@ struct TmdbCastMember {
 struct TmdbCrewMember {
     id: i64,
     name: String,
-    #[allow(dead_code)]
     job: Option<String>,
     department: Option<String>,
     profile_path: Option<String>,
@@ -402,11 +469,60 @@ struct TmdbSearchItem {
     genre_ids: Option<Vec<i32>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct TmdbImages {
     posters: Option<Vec<TmdbImage>>,
     backdrops: Option<Vec<TmdbImage>>,
     logos: Option<Vec<TmdbImage>>,
+}
+
+/// `releases` appended to a movie: the release (and certification) per country
+#[derive(Debug, Deserialize)]
+struct TmdbReleases {
+    countries: Option<Vec<TmdbReleaseCountry>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TmdbReleaseCountry {
+    iso_3166_1: String,
+    certification: Option<String>,
+}
+
+/// `content_ratings` appended to a series
+#[derive(Debug, Deserialize)]
+struct TmdbContentRatings {
+    results: Option<Vec<TmdbContentRating>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TmdbContentRating {
+    iso_3166_1: String,
+    rating: Option<String>,
+}
+
+/// A season with its episodes (`/tv/{id}/season/{n}`)
+#[derive(Debug, Deserialize)]
+struct TmdbSeason {
+    id: Option<i64>,
+    overview: Option<String>,
+    air_date: Option<String>,
+    poster_path: Option<String>,
+    images: Option<TmdbImages>,
+    episodes: Option<Vec<TmdbEpisode>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TmdbEpisode {
+    id: i64,
+    episode_number: i32,
+    name: Option<String>,
+    overview: Option<String>,
+    air_date: Option<String>,
+    vote_average: Option<f64>,
+    runtime: Option<i32>,
+    still_path: Option<String>,
+    crew: Option<Vec<TmdbCrewMember>>,
+    guest_stars: Option<Vec<TmdbCastMember>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -455,6 +571,10 @@ struct TmdbMovieDetails {
     production_countries: Option<Vec<TmdbProductionCountry>>,
     #[serde(rename = "spoken_languages")]
     spoken_languages: Option<Vec<TmdbSpokenLanguage>>,
+    imdb_id: Option<String>,
+    credits: Option<TmdbCredits>,
+    images: Option<TmdbImages>,
+    releases: Option<TmdbReleases>,
 }
 
 /// Full TMDb TV details response
@@ -480,6 +600,11 @@ struct TmdbTvDetails {
     episode_run_time: Option<Vec<i32>>,
     number_of_seasons: Option<i32>,
     number_of_episodes: Option<i32>,
+    networks: Option<Vec<TmdbProductionCompany>>,
+    credits: Option<TmdbCredits>,
+    images: Option<TmdbImages>,
+    external_ids: Option<TmdbExternalIds>,
+    content_ratings: Option<TmdbContentRatings>,
 }
 
 /// TMDb genre
@@ -504,7 +629,24 @@ struct TmdbImage {
     file_path: String,
     width: Option<i32>,
     height: Option<i32>,
+    iso_639_1: Option<String>,
+    vote_average: Option<f64>,
 }
+
+/// What a movie details call appends, as Jellyfin 12.4's TMDb plugin asks for it, so that one call
+/// gives the details, credits, images, IMDb id and certifications (and the TMDb cache shares the
+/// entry with Jellyfin's).
+const MOVIE_APPEND: &str = "credits,images,keywords,releases,videos";
+/// What a series details call appends (Jellyfin 12.4's list).
+const SERIES_APPEND: &str =
+    "credits,images,external_ids,content_ratings,keywords,videos,episode_groups,aggregate_credits";
+/// What a season call appends (Jellyfin 12.4's list). The season lists all its episodes.
+const SEASON_APPEND: &str = "credits,images,external_ids,videos";
+/// Jellyfin's default for the TMDb plugin's MaxCastMembers.
+const MAX_CAST: usize = 15;
+/// The country whose certification becomes the official rating (Jellyfin's default metadata
+/// country).
+const RATING_COUNTRY: &str = "US";
 
 /// Search TMDb for a movie and return full metadata from details endpoint
 pub async fn search_movie(
@@ -524,34 +666,24 @@ pub async fn search_movie(
         Err(_) => return None,
     };
     let search_item = resp.results.into_iter().next()?;
-    let tmdb_id = search_item.id;
 
-    // Step 2: Fetch full details from the details endpoint
+    // Step 2: everything else comes with the details
+    movie_by_id(tmdb, search_item.id).await
+}
+
+/// A movie's metadata by TMDb id, from one details call.
+pub async fn movie_by_id(tmdb: &TmdbApi, tmdb_id: i64) -> Option<ExternalMetadata> {
     let details_endpoint = format!("/movie/{}", tmdb_id);
-    let details_query = [("append_to_response", "credits,external_ids")];
+    let details_query = [("append_to_response", MOVIE_APPEND)];
     let details: TmdbMovieDetails = match tmdb.get_json(&details_endpoint, &details_query).await {
         Ok(json) => serde_json::from_value(json).ok()?,
         Err(_) => return None,
     };
 
-    // Step 3: Fetch external IDs (IMDb, TVDb)
-    let external_ids: Option<TmdbExternalIds> = {
-        let endpoint = format!("/movie/{}/external_ids", tmdb_id);
-        match tmdb.get_json(&endpoint, &[]).await {
-            Ok(json) => serde_json::from_value(json).ok(),
-            Err(_) => None,
-        }
-    };
-
-    // Step 4: Fetch images
-    let images = fetch_images(tmdb, "movie", tmdb_id).await;
+    let images = convert_images(tmdb, details.images.unwrap_or_default());
 
     // Parse production year from release_date
-    let production_year = details
-        .release_date
-        .as_deref()
-        .and_then(|d| d.split('-').next())
-        .and_then(|y| y.parse().ok());
+    let production_year = year_of(details.release_date.as_deref());
 
     // Genres from details (names, not IDs)
     let genres = details
@@ -575,20 +707,25 @@ pub async fn search_movie(
         .runtime
         .map(|mins| (mins as i64) * 60_i64 * 10_000_000);
 
-    // Directors from credits (fetched via append_to_response)
-    let directors = None; // Will be fetched via get_movie_people
+    // The certification of the rating country's release
+    let official_rating = details
+        .releases
+        .and_then(|r| r.countries)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|c| c.iso_3166_1 == RATING_COUNTRY)
+        .find_map(|c| non_empty(c.certification));
 
-    // Writers from credits
-    let writers = None; // Will be fetched via get_movie_people
+    let people = details.credits.map(|c| convert_people(tmdb, c, "Actor"));
 
     Some(ExternalMetadata {
         name: details.title,
         overview: details.overview,
         production_year,
         community_rating: details.vote_average,
-        official_rating: None,
+        official_rating,
         genres,
-        premiere_date: details.release_date,
+        premiere_date: non_empty(details.release_date),
         runtime_ticks,
         image_urls: images,
         tmdb_id: Some(tmdb_id),
@@ -608,59 +745,57 @@ pub async fn search_movie(
         vote_count: details.vote_count,
         popularity: details.popularity,
         studios,
-        directors,
-        writers,
-        imdb_id: external_ids.and_then(|e| e.imdb_id),
+        directors: None,
+        writers: None,
+        imdb_id: non_empty(details.imdb_id),
+        people,
     })
 }
 
-/// Search TMDb for a TV show and return full metadata from details endpoint
-pub async fn search_tv(tmdb: &TmdbApi, name: &str) -> Option<ExternalMetadata> {
+/// Search TMDb for a TV show and return full metadata from details endpoint. `year` is the first
+/// air year, which Jellyfin sends from the folder name ("One Night (2023)").
+pub async fn search_tv(tmdb: &TmdbApi, name: &str, year: Option<i32>) -> Option<ExternalMetadata> {
     // Step 1: Search to find the TMDb ID
-    let query = [("query", name)];
+    let year_text = year.map(|y| y.to_string());
+    let mut query = vec![("query", name)];
+    if let Some(y) = year_text.as_deref() {
+        query.push(("first_air_date_year", y));
+    }
     let resp: TmdbSearchResult = match tmdb.get_json("/search/tv", &query).await {
         Ok(json) => serde_json::from_value(json).ok()?,
         Err(_) => return None,
     };
     let search_item = resp.results.into_iter().next()?;
-    let tmdb_id = search_item.id;
 
-    // Step 2: Fetch full details from the details endpoint
+    // Step 2: everything else comes with the details
+    series_by_id(tmdb, search_item.id).await
+}
+
+/// A series' metadata by TMDb id, from one details call.
+pub async fn series_by_id(tmdb: &TmdbApi, tmdb_id: i64) -> Option<ExternalMetadata> {
     let details_endpoint = format!("/tv/{}", tmdb_id);
-    let details_query = [("append_to_response", "credits,external_ids")];
+    let details_query = [("append_to_response", SERIES_APPEND)];
     let details: TmdbTvDetails = match tmdb.get_json(&details_endpoint, &details_query).await {
         Ok(json) => serde_json::from_value(json).ok()?,
         Err(_) => return None,
     };
 
-    // Step 3: Fetch external IDs (IMDb, TVDb)
-    let external_ids: Option<TmdbExternalIds> = {
-        let endpoint = format!("/tv/{}/external_ids", tmdb_id);
-        match tmdb.get_json(&endpoint, &[]).await {
-            Ok(json) => serde_json::from_value(json).ok(),
-            Err(_) => None,
-        }
-    };
-
-    // Step 4: Fetch images
-    let images = fetch_images(tmdb, "tv", tmdb_id).await;
+    let images = convert_images(tmdb, details.images.unwrap_or_default());
 
     // Parse production year from first_air_date
-    let production_year = details
-        .first_air_date
-        .as_deref()
-        .and_then(|d| d.split('-').next())
-        .and_then(|y| y.parse().ok());
+    let production_year = year_of(details.first_air_date.as_deref());
 
     // Genres from details (names, not IDs)
     let genres = details
         .genres
         .map(|gs| gs.into_iter().map(|g| g.name).collect());
 
-    // Studios from production companies
+    // Studios: the networks, as Jellyfin's series provider does; else the production companies
     let studios = details
-        .production_companies
+        .networks
         .as_ref()
+        .filter(|ns| !ns.is_empty())
+        .or(details.production_companies.as_ref())
         .map(|pcs| pcs.iter().map(|pc| pc.name.clone()).collect());
 
     // Production countries
@@ -676,14 +811,31 @@ pub async fn search_tv(tmdb: &TmdbApi, name: &str) -> Option<ExternalMetadata> {
         .and_then(|rts| rts.first())
         .map(|mins| (*mins as i64) * 60_i64 * 10_000_000);
 
+    // The rating country's content rating, else the first one listed (Jellyfin's order)
+    let ratings: Vec<TmdbContentRating> = details
+        .content_ratings
+        .and_then(|r| r.results)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.rating.as_deref().is_some_and(|v| !v.trim().is_empty()))
+        .collect();
+    let official_rating = ratings
+        .iter()
+        .find(|r| r.iso_3166_1 == RATING_COUNTRY)
+        .or(ratings.first())
+        .and_then(|r| r.rating.clone());
+
+    let people = details.credits.map(|c| convert_people(tmdb, c, "Actor"));
+    let external_ids = details.external_ids;
+
     Some(ExternalMetadata {
         name: details.name,
         overview: details.overview,
         production_year,
         community_rating: details.vote_average,
-        official_rating: None,
+        official_rating,
         genres,
-        premiere_date: details.first_air_date,
+        premiere_date: non_empty(details.first_air_date),
         runtime_ticks,
         image_urls: images,
         tmdb_id: Some(tmdb_id),
@@ -705,8 +857,141 @@ pub async fn search_tv(tmdb: &TmdbApi, name: &str) -> Option<ExternalMetadata> {
         studios,
         directors: None,
         writers: None,
-        imdb_id: external_ids.and_then(|e| e.imdb_id),
+        imdb_id: external_ids.and_then(|e| non_empty(e.imdb_id)),
+        people,
     })
+}
+
+/// A season and all its episodes from one call. Episodes carry their name, overview, air date,
+/// rating, still and guest stars and crew; their IMDb and TVDb ids would need one call each, so
+/// they are left out.
+pub async fn season(tmdb: &TmdbApi, series_id: i64, season_number: i32) -> Option<SeasonMetadata> {
+    let endpoint = format!("/tv/{}/season/{}", series_id, season_number);
+    let query = [("append_to_response", SEASON_APPEND)];
+    let season: TmdbSeason = match tmdb.get_json(&endpoint, &query).await {
+        Ok(json) => serde_json::from_value(json).ok()?,
+        Err(_) => return None,
+    };
+
+    let mut images = convert_images(tmdb, season.images.unwrap_or_default());
+    if !images.iter().any(|i| i.image_type == "Primary")
+        && let Some(path) = season.poster_path
+    {
+        images.insert(
+            0,
+            MetadataImage {
+                image_type: "Primary".to_string(),
+                url: tmdb.image_url(&path),
+            },
+        );
+    }
+    let meta = ExternalMetadata {
+        overview: non_empty(season.overview),
+        premiere_date: non_empty(season.air_date.clone()),
+        production_year: year_of(season.air_date.as_deref()),
+        image_urls: images,
+        tmdb_id: season.id,
+        ..Default::default()
+    };
+
+    let episodes = season
+        .episodes
+        .unwrap_or_default()
+        .into_iter()
+        .map(|ep| {
+            let mut people = Vec::new();
+            for guest in ep
+                .guest_stars
+                .unwrap_or_default()
+                .into_iter()
+                .take(MAX_CAST)
+            {
+                people.push(cast_person(tmdb, guest, "GuestStar"));
+            }
+            people.extend(crew_people(tmdb, ep.crew.unwrap_or_default()));
+            let image_urls = ep
+                .still_path
+                .map(|path| MetadataImage {
+                    image_type: "Primary".to_string(),
+                    url: tmdb.image_url(&path),
+                })
+                .into_iter()
+                .collect();
+            let meta = ExternalMetadata {
+                name: non_empty(ep.name),
+                overview: non_empty(ep.overview),
+                premiere_date: non_empty(ep.air_date.clone()),
+                production_year: year_of(ep.air_date.as_deref()),
+                community_rating: ep.vote_average.filter(|v| *v > 0.0),
+                runtime_ticks: ep.runtime.map(|mins| (mins as i64) * 60_i64 * 10_000_000),
+                image_urls,
+                tmdb_id: Some(ep.id),
+                people: Some(people),
+                ..Default::default()
+            };
+            (ep.episode_number, meta)
+        })
+        .collect();
+
+    Some(SeasonMetadata { meta, episodes })
+}
+
+fn non_empty(value: Option<String>) -> Option<String> {
+    value.filter(|v| !v.trim().is_empty())
+}
+
+fn year_of(date: Option<&str>) -> Option<i32> {
+    date.and_then(|d| d.split('-').next())
+        .and_then(|y| y.parse().ok())
+}
+
+/// The cast (the first `MAX_CAST`, as `cast_kind`) and the directors, writers and producers.
+fn convert_people(tmdb: &TmdbApi, credits: TmdbCredits, cast_kind: &str) -> Vec<MetadataPerson> {
+    let mut people: Vec<MetadataPerson> = credits
+        .cast
+        .unwrap_or_default()
+        .into_iter()
+        .take(MAX_CAST)
+        .map(|member| cast_person(tmdb, member, cast_kind))
+        .collect();
+    people.extend(crew_people(tmdb, credits.crew.unwrap_or_default()));
+    people
+}
+
+fn cast_person(tmdb: &TmdbApi, member: TmdbCastMember, kind: &str) -> MetadataPerson {
+    MetadataPerson {
+        name: member.name,
+        kind: kind.to_string(),
+        role: non_empty(member.character),
+        image_url: member.profile_path.map(|p| tmdb.image_url(&p)),
+    }
+}
+
+/// Crew as Jellyfin keeps it (TmdbUtils.MapCrewToPersonType): directors, writers and producers.
+fn crew_people(tmdb: &TmdbApi, crew: Vec<TmdbCrewMember>) -> Vec<MetadataPerson> {
+    crew.into_iter()
+        .filter_map(|member| {
+            let job = member.job.as_deref().unwrap_or_default();
+            let department = member.department.as_deref().unwrap_or_default();
+            let kind = if job.eq_ignore_ascii_case("Director") {
+                "Director"
+            } else if department.eq_ignore_ascii_case("Writing") {
+                "Writer"
+            } else if department.eq_ignore_ascii_case("Production")
+                && job.to_ascii_lowercase().contains("producer")
+            {
+                "Producer"
+            } else {
+                return None;
+            };
+            Some(MetadataPerson {
+                name: member.name,
+                kind: kind.to_string(),
+                role: non_empty(member.job),
+                image_url: member.profile_path.map(|p| tmdb.image_url(&p)),
+            })
+        })
+        .collect()
 }
 
 /// Map TMDb genre IDs to genre names
@@ -745,47 +1030,70 @@ fn tmdb_genre_name(id: i32) -> Option<&'static str> {
     }
 }
 
-async fn fetch_images(tmdb: &TmdbApi, media_type: &str, id: i64) -> Vec<MetadataImage> {
-    let endpoint = format!("/{}/{}/images", media_type, id);
+/// Image language preference, as Jellyfin ranks TMDb images: the metadata language first (for
+/// posters and logos), then images without text, then the rest; within each, the best voted first.
+fn rank_images(images: Option<Vec<TmdbImage>>, text_first: bool) -> Vec<TmdbImage> {
+    let mut images = images.unwrap_or_default();
+    let rank = |image: &TmdbImage| match image.iso_639_1.as_deref() {
+        Some("en") if text_first => 0,
+        None | Some("") => 1,
+        Some("en") => 2,
+        _ => 3,
+    };
+    images.sort_by(|a, b| {
+        rank(a).cmp(&rank(b)).then(
+            b.vote_average
+                .unwrap_or(0.0)
+                .total_cmp(&a.vote_average.unwrap_or(0.0)),
+        )
+    });
+    images
+}
+
+/// The Primary (posters), Backdrop (backdrops without text first), Thumb (a backdrop with the
+/// title on it) and Logo images of an appended `images` block.
+fn convert_images(tmdb: &TmdbApi, images: TmdbImages) -> Vec<MetadataImage> {
     let mut result = Vec::new();
-
-    if let Ok(json) = tmdb.get_json(&endpoint, &[]).await
-        && let Ok(imgs) = serde_json::from_value::<TmdbImages>(json)
+    let numbered = |kind: &str, i: usize| {
+        if i == 0 {
+            kind.to_string()
+        } else {
+            format!("{kind}_{i}")
+        }
+    };
+    for (i, p) in rank_images(images.posters, true)
+        .into_iter()
+        .take(3)
+        .enumerate()
     {
-        if let Some(posters) = imgs.posters {
-            for (i, p) in posters.into_iter().take(3).enumerate() {
-                result.push(MetadataImage {
-                    image_type: if i == 0 {
-                        "Primary".to_string()
-                    } else {
-                        format!("Primary_{}", i)
-                    },
-                    url: tmdb.image_url(&p.file_path),
-                });
-            }
-        }
-        if let Some(backdrops) = imgs.backdrops {
-            for (i, b) in backdrops.into_iter().take(3).enumerate() {
-                result.push(MetadataImage {
-                    image_type: if i == 0 {
-                        "Backdrop".to_string()
-                    } else {
-                        format!("Backdrop_{}", i)
-                    },
-                    url: tmdb.image_url(&b.file_path),
-                });
-            }
-        }
-        if let Some(logos) = imgs.logos
-            && let Some(l) = logos.into_iter().next()
-        {
-            result.push(MetadataImage {
-                image_type: "Logo".to_string(),
-                url: tmdb.image_url(&l.file_path),
-            });
-        }
+        result.push(MetadataImage {
+            image_type: numbered("Primary", i),
+            url: tmdb.image_url(&p.file_path),
+        });
     }
-
+    let backdrops = rank_images(images.backdrops, false);
+    if let Some(thumb) = backdrops
+        .iter()
+        .filter(|b| b.iso_639_1.as_deref().is_some_and(|l| !l.is_empty()))
+        .min_by_key(|b| b.iso_639_1.as_deref() != Some("en"))
+    {
+        result.push(MetadataImage {
+            image_type: "Thumb".to_string(),
+            url: tmdb.image_url(&thumb.file_path),
+        });
+    }
+    for (i, b) in backdrops.into_iter().take(3).enumerate() {
+        result.push(MetadataImage {
+            image_type: numbered("Backdrop", i),
+            url: tmdb.image_url(&b.file_path),
+        });
+    }
+    if let Some(l) = rank_images(images.logos, true).into_iter().next() {
+        result.push(MetadataImage {
+            image_type: "Logo".to_string(),
+            url: tmdb.image_url(&l.file_path),
+        });
+    }
     result
 }
 

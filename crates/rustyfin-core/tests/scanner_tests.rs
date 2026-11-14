@@ -4128,6 +4128,133 @@ async fn b134c_metadata_refresh_skips_identified_items() {
     );
 }
 
+// R1 scan (upgrades): with a provider that looks items up by id, the metadata refresh run asks
+// again, by id and without a search, about identified items stored before premiere dates were
+// (no premiere date); an item with one is still skipped.
+#[tokio::test]
+async fn r1scan_metadata_refresh_upgrades_identified_items_by_id() {
+    use rustyfin_core::scheduler::TASK_METADATA_REFRESH;
+    use rustyfin_model::metadata::{
+        ExternalMetadata, MetadataImage, MetadataLookups, SeasonMetadata,
+    };
+    use rustyfin_model::plugin::PluginStatus;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Mutex;
+    type Found = Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>>;
+    type Images = Pin<Box<dyn Future<Output = Vec<MetadataImage>> + Send>>;
+    type Lookup<'a, T> = Pin<Box<dyn Future<Output = Option<T>> + Send + 'a>>;
+
+    struct ById(Arc<Mutex<Vec<i64>>>);
+    impl MetadataLookups for ById {
+        fn movie_by_id(&self, id: i64) -> Lookup<'_, ExternalMetadata> {
+            self.0.lock().unwrap().push(id);
+            Box::pin(async move {
+                Some(ExternalMetadata {
+                    tmdb_id: Some(id),
+                    premiere_date: Some("2001-02-03".to_string()),
+                    imdb_id: Some("tt0000077".to_string()),
+                    ..Default::default()
+                })
+            })
+        }
+        fn series_by_id(&self, _: i64) -> Lookup<'_, ExternalMetadata> {
+            Box::pin(async { None })
+        }
+        fn search_series(&self, _: &str, _: Option<i32>) -> Lookup<'_, ExternalMetadata> {
+            Box::pin(async { None })
+        }
+        fn season(&self, _: i64, _: i32) -> Lookup<'_, SeasonMetadata> {
+            Box::pin(async { None })
+        }
+    }
+
+    let fx = Fixture::new().await;
+    let lib = fx.library("R1 Film", LibraryContentType::Movies).await;
+    let root = root_of(&lib);
+    let old_id = Uuid::new_v4();
+    for (id, name, tmdb_id, premiere) in [
+        (old_id, "Old Film", 77, None),
+        (
+            Uuid::new_v4(),
+            "Current Film",
+            78,
+            Some("2002-01-01T00:00:00+00:00"),
+        ),
+    ] {
+        let path = root.join(format!("{name} (2001)/{name} (2001).mkv"));
+        sqlx::query(
+            "INSERT INTO media_items (id, library_id, name, media_type, path, tmdb_id, premiere_date) \
+             VALUES (?, ?, ?, 'Movie', ?, ?, ?)",
+        )
+        .bind(id.to_string())
+        .bind(lib.id.to_string())
+        .bind(name)
+        .bind(path.to_str().unwrap())
+        .bind(tmdb_id)
+        .bind(premiere)
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+    }
+
+    let pm = rustyfin_core::plugin_manager::PluginManager::new(&fx.dir);
+    let searched: Arc<Mutex<Vec<String>>> = Arc::default();
+    let seen = searched.clone();
+    pm.register_metadata_provider(
+        "r1".to_string(),
+        "r1".to_string(),
+        PluginStatus::Active,
+        move |_: &reqwest::Client, name: &str, _: Option<i32>| -> Found {
+            seen.lock().unwrap().push(name.to_string());
+            Box::pin(async { None })
+        },
+        |_: &reqwest::Client, _: &str| -> Found { Box::pin(async { None }) },
+        |_: &reqwest::Client, _: Option<i64>, _: Option<i64>, _| -> Images {
+            Box::pin(async { Vec::new() })
+        },
+    )
+    .await;
+    let asked: Arc<Mutex<Vec<i64>>> = Arc::default();
+    pm.register_metadata_lookups("r1", Arc::new(ById(asked.clone())))
+        .await;
+    let sched = TaskScheduler::with_plugin_manager(
+        fx.pool.clone(),
+        Arc::new(fx.dir.clone()),
+        reqwest::Client::new(),
+        pm,
+    );
+    assert!(sched.start_task(TASK_METADATA_REFRESH).await);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while sched
+        .get_task(TASK_METADATA_REFRESH)
+        .await
+        .unwrap()
+        .last_execution_result
+        .is_none()
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the refresh did not end within 60 s"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(*asked.lock().unwrap(), [77]);
+    assert!(
+        searched.lock().unwrap().is_empty(),
+        "an identified item was searched"
+    );
+    let old = rustyfin_db::repo_media::get_item_by_id(&fx.pool, old_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        old.premiere_date.map(|d| d.date_naive().to_string()),
+        Some("2001-02-03".to_string())
+    );
+}
+
 // B30: a scheduled scan tells the server, so that it can drop what it cached from before.
 #[tokio::test]
 async fn b30_f8_a_scheduled_scan_calls_back_once_it_ends() {

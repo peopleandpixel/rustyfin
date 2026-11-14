@@ -11195,9 +11195,20 @@ async fn g12_stub() -> (String, G12Hits) {
                 "title": "Alpha Film",
                 "overview": "G12 stub overview",
                 "original_language": "en",
-                "release_date": "2001-05-04"
+                "release_date": "2001-05-04",
+                "imdb_id": "tt9001",
+                "production_companies": [{"id": 5, "name": "G12 Pictures"}],
+                "credits": {
+                    "cast": [{"id": 77, "name": "Dana Actor", "character": "Self",
+                              "profile_path": "/g12-dana.jpg"}],
+                    "crew": []
+                },
+                "releases": {"countries": [{"iso_3166_1": "US", "certification": "PG-13"}]},
+                "images": {
+                    "posters": [{"file_path": "/g12-poster.jpg"}],
+                    "backdrops": [{"file_path": "/g12-backdrop.jpg"}]
+                }
             }),
-            "/movie/9001/external_ids" => serde_json::json!({"id": 9001, "imdb_id": "tt9001"}),
             "/movie/9001/images" => serde_json::json!({
                 "posters": [{"file_path": "/g12-poster.jpg"}],
                 "backdrops": [{"file_path": "/g12-backdrop.jpg"}]
@@ -11446,18 +11457,65 @@ async fn test_g12_item_refresh_uses_env_key_and_base_urls() {
     assert!(!body.contains(G12_ENV_KEY), "the item shows the env key");
 
     let hits = server.hits();
-    for path in [
-        "/search/movie",
-        "/movie/9001",
-        "/movie/9001/images",
-        "/movie/9001/videos",
-    ] {
+    for path in ["/search/movie", "/movie/9001", "/movie/9001/videos"] {
         assert!(
             hits.iter().any(|hit| hit.path == path),
             "{path} not requested: {hits:?}"
         );
     }
     server.assert_all_signed_with(G12_ENV_KEY);
+}
+
+// R1 scan: E0-scan-1, E0-metadata-1, B137
+
+/// A TMDb refresh fills the IMDb id, studios, people, rating and premiere date, and both the
+/// list and the item answers show them, with Jellyfin's ProviderIds key names.
+#[tokio::test]
+async fn r1scan_refreshed_movie_shows_ids_people_and_studios_in_list_and_item() {
+    let server = g12_server(Some(G12_ENV_KEY), None).await;
+    let item_id = server.insert_movie().await;
+    assert_eq!(server.refresh(item_id).await, Some(9001));
+
+    let (status, list) = server
+        .send(
+            "GET",
+            "/Items?Recursive=true&IncludeItemTypes=Movie\
+             &Fields=ProviderIds,People,Studios,PremiereDate,OfficialRating",
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let list: serde_json::Value = serde_json::from_str(&list).unwrap();
+    let (status, item) = server.send("GET", &format!("/Items/{item_id}"), None).await;
+    assert_eq!(status, StatusCode::OK, "{item}");
+    let item: serde_json::Value = serde_json::from_str(&item).unwrap();
+    let listed = list["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["Id"] == item["Id"])
+        .expect("the movie in the list")
+        .clone();
+
+    for (view, answer) in [("list", &listed), ("item", &item)] {
+        assert_eq!(
+            answer["ProviderIds"],
+            serde_json::json!({"Tmdb": "9001", "Imdb": "tt9001"}),
+            "{view}"
+        );
+        assert_eq!(answer["Studios"][0]["Name"], "G12 Pictures", "{view}");
+        assert_eq!(answer["People"][0]["Name"], "Dana Actor", "{view}");
+        assert_eq!(answer["People"][0]["Type"], "Actor", "{view}");
+        assert_eq!(answer["People"][0]["Role"], "Self", "{view}");
+        assert_eq!(answer["OfficialRating"], "PG-13", "{view}");
+        assert!(
+            answer["PremiereDate"]
+                .as_str()
+                .is_some_and(|d| d.starts_with("2001-05-04")),
+            "{view}: {}",
+            answer["PremiereDate"]
+        );
+    }
 }
 
 #[tokio::test]
@@ -32669,8 +32727,9 @@ async fn b20_import_metadata_fills_empty_fields() {
         );
         assert_eq!(alpha["OriginalTitle"], "Alfa", "{name}");
         assert_eq!(alpha["CriticRating"], 88.0, "{name}");
-        assert_eq!(alpha["ProviderIds"]["tmdb"], "111", "{name}");
-        assert_eq!(alpha["ProviderIds"]["imdb"], "tt0000111", "{name}");
+        // Jellyfin's key names (B137)
+        assert_eq!(alpha["ProviderIds"]["Tmdb"], "111", "{name}");
+        assert_eq!(alpha["ProviderIds"]["Imdb"], "tt0000111", "{name}");
         assert_eq!(alpha["LockData"], false, "{name}");
         assert_eq!(alpha["LockedFields"], serde_json::json!([]), "{name}");
         let beta = b20_get_item(&w, m.beta).await;

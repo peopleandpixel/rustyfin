@@ -175,9 +175,32 @@ pub async fn scan_with_metadata(
         }
         // Increased from 5 to 10 — TMDb rate limits are typically 20-40 req/s, so 10 is safe.
         let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(10));
-        let mut handles = Vec::new();
+        // Seasons and episodes are looked up through their series' provider id, so the series
+        // (and everything else) are refreshed first, then the seasons and episodes.
+        let mut first = Vec::new();
+        let mut later = Vec::new();
         for new_id in new_item_ids {
-            if let Ok(Some(item)) = rustyfin_db::repo_media::get_item_by_id(pool, new_id).await {
+            match rustyfin_db::repo_media::get_item_by_id(pool, new_id).await {
+                Ok(Some(item))
+                    if matches!(
+                        item.media_type,
+                        rustyfin_model::media::MediaType::Season
+                            | rustyfin_model::media::MediaType::Episode
+                    ) =>
+                {
+                    later.push(item)
+                }
+                Ok(Some(item)) => first.push(item),
+                _ if counted => {
+                    // An item that can't be loaded has nothing to refresh, but it still counts.
+                    ticket.advance(1);
+                }
+                _ => {}
+            }
+        }
+        for wave in [first, later] {
+            let mut handles = Vec::new();
+            for item in wave {
                 let sem = semaphore.clone();
                 let pool = pool.clone();
                 let client = http_client.clone();
@@ -191,15 +214,12 @@ pub async fn scan_with_metadata(
                     }
                 });
                 handles.push(handle);
-            } else if counted {
-                // An item that can't be loaded has nothing to refresh, but it still counts.
-                ticket.advance(1);
             }
-        }
-        for handle in handles {
-            let _ = handle.await;
-            if counted {
-                ticket.advance(1);
+            for handle in handles {
+                let _ = handle.await;
+                if counted {
+                    ticket.advance(1);
+                }
             }
         }
     }

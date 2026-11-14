@@ -475,7 +475,16 @@ impl TaskScheduler {
 
                 // Collect all items from all libraries first. Items already identified by a
                 // provider ID are skipped (Jellyfin parity: no automatic re-query). An explicit
-                // refresh of one item or library from the API still re-queries them.
+                // refresh of one item or library from the API still re-queries them. Items
+                // identified before the premiere date, people and IMDb id were stored have no
+                // premiere date; they are asked again, by id, so an upgrade fills them, when a
+                // provider can look items up by id (TMDb).
+                let by_id = self
+                    .plugin_manager
+                    .metadata_providers()
+                    .await
+                    .iter()
+                    .any(|p| p.lookups.is_some());
                 let mut all_items = Vec::new();
                 let mut skipped_identified = 0usize;
                 for lib in &libraries {
@@ -487,7 +496,8 @@ impl TaskScheduler {
                                     matches!(item.media_type, MediaType::Movie | MediaType::Series)
                                         && (item.tmdb_id.is_some()
                                             || item.tvdb_id.is_some()
-                                            || item.provider_ids.get("imdb").is_some());
+                                            || item.provider_ids.get("Imdb").is_some())
+                                        && (item.premiere_date.is_some() || !by_id);
                                 if identified {
                                     skipped_identified += 1;
                                 } else {
