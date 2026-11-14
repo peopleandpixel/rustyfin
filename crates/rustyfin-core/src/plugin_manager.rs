@@ -25,6 +25,7 @@ use rustyfin_model::plugin::{
     NotificationPriority, Plugin, PluginConfiguration, PluginInfo, PluginStatus, PluginType,
     SubtitleResult,
 };
+use rustyfin_model::server_info::ServerConfiguration;
 
 /// A loaded plugin with its dynamic library handle.
 struct LoadedPlugin {
@@ -277,6 +278,68 @@ pub async fn install_fanart_plugin(pm: &PluginManager) {
         plugin_fanart::register_fanart_provider(&p, pm).await
     })
     .await;
+}
+
+/// Save a provider API key from the settings to the plugin's config. A non-blank key is saved
+/// and the plugin set Active. A blank key clears it and drops the status, so the plugin falls back
+/// to the key rule.
+pub async fn apply_provider_key(
+    pm: &PluginManager,
+    plugin_id: &str,
+    key: &str,
+) -> Result<(), String> {
+    let trimmed = key.trim();
+    let config = if trimmed.is_empty() {
+        serde_json::json!({ "api_key": null, "status": null })
+    } else {
+        serde_json::json!({ "api_key": trimmed, "status": "Active" })
+    };
+    pm.set_configuration(plugin_id, config).await
+}
+
+/// Whether the plugin's saved config holds a non-blank API key.
+pub async fn provider_key_set(pm: &PluginManager, plugin_id: &str) -> bool {
+    pm.load_plugin_config_from_db(plugin_id)
+        .await
+        .as_ref()
+        .and_then(|c| c.get("api_key"))
+        .and_then(|v| v.as_str())
+        .is_some_and(|k| !k.trim().is_empty())
+}
+
+/// Move the provider keys from an old config.json into the plugin configs at startup. Takes the
+/// three write-only fields (they end up None). A key goes in only when the plugin config has no
+/// non-blank key yet, so a key saved in the DB wins. The status is not set, so a saved Disabled
+/// holds. Returns true only when at least one key field was present and every non-blank key is
+/// now in its plugin config (already there, or saved just now). A false return with keys present
+/// means a save failed, so the caller must keep config.json as it is or the key would be lost.
+pub async fn seed_provider_keys(pm: &PluginManager, config: &mut ServerConfiguration) -> bool {
+    let keys = [
+        ("tmdb", config.tmdb_api_key.take()),
+        ("omdb", config.omdb_api_key.take()),
+        ("fanart", config.fanart_api_key.take()),
+    ];
+    let found = keys.iter().any(|(_, key)| key.is_some());
+    let mut all_saved = true;
+    for (plugin_id, key) in keys {
+        let Some(stored) = key.as_deref().map(str::trim).filter(|k| !k.is_empty()) else {
+            continue;
+        };
+        if provider_key_set(pm, plugin_id).await {
+            continue;
+        }
+        match pm
+            .save_plugin_config_to_db(plugin_id, &serde_json::json!({ "api_key": stored }))
+            .await
+        {
+            Ok(()) => tracing::info!("seeded the {plugin_id} plugin API key from config.json"),
+            Err(e) => {
+                all_saved = false;
+                tracing::warn!("failed to seed the {plugin_id} plugin API key: {e}");
+            }
+        }
+    }
+    found && all_saved
 }
 
 /// Shared install for the keyed built-in plugins (TMDb, OMDb, Fanart.tv): applies the saved

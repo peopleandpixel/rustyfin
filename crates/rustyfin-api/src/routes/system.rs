@@ -160,21 +160,68 @@ fn hide_secrets(config: &mut ServerConfiguration) {
     config.smtp_password = None;
 }
 
+/// The configuration as JSON for a caller. Admins also get `TmdbApiKeySet`, `OmdbApiKeySet` and
+/// `FanartApiKeySet`: whether that provider's plugin config holds a key. The keys are never
+/// returned.
+async fn configuration_json(
+    state: &AppState,
+    is_admin: bool,
+) -> Result<serde_json::Value, ApiError> {
+    let mut config = state.config.read().await.clone();
+    if !is_admin {
+        hide_secrets(&mut config);
+    }
+    let mut json = serde_json::to_value(&config).map_err(|e| ApiError::Internal(e.to_string()))?;
+    if is_admin && let Some(obj) = json.as_object_mut() {
+        for (field, plugin_id) in [
+            ("TmdbApiKeySet", "tmdb"),
+            ("OmdbApiKeySet", "omdb"),
+            ("FanartApiKeySet", "fanart"),
+        ] {
+            let set =
+                rustyfin_core::plugin_manager::provider_key_set(&state.plugin_manager, plugin_id)
+                    .await;
+            obj.insert(field.to_string(), serde_json::json!(set));
+        }
+    }
+    Ok(json)
+}
+
 async fn get_configuration(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
-) -> Json<ServerConfiguration> {
-    let mut config = state.config.read().await.clone();
-    if !claims.is_admin {
-        hide_secrets(&mut config);
+) -> Result<Json<serde_json::Value>, ApiError> {
+    Ok(Json(configuration_json(&state, claims.is_admin).await?))
+}
+
+/// Save the provider keys from a settings POST to their plugin configs. The keys are then cleared
+/// from the config, so none reaches config.json or memory. A failure is logged without the key.
+async fn apply_posted_provider_keys(state: &AppState, config: &mut ServerConfiguration) {
+    let keys = [
+        ("tmdb", config.tmdb_api_key.take()),
+        ("omdb", config.omdb_api_key.take()),
+        ("fanart", config.fanart_api_key.take()),
+    ];
+    for (plugin_id, key) in keys {
+        let Some(key) = key else { continue };
+        if let Err(e) = rustyfin_core::plugin_manager::apply_provider_key(
+            &state.plugin_manager,
+            plugin_id,
+            &key,
+        )
+        .await
+        {
+            tracing::warn!("failed to save the {plugin_id} API key: {e}");
+        }
     }
-    Json(config)
 }
 
 async fn update_configuration(
     State(state): State<AppState>,
-    Json(new_config): Json<ServerConfiguration>,
+    Json(mut new_config): Json<ServerConfiguration>,
 ) -> Result<StatusCode, ApiError> {
+    apply_posted_provider_keys(&state, &mut new_config).await;
+
     // Persist to disk
     let config_path = state.data_dir.join("config.json");
     let json =
@@ -718,11 +765,7 @@ async fn get_configuration_by_key(
     Extension(claims): Extension<Claims>,
     Path(key): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let mut config = state.config.read().await.clone();
-    if !claims.is_admin {
-        hide_secrets(&mut config);
-    }
-    let json = serde_json::to_value(&config).map_err(|e| ApiError::Internal(e.to_string()))?;
+    let json = configuration_json(&state, claims.is_admin).await?;
     Ok(Json(
         json.get(&key).cloned().unwrap_or(serde_json::json!({})),
     ))
@@ -742,8 +785,12 @@ async fn update_configuration_by_key(
     let merged = merge_json_values(json, &key, body);
 
     // Parse back into ServerConfiguration
-    let new_config: ServerConfiguration =
+    let mut new_config: ServerConfiguration =
         serde_json::from_value(merged).map_err(|e| ApiError::BadRequest(format!("{key}: {e}")))?;
+
+    // Provider keys go to their plugin configs, and are cleared from the config before it is
+    // stored. The write lock is held here; set_configuration does not touch state.config.
+    apply_posted_provider_keys(&state, &mut new_config).await;
 
     *config = new_config;
     state

@@ -192,6 +192,20 @@ async fn main() {
     // Register built-in plugins with database-backed configuration
     let plugin_manager_with_db = plugin_manager.with_database(pool.clone());
 
+    // Provider keys from an older config.json move to the plugin configs before the installs read
+    // them. Then config.json is rewritten without them.
+    if rustyfin_core::plugin_manager::seed_provider_keys(&plugin_manager_with_db, &mut config).await
+    {
+        match serde_json::to_string_pretty(&config) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(data_dir_arc.join("config.json"), json) {
+                    tracing::warn!("failed to rewrite config.json after seeding keys: {}", e);
+                }
+            }
+            Err(e) => tracing::warn!("failed to serialize config after seeding keys: {}", e),
+        }
+    }
+
     // The scheduler shares the DB-backed manager so scheduled scans reach the providers (B135)
     let task_scheduler = rustyfin_core::scheduler::TaskScheduler::with_plugin_manager(
         pool.clone(),

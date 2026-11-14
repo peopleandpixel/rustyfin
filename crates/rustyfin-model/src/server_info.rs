@@ -67,8 +67,16 @@ pub struct ServerConfiguration {
     pub public_https_port: u16,
     #[serde(default = "default_http_port")]
     pub public_port: u16,
-    // Plugin configurations (TMDB, OMDb, Fanart, etc.) are now stored in the database
-    // via the plugin_config table, not in config.json.
+    // Provider API keys are write-only input: they are never serialized, so they are never
+    // written to config.json or returned by the API. A key sent in a settings POST is applied to
+    // the provider's plugin config (the plugin_config table), and a key left in an old config.json
+    // is moved there at startup.
+    #[serde(default, skip_serializing)]
+    pub tmdb_api_key: Option<String>,
+    #[serde(default, skip_serializing)]
+    pub omdb_api_key: Option<String>,
+    #[serde(default, skip_serializing)]
+    pub fanart_api_key: Option<String>,
     // SMTP mail server configuration for password reset emails
     #[serde(default)]
     pub smtp_host: Option<String>,
@@ -150,6 +158,9 @@ impl Default for ServerConfiguration {
             smtp_password: None,
             smtp_enable_ssl: false,
             smtp_from_address: None,
+            tmdb_api_key: None,
+            omdb_api_key: None,
+            fanart_api_key: None,
             library_monitor_delay: 60,
             library_monitor_poll_interval: 60,
         }

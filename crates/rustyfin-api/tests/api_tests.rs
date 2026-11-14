@@ -17213,6 +17213,284 @@ async fn g1_plugin_configuration_is_admin_only() {
     }
 }
 
+// B142: provider API keys saved in Settings reach the provider plugins and never come back out.
+
+/// A server with the TMDb, OMDb and Fanart.tv plugins installed as main.rs installs them (no env key),
+/// plus the owner's and a viewer's tokens.
+async fn b142_server() -> (AppState, axum::Router, String, String) {
+    let mut state = test_state().await;
+    state.plugin_manager = state.plugin_manager.with_database(state.db.clone());
+    let pm = &state.plugin_manager;
+    rustyfin_core::plugin_manager::install_tmdb_plugin(pm, state.tmdb.clone()).await;
+    rustyfin_core::plugin_manager::install_omdb_plugin(pm).await;
+    rustyfin_core::plugin_manager::install_fanart_plugin(pm).await;
+    let app = app(state.clone());
+    let (owner, _, viewer, _) = g1_owner_and_viewer(&state, &app).await;
+    (state, app, owner, viewer)
+}
+
+/// Posts the current server configuration with `keys` merged in.
+async fn b142_save_settings(app: &axum::Router, owner: &str, keys: serde_json::Value) {
+    let (status, mut config) = send(
+        app,
+        request("GET", "/System/Configuration", Some(owner), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    for (k, v) in keys.as_object().unwrap() {
+        config[k] = v.clone();
+    }
+    let req = request("POST", "/System/Configuration", Some(owner), Some(config));
+    assert_eq!(send(app, req).await.0, StatusCode::NO_CONTENT);
+}
+
+async fn b142_plugin_config(app: &axum::Router, owner: &str, plugin: &str) -> serde_json::Value {
+    let uri = format!("/Plugins/{plugin}/Configuration");
+    let (status, json) = send(app, request("GET", &uri, Some(owner), None)).await;
+    assert_eq!(status, StatusCode::OK, "GET {uri}");
+    json
+}
+
+async fn b142_status(state: &AppState, plugin: &str) -> rustyfin_model::plugin::PluginStatus {
+    state
+        .plugin_manager
+        .get_plugin_status(plugin)
+        .await
+        .unwrap()
+}
+
+async fn b142_active_providers(state: &AppState) -> Vec<String> {
+    let mut names: Vec<String> = state
+        .plugin_manager
+        .metadata_providers()
+        .await
+        .into_iter()
+        .map(|h| h.provider_name)
+        .collect();
+    names.sort();
+    names
+}
+
+#[tokio::test]
+async fn b142_plugin_status_and_key_survive_each_other() {
+    use rustyfin_model::plugin::PluginStatus;
+    let (state, app, owner, _) = b142_server().await;
+    let req = request(
+        "POST",
+        "/Plugins/omdb/Configuration",
+        Some(&owner),
+        Some(serde_json::json!({ "api_key": "b142-omdb-1" })),
+    );
+    assert_eq!(send(&app, req).await.0, StatusCode::OK);
+    state
+        .plugin_manager
+        .set_plugin_status("omdb", PluginStatus::Disabled)
+        .await
+        .unwrap();
+    let config = b142_plugin_config(&app, &owner, "omdb").await;
+    assert_eq!(
+        config["api_key"], "b142-omdb-1",
+        "status write kept the key"
+    );
+    assert_eq!(config["status"], "Disabled");
+
+    // A later key keeps the saved status, and the saved Disabled still wins over the key.
+    let req = request(
+        "POST",
+        "/Plugins/omdb/Configuration",
+        Some(&owner),
+        Some(serde_json::json!({ "api_key": "b142-omdb-2" })),
+    );
+    assert_eq!(send(&app, req).await.0, StatusCode::OK);
+    let config = b142_plugin_config(&app, &owner, "omdb").await;
+    assert_eq!(config["api_key"], "b142-omdb-2");
+    assert_eq!(config["status"], "Disabled", "key write kept the status");
+    assert_eq!(b142_status(&state, "omdb").await, PluginStatus::Disabled);
+}
+
+#[tokio::test]
+async fn b142_omdb_fanart_key_enables_without_restart() {
+    use rustyfin_model::plugin::PluginStatus;
+    let (state, app, owner, _) = b142_server().await;
+    assert_eq!(b142_status(&state, "omdb").await, PluginStatus::Disabled);
+    assert_eq!(b142_status(&state, "fanart").await, PluginStatus::Disabled);
+    assert!(b142_active_providers(&state).await.is_empty());
+
+    for plugin in ["omdb", "fanart"] {
+        let req = request(
+            "POST",
+            &format!("/Plugins/{plugin}/Configuration"),
+            Some(&owner),
+            Some(serde_json::json!({ "api_key": format!("b142-{plugin}") })),
+        );
+        assert_eq!(send(&app, req).await.0, StatusCode::OK);
+        assert_eq!(b142_status(&state, plugin).await, PluginStatus::Active);
+    }
+    assert_eq!(b142_active_providers(&state).await, ["fanart", "omdb"]);
+}
+
+#[tokio::test]
+async fn b142_settings_key_enables_provider_plugins() {
+    use rustyfin_model::plugin::PluginStatus;
+    let (state, app, owner, _) = b142_server().await;
+    b142_save_settings(
+        &app,
+        &owner,
+        serde_json::json!({
+            "TmdbApiKey": "b142-tmdb-secret",
+            "OmdbApiKey": " b142-omdb-secret ",
+            "FanartApiKey": "b142-fanart-secret",
+        }),
+    )
+    .await;
+    for (plugin, key) in [
+        ("tmdb", "b142-tmdb-secret"),
+        ("omdb", "b142-omdb-secret"),
+        ("fanart", "b142-fanart-secret"),
+    ] {
+        let config = b142_plugin_config(&app, &owner, plugin).await;
+        assert_eq!(config["api_key"], key, "{plugin} key (trimmed)");
+        assert_eq!(config["status"], "Active", "{plugin} saved status");
+        assert_eq!(b142_status(&state, plugin).await, PluginStatus::Active);
+    }
+    assert_eq!(
+        b142_active_providers(&state).await,
+        ["fanart", "omdb", "tmdb"]
+    );
+}
+
+#[tokio::test]
+async fn b142_settings_never_return_keys() {
+    let (state, app, owner, viewer) = b142_server().await;
+    let before = send(
+        &app,
+        request("GET", "/System/Configuration", Some(&owner), None),
+    )
+    .await;
+    assert_eq!(before.1["TmdbApiKeySet"], false);
+    assert_eq!(before.1["OmdbApiKeySet"], false);
+    assert_eq!(before.1["FanartApiKeySet"], false);
+
+    b142_save_settings(
+        &app,
+        &owner,
+        serde_json::json!({ "TmdbApiKey": "b142-tmdb-secret", "FanartApiKey": "b142-fanart-secret" }),
+    )
+    .await;
+
+    let (status, admin) = send(
+        &app,
+        request("GET", "/System/Configuration", Some(&owner), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(admin["TmdbApiKeySet"], true);
+    assert_eq!(admin["OmdbApiKeySet"], false);
+    assert_eq!(admin["FanartApiKeySet"], true);
+    let (_, viewer_view) = send(
+        &app,
+        request("GET", "/System/Configuration", Some(&viewer), None),
+    )
+    .await;
+    assert!(viewer_view.get("TmdbApiKeySet").is_none());
+    for body in [&admin, &viewer_view] {
+        let text = body.to_string();
+        assert!(!text.contains("b142-"), "a key leaked: {text}");
+        assert!(body.get("TmdbApiKey").is_none());
+    }
+    for (token, key) in [
+        (&owner, "TmdbApiKey"),
+        (&viewer, "TmdbApiKey"),
+        (&owner, "FanartApiKey"),
+    ] {
+        let uri = format!("/System/Configuration/{key}");
+        let (_, json) = send(&app, request("GET", &uri, Some(token), None)).await;
+        assert!(!json.to_string().contains("b142-"), "GET {uri} leaked");
+    }
+    let on_disk = std::fs::read_to_string(state.data_dir.join("config.json")).unwrap();
+    assert!(!on_disk.contains("b142-"), "config.json holds a key");
+}
+
+#[tokio::test]
+async fn b142_settings_absent_key_keeps_saved_key() {
+    let (_state, app, owner, _) = b142_server().await;
+    b142_save_settings(
+        &app,
+        &owner,
+        serde_json::json!({ "TmdbApiKey": "b142-tmdb-secret" }),
+    )
+    .await;
+    // A save without the field, and one with null, leave the stored key alone.
+    b142_save_settings(&app, &owner, serde_json::json!({ "ServerName": "b142" })).await;
+    b142_save_settings(&app, &owner, serde_json::json!({ "TmdbApiKey": null })).await;
+    let config = b142_plugin_config(&app, &owner, "tmdb").await;
+    assert_eq!(config["api_key"], "b142-tmdb-secret");
+    assert_eq!(config["status"], "Active");
+}
+
+#[tokio::test]
+async fn b142_settings_empty_key_clears_and_disables() {
+    use rustyfin_model::plugin::PluginStatus;
+    let (state, app, owner, _) = b142_server().await;
+    b142_save_settings(
+        &app,
+        &owner,
+        serde_json::json!({ "OmdbApiKey": "b142-omdb-secret" }),
+    )
+    .await;
+    assert_eq!(b142_status(&state, "omdb").await, PluginStatus::Active);
+    b142_save_settings(&app, &owner, serde_json::json!({ "OmdbApiKey": "  " })).await;
+    let config = b142_plugin_config(&app, &owner, "omdb").await;
+    assert!(config.get("api_key").is_none(), "{config}");
+    assert!(config.get("status").is_none(), "{config}");
+    assert_eq!(b142_status(&state, "omdb").await, PluginStatus::Disabled);
+    assert!(b142_active_providers(&state).await.is_empty());
+    let (_, admin) = send(
+        &app,
+        request("GET", "/System/Configuration", Some(&owner), None),
+    )
+    .await;
+    assert_eq!(admin["OmdbApiKeySet"], false);
+}
+
+#[tokio::test]
+async fn b142_seed_moves_config_json_keys() {
+    let state = test_state().await;
+    let pm = state.plugin_manager.clone().with_database(state.db.clone());
+    // An existing plugin key wins over the old config.json one.
+    pm.save_plugin_config_to_db(
+        "fanart",
+        &serde_json::json!({ "api_key": "b142-fanart-db" }),
+    )
+    .await
+    .unwrap();
+    let mut config: ServerConfiguration = serde_json::from_value(serde_json::json!({
+        "TmdbApiKey": "b142-tmdb-old",
+        "OmdbApiKey": "",
+        "FanartApiKey": "b142-fanart-old",
+    }))
+    .unwrap();
+    assert!(rustyfin_core::plugin_manager::seed_provider_keys(&pm, &mut config).await);
+    assert!(config.tmdb_api_key.is_none());
+    assert!(config.omdb_api_key.is_none());
+    assert!(config.fanart_api_key.is_none());
+    assert!(!serde_json::to_string(&config).unwrap().contains("b142-"));
+
+    let tmdb = pm.load_plugin_config_from_db("tmdb").await.unwrap();
+    assert_eq!(tmdb, serde_json::json!({ "api_key": "b142-tmdb-old" }));
+    assert!(pm.load_plugin_config_from_db("omdb").await.is_none());
+    let fanart = pm.load_plugin_config_from_db("fanart").await.unwrap();
+    assert_eq!(fanart["api_key"], "b142-fanart-db");
+
+    // TMDb comes up Active from the seeded key; nothing left to seed the second time.
+    rustyfin_core::plugin_manager::install_tmdb_plugin(&pm, state.tmdb.clone()).await;
+    assert_eq!(
+        pm.get_plugin_status("tmdb").await,
+        Some(rustyfin_model::plugin::PluginStatus::Active)
+    );
+    assert!(!rustyfin_core::plugin_manager::seed_provider_keys(&pm, &mut config).await);
+}
+
 #[tokio::test]
 async fn g1_self_or_admin_user_routes() {
     let state = test_state().await;
