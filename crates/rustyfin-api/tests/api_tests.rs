@@ -8335,6 +8335,20 @@ async fn b156_start_from_another_origin_is_refused() {
         t.settings().await["MismatchedOrigin"],
         serde_json::Value::Null
     );
+
+    // Other addresses, a port-only difference included, are refused (the public URL is
+    // http://rf.test:8121).
+    for origin in [
+        "http://rf.test",
+        "http://rf.test:80",
+        "https://rf.test:8121",
+        "http://other.test:8121",
+        "http://rf.test:8122/web/",
+    ] {
+        let (status, headers, _) = b156_start(&t, &[("origin", origin)]).await;
+        assert_eq!(status, StatusCode::CONFLICT, "from {origin}");
+        assert_eq!(b21_header(&headers, "set-cookie"), "", "from {origin}");
+    }
 }
 
 #[tokio::test]
@@ -8395,7 +8409,19 @@ async fn b156_only_a_same_origin_start_is_noted() {
 #[tokio::test]
 async fn b156_start_from_the_public_origin_goes_on() {
     let t = b21_on(serde_json::json!({})).await;
-    for origin in ["http://rf.test:8121", "http://RF.test:8121", "null"] {
+    // The public URL's own address in any spelling, an Origin with a path (only its origin
+    // counts), and Origins that name no web address (null, garbled, another scheme), which are
+    // not checked, like a request without one.
+    for origin in [
+        "http://rf.test:8121",
+        "http://RF.test:8121",
+        "http://rf.test:8121/web/",
+        "null",
+        "not a url",
+        "http//rf.test",
+        "file:///etc/passwd",
+        "chrome-extension://abcdef",
+    ] {
         let (status, headers, body) = b156_start(&t, &[("origin", origin)]).await;
         let flow = b21_flow(status, &headers, &body);
         assert_eq!(flow.param("redirect_uri"), B21_CALLBACK, "from {origin}");
@@ -8421,6 +8447,41 @@ async fn b156_start_from_the_public_origin_goes_on() {
         status,
         StatusCode::CONFLICT,
         "another scheme is another address"
+    );
+
+    // A default port matches its absence, on either side.
+    for (public_url, origin) in [
+        ("https://media.example:443", "https://media.example"),
+        ("https://media.example", "https://media.example:443"),
+        ("http://media.example:80/jf", "http://media.example"),
+    ] {
+        let (status, _) = t.save(serde_json::json!({ "PublicUrl": public_url })).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, headers, body) = b156_start(&t, &[("origin", origin)]).await;
+        b21_flow(status, &headers, &body);
+    }
+}
+
+#[tokio::test]
+async fn b156_start_without_origin_and_matching_link_go_on() {
+    let t = b21_on(serde_json::json!({})).await;
+    // No Origin at all, as from a non-browser client: not checked.
+    let (status, headers, body) = t.start_raw().await;
+    let flow = b21_flow(status, &headers, &body);
+    assert_eq!(flow.param("redirect_uri"), B21_CALLBACK);
+
+    // A link from the public URL's own address starts.
+    let mut req = request("POST", "/Auth/Oidc/Link", Some(&t.admin), None);
+    req.headers_mut()
+        .insert("origin", B21_PUBLIC_URL.parse().unwrap());
+    req.headers_mut()
+        .insert("sec-fetch-site", "same-origin".parse().unwrap());
+    let (status, headers, body) = t.raw(req).await;
+    let flow = b21_flow(status, &headers, &body);
+    assert_eq!(flow.param("redirect_uri"), B21_CALLBACK);
+    assert_eq!(
+        t.settings().await["MismatchedOrigin"],
+        serde_json::Value::Null
     );
 }
 
