@@ -1616,6 +1616,12 @@ struct ItemsQuery {
     image_types_limit: Option<i32>,
     #[serde(rename = "imageTypesLimit")]
     image_types_limit_lower: Option<i32>,
+    /// A Rustyfin extension, not a Jellyfin option: `RustyfinCardIndex=true` answers with only
+    /// what a poster card shows (see `card_index_result`). Jellyfin clients never send it, so their
+    /// answers keep Jellyfin's DTO.
+    rustyfin_card_index: Option<bool>,
+    #[serde(rename = "rustyfinCardIndex")]
+    rustyfin_card_index_lower: Option<bool>,
     // Jellyfin's DTO options: EnableUserData=false leaves out UserData only; EnableImages,
     // EnableImageTypes and ImageTypeLimit narrow the images (see `ImageOptions`)
     enable_user_data: Option<bool>,
@@ -1781,6 +1787,11 @@ impl ItemsQuery {
     }
     fn fields(&self) -> Option<&str> {
         self.fields.as_deref().or(self.fields_lower.as_deref())
+    }
+    fn card_index(&self) -> bool {
+        self.rustyfin_card_index
+            .or(self.rustyfin_card_index_lower)
+            .unwrap_or(false)
     }
     fn enable_user_data(&self) -> bool {
         self.enable_user_data
@@ -2057,6 +2068,12 @@ async fn get_items(
     )
     .await?;
 
+    if query.card_index() {
+        let result =
+            card_index_result(&state.db_ro, &items, total, query.start_index_requested()).await?;
+        return Ok(Json(result).into_response());
+    }
+
     // Only populate media_sources when explicitly requested via Fields parameter
     // This significantly speeds up listing views with many items
     let fields: Vec<&str> = query
@@ -2103,6 +2120,83 @@ async fn get_items(
         start_index: query.start_index_requested(),
     })
     .into_response())
+}
+
+/// The answer to a list request with `RustyfinCardIndex=true` (a Rustyfin extension; the web
+/// client's library index asks this way): per item only what a poster card shows before its page
+/// arrives, Jellyfin's names and shapes, null fields left out: Id, Name, SortName (the letter
+/// rail; only when it differs from the name beyond case), Type, ProductionYear, CommunityRating
+/// (to the tenth), for episodes their numbers (IndexNumberEnd too) and series, and the Primary
+/// picture's tag and BlurHash: about 300 bytes an item. The list's filters and order are the request's; the only
+/// other query is one batch of Primary pictures, with no per-item work.
+async fn card_index_result(
+    pool: &sqlx::SqlitePool,
+    items: &[MediaItem],
+    total: i64,
+    start_index: i64,
+) -> Result<Value, ApiError> {
+    use rustyfin_model::image::ImageType;
+    let ids: Vec<Uuid> = items.iter().map(|item| item.id).collect();
+    let images = rustyfin_db::repo_image::get_images_batch_of(
+        pool,
+        &ids,
+        Some(&[ImageType::Primary]),
+        Some(1),
+    )
+    .await?;
+    let cards: Vec<Value> = items
+        .iter()
+        .map(|item| {
+            let mut card = serde_json::Map::new();
+            card.insert("Id".into(), json!(item.id));
+            card.insert("Name".into(), json!(item.name));
+            // Only when it sorts otherwise than the name (the rail reads Name when it is missing)
+            if let Some(sort_name) = &item.sort_name
+                && sort_name.to_lowercase() != item.name.to_lowercase()
+            {
+                card.insert("SortName".into(), json!(sort_name));
+            }
+            card.insert("Type".into(), json!(item.media_type.item_kind()));
+            if let Some(year) = item.production_year {
+                card.insert("ProductionYear".into(), json!(year));
+            }
+            // To the tenth the card shows
+            if let Some(rating) = item.community_rating {
+                card.insert(
+                    "CommunityRating".into(),
+                    json!((rating * 10.0).round() / 10.0),
+                );
+            }
+            if let Some(n) = item.index_number {
+                card.insert("IndexNumber".into(), json!(n));
+            }
+            // A file holding several episodes: the card shows "E1-2"
+            if let Some(n) = item.index_number_end {
+                card.insert("IndexNumberEnd".into(), json!(n));
+            }
+            if let Some(n) = item.parent_index_number {
+                card.insert("ParentIndexNumber".into(), json!(n));
+            }
+            if let Some(series) = &item.series_name {
+                card.insert("SeriesName".into(), json!(series));
+            }
+            let primary = images
+                .get(&item.id.to_string())
+                .and_then(|list| list.iter().find(|img| img.image_type == ImageType::Primary));
+            if let Some(img) = primary {
+                let tag = rustyfin_core::image_proxy::image_tag(&img.path, img.stamp);
+                if let Some(hash) = &img.blurhash {
+                    card.insert(
+                        "ImageBlurHashes".into(),
+                        json!({ "Primary": { tag.clone(): hash } }),
+                    );
+                }
+                card.insert("ImageTags".into(), json!({ "Primary": tag }));
+            }
+            Value::Object(card)
+        })
+        .collect();
+    Ok(json!({ "Items": cards, "TotalRecordCount": total, "StartIndex": start_index }))
 }
 
 /// Jellyfin's optional item fields (ItemFields) that Rustyfin fills on every item, by JSON name.

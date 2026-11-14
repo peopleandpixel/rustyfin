@@ -4082,6 +4082,196 @@ async fn b152_a_lean_list_has_names_pictures_and_blurhashes_only() {
     );
 }
 
+// B152 round 9: RustyfinCardIndex=true (a Rustyfin extension) answers with only what a poster
+// card shows, under 300 bytes an item; the same request without it keeps Jellyfin's base DTO
+#[tokio::test]
+async fn b152_a_card_index_has_only_what_a_card_shows() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let id = b30_photo(&state).await;
+    let app = app(state.clone());
+    b30_upload(&app, &token, id, &b30_jpeg(64, 96, [200, 30, 30])).await;
+    rustyfin_core::image_warmer::warm_pass(&state.db, &state.data_dir, &state.http_client)
+        .await
+        .unwrap();
+    let tag = b30_primary_tag(&app, &token, id, "Photo").await;
+
+    let base = "/Items?IncludeItemTypes=Photo&Recursive=true&Fields=&EnableUserData=false\
+                &EnableImageTypes=Primary&ImageTypeLimit=1";
+    let (status, jellyfin) = send_authed(&app, "GET", base, &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{jellyfin}");
+    let uri = format!("{base}&RustyfinCardIndex=true");
+    let (status, cards) = send_authed(&app, "GET", &uri, &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{cards}");
+
+    assert_eq!(cards["TotalRecordCount"], jellyfin["TotalRecordCount"]);
+    let item = &cards["Items"][0];
+    let keys: Vec<&str> = item
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let allowed = [
+        "Id",
+        "Name",
+        "SortName",
+        "Type",
+        "ProductionYear",
+        "CommunityRating",
+        "IndexNumber",
+        "IndexNumberEnd",
+        "ParentIndexNumber",
+        "SeriesName",
+        "ImageTags",
+        "ImageBlurHashes",
+    ];
+    assert!(keys.iter().all(|k| allowed.contains(k)), "{item}");
+    assert_eq!(item["Id"], jellyfin["Items"][0]["Id"]);
+    assert_eq!(item["Name"], "B30 Photo");
+    assert_eq!(item["Type"], jellyfin["Items"][0]["Type"]);
+    assert_eq!(item["ImageTags"], serde_json::json!({ "Primary": tag }));
+    assert_eq!(
+        item["ImageBlurHashes"]["Primary"][&tag],
+        jellyfin["Items"][0]["ImageBlurHashes"]["Primary"][&tag]
+    );
+    assert!(
+        item.as_object().unwrap().values().all(|v| !v.is_null()),
+        "{item}"
+    );
+    assert!(
+        item.to_string().len() < 300,
+        "{} bytes: {item}",
+        item.to_string().len()
+    );
+    // Without the extension, the answer is Jellyfin's base DTO, as other clients expect
+    assert!(
+        jellyfin["Items"][0]
+            .as_object()
+            .unwrap()
+            .contains_key("CanDelete"),
+        "{jellyfin}"
+    );
+}
+
+// B152 round 10: the card index lists the same items as the normal list for a user who isn't an
+// administrator, per-user filters included (Rustyfin has no library-access or parental-rating
+// limits; the per-user favourites are the per-user filter there is), and an episode card carries
+// its IndexNumberEnd
+#[tokio::test]
+async fn b152_a_card_index_lists_what_the_list_lists_for_a_plain_user() {
+    let state = test_state().await;
+    let folder = media_folder(&state, "b152 cards");
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: "B152 Cards".to_string(),
+        content_type: rustyfin_model::library::LibraryContentType::Movies,
+        paths: vec![folder.clone()],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    let mut ids = Vec::new();
+    for (name, kind, numbers) in [
+        ("Alpha", "Movie", None),
+        ("Beta", "Movie", None),
+        ("Gamma", "Movie", None),
+        ("Delta E1-2", "Episode", Some((1, 2))),
+    ] {
+        let id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO media_items (id, library_id, name, media_type, path, index_number, \
+             index_number_end) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(id.to_string())
+        .bind(lib.id.to_string())
+        .bind(name)
+        .bind(kind)
+        .bind(format!("{folder}/{name}.mkv"))
+        .bind(numbers.map(|(first, _)| first))
+        .bind(numbers.map(|(_, last)| last))
+        .execute(&state.db)
+        .await
+        .unwrap();
+        ids.push(id);
+    }
+    let (token, user) = j6_user_session(&state).await;
+    let (other_token, other) = j6_user_session(&state).await;
+    let app = app(state.clone());
+    // The user's favourite, and another user's
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        &format!("/Users/{user}/FavoriteItems/{}", ids[1]),
+        &token,
+        None,
+    )
+    .await;
+    assert!(status.is_success(), "{status}");
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        &format!("/Users/{other}/FavoriteItems/{}", ids[2]),
+        &other_token,
+        None,
+    )
+    .await;
+    assert!(status.is_success(), "{status}");
+
+    let listed = |body: &serde_json::Value| -> Vec<String> {
+        body["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["Id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    for filter in ["", "&IsFavorite=true"] {
+        let base = format!(
+            "/Items?LibraryId={}&Recursive=true&SortBy=SortName&Fields=&EnableUserData=false{filter}",
+            lib.id
+        );
+        let (status, plain) = send_authed(&app, "GET", &base, &token, None).await;
+        assert_eq!(status, StatusCode::OK, "{plain}");
+        let (status, cards) = send_authed(
+            &app,
+            "GET",
+            &format!("{base}&RustyfinCardIndex=true"),
+            &token,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{cards}");
+        assert_eq!(listed(&cards), listed(&plain), "{filter}");
+        assert_eq!(
+            cards["TotalRecordCount"], plain["TotalRecordCount"],
+            "{filter}"
+        );
+        if filter.is_empty() {
+            assert_eq!(listed(&cards).len(), 4);
+            let episode = cards["Items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["Id"] == ids[3].to_string())
+                .unwrap();
+            assert_eq!(
+                (
+                    episode["IndexNumber"].clone(),
+                    episode["IndexNumberEnd"].clone()
+                ),
+                (1.into(), 2.into())
+            );
+        } else {
+            assert_eq!(
+                listed(&cards),
+                vec![ids[1].to_string()],
+                "only the user's own favourite"
+            );
+        }
+    }
+}
+
 // B152 F13: EnableUserData=false leaves out UserData and nothing else, as in Jellyfin: a
 // third-party request with normal Fields gets the same movie, series and episode fields as without
 // it (no lean answer), and the episode keeps its series fields

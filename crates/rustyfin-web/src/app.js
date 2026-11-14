@@ -2034,11 +2034,11 @@ async function fetchLibraryPage(startIndex, signal) {
     return { items, total: data.TotalRecordCount ?? data.total_record_count ?? items.length };
 }
 
-// The index of the whole list: the list query with Fields given empty (Jellyfin's "no optional
-// fields"), EnableUserData=false and the Primary picture only, for every item (Limit is the
-// total, past the server's default cap). The server answers it without optional or null fields
-// (about 80 bytes of gzip an item). Cards made from it get their watch state when their page
-// arrives. Its request is dropped with the load. It goes out with the first page, not after it
+// The index of the whole list: the list query with RustyfinCardIndex=true (a Rustyfin extension:
+// per item only what a card shows, about 300 bytes, 50 of gzip; Fields given empty, EnableUserData
+// and the image options go along so a server without the extension still answers lean), for
+// every item (Limit past the server's default cap). Cards made from it get their watch state when
+// their page arrives. Its request is dropped with the load. It goes out with the first page, not after it
 // (one round trip less on a real network), so it asks for at least LIBRARY_INDEX_LIMIT items.
 // An index whose pictures mostly have no BlurHash yet (a server just upgraded computes them in
 // the background) is asked again, LIBRARY_INDEX_HASH_RETRY_MS later, a few times.
@@ -2049,6 +2049,7 @@ async function loadLibraryIndex(gen) {
         if (k !== 'Fields' && v !== undefined && v !== null && v !== '') q.set(k, v);
     }
     q.set('Fields', '');
+    q.set('RustyfinCardIndex', 'true');
     libraryIndexRequest?.abort();
     const controller = new AbortController();
     libraryIndexRequest = controller;
