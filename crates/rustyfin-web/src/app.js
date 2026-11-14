@@ -2966,9 +2966,13 @@ function showLoginError(message) {
     show('login-error');
 }
 
+// The address sign-ins must start from, from the last Info call (B156).
+let oidcPublicUrl = '';
+
 // Adds the provider button below the sign-in form when OIDC is on. A failed Info call counts as off.
 async function loadOidcSignIn() {
     const info = await API.oidcInfo().catch(() => null);
+    oidcPublicUrl = info?.PublicUrl || '';
     const box = $('oidc-sign-in');
     if (!info?.Enabled || !box) return;
     const label = (info.ButtonLabel || '').trim() || t('oidc.sign_in_default');
@@ -2980,7 +2984,8 @@ async function startOidcSignIn() {
         const { AuthorizationUrl } = await API.oidcStart();
         goToOidcProvider(AuthorizationUrl);
     } catch (err) {
-        showLoginError(err.message);
+        // 409: this page is open at another address than the one the provider sends users back to
+        showLoginError(err.status === 409 && oidcPublicUrl ? t('oidc.error.wrong_address', { url: oidcPublicUrl }) : err.message);
     }
 }
 
@@ -3771,6 +3776,13 @@ function renderOidcAdminSettings(s) {
                 <button type="button" class="jf-btn-ghost !py-2 !px-4 text-xs whitespace-nowrap" data-action="oidc-copy-callback">${escapeHtml(t('oidc.copy'))}</button>
             </div>`
         : hint('oidc.callback_after_save');
+    // B156: the provider sends users back to the public URL only, so a sign-in from another address is refused
+    const publicOrigin = (() => { try { return new URL(s.PublicUrl).origin; } catch { return ''; } })();
+    const originWarn = (key, origin) => `<p class="text-xs text-amber-300/80 mt-1" role="alert">${escapeHtml(t(key, { origin, url: s.PublicUrl }))}</p>`;
+    const originWarnings = [
+        publicOrigin && publicOrigin !== location.origin ? originWarn('oidc.public_url_other_page', location.origin) : '',
+        s.MismatchedOrigin && s.MismatchedOrigin !== location.origin ? originWarn('oidc.public_url_other_signin', s.MismatchedOrigin) : ''
+    ].join('');
 
     box.innerHTML = `
         <h3 class="font-bold text-white text-base mb-4">${escapeHtml(t('oidc.settings_title'))}</h3>
@@ -3824,6 +3836,7 @@ function renderOidcAdminSettings(s) {
             <div>
                 ${label('oidc-public-url', 'oidc.public_url')}
                 <input id="oidc-public-url" type="text" class="jf-input w-full" value="${escapeHtml(s.PublicUrl || location.origin)}">
+                ${originWarnings}
             </div>
             <div>
                 ${label('oidc-callback-url', 'oidc.callback_url')}

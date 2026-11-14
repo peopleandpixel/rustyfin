@@ -481,7 +481,8 @@
             "already_linked": "Diese Anmeldung oder dieses Konto ist bereits mit einem anderen Konto verknüpft.",
             "account_disabled": "Dieses Konto ist deaktiviert. Bitte einen Administrator fragen.",
             "server_error": "Der Server konnte die Anmeldung nicht abschließen. Bitte erneut versuchen.",
-            "unknown": "Die Anmeldung beim Anbieter ist fehlgeschlagen."
+            "unknown": "Die Anmeldung beim Anbieter ist fehlgeschlagen.",
+            "wrong_address": "Single Sign-on ist für {{url}} eingerichtet. Öffne Rustyfin unter dieser Adresse, um dich anzumelden."
         },
         "admin_tab": "Anmeldung",
         "settings_title": "OpenID Connect",
@@ -503,6 +504,8 @@
         "admin_group": "Administratorgruppe",
         "admin_group_hint": "Leer: Der Anbieter vergibt keine Administratorrechte.",
         "public_url": "Öffentliche URL dieses Servers",
+        "public_url_other_page": "Diese Seite ist unter {{origin}} geöffnet, Single Sign-on schickt Benutzer aber zu {{url}} zurück. Anmeldungen von einer anderen Adresse werden abgelehnt. Trage als öffentliche URL die Adresse ein, die Benutzer öffnen.",
+        "public_url_other_signin": "Eine Anmeldung wurde abgelehnt, weil sie von {{origin}} statt von {{url}} gestartet wurde. Erreichen Benutzer den Server unter dieser Adresse, trage sie als öffentliche URL ein.",
         "callback_url": "Callback-URL (beim Anbieter eintragen)",
         "callback_after_save": "Zuerst eine öffentliche URL speichern, dann erscheint die Callback-URL.",
         "copy": "Kopieren",
