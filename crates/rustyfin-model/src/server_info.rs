@@ -1,12 +1,29 @@
 use serde::{Deserialize, Serialize};
 
+/// The product name Jellyfin clients expect; jellyfin-sdk-kotlin's RecommendedServerDiscovery
+/// rejects a server that reports any other.
+pub const JELLYFIN_PRODUCT_NAME: &str = "Jellyfin Server";
+
+/// The Jellyfin version Rustyfin reports as `Version`, matching current stable Jellyfin (12.4.0).
+/// jellyfin-sdk-kotlin rates lower versions as outdated (minimum 10.10.0 in SDK 1.7, 10.11.0 in
+/// 1.8, 12.0.0 in 1.9) and has no upper bound. Rustyfin's own version goes in `RustyfinVersion`.
+pub const JELLYFIN_API_VERSION: &str = "12.4.0";
+
+/// Public server info returned by GET /System/Info/Public (no authentication)
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct ServerInfo {
+    /// Address of a server bound to a specific interface; omitted when bound to all interfaces.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_address: Option<String>,
     pub server_name: String,
     pub version: String,
+    pub product_name: String,
+    /// Always empty, as in Jellyfin, which no longer sets it.
+    pub operating_system: String,
     pub id: String,
     pub startup_wizard_completed: bool,
+    pub rustyfin_version: String,
 }
 
 /// Full server info returned by GET /System/Info (authenticated)
@@ -15,8 +32,10 @@ pub struct ServerInfo {
 pub struct FullServerInfo {
     pub server_name: String,
     pub version: String,
+    pub product_name: String,
     pub id: String,
     pub startup_wizard_completed: bool,
+    pub rustyfin_version: String,
     pub operating_system: String,
     pub has_pending_restart: bool,
     pub has_update_available: bool,

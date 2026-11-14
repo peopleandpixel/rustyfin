@@ -9,6 +9,12 @@ use tracing;
 /// SSDP multicast address and port
 const SSDP_ADDR: Ipv4Addr = Ipv4Addr::new(239, 255, 255, 250);
 const SSDP_PORT: u16 = 1900;
+/// SERVER header of the SSDP messages: Rustyfin's version, as a UPnP product token.
+const SSDP_SERVER: &str = concat!(
+    "Rustyfin/",
+    env!("CARGO_PKG_VERSION"),
+    " DLNADOC/1.50 UPnP/1.0"
+);
 
 /// DLNA server configuration
 #[derive(Debug, Clone)]
@@ -88,7 +94,7 @@ async fn handle_msearch(sock: &TokioUdpSocket, src: SocketAddr, config: &DlnaCon
         "HTTP/1.1 200 OK\r\n\
          CACHE-CONTROL: max-age=1800\r\n\
          LOCATION: {location}\r\n\
-         SERVER: Rustyfin/0.1 DLNADOC/1.50 UPnP/1.0\r\n\
+         SERVER: {SSDP_SERVER}\r\n\
          ST: upnp:rootdevice\r\n\
          USN: {usn}::upnp:rootdevice\r\n\
          EXT:\r\n\
@@ -124,7 +130,7 @@ pub async fn run_ssdp_advertiser(config: Arc<DlnaConfig>, mut shutdown: watch::R
          LOCATION: {location}\r\n\
          NT: upnp:rootdevice\r\n\
          NTS: ssdp:alive\r\n\
-         SERVER: Rustyfin/0.1 DLNADOC/1.50 UPnP/1.0\r\n\
+         SERVER: {SSDP_SERVER}\r\n\
          USN: {usn}::upnp:rootdevice\r\n\
          \r\n"
     );
@@ -174,7 +180,7 @@ pub fn device_description_xml(config: &DlnaConfig) -> String {
     <manufacturerURL>https://github.com/rustyfin</manufacturerURL>
     <modelDescription>Rustyfin DLNA Media Server</modelDescription>
     <modelName>Rustyfin</modelName>
-    <modelNumber>0.1</modelNumber>
+    <modelNumber>{version}</modelNumber>
     <UDN>uuid:{id}</UDN>
     <dlna:X_DLNADOC>DMS-1.50</dlna:X_DLNADOC>
     <serviceList>
@@ -197,6 +203,7 @@ pub fn device_description_xml(config: &DlnaConfig) -> String {
 </root>"#,
         name = config.server_name,
         id = config.server_id,
+        version = env!("CARGO_PKG_VERSION"),
     )
 }
 
@@ -275,4 +282,30 @@ pub fn connection_manager_scpd() -> &'static str {
     <stateVariable sendEvents="yes"><name>SinkProtocolInfo</name><dataType>string</dataType></stateVariable>
   </serviceStateTable>
 </scpd>"#
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // B130: DLNA names Rustyfin, so it carries Rustyfin's own version.
+    #[test]
+    fn b130_dlna_reports_the_crate_version() {
+        let config = DlnaConfig {
+            server_name: "Test".to_string(),
+            server_id: "test-id".to_string(),
+            http_port: 8096,
+            bind_ip: Ipv4Addr::LOCALHOST,
+        };
+        let xml = device_description_xml(&config);
+        let model_number = format!("<modelNumber>{}</modelNumber>", env!("CARGO_PKG_VERSION"));
+        assert!(xml.contains(&model_number), "{xml}");
+        assert_eq!(
+            SSDP_SERVER,
+            format!(
+                "Rustyfin/{} DLNADOC/1.50 UPnP/1.0",
+                env!("CARGO_PKG_VERSION")
+            )
+        );
+    }
 }

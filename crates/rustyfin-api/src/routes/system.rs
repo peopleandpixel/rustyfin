@@ -5,7 +5,8 @@ use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use rustyfin_model::auth::Claims;
 use rustyfin_model::server_info::{
-    EndpointInfo, FullServerInfo, LogFile, ServerConfiguration, ServerInfo,
+    EndpointInfo, FullServerInfo, JELLYFIN_API_VERSION, JELLYFIN_PRODUCT_NAME, LogFile,
+    ServerConfiguration, ServerInfo,
 };
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -78,14 +79,24 @@ async fn ping() -> &'static str {
     "\"Rustyfin\""
 }
 
+/// The address clients can reach, when the server is bound to one specific address.
+fn specific_local_address(bind_addr: &str) -> Option<String> {
+    let addr: SocketAddr = bind_addr.parse().ok()?;
+    (!addr.ip().is_unspecified()).then(|| format!("http://{addr}"))
+}
+
 async fn get_public_info(State(state): State<AppState>) -> Result<Json<ServerInfo>, ApiError> {
     let startup_wizard_completed = rustyfin_db::repo_user::users_exist(&state.db_ro).await?;
     let config = state.config.read().await;
     Ok(Json(ServerInfo {
+        local_address: specific_local_address(&state.bind_addr),
         server_name: config.server_name.clone(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
+        version: JELLYFIN_API_VERSION.to_string(),
+        product_name: JELLYFIN_PRODUCT_NAME.to_string(),
+        operating_system: String::new(),
         id: state.server_id.to_string(),
         startup_wizard_completed,
+        rustyfin_version: env!("CARGO_PKG_VERSION").to_string(),
     }))
 }
 
@@ -103,9 +114,11 @@ async fn get_full_info(
 
     Ok(Json(FullServerInfo {
         server_name: config.server_name.clone(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
+        version: JELLYFIN_API_VERSION.to_string(),
+        product_name: JELLYFIN_PRODUCT_NAME.to_string(),
         id: state.server_id.to_string(),
         startup_wizard_completed,
+        rustyfin_version: env!("CARGO_PKG_VERSION").to_string(),
         operating_system: os,
         has_pending_restart: false,
         has_update_available: false,
