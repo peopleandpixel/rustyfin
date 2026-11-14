@@ -65,6 +65,15 @@ function initLazyImages(root = document) {
     });
 }
 
+// Lucide icon as an SVG string. name is a key of window.lucideIcons (src/icons.js); an unknown name gives ''.
+function icon(name, { size = 16, class: cls = '', label } = {}) {
+    const nodes = window.lucideIcons?.[name];
+    if (!nodes) return '';
+    const children = nodes.map(([tag, attrs]) => `<${tag} ${Object.entries(attrs).map(([k, v]) => `${k}="${escapeHtml(v)}"`).join(' ')}/>`).join('');
+    const a11y = label ? `role="img" aria-label="${escapeHtml(label)}"` : 'aria-hidden="true"';
+    return `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"${cls ? ` class="${escapeHtml(cls)}"` : ''} ${a11y}>${children}</svg>`;
+}
+
 function toast(msg, type = 'success') {
     const c = $('toast-container');
     if (!c) return;
@@ -810,6 +819,33 @@ function startScanWithToast(request, startedMessage) {
     }).finally(() => clearTimeout(timer));
 }
 
+// The refresh answers only when the server has finished, so the button stays busy until then, and the open page is re-rendered from fresh data.
+async function refreshItemMetadata(button, id) {
+    if (button.disabled) return;
+    const busy = t('detail.metadata_refreshing');
+    button.disabled = true;
+    button.setAttribute('aria-busy', 'true');
+    button.classList.add('is-busy');
+    button.setAttribute('aria-label', busy);
+    button.setAttribute('title', busy);
+    try {
+        await API.refreshItem(id);
+        API.invalidateCache('/Items');
+        API.invalidateCache('/Shows');
+        toast(t('detail.metadata_refreshed'));
+        if (currentPage === 'detail' && currentDetailId === id) await renderDetail(id);
+    } catch (err) {
+        if (err.name === 'TimeoutError') toast(t('detail.metadata_refresh_timeout'), 'error');
+        else toast(t('detail.metadata_refresh_failed', { message: err.message }), 'error');
+    } finally {
+        button.disabled = false;
+        button.removeAttribute('aria-busy');
+        button.classList.remove('is-busy');
+        button.setAttribute('aria-label', t('detail.refresh_metadata'));
+        button.setAttribute('title', t('detail.refresh_metadata'));
+    }
+}
+
 // Clicks on rendered markup are dispatched here from data-action and data-* attributes, so server values never end up inside inline JavaScript.
 const clickActions = {
     navigate: el => navigate(el.dataset.page, el.dataset.id),
@@ -827,7 +863,7 @@ const clickActions = {
     'jump-letter': el => jumpToLetter(el.dataset.id, el.dataset.letter),
     'toggle-favorite': el => toggleFavorite(el.dataset.id, el.dataset.favorite === 'true'),
     'toggle-played': el => togglePlayed(el.dataset.id, el.dataset.played === 'true'),
-    'refresh-item': el => API.refreshItem(el.dataset.id).then(() => toast(t('detail.metadata_refreshing'))),
+    'refresh-item': el => refreshItemMetadata(el, el.dataset.id),
     'admin-tab': el => showAdminTab(el, el.dataset.tab),
     'delete-user': el => { if (confirm(t('admin.delete_user_confirm'))) API.deleteUser(el.dataset.id).then(() => renderAdmin()); },
     'set-user-admin': el => setUserPolicy(el, { IsAdministrator: el.checked }),
@@ -1993,27 +2029,27 @@ async function renderDetail(itemId) {
                         <!-- Action Bar -->
                         <div class="flex flex-wrap items-center gap-3">
                             ${canPlay ? `
-                            <button class="jf-btn-primary !py-3 !px-7 text-sm font-bold shadow-xl" data-action="play" data-id="${escapeHtml(id)}" data-stream-type="${escapeHtml(streamType)}" data-title="${escapeHtml(name)}"${resumeTicks > 0 ? ' data-resume="true"' : ''}>
+                            <button class="jf-btn-primary h-11 !py-0 !px-7 text-sm font-bold shadow-xl" data-action="play" data-id="${escapeHtml(id)}" data-stream-type="${escapeHtml(streamType)}" data-title="${escapeHtml(name)}"${resumeTicks > 0 ? ' data-resume="true"' : ''}>
                                 <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
                                 ${resumeTicks > 0 ? t('detail.resume') : t('common.play')}
                             </button>
                             ${resumeTicks > 0 ? `
-                            <button class="jf-btn-ghost !py-3 !px-4 text-sm" data-action="play" data-id="${escapeHtml(id)}" data-stream-type="${escapeHtml(streamType)}" data-title="${escapeHtml(name)}" data-from-start="true">
+                            <button class="jf-btn-ghost h-11 !py-0 !px-4 text-sm" data-action="play" data-id="${escapeHtml(id)}" data-stream-type="${escapeHtml(streamType)}" data-title="${escapeHtml(name)}" data-from-start="true">
                                 ${t('detail.play_from_beginning')}
                             </button>` : ''}` : ''}
 
-                            <button class="jf-btn-ghost !py-3 !px-4 text-sm" title="${escapeHtml(t('detail.toggle_favorite'))}" data-action="toggle-favorite" data-id="${escapeHtml(id)}" data-favorite="${fav}">
-                                <span class="${fav ? 'text-rose-500 font-bold' : 'text-white/60'} text-base">♥</span>
+                            <button class="jf-btn-ghost h-11 !py-0 w-11 !px-0 sm:w-auto sm:!px-4 text-sm" title="${escapeHtml(t('detail.toggle_favorite'))}" aria-label="${escapeHtml(t('detail.toggle_favorite'))}" data-action="toggle-favorite" data-id="${escapeHtml(id)}" data-favorite="${fav}">
+                                ${icon('Heart', { size: 18, class: fav ? 'text-rose-500 fill-current' : 'text-white/60' })}
                                 <span class="hidden sm:inline text-xs ml-1">${fav ? t('detail.favorite') : t('detail.add_favorite')}</span>
                             </button>
 
-                            <button class="jf-btn-ghost !py-3 !px-4 text-xs font-semibold" data-action="toggle-played" data-id="${escapeHtml(id)}" data-played="${played}">
+                            <button class="jf-btn-ghost h-11 !py-0 !px-4 text-xs font-semibold" data-action="toggle-played" data-id="${escapeHtml(id)}" data-played="${played}">
                                 ${played ? `<span class="text-emerald-400">${t('detail.played')}</span>` : `<span class="text-white/60">${t('detail.unplayed')}</span>`}
                             </button>
 
                             ${API.isAdmin ? `
-                            <button class="jf-btn-ghost !py-3 !px-3 text-xs" title="${escapeHtml(t('detail.refresh_metadata'))}" data-action="refresh-item" data-id="${escapeHtml(id)}">
-                                🔄
+                            <button class="jf-btn-ghost h-11 !py-0 w-11 !px-0" title="${escapeHtml(t('detail.refresh_metadata'))}" aria-label="${escapeHtml(t('detail.refresh_metadata'))}" data-action="refresh-item" data-id="${escapeHtml(id)}">
+                                ${icon('RefreshCw', { size: 18, class: 'jf-busy-spin' })}
                             </button>` : ''}
                         </div>
                     </div>
@@ -4949,6 +4985,22 @@ let scanSocketDelay = 1000;
 // True once the current outage has been logged, so the warning is printed only once
 let scanSocketWarned = false;
 
+// A library change re-renders the open detail, library or home page from fresh data. The lists are dropped from the
+// 30 s cache first, so the re-render is not served from it. Other pages get no re-render.
+function refreshViewAfterLibraryChange() {
+    const page = currentPage;
+    API.invalidateCache('/Items');
+    API.invalidateCache('/Shows');
+    if (page !== 'detail' && page !== 'library' && page !== 'home') return;
+    setTimeout(() => {
+        // Only if the user is still on that page
+        if (currentPage !== page) return;
+        if (page === 'detail' && currentDetailId) renderDetail(currentDetailId);
+        else if (page === 'library' && currentLibraryId) renderLibrary(currentLibraryId);
+        else if (page === 'home') renderHome();
+    }, 500);
+}
+
 function initScanProgressWebSocket() {
     if (typeof WebSocket === 'undefined') return;
     if (!API.isLoggedIn() || scanSocket || scanSocketRetry) return;
@@ -5002,15 +5054,7 @@ function initScanProgressWebSocket() {
                     updateScanRings(id);
                 }
             } else if (data.MessageType === 'LibraryChanged') {
-                // Library changed - refresh current view if on library page
-                // Drop the cached lists first, so the re-render is not served from the 30 s cache
-                API.invalidateCache('/Items');
-                API.invalidateCache('/Shows');
-                if (currentPage === 'library' && currentLibraryId) {
-                    setTimeout(() => renderLibrary(currentLibraryId), 500);
-                } else if (currentPage === 'home') {
-                    setTimeout(() => renderHome(), 500);
-                }
+                refreshViewAfterLibraryChange();
             }
         } catch (e) {
             console.error('Handling a server event failed:', e);

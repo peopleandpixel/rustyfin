@@ -17746,6 +17746,12 @@ fn b142_provider_key_field() {
     b124_node_test("b142_provider_keys.mjs");
 }
 
+// B144: Refresh metadata feedback and page updates in the web client
+#[test]
+fn b144_refresh_metadata() {
+    b124_node_test("b144_refresh_metadata.mjs");
+}
+
 #[test]
 fn b142_settings_key_inputs_hide_keys() {
     let app_js = b124_web_source("app.js");
