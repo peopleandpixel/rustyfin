@@ -277,6 +277,7 @@
         "last_login": "Letzter Login",
         "action": "Aktion",
         "role_admin": "Admin",
+        "role_user": "Benutzer",
         "delete_user_confirm": "Benutzer löschen?",
         "disabled_column": "Deaktiviert",
         "administrator_for": "{{name}} ist Administrator",
