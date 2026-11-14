@@ -246,6 +246,9 @@ async fn main() {
         .await;
     }
 
+    // One TMDb client (cache, rate limiter, retries) shared by the provider and AppState.
+    let tmdb = rustyfin_core::tmdb_client::TmdbClient::new(http_client.clone(), tmdb_settings);
+
     // Register TMDb plugin (disabled by default)
     {
         let tmdb_plugin = plugin_tmdb::TmdbPlugin::default();
@@ -258,7 +261,8 @@ async fn main() {
         register_builtin_plugin(&tmdb_plugin, &plugin_manager_with_db).await;
         // Register as metadata provider — will be active only if the plugin is enabled
         if let Err(e) =
-            plugin_tmdb::register_tmdb_provider(&tmdb_plugin, &plugin_manager_with_db).await
+            plugin_tmdb::register_tmdb_provider(&tmdb_plugin, tmdb.clone(), &plugin_manager_with_db)
+                .await
         {
             tracing::debug!("TMDb plugin not registered as provider (no API key): {}", e);
         }
@@ -422,8 +426,6 @@ async fn main() {
     // In-memory response caches
     let cache = rustyfin_api::cache::ApiCache::new();
     let image_cache = rustyfin_api::cache::ImageCache::new();
-
-    let tmdb = rustyfin_core::tmdb_client::TmdbClient::new(http_client.clone(), tmdb_settings);
 
     let state = AppState {
         db: pool,

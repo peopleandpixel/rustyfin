@@ -2,9 +2,9 @@ pub mod tmdb_client;
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-use crate::tmdb_client::TmdbApi;
+use crate::tmdb_client::{TmdbApi, TmdbClient};
 use rustyfin_model::media::MediaType;
 use rustyfin_model::metadata::{ExternalMetadata, MetadataImage};
 use rustyfin_model::plugin::{Plugin, PluginType};
@@ -51,13 +51,13 @@ pub trait MetadataProviderRegistrar {
 
 /// TMDb plugin that registers itself as a metadata provider.
 pub struct TmdbPlugin {
-    api_key: Mutex<Option<String>>,
+    api_key: Arc<Mutex<Option<String>>>,
 }
 
 impl Default for TmdbPlugin {
     fn default() -> Self {
         Self {
-            api_key: Mutex::new(None),
+            api_key: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -106,12 +106,6 @@ impl Plugin for TmdbPlugin {
     }
 }
 
-impl TmdbPlugin {
-    fn api_key(&self) -> Option<String> {
-        self.api_key.lock().unwrap().clone()
-    }
-}
-
 /// Create a new TMDb plugin instance (FFI entry point for dynamic loading).
 /// Only compiled when building as a dynamic library (`cdylib`).
 /// Returns a raw pointer to a `Box<dyn Plugin>` for FFI safety.
@@ -122,24 +116,28 @@ impl TmdbPlugin {
 #[cfg(feature = "dynamic")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rustyfin_plugin_create() -> *mut std::ffi::c_void {
-    let plugin: Box<dyn Plugin> = Box::new(TmdbPlugin {
-        api_key: Mutex::new(None),
-    });
+    let plugin: Box<dyn Plugin> = Box::new(TmdbPlugin::default());
     Box::into_raw(Box::new(plugin)).cast()
 }
 
 /// Register the TMDb plugin as a metadata provider with the given PluginManager.
+///
+/// Always registers. Each call reads the plugin's current key and uses the shared `client`; with
+/// no key the call returns nothing and makes no request.
 pub async fn register_tmdb_provider<P>(
     plugin: &TmdbPlugin,
+    client: TmdbClient,
     plugin_manager: &P,
 ) -> Result<(), String>
 where
     P: MetadataProviderRegistrar,
 {
-    let api_key = plugin.api_key().ok_or("TMDb API key not configured")?;
-    let api_key1 = api_key.clone();
-    let api_key2 = api_key.clone();
-    let api_key3 = api_key.clone();
+    let key1 = plugin.api_key.clone();
+    let key2 = plugin.api_key.clone();
+    let key3 = plugin.api_key.clone();
+    let client1 = client.clone();
+    let client2 = client.clone();
+    let client3 = client;
 
     let plugin_id = plugin.id().to_string();
     plugin_manager
@@ -150,20 +148,24 @@ where
                   name: &str,
                   year: Option<i32>|
                   -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>> {
-                let api_key = api_key1.clone();
+                let key = key1.clone();
+                let client = client1.clone();
                 let name = name.to_string();
                 Box::pin(async move {
-                    let tmdb = TmdbApi::new(&api_key);
+                    let current = key.lock().unwrap().clone();
+                    let tmdb = client.api(current.as_deref())?;
                     search_movie(&tmdb, &name, year).await
                 })
             },
             move |_client: &reqwest::Client,
                   name: &str|
                   -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>> {
-                let api_key = api_key2.clone();
+                let key = key2.clone();
+                let client = client2.clone();
                 let name = name.to_string();
                 Box::pin(async move {
-                    let tmdb = TmdbApi::new(&api_key);
+                    let current = key.lock().unwrap().clone();
+                    let tmdb = client.api(current.as_deref())?;
                     search_tv(&tmdb, &name).await
                 })
             },
@@ -172,14 +174,17 @@ where
                   _tvdb_id: Option<i64>,
                   _media_type: MediaType|
                   -> Pin<Box<dyn Future<Output = Vec<MetadataImage>> + Send>> {
-                let api_key = api_key3.clone();
+                let key = key3.clone();
+                let client = client3.clone();
                 Box::pin(async move {
-                    if let Some(id) = tmdb_id {
-                        let tmdb = TmdbApi::new(&api_key);
-                        fetch_images_for_tmdb(&tmdb, id).await
-                    } else {
-                        Vec::new()
-                    }
+                    let Some(id) = tmdb_id else {
+                        return Vec::new();
+                    };
+                    let current = key.lock().unwrap().clone();
+                    let Some(tmdb) = client.api(current.as_deref()) else {
+                        return Vec::new();
+                    };
+                    fetch_images_for_tmdb(&tmdb, id).await
                 })
             },
         )
