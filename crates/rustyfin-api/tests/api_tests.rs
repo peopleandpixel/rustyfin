@@ -17491,6 +17491,90 @@ async fn b142_seed_moves_config_json_keys() {
     assert!(!rustyfin_core::plugin_manager::seed_provider_keys(&pm, &mut config).await);
 }
 
+/// The `<input …>` tag holding `id="{id}"` in `source`.
+fn b142_input_tag<'a>(source: &'a str, id: &str) -> &'a str {
+    let at = source
+        .find(&format!("id=\"{id}\""))
+        .unwrap_or_else(|| panic!("an element with id {id}"));
+    let start = source[..at].rfind("<input").expect("an <input> tag");
+    let end = at + source[at..].find('>').unwrap();
+    &source[start..=end]
+}
+
+fn b142_assert_secret_input(tag: &str) {
+    for attr in [
+        "type=\"password\"",
+        "autocomplete=\"new-password\"",
+        "autocapitalize=\"off\"",
+        "spellcheck=\"false\"",
+        "data-1p-ignore",
+        "data-lpignore=\"true\"",
+    ] {
+        assert!(tag.contains(attr), "{tag} lacks {attr}");
+    }
+    assert!(!tag.contains("value="), "{tag} is prefilled");
+}
+
+#[test]
+fn b142_provider_key_field() {
+    b124_node_test("b142_provider_keys.mjs");
+}
+
+#[test]
+fn b142_settings_key_inputs_hide_keys() {
+    let app_js = b124_web_source("app.js");
+    for id in ["cfg-tmdb", "cfg-omdb", "cfg-fanart"] {
+        b142_assert_secret_input(b142_input_tag(&app_js, id));
+        assert!(
+            app_js.contains(&format!("id=\"{id}-clear\"")),
+            "{id} has a clear box"
+        );
+    }
+    let form_start = app_js[..app_js.find("id=\"cfg-tmdb\"").unwrap()]
+        .rfind("<form")
+        .unwrap();
+    let form_tag = &app_js[form_start..form_start + app_js[form_start..].find('>').unwrap()];
+    assert!(
+        form_tag.contains("autocomplete=\"off\""),
+        "settings form: {form_tag}"
+    );
+    for key in [
+        "config.TmdbApiKey",
+        "config.OmdbApiKey",
+        "config.FanartApiKey",
+    ] {
+        // The key-state flags (`config.TmdbApiKeySet`) are fine; reading a key itself is not.
+        let reads_key = app_js
+            .match_indices(key)
+            .any(|(at, _)| !app_js[at + key.len()..].starts_with("Set"));
+        assert!(!reads_key, "app.js still reads {key}");
+    }
+    for key in ["tmdb_api_key", "omdb_api_key", "fanart_api_key"] {
+        assert!(!app_js.contains(key), "app.js still reads {key}");
+    }
+    let save = b124_function(&app_js, "async function handleSaveConfig(");
+    assert!(save.contains("providerKeyField("), "handleSaveConfig");
+}
+
+#[test]
+fn b142_plugin_modal_masks_the_key() {
+    let app_js = b124_web_source("app.js");
+    let html = b124_web_source("index.html");
+    let source = if html.contains("id=\"plugin-config-key\"") {
+        &html
+    } else {
+        &app_js
+    };
+    b142_assert_secret_input(b142_input_tag(source, "plugin-config-key"));
+    assert!(
+        html.contains("id=\"plugin-config-enabled\"")
+            || app_js.contains("id=\"plugin-config-enabled\""),
+        "the modal has an Enable toggle"
+    );
+    let save = b124_function(&app_js, "async function savePluginConfig(");
+    assert!(save.contains("providerKeyField("), "savePluginConfig");
+}
+
 #[tokio::test]
 async fn g1_self_or_admin_user_routes() {
     let state = test_state().await;

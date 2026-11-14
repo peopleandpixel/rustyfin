@@ -3186,7 +3186,7 @@ async function renderSettings(data) {
                     <span class="w-2 h-2 rounded-full bg-[#00a4dc]"></span>
                     ${t('settings.server_config')}
                 </h3>
-                <form onsubmit="handleSaveConfig(event)" class="space-y-4">
+                <form onsubmit="handleSaveConfig(event)" autocomplete="off" class="space-y-4">
                     <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
                         <div>
                             <label class="block text-xs font-semibold text-white/70 mb-1">${t('settings.server_name')}</label>
@@ -3204,15 +3204,18 @@ async function renderSettings(data) {
                         </div>
                         <div>
                             <label class="block text-xs font-semibold text-white/70 mb-1">${t('settings.api_key', { service: 'TMDb' })}</label>
-                            <input id="cfg-tmdb" type="text" class="jf-input w-full" value="${escapeHtml(config.TmdbApiKey || config.tmdb_api_key || '')}" placeholder="${escapeHtml(t('common.optional'))}">
+                            <input id="cfg-tmdb" type="password" autocomplete="new-password" autocapitalize="off" spellcheck="false" data-1p-ignore data-lpignore="true" class="jf-input w-full" placeholder="${escapeHtml(config.TmdbApiKeySet ? t('settings.key_saved') : t('common.optional'))}">
+                            ${config.TmdbApiKeySet ? `<label class="flex items-center gap-2 mt-1 text-xs text-white/70"><input id="cfg-tmdb-clear" type="checkbox" class="checkbox checkbox-xs"> ${t('settings.key_clear')}</label>` : ''}
                         </div>
                         <div>
                             <label class="block text-xs font-semibold text-white/70 mb-1">${t('settings.api_key', { service: 'OMDb' })}</label>
-                            <input id="cfg-omdb" type="text" class="jf-input w-full" value="${escapeHtml(config.OmdbApiKey || config.omdb_api_key || '')}" placeholder="${escapeHtml(t('common.optional'))}">
+                            <input id="cfg-omdb" type="password" autocomplete="new-password" autocapitalize="off" spellcheck="false" data-1p-ignore data-lpignore="true" class="jf-input w-full" placeholder="${escapeHtml(config.OmdbApiKeySet ? t('settings.key_saved') : t('common.optional'))}">
+                            ${config.OmdbApiKeySet ? `<label class="flex items-center gap-2 mt-1 text-xs text-white/70"><input id="cfg-omdb-clear" type="checkbox" class="checkbox checkbox-xs"> ${t('settings.key_clear')}</label>` : ''}
                         </div>
                         <div>
                             <label class="block text-xs font-semibold text-white/70 mb-1">${t('settings.api_key', { service: 'Fanart.tv' })}</label>
-                            <input id="cfg-fanart" type="text" class="jf-input w-full" value="${escapeHtml(config.FanartApiKey || config.fanart_api_key || '')}" placeholder="${escapeHtml(t('common.optional'))}">
+                            <input id="cfg-fanart" type="password" autocomplete="new-password" autocapitalize="off" spellcheck="false" data-1p-ignore data-lpignore="true" class="jf-input w-full" placeholder="${escapeHtml(config.FanartApiKeySet ? t('settings.key_saved') : t('common.optional'))}">
+                            ${config.FanartApiKeySet ? `<label class="flex items-center gap-2 mt-1 text-xs text-white/70"><input id="cfg-fanart-clear" type="checkbox" class="checkbox checkbox-xs"> ${t('settings.key_clear')}</label>` : ''}
                         </div>
                     </div>
                     <div class="pt-2">
@@ -3308,19 +3311,34 @@ async function handleChangePassword(e, userId) {
     }
 }
 
+// A provider key field: the trimmed typed value, "" to clear the saved key, or undefined to leave it alone.
+function providerKeyField(value, clear) {
+    const typed = typeof value === 'string' ? value.trim() : '';
+    if (typed) return typed;
+    if (clear) return '';
+    return undefined;
+}
+
 async function handleSaveConfig(e) {
     e.preventDefault();
+    const body = {
+        ServerName: $('cfg-server-name')?.value || 'Rustyfin',
+        PreferredMetadataLanguage: $('cfg-meta-lang')?.value || 'de',
+        PublicPort: parseInt($('cfg-port')?.value) || 8096,
+        IsStartupWizardCompleted: true
+    };
+    const keys = {
+        TmdbApiKey: providerKeyField($('cfg-tmdb')?.value, $('cfg-tmdb-clear')?.checked),
+        OmdbApiKey: providerKeyField($('cfg-omdb')?.value, $('cfg-omdb-clear')?.checked),
+        FanartApiKey: providerKeyField($('cfg-fanart')?.value, $('cfg-fanart-clear')?.checked)
+    };
+    for (const [name, value] of Object.entries(keys)) {
+        if (value !== undefined) body[name] = value;
+    }
     try {
-        await API.updateConfig({
-            ServerName: $('cfg-server-name')?.value || 'Rustyfin',
-            PreferredMetadataLanguage: $('cfg-meta-lang')?.value || 'de',
-            PublicPort: parseInt($('cfg-port')?.value) || 8096,
-            TmdbApiKey: $('cfg-tmdb')?.value || null,
-            OmdbApiKey: $('cfg-omdb')?.value || null,
-            FanartApiKey: $('cfg-fanart')?.value || null,
-            IsStartupWizardCompleted: true
-        });
+        await API.updateConfig(body);
         toast(t('settings.server_config_updated'));
+        renderSettings();
     } catch (err) {
         toast(err.message, 'error');
     }
@@ -5248,7 +5266,9 @@ async function setLogLevel(level) {
 // --- Plugin Configuration Modal ---
 let currentPluginConfigId = null;
 let currentPluginConfigOriginal = null;
+let currentPluginConfigProvider = false;
 let currentPluginPriorityId = null;
+const PROVIDER_PLUGIN_NAMES = { tmdb: 'TMDb', omdb: 'OMDb', fanart: 'Fanart.tv' };
 
 async function openPluginConfig(pluginId) {
     currentPluginConfigId = pluginId;
@@ -5256,13 +5276,35 @@ async function openPluginConfig(pluginId) {
     const err = $('plugin-config-error');
     if (!dlg) return;
     hide(err);
+    let config = {};
     try {
-        const config = await API.getPluginConfig(pluginId);
+        config = await API.getPluginConfig(pluginId) ?? {};
+    } catch {
+        config = {};
+    }
+    currentPluginConfigProvider = Object.hasOwn(PROVIDER_PLUGIN_NAMES, pluginId) || Object.hasOwn(config, 'api_key');
+    if (currentPluginConfigProvider) {
+        // The stored key never reaches the DOM: only whether one is saved, and the status.
+        const keySet = Boolean(config.api_key);
+        currentPluginConfigOriginal = '{}';
+        $('plugin-config-textarea').value = '{}';
+        $('plugin-config-key').placeholder = t(keySet ? 'settings.key_saved' : 'common.optional');
+        $('plugin-config-key-label').textContent = t('settings.api_key', { service: PROVIDER_PLUGIN_NAMES[pluginId] ?? pluginId });
+        keySet ? show('plugin-config-key-clear-row') : hide('plugin-config-key-clear-row');
+        let status = config.status;
+        if (!status) {
+            try {
+                status = (await API.getPlugins()).find(p => p.Id === pluginId)?.Status;
+            } catch { /* leave unchecked */ }
+        }
+        $('plugin-config-enabled').checked = status === 'Active';
+        show('plugin-config-provider');
+        hide('plugin-config-json-block');
+    } else {
         currentPluginConfigOriginal = JSON.stringify(config, null, 2);
         $('plugin-config-textarea').value = currentPluginConfigOriginal;
-    } catch {
-        $('plugin-config-textarea').value = '{}';
-        currentPluginConfigOriginal = '{}';
+        hide('plugin-config-provider');
+        show('plugin-config-json-block');
     }
     dlg.classList.add('modal-open');
     if (typeof dlg.showModal === 'function') {
@@ -5284,18 +5326,29 @@ function closePluginConfig() {
     }
     currentPluginConfigId = null;
     currentPluginConfigOriginal = null;
+    currentPluginConfigProvider = false;
+    $('plugin-config-key').value = '';
+    $('plugin-config-key-clear').checked = false;
+    $('plugin-config-enabled').checked = false;
 }
 
 async function savePluginConfig() {
     const err = $('plugin-config-error');
     const textarea = $('plugin-config-textarea');
     let parsed;
-    try {
-        parsed = JSON.parse(textarea.value);
-    } catch (e) {
-        err.textContent = t('admin.plugin_config_failed', { message: 'Invalid JSON' });
-        show(err);
-        return;
+    if (currentPluginConfigProvider) {
+        parsed = { status: $('plugin-config-enabled').checked ? 'Active' : 'Disabled' };
+        const key = providerKeyField($('plugin-config-key').value, $('plugin-config-key-clear').checked);
+        if (key === '') parsed.api_key = null;
+        else if (key !== undefined) parsed.api_key = key;
+    } else {
+        try {
+            parsed = JSON.parse(textarea.value);
+        } catch (e) {
+            err.textContent = t('admin.plugin_config_failed', { message: 'Invalid JSON' });
+            show(err);
+            return;
+        }
     }
     hide(err);
     try {

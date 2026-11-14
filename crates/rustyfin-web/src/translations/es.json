@@ -80,6 +80,8 @@
         "server_name": "Nombre del servidor",
         "http_port": "Puerto HTTP",
         "api_key": "Clave API de {{service}}",
+        "key_saved": "Clave guardada: escriba una nueva para reemplazarla",
+        "key_clear": "Quitar la clave guardada",
         "save_config": "Guardar configuración",
         "server_config_updated": "Configuración del servidor actualizada"
     },
@@ -286,7 +288,8 @@
         "plugin_type_task": "Tarea",
         "plugin_no_plugins": "No hay plugins instalados",
         "plugin_builtin": "Integrado",
-        "plugin_config_json": "Configuración (JSON)"
+        "plugin_config_json": "Configuración (JSON)",
+        "plugin_enabled": "Habilitado"
     },
     "quick_connect": {
         "title": "Conexión rápida",

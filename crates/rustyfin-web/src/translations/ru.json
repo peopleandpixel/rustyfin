@@ -84,6 +84,8 @@
         "server_name": "Имя сервера",
         "http_port": "HTTP-порт",
         "api_key": "API-ключ {{service}}",
+        "key_saved": "Ключ сохранён – введите новый, чтобы заменить",
+        "key_clear": "Удалить сохранённый ключ",
         "save_config": "Сохранить настройки",
         "server_config_updated": "Настройки сервера обновлены"
     },
@@ -294,7 +296,8 @@
         "plugin_type_task": "Задача",
         "plugin_no_plugins": "Плагины не установлены",
         "plugin_builtin": "Встроенный",
-        "plugin_config_json": "Конфигурация (JSON)"
+        "plugin_config_json": "Конфигурация (JSON)",
+        "plugin_enabled": "Включён"
     },
     "quick_connect": {
         "title": "Быстрое подключение",

@@ -80,6 +80,8 @@
         "server_name": "服务器名称",
         "http_port": "HTTP 端口",
         "api_key": "{{service}} API 密钥",
+        "key_saved": "密钥已保存 – 输入新密钥即可替换",
+        "key_clear": "删除已保存的密钥",
         "save_config": "保存配置",
         "server_config_updated": "服务器配置已更新"
     },
@@ -286,7 +288,8 @@
         "plugin_type_task": "任务",
         "plugin_no_plugins": "未安装插件",
         "plugin_builtin": "内置",
-        "plugin_config_json": "配置（JSON）"
+        "plugin_config_json": "配置（JSON）",
+        "plugin_enabled": "启用"
     },
     "quick_connect": {
         "title": "快速连接",

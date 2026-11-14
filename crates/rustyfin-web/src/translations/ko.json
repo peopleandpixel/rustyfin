@@ -80,6 +80,8 @@
         "server_name": "서버 이름",
         "http_port": "HTTP 포트",
         "api_key": "{{service}} API 키",
+        "key_saved": "키 저장됨 – 새 키를 입력하면 바뀝니다",
+        "key_clear": "저장된 키 삭제",
         "save_config": "구성 저장",
         "server_config_updated": "서버 구성이 업데이트되었습니다"
     },
@@ -286,7 +288,8 @@
         "plugin_type_task": "작업",
         "plugin_no_plugins": "설치된 플러그인이 없습니다",
         "plugin_builtin": "내장",
-        "plugin_config_json": "설정(JSON)"
+        "plugin_config_json": "설정(JSON)",
+        "plugin_enabled": "사용"
     },
     "quick_connect": {
         "title": "빠른 연결",

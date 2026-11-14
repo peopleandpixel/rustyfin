@@ -129,6 +129,8 @@
         "server_name": "Servername",
         "http_port": "HTTP Port",
         "api_key": "{{service}} API Key",
+        "key_saved": "Schlüssel gespeichert – zum Ersetzen einen neuen eingeben",
+        "key_clear": "Gespeicherten Schlüssel entfernen",
         "save_config": "Konfiguration speichern",
         "server_config_updated": "Server-Konfiguration aktualisiert"
     },
@@ -372,7 +374,8 @@
         "plugin_type_task": "Aufgabe",
         "plugin_no_plugins": "Keine Plugins installiert",
         "plugin_builtin": "Eingebaut",
-        "plugin_config_json": "Konfiguration (JSON)"
+        "plugin_config_json": "Konfiguration (JSON)",
+        "plugin_enabled": "Aktiviert"
     },
     "quick_connect": {
         "title": "Quick Connect",

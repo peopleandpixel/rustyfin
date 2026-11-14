@@ -80,6 +80,8 @@
         "server_name": "Sunucu adı",
         "http_port": "HTTP bağlantı noktası",
         "api_key": "{{service}} API anahtarı",
+        "key_saved": "Anahtar kayıtlı – değiştirmek için yenisini yazın",
+        "key_clear": "Kayıtlı anahtarı kaldır",
         "save_config": "Yapılandırmayı kaydet",
         "server_config_updated": "Sunucu yapılandırması güncellendi"
     },
@@ -286,7 +288,8 @@
         "plugin_type_task": "Görev",
         "plugin_no_plugins": "Yüklenen eklenti yok",
         "plugin_builtin": "Yerleşik",
-        "plugin_config_json": "Yapılandırma (JSON)"
+        "plugin_config_json": "Yapılandırma (JSON)",
+        "plugin_enabled": "Etkin"
     },
     "quick_connect": {
         "title": "Hızlı Bağlantı",

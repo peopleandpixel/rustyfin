@@ -80,6 +80,8 @@
         "server_name": "Nome server",
         "http_port": "Porta HTTP",
         "api_key": "Chiave API {{service}}",
+        "key_saved": "Chiave salvata: inseriscine una nuova per sostituirla",
+        "key_clear": "Rimuovi la chiave salvata",
         "save_config": "Salva configurazione",
         "server_config_updated": "Configurazione server aggiornata"
     },
@@ -286,7 +288,8 @@
         "plugin_type_task": "Attività",
         "plugin_no_plugins": "Nessun plugin installato",
         "plugin_builtin": "Integrato",
-        "plugin_config_json": "Configurazione (JSON)"
+        "plugin_config_json": "Configurazione (JSON)",
+        "plugin_enabled": "Abilitato"
     },
     "quick_connect": {
         "title": "Connessione rapida",
