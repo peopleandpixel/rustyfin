@@ -828,16 +828,21 @@ impl PluginManager {
             }
         }
 
-        // Persist to database (built-in plugins rely solely on DB)
+        // Persist to database (built-in plugins rely solely on DB). The DB merges the patch
+        // into the stored config, so the hook below gets the stored result, not just the patch.
         if let Err(e) = self.save_plugin_config_to_db(plugin_id, &config).await {
             tracing::warn!("failed to persist plugin config to DB: {}", e);
         }
+        let merged = self
+            .load_plugin_config_from_db(plugin_id)
+            .await
+            .unwrap_or_else(|| config.clone());
 
-        // Let the plugin's hook set its status from the new config (e.g. a TMDb key enables it).
+        // Let the plugin's hook set its status from the merged config (e.g. a TMDb key enables it).
         // The lock is released before the hook runs.
         let hook = self.inner.read().await.config_hooks.get(plugin_id).cloned();
         if let Some(hook) = hook
-            && let Some(status) = hook(&config)
+            && let Some(status) = hook(&merged)
         {
             self.set_status_in_memory(plugin_id, status).await;
         }
@@ -927,7 +932,7 @@ impl PluginManager {
         // Update built-in plugin info and provider handles
         self.set_status_in_memory(plugin_id, status.clone()).await;
 
-        // Persist to database
+        // Persist to database. Only the "status" key is written; the stored merge keeps other keys.
         if let Some(_db) = &self.db {
             let status_str = match status {
                 PluginStatus::Active => "Active",
