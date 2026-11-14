@@ -496,6 +496,103 @@ pub async fn get_or_resize_image(
     render_image(source_path, None, rendition, cache_dir, http_client).await
 }
 
+/// Why a remote image could not be kept in the store by `localize_remote_image_checked`.
+#[derive(Debug)]
+pub enum LocalizeError {
+    /// The image could not be fetched (status, content type, size or network). Nothing is written.
+    Download(String),
+    /// The image was fetched but could not be written into the store. The URL can still be served.
+    Store(String),
+}
+
+impl std::fmt::Display for LocalizeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Download(e) | Self::Store(e) => f.write_str(e),
+        }
+    }
+}
+
+/// Counts the temp files written, so two writers in one process never share a temp name.
+static PART_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The file a remote image is kept in: `store_dir/<h[0..2]>/<h><.ext>`, where `h` is the lower-case
+/// hex SHA-256 of the URL and `.ext` is the URL path's extension when it is 1-5 ASCII alphanumerics.
+fn remote_image_file(url: &str, store_dir: &Path) -> std::path::PathBuf {
+    let h = hex(&Sha256::digest(url.as_bytes()));
+    let ext = reqwest::Url::parse(url)
+        .ok()
+        .and_then(|u| {
+            u.path_segments()
+                .and_then(|mut segments| segments.next_back().map(str::to_owned))
+        })
+        .and_then(|segment| {
+            segment
+                .rsplit_once('.')
+                .map(|(_, e)| e.to_ascii_lowercase())
+        })
+        .filter(|e| (1..=5).contains(&e.len()) && e.bytes().all(|b| b.is_ascii_alphanumeric()));
+    let name = match ext {
+        Some(ext) => format!("{h}.{ext}"),
+        None => h.clone(),
+    };
+    store_dir.join(&h[..2]).join(name)
+}
+
+/// Keeps a remote image in `store_dir` and returns its path there, so it is downloaded once and
+/// read from disk after that. A file already there with bytes in it is returned with no request.
+/// Otherwise the image is fetched with `read_image_bytes` (same status, content-type and size
+/// checks), written to a temp file beside it and renamed into place. A concurrent writer may win
+/// the rename; that is fine. A download error creates no file.
+pub async fn localize_remote_image(
+    url: &str,
+    store_dir: &Path,
+    http_client: Option<&reqwest::Client>,
+) -> Result<std::path::PathBuf, String> {
+    localize_remote_image_checked(url, store_dir, http_client)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// `localize_remote_image`, with the failure kind kept apart: a `Store` error means the bytes were
+/// fetched and the caller may still serve the URL.
+pub async fn localize_remote_image_checked(
+    url: &str,
+    store_dir: &Path,
+    http_client: Option<&reqwest::Client>,
+) -> Result<std::path::PathBuf, LocalizeError> {
+    let path = remote_image_file(url, store_dir);
+    if fs::metadata(&path).await.is_ok_and(|m| m.len() > 0) {
+        return Ok(path);
+    }
+
+    let bytes = read_image_bytes(url, http_client)
+        .await
+        .map_err(LocalizeError::Download)?;
+
+    let dir = path.parent().unwrap_or(store_dir);
+    let part = path.with_extension(format!(
+        "part-{}-{}",
+        std::process::id(),
+        PART_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let written: std::io::Result<()> = async {
+        fs::create_dir_all(dir).await?;
+        fs::write(&part, &bytes).await?;
+        fs::rename(&part, &path).await
+    }
+    .await;
+    if let Err(e) = written {
+        let _ = fs::remove_file(&part).await;
+        return Err(LocalizeError::Store(format!(
+            "failed to store remote image {}: {}",
+            path.display(),
+            e
+        )));
+    }
+    Ok(path)
+}
+
 async fn read_image_bytes(
     source: &str,
     http_client: Option<&reqwest::Client>,
@@ -1608,6 +1705,53 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(bytes.len(), 1000);
+    }
+
+    // B134b: a remote image is downloaded once into the store, then read from there. The stub
+    // answers one request only, so a second download would fail.
+    #[tokio::test]
+    async fn b134b_localize_downloads_once_and_keeps_the_extension() {
+        let (root, _remove) = b30_root();
+        let url = b30_serve_zeros(1000, true).await;
+        let first = localize_remote_image(&url, &root, None).await.unwrap();
+        assert!(first.starts_with(&root), "{}", first.display());
+        assert_eq!(first.extension().and_then(|e| e.to_str()), Some("jpg"));
+        assert_eq!(std::fs::metadata(&first).unwrap().len(), 1000);
+
+        let again = localize_remote_image(&url, &root, None).await.unwrap();
+        assert_eq!(again, first);
+        // No temp file is left behind.
+        let dir = first.parent().unwrap();
+        assert_eq!(b30_names(dir).len(), 1, "{:?}", b30_names(dir));
+    }
+
+    #[tokio::test]
+    async fn b134b_localize_refuses_a_body_over_the_cap_and_stores_nothing() {
+        let (root, _remove) = b30_root();
+        let url = b30_serve_zeros(REMOTE_IMAGE_MAX_BYTES as usize + 1, true).await;
+        let error = localize_remote_image(&url, &root, None)
+            .await
+            .expect_err("stored a body over the cap");
+        assert!(error.contains("too large"), "{error}");
+        let stored: Vec<_> = walkdir_files(&root);
+        assert!(stored.is_empty(), "{stored:?}");
+    }
+
+    /// The files below `dir`, at any depth; none when it is missing.
+    fn walkdir_files(dir: &Path) -> Vec<std::path::PathBuf> {
+        let mut files = Vec::new();
+        let mut dirs = vec![dir.to_path_buf()];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else {
+                    files.push(path);
+                }
+            }
+        }
+        files
     }
 
     #[test]

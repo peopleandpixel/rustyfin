@@ -1266,6 +1266,77 @@ async fn test_webclient_redirects() {
     }
 }
 
+// B148: after an upgrade a browser loads one consistent asset set. index.html and other
+// unhashed files revalidate (no-cache); content-hashed assets are immutable.
+#[tokio::test]
+#[cfg_attr(not(feature = "webclient"), ignore)]
+async fn b148_webclient_cache_control() {
+    let dist = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../rustyfin-web/dist");
+    let Ok(html) = std::fs::read_to_string(dist.join("index.html")) else {
+        tracing::info!("skipping b148_webclient_cache_control: web client dist not found");
+        return;
+    };
+    let state = test_state().await;
+
+    let get = |uri: String| {
+        let app = app(state.clone());
+        async move {
+            let resp = app
+                .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let cc = resp
+                .headers()
+                .get("cache-control")
+                .map(|v| v.to_str().unwrap().to_string());
+            (resp.status(), cc)
+        }
+    };
+
+    for uri in [
+        "/web/",
+        "/web/index.html",
+        "/web/sw.js",
+        "/web/assets/logo.png",
+    ] {
+        let (status, cc) = get(uri.to_string()).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert_eq!(cc.as_deref(), Some("no-cache"), "{uri}");
+    }
+
+    // Every script and stylesheet index.html loads from /web/assets/ has a content hash in its
+    // name: <stem>-<8 chars of [A-Za-z0-9_-]>.<ext>.
+    let hashed = |uri: &str| {
+        let name = uri.rsplit('/').next().unwrap();
+        let stem = name.rsplit_once('.').map_or(name, |(s, _)| s);
+        let b = stem.as_bytes();
+        b.len() > 9
+            && b[b.len() - 9] == b'-'
+            && b[b.len() - 8..]
+                .iter()
+                .all(|c| c.is_ascii_alphanumeric() || *c == b'_' || *c == b'-')
+    };
+    let refs: Vec<String> = html
+        .split('"')
+        .filter(|s| s.starts_with("/web/assets/") && (s.ends_with(".js") || s.ends_with(".css")))
+        .map(str::to_string)
+        .collect();
+    assert!(
+        refs.len() >= 4,
+        "index.html loads index js/css, hls, api.js and app.js: {refs:?}"
+    );
+    for uri in refs {
+        assert!(hashed(&uri), "{uri} has no content hash");
+        let (status, cc) = get(uri.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert_eq!(
+            cc.as_deref(),
+            Some("public, max-age=31536000, immutable"),
+            "{uri}"
+        );
+    }
+}
+
 // ── Rate Limiter Tests ──
 
 #[tokio::test]
@@ -11159,6 +11230,7 @@ struct G12Server {
     token: String,
     db: sqlx::SqlitePool,
     data_dir: Arc<std::path::PathBuf>,
+    image_cache: ImageCache,
 }
 
 async fn g12_server(env_key: Option<&str>, config_key: Option<&str>) -> G12Server {
@@ -11175,8 +11247,10 @@ async fn g12_server(env_key: Option<&str>, config_key: Option<&str>) -> G12Serve
     };
     let http = reqwest::Client::builder().no_proxy().build().unwrap();
     state.tmdb = TmdbClient::new(http, settings);
-    // API keys are now managed via the plugin system, not ServerConfiguration
-    let _ = config_key;
+    // B136: the server's own install path, so the env key alone enables TMDb.
+    state.plugin_manager = state.plugin_manager.with_database(state.db.clone());
+    rustyfin_core::plugin_manager::install_tmdb_plugin(&state.plugin_manager, state.tmdb.clone())
+        .await;
 
     let username = format!("admin_{}", uuid::Uuid::new_v4().simple());
     rustyfin_auth::create_initial_user(&state.db, &username, "admin")
@@ -11190,14 +11264,22 @@ async fn g12_server(env_key: Option<&str>, config_key: Option<&str>) -> G12Serve
         .await
         .unwrap();
 
-    G12Server {
+    let server = G12Server {
         origin,
         hits,
         token,
         db: state.db.clone(),
         data_dir: state.data_dir.clone(),
+        image_cache: state.image_cache.clone(),
         app: app(state),
+    };
+    // B136: a key saved in the plugin's configuration takes effect without a restart.
+    if let Some(key) = config_key {
+        server
+            .configure_tmdb(serde_json::json!({ "api_key": key }))
+            .await;
     }
+    server
 }
 
 impl G12Server {
@@ -11246,6 +11328,18 @@ impl G12Server {
         .await
         .unwrap();
         item_id
+    }
+
+    /// `POST /Plugins/tmdb/Configuration` with `config`.
+    async fn configure_tmdb(&self, config: serde_json::Value) {
+        let (status, body) = self
+            .send(
+                "POST",
+                "/Plugins/tmdb/Configuration",
+                Some(config.to_string()),
+            )
+            .await;
+        assert!(status.is_success(), "{status}: {body}");
     }
 
     /// `POST /Items/{id}/Refresh`, which must answer 200 whatever TMDb does. Returns the
@@ -11318,7 +11412,7 @@ async fn test_g12_configuration_round_trip_never_persists_env_key() {
 }
 
 #[tokio::test]
-#[ignore = "B128: TMDb lookups moved to plugin-tmdb (2d37da7); the test server registers no TMDb provider, so a refresh finds no TmdbId"]
+
 async fn test_g12_item_refresh_uses_env_key_and_base_urls() {
     let server = g12_server(Some(G12_ENV_KEY), None).await;
     let item_id = server.insert_movie().await;
@@ -11367,7 +11461,7 @@ async fn test_g12_item_refresh_uses_env_key_and_base_urls() {
 }
 
 #[tokio::test]
-#[ignore = "B128: TMDb lookups moved to plugin-tmdb (2d37da7); the test server registers no TMDb provider, so a refresh finds no TmdbId"]
+
 async fn test_g12_env_tmdb_key_wins_over_config_key() {
     let server = g12_server(Some(G12_ENV_KEY), Some(G12_CONFIG_KEY)).await;
     let item_id = server.insert_movie().await;
@@ -11377,13 +11471,26 @@ async fn test_g12_env_tmdb_key_wins_over_config_key() {
 }
 
 #[tokio::test]
-#[ignore = "B128: TMDb lookups moved to plugin-tmdb (2d37da7); the test server registers no TMDb provider, so a refresh finds no TmdbId"]
+
 async fn test_g12_item_refresh_still_uses_config_key() {
     let server = g12_server(None, Some(G12_CONFIG_KEY)).await;
     let item_id = server.insert_movie().await;
 
     assert_eq!(server.refresh(item_id).await, Some(9001));
     server.assert_all_signed_with(G12_CONFIG_KEY);
+}
+
+// B136: a saved "Disabled" status keeps TMDb off, even with a key in the environment.
+#[tokio::test]
+async fn b136_saved_disabled_status_keeps_tmdb_off() {
+    let server = g12_server(Some(G12_ENV_KEY), None).await;
+    server
+        .configure_tmdb(serde_json::json!({ "status": "Disabled" }))
+        .await;
+    let item_id = server.insert_movie().await;
+
+    assert_eq!(server.refresh(item_id).await, None);
+    assert!(server.hits().is_empty(), "TMDb was called while disabled");
 }
 
 #[tokio::test]
@@ -11393,6 +11500,156 @@ async fn test_g12_no_tmdb_key_sends_nothing() {
 
     assert_eq!(server.refresh(item_id).await, None);
     assert!(server.hits().is_empty(), "TMDb was called without a key");
+}
+
+// ── B134b: TMDb images are stored once in the data dir ──
+
+/// A stub image host. `/t/p/original/poster.png` is a 40x20 PNG and `/t/p/original/page.png`
+/// an HTML page. Returns the origin and the requested paths.
+async fn b134b_image_stub() -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+    use axum::http::header;
+    use axum::response::IntoResponse;
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::RgbImage::from_pixel(40, 20, image::Rgb([200, 30, 30]))
+        .write_to(&mut png, image::ImageFormat::Png)
+        .unwrap();
+    let png = png.into_inner();
+    let hits: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+    let seen = hits.clone();
+    let stub = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+        let png = png.clone();
+        let seen = seen.clone();
+        async move {
+            seen.lock().unwrap().push(uri.path().to_string());
+            match uri.path() {
+                "/t/p/original/poster.png" => {
+                    ([(header::CONTENT_TYPE, "image/png")], png).into_response()
+                }
+                "/t/p/original/page.png" => (
+                    [(header::CONTENT_TYPE, "text/html")],
+                    b"<html></html>".to_vec(),
+                )
+                    .into_response(),
+                _ => StatusCode::NOT_FOUND.into_response(),
+            }
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
+    (origin, hits)
+}
+
+/// The files below `dir`, at any depth.
+fn b134b_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut files = Vec::new();
+    let mut dirs = vec![dir.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else {
+                files.push(path);
+            }
+        }
+    }
+    files
+}
+
+/// The first view of a remote image stores it under the data dir; later views, also after the
+/// in-memory cache is gone (a restart), and resized ones read the file and never ask the host.
+#[tokio::test]
+async fn b134b_remote_image_is_downloaded_once_into_the_data_dir() {
+    let (origin, hits) = b134b_image_stub().await;
+    let server = g12_server(None, None).await;
+    let item_id = server.insert_movie().await;
+    let url = format!("{origin}/t/p/original/poster.png");
+    rustyfin_db::repo_image::batch_upsert_images(
+        &server.db,
+        &[rustyfin_model::image::ItemImage {
+            item_id,
+            image_type: rustyfin_model::image::ImageType::Primary,
+            image_index: 0,
+            path: url.clone(),
+            provider: "tmdb".to_string(),
+            width: None,
+            height: None,
+            blurhash: None,
+            stamp: None,
+        }],
+    )
+    .await
+    .unwrap();
+    let store = server.data_dir.join("metadata").join("remote-images");
+
+    let (status, body) = server
+        .send("GET", &format!("/Items/{item_id}/Images/Primary"), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(hits.lock().unwrap().len(), 1, "{:?}", hits.lock().unwrap());
+    let files = b134b_files(&store);
+    assert_eq!(files.len(), 1, "{files:?}");
+    assert!(
+        files[0].extension().is_some_and(|ext| ext == "png"),
+        "{files:?}"
+    );
+
+    // A restart empties the memory cache; the file stays.
+    server.image_cache.invalidate_all();
+    for uri in [
+        format!("/Items/{item_id}/Images/Primary"),
+        format!("/Items/{item_id}/Images/Primary?maxWidth=20"),
+    ] {
+        let (status, body) = server.send("GET", &uri, None).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+    }
+    assert_eq!(
+        hits.lock().unwrap().len(),
+        1,
+        "the stored image was fetched again: {:?}",
+        hits.lock().unwrap()
+    );
+    assert_eq!(b134b_files(&store).len(), 1);
+    // The row keeps the URL, so the image base URL still applies to it.
+    let images = rustyfin_db::repo_image::get_images_for_item(&server.db, item_id)
+        .await
+        .unwrap();
+    assert_eq!(images[0].path, url);
+}
+
+/// A remote answer that is not an image is refused and stores nothing.
+#[tokio::test]
+async fn b134b_remote_non_image_stores_nothing() {
+    let (origin, _hits) = b134b_image_stub().await;
+    let server = g12_server(None, None).await;
+    let item_id = server.insert_movie().await;
+    rustyfin_db::repo_image::batch_upsert_images(
+        &server.db,
+        &[rustyfin_model::image::ItemImage {
+            item_id,
+            image_type: rustyfin_model::image::ImageType::Primary,
+            image_index: 0,
+            path: format!("{origin}/t/p/original/page.png"),
+            provider: "tmdb".to_string(),
+            width: None,
+            height: None,
+            blurhash: None,
+            stamp: None,
+        }],
+    )
+    .await
+    .unwrap();
+
+    let (status, _) = server
+        .send("GET", &format!("/Items/{item_id}/Images/Primary"), None)
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let store = server.data_dir.join("metadata").join("remote-images");
+    assert!(b134b_files(&store).is_empty(), "{:?}", b134b_files(&store));
 }
 
 // ── Live TV Tests ──
@@ -17025,6 +17282,624 @@ async fn g1_plugin_configuration_is_admin_only() {
         let req = request("POST", &uri, Some(&viewer), Some(body));
         assert_eq!(send(&app, req).await.0, StatusCode::FORBIDDEN, "POST {uri}");
     }
+}
+
+// B142: provider API keys saved in Settings reach the provider plugins and never come back out.
+
+/// A server with the TMDb, OMDb and Fanart.tv plugins installed as main.rs installs them (no env key),
+/// plus the owner's and a viewer's tokens.
+async fn b142_server() -> (AppState, axum::Router, String, String) {
+    let mut state = test_state().await;
+    state.plugin_manager = state.plugin_manager.with_database(state.db.clone());
+    let pm = &state.plugin_manager;
+    rustyfin_core::plugin_manager::install_tmdb_plugin(pm, state.tmdb.clone()).await;
+    rustyfin_core::plugin_manager::install_omdb_plugin(pm).await;
+    rustyfin_core::plugin_manager::install_fanart_plugin(pm).await;
+    let app = app(state.clone());
+    let (owner, _, viewer, _) = g1_owner_and_viewer(&state, &app).await;
+    (state, app, owner, viewer)
+}
+
+/// Posts the current server configuration with `keys` merged in.
+async fn b142_save_settings(app: &axum::Router, owner: &str, keys: serde_json::Value) {
+    let (status, mut config) = send(
+        app,
+        request("GET", "/System/Configuration", Some(owner), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    for (k, v) in keys.as_object().unwrap() {
+        config[k] = v.clone();
+    }
+    let req = request("POST", "/System/Configuration", Some(owner), Some(config));
+    assert_eq!(send(app, req).await.0, StatusCode::NO_CONTENT);
+}
+
+/// The plugin's stored config. The API no longer returns provider keys (F6), so read the DB.
+async fn b142_stored(state: &AppState, plugin: &str) -> serde_json::Value {
+    state
+        .plugin_manager
+        .load_plugin_config_from_db(plugin)
+        .await
+        .unwrap_or_else(|| serde_json::json!({}))
+}
+
+async fn b142_status(state: &AppState, plugin: &str) -> rustyfin_model::plugin::PluginStatus {
+    state
+        .plugin_manager
+        .get_plugin_status(plugin)
+        .await
+        .unwrap()
+}
+
+async fn b142_active_providers(state: &AppState) -> Vec<String> {
+    let mut names: Vec<String> = state
+        .plugin_manager
+        .metadata_providers()
+        .await
+        .into_iter()
+        .map(|h| h.provider_name)
+        .collect();
+    names.sort();
+    names
+}
+
+#[tokio::test]
+async fn b142_plugin_status_and_key_survive_each_other() {
+    use rustyfin_model::plugin::PluginStatus;
+    let (state, app, owner, _) = b142_server().await;
+    let req = request(
+        "POST",
+        "/Plugins/omdb/Configuration",
+        Some(&owner),
+        Some(serde_json::json!({ "api_key": "b142-omdb-1" })),
+    );
+    assert_eq!(send(&app, req).await.0, StatusCode::OK);
+    state
+        .plugin_manager
+        .set_plugin_status("omdb", PluginStatus::Disabled)
+        .await
+        .unwrap();
+    let config = b142_stored(&state, "omdb").await;
+    assert_eq!(
+        config["api_key"], "b142-omdb-1",
+        "status write kept the key"
+    );
+    assert_eq!(config["status"], "Disabled");
+
+    // A later key keeps the saved status, and the saved Disabled still wins over the key.
+    let req = request(
+        "POST",
+        "/Plugins/omdb/Configuration",
+        Some(&owner),
+        Some(serde_json::json!({ "api_key": "b142-omdb-2" })),
+    );
+    assert_eq!(send(&app, req).await.0, StatusCode::OK);
+    let config = b142_stored(&state, "omdb").await;
+    assert_eq!(config["api_key"], "b142-omdb-2");
+    assert_eq!(config["status"], "Disabled", "key write kept the status");
+    assert_eq!(b142_status(&state, "omdb").await, PluginStatus::Disabled);
+}
+
+#[tokio::test]
+async fn b142_omdb_fanart_key_enables_without_restart() {
+    use rustyfin_model::plugin::PluginStatus;
+    let (state, app, owner, _) = b142_server().await;
+    assert_eq!(b142_status(&state, "omdb").await, PluginStatus::Disabled);
+    assert_eq!(b142_status(&state, "fanart").await, PluginStatus::Disabled);
+    assert!(b142_active_providers(&state).await.is_empty());
+
+    for plugin in ["omdb", "fanart"] {
+        let req = request(
+            "POST",
+            &format!("/Plugins/{plugin}/Configuration"),
+            Some(&owner),
+            Some(serde_json::json!({ "api_key": format!("b142-{plugin}") })),
+        );
+        assert_eq!(send(&app, req).await.0, StatusCode::OK);
+        assert_eq!(b142_status(&state, plugin).await, PluginStatus::Active);
+    }
+    assert_eq!(b142_active_providers(&state).await, ["fanart", "omdb"]);
+}
+
+#[tokio::test]
+async fn b142_settings_key_enables_provider_plugins() {
+    use rustyfin_model::plugin::PluginStatus;
+    let (state, app, owner, _) = b142_server().await;
+    b142_save_settings(
+        &app,
+        &owner,
+        serde_json::json!({
+            "TmdbApiKey": "b142-tmdb-secret",
+            "OmdbApiKey": " b142-omdb-secret ",
+            "FanartApiKey": "b142-fanart-secret",
+        }),
+    )
+    .await;
+    for (plugin, key) in [
+        ("tmdb", "b142-tmdb-secret"),
+        ("omdb", "b142-omdb-secret"),
+        ("fanart", "b142-fanart-secret"),
+    ] {
+        let config = b142_stored(&state, plugin).await;
+        assert_eq!(config["api_key"], key, "{plugin} key (trimmed)");
+        assert_eq!(config["status"], "Active", "{plugin} saved status");
+        assert_eq!(b142_status(&state, plugin).await, PluginStatus::Active);
+    }
+    assert_eq!(
+        b142_active_providers(&state).await,
+        ["fanart", "omdb", "tmdb"]
+    );
+}
+
+#[tokio::test]
+async fn b142_settings_never_return_keys() {
+    let (state, app, owner, viewer) = b142_server().await;
+    let before = send(
+        &app,
+        request("GET", "/System/Configuration", Some(&owner), None),
+    )
+    .await;
+    assert_eq!(before.1["TmdbApiKeySet"], false);
+    assert_eq!(before.1["OmdbApiKeySet"], false);
+    assert_eq!(before.1["FanartApiKeySet"], false);
+
+    b142_save_settings(
+        &app,
+        &owner,
+        serde_json::json!({ "TmdbApiKey": "b142-tmdb-secret", "FanartApiKey": "b142-fanart-secret" }),
+    )
+    .await;
+
+    let (status, admin) = send(
+        &app,
+        request("GET", "/System/Configuration", Some(&owner), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(admin["TmdbApiKeySet"], true);
+    assert_eq!(admin["OmdbApiKeySet"], false);
+    assert_eq!(admin["FanartApiKeySet"], true);
+    let (_, viewer_view) = send(
+        &app,
+        request("GET", "/System/Configuration", Some(&viewer), None),
+    )
+    .await;
+    assert!(viewer_view.get("TmdbApiKeySet").is_none());
+    for body in [&admin, &viewer_view] {
+        let text = body.to_string();
+        assert!(!text.contains("b142-"), "a key leaked: {text}");
+        assert!(body.get("TmdbApiKey").is_none());
+    }
+    for (token, key) in [
+        (&owner, "TmdbApiKey"),
+        (&viewer, "TmdbApiKey"),
+        (&owner, "FanartApiKey"),
+    ] {
+        let uri = format!("/System/Configuration/{key}");
+        let (_, json) = send(&app, request("GET", &uri, Some(token), None)).await;
+        assert!(!json.to_string().contains("b142-"), "GET {uri} leaked");
+    }
+    let on_disk = std::fs::read_to_string(state.data_dir.join("config.json")).unwrap();
+    assert!(!on_disk.contains("b142-"), "config.json holds a key");
+}
+
+#[tokio::test]
+async fn b142_settings_absent_key_keeps_saved_key() {
+    let (state, app, owner, _) = b142_server().await;
+    b142_save_settings(
+        &app,
+        &owner,
+        serde_json::json!({ "TmdbApiKey": "b142-tmdb-secret" }),
+    )
+    .await;
+    // A save without the field, and one with null, leave the stored key alone.
+    b142_save_settings(&app, &owner, serde_json::json!({ "ServerName": "b142" })).await;
+    b142_save_settings(&app, &owner, serde_json::json!({ "TmdbApiKey": null })).await;
+    let config = b142_stored(&state, "tmdb").await;
+    assert_eq!(config["api_key"], "b142-tmdb-secret");
+    assert_eq!(config["status"], "Active");
+}
+
+#[tokio::test]
+async fn b142_settings_empty_key_clears_and_disables() {
+    use rustyfin_model::plugin::PluginStatus;
+    let (state, app, owner, _) = b142_server().await;
+    b142_save_settings(
+        &app,
+        &owner,
+        serde_json::json!({ "OmdbApiKey": "b142-omdb-secret" }),
+    )
+    .await;
+    assert_eq!(b142_status(&state, "omdb").await, PluginStatus::Active);
+    b142_save_settings(&app, &owner, serde_json::json!({ "OmdbApiKey": "  " })).await;
+    let config = b142_stored(&state, "omdb").await;
+    assert!(config.get("api_key").is_none(), "{config}");
+    assert!(config.get("status").is_none(), "{config}");
+    assert_eq!(b142_status(&state, "omdb").await, PluginStatus::Disabled);
+    assert!(b142_active_providers(&state).await.is_empty());
+    let (_, admin) = send(
+        &app,
+        request("GET", "/System/Configuration", Some(&owner), None),
+    )
+    .await;
+    assert_eq!(admin["OmdbApiKeySet"], false);
+}
+
+#[tokio::test]
+async fn b142_seed_moves_config_json_keys() {
+    let state = test_state().await;
+    let pm = state.plugin_manager.clone().with_database(state.db.clone());
+    // An existing plugin key wins over the old config.json one.
+    pm.save_plugin_config_to_db(
+        "fanart",
+        &serde_json::json!({ "api_key": "b142-fanart-db" }),
+    )
+    .await
+    .unwrap();
+    let mut config: ServerConfiguration = serde_json::from_value(serde_json::json!({
+        "TmdbApiKey": "b142-tmdb-old",
+        "OmdbApiKey": "",
+        "FanartApiKey": "b142-fanart-old",
+    }))
+    .unwrap();
+    assert!(rustyfin_core::plugin_manager::seed_provider_keys(&pm, &mut config).await);
+    assert!(config.tmdb_api_key.is_none());
+    assert!(config.omdb_api_key.is_none());
+    assert!(config.fanart_api_key.is_none());
+    assert!(!serde_json::to_string(&config).unwrap().contains("b142-"));
+
+    let tmdb = pm.load_plugin_config_from_db("tmdb").await.unwrap();
+    assert_eq!(tmdb, serde_json::json!({ "api_key": "b142-tmdb-old" }));
+    assert!(pm.load_plugin_config_from_db("omdb").await.is_none());
+    let fanart = pm.load_plugin_config_from_db("fanart").await.unwrap();
+    assert_eq!(fanart["api_key"], "b142-fanart-db");
+
+    // TMDb comes up Active from the seeded key; nothing left to seed the second time.
+    rustyfin_core::plugin_manager::install_tmdb_plugin(&pm, state.tmdb.clone()).await;
+    assert_eq!(
+        pm.get_plugin_status("tmdb").await,
+        Some(rustyfin_model::plugin::PluginStatus::Active)
+    );
+    assert!(!rustyfin_core::plugin_manager::seed_provider_keys(&pm, &mut config).await);
+}
+
+/// Makes every write to `plugin_config` fail, as a full or broken disk would.
+async fn b142_fail_plugin_config_writes(state: &AppState) {
+    for event in ["INSERT", "UPDATE"] {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE TRIGGER b142_fail_{event} BEFORE {event} ON plugin_config \
+             BEGIN SELECT RAISE(ABORT, 'b142 write refused'); END"
+        )))
+        .execute(&state.db)
+        .await
+        .unwrap();
+    }
+}
+
+async fn b142_allow_plugin_config_writes(state: &AppState) {
+    for event in ["INSERT", "UPDATE"] {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP TRIGGER b142_fail_{event}"
+        )))
+        .execute(&state.db)
+        .await
+        .unwrap();
+    }
+}
+
+// B142 F1: a key that can't be stored is an error, not a silent 204.
+#[tokio::test]
+async fn b142_failed_key_save_answers_500() {
+    use rustyfin_model::plugin::PluginStatus;
+    let (state, app, owner, _) = b142_server().await;
+    b142_fail_plugin_config_writes(&state).await;
+
+    let (_, mut config) = send(
+        &app,
+        request("GET", "/System/Configuration", Some(&owner), None),
+    )
+    .await;
+    config["TmdbApiKey"] = serde_json::json!("b142-tmdb-secret");
+    config["ServerName"] = serde_json::json!("b142-after-failure");
+    let req = request("POST", "/System/Configuration", Some(&owner), Some(config));
+    assert_eq!(send(&app, req).await.0, StatusCode::INTERNAL_SERVER_ERROR);
+    // Nothing of the failed save is kept: no key, no status, and not the rest of the settings.
+    assert_eq!(b142_status(&state, "tmdb").await, PluginStatus::Disabled);
+    assert!(b142_stored(&state, "tmdb").await.get("api_key").is_none());
+    let (_, now) = send(
+        &app,
+        request("GET", "/System/Configuration", Some(&owner), None),
+    )
+    .await;
+    assert_ne!(now["ServerName"], "b142-after-failure");
+    assert_eq!(now["TmdbApiKeySet"], false);
+
+    let req = request(
+        "POST",
+        "/System/Configuration/TmdbApiKey",
+        Some(&owner),
+        Some(serde_json::json!("b142-tmdb-secret")),
+    );
+    assert_eq!(send(&app, req).await.0, StatusCode::INTERNAL_SERVER_ERROR);
+    let req = request(
+        "POST",
+        "/Plugins/omdb/Configuration",
+        Some(&owner),
+        Some(serde_json::json!({ "api_key": "b142-omdb-secret" })),
+    );
+    assert_eq!(send(&app, req).await.0, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(b142_status(&state, "omdb").await, PluginStatus::Disabled);
+    let req = request(
+        "POST",
+        "/Plugins/b142-missing/Configuration",
+        Some(&owner),
+        Some(serde_json::json!({})),
+    );
+    assert_eq!(send(&app, req).await.0, StatusCode::NOT_FOUND);
+
+    // Once the DB takes writes again, the same save works.
+    b142_allow_plugin_config_writes(&state).await;
+    b142_save_settings(
+        &app,
+        &owner,
+        serde_json::json!({ "TmdbApiKey": "b142-tmdb-secret" }),
+    )
+    .await;
+    assert_eq!(b142_status(&state, "tmdb").await, PluginStatus::Active);
+}
+
+// B142 F6: the plugin config API reports whether a provider key is set, never the key.
+#[tokio::test]
+async fn b142_plugin_config_hides_provider_keys() {
+    use rustyfin_core::plugin_manager::BuiltinPluginInfo;
+    use rustyfin_model::plugin::{PluginStatus, PluginType};
+    let (state, app, owner, _) = b142_server().await;
+    b142_save_settings(
+        &app,
+        &owner,
+        serde_json::json!({ "TmdbApiKey": "b142-tmdb-secret" }),
+    )
+    .await;
+    for (plugin, set) in [("tmdb", true), ("omdb", false), ("fanart", false)] {
+        let uri = format!("/Plugins/{plugin}/Configuration");
+        let (status, json) = send(&app, request("GET", &uri, Some(&owner), None)).await;
+        assert_eq!(status, StatusCode::OK, "GET {uri}");
+        assert!(json.get("api_key").is_none(), "GET {uri}: {json}");
+        assert_eq!(json["api_key_set"], set, "GET {uri}");
+        assert!(!json.to_string().contains("b142-"), "GET {uri} leaked");
+    }
+
+    // POST still takes a key; a posted api_key_set is not stored.
+    let req = request(
+        "POST",
+        "/Plugins/omdb/Configuration",
+        Some(&owner),
+        Some(serde_json::json!({ "api_key": "b142-omdb-secret", "api_key_set": false })),
+    );
+    assert_eq!(send(&app, req).await.0, StatusCode::OK);
+    let stored = b142_stored(&state, "omdb").await;
+    assert_eq!(stored["api_key"], "b142-omdb-secret");
+    assert!(stored.get("api_key_set").is_none(), "{stored}");
+    let (_, json) = send(
+        &app,
+        request("GET", "/Plugins/omdb/Configuration", Some(&owner), None),
+    )
+    .await;
+    assert_eq!(json["api_key_set"], true);
+
+    // Other plugins' configs are returned as stored.
+    state
+        .plugin_manager
+        .register_builtin_plugin(BuiltinPluginInfo {
+            name: "B142 other".to_string(),
+            version: "1".to_string(),
+            id: "b142-other".to_string(),
+            description: String::new(),
+            plugin_type: PluginType::NotificationProvider,
+            status: PluginStatus::Disabled,
+        })
+        .await;
+    let req = request(
+        "POST",
+        "/Plugins/b142-other/Configuration",
+        Some(&owner),
+        Some(serde_json::json!({ "api_key": "b142-other-token" })),
+    );
+    assert_eq!(send(&app, req).await.0, StatusCode::OK);
+    let (_, json) = send(
+        &app,
+        request(
+            "GET",
+            "/Plugins/b142-other/Configuration",
+            Some(&owner),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(json["api_key"], "b142-other-token");
+}
+
+// B142 F4: a key that couldn't be moved to its plugin stays in config.json until it is.
+#[tokio::test]
+async fn b142_seed_keeps_unsaved_keys() {
+    let (state, app, owner, _) = b142_server().await;
+    let pm = state.plugin_manager.clone();
+    b142_fail_plugin_config_writes(&state).await;
+    let mut config: ServerConfiguration = serde_json::from_value(serde_json::json!({
+        "TmdbApiKey": "b142-pending",
+    }))
+    .unwrap();
+    assert!(
+        !rustyfin_core::plugin_manager::seed_provider_keys(&pm, &mut config).await,
+        "nothing moved, so config.json needn't change"
+    );
+    assert_eq!(config.tmdb_api_key.as_deref(), Some("b142-pending"));
+    assert!(
+        serde_json::to_string(&config)
+            .unwrap()
+            .contains("b142-pending"),
+        "an unsaved key is still written to config.json"
+    );
+
+    // While it waits, responses don't carry it and a settings save keeps it.
+    *state.config.write().await = config.clone();
+    let (_, shown) = send(
+        &app,
+        request("GET", "/System/Configuration", Some(&owner), None),
+    )
+    .await;
+    assert!(!shown.to_string().contains("b142-pending"), "{shown}");
+    b142_save_settings(&app, &owner, serde_json::json!({ "ServerName": "b142" })).await;
+    let on_disk = std::fs::read_to_string(state.data_dir.join("config.json")).unwrap();
+    assert!(
+        on_disk.contains("b142-pending"),
+        "a settings save dropped it"
+    );
+
+    // The next try moves it.
+    b142_allow_plugin_config_writes(&state).await;
+    let mut config = state.config.read().await.clone();
+    assert!(rustyfin_core::plugin_manager::seed_provider_keys(&pm, &mut config).await);
+    assert!(config.tmdb_api_key.is_none());
+    assert_eq!(b142_stored(&state, "tmdb").await["api_key"], "b142-pending");
+}
+
+// B142 F2: plugin config writes are RFC 7396 merge patches, in memory as in the DB.
+#[test]
+fn b142_merge_patch() {
+    use serde_json::json;
+    let mut stored = json!({ "a": 1, "b": { "c": 2, "d": 3 }, "e": 4 });
+    rustyfin_core::plugin_manager::merge_patch(
+        &mut stored,
+        &json!({ "a": 5, "b": { "c": null }, "e": null, "f": 6 }),
+    );
+    assert_eq!(stored, json!({ "a": 5, "b": { "d": 3 }, "f": 6 }));
+    let mut stored = json!({ "a": 1 });
+    rustyfin_core::plugin_manager::merge_patch(&mut stored, &json!([1, 2]));
+    assert_eq!(stored, json!([1, 2]));
+    let mut stored = json!("not an object");
+    rustyfin_core::plugin_manager::merge_patch(&mut stored, &json!({ "a": null, "b": 1 }));
+    assert_eq!(stored, json!({ "b": 1 }));
+}
+
+#[test]
+fn b142_plugin_config_patch() {
+    b124_node_test("b142_plugin_config_patch.mjs");
+}
+
+/// The `<input …>` tag holding `id="{id}"` in `source`.
+fn b142_input_tag<'a>(source: &'a str, id: &str) -> &'a str {
+    let at = source
+        .find(&format!("id=\"{id}\""))
+        .unwrap_or_else(|| panic!("an element with id {id}"));
+    let start = source[..at].rfind("<input").expect("an <input> tag");
+    let end = at + source[at..].find('>').unwrap();
+    &source[start..=end]
+}
+
+fn b142_assert_secret_input(tag: &str) {
+    for attr in [
+        "type=\"password\"",
+        "autocomplete=\"new-password\"",
+        "autocapitalize=\"off\"",
+        "spellcheck=\"false\"",
+        "data-1p-ignore",
+        "data-lpignore=\"true\"",
+    ] {
+        assert!(tag.contains(attr), "{tag} lacks {attr}");
+    }
+    assert!(!tag.contains("value="), "{tag} is prefilled");
+}
+
+#[test]
+fn b142_provider_key_field() {
+    b124_node_test("b142_provider_keys.mjs");
+}
+
+// B144: Refresh metadata feedback and page updates in the web client
+#[test]
+fn b144_refresh_metadata() {
+    b124_node_test("b144_refresh_metadata.mjs");
+}
+
+// B145: Lucide icons instead of colour emoji and hand-copied SVG in the web client
+#[test]
+fn b145_icons() {
+    b124_node_test("b145_icons.mjs");
+}
+
+#[test]
+fn b142_settings_key_inputs_hide_keys() {
+    let app_js = b124_web_source("app.js");
+    for id in ["cfg-tmdb", "cfg-omdb", "cfg-fanart"] {
+        b142_assert_secret_input(b142_input_tag(&app_js, id));
+        assert!(
+            app_js.contains(&format!("id=\"{id}-clear\"")),
+            "{id} has a clear box"
+        );
+    }
+    let form_start = app_js[..app_js.find("id=\"cfg-tmdb\"").unwrap()]
+        .rfind("<form")
+        .unwrap();
+    let form_tag = &app_js[form_start..form_start + app_js[form_start..].find('>').unwrap()];
+    assert!(
+        form_tag.contains("autocomplete=\"off\""),
+        "settings form: {form_tag}"
+    );
+    for key in [
+        "config.TmdbApiKey",
+        "config.OmdbApiKey",
+        "config.FanartApiKey",
+    ] {
+        // The key-state flags (`config.TmdbApiKeySet`) are fine; reading a key itself is not.
+        let reads_key = app_js
+            .match_indices(key)
+            .any(|(at, _)| !app_js[at + key.len()..].starts_with("Set"));
+        assert!(!reads_key, "app.js still reads {key}");
+    }
+    for key in ["tmdb_api_key", "omdb_api_key", "fanart_api_key"] {
+        assert!(!app_js.contains(key), "app.js still reads {key}");
+    }
+    let save = b124_function(&app_js, "async function handleSaveConfig(");
+    assert!(save.contains("providerKeyField("), "handleSaveConfig");
+}
+
+#[test]
+fn b142_plugin_modal_masks_the_key() {
+    let app_js = b124_web_source("app.js");
+    let html = b124_web_source("index.html");
+    let source = if html.contains("id=\"plugin-config-key\"") {
+        &html
+    } else {
+        &app_js
+    };
+    b142_assert_secret_input(b142_input_tag(source, "plugin-config-key"));
+    assert!(
+        html.contains("id=\"plugin-config-enabled\"")
+            || app_js.contains("id=\"plugin-config-enabled\""),
+        "the modal has an Enable toggle"
+    );
+    let save = b124_function(&app_js, "async function savePluginConfig(");
+    assert!(save.contains("providerKeyField("), "savePluginConfig");
+    // F2: fields removed in the JSON editor are sent as null, and the dialog says so.
+    assert!(save.contains("pluginConfigPatch("), "savePluginConfig");
+    assert!(html.contains("data-i18n=\"admin.plugin_config_hint\""));
+    // F3: the provider dialog is for TMDb, OMDb and Fanart.tv only, and reads api_key_set (F6).
+    let open = b124_function(&app_js, "async function openPluginConfig(");
+    assert!(open.contains("PROVIDER_PLUGIN_NAMES"), "openPluginConfig");
+    assert!(
+        !open.contains("'api_key')"),
+        "openPluginConfig keys off an api_key field"
+    );
+    assert!(
+        open.contains("api_key_set"),
+        "openPluginConfig reads api_key_set"
+    );
+    assert!(
+        !open.contains("config.api_key)"),
+        "openPluginConfig reads the key"
+    );
 }
 
 #[tokio::test]

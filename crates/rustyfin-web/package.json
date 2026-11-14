@@ -17,6 +17,7 @@
   "dependencies": {
     "hls.js": "^1.5.7",
     "i18next": "^26.7.1",
-    "i18next-browser-languagedetector": "^8.3.0"
+    "i18next-browser-languagedetector": "^8.3.0",
+    "lucide": "^1.72.0"
   }
 }

@@ -96,12 +96,34 @@ async fn serve_image(
 
     let found = rustyfin_db::repo_image::get_image(&state.db_ro, id, &image_type, index).await?;
     // Imported people keep their images in `person_images`; try those before giving up.
-    let img = match found {
+    let mut img = match found {
         Some(img) => img,
         None => rustyfin_db::repo_image::get_person_image(&state.db_ro, id, &image_type, index)
             .await?
             .ok_or_else(|| ApiError::NotFound("image not found".into()))?,
     };
+
+    // A remote image is kept in the data dir on first use, so a restart reads it from disk rather
+    // than the origin. The DB row keeps the URL. If only the write failed, the URL is served.
+    if img.path.starts_with("http://") || img.path.starts_with("https://") {
+        let store = state.data_dir.join("metadata").join("remote-images");
+        match rustyfin_core::image_proxy::localize_remote_image_checked(
+            &img.path,
+            &store,
+            Some(&state.http_client),
+        )
+        .await
+        {
+            Ok(path) => img.path = path.to_string_lossy().into_owned(),
+            Err(rustyfin_core::image_proxy::LocalizeError::Download(e)) => {
+                tracing::warn!(error = %e, path = %img.path, "remote image could not be downloaded");
+                return Err(ApiError::NotFound(format!("image not found: {}", e)));
+            }
+            Err(rustyfin_core::image_proxy::LocalizeError::Store(e)) => {
+                tracing::warn!(error = %e, path = %img.path, "remote image could not be stored; serving the URL");
+            }
+        }
+    }
 
     // A stored size spares the header read, but counts only when both sides are known.
     let stored_size = match (img.width, img.height) {

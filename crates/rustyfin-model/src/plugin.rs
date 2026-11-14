@@ -282,3 +282,65 @@ pub enum NotificationPriority {
     High,
     Emergency,
 }
+
+/// Works out a keyed plugin's status (TMDb, OMDb, Fanart.tv) from its saved config and whether
+/// the plugin's env key is set.
+///
+/// A saved `"status"` string wins: "Active", "Disabled" or "Malfunctioned" map to that status and
+/// any other string is Disabled. Without one, the plugin is Active when `env_key` is set or the
+/// config's `api_key` is a string that is non-blank after trimming, and Disabled otherwise.
+pub fn key_status(config: Option<&serde_json::Value>, env_key: bool) -> PluginStatus {
+    if let Some(status) = config
+        .and_then(|c| c.get("status"))
+        .and_then(|v| v.as_str())
+    {
+        return match status {
+            "Active" => PluginStatus::Active,
+            "Malfunctioned" => PluginStatus::Malfunctioned,
+            _ => PluginStatus::Disabled,
+        };
+    }
+    let saved_key = config
+        .and_then(|c| c.get("api_key"))
+        .and_then(|v| v.as_str())
+        .is_some_and(|k| !k.trim().is_empty());
+    if env_key || saved_key {
+        PluginStatus::Active
+    } else {
+        PluginStatus::Disabled
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // B142: one rule for every keyed provider (TMDb, OMDb, Fanart.tv).
+    #[test]
+    fn b142_key_status_follows_the_key_unless_a_status_is_saved() {
+        assert_eq!(key_status(None, false), PluginStatus::Disabled);
+        assert_eq!(key_status(None, true), PluginStatus::Active);
+        let keyed = json!({ "api_key": " k " });
+        assert_eq!(key_status(Some(&keyed), false), PluginStatus::Active);
+        for blank in [
+            json!({}),
+            json!({ "api_key": "  " }),
+            json!({ "api_key": 1 }),
+        ] {
+            assert_eq!(
+                key_status(Some(&blank), false),
+                PluginStatus::Disabled,
+                "{blank}"
+            );
+        }
+        let disabled = json!({ "api_key": "k", "status": "Disabled" });
+        assert_eq!(key_status(Some(&disabled), true), PluginStatus::Disabled);
+        let active = json!({ "status": "Active" });
+        assert_eq!(key_status(Some(&active), false), PluginStatus::Active);
+        let broken = json!({ "status": "Malfunctioned" });
+        assert_eq!(key_status(Some(&broken), true), PluginStatus::Malfunctioned);
+        let odd = json!({ "api_key": "k", "status": "Paused" });
+        assert_eq!(key_status(Some(&odd), true), PluginStatus::Disabled);
+    }
+}

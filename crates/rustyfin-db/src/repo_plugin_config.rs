@@ -26,7 +26,12 @@ pub async fn get_plugin_config(
     }
 }
 
-/// Save or update the configuration JSON for a plugin.
+/// Merge a configuration patch into the stored configuration for a plugin.
+///
+/// The patch is an RFC 7396 merge patch applied with SQLite `json_patch`:
+/// keys in the patch replace stored ones, a `null` value removes a key, and
+/// a non-object patch replaces the whole value. Invalid stored JSON is
+/// replaced by the patch. The merge runs in one atomic statement.
 pub async fn set_plugin_config(
     pool: &SqlitePool,
     plugin_id: &str,
@@ -35,11 +40,17 @@ pub async fn set_plugin_config(
     let json_str =
         serde_json::to_string(config).map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
 
+    // `?2` is the raw patch on both paths: the insert path strips nulls via
+    // `json_patch('{}', ...)`, while the conflict path needs the nulls to
+    // remove stored keys.
     sqlx::query(
         "INSERT INTO plugin_config (plugin_id, config_json, updated_at)
-         VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+         VALUES (?1, json_patch('{}', ?2), strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
          ON CONFLICT(plugin_id) DO UPDATE SET
-             config_json = excluded.config_json,
+             config_json = CASE WHEN json_valid(plugin_config.config_json)
+                 THEN json_patch(plugin_config.config_json, ?2)
+                 ELSE json_patch('{}', ?2)
+             END,
              updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')",
     )
     .bind(plugin_id)
@@ -68,4 +79,73 @@ pub async fn list_plugin_configs(pool: &SqlitePool) -> Result<Vec<String>, sqlx:
             .await?;
 
     Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_pool;
+    use serde_json::json;
+
+    // B142: a status write and a config write must not wipe each other.
+    #[tokio::test]
+    async fn b142_set_plugin_config_merges_top_level_keys() {
+        let pool = test_pool().await;
+        set_plugin_config(&pool, "tmdb", &json!({ "api_key": "k1" }))
+            .await
+            .unwrap();
+        set_plugin_config(&pool, "tmdb", &json!({ "status": "Active" }))
+            .await
+            .unwrap();
+        let stored = get_plugin_config(&pool, "tmdb").await.unwrap().unwrap();
+        assert_eq!(stored, json!({ "api_key": "k1", "status": "Active" }));
+
+        set_plugin_config(&pool, "tmdb", &json!({ "api_key": "k2" }))
+            .await
+            .unwrap();
+        let stored = get_plugin_config(&pool, "tmdb").await.unwrap().unwrap();
+        assert_eq!(stored, json!({ "api_key": "k2", "status": "Active" }));
+    }
+
+    #[tokio::test]
+    async fn b142_set_plugin_config_null_removes_a_key() {
+        let pool = test_pool().await;
+        set_plugin_config(
+            &pool,
+            "omdb",
+            &json!({ "api_key": "k", "status": "Active" }),
+        )
+        .await
+        .unwrap();
+        set_plugin_config(&pool, "omdb", &json!({ "api_key": null, "status": null }))
+            .await
+            .unwrap();
+        let stored = get_plugin_config(&pool, "omdb").await.unwrap().unwrap();
+        assert_eq!(stored, json!({}));
+
+        // A first write stores no nulls either.
+        set_plugin_config(
+            &pool,
+            "fanart",
+            &json!({ "api_key": null, "status": "Disabled" }),
+        )
+        .await
+        .unwrap();
+        let stored = get_plugin_config(&pool, "fanart").await.unwrap().unwrap();
+        assert_eq!(stored, json!({ "status": "Disabled" }));
+    }
+
+    #[tokio::test]
+    async fn b142_set_plugin_config_replaces_invalid_stored_json() {
+        let pool = test_pool().await;
+        sqlx::query("INSERT INTO plugin_config (plugin_id, config_json) VALUES ('x', 'not json')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        set_plugin_config(&pool, "x", &json!({ "status": "Active" }))
+            .await
+            .unwrap();
+        let stored = get_plugin_config(&pool, "x").await.unwrap().unwrap();
+        assert_eq!(stored, json!({ "status": "Active" }));
+    }
 }

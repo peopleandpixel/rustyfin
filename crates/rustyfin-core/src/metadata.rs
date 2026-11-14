@@ -65,25 +65,40 @@ pub async fn refresh_item_metadata(
         );
         return Ok(());
     }
-    let search_name = clean_filename_for_search(&item.path);
-
-    if !search_name.is_empty() && search_name != item.name {
-        tracing::debug!(
-            "searching metadata for '{}' (cleaned from '{}')",
-            search_name,
-            item.name
-        );
+    // Candidate names in search order. Jellyfin searches the parsed name first; release
+    // tags left in the file name (e.g. "Bluray-1080p") make TMDb find nothing.
+    let mut candidates: Vec<String> = Vec::new();
+    let parsed = item.name.trim();
+    if !parsed.is_empty() {
+        candidates.push(parsed.to_string());
+    }
+    let cleaned = clean_filename_for_search(&item.path);
+    if !cleaned.is_empty() && !candidates.contains(&cleaned) {
+        candidates.push(cleaned);
     }
 
     for provider in &providers {
-        // Search for metadata
-        let meta = match item.media_type {
-            MediaType::Movie => {
-                (provider.search_movie)(client, &search_name, item.production_year).await
+        // Search for metadata, stopping at the first candidate name that matches
+        let mut meta = None;
+        for candidate in &candidates {
+            let found = match item.media_type {
+                MediaType::Movie => {
+                    (provider.search_movie)(client, candidate, item.production_year).await
+                }
+                MediaType::Series => (provider.search_tv)(client, candidate).await,
+                _ => break,
+            };
+            tracing::debug!(
+                "metadata search '{}' via {}: {}",
+                candidate,
+                provider.provider_name,
+                if found.is_some() { "found" } else { "no match" }
+            );
+            if found.is_some() {
+                meta = found;
+                break;
             }
-            MediaType::Series => (provider.search_tv)(client, &search_name).await,
-            _ => None,
-        };
+        }
 
         if let Some(meta) = meta {
             apply_metadata_to_item(pool, &mut working, &meta).await?;

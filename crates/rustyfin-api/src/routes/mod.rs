@@ -166,10 +166,52 @@ pub fn build_router(state: AppState) -> Router {
 #[cfg(feature = "webclient")]
 mod webclient {
     use axum::Router;
-    use axum::response::Redirect;
+    use axum::extract::Request;
+    use axum::http::{HeaderValue, header};
+    use axum::middleware::{Next, from_fn};
+    use axum::response::{Redirect, Response};
     use tower_http::services::ServeDir;
 
     use crate::state::AppState;
+
+    /// True for `/assets/<stem>-<8 chars of [A-Za-z0-9_-]>.<ext>`, with or without the `/web` prefix.
+    fn is_hashed_asset(path: &str) -> bool {
+        let path = path.strip_prefix("/web").unwrap_or(path);
+        let Some(rest) = path.strip_prefix("/assets/") else {
+            return false;
+        };
+        let Some((stem, ext)) = rest.rsplit_once('.') else {
+            return false;
+        };
+        if ext.is_empty()
+            || !ext
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        {
+            return false;
+        }
+        let b = stem.as_bytes();
+        b.len() > 9
+            && b[b.len() - 9] == b'-'
+            && b[b.len() - 8..]
+                .iter()
+                .all(|c| c.is_ascii_alphanumeric() || *c == b'_' || *c == b'-')
+    }
+
+    /// Hashed assets never change, so cache them forever; everything else revalidates,
+    /// errors included, so a 404 during an upgrade is not kept.
+    async fn web_cache_headers(req: Request, next: Next) -> Response {
+        let hashed = is_hashed_asset(req.uri().path());
+        let mut resp = next.run(req).await;
+        let value = if hashed && resp.status().is_success() {
+            "public, max-age=31536000, immutable"
+        } else {
+            "no-cache"
+        };
+        resp.headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static(value));
+        resp
+    }
 
     pub fn mount_webclient(router: Router<AppState>) -> Router<AppState> {
         let web_dir = std::env::var("RUSTYFIN_WEBCLIENT_DIR")
@@ -228,8 +270,12 @@ mod webclient {
 
         let serve_dir = ServeDir::new(&web_dir).append_index_html_on_directories(true);
 
+        let web = Router::new()
+            .fallback_service(serve_dir)
+            .layer(from_fn(web_cache_headers));
+
         router
-            .nest_service("/web", serve_dir)
+            .nest_service("/web", web)
             .route(
                 "/",
                 axum::routing::get(|| async { Redirect::permanent("/web/index.html") }),
@@ -238,5 +284,21 @@ mod webclient {
                 "/index.html",
                 axum::routing::get(|| async { Redirect::permanent("/web/index.html") }),
             )
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::is_hashed_asset;
+
+        #[test]
+        fn is_hashed_asset_matches_only_hashed_names() {
+            assert!(is_hashed_asset("/assets/index-AbC_-123.js"));
+            assert!(is_hashed_asset("/web/assets/app-1a2b3c4d.js"));
+            assert!(is_hashed_asset("/assets/hls.min-1a2b3c4d.js"));
+            assert!(!is_hashed_asset("/assets/logo.png"));
+            assert!(!is_hashed_asset("/assets/index.js"));
+            assert!(!is_hashed_asset("/index.html"));
+            assert!(!is_hashed_asset("/assets/a-1234567.js"));
+        }
     }
 }

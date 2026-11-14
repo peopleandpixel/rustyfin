@@ -2639,6 +2639,7 @@ dependencies = [
  "rustyfin-model",
  "serde",
  "serde_json",
+ "tokio",
  "tracing",
 ]
 

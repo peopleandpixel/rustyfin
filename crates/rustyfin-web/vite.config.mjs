@@ -8,36 +8,10 @@ import { fileURLToPath } from 'node:url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-// Compute content-based cache version hash
-function computeCacheVersion() {
-  const files = [
-    join(__dirname, 'src', 'app.js'),
-    join(__dirname, 'src', 'api.js'),
-    join(__dirname, 'src', 'input.css'),
-    join(__dirname, 'src', 'index.html'),
-    join(__dirname, 'src', 'main.js'),
-    join(__dirname, 'src', 'i18n.js'),
-    ...readdirSync(join(__dirname, 'src', 'translations')).sort()
-      .map(f => join(__dirname, 'src', 'translations', f)),
-    join(__dirname, 'src', 'assets', 'logo.png'),
-    join(__dirname, 'node_modules', 'hls.js', 'dist', 'hls.min.js'),
-  ];
-  const hash = createHash('md5');
-  for (const f of files) {
-    try {
-      hash.update(readFileSync(f));
-    } catch {
-      // skip missing files
-    }
-  }
-  return hash.digest('hex').substring(0, 8);
-}
+const sha8 = (buf) => createHash('sha256').update(buf).digest('hex').substring(0, 8);
 
-// Custom plugin: copy static assets and replace __CACHE_VERSION__ placeholders
+// Post-build step: hash-named global scripts, rewritten HTML, cache version
 function cacheVersionPlugin() {
-  const cacheVersion = computeCacheVersion();
-  console.log(`[vite:cache-version] Cache version: ${cacheVersion}`);
-
   return {
     name: 'vite-cache-version',
     closeBundle() {
@@ -45,45 +19,44 @@ function cacheVersionPlugin() {
       const assetsDir = join(distDir, 'assets');
       mkdirSync(assetsDir, { recursive: true });
 
-      // Copy hls.min.js locally
-      copyFileSync(
-        join(__dirname, 'node_modules', 'hls.js', 'dist', 'hls.min.js'),
-        join(assetsDir, 'hls.min.js')
-      );
+      // Global (non-module) scripts: copy as <stem>-<hash8>.js
+      const scripts = {
+        'api.js': join(__dirname, 'src', 'api.js'),
+        'app.js': join(__dirname, 'src', 'app.js'),
+        'hls.min.js': join(__dirname, 'node_modules', 'hls.js', 'dist', 'hls.min.js'),
+      };
+      const hashed = {};
+      for (const [name, src] of Object.entries(scripts)) {
+        const buf = readFileSync(src);
+        const out = `${name.replace(/\.js$/, '')}-${sha8(buf)}.js`;
+        writeFileSync(join(assetsDir, out), buf);
+        hashed[name] = out;
+      }
 
-      // Copy logo.png
+      // logo.png stays unhashed
       copyFileSync(
         join(__dirname, 'src', 'assets', 'logo.png'),
         join(assetsDir, 'logo.png')
       );
 
-      // Copy global scripts (non-module, loaded via plain <script> tags)
-      copyFileSync(
-        join(__dirname, 'src', 'api.js'),
-        join(assetsDir, 'api.js')
-      );
-      copyFileSync(
-        join(__dirname, 'src', 'app.js'),
-        join(assetsDir, 'app.js')
-      );
-
-      // Process sw.js: replace __CACHE_VERSION__
-      const swSrc = join(__dirname, 'src', 'sw.js');
-      const swContent = readFileSync(swSrc, 'utf8').replace(/__CACHE_VERSION__/g, cacheVersion);
-      writeFileSync(join(distDir, 'sw.js'), swContent);
-
-      // Process index.html: replace __CACHE_VERSION__ and fix non-module script paths
+      // Rewrite index.html to the hashed script names
       const htmlPath = join(distDir, 'index.html');
-      let htmlContent = readFileSync(htmlPath, 'utf8');
-      htmlContent = htmlContent
-        .replace(/__CACHE_VERSION__/g, cacheVersion)
-        // Vite keeps relative paths for non-module scripts; fix them to absolute
-        // Add cache-busting version query so the service worker always fetches fresh content
-        .replace(/src="\.\/api\.js"/g, `src="/web/assets/api.js?v=${cacheVersion}"`)
-        .replace(/src="\.\/app\.js"/g, `src="/web/assets/app.js?v=${cacheVersion}"`);
-      writeFileSync(htmlPath, htmlContent);
+      let html = readFileSync(htmlPath, 'utf8')
+        .replace('src="./api.js"', `src="/web/assets/${hashed['api.js']}"`)
+        .replace('src="./app.js"', `src="/web/assets/${hashed['app.js']}"`)
+        .replace('src="/web/assets/hls.min.js"', `src="/web/assets/${hashed['hls.min.js']}"`);
 
-      console.log(`[vite:cache-version] Done — version ${cacheVersion}`);
+      // Cache version: hash over the final asset names, so it changes whenever any asset does
+      const names = readdirSync(assetsDir).sort().join('\n');
+      const cacheVersion = sha8(names);
+      console.log(`[vite:cache-version] Cache version: ${cacheVersion}`);
+
+      writeFileSync(
+        join(distDir, 'sw.js'),
+        readFileSync(join(__dirname, 'src', 'sw.js'), 'utf8').replace(/__CACHE_VERSION__/g, cacheVersion)
+      );
+      html = html.replace(/__CACHE_VERSION__/g, cacheVersion);
+      writeFileSync(htmlPath, html);
     },
   };
 }
@@ -99,9 +72,9 @@ export default defineConfig({
     rollupOptions: {
       input: join(__dirname, 'src', 'index.html'),
       output: {
-        entryFileNames: 'assets/[name].js',
-        chunkFileNames: 'assets/[name].js',
-        assetFileNames: 'assets/[name][extname]',
+        entryFileNames: 'assets/[name]-[hash].js',
+        chunkFileNames: 'assets/[name]-[hash].js',
+        assetFileNames: 'assets/[name]-[hash][extname]',
       },
     },
   },
