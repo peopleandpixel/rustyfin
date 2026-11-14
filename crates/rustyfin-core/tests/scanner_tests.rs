@@ -3869,6 +3869,265 @@ async fn b17_scheduler_scan_reports_progress_until_its_probes_finish() {
     }
 }
 
+// B135: the scheduled scan identifies new items with the metadata providers of the server's plugin
+// manager, not with an empty one of its own.
+#[tokio::test]
+async fn b135_a_scheduled_scan_uses_the_given_plugin_manager() {
+    use rustyfin_model::metadata::{ExternalMetadata, MetadataImage};
+    use rustyfin_model::plugin::PluginStatus;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Mutex;
+    type Found = Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>>;
+    type Images = Pin<Box<dyn Future<Output = Vec<MetadataImage>> + Send>>;
+
+    let fx = Fixture::new().await;
+    let lib = fx.library("B135 Film", LibraryContentType::Movies).await;
+    touch(&root_of(&lib), "B135 Movie (2001)/B135 Movie (2001).mkv");
+
+    let pm = rustyfin_core::plugin_manager::PluginManager::new(&fx.dir);
+    let searched: Arc<Mutex<Vec<String>>> = Arc::default();
+    let seen = searched.clone();
+    pm.register_metadata_provider(
+        "b135".to_string(),
+        "b135".to_string(),
+        PluginStatus::Active,
+        move |_: &reqwest::Client, name: &str, _: Option<i32>| -> Found {
+            seen.lock().unwrap().push(name.to_string());
+            Box::pin(async {
+                Some(ExternalMetadata {
+                    tmdb_id: Some(135),
+                    ..Default::default()
+                })
+            })
+        },
+        |_: &reqwest::Client, _: &str| -> Found { Box::pin(async { None }) },
+        |_: &reqwest::Client, _: Option<i64>, _: Option<i64>, _| -> Images {
+            Box::pin(async { Vec::new() })
+        },
+    )
+    .await;
+    let sched = TaskScheduler::with_plugin_manager(
+        fx.pool.clone(),
+        Arc::new(fx.dir.clone()),
+        reqwest::Client::new(),
+        pm,
+    );
+    assert!(sched.start_task(TASK_LIBRARY_SCAN).await);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let item = loop {
+        let items = rustyfin_db::repo_media::get_items_by_library(&fx.pool, lib.id)
+            .await
+            .unwrap();
+        if let Some(item) = items.into_iter().find(|i| i.tmdb_id == Some(135)) {
+            break item;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the scheduled scan identified nothing within 60 s; searched {:?}",
+            searched.lock().unwrap()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert!(
+        item.path.ends_with("B135 Movie (2001).mkv"),
+        "{}",
+        item.path
+    );
+    assert_eq!(
+        searched.lock().unwrap().len(),
+        1,
+        "{:?}",
+        searched.lock().unwrap()
+    );
+}
+
+// B134d: providers are searched with the item's parsed name, as Jellyfin does, not with the
+// file name, whose release tags make TMDb find nothing. The cleaned file name is the fallback.
+#[tokio::test]
+async fn b134d_refresh_searches_the_parsed_name_first() {
+    use rustyfin_model::metadata::{ExternalMetadata, MetadataImage};
+    use rustyfin_model::plugin::PluginStatus;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Mutex;
+    type Found = Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>>;
+    type Images = Pin<Box<dyn Future<Output = Vec<MetadataImage>> + Send>>;
+    type Searches = Arc<Mutex<Vec<(String, Option<i32>)>>>;
+
+    let fx = Fixture::new().await;
+    let lib = fx.library("B134d Film", LibraryContentType::Movies).await;
+    let root = root_of(&lib);
+    let pm = rustyfin_core::plugin_manager::PluginManager::new(&fx.dir);
+    let searched: Searches = Arc::default();
+    let seen = searched.clone();
+    pm.register_metadata_provider(
+        "b134d".to_string(),
+        "b134d".to_string(),
+        PluginStatus::Active,
+        move |_: &reqwest::Client, name: &str, year: Option<i32>| -> Found {
+            seen.lock().unwrap().push((name.to_string(), year));
+            // Only the clean title is found, as on TMDb.
+            let found = matches!(name, "A Quiet Place" | "Odd Name Film");
+            Box::pin(async move {
+                found.then(|| ExternalMetadata {
+                    tmdb_id: Some(447332),
+                    ..Default::default()
+                })
+            })
+        },
+        |_: &reqwest::Client, _: &str| -> Found { Box::pin(async { None }) },
+        |_: &reqwest::Client, _: Option<i64>, _: Option<i64>, _| -> Images {
+            Box::pin(async { Vec::new() })
+        },
+    )
+    .await;
+
+    // (stored name, file) -> the searches expected
+    let cases = [
+        (
+            "A Quiet Place",
+            "A Quiet Place (2018)/A Quiet Place (2018) Bluray-1080p.mkv",
+            vec![("A Quiet Place".to_string(), Some(2018))],
+        ),
+        // The stored name finds nothing, so the cleaned file name is tried next.
+        (
+            "Something Else",
+            "Odd Name Film/Odd.Name.Film.1080p.mkv",
+            vec![
+                ("Something Else".to_string(), Some(2018)),
+                ("Odd Name Film".to_string(), Some(2018)),
+            ],
+        ),
+    ];
+    for (name, file, expected) in cases {
+        searched.lock().unwrap().clear();
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO media_items (id, library_id, name, media_type, path, production_year) \
+             VALUES (?, ?, ?, 'Movie', ?, 2018)",
+        )
+        .bind(id.to_string())
+        .bind(lib.id.to_string())
+        .bind(name)
+        .bind(root.join(file).to_str().unwrap())
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+        let item = rustyfin_db::repo_media::get_item_by_id(&fx.pool, id)
+            .await
+            .unwrap()
+            .unwrap();
+        rustyfin_core::metadata::refresh_item_metadata(
+            &fx.pool,
+            &reqwest::Client::new(),
+            &item,
+            &pm,
+        )
+        .await
+        .unwrap();
+        assert_eq!(*searched.lock().unwrap(), expected, "{file}");
+        let item = rustyfin_db::repo_media::get_item_by_id(&fx.pool, id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(item.tmdb_id, Some(447332), "{file}");
+    }
+}
+
+// B134c: like Jellyfin (AutomaticRefreshIntervalDays = 0), nothing re-queries metadata on a
+// timer by default.
+#[tokio::test]
+async fn b134c_metadata_refresh_has_no_default_trigger() {
+    let fx = Fixture::new().await;
+    let sched = TaskScheduler::new(fx.pool.clone(), Arc::new(fx.dir.clone()));
+    let task = sched
+        .get_task(rustyfin_core::scheduler::TASK_METADATA_REFRESH)
+        .await
+        .expect("the metadata refresh task");
+    assert!(task.triggers.is_empty(), "{:?}", task.triggers);
+}
+
+// B134c: a metadata refresh run asks the providers only about items not identified yet.
+#[tokio::test]
+async fn b134c_metadata_refresh_skips_identified_items() {
+    use rustyfin_core::scheduler::TASK_METADATA_REFRESH;
+    use rustyfin_model::metadata::{ExternalMetadata, MetadataImage};
+    use rustyfin_model::plugin::PluginStatus;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Mutex;
+    type Found = Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>>;
+    type Images = Pin<Box<dyn Future<Output = Vec<MetadataImage>> + Send>>;
+
+    let fx = Fixture::new().await;
+    let lib = fx.library("B134c Film", LibraryContentType::Movies).await;
+    let root = root_of(&lib);
+    for (name, tmdb_id) in [("Known Film", Some(77)), ("Unknown Film", None)] {
+        let path = root.join(format!("{name} (2001)/{name} (2001).mkv"));
+        sqlx::query(
+            "INSERT INTO media_items (id, library_id, name, media_type, path, tmdb_id) \
+             VALUES (?, ?, ?, 'Movie', ?, ?)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(lib.id.to_string())
+        .bind(name)
+        .bind(path.to_str().unwrap())
+        .bind(tmdb_id)
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+    }
+
+    let pm = rustyfin_core::plugin_manager::PluginManager::new(&fx.dir);
+    let searched: Arc<Mutex<Vec<String>>> = Arc::default();
+    let seen = searched.clone();
+    pm.register_metadata_provider(
+        "b134c".to_string(),
+        "b134c".to_string(),
+        PluginStatus::Active,
+        move |_: &reqwest::Client, name: &str, _: Option<i32>| -> Found {
+            seen.lock().unwrap().push(name.to_string());
+            Box::pin(async { None })
+        },
+        |_: &reqwest::Client, _: &str| -> Found { Box::pin(async { None }) },
+        |_: &reqwest::Client, _: Option<i64>, _: Option<i64>, _| -> Images {
+            Box::pin(async { Vec::new() })
+        },
+    )
+    .await;
+    let sched = TaskScheduler::with_plugin_manager(
+        fx.pool.clone(),
+        Arc::new(fx.dir.clone()),
+        reqwest::Client::new(),
+        pm,
+    );
+    assert!(sched.start_task(TASK_METADATA_REFRESH).await);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while sched
+        .get_task(TASK_METADATA_REFRESH)
+        .await
+        .unwrap()
+        .last_execution_result
+        .is_none()
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the refresh did not end within 60 s"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // Only the unidentified item is searched (under its name and then its file name).
+    let searched = searched.lock().unwrap().clone();
+    assert!(!searched.is_empty(), "nothing was searched");
+    assert!(
+        searched.iter().all(|name| name.contains("Unknown Film")),
+        "{searched:?}"
+    );
+}
+
 // B30: a scheduled scan tells the server, so that it can drop what it cached from before.
 #[tokio::test]
 async fn b30_f8_a_scheduled_scan_calls_back_once_it_ends() {

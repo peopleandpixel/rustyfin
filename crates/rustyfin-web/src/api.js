@@ -404,7 +404,8 @@ const API = {
     getRecommendations() { return this.cachedGet('/Movies/Recommendations'); },
     getFilters() { return this.cachedGet('/Items/Filters', 60000); }, // 60s TTL for filters
     deleteItem(id) { return this.del(`/Items/${id}`); },
-    refreshItem(id) { return this.post(`/Items/${id}/Refresh`); },
+    // The server answers only when the refresh is done; a slow one ends in a TimeoutError, and the server keeps going
+    refreshItem(id) { return this.post(`/Items/${id}/Refresh`, undefined, { signal: AbortSignal.timeout(120000) }); },
 
     // User Items
     getUserItems(params = {}) {

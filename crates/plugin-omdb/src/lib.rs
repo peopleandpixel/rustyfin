@@ -8,7 +8,7 @@ use rustyfin_model::plugin::{Plugin, PluginType};
 use serde::Deserialize;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 const OMDB_BASE: &str = "https://www.omdbapi.com";
 
@@ -124,13 +124,13 @@ pub async fn search(
 
 /// OMDb plugin that registers itself as a metadata provider.
 pub struct OmdbPlugin {
-    api_key: Mutex<Option<String>>,
+    api_key: Arc<Mutex<Option<String>>>,
 }
 
 impl Default for OmdbPlugin {
     fn default() -> Self {
         Self {
-            api_key: Mutex::new(None),
+            api_key: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -179,12 +179,6 @@ impl Plugin for OmdbPlugin {
     }
 }
 
-impl OmdbPlugin {
-    fn api_key(&self) -> Option<String> {
-        self.api_key.lock().unwrap().clone()
-    }
-}
-
 /// Create a new OMDb plugin instance (FFI entry point for dynamic loading).
 /// Only compiled when building as a dynamic library (`cdylib`).
 /// Returns a raw pointer to a `Box<dyn Plugin>` for FFI safety.
@@ -196,9 +190,14 @@ impl OmdbPlugin {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rustyfin_plugin_create() -> *mut std::ffi::c_void {
     let plugin: Box<dyn Plugin> = Box::new(OmdbPlugin {
-        api_key: Mutex::new(None),
+        api_key: Arc::new(Mutex::new(None)),
     });
     Box::into_raw(Box::new(plugin)).cast()
+}
+
+/// The key to call OMDb with: the current key, or `None` when it is missing or blank.
+fn usable_key(key: &Mutex<Option<String>>) -> Option<String> {
+    key.lock().unwrap().clone().filter(|k| !k.trim().is_empty())
 }
 
 /// Register the OMDb plugin as a metadata provider with the given PluginManager.
@@ -209,9 +208,9 @@ pub async fn register_omdb_provider<P>(
 where
     P: MetadataProviderRegistrar,
 {
-    let api_key = plugin.api_key().ok_or("OMDb API key not configured")?;
-    let api_key1 = api_key.clone();
-    let api_key2 = api_key.clone();
+    // Always registers; each call reads the plugin's current key and makes no request without one.
+    let key1 = plugin.api_key.clone();
+    let key2 = plugin.api_key.clone();
 
     let plugin_id = plugin.id().to_string();
     plugin_manager
@@ -222,18 +221,24 @@ where
                   name: &str,
                   year: Option<i32>|
                   -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>> {
-                let api_key = api_key1.clone();
+                let key = key1.clone();
                 let name = name.to_string();
                 let client = client.clone();
-                Box::pin(async move { search(&client, &api_key, &name, year).await })
+                Box::pin(async move {
+                    let api_key = usable_key(&key)?;
+                    search(&client, &api_key, &name, year).await
+                })
             },
             move |client: &reqwest::Client,
                   name: &str|
                   -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>> {
-                let api_key = api_key2.clone();
+                let key = key2.clone();
                 let name = name.to_string();
                 let client = client.clone();
-                Box::pin(async move { search(&client, &api_key, &name, None).await })
+                Box::pin(async move {
+                    let api_key = usable_key(&key)?;
+                    search(&client, &api_key, &name, None).await
+                })
             },
             move |_client: &reqwest::Client,
                   _tmdb_id: Option<i64>,

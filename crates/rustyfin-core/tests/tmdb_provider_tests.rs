@@ -8,12 +8,14 @@ use std::sync::{Arc, Mutex};
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
-use plugin_tmdb::tmdb_client::TmdbApi;
+use plugin_tmdb::tmdb_client::{TmdbApi, TmdbClient, TmdbSettings};
 use plugin_tmdb::{
-    get_movie_people, get_person_photo, get_similar, get_trailers, get_tv_people, get_tvdb_id,
-    search_movie, search_tv,
+    TmdbPlugin, get_movie_people, get_person_photo, get_similar, get_trailers, get_tv_people,
+    get_tvdb_id, register_tmdb_provider, search_movie, search_tv,
 };
+use rustyfin_core::plugin_manager::{BuiltinPluginInfo, PluginManager};
 use rustyfin_core::tmdb_client::USER_AGENT;
+use rustyfin_model::plugin::{Plugin, PluginStatus, PluginType};
 use serde_json::{Value, json};
 
 const KEY: &str = "g12-provider-fake-key-4444";
@@ -71,9 +73,22 @@ impl Stub {
         format!("{}/t/p/original", self.origin)
     }
 
-    /// A simple TMDb API client with `KEY` as the API key.
+    /// A shared client on this stub, with short waits so retries stay fast.
+    fn client(&self) -> TmdbClient {
+        let settings = TmdbSettings {
+            api_base_url: format!("{}/3", self.origin),
+            image_base_url: self.image_base(),
+            min_interval: std::time::Duration::from_millis(1),
+            initial_backoff: std::time::Duration::from_millis(1),
+            ..TmdbSettings::default()
+        };
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        TmdbClient::new(http, settings)
+    }
+
+    /// A new client's handle with `KEY` as the API key.
     fn api(&self) -> TmdbApi {
-        TmdbApi::new(KEY)
+        self.client().api(Some(KEY)).expect("a key")
     }
 
     fn hits(&self) -> Vec<Hit> {
@@ -223,7 +238,7 @@ fn assert_on_image_base<'a>(stub: &Stub, urls: impl IntoIterator<Item = &'a str>
 // ── Movies and shows ──
 
 #[tokio::test]
-#[ignore = "B128: plugin_tmdb::TmdbApi::new always targets api.themoviedb.org, so the test reaches the real TMDb instead of the stub"]
+
 async fn search_movie_goes_through_the_client() {
     let stub = Stub::start(Mode::Canned).await;
 
@@ -260,7 +275,7 @@ async fn search_movie_goes_through_the_client() {
 }
 
 #[tokio::test]
-#[ignore = "B128: plugin_tmdb::TmdbApi::new always targets api.themoviedb.org, so the test reaches the real TMDb instead of the stub"]
+
 async fn search_tv_goes_through_the_client() {
     let stub = Stub::start(Mode::Canned).await;
 
@@ -290,7 +305,7 @@ async fn search_tv_goes_through_the_client() {
 }
 
 #[tokio::test]
-#[ignore = "B128: plugin_tmdb::TmdbApi::new always targets api.themoviedb.org, so the test reaches the real TMDb instead of the stub"]
+
 async fn people_photos_use_the_image_base() {
     let stub = Stub::start(Mode::Canned).await;
     let api = stub.api();
@@ -314,7 +329,7 @@ async fn people_photos_use_the_image_base() {
 }
 
 #[tokio::test]
-#[ignore = "B128: plugin_tmdb::TmdbApi::new always targets api.themoviedb.org, so the test reaches the real TMDb instead of the stub"]
+
 async fn trailers_similar_and_tvdb_id_go_through_the_client() {
     let stub = Stub::start(Mode::Canned).await;
     let api = stub.api();
@@ -343,7 +358,7 @@ async fn trailers_similar_and_tvdb_id_go_through_the_client() {
 /// The cache belongs to a `TmdbClient`, not to the process: another client asks its own
 /// server.
 #[tokio::test]
-#[ignore = "B128: plugin_tmdb::TmdbApi::new always targets api.themoviedb.org, so the test reaches the real TMDb instead of the stub"]
+
 async fn each_client_has_its_own_cache() {
     let first = Stub::start(Mode::Canned).await;
     let second = Stub::start(Mode::Canned).await;
@@ -355,11 +370,69 @@ async fn each_client_has_its_own_cache() {
     }
 }
 
+/// B134a: the registered provider uses the client it is given, so every search shares one cache,
+/// and it reads the plugin's current key on each call.
+#[tokio::test]
+async fn b134a_registered_provider_shares_the_client_cache() {
+    let stub = Stub::start(Mode::Canned).await;
+    let dir = std::env::temp_dir().join(format!("b134a_{}", std::process::id()));
+    let pm = PluginManager::new(&dir);
+    pm.register_builtin_plugin(BuiltinPluginInfo {
+        name: "TMDb".to_string(),
+        version: "0".to_string(),
+        id: "tmdb".to_string(),
+        description: String::new(),
+        plugin_type: PluginType::MetadataProvider,
+        status: PluginStatus::Active,
+    })
+    .await;
+    let plugin = TmdbPlugin::default();
+    plugin.set_configuration(json!({ "api_key": KEY })).unwrap();
+    register_tmdb_provider(&plugin, stub.client(), &pm)
+        .await
+        .unwrap();
+
+    let providers = pm.metadata_providers().await;
+    let tmdb = providers
+        .iter()
+        .find(|p| p.provider_name == "tmdb")
+        .expect("an active tmdb provider");
+    let http = reqwest::Client::new();
+    for _ in 0..2 {
+        let meta = (tmdb.search_movie)(&http, "Alpha Film", Some(2001)).await;
+        assert_eq!(meta.and_then(|m| m.tmdb_id), Some(9001));
+    }
+    let searches = stub
+        .hits()
+        .iter()
+        .filter(|hit| hit.path == "/search/movie")
+        .count();
+    assert_eq!(searches, 1, "the second search missed the cache");
+    stub.assert_all_signed();
+
+    // A cleared key turns the provider off without a request.
+    plugin
+        .set_configuration(json!({ "api_key": null }))
+        .unwrap();
+    let before = stub.hits().len();
+    assert!(
+        (tmdb.search_movie)(&http, "Beta Film", None)
+            .await
+            .is_none(),
+        "searched without a key"
+    );
+    assert_eq!(
+        stub.hits().len(),
+        before,
+        "a request went out without a key"
+    );
+}
+
 // ── Failures ──
 
 /// A TMDb failure is not an error for the caller: the providers return `None` or nothing.
 #[tokio::test]
-#[ignore = "B128: plugin_tmdb::TmdbApi::new always targets api.themoviedb.org, so the test reaches the real TMDb instead of the stub"]
+
 async fn failures_give_none_or_nothing() {
     for status in [404, 500] {
         let stub = Stub::start(Mode::Status(status)).await;

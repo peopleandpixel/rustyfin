@@ -22,7 +22,6 @@ use rustyfin_api::middleware::{
 use rustyfin_api::routes::build_router;
 use rustyfin_api::state::AppState;
 use rustyfin_core::image_proxy::{IMAGE_CACHE_MAX_BYTES, sweep_image_cache};
-use rustyfin_model::plugin::Plugin;
 use rustyfin_model::server_info::ServerConfiguration;
 
 #[tokio::main]
@@ -187,10 +186,29 @@ async fn main() {
         .build()
         .expect("Failed to build HTTP client");
 
-    let task_scheduler = rustyfin_core::scheduler::TaskScheduler::with_http_client(
+    let plugin_manager = rustyfin_core::plugin_manager::PluginManager::new(&data_dir_arc);
+    plugin_manager.load_all().await;
+
+    // Register built-in plugins with database-backed configuration
+    let plugin_manager_with_db = plugin_manager.with_database(pool.clone());
+
+    // Provider keys from an older config.json move to the plugin configs before the installs read
+    // them. Then config.json is rewritten without them.
+    if rustyfin_core::plugin_manager::seed_provider_keys(&plugin_manager_with_db, &mut config).await
+        && let Err(e) = rustyfin_core::config_file::write_config_atomic(
+            &data_dir_arc.join("config.json"),
+            &config,
+        )
+    {
+        tracing::warn!("failed to rewrite config.json after seeding keys: {}", e);
+    }
+
+    // The scheduler shares the DB-backed manager so scheduled scans reach the providers (B135)
+    let task_scheduler = rustyfin_core::scheduler::TaskScheduler::with_plugin_manager(
         pool.clone(),
         data_dir_arc.clone(),
         http_client.clone(),
+        plugin_manager_with_db.clone(),
     );
     task_scheduler
         .changes()
@@ -203,15 +221,11 @@ async fn main() {
             config.library_monitor_poll_interval.max(1),
         )));
 
-    let plugin_manager = rustyfin_core::plugin_manager::PluginManager::new(&data_dir_arc);
-    plugin_manager.load_all().await;
-
-    // Register built-in plugins with database-backed configuration
-    let plugin_manager_with_db = plugin_manager.with_database(pool.clone());
-
     // Helper: register a built-in plugin, loading config and status from DB if available.
     // Plugins are DISABLED by default — they must be explicitly enabled via the API or by
-    // storing an Active status in the database. This ensures fast scans without external API calls.
+    // storing an Active status in the database. TMDb, OMDb and Fanart.tv are the exceptions: a key
+    // enables them (see install_tmdb_plugin, install_omdb_plugin, install_fanart_plugin). This
+    // ensures fast scans without external API calls.
     async fn register_builtin_plugin<P: rustyfin_model::plugin::Plugin>(
         plugin: &P,
         pm: &rustyfin_core::plugin_manager::PluginManager,
@@ -246,48 +260,15 @@ async fn main() {
         .await;
     }
 
-    // Register TMDb plugin (disabled by default)
-    {
-        let tmdb_plugin = plugin_tmdb::TmdbPlugin::default();
-        // Check env var for API key (configuration only; plugin is still disabled by default)
-        if let Ok(key) = std::env::var("RUSTYFIN_TMDB_API_KEY")
-            && !key.trim().is_empty()
-        {
-            let _ = tmdb_plugin.set_configuration(serde_json::json!({ "api_key": key }));
-        }
-        register_builtin_plugin(&tmdb_plugin, &plugin_manager_with_db).await;
-        // Register as metadata provider — will be active only if the plugin is enabled
-        if let Err(e) =
-            plugin_tmdb::register_tmdb_provider(&tmdb_plugin, &plugin_manager_with_db).await
-        {
-            tracing::debug!("TMDb plugin not registered as provider (no API key): {}", e);
-        }
-    }
+    // One TMDb client (cache, rate limiter, retries) shared by the provider and AppState.
+    let tmdb = rustyfin_core::tmdb_client::TmdbClient::new(http_client.clone(), tmdb_settings);
 
-    // Register OMDb plugin (disabled by default)
-    {
-        let omdb_plugin = plugin_omdb::OmdbPlugin::default();
-        register_builtin_plugin(&omdb_plugin, &plugin_manager_with_db).await;
-        if let Err(e) =
-            plugin_omdb::register_omdb_provider(&omdb_plugin, &plugin_manager_with_db).await
-        {
-            tracing::debug!("OMDb plugin not registered as provider (no API key): {}", e);
-        }
-    }
+    // Register TMDb plugin: enabled by a key (env or saved), also when one is saved later
+    rustyfin_core::plugin_manager::install_tmdb_plugin(&plugin_manager_with_db, tmdb.clone()).await;
 
-    // Register Fanart.tv plugin (disabled by default)
-    {
-        let fanart_plugin = plugin_fanart::FanartPlugin::default();
-        register_builtin_plugin(&fanart_plugin, &plugin_manager_with_db).await;
-        if let Err(e) =
-            plugin_fanart::register_fanart_provider(&fanart_plugin, &plugin_manager_with_db).await
-        {
-            tracing::debug!(
-                "Fanart.tv plugin not registered as provider (no API key): {}",
-                e
-            );
-        }
-    }
+    // Register OMDb and Fanart.tv plugins: enabled by a saved key, also when one is saved later
+    rustyfin_core::plugin_manager::install_omdb_plugin(&plugin_manager_with_db).await;
+    rustyfin_core::plugin_manager::install_fanart_plugin(&plugin_manager_with_db).await;
 
     // Register Trakt plugin (disabled by default)
     {
@@ -422,8 +403,6 @@ async fn main() {
     // In-memory response caches
     let cache = rustyfin_api::cache::ApiCache::new();
     let image_cache = rustyfin_api::cache::ImageCache::new();
-
-    let tmdb = rustyfin_core::tmdb_client::TmdbClient::new(http_client.clone(), tmdb_settings);
 
     let state = AppState {
         db: pool,

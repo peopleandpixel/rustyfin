@@ -65,6 +65,15 @@ function initLazyImages(root = document) {
     });
 }
 
+// Lucide icon as an SVG string. name is a key of window.lucideIcons (src/icons.js); an unknown name gives ''.
+function icon(name, { size = 16, class: cls = '', label } = {}) {
+    const nodes = window.lucideIcons?.[name];
+    if (!nodes) return '';
+    const children = nodes.map(([tag, attrs]) => `<${tag} ${Object.entries(attrs).map(([k, v]) => `${k}="${escapeHtml(v)}"`).join(' ')}/>`).join('');
+    const a11y = label ? `role="img" aria-label="${escapeHtml(label)}"` : 'aria-hidden="true"';
+    return `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"${cls ? ` class="${escapeHtml(cls)}"` : ''} ${a11y}>${children}</svg>`;
+}
+
 function toast(msg, type = 'success') {
     const c = $('toast-container');
     if (!c) return;
@@ -373,7 +382,7 @@ function wizPathRow(from) {
     el.dataset.from = from;
     el.querySelector('.wiz-path-label').textContent = t('wizard.path_on_server');
     el.querySelector('.wiz-path-input').value = from;
-    el.querySelector('.path-field button').textContent = t('library.browse');
+    el.querySelector('.path-field button span').textContent = t('library.browse');
     el.querySelector('.wiz-jf-path-label').textContent = t('wizard.jellyfin_path');
     el.querySelector('.wiz-jf-path').textContent = from;
     return frag;
@@ -811,6 +820,33 @@ function startScanWithToast(request, startedMessage) {
     }).finally(() => clearTimeout(timer));
 }
 
+// The refresh answers only when the server has finished, so the button stays busy until then, and the open page is re-rendered from fresh data.
+async function refreshItemMetadata(button, id) {
+    if (button.disabled) return;
+    const busy = t('detail.metadata_refreshing');
+    button.disabled = true;
+    button.setAttribute('aria-busy', 'true');
+    button.classList.add('is-busy');
+    button.setAttribute('aria-label', busy);
+    button.setAttribute('title', busy);
+    try {
+        await API.refreshItem(id);
+        API.invalidateCache('/Items');
+        API.invalidateCache('/Shows');
+        toast(t('detail.metadata_refreshed'));
+        if (currentPage === 'detail' && currentDetailId === id) await renderDetail(id);
+    } catch (err) {
+        if (err.name === 'TimeoutError') toast(t('detail.metadata_refresh_timeout'), 'error');
+        else toast(t('detail.metadata_refresh_failed', { message: err.message }), 'error');
+    } finally {
+        button.disabled = false;
+        button.removeAttribute('aria-busy');
+        button.classList.remove('is-busy');
+        button.setAttribute('aria-label', t('detail.refresh_metadata'));
+        button.setAttribute('title', t('detail.refresh_metadata'));
+    }
+}
+
 // Clicks on rendered markup are dispatched here from data-action and data-* attributes, so server values never end up inside inline JavaScript.
 const clickActions = {
     navigate: el => navigate(el.dataset.page, el.dataset.id),
@@ -828,7 +864,7 @@ const clickActions = {
     'jump-letter': el => jumpToLetter(el.dataset.id, el.dataset.letter),
     'toggle-favorite': el => toggleFavorite(el.dataset.id, el.dataset.favorite === 'true'),
     'toggle-played': el => togglePlayed(el.dataset.id, el.dataset.played === 'true'),
-    'refresh-item': el => API.refreshItem(el.dataset.id).then(() => toast(t('detail.metadata_refreshing'))),
+    'refresh-item': el => refreshItemMetadata(el, el.dataset.id),
     'admin-tab': el => showAdminTab(el, el.dataset.tab),
     'delete-user': el => { if (confirm(t('admin.delete_user_confirm'))) API.deleteUser(el.dataset.id).then(() => renderAdmin()); },
     'set-user-admin': el => setUserPolicy(el, { IsAdministrator: el.checked }),
@@ -944,8 +980,8 @@ function itemCard(item, options = {}) {
 
     // Type icons
     const typeIcons = {
-        Movie: '🎬', Series: '📺', Episode: '📺', Audio: '🎵', MusicAlbum: '💿',
-        MusicArtist: '🎤', Folder: '📁', CollectionFolder: '🗂️', Photo: '🖼️'
+        Movie: 'Film', Series: 'Tv', Episode: 'Tv', Audio: 'Music', MusicAlbum: 'Disc3',
+        MusicArtist: 'MicVocal', Folder: 'Folder', CollectionFolder: 'Library', Photo: 'Image'
     };
 
     return `
@@ -958,27 +994,27 @@ function itemCard(item, options = {}) {
                  data-full-src="${fullSrc}"
                  onload="this.style.opacity='0.8';this.classList.remove('blur-sm','scale-105');const sk=this.previousElementSibling;if(sk&&sk.classList.contains('jf-poster-skeleton'))sk.style.display='none';"
                  onerror="this.style.display='none';const sk=this.previousElementSibling;if(sk&&sk.classList.contains('jf-poster-skeleton'))sk.style.display='none';const ic=this.nextElementSibling;if(ic)ic.style.display='flex';">` : ''}
-            <div class="${picture ? 'hidden' : 'flex'} items-center justify-center h-full text-4xl text-white/20 absolute inset-0 bg-white/5"${picture ? ' style="display:none"' : ''}>
-                ${typeIcons[type] || '📁'}
+            <div class="${picture ? 'hidden' : 'flex'} items-center justify-center h-full text-white/20 absolute inset-0 bg-white/5"${picture ? ' style="display:none"' : ''}>
+                ${icon(typeIcons[type] || 'Folder', { size: 40 })}
             </div>
 
             <!-- Top Badges -->
             <div class="absolute top-2 left-2 right-2 flex items-center justify-between pointer-events-none z-10">
-                ${fav ? '<span class="text-rose-500 bg-black/60 backdrop-blur-md p-1 rounded-full text-xs leading-none">♥</span>' : '<span></span>'}
-                ${rating ? `<span class="jf-badge jf-badge-rating text-[10px] !py-0.5 !px-1.5 shadow-md">★ ${rating.toFixed(1)}</span>` : ''}
+                ${fav ? `<span class="inline-flex text-rose-500 bg-black/60 backdrop-blur-md p-1 rounded-full text-xs leading-none">${icon('Heart', { size: 12, class: 'fill-current' })}</span>` : '<span></span>'}
+                ${rating ? `<span class="jf-badge jf-badge-rating inline-flex items-center gap-0.5 text-[10px] !py-0.5 !px-1.5 shadow-md">${icon('Star', { size: 10, class: 'fill-current' })} ${rating.toFixed(1)}</span>` : ''}
             </div>
 
             <!-- Watched checkmark badge -->
             ${played ? `
             <div class="absolute top-2 right-2 w-6 h-6 rounded-full bg-[#00a4dc] text-white flex items-center justify-center shadow-lg border border-white/20 z-10">
-                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M5 13l4 4L19 7"/></svg>
+                ${icon('Check', { size: 14 })}
             </div>` : ''}
 
             <!-- Play Button Hover Overlay -->
             ${canPlay ? `
             <div class="jf-play-overlay" data-action="play" data-id="${escapeHtml(id)}" data-stream-type="${escapeHtml(streamType)}" data-title="${escapeHtml(rawName || t('common.unknown'))}">
                 <div class="jf-play-btn-circle">
-                    <svg class="w-7 h-7 text-white ml-1" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+                    ${icon('Play', { size: 28, class: 'text-white ml-1 fill-current' })}
                 </div>
             </div>` : ''}
 
@@ -1130,14 +1166,14 @@ async function renderHome() {
                         <span class="jf-badge jf-badge-accent uppercase tracking-wider text-[11px]">${t('home.highlights')}</span>
                         <span class="jf-badge jf-badge-primary uppercase tracking-wider text-[11px]">${escapeHtml(spType)}</span>
                         ${spYear ? `<span class="jf-badge text-[11px]">${escapeHtml(spYear)}</span>` : ''}
-                        ${spRating ? `<span class="jf-badge jf-badge-rating text-[11px]">★ ${spRating.toFixed(1)}</span>` : ''}
+                        ${spRating ? `<span class="jf-badge jf-badge-rating inline-flex items-center gap-0.5 text-[11px]">${icon('Star', { size: 10, class: 'fill-current' })} ${spRating.toFixed(1)}</span>` : ''}
                     </div>
                     <h1 class="text-3xl sm:text-4xl lg:text-5xl font-black text-white tracking-tight mb-3 drop-shadow-md">${escapeHtml(spName)}</h1>
                     ${spOverview ? `<p class="text-white/80 text-xs sm:text-sm line-clamp-3 mb-6 max-w-2xl leading-relaxed">${escapeHtml(spOverview)}</p>` : ''}
                     <div class="flex flex-wrap items-center gap-3">
                         ${canPlay ? `
                         <button class="jf-btn-primary !py-2.5 !px-6 text-sm" data-action="play" data-id="${escapeHtml(spId)}" data-stream-type="${escapeHtml(streamType)}" data-title="${escapeHtml(spName)}">
-                            <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+                            ${icon('Play', { size: 16, class: 'fill-current' })}
                             ${t('common.play')}
                         </button>` : ''}
                         <button class="jf-btn-ghost !py-2.5 !px-5 text-sm" data-action="navigate" data-page="detail" data-id="${escapeHtml(spId)}">
@@ -1177,14 +1213,14 @@ async function renderHome() {
                             Photos: 'from-emerald-600/40 to-teal-500/10 border-emerald-500/30',
                             Mixed: 'from-slate-600/40 to-zinc-500/10 border-slate-500/30'
                         };
-                        const icons = { Movies: '🎬', TvShows: '📺', Music: '🎵', Photos: '🖼️', Mixed: '📁' };
+                        const icons = { Movies: 'Film', TvShows: 'Tv', Music: 'Music', Photos: 'Image', Mixed: 'Folder' };
                         return `
                         <div class="jf-card p-5 bg-gradient-to-br ${gradients[libType] || gradients.Mixed} flex flex-col justify-between min-h-[120px] relative" data-action="navigate" data-page="library" data-id="${escapeHtml(libId)}">
                             <div class="flex items-center justify-between">
-                                <span class="text-3xl">${icons[libType] || '📁'}</span>
+                                <span class="inline-flex">${icon(icons[libType] || 'Folder', { size: 28 })}</span>
                                 <div class="flex items-center gap-1">
-                                    <button type="button" class="w-6 h-6 rounded flex items-center justify-center text-white/40 hover:text-white hover:bg-white/10 transition" data-action="scan-library" data-id="${escapeHtml(libId)}" data-name="${escapeHtml(libName)}" title="${escapeHtml(t('library.scan_library'))}">
-                                        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+                                    <button type="button" class="w-6 h-6 rounded flex items-center justify-center text-white/40 hover:text-white hover:bg-white/10 transition" data-action="scan-library" data-id="${escapeHtml(libId)}" data-name="${escapeHtml(libName)}" title="${escapeHtml(t('library.scan_library'))}" aria-label="${escapeHtml(t('library.scan_library'))}">
+                                        ${icon('RefreshCw', { size: 14 })}
                                     </button>
                                 </div>
                             </div>
@@ -1284,7 +1320,7 @@ async function renderFavorites() {
                     <span class="text-xs text-white/40">(${total})</span>
                 </div>
                 <div class="text-center py-24 text-white/40">
-                    <p class="text-4xl mb-3">♡</p>
+                    <div class="flex justify-center mb-3 text-white/30">${icon('Heart', { size: 40 })}</div>
                     <p class="text-base font-semibold">${t('favorites.empty')}</p>
                     <p class="text-xs text-white/30 mt-1">${t('favorites.empty_hint')}</p>
                 </div>
@@ -1435,14 +1471,15 @@ async function renderLibrary(libId) {
     const lib = libraries.find(l => (l.id || l.Id) === libId);
     const libName = lib ? (lib.name || lib.Name) : t('common.library');
     const contentType = lib?.content_type || lib?.Content_type || lib?.ContentType || '';
-    const libIcon = contentType === 'Movies' ? '🎬' : contentType === 'TvShows' ? '📺' : contentType === 'Music' ? '🎵' : '📁';
+    const libIcon = contentType === 'Movies' ? 'Film' : contentType === 'TvShows' ? 'Tv' : contentType === 'Music' ? 'Music' : 'Folder';
+    const headerIcon = { Movies: 'Film', TvShows: 'Tv', Music: 'Music' }[lib?.content_type] || 'Folder';
     
     page.innerHTML = `
     <div class="jf-page">
         <div class="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-6 pb-4 border-b border-white/10">
             <div>
                 <div class="flex items-center gap-2">
-                    <span class="text-2xl">${libIcon}</span>
+                    <span class="inline-flex">${icon(libIcon, { size: 28 })}</span>
                     <h1 class="text-2xl lg:text-3xl font-extrabold text-white tracking-tight">${escapeHtml(libName)}</h1>
                 </div>
                 <p class="text-xs text-white/40 mt-1">${t('common.loading')}</p>
@@ -1479,7 +1516,7 @@ async function renderLibrary(libId) {
             <div class="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-6 pb-4 border-b border-white/10">
                 <div>
                     <div class="flex items-center gap-2">
-                        <span class="text-2xl">${lib?.content_type === 'Movies' ? '🎬' : lib?.content_type === 'TvShows' ? '📺' : lib?.content_type === 'Music' ? '🎵' : '📁'}</span>
+                        <span class="inline-flex">${icon(headerIcon, { size: 28 })}</span>
                         <h1 class="text-2xl lg:text-3xl font-extrabold text-white tracking-tight">${escapeHtml(libName)}</h1>
                         ${scanRing(libId, libName, 'w-5 h-5')}
                     </div>
@@ -1496,7 +1533,7 @@ async function renderLibrary(libId) {
                             <option value="CommunityRating,SortName,ProductionYear:Descending">${t('library.sort_rating')}</option>
                         </select>
                         <button id="lib-sort-reverse" type="button" class="jf-btn-ghost self-stretch !py-1.5 !px-2 text-xs" aria-pressed="false" title="${escapeHtml(t('library.sort_reverse'))}" aria-label="${escapeHtml(t('library.sort_reverse'))}">
-                            <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M3 7.5 7.5 3m0 0L12 7.5M7.5 3v13.5m13.5 0L16.5 21m0 0L12 16.5m4.5 4.5V7.5"/></svg>
+                            ${icon('ArrowDownUp', { size: 16 })}
                         </button>
                     </div>
 
@@ -1508,7 +1545,8 @@ async function renderLibrary(libId) {
                     </select>` : ''}
 
                     <!-- Scan trigger -->
-                    <button class="jf-btn-ghost !py-1.5 !px-3 text-xs" data-action="scan-library-page" data-id="${escapeHtml(libId)}" data-name="${escapeHtml(libName)}">
+                    <button class="jf-btn-ghost inline-flex items-center gap-1.5 !py-1.5 !px-3 text-xs" data-action="scan-library-page" data-id="${escapeHtml(libId)}" data-name="${escapeHtml(libName)}">
+                        ${icon('RefreshCw', { size: 14 })}
                         ${t('library.scan_button')}
                     </button>
                 </div>
@@ -1886,10 +1924,10 @@ async function renderDetail(itemId) {
                                     ${epThumb ? `<img src="${epThumb}" alt="${escapeHtml(epName)}" class="w-full h-full object-cover">` : ''}
                                     <div class="absolute inset-0 bg-black/40 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
                                         <div class="w-10 h-10 rounded-full bg-[#00a4dc] text-white flex items-center justify-center shadow-lg">
-                                            <svg class="w-5 h-5 ml-0.5" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+                                            ${icon('Play', { size: 20, class: 'fill-current ml-0.5' })}
                                         </div>
                                     </div>
-                                    ${epPlayed ? `<span class="absolute top-2 right-2 w-5 h-5 rounded-full bg-[#00a4dc] text-white flex items-center justify-center text-[10px]">✓</span>` : ''}
+                                    ${epPlayed ? `<span class="absolute top-2 right-2 w-5 h-5 rounded-full bg-[#00a4dc] text-white flex items-center justify-center text-[10px]">${icon('Check', { size: 12 })}</span>` : ''}
                                 </div>
                                 <div class="flex-1 min-w-0">
                                     <div class="flex items-center gap-2 mb-1">
@@ -1980,7 +2018,7 @@ async function renderDetail(itemId) {
                             ${year ? `<span class="jf-badge text-[11px] font-bold">${year}</span>` : ''}
                             ${officialRating ? `<span class="jf-badge text-[11px] font-bold bg-white/15">${escapeHtml(officialRating)}</span>` : ''}
                             ${runtime ? `<span class="jf-badge text-[11px]">${formatRuntime(runtime)}</span>` : ''}
-                            ${rating ? `<span class="jf-badge jf-badge-rating text-[11px]">★ ${rating.toFixed(1)}</span>` : ''}
+                            ${rating ? `<span class="jf-badge jf-badge-rating inline-flex items-center gap-0.5 text-[11px]">${icon('Star', { size: 10, class: 'fill-current' })} ${rating.toFixed(1)}</span>` : ''}
                         </div>
 
                         ${breadcrumbHtml}
@@ -1994,27 +2032,27 @@ async function renderDetail(itemId) {
                         <!-- Action Bar -->
                         <div class="flex flex-wrap items-center gap-3">
                             ${canPlay ? `
-                            <button class="jf-btn-primary !py-3 !px-7 text-sm font-bold shadow-xl" data-action="play" data-id="${escapeHtml(id)}" data-stream-type="${escapeHtml(streamType)}" data-title="${escapeHtml(name)}"${resumeTicks > 0 ? ' data-resume="true"' : ''}>
-                                <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+                            <button class="jf-btn-primary h-11 !py-0 !px-7 text-sm font-bold shadow-xl" data-action="play" data-id="${escapeHtml(id)}" data-stream-type="${escapeHtml(streamType)}" data-title="${escapeHtml(name)}"${resumeTicks > 0 ? ' data-resume="true"' : ''}>
+                                ${icon('Play', { size: 20, class: 'fill-current' })}
                                 ${resumeTicks > 0 ? t('detail.resume') : t('common.play')}
                             </button>
                             ${resumeTicks > 0 ? `
-                            <button class="jf-btn-ghost !py-3 !px-4 text-sm" data-action="play" data-id="${escapeHtml(id)}" data-stream-type="${escapeHtml(streamType)}" data-title="${escapeHtml(name)}" data-from-start="true">
+                            <button class="jf-btn-ghost h-11 !py-0 !px-4 text-sm" data-action="play" data-id="${escapeHtml(id)}" data-stream-type="${escapeHtml(streamType)}" data-title="${escapeHtml(name)}" data-from-start="true">
                                 ${t('detail.play_from_beginning')}
                             </button>` : ''}` : ''}
 
-                            <button class="jf-btn-ghost !py-3 !px-4 text-sm" title="${escapeHtml(t('detail.toggle_favorite'))}" data-action="toggle-favorite" data-id="${escapeHtml(id)}" data-favorite="${fav}">
-                                <span class="${fav ? 'text-rose-500 font-bold' : 'text-white/60'} text-base">♥</span>
+                            <button class="jf-btn-ghost h-11 !py-0 w-11 !px-0 sm:w-auto sm:!px-4 text-sm" title="${escapeHtml(t('detail.toggle_favorite'))}" aria-label="${escapeHtml(t('detail.toggle_favorite'))}" data-action="toggle-favorite" data-id="${escapeHtml(id)}" data-favorite="${fav}">
+                                ${icon('Heart', { size: 18, class: fav ? 'text-rose-500 fill-current' : 'text-white/60' })}
                                 <span class="hidden sm:inline text-xs ml-1">${fav ? t('detail.favorite') : t('detail.add_favorite')}</span>
                             </button>
 
-                            <button class="jf-btn-ghost !py-3 !px-4 text-xs font-semibold" data-action="toggle-played" data-id="${escapeHtml(id)}" data-played="${played}">
-                                ${played ? `<span class="text-emerald-400">${t('detail.played')}</span>` : `<span class="text-white/60">${t('detail.unplayed')}</span>`}
+                            <button class="jf-btn-ghost h-11 !py-0 !px-4 text-xs font-semibold" data-action="toggle-played" data-id="${escapeHtml(id)}" data-played="${played}">
+                                ${played ? `<span class="inline-flex items-center gap-1 text-emerald-400">${icon('Check', { size: 14 })} ${t('detail.played')}</span>` : `<span class="inline-flex items-center gap-1 text-white/60">${icon('Circle', { size: 14 })} ${t('detail.unplayed')}</span>`}
                             </button>
 
                             ${API.isAdmin ? `
-                            <button class="jf-btn-ghost !py-3 !px-3 text-xs" title="${escapeHtml(t('detail.refresh_metadata'))}" data-action="refresh-item" data-id="${escapeHtml(id)}">
-                                🔄
+                            <button class="jf-btn-ghost h-11 !py-0 w-11 !px-0" title="${escapeHtml(t('detail.refresh_metadata'))}" aria-label="${escapeHtml(t('detail.refresh_metadata'))}" data-action="refresh-item" data-id="${escapeHtml(id)}">
+                                ${icon('RefreshCw', { size: 18, class: 'jf-busy-spin' })}
                             </button>` : ''}
                         </div>
                     </div>
@@ -2780,11 +2818,11 @@ function togglePlayPause() {
 }
 
 function updatePlayIcon(isPlaying) {
-    const icon = $('player-play-icon');
-    if (icon) {
-        icon.innerHTML = isPlaying
-            ? '<path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/>'
-            : '<path d="M8 5v14l11-7z"/>';
+    const slot = $('player-play-icon');
+    if (slot) {
+        slot.innerHTML = isPlaying
+            ? icon('Pause', { size: 20, class: 'w-5 h-5 fill-current' })
+            : icon('Play', { size: 20, class: 'w-5 h-5 ml-0.5 fill-current' });
     }
 }
 
@@ -2811,17 +2849,17 @@ function toggleMute() {
 
 function updateVolumeIcon() {
     const v = $('video-player');
-    const icon = $('player-vol-icon');
-    if (!v || !icon) return;
+    const slot = $('player-vol-icon');
+    if (!v || !slot) return;
     if (v.muted || v.volume === 0) {
         // Muted: speaker with X
-        icon.innerHTML = '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5L6 9H2v6h4l5 4V5z"/><line stroke-linecap="round" stroke-width="2" x1="23" y1="9" x2="17" y2="15"/><line stroke-linecap="round" stroke-width="2" x1="17" y1="9" x2="23" y2="15"/>';
+        slot.innerHTML = icon('VolumeX', { size: 16, class: 'w-4 h-4' });
     } else if (v.volume < 0.5) {
         // Low volume: speaker only
-        icon.innerHTML = '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5L6 9H2v6h4l5 4V5z"/>';
+        slot.innerHTML = icon('Volume1', { size: 16, class: 'w-4 h-4' });
     } else {
         // High volume: speaker with waves
-        icon.innerHTML = '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15.536 8.464a5 5 0 010 7.072M18.364 5.636a9 9 0 010 12.728M11 5L6 9H2v6h4l5 4V5z"/>';
+        slot.innerHTML = icon('Volume2', { size: 16, class: 'w-4 h-4' });
     }
 }
 
@@ -3187,7 +3225,7 @@ async function renderSettings(data) {
                     <span class="w-2 h-2 rounded-full bg-[#00a4dc]"></span>
                     ${t('settings.server_config')}
                 </h3>
-                <form onsubmit="handleSaveConfig(event)" class="space-y-4">
+                <form onsubmit="handleSaveConfig(event)" autocomplete="off" class="space-y-4">
                     <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
                         <div>
                             <label class="block text-xs font-semibold text-white/70 mb-1">${t('settings.server_name')}</label>
@@ -3205,15 +3243,18 @@ async function renderSettings(data) {
                         </div>
                         <div>
                             <label class="block text-xs font-semibold text-white/70 mb-1">${t('settings.api_key', { service: 'TMDb' })}</label>
-                            <input id="cfg-tmdb" type="text" class="jf-input w-full" value="${escapeHtml(config.TmdbApiKey || config.tmdb_api_key || '')}" placeholder="${escapeHtml(t('common.optional'))}">
+                            <input id="cfg-tmdb" type="password" autocomplete="new-password" autocapitalize="off" spellcheck="false" data-1p-ignore data-lpignore="true" class="jf-input w-full" placeholder="${escapeHtml(config.TmdbApiKeySet ? t('settings.key_saved') : t('common.optional'))}">
+                            ${config.TmdbApiKeySet ? `<label class="flex items-center gap-2 mt-1 text-xs text-white/70"><input id="cfg-tmdb-clear" type="checkbox" class="checkbox checkbox-xs"> ${t('settings.key_clear')}</label>` : ''}
                         </div>
                         <div>
                             <label class="block text-xs font-semibold text-white/70 mb-1">${t('settings.api_key', { service: 'OMDb' })}</label>
-                            <input id="cfg-omdb" type="text" class="jf-input w-full" value="${escapeHtml(config.OmdbApiKey || config.omdb_api_key || '')}" placeholder="${escapeHtml(t('common.optional'))}">
+                            <input id="cfg-omdb" type="password" autocomplete="new-password" autocapitalize="off" spellcheck="false" data-1p-ignore data-lpignore="true" class="jf-input w-full" placeholder="${escapeHtml(config.OmdbApiKeySet ? t('settings.key_saved') : t('common.optional'))}">
+                            ${config.OmdbApiKeySet ? `<label class="flex items-center gap-2 mt-1 text-xs text-white/70"><input id="cfg-omdb-clear" type="checkbox" class="checkbox checkbox-xs"> ${t('settings.key_clear')}</label>` : ''}
                         </div>
                         <div>
                             <label class="block text-xs font-semibold text-white/70 mb-1">${t('settings.api_key', { service: 'Fanart.tv' })}</label>
-                            <input id="cfg-fanart" type="text" class="jf-input w-full" value="${escapeHtml(config.FanartApiKey || config.fanart_api_key || '')}" placeholder="${escapeHtml(t('common.optional'))}">
+                            <input id="cfg-fanart" type="password" autocomplete="new-password" autocapitalize="off" spellcheck="false" data-1p-ignore data-lpignore="true" class="jf-input w-full" placeholder="${escapeHtml(config.FanartApiKeySet ? t('settings.key_saved') : t('common.optional'))}">
+                            ${config.FanartApiKeySet ? `<label class="flex items-center gap-2 mt-1 text-xs text-white/70"><input id="cfg-fanart-clear" type="checkbox" class="checkbox checkbox-xs"> ${t('settings.key_clear')}</label>` : ''}
                         </div>
                     </div>
                     <div class="pt-2">
@@ -3309,19 +3350,34 @@ async function handleChangePassword(e, userId) {
     }
 }
 
+// A provider key field: the trimmed typed value, "" to clear the saved key, or undefined to leave it alone.
+function providerKeyField(value, clear) {
+    const typed = typeof value === 'string' ? value.trim() : '';
+    if (typed) return typed;
+    if (clear) return '';
+    return undefined;
+}
+
 async function handleSaveConfig(e) {
     e.preventDefault();
+    const body = {
+        ServerName: $('cfg-server-name')?.value || 'Rustyfin',
+        PreferredMetadataLanguage: $('cfg-meta-lang')?.value || 'de',
+        PublicPort: parseInt($('cfg-port')?.value) || 8096,
+        IsStartupWizardCompleted: true
+    };
+    const keys = {
+        TmdbApiKey: providerKeyField($('cfg-tmdb')?.value, $('cfg-tmdb-clear')?.checked),
+        OmdbApiKey: providerKeyField($('cfg-omdb')?.value, $('cfg-omdb-clear')?.checked),
+        FanartApiKey: providerKeyField($('cfg-fanart')?.value, $('cfg-fanart-clear')?.checked)
+    };
+    for (const [name, value] of Object.entries(keys)) {
+        if (value !== undefined) body[name] = value;
+    }
     try {
-        await API.updateConfig({
-            ServerName: $('cfg-server-name')?.value || 'Rustyfin',
-            PreferredMetadataLanguage: $('cfg-meta-lang')?.value || 'de',
-            PublicPort: parseInt($('cfg-port')?.value) || 8096,
-            TmdbApiKey: $('cfg-tmdb')?.value || null,
-            OmdbApiKey: $('cfg-omdb')?.value || null,
-            FanartApiKey: $('cfg-fanart')?.value || null,
-            IsStartupWizardCompleted: true
-        });
+        await API.updateConfig(body);
         toast(t('settings.server_config_updated'));
+        renderSettings();
     } catch (err) {
         toast(err.message, 'error');
     }
@@ -3365,11 +3421,11 @@ async function renderAdmin(tab) {
                     <p class="text-xs text-white/40 mt-1">${t('admin.subtitle', { name: escapeHtml(info.ServerName || 'Rustyfin') })}</p>
                 </div>
                 <div class="flex gap-2">
-                    <button class="jf-btn-ghost !py-1.5 !px-3 text-xs" data-action="scan-all">
-                        ${t('admin.scan_all')}
+                    <button class="jf-btn-ghost !py-1.5 !px-3 text-xs inline-flex items-center gap-1.5" data-action="scan-all">
+                        ${icon('Library', { size: 14 })}${t('admin.scan_all')}
                     </button>
-                    <button class="jf-btn-ghost !py-1.5 !px-3 text-xs text-amber-400 hover:text-amber-300" onclick="if(confirm(t('admin.restart_confirm')))API.restart().then(()=>toast(t('admin.restarting')))">
-                        ${t('admin.restart')}
+                    <button class="jf-btn-ghost !py-1.5 !px-3 text-xs text-amber-400 hover:text-amber-300 inline-flex items-center gap-1.5" onclick="if(confirm(t('admin.restart_confirm')))API.restart().then(()=>toast(t('admin.restarting')))">
+                        ${icon('RotateCcw', { size: 14 })}${t('admin.restart')}
                     </button>
                 </div>
             </div>
@@ -3499,7 +3555,7 @@ async function renderAdmin(tab) {
             <div id="admin-tasks" class="hidden">
                 <div class="flex items-center justify-between mb-4">
                     <h3 class="font-bold text-white text-base">${t('admin.background_tasks')}</h3>
-                    <button class="jf-btn-ghost !py-1.5 !px-3 text-xs" onclick="refreshTasks()">${t('admin.refresh')}</button>
+                    <button class="jf-btn-ghost !py-1.5 !px-3 text-xs inline-flex items-center gap-1.5" onclick="refreshTasks()">${icon('RefreshCw', { size: 14 })}${t('admin.refresh')}</button>
                 </div>
                 <div id="admin-tasks-list" class="grid gap-3">
                     ${tasks.map(task => renderTaskCard(task)).join('')}
@@ -3863,7 +3919,7 @@ function jiPanelHtml() {
                     <span class="block text-xs font-semibold text-white/70 mb-1.5">${t('jellyfin_import.folder')}</span>
                     <div class="path-field flex gap-2">
                         <input type="text" id="ji-source" class="jf-input flex-1 min-w-0" placeholder="/import/jellyfin" oninput="jiForget()" data-path-field list="path-suggestions" autocomplete="off" spellcheck="false">
-                        <button type="button" class="jf-btn-ghost !px-3 !py-2 text-xs whitespace-nowrap" data-action="browse-path">${t('library.browse')}</button>
+                        <button type="button" class="jf-btn-ghost !px-3 !py-2 text-xs whitespace-nowrap inline-flex items-center gap-1.5" data-action="browse-path">${icon('FolderOpen', { size: 14 })}<span>${t('library.browse')}</span></button>
                     </div>
                 </label>
                 <label class="block">
@@ -4391,14 +4447,14 @@ function getTaskStateLabel(state) {
 }
 
 function getTaskCategoryIcon(category) {
-    if (!category) return '⚙️';
+    if (!category) return 'Settings';
     const c = category.toLowerCase();
-    if (c.includes('scan') || c.includes('library')) return '📚';
-    if (c.includes('metadata') || c.includes('nfo')) return '🏷️';
-    if (c.includes('image') || c.includes('cover')) return '🖼️';
-    if (c.includes('cache')) return '💾';
-    if (c.includes('cleanup') || c.includes('maintenance')) return '🧹';
-    return '⚙️';
+    if (c.includes('scan') || c.includes('library')) return 'Library';
+    if (c.includes('metadata') || c.includes('nfo')) return 'Tag';
+    if (c.includes('image') || c.includes('cover')) return 'Image';
+    if (c.includes('cache')) return 'HardDrive';
+    if (c.includes('cleanup') || c.includes('maintenance')) return 'BrushCleaning';
+    return 'Settings';
 }
 
 function renderTaskCard(task) {
@@ -4411,7 +4467,7 @@ function renderTaskCard(task) {
     const lastResult = task.LastExecutionResult || task.last_execution_result;
     const triggers = task.Triggers || task.triggers || [];
     const stateInfo = getTaskStateLabel(state);
-    const icon = getTaskCategoryIcon(category);
+    const categoryIcon = getTaskCategoryIcon(category);
     const isRunning = state.toLowerCase() === 'running';
     const isCancelling = state.toLowerCase() === 'cancelling';
 
@@ -4452,7 +4508,7 @@ function renderTaskCard(task) {
             }
             return escapeHtml(type);
         });
-        triggerHtml = `<span class="text-white/40 text-[10px]">🕐 ${triggerTypes.join(', ')}</span>`;
+        triggerHtml = `<span class="text-white/40 text-[10px]">${icon('Clock', { size: 10, class: 'inline-block align-[-1px]' })} ${triggerTypes.join(', ')}</span>`;
     }
 
     // Progress bar
@@ -4474,7 +4530,7 @@ function renderTaskCard(task) {
     return `
     <div class="jf-settings-card p-4" id="task-card-${escapeHtml(id)}">
         <div class="flex items-start gap-3">
-            <span class="text-2xl flex-shrink-0 mt-0.5">${icon}</span>
+            <span class="inline-flex flex-shrink-0 mt-0.5">${icon(categoryIcon, { size: 16 })}</span>
             <div class="flex-1 min-w-0">
                 <div class="flex items-center gap-2 flex-wrap">
                     <h4 class="font-bold text-white text-sm">${escapeHtml(name)}</h4>
@@ -4489,16 +4545,16 @@ function renderTaskCard(task) {
                 ${progressHtml}
                 <div class="flex items-center gap-2 mt-3">
                     ${isRunning || isCancelling ? `
-                        <button class="jf-btn-danger text-xs !py-1.5 !px-3" data-action="stop-task" data-id="${escapeHtml(id)}" data-name="${escapeHtml(name)}">
-                            ${t('admin.stop')}
+                        <button class="jf-btn-danger text-xs !py-1.5 !px-3 inline-flex items-center gap-1.5" data-action="stop-task" data-id="${escapeHtml(id)}" data-name="${escapeHtml(name)}">
+                            ${icon('Square', { size: 12, class: 'fill-current' })}${t('admin.stop')}
                         </button>
                     ` : `
-                        <button class="jf-btn-primary text-xs !py-1.5 !px-3" data-action="start-task" data-id="${escapeHtml(id)}" data-name="${escapeHtml(name)}">
-                            ${t('admin.start')}
+                        <button class="jf-btn-primary text-xs !py-1.5 !px-3 inline-flex items-center gap-1.5" data-action="start-task" data-id="${escapeHtml(id)}" data-name="${escapeHtml(name)}">
+                            ${icon('Play', { size: 12, class: 'fill-current' })}${t('admin.start')}
                         </button>
                     `}
-                    <button class="jf-btn-ghost text-xs !py-1.5 !px-3 text-white/40" onclick="refreshTasks()" title="${escapeHtml(t('admin.refresh_status'))}">
-                        🔄
+                    <button class="jf-btn-ghost text-xs !py-1.5 !px-3 text-white/40" onclick="refreshTasks()" title="${escapeHtml(t('admin.refresh_status'))}" aria-label="${escapeHtml(t('admin.refresh_status'))}">
+                        ${icon('RefreshCw', { size: 14 })}
                     </button>
                 </div>
             </div>
@@ -4597,8 +4653,8 @@ async function loadSidebar() {
     if (!list) return;
     list.innerHTML = '';
     const icons = {
-        movies: '🎬', tvshows: '📺', music: '🎵', photos: '🖼️', mixed: '📁',
-        Movies: '🎬', TvShows: '📺', Music: '🎵', Photos: '🖼️', Mixed: '📁'
+        movies: 'Film', tvshows: 'Tv', music: 'Music', photos: 'Image', mixed: 'Folder',
+        Movies: 'Film', TvShows: 'Tv', Music: 'Music', Photos: 'Image', Mixed: 'Folder'
     };
     libraries.forEach(lib => {
         const id = lib.id || lib.Id;
@@ -4607,12 +4663,12 @@ async function loadSidebar() {
         list.innerHTML += `
             <div class="flex items-center gap-1 group">
                 <a data-action="navigate" data-page="library" data-id="${escapeHtml(id)}" class="jf-drawer-item ${currentLibraryId === id && currentPage === 'library' ? 'active' : ''} flex-1">
-                    <span class="text-base">${icons[type] || '📁'}</span>
+                    <span class="inline-flex">${icon(icons[type] || 'Folder', { size: 16 })}</span>
                     <span class="truncate">${escapeHtml(name)}</span>
                     ${scanRing(id, name)}
                 </a>
                 <button type="button" class="jf-icon-btn !w-6 !h-6 text-white/20 hover:text-white opacity-0 group-hover:opacity-100 transition flex-shrink-0" data-action="scan-library" data-id="${escapeHtml(id)}" data-name="${escapeHtml(name)}" title="${escapeHtml(t('library.scan_library'))}">
-                    <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+                    ${icon('RefreshCw', { size: 12 })}
                 </button>
             </div>`;
     });
@@ -4845,7 +4901,7 @@ async function folderBrowserLoad(path) {
     if (!entries.length) {
         list.innerHTML = `<div class="p-3 text-center text-white/30 text-xs">${t('library.no_subfolders')}</div>`;
     } else {
-        list.innerHTML = entries.map(entry => `<button type="button" class="w-full text-left px-3 py-2 text-xs text-white hover:bg-white/5 flex items-center gap-2 rounded" data-action="folder-open" data-path="${escapeHtml(entry.Path)}">📁 <span class="truncate min-w-0">${escapeHtml(entry.Name)}</span></button>`).join('');
+        list.innerHTML = entries.map(entry => `<button type="button" class="w-full text-left px-3 py-2 text-xs text-white hover:bg-white/5 flex items-center gap-2 rounded" data-action="folder-open" data-path="${escapeHtml(entry.Path)}">${icon('Folder', { size: 14, class: 'inline-block align-[-2px] mr-1.5' })}<span class="truncate min-w-0">${escapeHtml(entry.Name)}</span></button>`).join('');
     }
     const first = list.querySelector('[data-action="folder-open"]');
     (first || $('folder-browser').querySelector('[data-action="folder-up"]')).focus();
@@ -4932,6 +4988,22 @@ let scanSocketDelay = 1000;
 // True once the current outage has been logged, so the warning is printed only once
 let scanSocketWarned = false;
 
+// A library change re-renders the open detail, library or home page from fresh data. The lists are dropped from the
+// 30 s cache first, so the re-render is not served from it. Other pages get no re-render.
+function refreshViewAfterLibraryChange() {
+    const page = currentPage;
+    API.invalidateCache('/Items');
+    API.invalidateCache('/Shows');
+    if (page !== 'detail' && page !== 'library' && page !== 'home') return;
+    setTimeout(() => {
+        // Only if the user is still on that page
+        if (currentPage !== page) return;
+        if (page === 'detail' && currentDetailId) renderDetail(currentDetailId);
+        else if (page === 'library' && currentLibraryId) renderLibrary(currentLibraryId);
+        else if (page === 'home') renderHome();
+    }, 500);
+}
+
 function initScanProgressWebSocket() {
     if (typeof WebSocket === 'undefined') return;
     if (!API.isLoggedIn() || scanSocket || scanSocketRetry) return;
@@ -4985,15 +5057,7 @@ function initScanProgressWebSocket() {
                     updateScanRings(id);
                 }
             } else if (data.MessageType === 'LibraryChanged') {
-                // Library changed - refresh current view if on library page
-                // Drop the cached lists first, so the re-render is not served from the 30 s cache
-                API.invalidateCache('/Items');
-                API.invalidateCache('/Shows');
-                if (currentPage === 'library' && currentLibraryId) {
-                    setTimeout(() => renderLibrary(currentLibraryId), 500);
-                } else if (currentPage === 'home') {
-                    setTimeout(() => renderHome(), 500);
-                }
+                refreshViewAfterLibraryChange();
             }
         } catch (e) {
             console.error('Handling a server event failed:', e);
@@ -5246,10 +5310,27 @@ async function setLogLevel(level) {
     }
 }
 
+// The JSON editor saves a merge patch: a top-level field the user deleted is sent as null,
+// and PluginId (added by GET) is never sent back.
+function pluginConfigPatch(original, edited) {
+    const isObject = v => v !== null && typeof v === 'object' && !Array.isArray(v);
+    if (!isObject(edited)) return edited;
+    const patch = { ...edited };
+    delete patch.PluginId;
+    if (isObject(original)) {
+        for (const key of Object.keys(original)) {
+            if (key !== 'PluginId' && !Object.hasOwn(edited, key)) patch[key] = null;
+        }
+    }
+    return patch;
+}
+
 // --- Plugin Configuration Modal ---
 let currentPluginConfigId = null;
 let currentPluginConfigOriginal = null;
+let currentPluginConfigProvider = false;
 let currentPluginPriorityId = null;
+const PROVIDER_PLUGIN_NAMES = { tmdb: 'TMDb', omdb: 'OMDb', fanart: 'Fanart.tv' };
 
 async function openPluginConfig(pluginId) {
     currentPluginConfigId = pluginId;
@@ -5257,13 +5338,35 @@ async function openPluginConfig(pluginId) {
     const err = $('plugin-config-error');
     if (!dlg) return;
     hide(err);
+    let config = {};
     try {
-        const config = await API.getPluginConfig(pluginId);
+        config = await API.getPluginConfig(pluginId) ?? {};
+    } catch {
+        config = {};
+    }
+    currentPluginConfigProvider = Object.hasOwn(PROVIDER_PLUGIN_NAMES, pluginId);
+    if (currentPluginConfigProvider) {
+        // The stored key never reaches the DOM: only whether one is saved, and the status.
+        const keySet = config.api_key_set === true;
+        currentPluginConfigOriginal = '{}';
+        $('plugin-config-textarea').value = '{}';
+        $('plugin-config-key').placeholder = t(keySet ? 'settings.key_saved' : 'common.optional');
+        $('plugin-config-key-label').textContent = t('settings.api_key', { service: PROVIDER_PLUGIN_NAMES[pluginId] ?? pluginId });
+        keySet ? show('plugin-config-key-clear-row') : hide('plugin-config-key-clear-row');
+        let status = config.status;
+        if (!status) {
+            try {
+                status = (await API.getPlugins()).find(p => p.Id === pluginId)?.Status;
+            } catch { /* leave unchecked */ }
+        }
+        $('plugin-config-enabled').checked = status === 'Active';
+        show('plugin-config-provider');
+        hide('plugin-config-json-block');
+    } else {
         currentPluginConfigOriginal = JSON.stringify(config, null, 2);
         $('plugin-config-textarea').value = currentPluginConfigOriginal;
-    } catch {
-        $('plugin-config-textarea').value = '{}';
-        currentPluginConfigOriginal = '{}';
+        hide('plugin-config-provider');
+        show('plugin-config-json-block');
     }
     dlg.classList.add('modal-open');
     if (typeof dlg.showModal === 'function') {
@@ -5285,18 +5388,29 @@ function closePluginConfig() {
     }
     currentPluginConfigId = null;
     currentPluginConfigOriginal = null;
+    currentPluginConfigProvider = false;
+    $('plugin-config-key').value = '';
+    $('plugin-config-key-clear').checked = false;
+    $('plugin-config-enabled').checked = false;
 }
 
 async function savePluginConfig() {
     const err = $('plugin-config-error');
     const textarea = $('plugin-config-textarea');
     let parsed;
-    try {
-        parsed = JSON.parse(textarea.value);
-    } catch (e) {
-        err.textContent = t('admin.plugin_config_failed', { message: 'Invalid JSON' });
-        show(err);
-        return;
+    if (currentPluginConfigProvider) {
+        parsed = { status: $('plugin-config-enabled').checked ? 'Active' : 'Disabled' };
+        const key = providerKeyField($('plugin-config-key').value, $('plugin-config-key-clear').checked);
+        if (key === '') parsed.api_key = null;
+        else if (key !== undefined) parsed.api_key = key;
+    } else {
+        try {
+            parsed = pluginConfigPatch(JSON.parse(currentPluginConfigOriginal || '{}'), JSON.parse(textarea.value));
+        } catch (e) {
+            err.textContent = t('admin.plugin_config_failed', { message: 'Invalid JSON' });
+            show(err);
+            return;
+        }
     }
     hide(err);
     try {

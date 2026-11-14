@@ -868,3 +868,23 @@ img.jf-thumb-img {
 @keyframes jfSpin {
   to { transform: rotate(360deg); }
 }
+
+/* A button that is waiting on the server: disabled, spinning icon, wait cursor */
+button:disabled,
+.is-busy {
+  cursor: wait;
+}
+
+.is-busy .jf-busy-spin {
+  animation: jfSpin 1s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .is-busy .jf-busy-spin {
+    animation: none;
+  }
+
+  .is-busy {
+    opacity: .6;
+  }
+}

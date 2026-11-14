@@ -25,6 +25,7 @@ use rustyfin_model::plugin::{
     NotificationPriority, Plugin, PluginConfiguration, PluginInfo, PluginStatus, PluginType,
     SubtitleResult,
 };
+use rustyfin_model::server_info::ServerConfiguration;
 
 /// A loaded plugin with its dynamic library handle.
 struct LoadedPlugin {
@@ -192,6 +193,10 @@ type SendNotificationFn = Arc<
         + Sync,
 >;
 
+/// Runs after `set_configuration` saves a built-in plugin's config. `Some(status)` updates the
+/// plugin's in-memory status (the DB is not written); `None` leaves it alone.
+pub type ConfigHook = Arc<dyn Fn(&serde_json::Value) -> Option<PluginStatus> + Send + Sync>;
+
 /// A built-in plugin registered via registrar traits (no dynamic library).
 #[derive(Clone)]
 pub struct BuiltinPluginInfo {
@@ -235,6 +240,230 @@ pub struct NotificationProviderHandle {
     send_notification: SendNotificationFn,
 }
 
+/// Install the built-in TMDb plugin. It is enabled by a key (`RUSTYFIN_TMDB_API_KEY` or a saved
+/// `api_key`) unless a saved status says otherwise. A key saved later through the plugin's
+/// configuration enables it at once, without a restart. The env key is never written to the
+/// plugin config or the DB.
+pub async fn install_tmdb_plugin(pm: &PluginManager, client: crate::tmdb_client::TmdbClient) {
+    let env_key = client.has_env_key();
+    let plugin = Arc::new(plugin_tmdb::TmdbPlugin::default());
+    install_keyed_plugin(
+        pm,
+        plugin,
+        "TMDb",
+        env_key,
+        Some("RUSTYFIN_TMDB_API_KEY"),
+        move |p| async move { plugin_tmdb::register_tmdb_provider(&p, client, pm).await },
+    )
+    .await;
+}
+
+/// Install the built-in OMDb plugin. It is enabled by a saved `api_key` unless a saved status says
+/// otherwise. A key saved later through the plugin's configuration enables it at once, without a
+/// restart.
+pub async fn install_omdb_plugin(pm: &PluginManager) {
+    let plugin = Arc::new(plugin_omdb::OmdbPlugin::default());
+    install_keyed_plugin(pm, plugin, "OMDb", false, None, move |p| async move {
+        plugin_omdb::register_omdb_provider(&p, pm).await
+    })
+    .await;
+}
+
+/// Install the built-in Fanart.tv plugin. It is enabled by a saved `api_key` unless a saved status
+/// says otherwise. A key saved later through the plugin's configuration enables it at once,
+/// without a restart.
+pub async fn install_fanart_plugin(pm: &PluginManager) {
+    let plugin = Arc::new(plugin_fanart::FanartPlugin::default());
+    install_keyed_plugin(pm, plugin, "Fanart.tv", false, None, move |p| async move {
+        plugin_fanart::register_fanart_provider(&p, pm).await
+    })
+    .await;
+}
+
+/// Why `PluginManager::set_configuration` failed.
+#[derive(Debug)]
+pub enum SetConfigError {
+    /// No dynamic or built-in plugin has this id.
+    NotFound,
+    /// The dynamic plugin refused the configuration. Nothing was saved.
+    Rejected(String),
+    /// The configuration could not be written to the database. The in-memory plugin is restored.
+    Persist(String),
+}
+
+impl std::fmt::Display for SetConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound => write!(f, "plugin not found"),
+            Self::Rejected(msg) => write!(f, "plugin rejected the configuration: {msg}"),
+            Self::Persist(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
+/// Apply an RFC 7396 JSON merge patch to `target`. An object patch merges into the target
+/// recursively, a `null` member removes its key, and a non-object patch replaces the target.
+/// A non-object target becomes `{}` before an object patch is applied.
+pub fn merge_patch(target: &mut serde_json::Value, patch: &serde_json::Value) {
+    let Some(patch_map) = patch.as_object() else {
+        *target = patch.clone();
+        return;
+    };
+    if !target.is_object() {
+        *target = serde_json::Value::Object(serde_json::Map::new());
+    }
+    let map = target.as_object_mut().expect("target is an object");
+    for (key, value) in patch_map {
+        if value.is_null() {
+            map.remove(key);
+        } else {
+            merge_patch(
+                map.entry(key.clone()).or_insert(serde_json::Value::Null),
+                value,
+            );
+        }
+    }
+}
+
+/// Save a provider API key from the settings to the plugin's config. A non-blank key is saved
+/// and the plugin set Active. A blank key clears it and drops the status, so the plugin falls back
+/// to the key rule.
+pub async fn apply_provider_key(
+    pm: &PluginManager,
+    plugin_id: &str,
+    key: &str,
+) -> Result<(), SetConfigError> {
+    let trimmed = key.trim();
+    let config = if trimmed.is_empty() {
+        serde_json::json!({ "api_key": null, "status": null })
+    } else {
+        serde_json::json!({ "api_key": trimmed, "status": "Active" })
+    };
+    pm.set_configuration(plugin_id, config).await
+}
+
+/// Whether the plugin's saved config holds a non-blank API key.
+pub async fn provider_key_set(pm: &PluginManager, plugin_id: &str) -> bool {
+    pm.load_plugin_config_from_db(plugin_id)
+        .await
+        .as_ref()
+        .and_then(|c| c.get("api_key"))
+        .and_then(|v| v.as_str())
+        .is_some_and(|k| !k.trim().is_empty())
+}
+
+/// Move the provider keys from an old config.json into the plugin configs at startup. A key
+/// goes in only when the plugin config has no non-blank key yet, so a key saved in the DB wins.
+/// The status is not set, so a saved Disabled holds. A key field is set to None only once it is
+/// in its plugin config (saved now, or already there) or is blank. A key whose save failed stays
+/// Some, so it is kept in config.json and tried again at the next start. Returns true when any
+/// field was set to None, so the caller knows config.json should be rewritten.
+pub async fn seed_provider_keys(pm: &PluginManager, config: &mut ServerConfiguration) -> bool {
+    let slots = [
+        ("tmdb", &mut config.tmdb_api_key),
+        ("omdb", &mut config.omdb_api_key),
+        ("fanart", &mut config.fanart_api_key),
+    ];
+    let mut changed = false;
+    for (plugin_id, slot) in slots {
+        let Some(raw) = slot.clone() else {
+            continue;
+        };
+        if raw.trim().is_empty() || provider_key_set(pm, plugin_id).await {
+            *slot = None;
+            changed = true;
+            continue;
+        }
+        let stored = raw.trim();
+        match pm
+            .save_plugin_config_to_db(plugin_id, &serde_json::json!({ "api_key": stored }))
+            .await
+        {
+            Ok(()) => {
+                tracing::info!("seeded the {plugin_id} plugin API key from config.json");
+                *slot = None;
+                changed = true;
+            }
+            Err(e) => tracing::warn!("failed to seed the {plugin_id} plugin API key: {e}"),
+        }
+    }
+    changed
+}
+
+/// Shared install for the keyed built-in plugins (TMDb, OMDb, Fanart.tv): applies the saved
+/// config, registers the builtin info, then the provider (`register_provider`, which must run
+/// after the info so the provider picks up its status), then the config hook.
+async fn install_keyed_plugin<P, F, Fut>(
+    pm: &PluginManager,
+    plugin: Arc<P>,
+    label: &str,
+    env_key: bool,
+    env_var: Option<&str>,
+    register_provider: F,
+) where
+    P: Plugin + 'static,
+    F: FnOnce(Arc<P>) -> Fut,
+    Fut: Future<Output = Result<(), String>>,
+{
+    let id = plugin.id().to_string();
+    let saved = pm.load_plugin_config_from_db(&id).await;
+    if let Some(config) = &saved
+        && let Err(e) = Plugin::set_configuration(plugin.as_ref(), config.clone())
+    {
+        tracing::warn!("failed to apply saved config for {}: {}", id, e);
+    }
+
+    let status = rustyfin_model::plugin::key_status(saved.as_ref(), env_key);
+    let saved_status = saved
+        .as_ref()
+        .and_then(|c| c.get("status"))
+        .and_then(|v| v.as_str());
+    let saved_key = saved
+        .as_ref()
+        .and_then(|c| c.get("api_key"))
+        .and_then(|v| v.as_str())
+        .is_some_and(|k| !k.trim().is_empty());
+    let reason = match (saved_status, env_key, saved_key) {
+        (Some(s), _, _) => format!("saved status {s}"),
+        (None, true, _) => match env_var {
+            Some(var) => format!("{var} is set"),
+            None => "an env key is set".to_string(),
+        },
+        (None, false, true) => "saved API key".to_string(),
+        (None, false, false) => match env_var {
+            Some(var) => format!("no API key (set {var} or save one)"),
+            None => "no API key (save one)".to_string(),
+        },
+    };
+    tracing::info!("{} plugin status {:?}: {}", label, status, reason);
+
+    pm.register_builtin_plugin(BuiltinPluginInfo {
+        name: plugin.name().to_string(),
+        version: plugin.version().to_string(),
+        id: id.clone(),
+        description: plugin.description().to_string(),
+        plugin_type: plugin.plugin_type(),
+        status,
+    })
+    .await;
+
+    if let Err(e) = register_provider(plugin.clone()).await {
+        tracing::debug!("{} plugin not registered as provider: {}", label, e);
+    }
+
+    let hook_plugin = plugin.clone();
+    pm.register_config_hook(
+        &id,
+        Arc::new(move |config: &serde_json::Value| {
+            if let Err(e) = Plugin::set_configuration(hook_plugin.as_ref(), config.clone()) {
+                tracing::warn!("failed to apply {} config: {}", hook_plugin.id(), e);
+            }
+            Some(rustyfin_model::plugin::key_status(Some(config), env_key))
+        }),
+    )
+    .await;
+}
+
 /// Manages loading, unloading, and querying plugins.
 #[derive(Clone)]
 pub struct PluginManager {
@@ -254,6 +483,8 @@ struct PluginManagerInner {
     subtitle_providers: Vec<SubtitleProviderHandle>,
     /// Registered notification providers from plugins
     notification_providers: Vec<NotificationProviderHandle>,
+    /// Per-plugin hooks that run after `set_configuration`
+    config_hooks: HashMap<String, ConfigHook>,
 }
 
 impl PluginManager {
@@ -269,6 +500,7 @@ impl PluginManager {
                 metadata_providers: Vec::new(),
                 subtitle_providers: Vec::new(),
                 notification_providers: Vec::new(),
+                config_hooks: HashMap::new(),
             })),
             db: None,
         }
@@ -407,6 +639,12 @@ impl PluginManager {
         let mut inner = self.inner.write().await;
         inner.builtin_plugins.insert(info.id.clone(), info);
         tracing::info!("registered built-in plugin: {}", name);
+    }
+
+    /// Register a hook that runs after `set_configuration` saves this plugin's config.
+    pub async fn register_config_hook(&self, plugin_id: &str, hook: ConfigHook) {
+        let mut inner = self.inner.write().await;
+        inner.config_hooks.insert(plugin_id.to_string(), hook);
     }
 
     /// Register a metadata provider plugin.
@@ -734,33 +972,103 @@ impl PluginManager {
 
     /// Update configuration for a specific plugin.
     /// Updates the in-memory plugin (if dynamic) and persists to the database.
+    /// `config` is a JSON merge patch (RFC 7396) over the stored config: a `null` member removes
+    /// that key. A dynamic plugin is given the merged config first, and nothing is saved if it
+    /// refuses. The hook sees the stored config after the save.
     pub async fn set_configuration(
         &self,
         plugin_id: &str,
         config: serde_json::Value,
-    ) -> Result<(), String> {
+    ) -> Result<(), SetConfigError> {
         // Check if plugin exists (dynamic or built-in)
+        let dynamic_current = {
+            let inner = self.inner.read().await;
+            if !inner.plugins.contains_key(plugin_id)
+                && !inner.builtin_plugins.contains_key(plugin_id)
+            {
+                return Err(SetConfigError::NotFound);
+            }
+            inner
+                .plugins
+                .get(plugin_id)
+                .and_then(|lp| lp.plugin.get_configuration())
+        };
+
+        // The stored config: the DB's, else the dynamic plugin's current one (no DB).
+        let mut merged = if self.db.is_some() {
+            self.load_plugin_config_from_db(plugin_id)
+                .await
+                .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()))
+        } else {
+            dynamic_current
+                .clone()
+                .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()))
+        };
+        merge_patch(&mut merged, &config);
+
+        // Update in-memory dynamic plugin if it exists. A refusal saves nothing.
         {
             let inner = self.inner.read().await;
-            let is_dynamic = inner.plugins.contains_key(plugin_id);
-            let is_builtin = inner.builtin_plugins.contains_key(plugin_id);
-
-            if !is_dynamic && !is_builtin {
-                return Err("plugin not found".to_string());
-            }
-
-            // Update in-memory dynamic plugin if it exists
-            if is_dynamic && let Some(lp) = inner.plugins.get(plugin_id) {
-                lp.plugin.set_configuration(config.clone())?;
+            if let Some(lp) = inner.plugins.get(plugin_id) {
+                lp.plugin
+                    .set_configuration(merged.clone())
+                    .map_err(SetConfigError::Rejected)?;
             }
         }
 
-        // Persist to database (built-in plugins rely solely on DB)
-        if let Err(e) = self.save_plugin_config_to_db(plugin_id, &config).await {
-            tracing::warn!("failed to persist plugin config to DB: {}", e);
+        // Persist the patch to the database (built-in plugins rely solely on DB). The DB applies
+        // the same merge, and it needs the nulls to remove stored keys, so the raw patch is sent.
+        let hook_config = if self.db.is_some() {
+            if let Err(e) = self.save_plugin_config_to_db(plugin_id, &config).await {
+                if let Some(prev) = dynamic_current {
+                    let inner = self.inner.read().await;
+                    if let Some(lp) = inner.plugins.get(plugin_id) {
+                        let _ = lp.plugin.set_configuration(prev);
+                    }
+                }
+                return Err(SetConfigError::Persist(e));
+            }
+            self.load_plugin_config_from_db(plugin_id)
+                .await
+                .unwrap_or(merged)
+        } else {
+            merged
+        };
+
+        // Let the plugin's hook set its status from the stored config (e.g. a TMDb key enables
+        // it). The lock is released before the hook runs.
+        let hook = self.inner.read().await.config_hooks.get(plugin_id).cloned();
+        if let Some(hook) = hook
+            && let Some(status) = hook(&hook_config)
+        {
+            self.set_status_in_memory(plugin_id, status).await;
         }
 
         Ok(())
+    }
+
+    /// Set a built-in plugin's status, and its provider handles' status, in memory only.
+    async fn set_status_in_memory(&self, plugin_id: &str, status: PluginStatus) {
+        let mut inner = self.inner.write().await;
+        if let Some(info) = inner.builtin_plugins.get_mut(plugin_id) {
+            info.status = status.clone();
+        }
+        // Update all provider handles for this plugin
+        for handle in &mut inner.metadata_providers {
+            if handle.plugin_id == plugin_id {
+                handle.status = status.clone();
+            }
+        }
+        for handle in &mut inner.subtitle_providers {
+            if handle.plugin_id == plugin_id {
+                handle.status = status.clone();
+            }
+        }
+        for handle in &mut inner.notification_providers {
+            if handle.plugin_id == plugin_id {
+                handle.status = status.clone();
+            }
+        }
     }
 
     // ── Plugin type queries ──
@@ -818,31 +1126,10 @@ impl PluginManager {
         plugin_id: &str,
         status: PluginStatus,
     ) -> Result<(), String> {
-        // Update built-in plugin info
-        {
-            let mut inner = self.inner.write().await;
-            if let Some(info) = inner.builtin_plugins.get_mut(plugin_id) {
-                info.status = status.clone();
-            }
-            // Update all provider handles for this plugin
-            for handle in &mut inner.metadata_providers {
-                if handle.plugin_id == plugin_id {
-                    handle.status = status.clone();
-                }
-            }
-            for handle in &mut inner.subtitle_providers {
-                if handle.plugin_id == plugin_id {
-                    handle.status = status.clone();
-                }
-            }
-            for handle in &mut inner.notification_providers {
-                if handle.plugin_id == plugin_id {
-                    handle.status = status.clone();
-                }
-            }
-        }
+        // Update built-in plugin info and provider handles
+        self.set_status_in_memory(plugin_id, status.clone()).await;
 
-        // Persist to database
+        // Persist to database. Only the "status" key is written; the stored merge keeps other keys.
         if let Some(_db) = &self.db {
             let status_str = match status {
                 PluginStatus::Active => "Active",
