@@ -16,7 +16,7 @@
   --jf-bg-dark: #0d1117;
   --jf-bg-card: #151a23;
   --jf-bg-surface: #1e2430;
-
+  --jf-bg-glass: rgba(19, 24, 34, 0.75);
   --jf-border: rgba(255, 255, 255, 0.08);
   --jf-border-hover: rgba(0, 164, 220, 0.35);
   --jf-accent: #00a4dc;
@@ -48,32 +48,28 @@ body {
   overflow-x: hidden;
 }
 
-/* Header: frosted glass on desktop (a translucent tint, and the page blurred under it there).
-   It is one fixed layer of its own; nothing scrolls above it, so it promotes nothing else (see
-   B152 round 12's measurement). */
+/* Frosted glass header — backdrop-filter only on desktop to save mobile CPU */
 .jf-header {
-  background: rgba(19, 24, 34, 0.75);
+  background: var(--jf-bg-glass);
   border-bottom: 1px solid var(--jf-border);
   transition: all 0.25s ease;
 }
 @media (min-width: 768px) {
   .jf-header {
-    /* The prefix first: the build treats both as one property, and the last one written is the
-       one it keeps (Safari reads the prefixed one, Chromium and Firefox the standard one) */
-    -webkit-backdrop-filter: blur(24px);
     backdrop-filter: blur(24px);
+    -webkit-backdrop-filter: blur(24px);
   }
 }
 
-/* Sidebar: frosted glass on desktop, as the header */
+/* Sidebar & Drawer — backdrop-filter only on desktop */
 .jf-drawer {
   background: rgba(13, 17, 23, 0.85);
   border-right: 1px solid var(--jf-border);
 }
 @media (min-width: 768px) {
   .jf-drawer {
-    -webkit-backdrop-filter: blur(20px);
     backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
   }
 }
 
