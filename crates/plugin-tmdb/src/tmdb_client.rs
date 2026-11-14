@@ -12,6 +12,24 @@ pub const DEFAULT_API_BASE_URL: &str = "https://api.themoviedb.org/3";
 pub const DEFAULT_IMAGE_BASE_URL: &str = "https://image.tmdb.org/t/p/original";
 /// Environment variable for the API key
 pub const ENV_API_KEY: &str = "RUSTYFIN_TMDB_API_KEY";
+/// Environment variable overriding the API base URL
+pub const ENV_BASE_URL: &str = "RUSTYFIN_TMDB_BASE_URL";
+/// Environment variable overriding the image base URL
+pub const ENV_IMAGE_BASE_URL: &str = "RUSTYFIN_TMDB_IMAGE_BASE_URL";
+
+/// Trims `raw` and any trailing '/'; returns it if it is an absolute http(s) URL with a host, else `default`.
+fn base_url_from(raw: Option<&str>, default: &str) -> String {
+    let trimmed = raw.unwrap_or("").trim().trim_end_matches('/');
+    match reqwest::Url::parse(trimmed) {
+        Ok(url)
+            if matches!(url.scheme(), "http" | "https")
+                && url.host_str().is_some_and(|h| !h.is_empty()) =>
+        {
+            trimmed.to_string()
+        }
+        _ => default.to_string(),
+    }
+}
 
 /// Error type for TMDb API requests
 #[derive(Debug)]
@@ -45,15 +63,22 @@ pub struct TmdbApi {
 }
 
 impl TmdbApi {
-    /// Create a new TMDb API client with the given API key.
+    /// Create a new TMDb API client with the given API key. The API and image
+    /// base URLs come from `ENV_BASE_URL` and `ENV_IMAGE_BASE_URL` when set and valid.
     pub fn new(api_key: &str) -> Self {
         Self {
             http: HttpClient::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .unwrap_or_else(|_| HttpClient::new()),
-            api_base_url: Arc::new(DEFAULT_API_BASE_URL.to_string()),
-            image_base_url: Arc::new(DEFAULT_IMAGE_BASE_URL.to_string()),
+            api_base_url: Arc::new(base_url_from(
+                std::env::var(ENV_BASE_URL).ok().as_deref(),
+                DEFAULT_API_BASE_URL,
+            )),
+            image_base_url: Arc::new(base_url_from(
+                std::env::var(ENV_IMAGE_BASE_URL).ok().as_deref(),
+                DEFAULT_IMAGE_BASE_URL,
+            )),
             api_key: Arc::new(api_key.trim().to_string()),
         }
     }
@@ -120,5 +145,54 @@ impl TmdbApi {
     /// `image_base_url` + `file_path` (TMDb file paths start with '/').
     pub fn image_url(&self, file_path: &str) -> String {
         format!("{}{}", self.image_base_url, file_path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base_url_from_unset_or_blank_is_default() {
+        assert_eq!(
+            base_url_from(None, DEFAULT_API_BASE_URL),
+            DEFAULT_API_BASE_URL
+        );
+        assert_eq!(
+            base_url_from(Some("   "), DEFAULT_IMAGE_BASE_URL),
+            DEFAULT_IMAGE_BASE_URL
+        );
+    }
+
+    #[test]
+    fn base_url_from_trims_whitespace_and_trailing_slashes() {
+        assert_eq!(
+            base_url_from(Some(" http://127.0.0.1:8193/3/ \n"), DEFAULT_API_BASE_URL),
+            "http://127.0.0.1:8193/3"
+        );
+        assert_eq!(
+            base_url_from(
+                Some("http://127.0.0.1:8193/t/p/original//"),
+                DEFAULT_IMAGE_BASE_URL
+            ),
+            "http://127.0.0.1:8193/t/p/original"
+        );
+    }
+
+    #[test]
+    fn base_url_from_rejects_non_http_urls() {
+        for raw in ["not a url", "ftp://example.com/3", "/3", "http://"] {
+            assert_eq!(
+                base_url_from(Some(raw), DEFAULT_API_BASE_URL),
+                DEFAULT_API_BASE_URL,
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn base_url_from_env_var_names_match_core() {
+        assert_eq!(ENV_BASE_URL, "RUSTYFIN_TMDB_BASE_URL");
+        assert_eq!(ENV_IMAGE_BASE_URL, "RUSTYFIN_TMDB_IMAGE_BASE_URL");
     }
 }
