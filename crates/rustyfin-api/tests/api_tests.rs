@@ -11159,6 +11159,7 @@ struct G12Server {
     token: String,
     db: sqlx::SqlitePool,
     data_dir: Arc<std::path::PathBuf>,
+    image_cache: ImageCache,
 }
 
 async fn g12_server(env_key: Option<&str>, config_key: Option<&str>) -> G12Server {
@@ -11198,6 +11199,7 @@ async fn g12_server(env_key: Option<&str>, config_key: Option<&str>) -> G12Serve
         token,
         db: state.db.clone(),
         data_dir: state.data_dir.clone(),
+        image_cache: state.image_cache.clone(),
         app: app(state),
     };
     // B136: a key saved in the plugin's configuration takes effect without a restart.
@@ -11427,6 +11429,156 @@ async fn test_g12_no_tmdb_key_sends_nothing() {
 
     assert_eq!(server.refresh(item_id).await, None);
     assert!(server.hits().is_empty(), "TMDb was called without a key");
+}
+
+// ── B134b: TMDb images are stored once in the data dir ──
+
+/// A stub image host. `/t/p/original/poster.png` is a 40x20 PNG and `/t/p/original/page.png`
+/// an HTML page. Returns the origin and the requested paths.
+async fn b134b_image_stub() -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+    use axum::http::header;
+    use axum::response::IntoResponse;
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::RgbImage::from_pixel(40, 20, image::Rgb([200, 30, 30]))
+        .write_to(&mut png, image::ImageFormat::Png)
+        .unwrap();
+    let png = png.into_inner();
+    let hits: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+    let seen = hits.clone();
+    let stub = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+        let png = png.clone();
+        let seen = seen.clone();
+        async move {
+            seen.lock().unwrap().push(uri.path().to_string());
+            match uri.path() {
+                "/t/p/original/poster.png" => {
+                    ([(header::CONTENT_TYPE, "image/png")], png).into_response()
+                }
+                "/t/p/original/page.png" => (
+                    [(header::CONTENT_TYPE, "text/html")],
+                    b"<html></html>".to_vec(),
+                )
+                    .into_response(),
+                _ => StatusCode::NOT_FOUND.into_response(),
+            }
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
+    (origin, hits)
+}
+
+/// The files below `dir`, at any depth.
+fn b134b_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut files = Vec::new();
+    let mut dirs = vec![dir.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else {
+                files.push(path);
+            }
+        }
+    }
+    files
+}
+
+/// The first view of a remote image stores it under the data dir; later views, also after the
+/// in-memory cache is gone (a restart), and resized ones read the file and never ask the host.
+#[tokio::test]
+async fn b134b_remote_image_is_downloaded_once_into_the_data_dir() {
+    let (origin, hits) = b134b_image_stub().await;
+    let server = g12_server(None, None).await;
+    let item_id = server.insert_movie().await;
+    let url = format!("{origin}/t/p/original/poster.png");
+    rustyfin_db::repo_image::batch_upsert_images(
+        &server.db,
+        &[rustyfin_model::image::ItemImage {
+            item_id,
+            image_type: rustyfin_model::image::ImageType::Primary,
+            image_index: 0,
+            path: url.clone(),
+            provider: "tmdb".to_string(),
+            width: None,
+            height: None,
+            blurhash: None,
+            stamp: None,
+        }],
+    )
+    .await
+    .unwrap();
+    let store = server.data_dir.join("metadata").join("remote-images");
+
+    let (status, body) = server
+        .send("GET", &format!("/Items/{item_id}/Images/Primary"), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(hits.lock().unwrap().len(), 1, "{:?}", hits.lock().unwrap());
+    let files = b134b_files(&store);
+    assert_eq!(files.len(), 1, "{files:?}");
+    assert!(
+        files[0].extension().is_some_and(|ext| ext == "png"),
+        "{files:?}"
+    );
+
+    // A restart empties the memory cache; the file stays.
+    server.image_cache.invalidate_all();
+    for uri in [
+        format!("/Items/{item_id}/Images/Primary"),
+        format!("/Items/{item_id}/Images/Primary?maxWidth=20"),
+    ] {
+        let (status, body) = server.send("GET", &uri, None).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+    }
+    assert_eq!(
+        hits.lock().unwrap().len(),
+        1,
+        "the stored image was fetched again: {:?}",
+        hits.lock().unwrap()
+    );
+    assert_eq!(b134b_files(&store).len(), 1);
+    // The row keeps the URL, so the image base URL still applies to it.
+    let images = rustyfin_db::repo_image::get_images_for_item(&server.db, item_id)
+        .await
+        .unwrap();
+    assert_eq!(images[0].path, url);
+}
+
+/// A remote answer that is not an image is refused and stores nothing.
+#[tokio::test]
+async fn b134b_remote_non_image_stores_nothing() {
+    let (origin, _hits) = b134b_image_stub().await;
+    let server = g12_server(None, None).await;
+    let item_id = server.insert_movie().await;
+    rustyfin_db::repo_image::batch_upsert_images(
+        &server.db,
+        &[rustyfin_model::image::ItemImage {
+            item_id,
+            image_type: rustyfin_model::image::ImageType::Primary,
+            image_index: 0,
+            path: format!("{origin}/t/p/original/page.png"),
+            provider: "tmdb".to_string(),
+            width: None,
+            height: None,
+            blurhash: None,
+            stamp: None,
+        }],
+    )
+    .await
+    .unwrap();
+
+    let (status, _) = server
+        .send("GET", &format!("/Items/{item_id}/Images/Primary"), None)
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let store = server.data_dir.join("metadata").join("remote-images");
+    assert!(b134b_files(&store).is_empty(), "{:?}", b134b_files(&store));
 }
 
 // ── Live TV Tests ──
