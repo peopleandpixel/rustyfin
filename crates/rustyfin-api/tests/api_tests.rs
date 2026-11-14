@@ -7715,6 +7715,7 @@ async fn b21_settings_defaults() {
             "PublicUrl": "",
             "CallbackUrl": "",
             "AllowPasswordSignIn": true,
+            "MismatchedOrigin": null,
         })
     );
 }
@@ -7963,7 +7964,7 @@ async fn b21_info_is_public_and_minimal() {
         info().await,
         (
             StatusCode::OK,
-            serde_json::json!({ "Enabled": false, "ButtonLabel": "" })
+            serde_json::json!({ "Enabled": false, "ButtonLabel": "", "PublicUrl": "" })
         )
     );
     let body = b21_settings_body(&t.op, serde_json::json!({ "ButtonLabel": "Pocket ID" }));
@@ -7973,7 +7974,11 @@ async fn b21_info_is_public_and_minimal() {
         info().await,
         (
             StatusCode::OK,
-            serde_json::json!({ "Enabled": true, "ButtonLabel": "Pocket ID" })
+            serde_json::json!({
+                "Enabled": true,
+                "ButtonLabel": "Pocket ID",
+                "PublicUrl": B21_PUBLIC_URL
+            })
         )
     );
 }
@@ -8257,6 +8262,136 @@ async fn b21_start_reports_a_provider_that_is_down() {
     assert!(!body.contains(B21_CLIENT_SECRET));
     t.op.with(|st| st.down = false);
     t.start().await;
+}
+
+// B156: single sign-on started from an address other than the public URL
+
+/// `POST /Auth/Oidc/Start` with extra headers, as a browser on another address sends it.
+async fn b156_start(
+    t: &B21,
+    headers: &[(&str, &str)],
+) -> (StatusCode, axum::http::HeaderMap, String) {
+    let mut req = request("POST", "/Auth/Oidc/Start", None, None);
+    for (name, value) in headers {
+        req.headers_mut().insert(
+            axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+            value.parse().unwrap(),
+        );
+    }
+    t.raw(req).await
+}
+
+#[tokio::test]
+async fn b156_start_from_another_origin_is_refused() {
+    let t = b21_on(serde_json::json!({})).await;
+    assert_eq!(
+        t.settings().await["MismatchedOrigin"],
+        serde_json::Value::Null
+    );
+    let (status, headers, body) = b156_start(&t, &[("origin", "https://flix.example")]).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(
+        b21_header(&headers, "set-cookie"),
+        "",
+        "no flow from another address"
+    );
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        json["Detail"].as_str().unwrap().contains(B21_PUBLIC_URL),
+        "the refusal names the address to use: {body}"
+    );
+    assert_eq!(
+        t.settings().await["MismatchedOrigin"],
+        "https://flix.example",
+        "the admin sees where sign-ins come from"
+    );
+
+    // The profile's link is refused the same way.
+    let mut req = request("POST", "/Auth/Oidc/Link", Some(&t.admin), None);
+    req.headers_mut()
+        .insert("origin", "http://10.0.0.5:8096".parse().unwrap());
+    let (status, headers, _) = t.raw(req).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(b21_header(&headers, "set-cookie"), "");
+    assert_eq!(
+        t.settings().await["MismatchedOrigin"],
+        "http://10.0.0.5:8096"
+    );
+
+    // Saving the settings clears the warning.
+    let (status, saved) = t.save(serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(saved["MismatchedOrigin"], serde_json::Value::Null);
+    assert_eq!(
+        t.settings().await["MismatchedOrigin"],
+        serde_json::Value::Null
+    );
+}
+
+#[tokio::test]
+async fn b156_start_from_the_public_origin_goes_on() {
+    let t = b21_on(serde_json::json!({})).await;
+    for origin in ["http://rf.test:8121", "http://RF.test:8121", "null"] {
+        let (status, headers, body) = b156_start(&t, &[("origin", origin)]).await;
+        let flow = b21_flow(status, &headers, &body);
+        assert_eq!(flow.param("redirect_uri"), B21_CALLBACK, "from {origin}");
+    }
+    assert_eq!(
+        t.settings().await["MismatchedOrigin"],
+        serde_json::Value::Null
+    );
+
+    // Under a path prefix, the origin is the public URL's scheme, host and port.
+    let (status, _) = t
+        .save(serde_json::json!({ "PublicUrl": "https://media.example/jf" }))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, headers, body) = b156_start(&t, &[("origin", "https://media.example")]).await;
+    let flow = b21_flow(status, &headers, &body);
+    assert_eq!(
+        flow.param("redirect_uri"),
+        "https://media.example/jf/Auth/Oidc/Callback"
+    );
+    let (status, _, _) = b156_start(&t, &[("origin", "http://media.example")]).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "another scheme is another address"
+    );
+}
+
+#[tokio::test]
+async fn b156_forwarded_headers_never_move_the_flow() {
+    let t = b21_on(serde_json::json!({})).await;
+    let forged = [
+        ("origin", B21_PUBLIC_URL),
+        ("host", "evil.example"),
+        ("x-forwarded-host", "evil.example"),
+        ("x-forwarded-proto", "https"),
+    ];
+    let (status, headers, body) = b156_start(&t, &forged).await;
+    let flow = b21_flow(status, &headers, &body);
+    assert_eq!(flow.param("redirect_uri"), B21_CALLBACK);
+    assert!(!body.contains("evil.example"));
+    let location = t
+        .approve(&flow, b21_user("fwd-sub", "fwd"), B21Sign::Key(0))
+        .await;
+    assert_eq!(location, format!("{B21_PUBLIC_URL}/web/#login/oidc"));
+
+    // A forged forwarded origin does not make a matching sign-in look mismatched either.
+    let (status, _, _) = b156_start(
+        &t,
+        &[
+            ("x-forwarded-host", "evil.example"),
+            ("x-forwarded-proto", "https"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        t.settings().await["MismatchedOrigin"],
+        serde_json::Value::Null
+    );
 }
 
 #[tokio::test]
