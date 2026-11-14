@@ -24,7 +24,7 @@
   --jf-text-muted: #8b949e;
   /* Skeletons: anything not painted yet, a step lighter than the surface so it never reads as a
      black gap */
-  --jf-skeleton: color-mix(in srgb, var(--jf-text-muted) 22%, var(--jf-bg-surface));
+  --jf-skeleton: color-mix(in srgb, var(--jf-text-muted) 30%, var(--jf-bg-surface));
 }
 
 [data-theme="dark"] {
@@ -139,10 +139,46 @@ body {
   position: relative;
   contain: layout;
 }
+/* Under the cells, the grid paints a skeleton card at every position of the list, from the
+   layout's numbers (--vg-*, set with each measure): where no cell is made yet (the scroll got
+   ahead of the page's script, as a compositor-driven fling can, or a slow device lags), the list
+   still shows cards, never the page's black. ::before covers the full rows, ::after the last,
+   partly filled one. Gaps take the page's colour; each card has a poster box and a text strip. */
+.jf-vgrid::before,
+.jf-vgrid::after {
+  content: '';
+  position: absolute;
+  z-index: -1;
+  left: 0;
+  pointer-events: none;
+  background:
+    linear-gradient(90deg, transparent var(--vg-cw), var(--jf-bg-darkest) 0) 0 0 / var(--vg-px) 100%,
+    linear-gradient(180deg, transparent var(--vg-ch), var(--jf-bg-darkest) 0) 0 0 / 100% var(--vg-py),
+    linear-gradient(180deg, transparent var(--vg-poster), var(--jf-bg-card) 0) 0 0 / 100% var(--vg-py),
+    var(--jf-skeleton);
+}
+.jf-vgrid::before {
+  top: 0;
+  right: 0;
+  height: var(--vg-full, 0);
+}
+.jf-vgrid::after {
+  top: var(--vg-full, 0);
+  width: var(--vg-last-w, 0);
+  height: var(--vg-ch, 0);
+}
 .jf-vgrid > * {
   position: absolute;
   /* No paint containment: it would clip the card's hover lift, shadow, glow and focus outline */
   contain: layout style;
+  /* A made cell covers the grid's skeleton under it: the page's colour shows around the card's
+     rounded corners and under its hover lift, as before the skeleton */
+  background: var(--jf-bg-darkest);
+}
+/* A lifted or focused card's shadow, glow and outline stay above the cells after it */
+.jf-vgrid > :hover,
+.jf-vgrid > :focus-within {
+  z-index: 1;
 }
 /* A cell holds one card (the link to its item), as tall as the cell */
 .jf-vgrid > * > .jf-card {

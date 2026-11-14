@@ -25,7 +25,7 @@ class El {
         this.children = [];
         this.parent = null;
         this.dataset = {};
-        this.style = {};
+        this.style = { setProperty(k, v) { this[k] = v; } };
         this.attrs = {};
         this.classes = new Set();
     }
@@ -96,6 +96,7 @@ const context = vm.createContext({
     railLetter: item => (item.Name || '#')[0].toUpperCase(),
     posterLoader: { forget: c => forgotten.push(c) },
     AbortController,
+    URLSearchParams,
     console,
 });
 vm.runInContext([
@@ -103,6 +104,9 @@ vm.runInContext([
     'var libraryInFlight = new Map(), libraryRequested = new Set(), libraryDir = 1, libraryIndexRequest = null;',
     'var calls = { changed: [], loaded: [], scheduled: 0 };',
     'var librarySettle = null, libraryLastScroll = -1e9, libraryLastSpeed = 0, performance = { now: () => 0 };',
+    'var libraryIndexHashRetries = 0, libraryIndexAt = null, libraryFlyingNow = false, libraryIndexMissing = null;',
+    // Frames are kept until a test runs them (flushFrames)
+    'var frames = []; function requestAnimationFrame(f) { frames.push(f); } function flushFrames() { while (frames.length) frames.shift()(); }',
     // Timers are kept, so a test can see what was queued, cleared or run
     'var timers = []; function setTimeout(f, ms) { timers.push({ f, ms, live: true }); return timers.length; }',
     'function clearTimeout(id) { if (timers[id - 1]) timers[id - 1].live = false; }',
@@ -112,12 +116,21 @@ vm.runInContext([
     line('const LIBRARY_PLACEHOLDER ='),
     line('const LIBRARY_PAGE_SIZE ='),
     line('const LIBRARY_PAGES_AT_ONCE ='),
+    line('const LIBRARY_OVERSCAN ='),
+    line('const SKELETON_RGB ='),
+    line('const TINT_MIN_LUMA ='),
+    line('const lumaOf ='),
+    line('const LIBRARY_INDEX_LIMIT ='),
+    line('const LIBRARY_INDEX_HASH_RETRY_MS ='),
+    line('const LIBRARY_INDEX_HASH_RETRIES ='),
     line('const cardPictureTag ='),
     ...['function libraryLayout(', 'function libraryCellBox(', 'function libraryCellRange(', 'function libraryPagePlan(',
         'function libraryCellElement(', 'function libraryPlace(', 'function libraryRenderRange(', 'function libraryRefreshCells(',
         'function libraryReplaceCell(', 'function libraryFillCell(', 'function liteCardDiffers(', 'function upgradeCard(',
         'async function loadLibraryPage(', 'function libraryUpdate(', 'function libraryFlying(',
-        'function libraryScrollSpeed(', 'function blurhashAverage(', 'function stopLibraryLoad('].map(fn),
+        'function libraryScrollSpeed(', 'function blurhashAverage(', 'function stopLibraryLoad(',
+        'function libraryRowsAhead(', 'function blurhashTint(', 'function librarySize(', 'function libraryHasHash(',
+        'function libraryFlyingLimit('].map(fn),
     // Stand-ins for what the tests drive by hand
     'function scheduleLibraryUpdate() { calls.scheduled++; }',
     'function scheduleRailUpdate() {}',
@@ -133,6 +146,12 @@ vm.runInContext([
 ].join('\n'), context);
 
 const COLS = 7;
+// The cells on a screen whose top is `y` px into the grid (800 px tall)
+function screenOf(y) {
+    const v = context.libraryView;
+    return context.libraryCellRange(y - context.libraryGridTop(v), y - context.libraryGridTop(v) + 800, v.pitch, v.cols, context.libraryTotal);
+}
+
 function newGrid(total) {
     const grid = new El('div');
     grid.root = true;
@@ -146,6 +165,7 @@ function newGrid(total) {
     context.libraryItems = [];
     context.libraryIndex = null;
     context.libraryGen = 1;
+    context.libraryFlyingNow = false;
     context.document.activeElement = null;
     forgotten.length = 0;
     return grid;
@@ -252,8 +272,8 @@ test('pages far from a new landing are aborted, and the screen\'s pages are aske
     assert.ok(far.signal.aborted, 'page 60 aborted');
     assert.ok(!context.libraryRequested.has(60));
     assert.deepEqual([...context.calls.loaded], [1, 2], 'page 0 held, then the pages ahead, two at a time');
-    // From a screen above the viewport's top to three screens below it (2,400 px): rows 0-7
-    assert.equal(context.libraryView.cells.size, 56);
+    // At rest the overscan is LIBRARY_OVERSCAN.aheadMin rows (6 x 316 px) below the screen: rows 0-8
+    assert.equal(context.libraryView.cells.size, 63);
 });
 
 test('a lone jump after a pause is a landing; consecutive fast events fly (F20)', () => {
@@ -265,7 +285,7 @@ test('a lone jump after a pause is a landing; consecutive fast events fly (F20)'
     assert.ok(speed(40, 16, 800) < context.LIBRARY_FLYING_SPEED, 'a steady 2,500 px/s scroll does not fly');
 });
 
-test('while flying, new cells are tinted skeletons of the screen only, and become cards when it settles', () => {
+test('while flying, new cells are tinted skeletons of the screen and its overscan, and become cards when it settles', () => {
     const grid = newGrid(3654);
     const DIGITS = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz#$%*+,-.:;=?@[]^_{|}~';
     const dc = v => Array.from({ length: 4 }, (_, k) => DIGITS[Math.floor(v / 83 ** (3 - k)) % 83]).join('');
@@ -276,15 +296,24 @@ test('while flying, new cells are tinted skeletons of the screen only, and becom
     context.window.scrollY = 20000;
     context.libraryUpdate(20); // 20 screens a second
     const cells = [...context.libraryView.cells.values()];
-    // The screen alone: rows 63-65 (20,000-20,800 px)
-    assert.equal(cells.length, 21);
+    // The screen (rows 50-52, 20,000-20,800 px), 2 rows behind and, at 20 screens a second, the
+    // most rows ahead (10): rows 48-62
+    assert.equal(cells.length, 15 * 7);
     assert.ok(cells.every(c => c.dataset.tint === '1' && c.hasAttribute('data-i')), 'tinted skeletons');
-    assert.equal(cells[0].firstElementChild.firstElementChild.style.backgroundColor, 'rgb(16, 32, 48)');
-    // It settles: the same rows become lite cards from the index, and the band fills
+    // The average rgb(16, 32, 48) is darker than TINT_MIN_LUMA: lifted toward the skeleton tone
+    assert.equal(cells[0].firstElementChild.firstElementChild.style.backgroundColor, 'rgb(57, 65, 77)');
+    // It settles: the screen's rows become lite cards at once, the overscan in the next frame;
+    // the band is back to its resting 6 rows: rows 48-58
     context.libraryUpdate(0);
+    const isCard = c => c.firstElementChild.dataset.lite === '1';
+    const screen = screenOf(20000);
+    const cellsOf = (a, b) => [...context.libraryView.cells].filter(([i]) => i >= a && i <= b).map(([, c]) => c);
+    assert.ok(cellsOf(screen.first, screen.last).every(isCard), 'the screen first');
+    assert.ok(!cellsOf(screen.last + 1, Infinity).some(isCard), 'the overscan waits a frame');
+    context.flushFrames();
     const settled = [...context.libraryView.cells.values()];
-    assert.ok(settled.every(c => c.firstElementChild.dataset.lite === '1'), 'cards now');
-    assert.ok(settled.length > 21);
+    assert.ok(settled.every(isCard), 'cards now');
+    assert.equal(settled.length, 11 * 7);
     assert.deepEqual(order(grid), [...order(grid)].sort((a, b) => a - b));
 });
 
@@ -477,4 +506,106 @@ test('the place in the list is restored only through history (F27)', () => {
     const fill = fn('function fillLibraryGrid(');
     assert.match(fill, /const memory = libraryRestore \? libraryMemory : null;/);
     assert.match(fill, /libraryMemory = null;/);
+});
+
+test('slowing under the flying speed, the screen\'s rows become cards while the overscan stays colour cells', () => {
+    newGrid(3654);
+    context.libraryIndex = Array.from({ length: 3654 }, (_, i) => item(i));
+    vm.runInContext('loadLibraryPage = () => {};', context);
+    context.window.scrollY = 20000;
+    context.libraryUpdate(20);
+    assert.ok(context.libraryFlyingNow);
+    // 7 screens a second: still flying (over three quarters of 8), but slower than the limit
+    context.libraryUpdate(7);
+    assert.ok(context.libraryFlyingNow);
+    const screen = screenOf(20000);
+    const cells = [...context.libraryView.cells];
+    assert.ok(cells.filter(([i]) => i >= screen.first && i <= screen.last).every(([, c]) => c.firstElementChild.dataset.lite === '1'), 'screen rows are cards');
+    const ahead = cells.filter(([i]) => i > screen.last);
+    assert.ok(ahead.length > 0 && ahead.every(([, c]) => c.hasAttribute('data-i')), 'the overscan stays colour cells');
+    context.libraryUpdate(0);
+    context.flushFrames();
+});
+
+test('once flying, the page keeps flying down to three quarters of the limit, so it does not switch every frame', () => {
+    newGrid(3654);
+    context.libraryIndex = Array.from({ length: 3654 }, (_, i) => item(i));
+    vm.runInContext('loadLibraryPage = () => {};', context);
+    context.window.scrollY = 20000;
+    const limit = context.LIBRARY_FLYING_SPEED;
+    context.libraryUpdate(limit * 0.8);
+    assert.ok(!context.libraryFlyingNow, 'below the limit: not flying');
+    context.libraryUpdate(limit * 1.5);
+    assert.ok(context.libraryFlyingNow, 'above it: flying');
+    context.libraryUpdate(limit * 0.8);
+    assert.ok(context.libraryFlyingNow, 'still above three quarters of it: still flying');
+    context.libraryUpdate(limit * 0.7);
+    assert.ok(!context.libraryFlyingNow, 'below three quarters: it stops flying');
+    context.libraryUpdate(0); // it settles
+    assert.ok(!context.libraryFlyingNow);
+});
+
+test('the overscan grows with the scroll speed, from 6 rows ahead at rest to 10', () => {
+    const ahead = speed => context.libraryRowsAhead(speed, 316, 800);
+    assert.equal(ahead(0), context.LIBRARY_OVERSCAN.aheadMin);
+    // 2 screens a second cover 480 px in 300 ms: two more rows of 316 px
+    assert.equal(ahead(2), context.LIBRARY_OVERSCAN.aheadMin + 2);
+    assert.equal(ahead(20), context.LIBRARY_OVERSCAN.aheadMax);
+    assert.equal(context.libraryRowsAhead(5, 0, 800), context.LIBRARY_OVERSCAN.aheadMin, 'no geometry yet');
+});
+
+test('a cell colour is never near black: dark BlurHash averages are lifted, light ones kept', () => {
+    const DIGITS = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz#$%*+,-.:;=?@[]^_{|}~';
+    const hash = v => '00' + Array.from({ length: 4 }, (_, k) => DIGITS[Math.floor(v / 83 ** (3 - k)) % 83]).join('');
+    assert.equal(context.blurhashTint(hash(0x8090a0)), 'rgb(128, 144, 160)', 'light enough: unchanged');
+    // Darker averages reach the floor's luma exactly, never past it: a darker poster never gets a
+    // lighter cell
+    const luma = s => { const c = s.match(/\d+/g).map(Number); return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]; };
+    assert.equal(context.blurhashTint(hash(0)), 'rgb(58, 65, 75)', 'black: lifted to the floor');
+    for (const v of [0, 0x101010, 0x203040, 0x404040]) {
+        assert.ok(Math.abs(luma(context.blurhashTint(hash(v))) - context.TINT_MIN_LUMA) < 1, v.toString(16));
+    }
+    assert.equal(context.blurhashTint('bad'), null);
+});
+
+test('the grid background gets a card at every position, the last row only as wide as its items', () => {
+    const grid = newGrid(3650); // 521 full rows of 7, and 3 in the last
+    const v = context.libraryView;
+    v.posterHeight = 200;
+    context.librarySize(v, 3650);
+    assert.equal(grid.style.height, `${v.height}px`);
+    assert.equal(grid.style['--vg-full'], `${521 * v.pitch}px`);
+    assert.equal(grid.style['--vg-last-w'], `${3 * (v.colWidth + v.gap) - v.gap}px`);
+    assert.equal(grid.style['--vg-poster'], '200px');
+    assert.equal(grid.style['--vg-py'], `${v.pitch}px`);
+    context.librarySize(v, 3654); // 522 full rows: no partial row
+    assert.equal(grid.style['--vg-last-w'], '0px');
+});
+
+test('an index whose pictures mostly have no BlurHash yet is asked again later, a few times', async () => {
+    vm.runInContext(fn('async function loadLibraryIndex('), context);
+    newGrid(100);
+    const answers = [];
+    context.API = { get: async () => answers.shift() };
+    context.libraryQuery = {};
+    context.libraryIndexHashRetries = 0;
+    const bare = { Items: Array.from({ length: 100 }, (_, i) => item(i)) };
+    const hashed = { Items: Array.from({ length: 100 }, (_, i) => item(i, `t${i}`, { ImageBlurHashes: { Primary: { [`t${i}`]: 'L00000fQfQfQfQfQfQfQfQfQfQfQ' } } })) };
+    const live = () => context.timers.filter(t => t.live && t.ms === context.LIBRARY_INDEX_HASH_RETRY_MS);
+    answers.push(bare);
+    await context.loadLibraryIndex(1);
+    assert.equal(context.libraryIndex.length, 100);
+    assert.equal(live().length, 1, 'asked again later');
+    assert.equal(context.libraryIndexHashRetries, 1);
+    // The retry finds the BlurHashes: no more retries
+    answers.push(hashed);
+    live()[0].live = false;
+    await context.loadLibraryIndex(1);
+    assert.equal(live().length, 0);
+    // Retries stop at LIBRARY_INDEX_HASH_RETRIES
+    context.libraryIndexHashRetries = context.LIBRARY_INDEX_HASH_RETRIES;
+    answers.push(bare);
+    await context.loadLibraryIndex(1);
+    assert.equal(live().length, 0);
+    vm.runInContext('function loadLibraryIndex(gen) { calls.index = (calls.index || 0) + 1; }', context);
 });

@@ -39,8 +39,8 @@ const card = (top, extra = {}) => ({ top, bottom: top + 200, left: 0, right: 150
 test('the window looks 2 screens ahead at rest and down, 3 when fast, and half a screen behind', () => {
     assert.deepEqual({ ...posterWindow(0, VH) }, { top: -400, bottom: VH + 1600 });
     assert.deepEqual({ ...posterWindow(VH / 1000, VH) }, { top: -400, bottom: VH + 2000 }); // 1 screen/s
-    assert.deepEqual({ ...posterWindow(10, VH) }, { top: -400, bottom: VH + 2400 }); // capped at 3
-    assert.deepEqual({ ...posterWindow(-10, VH) }, { top: -2400, bottom: VH + 400 }); // scrolling up
+    assert.deepEqual({ ...posterWindow(10, VH) }, { top: -400, bottom: VH + 3600 }); // capped at 4.5
+    assert.deepEqual({ ...posterWindow(-10, VH) }, { top: -3600, bottom: VH + 400 }); // scrolling up
 });
 
 test('on-screen cards start first, then the nearest ahead, up to the limit', () => {

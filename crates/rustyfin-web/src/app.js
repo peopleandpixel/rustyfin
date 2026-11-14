@@ -103,6 +103,26 @@ function blurhashAverage(hash) {
     return `rgb(${v >> 16}, ${(v >> 8) & 255}, ${v & 255})`;
 }
 
+// The skeleton tone (input.css --jf-skeleton) and the least luma a cell's colour may have: a dark
+// poster's average lifted toward it, so a cell is never near the page's black
+const SKELETON_RGB = [63, 70, 81];
+const TINT_MIN_LUMA = 64;
+
+// The colour a cell shows for a picture not shown yet: its BlurHash average, mixed toward the
+// skeleton tone just enough to reach TINT_MIN_LUMA when darker (so a darker poster never gets a
+// lighter cell). Painted as a CSS background, it needs no canvas (which a browser's
+// fingerprinting protection may block or blank). null without a BlurHash.
+const lumaOf = c => 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+function blurhashTint(hash) {
+    const avg = blurhashAverage(hash);
+    if (!avg) return null;
+    const c = avg.match(/\d+/g).map(Number);
+    const luma = lumaOf(c);
+    if (luma >= TINT_MIN_LUMA) return avg;
+    const t = (TINT_MIN_LUMA - luma) / (lumaOf(SKELETON_RGB) - luma);
+    return `rgb(${c.map((v, i) => Math.round(v + (SKELETON_RGB[i] - v) * t)).join(', ')})`;
+}
+
 // Paints each canvas[data-blurhash] under root (root included) once
 function paintBlurhashes(root) {
     const canvases = root.matches?.('canvas[data-blurhash]') ? [root] : root.querySelectorAll?.('canvas[data-blurhash]') || [];
@@ -120,6 +140,18 @@ function paintBlurhashes(root) {
 // further ahead in the scroll direction, starts what is on screen first, keeps a connection free
 // for the page's own requests, and stops pictures that are no longer near.
 const POSTER_MAX_LOADING = 5;
+// How many loaded pictures' URLs the loader remembers (see posterLoader.seen)
+const POSTER_SEEN_MAX = 20000;
+// At most this many remembered pictures start outside the cap in one run (about a screen of cards)
+const POSTER_GUESSES_MAX = 30;
+// A picture that loads within this long after its start came from the browser's cache: no fade-in
+const POSTER_CACHED_MS = 50;
+
+// The key of the picture an <img> shows: item, type and tag (a new tag is another picture)
+function posterKey(img) {
+    const { imgId, imgType, imgTag } = img.dataset;
+    return imgTag ? `${imgId}|${imgType}|${imgTag}` : img.dataset.src;
+}
 
 // The widths card pictures are asked for. A few fixed steps, so the server, the browser and the
 // service worker share their copies between screens and card sizes.
@@ -133,11 +165,12 @@ function posterWidth(cssWidth, dpr) {
 }
 
 // The band of the page, relative to the viewport's top, that pictures are loaded in: 2 screens
-// ahead in the scroll direction, up to 3 when scrolling fast, and half a screen behind.
+// ahead in the scroll direction, up to 4.5 when scrolling fast (the library grid's overscan of up
+// to ten rows, LIBRARY_OVERSCAN), and half a screen behind. Pictures on screen still start first.
 // velocity is in px per ms, negative when scrolling up.
 function posterWindow(velocity, vh) {
     const screensPerSecond = (Math.abs(velocity) * 1000) / vh;
-    const ahead = vh * Math.min(3, 2 + screensPerSecond / 2);
+    const ahead = vh * Math.min(4.5, 2 + screensPerSecond / 2);
     const behind = vh / 2;
     return velocity < 0 ? { top: -ahead, bottom: vh + behind } : { top: -behind, bottom: vh + ahead };
 }
@@ -169,6 +202,12 @@ const posterLoader = {
     near: new Set(), // cards in or near the viewport whose picture has not loaded
     loading: new Set(),
     watched: new Set(), // every card the observer watches, so cards of a page left behind are dropped
+    // Every picture that loaded in this page, by item, type and tag: { url, width }, the most
+    // recently used last. One shown again (a recycled cell, a page visited again) is likely in the
+    // browser's cache: when its card is in the window and the width is enough, it starts at once,
+    // outside the queue (see run)
+    seen: new Map(),
+    seenToken: null,
     velocity: 0,
     lastY: window.scrollY,
     lastScroll: 0,
@@ -235,17 +274,56 @@ const posterLoader = {
             return false;
         });
         for (const card of this.loading) if (!this.near.has(card)) this.stop(card);
-        const entries = cards.map(card => {
+        const all = cards.map(card => {
             const r = card.getBoundingClientRect();
             return { top: r.top, bottom: r.bottom, left: r.left, right: r.right, loading: this.loading.has(card) };
         });
-        const { start, stop } = posterPlan(entries, innerWidth, innerHeight, posterWindow(this.velocity, innerHeight), POSTER_MAX_LOADING);
-        for (const i of stop) this.stop(cards[i]);
+        const win = posterWindow(this.velocity, innerHeight);
         const onScreen = r => r.bottom > 0 && r.top < innerHeight;
-        for (const i of start) this.start(cards[i], onScreen(entries[i]), entries[i].right - entries[i].left);
+        // Pictures loaded before, in the window, at least as wide as the card needs now: started at
+        // once, nearest first. One the browser has in memory is complete as soon as its src is set
+        // (a hit: not counted); any other (most come from the disk cache in a few ms) stays an
+        // ordinary load, counted against the cap and stopped when it leaves the window, and at most
+        // POSTER_GUESSES_MAX such guesses start a run
+        const seen = this.seenNow();
+        const hits = new Set();
+        let guesses = 0;
+        const distance = r => Math.max(0, r.top - innerHeight, -r.bottom);
+        const order = all.map((r, i) => i).sort((a, b) => distance(all[a]) - distance(all[b]));
+        order.forEach(i => {
+            const r = all[i];
+            if (r.loading || r.bottom <= r.top || !(r.bottom > win.top && r.top < win.bottom) || guesses >= POSTER_GUESSES_MAX) return;
+            const img = cards[i]._poster;
+            const key = posterKey(img);
+            const known = key && seen.get(key);
+            if (!known) return;
+            const fits = img.dataset.imgTag
+                ? known.width >= posterWidth(r.right - r.left, devicePixelRatio)
+                : known.url === img.dataset.src;
+            if (!fits) return;
+            seen.delete(key);
+            seen.set(key, known);
+            if (img.dataset.imgTag) {
+                img.dataset.src = known.url;
+                img.dataset.w = known.width;
+            }
+            this.start(cards[i], onScreen(r), r.right - r.left);
+            if (img.complete) {
+                hits.add(i);
+            } else {
+                guesses++;
+                r.loading = true;
+            }
+        });
+        const kept = all.map((r, i) => i).filter(i => !hits.has(i));
+        const entries = kept.map(i => all[i]);
+        const planCards = kept.map(i => cards[i]);
+        const { start, stop } = posterPlan(entries, innerWidth, innerHeight, win, POSTER_MAX_LOADING);
+        for (const i of stop) this.stop(planCards[i]);
+        for (const i of start) this.start(planCards[i], onScreen(entries[i]), entries[i].right - entries[i].left);
         // A picture started ahead of the screen gets the high priority once its card is on it
         entries.forEach((r, i) => {
-            if (r.loading && onScreen(r) && !stop.includes(i)) cards[i]._poster.fetchPriority = 'high';
+            if (r.loading && onScreen(r) && !stop.includes(i)) planCards[i]._poster.fetchPriority = 'high';
         });
     },
 
@@ -260,9 +338,19 @@ const posterLoader = {
         img.fetchPriority = onScreen ? 'high' : 'low';
         if (!img.dataset.src) {
             const { imgId, imgType, imgTag } = img.dataset;
-            img.dataset.src = API.imageUrl(imgId, imgType, { maxWidth: posterWidth(cssWidth, devicePixelRatio), tag: imgTag });
+            const width = posterWidth(cssWidth, devicePixelRatio);
+            img.dataset.w = width;
+            img.dataset.src = API.imageUrl(imgId, imgType, { maxWidth: width, tag: imgTag });
         }
-        const done = () => {
+        const started = performance.now();
+        const done = e => {
+            if (e?.type === 'load') {
+                this.remember(img);
+                gridDiagOnPoster?.(img);
+                // Loaded within a few frames: from the browser's cache, shown without the fade-in
+                // (the card's onload has just set its opacity; no frame has drawn it yet)
+                if (img.complete !== false && performance.now() - started < POSTER_CACHED_MS) img.style.transition = 'none';
+            }
             this.unlisten(card);
             card._posterDone = true;
             this.loading.delete(card);
@@ -281,6 +369,24 @@ const posterLoader = {
         this.loading.delete(card);
         this.unlisten(card);
         if (!card._posterDone) card._poster?.removeAttribute('src');
+    },
+
+    remember(img) {
+        const key = posterKey(img);
+        if (!key || !img.dataset.src) return;
+        const seen = this.seenNow();
+        seen.delete(key);
+        if (seen.size >= POSTER_SEEN_MAX) seen.delete(seen.keys().next().value);
+        seen.set(key, { url: img.dataset.src, width: Number(img.dataset.w) || 0 });
+    },
+
+    // The URLs carry the session's token: another session (sign-out, another user) starts empty
+    seenNow() {
+        if (this.seenToken !== API.token) {
+            this.seen.clear();
+            this.seenToken = API.token;
+        }
+        return this.seen;
     },
 
     unlisten(card) {
@@ -1235,6 +1341,9 @@ function itemCard(item, options = {}) {
     const picture = cardImage(item, isBackdrop);
     // The picture's BlurHash, painted under it until it loads (Jellyfin's ImageBlurHashes shape)
     const blurhash = picture ? item.ImageBlurHashes?.[picture.type]?.[picture.tag] : null;
+    // Under the BlurHash canvas: its average colour (as the `background` shorthand, which drops the
+    // poster box's dark gradient), so the box is never dark if the canvas is not
+    const tint = blurhash ? blurhashTint(blurhash) : null;
     // Episode landscape cards: series name on the title line, "S1:E2 · name" on the second line
     const hasNumbers = item.ParentIndexNumber != null && item.IndexNumber != null;
     const isEpisodeCard = isBackdrop && type === 'Episode' && !!item.SeriesName && hasNumbers;
@@ -1260,7 +1369,7 @@ function itemCard(item, options = {}) {
 
     return `
     <div class="jf-card group" data-action="navigate" data-page="detail" data-id="${escapeHtml(id)}">
-        <div class="${isBackdrop ? 'jf-poster-backdrop' : 'jf-poster'}">
+        <div class="${isBackdrop ? 'jf-poster-backdrop' : 'jf-poster'}"${tint ? ` style="background:${tint}"` : ''}>
             ${picture ? `
             ${blurhash
                 ? `<canvas class="jf-blurhash" width="${isBackdrop ? 32 : 20}" height="${isBackdrop ? 18 : 30}" data-blurhash="${escapeHtml(blurhash)}" aria-hidden="true"></canvas>`
@@ -1782,6 +1891,7 @@ async function renderLibrary(libId) {
     renderLetterRail(libId);
 
     const gen = startLibraryLoad(libId);
+    loadLibraryIndex(gen);
     try {
         // Fetch first page with pagination + total count, and the genres for the filter
         const [{ items, total }, filterData] = await Promise.all([
@@ -1885,6 +1995,9 @@ function startLibraryLoad(libId) {
     stopLibraryLoad();
     libraryQuery = libraryListQuery(libId);
     libraryRequested = new Set([0]); // the first page is requested by the load itself
+    libraryIndexHashRetries = 0;
+    libraryIndexMissing = null;
+    libraryIndexAt = null;
     return ++libraryGen;
 }
 
@@ -1900,6 +2013,7 @@ function stopLibraryLoad() {
     libraryIndexRequest?.abort();
     libraryIndexRequest = null;
     clearTimeout(librarySettle);
+    libraryFlyingNow = false;
     libraryView?.resizeObserver.disconnect();
     libraryView = null;
     libraryTotal = null;
@@ -1924,9 +2038,12 @@ async function fetchLibraryPage(startIndex, signal) {
 // fields"), EnableUserData=false and the Primary picture only, for every item (Limit is the
 // total, past the server's default cap). The server answers it without optional or null fields
 // (about 80 bytes of gzip an item). Cards made from it get their watch state when their page
-// arrives. Its request is dropped with the load.
+// arrives. Its request is dropped with the load. It goes out with the first page, not after it
+// (one round trip less on a real network), so it asks for at least LIBRARY_INDEX_LIMIT items.
+// An index whose pictures mostly have no BlurHash yet (a server just upgraded computes them in
+// the background) is asked again, LIBRARY_INDEX_HASH_RETRY_MS later, a few times.
 async function loadLibraryIndex(gen) {
-    const params = { ...libraryQuery, EnableUserData: false, EnableImageTypes: 'Primary', ImageTypeLimit: 1, Limit: libraryTotal };
+    const params = { ...libraryQuery, EnableUserData: false, EnableImageTypes: 'Primary', ImageTypeLimit: 1, Limit: Math.max(libraryTotal ?? 0, LIBRARY_INDEX_LIMIT) };
     const q = new URLSearchParams();
     for (const [k, v] of Object.entries(params)) {
         if (k !== 'Fields' && v !== undefined && v !== null && v !== '') q.set(k, v);
@@ -1940,11 +2057,37 @@ async function loadLibraryIndex(gen) {
         const data = await API.get('/Items?' + q.toString(), { priority: 'low', signal: controller.signal });
         if (gen !== libraryGen) return;
         libraryIndexRequest = null;
-        libraryIndex = data.Items || data.items || [];
-        libraryRefreshCells(cell => cell.hasAttribute('data-i'));
+        const fresh = data.Items || data.items || [];
+        const hadIndex = !!libraryIndex;
+        libraryIndex = fresh;
+        libraryIndexAt = performance.now();
+        // Skeletons take their item; on a later index, so do lite cards whose picture is not
+        // shown yet and that now have a BlurHash. Not while flying: the settle makes the cells
+        // then, and a whole flying band of cards at once would be a long task mid-fling.
+        if (!libraryFlyingNow) libraryRefreshCells(cell => cell.hasAttribute('data-i')
+            || (hadIndex && cell.firstElementChild?.dataset.lite && !cell.firstElementChild._posterDone
+                && !cell.querySelector('canvas.jf-blurhash') && libraryHasHash(fresh[cell.dataset.pos])));
+        const pictured = fresh.filter(item => item.ImageTags?.Primary);
+        const missing = pictured.filter(item => !libraryHasHash(item)).length;
+        // Asked again only while the server is still adding BlurHashes: pictures it can't hash
+        // would otherwise cost every retry on every visit
+        const falling = libraryIndexMissing == null || missing < libraryIndexMissing;
+        libraryIndexMissing = missing;
+        if (pictured.length && missing / pictured.length > 0.05 && falling && libraryIndexHashRetries < LIBRARY_INDEX_HASH_RETRIES) {
+            libraryIndexHashRetries++;
+            clearTimeout(libraryIndexRefresh);
+            libraryIndexRefresh = setTimeout(() => { if (gen === libraryGen) loadLibraryIndex(gen); }, LIBRARY_INDEX_HASH_RETRY_MS);
+        }
     } catch (e) {
+        if (libraryIndexRequest === controller) libraryIndexRequest = null;
         if (e.name !== 'AbortError') console.warn('Library index failed; pages still load', e);
     }
+}
+
+// Whether an item's Primary picture has a BlurHash
+function libraryHasHash(item) {
+    const tag = item?.ImageTags?.Primary;
+    return !!(tag && item.ImageBlurHashes?.Primary?.[tag]);
 }
 
 // Whether a lite card must be drawn again for its full item: it shows another item (the list's
@@ -1997,7 +2140,21 @@ const LIBRARY_PLACEHOLDER = '<div class="jf-card jf-card-pending"><div class="jf
 
 // How many library pages may load at once; the rest of the browser's connections stay free for
 // the posters
-const LIBRARY_PAGES_AT_ONCE = 2;
+const LIBRARY_PAGES_AT_ONCE = 3;
+
+// Rows made beyond the screen (the overscan), so a fling lands on cells already made, with their
+// items and pictures on the way: `behind` rows behind the scroll direction; ahead, `aheadMin`
+// rows at rest, plus the rows the scroll covers in `leadMs` at its speed, up to `aheadMax`. A slow
+// scroll keeps a few rows ahead; a fling gets up to ten.
+const LIBRARY_OVERSCAN = { behind: 2, aheadMin: 6, aheadMax: 10, leadMs: 300 };
+
+// Rows to make ahead at `speed` screens a second, for rows `pitch` px apart in a screen `vh` tall
+function libraryRowsAhead(speed, pitch, vh) {
+    const { aheadMin, aheadMax, leadMs } = LIBRARY_OVERSCAN;
+    if (!(pitch > 0)) return aheadMin;
+    const travelled = (Math.max(0, speed || 0) * vh * leadMs) / 1000;
+    return Math.min(aheadMax, aheadMin + Math.ceil(travelled / pitch));
+}
 
 // The geometry of `total` cells in `cols` columns of a grid `width` wide with `gap` between
 // cells, each `cellHeight` tall: the column width, the distance between two rows' tops (pitch)
@@ -2054,8 +2211,27 @@ function libraryMeasure(grid, total) {
     sample.style.cssText = `visibility:hidden;width:${Math.max(0, (width - (cols - 1) * gap) / cols)}px`;
     grid.appendChild(sample);
     const cellHeight = sample.offsetHeight;
+    const box = sample.querySelector('.jf-poster');
+    // From the card's outer top (its border included) to the poster box's bottom
+    const posterHeight = box ? box.getBoundingClientRect().bottom - sample.getBoundingClientRect().top : cellHeight;
     sample.remove();
-    return libraryLayout(width, cols, gap, cellHeight, total);
+    return { ...libraryLayout(width, cols, gap, cellHeight, total), posterHeight };
+}
+
+// Gives the grid the list's height, and its skeleton background (input.css .jf-vgrid::before)
+// the layout's numbers: a card at every position, the last row only as wide as its items
+function librarySize(v, total) {
+    const s = v.grid.style;
+    s.height = `${v.height}px`;
+    const fullRows = Math.floor(total / v.cols);
+    const last = total % v.cols;
+    s.setProperty('--vg-cw', `${v.colWidth}px`);
+    s.setProperty('--vg-px', `${v.colWidth + v.gap}px`);
+    s.setProperty('--vg-ch', `${v.cellHeight}px`);
+    s.setProperty('--vg-py', `${v.pitch}px`);
+    s.setProperty('--vg-poster', `${v.posterHeight ?? v.cellHeight}px`);
+    s.setProperty('--vg-full', `${fullRows * v.pitch}px`);
+    s.setProperty('--vg-last-w', last ? `${last * (v.colWidth + v.gap) - v.gap}px` : '0px');
 }
 
 // A new element for cell `i`: the full card, a lite card or a skeleton, placed at its row and
@@ -2082,7 +2258,7 @@ function libraryCellElement(i, tint = false) {
         card = probe.firstElementChild;
         cell.dataset.i = i;
         const tag = item?.ImageTags?.Primary;
-        const color = tag ? blurhashAverage(item.ImageBlurHashes?.Primary?.[tag]) : null;
+        const color = tag ? blurhashTint(item.ImageBlurHashes?.Primary?.[tag]) : null;
         if (color) {
             cell.dataset.tint = '1';
             card.firstElementChild.style.backgroundColor = color;
@@ -2109,6 +2285,7 @@ function libraryPlace(cell, i, v) {
 // keeping those already there and in index order, so Tab follows the list. A cell that leaves is
 // dropped from the poster loader too. New cells are tinted skeletons when `tint` (see
 // libraryCellElement).
+// tint: whether new cells are colour cells, or a function of the cell's index that says so
 function libraryRenderRange(first, last, tint = false) {
     const v = libraryView;
     if (!v) return;
@@ -2125,7 +2302,7 @@ function libraryRenderRange(first, last, tint = false) {
     for (let i = last; i >= first; i--) {
         let cell = v.cells.get(i);
         if (!cell) {
-            cell = libraryCellElement(i, tint);
+            cell = libraryCellElement(i, typeof tint === 'function' ? tint(i) : tint);
             v.cells.set(i, cell);
             v.grid.insertBefore(cell, next);
         }
@@ -2215,33 +2392,59 @@ function libraryGridTop(v) {
 function libraryUpdate(speed = null) {
     const v = libraryView;
     if (!v || libraryTotal == null) return;
-    const flying = speed == null ? libraryFlying() : speed > LIBRARY_FLYING_SPEED;
+    const recent = performance.now() - libraryLastScroll < 150;
+    const wasFlying = libraryFlyingNow;
+    const flying = speed == null ? libraryFlying() : speed > libraryFlyingLimit();
+    libraryFlyingNow = flying;
+    const now = speed ?? (recent ? libraryLastSpeed : 0);
     const gen = libraryGen;
     const viewTop = window.scrollY - libraryGridTop(v);
     const screen = libraryCellRange(viewTop, viewTop + innerHeight, v.pitch, v.cols, libraryTotal);
     if (!screen) return;
+    // The overscan: rows behind and ahead of the screen in the scroll direction
+    const ahead = libraryRowsAhead(now, v.pitch, innerHeight) * v.pitch;
+    const behind = LIBRARY_OVERSCAN.behind * v.pitch;
+    const band = libraryDir < 0
+        ? libraryCellRange(viewTop - ahead, viewTop + innerHeight + behind, v.pitch, v.cols, libraryTotal)
+        : libraryCellRange(viewTop - behind, viewTop + innerHeight + ahead, v.pitch, v.cols, libraryTotal);
+    const onScreen = i => i >= screen.first && i <= screen.last;
+    const offScreen = i => !onScreen(i);
+    // Colour cells and skeletons whose item is here now
+    const fillable = cell => cell.dataset.tint === '1' || (cell.hasAttribute('data-i') && !!(libraryItems[cell.dataset.pos] || libraryIndex?.[cell.dataset.pos]));
     if (flying) {
-        libraryRenderRange(screen.first, screen.last, true);
+        // In flight, the band is colour cells (one element each) and they become cards on settling.
+        // Slowing down (under the flying speed, still flying by the hysteresis), the screen's rows
+        // become cards already, so the landing's pictures start as soon as they would without it.
+        // (Making the resting overscan cards too cost 480-600 ms of main thread per flick.)
+        const slowing = now <= LIBRARY_FLYING_SPEED;
+        libraryRenderRange(band.first, band.last, slowing ? offScreen : true);
+        if (slowing) libraryRefreshCells((cell, i) => onScreen(i) && fillable(cell));
         clearTimeout(librarySettle);
         librarySettle = setTimeout(() => libraryUpdate(0), 150);
+    } else if (wasFlying) {
+        // Settling: the screen's rows first (their pictures start in this frame), the overscan in
+        // the next frame
+        libraryRenderRange(band.first, band.last, offScreen);
+        libraryRefreshCells((cell, i) => onScreen(i) && fillable(cell));
+        requestAnimationFrame(() => { if (libraryView === v && !libraryFlyingNow) libraryRefreshCells(fillable); });
     } else {
-        const band = libraryDir < 0
-            ? libraryCellRange(viewTop - 2 * innerHeight, viewTop + 2 * innerHeight, v.pitch, v.cols, libraryTotal)
-            : libraryCellRange(viewTop - innerHeight, viewTop + 3 * innerHeight, v.pitch, v.cols, libraryTotal);
         libraryRenderRange(band.first, band.last);
-        libraryRefreshCells(cell => cell.dataset.tint === '1' || (cell.hasAttribute('data-i') && !!(libraryItems[cell.dataset.pos] || libraryIndex?.[cell.dataset.pos])));
+        libraryRefreshCells(fillable);
     }
-    // Requests far from the screen (more than two pages away) are dropped
+    // The band's pages are asked for; requests further than the band (and two pages) are dropped
+    const pagesAhead = Math.max(2, Math.ceil((libraryDir < 0 ? screen.first - band.first : band.last - screen.last) / LIBRARY_PAGE_SIZE));
     const firstPage = Math.floor(screen.first / LIBRARY_PAGE_SIZE);
     const lastPage = Math.floor(screen.last / LIBRARY_PAGE_SIZE);
+    const keepBefore = libraryDir < 0 ? pagesAhead : 2;
+    const keepAfter = libraryDir < 0 ? 2 : pagesAhead;
     for (const [page, controller] of libraryInFlight) {
-        if (page < firstPage - 2 || page > lastPage + 2) {
+        if (page < firstPage - keepBefore || page > lastPage + keepAfter) {
             controller.abort();
             libraryInFlight.delete(page);
             libraryRequested.delete(page);
         }
     }
-    for (const page of libraryPagePlan(screen, libraryDir, LIBRARY_PAGE_SIZE, libraryTotal, libraryRequested)) {
+    for (const page of libraryPagePlan(screen, libraryDir, LIBRARY_PAGE_SIZE, libraryTotal, libraryRequested, pagesAhead)) {
         if (libraryInFlight.size >= LIBRARY_PAGES_AT_ONCE) break;
         libraryRequested.add(page);
         loadLibraryPage(gen, page);
@@ -2262,7 +2465,16 @@ let libraryLastSpeed = 0;
 
 // Whether the page is flying now (the last scroll event was fast and recent)
 function libraryFlying() {
-    return libraryLastSpeed > LIBRARY_FLYING_SPEED && performance.now() - libraryLastScroll < 150;
+    return libraryLastSpeed > libraryFlyingLimit() && performance.now() - libraryLastScroll < 150;
+}
+
+// The speed above which the page flies: once flying, it keeps flying down to three quarters of
+// LIBRARY_FLYING_SPEED, so speeds around the limit don't switch every frame between colour cells
+// and full cards (each switch makes the whole band again). Not lower: the landing's cards and
+// pictures start when it stops flying, so a fling that settles late lands on BlurHashes.
+let libraryFlyingNow = false;
+function libraryFlyingLimit() {
+    return libraryFlyingNow ? LIBRARY_FLYING_SPEED * 0.75 : LIBRARY_FLYING_SPEED;
 }
 
 // The speed of a scroll event in screens a second. The first event after a pause is a landing
@@ -2277,7 +2489,10 @@ window.addEventListener('scroll', () => {
     const y = window.scrollY;
     const now = performance.now();
     if (y !== libraryLastY) libraryDir = y > libraryLastY ? 1 : -1;
-    const speed = libraryScrollSpeed(y - libraryLastY, now - libraryLastScroll, innerHeight);
+    // Smoothed over consecutive events (frames of uneven length give uneven speeds); a landing
+    // after a pause is 0, as is the event that brings it
+    const raw = libraryScrollSpeed(y - libraryLastY, now - libraryLastScroll, innerHeight);
+    const speed = raw && libraryLastSpeed ? (raw + libraryLastSpeed) / 2 : raw;
     libraryLastY = y;
     libraryLastScroll = now;
     libraryLastSpeed = speed;
@@ -2323,7 +2538,7 @@ function libraryRelayout() {
     const layout = libraryMeasure(v.grid, libraryTotal);
     if (layout.cols === v.cols && layout.colWidth === v.colWidth && layout.cellHeight === v.cellHeight) return;
     Object.assign(v, layout);
-    v.grid.style.height = `${v.height}px`;
+    librarySize(v, libraryTotal);
     for (const [i, cell] of v.cells) libraryPlace(cell, i, v);
     window.scrollTo({ top: libraryGridTop(v) + libraryCellBox(anchor, v).y - before, behavior: 'instant' });
     libraryUpdate();
@@ -2335,6 +2550,18 @@ const LIBRARY_INDEX_SETTLE_MS = 3000;
 let librarySeq = 0;
 let libraryTotalSeq = 0;
 let libraryIndexRefresh = null;
+// The index asks for at least this many items (the server's default cap is 10,000), so it can go
+// out before the first page has told the total
+const LIBRARY_INDEX_LIMIT = 100000;
+// While over 5% of the index's pictures have no BlurHash, it is asked again this much later, up to
+// LIBRARY_INDEX_HASH_RETRIES times a load
+const LIBRARY_INDEX_HASH_RETRY_MS = 20000;
+const LIBRARY_INDEX_HASH_RETRIES = 6;
+let libraryIndexHashRetries = 0;
+// How many of the last index's pictures had no BlurHash (null before the first index of a load)
+let libraryIndexMissing = null;
+// When the index came (performance.now()), for the diagnostics
+let libraryIndexAt = null;
 
 // The list changed under the load (a page came with another total, as during a scan): the grid
 // takes the new total in place, without a jump or a flash of skeletons
@@ -2365,7 +2592,7 @@ function libraryChanged(total) {
     // The grid takes the new height and count in place; the cells in view stay, and their pages
     // correct them as they come (a card whose position now holds another item is replaced)
     Object.assign(v, libraryLayout(v.grid.clientWidth, v.cols, v.gap, v.cellHeight, total));
-    v.grid.style.height = `${v.height}px`;
+    librarySize(v, total);
     for (const [i, cell] of v.cells) {
         if (i >= total) {
             cell.remove();
@@ -2401,13 +2628,13 @@ function fillLibraryGrid(items, total) {
     const grid = container.firstElementChild;
     grid.setAttribute('aria-label', $('page-library')?.querySelector('h1')?.textContent || t('common.library'));
     const layout = libraryMeasure(grid, total);
-    grid.style.height = `${layout.height}px`;
     let resizeFrame = 0;
     const resizeObserver = new ResizeObserver(() => {
         cancelAnimationFrame(resizeFrame);
         resizeFrame = requestAnimationFrame(libraryRelayout);
     });
     libraryView = { ...layout, grid, cells: new Map(), resizeObserver };
+    librarySize(libraryView, total);
     resizeObserver.observe(grid);
     document.fonts?.ready.then(() => { if (libraryView?.grid === grid) libraryRelayout(); });
     // Enter or Space on a focused card opens it, as a click does
@@ -2429,7 +2656,8 @@ function fillLibraryGrid(items, total) {
     libraryLastY = window.scrollY;
     libraryUpdate();
     scheduleRailUpdate();
-    if (items.length < total) loadLibraryIndex(libraryGen);
+    // The index went out with the first page; a load without it (none asked, or it failed) asks now
+    if (items.length < total && !libraryIndex && !libraryIndexRequest) loadLibraryIndex(libraryGen);
 }
 
 // Remembers where the library list is, before the page is left
@@ -2476,6 +2704,215 @@ async function loadLibraryPage(gen, page) {
     }
 }
 
+// --- Grid diagnostics (opt-in) ---
+// With ?debug=grid in the page's URL (before the #) or localStorage 'rustyfin.gridDebug' = '1', a
+// small panel shows what the library grid has on screen, the index's state and the requests'
+// timings, so a user can report what their browser sees (Copy as text gives it as plain text). It
+// shows counts and times only, never a URL (picture URLs carry the session's token).
+// window.rfGridDiag() returns the same numbers. Off, it costs nothing past this check at start.
+function gridDiagEnabled() {
+    try {
+        return new URLSearchParams(location.search).get('debug') === 'grid' || localStorage.getItem('rustyfin.gridDebug') === '1';
+    } catch {
+        return false;
+    }
+}
+
+// What the panel collects while it is on (nothing is collected when it is off): the last
+// GRID_DIAG_RING requests of each kind as numbers only (no URL), the pictures' decode-to-paint
+// times and widths, and the cells on screen at the last stop
+const GRID_DIAG_RING = 300;
+const gridDiagData = { image: [], items: [], paint: [], stop: null, stopLater: null };
+// Set by the panel: the poster loader calls it for each picture loaded (null when the panel is off)
+let gridDiagOnPoster = null;
+
+const gridDiagPush = (list, value) => {
+    list.push(value);
+    if (list.length > GRID_DIAG_RING) list.shift();
+};
+
+// The median and 90th percentile of a list of numbers, rounded (nulls when empty)
+function gridDiagSpread(values) {
+    const v = values.filter(Number.isFinite).sort((a, b) => a - b);
+    const at = p => (v.length ? Math.round(v[Math.min(v.length - 1, Math.floor((v.length - 1) * p))]) : null);
+    return { p50: at(0.5), p90: at(0.9) };
+}
+
+// The library cells on screen by state
+function gridDiagCells() {
+    const cells = { poster: 0, blurhash: 0, shimmer: 0, colour: 0, skeleton: 0, icon: 0 };
+    for (const cell of libraryView?.cells.values() || []) {
+        const r = cell.getBoundingClientRect();
+        if (r.bottom <= 0 || r.top >= innerHeight) continue;
+        const img = cell.querySelector('img.jf-thumb-img');
+        if (cell.hasAttribute('data-i')) cells[cell.dataset.tint ? 'colour' : 'skeleton']++;
+        else if (!img) cells.icon++;
+        else if (img.complete && img.naturalWidth > 0 && img.style.opacity) cells.poster++;
+        else if (cell.querySelector('canvas.jf-blurhash:not([data-blurhash])')) cells.blurhash++;
+        else cells.shimmer++;
+    }
+    return cells;
+}
+
+// Timings of one kind of request: queueing (fetchStart to requestStart: waiting for a connection,
+// and connecting), the server (requestStart to responseStart), the download (responseStart to
+// responseEnd), the protocols and how many came from the browser's cache (transferSize 0)
+function gridDiagRequests(list) {
+    const net = list.filter(e => !e.cached);
+    const protocols = {};
+    for (const e of list) protocols[e.protocol || '?'] = (protocols[e.protocol || '?'] || 0) + 1;
+    return {
+        n: list.length,
+        cached: list.length - net.length,
+        protocols,
+        queueMs: gridDiagSpread(net.map(e => e.queue)),
+        serverMs: gridDiagSpread(net.map(e => e.server)),
+        downloadMs: gridDiagSpread(net.map(e => e.download)),
+    };
+}
+
+function gridDiag() {
+    const now = performance.now();
+    const index = libraryIndex
+        ? { items: libraryIndex.length, blurhashes: libraryIndex.filter(libraryHasHash).length, agoS: libraryIndexAt == null ? null : Math.round((now - libraryIndexAt) / 1000) }
+        : libraryIndexRequest ? 'loading' : 'none';
+    const widths = {};
+    for (const p of gridDiagData.paint) widths[p.width] = (widths[p.width] || 0) + 1;
+    return {
+        browser: navigator.userAgent,
+        viewport: `${innerWidth}x${innerHeight}`,
+        dpr: devicePixelRatio,
+        secure: window.isSecureContext,
+        serviceWorker: !!navigator.serviceWorker?.controller,
+        total: libraryTotal,
+        index,
+        pagesInFlight: libraryInFlight.size,
+        pagesHeld: libraryItems.filter(Boolean).length,
+        cells: gridDiagCells(),
+        cellsInPage: libraryView?.cells.size ?? 0,
+        flying: libraryFlying(),
+        speed: Math.round(libraryLastSpeed * 10) / 10,
+        postersLoading: posterLoader.loading.size,
+        postersRemembered: posterLoader.seen.size,
+        atLastStop: gridDiagData.stop,
+        halfSecondAfterStop: gridDiagData.stopLater,
+        images: gridDiagRequests(gridDiagData.image),
+        items: gridDiagRequests(gridDiagData.items),
+        // From a picture's load event to the frame after it decoded (decode and paint)
+        decodePaintMs: gridDiagSpread(gridDiagData.paint.map(p => p.ms)),
+        posterWidths: widths,
+    };
+}
+
+// The numbers as plain text, one line each: the panel's body and what the copy button copies
+function gridDiagText(d) {
+    const c = s => `poster ${s.poster} · blurhash ${s.blurhash} · shimmer ${s.shimmer} · colour ${s.colour} · skeleton ${s.skeleton} · icon ${s.icon}`;
+    const idx = typeof d.index === 'string' ? d.index : `${d.index.items} items, ${d.index.blurhashes} BlurHashes, ${d.index.agoS}s ago`;
+    const ms = s => `${s.p50 ?? '-'}/${s.p90 ?? '-'}`;
+    const req = r => `${r.n} (${r.cached} cached) · ${Object.entries(r.protocols).map(([k, n]) => `${k} ${n}`).join(', ') || '-'}\n`
+        + `  queue ${ms(r.queueMs)} · server ${ms(r.serverMs)} · download ${ms(r.downloadMs)} ms (p50/p90)`;
+    return [
+        `Rustyfin grid diagnostics ${new Date().toISOString()}`,
+        d.browser,
+        `viewport ${d.viewport} @${d.dpr}x · secure ${d.secure ? 'yes' : 'no'} · service worker ${d.serviceWorker ? 'yes' : 'no'}`,
+        `total ${d.total} · index ${idx}`,
+        `pages held ${d.pagesHeld} items · in flight ${d.pagesInFlight}`,
+        `on screen: ${c(d.cells)}`,
+        `at last stop: ${d.atLastStop ? c(d.atLastStop) : '-'}`,
+        `500 ms after: ${d.halfSecondAfterStop ? c(d.halfSecondAfterStop) : '-'}`,
+        `cells in page ${d.cellsInPage} · ${d.flying ? 'flying' : 'settled'} · ${d.speed} screens/s`,
+        `pictures loading ${d.postersLoading} · remembered ${d.postersRemembered} · widths ${Object.entries(d.posterWidths).map(([w, n]) => `${w}px ${n}`).join(', ') || '-'}`,
+        `images ${req(d.images)}`,
+        `  decode+paint ${ms(d.decodePaintMs)} ms (p50/p90)`,
+        `items ${req(d.items)}`,
+    ].join('\n');
+}
+
+// Copies text; navigator.clipboard needs a secure context, so plain http falls back to a selection
+async function gridDiagCopy(text) {
+    try {
+        await navigator.clipboard.writeText(text);
+        return true;
+    } catch {
+        const area = document.createElement('textarea');
+        area.value = text;
+        area.style.cssText = 'position:fixed;opacity:0';
+        document.body.appendChild(area);
+        area.select();
+        const ok = document.execCommand('copy');
+        area.remove();
+        return ok;
+    }
+}
+
+function startGridDiag() {
+    if (!gridDiagEnabled() || $('rf-grid-diag')) return;
+    window.rfGridDiag = gridDiag;
+    // Requests as numbers only: the URL is read for its path and dropped
+    const kind = name => {
+        const path = new URL(name, location.href).pathname;
+        return /\/Images\//.test(path) ? 'image' : /\/Items$/.test(path) || /\/Users\/[^/]+\/Items$/.test(path) ? 'items' : null;
+    };
+    new PerformanceObserver(list => {
+        for (const e of list.getEntries()) {
+            const k = kind(e.name);
+            if (!k) continue;
+            gridDiagPush(gridDiagData[k], {
+                cached: e.transferSize === 0 && e.decodedBodySize > 0,
+                // A response from the browser's cache has no protocol
+                protocol: e.nextHopProtocol || (e.transferSize === 0 ? 'cache' : '?'),
+                queue: e.requestStart - e.fetchStart,
+                server: e.responseStart - e.requestStart,
+                download: e.responseEnd - e.responseStart,
+            });
+        }
+    }).observe({ type: 'resource', buffered: true });
+    // Each picture the loader shows: from its load event to the frame after it decoded
+    gridDiagOnPoster = img => {
+        const loaded = performance.now();
+        const width = Number(img.dataset.w) || img.naturalWidth;
+        (img.decode ? img.decode() : Promise.resolve()).catch(() => {}).then(() => requestAnimationFrame(() => {
+            gridDiagPush(gridDiagData.paint, { ms: performance.now() - loaded, width });
+        }));
+    };
+    // The cells on screen when a scroll stops (no scroll event for 150 ms), and 500 ms later
+    let stopTimer = 0;
+    let laterTimer = 0;
+    window.addEventListener('scroll', () => {
+        clearTimeout(stopTimer);
+        clearTimeout(laterTimer);
+        stopTimer = setTimeout(() => {
+            if (!libraryView) return;
+            gridDiagData.stop = gridDiagCells();
+            gridDiagData.stopLater = null;
+            laterTimer = setTimeout(() => { if (libraryView) gridDiagData.stopLater = gridDiagCells(); }, 500);
+        }, 150);
+    }, { passive: true });
+
+    const panel = document.createElement('div');
+    panel.id = 'rf-grid-diag';
+    panel.style.cssText = 'position:fixed;right:8px;bottom:8px;z-index:9999;padding:8px 10px;max-width:420px;'
+        + 'font:11px/1.35 ui-monospace,monospace;color:#e6edf3;background:rgba(0,0,0,.85);border:1px solid #30363d;border-radius:8px';
+    const body = document.createElement('pre');
+    body.style.cssText = 'margin:0;white-space:pre-wrap;user-select:text';
+    const copy = document.createElement('button');
+    copy.type = 'button';
+    copy.textContent = 'Copy as text';
+    copy.style.cssText = 'margin-top:6px;padding:2px 8px;border:1px solid #30363d;border-radius:6px;background:#161b22;color:#e6edf3;cursor:pointer';
+    copy.addEventListener('click', async () => {
+        const ok = await gridDiagCopy(gridDiagText(gridDiag()));
+        copy.textContent = ok ? 'Copied' : 'Copy failed: select the text';
+        setTimeout(() => { copy.textContent = 'Copy as text'; }, 2000);
+    });
+    panel.append(body, copy);
+    document.body.appendChild(panel);
+    setInterval(() => {
+        body.textContent = libraryView ? gridDiagText(gridDiag()) : 'grid diagnostics: open a library';
+    }, 500);
+}
+if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', startGridDiag);
+else startGridDiag();
+
 // A sort or genre change: a new load for the new query, shown from the top of the list
 async function reloadLibrary(libId) {
     renderLetterRail(libId);
@@ -2487,6 +2924,7 @@ async function reloadLibrary(libId) {
         container.innerHTML = '<div class="flex justify-center items-center py-24"><div class="w-10 h-10 border-3 border-[#00a4dc] border-t-transparent rounded-full animate-spin"></div></div>';
     }
 
+    loadLibraryIndex(gen);
     try {
         const { items, total } = await fetchLibraryPage(0);
         if (gen !== libraryGen) return;

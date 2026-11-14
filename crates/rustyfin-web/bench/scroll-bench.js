@@ -14,8 +14,10 @@
 //
 // Modes:
 //   steady { speed, maxMs }  px/s from the top to the end (or for maxMs), driven from the page
-//   fling  { v0, tau, from } v = v0 * exp(-t / tau) px/s, from the current position (or `from`,
-//                            a fraction of the page)
+//   fling  { v0, tau, from, stopBelow }
+//                            v = v0 * exp(-t / tau) px/s, from the current position (or `from`,
+//                            a fraction of the page), until v < stopBelow (default 20 px/s: a
+//                            trackpad's momentum; a spun mouse wheel stops abruptly, e.g. 1500)
 //   jump   { to }            an instant scroll to a fraction of the page (a scrollbar drag, End)
 //   rail   { letter }        a click on the library's letter rail
 //   watch                    records while real input (wheel, touch, scrollbar) scrolls; the
@@ -122,7 +124,7 @@
             } else if (stopAt == null && mode === 'fling') {
                 const tau = opts.tau || 325;
                 scroller.scrollTop = Math.min(max(), flingStart + (opts.v0 * tau * (1 - Math.exp(-t / tau))) / 1000);
-                if (opts.v0 * Math.exp(-t / tau) < 20 || scroller.scrollTop >= max() - 1) stopAt = now;
+                if (opts.v0 * Math.exp(-t / tau) < (opts.stopBelow || 20) || scroller.scrollTop >= max() - 1) stopAt = now;
             } else if (stopAt == null && mode === 'watch') {
                 if (scroller.scrollTop !== lastY) {
                     if (!moved) t0 = now;
@@ -183,10 +185,19 @@
                 .map(e => ({
                     start: round(e.startTime - stopAt),
                     queued: round(e.requestStart - e.startTime),
+                    server: round(e.responseStart - e.requestStart),
                     ms: round(e.responseEnd - e.startTime),
                     kb: round((e.transferSize || e.encodedBodySize) / 1024),
                 }));
             const images = entries.filter(e => /\/Items\/[^/]+\/Images\//.test(path(e)));
+            // Pictures asked from 500 ms before the stop on: how long each waited for a connection
+            // (requestStart - startTime, with any connect), the server's time to the first byte,
+            // and the whole request
+            const late = images.filter(e => e.startTime >= stopAt - 500 && e.responseEnd > 0);
+            const dist = f => {
+                const v = late.map(f).sort((a, b) => a - b);
+                return { p50: round(percentile(v, 0.5)), p95: round(percentile(v, 0.95)) };
+            };
             state.summary = {
                 mode,
                 viewport: `${innerWidth}x${innerHeight}@${devicePixelRatio}`,
@@ -211,6 +222,13 @@
                 pages: pages.filter(p => p.start > -1000).slice(-12),
                 pageCount: pages.length,
                 imageRequests: images.length,
+                imagesAroundStop: late.length ? {
+                    count: late.length,
+                    queuedMs: dist(e => e.requestStart - e.startTime),
+                    serverMs: dist(e => e.responseStart - e.requestStart),
+                    totalMs: dist(e => e.responseEnd - e.startTime),
+                    kb: round(late.reduce((n, e) => n + (e.transferSize || e.encodedBodySize), 0) / 1024),
+                } : null,
                 stopAt,
             };
             state.running = false;
