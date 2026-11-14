@@ -17039,17 +17039,22 @@ async fn g1_easy_pin_is_hashed_and_never_returned() {
     assert_eq!(pin_hash("viewer").await, None);
 }
 
+// B155: new users and administrator rights
+
+/// `POST /Users/New` creates a user without administrator rights whatever the body says, as
+/// Jellyfin's `CreateUserByName` does; rights come only from a later `POST /Users/{id}/Policy`.
 #[tokio::test]
-async fn g1_create_user_honours_is_administrator() {
+async fn b155_new_user_is_never_admin() {
     let state = test_state().await;
     let app = app(state.clone());
     let (owner, _, _, _) = g1_owner_and_viewer(&state, &app).await;
-    for (name, flag, admin) in [
-        ("g1-admin", Some(true), true),
-        ("g1-plain", Some(false), false),
-        ("g1-default", None, false),
+    let mut promote_id = String::new();
+    for (name, flag) in [
+        ("b155-true", Some(true)),
+        ("b155-false", Some(false)),
+        ("b155-none", None),
     ] {
-        let mut body = serde_json::json!({ "Name": name, "Password": "g1-pass" });
+        let mut body = serde_json::json!({ "Name": name, "Password": "b155-pass" });
         if let Some(flag) = flag {
             body["IsAdministrator"] = serde_json::json!(flag);
         }
@@ -17059,12 +17064,42 @@ async fn g1_create_user_honours_is_administrator() {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "create {name}: {created}");
+        assert_eq!(created["IsAdministrator"], false, "{name}: {created}");
         assert_eq!(
             user_flags(&state, name).await,
-            Some((admin, false, false)),
+            Some((false, false, false)),
             "{name}"
         );
+
+        // The new user's own token gets no administrator rights.
+        let (token, id) = login(&app, name, "b155-pass").await.expect(name);
+        let (status, _) = send(
+            &app,
+            request("GET", "/Library/VirtualFolders", Some(&token), None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{name}");
+        if flag == Some(true) {
+            promote_id = id;
+        }
     }
+
+    // The Policy call that follows is what makes an administrator.
+    let (status, _) = send(
+        &app,
+        request(
+            "POST",
+            &format!("/Users/{promote_id}/Policy"),
+            Some(&owner),
+            Some(serde_json::json!({ "IsAdministrator": true })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        user_flags(&state, "b155-true").await,
+        Some((true, false, false))
+    );
 }
 
 #[tokio::test]
