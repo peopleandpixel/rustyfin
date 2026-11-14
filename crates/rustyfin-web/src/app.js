@@ -146,8 +146,9 @@ async function checkSetupWizard() {
         const info = await API.getPublicInfo();
         const done = info.StartupWizardCompleted ?? info.startup_wizard_completed ?? true;
         // Update version badge with server version
-        if (info.Version || info.version) {
-            serverVersion = info.Version || info.version;
+        const reportedVersion = info.RustyfinVersion || info.Version || info.version;
+        if (reportedVersion) {
+            serverVersion = reportedVersion;
             const badge = $('version-badge');
             if (badge) badge.textContent = serverVersion;
         }
@@ -1052,7 +1053,7 @@ async function renderHome() {
             const info = await API.getPublicInfo();
             if (API.token !== session) return;
             const sn = info.ServerName || info.server_name || 'Rustyfin';
-            const ver = info.Version || info.version || serverVersion;
+            const ver = info.RustyfinVersion || info.Version || info.version || serverVersion;
             page.innerHTML = `
             <div class="flex flex-col items-center justify-center min-h-[75vh] text-center jf-page px-4">
                 <div class="relative mb-6">
@@ -3389,7 +3390,7 @@ async function renderAdmin(tab) {
                         <p class="text-[11px] text-white/40 uppercase tracking-wider mt-1">${t('nav.server')}</p>
                     </div>
                     <div class="jf-settings-card text-center">
-                        <p class="text-3xl font-black text-white">v${escapeHtml(info.Version || serverVersion)}</p>
+                        <p class="text-3xl font-black text-white">v${escapeHtml(info.RustyfinVersion || info.Version || serverVersion)}</p>
                         <p class="text-[11px] text-white/40 uppercase tracking-wider mt-1">${t('admin.release_version')}</p>
                     </div>
                     <div class="jf-settings-card text-center">
