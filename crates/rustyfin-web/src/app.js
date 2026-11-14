@@ -2748,6 +2748,7 @@ function gridDiagEnabled() {
     try {
         return new URLSearchParams(location.search).get('debug') === 'grid'
             || hashRoute(location.hash.slice(1)).query.get('debug') === 'grid'
+            || sessionStorage.getItem('rustyfin.gridDebug') === '1'
             || localStorage.getItem('rustyfin.gridDebug') === '1';
     } catch {
         return false;
@@ -6761,11 +6762,21 @@ function handleHash() {
     // navigate() sets the hash itself; a change to any other hash came from history (Back/Forward)
     const fromHistory = hash !== navigatedHash;
     const { page, param, query } = hashRoute(hash);
-    if (query.get('debug') === 'grid') startGridDiag(true);
+    // debug=grid is kept for the tab (sessionStorage), so a reload keeps the panel: the hash
+    // itself is cleaned just below
+    if (query.get('debug') === 'grid') {
+        try { sessionStorage.setItem('rustyfin.gridDebug', '1'); } catch {}
+        startGridDiag(true);
+    }
     if (!page) {
         navigate('home');
         return;
     }
+    // A hash typed in another form (a leading slash, a ?query) becomes the canonical one in place:
+    // navigate() then sets the hash it already has, so no history entry is added and no second
+    // hashchange draws the page again (Back would land on the typed form and come straight back)
+    const canonical = param ? `${page}/${param}` : page;
+    if (hash !== canonical) history.replaceState(null, '', `#${canonical}`);
     navigate(page, param, { fromHistory });
 }
 

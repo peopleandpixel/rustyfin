@@ -488,6 +488,8 @@ test('the place in the list is restored only through history (F27)', () => {
     const calls = [];
     const router = vm.createContext({
         URLSearchParams,
+        history: { replaceState: (_, __, url) => { router.window.location.hash = url; } },
+        sessionStorage: { setItem() {} },
         window: { location: { hash: '' } },
         navigate: (page, data, opts) => calls.push({ page, data, fromHistory: opts?.fromHistory ?? false }),
     });
@@ -515,6 +517,42 @@ test('the place in the list is restored only through history (F27)', () => {
     router.window.location.hash = '#?debug=grid';
     router.handleHash();
     assert.deepEqual(calls.at(-1), { page: 'home', data: undefined, fromHistory: false });
+    // A typed hash in another form is made canonical in place: one render, no history entry
+    // added, no second hashchange; debug=grid is kept for the tab
+    {
+        let entries = 0;
+        let renders = 0;
+        const stored = new Map();
+        const sim = vm.createContext({ URLSearchParams });
+        const location = {
+            current: '',
+            get hash() { return this.current; },
+            // As a browser: a new value adds a history entry and fires hashchange
+            set hash(value) {
+                const next = value.startsWith('#') ? value : `#${value}`;
+                if (next === this.current) return;
+                this.current = next;
+                entries++;
+                sim.handleHash();
+            },
+        };
+        Object.assign(sim, {
+            window: { location },
+            history: { replaceState: (_, __, url) => { location.current = url; } },
+            sessionStorage: { setItem: (k, v) => stored.set(k, v) },
+            navigate: (page, data) => {
+                renders++;
+                sim.navigatedHash = data ? `${page}/${data}` : page;
+                location.hash = sim.navigatedHash;
+            },
+        });
+        vm.runInContext(`var navigatedHash = null;\nfunction startGridDiag() {}\n${fn('function hashRoute(')}\n${fn('function handleHash(')}`, sim);
+        location.hash = '#/library/abc?debug=grid'; // typed: one entry, its hashchange
+        assert.equal(renders, 1, 'drawn once');
+        assert.equal(entries, 1, 'only the typed entry');
+        assert.equal(location.hash, '#library/abc', 'replaced by the canonical hash');
+        assert.equal(stored.get('rustyfin.gridDebug'), '1', 'debug=grid kept for a reload');
+    }
     // navigate() turns that into the restore decision, and fillLibraryGrid uses only it
     assert.match(fn('function navigate('), /libraryRestore = fromHistory && page === 'library'/);
     assert.match(fn('function navigate('), /navigatedHash = data \?/);
