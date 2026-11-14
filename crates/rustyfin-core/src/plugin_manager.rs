@@ -244,16 +244,65 @@ pub struct NotificationProviderHandle {
 /// configuration enables it at once, without a restart. The env key is never written to the
 /// plugin config or the DB.
 pub async fn install_tmdb_plugin(pm: &PluginManager, client: crate::tmdb_client::TmdbClient) {
+    let env_key = client.has_env_key();
     let plugin = Arc::new(plugin_tmdb::TmdbPlugin::default());
-    let saved = pm.load_plugin_config_from_db("tmdb").await;
+    install_keyed_plugin(
+        pm,
+        plugin,
+        "TMDb",
+        env_key,
+        Some("RUSTYFIN_TMDB_API_KEY"),
+        move |p| async move { plugin_tmdb::register_tmdb_provider(&p, client, pm).await },
+    )
+    .await;
+}
+
+/// Install the built-in OMDb plugin. It is enabled by a saved `api_key` unless a saved status says
+/// otherwise. A key saved later through the plugin's configuration enables it at once, without a
+/// restart.
+pub async fn install_omdb_plugin(pm: &PluginManager) {
+    let plugin = Arc::new(plugin_omdb::OmdbPlugin::default());
+    install_keyed_plugin(pm, plugin, "OMDb", false, None, move |p| async move {
+        plugin_omdb::register_omdb_provider(&p, pm).await
+    })
+    .await;
+}
+
+/// Install the built-in Fanart.tv plugin. It is enabled by a saved `api_key` unless a saved status
+/// says otherwise. A key saved later through the plugin's configuration enables it at once,
+/// without a restart.
+pub async fn install_fanart_plugin(pm: &PluginManager) {
+    let plugin = Arc::new(plugin_fanart::FanartPlugin::default());
+    install_keyed_plugin(pm, plugin, "Fanart.tv", false, None, move |p| async move {
+        plugin_fanart::register_fanart_provider(&p, pm).await
+    })
+    .await;
+}
+
+/// Shared install for the keyed built-in plugins (TMDb, OMDb, Fanart.tv): applies the saved
+/// config, registers the builtin info, then the provider (`register_provider`, which must run
+/// after the info so the provider picks up its status), then the config hook.
+async fn install_keyed_plugin<P, F, Fut>(
+    pm: &PluginManager,
+    plugin: Arc<P>,
+    label: &str,
+    env_key: bool,
+    env_var: Option<&str>,
+    register_provider: F,
+) where
+    P: Plugin + 'static,
+    F: FnOnce(Arc<P>) -> Fut,
+    Fut: Future<Output = Result<(), String>>,
+{
+    let id = plugin.id().to_string();
+    let saved = pm.load_plugin_config_from_db(&id).await;
     if let Some(config) = &saved
         && let Err(e) = Plugin::set_configuration(plugin.as_ref(), config.clone())
     {
-        tracing::warn!("failed to apply saved config for tmdb: {}", e);
+        tracing::warn!("failed to apply saved config for {}: {}", id, e);
     }
 
-    let env_key = client.has_env_key();
-    let status = plugin_tmdb::status_for(saved.as_ref(), env_key);
+    let status = rustyfin_model::plugin::key_status(saved.as_ref(), env_key);
     let saved_status = saved
         .as_ref()
         .and_then(|c| c.get("status"))
@@ -265,35 +314,40 @@ pub async fn install_tmdb_plugin(pm: &PluginManager, client: crate::tmdb_client:
         .is_some_and(|k| !k.trim().is_empty());
     let reason = match (saved_status, env_key, saved_key) {
         (Some(s), _, _) => format!("saved status {s}"),
-        (None, true, _) => "RUSTYFIN_TMDB_API_KEY is set".to_string(),
+        (None, true, _) => match env_var {
+            Some(var) => format!("{var} is set"),
+            None => "an env key is set".to_string(),
+        },
         (None, false, true) => "saved API key".to_string(),
-        (None, false, false) => "no API key (set RUSTYFIN_TMDB_API_KEY or save one)".to_string(),
+        (None, false, false) => match env_var {
+            Some(var) => format!("no API key (set {var} or save one)"),
+            None => "no API key (save one)".to_string(),
+        },
     };
-    tracing::info!("TMDb plugin status {:?}: {}", status, reason);
+    tracing::info!("{} plugin status {:?}: {}", label, status, reason);
 
     pm.register_builtin_plugin(BuiltinPluginInfo {
         name: plugin.name().to_string(),
         version: plugin.version().to_string(),
-        id: plugin.id().to_string(),
+        id: id.clone(),
         description: plugin.description().to_string(),
         plugin_type: plugin.plugin_type(),
         status,
     })
     .await;
 
-    // Always registers; the provider reads the plugin's current key on each call.
-    if let Err(e) = plugin_tmdb::register_tmdb_provider(&plugin, client, pm).await {
-        tracing::debug!("TMDb plugin not registered as provider: {}", e);
+    if let Err(e) = register_provider(plugin.clone()).await {
+        tracing::debug!("{} plugin not registered as provider: {}", label, e);
     }
 
     let hook_plugin = plugin.clone();
     pm.register_config_hook(
-        "tmdb",
+        &id,
         Arc::new(move |config: &serde_json::Value| {
             if let Err(e) = Plugin::set_configuration(hook_plugin.as_ref(), config.clone()) {
-                tracing::warn!("failed to apply tmdb config: {}", e);
+                tracing::warn!("failed to apply {} config: {}", hook_plugin.id(), e);
             }
-            Some(plugin_tmdb::status_for(Some(config), env_key))
+            Some(rustyfin_model::plugin::key_status(Some(config), env_key))
         }),
     )
     .await;

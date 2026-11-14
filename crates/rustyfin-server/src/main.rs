@@ -212,8 +212,9 @@ async fn main() {
 
     // Helper: register a built-in plugin, loading config and status from DB if available.
     // Plugins are DISABLED by default — they must be explicitly enabled via the API or by
-    // storing an Active status in the database. TMDb is the exception: a key (env or saved)
-    // enables it (see install_tmdb_plugin). This ensures fast scans without external API calls.
+    // storing an Active status in the database. TMDb, OMDb and Fanart.tv are the exceptions: a key
+    // enables them (see install_tmdb_plugin, install_omdb_plugin, install_fanart_plugin). This
+    // ensures fast scans without external API calls.
     async fn register_builtin_plugin<P: rustyfin_model::plugin::Plugin>(
         plugin: &P,
         pm: &rustyfin_core::plugin_manager::PluginManager,
@@ -254,30 +255,9 @@ async fn main() {
     // Register TMDb plugin: enabled by a key (env or saved), also when one is saved later
     rustyfin_core::plugin_manager::install_tmdb_plugin(&plugin_manager_with_db, tmdb.clone()).await;
 
-    // Register OMDb plugin (disabled by default)
-    {
-        let omdb_plugin = plugin_omdb::OmdbPlugin::default();
-        register_builtin_plugin(&omdb_plugin, &plugin_manager_with_db).await;
-        if let Err(e) =
-            plugin_omdb::register_omdb_provider(&omdb_plugin, &plugin_manager_with_db).await
-        {
-            tracing::debug!("OMDb plugin not registered as provider (no API key): {}", e);
-        }
-    }
-
-    // Register Fanart.tv plugin (disabled by default)
-    {
-        let fanart_plugin = plugin_fanart::FanartPlugin::default();
-        register_builtin_plugin(&fanart_plugin, &plugin_manager_with_db).await;
-        if let Err(e) =
-            plugin_fanart::register_fanart_provider(&fanart_plugin, &plugin_manager_with_db).await
-        {
-            tracing::debug!(
-                "Fanart.tv plugin not registered as provider (no API key): {}",
-                e
-            );
-        }
-    }
+    // Register OMDb and Fanart.tv plugins: enabled by a saved key, also when one is saved later
+    rustyfin_core::plugin_manager::install_omdb_plugin(&plugin_manager_with_db).await;
+    rustyfin_core::plugin_manager::install_fanart_plugin(&plugin_manager_with_db).await;
 
     // Register Trakt plugin (disabled by default)
     {

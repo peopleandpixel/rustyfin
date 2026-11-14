@@ -113,25 +113,7 @@ impl Plugin for TmdbPlugin {
 /// any other string is Disabled. Without one, the plugin is Active when `env_key` is set or the
 /// config's `api_key` is a string that is non-blank after trimming, and Disabled otherwise.
 pub fn status_for(config: Option<&serde_json::Value>, env_key: bool) -> PluginStatus {
-    if let Some(status) = config
-        .and_then(|c| c.get("status"))
-        .and_then(|v| v.as_str())
-    {
-        return match status {
-            "Active" => PluginStatus::Active,
-            "Malfunctioned" => PluginStatus::Malfunctioned,
-            _ => PluginStatus::Disabled,
-        };
-    }
-    let saved_key = config
-        .and_then(|c| c.get("api_key"))
-        .and_then(|v| v.as_str())
-        .is_some_and(|k| !k.trim().is_empty());
-    if env_key || saved_key {
-        PluginStatus::Active
-    } else {
-        PluginStatus::Disabled
-    }
+    rustyfin_model::plugin::key_status(config, env_key)
 }
 
 /// Create a new TMDb plugin instance (FFI entry point for dynamic loading).

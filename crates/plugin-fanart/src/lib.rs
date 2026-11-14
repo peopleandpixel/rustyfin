@@ -8,7 +8,7 @@ use rustyfin_model::plugin::{Plugin, PluginType};
 use serde::Deserialize;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 const FANART_BASE: &str = "https://webservice.fanart.tv/v3";
 
@@ -235,13 +235,13 @@ pub async fn get_tv_show_images(
 
 /// Fanart.tv plugin that registers itself as a metadata provider (images only).
 pub struct FanartPlugin {
-    api_key: Mutex<Option<String>>,
+    api_key: Arc<Mutex<Option<String>>>,
 }
 
 impl Default for FanartPlugin {
     fn default() -> Self {
         Self {
-            api_key: Mutex::new(None),
+            api_key: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -290,10 +290,9 @@ impl Plugin for FanartPlugin {
     }
 }
 
-impl FanartPlugin {
-    fn api_key(&self) -> Option<String> {
-        self.api_key.lock().unwrap().clone()
-    }
+/// The key to call fanart.tv with: the current key, or `None` when it is missing or blank.
+fn usable_key(key: &Mutex<Option<String>>) -> Option<String> {
+    key.lock().unwrap().clone().filter(|k| !k.trim().is_empty())
 }
 
 /// Create a new Fanart plugin instance (FFI entry point for dynamic loading).
@@ -307,7 +306,7 @@ impl FanartPlugin {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rustyfin_plugin_create() -> *mut std::ffi::c_void {
     let plugin: Box<dyn Plugin> = Box::new(FanartPlugin {
-        api_key: Mutex::new(None),
+        api_key: Arc::new(Mutex::new(None)),
     });
     Box::into_raw(Box::new(plugin)).cast()
 }
@@ -323,7 +322,8 @@ pub async fn register_fanart_provider<P>(
 where
     P: MetadataProviderRegistrar,
 {
-    let api_key = plugin.api_key().ok_or("Fanart.tv API key not configured")?;
+    // Always registers; each call reads the plugin's current key and makes no request without one.
+    let key = plugin.api_key.clone();
 
     let plugin_id = plugin.id().to_string();
     plugin_manager
@@ -346,9 +346,12 @@ where
                   tvdb_id: Option<i64>,
                   media_type: MediaType|
                   -> Pin<Box<dyn Future<Output = Vec<MetadataImage>> + Send>> {
-                let api_key = api_key.clone();
+                let key = key.clone();
                 let client = client.clone();
                 Box::pin(async move {
+                    let Some(api_key) = usable_key(&key) else {
+                        return Vec::new();
+                    };
                     match media_type {
                         MediaType::Movie => {
                             if let Some(id) = tmdb_id {
