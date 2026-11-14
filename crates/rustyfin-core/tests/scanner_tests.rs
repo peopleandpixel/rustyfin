@@ -3943,6 +3943,99 @@ async fn b135_a_scheduled_scan_uses_the_given_plugin_manager() {
     );
 }
 
+// B134d: providers are searched with the item's parsed name, as Jellyfin does, not with the
+// file name, whose release tags make TMDb find nothing. The cleaned file name is the fallback.
+#[tokio::test]
+async fn b134d_refresh_searches_the_parsed_name_first() {
+    use rustyfin_model::metadata::{ExternalMetadata, MetadataImage};
+    use rustyfin_model::plugin::PluginStatus;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Mutex;
+    type Found = Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>>;
+    type Images = Pin<Box<dyn Future<Output = Vec<MetadataImage>> + Send>>;
+    type Searches = Arc<Mutex<Vec<(String, Option<i32>)>>>;
+
+    let fx = Fixture::new().await;
+    let lib = fx.library("B134d Film", LibraryContentType::Movies).await;
+    let root = root_of(&lib);
+    let pm = rustyfin_core::plugin_manager::PluginManager::new(&fx.dir);
+    let searched: Searches = Arc::default();
+    let seen = searched.clone();
+    pm.register_metadata_provider(
+        "b134d".to_string(),
+        "b134d".to_string(),
+        PluginStatus::Active,
+        move |_: &reqwest::Client, name: &str, year: Option<i32>| -> Found {
+            seen.lock().unwrap().push((name.to_string(), year));
+            // Only the clean title is found, as on TMDb.
+            let found = matches!(name, "A Quiet Place" | "Odd Name Film");
+            Box::pin(async move {
+                found.then(|| ExternalMetadata {
+                    tmdb_id: Some(447332),
+                    ..Default::default()
+                })
+            })
+        },
+        |_: &reqwest::Client, _: &str| -> Found { Box::pin(async { None }) },
+        |_: &reqwest::Client, _: Option<i64>, _: Option<i64>, _| -> Images {
+            Box::pin(async { Vec::new() })
+        },
+    )
+    .await;
+
+    // (stored name, file) -> the searches expected
+    let cases = [
+        (
+            "A Quiet Place",
+            "A Quiet Place (2018)/A Quiet Place (2018) Bluray-1080p.mkv",
+            vec![("A Quiet Place".to_string(), Some(2018))],
+        ),
+        // The stored name finds nothing, so the cleaned file name is tried next.
+        (
+            "Something Else",
+            "Odd Name Film/Odd.Name.Film.1080p.mkv",
+            vec![
+                ("Something Else".to_string(), Some(2018)),
+                ("Odd Name Film".to_string(), Some(2018)),
+            ],
+        ),
+    ];
+    for (name, file, expected) in cases {
+        searched.lock().unwrap().clear();
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO media_items (id, library_id, name, media_type, path, production_year) \
+             VALUES (?, ?, ?, 'Movie', ?, 2018)",
+        )
+        .bind(id.to_string())
+        .bind(lib.id.to_string())
+        .bind(name)
+        .bind(root.join(file).to_str().unwrap())
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+        let item = rustyfin_db::repo_media::get_item_by_id(&fx.pool, id)
+            .await
+            .unwrap()
+            .unwrap();
+        rustyfin_core::metadata::refresh_item_metadata(
+            &fx.pool,
+            &reqwest::Client::new(),
+            &item,
+            &pm,
+        )
+        .await
+        .unwrap();
+        assert_eq!(*searched.lock().unwrap(), expected, "{file}");
+        let item = rustyfin_db::repo_media::get_item_by_id(&fx.pool, id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(item.tmdb_id, Some(447332), "{file}");
+    }
+}
+
 // B134c: like Jellyfin (AutomaticRefreshIntervalDays = 0), nothing re-queries metadata on a
 // timer by default.
 #[tokio::test]
@@ -4026,9 +4119,13 @@ async fn b134c_metadata_refresh_skips_identified_items() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    // Only the unidentified item is searched (under its name and then its file name).
     let searched = searched.lock().unwrap().clone();
-    assert_eq!(searched.len(), 1, "{searched:?}");
-    assert!(searched[0].contains("Unknown Film"), "{searched:?}");
+    assert!(!searched.is_empty(), "nothing was searched");
+    assert!(
+        searched.iter().all(|name| name.contains("Unknown Film")),
+        "{searched:?}"
+    );
 }
 
 // B30: a scheduled scan tells the server, so that it can drop what it cached from before.
