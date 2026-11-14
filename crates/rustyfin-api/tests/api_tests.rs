@@ -1266,6 +1266,77 @@ async fn test_webclient_redirects() {
     }
 }
 
+// B148: after an upgrade a browser loads one consistent asset set. index.html and other
+// unhashed files revalidate (no-cache); content-hashed assets are immutable.
+#[tokio::test]
+#[cfg_attr(not(feature = "webclient"), ignore)]
+async fn b148_webclient_cache_control() {
+    let dist = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../rustyfin-web/dist");
+    let Ok(html) = std::fs::read_to_string(dist.join("index.html")) else {
+        tracing::info!("skipping b148_webclient_cache_control: web client dist not found");
+        return;
+    };
+    let state = test_state().await;
+
+    let get = |uri: String| {
+        let app = app(state.clone());
+        async move {
+            let resp = app
+                .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let cc = resp
+                .headers()
+                .get("cache-control")
+                .map(|v| v.to_str().unwrap().to_string());
+            (resp.status(), cc)
+        }
+    };
+
+    for uri in [
+        "/web/",
+        "/web/index.html",
+        "/web/sw.js",
+        "/web/assets/logo.png",
+    ] {
+        let (status, cc) = get(uri.to_string()).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert_eq!(cc.as_deref(), Some("no-cache"), "{uri}");
+    }
+
+    // Every script and stylesheet index.html loads from /web/assets/ has a content hash in its
+    // name: <stem>-<8 chars of [A-Za-z0-9_-]>.<ext>.
+    let hashed = |uri: &str| {
+        let name = uri.rsplit('/').next().unwrap();
+        let stem = name.rsplit_once('.').map_or(name, |(s, _)| s);
+        let b = stem.as_bytes();
+        b.len() > 9
+            && b[b.len() - 9] == b'-'
+            && b[b.len() - 8..]
+                .iter()
+                .all(|c| c.is_ascii_alphanumeric() || *c == b'_' || *c == b'-')
+    };
+    let refs: Vec<String> = html
+        .split('"')
+        .filter(|s| s.starts_with("/web/assets/") && (s.ends_with(".js") || s.ends_with(".css")))
+        .map(str::to_string)
+        .collect();
+    assert!(
+        refs.len() >= 4,
+        "index.html loads index js/css, hls, api.js and app.js: {refs:?}"
+    );
+    for uri in refs {
+        assert!(hashed(&uri), "{uri} has no content hash");
+        let (status, cc) = get(uri.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert_eq!(
+            cc.as_deref(),
+            Some("public, max-age=31536000, immutable"),
+            "{uri}"
+        );
+    }
+}
+
 // ── Rate Limiter Tests ──
 
 #[tokio::test]

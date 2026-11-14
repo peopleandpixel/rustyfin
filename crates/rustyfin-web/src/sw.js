@@ -1,18 +1,9 @@
-// Rustyfin Service Worker — Cache-First für statische Assets
-// Vite generates: index.css (bundled styles), hls.min.js, logo.png
-// api.js & app.js are loaded with cache-busting query params, not pre-cached
-// index.html is NOT cached — always fetched from server to get latest script references
+// Rustyfin Service Worker: cache-first for content-hashed assets only.
+// Everything else (index.html, sw.js, logo.png, API) goes to the network.
 const CACHE_NAME = 'rustyfin-v__CACHE_VERSION__';
-const ASSETS = [
-  '/web/assets/index.css',
-  '/web/assets/hls.min.js',
-  '/web/assets/logo.png'
-];
+const HASHED_ASSET = /^\/web\/assets\/.+-[A-Za-z0-9_-]{8}\.[a-z0-9]+$/;
 
-self.addEventListener('install', (event) => {
-  event.waitUntil(
-    caches.open(CACHE_NAME).then((cache) => cache.addAll(ASSETS))
-  );
+self.addEventListener('install', () => {
   self.skipWaiting();
 });
 
@@ -29,38 +20,18 @@ self.addEventListener('activate', (event) => {
 
 self.addEventListener('fetch', (event) => {
   const { request } = event;
+  if (request.method !== 'GET') return;
+  if (!HASHED_ASSET.test(new URL(request.url).pathname)) return;
 
-  // Cache-First für statische Assets (aber nicht für index.html, api.js/app.js mit Cache-Busting)
-  if (request.url.startsWith('/web/') && !request.url.includes('/api/') && !request.url.includes('?v=') && !request.url.endsWith('/index.html')) {
-    event.respondWith(
-      caches.match(request).then((cached) => {
-        const fetchPromise = fetch(request).then((response) => {
-          if (response.ok) {
-            const clone = response.clone();
-            caches.open(CACHE_NAME).then((cache) => cache.put(request, clone));
-          }
+  event.respondWith(
+    caches.open(CACHE_NAME).then((cache) =>
+      cache.match(request).then((cached) => {
+        if (cached) return cached;
+        return fetch(request).then((response) => {
+          if (response.ok) cache.put(request, response.clone());
           return response;
         });
-        return cached || fetchPromise;
       })
-    );
-    return;
-  }
-
-  // Network-First für API-Calls (mit Cache-Fallback)
-  if (request.url.includes('/api/')) {
-    event.respondWith(
-      fetch(request).then((response) => {
-        if (response.ok) {
-          const clone = response.clone();
-          caches.open(CACHE_NAME).then((cache) => cache.put(request, clone));
-        }
-        return response;
-      }).catch(() => caches.match(request))
-    );
-    return;
-  }
-
-  // Standard: Network only
-  event.respondWith(fetch(request));
+    )
+  );
 });
