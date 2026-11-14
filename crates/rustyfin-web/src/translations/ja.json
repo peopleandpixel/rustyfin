@@ -138,7 +138,7 @@
         "sort_name_desc": "名前（ん-あ）",
         "sort_release_date": "リリース日",
         "sort_date_added": "追加日",
-        "sort_rating": "評価（★）",
+        "sort_rating": "評価",
         "all_genres": "すべてのジャンル",
         "media_scan_started_for": "{{name}}のメディアスキャンを開始しました",
         "scan_button": "スキャン",
