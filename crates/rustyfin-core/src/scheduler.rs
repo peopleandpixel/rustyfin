@@ -117,17 +117,13 @@ impl TaskScheduler {
                     id: TASK_METADATA_REFRESH.to_string(),
                     name: "Refresh Metadata".to_string(),
                     description:
-                        "Updates metadata for all media items from local and remote sources."
+                        "Fills in metadata for media items that are not identified yet, from local and remote sources."
                             .to_string(),
                     category: "Library".to_string(),
                     state: TaskState::Idle,
                     current_progress_percentage: None,
-                    triggers: vec![TaskTriggerInfo {
-                        trigger_type: "IntervalTrigger".to_string(),
-                        interval_ticks: Some(TICKS_24H),
-                        time_of_day_ticks: None,
-                        max_runtime_ticks: None,
-                    }],
+                    // Like Jellyfin, no timer by default: identified items are never re-queried.
+                    triggers: vec![],
                     last_execution_result: None,
                 },
             },
@@ -477,13 +473,26 @@ impl TaskScheduler {
                 let mut errors = Vec::new();
                 let http = &self.http_client;
 
-                // Collect all items from all libraries first
+                // Collect all items from all libraries first. Items already identified by a
+                // provider ID are skipped (Jellyfin parity: no automatic re-query). An explicit
+                // refresh of one item or library from the API still re-queries them.
                 let mut all_items = Vec::new();
+                let mut skipped_identified = 0usize;
                 for lib in &libraries {
                     match rustyfin_db::repo_media::get_items_by_library(&self.db, lib.id).await {
                         Ok(items) => {
                             for item in items {
-                                all_items.push((lib.name.clone(), item));
+                                use rustyfin_model::media::MediaType;
+                                let identified =
+                                    matches!(item.media_type, MediaType::Movie | MediaType::Series)
+                                        && (item.tmdb_id.is_some()
+                                            || item.tvdb_id.is_some()
+                                            || item.provider_ids.get("imdb").is_some());
+                                if identified {
+                                    skipped_identified += 1;
+                                } else {
+                                    all_items.push((lib.name.clone(), item));
+                                }
                             }
                         }
                         Err(e) => {
@@ -491,6 +500,11 @@ impl TaskScheduler {
                         }
                     }
                 }
+                tracing::info!(
+                    "metadata refresh: refreshing {} items, skipped {} identified items",
+                    all_items.len(),
+                    skipped_identified
+                );
 
                 // Process items concurrently with a semaphore (10 concurrent)
                 let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(10));
@@ -634,15 +648,20 @@ impl TaskScheduler {
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(120)).await;
             loop {
-                sched.run_metadata_refresh().await;
-                let interval = sched
-                    .get_interval_for_task(TASK_METADATA_REFRESH)
-                    .await
-                    .unwrap_or(std::time::Duration::from_secs(24 * 3600));
+                // Runs only once an IntervalTrigger is set on the task. The first run comes one
+                // interval later, not at startup.
+                let Some(interval) = sched.get_interval_for_task(TASK_METADATA_REFRESH).await
+                else {
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => continue,
+                        _ = rx.wait_for(|v| *v) => break,
+                    }
+                };
                 tokio::select! {
                     _ = tokio::time::sleep(interval) => {}
                     _ = rx.wait_for(|v| *v) => break,
                 }
+                sched.run_metadata_refresh().await;
             }
         });
 

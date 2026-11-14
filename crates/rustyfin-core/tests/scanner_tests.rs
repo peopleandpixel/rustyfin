@@ -3943,6 +3943,94 @@ async fn b135_a_scheduled_scan_uses_the_given_plugin_manager() {
     );
 }
 
+// B134c: like Jellyfin (AutomaticRefreshIntervalDays = 0), nothing re-queries metadata on a
+// timer by default.
+#[tokio::test]
+async fn b134c_metadata_refresh_has_no_default_trigger() {
+    let fx = Fixture::new().await;
+    let sched = TaskScheduler::new(fx.pool.clone(), Arc::new(fx.dir.clone()));
+    let task = sched
+        .get_task(rustyfin_core::scheduler::TASK_METADATA_REFRESH)
+        .await
+        .expect("the metadata refresh task");
+    assert!(task.triggers.is_empty(), "{:?}", task.triggers);
+}
+
+// B134c: a metadata refresh run asks the providers only about items not identified yet.
+#[tokio::test]
+async fn b134c_metadata_refresh_skips_identified_items() {
+    use rustyfin_core::scheduler::TASK_METADATA_REFRESH;
+    use rustyfin_model::metadata::{ExternalMetadata, MetadataImage};
+    use rustyfin_model::plugin::PluginStatus;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Mutex;
+    type Found = Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>>;
+    type Images = Pin<Box<dyn Future<Output = Vec<MetadataImage>> + Send>>;
+
+    let fx = Fixture::new().await;
+    let lib = fx.library("B134c Film", LibraryContentType::Movies).await;
+    let root = root_of(&lib);
+    for (name, tmdb_id) in [("Known Film", Some(77)), ("Unknown Film", None)] {
+        let path = root.join(format!("{name} (2001)/{name} (2001).mkv"));
+        sqlx::query(
+            "INSERT INTO media_items (id, library_id, name, media_type, path, tmdb_id) \
+             VALUES (?, ?, ?, 'Movie', ?, ?)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(lib.id.to_string())
+        .bind(name)
+        .bind(path.to_str().unwrap())
+        .bind(tmdb_id)
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+    }
+
+    let pm = rustyfin_core::plugin_manager::PluginManager::new(&fx.dir);
+    let searched: Arc<Mutex<Vec<String>>> = Arc::default();
+    let seen = searched.clone();
+    pm.register_metadata_provider(
+        "b134c".to_string(),
+        "b134c".to_string(),
+        PluginStatus::Active,
+        move |_: &reqwest::Client, name: &str, _: Option<i32>| -> Found {
+            seen.lock().unwrap().push(name.to_string());
+            Box::pin(async { None })
+        },
+        |_: &reqwest::Client, _: &str| -> Found { Box::pin(async { None }) },
+        |_: &reqwest::Client, _: Option<i64>, _: Option<i64>, _| -> Images {
+            Box::pin(async { Vec::new() })
+        },
+    )
+    .await;
+    let sched = TaskScheduler::with_plugin_manager(
+        fx.pool.clone(),
+        Arc::new(fx.dir.clone()),
+        reqwest::Client::new(),
+        pm,
+    );
+    assert!(sched.start_task(TASK_METADATA_REFRESH).await);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while sched
+        .get_task(TASK_METADATA_REFRESH)
+        .await
+        .unwrap()
+        .last_execution_result
+        .is_none()
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the refresh did not end within 60 s"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let searched = searched.lock().unwrap().clone();
+    assert_eq!(searched.len(), 1, "{searched:?}");
+    assert!(searched[0].contains("Unknown Film"), "{searched:?}");
+}
+
 // B30: a scheduled scan tells the server, so that it can drop what it cached from before.
 #[tokio::test]
 async fn b30_f8_a_scheduled_scan_calls_back_once_it_ends() {
