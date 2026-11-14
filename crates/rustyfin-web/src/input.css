@@ -48,18 +48,33 @@ body {
   overflow-x: hidden;
 }
 
-/* Header and sidebar: solid, the colour the old frosted glass showed over the page (its tint over
-   --jf-bg-darkest). A backdrop-filter re-blurs whatever scrolls under it every frame, which made
-   a fling outrun the browser's drawing (whole-screen checkerboard on Safari and Brave). */
+/* Header: frosted glass on desktop (a translucent tint, and the page blurred under it there).
+   It is one fixed layer of its own; nothing scrolls above it, so it promotes nothing else (see
+   B152 round 12's measurement). */
 .jf-header {
-  background: rgb(16, 20, 29);
+  background: rgba(19, 24, 34, 0.75);
   border-bottom: 1px solid var(--jf-border);
   transition: all 0.25s ease;
 }
+@media (min-width: 768px) {
+  .jf-header {
+    /* The prefix first: the build treats both as one property, and the last one written is the
+       one it keeps (Safari reads the prefixed one, Chromium and Firefox the standard one) */
+    -webkit-backdrop-filter: blur(24px);
+    backdrop-filter: blur(24px);
+  }
+}
 
+/* Sidebar: frosted glass on desktop, as the header */
 .jf-drawer {
-  background: rgb(12, 16, 22);
+  background: rgba(13, 17, 23, 0.85);
   border-right: 1px solid var(--jf-border);
+}
+@media (min-width: 768px) {
+  .jf-drawer {
+    -webkit-backdrop-filter: blur(20px);
+    backdrop-filter: blur(20px);
+  }
 }
 
 .jf-drawer-item {
@@ -272,9 +287,10 @@ body {
   color: #fb923c;
 }
 
-/* Over a poster: a solid dark amber fill, no blur, so it reads on light and busy pictures */
+/* Over a poster: the old amber tint over a light dark wash. No backdrop blur: it would give every
+   card a layer of its own; the wash stands in for the softening the blur gave. */
 .jf-badge-rating {
-  background: rgba(38, 30, 6, 0.8);
+  background: linear-gradient(rgba(234, 179, 8, 0.15), rgba(234, 179, 8, 0.15)), rgba(0, 0, 0, 0.2);
   border-color: rgba(234, 179, 8, 0.3);
   color: #facc15;
 }
@@ -828,11 +844,13 @@ img.jf-lazy-img:not([data-src]) {
 img.jf-thumb-img {
   transition: opacity 0.2s ease;
 }
-/* In the library grid a picture shows at once: a fade on each of a screen of posters animates
-   their opacity, which gives each one a compositing layer for its duration */
+/* In the library grid a picture shows at once: a fade animates each picture's opacity, and the
+   browser gives every fading picture (and what overlaps it) a layer of its own until it ends:
+   29-31 layers mid-fling instead of 8 (B152 round 12) */
 .jf-vgrid img.jf-thumb-img {
   transition: none;
 }
+
 
 .jf-poster, .jf-poster-backdrop {
   background: linear-gradient(135deg, #151a23 0%, #1e2430 100%);

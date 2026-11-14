@@ -1426,7 +1426,7 @@ function itemCard(item, options = {}) {
 
             <!-- Top Badges -->
             <div class="absolute top-2 left-2 right-2 flex items-center justify-between pointer-events-none z-10">
-                ${fav ? `<span class="inline-flex text-rose-500 bg-black/70 p-1 rounded-full text-xs leading-none">${icon('Heart', { size: 12, class: 'fill-current' })}</span>` : '<span></span>'}
+                ${fav ? `<span class="inline-flex text-rose-500 bg-black/60 p-1 rounded-full text-xs leading-none">${icon('Heart', { size: 12, class: 'fill-current' })}</span>` : '<span></span>'}
                 ${rating ? `<span class="jf-badge jf-badge-rating inline-flex items-center gap-0.5 text-[10px] !py-0.5 !px-1.5 shadow-md">${icon('Star', { size: 10, class: 'fill-current' })} ${rating.toFixed(1)}</span>` : ''}
             </div>
 
