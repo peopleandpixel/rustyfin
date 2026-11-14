@@ -67,12 +67,24 @@ impl TaskScheduler {
     }
 
     /// Create a scheduler with a shared HTTP client (connection pool reuse).
+    /// It gets its own empty plugin manager; use `with_plugin_manager` to share the server's.
     pub fn with_http_client(
         db: SqlitePool,
         data_dir: Arc<PathBuf>,
         http_client: reqwest::Client,
     ) -> Self {
         let plugin_manager = PluginManager::new(&data_dir);
+        Self::with_plugin_manager(db, data_dir, http_client, plugin_manager)
+    }
+
+    /// Create a scheduler that uses the given plugin manager, so scheduled scans reach the
+    /// metadata providers registered on it (B135).
+    pub fn with_plugin_manager(
+        db: SqlitePool,
+        data_dir: Arc<PathBuf>,
+        http_client: reqwest::Client,
+        plugin_manager: PluginManager,
+    ) -> Self {
         let mut tasks = HashMap::new();
 
         // Library Scan

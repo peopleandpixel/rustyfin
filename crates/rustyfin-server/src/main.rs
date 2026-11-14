@@ -187,10 +187,18 @@ async fn main() {
         .build()
         .expect("Failed to build HTTP client");
 
-    let task_scheduler = rustyfin_core::scheduler::TaskScheduler::with_http_client(
+    let plugin_manager = rustyfin_core::plugin_manager::PluginManager::new(&data_dir_arc);
+    plugin_manager.load_all().await;
+
+    // Register built-in plugins with database-backed configuration
+    let plugin_manager_with_db = plugin_manager.with_database(pool.clone());
+
+    // The scheduler shares the DB-backed manager so scheduled scans reach the providers (B135)
+    let task_scheduler = rustyfin_core::scheduler::TaskScheduler::with_plugin_manager(
         pool.clone(),
         data_dir_arc.clone(),
         http_client.clone(),
+        plugin_manager_with_db.clone(),
     );
     task_scheduler
         .changes()
@@ -202,12 +210,6 @@ async fn main() {
         .set_poll_interval(std::time::Duration::from_secs(u64::from(
             config.library_monitor_poll_interval.max(1),
         )));
-
-    let plugin_manager = rustyfin_core::plugin_manager::PluginManager::new(&data_dir_arc);
-    plugin_manager.load_all().await;
-
-    // Register built-in plugins with database-backed configuration
-    let plugin_manager_with_db = plugin_manager.with_database(pool.clone());
 
     // Helper: register a built-in plugin, loading config and status from DB if available.
     // Plugins are DISABLED by default — they must be explicitly enabled via the API or by

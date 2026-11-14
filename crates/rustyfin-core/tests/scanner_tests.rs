@@ -3869,6 +3869,80 @@ async fn b17_scheduler_scan_reports_progress_until_its_probes_finish() {
     }
 }
 
+// B135: the scheduled scan identifies new items with the metadata providers of the server's plugin
+// manager, not with an empty one of its own.
+#[tokio::test]
+async fn b135_a_scheduled_scan_uses_the_given_plugin_manager() {
+    use rustyfin_model::metadata::{ExternalMetadata, MetadataImage};
+    use rustyfin_model::plugin::PluginStatus;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Mutex;
+    type Found = Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>>;
+    type Images = Pin<Box<dyn Future<Output = Vec<MetadataImage>> + Send>>;
+
+    let fx = Fixture::new().await;
+    let lib = fx.library("B135 Film", LibraryContentType::Movies).await;
+    touch(&root_of(&lib), "B135 Movie (2001)/B135 Movie (2001).mkv");
+
+    let pm = rustyfin_core::plugin_manager::PluginManager::new(&fx.dir);
+    let searched: Arc<Mutex<Vec<String>>> = Arc::default();
+    let seen = searched.clone();
+    pm.register_metadata_provider(
+        "b135".to_string(),
+        "b135".to_string(),
+        PluginStatus::Active,
+        move |_: &reqwest::Client, name: &str, _: Option<i32>| -> Found {
+            seen.lock().unwrap().push(name.to_string());
+            Box::pin(async {
+                Some(ExternalMetadata {
+                    tmdb_id: Some(135),
+                    ..Default::default()
+                })
+            })
+        },
+        |_: &reqwest::Client, _: &str| -> Found { Box::pin(async { None }) },
+        |_: &reqwest::Client, _: Option<i64>, _: Option<i64>, _| -> Images {
+            Box::pin(async { Vec::new() })
+        },
+    )
+    .await;
+    let sched = TaskScheduler::with_plugin_manager(
+        fx.pool.clone(),
+        Arc::new(fx.dir.clone()),
+        reqwest::Client::new(),
+        pm,
+    );
+    assert!(sched.start_task(TASK_LIBRARY_SCAN).await);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let item = loop {
+        let items = rustyfin_db::repo_media::get_items_by_library(&fx.pool, lib.id)
+            .await
+            .unwrap();
+        if let Some(item) = items.into_iter().find(|i| i.tmdb_id == Some(135)) {
+            break item;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the scheduled scan identified nothing within 60 s; searched {:?}",
+            searched.lock().unwrap()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert!(
+        item.path.ends_with("B135 Movie (2001).mkv"),
+        "{}",
+        item.path
+    );
+    assert_eq!(
+        searched.lock().unwrap().len(),
+        1,
+        "{:?}",
+        searched.lock().unwrap()
+    );
+}
+
 // B30: a scheduled scan tells the server, so that it can drop what it cached from before.
 #[tokio::test]
 async fn b30_f8_a_scheduled_scan_calls_back_once_it_ends() {
