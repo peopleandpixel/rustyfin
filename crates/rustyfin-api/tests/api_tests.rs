@@ -11175,8 +11175,10 @@ async fn g12_server(env_key: Option<&str>, config_key: Option<&str>) -> G12Serve
     };
     let http = reqwest::Client::builder().no_proxy().build().unwrap();
     state.tmdb = TmdbClient::new(http, settings);
-    // API keys are now managed via the plugin system, not ServerConfiguration
-    let _ = config_key;
+    // B136: the server's own install path, so the env key alone enables TMDb.
+    state.plugin_manager = state.plugin_manager.with_database(state.db.clone());
+    rustyfin_core::plugin_manager::install_tmdb_plugin(&state.plugin_manager, state.tmdb.clone())
+        .await;
 
     let username = format!("admin_{}", uuid::Uuid::new_v4().simple());
     rustyfin_auth::create_initial_user(&state.db, &username, "admin")
@@ -11190,14 +11192,21 @@ async fn g12_server(env_key: Option<&str>, config_key: Option<&str>) -> G12Serve
         .await
         .unwrap();
 
-    G12Server {
+    let server = G12Server {
         origin,
         hits,
         token,
         db: state.db.clone(),
         data_dir: state.data_dir.clone(),
         app: app(state),
+    };
+    // B136: a key saved in the plugin's configuration takes effect without a restart.
+    if let Some(key) = config_key {
+        server
+            .configure_tmdb(serde_json::json!({ "api_key": key }))
+            .await;
     }
+    server
 }
 
 impl G12Server {
@@ -11246,6 +11255,18 @@ impl G12Server {
         .await
         .unwrap();
         item_id
+    }
+
+    /// `POST /Plugins/tmdb/Configuration` with `config`.
+    async fn configure_tmdb(&self, config: serde_json::Value) {
+        let (status, body) = self
+            .send(
+                "POST",
+                "/Plugins/tmdb/Configuration",
+                Some(config.to_string()),
+            )
+            .await;
+        assert!(status.is_success(), "{status}: {body}");
     }
 
     /// `POST /Items/{id}/Refresh`, which must answer 200 whatever TMDb does. Returns the
@@ -11318,7 +11339,7 @@ async fn test_g12_configuration_round_trip_never_persists_env_key() {
 }
 
 #[tokio::test]
-#[ignore = "B128: TMDb lookups moved to plugin-tmdb (2d37da7); the test server registers no TMDb provider, so a refresh finds no TmdbId"]
+
 async fn test_g12_item_refresh_uses_env_key_and_base_urls() {
     let server = g12_server(Some(G12_ENV_KEY), None).await;
     let item_id = server.insert_movie().await;
@@ -11367,7 +11388,7 @@ async fn test_g12_item_refresh_uses_env_key_and_base_urls() {
 }
 
 #[tokio::test]
-#[ignore = "B128: TMDb lookups moved to plugin-tmdb (2d37da7); the test server registers no TMDb provider, so a refresh finds no TmdbId"]
+
 async fn test_g12_env_tmdb_key_wins_over_config_key() {
     let server = g12_server(Some(G12_ENV_KEY), Some(G12_CONFIG_KEY)).await;
     let item_id = server.insert_movie().await;
@@ -11377,13 +11398,26 @@ async fn test_g12_env_tmdb_key_wins_over_config_key() {
 }
 
 #[tokio::test]
-#[ignore = "B128: TMDb lookups moved to plugin-tmdb (2d37da7); the test server registers no TMDb provider, so a refresh finds no TmdbId"]
+
 async fn test_g12_item_refresh_still_uses_config_key() {
     let server = g12_server(None, Some(G12_CONFIG_KEY)).await;
     let item_id = server.insert_movie().await;
 
     assert_eq!(server.refresh(item_id).await, Some(9001));
     server.assert_all_signed_with(G12_CONFIG_KEY);
+}
+
+// B136: a saved "Disabled" status keeps TMDb off, even with a key in the environment.
+#[tokio::test]
+async fn b136_saved_disabled_status_keeps_tmdb_off() {
+    let server = g12_server(Some(G12_ENV_KEY), None).await;
+    server
+        .configure_tmdb(serde_json::json!({ "status": "Disabled" }))
+        .await;
+    let item_id = server.insert_movie().await;
+
+    assert_eq!(server.refresh(item_id).await, None);
+    assert!(server.hits().is_empty(), "TMDb was called while disabled");
 }
 
 #[tokio::test]

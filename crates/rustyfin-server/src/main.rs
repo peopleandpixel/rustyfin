@@ -22,7 +22,6 @@ use rustyfin_api::middleware::{
 use rustyfin_api::routes::build_router;
 use rustyfin_api::state::AppState;
 use rustyfin_core::image_proxy::{IMAGE_CACHE_MAX_BYTES, sweep_image_cache};
-use rustyfin_model::plugin::Plugin;
 use rustyfin_model::server_info::ServerConfiguration;
 
 #[tokio::main]
@@ -213,7 +212,8 @@ async fn main() {
 
     // Helper: register a built-in plugin, loading config and status from DB if available.
     // Plugins are DISABLED by default — they must be explicitly enabled via the API or by
-    // storing an Active status in the database. This ensures fast scans without external API calls.
+    // storing an Active status in the database. TMDb is the exception: a key (env or saved)
+    // enables it (see install_tmdb_plugin). This ensures fast scans without external API calls.
     async fn register_builtin_plugin<P: rustyfin_model::plugin::Plugin>(
         plugin: &P,
         pm: &rustyfin_core::plugin_manager::PluginManager,
@@ -251,24 +251,8 @@ async fn main() {
     // One TMDb client (cache, rate limiter, retries) shared by the provider and AppState.
     let tmdb = rustyfin_core::tmdb_client::TmdbClient::new(http_client.clone(), tmdb_settings);
 
-    // Register TMDb plugin (disabled by default)
-    {
-        let tmdb_plugin = plugin_tmdb::TmdbPlugin::default();
-        // Check env var for API key (configuration only; plugin is still disabled by default)
-        if let Ok(key) = std::env::var("RUSTYFIN_TMDB_API_KEY")
-            && !key.trim().is_empty()
-        {
-            let _ = tmdb_plugin.set_configuration(serde_json::json!({ "api_key": key }));
-        }
-        register_builtin_plugin(&tmdb_plugin, &plugin_manager_with_db).await;
-        // Register as metadata provider — will be active only if the plugin is enabled
-        if let Err(e) =
-            plugin_tmdb::register_tmdb_provider(&tmdb_plugin, tmdb.clone(), &plugin_manager_with_db)
-                .await
-        {
-            tracing::debug!("TMDb plugin not registered as provider (no API key): {}", e);
-        }
-    }
+    // Register TMDb plugin: enabled by a key (env or saved), also when one is saved later
+    rustyfin_core::plugin_manager::install_tmdb_plugin(&plugin_manager_with_db, tmdb.clone()).await;
 
     // Register OMDb plugin (disabled by default)
     {

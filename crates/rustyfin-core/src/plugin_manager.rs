@@ -192,6 +192,10 @@ type SendNotificationFn = Arc<
         + Sync,
 >;
 
+/// Runs after `set_configuration` saves a built-in plugin's config. `Some(status)` updates the
+/// plugin's in-memory status (the DB is not written); `None` leaves it alone.
+pub type ConfigHook = Arc<dyn Fn(&serde_json::Value) -> Option<PluginStatus> + Send + Sync>;
+
 /// A built-in plugin registered via registrar traits (no dynamic library).
 #[derive(Clone)]
 pub struct BuiltinPluginInfo {
@@ -235,6 +239,66 @@ pub struct NotificationProviderHandle {
     send_notification: SendNotificationFn,
 }
 
+/// Install the built-in TMDb plugin. It is enabled by a key (`RUSTYFIN_TMDB_API_KEY` or a saved
+/// `api_key`) unless a saved status says otherwise. A key saved later through the plugin's
+/// configuration enables it at once, without a restart. The env key is never written to the
+/// plugin config or the DB.
+pub async fn install_tmdb_plugin(pm: &PluginManager, client: crate::tmdb_client::TmdbClient) {
+    let plugin = Arc::new(plugin_tmdb::TmdbPlugin::default());
+    let saved = pm.load_plugin_config_from_db("tmdb").await;
+    if let Some(config) = &saved
+        && let Err(e) = Plugin::set_configuration(plugin.as_ref(), config.clone())
+    {
+        tracing::warn!("failed to apply saved config for tmdb: {}", e);
+    }
+
+    let env_key = client.has_env_key();
+    let status = plugin_tmdb::status_for(saved.as_ref(), env_key);
+    let saved_status = saved
+        .as_ref()
+        .and_then(|c| c.get("status"))
+        .and_then(|v| v.as_str());
+    let saved_key = saved
+        .as_ref()
+        .and_then(|c| c.get("api_key"))
+        .and_then(|v| v.as_str())
+        .is_some_and(|k| !k.trim().is_empty());
+    let reason = match (saved_status, env_key, saved_key) {
+        (Some(s), _, _) => format!("saved status {s}"),
+        (None, true, _) => "RUSTYFIN_TMDB_API_KEY is set".to_string(),
+        (None, false, true) => "saved API key".to_string(),
+        (None, false, false) => "no API key (set RUSTYFIN_TMDB_API_KEY or save one)".to_string(),
+    };
+    tracing::info!("TMDb plugin status {:?}: {}", status, reason);
+
+    pm.register_builtin_plugin(BuiltinPluginInfo {
+        name: plugin.name().to_string(),
+        version: plugin.version().to_string(),
+        id: plugin.id().to_string(),
+        description: plugin.description().to_string(),
+        plugin_type: plugin.plugin_type(),
+        status,
+    })
+    .await;
+
+    // Always registers; the provider reads the plugin's current key on each call.
+    if let Err(e) = plugin_tmdb::register_tmdb_provider(&plugin, client, pm).await {
+        tracing::debug!("TMDb plugin not registered as provider: {}", e);
+    }
+
+    let hook_plugin = plugin.clone();
+    pm.register_config_hook(
+        "tmdb",
+        Arc::new(move |config: &serde_json::Value| {
+            if let Err(e) = Plugin::set_configuration(hook_plugin.as_ref(), config.clone()) {
+                tracing::warn!("failed to apply tmdb config: {}", e);
+            }
+            Some(plugin_tmdb::status_for(Some(config), env_key))
+        }),
+    )
+    .await;
+}
+
 /// Manages loading, unloading, and querying plugins.
 #[derive(Clone)]
 pub struct PluginManager {
@@ -254,6 +318,8 @@ struct PluginManagerInner {
     subtitle_providers: Vec<SubtitleProviderHandle>,
     /// Registered notification providers from plugins
     notification_providers: Vec<NotificationProviderHandle>,
+    /// Per-plugin hooks that run after `set_configuration`
+    config_hooks: HashMap<String, ConfigHook>,
 }
 
 impl PluginManager {
@@ -269,6 +335,7 @@ impl PluginManager {
                 metadata_providers: Vec::new(),
                 subtitle_providers: Vec::new(),
                 notification_providers: Vec::new(),
+                config_hooks: HashMap::new(),
             })),
             db: None,
         }
@@ -407,6 +474,12 @@ impl PluginManager {
         let mut inner = self.inner.write().await;
         inner.builtin_plugins.insert(info.id.clone(), info);
         tracing::info!("registered built-in plugin: {}", name);
+    }
+
+    /// Register a hook that runs after `set_configuration` saves this plugin's config.
+    pub async fn register_config_hook(&self, plugin_id: &str, hook: ConfigHook) {
+        let mut inner = self.inner.write().await;
+        inner.config_hooks.insert(plugin_id.to_string(), hook);
     }
 
     /// Register a metadata provider plugin.
@@ -760,7 +833,40 @@ impl PluginManager {
             tracing::warn!("failed to persist plugin config to DB: {}", e);
         }
 
+        // Let the plugin's hook set its status from the new config (e.g. a TMDb key enables it).
+        // The lock is released before the hook runs.
+        let hook = self.inner.read().await.config_hooks.get(plugin_id).cloned();
+        if let Some(hook) = hook
+            && let Some(status) = hook(&config)
+        {
+            self.set_status_in_memory(plugin_id, status).await;
+        }
+
         Ok(())
+    }
+
+    /// Set a built-in plugin's status, and its provider handles' status, in memory only.
+    async fn set_status_in_memory(&self, plugin_id: &str, status: PluginStatus) {
+        let mut inner = self.inner.write().await;
+        if let Some(info) = inner.builtin_plugins.get_mut(plugin_id) {
+            info.status = status.clone();
+        }
+        // Update all provider handles for this plugin
+        for handle in &mut inner.metadata_providers {
+            if handle.plugin_id == plugin_id {
+                handle.status = status.clone();
+            }
+        }
+        for handle in &mut inner.subtitle_providers {
+            if handle.plugin_id == plugin_id {
+                handle.status = status.clone();
+            }
+        }
+        for handle in &mut inner.notification_providers {
+            if handle.plugin_id == plugin_id {
+                handle.status = status.clone();
+            }
+        }
     }
 
     // ── Plugin type queries ──
@@ -818,29 +924,8 @@ impl PluginManager {
         plugin_id: &str,
         status: PluginStatus,
     ) -> Result<(), String> {
-        // Update built-in plugin info
-        {
-            let mut inner = self.inner.write().await;
-            if let Some(info) = inner.builtin_plugins.get_mut(plugin_id) {
-                info.status = status.clone();
-            }
-            // Update all provider handles for this plugin
-            for handle in &mut inner.metadata_providers {
-                if handle.plugin_id == plugin_id {
-                    handle.status = status.clone();
-                }
-            }
-            for handle in &mut inner.subtitle_providers {
-                if handle.plugin_id == plugin_id {
-                    handle.status = status.clone();
-                }
-            }
-            for handle in &mut inner.notification_providers {
-                if handle.plugin_id == plugin_id {
-                    handle.status = status.clone();
-                }
-            }
-        }
+        // Update built-in plugin info and provider handles
+        self.set_status_in_memory(plugin_id, status.clone()).await;
 
         // Persist to database
         if let Some(_db) = &self.db {

@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use crate::tmdb_client::{TmdbApi, TmdbClient};
 use rustyfin_model::media::MediaType;
 use rustyfin_model::metadata::{ExternalMetadata, MetadataImage};
-use rustyfin_model::plugin::{Plugin, PluginType};
+use rustyfin_model::plugin::{Plugin, PluginStatus, PluginType};
 use serde::Deserialize;
 
 /// Trait for types that can register metadata providers.
@@ -103,6 +103,34 @@ impl Plugin for TmdbPlugin {
 
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
+    }
+}
+
+/// Works out the TMDb plugin's status from its saved config and whether `RUSTYFIN_TMDB_API_KEY`
+/// is set.
+///
+/// A saved `"status"` string wins: "Active", "Disabled" or "Malfunctioned" map to that status and
+/// any other string is Disabled. Without one, the plugin is Active when `env_key` is set or the
+/// config's `api_key` is a string that is non-blank after trimming, and Disabled otherwise.
+pub fn status_for(config: Option<&serde_json::Value>, env_key: bool) -> PluginStatus {
+    if let Some(status) = config
+        .and_then(|c| c.get("status"))
+        .and_then(|v| v.as_str())
+    {
+        return match status {
+            "Active" => PluginStatus::Active,
+            "Malfunctioned" => PluginStatus::Malfunctioned,
+            _ => PluginStatus::Disabled,
+        };
+    }
+    let saved_key = config
+        .and_then(|c| c.get("api_key"))
+        .and_then(|v| v.as_str())
+        .is_some_and(|k| !k.trim().is_empty());
+    if env_key || saved_key {
+        PluginStatus::Active
+    } else {
+        PluginStatus::Disabled
     }
 }
 
@@ -874,4 +902,51 @@ pub async fn get_similar(
         result.truncate(20);
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustyfin_model::plugin::PluginStatus;
+    use serde_json::json;
+
+    // B136: a key turns TMDb on unless a saved status says otherwise.
+    #[test]
+    fn b136_status_for_a_key_without_a_saved_status_is_active() {
+        assert_eq!(status_for(None, true), PluginStatus::Active);
+        assert_eq!(
+            status_for(Some(&json!({ "api_key": "k" })), false),
+            PluginStatus::Active
+        );
+        assert_eq!(
+            status_for(Some(&json!({ "api_key": "k" })), true),
+            PluginStatus::Active
+        );
+    }
+
+    #[test]
+    fn b136_status_for_no_key_is_disabled() {
+        assert_eq!(status_for(None, false), PluginStatus::Disabled);
+        for config in [
+            json!({}),
+            json!({ "api_key": null }),
+            json!({ "api_key": "   " }),
+        ] {
+            assert_eq!(
+                status_for(Some(&config), false),
+                PluginStatus::Disabled,
+                "{config}"
+            );
+        }
+    }
+
+    #[test]
+    fn b136_status_for_a_saved_status_wins() {
+        let disabled = json!({ "api_key": "k", "status": "Disabled" });
+        assert_eq!(status_for(Some(&disabled), true), PluginStatus::Disabled);
+        let active = json!({ "status": "Active" });
+        assert_eq!(status_for(Some(&active), false), PluginStatus::Active);
+        let broken = json!({ "status": "Malfunctioned" });
+        assert_eq!(status_for(Some(&broken), true), PluginStatus::Malfunctioned);
+    }
 }
