@@ -17712,6 +17712,11 @@ fn b142_merge_patch() {
     assert_eq!(stored, json!({ "b": 1 }));
 }
 
+#[test]
+fn b142_plugin_config_patch() {
+    b124_node_test("b142_plugin_config_patch.mjs");
+}
+
 /// The `<input …>` tag holding `id="{id}"` in `source`.
 fn b142_input_tag<'a>(source: &'a str, id: &str) -> &'a str {
     let at = source
@@ -17794,6 +17799,24 @@ fn b142_plugin_modal_masks_the_key() {
     );
     let save = b124_function(&app_js, "async function savePluginConfig(");
     assert!(save.contains("providerKeyField("), "savePluginConfig");
+    // F2: fields removed in the JSON editor are sent as null, and the dialog says so.
+    assert!(save.contains("pluginConfigPatch("), "savePluginConfig");
+    assert!(html.contains("data-i18n=\"admin.plugin_config_hint\""));
+    // F3: the provider dialog is for TMDb, OMDb and Fanart.tv only, and reads api_key_set (F6).
+    let open = b124_function(&app_js, "async function openPluginConfig(");
+    assert!(open.contains("PROVIDER_PLUGIN_NAMES"), "openPluginConfig");
+    assert!(
+        !open.contains("'api_key')"),
+        "openPluginConfig keys off an api_key field"
+    );
+    assert!(
+        open.contains("api_key_set"),
+        "openPluginConfig reads api_key_set"
+    );
+    assert!(
+        !open.contains("config.api_key)"),
+        "openPluginConfig reads the key"
+    );
 }
 
 #[tokio::test]

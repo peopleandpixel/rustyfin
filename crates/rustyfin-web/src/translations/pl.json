@@ -282,6 +282,7 @@
         "plugin_cancel": "Anuluj",
         "plugin_config_saved": "Konfiguracja zapisana",
         "plugin_config_failed": "Nie udało się zapisać konfiguracji: {{message}}",
+        "plugin_config_hint": "Pola usunięte z konfiguracji zostaną usunięte po zapisaniu.",
         "plugin_priority_saved": "Priorytet zapisany",
         "plugin_priority_failed": "Nie udało się zapisać priorytetu: {{message}}",
         "plugin_priority_label": "Priorytet (niższy = wyższy priorytet)",

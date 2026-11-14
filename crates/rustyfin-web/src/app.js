@@ -5263,6 +5263,21 @@ async function setLogLevel(level) {
     }
 }
 
+// The JSON editor saves a merge patch: a top-level field the user deleted is sent as null,
+// and PluginId (added by GET) is never sent back.
+function pluginConfigPatch(original, edited) {
+    const isObject = v => v !== null && typeof v === 'object' && !Array.isArray(v);
+    if (!isObject(edited)) return edited;
+    const patch = { ...edited };
+    delete patch.PluginId;
+    if (isObject(original)) {
+        for (const key of Object.keys(original)) {
+            if (key !== 'PluginId' && !Object.hasOwn(edited, key)) patch[key] = null;
+        }
+    }
+    return patch;
+}
+
 // --- Plugin Configuration Modal ---
 let currentPluginConfigId = null;
 let currentPluginConfigOriginal = null;
@@ -5282,10 +5297,10 @@ async function openPluginConfig(pluginId) {
     } catch {
         config = {};
     }
-    currentPluginConfigProvider = Object.hasOwn(PROVIDER_PLUGIN_NAMES, pluginId) || Object.hasOwn(config, 'api_key');
+    currentPluginConfigProvider = Object.hasOwn(PROVIDER_PLUGIN_NAMES, pluginId);
     if (currentPluginConfigProvider) {
         // The stored key never reaches the DOM: only whether one is saved, and the status.
-        const keySet = Boolean(config.api_key);
+        const keySet = config.api_key_set === true;
         currentPluginConfigOriginal = '{}';
         $('plugin-config-textarea').value = '{}';
         $('plugin-config-key').placeholder = t(keySet ? 'settings.key_saved' : 'common.optional');
@@ -5343,7 +5358,7 @@ async function savePluginConfig() {
         else if (key !== undefined) parsed.api_key = key;
     } else {
         try {
-            parsed = JSON.parse(textarea.value);
+            parsed = pluginConfigPatch(JSON.parse(currentPluginConfigOriginal || '{}'), JSON.parse(textarea.value));
         } catch (e) {
             err.textContent = t('admin.plugin_config_failed', { message: 'Invalid JSON' });
             show(err);

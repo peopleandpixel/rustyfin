@@ -360,6 +360,7 @@
         "plugin_cancel": "Abbrechen",
         "plugin_config_saved": "Konfiguration gespeichert",
         "plugin_config_failed": "Konfiguration konnte nicht gespeichert werden: {{message}}",
+        "plugin_config_hint": "Gelöschte Felder werden beim Speichern entfernt.",
         "plugin_priority_saved": "Priorität gespeichert",
         "plugin_priority_failed": "Priorität konnte nicht gespeichert werden: {{message}}",
         "plugin_priority_label": "Priorität (niedriger = höhere Priorität)",

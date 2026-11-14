@@ -282,6 +282,7 @@
         "plugin_cancel": "Отмена",
         "plugin_config_saved": "Конфигурация сохранена",
         "plugin_config_failed": "Не удалось сохранить конфигурацию: {{message}}",
+        "plugin_config_hint": "Удалённые поля будут удалены при сохранении.",
         "plugin_priority_saved": "Приоритет сохранён",
         "plugin_priority_failed": "Не удалось сохранить приоритет: {{message}}",
         "plugin_priority_label": "Приоритет (меньше = выше приоритет)",

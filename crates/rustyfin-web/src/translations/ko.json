@@ -274,6 +274,7 @@
         "plugin_cancel": "취소",
         "plugin_config_saved": "설정이 저장되었습니다",
         "plugin_config_failed": "설정을 저장할 수 없습니다: {{message}}",
+        "plugin_config_hint": "삭제한 필드는 저장할 때 제거됩니다.",
         "plugin_priority_saved": "우선순위가 저장되었습니다",
         "plugin_priority_failed": "우선순위를 저장할 수 없습니다: {{message}}",
         "plugin_priority_label": "우선순위(낮을수록 우선순위가 높음)",

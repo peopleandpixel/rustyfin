@@ -274,6 +274,7 @@
         "plugin_cancel": "キャンセル",
         "plugin_config_saved": "設定が保存されました",
         "plugin_config_failed": "設定を保存できませんでした: {{message}}",
+        "plugin_config_hint": "削除した項目は保存時に削除されます。",
         "plugin_priority_saved": "優先度が保存されました",
         "plugin_priority_failed": "優先度を保存できませんでした: {{message}}",
         "plugin_priority_label": "優先度（低い値ほど優先度高い）",

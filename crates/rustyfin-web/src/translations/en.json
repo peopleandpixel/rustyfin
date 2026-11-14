@@ -360,6 +360,7 @@
         "plugin_cancel": "Cancel",
         "plugin_config_saved": "Configuration saved",
         "plugin_config_failed": "Could not save configuration: {{message}}",
+        "plugin_config_hint": "Fields you delete are removed when you save.",
         "plugin_priority_saved": "Priority saved",
         "plugin_priority_failed": "Could not save priority: {{message}}",
         "plugin_priority_label": "Priority (lower = higher priority)",

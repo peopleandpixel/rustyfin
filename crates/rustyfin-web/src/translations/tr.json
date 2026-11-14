@@ -274,6 +274,7 @@
         "plugin_cancel": "İptal",
         "plugin_config_saved": "Yapılandırma kaydedildi",
         "plugin_config_failed": "Yapılandırma kaydedilemedi: {{message}}",
+        "plugin_config_hint": "Sildiğiniz alanlar kaydettiğinizde kaldırılır.",
         "plugin_priority_saved": "Öncelik kaydedildi",
         "plugin_priority_failed": "Öncelik kaydedilemedi: {{message}}",
         "plugin_priority_label": "Öncelik (düşük = yüksek öncelik)",

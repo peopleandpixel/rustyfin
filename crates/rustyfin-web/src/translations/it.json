@@ -274,6 +274,7 @@
         "plugin_cancel": "Annulla",
         "plugin_config_saved": "Configurazione salvata",
         "plugin_config_failed": "Impossibile salvare la configurazione: {{message}}",
+        "plugin_config_hint": "I campi eliminati vengono rimossi al salvataggio.",
         "plugin_priority_saved": "Priorità salvata",
         "plugin_priority_failed": "Impossibile salvare la priorità: {{message}}",
         "plugin_priority_label": "Priorità (minore = priorità più alta)",

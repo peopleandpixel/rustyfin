@@ -274,6 +274,7 @@
         "plugin_cancel": "取消",
         "plugin_config_saved": "配置已保存",
         "plugin_config_failed": "无法保存配置: {{message}}",
+        "plugin_config_hint": "删除的字段在保存时会被移除。",
         "plugin_priority_saved": "优先级已保存",
         "plugin_priority_failed": "无法保存优先级: {{message}}",
         "plugin_priority_label": "优先级（数值越低优先级越高）",
