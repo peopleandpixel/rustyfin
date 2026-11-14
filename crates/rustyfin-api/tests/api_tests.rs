@@ -17752,6 +17752,12 @@ fn b144_refresh_metadata() {
     b124_node_test("b144_refresh_metadata.mjs");
 }
 
+// B145: Lucide icons instead of colour emoji and hand-copied SVG in the web client
+#[test]
+fn b145_icons() {
+    b124_node_test("b145_icons.mjs");
+}
+
 #[test]
 fn b142_settings_key_inputs_hide_keys() {
     let app_js = b124_web_source("app.js");
