@@ -123,15 +123,59 @@ function blurhashTint(hash) {
     return `rgb(${c.map((v, i) => Math.round(v + (SKELETON_RGB[i] - v) * t)).join(', ')})`;
 }
 
-// Paints each canvas[data-blurhash] under root (root included) once
+
+// Each .jf-blurhash[data-blurhash] under root (root included) gets its BlurHash as a background
+// image, once. Not a <canvas>: browsers composite every canvas in a layer of its own, and
+// everything drawn above one then gets a layer too (two per card), which a fling can't draw in
+// time. A tiny bitmap stretched by the browser looks the same and is painted with the card.
 function paintBlurhashes(root) {
-    const canvases = root.matches?.('canvas[data-blurhash]') ? [root] : root.querySelectorAll?.('canvas[data-blurhash]') || [];
-    for (const canvas of canvases) {
-        const px = decodeBlurhash(canvas.dataset.blurhash, canvas.width, canvas.height);
-        delete canvas.dataset.blurhash;
-        if (px) canvas.getContext('2d').putImageData(new ImageData(px, canvas.width, canvas.height), 0, 0);
-        else canvas.remove();
+    const boxes = root.matches?.('.jf-blurhash[data-blurhash]') ? [root] : root.querySelectorAll?.('.jf-blurhash[data-blurhash]') || [];
+    for (const box of boxes) {
+        const w = Number(box.dataset.w) || 20;
+        const h = Number(box.dataset.h) || 30;
+        const url = blurhashImageUrl(box.dataset.blurhash, w, h);
+        delete box.dataset.blurhash;
+        if (url) box.style.backgroundImage = `url(${url})`;
+        else box.remove();
     }
+}
+
+// A BlurHash as a w x h bitmap's data URL (an uncompressed 24-bit BMP, built from the decoded
+// pixels: no canvas, so no read-back a browser's fingerprinting protection could alter), or null
+// for a malformed hash. Kept by hash and size, as a grid shows the same pictures again.
+const blurhashUrls = new Map();
+function blurhashImageUrl(hash, w, h) {
+    const key = `${hash}|${w}|${h}`;
+    if (blurhashUrls.has(key)) return blurhashUrls.get(key);
+    const px = decodeBlurhash(hash, w, h);
+    if (!px) return null;
+    const row = (w * 3 + 3) & ~3; // rows are padded to 4 bytes
+    const size = 54 + row * h;
+    const bmp = new Uint8Array(size);
+    const view = new DataView(bmp.buffer);
+    bmp[0] = 0x42; bmp[1] = 0x4d; // "BM"
+    view.setUint32(2, size, true);
+    view.setUint32(10, 54, true); // pixel data offset
+    view.setUint32(14, 40, true); // BITMAPINFOHEADER
+    view.setInt32(18, w, true);
+    view.setInt32(22, h, true); // positive: rows from the bottom up
+    view.setUint16(26, 1, true);
+    view.setUint16(28, 24, true);
+    for (let y = 0; y < h; y++) {
+        const src = (h - 1 - y) * w * 4;
+        const dst = 54 + y * row;
+        for (let x = 0; x < w; x++) {
+            bmp[dst + x * 3] = px[src + x * 4 + 2];
+            bmp[dst + x * 3 + 1] = px[src + x * 4 + 1];
+            bmp[dst + x * 3 + 2] = px[src + x * 4];
+        }
+    }
+    let binary = '';
+    for (let i = 0; i < size; i++) binary += String.fromCharCode(bmp[i]);
+    const url = `data:image/bmp;base64,${btoa(binary)}`;
+    if (blurhashUrls.size >= 5000) blurhashUrls.delete(blurhashUrls.keys().next().value);
+    blurhashUrls.set(key, url);
+    return url;
 }
 
 // --- Poster loader: card pictures (img[data-src]) start here, not by the browser's lazy loading ---
@@ -1341,8 +1385,8 @@ function itemCard(item, options = {}) {
     const picture = cardImage(item, isBackdrop);
     // The picture's BlurHash, painted under it until it loads (Jellyfin's ImageBlurHashes shape)
     const blurhash = picture ? item.ImageBlurHashes?.[picture.type]?.[picture.tag] : null;
-    // Under the BlurHash canvas: its average colour (as the `background` shorthand, which drops the
-    // poster box's dark gradient), so the box is never dark if the canvas is not
+    // Under the BlurHash: its average colour (as the `background` shorthand, which drops the poster
+    // box's dark gradient), so the box is never dark before the BlurHash is painted
     const tint = blurhash ? blurhashTint(blurhash) : null;
     // Episode landscape cards: series name on the title line, "S1:E2 · name" on the second line
     const hasNumbers = item.ParentIndexNumber != null && item.IndexNumber != null;
@@ -1372,7 +1416,7 @@ function itemCard(item, options = {}) {
         <div class="${isBackdrop ? 'jf-poster-backdrop' : 'jf-poster'}"${tint ? ` style="background:${tint}"` : ''}>
             ${picture ? `
             ${blurhash
-                ? `<canvas class="jf-blurhash" width="${isBackdrop ? 32 : 20}" height="${isBackdrop ? 18 : 30}" data-blurhash="${escapeHtml(blurhash)}" aria-hidden="true"></canvas>`
+                ? `<div class="jf-blurhash" data-w="${isBackdrop ? 32 : 20}" data-h="${isBackdrop ? 18 : 30}" data-blurhash="${escapeHtml(blurhash)}" aria-hidden="true"></div>`
                 : '<div class="jf-poster-skeleton"></div>'}
             <img alt="${escapeHtml(cardTitle)}" decoding="async" class="jf-thumb-img absolute inset-0 w-full h-full object-cover z-[1] opacity-0 transition-opacity duration-200${picture.contain ? ' jf-img-contain' : ''}"
                  data-img-id="${escapeHtml(picture.id)}" data-img-type="${escapeHtml(picture.type)}" data-img-tag="${escapeHtml(picture.tag)}" onload="posterLoaded(this)" onerror="posterFailed(this)">` : ''}
@@ -1382,7 +1426,7 @@ function itemCard(item, options = {}) {
 
             <!-- Top Badges -->
             <div class="absolute top-2 left-2 right-2 flex items-center justify-between pointer-events-none z-10">
-                ${fav ? `<span class="inline-flex text-rose-500 bg-black/60 backdrop-blur-md p-1 rounded-full text-xs leading-none">${icon('Heart', { size: 12, class: 'fill-current' })}</span>` : '<span></span>'}
+                ${fav ? `<span class="inline-flex text-rose-500 bg-black/70 p-1 rounded-full text-xs leading-none">${icon('Heart', { size: 12, class: 'fill-current' })}</span>` : '<span></span>'}
                 ${rating ? `<span class="jf-badge jf-badge-rating inline-flex items-center gap-0.5 text-[10px] !py-0.5 !px-1.5 shadow-md">${icon('Star', { size: 10, class: 'fill-current' })} ${rating.toFixed(1)}</span>` : ''}
             </div>
 
@@ -2069,7 +2113,7 @@ async function loadLibraryIndex(gen) {
         // then, and a whole flying band of cards at once would be a long task mid-fling.
         if (!libraryFlyingNow) libraryRefreshCells(cell => cell.hasAttribute('data-i')
             || (hadIndex && cell.firstElementChild?.dataset.lite && !cell.firstElementChild._posterDone
-                && !cell.querySelector('canvas.jf-blurhash') && libraryHasHash(fresh[cell.dataset.pos])));
+                && !cell.querySelector('.jf-blurhash') && libraryHasHash(fresh[cell.dataset.pos])));
         const pictured = fresh.filter(item => item.ImageTags?.Primary);
         const missing = pictured.filter(item => !libraryHasHash(item)).length;
         // Asked again only while the server is still adding BlurHashes: pictures it can't hash
@@ -2111,8 +2155,8 @@ function upgradeCard(card, item) {
     const freshImg = full.querySelector('img.jf-thumb-img');
     if (oldImg && freshImg) {
         freshImg.replaceWith(oldImg);
-        const oldHash = card.querySelector('canvas.jf-blurhash');
-        const freshHash = full.querySelector('canvas.jf-blurhash');
+        const oldHash = card.querySelector('.jf-blurhash');
+        const freshHash = full.querySelector('.jf-blurhash');
         if (oldHash && freshHash) freshHash.replaceWith(oldHash);
         // A picture already shown keeps its skeleton hidden
         if (oldImg.style.opacity) full.querySelectorAll('.jf-poster-skeleton').forEach(el => { el.style.visibility = 'hidden'; });
@@ -2214,27 +2258,13 @@ function libraryMeasure(grid, total) {
     sample.style.cssText = `visibility:hidden;width:${Math.max(0, (width - (cols - 1) * gap) / cols)}px`;
     grid.appendChild(sample);
     const cellHeight = sample.offsetHeight;
-    const box = sample.querySelector('.jf-poster');
-    // From the card's outer top (its border included) to the poster box's bottom
-    const posterHeight = box ? box.getBoundingClientRect().bottom - sample.getBoundingClientRect().top : cellHeight;
     sample.remove();
-    return { ...libraryLayout(width, cols, gap, cellHeight, total), posterHeight };
+    return libraryLayout(width, cols, gap, cellHeight, total);
 }
 
-// Gives the grid the list's height, and its skeleton background (input.css .jf-vgrid::before)
-// the layout's numbers: a card at every position, the last row only as wide as its items
+// Gives the grid the list's height (`total` items in the layout `v`)
 function librarySize(v, total) {
-    const s = v.grid.style;
-    s.height = `${v.height}px`;
-    const fullRows = Math.floor(total / v.cols);
-    const last = total % v.cols;
-    s.setProperty('--vg-cw', `${v.colWidth}px`);
-    s.setProperty('--vg-px', `${v.colWidth + v.gap}px`);
-    s.setProperty('--vg-ch', `${v.cellHeight}px`);
-    s.setProperty('--vg-py', `${v.pitch}px`);
-    s.setProperty('--vg-poster', `${v.posterHeight ?? v.cellHeight}px`);
-    s.setProperty('--vg-full', `${fullRows * v.pitch}px`);
-    s.setProperty('--vg-last-w', last ? `${last * (v.colWidth + v.gap) - v.gap}px` : '0px');
+    v.grid.style.height = `${v.height}px`;
 }
 
 // A new element for cell `i`: the full card, a lite card or a skeleton, placed at its row and
@@ -2716,7 +2746,9 @@ async function loadLibraryPage(gen, page) {
 // window.rfGridDiag() returns the same numbers. Off, it costs nothing past this check at start.
 function gridDiagEnabled() {
     try {
-        return new URLSearchParams(location.search).get('debug') === 'grid' || localStorage.getItem('rustyfin.gridDebug') === '1';
+        return new URLSearchParams(location.search).get('debug') === 'grid'
+            || hashRoute(location.hash.slice(1)).query.get('debug') === 'grid'
+            || localStorage.getItem('rustyfin.gridDebug') === '1';
     } catch {
         return false;
     }
@@ -2752,7 +2784,7 @@ function gridDiagCells() {
         if (cell.hasAttribute('data-i')) cells[cell.dataset.tint ? 'colour' : 'skeleton']++;
         else if (!img) cells.icon++;
         else if (img.complete && img.naturalWidth > 0 && img.style.opacity) cells.poster++;
-        else if (cell.querySelector('canvas.jf-blurhash:not([data-blurhash])')) cells.blurhash++;
+        else if (cell.querySelector('.jf-blurhash:not([data-blurhash])')) cells.blurhash++;
         else cells.shimmer++;
     }
     return cells;
@@ -2861,8 +2893,9 @@ async function gridDiagCopy(text) {
     }
 }
 
-function startGridDiag() {
-    if (!gridDiagEnabled() || $('rf-grid-diag')) return;
+// asked: true when the route asked for it (#…?debug=grid), whatever gridDiagEnabled says
+function startGridDiag(asked = false) {
+    if (!(asked || gridDiagEnabled()) || $('rf-grid-diag')) return;
     window.rfGridDiag = gridDiag;
     // Requests as numbers only: the URL is read for its path and dropped
     const kind = name => {
@@ -2926,7 +2959,7 @@ function startGridDiag() {
         body.textContent = libraryView ? gridDiagText(gridDiag()) : 'grid diagnostics: open a library';
     }, 500);
 }
-if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', startGridDiag);
+if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => startGridDiag());
 else startGridDiag();
 
 // A sort or genre change: a new load for the new query, shown from the top of the list
@@ -6712,16 +6745,28 @@ async function savePluginPriority() {
 }
 
 // --- Hash Router ---
+// A hash route (location.hash without its #) as { page, param, query }: a leading slash is
+// allowed (#/library/<id>), and a ?query after the route (#library/<id>?debug=grid) is split off,
+// so it never becomes part of the page's parameter (nor reaches the server in it)
+function hashRoute(hash) {
+    const at = hash.indexOf('?');
+    const path = (at < 0 ? hash : hash.slice(0, at)).replace(/^\/+/, '');
+    const query = new URLSearchParams(at < 0 ? '' : hash.slice(at + 1));
+    const [page, ...rest] = path.split('/');
+    return { page, param: rest.join('/') || undefined, query };
+}
+
 function handleHash() {
     const hash = window.location.hash.slice(1);
     // navigate() sets the hash itself; a change to any other hash came from history (Back/Forward)
     const fromHistory = hash !== navigatedHash;
-    if (!hash) {
+    const { page, param, query } = hashRoute(hash);
+    if (query.get('debug') === 'grid') startGridDiag(true);
+    if (!page) {
         navigate('home');
         return;
     }
-    const [page, ...rest] = hash.split('/');
-    navigate(page, rest.join('/') || undefined, { fromHistory });
+    navigate(page, param, { fromHistory });
 }
 
 // --- Bootstrap & Lifecycle ---

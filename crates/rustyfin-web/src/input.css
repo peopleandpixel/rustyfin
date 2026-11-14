@@ -48,29 +48,18 @@ body {
   overflow-x: hidden;
 }
 
-/* Frosted glass header — backdrop-filter only on desktop to save mobile CPU */
+/* Header and sidebar: solid, the colour the old frosted glass showed over the page (its tint over
+   --jf-bg-darkest). A backdrop-filter re-blurs whatever scrolls under it every frame, which made
+   a fling outrun the browser's drawing (whole-screen checkerboard on Safari and Brave). */
 .jf-header {
-  background: var(--jf-bg-glass);
+  background: rgb(16, 20, 29);
   border-bottom: 1px solid var(--jf-border);
   transition: all 0.25s ease;
 }
-@media (min-width: 768px) {
-  .jf-header {
-    backdrop-filter: blur(24px);
-    -webkit-backdrop-filter: blur(24px);
-  }
-}
 
-/* Sidebar & Drawer — backdrop-filter only on desktop */
 .jf-drawer {
-  background: rgba(13, 17, 23, 0.85);
+  background: rgb(12, 16, 22);
   border-right: 1px solid var(--jf-border);
-}
-@media (min-width: 768px) {
-  .jf-drawer {
-    backdrop-filter: blur(20px);
-    -webkit-backdrop-filter: blur(20px);
-  }
 }
 
 .jf-drawer-item {
@@ -139,41 +128,13 @@ body {
   position: relative;
   contain: layout;
 }
-/* Under the cells, the grid paints a skeleton card at every position of the list, from the
-   layout's numbers (--vg-*, set with each measure): where no cell is made yet (the scroll got
-   ahead of the page's script, as a compositor-driven fling can, or a slow device lags), the list
-   still shows cards, never the page's black. ::before covers the full rows, ::after the last,
-   partly filled one. Gaps take the page's colour; each card has a poster box and a text strip. */
-.jf-vgrid::before,
-.jf-vgrid::after {
-  content: '';
-  position: absolute;
-  z-index: -1;
-  left: 0;
-  pointer-events: none;
-  background:
-    linear-gradient(90deg, transparent var(--vg-cw), var(--jf-bg-darkest) 0) 0 0 / var(--vg-px) 100%,
-    linear-gradient(180deg, transparent var(--vg-ch), var(--jf-bg-darkest) 0) 0 0 / 100% var(--vg-py),
-    linear-gradient(180deg, transparent var(--vg-poster), var(--jf-bg-card) 0) 0 0 / 100% var(--vg-py),
-    var(--jf-skeleton);
-}
-.jf-vgrid::before {
-  top: 0;
-  right: 0;
-  height: var(--vg-full, 0);
-}
-.jf-vgrid::after {
-  top: var(--vg-full, 0);
-  width: var(--vg-last-w, 0);
-  height: var(--vg-ch, 0);
-}
+/* The grid paints nothing itself: a position whose cell is not made yet shows the page. (A
+   list-tall skeleton background was tried in round 7; its raster over the whole scroll height
+   added to what a fling has to draw.) */
 .jf-vgrid > * {
   position: absolute;
   /* No paint containment: it would clip the card's hover lift, shadow, glow and focus outline */
   contain: layout style;
-  /* A made cell covers the grid's skeleton under it: the page's colour shows around the card's
-     rounded corners and under its hover lift, as before the skeleton */
-  background: var(--jf-bg-darkest);
 }
 /* A lifted or focused card's shadow, glow and outline stay above the cells after it */
 .jf-vgrid > :hover,
@@ -237,7 +198,7 @@ body {
   opacity: 0;
   z-index: 2;
   pointer-events: none;
-  transition: opacity 0.25s ease, backdrop-filter 0.25s ease;
+  transition: opacity 0.25s ease;
 }
 
 .jf-card:hover .jf-play-overlay {
@@ -276,7 +237,6 @@ body {
   height: 4px;
   z-index: 2;
   background: rgba(0, 0, 0, 0.6);
-  backdrop-filter: blur(4px);
 }
 
 .jf-progress-bar {
@@ -298,7 +258,6 @@ body {
   background: rgba(255, 255, 255, 0.08);
   border: 1px solid rgba(255, 255, 255, 0.08);
   color: rgba(255, 255, 255, 0.85);
-  backdrop-filter: blur(8px);
 }
 
 .jf-badge-primary {
@@ -313,8 +272,9 @@ body {
   color: #fb923c;
 }
 
+/* Over a poster: a solid dark amber fill, no blur, so it reads on light and busy pictures */
 .jf-badge-rating {
-  background: rgba(234, 179, 8, 0.15);
+  background: rgba(38, 30, 6, 0.8);
   border-color: rgba(234, 179, 8, 0.3);
   color: #facc15;
 }
@@ -857,7 +817,6 @@ dialog.modal::backdrop {
 img.jf-lazy-img {
   opacity: 0;
   transition: opacity 0.3s cubic-bezier(0.16, 1, 0.3, 1);
-  will-change: opacity;
 }
 
 img.jf-lazy-img.loaded,
@@ -868,6 +827,11 @@ img.jf-lazy-img:not([data-src]) {
 /* Progressive thumbnail image - shown while full-res loads */
 img.jf-thumb-img {
   transition: opacity 0.2s ease;
+}
+/* In the library grid a picture shows at once: a fade on each of a screen of posters animates
+   their opacity, which gives each one a compositing layer for its duration */
+.jf-vgrid img.jf-thumb-img {
+  transition: none;
 }
 
 .jf-poster, .jf-poster-backdrop {
@@ -889,13 +853,15 @@ img.jf-thumb-img {
   background-size: 40% 60%;
 }
 
-/* A card's BlurHash: a tiny canvas stretched over the poster box, under the picture */
+/* A card's BlurHash: a tiny bitmap (see paintBlurhashes) stretched over the poster box, under
+   the picture */
 .jf-blurhash {
   position: absolute;
   inset: 0;
   width: 100%;
   height: 100%;
   z-index: 0;
+  background-size: 100% 100%;
 }
 
 .jf-poster-skeleton {

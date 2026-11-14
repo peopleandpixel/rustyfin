@@ -7,7 +7,7 @@
 //                 apart from what is painted
 //   colour      - a placeholder painted in its picture's BlurHash average colour (data-tint)
 //   blank       - a card that shows nothing yet (no painted BlurHash, no loaded picture)
-//   preview     - its BlurHash canvas is painted
+//   preview     - its BlurHash is painted
 //   poster      - its <img> has loaded and is not transparent
 // Cards without a picture (they show their type icon) are left out. `skipped` counts viewport cells
 // content-visibility still skips.
@@ -36,8 +36,8 @@
         if (cell.hasAttribute('data-i')) return cell.dataset.tint ? 'colour' : 'placeholder';
         const img = cell.querySelector('img');
         if (img && img.complete && img.naturalWidth > 0 && getComputedStyle(img).opacity !== '0') return 'poster';
-        const canvas = cell.querySelector('canvas.jf-blurhash');
-        if (canvas && !canvas.hasAttribute('data-blurhash')) return 'preview';
+        const hash = cell.querySelector('.jf-blurhash');
+        if (hash && !hash.hasAttribute('data-blurhash')) return 'preview';
         if (!img) return 'noimage';
         return 'blank';
     }

@@ -487,10 +487,11 @@ test('a refresh in place redraws a full card whose text changed, keeping its pic
 test('the place in the list is restored only through history (F27)', () => {
     const calls = [];
     const router = vm.createContext({
+        URLSearchParams,
         window: { location: { hash: '' } },
         navigate: (page, data, opts) => calls.push({ page, data, fromHistory: opts?.fromHistory ?? false }),
     });
-    vm.runInContext(`var navigatedHash = null;\n${fn('function handleHash(')}`, router);
+    vm.runInContext(`var navigatedHash = null;\nvar startedDiag = 0; function startGridDiag(asked) { if (asked) startedDiag++; }\n${fn('function hashRoute(')}\n${fn('function handleHash(')}`, router);
     // navigate() set this hash itself: its own hashchange is not history
     router.navigatedHash = 'library/1';
     router.window.location.hash = '#library/1';
@@ -500,6 +501,20 @@ test('the place in the list is restored only through history (F27)', () => {
     router.window.location.hash = '#library/1';
     router.handleHash();
     assert.deepEqual(calls.map(c => c.fromHistory), [false, true]);
+    // A ?query after the route is split off, never part of the page's parameter; debug=grid there
+    // turns the diagnostics on; a leading slash is allowed
+    calls.length = 0;
+    router.window.location.hash = '#/library/abc?debug=grid';
+    router.handleHash();
+    router.window.location.hash = '#library/abc?x=1';
+    router.handleHash();
+    router.window.location.hash = '#library/abc';
+    router.handleHash();
+    assert.deepEqual(calls.map(c => [c.page, c.data]), [['library', 'abc'], ['library', 'abc'], ['library', 'abc']]);
+    assert.equal(router.startedDiag, 1, 'debug=grid in the hash starts the panel');
+    router.window.location.hash = '#?debug=grid';
+    router.handleHash();
+    assert.deepEqual(calls.at(-1), { page: 'home', data: undefined, fromHistory: false });
     // navigate() turns that into the restore decision, and fillLibraryGrid uses only it
     assert.match(fn('function navigate('), /libraryRestore = fromHistory && page === 'library'/);
     assert.match(fn('function navigate('), /navigatedHash = data \?/);
@@ -568,18 +583,12 @@ test('a cell colour is never near black: dark BlurHash averages are lifted, ligh
     assert.equal(context.blurhashTint('bad'), null);
 });
 
-test('the grid background gets a card at every position, the last row only as wide as its items', () => {
-    const grid = newGrid(3650); // 521 full rows of 7, and 3 in the last
+test('the grid takes the list\'s height and paints nothing else (no list-tall skeleton)', () => {
+    const grid = newGrid(3650);
     const v = context.libraryView;
-    v.posterHeight = 200;
     context.librarySize(v, 3650);
     assert.equal(grid.style.height, `${v.height}px`);
-    assert.equal(grid.style['--vg-full'], `${521 * v.pitch}px`);
-    assert.equal(grid.style['--vg-last-w'], `${3 * (v.colWidth + v.gap) - v.gap}px`);
-    assert.equal(grid.style['--vg-poster'], '200px');
-    assert.equal(grid.style['--vg-py'], `${v.pitch}px`);
-    context.librarySize(v, 3654); // 522 full rows: no partial row
-    assert.equal(grid.style['--vg-last-w'], '0px');
+    assert.deepEqual(Object.keys(grid.style).filter(k => k.startsWith('--vg')), []);
 });
 
 test('an index whose pictures mostly have no BlurHash yet is asked again later, a few times', async () => {
