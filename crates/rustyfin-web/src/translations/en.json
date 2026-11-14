@@ -343,6 +343,7 @@
         "only_admins_create_users": "Only administrators can create users",
         "name_and_password_required": "Name and password are required",
         "user_created": "User \"{{name}}\" created",
+        "user_created_not_admin": "User \"{{name}}\" was created without administrator rights: {{error}}",
         "connected": "Connected",
         "connecting": "Connecting…",
         "log_cleared": "Log cleared. Waiting for new entries…",

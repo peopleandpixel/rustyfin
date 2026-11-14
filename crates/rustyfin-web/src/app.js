@@ -5133,14 +5133,27 @@ async function submitAddUser(e) {
         toast(t('admin.name_and_password_required'), 'error');
         return;
     }
+    let created;
     try {
-        await API.createUser(name, password, isAdmin);
-        toast(t('admin.user_created', { name }));
-        closeAddUser();
-        if (currentPage === 'admin') renderAdmin();
+        created = await API.createUser(name, password);
     } catch (err) {
         toast(err.message, 'error');
+        return;
     }
+    // The server creates every user without administrator rights; a ticked box grants them separately.
+    if (isAdmin) {
+        try {
+            await API.updatePolicy(created.Id, { IsAdministrator: true });
+            toast(t('admin.user_created', { name }));
+        } catch (err) {
+            toast(t('admin.user_created_not_admin', { name, error: err.message }), 'error');
+        }
+    } else {
+        toast(t('admin.user_created', { name }));
+    }
+    closeAddUser();
+    API.invalidateCache('/Users');
+    if (currentPage === 'admin') renderAdmin();
 }
 
 // --- Auth UI Sync ---
