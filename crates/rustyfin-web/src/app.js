@@ -2055,9 +2055,11 @@ async function loadLibraryIndex(gen) {
     libraryIndexRequest = controller;
     try {
         // Low priority: the first screens' pages and posters come first
+        const asked = performance.now();
         const data = await API.get('/Items?' + q.toString(), { priority: 'low', signal: controller.signal });
         if (gen !== libraryGen) return;
         libraryIndexRequest = null;
+        libraryIndexMs = performance.now() - asked;
         const fresh = data.Items || data.items || [];
         const hadIndex = !!libraryIndex;
         libraryIndex = fresh;
@@ -2561,8 +2563,9 @@ const LIBRARY_INDEX_HASH_RETRIES = 6;
 let libraryIndexHashRetries = 0;
 // How many of the last index's pictures had no BlurHash (null before the first index of a load)
 let libraryIndexMissing = null;
-// When the index came (performance.now()), for the diagnostics
+// When the index came (performance.now()) and how long it took, for the diagnostics
 let libraryIndexAt = null;
+let libraryIndexMs = null;
 
 // The list changed under the load (a page came with another total, as during a scan): the grid
 // takes the new total in place, without a jump or a flash of skeletons
@@ -2772,10 +2775,21 @@ function gridDiagRequests(list) {
     };
 }
 
+// The last index request's size and times, from its resource entry (its URL is matched and dropped)
+function gridDiagIndexRequest() {
+    const e = performance.getEntriesByType('resource').filter(r => r.name.includes('RustyfinCardIndex=true')).pop();
+    return {
+        ms: libraryIndexMs == null ? null : Math.round(libraryIndexMs),
+        serverMs: e ? Math.round(e.responseStart - e.requestStart) : null,
+        wireKB: e ? Math.round(e.transferSize / 1024) : null,
+        rawKB: e ? Math.round(e.decodedBodySize / 1024) : null,
+    };
+}
+
 function gridDiag() {
     const now = performance.now();
     const index = libraryIndex
-        ? { items: libraryIndex.length, blurhashes: libraryIndex.filter(libraryHasHash).length, agoS: libraryIndexAt == null ? null : Math.round((now - libraryIndexAt) / 1000) }
+        ? { items: libraryIndex.length, blurhashes: libraryIndex.filter(libraryHasHash).length, agoS: libraryIndexAt == null ? null : Math.round((now - libraryIndexAt) / 1000), ...gridDiagIndexRequest() }
         : libraryIndexRequest ? 'loading' : 'none';
     const widths = {};
     for (const p of gridDiagData.paint) widths[p.width] = (widths[p.width] || 0) + 1;
@@ -2808,7 +2822,8 @@ function gridDiag() {
 // The numbers as plain text, one line each: the panel's body and what the copy button copies
 function gridDiagText(d) {
     const c = s => `poster ${s.poster} · blurhash ${s.blurhash} · shimmer ${s.shimmer} · colour ${s.colour} · skeleton ${s.skeleton} · icon ${s.icon}`;
-    const idx = typeof d.index === 'string' ? d.index : `${d.index.items} items, ${d.index.blurhashes} BlurHashes, ${d.index.agoS}s ago`;
+    const idx = typeof d.index === 'string' ? d.index : `${d.index.items} items, ${d.index.blurhashes} BlurHashes, ${d.index.agoS}s ago\n`
+        + `  index ${d.index.ms ?? '-'} ms (server ${d.index.serverMs ?? '-'} ms) · ${d.index.wireKB ?? '-'} KB on the wire, ${d.index.rawKB ?? '-'} KB raw`;
     const ms = s => `${s.p50 ?? '-'}/${s.p90 ?? '-'}`;
     const req = r => `${r.n} (${r.cached} cached) · ${Object.entries(r.protocols).map(([k, n]) => `${k} ${n}`).join(', ') || '-'}\n`
         + `  queue ${ms(r.queueMs)} · server ${ms(r.serverMs)} · download ${ms(r.downloadMs)} ms (p50/p90)`;
