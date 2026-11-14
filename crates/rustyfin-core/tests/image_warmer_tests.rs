@@ -162,6 +162,52 @@ async fn b152_a_pass_prepares_masters_and_blurhashes_once() {
 }
 
 #[tokio::test]
+async fn b152_a_pass_makes_the_grid_copies_a_warmed_picture_lacks() {
+    let fx = Fixture::new().await;
+    let big = fx.dir.join("film").join("big.jpg");
+    write_jpeg(&big, 1000, 1500);
+    let a = fx.movie("A", &big, None).await;
+    let client = reqwest::Client::new();
+    warm_pass(&fx.pool, &fx.dir, &client).await.unwrap();
+
+    // A server warmed before the copies were added: the master and BlurHash, no copies
+    let cache = fx.dir.join("cache").join("images");
+    for entry in std::fs::read_dir(&cache).unwrap().flatten() {
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .ends_with("_480x720.jpg")
+        {
+            std::fs::remove_file(entry.path()).unwrap();
+        }
+    }
+    assert!(fx.master(&a).exists());
+
+    let report = warm_pass(&fx.pool, &fx.dir, &client).await.unwrap();
+    assert_eq!((report.prepared, report.ready), (1, 0), "{report:?}");
+    // The copies are the ones the image route asks for at those widths
+    let source = big.to_string_lossy();
+    for width in rustyfin_core::image_warmer::GRID_COPY_WIDTHS {
+        let rendition = image_proxy::plan_rendition(&source, None, Some(width), None)
+            .await
+            .unwrap();
+        let image_proxy::Rendition::Copy {
+            width: w,
+            height: h,
+        } = rendition
+        else {
+            panic!("{rendition:?}");
+        };
+        let copy =
+            image::open(cache.join(image_proxy::cached_copy_name(&source, a.stamp, w, h))).unwrap();
+        assert_eq!((copy.width(), copy.height()), (width, width * 3 / 2));
+    }
+    // And a further pass finds everything ready
+    let again = warm_pass(&fx.pool, &fx.dir, &client).await.unwrap();
+    assert_eq!((again.prepared, again.ready), (0, 1), "{again:?}");
+}
+
+#[tokio::test]
 async fn b152_grid_copies_come_from_the_master_and_larger_ones_from_the_original() {
     let fx = Fixture::new().await;
     let poster = fx.dir.join("film").join("poster.jpg");

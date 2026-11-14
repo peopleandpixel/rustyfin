@@ -205,6 +205,55 @@ struct Warmed {
     capped: bool,
 }
 
+/// The grid copies made from the master after it, so a landing is served from disk without a
+/// render, at the size asked (see `image_proxy::GRID_COPY_WIDTHS`).
+pub use image_proxy::GRID_COPY_WIDTHS;
+
+/// Makes the `GRID_COPY_WIDTHS` copies of a picture that are not on disk, from its grid master,
+/// while `budget` has room. Returns the bytes written. A copy that fails is left to be made on
+/// request.
+async fn prepare_grid_copies(img: &ItemImage, source: &str, cache_dir: &Path, budget: u64) -> u64 {
+    let known = match (img.width, img.height) {
+        (Some(w), Some(h)) if w > 0 && h > 0 => Some((w as u32, h as u32)),
+        _ => None,
+    };
+    let mut written = 0;
+    for width in GRID_COPY_WIDTHS {
+        if budget.saturating_sub(written) < 64 << 10 {
+            break;
+        }
+        let Ok(rendition) = image_proxy::plan_rendition(source, known, Some(width), None).await
+        else {
+            continue;
+        };
+        let image_proxy::Rendition::Copy {
+            width: w,
+            height: h,
+        } = rendition
+        else {
+            continue;
+        };
+        let name = image_proxy::cached_copy_name(source, img.stamp, w, h);
+        if std::fs::metadata(cache_dir.join(&name)).is_ok_and(|m| m.len() > 0) {
+            continue;
+        }
+        match image_proxy::render_image_for(
+            source,
+            img.stamp,
+            rendition,
+            cache_dir,
+            None,
+            image_proxy::RenderFor::Background,
+        )
+        .await
+        {
+            Ok(bytes) => written += bytes.len() as u64,
+            Err(e) => tracing::debug!(path = %source, "could not prepare grid copy: {}", e),
+        }
+    }
+    written
+}
+
 /// Prepares one picture: its grid master if missing and `budget` has room, and its BlurHash if it
 /// has none (from the master, else from an original already on disk).
 async fn warm_one(
@@ -228,8 +277,10 @@ async fn warm_one(
         .as_deref()
         .is_some_and(|s| std::fs::metadata(master_path(s)).is_ok_and(|m| m.len() > 0));
     if existed && img.blurhash.is_some() {
+        // A server warmed before the copies were added gets them now
+        let source = on_disk.expect("a master exists only for a picture on disk");
         return Ok(Warmed {
-            written: 0,
+            written: prepare_grid_copies(img, &source, cache_dir, budget).await,
             hashed: false,
             capped: false,
         });
@@ -265,6 +316,13 @@ async fn warm_one(
         if !existed {
             warmed.written = master.len() as u64;
         }
+        warmed.written += prepare_grid_copies(
+            img,
+            &source,
+            cache_dir,
+            budget.saturating_sub(warmed.written),
+        )
+        .await;
         Some(master)
     } else if img.blurhash.is_none()
         && let Some(source) = on_disk

@@ -4082,6 +4082,94 @@ async fn b152_a_lean_list_has_names_pictures_and_blurhashes_only() {
     );
 }
 
+// B152 round 9-10: a copy at a grid width not made yet is answered with the pre-generated grid
+// master at once (its ETag names the master; kept 5 minutes, not as immutable), and made in the
+// background; the next request gets the copy, immutable. Other widths are rendered when asked.
+#[tokio::test]
+async fn b152_a_grid_copy_not_made_yet_is_served_by_the_master() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let id = b30_photo(&state).await;
+    let app = app(state.clone());
+    b30_upload(&app, &token, id, &b30_jpeg(640, 960, [30, 200, 30])).await;
+    rustyfin_core::image_warmer::warm_pass(&state.db, &state.data_dir, &state.http_client)
+        .await
+        .unwrap();
+    // A server warmed before the grid copies existed: the master only
+    let cache = state.data_dir.join("cache").join("images");
+    for entry in std::fs::read_dir(&cache).unwrap().flatten() {
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .ends_with("_480x720.jpg")
+        {
+            std::fs::remove_file(entry.path()).unwrap();
+        }
+    }
+    let tag = b30_primary_tag(&app, &token, id, "Photo").await;
+    let get = |uri: String| {
+        let app = app.clone();
+        let token = token.clone();
+        async move {
+            let request = Request::builder()
+                .uri(&uri)
+                .header("Authorization", format!("Bearer {token}"));
+            let resp = app
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let header = |name: &str| {
+                resp.headers()
+                    .get(name)
+                    .map(|v| v.to_str().unwrap().to_string())
+                    .unwrap_or_default()
+            };
+            let (etag, cache_control) = (header("etag"), header("cache-control"));
+            let status = resp.status();
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            (status, etag, cache_control, body)
+        }
+    };
+
+    // A width the warmer doesn't make: rendered now, at its size, kept as immutable
+    let uri = format!("/Items/{id}/Images/Primary?maxWidth=200&tag={tag}");
+    let (status, etag, cache_control, body) = get(uri).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(etag, format!("\"{tag}-200x300\""));
+    assert!(cache_control.contains("immutable"), "{cache_control}");
+    let img = image::load_from_memory(&body).unwrap();
+    assert_eq!(img.width(), 200);
+
+    // A grid width: the master at once, kept briefly
+    let uri = format!("/Items/{id}/Images/Primary?maxWidth=320&tag={tag}");
+    let (status, etag, cache_control, body) = get(uri.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(etag, format!("\"{tag}-480x720\""), "the master's ETag");
+    assert_eq!(cache_control, "public, max-age=300", "not immutable");
+    let img = image::load_from_memory(&body).unwrap();
+    assert_eq!(
+        (img.width(), img.height()),
+        (480, 720),
+        "the master's bytes"
+    );
+
+    // The copy is made in the background; then the same URL gets it, with its own ETag
+    let mut copy = None;
+    for _ in 0..100 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let (_, etag, cache_control, body) = get(uri.clone()).await;
+        if etag != format!("\"{tag}-480x720\"") {
+            copy = Some((etag, cache_control, body));
+            break;
+        }
+    }
+    let (etag, cache_control, body) = copy.expect("the copy was made within 5 s");
+    assert_eq!(etag, format!("\"{tag}-320x480\""));
+    assert!(cache_control.contains("immutable"), "{cache_control}");
+    let img = image::load_from_memory(&body).unwrap();
+    assert_eq!((img.width(), img.height()), (320, 480));
+}
+
 // B152 round 9: RustyfinCardIndex=true (a Rustyfin extension) answers with only what a poster
 // card shows, under 300 bytes an item; the same request without it keeps Jellyfin's base DTO
 #[tokio::test]

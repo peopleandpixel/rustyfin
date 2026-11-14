@@ -216,6 +216,42 @@ async fn serve_image(
         cached
     } else {
         let cache_dir = state.data_dir.join("cache").join("images");
+        // A copy at one of the grid widths (GRID_COPY_WIDTHS) not made yet is answered with the
+        // pre-generated grid master, larger, at once (the browser scales it down) rather than
+        // rendered now; the copy is made in the background (at most PREPARING_MAX at a time;
+        // with no room, a later request asks again). The ETag names the master's bytes, which are
+        // what is sent, and the answer is kept 5 minutes, not as immutable: the browser, the
+        // service worker (it keeps immutable answers only) and any proxy then fetch the copy.
+        // Other widths are rendered now, as before.
+        let grid_width =
+            max_width.is_some_and(|w| rustyfin_core::image_proxy::GRID_COPY_WIDTHS.contains(&w));
+        if grid_width
+            && let Some(bytes) = rustyfin_core::image_proxy::grid_master_stand_in(
+                &img.path, img.stamp, rendition, &cache_dir,
+            )
+            .await
+        {
+            rustyfin_core::image_proxy::prepare_copy_in_background(
+                img.path.clone(),
+                img.stamp,
+                rendition,
+                cache_dir,
+            );
+            let master = rustyfin_core::image_proxy::Rendition::Copy {
+                width: rustyfin_core::image_proxy::GRID_MASTER.0,
+                height: rustyfin_core::image_proxy::GRID_MASTER.1,
+            };
+            return Ok(Response::builder()
+                .header(header::CONTENT_TYPE, "image/jpeg")
+                .header(header::CACHE_CONTROL, "public, max-age=300")
+                .header(
+                    header::ETAG,
+                    format!("\"{}-{}\"", current_tag, master.key()),
+                )
+                .header(header::CONTENT_LENGTH, bytes.len().to_string())
+                .body(Body::from(bytes))
+                .unwrap());
+        }
         let bytes = match rustyfin_core::image_proxy::render_image(
             &img.path,
             img.stamp,

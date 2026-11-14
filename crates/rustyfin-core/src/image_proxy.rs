@@ -1,7 +1,7 @@
 use image::imageops::FilterType;
 use sha2::{Digest, Sha256};
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use tokio::fs;
 
@@ -443,6 +443,107 @@ async fn grid_master_for(
     // The copy's own size, fitted to the master as it would be to the original
     let (tw, th) = fit_target(mw, mh, width, height);
     (tw <= mw && th <= mh && (tw < mw || th < mh)).then_some(bytes)
+}
+
+/// The grid master, served in place of a smaller grid copy that is not on disk yet: the browser
+/// scales it down, so a landing on pictures never asked at this size waits for no render (a
+/// first render queues on the render permits, 60-190 ms on a modest CPU). `None` when the copy is
+/// on disk (it is served as usual), or there is no master to stand in.
+pub async fn grid_master_stand_in(
+    source_path: &str,
+    stamp: Option<i64>,
+    rendition: Rendition,
+    cache_dir: &Path,
+) -> Option<Vec<u8>> {
+    let Rendition::Copy { width, height } = rendition else {
+        return None;
+    };
+    let copy = cache_dir.join(cached_copy_name(source_path, stamp, width, height));
+    if fs::metadata(&copy).await.is_ok_and(|meta| meta.len() > 0) {
+        return None;
+    }
+    grid_master_for(source_path, stamp, width, height, cache_dir).await
+}
+
+/// The grid widths the web client asks most (a 160 px card at 1x and 2x: 1280 px windows). The
+/// warmer makes these copies from the master after it; a request at one of them whose copy is not
+/// made yet is served by the master (`grid_master_stand_in`) while the copy is made in the
+/// background. Other widths are rendered when asked, as any picture.
+pub const GRID_COPY_WIDTHS: [u32; 2] = [240, 320];
+
+/// At most this many copies are made in the background at once (see `prepare_copy_in_background`)
+pub const PREPARING_MAX: usize = 8;
+
+/// The copies being made in the background, by disk name: each once however often it is asked,
+/// and at most `cap` at a time.
+pub struct Preparing {
+    names: std::sync::Mutex<std::collections::HashSet<String>>,
+    cap: usize,
+}
+
+impl Preparing {
+    pub fn new(cap: usize) -> Self {
+        Preparing {
+            names: Default::default(),
+            cap,
+        }
+    }
+
+    /// Takes `name` for one background render: false when it is on its way already, or `cap`
+    /// are.
+    pub fn reserve(&self, name: &str) -> bool {
+        let Ok(mut names) = self.names.lock() else {
+            return false;
+        };
+        if names.len() >= self.cap || names.contains(name) {
+            return false;
+        }
+        names.insert(name.to_string())
+    }
+
+    /// Gives `name` back once its render ended.
+    pub fn release(&self, name: &str) {
+        if let Ok(mut names) = self.names.lock() {
+            names.remove(name);
+        }
+    }
+}
+
+static PREPARING: LazyLock<Preparing> = LazyLock::new(|| Preparing::new(PREPARING_MAX));
+
+/// Renders a copy in the background lane (after client renders) and stores it, unless the same
+/// copy is already on its way or `PREPARING_MAX` copies are. For a request served by
+/// `grid_master_stand_in`: later requests at that size get the smaller copy (one that found no
+/// room is asked again by a later request). Returns whether a render was started.
+pub fn prepare_copy_in_background(
+    source_path: String,
+    stamp: Option<i64>,
+    rendition: Rendition,
+    cache_dir: PathBuf,
+) -> bool {
+    let Rendition::Copy { width, height } = rendition else {
+        return false;
+    };
+    let name = cached_copy_name(&source_path, stamp, width, height);
+    if !PREPARING.reserve(&name) {
+        return false;
+    }
+    tokio::spawn(async move {
+        if let Err(e) = render_image_for(
+            &source_path,
+            stamp,
+            rendition,
+            &cache_dir,
+            None,
+            RenderFor::Background,
+        )
+        .await
+        {
+            tracing::debug!(path = %source_path, "could not prepare image copy: {}", e);
+        }
+        PREPARING.release(&name);
+    });
+    true
 }
 
 /// Whether a client render is running.
@@ -1078,6 +1179,22 @@ fn is_decimal(part: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // B152 round 10: background copies are made once each, and at most `cap` at a time
+    #[test]
+    fn b152_background_copies_are_deduped_and_capped() {
+        let preparing = Preparing::new(2);
+        assert!(preparing.reserve("a"));
+        assert!(!preparing.reserve("a"), "the same copy is on its way");
+        assert!(preparing.reserve("b"));
+        assert!(!preparing.reserve("c"), "two at a time: no room");
+        preparing.release("a");
+        assert!(preparing.reserve("c"), "room again once one ended");
+        assert!(!preparing.reserve("a"), "still full: b and c");
+        preparing.release("b");
+        preparing.release("c");
+        assert!(preparing.reserve("a"));
+    }
 
     // B27: cache keys
 
