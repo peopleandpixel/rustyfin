@@ -8288,7 +8288,14 @@ async fn b156_start_from_another_origin_is_refused() {
         t.settings().await["MismatchedOrigin"],
         serde_json::Value::Null
     );
-    let (status, headers, body) = b156_start(&t, &[("origin", "https://flix.example")]).await;
+    let (status, headers, body) = b156_start(
+        &t,
+        &[
+            ("origin", "https://flix.example"),
+            ("sec-fetch-site", "same-origin"),
+        ],
+    )
+    .await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(
         b21_header(&headers, "set-cookie"),
@@ -8310,6 +8317,8 @@ async fn b156_start_from_another_origin_is_refused() {
     let mut req = request("POST", "/Auth/Oidc/Link", Some(&t.admin), None);
     req.headers_mut()
         .insert("origin", "http://10.0.0.5:8096".parse().unwrap());
+    req.headers_mut()
+        .insert("sec-fetch-site", "same-origin".parse().unwrap());
     let (status, headers, _) = t.raw(req).await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(b21_header(&headers, "set-cookie"), "");
@@ -8326,6 +8335,61 @@ async fn b156_start_from_another_origin_is_refused() {
         t.settings().await["MismatchedOrigin"],
         serde_json::Value::Null
     );
+}
+
+#[tokio::test]
+async fn b156_only_a_same_origin_start_is_noted() {
+    let t = b21_on(serde_json::json!({})).await;
+    let noted = || async { t.settings().await["MismatchedOrigin"].clone() };
+
+    // A cross-site page or a request without Sec-Fetch-Site is refused but not noted.
+    for fetch_site in [Some("cross-site"), Some("same-site"), Some("none"), None] {
+        let mut headers = vec![("origin", "https://attacker.example")];
+        if let Some(value) = fetch_site {
+            headers.push(("sec-fetch-site", value));
+        }
+        let (status, _, _) = b156_start(&t, &headers).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{fetch_site:?}");
+        assert_eq!(noted().await, serde_json::Value::Null, "{fetch_site:?}");
+    }
+
+    // The web client on another address posts same-origin: noted.
+    let (status, _, _) = b156_start(
+        &t,
+        &[
+            ("origin", "https://flix.example"),
+            ("sec-fetch-site", "same-origin"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(noted().await, "https://flix.example");
+
+    // A later cross-site request does not overwrite it.
+    let (status, _, _) = b156_start(
+        &t,
+        &[
+            ("origin", "https://attacker.example"),
+            ("sec-fetch-site", "cross-site"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(noted().await, "https://flix.example");
+
+    // The noted value is capped.
+    let long_host = vec!["a".repeat(60); 6].join(".");
+    let origin = format!("https://{long_host}.example");
+    let (status, _, _) = b156_start(
+        &t,
+        &[("origin", &origin), ("sec-fetch-site", "same-origin")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let noted = noted().await;
+    let noted = noted.as_str().expect("an origin is noted");
+    assert!(noted.len() <= 300, "noted {} bytes", noted.len());
+    assert!(origin.starts_with(noted));
 }
 
 #[tokio::test]

@@ -184,7 +184,12 @@ fn ensure_on(config: &OidcConfig) -> Result<(), ApiError> {
 /// Refuses a flow that a browser starts from an address other than the public URL's (B156). The
 /// provider sends the browser back to the public URL, where this browser has no flow cookie (and
 /// maybe another session), so the flow could only fail there. The refusal is a 409 the sign-in
-/// page explains, and the address is noted for the admin's warning.
+/// page explains.
+///
+/// The address is noted for the admin's warning only when the browser says the request comes
+/// from the page's own address (`Sec-Fetch-Site: same-origin`), as the web client's does. A
+/// cross-site page or a hand-made request (no `Sec-Fetch-Site`) is refused all the same but can't
+/// put an address of its choosing in front of the admin.
 ///
 /// The browser's `Origin` header only chooses between going on and this refusal: the redirect URI
 /// and the return address always come from the public URL, so no request header (`Host`,
@@ -205,7 +210,12 @@ fn ensure_origin(
     if origin_of(&config.public_url).as_deref() == Some(origin.as_str()) {
         return Ok(());
     }
-    state.oidc.note_mismatched_origin(origin);
+    let same_origin = headers
+        .get("sec-fetch-site")
+        .is_some_and(|value| value.as_bytes() == b"same-origin");
+    if same_origin {
+        state.oidc.note_mismatched_origin(origin);
+    }
     Err(ApiError::Conflict(format!(
         "Single sign-on is set up for {}. Open Rustyfin at that address to sign in.",
         config.public_url

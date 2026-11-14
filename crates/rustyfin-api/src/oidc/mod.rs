@@ -277,6 +277,9 @@ fn strings_of(doc: &Value, key: &str) -> Option<Vec<String>> {
     })
 }
 
+/// The longest noted mismatched origin: a scheme, a 253-byte host name and a port fit.
+const MISMATCHED_ORIGIN_MAX: usize = 300;
+
 /// The HTTP client for the provider and the checked provider. Cloning shares the cache.
 #[derive(Clone)]
 pub struct OidcState {
@@ -319,8 +322,13 @@ impl OidcState {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Notes `origin` as the last address a flow was refused from (B156).
-    pub fn note_mismatched_origin(&self, origin: String) {
+    /// Notes `origin` as the last address a flow was refused from (B156), cut to
+    /// `MISMATCHED_ORIGIN_MAX` bytes. An origin is ASCII (IDNs are in punycode), so the cut never
+    /// splits a character.
+    pub fn note_mismatched_origin(&self, mut origin: String) {
+        if origin.len() > MISMATCHED_ORIGIN_MAX && origin.is_char_boundary(MISMATCHED_ORIGIN_MAX) {
+            origin.truncate(MISMATCHED_ORIGIN_MAX);
+        }
         *self.mismatch() = Some(origin);
     }
 
