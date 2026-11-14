@@ -505,7 +505,7 @@
         "admin_group_hint": "Leer: Der Anbieter vergibt keine Administratorrechte.",
         "public_url": "Öffentliche URL dieses Servers",
         "public_url_other_page": "Diese Seite ist unter {{origin}} geöffnet, Single Sign-on schickt Benutzer aber zu {{url}} zurück. Anmeldungen von einer anderen Adresse werden abgelehnt. Trage als öffentliche URL die Adresse ein, die Benutzer öffnen.",
-        "public_url_other_signin": "Eine Anmeldung wurde abgelehnt, weil sie von {{origin}} statt von {{url}} gestartet wurde. Erreichen Benutzer den Server unter dieser Adresse, trage sie als öffentliche URL ein.",
+        "public_url_other_signin": "Ein Single Sign-on wurde von {{origin}} gestartet, das nicht zur öffentlichen URL {{url}} passt, und abgelehnt.",
         "callback_url": "Callback-URL (beim Anbieter eintragen)",
         "callback_after_save": "Zuerst eine öffentliche URL speichern, dann erscheint die Callback-URL.",
         "copy": "Kopieren",

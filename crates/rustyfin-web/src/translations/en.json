@@ -505,7 +505,7 @@
         "admin_group_hint": "Empty: no administrator rights come from the provider.",
         "public_url": "Public URL of this server",
         "public_url_other_page": "This page is open at {{origin}}, but single sign-on sends users back to {{url}}. Sign-ins started from another address are refused. Set the public URL to the address users open.",
-        "public_url_other_signin": "A sign-in was refused because it started from {{origin}}, not from {{url}}. If users reach this server at that address, set it as the public URL.",
+        "public_url_other_signin": "A single sign-on was started from {{origin}}, which doesn't match the public URL {{url}}, and was refused.",
         "callback_url": "Callback URL (enter it at the provider)",
         "callback_after_save": "Save a public URL to get the callback URL.",
         "copy": "Copy",
