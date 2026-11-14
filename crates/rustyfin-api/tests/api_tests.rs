@@ -17244,11 +17244,13 @@ async fn b142_save_settings(app: &axum::Router, owner: &str, keys: serde_json::V
     assert_eq!(send(app, req).await.0, StatusCode::NO_CONTENT);
 }
 
-async fn b142_plugin_config(app: &axum::Router, owner: &str, plugin: &str) -> serde_json::Value {
-    let uri = format!("/Plugins/{plugin}/Configuration");
-    let (status, json) = send(app, request("GET", &uri, Some(owner), None)).await;
-    assert_eq!(status, StatusCode::OK, "GET {uri}");
-    json
+/// The plugin's stored config. The API no longer returns provider keys (F6), so read the DB.
+async fn b142_stored(state: &AppState, plugin: &str) -> serde_json::Value {
+    state
+        .plugin_manager
+        .load_plugin_config_from_db(plugin)
+        .await
+        .unwrap_or_else(|| serde_json::json!({}))
 }
 
 async fn b142_status(state: &AppState, plugin: &str) -> rustyfin_model::plugin::PluginStatus {
@@ -17287,7 +17289,7 @@ async fn b142_plugin_status_and_key_survive_each_other() {
         .set_plugin_status("omdb", PluginStatus::Disabled)
         .await
         .unwrap();
-    let config = b142_plugin_config(&app, &owner, "omdb").await;
+    let config = b142_stored(&state, "omdb").await;
     assert_eq!(
         config["api_key"], "b142-omdb-1",
         "status write kept the key"
@@ -17302,7 +17304,7 @@ async fn b142_plugin_status_and_key_survive_each_other() {
         Some(serde_json::json!({ "api_key": "b142-omdb-2" })),
     );
     assert_eq!(send(&app, req).await.0, StatusCode::OK);
-    let config = b142_plugin_config(&app, &owner, "omdb").await;
+    let config = b142_stored(&state, "omdb").await;
     assert_eq!(config["api_key"], "b142-omdb-2");
     assert_eq!(config["status"], "Disabled", "key write kept the status");
     assert_eq!(b142_status(&state, "omdb").await, PluginStatus::Disabled);
@@ -17348,7 +17350,7 @@ async fn b142_settings_key_enables_provider_plugins() {
         ("omdb", "b142-omdb-secret"),
         ("fanart", "b142-fanart-secret"),
     ] {
-        let config = b142_plugin_config(&app, &owner, plugin).await;
+        let config = b142_stored(&state, plugin).await;
         assert_eq!(config["api_key"], key, "{plugin} key (trimmed)");
         assert_eq!(config["status"], "Active", "{plugin} saved status");
         assert_eq!(b142_status(&state, plugin).await, PluginStatus::Active);
@@ -17413,7 +17415,7 @@ async fn b142_settings_never_return_keys() {
 
 #[tokio::test]
 async fn b142_settings_absent_key_keeps_saved_key() {
-    let (_state, app, owner, _) = b142_server().await;
+    let (state, app, owner, _) = b142_server().await;
     b142_save_settings(
         &app,
         &owner,
@@ -17423,7 +17425,7 @@ async fn b142_settings_absent_key_keeps_saved_key() {
     // A save without the field, and one with null, leave the stored key alone.
     b142_save_settings(&app, &owner, serde_json::json!({ "ServerName": "b142" })).await;
     b142_save_settings(&app, &owner, serde_json::json!({ "TmdbApiKey": null })).await;
-    let config = b142_plugin_config(&app, &owner, "tmdb").await;
+    let config = b142_stored(&state, "tmdb").await;
     assert_eq!(config["api_key"], "b142-tmdb-secret");
     assert_eq!(config["status"], "Active");
 }
@@ -17440,7 +17442,7 @@ async fn b142_settings_empty_key_clears_and_disables() {
     .await;
     assert_eq!(b142_status(&state, "omdb").await, PluginStatus::Active);
     b142_save_settings(&app, &owner, serde_json::json!({ "OmdbApiKey": "  " })).await;
-    let config = b142_plugin_config(&app, &owner, "omdb").await;
+    let config = b142_stored(&state, "omdb").await;
     assert!(config.get("api_key").is_none(), "{config}");
     assert!(config.get("status").is_none(), "{config}");
     assert_eq!(b142_status(&state, "omdb").await, PluginStatus::Disabled);
@@ -17489,6 +17491,225 @@ async fn b142_seed_moves_config_json_keys() {
         Some(rustyfin_model::plugin::PluginStatus::Active)
     );
     assert!(!rustyfin_core::plugin_manager::seed_provider_keys(&pm, &mut config).await);
+}
+
+/// Makes every write to `plugin_config` fail, as a full or broken disk would.
+async fn b142_fail_plugin_config_writes(state: &AppState) {
+    for event in ["INSERT", "UPDATE"] {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE TRIGGER b142_fail_{event} BEFORE {event} ON plugin_config \
+             BEGIN SELECT RAISE(ABORT, 'b142 write refused'); END"
+        )))
+        .execute(&state.db)
+        .await
+        .unwrap();
+    }
+}
+
+async fn b142_allow_plugin_config_writes(state: &AppState) {
+    for event in ["INSERT", "UPDATE"] {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP TRIGGER b142_fail_{event}"
+        )))
+        .execute(&state.db)
+        .await
+        .unwrap();
+    }
+}
+
+// B142 F1: a key that can't be stored is an error, not a silent 204.
+#[tokio::test]
+async fn b142_failed_key_save_answers_500() {
+    use rustyfin_model::plugin::PluginStatus;
+    let (state, app, owner, _) = b142_server().await;
+    b142_fail_plugin_config_writes(&state).await;
+
+    let (_, mut config) = send(
+        &app,
+        request("GET", "/System/Configuration", Some(&owner), None),
+    )
+    .await;
+    config["TmdbApiKey"] = serde_json::json!("b142-tmdb-secret");
+    config["ServerName"] = serde_json::json!("b142-after-failure");
+    let req = request("POST", "/System/Configuration", Some(&owner), Some(config));
+    assert_eq!(send(&app, req).await.0, StatusCode::INTERNAL_SERVER_ERROR);
+    // Nothing of the failed save is kept: no key, no status, and not the rest of the settings.
+    assert_eq!(b142_status(&state, "tmdb").await, PluginStatus::Disabled);
+    assert!(b142_stored(&state, "tmdb").await.get("api_key").is_none());
+    let (_, now) = send(
+        &app,
+        request("GET", "/System/Configuration", Some(&owner), None),
+    )
+    .await;
+    assert_ne!(now["ServerName"], "b142-after-failure");
+    assert_eq!(now["TmdbApiKeySet"], false);
+
+    let req = request(
+        "POST",
+        "/System/Configuration/TmdbApiKey",
+        Some(&owner),
+        Some(serde_json::json!("b142-tmdb-secret")),
+    );
+    assert_eq!(send(&app, req).await.0, StatusCode::INTERNAL_SERVER_ERROR);
+    let req = request(
+        "POST",
+        "/Plugins/omdb/Configuration",
+        Some(&owner),
+        Some(serde_json::json!({ "api_key": "b142-omdb-secret" })),
+    );
+    assert_eq!(send(&app, req).await.0, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(b142_status(&state, "omdb").await, PluginStatus::Disabled);
+    let req = request(
+        "POST",
+        "/Plugins/b142-missing/Configuration",
+        Some(&owner),
+        Some(serde_json::json!({})),
+    );
+    assert_eq!(send(&app, req).await.0, StatusCode::NOT_FOUND);
+
+    // Once the DB takes writes again, the same save works.
+    b142_allow_plugin_config_writes(&state).await;
+    b142_save_settings(
+        &app,
+        &owner,
+        serde_json::json!({ "TmdbApiKey": "b142-tmdb-secret" }),
+    )
+    .await;
+    assert_eq!(b142_status(&state, "tmdb").await, PluginStatus::Active);
+}
+
+// B142 F6: the plugin config API reports whether a provider key is set, never the key.
+#[tokio::test]
+async fn b142_plugin_config_hides_provider_keys() {
+    use rustyfin_core::plugin_manager::BuiltinPluginInfo;
+    use rustyfin_model::plugin::{PluginStatus, PluginType};
+    let (state, app, owner, _) = b142_server().await;
+    b142_save_settings(
+        &app,
+        &owner,
+        serde_json::json!({ "TmdbApiKey": "b142-tmdb-secret" }),
+    )
+    .await;
+    for (plugin, set) in [("tmdb", true), ("omdb", false), ("fanart", false)] {
+        let uri = format!("/Plugins/{plugin}/Configuration");
+        let (status, json) = send(&app, request("GET", &uri, Some(&owner), None)).await;
+        assert_eq!(status, StatusCode::OK, "GET {uri}");
+        assert!(json.get("api_key").is_none(), "GET {uri}: {json}");
+        assert_eq!(json["api_key_set"], set, "GET {uri}");
+        assert!(!json.to_string().contains("b142-"), "GET {uri} leaked");
+    }
+
+    // POST still takes a key; a posted api_key_set is not stored.
+    let req = request(
+        "POST",
+        "/Plugins/omdb/Configuration",
+        Some(&owner),
+        Some(serde_json::json!({ "api_key": "b142-omdb-secret", "api_key_set": false })),
+    );
+    assert_eq!(send(&app, req).await.0, StatusCode::OK);
+    let stored = b142_stored(&state, "omdb").await;
+    assert_eq!(stored["api_key"], "b142-omdb-secret");
+    assert!(stored.get("api_key_set").is_none(), "{stored}");
+    let (_, json) = send(
+        &app,
+        request("GET", "/Plugins/omdb/Configuration", Some(&owner), None),
+    )
+    .await;
+    assert_eq!(json["api_key_set"], true);
+
+    // Other plugins' configs are returned as stored.
+    state
+        .plugin_manager
+        .register_builtin_plugin(BuiltinPluginInfo {
+            name: "B142 other".to_string(),
+            version: "1".to_string(),
+            id: "b142-other".to_string(),
+            description: String::new(),
+            plugin_type: PluginType::NotificationProvider,
+            status: PluginStatus::Disabled,
+        })
+        .await;
+    let req = request(
+        "POST",
+        "/Plugins/b142-other/Configuration",
+        Some(&owner),
+        Some(serde_json::json!({ "api_key": "b142-other-token" })),
+    );
+    assert_eq!(send(&app, req).await.0, StatusCode::OK);
+    let (_, json) = send(
+        &app,
+        request(
+            "GET",
+            "/Plugins/b142-other/Configuration",
+            Some(&owner),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(json["api_key"], "b142-other-token");
+}
+
+// B142 F4: a key that couldn't be moved to its plugin stays in config.json until it is.
+#[tokio::test]
+async fn b142_seed_keeps_unsaved_keys() {
+    let (state, app, owner, _) = b142_server().await;
+    let pm = state.plugin_manager.clone();
+    b142_fail_plugin_config_writes(&state).await;
+    let mut config: ServerConfiguration = serde_json::from_value(serde_json::json!({
+        "TmdbApiKey": "b142-pending",
+    }))
+    .unwrap();
+    assert!(
+        !rustyfin_core::plugin_manager::seed_provider_keys(&pm, &mut config).await,
+        "nothing moved, so config.json needn't change"
+    );
+    assert_eq!(config.tmdb_api_key.as_deref(), Some("b142-pending"));
+    assert!(
+        serde_json::to_string(&config)
+            .unwrap()
+            .contains("b142-pending"),
+        "an unsaved key is still written to config.json"
+    );
+
+    // While it waits, responses don't carry it and a settings save keeps it.
+    *state.config.write().await = config.clone();
+    let (_, shown) = send(
+        &app,
+        request("GET", "/System/Configuration", Some(&owner), None),
+    )
+    .await;
+    assert!(!shown.to_string().contains("b142-pending"), "{shown}");
+    b142_save_settings(&app, &owner, serde_json::json!({ "ServerName": "b142" })).await;
+    let on_disk = std::fs::read_to_string(state.data_dir.join("config.json")).unwrap();
+    assert!(
+        on_disk.contains("b142-pending"),
+        "a settings save dropped it"
+    );
+
+    // The next try moves it.
+    b142_allow_plugin_config_writes(&state).await;
+    let mut config = state.config.read().await.clone();
+    assert!(rustyfin_core::plugin_manager::seed_provider_keys(&pm, &mut config).await);
+    assert!(config.tmdb_api_key.is_none());
+    assert_eq!(b142_stored(&state, "tmdb").await["api_key"], "b142-pending");
+}
+
+// B142 F2: plugin config writes are RFC 7396 merge patches, in memory as in the DB.
+#[test]
+fn b142_merge_patch() {
+    use serde_json::json;
+    let mut stored = json!({ "a": 1, "b": { "c": 2, "d": 3 }, "e": 4 });
+    rustyfin_core::plugin_manager::merge_patch(
+        &mut stored,
+        &json!({ "a": 5, "b": { "c": null }, "e": null, "f": 6 }),
+    );
+    assert_eq!(stored, json!({ "a": 5, "b": { "d": 3 }, "f": 6 }));
+    let mut stored = json!({ "a": 1 });
+    rustyfin_core::plugin_manager::merge_patch(&mut stored, &json!([1, 2]));
+    assert_eq!(stored, json!([1, 2]));
+    let mut stored = json!("not an object");
+    rustyfin_core::plugin_manager::merge_patch(&mut stored, &json!({ "a": null, "b": 1 }));
+    assert_eq!(stored, json!({ "b": 1 }));
 }
 
 /// The `<input …>` tag holding `id="{id}"` in `source`.
