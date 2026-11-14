@@ -474,6 +474,12 @@ function posterLoaded(img) {
     // visibility, not display: hiding it repaints, but lays nothing out again
     img.parentElement?.querySelectorAll('.jf-poster-skeleton').forEach(el => { el.style.visibility = 'hidden'; el.style.animation = 'none'; });
 }
+// A card the pointer goes over shows its picture at full brightness from then on, as before:
+// one card at a time, a plain style change (no will-change, no layer)
+document.addEventListener('pointerover', e => {
+    const img = e.target.closest?.('.jf-card')?.querySelector('img.jf-thumb-img');
+    if (img && img.style.opacity === '0.8') img.style.opacity = '1';
+}, { passive: true });
 function posterFailed(img) {
     if (!img.getAttribute('src')) return; // a load the poster loader stopped
     img.style.display = 'none';

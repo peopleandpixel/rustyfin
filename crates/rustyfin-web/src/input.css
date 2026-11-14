@@ -269,6 +269,7 @@ body {
   background: rgba(255, 255, 255, 0.08);
   border: 1px solid rgba(255, 255, 255, 0.08);
   color: rgba(255, 255, 255, 0.85);
+  backdrop-filter: blur(8px);
 }
 
 .jf-badge-primary {
@@ -283,12 +284,21 @@ body {
   color: #fb923c;
 }
 
-/* Over a poster: the old amber tint over a light dark wash. No backdrop blur: it would give every
-   card a layer of its own; the wash stands in for the softening the blur gave. */
 .jf-badge-rating {
-  background: linear-gradient(rgba(234, 179, 8, 0.15), rgba(234, 179, 8, 0.15)), rgba(0, 0, 0, 0.2);
+  background: rgba(234, 179, 8, 0.15);
   border-color: rgba(234, 179, 8, 0.3);
   color: #facc15;
+}
+
+/* Badges on cards (the library grid, home rows, other card grids): no backdrop blur, which would
+   give every card a compositing layer of its own; the rating badge's tint goes over a light dark
+   wash instead, standing in for the softening the blur gave. One-off badges (the spotlight, a
+   detail page) keep master's blur. */
+.jf-card .jf-badge {
+  backdrop-filter: none;
+}
+.jf-card .jf-badge-rating {
+  background: linear-gradient(rgba(234, 179, 8, 0.15), rgba(234, 179, 8, 0.15)), rgba(0, 0, 0, 0.2);
 }
 
 /* Hero Spotlight / Featured Banner */
