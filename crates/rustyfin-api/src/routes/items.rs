@@ -1719,6 +1719,15 @@ struct ItemsQuery {
     official_ratings: Option<String>,
     #[serde(rename = "officialRatings")]
     official_ratings_lower: Option<String>,
+    filters: Option<String>,
+    #[serde(rename = "filters")]
+    filters_lower: Option<String>,
+    is_resumable: Option<bool>,
+    #[serde(rename = "isResumable")]
+    is_resumable_lower: Option<bool>,
+    series_status: Option<String>,
+    #[serde(rename = "seriesStatus")]
+    series_status_lower: Option<String>,
     start_date: Option<String>,
     #[serde(rename = "startDate")]
     start_date_lower: Option<String>,
@@ -1886,6 +1895,21 @@ impl ItemsQuery {
     fn is_played(&self) -> Option<bool> {
         self.is_played.or(self.is_played_lower)
     }
+    /// Whether `Filters` lists a flag (`IsPlayed`, `IsFavorite`, ...), case-insensitively.
+    fn has_filter(&self, flag: &str) -> bool {
+        self.filters
+            .as_deref()
+            .or(self.filters_lower.as_deref())
+            .is_some_and(|list| list.split(',').any(|f| f.trim().eq_ignore_ascii_case(flag)))
+    }
+    fn is_resumable(&self) -> Option<bool> {
+        self.is_resumable.or(self.is_resumable_lower)
+    }
+    fn series_status(&self) -> Option<&str> {
+        self.series_status
+            .as_deref()
+            .or(self.series_status_lower.as_deref())
+    }
     fn is_movie(&self) -> Option<bool> {
         self.is_movie.or(self.is_movie_lower)
     }
@@ -2018,6 +2042,17 @@ fn parse_ids(value: Option<&str>) -> Vec<Uuid> {
         .collect()
 }
 
+/// The ids of `kept` (all items when `None`) that are also in `ids`.
+fn narrow_ids(kept: Option<Vec<String>>, ids: Vec<String>) -> Vec<String> {
+    match kept {
+        Some(kept) => {
+            let ids: std::collections::HashSet<String> = ids.into_iter().collect();
+            kept.into_iter().filter(|id| ids.contains(id)).collect()
+        }
+        None => ids,
+    }
+}
+
 async fn get_items(
     State(state): State<AppState>,
     Query(query): Query<ItemsQuery>,
@@ -2029,16 +2064,26 @@ async fn get_items(
     let exclude_media_types: Option<Vec<String>> = query
         .exclude_item_types()
         .map(|s| s.split(',').map(|t| t.trim().to_string()).collect());
+    // Genres and OfficialRatings are pipe-delimited, as in Jellyfin (`PipeDelimitedCollectionModelBinder`):
+    // a genre name may hold a comma. Ratings never do, so a comma still separates them too.
     let genres: Option<Vec<String>> = query
         .genres
         .as_ref()
-        .map(|s| s.split(',').map(|g| g.trim().to_string()).collect());
+        .map(|s| s.split('|').map(|g| g.trim().to_string()).collect());
     let years: Option<Vec<i32>> = query
         .years()
         .map(|s| s.split(',').filter_map(|y| y.trim().parse().ok()).collect());
     let official_ratings: Option<Vec<String>> = query
         .official_ratings()
-        .map(|s| s.split(',').map(|r| r.trim().to_string()).collect());
+        .map(|s| s.split(['|', ',']).map(|r| r.trim().to_string()).collect());
+    // `Filters=IsPlayed,IsUnplayed,IsResumable,IsFavorite` sets the same conditions as the flags.
+    let flag = |set: Option<bool>, names: &[&str]| {
+        set.or(names.iter().any(|n| query.has_filter(n)).then_some(true))
+    };
+    let is_favorite = flag(query.is_favorite(), &["IsFavorite", "IsFavoriteOrLikes"]);
+    let is_played = flag(query.is_played(), &["IsPlayed"]);
+    let is_unplayed = flag(query.is_unplayed(), &["IsUnplayed"]);
+    let is_resumable = flag(query.is_resumable(), &["IsResumable"]);
     let tags: Option<Vec<String>> = query
         .tags()
         .map(|s| s.split(',').map(|t| t.trim().to_string()).collect());
@@ -2071,12 +2116,22 @@ async fn get_items(
     };
 
     // GenreIds and StudioIds keep the items with one of those genres and one of those studios.
-    let item_ids = rustyfin_db::repo_by_name::item_ids_with(
+    let mut item_ids = rustyfin_db::repo_by_name::item_ids_with(
         &state.db_ro,
         &parse_ids(query.genre_ids()),
         &parse_ids(query.studio_ids()),
     )
     .await?;
+    // IsResumable and SeriesStatus narrow the same id list. IsResumable=false filters nothing.
+    if is_resumable == Some(true) {
+        let ids = rustyfin_db::repo_media::resumable_item_ids(&state.db_ro, claims.sub).await?;
+        item_ids = Some(narrow_ids(item_ids, ids));
+    }
+    if let Some(statuses) = query.series_status() {
+        let statuses: Vec<&str> = statuses.split(',').map(str::trim).collect();
+        let ids = rustyfin_db::repo_media::series_ids_with_status(&state.db_ro, &statuses).await?;
+        item_ids = Some(narrow_ids(item_ids, ids));
+    }
 
     let (items, total) = rustyfin_db::repo_media::get_items_filtered(
         &state.db_ro,
@@ -2094,9 +2149,9 @@ async fn get_items(
         start_index,
         limit,
         query.recursive(),
-        query.is_favorite(),
-        query.is_unplayed(),
-        query.is_played(),
+        is_favorite,
+        is_unplayed,
+        is_played,
         official_ratings.as_deref(),
         tags.as_deref(),
         media_types_filter.as_deref(),

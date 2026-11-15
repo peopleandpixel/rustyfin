@@ -1002,12 +1002,15 @@ fn build_filtered_query(
     // Genres filter — exact delimited match to avoid false positives.
     // Data is stored as "Action|Sci-Fi", so we check all 4 boundary positions:
     //   exact match, start, middle, end.
-    if let Some(genre_list) = genres {
-        for _g in genre_list {
-            where_parts.push(
-                "(genres = ? OR genres LIKE ? OR genres LIKE ? OR genres LIKE ?)".to_string(),
-            );
-        }
+    // An item with any of the listed genres is kept, as in Jellyfin.
+    if let Some(genre_list) = genres
+        && !genre_list.is_empty()
+    {
+        let any: Vec<&str> = genre_list
+            .iter()
+            .map(|_| "(genres = ? OR genres LIKE ? OR genres LIKE ? OR genres LIKE ?)")
+            .collect();
+        where_parts.push(format!("({})", any.join(" OR ")));
     }
 
     // Years filter
@@ -1726,6 +1729,49 @@ pub async fn rebuild_filter_indexes(pool: &SqlitePool) -> Result<(), sqlx::Error
 
     tx.commit().await?;
     Ok(())
+}
+
+/// The ids of the items the user has a resume position on (`/Items?Filters=IsResumable`).
+pub async fn resumable_item_ids(
+    pool: &SqlitePool,
+    user_id: Uuid,
+) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT item_id FROM user_item_data WHERE user_id = ? AND playback_position_ticks > 0",
+    )
+    .bind(user_id.to_string())
+    .fetch_all(pool)
+    .await
+}
+
+/// The ids of the series whose status is one of Jellyfin's `SeriesStatus` values (`Continuing`,
+/// `Ended`, `Unreleased`). Metadata providers store their own words, so TMDb's map onto them as
+/// Jellyfin's TMDb provider maps them.
+pub async fn series_ids_with_status(
+    pool: &SqlitePool,
+    statuses: &[&str],
+) -> Result<Vec<String>, sqlx::Error> {
+    let mut stored: Vec<&str> = Vec::new();
+    for status in statuses {
+        let words: &[&str] = match status.to_ascii_lowercase().as_str() {
+            "continuing" => &["Continuing", "Returning Series"],
+            "ended" => &["Ended", "Canceled", "Cancelled"],
+            "unreleased" => &["Unreleased", "In Production", "Planned", "Pilot"],
+            _ => &[],
+        };
+        stored.extend(words);
+    }
+    if stored.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut qb: QueryBuilder<Sqlite> =
+        QueryBuilder::new("SELECT id FROM media_items WHERE media_type = 'Series' AND status IN (");
+    let mut list = qb.separated(", ");
+    for word in stored {
+        list.push_bind(word);
+    }
+    qb.push(")");
+    qb.build_query_scalar().fetch_all(pool).await
 }
 
 /// Get filter values from materialized index tables.

@@ -15578,6 +15578,156 @@ async fn b40_last_activity_date_skips_ids_that_are_not_media_items() {
     assert_eq!(b.user_data_rows().await, 1);
 }
 
+// W1: library filters. The web client's filter menu sends Jellyfin Web's /Items parameters.
+
+/// The names an `/Items` request in `library` lists, in answer order, and its `TotalRecordCount`.
+async fn w1filters_names(
+    app: &axum::Router,
+    token: &str,
+    library: uuid::Uuid,
+    params: &str,
+) -> (Vec<String>, i64) {
+    let params = params.replace('|', "%7C").replace(' ', "%20");
+    let uri = format!("/Items?LibraryId={library}&Recursive=true&SortBy=SortName&{params}");
+    let body = b27_answer(app, &uri, token).await;
+    let names = body["Items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{uri}: no Items in {body}"))
+        .iter()
+        .map(|item| item["Name"].as_str().unwrap_or("?").to_string())
+        .collect();
+    (names, body["TotalRecordCount"].as_i64().unwrap_or(-1))
+}
+
+/// Seeds four movies and two series with genres, ratings, years and statuses, and the caller's
+/// watch data on three of the movies. Returns the app, the token and the library.
+async fn w1filters_seed() -> (axum::Router, String, uuid::Uuid) {
+    let state = test_state().await;
+    let library = j6_library(&state, "W1 Library").await;
+    let (token, admin) = admin_session(&state).await;
+    for (name, kind, genres, rating, year, status) in [
+        ("Alpha", "Movie", "Action|Drama", "PG-13", 2001, ""),
+        ("Bravo", "Movie", "Comedy", "R", 2002, ""),
+        ("Charlie", "Movie", "Drama, Romance", "PG-13", 2003, ""),
+        ("Delta", "Movie", "Horror", "R", 2001, ""),
+        ("Echo", "Series", "Drama", "TV-MA", 2010, "Returning Series"),
+        ("Foxtrot", "Series", "Comedy", "TV-14", 2011, "Ended"),
+    ] {
+        let id = j6_add_item(&state, library, None, name, kind).await;
+        sqlx::query(
+            "UPDATE media_items SET sort_name = ?, genres = ?, official_rating = ?,
+             production_year = ?, status = NULLIF(?, '') WHERE id = ?",
+        )
+        .bind(name.to_lowercase())
+        .bind(genres)
+        .bind(rating)
+        .bind(year)
+        .bind(status)
+        .bind(id.to_string())
+        .execute(&state.db)
+        .await
+        .unwrap();
+        // Alpha is played, Bravo resumable and a favourite, Charlie a favourite.
+        let data = match name {
+            "Alpha" => Some((0i64, 1, 0)),
+            "Bravo" => Some((B110_HOUR, 0, 1)),
+            "Charlie" => Some((0, 0, 1)),
+            _ => None,
+        };
+        if let Some((position, played, favorite)) = data {
+            sqlx::query(
+                "INSERT INTO user_item_data (user_id, item_id, playback_position_ticks, played,
+                 is_favorite) VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(admin.to_string())
+            .bind(id.to_string())
+            .bind(position)
+            .bind(played)
+            .bind(favorite)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        }
+    }
+    (app(state), token, library)
+}
+
+#[tokio::test]
+async fn w1filters_filters_flags_match_jellyfin_web() {
+    let (app, token, library) = w1filters_seed().await;
+    let movies = "IncludeItemTypes=Movie";
+    let cases: [(&str, &[&str]); 6] = [
+        ("Filters=IsPlayed", &["Alpha"]),
+        ("Filters=IsUnplayed", &["Bravo", "Charlie", "Delta"]),
+        ("Filters=IsResumable", &["Bravo"]),
+        ("Filters=IsFavorite", &["Bravo", "Charlie"]),
+        // Several flags must all hold, as in Jellyfin.
+        ("Filters=IsUnplayed,IsFavorite", &["Bravo", "Charlie"]),
+        ("filters=isfavorite,isresumable", &["Bravo"]),
+    ];
+    for (params, expected) in cases {
+        let (names, total) =
+            w1filters_names(&app, &token, library, &format!("{movies}&{params}")).await;
+        assert_eq!(names, j6_names(expected), "{params}");
+        assert_eq!(total, expected.len() as i64, "{params}: TotalRecordCount");
+    }
+    // The paged total is the filtered count.
+    let (names, total) = w1filters_names(
+        &app,
+        &token,
+        library,
+        &format!("{movies}&Filters=IsUnplayed&StartIndex=1&Limit=1"),
+    )
+    .await;
+    assert_eq!((names, total), (j6_names(&["Charlie"]), 3));
+}
+
+#[tokio::test]
+async fn w1filters_genres_ratings_and_years_are_lists() {
+    let (app, token, library) = w1filters_seed().await;
+    let cases: [(&str, &[&str]); 6] = [
+        // Genres are pipe-delimited and an item with any of them is kept.
+        ("Genres=Comedy|Horror", &["Bravo", "Delta", "Foxtrot"]),
+        // A genre name may hold a comma.
+        ("Genres=Drama, Romance", &["Charlie"]),
+        ("OfficialRatings=PG-13|TV-MA", &["Alpha", "Charlie", "Echo"]),
+        ("Years=2001,2011", &["Alpha", "Delta", "Foxtrot"]),
+        // Different filters must all hold.
+        ("Genres=Drama&Years=2001,2010", &["Alpha", "Echo"]),
+        (
+            "IncludeItemTypes=Movie&Genres=Drama&Filters=IsPlayed",
+            &["Alpha"],
+        ),
+    ];
+    for (params, expected) in cases {
+        let (names, total) = w1filters_names(&app, &token, library, params).await;
+        assert_eq!(names, j6_names(expected), "{params}");
+        assert_eq!(total, expected.len() as i64, "{params}: TotalRecordCount");
+    }
+}
+
+#[tokio::test]
+async fn w1filters_series_status_maps_provider_words() {
+    let (app, token, library) = w1filters_seed().await;
+    let cases: [(&str, &[&str]); 4] = [
+        ("SeriesStatus=Continuing", &["Echo"]),
+        ("SeriesStatus=Ended", &["Foxtrot"]),
+        ("SeriesStatus=Continuing,Ended", &["Echo", "Foxtrot"]),
+        ("SeriesStatus=Unreleased", &[]),
+    ];
+    for (params, expected) in cases {
+        let (names, total) = w1filters_names(
+            &app,
+            &token,
+            library,
+            &format!("IncludeItemTypes=Series&{params}"),
+        )
+        .await;
+        assert_eq!(names, j6_names(expected), "{params}");
+        assert_eq!(total, expected.len() as i64, "{params}: TotalRecordCount");
+    }
+}
+
 // B110: watched status
 
 /// One hour in ticks.
