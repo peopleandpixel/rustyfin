@@ -274,6 +274,7 @@ pub async fn probe_file(path: &str) -> Result<ProbeResult, ProbeError> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .kill_on_drop(true)
         .output()
         .await
         .map_err(|e| ProbeError::FfprobeNotFound(e.to_string()))?;

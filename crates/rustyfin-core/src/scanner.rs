@@ -5,6 +5,7 @@ use rustyfin_model::media::{LocationType, MediaItem, MediaType};
 use sqlx::SqlitePool;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tokio::fs;
 use tokio::sync::{Mutex, MutexGuard};
 use uuid::Uuid;
@@ -1329,6 +1330,10 @@ fn artists_and_album_artist(
     }
 }
 
+/// The time limit for reading the tags of one existing track. A longer probe is dropped, which kills it,
+/// and counts as a failed read.
+const BACKFILL_PROBE_LIMIT: Duration = Duration::from_secs(60);
+
 /// Fill in an existing track that has no artist link: its artists, its album artist, its disc number and
 /// the years of it and its album, as a new track gets them. The track keeps its id and its album keeps its parent.
 async fn fill_track_links(
@@ -1338,7 +1343,13 @@ async fn fill_track_links(
     dirs: &MusicDirs,
     linked_albums: &mut HashSet<Uuid>,
 ) -> Result<(), sqlx::Error> {
-    let probe_result = probe::probe_file(file_path).await;
+    let probe_result =
+        match tokio::time::timeout(BACKFILL_PROBE_LIMIT, probe::probe_file(file_path)).await {
+            Ok(result) => result,
+            Err(_) => Err(probe::ProbeError::FfprobeFailed(format!(
+                "no result within {BACKFILL_PROBE_LIMIT:?}"
+            ))),
+        };
     let (artists, album_artist) = artists_and_album_artist(&probe_result);
     let tags = probe_result
         .as_ref()
@@ -1434,6 +1445,12 @@ async fn scan_music_library(
         "AlbumArtist",
     )
     .await?;
+    // The tracks whose tags a scan has read, with the size and modification time of the file then. A
+    // track without an artist link is read again only when its file differs from these.
+    let tags_read =
+        rustyfin_db::repo_media::get_library_music_tags_read(pool, library.id, &filter).await?;
+    // The existing tracks whose tags this scan read again.
+    let mut backfilled = 0u32;
 
     // Pre-load the music album rows once for the whole scan, for O(1) ID lookup.
     // Albums are MusicAlbum rows; artists are MusicArtist rows (older scans stored them as MusicAlbum).
@@ -1537,11 +1554,21 @@ async fn scan_music_library(
                         probe::spawn_probe_and_save(pool.clone(), item_id, file_path.clone());
                     }
                 }
+                // A track without an artist link is read once per file version. A failed or empty
+                // read counts too, so that the track is not read again until its file changes.
                 if let Some(&(track, _, _)) = known_tracks.get(&file_path)
                     && !linked_tracks.contains(&track)
+                    && let Some(stamp) = scan_sync::file_stamp(&file_path)
+                    && tags_read.get(&track) != Some(&stamp)
                 {
                     let dirs = music_dirs(path, &file_path_buf);
                     fill_track_links(pool, track, &file_path, &dirs, &mut linked_albums).await?;
+                    rustyfin_db::repo_media::upsert_music_tags_read(
+                        pool,
+                        &[(track, stamp.0, stamp.1)],
+                    )
+                    .await?;
+                    backfilled += 1;
                 }
                 continue;
             }
@@ -1843,10 +1870,32 @@ async fn scan_music_library(
                         probe::spawn_probe_and_save(pool.clone(), item.id, item.path.clone());
                     }
                 }
+                // The new tracks were read by the probes above, so they are not read again by a rescan.
+                let tracks_read: Vec<(Uuid, i64, i64)> = new_items
+                    .iter()
+                    .filter(|item| item.media_type == MediaType::Audio)
+                    .filter_map(|item| {
+                        scan_sync::file_stamp(&item.path)
+                            .map(|(size, mtime)| (item.id, size, mtime))
+                    })
+                    .collect();
+                if let Err(e) =
+                    rustyfin_db::repo_media::upsert_music_tags_read(pool, &tracks_read).await
+                {
+                    tracing::error!("failed to record the music tags read: {}", e);
+                }
                 count += new_items.len() as u32;
                 new_item_ids.extend(new_items.iter().map(|item| item.id));
             }
         }
+    }
+
+    if backfilled > 0 {
+        tracing::info!(
+            "music library '{}': read the tags of {} older tracks again",
+            library.name,
+            backfilled
+        );
     }
 
     // Remove the items that this scan no longer collects. A failure is logged, not returned.

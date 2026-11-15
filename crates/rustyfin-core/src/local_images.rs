@@ -90,30 +90,54 @@ pub async fn embedded_cover_paths(pool: &SqlitePool, library_id: Uuid) -> Vec<Pa
 /// Removes each file of `paths` that no `item_images` row refers to any more, that is, the covers of
 /// items deleted since [`embedded_cover_paths`] was taken. Failures are logged and do not stop the rest.
 pub async fn remove_orphaned_covers(pool: &SqlitePool, paths: &[PathBuf]) {
+    let Some(dir) = embedded_images_dir() else {
+        return;
+    };
+    if paths.is_empty() {
+        return;
+    }
+    // One query finds every cover in the embedded directory that an item still refers to. A failed
+    // query removes nothing, since the referenced set is then unknown.
+    let prefix = format!("{}{}", dir.to_string_lossy(), std::path::MAIN_SEPARATOR);
+    let pattern = format!("{}%", escape_like(&prefix));
+    let referenced: Result<Vec<String>, sqlx::Error> =
+        sqlx::query_scalar("SELECT path FROM item_images WHERE path LIKE ? ESCAPE '\\'")
+            .bind(pattern)
+            .fetch_all(pool)
+            .await;
+    let referenced: std::collections::HashSet<String> = match referenced {
+        Ok(paths) => paths.into_iter().collect(),
+        Err(e) => {
+            tracing::warn!("could not list the referenced covers: {}", e);
+            return;
+        }
+    };
     for path in paths {
-        let referenced: Result<i64, sqlx::Error> =
-            sqlx::query_scalar("SELECT COUNT(*) FROM item_images WHERE path = ?")
-                .bind(path.to_string_lossy().to_string())
-                .fetch_one(pool)
-                .await;
-        match referenced {
-            Ok(0) => {
-                if let Err(e) = tokio::fs::remove_file(path).await
-                    && e.kind() != std::io::ErrorKind::NotFound
-                {
-                    tracing::warn!(
-                        "could not remove the orphaned cover {}: {}",
-                        path.display(),
-                        e
-                    );
-                }
-            }
-            Ok(_) => {}
-            Err(e) => {
-                tracing::warn!("could not check the cover {}: {}", path.display(), e);
-            }
+        if referenced.contains(path.to_string_lossy().as_ref()) {
+            continue;
+        }
+        if let Err(e) = tokio::fs::remove_file(path).await
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                "could not remove the orphaned cover {}: {}",
+                path.display(),
+                e
+            );
         }
     }
+}
+
+/// Escapes `%`, `_` and `\` so that `text` matches only itself in a `LIKE ... ESCAPE '\'` pattern.
+fn escape_like(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for c in text.chars() {
+        if matches!(c, '%' | '_' | '\\') {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    escaped
 }
 
 /// Extracts the attached picture of `track` (with stream codec `codec`) to `<embedded dir>/<album id>.<ext>`

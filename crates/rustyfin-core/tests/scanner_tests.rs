@@ -3132,6 +3132,12 @@ impl std::io::Write for B28Logs {
 /// for one thread misses events from a place another thread logged from first.
 #[cfg(target_os = "linux")]
 fn b28_logged() -> Vec<String> {
+    logged_lines("date added backfill: ")
+}
+
+/// The log lines holding `marker`, from every test in this binary since the first call.
+#[cfg(target_os = "linux")]
+fn logged_lines(marker: &str) -> Vec<String> {
     static LOGS: std::sync::OnceLock<B28Logs> = std::sync::OnceLock::new();
     let logs = LOGS.get_or_init(|| {
         let logs = B28Logs::default();
@@ -3147,7 +3153,7 @@ fn b28_logged() -> Vec<String> {
     });
     let text = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
     text.lines()
-        .filter(|line| line.contains("date added backfill: "))
+        .filter(|line| line.contains(marker))
         .map(str::to_owned)
         .collect()
 }
@@ -5508,6 +5514,50 @@ fn r2music_cover_extensions_follow_the_codec() {
     }
 }
 
+/// A track that gives no artist, whether untagged or unreadable, is read once: rescans skip it
+/// until its file changes.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn r2music_rescan_reads_a_track_without_artists_once() {
+    if !have_ffmpeg() {
+        eprintln!("skipped: needs ffmpeg and ffprobe");
+        return;
+    }
+    logged_lines("");
+    let fx = Fixture::new().await;
+    let lib = b18_music_library(&fx, &["music_untagged"]).await;
+    let root = root_of(&lib);
+    let lone = r2music_track(&root, "Lone.flac", &[], false);
+    std::fs::write(root.join("Broken.flac"), b"not audio").unwrap();
+    // The scanner logs "music library '<name>': read the tags of <n> older tracks again".
+    let reads = || logged_lines("music library 'music_untagged': read the tags of ");
+
+    scan_idle(&fx.pool, &lib).await;
+    scan_idle(&fx.pool, &lib).await;
+    scan_idle(&fx.pool, &lib).await;
+    assert_eq!(
+        reads(),
+        Vec::<String>::new(),
+        "rescans read the tracks again"
+    );
+
+    // A changed file is read again, once.
+    let later = SystemTime::now() + Duration::from_secs(120);
+    std::fs::File::options()
+        .write(true)
+        .open(&lone)
+        .and_then(|f| f.set_modified(later))
+        .unwrap();
+    scan_idle(&fx.pool, &lib).await;
+    scan_idle(&fx.pool, &lib).await;
+    let logged = reads();
+    assert_eq!(logged.len(), 1, "{logged:?}");
+    assert!(
+        logged[0].ends_with("read the tags of 1 older tracks again"),
+        "{logged:?}"
+    );
+}
+
 /// A bounded run gives up after its limit and kills the program.
 #[tokio::test]
 async fn r2music_bounded_run_stops_a_hung_program() {
@@ -5564,6 +5614,7 @@ async fn r2music_rescan_fills_in_artists_of_older_scans() {
     // What a scan before artists were read left behind.
     exec(&fx.pool, "DELETE FROM item_people", &[]).await;
     exec(&fx.pool, "DELETE FROM people", &[]).await;
+    exec(&fx.pool, "DELETE FROM music_tags_read", &[]).await;
     exec(
         &fx.pool,
         "UPDATE media_items SET parent_index_number = NULL, production_year = NULL WHERE library_id = ?",

@@ -6945,7 +6945,7 @@ fn r2music_names(answer: &serde_json::Value) -> Vec<String> {
         .collect()
 }
 
-/// Spec 2.1-2.4: tracks and albums name their artists the way Jellyfin does (Artists as strings,
+/// Tracks and albums name their artists the way Jellyfin does (Artists as strings,
 /// ArtistItems and AlbumArtists as name and id pairs), and /Artists and /Artists/AlbumArtists list
 /// the track artists and album artists of a library.
 #[tokio::test]

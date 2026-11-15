@@ -633,6 +633,10 @@ pub async fn delete_item_rows_in(
         .bind(id)
         .execute(&mut *conn)
         .await?;
+    sqlx::query("DELETE FROM music_tags_read WHERE item_id=?1")
+        .bind(id)
+        .execute(&mut *conn)
+        .await?;
     let result = sqlx::query("DELETE FROM media_items WHERE id=?1")
         .bind(id)
         .execute(&mut *conn)
@@ -1947,6 +1951,54 @@ pub async fn fill_production_year(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// The audio items of a library whose path is in `scope` whose tags a music scan has read, as item id
+/// to (size, modification time) of the file when it was read.
+pub async fn get_library_music_tags_read(
+    pool: &SqlitePool,
+    library_id: Uuid,
+    scope: &PathScope,
+) -> Result<HashMap<Uuid, (i64, i64)>, sqlx::Error> {
+    let rows: Vec<(String, i64, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT t.item_id, t.size, t.mtime
+         FROM music_tags_read AS t
+         JOIN media_items AS m ON m.id = t.item_id
+         WHERE m.library_id = ?1 AND {}",
+        scope.sql("m.path", 2)
+    )))
+    .bind(library_id.to_string())
+    .bind(scope.param())
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(id, size, mtime)| Uuid::parse_str(&id).ok().map(|id| (id, (size, mtime))))
+        .collect())
+}
+
+/// Records that a music scan read the tags of each item, with the size and modification time of its
+/// file at that time. An item that has a row already gets the new stamp.
+pub async fn upsert_music_tags_read(
+    pool: &SqlitePool,
+    reads: &[(Uuid, i64, i64)],
+) -> Result<(), sqlx::Error> {
+    if reads.is_empty() {
+        return Ok(());
+    }
+    let mut tx = pool.begin().await?;
+    for (item_id, size, mtime) in reads {
+        sqlx::query(
+            "INSERT INTO music_tags_read (item_id, size, mtime) VALUES (?1, ?2, ?3)
+             ON CONFLICT(item_id) DO UPDATE SET size = excluded.size, mtime = excluded.mtime",
+        )
+        .bind(item_id.to_string())
+        .bind(size)
+        .bind(mtime)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await
 }
 
 /// Fetch the source of each audio item of a library whose source path is in `scope`, as (item id, path,
