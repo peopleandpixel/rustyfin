@@ -10,6 +10,7 @@ use rustyfin_model::playlist::{CreatePlaylistRequest, PlaylistDto};
 use uuid::Uuid;
 
 use crate::error::ApiError;
+use crate::parental::HiddenItems;
 use crate::state::AppState;
 
 pub fn routes() -> Router<AppState> {
@@ -103,8 +104,12 @@ async fn create_collection(
 async fn get_collection_items(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    Extension(claims): Extension<Claims>,
 ) -> Result<Json<QueryResult>, ApiError> {
-    let items = rustyfin_db::repo_collection::get_collection_items(&state.db_ro, id).await?;
+    let mut items = rustyfin_db::repo_collection::get_collection_items(&state.db_ro, id).await?;
+    HiddenItems::for_caller(&state, &claims)
+        .await?
+        .retain(&mut items, |i| i.id);
     let count = items.len() as i64;
     Ok(Json(QueryResult {
         items,
@@ -210,7 +215,11 @@ async fn get_playlist_items(
 ) -> Result<Json<QueryResult>, ApiError> {
     ensure_playlist_visible(&state, id, &claims).await?;
     let caller = playlist_caller(&claims);
-    let items = rustyfin_db::repo_playlist::get_playlist_items(&state.db_ro, id, caller).await?;
+    let mut items =
+        rustyfin_db::repo_playlist::get_playlist_items(&state.db_ro, id, caller).await?;
+    HiddenItems::for_caller(&state, &claims)
+        .await?
+        .retain(&mut items, |i| i.id);
     let count = items.len() as i64;
     Ok(Json(QueryResult {
         items,

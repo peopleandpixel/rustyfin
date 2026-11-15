@@ -4,6 +4,8 @@ use unicase::UniCase;
 use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
+use crate::parental::ParentalPolicy;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct User {
@@ -35,10 +37,20 @@ pub struct UserDto {
     pub is_disabled: bool,
     pub last_login_date: Option<DateTime<Utc>>,
     pub configuration: serde_json::Value,
+    /// Jellyfin's `UserPolicy`, with the fields Rustyfin keeps.
+    #[serde(default)]
+    pub policy: serde_json::Value,
 }
 
 impl UserDto {
     pub fn new(u: User, flags: UserFlags) -> Self {
+        let mut policy = serde_json::json!({
+            "IsAdministrator": u.is_administrator,
+            "IsDisabled": flags.is_disabled,
+        });
+        if let Some(policy) = policy.as_object_mut() {
+            ParentalPolicy::default().write_policy_fields(policy);
+        }
         Self {
             id: u.id,
             name: u.name,
@@ -47,7 +59,16 @@ impl UserDto {
             is_disabled: flags.is_disabled,
             last_login_date: u.last_login_date,
             configuration: u.configuration,
+            policy,
         }
+    }
+
+    /// Puts the user's parental limits into `Policy`.
+    pub fn with_parental(mut self, parental: &ParentalPolicy) -> Self {
+        if let Some(policy) = self.policy.as_object_mut() {
+            parental.write_policy_fields(policy);
+        }
+        self
     }
 }
 
@@ -89,6 +110,28 @@ pub struct ChangePasswordRequest {
 pub struct UpdatePolicyRequest {
     pub is_administrator: Option<bool>,
     pub is_disabled: Option<bool>,
+    /// The parental fields: absent leaves the stored value, null clears it.
+    #[serde(default, deserialize_with = "present")]
+    pub max_parental_rating: Option<Option<i32>>,
+    #[serde(default, deserialize_with = "present")]
+    pub max_parental_sub_rating: Option<Option<i32>>,
+    #[serde(default, deserialize_with = "present")]
+    pub block_unrated_items: Option<Option<Vec<String>>>,
+    #[serde(default, deserialize_with = "present")]
+    pub blocked_tags: Option<Option<Vec<String>>>,
+    #[serde(default, deserialize_with = "present")]
+    pub allowed_tags: Option<Option<Vec<String>>>,
+    #[serde(default)]
+    pub access_schedules: Option<Vec<serde_json::Value>>,
+}
+
+/// A field that is present, null or not: `Some(None)` for null, while an absent field stays `None`.
+fn present<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(d).map(Some)
 }
 
 #[derive(Debug, Deserialize)]

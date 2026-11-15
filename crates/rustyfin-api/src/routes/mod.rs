@@ -138,6 +138,10 @@ pub fn build_router(state: AppState) -> Router {
         .merge(sync_play::routes())
         .merge(oidc::protected_routes())
         .merge(admin)
+        .route_layer(axum_mw::from_fn_with_state(
+            state.clone(),
+            crate::parental::item_gate,
+        ))
         .layer(axum_mw::from_fn_with_state(state.clone(), require_auth));
 
     // Rate limit only the endpoints that check a password or PIN, and Quick Connect's Initiate,

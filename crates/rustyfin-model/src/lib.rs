@@ -15,6 +15,7 @@ pub mod media_source;
 pub mod metadata;
 pub mod notification;
 pub mod oidc;
+pub mod parental;
 pub mod person;
 pub mod playback;
 pub mod playback_info;

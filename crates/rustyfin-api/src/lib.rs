@@ -5,6 +5,7 @@ pub mod error;
 pub mod log_stream;
 pub mod middleware;
 pub mod oidc;
+pub mod parental;
 pub mod query;
 pub mod routes;
 pub mod state;

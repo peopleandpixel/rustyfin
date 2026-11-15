@@ -670,6 +670,7 @@ pub async fn get_latest_items(
     limit: i64,
     media_type: Option<&str>,
     library_id: Option<Uuid>,
+    hidden_ids_json: Option<&str>,
 ) -> Result<Vec<MediaItem>, sqlx::Error> {
     let rows = sqlx::query_as::<_, MediaItemRow>(
         "SELECT id, name, sort_name, overview, media_type, path, parent_id, library_id, \
@@ -680,11 +681,13 @@ pub async fn get_latest_items(
          FROM media_items \
          WHERE (?1 IS NULL OR media_type = ?1) \
          AND (?2 IS NULL OR library_id = ?2) \
+         AND (?4 IS NULL OR id NOT IN (SELECT value FROM json_each(?4))) \
          ORDER BY date_created DESC LIMIT ?3",
     )
     .bind(media_type)
     .bind(library_id.map(|u| u.to_string()))
     .bind(limit)
+    .bind(hidden_ids_json)
     .fetch_all(pool)
     .await?;
 
@@ -1091,6 +1094,7 @@ fn build_filtered_query(
         AND (? IS NULL OR runtime_ticks >= ?)
         AND (? IS NULL OR runtime_ticks <= ?)
         AND (? IS NULL OR id IN (SELECT value FROM json_each(?)))
+        AND (? IS NULL OR id NOT IN (SELECT value FROM json_each(?)))
     ";
 
     // Combine base WHERE with array filter WHERE parts
@@ -1164,6 +1168,7 @@ pub async fn get_items_filtered(
     runtime: Option<(i32, i32)>,
     user_id: Option<Uuid>,
     item_ids: Option<&[String]>,
+    hidden_ids_json: Option<&str>,
 ) -> Result<(Vec<MediaItem>, i64), sqlx::Error> {
     // Convert options to strings for the (? IS NULL OR ? = '' OR col = ?) pattern
     let pid_str = parent_id.map(|u| u.to_string()).unwrap_or_default();
@@ -1259,7 +1264,9 @@ pub async fn get_items_filtered(
         .bind(&max_ticks)
         .bind(&max_ticks)
         .bind(&item_ids_json)
-        .bind(&item_ids_json);
+        .bind(&item_ids_json)
+        .bind(hidden_ids_json)
+        .bind(hidden_ids_json);
 
     // Array filter params
     if let Some(types) = media_types {
@@ -1375,7 +1382,9 @@ pub async fn get_items_filtered(
         .bind(&max_ticks)
         .bind(&max_ticks)
         .bind(&item_ids_json)
-        .bind(&item_ids_json);
+        .bind(&item_ids_json)
+        .bind(hidden_ids_json)
+        .bind(hidden_ids_json);
 
     // Array filter params (same order as count query)
     if let Some(types) = media_types {
@@ -1745,22 +1754,36 @@ pub async fn get_filters(
         Ok((genres, years, ratings))
     } else {
         // Fallback to DISTINCT queries
-        get_filters_distinct(pool, _library_id).await
+        get_filters_distinct(pool, _library_id, None).await
     }
+}
+
+/// The filter values of the items a user may see: `get_filters` without the items whose ids are
+/// in `hidden_ids_json` (a JSON array).
+pub async fn get_filters_hiding(
+    pool: &SqlitePool,
+    library_id: Option<Uuid>,
+    hidden_ids_json: &str,
+) -> Result<(Vec<String>, Vec<i32>, Vec<String>), sqlx::Error> {
+    get_filters_distinct(pool, library_id, Some(hidden_ids_json)).await
 }
 
 /// Original DISTINCT-based filter query (fallback when materialized indexes are empty).
 async fn get_filters_distinct(
     pool: &SqlitePool,
     library_id: Option<Uuid>,
+    hidden_ids_json: Option<&str>,
 ) -> Result<(Vec<String>, Vec<i32>, Vec<String>), sqlx::Error> {
     let lid = library_id.map(|u| u.to_string()).unwrap_or_default();
 
     let genre_strs: Vec<String> = sqlx::query_scalar::<_, String>(
-        "SELECT DISTINCT genres FROM media_items WHERE (? = '' OR library_id = ?)",
+        "SELECT DISTINCT genres FROM media_items WHERE (? = '' OR library_id = ?) \
+         AND (? IS NULL OR id NOT IN (SELECT value FROM json_each(?)))",
     )
     .bind(&lid)
     .bind(lid.clone())
+    .bind(hidden_ids_json)
+    .bind(hidden_ids_json)
     .fetch_all(pool)
     .await?;
     let mut all_genres: Vec<String> = Vec::new();
@@ -1777,20 +1800,26 @@ async fn get_filters_distinct(
     let years: Vec<i32> = sqlx::query_scalar::<_, i32>(
         "SELECT DISTINCT production_year FROM media_items \
          WHERE production_year IS NOT NULL AND (? = '' OR library_id = ?) \
+         AND (? IS NULL OR id NOT IN (SELECT value FROM json_each(?))) \
          ORDER BY production_year DESC",
     )
     .bind(&lid)
     .bind(lid.clone())
+    .bind(hidden_ids_json)
+    .bind(hidden_ids_json)
     .fetch_all(pool)
     .await?;
 
     let ratings: Vec<String> = sqlx::query_scalar::<_, String>(
         "SELECT DISTINCT official_rating FROM media_items \
          WHERE official_rating IS NOT NULL AND (? = '' OR library_id = ?) \
+         AND (? IS NULL OR id NOT IN (SELECT value FROM json_each(?))) \
          ORDER BY official_rating",
     )
     .bind(&lid)
     .bind(lid.clone())
+    .bind(hidden_ids_json)
+    .bind(hidden_ids_json)
     .fetch_all(pool)
     .await?;
 
@@ -2053,6 +2082,7 @@ pub async fn get_user_resume_items(
     pool: &SqlitePool,
     user_id: Uuid,
     limit: i64,
+    hidden_ids_json: Option<&str>,
 ) -> Result<Vec<MediaItem>, sqlx::Error> {
     let uid = user_id.to_string();
     let rows = sqlx::query_as::<_, MediaItemRow>(
@@ -2064,9 +2094,12 @@ pub async fn get_user_resume_items(
          FROM media_items m \
          INNER JOIN user_item_data u ON u.item_id = m.id AND u.user_id = ? \
          WHERE u.playback_position_ticks > 0 \
+         AND (? IS NULL OR m.id NOT IN (SELECT value FROM json_each(?))) \
          ORDER BY u.last_played_date DESC LIMIT ?",
     )
     .bind(&uid)
+    .bind(hidden_ids_json)
+    .bind(hidden_ids_json)
     .bind(limit)
     .fetch_all(pool)
     .await?;

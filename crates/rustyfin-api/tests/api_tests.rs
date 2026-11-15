@@ -16146,6 +16146,599 @@ async fn test_upgrade_promotes_earliest_admin() {
     );
 }
 
+// ── Parental controls ──
+// A user's MaxParentalRating, BlockUnratedItems, BlockedTags and AllowedTags are kept in Policy and
+// hide items on every route: lists and counts leave them out, and routes on one item answer 404.
+
+/// A library of rated movies and two series, an administrator and a user "kid" who has no limits
+/// until a test sets them.
+struct R2Parental {
+    state: AppState,
+    app: axum::Router,
+    admin: String,
+    kid: String,
+    kid_id: uuid::Uuid,
+    /// Item ids by name.
+    ids: HashMap<&'static str, uuid::Uuid>,
+}
+
+impl R2Parental {
+    fn id(&self, name: &str) -> uuid::Uuid {
+        self.ids[name]
+    }
+
+    /// Sets the kid's policy through the API, as an administrator.
+    async fn set_policy(&self, policy: serde_json::Value) {
+        let uri = format!("/Users/{}/Policy", self.kid_id);
+        let (status, body) = send(
+            &self.app,
+            request("POST", &uri, Some(&self.admin), Some(policy)),
+        )
+        .await;
+        assert!(status.is_success(), "{uri}: {status} {body}");
+    }
+
+    async fn get(&self, token: &str, uri: &str) -> (StatusCode, serde_json::Value) {
+        send(&self.app, request("GET", uri, Some(token), None)).await
+    }
+
+    /// The sorted names of the items a list route answers to `token`, and its TotalRecordCount
+    /// (the list's length for a route that answers a bare array).
+    async fn names(&self, token: &str, uri: &str) -> (Vec<String>, i64) {
+        let (status, body) = self.get(token, uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        let items = body
+            .get("Items")
+            .or_else(|| body.get("SearchHints"))
+            .unwrap_or(&body)
+            .as_array()
+            .unwrap_or_else(|| panic!("{uri}: no list in {body}"))
+            .clone();
+        let mut names: Vec<String> = items
+            .iter()
+            .map(|i| i["Name"].as_str().unwrap_or("?").to_string())
+            .collect();
+        names.sort();
+        let total = body
+            .get("TotalRecordCount")
+            .and_then(|t| t.as_i64())
+            .unwrap_or(names.len() as i64);
+        (names, total)
+    }
+}
+
+/// A test item: name, type, parent's name, rating, tags and genres.
+type R2ParentalRow = (
+    &'static str,
+    &'static str,
+    Option<&'static str>,
+    Option<&'static str>,
+    &'static str,
+    &'static str,
+);
+
+async fn r2parental() -> R2Parental {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (admin, _) = admin_session(&state).await;
+    let kid = rustyfin_model::user::User {
+        id: uuid::Uuid::new_v4(),
+        name: "kid".to_string(),
+        password_hash: String::new(),
+        is_administrator: false,
+        created_at: chrono::Utc::now(),
+        last_login_date: None,
+        configuration: serde_json::Value::Null,
+    };
+    rustyfin_db::repo_user::create_user(&state.db, &kid)
+        .await
+        .unwrap();
+    let kid_token = rustyfin_auth::create_token(&state.db, &kid, &Default::default())
+        .await
+        .unwrap();
+
+    let folder = state.data_dir.join("media").join("r2parental");
+    std::fs::create_dir_all(&folder).unwrap();
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: "Parental".to_string(),
+        content_type: rustyfin_model::library::LibraryContentType::Movies,
+        paths: vec![folder.to_string_lossy().to_string()],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+
+    let rows: [R2ParentalRow; 14] = [
+        ("Gentle", "Movie", None, Some("G"), "", "Family"),
+        ("Pleasant", "Movie", None, Some("PG"), "", "Family"),
+        ("Rough", "Movie", None, Some("R"), "", "Thriller"),
+        ("Edgy", "Movie", None, Some("US-PG-13"), "", "Thriller"),
+        ("Plain", "Movie", None, None, "", ""),
+        ("Odd", "Movie", None, Some("Zorblax"), "", ""),
+        ("Spooky", "Movie", None, Some("G"), "Horror|Night", ""),
+        ("Grim Show", "Series", None, Some("TV-MA"), "", ""),
+        ("Grim Season", "Season", Some("Grim Show"), None, "", ""),
+        ("Grim Episode", "Episode", Some("Grim Season"), None, "", ""),
+        (
+            "Grim Mild Episode",
+            "Episode",
+            Some("Grim Season"),
+            Some("TV-PG"),
+            "",
+            "",
+        ),
+        ("Kind Show", "Series", None, Some("TV-G"), "Kids", ""),
+        ("Kind Season", "Season", Some("Kind Show"), None, "", ""),
+        ("Kind Episode", "Episode", Some("Kind Season"), None, "", ""),
+    ];
+    let mut ids: HashMap<&'static str, uuid::Uuid> = HashMap::new();
+    for (name, media_type, parent, rating, tags, genres) in rows {
+        let id = uuid::Uuid::new_v4();
+        let path = folder.join(format!("{name}.mkv"));
+        if matches!(media_type, "Movie" | "Episode") {
+            std::fs::write(&path, b"r2parental video bytes").unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO media_items (id, library_id, name, media_type, path, parent_id, \
+             official_rating, tags, genres) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(id.to_string())
+        .bind(lib.id.to_string())
+        .bind(name)
+        .bind(media_type)
+        .bind(path.to_string_lossy().to_string())
+        .bind(parent.map(|p| ids[p].to_string()))
+        .bind(rating)
+        .bind(tags)
+        .bind(genres)
+        .execute(&state.db)
+        .await
+        .unwrap();
+        ids.insert(name, id);
+    }
+    R2Parental {
+        state,
+        app,
+        admin,
+        kid: kid_token,
+        kid_id: kid.id,
+        ids,
+    }
+}
+
+fn r2parental_names(names: &[&str]) -> Vec<String> {
+    let mut names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+    names.sort();
+    names
+}
+
+const R2PARENTAL_ALL_MOVIES: [&str; 7] = [
+    "Edgy", "Gentle", "Odd", "Plain", "Pleasant", "Rough", "Spooky",
+];
+
+#[tokio::test]
+async fn r2parental_policy_is_kept_and_returned() {
+    let w = r2parental().await;
+    let user_uri = format!("/Users/{}", w.kid_id);
+    let (status, user) = w.get(&w.admin, &user_uri).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(user["Policy"]["MaxParentalRating"], serde_json::Value::Null);
+    assert_eq!(user["Policy"]["BlockUnratedItems"], serde_json::json!([]));
+    assert_eq!(user["Policy"]["IsAdministrator"], false);
+
+    // A whole Jellyfin policy, as Jellyfin Web sends it back.
+    let mut policy = user["Policy"].clone();
+    policy["MaxParentalRating"] = 10.into();
+    policy["MaxParentalSubRating"] = 0.into();
+    policy["BlockUnratedItems"] = serde_json::json!(["movie", "Series", "Movie"]);
+    policy["BlockedTags"] = serde_json::json!([" Horror ", "horror", ""]);
+    policy["AllowedTags"] = serde_json::json!(["Kids"]);
+    w.set_policy(policy).await;
+    for (token, uri) in [
+        (&w.admin, user_uri.clone()),
+        (&w.kid, "/Users/Me".to_string()),
+    ] {
+        let (status, user) = w.get(token, &uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        let p = &user["Policy"];
+        assert_eq!(p["MaxParentalRating"], 10, "{uri}");
+        assert_eq!(p["MaxParentalSubRating"], 0, "{uri}");
+        assert_eq!(
+            p["BlockUnratedItems"],
+            serde_json::json!(["Movie", "Series"])
+        );
+        assert_eq!(p["BlockedTags"], serde_json::json!(["Horror"]));
+        assert_eq!(p["AllowedTags"], serde_json::json!(["Kids"]));
+    }
+    let (status, users) = w.get(&w.admin, "/Users").await;
+    assert_eq!(status, StatusCode::OK);
+    let listed = users
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["Name"] == "kid")
+        .unwrap();
+    assert_eq!(listed["Policy"]["MaxParentalRating"], 10);
+
+    // A policy without the fields keeps them; null clears the maximum.
+    w.set_policy(serde_json::json!({ "IsAdministrator": false }))
+        .await;
+    let (_, user) = w.get(&w.admin, &user_uri).await;
+    assert_eq!(user["Policy"]["MaxParentalRating"], 10);
+    w.set_policy(serde_json::json!({ "MaxParentalRating": null, "AllowedTags": null }))
+        .await;
+    let (_, user) = w.get(&w.admin, &user_uri).await;
+    assert_eq!(user["Policy"]["MaxParentalRating"], serde_json::Value::Null);
+    assert_eq!(user["Policy"]["AllowedTags"], serde_json::json!([]));
+    assert_eq!(user["Policy"]["BlockedTags"], serde_json::json!(["Horror"]));
+
+    // What can't be kept is refused, and nothing changes.
+    let uri = format!("/Users/{}/Policy", w.kid_id);
+    for bad in [
+        serde_json::json!({ "MaxParentalRating": 13, "BlockUnratedItems": ["Cartoons"] }),
+        serde_json::json!({ "MaxParentalRating": 13, "AccessSchedules": [
+            { "DayOfWeek": "Everyday", "StartHour": 8, "EndHour": 20 }
+        ] }),
+    ] {
+        let (status, _) = send(&w.app, request("POST", &uri, Some(&w.admin), Some(bad))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+    let (_, user) = w.get(&w.admin, &user_uri).await;
+    assert_eq!(user["Policy"]["MaxParentalRating"], serde_json::Value::Null);
+
+    // Only an administrator sets limits; the kid can't lift their own.
+    let body = serde_json::json!({ "BlockedTags": [] });
+    let (status, _) = send(&w.app, request("POST", &uri, Some(&w.kid), Some(body))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn r2parental_lists_leave_out_items_above_the_limit() {
+    let w = r2parental().await;
+    let movies = "/Items?Recursive=true&IncludeItemTypes=Movie";
+    assert_eq!(
+        w.names(&w.kid, movies).await,
+        (r2parental_names(&R2PARENTAL_ALL_MOVIES), 7),
+        "no limits yet"
+    );
+
+    w.set_policy(serde_json::json!({ "MaxParentalRating": 10 }))
+        .await;
+    // PG-13 and R are above 10; unrated and unknown ratings pass while unrated movies aren't
+    // blocked.
+    let allowed = r2parental_names(&["Gentle", "Odd", "Plain", "Pleasant", "Spooky"]);
+    assert_eq!(w.names(&w.kid, movies).await, (allowed.clone(), 5));
+    let page = format!("{movies}&SortBy=SortName&StartIndex=0&Limit=2");
+    let (names, total) = w.names(&w.kid, &page).await;
+    assert_eq!(
+        (names.len(), total),
+        (2, 5),
+        "paging counts only what the kid sees"
+    );
+    let (names, _) = w
+        .names(
+            &w.kid,
+            &format!(
+                "/Users/{}/Items?Recursive=true&IncludeItemTypes=Movie",
+                w.kid_id
+            ),
+        )
+        .await;
+    assert_eq!(names, allowed);
+    assert_eq!(
+        w.names(&w.admin, movies).await.0,
+        r2parental_names(&R2PARENTAL_ALL_MOVIES),
+        "the administrator has no limits"
+    );
+    assert_eq!(
+        w.names("test-api-key", movies).await.0,
+        r2parental_names(&R2PARENTAL_ALL_MOVIES),
+        "nor has the API key"
+    );
+
+    // A TV-MA series hides its seasons and episodes, even an episode rated lower; an unrated
+    // episode of a TV-G series takes the series' rating.
+    let (all, _) = w.names(&w.kid, "/Items?Recursive=true").await;
+    for name in [
+        "Rough",
+        "Edgy",
+        "Grim Show",
+        "Grim Season",
+        "Grim Episode",
+        "Grim Mild Episode",
+    ] {
+        assert!(!all.contains(&name.to_string()), "{name} in {all:?}");
+    }
+    for name in ["Kind Show", "Kind Season", "Kind Episode", "Gentle"] {
+        assert!(
+            all.contains(&name.to_string()),
+            "{name} missing from {all:?}"
+        );
+    }
+
+    let kind = w.id("Kind Show");
+    let grim_season = w.id("Grim Season");
+    let latest = w.names(&w.kid, "/Items/Latest?Limit=3").await.0;
+    assert_eq!(
+        latest.len(),
+        3,
+        "the limit is filled with what the kid sees: {latest:?}"
+    );
+    let checks = [
+        "/Items/Latest?Limit=100".to_string(),
+        format!("/Users/{}/Items/Latest?Limit=100", w.kid_id),
+        "/Search/Hints?searchTerm=Ro".to_string(),
+        "/Search/Hints?searchTerm=Grim".to_string(),
+        "/Search?Term=Rough".to_string(),
+        "/Search?Term=Grim&IncludeItemTypes=Episode".to_string(),
+        format!("/Shows/{kind}/Episodes"),
+        format!("/Shows/{kind}/Seasons"),
+        "/Shows/NextUp".to_string(),
+        "/Movies/Recommendations".to_string(),
+        "/Movies/Featured".to_string(),
+        format!("/Items/{}/Similar", w.id("Gentle")),
+        format!("/Movies/{}/Similar", w.id("Gentle")),
+    ];
+    for uri in &checks {
+        let (names, _) = w.names(&w.kid, uri).await;
+        for hidden in [
+            "Rough",
+            "Edgy",
+            "Grim Show",
+            "Grim Episode",
+            "Grim Mild Episode",
+        ] {
+            assert!(
+                !names.contains(&hidden.to_string()),
+                "{uri}: {hidden} in {names:?}"
+            );
+        }
+    }
+    assert_eq!(
+        w.names(&w.kid, &format!("/Shows/{kind}/Episodes")).await,
+        (vec!["Kind Episode".to_string()], 1)
+    );
+
+    // Resume keeps the kid's own unfinished items, but not hidden ones.
+    for name in ["Rough", "Gentle"] {
+        sqlx::query(
+            "INSERT INTO user_item_data (user_id, item_id, playback_position_ticks, last_played_date) \
+             VALUES (?, ?, 1000, datetime('now'))",
+        )
+        .bind(w.kid_id.to_string())
+        .bind(w.id(name).to_string())
+        .execute(&w.state.db)
+        .await
+        .unwrap();
+    }
+    for uri in [
+        "/Items/Resume".to_string(),
+        format!("/Users/{}/Items/Resume", w.kid_id),
+    ] {
+        assert_eq!(
+            w.names(&w.kid, &uri).await,
+            (vec!["Gentle".to_string()], 1),
+            "{uri}"
+        );
+    }
+
+    // Filters and the genre list count only visible items.
+    let (status, filters) = w.get(&w.kid, "/Items/Filters").await;
+    assert_eq!(status, StatusCode::OK);
+    let ratings = filters["OfficialRatings"].as_array().unwrap();
+    assert!(!ratings.contains(&"R".into()), "{filters}");
+    assert!(ratings.contains(&"G".into()), "{filters}");
+    let (genres, _) = w.names(&w.kid, "/Genres").await;
+    assert_eq!(genres, vec!["Family".to_string()]);
+    let (status, _) = w.get(&w.kid, "/Genres/Thriller").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = w.get(&w.admin, "/Genres/Thriller").await;
+    assert_eq!(status, StatusCode::OK);
+
+    // A hidden folder's contents aren't listed either.
+    let (status, _) = w
+        .get(&w.kid, &format!("/Items/{grim_season}/Children"))
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (names, total) = w
+        .names(&w.kid, &format!("/Items?ParentId={grim_season}"))
+        .await;
+    assert_eq!((names.len(), total), (0, 0));
+}
+
+#[tokio::test]
+async fn r2parental_routes_on_one_item_answer_404_for_a_hidden_item() {
+    let w = r2parental().await;
+    w.set_policy(serde_json::json!({ "MaxParentalRating": 10 }))
+        .await;
+    let routes = [
+        "/Items/{id}",
+        "/Items/{id}/Images",
+        "/Items/{id}/Images/Primary",
+        "/Items/{id}/Images/Primary/0",
+        "/Items/{id}/PlaybackInfo",
+        "/Videos/{id}/PlaybackInfo",
+        "/Videos/{id}/stream",
+        "/Videos/{id}/stream.mkv",
+        "/Videos/{id}/progressive.stream",
+        "/Videos/{id}/Universal",
+        "/Videos/{id}/main.m3u8",
+        "/Videos/{id}/hls/0.ts",
+        "/Videos/{id}/Chapters",
+        "/Videos/{id}/Subtitles/0/Stream",
+        "/Videos/{id}/{id}/Subtitles/0/Stream.vtt",
+        "/Items/{id}/Similar",
+        "/Items/{id}/Ancestors",
+        "/Items/{id}/Children",
+        "/Items/{id}/Collections",
+        "/Items/{id}/Trickplay/Preview/320/0",
+        "/MediaSegments/{id}",
+        "/Movies/{id}/Similar",
+        "/Users/{user}/Items/{id}/InstantMix",
+        "/Audio/{id}/stream",
+        "/Audio/{id}/universal",
+    ];
+    for hidden in ["Rough", "Grim Show", "Grim Episode", "Grim Mild Episode"] {
+        let id = w.id(hidden).to_string();
+        for route in routes {
+            let uri = route
+                .replace("{id}", &id)
+                .replace("{user}", &w.kid_id.to_string());
+            let (status, body) = w.get(&w.kid, &uri).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{hidden}: {uri}: {body}");
+        }
+        for uri in [
+            format!("/Shows/{id}/Seasons"),
+            format!("/Shows/{id}/Episodes"),
+        ] {
+            if hidden == "Grim Show" {
+                let (status, _) = w.get(&w.kid, &uri).await;
+                assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+            }
+        }
+    }
+    // The same routes still serve a visible item and serve the hidden one to the administrator.
+    for (token, name) in [
+        (&w.kid, "Gentle"),
+        (&w.admin, "Rough"),
+        (&w.kid, "Kind Episode"),
+    ] {
+        let id = w.id(name);
+        let (status, body) = w.get(token, &format!("/Items/{id}")).await;
+        assert_eq!(status, StatusCode::OK, "{name}: {body}");
+        assert_eq!(body["Name"], name);
+        let (status, _) = w.get(token, &format!("/Videos/{id}/stream")).await;
+        assert!(status.is_success(), "{name}: stream {status}");
+    }
+
+    // Every item is either listed and served, or neither: the lists and the routes on one item
+    // apply the same rule.
+    let (listed, _) = w.names(&w.kid, "/Items?Recursive=true").await;
+    for (name, id) in &w.ids {
+        let (status, _) = w.get(&w.kid, &format!("/Items/{id}")).await;
+        assert_eq!(
+            status == StatusCode::OK,
+            listed.contains(&name.to_string()),
+            "{name}: {status}, listed {listed:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn r2parental_unrated_items_are_blocked_by_kind() {
+    let w = r2parental().await;
+    let movies = "/Items?Recursive=true&IncludeItemTypes=Movie";
+    // Unrated movies (none stored, or a rating no system knows) are blocked; rated ones pass
+    // with no maximum.
+    w.set_policy(serde_json::json!({ "BlockUnratedItems": ["Movie"] }))
+        .await;
+    assert_eq!(
+        w.names(&w.kid, movies).await.0,
+        r2parental_names(&["Edgy", "Gentle", "Pleasant", "Rough", "Spooky"])
+    );
+    let (all, _) = w.names(&w.kid, "/Items?Recursive=true").await;
+    assert!(
+        all.contains(&"Kind Episode".to_string()),
+        "series aren't blocked: {all:?}"
+    );
+    let (status, _) = w.get(&w.kid, &format!("/Items/{}", w.id("Plain"))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // The harness's case: a maximum of 10 with unrated movies and series blocked.
+    w.set_policy(
+        serde_json::json!({ "MaxParentalRating": 10, "BlockUnratedItems": ["Movie", "Series"] }),
+    )
+    .await;
+    assert_eq!(
+        w.names(&w.kid, movies).await.0,
+        r2parental_names(&["Gentle", "Pleasant", "Spooky"])
+    );
+    // An unrated episode of a rated series takes the series' rating, and seasons are never
+    // blocked as unrated.
+    let (all, _) = w.names(&w.kid, "/Items?Recursive=true").await;
+    for name in ["Kind Show", "Kind Season", "Kind Episode"] {
+        assert!(
+            all.contains(&name.to_string()),
+            "{name} missing from {all:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn r2parental_tags_block_and_allow() {
+    let w = r2parental().await;
+    let movies = "/Items?Recursive=true&IncludeItemTypes=Movie";
+    w.set_policy(serde_json::json!({ "BlockedTags": ["HORROR"] }))
+        .await;
+    let (names, total) = w.names(&w.kid, movies).await;
+    assert!(!names.contains(&"Spooky".to_string()), "{names:?}");
+    assert_eq!(total, 6);
+    let (status, _) = w.get(&w.kid, &format!("/Items/{}", w.id("Spooky"))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // With allowed tags, only top-level items with one show, and what is under them.
+    w.set_policy(serde_json::json!({ "BlockedTags": [], "AllowedTags": ["kids"] }))
+        .await;
+    let (all, _) = w.names(&w.kid, "/Items?Recursive=true").await;
+    assert_eq!(
+        all,
+        r2parental_names(&["Kind Show", "Kind Season", "Kind Episode"])
+    );
+    let (status, _) = w
+        .get(&w.kid, &format!("/Videos/{}/stream", w.id("Kind Episode")))
+        .await;
+    assert!(status.is_success(), "{status}");
+    let (status, _) = w
+        .get(&w.kid, &format!("/Videos/{}/stream", w.id("Gentle")))
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn r2parental_shared_caches_never_answer_a_limited_user() {
+    let w = r2parental().await;
+    w.set_policy(serde_json::json!({ "MaxParentalRating": 10 }))
+        .await;
+    // The administrator's answers go into the shared caches first.
+    for uri in [
+        "/Search/Hints?searchTerm=Rough",
+        "/Search?Term=Rough",
+        "/Items/Filters",
+    ] {
+        let (status, _) = w.get(&w.admin, uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+    }
+    for uri in ["/Search/Hints?searchTerm=Rough", "/Search?Term=Rough"] {
+        assert_eq!(w.names(&w.kid, uri).await, (vec![], 0), "{uri}");
+    }
+    let (_, filters) = w.get(&w.kid, "/Items/Filters").await;
+    assert!(
+        !filters["OfficialRatings"]
+            .as_array()
+            .unwrap()
+            .contains(&"R".into())
+    );
+    // A Series' details are cached for every user; the kid still can't read the hidden one.
+    let grim = w.id("Grim Show");
+    let (status, _) = w.get(&w.admin, &format!("/Items/{grim}")).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = w.get(&w.kid, &format!("/Items/{grim}")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn r2parental_rating_list_offers_us_ratings() {
+    let w = r2parental().await;
+    let (status, list) = w.get(&w.kid, "/Localization/ParentalRatings").await;
+    assert_eq!(status, StatusCode::OK);
+    let list = list.as_array().unwrap();
+    let pg = list.iter().find(|r| r["Name"] == "PG").unwrap();
+    assert_eq!(pg["Value"], 10);
+    assert_eq!(pg["RatingScore"]["score"], 10);
+    assert!(list.iter().any(|r| r["Name"] == "R" && r["Value"] == 17));
+}
+
 // ── G1: authorization ──
 // Admin endpoints answer 401 without a valid token and 403 to a non-admin. Setup endpoints are
 // open only while the server has no users. Names taken from a request stay inside their directory.

@@ -1,11 +1,13 @@
-use axum::Json;
 use axum::Router;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::get;
+use axum::{Extension, Json};
+use rustyfin_model::auth::Claims;
 use serde::Serialize;
 use uuid::Uuid;
 
+use crate::parental::HiddenItems;
 use crate::state::AppState;
 
 /// Additional Jellyfin-compatible controllers: recommendations, featured, instant mix.
@@ -50,6 +52,7 @@ struct QueryResult<T: Serialize> {
 /// Uses highly-rated and recently added movies as recommendations.
 async fn get_recommendations(
     State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
 ) -> Result<
     (
         StatusCode,
@@ -58,9 +61,12 @@ async fn get_recommendations(
     crate::error::ApiError,
 > {
     // Get highly-rated movies (community_rating >= 7.0)
-    let items = rustyfin_db::repo_media::get_recommendations(&state.db_ro, 25)
+    let mut items = rustyfin_db::repo_media::get_recommendations(&state.db_ro, 25)
         .await
         .map_err(|e| crate::error::ApiError::Internal(e.to_string()))?;
+    HiddenItems::for_caller(&state, &claims)
+        .await?
+        .retain(&mut items, |i| i.id);
 
     let total = items.len() as i64;
     Ok((
@@ -76,6 +82,7 @@ async fn get_recommendations(
 /// GET /Movies/Featured — Returns featured movies (recently added or highly rated).
 async fn get_featured(
     State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
 ) -> Result<
     (
         StatusCode,
@@ -83,9 +90,12 @@ async fn get_featured(
     ),
     crate::error::ApiError,
 > {
-    let items = rustyfin_db::repo_media::get_featured_movies(&state.db_ro, 10)
+    let mut items = rustyfin_db::repo_media::get_featured_movies(&state.db_ro, 10)
         .await
         .map_err(|e| crate::error::ApiError::Internal(e.to_string()))?;
+    HiddenItems::for_caller(&state, &claims)
+        .await?
+        .retain(&mut items, |i| i.id);
 
     let total = items.len() as i64;
     Ok((
@@ -103,6 +113,7 @@ async fn get_featured(
 async fn get_instant_mix(
     State(state): State<AppState>,
     Path((_user_id, item_id)): Path<(Uuid, Uuid)>,
+    Extension(claims): Extension<Claims>,
 ) -> Result<
     (
         StatusCode,
@@ -111,15 +122,18 @@ async fn get_instant_mix(
     crate::error::ApiError,
 > {
     // Get the source item to find similar items
+
+    let hidden = HiddenItems::for_caller(&state, &claims).await?;
     let source = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, item_id)
         .await
         .map_err(|e| crate::error::ApiError::Internal(e.to_string()))?
         .ok_or_else(|| crate::error::ApiError::NotFound("Item not found".to_string()))?;
 
     // Get similar items based on the source
-    let items = rustyfin_db::repo_media::get_similar_items(&state.db_ro, &source, 50)
+    let mut items = rustyfin_db::repo_media::get_similar_items(&state.db_ro, &source, 50)
         .await
         .map_err(|e| crate::error::ApiError::Internal(e.to_string()))?;
+    hidden.retain(&mut items, |i| i.id);
 
     let total = items.len() as i64;
     Ok((
@@ -136,6 +150,7 @@ async fn get_instant_mix(
 async fn get_albums_instant_mix(
     State(state): State<AppState>,
     Path(item_id): Path<Uuid>,
+    Extension(claims): Extension<Claims>,
 ) -> Result<
     (
         StatusCode,
@@ -143,13 +158,15 @@ async fn get_albums_instant_mix(
     ),
     crate::error::ApiError,
 > {
+    let hidden = HiddenItems::for_caller(&state, &claims).await?;
     let source = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, item_id)
         .await
         .map_err(|e| crate::error::ApiError::Internal(e.to_string()))?
         .ok_or_else(|| crate::error::ApiError::NotFound("Album not found".to_string()))?;
-    let items = rustyfin_db::repo_media::get_similar_items(&state.db_ro, &source, 50)
+    let mut items = rustyfin_db::repo_media::get_similar_items(&state.db_ro, &source, 50)
         .await
         .map_err(|e| crate::error::ApiError::Internal(e.to_string()))?;
+    hidden.retain(&mut items, |i| i.id);
     let total = items.len() as i64;
     Ok((
         StatusCode::OK,
@@ -165,6 +182,7 @@ async fn get_albums_instant_mix(
 async fn get_albums_similar(
     State(state): State<AppState>,
     Path(item_id): Path<Uuid>,
+    Extension(claims): Extension<Claims>,
 ) -> Result<
     (
         StatusCode,
@@ -172,13 +190,15 @@ async fn get_albums_similar(
     ),
     crate::error::ApiError,
 > {
+    let hidden = HiddenItems::for_caller(&state, &claims).await?;
     let source = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, item_id)
         .await
         .map_err(|e| crate::error::ApiError::Internal(e.to_string()))?
         .ok_or_else(|| crate::error::ApiError::NotFound("Album not found".to_string()))?;
-    let items = rustyfin_db::repo_media::get_similar_items(&state.db_ro, &source, 20)
+    let mut items = rustyfin_db::repo_media::get_similar_items(&state.db_ro, &source, 20)
         .await
         .map_err(|e| crate::error::ApiError::Internal(e.to_string()))?;
+    hidden.retain(&mut items, |i| i.id);
     let total = items.len() as i64;
     Ok((
         StatusCode::OK,
@@ -194,6 +214,7 @@ async fn get_albums_similar(
 async fn get_artists_instant_mix(
     State(state): State<AppState>,
     Path(item_id): Path<Uuid>,
+    Extension(claims): Extension<Claims>,
 ) -> Result<
     (
         StatusCode,
@@ -201,13 +222,15 @@ async fn get_artists_instant_mix(
     ),
     crate::error::ApiError,
 > {
+    let hidden = HiddenItems::for_caller(&state, &claims).await?;
     let source = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, item_id)
         .await
         .map_err(|e| crate::error::ApiError::Internal(e.to_string()))?
         .ok_or_else(|| crate::error::ApiError::NotFound("Artist not found".to_string()))?;
-    let items = rustyfin_db::repo_media::get_similar_items(&state.db_ro, &source, 50)
+    let mut items = rustyfin_db::repo_media::get_similar_items(&state.db_ro, &source, 50)
         .await
         .map_err(|e| crate::error::ApiError::Internal(e.to_string()))?;
+    hidden.retain(&mut items, |i| i.id);
     let total = items.len() as i64;
     Ok((
         StatusCode::OK,
@@ -223,6 +246,7 @@ async fn get_artists_instant_mix(
 async fn get_artists_similar(
     State(state): State<AppState>,
     Path(item_id): Path<Uuid>,
+    Extension(claims): Extension<Claims>,
 ) -> Result<
     (
         StatusCode,
@@ -230,13 +254,15 @@ async fn get_artists_similar(
     ),
     crate::error::ApiError,
 > {
+    let hidden = HiddenItems::for_caller(&state, &claims).await?;
     let source = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, item_id)
         .await
         .map_err(|e| crate::error::ApiError::Internal(e.to_string()))?
         .ok_or_else(|| crate::error::ApiError::NotFound("Artist not found".to_string()))?;
-    let items = rustyfin_db::repo_media::get_similar_items(&state.db_ro, &source, 20)
+    let mut items = rustyfin_db::repo_media::get_similar_items(&state.db_ro, &source, 20)
         .await
         .map_err(|e| crate::error::ApiError::Internal(e.to_string()))?;
+    hidden.retain(&mut items, |i| i.id);
     let total = items.len() as i64;
     Ok((
         StatusCode::OK,
@@ -301,6 +327,7 @@ async fn get_artists_by_name(
 async fn get_movies_similar(
     State(state): State<AppState>,
     Path(item_id): Path<Uuid>,
+    Extension(claims): Extension<Claims>,
 ) -> Result<
     (
         StatusCode,
@@ -308,13 +335,15 @@ async fn get_movies_similar(
     ),
     crate::error::ApiError,
 > {
+    let hidden = HiddenItems::for_caller(&state, &claims).await?;
     let source = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, item_id)
         .await
         .map_err(|e| crate::error::ApiError::Internal(e.to_string()))?
         .ok_or_else(|| crate::error::ApiError::NotFound("Movie not found".to_string()))?;
-    let items = rustyfin_db::repo_media::get_similar_items(&state.db_ro, &source, 20)
+    let mut items = rustyfin_db::repo_media::get_similar_items(&state.db_ro, &source, 20)
         .await
         .map_err(|e| crate::error::ApiError::Internal(e.to_string()))?;
+    hidden.retain(&mut items, |i| i.id);
     let total = items.len() as i64;
     Ok((
         StatusCode::OK,
@@ -330,6 +359,7 @@ async fn get_movies_similar(
 async fn get_shows_similar(
     State(state): State<AppState>,
     Path(item_id): Path<Uuid>,
+    Extension(claims): Extension<Claims>,
 ) -> Result<
     (
         StatusCode,
@@ -337,13 +367,15 @@ async fn get_shows_similar(
     ),
     crate::error::ApiError,
 > {
+    let hidden = HiddenItems::for_caller(&state, &claims).await?;
     let source = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, item_id)
         .await
         .map_err(|e| crate::error::ApiError::Internal(e.to_string()))?
         .ok_or_else(|| crate::error::ApiError::NotFound("Show not found".to_string()))?;
-    let items = rustyfin_db::repo_media::get_similar_items(&state.db_ro, &source, 20)
+    let mut items = rustyfin_db::repo_media::get_similar_items(&state.db_ro, &source, 20)
         .await
         .map_err(|e| crate::error::ApiError::Internal(e.to_string()))?;
+    hidden.retain(&mut items, |i| i.id);
     let total = items.len() as i64;
     Ok((
         StatusCode::OK,
@@ -359,6 +391,7 @@ async fn get_shows_similar(
 async fn get_playlists_instant_mix(
     State(state): State<AppState>,
     Path(item_id): Path<Uuid>,
+    Extension(claims): Extension<Claims>,
 ) -> Result<
     (
         StatusCode,
@@ -366,13 +399,15 @@ async fn get_playlists_instant_mix(
     ),
     crate::error::ApiError,
 > {
+    let hidden = HiddenItems::for_caller(&state, &claims).await?;
     let source = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, item_id)
         .await
         .map_err(|e| crate::error::ApiError::Internal(e.to_string()))?
         .ok_or_else(|| crate::error::ApiError::NotFound("Playlist not found".to_string()))?;
-    let items = rustyfin_db::repo_media::get_similar_items(&state.db_ro, &source, 50)
+    let mut items = rustyfin_db::repo_media::get_similar_items(&state.db_ro, &source, 50)
         .await
         .map_err(|e| crate::error::ApiError::Internal(e.to_string()))?;
+    hidden.retain(&mut items, |i| i.id);
     let total = items.len() as i64;
     Ok((
         StatusCode::OK,

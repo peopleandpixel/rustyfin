@@ -7,6 +7,7 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::error::ApiError;
+use crate::parental::HiddenItems;
 use crate::routes::items::enrich_items;
 use crate::routes::playback::query_user;
 use crate::state::AppState;
@@ -46,7 +47,11 @@ async fn next_up(
     let limit = q.limit.unwrap_or(20) as usize;
 
     // One episode per series: its next unplayed episode (see get_next_up)
-    let episodes = rustyfin_db::repo_media::get_next_up(&state.db_ro, user_id, series_id).await?;
+    let mut episodes =
+        rustyfin_db::repo_media::get_next_up(&state.db_ro, user_id, series_id).await?;
+    HiddenItems::for_caller(&state, &claims)
+        .await?
+        .retain(&mut episodes, |i| i.id);
 
     let total = episodes.len() as i64;
     let end = start_index.saturating_add(limit).min(episodes.len());
@@ -87,11 +92,14 @@ async fn upcoming(
     let start_index = q.start_index.unwrap_or(0) as usize;
     let limit = q.limit.unwrap_or(20) as usize;
 
-    let episodes = if let Some(sid) = series_id {
+    let mut episodes = if let Some(sid) = series_id {
         rustyfin_db::repo_media::get_upcoming_for_series(&state.db_ro, user_id, sid).await?
     } else {
         rustyfin_db::repo_media::get_upcoming(&state.db_ro, user_id).await?
     };
+    HiddenItems::for_caller(&state, &claims)
+        .await?
+        .retain(&mut episodes, |i| i.id);
 
     let total = episodes.len() as i64;
     let end = start_index.saturating_add(limit).min(episodes.len());
@@ -127,6 +135,9 @@ async fn get_seasons(
         .into_iter()
         .filter(|c| c.media_type == MediaType::Season)
         .collect();
+    HiddenItems::for_caller(&state, &claims)
+        .await?
+        .retain(&mut seasons, |i| i.id);
     let total = seasons.len() as i64;
 
     let tmdb_key = state
@@ -182,7 +193,7 @@ async fn get_episodes(
 ) -> Result<Json<QueryResult>, ApiError> {
     let user_id = query_user(&state, &claims, q.user_id).await?;
     // Single-query fetch: get all episodes for the series using a subquery
-    let episodes = if let Some(season_id) = q.season_id {
+    let mut episodes: Vec<MediaItem> = if let Some(season_id) = q.season_id {
         // If season_id is specified, fetch children of that season directly
         let children = rustyfin_db::repo_media::get_children(&state.db, season_id).await?;
         children
@@ -193,6 +204,9 @@ async fn get_episodes(
         // Use single-query subquery to fetch all episodes for the series
         rustyfin_db::repo_media::get_episodes_for_series(&state.db_ro, series_id, q.season).await?
     };
+    HiddenItems::for_caller(&state, &claims)
+        .await?
+        .retain(&mut episodes, |i| i.id);
 
     let total = episodes.len() as i64;
     let start = q.start_index.unwrap_or(0).max(0) as usize;

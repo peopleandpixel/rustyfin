@@ -12,6 +12,7 @@ use sqlx::SqlitePool;
 use uuid::Uuid;
 
 use crate::error::ApiError;
+use crate::parental::HiddenItems;
 use crate::routes::playback::{path_user, query_user};
 use crate::state::AppState;
 
@@ -1808,6 +1809,8 @@ async fn get_items(
         &parse_ids(query.studio_ids()),
     )
     .await?;
+    let hidden = HiddenItems::for_caller(&state, &claims).await?;
+    let hidden_json = hidden.json();
 
     let (items, total) = rustyfin_db::repo_media::get_items_filtered(
         &state.db_ro,
@@ -1838,6 +1841,7 @@ async fn get_items(
         runtime_parts,
         Some(claims.sub),
         item_ids.as_deref(),
+        hidden_json.as_deref(),
     )
     .await?;
 
@@ -1965,7 +1969,10 @@ async fn get_children(
     Query(query): Query<ItemsQuery>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<QueryResult>, ApiError> {
-    let children = rustyfin_db::repo_media::get_children(&state.db_ro, id).await?;
+    let mut children = rustyfin_db::repo_media::get_children(&state.db_ro, id).await?;
+    HiddenItems::for_caller(&state, &claims)
+        .await?
+        .retain(&mut children, |i| i.id);
     let total = children.len() as i64;
 
     // Only populate media_sources when explicitly requested
@@ -2011,6 +2018,7 @@ async fn get_similar(
     Query(query): Query<LimitQuery>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<QueryResult>, ApiError> {
+    let hidden = HiddenItems::for_caller(&state, &claims).await?;
     let item = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, id)
         .await?
         .ok_or(ApiError::NotFound("item not found".into()))?;
@@ -2044,7 +2052,7 @@ async fn get_similar(
                 .flatten()
                 .map(|row| row.into());
 
-            if let Some(local_item) = local_item {
+            if let Some(local_item) = local_item.filter(|i| !hidden.hides(i.id)) {
                 similar.push(local_item);
             }
         }
@@ -2052,7 +2060,11 @@ async fn get_similar(
 
     // Priority 2: Local algorithm fills remaining slots
     if similar.len() < limit {
-        let remaining = i64::try_from(limit - similar.len()).unwrap_or(i64::MAX);
+        let mut remaining = i64::try_from(limit - similar.len()).unwrap_or(i64::MAX);
+        if hidden.is_restricted() {
+            // Some of the best matches may be hidden: ask for more to fill the list.
+            remaining = remaining.saturating_mul(4);
+        }
         let local_similar =
             rustyfin_db::repo_media::get_similar_items(&state.db_ro, &item, remaining).await?;
 
@@ -2063,7 +2075,7 @@ async fn get_similar(
             if similar.len() >= limit {
                 break;
             }
-            if !existing_ids.contains(&local_item.id.to_string()) {
+            if !existing_ids.contains(&local_item.id.to_string()) && !hidden.hides(local_item.id) {
                 similar.push(local_item);
             }
         }
@@ -2123,11 +2135,13 @@ async fn get_latest(
         .or(query.include_item_types_lower.as_deref())
         .map(|s| format!("\"{}\"", s.split(',').next().unwrap_or("").trim()));
     let library_id = query.parent_id.or(query.parent_id_lower);
+    let hidden = HiddenItems::for_caller(&state, &claims).await?.json();
     let mut items = rustyfin_db::repo_media::get_latest_items(
         &state.db_ro,
         limit,
         media_type.as_deref(),
         library_id,
+        hidden.as_deref(),
     )
     .await?;
     // Enrich latest items using batch queries
@@ -2156,8 +2170,14 @@ async fn get_resume(
         .await?
         .ok_or_else(|| ApiError::NotFound("user not found".into()))?;
     let limit = query.limit.unwrap_or(10);
-    let mut items =
-        rustyfin_db::repo_media::get_user_resume_items(&state.db_ro, user, limit).await?;
+    let hidden = HiddenItems::for_caller(&state, &claims).await?.json();
+    let mut items = rustyfin_db::repo_media::get_user_resume_items(
+        &state.db_ro,
+        user,
+        limit,
+        hidden.as_deref(),
+    )
+    .await?;
     let total = items.len() as i64;
     // Enrich resume items using batch queries
     // Skip blurhash for list views to avoid per-item disk I/O
@@ -2199,8 +2219,20 @@ struct FiltersQuery {
 async fn get_filters(
     State(state): State<AppState>,
     Query(query): Query<FiltersQuery>,
+    Extension(claims): Extension<Claims>,
 ) -> Result<Json<FiltersResult>, ApiError> {
     let library_id = query.parent_id.or(query.parent_id_lower);
+    // A user with parental limits gets the values of the items they may see, never the cached
+    // list every user shares.
+    if let Some(hidden) = HiddenItems::for_caller(&state, &claims).await?.json() {
+        let (genres, years, official_ratings) =
+            rustyfin_db::repo_media::get_filters_hiding(&state.db_ro, library_id, &hidden).await?;
+        return Ok(Json(FiltersResult {
+            genres,
+            years,
+            official_ratings,
+        }));
+    }
     let cache_key = library_id.map_or("all".to_string(), |id| id.to_string());
     // Check cache first
     if let Some(cached) = state.cache.filter_lists.get(&cache_key)
@@ -2250,8 +2282,14 @@ async fn get_user_resume(
 ) -> Result<Json<QueryResult>, ApiError> {
     let user_id = path_user(&state, &claims, user_id).await?;
     let limit = query.limit.unwrap_or(10);
-    let mut items =
-        rustyfin_db::repo_media::get_user_resume_items(&state.db_ro, user_id, limit).await?;
+    let hidden = HiddenItems::for_caller(&state, &claims).await?.json();
+    let mut items = rustyfin_db::repo_media::get_user_resume_items(
+        &state.db_ro,
+        user_id,
+        limit,
+        hidden.as_deref(),
+    )
+    .await?;
     let total = items.len() as i64;
     // Enrich user resume items using batch queries
     // Skip blurhash for list views to avoid per-item disk I/O
