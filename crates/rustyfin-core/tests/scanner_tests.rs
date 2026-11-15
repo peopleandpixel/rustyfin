@@ -4396,6 +4396,492 @@ async fn b18_scheduler_skips_a_library_another_caller_claimed() {
 // percent reaches 99 only at the end. A rescan reuses the artist rows of earlier scans.
 
 /// A music library whose roots are `<temp dir>/<root>` for each of `roots`, in that order.
+// R2 music: tags, disc folders, artists and embedded covers
+
+/// Writes a one-second FLAC track at `<root>/<rel>` with `tags`, and with an embedded JPEG picture
+/// when `picture` is set.
+fn r2music_track(root: &Path, rel: &str, tags: &[(&str, &str)], picture: bool) -> PathBuf {
+    let path = root.join(rel);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(["-nostdin", "-loglevel", "error", "-y"]).args([
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=duration=1",
+    ]);
+    if picture {
+        cmd.args(["-f", "lavfi", "-i", "color=c=red:s=16x16:d=1"])
+            .args(["-map", "0:a", "-map", "1:v", "-frames:v", "1"])
+            .args(["-c:v", "mjpeg", "-disposition:v", "attached_pic"]);
+    }
+    cmd.args(["-c:a", "flac"]);
+    for (key, value) in tags {
+        cmd.arg("-metadata").arg(format!("{key}={value}"));
+    }
+    let status = cmd.arg(&path).status().expect("run ffmpeg");
+    assert!(
+        status.success(),
+        "ffmpeg could not write {}",
+        path.display()
+    );
+    path
+}
+
+/// The library's rows of `media_type` as (path, name, parent's path, year, index, parent index),
+/// paths relative to its root, sorted.
+async fn r2music_rows(
+    pool: &SqlitePool,
+    lib: &Library,
+    media_type: &str,
+) -> Vec<(
+    String,
+    String,
+    Option<String>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+)> {
+    let root = root_of(lib);
+    let rows: Vec<(
+        String,
+        String,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+    )> = sqlx::query_as(
+        "SELECT a.path, a.name, p.path, a.production_year, a.index_number, a.parent_index_number
+         FROM media_items a LEFT JOIN media_items p ON p.id = a.parent_id
+         WHERE a.library_id = ?1 AND a.media_type = ?2",
+    )
+    .bind(lib.id.to_string())
+    .bind(media_type)
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    let mut out: Vec<_> = rows
+        .into_iter()
+        .map(|(path, name, parent, year, index, disc)| {
+            (
+                rel(&root, &path),
+                name,
+                parent.as_deref().map(|p| rel(&root, p)),
+                year,
+                index,
+                disc,
+            )
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// The `item_people` links of `kind` as (item path relative to the root, person name, person id),
+/// in item path and credit order.
+async fn r2music_links(
+    pool: &SqlitePool,
+    lib: &Library,
+    kind: &str,
+) -> Vec<(String, String, String)> {
+    let root = root_of(lib);
+    let rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT m.path, p.name, p.id FROM item_people ip
+         JOIN media_items m ON m.id = ip.item_id JOIN people p ON p.id = ip.person_id
+         WHERE m.library_id = ?1 AND ip.type = ?2
+         ORDER BY m.path, ip.sort_order",
+    )
+    .bind(lib.id.to_string())
+    .bind(kind)
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    rows.into_iter()
+        .map(|(path, name, id)| (rel(&root, &path), name, id))
+        .collect()
+}
+
+/// Spec 1.1-1.7: one album per album folder (disc folders are part of it), artist folders are
+/// MusicArtist items named after the folder, years come from `date` tags, disc numbers from tags
+/// or disc folders, and track and album artists are stored as people, once per name.
+#[tokio::test]
+async fn r2music_scan_tags_discs_and_artists() {
+    if !have_ffmpeg() {
+        eprintln!("skipped: needs ffmpeg and ffprobe");
+        return;
+    }
+    let fx = Fixture::new().await;
+    let lib = b18_music_library(&fx, &["music"]).await;
+    let root = root_of(&lib);
+    let tags = |title: &'static str,
+                artist: &'static str,
+                album_artist: Option<&'static str>,
+                album: &'static str,
+                date: &'static str,
+                disc: Option<&'static str>,
+                track: &'static str| {
+        let mut out = vec![
+            ("title", title),
+            ("artist", artist),
+            ("album", album),
+            ("date", date),
+            ("track", track),
+        ];
+        if let Some(a) = album_artist {
+            out.push(("album_artist", a));
+        }
+        if let Some(d) = disc {
+            out.push(("disc", d));
+        }
+        out
+    };
+    r2music_track(
+        &root,
+        "Kilo Band/Lima Sessions/01 - Opening Tone.flac",
+        &tags(
+            "Opening Tone",
+            "Kilo Band",
+            Some("Kilo Band"),
+            "Lima Sessions",
+            "2010",
+            Some("1"),
+            "1",
+        ),
+        false,
+    );
+    r2music_track(
+        &root,
+        "Mike Ensemble/November Nights/Disc 1/01 - Dusk.flac",
+        &tags(
+            "Dusk",
+            "Mike Ensemble",
+            None,
+            "November Nights",
+            "2016-03-01",
+            Some("1/2"),
+            "1",
+        ),
+        false,
+    );
+    r2music_track(
+        &root,
+        "Mike Ensemble/November Nights/Disc 2/01 - Small Hours.flac",
+        &tags(
+            "Small Hours",
+            "Mike Ensemble",
+            None,
+            "November Nights",
+            "2016-03-01",
+            Some("2/2"),
+            "1",
+        ),
+        false,
+    );
+    // No disc tag: the disc folder gives the number.
+    r2music_track(
+        &root,
+        "Mike Ensemble/November Nights/Disc 2/02 - Dawn.flac",
+        &tags(
+            "Dawn",
+            "Mike Ensemble",
+            None,
+            "November Nights",
+            "2016-03-01",
+            None,
+            "2",
+        ),
+        false,
+    );
+    r2music_track(
+        &root,
+        "Various Artists/Oscar Hits/01 - Papa Song.flac",
+        &tags(
+            "Papa Song",
+            "Papa Trio",
+            Some("Various Artists"),
+            "Oscar Hits",
+            "2020",
+            Some("1"),
+            "1",
+        ),
+        false,
+    );
+    r2music_track(
+        &root,
+        "Various Artists/Oscar Hits/02 - Duet.flac",
+        &tags(
+            "Duet",
+            "Quebec Duo; Kilo Band",
+            Some("Various Artists"),
+            "Oscar Hits",
+            "2020",
+            Some("1"),
+            "2",
+        ),
+        false,
+    );
+
+    scan_idle(&fx.pool, &lib).await;
+
+    let artist = |path: &str| (path.to_string(), path.to_string(), None, None, None, None);
+    assert_eq!(
+        r2music_rows(&fx.pool, &lib, "MusicArtist").await,
+        [
+            artist("Kilo Band"),
+            artist("Mike Ensemble"),
+            artist("Various Artists")
+        ]
+    );
+    let album = |path: &str, name: &str, parent: &str, year: i64| {
+        (
+            path.to_string(),
+            name.to_string(),
+            Some(parent.to_string()),
+            Some(year),
+            None,
+            None,
+        )
+    };
+    assert_eq!(
+        r2music_rows(&fx.pool, &lib, "MusicAlbum").await,
+        [
+            album(
+                "Kilo Band/Lima Sessions",
+                "Lima Sessions",
+                "Kilo Band",
+                2010
+            ),
+            album(
+                "Mike Ensemble/November Nights",
+                "November Nights",
+                "Mike Ensemble",
+                2016
+            ),
+            album(
+                "Various Artists/Oscar Hits",
+                "Oscar Hits",
+                "Various Artists",
+                2020
+            ),
+        ]
+    );
+    let tracks: Vec<(String, Option<String>, Option<i64>, Option<i64>)> =
+        r2music_rows(&fx.pool, &lib, "Audio")
+            .await
+            .into_iter()
+            .map(|(path, _, parent, _, index, disc)| (path, parent, index, disc))
+            .collect();
+    let track = |path: &str, parent: &str, index: i64, disc: i64| {
+        (
+            path.to_string(),
+            Some(parent.to_string()),
+            Some(index),
+            Some(disc),
+        )
+    };
+    assert_eq!(
+        tracks,
+        [
+            track(
+                "Kilo Band/Lima Sessions/01 - Opening Tone.flac",
+                "Kilo Band/Lima Sessions",
+                1,
+                1
+            ),
+            track(
+                "Mike Ensemble/November Nights/Disc 1/01 - Dusk.flac",
+                "Mike Ensemble/November Nights",
+                1,
+                1
+            ),
+            track(
+                "Mike Ensemble/November Nights/Disc 2/01 - Small Hours.flac",
+                "Mike Ensemble/November Nights",
+                1,
+                2
+            ),
+            track(
+                "Mike Ensemble/November Nights/Disc 2/02 - Dawn.flac",
+                "Mike Ensemble/November Nights",
+                2,
+                2
+            ),
+            track(
+                "Various Artists/Oscar Hits/01 - Papa Song.flac",
+                "Various Artists/Oscar Hits",
+                1,
+                1
+            ),
+            track(
+                "Various Artists/Oscar Hits/02 - Duet.flac",
+                "Various Artists/Oscar Hits",
+                2,
+                1
+            ),
+        ]
+    );
+
+    let names = |links: &[(String, String, String)]| -> Vec<(String, String)> {
+        links
+            .iter()
+            .map(|(path, name, _)| (path.clone(), name.clone()))
+            .collect()
+    };
+    let link = |path: &str, name: &str| (path.to_string(), name.to_string());
+    let artists = r2music_links(&fx.pool, &lib, "Artist").await;
+    assert_eq!(
+        names(&artists),
+        [
+            link(
+                "Kilo Band/Lima Sessions/01 - Opening Tone.flac",
+                "Kilo Band"
+            ),
+            link(
+                "Mike Ensemble/November Nights/Disc 1/01 - Dusk.flac",
+                "Mike Ensemble"
+            ),
+            link(
+                "Mike Ensemble/November Nights/Disc 2/01 - Small Hours.flac",
+                "Mike Ensemble"
+            ),
+            link(
+                "Mike Ensemble/November Nights/Disc 2/02 - Dawn.flac",
+                "Mike Ensemble"
+            ),
+            link(
+                "Various Artists/Oscar Hits/01 - Papa Song.flac",
+                "Papa Trio"
+            ),
+            link("Various Artists/Oscar Hits/02 - Duet.flac", "Quebec Duo"),
+            link("Various Artists/Oscar Hits/02 - Duet.flac", "Kilo Band"),
+        ]
+    );
+    let album_artists = r2music_links(&fx.pool, &lib, "AlbumArtist").await;
+    assert_eq!(
+        names(&album_artists),
+        [
+            link("Kilo Band/Lima Sessions", "Kilo Band"),
+            link("Mike Ensemble/November Nights", "Mike Ensemble"),
+            link("Various Artists/Oscar Hits", "Various Artists"),
+        ]
+    );
+    // One person per name: Kilo Band is the same person as a track artist and an album artist.
+    let ids: std::collections::HashSet<&str> = artists
+        .iter()
+        .chain(album_artists.iter())
+        .filter(|(_, name, _)| name == "Kilo Band")
+        .map(|(_, _, id)| id.as_str())
+        .collect();
+    assert_eq!(ids.len(), 1, "{artists:?} {album_artists:?}");
+    let people: Vec<(String, String)> =
+        sqlx::query_as("SELECT name, type FROM people ORDER BY name")
+            .fetch_all(&fx.pool)
+            .await
+            .unwrap();
+    let person = |name: &str| (name.to_string(), "Artist".to_string());
+    assert_eq!(
+        people,
+        [
+            person("Kilo Band"),
+            person("Mike Ensemble"),
+            person("Papa Trio"),
+            person("Quebec Duo"),
+            person("Various Artists")
+        ]
+    );
+
+    // A rescan with nothing changed adds nothing.
+    let totals = async || {
+        (
+            count(&fx.pool, "SELECT COUNT(*) FROM media_items").await,
+            count(&fx.pool, "SELECT COUNT(*) FROM people").await,
+            count(&fx.pool, "SELECT COUNT(*) FROM item_people").await,
+        )
+    };
+    let before = totals().await;
+    scan_idle(&fx.pool, &lib).await;
+    assert_eq!(totals().await, before);
+}
+
+/// Spec 3.1-3.2: an album without a cover file gets its Primary image from the embedded picture
+/// of a track, extracted under the server's dir; a cover file still wins, and nothing is written
+/// into the library.
+#[tokio::test]
+async fn r2music_embedded_cover_becomes_album_primary() {
+    if !have_ffmpeg() {
+        eprintln!("skipped: needs ffmpeg and ffprobe");
+        return;
+    }
+    let fx = Fixture::new().await;
+    // Process-wide: no other test in this binary writes tracks with pictures.
+    let embedded = fx.path("embedded");
+    rustyfin_core::local_images::set_embedded_images_dir(embedded.clone());
+    let lib = b18_music_library(&fx, &["music"]).await;
+    let root = root_of(&lib);
+    let tags = |title: &'static str, album: &'static str| {
+        vec![
+            ("title", title),
+            ("artist", "Lima"),
+            ("album", album),
+            ("track", "1"),
+        ]
+    };
+    r2music_track(
+        &root,
+        "Lima/Pictured/01 - One.flac",
+        &tags("One", "Pictured"),
+        true,
+    );
+    r2music_track(
+        &root,
+        "Lima/Covered/01 - Two.flac",
+        &tags("Two", "Covered"),
+        true,
+    );
+    std::fs::copy(
+        root.join("Lima/Covered/01 - Two.flac"),
+        root.join("Lima/Covered/cover.jpg"),
+    )
+    .unwrap();
+    let files_before = tree(&root).len();
+
+    scan_idle(&fx.pool, &lib).await;
+
+    let primary = async |album: &str| -> Option<String> {
+        sqlx::query_scalar(
+            "SELECT i.path FROM item_images i JOIN media_items m ON m.id = i.item_id
+             WHERE m.library_id = ?1 AND m.media_type = 'MusicAlbum' AND m.path = ?2
+             AND i.image_type = 'Primary'",
+        )
+        .bind(lib.id.to_string())
+        .bind(root.join(album).to_str().unwrap())
+        .fetch_optional(&fx.pool)
+        .await
+        .unwrap()
+    };
+    let pictured = primary("Lima/Pictured")
+        .await
+        .expect("the album without a cover file has a Primary image");
+    assert!(
+        Path::new(&pictured).starts_with(&embedded),
+        "{pictured} is not under {}",
+        embedded.display()
+    );
+    assert!(
+        std::fs::metadata(&pictured).unwrap().len() > 0,
+        "{pictured} is empty"
+    );
+    assert_eq!(
+        primary("Lima/Covered").await.as_deref(),
+        root.join("Lima/Covered/cover.jpg").to_str()
+    );
+    assert_eq!(
+        tree(&root).len(),
+        files_before,
+        "the scan wrote into the library"
+    );
+}
+
 async fn b18_music_library(fx: &Fixture, roots: &[&str]) -> Library {
     let paths = roots
         .iter()
