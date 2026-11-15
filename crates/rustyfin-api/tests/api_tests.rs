@@ -29806,6 +29806,12 @@ async fn b17_scheduler_scan_reports_progress_without_task_events() {
 
 // R3 tasks: a running task's state and progress in /ScheduledTasks and on the socket
 
+// The admin tasks tab's cards and polling (tests/web/r3tasks_admin.mjs).
+#[test]
+fn r3tasks_web_task_cards_and_polling() {
+    b124_node_test("r3tasks_admin.mjs");
+}
+
 /// Sends a text frame on `socket`. Client frames are masked; a zero mask leaves the text as is.
 async fn r3tasks_send(socket: &mut G1cSocket, text: &str) {
     use tokio::io::AsyncWriteExt;

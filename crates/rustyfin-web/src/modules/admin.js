@@ -176,7 +176,7 @@ async function renderAdmin(tab) {
                     <button class="jf-btn-ghost !py-1.5 !px-3 text-xs inline-flex items-center gap-1.5" onclick="refreshTasks()">${icon('RefreshCw', { size: 14 })}${t('admin.refresh')}</button>
                 </div>
                 <div id="admin-tasks-list" class="grid gap-3">
-                    ${tasks.map(task => renderTaskCard(task)).join('')}
+                    ${sortTasks(tasks).map(task => renderTaskCard(task)).join('')}
                 </div>
             </div>
 
@@ -300,6 +300,8 @@ function showAdminTab(btn, tabId) {
         if (el) el.classList.toggle('hidden', id !== tabId);
     });
 
+    if (tabId === 'admin-tasks') refreshTasks(true);
+    else stopTaskPolling();
     if (tabId === 'admin-activity') loadActivityLog();
     if (tabId === 'admin-livelog') initLiveLog();
     if (tabId === 'admin-signin') loadOidcAdminTab();
@@ -524,7 +526,7 @@ function renderTaskCard(task) {
     const name = task.Name || task.name || id;
     const description = task.Description || task.description || '';
     const state = task.State || task.state || 'Idle';
-    const progress = task.CurrentProgressPercentage || task.current_progress_percentage;
+    const progress = task.CurrentProgressPercentage ?? task.current_progress_percentage;
     const category = task.Category || task.category || '';
     const lastResult = task.LastExecutionResult || task.last_execution_result;
     const triggers = task.Triggers || task.triggers || [];
@@ -573,18 +575,23 @@ function renderTaskCard(task) {
         triggerHtml = `<span class="text-white/40 text-[10px]">${icon('Clock', { size: 10, class: 'inline-block align-[-1px]' })} ${triggerTypes.join(', ')}</span>`;
     }
 
-    // Progress bar
+    // Progress bar: the percent when the task reports one, else a sliding stripe
     let progressHtml = '';
-    if (isRunning && progress !== undefined && progress !== null) {
-        const pct = Math.round(progress);
+    if (isRunning || isCancelling) {
+        const known = typeof progress === 'number' && Number.isFinite(progress);
+        const pct = known ? Math.max(0, Math.min(100, Math.round(progress))) : null;
+        const bar = known
+            ? `<div class="h-full bg-gradient-to-r from-[#00a4dc] to-[#38bdf8] rounded-full transition-all duration-500" style="width:${pct}%"></div>`
+            : '<div class="h-full bg-gradient-to-r from-[#00a4dc] to-[#38bdf8] rounded-full jf-progress-indeterminate"></div>';
+        const aria = known ? `aria-valuemin="0" aria-valuemax="100" aria-valuenow="${pct}"` : '';
         progressHtml = `
-        <div class="mt-3">
+        <div class="mt-3" data-task-progress="${known ? pct : 'indeterminate'}">
             <div class="flex justify-between text-[10px] text-white/40 mb-1">
                 <span>${t('admin.progress')}</span>
-                <span>${pct}%</span>
+                <span>${known ? `${pct}%` : ''}</span>
             </div>
-            <div class="w-full h-1.5 bg-white/10 rounded-full overflow-hidden">
-                <div class="h-full bg-gradient-to-r from-[#00a4dc] to-[#38bdf8] rounded-full transition-all duration-500" style="width:${pct}%"></div>
+            <div class="w-full h-1.5 bg-white/10 rounded-full overflow-hidden" role="progressbar" aria-label="${escapeHtml(t('admin.progress'))}" ${aria}>
+                ${bar}
             </div>
         </div>`;
     }
@@ -607,7 +614,7 @@ function renderTaskCard(task) {
                 ${progressHtml}
                 <div class="flex items-center gap-2 mt-3">
                     ${isRunning || isCancelling ? `
-                        <button class="jf-btn-danger text-xs !py-1.5 !px-3 inline-flex items-center gap-1.5" data-action="stop-task" data-id="${escapeHtml(id)}" data-name="${escapeHtml(name)}">
+                        <button class="jf-btn-danger text-xs !py-1.5 !px-3 inline-flex items-center gap-1.5" data-action="stop-task" data-id="${escapeHtml(id)}" data-name="${escapeHtml(name)}"${isCancelling ? ' disabled' : ''}>
                             ${icon('Square', { size: 12, class: 'fill-current' })}${t('admin.stop')}
                         </button>
                     ` : `
@@ -644,17 +651,66 @@ async function stopTaskAction(id, name) {
     }
 }
 
-async function refreshTasks() {
+// The tasks in a steady order, by category and then name, so that cards don't move between reloads.
+function sortTasks(tasks) {
+    const key = task => [task.Category || task.category || '', task.Name || task.name || ''];
+    return [...tasks].sort((a, b) => {
+        const [ca, na] = key(a);
+        const [cb, nb] = key(b);
+        return ca.localeCompare(cb) || na.localeCompare(nb);
+    });
+}
+
+// While the tasks tab is open its list reloads: often while a task runs or stops, slowly otherwise.
+const TASK_POLL_BUSY_MS = 1500;
+const TASK_POLL_IDLE_MS = 10000;
+let taskPollTimer = null;
+
+function tasksBusy(tasks) {
+    return tasks.some(task => (task.State || task.state || 'Idle').toLowerCase() !== 'idle');
+}
+
+// Whether the tasks tab is on screen: it is on the page and not hidden.
+function tasksTabOpen() {
+    const tab = $('admin-tasks');
+    return !!tab && tab.isConnected && !tab.classList.contains('hidden');
+}
+
+function stopTaskPolling() {
+    clearTimeout(taskPollTimer);
+    taskPollTimer = null;
+}
+
+// Plans the next reload, unless the tab has been left.
+function scheduleTaskPoll(busy) {
+    stopTaskPolling();
+    if (!tasksTabOpen()) return;
+    taskPollTimer = setTimeout(() => {
+        taskPollTimer = null;
+        if (tasksTabOpen()) refreshTasks(true);
+    }, busy ? TASK_POLL_BUSY_MS : TASK_POLL_IDLE_MS);
+}
+
+// Reloads the task list. A reload by the timer (quiet) shows no error toast; it tries again later.
+async function refreshTasks(quiet = false) {
+    let busy = false;
     try {
         const tasks = await API.getTasks();
+        busy = tasksBusy(tasks);
         const list = $('admin-tasks-list');
         if (list) {
-            list.innerHTML = tasks.map(task => renderTaskCard(task)).join('');
+            list.innerHTML = sortTasks(tasks).map(task => renderTaskCard(task)).join('');
         }
     } catch (e) {
-        toast(t('admin.tasks_load_failed', { message: e.message }), 'error');
+        if (quiet !== true) toast(t('admin.tasks_load_failed', { message: e.message }), 'error');
     }
+    scheduleTaskPoll(busy);
 }
+
+// Leaving the page stops the reloads.
+window.addEventListener('hashchange', () => {
+    if (!tasksTabOpen()) stopTaskPolling();
+});
 
 async function loadActivityLog() {
     try {
