@@ -761,6 +761,7 @@ async fn probe_and_write(
                 save_runtime_and_chapters(
                     pool,
                     item_id,
+                    path,
                     result.source.run_time_ticks,
                     result.chapters,
                 )
@@ -998,7 +999,7 @@ async fn probe_and_add_source_internal(
         rustyfin_db::repo_media_source::insert_media_source_with_streams(pool, item_id, &source)
             .await?;
 
-    save_runtime_and_chapters(pool, item_id, source.run_time_ticks, result.chapters).await;
+    save_runtime_and_chapters(pool, item_id, path, source.run_time_ticks, result.chapters).await;
 
     Ok(())
 }
@@ -1007,8 +1008,9 @@ async fn probe_and_add_source_internal(
 async fn save_runtime_and_chapters(
     pool: &sqlx::SqlitePool,
     item_id: &uuid::Uuid,
+    path: &str,
     run_time_ticks: Option<i64>,
-    chapters: Vec<Chapter>,
+    mut chapters: Vec<Chapter>,
 ) {
     // Update the media item's runtime_ticks if we got them from probing
     if let Some(ticks) = run_time_ticks {
@@ -1019,13 +1021,37 @@ async fn save_runtime_and_chapters(
             .await;
     }
 
-    // A probed file is new or changed: its tile set and failed image jobs belonged to the old one.
-    // The image tasks remove the old tiles from disk.
-    if let Err(e) = rustyfin_db::repo_trickplay::delete_trickplay(pool, *item_id).await {
-        warn!("failed to drop the old trickplay tiles: {}", e);
-    }
-    if let Err(e) = rustyfin_db::repo_trickplay::clear_failures(pool, *item_id).await {
-        warn!("failed to clear old image failures: {}", e);
+    // The tile set, chapter images and failed image jobs belong to the file version they were
+    // made from. When this file's size or time differs, they go (the image tasks remove the old
+    // files from disk); when it is the same file probed again, they stay.
+    use rustyfin_db::repo_trickplay as tp;
+    let now = crate::trickplay::file_version(path).await;
+    match tp::get_image_version(pool, *item_id).await {
+        Ok(Some(made_from)) if made_from != now => {
+            let dropped = async {
+                tp::delete_trickplay(pool, *item_id).await?;
+                tp::clear_failures(pool, *item_id).await?;
+                tp::set_image_version(pool, *item_id, None).await
+            };
+            if let Err(e) = dropped.await {
+                warn!("failed to drop the old trickplay tiles: {}", e);
+            }
+        }
+        Ok(_) => {
+            // The same file: chapters at the same start keep their image, or their failure mark.
+            if let Ok(old) = rustyfin_db::repo_chapter::get_chapters(pool, *item_id).await {
+                for ch in &mut chapters {
+                    if let Some(o) = old
+                        .iter()
+                        .find(|o| o.start_position_ticks == ch.start_position_ticks)
+                    {
+                        ch.image_path.clone_from(&o.image_path);
+                        ch.image_date_modified.clone_from(&o.image_date_modified);
+                    }
+                }
+            }
+        }
+        Err(e) => warn!("failed to read the version images were made from: {}", e),
     }
     save_chapters(pool, item_id, chapters).await;
 }

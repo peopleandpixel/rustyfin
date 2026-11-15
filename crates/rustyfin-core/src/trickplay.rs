@@ -129,11 +129,16 @@ pub async fn sweep_unused_files(pool: &SqlitePool, data_dir: &Path) -> Result<()
                 .into_iter()
                 .filter_map(|c| c.image_path.filter(|p| !p.is_empty()).map(PathBuf::from))
                 .collect();
-        let mut files = fs::read_dir(entry.path())
-            .await
-            .map_err(|e| e.to_string())?;
+        // A stray entry (a file named like an item, say) is skipped, not the whole sweep.
+        let mut files = match fs::read_dir(entry.path()).await {
+            Ok(files) => files,
+            Err(e) => {
+                warn!(path = %entry.path().display(), error = %e, "skipped an unexpected entry");
+                continue;
+            }
+        };
         let mut kept = 0;
-        while let Some(file) = files.next_entry().await.map_err(|e| e.to_string())? {
+        while let Ok(Some(file)) = files.next_entry().await {
             if named.contains(&file.path()) {
                 kept += 1;
             } else {
@@ -208,6 +213,18 @@ async fn jpegs(dir: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(files)
 }
 
+/// How many times `generate` has started on the file at `path` since the server started. It
+/// lets tests see that a failed file is not tried again.
+pub fn generate_attempts(path: &str) -> u32 {
+    attempts().lock().unwrap().get(path).copied().unwrap_or(0)
+}
+
+fn attempts() -> &'static std::sync::Mutex<std::collections::HashMap<String, u32>> {
+    static ATTEMPTS: OnceLock<std::sync::Mutex<std::collections::HashMap<String, u32>>> =
+        OnceLock::new();
+    ATTEMPTS.get_or_init(Default::default)
+}
+
 /// Makes the tile set of the video at `path`, an item's file, and saves it. The old set, if any,
 /// is replaced only once the new one is complete. Waits for `ffmpeg_lock`.
 pub async fn generate(
@@ -218,6 +235,11 @@ pub async fn generate(
     cancel: &Cancel,
 ) -> Result<TrickplayInfo, String> {
     let _one_at_a_time = ffmpeg_lock().lock().await;
+    *attempts()
+        .lock()
+        .unwrap()
+        .entry(path.to_string())
+        .or_default() += 1;
     let item_dir = data_dir.join("trickplay").join(item_id.to_string());
     let work = item_dir.join(format!(".work-{WIDTH}"));
     let thumbs = work.join("thumbs");
@@ -362,7 +384,9 @@ pub async fn generate_for_libraries(
     library_ids: &[String],
     cancel: &Cancel,
 ) -> Result<u32, String> {
-    use rustyfin_db::repo_trickplay::{clear_failure, get_failure, record_failure};
+    use rustyfin_db::repo_trickplay::{
+        clear_failure, get_failure, record_failure, set_image_version,
+    };
     // Videos this run won't try (again): failed now, or before on the same file
     let mut failed: Vec<Uuid> = Vec::new();
     let mut made = 0u32;
@@ -395,12 +419,18 @@ pub async fn generate_for_libraries(
                     clear_failure(pool, item_id, FAILURE_KIND)
                         .await
                         .map_err(db)?;
+                    set_image_version(pool, item_id, Some(version))
+                        .await
+                        .map_err(db)?;
                     info!(item = %item_id, thumbnails = set.thumbnail_count, "made trickplay tiles");
                 }
                 Err(_) if cancel.is_cancelled() => return Ok(made),
                 Err(e) => {
                     warn!(item = %item_id, path = %path, error = %e, "could not make trickplay tiles");
                     record_failure(pool, item_id, FAILURE_KIND, version)
+                        .await
+                        .map_err(db)?;
+                    set_image_version(pool, item_id, Some(version))
                         .await
                         .map_err(db)?;
                     failed.push(item_id);
@@ -425,12 +455,28 @@ mod tests {
             eprintln!("SKIPPED r2chapters_cancel_kills_the_running_ffmpeg: ffmpeg is not on PATH");
             return;
         }
+        // The null muxer ignores its file name, so a unique one finds this ffmpeg in /proc.
+        let marker = format!("/nonexistent/r2chapters-{}", Uuid::new_v4());
+        let running = {
+            let marker = marker.clone();
+            move || {
+                std::fs::read_dir("/proc").unwrap().flatten().any(|p| {
+                    std::fs::read(p.path().join("cmdline"))
+                        .is_ok_and(|c| String::from_utf8_lossy(&c).contains(&marker))
+                })
+            }
+        };
         let cancel = Cancel::new();
         let stopper = cancel.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            stopper.cancel();
-        });
+        let seen = {
+            let running = running.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                let seen = running();
+                stopper.cancel();
+                seen
+            })
+        };
         let started = std::time::Instant::now();
         // An endless input: only the cancel ends it.
         let result = run_ffmpeg(
@@ -442,11 +488,18 @@ mod tests {
                 "testsrc=rate=5",
                 "-f",
                 "null",
-                "-",
+                &marker,
             ],
             &cancel,
         )
         .await;
+        assert!(seen.await.unwrap(), "ffmpeg was running before the cancel");
+        // Killed and reaped: a zombie has an empty cmdline, so poll briefly.
+        let gone_by = std::time::Instant::now() + Duration::from_secs(3);
+        while running() && std::time::Instant::now() < gone_by {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(!running(), "the ffmpeg child is gone");
         assert_eq!(result, Err("cancelled".to_string()));
         assert!(started.elapsed() < Duration::from_secs(5));
     }

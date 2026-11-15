@@ -287,7 +287,9 @@ fn touch_later(path: &str) {
 
 #[tokio::test]
 async fn r2chapters_failed_trickplay_waits_for_the_file_to_change() {
-    use rustyfin_core::trickplay::{FAILURE_KIND, file_version, generate_for_libraries};
+    use rustyfin_core::trickplay::{
+        FAILURE_KIND, file_version, generate_attempts, generate_for_libraries,
+    };
     use rustyfin_db::repo_trickplay::{get_failure, record_failure};
     if !ffmpeg_or_skip() {
         return;
@@ -317,6 +319,8 @@ async fn r2chapters_failed_trickplay_waits_for_the_file_to_change() {
         Some(file_version(&junk).await)
     );
     assert!(!data.join("trickplay").join(item.to_string()).exists());
+    assert_eq!(generate_attempts(&clip), 0, "the clip was skipped");
+    assert_eq!(generate_attempts(&junk), 1);
 
     // Once the clip's file changes it is tried again; the junk, unchanged, still isn't.
     touch_later(&clip);
@@ -327,21 +331,21 @@ async fn r2chapters_failed_trickplay_waits_for_the_file_to_change() {
         1
     );
     assert_eq!(get_failure(&pool, item, FAILURE_KIND).await.unwrap(), None);
-    assert!(
-        rustyfin_db::repo_trickplay::get_trickplay(&pool, broken)
-            .await
-            .unwrap()
-            .is_empty()
+    assert_eq!(generate_attempts(&clip), 1);
+    assert_eq!(
+        generate_attempts(&junk),
+        1,
+        "the unchanged junk was not tried again"
     );
 
-    // A refresh that replaces all images forgets the junk's failure.
+    // A refresh that replaces all images forgets the junk's failure, so it is tried once more.
     rustyfin_db::repo_trickplay::clear_failures(&pool, broken)
         .await
         .unwrap();
-    assert_eq!(
-        get_failure(&pool, broken, FAILURE_KIND).await.unwrap(),
-        None
-    );
+    generate_for_libraries(&pool, &data, &libs, &go())
+        .await
+        .unwrap();
+    assert_eq!(generate_attempts(&junk), 2);
 }
 
 #[tokio::test]
@@ -413,12 +417,42 @@ async fn r2chapters_old_tiles_and_chapter_images_are_removed() {
         assert!(tiles.exists() && images.exists());
     };
 
-    // The file changed and was probed again: its tile set and chapter images are dropped, and
-    // the sweep removes their files.
+    // The same file probed again (a newer probe version, say) keeps them.
     make_all().await;
     rustyfin_core::probe::probe_and_save(&pool, &item, &clip)
         .await
         .unwrap();
+    assert_eq!(
+        rustyfin_db::repo_trickplay::get_trickplay(&pool, item)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    let kept = rustyfin_db::repo_chapter::get_chapters(&pool, item)
+        .await
+        .unwrap();
+    assert_eq!(kept.len(), 2);
+    assert!(
+        kept.iter()
+            .all(|c| c.image_path.as_deref().is_some_and(|p| !p.is_empty()))
+    );
+    sweep_unused_files(&pool, &data).await.unwrap();
+    assert!(tiles.exists() && images.exists(), "nothing is swept");
+
+    // The file changed and was probed again: its tile set and chapter images are dropped, and
+    // the sweep removes their files.
+    touch_later(&clip);
+    rustyfin_core::probe::probe_and_save(&pool, &item, &clip)
+        .await
+        .unwrap();
+    assert!(
+        rustyfin_db::repo_chapter::get_chapters(&pool, item)
+            .await
+            .unwrap()
+            .iter()
+            .all(|c| c.image_path.is_none())
+    );
     assert!(
         rustyfin_db::repo_trickplay::get_trickplay(&pool, item)
             .await

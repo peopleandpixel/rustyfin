@@ -13356,6 +13356,62 @@ async fn r2chapters_media_segments_are_jellyfins_dtos() {
 }
 
 #[tokio::test]
+async fn r2chapters_deleting_an_item_removes_its_image_folders() {
+    let t = R2Chapters::new().await;
+    let tiles = t.state.data_dir.join("trickplay").join(t.film.to_string());
+    R2Chapters::write_jpeg(&tiles.join("320 - 10x10").join("0.jpg"));
+    let images = t.save_chapters().await.parent().unwrap().to_path_buf();
+    assert!(tiles.exists() && images.exists());
+
+    let (status, body) = send_authed(
+        &t.app,
+        "DELETE",
+        &format!("/Items/{}", t.film),
+        &t.token,
+        None,
+    )
+    .await;
+    assert!(status.is_success(), "{status} {body}");
+    assert!(!tiles.exists(), "tiles removed");
+    assert!(!images.exists(), "chapter images removed");
+}
+
+#[tokio::test]
+async fn r2chapters_refresh_replacing_all_images_forgets_image_failures() {
+    let t = R2Chapters::new().await;
+    let fail = || async {
+        rustyfin_db::repo_trickplay::record_failure(&t.state.db, t.film, "trickplay", (1, 2))
+            .await
+            .unwrap();
+    };
+    let failure = || rustyfin_db::repo_trickplay::get_failure(&t.state.db, t.film, "trickplay");
+
+    // A plain refresh keeps the failure; ReplaceAllImages=true (any case) forgets it.
+    fail().await;
+    send_authed(
+        &t.app,
+        "POST",
+        &format!("/Items/{}/Refresh", t.film),
+        &t.token,
+        None,
+    )
+    .await;
+    assert_eq!(failure().await.unwrap(), Some((1, 2)));
+    send_authed(
+        &t.app,
+        "POST",
+        &format!(
+            "/Items/{}/Refresh?MetadataRefreshMode=FullRefresh&replaceAllImages=True",
+            t.film
+        ),
+        &t.token,
+        None,
+    )
+    .await;
+    assert_eq!(failure().await.unwrap(), None);
+}
+
+#[tokio::test]
 async fn r2chapters_image_tasks_are_listed_with_jellyfins_keys() {
     let t = R2Chapters::new().await;
     for id in ["RefreshChapterImages", "RefreshTrickplayImages"] {

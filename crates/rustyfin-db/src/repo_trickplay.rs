@@ -201,6 +201,46 @@ pub async fn record_failure(
     Ok(())
 }
 
+/// The file version (size, modified seconds) an item's tile set and chapter images were made
+/// from, if any were made or tried.
+pub async fn get_image_version(
+    pool: &SqlitePool,
+    item_id: Uuid,
+) -> Result<Option<(i64, i64)>, sqlx::Error> {
+    sqlx::query_as("SELECT file_size, file_mtime FROM video_image_versions WHERE item_id = ?1")
+        .bind(item_id.to_string())
+        .fetch_optional(pool)
+        .await
+}
+
+/// Records the file version an item's images are made from, or forgets it (`None`).
+pub async fn set_image_version(
+    pool: &SqlitePool,
+    item_id: Uuid,
+    version: Option<(i64, i64)>,
+) -> Result<(), sqlx::Error> {
+    match version {
+        Some((size, mtime)) => {
+            sqlx::query(
+                "INSERT OR REPLACE INTO video_image_versions (item_id, file_size, file_mtime)
+                 VALUES (?1, ?2, ?3)",
+            )
+            .bind(item_id.to_string())
+            .bind(size)
+            .bind(mtime)
+            .execute(pool)
+            .await?;
+        }
+        None => {
+            sqlx::query("DELETE FROM video_image_versions WHERE item_id = ?1")
+                .bind(item_id.to_string())
+                .execute(pool)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
 /// Forgets an item's `kind` failure.
 pub async fn clear_failure(
     pool: &SqlitePool,

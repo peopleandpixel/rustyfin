@@ -39,6 +39,7 @@ pub async fn extract_for_item(
         .await
         .map_err(|e| format!("could not read the chapters: {e}"))?;
     let mut made = 0;
+    let mut tried = false;
     let _one_at_a_time = ffmpeg_lock().lock().await;
     for chapter in chapters.iter().filter(|c| c.image_path.is_none()) {
         let file = image_path(data_dir, item_id, chapter.start_position_ticks);
@@ -69,6 +70,14 @@ pub async fn extract_for_item(
         )
         .await
         .map_err(|e| format!("could not save a chapter image: {e}"))?;
+        tried = true;
+    }
+    if tried {
+        // A re-probe of this same file keeps the images (and the failure marks).
+        let version = crate::trickplay::file_version(path).await;
+        rustyfin_db::repo_trickplay::set_image_version(pool, item_id, Some(version))
+            .await
+            .map_err(|e| format!("could not save the file version: {e}"))?;
     }
     Ok(made)
 }
