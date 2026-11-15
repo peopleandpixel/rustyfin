@@ -4422,7 +4422,11 @@ async fn r1auth_routes_match_without_case() {
     assert!(users.is_array());
     let (status, info) = r1auth_send(&state, "GET", "/SYSTEM/info/Public", None, None).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(!info["ProductName"].as_str().unwrap().is_empty());
+    // Jellyfin Android (jellyfin-sdk-kotlin) rejects any other product name.
+    assert_eq!(info["ProductName"], "Jellyfin Server");
+    let (status, full) = r1auth_get(&state, "/system/info", &lib.token).await;
+    assert_eq!(status, StatusCode::OK, "{full}");
+    assert_eq!(full["ProductName"], "Jellyfin Server");
     assert!(
         info["LocalAddress"]
             .as_str()

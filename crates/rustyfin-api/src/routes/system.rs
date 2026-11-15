@@ -6,7 +6,7 @@ use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use rustyfin_model::auth::Claims;
 use rustyfin_model::server_info::{
-    EndpointInfo, FullServerInfo, LogFile, ServerConfiguration, ServerInfo,
+    EndpointInfo, FullServerInfo, JELLYFIN_PRODUCT_NAME, LogFile, ServerConfiguration, ServerInfo,
 };
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -120,7 +120,7 @@ async fn get_public_info(
     Ok(Json(ServerInfo {
         server_name: config.server_name.clone(),
         version: env!("CARGO_PKG_VERSION").to_string(),
-        product_name: rustyfin_model::server_info::PRODUCT_NAME.to_string(),
+        product_name: JELLYFIN_PRODUCT_NAME.to_string(),
         id: state.server_id.to_string(),
         startup_wizard_completed,
         local_address,
@@ -144,7 +144,7 @@ async fn get_full_info(
     Ok(Json(FullServerInfo {
         server_name: config.server_name.clone(),
         version: env!("CARGO_PKG_VERSION").to_string(),
-        product_name: rustyfin_model::server_info::PRODUCT_NAME.to_string(),
+        product_name: JELLYFIN_PRODUCT_NAME.to_string(),
         id: state.server_id.to_string(),
         startup_wizard_completed,
         operating_system: os,

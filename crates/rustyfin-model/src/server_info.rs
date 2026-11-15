@@ -1,5 +1,9 @@
 use serde::{Deserialize, Serialize};
 
+/// The product name Jellyfin clients expect; jellyfin-sdk-kotlin's RecommendedServerDiscovery
+/// rejects a server that reports any other.
+pub const JELLYFIN_PRODUCT_NAME: &str = "Jellyfin Server";
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct ServerInfo {
@@ -10,10 +14,6 @@ pub struct ServerInfo {
     pub startup_wizard_completed: bool,
     pub local_address: String,
 }
-
-/// The `ProductName` of `/System/Info` and `/System/Info/Public`. Jellyfin's is "Jellyfin Server";
-/// Jellyfin clients only show it.
-pub const PRODUCT_NAME: &str = "Rustyfin Server";
 
 /// Full server info returned by GET /System/Info (authenticated)
 #[derive(Debug, Serialize)]
