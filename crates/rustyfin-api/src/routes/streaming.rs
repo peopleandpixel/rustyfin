@@ -129,6 +129,43 @@ async fn video_file(
     }
 }
 
+/// Resolves `.` and `..` in an absolute path without touching the filesystem,
+/// so symlinks are kept. Returns `None` for a relative path or one whose `..`
+/// climbs above the root.
+fn lexical_normalize(path: &FilePath) -> Option<std::path::PathBuf> {
+    use std::path::Component;
+    if !path.is_absolute() {
+        return None;
+    }
+    let mut out = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    return None;
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    Some(out)
+}
+
+/// True when `file_path` lies under `lib_path`, either as written (a file
+/// reached through a symlink inside the library, which Jellyfin also serves)
+/// or after resolving symlinks on both sides.
+fn path_is_under_library(file_path: &FilePath, canonical_file: &FilePath, lib_path: &str) -> bool {
+    let lib = FilePath::new(lib_path);
+    if let (Some(file_lex), Some(lib_lex)) = (lexical_normalize(file_path), lexical_normalize(lib))
+        && file_lex.starts_with(&lib_lex)
+    {
+        return true;
+    }
+    lib.canonicalize()
+        .is_ok_and(|canonical_lib| canonical_file.starts_with(canonical_lib))
+}
+
 /// Validates that `file_path` is inside one of the library's configured paths.
 /// This prevents path traversal if the database is compromised.
 async fn validate_path_against_library(
@@ -148,12 +185,13 @@ async fn validate_path_against_library(
 
     if let Ok(Some(library)) = rustyfin_db::repo_library::get_library_by_id(pool, *library_id).await
     {
-        for lib_path in &library.paths {
-            if let Ok(canonical_lib) = std::path::Path::new(lib_path).canonicalize()
-                && canonical.starts_with(&canonical_lib)
-            {
-                return Ok(());
-            }
+        let raw = FilePath::new(file_path);
+        if library
+            .paths
+            .iter()
+            .any(|lib_path| path_is_under_library(raw, &canonical, lib_path))
+        {
+            return Ok(());
         }
         // Path not under any library path — log and reject
         tracing::warn!(
@@ -431,7 +469,7 @@ fn mime_from_path(path: &str) -> String {
         "mov" => "video/quicktime",
         "wmv" => "video/x-ms-wmv",
         "flv" => "video/x-flv",
-        "ts" => "video/mp2t",
+        "ts" | "m2ts" | "mts" => "video/mp2t",
         "mpg" | "mpeg" => "video/mpeg",
         "3gp" => "video/3gpp",
         // Audio
@@ -1507,6 +1545,69 @@ mod tests {
     #[test]
     fn test_mime_ts() {
         assert_eq!(mime_from_path("/path/to/video.ts"), "video/mp2t");
+    }
+
+    /// A folder under the temp dir, removed when dropped.
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new() -> TempDir {
+            let dir =
+                std::env::temp_dir().join(format!("rustyfin-r1play-{}", Uuid::new_v4().simple()));
+            std::fs::create_dir_all(&dir).unwrap();
+            TempDir(dir)
+        }
+
+        fn path(&self) -> &FilePath {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn r1play_mime_m2ts_and_mts() {
+        assert_eq!(mime_from_path("/path/to/video.m2ts"), "video/mp2t");
+        assert_eq!(mime_from_path("/path/to/VIDEO.MTS"), "video/mp2t");
+    }
+
+    #[test]
+    fn r1play_symlinked_file_inside_library_is_allowed() {
+        let dir = TempDir::new();
+        let lib = dir.path().join("lib");
+        let outside = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&lib).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("movie.mkv"), b"x").unwrap();
+        std::os::unix::fs::symlink(&outside, lib.join("Movie")).unwrap();
+        let file = lib.join("Movie/movie.mkv");
+        let canonical = file.canonicalize().unwrap();
+        assert!(path_is_under_library(
+            &file,
+            &canonical,
+            lib.to_str().unwrap()
+        ));
+    }
+
+    #[test]
+    fn r1play_dotdot_escape_is_rejected() {
+        let dir = TempDir::new();
+        let lib = dir.path().join("lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        std::fs::write(dir.path().join("secret.mkv"), b"x").unwrap();
+        let file = lib.join("../secret.mkv");
+        let canonical = file.canonicalize().unwrap();
+        assert!(!path_is_under_library(
+            &file,
+            &canonical,
+            lib.to_str().unwrap()
+        ));
+        assert_eq!(lexical_normalize(FilePath::new("/../x")), None);
+        assert_eq!(lexical_normalize(FilePath::new("rel/x")), None);
     }
 
     #[test]
