@@ -2058,9 +2058,12 @@ async fn send_authed(
     (status, json)
 }
 
-/// Creates the folder `media/<name>` in the test's data dir and returns its path.
+/// Creates the folder `<name>` in a media dir beside the test's data dir and returns its path.
 fn media_folder(state: &AppState, name: &str) -> String {
-    let dir = state.data_dir.join("media").join(name);
+    // Beside the data dir, not in it: the stream routes refuse files inside the data dir
+    let root = state.data_dir.with_extension("media");
+    remove_when_test_ends(&root);
+    let dir = root.join(name);
     std::fs::create_dir_all(&dir).unwrap();
     dir.to_str().unwrap().to_string()
 }

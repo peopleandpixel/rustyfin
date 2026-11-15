@@ -161,41 +161,96 @@ fn path_is_under_library(file_path: &FilePath, canonical_file: &FilePath, lib_pa
         .is_ok_and(|canonical_lib| canonical_file.starts_with(canonical_lib))
 }
 
-/// Whether `file_path` may be streamed from a library with `lib_paths`: it must lie under one of
-/// them (see `path_is_under_library`), and its target must not be inside Rustyfin's data dir
-/// (database, config, cache, logs, transcodes, plugins), even when a link in the library points
-/// there, unless that target is itself inside a library path.
-fn path_allowed(file_path: &str, lib_paths: &[String], data_dir: &FilePath) -> bool {
+/// Whether a stored path has a `..` component. Such a path is refused before anything is
+/// resolved: the scanner never stores one, and `..` after a link can leave the library.
+fn has_parent_dir(path: &FilePath) -> bool {
+    path.components()
+        .any(|c| c == std::path::Component::ParentDir)
+}
+
+/// Whether `file_path` may be streamed from a library with `lib_paths`. It is refused when:
+/// - it has a `..` component;
+/// - resolving its links fails;
+/// - it lies under none of `lib_paths`, as written or after resolving links (see
+///   `path_is_under_library`);
+/// - its resolved target is inside Rustyfin's data dir (`data_dir`: config, cache, logs,
+///   transcodes, plugins and, by default, the database), even when a library path contains the
+///   data dir;
+/// - its resolved target is the database file `db_file` (wherever `RUSTYFIN_DB` puts it) or
+///   that file's `-wal` or `-shm` sibling.
+fn path_allowed(
+    file_path: &str,
+    lib_paths: &[String],
+    data_dir: &FilePath,
+    db_file: Option<&FilePath>,
+) -> bool {
     let raw = FilePath::new(file_path);
-    let canonical = raw.canonicalize().unwrap_or_else(|_| raw.to_path_buf());
+    if has_parent_dir(raw) {
+        return false;
+    }
+    let Ok(canonical) = raw.canonicalize() else {
+        return false;
+    };
     if !lib_paths
         .iter()
         .any(|lib_path| path_is_under_library(raw, &canonical, lib_path))
     {
         return false;
     }
-    let in_data_dir = data_dir
+    if data_dir
         .canonicalize()
-        .is_ok_and(|data| canonical.starts_with(data));
-    !in_data_dir
-        || lib_paths.iter().any(|lib_path| {
-            FilePath::new(lib_path)
-                .canonicalize()
-                .is_ok_and(|lib| canonical.starts_with(lib))
-        })
+        .is_ok_and(|data| canonical.starts_with(data))
+    {
+        return false;
+    }
+    let Some(db) = db_file.and_then(|db| db.canonicalize().ok()) else {
+        return true;
+    };
+    let db = db.into_os_string();
+    let mut wal = db.clone();
+    wal.push("-wal");
+    let mut shm = db.clone();
+    shm.push("-shm");
+    ![db, wal, shm]
+        .iter()
+        .any(|name| canonical.as_os_str() == name)
+}
+
+/// The file of the server's main database, as SQLite reports it; None for an in-memory one.
+async fn database_file(pool: &sqlx::SqlitePool) -> Option<std::path::PathBuf> {
+    sqlx::query_scalar::<_, String>("SELECT file FROM pragma_database_list WHERE name = 'main'")
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .filter(|file| !file.is_empty())
+        .map(std::path::PathBuf::from)
 }
 
 /// Validates that `file_path` is inside one of the library's configured paths and not a link
-/// into the server's own data. This prevents path traversal if the database is compromised.
+/// into the server's own data (see `path_allowed`). This prevents path traversal if the
+/// database is compromised.
 async fn validate_path_against_library(
     state: &AppState,
     library_id: &uuid::Uuid,
     file_path: &str,
 ) -> Result<(), ApiError> {
+    if has_parent_dir(FilePath::new(file_path)) {
+        tracing::warn!("streaming path '{}' has a '..' component", file_path);
+        return Err(ApiError::NotFound(
+            "File is outside configured library paths".to_string(),
+        ));
+    }
     if let Ok(Some(library)) =
         rustyfin_db::repo_library::get_library_by_id(&state.db_ro, *library_id).await
     {
-        if path_allowed(file_path, &library.paths, &state.data_dir) {
+        let db_file = database_file(&state.db_ro).await;
+        if path_allowed(
+            file_path,
+            &library.paths,
+            &state.data_dir,
+            db_file.as_deref(),
+        ) {
             return Ok(());
         }
         // Path not under any library path — log and reject
@@ -1638,7 +1693,32 @@ mod tests {
         let data = dir.path().join("data");
         std::fs::create_dir_all(&data).unwrap();
         let libs = [lib.to_str().unwrap().to_string()];
-        assert!(!path_allowed(file.to_str().unwrap(), &libs, &data));
+        assert!(!path_allowed(file.to_str().unwrap(), &libs, &data, None));
+        assert!(has_parent_dir(&file));
+    }
+
+    #[test]
+    fn r1play_dotdot_and_unresolvable_paths_are_refused() {
+        let dir = TempDir::new();
+        let lib = dir.path().join("lib");
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(lib.join("Movie")).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(lib.join("movie.mkv"), b"x").unwrap();
+        let libs = [lib.to_str().unwrap().to_string()];
+        let path = |p: &str| lib.join(p).to_str().unwrap().to_string();
+        assert!(path_allowed(&path("movie.mkv"), &libs, &data, None));
+        // `..` that stays inside the library is refused too: it is never resolved
+        assert!(!path_allowed(
+            &path("Movie/../movie.mkv"),
+            &libs,
+            &data,
+            None
+        ));
+        // A path whose links can't be resolved is refused, not checked as written
+        assert!(!path_allowed(&path("missing.mkv"), &libs, &data, None));
+        std::os::unix::fs::symlink(lib.join("loop.mkv"), lib.join("loop.mkv")).unwrap();
+        assert!(!path_allowed(&path("loop.mkv"), &libs, &data, None));
     }
 
     #[test]
@@ -1656,15 +1736,96 @@ mod tests {
         std::os::unix::fs::symlink(&elsewhere, lib.join("Movie")).unwrap();
         let libs = [lib.to_str().unwrap().to_string()];
         let path = |p: &str| lib.join(p).to_str().unwrap().to_string();
-        assert!(!path_allowed(&path("db.mkv"), &libs, &data));
-        assert!(path_allowed(&path("Movie/movie.mkv"), &libs, &data));
-        // A library inside the data dir still serves its own files
+        assert!(!path_allowed(&path("db.mkv"), &libs, &data, None));
+        assert!(path_allowed(&path("Movie/movie.mkv"), &libs, &data, None));
+        // A library inside the data dir doesn't make its files streamable
         let inner = data.join("media");
         std::fs::create_dir_all(&inner).unwrap();
         std::fs::write(inner.join("clip.mkv"), b"x").unwrap();
         let inner_libs = [inner.to_str().unwrap().to_string()];
         let clip = inner.join("clip.mkv");
-        assert!(path_allowed(clip.to_str().unwrap(), &inner_libs, &data));
+        assert!(!path_allowed(
+            clip.to_str().unwrap(),
+            &inner_libs,
+            &data,
+            None
+        ));
+    }
+
+    #[test]
+    fn r1play_data_dir_inside_a_library_is_refused() {
+        // A library at /srv with RUSTYFIN_DATA=/srv/rustyfin
+        let dir = TempDir::new();
+        let srv = dir.path().join("srv");
+        let data = srv.join("rustyfin");
+        std::fs::create_dir_all(data.join("cache")).unwrap();
+        std::fs::create_dir_all(srv.join("Movies")).unwrap();
+        std::fs::write(data.join("rustyfin.db"), b"x").unwrap();
+        std::fs::write(data.join("cache/x.mkv"), b"x").unwrap();
+        std::fs::write(srv.join("Movies/movie.mkv"), b"x").unwrap();
+        std::os::unix::fs::symlink(data.join("rustyfin.db"), srv.join("Movies/db.mkv")).unwrap();
+        let libs = [srv.to_str().unwrap().to_string()];
+        let path = |p: &FilePath| p.to_str().unwrap().to_string();
+        assert!(path_allowed(
+            &path(&srv.join("Movies/movie.mkv")),
+            &libs,
+            &data,
+            None
+        ));
+        for refused in [
+            srv.join("Movies/db.mkv"),
+            data.join("cache/x.mkv"),
+            data.join("rustyfin.db"),
+        ] {
+            assert!(
+                !path_allowed(&path(&refused), &libs, &data, None),
+                "{refused:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn r1play_database_file_outside_the_data_dir_is_refused() {
+        // RUSTYFIN_DB=/dir/db/main.db, outside RUSTYFIN_DATA, with links to it and its siblings
+        let dir = TempDir::new();
+        let lib = dir.path().join("lib");
+        let data = dir.path().join("data");
+        let db_dir = dir.path().join("db");
+        for d in [&lib, &data, &db_dir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let db = db_dir.join("main.db");
+        let libs = [lib.to_str().unwrap().to_string()];
+        for name in ["main.db", "main.db-wal", "main.db-shm", "other.db"] {
+            std::fs::write(db_dir.join(name), b"x").unwrap();
+            std::os::unix::fs::symlink(db_dir.join(name), lib.join(format!("{name}.mkv"))).unwrap();
+        }
+        let path = |name: &str| {
+            lib.join(format!("{name}.mkv"))
+                .to_str()
+                .unwrap()
+                .to_string()
+        };
+        for name in ["main.db", "main.db-wal", "main.db-shm"] {
+            assert!(
+                !path_allowed(&path(name), &libs, &data, Some(&db)),
+                "{name}"
+            );
+        }
+        assert!(path_allowed(&path("other.db"), &libs, &data, Some(&db)));
+        assert!(path_allowed(&path("main.db"), &libs, &data, None));
+    }
+
+    #[tokio::test]
+    async fn r1play_database_file_comes_from_sqlite() {
+        let dir = TempDir::new();
+        let db = dir.path().join("main.db");
+        let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}?mode=rwc", db.display()))
+            .await
+            .unwrap();
+        let file = database_file(&pool).await.unwrap();
+        assert_eq!(file.canonicalize().unwrap(), db.canonicalize().unwrap());
+        pool.close().await;
     }
 
     #[test]
