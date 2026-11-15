@@ -147,13 +147,25 @@ async fn get_device_options(
     }))
 }
 
-/// POST /Devices/Options?id= - sets the device's custom name (204)
+/// The longest custom device name, in bytes.
+const MAX_CUSTOM_NAME_BYTES: usize = 256;
+
+/// POST /Devices/Options?id= - sets the device's custom name (204); 400 over 256 bytes
 async fn update_device_options(
     State(state): State<AppState>,
     Query(params): Query<Vec<(String, String)>>,
     Json(body): Json<DeviceOptionsUpdate>,
 ) -> Result<StatusCode, ApiError> {
     let id = device_id_param(&params)?;
+    if body
+        .custom_name
+        .as_ref()
+        .is_some_and(|n| n.trim().len() > MAX_CUSTOM_NAME_BYTES)
+    {
+        return Err(ApiError::BadRequest(format!(
+            "CustomName: longer than {MAX_CUSTOM_NAME_BYTES} bytes"
+        )));
+    }
     if !rustyfin_db::repo_device::set_custom_name(&state.db, &id, body.custom_name.as_deref())
         .await?
     {

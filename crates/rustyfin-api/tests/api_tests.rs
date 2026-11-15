@@ -2277,6 +2277,14 @@ async fn r2admin_devices_list_as_jellyfin() {
     }
     let (status, _) = send_authed(&app, "GET", "/Devices/Info", &admin, None).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // A custom name is at most 256 bytes.
+    let body = serde_json::json!({ "CustomName": "x".repeat(257) }).to_string();
+    let uri = "/Devices/Options?id=r2-dev";
+    let (status, _) = send_authed(&app, "POST", uri, &admin, Some(&body)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (_, json) = send_authed(&app, "GET", uri, &admin, None).await;
+    assert_eq!(json["CustomName"], "Living room");
 }
 
 #[tokio::test]
@@ -2444,6 +2452,102 @@ async fn r2admin_encoding_configuration() {
     // The main configuration has no "encoding" field.
     let (_, config) = send_authed(&app, "GET", "/System/Configuration", &admin, None).await;
     assert!(config.get("encoding").is_none(), "{config}");
+}
+
+#[tokio::test]
+async fn r2admin_configuration_keys_match_without_case_and_stay_bounded() {
+    // With the provider plugins installed, so a TMDb key can be saved.
+    let (_state, app, admin, viewer) = b142_server().await;
+    let bob = (viewer, ());
+    let (_, mut config) = send_authed(&app, "GET", "/System/Configuration", &admin, None).await;
+    // A secret in the wrong case is the secret, and an unknown field is the admin's alone.
+    config["tmdbApiKey"] = serde_json::json!("r2-secret-tmdb-key");
+    // The GET answers SmtpPassword in its own case; post only the variant.
+    config.as_object_mut().unwrap().remove("SmtpPassword");
+    config["smtpPassword"] = serde_json::json!("r2-secret-smtp");
+    config["minResumePct"] = serde_json::json!(12);
+    config["MinResumePct"] = serde_json::json!(11);
+    config["R2Unknown"] = serde_json::json!("r2-unknown-value");
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        "/System/Configuration",
+        &admin,
+        Some(&config.to_string()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (_, admin_view) = send_authed(&app, "GET", "/System/Configuration", &admin, None).await;
+    let (_, bob_view) = send_authed(&app, "GET", "/System/Configuration", &bob.0, None).await;
+    for view in [&admin_view, &bob_view] {
+        let text = view.to_string();
+        assert!(!text.contains("r2-secret-tmdb-key"), "{text}");
+        assert!(view.get("tmdbApiKey").is_none() && view.get("smtpPassword").is_none());
+        // The exact-case field wins over its variant.
+        assert_eq!(view["MinResumePct"], 11, "{text}");
+    }
+    assert_eq!(admin_view["TmdbApiKeySet"], true, "{admin_view}");
+    assert_eq!(admin_view["SmtpPassword"], "r2-secret-smtp", "{admin_view}");
+    assert!(
+        !bob_view.to_string().contains("r2-secret-smtp"),
+        "{bob_view}"
+    );
+    assert_eq!(admin_view["R2Unknown"], "r2-unknown-value", "{admin_view}");
+    assert!(bob_view.get("R2Unknown").is_none(), "{bob_view}");
+
+    // A key by name, without case.
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        "/System/Configuration/maxResumePct",
+        &admin,
+        Some("80"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, view) = send_authed(&app, "GET", "/System/Configuration", &admin, None).await;
+    assert_eq!(view["MaxResumePct"], 80, "{view}");
+    assert!(view.get("maxResumePct").is_none(), "{view}");
+
+    // Documents over 256 KiB are refused and change nothing.
+    let big = "x".repeat(300 * 1024);
+    let mut config = view.clone();
+    config["R2Big"] = serde_json::json!(big);
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        "/System/Configuration",
+        &admin,
+        Some(&config.to_string()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    let body = serde_json::json!(big).to_string();
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        "/System/Configuration/R2Big",
+        &admin,
+        Some(&body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    let body = serde_json::json!({ "H264Crf": 20, "R2Big": big }).to_string();
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        "/System/Configuration/encoding",
+        &admin,
+        Some(&body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    let (_, view) = send_authed(&app, "GET", "/System/Configuration", &admin, None).await;
+    assert!(view.get("R2Big").is_none());
+    let (_, encoding) =
+        send_authed(&app, "GET", "/System/Configuration/encoding", &admin, None).await;
+    assert_eq!(encoding["H264Crf"], 23, "{encoding}");
 }
 
 #[tokio::test]

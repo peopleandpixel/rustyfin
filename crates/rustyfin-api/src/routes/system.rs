@@ -258,13 +258,20 @@ async fn configuration_json(
         hide_secrets(&mut config);
     }
     let mut json = serde_json::to_value(&config).map_err(|e| ApiError::Internal(e.to_string()))?;
+    let defaults = rustyfin_model::server_info::jellyfin_server_defaults();
     if let Some(obj) = json.as_object_mut() {
         // A key still waiting to be saved is in the config, but is never returned.
         for field in ["TmdbApiKey", "OmdbApiKey", "FanartApiKey"] {
             obj.remove(field);
         }
+        // Fields that are neither Rustyfin's nor Jellyfin's go to administrators only.
+        if !is_admin {
+            for field in config.other.keys().filter(|f| !defaults.contains_key(*f)) {
+                obj.remove(field);
+            }
+        }
         // Jellyfin's fields that no client has saved yet get Jellyfin's defaults.
-        for (field, value) in rustyfin_model::server_info::jellyfin_server_defaults() {
+        for (field, value) in defaults {
             obj.entry(field).or_insert(value);
         }
     }
@@ -330,6 +337,77 @@ async fn save_config_file(path: PathBuf, config: ServerConfiguration) -> Result<
     .await
     .map_err(|e| ApiError::Internal(e.to_string()))?
     .map_err(|e| ApiError::Internal(e.to_string()))
+}
+
+/// The largest configuration document stored, as JSON: the server settings, the encoding settings.
+const MAX_CONFIG_BYTES: usize = 256 * 1024;
+
+/// Refuses, with 413, a document `what` whose JSON is over `MAX_CONFIG_BYTES`.
+fn ensure_config_size(what: &str, document: &impl serde::Serialize) -> Result<(), ApiError> {
+    let size = serde_json::to_vec(document)
+        .map_err(|e| ApiError::Internal(e.to_string()))?
+        .len();
+    if size > MAX_CONFIG_BYTES {
+        return Err(ApiError::PayloadTooLarge(format!(
+            "{what}: {size} bytes is over the {MAX_CONFIG_BYTES}-byte limit"
+        )));
+    }
+    Ok(())
+}
+
+/// Every field name the server settings know: Rustyfin's, the provider keys and their flags, and
+/// Jellyfin's.
+fn known_config_fields() -> Vec<String> {
+    let mut names: Vec<String> = match serde_json::to_value(ServerConfiguration::default()) {
+        Ok(serde_json::Value::Object(map)) => map.into_iter().map(|(k, _)| k).collect(),
+        _ => Vec::new(),
+    };
+    names.extend(
+        [
+            "TmdbApiKey",
+            "OmdbApiKey",
+            "FanartApiKey",
+            "TmdbApiKeySet",
+            "OmdbApiKeySet",
+            "FanartApiKeySet",
+        ]
+        .map(String::from),
+    );
+    names.extend(
+        rustyfin_model::server_info::jellyfin_server_defaults()
+            .into_iter()
+            .map(|(k, _)| k),
+    );
+    names
+}
+
+/// The known field name `key` matches without case, else `key` as given.
+fn canonical_field(key: &str, known: &[String]) -> String {
+    known
+        .iter()
+        .find(|k| k.eq_ignore_ascii_case(key))
+        .cloned()
+        .unwrap_or_else(|| key.to_string())
+}
+
+/// Renames the fields of a posted configuration to the known field each matches without case, as
+/// Jellyfin reads JSON, so `tmdbApiKey` is the TMDb key (saved to its plugin, never stored or
+/// returned) rather than an unknown field. A field in the exact case wins over a variant.
+fn canonical_fields(body: serde_json::Value) -> serde_json::Value {
+    let serde_json::Value::Object(map) = body else {
+        return body;
+    };
+    let known = known_config_fields();
+    let mut out = serde_json::Map::new();
+    for (key, value) in map {
+        let canonical = canonical_field(&key, &known);
+        if canonical == key {
+            out.insert(canonical, value);
+        } else {
+            out.entry(canonical).or_insert(value);
+        }
+    }
+    serde_json::Value::Object(out)
 }
 
 /// Drops the fields that `configuration_json` works out on each GET, so a client that posts the
@@ -437,11 +515,14 @@ async fn save_encoding_configuration(
             "encoding: the body must be a JSON object".to_string(),
         ));
     }
+    ensure_config_size(ENCODING_KEY, &body)?;
     let path = encoding_path(state);
     let text =
         serde_json::to_string_pretty(&body).map_err(|e| ApiError::Internal(e.to_string()))?;
     tokio::task::spawn_blocking(move || {
-        let tmp = path.with_extension("json.tmp");
+        // Each save writes its own temp file, so two saves at once never write the same file;
+        // the last rename wins.
+        let tmp = path.with_file_name(format!("encoding.json.{}.tmp", uuid::Uuid::new_v4()));
         std::fs::write(&tmp, text)?;
         std::fs::rename(&tmp, &path)
     })
@@ -452,9 +533,12 @@ async fn save_encoding_configuration(
 
 async fn update_configuration(
     State(state): State<AppState>,
-    Json(mut new_config): Json<ServerConfiguration>,
+    Json(body): Json<serde_json::Value>,
 ) -> Result<StatusCode, ApiError> {
+    let mut new_config: ServerConfiguration = serde_json::from_value(canonical_fields(body))
+        .map_err(|e| ApiError::BadRequest(format!("configuration: {e}")))?;
     drop_computed_fields(&mut new_config);
+    ensure_config_size("configuration", &new_config)?;
     let posted = [
         new_config.tmdb_api_key.is_some(),
         new_config.omdb_api_key.is_some(),
@@ -1039,13 +1123,16 @@ async fn update_configuration_by_key(
     let json = serde_json::to_value(&*current).map_err(|e| ApiError::Internal(e.to_string()))?;
     drop(current);
 
-    // Merge the body into the config at the specified key path
+    // Merge the body into the config at the specified key path, the known field it names
+    // without case.
+    let key = canonical_field(&key, &known_config_fields());
     let merged = merge_json_values(json, &key, body);
 
     // Parse back into ServerConfiguration
     let mut new_config: ServerConfiguration =
         serde_json::from_value(merged).map_err(|e| ApiError::BadRequest(format!("{key}: {e}")))?;
     drop_computed_fields(&mut new_config);
+    ensure_config_size("configuration", &new_config)?;
 
     // Provider keys go to their plugin configs, and are cleared from the config before it is
     // stored. A failed save returns here, before the config is written.
