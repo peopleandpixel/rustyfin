@@ -20108,6 +20108,12 @@ fn b145_icons() {
     b124_node_test("b145_icons.mjs");
 }
 
+// B165: subtitles stayed on screen while the subtitle menu said Off
+#[test]
+fn b165_subtitle_tracks() {
+    b124_node_test("b165_subtitle_tracks.mjs");
+}
+
 // B152: library grid images keep up with scrolling (web client)
 #[test]
 fn b152_blurhash_decoder() {
@@ -27838,6 +27844,36 @@ async fn g4_get_range(
     (status, content_range, body)
 }
 
+// R1 play: media kept inside the data dir (Docker /data with /data/media) direct-plays, while
+// the files Rustyfin owns there (its database, a cache file) are refused even from a library
+#[tokio::test]
+async fn r1play_media_in_the_data_dir_plays_owned_files_are_refused() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let folder = media_folder(&state, "r1play");
+    let movie = std::path::Path::new(&folder).join("R1 Movie.mkv");
+    std::fs::write(&movie, vec![7u8; 500]).unwrap();
+    let cached = state.data_dir.join("cache").join("r1play.mkv");
+    std::fs::write(&cached, vec![7u8; 500]).unwrap();
+    // test_state's database; Rustyfin learns its place from SQLite
+    let db = state.data_dir.join("test.db");
+    assert!(db.is_file());
+    let movie_id = g4_insert_item(&state, "Movie", &movie).await;
+    let cached_id = g4_insert_item(&state, "Movie", &cached).await;
+    let db_id = g4_insert_item(&state, "Movie", &db).await;
+    let app = app(state);
+
+    let uri = |id| format!("/Videos/{id}/stream?Static=true");
+    let (status, content_range, _) = g4_get_range(&app, &uri(movie_id), &token, "bytes=0-99").await;
+    assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(content_range.as_deref(), Some("bytes 0-99/500"));
+    for id in [cached_id, db_id] {
+        let (status, _, body) = g4_get_range(&app, &uri(id), &token, "bytes=0-99").await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{id}");
+        assert!(!body.starts_with(b"SQLite format"), "{id}: database bytes");
+    }
+}
+
 #[tokio::test]
 async fn g4_unsatisfiable_ranges_get_416() {
     let state = test_state().await;
@@ -29187,7 +29223,7 @@ async fn b22_playback_info_lists_external_subtitles() {
         (&streams[4], "srt", Some("eng"), &srt),
     ] {
         assert_eq!(stream["CodecType"], "subtitle", "{stream}");
-        assert_eq!(stream["Type"], "External", "{stream}");
+        assert_eq!(stream["Type"], "Subtitle", "{stream}");
         assert_eq!(stream["IsExternal"], true, "{stream}");
         assert_eq!(stream["Codec"], codec, "{stream}");
         assert_eq!(stream["Language"].as_str(), language, "{stream}");
