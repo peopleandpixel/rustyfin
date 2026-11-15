@@ -1,16 +1,22 @@
-use axum::extract::{Path, State};
+use axum::body::Bytes;
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{delete, get, post};
 use axum::{Extension, Json, Router};
 use rustyfin_db::repo_playlist::PlaylistCaller;
 use rustyfin_model::auth::Claims;
-use rustyfin_model::collection::{CollectionDto, CreateCollectionRequest};
-use rustyfin_model::media::QueryResult;
-use rustyfin_model::playlist::{CreatePlaylistRequest, PlaylistDto};
+use rustyfin_model::collection::CollectionDto;
+use rustyfin_model::media::{MediaItem, MediaType, QueryResult};
+use rustyfin_model::playlist::PlaylistDto;
+use serde_json::Value;
 use uuid::Uuid;
 
 use crate::error::ApiError;
+use crate::parental::HiddenItems;
+use crate::query;
 use crate::state::AppState;
+
+type Params = Query<Vec<(String, String)>>;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -26,6 +32,10 @@ pub fn routes() -> Router<AppState> {
             get(get_playlist_items)
                 .post(add_items_to_playlist)
                 .delete(remove_items_from_playlist),
+        )
+        .route(
+            "/Playlists/{id}/Items/{entry_id}/Move/{new_index}",
+            post(move_playlist_item),
         )
         .route("/Playlists/{id}/Users", get(get_playlist_users))
         .route(
@@ -53,19 +63,60 @@ async fn get_collections(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<Vec<CollectionDto>>, ApiError> {
-    let collections =
+    let mut collections =
         rustyfin_db::repo_collection::get_collections(&state.db_ro, claims.sub).await?;
+    let hidden = HiddenItems::for_caller(&state, &claims).await?;
+    for collection in &mut collections {
+        visible_collection_count(&state, &hidden, collection).await?;
+    }
     Ok(Json(collections))
 }
 
 async fn get_collection(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    Extension(claims): Extension<Claims>,
 ) -> Result<Json<CollectionDto>, ApiError> {
-    let collection = rustyfin_db::repo_collection::get_collection(&state.db_ro, id)
+    let mut collection = rustyfin_db::repo_collection::get_collection(&state.db_ro, id)
         .await?
         .ok_or_else(|| ApiError::NotFound("Collection not found".to_string()))?;
+    let hidden = HiddenItems::for_caller(&state, &claims).await?;
+    visible_collection_count(&state, &hidden, &mut collection).await?;
     Ok(Json(collection))
+}
+
+/// For a user with parental limits, a collection's `ChildCount` counts only the items they may
+/// see, as its item list shows them.
+async fn visible_collection_count(
+    state: &AppState,
+    hidden: &HiddenItems,
+    collection: &mut CollectionDto,
+) -> Result<(), ApiError> {
+    if hidden.is_restricted() {
+        let mut items =
+            rustyfin_db::repo_collection::get_collection_items(&state.db_ro, collection.id).await?;
+        hidden.retain(&mut items, |i| i.id);
+        collection.child_count = items.len() as i64;
+    }
+    Ok(())
+}
+
+/// The same for a playlist the caller can read.
+async fn visible_playlist_count(
+    state: &AppState,
+    claims: &Claims,
+    hidden: &HiddenItems,
+    playlist: &mut PlaylistDto,
+) -> Result<(), ApiError> {
+    if hidden.is_restricted() {
+        let caller = playlist_caller(claims);
+        let mut items =
+            rustyfin_db::repo_playlist::get_playlist_items(&state.db_ro, playlist.id, caller)
+                .await?;
+        hidden.retain(&mut items, |i| i.id);
+        playlist.child_count = items.len() as i64;
+    }
+    Ok(())
 }
 
 async fn delete_collection(
@@ -76,35 +127,108 @@ async fn delete_collection(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// A JSON body, if the request has one. Jellyfin clients send most of these calls with query
+/// parameters and no body at all.
+fn optional_body(body: &Bytes) -> Result<Option<Value>, ApiError> {
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return Ok(None);
+    }
+    serde_json::from_slice(body)
+        .map(Some)
+        .map_err(|e| ApiError::BadRequest(format!("invalid JSON body: {e}")))
+}
+
+fn body_field<'a>(body: Option<&'a Value>, key: &str) -> Option<&'a Value> {
+    body?
+        .as_object()?
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(key))
+        .map(|(_, value)| value)
+}
+
+/// The text given for `key` in the query, or else in the body.
+fn text_param(params: &[(String, String)], body: Option<&Value>, key: &str) -> Option<String> {
+    query::first_value(params, key)
+        .or_else(|| body_field(body, key)?.as_str().map(str::trim))
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+/// The most ids one request may name.
+const MAX_IDS: usize = 1_000;
+
+/// The ids given for `key` in the query (a comma list, or the key repeated), or else in the body
+/// (an array or a comma list). A value that isn't a UUID, or more than `MAX_IDS` of them, is a 400.
+fn id_list(
+    params: &[(String, String)],
+    body: Option<&Value>,
+    key: &str,
+) -> Result<Vec<Uuid>, ApiError> {
+    let mut values = query::list_values(params, key, ',');
+    if values.is_empty() {
+        values = match body_field(body, key) {
+            Some(Value::Array(entries)) => entries
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect(),
+            Some(Value::String(list)) => list
+                .split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(str::to_string)
+                .collect(),
+            _ => Vec::new(),
+        };
+    }
+    if values.len() > MAX_IDS {
+        return Err(ApiError::BadRequest(format!(
+            "{key} may name at most {MAX_IDS} items"
+        )));
+    }
+    values
+        .iter()
+        .map(|value| query::parse_uuid(key, value))
+        .collect()
+}
+
+/// POST /Collections?Name=&Ids= (or the same keys in a JSON body).
 async fn create_collection(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
-    Json(req): Json<CreateCollectionRequest>,
+    Query(params): Params,
+    body: Bytes,
 ) -> Result<Json<CollectionDto>, ApiError> {
-    if req.name.trim().is_empty() {
-        return Err(ApiError::BadRequest("name is required".into()));
-    }
+    let body = optional_body(&body)?;
+    let name = text_param(&params, body.as_ref(), "Name")
+        .ok_or_else(|| ApiError::BadRequest("name is required".into()))?;
+    let item_ids = id_list(&params, body.as_ref(), "Ids")?;
     let id = Uuid::new_v4();
-    let item_ids = req.ids.unwrap_or_default();
-    rustyfin_db::repo_collection::create_collection(
-        &state.db, id, &req.name, claims.sub, &item_ids,
-    )
-    .await?;
+    rustyfin_db::repo_collection::create_collection(&state.db, id, &name, claims.sub, &item_ids)
+        .await?;
 
-    let collections =
-        rustyfin_db::repo_collection::get_collections(&state.db_ro, claims.sub).await?;
-    let col = collections
-        .into_iter()
-        .find(|c| c.id == id)
+    let col = rustyfin_db::repo_collection::get_collection(&state.db, id)
+        .await?
         .ok_or_else(|| ApiError::Internal("collection not found after creation".into()))?;
     Ok(Json(col))
+}
+
+async fn ensure_collection(state: &AppState, id: Uuid) -> Result<(), ApiError> {
+    rustyfin_db::repo_collection::get_collection(&state.db_ro, id)
+        .await?
+        .map(|_| ())
+        .ok_or_else(|| ApiError::NotFound("Collection not found".to_string()))
 }
 
 async fn get_collection_items(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    Extension(claims): Extension<Claims>,
 ) -> Result<Json<QueryResult>, ApiError> {
-    let items = rustyfin_db::repo_collection::get_collection_items(&state.db_ro, id).await?;
+    let mut items = rustyfin_db::repo_collection::get_collection_items(&state.db_ro, id).await?;
+    HiddenItems::for_caller(&state, &claims)
+        .await?
+        .retain(&mut items, |i| i.id);
     let count = items.len() as i64;
     Ok(Json(QueryResult {
         items,
@@ -134,7 +258,11 @@ async fn get_playlists(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<Vec<PlaylistDto>>, ApiError> {
-    let playlists = rustyfin_db::repo_playlist::get_playlists(&state.db_ro, claims.sub).await?;
+    let mut playlists = rustyfin_db::repo_playlist::get_playlists(&state.db_ro, claims.sub).await?;
+    let hidden = HiddenItems::for_caller(&state, &claims).await?;
+    for playlist in &mut playlists {
+        visible_playlist_count(&state, &claims, &hidden, playlist).await?;
+    }
     Ok(Json(playlists))
 }
 
@@ -157,9 +285,11 @@ async fn get_playlist(
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<PlaylistDto>, ApiError> {
     let caller = playlist_caller(&claims);
-    let playlist = rustyfin_db::repo_playlist::get_playlist(&state.db_ro, id, caller)
+    let mut playlist = rustyfin_db::repo_playlist::get_playlist(&state.db_ro, id, caller)
         .await?
         .ok_or_else(playlist_not_found)?;
+    let hidden = HiddenItems::for_caller(&state, &claims).await?;
+    visible_playlist_count(&state, &claims, &hidden, &mut playlist).await?;
     Ok(Json(playlist))
 }
 
@@ -175,48 +305,106 @@ async fn delete_playlist(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// POST /Playlists with Name, Ids, UserId and MediaType in the query or a JSON body; the query
+/// wins, as in Jellyfin.
 async fn create_playlist(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
-    Json(req): Json<CreatePlaylistRequest>,
+    Query(params): Params,
+    body: Bytes,
 ) -> Result<Json<PlaylistDto>, ApiError> {
-    if req.name.trim().is_empty() {
-        return Err(ApiError::BadRequest("name is required".into()));
+    let body = optional_body(&body)?;
+    let body = body.as_ref();
+    let name = text_param(&params, body, "Name")
+        .ok_or_else(|| ApiError::BadRequest("name is required".into()))?;
+    let mut item_ids = id_list(&params, body, "Ids")?;
+    if item_ids.is_empty() {
+        // The Rustyfin web client's name for the list.
+        item_ids = id_list(&params, body, "ItemIds")?;
     }
+    if let Some(user) = text_param(&params, body, "UserId") {
+        let user = query::parse_uuid("UserId", &user)?;
+        if user != claims.sub && !claims.is_admin {
+            return Err(ApiError::Forbidden(
+                "A playlist can only be created for yourself.".into(),
+            ));
+        }
+    }
+    let media_type = text_param(&params, body, "MediaType");
     let id = Uuid::new_v4();
-    let item_ids = req.ids.unwrap_or_default();
     rustyfin_db::repo_playlist::create_playlist(
         &state.db,
         id,
-        &req.name,
+        &name,
         claims.sub,
-        req.media_type.as_deref(),
+        media_type.as_deref(),
         &item_ids,
     )
     .await?;
 
-    let playlists = rustyfin_db::repo_playlist::get_playlists(&state.db_ro, claims.sub).await?;
-    let pl = playlists
-        .into_iter()
-        .find(|p| p.id == id)
+    let pl = rustyfin_db::repo_playlist::get_playlist(&state.db, id, PlaylistCaller::Admin)
+        .await?
         .ok_or_else(|| ApiError::Internal("playlist not found after creation".into()))?;
     Ok(Json(pl))
 }
 
+/// GET /Playlists/{id}/Items?StartIndex=&Limit=
 async fn get_playlist_items(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Extension(claims): Extension<Claims>,
+    Query(params): Params,
 ) -> Result<Json<QueryResult>, ApiError> {
     ensure_playlist_visible(&state, id, &claims).await?;
-    let caller = playlist_caller(&claims);
-    let items = rustyfin_db::repo_playlist::get_playlist_items(&state.db_ro, id, caller).await?;
-    let count = items.len() as i64;
-    Ok(Json(QueryResult {
+    let start = query::count_param(&params, "StartIndex")?.unwrap_or(0);
+    let limit = query::count_param(&params, "Limit")?;
+    playlist_entries(&state, id, &claims, start, limit)
+        .await
+        .map(Json)
+}
+
+/// The entries of a playlist the caller sees, in playlist order, each with its PlaylistItemId,
+/// enriched like any item list. Items hidden from the caller by parental limits are left out,
+/// and out of the total.
+pub(crate) async fn playlist_entries(
+    state: &AppState,
+    id: Uuid,
+    claims: &Claims,
+    start: usize,
+    limit: Option<usize>,
+) -> Result<QueryResult, ApiError> {
+    let caller = playlist_caller(claims);
+    let mut all = rustyfin_db::repo_playlist::get_playlist_items(&state.db_ro, id, caller).await?;
+    HiddenItems::for_caller(state, claims)
+        .await?
+        .retain(&mut all, |i| i.id);
+    let total = all.len() as i64;
+    let mut items: Vec<MediaItem> = all
+        .into_iter()
+        .skip(start)
+        .take(limit.unwrap_or(usize::MAX))
+        .collect();
+    enrich(state, claims, &mut items).await;
+    Ok(QueryResult {
         items,
-        total_record_count: count,
-        start_index: 0,
-    }))
+        total_record_count: total,
+        start_index: start as i64,
+    })
+}
+
+async fn enrich(state: &AppState, claims: &Claims, items: &mut [MediaItem]) {
+    let tmdb = state.tmdb.api(None);
+    super::items::enrich_items(
+        &state.db_ro,
+        &state.server_id,
+        Some(claims.sub),
+        items,
+        &state.http_client,
+        tmdb.as_ref(),
+        &state.data_dir,
+        true,
+    )
+    .await;
 }
 
 /// POST /Playlists/{id} - Update playlist
@@ -251,58 +439,69 @@ async fn update_playlist(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// POST /Playlists/{id}/Items - Add items to playlist
+/// POST /Playlists/{id}/Items?Ids= (or `Ids` in a JSON body): appends the items in order.
 async fn add_items_to_playlist(
     State(state): State<AppState>,
     Path(playlist_id): Path<Uuid>,
     Extension(claims): Extension<Claims>,
-    Json(body): Json<serde_json::Value>,
+    Query(params): Params,
+    body: Bytes,
 ) -> Result<StatusCode, ApiError> {
+    let body = optional_body(&body)?;
+    let item_ids = id_list(&params, body.as_ref(), "Ids")?;
     ensure_playlist_visible(&state, playlist_id, &claims).await?;
     let caller = playlist_caller(&claims);
-    if let Some(ids) = body.get("Ids").and_then(|v| v.as_array()) {
-        for id_val in ids {
-            if let Some(id_str) = id_val.as_str()
-                && let Ok(item_id) = id_str.parse::<Uuid>()
-            {
-                rustyfin_db::repo_playlist::add_item_to_playlist(
-                    &state.db,
-                    playlist_id,
-                    item_id,
-                    caller,
-                )
-                .await
-                .ok();
-            }
-        }
-    }
+    rustyfin_db::repo_playlist::add_items_to_playlist(&state.db, playlist_id, &item_ids, caller)
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// DELETE /Playlists/{id}/Items - Remove items from playlist
+/// DELETE /Playlists/{id}/Items?EntryIds= (PlaylistItemIds, as Jellyfin), or item `Ids` in a
+/// JSON body.
 async fn remove_items_from_playlist(
     State(state): State<AppState>,
     Path(playlist_id): Path<Uuid>,
     Extension(claims): Extension<Claims>,
-    Json(body): Json<serde_json::Value>,
+    Query(params): Params,
+    body: Bytes,
 ) -> Result<StatusCode, ApiError> {
+    let body = optional_body(&body)?;
+    let mut item_ids: Vec<Uuid> = id_list(&params, body.as_ref(), "EntryIds")?
+        .into_iter()
+        .map(|entry| rustyfin_db::repo_playlist::entry_item(playlist_id, entry))
+        .collect();
+    item_ids.extend(id_list(&params, body.as_ref(), "Ids")?);
     ensure_playlist_visible(&state, playlist_id, &claims).await?;
     let caller = playlist_caller(&claims);
-    if let Some(ids) = body.get("Ids").and_then(|v| v.as_array()) {
-        for id_val in ids {
-            if let Some(id_str) = id_val.as_str()
-                && let Ok(item_id) = id_str.parse::<Uuid>()
-            {
-                rustyfin_db::repo_playlist::remove_item_from_playlist(
-                    &state.db,
-                    playlist_id,
-                    item_id,
-                    caller,
-                )
-                .await
-                .ok();
-            }
-        }
+    for item_id in item_ids {
+        rustyfin_db::repo_playlist::remove_item_from_playlist(
+            &state.db,
+            playlist_id,
+            item_id,
+            caller,
+        )
+        .await?;
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// POST /Playlists/{id}/Items/{entryId}/Move/{newIndex}
+async fn move_playlist_item(
+    State(state): State<AppState>,
+    Path((playlist_id, entry, new_index)): Path<(Uuid, Uuid, usize)>,
+    Extension(claims): Extension<Claims>,
+) -> Result<StatusCode, ApiError> {
+    let item_id = rustyfin_db::repo_playlist::entry_item(playlist_id, entry);
+    let moved = rustyfin_db::repo_playlist::move_playlist_item(
+        &state.db,
+        playlist_id,
+        item_id,
+        new_index,
+        playlist_caller(&claims),
+    )
+    .await?;
+    if !moved {
+        return Err(ApiError::NotFound("Playlist item not found".to_string()));
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -349,50 +548,177 @@ async fn remove_playlist_user(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// POST /Collections/{id}/Items - Add items to collection (bulk)
+/// POST /Collections/{id}/Items?Ids= (or `Ids` in a JSON body) - Add items to a collection
 async fn add_items_to_collection(
     State(state): State<AppState>,
     Path(collection_id): Path<Uuid>,
-    Json(_body): Json<serde_json::Value>,
+    Query(params): Params,
+    body: Bytes,
 ) -> Result<StatusCode, ApiError> {
-    if let Some(ids) = _body.get("Ids").and_then(|v| v.as_array()) {
-        for id_val in ids {
-            if let Some(id_str) = id_val.as_str()
-                && let Ok(item_id) = id_str.parse::<Uuid>()
-            {
-                rustyfin_db::repo_collection::add_item_to_collection(
-                    &state.db,
-                    collection_id,
-                    item_id,
-                )
-                .await
-                .ok();
-            }
-        }
+    let body = optional_body(&body)?;
+    let item_ids = id_list(&params, body.as_ref(), "Ids")?;
+    ensure_collection(&state, collection_id).await?;
+    for item_id in item_ids {
+        rustyfin_db::repo_collection::add_item_to_collection(&state.db, collection_id, item_id)
+            .await
+            .ok();
     }
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// DELETE /Collections/{id}/Items - Remove items from collection (bulk)
+/// DELETE /Collections/{id}/Items?Ids= (or `Ids` in a JSON body) - Remove items from a collection
 async fn remove_items_from_collection(
     State(state): State<AppState>,
     Path(collection_id): Path<Uuid>,
-    Json(_body): Json<serde_json::Value>,
+    Query(params): Params,
+    body: Bytes,
 ) -> Result<StatusCode, ApiError> {
-    if let Some(ids) = _body.get("Ids").and_then(|v| v.as_array()) {
-        for id_val in ids {
-            if let Some(id_str) = id_val.as_str()
-                && let Ok(item_id) = id_str.parse::<Uuid>()
-            {
-                rustyfin_db::repo_collection::remove_item_from_collection(
-                    &state.db,
-                    collection_id,
-                    item_id,
-                )
-                .await
-                .ok();
-            }
-        }
+    let body = optional_body(&body)?;
+    let item_ids = id_list(&params, body.as_ref(), "Ids")?;
+    ensure_collection(&state, collection_id).await?;
+    for item_id in item_ids {
+        rustyfin_db::repo_collection::remove_item_from_collection(
+            &state.db,
+            collection_id,
+            item_id,
+        )
+        .await?;
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// What an id names when it isn't a media item: a collection (with its item ids) or a playlist
+/// the caller sees.
+pub(crate) enum Container {
+    Collection(Vec<Uuid>),
+    Playlist,
+}
+
+pub(crate) async fn container_of(
+    state: &AppState,
+    id: Uuid,
+    claims: &Claims,
+) -> Result<Option<Container>, ApiError> {
+    if rustyfin_db::repo_collection::get_collection(&state.db_ro, id)
+        .await?
+        .is_some()
+    {
+        let ids = rustyfin_db::repo_collection::get_collection_item_ids(&state.db_ro, id).await?;
+        return Ok(Some(Container::Collection(ids)));
+    }
+    let playlist =
+        rustyfin_db::repo_playlist::get_playlist(&state.db_ro, id, playlist_caller(claims)).await?;
+    Ok(playlist.map(|_| Container::Playlist))
+}
+
+fn container_item(
+    state: &AppState,
+    id: Uuid,
+    name: String,
+    media_type: MediaType,
+    child_count: i64,
+    date_created: chrono::DateTime<chrono::Utc>,
+) -> MediaItem {
+    MediaItem {
+        id,
+        sort_name: Some(name.to_lowercase()),
+        name,
+        media_type,
+        child_count: Some(child_count as i32),
+        date_created,
+        server_id: Some(state.server_id.to_string()),
+        ..MediaItem::default_dto_fields()
+    }
+}
+
+fn collection_item(state: &AppState, c: CollectionDto) -> MediaItem {
+    container_item(
+        state,
+        c.id,
+        c.name,
+        MediaType::BoxSet,
+        c.child_count,
+        c.date_created,
+    )
+}
+
+fn playlist_item(state: &AppState, p: PlaylistDto) -> MediaItem {
+    container_item(
+        state,
+        p.id,
+        p.name,
+        MediaType::Playlist,
+        p.child_count,
+        p.date_created,
+    )
+}
+
+/// GET /Items/{id} for a collection, or a playlist the caller sees.
+pub(crate) async fn container_details(
+    state: &AppState,
+    id: Uuid,
+    claims: &Claims,
+) -> Result<Option<MediaItem>, ApiError> {
+    if let Some(c) = rustyfin_db::repo_collection::get_collection(&state.db_ro, id).await? {
+        return Ok(Some(collection_item(state, c)));
+    }
+    let playlist =
+        rustyfin_db::repo_playlist::get_playlist(&state.db_ro, id, playlist_caller(claims)).await?;
+    Ok(playlist.map(|p| playlist_item(state, p)))
+}
+
+/// /Items?IncludeItemTypes=BoxSet,Playlist: every collection and the caller's playlists, sorted
+/// by name and paged with StartIndex and Limit; the other filters don't apply.
+pub(crate) async fn container_listing(
+    state: &AppState,
+    claims: &Claims,
+    collections: bool,
+    playlists: bool,
+    start: usize,
+    limit: usize,
+) -> Result<QueryResult, ApiError> {
+    let mut all = Vec::new();
+    if collections {
+        for c in rustyfin_db::repo_collection::get_all_collections(&state.db_ro).await? {
+            all.push(collection_item(state, c));
+        }
+    }
+    if playlists {
+        for p in rustyfin_db::repo_playlist::get_playlists(&state.db_ro, claims.sub).await? {
+            all.push(playlist_item(state, p));
+        }
+    }
+    all.sort_by(|a, b| a.sort_name.cmp(&b.sort_name));
+    let total = all.len() as i64;
+    let items = all.into_iter().skip(start).take(limit).collect();
+    Ok(QueryResult {
+        items,
+        total_record_count: total,
+        start_index: start as i64,
+    })
+}
+
+/// DELETE /Items/{id} for a collection (administrators) or a playlist (its owner or an
+/// administrator). None when the id names neither, so the caller goes on to media items.
+pub(crate) async fn delete_container(
+    state: &AppState,
+    id: Uuid,
+    claims: &Claims,
+) -> Result<Option<StatusCode>, ApiError> {
+    if rustyfin_db::repo_collection::get_collection(&state.db_ro, id)
+        .await?
+        .is_some()
+    {
+        if !claims.is_admin {
+            return Err(ApiError::Forbidden(
+                "Administrator access is required.".to_string(),
+            ));
+        }
+        rustyfin_db::repo_collection::delete_collection(&state.db, id).await?;
+        return Ok(Some(StatusCode::NO_CONTENT));
+    }
+    if rustyfin_db::repo_playlist::delete_playlist(&state.db, id, playlist_caller(claims)).await? {
+        return Ok(Some(StatusCode::NO_CONTENT));
+    }
+    Ok(None)
 }

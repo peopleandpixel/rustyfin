@@ -98,16 +98,21 @@ async fn serve_image(
     tag: Option<&str>,
     if_none_match: Option<&HeaderValue>,
 ) -> Result<Response, ApiError> {
-    let image_type = ImageType::from_str(image_type_str)
-        .ok_or_else(|| ApiError::BadRequest(format!("unknown image type: {}", image_type_str)))?;
-
-    let found = rustyfin_db::repo_image::get_image(&state.db_ro, id, &image_type, index).await?;
-    // Imported people keep their images in `person_images`; try those before giving up.
-    let mut img = match found {
-        Some(img) => img,
-        None => rustyfin_db::repo_image::get_person_image(&state.db_ro, id, &image_type, index)
-            .await?
-            .ok_or_else(|| ApiError::NotFound("image not found".into()))?,
+    let mut img = if image_type_str.eq_ignore_ascii_case("chapter") {
+        chapter_image(state, id, index).await?
+    } else {
+        let image_type = ImageType::from_str(image_type_str).ok_or_else(|| {
+            ApiError::BadRequest(format!("unknown image type: {}", image_type_str))
+        })?;
+        let found =
+            rustyfin_db::repo_image::get_image(&state.db_ro, id, &image_type, index).await?;
+        // Imported people keep their images in `person_images`; try those before giving up.
+        match found {
+            Some(img) => img,
+            None => rustyfin_db::repo_image::get_person_image(&state.db_ro, id, &image_type, index)
+                .await?
+                .ok_or_else(|| ApiError::NotFound("image not found".into()))?,
+        }
     };
 
     // The URL's tag names one version of the picture. When it is the current one, the answer
@@ -286,6 +291,35 @@ async fn serve_image(
         .unwrap())
 }
 
+/// The image of chapter `index` (from 0, in start order) of item `id`, as an image row. Chapter
+/// images live in the chapters table, not with the item's other images; the row's type is never
+/// read. 404 when the chapter has no image.
+async fn chapter_image(state: &AppState, id: Uuid, index: i32) -> Result<ItemImage, ApiError> {
+    let chapters = rustyfin_db::repo_chapter::get_chapters(&state.db_ro, id).await?;
+    let chapter = usize::try_from(index)
+        .ok()
+        .and_then(|i| chapters.get(i))
+        .ok_or_else(|| ApiError::NotFound("chapter not found".into()))?;
+    let path = chapter
+        .image_path
+        .clone()
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| ApiError::NotFound("chapter image not found".into()))?;
+    let (stamp, width, height) =
+        rustyfin_core::local_images::local_image_version(std::path::Path::new(&path));
+    Ok(ItemImage {
+        item_id: id,
+        image_type: ImageType::Screenshot,
+        image_index: index,
+        path,
+        provider: "chapter".to_string(),
+        width,
+        height,
+        blurhash: None,
+        stamp,
+    })
+}
+
 async fn get_item_image(
     State(state): State<AppState>,
     Path((id, image_type_str)): Path<(Uuid, String)>,
@@ -378,10 +412,23 @@ async fn upload_item_image(
 async fn refresh_item(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
 ) -> Result<Json<Value>, ApiError> {
     let item = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, id)
         .await?
         .ok_or_else(|| ApiError::NotFound("item not found".into()))?;
+
+    // A refresh that replaces all images tries failed chapter images and trickplay again.
+    let replace_all = query.as_deref().is_some_and(|q| {
+        q.split('&').any(|pair| {
+            pair.split_once('=').is_some_and(|(name, value)| {
+                name.eq_ignore_ascii_case("ReplaceAllImages") && value.eq_ignore_ascii_case("true")
+            })
+        })
+    });
+    if replace_all {
+        rustyfin_db::repo_trickplay::clear_failures(&state.db, id).await?;
+    }
 
     rustyfin_core::metadata::refresh_item_metadata(
         &state.db,

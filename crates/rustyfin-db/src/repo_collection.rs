@@ -70,6 +70,46 @@ pub async fn get_collections(
         .collect())
 }
 
+/// Every collection, whoever made it: as in Jellyfin, collections are shared by all users.
+pub async fn get_all_collections(pool: &SqlitePool) -> Result<Vec<CollectionDto>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, (String, String, String, i64, String)>(
+        "SELECT c.id, c.name, c.user_id, COUNT(ci.item_id), c.created_at
+         FROM collections c
+         LEFT JOIN collection_items ci ON ci.collection_id = c.id
+         GROUP BY c.id
+         ORDER BY c.name",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .filter_map(|r| {
+            Some(CollectionDto {
+                id: Uuid::parse_str(&r.0).ok()?,
+                name: r.1,
+                user_id: Uuid::parse_str(&r.2).ok()?,
+                child_count: r.3,
+                date_created: parse_dt(&r.4),
+            })
+        })
+        .collect())
+}
+
+/// The item ids of a collection, in collection order.
+pub async fn get_collection_item_ids(
+    pool: &SqlitePool,
+    collection_id: Uuid,
+) -> Result<Vec<Uuid>, sqlx::Error> {
+    let ids = sqlx::query_scalar::<_, String>(
+        "SELECT item_id FROM collection_items WHERE collection_id = ?1 ORDER BY sort_order",
+    )
+    .bind(collection_id.to_string())
+    .fetch_all(pool)
+    .await?;
+    Ok(ids.iter().filter_map(|s| Uuid::parse_str(s).ok()).collect())
+}
+
 pub async fn get_collection(
     pool: &SqlitePool,
     id: Uuid,

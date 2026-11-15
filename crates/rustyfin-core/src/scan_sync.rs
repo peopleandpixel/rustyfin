@@ -198,7 +198,7 @@ async fn remove_empty_containers_in_scope(
 fn scanned_types(content_type: &LibraryContentType) -> &'static [&'static str] {
     match content_type {
         LibraryContentType::Movies => &["Movie"],
-        LibraryContentType::Photos => &["Photo"],
+        LibraryContentType::Photos => &["Photo", "Video"],
         LibraryContentType::Mixed => &["Movie", "Audio", "Photo"],
         LibraryContentType::TvShows => &["Episode"],
         LibraryContentType::Music => &["Audio"],

@@ -185,8 +185,15 @@ pub(crate) async fn start_session(
             Default::default()
         });
 
+    let parental = rustyfin_db::repo_parental::get_policy(&state.db, user.id)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "could not read the user's parental policy for the sign-in answer");
+            Default::default()
+        });
+
     AuthResponse {
-        user: UserDto::new(user, flags, &state.server_id),
+        user: UserDto::new(user, flags, &state.server_id, &parental),
         session_info,
         access_token: token,
         server_id: state.server_id.to_string(),

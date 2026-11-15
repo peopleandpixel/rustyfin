@@ -19,6 +19,18 @@ fn owner_filter(caller: PlaylistCaller) -> Option<String> {
     }
 }
 
+/// The entry id (Jellyfin's `PlaylistItemId`) of an item in a playlist. A playlist holds an item
+/// once, so the pair names the entry; XOR keeps it reversible without a stored id.
+pub fn entry_id(playlist_id: Uuid, item_id: Uuid) -> Uuid {
+    let (p, i) = (playlist_id.as_u128(), item_id.as_u128());
+    Uuid::from_u128(p ^ i)
+}
+
+/// The item an entry id names in a playlist: the inverse of `entry_id`.
+pub fn entry_item(playlist_id: Uuid, entry: Uuid) -> Uuid {
+    entry_id(playlist_id, entry)
+}
+
 fn parse_dt(s: &str) -> chrono::DateTime<Utc> {
     NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
         .map(|ndt| Utc.from_utc_datetime(&ndt))
@@ -88,29 +100,38 @@ pub async fn get_playlists(
         .collect())
 }
 
-pub async fn get_playlist_items(
+/// The item ids of a visible playlist, in playlist order.
+pub async fn get_playlist_item_ids(
     pool: &SqlitePool,
     playlist_id: Uuid,
     caller: PlaylistCaller,
-) -> Result<Vec<MediaItem>, sqlx::Error> {
+) -> Result<Vec<Uuid>, sqlx::Error> {
     let pid = playlist_id.to_string();
     let owner = owner_filter(caller);
-    let ids = sqlx::query_as::<_, (String,)>(
+    let ids = sqlx::query_scalar::<_, String>(
         "SELECT pi.item_id FROM playlist_items pi
          JOIN playlists p ON p.id = pi.playlist_id
          WHERE pi.playlist_id = ?1 AND (?2 IS NULL OR p.user_id = ?2)
-         ORDER BY pi.sort_order",
+         ORDER BY pi.sort_order, pi.rowid",
     )
     .bind(&pid)
     .bind(owner.as_deref())
     .fetch_all(pool)
     .await?;
+    Ok(ids.iter().filter_map(|s| Uuid::parse_str(s).ok()).collect())
+}
 
+/// The items of a visible playlist, in playlist order, each with its `PlaylistItemId`.
+pub async fn get_playlist_items(
+    pool: &SqlitePool,
+    playlist_id: Uuid,
+    caller: PlaylistCaller,
+) -> Result<Vec<MediaItem>, sqlx::Error> {
+    let ids = get_playlist_item_ids(pool, playlist_id, caller).await?;
     let mut items = Vec::with_capacity(ids.len());
-    for (id_str,) in ids {
-        if let Ok(id) = Uuid::parse_str(&id_str)
-            && let Ok(Some(item)) = crate::repo_media::get_item_by_id(pool, id).await
-        {
+    for id in ids {
+        if let Ok(Some(mut item)) = crate::repo_media::get_item_by_id(pool, id).await {
+            item.playlist_item_id = Some(entry_id(playlist_id, id));
             items.push(item);
         }
     }
@@ -186,8 +207,10 @@ pub async fn add_item_to_playlist(
     let iid = item_id.to_string();
     let owner = owner_filter(caller);
     sqlx::query(
-        "INSERT OR IGNORE INTO playlist_items (playlist_id, item_id)
-         SELECT ?1, ?2 WHERE EXISTS (
+        "INSERT OR IGNORE INTO playlist_items (playlist_id, item_id, sort_order)
+         SELECT ?1, ?2, (SELECT COALESCE(MAX(sort_order), -1) + 1
+                         FROM playlist_items WHERE playlist_id = ?1)
+         WHERE EXISTS (
             SELECT 1 FROM playlists WHERE id = ?1 AND (?3 IS NULL OR user_id = ?3))",
     )
     .bind(&pid)
@@ -195,6 +218,45 @@ pub async fn add_item_to_playlist(
     .bind(owner.as_deref())
     .execute(pool)
     .await?;
+    Ok(())
+}
+
+/// Append items to a visible playlist in one transaction, in the order given. Ids that name no
+/// item, or an item the playlist already holds, are skipped.
+pub async fn add_items_to_playlist(
+    pool: &SqlitePool,
+    playlist_id: Uuid,
+    item_ids: &[Uuid],
+    caller: PlaylistCaller,
+) -> Result<(), sqlx::Error> {
+    let pid = playlist_id.to_string();
+    let owner = owner_filter(caller);
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let next = sqlx::query_scalar::<_, i64>(
+        "SELECT COALESCE(MAX(pi.sort_order), -1) + 1 FROM playlists p
+         LEFT JOIN playlist_items pi ON pi.playlist_id = p.id
+         WHERE p.id = ?1 AND (?2 IS NULL OR p.user_id = ?2)
+         GROUP BY p.id",
+    )
+    .bind(&pid)
+    .bind(owner.as_deref())
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(next) = next else {
+        return Ok(());
+    };
+    for (i, item_id) in item_ids.iter().enumerate() {
+        sqlx::query(
+            "INSERT OR IGNORE INTO playlist_items (playlist_id, item_id, sort_order)
+             SELECT ?1, ?2, ?3 WHERE EXISTS (SELECT 1 FROM media_items WHERE id = ?2)",
+        )
+        .bind(&pid)
+        .bind(item_id.to_string())
+        .bind(next + i as i64)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
     Ok(())
 }
 
@@ -217,6 +279,50 @@ pub async fn remove_item_from_playlist(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Move an item of a visible playlist to `new_index` (clamped to the end), renumbering the
+/// entries. Returns false when the playlist isn't visible or doesn't hold the item.
+pub async fn move_playlist_item(
+    pool: &SqlitePool,
+    playlist_id: Uuid,
+    item_id: Uuid,
+    new_index: usize,
+    caller: PlaylistCaller,
+) -> Result<bool, sqlx::Error> {
+    let pid = playlist_id.to_string();
+    // Take the write lock before reading, so a write committed between the read and the
+    // renumbering can't fail the move with SQLITE_BUSY_SNAPSHOT.
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let owner = owner_filter(caller);
+    let mut ids = sqlx::query_scalar::<_, String>(
+        "SELECT pi.item_id FROM playlist_items pi
+         JOIN playlists p ON p.id = pi.playlist_id
+         WHERE pi.playlist_id = ?1 AND (?2 IS NULL OR p.user_id = ?2)
+         ORDER BY pi.sort_order, pi.rowid",
+    )
+    .bind(&pid)
+    .bind(owner.as_deref())
+    .fetch_all(&mut *tx)
+    .await?;
+    let iid = item_id.to_string();
+    let Some(from) = ids.iter().position(|id| *id == iid) else {
+        return Ok(false);
+    };
+    let moved = ids.remove(from);
+    ids.insert(new_index.min(ids.len()), moved);
+    for (order, id) in ids.iter().enumerate() {
+        sqlx::query(
+            "UPDATE playlist_items SET sort_order = ?1 WHERE playlist_id = ?2 AND item_id = ?3",
+        )
+        .bind(order as i64)
+        .bind(&pid)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(true)
 }
 
 /// Update a playlist's name and/or media type. Returns true when a visible playlist exists.

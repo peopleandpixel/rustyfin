@@ -35,6 +35,7 @@ mod subtitle;
 mod sync_play;
 mod system;
 mod transcode;
+mod trickplay;
 mod users;
 mod websocket;
 
@@ -143,11 +144,16 @@ pub fn build_router(state: AppState) -> Router {
         .merge(live_tv::routes())
         .merge(additional::routes())
         .merge(media_segments::routes())
+        .merge(trickplay::routes())
         .merge(dynamic_hls::routes())
         .merge(localization::routes())
         .merge(sync_play::routes())
         .merge(oidc::protected_routes())
         .merge(admin)
+        .route_layer(axum_mw::from_fn_with_state(
+            state.clone(),
+            crate::parental::item_gate,
+        ))
         .layer(axum_mw::from_fn_with_state(state.clone(), require_auth));
 
     // Rate limit only the endpoints that check a password or PIN, and Quick Connect's Initiate,

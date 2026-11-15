@@ -34,7 +34,7 @@ pub struct CreateLibraryRequest {
 
 /// Library options for per-library metadata and image providers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase", from = "LibraryOptionsIn")]
 pub struct LibraryOptions {
     /// Metadata provider (e.g., "TMDb", "TheMovieDb", "TheOpenMovieDatabase")
     #[serde(default)]
@@ -45,12 +45,18 @@ pub struct LibraryOptions {
     /// Skip subfolders during scanning
     #[serde(default)]
     pub skip_subfolders: bool,
-    /// Enable automatic chapter extraction
+    /// Make chapter images (Jellyfin's EnableChapterImageExtraction), in the nightly task
     #[serde(default)]
     pub enable_chapter_extraction: bool,
-    /// Enable trickplay generation
+    /// Also make chapter images after each scan of the library
+    #[serde(default)]
+    pub extract_chapter_images_during_library_scan: bool,
+    /// Make trickplay tiles (Jellyfin's EnableTrickplayImageExtraction), in the nightly task
     #[serde(default)]
     pub enable_trickplay: bool,
+    /// Also make trickplay tiles after each scan of the library
+    #[serde(default)]
+    pub extract_trickplay_images_during_library_scan: bool,
     /// Enable intro detection
     #[serde(default)]
     pub enable_intro_detection: bool,
@@ -66,9 +72,64 @@ impl Default for LibraryOptions {
             image_provider: String::new(),
             skip_subfolders: false,
             enable_chapter_extraction: false,
+            extract_chapter_images_during_library_scan: false,
             enable_trickplay: false,
+            extract_trickplay_images_during_library_scan: false,
             enable_intro_detection: false,
             enable_realtime_monitor: true,
+        }
+    }
+}
+
+/// `LibraryOptions` as a request sends it: chapter images and trickplay under Rustyfin's name,
+/// Jellyfin's, or both. Jellyfin's name wins when both are sent, since Jellyfin clients set it.
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct LibraryOptionsIn {
+    #[serde(default)]
+    metadata_provider: String,
+    #[serde(default)]
+    image_provider: String,
+    #[serde(default)]
+    skip_subfolders: bool,
+    #[serde(default)]
+    enable_chapter_extraction: Option<bool>,
+    #[serde(default)]
+    enable_chapter_image_extraction: Option<bool>,
+    #[serde(default)]
+    extract_chapter_images_during_library_scan: bool,
+    #[serde(default)]
+    enable_trickplay: Option<bool>,
+    #[serde(default)]
+    enable_trickplay_image_extraction: Option<bool>,
+    #[serde(default)]
+    extract_trickplay_images_during_library_scan: bool,
+    #[serde(default)]
+    enable_intro_detection: bool,
+    #[serde(default = "default_true")]
+    enable_realtime_monitor: bool,
+}
+
+impl From<LibraryOptionsIn> for LibraryOptions {
+    fn from(o: LibraryOptionsIn) -> Self {
+        Self {
+            metadata_provider: o.metadata_provider,
+            image_provider: o.image_provider,
+            skip_subfolders: o.skip_subfolders,
+            enable_chapter_extraction: o
+                .enable_chapter_image_extraction
+                .or(o.enable_chapter_extraction)
+                .unwrap_or(false),
+            extract_chapter_images_during_library_scan: o
+                .extract_chapter_images_during_library_scan,
+            enable_trickplay: o
+                .enable_trickplay_image_extraction
+                .or(o.enable_trickplay)
+                .unwrap_or(false),
+            extract_trickplay_images_during_library_scan: o
+                .extract_trickplay_images_during_library_scan,
+            enable_intro_detection: o.enable_intro_detection,
+            enable_realtime_monitor: o.enable_realtime_monitor,
         }
     }
 }
@@ -104,6 +165,28 @@ impl LibraryContentType {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn r2chapters_options_take_either_name_and_prefer_jellyfins() {
+        let read = |json: &str| serde_json::from_str::<LibraryOptions>(json).unwrap();
+        let o = read(r#"{"EnableChapterExtraction":true,"EnableTrickplay":true}"#);
+        assert!(o.enable_chapter_extraction && o.enable_trickplay);
+        let o =
+            read(r#"{"EnableChapterImageExtraction":true,"EnableTrickplayImageExtraction":true}"#);
+        assert!(o.enable_chapter_extraction && o.enable_trickplay);
+        // Both names in one body: no "duplicate field", and Jellyfin's wins.
+        let o = read(
+            r#"{"EnableChapterExtraction":false,"EnableChapterImageExtraction":true,
+                "EnableTrickplay":true,"EnableTrickplayImageExtraction":false}"#,
+        );
+        assert!(o.enable_chapter_extraction);
+        assert!(!o.enable_trickplay);
+        let o = read("{}");
+        assert!(!o.enable_trickplay && o.enable_realtime_monitor);
+        // What is stored reads back the same.
+        let back = read(&serde_json::to_string(&o).unwrap());
+        assert_eq!(back.enable_realtime_monitor, o.enable_realtime_monitor);
+    }
 
     // ── LibraryContentType::default_media_type ──
 

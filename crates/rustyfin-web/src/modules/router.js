@@ -3,10 +3,12 @@ import { $, toast } from './util.js';
 import { checkSetupWizard, wizAddManualLibrary } from './wizard.js';
 import { startOidcSignIn, startOidcLink, unlinkOidc, renderLogin, updateAuthUI } from './auth.js';
 import { renderHome, renderFavorites } from './home.js';
-import { renderLibrary, stopLibraryLoad, libraryRemember, startGridDiag, jumpToLetter } from './library.js';
+import {
+    renderLibrary, stopLibraryLoad, libraryRemember, startGridDiag, jumpToLetter, clearLibraryFilters,
+} from './library.js';
 import { currentDetailId, renderDetail, renderPerson, toggleFavorite, togglePlayed } from './item.js';
 import { renderSearch } from './search.js';
-import { playWithResumeChoice, stopPlayback, playItem } from './player.js';
+import { playWithResumeChoice, stopPlayback, playItem, playerAutoHide, onPlayerClosed } from './player.js';
 import { renderSettings } from './settings.js';
 import {
     renderAdmin, showAdminTab, setUserPolicy, removeOidcLinkAsAdmin, copyOidcCallbackUrl, saveOidcAdminSettings,
@@ -129,6 +131,7 @@ const clickActions = {
     'scan-library-admin': el => startScanWithToast(API.scanLibrary(el.dataset.id), t('admin.scan_started')),
     'scan-all': () => startScanWithToast(API.scanAllLibraries(), t('admin.scanning_all')),
     'jump-letter': el => jumpToLetter(el.dataset.id, el.dataset.letter),
+    'clear-library-filters': el => clearLibraryFilters(el.dataset.id),
     'toggle-favorite': el => toggleFavorite(el.dataset.id, el.dataset.favorite === 'true'),
     'toggle-played': el => togglePlayed(el.dataset.id, el.dataset.played === 'true'),
     'refresh-item': el => refreshItemMetadata(el, el.dataset.id),
@@ -219,7 +222,8 @@ window.addEventListener('hashchange', handleHash);
 
 document.addEventListener('DOMContentLoaded', async () => {
     // Every way of closing the player goes through here, so the session is stopped and its position reported once
-    $('player-modal')?.addEventListener('close', () => stopPlayback());
+    if ($('player-modal') && $('video-player')) playerBars = playerAutoHide($('player-modal'), $('video-player'));
+    $('player-modal')?.addEventListener('close', onPlayerClosed);
     window.addEventListener('pagehide', () => stopPlayback());
     updateAuthUI();
     const wizardActive = await checkSetupWizard();

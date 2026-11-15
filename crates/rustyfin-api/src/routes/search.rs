@@ -14,6 +14,7 @@ use rustyfin_model::media::{MediaItem, QueryResult};
 use rustyfin_model::search::{SearchHint, SearchHintResult};
 
 use crate::error::ApiError;
+use crate::parental::HiddenItems;
 use crate::query;
 use crate::state::AppState;
 
@@ -473,8 +474,12 @@ async fn search_hints(
         ));
     }
 
+    // A user with parental limits gets an answer of their own, never one from the shared cache.
+    let hidden = HiddenItems::for_caller(&state, &claims).await?;
     let cache_key = request.cache_key();
-    if let Some(cached) = state.cache.search_results.get(&cache_key) {
+    if !hidden.is_restricted()
+        && let Some(cached) = state.cache.search_results.get(&cache_key)
+    {
         return Ok(Json(cached));
     }
 
@@ -500,7 +505,7 @@ async fn search_hints(
         .into_iter()
         .filter_map(|candidate| {
             let kind = stored_kind(&candidate.kind);
-            if !request.keeps(&filter, kind, &candidate.tags) {
+            if hidden.hides(candidate.id) || !request.keeps(&filter, kind, &candidate.tags) {
                 return None;
             }
             Some((match_score(&clean_term, &candidate.name), candidate))
@@ -523,6 +528,9 @@ async fn search_hints(
         search_hints,
         total_record_count,
     })?;
+    if hidden.is_restricted() {
+        return Ok(Json(value));
+    }
     state
         .cache
         .search_results
@@ -564,6 +572,7 @@ pub(crate) fn search_kinds(params: &[(String, String)]) -> Vec<&'static str> {
 /// term is blank. A blank term gets the empty answer, which is not cached.
 async fn full_search(
     State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
     Query(params): Query<Vec<(String, String)>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let start = query::count_param(&params, "StartIndex")?.unwrap_or(0);
@@ -582,15 +591,26 @@ async fn full_search(
 
     let kinds = search_kinds(&params);
 
-    // Check cache first. The cached value is the reply as it was first serialized.
+    // Check cache first. The cached value is the reply as it was first serialized. A user with
+    // parental limits gets an answer of their own, never one from the shared cache.
+    let hidden = HiddenItems::for_caller(&state, &claims).await?;
     let cache_key = full_search_cache_key(term, &kinds, start, limit);
-    if let Some(cached) = state.cache.search_results.get(&cache_key) {
+    if !hidden.is_restricted()
+        && let Some(cached) = state.cache.search_results.get(&cache_key)
+    {
         return Ok(Json(cached));
     }
 
-    // The first `start + limit` matches; the page is cut from them below.
-    let fetch = i64::try_from(start.saturating_add(limit)).unwrap_or(i64::MAX);
-    let items = rustyfin_db::repo_search::search_items(&state.db_ro, term, &kinds, fetch).await?;
+    // The first `start + limit` matches; the page is cut from them below. With hidden items,
+    // every match, so the page and the count leave them out.
+    let fetch = if hidden.is_restricted() {
+        i64::MAX
+    } else {
+        i64::try_from(start.saturating_add(limit)).unwrap_or(i64::MAX)
+    };
+    let mut items =
+        rustyfin_db::repo_search::search_items(&state.db_ro, term, &kinds, fetch).await?;
+    hidden.retain(&mut items, |i| i.id);
 
     let total = items.len() as i64;
     let page: Vec<MediaItem> = items.into_iter().skip(start).take(limit).collect();
@@ -601,6 +621,9 @@ async fn full_search(
         start_index: start as i64,
     };
     let value = search_answer(&result)?;
+    if hidden.is_restricted() {
+        return Ok(Json(value));
+    }
     // Cache the result
     state
         .cache

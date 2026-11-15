@@ -607,37 +607,47 @@ pub async fn rename_user_unless_taken(
     Ok(Renamed::Done)
 }
 
+/// Saves a user's display preferences for an id and client; other clients' rows stay.
 pub async fn update_display_preference(
     pool: &SqlitePool,
     user_id: Uuid,
     key: &str,
+    client: &str,
     value: &str,
 ) -> Result<(), sqlx::Error> {
     let uid = user_id.to_string();
     sqlx::query(
-        "INSERT INTO display_preferences (user_id, key, value) VALUES (?1, ?2, ?3)
-         ON CONFLICT(user_id, key) DO UPDATE SET value = excluded.value",
+        "INSERT INTO display_preferences (user_id, key, client, value) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(user_id, key, client) DO UPDATE SET value = excluded.value",
     )
     .bind(&uid)
     .bind(key)
+    .bind(client)
     .bind(value)
     .execute(pool)
     .await?;
     Ok(())
 }
 
+/// A user's display preferences for an id and client, else the row saved before preferences were
+/// kept per client (client '').
 pub async fn get_display_preference(
     pool: &SqlitePool,
     user_id: Uuid,
     key: &str,
+    client: &str,
 ) -> Result<Option<String>, sqlx::Error> {
     let uid = user_id.to_string();
-    let value: Option<String> =
-        sqlx::query_scalar("SELECT value FROM display_preferences WHERE user_id = ?1 AND key = ?2")
-            .bind(&uid)
-            .bind(key)
-            .fetch_optional(pool)
-            .await?;
+    let value: Option<String> = sqlx::query_scalar(
+        "SELECT value FROM display_preferences WHERE user_id = ?1 AND key = ?2
+           AND client IN (?3, '')
+         ORDER BY client = '' LIMIT 1",
+    )
+    .bind(&uid)
+    .bind(key)
+    .bind(client)
+    .fetch_optional(pool)
+    .await?;
     Ok(value)
 }
 
@@ -746,12 +756,15 @@ pub async fn get_user_preferences(
 ) -> Result<UserPreferences, sqlx::Error> {
     let uid = id.to_string();
 
-    // Try to read from display_preferences table
-    let prefs: Vec<(String, String)> =
-        sqlx::query_as("SELECT key, value FROM display_preferences WHERE user_id = ?")
-            .bind(&uid)
-            .fetch_all(pool)
-            .await?;
+    // Try to read from display_preferences table. A key saved by several clients reads in a fixed
+    // order: the row without a client first, then each client's by name, the last one kept.
+    let prefs: Vec<(String, String)> = sqlx::query_as(
+        "SELECT key, value FROM display_preferences WHERE user_id = ?
+         ORDER BY client != '', client",
+    )
+    .bind(&uid)
+    .fetch_all(pool)
+    .await?;
 
     let prefs_map: std::collections::HashMap<String, String> = prefs.into_iter().collect();
 

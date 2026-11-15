@@ -1,13 +1,15 @@
 use crate::query::Query;
 use axum::extract::{Path, State};
 use axum::routing::get;
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
+use rustyfin_model::auth::Claims;
 use serde::Deserialize;
 
 use rustyfin_model::media::QueryResult;
 use rustyfin_model::person::{NameIdPair, PersonDto};
 
 use crate::error::ApiError;
+use crate::parental::HiddenItems;
 use crate::state::AppState;
 
 mod by_name;
@@ -58,8 +60,12 @@ async fn get_person_items(
     Path(id): Path<String>,
     State(state): State<AppState>,
     Query(_query): Query<PersonItemsQuery>,
+    Extension(claims): Extension<Claims>,
 ) -> Result<Json<QueryResult>, ApiError> {
-    let items = rustyfin_db::repo_person::get_person_items(&state.db_ro, &id).await?;
+    let mut items = rustyfin_db::repo_person::get_person_items(&state.db_ro, &id).await?;
+    HiddenItems::for_caller(&state, &claims)
+        .await?
+        .retain(&mut items, |i| i.id);
     let total = items.len() as i64;
     Ok(Json(QueryResult {
         items,

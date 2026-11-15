@@ -93,6 +93,7 @@ pub fn plan_users(
                 code: None,
                 match_kind: None,
                 target_account: None,
+                parental_limits: Default::default(),
             }
         })
         .collect();

@@ -1,6 +1,6 @@
 use crate::query::Query;
 use axum::extract::{Path, State};
-use axum::http::{StatusCode, header};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get};
 use axum::{Extension, Json, Router};
@@ -13,6 +13,8 @@ use sqlx::SqlitePool;
 use uuid::Uuid;
 
 use crate::error::ApiError;
+use crate::parental::HiddenItems;
+use crate::routes::collections::Container;
 use crate::routes::playback::{path_user, query_user};
 use crate::state::AppState;
 
@@ -132,6 +134,73 @@ async fn load_image_tags(pool: &SqlitePool, item: &mut MediaItem) {
     }
 }
 
+/// Sets an item's `Chapters` and `ChapterCount`, as Jellyfin's `ChapterInfo`s. A chapter with an
+/// image gets its `ImageTag` and `ImageDateModified`; one whose image failed counts as none.
+fn set_chapters(item: &mut MediaItem, chapters: &[rustyfin_model::chapter::Chapter]) {
+    use rustyfin_model::media::ChapterInfo;
+    item.chapters = chapters
+        .iter()
+        .map(|c| {
+            let image = c.image_path.as_deref().filter(|p| !p.is_empty());
+            let date = image.and(c.image_date_modified.as_deref());
+            ChapterInfo {
+                start_position_ticks: c.start_position_ticks,
+                name: c.name.clone(),
+                image_date_modified: date.unwrap_or(ChapterInfo::NO_IMAGE_DATE).to_string(),
+                image_tag: image.map(|path| chapter_image_tag(path, date)),
+            }
+        })
+        .collect();
+    item.chapter_count = item.chapters.len() as i32;
+}
+
+/// A chapter image's tag: it changes when the image is made again.
+fn chapter_image_tag(path: &str, date: Option<&str>) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut hasher);
+    date.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// Sets an item's `Trickplay`: its tile sets by width, under its own id as the media source
+/// Jellyfin clients look them up by, and under its first source's id too when that differs.
+fn set_trickplay(item: &mut MediaItem, sets: Vec<rustyfin_model::trickplay::TrickplayInfo>) {
+    if sets.is_empty() {
+        return;
+    }
+    let by_width: std::collections::BTreeMap<_, _> = sets
+        .into_iter()
+        .map(|info| (info.width.to_string(), info))
+        .collect();
+    let mut by_source = std::collections::BTreeMap::new();
+    if let Some(source) = item.media_sources.first()
+        && source.id != item.id.simple().to_string()
+    {
+        by_source.insert(source.id.clone(), by_width.clone());
+    }
+    by_source.insert(item.id.simple().to_string(), by_width);
+    item.trickplay = Some(by_source);
+}
+
+/// Puts what a photo's file says into its item, as Jellyfin's DtoService does for a photo. The date
+/// taken is already the item's premiere date and production year.
+fn apply_photo_info(item: &mut MediaItem, info: &rustyfin_model::photo::PhotoInfo) {
+    item.width = info.width;
+    item.height = info.height;
+    item.camera_make = info.camera_make.clone();
+    item.camera_model = info.camera_model.clone();
+    item.software = info.software.clone();
+    item.image_orientation = info.orientation.clone();
+    item.exposure_time = info.exposure_time;
+    item.focal_length = info.focal_length;
+    item.aperture = info.aperture;
+    item.iso_speed_rating = info.iso_speed_rating;
+    item.latitude = info.latitude;
+    item.longitude = info.longitude;
+    item.altitude = info.altitude;
+}
+
 /// TMDb's path segment for an item's TMDb id: a movie's or a series'. A season's or an episode's
 /// TMDb id is not one TMDb's movie or tv routes take.
 fn tmdb_kind(item: &MediaItem) -> Option<&'static str> {
@@ -202,6 +271,13 @@ async fn enrich_item(
             .filter(|field| !field.is_empty())
             .map(str::to_string)
             .collect();
+    }
+
+    // Photos: what the scan read from the file's header and EXIF block
+    if item.media_type == rustyfin_model::media::MediaType::Photo
+        && let Ok(Some(info)) = rustyfin_db::repo_photo::get_photo_info(pool, item.id).await
+    {
+        apply_photo_info(item, &info);
     }
 
     // ExternalUrls from provider_ids
@@ -305,21 +381,12 @@ async fn enrich_item(
 
     // Chapters from chapters table
     if let Ok(chapters) = chapters_result {
-        item.chapters = chapters
-            .iter()
-            .map(|c| rustyfin_model::media::ChapterInfo {
-                start_ticks: c.start_position_ticks,
-                name: c.name.clone(),
-                image: c.image_path.clone(),
-                image_date_modified: None,
-            })
-            .collect();
-        item.chapter_count = item.chapters.len() as i32;
+        set_chapters(item, &chapters);
     }
 
-    // ScreenshotImageTags from trickplay table
-    if let Ok(Some(_trickplay)) = trickplay_result {
-        item.screenshot_image_tags = vec![format!("{}-{}", item.id, _trickplay.width)];
+    // Trickplay tile sets
+    if let Ok(trickplay) = trickplay_result {
+        set_trickplay(item, trickplay);
     }
 
     // Etag from date_created
@@ -836,7 +903,7 @@ pub(crate) async fn enrich_items_with(
         .unwrap_or_default();
 
     // Batch query 2: All trickplay info for all items
-    let trickplay_map = rustyfin_db::repo_trickplay::get_trickplay_batch(pool, &item_ids)
+    let mut trickplay_map = rustyfin_db::repo_trickplay::get_trickplay_batch(pool, &item_ids)
         .await
         .unwrap_or_default();
 
@@ -848,6 +915,23 @@ pub(crate) async fn enrich_items_with(
     } else {
         std::collections::HashMap::new()
     };
+
+    // Batch query 3a: what the scan read from the photos in the batch
+    let photo_ids: Vec<Uuid> = items
+        .iter()
+        .filter(|item| item.media_type == rustyfin_model::media::MediaType::Photo)
+        .map(|item| item.id)
+        .collect();
+    if !photo_ids.is_empty() {
+        let photos = rustyfin_db::repo_photo::get_photo_infos(pool, &photo_ids)
+            .await
+            .unwrap_or_default();
+        for item in items.iter_mut() {
+            if let Some(info) = photos.get(&item.id) {
+                apply_photo_info(item, info);
+            }
+        }
+    }
 
     // Batch query 3b: unplayed episode counts for the Series and Seasons in the batch
     let folder_ids: Vec<Uuid> = items
@@ -1110,21 +1194,12 @@ pub(crate) async fn enrich_items_with(
 
         // Chapters from batch map
         if let Some(chapters) = chapters_map.get(&item.id.to_string()) {
-            item.chapters = chapters
-                .iter()
-                .map(|c| rustyfin_model::media::ChapterInfo {
-                    start_ticks: c.start_position_ticks,
-                    name: c.name.clone(),
-                    image: c.image_path.clone(),
-                    image_date_modified: None,
-                })
-                .collect();
-            item.chapter_count = item.chapters.len() as i32;
+            set_chapters(item, chapters);
         }
 
-        // ScreenshotImageTags from trickplay batch map
-        if let Some(trickplay) = trickplay_map.get(&item.id.to_string()) {
-            item.screenshot_image_tags = vec![format!("{}-{}", item.id, trickplay.width)];
+        // Trickplay tile sets from batch map
+        if let Some(trickplay) = trickplay_map.remove(&item.id.to_string()) {
+            set_trickplay(item, trickplay);
         }
 
         // Etag from date_created
@@ -1561,7 +1636,8 @@ pub(crate) async fn enrich_items_with(
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/Items", get(get_items))
-        .route("/Items/{id}", get(get_item))
+        // DELETE checks the caller itself: a playlist's owner may delete it, as in Jellyfin.
+        .route("/Items/{id}", get(get_item).delete(delete_item))
         .route("/Items/{id}/Children", get(get_children))
         .route("/Items/{id}/Similar", get(get_similar))
         .route("/Items/Latest", get(get_latest))
@@ -1575,10 +1651,6 @@ pub fn routes() -> Router<AppState> {
         .route("/Items/{id}/ThemeVideos", get(get_theme_list))
         .route("/Users/{userId}/Items/{itemId}", get(get_user_item))
         .route("/Users/{userId}/Items/{itemId}/Intros", get(get_intros))
-        .route(
-            "/Items/{id}/Trickplay/Preview/{width}/{seekTicks}",
-            get(get_trickplay_preview),
-        )
         .route("/Users/{userId}/Items", get(get_user_items))
         .route("/Users/{userId}/Items/Latest", get(get_user_latest))
         .route("/Users/{userId}/Items/Resume", get(get_user_resume))
@@ -1596,7 +1668,6 @@ pub fn routes() -> Router<AppState> {
 pub fn admin_routes() -> Router<AppState> {
     Router::new()
         .route("/Items", delete(delete_items))
-        .route("/Items/{id}", delete(delete_item))
         .route("/Items/{id}/Images/{image_type}", delete(delete_item_image))
         .route(
             "/Items/{id}/Images/{image_type}/{image_index}",
@@ -1719,6 +1790,15 @@ struct ItemsQuery {
     official_ratings: Option<String>,
     #[serde(rename = "officialRatings")]
     official_ratings_lower: Option<String>,
+    filters: Option<String>,
+    #[serde(rename = "filters")]
+    filters_lower: Option<String>,
+    is_resumable: Option<bool>,
+    #[serde(rename = "isResumable")]
+    is_resumable_lower: Option<bool>,
+    series_status: Option<String>,
+    #[serde(rename = "seriesStatus")]
+    series_status_lower: Option<String>,
     start_date: Option<String>,
     #[serde(rename = "startDate")]
     start_date_lower: Option<String>,
@@ -1886,6 +1966,21 @@ impl ItemsQuery {
     fn is_played(&self) -> Option<bool> {
         self.is_played.or(self.is_played_lower)
     }
+    /// Whether `Filters` lists a flag (`IsPlayed`, `IsFavorite`, ...), case-insensitively.
+    fn has_filter(&self, flag: &str) -> bool {
+        self.filters
+            .as_deref()
+            .or(self.filters_lower.as_deref())
+            .is_some_and(|list| list.split(',').any(|f| f.trim().eq_ignore_ascii_case(flag)))
+    }
+    fn is_resumable(&self) -> Option<bool> {
+        self.is_resumable.or(self.is_resumable_lower)
+    }
+    fn series_status(&self) -> Option<&str> {
+        self.series_status
+            .as_deref()
+            .or(self.series_status_lower.as_deref())
+    }
     fn is_movie(&self) -> Option<bool> {
         self.is_movie.or(self.is_movie_lower)
     }
@@ -2018,6 +2113,17 @@ fn parse_ids(value: Option<&str>) -> Vec<Uuid> {
         .collect()
 }
 
+/// The ids of `kept` (all items when `None`) that are also in `ids`.
+fn narrow_ids(kept: Option<Vec<String>>, ids: Vec<String>) -> Vec<String> {
+    match kept {
+        Some(kept) => {
+            let ids: std::collections::HashSet<String> = ids.into_iter().collect();
+            kept.into_iter().filter(|id| ids.contains(id)).collect()
+        }
+        None => ids,
+    }
+}
+
 async fn get_items(
     State(state): State<AppState>,
     Query(query): Query<ItemsQuery>,
@@ -2029,16 +2135,26 @@ async fn get_items(
     let exclude_media_types: Option<Vec<String>> = query
         .exclude_item_types()
         .map(|s| s.split(',').map(|t| t.trim().to_string()).collect());
+    // Genres and OfficialRatings are pipe-delimited, as in Jellyfin (`PipeDelimitedCollectionModelBinder`):
+    // a genre name may hold a comma. Ratings never do, so a comma still separates them too.
     let genres: Option<Vec<String>> = query
         .genres
         .as_ref()
-        .map(|s| s.split(',').map(|g| g.trim().to_string()).collect());
+        .map(|s| s.split('|').map(|g| g.trim().to_string()).collect());
     let years: Option<Vec<i32>> = query
         .years()
         .map(|s| s.split(',').filter_map(|y| y.trim().parse().ok()).collect());
     let official_ratings: Option<Vec<String>> = query
         .official_ratings()
-        .map(|s| s.split(',').map(|r| r.trim().to_string()).collect());
+        .map(|s| s.split(['|', ',']).map(|r| r.trim().to_string()).collect());
+    // `Filters=IsPlayed,IsUnplayed,IsResumable,IsFavorite` sets the same conditions as the flags.
+    let flag = |set: Option<bool>, names: &[&str]| {
+        set.or(names.iter().any(|n| query.has_filter(n)).then_some(true))
+    };
+    let is_favorite = flag(query.is_favorite(), &["IsFavorite", "IsFavoriteOrLikes"]);
+    let is_played = flag(query.is_played(), &["IsPlayed"]);
+    let is_unplayed = flag(query.is_unplayed(), &["IsUnplayed"]);
+    let is_resumable = flag(query.is_resumable(), &["IsResumable"]);
     let tags: Option<Vec<String>> = query
         .tags()
         .map(|s| s.split(',').map(|t| t.trim().to_string()).collect());
@@ -2061,6 +2177,47 @@ async fn get_items(
     let start_index = query.start_index();
     let limit = query.limit();
 
+    // Collections and playlists live outside media_items: a list of only those kinds, or one of
+    // them as ParentId, is answered from their own tables.
+    let mut parent_id = query.parent_id();
+    let mut collection_ids = None;
+    if let Some(id) = parent_id {
+        match super::collections::container_of(&state, id, &claims).await? {
+            Some(Container::Playlist) => {
+                let limit = Some(limit as usize);
+                let entries = super::collections::playlist_entries(
+                    &state,
+                    id,
+                    &claims,
+                    start_index as usize,
+                    limit,
+                );
+                return entries.await.map(|r| Json(r).into_response());
+            }
+            Some(Container::Collection(ids)) => {
+                parent_id = None;
+                collection_ids = Some(ids);
+            }
+            None => {}
+        }
+    } else if let Some(kinds) = media_types.as_ref().filter(|kinds| {
+        !kinds.is_empty()
+            && kinds.iter().all(|kind| {
+                kind.eq_ignore_ascii_case("BoxSet") || kind.eq_ignore_ascii_case("Playlist")
+            })
+    }) {
+        let wants = |name: &str| kinds.iter().any(|kind| kind.eq_ignore_ascii_case(name));
+        let listing = super::collections::container_listing(
+            &state,
+            &claims,
+            wants("BoxSet"),
+            wants("Playlist"),
+            start_index as usize,
+            limit as usize,
+        );
+        return listing.await.map(|r| Json(r).into_response());
+    }
+
     // If IsMovie/IsSeries is set, constrain media_type
     let constrained_media_types: Option<Vec<String>> = if let Some(true) = query.is_movie() {
         Some(vec!["\"Movie\"".to_string()])
@@ -2071,16 +2228,33 @@ async fn get_items(
     };
 
     // GenreIds and StudioIds keep the items with one of those genres and one of those studios.
-    let item_ids = rustyfin_db::repo_by_name::item_ids_with(
+    let mut item_ids = rustyfin_db::repo_by_name::item_ids_with(
         &state.db_ro,
         &parse_ids(query.genre_ids()),
         &parse_ids(query.studio_ids()),
     )
     .await?;
+    // A collection as ParentId, IsResumable and SeriesStatus narrow the same id list.
+    // IsResumable=false filters nothing.
+    if let Some(ids) = collection_ids {
+        let ids = ids.iter().map(Uuid::to_string).collect();
+        item_ids = Some(narrow_ids(item_ids, ids));
+    }
+    if is_resumable == Some(true) {
+        let ids = rustyfin_db::repo_media::resumable_item_ids(&state.db_ro, claims.sub).await?;
+        item_ids = Some(narrow_ids(item_ids, ids));
+    }
+    if let Some(statuses) = query.series_status() {
+        let statuses: Vec<&str> = statuses.split(',').map(str::trim).collect();
+        let ids = rustyfin_db::repo_media::series_ids_with_status(&state.db_ro, &statuses).await?;
+        item_ids = Some(narrow_ids(item_ids, ids));
+    }
+    let hidden = HiddenItems::for_caller(&state, &claims).await?;
+    let hidden_json = hidden.json();
 
     let (items, total) = rustyfin_db::repo_media::get_items_filtered(
         &state.db_ro,
-        query.parent_id(),
+        parent_id,
         query.library_id(),
         constrained_media_types.as_deref(),
         exclude_media_types.as_deref(),
@@ -2094,9 +2268,9 @@ async fn get_items(
         start_index,
         limit,
         query.recursive(),
-        query.is_favorite(),
-        query.is_unplayed(),
-        query.is_played(),
+        is_favorite,
+        is_unplayed,
+        is_played,
         official_ratings.as_deref(),
         tags.as_deref(),
         media_types_filter.as_deref(),
@@ -2107,6 +2281,7 @@ async fn get_items(
         runtime_parts,
         Some(claims.sub),
         item_ids.as_deref(),
+        hidden_json.as_deref(),
     )
     .await?;
 
@@ -2289,17 +2464,28 @@ async fn get_item(
     Path(id): Path<Uuid>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Response, ApiError> {
-    item_or_library(&state, id, claims.sub).await
+    item_or_library(&state, id, claims.sub, &claims).await
 }
 
-/// The media item `id` with `user`'s watch data, or the library `id` as its view.
-async fn item_or_library(state: &AppState, id: Uuid, user: Uuid) -> Result<Response, ApiError> {
+/// The media item `id` with `user`'s watch data, the library `id` as its view, or the collection
+/// or playlist `id` (a playlist only when `claims`' caller may see it).
+async fn item_or_library(
+    state: &AppState,
+    id: Uuid,
+    user: Uuid,
+    claims: &Claims,
+) -> Result<Response, ApiError> {
     match media_item(state, id, user).await {
         Err(ApiError::NotFound(message)) => {
-            match rustyfin_db::repo_library::get_library_by_id(&state.db_ro, id).await? {
-                Some(lib) => {
-                    Ok(Json(super::library::library_view(&lib, &state.server_id)).into_response())
-                }
+            if let Some(lib) =
+                rustyfin_db::repo_library::get_library_by_id(&state.db_ro, id).await?
+            {
+                return Ok(
+                    Json(super::library::library_view(&lib, &state.server_id)).into_response()
+                );
+            }
+            match super::collections::container_details(state, id, claims).await? {
+                Some(item) => Ok(Json(item).into_response()),
                 None => Err(ApiError::NotFound(message)),
             }
         }
@@ -2314,7 +2500,7 @@ async fn get_user_item(
     Extension(claims): Extension<Claims>,
 ) -> Result<Response, ApiError> {
     let user = path_user(&state, &claims, user_id).await?;
-    item_or_library(&state, item_id, user).await
+    item_or_library(&state, item_id, user, &claims).await
 }
 
 /// The media item `id` with `user`'s watch data.
@@ -2353,12 +2539,14 @@ async fn media_item(state: &AppState, id: Uuid, user: Uuid) -> Result<MediaItem,
                 &state.data_dir,
             )
             .await;
-            // Movies and episodes are not cached: their sources, streams, chapters and
-            // trickplay change on rescans, re-probes and extraction, and none of those
-            // clear this cache.
+            // Movies, episodes and other videos are not cached: their sources, streams,
+            // chapters and trickplay change on rescans, re-probes and extraction, and none of
+            // those clear this cache.
             if !matches!(
                 item.media_type,
-                rustyfin_model::media::MediaType::Movie | rustyfin_model::media::MediaType::Episode
+                rustyfin_model::media::MediaType::Movie
+                    | rustyfin_model::media::MediaType::Episode
+                    | rustyfin_model::media::MediaType::Video
             ) {
                 state.cache.item_details.insert(id_str, item.clone());
             }
@@ -2419,12 +2607,23 @@ async fn get_theme_list(Path(id): Path<Uuid>) -> Json<Value> {
 async fn delete_item(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-) -> Result<Json<Value>, ApiError> {
+    Extension(claims): Extension<Claims>,
+) -> Result<Response, ApiError> {
+    if let Some(status) = super::collections::delete_container(&state, id, &claims).await? {
+        return Ok(status.into_response());
+    }
+    if !claims.is_admin {
+        return Err(ApiError::Forbidden(
+            "Administrator access is required.".to_string(),
+        ));
+    }
     let deleted = rustyfin_db::repo_media::delete_item(&state.db, id).await?;
     if !deleted {
         return Err(ApiError::NotFound("item not found".into()));
     }
-    Ok(Json(json!({ "status": "ok" })))
+    // The items under it lose theirs at the image tasks' next run.
+    rustyfin_core::trickplay::remove_item_files(&state.data_dir, id).await;
+    Ok(Json(json!({ "status": "ok" })).into_response())
 }
 
 async fn get_children(
@@ -2433,7 +2632,10 @@ async fn get_children(
     Query(query): Query<ItemsQuery>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<QueryResult>, ApiError> {
-    let children = rustyfin_db::repo_media::get_children(&state.db_ro, id).await?;
+    let mut children = rustyfin_db::repo_media::get_children(&state.db_ro, id).await?;
+    HiddenItems::for_caller(&state, &claims)
+        .await?
+        .retain(&mut children, |i| i.id);
     let total = children.len() as i64;
 
     // Only populate media_sources when explicitly requested
@@ -2479,6 +2681,7 @@ async fn get_similar(
     Query(query): Query<LimitQuery>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<QueryResult>, ApiError> {
+    let hidden = HiddenItems::for_caller(&state, &claims).await?;
     let item = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, id)
         .await?
         .ok_or(ApiError::NotFound("item not found".into()))?;
@@ -2513,7 +2716,7 @@ async fn get_similar(
                 .flatten()
                 .map(|row| row.into());
 
-            if let Some(local_item) = local_item {
+            if let Some(local_item) = local_item.filter(|i| !hidden.hides(i.id)) {
                 similar.push(local_item);
             }
         }
@@ -2521,7 +2724,11 @@ async fn get_similar(
 
     // Priority 2: Local algorithm fills remaining slots
     if similar.len() < limit {
-        let remaining = i64::try_from(limit - similar.len()).unwrap_or(i64::MAX);
+        let mut remaining = i64::try_from(limit - similar.len()).unwrap_or(i64::MAX);
+        if hidden.is_restricted() {
+            // Some of the best matches may be hidden: ask for more to fill the list.
+            remaining = remaining.saturating_mul(4);
+        }
         let local_similar =
             rustyfin_db::repo_media::get_similar_items(&state.db_ro, &item, remaining).await?;
 
@@ -2532,7 +2739,7 @@ async fn get_similar(
             if similar.len() >= limit {
                 break;
             }
-            if !existing_ids.contains(&local_item.id.to_string()) {
+            if !existing_ids.contains(&local_item.id.to_string()) && !hidden.hides(local_item.id) {
                 similar.push(local_item);
             }
         }
@@ -2592,11 +2799,13 @@ async fn get_latest(
         .or(query.include_item_types_lower.as_deref())
         .map(|s| format!("\"{}\"", s.split(',').next().unwrap_or("").trim()));
     let library_id = query.parent_id.or(query.parent_id_lower);
+    let hidden = HiddenItems::for_caller(&state, &claims).await?.json();
     let mut items = rustyfin_db::repo_media::get_latest_items(
         &state.db_ro,
         limit,
         media_type.as_deref(),
         library_id,
+        hidden.as_deref(),
     )
     .await?;
     // Enrich latest items using batch queries
@@ -2624,13 +2833,14 @@ async fn get_resume(
     let user = query_user(&state, &claims, query.user_id)
         .await?
         .ok_or_else(|| ApiError::NotFound("user not found".into()))?;
-    resume_page(&state, user, &query).await
+    resume_page(&state, &claims, user, &query).await
 }
 
 /// One page of the user's resume list (`/UserItems/Resume`, `/Items/Resume` and the legacy
 /// `/Users/{userId}/Items/Resume`), with the count of all matching items, as Jellyfin answers it.
 async fn resume_page(
     state: &AppState,
+    claims: &Claims,
     user: Uuid,
     query: &ResumeQuery,
 ) -> Result<Json<QueryResult>, ApiError> {
@@ -2641,6 +2851,7 @@ async fn resume_page(
         parent_id: query.parent_id,
         start_index,
         limit: query.limit.filter(|l| *l >= 0),
+        hidden_ids_json: HiddenItems::for_caller(state, claims).await?.json(),
     };
     let (mut items, total) =
         rustyfin_db::repo_media::get_user_resume_items(&state.db_ro, user, &filter).await?;
@@ -2734,14 +2945,54 @@ struct FiltersQuery {
     parent_id: Option<Uuid>,
     #[serde(rename = "parentId")]
     parent_id_lower: Option<Uuid>,
+    include_item_types: Option<String>,
+    #[serde(rename = "includeItemTypes")]
+    include_item_types_lower: Option<String>,
+}
+
+impl FiltersQuery {
+    /// The `IncludeItemTypes` list, without empty entries.
+    fn item_types(&self) -> Vec<String> {
+        self.include_item_types
+            .as_deref()
+            .or(self.include_item_types_lower.as_deref())
+            .into_iter()
+            .flat_map(|types| types.split(','))
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect()
+    }
 }
 
 async fn get_filters(
     State(state): State<AppState>,
     Query(query): Query<FiltersQuery>,
+    Extension(claims): Extension<Claims>,
 ) -> Result<Json<FiltersResult>, ApiError> {
-    let library_id = query.parent_id.or(query.parent_id_lower);
-    let cache_key = library_id.map_or("all".to_string(), |id| id.to_string());
+    // A library, an item or a collection; the database works out which.
+    let parent_id = query.parent_id.or(query.parent_id_lower);
+    let item_types = query.item_types();
+    // A user with parental limits gets the values of the items they may see, never the cached
+    // list every user shares.
+    if let Some(hidden) = HiddenItems::for_caller(&state, &claims).await?.json() {
+        let (genres, years, official_ratings) = rustyfin_db::repo_media::get_filters_hiding(
+            &state.db_ro,
+            parent_id,
+            &item_types,
+            &hidden,
+        )
+        .await?;
+        return Ok(Json(FiltersResult {
+            genres,
+            years,
+            official_ratings,
+        }));
+    }
+    let cache_key = format!(
+        "{}:{}",
+        parent_id.map_or("all".to_string(), |id| id.to_string()),
+        item_types.join(",")
+    );
     // Check cache first
     if let Some(cached) = state.cache.filter_lists.get(&cache_key)
         && let Ok(filters) = serde_json::from_value(cached.clone())
@@ -2749,7 +3000,7 @@ async fn get_filters(
         return Ok(Json(filters));
     }
     let (genres, years, official_ratings) =
-        rustyfin_db::repo_media::get_filters(&state.db_ro, library_id).await?;
+        rustyfin_db::repo_media::get_filters(&state.db_ro, parent_id, &item_types).await?;
     let result = FiltersResult {
         genres,
         years,
@@ -2767,9 +3018,23 @@ async fn get_filters(
 async fn get_filters2(
     State(state): State<AppState>,
     Query(query): Query<FiltersQuery>,
+    Extension(claims): Extension<Claims>,
 ) -> Result<Json<Value>, ApiError> {
     let library_id = query.parent_id.or(query.parent_id_lower);
-    let (genres, _, _) = rustyfin_db::repo_media::get_filters(&state.db_ro, library_id).await?;
+    let item_types = query.item_types();
+    // A user with parental limits gets the genres of the items they may see.
+    let (genres, _, _) = match HiddenItems::for_caller(&state, &claims).await?.json() {
+        Some(hidden) => {
+            rustyfin_db::repo_media::get_filters_hiding(
+                &state.db_ro,
+                library_id,
+                &item_types,
+                &hidden,
+            )
+            .await?
+        }
+        None => rustyfin_db::repo_media::get_filters(&state.db_ro, library_id, &item_types).await?,
+    };
     let genres: Vec<Value> = genres
         .into_iter()
         .map(|name| {
@@ -2810,34 +3075,7 @@ async fn get_user_resume(
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<QueryResult>, ApiError> {
     let user_id = path_user(&state, &claims, user_id).await?;
-    resume_page(&state, user_id, &query).await
-}
-
-/// `GET /Items/{id}/Trickplay/Preview/{width}/{seekTicks}` — Returns a trickplay preview thumbnail.
-async fn get_trickplay_preview(
-    State(state): State<AppState>,
-    Path((id, width, seek_ticks)): Path<(Uuid, u32, i64)>,
-) -> Result<Response, ApiError> {
-    let result =
-        rustyfin_core::trickplay::get_trickplay_thumbnail(&state.db_ro, id, width, seek_ticks)
-            .await
-            .map_err(|e| ApiError::Internal(e.to_string()))?;
-
-    match result {
-        Some((file_path, content_type)) => {
-            let bytes = tokio::fs::read(&file_path)
-                .await
-                .map_err(|e| ApiError::NotFound(format!("Thumbnail not found: {}", e)))?;
-
-            Ok((
-                StatusCode::OK,
-                [(header::CONTENT_TYPE, content_type)],
-                bytes,
-            )
-                .into_response())
-        }
-        None => Err(ApiError::NotFound("Trickplay not available".to_string())),
-    }
+    resume_page(&state, &claims, user_id, &query).await
 }
 
 /// DELETE /Items - Delete multiple items
@@ -2853,9 +3091,9 @@ async fn delete_items(
         Vec::new()
     };
     for id in &ids {
-        rustyfin_db::repo_media::delete_item(&state.db, *id)
-            .await
-            .ok();
+        if let Ok(true) = rustyfin_db::repo_media::delete_item(&state.db, *id).await {
+            rustyfin_core::trickplay::remove_item_files(&state.data_dir, *id).await;
+        }
     }
     Ok((StatusCode::OK, Json(serde_json::json!({"Success": true}))))
 }
