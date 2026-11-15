@@ -15759,6 +15759,67 @@ async fn w1filters_series_played_follows_their_episodes() {
     assert_eq!(names, j6_names(&["Hotel", "India", "Juliet", "Kilo"]));
 }
 
+#[tokio::test]
+async fn w1filters_display_preferences_are_kept_per_client() {
+    let state = test_state().await;
+    let (token, admin) = admin_session(&state).await;
+    // A row saved before preferences were kept per client
+    sqlx::query("INSERT INTO display_preferences (user_id, key, value) VALUES (?, 'films', ?)")
+        .bind(admin.to_string())
+        .bind(r#"{"Id":"films","Client":"emby","SortBy":"SortName","SortOrder":"Ascending","CustomPrefs":{"old":"1"},"RememberIndexing":false,"RememberSorting":false,"PrimaryImageHeight":0,"PrimaryImageWidth":0,"ShowBackdrop":true,"ShowSidebar":false,"ScrollDirection":"Horizontal"}"#)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    let app = app(state);
+    let get = |client: &'static str| {
+        let (app, token) = (app.clone(), token.clone());
+        async move {
+            let uri = format!("/DisplayPreferences/films?client={client}");
+            let prefs = b27_answer(&app, &uri, &token).await;
+            (prefs["SortBy"].clone(), prefs["CustomPrefs"].clone())
+        }
+    };
+    let save = |client: &'static str, sort: &'static str| {
+        let (app, token) = (app.clone(), token.clone());
+        async move {
+            let uri = format!("/DisplayPreferences/films?client={client}");
+            let body = serde_json::json!({
+                "Id": "films", "Client": client, "SortBy": sort, "SortOrder": "Descending",
+                "CustomPrefs": { "by": client }, "RememberIndexing": false,
+                "RememberSorting": true, "PrimaryImageHeight": 0, "PrimaryImageWidth": 0,
+                "ShowBackdrop": true, "ShowSidebar": false, "ScrollDirection": "Horizontal",
+            });
+            let (status, _) =
+                send_authed(&app, "POST", &uri, &token, Some(&body.to_string())).await;
+            assert_eq!(status, StatusCode::NO_CONTENT);
+        }
+    };
+    let old = (
+        serde_json::json!("SortName"),
+        serde_json::json!({ "old": "1" }),
+    );
+    // Every client reads the old row until it saves its own.
+    assert_eq!(get("rustyfin").await, old);
+    assert_eq!(get("AndroidTV").await, old);
+    save("rustyfin", "DateCreated").await;
+    save("AndroidTV", "PremiereDate").await;
+    assert_eq!(
+        get("rustyfin").await,
+        (
+            serde_json::json!("DateCreated"),
+            serde_json::json!({ "by": "rustyfin" })
+        )
+    );
+    assert_eq!(
+        get("AndroidTV").await,
+        (
+            serde_json::json!("PremiereDate"),
+            serde_json::json!({ "by": "AndroidTV" })
+        )
+    );
+    assert_eq!(get("emby").await, old);
+}
+
 // The web client's sort, filter and preference functions (tests/web/w1filters_library.mjs).
 #[test]
 fn w1filters_library() {
