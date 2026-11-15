@@ -3245,6 +3245,7 @@ const B124_WEB_MODULES: &[&str] = &[
     "jellyfin-import.js",
     "library-admin.js",
     "library.js",
+    "music.js",
     "player.js",
     "plugins.js",
     "router.js",
@@ -23372,6 +23373,12 @@ fn b152_library_pages() {
 #[test]
 fn b152_library_grid() {
     b124_node_test("b152_library_grid.mjs");
+}
+
+// R3 music and home: the web client's album page, music library tabs, home rows and search
+#[test]
+fn r3music_album() {
+    b124_node_test("r3music_album.mjs");
 }
 
 #[test]

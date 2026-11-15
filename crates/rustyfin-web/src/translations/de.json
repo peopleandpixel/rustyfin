@@ -478,6 +478,10 @@
         "no_results": "Keine Treffer für „{{term}}\"",
         "results_for": "Suchergebnisse für „{{term}}\" ({{count}})"
     },
+    "music": {
+        "tracks_count": "Titel ({{count}})",
+        "disc": "CD {{number}}"
+    },
     "oidc": {
         "sign_in_default": "Mit Single Sign-on anmelden",
         "complete_failed": "Die Anmeldung konnte nicht abgeschlossen werden. Bitte erneut versuchen.",
