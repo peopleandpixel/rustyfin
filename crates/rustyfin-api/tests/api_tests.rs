@@ -2058,12 +2058,9 @@ async fn send_authed(
     (status, json)
 }
 
-/// Creates the folder `<name>` in a media dir beside the test's data dir and returns its path.
+/// Creates the folder `media/<name>` in the test's data dir and returns its path.
 fn media_folder(state: &AppState, name: &str) -> String {
-    // Beside the data dir, not in it: the stream routes refuse files inside the data dir
-    let root = state.data_dir.with_extension("media");
-    remove_when_test_ends(&root);
-    let dir = root.join(name);
+    let dir = state.data_dir.join("media").join(name);
     std::fs::create_dir_all(&dir).unwrap();
     dir.to_str().unwrap().to_string()
 }
@@ -25529,6 +25526,36 @@ async fn g4_get_range(
         .to_bytes()
         .to_vec();
     (status, content_range, body)
+}
+
+// R1 play: media kept inside the data dir (Docker /data with /data/media) direct-plays, while
+// the files Rustyfin owns there (its database, a cache file) are refused even from a library
+#[tokio::test]
+async fn r1play_media_in_the_data_dir_plays_owned_files_are_refused() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let folder = media_folder(&state, "r1play");
+    let movie = std::path::Path::new(&folder).join("R1 Movie.mkv");
+    std::fs::write(&movie, vec![7u8; 500]).unwrap();
+    let cached = state.data_dir.join("cache").join("r1play.mkv");
+    std::fs::write(&cached, vec![7u8; 500]).unwrap();
+    // test_state's database; Rustyfin learns its place from SQLite
+    let db = state.data_dir.join("test.db");
+    assert!(db.is_file());
+    let movie_id = g4_insert_item(&state, "Movie", &movie).await;
+    let cached_id = g4_insert_item(&state, "Movie", &cached).await;
+    let db_id = g4_insert_item(&state, "Movie", &db).await;
+    let app = app(state);
+
+    let uri = |id| format!("/Videos/{id}/stream?Static=true");
+    let (status, content_range, _) = g4_get_range(&app, &uri(movie_id), &token, "bytes=0-99").await;
+    assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(content_range.as_deref(), Some("bytes 0-99/500"));
+    for id in [cached_id, db_id] {
+        let (status, _, body) = g4_get_range(&app, &uri(id), &token, "bytes=0-99").await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{id}");
+        assert!(!body.starts_with(b"SQLite format"), "{id}: database bytes");
+    }
 }
 
 #[tokio::test]
