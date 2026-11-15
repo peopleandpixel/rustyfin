@@ -47,12 +47,6 @@ pub fn routes() -> Router<AppState> {
         .route("/Users/{userId}/EasyPassword", post(set_easy_password))
         .route("/Users/{userId}/Preferences", get(get_preferences))
         .route("/Users/{userId}/Periods", get(get_periods))
-        // User played/favorite items (delete variants)
-        .route("/UserPlayedItems/{itemId}", delete(delete_user_played_item))
-        .route(
-            "/UserFavoriteItems/{itemId}",
-            delete(delete_user_favorite_item),
-        )
         // User image delete
         .route("/UserImage", delete(delete_user_image))
 }
@@ -753,32 +747,6 @@ async fn get_password_reset_providers(
         "Description": "Default Password Reset Provider",
         "Id": "Jellyfin.Authentication.DefaultPasswordResetProvider, Jellyfin.Server"
     }])))
-}
-
-/// DELETE /UserPlayedItems/{itemId} - Mark item as unplayed
-async fn delete_user_played_item(
-    State(state): State<AppState>,
-    Path(item_id): Path<Uuid>,
-    Extension(claims): Extension<Claims>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    crate::routes::playback::require_item(&state, item_id).await?;
-    rustyfin_db::repo_playback::mark_unplayed(&state.db, claims.sub, item_id)
-        .await
-        .ok();
-    Ok(Json(serde_json::json!({})))
-}
-
-/// DELETE /UserFavoriteItems/{itemId} - Unset favorite
-async fn delete_user_favorite_item(
-    State(state): State<AppState>,
-    Path(item_id): Path<Uuid>,
-    Extension(claims): Extension<Claims>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    crate::routes::playback::require_item(&state, item_id).await?;
-    rustyfin_db::repo_playback::set_favorite(&state.db, claims.sub, item_id, false)
-        .await
-        .ok();
-    Ok(Json(serde_json::json!({})))
 }
 
 /// DELETE /UserImage - Delete user image

@@ -1,7 +1,7 @@
 use crate::query::Query;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::routing::{delete, post, put};
+use axum::routing::{delete, get, post, put};
 use axum::{Extension, Json, Router};
 use rustyfin_db::repo_playback::StreamChoice;
 use rustyfin_model::auth::Claims;
@@ -9,7 +9,7 @@ use rustyfin_model::media::MediaItem;
 use rustyfin_model::media_source::MediaSourceResponse;
 use rustyfin_model::playback::{
     LastActivityDateRequest, PinEpisodeRequest, PlaybackProgressInfo, PlaybackStartInfo,
-    PlaybackStopInfo, SetRatingRequest, UserItemDataDto,
+    PlaybackStopInfo, SetRatingRequest, UpdateUserItemDataDto, UserItemDataDto,
 };
 use rustyfin_model::ws_event::WsEvent;
 use serde::Deserialize;
@@ -43,6 +43,27 @@ pub fn routes() -> Router<AppState> {
             "/Users/{userId}/PlayingItems/{itemId}/Progress",
             post(legacy_playing_item_progress),
         )
+        // Jellyfin 10.9+ forms, for the caller or the `userId` the query names.
+        .route(
+            "/UserPlayedItems/{itemId}",
+            post(user_mark_played).delete(user_mark_unplayed),
+        )
+        .route(
+            "/UserFavoriteItems/{itemId}",
+            post(user_set_favorite).delete(user_unset_favorite),
+        )
+        .route(
+            "/UserItems/{itemId}/UserData",
+            get(user_get_user_data).post(user_update_user_data),
+        )
+        .route(
+            "/UserItems/{itemId}/Rating",
+            post(user_set_likes).delete(user_clear_rating),
+        )
+        .route(
+            "/Users/{userId}/Items/{itemId}/UserData",
+            get(legacy_get_user_data).post(legacy_update_user_data),
+        )
         .route("/Users/{userId}/PlayedItems/{itemId}", post(mark_played))
         .route(
             "/Users/{userId}/PlayedItems/{itemId}",
@@ -59,7 +80,12 @@ pub fn routes() -> Router<AppState> {
         .route("/Playstate/Pause", post(playstate_pause))
         .route("/Playstate/Unpause", post(playstate_unpause))
         .route("/Playstate/Stop", post(playstate_stop))
-        .route("/Users/{userId}/Items/{itemId}/Rating", put(set_rating))
+        .route(
+            "/Users/{userId}/Items/{itemId}/Rating",
+            put(set_rating)
+                .post(legacy_set_likes)
+                .delete(legacy_clear_rating),
+        )
 }
 
 /// The remembered tracks a playback report names. Each index is stored with the key of the stream
@@ -540,15 +566,265 @@ pub(crate) async fn require_item(state: &AppState, item_id: Uuid) -> Result<(), 
         .ok_or_else(|| ApiError::NotFound("item not found".to_string()))
 }
 
-async fn mark_played(
+/// Query of the user data routes: Jellyfin 10.9's `userId` (default the caller), `datePlayed` for
+/// marking played, and `likes` for the rating.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UserItemQuery {
+    #[serde(default, alias = "UserId")]
+    user_id: Option<Uuid>,
+    #[serde(default, alias = "DatePlayed")]
+    date_played: Option<String>,
+    #[serde(default, alias = "Likes")]
+    likes: Option<bool>,
+}
+
+impl UserItemQuery {
+    /// `datePlayed` in any form clients send (`parse_client_date`); one that doesn't parse is
+    /// ignored, so the item is still marked, on today's date, as Jellyfin's binder falls back.
+    fn date_played(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.date_played
+            .as_deref()
+            .and_then(rustyfin_model::playback::parse_client_date)
+    }
+}
+
+/// The user a 10.9 route acts for (`query_user`), and a 404 for an item that is no media item.
+/// The API key names no user of its own, so it must pass `userId`.
+async fn query_user_item(
+    state: &AppState,
+    claims: &Claims,
+    user_id: Option<Uuid>,
+    item_id: Uuid,
+) -> Result<Uuid, ApiError> {
+    let user = query_user(state, claims, user_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("user not found".into()))?;
+    require_item(state, item_id).await?;
+    Ok(user)
+}
+
+/// POST /UserPlayedItems/{itemId} and POST /Users/{userId}/PlayedItems/{itemId}: mark played,
+/// on `datePlayed` when given.
+async fn played(
+    state: &AppState,
+    user_id: Uuid,
+    item_id: Uuid,
+    date_played: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<Json<UserItemDataDto>, ApiError> {
+    let data = rustyfin_db::repo_playback::mark_played_on(&state.db, user_id, item_id, date_played)
+        .await?;
+    Ok(Json(folder_answer(state, user_id, item_id, data).await?))
+}
+
+async fn unplayed(
+    state: &AppState,
+    user_id: Uuid,
+    item_id: Uuid,
+) -> Result<Json<UserItemDataDto>, ApiError> {
+    let data = rustyfin_db::repo_playback::mark_unplayed(&state.db, user_id, item_id).await?;
+    Ok(Json(folder_answer(state, user_id, item_id, data).await?))
+}
+
+async fn favorite(
+    state: &AppState,
+    user_id: Uuid,
+    item_id: Uuid,
+    on: bool,
+) -> Result<Json<UserItemDataDto>, ApiError> {
+    let data = rustyfin_db::repo_playback::set_favorite(&state.db, user_id, item_id, on).await?;
+    Ok(Json(folder_answer(state, user_id, item_id, data).await?))
+}
+
+async fn user_mark_played(
+    State(state): State<AppState>,
+    Path(item_id): Path<Uuid>,
+    Query(q): Query<UserItemQuery>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<UserItemDataDto>, ApiError> {
+    let user_id = query_user_item(&state, &claims, q.user_id, item_id).await?;
+    played(&state, user_id, item_id, q.date_played()).await
+}
+
+async fn user_mark_unplayed(
+    State(state): State<AppState>,
+    Path(item_id): Path<Uuid>,
+    Query(q): Query<UserItemQuery>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<UserItemDataDto>, ApiError> {
+    let user_id = query_user_item(&state, &claims, q.user_id, item_id).await?;
+    unplayed(&state, user_id, item_id).await
+}
+
+async fn user_set_favorite(
+    State(state): State<AppState>,
+    Path(item_id): Path<Uuid>,
+    Query(q): Query<UserItemQuery>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<UserItemDataDto>, ApiError> {
+    let user_id = query_user_item(&state, &claims, q.user_id, item_id).await?;
+    favorite(&state, user_id, item_id, true).await
+}
+
+async fn user_unset_favorite(
+    State(state): State<AppState>,
+    Path(item_id): Path<Uuid>,
+    Query(q): Query<UserItemQuery>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<UserItemDataDto>, ApiError> {
+    let user_id = query_user_item(&state, &claims, q.user_id, item_id).await?;
+    favorite(&state, user_id, item_id, false).await
+}
+
+/// GET /UserItems/{itemId}/UserData and its legacy form: the user's data on the item.
+async fn user_data(
+    state: &AppState,
+    user_id: Uuid,
+    item_id: Uuid,
+) -> Result<Json<UserItemDataDto>, ApiError> {
+    let data =
+        rustyfin_db::repo_playback::get_user_item_data(&state.db_ro, user_id, item_id).await?;
+    Ok(Json(folder_answer(state, user_id, item_id, data).await?))
+}
+
+/// POST /UserItems/{itemId}/UserData and its legacy form: sets the fields the body carries.
+async fn update_user_data(
+    state: &AppState,
+    user_id: Uuid,
+    item_id: Uuid,
+    update: &UpdateUserItemDataDto,
+) -> Result<Json<UserItemDataDto>, ApiError> {
+    let data =
+        rustyfin_db::repo_playback::update_user_data(&state.db, user_id, item_id, update).await?;
+    Ok(Json(folder_answer(state, user_id, item_id, data).await?))
+}
+
+async fn user_get_user_data(
+    State(state): State<AppState>,
+    Path(item_id): Path<Uuid>,
+    Query(q): Query<UserItemQuery>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<UserItemDataDto>, ApiError> {
+    let user_id = query_user_item(&state, &claims, q.user_id, item_id).await?;
+    user_data(&state, user_id, item_id).await
+}
+
+async fn user_update_user_data(
+    State(state): State<AppState>,
+    Path(item_id): Path<Uuid>,
+    Query(q): Query<UserItemQuery>,
+    Extension(claims): Extension<Claims>,
+    Json(update): Json<UpdateUserItemDataDto>,
+) -> Result<Json<UserItemDataDto>, ApiError> {
+    let user_id = query_user_item(&state, &claims, q.user_id, item_id).await?;
+    update_user_data(&state, user_id, item_id, &update).await
+}
+
+async fn legacy_get_user_data(
     State(state): State<AppState>,
     Path((user_id, item_id)): Path<(Uuid, Uuid)>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<UserItemDataDto>, ApiError> {
     let user_id = path_user(&state, &claims, user_id).await?;
     require_item(&state, item_id).await?;
-    let data = rustyfin_db::repo_playback::mark_played(&state.db, user_id, item_id).await?;
-    Ok(Json(folder_answer(&state, user_id, item_id, data).await?))
+    user_data(&state, user_id, item_id).await
+}
+
+async fn legacy_update_user_data(
+    State(state): State<AppState>,
+    Path((user_id, item_id)): Path<(Uuid, Uuid)>,
+    Extension(claims): Extension<Claims>,
+    Json(update): Json<UpdateUserItemDataDto>,
+) -> Result<Json<UserItemDataDto>, ApiError> {
+    let user_id = path_user(&state, &claims, user_id).await?;
+    require_item(&state, item_id).await?;
+    update_user_data(&state, user_id, item_id, &update).await
+}
+
+/// POST .../Rating?likes=: sets Likes, or clears the rating when `likes` is absent, as Jellyfin's
+/// UpdateUserItemRating does.
+async fn set_likes(
+    state: &AppState,
+    user_id: Uuid,
+    item_id: Uuid,
+    likes: Option<bool>,
+) -> Result<Json<UserItemDataDto>, ApiError> {
+    let data = match likes {
+        Some(likes) => {
+            rustyfin_db::repo_playback::set_user_rating(
+                &state.db,
+                user_id,
+                item_id,
+                Some(likes),
+                None,
+            )
+            .await?
+        }
+        None => return clear_rating(state, user_id, item_id).await,
+    };
+    Ok(Json(folder_answer(state, user_id, item_id, data).await?))
+}
+
+/// DELETE .../Rating: clears Likes and the rating, and answers the user data.
+async fn clear_rating(
+    state: &AppState,
+    user_id: Uuid,
+    item_id: Uuid,
+) -> Result<Json<UserItemDataDto>, ApiError> {
+    rustyfin_db::repo_playback::clear_user_rating(&state.db, user_id, item_id).await?;
+    user_data(state, user_id, item_id).await
+}
+
+async fn user_set_likes(
+    State(state): State<AppState>,
+    Path(item_id): Path<Uuid>,
+    Query(q): Query<UserItemQuery>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<UserItemDataDto>, ApiError> {
+    let user_id = query_user_item(&state, &claims, q.user_id, item_id).await?;
+    set_likes(&state, user_id, item_id, q.likes).await
+}
+
+async fn user_clear_rating(
+    State(state): State<AppState>,
+    Path(item_id): Path<Uuid>,
+    Query(q): Query<UserItemQuery>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<UserItemDataDto>, ApiError> {
+    let user_id = query_user_item(&state, &claims, q.user_id, item_id).await?;
+    clear_rating(&state, user_id, item_id).await
+}
+
+async fn legacy_set_likes(
+    State(state): State<AppState>,
+    Path((user_id, item_id)): Path<(Uuid, Uuid)>,
+    Query(q): Query<UserItemQuery>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<UserItemDataDto>, ApiError> {
+    let user_id = path_user(&state, &claims, user_id).await?;
+    require_item(&state, item_id).await?;
+    set_likes(&state, user_id, item_id, q.likes).await
+}
+
+async fn legacy_clear_rating(
+    State(state): State<AppState>,
+    Path((user_id, item_id)): Path<(Uuid, Uuid)>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<UserItemDataDto>, ApiError> {
+    let user_id = path_user(&state, &claims, user_id).await?;
+    require_item(&state, item_id).await?;
+    clear_rating(&state, user_id, item_id).await
+}
+
+async fn mark_played(
+    State(state): State<AppState>,
+    Path((user_id, item_id)): Path<(Uuid, Uuid)>,
+    Query(q): Query<UserItemQuery>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<UserItemDataDto>, ApiError> {
+    let user_id = path_user(&state, &claims, user_id).await?;
+    require_item(&state, item_id).await?;
+    played(&state, user_id, item_id, q.date_played()).await
 }
 
 async fn mark_unplayed(
@@ -558,26 +834,31 @@ async fn mark_unplayed(
 ) -> Result<Json<UserItemDataDto>, ApiError> {
     let user_id = path_user(&state, &claims, user_id).await?;
     require_item(&state, item_id).await?;
-    let data = rustyfin_db::repo_playback::mark_unplayed(&state.db, user_id, item_id).await?;
-    Ok(Json(folder_answer(&state, user_id, item_id, data).await?))
+    unplayed(&state, user_id, item_id).await
 }
 
-/// After a mark, a Series or Season answers with its Played and UnplayedItemCount derived from its
-/// episodes, as items answer them. Other items answer as stored.
+/// User data as items answer it: a Series or Season with its Played and UnplayedItemCount derived
+/// from its episodes, other items with their PlayedPercentage, and every answer with Jellyfin's
+/// Key and ItemId.
 async fn folder_answer(
     state: &AppState,
     user_id: Uuid,
     item_id: Uuid,
-    mut data: UserItemDataDto,
+    data: UserItemDataDto,
 ) -> Result<UserItemDataDto, ApiError> {
-    let is_folder = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, item_id)
-        .await?
-        .is_some_and(|item| {
-            matches!(
-                item.media_type,
-                rustyfin_model::media::MediaType::Series | rustyfin_model::media::MediaType::Season
-            )
-        });
+    let mut data = data.for_item(item_id);
+    let item = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, item_id).await?;
+    let is_folder = item.as_ref().is_some_and(|item| {
+        matches!(
+            item.media_type,
+            rustyfin_model::media::MediaType::Series | rustyfin_model::media::MediaType::Season
+        )
+    });
+    if let Some(runtime) = item.and_then(|item| item.runtime_ticks).filter(|r| *r > 0)
+        && data.playback_position_ticks > 0
+    {
+        data.played_percentage = Some(100.0 * data.playback_position_ticks as f64 / runtime as f64);
+    }
     if is_folder {
         let counts =
             rustyfin_db::repo_playback::get_unplayed_counts(&state.db, user_id, &[item_id])
@@ -598,8 +879,7 @@ async fn set_favorite(
 ) -> Result<Json<UserItemDataDto>, ApiError> {
     let user_id = path_user(&state, &claims, user_id).await?;
     require_item(&state, item_id).await?;
-    let data = rustyfin_db::repo_playback::set_favorite(&state.db, user_id, item_id, true).await?;
-    Ok(Json(data))
+    favorite(&state, user_id, item_id, true).await
 }
 
 async fn unset_favorite(
@@ -609,8 +889,7 @@ async fn unset_favorite(
 ) -> Result<Json<UserItemDataDto>, ApiError> {
     let user_id = path_user(&state, &claims, user_id).await?;
     require_item(&state, item_id).await?;
-    let data = rustyfin_db::repo_playback::set_favorite(&state.db, user_id, item_id, false).await?;
-    Ok(Json(data))
+    favorite(&state, user_id, item_id, false).await
 }
 
 /// POST /Playstate/PinEpisode – Pin current episode for a series

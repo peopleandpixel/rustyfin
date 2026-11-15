@@ -2064,28 +2064,60 @@ pub async fn get_library_episodes(
 }
 
 /// Get items with playback position > 0 (resume items) for a specific user
+/// What `get_user_resume_items` lists: Jellyfin's resume query filters. Types are stored media
+/// types (Jellyfin item kinds); `parent_id` is a library, or an item up to two levels above.
+#[derive(Debug, Default, Clone)]
+pub struct ResumeFilter {
+    pub include_types: Vec<String>,
+    pub exclude_types: Vec<String>,
+    pub parent_id: Option<Uuid>,
+    pub start_index: i64,
+    pub limit: Option<i64>,
+}
+
+/// The user's resumable items (a resume point above 0), newest play first, as Jellyfin's
+/// `/UserItems/Resume` lists them: one page of them and the count of all that match.
 pub async fn get_user_resume_items(
     pool: &SqlitePool,
     user_id: Uuid,
-    limit: i64,
-) -> Result<Vec<MediaItem>, sqlx::Error> {
+    filter: &ResumeFilter,
+) -> Result<(Vec<MediaItem>, i64), sqlx::Error> {
     let uid = user_id.to_string();
-    let rows = sqlx::query_as::<_, MediaItemRow>(
+    let parent = filter.parent_id.map(|p| p.to_string());
+    let include = serde_json::to_string(&filter.include_types).unwrap_or_default();
+    let exclude = serde_json::to_string(&filter.exclude_types).unwrap_or_default();
+    // ?1 user, ?2 parent, ?3 include list, ?4 exclude list (JSON arrays; empty means no filter).
+    let from = "FROM media_items m \
+         INNER JOIN user_item_data u ON u.item_id = m.id AND u.user_id = ?1 \
+         WHERE u.playback_position_ticks > 0 \
+         AND (?2 IS NULL OR m.library_id = ?2 OR m.parent_id = ?2 \
+              OR m.parent_id IN (SELECT id FROM media_items WHERE parent_id = ?2)) \
+         AND (json_array_length(?3) = 0 OR m.media_type IN (SELECT value FROM json_each(?3))) \
+         AND m.media_type NOT IN (SELECT value FROM json_each(?4))";
+    let total: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) {from}")))
+        .bind(&uid)
+        .bind(parent.as_deref())
+        .bind(&include)
+        .bind(&exclude)
+        .fetch_one(pool)
+        .await?;
+    let rows = sqlx::query_as::<_, MediaItemRow>(sqlx::AssertSqlSafe(format!(
         "SELECT m.id, m.name, m.sort_name, m.overview, m.media_type, m.path, m.parent_id, m.library_id, \
          m.production_year, m.community_rating, m.official_rating, m.genres, m.date_created, \
          m.premiere_date, m.runtime_ticks, m.index_number, m.parent_index_number, m.index_number_end, m.location_type, m.tmdb_id, m.tvdb_id, \
          m.tags, m.status, m.original_language, m.tagline, m.production_countries, m.budget, m.revenue, \
          m.homepage, m.end_date, m.vote_count, m.popularity \
-         FROM media_items m \
-         INNER JOIN user_item_data u ON u.item_id = m.id AND u.user_id = ? \
-         WHERE u.playback_position_ticks > 0 \
-         ORDER BY u.last_played_date DESC LIMIT ?",
-    )
+         {from} ORDER BY u.last_played_date DESC, m.sort_name LIMIT ?5 OFFSET ?6"
+    )))
     .bind(&uid)
-    .bind(limit)
+    .bind(parent.as_deref())
+    .bind(&include)
+    .bind(&exclude)
+    .bind(filter.limit.unwrap_or(-1))
+    .bind(filter.start_index.max(0))
     .fetch_all(pool)
     .await?;
-    Ok(rows.into_iter().map(Into::into).collect())
+    Ok((rows.into_iter().map(Into::into).collect(), total))
 }
 
 #[derive(sqlx::FromRow)]
