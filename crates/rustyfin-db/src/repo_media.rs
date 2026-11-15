@@ -1117,8 +1117,9 @@ fn build_filtered_query(
     };
 
     let terms = parse_sort(sort_by, sort_order);
+    // A random order shuffles every match, as Jellyfin's does, so a page of it can hold any of them
     let order_clause = if is_random_sort(&terms) {
-        "ORDER BY ROWID".to_string()
+        "ORDER BY RANDOM()".to_string()
     } else {
         order_by_clause(&terms)
     };
@@ -1528,17 +1529,7 @@ pub async fn get_items_filtered(
     }
 
     // Pagination
-    let is_random = is_random_sort(&parse_sort(sort_by_str, sort_order_str));
-    if is_random {
-        let random_offset = if total > 0 {
-            fastrand::u64(0..total as u64) as i64
-        } else {
-            0
-        };
-        data_q = data_q.bind(limit).bind(random_offset);
-    } else {
-        data_q = data_q.bind(limit).bind(start_index);
-    }
+    data_q = data_q.bind(limit).bind(start_index);
 
     let rows = data_q.fetch_all(pool).await?;
     Ok((rows.into_iter().map(Into::into).collect(), total))
