@@ -6,7 +6,42 @@ use uuid::Uuid;
 
 use crate::local_images;
 use crate::nfo_parser;
-use crate::plugin_manager::PluginManager;
+use crate::plugin_manager::{MetadataProviderHandle, PluginManager};
+use rustyfin_model::metadata::{LookupFailed, SeasonMetadata};
+
+/// How a metadata refresh may ask the providers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RefreshOptions {
+    /// Search providers by name for an item they can't look up by id. Off for the "Refresh
+    /// metadata" task, which never searches or renames.
+    pub search: bool,
+    /// Look a season or episode up through its season. Off for the task: a series' refresh fills
+    /// the seasons and episodes that need it.
+    pub season_lookups: bool,
+    /// Ask again about a season or episode that a provider already answered for.
+    pub force: bool,
+}
+
+impl RefreshOptions {
+    /// A refresh asked for through the API: everything, again.
+    pub const EXPLICIT: RefreshOptions = RefreshOptions {
+        search: true,
+        season_lookups: true,
+        force: true,
+    };
+    /// A scan's refresh of the items it added.
+    pub const SCAN: RefreshOptions = RefreshOptions {
+        search: true,
+        season_lookups: true,
+        force: false,
+    };
+    /// The "Refresh metadata" task: by id only.
+    pub const TASK: RefreshOptions = RefreshOptions {
+        search: false,
+        season_lookups: false,
+        force: false,
+    };
+}
 
 /// Refresh metadata for a single item: local images, NFO, then optionally remote providers
 pub async fn refresh_item_metadata(
@@ -15,6 +50,19 @@ pub async fn refresh_item_metadata(
     item: &MediaItem,
     plugin_manager: &PluginManager,
 ) -> Result<(), String> {
+    refresh_item_metadata_with(pool, client, item, plugin_manager, RefreshOptions::EXPLICIT)
+        .await
+        .map(|_| ())
+}
+
+/// `refresh_item_metadata` with the given options.
+pub async fn refresh_item_metadata_with(
+    pool: &SqlitePool,
+    client: &reqwest::Client,
+    item: &MediaItem,
+    plugin_manager: &PluginManager,
+    options: RefreshOptions,
+) -> Result<RefreshOutcome, String> {
     let media_path = Path::new(&item.path);
     // Each source fills this copy, so a later source keeps what an earlier one filled
     let mut working = item.clone();
@@ -39,7 +87,11 @@ pub async fn refresh_item_metadata(
         item.name
     );
 
-    // 2. Parse NFO file if present
+    // 2. Parse NFO file if present. Its title is the user's, so a provider never replaces it.
+    let name_locked = rustyfin_db::repo_media::is_field_locked(pool, item.id, "Name")
+        .await
+        .unwrap_or(false);
+    let mut nfo_named = false;
     let nfo_path = match item.media_type {
         MediaType::Series => nfo_parser::find_series_nfo(media_path),
         _ => nfo_parser::find_nfo_for_media(media_path),
@@ -47,12 +99,14 @@ pub async fn refresh_item_metadata(
     if let Some(nfo_path) = nfo_path
         && let Some(meta) = nfo_parser::parse_nfo(&nfo_path).await
     {
+        nfo_named = meta.name.as_deref().is_some_and(|n| !n.trim().is_empty());
         // Update media item metadata from NFO
-        apply_metadata_to_item(pool, &mut working, &meta).await?;
+        apply_metadata_to_item(pool, &mut working, &meta, false).await?;
 
         // Batch-store image URLs from NFO, skipping types that already exist
         store_images_batch(pool, item.id, &meta.image_urls, "nfo").await?;
     }
+    let replace_name = !name_locked && !nfo_named;
 
     // 3. Use registered metadata providers (TMDb, OMDb, Fanart, etc.)
     // Only active/enabled providers are returned; if none are enabled, this is a fast scan
@@ -63,95 +117,481 @@ pub async fn refresh_item_metadata(
             "no active metadata providers for '{}' (fast scan mode)",
             item.name
         );
-        return Ok(());
+        return Ok(RefreshOutcome::Done);
     }
+
+    let mut outcome = RefreshOutcome::Done;
+    match item.media_type {
+        MediaType::Movie | MediaType::Series => {
+            let asked = refresh_from_providers(
+                pool,
+                client,
+                &mut working,
+                &providers,
+                replace_name,
+                options.search,
+            )
+            .await?;
+            // A series counts as answered only once its seasons have answered too, since the
+            // task reaches them only through it. After its own lookup failed, its seasons
+            // aren't asked for in this run either.
+            let mut children = ChildrenAnswer {
+                all_answered: true,
+                unauthorized: false,
+            };
+            if item.media_type == MediaType::Series && working.tmdb_id.is_some() && !asked.failed {
+                children =
+                    refresh_series_children(pool, &working, &providers, options.force).await?;
+            }
+            if asked.unauthorized || children.unauthorized {
+                outcome = RefreshOutcome::Unauthorized;
+            }
+            // Only a final answer counts; after a failure the next run asks again
+            if asked.answered && !asked.failed && children.all_answered {
+                rustyfin_db::repo_media::mark_provider_refreshed(pool, &[item.id])
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        MediaType::Season | MediaType::Episode if options.season_lookups => {
+            let answered = !options.force
+                && rustyfin_db::repo_media::provider_refreshed_ids(pool, &[item.id])
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .contains(&item.id);
+            if !answered {
+                refresh_from_season(pool, &mut working, &providers, replace_name).await?;
+            }
+        }
+        _ => {}
+    }
+
+    Ok(outcome)
+}
+
+/// How a refresh ended for the caller that runs many of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshOutcome {
+    /// Done, whatever the providers answered
+    Done,
+    /// A provider refused its API key (or has none): every other lookup in this run would fail
+    /// the same way, so a run over many items can stop
+    Unauthorized,
+}
+
+/// What `refresh_from_providers` got from the providers with lookups.
+struct ProvidersAnswer {
+    /// One gave a final answer (found, or a 404 for the id)
+    answered: bool,
+    /// One failed
+    failed: bool,
+    /// One failed for its API key
+    unauthorized: bool,
+}
+
+/// What `refresh_series_children` got.
+struct ChildrenAnswer {
+    /// Every season asked for gave a final answer
+    all_answered: bool,
+    /// A season lookup failed for the provider's API key
+    unauthorized: bool,
+}
+
+/// Identify a movie or series with each provider in turn and apply what it finds. A provider
+/// with lookups (TMDb) fetches an item it already knows by id and never searches for it, even
+/// when the id is gone from TMDb (the item stays as it is, as in Jellyfin); a series search sends
+/// the folder's year. Without `search`, no provider is searched by name. Returns what the
+/// providers with lookups answered.
+async fn refresh_from_providers(
+    pool: &SqlitePool,
+    client: &reqwest::Client,
+    working: &mut MediaItem,
+    providers: &[MetadataProviderHandle],
+    replace_name: bool,
+    search: bool,
+) -> Result<ProvidersAnswer, String> {
+    let mut answered = false;
+    let mut failed = false;
+    let mut unauthorized = false;
     // Candidate names in search order. Jellyfin searches the parsed name first; release
     // tags left in the file name (e.g. "Bluray-1080p") make TMDb find nothing.
     let mut candidates: Vec<String> = Vec::new();
-    let parsed = item.name.trim();
+    let parsed = working.name.trim();
     if !parsed.is_empty() {
         candidates.push(parsed.to_string());
     }
-    let cleaned = clean_filename_for_search(&item.path);
+    let cleaned = clean_filename_for_search(&working.path);
     if !cleaned.is_empty() && !candidates.contains(&cleaned) {
         candidates.push(cleaned);
     }
+    let media_type = working.media_type;
+    let year = working.production_year;
 
-    for provider in &providers {
-        // Search for metadata, stopping at the first candidate name that matches
+    for provider in providers {
         let mut meta = None;
-        for candidate in &candidates {
-            let found = match item.media_type {
-                MediaType::Movie => {
-                    (provider.search_movie)(client, candidate, item.production_year).await
-                }
-                MediaType::Series => (provider.search_tv)(client, candidate).await,
-                _ => break,
+        let by_id = provider.lookups.is_some() && working.tmdb_id.is_some();
+        if let (Some(lookups), Some(id)) = (&provider.lookups, working.tmdb_id) {
+            let result = match media_type {
+                MediaType::Series => lookups.series_by_id(id).await,
+                _ => lookups.movie_by_id(id).await,
             };
+            match result {
+                Ok(found) => {
+                    answered = true;
+                    meta = found;
+                }
+                Err(e) => {
+                    failed = true;
+                    unauthorized |= e == LookupFailed::Unauthorized;
+                }
+            }
             tracing::debug!(
-                "metadata search '{}' via {}: {}",
-                candidate,
+                "metadata lookup of id {} via {}: {}",
+                id,
                 provider.provider_name,
-                if found.is_some() { "found" } else { "no match" }
+                if meta.is_some() { "found" } else { "no match" }
             );
-            if found.is_some() {
-                meta = found;
-                break;
+        }
+        // Search for metadata, stopping at the first candidate name that matches
+        if meta.is_none() && search && !by_id {
+            for candidate in &candidates {
+                let found = match (media_type, &provider.lookups) {
+                    (MediaType::Series, Some(lookups)) => {
+                        match lookups.search_series(candidate, year).await {
+                            Ok(found) => found,
+                            Err(e) => {
+                                failed = true;
+                                unauthorized |= e == LookupFailed::Unauthorized;
+                                None
+                            }
+                        }
+                    }
+                    (MediaType::Series, None) => (provider.search_tv)(client, candidate).await,
+                    _ => (provider.search_movie)(client, candidate, year).await,
+                };
+                tracing::debug!(
+                    "metadata search '{}' via {}: {}",
+                    candidate,
+                    provider.provider_name,
+                    if found.is_some() { "found" } else { "no match" }
+                );
+                if found.is_some() {
+                    // A search's match is an answer from a provider with lookups
+                    answered |= provider.lookups.is_some();
+                    meta = found;
+                    break;
+                }
             }
         }
 
         if let Some(meta) = meta {
-            apply_metadata_to_item(pool, &mut working, &meta).await?;
-            store_images_batch(pool, item.id, &meta.image_urls, &provider.provider_name).await?;
+            apply_metadata_to_item(pool, working, &meta, replace_name).await?;
+            store_images_batch(pool, working.id, &meta.image_urls, &provider.provider_name).await?;
         }
 
         // Fetch additional images from this provider
         let images =
-            (provider.get_images)(client, working.tmdb_id, working.tvdb_id, item.media_type).await;
+            (provider.get_images)(client, working.tmdb_id, working.tvdb_id, media_type).await;
         if !images.is_empty() {
-            store_images_batch(pool, item.id, &images, &provider.provider_name).await?;
+            store_images_batch(pool, working.id, &images, &provider.provider_name).await?;
         }
     }
+    Ok(ProvidersAnswer {
+        answered,
+        failed,
+        unauthorized,
+    })
+}
 
+/// The series that a season or episode belongs to, and the season number: an episode's parent is
+/// its season, or the series itself when it has no season folder.
+async fn series_and_season(
+    pool: &SqlitePool,
+    item: &MediaItem,
+) -> Result<Option<(MediaItem, i32)>, String> {
+    let get = |id: Uuid| async move {
+        rustyfin_db::repo_media::get_item_by_id(pool, id)
+            .await
+            .map_err(|e| e.to_string())
+    };
+    let Some(parent) = (match item.parent_id {
+        Some(id) => get(id).await?,
+        None => None,
+    }) else {
+        return Ok(None);
+    };
+    let (series, season_number) = match (item.media_type, parent.media_type) {
+        (MediaType::Season, MediaType::Series) => (parent, item.index_number),
+        (MediaType::Episode, MediaType::Series) => (parent, item.parent_index_number),
+        (MediaType::Episode, MediaType::Season) => {
+            let number = item.parent_index_number.or(parent.index_number);
+            match parent.parent_id {
+                Some(id) => match get(id).await? {
+                    Some(series) if series.media_type == MediaType::Series => (series, number),
+                    _ => return Ok(None),
+                },
+                None => return Ok(None),
+            }
+        }
+        _ => return Ok(None),
+    };
+    Ok(season_number.map(|n| (series, n)))
+}
+
+/// Fill a season or an episode from its series' season lookup (one provider call per season,
+/// shared by all its episodes through the provider's cache). Nothing happens until the series is
+/// identified; its own refresh then fills its seasons and episodes.
+async fn refresh_from_season(
+    pool: &SqlitePool,
+    working: &mut MediaItem,
+    providers: &[MetadataProviderHandle],
+    replace_name: bool,
+) -> Result<(), String> {
+    let Some((series, season_number)) = series_and_season(pool, working).await? else {
+        return Ok(());
+    };
+    let Some(series_id) = series.tmdb_id else {
+        return Ok(());
+    };
+    // Marked only on final answers (found, or a 404): after a failure the next refresh asks again
+    let mut answered = false;
+    let mut failed = false;
+    for provider in providers {
+        let Some(lookups) = &provider.lookups else {
+            continue;
+        };
+        let season = match lookups.season(series_id, season_number).await {
+            Ok(found) => {
+                answered = true;
+                found
+            }
+            Err(_) => {
+                failed = true;
+                None
+            }
+        };
+        let Some(season) = season else {
+            continue;
+        };
+        apply_season(
+            pool,
+            working,
+            &season,
+            &provider.provider_name,
+            replace_name,
+        )
+        .await?;
+    }
+    if answered && !failed {
+        rustyfin_db::repo_media::mark_provider_refreshed(pool, &[working.id])
+            .await
+            .map_err(|e| e.to_string())?;
+    }
     Ok(())
+}
+
+/// Whether the NFO next to a media file gives a title, which a provider's title doesn't replace.
+async fn nfo_has_title(path: &str) -> bool {
+    match nfo_parser::find_nfo_for_media(Path::new(path)) {
+        Some(nfo) => nfo_parser::parse_nfo(&nfo)
+            .await
+            .and_then(|meta| meta.name)
+            .is_some_and(|name| !name.trim().is_empty()),
+        None => false,
+    }
+}
+
+/// Apply a season lookup to a season item, or to the episode it lists under the item's number.
+async fn apply_season(
+    pool: &SqlitePool,
+    working: &mut MediaItem,
+    season: &SeasonMetadata,
+    provider: &str,
+    replace_name: bool,
+) -> Result<(), String> {
+    let meta = match working.media_type {
+        // A season keeps its own name ("Season 1"), as in Jellyfin
+        MediaType::Season => season.meta.clone(),
+        MediaType::Episode => {
+            let Some(number) = working.index_number else {
+                return Ok(());
+            };
+            let Some((_, first)) = season.episodes.iter().find(|(n, _)| *n == number) else {
+                return Ok(());
+            };
+            let mut meta = first.clone();
+            // A file holding several episodes is named after all of them, as Jellyfin names it
+            // ("The Shadow That Devours the Sun / Mushi that Inhale Rain")
+            if let Some(end) = working.index_number_end.filter(|end| *end > number) {
+                let names: Vec<&str> = (number..=end)
+                    .filter_map(|n| season.episodes.iter().find(|(e, _)| *e == n))
+                    .filter_map(|(_, m)| m.name.as_deref())
+                    .collect();
+                if names.len() > 1 {
+                    meta.name = Some(names.join(" / "));
+                }
+            }
+            meta
+        }
+        _ => return Ok(()),
+    };
+    let meta = &meta;
+    apply_metadata_to_item(pool, working, meta, replace_name).await?;
+    store_images_batch(pool, working.id, &meta.image_urls, provider).await
+}
+
+/// After a series is identified, fill its seasons and episodes: one season lookup per season.
+async fn refresh_series_children(
+    pool: &SqlitePool,
+    series: &MediaItem,
+    providers: &[MetadataProviderHandle],
+    force: bool,
+) -> Result<ChildrenAnswer, String> {
+    let Some(series_id) = series.tmdb_id else {
+        return Ok(ChildrenAnswer {
+            all_answered: true,
+            unauthorized: false,
+        });
+    };
+    let children = rustyfin_db::repo_media::get_children(pool, series.id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut targets: Vec<(MediaItem, i32)> = Vec::new();
+    for child in children {
+        match child.media_type {
+            MediaType::Season => {
+                let Some(number) = child.index_number else {
+                    continue;
+                };
+                let episodes = rustyfin_db::repo_media::get_children(pool, child.id)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                for episode in episodes {
+                    if episode.media_type == MediaType::Episode {
+                        let n = episode.parent_index_number.unwrap_or(number);
+                        targets.push((episode, n));
+                    }
+                }
+                targets.push((child, number));
+            }
+            MediaType::Episode => {
+                if let Some(n) = child.parent_index_number {
+                    targets.push((child, n));
+                }
+            }
+            _ => {}
+        }
+    }
+    // Only the seasons and episodes no provider answered for yet, unless forced (an explicit
+    // refresh refills them all): a later refresh of the series asks TMDb for nothing more
+    if !force {
+        let ids: Vec<Uuid> = targets.iter().map(|(t, _)| t.id).collect();
+        let answered = rustyfin_db::repo_media::provider_refreshed_ids(pool, &ids)
+            .await
+            .map_err(|e| e.to_string())?;
+        targets.retain(|(t, _)| !answered.contains(&t.id));
+    }
+    if targets.is_empty() {
+        return Ok(ChildrenAnswer {
+            all_answered: true,
+            unauthorized: false,
+        });
+    }
+    // Season numbers with a final answer from every provider with lookups, and any failed
+    let mut answered: std::collections::HashSet<i32> = std::collections::HashSet::new();
+    let mut failed: std::collections::HashSet<i32> = std::collections::HashSet::new();
+    let mut unauthorized = false;
+    for provider in providers {
+        let Some(lookups) = &provider.lookups else {
+            continue;
+        };
+        let mut seasons: std::collections::HashMap<i32, Option<SeasonMetadata>> =
+            std::collections::HashMap::new();
+        for (target, number) in &targets {
+            if !seasons.contains_key(number) {
+                let found = match lookups.season(series_id, *number).await {
+                    Ok(found) => {
+                        answered.insert(*number);
+                        found
+                    }
+                    Err(e) => {
+                        unauthorized |= e == LookupFailed::Unauthorized;
+                        failed.insert(*number);
+                        None
+                    }
+                };
+                seasons.insert(*number, found);
+            }
+            let Some(Some(season)) = seasons.get(number) else {
+                continue;
+            };
+            let mut working = target.clone();
+            // As in the item's own refresh: a locked name or an NFO's title stays
+            let keep_name = rustyfin_db::repo_media::is_field_locked(pool, target.id, "Name")
+                .await
+                .unwrap_or(false)
+                || nfo_has_title(&target.path).await;
+            apply_season(
+                pool,
+                &mut working,
+                season,
+                &provider.provider_name,
+                !keep_name,
+            )
+            .await?;
+        }
+    }
+    let ids: Vec<Uuid> = targets
+        .iter()
+        .filter(|(_, n)| answered.contains(n) && !failed.contains(n))
+        .map(|(t, _)| t.id)
+        .collect();
+    if !ids.is_empty() {
+        rustyfin_db::repo_media::mark_provider_refreshed(pool, &ids)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(ChildrenAnswer {
+        all_answered: failed.is_empty(),
+        unauthorized,
+    })
 }
 
 async fn apply_metadata_to_item(
     pool: &SqlitePool,
     updated: &mut MediaItem,
     meta: &rustyfin_model::metadata::ExternalMetadata,
+    replace_name: bool,
 ) -> Result<(), String> {
     // Update fields from external metadata
     let before = updated.clone();
     let mut changed = false;
 
-    // Update name from TMDB if it looks like a filename (contains dots, underscores, or release tags)
-    if let Some(ref tmdb_name) = meta.name {
-        let looks_like_filename = updated.name.contains('.')
-            || updated.name.contains('_')
-            || updated.name.contains("-ENCOUNTERS")
-            || updated.name.contains("-NIMA4K")
-            || updated.name.contains("-eisbaer")
-            || updated.name.contains("-WATCHABLE")
-            || updated.name.contains("1080p")
-            || updated.name.contains("2160p")
-            || updated.name.contains("BluRay")
-            || updated.name.contains("WEB-DL")
-            || updated.name.contains("HDTV");
-
-        if looks_like_filename || updated.name.len() > 80 {
-            // The current name looks like a filename, replace with TMDB name
-            if updated.name != *tmdb_name {
-                updated.name = tmdb_name.clone();
-                updated.sort_name = Some(tmdb_name.to_lowercase());
-                changed = true;
-                tracing::info!(
-                    "updated name from filename '{}' to TMDB name '{}'",
-                    before.name,
-                    tmdb_name
-                );
-            }
+    // A provider's title replaces the name parsed from the path, as in Jellyfin ("Mission:
+    // Impossible - Dead Reckoning Part One", not the folder's "Mission Impossible - ..."), unless
+    // the name is locked or an NFO has a title. An NFO's title (`replace_name` false) replaces
+    // only a name that still looks like a file name. Seasons keep "Season N".
+    if (replace_name || looks_like_filename(&updated.name))
+        && updated.media_type != MediaType::Season
+        && let Some(new_name) = meta.name.as_deref().map(str::trim)
+        && !new_name.is_empty()
+        && updated.name != new_name
+    {
+        updated.name = new_name.to_string();
+        // An episode sorts by its numbers; its sort name stays
+        if updated.media_type != MediaType::Episode {
+            updated.sort_name = Some(new_name.to_lowercase());
         }
+        changed = true;
+        tracing::debug!("updated name '{}' to '{}'", before.name, new_name);
+    }
+    if updated.premiere_date.is_none()
+        && let Some(date) = meta.premiere_date.as_deref()
+        && let Ok(day) =
+            chrono::NaiveDate::parse_from_str(date.get(..10).unwrap_or(date), "%Y-%m-%d")
+    {
+        updated.premiere_date = Some(day.and_time(chrono::NaiveTime::MIN).and_utc());
+        changed = true;
     }
 
     if updated.overview.is_none()
@@ -172,8 +612,13 @@ async fn apply_metadata_to_item(
         updated.community_rating = Some(v);
         changed = true;
     }
-    if updated.official_rating.is_none()
+    // An empty rating (an NFO's empty <mpaa/>) counts as none
+    if updated
+        .official_rating
+        .as_deref()
+        .is_none_or(|r| r.trim().is_empty())
         && let Some(ref v) = meta.official_rating
+        && !v.trim().is_empty()
     {
         updated.official_rating = Some(v.clone());
         changed = true;
@@ -285,8 +730,36 @@ async fn apply_metadata_to_item(
     {
         store_studios(pool, updated.id, studios).await?;
     }
+    if let Some(imdb) = meta.imdb_id.as_deref().filter(|v| v.starts_with("tt")) {
+        rustyfin_db::repo_media::set_imdb_id_if_missing(pool, updated.id, imdb)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    if let Some(people) = meta.people.as_deref() {
+        rustyfin_db::repo_person::set_item_people_if_none(pool, updated.id, people)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
 
     Ok(())
+}
+
+/// Whether a name still looks like a file name (dots, underscores, release tags), so that any
+/// source's title may replace it.
+fn looks_like_filename(name: &str) -> bool {
+    const TAGS: [&str; 10] = [
+        "-ENCOUNTERS",
+        "-NIMA4K",
+        "-eisbaer",
+        "-WATCHABLE",
+        "1080p",
+        "2160p",
+        "BluRay",
+        "WEB-DL",
+        "HDTV",
+        "_",
+    ];
+    name.contains('.') || TAGS.iter().any(|tag| name.contains(tag)) || name.len() > 80
 }
 
 /// Clean a filename to make it suitable for TMDB search.
@@ -430,12 +903,15 @@ async fn store_images_batch(
     let mut to_insert = Vec::new();
     for (base_type, img_group) in type_counts {
         if let Some(image_type_base) = ImageType::from_str(&base_type) {
-            // First provider image of each type goes to index 0
-            // Subsequent images from the same provider follow after the max index
-            let start_index = match provider_max_indices.get(&base_type) {
-                Some(&max_idx) if max_idx >= 0 => max_idx + 1,
-                _ => 0,
-            };
+            // A type this provider stored before keeps its images, so a refresh that asks the
+            // provider again doesn't add the same pictures at new indices
+            if provider_max_indices
+                .get(image_type_base.as_str())
+                .is_some_and(|&max_idx| max_idx >= 0)
+            {
+                continue;
+            }
+            let start_index = 0;
 
             for (idx, img_meta) in img_group {
                 let item_image_type = if idx == 0 {

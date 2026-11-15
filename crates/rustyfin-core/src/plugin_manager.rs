@@ -20,7 +20,7 @@ use plugin_trakt::MetadataProviderRegistrar as TraktRegistrar;
 use plugin_tvdb::MetadataProviderRegistrar as TvdbRegistrar;
 use plugin_webhook::NotificationProviderRegistrar as WebhookRegistrar;
 use rustyfin_model::media::{MediaItem, MediaType};
-use rustyfin_model::metadata::{ExternalMetadata, MetadataImage};
+use rustyfin_model::metadata::{ExternalMetadata, MetadataImage, MetadataLookups};
 use rustyfin_model::plugin::{
     NotificationPriority, Plugin, PluginConfiguration, PluginInfo, PluginStatus, PluginType,
     SubtitleResult,
@@ -218,6 +218,8 @@ pub struct MetadataProviderHandle {
     pub search_movie: SearchMovieFn,
     pub search_tv: SearchTvFn,
     pub get_images: GetImagesFn,
+    /// Lookups by id, by year and by season, when the provider offers them (TMDb)
+    pub lookups: Option<Arc<dyn MetadataLookups>>,
 }
 
 /// Subtitle provider handle stored in the plugin manager.
@@ -695,6 +697,7 @@ impl PluginManager {
             search_movie: Arc::new(search_movie),
             search_tv: Arc::new(search_tv),
             get_images: Arc::new(get_images),
+            lookups: None,
         });
         inner.metadata_providers.sort_by_key(|h| h.priority);
         tracing::info!(
@@ -1154,11 +1157,35 @@ impl PluginManager {
             .get(plugin_id)
             .map(|info| info.status.clone())
     }
+
+    /// Attach `lookups` to the registered metadata provider named `provider_name`.
+    pub async fn register_metadata_lookups(
+        &self,
+        provider_name: &str,
+        lookups: Arc<dyn MetadataLookups>,
+    ) {
+        let mut inner = self.inner.write().await;
+        for handle in inner
+            .metadata_providers
+            .iter_mut()
+            .filter(|h| h.provider_name == provider_name)
+        {
+            handle.lookups = Some(lookups.clone());
+        }
+    }
 }
 
 // ── MetadataProviderRegistrar trait implementations ──
 
 impl TmdbRegistrar for PluginManager {
+    async fn register_metadata_lookups(
+        &self,
+        provider_name: String,
+        lookups: Arc<dyn MetadataLookups>,
+    ) {
+        PluginManager::register_metadata_lookups(self, &provider_name, lookups).await;
+    }
+
     async fn register_metadata_provider<F1, F2, F3>(
         &self,
         plugin_id: String,

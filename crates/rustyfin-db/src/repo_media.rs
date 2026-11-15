@@ -292,6 +292,12 @@ pub async fn save_refresh_changes(
         read.end_date.map(|d| d.to_rfc3339()),
         updated.end_date.map(|d| d.to_rfc3339()),
     );
+    scalar_change(
+        &mut changes,
+        "premiere_date",
+        read.premiere_date.map(|d| d.to_rfc3339()),
+        updated.premiere_date.map(|d| d.to_rfc3339()),
+    );
     scalar_change(&mut changes, "budget", read.budget, updated.budget);
     scalar_change(&mut changes, "revenue", read.revenue, updated.revenue);
     scalar_change(
@@ -3016,6 +3022,131 @@ pub async fn get_studios_for_item(
     .bind(&iid)
     .fetch_all(pool)
     .await
+}
+
+/// Studios of many items at once, for list answers: item id -> (studio_id, studio_name).
+pub async fn get_studios_for_items(
+    pool: &SqlitePool,
+    item_ids: &[uuid::Uuid],
+) -> Result<std::collections::HashMap<String, Vec<(String, String)>>, sqlx::Error> {
+    let mut out: std::collections::HashMap<String, Vec<(String, String)>> =
+        std::collections::HashMap::new();
+    for chunk in item_ids.chunks(500) {
+        let mut qb = QueryBuilder::<sqlx::Sqlite>::new(
+            "SELECT ist.item_id, s.id, s.name FROM item_studios ist \
+             JOIN studios s ON s.id = ist.studio_id WHERE ist.item_id IN (",
+        );
+        let mut sep = qb.separated(", ");
+        for id in chunk {
+            sep.push_bind(id.to_string());
+        }
+        qb.push(") ORDER BY ist.rowid");
+        let rows: Vec<(String, String, String)> = qb.build_query_as().fetch_all(pool).await?;
+        for (item, id, name) in rows {
+            out.entry(item).or_default().push((id, name));
+        }
+    }
+    Ok(out)
+}
+
+/// IMDb ids of many items at once (`item_metadata_extras`), for list answers.
+pub async fn get_imdb_ids_for_items(
+    pool: &SqlitePool,
+    item_ids: &[uuid::Uuid],
+) -> Result<std::collections::HashMap<String, String>, sqlx::Error> {
+    let mut out = std::collections::HashMap::new();
+    for chunk in item_ids.chunks(500) {
+        let mut qb = QueryBuilder::<sqlx::Sqlite>::new(
+            "SELECT item_id, imdb_id FROM item_metadata_extras \
+             WHERE imdb_id IS NOT NULL AND imdb_id != '' AND item_id IN (",
+        );
+        let mut sep = qb.separated(", ");
+        for id in chunk {
+            sep.push_bind(id.to_string());
+        }
+        qb.push(")");
+        let rows: Vec<(String, String)> = qb.build_query_as().fetch_all(pool).await?;
+        out.extend(rows);
+    }
+    Ok(out)
+}
+
+/// Stores a provider's IMDb id for an item that has none yet; an id already stored (by an
+/// import, an NFO or an earlier refresh) stays. Returns whether it was written.
+pub async fn set_imdb_id_if_missing(
+    pool: &SqlitePool,
+    item_id: uuid::Uuid,
+    imdb_id: &str,
+) -> Result<bool, sqlx::Error> {
+    let done = sqlx::query(
+        "INSERT INTO item_metadata_extras (item_id, imdb_id) VALUES (?, ?) \
+         ON CONFLICT(item_id) DO UPDATE SET imdb_id = excluded.imdb_id \
+         WHERE item_metadata_extras.imdb_id IS NULL OR item_metadata_extras.imdb_id = ''",
+    )
+    .bind(item_id.to_string())
+    .bind(imdb_id)
+    .execute(pool)
+    .await?;
+    Ok(done.rows_affected() > 0)
+}
+
+/// Records that a metadata provider answered for these items now (`provider_refreshed_at`).
+pub async fn mark_provider_refreshed(
+    pool: &SqlitePool,
+    item_ids: &[Uuid],
+) -> Result<(), sqlx::Error> {
+    let now = Utc::now().to_rfc3339();
+    for id in item_ids {
+        sqlx::query(
+            "INSERT INTO item_metadata_extras (item_id, provider_refreshed_at) VALUES (?, ?) \
+             ON CONFLICT(item_id) DO UPDATE SET provider_refreshed_at = excluded.provider_refreshed_at",
+        )
+        .bind(id.to_string())
+        .bind(&now)
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
+/// The ids among `item_ids` that a metadata provider has answered for (`mark_provider_refreshed`).
+pub async fn provider_refreshed_ids(
+    pool: &SqlitePool,
+    item_ids: &[Uuid],
+) -> Result<std::collections::HashSet<Uuid>, sqlx::Error> {
+    let mut out = std::collections::HashSet::new();
+    for chunk in item_ids.chunks(500) {
+        let mut qb = QueryBuilder::<sqlx::Sqlite>::new(
+            "SELECT item_id FROM item_metadata_extras \
+             WHERE provider_refreshed_at IS NOT NULL AND item_id IN (",
+        );
+        let mut sep = qb.separated(", ");
+        for id in chunk {
+            sep.push_bind(id.to_string());
+        }
+        qb.push(")");
+        let rows: Vec<(String,)> = qb.build_query_as().fetch_all(pool).await?;
+        out.extend(rows.into_iter().filter_map(|(id,)| id.parse::<Uuid>().ok()));
+    }
+    Ok(out)
+}
+
+/// Whether an item's metadata is locked against a refresh changing `field` (Jellyfin's
+/// LockData, or the field in LockedFields).
+pub async fn is_field_locked(
+    pool: &SqlitePool,
+    item_id: uuid::Uuid,
+    field: &str,
+) -> Result<bool, sqlx::Error> {
+    let row: Option<(i64, String)> = sqlx::query_as(
+        "SELECT lock_data, locked_fields FROM item_metadata_extras WHERE item_id = ?",
+    )
+    .bind(item_id.to_string())
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.is_some_and(|(lock, fields)| {
+        lock != 0 || fields.split('|').any(|f| f.eq_ignore_ascii_case(field))
+    }))
 }
 
 /// Get the last media added date for a folder (max date_created of children).
