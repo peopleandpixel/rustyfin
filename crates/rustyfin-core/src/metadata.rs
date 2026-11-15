@@ -386,8 +386,13 @@ async fn apply_metadata_to_item(
         updated.community_rating = Some(v);
         changed = true;
     }
-    if updated.official_rating.is_none()
+    // An empty rating (an NFO's empty <mpaa/>) counts as none
+    if updated
+        .official_rating
+        .as_deref()
+        .is_none_or(|r| r.trim().is_empty())
         && let Some(ref v) = meta.official_rating
+        && !v.trim().is_empty()
     {
         updated.official_rating = Some(v.clone());
         changed = true;

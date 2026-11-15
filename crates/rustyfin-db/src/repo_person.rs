@@ -125,7 +125,9 @@ pub async fn set_item_people_if_none(
         return Ok(false);
     }
     let item = item_id.to_string();
-    let mut tx = pool.begin().await?;
+    // IMMEDIATE: the read below and the writes after it run under the write lock, so concurrent
+    // refreshes wait instead of failing with a deadlock on the upgrade from read to write
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     let (credited,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM item_people WHERE item_id = ?")
         .bind(&item)
         .fetch_one(&mut *tx)

@@ -460,6 +460,8 @@ struct TmdbSearchItem {
     id: i64,
     title: Option<String>,
     name: Option<String>,
+    original_title: Option<String>,
+    original_name: Option<String>,
     overview: Option<String>,
     release_date: Option<String>,
     first_air_date: Option<String>,
@@ -665,7 +667,7 @@ pub async fn search_movie(
         Ok(json) => serde_json::from_value(json).ok()?,
         Err(_) => return None,
     };
-    let search_item = resp.results.into_iter().next()?;
+    let search_item = best_match(resp.results, name)?;
 
     // Step 2: everything else comes with the details
     movie_by_id(tmdb, search_item.id).await
@@ -765,7 +767,7 @@ pub async fn search_tv(tmdb: &TmdbApi, name: &str, year: Option<i32>) -> Option<
         Ok(json) => serde_json::from_value(json).ok()?,
         Err(_) => return None,
     };
-    let search_item = resp.results.into_iter().next()?;
+    let search_item = best_match(resp.results, name)?;
 
     // Step 2: everything else comes with the details
     series_by_id(tmdb, search_item.id).await
@@ -934,6 +936,25 @@ pub async fn season(tmdb: &TmdbApi, series_id: i64, season_number: i32) -> Optio
         .collect();
 
     Some(SeasonMetadata { meta, episodes })
+}
+
+/// The search result whose title (or original title) is the searched name, ignoring case, else
+/// the first one, as Jellyfin picks: "One Night" (2023) is the show "One Night", though TMDb
+/// lists "One Night Stand" first.
+fn best_match(results: Vec<TmdbSearchItem>, name: &str) -> Option<TmdbSearchItem> {
+    let wanted = name.trim().to_lowercase();
+    let exact = results.iter().position(|item| {
+        [
+            &item.title,
+            &item.name,
+            &item.original_title,
+            &item.original_name,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|t| t.trim().to_lowercase() == wanted)
+    });
+    results.into_iter().nth(exact.unwrap_or(0))
 }
 
 fn non_empty(value: Option<String>) -> Option<String> {
@@ -1199,6 +1220,26 @@ mod tests {
     use super::*;
     use rustyfin_model::plugin::PluginStatus;
     use serde_json::json;
+
+    // R1 scan (E0-scan-3): a search takes the result titled as searched, else the first.
+    #[test]
+    fn r1scan_best_match_prefers_the_exact_title() {
+        let results = |json: serde_json::Value| -> Vec<TmdbSearchItem> {
+            serde_json::from_value(json).unwrap()
+        };
+        let listed = json!([
+            {"id": 231889, "name": "One Night Stand"},
+            {"id": 228527, "name": "One Night"}
+        ]);
+        assert_eq!(
+            best_match(results(listed.clone()), "one night").unwrap().id,
+            228527
+        );
+        assert_eq!(best_match(results(listed), "Night").unwrap().id, 231889);
+        let original = json!([{"id": 1, "title": "Other"}, {"id": 2, "title": "Didi", "original_title": "弟弟"}]);
+        assert_eq!(best_match(results(original), "弟弟").unwrap().id, 2);
+        assert!(best_match(Vec::new(), "x").is_none());
+    }
 
     // B136: a key turns TMDb on unless a saved status says otherwise.
     #[test]
