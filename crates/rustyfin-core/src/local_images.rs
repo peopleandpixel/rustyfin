@@ -21,6 +21,57 @@ pub fn embedded_images_dir() -> Option<&'static Path> {
     EMBEDDED_IMAGES_DIR.get().map(PathBuf::as_path)
 }
 
+/// Extracts the attached picture of `track` (with stream codec `codec`) to `<embedded dir>/<album id>.<ext>`
+/// and returns it as the album's Primary image. Returns `None`, logging a warning, on any failure. Nothing is
+/// written when no embedded directory is set.
+pub async fn extract_embedded_cover(
+    track: &Path,
+    album_id: Uuid,
+    codec: &str,
+) -> Option<ItemImage> {
+    let dir = embedded_images_dir()?;
+    let ext = if codec == "mjpeg" { "jpg" } else { "png" };
+    let out = dir.join(format!("{album_id}.{ext}"));
+    let result = async {
+        tokio::fs::create_dir_all(dir).await?;
+        let status = tokio::process::Command::new("ffmpeg")
+            .args(["-nostdin", "-loglevel", "error", "-y", "-i"])
+            .arg(track)
+            .args(["-an", "-map", "0:v:0", "-c", "copy", "-frames:v", "1"])
+            .arg(&out)
+            .status()
+            .await?;
+        if !status.success() {
+            return Err(std::io::Error::other(format!(
+                "ffmpeg exited with {status}"
+            )));
+        }
+        Ok::<(), std::io::Error>(())
+    }
+    .await;
+    if let Err(e) = result {
+        tracing::warn!(
+            "could not extract the cover of {} to {}: {}",
+            track.display(),
+            out.display(),
+            e
+        );
+        return None;
+    }
+    let (stamp, width, height) = local_image_version(&out);
+    Some(ItemImage {
+        item_id: album_id,
+        image_type: rustyfin_model::image::ImageType::Primary,
+        image_index: 0,
+        path: out.to_string_lossy().to_string(),
+        provider: "local".to_string(),
+        width,
+        height,
+        blurhash: None,
+        stamp,
+    })
+}
+
 /// Scan a single directory for local images, optionally filtering by media file name.
 /// When `media_path` is provided, only images whose filenames match the media file are included.
 /// This prevents unrelated posters in shared directories from being assigned to wrong items.

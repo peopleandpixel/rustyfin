@@ -1285,6 +1285,8 @@ async fn scan_music_library(
         let mut new_items: Vec<MediaItem> = Vec::new();
         // The artist links of the new items, written once their batch is stored (spec 1.5-1.6).
         let mut music_links: Vec<(Uuid, &str, Vec<String>)> = Vec::new();
+        // Per new album, the first new track whose file has an attached picture, and its codec.
+        let mut embedded_covers: HashMap<Uuid, (String, String)> = HashMap::new();
 
         let mut scanned_files = 0u32;
         let mut skipped_ext = 0u32;
@@ -1601,6 +1603,15 @@ async fn scan_music_library(
             if !track_artists.is_empty() {
                 music_links.push((item.id, "Artist", track_artists));
             }
+            if let Some(codec) = probe_result
+                .as_ref()
+                .ok()
+                .and_then(|r| r.attached_picture_codec.clone())
+            {
+                embedded_covers
+                    .entry(album_id)
+                    .or_insert((file_path.clone(), codec));
+            }
             new_items.push(item);
             if counted {
                 ticket.add_total(1);
@@ -1653,6 +1664,24 @@ async fn scan_music_library(
                             );
                         }
                         all_images.extend(images);
+                    }
+                }
+                // An album without a local cover takes the embedded cover of its first pictured track.
+                for item in &new_items {
+                    if item.media_type != MediaType::MusicAlbum
+                        || all_images.iter().any(|image| {
+                            image.item_id == item.id
+                                && image.image_type == rustyfin_model::image::ImageType::Primary
+                        })
+                    {
+                        continue;
+                    }
+                    if let Some((track, codec)) = embedded_covers.get(&item.id)
+                        && let Some(image) =
+                            local_images::extract_embedded_cover(Path::new(track), item.id, codec)
+                                .await
+                    {
+                        all_images.push(image);
                     }
                 }
                 if !all_images.is_empty() {
