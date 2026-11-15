@@ -13,7 +13,8 @@ pub const JELLYFIN_API_VERSION: &str = "12.4.0";
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct ServerInfo {
-    /// Address of a server bound to a specific interface; omitted when bound to all interfaces.
+    /// The address clients reach the server at (`routes::system::local_address`); omitted when
+    /// unknown.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub local_address: Option<String>,
     pub server_name: String,
