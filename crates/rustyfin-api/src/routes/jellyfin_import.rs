@@ -285,8 +285,8 @@ async fn queue_route(
 /// Ends a queue that could not be written or stored: the job fails with `error`, the queue file is
 /// removed, and the answer is a 500 with the same text.
 async fn queue_failed(handle: JobHandle, data_dir: &std::path::Path, error: String) -> ApiError {
-    handle.fail(error.clone());
     remove_queue(data_dir).await;
+    handle.fail(error.clone());
     ApiError::Internal(error)
 }
 
