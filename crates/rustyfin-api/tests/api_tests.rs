@@ -20120,6 +20120,44 @@ fn b170_player_header_autohide() {
     b124_node_test("b170_player_header_autohide.mjs");
 }
 
+// B171: next-episode autoplay and previous/next episode buttons in the web player
+#[test]
+fn b171_next_episode() {
+    b124_node_test("b171_next_episode.mjs");
+}
+
+// The web client's autoplay switch is Jellyfin's UserConfiguration.EnableNextEpisodeAutoPlay: each
+// key a user saves comes back from /Users/Me with the value sent (the server may add defaults), and
+// a save built as the client builds it (the current configuration plus the flag) keeps the others.
+#[tokio::test]
+async fn b171_user_configuration_keeps_next_episode_autoplay() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (_owner, _owner_id, viewer, viewer_id) = g1_owner_and_viewer(&state, &app).await;
+    let uri = format!("/Users/{viewer_id}/Configuration");
+    let save = |config: serde_json::Value| {
+        let req = request("POST", &uri, Some(&viewer), Some(config));
+        let app = app.clone();
+        async move { assert!(send(&app, req).await.0.is_success()) }
+    };
+    let configuration = || async {
+        let (status, me) = send(&app, request("GET", "/Users/Me", Some(&viewer), None)).await;
+        assert_eq!(status, StatusCode::OK);
+        me["Configuration"].clone()
+    };
+    save(serde_json::json!({ "EnableNextEpisodeAutoPlay": false, "SubtitleMode": "Always" })).await;
+    let saved = configuration().await;
+    assert_eq!(saved["EnableNextEpisodeAutoPlay"], false);
+    assert_eq!(saved["SubtitleMode"], "Always");
+
+    let mut changed = saved.clone();
+    changed["EnableNextEpisodeAutoPlay"] = serde_json::json!(true);
+    save(changed).await;
+    let saved = configuration().await;
+    assert_eq!(saved["EnableNextEpisodeAutoPlay"], true);
+    assert_eq!(saved["SubtitleMode"], "Always");
+}
+
 // B152: library grid images keep up with scrolling (web client)
 #[test]
 fn b152_blurhash_decoder() {
