@@ -22171,7 +22171,7 @@ async fn r2collections_playlist_entries_have_ids_and_can_be_moved_and_removed() 
     assert!(listed_entries.iter().all(Option::is_some));
     let (hidden, _) = r2collections_listed(app, bob, &format!("ParentId={pl}")).await;
     assert!(
-        !hidden.contains(&m[2]),
+        hidden.is_empty(),
         "another user's playlist lists nothing: {hidden:?}"
     );
 
@@ -22242,6 +22242,59 @@ async fn r2collections_playlists_take_query_parameters_and_owners_delete_them_as
         StatusCode::FORBIDDEN,
         "media items stay administrator-only"
     );
+    assert_eq!(
+        send_authed(app, "GET", &format!("/Items/{}", m[0]), admin, None)
+            .await
+            .0,
+        StatusCode::OK,
+        "a refused delete leaves the movie in place"
+    );
+    let unknown = format!("/Items/{}", uuid::Uuid::new_v4());
+    assert_eq!(
+        send_authed(app, "DELETE", &unknown, alice, None).await.0,
+        StatusCode::FORBIDDEN,
+        "an unknown id is refused like any other, not a 404"
+    );
+    assert_eq!(
+        send_authed(app, "POST", "/Collections?Name=x", alice, None)
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    let (boxsets, _) = r2collections_listed(app, admin, "IncludeItemTypes=BoxSet").await;
+    assert!(boxsets.is_empty(), "{boxsets:?}");
+}
+
+#[tokio::test]
+async fn r2collections_adding_to_a_playlist_caps_the_ids_and_skips_unknown_ones() {
+    let w = b38_world().await;
+    let (app, alice, pl, m) = (&w.app, &w.alice.0, &w.playlist, &w.movies);
+    let uri = format!("/Playlists/{pl}/Items");
+    let ids = |n: usize| -> String {
+        let ids: Vec<String> = (0..n)
+            .map(|_| format!("\"{}\"", uuid::Uuid::new_v4()))
+            .collect();
+        format!(r#"{{"Ids":[{}]}}"#, ids.join(","))
+    };
+
+    let (status, body) = send_authed(app, "POST", &uri, alice, Some(&ids(1_001))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, body) = send_authed(app, "POST", &uri, alice, Some(&ids(1_000))).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let (listed, _) = r2collections_entries(app, alice, pl).await;
+    assert_eq!(
+        listed,
+        vec![m[0].clone(), m[1].clone()],
+        "unknown ids are skipped"
+    );
+
+    let both = format!("{uri}?Ids={},{}", m[2], m[0]);
+    assert_eq!(
+        send_authed(app, "POST", &both, alice, None).await.0,
+        StatusCode::NO_CONTENT
+    );
+    let (listed, _) = r2collections_entries(app, alice, pl).await;
+    assert_eq!(listed, vec![m[0].clone(), m[1].clone(), m[2].clone()]);
 }
 
 // B93: home row cards

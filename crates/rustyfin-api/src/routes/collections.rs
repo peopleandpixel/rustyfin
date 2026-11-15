@@ -112,8 +112,11 @@ fn text_param(params: &[(String, String)], body: Option<&Value>, key: &str) -> O
         .map(str::to_string)
 }
 
+/// The most ids one request may name.
+const MAX_IDS: usize = 1_000;
+
 /// The ids given for `key` in the query (a comma list, or the key repeated), or else in the body
-/// (an array or a comma list). A value that isn't a UUID is a 400.
+/// (an array or a comma list). A value that isn't a UUID, or more than `MAX_IDS` of them, is a 400.
 fn id_list(
     params: &[(String, String)],
     body: Option<&Value>,
@@ -135,6 +138,11 @@ fn id_list(
                 .collect(),
             _ => Vec::new(),
         };
+    }
+    if values.len() > MAX_IDS {
+        return Err(ApiError::BadRequest(format!(
+            "{key} may name at most {MAX_IDS} items"
+        )));
     }
     values
         .iter()
@@ -387,11 +395,8 @@ async fn add_items_to_playlist(
     let item_ids = id_list(&params, body.as_ref(), "Ids")?;
     ensure_playlist_visible(&state, playlist_id, &claims).await?;
     let caller = playlist_caller(&claims);
-    for item_id in item_ids {
-        rustyfin_db::repo_playlist::add_item_to_playlist(&state.db, playlist_id, item_id, caller)
-            .await
-            .ok();
-    }
+    rustyfin_db::repo_playlist::add_items_to_playlist(&state.db, playlist_id, &item_ids, caller)
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

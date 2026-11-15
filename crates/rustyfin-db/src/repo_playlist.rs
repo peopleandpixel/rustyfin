@@ -221,6 +221,45 @@ pub async fn add_item_to_playlist(
     Ok(())
 }
 
+/// Append items to a visible playlist in one transaction, in the order given. Ids that name no
+/// item, or an item the playlist already holds, are skipped.
+pub async fn add_items_to_playlist(
+    pool: &SqlitePool,
+    playlist_id: Uuid,
+    item_ids: &[Uuid],
+    caller: PlaylistCaller,
+) -> Result<(), sqlx::Error> {
+    let pid = playlist_id.to_string();
+    let owner = owner_filter(caller);
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let next = sqlx::query_scalar::<_, i64>(
+        "SELECT COALESCE(MAX(pi.sort_order), -1) + 1 FROM playlists p
+         LEFT JOIN playlist_items pi ON pi.playlist_id = p.id
+         WHERE p.id = ?1 AND (?2 IS NULL OR p.user_id = ?2)
+         GROUP BY p.id",
+    )
+    .bind(&pid)
+    .bind(owner.as_deref())
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(next) = next else {
+        return Ok(());
+    };
+    for (i, item_id) in item_ids.iter().enumerate() {
+        sqlx::query(
+            "INSERT OR IGNORE INTO playlist_items (playlist_id, item_id, sort_order)
+             SELECT ?1, ?2, ?3 WHERE EXISTS (SELECT 1 FROM media_items WHERE id = ?2)",
+        )
+        .bind(&pid)
+        .bind(item_id.to_string())
+        .bind(next + i as i64)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 pub async fn remove_item_from_playlist(
     pool: &SqlitePool,
     playlist_id: Uuid,
@@ -252,7 +291,9 @@ pub async fn move_playlist_item(
     caller: PlaylistCaller,
 ) -> Result<bool, sqlx::Error> {
     let pid = playlist_id.to_string();
-    let mut tx = pool.begin().await?;
+    // Take the write lock before reading, so a write committed between the read and the
+    // renumbering can't fail the move with SQLITE_BUSY_SNAPSHOT.
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     let owner = owner_filter(caller);
     let mut ids = sqlx::query_scalar::<_, String>(
         "SELECT pi.item_id FROM playlist_items pi
