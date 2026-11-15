@@ -27689,6 +27689,40 @@ async fn r2collections_a_collection_made_with_query_parameters_works_end_to_end(
     );
 }
 
+// A web client's Shuffle on a playlist sends ParentId=<playlist>&SortBy=Random, as Jellyfin Web
+// does: the entries come back shuffled, each once, and without SortBy in playlist order.
+#[tokio::test]
+async fn r3player_playlist_parent_honours_random_sort() {
+    let w = b38_world().await;
+    let (app, alice, pl, m) = (&w.app, &w.alice.0, &w.playlist, &w.movies);
+    let add = format!("/Playlists/{pl}/Items?Ids={}", m[2]);
+    assert_eq!(
+        send_authed(app, "POST", &add, alice, None).await.0,
+        StatusCode::NO_CONTENT
+    );
+    let ordered = vec![m[0].clone(), m[1].clone(), m[2].clone()];
+    let (ids, _) = r2collections_listed(app, alice, &format!("ParentId={pl}")).await;
+    assert_eq!(ids, ordered);
+
+    let random = format!("ParentId={pl}&SortBy=Random");
+    let mut orders = std::collections::HashSet::new();
+    for _ in 0..30 {
+        let (ids, entries) = r2collections_listed(app, alice, &random).await;
+        assert!(
+            entries.iter().all(Option::is_some),
+            "still playlist entries"
+        );
+        let mut sorted = ids.clone();
+        sorted.sort();
+        let mut want = ordered.clone();
+        want.sort();
+        assert_eq!(sorted, want, "every entry, once");
+        orders.insert(ids);
+    }
+    // 30 shuffles of three entries all in playlist order would be chance of 6^-30
+    assert!(orders.len() > 1, "the order changes: {orders:?}");
+}
+
 #[tokio::test]
 async fn r2collections_playlist_entries_have_ids_and_can_be_moved_and_removed() {
     let w = b38_world().await;

@@ -894,6 +894,17 @@ fn parse_sort(sort_by: &str, sort_order: &str) -> Vec<SortTerm> {
     terms
 }
 
+/// Whether a SortBy list sorts randomly, as `/Items` reads it: Random first once Default is gone.
+/// Lists answered outside the item query (a playlist's entries) use it with [`shuffle`].
+pub fn sorts_randomly(sort_by: &str) -> bool {
+    is_random_sort(&parse_sort(sort_by, ""))
+}
+
+/// Shuffles a list in place, for a random order kept outside SQL.
+pub fn shuffle<T>(items: &mut [T]) {
+    fastrand::shuffle(items);
+}
+
 /// Whether `terms` sort randomly, which holds only when the first key is Random.
 fn is_random_sort(terms: &[SortTerm]) -> bool {
     terms

@@ -358,26 +358,31 @@ async fn get_playlist_items(
     ensure_playlist_visible(&state, id, &claims).await?;
     let start = query::count_param(&params, "StartIndex")?.unwrap_or(0);
     let limit = query::count_param(&params, "Limit")?;
-    playlist_entries(&state, id, &claims, start, limit)
+    playlist_entries(&state, id, &claims, start, limit, false)
         .await
         .map(Json)
 }
 
-/// The entries of a playlist the caller sees, in playlist order, each with its PlaylistItemId,
-/// enriched like any item list. Items hidden from the caller by parental limits are left out,
-/// and out of the total.
+/// The entries of a playlist the caller sees, in playlist order, or shuffled when `shuffle` is
+/// set (`/Items?ParentId=<playlist>&SortBy=Random`, as Jellyfin answers it). Each has its
+/// PlaylistItemId and is enriched like any item list. Items hidden from the caller by parental
+/// limits are left out, and out of the total.
 pub(crate) async fn playlist_entries(
     state: &AppState,
     id: Uuid,
     claims: &Claims,
     start: usize,
     limit: Option<usize>,
+    shuffle: bool,
 ) -> Result<QueryResult, ApiError> {
     let caller = playlist_caller(claims);
     let mut all = rustyfin_db::repo_playlist::get_playlist_items(&state.db_ro, id, caller).await?;
     HiddenItems::for_caller(state, claims)
         .await?
         .retain(&mut all, |i| i.id);
+    if shuffle {
+        rustyfin_db::repo_media::shuffle(&mut all);
+    }
     let total = all.len() as i64;
     let mut items: Vec<MediaItem> = all
         .into_iter()

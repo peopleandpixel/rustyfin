@@ -613,8 +613,9 @@ async fn test_get_items_filtered_no_overflow() {
 }
 
 // SortBy=Random shuffles every match, as Jellyfin's does: a page as large as the list holds all of
-// it, and StartIndex pages through it. (It used to return a window from a random offset, so a
-// web client's Shuffle lost most of the items.)
+// it. (It used to return a window from a random offset, so a web client's Shuffle lost most of the
+// items.) Each request shuffles again, as in Jellyfin, so StartIndex and Limit only bound a page's
+// size: two pages may share items.
 #[tokio::test]
 async fn r3player_random_sort_returns_every_match() {
     let temp_db = test_pool().await;
@@ -689,7 +690,7 @@ async fn r3player_random_sort_returns_every_match() {
     let (first, _) = page(0, 5).await;
     let (last, _) = page(10, 5).await;
     assert_eq!(first.len(), 5);
-    assert_eq!(last.len(), 2, "StartIndex pages as in any other order");
+    assert_eq!(last.len(), 2, "StartIndex and Limit bound the page");
 }
 
 #[tokio::test]
