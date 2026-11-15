@@ -685,9 +685,20 @@ impl TaskScheduler {
             .map_err(|e| format!("could not list libraries: {e}"))?;
         let mut ids = Vec::new();
         for library in libraries {
-            let options = rustyfin_db::repo_library::get_library_options(&self.db, library.id)
-                .await
-                .unwrap_or_default();
+            // A library whose options can't be read is skipped and named, rather than read as
+            // having everything off
+            let options =
+                match rustyfin_db::repo_library::get_library_options(&self.db, library.id).await {
+                    Ok(options) => options,
+                    Err(e) => {
+                        tracing::warn!(
+                            library = %library.name,
+                            error = %e,
+                            "could not read the library's options; skipping it"
+                        );
+                        continue;
+                    }
+                };
             if wanted(&options) {
                 ids.push(library.id.to_string());
             }
@@ -1541,6 +1552,45 @@ mod tests {
         assert_eq!(state().await, TaskState::Cancelling);
         sched.set_task_state(TASK_TRICKPLAY, TaskState::Idle).await;
         assert_eq!(state().await, TaskState::Idle);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn r3tasks_libraries_where_skips_unreadable_options() {
+        let (sched, dir) = r3tasks_scheduler().await;
+        let mut ids = Vec::new();
+        for name in ["Readable", "Unreadable"] {
+            let library = rustyfin_model::library::Library {
+                id: uuid::Uuid::new_v4(),
+                name: name.to_string(),
+                content_type: rustyfin_model::library::LibraryContentType::Movies,
+                paths: vec![dir.join(name).to_string_lossy().to_string()],
+            };
+            rustyfin_db::repo_library::create_library(&sched.db, &library)
+                .await
+                .unwrap();
+            ids.push(library.id);
+        }
+        let on = rustyfin_model::library::LibraryOptions {
+            enable_trickplay: true,
+            ..Default::default()
+        };
+        rustyfin_db::repo_library::set_library_options(&sched.db, ids[0], &on)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO configuration (key, value) VALUES (?1, 'not json')")
+            .bind(format!("library_options_{}", ids[1]))
+            .execute(&sched.db)
+            .await
+            .unwrap();
+        let picked = sched.libraries_where(|o| o.enable_trickplay).await.unwrap();
+        assert_eq!(picked, vec![ids[0].to_string()]);
+        // Nor is it read as "everything off" for a task that wants options off
+        let off = sched
+            .libraries_where(|o| !o.enable_trickplay)
+            .await
+            .unwrap();
+        assert!(off.is_empty(), "{off:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

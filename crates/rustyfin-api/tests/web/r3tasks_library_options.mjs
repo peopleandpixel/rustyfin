@@ -160,9 +160,23 @@ test('options are saved through Jellyfin\'s route, with the library id and its w
         ${method} })`);
     API.posts = posts;
     await API.saveLibraryOptions('lib-1', { EnableTrickplay: true });
+    // Jellyfin's names for the same settings never ride along, so a stale one can't win
+    await API.saveLibraryOptions('lib-1', {
+        EnableTrickplay: true, EnableTrickplayImageExtraction: false,
+        EnableChapterExtraction: false, EnableChapterImageExtraction: true, EnableRealtimeMonitor: false,
+    });
     assert.deepEqual(JSON.parse(JSON.stringify(posts)), [
         ['/Library/VirtualFolders/LibraryOptions', { Id: 'lib-1', LibraryOptions: { EnableTrickplay: true } }],
+        ['/Library/VirtualFolders/LibraryOptions', { Id: 'lib-1', LibraryOptions: {
+            EnableTrickplay: true, EnableChapterExtraction: false, EnableRealtimeMonitor: false,
+        } }],
     ]);
+});
+
+test('the dialog reads the stored options fresh, never from a cache', () => {
+    const api = read('api.js');
+    assert.match(api, /getLibraryOptions\(id\) \{ return this\.get\(`\/Library\/\$\{id\}\/Options`, \{ cache: 'no-store' \}\); \}/);
+    assert.doesNotMatch(api, /getLibraryOptions\(id\) \{ return this\.cachedGet/);
 });
 
 test('the page has the dialogs, and the admin library list opens the options', () => {
