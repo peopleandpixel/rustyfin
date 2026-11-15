@@ -593,6 +593,8 @@
         "copied": "Codes copied",
         "copy_manually": "Copying isn’t available here. The codes are selected; press Ctrl+C.",
         "former_admins": "New users who were administrators in Jellyfin: {{names}}. They are regular users here; make them administrators under Users if they should be.",
+        "parental_not_carried": "These users had parental limits in Jellyfin, but their data went into an existing account whose limits were left as they are: {{names}}. Set their limits under Users.",
+        "parental_unknown": "This Jellyfin database doesn’t keep parental limits in a form the import can read. If any of these users had limits, set them again under Users: {{names}}.",
         "pending_title": "Waiting for a password",
         "pending_help": "These imported users haven’t signed in with their code yet. A new code replaces the old one.",
         "pending_none": "No imported user is waiting.",

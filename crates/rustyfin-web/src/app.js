@@ -3980,6 +3980,8 @@ function jiPanelHtml() {
                 <button id="ji-copy-codes" class="jf-btn-primary !py-2 !px-4 text-sm" onclick="jiCopyCodes()">${t('jellyfin_import.copy_codes')}</button>
             </div>
             <p id="ji-former-admins" class="hidden text-xs text-amber-300"></p>
+            <p id="ji-parental-kept" class="hidden text-xs text-amber-300"></p>
+            <p id="ji-parental-unknown" class="hidden text-xs text-amber-300"></p>
         </div>
 
         <div id="ji-pending" class="jf-settings-card">
@@ -4286,6 +4288,8 @@ function jiShowResult(st) {
         $('ji-result-report').innerHTML = '';
         hide('ji-codes-box');
         hide('ji-former-admins');
+        hide('ji-parental-kept');
+        hide('ji-parental-unknown');
         return;
     }
     if (st.State !== 'Completed' || !st.Result) {
@@ -4306,6 +4310,17 @@ function jiShowResult(st) {
     $('ji-former-admins').innerHTML = t('jellyfin_import.former_admins', { names: admins.map(u => escapeHtml(u.Name)).join(', ') });
     if (admins.length) show('ji-former-admins');
     else hide('ji-former-admins');
+    // Parental limits the import didn't give an account: kept off an existing account, or not
+    // readable from this Jellyfin's database.
+    for (const [id, status, key] of [
+        ['ji-parental-kept', 'NotCarried', 'jellyfin_import.parental_not_carried'],
+        ['ji-parental-unknown', 'Unknown', 'jellyfin_import.parental_unknown'],
+    ]) {
+        const names = users.filter(u => u.Action !== 'Skip' && u.ParentalLimits === status);
+        $(id).innerHTML = t(key, { names: names.map(u => escapeHtml(u.Name)).join(', ') });
+        if (names.length) show(id);
+        else hide(id);
+    }
 }
 
 // One loop: read the status and show it; while it runs, the next read follows in one second.

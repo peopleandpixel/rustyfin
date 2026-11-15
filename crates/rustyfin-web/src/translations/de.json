@@ -593,6 +593,8 @@
         "copied": "Codes kopiert",
         "copy_manually": "Kopieren ist hier nicht verfügbar. Die Codes sind markiert, drücke Strg+C.",
         "former_admins": "Neue Benutzer, die in Jellyfin Administratoren waren: {{names}}. Hier sind sie normale Benutzer; mache sie unter Benutzer zu Administratoren, falls nötig.",
+        "parental_not_carried": "Diese Benutzer hatten in Jellyfin Jugendschutz-Einschränkungen, ihre Daten gingen aber in ein bestehendes Konto, dessen Einschränkungen unverändert blieben: {{names}}. Lege ihre Einschränkungen unter Benutzer fest.",
+        "parental_unknown": "Diese Jellyfin-Datenbank speichert Jugendschutz-Einschränkungen nicht in einer Form, die der Import lesen kann. Falls einer dieser Benutzer Einschränkungen hatte, lege sie unter Benutzer neu fest: {{names}}.",
         "pending_title": "Warten auf ein Passwort",
         "pending_help": "Diese importierten Benutzer haben sich noch nicht mit ihrem Code angemeldet. Ein neuer Code ersetzt den alten.",
         "pending_none": "Kein importierter Benutzer wartet.",
