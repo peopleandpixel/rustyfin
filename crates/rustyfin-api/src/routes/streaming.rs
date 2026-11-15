@@ -185,12 +185,14 @@ const OWNED_DATA_DIRS: [&str; 9] = [
     "jellyfin-import-copy",
 ];
 
-/// The files at the top of the data dir that Rustyfin writes: `config.json`, `server_id` and
-/// its temp file (main.rs), the wizard's import queue and its temp file (wizard_import.rs), and
-/// the default database `rustyfin.db` (main.rs). Password reset PIN files
-/// (`passwordreset-*.json`, rustyfin-auth) are matched by their pattern.
-const OWNED_DATA_FILES: [&str; 6] = [
+/// The files at the top of the data dir that Rustyfin writes: `config.json` and its temp file
+/// (config_file.rs, written then renamed), `server_id` and its temp file (main.rs), the wizard's
+/// import queue and its temp file (wizard_import.rs), and the default database `rustyfin.db`
+/// (main.rs). Password reset PIN files (`passwordreset-*.json`, rustyfin-auth) are matched by
+/// their pattern.
+const OWNED_DATA_FILES: [&str; 7] = [
     "config.json",
+    "config.json.tmp",
     "server_id",
     "server_id.tmp",
     "jellyfin-import-queue.json",
@@ -198,11 +200,22 @@ const OWNED_DATA_FILES: [&str; 6] = [
     "rustyfin.db",
 ];
 
-/// The paths Rustyfin owns, which a library link must not reach: the data dir's own folders
-/// and files (`OWNED_DATA_DIRS`, `OWNED_DATA_FILES`), the database file wherever it is
-/// (`RUSTYFIN_DB`), and the TLS key (`RUSTYFIN_TLS_KEY`). A database file also owns its `-wal`
-/// and `-shm` files. Each path is compared resolved and as configured (made absolute), so an
-/// owned path is refused even when it can't be resolved.
+/// The files SQLite keeps beside a database file `x`: `x-wal`, `x-shm` and `x-journal`.
+const DATABASE_SIBLINGS: [&str; 3] = ["-wal", "-shm", "-journal"];
+
+/// The paths Rustyfin owns, which a library link must not reach:
+/// - in the data dir, any file under one of its own folders (`OWNED_DATA_DIRS`), and its own
+///   top-level files (`OWNED_DATA_FILES`, PIN files, and their SQLite siblings), with names
+///   compared without ASCII case;
+/// - each owned folder resolved, so one linked out of the data dir (`transcodes -> /fast/...`)
+///   is still owned;
+/// - by full path: the database wherever `RUSTYFIN_DB` puts it, the TLS key and certificate
+///   (`RUSTYFIN_TLS_KEY`, `RUSTYFIN_TLS_CERT`), and each data-dir file above, each with its
+///   SQLite siblings (`DATABASE_SIBLINGS`).
+///
+/// Every path is compared resolved (a certbot `live/privkey.pem` link counts as the
+/// `archive/privkey1.pem` it points to) and as configured, made absolute, so an owned path is
+/// refused even when it can't be resolved.
 struct OwnedPaths {
     data_dir: std::path::PathBuf,
     files: Vec<std::path::PathBuf>,
@@ -217,45 +230,81 @@ impl OwnedPaths {
             .collect()
     }
 
-    fn is_database_name(name: &str, db: &str) -> bool {
-        name == db
+    /// `path` with `suffix` added to its file name.
+    fn with_suffix(path: &FilePath, suffix: &str) -> std::path::PathBuf {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(suffix);
+        name.into()
+    }
+
+    /// Whether `name` is `file` or one of its SQLite siblings, without ASCII case.
+    fn is_file_or_sibling(name: &str, file: &str) -> bool {
+        let (name, file) = (name.to_ascii_lowercase(), file.to_ascii_lowercase());
+        name == file
             || name
-                .strip_prefix(db)
-                .is_some_and(|s| s == "-wal" || s == "-shm")
+                .strip_prefix(&file)
+                .is_some_and(|rest| DATABASE_SIBLINGS.contains(&rest))
+    }
+
+    /// Whether `name`, a top-level name in the data dir, is a file Rustyfin owns there.
+    fn is_owned_data_file(name: &str) -> bool {
+        let lower = name.to_ascii_lowercase();
+        OWNED_DATA_FILES
+            .iter()
+            .any(|file| Self::is_file_or_sibling(name, file))
+            || lower.starts_with("passwordreset-") && lower.ends_with(".json")
+    }
+
+    /// Whether the resolved `target` lies in the data dir form `data` as an owned file.
+    fn owned_by_name(data: &FilePath, target: &FilePath) -> bool {
+        let Ok(rest) = target.strip_prefix(data) else {
+            return false;
+        };
+        let mut parts = rest.components().map(|c| c.as_os_str().to_string_lossy());
+        let Some(first) = parts.next() else {
+            return false;
+        };
+        if parts.next().is_some() {
+            OWNED_DATA_DIRS
+                .iter()
+                .any(|dir| dir.eq_ignore_ascii_case(&first))
+        } else {
+            Self::is_owned_data_file(&first)
+        }
     }
 
     /// Whether the resolved `target` is one of these owned paths.
     fn owns(&self, target: &FilePath) -> bool {
-        for data in Self::forms(&self.data_dir) {
-            let Ok(rest) = target.strip_prefix(&data) else {
-                continue;
-            };
-            let mut parts = rest.components().map(|c| c.as_os_str().to_string_lossy());
-            let (Some(first), more) = (parts.next(), parts.next().is_some()) else {
-                continue;
-            };
-            if OWNED_DATA_DIRS.contains(&first.as_ref()) && more {
-                return true;
-            }
-            if !more
-                && (OWNED_DATA_FILES
-                    .iter()
-                    .any(|f| Self::is_database_name(&first, f))
-                    || first.starts_with("passwordreset-") && first.ends_with(".json"))
-            {
-                return true;
-            }
+        let data_forms = Self::forms(&self.data_dir);
+        if data_forms
+            .iter()
+            .any(|data| Self::owned_by_name(data, target))
+        {
+            return true;
         }
-        self.files.iter().any(|file| {
-            let Some(name) = file.file_name().map(|n| n.to_string_lossy()) else {
-                return false;
-            };
-            Self::forms(file).iter().any(|form| {
-                target.parent() == form.parent()
-                    && target
-                        .file_name()
-                        .is_some_and(|t| Self::is_database_name(&t.to_string_lossy(), &name))
+        // Owned folders that are links out of the data dir
+        let linked_dir = data_forms.iter().any(|data| {
+            OWNED_DATA_DIRS.iter().any(|dir| {
+                data.join(dir)
+                    .canonicalize()
+                    .is_ok_and(|real| target != real && target.starts_with(&real))
             })
+        });
+        if linked_dir {
+            return true;
+        }
+        // Owned files by full path, each as configured and resolved, with its SQLite siblings
+        let data_files = OWNED_DATA_FILES.iter().map(|name| self.data_dir.join(name));
+        self.files.iter().cloned().chain(data_files).any(|file| {
+            let mut candidates = Self::forms(&file);
+            for suffix in DATABASE_SIBLINGS {
+                candidates.extend(Self::forms(&Self::with_suffix(&file, suffix)));
+                // SQLite keeps the siblings beside the file a link resolves to
+                if let Ok(real) = file.canonicalize() {
+                    candidates.push(Self::with_suffix(&real, suffix));
+                }
+            }
+            candidates.iter().any(|candidate| candidate == target)
         })
     }
 }
@@ -317,7 +366,12 @@ async fn validate_path_against_library(
             files: database_file(&state.db_ro)
                 .await
                 .into_iter()
-                .chain(std::env::var_os("RUSTYFIN_TLS_KEY").map(std::path::PathBuf::from))
+                .chain(
+                    ["RUSTYFIN_TLS_KEY", "RUSTYFIN_TLS_CERT"]
+                        .into_iter()
+                        .filter_map(std::env::var_os)
+                        .map(std::path::PathBuf::from),
+                )
                 .collect(),
         };
         if path_allowed(file_path, &library.paths, &owned) {
@@ -1958,6 +2012,96 @@ mod tests {
             &root,
             &owned
         ));
+    }
+
+    #[test]
+    fn r1play_linked_tls_key_and_database_are_refused() {
+        // certbot: RUSTYFIN_TLS_KEY=live/x/privkey.pem -> ../../archive/x/privkey1.pem, and
+        // RUSTYFIN_DB=conf/main.db -> store/real.db, whose WAL SQLite keeps beside real.db
+        let dir = TempDir::new();
+        let lib = dir.path().join("lib");
+        let data = dir.path().join("data");
+        let archive = dir.path().join("letsencrypt/archive/x");
+        let live = dir.path().join("letsencrypt/live/x");
+        let store = dir.path().join("store");
+        let conf = dir.path().join("conf");
+        for d in [&lib, &data, &archive, &live, &store, &conf] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(archive.join("privkey1.pem"), b"x").unwrap();
+        std::os::unix::fs::symlink("../../archive/x/privkey1.pem", live.join("privkey.pem"))
+            .unwrap();
+        for name in ["real.db", "real.db-wal", "real.db-shm", "other.db"] {
+            std::fs::write(store.join(name), b"x").unwrap();
+        }
+        std::os::unix::fs::symlink(store.join("real.db"), conf.join("main.db")).unwrap();
+        let links = [
+            ("key.mkv", archive.join("privkey1.pem")),
+            ("db.mkv", store.join("real.db")),
+            ("wal.mkv", store.join("real.db-wal")),
+            ("shm.mkv", store.join("real.db-shm")),
+            ("other.mkv", store.join("other.db")),
+        ];
+        for (name, to) in &links {
+            std::os::unix::fs::symlink(to, lib.join(name)).unwrap();
+        }
+        let key = live.join("privkey.pem");
+        let db = conf.join("main.db");
+        let owned = owned(&data, &[&key, &db]);
+        let libs = [lib.to_str().unwrap().to_string()];
+        let path = |p: &str| lib.join(p).to_str().unwrap().to_string();
+        for refused in ["key.mkv", "db.mkv", "wal.mkv", "shm.mkv"] {
+            assert!(!path_allowed(&path(refused), &libs, &owned), "{refused}");
+        }
+        assert!(path_allowed(&path("other.mkv"), &libs, &owned));
+    }
+
+    #[test]
+    fn r1play_owned_folder_linked_out_of_the_data_dir_is_refused() {
+        // /data/transcodes -> /fast/transcodes
+        let dir = TempDir::new();
+        let lib = dir.path().join("lib");
+        let data = dir.path().join("data");
+        let fast = dir.path().join("fast/transcodes/abc");
+        for d in [&lib, &data, &fast] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(fast.join("segment_0000.ts"), b"x").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("fast/transcodes"), data.join("transcodes"))
+            .unwrap();
+        std::os::unix::fs::symlink(&fast, lib.join("seg")).unwrap();
+        let libs = [lib.to_str().unwrap().to_string()];
+        let seg = lib.join("seg/segment_0000.ts");
+        assert!(!path_allowed(
+            seg.to_str().unwrap(),
+            &libs,
+            &owned(&data, &[])
+        ));
+    }
+
+    #[test]
+    fn r1play_owned_names_ignore_ascii_case_and_cover_temp_files() {
+        let owned = owned(FilePath::new("/r1play-missing/data"), &[]);
+        for name in [
+            "CACHE/images/x.jpg",
+            "Logs/server.log",
+            "Config.JSON",
+            "config.json.tmp",
+            "RUSTYFIN.DB-WAL",
+            "PasswordReset-ab12.JSON",
+        ] {
+            let target = FilePath::new("/r1play-missing/data").join(name);
+            assert!(owned.owns(&target), "{name}");
+        }
+        for name in [
+            "Media/cache/x.mkv",
+            "cached/x.mkv",
+            "config.json.bak",
+            "Movie.mkv",
+        ] {
+            let target = FilePath::new("/r1play-missing/data").join(name);
+            assert!(!owned.owns(&target), "{name}");
+        }
     }
 
     #[test]
