@@ -1376,7 +1376,7 @@ async fn b148_webclient_cache_control() {
         .collect();
     assert!(
         refs.len() >= 4,
-        "index.html loads index js/css, hls, api.js and app.js: {refs:?}"
+        "index.html loads the index js (app.js bundled in) and css, hls and api.js: {refs:?}"
     );
     for uri in refs {
         assert!(hashed(&uri), "{uri} has no content hash");
@@ -2579,12 +2579,55 @@ async fn b118_validate_path_admin_only_after_owner() {
 }
 
 // B124: wizard Enter. Enter in a wizard field does what the step's primary button does.
+// "app.js" stands for the whole client: the entry app.js and then every module in
+// src/modules/, in the order below, so a check finds a function whichever module holds it.
+// A missing, empty or unlisted module fails here, so a "no longer uses X" check can't pass
+// on a part of the client.
+const B124_WEB_MODULES: &[&str] = &[
+    "admin.js",
+    "auth.js",
+    "cards.js",
+    "home.js",
+    "item.js",
+    "jellyfin-import.js",
+    "library-admin.js",
+    "library.js",
+    "player.js",
+    "plugins.js",
+    "router.js",
+    "search.js",
+    "settings.js",
+    "util.js",
+    "wizard.js",
+];
+
 fn b124_web_source(file: &str) -> String {
-    std::fs::read_to_string(format!(
-        "{}/../rustyfin-web/src/{file}",
-        env!("CARGO_MANIFEST_DIR")
-    ))
-    .unwrap()
+    let src = format!("{}/../rustyfin-web/src", env!("CARGO_MANIFEST_DIR"));
+    let read = |path: &str| {
+        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("web client source {path}: {e}"))
+    };
+    if file != "app.js" {
+        return read(&format!("{src}/{file}"));
+    }
+    let mut found: Vec<String> = std::fs::read_dir(format!("{src}/modules"))
+        .unwrap_or_else(|e| panic!("{src}/modules: {e}"))
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name.ends_with(".js"))
+        .collect();
+    found.sort();
+    let mut listed: Vec<String> = B124_WEB_MODULES.iter().map(|m| m.to_string()).collect();
+    listed.sort();
+    assert_eq!(
+        found, listed,
+        "src/modules/ holds exactly the listed modules"
+    );
+    let mut all = read(&format!("{src}/app.js"));
+    for module in B124_WEB_MODULES {
+        let text = read(&format!("{src}/modules/{module}"));
+        assert!(text.contains("function "), "{module} has no functions");
+        all.push_str(&text);
+    }
+    all
 }
 
 // A top-level function of app.js, from its head to its closing brace.
@@ -2597,12 +2640,16 @@ fn b124_function(app_js: &str, head: &str) -> String {
 }
 
 // Runs a node test of tests/web/ against app.js. Without node it fails rather than skip:
-// CI's Check job installs nodejs so that these tests run there.
+// CI's Check job installs nodejs so that these tests run there. The script gets the whole
+// client's source as one file (see b124_web_source) and the client's src dir.
 fn b124_node_test(script: &str) {
     let dir = env!("CARGO_MANIFEST_DIR");
+    let source = format!("{}/{script}.client.js", env!("CARGO_TARGET_TMPDIR"));
+    std::fs::write(&source, b124_web_source("app.js")).unwrap();
     let out = std::process::Command::new("node")
         .arg(format!("{dir}/tests/web/{script}"))
-        .arg(format!("{dir}/../rustyfin-web/src/app.js"))
+        .arg(&source)
+        .arg(format!("{dir}/../rustyfin-web/src"))
         .output()
         .unwrap_or_else(|e| panic!("{script} needs node on PATH: {e}"));
     assert!(
@@ -10468,11 +10515,7 @@ fn b21_web_explains_taken_names() {
             assert_eq!(b21_translation(lang, key), None, "{lang} {key} is gone");
         }
     }
-    let app_js = std::fs::read_to_string(format!(
-        "{}/../rustyfin-web/src/app.js",
-        env!("CARGO_MANIFEST_DIR")
-    ))
-    .unwrap();
+    let app_js = b124_web_source("app.js");
     for code in ["name_taken", "name_taken_ask_admin"] {
         assert!(
             app_js.contains(&format!("['{code}', 'oidc.error.{code}']")),
@@ -11241,11 +11284,7 @@ fn b21_web_client_follows_a_demotion() {
 
 #[test]
 fn b21_dashboard_follows_a_demotion() {
-    let app_js = std::fs::read_to_string(format!(
-        "{}/../rustyfin-web/src/app.js",
-        env!("CARGO_MANIFEST_DIR")
-    ))
-    .unwrap();
+    let app_js = b124_web_source("app.js");
     // A top-level function of app.js, from its head to its closing brace.
     let function = |head: &str| -> String {
         let start = app_js
