@@ -1,5 +1,6 @@
+use crate::query::Query;
 use axum::body::Body;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::header;
 use axum::response::Response;
 use axum::routing::{get, post};

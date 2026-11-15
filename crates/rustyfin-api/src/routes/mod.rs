@@ -2,6 +2,7 @@ mod activity;
 mod additional;
 mod auth;
 mod backup;
+mod branding;
 mod collections;
 mod configuration;
 mod devices;
@@ -42,6 +43,7 @@ pub use startup::{StartupOwner, settle_owner_at_startup};
 use axum::Router;
 use axum::middleware as axum_mw;
 use std::sync::Arc;
+use tower::Layer;
 
 use crate::middleware::{
     rate_limit, rate_limit_resource, require_admin, require_auth, require_setup_or_admin,
@@ -67,6 +69,7 @@ pub fn build_router(state: AppState) -> Router {
 
     let public = Router::new()
         .merge(system::public_routes())
+        .merge(branding::routes())
         .merge(users::public_routes())
         .merge(oidc::public_routes())
         .merge(quick_connect::public_routes())
@@ -159,7 +162,10 @@ pub fn build_router(state: AppState) -> Router {
         router = webclient::mount_webclient(router);
     }
 
-    router.with_state(state)
+    // Paths match their routes without case, as in Jellyfin (see `route_case`).
+    let router = axum::middleware::map_request(crate::route_case::canonical_case)
+        .layer(router.with_state(state));
+    Router::new().fallback_service(router)
 }
 
 /// Static web client serving (only compiled when "webclient" feature is enabled)

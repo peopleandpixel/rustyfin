@@ -3,7 +3,8 @@
 
 use std::time::Instant;
 
-use axum::extract::{Path, Query, State};
+use crate::query::Query;
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};

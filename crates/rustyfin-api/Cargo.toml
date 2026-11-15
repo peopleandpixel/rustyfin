@@ -36,10 +36,10 @@ dashmap = "6"
 ipnet = "2"
 form_urlencoded = "1"
 unicode-normalization = { workspace = true }
+tower = { workspace = true }
 
 [dev-dependencies]
 http-body-util = "0.1"
-tower = { workspace = true }
 rustyfin-db = { workspace = true }
 rustyfin-auth = { workspace = true }
 rustyfin-core = { workspace = true }

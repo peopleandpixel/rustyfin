@@ -5,9 +5,74 @@
 
 use std::num::IntErrorKind;
 
+use axum::extract::FromRequestParts;
+use axum::extract::rejection::QueryRejection;
+use axum::http::Uri;
+use axum::http::request::Parts;
+use serde::de::DeserializeOwned;
 use uuid::Uuid;
 
 use crate::error::ApiError;
+
+/// `axum::extract::Query` that also takes a list parameter repeated, as ASP.NET binds it for
+/// Jellyfin: when the query string doesn't parse and a name repeats (`fields=A&fields=B`, as
+/// Jellyfin Web sends it), the values are joined with commas (`fields=A,B`) and parsed again. A
+/// query that parses as it is gets exactly the plain `Query` result.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Query<T>(pub T);
+
+impl<T, S> FromRequestParts<S> for Query<T>
+where
+    T: DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = QueryRejection;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        Self::try_from_uri(&parts.uri)
+    }
+}
+
+impl<T: DeserializeOwned> Query<T> {
+    /// The query of `uri`, as the extractor reads it.
+    pub fn try_from_uri(uri: &Uri) -> Result<Self, QueryRejection> {
+        match axum::extract::Query::<T>::try_from_uri(uri) {
+            Ok(axum::extract::Query(value)) => Ok(Query(value)),
+            Err(err) => match joined_repeats(uri) {
+                Some(uri) => axum::extract::Query::<T>::try_from_uri(&uri)
+                    .map(|axum::extract::Query(value)| Query(value))
+                    .map_err(|_| err),
+                None => Err(err),
+            },
+        }
+    }
+}
+
+/// The URI with each repeated query name given once, its values joined with commas in their
+/// order, or `None` when no name repeats.
+fn joined_repeats(uri: &Uri) -> Option<Uri> {
+    let query = uri.query()?;
+    let mut pairs: Vec<(&str, Vec<&str>)> = Vec::new();
+    let mut repeated = false;
+    for pair in query.split('&').filter(|p| !p.is_empty()) {
+        let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+        match pairs.iter_mut().find(|(n, _)| *n == name) {
+            Some((_, values)) => {
+                values.push(value);
+                repeated = true;
+            }
+            None => pairs.push((name, vec![value])),
+        }
+    }
+    if !repeated {
+        return None;
+    }
+    let joined: Vec<String> = pairs
+        .iter()
+        .map(|(name, values)| format!("{name}={}", values.join(",")))
+        .collect();
+    format!("{}?{}", uri.path(), joined.join("&")).parse().ok()
+}
 
 /// Jellyfin `BaseItemKind` names, in Jellyfin's order.
 pub const ITEM_KINDS: [&str; 37] = [
@@ -428,6 +493,47 @@ mod tests {
         assert_eq!(
             bad_request(parse_uuid("ParentId", "12")),
             "ParentId must be a UUID"
+        );
+    }
+
+    // R1 auth: the Jellyfin Web contract
+
+    #[derive(Debug, serde::Deserialize, PartialEq)]
+    struct ListQuery {
+        fields: Option<String>,
+        limit: Option<i64>,
+    }
+
+    async fn extract<T: DeserializeOwned>(uri: &str) -> Result<T, QueryRejection> {
+        let (mut parts, _) = axum::http::Request::get(uri).body(()).unwrap().into_parts();
+        Query::<T>::from_request_parts(&mut parts, &())
+            .await
+            .map(|Query(value)| value)
+    }
+
+    #[tokio::test]
+    async fn r1auth_repeated_names_join_with_commas() {
+        let q: ListQuery = extract("/Items?fields=A&limit=5&fields=B&fields=C")
+            .await
+            .unwrap();
+        assert_eq!(q.fields.as_deref(), Some("A,B,C"));
+        assert_eq!(q.limit, Some(5));
+        let q: ListQuery = extract("/Items?fields=A%2CB").await.unwrap();
+        assert_eq!(q.fields.as_deref(), Some("A,B"));
+    }
+
+    #[tokio::test]
+    async fn r1auth_a_query_that_parses_is_unchanged() {
+        let pairs: Vec<(String, String)> = extract("/Items?ids=a&ids=b").await.unwrap();
+        assert_eq!(
+            pairs,
+            vec![("ids".into(), "a".into()), ("ids".into(), "b".into())]
+        );
+        assert!(extract::<ListQuery>("/Items?limit=x").await.is_err());
+        assert!(
+            extract::<ListQuery>("/Items?limit=1&limit=2")
+                .await
+                .is_err()
         );
     }
 }
