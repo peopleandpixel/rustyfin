@@ -135,8 +135,12 @@ impl ProviderIds {
 impl<'de> Deserialize<'de> for ProviderIds {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let raw = std::collections::HashMap::<String, String>::deserialize(deserializer)?;
+        // When one key comes in several letter cases ({"tmdb": .., "Tmdb": ..}), the one spelled
+        // as Jellyfin spells it wins, whatever the map's order; among others, the greatest
+        let mut entries: Vec<(String, String)> = raw.into_iter().collect();
+        entries.sort_by_key(|(key, _)| (canonical_provider_key(key) == *key, key.clone()));
         let mut ids = ProviderIds::default();
-        for (key, value) in raw {
+        for (key, value) in entries {
             ids.set(key, value);
         }
         Ok(ids)
@@ -1167,6 +1171,14 @@ mod tests {
         assert_eq!(old.get("imdb"), Some("tt1"));
         assert_eq!(old.ids.get("Imdb").map(String::as_str), Some("tt1"));
         assert_eq!(old.get("other"), Some("x"));
+        // A key sent in two cases keeps the canonical spelling's value
+        for _ in 0..20 {
+            let both: ProviderIds =
+                serde_json::from_value(serde_json::json!({"tmdb": "1", "Tmdb": "2", "TMDB": "3"}))
+                    .unwrap();
+            assert_eq!(both.ids.len(), 1);
+            assert_eq!(both.get("Tmdb"), Some("2"));
+        }
         // Setting a key again in another case replaces it
         ids.set("TMDB".to_string(), "604".to_string());
         assert_eq!(ids.ids.len(), 3);
