@@ -192,7 +192,7 @@
         "sort_name": "Name",
         "sort_release_date": "Release date",
         "sort_date_added": "Date added",
-        "sort_rating": "Rating (★)",
+        "sort_rating": "Rating",
         "sort_reverse": "Reverse order",
         "all_genres": "All genres",
         "media_scan_started_for": "Media scan started for {{name}}",
