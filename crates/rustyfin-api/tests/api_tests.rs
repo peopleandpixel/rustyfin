@@ -161,6 +161,59 @@ async fn test_public_info_endpoint() {
     assert_eq!(info["Id"], "test-server-id");
 }
 
+// B130: Jellyfin clients' server check (jellyfin-sdk-kotlin RecommendedServerDiscovery)
+
+/// Asserts the fields the Jellyfin SDK checks: the product name, and a version of three or four
+/// numeric parts at or above 12.0.0 (SDK 1.9's minimum). Rustyfin's own version is separate.
+fn b130_assert_jellyfin_identity(info: &serde_json::Value) {
+    assert_eq!(info["ProductName"], "Jellyfin Server", "{info}");
+    let version = info["Version"].as_str().expect("Version is a string");
+    let parts: Vec<u32> = version
+        .split('.')
+        .map(|part| part.parse().expect("numeric version part"))
+        .collect();
+    assert!(matches!(parts.len(), 3 | 4), "{version}");
+    assert!(parts[..3] >= [12, 0, 0][..], "{version}");
+    assert_eq!(info["RustyfinVersion"], env!("CARGO_PKG_VERSION"), "{info}");
+}
+
+#[tokio::test]
+async fn b130_public_info_passes_the_sdk_server_check() {
+    let state = test_state().await;
+    let (status, body) = j1_get(&state, "/System/Info/Public", &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    let info: serde_json::Value = serde_json::from_str(&body).unwrap();
+    b130_assert_jellyfin_identity(&info);
+    assert_eq!(info["Id"], "test-server-id");
+    assert!(info["ServerName"].is_string());
+    assert!(info["StartupWizardCompleted"].is_boolean());
+    // Jellyfin no longer sets OperatingSystem and sends it empty; so does Rustyfin.
+    assert_eq!(info["OperatingSystem"], "", "{info}");
+    // Bound to 0.0.0.0, there is no address a client could reach.
+    assert!(info.get("LocalAddress").is_none(), "{info}");
+}
+
+#[tokio::test]
+async fn b130_public_info_local_address_follows_a_specific_bind() {
+    let mut state = test_state().await;
+    state.bind_addr = Arc::new("127.0.0.1:8102".to_string());
+    let (status, body) = j1_get(&state, "/System/Info/Public", &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    let info: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(info["LocalAddress"], "http://127.0.0.1:8102", "{info}");
+}
+
+#[tokio::test]
+async fn b130_full_info_reports_the_same_identity() {
+    let state = test_state().await;
+    let (token, _) = j1_user(&state).await;
+    let (status, body) = j1_get(&state, "/System/Info", &[("X-Emby-Token", token.as_str())]).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let info: serde_json::Value = serde_json::from_str(&body).unwrap();
+    b130_assert_jellyfin_identity(&info);
+    assert_eq!(info["PackageVersion"], env!("CARGO_PKG_VERSION"), "{info}");
+}
+
 // ── Auth Endpoint Tests ──
 
 #[tokio::test]
