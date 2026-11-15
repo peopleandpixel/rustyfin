@@ -7,7 +7,7 @@ use uuid::Uuid;
 use crate::local_images;
 use crate::nfo_parser;
 use crate::plugin_manager::{MetadataProviderHandle, PluginManager};
-use rustyfin_model::metadata::SeasonMetadata;
+use rustyfin_model::metadata::{LookupFailed, SeasonMetadata};
 
 /// How a metadata refresh may ask the providers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,7 +50,9 @@ pub async fn refresh_item_metadata(
     item: &MediaItem,
     plugin_manager: &PluginManager,
 ) -> Result<(), String> {
-    refresh_item_metadata_with(pool, client, item, plugin_manager, RefreshOptions::EXPLICIT).await
+    refresh_item_metadata_with(pool, client, item, plugin_manager, RefreshOptions::EXPLICIT)
+        .await
+        .map(|_| ())
 }
 
 /// `refresh_item_metadata` with the given options.
@@ -60,7 +62,7 @@ pub async fn refresh_item_metadata_with(
     item: &MediaItem,
     plugin_manager: &PluginManager,
     options: RefreshOptions,
-) -> Result<(), String> {
+) -> Result<RefreshOutcome, String> {
     let media_path = Path::new(&item.path);
     // Each source fills this copy, so a later source keeps what an earlier one filled
     let mut working = item.clone();
@@ -115,12 +117,13 @@ pub async fn refresh_item_metadata_with(
             "no active metadata providers for '{}' (fast scan mode)",
             item.name
         );
-        return Ok(());
+        return Ok(RefreshOutcome::Done);
     }
 
+    let mut outcome = RefreshOutcome::Done;
     match item.media_type {
         MediaType::Movie | MediaType::Series => {
-            let answered = refresh_from_providers(
+            let asked = refresh_from_providers(
                 pool,
                 client,
                 &mut working,
@@ -130,15 +133,21 @@ pub async fn refresh_item_metadata_with(
             )
             .await?;
             // A series counts as answered only once its seasons have answered too, since the
-            // task reaches them only through it
-            let children_answered =
-                if item.media_type == MediaType::Series && working.tmdb_id.is_some() {
-                    refresh_series_children(pool, &working, &providers, options.force).await?
-                } else {
-                    true
-                };
+            // task reaches them only through it. After its own lookup failed, its seasons
+            // aren't asked for in this run either.
+            let mut children = ChildrenAnswer {
+                all_answered: true,
+                unauthorized: false,
+            };
+            if item.media_type == MediaType::Series && working.tmdb_id.is_some() && !asked.failed {
+                children =
+                    refresh_series_children(pool, &working, &providers, options.force).await?;
+            }
+            if asked.unauthorized || children.unauthorized {
+                outcome = RefreshOutcome::Unauthorized;
+            }
             // Only a final answer counts; after a failure the next run asks again
-            if answered && children_answered {
+            if asked.answered && !asked.failed && children.all_answered {
                 rustyfin_db::repo_media::mark_provider_refreshed(pool, &[item.id])
                     .await
                     .map_err(|e| e.to_string())?;
@@ -157,14 +166,42 @@ pub async fn refresh_item_metadata_with(
         _ => {}
     }
 
-    Ok(())
+    Ok(outcome)
+}
+
+/// How a refresh ended for the caller that runs many of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshOutcome {
+    /// Done, whatever the providers answered
+    Done,
+    /// A provider refused its API key (or has none): every other lookup in this run would fail
+    /// the same way, so a run over many items can stop
+    Unauthorized,
+}
+
+/// What `refresh_from_providers` got from the providers with lookups.
+struct ProvidersAnswer {
+    /// One gave a final answer (found, or a 404 for the id)
+    answered: bool,
+    /// One failed
+    failed: bool,
+    /// One failed for its API key
+    unauthorized: bool,
+}
+
+/// What `refresh_series_children` got.
+struct ChildrenAnswer {
+    /// Every season asked for gave a final answer
+    all_answered: bool,
+    /// A season lookup failed for the provider's API key
+    unauthorized: bool,
 }
 
 /// Identify a movie or series with each provider in turn and apply what it finds. A provider
 /// with lookups (TMDb) fetches an item it already knows by id and never searches for it, even
 /// when the id is gone from TMDb (the item stays as it is, as in Jellyfin); a series search sends
-/// the folder's year. Without `search`, no provider is searched by name. Returns whether a
-/// provider with lookups gave a final answer (found, or a 404 for the id) and none failed.
+/// the folder's year. Without `search`, no provider is searched by name. Returns what the
+/// providers with lookups answered.
 async fn refresh_from_providers(
     pool: &SqlitePool,
     client: &reqwest::Client,
@@ -172,9 +209,10 @@ async fn refresh_from_providers(
     providers: &[MetadataProviderHandle],
     replace_name: bool,
     search: bool,
-) -> Result<bool, String> {
+) -> Result<ProvidersAnswer, String> {
     let mut answered = false;
     let mut failed = false;
+    let mut unauthorized = false;
     // Candidate names in search order. Jellyfin searches the parsed name first; release
     // tags left in the file name (e.g. "Bluray-1080p") make TMDb find nothing.
     let mut candidates: Vec<String> = Vec::new();
@@ -202,7 +240,10 @@ async fn refresh_from_providers(
                     answered = true;
                     meta = found;
                 }
-                Err(_) => failed = true,
+                Err(e) => {
+                    failed = true;
+                    unauthorized |= e == LookupFailed::Unauthorized;
+                }
             }
             tracing::debug!(
                 "metadata lookup of id {} via {}: {}",
@@ -218,8 +259,9 @@ async fn refresh_from_providers(
                     (MediaType::Series, Some(lookups)) => {
                         match lookups.search_series(candidate, year).await {
                             Ok(found) => found,
-                            Err(_) => {
+                            Err(e) => {
                                 failed = true;
+                                unauthorized |= e == LookupFailed::Unauthorized;
                                 None
                             }
                         }
@@ -254,7 +296,11 @@ async fn refresh_from_providers(
             store_images_batch(pool, working.id, &images, &provider.provider_name).await?;
         }
     }
-    Ok(answered && !failed)
+    Ok(ProvidersAnswer {
+        answered,
+        failed,
+        unauthorized,
+    })
 }
 
 /// The series that a season or episode belongs to, and the season number: an episode's parent is
@@ -400,9 +446,12 @@ async fn refresh_series_children(
     series: &MediaItem,
     providers: &[MetadataProviderHandle],
     force: bool,
-) -> Result<bool, String> {
+) -> Result<ChildrenAnswer, String> {
     let Some(series_id) = series.tmdb_id else {
-        return Ok(true);
+        return Ok(ChildrenAnswer {
+            all_answered: true,
+            unauthorized: false,
+        });
     };
     let children = rustyfin_db::repo_media::get_children(pool, series.id)
         .await
@@ -443,11 +492,15 @@ async fn refresh_series_children(
         targets.retain(|(t, _)| !answered.contains(&t.id));
     }
     if targets.is_empty() {
-        return Ok(true);
+        return Ok(ChildrenAnswer {
+            all_answered: true,
+            unauthorized: false,
+        });
     }
     // Season numbers with a final answer from every provider with lookups, and any failed
     let mut answered: std::collections::HashSet<i32> = std::collections::HashSet::new();
     let mut failed: std::collections::HashSet<i32> = std::collections::HashSet::new();
+    let mut unauthorized = false;
     for provider in providers {
         let Some(lookups) = &provider.lookups else {
             continue;
@@ -461,7 +514,8 @@ async fn refresh_series_children(
                         answered.insert(*number);
                         found
                     }
-                    Err(_) => {
+                    Err(e) => {
+                        unauthorized |= e == LookupFailed::Unauthorized;
                         failed.insert(*number);
                         None
                     }
@@ -497,7 +551,10 @@ async fn refresh_series_children(
             .await
             .map_err(|e| e.to_string())?;
     }
-    Ok(failed.is_empty())
+    Ok(ChildrenAnswer {
+        all_answered: failed.is_empty(),
+        unauthorized,
+    })
 }
 
 async fn apply_metadata_to_item(

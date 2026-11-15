@@ -4125,12 +4125,13 @@ async fn b134c_metadata_refresh_skips_identified_items() {
     assert!(searched.is_empty(), "{searched:?}");
 }
 
-// R1 scan (upgrades; review L1, L2): with a provider that looks items up by id, the "Refresh
-// metadata" task asks once, by id and without a search, about movies and series identified
-// before premiere dates were stored (no premiere date), fills a series' seasons and episodes
-// from one season lookup, skips movies and series without a TMDb id (no search, no rename) and
-// those with a premiere date, and a second run asks the provider nothing, though TMDb gave one
-// movie no premiere date.
+// R1 scan (upgrades; review L1, L2, rechecks): with a provider that looks items up by id, the
+// "Refresh metadata" task asks, by id and without a search, about every movie and series with a
+// TMDb id and no answer recorded, dated or not; fills a series' seasons and episodes from one
+// season lookup; skips movies and series without a TMDb id (no search, no rename). The next run
+// asks again only what failed: a movie, a dated series' season, a series whose own lookup failed
+// (its season is asked only once it answers); a 404 and a dateless answer are final. A third run
+// asks nothing.
 #[tokio::test]
 async fn r1scan_metadata_refresh_upgrades_identified_items_by_id() {
     use rustyfin_core::scheduler::TASK_METADATA_REFRESH;
@@ -4147,8 +4148,9 @@ async fn r1scan_metadata_refresh_upgrades_identified_items_by_id() {
         Pin<Box<dyn Future<Output = rustyfin_model::metadata::LookupResult<T>> + Send + 'a>>;
     use rustyfin_model::metadata::LookupFailed;
 
-    /// Every lookup, as "movie 77", "series 90", "search ..." or "season 90/1". Movie 80 and
-    /// season 92/1 fail (a timeout, a 5xx) the first time they are asked; movie 404 is gone.
+    /// Every lookup, as "movie 77", "series 90", "search ..." or "season 90/1". Movie 80, series
+    /// 93 and season 92/1 fail (a timeout, a 5xx) the first time they are asked; movie 404 is
+    /// gone.
     struct ById(Arc<Mutex<Vec<String>>>);
     impl ById {
         /// Logs `call` and tells whether it was asked before.
@@ -4164,7 +4166,7 @@ async fn r1scan_metadata_refresh_upgrades_identified_items_by_id() {
             let again = self.log(format!("movie {id}"));
             Box::pin(async move {
                 if id == 80 && !again {
-                    return Err(LookupFailed);
+                    return Err(LookupFailed::Transient);
                 }
                 if id == 404 {
                     return Ok(None);
@@ -4179,10 +4181,16 @@ async fn r1scan_metadata_refresh_upgrades_identified_items_by_id() {
             })
         }
         fn series_by_id(&self, id: i64) -> Lookup<'_, ExternalMetadata> {
-            self.log(format!("series {id}"));
+            let again = self.log(format!("series {id}"));
             Box::pin(async move {
+                if id == 93 && !again {
+                    return Err(LookupFailed::Transient);
+                }
+                // A series has a premiere date, as TMDb gives almost every one: a series isn't
+                // asked again for a missing date but for its unanswered seasons
                 Ok(Some(ExternalMetadata {
                     tmdb_id: Some(id),
+                    premiere_date: Some("2003-01-01".to_string()),
                     ..Default::default()
                 }))
             })
@@ -4195,7 +4203,7 @@ async fn r1scan_metadata_refresh_upgrades_identified_items_by_id() {
             let again = self.log(format!("season {series}/{season}"));
             Box::pin(async move {
                 if series == 92 && !again {
-                    return Err(LookupFailed);
+                    return Err(LookupFailed::Transient);
                 }
                 Ok(Some(SeasonMetadata {
                     meta: ExternalMetadata::default(),
@@ -4417,7 +4425,25 @@ async fn r1scan_metadata_refresh_upgrades_identified_items_by_id() {
     }
     let (flaky_show, flaky_season, flaky_episode) =
         (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    // Series 93's own lookup fails on the first run: its season isn't asked for in that run
+    let (failing_show, failing_season) = (Uuid::new_v4(), Uuid::new_v4());
     for (id, name, kind, parent, tmdb, numbers) in [
+        (
+            failing_show,
+            "Failing Show",
+            "Series",
+            None,
+            Some(93),
+            (None, None),
+        ),
+        (
+            failing_season,
+            "Failing Show/Season 1",
+            "Season",
+            Some(failing_show),
+            None,
+            (Some(1), None),
+        ),
         (
             flaky_show,
             "Flaky Show",
@@ -4473,12 +4499,14 @@ async fn r1scan_metadata_refresh_upgrades_identified_items_by_id() {
         [
             "movie 404",
             "movie 77",
+            "movie 78",
             "movie 79",
             "movie 80",
             "season 90/1",
             "season 92/1",
             "series 90",
-            "series 92"
+            "series 92",
+            "series 93"
         ]
     );
     assert!(searched.lock().unwrap().is_empty(), "{searched:?}");
@@ -4506,7 +4534,19 @@ async fn r1scan_metadata_refresh_upgrades_identified_items_by_id() {
     // Answers, the 404 and the dateless movie included, aren't asked again.
     let mark = asked.lock().unwrap().len();
     run().await;
-    assert_eq!(calls_since(mark), ["movie 80", "season 92/1", "series 92"]);
+    // Series 92 has its premiere date now; it is picked again for its unanswered season. Series
+    // 93 answers now, and only now is its season asked for.
+    assert_eq!(
+        calls_since(mark),
+        [
+            "movie 80",
+            "season 92/1",
+            "season 93/1",
+            "series 92",
+            "series 93"
+        ]
+    );
+    assert!(get(flaky_show).await.premiere_date.is_some());
     assert_eq!(get(flaky_episode).await.name, "Upgraded Pilot");
 
     // A third run asks for nothing
@@ -4514,6 +4554,132 @@ async fn r1scan_metadata_refresh_upgrades_identified_items_by_id() {
     run().await;
     assert!(calls_since(mark).is_empty(), "{:?}", calls_since(mark));
     assert!(searched.lock().unwrap().is_empty(), "{searched:?}");
+}
+
+// R1 scan (recheck 2): a refused or missing API key fails every lookup alike, so the task's run
+// stops after the first such failure: with 30 movies to ask about, at most the 10 refreshes
+// already running ask, and their series' seasons aren't asked for.
+#[tokio::test]
+async fn r1scan_metadata_refresh_stops_after_an_auth_failure() {
+    use rustyfin_core::scheduler::TASK_METADATA_REFRESH;
+    use rustyfin_model::metadata::{
+        ExternalMetadata, LookupFailed, LookupResult, MetadataImage, MetadataLookups,
+        SeasonMetadata,
+    };
+    use rustyfin_model::plugin::PluginStatus;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    type Found = Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>>;
+    type Images = Pin<Box<dyn Future<Output = Vec<MetadataImage>> + Send>>;
+    type Lookup<'a, T> = Pin<Box<dyn Future<Output = LookupResult<T>> + Send + 'a>>;
+
+    struct Refused(Arc<AtomicUsize>);
+    impl Refused {
+        fn refuse<T: Send + 'static>(&self) -> Lookup<'_, T> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                // As a request would take a moment
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                Err(LookupFailed::Unauthorized)
+            })
+        }
+    }
+    impl MetadataLookups for Refused {
+        fn movie_by_id(&self, _: i64) -> Lookup<'_, ExternalMetadata> {
+            self.refuse()
+        }
+        fn series_by_id(&self, _: i64) -> Lookup<'_, ExternalMetadata> {
+            self.refuse()
+        }
+        fn search_series(&self, _: &str, _: Option<i32>) -> Lookup<'_, ExternalMetadata> {
+            self.refuse()
+        }
+        fn season(&self, _: i64, _: i32) -> Lookup<'_, SeasonMetadata> {
+            self.refuse()
+        }
+    }
+
+    let fx = Fixture::new().await;
+    let lib = fx.library("R1 Refused", LibraryContentType::Movies).await;
+    let root = root_of(&lib);
+    for n in 0..30 {
+        let kind = if n % 2 == 0 { "Movie" } else { "Series" };
+        let series = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO media_items (id, library_id, name, media_type, path, tmdb_id) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(series.to_string())
+        .bind(lib.id.to_string())
+        .bind(format!("Item {n}"))
+        .bind(kind)
+        .bind(root.join(format!("Item {n}")).to_str().unwrap())
+        .bind(1000 + n)
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+        if kind == "Series" {
+            sqlx::query(
+                "INSERT INTO media_items (id, library_id, name, media_type, path, parent_id, \
+                 index_number) VALUES (?, ?, 'Season 1', 'Season', ?, ?, 1)",
+            )
+            .bind(Uuid::new_v4().to_string())
+            .bind(lib.id.to_string())
+            .bind(root.join(format!("Item {n}/Season 1")).to_str().unwrap())
+            .bind(series.to_string())
+            .execute(&fx.pool)
+            .await
+            .unwrap();
+        }
+    }
+
+    let pm = rustyfin_core::plugin_manager::PluginManager::new(&fx.dir);
+    pm.register_metadata_provider(
+        "r1".to_string(),
+        "r1".to_string(),
+        PluginStatus::Active,
+        |_: &reqwest::Client, _: &str, _: Option<i32>| -> Found { Box::pin(async { None }) },
+        |_: &reqwest::Client, _: &str| -> Found { Box::pin(async { None }) },
+        |_: &reqwest::Client, _: Option<i64>, _: Option<i64>, _| -> Images {
+            Box::pin(async { Vec::new() })
+        },
+    )
+    .await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    pm.register_metadata_lookups("r1", Arc::new(Refused(calls.clone())))
+        .await;
+    let sched = TaskScheduler::with_plugin_manager(
+        fx.pool.clone(),
+        Arc::new(fx.dir.clone()),
+        reqwest::Client::new(),
+        pm,
+    );
+    assert!(sched.start_task(TASK_METADATA_REFRESH).await);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while sched
+        .get_task(TASK_METADATA_REFRESH)
+        .await
+        .unwrap()
+        .last_execution_result
+        .is_none()
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the refresh did not end within 60 s"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let made = calls.load(Ordering::SeqCst);
+    assert!((1..=10).contains(&made), "{made} lookups for 30 items");
+    // Nothing was answered, so the next run asks again
+    let answered: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM item_metadata_extras WHERE provider_refreshed_at IS NOT NULL",
+    )
+    .fetch_one(&fx.pool)
+    .await
+    .unwrap();
+    assert_eq!(answered, 0);
 }
 
 // B30: a scheduled scan tells the server, so that it can drop what it cached from before.

@@ -475,12 +475,13 @@ impl TaskScheduler {
 
                 // Collect all items from all libraries first. The task never searches by name
                 // (RefreshOptions::TASK), so a movie or series is refreshed only when a provider
-                // can look it up by its TMDb id and none has answered for it since the item was
-                // stored before premiere dates, people and IMDb ids were (no premiere date, no
-                // provider_refreshed_at): an upgraded library is asked once, by id. Movies and
-                // series without a TMDb id are skipped (no search, no rename). Other items get
-                // their local images and NFO; their seasons' lookups come from their series'
-                // refresh. An explicit refresh from the API still re-queries.
+                // can look it up by its TMDb id and it has no final answer recorded
+                // (provider_refreshed_at unset): an upgraded library is asked once, by id, and
+                // an item whose lookup failed, or a series one of whose seasons failed (it stays
+                // unanswered then), is asked again on the next run. Movies and series without a
+                // TMDb id are skipped (no search, no rename). Other items get their local images
+                // and NFO; their seasons' lookups come from their series' refresh. An explicit
+                // refresh from the API still re-queries.
                 let by_id = self
                     .plugin_manager
                     .metadata_providers()
@@ -503,7 +504,6 @@ impl TaskScheduler {
                                     matches!(item.media_type, MediaType::Movie | MediaType::Series)
                                         && !(by_id
                                             && item.tmdb_id.is_some()
-                                            && item.premiere_date.is_none()
                                             && !answered.contains(&item.id));
                                 if skip {
                                     skipped_identified += 1;
@@ -525,16 +525,24 @@ impl TaskScheduler {
 
                 // Process items concurrently with a semaphore (10 concurrent)
                 let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(10));
+                // A refused or missing API key fails every lookup alike: the first one stops
+                // the run, and the refreshes not started yet are skipped
+                let unauthorized = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let mut handles = Vec::new();
                 for (lib_name, item) in all_items {
                     let sem = semaphore.clone();
+                    let unauthorized = unauthorized.clone();
                     let db = self.db.clone();
                     let http_client = http.clone();
                     let item_name = item.name.clone();
                     let pm = self.plugin_manager.clone();
                     let handle = tokio::spawn(async move {
                         let _permit = sem.acquire().await;
-                        if let Err(e) = crate::metadata::refresh_item_metadata_with(
+                        use std::sync::atomic::Ordering;
+                        if unauthorized.load(Ordering::Relaxed) {
+                            return None;
+                        }
+                        match crate::metadata::refresh_item_metadata_with(
                             &db,
                             &http_client,
                             &item,
@@ -543,9 +551,17 @@ impl TaskScheduler {
                         )
                         .await
                         {
-                            Some(format!("{}: {}", item_name, e))
-                        } else {
-                            None
+                            Err(e) => Some(format!("{}: {}", item_name, e)),
+                            Ok(crate::metadata::RefreshOutcome::Unauthorized) => {
+                                if !unauthorized.swap(true, Ordering::Relaxed) {
+                                    tracing::warn!(
+                                        "metadata refresh: a provider refused its API key (or \
+                                         has none); stopping this run"
+                                    );
+                                }
+                                None
+                            }
+                            Ok(crate::metadata::RefreshOutcome::Done) => None,
                         }
                     });
                     handles.push((lib_name, handle));

@@ -84,29 +84,29 @@ impl MetadataLookups for TmdbLookups {
     // No API key is a failure, not an answer: the item is asked again once a key is set
     fn movie_by_id(&self, id: i64) -> Answer<'_, ExternalMetadata> {
         Box::pin(async move {
-            let tmdb = self.api().ok_or(LookupFailed)?;
-            movie_lookup(&tmdb, id).await.map_err(|_| LookupFailed)
+            let tmdb = self.api().ok_or(LookupFailed::Unauthorized)?;
+            movie_lookup(&tmdb, id).await.map_err(|e| failure(&e))
         })
     }
 
     fn series_by_id(&self, id: i64) -> Answer<'_, ExternalMetadata> {
         Box::pin(async move {
-            let tmdb = self.api().ok_or(LookupFailed)?;
-            series_lookup(&tmdb, id).await.map_err(|_| LookupFailed)
+            let tmdb = self.api().ok_or(LookupFailed::Unauthorized)?;
+            series_lookup(&tmdb, id).await.map_err(|e| failure(&e))
         })
     }
 
     fn search_series(&self, name: &str, year: Option<i32>) -> Answer<'_, ExternalMetadata> {
         let name = name.to_string();
         Box::pin(async move {
-            let tmdb = self.api().ok_or(LookupFailed)?;
+            let tmdb = self.api().ok_or(LookupFailed::Unauthorized)?;
             Ok(search_tv(&tmdb, &name, year).await)
         })
     }
 
     fn season(&self, series_id: i64, season_number: i32) -> Answer<'_, SeasonMetadata> {
         Box::pin(async move {
-            let tmdb = self.api().ok_or(LookupFailed)?;
+            let tmdb = self.api().ok_or(LookupFailed::Unauthorized)?;
             // One request for concurrent callers; a final answer (a 404 too) is kept, a failure
             // is not
             self.seasons
@@ -114,8 +114,16 @@ impl MetadataLookups for TmdbLookups {
                     season_lookup(&tmdb, series_id, season_number).await
                 })
                 .await
-                .map_err(|_| LookupFailed)
+                .map_err(|e| failure(&e))
         })
+    }
+}
+
+/// A TMDb error as a lookup failure: a refused key (401, 403) fails every lookup alike.
+fn failure(error: &crate::tmdb_client::TmdbError) -> LookupFailed {
+    match error.kind {
+        crate::tmdb_client::TmdbErrorKind::Status(401 | 403) => LookupFailed::Unauthorized,
+        _ => LookupFailed::Transient,
     }
 }
 

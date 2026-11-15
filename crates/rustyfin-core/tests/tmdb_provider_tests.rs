@@ -646,12 +646,35 @@ async fn r1scan_season_lookups_are_single_flight_and_remember_a_404() {
     // A failure is reported as one and not kept
     let failing = Stub::start(Mode::Status(500)).await;
     let lookups = lookups_on(&failing).await;
-    assert_eq!(lookups.season(9101, 1).await.err(), Some(LookupFailed));
+    assert_eq!(
+        lookups.season(9101, 1).await.err(),
+        Some(LookupFailed::Transient)
+    );
     let first = count(&failing, "/tv/9101/season/1");
-    assert_eq!(lookups.season(9101, 1).await.err(), Some(LookupFailed));
+    assert_eq!(
+        lookups.season(9101, 1).await.err(),
+        Some(LookupFailed::Transient)
+    );
     assert!(count(&failing, "/tv/9101/season/1") > first);
-    assert_eq!(lookups.movie_by_id(9001).await.err(), Some(LookupFailed));
-    assert_eq!(lookups.series_by_id(9101).await.err(), Some(LookupFailed));
+    assert_eq!(
+        lookups.movie_by_id(9001).await.err(),
+        Some(LookupFailed::Transient)
+    );
+    assert_eq!(
+        lookups.series_by_id(9101).await.err(),
+        Some(LookupFailed::Transient)
+    );
+    // A refused key is told apart, so a run can stop
+    let refused = Stub::start(Mode::Status(401)).await;
+    let lookups = lookups_on(&refused).await;
+    assert_eq!(
+        lookups.movie_by_id(9001).await.err(),
+        Some(LookupFailed::Unauthorized)
+    );
+    assert_eq!(
+        lookups.season(9101, 1).await.err(),
+        Some(LookupFailed::Unauthorized)
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

@@ -76,7 +76,12 @@ pub struct SeasonMetadata {
 /// A lookup that got no final answer (a timeout, a 5xx, a rate limit, no API key), so it is worth
 /// asking again later. `Ok(None)` is a final "not there" (a 404).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LookupFailed;
+pub enum LookupFailed {
+    /// A timeout, a 5xx, a rate limit, a network error: worth asking again
+    Transient,
+    /// No API key, or the provider refused it (401, 403): every other lookup will fail too
+    Unauthorized,
+}
 
 /// The answer of a lookup: `Ok(Some(_))` found, `Ok(None)` not there, `Err` failed.
 pub type LookupResult<T> = Result<Option<T>, LookupFailed>;
