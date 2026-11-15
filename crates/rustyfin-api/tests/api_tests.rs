@@ -190,8 +190,18 @@ async fn b130_public_info_passes_the_sdk_server_check() {
     assert!(info["StartupWizardCompleted"].is_boolean());
     // Jellyfin no longer sets OperatingSystem and sends it empty; so does Rustyfin.
     assert_eq!(info["OperatingSystem"], "", "{info}");
-    // Bound to 0.0.0.0, there is no address a client could reach.
-    assert!(info.get("LocalAddress").is_none(), "{info}");
+    // Bound to 0.0.0.0 (no address a client could reach), LocalAddress is the address the
+    // request came to, or localhost without a Host header; never 0.0.0.0.
+    assert_eq!(info["LocalAddress"], "http://localhost:8096", "{info}");
+    let (status, body) = j1_get(
+        &state,
+        "/System/Info/Public",
+        &[("Host", "192.168.1.20:8096")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let info: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(info["LocalAddress"], "http://192.168.1.20:8096", "{info}");
 }
 
 #[tokio::test]
