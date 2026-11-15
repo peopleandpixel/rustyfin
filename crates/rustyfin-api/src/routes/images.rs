@@ -341,10 +341,23 @@ async fn upload_item_image(
 async fn refresh_item(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
 ) -> Result<Json<Value>, ApiError> {
     let item = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, id)
         .await?
         .ok_or_else(|| ApiError::NotFound("item not found".into()))?;
+
+    // A refresh that replaces all images tries failed chapter images and trickplay again.
+    let replace_all = query.as_deref().is_some_and(|q| {
+        q.split('&').any(|pair| {
+            pair.split_once('=').is_some_and(|(name, value)| {
+                name.eq_ignore_ascii_case("ReplaceAllImages") && value.eq_ignore_ascii_case("true")
+            })
+        })
+    });
+    if replace_all {
+        rustyfin_db::repo_trickplay::clear_failures(&state.db, id).await?;
+    }
 
     rustyfin_core::metadata::refresh_item_metadata(
         &state.db,

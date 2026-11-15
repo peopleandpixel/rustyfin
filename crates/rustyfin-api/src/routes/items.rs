@@ -1982,6 +1982,8 @@ async fn delete_item(
     if !deleted {
         return Err(ApiError::NotFound("item not found".into()));
     }
+    // The items under it lose theirs at the image tasks' next run.
+    rustyfin_core::trickplay::remove_item_files(&state.data_dir, id).await;
     Ok(Json(json!({ "status": "ok" })))
 }
 
@@ -2313,9 +2315,9 @@ async fn delete_items(
         Vec::new()
     };
     for id in &ids {
-        rustyfin_db::repo_media::delete_item(&state.db, *id)
-            .await
-            .ok();
+        if let Ok(true) = rustyfin_db::repo_media::delete_item(&state.db, *id).await {
+            rustyfin_core::trickplay::remove_item_files(&state.data_dir, *id).await;
+        }
     }
     Ok((StatusCode::OK, Json(serde_json::json!({"Success": true}))))
 }

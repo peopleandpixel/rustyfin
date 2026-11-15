@@ -486,7 +486,20 @@ fn extract_album_art(streams: &[FfprobeStream]) -> (Option<Vec<u8>>, Option<Stri
 
 /// Reads the chapter markers of a media file with ffprobe; none when it can't.
 pub(crate) async fn read_chapters(path: &str) -> Vec<Chapter> {
-    let output = Command::new("ffprobe")
+    read_chapters_with("ffprobe", path, CHAPTER_READ_TIMEOUT).await
+}
+
+/// The longest one chapter read may take, so a stalled file can't hold up the re-read list.
+const CHAPTER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// `read_chapters` with the ffprobe `program` and a `timeout`, after which ffprobe is killed and
+/// no chapters are given.
+async fn read_chapters_with(
+    program: &str,
+    path: &str,
+    timeout: std::time::Duration,
+) -> Vec<Chapter> {
+    let run = Command::new(program)
         .args([
             "-v",
             "quiet",
@@ -498,13 +511,19 @@ pub(crate) async fn read_chapters(path: &str) -> Vec<Chapter> {
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await;
-
-    let output = match output {
-        Ok(o) if o.status.success() => o,
-        _ => return Vec::new(),
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    let output = match tokio::time::timeout(timeout, run).await {
+        Ok(Ok(o)) if o.status.success() => o,
+        Ok(_) => return Vec::new(),
+        Err(_) => {
+            warn!(
+                path,
+                "reading the chapters took too long; ffprobe was stopped"
+            );
+            return Vec::new();
+        }
     };
 
     parse_chapters(&String::from_utf8_lossy(&output.stdout))
@@ -1000,6 +1019,14 @@ async fn save_runtime_and_chapters(
             .await;
     }
 
+    // A probed file is new or changed: its tile set and failed image jobs belonged to the old one.
+    // The image tasks remove the old tiles from disk.
+    if let Err(e) = rustyfin_db::repo_trickplay::delete_trickplay(pool, *item_id).await {
+        warn!("failed to drop the old trickplay tiles: {}", e);
+    }
+    if let Err(e) = rustyfin_db::repo_trickplay::clear_failures(pool, *item_id).await {
+        warn!("failed to clear old image failures: {}", e);
+    }
     save_chapters(pool, item_id, chapters).await;
 }
 
@@ -1268,6 +1295,27 @@ mod tests {
         assert_eq!(got[2].end_position_ticks, 9_000_000_000);
         let numbers: Vec<_> = got.iter().map(|c| c.chapter_number).collect();
         assert_eq!(numbers, [1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn r2chapters_a_stalled_chapter_read_times_out() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("rustyfin_stall_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("ffprobe");
+        std::fs::write(&fake, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let started = std::time::Instant::now();
+        let got = read_chapters_with(
+            fake.to_str().unwrap(),
+            "/no/such.mkv",
+            std::time::Duration::from_millis(300),
+        )
+        .await;
+        assert!(got.is_empty());
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

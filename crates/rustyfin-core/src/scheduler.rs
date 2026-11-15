@@ -53,6 +53,8 @@ pub struct TaskScheduler {
     on_scan: Arc<std::sync::RwLock<Option<OnScan>>>,
     plugin_manager: crate::plugin_manager::PluginManager,
     http_client: reqwest::Client,
+    /// The image tasks running, each with the handle that stops it.
+    image_runs: Arc<std::sync::Mutex<HashMap<String, crate::trickplay::Cancel>>>,
 }
 
 impl TaskScheduler {
@@ -249,6 +251,7 @@ impl TaskScheduler {
             on_scan: Arc::new(std::sync::RwLock::new(None)),
             plugin_manager,
             http_client,
+            image_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -339,6 +342,13 @@ impl TaskScheduler {
 
     /// Stop a running task (sets state to Idle)
     pub async fn stop_task(&self, id: &str) -> bool {
+        // An image task stops between videos and kills the ffmpeg it runs
+        let image_run = self.image_runs.lock().unwrap().get(id).cloned();
+        if let Some(cancel) = image_run {
+            cancel.cancel();
+            self.set_task_state(id, TaskState::Idle).await;
+            return true;
+        }
         let tasks = self.tasks.read().await;
         if let Some(entry) = tasks.get(id) {
             if entry.info.state == TaskState::Running {
@@ -473,16 +483,26 @@ impl TaskScheduler {
             .await;
     }
 
-    /// Sets task `id` running, unless it is already. Returns whether it was set.
-    async fn try_begin(&self, id: &str) -> bool {
-        let mut tasks = self.tasks.write().await;
-        match tasks.get_mut(id) {
-            Some(entry) if entry.info.state != TaskState::Running => {
-                entry.info.state = TaskState::Running;
-                true
+    /// Starts a run of image task `id`, unless one is still going (a stopped one included, until
+    /// it has wound down). Returns the handle that stops it.
+    async fn begin_image_run(&self, id: &str) -> Option<crate::trickplay::Cancel> {
+        let cancel = {
+            let mut runs = self.image_runs.lock().unwrap();
+            if runs.contains_key(id) {
+                return None;
             }
-            _ => false,
-        }
+            let cancel = crate::trickplay::Cancel::new();
+            runs.insert(id.to_string(), cancel.clone());
+            cancel
+        };
+        self.set_task_state(id, TaskState::Running).await;
+        Some(cancel)
+    }
+
+    /// Ends the run of image task `id`.
+    async fn end_image_run(&self, id: &str) {
+        self.image_runs.lock().unwrap().remove(id);
+        self.set_task_state(id, TaskState::Idle).await;
     }
 
     /// The ids of the libraries whose options pass `wanted`.
@@ -508,27 +528,36 @@ impl TaskScheduler {
     /// Runs the chapter image task or the trickplay task once, over the libraries that turn it
     /// on. Does nothing when that task is running already.
     async fn run_video_images(&self, id: &str) {
-        if !self.try_begin(id).await {
+        let Some(cancel) = self.begin_image_run(id).await else {
             return;
-        }
+        };
         let start = Utc::now();
         let data_dir = self.data_dir.as_path();
+        // Tiles and chapter images of deleted items and changed files go first
+        if let Err(e) = crate::trickplay::sweep_unused_files(&self.db, data_dir).await {
+            tracing::warn!(task = id, error = %e, "could not remove unused image files");
+        }
         let result = if id == TASK_TRICKPLAY {
             match self.libraries_where(|o| o.enable_trickplay).await {
-                Ok(libs) => crate::trickplay::generate_for_libraries(&self.db, data_dir, &libs)
-                    .await
-                    .map(|n| format!("Made the trickplay images of {n} videos")),
+                Ok(libs) => {
+                    crate::trickplay::generate_for_libraries(&self.db, data_dir, &libs, &cancel)
+                        .await
+                        .map(|n| format!("Made the trickplay images of {n} videos"))
+                }
                 Err(e) => Err(e),
             }
         } else {
             match self.libraries_where(|o| o.enable_chapter_extraction).await {
-                Ok(libs) => crate::chapter_images::extract_for_libraries(&self.db, data_dir, &libs)
-                    .await
-                    .map(|n| format!("Made {n} chapter images")),
+                Ok(libs) => {
+                    crate::chapter_images::extract_for_libraries(&self.db, data_dir, &libs, &cancel)
+                        .await
+                        .map(|n| format!("Made {n} chapter images"))
+                }
                 Err(e) => Err(e),
             }
         };
         let (status, message) = match result {
+            Ok(message) if cancel.is_cancelled() => (TaskCompletionStatus::Cancelled, message),
             Ok(message) => (TaskCompletionStatus::Completed, message),
             Err(e) => {
                 tracing::warn!(task = id, error = %e, "task failed");
@@ -546,7 +575,7 @@ impl TaskScheduler {
             },
         )
         .await;
-        self.set_task_state(id, TaskState::Idle).await;
+        self.end_image_run(id).await;
     }
 
     /// After a scan of library `library_id` ends, starts the chapter image and trickplay tasks
@@ -876,11 +905,20 @@ impl TaskScheduler {
         });
 
         // Once, a little after startup: the chapters of videos probed before they were read
+        // It stops at shutdown, and each read is limited in time.
         let db = self.db.clone();
+        let mut rx = shutdown_rx.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(90)).await;
-            if let Err(e) = crate::chapter_images::reread_chapters(&db).await {
-                tracing::warn!(error = %e, "could not re-read chapters");
+            let cancel = crate::trickplay::Cancel::new();
+            let reread = async {
+                tokio::time::sleep(std::time::Duration::from_secs(90)).await;
+                crate::chapter_images::reread_chapters(&db, &cancel).await
+            };
+            tokio::select! {
+                result = reread => if let Err(e) = result {
+                    tracing::warn!(error = %e, "could not re-read chapters");
+                },
+                _ = rx.wait_for(|v| *v) => cancel.cancel(),
             }
         });
 
@@ -1007,4 +1045,39 @@ async fn cleanup_transcode_cache(cache_dir: &std::path::Path) -> Result<u32, Str
     }
 
     Ok(removed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn r2chapters_stop_task_cancels_an_image_run() {
+        let dir = std::env::temp_dir().join(format!("rustyfin_sched_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = rustyfin_db::init_db(dir.join("t.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let sched = TaskScheduler::new(db, Arc::new(dir.clone()));
+
+        let run = sched.begin_image_run(TASK_TRICKPLAY).await.unwrap();
+        assert_eq!(
+            sched.get_task(TASK_TRICKPLAY).await.unwrap().state,
+            TaskState::Running
+        );
+        assert!(sched.stop_task(TASK_TRICKPLAY).await);
+        assert!(run.is_cancelled(), "the run is told to stop");
+        assert_eq!(
+            sched.get_task(TASK_TRICKPLAY).await.unwrap().state,
+            TaskState::Idle
+        );
+        // No second run starts while the stopped one winds down.
+        assert!(sched.begin_image_run(TASK_TRICKPLAY).await.is_none());
+        sched.end_image_run(TASK_TRICKPLAY).await;
+        let next = sched.begin_image_run(TASK_TRICKPLAY).await.unwrap();
+        assert!(!next.is_cancelled());
+        // The other image task is separate.
+        assert!(sched.begin_image_run(TASK_CHAPTER_IMAGES).await.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

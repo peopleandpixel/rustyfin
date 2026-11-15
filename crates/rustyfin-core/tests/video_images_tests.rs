@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use rustyfin_core::trickplay::Cancel;
 use rustyfin_model::library::{Library, LibraryContentType, LibraryOptions};
 use sqlx::SqlitePool;
 use uuid::Uuid;
@@ -24,12 +25,27 @@ impl Drop for TempDir {
     }
 }
 
+/// Whether ffmpeg is here. Without it the test says so, as SKIPPED, and checks nothing.
+fn ffmpeg_or_skip() -> bool {
+    let here = have_ffmpeg();
+    if !here {
+        let test = std::thread::current().name().unwrap_or("?").to_string();
+        eprintln!("SKIPPED {test}: ffmpeg is not on PATH, so this test checked nothing");
+    }
+    here
+}
+
 fn have_ffmpeg() -> bool {
     Command::new("ffmpeg")
         .arg("-version")
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+/// A handle that is never cancelled.
+fn go() -> Cancel {
+    Cancel::new()
 }
 
 /// A 35-second 640x360 clip with two chapters: "Opening" at 0 s and an untitled one at 20 s.
@@ -103,8 +119,7 @@ async fn movie_db(dir: &Path, clip: &str) -> (SqlitePool, String, Uuid) {
 
 #[tokio::test]
 async fn r2chapters_probe_reads_the_clips_chapters() {
-    if !have_ffmpeg() {
-        eprintln!("skipped: no ffmpeg");
+    if !ffmpeg_or_skip() {
         return;
     }
     let dir = TempDir::new("r2chapters_probe");
@@ -120,8 +135,7 @@ async fn r2chapters_probe_reads_the_clips_chapters() {
 
 #[tokio::test]
 async fn r2chapters_trickplay_and_chapter_images_are_made_once() {
-    if !have_ffmpeg() {
-        eprintln!("skipped: no ffmpeg");
+    if !ffmpeg_or_skip() {
         return;
     }
     let dir = TempDir::new("r2chapters_images");
@@ -131,7 +145,7 @@ async fn r2chapters_trickplay_and_chapter_images_are_made_once() {
     let libs = [lib];
 
     // Trickplay: one thumbnail every 10 s, 320 wide, in one 10x10 tile.
-    let made = rustyfin_core::trickplay::generate_for_libraries(&pool, &data, &libs)
+    let made = rustyfin_core::trickplay::generate_for_libraries(&pool, &data, &libs, &go())
         .await
         .unwrap();
     assert_eq!(made, 1);
@@ -157,7 +171,7 @@ async fn r2chapters_trickplay_and_chapter_images_are_made_once() {
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
     assert_eq!(left, ["320 - 10x10"]);
-    let again = rustyfin_core::trickplay::generate_for_libraries(&pool, &data, &libs)
+    let again = rustyfin_core::trickplay::generate_for_libraries(&pool, &data, &libs, &go())
         .await
         .unwrap();
     assert_eq!(again, 0);
@@ -171,7 +185,7 @@ async fn r2chapters_trickplay_and_chapter_images_are_made_once() {
     rustyfin_db::repo_chapter::save_chapters(&pool, item, chapters)
         .await
         .unwrap();
-    let made = rustyfin_core::chapter_images::extract_for_libraries(&pool, &data, &libs)
+    let made = rustyfin_core::chapter_images::extract_for_libraries(&pool, &data, &libs, &go())
         .await
         .unwrap();
     assert_eq!(made, 2);
@@ -187,7 +201,7 @@ async fn r2chapters_trickplay_and_chapter_images_are_made_once() {
         assert_eq!(image::image_dimensions(path).unwrap(), (640, 360));
         assert!(c.image_date_modified.is_some());
     }
-    let again = rustyfin_core::chapter_images::extract_for_libraries(&pool, &data, &libs)
+    let again = rustyfin_core::chapter_images::extract_for_libraries(&pool, &data, &libs, &go())
         .await
         .unwrap();
     assert_eq!(again, 0);
@@ -195,15 +209,14 @@ async fn r2chapters_trickplay_and_chapter_images_are_made_once() {
 
 #[tokio::test]
 async fn r2chapters_nothing_is_made_where_a_library_turns_it_off() {
-    if !have_ffmpeg() {
-        eprintln!("skipped: no ffmpeg");
+    if !ffmpeg_or_skip() {
         return;
     }
     let dir = TempDir::new("r2chapters_off");
     let clip = make_clip(&dir.0);
     let data = dir.0.join("data");
     let (pool, _lib, item) = movie_db(&dir.0, &clip).await;
-    let made = rustyfin_core::trickplay::generate_for_libraries(&pool, &data, &[])
+    let made = rustyfin_core::trickplay::generate_for_libraries(&pool, &data, &[], &go())
         .await
         .unwrap();
     assert_eq!(made, 0);
@@ -218,8 +231,7 @@ async fn r2chapters_nothing_is_made_where_a_library_turns_it_off() {
 
 #[tokio::test]
 async fn r2chapters_reread_fills_chapters_once() {
-    if !have_ffmpeg() {
-        eprintln!("skipped: no ffmpeg");
+    if !ffmpeg_or_skip() {
         return;
     }
     let dir = TempDir::new("r2chapters_reread");
@@ -231,7 +243,7 @@ async fn r2chapters_reread_fills_chapters_once() {
         .await
         .unwrap();
 
-    let with_chapters = rustyfin_core::chapter_images::reread_chapters(&pool)
+    let with_chapters = rustyfin_core::chapter_images::reread_chapters(&pool, &go())
         .await
         .unwrap();
     assert_eq!(with_chapters, 1);
@@ -248,4 +260,213 @@ async fn r2chapters_reread_fills_chapters_once() {
             .unwrap()
             .is_empty()
     );
+}
+
+/// Adds a movie at `path` to library `lib` and returns its id.
+async fn add_movie(pool: &SqlitePool, lib: &str, path: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO media_items (id, name, media_type, path, library_id, runtime_ticks)
+         VALUES (?1, 'Other', 'Movie', ?2, ?3, 350000000)",
+    )
+    .bind(id.to_string())
+    .bind(path)
+    .bind(lib)
+    .execute(pool)
+    .await
+    .unwrap();
+    id
+}
+
+/// Moves the modified time of the file at `path` an hour on, as a replaced file would have.
+fn touch_later(path: &str) {
+    let file = std::fs::File::options().write(true).open(path).unwrap();
+    let later = file.metadata().unwrap().modified().unwrap() + std::time::Duration::from_secs(3600);
+    file.set_modified(later).unwrap();
+}
+
+#[tokio::test]
+async fn r2chapters_failed_trickplay_waits_for_the_file_to_change() {
+    use rustyfin_core::trickplay::{FAILURE_KIND, file_version, generate_for_libraries};
+    use rustyfin_db::repo_trickplay::{get_failure, record_failure};
+    if !ffmpeg_or_skip() {
+        return;
+    }
+    let dir = TempDir::new("r2chapters_failures");
+    let clip = make_clip(&dir.0);
+    let data = dir.0.join("data");
+    let (pool, lib, item) = movie_db(&dir.0, &clip).await;
+    let junk = dir.0.join("junk.mkv");
+    std::fs::write(&junk, b"not a video").unwrap();
+    let junk = junk.to_string_lossy().into_owned();
+    let broken = add_movie(&pool, &lib, &junk).await;
+    let libs = [lib];
+
+    // The clip failed before on this very file, so it isn't tried; the junk fails and is recorded.
+    record_failure(&pool, item, FAILURE_KIND, file_version(&clip).await)
+        .await
+        .unwrap();
+    assert_eq!(
+        generate_for_libraries(&pool, &data, &libs, &go())
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        get_failure(&pool, broken, FAILURE_KIND).await.unwrap(),
+        Some(file_version(&junk).await)
+    );
+    assert!(!data.join("trickplay").join(item.to_string()).exists());
+
+    // Once the clip's file changes it is tried again; the junk, unchanged, still isn't.
+    touch_later(&clip);
+    assert_eq!(
+        generate_for_libraries(&pool, &data, &libs, &go())
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(get_failure(&pool, item, FAILURE_KIND).await.unwrap(), None);
+    assert!(
+        rustyfin_db::repo_trickplay::get_trickplay(&pool, broken)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // A refresh that replaces all images forgets the junk's failure.
+    rustyfin_db::repo_trickplay::clear_failures(&pool, broken)
+        .await
+        .unwrap();
+    assert_eq!(
+        get_failure(&pool, broken, FAILURE_KIND).await.unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn r2chapters_failed_chapter_images_wait_for_the_file_to_change() {
+    if !ffmpeg_or_skip() {
+        return;
+    }
+    let dir = TempDir::new("r2chapters_chapter_failures");
+    let junk = dir.0.join("junk.mkv");
+    std::fs::write(&junk, b"not a video").unwrap();
+    let junk = junk.to_string_lossy().into_owned();
+    let data = dir.0.join("data");
+    let (pool, lib, item) = movie_db(&dir.0, &junk).await;
+    let chapter = rustyfin_model::chapter::Chapter {
+        id: Uuid::new_v4().to_string(),
+        item_id: item.to_string(),
+        chapter_number: 1,
+        name: "One".to_string(),
+        start_position_ticks: 0,
+        end_position_ticks: 10_000_000,
+        image_path: None,
+        image_date_modified: None,
+    };
+    let save = || rustyfin_db::repo_chapter::save_chapters(&pool, item, vec![chapter.clone()]);
+    save().await.unwrap();
+    let libs = [lib];
+    let never = go();
+    let run = || rustyfin_core::chapter_images::extract_for_libraries(&pool, &data, &libs, &never);
+
+    assert_eq!(run().await.unwrap(), 0);
+    let missing = || rustyfin_db::repo_chapter::items_missing_chapter_images(&pool, &libs, 10);
+    assert!(missing().await.unwrap().is_empty(), "the failure is marked");
+    assert_eq!(run().await.unwrap(), 0);
+
+    // A re-probe of a changed file replaces the chapters, so they are tried again.
+    save().await.unwrap();
+    assert_eq!(missing().await.unwrap().len(), 1);
+    assert_eq!(run().await.unwrap(), 0);
+    // So does a refresh that replaces all images.
+    rustyfin_db::repo_trickplay::clear_failures(&pool, item)
+        .await
+        .unwrap();
+    assert_eq!(missing().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn r2chapters_old_tiles_and_chapter_images_are_removed() {
+    use rustyfin_core::trickplay::{generate_for_libraries, remove_item_files, sweep_unused_files};
+    if !ffmpeg_or_skip() {
+        return;
+    }
+    let dir = TempDir::new("r2chapters_cleanup");
+    let clip = make_clip(&dir.0);
+    let data = dir.0.join("data");
+    let (pool, lib, item) = movie_db(&dir.0, &clip).await;
+    let libs = [lib];
+    let tiles = data.join("trickplay").join(item.to_string());
+    let images = data.join("chapters").join(item.to_string());
+    let make_all = || async {
+        rustyfin_core::probe::probe_and_save(&pool, &item, &clip)
+            .await
+            .unwrap();
+        generate_for_libraries(&pool, &data, &libs, &go())
+            .await
+            .unwrap();
+        rustyfin_core::chapter_images::extract_for_libraries(&pool, &data, &libs, &go())
+            .await
+            .unwrap();
+        assert!(tiles.exists() && images.exists());
+    };
+
+    // The file changed and was probed again: its tile set and chapter images are dropped, and
+    // the sweep removes their files.
+    make_all().await;
+    rustyfin_core::probe::probe_and_save(&pool, &item, &clip)
+        .await
+        .unwrap();
+    assert!(
+        rustyfin_db::repo_trickplay::get_trickplay(&pool, item)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    sweep_unused_files(&pool, &data).await.unwrap();
+    assert!(!tiles.exists());
+    assert!(!images.exists());
+
+    // The item is deleted: its rows go with it, and the sweep removes its files.
+    make_all().await;
+    sqlx::query("DELETE FROM media_items WHERE id = ?1")
+        .bind(item.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    sweep_unused_files(&pool, &data).await.unwrap();
+    assert!(!tiles.exists() && !images.exists());
+
+    // Deleting through the API removes them at once.
+    std::fs::create_dir_all(&tiles).unwrap();
+    std::fs::create_dir_all(&images).unwrap();
+    remove_item_files(&data, item).await;
+    assert!(!tiles.exists() && !images.exists());
+}
+
+#[tokio::test]
+async fn r2chapters_a_cancelled_run_makes_and_records_nothing() {
+    if !ffmpeg_or_skip() {
+        return;
+    }
+    let dir = TempDir::new("r2chapters_cancel");
+    let clip = make_clip(&dir.0);
+    let data = dir.0.join("data");
+    let (pool, lib, item) = movie_db(&dir.0, &clip).await;
+    let stopped = Cancel::new();
+    stopped.cancel();
+    let made = rustyfin_core::trickplay::generate_for_libraries(&pool, &data, &[lib], &stopped)
+        .await
+        .unwrap();
+    assert_eq!(made, 0);
+    let failure = rustyfin_db::repo_trickplay::get_failure(
+        &pool,
+        item,
+        rustyfin_core::trickplay::FAILURE_KIND,
+    )
+    .await
+    .unwrap();
+    assert_eq!(failure, None, "a stop is not a failure");
 }

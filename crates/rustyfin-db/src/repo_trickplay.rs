@@ -165,6 +165,70 @@ pub async fn items_missing_trickplay(
         .collect())
 }
 
+/// The file version (size, modified seconds) an item's last `kind` image job failed on, if any.
+pub async fn get_failure(
+    pool: &SqlitePool,
+    item_id: Uuid,
+    kind: &str,
+) -> Result<Option<(i64, i64)>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT file_size, file_mtime FROM video_image_failures WHERE item_id = ?1 AND kind = ?2",
+    )
+    .bind(item_id.to_string())
+    .bind(kind)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Records that an item's `kind` image job failed on the file at `version` (size, modified
+/// seconds), so it isn't tried again until the file changes.
+pub async fn record_failure(
+    pool: &SqlitePool,
+    item_id: Uuid,
+    kind: &str,
+    version: (i64, i64),
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT OR REPLACE INTO video_image_failures (item_id, kind, file_size, file_mtime)
+         VALUES (?1, ?2, ?3, ?4)",
+    )
+    .bind(item_id.to_string())
+    .bind(kind)
+    .bind(version.0)
+    .bind(version.1)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Forgets an item's `kind` failure.
+pub async fn clear_failure(
+    pool: &SqlitePool,
+    item_id: Uuid,
+    kind: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM video_image_failures WHERE item_id = ?1 AND kind = ?2")
+        .bind(item_id.to_string())
+        .bind(kind)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Forgets every image failure of an item, and its chapters' failed-image marks, so they are
+/// tried again: for a changed file, or a refresh that replaces all images.
+pub async fn clear_failures(pool: &SqlitePool, item_id: Uuid) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM video_image_failures WHERE item_id = ?1")
+        .bind(item_id.to_string())
+        .execute(pool)
+        .await?;
+    sqlx::query("UPDATE chapters SET image_path = NULL WHERE item_id = ?1 AND image_path = ''")
+        .bind(item_id.to_string())
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// Deletes all of an item's tile sets.
 pub async fn delete_trickplay(pool: &SqlitePool, item_id: Uuid) -> Result<(), sqlx::Error> {
     sqlx::query("DELETE FROM trickplay_infos WHERE item_id = ?1")
