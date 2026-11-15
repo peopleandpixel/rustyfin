@@ -451,6 +451,13 @@ async fn main() {
         task_scheduler.start(shutdown_rx);
     }
 
+    // Grid pictures: a pass now for pictures stored before, then one after each scan or refresh
+    rustyfin_core::image_warmer::start(
+        state.db.clone(),
+        state.data_dir.to_path_buf(),
+        state.http_client.clone(),
+    );
+
     // A wizard import queued before a restart resumes here; the job runs in its own task (B119).
     rustyfin_api::wizard_import::resume(&state).await;
 

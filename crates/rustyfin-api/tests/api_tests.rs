@@ -4055,13 +4055,626 @@ async fn b30_f6_only_a_tagged_request_is_cached_for_long() {
         let uri = format!("/Items/{id}/Images/Primary?{bounds}tag={tag}");
         let (status, cache_control, _) = b30_get_cached(&app, &uri, &token).await;
         assert_eq!(status, StatusCode::OK, "{uri}");
-        assert_eq!(cache_control, "public, max-age=86400", "{uri}");
+        // B152: a current tag names this exact picture for good
+        assert_eq!(
+            cache_control, "public, max-age=31536000, immutable",
+            "{uri}"
+        );
         // Without the tag, the answer may not be kept long: the picture can change under its URL.
         let uri = format!("/Items/{id}/Images/Primary?{bounds}");
         let (status, cache_control, _) = b30_get_cached(&app, &uri, &token).await;
         assert_eq!(status, StatusCode::OK, "{uri}");
         assert_eq!(cache_control, "public, max-age=300", "{uri}");
     }
+}
+
+// B152: ImageBlurHashes has Jellyfin's shape ({type: {tag: hash}}), and lists carry stored hashes
+#[tokio::test]
+async fn b152_blur_hashes_are_keyed_by_type_and_tag_in_details_and_lists() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let id = b30_photo(&state).await;
+    let app = app(state.clone());
+    b30_upload(&app, &token, id, &b30_jpeg(64, 96, [200, 30, 30])).await;
+    let tag = b30_primary_tag(&app, &token, id, "Photo").await;
+    let listed = || async {
+        let uri = "/Items?IncludeItemTypes=Photo&Recursive=true";
+        let (status, list) = send_authed(&app, "GET", uri, &token, None).await;
+        assert_eq!(status, StatusCode::OK, "{list}");
+        list["Items"][0]["ImageBlurHashes"].clone()
+    };
+
+    // Details compute a missing hash; a list only sends stored ones
+    let (status, details) = send_authed(&app, "GET", &format!("/Items/{id}"), &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{details}");
+    let hashes = details["ImageBlurHashes"].as_object().unwrap();
+    assert_eq!(hashes.keys().collect::<Vec<_>>(), ["Primary"], "{details}");
+    let by_tag = hashes["Primary"].as_object().unwrap();
+    assert_eq!(by_tag.keys().collect::<Vec<_>>(), [&tag], "{details}");
+    let hash = by_tag[&tag].as_str().unwrap();
+    assert!(blurhash::decode(hash, 4, 4, 1.0).is_ok(), "{hash}");
+    assert_eq!(listed().await, serde_json::json!({}));
+
+    // The image warmer stores it, and the list sends it from then on
+    let report =
+        rustyfin_core::image_warmer::warm_pass(&state.db, &state.data_dir, &state.http_client)
+            .await
+            .unwrap();
+    assert_eq!(report.hashed, 1, "{report:?}");
+    let hashes = listed().await;
+    let stored = hashes["Primary"][&tag]
+        .as_str()
+        .unwrap_or_else(|| panic!("{hashes}"));
+    assert!(blurhash::decode(stored, 4, 4, 1.0).is_ok(), "{stored}");
+}
+
+// B152: the web client's library index (Fields given empty, EnableUserData=false,
+// EnableImageTypes=Primary, ImageTypeLimit=1) carries names, the Primary tag and BlurHash, no user
+// data, no optional fields and no null fields (as Jellyfin)
+#[tokio::test]
+async fn b152_a_lean_list_has_names_pictures_and_blurhashes_only() {
+    use rustyfin_model::image::ImageType::Backdrop;
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let id = b30_photo(&state).await;
+    let app = app(state.clone());
+    b30_upload(&app, &token, id, &b30_jpeg(64, 96, [200, 30, 30])).await;
+    let backdrop = state.data_dir.join("b152-backdrop.jpg");
+    b30_set_image(&state, id, Backdrop, &backdrop.to_string_lossy(), Some(3)).await;
+    rustyfin_core::image_warmer::warm_pass(&state.db, &state.data_dir, &state.http_client)
+        .await
+        .unwrap();
+    let tag = b30_primary_tag(&app, &token, id, "Photo").await;
+
+    let uri = "/Items?IncludeItemTypes=Photo&Recursive=true";
+    let (status, full) = send_authed(&app, "GET", uri, &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{full}");
+    let uri =
+        format!("{uri}&Fields=&EnableUserData=false&EnableImageTypes=Primary&ImageTypeLimit=1");
+    let (status, lean) = send_authed(&app, "GET", &uri, &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{lean}");
+    for optional in [
+        "Overview",
+        "Genres",
+        "Tags",
+        "Studios",
+        "People",
+        "ProviderIds",
+        "Path",
+    ] {
+        assert!(
+            lean["Items"][0].get(optional).is_none(),
+            "{optional}: {lean}"
+        );
+    }
+
+    assert_eq!(lean["TotalRecordCount"], full["TotalRecordCount"]);
+    let item = &lean["Items"][0];
+    let fields = item.as_object().unwrap();
+    assert_eq!(item["Id"], full["Items"][0]["Id"]);
+    assert_eq!(item["Name"], "B30 Photo");
+    assert_eq!(item["Type"], full["Items"][0]["Type"]);
+    assert_eq!(
+        item["ImageTags"],
+        serde_json::json!({ "Primary": tag }),
+        "{item}"
+    );
+    assert_eq!(item["BackdropImageTags"], serde_json::json!([]), "{item}");
+    let hash = item["ImageBlurHashes"]["Primary"][&tag]
+        .as_str()
+        .unwrap_or_else(|| panic!("{item}"));
+    assert!(blurhash::decode(hash, 4, 4, 1.0).is_ok());
+    assert!(!fields.contains_key("UserData"), "{item}");
+    assert!(
+        fields.values().all(|v| !v.is_null()),
+        "no null fields: {item}"
+    );
+    assert!(
+        item.to_string().len() * 2 < full["Items"][0].to_string().len(),
+        "the lean item is less than half the full one"
+    );
+    // The full list keeps its shape: user data and every field
+    assert!(
+        full["Items"][0]
+            .as_object()
+            .unwrap()
+            .contains_key("UserData")
+    );
+}
+
+// B152 round 9-10: a copy at a grid width not made yet is answered with the pre-generated grid
+// master at once (its ETag names the master; kept 5 minutes, not as immutable), and made in the
+// background; the next request gets the copy, immutable. Other widths are rendered when asked.
+#[tokio::test]
+async fn b152_a_grid_copy_not_made_yet_is_served_by_the_master() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let id = b30_photo(&state).await;
+    let app = app(state.clone());
+    b30_upload(&app, &token, id, &b30_jpeg(640, 960, [30, 200, 30])).await;
+    rustyfin_core::image_warmer::warm_pass(&state.db, &state.data_dir, &state.http_client)
+        .await
+        .unwrap();
+    // A server warmed before the grid copies existed: the master only
+    let cache = state.data_dir.join("cache").join("images");
+    for entry in std::fs::read_dir(&cache).unwrap().flatten() {
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .ends_with("_480x720.jpg")
+        {
+            std::fs::remove_file(entry.path()).unwrap();
+        }
+    }
+    let tag = b30_primary_tag(&app, &token, id, "Photo").await;
+    let get = |uri: String| {
+        let app = app.clone();
+        let token = token.clone();
+        async move {
+            let request = Request::builder()
+                .uri(&uri)
+                .header("Authorization", format!("Bearer {token}"));
+            let resp = app
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let header = |name: &str| {
+                resp.headers()
+                    .get(name)
+                    .map(|v| v.to_str().unwrap().to_string())
+                    .unwrap_or_default()
+            };
+            let (etag, cache_control) = (header("etag"), header("cache-control"));
+            let status = resp.status();
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            (status, etag, cache_control, body)
+        }
+    };
+
+    // A width the warmer doesn't make: rendered now, at its size, kept as immutable
+    let uri = format!("/Items/{id}/Images/Primary?maxWidth=200&tag={tag}");
+    let (status, etag, cache_control, body) = get(uri).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(etag, format!("\"{tag}-200x300\""));
+    assert!(cache_control.contains("immutable"), "{cache_control}");
+    let img = image::load_from_memory(&body).unwrap();
+    assert_eq!(img.width(), 200);
+
+    // A grid width: the master at once, kept briefly
+    let uri = format!("/Items/{id}/Images/Primary?maxWidth=320&tag={tag}");
+    let (status, etag, cache_control, body) = get(uri.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(etag, format!("\"{tag}-480x720\""), "the master's ETag");
+    assert_eq!(cache_control, "public, max-age=300", "not immutable");
+    let img = image::load_from_memory(&body).unwrap();
+    assert_eq!(
+        (img.width(), img.height()),
+        (480, 720),
+        "the master's bytes"
+    );
+
+    // The copy is made in the background; then the same URL gets it, with its own ETag
+    let mut copy = None;
+    for _ in 0..100 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let (_, etag, cache_control, body) = get(uri.clone()).await;
+        if etag != format!("\"{tag}-480x720\"") {
+            copy = Some((etag, cache_control, body));
+            break;
+        }
+    }
+    let (etag, cache_control, body) = copy.expect("the copy was made within 5 s");
+    assert_eq!(etag, format!("\"{tag}-320x480\""));
+    assert!(cache_control.contains("immutable"), "{cache_control}");
+    let img = image::load_from_memory(&body).unwrap();
+    assert_eq!((img.width(), img.height()), (320, 480));
+}
+
+// B152 round 9: RustyfinCardIndex=true (a Rustyfin extension) answers with only what a poster
+// card shows, under 300 bytes an item; the same request without it keeps Jellyfin's base DTO
+#[tokio::test]
+async fn b152_a_card_index_has_only_what_a_card_shows() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let id = b30_photo(&state).await;
+    let app = app(state.clone());
+    b30_upload(&app, &token, id, &b30_jpeg(64, 96, [200, 30, 30])).await;
+    rustyfin_core::image_warmer::warm_pass(&state.db, &state.data_dir, &state.http_client)
+        .await
+        .unwrap();
+    let tag = b30_primary_tag(&app, &token, id, "Photo").await;
+
+    let base = "/Items?IncludeItemTypes=Photo&Recursive=true&Fields=&EnableUserData=false\
+                &EnableImageTypes=Primary&ImageTypeLimit=1";
+    let (status, jellyfin) = send_authed(&app, "GET", base, &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{jellyfin}");
+    let uri = format!("{base}&RustyfinCardIndex=true");
+    let (status, cards) = send_authed(&app, "GET", &uri, &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{cards}");
+
+    assert_eq!(cards["TotalRecordCount"], jellyfin["TotalRecordCount"]);
+    let item = &cards["Items"][0];
+    let keys: Vec<&str> = item
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let allowed = [
+        "Id",
+        "Name",
+        "SortName",
+        "Type",
+        "ProductionYear",
+        "CommunityRating",
+        "IndexNumber",
+        "IndexNumberEnd",
+        "ParentIndexNumber",
+        "SeriesName",
+        "ImageTags",
+        "ImageBlurHashes",
+    ];
+    assert!(keys.iter().all(|k| allowed.contains(k)), "{item}");
+    assert_eq!(item["Id"], jellyfin["Items"][0]["Id"]);
+    assert_eq!(item["Name"], "B30 Photo");
+    assert_eq!(item["Type"], jellyfin["Items"][0]["Type"]);
+    assert_eq!(item["ImageTags"], serde_json::json!({ "Primary": tag }));
+    assert_eq!(
+        item["ImageBlurHashes"]["Primary"][&tag],
+        jellyfin["Items"][0]["ImageBlurHashes"]["Primary"][&tag]
+    );
+    assert!(
+        item.as_object().unwrap().values().all(|v| !v.is_null()),
+        "{item}"
+    );
+    assert!(
+        item.to_string().len() < 300,
+        "{} bytes: {item}",
+        item.to_string().len()
+    );
+    // Without the extension, the answer is Jellyfin's base DTO, as other clients expect
+    assert!(
+        jellyfin["Items"][0]
+            .as_object()
+            .unwrap()
+            .contains_key("CanDelete"),
+        "{jellyfin}"
+    );
+}
+
+// B152 round 10: the card index lists the same items as the normal list for a user who isn't an
+// administrator, per-user filters included (Rustyfin has no library-access or parental-rating
+// limits; the per-user favourites are the per-user filter there is), and an episode card carries
+// its IndexNumberEnd
+#[tokio::test]
+async fn b152_a_card_index_lists_what_the_list_lists_for_a_plain_user() {
+    let state = test_state().await;
+    let folder = media_folder(&state, "b152 cards");
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: "B152 Cards".to_string(),
+        content_type: rustyfin_model::library::LibraryContentType::Movies,
+        paths: vec![folder.clone()],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    let mut ids = Vec::new();
+    for (name, kind, numbers) in [
+        ("Alpha", "Movie", None),
+        ("Beta", "Movie", None),
+        ("Gamma", "Movie", None),
+        ("Delta E1-2", "Episode", Some((1, 2))),
+    ] {
+        let id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO media_items (id, library_id, name, media_type, path, index_number, \
+             index_number_end) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(id.to_string())
+        .bind(lib.id.to_string())
+        .bind(name)
+        .bind(kind)
+        .bind(format!("{folder}/{name}.mkv"))
+        .bind(numbers.map(|(first, _)| first))
+        .bind(numbers.map(|(_, last)| last))
+        .execute(&state.db)
+        .await
+        .unwrap();
+        ids.push(id);
+    }
+    let (token, user) = j6_user_session(&state).await;
+    let (other_token, other) = j6_user_session(&state).await;
+    let app = app(state.clone());
+    // The user's favourite, and another user's
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        &format!("/Users/{user}/FavoriteItems/{}", ids[1]),
+        &token,
+        None,
+    )
+    .await;
+    assert!(status.is_success(), "{status}");
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        &format!("/Users/{other}/FavoriteItems/{}", ids[2]),
+        &other_token,
+        None,
+    )
+    .await;
+    assert!(status.is_success(), "{status}");
+
+    let listed = |body: &serde_json::Value| -> Vec<String> {
+        body["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["Id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    for filter in ["", "&IsFavorite=true"] {
+        let base = format!(
+            "/Items?LibraryId={}&Recursive=true&SortBy=SortName&Fields=&EnableUserData=false{filter}",
+            lib.id
+        );
+        let (status, plain) = send_authed(&app, "GET", &base, &token, None).await;
+        assert_eq!(status, StatusCode::OK, "{plain}");
+        let (status, cards) = send_authed(
+            &app,
+            "GET",
+            &format!("{base}&RustyfinCardIndex=true"),
+            &token,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{cards}");
+        assert_eq!(listed(&cards), listed(&plain), "{filter}");
+        assert_eq!(
+            cards["TotalRecordCount"], plain["TotalRecordCount"],
+            "{filter}"
+        );
+        if filter.is_empty() {
+            assert_eq!(listed(&cards).len(), 4);
+            let episode = cards["Items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["Id"] == ids[3].to_string())
+                .unwrap();
+            assert_eq!(
+                (
+                    episode["IndexNumber"].clone(),
+                    episode["IndexNumberEnd"].clone()
+                ),
+                (1.into(), 2.into())
+            );
+        } else {
+            assert_eq!(
+                listed(&cards),
+                vec![ids[1].to_string()],
+                "only the user's own favourite"
+            );
+        }
+    }
+}
+
+// B152 F13: EnableUserData=false leaves out UserData and nothing else, as in Jellyfin: a
+// third-party request with normal Fields gets the same movie, series and episode fields as without
+// it (no lean answer), and the episode keeps its series fields
+#[tokio::test]
+async fn b152_enable_user_data_false_drops_only_user_data() {
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    let app = app(state.clone());
+    let base = "/Items?Recursive=true&IncludeItemTypes=Movie,Series,Episode&SortBy=SortName\
+                &Fields=ChildCount,ProviderIds,Overview,PrimaryImageAspectRatio";
+    let (status, full) = send_authed(&app, "GET", base, &lib.token, None).await;
+    assert_eq!(status, StatusCode::OK, "{full}");
+    let uri = format!("{base}&EnableUserData=false");
+    let (status, without) = send_authed(&app, "GET", &uri, &lib.token, None).await;
+    assert_eq!(status, StatusCode::OK, "{without}");
+
+    let items = |body: &serde_json::Value| body["Items"].as_array().unwrap().clone();
+    let (full, without) = (items(&full), items(&without));
+    let ids: Vec<_> = full.iter().map(|i| i["Id"].clone()).collect();
+    for id in [lib.movie, lib.series, lib.episode] {
+        assert!(ids.contains(&serde_json::json!(id)), "{id} listed");
+    }
+    assert_eq!(full.len(), without.len());
+    for (a, b) in full.iter().zip(&without) {
+        let mut a = a.as_object().unwrap().clone();
+        let mut b = b.as_object().unwrap().clone();
+        assert!(b["UserData"].is_null(), "no user data: {b:?}");
+        if a["Id"] == serde_json::json!(lib.episode) {
+            assert!(
+                a["UserData"].is_object(),
+                "an episode always has user data: {a:?}"
+            );
+        }
+        a.remove("UserData");
+        b.remove("UserData");
+        let b = &b;
+        // The same keys and values, the per-user ones aside
+        let differ: Vec<&String> = a
+            .keys()
+            .chain(b.keys())
+            .filter(|k| a.get(*k) != b.get(*k))
+            .collect();
+        assert!(differ.is_empty(), "{}: {differ:?}", a["Type"]);
+    }
+    let episode = without
+        .iter()
+        .find(|i| i["Id"] == serde_json::json!(lib.episode))
+        .unwrap();
+    assert_eq!(
+        episode["SeriesId"],
+        serde_json::json!(lib.series),
+        "{episode}"
+    );
+    assert!(episode["SeriesName"].is_string(), "{episode}");
+}
+
+// B152 F14: EnableImageTypes naming no known type keeps every image (Jellyfin applies it only when
+// it holds a type); EnableImages=false sends none
+#[tokio::test]
+async fn b152_image_options_follow_jellyfin() {
+    use rustyfin_model::image::ImageType::Backdrop;
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let id = b30_photo(&state).await;
+    let app = app(state.clone());
+    b30_upload(&app, &token, id, &b30_jpeg(64, 96, [200, 30, 30])).await;
+    for (i, stamp) in [(0, 3), (1, 4)] {
+        let path = state.data_dir.join(format!("b152-backdrop-{i}.jpg"));
+        let image = rustyfin_model::image::ItemImage {
+            item_id: id,
+            image_type: Backdrop,
+            image_index: i,
+            path: path.to_string_lossy().into_owned(),
+            provider: "local".to_string(),
+            width: None,
+            height: None,
+            blurhash: None,
+            stamp: Some(stamp),
+        };
+        rustyfin_db::repo_image::upsert_image(&state.db, &image)
+            .await
+            .unwrap();
+    }
+    let get = |query: &'static str| {
+        let app = app.clone();
+        let token = token.clone();
+        async move {
+            let uri = format!("/Items?IncludeItemTypes=Photo&Recursive=true{query}");
+            let (status, body) = send_authed(&app, "GET", &uri, &token, None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            body["Items"][0].clone()
+        }
+    };
+    let all = get("").await;
+    assert_eq!(
+        all["BackdropImageTags"].as_array().unwrap().len(),
+        2,
+        "{all}"
+    );
+    for query in [
+        "&EnableImageTypes=",
+        "&EnableImageTypes=Foo",
+        "&enableImageTypes=Foo,",
+    ] {
+        let item = get(query).await;
+        assert_eq!(item["ImageTags"], all["ImageTags"], "{query}");
+        assert_eq!(
+            item["BackdropImageTags"], all["BackdropImageTags"],
+            "{query}"
+        );
+    }
+    let one = get("&ImageTypeLimit=1").await;
+    assert_eq!(
+        one["BackdropImageTags"].as_array().unwrap().len(),
+        1,
+        "{one}"
+    );
+    assert_eq!(one["ImageTags"], all["ImageTags"]);
+    let backdrops = get("&EnableImageTypes=Backdrop").await;
+    assert!(
+        backdrops["ImageTags"].get("Primary").is_none(),
+        "{backdrops}"
+    );
+    assert_eq!(backdrops["BackdropImageTags"], all["BackdropImageTags"]);
+    let none = get("&EnableImages=false").await;
+    assert_eq!(none["ImageTags"], serde_json::json!({}), "{none}");
+    assert_eq!(none["BackdropImageTags"], serde_json::json!([]), "{none}");
+    assert_eq!(none["ImageBlurHashes"], serde_json::json!({}), "{none}");
+}
+
+// B152: images answer If-None-Match with 304, and only a current tag is kept for good
+#[tokio::test]
+async fn b152_images_carry_an_etag_and_answer_304_when_unchanged() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let id = b30_photo(&state).await;
+    let app = app(state);
+    b30_upload(&app, &token, id, &b30_jpeg(64, 96, [255, 0, 0])).await;
+    let tag = b30_primary_tag(&app, &token, id, "Photo").await;
+
+    let get = |uri: String, if_none_match: Option<String>| {
+        let app = app.clone();
+        let token = token.clone();
+        async move {
+            let mut request = Request::builder()
+                .uri(&uri)
+                .header("Authorization", format!("Bearer {token}"));
+            if let Some(etag) = if_none_match {
+                request = request.header("If-None-Match", etag);
+            }
+            let resp = app
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let header = |name: &str| {
+                resp.headers()
+                    .get(name)
+                    .map(|v| v.to_str().unwrap().to_string())
+                    .unwrap_or_default()
+            };
+            let (status, etag, cache_control) =
+                (resp.status(), header("etag"), header("cache-control"));
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            (status, etag, cache_control, body.len())
+        }
+    };
+
+    let mut etags = Vec::new();
+    for bounds in ["", "maxWidth=32&"] {
+        let uri = format!("/Items/{id}/Images/Primary?{bounds}tag={tag}");
+        let (status, etag, _, len) = get(uri.clone(), None).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert!(
+            len > 0 && etag.starts_with('"') && etag.ends_with('"'),
+            "{uri}: {etag}"
+        );
+        // The same picture asked again with its ETag: 304, no body, the same caching
+        for sent in [
+            etag.clone(),
+            format!("W/{etag}"),
+            format!("\"other\", {etag}"),
+            "*".into(),
+        ] {
+            let (status, again, cache_control, len) = get(uri.clone(), Some(sent.clone())).await;
+            assert_eq!(status, StatusCode::NOT_MODIFIED, "{uri} with {sent}");
+            assert_eq!(
+                (again.as_str(), len),
+                (etag.as_str(), 0),
+                "{uri} with {sent}"
+            );
+            assert_eq!(cache_control, "public, max-age=31536000, immutable");
+        }
+        let (status, _, _, _) = get(uri.clone(), Some("\"other\"".into())).await;
+        assert_eq!(status, StatusCode::OK, "{uri} with another ETag");
+        etags.push(etag);
+    }
+    assert_ne!(etags[0], etags[1], "each size has its own ETag");
+
+    // A stale tag still gets the picture, but only for a short while: it may be the wrong one
+    let uri =
+        format!("/Items/{id}/Images/Primary?maxWidth=32&tag=0123456789abcdef0123456789abcdef");
+    let (status, etag, cache_control, _) = get(uri, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        etag, etags[1],
+        "the ETag names the picture sent, whatever the URL's tag"
+    );
+    assert_eq!(cache_control, "public, max-age=300");
+
+    // A new picture gets a new ETag, so the old one no longer matches
+    b30_upload(&app, &token, id, &b30_jpeg(64, 96, [0, 0, 255])).await;
+    let uri = format!("/Items/{id}/Images/Primary?maxWidth=32");
+    let (status, etag, _, _) = get(uri, Some(etags[1].clone())).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_ne!(etag, etags[1]);
 }
 
 #[tokio::test]
@@ -4180,6 +4793,63 @@ async fn b30_f2_hint_tags_change_with_the_image() {
     );
     let details = b30_details(&app, &lib.token, lib.movie).await;
     assert_eq!(second, details["ImageTags"]["Primary"], "{details}");
+}
+
+// B152 F10: a listed episode carries the BlurHashes of the series pictures it names, as Jellyfin's
+// ImageBlurHashes does, so a card showing the series thumb paints its preview
+#[tokio::test]
+async fn b152_a_listed_episode_carries_its_series_blur_hashes() {
+    use rustyfin_core::image_proxy::image_tag;
+    use rustyfin_model::image::ImageType::{Primary, Thumb};
+
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    let app = app(state.clone());
+    let primary = state.data_dir.join("b152-series-primary.jpg");
+    let primary = primary.to_string_lossy();
+    let thumb = state.data_dir.join("b152-series-thumb.jpg");
+    let thumb = thumb.to_string_lossy();
+    b30_set_image(&state, lib.series, Primary, &primary, Some(5)).await;
+    b30_set_image(&state, lib.series, Thumb, &thumb, Some(6)).await;
+    for (image_type, path, stamp, hash) in [
+        (Primary, &primary, 5, "LKO2?U%2Tw=w"),
+        (Thumb, &thumb, 6, "L00000fQfQfQ"),
+    ] {
+        let img = rustyfin_model::image::ItemImage {
+            item_id: lib.series,
+            image_type,
+            image_index: 0,
+            path: path.to_string(),
+            provider: "local".to_string(),
+            width: None,
+            height: None,
+            blurhash: None,
+            stamp: Some(stamp),
+        };
+        assert!(
+            rustyfin_db::repo_image::set_image_blurhash(&state.db, &img, hash)
+                .await
+                .unwrap()
+        );
+    }
+
+    let uri = "/Items?IncludeItemTypes=Episode&Recursive=true";
+    let (status, list) = send_authed(&app, "GET", uri, &lib.token, None).await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let episode = list["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["Id"] == serde_json::json!(lib.episode))
+        .unwrap_or_else(|| panic!("no episode in {list}"));
+    assert_eq!(
+        episode["ImageBlurHashes"],
+        serde_json::json!({
+            "Primary": { image_tag(&primary, Some(5)): "LKO2?U%2Tw=w" },
+            "Thumb": { image_tag(&thumb, Some(6)): "L00000fQfQfQ" },
+        }),
+        "{episode}"
+    );
 }
 
 #[tokio::test]
@@ -18319,6 +18989,37 @@ fn b144_refresh_metadata() {
 #[test]
 fn b145_icons() {
     b124_node_test("b145_icons.mjs");
+}
+
+// B152: library grid images keep up with scrolling (web client)
+#[test]
+fn b152_blurhash_decoder() {
+    b124_node_test("b152_blurhash.mjs");
+}
+
+#[test]
+fn b152_poster_loader_plan() {
+    b124_node_test("b152_poster_loader.mjs");
+}
+
+#[test]
+fn b152_poster_loader_runtime() {
+    b124_node_test("b152_poster_loader_runtime.mjs");
+}
+
+#[test]
+fn b152_library_pages() {
+    b124_node_test("b152_library_pages.mjs");
+}
+
+#[test]
+fn b152_library_grid() {
+    b124_node_test("b152_library_grid.mjs");
+}
+
+#[test]
+fn b152_service_worker() {
+    b124_node_test("b152_service_worker.mjs");
 }
 
 #[test]

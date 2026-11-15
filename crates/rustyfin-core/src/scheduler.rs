@@ -575,6 +575,8 @@ impl TaskScheduler {
                         Err(e) => errors.push(format!("{}: task failed: {}", lib_name, e)),
                     }
                 }
+                // New pictures get their grid copies in the background
+                crate::image_warmer::kick();
 
                 let end = Utc::now();
                 if errors.is_empty() {

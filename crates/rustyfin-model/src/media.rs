@@ -611,9 +611,11 @@ pub struct MediaItem {
     /// Screenshot image tags for trickplay
     #[serde(default)]
     pub screenshot_image_tags: Vec<String>,
-    /// Image blur hashes
+    /// The BlurHash of each image that has one, by image type and then by image tag, as
+    /// Jellyfin's `ImageBlurHashes` has them
     #[serde(default)]
-    pub image_blur_hashes: std::collections::HashMap<String, String>,
+    pub image_blur_hashes:
+        std::collections::HashMap<String, std::collections::HashMap<String, String>>,
     /// Video 3D format
     #[serde(default)]
     pub video_3_d_format: Option<String>,

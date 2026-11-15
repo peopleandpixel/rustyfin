@@ -232,6 +232,8 @@ pub async fn scan_with_metadata(
 
     // A local image replaced in place gets its new stamp, so its tag and copies change.
     changes.images = restamp_local_images(pool, library, scope).await;
+    // New and changed pictures get their grid copies in the background
+    crate::image_warmer::kick();
 
     // Rebuild materialized filter indexes after scan completes
     // This keeps the filter_genre_index, filter_year_index, filter_rating_index up-to-date.
