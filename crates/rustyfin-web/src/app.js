@@ -155,8 +155,9 @@ async function checkSetupWizard() {
         const info = await API.getPublicInfo();
         const done = info.StartupWizardCompleted ?? info.startup_wizard_completed ?? true;
         // Update version badge with server version
-        if (info.Version || info.version) {
-            serverVersion = info.Version || info.version;
+        const reportedVersion = info.RustyfinVersion || info.Version || info.version;
+        if (reportedVersion) {
+            serverVersion = reportedVersion;
             const badge = $('version-badge');
             if (badge) badge.textContent = serverVersion;
         }
@@ -1088,7 +1089,7 @@ async function renderHome() {
             const info = await API.getPublicInfo();
             if (API.token !== session) return;
             const sn = info.ServerName || info.server_name || 'Rustyfin';
-            const ver = info.Version || info.version || serverVersion;
+            const ver = info.RustyfinVersion || info.Version || info.version || serverVersion;
             page.innerHTML = `
             <div class="flex flex-col items-center justify-center min-h-[75vh] text-center jf-page px-4">
                 <div class="relative mb-6">
@@ -2966,9 +2967,13 @@ function showLoginError(message) {
     show('login-error');
 }
 
+// The address sign-ins must start from, from the last Info call (B156).
+let oidcPublicUrl = '';
+
 // Adds the provider button below the sign-in form when OIDC is on. A failed Info call counts as off.
 async function loadOidcSignIn() {
     const info = await API.oidcInfo().catch(() => null);
+    oidcPublicUrl = info?.PublicUrl || '';
     const box = $('oidc-sign-in');
     if (!info?.Enabled || !box) return;
     const label = (info.ButtonLabel || '').trim() || t('oidc.sign_in_default');
@@ -2980,8 +2985,18 @@ async function startOidcSignIn() {
         const { AuthorizationUrl } = await API.oidcStart();
         goToOidcProvider(AuthorizationUrl);
     } catch (err) {
-        showLoginError(err.message);
+        // 409: this page is open at another address than the one the provider sends users back to
+        showLoginError(err.status === 409 && oidcPublicUrl ? t('oidc.error.wrong_address', { url: oidcPublicUrl }) : err.message);
     }
+}
+
+// Leaves a return from the provider for the home page when this page is signed in already (a session
+// from before), so it never ends on the sign-in form inside the signed-in page. The entry is replaced,
+// so Back does not return to the provider's answer.
+function leaveOidcReturnSignedIn(errorMessage) {
+    if (errorMessage) toast(errorMessage, 'error');
+    history.replaceState(null, '', '#home');
+    navigate('home');
 }
 
 // The flow is single-use, so the browser's return to #login/oidc is completed once per page load.
@@ -2992,10 +3007,15 @@ async function completeOidcSignIn() {
     oidcCompleteStarted = true;
     const completed = await API.oidcComplete().then(() => true, () => false);
     if (!completed) {
+        if (API.isLoggedIn()) {
+            leaveOidcReturnSignedIn(t('oidc.complete_failed'));
+            return;
+        }
         showLoginError(t('oidc.complete_failed'));
         history.replaceState(null, '', '#login');
         return;
     }
+    history.replaceState(null, '', '#home');
     await finishSignIn();
 }
 
@@ -3064,6 +3084,11 @@ function oidcCardHtml(enabled, account) {
 let pendingSetup = null; // { username, code } of an imported user's one-time code; memory only
 function renderLogin(data) {
     pendingSetup = null;
+    const oidcError = oidcErrorCode(data);
+    if (oidcError !== null && API.isLoggedIn()) {
+        leaveOidcReturnSignedIn(oidcErrorText(oidcError));
+        return;
+    }
     html('page-login', `
     <div class="flex justify-center items-center min-h-[70vh] jf-page px-4">
         <div class="w-full max-w-sm p-8 rounded-2xl bg-[#131822] border border-white/10 shadow-2xl">
@@ -3090,7 +3115,6 @@ function renderLogin(data) {
         </div>
     </div>`);
     loadOidcSignIn();
-    const oidcError = oidcErrorCode(data);
     if (data === 'oidc') completeOidcSignIn();
     else if (oidcError !== null) showLoginError(oidcErrorText(oidcError));
 }
@@ -3445,7 +3469,7 @@ async function renderAdmin(tab) {
                         <p class="text-[11px] text-white/40 uppercase tracking-wider mt-1">${t('nav.server')}</p>
                     </div>
                     <div class="jf-settings-card text-center">
-                        <p class="text-3xl font-black text-white">v${escapeHtml(info.Version || serverVersion)}</p>
+                        <p class="text-3xl font-black text-white">v${escapeHtml(info.RustyfinVersion || info.Version || serverVersion)}</p>
                         <p class="text-[11px] text-white/40 uppercase tracking-wider mt-1">${t('admin.release_version')}</p>
                     </div>
                     <div class="jf-settings-card text-center">
@@ -3501,7 +3525,7 @@ async function renderAdmin(tab) {
                                 return `
                             <tr>
                                 <td class="py-3 font-bold text-white">${escapeHtml(name)}</td>
-                                <td class="py-3"><label class="inline-flex items-center gap-2 text-white/80"><input type="checkbox" data-action="set-user-admin" data-id="${escapeHtml(id)}" data-name="${escapeHtml(name)}" aria-label="${escapeHtml(t('admin.administrator_for', { name }))}" ${isAdmin ? 'checked' : ''} ${locked || promoteBlocked ? 'disabled' : ''} class="w-4 h-4 rounded bg-white/10 border-white/20 text-[#00a4dc]"><span>${escapeHtml(t('admin.role_admin'))}</span></label>${isOwner ? `<span class="ml-1.5 px-2 py-0.5 rounded text-[10px] font-bold bg-[#00a4dc]/20 text-[#38bdf8]">${escapeHtml(t('admin.role_owner'))}</span>` : ''}${account?.AdminFromGroup ? `<span class="ml-1.5 text-[10px] text-white/40">${escapeHtml(t('oidc.from_group'))}</span><p class="text-[10px] text-white/40 mt-1">${escapeHtml(t('admin.group_admin_hint'))}</p>` : ''}${locked ? `<p class="text-[10px] text-white/40 mt-1">${escapeHtml(t(isOwner ? 'admin.owner_locked' : 'admin.self_locked'))}</p>` : ''}${promoteBlocked ? `<p class="text-[10px] text-white/40 mt-1">${escapeHtml(t('admin.promote_disabled_locked'))}</p>` : ''}</td>
+                                <td class="py-3"><label class="inline-flex items-center gap-2 text-white/80"><input type="checkbox" data-action="set-user-admin" data-id="${escapeHtml(id)}" data-name="${escapeHtml(name)}" aria-label="${escapeHtml(t('admin.administrator_for', { name }))}" ${isAdmin ? 'checked' : ''} ${locked || promoteBlocked ? 'disabled' : ''} class="w-4 h-4 rounded bg-white/10 border-white/20 text-[#00a4dc]">${isAdmin ? `<span class="px-2 py-0.5 rounded text-[10px] font-bold bg-[#00a4dc]/20 text-[#38bdf8]">${escapeHtml(t('admin.role_admin'))}</span>` : `<span class="text-white/40">${escapeHtml(t('admin.role_user'))}</span>`}</label>${isOwner ? `<span class="ml-1.5 px-2 py-0.5 rounded text-[10px] font-bold bg-[#00a4dc]/20 text-[#38bdf8]">${escapeHtml(t('admin.role_owner'))}</span>` : ''}${account?.AdminFromGroup ? `<span class="ml-1.5 text-[10px] text-white/40">${escapeHtml(t('oidc.from_group'))}</span><p class="text-[10px] text-white/40 mt-1">${escapeHtml(t('admin.group_admin_hint'))}</p>` : ''}${locked ? `<p class="text-[10px] text-white/40 mt-1">${escapeHtml(t(isOwner ? 'admin.owner_locked' : 'admin.self_locked'))}</p>` : ''}${promoteBlocked ? `<p class="text-[10px] text-white/40 mt-1">${escapeHtml(t('admin.promote_disabled_locked'))}</p>` : ''}</td>
                                 <td class="py-3"><input type="checkbox" data-action="set-user-disabled" data-id="${escapeHtml(id)}" data-name="${escapeHtml(name)}" aria-label="${escapeHtml(t('admin.disabled_for', { name }))}" ${u.IsDisabled ? 'checked' : ''} ${locked || disableBlocked ? 'disabled' : ''} class="w-4 h-4 rounded bg-white/10 border-white/20 text-[#00a4dc]">${disableBlocked ? `<p class="text-[10px] text-white/40 mt-1">${escapeHtml(t('admin.disable_admin_locked'))}</p>` : ''}</td>
                                 <td class="py-3 text-white/40">${escapeHtml(u.LastLoginDate || u.last_login_date || '–')}</td>
                                 <td class="py-3 text-white/60">${account?.Linked ? `${escapeHtml(account.ProviderUsername || '—')} <button type="button" class="ml-2 text-[#00a4dc] hover:text-[#38bdf8] font-semibold" data-action="oidc-remove-link" data-id="${escapeHtml(account.UserId)}" data-name="${escapeHtml(name)}">${escapeHtml(t('oidc.remove_link'))}</button>` : '<span class="text-white/40">—</span>'}</td>
@@ -3753,6 +3777,13 @@ function renderOidcAdminSettings(s) {
                 <button type="button" class="jf-btn-ghost !py-2 !px-4 text-xs whitespace-nowrap" data-action="oidc-copy-callback">${escapeHtml(t('oidc.copy'))}</button>
             </div>`
         : hint('oidc.callback_after_save');
+    // B156: the provider sends users back to the public URL only, so a sign-in from another address is refused
+    const publicOrigin = (() => { try { return new URL(s.PublicUrl).origin; } catch { return ''; } })();
+    const originWarn = (key, origin) => `<p class="text-xs text-amber-300/80 mt-1" role="alert">${escapeHtml(t(key, { origin, url: s.PublicUrl }))}</p>`;
+    const originWarnings = [
+        publicOrigin && publicOrigin !== location.origin ? originWarn('oidc.public_url_other_page', location.origin) : '',
+        s.MismatchedOrigin && s.MismatchedOrigin !== location.origin ? originWarn('oidc.public_url_other_signin', s.MismatchedOrigin) : ''
+    ].join('');
 
     box.innerHTML = `
         <h3 class="font-bold text-white text-base mb-4">${escapeHtml(t('oidc.settings_title'))}</h3>
@@ -3806,6 +3837,7 @@ function renderOidcAdminSettings(s) {
             <div>
                 ${label('oidc-public-url', 'oidc.public_url')}
                 <input id="oidc-public-url" type="text" class="jf-input w-full" value="${escapeHtml(s.PublicUrl || location.origin)}">
+                ${originWarnings}
             </div>
             <div>
                 ${label('oidc-callback-url', 'oidc.callback_url')}
@@ -5133,14 +5165,27 @@ async function submitAddUser(e) {
         toast(t('admin.name_and_password_required'), 'error');
         return;
     }
+    let created;
     try {
-        await API.createUser(name, password, isAdmin);
-        toast(t('admin.user_created', { name }));
-        closeAddUser();
-        if (currentPage === 'admin') renderAdmin();
+        created = await API.createUser(name, password);
     } catch (err) {
         toast(err.message, 'error');
+        return;
     }
+    // The server creates every user without administrator rights; a ticked box grants them separately.
+    if (isAdmin) {
+        try {
+            await API.updatePolicy(created.Id, { IsAdministrator: true });
+            toast(t('admin.user_created', { name }));
+        } catch (err) {
+            toast(t('admin.user_created_not_admin', { name, error: err.message }), 'error');
+        }
+    } else {
+        toast(t('admin.user_created', { name }));
+    }
+    closeAddUser();
+    API.invalidateCache('/Users');
+    if (currentPage === 'admin') renderAdmin();
 }
 
 // --- Auth UI Sync ---

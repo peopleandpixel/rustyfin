@@ -142,7 +142,8 @@ async fn create_user(
         id: Uuid::new_v4(),
         name: req.name,
         password_hash: hash,
-        is_administrator: req.is_administrator.unwrap_or(false),
+        // As in Jellyfin, a new user is never an administrator; POST /Users/{id}/Policy grants that.
+        is_administrator: false,
         created_at: Utc::now(),
         last_login_date: None,
         configuration: serde_json::Value::Object(Default::default()),

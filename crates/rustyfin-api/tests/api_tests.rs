@@ -162,6 +162,59 @@ async fn test_public_info_endpoint() {
     assert_eq!(info["Id"], "test-server-id");
 }
 
+// B130: Jellyfin clients' server check (jellyfin-sdk-kotlin RecommendedServerDiscovery)
+
+/// Asserts the fields the Jellyfin SDK checks: the product name, and a version of three or four
+/// numeric parts at or above 12.0.0 (SDK 1.9's minimum). Rustyfin's own version is separate.
+fn b130_assert_jellyfin_identity(info: &serde_json::Value) {
+    assert_eq!(info["ProductName"], "Jellyfin Server", "{info}");
+    let version = info["Version"].as_str().expect("Version is a string");
+    let parts: Vec<u32> = version
+        .split('.')
+        .map(|part| part.parse().expect("numeric version part"))
+        .collect();
+    assert!(matches!(parts.len(), 3 | 4), "{version}");
+    assert!(parts[..3] >= [12, 0, 0][..], "{version}");
+    assert_eq!(info["RustyfinVersion"], env!("CARGO_PKG_VERSION"), "{info}");
+}
+
+#[tokio::test]
+async fn b130_public_info_passes_the_sdk_server_check() {
+    let state = test_state().await;
+    let (status, body) = j1_get(&state, "/System/Info/Public", &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    let info: serde_json::Value = serde_json::from_str(&body).unwrap();
+    b130_assert_jellyfin_identity(&info);
+    assert_eq!(info["Id"], "test-server-id");
+    assert!(info["ServerName"].is_string());
+    assert!(info["StartupWizardCompleted"].is_boolean());
+    // Jellyfin no longer sets OperatingSystem and sends it empty; so does Rustyfin.
+    assert_eq!(info["OperatingSystem"], "", "{info}");
+    // Bound to 0.0.0.0, there is no address a client could reach.
+    assert!(info.get("LocalAddress").is_none(), "{info}");
+}
+
+#[tokio::test]
+async fn b130_public_info_local_address_follows_a_specific_bind() {
+    let mut state = test_state().await;
+    state.bind_addr = Arc::new("127.0.0.1:8102".to_string());
+    let (status, body) = j1_get(&state, "/System/Info/Public", &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    let info: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(info["LocalAddress"], "http://127.0.0.1:8102", "{info}");
+}
+
+#[tokio::test]
+async fn b130_full_info_reports_the_same_identity() {
+    let state = test_state().await;
+    let (token, _) = j1_user(&state).await;
+    let (status, body) = j1_get(&state, "/System/Info", &[("X-Emby-Token", token.as_str())]).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let info: serde_json::Value = serde_json::from_str(&body).unwrap();
+    b130_assert_jellyfin_identity(&info);
+    assert_eq!(info["PackageVersion"], env!("CARGO_PKG_VERSION"), "{info}");
+}
+
 // ── Auth Endpoint Tests ──
 
 #[tokio::test]
@@ -1324,7 +1377,7 @@ async fn b148_webclient_cache_control() {
         .collect();
     assert!(
         refs.len() >= 4,
-        "index.html loads index js/css, hls, api.js and app.js: {refs:?}"
+        "index.html loads the index js (app.js bundled in) and css, hls and api.js: {refs:?}"
     );
     for uri in refs {
         assert!(hashed(&uri), "{uri} has no content hash");
@@ -2527,12 +2580,55 @@ async fn b118_validate_path_admin_only_after_owner() {
 }
 
 // B124: wizard Enter. Enter in a wizard field does what the step's primary button does.
+// "app.js" stands for the whole client: the entry app.js and then every module in
+// src/modules/, in the order below, so a check finds a function whichever module holds it.
+// A missing, empty or unlisted module fails here, so a "no longer uses X" check can't pass
+// on a part of the client.
+const B124_WEB_MODULES: &[&str] = &[
+    "admin.js",
+    "auth.js",
+    "cards.js",
+    "home.js",
+    "item.js",
+    "jellyfin-import.js",
+    "library-admin.js",
+    "library.js",
+    "player.js",
+    "plugins.js",
+    "router.js",
+    "search.js",
+    "settings.js",
+    "util.js",
+    "wizard.js",
+];
+
 fn b124_web_source(file: &str) -> String {
-    std::fs::read_to_string(format!(
-        "{}/../rustyfin-web/src/{file}",
-        env!("CARGO_MANIFEST_DIR")
-    ))
-    .unwrap()
+    let src = format!("{}/../rustyfin-web/src", env!("CARGO_MANIFEST_DIR"));
+    let read = |path: &str| {
+        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("web client source {path}: {e}"))
+    };
+    if file != "app.js" {
+        return read(&format!("{src}/{file}"));
+    }
+    let mut found: Vec<String> = std::fs::read_dir(format!("{src}/modules"))
+        .unwrap_or_else(|e| panic!("{src}/modules: {e}"))
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name.ends_with(".js"))
+        .collect();
+    found.sort();
+    let mut listed: Vec<String> = B124_WEB_MODULES.iter().map(|m| m.to_string()).collect();
+    listed.sort();
+    assert_eq!(
+        found, listed,
+        "src/modules/ holds exactly the listed modules"
+    );
+    let mut all = read(&format!("{src}/app.js"));
+    for module in B124_WEB_MODULES {
+        let text = read(&format!("{src}/modules/{module}"));
+        assert!(text.contains("function "), "{module} has no functions");
+        all.push_str(&text);
+    }
+    all
 }
 
 // A top-level function of app.js, from its head to its closing brace.
@@ -2545,12 +2641,16 @@ fn b124_function(app_js: &str, head: &str) -> String {
 }
 
 // Runs a node test of tests/web/ against app.js. Without node it fails rather than skip:
-// CI's Check job installs nodejs so that these tests run there.
+// CI's Check job installs nodejs so that these tests run there. The script gets the whole
+// client's source as one file (see b124_web_source) and the client's src dir.
 fn b124_node_test(script: &str) {
     let dir = env!("CARGO_MANIFEST_DIR");
+    let source = format!("{}/{script}.client.js", env!("CARGO_TARGET_TMPDIR"));
+    std::fs::write(&source, b124_web_source("app.js")).unwrap();
     let out = std::process::Command::new("node")
         .arg(format!("{dir}/tests/web/{script}"))
-        .arg(format!("{dir}/../rustyfin-web/src/app.js"))
+        .arg(&source)
+        .arg(format!("{dir}/../rustyfin-web/src"))
         .output()
         .unwrap_or_else(|e| panic!("{script} needs node on PATH: {e}"));
     assert!(
@@ -8282,6 +8382,7 @@ async fn b21_settings_defaults() {
             "PublicUrl": "",
             "CallbackUrl": "",
             "AllowPasswordSignIn": true,
+            "MismatchedOrigin": null,
         })
     );
 }
@@ -8530,7 +8631,7 @@ async fn b21_info_is_public_and_minimal() {
         info().await,
         (
             StatusCode::OK,
-            serde_json::json!({ "Enabled": false, "ButtonLabel": "" })
+            serde_json::json!({ "Enabled": false, "ButtonLabel": "", "PublicUrl": "" })
         )
     );
     let body = b21_settings_body(&t.op, serde_json::json!({ "ButtonLabel": "Pocket ID" }));
@@ -8540,7 +8641,11 @@ async fn b21_info_is_public_and_minimal() {
         info().await,
         (
             StatusCode::OK,
-            serde_json::json!({ "Enabled": true, "ButtonLabel": "Pocket ID" })
+            serde_json::json!({
+                "Enabled": true,
+                "ButtonLabel": "Pocket ID",
+                "PublicUrl": B21_PUBLIC_URL
+            })
         )
     );
 }
@@ -8824,6 +8929,261 @@ async fn b21_start_reports_a_provider_that_is_down() {
     assert!(!body.contains(B21_CLIENT_SECRET));
     t.op.with(|st| st.down = false);
     t.start().await;
+}
+
+// B156: single sign-on started from an address other than the public URL
+
+/// `POST /Auth/Oidc/Start` with extra headers, as a browser on another address sends it.
+async fn b156_start(
+    t: &B21,
+    headers: &[(&str, &str)],
+) -> (StatusCode, axum::http::HeaderMap, String) {
+    let mut req = request("POST", "/Auth/Oidc/Start", None, None);
+    for (name, value) in headers {
+        req.headers_mut().insert(
+            axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+            value.parse().unwrap(),
+        );
+    }
+    t.raw(req).await
+}
+
+#[tokio::test]
+async fn b156_start_from_another_origin_is_refused() {
+    let t = b21_on(serde_json::json!({})).await;
+    assert_eq!(
+        t.settings().await["MismatchedOrigin"],
+        serde_json::Value::Null
+    );
+    let (status, headers, body) = b156_start(
+        &t,
+        &[
+            ("origin", "https://flix.example"),
+            ("sec-fetch-site", "same-origin"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(
+        b21_header(&headers, "set-cookie"),
+        "",
+        "no flow from another address"
+    );
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        json["Detail"].as_str().unwrap().contains(B21_PUBLIC_URL),
+        "the refusal names the address to use: {body}"
+    );
+    assert_eq!(
+        t.settings().await["MismatchedOrigin"],
+        "https://flix.example",
+        "the admin sees where sign-ins come from"
+    );
+
+    // The profile's link is refused the same way.
+    let mut req = request("POST", "/Auth/Oidc/Link", Some(&t.admin), None);
+    req.headers_mut()
+        .insert("origin", "http://10.0.0.5:8096".parse().unwrap());
+    req.headers_mut()
+        .insert("sec-fetch-site", "same-origin".parse().unwrap());
+    let (status, headers, _) = t.raw(req).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(b21_header(&headers, "set-cookie"), "");
+    assert_eq!(
+        t.settings().await["MismatchedOrigin"],
+        "http://10.0.0.5:8096"
+    );
+
+    // Saving the settings clears the warning.
+    let (status, saved) = t.save(serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(saved["MismatchedOrigin"], serde_json::Value::Null);
+    assert_eq!(
+        t.settings().await["MismatchedOrigin"],
+        serde_json::Value::Null
+    );
+
+    // Other addresses, a port-only difference included, are refused (the public URL is
+    // http://rf.test:8121).
+    for origin in [
+        "http://rf.test",
+        "http://rf.test:80",
+        "https://rf.test:8121",
+        "http://other.test:8121",
+        "http://rf.test:8122/web/",
+    ] {
+        let (status, headers, _) = b156_start(&t, &[("origin", origin)]).await;
+        assert_eq!(status, StatusCode::CONFLICT, "from {origin}");
+        assert_eq!(b21_header(&headers, "set-cookie"), "", "from {origin}");
+    }
+}
+
+#[tokio::test]
+async fn b156_only_a_same_origin_start_is_noted() {
+    let t = b21_on(serde_json::json!({})).await;
+    let noted = || async { t.settings().await["MismatchedOrigin"].clone() };
+
+    // A cross-site page or a request without Sec-Fetch-Site is refused but not noted.
+    for fetch_site in [Some("cross-site"), Some("same-site"), Some("none"), None] {
+        let mut headers = vec![("origin", "https://attacker.example")];
+        if let Some(value) = fetch_site {
+            headers.push(("sec-fetch-site", value));
+        }
+        let (status, _, _) = b156_start(&t, &headers).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{fetch_site:?}");
+        assert_eq!(noted().await, serde_json::Value::Null, "{fetch_site:?}");
+    }
+
+    // The web client on another address posts same-origin: noted.
+    let (status, _, _) = b156_start(
+        &t,
+        &[
+            ("origin", "https://flix.example"),
+            ("sec-fetch-site", "same-origin"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(noted().await, "https://flix.example");
+
+    // A later cross-site request does not overwrite it.
+    let (status, _, _) = b156_start(
+        &t,
+        &[
+            ("origin", "https://attacker.example"),
+            ("sec-fetch-site", "cross-site"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(noted().await, "https://flix.example");
+
+    // The noted value is capped.
+    let long_host = vec!["a".repeat(60); 6].join(".");
+    let origin = format!("https://{long_host}.example");
+    let (status, _, _) = b156_start(
+        &t,
+        &[("origin", &origin), ("sec-fetch-site", "same-origin")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let noted = noted().await;
+    let noted = noted.as_str().expect("an origin is noted");
+    assert!(noted.len() <= 300, "noted {} bytes", noted.len());
+    assert!(origin.starts_with(noted));
+}
+
+#[tokio::test]
+async fn b156_start_from_the_public_origin_goes_on() {
+    let t = b21_on(serde_json::json!({})).await;
+    // The public URL's own address in any spelling, an Origin with a path (only its origin
+    // counts), and Origins that name no web address (null, garbled, another scheme), which are
+    // not checked, like a request without one.
+    for origin in [
+        "http://rf.test:8121",
+        "http://RF.test:8121",
+        "http://rf.test:8121/web/",
+        "null",
+        "not a url",
+        "http//rf.test",
+        "file:///etc/passwd",
+        "chrome-extension://abcdef",
+    ] {
+        let (status, headers, body) = b156_start(&t, &[("origin", origin)]).await;
+        let flow = b21_flow(status, &headers, &body);
+        assert_eq!(flow.param("redirect_uri"), B21_CALLBACK, "from {origin}");
+    }
+    assert_eq!(
+        t.settings().await["MismatchedOrigin"],
+        serde_json::Value::Null
+    );
+
+    // Under a path prefix, the origin is the public URL's scheme, host and port.
+    let (status, _) = t
+        .save(serde_json::json!({ "PublicUrl": "https://media.example/jf" }))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, headers, body) = b156_start(&t, &[("origin", "https://media.example")]).await;
+    let flow = b21_flow(status, &headers, &body);
+    assert_eq!(
+        flow.param("redirect_uri"),
+        "https://media.example/jf/Auth/Oidc/Callback"
+    );
+    let (status, _, _) = b156_start(&t, &[("origin", "http://media.example")]).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "another scheme is another address"
+    );
+
+    // A default port matches its absence, on either side.
+    for (public_url, origin) in [
+        ("https://media.example:443", "https://media.example"),
+        ("https://media.example", "https://media.example:443"),
+        ("http://media.example:80/jf", "http://media.example"),
+    ] {
+        let (status, _) = t.save(serde_json::json!({ "PublicUrl": public_url })).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, headers, body) = b156_start(&t, &[("origin", origin)]).await;
+        b21_flow(status, &headers, &body);
+    }
+}
+
+#[tokio::test]
+async fn b156_start_without_origin_and_matching_link_go_on() {
+    let t = b21_on(serde_json::json!({})).await;
+    // No Origin at all, as from a non-browser client: not checked.
+    let (status, headers, body) = t.start_raw().await;
+    let flow = b21_flow(status, &headers, &body);
+    assert_eq!(flow.param("redirect_uri"), B21_CALLBACK);
+
+    // A link from the public URL's own address starts.
+    let mut req = request("POST", "/Auth/Oidc/Link", Some(&t.admin), None);
+    req.headers_mut()
+        .insert("origin", B21_PUBLIC_URL.parse().unwrap());
+    req.headers_mut()
+        .insert("sec-fetch-site", "same-origin".parse().unwrap());
+    let (status, headers, body) = t.raw(req).await;
+    let flow = b21_flow(status, &headers, &body);
+    assert_eq!(flow.param("redirect_uri"), B21_CALLBACK);
+    assert_eq!(
+        t.settings().await["MismatchedOrigin"],
+        serde_json::Value::Null
+    );
+}
+
+#[tokio::test]
+async fn b156_forwarded_headers_never_move_the_flow() {
+    let t = b21_on(serde_json::json!({})).await;
+    let forged = [
+        ("origin", B21_PUBLIC_URL),
+        ("host", "evil.example"),
+        ("x-forwarded-host", "evil.example"),
+        ("x-forwarded-proto", "https"),
+    ];
+    let (status, headers, body) = b156_start(&t, &forged).await;
+    let flow = b21_flow(status, &headers, &body);
+    assert_eq!(flow.param("redirect_uri"), B21_CALLBACK);
+    assert!(!body.contains("evil.example"));
+    let location = t
+        .approve(&flow, b21_user("fwd-sub", "fwd"), B21Sign::Key(0))
+        .await;
+    assert_eq!(location, format!("{B21_PUBLIC_URL}/web/#login/oidc"));
+
+    // A forged forwarded origin does not make a matching sign-in look mismatched either.
+    let (status, _, _) = b156_start(
+        &t,
+        &[
+            ("x-forwarded-host", "evil.example"),
+            ("x-forwarded-proto", "https"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        t.settings().await["MismatchedOrigin"],
+        serde_json::Value::Null
+    );
 }
 
 #[tokio::test]
@@ -10722,11 +11082,7 @@ fn b21_web_explains_taken_names() {
             assert_eq!(b21_translation(lang, key), None, "{lang} {key} is gone");
         }
     }
-    let app_js = std::fs::read_to_string(format!(
-        "{}/../rustyfin-web/src/app.js",
-        env!("CARGO_MANIFEST_DIR")
-    ))
-    .unwrap();
+    let app_js = b124_web_source("app.js");
     for code in ["name_taken", "name_taken_ask_admin"] {
         assert!(
             app_js.contains(&format!("['{code}', 'oidc.error.{code}']")),
@@ -11495,11 +11851,7 @@ fn b21_web_client_follows_a_demotion() {
 
 #[test]
 fn b21_dashboard_follows_a_demotion() {
-    let app_js = std::fs::read_to_string(format!(
-        "{}/../rustyfin-web/src/app.js",
-        env!("CARGO_MANIFEST_DIR")
-    ))
-    .unwrap();
+    let app_js = b124_web_source("app.js");
     // A top-level function of app.js, from its head to its closing brace.
     let function = |head: &str| -> String {
         let start = app_js
@@ -17606,17 +17958,22 @@ async fn g1_easy_pin_is_hashed_and_never_returned() {
     assert_eq!(pin_hash("viewer").await, None);
 }
 
+// B155: new users and administrator rights
+
+/// `POST /Users/New` creates a user without administrator rights whatever the body says, as
+/// Jellyfin's `CreateUserByName` does; rights come only from a later `POST /Users/{id}/Policy`.
 #[tokio::test]
-async fn g1_create_user_honours_is_administrator() {
+async fn b155_new_user_is_never_admin() {
     let state = test_state().await;
     let app = app(state.clone());
     let (owner, _, _, _) = g1_owner_and_viewer(&state, &app).await;
-    for (name, flag, admin) in [
-        ("g1-admin", Some(true), true),
-        ("g1-plain", Some(false), false),
-        ("g1-default", None, false),
+    let mut promote_id = String::new();
+    for (name, flag) in [
+        ("b155-true", Some(true)),
+        ("b155-false", Some(false)),
+        ("b155-none", None),
     ] {
-        let mut body = serde_json::json!({ "Name": name, "Password": "g1-pass" });
+        let mut body = serde_json::json!({ "Name": name, "Password": "b155-pass" });
         if let Some(flag) = flag {
             body["IsAdministrator"] = serde_json::json!(flag);
         }
@@ -17626,12 +17983,42 @@ async fn g1_create_user_honours_is_administrator() {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "create {name}: {created}");
+        assert_eq!(created["IsAdministrator"], false, "{name}: {created}");
         assert_eq!(
             user_flags(&state, name).await,
-            Some((admin, false, false)),
+            Some((false, false, false)),
             "{name}"
         );
+
+        // The new user's own token gets no administrator rights.
+        let (token, id) = login(&app, name, "b155-pass").await.expect(name);
+        let (status, _) = send(
+            &app,
+            request("GET", "/Library/VirtualFolders", Some(&token), None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{name}");
+        if flag == Some(true) {
+            promote_id = id;
+        }
     }
+
+    // The Policy call that follows is what makes an administrator.
+    let (status, _) = send(
+        &app,
+        request(
+            "POST",
+            &format!("/Users/{promote_id}/Policy"),
+            Some(&owner),
+            Some(serde_json::json!({ "IsAdministrator": true })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        user_flags(&state, "b155-true").await,
+        Some((true, false, false))
+    );
 }
 
 #[tokio::test]
