@@ -416,24 +416,23 @@ impl TaskScheduler {
     /// Stop a running task (sets state to Idle)
     pub async fn stop_task(&self, id: &str) -> bool {
         // An image task stops between videos and kills the ffmpeg it runs; it shows Cancelling,
-        // as in Jellyfin, until it has wound down
+        // as in Jellyfin, until it has wound down. The run is looked up and marked under the
+        // tasks lock, as its start and end change them, so a run that has just ended stays Idle.
+        let mut tasks = self.tasks.write().await;
         let image_run = self.image_runs.lock().unwrap().get(id).cloned();
         if let Some(cancel) = image_run {
             cancel.cancel();
-            self.set_task_state(id, TaskState::Cancelling).await;
+            if let Some(entry) = tasks.get_mut(id) {
+                self.apply_state(entry, TaskState::Cancelling);
+            }
             return true;
         }
-        let tasks = self.tasks.read().await;
-        if let Some(entry) = tasks.get(id) {
-            if entry.info.state == TaskState::Running {
-                drop(tasks);
-                self.set_task_state(id, TaskState::Idle).await;
+        match tasks.get_mut(id) {
+            Some(entry) if entry.info.state == TaskState::Running => {
+                self.apply_state(entry, TaskState::Idle);
                 true
-            } else {
-                false
             }
-        } else {
-            false
+            _ => false,
         }
     }
 
@@ -453,12 +452,27 @@ impl TaskScheduler {
     async fn set_task_state(&self, id: &str, state: TaskState) {
         let mut tasks = self.tasks.write().await;
         if let Some(entry) = tasks.get_mut(id) {
-            // A run starts with no percent known, and an ended one keeps none
-            if state != TaskState::Cancelling {
-                self.progress_of(id).clear();
-            }
-            entry.info.state = state;
+            self.apply_state(entry, state);
         }
+    }
+
+    /// Moves a task to `state`, under the tasks lock its caller holds. Only a running task can
+    /// become Cancelling, and a cancelling one stays so until it ends (Idle). A run starts with no
+    /// percent known, and an ended one keeps none.
+    fn apply_state(&self, entry: &mut TaskEntry, state: TaskState) {
+        let allowed = match (&entry.info.state, &state) {
+            (TaskState::Running, TaskState::Cancelling) => true,
+            (_, TaskState::Cancelling) => false,
+            (TaskState::Cancelling, TaskState::Running) => false,
+            _ => true,
+        };
+        if !allowed {
+            return;
+        }
+        if state != TaskState::Cancelling {
+            self.progress_of(&entry.info.id).clear();
+        }
+        entry.info.state = state;
     }
 
     async fn set_task_result(&self, id: &str, result: TaskResult) {
@@ -585,7 +599,9 @@ impl TaskScheduler {
                     // The probes the scan queued keep the library listed until they finish.
                     drop(ticket);
                 }
+                // Waited for, so no late percent lands after the task ends
                 follower.abort();
+                let _ = follower.await;
                 let end = Utc::now();
                 if errors.is_empty() {
                     TaskResult {
@@ -631,7 +647,10 @@ impl TaskScheduler {
 
     /// Starts a run of image task `id`, unless one is still going (a stopped one included, until
     /// it has wound down). Returns the handle that stops it.
+    /// The run is listed and marked Running in one step under the tasks lock, so a stop can't
+    /// come in between.
     async fn begin_image_run(&self, id: &str) -> Option<crate::trickplay::Cancel> {
+        let mut tasks = self.tasks.write().await;
         let cancel = {
             let mut runs = self.image_runs.lock().unwrap();
             if runs.contains_key(id) {
@@ -641,14 +660,19 @@ impl TaskScheduler {
             runs.insert(id.to_string(), cancel.clone());
             cancel
         };
-        self.set_task_state(id, TaskState::Running).await;
+        if let Some(entry) = tasks.get_mut(id) {
+            self.apply_state(entry, TaskState::Running);
+        }
         Some(cancel)
     }
 
-    /// Ends the run of image task `id`.
+    /// Ends the run of image task `id`: unlisted and marked Idle in one step under the tasks lock.
     async fn end_image_run(&self, id: &str) {
+        let mut tasks = self.tasks.write().await;
         self.image_runs.lock().unwrap().remove(id);
-        self.set_task_state(id, TaskState::Idle).await;
+        if let Some(entry) = tasks.get_mut(id) {
+            self.apply_state(entry, TaskState::Idle);
+        }
     }
 
     /// The ids of the libraries whose options pass `wanted`.
@@ -883,7 +907,8 @@ impl TaskScheduler {
                     handles.push((lib_name, handle));
                 }
 
-                // Await all concurrent refresh tasks
+                // Await all concurrent refresh tasks. There is one per item, so the percent is
+                // the share of the items refreshed.
                 let progress = self.progress_of(TASK_METADATA_REFRESH);
                 let total = handles.len();
                 progress.report_count(0, total);
@@ -1415,6 +1440,107 @@ mod tests {
         assert!(json["CurrentProgressPercentage"].is_null(), "{json}");
         let _next = sched.begin_image_run(TASK_TRICKPLAY).await.unwrap();
         assert_eq!(percent(sched.get_task(TASK_TRICKPLAY).await.unwrap()), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Lets the spawned tasks run until each waits (the test runtime has one thread).
+    async fn r3tasks_settle() {
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn r3tasks_stop_racing_the_end_of_an_image_run_leaves_it_idle() {
+        let (sched, dir) = r3tasks_scheduler().await;
+        let run = sched.begin_image_run(TASK_TRICKPLAY).await.unwrap();
+
+        // A stop arrives while the tasks lock is taken: it must not look at the run yet.
+        let guard = sched.tasks.write().await;
+        let stopper = tokio::spawn({
+            let sched = sched.clone();
+            async move { sched.stop_task(TASK_TRICKPLAY).await }
+        });
+        r3tasks_settle().await;
+        assert!(!run.is_cancelled(), "the stop waits for the tasks lock");
+
+        // The run ends first (end_image_run's step, under the same lock), then the stop goes on.
+        let mut guard = guard;
+        sched.image_runs.lock().unwrap().remove(TASK_TRICKPLAY);
+        let entry = guard.get_mut(TASK_TRICKPLAY).unwrap();
+        sched.apply_state(entry, TaskState::Idle);
+        drop(guard);
+        assert!(!stopper.await.unwrap(), "nothing was left to stop");
+        let info = sched.get_task(TASK_TRICKPLAY).await.unwrap();
+        assert_eq!(info.state, TaskState::Idle, "never left Cancelling");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn r3tasks_stop_racing_the_start_of_an_image_run_cancels_it() {
+        let (sched, dir) = r3tasks_scheduler().await;
+
+        // A start waits for the tasks lock without listing its run, so no stop can see the run
+        // before it is marked Running.
+        let guard = sched.tasks.write().await;
+        let starter = tokio::spawn({
+            let sched = sched.clone();
+            async move { sched.begin_image_run(TASK_TRICKPLAY).await }
+        });
+        r3tasks_settle().await;
+        assert!(
+            !sched
+                .image_runs
+                .lock()
+                .unwrap()
+                .contains_key(TASK_TRICKPLAY),
+            "the run is listed only under the tasks lock"
+        );
+        let stopper = tokio::spawn({
+            let sched = sched.clone();
+            async move { sched.stop_task(TASK_TRICKPLAY).await }
+        });
+        r3tasks_settle().await;
+        drop(guard);
+
+        // The start goes first (it waited first), so the stop finds it Running and cancels it.
+        let run = starter.await.unwrap().expect("the run started");
+        assert!(stopper.await.unwrap());
+        assert!(run.is_cancelled());
+        let info = sched.get_task(TASK_TRICKPLAY).await.unwrap();
+        assert_eq!(
+            info.state,
+            TaskState::Cancelling,
+            "Running never overwrote the stop"
+        );
+        sched.end_image_run(TASK_TRICKPLAY).await;
+        let info = sched.get_task(TASK_TRICKPLAY).await.unwrap();
+        assert_eq!(info.state, TaskState::Idle);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn r3tasks_state_changes_keep_cancelling_until_the_end() {
+        let (sched, dir) = r3tasks_scheduler().await;
+        let state = || async { sched.get_task(TASK_TRICKPLAY).await.unwrap().state };
+        // Cancelling only from Running
+        sched
+            .set_task_state(TASK_TRICKPLAY, TaskState::Cancelling)
+            .await;
+        assert_eq!(state().await, TaskState::Idle);
+        sched
+            .set_task_state(TASK_TRICKPLAY, TaskState::Running)
+            .await;
+        sched
+            .set_task_state(TASK_TRICKPLAY, TaskState::Cancelling)
+            .await;
+        // Running doesn't overwrite Cancelling; Idle ends it
+        sched
+            .set_task_state(TASK_TRICKPLAY, TaskState::Running)
+            .await;
+        assert_eq!(state().await, TaskState::Cancelling);
+        sched.set_task_state(TASK_TRICKPLAY, TaskState::Idle).await;
+        assert_eq!(state().await, TaskState::Idle);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

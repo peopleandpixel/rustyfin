@@ -202,8 +202,13 @@ async fn handle_socket(socket: WebSocket, state: AppState, token: String) {
                                         let _ = sender.send(Message::Text(json.into())).await;
                                     }
                                 }
-                                "ScheduledTasksInfoStart" => {
+                                // Only an administrator may follow the tasks; the timer also
+                                // checks, for a socket whose user is demoted
+                                "ScheduledTasksInfoStart" if viewer.is_admin => {
                                     tasks_info = Some(tasks_info_timer(incoming.data.as_ref()));
+                                }
+                                "ScheduledTasksInfoStart" => {
+                                    tracing::debug!("ws: ScheduledTasksInfoStart from a non-administrator ignored");
                                 }
                                 "ScheduledTasksInfoStop" => tasks_info = None,
                                 "SessionsStart" | "ActivityLogEntryStart" => {
