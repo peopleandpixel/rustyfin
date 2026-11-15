@@ -1573,7 +1573,6 @@ pub fn routes() -> Router<AppState> {
         .route("/Items/{id}/ThemeMedia", get(get_theme_media))
         .route("/Items/{id}/ThemeSongs", get(get_theme_list))
         .route("/Items/{id}/ThemeVideos", get(get_theme_list))
-        .route("/UserItems/Resume", get(get_resume))
         .route("/Users/{userId}/Items/{itemId}", get(get_user_item))
         .route("/Users/{userId}/Items/{itemId}/Intros", get(get_intros))
         .route(

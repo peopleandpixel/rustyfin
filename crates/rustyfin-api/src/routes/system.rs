@@ -80,18 +80,46 @@ async fn ping() -> &'static str {
     "\"Rustyfin\""
 }
 
-/// The address clients can reach, when the server is bound to one specific address.
-fn specific_local_address(bind_addr: &str) -> Option<String> {
-    let addr: SocketAddr = bind_addr.parse().ok()?;
-    (!addr.ip().is_unspecified()).then(|| format!("http://{addr}"))
+/// The address clients reach this server at, Jellyfin's `LocalAddress` (as its
+/// `GetSmartApiUrl`): `RUSTYFIN_PUBLISHED_URL` when set; else the request's Host, with `https`
+/// when `X-Forwarded-Proto` says so and `http` otherwise; else the bind address, with
+/// `localhost` for an unspecified IP (`0.0.0.0` is no address a client can use). No trailing `/`.
+pub(crate) fn local_address(state: &AppState, headers: &axum::http::HeaderMap) -> String {
+    if let Some(published) = &state.published_url {
+        return published.trim().trim_end_matches('/').to_string();
+    }
+    let host = headers
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .map(str::trim)
+        .filter(|h| {
+            !h.is_empty()
+                && h.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b".-:[]_".contains(&b))
+        });
+    if let Some(host) = host {
+        let https = headers
+            .get("x-forwarded-proto")
+            .and_then(|p| p.to_str().ok())
+            .is_some_and(|p| p.trim().eq_ignore_ascii_case("https"));
+        let scheme = if https { "https" } else { "http" };
+        return format!("{scheme}://{host}");
+    }
+    match state.bind_addr.parse::<SocketAddr>() {
+        Ok(addr) if addr.ip().is_unspecified() => format!("http://localhost:{}", addr.port()),
+        _ => format!("http://{}", state.bind_addr),
+    }
 }
 
-async fn get_public_info(State(state): State<AppState>) -> Result<Json<ServerInfo>, ApiError> {
+async fn get_public_info(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<ServerInfo>, ApiError> {
     let startup_wizard_completed = rustyfin_db::repo_user::users_exist(&state.db_ro).await?;
     let local_address = local_address(&state, &headers);
     let config = state.config.read().await;
     Ok(Json(ServerInfo {
-        local_address: specific_local_address(&state.bind_addr),
+        local_address: Some(local_address),
         server_name: config.server_name.clone(),
         version: JELLYFIN_API_VERSION.to_string(),
         product_name: JELLYFIN_PRODUCT_NAME.to_string(),
