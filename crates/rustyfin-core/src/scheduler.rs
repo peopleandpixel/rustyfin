@@ -686,6 +686,7 @@ impl TaskScheduler {
         }
         let result = if id == TASK_TRICKPLAY {
             match self.libraries_where(|o| o.enable_trickplay).await {
+                Ok(libs) if libs.is_empty() => Ok(no_library_on(id, NO_TRICKPLAY_LIBRARY)),
                 Ok(libs) => crate::trickplay::generate_for_libraries_with_progress(
                     &self.db, data_dir, &libs, &cancel, &progress,
                 )
@@ -695,6 +696,7 @@ impl TaskScheduler {
             }
         } else {
             match self.libraries_where(|o| o.enable_chapter_extraction).await {
+                Ok(libs) if libs.is_empty() => Ok(no_library_on(id, NO_CHAPTER_LIBRARY)),
                 Ok(libs) => crate::chapter_images::extract_for_libraries_with_progress(
                     &self.db, data_dir, &libs, &cancel, &progress,
                 )
@@ -1232,6 +1234,21 @@ impl TaskScheduler {
     }
 }
 
+/// The result of the trickplay task when no library turns trickplay on.
+pub const NO_TRICKPLAY_LIBRARY: &str = "No library has trickplay image extraction turned on";
+/// The result of the chapter image task when no library turns chapter images on.
+pub const NO_CHAPTER_LIBRARY: &str = "No library has chapter image extraction turned on";
+
+/// Logs and returns `message`, the result of image task `id` when no library turns it on. Both
+/// options are off by default, so a run that does nothing says why rather than "0 made".
+fn no_library_on(id: &str, message: &str) -> String {
+    tracing::info!(
+        task = id,
+        "{message}; turn it on in a library's options to make these images"
+    );
+    message.to_string()
+}
+
 /// Reports the library scan task's percent from the scans' updates: the mean of each library's
 /// percent, where a library whose scan ended counts as 100. Each library's percent only rises, so
 /// the late updates of a library still probing never move the total back.
@@ -1398,6 +1415,47 @@ mod tests {
         assert!(json["CurrentProgressPercentage"].is_null(), "{json}");
         let _next = sched.begin_image_run(TASK_TRICKPLAY).await.unwrap();
         assert_eq!(percent(sched.get_task(TASK_TRICKPLAY).await.unwrap()), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn r3tasks_image_tasks_say_when_no_library_turns_them_on() {
+        let (sched, dir) = r3tasks_scheduler().await;
+        let library = rustyfin_model::library::Library {
+            id: uuid::Uuid::new_v4(),
+            name: "Films".to_string(),
+            content_type: rustyfin_model::library::LibraryContentType::Movies,
+            paths: vec![dir.join("films").to_string_lossy().to_string()],
+        };
+        rustyfin_db::repo_library::create_library(&sched.db, &library)
+            .await
+            .unwrap();
+        for (id, message) in [
+            (TASK_TRICKPLAY, NO_TRICKPLAY_LIBRARY),
+            (TASK_CHAPTER_IMAGES, NO_CHAPTER_LIBRARY),
+        ] {
+            sched.run_video_images(id).await;
+            let result = sched.get_task(id).await.unwrap().last_execution_result;
+            let result = result.expect("the run has a result");
+            assert_eq!(result.status, TaskCompletionStatus::Completed, "{id}");
+            assert_eq!(result.error_message.as_deref(), Some(message), "{id}");
+        }
+
+        // With the option on, the run reports what it made instead.
+        let options = rustyfin_model::library::LibraryOptions {
+            enable_trickplay: true,
+            ..Default::default()
+        };
+        rustyfin_db::repo_library::set_library_options(&sched.db, library.id, &options)
+            .await
+            .unwrap();
+        sched.run_video_images(TASK_TRICKPLAY).await;
+        let result = sched.get_task(TASK_TRICKPLAY).await.unwrap();
+        let message = result.last_execution_result.unwrap().error_message;
+        assert_eq!(
+            message.as_deref(),
+            Some("Made the trickplay images of 0 videos")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
