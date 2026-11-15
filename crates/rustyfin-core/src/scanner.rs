@@ -1449,6 +1449,11 @@ async fn scan_music_library(
     // track without an artist link is read again only when its file differs from these.
     let tags_read =
         rustyfin_db::repo_media::get_library_music_tags_read(pool, library.id, &filter).await?;
+    // The existing tracks by path. A track's source may not be written yet (a new track's probe runs
+    // in the background), so the read above is keyed on the track item, not on its source.
+    let audio_tracks =
+        rustyfin_db::repo_media::get_library_items_by_type(pool, library.id, "Audio", &filter)
+            .await?;
     // The existing tracks whose tags this scan read again.
     let mut backfilled = 0u32;
 
@@ -1556,7 +1561,7 @@ async fn scan_music_library(
                 }
                 // A track without an artist link is read once per file version. A failed or empty
                 // read counts too, so that the track is not read again until its file changes.
-                if let Some(&(track, _, _)) = known_tracks.get(&file_path)
+                if let Some(&track) = audio_tracks.get(&file_path)
                     && !linked_tracks.contains(&track)
                     && let Some(stamp) = scan_sync::file_stamp(&file_path)
                     && tags_read.get(&track) != Some(&stamp)
