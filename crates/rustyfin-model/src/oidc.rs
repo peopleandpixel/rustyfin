@@ -82,6 +82,8 @@ pub struct OidcSettings {
     pub public_url: String,
     pub callback_url: String,
     pub allow_password_sign_in: bool,
+    /// The last address a sign-in was refused from because it is not the public URL's, or null.
+    pub mismatched_origin: Option<String>,
 }
 
 /// The fields of a save. An absent or null field keeps its value; a `ClientSecret` of `""` clears
@@ -146,6 +148,8 @@ fn trimmed(sent: Option<String>, current: String) -> String {
 pub struct OidcInfo {
     pub enabled: bool,
     pub button_label: String,
+    /// The address sign-ins must start from (the public URL); empty while OIDC is off.
+    pub public_url: String,
 }
 
 /// One account's link to the provider (AC30). The keys are PascalCase and none is left out: a
