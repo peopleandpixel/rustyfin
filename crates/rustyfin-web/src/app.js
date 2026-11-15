@@ -24,7 +24,9 @@ import { refreshTasks, openAddUser, closeAddUser, submitAddUser, clearLiveLog, s
 import {
     jiAddPair, jiForget, jiSetMine, jiSetChoice, jiSetConfirm, jiPreview, jiRun, jiNewCode, jiCopyCodes,
 } from './modules/jellyfin-import.js';
-import { openAddLibrary, closeAddLibrary, submitAddLibrary } from './modules/library-admin.js';
+import {
+    openAddLibrary, closeAddLibrary, submitAddLibrary, closeLibraryOptions, submitLibraryOptions,
+} from './modules/library-admin.js';
 import { closePluginConfig, savePluginConfig, closePluginPriority, savePluginPriority } from './modules/plugins.js';
 
 Object.assign(window, {
@@ -34,7 +36,8 @@ Object.assign(window, {
     playUpNextNow, cancelUpNext, togglePlayPause, setVolume, toggleMute, setPlaybackRate, toggleFullscreen, renderLogin,
     handleLogin, handleSetupPassword, doLogout, showQuickConnectModal, authorizeQuickConnect, changeNextEpisodeAutoPlay,
     changeUiLanguage, handleSaveConfig, jiAddPair, jiForget, jiSetMine, jiSetChoice, jiSetConfirm, jiPreview, jiRun,
-    jiNewCode, jiCopyCodes, refreshTasks, openAddLibrary, closeAddLibrary, submitAddLibrary, openAddUser, closeAddUser,
+    jiNewCode, jiCopyCodes, refreshTasks, openAddLibrary, closeAddLibrary, submitAddLibrary, closeLibraryOptions,
+    submitLibraryOptions, openAddUser, closeAddUser,
     submitAddUser, clearLiveLog, setLogLevel, closePluginConfig, savePluginConfig, closePluginPriority,
     savePluginPriority,
 });

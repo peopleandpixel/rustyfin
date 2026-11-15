@@ -29885,6 +29885,12 @@ async fn r3tasks_virtual_folder_library_options_saves_as_jellyfin() {
     assert_eq!(saved["EnableTrickplay"], false, "{saved}");
 }
 
+// The library dialogs' trickplay and chapter image options (tests/web/r3tasks_library_options.mjs).
+#[test]
+fn r3tasks_web_library_image_options() {
+    b124_node_test("r3tasks_library_options.mjs");
+}
+
 // The admin tasks tab's cards and polling (tests/web/r3tasks_admin.mjs).
 #[test]
 fn r3tasks_web_task_cards_and_polling() {

@@ -129,6 +129,16 @@ test('an idle task shows Ready, its last result and Start, with no progress bar'
     assert.doesNotMatch(html, /role="progressbar"/);
 });
 
+test('an idle task shows its result message, such as why it did nothing', () => {
+    const { context } = sandbox([]);
+    const message = 'No library has trickplay image extraction turned on';
+    const html = context.fns.renderTaskCard(task('Idle', null, {
+        LastExecutionResult: { Status: 'Completed', EndTimeUtc: '2026-11-15T10:00:00Z', ErrorMessage: message },
+    }));
+    assert.match(html, new RegExp(`data-task-message>· ${message}<`));
+    assert.doesNotMatch(context.fns.renderTaskCard(task('Idle', null)), /data-task-message/);
+});
+
 test('a running task with a percent shows Running, its bar at that percent and Stop', () => {
     const { context } = sandbox([]);
     const html = context.fns.renderTaskCard(task('Running', 42.4));

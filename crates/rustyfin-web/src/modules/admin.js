@@ -161,6 +161,7 @@ async function renderAdmin(tab) {
                                 <td class="py-3"><input type="checkbox" data-action="toggle-realtime-monitor" data-id="${escapeHtml(l.id || l.Id)}" aria-label="${escapeHtml(t('admin.realtime_monitor_for', { name: l.name || l.Name }))}" ${(l.LibraryOptions || {}).EnableRealtimeMonitor === false ? '' : 'checked'} class="w-4 h-4 rounded bg-white/10 border-white/20 text-[#00a4dc]"></td>
                                 <td class="py-3 text-right space-x-2">
                                     <button class="text-[#00a4dc] hover:text-[#38bdf8]" data-action="scan-library-admin" data-id="${escapeHtml(l.id || l.Id)}">${t('admin.scan')}</button>
+                                    <button class="text-[#00a4dc] hover:text-[#38bdf8]" data-action="library-options" data-id="${escapeHtml(l.id || l.Id)}" data-name="${escapeHtml(l.name || l.Name)}" aria-label="${escapeHtml(t('library.options_for', { name: l.name || l.Name }))}">${t('library.options_button')}</button>
                                     <button class="text-red-400 hover:text-red-300" data-action="delete-library" data-id="${escapeHtml(l.id || l.Id)}">${t('common.delete')}</button>
                                 </td>
                             </tr>`).join('')}
@@ -548,7 +549,10 @@ function renderTaskCard(task) {
         };
         const statusColor = statusColors[(status || '').toLowerCase()] || 'text-white/40';
         const timeStr = endTime ? new Date(endTime).toLocaleString(uiLocale(), { day: '2-digit', month: '2-digit', year: '2-digit', hour: '2-digit', minute: '2-digit' }) : '–';
-        lastExecHtml = `<span class="${statusColor}">${escapeHtml(status || '–')}</span> <span class="text-white/30">(${timeStr})</span>`;
+        // The task's message says what it did, or why it did nothing
+        const message = lastResult.ErrorMessage || lastResult.error_message;
+        const messageHtml = message ? ` <span class="text-white/50" data-task-message>· ${escapeHtml(message)}</span>` : '';
+        lastExecHtml = `<span class="${statusColor}">${escapeHtml(status || '–')}</span> <span class="text-white/30">(${timeStr})</span>${messageHtml}`;
     }
 
     // Trigger info
