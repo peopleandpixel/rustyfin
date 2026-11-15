@@ -4356,6 +4356,390 @@ async fn b30_p6_terms_the_index_cannot_parse_still_find_by_name() {
     }
 }
 
+// ── R1 auth: the Jellyfin Web contract ──
+
+/// The status and JSON body (Null when the body isn't JSON) of `method uri` with `token` and an
+/// optional JSON body.
+async fn r1auth_send(
+    state: &AppState,
+    method: &str,
+    uri: &str,
+    token: Option<&str>,
+    body: Option<serde_json::Value>,
+) -> (StatusCode, serde_json::Value) {
+    let mut builder = Request::builder().method(method).uri(uri);
+    if let Some(token) = token {
+        builder = builder.header("X-Emby-Token", token);
+    }
+    let body = match body {
+        Some(json) => {
+            builder = builder.header("Content-Type", "application/json");
+            Body::from(json.to_string())
+        }
+        None => Body::empty(),
+    };
+    let resp = app(state.clone())
+        .oneshot(builder.body(body).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+    )
+}
+
+async fn r1auth_get(state: &AppState, uri: &str, token: &str) -> (StatusCode, serde_json::Value) {
+    r1auth_send(state, "GET", uri, Some(token), None).await
+}
+
+/// The ids of a `QueryResult`'s items, as strings without dashes.
+fn r1auth_ids(result: &serde_json::Value) -> Vec<String> {
+    let mut ids: Vec<String> = result["Items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no Items in {result}"))
+        .iter()
+        .map(|item| item["Id"].as_str().unwrap().replace('-', ""))
+        .collect();
+    ids.sort();
+    ids
+}
+
+fn r1auth_sorted(ids: &[uuid::Uuid]) -> Vec<String> {
+    let mut ids: Vec<String> = ids.iter().map(|id| id.simple().to_string()).collect();
+    ids.sort();
+    ids
+}
+
+#[tokio::test]
+async fn r1auth_routes_match_without_case() {
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    let (status, users) = r1auth_send(&state, "GET", "/users/public", None, None).await;
+    assert_eq!(status, StatusCode::OK, "{users}");
+    assert!(users.is_array());
+    let (status, info) = r1auth_send(&state, "GET", "/SYSTEM/info/Public", None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!info["ProductName"].as_str().unwrap().is_empty());
+    assert!(
+        info["LocalAddress"]
+            .as_str()
+            .unwrap()
+            .starts_with("http://")
+    );
+    // A literal beats a parameter, so this is the sign-in route, not POST /Users/{userId}.
+    let wrong = serde_json::json!({ "Username": "nobody", "Pw": "wrong" });
+    let (status, _) = r1auth_send(
+        &state,
+        "POST",
+        "/Users/authenticatebyname",
+        None,
+        Some(wrong),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, item) = r1auth_get(
+        &state,
+        &format!("/items/{}?userid={}", lib.movie, lib.admin),
+        &lib.token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{item}");
+    assert_eq!(item["Name"], "Comet Night");
+    let (status, _) = r1auth_get(&state, "/users/me", &lib.token).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = r1auth_get(&state, "/no/such/route", &lib.token).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn r1auth_repeated_list_parameters_are_accepted() {
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    let uri = format!(
+        "/Items?userId={}&recursive=true&parentId={}&fields=MediaSourceCount\
+         &fields=PrimaryImageAspectRatio&includeItemTypes=Movie&sortBy=SortName\
+         &enableImageTypes=Primary&enableImageTypes=Backdrop",
+        lib.admin, lib.library
+    );
+    let (status, body) = r1auth_get(&state, &uri, &lib.token).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(r1auth_ids(&body), r1auth_sorted(&[lib.movie]));
+    // Repeated and comma-separated forms give the same items.
+    let (status, comma) = r1auth_get(
+        &state,
+        &format!(
+            "/Items?parentId={}&recursive=true&includeItemTypes=Movie,Series",
+            lib.library
+        ),
+        &lib.token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{comma}");
+    let (status, repeated) = r1auth_get(
+        &state,
+        &format!(
+            "/Items?parentId={}&recursive=true&includeItemTypes=Movie&includeItemTypes=Series",
+            lib.library
+        ),
+        &lib.token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{repeated}");
+    assert_eq!(r1auth_ids(&comma), r1auth_ids(&repeated));
+    assert_eq!(r1auth_ids(&comma), r1auth_sorted(&[lib.movie, lib.series]));
+    let (status, body) = r1auth_get(
+        &state,
+        &format!(
+            "/Studios?parentId={}&fields=DateCreated&fields=PrimaryImageAspectRatio",
+            lib.library
+        ),
+        &lib.token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
+async fn r1auth_jellyfin_web_routes_answer() {
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    let t = lib.token.as_str();
+    let (status, item) = r1auth_get(
+        &state,
+        &format!("/Users/{}/Items/{}", lib.admin, lib.movie),
+        t,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{item}");
+    assert_eq!(item["Name"], "Comet Night");
+    for uri in [
+        format!("/Users/{}/Items/{}/Intros", lib.admin, lib.movie),
+        format!("/Items/{}/Intros", lib.movie),
+    ] {
+        let (status, body) = r1auth_get(&state, &uri, t).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        assert_eq!(body["TotalRecordCount"], 0);
+        assert_eq!(body["Items"], serde_json::json!([]));
+    }
+    let (status, theme) = r1auth_get(
+        &state,
+        &format!(
+            "/Items/{}/ThemeMedia?userId={}&inheritFromParent=true&sortBy=Random",
+            lib.movie, lib.admin
+        ),
+        t,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{theme}");
+    for key in [
+        "ThemeVideosResult",
+        "ThemeSongsResult",
+        "SoundtrackSongsResult",
+    ] {
+        assert_eq!(theme[key]["TotalRecordCount"], 0, "{key}");
+        assert_eq!(theme[key]["OwnerId"], lib.movie.simple().to_string());
+    }
+    let (status, groups) = r1auth_get(&state, "/SyncPlay/List", t).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(groups, serde_json::json!([]));
+    let (status, resume) = r1auth_get(
+        &state,
+        &format!(
+            "/UserItems/Resume?userId={}&limit=12&fields=PrimaryImageAspectRatio\
+             &mediaTypes=Video&enableImageTypes=Primary&enableImageTypes=Thumb",
+            lib.admin
+        ),
+        t,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{resume}");
+    assert!(resume["Items"].is_array());
+    let (status, filters) = r1auth_get(
+        &state,
+        &format!(
+            "/Items/Filters2?userId={}&parentId={}&includeItemTypes=Movie",
+            lib.admin, lib.library
+        ),
+        t,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{filters}");
+    assert!(filters["Genres"].is_array() && filters["Tags"].is_array());
+    // A library is an item too: its CollectionFolder view.
+    let (status, folder) = r1auth_get(
+        &state,
+        &format!("/Items/{}?userId={}", lib.library, lib.admin),
+        t,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{folder}");
+    assert_eq!(folder["Type"], "CollectionFolder");
+    assert_eq!(folder["Name"], "J6 Library");
+    assert_eq!(folder["ServerId"], state.server_id.as_str());
+    // Ancestors: an array, nearest parent first, ending with the library.
+    let (status, ancestors) =
+        r1auth_get(&state, &format!("/Items/{}/Ancestors", lib.episode), t).await;
+    assert_eq!(status, StatusCode::OK, "{ancestors}");
+    let names: Vec<&str> = ancestors
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["Name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        ["Comet Hunters Season 1", "Comet Hunters", "J6 Library"]
+    );
+    let (status, ancestors) =
+        r1auth_get(&state, &format!("/Items/{}/Ancestors", lib.movie), t).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ancestors[0]["Type"], "CollectionFolder");
+    assert_eq!(ancestors.as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn r1auth_branding_is_public() {
+    let state = test_state().await;
+    let (status, branding) =
+        r1auth_send(&state, "GET", "/Branding/Configuration", None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(branding["SplashscreenEnabled"], false);
+    assert!(branding["LoginDisclaimer"].is_string());
+    assert!(branding["CustomCss"].is_string());
+    for uri in ["/Branding/Css", "/Branding/Css.css"] {
+        let resp = app(state.clone())
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+        assert!(
+            resp.headers()["content-type"]
+                .to_str()
+                .unwrap()
+                .starts_with("text/css")
+        );
+    }
+}
+
+/// B146: ParentId narrows to the parent's items, as in Jellyfin.
+#[tokio::test]
+async fn r1auth_parent_id_filters_seasons_and_episodes() {
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    let other = j6_add_item(&state, lib.library, None, "Other Show", "Series").await;
+    let other_season =
+        j6_add_item(&state, lib.library, Some(other), "Other Season 1", "Season").await;
+    let other_episode = j6_add_item(
+        &state,
+        lib.library,
+        Some(other_season),
+        "Other S01E01",
+        "Episode",
+    )
+    .await;
+    let (user_token, _) = j6_user_session(&state).await;
+    for token in [lib.token.as_str(), user_token.as_str()] {
+        let get = |query: String| {
+            let state = state.clone();
+            async move {
+                let (status, body) = r1auth_get(&state, &format!("/Items?{query}"), token).await;
+                assert_eq!(status, StatusCode::OK, "{query}: {body}");
+                r1auth_ids(&body)
+            }
+        };
+        assert_eq!(
+            get(format!(
+                "ParentId={}&Recursive=true&IncludeItemTypes=Episode",
+                lib.series
+            ))
+            .await,
+            r1auth_sorted(&[lib.episode])
+        );
+        assert_eq!(
+            get(format!("ParentId={}&IncludeItemTypes=Season", lib.series)).await,
+            r1auth_sorted(&[lib.season])
+        );
+        assert_eq!(
+            get(format!("ParentId={}", lib.season)).await,
+            r1auth_sorted(&[lib.episode])
+        );
+        assert_eq!(
+            get(format!(
+                "ParentId={}&Recursive=true&IncludeItemTypes=Episode",
+                lib.library
+            ))
+            .await,
+            r1auth_sorted(&[lib.episode, other_episode])
+        );
+        assert_eq!(
+            get(format!(
+                "ParentId={}&IncludeItemTypes=Movie,Series",
+                lib.library
+            ))
+            .await,
+            r1auth_sorted(&[lib.movie, lib.series, other])
+        );
+    }
+}
+
+/// B157: user objects carry Jellyfin's Policy and Configuration.
+#[tokio::test]
+async fn r1auth_users_have_policy_and_configuration() {
+    let state = test_state().await;
+    let (admin_token, admin) = admin_session(&state).await;
+    let (_, user) = j6_user_session(&state).await;
+    let (status, me) = r1auth_get(&state, &format!("/Users/{admin}"), &admin_token).await;
+    assert_eq!(status, StatusCode::OK, "{me}");
+    assert_eq!(me["Policy"]["IsAdministrator"], true);
+    assert_eq!(me["Policy"]["IsDisabled"], false);
+    assert_eq!(me["Policy"]["EnableAllFolders"], true);
+    assert_eq!(me["Policy"]["EnableContentDeletion"], true);
+    assert_eq!(me["Configuration"]["PlayDefaultAudioTrack"], true);
+    assert_eq!(me["HasPassword"], true);
+    assert_eq!(me["HasConfiguredPassword"], true);
+    assert_eq!(me["ServerId"], state.server_id.as_str());
+    assert_eq!(me["IsAdministrator"], true);
+
+    let (status, other) = r1auth_get(&state, &format!("/Users/{user}"), &admin_token).await;
+    assert_eq!(status, StatusCode::OK);
+    let policy = other["Policy"].clone();
+    assert_eq!(policy["IsAdministrator"], false);
+    assert_eq!(policy["EnableContentDeletion"], false);
+    assert_eq!(policy["EnableMediaPlayback"], true);
+    assert_eq!(policy["EnableAllFolders"], true);
+
+    // A Jellyfin client saves the whole policy back; the account keeps its role.
+    let (status, _) = r1auth_send(
+        &state,
+        "POST",
+        &format!("/Users/{user}/Policy"),
+        Some(&admin_token),
+        Some(policy),
+    )
+    .await;
+    assert!(status.is_success(), "{status}");
+    let (_, other) = r1auth_get(&state, &format!("/Users/{user}"), &admin_token).await;
+    assert_eq!(other["Policy"]["IsAdministrator"], false);
+    assert_eq!(other["IsAdministrator"], false);
+
+    // The sign-in answer's user has them too.
+    let name = format!("r1auth_{}", uuid::Uuid::new_v4().simple());
+    add_user(&state, &name, "pw", false).await;
+    let (status, auth) = r1auth_send(
+        &state,
+        "POST",
+        "/Users/AuthenticateByName",
+        None,
+        Some(serde_json::json!({ "Username": name, "Pw": "pw" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{auth}");
+    assert_eq!(auth["User"]["Policy"]["IsAdministrator"], false);
+    assert!(auth["User"]["Configuration"].is_object());
+}
+
 // ── J6: search parity ──
 
 /// The J6 library and the ids of its items, with an administrator's token and id.
