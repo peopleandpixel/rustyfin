@@ -164,9 +164,13 @@ pub async fn get_links_batch(
 }
 
 pub async fn get_all_persons(pool: &SqlitePool) -> Result<Vec<NameIdPair>, sqlx::Error> {
-    let rows = sqlx::query_as::<_, (String, String)>("SELECT id, name FROM people ORDER BY name")
-        .fetch_all(pool)
-        .await?;
+    // Music artists are stored as people of type 'Artist', but Jellyfin lists them only as
+    // MusicArtist items, so they are left out here.
+    let rows = sqlx::query_as::<_, (String, String)>(
+        "SELECT id, name FROM people WHERE type IS NOT 'Artist' ORDER BY name",
+    )
+    .fetch_all(pool)
+    .await?;
 
     Ok(rows
         .into_iter()
