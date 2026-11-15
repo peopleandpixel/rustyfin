@@ -75,6 +75,7 @@ struct PlayStateRequest {
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/SyncPlay", get(get_status))
+        .route("/SyncPlay/List", get(list_groups))
         .route("/SyncPlay/CreateGroup", post(create_group))
         .route("/SyncPlay/JoinGroup", post(join_group))
         .route("/SyncPlay/LeaveGroup", post(leave_group))
@@ -112,6 +113,27 @@ async fn get_status(State(state): State<AppState>) -> Result<Json<serde_json::Va
         "Groups": items,
         "IsInGroup": false
     })))
+}
+
+/// GET /SyncPlay/List: Jellyfin's `GroupInfoDto` list, which Jellyfin Web loads after sign-in.
+async fn list_groups(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+    let groups = rustyfin_db::repo_sync_play::get_groups(&state.db_ro)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let items: Vec<serde_json::Value> = groups
+        .into_iter()
+        .map(|g| {
+            serde_json::json!({
+                "GroupId": g.id,
+                "GroupName": g.name,
+                "State": "Idle",
+                "Participants": [],
+                "LastUpdatedAt": now,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::Value::Array(items)))
 }
 
 async fn create_group(

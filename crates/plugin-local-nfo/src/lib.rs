@@ -300,6 +300,7 @@ fn parse_nfo_content(content: &str) -> Option<ExternalMetadata> {
         directors: nfo.director,
         writers: nfo.writer,
         imdb_id: nfo.id.imdb,
+        people: None,
     })
 }
 

@@ -292,6 +292,7 @@ pub async fn search_movie(
         directors: None,
         writers: None,
         imdb_id: details.ids.imdb_id,
+        people: None,
     })
 }
 
@@ -364,6 +365,7 @@ pub async fn search_tv(
         directors: None,
         writers: None,
         imdb_id: details.ids.imdb_id,
+        people: None,
     })
 }
 

@@ -2295,6 +2295,18 @@ async fn b34_rating_recounts_use_the_index() {
     }
 }
 
+/// R1 scan (L4): the people writer's lookup by name, run under the write lock, uses an index.
+#[tokio::test]
+async fn r1scan_people_name_lookup_uses_the_index() {
+    let db = test_pool().await;
+    let sql = "EXPLAIN QUERY PLAN SELECT id FROM people WHERE name = ?1 ORDER BY rowid LIMIT 1";
+    let plan = b34_plan(&db.pool, sql).await;
+    assert!(
+        plan.iter().any(|step| step.contains("idx_people_name")),
+        "{plan:?}"
+    );
+}
+
 /// An import that writes 20,000 items in one transaction holds the write lock for well under the
 /// 30 s busy timeout other writers wait. Without the index each item's recounts scanned the table
 /// twice, about 35-43 s in all (B20's re-check 9). It times the debug build's SQLite, and its time

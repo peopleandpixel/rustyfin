@@ -1,6 +1,7 @@
+use crate::query::Query;
 use axum::Extension;
 use axum::Router;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
