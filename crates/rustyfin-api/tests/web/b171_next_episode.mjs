@@ -336,6 +336,10 @@ test('after the audio carries over, the default subtitle is picked again for its
     // Subtitles that carried over, or were turned off, stay as they are
     assert.deepEqual(plain(fns.carriedTracks(next, { ...carry, subtitleLanguage: 'eng', subtitleForced: true }, 1, 5)), { audioIndex: 2, subtitleIndex: 5 });
     assert.deepEqual(plain(fns.carriedTracks(next, { ...carry, subtitlesOff: true }, 1, 5)), { audioIndex: 2, subtitleIndex: -1 });
+    // A subtitle the server remembered for this episode stays, off included
+    assert.deepEqual(plain(fns.carriedTracks(next, carry, 1, 5, true)), { audioIndex: 2, subtitleIndex: 5 });
+    assert.deepEqual(plain(fns.carriedTracks(next, carry, 1, -1, true)), { audioIndex: 2, subtitleIndex: -1 });
+    assert.match(slice('async function playItem('), /carriedTracks\(streams, carry, audioIndex, subtitleIndex, serverSubtitle\)/);
     // Audio that doesn't change leaves the episode's own subtitle choice alone
     assert.deepEqual(plain(fns.carriedTracks(next, { ...carry, audioLanguage: 'eng' }, 1, -1)), { audioIndex: 1, subtitleIndex: -1 });
 });
@@ -395,11 +399,12 @@ test('a seek into the last second shows the card; the time check then the end ad
     assert.match(source, /totalduration !== 0\) return;\s*session\.stop\(\);\s*upNextAtEnd\(session\);/);
 });
 
-test('Space on a focused button in the player works the button; elsewhere it toggles play', () => {
+test('Space on a button focused by keyboard works the button; after a click, or elsewhere, it toggles play', () => {
     const start = source.indexOf('// Global Keyboard Shortcuts');
     const handler = source.slice(start, source.indexOf('\n});\n', start) + 5);
     class Element {
-        constructor(match) { this.match = match; }
+        constructor(match, keyboard = true) { this.match = match; this.keyboard = keyboard; }
+        matches(selector) { return selector === ':focus-visible' && this.keyboard; }
         closest(selector) { return this.match && selector.includes(this.match) ? this : null; }
     }
     const log = [];
@@ -423,12 +428,16 @@ test('Space on a focused button in the player works the button; elsewhere it tog
     assert.deepEqual(log, []);
     assert.equal(press(new Element(null)), true, 'the seek slider or the video toggles play');
     assert.deepEqual(log, ['toggle']);
+    // A button focused by a mouse click or tap: Space pauses as before instead of pressing it again
+    assert.equal(press(new Element('button', false)), true);
+    assert.deepEqual(log, ['toggle', 'toggle']);
+    assert.match(handler, /e\.target\.matches\(':focus-visible'\)/);
     assert.match(handler, /input:not\(\[type="range"\]\)/);
 });
 
 test('the player wires the block in: reports, stop, ended and fullscreen', () => {
     const play = slice('async function playItem(');
-    assert.match(play, /carriedTracks\(streams, carry, audioIndex, subtitleIndex\)/);
+    assert.match(play, /carriedTracks\(streams, carry, audioIndex, subtitleIndex, serverSubtitle\)/);
     assert.match(play, /resetEpisodeNav\(\)/);
     assert.match(play, /loadEpisodeNav\(session, item\)/);
     assert.match(play, /checkUpNext\(session\)/);

@@ -2696,10 +2696,10 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
     if (source) {
         audioIndex = chosenAudio ? chosenAudio.Index : null;
         const defaultSub = source.DefaultSubtitleStreamIndex;
-        subtitleIndex = (defaultSub === -1 || subStreams.some(s => s.Index === defaultSub))
-            ? defaultSub
-            : defaultSubtitleIndex(subStreams, chosenAudio);
-        ({ audioIndex, subtitleIndex } = carriedTracks(streams, carry, audioIndex, subtitleIndex));
+        // The server's choice for this item (a remembered one, or off) wins over the client's default
+        const serverSubtitle = defaultSub === -1 || subStreams.some(s => s.Index === defaultSub);
+        subtitleIndex = serverSubtitle ? defaultSub : defaultSubtitleIndex(subStreams, chosenAudio);
+        ({ audioIndex, subtitleIndex } = carriedTracks(streams, carry, audioIndex, subtitleIndex, serverSubtitle));
     }
 
     // The session owns this playback: stop() reports the position once and tears the player down
@@ -2864,8 +2864,9 @@ function episodeTrackCarry(session) {
 }
 
 // As in Jellyfin: a track in the last episode's language, else the default this episode picked. When
-// the audio changes and no subtitle carries over, the default subtitle is picked again for that audio.
-function carriedTracks(streams, carry, audioIndex, subtitleIndex) {
+// the audio changes and no subtitle carries over, the default subtitle is picked again for that audio,
+// unless the subtitle is the server's choice for this episode (subtitleFromServer), off included.
+function carriedTracks(streams, carry, audioIndex, subtitleIndex, subtitleFromServer = false) {
     if (!carry) return { audioIndex, subtitleIndex };
     const inLanguage = (type, language) => (language
         ? streams.filter(s => isStreamType(s, type) && (s.Language || '').toLowerCase() === language)
@@ -2879,7 +2880,7 @@ function carriedTracks(streams, carry, audioIndex, subtitleIndex) {
     const sameKind = subs.filter(s => !!s.IsForced === carry.subtitleForced);
     const pickedSub = sameKind.find(s => s.Index === subtitleIndex) || sameKind.find(s => s.IsDefault) || sameKind[0] || subs[0];
     if (pickedSub) subtitleIndex = pickedSub.Index;
-    else if (audioChanged) subtitleIndex = defaultSubtitleIndex(streams.filter(s => isStreamType(s, 'subtitle')), pickedAudio);
+    else if (audioChanged && !subtitleFromServer) subtitleIndex = defaultSubtitleIndex(streams.filter(s => isStreamType(s, 'subtitle')), pickedAudio);
     return { audioIndex, subtitleIndex };
 }
 
@@ -3110,8 +3111,10 @@ function toggleFullscreen() {
 // Global Keyboard Shortcuts
 document.addEventListener('keydown', e => {
     if ($('player-modal')?.open) {
-        // Space on a focused button, menu or text field works that control; the seek and volume sliders still toggle play
-        const onControl = e.target instanceof Element && e.target.closest('button, select, textarea, a[href], input:not([type="range"])');
+        // Space on a button, menu or text field focused by keyboard works that control. After a click or
+        // tap, and on the seek and volume sliders, Space still toggles play.
+        const onControl = e.target instanceof Element && e.target.matches(':focus-visible')
+            && e.target.closest('button, select, textarea, a[href], input:not([type="range"])');
         if (e.code === 'Space' && !onControl) { e.preventDefault(); togglePlayPause(); }
         if (e.code === 'ArrowLeft') { e.preventDefault(); skipTime(-10); }
         if (e.code === 'ArrowRight') { e.preventDefault(); skipTime(30); }
