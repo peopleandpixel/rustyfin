@@ -735,18 +735,22 @@ select.jf-input {
   padding: 1.5rem 1.5rem 1rem;
 }
 
-/* The top bar (title, back and close) hides and shows with the bottom controls */
+/* The top bar (title, back and close) and the bottom controls fade out together when the
+   player goes idle (playerAutoHide in app.js), and the cursor hides with them */
 .jf-player-topbar,
 .jf-player-controls {
-  opacity: 0;
   transition: opacity 0.3s ease;
 }
 
-.jf-player-container:hover .jf-player-topbar,
-.jf-player-container:hover .jf-player-controls,
-.jf-player-topbar.visible,
-.jf-player-controls.visible {
-  opacity: 1;
+.jf-player-idle .jf-player-topbar,
+.jf-player-idle .jf-player-controls {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.jf-player-container.jf-player-idle,
+.jf-player-container.jf-player-idle * {
+  cursor: none;
 }
 
 /* Animations */

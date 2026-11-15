@@ -485,7 +485,7 @@
         </div>
 
         <!-- Video Element -->
-        <div class="flex-1 flex items-center justify-center relative bg-black cursor-pointer" onclick="togglePlayPause()">
+        <div class="flex-1 flex items-center justify-center relative bg-black cursor-pointer" onclick="playerAreaClick(event)">
             <video id="video-player" class="w-full h-full max-h-screen object-contain" playsinline preload="auto"></video>
             <!-- Center Play/Pause indicator animation -->
             <div id="player-center-icon" class="hidden absolute w-20 h-20 rounded-full bg-black/60 backdrop-blur-md flex items-center justify-center pointer-events-none transition-transform duration-200"></div>
