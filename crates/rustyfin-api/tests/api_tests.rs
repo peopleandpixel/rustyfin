@@ -15659,6 +15659,106 @@ async fn w1filters_seed_into(state: &AppState) -> (String, uuid::Uuid) {
     (token, library)
 }
 
+/// Sets the user's watch data on an item: resume position and played flag.
+async fn w1filters_watch(
+    state: &AppState,
+    user: uuid::Uuid,
+    item: uuid::Uuid,
+    pos: i64,
+    played: bool,
+) {
+    sqlx::query(
+        "INSERT INTO user_item_data (user_id, item_id, playback_position_ticks, played)
+         VALUES (?, ?, ?, ?)",
+    )
+    .bind(user.to_string())
+    .bind(item.to_string())
+    .bind(pos)
+    .bind(played)
+    .execute(&state.db)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn w1filters_series_played_follows_their_episodes() {
+    let state = test_state().await;
+    let library = j6_library(&state, "W1 Shows").await;
+    let (token, admin) = admin_session(&state).await;
+    let (other_token, other) = j6_user_session(&state).await;
+    // (series, [(played, resume position)] per episode of its one season)
+    let shows: [(&str, &[(bool, i64)]); 5] = [
+        ("Hotel", &[(true, 0), (true, 0)]),
+        ("India", &[(true, 0), (false, 0)]),
+        ("Juliet", &[(false, 0), (false, 0)]),
+        ("Kilo", &[(true, 0), (false, B110_HOUR)]),
+        ("Lima", &[]),
+    ];
+    for (name, episodes) in shows {
+        let series = j6_add_item(&state, library, None, name, "Series").await;
+        // The series' own flag doesn't decide: Juliet's says played.
+        if name == "Juliet" {
+            w1filters_watch(&state, admin, series, 0, true).await;
+        }
+        let season = j6_add_item(
+            &state,
+            library,
+            Some(series),
+            &format!("{name} S1"),
+            "Season",
+        )
+        .await;
+        for (i, (played, pos)) in episodes.iter().enumerate() {
+            let episode = j6_add_item(
+                &state,
+                library,
+                Some(season),
+                &format!("{name} E{i}"),
+                "Episode",
+            )
+            .await;
+            if *played || *pos > 0 {
+                w1filters_watch(&state, admin, episode, *pos, *played).await;
+            }
+            // Another user's watch data never counts.
+            w1filters_watch(&state, other, episode, B110_HOUR, true).await;
+        }
+    }
+    let app = app(state);
+    let cases: [(&str, &str, &[&str]); 7] = [
+        ("Series", "Filters=IsPlayed", &["Hotel"]),
+        (
+            "Series",
+            "Filters=IsUnplayed",
+            &["India", "Juliet", "Kilo", "Lima"],
+        ),
+        ("Series", "Filters=IsResumable", &["Kilo"]),
+        (
+            "Series",
+            "IsPlayed=false",
+            &["India", "Juliet", "Kilo", "Lima"],
+        ),
+        ("Season", "Filters=IsPlayed", &["Hotel S1"]),
+        ("Season", "Filters=IsResumable", &["Kilo S1"]),
+        ("Episode", "Filters=IsResumable", &["Kilo E1"]),
+    ];
+    for (kind, params, expected) in cases {
+        let params = format!("IncludeItemTypes={kind}&{params}");
+        let (names, total) = w1filters_names(&app, &token, library, &params).await;
+        assert_eq!(names, j6_names(expected), "{params}");
+        assert_eq!(total, expected.len() as i64, "{params}: TotalRecordCount");
+    }
+    // The other user has watched every episode.
+    let (names, _) = w1filters_names(
+        &app,
+        &other_token,
+        library,
+        "IncludeItemTypes=Series&Filters=IsPlayed",
+    )
+    .await;
+    assert_eq!(names, j6_names(&["Hotel", "India", "Juliet", "Kilo"]));
+}
+
 // The web client's sort, filter and preference functions (tests/web/w1filters_library.mjs).
 #[test]
 fn w1filters_library() {

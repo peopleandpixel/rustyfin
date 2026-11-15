@@ -1061,27 +1061,16 @@ fn build_filtered_query(
                 .to_string(),
         );
     }
+    // Played binds the user twice (see PLAYED_CLAUSE); unplayed is its negation.
     if is_played == Some(true) {
-        where_parts.push(
-            "id IN (SELECT item_id FROM user_item_data WHERE user_id = ? AND played = 1)"
-                .to_string(),
-        );
+        where_parts.push(PLAYED_CLAUSE.to_string());
     } else if is_played == Some(false) {
-        where_parts.push(
-            "id NOT IN (SELECT item_id FROM user_item_data WHERE user_id = ? AND played = 1)"
-                .to_string(),
-        );
+        where_parts.push(format!("NOT {PLAYED_CLAUSE}"));
     }
     if is_unplayed == Some(true) {
-        where_parts.push(
-            "id NOT IN (SELECT item_id FROM user_item_data WHERE user_id = ? AND played = 1)"
-                .to_string(),
-        );
+        where_parts.push(format!("NOT {PLAYED_CLAUSE}"));
     } else if is_unplayed == Some(false) {
-        where_parts.push(
-            "id IN (SELECT item_id FROM user_item_data WHERE user_id = ? AND played = 1)"
-                .to_string(),
-        );
+        where_parts.push(PLAYED_CLAUSE.to_string());
     }
 
     // Build the static base WHERE clause for single-value params.
@@ -1151,6 +1140,25 @@ fn build_filtered_query(
 
     (count_sql, data_sql)
 }
+
+/// Whether an item is played for the user bound twice: a Series or Season when it has episodes
+/// and all of them are played, as Jellyfin works it out (and as `get_unplayed_counts` counts it);
+/// any other item by its own flag. Both subqueries are uncorrelated, so each runs once per query:
+/// the episodes are found by type and their seasons and series by primary key.
+const PLAYED_CLAUSE: &str = "(CASE WHEN media_type IN ('Series', 'Season') THEN id IN (
+        SELECT ef.folder_id FROM (
+            SELECT e.id AS episode_id, p.id AS folder_id
+            FROM media_items e JOIN media_items p ON p.id = e.parent_id AND p.media_type = 'Season'
+            WHERE e.media_type = 'Episode'
+            UNION ALL
+            SELECT e.id, p.parent_id
+            FROM media_items e JOIN media_items p ON p.id = e.parent_id AND p.media_type = 'Season'
+            WHERE e.media_type = 'Episode' AND p.parent_id IS NOT NULL
+        ) ef
+        LEFT JOIN user_item_data ud ON ud.item_id = ef.episode_id AND ud.user_id = ?
+        GROUP BY ef.folder_id
+        HAVING MIN(COALESCE(ud.played, 0)) = 1)
+    ELSE id IN (SELECT item_id FROM user_item_data WHERE user_id = ? AND played = 1) END)";
 
 #[allow(clippy::too_many_arguments)]
 pub async fn get_items_filtered(
@@ -1335,15 +1343,16 @@ pub async fn get_items_filtered(
             }
         }
     }
-    // One user_id per IsFavorite / IsPlayed / IsUnplayed clause, in build_filtered_query's order.
+    // One user_id per IsFavorite clause and two per IsPlayed / IsUnplayed clause, in
+    // build_filtered_query's order.
     if is_favorite.is_some() {
         count_q = count_q.bind(&uid_str);
     }
     if is_played.is_some() {
-        count_q = count_q.bind(&uid_str);
+        count_q = count_q.bind(&uid_str).bind(&uid_str);
     }
     if is_unplayed.is_some() {
-        count_q = count_q.bind(&uid_str);
+        count_q = count_q.bind(&uid_str).bind(&uid_str);
     }
 
     let total: i64 = count_q.fetch_one(pool).await.unwrap_or(0);
@@ -1456,10 +1465,10 @@ pub async fn get_items_filtered(
         data_q = data_q.bind(&uid_str);
     }
     if is_played.is_some() {
-        data_q = data_q.bind(&uid_str);
+        data_q = data_q.bind(&uid_str).bind(&uid_str);
     }
     if is_unplayed.is_some() {
-        data_q = data_q.bind(&uid_str);
+        data_q = data_q.bind(&uid_str).bind(&uid_str);
     }
 
     // Pagination
@@ -1731,13 +1740,22 @@ pub async fn rebuild_filter_indexes(pool: &SqlitePool) -> Result<(), sqlx::Error
     Ok(())
 }
 
-/// The ids of the items the user has a resume position on (`/Items?Filters=IsResumable`).
+/// The ids of the items the user has a resume position on (`/Items?Filters=IsResumable`), and as
+/// in Jellyfin the seasons and series of the episodes among them. Starts from the user's rows, so
+/// it reads them by key and their episodes' parents by primary key.
 pub async fn resumable_item_ids(
     pool: &SqlitePool,
     user_id: Uuid,
 ) -> Result<Vec<String>, sqlx::Error> {
     sqlx::query_scalar(
-        "SELECT item_id FROM user_item_data WHERE user_id = ? AND playback_position_ticks > 0",
+        "WITH r AS (SELECT item_id FROM user_item_data
+                    WHERE user_id = ?1 AND playback_position_ticks > 0),
+              s AS (SELECT p.id, p.parent_id FROM r
+                    JOIN media_items e ON e.id = r.item_id AND e.media_type = 'Episode'
+                    JOIN media_items p ON p.id = e.parent_id AND p.media_type = 'Season')
+         SELECT item_id FROM r
+         UNION SELECT id FROM s
+         UNION SELECT parent_id FROM s WHERE parent_id IS NOT NULL",
     )
     .bind(user_id.to_string())
     .fetch_all(pool)
