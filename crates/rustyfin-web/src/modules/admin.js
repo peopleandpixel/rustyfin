@@ -549,8 +549,9 @@ function renderTaskCard(task) {
         };
         const statusColor = statusColors[(status || '').toLowerCase()] || 'text-white/40';
         const timeStr = endTime ? new Date(endTime).toLocaleString(uiLocale(), { day: '2-digit', month: '2-digit', year: '2-digit', hour: '2-digit', minute: '2-digit' }) : '–';
-        // The task's message says what it did, or why it did nothing
-        const message = lastResult.ErrorMessage || lastResult.error_message;
+        // The task's message says what it did, or why it did nothing. It belongs to the last run,
+        // so it is left out while a new run goes, which could be read as that run's outcome.
+        const message = isRunning || isCancelling ? '' : lastResult.ErrorMessage || lastResult.error_message;
         const messageHtml = message ? ` <span class="text-white/50" data-task-message>· ${escapeHtml(message)}</span>` : '';
         lastExecHtml = `<span class="${statusColor}">${escapeHtml(status || '–')}</span> <span class="text-white/30">(${timeStr})</span>${messageHtml}`;
     }

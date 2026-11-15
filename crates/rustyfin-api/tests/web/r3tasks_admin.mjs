@@ -137,6 +137,13 @@ test('an idle task shows its result message, such as why it did nothing', () => 
     }));
     assert.match(html, new RegExp(`data-task-message>· ${message}<`));
     assert.doesNotMatch(context.fns.renderTaskCard(task('Idle', null)), /data-task-message/);
+    // A new run is going: the old run's message would read as this run's outcome
+    for (const state of ['Running', 'Cancelling']) {
+        const running = context.fns.renderTaskCard(task(state, 0, {
+            LastExecutionResult: { Status: 'Completed', EndTimeUtc: '2026-11-15T10:00:00Z', ErrorMessage: message },
+        }));
+        assert.doesNotMatch(running, /data-task-message/, state);
+    }
 });
 
 test('triggers show their interval in hours and their time of day, from .NET ticks', () => {
