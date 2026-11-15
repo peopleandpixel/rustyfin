@@ -178,7 +178,9 @@ fn played_on_start(media_type: MediaType) -> PlayedUpdate {
         | MediaType::Season
         | MediaType::MusicAlbum
         | MediaType::MusicArtist
-        | MediaType::Genre => PlayedUpdate::Keep(false),
+        | MediaType::Genre
+        | MediaType::BoxSet
+        | MediaType::Playlist => PlayedUpdate::Keep(false),
         MediaType::Audio | MediaType::Photo => PlayedUpdate::Assign(true),
         _ => PlayedUpdate::Assign(false),
     }

@@ -99,6 +99,19 @@ pub async fn require_setup_or_admin(
     Ok(next.run(req).await)
 }
 
+/// Jellyfin's FirstTimeSetupOrDefault: open while the server has no users, then any signed-in
+/// user (401 without a valid token).
+pub async fn require_setup_or_auth(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    if !rustyfin_db::repo_user::users_exist(&state.db).await? {
+        return Ok(next.run(req).await);
+    }
+    require_auth(State(state), req, next).await
+}
+
 /// Guards the administrator routes. It runs after `require_auth`, which inserts the claims, so a
 /// request without claims gets 401. A logged-in user who is not an administrator gets 403. The
 /// configured API key carries administrator claims and passes.

@@ -14,6 +14,7 @@ use std::time::Duration;
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use rustyfin_model::image::ImageType;
 use rustyfin_model::media::MediaType;
+use rustyfin_model::parental::{ParentalPolicy, UNRATED_ITEM_KINDS, unrated_item_kind};
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{ConnectOptions, SqliteConnection};
 use tokio::sync::MutexGuard;
@@ -161,6 +162,10 @@ pub struct JfUser {
     /// `Users.InternalId`, which the old layout's `UserDatas.userId` refers to.
     pub internal_id: i64,
     pub is_admin: bool,
+    /// The user's parental limits, or `None` when the database doesn't keep them (a Jellyfin
+    /// without `Users.MaxParentalRatingScore` or `MaxParentalAgeRating`, or without
+    /// `Preferences`), so whether the user had limits is unknown.
+    pub parental: Option<ParentalPolicy>,
 }
 
 /// A Jellyfin item of one of the spec 2.9 types.
@@ -637,6 +642,102 @@ struct JellyfinDb {
     streams: Vec<JfStream>,
 }
 
+/// A user's id, rating maximum and sub-score maximum in `Users`.
+type RatingRow = (Option<Vec<u8>>, Option<i64>, Option<i64>);
+
+/// Jellyfin's `PreferenceKind` values for the parental lists.
+const PREF_BLOCKED_TAGS: i64 = 0;
+const PREF_BLOCK_UNRATED_ITEMS: i64 = 10;
+const PREF_ALLOWED_TAGS: i64 = 12;
+
+/// Each user's parental limits, by Jellyfin user id: the maximum from `Users`
+/// (`MaxParentalRatingScore` and `MaxParentalRatingSubScore`, or `MaxParentalAgeRating` before
+/// 10.11) and the lists from `Preferences`, `|`-separated. `None` when the database lacks either,
+/// so the limits can't be read; a user with no row has no limits.
+async fn read_parental_limits(
+    conn: &mut SqliteConnection,
+) -> Result<Option<HashMap<Uuid, ParentalPolicy>>, sqlx::Error> {
+    let columns: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('Users')")
+        .fetch_all(&mut *conn)
+        .await?;
+    let has = |name: &str| columns.iter().any(|c| c.eq_ignore_ascii_case(name));
+    let rating_sql = if has("MaxParentalRatingScore") {
+        let sub = if has("MaxParentalRatingSubScore") {
+            "MaxParentalRatingSubScore"
+        } else {
+            "NULL"
+        };
+        format!("SELECT Id, MaxParentalRatingScore, {sub} FROM Users")
+    } else if has("MaxParentalAgeRating") {
+        "SELECT Id, MaxParentalAgeRating, NULL FROM Users".to_string()
+    } else {
+        return Ok(None);
+    };
+    let (preferences,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'Preferences'",
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    if preferences == 0 {
+        return Ok(None);
+    }
+
+    let mut limits: HashMap<Uuid, ParentalPolicy> = HashMap::new();
+    let ratings: Vec<RatingRow> = sqlx::query_as(sqlx::AssertSqlSafe(rating_sql))
+        .fetch_all(&mut *conn)
+        .await?;
+    for (id, max, sub) in ratings {
+        if let Some(id) = guid_column(id.as_deref()) {
+            let policy = limits.entry(id).or_default();
+            policy.max_parental_rating = max.and_then(|v| i32::try_from(v).ok());
+            policy.max_parental_sub_rating = sub.and_then(|v| i32::try_from(v).ok());
+        }
+    }
+    let prefs: Vec<(Option<Vec<u8>>, i64, Option<String>)> =
+        sqlx::query_as("SELECT UserId, Kind, Value FROM Preferences WHERE Kind IN (?, ?, ?)")
+            .bind(PREF_BLOCKED_TAGS)
+            .bind(PREF_BLOCK_UNRATED_ITEMS)
+            .bind(PREF_ALLOWED_TAGS)
+            .fetch_all(&mut *conn)
+            .await?;
+    for (id, kind, value) in prefs {
+        let Some(id) = guid_column(id.as_deref()) else {
+            continue;
+        };
+        let values: Vec<String> = value
+            .unwrap_or_default()
+            .split('|')
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+            .collect();
+        let policy = limits.entry(id).or_default();
+        match kind {
+            PREF_BLOCKED_TAGS => policy.blocked_tags = values,
+            PREF_ALLOWED_TAGS => policy.allowed_tags = values,
+            _ => {
+                // Names ("Movie"), or the enum's numbers in older databases.
+                let mut kinds: Vec<String> = Vec::new();
+                for value in values {
+                    let kind = unrated_item_kind(&value).or_else(|| {
+                        value
+                            .parse::<usize>()
+                            .ok()
+                            .and_then(|n| UNRATED_ITEM_KINDS.get(n).copied())
+                    });
+                    if let Some(kind) = kind
+                        && !kinds.iter().any(|k| k == kind)
+                    {
+                        kinds.push(kind.to_string());
+                    }
+                }
+                policy.block_unrated_items = kinds;
+            }
+        }
+    }
+    Ok(Some(limits))
+}
+
 async fn read_jellyfin_db(
     conn: &mut SqliteConnection,
     choice: LayoutChoice,
@@ -652,6 +753,7 @@ async fn read_jellyfin_db(
         .iter()
         .filter_map(|(id,)| guid_column(id.as_deref()))
         .collect();
+    let mut parental = read_parental_limits(conn).await?;
     let users: Vec<JfUser> = user_rows
         .into_iter()
         .filter_map(|(id, name, internal_id)| {
@@ -661,6 +763,9 @@ async fn read_jellyfin_db(
                 name,
                 internal_id,
                 is_admin: admins.contains(&id),
+                parental: parental
+                    .as_mut()
+                    .map(|limits| limits.remove(&id).unwrap_or_default()),
             })
         })
         .collect();

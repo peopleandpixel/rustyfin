@@ -16,6 +16,7 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use crate::error::ApiError;
+use crate::parental::HiddenItems;
 use crate::query::{
     bool_param, count_param, enum_values, first_value, item_kinds, list_values, media_types,
     parent_param, uuid_param,
@@ -119,8 +120,12 @@ async fn list_of(
     params: &[(String, String)],
     kind: ByNameKind,
 ) -> Result<Json<ByNameList>, ApiError> {
-    let query = ListQuery::parse(params)?;
+    let mut query = ListQuery::parse(params)?;
     query_user(state, claims, query.user_id).await?;
+    query.filter.hidden_items = HiddenItems::for_caller(state, claims)
+        .await?
+        .stored_ids()
+        .clone();
     let kind =
         if kind == ByNameKind::Genre && is_music_library(state, query.filter.parent_id).await? {
             ByNameKind::MusicGenre
@@ -153,9 +158,11 @@ async fn single_of(
         uuid_param(params, "UserId")?.filter(|id| !id.is_nil()),
     )
     .await?;
-    let entry = repo_by_name::get_by_name(&state.db_ro, kind, name)
-        .await?
-        .ok_or_else(|| ApiError::NotFound(format!("{} not found", kind.as_str())))?;
+    let hidden = HiddenItems::for_caller(state, claims).await?;
+    let entry =
+        repo_by_name::get_by_name_hiding(&state.db_ro, kind, name, hidden.stored_ids().clone())
+            .await?
+            .ok_or_else(|| ApiError::NotFound(format!("{} not found", kind.as_str())))?;
     Ok(Json(ByNameDto::new(entry, state.server_id.as_str(), true)))
 }
 
@@ -195,6 +202,7 @@ impl ListQuery {
                 == Some(&"Descending"),
             start_index: count_param(params, "StartIndex")?.unwrap_or(0),
             limit: count_param(params, "Limit")?,
+            hidden_items: Default::default(),
         };
         Ok(Self {
             filter,

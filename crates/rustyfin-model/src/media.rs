@@ -147,16 +147,27 @@ impl<'de> Deserialize<'de> for ProviderIds {
     }
 }
 
-/// Chapter info for media items
+/// A chapter in an item's `Chapters`, as Jellyfin's `ChapterInfo`. The image's file path is not
+/// sent; clients fetch the image at `/Items/{id}/Images/Chapter/{index}` with `ImageTag`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct ChapterInfo {
-    pub start_ticks: i64,
+    pub start_position_ticks: i64,
     pub name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub image_date_modified: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub image: Option<String>,
+    /// When the chapter's image was made; Jellyfin's empty date when it has none.
+    #[serde(default = "ChapterInfo::no_image_date")]
+    pub image_date_modified: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_tag: Option<String>,
+}
+
+impl ChapterInfo {
+    /// The date Jellyfin gives a chapter without an image.
+    pub const NO_IMAGE_DATE: &'static str = "0001-01-01T00:00:00.0000000Z";
+
+    fn no_image_date() -> String {
+        Self::NO_IMAGE_DATE.to_string()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -170,7 +181,12 @@ pub enum MediaType {
     MusicAlbum,
     MusicArtist,
     Photo,
+    /// A video that is neither a movie nor an episode, as in a home videos library: Jellyfin's `Video`.
+    Video,
     Genre,
+    /// A collection: Jellyfin's `BoxSet`.
+    BoxSet,
+    Playlist,
     Unknown,
 }
 
@@ -187,7 +203,10 @@ impl std::str::FromStr for MediaType {
             "MusicAlbum" => Ok(MediaType::MusicAlbum),
             "MusicArtist" => Ok(MediaType::MusicArtist),
             "Photo" => Ok(MediaType::Photo),
+            "Video" => Ok(MediaType::Video),
             "Genre" => Ok(MediaType::Genre),
+            "BoxSet" => Ok(MediaType::BoxSet),
+            "Playlist" => Ok(MediaType::Playlist),
             _ => Ok(MediaType::Unknown),
         }
     }
@@ -211,7 +230,10 @@ impl MediaType {
             MediaType::MusicAlbum => "MusicAlbum",
             MediaType::MusicArtist => "MusicArtist",
             MediaType::Photo => "Photo",
+            MediaType::Video => "Video",
             MediaType::Genre => "Genre",
+            MediaType::BoxSet => "BoxSet",
+            MediaType::Playlist => "Playlist",
             MediaType::Unknown => "Folder",
         }
     }
@@ -219,11 +241,11 @@ impl MediaType {
     /// Jellyfin `MediaType` value (only Video/Audio/Photo/Book/Unknown).
     pub fn media_kind(self) -> &'static str {
         match self {
-            MediaType::Movie | MediaType::Episode => "Video",
+            MediaType::Movie | MediaType::Episode | MediaType::Video => "Video",
             MediaType::Series | MediaType::Season => "Unknown",
             MediaType::Audio | MediaType::MusicAlbum | MediaType::MusicArtist => "Audio",
             MediaType::Photo => "Photo",
-            MediaType::Genre => "Unknown",
+            MediaType::Genre | MediaType::BoxSet | MediaType::Playlist => "Unknown",
             MediaType::Unknown => "Unknown",
         }
     }
@@ -236,6 +258,8 @@ impl MediaType {
                 | MediaType::MusicAlbum
                 | MediaType::MusicArtist
                 | MediaType::Genre
+                | MediaType::BoxSet
+                | MediaType::Playlist
         )
     }
 }
@@ -615,9 +639,17 @@ pub struct MediaItem {
     /// Parent logo item ID
     #[serde(default)]
     pub parent_logo_item_id: Option<Uuid>,
-    /// Screenshot image tags for trickplay
+    /// Screenshot image tags
     #[serde(default)]
     pub screenshot_image_tags: Vec<String>,
+    /// Trickplay tile sets, by media source id, then by width; sent only when the item has any.
+    #[serde(default)]
+    pub trickplay: Option<
+        std::collections::BTreeMap<
+            String,
+            std::collections::BTreeMap<String, crate::trickplay::TrickplayInfo>,
+        >,
+    >,
     /// The BlurHash of each image that has one, by image type and then by image tag, as
     /// Jellyfin's `ImageBlurHashes` has them
     #[serde(default)]
@@ -632,6 +664,41 @@ pub struct MediaItem {
     /// Official rating image tag
     #[serde(default)]
     pub official_rating_image_tag: Option<String>,
+
+    // --- Photo fields, read from a photo's header and EXIF; `None` for every other item ---
+    /// The camera's maker (EXIF `Make`)
+    #[serde(default)]
+    pub camera_make: Option<String>,
+    /// The camera's model (EXIF `Model`)
+    #[serde(default)]
+    pub camera_model: Option<String>,
+    /// The software that wrote the photo (EXIF `Software`)
+    #[serde(default)]
+    pub software: Option<String>,
+    /// Jellyfin's `ImageOrientation` name of the EXIF orientation, such as "TopLeft"
+    #[serde(default)]
+    pub image_orientation: Option<String>,
+    /// The exposure time in seconds
+    #[serde(default)]
+    pub exposure_time: Option<f64>,
+    /// The focal length in millimetres
+    #[serde(default)]
+    pub focal_length: Option<f64>,
+    /// The aperture (f-number)
+    #[serde(default)]
+    pub aperture: Option<f64>,
+    /// The ISO speed rating
+    #[serde(default)]
+    pub iso_speed_rating: Option<i32>,
+    /// GPS latitude in degrees, south negative
+    #[serde(default)]
+    pub latitude: Option<f64>,
+    /// GPS longitude in degrees, west negative
+    #[serde(default)]
+    pub longitude: Option<f64>,
+    /// GPS altitude in metres, below sea level negative
+    #[serde(default)]
+    pub altitude: Option<f64>,
 }
 
 impl MediaItem {
@@ -777,17 +844,29 @@ impl MediaItem {
             parent_logo_image_tag: None,
             parent_logo_item_id: None,
             screenshot_image_tags: Vec::new(),
+            trickplay: None,
             image_blur_hashes: std::collections::HashMap::new(),
             video_3_d_format: None,
             play_access: None,
             official_rating_image_tag: None,
+            camera_make: None,
+            camera_model: None,
+            software: None,
+            image_orientation: None,
+            exposure_time: None,
+            focal_length: None,
+            aperture: None,
+            iso_speed_rating: None,
+            latitude: None,
+            longitude: None,
+            altitude: None,
         }
     }
 }
 
 impl Serialize for MediaItem {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut s = serializer.serialize_struct("MediaItem", 161)?;
+        let mut s = serializer.serialize_struct("MediaItem", 162)?;
         s.serialize_field("Id", &self.id)?;
         s.serialize_field("Name", &self.name)?;
         s.serialize_field("SortName", &self.sort_name)?;
@@ -952,10 +1031,34 @@ impl Serialize for MediaItem {
         s.serialize_field("ParentLogoImageTag", &self.parent_logo_image_tag)?;
         s.serialize_field("ParentLogoItemId", &self.parent_logo_item_id)?;
         s.serialize_field("ScreenshotImageTags", &self.screenshot_image_tags)?;
+        match &self.trickplay {
+            Some(trickplay) => s.serialize_field("Trickplay", trickplay)?,
+            None => s.skip_field("Trickplay")?,
+        }
         s.serialize_field("ImageBlurHashes", &self.image_blur_hashes)?;
         s.serialize_field("Video3DFormat", &self.video_3_d_format)?;
         s.serialize_field("PlayAccess", &self.play_access)?;
         s.serialize_field("OfficialRatingImageTag", &self.official_rating_image_tag)?;
+        // Jellyfin leaves out a null field, so only a photo's known values are written.
+        macro_rules! some_field {
+            ($key:literal, $value:expr) => {
+                match &$value {
+                    Some(value) => s.serialize_field($key, value)?,
+                    None => s.skip_field($key)?,
+                }
+            };
+        }
+        some_field!("CameraMake", self.camera_make);
+        some_field!("CameraModel", self.camera_model);
+        some_field!("Software", self.software);
+        some_field!("ImageOrientation", self.image_orientation);
+        some_field!("ExposureTime", self.exposure_time);
+        some_field!("FocalLength", self.focal_length);
+        some_field!("Aperture", self.aperture);
+        some_field!("IsoSpeedRating", self.iso_speed_rating);
+        some_field!("Latitude", self.latitude);
+        some_field!("Longitude", self.longitude);
+        some_field!("Altitude", self.altitude);
         s.end()
     }
 }

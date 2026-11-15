@@ -211,6 +211,9 @@ pub struct ByNameFilter {
     pub start_index: usize,
     /// The number of entries to return; `None` returns all of them.
     pub limit: Option<usize>,
+    /// Item ids, as stored, that are neither counted nor make an entry: those a user's parental
+    /// limits hide.
+    pub hidden_items: HashSet<String>,
 }
 
 /// One page of a list.
@@ -238,7 +241,10 @@ pub async fn list(
             continue;
         }
         let group = groups.entry(fold_name(&row.name)).or_default();
-        if row.in_scope && passes_type_filters(filter, row.media) {
+        if row.in_scope
+            && passes_type_filters(filter, row.media)
+            && !filter.hidden_items.contains(&row.item)
+        {
             group.items.insert(row.item, row.media);
         }
         *group.spellings.entry(row.name).or_default() += 1;
@@ -278,6 +284,17 @@ pub async fn get_by_name(
     kind: ByNameKind,
     name: &str,
 ) -> Result<Option<ByNameEntry>, sqlx::Error> {
+    get_by_name_hiding(pool, kind, name, HashSet::new()).await
+}
+
+/// `get_by_name` counting only the items not in `hidden_items` (ids as stored); an entry whose
+/// items are all hidden is `None`.
+pub async fn get_by_name_hiding(
+    pool: &SqlitePool,
+    kind: ByNameKind,
+    name: &str,
+    hidden_items: HashSet<String>,
+) -> Result<Option<ByNameEntry>, sqlx::Error> {
     // A year is its positive number, so `01999` finds 1999, while `0`, `-5` and `abc` find nothing.
     let folded = match kind {
         ByNameKind::Year => match name.trim().parse::<i64>() {
@@ -290,7 +307,11 @@ pub async fn get_by_name(
     if folded.contains('-') {
         candidates.extend(["&", "/", "?"].map(|sep| folded.replace('-', sep)));
     }
-    let page = list(pool, kind, &ByNameFilter::default()).await?;
+    let filter = ByNameFilter {
+        hidden_items,
+        ..Default::default()
+    };
+    let page = list(pool, kind, &filter).await?;
     for candidate in candidates {
         if let Some(entry) = page
             .items

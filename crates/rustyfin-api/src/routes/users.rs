@@ -5,6 +5,7 @@ use axum::{Extension, Json, Router};
 use chrono::Utc;
 use rustyfin_db::repo_user::PolicyChange;
 use rustyfin_model::auth::Claims;
+use rustyfin_model::parental::{self, ParentalPolicy};
 use rustyfin_model::user::{
     ChangePasswordRequest, CreateUserRequest, EasyPasswordRequest, ForgotPasswordPinRequest,
     ForgotPasswordRequest, ForgotPasswordResult, PublicUserDto, ResetPasswordRequest,
@@ -70,12 +71,14 @@ pub fn admin_routes() -> Router<AppState> {
 async fn get_users(State(state): State<AppState>) -> Result<Json<Vec<UserDto>>, ApiError> {
     let users = rustyfin_db::repo_user::get_all_users(&state.db_ro).await?;
     let flags = rustyfin_db::repo_user::all_user_flags(&state.db_ro).await?;
+    let parental = rustyfin_db::repo_parental::all_policies(&state.db_ro).await?;
     Ok(Json(
         users
             .into_iter()
             .map(|u| {
                 let f = flags.get(&u.id).copied().unwrap_or_default();
-                UserDto::new(u, f, &state.server_id)
+                let p = parental.get(&u.id).cloned().unwrap_or_default();
+                UserDto::new(u, f, &state.server_id, &p)
             })
             .collect(),
     ))
@@ -89,7 +92,8 @@ async fn get_me(
         .await?
         .ok_or(ApiError::NotFound("user not found".into()))?;
     let flags = rustyfin_db::repo_user::user_flags(&state.db_ro, user.id).await?;
-    Ok(Json(UserDto::new(user, flags, &state.server_id)))
+    let parental = rustyfin_db::repo_parental::get_policy(&state.db_ro, user.id).await?;
+    Ok(Json(UserDto::new(user, flags, &state.server_id, &parental)))
 }
 
 async fn get_user(
@@ -100,7 +104,8 @@ async fn get_user(
         .await?
         .ok_or(ApiError::NotFound("user not found".into()))?;
     let flags = rustyfin_db::repo_user::user_flags(&state.db_ro, user.id).await?;
-    Ok(Json(UserDto::new(user, flags, &state.server_id)))
+    let parental = rustyfin_db::repo_parental::get_policy(&state.db_ro, user.id).await?;
+    Ok(Json(UserDto::new(user, flags, &state.server_id, &parental)))
 }
 
 async fn get_public_users(
@@ -146,10 +151,19 @@ async fn create_user(
     if !rustyfin_db::repo_user::create_user_unless_taken(&state.db, &user).await? {
         return Err(ApiError::BadRequest("user already exists".into()));
     }
+    super::activity::record(
+        &state,
+        &format!("User {} has been created", user.name),
+        "UserCreated",
+        Some(user.id),
+        "Information",
+    )
+    .await;
     Ok(Json(UserDto::new(
         user,
         UserFlags::default(),
         &state.server_id,
+        &ParentalPolicy::default(),
     )))
 }
 
@@ -171,10 +185,21 @@ async fn remove_user(state: &AppState, claims: &Claims, id: Uuid) -> Result<(), 
         return Err(ApiError::BadRequest("cannot delete yourself".into()));
     }
 
+    let name = rustyfin_db::repo_user::get_user_by_id(&state.db, id)
+        .await?
+        .map(|u| u.name);
     let deleted = rustyfin_db::repo_user::delete_user(&state.db, id).await?;
     if !deleted {
         return Err(ApiError::NotFound("user not found".into()));
     }
+    super::activity::record(
+        state,
+        &format!("User {} has been deleted", name.unwrap_or_default()),
+        "UserDeleted",
+        Some(id),
+        "Information",
+    )
+    .await;
 
     Ok(())
 }
@@ -236,6 +261,14 @@ async fn change_password(
     rustyfin_auth::revoke_user_tokens(&state.db, id, keep.as_deref())
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
+    super::activity::record(
+        &state,
+        &format!("Password has been changed for user {}", user.name),
+        "UserPasswordChanged",
+        Some(id),
+        "Information",
+    )
+    .await;
 
     Ok(Json(serde_json::json!({})))
 }
@@ -262,6 +295,12 @@ async fn update_policy(
     {
         return Err(ApiError::NotFound("user not found".into()));
     }
+
+    // Checked before anything is stored, so a policy that can't be kept changes nothing.
+    let parental = parental_policy(
+        &req,
+        rustyfin_db::repo_parental::get_policy(&state.db, id).await?,
+    )?;
 
     if rustyfin_db::repo_user::is_owner(&state.db, id).await? {
         if req.is_administrator == Some(false) {
@@ -311,8 +350,63 @@ async fn update_policy(
             ));
         }
     }
+    if !rustyfin_db::repo_parental::set_policy(&state.db, id, &parental).await? {
+        return Err(ApiError::NotFound("user not found".into()));
+    }
 
     Ok(Json(serde_json::json!({})))
+}
+
+/// The stored parental policy with the request's fields over it. An unknown kind of unrated item
+/// is refused, and so are access schedules, which Rustyfin doesn't enforce: an administrator is
+/// told the limit wasn't kept instead of believing it was.
+fn parental_policy(
+    req: &UpdatePolicyRequest,
+    mut policy: ParentalPolicy,
+) -> Result<ParentalPolicy, ApiError> {
+    if req.access_schedules.as_ref().is_some_and(|s| !s.is_empty()) {
+        return Err(ApiError::BadRequest(
+            "Access schedules are not supported.".into(),
+        ));
+    }
+    if let Some(max) = req.max_parental_rating {
+        policy.max_parental_rating = max;
+    }
+    if let Some(sub) = req.max_parental_sub_rating {
+        policy.max_parental_sub_rating = sub;
+    }
+    if let Some(kinds) = &req.block_unrated_items {
+        let mut out = Vec::new();
+        for kind in kinds.iter().flatten() {
+            let kind = parental::unrated_item_kind(kind).ok_or_else(|| {
+                ApiError::BadRequest(format!("Unknown kind of unrated item: {kind}"))
+            })?;
+            if !out.iter().any(|k| k == kind) {
+                out.push(kind.to_string());
+            }
+        }
+        policy.block_unrated_items = out;
+    }
+    let tags = |tags: &Option<Vec<String>>| -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for tag in tags.iter().flatten().map(|t| t.trim()) {
+            if !tag.is_empty()
+                && !out
+                    .iter()
+                    .any(|t| parental::tag_key(t) == parental::tag_key(tag))
+            {
+                out.push(tag.to_string());
+            }
+        }
+        out
+    };
+    if let Some(blocked) = &req.blocked_tags {
+        policy.blocked_tags = tags(blocked);
+    }
+    if let Some(allowed) = &req.allowed_tags {
+        policy.allowed_tags = tags(allowed);
+    }
+    Ok(policy)
 }
 
 async fn update_configuration(

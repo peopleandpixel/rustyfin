@@ -37,6 +37,15 @@ async fn login(
     let user = match rustyfin_auth::check_password(&state.db, &req.username, &req.password).await {
         Ok(user) => user,
         Err(rustyfin_auth::AuthError::InvalidCredentials) => {
+            let name: String = req.username.chars().take(64).collect();
+            super::activity::record(
+                &state,
+                &format!("Failed login try from {name}"),
+                "AuthenticationFailed",
+                None,
+                "Error",
+            )
+            .await;
             // The password may be a pending user's one-time code: the header says so (B20 3.2).
             // It goes only to a user who may use a password, so a refused code gets no header (X1).
             let config = rustyfin_db::repo_oidc::get_settings(&state.db).await?;
@@ -124,6 +133,14 @@ pub(crate) async fn start_session(
     token: String,
 ) -> AuthResponse {
     let session_id = Uuid::new_v4();
+    super::activity::record(
+        state,
+        &format!("{} successfully authenticated", user.name),
+        "AuthenticationSucceeded",
+        Some(user.id),
+        "Information",
+    )
+    .await;
 
     // Create session in database with empty capabilities (will be updated by client)
     rustyfin_db::repo_session::create_session(
@@ -168,8 +185,15 @@ pub(crate) async fn start_session(
             Default::default()
         });
 
+    let parental = rustyfin_db::repo_parental::get_policy(&state.db, user.id)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "could not read the user's parental policy for the sign-in answer");
+            Default::default()
+        });
+
     AuthResponse {
-        user: UserDto::new(user, flags, &state.server_id),
+        user: UserDto::new(user, flags, &state.server_id, &parental),
         session_info,
         access_token: token,
         server_id: state.server_id.to_string(),

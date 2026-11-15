@@ -1,52 +1,69 @@
 use sqlx::SqlitePool;
 
+/// A signed-in device, from the `devices` table that sign-ins fill (`repo_session`), with the
+/// name of its last user.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct DeviceRow {
     pub id: String,
     pub name: String,
+    pub custom_name: Option<String>,
     pub user_id: Option<String>,
+    pub user_name: Option<String>,
     pub app_name: String,
     pub app_version: String,
-    pub device_name: String,
-    pub last_activity_date: String,
-    pub image_path: String,
+    /// When the device was last used, ISO 8601 UTC.
+    pub last_seen: String,
 }
 
-pub async fn get_devices(pool: &SqlitePool) -> Result<Vec<DeviceRow>, sqlx::Error> {
-    let rows = sqlx::query_as::<_, DeviceRow>(
-        "SELECT id, name, user_id, app_name, app_version, device_name, last_activity_date, image_path FROM devices",
+/// Every device, most recently used first; only `user_id`'s when given.
+pub async fn get_devices(
+    pool: &SqlitePool,
+    user_id: Option<&str>,
+) -> Result<Vec<DeviceRow>, sqlx::Error> {
+    sqlx::query_as::<_, DeviceRow>(
+        "SELECT d.id, d.name, d.custom_name, d.user_id, u.name AS user_name,
+                d.app_name, d.app_version, strftime('%Y-%m-%dT%H:%M:%fZ', d.last_seen) AS last_seen
+         FROM devices d LEFT JOIN users u ON u.id = d.user_id
+         WHERE ?1 IS NULL OR d.user_id = ?1
+         ORDER BY d.last_seen DESC, d.id",
     )
+    .bind(user_id)
     .fetch_all(pool)
-    .await?;
-    Ok(rows)
+    .await
 }
 
 pub async fn get_device(
     pool: &SqlitePool,
     device_id: &str,
 ) -> Result<Option<DeviceRow>, sqlx::Error> {
-    let row = sqlx::query_as::<_, DeviceRow>(
-        "SELECT id, name, user_id, app_name, app_version, device_name, last_activity_date, image_path FROM devices WHERE id = ?1",
+    sqlx::query_as::<_, DeviceRow>(
+        "SELECT d.id, d.name, d.custom_name, d.user_id, u.name AS user_name,
+                d.app_name, d.app_version, strftime('%Y-%m-%dT%H:%M:%fZ', d.last_seen) AS last_seen
+         FROM devices d LEFT JOIN users u ON u.id = d.user_id
+         WHERE d.id = ?1",
     )
     .bind(device_id)
     .fetch_optional(pool)
-    .await?;
-    Ok(row)
+    .await
 }
 
-pub async fn get_device_by_user(
+/// Sets a device's custom name (Jellyfin's device options); a blank name clears it. Returns
+/// false when there is no such device.
+pub async fn set_custom_name(
     pool: &SqlitePool,
-    user_id: &str,
-) -> Result<Vec<DeviceRow>, sqlx::Error> {
-    let rows = sqlx::query_as::<_, DeviceRow>(
-        "SELECT id, name, user_id, app_name, app_version, device_name, last_activity_date, image_path FROM devices WHERE user_id = ?1",
-    )
-    .bind(user_id)
-    .fetch_all(pool)
-    .await?;
-    Ok(rows)
+    device_id: &str,
+    custom_name: Option<&str>,
+) -> Result<bool, sqlx::Error> {
+    let custom_name = custom_name.map(str::trim).filter(|n| !n.is_empty());
+    let done = sqlx::query("UPDATE devices SET custom_name = ?1 WHERE id = ?2")
+        .bind(custom_name)
+        .bind(device_id)
+        .execute(pool)
+        .await?;
+    Ok(done.rows_affected() > 0)
 }
 
+/// Adds or replaces a device by hand (`POST /Devices`); sign-ins add theirs themselves.
 pub async fn create_device(
     pool: &SqlitePool,
     id: &str,
@@ -54,40 +71,23 @@ pub async fn create_device(
     user_id: Option<&str>,
     app_name: &str,
     app_version: &str,
-    device_name: &str,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "INSERT OR REPLACE INTO devices (id, name, user_id, app_name, app_version, device_name, last_activity_date)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))",
+        "INSERT INTO devices (id, name, user_id, app_name, app_version, last_seen)
+         VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))
+         ON CONFLICT(id) DO UPDATE SET
+           name = excluded.name,
+           user_id = excluded.user_id,
+           app_name = excluded.app_name,
+           app_version = excluded.app_version,
+           last_seen = excluded.last_seen",
     )
     .bind(id)
     .bind(name)
     .bind(user_id)
     .bind(app_name)
     .bind(app_version)
-    .bind(device_name)
     .execute(pool)
     .await?;
-    Ok(())
-}
-
-pub async fn update_device_image(
-    pool: &SqlitePool,
-    device_id: &str,
-    image_path: &str,
-) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE devices SET image_path = ?1 WHERE id = ?2")
-        .bind(image_path)
-        .bind(device_id)
-        .execute(pool)
-        .await?;
-    Ok(())
-}
-
-pub async fn update_device_activity(pool: &SqlitePool, device_id: &str) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE devices SET last_activity_date = datetime('now') WHERE id = ?1")
-        .bind(device_id)
-        .execute(pool)
-        .await?;
     Ok(())
 }

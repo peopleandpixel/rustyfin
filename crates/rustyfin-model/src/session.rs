@@ -114,19 +114,20 @@ pub struct ClientCapabilities {
     pub device_profile: Option<serde_json::Value>,
 }
 
-/// Request body for POST /Sessions/Capabilities
+/// Request body for POST /Sessions/Capabilities. Jellyfin binds it without regard to case, so
+/// the camelCase names that some clients post are read too.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct SessionCapabilitiesRequest {
-    #[serde(default)]
+    #[serde(default, alias = "playableMediaTypes")]
     pub playable_media_types: Option<Vec<String>>,
-    #[serde(default)]
+    #[serde(default, alias = "supportedCommands")]
     pub supported_commands: Option<Vec<String>>,
-    #[serde(default)]
+    #[serde(default, alias = "unsupportedCommands")]
     pub unsupported_commands: Option<Vec<String>>,
-    #[serde(default)]
+    #[serde(default, alias = "supportedFunctions")]
     pub supported_functions: Option<Vec<String>>,
-    #[serde(default)]
+    #[serde(default, alias = "deviceProfile")]
     pub device_profile: Option<serde_json::Value>,
 }
 
@@ -136,4 +137,25 @@ pub struct SessionCommand {
     pub command: String,
     #[serde(default)]
     pub arguments: Option<serde_json::Value>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn r1play_capabilities_read_camel_case() {
+        let req: SessionCapabilitiesRequest = serde_json::from_value(serde_json::json!({
+            "playableMediaTypes": ["Video", "Audio"],
+            "supportedCommands": ["Play"],
+            "deviceProfile": {"Name": "x"},
+        }))
+        .unwrap();
+        assert_eq!(
+            req.playable_media_types,
+            Some(vec!["Video".to_string(), "Audio".to_string()])
+        );
+        assert_eq!(req.supported_commands, Some(vec!["Play".to_string()]));
+        assert!(req.device_profile.is_some());
+    }
 }

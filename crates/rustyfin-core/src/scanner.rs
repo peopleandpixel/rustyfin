@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use rustyfin_db::repo_media::PathScope;
+use rustyfin_model::image::ImageType;
 use rustyfin_model::library::{Library, LibraryContentType};
 use rustyfin_model::media::{LocationType, MediaItem, MediaType};
 use sqlx::SqlitePool;
@@ -231,8 +232,33 @@ pub async fn scan_with_metadata(
         }
     }
 
+    // The file reads below share one guard, so a scan gives up waiting on at most a few files.
+    let mut reads = FileReads::new(FILE_READ_WAIT);
+
+    // Photos get their size, EXIF fields and Primary image, as in Jellyfin.
+    if matches!(
+        library.content_type,
+        LibraryContentType::Photos | LibraryContentType::Mixed
+    ) {
+        read_photos(
+            pool,
+            library,
+            scope,
+            crate::photo_info::read_photo,
+            &mut reads,
+        )
+        .await;
+    }
+
     // A local image replaced in place gets its new stamp, so its tag and copies change.
-    changes.images = restamp_local_images(pool, library, scope).await;
+    changes.images = restamp_local_images(
+        pool,
+        library,
+        scope,
+        local_images::local_image_version,
+        &mut reads,
+    )
+    .await;
     // New and changed pictures get their grid copies in the background
     crate::image_warmer::kick();
 
@@ -248,11 +274,375 @@ pub async fn scan_with_metadata(
     Ok(changes)
 }
 
+/// Reads the photos of `scope` that were never read or whose file changed since, and stores what each
+/// says (`photo_info::read_photo`: the header size and the EXIF block, nothing decoded). A photo with
+/// no Primary image and a readable header gets its own file as one, as Jellyfin serves a photo's
+/// picture as its Primary. A failure is logged and skips its photo. Each photo is read through
+/// `reads` with `read` (`photo_info::read_photo`, or a stand-in in tests), and what a chunk of
+/// `PHOTO_CHUNK` photos gave is stored before the next is read. Returns how many photos' metadata
+/// was stored.
+async fn read_photos(
+    pool: &SqlitePool,
+    library: &Library,
+    scope: &ScanScope,
+    read: PhotoReader,
+    reads: &mut FileReads,
+) -> u32 {
+    let photos =
+        match rustyfin_db::repo_photo::library_photos(pool, library.id, &path_scope(scope)).await {
+            Ok(photos) => photos,
+            Err(e) => {
+                tracing::warn!(
+                    "failed to list the photos of library '{}': {}",
+                    library.name,
+                    e
+                );
+                return 0;
+            }
+        };
+    let mut count = 0;
+    for chunk in photos.chunks(PHOTO_CHUNK) {
+        let mut done = Vec::with_capacity(chunk.len());
+        for photo in chunk {
+            if reads.given_up(&library.name) {
+                return count + store_photo_reads(pool, done).await;
+            }
+            let task = photo.clone();
+            if let Some(Some(result)) = reads
+                .run(&photo.path, move || read_one_photo(&task, read))
+                .await
+            {
+                done.push((photo.clone(), result));
+            }
+        }
+        count += store_photo_reads(pool, done).await;
+    }
+    count
+}
+
+/// How many photos are read before what they gave is stored, so an interrupted scan keeps it.
+const PHOTO_CHUNK: usize = 200;
+
+/// How long a scan waits for one file's stat and reads. A read can't be stopped: one that takes
+/// longer finishes on its own blocking thread, and the scan goes on without it.
+const FILE_READ_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How many reads may be stopped waiting for: per scan, and still running across the process.
+/// While this many abandoned reads are still running, scans skip their file reads, as the storage
+/// likely isn't answering, so scans never tie up more blocking threads than this between them.
+const MAX_ABANDONED_READS: usize = 3;
+
+/// The paths of the reads a scan stopped waiting for that are still running. Scans of this process
+/// share one (`HUNG_READS`); a test makes its own.
+#[derive(Default)]
+struct HungReads {
+    paths: std::sync::Mutex<HashSet<String>>,
+}
+
+impl HungReads {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashSet<String>> {
+        self.paths.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn contains(&self, path: &str) -> bool {
+        self.lock().contains(path)
+    }
+
+    fn len(&self) -> usize {
+        self.lock().len()
+    }
+}
+
+/// The process's hung reads, shared by every scan.
+static HUNG_READS: std::sync::LazyLock<std::sync::Arc<HungReads>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// One read's state, shared by the scan and the read's task, so the path leaves `HungReads` exactly
+/// when an abandoned read ends.
+#[derive(Default)]
+struct ReadState {
+    done: bool,
+    abandoned: bool,
+}
+
+/// Marks a read done when its task ends, even by a panic, and takes an abandoned read's path out
+/// of `HungReads`.
+struct ReadEnd {
+    state: std::sync::Arc<std::sync::Mutex<ReadState>>,
+    hung: std::sync::Arc<HungReads>,
+    path: String,
+}
+
+impl Drop for ReadEnd {
+    fn drop(&mut self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.done = true;
+        if state.abandoned {
+            self.hung.lock().remove(&self.path);
+        }
+    }
+}
+
+/// Runs a scan's blocking file reads, each on its own blocking task, waiting at most `wait` for
+/// each. A read it stops waiting for goes on running and its path stays in `hung` until it ends;
+/// later scans skip that path meanwhile. A scan skips the rest of its reads after it stopped
+/// waiting for `MAX_ABANDONED_READS`, or while that many abandoned reads are still running.
+struct FileReads {
+    wait: std::time::Duration,
+    hung: std::sync::Arc<HungReads>,
+    abandoned: usize,
+    warned: bool,
+}
+
+impl FileReads {
+    fn new(wait: std::time::Duration) -> Self {
+        Self::with_hung(wait, HUNG_READS.clone())
+    }
+
+    fn with_hung(wait: std::time::Duration, hung: std::sync::Arc<HungReads>) -> Self {
+        Self {
+            wait,
+            hung,
+            abandoned: 0,
+            warned: false,
+        }
+    }
+
+    /// Whether the scan skips the rest of its reads; warns once.
+    fn given_up(&mut self, library: &str) -> bool {
+        let running = self.hung.len();
+        let given_up = self.abandoned >= MAX_ABANDONED_READS || running >= MAX_ABANDONED_READS;
+        if given_up && !self.warned {
+            self.warned = true;
+            tracing::warn!(
+                "library '{}': {} file reads took over {:?} in this scan and {} abandoned reads are \
+                 still running; the rest are left for a later scan",
+                library,
+                self.abandoned,
+                self.wait,
+                running
+            );
+        }
+        given_up
+    }
+
+    /// Runs `read` for the file at `path`; `None` when the scan stopped waiting for it, its task
+    /// failed, or an earlier abandoned read of the same path is still running.
+    async fn run<R: Send + 'static>(
+        &mut self,
+        path: &str,
+        read: impl FnOnce() -> R + Send + 'static,
+    ) -> Option<R> {
+        if self.hung.contains(path) {
+            tracing::warn!(
+                "an earlier read of '{}' is still running; skipped for this scan",
+                path
+            );
+            return None;
+        }
+        let state = std::sync::Arc::new(std::sync::Mutex::new(ReadState::default()));
+        let end = ReadEnd {
+            state: state.clone(),
+            hung: self.hung.clone(),
+            path: path.to_string(),
+        };
+        let task = tokio::task::spawn_blocking(move || {
+            let _end = end;
+            read()
+        });
+        match tokio::time::timeout(self.wait, task).await {
+            Ok(Ok(result)) => Some(result),
+            Ok(Err(e)) => {
+                tracing::warn!("failed to read '{}': {}", path, e);
+                None
+            }
+            Err(_) => {
+                self.abandoned += 1;
+                let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+                if !state.done {
+                    state.abandoned = true;
+                    self.hung.lock().insert(path.to_string());
+                }
+                tracing::warn!(
+                    "reading '{}' took over {:?}; the scan goes on without it",
+                    path,
+                    self.wait
+                );
+                None
+            }
+        }
+    }
+}
+
+/// Reads a photo's file: its stamp and what it says (`photo_info::read_photo`, or a stand-in in
+/// tests).
+type PhotoReader = fn(&Path) -> (Option<i64>, rustyfin_model::photo::PhotoInfo);
+
+/// What one photo's read gave: the file's stamp and what it says. `changed` when the metadata is to
+/// be stored again; else only the size was read, for a missing Primary image.
+struct PhotoRead {
+    stamp: Option<i64>,
+    info: rustyfin_model::photo::PhotoInfo,
+    changed: bool,
+}
+
+/// Stats and reads one photo; `None` when there's nothing to store: the file is gone, isn't a
+/// regular file, or is unchanged with a Primary image. A FIFO, socket or device named like a photo
+/// is never opened, as an open could block. A read that panics is logged; a changed file then gets
+/// an empty row at its current stamp, so it isn't read again until it changes.
+fn read_one_photo(
+    photo: &rustyfin_db::repo_photo::StoredPhoto,
+    read: PhotoReader,
+) -> Option<PhotoRead> {
+    let path = Path::new(&photo.path);
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() {
+        tracing::warn!("photo '{}' is not a regular file; skipped", photo.path);
+        return None;
+    }
+    let current = crate::image_proxy::file_stamp(&meta);
+    if photo.stamp == Some(Some(current)) {
+        if photo.has_primary {
+            return None;
+        }
+        let read = std::panic::catch_unwind(|| crate::photo_info::read_photo_size(path));
+        let Ok((stamp, width, height)) = read else {
+            tracing::warn!(
+                "reading the size of photo '{}' panicked; skipped",
+                photo.path
+            );
+            return None;
+        };
+        let info = rustyfin_model::photo::PhotoInfo {
+            width,
+            height,
+            ..Default::default()
+        };
+        return Some(PhotoRead {
+            stamp,
+            info,
+            changed: false,
+        });
+    }
+    Some(match std::panic::catch_unwind(|| read(path)) {
+        Ok((stamp, info)) => PhotoRead {
+            stamp,
+            info,
+            changed: true,
+        },
+        Err(_) => {
+            tracing::warn!(
+                "reading photo '{}' panicked; it is skipped until the file changes",
+                photo.path
+            );
+            PhotoRead {
+                stamp: Some(current),
+                info: rustyfin_model::photo::PhotoInfo::default(),
+                changed: true,
+            }
+        }
+    })
+}
+
+/// Stores what a chunk of photos gave: the metadata of each changed one, and a Primary image for
+/// each with none and a readable header. Returns how many metadata rows were stored.
+async fn store_photo_reads(
+    pool: &SqlitePool,
+    reads: Vec<(rustyfin_db::repo_photo::StoredPhoto, PhotoRead)>,
+) -> u32 {
+    let mut count = 0;
+    for (photo, read) in reads {
+        let PhotoRead {
+            stamp,
+            info,
+            changed,
+        } = read;
+        if changed {
+            if let Err(e) =
+                rustyfin_db::repo_photo::save_photo_info(pool, photo.item_id, stamp, &info).await
+            {
+                tracing::warn!("failed to store the metadata of '{}': {}", photo.path, e);
+                continue;
+            }
+            count += 1;
+        }
+        // A file whose header gives no size is no picture to serve.
+        if photo.has_primary || stamp.is_none() || info.width.is_none() {
+            continue;
+        }
+        let image = rustyfin_model::image::ItemImage {
+            item_id: photo.item_id,
+            image_type: ImageType::Primary,
+            image_index: 0,
+            path: photo.path.clone(),
+            provider: "local".to_string(),
+            width: info.width,
+            height: info.height,
+            blurhash: None,
+            stamp,
+        };
+        if let Err(e) = rustyfin_db::repo_image::upsert_image(pool, &image).await {
+            tracing::warn!("failed to store the image of '{}': {}", photo.path, e);
+        }
+    }
+    count
+}
+
+/// Reads a local image's file: its stamp and size (`local_images::local_image_version`, or a
+/// stand-in in tests).
+type ImageReader = fn(&Path) -> (Option<i64>, Option<i32>, Option<i32>);
+
+/// Stats one local image and, when its file changed, reads its stamp and size; `None` when there's
+/// nothing to store. A FIFO, socket or device is never opened, as an open could block. An image
+/// that is its item's own file (a photo's Primary) has its size read from the header alone
+/// (`photo_info::read_photo_size`), as the photo pass does; other images use `read`. A read that
+/// panics is logged and skips the image.
+fn restamp_one(
+    mut img: rustyfin_model::image::ItemImage,
+    own_file: bool,
+    read: ImageReader,
+) -> Option<(rustyfin_model::image::ItemImage, bool)> {
+    let meta = std::fs::metadata(&img.path).ok()?;
+    if !meta.is_file() {
+        tracing::warn!("image '{}' is not a regular file; skipped", img.path);
+        return None;
+    }
+    if img.stamp == Some(crate::image_proxy::file_stamp(&meta)) {
+        return None;
+    }
+    let path = Path::new(&img.path);
+    let version = std::panic::catch_unwind(|| {
+        if own_file {
+            crate::photo_info::read_photo_size(path)
+        } else {
+            read(path)
+        }
+    });
+    let Ok((stamp, width, height)) = version else {
+        tracing::warn!("reading image '{}' panicked; skipped", img.path);
+        return None;
+    };
+    let counted = img.stamp.is_some();
+    img.stamp = Some(stamp?);
+    if let (Some(w), Some(h)) = (width, height) {
+        img.width = Some(w);
+        img.height = Some(h);
+    }
+    Some((img, counted))
+}
+
 /// Restamps the local images of `scope` whose files changed since they were stored, and returns how
 /// many had a stored stamp that changed. An image with no stamp yet is stamped without being counted.
 /// A failed stat or read skips its image, and a database error skips it too, so it counts nothing.
-/// A header that can't be read leaves the stored size.
-async fn restamp_local_images(pool: &SqlitePool, library: &Library, scope: &ScanScope) -> u32 {
+/// A header that can't be read leaves the stored size. Each image is stat'ed and read through
+/// `reads` (see `restamp_one`).
+async fn restamp_local_images(
+    pool: &SqlitePool,
+    library: &Library,
+    scope: &ScanScope,
+    read: ImageReader,
+    reads: &mut FileReads,
+) -> u32 {
     let images = match rustyfin_db::repo_image::get_local_images_in_scope(
         pool,
         library.id,
@@ -271,45 +661,43 @@ async fn restamp_local_images(pool: &SqlitePool, library: &Library, scope: &Scan
         }
     };
     // One stat per image. Only a file whose stamp differs is read again, for its size.
-    let changed = match tokio::task::spawn_blocking(move || {
-        images
-            .into_iter()
-            .filter_map(|mut img| {
-                let meta = std::fs::metadata(&img.path).ok()?;
-                if img.stamp == Some(crate::image_proxy::file_stamp(&meta)) {
-                    return None;
-                }
-                let (stamp, width, height) =
-                    local_images::local_image_version(Path::new(&img.path));
-                let counted = img.stamp.is_some();
-                img.stamp = Some(stamp?);
-                if let (Some(w), Some(h)) = (width, height) {
-                    img.width = Some(w);
-                    img.height = Some(h);
-                }
-                Some((img, counted))
-            })
-            .collect::<Vec<_>>()
-    })
-    .await
-    {
-        Ok(changed) => changed,
-        Err(e) => {
-            tracing::warn!(
-                "failed to stat the images of library '{}': {}",
-                library.name,
-                e
-            );
-            return 0;
+    let mut changed = Vec::new();
+    for (img, own_file) in images {
+        if reads.given_up(&library.name) {
+            break;
         }
-    };
+        let path = img.path.clone();
+        if let Some(Some(result)) = reads
+            .run(&path, move || restamp_one(img, own_file, read))
+            .await
+        {
+            changed.push(result);
+        }
+    }
 
-    // The blurhashes are computed first, so the stores below run as one batch.
+    // The blurhashes are computed first, so the stores below run as one batch. Each runs through
+    // `reads`, with a panic caught; one that doesn't finish keeps the image's old blurhash.
     let mut counted_images = 0;
     let mut batch = Vec::with_capacity(changed.len());
     for (mut img, counted) in changed {
         if counted {
-            img.blurhash = crate::image_proxy::compute_blurhash(&img.path, None).await;
+            if !reads.given_up(&library.name) {
+                let path = img.path.clone();
+                let hash = reads
+                    .run(&img.path, move || {
+                        std::panic::catch_unwind(|| {
+                            crate::image_proxy::local_blurhash(Path::new(&path))
+                        })
+                    })
+                    .await;
+                match hash {
+                    Some(Ok(hash)) => img.blurhash = hash,
+                    Some(Err(_)) => {
+                        tracing::warn!("the blurhash of image '{}' panicked; kept", img.path)
+                    }
+                    None => {}
+                }
+            }
             counted_images += 1;
         }
         batch.push(img);
@@ -1946,7 +2334,9 @@ fn detect_media_type(ext: &str, content_type: &LibraryContentType) -> Option<Med
         LibraryContentType::Movies if VIDEO_EXTENSIONS.contains(&ext) => Some(MediaType::Movie),
         LibraryContentType::TvShows if VIDEO_EXTENSIONS.contains(&ext) => Some(MediaType::Episode),
         LibraryContentType::Music if AUDIO_EXTENSIONS.contains(&ext) => Some(MediaType::Audio),
+        // A home videos library holds photos and home videos, as Jellyfin's does.
         LibraryContentType::Photos if PHOTO_EXTENSIONS.contains(&ext) => Some(MediaType::Photo),
+        LibraryContentType::Photos if VIDEO_EXTENSIONS.contains(&ext) => Some(MediaType::Video),
         LibraryContentType::Mixed => {
             if VIDEO_EXTENSIONS.contains(&ext) {
                 Some(MediaType::Movie)
@@ -2358,5 +2748,414 @@ mod tests {
         // Any other error, here a symlink loop, says nothing about the folder.
         assert_eq!(season_location(&at("loop")).await, None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A temp dir, removed when the test ends, whether it passed or not.
+    struct TempDir(PathBuf);
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A database and a Photos library on `<dir>/photos` with one Photo item per file name, which
+    /// is written as a small JPEG unless the caller makes it. Returns the pool, the library and the
+    /// folder.
+    async fn r2photos_world(dir: &Path, names: &[&str]) -> (SqlitePool, Library, PathBuf) {
+        let folder = dir.join("photos");
+        std::fs::create_dir_all(&folder).unwrap();
+        let pool = rustyfin_db::init_db(dir.join("test.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let lib = Library {
+            id: Uuid::new_v4(),
+            name: "R2 photos".to_string(),
+            content_type: LibraryContentType::Photos,
+            paths: vec![folder.to_string_lossy().into_owned()],
+        };
+        rustyfin_db::repo_library::create_library(&pool, &lib)
+            .await
+            .unwrap();
+        for name in names {
+            sqlx::query(
+                "INSERT INTO media_items (id, library_id, name, media_type, path) \
+                 VALUES (?, ?, ?, 'Photo', ?)",
+            )
+            .bind(Uuid::new_v4().to_string())
+            .bind(lib.id.to_string())
+            .bind(*name)
+            .bind(folder.join(name).to_string_lossy().into_owned())
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        (pool, lib, folder)
+    }
+
+    fn r2photos_jpeg(path: &Path) {
+        image::RgbImage::from_pixel(8, 6, image::Rgb([1, 2, 3]))
+            .save(path)
+            .unwrap();
+    }
+
+    /// Each stored photo's file name and width.
+    async fn r2photos_rows(pool: &SqlitePool) -> Vec<(String, Option<i32>)> {
+        let mut rows: Vec<(String, Option<i32>)> = sqlx::query_as(
+            "SELECT m.name, p.width FROM photo_metadata p JOIN media_items m ON m.id = p.item_id",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        rows.sort();
+        rows
+    }
+
+    /// The file name of `path`, for the readers' logs.
+    fn r2photos_name(path: &Path) -> String {
+        path.file_name().unwrap().to_string_lossy().into_owned()
+    }
+
+    /// Runs a test's body on its own runtime with a deadline of 60 s, and doesn't wait for blocking
+    /// tasks still running at the end, so a test whose read blocks fails instead of hanging.
+    fn r2photos_block_on(body: impl std::future::Future<Output = ()>) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let deadline = std::time::Duration::from_secs(60);
+        let done = rt.block_on(async { tokio::time::timeout(deadline, body).await });
+        rt.shutdown_timeout(std::time::Duration::from_millis(100));
+        done.expect("the test timed out: a read blocked");
+    }
+
+    /// Waits, up to 30 s, until `cond` holds.
+    async fn r2photos_until(what: &str, cond: impl Fn() -> bool) {
+        for _ in 0..3000 {
+            if cond() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting until {what}");
+    }
+
+    /// Blocks until `release` is set.
+    fn r2photos_wait_for(release: &std::sync::atomic::AtomicBool) {
+        while !release.load(std::sync::atomic::Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// The files `r2photos_reader` was called for, in order.
+    static R2PHOTOS_READ: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    /// Lets `r2photos_reader`'s reads of `hang.jpg` end.
+    static R2PHOTOS_RELEASE: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    /// `photo_info::read_photo`, except that `panic.jpg` panics and `hang.jpg` blocks until
+    /// `R2PHOTOS_RELEASE` is set. Each call is logged in `R2PHOTOS_READ` first.
+    fn r2photos_reader(path: &Path) -> (Option<i64>, rustyfin_model::photo::PhotoInfo) {
+        R2PHOTOS_READ.lock().unwrap().push(r2photos_name(path));
+        match path.file_name().and_then(|n| n.to_str()) {
+            Some("panic.jpg") => panic!("r2photos: a reader that panics"),
+            Some("hang.jpg") => r2photos_wait_for(&R2PHOTOS_RELEASE),
+            _ => {}
+        }
+        crate::photo_info::read_photo(path)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn r2photos_a_fifo_named_like_a_photo_does_not_block_the_pass() {
+        r2photos_block_on(async {
+            let temp =
+                TempDir(std::env::temp_dir().join(format!("r2photos-fifo-{}", Uuid::new_v4())));
+            let (pool, lib, folder) = r2photos_world(&temp.0, &["fifo.jpg", "good.jpg"]).await;
+            r2photos_jpeg(&folder.join("good.jpg"));
+            let fifo = std::ffi::CString::new(folder.join("fifo.jpg").to_str().unwrap()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+
+            let hung = std::sync::Arc::new(HungReads::default());
+            let mut reads = FileReads::with_hung(std::time::Duration::from_secs(5), hung);
+            let read = crate::photo_info::read_photo;
+            let count = read_photos(&pool, &lib, &ScanScope::Library, read, &mut reads).await;
+            // The FIFO was never opened: no read was given up on.
+            assert_eq!(reads.abandoned, 0);
+            assert_eq!(count, 1);
+            assert_eq!(r2photos_rows(&pool).await, [("good.jpg".into(), Some(8))]);
+        });
+    }
+
+    #[test]
+    fn r2photos_a_photo_that_fails_panics_or_hangs_is_skipped_and_the_rest_are_saved() {
+        r2photos_block_on(r2photos_bad_photos());
+    }
+
+    async fn r2photos_bad_photos() {
+        let temp = TempDir(std::env::temp_dir().join(format!("r2photos-bad-{}", Uuid::new_v4())));
+        let names = ["bad.jpg", "good.jpg", "hang.jpg", "panic.jpg"];
+        let (pool, lib, folder) = r2photos_world(&temp.0, &names).await;
+        for name in ["good.jpg", "panic.jpg", "hang.jpg"] {
+            r2photos_jpeg(&folder.join(name));
+        }
+        std::fs::write(
+            folder.join("bad.jpg"),
+            b"\xFF\xD8\xFF\xE1\xFF\xFFnot a jpeg",
+        )
+        .unwrap();
+        let hang = folder.join("hang.jpg").to_string_lossy().into_owned();
+
+        // The hanging read blocks until released, so it times out whatever the machine's load.
+        let wait = std::time::Duration::from_secs(5);
+        let hung = std::sync::Arc::new(HungReads::default());
+        let scope = ScanScope::Library;
+        let mut reads = FileReads::with_hung(wait, hung.clone());
+        let count = read_photos(&pool, &lib, &scope, r2photos_reader, &mut reads).await;
+        // The parser's failure gives an empty row, the panic one too (so it isn't read again until
+        // the file changes), and the hanging photo is left for a later scan.
+        assert_eq!(count, 3);
+        assert!(hung.contains(&hang));
+        let mut first = std::mem::take(&mut *R2PHOTOS_READ.lock().unwrap());
+        first.sort();
+        assert_eq!(first, ["bad.jpg", "good.jpg", "hang.jpg", "panic.jpg"]);
+        assert_eq!(
+            r2photos_rows(&pool).await,
+            [
+                ("bad.jpg".into(), None),
+                ("good.jpg".into(), Some(8)),
+                ("panic.jpg".into(), None),
+            ]
+        );
+        let primaries: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM item_images WHERE image_type = 'Primary'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(primaries, 1);
+
+        // A second scan skips the photo whose read still runs, and stores nothing. The unchanged
+        // photos with no Primary get only their header read for one: panic.jpg is a whole JPEG, so
+        // it gets its Primary now; bad.jpg has no size, so none.
+        let mut reads = FileReads::with_hung(wait, hung.clone());
+        let count = read_photos(&pool, &lib, &scope, r2photos_reader, &mut reads).await;
+        assert_eq!(count, 0);
+        assert!(R2PHOTOS_READ.lock().unwrap().is_empty());
+        assert_eq!(reads.abandoned, 0);
+        let primaries: Vec<String> = sqlx::query_scalar(
+            "SELECT m.name FROM item_images i JOIN media_items m ON m.id = i.item_id \
+             WHERE i.image_type = 'Primary' ORDER BY m.name",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(primaries, ["good.jpg", "panic.jpg"]);
+
+        // Once the hanging read ends, its path is free, and the next scan reads that photo alone.
+        R2PHOTOS_RELEASE.store(true, std::sync::atomic::Ordering::SeqCst);
+        r2photos_until("the hanging read ended", || hung.len() == 0).await;
+        let mut reads = FileReads::with_hung(wait, hung.clone());
+        let count = read_photos(&pool, &lib, &scope, r2photos_reader, &mut reads).await;
+        assert_eq!(count, 1);
+        assert_eq!(*R2PHOTOS_READ.lock().unwrap(), ["hang.jpg"]);
+    }
+
+    /// The files `r2photos_hanging_reader` was called for.
+    static R2PHOTOS_HUNG: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    /// Lets `r2photos_hanging_reader`'s reads end.
+    static R2PHOTOS_RELEASE_ALL: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    /// A reader that logs its call in `R2PHOTOS_HUNG`, then blocks until `R2PHOTOS_RELEASE_ALL` is
+    /// set.
+    fn r2photos_hanging_reader(path: &Path) -> (Option<i64>, rustyfin_model::photo::PhotoInfo) {
+        R2PHOTOS_HUNG.lock().unwrap().push(r2photos_name(path));
+        r2photos_wait_for(&R2PHOTOS_RELEASE_ALL);
+        crate::photo_info::read_photo(path)
+    }
+
+    #[test]
+    fn r2photos_abandoned_reads_are_capped_within_and_across_scans() {
+        r2photos_block_on(r2photos_cap());
+    }
+
+    async fn r2photos_cap() {
+        let temp = TempDir(std::env::temp_dir().join(format!("r2photos-cap-{}", Uuid::new_v4())));
+        let names = ["1.jpg", "2.jpg", "3.jpg", "4.jpg", "5.jpg"];
+        let (pool, lib, folder) = r2photos_world(&temp.0, &names).await;
+        for name in names {
+            r2photos_jpeg(&folder.join(name));
+        }
+        // Every read blocks until released, so each one times out whatever the machine's load.
+        let wait = std::time::Duration::from_millis(200);
+        let hung = std::sync::Arc::new(HungReads::default());
+        let scope = ScanScope::Library;
+        let mut reads = FileReads::with_hung(wait, hung.clone());
+        let count = read_photos(&pool, &lib, &scope, r2photos_hanging_reader, &mut reads).await;
+        assert_eq!(count, 0);
+        // Three reads were abandoned and still run; the other two were never started.
+        assert_eq!(reads.abandoned, 3);
+        assert_eq!(hung.len(), 3);
+        assert!(reads.given_up(&lib.name));
+        r2photos_until("the three reads started", || {
+            R2PHOTOS_HUNG.lock().unwrap().len() >= 3
+        })
+        .await;
+
+        // The image restamp in the same scan reads nothing either.
+        let image = rustyfin_model::image::ItemImage {
+            item_id: r2photos_item(&pool, "1.jpg").await,
+            image_type: ImageType::Backdrop,
+            image_index: 0,
+            path: folder.join("5.jpg").to_string_lossy().into_owned(),
+            provider: "local".to_string(),
+            width: None,
+            height: None,
+            blurhash: None,
+            stamp: None,
+        };
+        rustyfin_db::repo_image::upsert_image(&pool, &image)
+            .await
+            .unwrap();
+        restamp_local_images(&pool, &lib, &scope, r2photos_image_reader, &mut reads).await;
+        assert_eq!(r2photos_stamps(&pool).await, [("5.jpg".into(), None)]);
+
+        // A later scan, while those three reads still run, reads nothing at all.
+        let mut reads = FileReads::with_hung(wait, hung.clone());
+        let count = read_photos(&pool, &lib, &scope, r2photos_hanging_reader, &mut reads).await;
+        assert_eq!(count, 0);
+        restamp_local_images(&pool, &lib, &scope, r2photos_image_reader, &mut reads).await;
+        assert_eq!(reads.abandoned, 0);
+        assert_eq!(R2PHOTOS_HUNG.lock().unwrap().len(), 3);
+        assert_eq!(r2photos_stamps(&pool).await, [("5.jpg".into(), None)]);
+
+        // When they end, the next scan reads every photo, and the restamp runs.
+        R2PHOTOS_RELEASE_ALL.store(true, std::sync::atomic::Ordering::SeqCst);
+        r2photos_until("the hung reads ended", || hung.len() == 0).await;
+        let mut reads = FileReads::with_hung(wait, hung.clone());
+        let count = read_photos(&pool, &lib, &scope, r2photos_hanging_reader, &mut reads).await;
+        assert_eq!(count, 5);
+        assert_eq!(R2PHOTOS_HUNG.lock().unwrap().len(), 8);
+    }
+
+    /// The id of the item named `name`.
+    async fn r2photos_item(pool: &SqlitePool, name: &str) -> Uuid {
+        let id: String = sqlx::query_scalar("SELECT id FROM media_items WHERE name = ?")
+            .bind(name)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        Uuid::parse_str(&id).unwrap()
+    }
+
+    /// Each stored image's file name and stamp, by file name.
+    async fn r2photos_stamps(pool: &SqlitePool) -> Vec<(String, Option<i64>)> {
+        let rows: Vec<(String, Option<i64>)> =
+            sqlx::query_as("SELECT path, stamp FROM item_images ORDER BY path")
+                .fetch_all(pool)
+                .await
+                .unwrap();
+        rows.into_iter()
+            .map(|(path, stamp)| (r2photos_name(Path::new(&path)), stamp))
+            .collect()
+    }
+
+    /// The files `r2photos_image_reader` was called for.
+    static R2PHOTOS_IMAGES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    /// `local_images::local_image_version`, except that `panic.jpg` panics. Each call is logged in
+    /// `R2PHOTOS_IMAGES` first.
+    fn r2photos_image_reader(path: &Path) -> (Option<i64>, Option<i32>, Option<i32>) {
+        R2PHOTOS_IMAGES.lock().unwrap().push(r2photos_name(path));
+        if path.ends_with("panic.jpg") {
+            panic!("r2photos: an image reader that panics");
+        }
+        local_images::local_image_version(path)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn r2photos_the_image_restamp_skips_fifos_and_panics_and_reads_a_photo_header_only() {
+        r2photos_block_on(r2photos_restamp());
+    }
+
+    #[cfg(unix)]
+    async fn r2photos_restamp() {
+        let temp = TempDir(std::env::temp_dir().join(format!("r2photos-stamp-{}", Uuid::new_v4())));
+        let (pool, lib, folder) = r2photos_world(&temp.0, &["photo.jpg"]).await;
+        let item_id = r2photos_item(&pool, "photo.jpg").await;
+        r2photos_jpeg(&folder.join("photo.jpg"));
+        r2photos_jpeg(&folder.join("good.jpg"));
+        r2photos_jpeg(&folder.join("panic.jpg"));
+        std::fs::write(folder.join("garbage.jpg"), b"\xFF\xD8 not a picture").unwrap();
+        let fifo = std::ffi::CString::new(folder.join("fifo.jpg").to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let images = [
+            (ImageType::Primary, 0, "photo.jpg"),
+            (ImageType::Backdrop, 0, "fifo.jpg"),
+            (ImageType::Backdrop, 1, "panic.jpg"),
+            (ImageType::Backdrop, 2, "garbage.jpg"),
+            (ImageType::Thumb, 0, "good.jpg"),
+        ];
+        for (image_type, image_index, name) in images {
+            // good.jpg and garbage.jpg were stamped before and changed since, so they get a new
+            // blurhash; the rest are stamped for the first time.
+            let changed = matches!(name, "good.jpg" | "garbage.jpg");
+            let image = rustyfin_model::image::ItemImage {
+                item_id,
+                image_type,
+                image_index,
+                path: folder.join(name).to_string_lossy().into_owned(),
+                provider: "local".to_string(),
+                width: None,
+                height: None,
+                blurhash: changed.then(|| "old".to_string()),
+                stamp: changed.then_some(1),
+            };
+            rustyfin_db::repo_image::upsert_image(&pool, &image)
+                .await
+                .unwrap();
+        }
+
+        let hung = std::sync::Arc::new(HungReads::default());
+        let mut reads = FileReads::with_hung(std::time::Duration::from_secs(5), hung);
+        let scope = ScanScope::Library;
+        let counted =
+            restamp_local_images(&pool, &lib, &scope, r2photos_image_reader, &mut reads).await;
+        // The FIFO was never opened: no read was given up on.
+        assert_eq!(reads.abandoned, 0);
+        assert_eq!(counted, 2);
+        let hashes: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT path, blurhash FROM item_images WHERE path GLOB '*good.jpg' \
+             OR path GLOB '*garbage.jpg' ORDER BY path",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        // The changed picture gets its new blurhash; garbage that can't be decoded gets none.
+        assert_eq!(hashes[0].1, None, "{hashes:?}");
+        assert!(
+            hashes[1].1.as_deref().is_some_and(|h| h != "old"),
+            "{hashes:?}"
+        );
+
+        let stamped: Vec<(String, bool)> = r2photos_stamps(&pool)
+            .await
+            .into_iter()
+            .map(|(name, stamp)| (name, stamp.is_some()))
+            .collect();
+        assert_eq!(
+            stamped,
+            [
+                ("fifo.jpg".into(), false),
+                ("garbage.jpg".into(), true),
+                ("good.jpg".into(), true),
+                ("panic.jpg".into(), false),
+                ("photo.jpg".into(), true),
+            ]
+        );
+        // The FIFO is never opened, and the photo's own file is read by its header alone.
+        let mut called = R2PHOTOS_IMAGES.lock().unwrap().clone();
+        called.sort();
+        assert_eq!(called, ["garbage.jpg", "good.jpg", "panic.jpg"]);
     }
 }
