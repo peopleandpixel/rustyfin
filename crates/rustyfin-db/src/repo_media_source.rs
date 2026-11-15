@@ -109,7 +109,7 @@ struct MediaStreamRow {
 impl From<MediaStreamRow> for MediaStream {
     fn from(r: MediaStreamRow) -> Self {
         // The stored type is ignored: older probes wrote "Embedded" or "External" there
-        let stream_type = MediaStream::stream_type(&r.codec_type);
+        let stream_type = MediaStream::stream_type(&r.codec_type, r.codec.as_deref());
         Self {
             index: r.index,
             codec: r.codec,
@@ -799,7 +799,10 @@ pub async fn get_media_sources_batch(
                     channel_layout: row.channel_layout.clone(),
                     sample_rate: row.sample_rate,
                     profile: row.profile.clone(),
-                    r#type: MediaStream::stream_type(row.codec_type.as_deref().unwrap_or("")),
+                    r#type: MediaStream::stream_type(
+                        row.codec_type.as_deref().unwrap_or(""),
+                        row.codec.as_deref(),
+                    ),
                     aspect_ratio_text: row.aspect_ratio_text.clone(),
                     aspect_ratio: row.stream_aspect_ratio,
                     title: row.title.clone(),

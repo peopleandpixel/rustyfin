@@ -219,7 +219,7 @@ pub(crate) async fn external_streams(source: &MediaSourceResponse) -> Vec<MediaS
             language: file.language,
             is_external: true,
             path: Some(file.path.to_string_lossy().into_owned()),
-            r#type: MediaStream::stream_type("subtitle"),
+            r#type: MediaStream::stream_type("subtitle", None),
             ..Default::default()
         })
         .collect()

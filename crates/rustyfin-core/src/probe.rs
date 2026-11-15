@@ -683,7 +683,10 @@ fn stream_to_model(s: FfprobeStream) -> MediaStream {
         .map(str::to_string)
         .or(s.title);
 
-    let stream_type = MediaStream::stream_type(s.codec_type.as_deref().unwrap_or(""));
+    let stream_type = MediaStream::stream_type(
+        s.codec_type.as_deref().unwrap_or(""),
+        s.codec_name.as_deref(),
+    );
 
     // As in Jellyfin, only the disposition makes a subtitle forced; a title or codec name
     // that says "forced" does not

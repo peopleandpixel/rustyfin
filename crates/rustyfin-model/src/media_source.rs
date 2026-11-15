@@ -208,10 +208,17 @@ impl MediaStream {
         }
     }
 
-    /// Jellyfin's MediaStreamType for an ffprobe codec type: "Video", "Audio", "Subtitle" or
-    /// "Data"; None for any other (an attachment, which Jellyfin leaves out of MediaStreams).
-    pub fn stream_type(codec_type: &str) -> Option<String> {
+    /// Jellyfin's MediaStreamType for an ffprobe codec type and codec: "Video", "EmbeddedImage"
+    /// (a picture codec, as cover art is), "Audio", "Subtitle" or "Data"; None for any other (an
+    /// attachment, which Jellyfin leaves out of MediaStreams).
+    pub fn stream_type(codec_type: &str, codec: Option<&str>) -> Option<String> {
+        let picture = codec.is_some_and(|c| {
+            ["mjpeg", "png", "gif", "webp"]
+                .iter()
+                .any(|p| p.eq_ignore_ascii_case(c))
+        });
         let kind = match codec_type.to_ascii_lowercase().as_str() {
+            "video" if picture => "EmbeddedImage",
             "video" => "Video",
             "audio" => "Audio",
             "subtitle" => "Subtitle",
@@ -294,7 +301,7 @@ mod tests {
             codec: Some("hdmv_pgs_subtitle".into()),
             codec_type: "subtitle".into(),
             language: Some("ger".into()),
-            r#type: MediaStream::stream_type("subtitle"),
+            r#type: MediaStream::stream_type("subtitle", Some("hdmv_pgs_subtitle")),
             ..Default::default()
         };
         let json = serde_json::to_value(&stream).unwrap();
@@ -312,8 +319,11 @@ mod tests {
         assert_eq!(jellyfin_language("eng"), "eng");
         assert_eq!(jellyfin_language("CHI"), "zho");
         assert_eq!(jellyfin_language("und"), "und");
-        assert_eq!(MediaStream::stream_type("Audio").as_deref(), Some("Audio"));
-        assert_eq!(MediaStream::stream_type("data").as_deref(), Some("Data"));
-        assert_eq!(MediaStream::stream_type("attachment"), None);
+        let kind = |t, c| MediaStream::stream_type(t, Some(c));
+        assert_eq!(kind("Audio", "aac").as_deref(), Some("Audio"));
+        assert_eq!(kind("data", "bin_data").as_deref(), Some("Data"));
+        assert_eq!(kind("video", "hevc").as_deref(), Some("Video"));
+        assert_eq!(kind("video", "mjpeg").as_deref(), Some("EmbeddedImage"));
+        assert_eq!(kind("attachment", "ttf"), None);
     }
 }
