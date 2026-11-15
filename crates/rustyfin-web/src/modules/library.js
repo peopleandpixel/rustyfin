@@ -3,7 +3,10 @@
 import { $, icon, toast, escapeHtml, scanRing } from './util.js';
 import { createCardElement } from './cards.js';
 import { hashRoute } from './router.js';
+import { musicTab, rememberMusicTab, musicTabBar, renderMusicTab } from './music.js';
 let currentLibraryId = null;
+// The route shown (library/<this>): the library id, then a music library's tab and genre
+let currentLibraryRoute = null;
 
 
 // --- BlurHash previews (https://blurha.sh): cards paint the server's ImageBlurHashes at once ---
@@ -570,9 +573,13 @@ function addInfiniteScrollSentinel(container) {
 }
 
 // --- Library Explorer Page Renderer (with pagination) ---
-async function renderLibrary(libId) {
+// The route is a library id, then for a music library its tab (library/<id>/songs) and, for a
+// genre, its id (library/<id>/genres/<genre id>)
+async function renderLibrary(route) {
+    const [libId, tab, sub] = String(route || '').split('/');
     const session = API.token;
     currentLibraryId = libId;
+    currentLibraryRoute = route;
     const page = $('page-library');
     
     // Show skeleton grid immediately for instant visual feedback
@@ -581,6 +588,16 @@ async function renderLibrary(libId) {
     const contentType = lib?.content_type || lib?.Content_type || lib?.ContentType || '';
     const libIcon = contentType === 'Movies' ? 'Film' : contentType === 'TvShows' ? 'Tv' : contentType === 'Music' ? 'Music' : 'Folder';
     const headerIcon = { Movies: 'Film', TvShows: 'Tv', Music: 'Music' }[lib?.content_type] || 'Folder';
+    // A music library's tabs other than Albums are drawn by music.js; Albums is this grid
+    const musicView = contentType === 'Music' ? musicTab(libId, tab, sub) : null;
+    if (musicView && musicView !== 'albums') {
+        stopLibraryLoad();
+        // A scan refresh draws this tab again (see library-admin.js), not the one last shown
+        currentLibraryRoute = musicView === 'genre' ? `${libId}/genres/${sub}` : `${libId}/${musicView}`;
+        renderMusicTab(libId, libName, musicView, sub);
+        return;
+    }
+    if (musicView) rememberMusicTab(libId, 'albums');
     
     page.innerHTML = `
     <div class="jf-page">
@@ -677,6 +694,8 @@ async function renderLibrary(libId) {
                     </button>
                 </div>
             </div>
+
+            ${musicView ? musicTabBar(libId, 'albums') : ''}
 
             <!-- Media Grid Container -->
             <div id="lib-grid-container"></div>
@@ -1219,6 +1238,7 @@ function libraryFillCell(i) {
 // page comes); the cards on screen stay meanwhile, and the index is asked again once things
 // settle. Returns false when no list is open.
 function libraryRefreshInPlace() {
+
     if (!libraryView || libraryTotal == null) return false;
     for (const controller of libraryInFlight.values()) controller.abort();
     libraryInFlight = new Map();
@@ -1912,8 +1932,8 @@ window.addEventListener('scroll', scheduleRailUpdate, { passive: true });
 window.addEventListener('resize', scheduleRailUpdate);
 
 export {
-    currentLibraryId, blurhashTint, posterLoaded, posterFailed, LIBRARY_PAGE_SIZE, setupInfiniteScroll,
-    destroyInfiniteScroll, renderLibrary, stopLibraryLoad, libraryRefreshInPlace, libraryRemember, startGridDiag,
+    currentLibraryId, currentLibraryRoute, blurhashTint, posterLoaded, posterFailed, LIBRARY_PAGE_SIZE, setupInfiniteScroll,
+    destroyInfiniteScroll, addInfiniteScrollSentinel, renderLibrary, stopLibraryLoad, libraryRefreshInPlace, libraryRemember, startGridDiag,
     jumpToLetter, clearLibraryFilters,
 };
 

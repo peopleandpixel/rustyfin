@@ -73,7 +73,7 @@ function sandbox({ responses = {}, me = { Configuration: {} } } = {}) {
     );
     // playItem and the resume choice are logged, not run
     context.playItem = (id, type, title, opts) => log.push(['playItem', id, type, title, JSON.parse(JSON.stringify(opts))]);
-    context.playWithResumeChoice = (id, type, title, opts) => log.push(['resumeChoice', id, type, title, JSON.parse(JSON.stringify(opts))]);
+    context.playWithResumeChoice = (id, type, title, selection, opts) => log.push(['resumeChoice', id, type, title, selection, JSON.parse(JSON.stringify(opts))]);
     return { fns: context.fns, state: context.state, setActive: context.setActive, log, elements, handlers };
 }
 
@@ -118,7 +118,7 @@ test('a series starts at its Next Up episode, else its first unplayed one; Shuff
     const box = sandbox({ responses: { '/Items/s': { Id: 's', Type: 'Series' }, '/Shows/s/Episodes': { Items: episodes }, '/Shows/NextUp': { Items: [{ Id: 'e150' }] } } });
     await box.fns.playContainer('s');
     assert.ok(box.log.some(e => e[0] === 'get' && e[1] === '/Shows/NextUp?SeriesId=s&Limit=1'));
-    assert.deepEqual(box.log.at(-1), ['resumeChoice', 'e150', 'Videos', 'E150', { queued: true }]);
+    assert.deepEqual(box.log.at(-1), ['resumeChoice', 'e150', 'Videos', 'E150', null, { queued: true }]);
     assert.equal(box.state().playQueue.index, 150);
 });
 
@@ -127,7 +127,7 @@ test('Shuffle plays the random list from its first item; previous and next walk 
     const box = sandbox({ responses: { '/Items/al': { Id: 'al', Type: 'MusicAlbum' }, '/Items?': { Items: songs } } });
     await box.fns.playContainer('al', { shuffle: true });
     assert.equal(query(box.log[1][1]).SortBy, 'Random');
-    assert.deepEqual(box.log[2], ['resumeChoice', 'x', 'Audio', 'X', { queued: true }]);
+    assert.deepEqual(box.log[2], ['resumeChoice', 'x', 'Audio', 'X', null, { queued: true }]);
     assert.equal(box.state().playQueue.items.length, 2, 'folders are left out');
     assert.deepEqual(JSON.parse(JSON.stringify(box.fns.queueNeighbours())), { prev: null, next: songs[1] });
     assert.equal(box.fns.playQueueStep(1), true);
@@ -201,7 +201,7 @@ test('the player ends the queue on any other play and on close; Play all and Shu
     assert.match(slice(playerJs, 'function onPlayerClosed('), /clearQueue\(\);/);
     // The resume choice passes the queue on, and a cancelled choice ends it
     const choice = slice(playerJs, 'async function playWithResumeChoice(');
-    assert.match(choice, /playItem\(itemId, streamType, title, \{ \.\.\.opts, fromStart: true \}\)/);
+    assert.match(choice, /playItem\(itemId, streamType, title, \{ \.\.\.opts, fromStart: true, selection \}\)/);
     assert.match(choice, /else if \(opts\.queued\) clearQueue\(\);/);
     const router = read('modules/router.js');
     assert.match(router, /'play-all': el => playContainer\(el\.dataset\.id\)/);

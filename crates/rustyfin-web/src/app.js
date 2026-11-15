@@ -12,6 +12,7 @@ import {
 } from './modules/auth.js';
 import './modules/home.js';
 import { posterLoaded, posterFailed } from './modules/library.js';
+import './modules/music.js';
 import './modules/item.js';
 import { doSearch } from './modules/search.js';
 import {
@@ -25,7 +26,9 @@ import { refreshTasks, openAddUser, closeAddUser, submitAddUser, clearLiveLog, s
 import {
     jiAddPair, jiForget, jiSetMine, jiSetChoice, jiSetConfirm, jiPreview, jiRun, jiNewCode, jiCopyCodes,
 } from './modules/jellyfin-import.js';
-import { openAddLibrary, closeAddLibrary, submitAddLibrary } from './modules/library-admin.js';
+import {
+    openAddLibrary, closeAddLibrary, submitAddLibrary, closeLibraryOptions, submitLibraryOptions,
+} from './modules/library-admin.js';
 import { closePluginConfig, savePluginConfig, closePluginPriority, savePluginPriority } from './modules/plugins.js';
 
 Object.assign(window, {
@@ -36,7 +39,8 @@ Object.assign(window, {
     togglePictureInPicture, skipSegment, hoverSeek, hideTrickplay, renderLogin,
     handleLogin, handleSetupPassword, doLogout, showQuickConnectModal, authorizeQuickConnect, changeNextEpisodeAutoPlay,
     changeUiLanguage, handleSaveConfig, jiAddPair, jiForget, jiSetMine, jiSetChoice, jiSetConfirm, jiPreview, jiRun,
-    jiNewCode, jiCopyCodes, refreshTasks, openAddLibrary, closeAddLibrary, submitAddLibrary, openAddUser, closeAddUser,
+    jiNewCode, jiCopyCodes, refreshTasks, openAddLibrary, closeAddLibrary, submitAddLibrary, closeLibraryOptions,
+    submitLibraryOptions, openAddUser, closeAddUser,
     submitAddUser, clearLiveLog, setLogLevel, closePluginConfig, savePluginConfig, closePluginPriority,
     savePluginPriority,
 });

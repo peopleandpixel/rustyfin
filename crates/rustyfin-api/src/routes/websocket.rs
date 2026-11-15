@@ -91,6 +91,19 @@ async fn ws_handler(
 /// Seconds between re-checks of an open websocket's user token.
 const WS_TOKEN_RECHECK_SECS: u64 = 5;
 
+/// The timer of a `ScheduledTasksInfoStart`, whose data is Jellyfin's "initialDelayMs,intervalMs"
+/// (as Jellyfin Web sends "0,1000"). The interval is at least 500 ms; it defaults to 1000.
+fn tasks_info_timer(data: Option<&serde_json::Value>) -> tokio::time::Interval {
+    let text = data.and_then(serde_json::Value::as_str).unwrap_or("");
+    let mut parts = text.split(',').map(|p| p.trim().parse::<u64>().ok());
+    let delay = parts.next().flatten().unwrap_or(0);
+    let every = parts.next().flatten().unwrap_or(1000).max(500);
+    let start = tokio::time::Instant::now() + std::time::Duration::from_millis(delay);
+    let mut timer = tokio::time::interval_at(start, std::time::Duration::from_millis(every));
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    timer
+}
+
 /// True only when an API key is configured and the token is that key.
 fn is_api_key(api_key: Option<&str>, token: &str) -> bool {
     api_key.is_some_and(|key| token == key)
@@ -167,6 +180,8 @@ async fn handle_socket(socket: WebSocket, state: AppState, token: String) {
 
     let period = std::time::Duration::from_secs(WS_TOKEN_RECHECK_SECS);
     let mut recheck = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    // The ScheduledTasksInfo timer an administrator's ScheduledTasksInfoStart sets
+    let mut tasks_info: Option<tokio::time::Interval> = None;
 
     loop {
         tokio::select! {
@@ -187,11 +202,20 @@ async fn handle_socket(socket: WebSocket, state: AppState, token: String) {
                                         let _ = sender.send(Message::Text(json.into())).await;
                                     }
                                 }
-                                "SessionsStart" | "ScheduledTasksInfoStart" | "ActivityLogEntryStart" => {
+                                // Only an administrator may follow the tasks; the timer also
+                                // checks, for a socket whose user is demoted
+                                "ScheduledTasksInfoStart" if viewer.is_admin => {
+                                    tasks_info = Some(tasks_info_timer(incoming.data.as_ref()));
+                                }
+                                "ScheduledTasksInfoStart" => {
+                                    tracing::debug!("ws: ScheduledTasksInfoStart from a non-administrator ignored");
+                                }
+                                "ScheduledTasksInfoStop" => tasks_info = None,
+                                "SessionsStart" | "ActivityLogEntryStart" => {
                                     // Acknowledge subscription-style messages
                                     tracing::debug!("ws subscription: {}", incoming.message_type);
                                 }
-                                "SessionsStop" | "ScheduledTasksInfoStop" | "ActivityLogEntryStop" => {
+                                "SessionsStop" | "ActivityLogEntryStop" => {
                                     tracing::debug!("ws unsubscribe: {}", incoming.message_type);
                                 }
                                 other => {
@@ -273,6 +297,22 @@ async fn handle_socket(socket: WebSocket, state: AppState, token: String) {
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         // Command sender dropped, ignore
+                    }
+                }
+            }
+
+            // The tasks and their progress, to an administrator that asked for them
+            _ = async { tasks_info.as_mut().unwrap().tick().await }, if tasks_info.is_some() => {
+                if viewer.is_admin {
+                    let tasks = state.task_scheduler.get_all_tasks().await;
+                    let frame = serde_json::json!({
+                        "MessageType": "ScheduledTasksInfo",
+                        "MessageId": uuid::Uuid::new_v4().simple().to_string(),
+                        "Data": tasks,
+                    });
+                    if sender.send(Message::Text(frame.to_string().into())).await.is_err() {
+                        tracing::debug!("WebSocket: session {} sender closed", session_id);
+                        break;
                     }
                 }
             }

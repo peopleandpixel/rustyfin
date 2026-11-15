@@ -55,9 +55,10 @@ function askResumeOrStart(title, ticks) {
 }
 
 // Starts an item from a card or a Play button. A video with a resume point asks first whether to resume.
-// opts go on to playItem (queued: the play queue's first item); cancelling the choice ends that queue.
-async function playWithResumeChoice(itemId, streamType = 'Videos', title = '', opts = {}) {
-    if (streamType !== 'Videos') return playItem(itemId, streamType, title, opts);
+// selection: the detail page's version and track choice, passed on to playItem. opts go on to playItem too
+// (queued: the play queue's first item); cancelling the choice ends that queue.
+async function playWithResumeChoice(itemId, streamType = 'Videos', title = '', selection = null, opts = {}) {
+    if (streamType !== 'Videos') return playItem(itemId, streamType, title, { ...opts, selection });
     // Read the point after the last Stopped report and uncached, so it includes the position just saved
     await pendingStop;
     let item = null;
@@ -67,10 +68,10 @@ async function playWithResumeChoice(itemId, streamType = 'Videos', title = '', o
         console.warn('Could not load item for resume point:', e);
     }
     const ticks = resumePositionTicks(item);
-    if (ticks <= 0) return playItem(itemId, streamType, title, opts);
+    if (ticks <= 0) return playItem(itemId, streamType, title, { ...opts, selection });
     const choice = await askResumeOrStart(title || item?.Name || '', ticks);
-    if (choice === 'resume') playItem(itemId, streamType, title, opts);
-    else if (choice === 'start') playItem(itemId, streamType, title, { ...opts, fromStart: true });
+    if (choice === 'resume') playItem(itemId, streamType, title, { ...opts, selection });
+    else if (choice === 'start') playItem(itemId, streamType, title, { ...opts, fromStart: true, selection });
     else if (opts.queued) clearQueue();
 }
 
@@ -476,7 +477,9 @@ function renderTrackMenus(session) {
 // --- Video Player (Cinema Mode) ---
 // carry: the previous episode's track languages (episodeTrackCarry), chosen again here where they exist.
 // queued: the play queue (queue.js) started this item; any other play ends the queue.
-async function playItem(itemId, streamType = 'Videos', title = '', { fromStart = false, carry = null, queued = false } = {}) {
+// selection: the detail page's choice, { mediaSourceId, audioIndex, subtitleIndex (-1 is off), startTicks };
+// a field left out keeps the default.
+async function playItem(itemId, streamType = 'Videos', title = '', { fromStart = false, carry = null, queued = false, selection = null } = {}) {
     const video = $('video-player');
     const modal = $('player-modal');
     if (!video || !modal) return;
@@ -529,11 +532,11 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
     if (!modal.open || request !== playRequest) return; // closed or replaced while loading
     if (!title && item?.Name) $('player-title').textContent = item.Name;
 
-    const startTicks = (streamType !== 'Videos' || fromStart) ? 0 : resumePositionTicks(item);
+    const startTicks = selection?.startTicks ?? ((streamType !== 'Videos' || fromStart) ? 0 : resumePositionTicks(item));
     const runtimeTicks = item?.RunTimeTicks || 0;
 
     // Track choices as Jellyfin's defaults pick them; with no PlaybackInfo there are none
-    const source = info?.MediaSources?.[0];
+    const source = info?.MediaSources?.find(s => s.Id === selection?.mediaSourceId) || info?.MediaSources?.[0];
     const streams = source?.MediaStreams || [];
     const audioStreams = streams.filter(s => isStreamType(s, 'audio'));
     const subStreams = streams.filter(s => isStreamType(s, 'subtitle'));
@@ -548,6 +551,8 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
         const serverSubtitle = defaultSub === -1 || subStreams.some(s => s.Index === defaultSub);
         subtitleIndex = serverSubtitle ? defaultSub : defaultSubtitleIndex(subStreams, chosenAudio);
         ({ audioIndex, subtitleIndex } = carriedTracks(streams, carry, audioIndex, subtitleIndex, serverSubtitle));
+        if (audioStreams.some(s => s.Index === selection?.audioIndex)) audioIndex = selection.audioIndex;
+        if (selection?.subtitleIndex === -1 || subStreams.some(s => s.Index === selection?.subtitleIndex)) subtitleIndex = selection.subtitleIndex;
     }
 
     // The session owns this playback: stop() reports the position once and tears the player down

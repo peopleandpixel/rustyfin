@@ -79,7 +79,7 @@ function playQueueAt(items, index) {
     const item = items[index];
     if (!item) return;
     playQueue = { items, index };
-    playWithResumeChoice(item.Id, queueStreamType(item), item.Name || '', { queued: true });
+    playWithResumeChoice(item.Id, queueStreamType(item), item.Name || '', null, { queued: true });
 }
 
 // The queue's items before and after the playing one, or null without a queue

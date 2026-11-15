@@ -6,7 +6,9 @@ import { renderHome, renderFavorites } from './home.js';
 import {
     renderLibrary, stopLibraryLoad, libraryRemember, startGridDiag, jumpToLetter, clearLibraryFilters,
 } from './library.js';
-import { currentDetailId, renderDetail, renderPerson, toggleFavorite, togglePlayed } from './item.js';
+import {
+    currentDetailId, renderDetail, renderPerson, toggleFavorite, togglePlayed, deleteItemFromDetail, detailSelection,
+} from './item.js';
 import { renderSearch } from './search.js';
 import { playWithResumeChoice, stopPlayback, playItem, playerAutoHide, onPlayerClosed } from './player.js';
 import { playContainer } from './queue.js';
@@ -16,7 +18,7 @@ import {
     startTaskAction, stopTaskAction,
 } from './admin.js';
 import {
-    loadSidebar, deleteLibraryFromAdmin, toggleRealtimeMonitor, openFolderBrowser, folderBrowserLoad, folderBrowserUp,
+    loadSidebar, deleteLibraryFromAdmin, toggleRealtimeMonitor, openLibraryOptions, openFolderBrowser, folderBrowserLoad, folderBrowserUp,
     folderBrowserSelect, closeFolderBrowser, addLibraryPathRow, removeLibraryPathRow, initScanProgressWebSocket,
 } from './library-admin.js';
 import { openPluginConfig, openPluginPriority } from './plugins.js';
@@ -120,12 +122,17 @@ async function refreshItemMetadata(button, id) {
 // Clicks on rendered markup are dispatched here from data-action and data-* attributes, so server values never end up inside inline JavaScript.
 const clickActions = {
     navigate: el => navigate(el.dataset.page, el.dataset.id),
-    // A video with a resume point asks first; the detail page's Resume and Play from beginning buttons are that choice
+    // A video with a resume point asks first; the detail page's Resume and Play from beginning buttons are that choice.
+    // The detail page's buttons and chapters also pass its version and track choice, and a chapter its start.
+    // Its Play button still asks, from a fresh resume point: the page's own item may be cached.
     play: el => {
         const { id, streamType, title } = el.dataset;
-        if (el.dataset.resume === 'true') playItem(id, streamType, title);
-        else if (el.dataset.fromStart === 'true') playItem(id, streamType, title, { fromStart: true });
-        else playWithResumeChoice(id, streamType, title);
+        const selection = el.dataset.detailTracks === 'true' ? detailSelection(id) || {} : null;
+        if (el.dataset.startTicks !== undefined) {
+            playItem(id, streamType, title, { selection: { ...selection, startTicks: Number(el.dataset.startTicks) } });
+        } else if (el.dataset.resume === 'true') playItem(id, streamType, title, { selection });
+        else if (el.dataset.fromStart === 'true') playItem(id, streamType, title, { fromStart: true, selection });
+        else playWithResumeChoice(id, streamType, title, selection);
     },
     // Play all and Shuffle on a series, season, album, artist, playlist, collection or library
     'play-all': el => playContainer(el.dataset.id),
@@ -137,7 +144,8 @@ const clickActions = {
     'jump-letter': el => jumpToLetter(el.dataset.id, el.dataset.letter),
     'clear-library-filters': el => clearLibraryFilters(el.dataset.id),
     'toggle-favorite': el => toggleFavorite(el.dataset.id, el.dataset.favorite === 'true'),
-    'toggle-played': el => togglePlayed(el.dataset.id, el.dataset.played === 'true'),
+    'toggle-played': el => togglePlayed(el.dataset.id, el.dataset.played === 'true', el.dataset.all === 'true'),
+    'delete-item': el => deleteItemFromDetail(el.dataset),
     'refresh-item': el => refreshItemMetadata(el, el.dataset.id),
     'admin-tab': el => showAdminTab(el, el.dataset.tab),
     'delete-user': el => { if (confirm(t('admin.delete_user_confirm'))) API.deleteUser(el.dataset.id).then(() => renderAdmin()); },
@@ -145,6 +153,7 @@ const clickActions = {
     'set-user-disabled': el => setUserPolicy(el, { IsDisabled: el.checked }),
     'delete-library': el => deleteLibraryFromAdmin(el.dataset.id),
     'toggle-realtime-monitor': el => toggleRealtimeMonitor(el),
+    'library-options': el => openLibraryOptions(el.dataset.id, el.dataset.name),
     'start-task': el => startTaskAction(el.dataset.id, el.dataset.name),
     'stop-task': el => stopTaskAction(el.dataset.id, el.dataset.name),
     'browse-path': el => openFolderBrowser(el.closest('.path-field').querySelector('[data-path-field]')),

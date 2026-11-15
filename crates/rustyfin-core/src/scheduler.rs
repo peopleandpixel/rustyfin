@@ -13,6 +13,7 @@ use crate::library_monitor::ChangeQueue;
 use crate::library_watch::LibraryWatcher;
 use crate::plugin_manager::PluginManager;
 use crate::scan_progress::ScanRegistry;
+use crate::task_progress::TaskProgress;
 
 /// Known task IDs
 pub const TASK_LIBRARY_SCAN: &str = "LibraryScan";
@@ -59,6 +60,8 @@ pub struct TaskScheduler {
     http_client: reqwest::Client,
     /// The image tasks running, each with the handle that stops it.
     image_runs: Arc<std::sync::Mutex<HashMap<String, crate::trickplay::Cancel>>>,
+    /// Each task's percent done, shown while it runs.
+    progress: Arc<HashMap<String, TaskProgress>>,
 }
 
 impl TaskScheduler {
@@ -283,6 +286,10 @@ impl TaskScheduler {
             },
         );
 
+        let progress = tasks
+            .keys()
+            .map(|id| (id.clone(), TaskProgress::new()))
+            .collect();
         let changes = ChangeQueue::new(db.clone());
         let watcher = LibraryWatcher::new(db.clone(), changes.clone(), (*data_dir).clone());
         Self {
@@ -296,6 +303,7 @@ impl TaskScheduler {
             plugin_manager,
             http_client,
             image_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            progress: Arc::new(progress),
         }
     }
 
@@ -326,12 +334,29 @@ impl TaskScheduler {
 
     pub async fn get_all_tasks(&self) -> Vec<ScheduledTaskInfo> {
         let tasks = self.tasks.read().await;
-        tasks.values().map(|e| e.info.clone()).collect()
+        tasks.values().map(|e| self.info_of(e)).collect()
     }
 
     pub async fn get_task(&self, id: &str) -> Option<ScheduledTaskInfo> {
         let tasks = self.tasks.read().await;
-        tasks.get(id).map(|e| e.info.clone())
+        tasks.get(id).map(|e| self.info_of(e))
+    }
+
+    /// A task's info, with the percent it has reported while it is not idle.
+    fn info_of(&self, entry: &TaskEntry) -> ScheduledTaskInfo {
+        let mut info = entry.info.clone();
+        info.current_progress_percentage = match info.state {
+            TaskState::Idle => None,
+            TaskState::Running | TaskState::Cancelling => {
+                self.progress.get(&info.id).and_then(TaskProgress::get)
+            }
+        };
+        info
+    }
+
+    /// Where task `id` reports its percent done.
+    fn progress_of(&self, id: &str) -> TaskProgress {
+        self.progress.get(id).cloned().unwrap_or_default()
     }
 
     pub async fn set_triggers(&self, id: &str, triggers: Vec<TaskTriggerInfo>) -> bool {
@@ -390,24 +415,24 @@ impl TaskScheduler {
 
     /// Stop a running task (sets state to Idle)
     pub async fn stop_task(&self, id: &str) -> bool {
-        // An image task stops between videos and kills the ffmpeg it runs
+        // An image task stops between videos and kills the ffmpeg it runs; it shows Cancelling,
+        // as in Jellyfin, until it has wound down. The run is looked up and marked under the
+        // tasks lock, as its start and end change them, so a run that has just ended stays Idle.
+        let mut tasks = self.tasks.write().await;
         let image_run = self.image_runs.lock().unwrap().get(id).cloned();
         if let Some(cancel) = image_run {
             cancel.cancel();
-            self.set_task_state(id, TaskState::Idle).await;
+            if let Some(entry) = tasks.get_mut(id) {
+                self.apply_state(entry, TaskState::Cancelling);
+            }
             return true;
         }
-        let tasks = self.tasks.read().await;
-        if let Some(entry) = tasks.get(id) {
-            if entry.info.state == TaskState::Running {
-                drop(tasks);
-                self.set_task_state(id, TaskState::Idle).await;
+        match tasks.get_mut(id) {
+            Some(entry) if entry.info.state == TaskState::Running => {
+                self.apply_state(entry, TaskState::Idle);
                 true
-            } else {
-                false
             }
-        } else {
-            false
+            _ => false,
         }
     }
 
@@ -427,11 +452,27 @@ impl TaskScheduler {
     async fn set_task_state(&self, id: &str, state: TaskState) {
         let mut tasks = self.tasks.write().await;
         if let Some(entry) = tasks.get_mut(id) {
-            entry.info.state = state;
-            if entry.info.state == TaskState::Idle {
-                entry.info.current_progress_percentage = None;
-            }
+            self.apply_state(entry, state);
         }
+    }
+
+    /// Moves a task to `state`, under the tasks lock its caller holds. Only a running task can
+    /// become Cancelling, and a cancelling one stays so until it ends (Idle). A run starts with no
+    /// percent known, and an ended one keeps none.
+    fn apply_state(&self, entry: &mut TaskEntry, state: TaskState) {
+        let allowed = match (&entry.info.state, &state) {
+            (TaskState::Running, TaskState::Cancelling) => true,
+            (_, TaskState::Cancelling) => false,
+            (TaskState::Cancelling, TaskState::Running) => false,
+            _ => true,
+        };
+        if !allowed {
+            return;
+        }
+        if state != TaskState::Cancelling {
+            self.progress_of(&entry.info.id).clear();
+        }
+        entry.info.state = state;
     }
 
     async fn set_task_result(&self, id: &str, result: TaskResult) {
@@ -527,6 +568,11 @@ impl TaskScheduler {
 
         let result = match rustyfin_db::repo_library::get_all_libraries(&self.db).await {
             Ok(libraries) => {
+                let follower = follow_scans(
+                    self.scans.subscribe(),
+                    libraries.iter().map(|lib| lib.id).collect(),
+                    self.progress_of(TASK_LIBRARY_SCAN),
+                );
                 // Every library is listed as queued before the first one starts.
                 let tickets: Vec<_> = libraries
                     .iter()
@@ -553,6 +599,9 @@ impl TaskScheduler {
                     // The probes the scan queued keep the library listed until they finish.
                     drop(ticket);
                 }
+                // Waited for, so no late percent lands after the task ends
+                follower.abort();
+                let _ = follower.await;
                 let end = Utc::now();
                 if errors.is_empty() {
                     TaskResult {
@@ -598,7 +647,10 @@ impl TaskScheduler {
 
     /// Starts a run of image task `id`, unless one is still going (a stopped one included, until
     /// it has wound down). Returns the handle that stops it.
+    /// The run is listed and marked Running in one step under the tasks lock, so a stop can't
+    /// come in between.
     async fn begin_image_run(&self, id: &str) -> Option<crate::trickplay::Cancel> {
+        let mut tasks = self.tasks.write().await;
         let cancel = {
             let mut runs = self.image_runs.lock().unwrap();
             if runs.contains_key(id) {
@@ -608,14 +660,19 @@ impl TaskScheduler {
             runs.insert(id.to_string(), cancel.clone());
             cancel
         };
-        self.set_task_state(id, TaskState::Running).await;
+        if let Some(entry) = tasks.get_mut(id) {
+            self.apply_state(entry, TaskState::Running);
+        }
         Some(cancel)
     }
 
-    /// Ends the run of image task `id`.
+    /// Ends the run of image task `id`: unlisted and marked Idle in one step under the tasks lock.
     async fn end_image_run(&self, id: &str) {
+        let mut tasks = self.tasks.write().await;
         self.image_runs.lock().unwrap().remove(id);
-        self.set_task_state(id, TaskState::Idle).await;
+        if let Some(entry) = tasks.get_mut(id) {
+            self.apply_state(entry, TaskState::Idle);
+        }
     }
 
     /// The ids of the libraries whose options pass `wanted`.
@@ -645,6 +702,7 @@ impl TaskScheduler {
             return;
         };
         let start = Utc::now();
+        let progress = self.progress_of(id);
         let data_dir = self.data_dir.as_path();
         // Tiles and chapter images of deleted items and changed files go first
         if let Err(e) = crate::trickplay::sweep_unused_files(&self.db, data_dir).await {
@@ -652,20 +710,22 @@ impl TaskScheduler {
         }
         let result = if id == TASK_TRICKPLAY {
             match self.libraries_where(|o| o.enable_trickplay).await {
-                Ok(libs) => {
-                    crate::trickplay::generate_for_libraries(&self.db, data_dir, &libs, &cancel)
-                        .await
-                        .map(|n| format!("Made the trickplay images of {n} videos"))
-                }
+                Ok(libs) if libs.is_empty() => Ok(no_library_on(id, NO_TRICKPLAY_LIBRARY)),
+                Ok(libs) => crate::trickplay::generate_for_libraries_with_progress(
+                    &self.db, data_dir, &libs, &cancel, &progress,
+                )
+                .await
+                .map(|n| format!("Made the trickplay images of {n} videos")),
                 Err(e) => Err(e),
             }
         } else {
             match self.libraries_where(|o| o.enable_chapter_extraction).await {
-                Ok(libs) => {
-                    crate::chapter_images::extract_for_libraries(&self.db, data_dir, &libs, &cancel)
-                        .await
-                        .map(|n| format!("Made {n} chapter images"))
-                }
+                Ok(libs) if libs.is_empty() => Ok(no_library_on(id, NO_CHAPTER_LIBRARY)),
+                Ok(libs) => crate::chapter_images::extract_for_libraries_with_progress(
+                    &self.db, data_dir, &libs, &cancel, &progress,
+                )
+                .await
+                .map(|n| format!("Made {n} chapter images")),
                 Err(e) => Err(e),
             }
         };
@@ -711,27 +771,31 @@ impl TaskScheduler {
             .await;
         let start = Utc::now();
 
-        let result = match crate::media_segments::detect_for_all_episodes(&self.db).await {
-            Ok(count) => {
-                let end = Utc::now();
-                tracing::info!("Intro detection completed: {} episodes processed", count);
-                TaskResult {
-                    status: TaskCompletionStatus::Completed,
-                    error_message: Some(format!("Processed {} episodes", count)),
-                    start_time_utc: start.to_rfc3339(),
-                    end_time_utc: end.to_rfc3339(),
+        let progress = self.progress_of(TASK_INTRO_DETECTION);
+        let result =
+            match crate::media_segments::detect_for_all_episodes_with_progress(&self.db, &progress)
+                .await
+            {
+                Ok(count) => {
+                    let end = Utc::now();
+                    tracing::info!("Intro detection completed: {} episodes processed", count);
+                    TaskResult {
+                        status: TaskCompletionStatus::Completed,
+                        error_message: Some(format!("Processed {} episodes", count)),
+                        start_time_utc: start.to_rfc3339(),
+                        end_time_utc: end.to_rfc3339(),
+                    }
                 }
-            }
-            Err(e) => {
-                let end = Utc::now();
-                TaskResult {
-                    status: TaskCompletionStatus::Failed,
-                    error_message: Some(e),
-                    start_time_utc: start.to_rfc3339(),
-                    end_time_utc: end.to_rfc3339(),
+                Err(e) => {
+                    let end = Utc::now();
+                    TaskResult {
+                        status: TaskCompletionStatus::Failed,
+                        error_message: Some(e),
+                        start_time_utc: start.to_rfc3339(),
+                        end_time_utc: end.to_rfc3339(),
+                    }
                 }
-            }
-        };
+            };
 
         self.set_task_result(TASK_INTRO_DETECTION, result).await;
         self.set_task_state(TASK_INTRO_DETECTION, TaskState::Idle)
@@ -843,13 +907,18 @@ impl TaskScheduler {
                     handles.push((lib_name, handle));
                 }
 
-                // Await all concurrent refresh tasks
-                for (lib_name, handle) in handles {
+                // Await all concurrent refresh tasks. There is one per item, so the percent is
+                // the share of the items refreshed.
+                let progress = self.progress_of(TASK_METADATA_REFRESH);
+                let total = handles.len();
+                progress.report_count(0, total);
+                for (done, (lib_name, handle)) in handles.into_iter().enumerate() {
                     match handle.await {
                         Ok(Some(e)) => errors.push(e),
                         Ok(None) => {}
                         Err(e) => errors.push(format!("{}: task failed: {}", lib_name, e)),
                     }
+                    progress.report_count(done + 1, total);
                 }
                 // New pictures get their grid copies in the background
                 crate::image_warmer::kick();
@@ -896,7 +965,9 @@ impl TaskScheduler {
 
         let cache_dir = self.data_dir.join("cache").join("transcode");
         let result = if cache_dir.exists() {
-            match cleanup_transcode_cache(&cache_dir).await {
+            match cleanup_transcode_cache(&cache_dir, &self.progress_of(TASK_TRANSCODE_CLEANUP))
+                .await
+            {
                 Ok(removed) => {
                     if removed > 0 {
                         tracing::info!("transcode cache cleanup: removed {} files", removed);
@@ -1188,8 +1259,59 @@ impl TaskScheduler {
     }
 }
 
+/// The result of the trickplay task when no library turns trickplay on.
+pub const NO_TRICKPLAY_LIBRARY: &str = "No library has trickplay image extraction turned on";
+/// The result of the chapter image task when no library turns chapter images on.
+pub const NO_CHAPTER_LIBRARY: &str = "No library has chapter image extraction turned on";
+
+/// Logs and returns `message`, the result of image task `id` when no library turns it on. Both
+/// options are off by default, so a run that does nothing says why rather than "0 made".
+fn no_library_on(id: &str, message: &str) -> String {
+    tracing::info!(
+        task = id,
+        "{message}; turn it on in a library's options to make these images"
+    );
+    message.to_string()
+}
+
+/// Reports the library scan task's percent from the scans' updates: the mean of each library's
+/// percent, where a library whose scan ended counts as 100. Each library's percent only rises, so
+/// the late updates of a library still probing never move the total back.
+fn follow_scans(
+    mut updates: tokio::sync::broadcast::Receiver<crate::scan_progress::ScanUpdate>,
+    libraries: Vec<uuid::Uuid>,
+    progress: TaskProgress,
+) -> tokio::task::JoinHandle<()> {
+    use crate::scan_progress::ScanStatus;
+    use tokio::sync::broadcast::error::RecvError;
+    let mut percents = vec![0u8; libraries.len()];
+    progress.report_count(0, libraries.len());
+    tokio::spawn(async move {
+        loop {
+            let update = match updates.recv().await {
+                Ok(update) => update,
+                Err(RecvError::Lagged(_)) => continue,
+                Err(RecvError::Closed) => return,
+            };
+            let Some(i) = libraries.iter().position(|id| *id == update.library_id) else {
+                continue;
+            };
+            let percent = match update.status {
+                ScanStatus::Idle => 100,
+                ScanStatus::Active | ScanStatus::Queued => update.progress,
+            };
+            percents[i] = percents[i].max(percent);
+            let sum: usize = percents.iter().map(|&p| usize::from(p)).sum();
+            progress.report(sum as f64 / percents.len() as f64);
+        }
+    })
+}
+
 /// Remove transcode cache files older than 24 hours
-async fn cleanup_transcode_cache(cache_dir: &std::path::Path) -> Result<u32, String> {
+async fn cleanup_transcode_cache(
+    cache_dir: &std::path::Path,
+    progress: &TaskProgress,
+) -> Result<u32, String> {
     let cutoff = std::time::SystemTime::now()
         .checked_sub(std::time::Duration::from_secs(24 * 3600))
         .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
@@ -1198,8 +1320,14 @@ async fn cleanup_transcode_cache(cache_dir: &std::path::Path) -> Result<u32, Str
     let mut rd = tokio::fs::read_dir(cache_dir)
         .await
         .map_err(|e| e.to_string())?;
-
+    // Listed first, so the percent counts the entries looked at
+    let mut entries = Vec::new();
     while let Ok(Some(entry)) = rd.next_entry().await {
+        entries.push(entry);
+    }
+
+    for (i, entry) in entries.iter().enumerate() {
+        progress.report_count(i, entries.len());
         let path = entry.path();
         if let Ok(meta) = entry.metadata().await {
             let modified = meta.modified().unwrap_or(std::time::SystemTime::now());
@@ -1240,15 +1368,262 @@ mod tests {
         assert!(run.is_cancelled(), "the run is told to stop");
         assert_eq!(
             sched.get_task(TASK_TRICKPLAY).await.unwrap().state,
-            TaskState::Idle
+            TaskState::Cancelling,
+            "a stopped run shows Cancelling while it winds down, as in Jellyfin"
         );
         // No second run starts while the stopped one winds down.
         assert!(sched.begin_image_run(TASK_TRICKPLAY).await.is_none());
         sched.end_image_run(TASK_TRICKPLAY).await;
+        assert_eq!(
+            sched.get_task(TASK_TRICKPLAY).await.unwrap().state,
+            TaskState::Idle
+        );
         let next = sched.begin_image_run(TASK_TRICKPLAY).await.unwrap();
         assert!(!next.is_cancelled());
         // The other image task is separate.
         assert!(sched.begin_image_run(TASK_CHAPTER_IMAGES).await.is_some());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    async fn r3tasks_scheduler() -> (TaskScheduler, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("rustyfin_sched_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = rustyfin_db::init_db(dir.join("t.db").to_str().unwrap())
+            .await
+            .unwrap();
+        (TaskScheduler::new(db, Arc::new(dir.clone())), dir)
+    }
+
+    #[tokio::test]
+    async fn r3tasks_progress_is_shown_while_running_and_cleared_after() {
+        let (sched, dir) = r3tasks_scheduler().await;
+        let percent = |info: ScheduledTaskInfo| info.current_progress_percentage;
+
+        // A report from an idle task is not shown.
+        sched.progress_of(TASK_TRICKPLAY).report(10.0);
+        assert_eq!(percent(sched.get_task(TASK_TRICKPLAY).await.unwrap()), None);
+
+        // A run starts with no percent (an indeterminate Running), then shows what it reports.
+        let run = sched.begin_image_run(TASK_TRICKPLAY).await.unwrap();
+        assert_eq!(percent(sched.get_task(TASK_TRICKPLAY).await.unwrap()), None);
+        sched.progress_of(TASK_TRICKPLAY).report_count(1, 4);
+        let info = sched.get_task(TASK_TRICKPLAY).await.unwrap();
+        assert_eq!(info.state, TaskState::Running);
+        assert_eq!(info.current_progress_percentage, Some(25.0));
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["State"], "Running", "{json}");
+        assert_eq!(json["CurrentProgressPercentage"], 25.0, "{json}");
+        // Every task in the list carries the field, null while idle.
+        for task in sched.get_all_tasks().await {
+            let json = serde_json::to_value(&task).unwrap();
+            let want = if task.id == TASK_TRICKPLAY {
+                serde_json::json!(25.0)
+            } else {
+                serde_json::Value::Null
+            };
+            assert_eq!(json["CurrentProgressPercentage"], want, "{json}");
+        }
+
+        // A stopped run keeps its percent while it winds down.
+        assert!(sched.stop_task(TASK_TRICKPLAY).await);
+        assert!(run.is_cancelled());
+        let info = sched.get_task(TASK_TRICKPLAY).await.unwrap();
+        assert_eq!(info.state, TaskState::Cancelling);
+        assert_eq!(info.current_progress_percentage, Some(25.0));
+
+        // An ended run shows no percent, and the next run starts without the old one.
+        sched.end_image_run(TASK_TRICKPLAY).await;
+        let info = sched.get_task(TASK_TRICKPLAY).await.unwrap();
+        assert_eq!(info.state, TaskState::Idle);
+        assert_eq!(info.current_progress_percentage, None);
+        let json = serde_json::to_value(&info).unwrap();
+        assert!(json["CurrentProgressPercentage"].is_null(), "{json}");
+        let _next = sched.begin_image_run(TASK_TRICKPLAY).await.unwrap();
+        assert_eq!(percent(sched.get_task(TASK_TRICKPLAY).await.unwrap()), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Lets the spawned tasks run until each waits (the test runtime has one thread).
+    async fn r3tasks_settle() {
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn r3tasks_stop_racing_the_end_of_an_image_run_leaves_it_idle() {
+        let (sched, dir) = r3tasks_scheduler().await;
+        let run = sched.begin_image_run(TASK_TRICKPLAY).await.unwrap();
+
+        // A stop arrives while the tasks lock is taken: it must not look at the run yet.
+        let guard = sched.tasks.write().await;
+        let stopper = tokio::spawn({
+            let sched = sched.clone();
+            async move { sched.stop_task(TASK_TRICKPLAY).await }
+        });
+        r3tasks_settle().await;
+        assert!(!run.is_cancelled(), "the stop waits for the tasks lock");
+
+        // The run ends first (end_image_run's step, under the same lock), then the stop goes on.
+        let mut guard = guard;
+        sched.image_runs.lock().unwrap().remove(TASK_TRICKPLAY);
+        let entry = guard.get_mut(TASK_TRICKPLAY).unwrap();
+        sched.apply_state(entry, TaskState::Idle);
+        drop(guard);
+        assert!(!stopper.await.unwrap(), "nothing was left to stop");
+        let info = sched.get_task(TASK_TRICKPLAY).await.unwrap();
+        assert_eq!(info.state, TaskState::Idle, "never left Cancelling");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn r3tasks_stop_racing_the_start_of_an_image_run_cancels_it() {
+        let (sched, dir) = r3tasks_scheduler().await;
+
+        // A start waits for the tasks lock without listing its run, so no stop can see the run
+        // before it is marked Running.
+        let guard = sched.tasks.write().await;
+        let starter = tokio::spawn({
+            let sched = sched.clone();
+            async move { sched.begin_image_run(TASK_TRICKPLAY).await }
+        });
+        r3tasks_settle().await;
+        assert!(
+            !sched
+                .image_runs
+                .lock()
+                .unwrap()
+                .contains_key(TASK_TRICKPLAY),
+            "the run is listed only under the tasks lock"
+        );
+        let stopper = tokio::spawn({
+            let sched = sched.clone();
+            async move { sched.stop_task(TASK_TRICKPLAY).await }
+        });
+        r3tasks_settle().await;
+        drop(guard);
+
+        // The start goes first (it waited first), so the stop finds it Running and cancels it.
+        let run = starter.await.unwrap().expect("the run started");
+        assert!(stopper.await.unwrap());
+        assert!(run.is_cancelled());
+        let info = sched.get_task(TASK_TRICKPLAY).await.unwrap();
+        assert_eq!(
+            info.state,
+            TaskState::Cancelling,
+            "Running never overwrote the stop"
+        );
+        sched.end_image_run(TASK_TRICKPLAY).await;
+        let info = sched.get_task(TASK_TRICKPLAY).await.unwrap();
+        assert_eq!(info.state, TaskState::Idle);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn r3tasks_state_changes_keep_cancelling_until_the_end() {
+        let (sched, dir) = r3tasks_scheduler().await;
+        let state = || async { sched.get_task(TASK_TRICKPLAY).await.unwrap().state };
+        // Cancelling only from Running
+        sched
+            .set_task_state(TASK_TRICKPLAY, TaskState::Cancelling)
+            .await;
+        assert_eq!(state().await, TaskState::Idle);
+        sched
+            .set_task_state(TASK_TRICKPLAY, TaskState::Running)
+            .await;
+        sched
+            .set_task_state(TASK_TRICKPLAY, TaskState::Cancelling)
+            .await;
+        // Running doesn't overwrite Cancelling; Idle ends it
+        sched
+            .set_task_state(TASK_TRICKPLAY, TaskState::Running)
+            .await;
+        assert_eq!(state().await, TaskState::Cancelling);
+        sched.set_task_state(TASK_TRICKPLAY, TaskState::Idle).await;
+        assert_eq!(state().await, TaskState::Idle);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn r3tasks_image_tasks_say_when_no_library_turns_them_on() {
+        let (sched, dir) = r3tasks_scheduler().await;
+        let library = rustyfin_model::library::Library {
+            id: uuid::Uuid::new_v4(),
+            name: "Films".to_string(),
+            content_type: rustyfin_model::library::LibraryContentType::Movies,
+            paths: vec![dir.join("films").to_string_lossy().to_string()],
+        };
+        rustyfin_db::repo_library::create_library(&sched.db, &library)
+            .await
+            .unwrap();
+        for (id, message) in [
+            (TASK_TRICKPLAY, NO_TRICKPLAY_LIBRARY),
+            (TASK_CHAPTER_IMAGES, NO_CHAPTER_LIBRARY),
+        ] {
+            sched.run_video_images(id).await;
+            let result = sched.get_task(id).await.unwrap().last_execution_result;
+            let result = result.expect("the run has a result");
+            assert_eq!(result.status, TaskCompletionStatus::Completed, "{id}");
+            assert_eq!(result.error_message.as_deref(), Some(message), "{id}");
+        }
+
+        // With the option on, the run reports what it made instead.
+        let options = rustyfin_model::library::LibraryOptions {
+            enable_trickplay: true,
+            ..Default::default()
+        };
+        rustyfin_db::repo_library::set_library_options(&sched.db, library.id, &options)
+            .await
+            .unwrap();
+        sched.run_video_images(TASK_TRICKPLAY).await;
+        let result = sched.get_task(TASK_TRICKPLAY).await.unwrap();
+        let message = result.last_execution_result.unwrap().error_message;
+        assert_eq!(
+            message.as_deref(),
+            Some("Made the trickplay images of 0 videos")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn r3tasks_scan_progress_follows_the_libraries_scans() {
+        let scans = ScanRegistry::new();
+        let (first, second) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let progress = TaskProgress::new();
+        let follower = follow_scans(scans.subscribe(), vec![first, second], progress.clone());
+        assert_eq!(progress.get(), Some(0.0), "a scan of libraries starts at 0");
+
+        let wait_for = |want: f64| {
+            let progress = progress.clone();
+            async move {
+                for _ in 0..200 {
+                    if progress.get() == Some(want) {
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                panic!("progress {:?}, want {want}", progress.get());
+            }
+        };
+        let one = scans.queue(first);
+        let two = scans.queue(second);
+        one.start();
+        one.add_total(4);
+        one.advance(2);
+        wait_for(25.0).await;
+        drop(one);
+        wait_for(50.0).await;
+        two.start();
+        two.add_total(2);
+        two.advance(1);
+        wait_for(75.0).await;
+        // A late update of a library that has ended never moves the total back.
+        let late = scans.queue(first);
+        late.start();
+        two.advance(1);
+        drop(two);
+        wait_for(100.0).await;
+        drop(late);
+        follower.abort();
     }
 }
