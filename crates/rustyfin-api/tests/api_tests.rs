@@ -15659,6 +15659,44 @@ async fn w1filters_seed_into(state: &AppState) -> (String, uuid::Uuid) {
     (token, library)
 }
 
+// The web client's sort, filter and preference functions (tests/web/w1filters_library.mjs).
+#[test]
+fn w1filters_library() {
+    b124_node_test("w1filters_library.mjs");
+}
+
+#[tokio::test]
+async fn w1filters_display_preferences_keep_sort_and_filters_per_user() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let (other, _) = j6_user_session(&state).await;
+    let app = app(state);
+    let uri = "/DisplayPreferences/films?client=rustyfin";
+    // The body the web client saves (libraryPrefsToDisplay)
+    let body = serde_json::json!({
+        "Id": "films", "Client": "rustyfin", "SortBy": "DateCreated,SortName,ProductionYear",
+        "SortOrder": "Ascending",
+        "CustomPrefs": { "Filters": "IsUnplayed,IsFavorite", "Genres": "Action|Drama, Romance" },
+        "RememberIndexing": false, "RememberSorting": true, "PrimaryImageHeight": 0,
+        "PrimaryImageWidth": 0, "ShowBackdrop": true, "ShowSidebar": false,
+        "ScrollDirection": "Horizontal",
+    });
+    let (status, _) = send_authed(&app, "POST", uri, &token, Some(&body.to_string())).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let saved = b27_answer(&app, uri, &token).await;
+    assert_eq!(saved["SortBy"], body["SortBy"]);
+    assert_eq!(saved["SortOrder"], body["SortOrder"]);
+    assert_eq!(saved["CustomPrefs"], body["CustomPrefs"]);
+    // Another user, and another library, start from the server's defaults.
+    let theirs = b27_answer(&app, uri, &other).await;
+    assert_eq!(
+        (&theirs["SortBy"], &theirs["CustomPrefs"]),
+        (&serde_json::json!("SortName"), &serde_json::json!({}))
+    );
+    let shows = b27_answer(&app, "/DisplayPreferences/shows?client=rustyfin", &token).await;
+    assert_eq!(shows["CustomPrefs"], serde_json::json!({}));
+}
+
 #[tokio::test]
 async fn w1filters_filter_lists_are_the_librarys() {
     let state = test_state().await;

@@ -5,14 +5,14 @@ import {
     createIcons, RefreshCw, Heart, Film, Tv, Music, Disc3, MicVocal, Folder, FolderOpen, Library, Image, Settings, Tag,
     HardDrive, BrushCleaning, Clock, RotateCcw, Square, Check, Star, Menu, Search, Smartphone, ChartColumn, LogOut,
     House, LayoutDashboard, ChevronLeft, X, Play, Pause, Rewind, FastForward, Volume1, Volume2, VolumeX, Captions,
-    Maximize, ArrowDownUp, Circle,
+    Maximize, ArrowDownUp, Circle, Funnel, FunnelX,
 } from 'lucide';
 
 window.lucideIcons = {
     RefreshCw, Heart, Film, Tv, Music, Disc3, MicVocal, Folder, FolderOpen, Library, Image, Settings, Tag,
     HardDrive, BrushCleaning, Clock, RotateCcw, Square, Check, Star, Menu, Search, Smartphone, ChartColumn, LogOut,
     House, LayoutDashboard, ChevronLeft, X, Play, Pause, Rewind, FastForward, Volume1, Volume2, VolumeX, Captions,
-    Maximize, ArrowDownUp, Circle,
+    Maximize, ArrowDownUp, Circle, Funnel, FunnelX,
 };
 
 createIcons({ icons: window.lucideIcons, attrs: { 'aria-hidden': 'true' } });
