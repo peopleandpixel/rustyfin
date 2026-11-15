@@ -1,9 +1,10 @@
 //! `GET` and `POST /Items/{id}/PlaybackInfo`: an item's media sources, each with what the caller's
 //! device can play of it.
 
+use crate::query::Query;
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::routing::get;
 use axum::{Extension, Json};
 use rustyfin_core::stream_builder::{

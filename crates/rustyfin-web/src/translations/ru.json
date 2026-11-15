@@ -144,7 +144,7 @@
         "sort_name_desc": "Имя (Я-А)",
         "sort_release_date": "Дата выхода",
         "sort_date_added": "Дата добавления",
-        "sort_rating": "Рейтинг (★)",
+        "sort_rating": "Рейтинг",
         "all_genres": "Все жанры",
         "media_scan_started_for": "Сканирование медиа запущено для {{name}}",
         "scan_button": "Сканировать",

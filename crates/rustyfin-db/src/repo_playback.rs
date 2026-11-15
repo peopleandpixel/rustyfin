@@ -35,9 +35,11 @@ pub async fn get_user_item_data(
             unplayed_item_count: None,
             favorite: Some(fav),
             played_percentage: None,
+            item_id: None,
         },
         None => UserItemDataDto::default(),
-    })
+    }
+    .for_item(item_id))
 }
 
 /// For each Series or Season in `folder_ids`, counts its episodes and the ones `user_id` has not
@@ -381,16 +383,28 @@ const EPISODES_UNDER_FOLDER: &str = "WITH eps(id) AS ( \
      JOIN media_items e ON e.parent_id = f.id AND e.media_type = 'Episode' \
      WHERE f.id = ?1 AND f.media_type = 'Season' ) ";
 
-/// Marks an item played for the user. A Series or Season also marks each of its episodes played,
-/// as an episode is marked alone, and the folder's own row is written too; all in one transaction.
+/// Marks an item played for the user now. See `mark_played_on`.
 pub async fn mark_played(
     pool: &SqlitePool,
     user_id: Uuid,
     item_id: Uuid,
 ) -> Result<UserItemDataDto, sqlx::Error> {
+    mark_played_on(pool, user_id, item_id, None).await
+}
+
+/// Marks an item played for the user, with `date_played` as its last played date, or now. As
+/// Jellyfin's MarkPlayed does, the resume point is cleared. A Series or Season also marks each of
+/// its episodes played, as an episode is marked alone, and the folder's own row is written too; all
+/// in one transaction.
+pub async fn mark_played_on(
+    pool: &SqlitePool,
+    user_id: Uuid,
+    item_id: Uuid,
+    date_played: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<UserItemDataDto, sqlx::Error> {
     let uid = user_id.to_string();
     let iid = item_id.to_string();
-    let now = chrono::Utc::now().to_rfc3339();
+    let now = date_played.unwrap_or_else(chrono::Utc::now).to_rfc3339();
     let mut tx = pool.begin().await?;
 
     sqlx::query(
@@ -399,6 +413,7 @@ pub async fn mark_played(
          ON CONFLICT(user_id, item_id) DO UPDATE SET \
          played = 1, \
          play_count = play_count + 1, \
+         playback_position_ticks = 0, \
          last_played_date = excluded.last_played_date",
     )
     .bind(&uid)
@@ -413,6 +428,7 @@ pub async fn mark_played(
          ON CONFLICT(user_id, item_id) DO UPDATE SET \
          played = 1, \
          play_count = user_item_data.play_count + 1, \
+         playback_position_ticks = 0, \
          last_played_date = excluded.last_played_date"
     );
     sqlx::query(sqlx::AssertSqlSafe(episodes))
@@ -426,7 +442,8 @@ pub async fn mark_played(
     get_user_item_data(pool, user_id, item_id).await
 }
 
-/// Marks an item unplayed for the user. A Series or Season also marks each of its episodes
+/// Marks an item unplayed for the user: not played, no plays, no resume point and no last played
+/// date, as Jellyfin's MarkUnplayed leaves it. A Series or Season also marks each of its episodes
 /// unplayed, as an episode is marked alone, and the folder's own row is written too; all in one
 /// transaction.
 pub async fn mark_unplayed(
@@ -444,7 +461,8 @@ pub async fn mark_unplayed(
          ON CONFLICT(user_id, item_id) DO UPDATE SET \
          played = 0, \
          play_count = 0, \
-         playback_position_ticks = 0",
+         playback_position_ticks = 0, \
+         last_played_date = NULL",
     )
     .bind(&uid)
     .bind(&iid)
@@ -457,7 +475,8 @@ pub async fn mark_unplayed(
          ON CONFLICT(user_id, item_id) DO UPDATE SET \
          played = 0, \
          play_count = 0, \
-         playback_position_ticks = 0"
+         playback_position_ticks = 0, \
+         last_played_date = NULL"
     );
     sqlx::query(sqlx::AssertSqlSafe(episodes))
         .bind(&iid)
@@ -487,6 +506,50 @@ pub async fn set_favorite(
     .bind(&uid)
     .bind(&iid)
     .bind(favorite)
+    .execute(pool)
+    .await?;
+
+    get_user_item_data(pool, user_id, item_id).await
+}
+
+/// Sets the fields `update` carries and keeps the others (Jellyfin's UserDataManager.SaveUserData
+/// for `POST /UserItems/{itemId}/UserData`). A Series or Season is written as stored; its answer
+/// is derived from its episodes by the caller. `LastPlayedDate` is stored in RFC 3339 like every
+/// other writer's (`parse_client_date`), and dropped when it doesn't parse.
+pub async fn update_user_data(
+    pool: &SqlitePool,
+    user_id: Uuid,
+    item_id: Uuid,
+    update: &rustyfin_model::playback::UpdateUserItemDataDto,
+) -> Result<UserItemDataDto, sqlx::Error> {
+    let uid = user_id.to_string();
+    let iid = item_id.to_string();
+    sqlx::query(
+        "INSERT INTO user_item_data (user_id, item_id, playback_position_ticks, play_count, \
+         is_favorite, likes, played, last_played_date) \
+         VALUES (?1, ?2, COALESCE(?3, 0), COALESCE(?4, 0), COALESCE(?5, 0), ?6, COALESCE(?7, 0), ?8) \
+         ON CONFLICT(user_id, item_id) DO UPDATE SET \
+         playback_position_ticks = COALESCE(?3, playback_position_ticks), \
+         play_count = COALESCE(?4, play_count), \
+         is_favorite = COALESCE(?5, is_favorite), \
+         likes = COALESCE(?6, likes), \
+         played = COALESCE(?7, played), \
+         last_played_date = COALESCE(?8, last_played_date)",
+    )
+    .bind(&uid)
+    .bind(&iid)
+    .bind(update.playback_position_ticks.map(|t| t.max(0)))
+    .bind(update.play_count.map(|c| c.max(0)))
+    .bind(update.is_favorite)
+    .bind(update.likes)
+    .bind(update.played)
+    .bind(
+        update
+            .last_played_date
+            .as_deref()
+            .and_then(rustyfin_model::playback::parse_client_date)
+            .map(|date| date.to_rfc3339()),
+    )
     .execute(pool)
     .await?;
 
@@ -762,6 +825,7 @@ pub async fn get_user_item_data_batch(
                 unplayed_item_count: None,
                 favorite: Some(is_favorite),
                 played_percentage: None,
+                item_id: None,
             },
         );
     }
