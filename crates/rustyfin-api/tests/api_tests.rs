@@ -29806,6 +29806,85 @@ async fn b17_scheduler_scan_reports_progress_without_task_events() {
 
 // R3 tasks: a running task's state and progress in /ScheduledTasks and on the socket
 
+// Jellyfin's POST /Library/VirtualFolders/LibraryOptions saves a library's options: 204, and the
+// options read back, under Jellyfin's names or Rustyfin's.
+#[tokio::test]
+async fn r3tasks_virtual_folder_library_options_saves_as_jellyfin() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, viewer, _) = g1_owner_and_viewer(&state, &app).await;
+    let lib = create_library_via_api(&app, &state, &owner, "R3 Tasks Options", "Movies").await;
+    let uri = "/Library/VirtualFolders/LibraryOptions";
+    let options = |id: uuid::Uuid, body: serde_json::Value| {
+        serde_json::json!({ "Id": id, "LibraryOptions": body }).to_string()
+    };
+
+    // Jellyfin Web's names
+    let body = options(
+        lib,
+        serde_json::json!({
+            "EnableRealtimeMonitor": false,
+            "EnableTrickplayImageExtraction": true,
+            "ExtractTrickplayImagesDuringLibraryScan": true,
+            "EnableChapterImageExtraction": true,
+            "SomeOtherJellyfinOption": 1,
+        }),
+    );
+    let (status, answer) = send_authed(&app, "POST", uri, &owner, Some(&body)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{answer}");
+    let (_, saved) = send_authed(
+        &app,
+        "GET",
+        &format!("/Library/{lib}/Options"),
+        &owner,
+        None,
+    )
+    .await;
+    assert_eq!(saved["EnableRealtimeMonitor"], false, "{saved}");
+    assert_eq!(saved["EnableTrickplay"], true, "{saved}");
+    assert_eq!(
+        saved["ExtractTrickplayImagesDuringLibraryScan"], true,
+        "{saved}"
+    );
+    assert_eq!(saved["EnableChapterExtraction"], true, "{saved}");
+    assert_eq!(
+        saved["ExtractChapterImagesDuringLibraryScan"], false,
+        "{saved}"
+    );
+
+    // Rustyfin's names, as its web client sends them; the options are replaced
+    let body = options(lib, serde_json::json!({ "EnableChapterExtraction": false }));
+    let (status, _) = send_authed(&app, "POST", uri, &owner, Some(&body)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, saved) = send_authed(
+        &app,
+        "GET",
+        &format!("/Library/{lib}/Options"),
+        &owner,
+        None,
+    )
+    .await;
+    assert_eq!(saved["EnableChapterExtraction"], false, "{saved}");
+    assert_eq!(saved["EnableTrickplay"], false, "{saved}");
+
+    // An unknown library, and a user who isn't an administrator
+    let unknown = options(uuid::Uuid::new_v4(), serde_json::json!({}));
+    let (status, _) = send_authed(&app, "POST", uri, &owner, Some(&unknown)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let body = options(lib, serde_json::json!({ "EnableTrickplay": true }));
+    let (status, _) = send_authed(&app, "POST", uri, &viewer, Some(&body)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (_, saved) = send_authed(
+        &app,
+        "GET",
+        &format!("/Library/{lib}/Options"),
+        &owner,
+        None,
+    )
+    .await;
+    assert_eq!(saved["EnableTrickplay"], false, "{saved}");
+}
+
 // The admin tasks tab's cards and polling (tests/web/r3tasks_admin.mjs).
 #[test]
 fn r3tasks_web_task_cards_and_polling() {

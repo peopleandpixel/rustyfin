@@ -39,6 +39,10 @@ pub fn setup_routes() -> Router<AppState> {
             "/Library/{id}/Options",
             get(get_library_options).post(update_library_options),
         )
+        .route(
+            "/Library/VirtualFolders/LibraryOptions",
+            post(update_virtual_folder_options),
+        )
 }
 
 /// Administrator-only library refresh routes. `routes::build_router` wraps them in `require_admin`.
@@ -585,6 +589,36 @@ async fn update_library_options(
     rustyfin_db::repo_library::set_library_options(&state.db, id, &options).await?;
     state.task_scheduler.watcher().libraries_changed();
     Ok(Json(json!({ "status": "ok" })))
+}
+
+/// Jellyfin's `UpdateLibraryOptionsDto`: the library and its new options.
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct UpdateLibraryOptionsBody {
+    id: Uuid,
+    #[serde(default)]
+    library_options: Option<LibraryOptions>,
+}
+
+/// POST /Library/VirtualFolders/LibraryOptions — Jellyfin's route for saving a library's options:
+/// `{Id, LibraryOptions}` replaces them and answers 204. An unknown library is 404.
+async fn update_virtual_folder_options(
+    State(state): State<AppState>,
+    Json(body): Json<UpdateLibraryOptionsBody>,
+) -> Result<StatusCode, ApiError> {
+    if rustyfin_db::repo_library::get_library_by_id(&state.db, body.id)
+        .await?
+        .is_none()
+    {
+        return Err(ApiError::NotFound(format!(
+            "library '{}' not found",
+            body.id
+        )));
+    }
+    let options = body.library_options.unwrap_or_default();
+    rustyfin_db::repo_library::set_library_options(&state.db, body.id, &options).await?;
+    state.task_scheduler.watcher().libraries_changed();
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// DELETE /Library/VirtualFolders/Paths - Remove library paths
