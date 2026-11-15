@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 
-use axum::extract::{ConnectInfo, Query, State};
+use crate::query::Query;
+use axum::extract::{ConnectInfo, State};
 use axum::http::HeaderMap;
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};

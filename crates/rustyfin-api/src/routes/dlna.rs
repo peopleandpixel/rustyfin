@@ -1,6 +1,7 @@
+use crate::query::Query;
 use axum::Json;
 use axum::Router;
-use axum::extract::{Query, Request, State};
+use axum::extract::{Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};

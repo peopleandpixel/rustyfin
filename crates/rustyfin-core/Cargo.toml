@@ -16,6 +16,8 @@ reqwest = { workspace = true }
 image = { workspace = true }
 kamadak-exif = { workspace = true }
 blurhash = { workspace = true }
+jpeg-decoder = { workspace = true }
+fast_image_resize = { workspace = true }
 quick-xml = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

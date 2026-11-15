@@ -73,6 +73,7 @@ async fn test_state() -> AppState {
         config: Arc::new(RwLock::new(ServerConfiguration::default())),
         shutdown_tx: Arc::new(shutdown_tx),
         bind_addr: Arc::new("0.0.0.0:8096".to_string()),
+        published_url: None,
         api_key: Some(Arc::new("test-api-key".to_string())),
         quick_connect: Arc::new(RwLock::new(HashMap::new())),
         transcode_manager,
@@ -159,6 +160,69 @@ async fn test_public_info_endpoint() {
     let body = resp.into_body().collect().await.unwrap().to_bytes();
     let info: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(info["Id"], "test-server-id");
+}
+
+// B130: Jellyfin clients' server check (jellyfin-sdk-kotlin RecommendedServerDiscovery)
+
+/// Asserts the fields the Jellyfin SDK checks: the product name, and a version of three or four
+/// numeric parts at or above 12.0.0 (SDK 1.9's minimum). Rustyfin's own version is separate.
+fn b130_assert_jellyfin_identity(info: &serde_json::Value) {
+    assert_eq!(info["ProductName"], "Jellyfin Server", "{info}");
+    let version = info["Version"].as_str().expect("Version is a string");
+    let parts: Vec<u32> = version
+        .split('.')
+        .map(|part| part.parse().expect("numeric version part"))
+        .collect();
+    assert!(matches!(parts.len(), 3 | 4), "{version}");
+    assert!(parts[..3] >= [12, 0, 0][..], "{version}");
+    assert_eq!(info["RustyfinVersion"], env!("CARGO_PKG_VERSION"), "{info}");
+}
+
+#[tokio::test]
+async fn b130_public_info_passes_the_sdk_server_check() {
+    let state = test_state().await;
+    let (status, body) = j1_get(&state, "/System/Info/Public", &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    let info: serde_json::Value = serde_json::from_str(&body).unwrap();
+    b130_assert_jellyfin_identity(&info);
+    assert_eq!(info["Id"], "test-server-id");
+    assert!(info["ServerName"].is_string());
+    assert!(info["StartupWizardCompleted"].is_boolean());
+    // Jellyfin no longer sets OperatingSystem and sends it empty; so does Rustyfin.
+    assert_eq!(info["OperatingSystem"], "", "{info}");
+    // Bound to 0.0.0.0 (no address a client could reach), LocalAddress is the address the
+    // request came to, or localhost without a Host header; never 0.0.0.0.
+    assert_eq!(info["LocalAddress"], "http://localhost:8096", "{info}");
+    let (status, body) = j1_get(
+        &state,
+        "/System/Info/Public",
+        &[("Host", "192.168.1.20:8096")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let info: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(info["LocalAddress"], "http://192.168.1.20:8096", "{info}");
+}
+
+#[tokio::test]
+async fn b130_public_info_local_address_follows_a_specific_bind() {
+    let mut state = test_state().await;
+    state.bind_addr = Arc::new("127.0.0.1:8102".to_string());
+    let (status, body) = j1_get(&state, "/System/Info/Public", &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    let info: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(info["LocalAddress"], "http://127.0.0.1:8102", "{info}");
+}
+
+#[tokio::test]
+async fn b130_full_info_reports_the_same_identity() {
+    let state = test_state().await;
+    let (token, _) = j1_user(&state).await;
+    let (status, body) = j1_get(&state, "/System/Info", &[("X-Emby-Token", token.as_str())]).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let info: serde_json::Value = serde_json::from_str(&body).unwrap();
+    b130_assert_jellyfin_identity(&info);
+    assert_eq!(info["PackageVersion"], env!("CARGO_PKG_VERSION"), "{info}");
 }
 
 // ── Auth Endpoint Tests ──
@@ -1323,7 +1387,7 @@ async fn b148_webclient_cache_control() {
         .collect();
     assert!(
         refs.len() >= 4,
-        "index.html loads index js/css, hls, api.js and app.js: {refs:?}"
+        "index.html loads the index js (app.js bundled in) and css, hls and api.js: {refs:?}"
     );
     for uri in refs {
         assert!(hashed(&uri), "{uri} has no content hash");
@@ -2526,12 +2590,55 @@ async fn b118_validate_path_admin_only_after_owner() {
 }
 
 // B124: wizard Enter. Enter in a wizard field does what the step's primary button does.
+// "app.js" stands for the whole client: the entry app.js and then every module in
+// src/modules/, in the order below, so a check finds a function whichever module holds it.
+// A missing, empty or unlisted module fails here, so a "no longer uses X" check can't pass
+// on a part of the client.
+const B124_WEB_MODULES: &[&str] = &[
+    "admin.js",
+    "auth.js",
+    "cards.js",
+    "home.js",
+    "item.js",
+    "jellyfin-import.js",
+    "library-admin.js",
+    "library.js",
+    "player.js",
+    "plugins.js",
+    "router.js",
+    "search.js",
+    "settings.js",
+    "util.js",
+    "wizard.js",
+];
+
 fn b124_web_source(file: &str) -> String {
-    std::fs::read_to_string(format!(
-        "{}/../rustyfin-web/src/{file}",
-        env!("CARGO_MANIFEST_DIR")
-    ))
-    .unwrap()
+    let src = format!("{}/../rustyfin-web/src", env!("CARGO_MANIFEST_DIR"));
+    let read = |path: &str| {
+        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("web client source {path}: {e}"))
+    };
+    if file != "app.js" {
+        return read(&format!("{src}/{file}"));
+    }
+    let mut found: Vec<String> = std::fs::read_dir(format!("{src}/modules"))
+        .unwrap_or_else(|e| panic!("{src}/modules: {e}"))
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name.ends_with(".js"))
+        .collect();
+    found.sort();
+    let mut listed: Vec<String> = B124_WEB_MODULES.iter().map(|m| m.to_string()).collect();
+    listed.sort();
+    assert_eq!(
+        found, listed,
+        "src/modules/ holds exactly the listed modules"
+    );
+    let mut all = read(&format!("{src}/app.js"));
+    for module in B124_WEB_MODULES {
+        let text = read(&format!("{src}/modules/{module}"));
+        assert!(text.contains("function "), "{module} has no functions");
+        all.push_str(&text);
+    }
+    all
 }
 
 // A top-level function of app.js, from its head to its closing brace.
@@ -2544,12 +2651,16 @@ fn b124_function(app_js: &str, head: &str) -> String {
 }
 
 // Runs a node test of tests/web/ against app.js. Without node it fails rather than skip:
-// CI's Check job installs nodejs so that these tests run there.
+// CI's Check job installs nodejs so that these tests run there. The script gets the whole
+// client's source as one file (see b124_web_source) and the client's src dir.
 fn b124_node_test(script: &str) {
     let dir = env!("CARGO_MANIFEST_DIR");
+    let source = format!("{}/{script}.client.js", env!("CARGO_TARGET_TMPDIR"));
+    std::fs::write(&source, b124_web_source("app.js")).unwrap();
     let out = std::process::Command::new("node")
         .arg(format!("{dir}/tests/web/{script}"))
-        .arg(format!("{dir}/../rustyfin-web/src/app.js"))
+        .arg(&source)
+        .arg(format!("{dir}/../rustyfin-web/src"))
         .output()
         .unwrap_or_else(|e| panic!("{script} needs node on PATH: {e}"));
     assert!(
@@ -4220,13 +4331,626 @@ async fn b30_f6_only_a_tagged_request_is_cached_for_long() {
         let uri = format!("/Items/{id}/Images/Primary?{bounds}tag={tag}");
         let (status, cache_control, _) = b30_get_cached(&app, &uri, &token).await;
         assert_eq!(status, StatusCode::OK, "{uri}");
-        assert_eq!(cache_control, "public, max-age=86400", "{uri}");
+        // B152: a current tag names this exact picture for good
+        assert_eq!(
+            cache_control, "public, max-age=31536000, immutable",
+            "{uri}"
+        );
         // Without the tag, the answer may not be kept long: the picture can change under its URL.
         let uri = format!("/Items/{id}/Images/Primary?{bounds}");
         let (status, cache_control, _) = b30_get_cached(&app, &uri, &token).await;
         assert_eq!(status, StatusCode::OK, "{uri}");
         assert_eq!(cache_control, "public, max-age=300", "{uri}");
     }
+}
+
+// B152: ImageBlurHashes has Jellyfin's shape ({type: {tag: hash}}), and lists carry stored hashes
+#[tokio::test]
+async fn b152_blur_hashes_are_keyed_by_type_and_tag_in_details_and_lists() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let id = b30_photo(&state).await;
+    let app = app(state.clone());
+    b30_upload(&app, &token, id, &b30_jpeg(64, 96, [200, 30, 30])).await;
+    let tag = b30_primary_tag(&app, &token, id, "Photo").await;
+    let listed = || async {
+        let uri = "/Items?IncludeItemTypes=Photo&Recursive=true";
+        let (status, list) = send_authed(&app, "GET", uri, &token, None).await;
+        assert_eq!(status, StatusCode::OK, "{list}");
+        list["Items"][0]["ImageBlurHashes"].clone()
+    };
+
+    // Details compute a missing hash; a list only sends stored ones
+    let (status, details) = send_authed(&app, "GET", &format!("/Items/{id}"), &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{details}");
+    let hashes = details["ImageBlurHashes"].as_object().unwrap();
+    assert_eq!(hashes.keys().collect::<Vec<_>>(), ["Primary"], "{details}");
+    let by_tag = hashes["Primary"].as_object().unwrap();
+    assert_eq!(by_tag.keys().collect::<Vec<_>>(), [&tag], "{details}");
+    let hash = by_tag[&tag].as_str().unwrap();
+    assert!(blurhash::decode(hash, 4, 4, 1.0).is_ok(), "{hash}");
+    assert_eq!(listed().await, serde_json::json!({}));
+
+    // The image warmer stores it, and the list sends it from then on
+    let report =
+        rustyfin_core::image_warmer::warm_pass(&state.db, &state.data_dir, &state.http_client)
+            .await
+            .unwrap();
+    assert_eq!(report.hashed, 1, "{report:?}");
+    let hashes = listed().await;
+    let stored = hashes["Primary"][&tag]
+        .as_str()
+        .unwrap_or_else(|| panic!("{hashes}"));
+    assert!(blurhash::decode(stored, 4, 4, 1.0).is_ok(), "{stored}");
+}
+
+// B152: the web client's library index (Fields given empty, EnableUserData=false,
+// EnableImageTypes=Primary, ImageTypeLimit=1) carries names, the Primary tag and BlurHash, no user
+// data, no optional fields and no null fields (as Jellyfin)
+#[tokio::test]
+async fn b152_a_lean_list_has_names_pictures_and_blurhashes_only() {
+    use rustyfin_model::image::ImageType::Backdrop;
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let id = b30_photo(&state).await;
+    let app = app(state.clone());
+    b30_upload(&app, &token, id, &b30_jpeg(64, 96, [200, 30, 30])).await;
+    let backdrop = state.data_dir.join("b152-backdrop.jpg");
+    b30_set_image(&state, id, Backdrop, &backdrop.to_string_lossy(), Some(3)).await;
+    rustyfin_core::image_warmer::warm_pass(&state.db, &state.data_dir, &state.http_client)
+        .await
+        .unwrap();
+    let tag = b30_primary_tag(&app, &token, id, "Photo").await;
+
+    let uri = "/Items?IncludeItemTypes=Photo&Recursive=true";
+    let (status, full) = send_authed(&app, "GET", uri, &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{full}");
+    let uri =
+        format!("{uri}&Fields=&EnableUserData=false&EnableImageTypes=Primary&ImageTypeLimit=1");
+    let (status, lean) = send_authed(&app, "GET", &uri, &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{lean}");
+    for optional in [
+        "Overview",
+        "Genres",
+        "Tags",
+        "Studios",
+        "People",
+        "ProviderIds",
+        "Path",
+    ] {
+        assert!(
+            lean["Items"][0].get(optional).is_none(),
+            "{optional}: {lean}"
+        );
+    }
+
+    assert_eq!(lean["TotalRecordCount"], full["TotalRecordCount"]);
+    let item = &lean["Items"][0];
+    let fields = item.as_object().unwrap();
+    assert_eq!(item["Id"], full["Items"][0]["Id"]);
+    assert_eq!(item["Name"], "B30 Photo");
+    assert_eq!(item["Type"], full["Items"][0]["Type"]);
+    assert_eq!(
+        item["ImageTags"],
+        serde_json::json!({ "Primary": tag }),
+        "{item}"
+    );
+    assert_eq!(item["BackdropImageTags"], serde_json::json!([]), "{item}");
+    let hash = item["ImageBlurHashes"]["Primary"][&tag]
+        .as_str()
+        .unwrap_or_else(|| panic!("{item}"));
+    assert!(blurhash::decode(hash, 4, 4, 1.0).is_ok());
+    assert!(!fields.contains_key("UserData"), "{item}");
+    assert!(
+        fields.values().all(|v| !v.is_null()),
+        "no null fields: {item}"
+    );
+    assert!(
+        item.to_string().len() * 2 < full["Items"][0].to_string().len(),
+        "the lean item is less than half the full one"
+    );
+    // The full list keeps its shape: user data and every field
+    assert!(
+        full["Items"][0]
+            .as_object()
+            .unwrap()
+            .contains_key("UserData")
+    );
+}
+
+// B152 round 9-10: a copy at a grid width not made yet is answered with the pre-generated grid
+// master at once (its ETag names the master; kept 5 minutes, not as immutable), and made in the
+// background; the next request gets the copy, immutable. Other widths are rendered when asked.
+#[tokio::test]
+async fn b152_a_grid_copy_not_made_yet_is_served_by_the_master() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let id = b30_photo(&state).await;
+    let app = app(state.clone());
+    b30_upload(&app, &token, id, &b30_jpeg(640, 960, [30, 200, 30])).await;
+    rustyfin_core::image_warmer::warm_pass(&state.db, &state.data_dir, &state.http_client)
+        .await
+        .unwrap();
+    // A server warmed before the grid copies existed: the master only
+    let cache = state.data_dir.join("cache").join("images");
+    for entry in std::fs::read_dir(&cache).unwrap().flatten() {
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .ends_with("_480x720.jpg")
+        {
+            std::fs::remove_file(entry.path()).unwrap();
+        }
+    }
+    let tag = b30_primary_tag(&app, &token, id, "Photo").await;
+    let get = |uri: String| {
+        let app = app.clone();
+        let token = token.clone();
+        async move {
+            let request = Request::builder()
+                .uri(&uri)
+                .header("Authorization", format!("Bearer {token}"));
+            let resp = app
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let header = |name: &str| {
+                resp.headers()
+                    .get(name)
+                    .map(|v| v.to_str().unwrap().to_string())
+                    .unwrap_or_default()
+            };
+            let (etag, cache_control) = (header("etag"), header("cache-control"));
+            let status = resp.status();
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            (status, etag, cache_control, body)
+        }
+    };
+
+    // A width the warmer doesn't make: rendered now, at its size, kept as immutable
+    let uri = format!("/Items/{id}/Images/Primary?maxWidth=200&tag={tag}");
+    let (status, etag, cache_control, body) = get(uri).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(etag, format!("\"{tag}-200x300\""));
+    assert!(cache_control.contains("immutable"), "{cache_control}");
+    let img = image::load_from_memory(&body).unwrap();
+    assert_eq!(img.width(), 200);
+
+    // A grid width: the master at once, kept briefly
+    let uri = format!("/Items/{id}/Images/Primary?maxWidth=320&tag={tag}");
+    let (status, etag, cache_control, body) = get(uri.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(etag, format!("\"{tag}-480x720\""), "the master's ETag");
+    assert_eq!(cache_control, "public, max-age=300", "not immutable");
+    let img = image::load_from_memory(&body).unwrap();
+    assert_eq!(
+        (img.width(), img.height()),
+        (480, 720),
+        "the master's bytes"
+    );
+
+    // The copy is made in the background; then the same URL gets it, with its own ETag
+    let mut copy = None;
+    for _ in 0..100 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let (_, etag, cache_control, body) = get(uri.clone()).await;
+        if etag != format!("\"{tag}-480x720\"") {
+            copy = Some((etag, cache_control, body));
+            break;
+        }
+    }
+    let (etag, cache_control, body) = copy.expect("the copy was made within 5 s");
+    assert_eq!(etag, format!("\"{tag}-320x480\""));
+    assert!(cache_control.contains("immutable"), "{cache_control}");
+    let img = image::load_from_memory(&body).unwrap();
+    assert_eq!((img.width(), img.height()), (320, 480));
+}
+
+// B152 round 9: RustyfinCardIndex=true (a Rustyfin extension) answers with only what a poster
+// card shows, under 300 bytes an item; the same request without it keeps Jellyfin's base DTO
+#[tokio::test]
+async fn b152_a_card_index_has_only_what_a_card_shows() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let id = b30_photo(&state).await;
+    let app = app(state.clone());
+    b30_upload(&app, &token, id, &b30_jpeg(64, 96, [200, 30, 30])).await;
+    rustyfin_core::image_warmer::warm_pass(&state.db, &state.data_dir, &state.http_client)
+        .await
+        .unwrap();
+    let tag = b30_primary_tag(&app, &token, id, "Photo").await;
+
+    let base = "/Items?IncludeItemTypes=Photo&Recursive=true&Fields=&EnableUserData=false\
+                &EnableImageTypes=Primary&ImageTypeLimit=1";
+    let (status, jellyfin) = send_authed(&app, "GET", base, &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{jellyfin}");
+    let uri = format!("{base}&RustyfinCardIndex=true");
+    let (status, cards) = send_authed(&app, "GET", &uri, &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{cards}");
+
+    assert_eq!(cards["TotalRecordCount"], jellyfin["TotalRecordCount"]);
+    let item = &cards["Items"][0];
+    let keys: Vec<&str> = item
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let allowed = [
+        "Id",
+        "Name",
+        "SortName",
+        "Type",
+        "ProductionYear",
+        "CommunityRating",
+        "IndexNumber",
+        "IndexNumberEnd",
+        "ParentIndexNumber",
+        "SeriesName",
+        "ImageTags",
+        "ImageBlurHashes",
+    ];
+    assert!(keys.iter().all(|k| allowed.contains(k)), "{item}");
+    assert_eq!(item["Id"], jellyfin["Items"][0]["Id"]);
+    assert_eq!(item["Name"], "B30 Photo");
+    assert_eq!(item["Type"], jellyfin["Items"][0]["Type"]);
+    assert_eq!(item["ImageTags"], serde_json::json!({ "Primary": tag }));
+    assert_eq!(
+        item["ImageBlurHashes"]["Primary"][&tag],
+        jellyfin["Items"][0]["ImageBlurHashes"]["Primary"][&tag]
+    );
+    assert!(
+        item.as_object().unwrap().values().all(|v| !v.is_null()),
+        "{item}"
+    );
+    assert!(
+        item.to_string().len() < 300,
+        "{} bytes: {item}",
+        item.to_string().len()
+    );
+    // Without the extension, the answer is Jellyfin's base DTO, as other clients expect
+    assert!(
+        jellyfin["Items"][0]
+            .as_object()
+            .unwrap()
+            .contains_key("CanDelete"),
+        "{jellyfin}"
+    );
+}
+
+// B152 round 10: the card index lists the same items as the normal list for a user who isn't an
+// administrator, per-user filters included (Rustyfin has no library-access or parental-rating
+// limits; the per-user favourites are the per-user filter there is), and an episode card carries
+// its IndexNumberEnd
+#[tokio::test]
+async fn b152_a_card_index_lists_what_the_list_lists_for_a_plain_user() {
+    let state = test_state().await;
+    let folder = media_folder(&state, "b152 cards");
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: "B152 Cards".to_string(),
+        content_type: rustyfin_model::library::LibraryContentType::Movies,
+        paths: vec![folder.clone()],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    let mut ids = Vec::new();
+    for (name, kind, numbers) in [
+        ("Alpha", "Movie", None),
+        ("Beta", "Movie", None),
+        ("Gamma", "Movie", None),
+        ("Delta E1-2", "Episode", Some((1, 2))),
+    ] {
+        let id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO media_items (id, library_id, name, media_type, path, index_number, \
+             index_number_end) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(id.to_string())
+        .bind(lib.id.to_string())
+        .bind(name)
+        .bind(kind)
+        .bind(format!("{folder}/{name}.mkv"))
+        .bind(numbers.map(|(first, _)| first))
+        .bind(numbers.map(|(_, last)| last))
+        .execute(&state.db)
+        .await
+        .unwrap();
+        ids.push(id);
+    }
+    let (token, user) = j6_user_session(&state).await;
+    let (other_token, other) = j6_user_session(&state).await;
+    let app = app(state.clone());
+    // The user's favourite, and another user's
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        &format!("/Users/{user}/FavoriteItems/{}", ids[1]),
+        &token,
+        None,
+    )
+    .await;
+    assert!(status.is_success(), "{status}");
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        &format!("/Users/{other}/FavoriteItems/{}", ids[2]),
+        &other_token,
+        None,
+    )
+    .await;
+    assert!(status.is_success(), "{status}");
+
+    let listed = |body: &serde_json::Value| -> Vec<String> {
+        body["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["Id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    for filter in ["", "&IsFavorite=true"] {
+        let base = format!(
+            "/Items?LibraryId={}&Recursive=true&SortBy=SortName&Fields=&EnableUserData=false{filter}",
+            lib.id
+        );
+        let (status, plain) = send_authed(&app, "GET", &base, &token, None).await;
+        assert_eq!(status, StatusCode::OK, "{plain}");
+        let (status, cards) = send_authed(
+            &app,
+            "GET",
+            &format!("{base}&RustyfinCardIndex=true"),
+            &token,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{cards}");
+        assert_eq!(listed(&cards), listed(&plain), "{filter}");
+        assert_eq!(
+            cards["TotalRecordCount"], plain["TotalRecordCount"],
+            "{filter}"
+        );
+        if filter.is_empty() {
+            assert_eq!(listed(&cards).len(), 4);
+            let episode = cards["Items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["Id"] == ids[3].to_string())
+                .unwrap();
+            assert_eq!(
+                (
+                    episode["IndexNumber"].clone(),
+                    episode["IndexNumberEnd"].clone()
+                ),
+                (1.into(), 2.into())
+            );
+        } else {
+            assert_eq!(
+                listed(&cards),
+                vec![ids[1].to_string()],
+                "only the user's own favourite"
+            );
+        }
+    }
+}
+
+// B152 F13: EnableUserData=false leaves out UserData and nothing else, as in Jellyfin: a
+// third-party request with normal Fields gets the same movie, series and episode fields as without
+// it (no lean answer), and the episode keeps its series fields
+#[tokio::test]
+async fn b152_enable_user_data_false_drops_only_user_data() {
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    let app = app(state.clone());
+    let base = "/Items?Recursive=true&IncludeItemTypes=Movie,Series,Episode&SortBy=SortName\
+                &Fields=ChildCount,ProviderIds,Overview,PrimaryImageAspectRatio";
+    let (status, full) = send_authed(&app, "GET", base, &lib.token, None).await;
+    assert_eq!(status, StatusCode::OK, "{full}");
+    let uri = format!("{base}&EnableUserData=false");
+    let (status, without) = send_authed(&app, "GET", &uri, &lib.token, None).await;
+    assert_eq!(status, StatusCode::OK, "{without}");
+
+    let items = |body: &serde_json::Value| body["Items"].as_array().unwrap().clone();
+    let (full, without) = (items(&full), items(&without));
+    let ids: Vec<_> = full.iter().map(|i| i["Id"].clone()).collect();
+    for id in [lib.movie, lib.series, lib.episode] {
+        assert!(ids.contains(&serde_json::json!(id)), "{id} listed");
+    }
+    assert_eq!(full.len(), without.len());
+    for (a, b) in full.iter().zip(&without) {
+        let mut a = a.as_object().unwrap().clone();
+        let mut b = b.as_object().unwrap().clone();
+        assert!(b["UserData"].is_null(), "no user data: {b:?}");
+        if a["Id"] == serde_json::json!(lib.episode) {
+            assert!(
+                a["UserData"].is_object(),
+                "an episode always has user data: {a:?}"
+            );
+        }
+        a.remove("UserData");
+        b.remove("UserData");
+        let b = &b;
+        // The same keys and values, the per-user ones aside
+        let differ: Vec<&String> = a
+            .keys()
+            .chain(b.keys())
+            .filter(|k| a.get(*k) != b.get(*k))
+            .collect();
+        assert!(differ.is_empty(), "{}: {differ:?}", a["Type"]);
+    }
+    let episode = without
+        .iter()
+        .find(|i| i["Id"] == serde_json::json!(lib.episode))
+        .unwrap();
+    assert_eq!(
+        episode["SeriesId"],
+        serde_json::json!(lib.series),
+        "{episode}"
+    );
+    assert!(episode["SeriesName"].is_string(), "{episode}");
+}
+
+// B152 F14: EnableImageTypes naming no known type keeps every image (Jellyfin applies it only when
+// it holds a type); EnableImages=false sends none
+#[tokio::test]
+async fn b152_image_options_follow_jellyfin() {
+    use rustyfin_model::image::ImageType::Backdrop;
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let id = b30_photo(&state).await;
+    let app = app(state.clone());
+    b30_upload(&app, &token, id, &b30_jpeg(64, 96, [200, 30, 30])).await;
+    for (i, stamp) in [(0, 3), (1, 4)] {
+        let path = state.data_dir.join(format!("b152-backdrop-{i}.jpg"));
+        let image = rustyfin_model::image::ItemImage {
+            item_id: id,
+            image_type: Backdrop,
+            image_index: i,
+            path: path.to_string_lossy().into_owned(),
+            provider: "local".to_string(),
+            width: None,
+            height: None,
+            blurhash: None,
+            stamp: Some(stamp),
+        };
+        rustyfin_db::repo_image::upsert_image(&state.db, &image)
+            .await
+            .unwrap();
+    }
+    let get = |query: &'static str| {
+        let app = app.clone();
+        let token = token.clone();
+        async move {
+            let uri = format!("/Items?IncludeItemTypes=Photo&Recursive=true{query}");
+            let (status, body) = send_authed(&app, "GET", &uri, &token, None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            body["Items"][0].clone()
+        }
+    };
+    let all = get("").await;
+    assert_eq!(
+        all["BackdropImageTags"].as_array().unwrap().len(),
+        2,
+        "{all}"
+    );
+    for query in [
+        "&EnableImageTypes=",
+        "&EnableImageTypes=Foo",
+        "&enableImageTypes=Foo,",
+    ] {
+        let item = get(query).await;
+        assert_eq!(item["ImageTags"], all["ImageTags"], "{query}");
+        assert_eq!(
+            item["BackdropImageTags"], all["BackdropImageTags"],
+            "{query}"
+        );
+    }
+    let one = get("&ImageTypeLimit=1").await;
+    assert_eq!(
+        one["BackdropImageTags"].as_array().unwrap().len(),
+        1,
+        "{one}"
+    );
+    assert_eq!(one["ImageTags"], all["ImageTags"]);
+    let backdrops = get("&EnableImageTypes=Backdrop").await;
+    assert!(
+        backdrops["ImageTags"].get("Primary").is_none(),
+        "{backdrops}"
+    );
+    assert_eq!(backdrops["BackdropImageTags"], all["BackdropImageTags"]);
+    let none = get("&EnableImages=false").await;
+    assert_eq!(none["ImageTags"], serde_json::json!({}), "{none}");
+    assert_eq!(none["BackdropImageTags"], serde_json::json!([]), "{none}");
+    assert_eq!(none["ImageBlurHashes"], serde_json::json!({}), "{none}");
+}
+
+// B152: images answer If-None-Match with 304, and only a current tag is kept for good
+#[tokio::test]
+async fn b152_images_carry_an_etag_and_answer_304_when_unchanged() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let id = b30_photo(&state).await;
+    let app = app(state);
+    b30_upload(&app, &token, id, &b30_jpeg(64, 96, [255, 0, 0])).await;
+    let tag = b30_primary_tag(&app, &token, id, "Photo").await;
+
+    let get = |uri: String, if_none_match: Option<String>| {
+        let app = app.clone();
+        let token = token.clone();
+        async move {
+            let mut request = Request::builder()
+                .uri(&uri)
+                .header("Authorization", format!("Bearer {token}"));
+            if let Some(etag) = if_none_match {
+                request = request.header("If-None-Match", etag);
+            }
+            let resp = app
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let header = |name: &str| {
+                resp.headers()
+                    .get(name)
+                    .map(|v| v.to_str().unwrap().to_string())
+                    .unwrap_or_default()
+            };
+            let (status, etag, cache_control) =
+                (resp.status(), header("etag"), header("cache-control"));
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            (status, etag, cache_control, body.len())
+        }
+    };
+
+    let mut etags = Vec::new();
+    for bounds in ["", "maxWidth=32&"] {
+        let uri = format!("/Items/{id}/Images/Primary?{bounds}tag={tag}");
+        let (status, etag, _, len) = get(uri.clone(), None).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert!(
+            len > 0 && etag.starts_with('"') && etag.ends_with('"'),
+            "{uri}: {etag}"
+        );
+        // The same picture asked again with its ETag: 304, no body, the same caching
+        for sent in [
+            etag.clone(),
+            format!("W/{etag}"),
+            format!("\"other\", {etag}"),
+            "*".into(),
+        ] {
+            let (status, again, cache_control, len) = get(uri.clone(), Some(sent.clone())).await;
+            assert_eq!(status, StatusCode::NOT_MODIFIED, "{uri} with {sent}");
+            assert_eq!(
+                (again.as_str(), len),
+                (etag.as_str(), 0),
+                "{uri} with {sent}"
+            );
+            assert_eq!(cache_control, "public, max-age=31536000, immutable");
+        }
+        let (status, _, _, _) = get(uri.clone(), Some("\"other\"".into())).await;
+        assert_eq!(status, StatusCode::OK, "{uri} with another ETag");
+        etags.push(etag);
+    }
+    assert_ne!(etags[0], etags[1], "each size has its own ETag");
+
+    // A stale tag still gets the picture, but only for a short while: it may be the wrong one
+    let uri =
+        format!("/Items/{id}/Images/Primary?maxWidth=32&tag=0123456789abcdef0123456789abcdef");
+    let (status, etag, cache_control, _) = get(uri, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        etag, etags[1],
+        "the ETag names the picture sent, whatever the URL's tag"
+    );
+    assert_eq!(cache_control, "public, max-age=300");
+
+    // A new picture gets a new ETag, so the old one no longer matches
+    b30_upload(&app, &token, id, &b30_jpeg(64, 96, [0, 0, 255])).await;
+    let uri = format!("/Items/{id}/Images/Primary?maxWidth=32");
+    let (status, etag, _, _) = get(uri, Some(etags[1].clone())).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_ne!(etag, etags[1]);
 }
 
 #[tokio::test]
@@ -4345,6 +5069,63 @@ async fn b30_f2_hint_tags_change_with_the_image() {
     );
     let details = b30_details(&app, &lib.token, lib.movie).await;
     assert_eq!(second, details["ImageTags"]["Primary"], "{details}");
+}
+
+// B152 F10: a listed episode carries the BlurHashes of the series pictures it names, as Jellyfin's
+// ImageBlurHashes does, so a card showing the series thumb paints its preview
+#[tokio::test]
+async fn b152_a_listed_episode_carries_its_series_blur_hashes() {
+    use rustyfin_core::image_proxy::image_tag;
+    use rustyfin_model::image::ImageType::{Primary, Thumb};
+
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    let app = app(state.clone());
+    let primary = state.data_dir.join("b152-series-primary.jpg");
+    let primary = primary.to_string_lossy();
+    let thumb = state.data_dir.join("b152-series-thumb.jpg");
+    let thumb = thumb.to_string_lossy();
+    b30_set_image(&state, lib.series, Primary, &primary, Some(5)).await;
+    b30_set_image(&state, lib.series, Thumb, &thumb, Some(6)).await;
+    for (image_type, path, stamp, hash) in [
+        (Primary, &primary, 5, "LKO2?U%2Tw=w"),
+        (Thumb, &thumb, 6, "L00000fQfQfQ"),
+    ] {
+        let img = rustyfin_model::image::ItemImage {
+            item_id: lib.series,
+            image_type,
+            image_index: 0,
+            path: path.to_string(),
+            provider: "local".to_string(),
+            width: None,
+            height: None,
+            blurhash: None,
+            stamp: Some(stamp),
+        };
+        assert!(
+            rustyfin_db::repo_image::set_image_blurhash(&state.db, &img, hash)
+                .await
+                .unwrap()
+        );
+    }
+
+    let uri = "/Items?IncludeItemTypes=Episode&Recursive=true";
+    let (status, list) = send_authed(&app, "GET", uri, &lib.token, None).await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let episode = list["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["Id"] == serde_json::json!(lib.episode))
+        .unwrap_or_else(|| panic!("no episode in {list}"));
+    assert_eq!(
+        episode["ImageBlurHashes"],
+        serde_json::json!({
+            "Primary": { image_tag(&primary, Some(5)): "LKO2?U%2Tw=w" },
+            "Thumb": { image_tag(&thumb, Some(6)): "L00000fQfQfQ" },
+        }),
+        "{episode}"
+    );
 }
 
 #[tokio::test]
@@ -4619,6 +5400,572 @@ async fn b30_p6_terms_the_index_cannot_parse_still_find_by_name() {
         let hints = format!("/Search/Hints?SearchTerm={term}");
         assert_eq!(b27_found(&app, &hints, &token).await, [found]);
     }
+}
+
+// ── R1 auth: the Jellyfin Web contract ──
+
+/// The status and JSON body (Null when the body isn't JSON) of `method uri` with `token` and an
+/// optional JSON body.
+async fn r1auth_send(
+    state: &AppState,
+    method: &str,
+    uri: &str,
+    token: Option<&str>,
+    body: Option<serde_json::Value>,
+) -> (StatusCode, serde_json::Value) {
+    let mut builder = Request::builder().method(method).uri(uri);
+    if let Some(token) = token {
+        builder = builder.header("X-Emby-Token", token);
+    }
+    let body = match body {
+        Some(json) => {
+            builder = builder.header("Content-Type", "application/json");
+            Body::from(json.to_string())
+        }
+        None => Body::empty(),
+    };
+    let resp = app(state.clone())
+        .oneshot(builder.body(body).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+    )
+}
+
+async fn r1auth_get(state: &AppState, uri: &str, token: &str) -> (StatusCode, serde_json::Value) {
+    r1auth_send(state, "GET", uri, Some(token), None).await
+}
+
+/// The ids of a `QueryResult`'s items, as strings without dashes.
+fn r1auth_ids(result: &serde_json::Value) -> Vec<String> {
+    let mut ids: Vec<String> = result["Items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no Items in {result}"))
+        .iter()
+        .map(|item| item["Id"].as_str().unwrap().replace('-', ""))
+        .collect();
+    ids.sort();
+    ids
+}
+
+fn r1auth_sorted(ids: &[uuid::Uuid]) -> Vec<String> {
+    let mut ids: Vec<String> = ids.iter().map(|id| id.simple().to_string()).collect();
+    ids.sort();
+    ids
+}
+
+#[tokio::test]
+async fn r1auth_routes_match_without_case() {
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    let (status, users) = r1auth_send(&state, "GET", "/users/public", None, None).await;
+    assert_eq!(status, StatusCode::OK, "{users}");
+    assert!(users.is_array());
+    let (status, info) = r1auth_send(&state, "GET", "/SYSTEM/info/Public", None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    // Jellyfin Android (jellyfin-sdk-kotlin) rejects any other product name.
+    assert_eq!(info["ProductName"], "Jellyfin Server");
+    let (status, full) = r1auth_get(&state, "/system/info", &lib.token).await;
+    assert_eq!(status, StatusCode::OK, "{full}");
+    assert_eq!(full["ProductName"], "Jellyfin Server");
+    assert!(
+        info["LocalAddress"]
+            .as_str()
+            .unwrap()
+            .starts_with("http://")
+    );
+    // A literal beats a parameter, so this is the sign-in route, not POST /Users/{userId}.
+    let wrong = serde_json::json!({ "Username": "nobody", "Pw": "wrong" });
+    let (status, _) = r1auth_send(
+        &state,
+        "POST",
+        "/Users/authenticatebyname",
+        None,
+        Some(wrong),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, item) = r1auth_get(
+        &state,
+        &format!("/items/{}?userid={}", lib.movie, lib.admin),
+        &lib.token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{item}");
+    assert_eq!(item["Name"], "Comet Night");
+    let (status, _) = r1auth_get(&state, "/users/me", &lib.token).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = r1auth_get(&state, "/no/such/route", &lib.token).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn r1auth_repeated_list_parameters_are_accepted() {
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    let uri = format!(
+        "/Items?userId={}&recursive=true&parentId={}&fields=MediaSourceCount\
+         &fields=PrimaryImageAspectRatio&includeItemTypes=Movie&sortBy=SortName\
+         &enableImageTypes=Primary&enableImageTypes=Backdrop",
+        lib.admin, lib.library
+    );
+    let (status, body) = r1auth_get(&state, &uri, &lib.token).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(r1auth_ids(&body), r1auth_sorted(&[lib.movie]));
+    // Repeated and comma-separated forms give the same items.
+    let (status, comma) = r1auth_get(
+        &state,
+        &format!(
+            "/Items?parentId={}&recursive=true&includeItemTypes=Movie,Series",
+            lib.library
+        ),
+        &lib.token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{comma}");
+    let (status, repeated) = r1auth_get(
+        &state,
+        &format!(
+            "/Items?parentId={}&recursive=true&includeItemTypes=Movie&includeItemTypes=Series",
+            lib.library
+        ),
+        &lib.token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{repeated}");
+    assert_eq!(r1auth_ids(&comma), r1auth_ids(&repeated));
+    assert_eq!(r1auth_ids(&comma), r1auth_sorted(&[lib.movie, lib.series]));
+    let (status, body) = r1auth_get(
+        &state,
+        &format!(
+            "/Studios?parentId={}&fields=DateCreated&fields=PrimaryImageAspectRatio",
+            lib.library
+        ),
+        &lib.token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
+async fn r1auth_jellyfin_web_routes_answer() {
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    let t = lib.token.as_str();
+    let (status, item) = r1auth_get(
+        &state,
+        &format!("/Users/{}/Items/{}", lib.admin, lib.movie),
+        t,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{item}");
+    assert_eq!(item["Name"], "Comet Night");
+    for uri in [
+        format!("/Users/{}/Items/{}/Intros", lib.admin, lib.movie),
+        format!("/Items/{}/Intros", lib.movie),
+    ] {
+        let (status, body) = r1auth_get(&state, &uri, t).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        assert_eq!(body["TotalRecordCount"], 0);
+        assert_eq!(body["Items"], serde_json::json!([]));
+    }
+    let (status, theme) = r1auth_get(
+        &state,
+        &format!(
+            "/Items/{}/ThemeMedia?userId={}&inheritFromParent=true&sortBy=Random",
+            lib.movie, lib.admin
+        ),
+        t,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{theme}");
+    for key in [
+        "ThemeVideosResult",
+        "ThemeSongsResult",
+        "SoundtrackSongsResult",
+    ] {
+        assert_eq!(theme[key]["TotalRecordCount"], 0, "{key}");
+        assert_eq!(theme[key]["OwnerId"], lib.movie.simple().to_string());
+    }
+    let (status, groups) = r1auth_get(&state, "/SyncPlay/List", t).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(groups, serde_json::json!([]));
+    let (status, resume) = r1auth_get(
+        &state,
+        &format!(
+            "/UserItems/Resume?userId={}&limit=12&fields=PrimaryImageAspectRatio\
+             &mediaTypes=Video&enableImageTypes=Primary&enableImageTypes=Thumb",
+            lib.admin
+        ),
+        t,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{resume}");
+    assert!(resume["Items"].is_array());
+    let (status, filters) = r1auth_get(
+        &state,
+        &format!(
+            "/Items/Filters2?userId={}&parentId={}&includeItemTypes=Movie",
+            lib.admin, lib.library
+        ),
+        t,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{filters}");
+    assert!(filters["Genres"].is_array() && filters["Tags"].is_array());
+    // A library is an item too: its CollectionFolder view.
+    let (status, folder) = r1auth_get(
+        &state,
+        &format!("/Items/{}?userId={}", lib.library, lib.admin),
+        t,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{folder}");
+    assert_eq!(folder["Type"], "CollectionFolder");
+    assert_eq!(folder["Name"], "J6 Library");
+    assert_eq!(folder["ServerId"], state.server_id.as_str());
+    // Ancestors: an array, nearest parent first, ending with the library.
+    let (status, ancestors) =
+        r1auth_get(&state, &format!("/Items/{}/Ancestors", lib.episode), t).await;
+    assert_eq!(status, StatusCode::OK, "{ancestors}");
+    let names: Vec<&str> = ancestors
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["Name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        ["Comet Hunters Season 1", "Comet Hunters", "J6 Library"]
+    );
+    let (status, ancestors) =
+        r1auth_get(&state, &format!("/Items/{}/Ancestors", lib.movie), t).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ancestors[0]["Type"], "CollectionFolder");
+    assert_eq!(ancestors.as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn r1auth_branding_is_public() {
+    let state = test_state().await;
+    let (status, branding) =
+        r1auth_send(&state, "GET", "/Branding/Configuration", None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(branding["SplashscreenEnabled"], false);
+    assert!(branding["LoginDisclaimer"].is_string());
+    assert!(branding["CustomCss"].is_string());
+    for uri in ["/Branding/Css", "/Branding/Css.css"] {
+        let resp = app(state.clone())
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+        assert!(
+            resp.headers()["content-type"]
+                .to_str()
+                .unwrap()
+                .starts_with("text/css")
+        );
+    }
+}
+
+/// Case variants reach the route with its guards: signed-in routes need a token, admin routes an
+/// administrator, and another user's items need that user or an administrator.
+#[tokio::test]
+async fn r1auth_case_variants_keep_their_guards() {
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    let (user_token, _) = j6_user_session(&state).await;
+    for uri in [
+        "/USERS".to_string(),
+        "/users/me".to_string(),
+        format!("/items/{}", lib.movie),
+        format!("/ITEMS/{}/ANCESTORS", lib.movie),
+    ] {
+        let (status, _) = r1auth_send(&state, "GET", &uri, None, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri}");
+    }
+    for uri in ["/Auth/Keys", "/auth/keys", "/AUTH/KEYS"] {
+        let (status, _) = r1auth_get(&state, uri, &user_token).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
+        let (status, _) = r1auth_get(&state, uri, &lib.token).await;
+        assert_eq!(status, StatusCode::OK, "{uri} as an administrator");
+    }
+    for uri in [
+        format!("/Users/{}/Items/{}", lib.admin, lib.movie),
+        format!("/users/{}/items/{}", lib.admin, lib.movie),
+        format!("/UserItems/Resume?userId={}", lib.admin),
+    ] {
+        let (status, _) = r1auth_get(&state, &uri, &user_token).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
+    }
+}
+
+/// `LocalAddress` is an address a client can use: `RUSTYFIN_PUBLISHED_URL` when set, else the
+/// request's Host with its scheme, never the unspecified bind address.
+#[tokio::test]
+async fn r1auth_local_address_is_reachable() {
+    let state = test_state().await;
+    let local_in = |state: AppState, headers: Vec<(&'static str, &'static str)>| async move {
+        let mut builder = Request::builder().uri("/System/Info/Public");
+        for (name, value) in headers {
+            builder = builder.header(name, value);
+        }
+        let resp = app(state)
+            .oneshot(builder.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let info: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        info["LocalAddress"].as_str().unwrap().to_string()
+    };
+    let local = |headers: Vec<(&'static str, &'static str)>| local_in(state.clone(), headers);
+    // test_state binds 0.0.0.0:8096.
+    assert_eq!(local(vec![]).await, "http://localhost:8096");
+    assert_eq!(
+        local(vec![("Host", "media.example:8096")]).await,
+        "http://media.example:8096"
+    );
+    assert_eq!(
+        local(vec![
+            ("Host", "media.example"),
+            ("X-Forwarded-Proto", "https")
+        ])
+        .await,
+        "https://media.example"
+    );
+    assert_eq!(
+        local(vec![("Host", "evil\"<x>")]).await,
+        "http://localhost:8096"
+    );
+    // The sign-in provider's public URL is not LocalAddress's source.
+    let mut oidc = rustyfin_db::repo_oidc::get_settings(&state.db)
+        .await
+        .unwrap();
+    oidc.public_url = "https://sso.example/jf/".to_string();
+    rustyfin_db::repo_oidc::save_settings(&state.db, &oidc)
+        .await
+        .unwrap();
+    assert_eq!(
+        local(vec![("Host", "media.example:8096")]).await,
+        "http://media.example:8096"
+    );
+    // The published URL comes first, over the Host and the forwarded scheme.
+    let published = AppState {
+        published_url: Some(Arc::new("https://flix.example/jf/".to_string())),
+        ..state.clone()
+    };
+    for headers in [
+        vec![],
+        vec![
+            ("Host", "media.example:8096"),
+            ("X-Forwarded-Proto", "http"),
+        ],
+    ] {
+        assert_eq!(
+            local_in(published.clone(), headers).await,
+            "https://flix.example/jf"
+        );
+    }
+}
+
+/// `/Users/{userId}/Items/{itemId}` answers with the path user's watch data, as Jellyfin does.
+#[tokio::test]
+async fn r1auth_user_item_carries_the_path_users_data() {
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    let (user_token, user) = j6_user_session(&state).await;
+    let (status, _) = r1auth_send(
+        &state,
+        "POST",
+        &format!("/Users/{user}/PlayedItems/{}", lib.movie),
+        Some(&user_token),
+        None,
+    )
+    .await;
+    assert!(status.is_success(), "{status}");
+    let (status, item) = r1auth_get(
+        &state,
+        &format!("/Users/{user}/Items/{}", lib.movie),
+        &lib.token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{item}");
+    assert_eq!(item["UserData"]["Played"], true);
+    let (_, item) = r1auth_get(&state, &format!("/Items/{}", lib.movie), &lib.token).await;
+    assert_ne!(
+        item["UserData"]["Played"], true,
+        "the administrator's own data"
+    );
+    let (_, item) = r1auth_get(
+        &state,
+        &format!("/Users/{}/Items/{}", lib.admin, lib.movie),
+        &lib.token,
+    )
+    .await;
+    assert_ne!(item["UserData"]["Played"], true);
+}
+
+/// B146: ParentId narrows to the parent's items, as in Jellyfin.
+#[tokio::test]
+async fn r1auth_parent_id_filters_seasons_and_episodes() {
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    let other = j6_add_item(&state, lib.library, None, "Other Show", "Series").await;
+    let other_season =
+        j6_add_item(&state, lib.library, Some(other), "Other Season 1", "Season").await;
+    let other_episode = j6_add_item(
+        &state,
+        lib.library,
+        Some(other_season),
+        "Other S01E01",
+        "Episode",
+    )
+    .await;
+    let shelf = j6_add_item(&state, lib.library, None, "Shelf", "Folder").await;
+    let shelved = j6_add_item(&state, lib.library, Some(shelf), "Shelved Film", "Movie").await;
+    let (user_token, _) = j6_user_session(&state).await;
+    for token in [lib.token.as_str(), user_token.as_str()] {
+        let get = |query: String| {
+            let state = state.clone();
+            async move {
+                let (status, body) = r1auth_get(&state, &format!("/Items?{query}"), token).await;
+                assert_eq!(status, StatusCode::OK, "{query}: {body}");
+                r1auth_ids(&body)
+            }
+        };
+        assert_eq!(
+            get(format!(
+                "ParentId={}&Recursive=true&IncludeItemTypes=Episode",
+                lib.series
+            ))
+            .await,
+            r1auth_sorted(&[lib.episode])
+        );
+        assert_eq!(
+            get(format!("ParentId={}&IncludeItemTypes=Season", lib.series)).await,
+            r1auth_sorted(&[lib.season])
+        );
+        assert_eq!(
+            get(format!("ParentId={}", lib.season)).await,
+            r1auth_sorted(&[lib.episode])
+        );
+        assert_eq!(
+            get(format!(
+                "ParentId={}&Recursive=true&IncludeItemTypes=Episode",
+                lib.library
+            ))
+            .await,
+            r1auth_sorted(&[lib.episode, other_episode])
+        );
+        assert_eq!(
+            get(format!(
+                "ParentId={}&IncludeItemTypes=Movie,Series",
+                lib.library
+            ))
+            .await,
+            r1auth_sorted(&[lib.movie, lib.series, other])
+        );
+        // Without a type filter, so a leak of deeper items shows: a library's top level holds
+        // no season, episode, track or item of a nested folder.
+        let top = get(format!("ParentId={}", lib.library)).await;
+        for id in [lib.movie, lib.series, other, shelf, lib.artist] {
+            assert!(top.contains(&id.simple().to_string()), "{id} at the top");
+        }
+        for id in [
+            lib.season,
+            lib.episode,
+            lib.album,
+            lib.track,
+            other_season,
+            other_episode,
+            shelved,
+        ] {
+            assert!(
+                !top.contains(&id.simple().to_string()),
+                "{id} not at the top"
+            );
+        }
+        assert_eq!(
+            get(format!("ParentId={}", lib.series)).await,
+            r1auth_sorted(&[lib.season])
+        );
+        assert_eq!(
+            get(format!("ParentId={shelf}")).await,
+            r1auth_sorted(&[shelved])
+        );
+        // Recursive reaches into the nested folder.
+        assert_eq!(
+            get(format!(
+                "ParentId={}&Recursive=true&IncludeItemTypes=Movie",
+                lib.library
+            ))
+            .await,
+            r1auth_sorted(&[lib.movie, shelved])
+        );
+    }
+}
+
+/// B157: user objects carry Jellyfin's Policy and Configuration.
+#[tokio::test]
+async fn r1auth_users_have_policy_and_configuration() {
+    let state = test_state().await;
+    let (admin_token, admin) = admin_session(&state).await;
+    let (_, user) = j6_user_session(&state).await;
+    let (status, me) = r1auth_get(&state, &format!("/Users/{admin}"), &admin_token).await;
+    assert_eq!(status, StatusCode::OK, "{me}");
+    assert_eq!(me["Policy"]["IsAdministrator"], true);
+    assert_eq!(me["Policy"]["IsDisabled"], false);
+    assert_eq!(me["Policy"]["EnableAllFolders"], true);
+    assert_eq!(me["Policy"]["EnableContentDeletion"], true);
+    assert_eq!(me["Configuration"]["PlayDefaultAudioTrack"], true);
+    assert_eq!(me["HasPassword"], true);
+    assert_eq!(me["HasConfiguredPassword"], true);
+    assert_eq!(me["ServerId"], state.server_id.as_str());
+    assert_eq!(me["IsAdministrator"], true);
+
+    let (status, other) = r1auth_get(&state, &format!("/Users/{user}"), &admin_token).await;
+    assert_eq!(status, StatusCode::OK);
+    let policy = other["Policy"].clone();
+    assert_eq!(policy["IsAdministrator"], false);
+    assert_eq!(policy["EnableContentDeletion"], false);
+    assert_eq!(policy["EnableMediaPlayback"], true);
+    assert_eq!(policy["EnableContentDownloading"], false);
+    assert_eq!(policy["EnableAllFolders"], true);
+
+    // A Jellyfin client saves the whole policy back; the account keeps its role.
+    let (status, _) = r1auth_send(
+        &state,
+        "POST",
+        &format!("/Users/{user}/Policy"),
+        Some(&admin_token),
+        Some(policy),
+    )
+    .await;
+    assert!(status.is_success(), "{status}");
+    let (_, other) = r1auth_get(&state, &format!("/Users/{user}"), &admin_token).await;
+    assert_eq!(other["Policy"]["IsAdministrator"], false);
+    assert_eq!(other["IsAdministrator"], false);
+
+    // The sign-in answer's user has them too.
+    let name = format!("r1auth_{}", uuid::Uuid::new_v4().simple());
+    add_user(&state, &name, "pw", false).await;
+    let (status, auth) = r1auth_send(
+        &state,
+        "POST",
+        "/Users/AuthenticateByName",
+        None,
+        Some(serde_json::json!({ "Username": name, "Pw": "pw" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{auth}");
+    assert_eq!(auth["User"]["Policy"]["IsAdministrator"], false);
+    assert!(auth["User"]["Configuration"].is_object());
 }
 
 // ── J6: search parity ──
@@ -7980,6 +9327,7 @@ async fn b21_settings_defaults() {
             "PublicUrl": "",
             "CallbackUrl": "",
             "AllowPasswordSignIn": true,
+            "MismatchedOrigin": null,
         })
     );
 }
@@ -8228,7 +9576,7 @@ async fn b21_info_is_public_and_minimal() {
         info().await,
         (
             StatusCode::OK,
-            serde_json::json!({ "Enabled": false, "ButtonLabel": "" })
+            serde_json::json!({ "Enabled": false, "ButtonLabel": "", "PublicUrl": "" })
         )
     );
     let body = b21_settings_body(&t.op, serde_json::json!({ "ButtonLabel": "Pocket ID" }));
@@ -8238,7 +9586,11 @@ async fn b21_info_is_public_and_minimal() {
         info().await,
         (
             StatusCode::OK,
-            serde_json::json!({ "Enabled": true, "ButtonLabel": "Pocket ID" })
+            serde_json::json!({
+                "Enabled": true,
+                "ButtonLabel": "Pocket ID",
+                "PublicUrl": B21_PUBLIC_URL
+            })
         )
     );
 }
@@ -8522,6 +9874,261 @@ async fn b21_start_reports_a_provider_that_is_down() {
     assert!(!body.contains(B21_CLIENT_SECRET));
     t.op.with(|st| st.down = false);
     t.start().await;
+}
+
+// B156: single sign-on started from an address other than the public URL
+
+/// `POST /Auth/Oidc/Start` with extra headers, as a browser on another address sends it.
+async fn b156_start(
+    t: &B21,
+    headers: &[(&str, &str)],
+) -> (StatusCode, axum::http::HeaderMap, String) {
+    let mut req = request("POST", "/Auth/Oidc/Start", None, None);
+    for (name, value) in headers {
+        req.headers_mut().insert(
+            axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+            value.parse().unwrap(),
+        );
+    }
+    t.raw(req).await
+}
+
+#[tokio::test]
+async fn b156_start_from_another_origin_is_refused() {
+    let t = b21_on(serde_json::json!({})).await;
+    assert_eq!(
+        t.settings().await["MismatchedOrigin"],
+        serde_json::Value::Null
+    );
+    let (status, headers, body) = b156_start(
+        &t,
+        &[
+            ("origin", "https://flix.example"),
+            ("sec-fetch-site", "same-origin"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(
+        b21_header(&headers, "set-cookie"),
+        "",
+        "no flow from another address"
+    );
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        json["Detail"].as_str().unwrap().contains(B21_PUBLIC_URL),
+        "the refusal names the address to use: {body}"
+    );
+    assert_eq!(
+        t.settings().await["MismatchedOrigin"],
+        "https://flix.example",
+        "the admin sees where sign-ins come from"
+    );
+
+    // The profile's link is refused the same way.
+    let mut req = request("POST", "/Auth/Oidc/Link", Some(&t.admin), None);
+    req.headers_mut()
+        .insert("origin", "http://10.0.0.5:8096".parse().unwrap());
+    req.headers_mut()
+        .insert("sec-fetch-site", "same-origin".parse().unwrap());
+    let (status, headers, _) = t.raw(req).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(b21_header(&headers, "set-cookie"), "");
+    assert_eq!(
+        t.settings().await["MismatchedOrigin"],
+        "http://10.0.0.5:8096"
+    );
+
+    // Saving the settings clears the warning.
+    let (status, saved) = t.save(serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(saved["MismatchedOrigin"], serde_json::Value::Null);
+    assert_eq!(
+        t.settings().await["MismatchedOrigin"],
+        serde_json::Value::Null
+    );
+
+    // Other addresses, a port-only difference included, are refused (the public URL is
+    // http://rf.test:8121).
+    for origin in [
+        "http://rf.test",
+        "http://rf.test:80",
+        "https://rf.test:8121",
+        "http://other.test:8121",
+        "http://rf.test:8122/web/",
+    ] {
+        let (status, headers, _) = b156_start(&t, &[("origin", origin)]).await;
+        assert_eq!(status, StatusCode::CONFLICT, "from {origin}");
+        assert_eq!(b21_header(&headers, "set-cookie"), "", "from {origin}");
+    }
+}
+
+#[tokio::test]
+async fn b156_only_a_same_origin_start_is_noted() {
+    let t = b21_on(serde_json::json!({})).await;
+    let noted = || async { t.settings().await["MismatchedOrigin"].clone() };
+
+    // A cross-site page or a request without Sec-Fetch-Site is refused but not noted.
+    for fetch_site in [Some("cross-site"), Some("same-site"), Some("none"), None] {
+        let mut headers = vec![("origin", "https://attacker.example")];
+        if let Some(value) = fetch_site {
+            headers.push(("sec-fetch-site", value));
+        }
+        let (status, _, _) = b156_start(&t, &headers).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{fetch_site:?}");
+        assert_eq!(noted().await, serde_json::Value::Null, "{fetch_site:?}");
+    }
+
+    // The web client on another address posts same-origin: noted.
+    let (status, _, _) = b156_start(
+        &t,
+        &[
+            ("origin", "https://flix.example"),
+            ("sec-fetch-site", "same-origin"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(noted().await, "https://flix.example");
+
+    // A later cross-site request does not overwrite it.
+    let (status, _, _) = b156_start(
+        &t,
+        &[
+            ("origin", "https://attacker.example"),
+            ("sec-fetch-site", "cross-site"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(noted().await, "https://flix.example");
+
+    // The noted value is capped.
+    let long_host = vec!["a".repeat(60); 6].join(".");
+    let origin = format!("https://{long_host}.example");
+    let (status, _, _) = b156_start(
+        &t,
+        &[("origin", &origin), ("sec-fetch-site", "same-origin")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let noted = noted().await;
+    let noted = noted.as_str().expect("an origin is noted");
+    assert!(noted.len() <= 300, "noted {} bytes", noted.len());
+    assert!(origin.starts_with(noted));
+}
+
+#[tokio::test]
+async fn b156_start_from_the_public_origin_goes_on() {
+    let t = b21_on(serde_json::json!({})).await;
+    // The public URL's own address in any spelling, an Origin with a path (only its origin
+    // counts), and Origins that name no web address (null, garbled, another scheme), which are
+    // not checked, like a request without one.
+    for origin in [
+        "http://rf.test:8121",
+        "http://RF.test:8121",
+        "http://rf.test:8121/web/",
+        "null",
+        "not a url",
+        "http//rf.test",
+        "file:///etc/passwd",
+        "chrome-extension://abcdef",
+    ] {
+        let (status, headers, body) = b156_start(&t, &[("origin", origin)]).await;
+        let flow = b21_flow(status, &headers, &body);
+        assert_eq!(flow.param("redirect_uri"), B21_CALLBACK, "from {origin}");
+    }
+    assert_eq!(
+        t.settings().await["MismatchedOrigin"],
+        serde_json::Value::Null
+    );
+
+    // Under a path prefix, the origin is the public URL's scheme, host and port.
+    let (status, _) = t
+        .save(serde_json::json!({ "PublicUrl": "https://media.example/jf" }))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, headers, body) = b156_start(&t, &[("origin", "https://media.example")]).await;
+    let flow = b21_flow(status, &headers, &body);
+    assert_eq!(
+        flow.param("redirect_uri"),
+        "https://media.example/jf/Auth/Oidc/Callback"
+    );
+    let (status, _, _) = b156_start(&t, &[("origin", "http://media.example")]).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "another scheme is another address"
+    );
+
+    // A default port matches its absence, on either side.
+    for (public_url, origin) in [
+        ("https://media.example:443", "https://media.example"),
+        ("https://media.example", "https://media.example:443"),
+        ("http://media.example:80/jf", "http://media.example"),
+    ] {
+        let (status, _) = t.save(serde_json::json!({ "PublicUrl": public_url })).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, headers, body) = b156_start(&t, &[("origin", origin)]).await;
+        b21_flow(status, &headers, &body);
+    }
+}
+
+#[tokio::test]
+async fn b156_start_without_origin_and_matching_link_go_on() {
+    let t = b21_on(serde_json::json!({})).await;
+    // No Origin at all, as from a non-browser client: not checked.
+    let (status, headers, body) = t.start_raw().await;
+    let flow = b21_flow(status, &headers, &body);
+    assert_eq!(flow.param("redirect_uri"), B21_CALLBACK);
+
+    // A link from the public URL's own address starts.
+    let mut req = request("POST", "/Auth/Oidc/Link", Some(&t.admin), None);
+    req.headers_mut()
+        .insert("origin", B21_PUBLIC_URL.parse().unwrap());
+    req.headers_mut()
+        .insert("sec-fetch-site", "same-origin".parse().unwrap());
+    let (status, headers, body) = t.raw(req).await;
+    let flow = b21_flow(status, &headers, &body);
+    assert_eq!(flow.param("redirect_uri"), B21_CALLBACK);
+    assert_eq!(
+        t.settings().await["MismatchedOrigin"],
+        serde_json::Value::Null
+    );
+}
+
+#[tokio::test]
+async fn b156_forwarded_headers_never_move_the_flow() {
+    let t = b21_on(serde_json::json!({})).await;
+    let forged = [
+        ("origin", B21_PUBLIC_URL),
+        ("host", "evil.example"),
+        ("x-forwarded-host", "evil.example"),
+        ("x-forwarded-proto", "https"),
+    ];
+    let (status, headers, body) = b156_start(&t, &forged).await;
+    let flow = b21_flow(status, &headers, &body);
+    assert_eq!(flow.param("redirect_uri"), B21_CALLBACK);
+    assert!(!body.contains("evil.example"));
+    let location = t
+        .approve(&flow, b21_user("fwd-sub", "fwd"), B21Sign::Key(0))
+        .await;
+    assert_eq!(location, format!("{B21_PUBLIC_URL}/web/#login/oidc"));
+
+    // A forged forwarded origin does not make a matching sign-in look mismatched either.
+    let (status, _, _) = b156_start(
+        &t,
+        &[
+            ("x-forwarded-host", "evil.example"),
+            ("x-forwarded-proto", "https"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        t.settings().await["MismatchedOrigin"],
+        serde_json::Value::Null
+    );
 }
 
 #[tokio::test]
@@ -10420,11 +12027,7 @@ fn b21_web_explains_taken_names() {
             assert_eq!(b21_translation(lang, key), None, "{lang} {key} is gone");
         }
     }
-    let app_js = std::fs::read_to_string(format!(
-        "{}/../rustyfin-web/src/app.js",
-        env!("CARGO_MANIFEST_DIR")
-    ))
-    .unwrap();
+    let app_js = b124_web_source("app.js");
     for code in ["name_taken", "name_taken_ask_admin"] {
         assert!(
             app_js.contains(&format!("['{code}', 'oidc.error.{code}']")),
@@ -11193,11 +12796,7 @@ fn b21_web_client_follows_a_demotion() {
 
 #[test]
 fn b21_dashboard_follows_a_demotion() {
-    let app_js = std::fs::read_to_string(format!(
-        "{}/../rustyfin-web/src/app.js",
-        env!("CARGO_MANIFEST_DIR")
-    ))
-    .unwrap();
+    let app_js = b124_web_source("app.js");
     // A top-level function of app.js, from its head to its closing brace.
     let function = |head: &str| -> String {
         let start = app_js
@@ -11460,9 +13059,20 @@ async fn g12_stub() -> (String, G12Hits) {
                 "title": "Alpha Film",
                 "overview": "G12 stub overview",
                 "original_language": "en",
-                "release_date": "2001-05-04"
+                "release_date": "2001-05-04",
+                "imdb_id": "tt9001",
+                "production_companies": [{"id": 5, "name": "G12 Pictures"}],
+                "credits": {
+                    "cast": [{"id": 77, "name": "Dana Actor", "character": "Self",
+                              "profile_path": "/g12-dana.jpg"}],
+                    "crew": []
+                },
+                "releases": {"countries": [{"iso_3166_1": "US", "certification": "PG-13"}]},
+                "images": {
+                    "posters": [{"file_path": "/g12-poster.jpg"}],
+                    "backdrops": [{"file_path": "/g12-backdrop.jpg"}]
+                }
             }),
-            "/movie/9001/external_ids" => serde_json::json!({"id": 9001, "imdb_id": "tt9001"}),
             "/movie/9001/images" => serde_json::json!({
                 "posters": [{"file_path": "/g12-poster.jpg"}],
                 "backdrops": [{"file_path": "/g12-backdrop.jpg"}]
@@ -11711,18 +13321,112 @@ async fn test_g12_item_refresh_uses_env_key_and_base_urls() {
     assert!(!body.contains(G12_ENV_KEY), "the item shows the env key");
 
     let hits = server.hits();
-    for path in [
-        "/search/movie",
-        "/movie/9001",
-        "/movie/9001/images",
-        "/movie/9001/videos",
-    ] {
+    for path in ["/search/movie", "/movie/9001", "/movie/9001/videos"] {
         assert!(
             hits.iter().any(|hit| hit.path == path),
             "{path} not requested: {hits:?}"
         );
     }
     server.assert_all_signed_with(G12_ENV_KEY);
+}
+
+// R1 scan: E0-scan-1, E0-metadata-1, B137
+
+/// An episode's TMDb id (B147 stores one) is not a series id: its answers ask TMDb for no
+/// trailers or similar items with it and link no TMDb page, in the item and the list.
+#[tokio::test]
+async fn r1scan_episode_tmdb_id_is_not_used_as_a_series_id() {
+    let server = g12_server(Some(G12_ENV_KEY), None).await;
+    let movie = server.insert_movie().await;
+    let episode = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO media_items (id, library_id, name, media_type, path, tmdb_id) \
+         SELECT ?, library_id, 'Pilot', 'Episode', '/nonexistent/G12/Show/S01E01.mkv', 6101 \
+         FROM media_items WHERE id = ?",
+    )
+    .bind(episode.to_string())
+    .bind(movie.to_string())
+    .execute(&server.db)
+    .await
+    .unwrap();
+
+    let (status, item) = server.send("GET", &format!("/Items/{episode}"), None).await;
+    assert_eq!(status, StatusCode::OK, "{item}");
+    let item: serde_json::Value = serde_json::from_str(&item).unwrap();
+    assert_eq!(item["ProviderIds"]["Tmdb"], "6101");
+    assert_eq!(item["ExternalUrls"], serde_json::json!([]));
+    let (status, _) = server
+        .send(
+            "GET",
+            "/Items?Recursive=true&IncludeItemTypes=Episode",
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = server
+        .send("GET", &format!("/Items/{episode}/Similar"), None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let asked: Vec<String> = server
+        .hits()
+        .into_iter()
+        .map(|hit| hit.path)
+        .filter(|path| path.contains("6101"))
+        .collect();
+    assert!(
+        asked.is_empty(),
+        "asked TMDb with the episode id: {asked:?}"
+    );
+}
+
+/// A TMDb refresh fills the IMDb id, studios, people, rating and premiere date, and both the
+/// list and the item answers show them, with Jellyfin's ProviderIds key names.
+#[tokio::test]
+async fn r1scan_refreshed_movie_shows_ids_people_and_studios_in_list_and_item() {
+    let server = g12_server(Some(G12_ENV_KEY), None).await;
+    let item_id = server.insert_movie().await;
+    assert_eq!(server.refresh(item_id).await, Some(9001));
+
+    let (status, list) = server
+        .send(
+            "GET",
+            "/Items?Recursive=true&IncludeItemTypes=Movie\
+             &Fields=ProviderIds,People,Studios,PremiereDate,OfficialRating",
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let list: serde_json::Value = serde_json::from_str(&list).unwrap();
+    let (status, item) = server.send("GET", &format!("/Items/{item_id}"), None).await;
+    assert_eq!(status, StatusCode::OK, "{item}");
+    let item: serde_json::Value = serde_json::from_str(&item).unwrap();
+    let listed = list["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["Id"] == item["Id"])
+        .expect("the movie in the list")
+        .clone();
+
+    for (view, answer) in [("list", &listed), ("item", &item)] {
+        assert_eq!(
+            answer["ProviderIds"],
+            serde_json::json!({"Tmdb": "9001", "Imdb": "tt9001"}),
+            "{view}"
+        );
+        assert_eq!(answer["Studios"][0]["Name"], "G12 Pictures", "{view}");
+        assert_eq!(answer["People"][0]["Name"], "Dana Actor", "{view}");
+        assert_eq!(answer["People"][0]["Type"], "Actor", "{view}");
+        assert_eq!(answer["People"][0]["Role"], "Self", "{view}");
+        assert_eq!(answer["OfficialRating"], "PG-13", "{view}");
+        assert!(
+            answer["PremiereDate"]
+                .as_str()
+                .is_some_and(|d| d.starts_with("2001-05-04")),
+            "{view}: {}",
+            answer["PremiereDate"]
+        );
+    }
 }
 
 #[tokio::test]
@@ -13287,8 +14991,8 @@ async fn j5_user_data_on_a_real_item_still_works() {
     let (app, token, user, film) = j5_user_data_app().await;
     let (yes, no) = (Some(true), Some(false));
     let likes = Some(r#"{"Likes":true}"#);
-    // Each step's status and the IsFavorite, Played and Likes it answers with. The routes that
-    // answer `{}` show nothing, so the step after each shows its change.
+    // Each step's status and the IsFavorite, Played and Likes it answers with. Every route answers
+    // the user data, as Jellyfin's do.
     let steps = [
         (
             "POST",
@@ -13300,7 +15004,7 @@ async fn j5_user_data_on_a_real_item_still_works() {
             "DELETE",
             format!("/UserFavoriteItems/{film}"),
             None,
-            [None; 3],
+            [no, no, None],
         ),
         (
             "POST",
@@ -13312,7 +15016,7 @@ async fn j5_user_data_on_a_real_item_still_works() {
             "DELETE",
             format!("/UserPlayedItems/{film}"),
             None,
-            [None; 3],
+            [no, no, None],
         ),
         (
             "PUT",
@@ -13324,7 +15028,7 @@ async fn j5_user_data_on_a_real_item_still_works() {
             "DELETE",
             format!("/Users/{user}/Items/{film}/Rating"),
             None,
-            [None; 3],
+            [no, no, None],
         ),
         (
             "POST",
@@ -13362,6 +15066,546 @@ async fn j5_user_data_on_a_real_item_still_works() {
         .map(|(method, uri, _, data)| (*method, uri.as_str(), StatusCode::OK, *data))
         .collect();
     assert_eq!(actual, expected);
+}
+
+// R1 watch: Jellyfin 10.9+ user data routes, the resume list and the mark rules
+
+/// Sends a request as B110's administrator; answers the status and the JSON answer.
+async fn r1watch_send(
+    b: &B110,
+    method: &str,
+    uri: &str,
+    body: Option<serde_json::Value>,
+) -> (StatusCode, serde_json::Value) {
+    let body = body.map(|body| body.to_string());
+    send_authed(&b.app, method, uri, &b.token, body.as_deref()).await
+}
+
+#[tokio::test]
+async fn r1watch_played_and_favorite_routes_answer_the_user_data() {
+    let b = B110::new().await;
+    let (film, user) = (b.film, b.user);
+    let id = film.to_string();
+    // Each step's Played and IsFavorite; every answer carries Jellyfin's ItemId and Key.
+    let steps = [
+        ("POST", format!("/UserPlayedItems/{film}"), true, false),
+        ("DELETE", format!("/UserPlayedItems/{film}"), false, false),
+        (
+            "POST",
+            format!("/UserFavoriteItems/{film}?userId={user}"),
+            false,
+            true,
+        ),
+        ("DELETE", format!("/UserFavoriteItems/{film}"), false, false),
+        // The legacy routes older clients use answer the same.
+        (
+            "POST",
+            format!("/Users/{user}/PlayedItems/{film}"),
+            true,
+            false,
+        ),
+        (
+            "DELETE",
+            format!("/Users/{user}/PlayedItems/{film}"),
+            false,
+            false,
+        ),
+        (
+            "POST",
+            format!("/Users/{user}/FavoriteItems/{film}"),
+            false,
+            true,
+        ),
+        (
+            "DELETE",
+            format!("/Users/{user}/FavoriteItems/{film}"),
+            false,
+            false,
+        ),
+    ];
+    let mut actual = Vec::new();
+    for (method, uri, _, _) in &steps {
+        let (status, data) = r1watch_send(&b, method, uri, None).await;
+        actual.push((
+            *method,
+            uri.as_str(),
+            status,
+            data["Played"].as_bool(),
+            data["IsFavorite"].as_bool(),
+            data["ItemId"].as_str() == Some(id.as_str()),
+            data["Key"].is_string(),
+        ));
+    }
+    let expected: Vec<_> = steps
+        .iter()
+        .map(|(method, uri, played, favorite)| {
+            (
+                *method,
+                uri.as_str(),
+                StatusCode::OK,
+                Some(*played),
+                Some(*favorite),
+                true,
+                true,
+            )
+        })
+        .collect();
+    assert_eq!(actual, expected);
+}
+
+#[tokio::test]
+async fn r1watch_user_data_routes_on_an_unknown_item_answer_404() {
+    let b = B110::new().await;
+    let (x, user) = (uuid::Uuid::new_v4(), b.user);
+    let cases = [
+        ("POST", format!("/UserPlayedItems/{x}")),
+        ("DELETE", format!("/UserPlayedItems/{x}")),
+        ("POST", format!("/UserFavoriteItems/{x}")),
+        ("DELETE", format!("/UserFavoriteItems/{x}")),
+        ("GET", format!("/UserItems/{x}/UserData")),
+        ("POST", format!("/UserItems/{x}/UserData")),
+        ("GET", format!("/Users/{user}/Items/{x}/UserData")),
+        ("POST", format!("/Users/{user}/Items/{x}/UserData")),
+        ("POST", format!("/UserItems/{x}/Rating?likes=true")),
+        ("DELETE", format!("/UserItems/{x}/Rating")),
+        ("POST", format!("/Users/{user}/Items/{x}/Rating?likes=true")),
+    ];
+    let mut actual = Vec::new();
+    for (method, uri) in &cases {
+        let body = (*method == "POST").then(|| serde_json::json!({}));
+        actual.push((
+            *method,
+            uri.as_str(),
+            r1watch_send(&b, method, uri, body).await.0,
+        ));
+    }
+    let expected: Vec<_> = cases
+        .iter()
+        .map(|(method, uri)| (*method, uri.as_str(), StatusCode::NOT_FOUND))
+        .collect();
+    assert_eq!(actual, expected);
+}
+
+#[tokio::test]
+async fn r1watch_marking_played_takes_the_date_and_clears_the_resume_point() {
+    let b = B110::new().await;
+    let film = b.film;
+    b.start(film).await;
+    b.progress(film, B110_HOUR / 2).await;
+    assert_eq!(b.ids("/UserItems/Resume").await, [film.to_string()]);
+    // Jellyfin's MarkPlayed: played, no resume point, played on `datePlayed`.
+    let uri = format!("/UserPlayedItems/{film}?datePlayed=2020-01-02T03:04:05Z");
+    let (status, data) = r1watch_send(&b, "POST", &uri, None).await;
+    assert_eq!(
+        (
+            status,
+            data["Played"].as_bool(),
+            data["PlaybackPositionTicks"].as_i64(),
+            data["LastPlayedDate"].as_str().map(|d| d[..19].to_string()),
+        ),
+        (
+            StatusCode::OK,
+            Some(true),
+            Some(0),
+            Some("2020-01-02T03:04:05".to_string())
+        )
+    );
+    assert!(b.ids("/UserItems/Resume").await.is_empty());
+    // Jellyfin's MarkUnplayed: no plays and no last played date either.
+    let uri = format!("/UserPlayedItems/{film}");
+    let (_, data) = r1watch_send(&b, "DELETE", &uri, None).await;
+    assert_eq!(
+        (
+            data["Played"].as_bool(),
+            data["PlayCount"].as_i64(),
+            data["LastPlayedDate"].is_null(),
+        ),
+        (Some(false), Some(0), true)
+    );
+}
+
+#[tokio::test]
+async fn r1watch_date_played_takes_every_client_form_and_never_refuses() {
+    let b = B110::new().await;
+    let (film, user) = (b.film, b.user);
+    let new = format!("/UserPlayedItems/{film}");
+    let legacy = format!("/Users/{user}/PlayedItems/{film}");
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    // (route, query, the stored date's first 19 characters, or only today's date)
+    let cases = [
+        (
+            &new,
+            "datePlayed=2020-01-02T03:04:05Z",
+            "2020-01-02T03:04:05",
+        ),
+        (
+            &legacy,
+            "DatePlayed=2020-01-02T05:04:05%2B02:00",
+            "2020-01-02T03:04:05",
+        ),
+        // An offset's unescaped `+` arrives as a space.
+        (
+            &new,
+            "datePlayed=2020-01-02T05:04:05+02:00",
+            "2020-01-02T03:04:05",
+        ),
+        // The Kotlin SDK: ISO without an offset, taken as UTC.
+        (
+            &new,
+            "datePlayed=2020-01-02T03:04:05",
+            "2020-01-02T03:04:05",
+        ),
+        (
+            &legacy,
+            "DatePlayed=2020-01-02T03:04:05.1234567",
+            "2020-01-02T03:04:05",
+        ),
+        // jellyfin-apiclient's yyyyMMddHHmmss.
+        (&legacy, "DatePlayed=20200102030405", "2020-01-02T03:04:05"),
+        (&new, "datePlayed=20200102030405", "2020-01-02T03:04:05"),
+        // Anything else is ignored: marked played now.
+        (&legacy, "DatePlayed=yesterday", today.as_str()),
+        (&new, "datePlayed=", today.as_str()),
+    ];
+    let mut actual = Vec::new();
+    for (route, query, _) in &cases {
+        r1watch_send(&b, "DELETE", &new, None).await;
+        let uri = format!("{route}?{query}");
+        let (status, data) = r1watch_send(&b, "POST", &uri, None).await;
+        let date = data["LastPlayedDate"].as_str().unwrap_or("").to_string();
+        let expected_len = cases.iter().find(|c| c.1 == *query).unwrap().2.len();
+        actual.push((
+            uri,
+            status,
+            data["Played"].as_bool(),
+            date.get(..expected_len).unwrap_or("").to_string(),
+        ));
+    }
+    let expected: Vec<_> = cases
+        .iter()
+        .map(|(route, query, date)| {
+            (
+                format!("{route}?{query}"),
+                StatusCode::OK,
+                Some(true),
+                date.to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(actual, expected);
+}
+
+#[tokio::test]
+async fn r1watch_user_data_post_stores_last_played_date_as_rfc3339() {
+    let b = B110::new().await;
+    let film = b.film;
+    let uri = format!("/UserItems/{film}/UserData");
+    let stored = |b: &B110| {
+        let db = b.state.db.clone();
+        async move {
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT last_played_date FROM user_item_data WHERE item_id = ?",
+            )
+            .bind(film.to_string())
+            .fetch_one(&db)
+            .await
+            .unwrap()
+        }
+    };
+    // A client's 7-digit fraction is stored as the other writers store dates.
+    let body = serde_json::json!({ "LastPlayedDate": "2024-01-01T00:00:00.0000000Z" });
+    r1watch_send(&b, "POST", &uri, Some(body)).await;
+    assert_eq!(
+        stored(&b).await.as_deref(),
+        Some("2024-01-01T00:00:00+00:00")
+    );
+    // One that doesn't parse is dropped and the stored date kept.
+    let body = serde_json::json!({ "LastPlayedDate": "not a date", "IsFavorite": true });
+    let (status, data) = r1watch_send(&b, "POST", &uri, Some(body)).await;
+    assert_eq!(
+        (status, data["IsFavorite"].as_bool()),
+        (StatusCode::OK, Some(true))
+    );
+    assert_eq!(
+        stored(&b).await.as_deref(),
+        Some("2024-01-01T00:00:00+00:00")
+    );
+}
+
+#[tokio::test]
+async fn r1watch_a_non_admin_cannot_act_for_another_user() {
+    let b = B110::new().await;
+    let (film, owner) = (b.film, b.user);
+    add_user(&b.state, "r1viewer", "viewerpass", false).await;
+    let (viewer, _) = login(&b.app, "r1viewer", "viewerpass").await.unwrap();
+    let body = r#"{"Played":true,"IsFavorite":true,"PlaybackPositionTicks":5}"#;
+    let cases = [
+        (
+            "POST",
+            format!("/UserPlayedItems/{film}?userId={owner}"),
+            None,
+        ),
+        (
+            "DELETE",
+            format!("/UserPlayedItems/{film}?userId={owner}"),
+            None,
+        ),
+        (
+            "POST",
+            format!("/UserFavoriteItems/{film}?userId={owner}"),
+            None,
+        ),
+        (
+            "GET",
+            format!("/UserItems/{film}/UserData?userId={owner}"),
+            None,
+        ),
+        (
+            "POST",
+            format!("/UserItems/{film}/UserData?userId={owner}"),
+            Some(body),
+        ),
+        (
+            "POST",
+            format!("/UserItems/{film}/Rating?userId={owner}&likes=true"),
+            None,
+        ),
+        ("GET", format!("/UserItems/Resume?userId={owner}"), None),
+    ];
+    let mut actual = Vec::new();
+    for (method, uri, body) in &cases {
+        let (status, _) = send_authed(&b.app, method, uri, &viewer, *body).await;
+        actual.push((*method, uri.as_str(), status));
+    }
+    let expected: Vec<_> = cases
+        .iter()
+        .map(|(method, uri, _)| (*method, uri.as_str(), StatusCode::FORBIDDEN))
+        .collect();
+    assert_eq!(actual, expected);
+    // The owner's data is unchanged.
+    let (_, data) = r1watch_send(&b, "GET", &format!("/UserItems/{film}/UserData"), None).await;
+    assert_eq!(
+        (
+            data["Played"].as_bool(),
+            data["IsFavorite"].as_bool(),
+            data["PlaybackPositionTicks"].as_i64(),
+            data["Likes"].as_bool(),
+        ),
+        (Some(false), Some(false), Some(0), None)
+    );
+}
+
+#[tokio::test]
+async fn r1watch_user_data_post_sets_only_the_fields_sent() {
+    let b = B110::new().await;
+    let (film, user) = (b.film, b.user);
+    let fields = |data: &serde_json::Value| {
+        (
+            data["PlaybackPositionTicks"].as_i64(),
+            data["PlayedPercentage"].as_f64(),
+            data["IsFavorite"].as_bool(),
+            data["Played"].as_bool(),
+        )
+    };
+    let quarter = B110_HOUR / 4;
+    let body = serde_json::json!({ "PlaybackPositionTicks": quarter, "IsFavorite": true });
+    let uri = format!("/UserItems/{film}/UserData");
+    let (status, data) = r1watch_send(&b, "POST", &uri, Some(body)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        fields(&data),
+        (Some(quarter), Some(25.0), Some(true), Some(false))
+    );
+    // The legacy form; the fields not sent are kept.
+    let legacy = format!("/Users/{user}/Items/{film}/UserData");
+    let body = serde_json::json!({ "Played": true });
+    let (_, data) = r1watch_send(&b, "POST", &legacy, Some(body)).await;
+    let expected = (Some(quarter), Some(25.0), Some(true), Some(true));
+    assert_eq!(fields(&data), expected);
+    for uri in [uri, legacy] {
+        let (status, data) = r1watch_send(&b, "GET", &uri, None).await;
+        assert_eq!((status, fields(&data)), (StatusCode::OK, expected), "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn r1watch_rating_routes_set_and_clear_likes() {
+    let b = B110::new().await;
+    let (film, user) = (b.film, b.user);
+    let steps = [
+        (
+            "POST",
+            format!("/UserItems/{film}/Rating?likes=true"),
+            Some(true),
+        ),
+        (
+            "POST",
+            format!("/Users/{user}/Items/{film}/Rating?likes=false"),
+            Some(false),
+        ),
+        ("DELETE", format!("/UserItems/{film}/Rating"), None),
+        (
+            "POST",
+            format!("/UserItems/{film}/Rating?likes=true"),
+            Some(true),
+        ),
+        ("DELETE", format!("/Users/{user}/Items/{film}/Rating"), None),
+    ];
+    let mut actual = Vec::new();
+    for (method, uri, _) in &steps {
+        let (status, data) = r1watch_send(&b, method, uri, None).await;
+        actual.push((*method, uri.as_str(), status, data["Likes"].as_bool()));
+    }
+    let expected: Vec<_> = steps
+        .iter()
+        .map(|(method, uri, likes)| (*method, uri.as_str(), StatusCode::OK, *likes))
+        .collect();
+    assert_eq!(actual, expected);
+}
+
+#[tokio::test]
+async fn r1watch_resume_pages_and_filters_as_jellyfin_does() {
+    let b = B110::new().await;
+    let [e1, _, _] = b.episodes;
+    // Resume points with set dates; the newest play is listed first.
+    for (item, day) in [
+        (b.film, "2024-01-01"),
+        (b.unknown, "2024-02-01"),
+        (e1, "2024-03-01"),
+    ] {
+        let body = serde_json::json!({
+            "PlaybackPositionTicks": 1_000_000_000,
+            "LastPlayedDate": format!("{day}T00:00:00Z"),
+        });
+        let uri = format!("/UserItems/{item}/UserData");
+        assert_eq!(
+            r1watch_send(&b, "POST", &uri, Some(body)).await.0,
+            StatusCode::OK
+        );
+    }
+    let (e1, unknown, film) = (e1.to_string(), b.unknown.to_string(), b.film.to_string());
+    let (series, season) = (b.series, b.seasons[0]);
+    let cases = [
+        (
+            "/UserItems/Resume".to_string(),
+            vec![&e1, &unknown, &film],
+            3,
+            0,
+        ),
+        (
+            "/UserItems/Resume?Limit=1&StartIndex=1".to_string(),
+            vec![&unknown],
+            3,
+            1,
+        ),
+        (
+            "/UserItems/Resume?limit=2".to_string(),
+            vec![&e1, &unknown],
+            3,
+            0,
+        ),
+        (
+            "/UserItems/Resume?IncludeItemTypes=Episode".to_string(),
+            vec![&e1],
+            1,
+            0,
+        ),
+        (
+            "/UserItems/Resume?excludeItemTypes=Episode".to_string(),
+            vec![&unknown, &film],
+            2,
+            0,
+        ),
+        (
+            "/UserItems/Resume?MediaTypes=Audio".to_string(),
+            vec![],
+            0,
+            0,
+        ),
+        (
+            "/UserItems/Resume?mediaTypes=Video".to_string(),
+            vec![&e1, &unknown, &film],
+            3,
+            0,
+        ),
+        (
+            "/UserItems/Resume?MediaTypes=Video&IncludeItemTypes=Audio".to_string(),
+            vec![],
+            0,
+            0,
+        ),
+        (
+            format!("/UserItems/Resume?ParentId={series}"),
+            vec![&e1],
+            1,
+            0,
+        ),
+        (
+            format!("/UserItems/Resume?parentId={season}"),
+            vec![&e1],
+            1,
+            0,
+        ),
+        (
+            format!("/Users/{}/Items/Resume?Limit=1", b.user),
+            vec![&e1],
+            3,
+            0,
+        ),
+        ("/Items/Resume?Limit=1".to_string(), vec![&e1], 3, 0),
+    ];
+    let mut actual = Vec::new();
+    for (uri, _, _, _) in &cases {
+        let (status, body) = r1watch_send(&b, "GET", uri, None).await;
+        let ids: Vec<String> = body["Items"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| item["Id"].as_str().unwrap_or("").to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        actual.push((
+            uri.as_str(),
+            status,
+            ids,
+            body["TotalRecordCount"].as_i64(),
+            body["StartIndex"].as_i64(),
+        ));
+    }
+    let expected: Vec<_> = cases
+        .iter()
+        .map(|(uri, ids, total, start)| {
+            (
+                uri.as_str(),
+                StatusCode::OK,
+                ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+                Some(*total),
+                Some(*start),
+            )
+        })
+        .collect();
+    assert_eq!(actual, expected);
+}
+
+#[tokio::test]
+async fn r1watch_marking_a_series_through_the_new_route_marks_its_episodes() {
+    let b = B110::new().await;
+    let series = b.series;
+    let state =
+        |data: &serde_json::Value| (data["Played"].as_bool(), data["UnplayedItemCount"].as_i64());
+    let uri = format!("/UserPlayedItems/{series}");
+    let (_, data) = r1watch_send(&b, "POST", &uri, None).await;
+    assert_eq!(state(&data), (Some(true), Some(0)));
+    let mut played = Vec::new();
+    for item in b.episodes.iter().chain(&b.seasons) {
+        let (_, data) = r1watch_send(&b, "GET", &format!("/UserItems/{item}/UserData"), None).await;
+        played.push(data["Played"].as_bool());
+    }
+    assert_eq!(played, [Some(true); 5]);
+    let (_, data) = r1watch_send(&b, "DELETE", &uri, None).await;
+    assert_eq!(state(&data), (Some(false), Some(3)));
 }
 
 // B40: playback reports on a non-media id
@@ -17304,17 +19548,22 @@ async fn g1_easy_pin_is_hashed_and_never_returned() {
     assert_eq!(pin_hash("viewer").await, None);
 }
 
+// B155: new users and administrator rights
+
+/// `POST /Users/New` creates a user without administrator rights whatever the body says, as
+/// Jellyfin's `CreateUserByName` does; rights come only from a later `POST /Users/{id}/Policy`.
 #[tokio::test]
-async fn g1_create_user_honours_is_administrator() {
+async fn b155_new_user_is_never_admin() {
     let state = test_state().await;
     let app = app(state.clone());
     let (owner, _, _, _) = g1_owner_and_viewer(&state, &app).await;
-    for (name, flag, admin) in [
-        ("g1-admin", Some(true), true),
-        ("g1-plain", Some(false), false),
-        ("g1-default", None, false),
+    let mut promote_id = String::new();
+    for (name, flag) in [
+        ("b155-true", Some(true)),
+        ("b155-false", Some(false)),
+        ("b155-none", None),
     ] {
-        let mut body = serde_json::json!({ "Name": name, "Password": "g1-pass" });
+        let mut body = serde_json::json!({ "Name": name, "Password": "b155-pass" });
         if let Some(flag) = flag {
             body["IsAdministrator"] = serde_json::json!(flag);
         }
@@ -17324,12 +19573,42 @@ async fn g1_create_user_honours_is_administrator() {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "create {name}: {created}");
+        assert_eq!(created["IsAdministrator"], false, "{name}: {created}");
         assert_eq!(
             user_flags(&state, name).await,
-            Some((admin, false, false)),
+            Some((false, false, false)),
             "{name}"
         );
+
+        // The new user's own token gets no administrator rights.
+        let (token, id) = login(&app, name, "b155-pass").await.expect(name);
+        let (status, _) = send(
+            &app,
+            request("GET", "/Library/VirtualFolders", Some(&token), None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{name}");
+        if flag == Some(true) {
+            promote_id = id;
+        }
     }
+
+    // The Policy call that follows is what makes an administrator.
+    let (status, _) = send(
+        &app,
+        request(
+            "POST",
+            &format!("/Users/{promote_id}/Policy"),
+            Some(&owner),
+            Some(serde_json::json!({ "IsAdministrator": true })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        user_flags(&state, "b155-true").await,
+        Some((true, false, false))
+    );
 }
 
 #[tokio::test]
@@ -18094,6 +20373,37 @@ fn b145_icons() {
     b124_node_test("b145_icons.mjs");
 }
 
+// B152: library grid images keep up with scrolling (web client)
+#[test]
+fn b152_blurhash_decoder() {
+    b124_node_test("b152_blurhash.mjs");
+}
+
+#[test]
+fn b152_poster_loader_plan() {
+    b124_node_test("b152_poster_loader.mjs");
+}
+
+#[test]
+fn b152_poster_loader_runtime() {
+    b124_node_test("b152_poster_loader_runtime.mjs");
+}
+
+#[test]
+fn b152_library_pages() {
+    b124_node_test("b152_library_pages.mjs");
+}
+
+#[test]
+fn b152_library_grid() {
+    b124_node_test("b152_library_grid.mjs");
+}
+
+#[test]
+fn b152_service_worker() {
+    b124_node_test("b152_service_worker.mjs");
+}
+
 #[test]
 fn b142_settings_key_inputs_hide_keys() {
     let app_js = b124_web_source("app.js");
@@ -18484,6 +20794,11 @@ async fn g1f_rate(state: &AppState, user: &str, item: uuid::Uuid) {
     .unwrap();
 }
 
+/// A user data answer's status and `ItemId`.
+fn g1f_answer((status, data): (StatusCode, serde_json::Value)) -> (StatusCode, Option<String>) {
+    (status, data["ItemId"].as_str().map(str::to_string))
+}
+
 /// The user's `(Likes, UserRating)` on the item.
 async fn g1f_rating(state: &AppState, user: &str, item: uuid::Uuid) -> (Option<bool>, Option<i32>) {
     let data =
@@ -18526,22 +20841,22 @@ async fn g1f_delete_rating_follows_user_id() {
         );
     }
     assert_eq!(g1f_rating(&state, &owner_id, item).await, rated);
-    // On themselves: today's answer, and their rating is cleared.
+    // On themselves: their user data, as Jellyfin answers, and their rating is cleared.
     assert_eq!(
-        send(&app, delete(&viewer_id, Some(&viewer))).await,
-        (StatusCode::OK, serde_json::json!({}))
+        g1f_answer(send(&app, delete(&viewer_id, Some(&viewer))).await),
+        (StatusCode::OK, Some(item.to_string()))
     );
     assert_eq!(g1f_rating(&state, &viewer_id, item).await, cleared);
     // An administrator or the API key on another user: 200, and that user's rating is cleared.
     g1f_rate(&state, &viewer_id, item).await;
     assert_eq!(
-        send(&app, delete(&viewer_id, Some(&owner))).await,
-        (StatusCode::OK, serde_json::json!({}))
+        g1f_answer(send(&app, delete(&viewer_id, Some(&owner))).await),
+        (StatusCode::OK, Some(item.to_string()))
     );
     assert_eq!(g1f_rating(&state, &viewer_id, item).await, cleared);
     assert_eq!(
-        send(&app, delete(&owner_id, Some("test-api-key"))).await,
-        (StatusCode::OK, serde_json::json!({}))
+        g1f_answer(send(&app, delete(&owner_id, Some("test-api-key"))).await),
+        (StatusCode::OK, Some(item.to_string()))
     );
     assert_eq!(g1f_rating(&state, &owner_id, item).await, cleared);
     // An administrator on an unknown user: 404.
@@ -23502,10 +25817,10 @@ async fn g1c_delete_rating_unknown_item_is_404() {
     );
     assert_eq!(g1f_rating(&state, &owner_id, item).await, rated, "owner");
     assert_eq!(g1f_rating(&state, &viewer_id, item).await, rated, "viewer");
-    // A known item: only the path user's rating is cleared.
+    // A known item: only the path user's rating is cleared, and their user data answered.
     assert_eq!(
-        send(&app, delete(&viewer_id, item, &viewer)).await,
-        (StatusCode::OK, serde_json::json!({}))
+        g1f_answer(send(&app, delete(&viewer_id, item, &viewer)).await),
+        (StatusCode::OK, Some(item.to_string()))
     );
     assert_eq!(g1f_rating(&state, &viewer_id, item).await, (None, None));
     assert_eq!(g1f_rating(&state, &owner_id, item).await, rated, "owner");
@@ -23808,13 +26123,14 @@ async fn b29_progress(app: &axum::Router, token: &str, item: uuid::Uuid, ticks: 
     b29_ok(app, token, "POST", "/Sessions/Playing/Progress", Some(body)).await;
 }
 
-/// The user saves a resume point at `ticks` on the item, then marks it played and favorite.
+/// The user marks the item played and favorite, then saves a resume point at `ticks` on it.
+/// Marking played clears the resume point, as in Jellyfin, so the progress comes after.
 async fn b29_watch(app: &axum::Router, token: &str, user_id: &str, item: uuid::Uuid, ticks: i64) {
-    b29_progress(app, token, item, ticks).await;
     for route in ["PlayedItems", "FavoriteItems"] {
         let uri = format!("/Users/{user_id}/{route}/{item}");
         b29_ok(app, token, "POST", &uri, None).await;
     }
+    b29_progress(app, token, item, ticks).await;
 }
 
 /// `GET /Items/{id}?userId=` as the token's user: asserts a 200 and returns the details.
@@ -32934,8 +35250,9 @@ async fn b20_import_metadata_fills_empty_fields() {
         );
         assert_eq!(alpha["OriginalTitle"], "Alfa", "{name}");
         assert_eq!(alpha["CriticRating"], 88.0, "{name}");
-        assert_eq!(alpha["ProviderIds"]["tmdb"], "111", "{name}");
-        assert_eq!(alpha["ProviderIds"]["imdb"], "tt0000111", "{name}");
+        // Jellyfin's key names (B137)
+        assert_eq!(alpha["ProviderIds"]["Tmdb"], "111", "{name}");
+        assert_eq!(alpha["ProviderIds"]["Imdb"], "tt0000111", "{name}");
         assert_eq!(alpha["LockData"], false, "{name}");
         assert_eq!(alpha["LockedFields"], serde_json::json!([]), "{name}");
         let beta = b20_get_item(&w, m.beta).await;
