@@ -1,11 +1,12 @@
 // The play queue: Play all and Shuffle on a series, season, album, artist, playlist, collection or library,
 // and the player's previous and next through the items it holds
 import { toast } from './util.js';
-import { playItem } from './player.js';
+import { playItem, playWithResumeChoice } from './player.js';
 
 // The queue in play, or null: { items, index }. A play that doesn't come from the queue clears it.
 let playQueue = null;
-// Jellyfin Web plays at most this many items of a folder, and the first 100 episodes of a series
+// Jellyfin Web plays at most this many items of a folder, and shuffles 100 episodes of a series.
+// Play all on a series lists every episode, so its start (Next Up) is always in the list.
 const QUEUE_LIMIT = 300;
 const SERIES_LIMIT = 100;
 
@@ -22,8 +23,7 @@ function queueQuery(item, shuffle) {
     if ((type === 'Series' || type === 'Season') && !shuffle) {
         const seriesId = type === 'Season' ? item.SeriesId || item.ParentId : item.Id;
         if (type === 'Season') q.set('SeasonId', item.Id);
-        else q.set('Limit', String(SERIES_LIMIT));
-        return `/Shows/${seriesId}/Episodes?${q}`;
+        return `/Shows/${seriesId}/Episodes${type === 'Season' ? `?${q}` : ''}`;
     }
     if (type === 'MusicArtist') q.set('ArtistIds', item.Id);
     else q.set('ParentId', item.Id);
@@ -39,9 +39,12 @@ function queueQuery(item, shuffle) {
     return `/Items?${q}`;
 }
 
-// Where Play all starts: a series or season at its first unplayed episode, as Jellyfin does; else at the top
-function queueStartIndex(container, items, shuffle) {
+// Where Play all starts, as Jellyfin does: a series at its Next Up episode (nextUpId) and else its first
+// unplayed one, a season at its first unplayed episode; Shuffle and other containers at the top
+function queueStartIndex(container, items, shuffle, nextUpId = null) {
     if (shuffle || (container.Type !== 'Series' && container.Type !== 'Season')) return 0;
+    const nextUp = nextUpId ? items.findIndex(i => i.Id === nextUpId) : -1;
+    if (nextUp >= 0) return nextUp;
     const unplayed = items.findIndex(i => !i.UserData?.Played);
     return unplayed >= 0 ? unplayed : 0;
 }
@@ -50,10 +53,16 @@ function queueStartIndex(container, items, shuffle) {
 async function playContainer(id, { shuffle = false } = {}) {
     let items = [];
     let container = null;
+    let nextUpId = null;
     try {
         container = await API.get('/Items/' + id);
-        const result = await API.get(queueQuery(container, shuffle));
+        const series = container.Type === 'Series' && !shuffle;
+        const [result, nextUp] = await Promise.all([
+            API.get(queueQuery(container, shuffle)),
+            series ? API.get(`/Shows/NextUp?SeriesId=${encodeURIComponent(id)}&Limit=1`).catch(() => null) : null,
+        ]);
         items = (result?.Items || []).filter(i => !i.IsFolder && i.LocationType !== 'Virtual');
+        nextUpId = nextUp?.Items?.[0]?.Id || null;
     } catch (e) {
         console.warn('Could not load the items to play:', e);
     }
@@ -61,15 +70,16 @@ async function playContainer(id, { shuffle = false } = {}) {
         toast(t('player.queue_empty'), 'error');
         return;
     }
-    playQueueAt(items, queueStartIndex(container, items, shuffle));
+    playQueueAt(items, queueStartIndex(container, items, shuffle, nextUpId));
 }
 
-// Starts the queue at index, from the item's start
+// Starts the queue at index. Its first item resumes or starts over as the user picks, like any Play; the
+// items after it start from the beginning (playQueueStep).
 function playQueueAt(items, index) {
     const item = items[index];
     if (!item) return;
     playQueue = { items, index };
-    playItem(item.Id, queueStreamType(item), item.Name || '', { fromStart: true, queued: true });
+    playWithResumeChoice(item.Id, queueStreamType(item), item.Name || '', { queued: true });
 }
 
 // The queue's items before and after the playing one, or null without a queue

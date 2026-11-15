@@ -88,8 +88,9 @@ test('hovering or dragging shows the thumbnail and time over the bar; without tr
     const box = sandbox(TRICKPLAY);
     const session = { itemId: 'i1', mediaSourceId: 'src1', trickplay: sets[160], total: () => 2000 };
     box.context.setActive(session);
-    // Mouse or finger at a quarter of a 400 px bar
-    box.context.hoverSeek({ currentTarget: { clientWidth: 400 }, offsetX: 100 });
+    // Mouse or finger at a quarter of a 400 px bar that starts 50 px in (the position comes from clientX,
+    // since offsetX is relative to whatever child the pointer is over)
+    box.context.hoverSeek({ currentTarget: { getBoundingClientRect: () => ({ left: 50, width: 400 }) }, clientX: 150, offsetX: 7 });
     const { elements } = box;
     assert.equal(elements['player-trickplay'].hidden, false);
     assert.equal(elements['player-trickplay'].style.left, '25%');
@@ -179,6 +180,9 @@ test('the keys map to Jellyfin Web\'s player actions', () => {
     };
     assert.deepEqual(press('7', 'Digit7'), ['percent', 70]);
     assert.deepEqual(press('0', 'Numpad0'), ['percent', 0]);
+    // AZERTY: the digit row types &é"… unshifted and seeks by position; with Shift it is left alone
+    assert.deepEqual(press('é', 'Digit2'), ['percent', 20]);
+    assert.equal(press('2', 'Digit2', true), null);
     assert.deepEqual(press('k', 'KeyK'), ['play']);
     assert.deepEqual(press('ArrowUp', 'ArrowUp'), ['volume', 2]);
     assert.deepEqual(press('ArrowDown', 'ArrowDown'), ['volume', -2]);
@@ -204,7 +208,7 @@ test('the keys map to Jellyfin Web\'s player actions', () => {
     assert.equal(press('x', 'KeyX'), null);
 });
 
-test('the handler leaves Ctrl, Alt and Meta keys to the browser and closes on Escape', () => {
+test('the handler leaves Ctrl, Alt and Meta keys, and a control focused by keyboard, alone; Escape closes', () => {
     const start = playerJs.indexOf('// Global Keyboard Shortcuts');
     const handler = playerJs.slice(start, playerJs.indexOf('\n});\n', start) + 5);
     let listener = null;
@@ -217,13 +221,26 @@ test('the handler leaves Ctrl, Alt and Meta keys to the browser and closes on Es
         togglePlayPause: () => calls.push('play'),
         playerKeyAction: () => () => calls.push('action'),
     });
+    class Element {
+        constructor(match, keyboard = true) { this.match = match; this.keyboard = keyboard; }
+        matches(selector) { return selector === ':focus-visible' && this.keyboard; }
+        closest(selector) { return this.match && selector.includes(this.match) ? this : null; }
+    }
+    context.Element = Element;
     vm.runInContext(handler, context);
     const press = (e) => { const ev = { code: '', target: null, preventDefault() { this.prevented = true; }, ...e }; listener(ev); return ev; };
     for (const mod of ['ctrlKey', 'altKey', 'metaKey']) assert.equal(press({ key: 'f', [mod]: true }).prevented, undefined);
     assert.deepEqual(calls, []);
+    // A menu or button focused by keyboard keeps its arrows, digits and letters
+    for (const match of ['select', 'button']) {
+        for (const key of ['ArrowDown', '5', 'm']) assert.equal(press({ key, target: new Element(match) }).prevented, undefined);
+    }
+    assert.deepEqual(calls, []);
+    // After a click (no focus ring) and on the sliders the player takes them
+    assert.equal(press({ key: 'ArrowDown', target: new Element('select', false) }).prevented, true);
     assert.equal(press({ key: 'f' }).prevented, true);
-    press({ key: 'Escape' });
-    assert.deepEqual(calls, ['action', 'close']);
+    press({ key: 'Escape', target: new Element('select') });
+    assert.deepEqual(calls, ['action', 'action', 'close']);
 });
 
 test('volume steps on Jellyfin\'s cube-root scale; speed steps through its rates and keeps the menu true', () => {
@@ -294,7 +311,7 @@ test('the Media Session shows the item and binds Jellyfin Web\'s actions; previo
         closePlayer: () => calls.push('close'),
         skipTime: d => calls.push(['skip', d]),
         seekTo: (s, to) => calls.push(['seek', to]),
-    }, `${decl('hasMediaSession')} ${decl('ARTWORK_SIZES')}`);
+    }, `${decl('hasMediaSession')} ${decl('ARTWORK_SIZES')} ${decl('MEDIA_SESSION_ACTIONS')}`);
     box.elements['video-player'] = video;
     const { context } = box;
 
@@ -327,6 +344,12 @@ test('the Media Session shows the item and binds Jellyfin Web\'s actions; previo
     context.clearMediaSession();
     assert.equal(mediaSession.metadata, null);
     assert.equal(mediaSession.playbackState, 'none');
+    for (const action of ['play', 'pause', 'stop', 'seekbackward', 'seekforward', 'seekto', 'previoustrack', 'nexttrack']) {
+        assert.equal(handlers[action], null, `${action} is cleared on close`);
+    }
+    // The next item binds them again
+    context.updateMediaSession({}, episode, '');
+    assert.equal(typeof handlers.play, 'function');
 
     // previous/next track handlers come from updateEpisodeButtons, null where there is no neighbour
     assert.match(slice('function updateEpisodeButtons('), /setMediaSessionHandler\(step < 0 \? 'previoustrack' : 'nexttrack', episode \? \(\) => playAdjacentEpisode\(step\) : null\)/);
@@ -338,7 +361,7 @@ test('the Media Session shows the item and binds Jellyfin Web\'s actions; previo
 
 test('a browser without the Media Session is left alone', () => {
     const { context } = sandbox(['function updateMediaSession(', 'function clearMediaSession(', 'function setMediaSessionHandler('],
-        { navigator: {} }, decl('hasMediaSession'));
+        { navigator: {} }, `${decl('hasMediaSession')} ${decl('MEDIA_SESSION_ACTIONS')}`);
     context.updateMediaSession({}, { Name: 'x' }, '');
     context.clearMediaSession();
     context.setMediaSessionHandler('play', () => {});

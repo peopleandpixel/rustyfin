@@ -71,8 +71,9 @@ function sandbox({ responses = {}, me = { Configuration: {} } } = {}) {
          this.setActive = s => { activePlayback = s; };`,
         context,
     );
-    // playItem as the player runs it: the next session becomes the active one
+    // playItem and the resume choice are logged, not run
     context.playItem = (id, type, title, opts) => log.push(['playItem', id, type, title, JSON.parse(JSON.stringify(opts))]);
+    context.playWithResumeChoice = (id, type, title, opts) => log.push(['resumeChoice', id, type, title, JSON.parse(JSON.stringify(opts))]);
     return { fns: context.fns, state: context.state, setActive: context.setActive, log, elements, handlers };
 }
 
@@ -81,7 +82,8 @@ const session = (itemId, streamType = 'Videos') => ({ itemId, streamType, runtim
 
 test('Play all lists a container\'s items in Jellyfin Web\'s order; Shuffle asks the server for SortBy=Random', () => {
     const { fns } = sandbox();
-    assert.equal(fns.queueQuery({ Id: 's', Type: 'Series' }, false), '/Shows/s/Episodes?Limit=100');
+    // Every episode of a series, so its Next Up start is in the list however long it is
+    assert.equal(fns.queueQuery({ Id: 's', Type: 'Series' }, false), '/Shows/s/Episodes');
     assert.equal(fns.queueQuery({ Id: 'se', Type: 'Season', SeriesId: 's' }, false), '/Shows/s/Episodes?SeasonId=se');
     assert.deepEqual(query(fns.queueQuery({ Id: 's', Type: 'Series' }, true)),
         { ParentId: 's', Recursive: 'true', IncludeItemTypes: 'Episode', SortBy: 'Random', Limit: '100' });
@@ -101,13 +103,23 @@ test('Play all lists a container\'s items in Jellyfin Web\'s order; Shuffle asks
     assert.equal(query(fns.queueQuery({ Id: 'lib', Type: 'CollectionFolder', CollectionType: 'music' }, true)).SortBy, 'Random');
 });
 
-test('a series starts at its first unplayed episode; Shuffle and other containers start at the top', () => {
+test('a series starts at its Next Up episode, else its first unplayed one; Shuffle and others at the top', async () => {
     const { fns } = sandbox();
-    const items = [{ UserData: { Played: true } }, { UserData: { Played: false } }, {}];
+    const items = [{ Id: 'e1', UserData: { Played: true } }, { Id: 'e2', UserData: { Played: false } }, { Id: 'e3' }];
     assert.equal(fns.queueStartIndex({ Type: 'Series' }, items, false), 1);
+    assert.equal(fns.queueStartIndex({ Type: 'Series' }, items, false, 'e3'), 2, 'Next Up wins');
+    assert.equal(fns.queueStartIndex({ Type: 'Series' }, items, false, 'gone'), 1);
     assert.equal(fns.queueStartIndex({ Type: 'Season' }, [{ UserData: { Played: true } }], false), 0);
     assert.equal(fns.queueStartIndex({ Type: 'Series' }, items, true), 0);
     assert.equal(fns.queueStartIndex({ Type: 'MusicAlbum' }, items, false), 0);
+
+    // Episode 150 of a long series is found through Next Up, and its first item goes through the resume choice
+    const episodes = Array.from({ length: 200 }, (_, i) => ({ Id: `e${i}`, Name: `E${i}`, UserData: { Played: i < 150 } }));
+    const box = sandbox({ responses: { '/Items/s': { Id: 's', Type: 'Series' }, '/Shows/s/Episodes': { Items: episodes }, '/Shows/NextUp': { Items: [{ Id: 'e150' }] } } });
+    await box.fns.playContainer('s');
+    assert.ok(box.log.some(e => e[0] === 'get' && e[1] === '/Shows/NextUp?SeriesId=s&Limit=1'));
+    assert.deepEqual(box.log.at(-1), ['resumeChoice', 'e150', 'Videos', 'E150', { queued: true }]);
+    assert.equal(box.state().playQueue.index, 150);
 });
 
 test('Shuffle plays the random list from its first item; previous and next walk it; an empty one says so', async () => {
@@ -115,11 +127,11 @@ test('Shuffle plays the random list from its first item; previous and next walk 
     const box = sandbox({ responses: { '/Items/al': { Id: 'al', Type: 'MusicAlbum' }, '/Items?': { Items: songs } } });
     await box.fns.playContainer('al', { shuffle: true });
     assert.equal(query(box.log[1][1]).SortBy, 'Random');
-    assert.deepEqual(box.log[2], ['playItem', 'x', 'Audio', 'X', { fromStart: true, queued: true }]);
+    assert.deepEqual(box.log[2], ['resumeChoice', 'x', 'Audio', 'X', { queued: true }]);
     assert.equal(box.state().playQueue.items.length, 2, 'folders are left out');
     assert.deepEqual(JSON.parse(JSON.stringify(box.fns.queueNeighbours())), { prev: null, next: songs[1] });
     assert.equal(box.fns.playQueueStep(1), true);
-    assert.deepEqual(box.log[3], ['playItem', 'y', 'Audio', 'Y', { fromStart: true, queued: true, carry: null }]);
+    assert.deepEqual(box.log[3], ['playItem', 'y', 'Audio', 'Y', { fromStart: true, queued: true, carry: null }], 'later items start over');
     assert.equal(box.fns.playQueueStep(1), false, 'no item after the last');
     box.fns.clearQueue();
     assert.equal(box.fns.queueNeighbours(), null);
@@ -162,7 +174,7 @@ test('a video queue shows the next-item card and honours the autoplay setting; m
     assert.ok(box.state().upNext, 'the card shows');
     assert.equal(box.elements['player-up-next-heading'].textContent, 'player.up_next');
     assert.match(box.elements['player-up-next-status'].textContent, /^player\.up_next_item_announce_manual/);
-    assert.equal(box.log.filter(e => e[0] === 'playItem').length, 1, 'autoplay off waits for Play now');
+    assert.equal(box.log.filter(e => e[0] === 'playItem').length, 0, 'autoplay off waits for Play now');
     box.fns.playUpNextNow();
     assert.deepEqual(box.log.at(-1).slice(0, 2), ['playItem', 'm2']);
     assert.equal(s.finished, true);
@@ -187,6 +199,10 @@ test('the player ends the queue on any other play and on close; Play all and Shu
     assert.match(play, /queued = false/);
     assert.match(play, /if \(!queued\) clearQueue\(\);/);
     assert.match(slice(playerJs, 'function onPlayerClosed('), /clearQueue\(\);/);
+    // The resume choice passes the queue on, and a cancelled choice ends it
+    const choice = slice(playerJs, 'async function playWithResumeChoice(');
+    assert.match(choice, /playItem\(itemId, streamType, title, \{ \.\.\.opts, fromStart: true \}\)/);
+    assert.match(choice, /else if \(opts\.queued\) clearQueue\(\);/);
     const router = read('modules/router.js');
     assert.match(router, /'play-all': el => playContainer\(el\.dataset\.id\)/);
     assert.match(router, /shuffle: el => playContainer\(el\.dataset\.id, \{ shuffle: true \}\)/);

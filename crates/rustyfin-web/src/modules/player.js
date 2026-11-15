@@ -55,8 +55,9 @@ function askResumeOrStart(title, ticks) {
 }
 
 // Starts an item from a card or a Play button. A video with a resume point asks first whether to resume.
-async function playWithResumeChoice(itemId, streamType = 'Videos', title = '') {
-    if (streamType !== 'Videos') return playItem(itemId, streamType, title);
+// opts go on to playItem (queued: the play queue's first item); cancelling the choice ends that queue.
+async function playWithResumeChoice(itemId, streamType = 'Videos', title = '', opts = {}) {
+    if (streamType !== 'Videos') return playItem(itemId, streamType, title, opts);
     // Read the point after the last Stopped report and uncached, so it includes the position just saved
     await pendingStop;
     let item = null;
@@ -66,10 +67,11 @@ async function playWithResumeChoice(itemId, streamType = 'Videos', title = '') {
         console.warn('Could not load item for resume point:', e);
     }
     const ticks = resumePositionTicks(item);
-    if (ticks <= 0) return playItem(itemId, streamType, title);
+    if (ticks <= 0) return playItem(itemId, streamType, title, opts);
     const choice = await askResumeOrStart(title || item?.Name || '', ticks);
-    if (choice === 'resume') playItem(itemId, streamType, title);
-    else if (choice === 'start') playItem(itemId, streamType, title, { fromStart: true });
+    if (choice === 'resume') playItem(itemId, streamType, title, opts);
+    else if (choice === 'start') playItem(itemId, streamType, title, { ...opts, fromStart: true });
+    else if (opts.queued) clearQueue();
 }
 
 // Stops the session that is still playing, if any. Returns the promise of its Stopped report.
@@ -1151,8 +1153,10 @@ function previousChapter() {
 // of a key (< and >, previous and next item) and turns the rest off.
 function playerKeyAction(e) {
     const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+    // The digit keys by position, so they seek on layouts that need Shift for digits (AZERTY) too; with
+    // Shift they are left alone, as AZERTY types the digits there
     const digit = /^(?:Digit|Numpad)(\d)$/.exec(e.code || '');
-    if (digit) return () => seekPercent(Number(digit[1]) * 10);
+    if (digit) return e.shiftKey ? null : () => seekPercent(Number(digit[1]) * 10);
     // > and < from their own key (or Shift with . and , on US layouts) change the speed; . and , step frames
     if (e.key === '>' || (e.shiftKey && e.code === 'Period')) return () => stepPlaybackRate(1);
     if (e.key === '<' || (e.shiftKey && e.code === 'Comma')) return () => stepPlaybackRate(-1);
@@ -1226,6 +1230,7 @@ function mediaSessionMetadata(item, title) {
 
 function updateMediaSession(session, item, title) {
     if (!hasMediaSession()) return;
+    bindMediaSession();
     navigator.mediaSession.metadata = new MediaMetadata(mediaSessionMetadata(item, title));
     navigator.mediaSession.playbackState = 'paused';
 }
@@ -1250,10 +1255,12 @@ function updateMediaPosition(session) {
     }
 }
 
+// The player closed: no item, and no actions left for the OS to offer
 function clearMediaSession() {
     if (!hasMediaSession()) return;
     navigator.mediaSession.metadata = null;
     navigator.mediaSession.playbackState = 'none';
+    for (const action of MEDIA_SESSION_ACTIONS) setMediaSessionHandler(action, null);
 }
 
 // A null handler removes the action, so the OS hides its button; browsers without an action throw
@@ -1266,7 +1273,9 @@ function setMediaSessionHandler(action, handler) {
     }
 }
 
-// The actions Jellyfin Web binds; previous and next follow the item's neighbours (updateEpisodeButtons)
+// The actions Jellyfin Web binds, set for each item and cleared on close; previous and next follow the item's
+// neighbours (updateEpisodeButtons)
+const MEDIA_SESSION_ACTIONS = ['play', 'pause', 'stop', 'seekbackward', 'seekforward', 'seekto', 'previoustrack', 'nexttrack'];
 function bindMediaSession() {
     const video = () => $('video-player');
     setMediaSessionHandler('play', () => video()?.play());
@@ -1276,7 +1285,6 @@ function bindMediaSession() {
     setMediaSessionHandler('seekforward', d => skipTime(d?.seekOffset || 30));
     setMediaSessionHandler('seekto', d => { if (activePlayback && Number.isFinite(d?.seekTime)) seekTo(activePlayback, d.seekTime); });
 }
-bindMediaSession();
 
 // --- Skip intro and outro: Jellyfin Web asks to skip each media segment of these types ---
 const SKIP_SEGMENT_TYPES = ['Intro', 'Outro'];
@@ -1390,9 +1398,9 @@ function hideTrickplay() {
 
 // A mouse over the seek bar, or a finger on it, previews that point
 function hoverSeek(e) {
-    const bar = e.currentTarget;
-    if (!activePlayback || !bar?.clientWidth) return;
-    showTrickplay(Math.min(Math.max(e.offsetX / bar.clientWidth, 0), 1) * 100);
+    const rect = e.currentTarget?.getBoundingClientRect();
+    if (!activePlayback || !rect?.width) return;
+    showTrickplay(Math.min(Math.max((e.clientX - rect.left) / rect.width, 0), 1) * 100);
 }
 
 function toggleFullscreen() {
@@ -1419,12 +1427,14 @@ document.addEventListener('keydown', e => {
     if ($('player-modal')?.open) {
         if (e.key === 'Escape') { closePlayer(); return; }
         if (e.ctrlKey || e.altKey || e.metaKey) return;
-        // Space on a button, menu or text field focused by keyboard works that control. After a click or
-        // tap, and on the seek and volume sliders, Space still toggles play.
+        // A button, menu or text field focused by keyboard keeps its keys (Space, arrows, letters, digits).
+        // After a click or tap, and on the seek and volume sliders, the player's keys work.
         const onControl = e.target instanceof Element && e.target.matches(':focus-visible')
             && e.target.closest('button, select, textarea, a[href], input:not([type="range"])');
+        if (onControl) return;
         if (e.code === 'Space') {
-            if (!onControl) { e.preventDefault(); togglePlayPause(); }
+            e.preventDefault();
+            togglePlayPause();
             return;
         }
         const action = playerKeyAction(e);
