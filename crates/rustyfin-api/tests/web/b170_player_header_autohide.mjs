@@ -11,7 +11,8 @@ import test from 'node:test';
 import vm from 'node:vm';
 
 const appPath = process.argv[2];
-const srcDir = path.dirname(appPath);
+// The web client's src/, next to this crate: appPath is the client's combined source in a temp dir.
+const srcDir = path.join(path.dirname(new URL(import.meta.url).pathname), '../../../rustyfin-web/src');
 const app = fs.readFileSync(appPath, 'utf8');
 const html = fs.readFileSync(path.join(srcDir, 'index.html'), 'utf8');
 const css = fs.readFileSync(path.join(srcDir, 'input.css'), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '');
