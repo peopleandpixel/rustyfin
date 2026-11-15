@@ -1,4 +1,5 @@
-use axum::extract::{ConnectInfo, Path, Query, State};
+use crate::query::Query;
+use axum::extract::{ConnectInfo, Path, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -84,8 +85,10 @@ async fn get_public_info(State(state): State<AppState>) -> Result<Json<ServerInf
     Ok(Json(ServerInfo {
         server_name: config.server_name.clone(),
         version: env!("CARGO_PKG_VERSION").to_string(),
+        product_name: rustyfin_model::server_info::PRODUCT_NAME.to_string(),
         id: state.server_id.to_string(),
         startup_wizard_completed,
+        local_address: format!("http://{}", state.bind_addr),
     }))
 }
 
@@ -104,6 +107,7 @@ async fn get_full_info(
     Ok(Json(FullServerInfo {
         server_name: config.server_name.clone(),
         version: env!("CARGO_PKG_VERSION").to_string(),
+        product_name: rustyfin_model::server_info::PRODUCT_NAME.to_string(),
         id: state.server_id.to_string(),
         startup_wizard_completed,
         operating_system: os,

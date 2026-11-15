@@ -5,9 +5,15 @@ use serde::{Deserialize, Serialize};
 pub struct ServerInfo {
     pub server_name: String,
     pub version: String,
+    pub product_name: String,
     pub id: String,
     pub startup_wizard_completed: bool,
+    pub local_address: String,
 }
+
+/// The `ProductName` of `/System/Info` and `/System/Info/Public`. Jellyfin's is "Jellyfin Server";
+/// Jellyfin clients only show it.
+pub const PRODUCT_NAME: &str = "Rustyfin Server";
 
 /// Full server info returned by GET /System/Info (authenticated)
 #[derive(Debug, Serialize)]
@@ -15,6 +21,7 @@ pub struct ServerInfo {
 pub struct FullServerInfo {
     pub server_name: String,
     pub version: String,
+    pub product_name: String,
     pub id: String,
     pub startup_wizard_completed: bool,
     pub operating_system: String,
