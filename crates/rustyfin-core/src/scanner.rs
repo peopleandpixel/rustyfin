@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use rustyfin_db::repo_media::PathScope;
+use rustyfin_model::image::ImageType;
 use rustyfin_model::library::{Library, LibraryContentType};
 use rustyfin_model::media::{LocationType, MediaItem, MediaType};
 use sqlx::SqlitePool;
@@ -204,6 +205,14 @@ pub async fn scan_with_metadata(
         }
     }
 
+    // Photos get their size, EXIF fields and Primary image, as in Jellyfin.
+    if matches!(
+        library.content_type,
+        LibraryContentType::Photos | LibraryContentType::Mixed
+    ) {
+        read_photos(pool, library, scope).await;
+    }
+
     // A local image replaced in place gets its new stamp, so its tag and copies change.
     changes.images = restamp_local_images(pool, library, scope).await;
 
@@ -217,6 +226,100 @@ pub async fn scan_with_metadata(
     }
 
     Ok(changes)
+}
+
+/// Reads the photos of `scope` that were never read or whose file changed since, and stores what each
+/// says (`photo_info::read_photo`: the header size and the EXIF block, nothing decoded). A photo with
+/// no Primary image and a readable header gets its own file as one, as Jellyfin serves a photo's
+/// picture as its Primary. A failure is logged and skips its photo. Returns how many photos were
+/// read.
+async fn read_photos(pool: &SqlitePool, library: &Library, scope: &ScanScope) -> u32 {
+    let photos =
+        match rustyfin_db::repo_photo::library_photos(pool, library.id, &path_scope(scope)).await {
+            Ok(photos) => photos,
+            Err(e) => {
+                tracing::warn!(
+                    "failed to list the photos of library '{}': {}",
+                    library.name,
+                    e
+                );
+                return 0;
+            }
+        };
+    if photos.is_empty() {
+        return 0;
+    }
+    // One stat per photo. Only an unread or changed file is read; a photo with no Primary image
+    // gets its file's version and size for one.
+    let read = tokio::task::spawn_blocking(move || {
+        photos
+            .into_iter()
+            .filter_map(|photo| {
+                let current = std::fs::metadata(&photo.path)
+                    .ok()
+                    .map(|meta| crate::image_proxy::file_stamp(&meta));
+                if photo.stamp == Some(current) {
+                    if photo.has_primary {
+                        return None;
+                    }
+                    let (stamp, width, height) =
+                        local_images::local_image_version(Path::new(&photo.path));
+                    let size = rustyfin_model::photo::PhotoInfo {
+                        width,
+                        height,
+                        ..Default::default()
+                    };
+                    return Some((photo, stamp, size, false));
+                }
+                let (stamp, info) = crate::photo_info::read_photo(Path::new(&photo.path));
+                Some((photo, stamp, info, true))
+            })
+            .collect::<Vec<_>>()
+    })
+    .await;
+    let read = match read {
+        Ok(read) => read,
+        Err(e) => {
+            tracing::warn!(
+                "failed to read the photos of library '{}': {}",
+                library.name,
+                e
+            );
+            return 0;
+        }
+    };
+
+    let mut count = 0;
+    for (photo, stamp, info, changed) in read {
+        if changed {
+            if let Err(e) =
+                rustyfin_db::repo_photo::save_photo_info(pool, photo.item_id, stamp, &info).await
+            {
+                tracing::warn!("failed to store the metadata of '{}': {}", photo.path, e);
+                continue;
+            }
+            count += 1;
+        }
+        // A file whose header gives no size is no picture to serve.
+        if photo.has_primary || stamp.is_none() || info.width.is_none() {
+            continue;
+        }
+        let image = rustyfin_model::image::ItemImage {
+            item_id: photo.item_id,
+            image_type: ImageType::Primary,
+            image_index: 0,
+            path: photo.path.clone(),
+            provider: "local".to_string(),
+            width: info.width,
+            height: info.height,
+            blurhash: None,
+            stamp,
+        };
+        if let Err(e) = rustyfin_db::repo_image::upsert_image(pool, &image).await {
+            tracing::warn!("failed to store the image of '{}': {}", photo.path, e);
+        }
+    }
+    count
 }
 
 /// Restamps the local images of `scope` whose files changed since they were stored, and returns how
@@ -1608,7 +1711,9 @@ fn detect_media_type(ext: &str, content_type: &LibraryContentType) -> Option<Med
         LibraryContentType::Movies if VIDEO_EXTENSIONS.contains(&ext) => Some(MediaType::Movie),
         LibraryContentType::TvShows if VIDEO_EXTENSIONS.contains(&ext) => Some(MediaType::Episode),
         LibraryContentType::Music if AUDIO_EXTENSIONS.contains(&ext) => Some(MediaType::Audio),
+        // A home videos library holds photos and home videos, as Jellyfin's does.
         LibraryContentType::Photos if PHOTO_EXTENSIONS.contains(&ext) => Some(MediaType::Photo),
+        LibraryContentType::Photos if VIDEO_EXTENSIONS.contains(&ext) => Some(MediaType::Video),
         LibraryContentType::Mixed => {
             if VIDEO_EXTENSIONS.contains(&ext) {
                 Some(MediaType::Movie)

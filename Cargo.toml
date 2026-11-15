@@ -57,6 +57,7 @@ openidconnect = "4.1"
 
 # Image processing
 image = "0.25"
+kamadak-exif = "0.6"
 blurhash = "0.2"
 
 # XML parsing (NFO files)

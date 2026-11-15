@@ -11,6 +11,7 @@ pub mod media_segments;
 pub mod metadata;
 pub mod naming;
 pub mod nfo_parser;
+pub mod photo_info;
 pub mod plugin_manager;
 pub mod probe;
 pub mod scan_progress;

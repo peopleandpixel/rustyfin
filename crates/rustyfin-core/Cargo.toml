@@ -14,6 +14,7 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 reqwest = { workspace = true }
 image = { workspace = true }
+kamadak-exif = { workspace = true }
 blurhash = { workspace = true }
 quick-xml = { workspace = true }
 serde = { workspace = true }

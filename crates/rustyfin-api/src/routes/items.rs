@@ -120,6 +120,24 @@ async fn load_image_tags(pool: &SqlitePool, item: &mut MediaItem) {
     }
 }
 
+/// Puts what a photo's file says into its item, as Jellyfin's DtoService does for a photo. The date
+/// taken is already the item's premiere date and production year.
+fn apply_photo_info(item: &mut MediaItem, info: &rustyfin_model::photo::PhotoInfo) {
+    item.width = info.width;
+    item.height = info.height;
+    item.camera_make = info.camera_make.clone();
+    item.camera_model = info.camera_model.clone();
+    item.software = info.software.clone();
+    item.image_orientation = info.orientation.clone();
+    item.exposure_time = info.exposure_time;
+    item.focal_length = info.focal_length;
+    item.aperture = info.aperture;
+    item.iso_speed_rating = info.iso_speed_rating;
+    item.latitude = info.latitude;
+    item.longitude = info.longitude;
+    item.altitude = info.altitude;
+}
+
 /// Enrich a single MediaItem with all response fields: server_id, provider_ids, chapters,
 /// trickplay screenshots, etag, completion_percentage, external_urls, type flags,
 /// album/artist info, folder counts, inherited images, episode numbers, series branding,
@@ -180,6 +198,13 @@ async fn enrich_item(
             .filter(|field| !field.is_empty())
             .map(str::to_string)
             .collect();
+    }
+
+    // Photos: what the scan read from the file's header and EXIF block
+    if item.media_type == rustyfin_model::media::MediaType::Photo
+        && let Ok(Some(info)) = rustyfin_db::repo_photo::get_photo_info(pool, item.id).await
+    {
+        apply_photo_info(item, &info);
     }
 
     // ExternalUrls from provider_ids
@@ -731,6 +756,23 @@ pub(crate) async fn enrich_items(
     } else {
         std::collections::HashMap::new()
     };
+
+    // Batch query 3a: what the scan read from the photos in the batch
+    let photo_ids: Vec<Uuid> = items
+        .iter()
+        .filter(|item| item.media_type == rustyfin_model::media::MediaType::Photo)
+        .map(|item| item.id)
+        .collect();
+    if !photo_ids.is_empty() {
+        let photos = rustyfin_db::repo_photo::get_photo_infos(pool, &photo_ids)
+            .await
+            .unwrap_or_default();
+        for item in items.iter_mut() {
+            if let Some(info) = photos.get(&item.id) {
+                apply_photo_info(item, info);
+            }
+        }
+    }
 
     // Batch query 3b: unplayed episode counts for the Series and Seasons in the batch
     let folder_ids: Vec<Uuid> = items

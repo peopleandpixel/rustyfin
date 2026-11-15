@@ -125,6 +125,8 @@ pub enum MediaType {
     Audio,
     MusicAlbum,
     Photo,
+    /// A video that is neither a movie nor an episode, as in a home videos library: Jellyfin's `Video`.
+    Video,
     Genre,
     Unknown,
 }
@@ -141,6 +143,7 @@ impl std::str::FromStr for MediaType {
             "Audio" => Ok(MediaType::Audio),
             "MusicAlbum" => Ok(MediaType::MusicAlbum),
             "Photo" => Ok(MediaType::Photo),
+            "Video" => Ok(MediaType::Video),
             "Genre" => Ok(MediaType::Genre),
             _ => Ok(MediaType::Unknown),
         }
@@ -164,6 +167,7 @@ impl MediaType {
             MediaType::Audio => "Audio",
             MediaType::MusicAlbum => "MusicAlbum",
             MediaType::Photo => "Photo",
+            MediaType::Video => "Video",
             MediaType::Genre => "Genre",
             MediaType::Unknown => "Folder",
         }
@@ -172,7 +176,7 @@ impl MediaType {
     /// Jellyfin `MediaType` value (only Video/Audio/Photo/Book/Unknown).
     pub fn media_kind(self) -> &'static str {
         match self {
-            MediaType::Movie | MediaType::Episode => "Video",
+            MediaType::Movie | MediaType::Episode | MediaType::Video => "Video",
             MediaType::Series | MediaType::Season => "Unknown",
             MediaType::Audio | MediaType::MusicAlbum => "Audio",
             MediaType::Photo => "Photo",
@@ -579,6 +583,41 @@ pub struct MediaItem {
     /// Official rating image tag
     #[serde(default)]
     pub official_rating_image_tag: Option<String>,
+
+    // --- Photo fields, read from a photo's header and EXIF; `None` for every other item ---
+    /// The camera's maker (EXIF `Make`)
+    #[serde(default)]
+    pub camera_make: Option<String>,
+    /// The camera's model (EXIF `Model`)
+    #[serde(default)]
+    pub camera_model: Option<String>,
+    /// The software that wrote the photo (EXIF `Software`)
+    #[serde(default)]
+    pub software: Option<String>,
+    /// Jellyfin's `ImageOrientation` name of the EXIF orientation, such as "TopLeft"
+    #[serde(default)]
+    pub image_orientation: Option<String>,
+    /// The exposure time in seconds
+    #[serde(default)]
+    pub exposure_time: Option<f64>,
+    /// The focal length in millimetres
+    #[serde(default)]
+    pub focal_length: Option<f64>,
+    /// The aperture (f-number)
+    #[serde(default)]
+    pub aperture: Option<f64>,
+    /// The ISO speed rating
+    #[serde(default)]
+    pub iso_speed_rating: Option<i32>,
+    /// GPS latitude in degrees, south negative
+    #[serde(default)]
+    pub latitude: Option<f64>,
+    /// GPS longitude in degrees, west negative
+    #[serde(default)]
+    pub longitude: Option<f64>,
+    /// GPS altitude in metres, below sea level negative
+    #[serde(default)]
+    pub altitude: Option<f64>,
 }
 
 impl MediaItem {
@@ -728,6 +767,17 @@ impl MediaItem {
             video_3_d_format: None,
             play_access: None,
             official_rating_image_tag: None,
+            camera_make: None,
+            camera_model: None,
+            software: None,
+            image_orientation: None,
+            exposure_time: None,
+            focal_length: None,
+            aperture: None,
+            iso_speed_rating: None,
+            latitude: None,
+            longitude: None,
+            altitude: None,
         }
     }
 }
@@ -903,6 +953,26 @@ impl Serialize for MediaItem {
         s.serialize_field("Video3DFormat", &self.video_3_d_format)?;
         s.serialize_field("PlayAccess", &self.play_access)?;
         s.serialize_field("OfficialRatingImageTag", &self.official_rating_image_tag)?;
+        // Jellyfin leaves out a null field, so only a photo's known values are written.
+        macro_rules! some_field {
+            ($key:literal, $value:expr) => {
+                match &$value {
+                    Some(value) => s.serialize_field($key, value)?,
+                    None => s.skip_field($key)?,
+                }
+            };
+        }
+        some_field!("CameraMake", self.camera_make);
+        some_field!("CameraModel", self.camera_model);
+        some_field!("Software", self.software);
+        some_field!("ImageOrientation", self.image_orientation);
+        some_field!("ExposureTime", self.exposure_time);
+        some_field!("FocalLength", self.focal_length);
+        some_field!("Aperture", self.aperture);
+        some_field!("IsoSpeedRating", self.iso_speed_rating);
+        some_field!("Latitude", self.latitude);
+        some_field!("Longitude", self.longitude);
+        some_field!("Altitude", self.altitude);
         s.end()
     }
 }

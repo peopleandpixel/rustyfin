@@ -179,7 +179,7 @@ fn media_item_to_didl(item: &rustyfin_model::media::MediaItem, bind_addr: &str) 
     } else {
         let url = format!("http://{}/Items/{}/Download", bind_addr, item.id);
         let mime = match item.media_type {
-            MediaType::Movie | MediaType::Episode => "video/mp4",
+            MediaType::Movie | MediaType::Episode | MediaType::Video => "video/mp4",
             MediaType::Audio => "audio/mpeg",
             MediaType::Photo => "image/jpeg",
             _ => "application/octet-stream",
@@ -215,6 +215,7 @@ fn upnp_class(media_type: &MediaType, is_container: bool) -> &'static str {
     }
     match media_type {
         MediaType::Movie | MediaType::Episode => "object.item.videoItem.movie",
+        MediaType::Video => "object.item.videoItem",
         MediaType::Audio => "object.item.audioItem.musicTrack",
         MediaType::Photo => "object.item.imageItem.photo",
         _ => "object.item",
