@@ -73,9 +73,10 @@ impl UserDto {
 }
 
 /// Jellyfin's `UserPolicy` for an account. Rustyfin has no per-user library, device or feature
-/// restrictions, so every access flag is on; the flags for what only administrators may do here
-/// (deleting items, managing collections and subtitles, controlling others' sessions) follow
-/// `is_admin`. Only `IsAdministrator` and `IsDisabled` are read back by `POST /Users/{id}/Policy`.
+/// restrictions, so every access flag is on but downloading, which Rustyfin has no route for; the
+/// flags for what only administrators may do here (deleting items, managing collections and
+/// subtitles, controlling others' sessions) follow `is_admin`. Only `IsAdministrator` and
+/// `IsDisabled` are read back by `POST /Users/{id}/Policy`.
 pub fn jellyfin_policy(is_admin: bool, is_disabled: bool) -> serde_json::Value {
     // Two literals: one is past serde_json::json!'s macro recursion limit.
     let mut policy = serde_json::json!({
@@ -104,7 +105,8 @@ pub fn jellyfin_policy(is_admin: bool, is_disabled: bool) -> serde_json::Value {
         "ForceRemoteSourceTranscoding": false,
         "EnableContentDeletion": is_admin,
         "EnableContentDeletionFromFolders": [],
-        "EnableContentDownloading": true,
+        // No /Items/{id}/Download route yet; Jellyfin Web would offer a Download that 404s.
+        "EnableContentDownloading": false,
         "EnableSyncTranscoding": true,
         "EnableMediaConversion": true,
         "EnabledDevices": [],

@@ -4869,6 +4869,7 @@ async fn r1auth_users_have_policy_and_configuration() {
     assert_eq!(policy["IsAdministrator"], false);
     assert_eq!(policy["EnableContentDeletion"], false);
     assert_eq!(policy["EnableMediaPlayback"], true);
+    assert_eq!(policy["EnableContentDownloading"], false);
     assert_eq!(policy["EnableAllFolders"], true);
 
     // A Jellyfin client saves the whole policy back; the account keeps its role.
