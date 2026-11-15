@@ -81,7 +81,7 @@ async fn get_users(State(state): State<AppState>) -> Result<Json<Vec<UserDto>>, 
             .into_iter()
             .map(|u| {
                 let f = flags.get(&u.id).copied().unwrap_or_default();
-                UserDto::new(u, f)
+                UserDto::new(u, f, &state.server_id)
             })
             .collect(),
     ))
@@ -95,7 +95,7 @@ async fn get_me(
         .await?
         .ok_or(ApiError::NotFound("user not found".into()))?;
     let flags = rustyfin_db::repo_user::user_flags(&state.db_ro, user.id).await?;
-    Ok(Json(UserDto::new(user, flags)))
+    Ok(Json(UserDto::new(user, flags, &state.server_id)))
 }
 
 async fn get_user(
@@ -106,7 +106,7 @@ async fn get_user(
         .await?
         .ok_or(ApiError::NotFound("user not found".into()))?;
     let flags = rustyfin_db::repo_user::user_flags(&state.db_ro, user.id).await?;
-    Ok(Json(UserDto::new(user, flags)))
+    Ok(Json(UserDto::new(user, flags, &state.server_id)))
 }
 
 async fn get_public_users(
@@ -152,7 +152,11 @@ async fn create_user(
     if !rustyfin_db::repo_user::create_user_unless_taken(&state.db, &user).await? {
         return Err(ApiError::BadRequest("user already exists".into()));
     }
-    Ok(Json(UserDto::new(user, UserFlags::default())))
+    Ok(Json(UserDto::new(
+        user,
+        UserFlags::default(),
+        &state.server_id,
+    )))
 }
 
 /// Checks the caller may delete user `id`, then deletes the user and their data.

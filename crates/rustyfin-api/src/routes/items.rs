@@ -1,4 +1,5 @@
-use axum::extract::{Path, Query, State};
+use crate::query::Query;
+use axum::extract::{Path, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get};
@@ -1566,6 +1567,14 @@ pub fn routes() -> Router<AppState> {
         .route("/Items/Latest", get(get_latest))
         .route("/Items/Resume", get(get_resume))
         .route("/Items/Filters", get(get_filters))
+        .route("/Items/Filters2", get(get_filters2))
+        .route("/Items/{id}/Intros", get(get_intros))
+        .route("/Items/{id}/ThemeMedia", get(get_theme_media))
+        .route("/Items/{id}/ThemeSongs", get(get_theme_list))
+        .route("/Items/{id}/ThemeVideos", get(get_theme_list))
+        .route("/UserItems/Resume", get(get_resume))
+        .route("/Users/{userId}/Items/{itemId}", get(get_user_item))
+        .route("/Users/{userId}/Items/{itemId}/Intros", get(get_intros))
         .route(
             "/Items/{id}/Trickplay/Preview/{width}/{seekTicks}",
             get(get_trickplay_preview),
@@ -2279,11 +2288,42 @@ fn minimal_result(items: Vec<MediaItem>, total: i64, start_index: i64) -> Value 
     json!({ "Items": items, "TotalRecordCount": total, "StartIndex": start_index })
 }
 
+/// GET /Items/{id}: a media item, or a library as its `CollectionFolder` view.
 async fn get_item(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Extension(claims): Extension<Claims>,
-) -> Result<Json<MediaItem>, ApiError> {
+) -> Result<Response, ApiError> {
+    item_or_library(&state, id, claims.sub).await
+}
+
+/// The media item `id` with `user`'s watch data, or the library `id` as its view.
+async fn item_or_library(state: &AppState, id: Uuid, user: Uuid) -> Result<Response, ApiError> {
+    match media_item(state, id, user).await {
+        Err(ApiError::NotFound(message)) => {
+            match rustyfin_db::repo_library::get_library_by_id(&state.db_ro, id).await? {
+                Some(lib) => {
+                    Ok(Json(super::library::library_view(&lib, &state.server_id)).into_response())
+                }
+                None => Err(ApiError::NotFound(message)),
+            }
+        }
+        other => other.map(|item| Json(item).into_response()),
+    }
+}
+
+/// GET /Users/{userId}/Items/{itemId}: Jellyfin's older form of `GET /Items/{id}`.
+async fn get_user_item(
+    State(state): State<AppState>,
+    Path((user_id, item_id)): Path<(Uuid, Uuid)>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Response, ApiError> {
+    let user = path_user(&state, &claims, user_id).await?;
+    item_or_library(&state, item_id, user).await
+}
+
+/// The media item `id` with `user`'s watch data.
+async fn media_item(state: &AppState, id: Uuid, user: Uuid) -> Result<MediaItem, ApiError> {
     let id_str = id.to_string();
     // The details every user sees; the requester's watch data is added below. A scan that reads
     // a file again replaces the item's sources, with new ids, so a cached copy is served only
@@ -2331,21 +2371,54 @@ async fn get_item(
         }
     };
     let folder = is_episode_folder(&item);
-    let stored = rustyfin_db::repo_playback::get_user_item_data(&state.db_ro, claims.sub, id)
+    let stored = rustyfin_db::repo_playback::get_user_item_data(&state.db_ro, user, id)
         .await
         .ok();
     if let Some(user_data) = stored.or_else(|| folder.then(Default::default)) {
         apply_user_data(&mut item, user_data);
         if folder {
-            let counts =
-                rustyfin_db::repo_playback::get_unplayed_counts(&state.db_ro, claims.sub, &[id])
-                    .await
-                    .unwrap_or_default();
+            let counts = rustyfin_db::repo_playback::get_unplayed_counts(&state.db_ro, user, &[id])
+                .await
+                .unwrap_or_default();
             let key = id.to_string();
             apply_unplayed_counts(&mut item, counts.get(&key).copied().unwrap_or((0, 0)));
         }
     }
-    Ok(Json(item))
+    Ok(item)
+}
+
+/// An empty Jellyfin `QueryResult`.
+fn empty_result() -> Value {
+    json!({ "Items": [], "TotalRecordCount": 0, "StartIndex": 0 })
+}
+
+/// GET /Items/{id}/Intros and /Users/{userId}/Items/{itemId}/Intros: Rustyfin plays no intros.
+async fn get_intros() -> Json<Value> {
+    Json(empty_result())
+}
+
+/// An empty `ThemeMediaResult` for `id`.
+fn empty_theme_result(id: Uuid) -> Value {
+    json!({
+        "Items": [],
+        "TotalRecordCount": 0,
+        "StartIndex": 0,
+        "OwnerId": id.simple().to_string(),
+    })
+}
+
+/// GET /Items/{id}/ThemeMedia: Rustyfin has no theme songs or videos.
+async fn get_theme_media(Path(id): Path<Uuid>) -> Json<Value> {
+    Json(json!({
+        "ThemeVideosResult": empty_theme_result(id),
+        "ThemeSongsResult": empty_theme_result(id),
+        "SoundtrackSongsResult": empty_theme_result(id),
+    }))
+}
+
+/// GET /Items/{id}/ThemeSongs and /Items/{id}/ThemeVideos.
+async fn get_theme_list(Path(id): Path<Uuid>) -> Json<Value> {
+    Json(empty_theme_result(id))
 }
 
 async fn delete_item(
@@ -2623,6 +2696,27 @@ async fn get_filters(
     Ok(Json(result))
 }
 
+/// GET /Items/Filters2: Jellyfin's `QueryFilters`, the genres (with their ids) and tags under the
+/// parent. Rustyfin keeps no tag list for filters, so Tags is empty.
+async fn get_filters2(
+    State(state): State<AppState>,
+    Query(query): Query<FiltersQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let library_id = query.parent_id.or(query.parent_id_lower);
+    let (genres, _, _) = rustyfin_db::repo_media::get_filters(&state.db_ro, library_id).await?;
+    let genres: Vec<Value> = genres
+        .into_iter()
+        .map(|name| {
+            let id = rustyfin_db::repo_by_name::by_name_id(
+                rustyfin_db::repo_by_name::ByNameKind::Genre,
+                &name,
+            );
+            json!({ "Name": name, "Id": id.simple().to_string() })
+        })
+        .collect();
+    Ok(Json(json!({ "Genres": genres, "Tags": [] })))
+}
+
 // User-specific item endpoints (same as global for now; user-specific status comes in Phase 2)
 async fn get_user_items(
     State(state): State<AppState>,
@@ -2723,30 +2817,49 @@ async fn delete_items(
 }
 
 /// GET /Items/{id}/Ancestors - Get parent chain
+/// GET /Items/{id}/Ancestors: as in Jellyfin, an array of the item's parents, nearest first,
+/// ending with its library's `CollectionFolder`.
 async fn get_ancestors(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-) -> Result<Json<QueryResult>, ApiError> {
-    let mut ancestors = Vec::new();
-    let mut current_id = id;
-    loop {
-        let item = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, current_id).await?;
-        let Some(item) = item else { break };
-        match item.parent_id {
-            Some(parent_id) => {
-                ancestors.push(item);
-                current_id = parent_id;
-            }
-            None => break,
-        }
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<Vec<Value>>, ApiError> {
+    let item = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, id)
+        .await?
+        .ok_or(ApiError::NotFound("item not found".into()))?;
+    let mut parents = Vec::new();
+    let mut next = item.parent_id;
+    // A parent chain is a few levels deep; the cap stops a cycle in bad data.
+    while let Some(parent_id) = next.filter(|_| parents.len() < 16) {
+        let Some(parent) = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, parent_id).await?
+        else {
+            break;
+        };
+        next = parent.parent_id;
+        parents.push(parent);
     }
-    ancestors.reverse();
-    let total = ancestors.len() as i64;
-    Ok(Json(QueryResult {
-        items: ancestors,
-        total_record_count: total,
-        start_index: 0,
-    }))
+    let tmdb = state.tmdb.api(None);
+    enrich_items(
+        &state.db_ro,
+        &state.server_id,
+        Some(claims.sub),
+        &mut parents,
+        &state.http_client,
+        tmdb.as_ref(),
+        &state.data_dir,
+        true,
+    )
+    .await;
+    let mut ancestors: Vec<Value> = parents
+        .iter()
+        .filter_map(|p| serde_json::to_value(p).ok())
+        .collect();
+    if let Some(lib) =
+        rustyfin_db::repo_library::get_library_by_id(&state.db_ro, item.library_id).await?
+    {
+        ancestors.push(super::library::library_view(&lib, &state.server_id));
+    }
+    Ok(Json(ancestors))
 }
 
 /// GET /Items/{id}/Collections - Get collections containing this item
