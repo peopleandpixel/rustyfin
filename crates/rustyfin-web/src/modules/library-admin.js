@@ -2,7 +2,7 @@
 import { $, show, hide, icon, toast, escapeHtml, scanRing, updateScanRings } from './util.js';
 import { currentPage, navigate } from './router.js';
 import { renderHome } from './home.js';
-import { currentLibraryId, renderLibrary } from './library.js';
+import { currentLibraryId, renderLibrary, libraryRefreshInPlace } from './library.js';
 import { currentDetailId, renderDetail } from './item.js';
 import { renderAdmin, refreshTasks } from './admin.js';
 // Library id -> { percent, queued } while it scans (percent 0 = not known yet, so its ring spins; queued = waiting its turn). Absent when not scanning.
@@ -380,7 +380,10 @@ function refreshViewAfterLibraryChange() {
         // Only if the user is still on that page
         if (currentPage !== page) return;
         if (page === 'detail' && currentDetailId) renderDetail(currentDetailId);
-        else if (page === 'library' && currentLibraryId) renderLibrary(currentLibraryId);
+        else if (page === 'library' && currentLibraryId) {
+            // An open list is brought up to date where it stands; only a library not shown yet is drawn again
+            if (!libraryRefreshInPlace()) renderLibrary(currentLibraryId);
+        }
         else if (page === 'home') renderHome();
     }, 500);
 }

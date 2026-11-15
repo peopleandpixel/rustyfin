@@ -3,10 +3,10 @@ import { $, toast } from './util.js';
 import { checkSetupWizard, wizAddManualLibrary } from './wizard.js';
 import { startOidcSignIn, startOidcLink, unlinkOidc, renderLogin, updateAuthUI } from './auth.js';
 import { renderHome, renderFavorites } from './home.js';
-import { renderLibrary, jumpToLetter } from './library.js';
+import { renderLibrary, stopLibraryLoad, libraryRemember, startGridDiag, jumpToLetter } from './library.js';
 import { currentDetailId, renderDetail, renderPerson, toggleFavorite, togglePlayed } from './item.js';
 import { renderSearch } from './search.js';
-import { playWithResumeChoice, stopPlayback, playItem } from './player.js';
+import { playWithResumeChoice, stopPlayback, playItem, playerAutoHide, onPlayerClosed } from './player.js';
 import { renderSettings } from './settings.js';
 import {
     renderAdmin, showAdminTab, setUserPolicy, removeOidcLinkAsAdmin, copyOidcCallbackUrl, saveOidcAdminSettings,
@@ -20,7 +20,15 @@ import { openPluginConfig, openPluginPriority } from './plugins.js';
 let currentPage = 'home';
 
 // --- Navigation & Routing ---
-function navigate(page, data) {
+// The hash navigate() set last (see handleHash)
+let navigatedHash = null;
+
+function navigate(page, data, { fromHistory = false } = {}) {
+    // The library list remembers where it was, and stops loading once the page is left; it comes
+    // back to that place only through history
+    libraryRemember();
+    if (page !== 'library') stopLibraryLoad();
+    libraryRestore = fromHistory && page === 'library';
     document.querySelectorAll('[id^="page-"]').forEach(el => el.classList.add('hidden'));
     const el = $('page-' + page);
     if (el) {
@@ -28,7 +36,8 @@ function navigate(page, data) {
         el.classList.add('jf-page');
     }
     currentPage = page;
-    window.location.hash = data ? `${page}/${data}` : page;
+    navigatedHash = data ? `${page}/${data}` : page;
+    window.location.hash = navigatedHash;
 
     // Update sidebar active states
     document.querySelectorAll('.jf-drawer-item').forEach(item => item.classList.remove('active'));
@@ -171,14 +180,38 @@ function toggleSidebar() {
 }
 
 // --- Hash Router ---
+// A hash route (location.hash without its #) as { page, param, query }: a leading slash is
+// allowed (#/library/<id>), and a ?query after the route (#library/<id>?debug=grid) is split off,
+// so it never becomes part of the page's parameter (nor reaches the server in it)
+function hashRoute(hash) {
+    const at = hash.indexOf('?');
+    const path = (at < 0 ? hash : hash.slice(0, at)).replace(/^\/+/, '');
+    const query = new URLSearchParams(at < 0 ? '' : hash.slice(at + 1));
+    const [page, ...rest] = path.split('/');
+    return { page, param: rest.join('/') || undefined, query };
+}
+
 function handleHash() {
     const hash = window.location.hash.slice(1);
-    if (!hash) {
+    // navigate() sets the hash itself; a change to any other hash came from history (Back/Forward)
+    const fromHistory = hash !== navigatedHash;
+    const { page, param, query } = hashRoute(hash);
+    // debug=grid is kept for the tab (sessionStorage), so a reload keeps the panel: the hash
+    // itself is cleaned just below
+    if (query.get('debug') === 'grid') {
+        try { sessionStorage.setItem('rustyfin.gridDebug', '1'); } catch {}
+        startGridDiag(true);
+    }
+    if (!page) {
         navigate('home');
         return;
     }
-    const [page, ...rest] = hash.split('/');
-    navigate(page, rest.join('/') || undefined);
+    // A hash typed in another form (a leading slash, a ?query) becomes the canonical one in place:
+    // navigate() then sets the hash it already has, so no history entry is added and no second
+    // hashchange draws the page again (Back would land on the typed form and come straight back)
+    const canonical = param ? `${page}/${param}` : page;
+    if (hash !== canonical) history.replaceState(null, '', `#${canonical}`);
+    navigate(page, param, { fromHistory });
 }
 
 // --- Bootstrap & Lifecycle ---
@@ -186,7 +219,8 @@ window.addEventListener('hashchange', handleHash);
 
 document.addEventListener('DOMContentLoaded', async () => {
     // Every way of closing the player goes through here, so the session is stopped and its position reported once
-    $('player-modal')?.addEventListener('close', () => stopPlayback());
+    if ($('player-modal') && $('video-player')) playerBars = playerAutoHide($('player-modal'), $('video-player'));
+    $('player-modal')?.addEventListener('close', onPlayerClosed);
     window.addEventListener('pagehide', () => stopPlayback());
     updateAuthUI();
     const wizardActive = await checkSetupWizard();
@@ -200,4 +234,4 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 });
 
-export { currentPage, navigate, toggleUserMenu, closeUserMenu, toggleSidebar };
+export { currentPage, navigate, toggleUserMenu, closeUserMenu, toggleSidebar, hashRoute };

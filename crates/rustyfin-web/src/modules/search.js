@@ -1,5 +1,5 @@
 // The search page
-import { $, initLazyImages, escapeHtml } from './util.js';
+import { $, escapeHtml } from './util.js';
 import { createCardElement } from './cards.js';
 import { navigate } from './router.js';
 
@@ -36,7 +36,7 @@ async function renderSearch(term) {
         page.innerHTML = `
         <div class="jf-page">
             <h1 class="text-2xl font-bold mb-6 text-white">${t('search.results_for', { term: escapeHtml(term), count: items.length })}</h1>
-            <div id="search-grid" class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-7 gap-4"></div>
+            <div id="search-grid" class="jf-card-grid grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-7 gap-4"></div>
         </div>`;
         // Populate search grid using DocumentFragment
         const gridEl = $('search-grid');
@@ -48,7 +48,6 @@ async function renderSearch(term) {
             });
             gridEl.appendChild(fragment);
         }
-        initLazyImages();
     } catch (e) {
         page.innerHTML = `<div class="p-6 rounded-xl bg-red-500/10 text-red-400">${escapeHtml(e.message)}</div>`;
     }

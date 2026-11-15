@@ -1,5 +1,5 @@
 // The home page and favourites
-import { $, initLazyImages, icon, toast, escapeHtml, scanRing } from './util.js';
+import { $, icon, toast, escapeHtml, scanRing } from './util.js';
 import { backdropUrl, createCardElement, sectionRow } from './cards.js';
 import { serverVersion } from './wizard.js';
 import { LIBRARY_PAGE_SIZE, setupInfiniteScroll, destroyInfiniteScroll } from './library.js';
@@ -13,7 +13,7 @@ async function renderHome() {
             const info = await API.getPublicInfo();
             if (API.token !== session) return;
             const sn = info.ServerName || info.server_name || 'Rustyfin';
-            const ver = info.Version || info.version || serverVersion;
+            const ver = info.RustyfinVersion || info.Version || info.version || serverVersion;
             page.innerHTML = `
             <div class="flex flex-col items-center justify-center min-h-[75vh] text-center jf-page px-4">
                 <div class="relative mb-6">
@@ -227,7 +227,7 @@ async function renderFavorites() {
                     <h1 class="text-2xl lg:text-3xl font-extrabold text-white tracking-tight">${t('favorites.title')}</h1>
                     <span class="text-xs text-white/40">(${total})</span>
                 </div>
-                <div id="fav-grid" class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-7 gap-4"></div>
+                <div id="fav-grid" class="jf-card-grid grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-7 gap-4"></div>
                 ${hasMore ? `
                 <div id="fav-infinite-container" class="text-center mt-8">
                     <div id="infinite-scroll-spinner" class="jf-infinite-spinner" style="display:none"><div class="jf-spinner"></div></div>
@@ -272,7 +272,6 @@ function appendFavoriteCards(items) {
         if (card) frag.appendChild(card);
     }
     grid.appendChild(frag);
-    initLazyImages(grid);
 }
 
 async function loadMoreFavoritesInfinite(initialTotal) {
