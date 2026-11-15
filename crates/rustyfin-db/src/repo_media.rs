@@ -1061,7 +1061,8 @@ fn build_filtered_query(
                 .to_string(),
         );
     }
-    // Played binds the user twice (see PLAYED_CLAUSE); unplayed is its negation.
+    // Played binds the played series and seasons, then the user (see PLAYED_CLAUSE); unplayed is
+    // its negation.
     if is_played == Some(true) {
         where_parts.push(PLAYED_CLAUSE.to_string());
     } else if is_played == Some(false) {
@@ -1141,24 +1142,42 @@ fn build_filtered_query(
     (count_sql, data_sql)
 }
 
-/// Whether an item is played for the user bound twice: a Series or Season when it has episodes
-/// and all of them are played, as Jellyfin works it out (and as `get_unplayed_counts` counts it);
-/// any other item by its own flag. Both subqueries are uncorrelated, so each runs once per query:
-/// the episodes are found by type and their seasons and series by primary key.
-const PLAYED_CLAUSE: &str = "(CASE WHEN media_type IN ('Series', 'Season') THEN id IN (
-        SELECT ef.folder_id FROM (
-            SELECT e.id AS episode_id, p.id AS folder_id
-            FROM media_items e JOIN media_items p ON p.id = e.parent_id AND p.media_type = 'Season'
-            WHERE e.media_type = 'Episode'
-            UNION ALL
-            SELECT e.id, p.parent_id
-            FROM media_items e JOIN media_items p ON p.id = e.parent_id AND p.media_type = 'Season'
-            WHERE e.media_type = 'Episode' AND p.parent_id IS NOT NULL
-        ) ef
-        LEFT JOIN user_item_data ud ON ud.item_id = ef.episode_id AND ud.user_id = ?
-        GROUP BY ef.folder_id
-        HAVING MIN(COALESCE(ud.played, 0)) = 1)
-    ELSE id IN (SELECT item_id FROM user_item_data WHERE user_id = ? AND played = 1) END)";
+/// Whether an item is played: a Series or Season when it is in the JSON list bound first (from
+/// `played_folder_ids`), any other item by the user's flag, bound second.
+const PLAYED_CLAUSE: &str = "(CASE WHEN media_type IN ('Series', 'Season')
+        THEN id IN (SELECT value FROM json_each(?))
+        ELSE id IN (SELECT item_id FROM user_item_data WHERE user_id = ? AND played = 1) END)";
+
+/// The Series and Seasons in a library (every library when `library` is empty) that have episodes,
+/// all of them played by the user, as Jellyfin works it out and as `get_unplayed_counts` counts
+/// it, as a JSON list. The episodes are found by library and type, their seasons and series by
+/// primary key, and the user's rows by theirs.
+async fn played_folder_ids(
+    pool: &SqlitePool,
+    user_id: &str,
+    library: &str,
+) -> Result<String, sqlx::Error> {
+    let ids: Vec<String> = sqlx::query_scalar(
+        "SELECT ef.folder_id FROM (
+             SELECT e.id AS episode_id, p.id AS folder_id
+             FROM media_items e JOIN media_items p ON p.id = e.parent_id AND p.media_type = 'Season'
+             WHERE e.media_type = 'Episode' AND (?1 = '' OR e.library_id = ?1)
+             UNION ALL
+             SELECT e.id, p.parent_id
+             FROM media_items e JOIN media_items p ON p.id = e.parent_id AND p.media_type = 'Season'
+             WHERE e.media_type = 'Episode' AND (?1 = '' OR e.library_id = ?1)
+               AND p.parent_id IS NOT NULL
+         ) ef
+         LEFT JOIN user_item_data ud ON ud.item_id = ef.episode_id AND ud.user_id = ?2
+         GROUP BY ef.folder_id
+         HAVING MIN(COALESCE(ud.played, 0)) = 1",
+    )
+    .bind(library)
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(serde_json::to_string(&ids).unwrap_or_else(|_| "[]".to_string()))
+}
 
 #[allow(clippy::too_many_arguments)]
 pub async fn get_items_filtered(
@@ -1205,6 +1224,30 @@ pub async fn get_items_filtered(
     let pd_str = premiere_date.unwrap_or_default();
     let dc_str = date_created.unwrap_or_default();
     let uid_str = user_id.unwrap_or(Uuid::nil()).to_string();
+    // The played series and seasons, worked out once for both statements, and only when the
+    // list can hold them: in the listed library, the parent item's library, or every library (a
+    // parent that isn't an item, such as a library or collection id).
+    let lists_folders = media_types.is_none_or(|types| {
+        types
+            .iter()
+            .any(|t| matches!(t.trim_matches('"'), "Series" | "Season"))
+    });
+    let played_folders = if (is_played.is_some() || is_unplayed.is_some()) && lists_folders {
+        let library = if !lid_str.is_empty() {
+            lid_str.clone()
+        } else if !pid_str.is_empty() {
+            sqlx::query_scalar::<_, String>("SELECT library_id FROM media_items WHERE id = ?")
+                .bind(&pid_str)
+                .fetch_optional(pool)
+                .await?
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        played_folder_ids(pool, &uid_str, &library).await?
+    } else {
+        "[]".to_string()
+    };
     let (min_ticks, max_ticks) = runtime
         .map(|(min, max)| {
             (
@@ -1343,16 +1386,16 @@ pub async fn get_items_filtered(
             }
         }
     }
-    // One user_id per IsFavorite clause and two per IsPlayed / IsUnplayed clause, in
-    // build_filtered_query's order.
+    // The user_id for an IsFavorite clause, and the played series and seasons and the user_id for
+    // an IsPlayed / IsUnplayed clause, in build_filtered_query's order.
     if is_favorite.is_some() {
         count_q = count_q.bind(&uid_str);
     }
     if is_played.is_some() {
-        count_q = count_q.bind(&uid_str).bind(&uid_str);
+        count_q = count_q.bind(&played_folders).bind(&uid_str);
     }
     if is_unplayed.is_some() {
-        count_q = count_q.bind(&uid_str).bind(&uid_str);
+        count_q = count_q.bind(&played_folders).bind(&uid_str);
     }
 
     let total: i64 = count_q.fetch_one(pool).await.unwrap_or(0);
@@ -1465,10 +1508,10 @@ pub async fn get_items_filtered(
         data_q = data_q.bind(&uid_str);
     }
     if is_played.is_some() {
-        data_q = data_q.bind(&uid_str).bind(&uid_str);
+        data_q = data_q.bind(&played_folders).bind(&uid_str);
     }
     if is_unplayed.is_some() {
-        data_q = data_q.bind(&uid_str).bind(&uid_str);
+        data_q = data_q.bind(&played_folders).bind(&uid_str);
     }
 
     // Pagination

@@ -15748,6 +15748,15 @@ async fn w1filters_series_played_follows_their_episodes() {
         assert_eq!(names, j6_names(expected), "{params}");
         assert_eq!(total, expected.len() as i64, "{params}: TotalRecordCount");
     }
+    // Without a library, the played series are worked out over every library.
+    let all = b27_answer(
+        &app,
+        "/Items?IncludeItemTypes=Series&Recursive=true&Filters=IsPlayed",
+        &token,
+    )
+    .await;
+    assert_eq!(all["TotalRecordCount"], 1, "{all}");
+    assert_eq!(all["Items"][0]["Name"], "Hotel");
     // The other user has watched every episode.
     let (names, _) = w1filters_names(
         &app,
