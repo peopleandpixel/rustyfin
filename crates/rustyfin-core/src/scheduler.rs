@@ -473,12 +473,14 @@ impl TaskScheduler {
                 let mut errors = Vec::new();
                 let http = &self.http_client;
 
-                // Collect all items from all libraries first. Items already identified by a
-                // provider ID are skipped (Jellyfin parity: no automatic re-query). An explicit
-                // refresh of one item or library from the API still re-queries them. Items
-                // identified before the premiere date, people and IMDb id were stored have no
-                // premiere date; they are asked again, by id, so an upgrade fills them, when a
-                // provider can look items up by id (TMDb).
+                // Collect all items from all libraries first. The task never searches by name
+                // (RefreshOptions::TASK), so a movie or series is refreshed only when a provider
+                // can look it up by its TMDb id and none has answered for it since the item was
+                // stored before premiere dates, people and IMDb ids were (no premiere date, no
+                // provider_refreshed_at): an upgraded library is asked once, by id. Movies and
+                // series without a TMDb id are skipped (no search, no rename). Other items get
+                // their local images and NFO; their seasons' lookups come from their series'
+                // refresh. An explicit refresh from the API still re-queries.
                 let by_id = self
                     .plugin_manager
                     .metadata_providers()
@@ -490,15 +492,20 @@ impl TaskScheduler {
                 for lib in &libraries {
                     match rustyfin_db::repo_media::get_items_by_library(&self.db, lib.id).await {
                         Ok(items) => {
+                            let ids: Vec<uuid::Uuid> = items.iter().map(|i| i.id).collect();
+                            let answered =
+                                rustyfin_db::repo_media::provider_refreshed_ids(&self.db, &ids)
+                                    .await
+                                    .unwrap_or_default();
                             for item in items {
                                 use rustyfin_model::media::MediaType;
-                                let identified =
+                                let skip =
                                     matches!(item.media_type, MediaType::Movie | MediaType::Series)
-                                        && (item.tmdb_id.is_some()
-                                            || item.tvdb_id.is_some()
-                                            || item.provider_ids.get("Imdb").is_some())
-                                        && (item.premiere_date.is_some() || !by_id);
-                                if identified {
+                                        && !(by_id
+                                            && item.tmdb_id.is_some()
+                                            && item.premiere_date.is_none()
+                                            && !answered.contains(&item.id));
+                                if skip {
                                     skipped_identified += 1;
                                 } else {
                                     all_items.push((lib.name.clone(), item));
@@ -527,9 +534,14 @@ impl TaskScheduler {
                     let pm = self.plugin_manager.clone();
                     let handle = tokio::spawn(async move {
                         let _permit = sem.acquire().await;
-                        if let Err(e) =
-                            crate::metadata::refresh_item_metadata(&db, &http_client, &item, &pm)
-                                .await
+                        if let Err(e) = crate::metadata::refresh_item_metadata_with(
+                            &db,
+                            &http_client,
+                            &item,
+                            &pm,
+                            crate::metadata::RefreshOptions::TASK,
+                        )
+                        .await
                         {
                             Some(format!("{}: {}", item_name, e))
                         } else {

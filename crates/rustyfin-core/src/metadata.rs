@@ -9,12 +9,57 @@ use crate::nfo_parser;
 use crate::plugin_manager::{MetadataProviderHandle, PluginManager};
 use rustyfin_model::metadata::SeasonMetadata;
 
+/// How a metadata refresh may ask the providers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RefreshOptions {
+    /// Search providers by name for an item they can't look up by id. Off for the "Refresh
+    /// metadata" task, which never searches or renames.
+    pub search: bool,
+    /// Look a season or episode up through its season. Off for the task: a series' refresh fills
+    /// the seasons and episodes that need it.
+    pub season_lookups: bool,
+    /// Ask again about a season or episode that a provider already answered for.
+    pub force: bool,
+}
+
+impl RefreshOptions {
+    /// A refresh asked for through the API: everything, again.
+    pub const EXPLICIT: RefreshOptions = RefreshOptions {
+        search: true,
+        season_lookups: true,
+        force: true,
+    };
+    /// A scan's refresh of the items it added.
+    pub const SCAN: RefreshOptions = RefreshOptions {
+        search: true,
+        season_lookups: true,
+        force: false,
+    };
+    /// The "Refresh metadata" task: by id only.
+    pub const TASK: RefreshOptions = RefreshOptions {
+        search: false,
+        season_lookups: false,
+        force: false,
+    };
+}
+
 /// Refresh metadata for a single item: local images, NFO, then optionally remote providers
 pub async fn refresh_item_metadata(
     pool: &SqlitePool,
     client: &reqwest::Client,
     item: &MediaItem,
     plugin_manager: &PluginManager,
+) -> Result<(), String> {
+    refresh_item_metadata_with(pool, client, item, plugin_manager, RefreshOptions::EXPLICIT).await
+}
+
+/// `refresh_item_metadata` with the given options.
+pub async fn refresh_item_metadata_with(
+    pool: &SqlitePool,
+    client: &reqwest::Client,
+    item: &MediaItem,
+    plugin_manager: &PluginManager,
+    options: RefreshOptions,
 ) -> Result<(), String> {
     let media_path = Path::new(&item.path);
     // Each source fills this copy, so a later source keeps what an earlier one filled
@@ -75,13 +120,31 @@ pub async fn refresh_item_metadata(
 
     match item.media_type {
         MediaType::Movie | MediaType::Series => {
-            refresh_from_providers(pool, client, &mut working, &providers, replace_name).await?;
+            refresh_from_providers(
+                pool,
+                client,
+                &mut working,
+                &providers,
+                replace_name,
+                options.search,
+            )
+            .await?;
+            rustyfin_db::repo_media::mark_provider_refreshed(pool, &[item.id])
+                .await
+                .map_err(|e| e.to_string())?;
             if item.media_type == MediaType::Series && working.tmdb_id.is_some() {
                 refresh_series_children(pool, &working, &providers).await?;
             }
         }
-        MediaType::Season | MediaType::Episode => {
-            refresh_from_season(pool, &mut working, &providers, replace_name).await?;
+        MediaType::Season | MediaType::Episode if options.season_lookups => {
+            let answered = !options.force
+                && rustyfin_db::repo_media::provider_refreshed_ids(pool, &[item.id])
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .contains(&item.id);
+            if !answered {
+                refresh_from_season(pool, &mut working, &providers, replace_name).await?;
+            }
         }
         _ => {}
     }
@@ -90,14 +153,16 @@ pub async fn refresh_item_metadata(
 }
 
 /// Identify a movie or series with each provider in turn and apply what it finds. A provider
-/// with lookups (TMDb) fetches an item it already knows by id, with no search; a series search
-/// sends the folder's year.
+/// with lookups (TMDb) fetches an item it already knows by id and never searches for it, even
+/// when the id is gone from TMDb (the item stays as it is, as in Jellyfin); a series search sends
+/// the folder's year. Without `search`, no provider is searched by name.
 async fn refresh_from_providers(
     pool: &SqlitePool,
     client: &reqwest::Client,
     working: &mut MediaItem,
     providers: &[MetadataProviderHandle],
     replace_name: bool,
+    search: bool,
 ) -> Result<(), String> {
     // Candidate names in search order. Jellyfin searches the parsed name first; release
     // tags left in the file name (e.g. "Bluray-1080p") make TMDb find nothing.
@@ -115,6 +180,7 @@ async fn refresh_from_providers(
 
     for provider in providers {
         let mut meta = None;
+        let by_id = provider.lookups.is_some() && working.tmdb_id.is_some();
         if let (Some(lookups), Some(id)) = (&provider.lookups, working.tmdb_id) {
             meta = match media_type {
                 MediaType::Series => lookups.series_by_id(id).await,
@@ -128,7 +194,7 @@ async fn refresh_from_providers(
             );
         }
         // Search for metadata, stopping at the first candidate name that matches
-        if meta.is_none() {
+        if meta.is_none() && search && !by_id {
             for candidate in &candidates {
                 let found = match (media_type, &provider.lookups) {
                     (MediaType::Series, Some(lookups)) => {
@@ -215,10 +281,12 @@ async fn refresh_from_season(
     let Some(series_id) = series.tmdb_id else {
         return Ok(());
     };
+    let mut asked = false;
     for provider in providers {
         let Some(lookups) = &provider.lookups else {
             continue;
         };
+        asked = true;
         let Some(season) = lookups.season(series_id, season_number).await else {
             continue;
         };
@@ -231,7 +299,23 @@ async fn refresh_from_season(
         )
         .await?;
     }
+    if asked {
+        rustyfin_db::repo_media::mark_provider_refreshed(pool, &[working.id])
+            .await
+            .map_err(|e| e.to_string())?;
+    }
     Ok(())
+}
+
+/// Whether the NFO next to a media file gives a title, which a provider's title doesn't replace.
+async fn nfo_has_title(path: &str) -> bool {
+    match nfo_parser::find_nfo_for_media(Path::new(path)) {
+        Some(nfo) => nfo_parser::parse_nfo(&nfo)
+            .await
+            .and_then(|meta| meta.name)
+            .is_some_and(|name| !name.trim().is_empty()),
+        None => false,
+    }
 }
 
 /// Apply a season lookup to a season item, or to the episode it lists under the item's number.
@@ -311,10 +395,22 @@ async fn refresh_series_children(
             _ => {}
         }
     }
+    // Only the seasons and episodes no provider answered for yet: a later refresh of the series
+    // asks TMDb for nothing more
+    let ids: Vec<Uuid> = targets.iter().map(|(t, _)| t.id).collect();
+    let answered = rustyfin_db::repo_media::provider_refreshed_ids(pool, &ids)
+        .await
+        .map_err(|e| e.to_string())?;
+    targets.retain(|(t, _)| !answered.contains(&t.id));
+    if targets.is_empty() {
+        return Ok(());
+    }
+    let mut asked = false;
     for provider in providers {
         let Some(lookups) = &provider.lookups else {
             continue;
         };
+        asked = true;
         let mut seasons: std::collections::HashMap<i32, Option<SeasonMetadata>> =
             std::collections::HashMap::new();
         for (target, number) in &targets {
@@ -330,7 +426,7 @@ async fn refresh_series_children(
             let keep_name = rustyfin_db::repo_media::is_field_locked(pool, target.id, "Name")
                 .await
                 .unwrap_or(false)
-                || nfo_parser::find_nfo_for_media(Path::new(&target.path)).is_some();
+                || nfo_has_title(&target.path).await;
             apply_season(
                 pool,
                 &mut working,
@@ -340,6 +436,12 @@ async fn refresh_series_children(
             )
             .await?;
         }
+    }
+    if asked {
+        let ids: Vec<Uuid> = targets.iter().map(|(t, _)| t.id).collect();
+        rustyfin_db::repo_media::mark_provider_refreshed(pool, &ids)
+            .await
+            .map_err(|e| e.to_string())?;
     }
     Ok(())
 }

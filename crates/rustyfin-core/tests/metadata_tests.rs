@@ -529,7 +529,8 @@ fn r1scan_movie_meta() -> rustyfin_model::metadata::ExternalMetadata {
 impl rustyfin_model::metadata::MetadataLookups for R1Lookups {
     fn movie_by_id(&self, id: i64) -> R1Lookup<'_, rustyfin_model::metadata::ExternalMetadata> {
         self.0.lock().unwrap().movie_ids.push(id);
-        Box::pin(async { Some(r1scan_movie_meta()) })
+        // Id 404 is gone from the provider
+        Box::pin(async move { (id != 404).then(r1scan_movie_meta) })
     }
 
     fn series_by_id(&self, _id: i64) -> R1Lookup<'_, rustyfin_model::metadata::ExternalMetadata> {
@@ -704,6 +705,30 @@ async fn r1scan_movie_takes_title_imdb_people_and_premiere() {
     assert_eq!(calls.lock().unwrap().movie_searches.len(), 1);
     assert_eq!(calls.lock().unwrap().movie_ids, [954]);
     assert_eq!(r1scan_people(pool, read.id).await, people);
+}
+
+/// Review I1: an item whose provider id is gone (a by-id miss) stays as it is; it isn't searched
+/// by name, which could give it another item's title and data under the old id.
+#[tokio::test]
+async fn r1scan_gone_provider_id_is_not_searched() {
+    let fx = Fixture::new().await;
+    let pool = &fx.pool;
+    let mut read = fx.movie("Kept Name", None).await;
+    read.tmdb_id = Some(404);
+    rustyfin_db::repo_media::upsert_media_item(pool, &read)
+        .await
+        .unwrap();
+    let (pm, calls) = r1scan_manager().await;
+
+    rustyfin_core::metadata::refresh_item_metadata(pool, &reqwest::Client::new(), &read, &pm)
+        .await
+        .unwrap();
+
+    assert_eq!(calls.lock().unwrap().movie_ids, [404]);
+    assert!(calls.lock().unwrap().movie_searches.is_empty());
+    let after = stored(pool, read.id).await;
+    assert_eq!(after.name, "Kept Name");
+    assert_eq!(r1scan_imdb(pool, read.id).await, None);
 }
 
 /// A locked name, or an NFO's title, is not replaced by the provider's.

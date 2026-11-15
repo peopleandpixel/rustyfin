@@ -4119,18 +4119,18 @@ async fn b134c_metadata_refresh_skips_identified_items() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    // Only the unidentified item is searched (under its name and then its file name).
+    // Neither is searched: the identified item is skipped, and since R1 (review L1, the PM's
+    // decision) the task never searches by name, so the unidentified one isn't either.
     let searched = searched.lock().unwrap().clone();
-    assert!(!searched.is_empty(), "nothing was searched");
-    assert!(
-        searched.iter().all(|name| name.contains("Unknown Film")),
-        "{searched:?}"
-    );
+    assert!(searched.is_empty(), "{searched:?}");
 }
 
-// R1 scan (upgrades): with a provider that looks items up by id, the metadata refresh run asks
-// again, by id and without a search, about identified items stored before premiere dates were
-// (no premiere date); an item with one is still skipped.
+// R1 scan (upgrades; review L1, L2): with a provider that looks items up by id, the "Refresh
+// metadata" task asks once, by id and without a search, about movies and series identified
+// before premiere dates were stored (no premiere date), fills a series' seasons and episodes
+// from one season lookup, skips movies and series without a TMDb id (no search, no rename) and
+// those with a premiere date, and a second run asks the provider nothing, though TMDb gave one
+// movie no premiere date.
 #[tokio::test]
 async fn r1scan_metadata_refresh_upgrades_identified_items_by_id() {
     use rustyfin_core::scheduler::TASK_METADATA_REFRESH;
@@ -4145,27 +4145,51 @@ async fn r1scan_metadata_refresh_upgrades_identified_items_by_id() {
     type Images = Pin<Box<dyn Future<Output = Vec<MetadataImage>> + Send>>;
     type Lookup<'a, T> = Pin<Box<dyn Future<Output = Option<T>> + Send + 'a>>;
 
-    struct ById(Arc<Mutex<Vec<i64>>>);
+    /// Every lookup, as "movie 77", "series 90", "search ..." or "season 90/1".
+    struct ById(Arc<Mutex<Vec<String>>>);
     impl MetadataLookups for ById {
         fn movie_by_id(&self, id: i64) -> Lookup<'_, ExternalMetadata> {
-            self.0.lock().unwrap().push(id);
+            self.0.lock().unwrap().push(format!("movie {id}"));
             Box::pin(async move {
                 Some(ExternalMetadata {
                     tmdb_id: Some(id),
-                    premiere_date: Some("2001-02-03".to_string()),
-                    imdb_id: Some("tt0000077".to_string()),
+                    // TMDb has no date for movie 79
+                    premiere_date: (id != 79).then(|| "2001-02-03".to_string()),
+                    imdb_id: Some(format!("tt00000{id}")),
                     ..Default::default()
                 })
             })
         }
-        fn series_by_id(&self, _: i64) -> Lookup<'_, ExternalMetadata> {
+        fn series_by_id(&self, id: i64) -> Lookup<'_, ExternalMetadata> {
+            self.0.lock().unwrap().push(format!("series {id}"));
+            Box::pin(async move {
+                Some(ExternalMetadata {
+                    tmdb_id: Some(id),
+                    ..Default::default()
+                })
+            })
+        }
+        fn search_series(&self, name: &str, _: Option<i32>) -> Lookup<'_, ExternalMetadata> {
+            self.0.lock().unwrap().push(format!("search {name}"));
             Box::pin(async { None })
         }
-        fn search_series(&self, _: &str, _: Option<i32>) -> Lookup<'_, ExternalMetadata> {
-            Box::pin(async { None })
-        }
-        fn season(&self, _: i64, _: i32) -> Lookup<'_, SeasonMetadata> {
-            Box::pin(async { None })
+        fn season(&self, series: i64, season: i32) -> Lookup<'_, SeasonMetadata> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("season {series}/{season}"));
+            Box::pin(async {
+                Some(SeasonMetadata {
+                    meta: ExternalMetadata::default(),
+                    episodes: vec![(
+                        1,
+                        ExternalMetadata {
+                            name: Some("Upgraded Pilot".to_string()),
+                            ..Default::default()
+                        },
+                    )],
+                })
+            })
         }
     }
 
@@ -4173,34 +4197,138 @@ async fn r1scan_metadata_refresh_upgrades_identified_items_by_id() {
     let lib = fx.library("R1 Film", LibraryContentType::Movies).await;
     let root = root_of(&lib);
     let old_id = Uuid::new_v4();
-    for (id, name, tmdb_id, premiere) in [
-        (old_id, "Old Film", 77, None),
-        (
-            Uuid::new_v4(),
-            "Current Film",
-            78,
-            Some("2002-01-01T00:00:00+00:00"),
-        ),
-    ] {
-        let path = root.join(format!("{name} (2001)/{name} (2001).mkv"));
-        sqlx::query(
-            "INSERT INTO media_items (id, library_id, name, media_type, path, tmdb_id, premiere_date) \
-             VALUES (?, ?, ?, 'Movie', ?, ?, ?)",
-        )
-        .bind(id.to_string())
-        .bind(lib.id.to_string())
-        .bind(name)
-        .bind(path.to_str().unwrap())
-        .bind(tmdb_id)
-        .bind(premiere)
-        .execute(&fx.pool)
-        .await
-        .unwrap();
-    }
+    let unknown_id = Uuid::new_v4();
+    let (series_id, season_id, episode_id) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    let insert = |id: Uuid,
+                  name: &'static str,
+                  kind: &'static str,
+                  parent: Option<Uuid>,
+                  tmdb: Option<i64>,
+                  tvdb: Option<i64>,
+                  premiere: Option<&'static str>,
+                  numbers: (Option<i32>, Option<i32>)| {
+        let pool = fx.pool.clone();
+        let path = root.join(name);
+        let lib = lib.id;
+        async move {
+            sqlx::query(
+                "INSERT INTO media_items (id, library_id, name, media_type, path, parent_id, \
+                 tmdb_id, tvdb_id, premiere_date, index_number, parent_index_number) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(id.to_string())
+            .bind(lib.to_string())
+            .bind(name)
+            .bind(kind)
+            .bind(path.to_str().unwrap())
+            .bind(parent.map(|p| p.to_string()))
+            .bind(tmdb)
+            .bind(tvdb)
+            .bind(premiere)
+            .bind(numbers.0)
+            .bind(numbers.1)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+    };
+    let none = (None, None);
+    insert(
+        old_id,
+        "Old Film",
+        "Movie",
+        None,
+        Some(77),
+        None,
+        None,
+        none,
+    )
+    .await;
+    insert(
+        Uuid::new_v4(),
+        "Dateless Film",
+        "Movie",
+        None,
+        Some(79),
+        None,
+        None,
+        none,
+    )
+    .await;
+    let dated = Some("2002-01-01T00:00:00+00:00");
+    insert(
+        Uuid::new_v4(),
+        "Current Film",
+        "Movie",
+        None,
+        Some(78),
+        None,
+        dated,
+        none,
+    )
+    .await;
+    insert(
+        unknown_id,
+        "Unknown Film",
+        "Movie",
+        None,
+        None,
+        None,
+        None,
+        none,
+    )
+    .await;
+    insert(
+        Uuid::new_v4(),
+        "Tvdb Show",
+        "Series",
+        None,
+        None,
+        Some(5),
+        None,
+        none,
+    )
+    .await;
+    insert(
+        series_id,
+        "Old Show",
+        "Series",
+        None,
+        Some(90),
+        None,
+        None,
+        none,
+    )
+    .await;
+    let season_numbers = (Some(1), None);
+    insert(
+        season_id,
+        "Old Show/Season 1",
+        "Season",
+        Some(series_id),
+        None,
+        None,
+        None,
+        season_numbers,
+    )
+    .await;
+    let episode_numbers = (Some(1), Some(1));
+    insert(
+        episode_id,
+        "Old Show/Season 1/E1.mkv",
+        "Episode",
+        Some(season_id),
+        None,
+        None,
+        None,
+        episode_numbers,
+    )
+    .await;
 
     let pm = rustyfin_core::plugin_manager::PluginManager::new(&fx.dir);
     let searched: Arc<Mutex<Vec<String>>> = Arc::default();
     let seen = searched.clone();
+    let seen_tv = searched.clone();
     pm.register_metadata_provider(
         "r1".to_string(),
         "r1".to_string(),
@@ -4209,13 +4337,16 @@ async fn r1scan_metadata_refresh_upgrades_identified_items_by_id() {
             seen.lock().unwrap().push(name.to_string());
             Box::pin(async { None })
         },
-        |_: &reqwest::Client, _: &str| -> Found { Box::pin(async { None }) },
+        move |_: &reqwest::Client, name: &str| -> Found {
+            seen_tv.lock().unwrap().push(name.to_string());
+            Box::pin(async { None })
+        },
         |_: &reqwest::Client, _: Option<i64>, _: Option<i64>, _| -> Images {
             Box::pin(async { Vec::new() })
         },
     )
     .await;
-    let asked: Arc<Mutex<Vec<i64>>> = Arc::default();
+    let asked: Arc<Mutex<Vec<String>>> = Arc::default();
     pm.register_metadata_lookups("r1", Arc::new(ById(asked.clone())))
         .await;
     let sched = TaskScheduler::with_plugin_manager(
@@ -4224,35 +4355,66 @@ async fn r1scan_metadata_refresh_upgrades_identified_items_by_id() {
         reqwest::Client::new(),
         pm,
     );
-    assert!(sched.start_task(TASK_METADATA_REFRESH).await);
+    let run = || async {
+        let before = sched
+            .get_task(TASK_METADATA_REFRESH)
+            .await
+            .unwrap()
+            .last_execution_result
+            .map(|r| r.end_time_utc);
+        assert!(sched.start_task(TASK_METADATA_REFRESH).await);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let ended = sched
+                .get_task(TASK_METADATA_REFRESH)
+                .await
+                .unwrap()
+                .last_execution_result
+                .map(|r| r.end_time_utc);
+            if ended.is_some() && ended != before {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the refresh did not end within 60 s"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    while sched
-        .get_task(TASK_METADATA_REFRESH)
-        .await
-        .unwrap()
-        .last_execution_result
-        .is_none()
-    {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the refresh did not end within 60 s"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert_eq!(*asked.lock().unwrap(), [77]);
-    assert!(
-        searched.lock().unwrap().is_empty(),
-        "an identified item was searched"
-    );
-    let old = rustyfin_db::repo_media::get_item_by_id(&fx.pool, old_id)
-        .await
-        .unwrap()
-        .unwrap();
+    run().await;
+    let mut first = asked.lock().unwrap().clone();
+    first.sort();
+    assert_eq!(first, ["movie 77", "movie 79", "season 90/1", "series 90"]);
+    assert!(searched.lock().unwrap().is_empty(), "{searched:?}");
+    let get = |id: Uuid| {
+        let pool = fx.pool.clone();
+        async move {
+            rustyfin_db::repo_media::get_item_by_id(&pool, id)
+                .await
+                .unwrap()
+                .unwrap()
+        }
+    };
     assert_eq!(
-        old.premiere_date.map(|d| d.date_naive().to_string()),
+        get(old_id)
+            .await
+            .premiere_date
+            .map(|d| d.date_naive().to_string()),
         Some("2001-02-03".to_string())
     );
+    assert_eq!(get(unknown_id).await.name, "Unknown Film", "renamed");
+    assert_eq!(get(episode_id).await.name, "Upgraded Pilot");
+
+    // A second run asks for nothing, the dateless movie and the filled series included
+    asked.lock().unwrap().clear();
+    run().await;
+    assert!(
+        asked.lock().unwrap().is_empty(),
+        "{:?}",
+        asked.lock().unwrap()
+    );
+    assert!(searched.lock().unwrap().is_empty(), "{searched:?}");
 }
 
 // B30: a scheduled scan tells the server, so that it can drop what it cached from before.

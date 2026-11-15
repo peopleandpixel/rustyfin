@@ -207,8 +207,14 @@ pub async fn scan_with_metadata(
                 let pm = plugin_manager.clone();
                 let handle = tokio::spawn(async move {
                     let _perm = sem.acquire().await;
-                    if let Err(e) =
-                        crate::metadata::refresh_item_metadata(&pool, &client, &item, &pm).await
+                    if let Err(e) = crate::metadata::refresh_item_metadata_with(
+                        &pool,
+                        &client,
+                        &item,
+                        &pm,
+                        crate::metadata::RefreshOptions::SCAN,
+                    )
+                    .await
                     {
                         tracing::warn!("metadata refresh failed for '{}': {}", item.name, e);
                     }

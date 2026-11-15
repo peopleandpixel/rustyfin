@@ -3081,6 +3081,47 @@ pub async fn set_imdb_id_if_missing(
     Ok(done.rows_affected() > 0)
 }
 
+/// Records that a metadata provider answered for these items now (`provider_refreshed_at`).
+pub async fn mark_provider_refreshed(
+    pool: &SqlitePool,
+    item_ids: &[Uuid],
+) -> Result<(), sqlx::Error> {
+    let now = Utc::now().to_rfc3339();
+    for id in item_ids {
+        sqlx::query(
+            "INSERT INTO item_metadata_extras (item_id, provider_refreshed_at) VALUES (?, ?) \
+             ON CONFLICT(item_id) DO UPDATE SET provider_refreshed_at = excluded.provider_refreshed_at",
+        )
+        .bind(id.to_string())
+        .bind(&now)
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
+/// The ids among `item_ids` that a metadata provider has answered for (`mark_provider_refreshed`).
+pub async fn provider_refreshed_ids(
+    pool: &SqlitePool,
+    item_ids: &[Uuid],
+) -> Result<std::collections::HashSet<Uuid>, sqlx::Error> {
+    let mut out = std::collections::HashSet::new();
+    for chunk in item_ids.chunks(500) {
+        let mut qb = QueryBuilder::<sqlx::Sqlite>::new(
+            "SELECT item_id FROM item_metadata_extras \
+             WHERE provider_refreshed_at IS NOT NULL AND item_id IN (",
+        );
+        let mut sep = qb.separated(", ");
+        for id in chunk {
+            sep.push_bind(id.to_string());
+        }
+        qb.push(")");
+        let rows: Vec<(String,)> = qb.build_query_as().fetch_all(pool).await?;
+        out.extend(rows.into_iter().filter_map(|(id,)| id.parse::<Uuid>().ok()));
+    }
+    Ok(out)
+}
+
 /// Whether an item's metadata is locked against a refresh changing `field` (Jellyfin's
 /// LockData, or the field in LockedFields).
 pub async fn is_field_locked(
