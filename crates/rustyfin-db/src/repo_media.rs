@@ -1775,11 +1775,17 @@ pub async fn series_ids_with_status(
 }
 
 /// Get filter values from materialized index tables.
-/// Falls back to DISTINCT queries if indexes are empty.
+/// Falls back to DISTINCT queries if indexes are empty. The indexes cover every library, so one
+/// library's values always come from the DISTINCT queries.
+/// `item_types` (`IncludeItemTypes`) narrows the DISTINCT queries to those types.
 pub async fn get_filters(
     pool: &SqlitePool,
-    _library_id: Option<Uuid>,
+    library_id: Option<Uuid>,
+    item_types: &[String],
 ) -> Result<(Vec<String>, Vec<i32>, Vec<String>), sqlx::Error> {
+    if library_id.is_some() || !item_types.is_empty() {
+        return get_filters_distinct(pool, library_id, item_types).await;
+    }
     // Try materialized index tables first
     let genre_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM filter_genre_index")
         .fetch_one(pool)
@@ -1806,7 +1812,7 @@ pub async fn get_filters(
         Ok((genres, years, ratings))
     } else {
         // Fallback to DISTINCT queries
-        get_filters_distinct(pool, _library_id).await
+        get_filters_distinct(pool, library_id, item_types).await
     }
 }
 
@@ -1814,16 +1820,32 @@ pub async fn get_filters(
 async fn get_filters_distinct(
     pool: &SqlitePool,
     library_id: Option<Uuid>,
+    item_types: &[String],
 ) -> Result<(Vec<String>, Vec<i32>, Vec<String>), sqlx::Error> {
-    let lid = library_id.map(|u| u.to_string()).unwrap_or_default();
+    // `SELECT DISTINCT <column> FROM media_items WHERE <column> IS NOT NULL`, in the library and of
+    // the types when given.
+    let distinct = |column: &str| {
+        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(format!(
+            "SELECT DISTINCT {column} FROM media_items WHERE {column} IS NOT NULL"
+        ));
+        if let Some(id) = library_id {
+            qb.push(" AND library_id = ").push_bind(id.to_string());
+        }
+        if !item_types.is_empty() {
+            qb.push(" AND media_type IN (");
+            let mut list = qb.separated(", ");
+            for item_type in item_types {
+                list.push_bind(item_type.clone());
+            }
+            qb.push(")");
+        }
+        qb
+    };
 
-    let genre_strs: Vec<String> = sqlx::query_scalar::<_, String>(
-        "SELECT DISTINCT genres FROM media_items WHERE (? = '' OR library_id = ?)",
-    )
-    .bind(&lid)
-    .bind(lid.clone())
-    .fetch_all(pool)
-    .await?;
+    let genre_strs: Vec<String> = distinct("genres")
+        .build_query_scalar()
+        .fetch_all(pool)
+        .await?;
     let mut all_genres: Vec<String> = Vec::new();
     for gs in &genre_strs {
         for g in gs.split('|') {
@@ -1835,25 +1857,13 @@ async fn get_filters_distinct(
     }
     all_genres.sort();
 
-    let years: Vec<i32> = sqlx::query_scalar::<_, i32>(
-        "SELECT DISTINCT production_year FROM media_items \
-         WHERE production_year IS NOT NULL AND (? = '' OR library_id = ?) \
-         ORDER BY production_year DESC",
-    )
-    .bind(&lid)
-    .bind(lid.clone())
-    .fetch_all(pool)
-    .await?;
+    let mut years = distinct("production_year");
+    years.push(" ORDER BY production_year DESC");
+    let years: Vec<i32> = years.build_query_scalar().fetch_all(pool).await?;
 
-    let ratings: Vec<String> = sqlx::query_scalar::<_, String>(
-        "SELECT DISTINCT official_rating FROM media_items \
-         WHERE official_rating IS NOT NULL AND (? = '' OR library_id = ?) \
-         ORDER BY official_rating",
-    )
-    .bind(&lid)
-    .bind(lid.clone())
-    .fetch_all(pool)
-    .await?;
+    let mut ratings = distinct("official_rating");
+    ratings.push(" ORDER BY official_rating");
+    let ratings: Vec<String> = ratings.build_query_scalar().fetch_all(pool).await?;
 
     Ok((all_genres, years, ratings))
 }

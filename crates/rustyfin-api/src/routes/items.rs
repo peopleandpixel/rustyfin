@@ -2789,6 +2789,23 @@ struct FiltersQuery {
     parent_id: Option<Uuid>,
     #[serde(rename = "parentId")]
     parent_id_lower: Option<Uuid>,
+    include_item_types: Option<String>,
+    #[serde(rename = "includeItemTypes")]
+    include_item_types_lower: Option<String>,
+}
+
+impl FiltersQuery {
+    /// The `IncludeItemTypes` list, without empty entries.
+    fn item_types(&self) -> Vec<String> {
+        self.include_item_types
+            .as_deref()
+            .or(self.include_item_types_lower.as_deref())
+            .into_iter()
+            .flat_map(|types| types.split(','))
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect()
+    }
 }
 
 async fn get_filters(
@@ -2796,7 +2813,12 @@ async fn get_filters(
     Query(query): Query<FiltersQuery>,
 ) -> Result<Json<FiltersResult>, ApiError> {
     let library_id = query.parent_id.or(query.parent_id_lower);
-    let cache_key = library_id.map_or("all".to_string(), |id| id.to_string());
+    let item_types = query.item_types();
+    let cache_key = format!(
+        "{}:{}",
+        library_id.map_or("all".to_string(), |id| id.to_string()),
+        item_types.join(",")
+    );
     // Check cache first
     if let Some(cached) = state.cache.filter_lists.get(&cache_key)
         && let Ok(filters) = serde_json::from_value(cached.clone())
@@ -2804,7 +2826,7 @@ async fn get_filters(
         return Ok(Json(filters));
     }
     let (genres, years, official_ratings) =
-        rustyfin_db::repo_media::get_filters(&state.db_ro, library_id).await?;
+        rustyfin_db::repo_media::get_filters(&state.db_ro, library_id, &item_types).await?;
     let result = FiltersResult {
         genres,
         years,
@@ -2824,7 +2846,8 @@ async fn get_filters2(
     Query(query): Query<FiltersQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let library_id = query.parent_id.or(query.parent_id_lower);
-    let (genres, _, _) = rustyfin_db::repo_media::get_filters(&state.db_ro, library_id).await?;
+    let (genres, _, _) =
+        rustyfin_db::repo_media::get_filters(&state.db_ro, library_id, &query.item_types()).await?;
     let genres: Vec<Value> = genres
         .into_iter()
         .map(|name| {

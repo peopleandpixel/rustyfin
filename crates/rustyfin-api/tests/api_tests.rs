@@ -15603,6 +15603,13 @@ async fn w1filters_names(
 /// watch data on three of the movies. Returns the app, the token and the library.
 async fn w1filters_seed() -> (axum::Router, String, uuid::Uuid) {
     let state = test_state().await;
+    let (token, library) = w1filters_seed_into(&state).await;
+    (app(state), token, library)
+}
+
+/// Seeds the W1 library into `state`; returns an administrator's token and the library.
+async fn w1filters_seed_into(state: &AppState) -> (String, uuid::Uuid) {
+    let state = state.clone();
     let library = j6_library(&state, "W1 Library").await;
     let (token, admin) = admin_session(&state).await;
     for (name, kind, genres, rating, year, status) in [
@@ -15649,7 +15656,49 @@ async fn w1filters_seed() -> (axum::Router, String, uuid::Uuid) {
             .unwrap();
         }
     }
-    (app(state), token, library)
+    (token, library)
+}
+
+#[tokio::test]
+async fn w1filters_filter_lists_are_the_librarys() {
+    let state = test_state().await;
+    let (token, library) = w1filters_seed_into(&state).await;
+    // Another library's values, also in the server-wide index.
+    let other = j6_library(&state, "W1 Other").await;
+    let western = j6_add_item(&state, other, None, "Golf", "Movie").await;
+    sqlx::query("UPDATE media_items SET genres = 'Western', official_rating = 'G' WHERE id = ?")
+        .bind(western.to_string())
+        .execute(&state.db)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO filter_genre_index (genre) VALUES ('Western'), ('Drama')")
+        .execute(&state.db)
+        .await
+        .unwrap();
+    let app = app(state);
+    let filters = |params: String| {
+        let (app, token) = (app.clone(), token.clone());
+        async move { b27_answer(&app, &format!("/Items/Filters?{params}"), &token).await }
+    };
+    let all = filters(format!("ParentId={library}")).await;
+    assert_eq!(
+        all["Genres"],
+        serde_json::json!(["Action", "Comedy", "Drama", "Drama, Romance", "Horror"])
+    );
+    assert_eq!(
+        all["OfficialRatings"],
+        serde_json::json!(["PG-13", "R", "TV-14", "TV-MA"])
+    );
+    let movies = filters(format!("ParentId={library}&IncludeItemTypes=Movie")).await;
+    assert_eq!(
+        movies["Genres"],
+        serde_json::json!(["Action", "Comedy", "Drama", "Drama, Romance", "Horror"])
+    );
+    assert_eq!(movies["Years"], serde_json::json!([2003, 2002, 2001]));
+    assert_eq!(movies["OfficialRatings"], serde_json::json!(["PG-13", "R"]));
+    let series = filters(format!("ParentId={library}&IncludeItemTypes=Series")).await;
+    assert_eq!(series["Genres"], serde_json::json!(["Comedy", "Drama"]));
+    assert_eq!(series["Years"], serde_json::json!([2011, 2010]));
 }
 
 #[tokio::test]
