@@ -84,6 +84,7 @@ async fn test_state() -> AppState {
         known_proxies: Arc::new(Vec::new()),
         ws_broadcast: ws_tx,
         log_level_tx: _log_level_tx,
+        live_log: Default::default(),
         cache,
         image_cache,
         http_client: reqwest::Client::new(),
@@ -30169,6 +30170,66 @@ async fn b17_new_socket_lists_the_scans_in_progress() {
         "no scan is in progress"
     );
 }
+
+// R3 live log: LiveLogStart replays the kept lines, then sends new ones, to an administrator only.
+
+fn r3livelog_line(message: &str) -> rustyfin_model::ws_event::LogMessageData {
+    rustyfin_model::ws_event::LogMessageData {
+        timestamp: "2026-11-15T10:00:00.000+00:00".to_string(),
+        level: "INFO".to_string(),
+        message: message.to_string(),
+        target: Some("rustyfin_core::scanner".to_string()),
+    }
+}
+
+/// The messages of the socket's next `count` LogMessage frames.
+async fn r3livelog_next(socket: &mut G1cSocket, count: usize) -> Vec<serde_json::Value> {
+    let mut frames = Vec::new();
+    while frames.len() < count {
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+            .await
+            .expect("a log line within 5 s");
+        if frame["MessageType"] == "LogMessage" {
+            frames.push(frame["Data"].clone());
+        }
+    }
+    frames
+}
+
+#[tokio::test]
+async fn r3livelog_socket_replays_the_history_before_new_lines() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, viewer, _) = g1_owner_and_viewer(&state, &app).await;
+    let addr = b17_serve(&app).await;
+    state.live_log.push(r3livelog_line("first"));
+    state.live_log.push(r3livelog_line("second task=3"));
+
+    let mut socket = G1cSocket::open(addr, &owner).await;
+    r3tasks_send(&mut socket, r#"{"MessageType":"LiveLogStart"}"#).await;
+    let replay = r3livelog_next(&mut socket, 2).await;
+    assert_eq!(replay[0]["Message"], "first");
+    assert_eq!(replay[1]["Message"], "second task=3");
+    assert_eq!(replay[1]["Level"], "INFO");
+    assert_eq!(replay[1]["Target"], "rustyfin_core::scanner");
+    assert_eq!(replay[1]["Timestamp"], "2026-11-15T10:00:00.000+00:00");
+
+    state.live_log.push(r3livelog_line("third"));
+    assert_eq!(r3livelog_next(&mut socket, 1).await[0]["Message"], "third");
+
+    // A user who is not an administrator gets no log lines, neither the replay nor new ones.
+    let mut other = G1cSocket::open(addr, &viewer).await;
+    r3tasks_send(&mut other, r#"{"MessageType":"LiveLogStart"}"#).await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    state.live_log.push(r3livelog_line("fourth"));
+    assert_eq!(r3livelog_next(&mut socket, 1).await[0]["Message"], "fourth");
+    let marker = WsEvent::LibraryChanged {
+        data: serde_json::json!({ "LibraryName": "g1c-end" }),
+    };
+    state.ws_broadcast.send(marker).unwrap();
+    assert_eq!(other.until_end().await, Vec::<String>::new());
+}
+
 
 // ── B18: one scan per run, and Scan all's order ──
 // A manual scan of a library that Scan all has queued but not reached runs at once, and Scan all
