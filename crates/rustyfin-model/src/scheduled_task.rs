@@ -4,6 +4,12 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "PascalCase")]
 pub struct ScheduledTaskInfo {
     pub id: String,
+    /// Jellyfin's stable task key (`RefreshLibrary`, ...). Jellyfin Web finds tasks by it.
+    #[serde(default)]
+    pub key: String,
+    /// Hidden tasks are left out of `GET /ScheduledTasks?isHidden=false`. None is hidden.
+    #[serde(default)]
+    pub is_hidden: bool,
     pub name: String,
     pub description: String,
     pub category: String,

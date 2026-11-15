@@ -5,8 +5,7 @@ use axum::{Extension, Json, Router};
 use rustyfin_model::auth::Claims;
 use rustyfin_model::media::MediaItem;
 use rustyfin_model::session::{
-    ClientCapabilities, DeviceInfoQueryResult, SessionCapabilitiesRequest, SessionCommand,
-    SessionInfo,
+    ClientCapabilities, SessionCapabilitiesRequest, SessionCommand, SessionInfo,
 };
 use serde::Deserialize;
 
@@ -45,15 +44,10 @@ pub fn routes() -> Router<AppState> {
         .route("/Devices/{deviceId}/Command", post(send_device_command))
 }
 
-/// Administrator-only device routes. `routes::build_router` wraps them in `require_admin`.
+/// Administrator-only device routes. `routes::build_router` wraps them in `require_admin`. The
+/// device list, info and options are in `devices::routes`.
 pub fn admin_routes() -> Router<AppState> {
-    Router::new()
-        .route("/Devices", delete(delete_device))
-        .route("/Devices/Info", get(get_devices_info))
-        .route(
-            "/Devices/Options",
-            get(get_device_options).post(update_device_options),
-        )
+    Router::new().route("/Devices", delete(delete_device))
 }
 
 async fn get_sessions(
@@ -151,17 +145,6 @@ async fn send_command(
 #[derive(Debug, Deserialize)]
 pub struct DeviceIdQuery {
     pub id: String,
-}
-
-async fn get_devices(
-    State(state): State<AppState>,
-) -> Result<Json<DeviceInfoQueryResult>, ApiError> {
-    let devices = rustyfin_db::repo_session::get_all_devices(&state.db_ro).await?;
-    let count = devices.len();
-    Ok(Json(DeviceInfoQueryResult {
-        items: devices,
-        total_record_count: count,
-    }))
 }
 
 async fn delete_device(
@@ -415,32 +398,5 @@ async fn session_capabilities_full(
     let caps = build_capabilities_from_request(&req);
     let token = token.as_ref().map(|Extension(rt)| rt.0.as_str());
     update_user_capabilities(&state, claims.sub, token, &caps).await?;
-    Ok(Json(serde_json::json!({})))
-}
-
-/// GET /Devices/Info
-async fn get_devices_info(
-    State(state): State<AppState>,
-) -> Result<Json<DeviceInfoQueryResult>, ApiError> {
-    get_devices(State(state)).await
-}
-
-/// GET /Devices/Options
-async fn get_device_options(
-    State(_state): State<AppState>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    Ok(Json(serde_json::json!({
-        "CommandCapabilities": [],
-        "PlayableMediaTypes": ["Audio", "Video"],
-        "SupportedCommands": ["MoveUp", "MoveDown", "MoveLeft", "MoveRight"],
-        "SupportsMediaControl": true
-    })))
-}
-
-/// POST /Devices/Options
-async fn update_device_options(
-    State(_state): State<AppState>,
-    Json(_body): Json<serde_json::Value>,
-) -> Result<Json<serde_json::Value>, ApiError> {
     Ok(Json(serde_json::json!({})))
 }

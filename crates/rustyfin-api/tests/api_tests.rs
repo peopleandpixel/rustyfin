@@ -2062,6 +2062,544 @@ async fn test_get_user_views_with_library() {
     assert_eq!(items[0]["Type"], "CollectionFolder");
 }
 
+// R2 admin: the admin routes answer as Jellyfin 12.4.0's
+
+/// A server with an administrator, a non-admin "r2bob" and one movie library. Returns the app,
+/// the admin token, bob's token and id, and the library's folder path.
+async fn r2admin_world() -> (AppState, axum::Router, String, (String, uuid::Uuid), String) {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (admin, _) = admin_session(&state).await;
+    let bob = b38_user(&state, "r2bob", false).await;
+    let path = media_folder(&state, "r2-movies");
+    let body = serde_json::json!({ "Name": "R2 Movies", "ContentType": "Movies", "Paths": [path] });
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        "/Library/VirtualFolders",
+        &admin,
+        Some(&body.to_string()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    (state, app, admin, bob, path)
+}
+
+#[tokio::test]
+async fn r2admin_virtual_folders_carry_jellyfin_names() {
+    let (_state, app, admin, _bob, path) = r2admin_world().await;
+    let (status, json) = send_authed(&app, "GET", "/Library/VirtualFolders", &admin, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let lib = &json[0];
+    assert_eq!(lib["ItemId"], lib["Id"], "{lib}");
+    assert_eq!(lib["CollectionType"], "movies", "{lib}");
+    assert_eq!(lib["Locations"], serde_json::json!([path]), "{lib}");
+    assert_eq!(lib["RefreshStatus"], "Idle", "{lib}");
+    // Rustyfin's own names stay for its web client.
+    assert_eq!(lib["ContentType"], "Movies", "{lib}");
+    assert_eq!(lib["Paths"], serde_json::json!([path]), "{lib}");
+}
+
+#[tokio::test]
+async fn r2admin_media_folders_and_physical_paths() {
+    let (_state, app, admin, _bob, path) = r2admin_world().await;
+    let (status, json) = send_authed(&app, "GET", "/Library/MediaFolders", &admin, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["TotalRecordCount"], 1, "{json}");
+    assert_eq!(json["StartIndex"], 0, "{json}");
+    assert_eq!(json["Items"][0]["Name"], "R2 Movies", "{json}");
+    assert_eq!(json["Items"][0]["Type"], "CollectionFolder", "{json}");
+    assert_eq!(json["Items"][0]["CollectionType"], "movies", "{json}");
+
+    let (status, json) = send_authed(
+        &app,
+        "GET",
+        "/Library/MediaFolders?isHidden=true",
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["TotalRecordCount"], 0, "{json}");
+
+    let (status, json) = send_authed(&app, "GET", "/Library/PhysicalPaths", &admin, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json, serde_json::json!([path]));
+}
+
+#[tokio::test]
+async fn r2admin_scheduled_tasks_have_jellyfin_keys() {
+    let (_state, app, admin, _bob, _path) = r2admin_world().await;
+    let (status, json) =
+        send_authed(&app, "GET", "/ScheduledTasks?isHidden=false", &admin, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let tasks = json.as_array().unwrap();
+    let keys: Vec<&str> = tasks.iter().filter_map(|t| t["Key"].as_str()).collect();
+    for key in [
+        "RefreshLibrary",
+        "DeleteTranscodeFiles",
+        "OptimizeDatabaseTask",
+        "TaskExtractMediaSegments",
+        "CleanActivityLog",
+    ] {
+        assert!(keys.contains(&key), "{key} missing from {keys:?}");
+    }
+    assert!(tasks.iter().all(|t| t["IsHidden"] == false), "{json}");
+    // The library scan keeps its id, which POST /ScheduledTasks/Running/{id} takes.
+    let scan = tasks.iter().find(|t| t["Key"] == "RefreshLibrary").unwrap();
+    assert_eq!(scan["Id"], "LibraryScan");
+
+    let (status, json) =
+        send_authed(&app, "GET", "/ScheduledTasks?isHidden=true", &admin, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json, serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn r2admin_clean_activity_log_task_deletes_old_entries() {
+    let (state, app, admin, _bob, _path) = r2admin_world().await;
+    for name in ["r2 old", "r2 new"] {
+        rustyfin_db::repo_activity::log_activity(
+            &state.db,
+            name,
+            "Test",
+            None,
+            None,
+            "Information",
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    sqlx::query("UPDATE activity_log SET date = datetime('now', '-31 days') WHERE name = 'r2 old'")
+        .execute(&state.db)
+        .await
+        .unwrap();
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        "/ScheduledTasks/Running/CleanActivityLog",
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let names = || async {
+        sqlx::query_scalar::<_, String>("SELECT name FROM activity_log WHERE name LIKE 'r2 %'")
+            .fetch_all(&state.db)
+            .await
+            .unwrap()
+    };
+    for _ in 0..100 {
+        if names().await == ["r2 new"] {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("the old entry is still there: {:?}", names().await);
+}
+
+#[tokio::test]
+async fn r2admin_devices_list_as_jellyfin() {
+    let (state, app, admin, bob, _path) = r2admin_world().await;
+    rustyfin_db::repo_session::upsert_device(
+        &state.db, "r2-dev", "Bob's TV", "R2 App", "1.2", bob.1,
+    )
+    .await
+    .unwrap();
+
+    let (status, json) = send_authed(&app, "GET", "/Devices", &admin, None).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["TotalRecordCount"], 1, "{json}");
+    assert_eq!(json["StartIndex"], 0, "{json}");
+    let dev = &json["Items"][0];
+    assert_eq!(dev["Id"], "r2-dev", "{dev}");
+    assert_eq!(dev["Name"], "Bob's TV", "{dev}");
+    assert_eq!(dev["AppName"], "R2 App", "{dev}");
+    assert_eq!(dev["AppVersion"], "1.2", "{dev}");
+    assert_eq!(dev["LastUserId"], bob.1.to_string(), "{dev}");
+    assert_eq!(dev["LastUserName"], "r2bob", "{dev}");
+    assert!(
+        dev["DateLastActivated"].as_str().unwrap().ends_with('Z'),
+        "{dev}"
+    );
+    assert!(dev.get("AccessToken").is_none(), "{dev}");
+
+    // userId keeps that user's devices.
+    let other = uuid::Uuid::new_v4().simple();
+    let (_, json) = send_authed(
+        &app,
+        "GET",
+        &format!("/Devices?userId={other}"),
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(json["TotalRecordCount"], 0, "{json}");
+    let uri = format!("/Devices?userId={}", bob.1.simple());
+    let (_, json) = send_authed(&app, "GET", &uri, &admin, None).await;
+    assert_eq!(json["TotalRecordCount"], 1, "{json}");
+
+    // Info and Options, as Jellyfin Web's device page uses them.
+    let (status, json) = send_authed(&app, "GET", "/Devices/Info?id=r2-dev", &admin, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["Name"], "Bob's TV");
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        "/Devices/Options?id=r2-dev",
+        &admin,
+        Some(r#"{"CustomName":"Living room"}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, json) = send_authed(&app, "GET", "/Devices/Options?id=r2-dev", &admin, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["DeviceId"], "r2-dev");
+    assert_eq!(json["CustomName"], "Living room");
+    let (_, json) = send_authed(&app, "GET", "/Devices/Info?id=r2-dev", &admin, None).await;
+    assert_eq!(json["CustomName"], "Living room");
+
+    for uri in ["/Devices/Info?id=nope", "/Devices/Options?id=nope"] {
+        let (status, _) = send_authed(&app, "GET", uri, &admin, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+    }
+    let (status, _) = send_authed(&app, "GET", "/Devices/Info", &admin, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn r2admin_cultures_and_countries() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    // Open while the server has no users, for the setup wizard.
+    for uri in ["/Localization/Cultures", "/Localization/Countries"] {
+        let (status, json) = send(&app, request("GET", uri, None, None)).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert!(json.as_array().unwrap().len() > 100, "{uri}");
+    }
+    let bob = b38_user(&state, "r2bob", false).await;
+    for uri in ["/Localization/Cultures", "/Localization/Countries"] {
+        let (status, _) = send(&app, request("GET", uri, None, None)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri}");
+    }
+
+    let (status, json) = send_authed(&app, "GET", "/Localization/Cultures", &bob.0, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let german = json
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["TwoLetterISOLanguageName"] == "de")
+        .unwrap();
+    assert_eq!(german["Name"], "German");
+    assert_eq!(german["DisplayName"], "German");
+    assert_eq!(german["ThreeLetterISOLanguageName"], "deu");
+    assert_eq!(
+        german["ThreeLetterISOLanguageNames"],
+        serde_json::json!(["deu", "ger"])
+    );
+
+    let (status, json) = send_authed(&app, "GET", "/Localization/Countries", &bob.0, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let us = json
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["TwoLetterISORegionName"] == "US")
+        .unwrap();
+    assert_eq!(
+        us,
+        &serde_json::json!({
+            "Name": "US",
+            "DisplayName": "United States",
+            "TwoLetterISORegionName": "US",
+            "ThreeLetterISORegionName": "USA",
+        })
+    );
+}
+
+#[tokio::test]
+async fn r2admin_configuration_has_and_keeps_jellyfin_fields() {
+    let (_state, app, admin, bob, _path) = r2admin_world().await;
+    let (status, config) = send_authed(&app, "GET", "/System/Configuration", &admin, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(config["UICulture"], "en-US", "{config}");
+    assert_eq!(config["MinResumePct"], 5, "{config}");
+    assert_eq!(config["ActivityLogRetentionDays"], 30, "{config}");
+    assert_eq!(config["CorsHosts"], serde_json::json!(["*"]), "{config}");
+    assert_eq!(
+        config["MetadataOptions"].as_array().unwrap().len(),
+        9,
+        "{config}"
+    );
+    assert_eq!(
+        config["CastReceiverApplications"][0]["Id"], "F007D354",
+        "{config}"
+    );
+    assert_eq!(config["TrickplayOptions"]["Interval"], 10000, "{config}");
+
+    // Jellyfin Web posts the whole configuration back with its changes.
+    let mut changed = config.clone();
+    changed["MinResumePct"] = serde_json::json!(10);
+    changed["UICulture"] = serde_json::json!("de-DE");
+    changed["ServerName"] = serde_json::json!("R2 Server");
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        "/System/Configuration",
+        &admin,
+        Some(&changed.to_string()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, config) = send_authed(&app, "GET", "/System/Configuration", &admin, None).await;
+    assert_eq!(config["MinResumePct"], 10, "{config}");
+    assert_eq!(config["UICulture"], "de-DE", "{config}");
+    assert_eq!(config["ServerName"], "R2 Server", "{config}");
+    assert_eq!(config["MaxResumePct"], 90, "{config}");
+
+    // The admin-only key flags it carried were not stored, so a non-admin never sees them.
+    let (status, config) = send_authed(&app, "GET", "/System/Configuration", &bob.0, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(config.get("TmdbApiKeySet").is_none(), "{config}");
+    assert_eq!(config["MinResumePct"], 10, "{config}");
+
+    // A field by key still works, and the named key of a Jellyfin field too.
+    let (_, value) = send_authed(
+        &app,
+        "GET",
+        "/System/Configuration/ServerName",
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(value, "R2 Server");
+}
+
+#[tokio::test]
+async fn r2admin_encoding_configuration() {
+    let (_state, app, admin, _bob, _path) = r2admin_world().await;
+    let (status, encoding) =
+        send_authed(&app, "GET", "/System/Configuration/encoding", &admin, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(encoding["H264Crf"], 23, "{encoding}");
+    assert_eq!(encoding["HardwareAccelerationType"], "none", "{encoding}");
+    assert_eq!(encoding["DeinterlaceMethod"], "yadif", "{encoding}");
+    assert_eq!(
+        encoding["HlsAudioSeekStrategy"], "TrimCopiedAudio",
+        "{encoding}"
+    );
+    assert!(
+        encoding["EncoderAppPath"]
+            .as_str()
+            .unwrap()
+            .contains("ffmpeg"),
+        "{encoding}"
+    );
+    assert!(
+        encoding["TranscodingTempPath"]
+            .as_str()
+            .unwrap()
+            .ends_with("transcode"),
+        "{encoding}"
+    );
+
+    let mut changed = encoding.clone();
+    changed["H264Crf"] = serde_json::json!(20);
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        "/System/Configuration/encoding",
+        &admin,
+        Some(&changed.to_string()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, encoding) =
+        send_authed(&app, "GET", "/System/Configuration/Encoding", &admin, None).await;
+    assert_eq!(encoding["H264Crf"], 20, "{encoding}");
+    assert_eq!(encoding["H265Crf"], 28, "{encoding}");
+
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        "/System/Configuration/encoding",
+        &admin,
+        Some("[1]"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    // The main configuration has no "encoding" field.
+    let (_, config) = send_authed(&app, "GET", "/System/Configuration", &admin, None).await;
+    assert!(config.get("encoding").is_none(), "{config}");
+}
+
+#[tokio::test]
+async fn r2admin_activity_log_records_and_filters() {
+    let (_state, app, admin, _bob, _path) = r2admin_world().await;
+    assert!(login(&app, "r2bob", "wrong").await.is_none());
+    assert!(login(&app, "r2bob", "b38-password").await.is_some());
+    let body = serde_json::json!({ "Name": "r2carol", "Password": "pw" });
+    let (status, carol) =
+        send_authed(&app, "POST", "/Users/New", &admin, Some(&body.to_string())).await;
+    assert_eq!(status, StatusCode::OK);
+    let carol_id = carol["Id"].as_str().unwrap().to_string();
+    let (status, _) =
+        send_authed(&app, "DELETE", &format!("/Users/{carol_id}"), &admin, None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (status, json) = send_authed(
+        &app,
+        "GET",
+        "/System/ActivityLog/Entries?startIndex=0&limit=50",
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["StartIndex"], 0, "{json}");
+    let items = json["Items"].as_array().unwrap();
+    let entry = |t: &str| items.iter().find(|e| e["Type"] == t).cloned();
+    let failed = entry("AuthenticationFailed").expect("a failed sign-in entry");
+    assert_eq!(failed["Name"], "Failed login try from r2bob");
+    assert_eq!(failed["Severity"], "Error");
+    let signed_in = entry("AuthenticationSucceeded").expect("a sign-in entry");
+    assert_eq!(signed_in["Name"], "r2bob successfully authenticated");
+    assert!(
+        signed_in["Date"].as_str().unwrap().ends_with('Z'),
+        "{signed_in}"
+    );
+    assert_eq!(
+        entry("UserCreated").unwrap()["Name"],
+        "User r2carol has been created"
+    );
+    assert_eq!(
+        entry("UserDeleted").unwrap()["Name"],
+        "User r2carol has been deleted"
+    );
+
+    // Jellyfin Web's dashboard asks for the entries without a user.
+    let (_, json) = send_authed(
+        &app,
+        "GET",
+        "/System/ActivityLog/Entries?hasUserId=false",
+        &admin,
+        None,
+    )
+    .await;
+    let items = json["Items"].as_array().unwrap();
+    assert!(!items.is_empty());
+    assert!(
+        items.iter().all(|e| e["Type"] == "AuthenticationFailed"),
+        "{json}"
+    );
+    assert_eq!(json["TotalRecordCount"], items.len());
+
+    let (_, json) = send_authed(
+        &app,
+        "GET",
+        "/System/ActivityLog/Entries?limit=1",
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(json["Items"].as_array().unwrap().len(), 1, "{json}");
+
+    let (_, json) = send_authed(
+        &app,
+        "GET",
+        "/System/ActivityLog/Entries?minDate=2999-01-01T00:00:00.000Z",
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(json["TotalRecordCount"], 0, "{json}");
+    let (status, _) = send_authed(
+        &app,
+        "GET",
+        "/System/ActivityLog/Entries?minDate=yesterday",
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn r2admin_startup_configuration_ui_culture() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (status, json) = send(&app, request("GET", "/Startup/Configuration", None, None)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["UICulture"], "en-US", "{json}");
+    let body = serde_json::json!({
+        "UICulture": "de-DE",
+        "MetadataCountryCode": "DE",
+        "PreferredMetadataLanguage": "de",
+    });
+    let (status, _) = send(
+        &app,
+        request("POST", "/Startup/Configuration", None, Some(body)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, json) = send(&app, request("GET", "/Startup/Configuration", None, None)).await;
+    assert_eq!(json["UICulture"], "de-DE", "{json}");
+    assert_eq!(json["MetadataCountryCode"], "DE", "{json}");
+}
+
+#[tokio::test]
+async fn r2admin_system_info_fields() {
+    let (_state, app, admin, _bob, _path) = r2admin_world().await;
+    let (status, info) = send_authed(&app, "GET", "/System/Info", &admin, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(info["IsShuttingDown"], false, "{info}");
+    assert_eq!(info["SupportsLibraryMonitor"], true, "{info}");
+    for field in [
+        "ItemsByNamePath",
+        "InternalMetadataPath",
+        "TranscodingTempPath",
+        "EncoderLocation",
+        "SystemArchitecture",
+    ] {
+        assert!(
+            !info[field].as_str().unwrap_or("").is_empty(),
+            "{field}: {info}"
+        );
+    }
+    assert_eq!(
+        info["CastReceiverApplications"][0]["Id"], "F007D354",
+        "{info}"
+    );
+}
+
+#[tokio::test]
+async fn r2admin_changed_admin_routes_refuse_non_admins() {
+    let (_state, app, _admin, bob, _path) = r2admin_world().await;
+    for (method, uri, body) in [
+        ("GET", "/Library/VirtualFolders", None),
+        ("GET", "/Library/MediaFolders", None),
+        ("GET", "/Library/PhysicalPaths", None),
+        ("GET", "/ScheduledTasks", None),
+        ("POST", "/ScheduledTasks/Running/CleanActivityLog", None),
+        ("GET", "/Devices", None),
+        ("GET", "/Devices/Info?id=x", None),
+        ("GET", "/Devices/Options?id=x", None),
+        (
+            "POST",
+            "/Devices/Options?id=x",
+            Some(r#"{"CustomName":"x"}"#),
+        ),
+        ("GET", "/System/ActivityLog/Entries", None),
+        ("POST", "/System/Configuration", Some("{}")),
+        ("POST", "/System/Configuration/encoding", Some("{}")),
+    ] {
+        let (status, _) = send_authed(&app, method, uri, &bob.0, body).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}");
+    }
+}
+
 // ── Library List Consistency Tests ──
 //
 // Every list of libraries must show a create or delete as soon as it succeeds,
@@ -14284,8 +14822,7 @@ async fn test_devices_list() {
         .await
         .unwrap();
 
-    // May return 500 if devices table doesn't exist yet
-    assert!(resp.status().is_success() || resp.status() == StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(resp.status(), StatusCode::OK);
 }
 
 // ── Subtitle Tests ──

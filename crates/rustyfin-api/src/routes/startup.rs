@@ -31,7 +31,7 @@ pub fn routes() -> Router<AppState> {
 async fn get_startup_config(State(state): State<AppState>) -> Json<StartupConfiguration> {
     let config = state.config.read().await;
     Json(StartupConfiguration {
-        ui_culture: String::new(),
+        ui_culture: config.ui_culture.clone(),
         metadata_country_code: config.metadata_country_code.clone(),
         preferred_metadata_language: config.preferred_metadata_language.clone(),
     })
@@ -48,6 +48,9 @@ async fn update_startup_config(
         }
         if let Some(country) = update.metadata_country_code {
             config.metadata_country_code = country;
+        }
+        if let Some(culture) = update.ui_culture.filter(|c| !c.trim().is_empty()) {
+            config.ui_culture = culture;
         }
     }
     persist_config(&state).await?;

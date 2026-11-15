@@ -45,6 +45,7 @@ use std::sync::Arc;
 
 use crate::middleware::{
     rate_limit, rate_limit_resource, require_admin, require_auth, require_setup_or_admin,
+    require_setup_or_auth,
 };
 use crate::state::AppState;
 
@@ -75,6 +76,12 @@ pub fn build_router(state: AppState) -> Router {
             dlna::require_dlna_enabled,
         )))
         .merge(setup)
+        .merge(
+            localization::setup_or_user_routes().route_layer(axum_mw::from_fn_with_state(
+                state.clone(),
+                require_setup_or_auth,
+            )),
+        )
         .merge(websocket::routes());
 
     // Administrator routes. `require_auth` answers 401 without a valid token. `require_admin`

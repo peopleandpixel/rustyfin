@@ -52,6 +52,18 @@ pub struct FullServerInfo {
     pub local_addresses: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub package_version: Option<String>,
+    pub is_shutting_down: bool,
+    pub supports_library_monitor: bool,
+    pub items_by_name_path: String,
+    pub internal_metadata_path: String,
+    pub transcoding_temp_path: String,
+    pub web_path: String,
+    /// `System` for the ffmpeg on the PATH, `Custom` for `RUSTYFIN_FFMPEG_PATH`, as Jellyfin.
+    pub encoder_location: String,
+    /// .NET's name for the CPU architecture (`X64`, `Arm64`).
+    pub system_architecture: String,
+    /// From the configuration's `CastReceiverApplications`.
+    pub cast_receiver_applications: serde_json::Value,
 }
 
 /// Server configuration stored as JSON on disk
@@ -117,6 +129,125 @@ pub struct ServerConfiguration {
     /// Values below 1 count as 1.
     #[serde(default = "default_library_monitor_poll_interval")]
     pub library_monitor_poll_interval: u32,
+    /// The language of the server's own messages, as a culture code (Jellyfin's `UICulture`).
+    #[serde(rename = "UICulture", default = "default_ui_culture")]
+    pub ui_culture: String,
+    /// The other fields of Jellyfin's `ServerConfiguration` that a client saved. They are kept and
+    /// returned, so Jellyfin Web's settings pages round-trip, but Rustyfin doesn't act on them.
+    /// `jellyfin_server_defaults` fills in the ones never saved.
+    #[serde(flatten)]
+    pub other: serde_json::Map<String, serde_json::Value>,
+}
+
+fn default_ui_culture() -> String {
+    "en-US".to_string()
+}
+
+/// Jellyfin 12.4.0's defaults for the `ServerConfiguration` fields Rustyfin has no field for.
+/// `GET /System/Configuration` adds those a client never saved. `PluginRepositories` is empty:
+/// Rustyfin can't install Jellyfin's plugins.
+pub fn jellyfin_server_defaults() -> serde_json::Map<String, serde_json::Value> {
+    // Per item type: the metadata fetchers and the image fetchers Jellyfin disables by default.
+    const OMDB: &[&str] = &["The Open Movie Database"];
+    const AUDIO_DB: &[&str] = &["TheAudioDB"];
+    let metadata_options: Vec<serde_json::Value> = [
+        ("Book", &[][..], &[][..]),
+        ("Movie", &[], &[]),
+        ("MusicVideo", OMDB, OMDB),
+        ("Series", &[], &[]),
+        ("MusicAlbum", AUDIO_DB, &[]),
+        ("MusicArtist", AUDIO_DB, &[]),
+        ("BoxSet", &[], &[]),
+        ("Season", &[], &[]),
+        ("Episode", &[], &[]),
+    ]
+    .into_iter()
+    .map(|(item_type, disabled, disabled_images)| {
+        serde_json::json!({
+            "ItemType": item_type,
+            "DisabledMetadataSavers": [],
+            "LocalMetadataReaderOrder": [],
+            "DisabledMetadataFetchers": disabled,
+            "MetadataFetcherOrder": [],
+            "DisabledImageFetchers": disabled_images,
+            "ImageFetcherOrder": [],
+        })
+    })
+    .collect();
+    let cache_size = std::thread::available_parallelism().map_or(1, |n| n.get()) * 100;
+    use serde_json::json;
+    [
+        ("EnableCaseSensitiveItemIds", json!(true)),
+        ("DisableLiveTvChannelUserDataName", json!(true)),
+        ("MetadataPath", json!("")),
+        ("SortReplaceCharacters", json!([".", "+", "%"])),
+        (
+            "SortRemoveCharacters",
+            json!([",", "&", "-", "{", "}", "'"]),
+        ),
+        ("SortRemoveWords", json!(["the", "a", "an"])),
+        ("MinResumePct", json!(5)),
+        ("MaxResumePct", json!(90)),
+        ("MinResumeDurationSeconds", json!(300)),
+        ("MinAudiobookResume", json!(5)),
+        ("MaxAudiobookResume", json!(5)),
+        ("InactiveSessionThreshold", json!(0)),
+        ("LibraryUpdateDuration", json!(30)),
+        ("CacheSize", json!(cache_size)),
+        ("ImageSavingConvention", json!("Legacy")),
+        ("MetadataOptions", json!(metadata_options)),
+        ("SkipDeserializationForBasicTypes", json!(true)),
+        ("SaveMetadataHidden", json!(false)),
+        ("ContentTypes", json!([])),
+        ("RemoteClientBitrateLimit", json!(0)),
+        ("EnableFolderView", json!(false)),
+        ("EnableGroupingMoviesIntoCollections", json!(false)),
+        ("EnableGroupingShowsIntoCollections", json!(false)),
+        ("DisplaySpecialsWithinSeasons", json!(true)),
+        ("CodecsUsed", json!([])),
+        ("PluginRepositories", json!([])),
+        ("EnableExternalContentInSuggestions", json!(true)),
+        ("ImageExtractionTimeoutMs", json!(0)),
+        ("PathSubstitutions", json!([])),
+        ("EnableSlowResponseWarning", json!(true)),
+        ("SlowResponseThresholdMs", json!(500)),
+        ("CorsHosts", json!(["*"])),
+        ("ActivityLogRetentionDays", json!(30)),
+        ("LibraryScanFanoutConcurrency", json!(0)),
+        ("LibraryMetadataRefreshConcurrency", json!(0)),
+        ("AllowClientLogUpload", json!(true)),
+        ("DummyChapterDuration", json!(0)),
+        ("ChapterImageResolution", json!("MatchSource")),
+        ("ParallelImageEncodingLimit", json!(0)),
+        (
+            "CastReceiverApplications",
+            json!([
+                { "Id": "F007D354", "Name": "Stable" },
+                { "Id": "6F511C87", "Name": "Unstable" },
+            ]),
+        ),
+        (
+            "TrickplayOptions",
+            json!({
+                "EnableHwAcceleration": false,
+                "EnableHwEncoding": false,
+                "EnableKeyFrameOnlyExtraction": false,
+                "ScanBehavior": "NonBlocking",
+                "ProcessPriority": "BelowNormal",
+                "Interval": 10000,
+                "WidthResolutions": [320],
+                "TileWidth": 10,
+                "TileHeight": 10,
+                "Qscale": 4,
+                "JpegQuality": 90,
+                "ProcessThreads": 1,
+            }),
+        ),
+        ("EnableLegacyAuthorization", json!(false)),
+    ]
+    .into_iter()
+    .map(|(field, value)| (field.to_string(), value))
+    .collect()
 }
 
 fn default_smtp_port() -> u16 {
@@ -182,6 +313,8 @@ impl Default for ServerConfiguration {
             fanart_api_key: None,
             library_monitor_delay: 60,
             library_monitor_poll_interval: 60,
+            ui_culture: default_ui_culture(),
+            other: serde_json::Map::new(),
         }
     }
 }
