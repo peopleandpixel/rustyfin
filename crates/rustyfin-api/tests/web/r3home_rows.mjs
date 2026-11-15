@@ -67,6 +67,9 @@ test('each library but collections and playlists gets a latest row, with Jellyfi
     assert.deepEqual(plan.map(p => p.url), [latest('films', 16), latest('shows', 16), latest('tunes', 30)]);
     assert.equal(plan[2].name, 'Tunes & More');
     assert.deepEqual(JSON.parse(JSON.stringify(context.homeLatestPlan(null))), []);
+    // Jellyfin's CollectionType is lowercase
+    const lower = JSON.parse(JSON.stringify(context.homeLatestPlan([{ Id: 'm', Name: 'M', CollectionType: 'music' }])));
+    assert.equal(lower[0].url, latest('m', 30));
 });
 
 test('the home page shows resume video, resume audio, then a latest row per library in library order', async () => {

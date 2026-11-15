@@ -25,7 +25,7 @@ function homeLatestPlan(libs) {
         .map(lib => ({
             id: lib.id,
             name: lib.name,
-            url: `/Items/Latest?ParentId=${encodeURIComponent(lib.id)}&Limit=${lib.type === 'Music' ? 30 : 16}&Fields=PrimaryImageAspectRatio`,
+            url: `/Items/Latest?ParentId=${encodeURIComponent(lib.id)}&Limit=${String(lib.type).toLowerCase() === 'music' ? 30 : 16}&Fields=PrimaryImageAspectRatio`,
         }));
 }
 
