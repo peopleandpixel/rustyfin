@@ -558,20 +558,25 @@ function renderTaskCard(task) {
     // Trigger info
     let triggerHtml = '';
     if (triggers.length) {
+        // Trigger times are .NET ticks: 10,000,000 a second
+        const TICKS_PER_MINUTE = 600000000;
+        const TICKS_PER_HOUR = 60 * TICKS_PER_MINUTE;
         const triggerTypes = triggers.map(tr => {
             const type = tr.Type || tr.type || '';
             if (type.includes('Interval')) {
                 const ticks = tr.IntervalTicks || tr.interval_ticks;
                 if (ticks) {
-                    const hours = Math.round(ticks / 3600000);
+                    const hours = Math.round(ticks / TICKS_PER_HOUR);
                     return t('admin.every_hours', { count: hours });
                 }
             }
-            if (type.includes('TimeOfDay')) {
-                const ticks = tr.TimeOfDayTicks || tr.time_of_day_ticks;
-                if (ticks) {
-                    const hour = Math.floor(ticks / 3600000) % 24;
-                    return `${hour.toString().padStart(2, '0')}:00`;
+            // Jellyfin's DailyTrigger and WeeklyTrigger carry the time of day
+            if (type.includes('TimeOfDay') || type.includes('Daily') || type.includes('Weekly')) {
+                const ticks = tr.TimeOfDayTicks ?? tr.time_of_day_ticks;
+                if (typeof ticks === 'number') {
+                    const hour = Math.floor(ticks / TICKS_PER_HOUR) % 24;
+                    const minute = Math.floor(ticks / TICKS_PER_MINUTE) % 60;
+                    return `${hour.toString().padStart(2, '0')}:${minute.toString().padStart(2, '0')}`;
                 }
             }
             return escapeHtml(type);

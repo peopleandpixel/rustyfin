@@ -139,6 +139,24 @@ test('an idle task shows its result message, such as why it did nothing', () => 
     assert.doesNotMatch(context.fns.renderTaskCard(task('Idle', null)), /data-task-message/);
 });
 
+test('triggers show their interval in hours and their time of day, from .NET ticks', () => {
+    const { context } = sandbox([]);
+    const HOUR = 36000000000;
+    const html = context.fns.renderTaskCard(task('Idle', null, {
+        Triggers: [
+            { Type: 'IntervalTrigger', IntervalTicks: 12 * HOUR },
+            { Type: 'IntervalTrigger', IntervalTicks: 24 * HOUR },
+            { Type: 'DailyTrigger', TimeOfDayTicks: 3 * HOUR + 30 * 600000000 },
+            { Type: 'DailyTrigger', TimeOfDayTicks: 0 },
+        ],
+    }));
+    assert.match(html, /admin\.every_hours\|\{"count":12\}/);
+    assert.match(html, /admin\.every_hours\|\{"count":24\}/);
+    assert.match(html, /03:30/);
+    assert.match(html, /00:00/);
+    assert.doesNotMatch(html, /120000/);
+});
+
 test('a running task with a percent shows Running, its bar at that percent and Stop', () => {
     const { context } = sandbox([]);
     const html = context.fns.renderTaskCard(task('Running', 42.4));
