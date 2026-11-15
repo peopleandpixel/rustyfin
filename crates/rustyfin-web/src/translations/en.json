@@ -250,7 +250,9 @@
         "next_episode": "Next episode",
         "play_now": "Play now",
         "episode_number": "S{{season}}:E{{episode}}",
-        "up_next_countdown": "Starts in {{count}} s"
+        "up_next_countdown": "Starts in {{count}} s",
+        "up_next_announce": "Next episode in {{seconds}} seconds: {{title}}",
+        "up_next_announce_manual": "Next episode: {{title}}"
     },
     "admin": {
         "new_user_title": "New User",

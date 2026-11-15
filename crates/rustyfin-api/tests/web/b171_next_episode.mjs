@@ -22,12 +22,13 @@ function slice(head) {
 }
 
 const BLOCK = [
-    'function isStreamType(', 'function findStream(', 'function adjacentEpisodes(', 'function episodeTrackCarry(',
+    'function isStreamType(', 'function findStream(', 'function defaultSubtitleIndex(', 'function adjacentEpisodes(', 'function episodeTrackCarry(',
     'function carriedTracks(', 'function creditsStart(', 'function upNextStart(', 'async function loadEpisodeNav(',
     'function resetEpisodeNav(', 'function updateEpisodeButtons(', 'function playEpisode(',
     'function playAdjacentEpisode(', 'function checkUpNext(', 'function upNextAtEnd(', 'function episodeNumberLabel(',
     'function showUpNext(', 'function renderUpNextCountdown(', 'function upNextTick(', 'function playUpNextNow(',
     'function cancelUpNext(', 'function hideUpNext(', 'async function changeNextEpisodeAutoPlay(',
+    'async function restartStream(',
 ].map(slice).join('\n');
 
 function element() {
@@ -66,7 +67,7 @@ function sandbox({ episodes = SERIES, me = { Id: 'u1', Configuration: {} }, segm
          ${BLOCK}
          this.fns = { adjacentEpisodes, episodeTrackCarry, carriedTracks, creditsStart, upNextStart, loadEpisodeNav,
              resetEpisodeNav, playAdjacentEpisode, checkUpNext, upNextAtEnd, upNextTick, playUpNextNow, cancelUpNext,
-             changeNextEpisodeAutoPlay };
+             changeNextEpisodeAutoPlay, restartStream };
          this.state = () => ({ episodeNav, upNext });
          this.setActive = s => { activePlayback = s; };`,
         context,
@@ -306,6 +307,123 @@ test('the setting saves EnableNextEpisodeAutoPlay into the user configuration, k
     await failing.fns.changeNextEpisodeAutoPlay(input2);
     assert.equal(input2.checked, true, 'a failed save puts the switch back');
     assert.deepEqual(failing.log.at(-1), ['toast', 'nope', 'error']);
+});
+
+test('other versions of this episode and multi-episode files covering it are never next or previous', () => {
+    const { fns } = sandbox();
+    const ids = r => [r.prev?.Id ?? null, r.next?.Id ?? null];
+    const versions = [ep('e1', 1, 1), ep('e2a', 1, 2), ep('e2b', 1, 2), ep('e3', 1, 3)];
+    assert.deepEqual(ids(fns.adjacentEpisodes(versions.slice(), 'e2a')), ['e1', 'e3']);
+    assert.deepEqual(ids(fns.adjacentEpisodes(versions.slice(), 'e2b')), ['e1', 'e3']);
+    const multi = [ep('e1', 1, 1), ep('e1-2', 1, 1, { IndexNumberEnd: 2 }), ep('e2', 1, 2), ep('e3', 1, 3), ep('s2e1', 2, 1)];
+    assert.deepEqual(ids(fns.adjacentEpisodes(multi.slice(), 'e1')), [null, 'e2']);
+    assert.deepEqual(ids(fns.adjacentEpisodes(multi.slice(), 'e1-2')), [null, 'e3']);
+    assert.deepEqual(ids(fns.adjacentEpisodes(multi.slice(), 'e2')), ['e1', 'e3']);
+    assert.deepEqual(ids(fns.adjacentEpisodes(multi.slice(), 'e3')), ['e2', 's2e1']);
+});
+
+test('after the audio carries over, the default subtitle is picked again for its language', () => {
+    const { fns } = sandbox();
+    const next = [
+        { Index: 1, CodecType: 'audio', Language: 'eng', IsDefault: true },
+        { Index: 2, CodecType: 'audio', Language: 'jpn' },
+        { Index: 5, CodecType: 'subtitle', Language: 'eng', IsForced: true },
+        { Index: 6, CodecType: 'subtitle', Language: 'jpn', IsForced: true },
+    ];
+    // The defaults were chosen for the English audio: its forced subtitle
+    const carry = { audioLanguage: 'jpn', subtitleLanguage: '', subtitleForced: false, subtitlesOff: false };
+    assert.deepEqual(plain(fns.carriedTracks(next, carry, 1, 5)), { audioIndex: 2, subtitleIndex: 6 });
+    // Subtitles that carried over, or were turned off, stay as they are
+    assert.deepEqual(plain(fns.carriedTracks(next, { ...carry, subtitleLanguage: 'eng', subtitleForced: true }, 1, 5)), { audioIndex: 2, subtitleIndex: 5 });
+    assert.deepEqual(plain(fns.carriedTracks(next, { ...carry, subtitlesOff: true }, 1, 5)), { audioIndex: 2, subtitleIndex: -1 });
+    // Audio that doesn't change leaves the episode's own subtitle choice alone
+    assert.deepEqual(plain(fns.carriedTracks(next, { ...carry, audioLanguage: 'eng' }, 1, -1)), { audioIndex: 1, subtitleIndex: -1 });
+});
+
+test('the card is announced once, not every second', async () => {
+    const box = sandbox();
+    const s = session();
+    box.setActive(s);
+    await box.fns.loadEpisodeNav(s, { Type: 'Episode', SeriesId: 'series-1' });
+    s.seek(1495);
+    box.fns.checkUpNext(s);
+    const status = box.elements['player-up-next-status'];
+    const said = 'player.up_next_announce|{"seconds":10,"title":"Name s2e1"}';
+    assert.equal(status.textContent, said);
+    box.tick();
+    box.tick();
+    assert.equal(status.textContent, said);
+    box.fns.cancelUpNext();
+    assert.equal(status.textContent, '');
+
+    const manual = sandbox({ me: { Id: 'u1', Configuration: { EnableNextEpisodeAutoPlay: false } } });
+    const m = session();
+    manual.setActive(m);
+    await manual.fns.loadEpisodeNav(m, { Type: 'Episode', SeriesId: 'series-1' });
+    manual.fns.upNextAtEnd(m);
+    assert.equal(manual.elements['player-up-next-status'].textContent, 'player.up_next_announce_manual|{"seconds":10,"title":"Name s2e1"}');
+
+    assert.match(html, /<p id="player-up-next-countdown"[^>]*aria-hidden="true"/);
+    assert.doesNotMatch(html, /<p id="player-up-next-countdown"[^>]*aria-live/);
+    assert.match(html, /<p id="player-up-next-status"[^>]*role="status"/);
+    assert.doesNotMatch(html.slice(html.indexOf('id="player-up-next"'), html.indexOf('id="player-up-next-status"')), /aria-live/);
+});
+
+test('a seek into the last second shows the card; the time check then the end advance only once', async () => {
+    const box = sandbox();
+    const s = session({ stop() { this.stopped = (this.stopped || 0) + 1; } });
+    box.setActive(s);
+    await box.fns.loadEpisodeNav(s, { Type: 'Episode', SeriesId: 'series-1' });
+    await box.fns.restartStream(s, 1499.5);
+    assert.equal(s.stopped, 1);
+    assert.equal(box.elements['player-up-next'].hidden, false);
+
+    // The card shown by the time check stays the same card when the episode ends
+    const twice = sandbox();
+    const t2 = session();
+    twice.setActive(t2);
+    await twice.fns.loadEpisodeNav(t2, { Type: 'Episode', SeriesId: 'series-1' });
+    t2.seek(1495);
+    twice.fns.checkUpNext(t2);
+    twice.fns.upNextAtEnd(t2);
+    twice.fns.upNextAtEnd(t2);
+    assert.equal(twice.timers.size, 1);
+    for (let i = 0; i < 15; i++) twice.tick();
+    assert.equal(twice.log.filter(e => e[0] === 'playItem').length, 1);
+
+    // The HLS end of stream (nothing left to transcode) shows the card too
+    assert.match(source, /totalduration !== 0\) return;\s*session\.stop\(\);\s*upNextAtEnd\(session\);/);
+});
+
+test('Space on a focused button in the player works the button; elsewhere it toggles play', () => {
+    const start = source.indexOf('// Global Keyboard Shortcuts');
+    const handler = source.slice(start, source.indexOf('\n});\n', start) + 5);
+    class Element {
+        constructor(match) { this.match = match; }
+        closest(selector) { return this.match && selector.includes(this.match) ? this : null; }
+    }
+    const log = [];
+    let listener = null;
+    const context = vm.createContext({
+        Element,
+        document: { addEventListener: (type, fn) => { if (type === 'keydown') listener = fn; } },
+        $: () => ({ open: true }),
+        togglePlayPause: () => log.push('toggle'),
+        skipTime: () => {}, toggleFullscreen: () => {}, toggleMute: () => {}, closePlayer: () => {},
+    });
+    vm.runInContext(handler, context);
+    const press = target => {
+        const e = { code: 'Space', key: ' ', target, prevented: false, preventDefault() { this.prevented = true; } };
+        listener(e);
+        return e.prevented;
+    };
+    // closest() matches the button selector for a button inside the player (the card's Play now included)
+    assert.equal(press(new Element('button')), false);
+    assert.equal(press(new Element('select')), false);
+    assert.deepEqual(log, []);
+    assert.equal(press(new Element(null)), true, 'the seek slider or the video toggles play');
+    assert.deepEqual(log, ['toggle']);
+    assert.match(handler, /input:not\(\[type="range"\]\)/);
 });
 
 test('the player wires the block in: reports, stop, ended and fullscreen', () => {

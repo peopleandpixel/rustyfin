@@ -499,7 +499,7 @@
                 <div class="min-w-0">
                     <p id="player-up-next-number" class="text-xs text-white/60"></p>
                     <p id="player-up-next-title" class="text-sm font-semibold line-clamp-2"></p>
-                    <p id="player-up-next-countdown" class="text-xs text-[#38bdf8] mt-1" aria-live="polite"></p>
+                    <p id="player-up-next-countdown" class="text-xs text-[#38bdf8] mt-1" aria-hidden="true"></p>
                 </div>
             </div>
             <div class="flex justify-end gap-2 mt-3">
@@ -507,6 +507,9 @@
                 <button class="jf-btn-primary !py-1.5 !px-3 text-xs" onclick="playUpNextNow()" data-i18n="player.play_now">Play now</button>
             </div>
         </div>
+
+        <!-- Announces the next-episode card once when it appears -->
+        <p id="player-up-next-status" class="sr-only" role="status"></p>
 
         <!-- Bottom Controls Bar (autohide) -->
         <div id="player-controls" class="jf-player-controls z-30">

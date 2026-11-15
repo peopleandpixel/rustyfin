@@ -2359,7 +2359,11 @@ async function openStream(session, startTicks) {
         });
         // A transcode that starts after the last keyframe of copied video lists no time: nothing is left
         // to play, so end the playback as the stream's end does
-        hlsInstance.on(Hls.Events.LEVEL_LOADED, (event, data) => { if (current() && session.offset > 0 && data.details.totalduration === 0) session.stop(); });
+        hlsInstance.on(Hls.Events.LEVEL_LOADED, (event, data) => {
+            if (!current() || session.offset <= 0 || data.details.totalduration !== 0) return;
+            session.stop();
+            upNextAtEnd(session);
+        });
         hlsInstance.on(Hls.Events.ERROR, (event, data) => {
             if (!current()) return;
             console.error('HLS error:', data);
@@ -2449,6 +2453,7 @@ async function restartStream(session, seconds) {
     if (total > 0 && seconds > total - 1) {
         session.pendingSeek = total;
         session.stop();
+        upNextAtEnd(session);
         return;
     }
     session.tracksChanged = false;
@@ -2828,17 +2833,22 @@ let upNext = null;
 const UP_NEXT_SECONDS = 10;
 
 // The episodes before and after this one in season order, across seasons. Specials (season 0) only
-// count when this episode is one.
+// count when this episode is one. Other versions of this episode, and multi-episode files that cover
+// any of its numbers, are skipped: next has a higher number than this one ends on, prev a lower one.
 function adjacentEpisodes(episodes, currentId) {
     const current = episodes.find(e => e.Id === currentId);
     if (!current) return { prev: null, next: null };
     const isSpecial = e => e.ParentIndexNumber === 0;
     const order = n => (n == null ? Number.MAX_SAFE_INTEGER : n);
+    const season = e => order(e.ParentIndexNumber);
+    const first = e => order(e.IndexNumber);
+    const last = e => order(e.IndexNumberEnd ?? e.IndexNumber);
     const list = episodes
         .filter(e => isSpecial(current) || !isSpecial(e))
-        .sort((a, b) => order(a.ParentIndexNumber) - order(b.ParentIndexNumber) || order(a.IndexNumber) - order(b.IndexNumber));
-    const at = list.indexOf(current);
-    return { prev: list[at - 1] || null, next: list[at + 1] || null };
+        .sort((a, b) => season(a) - season(b) || first(a) - first(b));
+    const after = e => season(e) > season(current) || (season(e) === season(current) && first(e) > last(current));
+    const before = e => season(e) < season(current) || (season(e) === season(current) && last(e) < first(current));
+    return { prev: list.findLast(before) || null, next: list.find(after) || null };
 }
 
 // What the next episode keeps of this one's tracks: the audio and subtitle languages, or subtitles off
@@ -2853,7 +2863,8 @@ function episodeTrackCarry(session) {
     };
 }
 
-// As in Jellyfin: a track in the last episode's language, else the default this episode picked
+// As in Jellyfin: a track in the last episode's language, else the default this episode picked. When
+// the audio changes and no subtitle carries over, the default subtitle is picked again for that audio.
 function carriedTracks(streams, carry, audioIndex, subtitleIndex) {
     if (!carry) return { audioIndex, subtitleIndex };
     const inLanguage = (type, language) => (language
@@ -2861,12 +2872,14 @@ function carriedTracks(streams, carry, audioIndex, subtitleIndex) {
         : []);
     const audio = inLanguage('audio', carry.audioLanguage);
     const pickedAudio = audio.find(s => s.Index === audioIndex) || audio.find(s => s.IsDefault) || audio[0];
+    const audioChanged = !!pickedAudio && pickedAudio.Index !== audioIndex;
     if (pickedAudio) audioIndex = pickedAudio.Index;
     if (carry.subtitlesOff) return { audioIndex, subtitleIndex: -1 };
     const subs = inLanguage('subtitle', carry.subtitleLanguage);
     const sameKind = subs.filter(s => !!s.IsForced === carry.subtitleForced);
     const pickedSub = sameKind.find(s => s.Index === subtitleIndex) || sameKind.find(s => s.IsDefault) || sameKind[0] || subs[0];
     if (pickedSub) subtitleIndex = pickedSub.Index;
+    else if (audioChanged) subtitleIndex = defaultSubtitleIndex(streams.filter(s => isStreamType(s, 'subtitle')), pickedAudio);
     return { audioIndex, subtitleIndex };
 }
 
@@ -2980,6 +2993,9 @@ function showUpNext(nav) {
     $('player-up-next-countdown').hidden = !nav.autoPlay;
     renderUpNextCountdown();
     card.hidden = false;
+    // Screen readers hear the card once; the ticking countdown is hidden from them
+    $('player-up-next-status').textContent = t(nav.autoPlay ? 'player.up_next_announce' : 'player.up_next_announce_manual',
+        { seconds: UP_NEXT_SECONDS, title: episode.Name || '' });
 }
 
 function renderUpNextCountdown() {
@@ -3010,6 +3026,8 @@ function hideUpNext() {
     upNext = null;
     const card = $('player-up-next');
     if (card) card.hidden = true;
+    const status = $('player-up-next-status');
+    if (status) status.textContent = '';
 }
 
 function togglePlayPause() {
@@ -3092,7 +3110,9 @@ function toggleFullscreen() {
 // Global Keyboard Shortcuts
 document.addEventListener('keydown', e => {
     if ($('player-modal')?.open) {
-        if (e.code === 'Space') { e.preventDefault(); togglePlayPause(); }
+        // Space on a focused button, menu or text field works that control; the seek and volume sliders still toggle play
+        const onControl = e.target instanceof Element && e.target.closest('button, select, textarea, a[href], input:not([type="range"])');
+        if (e.code === 'Space' && !onControl) { e.preventDefault(); togglePlayPause(); }
         if (e.code === 'ArrowLeft') { e.preventDefault(); skipTime(-10); }
         if (e.code === 'ArrowRight') { e.preventDefault(); skipTime(30); }
         if (e.key === 'f' || e.key === 'F') { e.preventDefault(); toggleFullscreen(); }
