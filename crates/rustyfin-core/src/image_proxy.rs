@@ -680,7 +680,22 @@ pub async fn compute_blurhash(
     http_client: Option<&reqwest::Client>,
 ) -> Option<String> {
     let bytes = read_image_bytes(source_path, http_client).await.ok()?;
-    let img = decode_limited(&bytes).ok()?;
+    blurhash_of(&bytes)
+}
+
+/// `compute_blurhash` for a local file, blocking, for a caller that runs it off the async threads.
+/// A path that isn't a regular file (a FIFO, socket or device) is never opened. The decode has the
+/// same limits (`MAX_DECODE_SIDE`, `MAX_DECODE_BYTES`).
+pub fn local_blurhash(path: &Path) -> Option<String> {
+    if !std::fs::metadata(path).ok()?.is_file() {
+        return None;
+    }
+    blurhash_of(&std::fs::read(path).ok()?)
+}
+
+/// The blurhash of an image's bytes, decoded within the decode limits.
+fn blurhash_of(bytes: &[u8]) -> Option<String> {
+    let img = decode_limited(bytes).ok()?;
     // Downscale to a small image for faster encoding
     let small = img.resize(16, 16, FilterType::Triangle);
     let rgba = small.to_rgba8();
