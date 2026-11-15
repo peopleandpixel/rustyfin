@@ -139,7 +139,7 @@
     },
     "nav": {
         "toggle_menu": "Toggle menu",
-        "search_placeholder": "Search movies, shows, music… (press Enter)",
+        "search_placeholder": "Search movies, shows, music…",
         "connect": "Connect",
         "add_new_library": "Add a new library",
         "signed_in": "Signed in",
@@ -426,6 +426,8 @@
         "more_info": "More info",
         "my_media": "My Media",
         "continue_watching": "Continue Watching",
+        "continue_listening": "Continue Listening",
+        "latest_in": "Recently Added in {{name}}",
         "next_up": "Next Up",
         "recently_added": "Recently Added",
         "empty_title": "Your library is empty",
@@ -528,7 +530,30 @@
     },
     "search": {
         "no_results": "No results for “{{term}}”",
-        "results_for": "Search Results for “{{term}}” ({{count}})"
+        "results_for": "Search Results for “{{term}}” ({{count}})",
+        "section_movies": "Movies",
+        "section_shows": "Shows",
+        "section_episodes": "Episodes",
+        "section_people": "People",
+        "section_playlists": "Playlists",
+        "section_artists": "Artists",
+        "section_albums": "Albums",
+        "section_songs": "Songs",
+        "section_videos": "Videos",
+        "section_photos": "Photos",
+        "section_audiobooks": "Audiobooks",
+        "section_books": "Books",
+        "section_collections": "Collections"
+    },
+    "music": {
+        "tracks_count": "Tracks ({{count}})",
+        "disc": "Disc {{number}}",
+        "tabs": "Music library views",
+        "tab_albums": "Albums",
+        "tab_album_artists": "Album Artists",
+        "tab_artists": "Artists",
+        "tab_songs": "Songs",
+        "tab_genres": "Genres"
     },
     "oidc": {
         "sign_in_default": "Sign in with single sign-on",

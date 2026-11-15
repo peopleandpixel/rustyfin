@@ -3,6 +3,7 @@ import { $, icon, toast, escapeHtml, formatRuntime } from './util.js';
 import { backdropUrl, createCardElement, sectionRow } from './cards.js';
 import { resumePositionTicks } from './player.js';
 import { navigate } from './router.js';
+import { albumTrackList } from './music.js';
 let currentDetailId = null;
 let activeItem = null;
 // The detail page's version, audio and subtitle choice: { itemId, sources, mediaSourceId, audioIndex,
@@ -402,6 +403,8 @@ async function renderDetail(itemId) {
                         }).join('')}
                     </div>
                 </div>`;
+            } else if (type === 'MusicAlbum') {
+                seasonsOrEpisodesHtml = albumTrackList(item, children);
             } else {
                 seasonsOrEpisodesHtml = sectionRow(t('detail.titles'), children);
             }
