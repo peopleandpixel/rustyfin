@@ -469,8 +469,10 @@ function renderTrackMenus(session) {
 }
 
 // --- Video Player (Cinema Mode) ---
-// carry: the previous episode's track languages (episodeTrackCarry), chosen again here where they exist
-async function playItem(itemId, streamType = 'Videos', title = '', { fromStart = false, carry = null } = {}) {
+// carry: the previous episode's track languages (episodeTrackCarry), chosen again here where they exist.
+// selection: the detail page's choice, { mediaSourceId, audioIndex, subtitleIndex (-1 is off), startTicks };
+// a field left out keeps the default.
+async function playItem(itemId, streamType = 'Videos', title = '', { fromStart = false, carry = null, selection = null } = {}) {
     const video = $('video-player');
     const modal = $('player-modal');
     if (!video || !modal) return;
@@ -520,11 +522,11 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
     if (!modal.open || request !== playRequest) return; // closed or replaced while loading
     if (!title && item?.Name) $('player-title').textContent = item.Name;
 
-    const startTicks = (streamType !== 'Videos' || fromStart) ? 0 : resumePositionTicks(item);
+    const startTicks = selection?.startTicks ?? ((streamType !== 'Videos' || fromStart) ? 0 : resumePositionTicks(item));
     const runtimeTicks = item?.RunTimeTicks || 0;
 
     // Track choices as Jellyfin's defaults pick them; with no PlaybackInfo there are none
-    const source = info?.MediaSources?.[0];
+    const source = info?.MediaSources?.find(s => s.Id === selection?.mediaSourceId) || info?.MediaSources?.[0];
     const streams = source?.MediaStreams || [];
     const audioStreams = streams.filter(s => isStreamType(s, 'audio'));
     const subStreams = streams.filter(s => isStreamType(s, 'subtitle'));
@@ -539,6 +541,8 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
         const serverSubtitle = defaultSub === -1 || subStreams.some(s => s.Index === defaultSub);
         subtitleIndex = serverSubtitle ? defaultSub : defaultSubtitleIndex(subStreams, chosenAudio);
         ({ audioIndex, subtitleIndex } = carriedTracks(streams, carry, audioIndex, subtitleIndex, serverSubtitle));
+        if (audioStreams.some(s => s.Index === selection?.audioIndex)) audioIndex = selection.audioIndex;
+        if (selection?.subtitleIndex === -1 || subStreams.some(s => s.Index === selection?.subtitleIndex)) subtitleIndex = selection.subtitleIndex;
     }
 
     // The session owns this playback: stop() reports the position once and tears the player down
