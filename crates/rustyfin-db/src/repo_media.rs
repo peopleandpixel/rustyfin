@@ -1077,9 +1077,18 @@ fn build_filtered_query(
 
     // Build the static base WHERE clause for single-value params.
     // Uses (? IS NULL OR ? = '' OR col = ?) pattern so the query string is always identical.
+    // ParentId (binds: pid, pid, recursive, pid, pid, recursive, pid, pid, pid), as in Jellyfin:
+    // recursive gives every item of a library or every descendant of an item; otherwise a
+    // library's top-level items or an item's children.
     let base_where = "
-        (? IS NULL OR ? = '' OR (? = 1 AND library_id IN (SELECT DISTINCT library_id FROM media_items WHERE parent_id = ? OR id = ?))
-         OR ? = 0 AND (? IS NULL OR ? = '' OR parent_id = ?))
+        (? IS NULL OR ? = ''
+         OR (? = 1 AND (library_id = ? OR id IN (
+             WITH RECURSIVE sub(id) AS (
+                 SELECT id FROM media_items WHERE parent_id = ?
+                 UNION SELECT m.id FROM media_items m JOIN sub ON m.parent_id = sub.id)
+             SELECT id FROM sub)))
+         OR (? = 0 AND (parent_id = ?
+             OR (parent_id IS NULL AND library_id = ? AND EXISTS (SELECT 1 FROM libraries WHERE id = ?)))))
         AND (? IS NULL OR ? = '' OR library_id = ?)
         AND (? IS NULL OR ? = '' OR name LIKE ?)
         AND (? IS NULL OR ? = '' OR (? = '#' AND (sort_name < 'A' OR sort_name > 'z')) OR (? != '#' AND (sort_name LIKE ? OR name LIKE ?)))
