@@ -1,4 +1,5 @@
 use rustyfin_model::media::MediaItem;
+use rustyfin_model::metadata::MetadataPerson;
 use rustyfin_model::person::{NameIdPair, PersonDto};
 use sqlx::SqlitePool;
 
@@ -108,4 +109,73 @@ pub async fn search_persons(
         items.push(item);
     }
     Ok(items)
+}
+
+/// Credits `people` on an item that has no people yet, in the given order, in one transaction. A
+/// person is matched by exact name, as the Jellyfin import does, or created; a new person's
+/// photo URL becomes their Primary image. A person listed twice keeps the first credit. Returns
+/// false, writing nothing, when the item already has people (from an NFO, an import or an
+/// earlier refresh).
+pub async fn set_item_people_if_none(
+    pool: &SqlitePool,
+    item_id: uuid::Uuid,
+    people: &[MetadataPerson],
+) -> Result<bool, sqlx::Error> {
+    if people.is_empty() {
+        return Ok(false);
+    }
+    let item = item_id.to_string();
+    // IMMEDIATE: the read below and the writes after it run under the write lock, so concurrent
+    // refreshes wait instead of failing with a deadlock on the upgrade from read to write
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let (credited,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM item_people WHERE item_id = ?")
+        .bind(&item)
+        .fetch_one(&mut *tx)
+        .await?;
+    if credited > 0 {
+        return Ok(false);
+    }
+    for (order, person) in people.iter().enumerate() {
+        let existing: Option<(String,)> =
+            sqlx::query_as("SELECT id FROM people WHERE name = ? ORDER BY rowid LIMIT 1")
+                .bind(&person.name)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let person_id = match existing {
+            Some((id,)) => id,
+            None => {
+                let id = uuid::Uuid::new_v4().to_string();
+                sqlx::query("INSERT INTO people (id, name, type) VALUES (?, ?, ?)")
+                    .bind(&id)
+                    .bind(&person.name)
+                    .bind(&person.kind)
+                    .execute(&mut *tx)
+                    .await?;
+                id
+            }
+        };
+        if let Some(url) = &person.image_url {
+            sqlx::query(
+                "INSERT OR IGNORE INTO person_images (person_id, image_type, image_index, path, provider) \
+                 VALUES (?, 'Primary', 0, ?, 'tmdb')",
+            )
+            .bind(&person_id)
+            .bind(url)
+            .execute(&mut *tx)
+            .await?;
+        }
+        sqlx::query(
+            "INSERT OR IGNORE INTO item_people (item_id, person_id, type, role, sort_order) \
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(&item)
+        .bind(&person_id)
+        .bind(&person.kind)
+        .bind(&person.role)
+        .bind(order as i64)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(true)
 }
