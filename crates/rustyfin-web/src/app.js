@@ -2306,7 +2306,8 @@ async function openStream(session, startTicks) {
                     method = t('player.stream');
                 }
                 $('player-subtitle').textContent = method;
-                playSessionId = isHls ? data.PlaySessionId : null;
+                // Every load gets its own id from the server; the reports carry it, and an HLS one stops the transcode
+                playSessionId = data.PlaySessionId || null;
                 mediaSourceId = data.MediaSources?.[0]?.Id || null;
             } else {
                 // Fallback: direct stream
@@ -2624,7 +2625,8 @@ function renderTrackMenus(session) {
 }
 
 // --- Video Player (Cinema Mode) ---
-async function playItem(itemId, streamType = 'Videos', title = '', { fromStart = false } = {}) {
+// carry: the previous episode's track languages (episodeTrackCarry), chosen again here where they exist
+async function playItem(itemId, streamType = 'Videos', title = '', { fromStart = false, carry = null } = {}) {
     const video = $('video-player');
     const modal = $('player-modal');
     if (!video || !modal) return;
@@ -2648,6 +2650,7 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
     seekDragging = false;
     clearTextSubtitle();
     renderTrackMenus(null);
+    resetEpisodeNav();
 
     // Show modal immediately while loading
     if (!modal.open) {
@@ -2691,6 +2694,7 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
         subtitleIndex = (defaultSub === -1 || subStreams.some(s => s.Index === defaultSub))
             ? defaultSub
             : defaultSubtitleIndex(subStreams, chosenAudio);
+        ({ audioIndex, subtitleIndex } = carriedTracks(streams, carry, audioIndex, subtitleIndex));
     }
 
     // The session owns this playback: stop() reports the position once and tears the player down
@@ -2711,6 +2715,7 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
         tracksChanged: false,
         loads: 0,
         failed: false,
+        finished: false,
         pendingSeek: null,
         seekTimer: null,
         // Item time in seconds: the pending seek target, else where the stream is
@@ -2733,13 +2738,15 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
             if (this.mediaSourceId !== null) fields.MediaSourceId = this.mediaSourceId;
             if (this.audioIndex !== null) fields.AudioStreamIndex = this.audioIndex;
             if (this.subtitleIndex !== null) fields.SubtitleStreamIndex = this.subtitleIndex;
+            if (this.playSessionId) fields.PlaySessionId = this.playSessionId;
             return fields;
         },
         stop() {
             if (stopped) return pendingStop;
             stopped = true;
             clearTimeout(session.seekTimer);
-            const ticks = Math.round(session.position() * 1e7);
+            // Leaving from the next-episode card counts as watched to the end, credits included
+            const ticks = Math.round((session.finished ? Math.max(session.position(), session.total()) : session.position()) * 1e7);
             if (playerReportInterval) {
                 clearInterval(playerReportInterval);
                 playerReportInterval = null;
@@ -2769,6 +2776,7 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
     };
     activePlayback = session;
     renderTrackMenus(session);
+    loadEpisodeNav(session, item);
 
     // Periodic progress reporting
     if (playerReportInterval) clearInterval(playerReportInterval);
@@ -2781,7 +2789,9 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
 
     // Video events for custom UI
     video.ontimeupdate = () => {
-        if (activePlayback === session) updatePlayerControls(session);
+        if (activePlayback !== session) return;
+        updatePlayerControls(session);
+        checkUpNext(session);
     };
 
     video.onplay = () => updatePlayIcon(true);
@@ -2794,7 +2804,9 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
     };
 
     video.onended = () => {
-        if (activePlayback === session) session.stop();
+        if (activePlayback !== session) return;
+        session.stop();
+        upNextAtEnd(session);
     };
 
     await openStream(session, startTicks);
@@ -2807,6 +2819,197 @@ function closePlayer() {
         if (typeof m.close === 'function') m.close();
         else m.removeAttribute('open');
     }
+}
+
+// --- Next episode: the control bar's previous/next buttons and the next-episode card (episodes only) ---
+// episodeNav holds the playing episode's neighbours once loaded; upNext is the card while it shows
+let episodeNav = null;
+let upNext = null;
+const UP_NEXT_SECONDS = 10;
+
+// The episodes before and after this one in season order, across seasons. Specials (season 0) only
+// count when this episode is one.
+function adjacentEpisodes(episodes, currentId) {
+    const current = episodes.find(e => e.Id === currentId);
+    if (!current) return { prev: null, next: null };
+    const isSpecial = e => e.ParentIndexNumber === 0;
+    const order = n => (n == null ? Number.MAX_SAFE_INTEGER : n);
+    const list = episodes
+        .filter(e => isSpecial(current) || !isSpecial(e))
+        .sort((a, b) => order(a.ParentIndexNumber) - order(b.ParentIndexNumber) || order(a.IndexNumber) - order(b.IndexNumber));
+    const at = list.indexOf(current);
+    return { prev: list[at - 1] || null, next: list[at + 1] || null };
+}
+
+// What the next episode keeps of this one's tracks: the audio and subtitle languages, or subtitles off
+function episodeTrackCarry(session) {
+    const audio = findStream(session, 'audio', session.audioIndex);
+    const sub = findStream(session, 'subtitle', session.subtitleIndex);
+    return {
+        audioLanguage: (audio?.Language || '').toLowerCase(),
+        subtitleLanguage: (sub?.Language || '').toLowerCase(),
+        subtitleForced: !!sub?.IsForced,
+        subtitlesOff: session.subtitleIndex === -1 && session.streams.some(s => isStreamType(s, 'subtitle')),
+    };
+}
+
+// As in Jellyfin: a track in the last episode's language, else the default this episode picked
+function carriedTracks(streams, carry, audioIndex, subtitleIndex) {
+    if (!carry) return { audioIndex, subtitleIndex };
+    const inLanguage = (type, language) => (language
+        ? streams.filter(s => isStreamType(s, type) && (s.Language || '').toLowerCase() === language)
+        : []);
+    const audio = inLanguage('audio', carry.audioLanguage);
+    const pickedAudio = audio.find(s => s.Index === audioIndex) || audio.find(s => s.IsDefault) || audio[0];
+    if (pickedAudio) audioIndex = pickedAudio.Index;
+    if (carry.subtitlesOff) return { audioIndex, subtitleIndex: -1 };
+    const subs = inLanguage('subtitle', carry.subtitleLanguage);
+    const sameKind = subs.filter(s => !!s.IsForced === carry.subtitleForced);
+    const pickedSub = sameKind.find(s => s.Index === subtitleIndex) || sameKind.find(s => s.IsDefault) || sameKind[0] || subs[0];
+    if (pickedSub) subtitleIndex = pickedSub.Index;
+    return { audioIndex, subtitleIndex };
+}
+
+// Where the credits start, in seconds: an Outro media segment, else a credits chapter in the second half
+function creditsStart(segments, chapters, runtime) {
+    const outro = (segments || []).find(s => s.Type === 'Outro' && s.SegmentStartTicks > 0);
+    if (outro) return outro.SegmentStartTicks / 1e7;
+    const start = c => (c.StartPositionTicks ?? c.StartTicks ?? 0) / 1e7;
+    const credits = (chapters || []).find(c => /\b(credits|outro)\b/i.test(c.Name || '') && start(c) > (runtime || 0) / 2);
+    return credits ? start(credits) : null;
+}
+
+// When the card shows, in seconds: at the credits, else 10 s before the end; null shows it at the end
+function upNextStart(total, credits) {
+    if (credits !== null && credits > 0 && (!total || credits < total)) return credits;
+    return total >= 60 ? total - UP_NEXT_SECONDS : null;
+}
+
+// Loads the playing episode's neighbours, the user's autoplay switch and its credits; other items get none
+async function loadEpisodeNav(session, item) {
+    if (item?.Type !== 'Episode' || !item.SeriesId) return;
+    const [episodes, me, segments] = await Promise.all([
+        API.get(`/Shows/${item.SeriesId}/Episodes`).then(r => r?.Items || []).catch(e => {
+            console.warn('Could not load the episode list:', e);
+            return [];
+        }),
+        API.getMe().catch(() => null),
+        API.get(`/MediaSegments/${session.itemId}`).then(r => r?.Items || []).catch(() => []),
+    ]);
+    if (activePlayback !== session) return;
+    const { prev, next } = adjacentEpisodes(episodes, session.itemId);
+    episodeNav = {
+        session,
+        prev,
+        next,
+        // Jellyfin's UserConfiguration.EnableNextEpisodeAutoPlay, on unless the user turned it off
+        autoPlay: me?.Configuration?.EnableNextEpisodeAutoPlay !== false,
+        credits: creditsStart(segments, item.Chapters, session.runtime),
+        dismissed: false,
+    };
+    updateEpisodeButtons();
+}
+
+function resetEpisodeNav() {
+    hideUpNext();
+    episodeNav = null;
+    updateEpisodeButtons();
+}
+
+// Previous and next show for episodes only, and are disabled at the series' ends
+function updateEpisodeButtons() {
+    for (const [id, episode] of [['player-btn-prev-episode', episodeNav?.prev], ['player-btn-next-episode', episodeNav?.next]]) {
+        const button = $(id);
+        if (!button) continue;
+        button.hidden = !episodeNav;
+        button.disabled = !episode;
+    }
+}
+
+// Plays a neighbour from its start with this episode's track languages; finished reports this one as watched
+function playEpisode(session, episode, { finished = false } = {}) {
+    const carry = episodeTrackCarry(session);
+    if (finished) session.finished = true;
+    playItem(episode.Id, 'Videos', episode.Name || '', { fromStart: true, carry });
+}
+
+function playAdjacentEpisode(step) {
+    const nav = episodeNav;
+    const episode = step < 0 ? nav?.prev : nav?.next;
+    if (episode) playEpisode(nav.session, episode);
+}
+
+// Shows the card from its start time on; seeking back before that hides it again
+function checkUpNext(session) {
+    const nav = episodeNav;
+    if (!nav || nav.session !== session || !nav.next || nav.dismissed) return;
+    const start = upNextStart(session.total(), nav.credits);
+    if (start === null) return;
+    if (session.position() >= start) {
+        if (!upNext) showUpNext(nav);
+    } else if (upNext) {
+        hideUpNext();
+    }
+}
+
+// An episode that ended shows the card unless it was cancelled
+function upNextAtEnd(session) {
+    const nav = episodeNav;
+    if (nav && nav.session === session && nav.next && !nav.dismissed && !upNext) showUpNext(nav);
+}
+
+function episodeNumberLabel(e) {
+    if (e.ParentIndexNumber == null || e.IndexNumber == null) return '';
+    const episode = e.IndexNumberEnd != null && e.IndexNumberEnd !== e.IndexNumber ? `${e.IndexNumber}-${e.IndexNumberEnd}` : e.IndexNumber;
+    return t('player.episode_number', { season: e.ParentIndexNumber, episode });
+}
+
+// With autoplay on the card counts down and then plays; with it off it waits for Play now
+function showUpNext(nav) {
+    const card = $('player-up-next');
+    if (!card) return;
+    const episode = nav.next;
+    const picture = cardImage(episode, true);
+    const img = $('player-up-next-img');
+    img.hidden = !picture;
+    if (picture) img.src = API.imageUrl(picture.id, picture.type, { maxWidth: 320, tag: picture.tag });
+    else img.removeAttribute('src');
+    $('player-up-next-number').textContent = episodeNumberLabel(episode);
+    $('player-up-next-title').textContent = episode.Name || '';
+    upNext = { nav, remaining: UP_NEXT_SECONDS, timer: nav.autoPlay ? setInterval(upNextTick, 1000) : null };
+    $('player-up-next-countdown').hidden = !nav.autoPlay;
+    renderUpNextCountdown();
+    card.hidden = false;
+}
+
+function renderUpNextCountdown() {
+    if (upNext) $('player-up-next-countdown').textContent = t('player.up_next_countdown', { count: upNext.remaining });
+}
+
+function upNextTick() {
+    if (!upNext) return;
+    upNext.remaining -= 1;
+    if (upNext.remaining <= 0) playUpNextNow();
+    else renderUpNextCountdown();
+}
+
+function playUpNextNow() {
+    const nav = upNext?.nav;
+    hideUpNext();
+    if (nav?.next) playEpisode(nav.session, nav.next, { finished: true });
+}
+
+// Cancel closes the card for this episode, which then ends as usual
+function cancelUpNext() {
+    if (upNext) upNext.nav.dismissed = true;
+    hideUpNext();
+}
+
+function hideUpNext() {
+    if (upNext) clearInterval(upNext.timer);
+    upNext = null;
+    const card = $('player-up-next');
+    if (card) card.hidden = true;
 }
 
 function togglePlayPause() {
@@ -2871,17 +3074,15 @@ function toggleFullscreen() {
     const video = $('video-player');
     if (!video) return;
     if (!document.fullscreenElement) {
-        // Try video element first, then fallback to modal
-        if (video.requestFullscreen) {
-            video.requestFullscreen().catch(() => {
-                // Fallback: try the modal dialog
-                const m = $('player-modal');
-                if (m && m.requestFullscreen) m.requestFullscreen().catch(() => {});
+        // The player's container, so the controls and the next-episode card stay visible and the next
+        // episode plays on in fullscreen (a dialog can't be the fullscreen element); else the video alone
+        const container = $('player-modal')?.querySelector('.jf-player-container');
+        if (container && container.requestFullscreen) {
+            container.requestFullscreen().catch(() => {
+                if (video.requestFullscreen) video.requestFullscreen().catch(() => {});
             });
-        } else {
-            // Older browsers
-            const m = $('player-modal');
-            if (m && m.requestFullscreen) m.requestFullscreen().catch(() => {});
+        } else if (video.requestFullscreen) {
+            video.requestFullscreen().catch(() => {});
         }
     } else {
         document.exitFullscreen().catch(() => {});
@@ -3297,6 +3498,18 @@ async function renderSettings(data) {
                 <p class="text-xs text-white/40 mt-2">${t('settings.display_language_hint')}</p>
             </div>
 
+            <!-- Playback card -->
+            <div class="jf-settings-card">
+                <h3 class="text-base font-bold text-white mb-4 flex items-center gap-2">
+                    <span class="w-2 h-2 rounded-full bg-sky-400"></span>
+                    ${t('settings.playback')}
+                </h3>
+                <label class="flex items-center gap-3 text-sm text-white/80 cursor-pointer">
+                    <input id="pref-next-episode-autoplay" type="checkbox" class="toggle toggle-sm toggle-primary" ${me.Configuration?.EnableNextEpisodeAutoPlay !== false ? 'checked' : ''} onchange="changeNextEpisodeAutoPlay(this)">
+                    ${t('settings.next_episode_autoplay')}
+                </label>
+            </div>
+
             <!-- Change Password card -->
             <div class="jf-settings-card">
                 <h3 class="text-base font-bold text-white mb-4 flex items-center gap-2">
@@ -3320,6 +3533,22 @@ async function renderSettings(data) {
         $('change-password-form')?.addEventListener('submit', e => handleChangePassword(e, id));
     } catch (e) {
         page.innerHTML = `<div class="p-6 rounded-xl bg-red-500/10 text-red-400">${escapeHtml(e.message)}</div>`;
+    }
+}
+
+// Saves Jellyfin's EnableNextEpisodeAutoPlay into the user's configuration, keeping its other settings
+async function changeNextEpisodeAutoPlay(input) {
+    const enabled = input.checked;
+    input.disabled = true;
+    try {
+        const me = await API.getMe();
+        await API.post(`/Users/${me.Id}/Configuration`, { ...(me.Configuration || {}), EnableNextEpisodeAutoPlay: enabled });
+        toast(t('settings.next_episode_autoplay_saved'));
+    } catch (e) {
+        input.checked = !enabled;
+        toast(e.message, 'error');
+    } finally {
+        input.disabled = false;
     }
 }
 
@@ -5497,7 +5726,10 @@ window.addEventListener('hashchange', handleHash);
 
 document.addEventListener('DOMContentLoaded', async () => {
     // Every way of closing the player goes through here, so the session is stopped and its position reported once
-    $('player-modal')?.addEventListener('close', () => stopPlayback());
+    $('player-modal')?.addEventListener('close', () => {
+        stopPlayback();
+        resetEpisodeNav();
+    });
     window.addEventListener('pagehide', () => stopPlayback());
     updateAuthUI();
     const wizardActive = await checkSetupWizard();

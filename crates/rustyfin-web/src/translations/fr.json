@@ -83,7 +83,10 @@
         "key_saved": "Clé enregistrée – saisissez-en une nouvelle pour la remplacer",
         "key_clear": "Supprimer la clé enregistrée",
         "save_config": "Enregistrer la configuration",
-        "server_config_updated": "Configuration du serveur mise à jour"
+        "server_config_updated": "Configuration du serveur mise à jour",
+        "playback": "Lecture",
+        "next_episode_autoplay": "Lire automatiquement l'épisode suivant",
+        "next_episode_autoplay_saved": "Réglage de lecture enregistré"
     },
     "nav": {
         "toggle_menu": "Basculer le menu",

@@ -132,7 +132,10 @@
         "key_saved": "Key saved – type a new one to replace it",
         "key_clear": "Remove saved key",
         "save_config": "Save configuration",
-        "server_config_updated": "Server configuration updated"
+        "server_config_updated": "Server configuration updated",
+        "playback": "Playback",
+        "next_episode_autoplay": "Play next episode automatically",
+        "next_episode_autoplay_saved": "Playback setting saved"
     },
     "nav": {
         "toggle_menu": "Toggle menu",
@@ -242,7 +245,12 @@
         "track_undefined": "Undefined",
         "track_channels_one": "{{count}} ch",
         "track_channels_other": "{{count}} ch",
-        "subtitles_error": "Subtitles could not be loaded"
+        "subtitles_error": "Subtitles could not be loaded",
+        "previous_episode": "Previous episode",
+        "next_episode": "Next episode",
+        "play_now": "Play now",
+        "episode_number": "S{{season}}:E{{episode}}",
+        "up_next_countdown": "Starts in {{count}} s"
     },
     "admin": {
         "new_user_title": "New User",

@@ -491,6 +491,23 @@
             <div id="player-center-icon" class="hidden absolute w-20 h-20 rounded-full bg-black/60 backdrop-blur-md flex items-center justify-center pointer-events-none transition-transform duration-200"></div>
         </div>
 
+        <!-- Next episode card: near an episode's end, counts down unless autoplay is off -->
+        <div id="player-up-next" class="absolute right-4 bottom-32 lg:right-6 z-40 w-80 max-w-[calc(100%-2rem)] rounded-xl bg-black/70 backdrop-blur-md border border-white/10 p-3 text-white shadow-2xl" role="region" aria-labelledby="player-up-next-heading" hidden>
+            <p id="player-up-next-heading" class="text-xs font-semibold uppercase tracking-wide text-white/60 mb-2" data-i18n="player.next_episode">Next episode</p>
+            <div class="flex gap-3">
+                <img id="player-up-next-img" class="w-28 aspect-video object-cover rounded bg-white/10 shrink-0" alt="">
+                <div class="min-w-0">
+                    <p id="player-up-next-number" class="text-xs text-white/60"></p>
+                    <p id="player-up-next-title" class="text-sm font-semibold line-clamp-2"></p>
+                    <p id="player-up-next-countdown" class="text-xs text-[#38bdf8] mt-1" aria-live="polite"></p>
+                </div>
+            </div>
+            <div class="flex justify-end gap-2 mt-3">
+                <button class="jf-btn-ghost !py-1.5 !px-3 text-xs" onclick="cancelUpNext()" data-i18n="common.cancel">Cancel</button>
+                <button class="jf-btn-primary !py-1.5 !px-3 text-xs" onclick="playUpNextNow()" data-i18n="player.play_now">Play now</button>
+            </div>
+        </div>
+
         <!-- Bottom Controls Bar (autohide) -->
         <div id="player-controls" class="jf-player-controls z-30">
             <!-- Progress Slider -->
@@ -512,6 +529,14 @@
                     </button>
                     <button class="jf-icon-btn" title="Fast-forward 30s (→)" aria-label="Fast-forward 30s (→)" data-i18n-title="player.forward_tooltip" data-i18n-aria-label="player.forward_tooltip" onclick="skipTime(30)">
                         <i data-lucide="fast-forward" class="w-5 h-5"></i>
+                    </button>
+
+                    <!-- Episode navigation: shown for episodes only, disabled at the series' ends -->
+                    <button id="player-btn-prev-episode" class="jf-icon-btn disabled:opacity-40 disabled:cursor-not-allowed" title="Previous episode" aria-label="Previous episode" data-i18n-title="player.previous_episode" data-i18n-aria-label="player.previous_episode" onclick="playAdjacentEpisode(-1)" hidden>
+                        <i data-lucide="skip-back" class="w-5 h-5"></i>
+                    </button>
+                    <button id="player-btn-next-episode" class="jf-icon-btn disabled:opacity-40 disabled:cursor-not-allowed" title="Next episode" aria-label="Next episode" data-i18n-title="player.next_episode" data-i18n-aria-label="player.next_episode" onclick="playAdjacentEpisode(1)" hidden>
+                        <i data-lucide="skip-forward" class="w-5 h-5"></i>
                     </button>
 
                     <!-- Volume slider -->

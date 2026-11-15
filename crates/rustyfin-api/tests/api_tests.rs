@@ -17829,6 +17829,29 @@ fn b145_icons() {
     b124_node_test("b145_icons.mjs");
 }
 
+// B171: next-episode autoplay and previous/next episode buttons in the web player
+#[test]
+fn b171_next_episode() {
+    b124_node_test("b171_next_episode.mjs");
+}
+
+// The web client's autoplay switch is Jellyfin's UserConfiguration.EnableNextEpisodeAutoPlay: the
+// configuration a user saves comes back from /Users/Me as it was sent, other settings included.
+#[tokio::test]
+async fn b171_user_configuration_keeps_next_episode_autoplay() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (_owner, _owner_id, viewer, viewer_id) = g1_owner_and_viewer(&state, &app).await;
+    let config =
+        serde_json::json!({ "EnableNextEpisodeAutoPlay": false, "SubtitleMode": "Always" });
+    let uri = format!("/Users/{viewer_id}/Configuration");
+    let req = request("POST", &uri, Some(&viewer), Some(config.clone()));
+    assert!(send(&app, req).await.0.is_success());
+    let (status, me) = send(&app, request("GET", "/Users/Me", Some(&viewer), None)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(me["Configuration"], config);
+}
+
 #[test]
 fn b142_settings_key_inputs_hide_keys() {
     let app_js = b124_web_source("app.js");

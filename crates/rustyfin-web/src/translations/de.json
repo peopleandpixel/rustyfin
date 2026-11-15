@@ -132,7 +132,10 @@
         "key_saved": "Schlüssel gespeichert – zum Ersetzen einen neuen eingeben",
         "key_clear": "Gespeicherten Schlüssel entfernen",
         "save_config": "Konfiguration speichern",
-        "server_config_updated": "Server-Konfiguration aktualisiert"
+        "server_config_updated": "Server-Konfiguration aktualisiert",
+        "playback": "Wiedergabe",
+        "next_episode_autoplay": "Nächste Folge automatisch abspielen",
+        "next_episode_autoplay_saved": "Wiedergabe-Einstellung gespeichert"
     },
     "nav": {
         "toggle_menu": "Menü ein-/ausblenden",
@@ -242,7 +245,12 @@
         "track_undefined": "Undefiniert",
         "track_channels_one": "{{count}} Kanal",
         "track_channels_other": "{{count}} Kanäle",
-        "subtitles_error": "Untertitel konnten nicht geladen werden"
+        "subtitles_error": "Untertitel konnten nicht geladen werden",
+        "previous_episode": "Vorherige Folge",
+        "next_episode": "Nächste Folge",
+        "play_now": "Jetzt abspielen",
+        "episode_number": "S{{season}}:E{{episode}}",
+        "up_next_countdown": "Startet in {{count}} s"
     },
     "admin": {
         "new_user_title": "Neuer Benutzer",

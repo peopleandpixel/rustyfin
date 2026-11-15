@@ -83,7 +83,10 @@
         "key_saved": "키 저장됨 – 새 키를 입력하면 바뀝니다",
         "key_clear": "저장된 키 삭제",
         "save_config": "구성 저장",
-        "server_config_updated": "서버 구성이 업데이트되었습니다"
+        "server_config_updated": "서버 구성이 업데이트되었습니다",
+        "playback": "재생",
+        "next_episode_autoplay": "다음 에피소드 자동 재생",
+        "next_episode_autoplay_saved": "재생 설정이 저장되었습니다"
     },
     "nav": {
         "toggle_menu": "메뉴 전환",
