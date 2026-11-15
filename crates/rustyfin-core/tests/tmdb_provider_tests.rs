@@ -148,6 +148,10 @@ async fn handle(
         query,
         user_agent,
     });
+    // A season answers slowly, so that concurrent requests for it overlap
+    if path.contains("/season/") {
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
     match state.mode {
         Mode::Status(code) => StatusCode::from_u16(code).unwrap().into_response(),
         Mode::Canned => match canned(&path) {
@@ -600,6 +604,63 @@ async fn b134a_registered_provider_shares_the_client_cache() {
         before,
         "a request went out without a key"
     );
+}
+
+/// R1 scan (review L3): concurrent season lookups for one series and season make one request; a
+/// season TMDb lacks (404) is asked for once; a failure (500) is asked again.
+#[tokio::test]
+async fn r1scan_season_lookups_are_single_flight_and_remember_a_404() {
+    async fn lookups_on(stub: &Stub) -> Arc<dyn rustyfin_model::metadata::MetadataLookups> {
+        let dir = std::env::temp_dir().join(format!("r1scan_l3_{}", std::process::id()));
+        let pm = PluginManager::new(&dir);
+        pm.register_builtin_plugin(BuiltinPluginInfo {
+            name: "TMDb".to_string(),
+            version: "0".to_string(),
+            id: "tmdb".to_string(),
+            description: String::new(),
+            plugin_type: PluginType::MetadataProvider,
+            status: PluginStatus::Active,
+        })
+        .await;
+        let plugin = TmdbPlugin::default();
+        plugin.set_configuration(json!({ "api_key": KEY })).unwrap();
+        register_tmdb_provider(&plugin, stub.client(), &pm)
+            .await
+            .unwrap();
+        pm.metadata_providers()
+            .await
+            .into_iter()
+            .find(|p| p.provider_name == "tmdb")
+            .and_then(|p| p.lookups)
+            .expect("tmdb lookups")
+    }
+    let count = |stub: &Stub, path: &str| stub.hits().iter().filter(|h| h.path == path).count();
+
+    let stub = Stub::start(Mode::Canned).await;
+    let lookups = lookups_on(&stub).await;
+    let mut tasks = Vec::new();
+    for _ in 0..10 {
+        let lookups = lookups.clone();
+        tasks.push(tokio::spawn(async move { lookups.season(9101, 1).await }));
+    }
+    for task in tasks {
+        assert!(task.await.unwrap().is_some());
+    }
+    assert_eq!(count(&stub, "/tv/9101/season/1"), 1);
+
+    // A 404 is remembered
+    for _ in 0..3 {
+        assert!(lookups.season(9101, 9).await.is_none());
+    }
+    assert_eq!(count(&stub, "/tv/9101/season/9"), 1);
+
+    // A failure is not
+    let failing = Stub::start(Mode::Status(500)).await;
+    let lookups = lookups_on(&failing).await;
+    assert!(lookups.season(9101, 1).await.is_none());
+    let first = count(&failing, "/tv/9101/season/1");
+    assert!(lookups.season(9101, 1).await.is_none());
+    assert!(count(&failing, "/tv/9101/season/1") > first);
 }
 
 // ── Failures ──

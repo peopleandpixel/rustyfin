@@ -61,7 +61,14 @@ pub trait MetadataProviderRegistrar {
 struct TmdbLookups {
     key: Arc<Mutex<Option<String>>>,
     client: TmdbClient,
+    /// Season answers by (series id, season number), the season TMDb lacks (404) included. All
+    /// episodes of a season ask for it at once in a scan; this makes that one request, and a
+    /// missing season isn't asked for again by each of them or by the next run within the hour.
+    seasons: moka::future::Cache<(i64, i32), Option<SeasonMetadata>>,
 }
+
+/// How long `TmdbLookups` keeps a season's answer: longer than a scan or refresh run.
+const SEASON_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
 
 impl TmdbLookups {
     fn api(&self) -> Option<TmdbApi> {
@@ -99,7 +106,18 @@ impl MetadataLookups for TmdbLookups {
         series_id: i64,
         season_number: i32,
     ) -> Pin<Box<dyn Future<Output = Option<SeasonMetadata>> + Send + '_>> {
-        Box::pin(async move { season(&self.api()?, series_id, season_number).await })
+        Box::pin(async move {
+            let tmdb = self.api()?;
+            // One request for concurrent callers; a final answer (a 404 too) is kept, a failure
+            // is not
+            self.seasons
+                .try_get_with((series_id, season_number), async {
+                    season_lookup(&tmdb, series_id, season_number).await
+                })
+                .await
+                .ok()
+                .flatten()
+        })
     }
 }
 
@@ -207,6 +225,10 @@ where
     let lookups = Arc::new(TmdbLookups {
         key: plugin.api_key.clone(),
         client,
+        seasons: moka::future::Cache::builder()
+            .max_capacity(10_000)
+            .time_to_live(SEASON_CACHE_TTL)
+            .build(),
     });
 
     let plugin_id = plugin.id().to_string();
@@ -869,11 +891,31 @@ pub async fn series_by_id(tmdb: &TmdbApi, tmdb_id: i64) -> Option<ExternalMetada
 /// rating, still and guest stars and crew; their IMDb and TVDb ids would need one call each, so
 /// they are left out.
 pub async fn season(tmdb: &TmdbApi, series_id: i64, season_number: i32) -> Option<SeasonMetadata> {
+    season_lookup(tmdb, series_id, season_number)
+        .await
+        .ok()
+        .flatten()
+}
+
+/// A season as `season` gives it, telling a final answer (the season, or `None` for a 404 or a
+/// body that isn't a season) from a failure worth asking again (`Err`: other statuses, timeouts,
+/// network errors).
+async fn season_lookup(
+    tmdb: &TmdbApi,
+    series_id: i64,
+    season_number: i32,
+) -> Result<Option<SeasonMetadata>, crate::tmdb_client::TmdbError> {
     let endpoint = format!("/tv/{}/season/{}", series_id, season_number);
     let query = [("append_to_response", SEASON_APPEND)];
     let season: TmdbSeason = match tmdb.get_json(&endpoint, &query).await {
-        Ok(json) => serde_json::from_value(json).ok()?,
-        Err(_) => return None,
+        Ok(json) => match serde_json::from_value(json) {
+            Ok(season) => season,
+            Err(_) => return Ok(None),
+        },
+        Err(e) if matches!(e.kind, crate::tmdb_client::TmdbErrorKind::Status(404)) => {
+            return Ok(None);
+        }
+        Err(e) => return Err(e),
     };
 
     let mut images = convert_images(tmdb, season.images.unwrap_or_default());
@@ -946,7 +988,7 @@ pub async fn season(tmdb: &TmdbApi, series_id: i64, season_number: i32) -> Optio
         })
         .collect();
 
-    Some(SeasonMetadata { meta, episodes })
+    Ok(Some(SeasonMetadata { meta, episodes }))
 }
 
 /// The search result whose title (or original title) is the searched name, ignoring case, else
