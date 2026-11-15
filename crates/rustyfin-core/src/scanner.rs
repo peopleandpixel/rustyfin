@@ -1491,7 +1491,7 @@ async fn scan_music_library(
     for (path, files) in roots {
         // Collect new items for batch insert in a single transaction
         let mut new_items: Vec<MediaItem> = Vec::new();
-        // The artist links of the new items, written once their batch is stored (spec 1.5-1.6).
+        // The artist links of the new items, written once their batch is stored.
         let mut music_links: Vec<(Uuid, &str, Vec<String>)> = Vec::new();
         // Per new album, the first new track whose file has an attached picture, and its codec.
         let mut embedded_covers: HashMap<Uuid, (String, String)> = HashMap::new();
@@ -1584,7 +1584,7 @@ async fn scan_music_library(
                 (false, None, None, None, None, None, None, None)
             };
 
-            // The track's artists: the artist tag split on `;`, else the album artist tag (spec 1.5).
+            // The track's artists: the artist tag split on `;`, else the album artist tag.
             let (track_artists, album_artist_tag) = artists_and_album_artist(&probe_result);
 
             // Use tag album name if available, otherwise directory name
@@ -1676,7 +1676,7 @@ async fn scan_music_library(
                     ..MediaItem::default_dto_fields()
                 };
                 // The album artist: this first track's album artist tag, else the artist folder, else
-                // the track's first artist (spec 1.6).
+                // the track's first artist.
                 let album_artist = album_artist_tag
                     .clone()
                     .or_else(|| artist_name_from_dir.clone())
@@ -1876,7 +1876,7 @@ async fn scan_music_library(
 }
 
 /// The artist names in an artist tag: split on `;`, trimmed, empty and repeated names dropped, in
-/// tag order (spec 1.5).
+/// tag order.
 fn split_artist_tag(tag: &str) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     for part in tag.split(';').map(str::trim).filter(|p| !p.is_empty()) {

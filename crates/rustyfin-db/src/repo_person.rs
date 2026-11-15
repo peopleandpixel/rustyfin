@@ -57,7 +57,7 @@ pub async fn music_artist_by_id(
     }))
 }
 
-/// Links music items to their artists in one transaction (spec 1.5-1.6). Each `(item id, kind,
+/// Links music items to their artists in one transaction. Each `(item id, kind,
 /// names)` gets one `item_people` row per name, of `kind` (`Artist` for tracks, `AlbumArtist` for
 /// albums), in name order. A name that is already a person is reused; the rows are inserted with
 /// `INSERT OR IGNORE`, so a repeated link adds nothing.
@@ -186,6 +186,45 @@ pub async fn get_links_batch(
         }
         for (item_id, pid, name) in q.fetch_all(pool).await? {
             map.entry(item_id).or_default().push((pid, name));
+        }
+    }
+    Ok(map)
+}
+
+/// The distinct artists of the tracks of each album in `album_ids`, as `(album id, [(artist id,
+/// name)])`. Tracks are read in track order (parent index number, index number, name), then each
+/// track's artists in credit order; a name is kept once, case-insensitively, under the id its track
+/// links show it with. Albums whose tracks have no `Artist` links are absent. Chunked to keep the
+/// SQL parameter count small.
+pub async fn album_track_artists_batch(
+    pool: &SqlitePool,
+    album_ids: &[Uuid],
+) -> Result<std::collections::HashMap<String, Vec<(String, String)>>, sqlx::Error> {
+    let mut map: std::collections::HashMap<String, Vec<(String, String)>> =
+        std::collections::HashMap::new();
+    for chunk in album_ids.chunks(100) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let id_sql = item_artist_id_sql();
+        let query = format!(
+            "SELECT t.parent_id, CASE WHEN ip.type IN ('Artist', 'AlbumArtist') THEN {id_sql} ELSE p.id END, p.name \
+             FROM media_items t JOIN item_people ip ON ip.item_id = t.id JOIN people p ON p.id = ip.person_id \
+             WHERE t.media_type = 'Audio' AND ip.type = 'Artist' AND t.parent_id IN ({placeholders}) \
+             ORDER BY t.parent_id, t.parent_index_number IS NULL, t.parent_index_number, \
+             t.index_number IS NULL, t.index_number, t.name, t.id, ip.sort_order IS NULL, ip.sort_order, ip.rowid"
+        );
+        let mut q = sqlx::query_as::<_, (String, String, String)>(sqlx::AssertSqlSafe(query));
+        for id in chunk {
+            q = q.bind(id.to_string());
+        }
+        for (album_id, pid, name) in q.fetch_all(pool).await? {
+            let artists = map.entry(album_id).or_default();
+            let folded = name.to_lowercase();
+            if !artists
+                .iter()
+                .any(|(_, seen)| seen.to_lowercase() == folded)
+            {
+                artists.push((pid, name));
+            }
         }
     }
     Ok(map)
