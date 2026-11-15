@@ -73,6 +73,7 @@ async fn test_state() -> AppState {
         config: Arc::new(RwLock::new(ServerConfiguration::default())),
         shutdown_tx: Arc::new(shutdown_tx),
         bind_addr: Arc::new("0.0.0.0:8096".to_string()),
+        published_url: None,
         api_key: Some(Arc::new("test-api-key".to_string())),
         quick_connect: Arc::new(RwLock::new(HashMap::new())),
         transcode_manager,
@@ -4655,28 +4656,26 @@ async fn r1auth_case_variants_keep_their_guards() {
     }
 }
 
-/// `LocalAddress` is an address a client can use: the configured public URL, else the request's
-/// Host with its scheme, never the unspecified bind address.
+/// `LocalAddress` is an address a client can use: `RUSTYFIN_PUBLISHED_URL` when set, else the
+/// request's Host with its scheme, never the unspecified bind address.
 #[tokio::test]
 async fn r1auth_local_address_is_reachable() {
     let state = test_state().await;
-    let local = |headers: Vec<(&'static str, &'static str)>| {
-        let state = state.clone();
-        async move {
-            let mut builder = Request::builder().uri("/System/Info/Public");
-            for (name, value) in headers {
-                builder = builder.header(name, value);
-            }
-            let resp = app(state)
-                .oneshot(builder.body(Body::empty()).unwrap())
-                .await
-                .unwrap();
-            assert_eq!(resp.status(), StatusCode::OK);
-            let body = resp.into_body().collect().await.unwrap().to_bytes();
-            let info: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            info["LocalAddress"].as_str().unwrap().to_string()
+    let local_in = |state: AppState, headers: Vec<(&'static str, &'static str)>| async move {
+        let mut builder = Request::builder().uri("/System/Info/Public");
+        for (name, value) in headers {
+            builder = builder.header(name, value);
         }
+        let resp = app(state)
+            .oneshot(builder.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let info: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        info["LocalAddress"].as_str().unwrap().to_string()
     };
+    let local = |headers: Vec<(&'static str, &'static str)>| local_in(state.clone(), headers);
     // test_state binds 0.0.0.0:8096.
     assert_eq!(local(vec![]).await, "http://localhost:8096");
     assert_eq!(
@@ -4695,17 +4694,35 @@ async fn r1auth_local_address_is_reachable() {
         local(vec![("Host", "evil\"<x>")]).await,
         "http://localhost:8096"
     );
+    // The sign-in provider's public URL is not LocalAddress's source.
     let mut oidc = rustyfin_db::repo_oidc::get_settings(&state.db)
         .await
         .unwrap();
-    oidc.public_url = "https://flix.example/jf/".to_string();
+    oidc.public_url = "https://sso.example/jf/".to_string();
     rustyfin_db::repo_oidc::save_settings(&state.db, &oidc)
         .await
         .unwrap();
     assert_eq!(
         local(vec![("Host", "media.example:8096")]).await,
-        "https://flix.example/jf"
+        "http://media.example:8096"
     );
+    // The published URL comes first, over the Host and the forwarded scheme.
+    let published = AppState {
+        published_url: Some(Arc::new("https://flix.example/jf/".to_string())),
+        ..state.clone()
+    };
+    for headers in [
+        vec![],
+        vec![
+            ("Host", "media.example:8096"),
+            ("X-Forwarded-Proto", "http"),
+        ],
+    ] {
+        assert_eq!(
+            local_in(published.clone(), headers).await,
+            "https://flix.example/jf"
+        );
+    }
 }
 
 /// `/Users/{userId}/Items/{itemId}` answers with the path user's watch data, as Jellyfin does.

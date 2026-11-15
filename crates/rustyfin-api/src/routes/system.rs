@@ -79,16 +79,13 @@ async fn ping() -> &'static str {
     "\"Rustyfin\""
 }
 
-/// The address clients reach this server at, Jellyfin's `LocalAddress`: the public URL set in
-/// the single sign-on settings, the only configured public URL; else the request's Host, with
-/// `https` when `X-Forwarded-Proto` says so and `http` otherwise; else the bind address, with
+/// The address clients reach this server at, Jellyfin's `LocalAddress` (as its
+/// `GetSmartApiUrl`): `RUSTYFIN_PUBLISHED_URL` when set; else the request's Host, with `https`
+/// when `X-Forwarded-Proto` says so and `http` otherwise; else the bind address, with
 /// `localhost` for an unspecified IP (`0.0.0.0` is no address a client can use). No trailing `/`.
-pub(crate) async fn local_address(state: &AppState, headers: &axum::http::HeaderMap) -> String {
-    if let Ok(oidc) = rustyfin_db::repo_oidc::get_settings(&state.db_ro).await {
-        let public = oidc.public_url.trim().trim_end_matches('/');
-        if public.starts_with("http://") || public.starts_with("https://") {
-            return public.to_string();
-        }
+pub(crate) fn local_address(state: &AppState, headers: &axum::http::HeaderMap) -> String {
+    if let Some(published) = &state.published_url {
+        return published.trim().trim_end_matches('/').to_string();
     }
     let host = headers
         .get(header::HOST)
@@ -118,7 +115,7 @@ async fn get_public_info(
     headers: axum::http::HeaderMap,
 ) -> Result<Json<ServerInfo>, ApiError> {
     let startup_wizard_completed = rustyfin_db::repo_user::users_exist(&state.db_ro).await?;
-    let local_address = local_address(&state, &headers).await;
+    let local_address = local_address(&state, &headers);
     let config = state.config.read().await;
     Ok(Json(ServerInfo {
         server_name: config.server_name.clone(),
@@ -136,7 +133,7 @@ async fn get_full_info(
     headers: axum::http::HeaderMap,
 ) -> Result<Json<FullServerInfo>, ApiError> {
     let startup_wizard_completed = rustyfin_db::repo_user::users_exist(&state.db_ro).await?;
-    let local_address = local_address(&state, &headers).await;
+    let local_address = local_address(&state, &headers);
     let config = state.config.read().await;
     let log_path = state.data_dir.join("logs").to_string_lossy().to_string();
     let cache_path = state.data_dir.join("cache").to_string_lossy().to_string();
@@ -194,7 +191,7 @@ async fn get_endpoint(
     Json(EndpointInfo {
         is_local,
         is_in_network,
-        local_address: local_address(&state, req.headers()).await,
+        local_address: local_address(&state, req.headers()),
         remote_address: remote_ip,
     })
 }

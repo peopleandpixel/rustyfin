@@ -412,6 +412,10 @@ async fn main() {
         config: Arc::new(RwLock::new(config)),
         shutdown_tx: Arc::new(shutdown_tx),
         bind_addr: Arc::new(bind_addr.clone()),
+        published_url: std::env::var("RUSTYFIN_PUBLISHED_URL")
+            .ok()
+            .filter(|url| !url.trim().is_empty())
+            .map(Arc::new),
         api_key: api_key.map(Arc::new),
         quick_connect: Arc::new(RwLock::new(std::collections::HashMap::new())),
         transcode_manager,
@@ -493,7 +497,7 @@ async fn main() {
             server_id: state.server_id.to_string(),
             http_port,
             bind_ip: std::net::Ipv4Addr::UNSPECIFIED,
-            endpoint_address: std::env::var("RUSTYFIN_PUBLISHED_URL").ok(),
+            endpoint_address: state.published_url.as_deref().cloned(),
         });
         let shutdown_rx = state.shutdown_tx.subscribe();
         tokio::spawn(async move {

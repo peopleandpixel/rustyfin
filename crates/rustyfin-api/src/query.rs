@@ -89,13 +89,15 @@ const LIST_PARAMS: &[&str] = &[
 /// The most query pairs `joined_repeats` reads; a longer query gets the plain parse's error.
 const MAX_JOINED_PAIRS: usize = 512;
 
-/// The URI with each repeated query name given once: a list parameter's values joined with
+/// The URI with each repeated query name (without ASCII case) given once: a list parameter's
+/// values joined with
 /// commas in their order, any other parameter's first pair kept. `None` when no name repeats or
 /// the query has more than `MAX_JOINED_PAIRS` pairs. Linear in the number of pairs.
 fn joined_repeats(uri: &Uri) -> Option<Uri> {
     let query = uri.query()?;
     let mut pairs: Vec<(&str, Option<String>)> = Vec::new();
-    let mut index: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    // Names match without ASCII case, as ASP.NET binds them; the first spelling is kept.
+    let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut repeated = false;
     for (n, pair) in query.split('&').filter(|p| !p.is_empty()).enumerate() {
         if n == MAX_JOINED_PAIRS {
@@ -105,7 +107,7 @@ fn joined_repeats(uri: &Uri) -> Option<Uri> {
             Some((name, value)) => (name, Some(value)),
             None => (pair, None),
         };
-        match index.get(name) {
+        match index.get(&name.to_ascii_lowercase()) {
             Some(&i) => {
                 repeated = true;
                 if LIST_PARAMS.iter().any(|p| p.eq_ignore_ascii_case(name)) {
@@ -115,7 +117,7 @@ fn joined_repeats(uri: &Uri) -> Option<Uri> {
                 }
             }
             None => {
-                index.insert(name, pairs.len());
+                index.insert(name.to_ascii_lowercase(), pairs.len());
                 pairs.push((name, value.map(str::to_string)));
             }
         }
@@ -602,6 +604,13 @@ mod tests {
         assert_eq!(q.limit, Some(1));
         assert_eq!(q.search_term.as_deref(), Some("a"));
         assert_eq!(q.fields.as_deref(), Some("A,B"));
+        // Repeats that differ only in case are one name, under its first spelling, once a repeat
+        // makes the plain parse fail.
+        let q: ListQuery = extract("/Items?fields=A&Fields=B&fields=C&limit=3&LIMIT=4")
+            .await
+            .unwrap();
+        assert_eq!(q.fields.as_deref(), Some("A,B,C"));
+        assert_eq!(q.limit, Some(3));
         // A bad first value stays a 400, as the plain parse answers it.
         assert!(
             extract::<ListQuery>("/Items?limit=x&limit=2")
