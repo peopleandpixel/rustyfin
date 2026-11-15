@@ -73,8 +73,16 @@ pub struct SeasonMetadata {
     pub episodes: Vec<(i32, ExternalMetadata)>,
 }
 
+/// A lookup that got no final answer (a timeout, a 5xx, a rate limit, no API key), so it is worth
+/// asking again later. `Ok(None)` is a final "not there" (a 404).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LookupFailed;
+
+/// The answer of a lookup: `Ok(Some(_))` found, `Ok(None)` not there, `Err` failed.
+pub type LookupResult<T> = Result<Option<T>, LookupFailed>;
+
 type LookupFuture<'a, T> =
-    std::pin::Pin<Box<dyn std::future::Future<Output = Option<T>> + Send + 'a>>;
+    std::pin::Pin<Box<dyn std::future::Future<Output = LookupResult<T>> + Send + 'a>>;
 
 /// Lookups a provider offers beyond the name searches: by provider id, a TV search with the
 /// first-air year, and a season with its episodes. Ids are the provider's own (TMDb for TMDb).

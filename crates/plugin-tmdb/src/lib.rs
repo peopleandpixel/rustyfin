@@ -7,7 +7,8 @@ use std::sync::{Arc, Mutex};
 use crate::tmdb_client::{TmdbApi, TmdbClient};
 use rustyfin_model::media::MediaType;
 use rustyfin_model::metadata::{
-    ExternalMetadata, MetadataImage, MetadataLookups, MetadataPerson, SeasonMetadata,
+    ExternalMetadata, LookupFailed, LookupResult, MetadataImage, MetadataLookups, MetadataPerson,
+    SeasonMetadata,
 };
 use rustyfin_model::plugin::{Plugin, PluginStatus, PluginType};
 use serde::Deserialize;
@@ -77,37 +78,35 @@ impl TmdbLookups {
     }
 }
 
+type Answer<'a, T> = Pin<Box<dyn Future<Output = LookupResult<T>> + Send + 'a>>;
+
 impl MetadataLookups for TmdbLookups {
-    fn movie_by_id(
-        &self,
-        id: i64,
-    ) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send + '_>> {
-        Box::pin(async move { movie_by_id(&self.api()?, id).await })
-    }
-
-    fn series_by_id(
-        &self,
-        id: i64,
-    ) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send + '_>> {
-        Box::pin(async move { series_by_id(&self.api()?, id).await })
-    }
-
-    fn search_series(
-        &self,
-        name: &str,
-        year: Option<i32>,
-    ) -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send + '_>> {
-        let name = name.to_string();
-        Box::pin(async move { search_tv(&self.api()?, &name, year).await })
-    }
-
-    fn season(
-        &self,
-        series_id: i64,
-        season_number: i32,
-    ) -> Pin<Box<dyn Future<Output = Option<SeasonMetadata>> + Send + '_>> {
+    // No API key is a failure, not an answer: the item is asked again once a key is set
+    fn movie_by_id(&self, id: i64) -> Answer<'_, ExternalMetadata> {
         Box::pin(async move {
-            let tmdb = self.api()?;
+            let tmdb = self.api().ok_or(LookupFailed)?;
+            movie_lookup(&tmdb, id).await.map_err(|_| LookupFailed)
+        })
+    }
+
+    fn series_by_id(&self, id: i64) -> Answer<'_, ExternalMetadata> {
+        Box::pin(async move {
+            let tmdb = self.api().ok_or(LookupFailed)?;
+            series_lookup(&tmdb, id).await.map_err(|_| LookupFailed)
+        })
+    }
+
+    fn search_series(&self, name: &str, year: Option<i32>) -> Answer<'_, ExternalMetadata> {
+        let name = name.to_string();
+        Box::pin(async move {
+            let tmdb = self.api().ok_or(LookupFailed)?;
+            Ok(search_tv(&tmdb, &name, year).await)
+        })
+    }
+
+    fn season(&self, series_id: i64, season_number: i32) -> Answer<'_, SeasonMetadata> {
+        Box::pin(async move {
+            let tmdb = self.api().ok_or(LookupFailed)?;
             // One request for concurrent callers; a final answer (a 404 too) is kept, a failure
             // is not
             self.seasons
@@ -115,8 +114,7 @@ impl MetadataLookups for TmdbLookups {
                     season_lookup(&tmdb, series_id, season_number).await
                 })
                 .await
-                .ok()
-                .flatten()
+                .map_err(|_| LookupFailed)
         })
     }
 }
@@ -698,11 +696,35 @@ pub async fn search_movie(
 
 /// A movie's metadata by TMDb id, from one details call.
 pub async fn movie_by_id(tmdb: &TmdbApi, tmdb_id: i64) -> Option<ExternalMetadata> {
+    movie_lookup(tmdb, tmdb_id).await.ok().flatten()
+}
+
+/// The JSON of a request, telling a final "not there" (a 404: `Ok(None)`) from a failure worth
+/// asking again (`Err`: other statuses, timeouts, network errors).
+async fn final_json(
+    tmdb: &TmdbApi,
+    endpoint: &str,
+    query: &[(&str, &str)],
+) -> Result<Option<serde_json::Value>, crate::tmdb_client::TmdbError> {
+    match tmdb.get_json(endpoint, query).await {
+        Ok(json) => Ok(Some(json)),
+        Err(e) if matches!(e.kind, crate::tmdb_client::TmdbErrorKind::Status(404)) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// `movie_by_id`, telling a 404 or an unreadable body (`Ok(None)`) from a failure (`Err`).
+async fn movie_lookup(
+    tmdb: &TmdbApi,
+    tmdb_id: i64,
+) -> Result<Option<ExternalMetadata>, crate::tmdb_client::TmdbError> {
     let details_endpoint = format!("/movie/{}", tmdb_id);
     let details_query = [("append_to_response", MOVIE_APPEND)];
-    let details: TmdbMovieDetails = match tmdb.get_json(&details_endpoint, &details_query).await {
-        Ok(json) => serde_json::from_value(json).ok()?,
-        Err(_) => return None,
+    let Some(json) = final_json(tmdb, &details_endpoint, &details_query).await? else {
+        return Ok(None);
+    };
+    let Ok(details) = serde_json::from_value::<TmdbMovieDetails>(json) else {
+        return Ok(None);
     };
 
     let images = convert_images(tmdb, details.images.unwrap_or_default());
@@ -743,7 +765,7 @@ pub async fn movie_by_id(tmdb: &TmdbApi, tmdb_id: i64) -> Option<ExternalMetadat
 
     let people = details.credits.map(|c| convert_people(tmdb, c, "Actor"));
 
-    Some(ExternalMetadata {
+    Ok(Some(ExternalMetadata {
         name: details.title,
         overview: details.overview,
         production_year,
@@ -774,7 +796,7 @@ pub async fn movie_by_id(tmdb: &TmdbApi, tmdb_id: i64) -> Option<ExternalMetadat
         writers: None,
         imdb_id: non_empty(details.imdb_id),
         people,
-    })
+    }))
 }
 
 /// Search TMDb for a TV show and return full metadata from details endpoint. `year` is the first
@@ -798,11 +820,21 @@ pub async fn search_tv(tmdb: &TmdbApi, name: &str, year: Option<i32>) -> Option<
 
 /// A series' metadata by TMDb id, from one details call.
 pub async fn series_by_id(tmdb: &TmdbApi, tmdb_id: i64) -> Option<ExternalMetadata> {
+    series_lookup(tmdb, tmdb_id).await.ok().flatten()
+}
+
+/// `series_by_id`, telling a 404 or an unreadable body (`Ok(None)`) from a failure (`Err`).
+async fn series_lookup(
+    tmdb: &TmdbApi,
+    tmdb_id: i64,
+) -> Result<Option<ExternalMetadata>, crate::tmdb_client::TmdbError> {
     let details_endpoint = format!("/tv/{}", tmdb_id);
     let details_query = [("append_to_response", SERIES_APPEND)];
-    let details: TmdbTvDetails = match tmdb.get_json(&details_endpoint, &details_query).await {
-        Ok(json) => serde_json::from_value(json).ok()?,
-        Err(_) => return None,
+    let Some(json) = final_json(tmdb, &details_endpoint, &details_query).await? else {
+        return Ok(None);
+    };
+    let Ok(details) = serde_json::from_value::<TmdbTvDetails>(json) else {
+        return Ok(None);
     };
 
     let images = convert_images(tmdb, details.images.unwrap_or_default());
@@ -853,7 +885,7 @@ pub async fn series_by_id(tmdb: &TmdbApi, tmdb_id: i64) -> Option<ExternalMetada
     let people = details.credits.map(|c| convert_people(tmdb, c, "Actor"));
     let external_ids = details.external_ids;
 
-    Some(ExternalMetadata {
+    Ok(Some(ExternalMetadata {
         name: details.name,
         overview: details.overview,
         production_year,
@@ -884,7 +916,7 @@ pub async fn series_by_id(tmdb: &TmdbApi, tmdb_id: i64) -> Option<ExternalMetada
         writers: None,
         imdb_id: external_ids.and_then(|e| non_empty(e.imdb_id)),
         people,
-    })
+    }))
 }
 
 /// A season and all its episodes from one call. Episodes carry their name, overview, air date,
@@ -907,15 +939,11 @@ async fn season_lookup(
 ) -> Result<Option<SeasonMetadata>, crate::tmdb_client::TmdbError> {
     let endpoint = format!("/tv/{}/season/{}", series_id, season_number);
     let query = [("append_to_response", SEASON_APPEND)];
-    let season: TmdbSeason = match tmdb.get_json(&endpoint, &query).await {
-        Ok(json) => match serde_json::from_value(json) {
-            Ok(season) => season,
-            Err(_) => return Ok(None),
-        },
-        Err(e) if matches!(e.kind, crate::tmdb_client::TmdbErrorKind::Status(404)) => {
-            return Ok(None);
-        }
-        Err(e) => return Err(e),
+    let Some(json) = final_json(tmdb, &endpoint, &query).await? else {
+        return Ok(None);
+    };
+    let Ok(season) = serde_json::from_value::<TmdbSeason>(json) else {
+        return Ok(None);
     };
 
     let mut images = convert_images(tmdb, season.images.unwrap_or_default());

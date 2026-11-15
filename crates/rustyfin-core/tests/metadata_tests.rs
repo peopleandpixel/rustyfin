@@ -495,7 +495,16 @@ type R1Found = std::pin::Pin<
         dyn std::future::Future<Output = Option<rustyfin_model::metadata::ExternalMetadata>> + Send,
     >,
 >;
-type R1Lookup<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = Option<T>> + Send + 'a>>;
+type R1Lookup<'a, T> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = rustyfin_model::metadata::LookupResult<T>> + Send + 'a>,
+>;
+
+/// A fake lookup's final answer.
+fn r1scan_answer<'a, T: 'a>(
+    answer: impl std::future::Future<Output = Option<T>> + Send + 'a,
+) -> R1Lookup<'a, T> {
+    Box::pin(async move { Ok(answer.await) })
+}
 
 /// What the fake provider's lookups were asked.
 #[derive(Default)]
@@ -530,11 +539,11 @@ impl rustyfin_model::metadata::MetadataLookups for R1Lookups {
     fn movie_by_id(&self, id: i64) -> R1Lookup<'_, rustyfin_model::metadata::ExternalMetadata> {
         self.0.lock().unwrap().movie_ids.push(id);
         // Id 404 is gone from the provider
-        Box::pin(async move { (id != 404).then(r1scan_movie_meta) })
+        r1scan_answer(async move { (id != 404).then(r1scan_movie_meta) })
     }
 
     fn series_by_id(&self, _id: i64) -> R1Lookup<'_, rustyfin_model::metadata::ExternalMetadata> {
-        Box::pin(async { None })
+        r1scan_answer(async { None })
     }
 
     fn search_series(
@@ -547,7 +556,7 @@ impl rustyfin_model::metadata::MetadataLookups for R1Lookups {
             .unwrap()
             .series_searches
             .push((name.to_string(), year));
-        Box::pin(async {
+        r1scan_answer(async {
             Some(rustyfin_model::metadata::ExternalMetadata {
                 name: Some("One Night".to_string()),
                 tmdb_id: Some(228527),
@@ -569,7 +578,7 @@ impl rustyfin_model::metadata::MetadataLookups for R1Lookups {
             .unwrap()
             .seasons
             .push((series_id, season_number));
-        Box::pin(async move {
+        r1scan_answer(async move {
             Some(SeasonMetadata {
                 meta: ExternalMetadata {
                     name: Some("Season One Title".to_string()),
@@ -865,5 +874,78 @@ async fn r1scan_series_fills_its_seasons_and_episodes() {
         .await
         .unwrap();
     assert_eq!(calls.lock().unwrap().seasons, [(228527, 1), (228527, 1)]);
+    assert_eq!(stored(pool, episode.id).await.name, "Pilot: One");
+}
+
+/// Recheck info: a series' refresh without `force` (a scan's, the task's) leaves seasons and
+/// episodes a provider answered for alone; an explicit refresh (`force`) fills them again.
+#[tokio::test]
+async fn r1scan_forced_series_refresh_refills_answered_children() {
+    use rustyfin_core::metadata::{RefreshOptions, refresh_item_metadata_with};
+    let fx = Fixture::new().await;
+    let pool = &fx.pool;
+    let (pm, calls) = r1scan_manager().await;
+    let client = reqwest::Client::new();
+    let root = fx.dir.join("film").join("Forced Show");
+    let base = MediaItem {
+        library_id: fx.library_id,
+        date_created: Utc.with_ymd_and_hms(2020, 1, 2, 3, 4, 5).unwrap(),
+        ..MediaItem::default_dto_fields()
+    };
+    let series = MediaItem {
+        id: Uuid::new_v4(),
+        name: "Forced Show".to_string(),
+        media_type: MediaType::Series,
+        path: root.to_string_lossy().into_owned(),
+        tmdb_id: Some(228527),
+        ..base.clone()
+    };
+    let season = MediaItem {
+        id: Uuid::new_v4(),
+        name: "Season 1".to_string(),
+        media_type: MediaType::Season,
+        path: root.join("Season 1").to_string_lossy().into_owned(),
+        parent_id: Some(series.id),
+        index_number: Some(1),
+        ..base.clone()
+    };
+    let episode = MediaItem {
+        id: Uuid::new_v4(),
+        name: "Forced - S01E01".to_string(),
+        media_type: MediaType::Episode,
+        path: root.join("Season 1/E01.mkv").to_string_lossy().into_owned(),
+        parent_id: Some(season.id),
+        index_number: Some(1),
+        parent_index_number: Some(1),
+        ..base.clone()
+    };
+    for item in [&series, &season, &episode] {
+        rustyfin_db::repo_media::upsert_media_item(pool, item)
+            .await
+            .unwrap();
+    }
+    let seasons = || calls.lock().unwrap().seasons.len();
+
+    refresh_item_metadata_with(pool, &client, &series, &pm, RefreshOptions::SCAN)
+        .await
+        .unwrap();
+    assert_eq!(seasons(), 1);
+    // Someone renames the episode; an unforced refresh leaves it alone
+    exec(
+        pool,
+        "UPDATE media_items SET name = 'Renamed' WHERE id = ?1",
+        &[&episode.id.to_string()],
+    )
+    .await;
+    refresh_item_metadata_with(pool, &client, &series, &pm, RefreshOptions::SCAN)
+        .await
+        .unwrap();
+    assert_eq!(seasons(), 1);
+    assert_eq!(stored(pool, episode.id).await.name, "Renamed");
+
+    refresh_item_metadata_with(pool, &client, &series, &pm, RefreshOptions::EXPLICIT)
+        .await
+        .unwrap();
+    assert_eq!(seasons(), 2);
     assert_eq!(stored(pool, episode.id).await.name, "Pilot: One");
 }

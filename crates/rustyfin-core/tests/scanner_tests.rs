@@ -4143,43 +4143,61 @@ async fn r1scan_metadata_refresh_upgrades_identified_items_by_id() {
     use std::sync::Mutex;
     type Found = Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>>;
     type Images = Pin<Box<dyn Future<Output = Vec<MetadataImage>> + Send>>;
-    type Lookup<'a, T> = Pin<Box<dyn Future<Output = Option<T>> + Send + 'a>>;
+    type Lookup<'a, T> =
+        Pin<Box<dyn Future<Output = rustyfin_model::metadata::LookupResult<T>> + Send + 'a>>;
+    use rustyfin_model::metadata::LookupFailed;
 
-    /// Every lookup, as "movie 77", "series 90", "search ..." or "season 90/1".
+    /// Every lookup, as "movie 77", "series 90", "search ..." or "season 90/1". Movie 80 and
+    /// season 92/1 fail (a timeout, a 5xx) the first time they are asked; movie 404 is gone.
     struct ById(Arc<Mutex<Vec<String>>>);
+    impl ById {
+        /// Logs `call` and tells whether it was asked before.
+        fn log(&self, call: String) -> bool {
+            let mut calls = self.0.lock().unwrap();
+            let before = calls.contains(&call);
+            calls.push(call);
+            before
+        }
+    }
     impl MetadataLookups for ById {
         fn movie_by_id(&self, id: i64) -> Lookup<'_, ExternalMetadata> {
-            self.0.lock().unwrap().push(format!("movie {id}"));
+            let again = self.log(format!("movie {id}"));
             Box::pin(async move {
-                Some(ExternalMetadata {
+                if id == 80 && !again {
+                    return Err(LookupFailed);
+                }
+                if id == 404 {
+                    return Ok(None);
+                }
+                Ok(Some(ExternalMetadata {
                     tmdb_id: Some(id),
                     // TMDb has no date for movie 79
                     premiere_date: (id != 79).then(|| "2001-02-03".to_string()),
                     imdb_id: Some(format!("tt00000{id}")),
                     ..Default::default()
-                })
+                }))
             })
         }
         fn series_by_id(&self, id: i64) -> Lookup<'_, ExternalMetadata> {
-            self.0.lock().unwrap().push(format!("series {id}"));
+            self.log(format!("series {id}"));
             Box::pin(async move {
-                Some(ExternalMetadata {
+                Ok(Some(ExternalMetadata {
                     tmdb_id: Some(id),
                     ..Default::default()
-                })
+                }))
             })
         }
         fn search_series(&self, name: &str, _: Option<i32>) -> Lookup<'_, ExternalMetadata> {
-            self.0.lock().unwrap().push(format!("search {name}"));
-            Box::pin(async { None })
+            self.log(format!("search {name}"));
+            Box::pin(async { Ok(None) })
         }
         fn season(&self, series: i64, season: i32) -> Lookup<'_, SeasonMetadata> {
-            self.0
-                .lock()
-                .unwrap()
-                .push(format!("season {series}/{season}"));
-            Box::pin(async {
-                Some(SeasonMetadata {
+            let again = self.log(format!("season {series}/{season}"));
+            Box::pin(async move {
+                if series == 92 && !again {
+                    return Err(LookupFailed);
+                }
+                Ok(Some(SeasonMetadata {
                     meta: ExternalMetadata::default(),
                     episodes: vec![(
                         1,
@@ -4188,7 +4206,7 @@ async fn r1scan_metadata_refresh_upgrades_identified_items_by_id() {
                             ..Default::default()
                         },
                     )],
-                })
+                }))
             })
         }
     }
@@ -4382,10 +4400,87 @@ async fn r1scan_metadata_refresh_upgrades_identified_items_by_id() {
         }
     };
 
+    // N1: movie 80 and series 92's season fail on the first run; movie 404 is gone (a 404)
+    for (name, tmdb) in [("Flaky Film", 80), ("Gone Film", 404)] {
+        sqlx::query(
+            "INSERT INTO media_items (id, library_id, name, media_type, path, tmdb_id) \
+             VALUES (?, ?, ?, 'Movie', ?, ?)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(lib.id.to_string())
+        .bind(name)
+        .bind(root.join(name).to_str().unwrap())
+        .bind(tmdb)
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+    }
+    let (flaky_show, flaky_season, flaky_episode) =
+        (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    for (id, name, kind, parent, tmdb, numbers) in [
+        (
+            flaky_show,
+            "Flaky Show",
+            "Series",
+            None,
+            Some(92),
+            (None, None),
+        ),
+        (
+            flaky_season,
+            "Flaky Show/Season 1",
+            "Season",
+            Some(flaky_show),
+            None,
+            (Some(1), None),
+        ),
+        (
+            flaky_episode,
+            "Flaky Show/Season 1/E1.mkv",
+            "Episode",
+            Some(flaky_season),
+            None,
+            (Some(1), Some(1)),
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO media_items (id, library_id, name, media_type, path, parent_id, tmdb_id, \
+             index_number, parent_index_number) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(id.to_string())
+        .bind(lib.id.to_string())
+        .bind(name)
+        .bind(kind)
+        .bind(root.join(name).to_str().unwrap())
+        .bind(parent.map(|p: Uuid| p.to_string()))
+        .bind(tmdb)
+        .bind(numbers.0)
+        .bind(numbers.1)
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+    }
+    // The calls a run made, sorted
+    let calls_since = |from: usize| {
+        let mut calls = asked.lock().unwrap()[from..].to_vec();
+        calls.sort();
+        calls
+    };
+
     run().await;
-    let mut first = asked.lock().unwrap().clone();
-    first.sort();
-    assert_eq!(first, ["movie 77", "movie 79", "season 90/1", "series 90"]);
+    assert_eq!(
+        calls_since(0),
+        [
+            "movie 404",
+            "movie 77",
+            "movie 79",
+            "movie 80",
+            "season 90/1",
+            "season 92/1",
+            "series 90",
+            "series 92"
+        ]
+    );
     assert!(searched.lock().unwrap().is_empty(), "{searched:?}");
     let get = |id: Uuid| {
         let pool = fx.pool.clone();
@@ -4405,15 +4500,19 @@ async fn r1scan_metadata_refresh_upgrades_identified_items_by_id() {
     );
     assert_eq!(get(unknown_id).await.name, "Unknown Film", "renamed");
     assert_eq!(get(episode_id).await.name, "Upgraded Pilot");
+    assert_ne!(get(flaky_episode).await.name, "Upgraded Pilot");
 
-    // A second run asks for nothing, the dateless movie and the filled series included
-    asked.lock().unwrap().clear();
+    // The second run asks again only what failed: movie 80, and series 92 with its season.
+    // Answers, the 404 and the dateless movie included, aren't asked again.
+    let mark = asked.lock().unwrap().len();
     run().await;
-    assert!(
-        asked.lock().unwrap().is_empty(),
-        "{:?}",
-        asked.lock().unwrap()
-    );
+    assert_eq!(calls_since(mark), ["movie 80", "season 92/1", "series 92"]);
+    assert_eq!(get(flaky_episode).await.name, "Upgraded Pilot");
+
+    // A third run asks for nothing
+    let mark = asked.lock().unwrap().len();
+    run().await;
+    assert!(calls_since(mark).is_empty(), "{:?}", calls_since(mark));
     assert!(searched.lock().unwrap().is_empty(), "{searched:?}");
 }
 
