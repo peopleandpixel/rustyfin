@@ -782,6 +782,111 @@ async fn test_get_media_sources_batch_and_ordering() {
     assert_eq!(sources_2[0].media_streams.len(), 0);
 }
 
+// R1 play: a multi-version item lists its own file's source first, then the others widest
+// first, whatever order they were stored in; attachment streams are left out. The own file is
+// not the widest, so "own first" and "widest first" give different answers.
+#[tokio::test]
+async fn r1play_versions_list_the_items_own_file_first() {
+    let temp_db = test_pool().await;
+    let pool = temp_db.pool.clone();
+    let lib = make_library("Movies", LibraryContentType::Movies);
+    rustyfin_db::repo_library::create_library(&pool, &lib)
+        .await
+        .unwrap();
+    let item_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO media_items (id, library_id, name, media_type, path) VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(item_id.to_string())
+    .bind(lib.id.to_string())
+    .bind("Alien")
+    .bind("Movie")
+    .bind("/media/Alien 1080p.mp4")
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let source = |path: &str, width: u32, codecs: &[&str]| {
+        let streams = codecs
+            .iter()
+            .enumerate()
+            .map(
+                |(i, codec_type)| rustyfin_model::media_source::MediaStream {
+                    index: i as i32,
+                    codec_type: codec_type.to_string(),
+                    ..Default::default()
+                },
+            )
+            .collect();
+        rustyfin_model::media_source::MediaSourceResponse {
+            id: Uuid::new_v4().to_string(),
+            uid: Uuid::new_v4().to_string(),
+            container: Some("mkv".to_string()),
+            protocol: "File".to_string(),
+            path: path.to_string(),
+            r#type: "Default".to_string(),
+            run_time_ticks: None,
+            size: None,
+            bitrate: None,
+            video_bitrate: None,
+            audio_bitrate: None,
+            width: Some(width),
+            height: None,
+            aspect_ratio: None,
+            is_remote: false,
+            media_state: None,
+            media_streams: streams,
+            supports_transcoding: true,
+            supports_direct_stream: true,
+            supports_direct_play: true,
+        }
+    };
+    // Stored in the "wrong" order: the narrowest, the widest, then the item's own file
+    for s in [
+        source("/media/Alien 720p.mkv", 1280, &["video", "audio"]),
+        source("/media/Alien 2160p.mkv", 3840, &["video", "audio"]),
+        source(
+            "/media/Alien 1080p.mp4",
+            1920,
+            &["video", "audio", "subtitle", "attachment"],
+        ),
+    ] {
+        rustyfin_db::repo_media_source::insert_media_source_with_streams(&pool, &item_id, &s)
+            .await
+            .unwrap();
+    }
+    let want = [
+        "/media/Alien 1080p.mp4",
+        "/media/Alien 2160p.mkv",
+        "/media/Alien 720p.mkv",
+    ];
+    let paths = |sources: &[rustyfin_model::media_source::MediaSourceResponse]| {
+        sources.iter().map(|s| s.path.clone()).collect::<Vec<_>>()
+    };
+
+    let single = rustyfin_db::repo_media_source::get_media_sources(&pool, &item_id)
+        .await
+        .unwrap();
+    let checked =
+        rustyfin_db::repo_media_source::get_media_sources_with_item_check(&pool, &item_id)
+            .await
+            .unwrap();
+    let batch = rustyfin_db::repo_media_source::get_media_sources_batch(&pool, &[item_id])
+        .await
+        .unwrap()
+        .remove(&item_id.to_string())
+        .unwrap();
+    for sources in [&single, &checked, &batch] {
+        assert_eq!(paths(sources), want);
+        let types: Vec<_> = sources[0]
+            .media_streams
+            .iter()
+            .map(|s| s.r#type.as_deref())
+            .collect();
+        assert_eq!(types, [Some("Video"), Some("Audio"), Some("Subtitle")]);
+    }
+}
+
 #[tokio::test]
 async fn test_get_media_sources_batch_large() {
     let temp_db = test_pool().await;

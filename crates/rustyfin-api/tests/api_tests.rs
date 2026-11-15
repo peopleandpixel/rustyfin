@@ -20598,6 +20598,56 @@ fn b145_icons() {
     b124_node_test("b145_icons.mjs");
 }
 
+// B165: subtitles stayed on screen while the subtitle menu said Off
+#[test]
+fn b165_subtitle_tracks() {
+    b124_node_test("b165_subtitle_tracks.mjs");
+}
+
+// B170: the player's top bar hides and shows with its bottom controls
+#[test]
+fn b170_player_header_autohide() {
+    b124_node_test("b170_player_header_autohide.mjs");
+}
+
+// B171: next-episode autoplay and previous/next episode buttons in the web player
+#[test]
+fn b171_next_episode() {
+    b124_node_test("b171_next_episode.mjs");
+}
+
+// The web client's autoplay switch is Jellyfin's UserConfiguration.EnableNextEpisodeAutoPlay: each
+// key a user saves comes back from /Users/Me with the value sent (the server may add defaults), and
+// a save built as the client builds it (the current configuration plus the flag) keeps the others.
+#[tokio::test]
+async fn b171_user_configuration_keeps_next_episode_autoplay() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (_owner, _owner_id, viewer, viewer_id) = g1_owner_and_viewer(&state, &app).await;
+    let uri = format!("/Users/{viewer_id}/Configuration");
+    let save = |config: serde_json::Value| {
+        let req = request("POST", &uri, Some(&viewer), Some(config));
+        let app = app.clone();
+        async move { assert!(send(&app, req).await.0.is_success()) }
+    };
+    let configuration = || async {
+        let (status, me) = send(&app, request("GET", "/Users/Me", Some(&viewer), None)).await;
+        assert_eq!(status, StatusCode::OK);
+        me["Configuration"].clone()
+    };
+    save(serde_json::json!({ "EnableNextEpisodeAutoPlay": false, "SubtitleMode": "Always" })).await;
+    let saved = configuration().await;
+    assert_eq!(saved["EnableNextEpisodeAutoPlay"], false);
+    assert_eq!(saved["SubtitleMode"], "Always");
+
+    let mut changed = saved.clone();
+    changed["EnableNextEpisodeAutoPlay"] = serde_json::json!(true);
+    save(changed).await;
+    let saved = configuration().await;
+    assert_eq!(saved["EnableNextEpisodeAutoPlay"], true);
+    assert_eq!(saved["SubtitleMode"], "Always");
+}
+
 // B152: library grid images keep up with scrolling (web client)
 #[test]
 fn b152_blurhash_decoder() {
@@ -28328,6 +28378,36 @@ async fn g4_get_range(
     (status, content_range, body)
 }
 
+// R1 play: media kept inside the data dir (Docker /data with /data/media) direct-plays, while
+// the files Rustyfin owns there (its database, a cache file) are refused even from a library
+#[tokio::test]
+async fn r1play_media_in_the_data_dir_plays_owned_files_are_refused() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let folder = media_folder(&state, "r1play");
+    let movie = std::path::Path::new(&folder).join("R1 Movie.mkv");
+    std::fs::write(&movie, vec![7u8; 500]).unwrap();
+    let cached = state.data_dir.join("cache").join("r1play.mkv");
+    std::fs::write(&cached, vec![7u8; 500]).unwrap();
+    // test_state's database; Rustyfin learns its place from SQLite
+    let db = state.data_dir.join("test.db");
+    assert!(db.is_file());
+    let movie_id = g4_insert_item(&state, "Movie", &movie).await;
+    let cached_id = g4_insert_item(&state, "Movie", &cached).await;
+    let db_id = g4_insert_item(&state, "Movie", &db).await;
+    let app = app(state);
+
+    let uri = |id| format!("/Videos/{id}/stream?Static=true");
+    let (status, content_range, _) = g4_get_range(&app, &uri(movie_id), &token, "bytes=0-99").await;
+    assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(content_range.as_deref(), Some("bytes 0-99/500"));
+    for id in [cached_id, db_id] {
+        let (status, _, body) = g4_get_range(&app, &uri(id), &token, "bytes=0-99").await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{id}");
+        assert!(!body.starts_with(b"SQLite format"), "{id}: database bytes");
+    }
+}
+
 #[tokio::test]
 async fn g4_unsatisfiable_ranges_get_416() {
     let state = test_state().await;
@@ -29677,7 +29757,7 @@ async fn b22_playback_info_lists_external_subtitles() {
         (&streams[4], "srt", Some("eng"), &srt),
     ] {
         assert_eq!(stream["CodecType"], "subtitle", "{stream}");
-        assert_eq!(stream["Type"], "External", "{stream}");
+        assert_eq!(stream["Type"], "Subtitle", "{stream}");
         assert_eq!(stream["IsExternal"], true, "{stream}");
         assert_eq!(stream["Codec"], codec, "{stream}");
         assert_eq!(stream["Language"].as_str(), language, "{stream}");

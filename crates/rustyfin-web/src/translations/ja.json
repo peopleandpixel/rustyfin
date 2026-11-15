@@ -83,7 +83,10 @@
         "key_saved": "キー保存済み – 新しいキーを入力すると置き換えます",
         "key_clear": "保存済みのキーを削除",
         "save_config": "設定を保存",
-        "server_config_updated": "サーバー設定が更新されました"
+        "server_config_updated": "サーバー設定が更新されました",
+        "playback": "再生",
+        "next_episode_autoplay": "次のエピソードを自動再生する",
+        "next_episode_autoplay_saved": "再生設定を保存しました"
     },
     "nav": {
         "toggle_menu": "メニューを切り替え",
