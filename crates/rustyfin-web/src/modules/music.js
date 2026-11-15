@@ -106,8 +106,18 @@ const MUSIC_TABS = [
     ['genres', 'music.tab_genres'],
 ];
 const MUSIC_PAGE_SIZE = 100;
-// The tab last shown per library, which opening the library again shows, as in Jellyfin Web
+// The tab last shown per library, which opening the library again shows, as in Jellyfin Web; kept
+// for the signed-in session it was shown in
 const musicTabMemory = new Map();
+let musicTabOwner = null;
+
+function tabMemory() {
+    if (musicTabOwner !== API.token) {
+        musicTabMemory.clear();
+        musicTabOwner = API.token;
+    }
+    return musicTabMemory;
+}
 // Drops the pages of a tab that was left meanwhile
 let musicGen = 0;
 
@@ -115,11 +125,11 @@ let musicGen = 0;
 function musicTab(libId, tab, sub) {
     if (tab === 'genres' && sub) return 'genre';
     if (MUSIC_TABS.some(([key]) => key === tab)) return tab;
-    return musicTabMemory.get(libId) || 'albums';
+    return tabMemory().get(libId) || 'albums';
 }
 
 function rememberMusicTab(libId, tab) {
-    musicTabMemory.set(libId, tab === 'genre' ? 'genres' : tab);
+    tabMemory().set(libId, tab === 'genre' ? 'genres' : tab);
 }
 
 function musicTabBar(libId, active) {
@@ -240,6 +250,7 @@ async function renderMusicTab(libId, libName, tab, genreId) {
         }
     } catch (e) {
         if (gen !== musicGen || API.token !== session) return;
+        $('music-count').textContent = '';
         $('music-items').outerHTML = `<div class="p-6 rounded-xl bg-red-500/10 text-red-400">${escapeHtml(e.message)}</div>`;
     }
 }

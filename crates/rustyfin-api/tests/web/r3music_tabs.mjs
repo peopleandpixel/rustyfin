@@ -89,6 +89,23 @@ test('a route names its tab; without one the library opens on its last tab, else
     assert.equal(fns.musicTab('lib1', undefined), 'genres');
 });
 
+test('signing out forgets the tabs last shown', () => {
+    const { fns, context } = sandbox(() => ({}));
+    fns.rememberMusicTab('lib1', 'songs');
+    assert.equal(fns.musicTab('lib1', undefined), 'songs');
+    context.API.token = null;
+    assert.equal(fns.musicTab('lib1', undefined), 'albums');
+    context.API.token = 'other-user';
+    assert.equal(fns.musicTab('lib1', undefined), 'albums');
+});
+
+test('a first page that fails shows the error, not Loading', async () => {
+    const s = sandbox(() => { throw new Error('server down'); });
+    await s.fns.renderMusicTab('lib1', 'Music', 'artists');
+    assert.equal(s.elements['music-count'].textContent, '');
+    assert.ok(s.elements['music-items'].replacedWith.includes('server down'));
+});
+
 test('each tab asks Jellyfin\'s endpoint for its list, a page at a time, within the library', () => {
     const { fns } = sandbox(() => ({}));
     const req = (tab, start, genre) => plain(fns.musicTabRequest('lib1', tab, start, genre));
@@ -168,8 +185,15 @@ test('the library page hands every music tab but Albums to music.js, and shows t
     assert.ok(library.includes("import { musicTab, rememberMusicTab, musicTabBar, renderMusicTab } from './music.js';"));
     assert.match(library, /async function renderLibrary\(route\) \{\s*const \[libId, tab, sub\] = String\(route \|\| ''\)\.split\('\/'\);/);
     assert.match(library, /const musicView = contentType === 'Music' \? musicTab\(libId, tab, sub\) : null;/);
-    assert.match(library, /if \(musicView && musicView !== 'albums'\) \{\s*stopLibraryLoad\(\);\s*renderMusicTab\(libId, libName, musicView, sub\);\s*return;/);
+    assert.match(library, /if \(musicView && musicView !== 'albums'\) \{\s*stopLibraryLoad\(\);\s*musicRoute = [^;]+;\s*renderMusicTab\(libId, libName, musicView, sub\);\s*return;/);
     assert.ok(library.includes("${musicView ? musicTabBar(libId, 'albums') : ''}"));
+});
+
+test('a scan refresh draws the music tab shown again, genre included, not the library\'s first view', () => {
+    assert.ok(library.includes("musicRoute = musicView === 'genre' ? `${libId}/genres/${sub}` : `${libId}/${musicView}`;"));
+    assert.match(library, /function libraryRefreshInPlace\(\) \{[^}]*if \(musicRoute\) \{\s*renderLibrary\(musicRoute\);\s*return true;/);
+    // Every other view clears it first
+    assert.ok(library.indexOf('musicRoute = null;') < library.indexOf('musicRoute = musicView ==='));
 });
 
 test('the tab names are in English and German', () => {
