@@ -821,7 +821,23 @@ pub async fn run(
     data_dir: PathBuf,
     on_written: impl FnOnce() + Send + 'static,
 ) {
-    match plan_report(&db, &req, &prepared, &data_dir, Some(&handle)).await {
+    match execute(&db, &req, &prepared, &handle, &data_dir, on_written).await {
+        Ok(report) => handle.complete(report),
+        Err(error) => handle.fail(error),
+    }
+}
+
+/// [`run`] without ending the job: returns the report or the error, so a caller can tidy up before
+/// the job's status says it ended (the wizard's queued import removes its queue file first, B159).
+pub async fn execute(
+    db: &SqlitePool,
+    req: &ImportRequest,
+    prepared: &Prepared,
+    handle: &JobHandle,
+    data_dir: &Path,
+    on_written: impl FnOnce(),
+) -> Result<ImportReport, String> {
+    match plan_report(db, req, prepared, data_dir, Some(handle)).await {
         Ok(report) => {
             let layout = report.layout;
             let source = &req.source_path;
@@ -858,11 +874,11 @@ pub async fn run(
             if report.metadata.written {
                 on_written();
             }
-            handle.complete(report);
+            Ok(report)
         }
         Err(error) => {
             tracing::warn!("jellyfin import run failed: {error}");
-            handle.fail(error.to_string());
+            Err(error.to_string())
         }
     }
 }

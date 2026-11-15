@@ -147,7 +147,7 @@
         "sort_name_desc": "Nazwa (Z-A)",
         "sort_release_date": "Data wydania",
         "sort_date_added": "Data dodania",
-        "sort_rating": "Ocena (★)",
+        "sort_rating": "Ocena",
         "all_genres": "Wszystkie gatunki",
         "media_scan_started_for": "Rozpoczęto skanowanie multimediów dla {{name}}",
         "scan_button": "Skanuj",

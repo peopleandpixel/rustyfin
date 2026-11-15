@@ -141,7 +141,7 @@
         "sort_name_desc": "Nom (Z-A)",
         "sort_release_date": "Date de sortie",
         "sort_date_added": "Date d'ajout",
-        "sort_rating": "Note (★)",
+        "sort_rating": "Note",
         "all_genres": "Tous les genres",
         "media_scan_started_for": "Analyse multimédia démarrée pour {{name}}",
         "scan_button": "Analyser",

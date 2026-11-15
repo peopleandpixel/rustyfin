@@ -141,7 +141,7 @@
         "sort_name_desc": "Nombre (Z-A)",
         "sort_release_date": "Fecha de lanzamiento",
         "sort_date_added": "Fecha de adición",
-        "sort_rating": "Valoración (★)",
+        "sort_rating": "Valoración",
         "all_genres": "Todos los géneros",
         "media_scan_started_for": "Escaneo multimedia iniciado para {{name}}",
         "scan_button": "Escanear",

@@ -9,6 +9,8 @@ on:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
+  # The one Node version for the Check and Web client jobs
+  NODE_VERSION: "24.22.3"
 
 jobs:
   check:
@@ -18,16 +20,28 @@ jobs:
     container: rust:1-trixie
     steps:
       - uses: actions/checkout@v4
-      # ffmpeg as the image installs it, zstd so the Rust cache isn't gzipped, nodejs for the
-      # web client's logic tests that api_tests runs, and rustfmt and clippy, which the image's
-      # minimal rustup profile leaves out
-      - name: Install ffmpeg, zstd, nodejs, rustfmt and clippy
+      # ffmpeg as the image installs it, zstd so the Rust cache isn't gzipped, xz-utils to unpack
+      # Node, and rustfmt and clippy, which the image's minimal rustup profile leaves out
+      - name: Install ffmpeg, zstd, xz-utils, rustfmt and clippy
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends ffmpeg zstd nodejs
+          apt-get install -y --no-install-recommends ffmpeg zstd xz-utils
           rustup component add rustfmt clippy
+      # Node for the web client's logic tests that api_tests runs: the official release, as the
+      # Web client job gets from setup-node, not Debian's end-of-life nodejs
+      - name: Install Node ${{ env.NODE_VERSION }}
+        run: |
+          base="https://nodejs.org/dist/v${NODE_VERSION}"
+          file="node-v${NODE_VERSION}-linux-x64.tar.xz"
+          cd "$RUNNER_TEMP"
+          curl -fsSL --retry 3 -O "$base/$file" -O "$base/SHASUMS256.txt"
+          grep " $file\$" SHASUMS256.txt | sha256sum -c -
+          tar -xJf "$file" -C /usr/local --strip-components=1 --no-same-owner \
+            --exclude='*/CHANGELOG.md' --exclude='*/LICENSE' --exclude='*/README.md'
+          rm "$file" SHASUMS256.txt
+          node --version
       - uses: Swatinem/rust-cache@v2
         with:
           # $CARGO_HOME/bin holds the image's toolchain; nothing is cargo-installed
@@ -85,7 +99,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 24
+          node-version: ${{ env.NODE_VERSION }}
       # Corepack provides the pnpm version pinned in package.json (packageManager), as in the Dockerfile
       - name: Build
         working-directory: crates/rustyfin-web

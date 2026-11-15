@@ -141,7 +141,7 @@
         "sort_name_desc": "Nome (Z-A)",
         "sort_release_date": "Data de lançamento",
         "sort_date_added": "Data de adição",
-        "sort_rating": "Avaliação (★)",
+        "sort_rating": "Avaliação",
         "all_genres": "Todos os gêneros",
         "media_scan_started_for": "Varredura de mídia iniciada para {{name}}",
         "scan_button": "Varrer",

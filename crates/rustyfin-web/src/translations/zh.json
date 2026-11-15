@@ -141,7 +141,7 @@
         "sort_name_desc": "名称（Z-A）",
         "sort_release_date": "发行日期",
         "sort_date_added": "添加日期",
-        "sort_rating": "评分（★）",
+        "sort_rating": "评分",
         "all_genres": "所有类型",
         "media_scan_started_for": "已开始扫描 {{name}} 的媒体",
         "scan_button": "扫描",

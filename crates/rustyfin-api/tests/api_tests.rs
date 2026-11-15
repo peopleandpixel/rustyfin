@@ -161,6 +161,59 @@ async fn test_public_info_endpoint() {
     assert_eq!(info["Id"], "test-server-id");
 }
 
+// B130: Jellyfin clients' server check (jellyfin-sdk-kotlin RecommendedServerDiscovery)
+
+/// Asserts the fields the Jellyfin SDK checks: the product name, and a version of three or four
+/// numeric parts at or above 12.0.0 (SDK 1.9's minimum). Rustyfin's own version is separate.
+fn b130_assert_jellyfin_identity(info: &serde_json::Value) {
+    assert_eq!(info["ProductName"], "Jellyfin Server", "{info}");
+    let version = info["Version"].as_str().expect("Version is a string");
+    let parts: Vec<u32> = version
+        .split('.')
+        .map(|part| part.parse().expect("numeric version part"))
+        .collect();
+    assert!(matches!(parts.len(), 3 | 4), "{version}");
+    assert!(parts[..3] >= [12, 0, 0][..], "{version}");
+    assert_eq!(info["RustyfinVersion"], env!("CARGO_PKG_VERSION"), "{info}");
+}
+
+#[tokio::test]
+async fn b130_public_info_passes_the_sdk_server_check() {
+    let state = test_state().await;
+    let (status, body) = j1_get(&state, "/System/Info/Public", &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    let info: serde_json::Value = serde_json::from_str(&body).unwrap();
+    b130_assert_jellyfin_identity(&info);
+    assert_eq!(info["Id"], "test-server-id");
+    assert!(info["ServerName"].is_string());
+    assert!(info["StartupWizardCompleted"].is_boolean());
+    // Jellyfin no longer sets OperatingSystem and sends it empty; so does Rustyfin.
+    assert_eq!(info["OperatingSystem"], "", "{info}");
+    // Bound to 0.0.0.0, there is no address a client could reach.
+    assert!(info.get("LocalAddress").is_none(), "{info}");
+}
+
+#[tokio::test]
+async fn b130_public_info_local_address_follows_a_specific_bind() {
+    let mut state = test_state().await;
+    state.bind_addr = Arc::new("127.0.0.1:8102".to_string());
+    let (status, body) = j1_get(&state, "/System/Info/Public", &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    let info: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(info["LocalAddress"], "http://127.0.0.1:8102", "{info}");
+}
+
+#[tokio::test]
+async fn b130_full_info_reports_the_same_identity() {
+    let state = test_state().await;
+    let (token, _) = j1_user(&state).await;
+    let (status, body) = j1_get(&state, "/System/Info", &[("X-Emby-Token", token.as_str())]).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let info: serde_json::Value = serde_json::from_str(&body).unwrap();
+    b130_assert_jellyfin_identity(&info);
+    assert_eq!(info["PackageVersion"], env!("CARGO_PKG_VERSION"), "{info}");
+}
+
 // ── Auth Endpoint Tests ──
 
 #[tokio::test]
@@ -17039,17 +17092,22 @@ async fn g1_easy_pin_is_hashed_and_never_returned() {
     assert_eq!(pin_hash("viewer").await, None);
 }
 
+// B155: new users and administrator rights
+
+/// `POST /Users/New` creates a user without administrator rights whatever the body says, as
+/// Jellyfin's `CreateUserByName` does; rights come only from a later `POST /Users/{id}/Policy`.
 #[tokio::test]
-async fn g1_create_user_honours_is_administrator() {
+async fn b155_new_user_is_never_admin() {
     let state = test_state().await;
     let app = app(state.clone());
     let (owner, _, _, _) = g1_owner_and_viewer(&state, &app).await;
-    for (name, flag, admin) in [
-        ("g1-admin", Some(true), true),
-        ("g1-plain", Some(false), false),
-        ("g1-default", None, false),
+    let mut promote_id = String::new();
+    for (name, flag) in [
+        ("b155-true", Some(true)),
+        ("b155-false", Some(false)),
+        ("b155-none", None),
     ] {
-        let mut body = serde_json::json!({ "Name": name, "Password": "g1-pass" });
+        let mut body = serde_json::json!({ "Name": name, "Password": "b155-pass" });
         if let Some(flag) = flag {
             body["IsAdministrator"] = serde_json::json!(flag);
         }
@@ -17059,12 +17117,42 @@ async fn g1_create_user_honours_is_administrator() {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "create {name}: {created}");
+        assert_eq!(created["IsAdministrator"], false, "{name}: {created}");
         assert_eq!(
             user_flags(&state, name).await,
-            Some((admin, false, false)),
+            Some((false, false, false)),
             "{name}"
         );
+
+        // The new user's own token gets no administrator rights.
+        let (token, id) = login(&app, name, "b155-pass").await.expect(name);
+        let (status, _) = send(
+            &app,
+            request("GET", "/Library/VirtualFolders", Some(&token), None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{name}");
+        if flag == Some(true) {
+            promote_id = id;
+        }
     }
+
+    // The Policy call that follows is what makes an administrator.
+    let (status, _) = send(
+        &app,
+        request(
+            "POST",
+            &format!("/Users/{promote_id}/Policy"),
+            Some(&owner),
+            Some(serde_json::json!({ "IsAdministrator": true })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        user_flags(&state, "b155-true").await,
+        Some((true, false, false))
+    );
 }
 
 #[tokio::test]
