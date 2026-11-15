@@ -441,20 +441,35 @@ async fn lookup_artist(
     rustyfin_db::repo_media::get_library_artist_id(pool, library_id, path).await
 }
 
-/// The disc number of a folder named `Disc 1`, `disk-03`, `CD2` (case-insensitive), if it is one.
-fn disc_folder_number(name: &str) -> Option<i32> {
+/// The disc number of a disc folder such as `Disc 1 - Bonus`, `CD2`, `disk-03` or `Volume 3`
+/// (case-insensitive), as Jellyfin reads them: the text after the prefix, cut at its first space, must
+/// be digits. `vol`, `volume` and `part` only count when the folder is at least two levels below the
+/// library root (`depth` is the number of path components, file included), so an artist folder named
+/// `Part 1` is not a disc.
+fn disc_folder_number(name: &str, depth: usize) -> Option<i32> {
     let lower = name.to_ascii_lowercase();
-    let rest = lower
-        .strip_prefix("disc")
-        .or_else(|| lower.strip_prefix("disk"))
-        .or_else(|| lower.strip_prefix("cd"))?;
-    let digits = rest
-        .strip_prefix(|c: char| c == ' ' || c == '-' || c == '_')
-        .unwrap_or(rest);
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+    // Longer prefixes come first so that `volume` is not read as `vol`.
+    let (rest, needs_album_level) = [
+        ("volume", true),
+        ("vol", true),
+        ("part", true),
+        ("disc", false),
+        ("disk", false),
+        ("cd", false),
+    ]
+    .iter()
+    .find_map(|&(prefix, nested)| lower.strip_prefix(prefix).map(|rest| (rest, nested)))?;
+    if needs_album_level && depth < 4 {
         return None;
     }
-    digits.parse().ok()
+    let rest = rest
+        .strip_prefix(|c: char| c == ' ' || c == '-' || c == '_')
+        .unwrap_or(rest);
+    let number = rest.trim().split(' ').next().unwrap_or("");
+    if number.is_empty() || !number.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    number.parse().ok()
 }
 
 /// The year of a track: the `year` tag parsed, else the first four characters of the `date` tag when digits.
@@ -1373,7 +1388,7 @@ async fn scan_music_library(
             // belong to the album above it, and the disc number is kept for the tracks.
             let n = components.len();
             let disc_from_dir = if n >= 3 {
-                disc_folder_number(components[n - 2])
+                disc_folder_number(components[n - 2], n)
             } else {
                 None
             };
@@ -1736,7 +1751,9 @@ async fn scan_music_library(
     }
 
     // Remove the items that this scan no longer collects. A failure is logged, not returned.
+    let covers = local_images::embedded_cover_paths(pool, library.id).await;
     let removed = remove_uncollected(pool, library, &filter, &collected, &unreadable, &loops).await;
+    local_images::remove_orphaned_covers(pool, &covers).await;
     tracing::info!(
         "scanned music library '{}': {} new items added ({} existing items unchanged)",
         library.name,

@@ -1,8 +1,10 @@
 use crate::image_proxy::read_image_stamp;
 use rustyfin_model::image::{ItemImage, detect_image_type_from_filename};
+use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::time::Duration;
 use uuid::Uuid;
 
 const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "gif", "bmp", "webp", "tiff"];
@@ -21,6 +23,99 @@ pub fn embedded_images_dir() -> Option<&'static Path> {
     EMBEDDED_IMAGES_DIR.get().map(PathBuf::as_path)
 }
 
+/// The time limit for extracting one cover. A longer run is killed.
+const COVER_EXTRACT_LIMIT: Duration = Duration::from_secs(30);
+
+/// The file extension for a picture with stream codec `codec`, or `None` when the codec is not a known
+/// image format.
+pub fn cover_extension(codec: &str) -> Option<&'static str> {
+    match codec {
+        "mjpeg" => Some("jpg"),
+        "png" => Some("png"),
+        "webp" => Some("webp"),
+        "bmp" => Some("bmp"),
+        "gif" => Some("gif"),
+        _ => None,
+    }
+}
+
+/// Runs `cmd` and waits for it for at most `limit`. A program still running after that is killed, and the
+/// call fails with `ErrorKind::TimedOut`. The child is also killed if this future is dropped.
+pub async fn run_bounded(
+    mut cmd: tokio::process::Command,
+    limit: Duration,
+) -> std::io::Result<std::process::ExitStatus> {
+    cmd.kill_on_drop(true);
+    let mut child = cmd.spawn()?;
+    match tokio::time::timeout(limit, child.wait()).await {
+        Ok(status) => status,
+        Err(_) => {
+            // The kill is best effort; the child may already have exited.
+            let _ = child.kill().await;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("the program did not finish within {limit:?}"),
+            ))
+        }
+    }
+}
+
+/// The extracted covers (files under `embedded_images_dir()`) that the items of `library_id` refer to in
+/// `item_images`. Taken before items are deleted, so that [`remove_orphaned_covers`] can remove the files
+/// of the items that go. A query failure is logged and yields no paths.
+pub async fn embedded_cover_paths(pool: &SqlitePool, library_id: Uuid) -> Vec<PathBuf> {
+    let Some(dir) = embedded_images_dir() else {
+        return Vec::new();
+    };
+    let paths: Result<Vec<String>, sqlx::Error> = sqlx::query_scalar(
+        "SELECT DISTINCT i.path FROM item_images i JOIN media_items m ON m.id = i.item_id
+         WHERE m.library_id = ?",
+    )
+    .bind(library_id.to_string())
+    .fetch_all(pool)
+    .await;
+    match paths {
+        Ok(paths) => paths
+            .into_iter()
+            .map(PathBuf::from)
+            .filter(|path| path.starts_with(dir))
+            .collect(),
+        Err(e) => {
+            tracing::warn!("could not list the embedded covers of library {library_id}: {e}");
+            Vec::new()
+        }
+    }
+}
+
+/// Removes each file of `paths` that no `item_images` row refers to any more, that is, the covers of
+/// items deleted since [`embedded_cover_paths`] was taken. Failures are logged and do not stop the rest.
+pub async fn remove_orphaned_covers(pool: &SqlitePool, paths: &[PathBuf]) {
+    for path in paths {
+        let referenced: Result<i64, sqlx::Error> =
+            sqlx::query_scalar("SELECT COUNT(*) FROM item_images WHERE path = ?")
+                .bind(path.to_string_lossy().to_string())
+                .fetch_one(pool)
+                .await;
+        match referenced {
+            Ok(0) => {
+                if let Err(e) = tokio::fs::remove_file(path).await
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    tracing::warn!(
+                        "could not remove the orphaned cover {}: {}",
+                        path.display(),
+                        e
+                    );
+                }
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!("could not check the cover {}: {}", path.display(), e);
+            }
+        }
+    }
+}
+
 /// Extracts the attached picture of `track` (with stream codec `codec`) to `<embedded dir>/<album id>.<ext>`
 /// and returns it as the album's Primary image. Returns `None`, logging a warning, on any failure. Nothing is
 /// written when no embedded directory is set.
@@ -30,17 +125,18 @@ pub async fn extract_embedded_cover(
     codec: &str,
 ) -> Option<ItemImage> {
     let dir = embedded_images_dir()?;
-    let ext = if codec == "mjpeg" { "jpg" } else { "png" };
+    // A picture in a codec with no known image extension is not saved.
+    let ext = cover_extension(codec)?;
     let out = dir.join(format!("{album_id}.{ext}"));
     let result = async {
         tokio::fs::create_dir_all(dir).await?;
-        let status = tokio::process::Command::new("ffmpeg")
-            .args(["-nostdin", "-loglevel", "error", "-y", "-i"])
+        let mut cmd = tokio::process::Command::new("ffmpeg");
+        cmd.args(["-nostdin", "-loglevel", "error", "-y", "-i"])
             .arg(track)
             .args(["-an", "-map", "0:v:0", "-c", "copy", "-frames:v", "1"])
-            .arg(&out)
-            .status()
-            .await?;
+            .args(["-fs", "20000000"])
+            .arg(&out);
+        let status = run_bounded(cmd, COVER_EXTRACT_LIMIT).await?;
         if !status.success() {
             return Err(std::io::Error::other(format!(
                 "ffmpeg exited with {status}"
