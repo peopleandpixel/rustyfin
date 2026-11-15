@@ -192,7 +192,7 @@
         "sort_name": "Name",
         "sort_release_date": "Erscheinungsdatum",
         "sort_date_added": "Hinzugefügt am",
-        "sort_rating": "Bewertung (★)",
+        "sort_rating": "Bewertung",
         "sort_reverse": "Reihenfolge umkehren",
         "all_genres": "Alle Genres",
         "media_scan_started_for": "Medienscan für {{name}} gestartet",

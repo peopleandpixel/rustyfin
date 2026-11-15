@@ -138,7 +138,7 @@
         "sort_name_desc": "Nome (Z-A)",
         "sort_release_date": "Data di uscita",
         "sort_date_added": "Data di aggiunta",
-        "sort_rating": "Valutazione (★)",
+        "sort_rating": "Valutazione",
         "all_genres": "Tutti i generi",
         "media_scan_started_for": "Scansione multimediale avviata per {{name}}",
         "scan_button": "Scansiona",
