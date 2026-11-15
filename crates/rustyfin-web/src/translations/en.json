@@ -517,7 +517,8 @@
         "chapter_number": "Chapter {{number}}",
         "delete_item": "Delete from library",
         "delete_confirm": "Delete “{{name}}” from the library? Its files stay on disk, so a later library scan adds it again.",
-        "deleted": "“{{name}}” was deleted from the library",
+        "delete_confirm_permanent": "Delete “{{name}}” for good? This cannot be undone.",
+        "deleted": "“{{name}}” was deleted",
         "delete_failed": "Could not delete: {{message}}"
     },
     "person": {

@@ -123,15 +123,15 @@ const clickActions = {
     navigate: el => navigate(el.dataset.page, el.dataset.id),
     // A video with a resume point asks first; the detail page's Resume and Play from beginning buttons are that choice.
     // The detail page's buttons and chapters also pass its version and track choice, and a chapter its start.
+    // Its Play button still asks, from a fresh resume point: the page's own item may be cached.
     play: el => {
         const { id, streamType, title } = el.dataset;
-        if (el.dataset.detailTracks === 'true') {
-            const selection = detailSelection(id) || {};
-            if (el.dataset.startTicks !== undefined) selection.startTicks = Number(el.dataset.startTicks);
-            playItem(id, streamType, title, { fromStart: el.dataset.fromStart === 'true', selection });
-        } else if (el.dataset.resume === 'true') playItem(id, streamType, title);
-        else if (el.dataset.fromStart === 'true') playItem(id, streamType, title, { fromStart: true });
-        else playWithResumeChoice(id, streamType, title);
+        const selection = el.dataset.detailTracks === 'true' ? detailSelection(id) || {} : null;
+        if (el.dataset.startTicks !== undefined) {
+            playItem(id, streamType, title, { selection: { ...selection, startTicks: Number(el.dataset.startTicks) } });
+        } else if (el.dataset.resume === 'true') playItem(id, streamType, title, { selection });
+        else if (el.dataset.fromStart === 'true') playItem(id, streamType, title, { fromStart: true, selection });
+        else playWithResumeChoice(id, streamType, title, selection);
     },
     'scan-library': el => startScanWithToast(API.scanLibrary(el.dataset.id), t('library.scan_started_for', { name: el.dataset.name })),
     'scan-library-page': el => startScanWithToast(API.scanLibrary(el.dataset.id), t('library.media_scan_started_for', { name: el.dataset.name })),
@@ -141,7 +141,7 @@ const clickActions = {
     'clear-library-filters': el => clearLibraryFilters(el.dataset.id),
     'toggle-favorite': el => toggleFavorite(el.dataset.id, el.dataset.favorite === 'true'),
     'toggle-played': el => togglePlayed(el.dataset.id, el.dataset.played === 'true', el.dataset.all === 'true'),
-    'delete-item': el => deleteItemFromDetail(el.dataset.id),
+    'delete-item': el => deleteItemFromDetail(el.dataset),
     'refresh-item': el => refreshItemMetadata(el, el.dataset.id),
     'admin-tab': el => showAdminTab(el, el.dataset.tab),
     'delete-user': el => { if (confirm(t('admin.delete_user_confirm'))) API.deleteUser(el.dataset.id).then(() => renderAdmin()); },

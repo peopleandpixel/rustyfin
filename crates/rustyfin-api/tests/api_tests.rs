@@ -23316,8 +23316,8 @@ fn b171_next_episode() {
     b124_node_test("b171_next_episode.mjs");
 }
 
-// R3 item pages: the detail page's credits, ratings, media info, track pickers, chapters, links,
-// "mark all played" and delete (tests/web/r3item_detail.mjs), and the pickers' choice in the player
+// The web client's item page: credits, ratings, media info, track pickers, chapters, links, "mark all
+// played" and delete (tests/web/r3item_detail.mjs), and the pickers' choice in the player
 // (tests/web/r3item_play.mjs)
 #[test]
 fn r3item_detail() {

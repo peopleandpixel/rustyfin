@@ -41,11 +41,12 @@ function creditLinesHtml(item) {
         `<dt class="text-white/50">${t(names.length > 1 ? many : one)}</dt><dd class="text-white/85">${names.join(', ')}</dd>`).join('')}</dl>`;
 }
 
-// Where a provider id leads when the server sent no ExternalUrls for it
+// Where a provider id leads when the server sent no ExternalUrls for it. TMDb and TheTVDB ids name a page
+// only for movies and series, as Jellyfin's external-id providers have it; null is no link.
 const PROVIDER_URLS = {
     Imdb: (id) => `https://www.imdb.com/title/${id}`,
-    Tmdb: (id, type) => `https://www.themoviedb.org/${type === 'Series' || type === 'Season' || type === 'Episode' ? 'tv' : 'movie'}/${id}`,
-    Tvdb: (id, type) => type === 'Series' ? `https://thetvdb.com/?tab=series&id=${id}` : `https://thetvdb.com/?tab=episode&id=${id}`,
+    Tmdb: (id, type) => ({ Movie: `https://www.themoviedb.org/movie/${id}`, Series: `https://www.themoviedb.org/tv/${id}` })[type] || null,
+    Tvdb: (id, type) => ({ Movie: `https://thetvdb.com/dereferrer/movie/${id}`, Series: `https://thetvdb.com/?tab=series&id=${id}` })[type] || null,
 };
 const PROVIDER_NAMES = { Imdb: 'IMDb', Tmdb: 'TMDb', Tvdb: 'TheTVDB' };
 
@@ -57,7 +58,8 @@ function externalLinks(item) {
         const id = item.ProviderIds?.[key];
         const name = PROVIDER_NAMES[key];
         if (!id || links.some(l => l.Name === name || l.Name === key)) continue;
-        links.push({ Name: name, Url: url(encodeURIComponent(id), item.Type) });
+        const built = url(encodeURIComponent(id), item.Type);
+        if (built) links.push({ Name: name, Url: built });
     }
     if (item.HomePageUrl && /^https?:\/\//i.test(item.HomePageUrl)) links.unshift({ Name: t('detail.website'), Url: item.HomePageUrl });
     return links;
@@ -479,7 +481,7 @@ async function renderDetail(itemId) {
                             ${runtime ? `<span class="jf-badge text-[11px]">${formatRuntime(runtime)}</span>` : ''}
                             ${rating ? `<span class="jf-badge jf-badge-rating inline-flex items-center gap-0.5 text-[11px]">${icon('Star', { size: 10, class: 'fill-current' })} ${rating.toFixed(1)}</span>` : ''}
                             ${criticRatingHtml(item)}
-                            ${ends ? `<span class="jf-badge jf-ends-at text-[11px]">${t('detail.ends_at', { time: ends.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) })}</span>` : ''}
+                            ${ends ? `<span class="jf-badge jf-ends-at text-[11px]">${t('detail.ends_at', { time: ends.toLocaleTimeString(document.documentElement.lang || [], { hour: 'numeric', minute: '2-digit' }) })}</span>` : ''}
                         </div>
 
                         ${breadcrumbHtml}
@@ -515,7 +517,7 @@ async function renderDetail(itemId) {
                             <button class="jf-btn-ghost h-11 !py-0 w-11 !px-0" title="${escapeHtml(t('detail.refresh_metadata'))}" aria-label="${escapeHtml(t('detail.refresh_metadata'))}" data-action="refresh-item" data-id="${escapeHtml(id)}">
                                 ${icon('RefreshCw', { size: 18, class: 'jf-busy-spin' })}
                             </button>
-                            <button class="jf-btn-ghost h-11 !py-0 w-11 !px-0 hover:!text-rose-400" title="${escapeHtml(t('detail.delete_item'))}" aria-label="${escapeHtml(t('detail.delete_item'))}" data-action="delete-item" data-id="${escapeHtml(id)}">
+                            <button class="jf-btn-ghost h-11 !py-0 w-11 !px-0 hover:!text-rose-400" title="${escapeHtml(t('detail.delete_item'))}" aria-label="${escapeHtml(t('detail.delete_item'))}" data-action="delete-item" data-id="${escapeHtml(id)}" data-name="${escapeHtml(name)}" data-type="${escapeHtml(type)}" data-parent-id="${escapeHtml(deleteParentId(item))}">
                                 ${icon('Trash2', { size: 18 })}
                             </button>` : ''}
                         </div>
@@ -639,21 +641,23 @@ async function togglePlayed(id, current, all = false) {
 }
 
 // The page an item's deletion leaves for: its season, series or album, else home
-function afterDeletePage(item) {
-    const parent = item?.SeasonId || item?.SeriesId || item?.AlbumId;
-    return parent && parent !== item.Id ? ['detail', parent] : ['home'];
+function deleteParentId(item) {
+    const parent = item.SeasonId || item.SeriesId || item.AlbumId || '';
+    return parent === item.Id ? '' : parent;
 }
 
-// Admin: removes the item (and what is under it) from the library, after a confirmation
-async function deleteItemFromDetail(id) {
-    const item = activeItem?.Id === id ? activeItem : null;
-    if (!confirm(t('detail.delete_confirm', { name: item?.Name || '' }))) return;
+// Admin: removes the item (and what is under it) after a confirmation. The button carries the item's own
+// name, type and parent. A collection or playlist is gone for good; anything else only leaves the library,
+// and its files stay.
+async function deleteItemFromDetail({ id, name = '', type = '', parentId = '' }) {
+    const permanent = type === 'BoxSet' || type === 'Playlist';
+    if (!confirm(t(permanent ? 'detail.delete_confirm_permanent' : 'detail.delete_confirm', { name }))) return;
     try {
         await API.deleteItem(id);
         API.invalidateCache('/Items');
         API.invalidateCache('/Shows');
-        toast(t('detail.deleted', { name: item?.Name || '' }));
-        navigate(...afterDeletePage(item));
+        toast(t('detail.deleted', { name }));
+        navigate(...(parentId ? ['detail', parentId] : ['home']));
     } catch (e) {
         toast(t('detail.delete_failed', { message: e.message }), 'error');
     }

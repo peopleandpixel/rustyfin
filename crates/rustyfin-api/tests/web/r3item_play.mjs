@@ -1,7 +1,7 @@
-// R3 item pages: the detail page's version, audio and subtitle choice and a chapter's start reach the
+// The web client's item page: the detail page's version, audio and subtitle choice and a chapter's start reach the
 // player through playItem's `selection` option. Runs playItem's track and start choice (from the start
-// position to the default tracks) in a vm sandbox with the player's own helpers, and the router's play
-// action with stubs.
+// position to the default tracks) in a vm sandbox with the player's own helpers, playWithResumeChoice and
+// the router's play action with stubs.
 // Usage: node r3item_play.mjs (run by api_tests.rs r3item_play).
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -78,7 +78,7 @@ test("a chapter's start wins over the resume point and from-start", () => {
     assert.equal(choose(ITEM, INFO, { selection: { startTicks: 0 } }).startTicks, 0, 'the first chapter starts at 0');
 });
 
-test('the detail page buttons pass the selection; other play buttons are unchanged', () => {
+test('the detail page buttons pass the selection; Play still asks to resume; other play buttons are unchanged', () => {
     const action = slice(router, '    play: el => {', '\n    },\n');
     const calls = [];
     const run = (dataset, selection = { mediaSourceId: 'v720' }) => {
@@ -92,12 +92,44 @@ test('the detail page buttons pass the selection; other play buttons are unchang
         return JSON.parse(JSON.stringify(calls));
     };
     const base = { id: 'kilo', streamType: 'Videos', title: 'Kilo' };
-    assert.deepEqual(run({ ...base, detailTracks: 'true', resume: 'true' }),
-        [['playItem', 'kilo', 'Videos', 'Kilo', { fromStart: false, selection: { mediaSourceId: 'v720' } }]]);
+    const chosen = { mediaSourceId: 'v720' };
+    assert.deepEqual(run({ ...base, detailTracks: 'true' }), [['ask', 'kilo', 'Videos', 'Kilo', chosen]],
+        "the page's Play button asks from a fresh resume point, with the choice");
+    assert.deepEqual(run({ ...base, detailTracks: 'true', resume: 'true' }), [['playItem', 'kilo', 'Videos', 'Kilo', { selection: chosen }]]);
     assert.deepEqual(run({ ...base, detailTracks: 'true', fromStart: 'true' }),
-        [['playItem', 'kilo', 'Videos', 'Kilo', { fromStart: true, selection: { mediaSourceId: 'v720' } }]]);
+        [['playItem', 'kilo', 'Videos', 'Kilo', { fromStart: true, selection: chosen }]]);
     assert.deepEqual(run({ ...base, detailTracks: 'true', startTicks: '100000000' }, null),
-        [['playItem', 'kilo', 'Videos', 'Kilo', { fromStart: false, selection: { startTicks: 100000000 } }]]);
-    assert.deepEqual(run(base), [['ask', 'kilo', 'Videos', 'Kilo']], 'a card still asks to resume');
-    assert.deepEqual(run({ ...base, resume: 'true' }), [['playItem', 'kilo', 'Videos', 'Kilo']]);
+        [['playItem', 'kilo', 'Videos', 'Kilo', { selection: { startTicks: 100000000 } }]], 'a chapter starts where it starts');
+    assert.deepEqual(run({ ...base, detailTracks: 'true', startTicks: '0' }),
+        [['playItem', 'kilo', 'Videos', 'Kilo', { selection: { ...chosen, startTicks: 0 } }]]);
+    assert.deepEqual(run(base), [['ask', 'kilo', 'Videos', 'Kilo', null]], 'a card still asks to resume');
+    assert.deepEqual(run({ ...base, resume: 'true' }), [['playItem', 'kilo', 'Videos', 'Kilo', { selection: null }]]);
+});
+
+test('playWithResumeChoice reads the resume point uncached and passes the selection on', async () => {
+    const run = async (item, answer) => {
+        const calls = [];
+        const ctx = vm.createContext({
+            pendingStop: Promise.resolve(),
+            console: { warn: () => {} },
+            API: { get: path => { calls.push(['get', path]); return Promise.resolve(item); } },
+            askResumeOrStart: (title, ticks) => { calls.push(['ask', title, ticks]); return Promise.resolve(answer); },
+            playItem: (...args) => calls.push(['playItem', ...args]),
+        });
+        vm.runInContext(`${slice(player, 'function resumePositionTicks(')}
+            ${slice(player, 'async function playWithResumeChoice(')}
+            this.go = playWithResumeChoice;`, ctx);
+        await ctx.go('kilo', 'Videos', 'Kilo', { mediaSourceId: 'v720' });
+        return JSON.parse(JSON.stringify(calls));
+    };
+    const sel = { selection: { mediaSourceId: 'v720' } };
+    assert.deepEqual(await run(ITEM, 'resume'), [
+        ['get', '/Items/kilo'],
+        ['ask', 'Kilo', 2e9],
+        ['playItem', 'kilo', 'Videos', 'Kilo', sel],
+    ]);
+    assert.deepEqual((await run(ITEM, 'start')).at(-1), ['playItem', 'kilo', 'Videos', 'Kilo', { fromStart: true, ...sel }]);
+    assert.deepEqual(await run({ RunTimeTicks: 1e10 }, ''), [['get', '/Items/kilo'], ['playItem', 'kilo', 'Videos', 'Kilo', sel]],
+        'no resume point: plays at once');
+    assert.equal((await run(ITEM, '')).length, 2, 'a dismissed question plays nothing');
 });

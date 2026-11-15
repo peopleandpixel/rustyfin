@@ -54,8 +54,9 @@ function askResumeOrStart(title, ticks) {
 }
 
 // Starts an item from a card or a Play button. A video with a resume point asks first whether to resume.
-async function playWithResumeChoice(itemId, streamType = 'Videos', title = '') {
-    if (streamType !== 'Videos') return playItem(itemId, streamType, title);
+// selection: the detail page's version and track choice, passed on to playItem.
+async function playWithResumeChoice(itemId, streamType = 'Videos', title = '', selection = null) {
+    if (streamType !== 'Videos') return playItem(itemId, streamType, title, { selection });
     // Read the point after the last Stopped report and uncached, so it includes the position just saved
     await pendingStop;
     let item = null;
@@ -65,10 +66,10 @@ async function playWithResumeChoice(itemId, streamType = 'Videos', title = '') {
         console.warn('Could not load item for resume point:', e);
     }
     const ticks = resumePositionTicks(item);
-    if (ticks <= 0) return playItem(itemId, streamType, title);
+    if (ticks <= 0) return playItem(itemId, streamType, title, { selection });
     const choice = await askResumeOrStart(title || item?.Name || '', ticks);
-    if (choice === 'resume') playItem(itemId, streamType, title);
-    else if (choice === 'start') playItem(itemId, streamType, title, { fromStart: true });
+    if (choice === 'resume') playItem(itemId, streamType, title, { selection });
+    else if (choice === 'start') playItem(itemId, streamType, title, { fromStart: true, selection });
 }
 
 // Stops the session that is still playing, if any. Returns the promise of its Stopped report.

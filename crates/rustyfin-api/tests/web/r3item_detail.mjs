@@ -1,4 +1,4 @@
-// R3 item pages: the detail page's tagline, credit lines, critic rating and "ends at"; media info;
+// The web client's item page: the tagline, credit lines, critic rating and "ends at"; media info;
 // the version, audio and subtitle pickers; chapters; external links; "mark all played" on a series or
 // season; and the admin's delete with its confirmation.
 // Runs item.js's helpers in a vm sandbox and checks the markup, icons and translations as text.
@@ -29,7 +29,7 @@ const BLOCK = [
     slice('function versionLabels('), slice('function chosenTracks('), slice('function trackSelectsHtml('),
     slice('function changeTrackSelect('), slice('function detailSelection('), slice('function mediaInfo('),
     slice('function mediaInfoHtml('), slice('function clockTime('), slice('function chaptersHtml('),
-    slice('function playedButtonTitle('), slice('function afterDeletePage('), slice('async function deleteItemFromDetail('),
+    slice('function playedButtonTitle('), slice('function deleteParentId('), slice('async function deleteItemFromDetail('),
 ].join('\n');
 
 function sandbox({ confirmed = true, deleteFails = false } = {}) {
@@ -50,16 +50,15 @@ function sandbox({ confirmed = true, deleteFails = false } = {}) {
         },
     });
     vm.runInContext(
-        `let detailChoice = null; let activeItem = null;
+        `let detailChoice = null;
          ${BLOCK}
          this.fns = { endsAt, criticRatingHtml, creditLinesHtml, externalLinks, externalLinksHtml, streamLabel,
              versionLabels, chosenTracks, trackSelectsHtml, changeTrackSelect, detailSelection, mediaInfo, mediaInfoHtml,
-             chaptersHtml, playedButtonTitle, afterDeletePage, deleteItemFromDetail };
-         this.setChoice = c => { detailChoice = c; };
-         this.setActive = i => { activeItem = i; };`,
+             chaptersHtml, playedButtonTitle, deleteParentId, deleteItemFromDetail };
+         this.setChoice = c => { detailChoice = c; };`,
         context,
     );
-    return { ...context.fns, setChoice: context.setChoice, setActive: context.setActive, log };
+    return { ...context.fns, setChoice: context.setChoice, log };
 }
 
 const plain = value => JSON.parse(JSON.stringify(value));
@@ -131,6 +130,7 @@ test('the page shows the tagline, critic rating, ends at and credit lines', () =
     assert.match(render, /jf-tagline/);
     assert.match(render, /criticRatingHtml\(item\)/);
     assert.match(render, /detail\.ends_at/);
+    assert.match(render, /ends\.toLocaleTimeString\(document\.documentElement\.lang \|\| \[\],/, 'in the app language');
     assert.match(render, /creditLinesHtml\(item\)/);
 });
 
@@ -153,6 +153,12 @@ test('external links: the server ExternalUrls, then IMDb, TMDb and TheTVDB from 
         { Name: 'TMDb', Url: 'https://www.themoviedb.org/tv/42' },
         { Name: 'TheTVDB', Url: 'https://thetvdb.com/?tab=series&id=7' },
     ]);
+    assert.deepEqual(plain(f.externalLinks({ Type: 'Movie', ProviderIds: { Tvdb: '9' } })),
+        [{ Name: 'TheTVDB', Url: 'https://thetvdb.com/dereferrer/movie/9' }]);
+    for (const Type of ['Season', 'Episode', 'BoxSet', 'Person']) {
+        assert.deepEqual(plain(f.externalLinks({ Type, ProviderIds: { Tmdb: '42', Tvdb: '7', Imdb: 'tt2' } })),
+            [{ Name: 'IMDb', Url: 'https://www.imdb.com/title/tt2' }], `no built TMDb or TheTVDB link for a ${Type}`);
+    }
     assert.equal(f.externalLinksHtml({}), '');
     const html = f.externalLinksHtml({ ProviderIds: { Imdb: 'tt1' } });
     assert.match(html, /<a href="https:\/\/www\.imdb\.com\/title\/tt1" target="_blank" rel="noopener noreferrer"[^>]*>IMDb<\/a>/);
@@ -257,7 +263,7 @@ test('the page wires the pickers: selects under the buttons, media info of the c
     assert.match(render, /id="detail-media-info">\$\{detailChoice \? mediaInfoHtml\(chosenTracks\(detailChoice\)\.source\)/);
     assert.equal((render.match(/data-detail-tracks="true"/g) || []).length, 2, 'Play/Resume and Play from beginning');
     assert.match(source, /document\.addEventListener\('change', e => \{\s*const name = e\.target\.dataset\?\.trackSelect;/);
-    assert.match(router, /if \(el\.dataset\.detailTracks === 'true'\) \{\s*const selection = detailSelection\(id\) \|\| \{\};/);
+    assert.match(router, /const selection = el\.dataset\.detailTracks === 'true' \? detailSelection\(id\) \|\| \{\} : null;/);
 });
 
 // --- Chapters ---
@@ -281,7 +287,7 @@ test('chapters: image where the server has one, name and start time; a click pla
     assert.match(html, />Opening<\/p>\s*<p[^>]*>0:00<\/p>/);
     assert.match(html, />detail\.chapter_number\|\{&quot;number&quot;:2\}<\/p>\s*<p[^>]*>1:02:05<\/p>/);
     assert.match(slice('async function renderDetail('), /canPlay && streamType === 'Videos' \? chaptersHtml\(item\)/);
-    assert.match(router, /if \(el\.dataset\.startTicks !== undefined\) selection\.startTicks = Number\(el\.dataset\.startTicks\);/);
+    assert.match(router, /selection: \{ \.\.\.selection, startTicks: Number\(el\.dataset\.startTicks\) \}/);
 });
 
 // --- Mark all played ---
@@ -301,10 +307,10 @@ test('a series or season marks all its episodes, and says so', () => {
 
 // --- Delete ---
 
-test('delete asks first, then deletes and leaves for the parent', async () => {
+test('delete asks with the deleted item own name, then deletes and leaves for the parent', async () => {
     const f = sandbox();
-    f.setActive({ Id: 'e1', Name: 'Pilot', SeasonId: 's1', SeriesId: 'sr' });
-    await f.deleteItemFromDetail('e1');
+    // The button's dataset: the item's own name and parent, whatever page was rendered last
+    await f.deleteItemFromDetail({ id: 'e1', name: 'Pilot', type: 'Episode', parentId: 's1' });
     assert.deepEqual(plain(f.log), [
         ['confirm', 'detail.delete_confirm|{"name":"Pilot"}'],
         ['delete', 'e1'],
@@ -313,17 +319,30 @@ test('delete asks first, then deletes and leaves for the parent', async () => {
         ['toast', 'detail.deleted|{"name":"Pilot"}', 'success'],
         ['navigate', 'detail', 's1'],
     ]);
-    assert.deepEqual(plain(f.afterDeletePage({ Id: 'se', SeriesId: 'sr' })), ['detail', 'sr']);
-    assert.deepEqual(plain(f.afterDeletePage({ Id: 'm' })), ['home']);
-    assert.deepEqual(plain(f.afterDeletePage(null)), ['home']);
+    assert.equal(f.deleteParentId({ Id: 'e1', SeasonId: 's1', SeriesId: 'sr' }), 's1');
+    assert.equal(f.deleteParentId({ Id: 'se', SeriesId: 'sr' }), 'sr');
+    assert.equal(f.deleteParentId({ Id: 'm' }), '');
+    const movie = sandbox();
+    await movie.deleteItemFromDetail({ id: 'm', name: 'Film', type: 'Movie', parentId: '' });
+    assert.deepEqual(plain(movie.log.at(-1)), ['navigate', 'home']);
+});
+
+test('a collection or playlist is deleted for good, and the prompt says so', async () => {
+    for (const type of ['BoxSet', 'Playlist']) {
+        const f = sandbox();
+        await f.deleteItemFromDetail({ id: 'c', name: 'Mine', type });
+        assert.deepEqual(plain(f.log[0]), ['confirm', 'detail.delete_confirm_permanent|{"name":"Mine"}'], type);
+    }
+    assert.match(en.detail.delete_confirm, /files stay on disk/);
+    assert.doesNotMatch(en.detail.delete_confirm_permanent, /scan/);
 });
 
 test('delete does nothing when the user cancels, and reports a failure', async () => {
     const cancelled = sandbox({ confirmed: false });
-    await cancelled.deleteItemFromDetail('m');
+    await cancelled.deleteItemFromDetail({ id: 'm' });
     assert.deepEqual(plain(cancelled.log), [['confirm', 'detail.delete_confirm|{"name":""}']]);
     const failing = sandbox({ deleteFails: true });
-    await failing.deleteItemFromDetail('m');
+    await failing.deleteItemFromDetail({ id: 'm' });
     assert.deepEqual(plain(failing.log.slice(1)), [['delete', 'm'], ['toast', 'detail.delete_failed|{"message":"nope"}', 'error']]);
 });
 
@@ -332,7 +351,8 @@ test('delete is an admin button', () => {
     const admin = render.slice(render.indexOf('${API.isAdmin ? `'));
     assert.ok(admin.indexOf('data-action="delete-item"') > 0 && admin.indexOf('data-action="delete-item"') < admin.indexOf("` : ''}"),
         'inside the admin-only block');
-    assert.match(router, /'delete-item': el => deleteItemFromDetail\(el\.dataset\.id\)/);
+    assert.match(router, /'delete-item': el => deleteItemFromDetail\(el\.dataset\)/);
+    assert.match(render, /data-action="delete-item" data-id="\$\{escapeHtml\(id\)\}" data-name="\$\{escapeHtml\(name\)\}" data-type="\$\{escapeHtml\(type\)\}" data-parent-id="\$\{escapeHtml\(deleteParentId\(item\)\)\}"/);
 });
 
 // --- Icons and strings ---

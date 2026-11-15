@@ -517,7 +517,8 @@
         "chapter_number": "Kapitel {{number}}",
         "delete_item": "Aus der Bibliothek löschen",
         "delete_confirm": "„{{name}}“ aus der Bibliothek löschen? Die Dateien bleiben erhalten, ein späterer Bibliotheksscan nimmt es also wieder auf.",
-        "deleted": "„{{name}}“ wurde aus der Bibliothek gelöscht",
+        "delete_confirm_permanent": "„{{name}}“ endgültig löschen? Das lässt sich nicht rückgängig machen.",
+        "deleted": "„{{name}}“ wurde gelöscht",
         "delete_failed": "Löschen fehlgeschlagen: {{message}}"
     },
     "person": {
