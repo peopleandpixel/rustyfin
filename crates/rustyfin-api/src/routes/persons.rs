@@ -104,11 +104,20 @@ pub(crate) async fn music_artists_page(
     let total = all.len() as i64;
     let start = query.start_index.unwrap_or(0).max(0);
     let count = query.limit.map_or(total, |limit| limit.max(0));
-    let items = all
+    let mut items: Vec<_> = all
         .into_iter()
         .skip(start as usize)
         .take(count as usize)
         .collect();
+    // An artist with a folder item is listed under the folder's id, so its images are the folder's.
+    let ids: Vec<uuid::Uuid> = items.iter().map(|item| item.id).collect();
+    let images =
+        rustyfin_db::repo_image::get_images_batch_of(&state.db_ro, &ids, None, None).await?;
+    for item in &mut items {
+        if let Some(images) = images.get(&item.id.to_string()) {
+            super::items::set_image_tags(item, images);
+        }
+    }
     Ok(QueryResult {
         items,
         total_record_count: total,

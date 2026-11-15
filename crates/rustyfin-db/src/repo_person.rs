@@ -1,15 +1,58 @@
+use crate::repo_by_name::{ByNameKind, by_name_id};
 use rustyfin_model::media::{MediaItem, MediaType};
 use rustyfin_model::metadata::MetadataPerson;
 use rustyfin_model::person::{NameIdPair, PersonDto};
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
-/// The id of the music artist `name`: one person per lowercased name (spec 1.5).
+/// The id of the music artist `name`: one person per folded name, with the id `by_name_id` gives it.
 pub fn music_artist_person_id(name: &str) -> Uuid {
-    Uuid::new_v5(
-        &Uuid::NAMESPACE_OID,
-        format!("rustyfin-artist:{}", name.to_lowercase()).as_bytes(),
+    by_name_id(ByNameKind::MusicArtist, name)
+}
+
+/// SQL for the id an artist shows under in the lists: the id of the `MusicArtist` item of the same
+/// name (case-insensitive), so that the artist opens as that item, else the person id. Among
+/// several such items, one in the library that `library_is` gives comes first, then the lowest
+/// rowid. `library_is` is an SQL value (a bound `?`, or `NULL` when no library is known). The
+/// expression reads the person as `p`.
+pub fn artist_id_sql(library_is: &str) -> String {
+    artist_id_sql_with("", library_is)
+}
+
+/// `artist_id_sql` for a query over `item_people ip`, where the library preferred is that of the
+/// item `ip.item_id`. SQLite can't correlate the item's row from inside the ORDER BY of the
+/// subquery, so the item is joined in the subquery's FROM.
+pub fn item_artist_id_sql() -> String {
+    artist_id_sql_with("JOIN media_items x ON x.id = ip.item_id", "x.library_id")
+}
+
+fn artist_id_sql_with(join: &str, library_is: &str) -> String {
+    format!(
+        "COALESCE((SELECT m.id FROM media_items m {join} WHERE m.media_type = 'MusicArtist' \
+         AND m.name = p.name COLLATE NOCASE ORDER BY (m.library_id IS {library_is}) DESC, m.rowid LIMIT 1), p.id)"
     )
+}
+
+/// The MusicArtist item for person `id` when the person has an `Artist` or `AlbumArtist` link.
+/// This lets an artist id that a list answers with (a person id, when the artist has no folder
+/// item) open as an item.
+pub async fn music_artist_by_id(
+    pool: &SqlitePool,
+    id: Uuid,
+) -> Result<Option<MediaItem>, sqlx::Error> {
+    let name: Option<String> = sqlx::query_scalar(
+        "SELECT p.name FROM people p WHERE p.id = ? AND EXISTS (
+             SELECT 1 FROM item_people ip WHERE ip.person_id = p.id AND ip.type IN ('Artist', 'AlbumArtist'))",
+    )
+    .bind(id.to_string())
+    .fetch_optional(pool)
+    .await?;
+    Ok(name.map(|name| MediaItem {
+        id,
+        name,
+        media_type: MediaType::MusicArtist,
+        ..MediaItem::default_dto_fields()
+    }))
 }
 
 /// Links music items to their artists in one transaction (spec 1.5-1.6). Each `(item id, kind,
@@ -57,21 +100,25 @@ pub async fn get_music_artists(
     library: Option<Uuid>,
 ) -> Result<Vec<MediaItem>, sqlx::Error> {
     let library = library.map(|id| id.to_string());
-    let rows = sqlx::query_as::<_, (String, String)>(
-        "SELECT p.id, p.name FROM people p
+    let query = format!(
+        "SELECT {}, p.name FROM people p
          WHERE p.id IN (
              SELECT ip.person_id FROM item_people ip
              JOIN media_items mi ON mi.id = ip.item_id
              WHERE ip.type = ? AND mi.media_type = ? AND (? IS NULL OR mi.library_id = ?)
          )
          ORDER BY p.name COLLATE NOCASE",
-    )
-    .bind(link_kind)
-    .bind(item_type)
-    .bind(&library)
-    .bind(&library)
-    .fetch_all(pool)
-    .await?;
+        artist_id_sql("?")
+    );
+    // The library is bound first for the id, as it comes first in the text.
+    let rows = sqlx::query_as::<_, (String, String)>(sqlx::AssertSqlSafe(query))
+        .bind(&library)
+        .bind(link_kind)
+        .bind(item_type)
+        .bind(&library)
+        .bind(&library)
+        .fetch_all(pool)
+        .await?;
 
     Ok(rows
         .into_iter()
@@ -97,8 +144,11 @@ pub async fn get_links_batch(
         std::collections::HashMap::new();
     for chunk in item_ids.chunks(100) {
         let placeholders = vec!["?"; chunk.len()].join(",");
+        // An artist with a folder item is listed under that item's id, in the item's library.
+        let id_sql = item_artist_id_sql();
         let query = format!(
-            "SELECT ip.item_id, p.id, p.name FROM item_people ip JOIN people p ON p.id = ip.person_id \
+            "SELECT ip.item_id, CASE WHEN ip.type IN ('Artist', 'AlbumArtist') THEN {id_sql} ELSE p.id END, p.name \
+             FROM item_people ip JOIN people p ON p.id = ip.person_id \
              WHERE ip.type = ? AND ip.item_id IN ({placeholders}) ORDER BY ip.item_id, ip.sort_order IS NULL, ip.sort_order, ip.rowid"
         );
         let mut q =

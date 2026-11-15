@@ -98,7 +98,7 @@ fn apply_unplayed_counts(item: &mut MediaItem, counts: (i64, i64)) {
 
 /// Set an item's image tags (the first image of each type) and backdrop tags (every backdrop, in
 /// order) from its image rows.
-fn set_image_tags(item: &mut MediaItem, images: &[rustyfin_model::image::ItemImage]) {
+pub(crate) fn set_image_tags(item: &mut MediaItem, images: &[rustyfin_model::image::ItemImage]) {
     let mut tags: std::collections::HashMap<rustyfin_model::image::ImageType, String> =
         std::collections::HashMap::new();
     let mut backdrop_tags: Vec<String> = Vec::new();
@@ -1031,7 +1031,8 @@ pub(crate) async fn enrich_items_with(
             let placeholders: Vec<String> =
                 (1..=chunk_ids.len()).map(|i| format!("?{}", i)).collect();
             let query = format!(
-                "SELECT ip.item_id, p.id, p.name, ip.role, ip.type, (SELECT pi.path FROM person_images pi WHERE pi.person_id = p.id AND pi.image_type = 'Primary' AND pi.image_index = 0) FROM item_people ip JOIN people p ON p.id = ip.person_id WHERE ip.item_id IN ({}) ORDER BY ip.item_id, ip.sort_order IS NULL, ip.sort_order, ip.rowid",
+                "SELECT ip.item_id, CASE WHEN ip.type IN ('Artist', 'AlbumArtist') THEN {} ELSE p.id END, p.name, ip.role, ip.type, (SELECT pi.path FROM person_images pi WHERE pi.person_id = p.id AND pi.image_type = 'Primary' AND pi.image_index = 0) FROM item_people ip JOIN people p ON p.id = ip.person_id WHERE ip.item_id IN ({}) ORDER BY ip.item_id, ip.sort_order IS NULL, ip.sort_order, ip.rowid",
+                rustyfin_db::repo_person::item_artist_id_sql(),
                 placeholders.join(",")
             );
             let mut query_builder = sqlx::query_as::<
@@ -2420,7 +2421,12 @@ async fn item_or_library(state: &AppState, id: Uuid, user: Uuid) -> Result<Respo
                 Some(lib) => {
                     Ok(Json(super::library::library_view(&lib, &state.server_id)).into_response())
                 }
-                None => Err(ApiError::NotFound(message)),
+                // A music artist without a folder item is listed under its person id.
+                None => match rustyfin_db::repo_person::music_artist_by_id(&state.db_ro, id).await?
+                {
+                    Some(artist) => Ok(Json(artist).into_response()),
+                    None => Err(ApiError::NotFound(message)),
+                },
             }
         }
         other => other.map(|item| Json(item).into_response()),
