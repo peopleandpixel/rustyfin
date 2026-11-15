@@ -1,3 +1,4 @@
+pub mod chapter_images;
 pub mod config_file;
 pub mod date_backfill;
 pub mod dlna;

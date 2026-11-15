@@ -135,6 +135,7 @@ vm.runInContext([
     'function scheduleLibraryUpdate() { calls.scheduled++; }',
     'function scheduleRailUpdate() {}',
     'function libraryChanged(total) { calls.changed.push(total); }',
+    'function libraryEmptyHtml() { return \'<div class="text-center" tabindex="-1">library.no_filter_results</div>\'; }',
     'function loadLibraryIndex(gen) { calls.index = (calls.index || 0) + 1; }',
     'var libraryIndexRefresh = null, railAnchor = null, libraryQuery = {}, container = null;',
     'var librarySeq = 0, libraryTotalSeq = 0;',

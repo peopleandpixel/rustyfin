@@ -7,6 +7,7 @@
 use rustyfin_model::device_profile::{
     DeviceProfile, StreamProtocol, SubtitleDeliveryMethod, SubtitleProfile,
 };
+use rustyfin_model::media_source::jellyfin_language;
 
 use super::conditions::contains_container;
 use super::video::VideoPlan;
@@ -62,12 +63,15 @@ fn converts_to(stream: &StreamFacts, to: &str) -> bool {
 }
 
 /// Jellyfin's `SubtitleProfile.SupportsLanguage`. A profile without languages takes any stream,
-/// and a stream without a language counts as "und".
+/// and a stream without a language counts as "und". The stream's language is compared as
+/// Jellyfin reports it ("deu" for a file's "ger").
 fn supports_language(profile: &SubtitleProfile, language: Option<&str>) -> bool {
     profile.language.is_empty()
         || contains_container(
             &profile.language,
-            language.filter(|l| !l.is_empty()).unwrap_or("und"),
+            language
+                .filter(|l| !l.is_empty())
+                .map_or("und", jellyfin_language),
         )
 }
 

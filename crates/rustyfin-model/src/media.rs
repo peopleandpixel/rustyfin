@@ -147,16 +147,27 @@ impl<'de> Deserialize<'de> for ProviderIds {
     }
 }
 
-/// Chapter info for media items
+/// A chapter in an item's `Chapters`, as Jellyfin's `ChapterInfo`. The image's file path is not
+/// sent; clients fetch the image at `/Items/{id}/Images/Chapter/{index}` with `ImageTag`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct ChapterInfo {
-    pub start_ticks: i64,
+    pub start_position_ticks: i64,
     pub name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub image_date_modified: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub image: Option<String>,
+    /// When the chapter's image was made; Jellyfin's empty date when it has none.
+    #[serde(default = "ChapterInfo::no_image_date")]
+    pub image_date_modified: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_tag: Option<String>,
+}
+
+impl ChapterInfo {
+    /// The date Jellyfin gives a chapter without an image.
+    pub const NO_IMAGE_DATE: &'static str = "0001-01-01T00:00:00.0000000Z";
+
+    fn no_image_date() -> String {
+        Self::NO_IMAGE_DATE.to_string()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -612,9 +623,17 @@ pub struct MediaItem {
     /// Parent logo item ID
     #[serde(default)]
     pub parent_logo_item_id: Option<Uuid>,
-    /// Screenshot image tags for trickplay
+    /// Screenshot image tags
     #[serde(default)]
     pub screenshot_image_tags: Vec<String>,
+    /// Trickplay tile sets, by media source id, then by width; sent only when the item has any.
+    #[serde(default)]
+    pub trickplay: Option<
+        std::collections::BTreeMap<
+            String,
+            std::collections::BTreeMap<String, crate::trickplay::TrickplayInfo>,
+        >,
+    >,
     /// The BlurHash of each image that has one, by image type and then by image tag, as
     /// Jellyfin's `ImageBlurHashes` has them
     #[serde(default)]
@@ -809,6 +828,7 @@ impl MediaItem {
             parent_logo_image_tag: None,
             parent_logo_item_id: None,
             screenshot_image_tags: Vec::new(),
+            trickplay: None,
             image_blur_hashes: std::collections::HashMap::new(),
             video_3_d_format: None,
             play_access: None,
@@ -830,7 +850,7 @@ impl MediaItem {
 
 impl Serialize for MediaItem {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut s = serializer.serialize_struct("MediaItem", 161)?;
+        let mut s = serializer.serialize_struct("MediaItem", 162)?;
         s.serialize_field("Id", &self.id)?;
         s.serialize_field("Name", &self.name)?;
         s.serialize_field("SortName", &self.sort_name)?;
@@ -995,6 +1015,10 @@ impl Serialize for MediaItem {
         s.serialize_field("ParentLogoImageTag", &self.parent_logo_image_tag)?;
         s.serialize_field("ParentLogoItemId", &self.parent_logo_item_id)?;
         s.serialize_field("ScreenshotImageTags", &self.screenshot_image_tags)?;
+        match &self.trickplay {
+            Some(trickplay) => s.serialize_field("Trickplay", trickplay)?,
+            None => s.skip_field("Trickplay")?,
+        }
         s.serialize_field("ImageBlurHashes", &self.image_blur_hashes)?;
         s.serialize_field("Video3DFormat", &self.video_3_d_format)?;
         s.serialize_field("PlayAccess", &self.play_access)?;
