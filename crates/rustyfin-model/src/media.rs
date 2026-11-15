@@ -385,13 +385,13 @@ pub struct MediaItem {
     /// Album artist for audio items
     #[serde(default)]
     pub album_artist: Option<String>,
-    /// Album artists array for audio items
+    /// Album artists array for audio and music album items
     #[serde(default)]
-    pub album_artists: Vec<PersonInfo>,
-    /// Artists array for audio items
+    pub album_artists: Vec<GenreItem>,
+    /// Artist names for audio and music album items
     #[serde(default)]
-    pub artists: Vec<PersonInfo>,
-    /// Artist items array
+    pub artists: Vec<String>,
+    /// Artist name and id pairs for audio items
     #[serde(default)]
     pub artist_items: Vec<GenreItem>,
     /// Song count for folders

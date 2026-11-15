@@ -1,4 +1,4 @@
-use rustyfin_model::media::MediaItem;
+use rustyfin_model::media::{MediaItem, MediaType};
 use rustyfin_model::person::{NameIdPair, PersonDto};
 use sqlx::SqlitePool;
 use uuid::Uuid;
@@ -46,20 +46,70 @@ pub async fn link_music_artists(
     tx.commit().await
 }
 
-pub async fn get_artists(pool: &SqlitePool) -> Result<Vec<NameIdPair>, sqlx::Error> {
-    // Return distinct artists from Audio items (using parent name as album/artist proxy)
+/// The music artists of `library` (all libraries when `None`): the people linked as `link_kind`
+/// to items of `item_type` (a stored media type such as `"Audio"`), as MusicArtist items sorted
+/// by name. Person ids are one per lowercased name, so each name appears once.
+pub async fn get_music_artists(
+    pool: &SqlitePool,
+    link_kind: &str,
+    item_type: &str,
+    library: Option<Uuid>,
+) -> Result<Vec<MediaItem>, sqlx::Error> {
+    let library = library.map(|id| id.to_string());
     let rows = sqlx::query_as::<_, (String, String)>(
-        "SELECT DISTINCT p.id, p.name FROM media_items p
-         WHERE p.media_type IN ('\"MusicAlbum\"', '\"MusicArtist\"')
-         ORDER BY p.name",
+        "SELECT p.id, p.name FROM people p
+         WHERE p.id IN (
+             SELECT ip.person_id FROM item_people ip
+             JOIN media_items mi ON mi.id = ip.item_id
+             WHERE ip.type = ? AND mi.media_type = ? AND (? IS NULL OR mi.library_id = ?)
+         )
+         ORDER BY p.name COLLATE NOCASE",
     )
+    .bind(link_kind)
+    .bind(item_type)
+    .bind(&library)
+    .bind(&library)
     .fetch_all(pool)
     .await?;
 
     Ok(rows
         .into_iter()
-        .map(|r| NameIdPair { id: r.0, name: r.1 })
+        .filter_map(|(id, name)| {
+            Some(MediaItem {
+                id: Uuid::parse_str(&id).ok()?,
+                name,
+                media_type: MediaType::MusicArtist,
+                ..MediaItem::default_dto_fields()
+            })
+        })
         .collect())
+}
+
+/// The people linked as `kind` to each of `item_ids`, in link order: `(item id, person id, name)`
+/// rows, grouped by the item id string. Chunked to keep the SQL parameter count small.
+pub async fn get_links_batch(
+    pool: &SqlitePool,
+    item_ids: &[Uuid],
+    kind: &str,
+) -> Result<std::collections::HashMap<String, Vec<(String, String)>>, sqlx::Error> {
+    let mut map: std::collections::HashMap<String, Vec<(String, String)>> =
+        std::collections::HashMap::new();
+    for chunk in item_ids.chunks(100) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let query = format!(
+            "SELECT ip.item_id, p.id, p.name FROM item_people ip JOIN people p ON p.id = ip.person_id \
+             WHERE ip.type = ? AND ip.item_id IN ({placeholders}) ORDER BY ip.item_id, ip.sort_order IS NULL, ip.sort_order, ip.rowid"
+        );
+        let mut q =
+            sqlx::query_as::<_, (String, String, String)>(sqlx::AssertSqlSafe(query)).bind(kind);
+        for id in chunk {
+            q = q.bind(id.to_string());
+        }
+        for (item_id, pid, name) in q.fetch_all(pool).await? {
+            map.entry(item_id).or_default().push((pid, name));
+        }
+    }
+    Ok(map)
 }
 
 pub async fn get_all_persons(pool: &SqlitePool) -> Result<Vec<NameIdPair>, sqlx::Error> {

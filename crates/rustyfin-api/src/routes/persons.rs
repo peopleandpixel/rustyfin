@@ -67,7 +67,59 @@ async fn get_person_items(
     }))
 }
 
-async fn get_artists(State(state): State<AppState>) -> Result<Json<Vec<NameIdPair>>, ApiError> {
-    let artists = rustyfin_db::repo_person::get_artists(&state.db).await?;
-    Ok(Json(artists))
+/// The Jellyfin paging and library query of the music artist lists (`/Artists`, `/Artists/AlbumArtists`).
+#[derive(Deserialize)]
+pub(crate) struct ArtistsQuery {
+    #[serde(rename = "ParentId")]
+    parent_id: Option<String>,
+    #[serde(rename = "StartIndex")]
+    start_index: Option<i64>,
+    #[serde(rename = "Limit")]
+    limit: Option<i64>,
+}
+
+/// One page of the music artists linked as `link_kind` to items of `item_type`. A `ParentId`
+/// that is not a library id is ignored; `TotalRecordCount` counts all matches before paging.
+pub(crate) async fn music_artists_page(
+    state: &AppState,
+    query: &ArtistsQuery,
+    link_kind: &str,
+    item_type: &str,
+) -> Result<QueryResult, ApiError> {
+    let mut library = None;
+    if let Some(id) = query
+        .parent_id
+        .as_deref()
+        .and_then(|v| uuid::Uuid::parse_str(v).ok())
+        && rustyfin_db::repo_library::get_library_by_id(&state.db_ro, id)
+            .await?
+            .is_some()
+    {
+        library = Some(id);
+    }
+    let all =
+        rustyfin_db::repo_person::get_music_artists(&state.db_ro, link_kind, item_type, library)
+            .await?;
+    let total = all.len() as i64;
+    let start = query.start_index.unwrap_or(0).max(0);
+    let count = query.limit.map_or(total, |limit| limit.max(0));
+    let items = all
+        .into_iter()
+        .skip(start as usize)
+        .take(count as usize)
+        .collect();
+    Ok(QueryResult {
+        items,
+        total_record_count: total,
+        start_index: start,
+    })
+}
+
+async fn get_artists(
+    State(state): State<AppState>,
+    Query(query): Query<ArtistsQuery>,
+) -> Result<Json<QueryResult>, ApiError> {
+    Ok(Json(
+        music_artists_page(&state, &query, "Artist", "Audio").await?,
+    ))
 }

@@ -2685,9 +2685,12 @@ pub async fn get_music_genres(pool: &SqlitePool) -> Result<Vec<MediaItem>, sqlx:
     Ok(items)
 }
 
-/// Get album artists
-pub async fn get_album_artists(_pool: &SqlitePool) -> Result<Vec<MediaItem>, sqlx::Error> {
-    Ok(Vec::new())
+/// Get album artists: the people linked as `AlbumArtist` to music albums (of `library` when set).
+pub async fn get_album_artists(
+    pool: &SqlitePool,
+    library: Option<uuid::Uuid>,
+) -> Result<Vec<MediaItem>, sqlx::Error> {
+    crate::repo_person::get_music_artists(pool, "AlbumArtist", "MusicAlbum", library).await
 }
 
 /// Get genres by name
@@ -2935,14 +2938,14 @@ pub async fn get_album_for_audio(
     parent_id: uuid::Uuid,
 ) -> Result<Option<MediaItem>, sqlx::Error> {
     let pid = parent_id.to_string();
-    let row: Option<(String, String, String)> =
-        sqlx::query_as("SELECT id, name, media_type FROM media_items WHERE id = ?")
+    let row: Option<(String, String, String, Option<String>)> =
+        sqlx::query_as("SELECT id, name, media_type, parent_id FROM media_items WHERE id = ?")
             .bind(&pid)
             .fetch_optional(pool)
             .await?;
 
     match row {
-        Some((id, name, media_type)) if media_type == "MusicAlbum" => {
+        Some((id, name, media_type, album_parent)) if media_type == "MusicAlbum" => {
             let uid = match uuid::Uuid::parse_str(&id) {
                 Ok(u) => u,
                 Err(_) => return Ok(None),
@@ -2954,7 +2957,7 @@ pub async fn get_album_for_audio(
                 overview: None,
                 media_type: MediaType::MusicAlbum,
                 path: String::new(),
-                parent_id: None,
+                parent_id: album_parent.and_then(|p| uuid::Uuid::parse_str(&p).ok()),
                 library_id: uuid::Uuid::nil(),
                 production_year: None,
                 community_rating: None,

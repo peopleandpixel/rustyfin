@@ -1,6 +1,6 @@
 use axum::Json;
 use axum::Router;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::get;
 use serde::Serialize;
@@ -251,25 +251,12 @@ async fn get_artists_similar(
 /// GET /Artists/AlbumArtists — Returns album artists
 async fn get_album_artists(
     State(state): State<AppState>,
-) -> Result<
-    (
-        StatusCode,
-        Json<QueryResult<rustyfin_model::media::MediaItem>>,
-    ),
-    crate::error::ApiError,
-> {
-    let items = rustyfin_db::repo_media::get_album_artists(&state.db_ro)
-        .await
-        .map_err(|e| crate::error::ApiError::Internal(e.to_string()))?;
-    let total = items.len() as i64;
-    Ok((
-        StatusCode::OK,
-        Json(QueryResult {
-            items,
-            total_record_count: total,
-            start_index: None,
-        }),
-    ))
+    Query(query): Query<crate::routes::persons::ArtistsQuery>,
+) -> Result<(StatusCode, Json<rustyfin_model::media::QueryResult>), crate::error::ApiError> {
+    let page =
+        crate::routes::persons::music_artists_page(&state, &query, "AlbumArtist", "MusicAlbum")
+            .await?;
+    Ok((StatusCode::OK, Json(page)))
 }
 
 /// GET /Artists/{name} — Search artists by name
