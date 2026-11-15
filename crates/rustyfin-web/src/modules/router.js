@@ -9,6 +9,7 @@ import {
 import { currentDetailId, renderDetail, renderPerson, toggleFavorite, togglePlayed } from './item.js';
 import { renderSearch } from './search.js';
 import { playWithResumeChoice, stopPlayback, playItem, playerAutoHide, onPlayerClosed } from './player.js';
+import { playContainer } from './queue.js';
 import { renderSettings } from './settings.js';
 import {
     renderAdmin, showAdminTab, setUserPolicy, removeOidcLinkAsAdmin, copyOidcCallbackUrl, saveOidcAdminSettings,
@@ -126,6 +127,9 @@ const clickActions = {
         else if (el.dataset.fromStart === 'true') playItem(id, streamType, title, { fromStart: true });
         else playWithResumeChoice(id, streamType, title);
     },
+    // Play all and Shuffle on a series, season, album, artist, playlist, collection or library
+    'play-all': el => playContainer(el.dataset.id),
+    shuffle: el => playContainer(el.dataset.id, { shuffle: true }),
     'scan-library': el => startScanWithToast(API.scanLibrary(el.dataset.id), t('library.scan_started_for', { name: el.dataset.name })),
     'scan-library-page': el => startScanWithToast(API.scanLibrary(el.dataset.id), t('library.media_scan_started_for', { name: el.dataset.name })),
     'scan-library-admin': el => startScanWithToast(API.scanLibrary(el.dataset.id), t('admin.scan_started')),

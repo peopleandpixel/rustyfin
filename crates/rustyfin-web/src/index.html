@@ -508,6 +508,9 @@
             </div>
         </div>
 
+        <!-- Skip intro or outro: shows for 8 s when one starts, and while the bars show -->
+        <button id="player-skip-segment" type="button" class="jf-skip-segment absolute right-4 bottom-32 lg:right-6 z-40 rounded-lg bg-black/70 backdrop-blur-md border border-white/20 px-4 py-2 text-sm font-semibold text-white shadow-2xl hover:bg-white/20" onclick="skipSegment()" hidden></button>
+
         <!-- Announces the next-episode card once when it appears -->
         <p id="player-up-next-status" class="sr-only" role="status"></p>
 
@@ -516,8 +519,16 @@
             <!-- Progress Slider -->
             <div class="flex items-center gap-3 mb-3">
                 <span id="player-cur-time" class="text-xs font-mono text-white/70 w-12 text-right">0:00</span>
-                <input id="player-seek" type="range" min="0" max="100" value="0" step="0.1" class="w-full range range-xs range-primary accent-[#00a4dc] cursor-pointer"
-                       oninput="previewSeek(this.value)" onchange="seekVideo(this.value)" onpointerup="seekDragging = false" onpointercancel="seekDragging = false">
+                <div class="relative flex-1 flex items-center">
+                    <!-- Trickplay thumbnail and time over the point being dragged or hovered -->
+                    <div id="player-trickplay" class="absolute bottom-full mb-3 -translate-x-1/2 pointer-events-none flex flex-col items-center gap-1" hidden>
+                        <div id="player-trickplay-img" class="rounded border border-white/20 bg-black bg-no-repeat shadow-2xl" hidden></div>
+                        <span id="player-trickplay-time" class="text-xs font-mono text-white bg-black/70 rounded px-1.5 py-0.5"></span>
+                    </div>
+                    <input id="player-seek" type="range" min="0" max="100" value="0" step="0.1" class="w-full range range-xs range-primary accent-[#00a4dc] cursor-pointer"
+                           oninput="previewSeek(this.value)" onchange="seekVideo(this.value)" onpointerup="seekDragging = false" onpointercancel="seekDragging = false"
+                           onpointerdown="hoverSeek(event)" onpointermove="hoverSeek(event)" onpointerleave="if (!seekDragging) hideTrickplay()">
+                </div>
                 <span id="player-duration" class="text-xs font-mono text-white/70 w-12">0:00</span>
             </div>
 
@@ -562,13 +573,24 @@
                         <select id="player-subs" class="bg-white/10 text-xs text-white rounded px-2 py-1 outline-none border border-white/10 focus-visible:ring-2 focus-visible:ring-[#00a4dc] max-sm:absolute max-sm:inset-0 max-sm:w-full max-sm:opacity-0 sm:max-w-56" title="Choose subtitles" aria-label="Choose subtitles" data-i18n-title="player.choose_subtitles" data-i18n-aria-label="player.choose_subtitles" onchange="changeSubtitleTrack(this.value)"></select>
                     </label>
                     <!-- Playback Speed -->
-                    <select id="player-speed" class="bg-white/10 text-xs text-white rounded px-2 py-1 outline-none border border-white/10" onchange="setPlaybackRate(this.value)">
+                    <select id="player-speed" class="bg-white/10 text-xs text-white rounded px-2 py-1 outline-none border border-white/10" title="Playback speed (&lt; &gt;)" aria-label="Playback speed (&lt; &gt;)" data-i18n-title="player.speed_tooltip" data-i18n-aria-label="player.speed_tooltip" onchange="setPlaybackRate(this.value)">
+                        <option value="0.5">0.5x</option>
                         <option value="0.75">0.75x</option>
                         <option value="1" selected>1.0x</option>
                         <option value="1.25">1.25x</option>
                         <option value="1.5">1.5x</option>
+                        <option value="1.75">1.75x</option>
                         <option value="2">2.0x</option>
+                        <option value="2.5">2.5x</option>
+                        <option value="3">3.0x</option>
+                        <option value="3.5">3.5x</option>
+                        <option value="4">4.0x</option>
                     </select>
+
+                    <!-- Picture-in-picture: videos only, where the browser supports it -->
+                    <button id="player-btn-pip" class="jf-icon-btn" title="Picture-in-picture" aria-label="Picture-in-picture" data-i18n-title="player.picture_in_picture" data-i18n-aria-label="player.picture_in_picture" onclick="togglePictureInPicture()" hidden>
+                        <i data-lucide="picture-in-picture-2" class="w-5 h-5"></i>
+                    </button>
 
                     <!-- Fullscreen -->
                     <button class="jf-icon-btn" title="Fullscreen (F)" aria-label="Fullscreen (F)" data-i18n-title="player.fullscreen_tooltip" data-i18n-aria-label="player.fullscreen_tooltip" onclick="toggleFullscreen()">

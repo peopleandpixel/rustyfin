@@ -858,6 +858,16 @@ select.jf-input {
   pointer-events: none;
 }
 
+/* The skip intro button stays while the bars show, and fades with them once its 8 s are up */
+.jf-skip-segment {
+  transition: opacity 0.3s ease;
+}
+
+.jf-player-idle .jf-skip-segment.jf-skip-expired {
+  opacity: 0;
+  pointer-events: none;
+}
+
 .jf-player-container.jf-player-idle,
 .jf-player-container.jf-player-idle * {
   cursor: none;

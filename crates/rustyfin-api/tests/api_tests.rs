@@ -3247,6 +3247,7 @@ const B124_WEB_MODULES: &[&str] = &[
     "library.js",
     "player.js",
     "plugins.js",
+    "queue.js",
     "router.js",
     "search.js",
     "settings.js",
@@ -23314,6 +23315,18 @@ fn b170_player_header_autohide() {
 #[test]
 fn b171_next_episode() {
     b124_node_test("b171_next_episode.mjs");
+}
+
+// The web player's play queue (Play all, Shuffle, previous/next)
+#[test]
+fn r3player_queue() {
+    b124_node_test("r3player_queue.mjs");
+}
+
+// The web player's trickplay thumbnails, skip intro, keyboard shortcuts, Media Session and picture-in-picture
+#[test]
+fn r3player_controls() {
+    b124_node_test("r3player_controls.mjs");
 }
 
 // The web client's autoplay switch is Jellyfin's UserConfiguration.EnableNextEpisodeAutoPlay: each

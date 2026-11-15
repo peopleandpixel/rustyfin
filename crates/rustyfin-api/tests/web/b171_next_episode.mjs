@@ -24,7 +24,7 @@ function slice(head) {
 
 const BLOCK = [
     'function isStreamType(', 'function findStream(', 'function defaultSubtitleIndex(', 'function adjacentEpisodes(', 'function episodeTrackCarry(',
-    'function carriedTracks(', 'function creditsStart(', 'function upNextStart(', 'async function loadEpisodeNav(',
+    'function carriedTracks(', 'function creditsStart(', 'function upNextStart(', 'function loadMediaSegments(', 'async function loadEpisodeNav(',
     'function resetEpisodeNav(', 'function updateEpisodeButtons(', 'function playEpisode(',
     'function playAdjacentEpisode(', 'function checkUpNext(', 'function upNextAtEnd(', 'function episodeNumberLabel(',
     'function showUpNext(', 'function renderUpNextCountdown(', 'function upNextTick(', 'function playUpNextNow(',
@@ -62,6 +62,10 @@ function sandbox({ episodes = SERIES, me = { Id: 'u1', Configuration: {} }, segm
             imageUrl: (id, type, opts) => `/Items/${id}/Images/${type}?maxWidth=${opts.maxWidth}`,
         },
         playItem: (id, type, title, opts) => log.push(['playItem', id, type, title, opts]),
+        // No play queue here (r3player_queue.mjs covers it), and no Media Session
+        queueNeighbours: () => null,
+        playQueueStep: () => false,
+        setMediaSessionHandler: () => {},
     });
     vm.runInContext(
         `var activePlayback = null; let episodeNav = null; let upNext = null; const UP_NEXT_SECONDS = 10;

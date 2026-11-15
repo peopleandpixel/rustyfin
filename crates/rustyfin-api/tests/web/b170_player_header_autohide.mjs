@@ -91,8 +91,13 @@ test('closing the player resets the bars and leaves fullscreen when the page hol
         const calls = [];
         const context = vm.createContext({
             stopPlayback: () => calls.push('stop'),
-            // Closing also resets the next-episode buttons (next-episode autoplay)
+            // Closing also resets the next-episode buttons (next-episode autoplay), and ends the queue, the skip
+            // button, the seek thumbnail and the Media Session (r3player_*.mjs)
             resetEpisodeNav: () => {},
+            clearQueue: () => {},
+            hideSkipSegment: () => {},
+            hideTrickplay: () => {},
+            clearMediaSession: () => {},
             playerBars: { reset: () => calls.push('reset') },
             document: {
                 fullscreenElement: full ? {} : null,

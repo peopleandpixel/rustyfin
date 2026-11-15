@@ -54,6 +54,8 @@ async function renderDetail(itemId) {
         const imgSrc = item.ImageTags?.Primary ? API.imageUrl(id, 'Primary', { maxWidth: 500, tag: item.ImageTags.Primary }) : '';
         const backdropSrc = backdropUrl(item, 1920);
         const canPlay = ['Movie', 'Episode', 'Audio', 'MusicVideo', 'Video'].includes(type);
+        // Containers play their items as a queue: Play all from the start, Shuffle in a random order
+        const canPlayAll = ['Series', 'Season', 'MusicAlbum', 'MusicArtist', 'Playlist', 'BoxSet', 'Folder'].includes(type);
         const streamType = type === 'Audio' ? 'Audio' : 'Videos';
         const resumeTicks = streamType === 'Videos' ? resumePositionTicks(item) : 0;
 
@@ -223,6 +225,15 @@ async function renderDetail(itemId) {
                             <button class="jf-btn-ghost h-11 !py-0 !px-4 text-sm" data-action="play" data-id="${escapeHtml(id)}" data-stream-type="${escapeHtml(streamType)}" data-title="${escapeHtml(name)}" data-from-start="true">
                                 ${t('detail.play_from_beginning')}
                             </button>` : ''}` : ''}
+                            ${canPlayAll ? `
+                            <button class="jf-btn-primary h-11 !py-0 !px-7 text-sm font-bold shadow-xl" data-action="play-all" data-id="${escapeHtml(id)}">
+                                ${icon('Play', { size: 20, class: 'fill-current' })}
+                                ${t('common.play')}
+                            </button>
+                            <button class="jf-btn-ghost h-11 !py-0 !px-4 text-sm" data-action="shuffle" data-id="${escapeHtml(id)}">
+                                ${icon('Shuffle', { size: 18 })}
+                                ${t('player.shuffle')}
+                            </button>` : ''}
 
                             <button class="jf-btn-ghost h-11 !py-0 w-11 !px-0 sm:w-auto sm:!px-4 text-sm" title="${escapeHtml(t('detail.toggle_favorite'))}" aria-label="${escapeHtml(t('detail.toggle_favorite'))}" data-action="toggle-favorite" data-id="${escapeHtml(id)}" data-favorite="${fav}">
                                 ${icon('Heart', { size: 18, class: fav ? 'text-rose-500 fill-current' : 'text-white/60' })}
