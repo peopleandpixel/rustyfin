@@ -6,6 +6,7 @@ pub mod log_stream;
 pub mod middleware;
 pub mod oidc;
 pub mod query;
+mod route_case;
 pub mod routes;
 pub mod state;
 pub mod wizard_import;

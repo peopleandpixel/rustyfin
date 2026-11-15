@@ -1,4 +1,5 @@
-use axum::extract::{Path, Query, State};
+use crate::query::Query;
+use axum::extract::{Path, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get};
@@ -66,7 +67,7 @@ fn apply_user_data(item: &mut MediaItem, mut user_data: rustyfin_model::playback
         }
     }
     user_data.played_percentage = played_percentage(&user_data, item.runtime_ticks);
-    item.user_data = Some(user_data);
+    item.user_data = Some(user_data.for_item(item.id));
 }
 
 /// Jellyfin's PlayedPercentage: 100 * position / runtime, only with a position and a known runtime.
@@ -112,6 +113,17 @@ fn set_image_tags(item: &mut MediaItem, images: &[rustyfin_model::image::ItemIma
     item.backdrop_image_tags = backdrop_tags;
 }
 
+/// Adds an image's BlurHash to an item, under its type and tag (Jellyfin's ImageBlurHashes).
+fn add_blur_hash(item: &mut MediaItem, img: &rustyfin_model::image::ItemImage, hash: String) {
+    item.image_blur_hashes
+        .entry(img.image_type.as_str().to_string())
+        .or_default()
+        .insert(
+            rustyfin_core::image_proxy::image_tag(&img.path, img.stamp),
+            hash,
+        );
+}
+
 /// Load the image tags of an item read with `get_parent_item` or `get_album_for_audio`, which
 /// leave them empty.
 /// The album artists of a music album (spec 2.1-2.2): its `AlbumArtist` links `(person id,
@@ -152,6 +164,16 @@ async fn load_image_tags(pool: &SqlitePool, item: &mut MediaItem) {
     }
 }
 
+/// TMDb's path segment for an item's TMDb id: a movie's or a series'. A season's or an episode's
+/// TMDb id is not one TMDb's movie or tv routes take.
+fn tmdb_kind(item: &MediaItem) -> Option<&'static str> {
+    match item.media_type {
+        rustyfin_model::media::MediaType::Movie => Some("movie"),
+        rustyfin_model::media::MediaType::Series => Some("tv"),
+        _ => None,
+    }
+}
+
 /// Enrich a single MediaItem with all response fields: server_id, provider_ids, chapters,
 /// trickplay screenshots, etag, completion_percentage, external_urls, type flags,
 /// album/artist info, folder counts, inherited images, episode numbers, series branding,
@@ -187,10 +209,10 @@ async fn enrich_item(
     // ProviderIds from tmdb_id/tvdb_id
     let mut provider_ids = rustyfin_model::media::ProviderIds::default();
     if let Some(tmdb) = item.tmdb_id {
-        provider_ids.set("tmdb".to_string(), tmdb.to_string());
+        provider_ids.set("Tmdb".to_string(), tmdb.to_string());
     }
     if let Some(tvdb) = item.tvdb_id {
-        provider_ids.set("tvdb".to_string(), tvdb.to_string());
+        provider_ids.set("Tvdb".to_string(), tvdb.to_string());
     }
     item.provider_ids = provider_ids;
 
@@ -203,7 +225,7 @@ async fn enrich_item(
             item.critic_rating = Some(rating);
         }
         if let Some(imdb) = extras.imdb_id {
-            item.provider_ids.set("imdb".to_string(), imdb);
+            item.provider_ids.set("Imdb".to_string(), imdb);
         }
         item.lock_data = extras.lock_data;
         item.locked_fields = extras
@@ -216,8 +238,9 @@ async fn enrich_item(
 
     // ExternalUrls from provider_ids
     let mut external_urls = Vec::new();
-    if let Some(tmdb) = item.tmdb_id {
-        let kind = if item.is_movie { "movie" } else { "tv" };
+    if let Some(tmdb) = item.tmdb_id
+        && let Some(kind) = tmdb_kind(item)
+    {
         external_urls.push(rustyfin_model::media::ExternalUrl {
             name: "TMDb".to_string(),
             url: format!("https://www.themoviedb.org/{}/{}", kind, tmdb),
@@ -234,8 +257,8 @@ async fn enrich_item(
     // RemoteTrailers from TMDb API (real YouTube trailer URLs)
     if let Some(tmdb_id) = item.tmdb_id
         && let Some(api) = tmdb_api
+        && let Some(kind) = tmdb_kind(item)
     {
-        let kind = if item.is_movie { "movie" } else { "tv" };
         let trailers = rustyfin_core::tmdb_client::get_trailers(api, kind, tmdb_id).await;
         item.remote_trailers = trailers
             .into_iter()
@@ -288,8 +311,7 @@ async fn enrich_item(
         for img in images {
             // Use pre-computed blurhash from the database if available
             if let Some(ref hash) = img.blurhash {
-                let key = format!("{}-{}", img.image_type.as_str(), img.image_index);
-                item.image_blur_hashes.insert(key, hash.clone());
+                add_blur_hash(item, &img, hash.clone());
             } else if !img.path.starts_with("http://") && !img.path.starts_with("https://") {
                 // Fall back to on-demand computation for images without stored blurhash
                 let full_path = data_dir.join(&img.path);
@@ -302,8 +324,7 @@ async fn enrich_item(
                 )
                 .await
                 {
-                    let key = format!("{}-{}", img.image_type.as_str(), img.image_index);
-                    item.image_blur_hashes.insert(key, hash);
+                    add_blur_hash(item, &img, hash);
                 }
             }
         }
@@ -772,6 +793,102 @@ pub(crate) async fn enrich_items(
     data_dir: &std::path::Path,
     skip_blurhash: bool,
 ) {
+    enrich_items_with(
+        pool,
+        server_id,
+        user_id,
+        items,
+        http_client,
+        tmdb_api,
+        data_dir,
+        skip_blurhash,
+        &ImageOptions::default(),
+    )
+    .await
+}
+
+/// Jellyfin's image DTO options: EnableImages=false sends no image, EnableImageTypes keeps only
+/// the types it names (all when it names none it knows), ImageTypeLimit keeps that many images of
+/// a type (backdrops are the type with several). The default keeps everything.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct ImageOptions {
+    pub types: Option<Vec<rustyfin_model::image::ImageType>>,
+    pub limit: Option<usize>,
+}
+
+impl ImageOptions {
+    fn narrows(&self) -> bool {
+        self.types.is_some() || self.limit.is_some()
+    }
+
+    fn sends(&self, image_type: rustyfin_model::image::ImageType) -> bool {
+        self.limit != Some(0) && self.types.as_ref().is_none_or(|t| t.contains(&image_type))
+    }
+
+    /// Leaves out the images of an enriched item these options don't send: its own, its parents'
+    /// and its series', and the BlurHashes of the images left out.
+    fn apply(&self, item: &mut MediaItem) {
+        use rustyfin_model::image::ImageType as T;
+        if !self.narrows() {
+            return;
+        }
+        item.image_tags.retain(|t, _| self.sends(*t));
+        if !self.sends(T::Backdrop) {
+            item.backdrop_image_tags.clear();
+            item.parent_backdrop_image_tags.clear();
+        }
+        if let Some(n) = self.limit {
+            item.backdrop_image_tags.truncate(n);
+            item.parent_backdrop_image_tags.truncate(n);
+        }
+        if !self.sends(T::Primary) {
+            item.series_primary_image_tag = None;
+            item.parent_primary_image_tag = None;
+        }
+        if !self.sends(T::Thumb) {
+            item.series_thumb_image_tag = None;
+            item.parent_thumb_image_tag = None;
+        }
+        if !self.sends(T::Logo) {
+            item.parent_logo_image_tag = None;
+        }
+        if !self.sends(T::Art) {
+            item.parent_art_image_tag = None;
+        }
+        let kept: std::collections::HashSet<&String> = item
+            .image_tags
+            .values()
+            .chain(&item.backdrop_image_tags)
+            .chain(&item.parent_backdrop_image_tags)
+            .chain(&item.series_primary_image_tag)
+            .chain(&item.series_thumb_image_tag)
+            .chain(&item.parent_primary_image_tag)
+            .chain(&item.parent_thumb_image_tag)
+            .chain(&item.parent_logo_image_tag)
+            .chain(&item.parent_art_image_tag)
+            .collect();
+        let kept: std::collections::HashSet<String> = kept.into_iter().cloned().collect();
+        item.image_blur_hashes.retain(|_, by_tag| {
+            by_tag.retain(|tag, _| kept.contains(tag));
+            !by_tag.is_empty()
+        });
+    }
+}
+
+/// `enrich_items` with Jellyfin's image options: the image rows read are only those `images`
+/// sends, and the answer is narrowed to them (see `ImageOptions`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn enrich_items_with(
+    pool: &SqlitePool,
+    server_id: &str,
+    user_id: Option<Uuid>,
+    items: &mut [MediaItem],
+    http_client: &reqwest::Client,
+    tmdb_api: Option<&TmdbApi>,
+    data_dir: &std::path::Path,
+    skip_blurhash: bool,
+    images: &ImageOptions,
+) {
     if items.is_empty() {
         return;
     }
@@ -857,19 +974,30 @@ pub(crate) async fn enrich_items(
             .unwrap_or_default()
     };
 
-    // Batch query 6: All images for all items - populates image_tags
-    let images_map = rustyfin_db::repo_image::get_images_batch(pool, &item_ids)
-        .await
-        .unwrap_or_default();
+    // Batch query 6: All images for all items - populates image_tags. Only the image types and
+    // counts the answer sends are read (one row an item for a Primary-only list).
+    let images_map = rustyfin_db::repo_image::get_images_batch_of(
+        pool,
+        &item_ids,
+        images.types.as_deref(),
+        images.limit,
+    )
+    .await
+    .unwrap_or_default();
 
     // Batch query 7: Images for parent items too (needed for inherited image tags)
     let parent_image_ids: Vec<Uuid> = parent_map.values().map(|p| p.id).collect();
     let parent_images_map = if parent_image_ids.is_empty() {
         std::collections::HashMap::new()
     } else {
-        rustyfin_db::repo_image::get_images_batch(pool, &parent_image_ids)
-            .await
-            .unwrap_or_default()
+        rustyfin_db::repo_image::get_images_batch_of(
+            pool,
+            &parent_image_ids,
+            images.types.as_deref(),
+            images.limit,
+        )
+        .await
+        .unwrap_or_default()
     };
 
     // Batch query 7b: AlbumArtist links of the music albums that are listed or are parents of
@@ -886,6 +1014,14 @@ pub(crate) async fn enrich_items(
         rustyfin_db::repo_person::get_links_batch(pool, &album_link_ids, "AlbumArtist")
             .await
             .unwrap_or_default();
+
+    // Batch query: studios and IMDb ids for all items
+    let studios_map = rustyfin_db::repo_media::get_studios_for_items(pool, &item_ids)
+        .await
+        .unwrap_or_default();
+    let imdb_map = rustyfin_db::repo_media::get_imdb_ids_for_items(pool, &item_ids)
+        .await
+        .unwrap_or_default();
 
     // Batch query 8: People for all items
     let people_map: std::collections::HashMap<String, Vec<rustyfin_db::repo_media::PersonRow>> = {
@@ -965,17 +1101,21 @@ pub(crate) async fn enrich_items(
         // ProviderIds from tmdb_id/tvdb_id
         let mut provider_ids = rustyfin_model::media::ProviderIds::default();
         if let Some(tmdb) = item.tmdb_id {
-            provider_ids.set("tmdb".to_string(), tmdb.to_string());
+            provider_ids.set("Tmdb".to_string(), tmdb.to_string());
         }
         if let Some(tvdb) = item.tvdb_id {
-            provider_ids.set("tvdb".to_string(), tvdb.to_string());
+            provider_ids.set("Tvdb".to_string(), tvdb.to_string());
+        }
+        if let Some(imdb) = imdb_map.get(&item.id.to_string()) {
+            provider_ids.set("Imdb".to_string(), imdb.clone());
         }
         item.provider_ids = provider_ids;
 
         // ExternalUrls from provider_ids
         let mut external_urls = Vec::new();
-        if let Some(tmdb) = item.tmdb_id {
-            let kind = if item.is_movie { "movie" } else { "tv" };
+        if let Some(tmdb) = item.tmdb_id
+            && let Some(kind) = tmdb_kind(item)
+        {
             external_urls.push(rustyfin_model::media::ExternalUrl {
                 name: "TMDb".to_string(),
                 url: format!("https://www.themoviedb.org/{}/{}", kind, tmdb),
@@ -1011,9 +1151,10 @@ pub(crate) async fn enrich_items(
             item.backdrop_image_tags = backdrop_tags;
         }
 
-        // ImageBlurHashes: prefer stored values, fall back to on-demand computation
-        if !skip_blurhash {
-            // Use images from the batch-loaded map if available
+        // ImageBlurHashes: stored values always (lists paint them at once, as Jellyfin's do); an
+        // image without one is computed on demand only when `skip_blurhash` is false. The image
+        // warmer stores the missing ones in the background.
+        {
             let images_for_blurhash = images_map
                 .get(&item.id.to_string())
                 .cloned()
@@ -1021,9 +1162,11 @@ pub(crate) async fn enrich_items(
             for img in images_for_blurhash {
                 // Use pre-computed blurhash from the database if available
                 if let Some(ref hash) = img.blurhash {
-                    let key = format!("{}-{}", img.image_type.as_str(), img.image_index);
-                    item.image_blur_hashes.insert(key, hash.clone());
-                } else if !img.path.starts_with("http://") && !img.path.starts_with("https://") {
+                    add_blur_hash(item, &img, hash.clone());
+                } else if !skip_blurhash
+                    && !img.path.starts_with("http://")
+                    && !img.path.starts_with("https://")
+                {
                     // Fall back to on-demand computation
                     let full_path = data_dir.join(&img.path);
                     if let Ok(Some(hash)) = tokio::time::timeout(
@@ -1035,8 +1178,7 @@ pub(crate) async fn enrich_items(
                     )
                     .await
                     {
-                        let key = format!("{}-{}", img.image_type.as_str(), img.image_index);
-                        item.image_blur_hashes.insert(key, hash);
+                        add_blur_hash(item, &img, hash);
                     }
                 }
             }
@@ -1378,6 +1520,47 @@ pub(crate) async fn enrich_items(
             }
         }
 
+        // --- BlurHashes of the parent and series pictures the item names, as Jellyfin sends
+        // them, so a card that shows one of those can paint it at once ---
+        let shown: std::collections::HashSet<String> = item
+            .parent_thumb_image_tag
+            .iter()
+            .chain(&item.series_thumb_image_tag)
+            .chain(&item.series_primary_image_tag)
+            .chain(&item.parent_logo_image_tag)
+            .chain(&item.parent_art_image_tag)
+            .chain(&item.parent_backdrop_image_tags)
+            .cloned()
+            .collect();
+        if !shown.is_empty() {
+            let mut owners = [
+                item.parent_id,
+                item.series_id,
+                item.parent_thumb_item_id,
+                item.parent_backdrop_item_id,
+            ];
+            owners.sort();
+            let mut last = None;
+            for owner in owners.into_iter().flatten() {
+                if last == Some(owner) {
+                    continue;
+                }
+                last = Some(owner);
+                for img in parent_images_map
+                    .get(&owner.to_string())
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(hash) = &img.blurhash
+                        && shown
+                            .contains(&rustyfin_core::image_proxy::image_tag(&img.path, img.stamp))
+                    {
+                        add_blur_hash(item, img, hash.clone());
+                    }
+                }
+            }
+        }
+
         // --- GenreItems from genres, with the ids that /Genres or /MusicGenres lists ---
         if item.genre_items.is_empty() && !item.genres.is_empty() {
             let kind = rustyfin_db::repo_by_name::genre_kind_of(item.media_type);
@@ -1453,6 +1636,20 @@ pub(crate) async fn enrich_items(
             item.album_artist = item.album_artists.first().map(|a| a.name.clone());
             item.artists = item.album_artists.iter().map(|a| a.name.clone()).collect();
         }
+
+        // --- Studios from batch map, with the ids that /Studios lists (as enrich_item) ---
+        if item.studios.is_empty()
+            && let Some(studio_rows) = studios_map.get(&item.id.to_string())
+        {
+            let studio = rustyfin_db::repo_by_name::ByNameKind::Studio;
+            item.studios = studio_rows
+                .iter()
+                .map(|(_, sname)| rustyfin_model::media::StudioInfo {
+                    id: rustyfin_db::repo_by_name::by_name_id(studio, sname).to_string(),
+                    name: sname.clone(),
+                })
+                .collect();
+        }
     }
 
     // Batch fetch trailers from TMDb API for items with tmdb_id
@@ -1460,6 +1657,7 @@ pub(crate) async fn enrich_items(
         let trailer_items: Vec<(usize, i64, bool)> = items
             .iter()
             .enumerate()
+            .filter(|(_, item)| tmdb_kind(item).is_some())
             .filter_map(|(i, item)| item.tmdb_id.map(|tmdb| (i, tmdb, item.is_movie)))
             .collect();
 
@@ -1474,6 +1672,10 @@ pub(crate) async fn enrich_items(
             item.trailer_count = Some(item.remote_trailers.len() as i32);
         }
     }
+
+    for item in items.iter_mut() {
+        images.apply(item);
+    }
 }
 
 pub fn routes() -> Router<AppState> {
@@ -1484,7 +1686,15 @@ pub fn routes() -> Router<AppState> {
         .route("/Items/{id}/Similar", get(get_similar))
         .route("/Items/Latest", get(get_latest))
         .route("/Items/Resume", get(get_resume))
+        .route("/UserItems/Resume", get(get_resume))
         .route("/Items/Filters", get(get_filters))
+        .route("/Items/Filters2", get(get_filters2))
+        .route("/Items/{id}/Intros", get(get_intros))
+        .route("/Items/{id}/ThemeMedia", get(get_theme_media))
+        .route("/Items/{id}/ThemeSongs", get(get_theme_list))
+        .route("/Items/{id}/ThemeVideos", get(get_theme_list))
+        .route("/Users/{userId}/Items/{itemId}", get(get_user_item))
+        .route("/Users/{userId}/Items/{itemId}/Intros", get(get_intros))
         .route(
             "/Items/{id}/Trickplay/Preview/{width}/{seekTicks}",
             get(get_trickplay_preview),
@@ -1496,11 +1706,6 @@ pub fn routes() -> Router<AppState> {
         .route("/Items/{id}/Ancestors", get(get_ancestors))
         .route("/Items/{id}/Collections", get(get_item_collections))
         .route("/Items/{id}/Attachments/{index}", get(get_attachments))
-        // User items with rating
-        .route(
-            "/Users/{userId}/Items/{itemId}/Rating",
-            delete(delete_rating),
-        )
         // Channels
         .route("/Channels", get(get_channels))
         .route("/Channels/Items/Latest", get(get_channels_items_latest))
@@ -1573,6 +1778,26 @@ struct ItemsQuery {
     image_types_limit: Option<i32>,
     #[serde(rename = "imageTypesLimit")]
     image_types_limit_lower: Option<i32>,
+    /// A Rustyfin extension, not a Jellyfin option: `RustyfinCardIndex=true` answers with only
+    /// what a poster card shows (see `card_index_result`). Jellyfin clients never send it, so their
+    /// answers keep Jellyfin's DTO.
+    rustyfin_card_index: Option<bool>,
+    #[serde(rename = "rustyfinCardIndex")]
+    rustyfin_card_index_lower: Option<bool>,
+    // Jellyfin's DTO options: EnableUserData=false leaves out UserData only; EnableImages,
+    // EnableImageTypes and ImageTypeLimit narrow the images (see `ImageOptions`)
+    enable_user_data: Option<bool>,
+    #[serde(rename = "enableUserData")]
+    enable_user_data_lower: Option<bool>,
+    enable_image_types: Option<String>,
+    #[serde(rename = "enableImageTypes")]
+    enable_image_types_lower: Option<String>,
+    image_type_limit: Option<usize>,
+    #[serde(rename = "imageTypeLimit")]
+    image_type_limit_lower: Option<usize>,
+    enable_images: Option<bool>,
+    #[serde(rename = "enableImages")]
+    enable_images_lower: Option<bool>,
     is_favorite: Option<bool>,
     #[serde(rename = "isFavorite")]
     is_favorite_lower: Option<bool>,
@@ -1725,6 +1950,50 @@ impl ItemsQuery {
     fn fields(&self) -> Option<&str> {
         self.fields.as_deref().or(self.fields_lower.as_deref())
     }
+    fn card_index(&self) -> bool {
+        self.rustyfin_card_index
+            .or(self.rustyfin_card_index_lower)
+            .unwrap_or(false)
+    }
+    fn enable_user_data(&self) -> bool {
+        self.enable_user_data
+            .or(self.enable_user_data_lower)
+            .unwrap_or(true)
+    }
+    /// The image options: EnableImages=false sends none; EnableImageTypes keeps the types it
+    /// names, and naming none it knows (or none at all) keeps all of them, as Jellyfin applies
+    /// the list only when it holds a type.
+    fn image_options(&self) -> ImageOptions {
+        let types: Option<Vec<rustyfin_model::image::ImageType>> = self
+            .enable_image_types
+            .as_deref()
+            .or(self.enable_image_types_lower.as_deref())
+            .map(|types| {
+                types
+                    .split(',')
+                    .filter_map(|t| rustyfin_model::image::ImageType::from_str(t.trim()))
+                    .collect::<Vec<_>>()
+            })
+            .filter(|types| !types.is_empty());
+        let enabled = self
+            .enable_images
+            .or(self.enable_images_lower)
+            .unwrap_or(true);
+        ImageOptions {
+            types,
+            limit: if enabled {
+                self.image_type_limit.or(self.image_type_limit_lower)
+            } else {
+                Some(0)
+            },
+        }
+    }
+    /// Whether Fields is given and names no field: Jellyfin's "no optional fields" (see
+    /// `minimal_result`).
+    fn fields_given_empty(&self) -> bool {
+        self.fields()
+            .is_some_and(|fields| fields.split(',').all(|f| f.trim().is_empty()))
+    }
     fn image_types_limit(&self) -> Option<i32> {
         self.image_types_limit.or(self.image_types_limit_lower)
     }
@@ -1873,7 +2142,7 @@ async fn get_items(
     State(state): State<AppState>,
     Query(query): Query<ItemsQuery>,
     Extension(claims): Extension<Claims>,
-) -> Result<Json<QueryResult>, ApiError> {
+) -> Result<Response, ApiError> {
     let media_types: Option<Vec<String>> = query
         .include_item_types()
         .map(|s| s.split(',').map(|t| t.trim().to_string()).collect());
@@ -1961,6 +2230,12 @@ async fn get_items(
     )
     .await?;
 
+    if query.card_index() {
+        let result =
+            card_index_result(&state.db_ro, &items, total, query.start_index_requested()).await?;
+        return Ok(Json(result).into_response());
+    }
+
     // Only populate media_sources when explicitly requested via Fields parameter
     // This significantly speeds up listing views with many items
     let fields: Vec<&str> = query
@@ -1977,33 +2252,193 @@ async fn get_items(
         items
     };
 
-    // Enrich items with all response fields using batch queries
+    // Enrich items with all response fields using batch queries. EnableUserData=false enriches
+    // for no user, which leaves out UserData and the per-user counts, and nothing else. With
+    // Fields given empty no optional field is sent, so the trailers aren't looked up.
     // Skip blurhash for list views to avoid per-item disk I/O
-    let tmdb = state.tmdb.api(None);
-    enrich_items(
+    let minimal = query.fields_given_empty();
+    let tmdb = if minimal { None } else { state.tmdb.api(None) };
+    enrich_items_with(
         &state.db_ro,
         &state.server_id,
-        Some(claims.sub),
+        query.enable_user_data().then_some(claims.sub),
         &mut items,
         &state.http_client,
         tmdb.as_ref(),
         &state.data_dir,
         true, // skip_blurhash for list views
+        &query.image_options(),
     )
     .await;
 
+    if minimal {
+        return Ok(
+            Json(minimal_result(items, total, query.start_index_requested())).into_response(),
+        );
+    }
     Ok(Json(QueryResult {
         items,
         total_record_count: total,
         start_index: query.start_index_requested(),
-    }))
+    })
+    .into_response())
 }
 
+/// The answer to a list request with `RustyfinCardIndex=true` (a Rustyfin extension; the web
+/// client's library index asks this way): per item only what a poster card shows before its page
+/// arrives, Jellyfin's names and shapes, null fields left out: Id, Name, SortName (the letter
+/// rail; only when it differs from the name beyond case), Type, ProductionYear, CommunityRating
+/// (to the tenth), for episodes their numbers (IndexNumberEnd too) and series, and the Primary
+/// picture's tag and BlurHash: about 300 bytes an item. The list's filters and order are the request's; the only
+/// other query is one batch of Primary pictures, with no per-item work.
+async fn card_index_result(
+    pool: &sqlx::SqlitePool,
+    items: &[MediaItem],
+    total: i64,
+    start_index: i64,
+) -> Result<Value, ApiError> {
+    use rustyfin_model::image::ImageType;
+    let ids: Vec<Uuid> = items.iter().map(|item| item.id).collect();
+    let images = rustyfin_db::repo_image::get_images_batch_of(
+        pool,
+        &ids,
+        Some(&[ImageType::Primary]),
+        Some(1),
+    )
+    .await?;
+    let cards: Vec<Value> = items
+        .iter()
+        .map(|item| {
+            let mut card = serde_json::Map::new();
+            card.insert("Id".into(), json!(item.id));
+            card.insert("Name".into(), json!(item.name));
+            // Only when it sorts otherwise than the name (the rail reads Name when it is missing)
+            if let Some(sort_name) = &item.sort_name
+                && sort_name.to_lowercase() != item.name.to_lowercase()
+            {
+                card.insert("SortName".into(), json!(sort_name));
+            }
+            card.insert("Type".into(), json!(item.media_type.item_kind()));
+            if let Some(year) = item.production_year {
+                card.insert("ProductionYear".into(), json!(year));
+            }
+            // To the tenth the card shows
+            if let Some(rating) = item.community_rating {
+                card.insert(
+                    "CommunityRating".into(),
+                    json!((rating * 10.0).round() / 10.0),
+                );
+            }
+            if let Some(n) = item.index_number {
+                card.insert("IndexNumber".into(), json!(n));
+            }
+            // A file holding several episodes: the card shows "E1-2"
+            if let Some(n) = item.index_number_end {
+                card.insert("IndexNumberEnd".into(), json!(n));
+            }
+            if let Some(n) = item.parent_index_number {
+                card.insert("ParentIndexNumber".into(), json!(n));
+            }
+            if let Some(series) = &item.series_name {
+                card.insert("SeriesName".into(), json!(series));
+            }
+            let primary = images
+                .get(&item.id.to_string())
+                .and_then(|list| list.iter().find(|img| img.image_type == ImageType::Primary));
+            if let Some(img) = primary {
+                let tag = rustyfin_core::image_proxy::image_tag(&img.path, img.stamp);
+                if let Some(hash) = &img.blurhash {
+                    card.insert(
+                        "ImageBlurHashes".into(),
+                        json!({ "Primary": { tag.clone(): hash } }),
+                    );
+                }
+                card.insert("ImageTags".into(), json!({ "Primary": tag }));
+            }
+            Value::Object(card)
+        })
+        .collect();
+    Ok(json!({ "Items": cards, "TotalRecordCount": total, "StartIndex": start_index }))
+}
+
+/// Jellyfin's optional item fields (ItemFields) that Rustyfin fills on every item, by JSON name.
+/// An answer to a request that gives Fields empty leaves them out, as Jellyfin does.
+const OPTIONAL_ITEM_FIELDS: &[&str] = &[
+    "Overview",
+    "Genres",
+    "GenreItems",
+    "Tags",
+    "Studios",
+    "People",
+    "ProviderIds",
+    "ExternalUrls",
+    "Chapters",
+    "MediaSources",
+    "MediaStreams",
+    "Path",
+    "Taglines",
+    "ProductionLocations",
+    "RemoteTrailers",
+    "OriginalTitle",
+    "Etag",
+    "ScreenshotImageTags",
+];
+
+/// The answer to a list request that gives Fields empty (Jellyfin's "no optional fields"): each
+/// item without the optional fields and without null fields, as Jellyfin's serializer leaves those
+/// out (JsonIgnoreCondition.WhenWritingNull). The base fields, user data and images stay. The web
+/// client's library index asks this way, so a whole library stays small.
+fn minimal_result(items: Vec<MediaItem>, total: i64, start_index: i64) -> Value {
+    let items: Vec<Value> = items
+        .iter()
+        .map(|item| match serde_json::to_value(item) {
+            Ok(Value::Object(mut fields)) => {
+                fields.retain(|k, v| !v.is_null() && !OPTIONAL_ITEM_FIELDS.contains(&k.as_str()));
+                Value::Object(fields)
+            }
+            Ok(other) => other,
+            Err(_) => Value::Null,
+        })
+        .collect();
+    json!({ "Items": items, "TotalRecordCount": total, "StartIndex": start_index })
+}
+
+/// GET /Items/{id}: a media item, or a library as its `CollectionFolder` view.
 async fn get_item(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Extension(claims): Extension<Claims>,
-) -> Result<Json<MediaItem>, ApiError> {
+) -> Result<Response, ApiError> {
+    item_or_library(&state, id, claims.sub).await
+}
+
+/// The media item `id` with `user`'s watch data, or the library `id` as its view.
+async fn item_or_library(state: &AppState, id: Uuid, user: Uuid) -> Result<Response, ApiError> {
+    match media_item(state, id, user).await {
+        Err(ApiError::NotFound(message)) => {
+            match rustyfin_db::repo_library::get_library_by_id(&state.db_ro, id).await? {
+                Some(lib) => {
+                    Ok(Json(super::library::library_view(&lib, &state.server_id)).into_response())
+                }
+                None => Err(ApiError::NotFound(message)),
+            }
+        }
+        other => other.map(|item| Json(item).into_response()),
+    }
+}
+
+/// GET /Users/{userId}/Items/{itemId}: Jellyfin's older form of `GET /Items/{id}`.
+async fn get_user_item(
+    State(state): State<AppState>,
+    Path((user_id, item_id)): Path<(Uuid, Uuid)>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Response, ApiError> {
+    let user = path_user(&state, &claims, user_id).await?;
+    item_or_library(&state, item_id, user).await
+}
+
+/// The media item `id` with `user`'s watch data.
+async fn media_item(state: &AppState, id: Uuid, user: Uuid) -> Result<MediaItem, ApiError> {
     let id_str = id.to_string();
     // The details every user sees; the requester's watch data is added below. A scan that reads
     // a file again replaces the item's sources, with new ids, so a cached copy is served only
@@ -2051,21 +2486,54 @@ async fn get_item(
         }
     };
     let folder = is_episode_folder(&item);
-    let stored = rustyfin_db::repo_playback::get_user_item_data(&state.db_ro, claims.sub, id)
+    let stored = rustyfin_db::repo_playback::get_user_item_data(&state.db_ro, user, id)
         .await
         .ok();
     if let Some(user_data) = stored.or_else(|| folder.then(Default::default)) {
         apply_user_data(&mut item, user_data);
         if folder {
-            let counts =
-                rustyfin_db::repo_playback::get_unplayed_counts(&state.db_ro, claims.sub, &[id])
-                    .await
-                    .unwrap_or_default();
+            let counts = rustyfin_db::repo_playback::get_unplayed_counts(&state.db_ro, user, &[id])
+                .await
+                .unwrap_or_default();
             let key = id.to_string();
             apply_unplayed_counts(&mut item, counts.get(&key).copied().unwrap_or((0, 0)));
         }
     }
-    Ok(Json(item))
+    Ok(item)
+}
+
+/// An empty Jellyfin `QueryResult`.
+fn empty_result() -> Value {
+    json!({ "Items": [], "TotalRecordCount": 0, "StartIndex": 0 })
+}
+
+/// GET /Items/{id}/Intros and /Users/{userId}/Items/{itemId}/Intros: Rustyfin plays no intros.
+async fn get_intros() -> Json<Value> {
+    Json(empty_result())
+}
+
+/// An empty `ThemeMediaResult` for `id`.
+fn empty_theme_result(id: Uuid) -> Value {
+    json!({
+        "Items": [],
+        "TotalRecordCount": 0,
+        "StartIndex": 0,
+        "OwnerId": id.simple().to_string(),
+    })
+}
+
+/// GET /Items/{id}/ThemeMedia: Rustyfin has no theme songs or videos.
+async fn get_theme_media(Path(id): Path<Uuid>) -> Json<Value> {
+    Json(json!({
+        "ThemeVideosResult": empty_theme_result(id),
+        "ThemeSongsResult": empty_theme_result(id),
+        "SoundtrackSongsResult": empty_theme_result(id),
+    }))
+}
+
+/// GET /Items/{id}/ThemeSongs and /Items/{id}/ThemeVideos.
+async fn get_theme_list(Path(id): Path<Uuid>) -> Json<Value> {
+    Json(empty_theme_result(id))
 }
 
 async fn delete_item(
@@ -2141,8 +2609,9 @@ async fn get_similar(
     let mut similar: Vec<MediaItem> = Vec::new();
 
     // Priority 1: TMDb Similar API (highest weight)
-    if let (Some(tmdb_id), Some(api)) = (item.tmdb_id, tmdb.as_ref()) {
-        let media_type = if item.is_movie { "movie" } else { "tv" };
+    if let (Some(tmdb_id), Some(api), Some(media_type)) =
+        (item.tmdb_id, tmdb.as_ref(), tmdb_kind(&item))
+    {
         let tmdb_similar = rustyfin_core::tmdb_client::get_similar(api, media_type, tmdb_id).await;
 
         // For each TMDb similar item, find the local item by tmdb_id
@@ -2275,10 +2744,26 @@ async fn get_resume(
     let user = query_user(&state, &claims, query.user_id)
         .await?
         .ok_or_else(|| ApiError::NotFound("user not found".into()))?;
-    let limit = query.limit.unwrap_or(10);
-    let mut items =
-        rustyfin_db::repo_media::get_user_resume_items(&state.db_ro, user, limit).await?;
-    let total = items.len() as i64;
+    resume_page(&state, user, &query).await
+}
+
+/// One page of the user's resume list (`/UserItems/Resume`, `/Items/Resume` and the legacy
+/// `/Users/{userId}/Items/Resume`), with the count of all matching items, as Jellyfin answers it.
+async fn resume_page(
+    state: &AppState,
+    user: Uuid,
+    query: &ResumeQuery,
+) -> Result<Json<QueryResult>, ApiError> {
+    let start_index = query.start_index.unwrap_or(0).max(0);
+    let filter = rustyfin_db::repo_media::ResumeFilter {
+        include_types: query.include_types(),
+        exclude_types: csv(query.exclude_item_types.as_deref()),
+        parent_id: query.parent_id,
+        start_index,
+        limit: query.limit.filter(|l| *l >= 0),
+    };
+    let (mut items, total) =
+        rustyfin_db::repo_media::get_user_resume_items(&state.db_ro, user, &filter).await?;
     // Enrich resume items using batch queries
     // Skip blurhash for list views to avoid per-item disk I/O
     let tmdb = state.tmdb.api(None);
@@ -2296,16 +2781,71 @@ async fn get_resume(
     Ok(Json(QueryResult {
         items,
         total_record_count: total,
-        start_index: 0,
+        start_index,
     }))
 }
 
+/// The values of a comma-separated query parameter, trimmed, empty ones dropped.
+fn csv(value: Option<&str>) -> Vec<String> {
+    value
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Jellyfin's resume query parameters. Its clients send them in camelCase or PascalCase.
 #[derive(Deserialize)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "camelCase")]
 struct ResumeQuery {
+    #[serde(default, alias = "Limit")]
     limit: Option<i64>,
-    #[serde(alias = "userId")]
+    #[serde(default, alias = "StartIndex")]
+    start_index: Option<i64>,
+    #[serde(default, alias = "UserId")]
     user_id: Option<Uuid>,
+    #[serde(default, alias = "ParentId")]
+    parent_id: Option<Uuid>,
+    #[serde(default, alias = "IncludeItemTypes")]
+    include_item_types: Option<String>,
+    #[serde(default, alias = "ExcludeItemTypes")]
+    exclude_item_types: Option<String>,
+    #[serde(default, alias = "MediaTypes")]
+    media_types: Option<String>,
+}
+
+impl ResumeQuery {
+    /// The stored types to list: `IncludeItemTypes`, narrowed to those of `MediaTypes`. Empty means
+    /// any type; when the two leave nothing, a type no item has, so nothing is listed.
+    fn include_types(&self) -> Vec<String> {
+        let kinds = csv(self.include_item_types.as_deref());
+        let media = csv(self.media_types.as_deref());
+        if media.is_empty() {
+            return kinds;
+        }
+        let of_media: Vec<String> = media
+            .iter()
+            .flat_map(|m| match m.to_ascii_lowercase().as_str() {
+                "video" => &["Movie", "Episode"][..],
+                "audio" => &["Audio"][..],
+                "photo" => &["Photo"][..],
+                _ => &[][..],
+            })
+            .map(|k| k.to_string())
+            .collect();
+        let types: Vec<String> = if kinds.is_empty() {
+            of_media
+        } else {
+            kinds.into_iter().filter(|k| of_media.contains(k)).collect()
+        };
+        if types.is_empty() {
+            vec![String::new()]
+        } else {
+            types
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -2342,13 +2882,34 @@ async fn get_filters(
     Ok(Json(result))
 }
 
+/// GET /Items/Filters2: Jellyfin's `QueryFilters`, the genres (with their ids) and tags under the
+/// parent. Rustyfin keeps no tag list for filters, so Tags is empty.
+async fn get_filters2(
+    State(state): State<AppState>,
+    Query(query): Query<FiltersQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let library_id = query.parent_id.or(query.parent_id_lower);
+    let (genres, _, _) = rustyfin_db::repo_media::get_filters(&state.db_ro, library_id).await?;
+    let genres: Vec<Value> = genres
+        .into_iter()
+        .map(|name| {
+            let id = rustyfin_db::repo_by_name::by_name_id(
+                rustyfin_db::repo_by_name::ByNameKind::Genre,
+                &name,
+            );
+            json!({ "Name": name, "Id": id.simple().to_string() })
+        })
+        .collect();
+    Ok(Json(json!({ "Genres": genres, "Tags": [] })))
+}
+
 // User-specific item endpoints (same as global for now; user-specific status comes in Phase 2)
 async fn get_user_items(
     State(state): State<AppState>,
     Path(_user_id): Path<Uuid>,
     Query(query): Query<ItemsQuery>,
     Extension(claims): Extension<Claims>,
-) -> Result<Json<QueryResult>, ApiError> {
+) -> Result<Response, ApiError> {
     // Delegate to get_items with the user's claims
     get_items(State(state), Query(query), Extension(claims)).await
 }
@@ -2369,29 +2930,7 @@ async fn get_user_resume(
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<QueryResult>, ApiError> {
     let user_id = path_user(&state, &claims, user_id).await?;
-    let limit = query.limit.unwrap_or(10);
-    let mut items =
-        rustyfin_db::repo_media::get_user_resume_items(&state.db_ro, user_id, limit).await?;
-    let total = items.len() as i64;
-    // Enrich user resume items using batch queries
-    // Skip blurhash for list views to avoid per-item disk I/O
-    let tmdb = state.tmdb.api(None);
-    enrich_items(
-        &state.db_ro,
-        &state.server_id,
-        Some(user_id),
-        &mut items,
-        &state.http_client,
-        tmdb.as_ref(),
-        &state.data_dir,
-        true, // skip_blurhash for list views
-    )
-    .await;
-    Ok(Json(QueryResult {
-        items,
-        total_record_count: total,
-        start_index: 0,
-    }))
+    resume_page(&state, user_id, &query).await
 }
 
 /// `GET /Items/{id}/Trickplay/Preview/{width}/{seekTicks}` — Returns a trickplay preview thumbnail.
@@ -2442,30 +2981,49 @@ async fn delete_items(
 }
 
 /// GET /Items/{id}/Ancestors - Get parent chain
+/// GET /Items/{id}/Ancestors: as in Jellyfin, an array of the item's parents, nearest first,
+/// ending with its library's `CollectionFolder`.
 async fn get_ancestors(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-) -> Result<Json<QueryResult>, ApiError> {
-    let mut ancestors = Vec::new();
-    let mut current_id = id;
-    loop {
-        let item = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, current_id).await?;
-        let Some(item) = item else { break };
-        match item.parent_id {
-            Some(parent_id) => {
-                ancestors.push(item);
-                current_id = parent_id;
-            }
-            None => break,
-        }
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<Vec<Value>>, ApiError> {
+    let item = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, id)
+        .await?
+        .ok_or(ApiError::NotFound("item not found".into()))?;
+    let mut parents = Vec::new();
+    let mut next = item.parent_id;
+    // A parent chain is a few levels deep; the cap stops a cycle in bad data.
+    while let Some(parent_id) = next.filter(|_| parents.len() < 16) {
+        let Some(parent) = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, parent_id).await?
+        else {
+            break;
+        };
+        next = parent.parent_id;
+        parents.push(parent);
     }
-    ancestors.reverse();
-    let total = ancestors.len() as i64;
-    Ok(Json(QueryResult {
-        items: ancestors,
-        total_record_count: total,
-        start_index: 0,
-    }))
+    let tmdb = state.tmdb.api(None);
+    enrich_items(
+        &state.db_ro,
+        &state.server_id,
+        Some(claims.sub),
+        &mut parents,
+        &state.http_client,
+        tmdb.as_ref(),
+        &state.data_dir,
+        true,
+    )
+    .await;
+    let mut ancestors: Vec<Value> = parents
+        .iter()
+        .filter_map(|p| serde_json::to_value(p).ok())
+        .collect();
+    if let Some(lib) =
+        rustyfin_db::repo_library::get_library_by_id(&state.db_ro, item.library_id).await?
+    {
+        ancestors.push(super::library::library_view(&lib, &state.server_id));
+    }
+    Ok(Json(ancestors))
 }
 
 /// GET /Items/{id}/Collections - Get collections containing this item
@@ -2525,22 +3083,6 @@ async fn get_attachments(
     State(_state): State<AppState>,
     Path((_id, _index)): Path<(Uuid, i32)>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
-    Ok((StatusCode::OK, Json(serde_json::json!({}))))
-}
-
-/// DELETE /Users/{userId}/Items/{itemId}/Rating
-async fn delete_rating(
-    State(state): State<AppState>,
-    Path((user_id, item_id)): Path<(Uuid, Uuid)>,
-    Extension(claims): Extension<Claims>,
-) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
-    let user_id = path_user(&state, &claims, user_id).await?;
-    rustyfin_db::repo_media::get_item_by_id(&state.db_ro, item_id)
-        .await?
-        .ok_or(ApiError::NotFound("item not found".into()))?;
-    rustyfin_db::repo_playback::clear_user_rating(&state.db, user_id, item_id)
-        .await
-        .ok();
     Ok((StatusCode::OK, Json(serde_json::json!({}))))
 }
 

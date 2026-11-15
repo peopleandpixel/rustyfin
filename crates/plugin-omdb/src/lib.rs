@@ -117,6 +117,7 @@ pub async fn search(
         directors: None,
         writers: None,
         imdb_id: None,
+        people: None,
     })
 }
 
