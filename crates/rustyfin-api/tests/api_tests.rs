@@ -30347,7 +30347,6 @@ async fn r3livelog_socket_replays_the_history_before_new_lines() {
     assert_eq!(other.until_end().await, Vec::<String>::new());
 }
 
-
 // The live log view's rows, level filter, cap and scrolling (tests/web/r3livelog_view.mjs).
 #[test]
 fn r3livelog_web_view() {
