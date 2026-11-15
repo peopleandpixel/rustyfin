@@ -82,7 +82,24 @@ test('the cursor hides on the idle player only, and the video area routes clicks
     assert.ok(cursor[0].every(s => s.startsWith('.jf-player-container.jf-player-idle')), cursor[0].join(', '));
     assert.match(html, /onclick="playerAreaClick\(event\)"/);
     assert.match(app, /playerBars = playerAutoHide\(\$\('player-modal'\), \$\('video-player'\)\)/);
-    assert.match(app, /addEventListener\('close', \(\) => \{\s*stopPlayback\(\);\s*playerBars\?\.reset\(\);/);
+    assert.match(app, /\$\('player-modal'\)\?\.addEventListener\('close', onPlayerClosed\)/);
+});
+
+test('closing the player resets the bars and leaves fullscreen when the page holds it', () => {
+    for (const full of [true, false]) {
+        const calls = [];
+        const context = vm.createContext({
+            stopPlayback: () => calls.push('stop'),
+            playerBars: { reset: () => calls.push('reset') },
+            document: {
+                fullscreenElement: full ? {} : null,
+                exitFullscreen: () => { calls.push('exit'); return Promise.resolve(); },
+            },
+        });
+        vm.runInContext(slice('function onPlayerClosed('), context);
+        context.onPlayerClosed();
+        assert.deepEqual(calls, full ? ['stop', 'reset', 'exit'] : ['stop', 'reset']);
+    }
 });
 
 function slice(head) {
@@ -148,6 +165,7 @@ function sandbox() {
 
 const video = { target: { closest: () => null, tagName: 'DIV' } };
 const select = { target: { closest: () => ({}), tagName: 'SELECT' } };
+const button = { target: { closest: () => ({}), tagName: 'BUTTON' } };
 
 test('while playing, the bars hide 3 s after the last input, not before', () => {
     const s = sandbox();
@@ -217,6 +235,62 @@ test('an open menu or a hovered bar keeps the bars until it closes', () => {
     s.container.fire('pointermove', { pointerType: 'mouse', ...select });
     s.tick(10000);
     assert.equal(s.idle(), false, 'pointer over a bar');
+});
+
+test('after a tap on a control the bars still hide: touch keeps :hover, so it does not count', () => {
+    const s = sandbox();
+    s.state.barHovered = true; // the browser leaves :hover on the tapped Play button
+    s.container.fire('pointerdown', { pointerType: 'touch', ...button });
+    s.video.fire('play');
+    s.video.fire('playing');
+    s.tick(3000);
+    assert.equal(s.idle(), true, 'touch: hidden despite the sticky :hover');
+    s.container.fire('pointermove', { pointerType: 'mouse', ...button });
+    s.tick(10000);
+    assert.equal(s.idle(), false, 'mouse over a bar still holds them');
+});
+
+test('keys the player takes on a focused menu or control open nothing and let the bars hide', () => {
+    const keys = [
+        { key: ' ', defaultPrevented: true, ...select },
+        { key: 'ArrowLeft', altKey: true, defaultPrevented: true, ...select },
+        { key: ' ', defaultPrevented: true, ...button },
+    ];
+    for (const key of keys) {
+        const s = sandbox();
+        s.video.fire('playing');
+        s.tick(3000);
+        s.doc.fire('keydown', key);
+        assert.equal(s.idle(), false, `${key.key}: shown`);
+        s.tick(2999);
+        assert.equal(s.idle(), false, `${key.key}: timer restarted`);
+        s.tick(1);
+        assert.equal(s.idle(), true, `${key.key} on ${key.target.tagName}: hides`);
+    }
+    // A key that does open the popup holds the bars until the choice
+    const s = sandbox();
+    s.video.fire('playing');
+    s.doc.fire('keydown', { key: 'F4', ...select });
+    s.tick(10000);
+    assert.equal(s.idle(), false, 'F4 opened the menu');
+    s.container.fire('change', select);
+    s.tick(3000);
+    assert.equal(s.idle(), true);
+});
+
+test('a menu dismissed without a choice counts as closed on the next pointer move or tap outside it', () => {
+    for (const [type, pointerType] of [['pointermove', 'mouse'], ['pointerdown', 'mouse'], ['pointerdown', 'touch']]) {
+        const s = sandbox();
+        s.video.fire('playing');
+        s.container.fire('pointerdown', { pointerType, ...select });
+        s.container.fire('pointermove', { pointerType: 'mouse', ...select });
+        s.tick(10000);
+        assert.equal(s.idle(), false, 'open while the pointer stays on it');
+        s.container.fire(type, { pointerType, ...video });
+        if (pointerType === 'touch') s.bars.tap({ pointerType }); // the tap's click on the video
+        s.tick(3000);
+        assert.equal(s.idle(), true, `${type} ${pointerType} outside closed it`);
+    }
 });
 
 test('leaving the player while playing hides the bars at once', () => {

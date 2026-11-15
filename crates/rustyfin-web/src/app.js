@@ -2809,12 +2809,18 @@ function playerAutoHide(modal, video, delay = 3000) {
     const container = modal.querySelector('.jf-player-container');
     const bars = '.jf-player-topbar, .jf-player-controls';
     let timer = null;
-    let menuOpen = false;
+    // The select whose native popup is open; no event says when one is dismissed, so the next
+    // pointer move or tap outside it counts as closed
+    let openMenu = null;
     let lastPointer = 'mouse';
+    // Touch browsers keep :hover on the last tapped control, so a hovered bar holds them for a mouse only
+    const barHovered = () => lastPointer !== 'touch'
+        && !!container.querySelector('.jf-player-topbar:hover, .jf-player-controls:hover');
     const canHide = () => !video.paused && !video.ended && !video.seeking
         && video.readyState >= 3 // HAVE_FUTURE_DATA: not buffering
-        && !menuOpen
-        && !container.querySelector('.jf-player-topbar:hover, .jf-player-controls:hover, [aria-expanded="true"], details[open]');
+        && !openMenu
+        && !barHovered()
+        && !container.querySelector('[aria-expanded="true"], details[open]');
     const hide = () => {
         clearTimeout(timer);
         timer = null;
@@ -2829,22 +2835,32 @@ function playerAutoHide(modal, video, delay = 3000) {
     const isSelect = e => e.target?.tagName === 'SELECT';
 
     // A touch outside the bars waits for its click, which toggles them (tap)
-    container.addEventListener('pointermove', e => { if (e.pointerType !== 'touch' || onBar(e)) show(); });
-    container.addEventListener('pointerdown', e => {
+    const pointer = e => {
         lastPointer = e.pointerType || 'mouse';
-        if (isSelect(e)) menuOpen = true;
+        if (openMenu && e.target !== openMenu) openMenu = null;
+    };
+    container.addEventListener('pointermove', e => {
+        pointer(e);
+        if (e.pointerType !== 'touch' || onBar(e)) show();
+    });
+    container.addEventListener('pointerdown', e => {
+        pointer(e);
+        if (isSelect(e)) openMenu = e.target;
         if (lastPointer !== 'touch' || onBar(e)) show();
     });
     container.addEventListener('pointerleave', e => { if (e.pointerType !== 'touch') hide(); });
     container.addEventListener('focusin', show);
-    container.addEventListener('focusout', e => { if (isSelect(e)) menuOpen = false; });
-    container.addEventListener('change', e => { if (isSelect(e)) menuOpen = false; show(); });
-    container.addEventListener('keydown', e => {
-        if (!isSelect(e)) return;
-        if (e.key === 'Escape' || e.key === 'Tab') menuOpen = false;
-        else if (e.key === ' ' || e.key === 'Enter' || e.key === 'F4' || (e.altKey && e.key.startsWith('Arrow'))) menuOpen = true;
+    container.addEventListener('focusout', e => { if (isSelect(e)) openMenu = null; });
+    container.addEventListener('change', e => { if (isSelect(e)) openMenu = null; show(); });
+    // Runs after the player's shortcuts: a key they took (Space, Alt+Left/Right) opened no popup
+    document.addEventListener('keydown', e => {
+        if (!modal.open) return;
+        if (isSelect(e)) {
+            if (e.key === 'Escape' || e.key === 'Tab') openMenu = null;
+            else if (!e.defaultPrevented && (e.key === ' ' || e.key === 'F4' || (e.altKey && e.key.startsWith('Arrow')))) openMenu = e.target;
+        }
+        show();
     });
-    document.addEventListener('keydown', () => { if (modal.open) show(); });
     for (const type of ['play', 'playing', 'pause', 'ended', 'seeking', 'seeked', 'waiting']) {
         video.addEventListener(type, show);
     }
@@ -2863,10 +2879,17 @@ function playerAutoHide(modal, video, delay = 3000) {
         reset() {
             clearTimeout(timer);
             timer = null;
-            menuOpen = false;
+            openMenu = null;
             container.classList.remove('jf-player-idle');
         },
     };
+}
+
+// The dialog closed: stop the session, reset the bars, and leave fullscreen, which the dialog may hold
+function onPlayerClosed() {
+    stopPlayback();
+    playerBars?.reset();
+    if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
 }
 
 // A click on the video plays or pauses; a tap shows or hides the bars
@@ -5568,10 +5591,7 @@ window.addEventListener('hashchange', handleHash);
 document.addEventListener('DOMContentLoaded', async () => {
     // Every way of closing the player goes through here, so the session is stopped and its position reported once
     if ($('player-modal') && $('video-player')) playerBars = playerAutoHide($('player-modal'), $('video-player'));
-    $('player-modal')?.addEventListener('close', () => {
-        stopPlayback();
-        playerBars?.reset();
-    });
+    $('player-modal')?.addEventListener('close', onPlayerClosed);
     window.addEventListener('pagehide', () => stopPlayback());
     updateAuthUI();
     const wizardActive = await checkSetupWizard();
