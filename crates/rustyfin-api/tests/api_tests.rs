@@ -4708,6 +4708,8 @@ async fn r1auth_parent_id_filters_seasons_and_episodes() {
         "Episode",
     )
     .await;
+    let shelf = j6_add_item(&state, lib.library, None, "Shelf", "Folder").await;
+    let shelved = j6_add_item(&state, lib.library, Some(shelf), "Shelved Film", "Movie").await;
     let (user_token, _) = j6_user_session(&state).await;
     for token in [lib.token.as_str(), user_token.as_str()] {
         let get = |query: String| {
@@ -4749,6 +4751,43 @@ async fn r1auth_parent_id_filters_seasons_and_episodes() {
             ))
             .await,
             r1auth_sorted(&[lib.movie, lib.series, other])
+        );
+        // Without a type filter, so a leak of deeper items shows: a library's top level holds
+        // no season, episode, track or item of a nested folder.
+        let top = get(format!("ParentId={}", lib.library)).await;
+        for id in [lib.movie, lib.series, other, shelf, lib.artist] {
+            assert!(top.contains(&id.simple().to_string()), "{id} at the top");
+        }
+        for id in [
+            lib.season,
+            lib.episode,
+            lib.album,
+            lib.track,
+            other_season,
+            other_episode,
+            shelved,
+        ] {
+            assert!(
+                !top.contains(&id.simple().to_string()),
+                "{id} not at the top"
+            );
+        }
+        assert_eq!(
+            get(format!("ParentId={}", lib.series)).await,
+            r1auth_sorted(&[lib.season])
+        );
+        assert_eq!(
+            get(format!("ParentId={shelf}")).await,
+            r1auth_sorted(&[shelved])
+        );
+        // Recursive reaches into the nested folder.
+        assert_eq!(
+            get(format!(
+                "ParentId={}&Recursive=true&IncludeItemTypes=Movie",
+                lib.library
+            ))
+            .await,
+            r1auth_sorted(&[lib.movie, shelved])
         );
     }
 }
