@@ -380,6 +380,7 @@ pub async fn search_tv(client: &reqwest::Client, name: &str) -> Option<ExternalM
         directors: None,
         writers: None,
         imdb_id: show.externals.imdb,
+        people: None,
     })
 }
 

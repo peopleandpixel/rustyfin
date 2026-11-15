@@ -85,21 +85,65 @@ pub struct ExternalUrl {
     pub url: String,
 }
 
-/// Provider IDs (TMDb, TVDb, IMDb, etc.) stored as a map
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+/// Provider IDs (TMDb, TVDb, IMDb, etc.) stored as a map. Keys use Jellyfin's names (`Tmdb`, `Imdb`,
+/// `Tvdb`); the older lowercase keys are folded to them when set or read back, and lookups ignore
+/// letter case.
+#[derive(Debug, Clone, Serialize, Default)]
 #[serde(transparent)]
 pub struct ProviderIds {
     #[serde(flatten)]
     pub ids: std::collections::HashMap<String, String>,
 }
 
+/// Jellyfin's spelling of a known provider key (`MetadataProvider` in Jellyfin.Data), or the key as
+/// given when it is not one of them.
+pub fn canonical_provider_key(key: &str) -> String {
+    const KNOWN: [&str; 6] = [
+        "Tmdb",
+        "Imdb",
+        "Tvdb",
+        "TmdbCollection",
+        "MusicBrainzAlbum",
+        "Zap2It",
+    ];
+    KNOWN
+        .iter()
+        .find(|known| known.eq_ignore_ascii_case(key))
+        .map_or_else(|| key.to_string(), |known| known.to_string())
+}
+
 impl ProviderIds {
     pub fn get(&self, key: &str) -> Option<&str> {
-        self.ids.get(key).map(|s| s.as_str())
+        self.ids
+            .get(key)
+            .or_else(|| {
+                self.ids
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(key))
+                    .map(|(_, v)| v)
+            })
+            .map(|s| s.as_str())
     }
 
     pub fn set(&mut self, key: String, value: String) {
+        let key = canonical_provider_key(&key);
+        self.ids.retain(|k, _| !k.eq_ignore_ascii_case(&key));
         self.ids.insert(key, value);
+    }
+}
+
+impl<'de> Deserialize<'de> for ProviderIds {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = std::collections::HashMap::<String, String>::deserialize(deserializer)?;
+        // When one key comes in several letter cases ({"tmdb": .., "Tmdb": ..}), the one spelled
+        // as Jellyfin spells it wins, whatever the map's order; among others, the greatest
+        let mut entries: Vec<(String, String)> = raw.into_iter().collect();
+        entries.sort_by_key(|(key, _)| (canonical_provider_key(key) == *key, key.clone()));
+        let mut ids = ProviderIds::default();
+        for (key, value) in entries {
+            ids.set(key, value);
+        }
+        Ok(ids)
     }
 }
 
@@ -1108,6 +1152,39 @@ mod tests {
         assert_eq!(ids.get("tmdb"), Some("123"));
         assert_eq!(ids.get("imdb"), Some("tt456"));
         assert_eq!(ids.get("tvdb"), Some("789"));
+    }
+
+    #[test]
+    fn r1scan_provider_ids_use_jellyfin_key_names() {
+        let mut ids = ProviderIds::default();
+        ids.set("tmdb".to_string(), "603".to_string());
+        ids.set("Imdb".to_string(), "tt0133093".to_string());
+        ids.set("TVDB".to_string(), "1".to_string());
+        let json = serde_json::to_value(&ids).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"Tmdb": "603", "Imdb": "tt0133093", "Tvdb": "1"})
+        );
+        // Old lowercase keys, as stored before, read back under the new names
+        let old: ProviderIds =
+            serde_json::from_value(serde_json::json!({"tmdb": "603", "imdb": "tt1", "Other": "x"}))
+                .unwrap();
+        assert_eq!(old.get("Tmdb"), Some("603"));
+        assert_eq!(old.get("imdb"), Some("tt1"));
+        assert_eq!(old.ids.get("Imdb").map(String::as_str), Some("tt1"));
+        assert_eq!(old.get("other"), Some("x"));
+        // A key sent in two cases keeps the canonical spelling's value
+        for _ in 0..20 {
+            let both: ProviderIds =
+                serde_json::from_value(serde_json::json!({"tmdb": "1", "Tmdb": "2", "TMDB": "3"}))
+                    .unwrap();
+            assert_eq!(both.ids.len(), 1);
+            assert_eq!(both.get("Tmdb"), Some("2"));
+        }
+        // Setting a key again in another case replaces it
+        ids.set("TMDB".to_string(), "604".to_string());
+        assert_eq!(ids.ids.len(), 3);
+        assert_eq!(ids.get("tmdb"), Some("604"));
     }
 
     // ── IndexNumberEnd ──

@@ -131,6 +131,16 @@ async fn load_image_tags(pool: &SqlitePool, item: &mut MediaItem) {
     }
 }
 
+/// TMDb's path segment for an item's TMDb id: a movie's or a series'. A season's or an episode's
+/// TMDb id is not one TMDb's movie or tv routes take.
+fn tmdb_kind(item: &MediaItem) -> Option<&'static str> {
+    match item.media_type {
+        rustyfin_model::media::MediaType::Movie => Some("movie"),
+        rustyfin_model::media::MediaType::Series => Some("tv"),
+        _ => None,
+    }
+}
+
 /// Enrich a single MediaItem with all response fields: server_id, provider_ids, chapters,
 /// trickplay screenshots, etag, completion_percentage, external_urls, type flags,
 /// album/artist info, folder counts, inherited images, episode numbers, series branding,
@@ -166,10 +176,10 @@ async fn enrich_item(
     // ProviderIds from tmdb_id/tvdb_id
     let mut provider_ids = rustyfin_model::media::ProviderIds::default();
     if let Some(tmdb) = item.tmdb_id {
-        provider_ids.set("tmdb".to_string(), tmdb.to_string());
+        provider_ids.set("Tmdb".to_string(), tmdb.to_string());
     }
     if let Some(tvdb) = item.tvdb_id {
-        provider_ids.set("tvdb".to_string(), tvdb.to_string());
+        provider_ids.set("Tvdb".to_string(), tvdb.to_string());
     }
     item.provider_ids = provider_ids;
 
@@ -182,7 +192,7 @@ async fn enrich_item(
             item.critic_rating = Some(rating);
         }
         if let Some(imdb) = extras.imdb_id {
-            item.provider_ids.set("imdb".to_string(), imdb);
+            item.provider_ids.set("Imdb".to_string(), imdb);
         }
         item.lock_data = extras.lock_data;
         item.locked_fields = extras
@@ -195,8 +205,9 @@ async fn enrich_item(
 
     // ExternalUrls from provider_ids
     let mut external_urls = Vec::new();
-    if let Some(tmdb) = item.tmdb_id {
-        let kind = if item.is_movie { "movie" } else { "tv" };
+    if let Some(tmdb) = item.tmdb_id
+        && let Some(kind) = tmdb_kind(item)
+    {
         external_urls.push(rustyfin_model::media::ExternalUrl {
             name: "TMDb".to_string(),
             url: format!("https://www.themoviedb.org/{}/{}", kind, tmdb),
@@ -213,8 +224,8 @@ async fn enrich_item(
     // RemoteTrailers from TMDb API (real YouTube trailer URLs)
     if let Some(tmdb_id) = item.tmdb_id
         && let Some(api) = tmdb_api
+        && let Some(kind) = tmdb_kind(item)
     {
-        let kind = if item.is_movie { "movie" } else { "tv" };
         let trailers = rustyfin_core::tmdb_client::get_trailers(api, kind, tmdb_id).await;
         item.remote_trailers = trailers
             .into_iter()
@@ -922,6 +933,14 @@ pub(crate) async fn enrich_items_with(
         .unwrap_or_default()
     };
 
+    // Batch query: studios and IMDb ids for all items
+    let studios_map = rustyfin_db::repo_media::get_studios_for_items(pool, &item_ids)
+        .await
+        .unwrap_or_default();
+    let imdb_map = rustyfin_db::repo_media::get_imdb_ids_for_items(pool, &item_ids)
+        .await
+        .unwrap_or_default();
+
     // Batch query 8: People for all items
     let people_map: std::collections::HashMap<String, Vec<rustyfin_db::repo_media::PersonRow>> = {
         let mut map: std::collections::HashMap<String, Vec<rustyfin_db::repo_media::PersonRow>> =
@@ -1000,17 +1019,21 @@ pub(crate) async fn enrich_items_with(
         // ProviderIds from tmdb_id/tvdb_id
         let mut provider_ids = rustyfin_model::media::ProviderIds::default();
         if let Some(tmdb) = item.tmdb_id {
-            provider_ids.set("tmdb".to_string(), tmdb.to_string());
+            provider_ids.set("Tmdb".to_string(), tmdb.to_string());
         }
         if let Some(tvdb) = item.tvdb_id {
-            provider_ids.set("tvdb".to_string(), tvdb.to_string());
+            provider_ids.set("Tvdb".to_string(), tvdb.to_string());
+        }
+        if let Some(imdb) = imdb_map.get(&item.id.to_string()) {
+            provider_ids.set("Imdb".to_string(), imdb.clone());
         }
         item.provider_ids = provider_ids;
 
         // ExternalUrls from provider_ids
         let mut external_urls = Vec::new();
-        if let Some(tmdb) = item.tmdb_id {
-            let kind = if item.is_movie { "movie" } else { "tv" };
+        if let Some(tmdb) = item.tmdb_id
+            && let Some(kind) = tmdb_kind(item)
+        {
             external_urls.push(rustyfin_model::media::ExternalUrl {
                 name: "TMDb".to_string(),
                 url: format!("https://www.themoviedb.org/{}/{}", kind, tmdb),
@@ -1492,6 +1515,20 @@ pub(crate) async fn enrich_items_with(
                 item.album_artists = item.people.clone();
             }
         }
+
+        // --- Studios from batch map, with the ids that /Studios lists (as enrich_item) ---
+        if item.studios.is_empty()
+            && let Some(studio_rows) = studios_map.get(&item.id.to_string())
+        {
+            let studio = rustyfin_db::repo_by_name::ByNameKind::Studio;
+            item.studios = studio_rows
+                .iter()
+                .map(|(_, sname)| rustyfin_model::media::StudioInfo {
+                    id: rustyfin_db::repo_by_name::by_name_id(studio, sname).to_string(),
+                    name: sname.clone(),
+                })
+                .collect();
+        }
     }
 
     // Batch fetch trailers from TMDb API for items with tmdb_id
@@ -1499,6 +1536,7 @@ pub(crate) async fn enrich_items_with(
         let trailer_items: Vec<(usize, i64, bool)> = items
             .iter()
             .enumerate()
+            .filter(|(_, item)| tmdb_kind(item).is_some())
             .filter_map(|(i, item)| item.tmdb_id.map(|tmdb| (i, tmdb, item.is_movie)))
             .collect();
 
@@ -2383,8 +2421,9 @@ async fn get_similar(
     let mut similar: Vec<MediaItem> = Vec::new();
 
     // Priority 1: TMDb Similar API (highest weight)
-    if let (Some(tmdb_id), Some(api)) = (item.tmdb_id, tmdb.as_ref()) {
-        let media_type = if item.is_movie { "movie" } else { "tv" };
+    if let (Some(tmdb_id), Some(api), Some(media_type)) =
+        (item.tmdb_id, tmdb.as_ref(), tmdb_kind(&item))
+    {
         let tmdb_similar = rustyfin_core::tmdb_client::get_similar(api, media_type, tmdb_id).await;
 
         // For each TMDb similar item, find the local item by tmdb_id
