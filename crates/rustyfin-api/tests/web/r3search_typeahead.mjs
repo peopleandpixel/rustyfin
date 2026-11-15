@@ -44,7 +44,9 @@ function sandbox(hints = {}, { page: current = 'home' } = {}) {
             get(url) {
                 log.push(['get', url]);
                 const types = new URL(url, 'http://x').searchParams.get('IncludeItemTypes');
-                const answer = Promise.resolve({ SearchHints: hints[types] || [] });
+                const answer = hints[types] instanceof Error
+                    ? Promise.reject(hints[types])
+                    : Promise.resolve({ SearchHints: hints[types] || [] });
                 if (!context.hold) return answer;
                 return new Promise(resolve => held.push(() => resolve(answer)));
             },
@@ -116,6 +118,23 @@ test('each section asks for its own types; results show grouped in Jellyfin Web\
     assert.equal(people.lastElementChild.children[0].dataset.page, 'person', 'a person opens the person page');
     assert.equal(s.elements['search-sections'].children[0].lastElementChild.children[0].dataset.page, 'detail');
     assert.deepEqual(JSON.parse(JSON.stringify(s.elements['search-sections'].children[0].lastElementChild.children[0].item.ImageTags)), { Primary: 'tag' });
+});
+
+test('a section whose request fails is left out, and the others still show', async () => {
+    const s = sandbox({
+        Movie: new Error('boom'),
+        Audio: [{ Id: 'song1', Name: 'Kilo Remix', Type: 'Audio' }],
+    });
+    await s.fns.renderSearch('kilo');
+    assert.deepEqual(sectionsOf(s), [['songs', ['song1']]]);
+    assert.ok(!s.elements['page-search'].html.includes('boom'));
+});
+
+test('when every section fails, the error shows', async () => {
+    const s = sandbox(Object.fromEntries(['Movie', 'Series', 'Episode', 'Person', 'Playlist', 'MusicArtist', 'MusicAlbum',
+        'Audio', 'Video,MusicVideo', 'Photo', 'AudioBook', 'Book', 'BoxSet'].map(k => [k, new Error('server down')])));
+    await s.fns.renderSearch('kilo');
+    assert.ok(s.elements['page-search'].html.includes('server down'));
 });
 
 test('no hits in any section shows the no-results message', async () => {

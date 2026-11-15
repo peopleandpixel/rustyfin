@@ -82,10 +82,13 @@ async function renderSearch(term) {
     }
 
     try {
-        // One request per section, as Jellyfin Web makes, so no type crowds out the others
-        const sections = await Promise.all(SEARCH_SECTIONS.map(([key, types]) => API.get(searchSectionUrl(term, types))
+        // One request per section, so no type crowds out the others. A section whose request fails
+        // is left out; only when every one fails does the page show the error.
+        const settled = await Promise.allSettled(SEARCH_SECTIONS.map(([key, types]) => API.get(searchSectionUrl(term, types))
             .then(data => ({ key, items: (data.SearchHints || []).map(hintItem) }))));
         if (seq !== searchSeq) return;
+        if (settled.every(r => r.status === 'rejected')) throw settled[0].reason;
+        const sections = settled.filter(r => r.status === 'fulfilled').map(r => r.value);
         const found = sections.filter(s => s.items.length);
         const count = found.reduce((n, s) => n + s.items.length, 0);
         if (!count) {
