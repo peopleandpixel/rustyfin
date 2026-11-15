@@ -1,4 +1,5 @@
-use axum::extract::{ConnectInfo, Path, Query, State};
+use crate::query::Query;
+use axum::extract::{ConnectInfo, Path, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -87,6 +88,7 @@ fn specific_local_address(bind_addr: &str) -> Option<String> {
 
 async fn get_public_info(State(state): State<AppState>) -> Result<Json<ServerInfo>, ApiError> {
     let startup_wizard_completed = rustyfin_db::repo_user::users_exist(&state.db_ro).await?;
+    let local_address = local_address(&state, &headers);
     let config = state.config.read().await;
     Ok(Json(ServerInfo {
         local_address: specific_local_address(&state.bind_addr),
@@ -103,8 +105,10 @@ async fn get_public_info(State(state): State<AppState>) -> Result<Json<ServerInf
 async fn get_full_info(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Json<FullServerInfo>, ApiError> {
     let startup_wizard_completed = rustyfin_db::repo_user::users_exist(&state.db_ro).await?;
+    let local_address = local_address(&state, &headers);
     let config = state.config.read().await;
     let log_path = state.data_dir.join("logs").to_string_lossy().to_string();
     let cache_path = state.data_dir.join("cache").to_string_lossy().to_string();
@@ -128,9 +132,9 @@ async fn get_full_info(
         can_launch_web_browser: false,
         program_data_path,
         web_socket_port_number: config.public_port,
-        local_address: format!("http://{}", state.bind_addr),
+        local_addresses: Some(vec![local_address.clone()]),
+        local_address,
         remote_end_point: Some(format!("http://{}", addr)),
-        local_addresses: Some(vec![format!("http://{}", state.bind_addr)]),
         package_version: Some(env!("CARGO_PKG_VERSION").to_string()),
     }))
 }
@@ -163,7 +167,7 @@ async fn get_endpoint(
     Json(EndpointInfo {
         is_local,
         is_in_network,
-        local_address: format!("http://{}", state.bind_addr),
+        local_address: local_address(&state, req.headers()),
         remote_address: remote_ip,
     })
 }

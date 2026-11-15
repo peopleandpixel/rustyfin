@@ -18,6 +18,41 @@ struct NfoMovie {
     genre: Option<Vec<String>>,
     thumb: Option<Vec<NfoThumb>>,
     fanart: Option<NfoFanart>,
+    uniqueid: Option<Vec<NfoUniqueId>>,
+    imdbid: Option<String>,
+    tmdbid: Option<String>,
+    tvdbid: Option<String>,
+}
+
+/// `<uniqueid type="tmdb">603</uniqueid>`, as Kodi and Jellyfin write them.
+#[derive(Debug, Deserialize, Default)]
+struct NfoUniqueId {
+    #[serde(rename = "@type")]
+    kind: Option<String>,
+    #[serde(rename = "$text")]
+    value: Option<String>,
+}
+
+impl NfoMovie {
+    /// The id of `kind` ("tmdb", "imdb", "tvdb") from `<uniqueid>` or the older `<tmdbid>` tags.
+    fn provider_id(&self, kind: &str) -> Option<String> {
+        let unique = self.uniqueid.iter().flatten().find_map(|id| {
+            id.kind
+                .as_deref()
+                .filter(|k| k.eq_ignore_ascii_case(kind))
+                .and(id.value.as_deref())
+        });
+        let legacy = match kind {
+            "imdb" => self.imdbid.as_deref(),
+            "tmdb" => self.tmdbid.as_deref(),
+            _ => self.tvdbid.as_deref(),
+        };
+        unique
+            .or(legacy)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -79,6 +114,9 @@ pub async fn parse_nfo(nfo_path: &Path) -> Option<ExternalMetadata> {
 
         let runtime_ticks = nfo.runtime.map(|m| m as i64 * 600_000_000);
 
+        let tmdb_id = nfo.provider_id("tmdb").and_then(|v| v.parse().ok());
+        let tvdb_id = nfo.provider_id("tvdb").and_then(|v| v.parse().ok());
+        let imdb_id = nfo.provider_id("imdb").filter(|v| v.starts_with("tt"));
         return Some(ExternalMetadata {
             name: nfo.title.or(nfo.original_title),
             overview: nfo.plot,
@@ -89,8 +127,8 @@ pub async fn parse_nfo(nfo_path: &Path) -> Option<ExternalMetadata> {
             premiere_date: nfo.premiered,
             runtime_ticks,
             image_urls: images,
-            tmdb_id: None,
-            tvdb_id: None,
+            tmdb_id,
+            tvdb_id,
             status: None,
             original_language: None,
             tagline: None,
@@ -104,7 +142,8 @@ pub async fn parse_nfo(nfo_path: &Path) -> Option<ExternalMetadata> {
             studios: None,
             directors: None,
             writers: None,
-            imdb_id: None,
+            imdb_id,
+            people: None,
         });
     }
 

@@ -39,6 +39,9 @@ pub struct AppState {
     pub config: Arc<RwLock<ServerConfiguration>>,
     pub shutdown_tx: Arc<watch::Sender<bool>>,
     pub bind_addr: Arc<String>,
+    /// `RUSTYFIN_PUBLISHED_URL`: the URL clients reach the server at, when the operator set one.
+    /// UDP discovery's `EndpointAddress` and `LocalAddress` give it.
+    pub published_url: Option<Arc<String>>,
     pub api_key: Option<Arc<String>>,
     /// Quick Connect requests keyed by secret. Code→secret lookup done by scanning.
     pub quick_connect: Arc<RwLock<HashMap<String, QuickConnectResult>>>,

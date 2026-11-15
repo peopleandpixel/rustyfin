@@ -1,4 +1,5 @@
-use axum::extract::{Path, Query, State};
+use crate::query::Query;
+use axum::extract::{Path, State};
 use axum::routing::get;
 use axum::{Extension, Json, Router};
 use rustyfin_model::auth::Claims;
@@ -47,8 +48,8 @@ impl DisplayPreferencesDto {
         Self {
             id,
             view_type: None,
-            sort_by: None,
-            sort_order: None,
+            sort_by: Some("SortName".to_string()),
+            sort_order: Some("Ascending".to_string()),
             client,
             custom_prefs: HashMap::new(),
             remember_indexing: false,
