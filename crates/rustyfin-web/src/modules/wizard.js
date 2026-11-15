@@ -24,8 +24,9 @@ async function checkSetupWizard() {
         const info = await API.getPublicInfo();
         const done = info.StartupWizardCompleted ?? info.startup_wizard_completed ?? true;
         // Update version badge with server version
-        if (info.Version || info.version) {
-            serverVersion = info.Version || info.version;
+        const reportedVersion = info.RustyfinVersion || info.Version || info.version;
+        if (reportedVersion) {
+            serverVersion = reportedVersion;
             const badge = $('version-badge');
             if (badge) badge.textContent = serverVersion;
         }
