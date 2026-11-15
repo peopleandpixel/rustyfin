@@ -62,7 +62,8 @@ test('a two-disc album gets disc headings; each row has its number and length an
     assert.ok(html.indexOf('music.disc|{"number":1}') < html.indexOf('music.disc|{"number":2}'));
     assert.ok(html.includes('music.tracks_count|{"count":4}'));
     for (const id of ['dusk', 'midnight', 'small', 'dawn']) {
-        assert.match(html, new RegExp(`class="jf-track-row[^"]*" data-action="play" data-id="${id}" data-stream-type="Audio"`));
+        // A track plays the album from it (r3player_album.mjs)
+        assert.match(html, new RegExp(`class="jf-track-row[^"]*" data-action="play-album" data-id="${id}" data-stream-type="Audio"`));
     }
     // Disc order, then track order
     const order = ['Dusk', 'Midnight', 'Small Hours', 'Dawn'].map(n => html.indexOf(`>${n}<`));
@@ -73,8 +74,8 @@ test('a two-disc album gets disc headings; each row has its number and length an
     assert.match(html, /<span class="group-hover:hidden">2<\/span>/);
     // The album artist is not repeated on every row
     assert.ok(!html.includes('text-white/50">Mike Ensemble<'));
-    // Play starts from the first track of disc 1
-    assert.match(html, /class="jf-btn-primary[^"]*" data-action="play" data-id="dusk" data-stream-type="Audio"/);
+    // Play queues the album from the first track of disc 1 (r3player_album.mjs)
+    assert.match(html, /class="jf-btn-primary[^"]*" data-action="play-album">/);
 });
 
 test('a one-disc album has no disc heading, and a compilation names each track\'s artists', () => {
@@ -100,11 +101,12 @@ test('with several album artists, only a track with an artist outside them names
     assert.ok(html.includes('text-white/50">Kilo Band, Papa Trio<'));
 });
 
-test('Play and the rows read the id in either case', () => {
+test('the rows read the id in either case', () => {
     const { albumTrackList } = sandbox();
     const html = albumTrackList({}, [{ id: 'lower', name: 'Lower', IndexNumber: 1 }]);
-    assert.match(html, /class="jf-btn-primary[^"]*" data-action="play" data-id="lower" data-stream-type="Audio" data-title="Lower"/);
-    assert.match(html, /class="jf-track-row[^"]*" data-action="play" data-id="lower"/);
+    // Play reads the rows' ids when clicked (r3player_album.mjs)
+    assert.match(html, /class="jf-btn-primary[^"]*" data-action="play-album">/);
+    assert.match(html, /class="jf-track-row[^"]*" data-action="play-album" data-id="lower" data-stream-type="Audio" data-title="Lower"/);
 });
 
 test('an album with no tracks has no Play button', () => {

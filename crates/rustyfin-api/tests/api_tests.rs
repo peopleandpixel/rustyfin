@@ -23330,6 +23330,12 @@ fn r3player_controls() {
     b124_node_test("r3player_controls.mjs");
 }
 
+// The album page's Play queues every track in disc and track order; a track plays the album from it
+#[test]
+fn r3player_album() {
+    b124_node_test("r3player_album.mjs");
+}
+
 // The web client's item page: credits, ratings, media info, track pickers, chapters, links, "mark all
 // played" and delete (tests/web/r3item_detail.mjs), and the pickers' choice in the player
 // (tests/web/r3item_play.mjs)

@@ -12,6 +12,7 @@ import {
 import { renderSearch } from './search.js';
 import { playWithResumeChoice, stopPlayback, playItem, playerAutoHide, onPlayerClosed } from './player.js';
 import { playContainer } from './queue.js';
+import { playAlbumFrom } from './music.js';
 import { renderSettings } from './settings.js';
 import {
     renderAdmin, showAdminTab, setUserPolicy, removeOidcLinkAsAdmin, copyOidcCallbackUrl, saveOidcAdminSettings,
@@ -137,6 +138,8 @@ const clickActions = {
     // Play all and Shuffle on a series, season, album, artist, playlist, collection or library
     'play-all': el => playContainer(el.dataset.id),
     shuffle: el => playContainer(el.dataset.id, { shuffle: true }),
+    // An album page's Play, or one of its tracks: the album's tracks as a queue, from that track
+    'play-album': el => playAlbumFrom(el),
     'scan-library': el => startScanWithToast(API.scanLibrary(el.dataset.id), t('library.scan_started_for', { name: el.dataset.name })),
     'scan-library-page': el => startScanWithToast(API.scanLibrary(el.dataset.id), t('library.media_scan_started_for', { name: el.dataset.name })),
     'scan-library-admin': el => startScanWithToast(API.scanLibrary(el.dataset.id), t('admin.scan_started')),
