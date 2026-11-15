@@ -44,6 +44,12 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/Localization/Providers", get(get_providers))
         .route("/Localization/Options", get(get_options))
+        .route("/Localization/ParentalRatings", get(get_parental_ratings))
+}
+
+/// The ratings a user's limit can be set to, for the parental control editor.
+async fn get_parental_ratings() -> Json<Vec<serde_json::Value>> {
+    Json(rustyfin_model::parental::parental_ratings())
 }
 
 /// Administrator-only localization routes. `routes::build_router` wraps them in `require_admin`.

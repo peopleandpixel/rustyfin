@@ -19,7 +19,10 @@ pub struct Chapter {
     /// End time in ticks (100-nanosecond units)
     #[serde(rename = "EndPositionTicks")]
     pub end_position_ticks: i64,
-    /// Optional chapter image path
+    /// The chapter image's path; empty when extracting it failed, so it isn't tried again
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_path: Option<String>,
+    /// When the chapter image was made (RFC 3339)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_date_modified: Option<String>,
 }

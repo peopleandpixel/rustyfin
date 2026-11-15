@@ -18,12 +18,13 @@ pub async fn get_media_segments(
     )
     .bind(&item_id_str)
     .try_map(|row: sqlx::sqlite::SqliteRow| {
-        let _id: String = row.try_get("id")?;
+        let id: String = row.try_get("id")?;
         let item_id: String = row.try_get("item_id")?;
         let segment_type: String = row.try_get("segment_type")?;
         let segment_start_ticks: i64 = row.try_get("segment_start_ticks")?;
         let segment_end_ticks: i64 = row.try_get("segment_end_ticks")?;
         Ok(MediaSegment {
+            id,
             item_id,
             segment_type,
             segment_start_ticks,

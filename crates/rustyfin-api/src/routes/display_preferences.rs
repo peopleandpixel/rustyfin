@@ -74,10 +74,11 @@ async fn get_display_preferences(
     let id = format!("{}-{}", user_id_str, key);
 
     // Try to load from database
-    let stored = rustyfin_db::repo_user::get_display_preference(&state.db_ro, claims.sub, &key)
-        .await
-        .ok()
-        .flatten();
+    let stored =
+        rustyfin_db::repo_user::get_display_preference(&state.db_ro, claims.sub, &key, &client)
+            .await
+            .ok()
+            .flatten();
 
     if let Some(stored_value) = &stored {
         // Parse stored JSON and merge with defaults
@@ -94,16 +95,19 @@ async fn get_display_preferences(
 async fn update_display_preferences(
     State(state): State<AppState>,
     Path(key): Path<String>,
-    Query(_q): Query<DisplayPrefsQuery>,
+    Query(q): Query<DisplayPrefsQuery>,
     Extension(claims): Extension<Claims>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<axum::http::StatusCode, ApiError> {
-    // Persist to database
+    // Persist to database, per client as the GET reads it
+    let client = q.client.unwrap_or_else(|| "emby".to_string());
     let json_str = serde_json::to_string(&body).map_err(|e| ApiError::Internal(e.to_string()))?;
 
-    rustyfin_db::repo_user::update_display_preference(&state.db, claims.sub, &key, &json_str)
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    rustyfin_db::repo_user::update_display_preference(
+        &state.db, claims.sub, &key, &client, &json_str,
+    )
+    .await
+    .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     Ok(axum::http::StatusCode::NO_CONTENT)
 }

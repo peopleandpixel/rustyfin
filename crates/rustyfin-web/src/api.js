@@ -414,7 +414,19 @@ const API = {
     getResume(limit = 12) { return this.cachedGet(`/Items/Resume?Limit=${limit}`); },
     getNextUp(limit = 12) { return this.cachedGet(`/Shows/NextUp?Limit=${limit}`); },
     getRecommendations() { return this.cachedGet('/Movies/Recommendations'); },
-    getFilters() { return this.cachedGet('/Items/Filters', 60000); }, // 60s TTL for filters
+    // A library's genres, years and ratings, for the item types it lists; 60s TTL for filters
+    getFilters(parentId, includeItemTypes) {
+        const q = new URLSearchParams({ ParentId: parentId });
+        if (includeItemTypes) q.set('IncludeItemTypes', includeItemTypes);
+        return this.cachedGet('/Items/Filters?' + q.toString(), 60000);
+    },
+    // A client's display preferences, saved per user on the server
+    getDisplayPreferences(id, client) {
+        return this.get(`/DisplayPreferences/${encodeURIComponent(id)}?client=${encodeURIComponent(client)}`);
+    },
+    saveDisplayPreferences(id, client, prefs) {
+        return this.post(`/DisplayPreferences/${encodeURIComponent(id)}?client=${encodeURIComponent(client)}`, prefs);
+    },
     deleteItem(id) { return this.del(`/Items/${id}`); },
     // The server answers only when the refresh is done; a slow one ends in a TimeoutError, and the server keeps going
     refreshItem(id) { return this.post(`/Items/${id}/Refresh`, undefined, { signal: AbortSignal.timeout(120000) }); },
