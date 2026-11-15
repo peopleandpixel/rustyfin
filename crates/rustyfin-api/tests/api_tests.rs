@@ -4655,6 +4655,59 @@ async fn r1auth_case_variants_keep_their_guards() {
     }
 }
 
+/// `LocalAddress` is an address a client can use: the configured public URL, else the request's
+/// Host with its scheme, never the unspecified bind address.
+#[tokio::test]
+async fn r1auth_local_address_is_reachable() {
+    let state = test_state().await;
+    let local = |headers: Vec<(&'static str, &'static str)>| {
+        let state = state.clone();
+        async move {
+            let mut builder = Request::builder().uri("/System/Info/Public");
+            for (name, value) in headers {
+                builder = builder.header(name, value);
+            }
+            let resp = app(state)
+                .oneshot(builder.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            let info: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            info["LocalAddress"].as_str().unwrap().to_string()
+        }
+    };
+    // test_state binds 0.0.0.0:8096.
+    assert_eq!(local(vec![]).await, "http://localhost:8096");
+    assert_eq!(
+        local(vec![("Host", "media.example:8096")]).await,
+        "http://media.example:8096"
+    );
+    assert_eq!(
+        local(vec![
+            ("Host", "media.example"),
+            ("X-Forwarded-Proto", "https")
+        ])
+        .await,
+        "https://media.example"
+    );
+    assert_eq!(
+        local(vec![("Host", "evil\"<x>")]).await,
+        "http://localhost:8096"
+    );
+    let mut oidc = rustyfin_db::repo_oidc::get_settings(&state.db)
+        .await
+        .unwrap();
+    oidc.public_url = "https://flix.example/jf/".to_string();
+    rustyfin_db::repo_oidc::save_settings(&state.db, &oidc)
+        .await
+        .unwrap();
+    assert_eq!(
+        local(vec![("Host", "media.example:8096")]).await,
+        "https://flix.example/jf"
+    );
+}
+
 /// `/Users/{userId}/Items/{itemId}` answers with the path user's watch data, as Jellyfin does.
 #[tokio::test]
 async fn r1auth_user_item_carries_the_path_users_data() {
