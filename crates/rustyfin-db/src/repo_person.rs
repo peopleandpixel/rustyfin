@@ -1,12 +1,56 @@
 use rustyfin_model::media::MediaItem;
 use rustyfin_model::person::{NameIdPair, PersonDto};
 use sqlx::SqlitePool;
+use uuid::Uuid;
+
+/// The id of the music artist `name`: one person per lowercased name (spec 1.5).
+pub fn music_artist_person_id(name: &str) -> Uuid {
+    Uuid::new_v5(
+        &Uuid::NAMESPACE_OID,
+        format!("rustyfin-artist:{}", name.to_lowercase()).as_bytes(),
+    )
+}
+
+/// Links music items to their artists in one transaction (spec 1.5-1.6). Each `(item id, kind,
+/// names)` gets one `item_people` row per name, of `kind` (`Artist` for tracks, `AlbumArtist` for
+/// albums), in name order. A name that is already a person is reused; the rows are inserted with
+/// `INSERT OR IGNORE`, so a repeated link adds nothing.
+pub async fn link_music_artists(
+    pool: &SqlitePool,
+    links: &[(Uuid, &str, Vec<String>)],
+) -> Result<(), sqlx::Error> {
+    if links.is_empty() {
+        return Ok(());
+    }
+    let mut tx = pool.begin().await?;
+    for (item_id, kind, names) in links {
+        for (order, name) in names.iter().enumerate() {
+            let person_id = music_artist_person_id(name).to_string();
+            sqlx::query("INSERT OR IGNORE INTO people (id, name, type) VALUES (?, ?, 'Artist')")
+                .bind(&person_id)
+                .bind(name)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query(
+                "INSERT OR IGNORE INTO item_people (item_id, person_id, type, role, sort_order) \
+                 VALUES (?, ?, ?, NULL, ?)",
+            )
+            .bind(item_id.to_string())
+            .bind(&person_id)
+            .bind(*kind)
+            .bind(order as i64)
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
+    tx.commit().await
+}
 
 pub async fn get_artists(pool: &SqlitePool) -> Result<Vec<NameIdPair>, sqlx::Error> {
     // Return distinct artists from Audio items (using parent name as album/artist proxy)
     let rows = sqlx::query_as::<_, (String, String)>(
         "SELECT DISTINCT p.id, p.name FROM media_items p
-         WHERE p.media_type = '\"MusicAlbum\"'
+         WHERE p.media_type IN ('\"MusicAlbum\"', '\"MusicArtist\"')
          ORDER BY p.name",
     )
     .fetch_all(pool)

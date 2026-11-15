@@ -162,7 +162,7 @@ async fn connection_manager_control(body: String) -> Response {
 fn media_item_to_didl(item: &rustyfin_model::media::MediaItem, bind_addr: &str) -> String {
     let is_container = matches!(
         item.media_type,
-        MediaType::Series | MediaType::Season | MediaType::MusicAlbum
+        MediaType::Series | MediaType::Season | MediaType::MusicAlbum | MediaType::MusicArtist
     );
 
     if is_container {

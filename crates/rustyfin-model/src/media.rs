@@ -124,6 +124,7 @@ pub enum MediaType {
     Episode,
     Audio,
     MusicAlbum,
+    MusicArtist,
     Photo,
     Genre,
     Unknown,
@@ -140,6 +141,7 @@ impl std::str::FromStr for MediaType {
             "Episode" => Ok(MediaType::Episode),
             "Audio" => Ok(MediaType::Audio),
             "MusicAlbum" => Ok(MediaType::MusicAlbum),
+            "MusicArtist" => Ok(MediaType::MusicArtist),
             "Photo" => Ok(MediaType::Photo),
             "Genre" => Ok(MediaType::Genre),
             _ => Ok(MediaType::Unknown),
@@ -163,6 +165,7 @@ impl MediaType {
             MediaType::Episode => "Episode",
             MediaType::Audio => "Audio",
             MediaType::MusicAlbum => "MusicAlbum",
+            MediaType::MusicArtist => "MusicArtist",
             MediaType::Photo => "Photo",
             MediaType::Genre => "Genre",
             MediaType::Unknown => "Folder",
@@ -174,7 +177,7 @@ impl MediaType {
         match self {
             MediaType::Movie | MediaType::Episode => "Video",
             MediaType::Series | MediaType::Season => "Unknown",
-            MediaType::Audio | MediaType::MusicAlbum => "Audio",
+            MediaType::Audio | MediaType::MusicAlbum | MediaType::MusicArtist => "Audio",
             MediaType::Photo => "Photo",
             MediaType::Genre => "Unknown",
             MediaType::Unknown => "Unknown",
@@ -184,7 +187,11 @@ impl MediaType {
     pub fn is_folder(self) -> bool {
         matches!(
             self,
-            MediaType::Series | MediaType::Season | MediaType::MusicAlbum | MediaType::Genre
+            MediaType::Series
+                | MediaType::Season
+                | MediaType::MusicAlbum
+                | MediaType::MusicArtist
+                | MediaType::Genre
         )
     }
 }
@@ -1044,6 +1051,16 @@ mod tests {
     #[test]
     fn test_media_type_is_folder_music_album() {
         assert!(MediaType::MusicAlbum.is_folder());
+    }
+
+    #[test]
+    fn test_media_type_music_artist() {
+        assert_eq!(
+            MediaType::from_str("MusicArtist"),
+            Ok(MediaType::MusicArtist)
+        );
+        assert_eq!(MediaType::MusicArtist.item_kind(), "MusicArtist");
+        assert!(MediaType::MusicArtist.is_folder());
     }
 
     #[test]

@@ -1981,7 +1981,7 @@ pub async fn get_library_artists(
 ) -> Result<Vec<(Uuid, String, String)>, sqlx::Error> {
     let rows: Vec<(String, String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT id, path, name FROM media_items \
-         WHERE library_id = ?1 AND media_type = 'MusicAlbum' AND parent_id IS NULL \
+         WHERE library_id = ?1 AND media_type IN ('MusicArtist', 'MusicAlbum') AND parent_id IS NULL \
          AND (path = '' OR {})",
         scope.sql("path", 2)
     )))
@@ -2005,7 +2005,7 @@ pub async fn get_library_artist_id(
 ) -> Result<Option<Uuid>, sqlx::Error> {
     let id: Option<String> = sqlx::query_scalar(
         "SELECT id FROM media_items \
-         WHERE library_id = ? AND media_type = 'MusicAlbum' AND parent_id IS NULL AND path = ?",
+         WHERE library_id = ? AND media_type IN ('MusicArtist', 'MusicAlbum') AND parent_id IS NULL AND path = ?",
     )
     .bind(library_id.to_string())
     .bind(path)

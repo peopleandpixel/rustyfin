@@ -1,10 +1,25 @@
 use crate::image_proxy::read_image_stamp;
 use rustyfin_model::image::{ItemImage, detect_image_type_from_filename};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use uuid::Uuid;
 
 const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "gif", "bmp", "webp", "tiff"];
+
+/// The directory that images extracted from media files (embedded cover art) are written to. Set once by
+/// the server at start-up; unset means no extraction.
+static EMBEDDED_IMAGES_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Sets the directory for extracted images. A second call is ignored.
+pub fn set_embedded_images_dir(dir: PathBuf) {
+    let _ = EMBEDDED_IMAGES_DIR.set(dir);
+}
+
+/// The directory for extracted images, if one was set.
+pub fn embedded_images_dir() -> Option<&'static Path> {
+    EMBEDDED_IMAGES_DIR.get().map(PathBuf::as_path)
+}
 
 /// Scan a single directory for local images, optionally filtering by media file name.
 /// When `media_path` is provided, only images whose filenames match the media file are included.

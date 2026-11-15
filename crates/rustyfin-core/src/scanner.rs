@@ -413,6 +413,37 @@ async fn lookup_artist(
     rustyfin_db::repo_media::get_library_artist_id(pool, library_id, path).await
 }
 
+/// The disc number of a folder named `Disc 1`, `disk-03`, `CD2` (case-insensitive), if it is one.
+fn disc_folder_number(name: &str) -> Option<i32> {
+    let lower = name.to_ascii_lowercase();
+    let rest = lower
+        .strip_prefix("disc")
+        .or_else(|| lower.strip_prefix("disk"))
+        .or_else(|| lower.strip_prefix("cd"))?;
+    let digits = rest
+        .strip_prefix(|c: char| c == ' ' || c == '-' || c == '_')
+        .unwrap_or(rest);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// The year of a track: the `year` tag parsed, else the first four characters of the `date` tag when digits.
+fn tag_year(tags: &probe::AudioTags) -> Option<i32> {
+    tags.year
+        .as_deref()
+        .and_then(|y| y.parse::<i32>().ok())
+        .or_else(|| {
+            let prefix = tags.date.as_deref()?.get(..4)?;
+            if prefix.bytes().all(|b| b.is_ascii_digit()) {
+                prefix.parse().ok()
+            } else {
+                None
+            }
+        })
+}
+
 /// Removes the items of `filter` that the scan no longer collected, and returns how many. A failure
 /// is logged, and counts as none.
 async fn remove_uncollected(
@@ -1197,7 +1228,7 @@ async fn scan_music_library(
             .collect();
 
     // Pre-load the music album rows once for the whole scan, for O(1) ID lookup.
-    // Artists and albums both use MediaType::MusicAlbum in the DB, so artist paths are here too.
+    // Albums are MusicAlbum rows; artists are MusicArtist rows (older scans stored them as MusicAlbum).
     // A scoped scan loads the rows in its scope, and looks up the others when it meets them.
     // album_path -> album_id
     let mut album_map: HashMap<String, Uuid> =
@@ -1252,6 +1283,8 @@ async fn scan_music_library(
     for (path, files) in roots {
         // Collect new items for batch insert in a single transaction
         let mut new_items: Vec<MediaItem> = Vec::new();
+        // The artist links of the new items, written once their batch is stored (spec 1.5-1.6).
+        let mut music_links: Vec<(Uuid, &str, Vec<String>)> = Vec::new();
 
         let mut scanned_files = 0u32;
         let mut skipped_ext = 0u32;
@@ -1306,35 +1339,52 @@ async fn scan_music_library(
             // Determine artist and album from directory structure
             // Expected: MusicLibrary/Artist/Album/track.mp3
             // Fallback: MusicLibrary/Album/track.mp3 (no artist)
-            let (artist_name_from_dir, album_name_from_dir, album_dir, artist_dir) =
-                if components.len() >= 3 {
-                    // Artist/Album/track.mp3
-                    let artist_dir = path.join(components[components.len() - 3]);
-                    let album_dir = file_path_buf.parent().unwrap_or(path);
+            // A disc folder (`Disc 1`, `CD2`, `disk-03`) under an album folder is not an album: its tracks
+            // belong to the album above it, and the disc number is kept for the tracks.
+            let n = components.len();
+            let disc_from_dir = if n >= 3 {
+                disc_folder_number(components[n - 2])
+            } else {
+                None
+            };
+            let (artist_name_from_dir, album_name_from_dir, album_dir, artist_dir) = if n >= 2 {
+                let album_idx = if disc_from_dir.is_some() {
+                    n - 3
+                } else {
+                    n - 2
+                };
+                let album_dir = components[..=album_idx]
+                    .iter()
+                    .fold(path.to_path_buf(), |p, c| p.join(c));
+                // Artist/Album/track.mp3: the folder above the album is the artist
+                let (artist_name, artist_dir) = if album_idx >= 1 {
                     (
-                        Some(components[components.len() - 3].to_string()),
-                        components[components.len() - 2].to_string(),
-                        album_dir.to_string_lossy().to_string(),
-                        artist_dir.to_string_lossy().to_string(),
-                    )
-                } else if components.len() >= 2 {
-                    // Album/track.mp3 (no artist directory)
-                    let album_dir = file_path_buf.parent().unwrap_or(path);
-                    (
-                        None,
-                        components[components.len() - 2].to_string(),
-                        album_dir.to_string_lossy().to_string(),
-                        String::new(),
+                        Some(components[album_idx - 1].to_string()),
+                        components[..album_idx]
+                            .iter()
+                            .fold(path.to_path_buf(), |p, c| p.join(c))
+                            .to_string_lossy()
+                            .to_string(),
                     )
                 } else {
-                    // track.mp3 at root
-                    (
-                        None,
-                        "Unknown Album".to_string(),
-                        path.to_string_lossy().to_string(),
-                        String::new(),
-                    )
+                    // Album/track.mp3 (no artist directory)
+                    (None, String::new())
                 };
+                (
+                    artist_name,
+                    components[album_idx].to_string(),
+                    album_dir.to_string_lossy().to_string(),
+                    artist_dir,
+                )
+            } else {
+                // track.mp3 at root
+                (
+                    None,
+                    "Unknown Album".to_string(),
+                    path.to_string_lossy().to_string(),
+                    String::new(),
+                )
+            };
 
             // First, probe the file synchronously to get audio tags for metadata
             let probe_result = probe::probe_file(&file_path).await;
@@ -1346,6 +1396,7 @@ async fn scan_music_library(
                 year,
                 track_number,
                 title_from_tag,
+                disc_from_tag,
             ) = if let Ok(result) = &probe_result {
                 if let Some(ref tags) = result.audio_tags {
                     (
@@ -1353,26 +1404,54 @@ async fn scan_music_library(
                         tags.artist.clone().or_else(|| tags.album_artist.clone()),
                         tags.album.clone(),
                         tags.genre.clone(),
-                        tags.year.as_ref().and_then(|y| y.parse::<i32>().ok()),
+                        tag_year(tags),
                         tags.track_number.map(|n| n as i32),
                         tags.title.clone(),
+                        tags.disc_number.map(|n| n as i32),
                     )
                 } else {
-                    (false, None, None, None, None, None, None)
+                    (false, None, None, None, None, None, None, None)
                 }
             } else {
-                (false, None, None, None, None, None, None)
+                (false, None, None, None, None, None, None, None)
             };
+
+            // The track's artists: the artist tag split on `;`, else the album artist tag (spec 1.5).
+            let (track_artists, album_artist_tag): (Vec<String>, Option<String>) =
+                match probe_result
+                    .as_ref()
+                    .ok()
+                    .and_then(|r| r.audio_tags.as_ref())
+                {
+                    Some(tags) => {
+                        let album_artist = tags
+                            .album_artist
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string);
+                        let mut artists = tags
+                            .artist
+                            .as_deref()
+                            .map(split_artist_tag)
+                            .unwrap_or_default();
+                        if artists.is_empty() {
+                            artists.extend(album_artist.clone());
+                        }
+                        (artists, album_artist)
+                    }
+                    None => (Vec::new(), None),
+                };
 
             // Use tag album name if available, otherwise directory name
             let effective_album_name = album_name_from_tag
                 .clone()
                 .unwrap_or(album_name_from_dir.clone());
 
-            // Resolve artist
-            let effective_artist_name = artist_name_from_tag
+            // Resolve artist: the artist folder's name, else the track's artist tag
+            let effective_artist_name = artist_name_from_dir
                 .clone()
-                .or_else(|| artist_name_from_dir.clone());
+                .or_else(|| artist_name_from_tag.clone());
 
             // Resolve artist ID if we have an artist name
             let artist_id = if let Some(ref artist_name) = effective_artist_name {
@@ -1394,7 +1473,7 @@ async fn scan_music_library(
                         name: artist_name.clone(),
                         sort_name: Some(artist_name.to_lowercase()),
                         overview: None,
-                        media_type: MediaType::MusicAlbum, // Artists use same type as albums in DB
+                        media_type: MediaType::MusicArtist,
                         path: artist_dir.clone(),
                         parent_id: None,
                         library_id: library.id,
@@ -1452,6 +1531,15 @@ async fn scan_music_library(
                     media_sources: Vec::new(),
                     ..MediaItem::default_dto_fields()
                 };
+                // The album artist: this first track's album artist tag, else the artist folder, else
+                // the track's first artist (spec 1.6).
+                let album_artist = album_artist_tag
+                    .clone()
+                    .or_else(|| artist_name_from_dir.clone())
+                    .or_else(|| track_artists.first().cloned());
+                if let Some(name) = album_artist {
+                    music_links.push((id, "AlbumArtist", vec![name]));
+                }
                 new_items.push(album_item);
                 album_map.insert(album_dir, id);
                 if counted {
@@ -1505,11 +1593,14 @@ async fn scan_music_library(
                 premiere_date: None,
                 runtime_ticks: None,
                 index_number: track_number,
-                parent_index_number: None,
+                parent_index_number: disc_from_tag.or(disc_from_dir),
                 media_sources: Vec::new(),
                 ..MediaItem::default_dto_fields()
             };
 
+            if !track_artists.is_empty() {
+                music_links.push((item.id, "Artist", track_artists));
+            }
             new_items.push(item);
             if counted {
                 ticket.add_total(1);
@@ -1539,10 +1630,18 @@ async fn scan_music_library(
                     ticket.advance(new_items.len());
                 }
             } else {
+                if let Err(e) =
+                    rustyfin_db::repo_person::link_music_artists(pool, &music_links).await
+                {
+                    tracing::error!("failed to link music artists: {}", e);
+                }
                 // Find and save local images for albums (cover art)
                 let mut all_images: Vec<rustyfin_model::image::ItemImage> = Vec::new();
                 for item in &new_items {
-                    if item.media_type == MediaType::MusicAlbum {
+                    if matches!(
+                        item.media_type,
+                        MediaType::MusicAlbum | MediaType::MusicArtist
+                    ) {
                         // For albums, look for images in the album directory
                         let album_dir = std::path::Path::new(&item.path);
                         let images = local_images::find_local_images(album_dir, item.id);
@@ -1601,6 +1700,18 @@ async fn scan_music_library(
         images: 0,
     };
     Ok((changes, new_item_ids))
+}
+
+/// The artist names in an artist tag: split on `;`, trimmed, empty and repeated names dropped, in
+/// tag order (spec 1.5).
+fn split_artist_tag(tag: &str) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for part in tag.split(';').map(str::trim).filter(|p| !p.is_empty()) {
+        if !names.iter().any(|n| n == part) {
+            names.push(part.to_string());
+        }
+    }
+    names
 }
 
 fn detect_media_type(ext: &str, content_type: &LibraryContentType) -> Option<MediaType> {

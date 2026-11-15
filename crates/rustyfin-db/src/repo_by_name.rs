@@ -123,7 +123,10 @@ fn folded_id(kind: ByNameKind, folded: &str) -> Uuid {
 /// every other item. Jellyfin picks the id of a genre on an item the same way, by whether the item
 /// has music genres (`Emby.Server.Implementations/Dto/DtoService.cs:1027-1035`).
 pub fn genre_kind_of(media: MediaType) -> ByNameKind {
-    if matches!(media, MediaType::Audio | MediaType::MusicAlbum) {
+    if matches!(
+        media,
+        MediaType::Audio | MediaType::MusicAlbum | MediaType::MusicArtist
+    ) {
         ByNameKind::MusicGenre
     } else {
         ByNameKind::Genre

@@ -63,7 +63,7 @@ blurhash = "0.2"
 quick-xml = { version = "0.37", features = ["serialize"] }
 
 # Utilities
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
 sha1 = "0.10"
 unicode-normalization = "0.1.26"
 chrono = { version = "0.4", features = ["serde"] }

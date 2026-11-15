@@ -349,6 +349,14 @@ fn music_album(ancestors: &[HintAncestor], level: usize) -> Option<&HintAncestor
         .filter(|ancestor| stored_kind(&ancestor.kind) == "MusicAlbum")
 }
 
+/// The ancestor `level` steps up (0 is the parent), if it is an artist: a MusicArtist, or a MusicAlbum
+/// in data scanned before artists had their own type.
+fn music_artist(ancestors: &[HintAncestor], level: usize) -> Option<&HintAncestor> {
+    ancestors
+        .get(level)
+        .filter(|ancestor| matches!(stored_kind(&ancestor.kind), "MusicAlbum" | "MusicArtist"))
+}
+
 /// The tag of an image: its type and its index, as Jellyfin's image tags are formed.
 fn image_tag(image: &ItemImage) -> String {
     rustyfin_core::image_proxy::image_tag(&image.path, image.stamp)
@@ -388,10 +396,10 @@ fn page_hint(
         _ => None,
     };
     // A track names its album (the parent) and the album's artist (the grandparent, which scans
-    // store as a MusicAlbum). A MusicAlbum under a MusicAlbum names its parent as its artist.
+    // store as a MusicArtist, or as a MusicAlbum in older data). An album names its parent as its artist.
     let (album, artist) = match kind {
-        "Audio" => (music_album(ancestors, 0), music_album(ancestors, 1)),
-        "MusicAlbum" => (None, music_album(ancestors, 0)),
+        "Audio" => (music_album(ancestors, 0), music_artist(ancestors, 1)),
+        "MusicAlbum" => (None, music_artist(ancestors, 0)),
         _ => (None, None),
     };
     SearchHint {

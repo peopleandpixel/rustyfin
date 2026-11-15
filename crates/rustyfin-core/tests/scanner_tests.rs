@@ -4395,7 +4395,6 @@ async fn b18_scheduler_skips_a_library_another_caller_claimed() {
 // configured, each new artist, album and track is one more unit, which its refresh advances, so the
 // percent reaches 99 only at the end. A rescan reuses the artist rows of earlier scans.
 
-/// A music library whose roots are `<temp dir>/<root>` for each of `roots`, in that order.
 // R2 music: tags, disc folders, artists and embedded covers
 
 /// Writes a one-second FLAC track at `<root>/<rel>` with `tags`, and with an embedded JPEG picture
@@ -4430,27 +4429,9 @@ fn r2music_track(root: &Path, rel: &str, tags: &[(&str, &str)], picture: bool) -
 
 /// The library's rows of `media_type` as (path, name, parent's path, year, index, parent index),
 /// paths relative to its root, sorted.
-async fn r2music_rows(
-    pool: &SqlitePool,
-    lib: &Library,
-    media_type: &str,
-) -> Vec<(
-    String,
-    String,
-    Option<String>,
-    Option<i64>,
-    Option<i64>,
-    Option<i64>,
-)> {
+async fn r2music_rows(pool: &SqlitePool, lib: &Library, media_type: &str) -> Vec<R2MusicRow> {
     let root = root_of(lib);
-    let rows: Vec<(
-        String,
-        String,
-        Option<String>,
-        Option<i64>,
-        Option<i64>,
-        Option<i64>,
-    )> = sqlx::query_as(
+    let rows: Vec<R2MusicRow> = sqlx::query_as(
         "SELECT a.path, a.name, p.path, a.production_year, a.index_number, a.parent_index_number
          FROM media_items a LEFT JOIN media_items p ON p.id = a.parent_id
          WHERE a.library_id = ?1 AND a.media_type = ?2",
@@ -4476,6 +4457,16 @@ async fn r2music_rows(
     out.sort();
     out
 }
+
+/// A music row: path, name, parent's path, year, index and parent index.
+type R2MusicRow = (
+    String,
+    String,
+    Option<String>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+);
 
 /// The `item_people` links of `kind` as (item path relative to the root, person name, person id),
 /// in item path and credit order.
@@ -4665,12 +4656,13 @@ async fn r2music_scan_tags_discs_and_artists() {
             ),
         ]
     );
-    let tracks: Vec<(String, Option<String>, Option<i64>, Option<i64>)> =
-        r2music_rows(&fx.pool, &lib, "Audio")
-            .await
-            .into_iter()
-            .map(|(path, _, parent, _, index, disc)| (path, parent, index, disc))
-            .collect();
+    // (path, parent's path, index, parent index)
+    type Track = (String, Option<String>, Option<i64>, Option<i64>);
+    let tracks: Vec<Track> = r2music_rows(&fx.pool, &lib, "Audio")
+        .await
+        .into_iter()
+        .map(|(path, _, parent, _, index, disc)| (path, parent, index, disc))
+        .collect();
     let track = |path: &str, parent: &str, index: i64, disc: i64| {
         (
             path.to_string(),
@@ -4882,6 +4874,7 @@ async fn r2music_embedded_cover_becomes_album_primary() {
     );
 }
 
+/// A music library whose roots are `<temp dir>/<root>` for each of `roots`, in that order.
 async fn b18_music_library(fx: &Fixture, roots: &[&str]) -> Library {
     let paths = roots
         .iter()
@@ -4939,13 +4932,13 @@ async fn b18_music_frames(
         .collect()
 }
 
-/// The library's `MusicAlbum` rows (artists and albums) as (path, parent's path), relative to its
-/// first root, sorted.
+/// The library's `MusicArtist` and `MusicAlbum` rows (artists and albums) as (path, parent's
+/// path), relative to its first root, sorted.
 async fn b18_music_albums(pool: &SqlitePool, lib: &Library) -> Vec<(String, Option<String>)> {
     let root = root_of(lib);
     let rows: Vec<(String, Option<String>)> = sqlx::query_as(
         "SELECT a.path, p.path FROM media_items a LEFT JOIN media_items p ON p.id = a.parent_id
-         WHERE a.library_id = ?1 AND a.media_type = 'MusicAlbum'",
+         WHERE a.library_id = ?1 AND a.media_type IN ('MusicArtist', 'MusicAlbum')",
     )
     .bind(lib.id.to_string())
     .fetch_all(pool)
