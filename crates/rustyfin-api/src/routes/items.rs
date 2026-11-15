@@ -8,7 +8,7 @@ use rustyfin_core::tmdb_client::TmdbApi;
 use rustyfin_model::auth::Claims;
 use rustyfin_model::media::{FiltersResult, MediaItem, QueryResult};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
@@ -2077,7 +2077,7 @@ async fn get_items(
                     start_index as usize,
                     limit,
                 );
-                return entries.await.map(Json);
+                return entries.await.map(|r| Json(r).into_response());
             }
             Some(Container::Collection(ids)) => {
                 parent_id = None;
@@ -2100,7 +2100,7 @@ async fn get_items(
             start_index as usize,
             limit as usize,
         );
-        return listing.await.map(Json);
+        return listing.await.map(|r| Json(r).into_response());
     }
 
     // If IsMovie/IsSeries is set, constrain media_type
@@ -2338,17 +2338,28 @@ async fn get_item(
     Path(id): Path<Uuid>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Response, ApiError> {
-    item_or_library(&state, id, claims.sub).await
+    item_or_library(&state, id, claims.sub, &claims).await
 }
 
-/// The media item `id` with `user`'s watch data, or the library `id` as its view.
-async fn item_or_library(state: &AppState, id: Uuid, user: Uuid) -> Result<Response, ApiError> {
+/// The media item `id` with `user`'s watch data, the library `id` as its view, or the collection
+/// or playlist `id` (a playlist only when `claims`' caller may see it).
+async fn item_or_library(
+    state: &AppState,
+    id: Uuid,
+    user: Uuid,
+    claims: &Claims,
+) -> Result<Response, ApiError> {
     match media_item(state, id, user).await {
         Err(ApiError::NotFound(message)) => {
-            match rustyfin_db::repo_library::get_library_by_id(&state.db_ro, id).await? {
-                Some(lib) => {
-                    Ok(Json(super::library::library_view(&lib, &state.server_id)).into_response())
-                }
+            if let Some(lib) =
+                rustyfin_db::repo_library::get_library_by_id(&state.db_ro, id).await?
+            {
+                return Ok(
+                    Json(super::library::library_view(&lib, &state.server_id)).into_response()
+                );
+            }
+            match super::collections::container_details(state, id, claims).await? {
+                Some(item) => Ok(Json(item).into_response()),
                 None => Err(ApiError::NotFound(message)),
             }
         }
@@ -2363,7 +2374,7 @@ async fn get_user_item(
     Extension(claims): Extension<Claims>,
 ) -> Result<Response, ApiError> {
     let user = path_user(&state, &claims, user_id).await?;
-    item_or_library(&state, item_id, user).await
+    item_or_library(&state, item_id, user, &claims).await
 }
 
 /// The media item `id` with `user`'s watch data.
@@ -2386,13 +2397,9 @@ async fn media_item(state: &AppState, id: Uuid, user: Uuid) -> Result<MediaItem,
     let mut item = match cached {
         Some(cached) => cached,
         None => {
-            let Some(mut item) = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, id).await?
-            else {
-                return super::collections::container_details(&state, id, &claims)
-                    .await?
-                    .map(Json)
-                    .ok_or(ApiError::NotFound("item not found".into()));
-            };
+            let mut item = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, id)
+                .await?
+                .ok_or(ApiError::NotFound("item not found".into()))?;
             let _ = populate_media_source_single(&state.db_ro, &mut item).await;
             // Enrich with all response fields, without any user's watch data
             let tmdb = state.tmdb.api(None);
