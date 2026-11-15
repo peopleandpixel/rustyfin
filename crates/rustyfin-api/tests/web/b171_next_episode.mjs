@@ -144,6 +144,8 @@ test('audio and subtitle languages carry over, else the defaults stay; subtitles
 test('the card starts at the credits, else 10 s before the end, else at the end of a short item', () => {
     const { fns } = sandbox();
     assert.equal(fns.creditsStart([{ Type: 'Intro', SegmentStartTicks: 10e7 }, { Type: 'Outro', SegmentStartTicks: 1400e7 }], [], 1500), 1400);
+    // Jellyfin's field name, which the media segments route sends
+    assert.equal(fns.creditsStart([{ Type: 'Intro', StartTicks: 10e7 }, { Type: 'Outro', StartTicks: 1350e7 }], [], 1500), 1350);
     // A credits chapter in the second half counts; opening credits don't
     const chapters = [{ Name: 'Opening Credits', StartTicks: 30e7 }, { Name: 'End Credits', StartTicks: 1380e7 }];
     assert.equal(fns.creditsStart([], chapters, 1500), 1380);

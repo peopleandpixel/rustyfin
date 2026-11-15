@@ -825,8 +825,10 @@ function carriedTracks(streams, carry, audioIndex, subtitleIndex, subtitleFromSe
 
 // Where the credits start, in seconds: an Outro media segment, else a credits chapter in the second half
 function creditsStart(segments, chapters, runtime) {
-    const outro = (segments || []).find(s => s.Type === 'Outro' && s.SegmentStartTicks > 0);
-    if (outro) return outro.SegmentStartTicks / 1e7;
+    // Jellyfin names a segment's start StartTicks; older Rustyfin builds sent SegmentStartTicks
+    const segmentStart = s => s.StartTicks ?? s.SegmentStartTicks ?? 0;
+    const outro = (segments || []).find(s => s.Type === 'Outro' && segmentStart(s) > 0);
+    if (outro) return segmentStart(outro) / 1e7;
     const start = c => (c.StartPositionTicks ?? c.StartTicks ?? 0) / 1e7;
     const credits = (chapters || []).find(c => /\b(credits|outro)\b/i.test(c.Name || '') && start(c) > (runtime || 0) / 2);
     return credits ? start(credits) : null;
