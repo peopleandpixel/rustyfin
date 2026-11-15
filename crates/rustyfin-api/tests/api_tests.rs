@@ -17829,6 +17829,12 @@ fn b145_icons() {
     b124_node_test("b145_icons.mjs");
 }
 
+// B165: subtitles stayed on screen while the subtitle menu said Off
+#[test]
+fn b165_subtitle_tracks() {
+    b124_node_test("b165_subtitle_tracks.mjs");
+}
+
 #[test]
 fn b142_settings_key_inputs_hide_keys() {
     let app_js = b124_web_source("app.js");
