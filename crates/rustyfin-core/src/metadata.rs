@@ -244,18 +244,31 @@ async fn apply_season(
 ) -> Result<(), String> {
     let meta = match working.media_type {
         // A season keeps its own name ("Season 1"), as in Jellyfin
-        MediaType::Season => &season.meta,
+        MediaType::Season => season.meta.clone(),
         MediaType::Episode => {
             let Some(number) = working.index_number else {
                 return Ok(());
             };
-            match season.episodes.iter().find(|(n, _)| *n == number) {
-                Some((_, meta)) => meta,
-                None => return Ok(()),
+            let Some((_, first)) = season.episodes.iter().find(|(n, _)| *n == number) else {
+                return Ok(());
+            };
+            let mut meta = first.clone();
+            // A file holding several episodes is named after all of them, as Jellyfin names it
+            // ("The Shadow That Devours the Sun / Mushi that Inhale Rain")
+            if let Some(end) = working.index_number_end.filter(|end| *end > number) {
+                let names: Vec<&str> = (number..=end)
+                    .filter_map(|n| season.episodes.iter().find(|(e, _)| *e == n))
+                    .filter_map(|(_, m)| m.name.as_deref())
+                    .collect();
+                if names.len() > 1 {
+                    meta.name = Some(names.join(" / "));
+                }
             }
+            meta
         }
         _ => return Ok(()),
     };
+    let meta = &meta;
     apply_metadata_to_item(pool, working, meta, replace_name).await?;
     store_images_batch(pool, working.id, &meta.image_urls, provider).await
 }

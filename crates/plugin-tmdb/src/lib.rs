@@ -510,6 +510,7 @@ struct TmdbSeason {
     air_date: Option<String>,
     poster_path: Option<String>,
     images: Option<TmdbImages>,
+    credits: Option<TmdbCredits>,
     episodes: Option<Vec<TmdbEpisode>>,
 }
 
@@ -896,12 +897,22 @@ pub async fn season(tmdb: &TmdbApi, series_id: i64, season_number: i32) -> Optio
         ..Default::default()
     };
 
+    // The season's regular cast, which every episode credits before its guest stars (Jellyfin's
+    // episode credits list them too)
+    let regulars: Vec<MetadataPerson> = season
+        .credits
+        .and_then(|c| c.cast)
+        .unwrap_or_default()
+        .into_iter()
+        .take(MAX_CAST)
+        .map(|member| cast_person(tmdb, member, "Actor"))
+        .collect();
     let episodes = season
         .episodes
         .unwrap_or_default()
         .into_iter()
         .map(|ep| {
-            let mut people = Vec::new();
+            let mut people = regulars.clone();
             for guest in ep
                 .guest_stars
                 .unwrap_or_default()

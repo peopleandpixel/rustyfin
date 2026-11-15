@@ -579,17 +579,26 @@ impl rustyfin_model::metadata::MetadataLookups for R1Lookups {
                     }],
                     ..Default::default()
                 },
-                episodes: vec![(
-                    1,
-                    ExternalMetadata {
-                        name: Some("Pilot: One".to_string()),
-                        overview: Some("R1 episode overview".to_string()),
-                        premiere_date: Some("2023-09-01".to_string()),
-                        community_rating: Some(7.5),
-                        tmdb_id: Some(6101),
-                        ..Default::default()
-                    },
-                )],
+                episodes: vec![
+                    (
+                        1,
+                        ExternalMetadata {
+                            name: Some("Pilot: One".to_string()),
+                            overview: Some("R1 episode overview".to_string()),
+                            premiere_date: Some("2023-09-01".to_string()),
+                            community_rating: Some(7.5),
+                            tmdb_id: Some(6101),
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        2,
+                        ExternalMetadata {
+                            name: Some("Second".to_string()),
+                            ..Default::default()
+                        },
+                    ),
+                ],
             })
         })
     }
@@ -777,7 +786,18 @@ async fn r1scan_series_fills_its_seasons_and_episodes() {
         parent_index_number: Some(1),
         ..base.clone()
     };
-    for item in [&series, &season, &episode] {
+    // A file holding episodes 1 and 2
+    let double = MediaItem {
+        id: Uuid::new_v4(),
+        name: "One Night - S01E01-E02".to_string(),
+        path: root
+            .join("Season 1/One Night - S01E01-E02.mkv")
+            .to_string_lossy()
+            .into_owned(),
+        index_number_end: Some(2),
+        ..episode.clone()
+    };
+    for item in [&series, &season, &episode, &double] {
         rustyfin_db::repo_media::upsert_media_item(pool, item)
             .await
             .unwrap();
@@ -813,6 +833,7 @@ async fn r1scan_series_fills_its_seasons_and_episodes() {
     assert_eq!(episode_after.community_rating, Some(7.5));
     assert_eq!(episode_after.tmdb_id, Some(6101));
     assert_eq!(calls.lock().unwrap().seasons, [(228527, 1)]);
+    assert_eq!(stored(pool, double.id).await.name, "Pilot: One / Second");
 
     // The episode's own refresh asks for its season
     rustyfin_core::metadata::refresh_item_metadata(pool, &client, &episode_after, &pm)

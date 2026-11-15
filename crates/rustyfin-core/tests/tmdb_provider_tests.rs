@@ -214,6 +214,8 @@ fn canned(path: &str) -> Option<Value> {
             "overview": "R1 season overview",
             "air_date": "2003-01-01",
             "poster_path": "/r1-season-poster.jpg",
+            "credits": {"cast": [{"id": 77, "name": "Dana Actor", "character": "Self",
+                                  "profile_path": "/g12-dana.jpg"}]},
             "episodes": [
                 {
                     "id": 6101, "episode_number": 1, "name": "Pilot: One",
@@ -462,12 +464,18 @@ async fn r1scan_season_lists_its_episodes() {
         .collect();
     assert_eq!(
         people,
-        [("Gus Guest", "GuestStar"), ("Eli Director", "Director")]
+        [
+            ("Dana Actor", "Actor"),
+            ("Gus Guest", "GuestStar"),
+            ("Eli Director", "Director")
+        ]
     );
     // An episode without a rating or still has none
     let (_, two) = &season.episodes[1];
     assert_eq!(two.community_rating, None);
     assert!(two.image_urls.is_empty());
+    // The regular cast is credited on every episode
+    assert_eq!(two.people.as_ref().map(Vec::len), Some(1));
 }
 
 #[tokio::test]

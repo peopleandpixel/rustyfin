@@ -120,6 +120,16 @@ async fn load_image_tags(pool: &SqlitePool, item: &mut MediaItem) {
     }
 }
 
+/// TMDb's path segment for an item's TMDb id: a movie's or a series'. A season's or an episode's
+/// TMDb id is not one TMDb's movie or tv routes take.
+fn tmdb_kind(item: &MediaItem) -> Option<&'static str> {
+    match item.media_type {
+        rustyfin_model::media::MediaType::Movie => Some("movie"),
+        rustyfin_model::media::MediaType::Series => Some("tv"),
+        _ => None,
+    }
+}
+
 /// Enrich a single MediaItem with all response fields: server_id, provider_ids, chapters,
 /// trickplay screenshots, etag, completion_percentage, external_urls, type flags,
 /// album/artist info, folder counts, inherited images, episode numbers, series branding,
@@ -184,8 +194,9 @@ async fn enrich_item(
 
     // ExternalUrls from provider_ids
     let mut external_urls = Vec::new();
-    if let Some(tmdb) = item.tmdb_id {
-        let kind = if item.is_movie { "movie" } else { "tv" };
+    if let Some(tmdb) = item.tmdb_id
+        && let Some(kind) = tmdb_kind(item)
+    {
         external_urls.push(rustyfin_model::media::ExternalUrl {
             name: "TMDb".to_string(),
             url: format!("https://www.themoviedb.org/{}/{}", kind, tmdb),
@@ -202,8 +213,8 @@ async fn enrich_item(
     // RemoteTrailers from TMDb API (real YouTube trailer URLs)
     if let Some(tmdb_id) = item.tmdb_id
         && let Some(api) = tmdb_api
+        && let Some(kind) = tmdb_kind(item)
     {
-        let kind = if item.is_movie { "movie" } else { "tv" };
         let trailers = rustyfin_core::tmdb_client::get_trailers(api, kind, tmdb_id).await;
         item.remote_trailers = trailers
             .into_iter()
@@ -904,8 +915,9 @@ pub(crate) async fn enrich_items(
 
         // ExternalUrls from provider_ids
         let mut external_urls = Vec::new();
-        if let Some(tmdb) = item.tmdb_id {
-            let kind = if item.is_movie { "movie" } else { "tv" };
+        if let Some(tmdb) = item.tmdb_id
+            && let Some(kind) = tmdb_kind(item)
+        {
             external_urls.push(rustyfin_model::media::ExternalUrl {
                 name: "TMDb".to_string(),
                 url: format!("https://www.themoviedb.org/{}/{}", kind, tmdb),
@@ -1365,6 +1377,7 @@ pub(crate) async fn enrich_items(
         let trailer_items: Vec<(usize, i64, bool)> = items
             .iter()
             .enumerate()
+            .filter(|(_, item)| tmdb_kind(item).is_some())
             .filter_map(|(i, item)| item.tmdb_id.map(|tmdb| (i, tmdb, item.is_movie)))
             .collect();
 
@@ -2046,8 +2059,9 @@ async fn get_similar(
     let mut similar: Vec<MediaItem> = Vec::new();
 
     // Priority 1: TMDb Similar API (highest weight)
-    if let (Some(tmdb_id), Some(api)) = (item.tmdb_id, tmdb.as_ref()) {
-        let media_type = if item.is_movie { "movie" } else { "tv" };
+    if let (Some(tmdb_id), Some(api), Some(media_type)) =
+        (item.tmdb_id, tmdb.as_ref(), tmdb_kind(&item))
+    {
         let tmdb_similar = rustyfin_core::tmdb_client::get_similar(api, media_type, tmdb_id).await;
 
         // For each TMDb similar item, find the local item by tmdb_id

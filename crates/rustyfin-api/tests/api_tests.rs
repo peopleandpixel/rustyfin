@@ -11468,6 +11468,53 @@ async fn test_g12_item_refresh_uses_env_key_and_base_urls() {
 
 // R1 scan: E0-scan-1, E0-metadata-1, B137
 
+/// An episode's TMDb id (B147 stores one) is not a series id: its answers ask TMDb for no
+/// trailers or similar items with it and link no TMDb page, in the item and the list.
+#[tokio::test]
+async fn r1scan_episode_tmdb_id_is_not_used_as_a_series_id() {
+    let server = g12_server(Some(G12_ENV_KEY), None).await;
+    let movie = server.insert_movie().await;
+    let episode = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO media_items (id, library_id, name, media_type, path, tmdb_id) \
+         SELECT ?, library_id, 'Pilot', 'Episode', '/nonexistent/G12/Show/S01E01.mkv', 6101 \
+         FROM media_items WHERE id = ?",
+    )
+    .bind(episode.to_string())
+    .bind(movie.to_string())
+    .execute(&server.db)
+    .await
+    .unwrap();
+
+    let (status, item) = server.send("GET", &format!("/Items/{episode}"), None).await;
+    assert_eq!(status, StatusCode::OK, "{item}");
+    let item: serde_json::Value = serde_json::from_str(&item).unwrap();
+    assert_eq!(item["ProviderIds"]["Tmdb"], "6101");
+    assert_eq!(item["ExternalUrls"], serde_json::json!([]));
+    let (status, _) = server
+        .send(
+            "GET",
+            "/Items?Recursive=true&IncludeItemTypes=Episode",
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = server
+        .send("GET", &format!("/Items/{episode}/Similar"), None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let asked: Vec<String> = server
+        .hits()
+        .into_iter()
+        .map(|hit| hit.path)
+        .filter(|path| path.contains("6101"))
+        .collect();
+    assert!(
+        asked.is_empty(),
+        "asked TMDb with the episode id: {asked:?}"
+    );
+}
+
 /// A TMDb refresh fills the IMDb id, studios, people, rating and premiere date, and both the
 /// list and the item answers show them, with Jellyfin's ProviderIds key names.
 #[tokio::test]
