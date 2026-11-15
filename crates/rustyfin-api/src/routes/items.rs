@@ -1,6 +1,5 @@
 use axum::extract::{Path, Query, State};
-use axum::http::{StatusCode, header};
-use axum::response::{IntoResponse, Response};
+use axum::http::StatusCode;
 use axum::routing::{delete, get};
 use axum::{Extension, Json, Router};
 use rustyfin_core::tmdb_client::TmdbApi;
@@ -118,6 +117,55 @@ async fn load_image_tags(pool: &SqlitePool, item: &mut MediaItem) {
     if let Ok(images) = rustyfin_db::repo_image::get_images_for_item(pool, item.id).await {
         set_image_tags(item, &images);
     }
+}
+
+/// Sets an item's `Chapters` and `ChapterCount`, as Jellyfin's `ChapterInfo`s. A chapter with an
+/// image gets its `ImageTag` and `ImageDateModified`; one whose image failed counts as none.
+fn set_chapters(item: &mut MediaItem, chapters: &[rustyfin_model::chapter::Chapter]) {
+    use rustyfin_model::media::ChapterInfo;
+    item.chapters = chapters
+        .iter()
+        .map(|c| {
+            let image = c.image_path.as_deref().filter(|p| !p.is_empty());
+            let date = image.and(c.image_date_modified.as_deref());
+            ChapterInfo {
+                start_position_ticks: c.start_position_ticks,
+                name: c.name.clone(),
+                image_date_modified: date.unwrap_or(ChapterInfo::NO_IMAGE_DATE).to_string(),
+                image_tag: image.map(|path| chapter_image_tag(path, date)),
+            }
+        })
+        .collect();
+    item.chapter_count = item.chapters.len() as i32;
+}
+
+/// A chapter image's tag: it changes when the image is made again.
+fn chapter_image_tag(path: &str, date: Option<&str>) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut hasher);
+    date.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// Sets an item's `Trickplay`: its tile sets by width, under its own id as the media source
+/// Jellyfin clients look them up by, and under its first source's id too when that differs.
+fn set_trickplay(item: &mut MediaItem, sets: Vec<rustyfin_model::trickplay::TrickplayInfo>) {
+    if sets.is_empty() {
+        return;
+    }
+    let by_width: std::collections::BTreeMap<_, _> = sets
+        .into_iter()
+        .map(|info| (info.width.to_string(), info))
+        .collect();
+    let mut by_source = std::collections::BTreeMap::new();
+    if let Some(source) = item.media_sources.first()
+        && source.id != item.id.simple().to_string()
+    {
+        by_source.insert(source.id.clone(), by_width.clone());
+    }
+    by_source.insert(item.id.simple().to_string(), by_width);
+    item.trickplay = Some(by_source);
 }
 
 /// Enrich a single MediaItem with all response fields: server_id, provider_ids, chapters,
@@ -284,21 +332,12 @@ async fn enrich_item(
 
     // Chapters from chapters table
     if let Ok(chapters) = chapters_result {
-        item.chapters = chapters
-            .iter()
-            .map(|c| rustyfin_model::media::ChapterInfo {
-                start_ticks: c.start_position_ticks,
-                name: c.name.clone(),
-                image: c.image_path.clone(),
-                image_date_modified: None,
-            })
-            .collect();
-        item.chapter_count = item.chapters.len() as i32;
+        set_chapters(item, &chapters);
     }
 
-    // ScreenshotImageTags from trickplay table
-    if let Ok(Some(_trickplay)) = trickplay_result {
-        item.screenshot_image_tags = vec![format!("{}-{}", item.id, _trickplay.width)];
+    // Trickplay tile sets
+    if let Ok(trickplay) = trickplay_result {
+        set_trickplay(item, trickplay);
     }
 
     // Etag from date_created
@@ -719,7 +758,7 @@ pub(crate) async fn enrich_items(
         .unwrap_or_default();
 
     // Batch query 2: All trickplay info for all items
-    let trickplay_map = rustyfin_db::repo_trickplay::get_trickplay_batch(pool, &item_ids)
+    let mut trickplay_map = rustyfin_db::repo_trickplay::get_trickplay_batch(pool, &item_ids)
         .await
         .unwrap_or_default();
 
@@ -968,21 +1007,12 @@ pub(crate) async fn enrich_items(
 
         // Chapters from batch map
         if let Some(chapters) = chapters_map.get(&item.id.to_string()) {
-            item.chapters = chapters
-                .iter()
-                .map(|c| rustyfin_model::media::ChapterInfo {
-                    start_ticks: c.start_position_ticks,
-                    name: c.name.clone(),
-                    image: c.image_path.clone(),
-                    image_date_modified: None,
-                })
-                .collect();
-            item.chapter_count = item.chapters.len() as i32;
+            set_chapters(item, chapters);
         }
 
-        // ScreenshotImageTags from trickplay batch map
-        if let Some(trickplay) = trickplay_map.get(&item.id.to_string()) {
-            item.screenshot_image_tags = vec![format!("{}-{}", item.id, trickplay.width)];
+        // Trickplay tile sets from batch map
+        if let Some(trickplay) = trickplay_map.remove(&item.id.to_string()) {
+            set_trickplay(item, trickplay);
         }
 
         // Etag from date_created
@@ -1365,10 +1395,6 @@ pub fn routes() -> Router<AppState> {
         .route("/Items/Latest", get(get_latest))
         .route("/Items/Resume", get(get_resume))
         .route("/Items/Filters", get(get_filters))
-        .route(
-            "/Items/{id}/Trickplay/Preview/{width}/{seekTicks}",
-            get(get_trickplay_preview),
-        )
         .route("/Users/{userId}/Items", get(get_user_items))
         .route("/Users/{userId}/Items/Latest", get(get_user_latest))
         .route("/Users/{userId}/Items/Resume", get(get_user_resume))
@@ -2272,33 +2298,6 @@ async fn get_user_resume(
         total_record_count: total,
         start_index: 0,
     }))
-}
-
-/// `GET /Items/{id}/Trickplay/Preview/{width}/{seekTicks}` — Returns a trickplay preview thumbnail.
-async fn get_trickplay_preview(
-    State(state): State<AppState>,
-    Path((id, width, seek_ticks)): Path<(Uuid, u32, i64)>,
-) -> Result<Response, ApiError> {
-    let result =
-        rustyfin_core::trickplay::get_trickplay_thumbnail(&state.db_ro, id, width, seek_ticks)
-            .await
-            .map_err(|e| ApiError::Internal(e.to_string()))?;
-
-    match result {
-        Some((file_path, content_type)) => {
-            let bytes = tokio::fs::read(&file_path)
-                .await
-                .map_err(|e| ApiError::NotFound(format!("Thumbnail not found: {}", e)))?;
-
-            Ok((
-                StatusCode::OK,
-                [(header::CONTENT_TYPE, content_type)],
-                bytes,
-            )
-                .into_response())
-        }
-        None => Err(ApiError::NotFound("Trickplay not available".to_string())),
-    }
 }
 
 /// DELETE /Items - Delete multiple items

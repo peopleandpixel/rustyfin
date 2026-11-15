@@ -238,14 +238,12 @@ struct FfprobeChapters {
     chapters: Vec<FfprobeChapter>,
 }
 
+/// One entry of ffprobe's `-show_chapters` output. ffprobe writes `id`, `start` and `end` as
+/// JSON numbers and the times as strings, so only the string fields are read; the times carry
+/// the same positions as `start` and `end` over `time_base`.
 #[derive(Debug, Deserialize)]
 struct FfprobeChapter {
-    #[allow(dead_code)]
-    id: Option<String>,
-    time_base: Option<String>,
-    start: Option<String>,
     start_time: Option<String>,
-    end: Option<String>,
     end_time: Option<String>,
     tags: Option<HashMap<String, String>>,
 }
@@ -376,7 +374,7 @@ pub async fn probe_file(path: &str) -> Result<ProbeResult, ProbeError> {
     let audio_tags = extract_audio_tags(&format.tags, &probe.streams);
 
     // Extract chapters
-    let chapters = extract_chapters(path).await;
+    let chapters = read_chapters(path).await;
 
     Ok(ProbeResult {
         source,
@@ -486,8 +484,8 @@ fn extract_album_art(streams: &[FfprobeStream]) -> (Option<Vec<u8>>, Option<Stri
     (None, None)
 }
 
-/// Extract chapter markers from a media file using ffprobe.
-async fn extract_chapters(path: &str) -> Vec<Chapter> {
+/// Reads the chapter markers of a media file with ffprobe; none when it can't.
+pub(crate) async fn read_chapters(path: &str) -> Vec<Chapter> {
     let output = Command::new("ffprobe")
         .args([
             "-v",
@@ -509,74 +507,69 @@ async fn extract_chapters(path: &str) -> Vec<Chapter> {
         _ => return Vec::new(),
     };
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let chapters: FfprobeChapters = match serde_json::from_str(&stdout) {
+    parse_chapters(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Parses ffprobe's `-show_chapters` JSON into chapters, like Jellyfin: positions are rounded to
+/// the millisecond, and a chapter without a title, or titled with a time ("00:05:00.000", as some
+/// rippers write), is named "Chapter N".
+fn parse_chapters(json: &str) -> Vec<Chapter> {
+    let chapters: FfprobeChapters = match serde_json::from_str(json) {
         Ok(c) => c,
-        Err(_) => return Vec::new(),
+        Err(e) => {
+            warn!("could not read ffprobe's chapters: {}", e);
+            return Vec::new();
+        }
+    };
+    let ticks = |t: &Option<String>| {
+        t.as_deref()
+            .and_then(|t| t.trim().parse::<f64>().ok())
+            .map(|s| (s * 1000.0).round() as i64 * 10_000)
+            .unwrap_or(0)
     };
 
-    let mut result = Vec::new();
-    for (i, ch) in chapters.chapters.iter().enumerate() {
-        // Parse start time from time_base and start, or from start_time directly
-        let start_seconds = ch
-            .start_time
-            .as_ref()
-            .and_then(|t| t.parse::<f64>().ok())
-            .or_else(|| {
-                ch.time_base.as_ref().and_then(|tb| {
-                    let (_, denom) = tb.split_once('/')?;
-                    let denom = denom.parse::<f64>().ok()?;
-                    ch.start
-                        .as_ref()
-                        .and_then(|s| s.parse::<f64>().ok())
-                        .map(|s| s / denom)
-                })
-            })
-            .unwrap_or(0.0);
+    chapters
+        .chapters
+        .iter()
+        .enumerate()
+        .map(|(i, ch)| {
+            let title = ch.tags.as_ref().and_then(|tags| {
+                tags.iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("title"))
+                    .map(|(_, v)| v.trim())
+            });
+            let name = match title {
+                Some(t) if !t.is_empty() && !looks_like_time(t) => t.to_string(),
+                _ => format!("Chapter {}", i + 1),
+            };
+            Chapter {
+                id: uuid::Uuid::new_v4().to_string(),
+                item_id: String::new(), // will be set when saving
+                chapter_number: (i + 1) as i32,
+                name,
+                start_position_ticks: ticks(&ch.start_time),
+                end_position_ticks: ticks(&ch.end_time),
+                image_path: None,
+                image_date_modified: None,
+            }
+        })
+        .collect()
+}
 
-        // Parse end time
-        let end_seconds = ch
-            .end_time
-            .as_ref()
-            .and_then(|t| t.parse::<f64>().ok())
-            .or_else(|| {
-                ch.time_base.as_ref().and_then(|tb| {
-                    let (_, denom) = tb.split_once('/')?;
-                    let denom = denom.parse::<f64>().ok()?;
-                    ch.end
-                        .as_ref()
-                        .and_then(|e| e.parse::<f64>().ok())
-                        .map(|e| e / denom)
-                })
-            })
-            .unwrap_or(0.0);
-
-        // Chapter name from tags
-        let name = ch
-            .tags
-            .as_ref()
-            .and_then(|tags| {
-                tags.get("title").or_else(|| {
-                    tags.iter()
-                        .find(|(k, _)| k.eq_ignore_ascii_case("title"))
-                        .map(|(_, v)| v)
-                })
-            })
-            .cloned()
-            .unwrap_or_else(|| format!("Chapter {}", i + 1));
-
-        result.push(Chapter {
-            id: uuid::Uuid::new_v4().to_string(),
-            item_id: String::new(), // will be set when saving
-            chapter_number: (i + 1) as i32,
-            name,
-            start_position_ticks: (start_seconds * 10_000_000.0) as i64,
-            end_position_ticks: (end_seconds * 10_000_000.0) as i64,
-            image_path: None,
-        });
-    }
-
-    result
+/// Whether a chapter title is a time span such as "00:05:00.000" or "12", the titles Jellyfin
+/// replaces because .NET's `TimeSpan.TryParse` accepts them.
+fn looks_like_time(title: &str) -> bool {
+    let body = title.strip_prefix('-').unwrap_or(title);
+    let mut parts = body.split(':');
+    let count = body.split(':').count();
+    count <= 4
+        && parts.all(|p| {
+            let (whole, frac) = p.split_once('.').unwrap_or((p, "0"));
+            !whole.is_empty()
+                && whole.bytes().all(|b| b.is_ascii_digit())
+                && frac.bytes().all(|b| b.is_ascii_digit())
+                && !frac.is_empty()
+        })
 }
 
 /// Simple base64 decoder (avoids adding a dependency).
@@ -996,7 +989,7 @@ async fn save_runtime_and_chapters(
     pool: &sqlx::SqlitePool,
     item_id: &uuid::Uuid,
     run_time_ticks: Option<i64>,
-    mut chapters: Vec<Chapter>,
+    chapters: Vec<Chapter>,
 ) {
     // Update the media item's runtime_ticks if we got them from probing
     if let Some(ticks) = run_time_ticks {
@@ -1007,7 +1000,15 @@ async fn save_runtime_and_chapters(
             .await;
     }
 
-    // Save chapters if any were found
+    save_chapters(pool, item_id, chapters).await;
+}
+
+/// Saves a probed file's chapters for an item, replacing its old ones; none found keeps them.
+pub(crate) async fn save_chapters(
+    pool: &sqlx::SqlitePool,
+    item_id: &uuid::Uuid,
+    mut chapters: Vec<Chapter>,
+) {
     if !chapters.is_empty() {
         let item_id_str = item_id.to_string();
         // Set the item_id on each chapter
@@ -1240,5 +1241,56 @@ mod tests {
                 (6, None, false),
             ]
         );
+    }
+
+    // Chapters
+
+    /// ffprobe 7's `-show_chapters` output: `id`, `start` and `end` are numbers.
+    const R2CHAPTERS_FFPROBE: &str = r#"{"chapters": [
+        {"id": 7566774747248968120, "time_base": "1/1000000000", "start": 0,
+         "start_time": "0.000000", "end": 433350000000, "end_time": "433.350000",
+         "tags": {"title": "Opening"}},
+        {"id": -8933400255973827885, "time_base": "1/1000000000", "start": 433350000000,
+         "start_time": "433.350400", "end": 774107000000, "end_time": "774.107000",
+         "tags": {"TITLE": "00:07:13.350"}},
+        {"id": 3, "time_base": "1/1000", "start": 774107, "start_time": "774.107000",
+         "end": 900000, "end_time": "900.000000"}
+    ]}"#;
+
+    #[test]
+    fn r2chapters_parses_numeric_ids_and_positions() {
+        let got = parse_chapters(R2CHAPTERS_FFPROBE);
+        let names: Vec<_> = got.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["Opening", "Chapter 2", "Chapter 3"]);
+        let starts: Vec<_> = got.iter().map(|c| c.start_position_ticks).collect();
+        // Rounded to the millisecond, like Jellyfin.
+        assert_eq!(starts, [0, 4_333_500_000, 7_741_070_000]);
+        assert_eq!(got[2].end_position_ticks, 9_000_000_000);
+        let numbers: Vec<_> = got.iter().map(|c| c.chapter_number).collect();
+        assert_eq!(numbers, [1, 2, 3]);
+    }
+
+    #[test]
+    fn r2chapters_no_chapters_or_bad_json_gives_none() {
+        assert!(parse_chapters(r#"{"chapters": []}"#).is_empty());
+        assert!(parse_chapters("not json").is_empty());
+    }
+
+    #[test]
+    fn r2chapters_time_titles_are_renamed() {
+        // .NET reads a bare number as days, so Jellyfin renames "1984" too.
+        for t in [
+            "00:05:00.000",
+            "5",
+            "1984",
+            "1:02",
+            "-00:00:01",
+            "1.02:03:04",
+        ] {
+            assert!(looks_like_time(t), "{t}");
+        }
+        for t in ["Chapter 01", "Part 1: Intro", "12:", "Act 2", ""] {
+            assert!(!looks_like_time(t), "{t}");
+        }
     }
 }

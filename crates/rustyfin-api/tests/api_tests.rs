@@ -13099,6 +13099,272 @@ async fn j5_user_data_on_a_real_item_still_works() {
     assert_eq!(actual, expected);
 }
 
+// R2 chapters: chapters, chapter images, trickplay and media segments, as Jellyfin 12.4.0 gives
+// them (MediaBrowser.Model ChapterInfo and TrickplayInfoDto, TrickplayController,
+// MediaSegmentsController).
+
+/// A library with one film, and an administrator.
+struct R2Chapters {
+    state: AppState,
+    app: axum::Router,
+    token: String,
+    film: uuid::Uuid,
+    _dir: G1cDataDir,
+}
+
+impl R2Chapters {
+    async fn new() -> Self {
+        use rustyfin_model::library::LibraryContentType;
+        let state = test_state().await;
+        let _dir = G1cDataDir(state.data_dir.to_path_buf());
+        let (token, _) = admin_session(&state).await;
+        let library = j5_library(&state, "R2 Films", LibraryContentType::Movies).await;
+        let film = j5_item(&state, library, None, "R2 Film", "Movie", "Drama", None).await;
+        R2Chapters {
+            app: app(state.clone()),
+            state,
+            token,
+            film,
+            _dir,
+        }
+    }
+
+    async fn get(&self, uri: &str) -> (StatusCode, serde_json::Value) {
+        send_authed(&self.app, "GET", uri, &self.token, None).await
+    }
+
+    /// The status, content type and body of a GET.
+    async fn get_raw(&self, uri: &str) -> (StatusCode, String, Vec<u8>) {
+        let req = Request::builder()
+            .uri(uri)
+            .header("Authorization", format!("Bearer {}", self.token))
+            .body(Body::empty())
+            .unwrap();
+        let resp = self.app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .map(|v| v.to_str().unwrap().to_string())
+            .unwrap_or_default();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, content_type, bytes.to_vec())
+    }
+
+    /// Writes a small JPEG to `path`.
+    fn write_jpeg(path: &std::path::Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        image::RgbImage::from_pixel(32, 18, image::Rgb([200, 30, 30]))
+            .save_with_format(path, image::ImageFormat::Jpeg)
+            .unwrap();
+    }
+
+    /// Stores two chapters for the film; the first has an image.
+    async fn save_chapters(&self) -> std::path::PathBuf {
+        let image = rustyfin_core::chapter_images::image_path(&self.state.data_dir, self.film, 0);
+        Self::write_jpeg(&image);
+        let chapter = |n: i32, name: &str, image: Option<&std::path::Path>| {
+            rustyfin_model::chapter::Chapter {
+                id: uuid::Uuid::new_v4().to_string(),
+                item_id: self.film.to_string(),
+                chapter_number: n,
+                name: name.to_string(),
+                start_position_ticks: i64::from(n - 1) * 4_333_500_000,
+                end_position_ticks: i64::from(n) * 4_333_500_000,
+                image_path: image.map(|p| p.to_string_lossy().into_owned()),
+                image_date_modified: image.map(|_| "2026-11-14T12:00:00Z".to_string()),
+            }
+        };
+        rustyfin_db::repo_chapter::save_chapters(
+            &self.state.db,
+            self.film,
+            vec![
+                chapter(1, "Opening", Some(&image)),
+                chapter(2, "Chapter 2", None),
+            ],
+        )
+        .await
+        .unwrap();
+        image
+    }
+}
+
+#[tokio::test]
+async fn r2chapters_item_chapters_are_jellyfins_chapter_infos() {
+    let t = R2Chapters::new().await;
+    t.save_chapters().await;
+
+    let (status, item) = t.get(&format!("/Items/{}", t.film)).await;
+    assert_eq!(status, StatusCode::OK, "{item}");
+    let chapters = item["Chapters"].as_array().unwrap();
+    assert_eq!(chapters.len(), 2, "{item}");
+    assert_eq!(item["ChapterCount"], 2);
+    assert_eq!(chapters[0]["StartPositionTicks"], 0);
+    assert_eq!(chapters[1]["StartPositionTicks"], 4_333_500_000_i64);
+    assert_eq!(chapters[0]["Name"], "Opening");
+    assert_eq!(chapters[0]["ImageDateModified"], "2026-11-14T12:00:00Z");
+    assert!(
+        chapters[0]["ImageTag"]
+            .as_str()
+            .is_some_and(|t| !t.is_empty())
+    );
+    // No image: Jellyfin's empty date and no tag. The file path is never sent.
+    assert_eq!(
+        chapters[1]["ImageDateModified"],
+        "0001-01-01T00:00:00.0000000Z"
+    );
+    assert!(chapters[1].get("ImageTag").is_none(), "{item}");
+    assert!(!item.to_string().contains("chapters/"), "{item}");
+
+    // Lists carry the same chapters.
+    let (status, list) = t
+        .get(&format!("/Items?Ids={}&Fields=Chapters", t.film))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    assert_eq!(list["Items"][0]["Chapters"], item["Chapters"], "{list}");
+}
+
+#[tokio::test]
+async fn r2chapters_chapter_image_is_served_by_index() {
+    let t = R2Chapters::new().await;
+    let image = t.save_chapters().await;
+
+    let (status, content_type, body) = t
+        .get_raw(&format!("/Items/{}/Images/Chapter/0", t.film))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(content_type.starts_with("image/jpeg"), "{content_type}");
+    assert_eq!(body, std::fs::read(&image).unwrap());
+
+    // A chapter without an image, a chapter past the end, and an item without chapters: 404.
+    for uri in [
+        format!("/Items/{}/Images/Chapter/1", t.film),
+        format!("/Items/{}/Images/Chapter/9", t.film),
+        format!("/Items/{}/Images/Chapter/0", uuid::Uuid::new_v4()),
+    ] {
+        let (status, _, _) = t.get_raw(&uri).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn r2chapters_trickplay_playlist_tiles_and_item_field() {
+    let t = R2Chapters::new().await;
+    let tiles = format!("/Videos/{}/Trickplay/320/tiles.m3u8", t.film);
+    let (status, _, _) = t.get_raw(&tiles).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "no tile set yet");
+    let (_, item) = t.get(&format!("/Items/{}", t.film)).await;
+    assert!(item.get("Trickplay").is_none(), "{item}");
+
+    let info = rustyfin_model::trickplay::TrickplayInfo {
+        width: 320,
+        height: 180,
+        tile_width: 10,
+        tile_height: 10,
+        thumbnail_count: 150,
+        interval: 10_000,
+        bandwidth: 4321,
+    };
+    rustyfin_db::repo_trickplay::save_trickplay(&t.state.db, t.film, &info)
+        .await
+        .unwrap();
+    for i in 0..2 {
+        R2Chapters::write_jpeg(&rustyfin_core::trickplay::tile_path(
+            &t.state.data_dir,
+            t.film,
+            &info,
+            i,
+        ));
+    }
+
+    let (_, item) = t.get(&format!("/Items/{}", t.film)).await;
+    let set = &item["Trickplay"][t.film.simple().to_string()]["320"];
+    assert_eq!(
+        *set,
+        serde_json::json!({
+            "Width": 320, "Height": 180, "TileWidth": 10, "TileHeight": 10,
+            "ThumbnailCount": 150, "Interval": 10000, "Bandwidth": 4321
+        }),
+        "{item}"
+    );
+
+    let (status, content_type, body) = t.get_raw(&tiles).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(content_type, "application/x-mpegURL");
+    let playlist = String::from_utf8(body).unwrap();
+    assert!(playlist.contains("#EXT-X-IMAGES-ONLY"), "{playlist}");
+    assert!(
+        playlist.contains(&format!("\n1.jpg?MediaSourceId={}\n", t.film.simple())),
+        "{playlist}"
+    );
+    // A token sent in a header is never written into the playlist.
+    assert!(!playlist.contains(&t.token), "{playlist}");
+
+    let (status, content_type, _) = t
+        .get_raw(&format!("/Videos/{}/Trickplay/320/1.jpg", t.film))
+        .await;
+    assert_eq!(
+        (status, content_type.as_str()),
+        (StatusCode::OK, "image/jpeg")
+    );
+    for uri in [
+        format!("/Videos/{}/Trickplay/320/2.jpg", t.film),
+        format!("/Videos/{}/Trickplay/320/x.jpg", t.film),
+        format!("/Videos/{}/Trickplay/640/tiles.m3u8", t.film),
+    ] {
+        let (status, _, _) = t.get_raw(&uri).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn r2chapters_media_segments_are_jellyfins_dtos() {
+    let t = R2Chapters::new().await;
+    let (status, _) = t
+        .get(&format!("/MediaSegments/{}", uuid::Uuid::new_v4()))
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "unknown item");
+
+    let uri = format!("/MediaSegments/{}", t.film);
+    let (status, body) = t.get(&uri).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body,
+        serde_json::json!({ "Items": [], "TotalRecordCount": 0, "StartIndex": 0 })
+    );
+
+    for (kind, start, end) in [("Credits", 50_000, 60_000), ("Intro", 10_000, 20_000)] {
+        rustyfin_db::repo_media_segment::save_media_segment(&t.state.db, t.film, kind, start, end)
+            .await
+            .unwrap();
+    }
+    let (_, body) = t.get(&uri).await;
+    let items = body["Items"].as_array().unwrap();
+    assert_eq!(body["TotalRecordCount"], 2);
+    let types: Vec<_> = items.iter().map(|s| s["Type"].as_str().unwrap()).collect();
+    assert_eq!(types, ["Intro", "Outro"]);
+    let mut keys: Vec<_> = items[0].as_object().unwrap().keys().cloned().collect();
+    keys.sort();
+    assert_eq!(keys, ["EndTicks", "Id", "ItemId", "StartTicks", "Type"]);
+    assert_eq!(items[0]["StartTicks"], 10_000);
+    assert_eq!(items[0]["EndTicks"], 20_000);
+    assert_eq!(items[0]["ItemId"], t.film.to_string());
+
+    let (_, body) = t.get(&format!("{uri}?includeSegmentTypes=Outro")).await;
+    assert_eq!(body["TotalRecordCount"], 1);
+    assert_eq!(body["Items"][0]["Type"], "Outro");
+}
+
+#[tokio::test]
+async fn r2chapters_image_tasks_are_listed_with_jellyfins_keys() {
+    let t = R2Chapters::new().await;
+    for id in ["RefreshChapterImages", "RefreshTrickplayImages"] {
+        let (status, task) = t.get(&format!("/ScheduledTasks/{id}")).await;
+        assert_eq!(status, StatusCode::OK, "{id}");
+        assert_eq!(task["Category"], "Library", "{task}");
+    }
+}
+
 // B40: playback reports on a non-media id
 
 /// A library with one film (genre "Drama") whose source has two audio and two subtitle streams,

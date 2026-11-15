@@ -20,6 +20,10 @@ pub const TASK_METADATA_REFRESH: &str = "MetadataRefresh";
 pub const TASK_TRANSCODE_CLEANUP: &str = "TranscodeCacheCleanup";
 pub const TASK_INTRO_DETECTION: &str = "IntroDetection";
 pub const TASK_DB_VACUUM: &str = "DatabaseVacuum";
+/// Jellyfin's key for its chapter image task.
+pub const TASK_CHAPTER_IMAGES: &str = "RefreshChapterImages";
+/// Jellyfin's key for its trickplay task.
+pub const TASK_TRICKPLAY: &str = "RefreshTrickplayImages";
 
 /// Default interval: 12 hours in .NET ticks (1 tick = 100ns)
 const TICKS_12H: u64 = 12 * 60 * 60 * 10_000_000;
@@ -198,6 +202,41 @@ impl TaskScheduler {
             },
         );
 
+        // Chapter images and trickplay tiles: nightly, for the libraries that turn them on
+        for (id, name, description) in [
+            (
+                TASK_CHAPTER_IMAGES,
+                "Extract Chapter Images",
+                "Creates thumbnails for videos that have chapters, in the libraries that turn chapter images on.",
+            ),
+            (
+                TASK_TRICKPLAY,
+                "Generate Trickplay Images",
+                "Creates trickplay images for videos, in the libraries that turn trickplay on.",
+            ),
+        ] {
+            tasks.insert(
+                id.to_string(),
+                TaskEntry {
+                    info: ScheduledTaskInfo {
+                        id: id.to_string(),
+                        name: name.to_string(),
+                        description: description.to_string(),
+                        category: "Library".to_string(),
+                        state: TaskState::Idle,
+                        current_progress_percentage: None,
+                        triggers: vec![TaskTriggerInfo {
+                            trigger_type: "IntervalTrigger".to_string(),
+                            interval_ticks: Some(TICKS_24H),
+                            time_of_day_ticks: None,
+                            max_runtime_ticks: None,
+                        }],
+                        last_execution_result: None,
+                    },
+                },
+            );
+        }
+
         let changes = ChangeQueue::new(db.clone());
         let watcher = LibraryWatcher::new(db.clone(), changes.clone(), (*data_dir).clone());
         Self {
@@ -284,6 +323,11 @@ impl TaskScheduler {
                 TASK_DB_VACUUM => {
                     let sched = self.clone();
                     tokio::spawn(async move { sched.run_db_vacuum().await });
+                }
+                TASK_CHAPTER_IMAGES | TASK_TRICKPLAY => {
+                    let sched = self.clone();
+                    let id = id.to_string();
+                    tokio::spawn(async move { sched.run_video_images(&id).await });
                 }
                 _ => {}
             }
@@ -427,6 +471,96 @@ impl TaskScheduler {
         self.set_task_result(TASK_LIBRARY_SCAN, result).await;
         self.set_task_state(TASK_LIBRARY_SCAN, TaskState::Idle)
             .await;
+    }
+
+    /// Sets task `id` running, unless it is already. Returns whether it was set.
+    async fn try_begin(&self, id: &str) -> bool {
+        let mut tasks = self.tasks.write().await;
+        match tasks.get_mut(id) {
+            Some(entry) if entry.info.state != TaskState::Running => {
+                entry.info.state = TaskState::Running;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The ids of the libraries whose options pass `wanted`.
+    async fn libraries_where(
+        &self,
+        wanted: impl Fn(&rustyfin_model::library::LibraryOptions) -> bool,
+    ) -> Result<Vec<String>, String> {
+        let libraries = rustyfin_db::repo_library::get_all_libraries(&self.db)
+            .await
+            .map_err(|e| format!("could not list libraries: {e}"))?;
+        let mut ids = Vec::new();
+        for library in libraries {
+            let options = rustyfin_db::repo_library::get_library_options(&self.db, library.id)
+                .await
+                .unwrap_or_default();
+            if wanted(&options) {
+                ids.push(library.id.to_string());
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Runs the chapter image task or the trickplay task once, over the libraries that turn it
+    /// on. Does nothing when that task is running already.
+    async fn run_video_images(&self, id: &str) {
+        if !self.try_begin(id).await {
+            return;
+        }
+        let start = Utc::now();
+        let data_dir = self.data_dir.as_path();
+        let result = if id == TASK_TRICKPLAY {
+            match self.libraries_where(|o| o.enable_trickplay).await {
+                Ok(libs) => crate::trickplay::generate_for_libraries(&self.db, data_dir, &libs)
+                    .await
+                    .map(|n| format!("Made the trickplay images of {n} videos")),
+                Err(e) => Err(e),
+            }
+        } else {
+            match self.libraries_where(|o| o.enable_chapter_extraction).await {
+                Ok(libs) => crate::chapter_images::extract_for_libraries(&self.db, data_dir, &libs)
+                    .await
+                    .map(|n| format!("Made {n} chapter images")),
+                Err(e) => Err(e),
+            }
+        };
+        let (status, message) = match result {
+            Ok(message) => (TaskCompletionStatus::Completed, message),
+            Err(e) => {
+                tracing::warn!(task = id, error = %e, "task failed");
+                (TaskCompletionStatus::Failed, e)
+            }
+        };
+        let end = Utc::now();
+        self.set_task_result(
+            id,
+            TaskResult {
+                status,
+                error_message: Some(message),
+                start_time_utc: start.to_rfc3339(),
+                end_time_utc: end.to_rfc3339(),
+            },
+        )
+        .await;
+        self.set_task_state(id, TaskState::Idle).await;
+    }
+
+    /// After a scan of library `library_id` ends, starts the chapter image and trickplay tasks
+    /// that the library asks to run during scans.
+    async fn after_scan(&self, library_id: uuid::Uuid) {
+        let options = rustyfin_db::repo_library::get_library_options(&self.db, library_id)
+            .await
+            .unwrap_or_default();
+        if options.enable_chapter_extraction && options.extract_chapter_images_during_library_scan {
+            self.start_task(TASK_CHAPTER_IMAGES).await;
+        }
+        if options.enable_trickplay && options.extract_trickplay_images_during_library_scan {
+            self.start_task(TASK_TRICKPLAY).await;
+        }
     }
 
     /// Run intro/outro detection for all episodes
@@ -698,6 +832,55 @@ impl TaskScheduler {
                     _ = tokio::time::sleep(interval) => {}
                     _ = rx.wait_for(|v| *v) => break,
                 }
+            }
+        });
+
+        // Chapter image and trickplay loops: they find work only in libraries that turn them on
+        for (id, delay) in [(TASK_CHAPTER_IMAGES, 900), (TASK_TRICKPLAY, 1200)] {
+            let sched = self.clone();
+            let mut rx = shutdown_rx.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                loop {
+                    sched.run_video_images(id).await;
+                    let interval = sched
+                        .get_interval_for_task(id)
+                        .await
+                        .unwrap_or(std::time::Duration::from_secs(24 * 3600));
+                    tokio::select! {
+                        _ = tokio::time::sleep(interval) => {}
+                        _ = rx.wait_for(|v| *v) => break,
+                    }
+                }
+            });
+        }
+
+        // After each library scan, the image tasks the library asks to run during scans
+        let sched = self.clone();
+        let mut rx = shutdown_rx.clone();
+        let mut updates = self.scans.subscribe();
+        tokio::spawn(async move {
+            loop {
+                let update = tokio::select! {
+                    update = updates.recv() => update,
+                    _ = rx.wait_for(|v| *v) => break,
+                };
+                match update {
+                    Ok(u) if u.status == crate::scan_progress::ScanStatus::Idle => {
+                        sched.after_scan(u.library_id).await;
+                    }
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+
+        // Once, a little after startup: the chapters of videos probed before they were read
+        let db = self.db.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(90)).await;
+            if let Err(e) = crate::chapter_images::reread_chapters(&db).await {
+                tracing::warn!(error = %e, "could not re-read chapters");
             }
         });
 

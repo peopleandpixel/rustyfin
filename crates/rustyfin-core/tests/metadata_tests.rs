@@ -35,8 +35,8 @@ const ITEM_ROWS: [(&str, &str); 8] = [
         "SELECT COUNT(*) FROM chapters WHERE item_id = ?1",
     ),
     (
-        "trickplay",
-        "SELECT COUNT(*) FROM trickplay WHERE item_id = ?1",
+        "trickplay_infos",
+        "SELECT COUNT(*) FROM trickplay_infos WHERE item_id = ?1",
     ),
     (
         "playlist_items",
@@ -181,10 +181,10 @@ async fn add_item_rows(pool: &SqlitePool, item: Uuid) {
     .await;
     exec(
         pool,
-        "INSERT INTO trickplay
-         (id, item_id, width, height, interval_ticks, thumbnail_count, directory_path)
-         VALUES (?1, ?2, 320, 180, 100000000, 10, '/trickplay')",
-        &[&new_id(), &item],
+        "INSERT INTO trickplay_infos
+         (item_id, width, height, tile_width, tile_height, thumbnail_count, interval_ms, bandwidth)
+         VALUES (?1, 320, 180, 10, 10, 10, 10000, 1000)",
+        &[&item],
     )
     .await;
     exec(

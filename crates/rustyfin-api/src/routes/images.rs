@@ -84,8 +84,6 @@ async fn serve_image(
     max_height: Option<u32>,
     tagged: bool,
 ) -> Result<Response, ApiError> {
-    let image_type = ImageType::from_str(image_type_str)
-        .ok_or_else(|| ApiError::BadRequest(format!("unknown image type: {}", image_type_str)))?;
     // A tag names one version of the picture, so a tagged URL can be kept long. An untagged URL
     // can change under the same address when the picture is replaced, so it is kept only briefly.
     let cache_control = if tagged {
@@ -94,13 +92,21 @@ async fn serve_image(
         "public, max-age=300"
     };
 
-    let found = rustyfin_db::repo_image::get_image(&state.db_ro, id, &image_type, index).await?;
-    // Imported people keep their images in `person_images`; try those before giving up.
-    let mut img = match found {
-        Some(img) => img,
-        None => rustyfin_db::repo_image::get_person_image(&state.db_ro, id, &image_type, index)
-            .await?
-            .ok_or_else(|| ApiError::NotFound("image not found".into()))?,
+    let mut img = if image_type_str.eq_ignore_ascii_case("chapter") {
+        chapter_image(state, id, index).await?
+    } else {
+        let image_type = ImageType::from_str(image_type_str).ok_or_else(|| {
+            ApiError::BadRequest(format!("unknown image type: {}", image_type_str))
+        })?;
+        let found =
+            rustyfin_db::repo_image::get_image(&state.db_ro, id, &image_type, index).await?;
+        // Imported people keep their images in `person_images`; try those before giving up.
+        match found {
+            Some(img) => img,
+            None => rustyfin_db::repo_image::get_person_image(&state.db_ro, id, &image_type, index)
+                .await?
+                .ok_or_else(|| ApiError::NotFound("image not found".into()))?,
+        }
     };
 
     // A remote image is kept in the data dir on first use, so a restart reads it from disk rather
@@ -217,6 +223,35 @@ async fn serve_image(
         .header(header::CACHE_CONTROL, cache_control)
         .body(Body::from(bytes))
         .unwrap())
+}
+
+/// The image of chapter `index` (from 0, in start order) of item `id`, as an image row. Chapter
+/// images live in the chapters table, not with the item's other images; the row's type is never
+/// read. 404 when the chapter has no image.
+async fn chapter_image(state: &AppState, id: Uuid, index: i32) -> Result<ItemImage, ApiError> {
+    let chapters = rustyfin_db::repo_chapter::get_chapters(&state.db_ro, id).await?;
+    let chapter = usize::try_from(index)
+        .ok()
+        .and_then(|i| chapters.get(i))
+        .ok_or_else(|| ApiError::NotFound("chapter not found".into()))?;
+    let path = chapter
+        .image_path
+        .clone()
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| ApiError::NotFound("chapter image not found".into()))?;
+    let (stamp, width, height) =
+        rustyfin_core::local_images::local_image_version(std::path::Path::new(&path));
+    Ok(ItemImage {
+        item_id: id,
+        image_type: ImageType::Screenshot,
+        image_index: index,
+        path,
+        provider: "chapter".to_string(),
+        width,
+        height,
+        blurhash: None,
+        stamp,
+    })
 }
 
 async fn get_item_image(

@@ -45,12 +45,18 @@ pub struct LibraryOptions {
     /// Skip subfolders during scanning
     #[serde(default)]
     pub skip_subfolders: bool,
-    /// Enable automatic chapter extraction
-    #[serde(default)]
+    /// Make chapter images (Jellyfin's EnableChapterImageExtraction), in the nightly task
+    #[serde(default, alias = "EnableChapterImageExtraction")]
     pub enable_chapter_extraction: bool,
-    /// Enable trickplay generation
+    /// Also make chapter images after each scan of the library
     #[serde(default)]
+    pub extract_chapter_images_during_library_scan: bool,
+    /// Make trickplay tiles (Jellyfin's EnableTrickplayImageExtraction), in the nightly task
+    #[serde(default, alias = "EnableTrickplayImageExtraction")]
     pub enable_trickplay: bool,
+    /// Also make trickplay tiles after each scan of the library
+    #[serde(default)]
+    pub extract_trickplay_images_during_library_scan: bool,
     /// Enable intro detection
     #[serde(default)]
     pub enable_intro_detection: bool,
@@ -66,7 +72,9 @@ impl Default for LibraryOptions {
             image_provider: String::new(),
             skip_subfolders: false,
             enable_chapter_extraction: false,
+            extract_chapter_images_during_library_scan: false,
             enable_trickplay: false,
+            extract_trickplay_images_during_library_scan: false,
             enable_intro_detection: false,
             enable_realtime_monitor: true,
         }
