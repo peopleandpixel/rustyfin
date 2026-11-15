@@ -113,48 +113,270 @@ async fn video_file(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Item {id} not found")))?;
     let Some(requested) = requested_source_id(params) else {
-        validate_path_against_library(&state.db_ro, &item.library_id, &item.path).await?;
+        validate_path_against_library(state, &item.library_id, &item.path).await?;
         return Ok(item.path);
     };
     let sources = rustyfin_db::repo_media_source::get_media_sources(&state.db_ro, &id).await?;
     match select_version(id, &sources, Some(requested))? {
         Version::Primary => {
-            validate_path_against_library(&state.db_ro, &item.library_id, &item.path).await?;
+            validate_path_against_library(state, &item.library_id, &item.path).await?;
             Ok(item.path)
         }
         Version::Source(index) => {
-            validate_path_against_library(&state.db_ro, &item.library_id, &sources[index].path)
-                .await?;
+            validate_path_against_library(state, &item.library_id, &sources[index].path).await?;
             Ok(sources[index].path.clone())
         }
     }
 }
 
-/// Validates that `file_path` is inside one of the library's configured paths.
-/// This prevents path traversal if the database is compromised.
+/// An absolute path with `.` components dropped, so symlinks are kept. `None` for a relative
+/// path, or for one with a `..` component: the kernel resolves `..` after following a link, so
+/// `lib/link/sub/../../x` can leave the library although it looks like it stays inside.
+fn lexical_normalize(path: &FilePath) -> Option<std::path::PathBuf> {
+    use std::path::Component;
+    if !path.is_absolute() {
+        return None;
+    }
+    let mut out = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => return None,
+            other => out.push(other),
+        }
+    }
+    Some(out)
+}
+
+/// True when `file_path` lies under `lib_path`, either as written (a file reached through a
+/// symlink inside the library, which Jellyfin also serves) or after resolving symlinks on both
+/// sides. A path with a `..` component never passes as written.
+fn path_is_under_library(file_path: &FilePath, canonical_file: &FilePath, lib_path: &str) -> bool {
+    let lib = FilePath::new(lib_path);
+    if let (Some(file_lex), Some(lib_lex)) = (lexical_normalize(file_path), lexical_normalize(lib))
+        && file_lex.starts_with(&lib_lex)
+    {
+        return true;
+    }
+    lib.canonicalize()
+        .is_ok_and(|canonical_lib| canonical_file.starts_with(canonical_lib))
+}
+
+/// Whether a stored path has a `..` component. Such a path is refused before anything is
+/// resolved: the scanner never stores one, and `..` after a link can leave the library.
+fn has_parent_dir(path: &FilePath) -> bool {
+    path.components()
+        .any(|c| c == std::path::Component::ParentDir)
+}
+
+/// The folders in the data dir that Rustyfin writes: `cache` (subtitles, images; server main.rs),
+/// `logs`, `transcodes`, `trickplay` (main.rs), `plugins` (PluginManager), `metadata` and
+/// `images` (routes/images.rs, the Jellyfin import), `backups` (routes/backup.rs) and
+/// `jellyfin-import-copy` (jellyfin_import/source.rs). Anything else there, such as a media
+/// folder, may be streamed.
+const OWNED_DATA_DIRS: [&str; 9] = [
+    "cache",
+    "logs",
+    "transcodes",
+    "trickplay",
+    "plugins",
+    "metadata",
+    "images",
+    "backups",
+    "jellyfin-import-copy",
+];
+
+/// The files at the top of the data dir that Rustyfin writes: `config.json` and its temp file
+/// (config_file.rs, written then renamed), `server_id` and its temp file (main.rs), the wizard's
+/// import queue and its temp file (wizard_import.rs), and the default database `rustyfin.db`
+/// (main.rs). Password reset PIN files (`passwordreset-*.json`, rustyfin-auth) are matched by
+/// their pattern.
+const OWNED_DATA_FILES: [&str; 7] = [
+    "config.json",
+    "config.json.tmp",
+    "server_id",
+    "server_id.tmp",
+    "jellyfin-import-queue.json",
+    "jellyfin-import-queue.json.tmp",
+    "rustyfin.db",
+];
+
+/// The files SQLite keeps beside a database file `x`: `x-wal`, `x-shm` and `x-journal`.
+const DATABASE_SIBLINGS: [&str; 3] = ["-wal", "-shm", "-journal"];
+
+/// The paths Rustyfin owns, which a library link must not reach:
+/// - in the data dir, any file under one of its own folders (`OWNED_DATA_DIRS`), and its own
+///   top-level files (`OWNED_DATA_FILES`, PIN files, and their SQLite siblings), with names
+///   compared without ASCII case;
+/// - each owned folder resolved, so one linked out of the data dir (`transcodes -> /fast/...`)
+///   is still owned;
+/// - by full path: the database wherever `RUSTYFIN_DB` puts it, the TLS key and certificate
+///   (`RUSTYFIN_TLS_KEY`, `RUSTYFIN_TLS_CERT`), and each data-dir file above, each with its
+///   SQLite siblings (`DATABASE_SIBLINGS`).
+///
+/// Every path is compared resolved (a certbot `live/privkey.pem` link counts as the
+/// `archive/privkey1.pem` it points to) and as configured, made absolute, so an owned path is
+/// refused even when it can't be resolved.
+struct OwnedPaths {
+    data_dir: std::path::PathBuf,
+    files: Vec<std::path::PathBuf>,
+}
+
+impl OwnedPaths {
+    /// The two forms of `path`: resolved, when that works, and as configured, made absolute.
+    fn forms(path: &FilePath) -> Vec<std::path::PathBuf> {
+        path.canonicalize()
+            .into_iter()
+            .chain(std::path::absolute(path))
+            .collect()
+    }
+
+    /// `path` with `suffix` added to its file name.
+    fn with_suffix(path: &FilePath, suffix: &str) -> std::path::PathBuf {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(suffix);
+        name.into()
+    }
+
+    /// Whether `name` is `file` or one of its SQLite siblings, without ASCII case.
+    fn is_file_or_sibling(name: &str, file: &str) -> bool {
+        let (name, file) = (name.to_ascii_lowercase(), file.to_ascii_lowercase());
+        name == file
+            || name
+                .strip_prefix(&file)
+                .is_some_and(|rest| DATABASE_SIBLINGS.contains(&rest))
+    }
+
+    /// Whether `name`, a top-level name in the data dir, is a file Rustyfin owns there.
+    fn is_owned_data_file(name: &str) -> bool {
+        let lower = name.to_ascii_lowercase();
+        OWNED_DATA_FILES
+            .iter()
+            .any(|file| Self::is_file_or_sibling(name, file))
+            || lower.starts_with("passwordreset-") && lower.ends_with(".json")
+    }
+
+    /// Whether the resolved `target` lies in the data dir form `data` as an owned file.
+    fn owned_by_name(data: &FilePath, target: &FilePath) -> bool {
+        let Ok(rest) = target.strip_prefix(data) else {
+            return false;
+        };
+        let mut parts = rest.components().map(|c| c.as_os_str().to_string_lossy());
+        let Some(first) = parts.next() else {
+            return false;
+        };
+        if parts.next().is_some() {
+            OWNED_DATA_DIRS
+                .iter()
+                .any(|dir| dir.eq_ignore_ascii_case(&first))
+        } else {
+            Self::is_owned_data_file(&first)
+        }
+    }
+
+    /// Whether the resolved `target` is one of these owned paths.
+    fn owns(&self, target: &FilePath) -> bool {
+        let data_forms = Self::forms(&self.data_dir);
+        if data_forms
+            .iter()
+            .any(|data| Self::owned_by_name(data, target))
+        {
+            return true;
+        }
+        // Owned folders that are links out of the data dir
+        let linked_dir = data_forms.iter().any(|data| {
+            OWNED_DATA_DIRS.iter().any(|dir| {
+                data.join(dir)
+                    .canonicalize()
+                    .is_ok_and(|real| target != real && target.starts_with(&real))
+            })
+        });
+        if linked_dir {
+            return true;
+        }
+        // Owned files by full path, each as configured and resolved, with its SQLite siblings
+        let data_files = OWNED_DATA_FILES.iter().map(|name| self.data_dir.join(name));
+        self.files.iter().cloned().chain(data_files).any(|file| {
+            let mut candidates = Self::forms(&file);
+            for suffix in DATABASE_SIBLINGS {
+                candidates.extend(Self::forms(&Self::with_suffix(&file, suffix)));
+                // SQLite keeps the siblings beside the file a link resolves to
+                if let Ok(real) = file.canonicalize() {
+                    candidates.push(Self::with_suffix(&real, suffix));
+                }
+            }
+            candidates.iter().any(|candidate| candidate == target)
+        })
+    }
+}
+
+/// Whether `file_path` may be streamed from a library with `lib_paths`. It is refused when:
+/// - it has a `..` component;
+/// - resolving its links fails;
+/// - it lies under none of `lib_paths`, as written or after resolving links (see
+///   `path_is_under_library`);
+/// - its resolved target is a path Rustyfin owns (see `OwnedPaths`). Other files inside the
+///   data dir, such as media kept at `<data>/media`, may be streamed.
+fn path_allowed(file_path: &str, lib_paths: &[String], owned: &OwnedPaths) -> bool {
+    let raw = FilePath::new(file_path);
+    if has_parent_dir(raw) {
+        return false;
+    }
+    let Ok(canonical) = raw.canonicalize() else {
+        return false;
+    };
+    if !lib_paths
+        .iter()
+        .any(|lib_path| path_is_under_library(raw, &canonical, lib_path))
+    {
+        return false;
+    }
+    !owned.owns(&canonical)
+}
+
+/// The file of the server's main database, as SQLite reports it; None for an in-memory one.
+async fn database_file(pool: &sqlx::SqlitePool) -> Option<std::path::PathBuf> {
+    sqlx::query_scalar::<_, String>("SELECT file FROM pragma_database_list WHERE name = 'main'")
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .filter(|file| !file.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+/// Validates that `file_path` is inside one of the library's configured paths and not a link
+/// into the server's own data (see `path_allowed`). This prevents path traversal if the
+/// database is compromised.
 async fn validate_path_against_library(
-    pool: &sqlx::SqlitePool,
+    state: &AppState,
     library_id: &uuid::Uuid,
     file_path: &str,
 ) -> Result<(), ApiError> {
-    let canonical = std::path::Path::new(file_path)
-        .canonicalize()
-        .ok()
-        .or_else(|| Some(std::path::Path::new(file_path).to_path_buf()));
-
-    let Some(canonical) = canonical else {
-        tracing::debug!("could not resolve path '{}' for validation", file_path);
-        return Ok(());
-    };
-
-    if let Ok(Some(library)) = rustyfin_db::repo_library::get_library_by_id(pool, *library_id).await
+    if has_parent_dir(FilePath::new(file_path)) {
+        tracing::warn!("streaming path '{}' has a '..' component", file_path);
+        return Err(ApiError::NotFound(
+            "File is outside configured library paths".to_string(),
+        ));
+    }
+    if let Ok(Some(library)) =
+        rustyfin_db::repo_library::get_library_by_id(&state.db_ro, *library_id).await
     {
-        for lib_path in &library.paths {
-            if let Ok(canonical_lib) = std::path::Path::new(lib_path).canonicalize()
-                && canonical.starts_with(&canonical_lib)
-            {
-                return Ok(());
-            }
+        let owned = OwnedPaths {
+            data_dir: state.data_dir.to_path_buf(),
+            files: database_file(&state.db_ro)
+                .await
+                .into_iter()
+                .chain(
+                    ["RUSTYFIN_TLS_KEY", "RUSTYFIN_TLS_CERT"]
+                        .into_iter()
+                        .filter_map(std::env::var_os)
+                        .map(std::path::PathBuf::from),
+                )
+                .collect(),
+        };
+        if path_allowed(file_path, &library.paths, &owned) {
+            return Ok(());
         }
         // Path not under any library path — log and reject
         tracing::warn!(
@@ -212,7 +434,7 @@ async fn head_stream(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Item {id} not found")))?;
 
-    validate_path_against_library(&state.db_ro, &item.library_id, &item.path).await?;
+    validate_path_against_library(&state, &item.library_id, &item.path).await?;
     head_file(&item.path).await
 }
 
@@ -246,7 +468,7 @@ async fn stream_file(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Item {id} not found")))?;
 
-    validate_path_against_library(&state.db_ro, &item.library_id, &item.path).await?;
+    validate_path_against_library(&state, &item.library_id, &item.path).await?;
     serve_file(item.path, &headers).await
 }
 
@@ -432,7 +654,7 @@ fn mime_from_path(path: &str) -> String {
         "mov" => "video/quicktime",
         "wmv" => "video/x-ms-wmv",
         "flv" => "video/x-flv",
-        "ts" => "video/mp2t",
+        "ts" | "m2ts" | "mts" | "m2t" => "video/mp2t",
         "mpg" | "mpeg" => "video/mpeg",
         "3gp" => "video/3gpp",
         // Audio
@@ -1508,6 +1730,405 @@ mod tests {
     #[test]
     fn test_mime_ts() {
         assert_eq!(mime_from_path("/path/to/video.ts"), "video/mp2t");
+    }
+
+    /// A folder under the temp dir, removed when dropped.
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new() -> TempDir {
+            let dir =
+                std::env::temp_dir().join(format!("rustyfin-r1play-{}", Uuid::new_v4().simple()));
+            std::fs::create_dir_all(&dir).unwrap();
+            TempDir(dir)
+        }
+
+        fn path(&self) -> &FilePath {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn r1play_mime_m2ts_and_mts() {
+        assert_eq!(mime_from_path("/path/to/video.m2ts"), "video/mp2t");
+        assert_eq!(mime_from_path("/path/to/VIDEO.MTS"), "video/mp2t");
+        assert_eq!(mime_from_path("/path/to/video.m2t"), "video/mp2t");
+    }
+
+    #[test]
+    fn r1play_symlinked_file_inside_library_is_allowed() {
+        let dir = TempDir::new();
+        let lib = dir.path().join("lib");
+        let outside = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&lib).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("movie.mkv"), b"x").unwrap();
+        std::os::unix::fs::symlink(&outside, lib.join("Movie")).unwrap();
+        let file = lib.join("Movie/movie.mkv");
+        let canonical = file.canonicalize().unwrap();
+        assert!(path_is_under_library(
+            &file,
+            &canonical,
+            lib.to_str().unwrap()
+        ));
+    }
+
+    #[test]
+    fn r1play_dotdot_escape_is_rejected() {
+        let dir = TempDir::new();
+        let lib = dir.path().join("lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        std::fs::write(dir.path().join("secret.mkv"), b"x").unwrap();
+        let file = lib.join("../secret.mkv");
+        let canonical = file.canonicalize().unwrap();
+        assert!(!path_is_under_library(
+            &file,
+            &canonical,
+            lib.to_str().unwrap()
+        ));
+        assert_eq!(lexical_normalize(FilePath::new("/../x")), None);
+        assert_eq!(lexical_normalize(FilePath::new("rel/x")), None);
+    }
+
+    #[test]
+    fn r1play_dotdot_after_a_link_is_rejected() {
+        // lib/link -> /dir/srv/a; lib/link/sub/../../x reads /dir/srv/x, outside the library,
+        // although dropping the `..` pairs as written gives lib/x
+        let dir = TempDir::new();
+        let lib = dir.path().join("lib");
+        let target = dir.path().join("srv/a");
+        std::fs::create_dir_all(&lib).unwrap();
+        std::fs::create_dir_all(target.join("sub")).unwrap();
+        std::fs::write(dir.path().join("srv/x"), b"x").unwrap();
+        std::os::unix::fs::symlink(&target, lib.join("link")).unwrap();
+        let file = lib.join("link/sub/../../x");
+        let canonical = file.canonicalize().unwrap();
+        assert_eq!(canonical, dir.path().join("srv/x").canonicalize().unwrap());
+        assert!(!path_is_under_library(
+            &file,
+            &canonical,
+            lib.to_str().unwrap()
+        ));
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let libs = [lib.to_str().unwrap().to_string()];
+        assert!(!path_allowed(
+            file.to_str().unwrap(),
+            &libs,
+            &owned(&data, &[])
+        ));
+        assert!(has_parent_dir(&file));
+    }
+
+    #[test]
+    fn r1play_dotdot_and_unresolvable_paths_are_refused() {
+        let dir = TempDir::new();
+        let lib = dir.path().join("lib");
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(lib.join("Movie")).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(lib.join("movie.mkv"), b"x").unwrap();
+        let libs = [lib.to_str().unwrap().to_string()];
+        let path = |p: &str| lib.join(p).to_str().unwrap().to_string();
+        assert!(path_allowed(&path("movie.mkv"), &libs, &owned(&data, &[])));
+        // `..` that stays inside the library is refused too: it is never resolved
+        assert!(!path_allowed(
+            &path("Movie/../movie.mkv"),
+            &libs,
+            &owned(&data, &[]),
+        ));
+        // A path whose links can't be resolved is refused, not checked as written
+        assert!(!path_allowed(
+            &path("missing.mkv"),
+            &libs,
+            &owned(&data, &[])
+        ));
+        std::os::unix::fs::symlink(lib.join("loop.mkv"), lib.join("loop.mkv")).unwrap();
+        assert!(!path_allowed(&path("loop.mkv"), &libs, &owned(&data, &[])));
+    }
+
+    /// The owned paths of a server with `data` and the separate owned files `files`.
+    fn owned(data: &FilePath, files: &[&FilePath]) -> OwnedPaths {
+        OwnedPaths {
+            data_dir: data.to_path_buf(),
+            files: files.iter().map(|f| f.to_path_buf()).collect(),
+        }
+    }
+
+    #[test]
+    fn r1play_link_into_the_data_dir_is_refused() {
+        let dir = TempDir::new();
+        let lib = dir.path().join("lib");
+        let data = dir.path().join("data");
+        let elsewhere = dir.path().join("elsewhere");
+        for d in [&lib, &data, &elsewhere] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(data.join("rustyfin.db"), b"x").unwrap();
+        std::fs::write(elsewhere.join("movie.mkv"), b"x").unwrap();
+        std::os::unix::fs::symlink(data.join("rustyfin.db"), lib.join("db.mkv")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, lib.join("Movie")).unwrap();
+        let libs = [lib.to_str().unwrap().to_string()];
+        let path = |p: &str| lib.join(p).to_str().unwrap().to_string();
+        assert!(!path_allowed(&path("db.mkv"), &libs, &owned(&data, &[])));
+        assert!(path_allowed(
+            &path("Movie/movie.mkv"),
+            &libs,
+            &owned(&data, &[])
+        ));
+        // A library kept inside the data dir (Docker /data with /data/media) still plays
+        let inner = data.join("media");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(inner.join("clip.mkv"), b"x").unwrap();
+        let inner_libs = [inner.to_str().unwrap().to_string()];
+        let clip = inner.join("clip.mkv");
+        assert!(path_allowed(
+            clip.to_str().unwrap(),
+            &inner_libs,
+            &owned(&data, &[]),
+        ));
+    }
+
+    #[test]
+    fn r1play_data_dir_inside_a_library_is_refused() {
+        // A library at /srv with RUSTYFIN_DATA=/srv/rustyfin
+        let dir = TempDir::new();
+        let srv = dir.path().join("srv");
+        let data = srv.join("rustyfin");
+        std::fs::create_dir_all(data.join("cache")).unwrap();
+        std::fs::create_dir_all(srv.join("Movies")).unwrap();
+        std::fs::write(data.join("rustyfin.db"), b"x").unwrap();
+        std::fs::write(data.join("cache/x.mkv"), b"x").unwrap();
+        std::fs::write(srv.join("Movies/movie.mkv"), b"x").unwrap();
+        std::os::unix::fs::symlink(data.join("rustyfin.db"), srv.join("Movies/db.mkv")).unwrap();
+        let libs = [srv.to_str().unwrap().to_string()];
+        let path = |p: &FilePath| p.to_str().unwrap().to_string();
+        assert!(path_allowed(
+            &path(&srv.join("Movies/movie.mkv")),
+            &libs,
+            &owned(&data, &[]),
+        ));
+        for refused in [
+            srv.join("Movies/db.mkv"),
+            data.join("cache/x.mkv"),
+            data.join("rustyfin.db"),
+        ] {
+            assert!(
+                !path_allowed(&path(&refused), &libs, &owned(&data, &[])),
+                "{refused:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn r1play_database_file_outside_the_data_dir_is_refused() {
+        // RUSTYFIN_DB=/dir/db/main.db, outside RUSTYFIN_DATA, with links to it and its siblings
+        let dir = TempDir::new();
+        let lib = dir.path().join("lib");
+        let data = dir.path().join("data");
+        let db_dir = dir.path().join("db");
+        for d in [&lib, &data, &db_dir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let db = db_dir.join("main.db");
+        let libs = [lib.to_str().unwrap().to_string()];
+        for name in ["main.db", "main.db-wal", "main.db-shm", "other.db"] {
+            std::fs::write(db_dir.join(name), b"x").unwrap();
+            std::os::unix::fs::symlink(db_dir.join(name), lib.join(format!("{name}.mkv"))).unwrap();
+        }
+        let path = |name: &str| {
+            lib.join(format!("{name}.mkv"))
+                .to_str()
+                .unwrap()
+                .to_string()
+        };
+        for name in ["main.db", "main.db-wal", "main.db-shm"] {
+            assert!(
+                !path_allowed(&path(name), &libs, &owned(&data, &[&db])),
+                "{name}"
+            );
+        }
+        assert!(path_allowed(
+            &path("other.db"),
+            &libs,
+            &owned(&data, &[&db])
+        ));
+        assert!(path_allowed(&path("main.db"), &libs, &owned(&data, &[])));
+    }
+
+    #[test]
+    fn r1play_media_in_the_data_dir_plays_owned_files_do_not() {
+        // RUSTYFIN_DATA=/data, a library at /data/media, the database at its default place
+        let dir = TempDir::new();
+        let data = dir.path().join("data");
+        let media = data.join("media");
+        std::fs::create_dir_all(media.join("Movie")).unwrap();
+        std::fs::create_dir_all(data.join("cache/images")).unwrap();
+        std::fs::write(media.join("Movie/movie.mkv"), b"x").unwrap();
+        for owned_file in [
+            "rustyfin.db",
+            "rustyfin.db-wal",
+            "config.json",
+            "passwordreset-ab12.json",
+            "cache/images/poster.jpg",
+        ] {
+            std::fs::write(data.join(owned_file), b"x").unwrap();
+            let link = media.join(format!("{}.mkv", owned_file.replace('/', "_")));
+            std::os::unix::fs::symlink(data.join(owned_file), &link).unwrap();
+        }
+        let db = data.join("rustyfin.db");
+        let owned = owned(&data, &[&db]);
+        let libs = [media.to_str().unwrap().to_string()];
+        let lib_path = |p: &str| media.join(p).to_str().unwrap().to_string();
+        assert!(path_allowed(&lib_path("Movie/movie.mkv"), &libs, &owned));
+        for refused in [
+            "rustyfin.db.mkv",
+            "rustyfin.db-wal.mkv",
+            "config.json.mkv",
+            "passwordreset-ab12.json.mkv",
+            "cache_images_poster.jpg.mkv",
+        ] {
+            assert!(
+                !path_allowed(&lib_path(refused), &libs, &owned),
+                "{refused}"
+            );
+        }
+        // The same owned files straight from a library at the data dir itself
+        let root = [data.to_str().unwrap().to_string()];
+        let data_path = |p: &str| data.join(p).to_str().unwrap().to_string();
+        assert!(path_allowed(
+            &data_path("media/Movie/movie.mkv"),
+            &root,
+            &owned
+        ));
+        assert!(!path_allowed(&data_path("rustyfin.db"), &root, &owned));
+        assert!(!path_allowed(
+            &data_path("cache/images/poster.jpg"),
+            &root,
+            &owned
+        ));
+    }
+
+    #[test]
+    fn r1play_linked_tls_key_and_database_are_refused() {
+        // certbot: RUSTYFIN_TLS_KEY=live/x/privkey.pem -> ../../archive/x/privkey1.pem, and
+        // RUSTYFIN_DB=conf/main.db -> store/real.db, whose WAL SQLite keeps beside real.db
+        let dir = TempDir::new();
+        let lib = dir.path().join("lib");
+        let data = dir.path().join("data");
+        let archive = dir.path().join("letsencrypt/archive/x");
+        let live = dir.path().join("letsencrypt/live/x");
+        let store = dir.path().join("store");
+        let conf = dir.path().join("conf");
+        for d in [&lib, &data, &archive, &live, &store, &conf] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(archive.join("privkey1.pem"), b"x").unwrap();
+        std::os::unix::fs::symlink("../../archive/x/privkey1.pem", live.join("privkey.pem"))
+            .unwrap();
+        for name in ["real.db", "real.db-wal", "real.db-shm", "other.db"] {
+            std::fs::write(store.join(name), b"x").unwrap();
+        }
+        std::os::unix::fs::symlink(store.join("real.db"), conf.join("main.db")).unwrap();
+        let links = [
+            ("key.mkv", archive.join("privkey1.pem")),
+            ("db.mkv", store.join("real.db")),
+            ("wal.mkv", store.join("real.db-wal")),
+            ("shm.mkv", store.join("real.db-shm")),
+            ("other.mkv", store.join("other.db")),
+        ];
+        for (name, to) in &links {
+            std::os::unix::fs::symlink(to, lib.join(name)).unwrap();
+        }
+        let key = live.join("privkey.pem");
+        let db = conf.join("main.db");
+        let owned = owned(&data, &[&key, &db]);
+        let libs = [lib.to_str().unwrap().to_string()];
+        let path = |p: &str| lib.join(p).to_str().unwrap().to_string();
+        for refused in ["key.mkv", "db.mkv", "wal.mkv", "shm.mkv"] {
+            assert!(!path_allowed(&path(refused), &libs, &owned), "{refused}");
+        }
+        assert!(path_allowed(&path("other.mkv"), &libs, &owned));
+    }
+
+    #[test]
+    fn r1play_owned_folder_linked_out_of_the_data_dir_is_refused() {
+        // /data/transcodes -> /fast/transcodes
+        let dir = TempDir::new();
+        let lib = dir.path().join("lib");
+        let data = dir.path().join("data");
+        let fast = dir.path().join("fast/transcodes/abc");
+        for d in [&lib, &data, &fast] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(fast.join("segment_0000.ts"), b"x").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("fast/transcodes"), data.join("transcodes"))
+            .unwrap();
+        std::os::unix::fs::symlink(&fast, lib.join("seg")).unwrap();
+        let libs = [lib.to_str().unwrap().to_string()];
+        let seg = lib.join("seg/segment_0000.ts");
+        assert!(!path_allowed(
+            seg.to_str().unwrap(),
+            &libs,
+            &owned(&data, &[])
+        ));
+    }
+
+    #[test]
+    fn r1play_owned_names_ignore_ascii_case_and_cover_temp_files() {
+        let owned = owned(FilePath::new("/r1play-missing/data"), &[]);
+        for name in [
+            "CACHE/images/x.jpg",
+            "Logs/server.log",
+            "Config.JSON",
+            "config.json.tmp",
+            "RUSTYFIN.DB-WAL",
+            "PasswordReset-ab12.JSON",
+        ] {
+            let target = FilePath::new("/r1play-missing/data").join(name);
+            assert!(owned.owns(&target), "{name}");
+        }
+        for name in [
+            "Media/cache/x.mkv",
+            "cached/x.mkv",
+            "config.json.bak",
+            "Movie.mkv",
+        ] {
+            let target = FilePath::new("/r1play-missing/data").join(name);
+            assert!(!owned.owns(&target), "{name}");
+        }
+    }
+
+    #[test]
+    fn r1play_owned_paths_need_no_resolving() {
+        // A data dir and key file that can't be resolved are matched as configured
+        let owned = owned(
+            FilePath::new("/r1play-missing/data"),
+            &[FilePath::new("/r1play-missing/tls/key.pem")],
+        );
+        assert!(owned.owns(FilePath::new("/r1play-missing/data/rustyfin.db-shm")));
+        assert!(owned.owns(FilePath::new("/r1play-missing/data/logs/server.log")));
+        assert!(owned.owns(FilePath::new("/r1play-missing/tls/key.pem")));
+        assert!(!owned.owns(FilePath::new("/r1play-missing/data/media/a.mkv")));
+        assert!(!owned.owns(FilePath::new("/r1play-missing/data/cache")));
+    }
+
+    #[tokio::test]
+    async fn r1play_database_file_comes_from_sqlite() {
+        let dir = TempDir::new();
+        let db = dir.path().join("main.db");
+        let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}?mode=rwc", db.display()))
+            .await
+            .unwrap();
+        let file = database_file(&pool).await.unwrap();
+        assert_eq!(file.canonicalize().unwrap(), db.canonicalize().unwrap());
+        pool.close().await;
     }
 
     #[test]

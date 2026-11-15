@@ -171,4 +171,4 @@ function sectionRow(title, items, moreAction = null, options = {}) {
     return row.outerHTML;
 }
 
-export { backdropUrl, createCardElement, sectionRow };
+export { cardImage, backdropUrl, createCardElement, sectionRow };

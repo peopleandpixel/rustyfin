@@ -1002,12 +1002,15 @@ fn build_filtered_query(
     // Genres filter — exact delimited match to avoid false positives.
     // Data is stored as "Action|Sci-Fi", so we check all 4 boundary positions:
     //   exact match, start, middle, end.
-    if let Some(genre_list) = genres {
-        for _g in genre_list {
-            where_parts.push(
-                "(genres = ? OR genres LIKE ? OR genres LIKE ? OR genres LIKE ?)".to_string(),
-            );
-        }
+    // An item with any of the listed genres is kept, as in Jellyfin.
+    if let Some(genre_list) = genres
+        && !genre_list.is_empty()
+    {
+        let any: Vec<&str> = genre_list
+            .iter()
+            .map(|_| "(genres = ? OR genres LIKE ? OR genres LIKE ? OR genres LIKE ?)")
+            .collect();
+        where_parts.push(format!("({})", any.join(" OR ")));
     }
 
     // Years filter
@@ -1058,27 +1061,17 @@ fn build_filtered_query(
                 .to_string(),
         );
     }
+    // Played binds the played series and seasons, then the user (see PLAYED_CLAUSE); unplayed is
+    // its negation.
     if is_played == Some(true) {
-        where_parts.push(
-            "id IN (SELECT item_id FROM user_item_data WHERE user_id = ? AND played = 1)"
-                .to_string(),
-        );
+        where_parts.push(PLAYED_CLAUSE.to_string());
     } else if is_played == Some(false) {
-        where_parts.push(
-            "id NOT IN (SELECT item_id FROM user_item_data WHERE user_id = ? AND played = 1)"
-                .to_string(),
-        );
+        where_parts.push(format!("NOT {PLAYED_CLAUSE}"));
     }
     if is_unplayed == Some(true) {
-        where_parts.push(
-            "id NOT IN (SELECT item_id FROM user_item_data WHERE user_id = ? AND played = 1)"
-                .to_string(),
-        );
+        where_parts.push(format!("NOT {PLAYED_CLAUSE}"));
     } else if is_unplayed == Some(false) {
-        where_parts.push(
-            "id IN (SELECT item_id FROM user_item_data WHERE user_id = ? AND played = 1)"
-                .to_string(),
-        );
+        where_parts.push(PLAYED_CLAUSE.to_string());
     }
 
     // Build the static base WHERE clause for single-value params.
@@ -1149,6 +1142,43 @@ fn build_filtered_query(
     (count_sql, data_sql)
 }
 
+/// Whether an item is played: a Series or Season when it is in the JSON list bound first (from
+/// `played_folder_ids`), any other item by the user's flag, bound second.
+const PLAYED_CLAUSE: &str = "(CASE WHEN media_type IN ('Series', 'Season')
+        THEN id IN (SELECT value FROM json_each(?))
+        ELSE id IN (SELECT item_id FROM user_item_data WHERE user_id = ? AND played = 1) END)";
+
+/// The Series and Seasons in a library (every library when `library` is empty) that have episodes,
+/// all of them played by the user, as Jellyfin works it out and as `get_unplayed_counts` counts
+/// it, as a JSON list. The episodes are found by library and type, their seasons and series by
+/// primary key, and the user's rows by theirs.
+async fn played_folder_ids(
+    pool: &SqlitePool,
+    user_id: &str,
+    library: &str,
+) -> Result<String, sqlx::Error> {
+    let ids: Vec<String> = sqlx::query_scalar(
+        "SELECT ef.folder_id FROM (
+             SELECT e.id AS episode_id, p.id AS folder_id
+             FROM media_items e JOIN media_items p ON p.id = e.parent_id AND p.media_type = 'Season'
+             WHERE e.media_type = 'Episode' AND (?1 = '' OR e.library_id = ?1)
+             UNION ALL
+             SELECT e.id, p.parent_id
+             FROM media_items e JOIN media_items p ON p.id = e.parent_id AND p.media_type = 'Season'
+             WHERE e.media_type = 'Episode' AND (?1 = '' OR e.library_id = ?1)
+               AND p.parent_id IS NOT NULL
+         ) ef
+         LEFT JOIN user_item_data ud ON ud.item_id = ef.episode_id AND ud.user_id = ?2
+         GROUP BY ef.folder_id
+         HAVING MIN(COALESCE(ud.played, 0)) = 1",
+    )
+    .bind(library)
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(serde_json::to_string(&ids).unwrap_or_else(|_| "[]".to_string()))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn get_items_filtered(
     pool: &SqlitePool,
@@ -1194,6 +1224,30 @@ pub async fn get_items_filtered(
     let pd_str = premiere_date.unwrap_or_default();
     let dc_str = date_created.unwrap_or_default();
     let uid_str = user_id.unwrap_or(Uuid::nil()).to_string();
+    // The played series and seasons, worked out once for both statements, and only when the
+    // list can hold them: in the listed library, the parent item's library, or every library (a
+    // parent that isn't an item, such as a library or collection id).
+    let lists_folders = media_types.is_none_or(|types| {
+        types
+            .iter()
+            .any(|t| matches!(t.trim_matches('"'), "Series" | "Season"))
+    });
+    let played_folders = if (is_played.is_some() || is_unplayed.is_some()) && lists_folders {
+        let library = if !lid_str.is_empty() {
+            lid_str.clone()
+        } else if !pid_str.is_empty() {
+            sqlx::query_scalar::<_, String>("SELECT library_id FROM media_items WHERE id = ?")
+                .bind(&pid_str)
+                .fetch_optional(pool)
+                .await?
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        played_folder_ids(pool, &uid_str, &library).await?
+    } else {
+        "[]".to_string()
+    };
     let (min_ticks, max_ticks) = runtime
         .map(|(min, max)| {
             (
@@ -1332,15 +1386,16 @@ pub async fn get_items_filtered(
             }
         }
     }
-    // One user_id per IsFavorite / IsPlayed / IsUnplayed clause, in build_filtered_query's order.
+    // The user_id for an IsFavorite clause, and the played series and seasons and the user_id for
+    // an IsPlayed / IsUnplayed clause, in build_filtered_query's order.
     if is_favorite.is_some() {
         count_q = count_q.bind(&uid_str);
     }
     if is_played.is_some() {
-        count_q = count_q.bind(&uid_str);
+        count_q = count_q.bind(&played_folders).bind(&uid_str);
     }
     if is_unplayed.is_some() {
-        count_q = count_q.bind(&uid_str);
+        count_q = count_q.bind(&played_folders).bind(&uid_str);
     }
 
     let total: i64 = count_q.fetch_one(pool).await.unwrap_or(0);
@@ -1453,10 +1508,10 @@ pub async fn get_items_filtered(
         data_q = data_q.bind(&uid_str);
     }
     if is_played.is_some() {
-        data_q = data_q.bind(&uid_str);
+        data_q = data_q.bind(&played_folders).bind(&uid_str);
     }
     if is_unplayed.is_some() {
-        data_q = data_q.bind(&uid_str);
+        data_q = data_q.bind(&played_folders).bind(&uid_str);
     }
 
     // Pagination
@@ -1728,12 +1783,101 @@ pub async fn rebuild_filter_indexes(pool: &SqlitePool) -> Result<(), sqlx::Error
     Ok(())
 }
 
+/// The ids of the items the user has a resume position on (`/Items?Filters=IsResumable`), and as
+/// in Jellyfin the seasons and series of the episodes among them. Starts from the user's rows, so
+/// it reads them by key and their episodes' parents by primary key.
+pub async fn resumable_item_ids(
+    pool: &SqlitePool,
+    user_id: Uuid,
+) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar(
+        "WITH r AS (SELECT item_id FROM user_item_data
+                    WHERE user_id = ?1 AND playback_position_ticks > 0),
+              s AS (SELECT p.id, p.parent_id FROM r
+                    JOIN media_items e ON e.id = r.item_id AND e.media_type = 'Episode'
+                    JOIN media_items p ON p.id = e.parent_id AND p.media_type = 'Season')
+         SELECT item_id FROM r
+         UNION SELECT id FROM s
+         UNION SELECT parent_id FROM s WHERE parent_id IS NOT NULL",
+    )
+    .bind(user_id.to_string())
+    .fetch_all(pool)
+    .await
+}
+
+/// The ids of the series whose status is one of Jellyfin's `SeriesStatus` values (`Continuing`,
+/// `Ended`, `Unreleased`). Metadata providers store their own words, so TMDb's map onto them as
+/// Jellyfin's TMDb provider maps them.
+pub async fn series_ids_with_status(
+    pool: &SqlitePool,
+    statuses: &[&str],
+) -> Result<Vec<String>, sqlx::Error> {
+    let mut stored: Vec<&str> = Vec::new();
+    for status in statuses {
+        let words: &[&str] = match status.to_ascii_lowercase().as_str() {
+            "continuing" => &["Continuing", "Returning Series"],
+            "ended" => &["Ended", "Canceled", "Cancelled"],
+            "unreleased" => &["Unreleased", "In Production", "Planned", "Pilot"],
+            _ => &[],
+        };
+        stored.extend(words);
+    }
+    if stored.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut qb: QueryBuilder<Sqlite> =
+        QueryBuilder::new("SELECT id FROM media_items WHERE media_type = 'Series' AND status IN (");
+    let mut list = qb.separated(", ");
+    for word in stored {
+        list.push_bind(word);
+    }
+    qb.push(")");
+    qb.build_query_scalar().fetch_all(pool).await
+}
+
+/// The items `/Items/Filters` lists the values of.
+enum FilterScope {
+    All,
+    /// A library's items, by its id.
+    Library(String),
+    /// The descendants of an item, or a collection's items and their descendants, by its id.
+    Under(String),
+}
+
 /// Get filter values from materialized index tables.
-/// Falls back to DISTINCT queries if indexes are empty.
+/// Falls back to DISTINCT queries if indexes are empty. The indexes cover every library, so the
+/// values under a `parent_id` always come from the DISTINCT queries: a library's items, an item's
+/// descendants (a folder, series or season) or a collection's items and theirs. An id that is none
+/// of these lists every library's values, as before.
+/// `item_types` (`IncludeItemTypes`) narrows the DISTINCT queries to those types.
 pub async fn get_filters(
     pool: &SqlitePool,
-    _library_id: Option<Uuid>,
+    parent_id: Option<Uuid>,
+    item_types: &[String],
 ) -> Result<(Vec<String>, Vec<i32>, Vec<String>), sqlx::Error> {
+    let scope = match parent_id.map(|id| id.to_string()) {
+        None => FilterScope::All,
+        Some(id) => {
+            let (library, item): (bool, bool) = sqlx::query_as(
+                "SELECT EXISTS (SELECT 1 FROM libraries WHERE id = ?1),
+                        EXISTS (SELECT 1 FROM media_items WHERE id = ?1)
+                     OR EXISTS (SELECT 1 FROM collections WHERE id = ?1)",
+            )
+            .bind(&id)
+            .fetch_one(pool)
+            .await?;
+            if library {
+                FilterScope::Library(id)
+            } else if item {
+                FilterScope::Under(id)
+            } else {
+                FilterScope::All
+            }
+        }
+    };
+    if !matches!(scope, FilterScope::All) || !item_types.is_empty() {
+        return get_filters_distinct(pool, &scope, item_types).await;
+    }
     // Try materialized index tables first
     let genre_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM filter_genre_index")
         .fetch_one(pool)
@@ -1760,24 +1904,54 @@ pub async fn get_filters(
         Ok((genres, years, ratings))
     } else {
         // Fallback to DISTINCT queries
-        get_filters_distinct(pool, _library_id).await
+        get_filters_distinct(pool, &scope, item_types).await
     }
 }
 
 /// Original DISTINCT-based filter query (fallback when materialized indexes are empty).
 async fn get_filters_distinct(
     pool: &SqlitePool,
-    library_id: Option<Uuid>,
+    scope: &FilterScope,
+    item_types: &[String],
 ) -> Result<(Vec<String>, Vec<i32>, Vec<String>), sqlx::Error> {
-    let lid = library_id.map(|u| u.to_string()).unwrap_or_default();
+    // `SELECT DISTINCT <column> FROM media_items WHERE <column> IS NOT NULL`, in the scope and of
+    // the types when given. Descendants are walked down parent_id (indexed).
+    let distinct = |column: &str| {
+        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new("");
+        if let FilterScope::Under(id) = scope {
+            qb.push("WITH RECURSIVE scope(id) AS (SELECT item_id FROM collection_items WHERE collection_id = ")
+                .push_bind(id.clone())
+                .push(" UNION SELECT id FROM media_items WHERE parent_id = ")
+                .push_bind(id.clone())
+                .push(" UNION SELECT m.id FROM media_items m JOIN scope s ON m.parent_id = s.id) ");
+        }
+        qb.push(format!(
+            "SELECT DISTINCT {column} FROM media_items WHERE {column} IS NOT NULL"
+        ));
+        match scope {
+            FilterScope::All => {}
+            FilterScope::Library(id) => {
+                qb.push(" AND library_id = ").push_bind(id.clone());
+            }
+            FilterScope::Under(_) => {
+                qb.push(" AND id IN (SELECT id FROM scope)");
+            }
+        }
+        if !item_types.is_empty() {
+            qb.push(" AND media_type IN (");
+            let mut list = qb.separated(", ");
+            for item_type in item_types {
+                list.push_bind(item_type.clone());
+            }
+            qb.push(")");
+        }
+        qb
+    };
 
-    let genre_strs: Vec<String> = sqlx::query_scalar::<_, String>(
-        "SELECT DISTINCT genres FROM media_items WHERE (? = '' OR library_id = ?)",
-    )
-    .bind(&lid)
-    .bind(lid.clone())
-    .fetch_all(pool)
-    .await?;
+    // '[]' is the column's default: a row stored without genres.
+    let mut genres = distinct("genres");
+    genres.push(" AND genres != '[]'");
+    let genre_strs: Vec<String> = genres.build_query_scalar().fetch_all(pool).await?;
     let mut all_genres: Vec<String> = Vec::new();
     for gs in &genre_strs {
         for g in gs.split('|') {
@@ -1789,25 +1963,13 @@ async fn get_filters_distinct(
     }
     all_genres.sort();
 
-    let years: Vec<i32> = sqlx::query_scalar::<_, i32>(
-        "SELECT DISTINCT production_year FROM media_items \
-         WHERE production_year IS NOT NULL AND (? = '' OR library_id = ?) \
-         ORDER BY production_year DESC",
-    )
-    .bind(&lid)
-    .bind(lid.clone())
-    .fetch_all(pool)
-    .await?;
+    let mut years = distinct("production_year");
+    years.push(" ORDER BY production_year DESC");
+    let years: Vec<i32> = years.build_query_scalar().fetch_all(pool).await?;
 
-    let ratings: Vec<String> = sqlx::query_scalar::<_, String>(
-        "SELECT DISTINCT official_rating FROM media_items \
-         WHERE official_rating IS NOT NULL AND (? = '' OR library_id = ?) \
-         ORDER BY official_rating",
-    )
-    .bind(&lid)
-    .bind(lid.clone())
-    .fetch_all(pool)
-    .await?;
+    let mut ratings = distinct("official_rating");
+    ratings.push(" ORDER BY official_rating");
+    let ratings: Vec<String> = ratings.build_query_scalar().fetch_all(pool).await?;
 
     Ok((all_genres, years, ratings))
 }

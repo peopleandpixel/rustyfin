@@ -1,4 +1,5 @@
-// The library grid: paging, infinite scroll, the letter rail, BlurHash placeholders and the poster loader
+// The library grid: paging, infinite scroll, the letter rail, BlurHash placeholders, the poster loader,
+// and its sort and filters
 import { $, icon, toast, escapeHtml, scanRing } from './util.js';
 import { createCardElement } from './cards.js';
 import { hashRoute } from './router.js';
@@ -474,6 +475,24 @@ let railAnchor = null;
 let railFrame = 0;
 const LIBRARY_PAGE_SIZE = 50;
 
+// The sorts: an /Items SortBy with its default SortOrder, and the label key
+const LIBRARY_SORTS = [
+    ['SortName,ProductionYear:Ascending', 'library.sort_name'],
+    ['PremiereDate,SortName,ProductionYear:Descending', 'library.sort_release_date'],
+    ['DateCreated,SortName,ProductionYear:Descending', 'library.sort_date_added'],
+    ['CommunityRating,SortName,ProductionYear:Descending', 'library.sort_rating'],
+];
+// Each filter's /Items parameter, with the delimiter Jellyfin Web joins its values with
+const LIBRARY_FILTER_PARAMS = { Filters: ',', SeriesStatus: ',', Genres: '|', OfficialRatings: '|', Years: ',' };
+// The DisplayPreferences client the sort and filters are saved under, one entry per library id
+const LIBRARY_PREFS_CLIENT = 'rustyfin';
+// The open library's sort and filters ({ sort, reversed, filters: { param: [values] } }), and each
+// loaded library's, keyed by user and library
+let libraryPrefs = libraryPrefsFromDisplay(null);
+const libraryPrefsCache = new Map();
+// The pending preference saves: each waits for the one before, so the server keeps the last
+let librarySaves = Promise.resolve();
+
 // --- Infinite Scroll via IntersectionObserver ---
 let infiniteScrollObserver = null;
 let infiniteScrollLoading = false;
@@ -587,18 +606,25 @@ async function renderLibrary(libId) {
             </div>`).join('')}
         </div>
     </div>`;
+    // The saved sort and filters decide the first page and the index, so they come first; the
+    // previous load stops meanwhile
+    stopLibraryLoad();
+    const ticket = libraryGen;
+    const prefs = await loadLibraryPrefs(libId);
+    if (ticket !== libraryGen || API.token !== session) return;
+    libraryPrefs = prefs;
     renderLetterRail(libId);
 
     const gen = startLibraryLoad(libId);
     loadLibraryIndex(gen);
     try {
-        // Fetch first page with pagination + total count, and the genres for the filter
-        const [{ items, total }, filterData] = await Promise.all([
+        // Fetch first page with pagination + total count, and the values the filter menu offers
+        const [{ items, total }, filterLists] = await Promise.all([
             fetchLibraryPage(0),
-            API.getFilters().catch(() => ({ Genres: [] }))
+            API.getFilters(libId, libraryQuery.IncludeItemTypes).catch(() => ({}))
         ]);
         if (gen !== libraryGen || API.token !== session) return;
-        const genres = filterData.Genres || filterData.genres || [];
+        const filterCount = libraryFilterCount(libraryPrefs.filters);
 
         page.innerHTML = `
         <div class="jf-page">
@@ -617,22 +643,26 @@ async function renderLibrary(libId) {
                     <!-- Sort selector, with a toggle that reverses its order -->
                     <div class="flex items-center gap-1">
                         <select id="lib-sort" class="jf-input !py-1.5 text-xs">
-                            <option value="SortName,ProductionYear:Ascending">${t('library.sort_name')}</option>
-                            <option value="PremiereDate,SortName,ProductionYear:Descending">${t('library.sort_release_date')}</option>
-                            <option value="DateCreated,SortName,ProductionYear:Descending">${t('library.sort_date_added')}</option>
-                            <option value="CommunityRating,SortName,ProductionYear:Descending">${t('library.sort_rating')}</option>
+                            ${LIBRARY_SORTS.map(([value, key]) => `<option value="${value}"${value === libraryPrefs.sort ? ' selected' : ''}>${t(key)}</option>`).join('')}
                         </select>
-                        <button id="lib-sort-reverse" type="button" class="jf-btn-ghost self-stretch !py-1.5 !px-2 text-xs" aria-pressed="false" title="${escapeHtml(t('library.sort_reverse'))}" aria-label="${escapeHtml(t('library.sort_reverse'))}">
+                        <button id="lib-sort-reverse" type="button" class="jf-btn-ghost self-stretch !py-1.5 !px-2 text-xs" aria-pressed="${libraryPrefs.reversed}" title="${escapeHtml(t('library.sort_reverse'))}" aria-label="${escapeHtml(t('library.sort_reverse'))}">
                             ${icon('ArrowDownUp', { size: 16 })}
                         </button>
                     </div>
 
-                    <!-- Genre filter -->
-                    ${genres.length > 0 ? `
-                    <select id="lib-genre" class="jf-input !py-1.5 text-xs max-w-[140px]">
-                        <option value="">${t('library.all_genres')}</option>
-                        ${genres.map(g => `<option value="${escapeHtml(g)}">${escapeHtml(g)}</option>`).join('')}
-                    </select>` : ''}
+                    <!-- Filter menu, and a reset while any filter is on -->
+                    <button id="lib-filter-button" type="button" popovertarget="lib-filter-menu" class="jf-btn-ghost inline-flex items-center gap-1.5 !py-1.5 !px-3 text-xs">
+                        ${icon('Funnel', { size: 14 })}
+                        ${t('library.filters')}
+                        <span id="lib-filter-count" class="jf-filter-count"${filterCount ? '' : ' hidden'}>${filterCount}</span>
+                    </button>
+                    <div id="lib-filter-menu" popover role="dialog" class="jf-filter-menu" aria-label="${escapeHtml(t('library.filters'))}">
+                        ${libraryFilterMenu(contentType, filterLists, libraryPrefs.filters)}
+                    </div>
+                    <button id="lib-filter-clear" type="button" class="jf-btn-ghost inline-flex items-center gap-1.5 !py-1.5 !px-3 text-xs" data-action="clear-library-filters" data-id="${escapeHtml(libId)}"${filterCount ? '' : ' hidden'}>
+                        ${icon('FunnelX', { size: 14 })}
+                        ${t('library.clear_filters')}
+                    </button>
 
                     <!-- Scan trigger -->
                     <button class="jf-btn-ghost inline-flex items-center gap-1.5 !py-1.5 !px-3 text-xs" data-action="scan-library-page" data-id="${escapeHtml(libId)}" data-name="${escapeHtml(libName)}">
@@ -645,13 +675,13 @@ async function renderLibrary(libId) {
             <!-- Media Grid Container -->
             <div id="lib-grid-container"></div>
         </div>`;
-        $('lib-sort')?.addEventListener('change', () => reloadLibrary(libId));
+        $('lib-sort')?.addEventListener('change', () => libraryControlsChanged(libId));
         $('lib-sort-reverse')?.addEventListener('click', e => {
             const btn = e.currentTarget;
             btn.setAttribute('aria-pressed', btn.getAttribute('aria-pressed') === 'true' ? 'false' : 'true');
-            reloadLibrary(libId);
+            libraryControlsChanged(libId);
         });
-        $('lib-genre')?.addEventListener('change', () => reloadLibrary(libId));
+        $('lib-filter-menu')?.addEventListener('change', () => libraryControlsChanged(libId));
         fillLibraryGrid(items, total);
     } catch (e) {
         if (gen !== libraryGen || API.token !== session) return;
@@ -660,12 +690,148 @@ async function renderLibrary(libId) {
     }
 }
 
-// The library list's sort: the select's value, with the order flipped while the reverse toggle is pressed
-function librarySort() {
-    const [sortBy, sortOrder] = ($('lib-sort')?.value || 'SortName,ProductionYear:Ascending').split(':');
-    const reversed = $('lib-sort-reverse')?.getAttribute('aria-pressed') === 'true';
-    if (!reversed) return { sortBy, sortOrder };
+// The library list's sort: the chosen sort, with its order flipped while the reverse toggle is pressed
+function librarySort(prefs = libraryPrefs) {
+    const [sortBy, sortOrder] = prefs.sort.split(':');
+    if (!prefs.reversed) return { sortBy, sortOrder };
     return { sortBy, sortOrder: sortOrder === 'Ascending' ? 'Descending' : 'Ascending' };
+}
+
+// The /Items parameters of the chosen filters, each list joined as Jellyfin Web joins it
+function libraryFilterQuery(filters) {
+    const query = {};
+    for (const [param, delimiter] of Object.entries(LIBRARY_FILTER_PARAMS)) {
+        if (filters[param]?.length) query[param] = filters[param].join(delimiter);
+    }
+    return query;
+}
+
+function libraryFilterCount(filters) {
+    return Object.keys(LIBRARY_FILTER_PARAMS).reduce((n, param) => n + (filters[param]?.length || 0), 0);
+}
+
+// Sort and filters from a DisplayPreferences answer: SortBy and SortOrder, and each filter's /Items value in
+// CustomPrefs. Nothing saved, or a sort this client doesn't offer, gives the defaults.
+function libraryPrefsFromDisplay(display) {
+    const sortBy = display?.SortBy || '';
+    const sort = LIBRARY_SORTS.find(([value]) => value.split(':')[0] === sortBy)?.[0];
+    const custom = display?.CustomPrefs || {};
+    const filters = {};
+    for (const [param, delimiter] of Object.entries(LIBRARY_FILTER_PARAMS)) {
+        filters[param] = typeof custom[param] === 'string' ? custom[param].split(delimiter).filter(Boolean) : [];
+    }
+    return {
+        sort: sort || LIBRARY_SORTS[0][0],
+        reversed: !!sort && !!display.SortOrder && display.SortOrder !== sort.split(':')[1],
+        filters,
+    };
+}
+
+// The DisplayPreferences body that saves a library's sort and filters; the server keeps the whole body
+function libraryPrefsToDisplay(libId, prefs) {
+    const { sortBy, sortOrder } = librarySort(prefs);
+    return {
+        Id: libId,
+        Client: LIBRARY_PREFS_CLIENT,
+        SortBy: sortBy,
+        SortOrder: sortOrder,
+        CustomPrefs: libraryFilterQuery(prefs.filters),
+        RememberIndexing: false,
+        RememberSorting: true,
+        PrimaryImageHeight: 0,
+        PrimaryImageWidth: 0,
+        ShowBackdrop: true,
+        ShowSidebar: false,
+        ScrollDirection: 'Horizontal',
+    };
+}
+
+// The user's saved sort and filters for a library, read from the server once per session
+async function loadLibraryPrefs(libId) {
+    const key = `${API.userId}:${libId}`;
+    if (!libraryPrefsCache.has(key)) {
+        const display = await API.getDisplayPreferences(libId, LIBRARY_PREFS_CLIENT).catch(() => null);
+        libraryPrefsCache.set(key, libraryPrefsFromDisplay(display));
+    }
+    return libraryPrefsCache.get(key);
+}
+
+// Keeps the open library's sort and filters, for this session and on the server. Saves go one at a
+// time in the order they were made, so a slow earlier save can't land after a later one.
+function saveLibraryPrefs(libId) {
+    libraryPrefsCache.set(`${API.userId}:${libId}`, libraryPrefs);
+    const body = libraryPrefsToDisplay(libId, libraryPrefs);
+    librarySaves = librarySaves
+        .then(() => API.saveDisplayPreferences(libId, LIBRARY_PREFS_CLIENT, body))
+        .catch(e => toast(t('library.prefs_save_failed', { message: e.message }), 'error'));
+}
+
+// The filter menu's groups, one checkbox per value; a saved value the server no longer lists stays offered
+function libraryFilterMenu(contentType, lists, filters) {
+    const box = (param, value, label) => `<label><input type="checkbox" data-param="${param}" value="${escapeHtml(value)}"${filters[param].includes(String(value)) ? ' checked' : ''}><span title="${escapeHtml(label)}">${escapeHtml(label)}</span></label>`;
+    const group = (title, boxes) => boxes.length ? `<fieldset><legend>${escapeHtml(title)}</legend><div class="jf-filter-options">${boxes.join('')}</div></fieldset>` : '';
+    const listed = (param, values) => [...new Set([...(values || []).map(String), ...filters[param]])];
+    const choices = (param, pairs) => pairs.map(([value, key]) => box(param, value, t(key)));
+    const values = (param, list) => list.map(value => box(param, value, value));
+    return [
+        group(t('library.filter_status'), choices('Filters', [
+            ['IsUnplayed', 'library.filter_unplayed'], ['IsPlayed', 'library.filter_played'],
+            ['IsResumable', 'library.filter_resumable'], ['IsFavorite', 'library.filter_favorites'],
+        ])),
+        contentType === 'TvShows' ? group(t('library.filter_series_status'), choices('SeriesStatus', [
+            ['Continuing', 'library.filter_continuing'], ['Ended', 'library.filter_ended'],
+        ])) : '',
+        group(t('library.filter_genres'), values('Genres', listed('Genres', lists.Genres).sort((a, b) => a.localeCompare(b)))),
+        group(t('library.filter_ratings'), values('OfficialRatings', listed('OfficialRatings', lists.OfficialRatings))),
+        group(t('library.filter_years'), values('Years', listed('Years', lists.Years).sort((a, b) => b - a))),
+    ].join('');
+}
+
+// The sort and filters the controls show
+function libraryControlsPrefs() {
+    const filters = Object.fromEntries(Object.keys(LIBRARY_FILTER_PARAMS).map(param => [param, []]));
+    for (const box of document.querySelectorAll('#lib-filter-menu input:checked')) filters[box.dataset.param].push(box.value);
+    return {
+        sort: $('lib-sort')?.value || LIBRARY_SORTS[0][0],
+        reversed: $('lib-sort-reverse')?.getAttribute('aria-pressed') === 'true',
+        filters,
+    };
+}
+
+// The filter button's count and the reset button follow the chosen filters
+function showLibraryFilterCount() {
+    const count = libraryFilterCount(libraryPrefs.filters);
+    const badge = $('lib-filter-count');
+    if (badge) {
+        badge.textContent = count;
+        badge.hidden = !count;
+    }
+    const clear = $('lib-filter-clear');
+    if (clear) clear.hidden = !count;
+}
+
+// A sort or filter change: kept for the library, then a new load
+function libraryControlsChanged(libId) {
+    libraryPrefs = libraryControlsPrefs();
+    showLibraryFilterCount();
+    saveLibraryPrefs(libId);
+    reloadLibrary(libId);
+}
+
+// The reset in the header and in the empty state: every filter off, the sort kept
+function clearLibraryFilters(libId) {
+    for (const box of document.querySelectorAll('#lib-filter-menu input:checked')) box.checked = false;
+    libraryControlsChanged(libId);
+}
+
+// The list with no items: with filters on, says none match and offers the reset; else the library is
+// empty. Focusable, so focus can move to it when the list empties under the user.
+function libraryEmptyHtml() {
+    if (!libraryFilterCount(libraryPrefs.filters)) {
+        return `<div class="text-center py-20 text-white/40" tabindex="-1">${t('library.empty')}</div>`;
+    }
+    return `<div class="flex flex-col items-center gap-4 py-20 text-white/40" tabindex="-1">${t('library.no_filter_results')}
+        <button type="button" class="jf-btn-ghost inline-flex items-center gap-1.5 !py-1.5 !px-3 text-xs" data-action="clear-library-filters" data-id="${escapeHtml(currentLibraryId)}">${icon('FunnelX', { size: 14 })}${t('library.clear_filters')}</button></div>`;
 }
 
 // The /Items query for the library list; paging is added per request
@@ -685,7 +851,7 @@ function libraryListQuery(libId) {
         SortBy: sortBy,
         SortOrder: sortOrder,
         Fields: 'PrimaryImageAspectRatio',
-        Genres: $('lib-genre')?.value || undefined
+        ...libraryFilterQuery(libraryPrefs.filters),
     };
 }
 
@@ -1273,7 +1439,7 @@ function libraryChanged(total) {
         libraryView = null;
         const container = $('lib-grid-container');
         if (container) {
-            container.innerHTML = `<div class="text-center py-20 text-white/40" tabindex="-1">${t('library.no_filter_results')}</div>`;
+            container.innerHTML = libraryEmptyHtml();
             if (focusedPos >= 0) container.firstElementChild.focus({ preventScroll: true });
         }
         return;
@@ -1310,7 +1476,7 @@ function fillLibraryGrid(items, total) {
     libraryTotal = total;
     items.forEach((item, i) => { libraryItems[i] = item; });
     if (total === 0) {
-        container.innerHTML = `<div class="text-center py-20 text-white/40">${t('library.no_filter_results')}</div>`;
+        container.innerHTML = libraryEmptyHtml();
         return;
     }
     container.innerHTML = '<div id="lib-grid" class="jf-lib-grid jf-vgrid" role="list"></div>';
@@ -1618,7 +1784,7 @@ function startGridDiag(asked = false) {
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => startGridDiag());
 else startGridDiag();
 
-// A sort or genre change: a new load for the new query, shown from the top of the list
+// A sort or filter change: a new load for the new query, shown from the top of the list
 async function reloadLibrary(libId) {
     renderLetterRail(libId);
 
@@ -1742,7 +1908,7 @@ window.addEventListener('resize', scheduleRailUpdate);
 export {
     currentLibraryId, blurhashTint, posterLoaded, posterFailed, LIBRARY_PAGE_SIZE, setupInfiniteScroll,
     destroyInfiniteScroll, renderLibrary, stopLibraryLoad, libraryRefreshInPlace, libraryRemember, startGridDiag,
-    jumpToLetter,
+    jumpToLetter, clearLibraryFilters,
 };
 
 // Shared state that inline handlers or other modules assign: reached through window
