@@ -14,10 +14,11 @@ use uuid::Uuid;
 
 use crate::error::ApiError;
 
-/// `axum::extract::Query` that also takes a list parameter repeated, as ASP.NET binds it for
-/// Jellyfin: when the query string doesn't parse and a name repeats (`fields=A&fields=B`, as
-/// Jellyfin Web sends it), the values are joined with commas (`fields=A,B`) and parsed again. A
-/// query that parses as it is gets exactly the plain `Query` result.
+/// `axum::extract::Query` that also takes a parameter repeated, as ASP.NET binds it for Jellyfin:
+/// when the query string doesn't parse and a name repeats, a list parameter's values are joined
+/// with commas (`fields=A&fields=B`, as Jellyfin Web sends it, reads as `fields=A,B`) and any
+/// other parameter keeps its first value, and the query is parsed again. A query that parses as
+/// it is gets exactly the plain `Query` result.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Query<T>(pub T);
 
@@ -48,20 +49,75 @@ impl<T: DeserializeOwned> Query<T> {
     }
 }
 
-/// The URI with each repeated query name given once, its values joined with commas in their
-/// order, or `None` when no name repeats.
+/// Jellyfin's list (array) query parameters, which ASP.NET binds from repeated names. Matched
+/// without ASCII case.
+const LIST_PARAMS: &[&str] = &[
+    "albumArtistIds",
+    "albumIds",
+    "albums",
+    "artistIds",
+    "artists",
+    "channelIds",
+    "contributingArtistIds",
+    "enableImageTypes",
+    "excludeArtistIds",
+    "excludeItemIds",
+    "excludeItemTypes",
+    "excludeLocationTypes",
+    "fields",
+    "filters",
+    "genreIds",
+    "genres",
+    "ids",
+    "imageTypes",
+    "includeItemTypes",
+    "locationTypes",
+    "mediaTypes",
+    "officialRatings",
+    "personIds",
+    "personTypes",
+    "seriesStatus",
+    "sortBy",
+    "sortOrder",
+    "studioIds",
+    "studios",
+    "tags",
+    "videoTypes",
+    "years",
+];
+
+/// The most query pairs `joined_repeats` reads; a longer query gets the plain parse's error.
+const MAX_JOINED_PAIRS: usize = 512;
+
+/// The URI with each repeated query name given once: a list parameter's values joined with
+/// commas in their order, any other parameter's first pair kept. `None` when no name repeats or
+/// the query has more than `MAX_JOINED_PAIRS` pairs. Linear in the number of pairs.
 fn joined_repeats(uri: &Uri) -> Option<Uri> {
     let query = uri.query()?;
-    let mut pairs: Vec<(&str, Vec<&str>)> = Vec::new();
+    let mut pairs: Vec<(&str, Option<String>)> = Vec::new();
+    let mut index: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
     let mut repeated = false;
-    for pair in query.split('&').filter(|p| !p.is_empty()) {
-        let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
-        match pairs.iter_mut().find(|(n, _)| *n == name) {
-            Some((_, values)) => {
-                values.push(value);
+    for (n, pair) in query.split('&').filter(|p| !p.is_empty()).enumerate() {
+        if n == MAX_JOINED_PAIRS {
+            return None;
+        }
+        let (name, value) = match pair.split_once('=') {
+            Some((name, value)) => (name, Some(value)),
+            None => (pair, None),
+        };
+        match index.get(name) {
+            Some(&i) => {
                 repeated = true;
+                if LIST_PARAMS.iter().any(|p| p.eq_ignore_ascii_case(name)) {
+                    let joined = pairs[i].1.get_or_insert_with(String::new);
+                    joined.push(',');
+                    joined.push_str(value.unwrap_or(""));
+                }
             }
-            None => pairs.push((name, vec![value])),
+            None => {
+                index.insert(name, pairs.len());
+                pairs.push((name, value.map(str::to_string)));
+            }
         }
     }
     if !repeated {
@@ -69,7 +125,10 @@ fn joined_repeats(uri: &Uri) -> Option<Uri> {
     }
     let joined: Vec<String> = pairs
         .iter()
-        .map(|(name, values)| format!("{name}={}", values.join(",")))
+        .map(|(name, value)| match value {
+            Some(value) => format!("{name}={value}"),
+            None => name.to_string(),
+        })
         .collect();
     format!("{}?{}", uri.path(), joined.join("&")).parse().ok()
 }
@@ -502,6 +561,8 @@ mod tests {
     struct ListQuery {
         fields: Option<String>,
         limit: Option<i64>,
+        #[serde(rename = "searchTerm")]
+        search_term: Option<String>,
     }
 
     async fn extract<T: DeserializeOwned>(uri: &str) -> Result<T, QueryRejection> {
@@ -530,10 +591,50 @@ mod tests {
             vec![("ids".into(), "a".into()), ("ids".into(), "b".into())]
         );
         assert!(extract::<ListQuery>("/Items?limit=x").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn r1auth_a_repeated_single_value_keeps_the_first() {
+        let q: ListQuery =
+            extract("/Items?limit=1&searchTerm=a&limit=2&searchTerm=b&fields=A&fields=B")
+                .await
+                .unwrap();
+        assert_eq!(q.limit, Some(1));
+        assert_eq!(q.search_term.as_deref(), Some("a"));
+        assert_eq!(q.fields.as_deref(), Some("A,B"));
+        // A bad first value stays a 400, as the plain parse answers it.
         assert!(
-            extract::<ListQuery>("/Items?limit=1&limit=2")
+            extract::<ListQuery>("/Items?limit=x&limit=2")
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn r1auth_many_names_stay_linear_and_capped() {
+        // Under the cap: hundreds of distinct names around a repeated list name.
+        let mut uri = String::from("/Items?fields=A");
+        for i in 0..400 {
+            uri.push_str(&format!("&n{i}=x"));
+        }
+        uri.push_str("&fields=B");
+        let q: ListQuery = extract(&uri).await.unwrap();
+        assert_eq!(q.fields.as_deref(), Some("A,B"));
+
+        // Over the cap: 6,000 distinct names (near the 64 KiB URI limit) get the plain parse's
+        // error, at once.
+        let mut uri = String::from("/Items?fields=A&fields=B");
+        for i in 0..6_000 {
+            uri.push_str(&format!("&n{i}=x"));
+        }
+        let started = std::time::Instant::now();
+        assert!(extract::<ListQuery>(&uri).await.is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        // The scan stops at the cap, however long the query.
+        let started = std::time::Instant::now();
+        for _ in 0..100 {
+            assert!(joined_repeats(&uri.parse().unwrap()).is_none());
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 }
