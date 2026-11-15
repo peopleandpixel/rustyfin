@@ -1,7 +1,8 @@
 // B145: the web client draws its icons with Lucide, not colour emoji or hand-copied SVG.
 // Checks app.js, index.html, icons.js and the translations as text, and runs the player's
 // icon switches (updatePlayIcon, updateVolumeIcon) in a vm sandbox.
-// Usage: node b145_icons.mjs PATH/TO/app.js (run by api_tests.rs b145_icons).
+// Usage: node b145_icons.mjs PATH/TO/client.js PATH/TO/src (run by api_tests.rs b145_icons;
+// client.js is app.js and its modules in one file).
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -9,7 +10,7 @@ import test from 'node:test';
 import vm from 'node:vm';
 
 const appPath = process.argv[2];
-const srcDir = path.dirname(appPath);
+const srcDir = process.argv[3];
 const app = fs.readFileSync(appPath, 'utf8');
 const html = fs.readFileSync(path.join(srcDir, 'index.html'), 'utf8');
 const iconsJs = fs.readFileSync(path.join(srcDir, 'icons.js'), 'utf8');
