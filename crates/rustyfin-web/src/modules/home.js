@@ -5,6 +5,37 @@ import { serverVersion } from './wizard.js';
 import { LIBRARY_PAGE_SIZE, setupInfiniteScroll, destroyInfiniteScroll } from './library.js';
 
 // --- Home Page Renderer ---
+
+// Jellyfin Web's home rows: a resume row per media type, and a "Recently Added in" row per library
+// except the kinds it leaves out; music shows more items, as its cards are smaller
+const LATEST_EXCLUDED_TYPES = ['playlists', 'livetv', 'boxsets', 'channels', 'folders'];
+
+function resumeUrl(mediaType) {
+    return `/Items/Resume?Limit=12&MediaTypes=${mediaType}`;
+}
+
+function homeLatestPlan(libs) {
+    return (libs || [])
+        .map(lib => ({
+            id: lib.id || lib.Id,
+            name: lib.name || lib.Name || '',
+            type: lib.content_type || lib.ContentType || lib.CollectionType || '',
+        }))
+        .filter(lib => lib.id && !LATEST_EXCLUDED_TYPES.includes(String(lib.type).toLowerCase()))
+        .map(lib => ({
+            id: lib.id,
+            name: lib.name,
+            url: `/Items/Latest?ParentId=${encodeURIComponent(lib.id)}&Limit=${lib.type === 'Music' ? 30 : 16}&Fields=PrimaryImageAspectRatio`,
+        }));
+}
+
+// Each library's latest items, in library order; a library whose request fails shows no row
+function fetchLatestRows(libs) {
+    return Promise.all(homeLatestPlan(libs).map(row => API.cachedGet(row.url)
+        .then(data => ({ ...row, items: Array.isArray(data) ? data : (data.Items || []) }))
+        .catch(() => ({ ...row, items: [] }))));
+}
+
 async function renderHome() {
     const session = API.token; // stop drawing if this session ends meanwhile
     const page = $('page-home');
@@ -53,17 +84,20 @@ async function renderHome() {
 
     try {
         let libsError = null;
-        const [resumeData, nextUpData, latestData, libsData] = await Promise.all([
-            (API.getResume ? API.getResume(12) : Promise.resolve({ Items: [] })).catch(() => ({ Items: [] })),
+        const libsRequest = API.getLibraries().catch(err => { libsError = err; return null; });
+        const [resumeData, resumeAudioData, nextUpData, latestRows, libsData] = await Promise.all([
+            API.cachedGet(resumeUrl('Video')).catch(() => ({ Items: [] })),
+            API.cachedGet(resumeUrl('Audio')).catch(() => ({ Items: [] })),
             (API.getNextUp ? API.getNextUp(12) : Promise.resolve({ Items: [] })).catch(() => ({ Items: [] })),
-            (API.getLatest ? API.getLatest(20) : Promise.resolve([])).catch(() => []),
-            API.getLibraries().catch(err => { libsError = err; return null; })
+            libsRequest.then(fetchLatestRows),
+            libsRequest,
         ]);
         if (API.token !== session) return;
 
         const resume = resumeData.Items || resumeData.items || [];
+        const resumeAudio = resumeAudioData.Items || resumeAudioData.items || [];
         const nextUp = nextUpData.Items || nextUpData.items || [];
-        const latest = Array.isArray(latestData) ? latestData : (latestData.Items || latestData.items || []);
+        const latest = latestRows.find(row => row.items.length)?.items || [];
         if (!libsError) libraries = libsData || [];
 
         let c = '<div class="jf-page space-y-8">';
@@ -160,13 +194,16 @@ async function renderHome() {
             </div>`;
         }
 
-        // 3. Sections: Continue Watching & Next Up & Latest
+        // 3. Sections: Continue Watching, Continue Listening, Next Up, then each library's latest
         c += sectionRow(t('home.continue_watching'), resume, null, { backdrop: true });
+        c += sectionRow(t('home.continue_listening'), resumeAudio);
         c += sectionRow(t('home.next_up'), nextUp, null, { backdrop: true });
-        c += sectionRow(t('home.recently_added'), latest);
+        for (const row of latestRows) {
+            c += sectionRow(t('home.latest_in', { name: row.name }), row.items, { page: 'library', data: row.id });
+        }
 
         // Empty Library Welcome Banner
-        if (!resume.length && !nextUp.length && !latest.length) {
+        if (!resume.length && !resumeAudio.length && !nextUp.length && !latest.length) {
             c += `
             <div class="text-center py-20 px-4 rounded-2xl bg-white/5 border border-white/10 my-8">
                 <img src="/web/assets/logo.png" class="w-20 h-20 mx-auto rounded-2xl opacity-40 mb-4 p-1 bg-white/5">

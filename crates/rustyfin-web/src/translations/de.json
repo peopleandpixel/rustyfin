@@ -426,6 +426,8 @@
         "more_info": "Details & Info",
         "my_media": "Meine Bibliotheken",
         "continue_watching": "Weiterschauen",
+        "continue_listening": "Weiterhören",
+        "latest_in": "Neu in {{name}}",
         "next_up": "Als Nächstes (Serien)",
         "recently_added": "Zuletzt hinzugefügt",
         "empty_title": "Deine Bibliothek ist noch leer",
