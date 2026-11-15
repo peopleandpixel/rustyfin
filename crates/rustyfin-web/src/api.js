@@ -525,8 +525,9 @@ const API = {
     // Users (admin)
     getUsers() { return this.get('/Users'); },
     getMe() { return this.get('/Users/Me'); },
-    createUser(name, password, isAdministrator = false) {
-        return this.post('/Users/New', { Name: name, Password: password, IsAdministrator: isAdministrator });
+    // Creates a user without administrator rights, as Jellyfin does; updatePolicy() grants them.
+    createUser(name, password) {
+        return this.post('/Users/New', { Name: name, Password: password });
     },
     deleteUser(id) { return this.post(`/Users/${id}/Delete`); },
     changePassword(id, current, newPw) { return this.post(`/Users/${id}/Password`, { CurrentPw: current, NewPw: newPw }); },

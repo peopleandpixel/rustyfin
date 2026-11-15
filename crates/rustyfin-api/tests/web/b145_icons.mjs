@@ -14,8 +14,14 @@ const app = fs.readFileSync(appPath, 'utf8');
 const html = fs.readFileSync(path.join(srcDir, 'index.html'), 'utf8');
 const iconsJs = fs.readFileSync(path.join(srcDir, 'icons.js'), 'utf8');
 
-// Colour emoji, plus the text glyphs the client used as icons.
-const ICON_GLYPH = /[\p{Extended_Pictographic}★♥♡✓]/u;
+// Colour emoji, plus the text glyphs the client used as icons (★ ♥ ♡ ✓ ○ ▶ ⏸).
+// Explicit Unicode blocks rather than \p{Extended_Pictographic}: that property depends on
+// the ICU that node ships (node 20 on Debian trixie says ★ is pictographic, node 22 says
+// it isn't), and the test must give the same answer everywhere. The blocks: Misc Technical
+// (⌚ ⏯ ⏸), Geometric Shapes (○ ● ▶ ■), Misc Symbols and Dingbats (☀ ★ ♥ ✓ ✔), Misc Symbols
+// and Arrows (⬅ ⭐), the emoji planes U+1F000-U+1FAFF, and the emoji presentation selector.
+// Plain arrows (← → ↵), dashes and CJK punctuation stay allowed.
+const ICON_GLYPH = /[⌀-⏿■-◿☀-➿⬀-⯿\u{1F000}-\u{1FAFF}️]/u;
 
 // Drops // line comments, /* */ and <!-- --> comments, so a glyph in a comment doesn't count.
 function stripComments(text) {
@@ -73,14 +79,14 @@ test('icons.js renders the static markup with createIcons', () => {
     assert.match(iconsJs, /window\.lucideIcons\s*=/);
 });
 
-test('no translation value holds a colour emoji', () => {
+test('no translation value holds a colour emoji or icon glyph', () => {
     const dir = path.join(srcDir, 'translations');
     const found = [];
     const walk = (obj, prefix, file) => {
         for (const [k, v] of Object.entries(obj)) {
             if (v && typeof v === 'object') walk(v, `${prefix}${k}.`, file);
-            // A colour emoji anywhere, or a glyph icon (✓ ○ ★ ♥) leading a label.
-            else if (typeof v === 'string' && /\p{Extended_Pictographic}|^[✓○★♥] /u.test(v)) found.push(`${file} ${prefix}${k}: ${v}`);
+            // A colour emoji or a glyph icon (✓ ○ ★ ♥) anywhere in a label, e.g. "Rating (★)".
+            else if (typeof v === 'string' && ICON_GLYPH.test(v)) found.push(`${file} ${prefix}${k}: ${v}`);
         }
     };
     const files = fs.readdirSync(dir).filter(f => f.endsWith('.json'));
