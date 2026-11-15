@@ -109,9 +109,9 @@ fn rating_sql(alias: &str) -> String {
     )
 }
 
-/// The policy as SQL parameters, the `p` row of the queries below: whether ratings are limited,
-/// the stored ratings within the limit, the stored ratings that count as unrated, the unrated
-/// kinds to hide, and the ids that fail on their tags.
+/// The policy as the SQL parameters `?1` to `?5` of the queries below: whether ratings are
+/// limited, the stored ratings within the limit, the stored ratings that count as unrated, the
+/// unrated kinds to hide, and the ids that fail on their tags (JSON arrays).
 struct Params {
     limits_ratings: bool,
     allowed: String,
@@ -120,16 +120,35 @@ struct Params {
     tag_failures: String,
 }
 
-const PARAMS_CTE: &str = "p(limits_ratings, allowed, unrated, block_unrated, tag_failures) AS \
-                          (SELECT ?, ?, ?, ?, ?)";
-
-/// Whether the `r` row (id, media_type, eff = rating with inheritance) fails the policy in `p`.
-const FAILS_SQL: &str = "(r.id IN (SELECT value FROM json_each(p.tag_failures)) \
-     OR (p.limits_ratings = 1 AND CASE \
-         WHEN r.eff IS NULL OR r.eff IN (SELECT value FROM json_each(p.unrated)) \
-             THEN COALESCE(r.kind IN (SELECT value FROM json_each(p.block_unrated)), 0) \
-         WHEN r.eff IN (SELECT value FROM json_each(p.allowed)) THEN 0 \
+/// Whether the `r` row (id, kind, eff = rating with inheritance) fails the policy in `?1`-`?5`.
+/// The lists are bound parameters, not columns, so each `IN (SELECT ... json_each(?n))` is an
+/// uncorrelated subquery that SQLite builds once per statement rather than once per row.
+const FAILS_SQL: &str = "(r.id IN (SELECT value FROM json_each(?5)) \
+     OR (?1 = 1 AND CASE \
+         WHEN r.eff IS NULL OR r.eff IN (SELECT value FROM json_each(?3)) \
+             THEN COALESCE(r.kind IN (SELECT value FROM json_each(?4)), 0) \
+         WHEN r.eff IN (SELECT value FROM json_each(?2)) THEN 0 \
          ELSE 1 END))";
+
+/// Every item the policy in `?1`-`?5` hides: the failing ones and everything under them.
+fn hidden_sql() -> String {
+    format!(
+        "WITH RECURSIVE rated AS ({rated}), \
+         failing(id) AS (SELECT r.id FROM rated r WHERE {FAILS_SQL}), \
+         hidden(id) AS (SELECT id FROM failing \
+             UNION SELECT c.id FROM media_items c JOIN hidden h ON c.parent_id = h.id) \
+         SELECT id FROM hidden",
+        rated = rated_select(""),
+    )
+}
+
+/// Whether any of the items in the JSON array `?6` fails the policy in `?1`-`?5`.
+fn chain_fails_sql() -> String {
+    format!(
+        "WITH rated AS ({rated}) SELECT EXISTS (SELECT 1 FROM rated r WHERE {FAILS_SQL})",
+        rated = rated_select("WHERE m.id IN (SELECT value FROM json_each(?6))"),
+    )
+}
 
 /// The rows `FAILS_SQL` reads: every media item `m`, or those `filter` (a WHERE clause) keeps.
 fn rated_select(filter: &str) -> String {
@@ -217,16 +236,7 @@ pub async fn hidden_item_ids(
             .collect();
     }
     let p = params(pool, policy, &tag_failures).await?;
-    let sql = format!(
-        "WITH RECURSIVE {PARAMS_CTE}, \
-         rated AS ({rated}), \
-         failing(id) AS (SELECT r.id FROM rated r, p WHERE {FAILS_SQL}), \
-         hidden(id) AS (SELECT id FROM failing \
-             UNION SELECT c.id FROM media_items c JOIN hidden h ON c.parent_id = h.id) \
-         SELECT id FROM hidden",
-        rated = rated_select(""),
-    );
-    let ids: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+    let ids: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(hidden_sql()))
         .bind(p.limits_ratings)
         .bind(&p.allowed)
         .bind(&p.unrated)
@@ -273,12 +283,7 @@ pub async fn is_item_hidden(
     }
     let ids: Vec<String> = chain.into_iter().map(|(id, _, _)| id).collect();
     let p = params(pool, policy, &[]).await?;
-    let sql = format!(
-        "WITH {PARAMS_CTE}, rated AS ({rated}) \
-         SELECT EXISTS (SELECT 1 FROM rated r, p WHERE {FAILS_SQL})",
-        rated = rated_select("WHERE m.id IN (SELECT value FROM json_each(?))"),
-    );
-    let hidden: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+    let hidden: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(chain_fails_sql()))
         .bind(p.limits_ratings)
         .bind(&p.allowed)
         .bind(&p.unrated)
@@ -288,4 +293,160 @@ pub async fn is_item_hidden(
         .fetch_one(pool)
         .await?;
     Ok(hidden)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A database of `movies` top-level movies (every 3rd tagged "Kids", every 7th "Horror") and
+    /// `series` series with a season of 5 episodes each, under one library.
+    async fn library(movies: usize, series: usize) -> (SqlitePool, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("rustyfin_parental_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pool = crate::init_db(dir.join("test.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let lib = Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO libraries (id, name, content_type) VALUES (?, 'L', 'movies')")
+            .bind(&lib)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        let ratings = ["G", "PG", "PG-13", "R", ""];
+        let add =
+            |name: String, kind: &'static str, parent: Option<String>, rating: &str, tags: &str| {
+                let id = Uuid::new_v4().to_string();
+                let q = sqlx::query(
+                    "INSERT INTO media_items (id, library_id, name, media_type, path, parent_id, \
+                 official_rating, tags) VALUES (?, ?, ?, ?, ?, ?, NULLIF(?, ''), ?)",
+                )
+                .bind(id.clone())
+                .bind(lib.clone())
+                .bind(name.clone())
+                .bind(kind)
+                .bind(format!("/m/{name}"))
+                .bind(parent)
+                .bind(rating.to_string())
+                .bind(tags.to_string());
+                (id, q)
+            };
+        for n in 0..movies {
+            let tags = match (n % 3, n % 7) {
+                (_, 0) => "Kids|Horror",
+                (0, _) => "Kids",
+                _ => "",
+            };
+            let (_, q) = add(format!("movie {n}"), "Movie", None, ratings[n % 5], tags);
+            q.execute(&mut *tx).await.unwrap();
+        }
+        for n in 0..series {
+            let tags = if n % 2 == 0 { "Kids" } else { "" };
+            let (sid, q) = add(format!("series {n}"), "Series", None, ratings[n % 5], tags);
+            q.execute(&mut *tx).await.unwrap();
+            let (season, q) = add(format!("season {n}"), "Season", Some(sid), "", "");
+            q.execute(&mut *tx).await.unwrap();
+            for e in 0..5 {
+                let (_, q) = add(
+                    format!("ep {n} {e}"),
+                    "Episode",
+                    Some(season.clone()),
+                    "",
+                    "",
+                );
+                q.execute(&mut *tx).await.unwrap();
+            }
+        }
+        tx.commit().await.unwrap();
+        (pool, dir)
+    }
+
+    fn strict_policy() -> ParentalPolicy {
+        ParentalPolicy {
+            max_parental_rating: Some(10),
+            max_parental_sub_rating: None,
+            block_unrated_items: vec!["Movie".into()],
+            blocked_tags: vec!["horror".into()],
+            allowed_tags: vec!["kids".into()],
+        }
+    }
+
+    #[tokio::test]
+    async fn r2parental_hidden_set_stays_fast_with_tag_lists() {
+        let (pool, dir) = library(4000, 100).await;
+        let policy = strict_policy();
+        let started = std::time::Instant::now();
+        let hidden = hidden_item_ids(&pool, &policy).await.unwrap();
+        let took = started.elapsed();
+        // 4,700 items, about 2,700 of them failing on tags alone, so the tag list is long. The
+        // bound is loose so that a busy machine doesn't fail it.
+        eprintln!("hidden set of {} items in {took:?}", hidden.len());
+        assert!(took < std::time::Duration::from_secs(1), "took {took:?}");
+
+        let ids: Vec<String> = hidden.into_iter().collect();
+        let names: HashSet<String> = sqlx::query_scalar(
+            "SELECT name FROM media_items WHERE id IN (SELECT value FROM json_each(?))",
+        )
+        .bind(serde_json::Value::from(ids).to_string())
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .collect();
+        for (name, hidden, why) in [
+            ("movie 15", false, "Kids, G"),
+            ("movie 6", false, "Kids, PG"),
+            ("movie 1", true, "no Kids tag"),
+            ("movie 0", true, "Kids and Horror"),
+            ("movie 3", true, "Kids, R"),
+            ("movie 9", true, "Kids, unrated movie"),
+            ("ep 0 3", false, "under a Kids series rated G"),
+            ("ep 1 0", true, "under a series without Kids"),
+        ] {
+            assert_eq!(names.contains(name), hidden, "{name}: {why}");
+        }
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn r2parental_hidden_set_plan_has_no_correlated_subquery() {
+        let (pool, dir) = library(50, 5).await;
+        let p = params(&pool, &strict_policy(), &["x".to_string()])
+            .await
+            .unwrap();
+        for (sql, chain) in [(hidden_sql(), false), (chain_fails_sql(), true)] {
+            let mut q = sqlx::query_as::<_, (i64, i64, i64, String)>(sqlx::AssertSqlSafe(format!(
+                "EXPLAIN QUERY PLAN {sql}"
+            )))
+            .bind(p.limits_ratings)
+            .bind(&p.allowed)
+            .bind(&p.unrated)
+            .bind(&p.block_unrated)
+            .bind(&p.tag_failures);
+            if chain {
+                q = q.bind("[]");
+            }
+            let plan: Vec<String> = q
+                .fetch_all(&pool)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| row.3)
+                .collect();
+            assert!(!plan.is_empty());
+            assert!(
+                !plan.iter().any(|step| step.contains("CORRELATED")),
+                "{plan:#?}"
+            );
+            // The parents are found by primary key, not by scanning.
+            assert!(
+                plan.iter().any(|step| step.contains("mp USING INDEX")
+                    || step.contains("mp USING PRIMARY KEY")
+                    || step.contains("SEARCH mp")),
+                "{plan:#?}"
+            );
+        }
+        std::fs::remove_dir_all(dir).ok();
+    }
 }
