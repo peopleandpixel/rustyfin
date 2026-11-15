@@ -5,7 +5,7 @@
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
-use rustyfin_core::jellyfin_import::{ImportRequest, ImportStage, JobHandle, prepare, run};
+use rustyfin_core::jellyfin_import::{ImportRequest, ImportStage, JobHandle, execute, prepare};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -72,7 +72,8 @@ pub(crate) fn written_cache_clear(state: &AppState) -> impl FnOnce() + Send + 's
 }
 
 /// Runs a queued import (B119): scans its libraries, then imports. `handle` is the job's; the
-/// queue file is removed when the run ends, whatever its outcome.
+/// queue file is removed when the run ends, whatever its outcome, and before the job's status
+/// says it ended (B159): a caller that sees the end, or starts the next import, finds no file.
 pub(crate) async fn run_queued(state: AppState, mut file: QueueFile, handle: JobHandle) {
     let data_dir = (*state.data_dir).clone();
     scan_libraries(&state, &file.library_ids, &handle).await;
@@ -80,29 +81,33 @@ pub(crate) async fn run_queued(state: AppState, mut file: QueueFile, handle: Job
 
     file.state = QueueState::Importing;
     if write_queue(&data_dir, &file).await.is_err() {
+        remove_queue(&data_dir).await;
         handle
             .fail("The queued Jellyfin import could not be saved, so it did not run.".to_string());
-        remove_queue(&data_dir).await;
         return;
     }
     let prepared = match prepare(&file.request, file.caller, &data_dir).await {
         Ok(prepared) => prepared,
         Err(error) => {
-            handle.fail(error.to_string());
             remove_queue(&data_dir).await;
+            handle.fail(error.to_string());
             return;
         }
     };
-    run(
-        state.db.clone(),
-        file.request,
-        prepared,
-        handle,
-        data_dir.clone(),
+    let outcome = execute(
+        &state.db,
+        &file.request,
+        &prepared,
+        &handle,
+        &data_dir,
         written_cache_clear(&state),
     )
     .await;
     remove_queue(&data_dir).await;
+    match outcome {
+        Ok(report) => handle.complete(report),
+        Err(error) => handle.fail(error),
+    }
 }
 
 /// Scans each library in order and waits for each run to end (probes included), so the import reads
@@ -176,8 +181,8 @@ const UNREADABLE: &str = "The queued Jellyfin import could not be read, so it di
 /// Reports a resumed import as failed with `message`, and removes its queue file.
 async fn fail_resumed(state: &AppState, message: &str) {
     tracing::warn!("jellyfin import: {message}");
+    remove_queue(&(*state.data_dir).clone()).await;
     if let Some(handle) = state.jellyfin_import.try_start() {
         handle.fail(message.to_string());
     }
-    remove_queue(&(*state.data_dir).clone()).await;
 }
