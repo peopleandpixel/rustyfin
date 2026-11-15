@@ -372,7 +372,7 @@
         "clear": "Leeren",
         "disconnected": "Getrennt",
         "connecting_to_server": "Verbinde mit Server…",
-        "live_log_hint": "Zeigt die letzten 500 Log-Einträge in Echtzeit. Änderungen der Verbosity werden sofort wirksam.",
+        "live_log_hint": "Zeigt bis zu 2.000 aktuelle Zeilen des Server-Logs, so wie die Konsole sie ausgibt, und neue Zeilen in Echtzeit. Die Verbosity filtert, was diese Ansicht zeigt.",
         "state_ready": "Bereit",
         "state_running": "Läuft",
         "state_stopping": "Wird gestoppt",

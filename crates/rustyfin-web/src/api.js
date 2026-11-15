@@ -599,11 +599,16 @@ if (typeof window !== 'undefined') {
 const LiveLog = {
     ws: null,
     messages: [],
-    maxMessages: 500,
-    callbacks: [],
+    maxMessages: 2000,
+    // Each has add(entry) and, optionally, reset() for when the lines start over
+    listeners: [],
     connected: false,
+    stopped: false,
+    // The time of the last line before Clear; the replay after a reconnect skips lines up to it
+    clearedAt: 0,
 
     connect() {
+        this.stopped = false;
         if (this.ws && this.ws.readyState <= 1) return;
         const token = localStorage.getItem('rustyfin_token');
         if (!token) return;
@@ -616,25 +621,24 @@ const LiveLog = {
 
             this.ws.onopen = () => {
                 this.connected = true;
+                // The server sends its recent lines first, then new ones, so the list starts over
+                // from them: nothing missed while disconnected, and no line twice.
+                this.messages = [];
+                this.listeners.forEach(l => l.reset && l.reset());
+                this.ws.send(JSON.stringify({ MessageType: 'LiveLogStart' }));
             };
 
             this.ws.onmessage = (evt) => {
                 try {
                     const data = JSON.parse(evt.data);
-                    if (data.MessageType === 'LogMessage' && data.Data) {
-                        this.messages.push(data.Data);
-                        if (this.messages.length > this.maxMessages) {
-                            this.messages.shift();
-                        }
-                        this.callbacks.forEach(cb => cb(data.Data));
-                    }
+                    if (data.MessageType === 'LogMessage' && data.Data) this.add(data.Data);
                 } catch {}
             };
 
             this.ws.onclose = () => {
                 this.connected = false;
-                // Reconnect after 5 seconds
-                setTimeout(() => this.connect(), 5000);
+                // Reconnect after 5 seconds, unless disconnected on purpose
+                if (!this.stopped) setTimeout(() => this.connect(), 5000);
             };
 
             this.ws.onerror = () => {
@@ -643,11 +647,23 @@ const LiveLog = {
         } catch {}
     },
 
-    onMessage(cb) {
-        this.callbacks.push(cb);
+    add(entry) {
+        if (this.clearedAt && Date.parse(entry.Timestamp) <= this.clearedAt) return;
+        this.messages.push(entry);
+        if (this.messages.length > this.maxMessages) {
+            this.messages.splice(0, this.messages.length - this.maxMessages);
+        }
+        this.listeners.forEach(l => l.add(entry));
+    },
+
+    clear() {
+        const last = this.messages[this.messages.length - 1];
+        if (last) this.clearedAt = Date.parse(last.Timestamp) || this.clearedAt;
+        this.messages = [];
     },
 
     disconnect() {
+        this.stopped = true;
         if (this.ws) {
             this.ws.close();
             this.ws = null;

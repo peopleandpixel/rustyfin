@@ -250,7 +250,6 @@
         "clear": "지우기",
         "disconnected": "연결 끊김",
         "connecting_to_server": "서버에 연결하는 중…",
-        "live_log_hint": "최근 500개 로그 항목을 실시간으로 표시합니다. 상세 수준 변경은 즉시 적용됩니다.",
         "state_ready": "준비됨",
         "state_running": "실행 중",
         "state_stopping": "정지 중",

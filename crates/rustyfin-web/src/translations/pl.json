@@ -256,7 +256,6 @@
         "clear": "Wyczyść",
         "disconnected": "Rozłączono",
         "connecting_to_server": "Łączenie z serwerem…",
-        "live_log_hint": "Wyświetla ostatnie 500 wpisów dziennika w czasie rzeczywistym. Zmiany szczegółowości obowiązują natychmiast.",
         "state_ready": "Gotowy",
         "state_running": "Uruchomiony",
         "state_stopping": "Zatrzymywanie",

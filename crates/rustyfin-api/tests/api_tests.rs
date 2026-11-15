@@ -30231,6 +30231,12 @@ async fn r3livelog_socket_replays_the_history_before_new_lines() {
 }
 
 
+// The live log view's rows, level filter, cap and scrolling (tests/web/r3livelog_view.mjs).
+#[test]
+fn r3livelog_web_view() {
+    b124_node_test("r3livelog_view.mjs");
+}
+
 // ── B18: one scan per run, and Scan all's order ──
 // A manual scan of a library that Scan all has queued but not reached runs at once, and Scan all
 // leaves that library to it, so its ring follows one scan and one Completed comes after the 100.

@@ -250,7 +250,6 @@
         "clear": "Limpar",
         "disconnected": "Desconectado",
         "connecting_to_server": "Conectando ao servidor…",
-        "live_log_hint": "Mostra as últimas 500 entradas do log em tempo real. Alterações de verbosidade entram em vigor imediatamente.",
         "state_ready": "Pronto",
         "state_running": "Em execução",
         "state_stopping": "Parando",

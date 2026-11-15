@@ -250,7 +250,6 @@
         "clear": "清除",
         "disconnected": "已断开",
         "connecting_to_server": "正在连接到服务器…",
-        "live_log_hint": "实时显示最近 500 条日志条目。详细程度的更改立即生效。",
         "state_ready": "就绪",
         "state_running": "运行中",
         "state_stopping": "正在停止",
