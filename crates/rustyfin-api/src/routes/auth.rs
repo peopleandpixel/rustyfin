@@ -176,7 +176,7 @@ pub(crate) async fn start_session(
         });
 
     AuthResponse {
-        user: UserDto::new(user, flags).with_parental(&parental),
+        user: UserDto::new(user, flags, &state.server_id, &parental),
         session_info,
         access_token: token,
         server_id: state.server_id.to_string(),

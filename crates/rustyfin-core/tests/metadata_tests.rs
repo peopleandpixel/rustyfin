@@ -487,3 +487,465 @@ async fn b34_a_later_source_keeps_an_earlier_one_s_fills() {
     assert_eq!(after.overview.as_deref(), Some("A plot from the NFO."));
     assert_eq!(after.genres, ["Drama"]);
 }
+
+// ── R1 scan: identification, people, IMDb ids, seasons and episodes ──
+
+type R1Found = std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = Option<rustyfin_model::metadata::ExternalMetadata>> + Send,
+    >,
+>;
+type R1Lookup<'a, T> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = rustyfin_model::metadata::LookupResult<T>> + Send + 'a>,
+>;
+
+/// A fake lookup's final answer.
+fn r1scan_answer<'a, T: 'a>(
+    answer: impl std::future::Future<Output = Option<T>> + Send + 'a,
+) -> R1Lookup<'a, T> {
+    Box::pin(async move { Ok(answer.await) })
+}
+
+/// What the fake provider's lookups were asked.
+#[derive(Default)]
+struct R1Calls {
+    movie_searches: Vec<String>,
+    movie_ids: Vec<i64>,
+    series_searches: Vec<(String, Option<i32>)>,
+    seasons: Vec<(i64, i32)>,
+}
+
+struct R1Lookups(std::sync::Arc<std::sync::Mutex<R1Calls>>);
+
+fn r1scan_movie_meta() -> rustyfin_model::metadata::ExternalMetadata {
+    use rustyfin_model::metadata::{ExternalMetadata, MetadataPerson};
+    ExternalMetadata {
+        name: Some("Mission: Impossible".to_string()),
+        tmdb_id: Some(954),
+        imdb_id: Some("tt0117060".to_string()),
+        premiere_date: Some("1996-05-22".to_string()),
+        studios: Some(vec!["Paramount".to_string()]),
+        people: Some(vec![MetadataPerson {
+            name: "R1 Actor".to_string(),
+            kind: "Actor".to_string(),
+            role: Some("Ethan".to_string()),
+            image_url: Some("http://127.0.0.1:9/r1-actor.jpg".to_string()),
+        }]),
+        ..Default::default()
+    }
+}
+
+impl rustyfin_model::metadata::MetadataLookups for R1Lookups {
+    fn movie_by_id(&self, id: i64) -> R1Lookup<'_, rustyfin_model::metadata::ExternalMetadata> {
+        self.0.lock().unwrap().movie_ids.push(id);
+        // Id 404 is gone from the provider
+        r1scan_answer(async move { (id != 404).then(r1scan_movie_meta) })
+    }
+
+    fn series_by_id(&self, _id: i64) -> R1Lookup<'_, rustyfin_model::metadata::ExternalMetadata> {
+        r1scan_answer(async { None })
+    }
+
+    fn search_series(
+        &self,
+        name: &str,
+        year: Option<i32>,
+    ) -> R1Lookup<'_, rustyfin_model::metadata::ExternalMetadata> {
+        self.0
+            .lock()
+            .unwrap()
+            .series_searches
+            .push((name.to_string(), year));
+        r1scan_answer(async {
+            Some(rustyfin_model::metadata::ExternalMetadata {
+                name: Some("One Night".to_string()),
+                tmdb_id: Some(228527),
+                imdb_id: Some("tt26629692".to_string()),
+                premiere_date: Some("2023-09-01".to_string()),
+                ..Default::default()
+            })
+        })
+    }
+
+    fn season(
+        &self,
+        series_id: i64,
+        season_number: i32,
+    ) -> R1Lookup<'_, rustyfin_model::metadata::SeasonMetadata> {
+        use rustyfin_model::metadata::{ExternalMetadata, MetadataImage, SeasonMetadata};
+        self.0
+            .lock()
+            .unwrap()
+            .seasons
+            .push((series_id, season_number));
+        r1scan_answer(async move {
+            Some(SeasonMetadata {
+                meta: ExternalMetadata {
+                    name: Some("Season One Title".to_string()),
+                    overview: Some("R1 season overview".to_string()),
+                    image_urls: vec![MetadataImage {
+                        image_type: "Primary".to_string(),
+                        url: "http://127.0.0.1:9/r1-season.jpg".to_string(),
+                    }],
+                    ..Default::default()
+                },
+                episodes: vec![
+                    (
+                        1,
+                        ExternalMetadata {
+                            name: Some("Pilot: One".to_string()),
+                            overview: Some("R1 episode overview".to_string()),
+                            premiere_date: Some("2023-09-01".to_string()),
+                            community_rating: Some(7.5),
+                            tmdb_id: Some(6101),
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        2,
+                        ExternalMetadata {
+                            name: Some("Second".to_string()),
+                            ..Default::default()
+                        },
+                    ),
+                ],
+            })
+        })
+    }
+}
+
+/// A plugin manager with one active provider, "r1", whose name searches find the movie, and
+/// its lookups.
+async fn r1scan_manager() -> (
+    rustyfin_core::plugin_manager::PluginManager,
+    std::sync::Arc<std::sync::Mutex<R1Calls>>,
+) {
+    let pm = rustyfin_core::plugin_manager::PluginManager::new(&std::path::PathBuf::from("."));
+    let calls: std::sync::Arc<std::sync::Mutex<R1Calls>> = Default::default();
+    let seen = calls.clone();
+    pm.register_metadata_provider(
+        "r1".to_string(),
+        "r1".to_string(),
+        rustyfin_model::plugin::PluginStatus::Active,
+        move |_: &reqwest::Client, name: &str, _: Option<i32>| -> R1Found {
+            seen.lock().unwrap().movie_searches.push(name.to_string());
+            Box::pin(async { Some(r1scan_movie_meta()) })
+        },
+        |_: &reqwest::Client, _: &str| -> R1Found { Box::pin(async { None }) },
+        |_: &reqwest::Client,
+         _: Option<i64>,
+         _: Option<i64>,
+         _: MediaType|
+         -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Vec<rustyfin_model::metadata::MetadataImage>>
+                    + Send,
+            >,
+        > { Box::pin(async { Vec::new() }) },
+    )
+    .await;
+    pm.register_metadata_lookups("r1", std::sync::Arc::new(R1Lookups(calls.clone())))
+        .await;
+    (pm, calls)
+}
+
+async fn r1scan_imdb(pool: &SqlitePool, id: Uuid) -> Option<String> {
+    sqlx::query_scalar("SELECT imdb_id FROM item_metadata_extras WHERE item_id = ?1")
+        .bind(id.to_string())
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+        .flatten()
+}
+
+async fn r1scan_people(pool: &SqlitePool, id: Uuid) -> Vec<(String, String, Option<String>)> {
+    sqlx::query_as(
+        "SELECT p.name, ip.type, ip.role FROM item_people ip JOIN people p ON p.id = ip.person_id \
+         WHERE ip.item_id = ?1 ORDER BY ip.sort_order",
+    )
+    .bind(id.to_string())
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+/// E0-scan-1, E0-scan-2, E0-metadata-1: a movie takes the provider's title, premiere date, IMDb
+/// id, studios and people; a refresh of an identified movie asks by id, without a search, and
+/// adds nothing twice.
+#[tokio::test]
+async fn r1scan_movie_takes_title_imdb_people_and_premiere() {
+    let fx = Fixture::new().await;
+    let pool = &fx.pool;
+    let read = fx.movie("Mission Impossible", None).await;
+    let (pm, calls) = r1scan_manager().await;
+    let client = reqwest::Client::new();
+
+    rustyfin_core::metadata::refresh_item_metadata(pool, &client, &read, &pm)
+        .await
+        .unwrap();
+
+    let after = stored(pool, read.id).await;
+    assert_eq!(after.name, "Mission: Impossible");
+    assert_eq!(after.tmdb_id, Some(954));
+    assert_eq!(
+        after.premiere_date.map(|d| d.date_naive().to_string()),
+        Some("1996-05-22".to_string())
+    );
+    assert_eq!(
+        r1scan_imdb(pool, read.id).await.as_deref(),
+        Some("tt0117060")
+    );
+    let people = vec![(
+        "R1 Actor".to_string(),
+        "Actor".to_string(),
+        Some("Ethan".to_string()),
+    )];
+    assert_eq!(r1scan_people(pool, read.id).await, people);
+    let studios = rustyfin_db::repo_media::get_studios_for_item(pool, read.id)
+        .await
+        .unwrap();
+    assert_eq!(studios.len(), 1);
+    assert_eq!(calls.lock().unwrap().movie_searches, ["Mission Impossible"]);
+
+    // A second refresh asks by id and duplicates nothing
+    rustyfin_core::metadata::refresh_item_metadata(pool, &client, &after, &pm)
+        .await
+        .unwrap();
+    assert_eq!(calls.lock().unwrap().movie_searches.len(), 1);
+    assert_eq!(calls.lock().unwrap().movie_ids, [954]);
+    assert_eq!(r1scan_people(pool, read.id).await, people);
+}
+
+/// Review I1: an item whose provider id is gone (a by-id miss) stays as it is; it isn't searched
+/// by name, which could give it another item's title and data under the old id.
+#[tokio::test]
+async fn r1scan_gone_provider_id_is_not_searched() {
+    let fx = Fixture::new().await;
+    let pool = &fx.pool;
+    let mut read = fx.movie("Kept Name", None).await;
+    read.tmdb_id = Some(404);
+    rustyfin_db::repo_media::upsert_media_item(pool, &read)
+        .await
+        .unwrap();
+    let (pm, calls) = r1scan_manager().await;
+
+    rustyfin_core::metadata::refresh_item_metadata(pool, &reqwest::Client::new(), &read, &pm)
+        .await
+        .unwrap();
+
+    assert_eq!(calls.lock().unwrap().movie_ids, [404]);
+    assert!(calls.lock().unwrap().movie_searches.is_empty());
+    let after = stored(pool, read.id).await;
+    assert_eq!(after.name, "Kept Name");
+    assert_eq!(r1scan_imdb(pool, read.id).await, None);
+}
+
+/// A locked name, or an NFO's title, is not replaced by the provider's.
+#[tokio::test]
+async fn r1scan_locked_or_nfo_name_stays() {
+    let fx = Fixture::new().await;
+    let pool = &fx.pool;
+    let (pm, _) = r1scan_manager().await;
+    let client = reqwest::Client::new();
+
+    let locked = fx.movie("My Own Name", None).await;
+    exec(
+        pool,
+        "INSERT INTO item_metadata_extras (item_id, locked_fields) VALUES (?1, 'Name')",
+        &[&locked.id.to_string()],
+    )
+    .await;
+    rustyfin_core::metadata::refresh_item_metadata(pool, &client, &locked, &pm)
+        .await
+        .unwrap();
+    let after = stored(pool, locked.id).await;
+    assert_eq!(after.name, "My Own Name");
+    // The rest still fills
+    assert_eq!(
+        r1scan_imdb(pool, locked.id).await.as_deref(),
+        Some("tt0117060")
+    );
+
+    let from_nfo = fx.movie("Nfo Movie", Some(NFO)).await;
+    rustyfin_core::metadata::refresh_item_metadata(pool, &client, &from_nfo, &pm)
+        .await
+        .unwrap();
+    // The NFO's rule is unchanged (it replaces only a file-like name), and a provider's title
+    // doesn't replace a name next to an NFO with a title
+    assert_eq!(stored(pool, from_nfo.id).await.name, "Nfo Movie");
+}
+
+/// E0-scan-3, B147: a series search sends the folder year; the identified series fills its
+/// season and episode from one season lookup; an episode refreshed on its own asks the same
+/// season.
+#[tokio::test]
+async fn r1scan_series_fills_its_seasons_and_episodes() {
+    let fx = Fixture::new().await;
+    let pool = &fx.pool;
+    let (pm, calls) = r1scan_manager().await;
+    let client = reqwest::Client::new();
+    let root = fx.dir.join("film").join("One Night (2023)");
+    let base = MediaItem {
+        library_id: fx.library_id,
+        date_created: Utc.with_ymd_and_hms(2020, 1, 2, 3, 4, 5).unwrap(),
+        ..MediaItem::default_dto_fields()
+    };
+    let series = MediaItem {
+        id: Uuid::new_v4(),
+        name: "One Night".to_string(),
+        media_type: MediaType::Series,
+        path: root.to_string_lossy().into_owned(),
+        production_year: Some(2023),
+        ..base.clone()
+    };
+    let season = MediaItem {
+        id: Uuid::new_v4(),
+        name: "Season 1".to_string(),
+        media_type: MediaType::Season,
+        path: root.join("Season 1").to_string_lossy().into_owned(),
+        parent_id: Some(series.id),
+        index_number: Some(1),
+        ..base.clone()
+    };
+    let episode = MediaItem {
+        id: Uuid::new_v4(),
+        name: "One Night - S01E01".to_string(),
+        media_type: MediaType::Episode,
+        path: root
+            .join("Season 1/One Night - S01E01.mkv")
+            .to_string_lossy()
+            .into_owned(),
+        parent_id: Some(season.id),
+        index_number: Some(1),
+        parent_index_number: Some(1),
+        ..base.clone()
+    };
+    // A file holding episodes 1 and 2
+    let double = MediaItem {
+        id: Uuid::new_v4(),
+        name: "One Night - S01E01-E02".to_string(),
+        path: root
+            .join("Season 1/One Night - S01E01-E02.mkv")
+            .to_string_lossy()
+            .into_owned(),
+        index_number_end: Some(2),
+        ..episode.clone()
+    };
+    for item in [&series, &season, &episode, &double] {
+        rustyfin_db::repo_media::upsert_media_item(pool, item)
+            .await
+            .unwrap();
+    }
+
+    rustyfin_core::metadata::refresh_item_metadata(pool, &client, &series, &pm)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        calls.lock().unwrap().series_searches,
+        [("One Night".to_string(), Some(2023))]
+    );
+    let series_after = stored(pool, series.id).await;
+    assert_eq!(series_after.tmdb_id, Some(228527));
+    assert_eq!(
+        r1scan_imdb(pool, series.id).await.as_deref(),
+        Some("tt26629692")
+    );
+    let season_after = stored(pool, season.id).await;
+    assert_eq!(season_after.name, "Season 1", "a season keeps its name");
+    assert_eq!(season_after.overview.as_deref(), Some("R1 season overview"));
+    let images = rustyfin_db::repo_image::get_images_for_item(pool, season.id)
+        .await
+        .unwrap();
+    assert_eq!(images.len(), 1);
+    let episode_after = stored(pool, episode.id).await;
+    assert_eq!(episode_after.name, "Pilot: One");
+    assert_eq!(
+        episode_after.overview.as_deref(),
+        Some("R1 episode overview")
+    );
+    assert_eq!(episode_after.community_rating, Some(7.5));
+    assert_eq!(episode_after.tmdb_id, Some(6101));
+    assert_eq!(calls.lock().unwrap().seasons, [(228527, 1)]);
+    assert_eq!(stored(pool, double.id).await.name, "Pilot: One / Second");
+
+    // The episode's own refresh asks for its season
+    rustyfin_core::metadata::refresh_item_metadata(pool, &client, &episode_after, &pm)
+        .await
+        .unwrap();
+    assert_eq!(calls.lock().unwrap().seasons, [(228527, 1), (228527, 1)]);
+    assert_eq!(stored(pool, episode.id).await.name, "Pilot: One");
+}
+
+/// Recheck info: a series' refresh without `force` (a scan's, the task's) leaves seasons and
+/// episodes a provider answered for alone; an explicit refresh (`force`) fills them again.
+#[tokio::test]
+async fn r1scan_forced_series_refresh_refills_answered_children() {
+    use rustyfin_core::metadata::{RefreshOptions, refresh_item_metadata_with};
+    let fx = Fixture::new().await;
+    let pool = &fx.pool;
+    let (pm, calls) = r1scan_manager().await;
+    let client = reqwest::Client::new();
+    let root = fx.dir.join("film").join("Forced Show");
+    let base = MediaItem {
+        library_id: fx.library_id,
+        date_created: Utc.with_ymd_and_hms(2020, 1, 2, 3, 4, 5).unwrap(),
+        ..MediaItem::default_dto_fields()
+    };
+    let series = MediaItem {
+        id: Uuid::new_v4(),
+        name: "Forced Show".to_string(),
+        media_type: MediaType::Series,
+        path: root.to_string_lossy().into_owned(),
+        tmdb_id: Some(228527),
+        ..base.clone()
+    };
+    let season = MediaItem {
+        id: Uuid::new_v4(),
+        name: "Season 1".to_string(),
+        media_type: MediaType::Season,
+        path: root.join("Season 1").to_string_lossy().into_owned(),
+        parent_id: Some(series.id),
+        index_number: Some(1),
+        ..base.clone()
+    };
+    let episode = MediaItem {
+        id: Uuid::new_v4(),
+        name: "Forced - S01E01".to_string(),
+        media_type: MediaType::Episode,
+        path: root.join("Season 1/E01.mkv").to_string_lossy().into_owned(),
+        parent_id: Some(season.id),
+        index_number: Some(1),
+        parent_index_number: Some(1),
+        ..base.clone()
+    };
+    for item in [&series, &season, &episode] {
+        rustyfin_db::repo_media::upsert_media_item(pool, item)
+            .await
+            .unwrap();
+    }
+    let seasons = || calls.lock().unwrap().seasons.len();
+
+    refresh_item_metadata_with(pool, &client, &series, &pm, RefreshOptions::SCAN)
+        .await
+        .unwrap();
+    assert_eq!(seasons(), 1);
+    // Someone renames the episode; an unforced refresh leaves it alone
+    exec(
+        pool,
+        "UPDATE media_items SET name = 'Renamed' WHERE id = ?1",
+        &[&episode.id.to_string()],
+    )
+    .await;
+    refresh_item_metadata_with(pool, &client, &series, &pm, RefreshOptions::SCAN)
+        .await
+        .unwrap();
+    assert_eq!(seasons(), 1);
+    assert_eq!(stored(pool, episode.id).await.name, "Renamed");
+
+    refresh_item_metadata_with(pool, &client, &series, &pm, RefreshOptions::EXPLICIT)
+        .await
+        .unwrap();
+    assert_eq!(seasons(), 2);
+    assert_eq!(stored(pool, episode.id).await.name, "Pilot: One");
+}

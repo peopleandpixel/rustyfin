@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
+use crate::query::Query;
 use axum::Router;
-use axum::extract::{Path, Query, RawQuery, State};
+use axum::extract::{Path, RawQuery, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get};

@@ -46,6 +46,56 @@ pub struct ExternalMetadata {
     pub writers: Option<Vec<String>>,
     /// IMDb ID
     pub imdb_id: Option<String>,
+    /// Cast and crew, in the provider's billing order
+    #[serde(default)]
+    pub people: Option<Vec<MetadataPerson>>,
+}
+
+/// A cast or crew member from a metadata provider.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct MetadataPerson {
+    pub name: String,
+    /// Jellyfin's PersonKind: "Actor", "GuestStar", "Director", "Writer", "Producer"
+    pub kind: String,
+    /// The character for actors
+    pub role: Option<String>,
+    /// The person's photo
+    pub image_url: Option<String>,
+}
+
+/// One season from a metadata provider, with the episodes it lists. One provider call fills a
+/// season and all of its episodes.
+#[derive(Debug, Clone, Default)]
+pub struct SeasonMetadata {
+    pub meta: ExternalMetadata,
+    /// By episode number
+    pub episodes: Vec<(i32, ExternalMetadata)>,
+}
+
+/// A lookup that got no final answer (a timeout, a 5xx, a rate limit, no API key), so it is worth
+/// asking again later. `Ok(None)` is a final "not there" (a 404).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LookupFailed {
+    /// A timeout, a 5xx, a rate limit, a network error: worth asking again
+    Transient,
+    /// No API key, or the provider refused it (401, 403): every other lookup will fail too
+    Unauthorized,
+}
+
+/// The answer of a lookup: `Ok(Some(_))` found, `Ok(None)` not there, `Err` failed.
+pub type LookupResult<T> = Result<Option<T>, LookupFailed>;
+
+type LookupFuture<'a, T> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = LookupResult<T>> + Send + 'a>>;
+
+/// Lookups a provider offers beyond the name searches: by provider id, a TV search with the
+/// first-air year, and a season with its episodes. Ids are the provider's own (TMDb for TMDb).
+pub trait MetadataLookups: Send + Sync {
+    fn movie_by_id(&self, id: i64) -> LookupFuture<'_, ExternalMetadata>;
+    fn series_by_id(&self, id: i64) -> LookupFuture<'_, ExternalMetadata>;
+    fn search_series(&self, name: &str, year: Option<i32>) -> LookupFuture<'_, ExternalMetadata>;
+    fn season(&self, series_id: i64, season_number: i32) -> LookupFuture<'_, SeasonMetadata>;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

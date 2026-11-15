@@ -58,6 +58,9 @@ openidconnect = "4.1"
 # Image processing
 image = "0.25"
 blurhash = "0.2"
+# JPEG decoding at 1/2, 1/4 or 1/8 scale, and SIMD resizing, for the grid renditions (B152)
+jpeg-decoder = { version = "0.3", default-features = false }
+fast_image_resize = "6"
 
 # XML parsing (NFO files)
 quick-xml = { version = "0.37", features = ["serialize"] }

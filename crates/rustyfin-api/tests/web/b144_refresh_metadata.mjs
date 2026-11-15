@@ -21,7 +21,7 @@ const ICONS = {
 };
 
 // A sandbox with the app's globals stubbed; calls are logged in order.
-function sandbox({ page = 'detail', detailId = 'item-1', refresh } = {}) {
+function sandbox({ page = 'detail', detailId = 'item-1', refresh, listOpen = false } = {}) {
     const log = [];
     const timers = [];
     const context = vm.createContext({
@@ -31,6 +31,8 @@ function sandbox({ page = 'detail', detailId = 'item-1', refresh } = {}) {
         toast: (msg, type = 'success') => log.push(['toast', msg, type]),
         renderDetail: id => { log.push(['renderDetail', id]); return Promise.resolve(); },
         renderLibrary: id => log.push(['renderLibrary', id]),
+        // B152: an open library list is brought up to date in place; without one it is drawn again
+        libraryRefreshInPlace: () => { log.push(['libraryRefreshInPlace']); return listOpen; },
         renderHome: () => log.push(['renderHome']),
         setTimeout: (fn, ms) => { timers.push([fn, ms]); return timers.length; },
         API: {
@@ -182,6 +184,15 @@ test('a library change re-renders an open detail page, library page or home page
     context.refreshViewAfterLibraryChange();
     assert.equal(timers.length, 0);
     assert.ok(!log.some(e => e[0].startsWith('render')));
+});
+
+test('a library change brings an open library list up to date in place, without drawing the page again (B152)', () => {
+    const { context, log, timers } = sandbox({ page: 'library', listOpen: true });
+    context.refreshViewAfterLibraryChange();
+    assert.equal(timers.length, 1);
+    timers[0][0]();
+    assert.deepEqual(log.at(-1), ['libraryRefreshInPlace']);
+    assert.ok(!log.some(e => e[0] === 'renderLibrary'), 'the open list is not drawn again');
 });
 
 test("the detail page's action row uses Lucide icons, not emoji, at one height", () => {

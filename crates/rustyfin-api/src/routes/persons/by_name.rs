@@ -3,7 +3,8 @@
 
 use std::collections::BTreeMap;
 
-use axum::extract::{Path, Query, State};
+use crate::query::Query;
+use axum::extract::{Path, State};
 use axum::routing::get;
 use axum::{Extension, Json, Router};
 use rustyfin_db::repo_by_name::{
