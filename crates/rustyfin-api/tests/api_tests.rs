@@ -29804,6 +29804,138 @@ async fn b17_scheduler_scan_reports_progress_without_task_events() {
     );
 }
 
+// R3 tasks: a running task's state and progress in /ScheduledTasks and on the socket
+
+/// Sends a text frame on `socket`. Client frames are masked; a zero mask leaves the text as is.
+async fn r3tasks_send(socket: &mut G1cSocket, text: &str) {
+    use tokio::io::AsyncWriteExt;
+    assert!(text.len() < 126, "a short frame");
+    let mut frame = vec![0x81, 0x80 | text.len() as u8, 0, 0, 0, 0];
+    frame.extend_from_slice(text.as_bytes());
+    socket.0.get_mut().write_all(&frame).await.unwrap();
+}
+
+/// The library scan task's entry in `GET /ScheduledTasks`, after checking that every entry has
+/// Jellyfin's `State` and a `CurrentProgressPercentage` that is a number or null.
+async fn r3tasks_scan_entry(app: &axum::Router, token: &str) -> serde_json::Value {
+    let (status, tasks) = send_authed(app, "GET", "/ScheduledTasks", token, None).await;
+    assert_eq!(status, StatusCode::OK, "{tasks}");
+    for task in tasks.as_array().unwrap() {
+        let state = task["State"].as_str().unwrap_or_default();
+        assert!(["Idle", "Running", "Cancelling"].contains(&state), "{task}");
+        let percent = &task["CurrentProgressPercentage"];
+        assert!(percent.is_number() || percent.is_null(), "{task}");
+        if state == "Idle" {
+            assert!(percent.is_null(), "an idle task has no progress: {task}");
+        }
+    }
+    tasks
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["Key"] == "LibraryScan" || t["Id"] == "LibraryScan")
+        .cloned()
+        .expect("the library scan task is listed")
+}
+
+#[tokio::test]
+async fn r3tasks_running_scan_shows_its_progress_and_clears_it_after() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, viewer, _) = g1_owner_and_viewer(&state, &app).await;
+    create_library_via_api(&app, &state, &owner, "R3 Tasks First", "Movies").await;
+    create_library_via_api(&app, &state, &owner, "R3 Tasks Second", "Movies").await;
+    b17_movies(&media_folder(&state, "r3 tasks first"), 2);
+    b17_movies(&media_folder(&state, "r3 tasks second"), 2);
+    let addr = b17_serve(&app).await;
+
+    // The scan waits for the scan lock in its first library, so the task stays running.
+    let lock = rustyfin_core::scanner::SCAN_LOCK.lock().await;
+    let uri = "/ScheduledTasks/Running/LibraryScan";
+    let (status, body) = send_authed(&app, "POST", uri, &owner, None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let mut running = serde_json::Value::Null;
+    for _ in 0..200 {
+        running = r3tasks_scan_entry(&app, &owner).await;
+        if running["State"] == "Running" && running["CurrentProgressPercentage"].is_number() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(running["State"], "Running", "{running}");
+    assert_eq!(running["CurrentProgressPercentage"], 0.0, "{running}");
+
+    // An administrator's socket gets the tasks after ScheduledTasksInfoStart, as in Jellyfin.
+    let mut socket = G1cSocket::open(addr, &owner).await;
+    r3tasks_send(
+        &mut socket,
+        r#"{"MessageType":"ScheduledTasksInfoStart","Data":"0,500"}"#,
+    )
+    .await;
+    let info = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let frame = socket.next().await;
+            if frame["MessageType"] == "ScheduledTasksInfo" {
+                return frame;
+            }
+        }
+    })
+    .await
+    .expect("a ScheduledTasksInfo frame");
+    let scan = info["Data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["Id"] == "LibraryScan")
+        .cloned()
+        .unwrap();
+    assert_eq!(scan["State"], "Running", "{scan}");
+    assert!(scan["CurrentProgressPercentage"].is_number(), "{scan}");
+
+    // A viewer's socket gets none.
+    let mut other = G1cSocket::open(addr, &viewer).await;
+    r3tasks_send(
+        &mut other,
+        r#"{"MessageType":"ScheduledTasksInfoStart","Data":"0,500"}"#,
+    )
+    .await;
+    let marker = WsEvent::LibraryChanged {
+        data: serde_json::json!({ "LibraryName": "g1c-end" }),
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    state.ws_broadcast.send(marker).unwrap();
+    let frames = other.until_end().await;
+    assert!(
+        !frames.iter().any(|f| f.starts_with("ScheduledTasksInfo")),
+        "{frames:?}"
+    );
+
+    // Once the scan runs, its percent only rises, and the ended task has none.
+    drop(lock);
+    let mut seen = vec![0.0];
+    let mut ended = serde_json::Value::Null;
+    for _ in 0..1000 {
+        ended = r3tasks_scan_entry(&app, &owner).await;
+        if ended["State"] == "Idle" {
+            break;
+        }
+        if let Some(p) = ended["CurrentProgressPercentage"].as_f64() {
+            seen.push(p);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(ended["State"], "Idle", "{ended}");
+    assert!(ended["CurrentProgressPercentage"].is_null(), "{ended}");
+    assert_eq!(
+        ended["LastExecutionResult"]["Status"], "Completed",
+        "{ended}"
+    );
+    assert!(
+        seen.windows(2).all(|w| w[0] <= w[1]) && seen.iter().all(|p| (0.0..=100.0).contains(p)),
+        "{seen:?}"
+    );
+}
+
 #[tokio::test]
 async fn b17_new_socket_lists_the_scans_in_progress() {
     let state = test_state().await;

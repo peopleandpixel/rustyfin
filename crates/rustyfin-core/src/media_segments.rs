@@ -561,6 +561,14 @@ pub async fn detect_and_save(
 
 /// Batch detect segments for all episodes in a library.
 pub async fn detect_for_all_episodes(pool: &SqlitePool) -> Result<usize, String> {
+    detect_for_all_episodes_with_progress(pool, &crate::task_progress::TaskProgress::new()).await
+}
+
+/// `detect_for_all_episodes`, reporting the share of the episodes looked at on `progress`.
+pub async fn detect_for_all_episodes_with_progress(
+    pool: &SqlitePool,
+    progress: &crate::task_progress::TaskProgress,
+) -> Result<usize, String> {
     // Get all episodes with paths and runtime
     let episodes: Vec<(String, String, Option<i64>)> = sqlx::query(
         "SELECT id, path, runtime_ticks FROM media_items WHERE media_type = 'Episode' AND path IS NOT NULL",
@@ -576,7 +584,8 @@ pub async fn detect_for_all_episodes(pool: &SqlitePool) -> Result<usize, String>
     .map_err(|e| format!("Failed to fetch episodes: {}", e))?;
 
     let mut count = 0;
-    for (id_str, path, runtime_ticks) in &episodes {
+    for (i, (id_str, path, runtime_ticks)) in episodes.iter().enumerate() {
+        progress.report_count(i, episodes.len());
         let item_id = match Uuid::parse_str(id_str) {
             Ok(id) => id,
             Err(e) => {
