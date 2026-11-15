@@ -188,12 +188,17 @@ pub async fn plan_rendition(
     })
 }
 
-/// Reads an image's size from the first 64 KiB of its file, which holds the header for most
-/// formats. `None` when that is not enough or the file cannot be read.
-fn header_dimensions(path: &Path) -> Option<(u32, u32)> {
+/// How many bytes of a file `header_dimensions` reads at most.
+pub const HEADER_READ_MAX_BYTES: u64 = 64 << 10;
+
+/// Reads an image's size from the first `HEADER_READ_MAX_BYTES` of its file, which hold the header
+/// for most formats. `None` when that is not enough or the file cannot be read.
+pub fn header_dimensions(path: &Path) -> Option<(u32, u32)> {
     let file = std::fs::File::open(path).ok()?;
     let mut head = Vec::new();
-    file.take(64 * 1024).read_to_end(&mut head).ok()?;
+    file.take(HEADER_READ_MAX_BYTES)
+        .read_to_end(&mut head)
+        .ok()?;
     image::ImageReader::new(std::io::Cursor::new(head))
         .with_guessed_format()
         .ok()?

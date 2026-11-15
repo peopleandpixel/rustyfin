@@ -3784,7 +3784,7 @@ async fn r2photos_home_videos_are_listed_as_video_items() {
     let state = test_state().await;
     let (token, _) = admin_session(&state).await;
     r2photos_library(&state).await;
-    let app = app(state);
+    let app = app(state.clone());
     let items = r2photos_items(&app, &token).await;
     for (file, name) in [("garden walk.mkv", "garden walk"), ("party.mp4", "party")] {
         let item = items
@@ -3793,6 +3793,16 @@ async fn r2photos_home_videos_are_listed_as_video_items() {
         assert_eq!(item["Type"], "Video", "{item}");
         assert_eq!(item["MediaType"], "Video", "{item}");
         assert_eq!(item["Name"], name, "{item}");
+        // Like movies and episodes, a video's details are never cached: re-probes don't clear it.
+        let id = item["Id"].as_str().unwrap();
+        let (status, details) =
+            send_authed(&app, "GET", &format!("/Items/{id}"), &token, None).await;
+        assert_eq!(status, StatusCode::OK, "{details}");
+        assert_eq!(details["Type"], "Video", "{details}");
+        assert!(
+            !state.cache.item_details.contains_key(id),
+            "{file} was cached"
+        );
     }
     assert_eq!(items["IMG_0001.jpg"]["Type"], "Photo");
 
@@ -3882,6 +3892,16 @@ async fn r2photos_a_photo_is_its_own_primary_image() {
         .execute(&db)
         .await
         .unwrap();
+    // A sentinel in each photo's row: an unchanged photo keeps it, a rewritten one is read again.
+    sqlx::query("UPDATE photo_metadata SET camera_make = 'Sentinel'")
+        .execute(&db)
+        .await
+        .unwrap();
+    std::fs::write(
+        std::path::Path::new(&folder).join("scan.jpg"),
+        b30_jpeg(32, 20, [0, 0, 255]),
+    )
+    .unwrap();
     let lib = rustyfin_db::repo_library::get_all_libraries(&db)
         .await
         .unwrap()
@@ -3891,6 +3911,34 @@ async fn r2photos_a_photo_is_its_own_primary_image() {
     rustyfin_core::scanner::scan_library(&db, &lib)
         .await
         .unwrap();
+    let make = |file: &str| {
+        let id = items[file]["Id"].as_str().unwrap().to_string();
+        let db = db.clone();
+        async move {
+            sqlx::query_as::<_, (Option<String>, Option<i32>)>(
+                "SELECT camera_make, width FROM photo_metadata WHERE item_id = ?",
+            )
+            .bind(id)
+            .fetch_one(&db)
+            .await
+            .unwrap()
+        }
+    };
+    assert_eq!(
+        make("IMG_0001.jpg").await,
+        (Some("Sentinel".into()), Some(40))
+    );
+    assert_eq!(make("scan.jpg").await, (None, Some(32)));
+    // The rescan keeps exactly the two home videos.
+    let (_, list) = send_authed(
+        &app,
+        "GET",
+        "/Items?Recursive=true&IncludeItemTypes=Video",
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(list["TotalRecordCount"], 2, "{list}");
     let count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM item_images WHERE image_type = 'Primary'")
             .fetch_one(&db)

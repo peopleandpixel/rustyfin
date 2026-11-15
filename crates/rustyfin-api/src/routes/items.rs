@@ -1960,12 +1960,14 @@ async fn get_item(
                 &state.data_dir,
             )
             .await;
-            // Movies and episodes are not cached: their sources, streams, chapters and
-            // trickplay change on rescans, re-probes and extraction, and none of those
-            // clear this cache.
+            // Movies, episodes and other videos are not cached: their sources, streams,
+            // chapters and trickplay change on rescans, re-probes and extraction, and none of
+            // those clear this cache.
             if !matches!(
                 item.media_type,
-                rustyfin_model::media::MediaType::Movie | rustyfin_model::media::MediaType::Episode
+                rustyfin_model::media::MediaType::Movie
+                    | rustyfin_model::media::MediaType::Episode
+                    | rustyfin_model::media::MediaType::Video
             ) {
                 state.cache.item_details.insert(id_str, item.clone());
             }

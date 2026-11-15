@@ -234,63 +234,110 @@ pub async fn scan_with_metadata(
 /// picture as its Primary. A failure is logged and skips its photo. Returns how many photos were
 /// read.
 async fn read_photos(pool: &SqlitePool, library: &Library, scope: &ScanScope) -> u32 {
-    let photos =
-        match rustyfin_db::repo_photo::library_photos(pool, library.id, &path_scope(scope)).await {
-            Ok(photos) => photos,
-            Err(e) => {
-                tracing::warn!(
-                    "failed to list the photos of library '{}': {}",
-                    library.name,
-                    e
-                );
-                return 0;
-            }
-        };
-    if photos.is_empty() {
-        return 0;
-    }
-    // One stat per photo. Only an unread or changed file is read; a photo with no Primary image
-    // gets its file's version and size for one.
-    let read = tokio::task::spawn_blocking(move || {
-        photos
-            .into_iter()
-            .filter_map(|photo| {
-                let current = std::fs::metadata(&photo.path)
-                    .ok()
-                    .map(|meta| crate::image_proxy::file_stamp(&meta));
-                if photo.stamp == Some(current) {
-                    if photo.has_primary {
-                        return None;
-                    }
-                    let (stamp, width, height) =
-                        local_images::local_image_version(Path::new(&photo.path));
-                    let size = rustyfin_model::photo::PhotoInfo {
-                        width,
-                        height,
-                        ..Default::default()
-                    };
-                    return Some((photo, stamp, size, false));
-                }
-                let (stamp, info) = crate::photo_info::read_photo(Path::new(&photo.path));
-                Some((photo, stamp, info, true))
-            })
-            .collect::<Vec<_>>()
-    })
-    .await;
-    let read = match read {
-        Ok(read) => read,
-        Err(e) => {
-            tracing::warn!(
-                "failed to read the photos of library '{}': {}",
-                library.name,
-                e
-            );
-            return 0;
-        }
-    };
+    read_photos_with(
+        pool,
+        library,
+        scope,
+        crate::photo_info::read_photo,
+        PHOTO_READ_TIMEOUT,
+    )
+    .await
+}
 
+/// How many photos are read before what they gave is stored, so an interrupted scan keeps it.
+const PHOTO_CHUNK: usize = 200;
+
+/// The longest one photo's stat and reads may take. A photo that takes longer is skipped for this
+/// scan; its blocking read can't be stopped, but the scan stops waiting for it.
+const PHOTO_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// After this many photos in a row time out, the rest of the pass is left for a later scan, as the
+/// storage likely isn't answering.
+const PHOTO_TIMEOUTS_IN_A_ROW: u32 = 3;
+
+/// Reads a photo's file: its stamp and what it says (`photo_info::read_photo`, or a stand-in in
+/// tests).
+type PhotoReader = fn(&Path) -> (Option<i64>, rustyfin_model::photo::PhotoInfo);
+
+/// What one photo's read gave: the file's stamp and what it says. `changed` when the metadata is to
+/// be stored again; else only the size was read, for a missing Primary image.
+struct PhotoRead {
+    stamp: Option<i64>,
+    info: rustyfin_model::photo::PhotoInfo,
+    changed: bool,
+}
+
+/// Stats and reads one photo; `None` when there's nothing to store: the file is gone, isn't a
+/// regular file, or is unchanged with a Primary image. A FIFO, socket or device named like a photo
+/// is never opened, as an open could block. A read that panics is logged; a changed file then gets
+/// an empty row at its current stamp, so it isn't read again until it changes.
+fn read_one_photo(
+    photo: &rustyfin_db::repo_photo::StoredPhoto,
+    read: PhotoReader,
+) -> Option<PhotoRead> {
+    let path = Path::new(&photo.path);
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() {
+        tracing::warn!("photo '{}' is not a regular file; skipped", photo.path);
+        return None;
+    }
+    let current = crate::image_proxy::file_stamp(&meta);
+    if photo.stamp == Some(Some(current)) {
+        if photo.has_primary {
+            return None;
+        }
+        let read = std::panic::catch_unwind(|| crate::photo_info::read_photo_size(path));
+        let Ok((stamp, width, height)) = read else {
+            tracing::warn!(
+                "reading the size of photo '{}' panicked; skipped",
+                photo.path
+            );
+            return None;
+        };
+        let info = rustyfin_model::photo::PhotoInfo {
+            width,
+            height,
+            ..Default::default()
+        };
+        return Some(PhotoRead {
+            stamp,
+            info,
+            changed: false,
+        });
+    }
+    Some(match std::panic::catch_unwind(|| read(path)) {
+        Ok((stamp, info)) => PhotoRead {
+            stamp,
+            info,
+            changed: true,
+        },
+        Err(_) => {
+            tracing::warn!(
+                "reading photo '{}' panicked; it is skipped until the file changes",
+                photo.path
+            );
+            PhotoRead {
+                stamp: Some(current),
+                info: rustyfin_model::photo::PhotoInfo::default(),
+                changed: true,
+            }
+        }
+    })
+}
+
+/// Stores what a chunk of photos gave: the metadata of each changed one, and a Primary image for
+/// each with none and a readable header. Returns how many metadata rows were stored.
+async fn store_photo_reads(
+    pool: &SqlitePool,
+    reads: Vec<(rustyfin_db::repo_photo::StoredPhoto, PhotoRead)>,
+) -> u32 {
     let mut count = 0;
-    for (photo, stamp, info, changed) in read {
+    for (photo, read) in reads {
+        let PhotoRead {
+            stamp,
+            info,
+            changed,
+        } = read;
         if changed {
             if let Err(e) =
                 rustyfin_db::repo_photo::save_photo_info(pool, photo.item_id, stamp, &info).await
@@ -318,6 +365,67 @@ async fn read_photos(pool: &SqlitePool, library: &Library, scope: &ScanScope) ->
         if let Err(e) = rustyfin_db::repo_image::upsert_image(pool, &image).await {
             tracing::warn!("failed to store the image of '{}': {}", photo.path, e);
         }
+    }
+    count
+}
+
+/// `read_photos` with the reader and the per-photo time limit given. Each photo is read on its own
+/// blocking task, and what a chunk of `PHOTO_CHUNK` photos gave is stored before the next is read.
+async fn read_photos_with(
+    pool: &SqlitePool,
+    library: &Library,
+    scope: &ScanScope,
+    read: PhotoReader,
+    timeout: std::time::Duration,
+) -> u32 {
+    let photos =
+        match rustyfin_db::repo_photo::library_photos(pool, library.id, &path_scope(scope)).await {
+            Ok(photos) => photos,
+            Err(e) => {
+                tracing::warn!(
+                    "failed to list the photos of library '{}': {}",
+                    library.name,
+                    e
+                );
+                return 0;
+            }
+        };
+    let mut count = 0;
+    let mut timeouts_in_a_row = 0;
+    for chunk in photos.chunks(PHOTO_CHUNK) {
+        let mut reads = Vec::with_capacity(chunk.len());
+        for photo in chunk {
+            let task = {
+                let photo = photo.clone();
+                tokio::task::spawn_blocking(move || read_one_photo(&photo, read))
+            };
+            match tokio::time::timeout(timeout, task).await {
+                Ok(Ok(result)) => {
+                    timeouts_in_a_row = 0;
+                    reads.extend(result.map(|result| (photo.clone(), result)));
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("failed to read photo '{}': {}", photo.path, e);
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "reading photo '{}' took over {:?}; skipped for this scan",
+                        photo.path,
+                        timeout
+                    );
+                    timeouts_in_a_row += 1;
+                    if timeouts_in_a_row >= PHOTO_TIMEOUTS_IN_A_ROW {
+                        tracing::warn!(
+                            "{} photos in a row of library '{}' timed out; the rest are left for a later scan",
+                            timeouts_in_a_row,
+                            library.name
+                        );
+                        return count + store_photo_reads(pool, reads).await;
+                    }
+                }
+            }
+        }
+        count += store_photo_reads(pool, reads).await;
     }
     count
 }
@@ -2125,5 +2233,134 @@ mod tests {
         // Any other error, here a symlink loop, says nothing about the folder.
         assert_eq!(season_location(&at("loop")).await, None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A temp dir, removed when the test ends, whether it passed or not.
+    struct TempDir(PathBuf);
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A database and a Photos library on `<dir>/photos` with one Photo item per file name, which
+    /// is written as a small JPEG unless the caller makes it. Returns the pool, the library and the
+    /// folder.
+    async fn r2photos_world(dir: &Path, names: &[&str]) -> (SqlitePool, Library, PathBuf) {
+        let folder = dir.join("photos");
+        std::fs::create_dir_all(&folder).unwrap();
+        let pool = rustyfin_db::init_db(dir.join("test.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let lib = Library {
+            id: Uuid::new_v4(),
+            name: "R2 photos".to_string(),
+            content_type: LibraryContentType::Photos,
+            paths: vec![folder.to_string_lossy().into_owned()],
+        };
+        rustyfin_db::repo_library::create_library(&pool, &lib)
+            .await
+            .unwrap();
+        for name in names {
+            sqlx::query(
+                "INSERT INTO media_items (id, library_id, name, media_type, path) \
+                 VALUES (?, ?, ?, 'Photo', ?)",
+            )
+            .bind(Uuid::new_v4().to_string())
+            .bind(lib.id.to_string())
+            .bind(*name)
+            .bind(folder.join(name).to_string_lossy().into_owned())
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        (pool, lib, folder)
+    }
+
+    fn r2photos_jpeg(path: &Path) {
+        image::RgbImage::from_pixel(8, 6, image::Rgb([1, 2, 3]))
+            .save(path)
+            .unwrap();
+    }
+
+    /// Each stored photo's file name and width.
+    async fn r2photos_rows(pool: &SqlitePool) -> Vec<(String, Option<i32>)> {
+        let mut rows: Vec<(String, Option<i32>)> = sqlx::query_as(
+            "SELECT m.name, p.width FROM photo_metadata p JOIN media_items m ON m.id = p.item_id",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        rows.sort();
+        rows
+    }
+
+    /// `photo_info::read_photo`, except that `panic.jpg` panics and `slow.jpg` takes 2 s.
+    fn r2photos_reader(path: &Path) -> (Option<i64>, rustyfin_model::photo::PhotoInfo) {
+        match path.file_name().and_then(|n| n.to_str()) {
+            Some("panic.jpg") => panic!("r2photos: a reader that panics"),
+            Some("slow.jpg") => std::thread::sleep(std::time::Duration::from_secs(2)),
+            _ => {}
+        }
+        crate::photo_info::read_photo(path)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn r2photos_a_fifo_named_like_a_photo_does_not_block_the_pass() {
+        let temp = TempDir(std::env::temp_dir().join(format!("r2photos-fifo-{}", Uuid::new_v4())));
+        let (pool, lib, folder) = r2photos_world(&temp.0, &["fifo.jpg", "good.jpg"]).await;
+        r2photos_jpeg(&folder.join("good.jpg"));
+        let fifo = std::ffi::CString::new(folder.join("fifo.jpg").to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+
+        let pass = read_photos(&pool, &lib, &ScanScope::Library);
+        let count = tokio::time::timeout(std::time::Duration::from_secs(20), pass)
+            .await
+            .expect("the pass blocked on the FIFO");
+        assert_eq!(count, 1);
+        assert_eq!(r2photos_rows(&pool).await, [("good.jpg".into(), Some(8))]);
+    }
+
+    #[tokio::test]
+    async fn r2photos_a_photo_that_fails_panics_or_hangs_is_skipped_and_the_rest_are_saved() {
+        let temp = TempDir(std::env::temp_dir().join(format!("r2photos-bad-{}", Uuid::new_v4())));
+        let names = ["bad.jpg", "good.jpg", "panic.jpg", "slow.jpg"];
+        let (pool, lib, folder) = r2photos_world(&temp.0, &names).await;
+        for name in ["good.jpg", "panic.jpg", "slow.jpg"] {
+            r2photos_jpeg(&folder.join(name));
+        }
+        std::fs::write(
+            folder.join("bad.jpg"),
+            b"\xFF\xD8\xFF\xE1\xFF\xFFnot a jpeg",
+        )
+        .unwrap();
+
+        let timeout = std::time::Duration::from_millis(300);
+        let count =
+            read_photos_with(&pool, &lib, &ScanScope::Library, r2photos_reader, timeout).await;
+        // The parser's failure gives an empty row, the panic one too (so it isn't read again until
+        // the file changes), and the slow photo is left for a later scan.
+        assert_eq!(count, 3);
+        assert_eq!(
+            r2photos_rows(&pool).await,
+            [
+                ("bad.jpg".into(), None),
+                ("good.jpg".into(), Some(8)),
+                ("panic.jpg".into(), None),
+            ]
+        );
+        let primaries: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM item_images WHERE image_type = 'Primary'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(primaries, 1);
+
+        // A second pass reads only the slow photo again.
+        let count =
+            read_photos_with(&pool, &lib, &ScanScope::Library, r2photos_reader, timeout).await;
+        assert_eq!(count, 0);
     }
 }

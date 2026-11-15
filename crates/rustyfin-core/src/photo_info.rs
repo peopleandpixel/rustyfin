@@ -1,7 +1,8 @@
 //! Reads what Jellyfin's photo provider reads from a photo: its size from the image header, and the
 //! camera, orientation, exposure, place and date from its EXIF block. Nothing is decoded: the size
-//! comes from the header alone (`image_proxy`'s reader), and the EXIF block from the first
-//! `EXIF_READ_MAX_BYTES` of the file, so a huge or malformed file costs a bounded read.
+//! comes from the header in the first `image_proxy::HEADER_READ_MAX_BYTES` (64 KiB) of the file, and
+//! the EXIF block from the first `EXIF_READ_MAX_BYTES` (256 KiB), so a huge or malformed file costs
+//! two bounded reads.
 
 use std::io::Read;
 use std::path::Path;
@@ -14,10 +15,25 @@ use rustyfin_model::photo::{PhotoInfo, orientation_name};
 /// 64 KiB near the start of the file.
 pub const EXIF_READ_MAX_BYTES: u64 = 256 << 10;
 
+/// A photo's file version (`image_proxy::file_stamp`) and its size, read from the first
+/// `image_proxy::HEADER_READ_MAX_BYTES` of the file and nothing more. The stamp is `None` when the
+/// file's metadata can't be read; the size is `None` when the header isn't in those bytes.
+pub fn read_photo_size(path: &Path) -> (Option<i64>, Option<i32>, Option<i32>) {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return (None, None, None);
+    };
+    let size = crate::image_proxy::header_dimensions(path);
+    let (width, height) = match size {
+        Some((w, h)) => (i32::try_from(w).ok(), i32::try_from(h).ok()),
+        None => (None, None),
+    };
+    (Some(crate::image_proxy::file_stamp(&meta)), width, height)
+}
+
 /// A photo's file version (`image_proxy::file_stamp`) and what it says. The stamp is `None` when the
 /// file's metadata can't be read, and then the info is empty.
 pub fn read_photo(path: &Path) -> (Option<i64>, PhotoInfo) {
-    let (stamp, width, height) = crate::local_images::local_image_version(path);
+    let (stamp, width, height) = read_photo_size(path);
     if stamp.is_none() {
         return (None, PhotoInfo::default());
     }
@@ -242,10 +258,20 @@ mod tests {
         assert_eq!(exif_info(&junk), PhotoInfo::default());
     }
 
+    /// A temp dir, removed when the test ends, whether it passed or not.
+    struct TempDir(std::path::PathBuf);
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
     fn r2photos_read_photo_gives_the_header_size_and_reads_a_bounded_head() {
-        let dir = std::env::temp_dir().join(format!("r2photos-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let temp = TempDir(std::env::temp_dir().join(format!("r2photos-{}", uuid::Uuid::new_v4())));
+        let dir = &temp.0;
+        std::fs::create_dir_all(dir).unwrap();
         let path = dir.join("p.jpg");
         image::RgbImage::from_pixel(30, 20, image::Rgb([9, 9, 9]))
             .save(&path)
@@ -256,6 +282,5 @@ mod tests {
         assert_eq!(info.camera_make, None);
         let (stamp, info) = read_photo(&dir.join("missing.jpg"));
         assert_eq!((stamp, info), (None, PhotoInfo::default()));
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
