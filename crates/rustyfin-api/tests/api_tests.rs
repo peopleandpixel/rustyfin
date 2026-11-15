@@ -19106,6 +19106,98 @@ async fn r2parental_unrated_items_are_blocked_by_kind() {
 }
 
 #[tokio::test]
+async fn r2parental_watch_state_writes_refuse_a_hidden_item() {
+    let w = r2parental().await;
+    w.set_policy(serde_json::json!({ "MaxParentalRating": 10 }))
+        .await;
+    let rough = w.id("Rough");
+    let writes = [
+        ("POST", "/UserPlayedItems/{id}", None),
+        ("DELETE", "/UserPlayedItems/{id}", None),
+        ("POST", "/UserFavoriteItems/{id}", None),
+        ("DELETE", "/UserFavoriteItems/{id}", None),
+        ("POST", "/Users/{user}/PlayedItems/{id}", None),
+        ("DELETE", "/Users/{user}/PlayedItems/{id}", None),
+        ("POST", "/Users/{user}/FavoriteItems/{id}", None),
+        ("DELETE", "/Users/{user}/FavoriteItems/{id}", None),
+        (
+            "POST",
+            "/UserItems/{id}/UserData",
+            Some(serde_json::json!({ "IsFavorite": true, "Played": true })),
+        ),
+        (
+            "POST",
+            "/Users/{user}/Items/{id}/UserData",
+            Some(serde_json::json!({ "IsFavorite": true, "Played": true })),
+        ),
+        ("POST", "/UserItems/{id}/Rating?Likes=true", None),
+        ("DELETE", "/UserItems/{id}/Rating", None),
+        ("POST", "/Users/{user}/Items/{id}/Rating?Likes=true", None),
+        ("DELETE", "/Users/{user}/Items/{id}/Rating", None),
+    ];
+    let row = |user: uuid::Uuid| {
+        let db = w.state.db.clone();
+        async move {
+            sqlx::query_as::<_, (i64, i64, i64)>(
+                "SELECT played, is_favorite, play_count FROM user_item_data \
+                 WHERE user_id = ? AND item_id = ?",
+            )
+            .bind(user.to_string())
+            .bind(rough.to_string())
+            .fetch_optional(&db)
+            .await
+            .unwrap()
+        }
+    };
+    let before = row(w.kid_id).await;
+    for (method, route, body) in &writes {
+        let uri = route
+            .replace("{id}", &rough.to_string())
+            .replace("{user}", &w.kid_id.to_string());
+        let (status, answer) =
+            send(&w.app, request(method, &uri, Some(&w.kid), body.clone())).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{method} {uri}: {answer}");
+    }
+    assert_eq!(
+        row(w.kid_id).await,
+        before,
+        "the kid's data on Rough is unchanged"
+    );
+
+    // The administrator, without limits, writes their own data on the same item.
+    let (_, admin) = w.get(&w.admin, "/Users/Me").await;
+    let admin_id = admin["Id"].as_str().unwrap().to_string();
+    for (method, route, body) in &writes {
+        let uri = route
+            .replace("{id}", &rough.to_string())
+            .replace("{user}", &admin_id);
+        let (status, answer) =
+            send(&w.app, request(method, &uri, Some(&w.admin), body.clone())).await;
+        assert!(status.is_success(), "{method} {uri}: {status} {answer}");
+    }
+}
+
+#[tokio::test]
+async fn r2parental_card_index_leaves_out_hidden_items() {
+    let w = r2parental().await;
+    w.set_policy(serde_json::json!({ "MaxParentalRating": 10 }))
+        .await;
+    // The web client's slim library index; its letter rail is built from these names, so the
+    // letters count only what the kid sees.
+    let uri = "/Items?Recursive=true&IncludeItemTypes=Movie&RustyfinCardIndex=true\
+               &SortBy=SortName&StartIndex=0&Limit=100";
+    let (admin, _) = w.names(&w.admin, uri).await;
+    assert!(admin.contains(&"Rough".to_string()), "{admin:?}");
+    assert_eq!(
+        w.names(&w.kid, uri).await,
+        (
+            r2parental_names(&["Gentle", "Odd", "Plain", "Pleasant", "Spooky"]),
+            5
+        )
+    );
+}
+
+#[tokio::test]
 async fn r2parental_tags_block_and_allow() {
     let w = r2parental().await;
     let movies = "/Items?Recursive=true&IncludeItemTypes=Movie";
