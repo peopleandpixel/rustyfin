@@ -1,8 +1,10 @@
 use crate::repo_by_name::{ByNameKind, by_name_id};
+use crate::repo_media::PathScope;
 use rustyfin_model::media::{MediaItem, MediaType};
 use rustyfin_model::metadata::MetadataPerson;
 use rustyfin_model::person::{NameIdPair, PersonDto};
 use sqlx::SqlitePool;
+use std::collections::HashSet;
 use uuid::Uuid;
 
 /// The id of the music artist `name`: one person per folded name, with the id `by_name_id` gives it.
@@ -88,6 +90,32 @@ pub async fn link_music_artists(
         }
     }
     tx.commit().await
+}
+
+/// The ids of the items of `item_type` in `library`, within `scope`, that have a person linked as `kind`.
+pub async fn linked_item_ids(
+    pool: &SqlitePool,
+    library_id: Uuid,
+    scope: &PathScope,
+    item_type: &str,
+    kind: &str,
+) -> Result<HashSet<Uuid>, sqlx::Error> {
+    let rows: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT DISTINCT m.id FROM media_items AS m \
+         JOIN item_people AS p ON p.item_id = m.id \
+         WHERE m.library_id = ?1 AND m.media_type = ?3 AND p.type = ?4 AND {}",
+        scope.sql("m.path", 2)
+    )))
+    .bind(library_id.to_string())
+    .bind(scope.param())
+    .bind(item_type)
+    .bind(kind)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .iter()
+        .filter_map(|id| Uuid::parse_str(id).ok())
+        .collect())
 }
 
 /// The music artists of `library` (all libraries when `None`): the people linked as `link_kind`

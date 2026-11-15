@@ -1911,6 +1911,44 @@ pub async fn get_library_paths(
     Ok(rows)
 }
 
+/// The parent of an item, if it has one.
+pub async fn get_item_parent_id(pool: &SqlitePool, id: Uuid) -> Result<Option<Uuid>, sqlx::Error> {
+    let parent: Option<Option<String>> =
+        sqlx::query_scalar("SELECT parent_id FROM media_items WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_optional(pool)
+            .await?;
+    Ok(parent
+        .flatten()
+        .and_then(|parent| Uuid::parse_str(&parent).ok()))
+}
+
+/// Store the disc number of a track that has none. A disc number already stored is kept.
+pub async fn fill_track_disc(pool: &SqlitePool, track: Uuid, disc: i32) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE media_items SET parent_index_number = ? WHERE id = ? AND parent_index_number IS NULL")
+        .bind(disc)
+        .bind(track.to_string())
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Store the year of an item (a track or an album) that has none. A year already stored is kept.
+pub async fn fill_production_year(
+    pool: &SqlitePool,
+    item: Uuid,
+    year: i32,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE media_items SET production_year = ? WHERE id = ? AND production_year IS NULL",
+    )
+    .bind(year)
+    .bind(item.to_string())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Fetch the source of each audio item of a library whose source path is in `scope`, as (item id, path,
 /// size, modified). The size and modification time are the stamp that the source stores, and are `None`
 /// when it has none.
