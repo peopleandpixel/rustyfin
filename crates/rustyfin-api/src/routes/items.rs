@@ -66,7 +66,7 @@ fn apply_user_data(item: &mut MediaItem, mut user_data: rustyfin_model::playback
         }
     }
     user_data.played_percentage = played_percentage(&user_data, item.runtime_ticks);
-    item.user_data = Some(user_data);
+    item.user_data = Some(user_data.for_item(item.id));
 }
 
 /// Jellyfin's PlayedPercentage: 100 * position / runtime, only with a position and a known runtime.
@@ -1364,6 +1364,7 @@ pub fn routes() -> Router<AppState> {
         .route("/Items/{id}/Similar", get(get_similar))
         .route("/Items/Latest", get(get_latest))
         .route("/Items/Resume", get(get_resume))
+        .route("/UserItems/Resume", get(get_resume))
         .route("/Items/Filters", get(get_filters))
         .route(
             "/Items/{id}/Trickplay/Preview/{width}/{seekTicks}",
@@ -1376,11 +1377,6 @@ pub fn routes() -> Router<AppState> {
         .route("/Items/{id}/Ancestors", get(get_ancestors))
         .route("/Items/{id}/Collections", get(get_item_collections))
         .route("/Items/{id}/Attachments/{index}", get(get_attachments))
-        // User items with rating
-        .route(
-            "/Users/{userId}/Items/{itemId}/Rating",
-            delete(delete_rating),
-        )
         // Channels
         .route("/Channels", get(get_channels))
         .route("/Channels/Items/Latest", get(get_channels_items_latest))
@@ -2155,10 +2151,26 @@ async fn get_resume(
     let user = query_user(&state, &claims, query.user_id)
         .await?
         .ok_or_else(|| ApiError::NotFound("user not found".into()))?;
-    let limit = query.limit.unwrap_or(10);
-    let mut items =
-        rustyfin_db::repo_media::get_user_resume_items(&state.db_ro, user, limit).await?;
-    let total = items.len() as i64;
+    resume_page(&state, user, &query).await
+}
+
+/// One page of the user's resume list (`/UserItems/Resume`, `/Items/Resume` and the legacy
+/// `/Users/{userId}/Items/Resume`), with the count of all matching items, as Jellyfin answers it.
+async fn resume_page(
+    state: &AppState,
+    user: Uuid,
+    query: &ResumeQuery,
+) -> Result<Json<QueryResult>, ApiError> {
+    let start_index = query.start_index.unwrap_or(0).max(0);
+    let filter = rustyfin_db::repo_media::ResumeFilter {
+        include_types: query.include_types(),
+        exclude_types: csv(query.exclude_item_types.as_deref()),
+        parent_id: query.parent_id,
+        start_index,
+        limit: query.limit.filter(|l| *l >= 0),
+    };
+    let (mut items, total) =
+        rustyfin_db::repo_media::get_user_resume_items(&state.db_ro, user, &filter).await?;
     // Enrich resume items using batch queries
     // Skip blurhash for list views to avoid per-item disk I/O
     let tmdb = state.tmdb.api(None);
@@ -2176,16 +2188,71 @@ async fn get_resume(
     Ok(Json(QueryResult {
         items,
         total_record_count: total,
-        start_index: 0,
+        start_index,
     }))
 }
 
+/// The values of a comma-separated query parameter, trimmed, empty ones dropped.
+fn csv(value: Option<&str>) -> Vec<String> {
+    value
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Jellyfin's resume query parameters. Its clients send them in camelCase or PascalCase.
 #[derive(Deserialize)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "camelCase")]
 struct ResumeQuery {
+    #[serde(default, alias = "Limit")]
     limit: Option<i64>,
-    #[serde(alias = "userId")]
+    #[serde(default, alias = "StartIndex")]
+    start_index: Option<i64>,
+    #[serde(default, alias = "UserId")]
     user_id: Option<Uuid>,
+    #[serde(default, alias = "ParentId")]
+    parent_id: Option<Uuid>,
+    #[serde(default, alias = "IncludeItemTypes")]
+    include_item_types: Option<String>,
+    #[serde(default, alias = "ExcludeItemTypes")]
+    exclude_item_types: Option<String>,
+    #[serde(default, alias = "MediaTypes")]
+    media_types: Option<String>,
+}
+
+impl ResumeQuery {
+    /// The stored types to list: `IncludeItemTypes`, narrowed to those of `MediaTypes`. Empty means
+    /// any type; when the two leave nothing, a type no item has, so nothing is listed.
+    fn include_types(&self) -> Vec<String> {
+        let kinds = csv(self.include_item_types.as_deref());
+        let media = csv(self.media_types.as_deref());
+        if media.is_empty() {
+            return kinds;
+        }
+        let of_media: Vec<String> = media
+            .iter()
+            .flat_map(|m| match m.to_ascii_lowercase().as_str() {
+                "video" => &["Movie", "Episode"][..],
+                "audio" => &["Audio"][..],
+                "photo" => &["Photo"][..],
+                _ => &[][..],
+            })
+            .map(|k| k.to_string())
+            .collect();
+        let types: Vec<String> = if kinds.is_empty() {
+            of_media
+        } else {
+            kinds.into_iter().filter(|k| of_media.contains(k)).collect()
+        };
+        if types.is_empty() {
+            vec![String::new()]
+        } else {
+            types
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -2249,29 +2316,7 @@ async fn get_user_resume(
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<QueryResult>, ApiError> {
     let user_id = path_user(&state, &claims, user_id).await?;
-    let limit = query.limit.unwrap_or(10);
-    let mut items =
-        rustyfin_db::repo_media::get_user_resume_items(&state.db_ro, user_id, limit).await?;
-    let total = items.len() as i64;
-    // Enrich user resume items using batch queries
-    // Skip blurhash for list views to avoid per-item disk I/O
-    let tmdb = state.tmdb.api(None);
-    enrich_items(
-        &state.db_ro,
-        &state.server_id,
-        Some(user_id),
-        &mut items,
-        &state.http_client,
-        tmdb.as_ref(),
-        &state.data_dir,
-        true, // skip_blurhash for list views
-    )
-    .await;
-    Ok(Json(QueryResult {
-        items,
-        total_record_count: total,
-        start_index: 0,
-    }))
+    resume_page(&state, user_id, &query).await
 }
 
 /// `GET /Items/{id}/Trickplay/Preview/{width}/{seekTicks}` — Returns a trickplay preview thumbnail.
@@ -2405,22 +2450,6 @@ async fn get_attachments(
     State(_state): State<AppState>,
     Path((_id, _index)): Path<(Uuid, i32)>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
-    Ok((StatusCode::OK, Json(serde_json::json!({}))))
-}
-
-/// DELETE /Users/{userId}/Items/{itemId}/Rating
-async fn delete_rating(
-    State(state): State<AppState>,
-    Path((user_id, item_id)): Path<(Uuid, Uuid)>,
-    Extension(claims): Extension<Claims>,
-) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
-    let user_id = path_user(&state, &claims, user_id).await?;
-    rustyfin_db::repo_media::get_item_by_id(&state.db_ro, item_id)
-        .await?
-        .ok_or(ApiError::NotFound("item not found".into()))?;
-    rustyfin_db::repo_playback::clear_user_rating(&state.db, user_id, item_id)
-        .await
-        .ok();
     Ok((StatusCode::OK, Json(serde_json::json!({}))))
 }
 

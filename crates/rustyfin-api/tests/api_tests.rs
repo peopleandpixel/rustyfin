@@ -13022,8 +13022,8 @@ async fn j5_user_data_on_a_real_item_still_works() {
     let (app, token, user, film) = j5_user_data_app().await;
     let (yes, no) = (Some(true), Some(false));
     let likes = Some(r#"{"Likes":true}"#);
-    // Each step's status and the IsFavorite, Played and Likes it answers with. The routes that
-    // answer `{}` show nothing, so the step after each shows its change.
+    // Each step's status and the IsFavorite, Played and Likes it answers with. Every route answers
+    // the user data, as Jellyfin's do.
     let steps = [
         (
             "POST",
@@ -13035,7 +13035,7 @@ async fn j5_user_data_on_a_real_item_still_works() {
             "DELETE",
             format!("/UserFavoriteItems/{film}"),
             None,
-            [None; 3],
+            [no, no, None],
         ),
         (
             "POST",
@@ -13047,7 +13047,7 @@ async fn j5_user_data_on_a_real_item_still_works() {
             "DELETE",
             format!("/UserPlayedItems/{film}"),
             None,
-            [None; 3],
+            [no, no, None],
         ),
         (
             "PUT",
@@ -13059,7 +13059,7 @@ async fn j5_user_data_on_a_real_item_still_works() {
             "DELETE",
             format!("/Users/{user}/Items/{film}/Rating"),
             None,
-            [None; 3],
+            [no, no, None],
         ),
         (
             "POST",
@@ -13097,6 +13097,375 @@ async fn j5_user_data_on_a_real_item_still_works() {
         .map(|(method, uri, _, data)| (*method, uri.as_str(), StatusCode::OK, *data))
         .collect();
     assert_eq!(actual, expected);
+}
+
+// R1 watch: Jellyfin 10.9+ user data routes, the resume list and the mark rules
+
+/// Sends a request as B110's administrator; answers the status and the JSON answer.
+async fn r1watch_send(
+    b: &B110,
+    method: &str,
+    uri: &str,
+    body: Option<serde_json::Value>,
+) -> (StatusCode, serde_json::Value) {
+    let body = body.map(|body| body.to_string());
+    send_authed(&b.app, method, uri, &b.token, body.as_deref()).await
+}
+
+#[tokio::test]
+async fn r1watch_played_and_favorite_routes_answer_the_user_data() {
+    let b = B110::new().await;
+    let (film, user) = (b.film, b.user);
+    let id = film.to_string();
+    // Each step's Played and IsFavorite; every answer carries Jellyfin's ItemId and Key.
+    let steps = [
+        ("POST", format!("/UserPlayedItems/{film}"), true, false),
+        ("DELETE", format!("/UserPlayedItems/{film}"), false, false),
+        (
+            "POST",
+            format!("/UserFavoriteItems/{film}?userId={user}"),
+            false,
+            true,
+        ),
+        ("DELETE", format!("/UserFavoriteItems/{film}"), false, false),
+        // The legacy routes older clients use answer the same.
+        (
+            "POST",
+            format!("/Users/{user}/PlayedItems/{film}"),
+            true,
+            false,
+        ),
+        (
+            "DELETE",
+            format!("/Users/{user}/PlayedItems/{film}"),
+            false,
+            false,
+        ),
+        (
+            "POST",
+            format!("/Users/{user}/FavoriteItems/{film}"),
+            false,
+            true,
+        ),
+        (
+            "DELETE",
+            format!("/Users/{user}/FavoriteItems/{film}"),
+            false,
+            false,
+        ),
+    ];
+    let mut actual = Vec::new();
+    for (method, uri, _, _) in &steps {
+        let (status, data) = r1watch_send(&b, method, uri, None).await;
+        actual.push((
+            *method,
+            uri.as_str(),
+            status,
+            data["Played"].as_bool(),
+            data["IsFavorite"].as_bool(),
+            data["ItemId"].as_str() == Some(id.as_str()),
+            data["Key"].is_string(),
+        ));
+    }
+    let expected: Vec<_> = steps
+        .iter()
+        .map(|(method, uri, played, favorite)| {
+            (
+                *method,
+                uri.as_str(),
+                StatusCode::OK,
+                Some(*played),
+                Some(*favorite),
+                true,
+                true,
+            )
+        })
+        .collect();
+    assert_eq!(actual, expected);
+}
+
+#[tokio::test]
+async fn r1watch_user_data_routes_on_an_unknown_item_answer_404() {
+    let b = B110::new().await;
+    let (x, user) = (uuid::Uuid::new_v4(), b.user);
+    let cases = [
+        ("POST", format!("/UserPlayedItems/{x}")),
+        ("DELETE", format!("/UserPlayedItems/{x}")),
+        ("POST", format!("/UserFavoriteItems/{x}")),
+        ("DELETE", format!("/UserFavoriteItems/{x}")),
+        ("GET", format!("/UserItems/{x}/UserData")),
+        ("POST", format!("/UserItems/{x}/UserData")),
+        ("GET", format!("/Users/{user}/Items/{x}/UserData")),
+        ("POST", format!("/Users/{user}/Items/{x}/UserData")),
+        ("POST", format!("/UserItems/{x}/Rating?likes=true")),
+        ("DELETE", format!("/UserItems/{x}/Rating")),
+        ("POST", format!("/Users/{user}/Items/{x}/Rating?likes=true")),
+    ];
+    let mut actual = Vec::new();
+    for (method, uri) in &cases {
+        let body = (*method == "POST").then(|| serde_json::json!({}));
+        actual.push((
+            *method,
+            uri.as_str(),
+            r1watch_send(&b, method, uri, body).await.0,
+        ));
+    }
+    let expected: Vec<_> = cases
+        .iter()
+        .map(|(method, uri)| (*method, uri.as_str(), StatusCode::NOT_FOUND))
+        .collect();
+    assert_eq!(actual, expected);
+}
+
+#[tokio::test]
+async fn r1watch_marking_played_takes_the_date_and_clears_the_resume_point() {
+    let b = B110::new().await;
+    let film = b.film;
+    b.start(film).await;
+    b.progress(film, B110_HOUR / 2).await;
+    assert_eq!(b.ids("/UserItems/Resume").await, [film.to_string()]);
+    // Jellyfin's MarkPlayed: played, no resume point, played on `datePlayed`.
+    let uri = format!("/UserPlayedItems/{film}?datePlayed=2020-01-02T03:04:05Z");
+    let (status, data) = r1watch_send(&b, "POST", &uri, None).await;
+    assert_eq!(
+        (
+            status,
+            data["Played"].as_bool(),
+            data["PlaybackPositionTicks"].as_i64(),
+            data["LastPlayedDate"].as_str().map(|d| d[..19].to_string()),
+        ),
+        (
+            StatusCode::OK,
+            Some(true),
+            Some(0),
+            Some("2020-01-02T03:04:05".to_string())
+        )
+    );
+    assert!(b.ids("/UserItems/Resume").await.is_empty());
+    // Jellyfin's MarkUnplayed: no plays and no last played date either.
+    let uri = format!("/UserPlayedItems/{film}");
+    let (_, data) = r1watch_send(&b, "DELETE", &uri, None).await;
+    assert_eq!(
+        (
+            data["Played"].as_bool(),
+            data["PlayCount"].as_i64(),
+            data["LastPlayedDate"].is_null(),
+        ),
+        (Some(false), Some(0), true)
+    );
+}
+
+#[tokio::test]
+async fn r1watch_user_data_post_sets_only_the_fields_sent() {
+    let b = B110::new().await;
+    let (film, user) = (b.film, b.user);
+    let fields = |data: &serde_json::Value| {
+        (
+            data["PlaybackPositionTicks"].as_i64(),
+            data["PlayedPercentage"].as_f64(),
+            data["IsFavorite"].as_bool(),
+            data["Played"].as_bool(),
+        )
+    };
+    let quarter = B110_HOUR / 4;
+    let body = serde_json::json!({ "PlaybackPositionTicks": quarter, "IsFavorite": true });
+    let uri = format!("/UserItems/{film}/UserData");
+    let (status, data) = r1watch_send(&b, "POST", &uri, Some(body)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        fields(&data),
+        (Some(quarter), Some(25.0), Some(true), Some(false))
+    );
+    // The legacy form; the fields not sent are kept.
+    let legacy = format!("/Users/{user}/Items/{film}/UserData");
+    let body = serde_json::json!({ "Played": true });
+    let (_, data) = r1watch_send(&b, "POST", &legacy, Some(body)).await;
+    let expected = (Some(quarter), Some(25.0), Some(true), Some(true));
+    assert_eq!(fields(&data), expected);
+    for uri in [uri, legacy] {
+        let (status, data) = r1watch_send(&b, "GET", &uri, None).await;
+        assert_eq!((status, fields(&data)), (StatusCode::OK, expected), "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn r1watch_rating_routes_set_and_clear_likes() {
+    let b = B110::new().await;
+    let (film, user) = (b.film, b.user);
+    let steps = [
+        (
+            "POST",
+            format!("/UserItems/{film}/Rating?likes=true"),
+            Some(true),
+        ),
+        (
+            "POST",
+            format!("/Users/{user}/Items/{film}/Rating?likes=false"),
+            Some(false),
+        ),
+        ("DELETE", format!("/UserItems/{film}/Rating"), None),
+        (
+            "POST",
+            format!("/UserItems/{film}/Rating?likes=true"),
+            Some(true),
+        ),
+        ("DELETE", format!("/Users/{user}/Items/{film}/Rating"), None),
+    ];
+    let mut actual = Vec::new();
+    for (method, uri, _) in &steps {
+        let (status, data) = r1watch_send(&b, method, uri, None).await;
+        actual.push((*method, uri.as_str(), status, data["Likes"].as_bool()));
+    }
+    let expected: Vec<_> = steps
+        .iter()
+        .map(|(method, uri, likes)| (*method, uri.as_str(), StatusCode::OK, *likes))
+        .collect();
+    assert_eq!(actual, expected);
+}
+
+#[tokio::test]
+async fn r1watch_resume_pages_and_filters_as_jellyfin_does() {
+    let b = B110::new().await;
+    let [e1, _, _] = b.episodes;
+    // Resume points with set dates; the newest play is listed first.
+    for (item, day) in [
+        (b.film, "2024-01-01"),
+        (b.unknown, "2024-02-01"),
+        (e1, "2024-03-01"),
+    ] {
+        let body = serde_json::json!({
+            "PlaybackPositionTicks": 1_000_000_000,
+            "LastPlayedDate": format!("{day}T00:00:00Z"),
+        });
+        let uri = format!("/UserItems/{item}/UserData");
+        assert_eq!(
+            r1watch_send(&b, "POST", &uri, Some(body)).await.0,
+            StatusCode::OK
+        );
+    }
+    let (e1, unknown, film) = (e1.to_string(), b.unknown.to_string(), b.film.to_string());
+    let (series, season) = (b.series, b.seasons[0]);
+    let cases = [
+        (
+            "/UserItems/Resume".to_string(),
+            vec![&e1, &unknown, &film],
+            3,
+            0,
+        ),
+        (
+            "/UserItems/Resume?Limit=1&StartIndex=1".to_string(),
+            vec![&unknown],
+            3,
+            1,
+        ),
+        (
+            "/UserItems/Resume?limit=2".to_string(),
+            vec![&e1, &unknown],
+            3,
+            0,
+        ),
+        (
+            "/UserItems/Resume?IncludeItemTypes=Episode".to_string(),
+            vec![&e1],
+            1,
+            0,
+        ),
+        (
+            "/UserItems/Resume?excludeItemTypes=Episode".to_string(),
+            vec![&unknown, &film],
+            2,
+            0,
+        ),
+        (
+            "/UserItems/Resume?MediaTypes=Audio".to_string(),
+            vec![],
+            0,
+            0,
+        ),
+        (
+            "/UserItems/Resume?mediaTypes=Video".to_string(),
+            vec![&e1, &unknown, &film],
+            3,
+            0,
+        ),
+        (
+            "/UserItems/Resume?MediaTypes=Video&IncludeItemTypes=Audio".to_string(),
+            vec![],
+            0,
+            0,
+        ),
+        (
+            format!("/UserItems/Resume?ParentId={series}"),
+            vec![&e1],
+            1,
+            0,
+        ),
+        (
+            format!("/UserItems/Resume?parentId={season}"),
+            vec![&e1],
+            1,
+            0,
+        ),
+        (
+            format!("/Users/{}/Items/Resume?Limit=1", b.user),
+            vec![&e1],
+            3,
+            0,
+        ),
+        ("/Items/Resume?Limit=1".to_string(), vec![&e1], 3, 0),
+    ];
+    let mut actual = Vec::new();
+    for (uri, _, _, _) in &cases {
+        let (status, body) = r1watch_send(&b, "GET", uri, None).await;
+        let ids: Vec<String> = body["Items"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| item["Id"].as_str().unwrap_or("").to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        actual.push((
+            uri.as_str(),
+            status,
+            ids,
+            body["TotalRecordCount"].as_i64(),
+            body["StartIndex"].as_i64(),
+        ));
+    }
+    let expected: Vec<_> = cases
+        .iter()
+        .map(|(uri, ids, total, start)| {
+            (
+                uri.as_str(),
+                StatusCode::OK,
+                ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+                Some(*total),
+                Some(*start),
+            )
+        })
+        .collect();
+    assert_eq!(actual, expected);
+}
+
+#[tokio::test]
+async fn r1watch_marking_a_series_through_the_new_route_marks_its_episodes() {
+    let b = B110::new().await;
+    let series = b.series;
+    let state =
+        |data: &serde_json::Value| (data["Played"].as_bool(), data["UnplayedItemCount"].as_i64());
+    let uri = format!("/UserPlayedItems/{series}");
+    let (_, data) = r1watch_send(&b, "POST", &uri, None).await;
+    assert_eq!(state(&data), (Some(true), Some(0)));
+    let mut played = Vec::new();
+    for item in b.episodes.iter().chain(&b.seasons) {
+        let (_, data) = r1watch_send(&b, "GET", &format!("/UserItems/{item}/UserData"), None).await;
+        played.push(data["Played"].as_bool());
+    }
+    assert_eq!(played, [Some(true); 5]);
+    let (_, data) = r1watch_send(&b, "DELETE", &uri, None).await;
+    assert_eq!(state(&data), (Some(false), Some(3)));
 }
 
 // B40: playback reports on a non-media id
@@ -18219,6 +18588,11 @@ async fn g1f_rate(state: &AppState, user: &str, item: uuid::Uuid) {
     .unwrap();
 }
 
+/// A user data answer's status and `ItemId`.
+fn g1f_answer((status, data): (StatusCode, serde_json::Value)) -> (StatusCode, Option<String>) {
+    (status, data["ItemId"].as_str().map(str::to_string))
+}
+
 /// The user's `(Likes, UserRating)` on the item.
 async fn g1f_rating(state: &AppState, user: &str, item: uuid::Uuid) -> (Option<bool>, Option<i32>) {
     let data =
@@ -18261,22 +18635,22 @@ async fn g1f_delete_rating_follows_user_id() {
         );
     }
     assert_eq!(g1f_rating(&state, &owner_id, item).await, rated);
-    // On themselves: today's answer, and their rating is cleared.
+    // On themselves: their user data, as Jellyfin answers, and their rating is cleared.
     assert_eq!(
-        send(&app, delete(&viewer_id, Some(&viewer))).await,
-        (StatusCode::OK, serde_json::json!({}))
+        g1f_answer(send(&app, delete(&viewer_id, Some(&viewer))).await),
+        (StatusCode::OK, Some(item.to_string()))
     );
     assert_eq!(g1f_rating(&state, &viewer_id, item).await, cleared);
     // An administrator or the API key on another user: 200, and that user's rating is cleared.
     g1f_rate(&state, &viewer_id, item).await;
     assert_eq!(
-        send(&app, delete(&viewer_id, Some(&owner))).await,
-        (StatusCode::OK, serde_json::json!({}))
+        g1f_answer(send(&app, delete(&viewer_id, Some(&owner))).await),
+        (StatusCode::OK, Some(item.to_string()))
     );
     assert_eq!(g1f_rating(&state, &viewer_id, item).await, cleared);
     assert_eq!(
-        send(&app, delete(&owner_id, Some("test-api-key"))).await,
-        (StatusCode::OK, serde_json::json!({}))
+        g1f_answer(send(&app, delete(&owner_id, Some("test-api-key"))).await),
+        (StatusCode::OK, Some(item.to_string()))
     );
     assert_eq!(g1f_rating(&state, &owner_id, item).await, cleared);
     // An administrator on an unknown user: 404.
@@ -23237,10 +23611,10 @@ async fn g1c_delete_rating_unknown_item_is_404() {
     );
     assert_eq!(g1f_rating(&state, &owner_id, item).await, rated, "owner");
     assert_eq!(g1f_rating(&state, &viewer_id, item).await, rated, "viewer");
-    // A known item: only the path user's rating is cleared.
+    // A known item: only the path user's rating is cleared, and their user data answered.
     assert_eq!(
-        send(&app, delete(&viewer_id, item, &viewer)).await,
-        (StatusCode::OK, serde_json::json!({}))
+        g1f_answer(send(&app, delete(&viewer_id, item, &viewer)).await),
+        (StatusCode::OK, Some(item.to_string()))
     );
     assert_eq!(g1f_rating(&state, &viewer_id, item).await, (None, None));
     assert_eq!(g1f_rating(&state, &owner_id, item).await, rated, "owner");
@@ -23543,13 +23917,14 @@ async fn b29_progress(app: &axum::Router, token: &str, item: uuid::Uuid, ticks: 
     b29_ok(app, token, "POST", "/Sessions/Playing/Progress", Some(body)).await;
 }
 
-/// The user saves a resume point at `ticks` on the item, then marks it played and favorite.
+/// The user marks the item played and favorite, then saves a resume point at `ticks` on it.
+/// Marking played clears the resume point, as in Jellyfin, so the progress comes after.
 async fn b29_watch(app: &axum::Router, token: &str, user_id: &str, item: uuid::Uuid, ticks: i64) {
-    b29_progress(app, token, item, ticks).await;
     for route in ["PlayedItems", "FavoriteItems"] {
         let uri = format!("/Users/{user_id}/{route}/{item}");
         b29_ok(app, token, "POST", &uri, None).await;
     }
+    b29_progress(app, token, item, ticks).await;
 }
 
 /// `GET /Items/{id}?userId=` as the token's user: asserts a 200 and returns the details.

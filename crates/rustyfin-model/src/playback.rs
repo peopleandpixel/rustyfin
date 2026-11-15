@@ -81,6 +81,40 @@ pub struct UserItemDataDto {
     /// 100 * position / runtime, when there is a position and a known runtime
     #[serde(skip_serializing_if = "Option::is_none")]
     pub played_percentage: Option<f64>,
+    /// The item's id, as Jellyfin's UserItemDataDto.ItemId gives it, in the form item ids take
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub item_id: Option<String>,
+}
+
+impl UserItemDataDto {
+    /// Fills in the `Key` and `ItemId` Jellyfin gives every user data answer. Rustyfin keys user
+    /// data by item id, so both are that id, hyphenated as item ids are, which clients match
+    /// `ItemId` against.
+    pub fn for_item(mut self, item_id: uuid::Uuid) -> Self {
+        let id = item_id.hyphenated().to_string();
+        self.key = Some(id.clone());
+        self.item_id = Some(id);
+        self
+    }
+}
+
+/// The fields `POST /UserItems/{itemId}/UserData` may set (Jellyfin's UpdateUserItemDataDto).
+/// Each field that is present replaces the stored value; absent ones are kept.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct UpdateUserItemDataDto {
+    #[serde(default)]
+    pub playback_position_ticks: Option<i64>,
+    #[serde(default)]
+    pub play_count: Option<i64>,
+    #[serde(default)]
+    pub is_favorite: Option<bool>,
+    #[serde(default)]
+    pub likes: Option<bool>,
+    #[serde(default)]
+    pub played: Option<bool>,
+    #[serde(default)]
+    pub last_played_date: Option<String>,
 }
 
 /// Request body for PinEpisode endpoint
