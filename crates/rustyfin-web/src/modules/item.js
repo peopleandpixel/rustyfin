@@ -2,8 +2,281 @@
 import { $, icon, toast, escapeHtml, formatRuntime } from './util.js';
 import { backdropUrl, createCardElement, sectionRow } from './cards.js';
 import { resumePositionTicks } from './player.js';
+import { navigate } from './router.js';
+import { albumTrackList } from './music.js';
 let currentDetailId = null;
 let activeItem = null;
+// The detail page's version, audio and subtitle choice: { itemId, sources, mediaSourceId, audioIndex,
+// subtitleIndex }. A null index is untouched, so the player picks its own default for it.
+let detailChoice = null;
+
+// --- Detail page parts, in the order and with the rules of Jellyfin Web's item details ---
+
+// Jellyfin's "Ends at": only for a video with a runtime that is not a scheduled recording, counting from
+// the resume point
+function endsAt(item, now = Date.now()) {
+    if (item.MediaType !== 'Video' || !item.RunTimeTicks || item.StartDate) return null;
+    const left = item.RunTimeTicks - (item.UserData?.PlaybackPositionTicks || 0);
+    return new Date(now + left / 1e4);
+}
+
+// The critic rating badge; 60 and up counts as fresh, as in Jellyfin Web
+function criticRatingHtml(item) {
+    const rating = item.CriticRating;
+    if (rating == null) return '';
+    const fresh = rating >= 60;
+    return `<span class="jf-badge jf-critic-rating text-[11px] font-bold ${fresh ? 'text-emerald-300' : 'text-rose-300'}" data-fresh="${fresh}" title="${escapeHtml(t(fresh ? 'detail.critic_fresh' : 'detail.critic_rotten'))}">${icon(fresh ? 'ThumbsUp' : 'ThumbsDown', { size: 10 })} ${Math.round(rating)}%</span>`;
+}
+
+// Director, Writer and Studio lines; Jellyfin Web uses the plural label for more than one name
+function creditLinesHtml(item) {
+    const people = item.People || [];
+    const personLink = p => p.Id ? `<a href="#person/${escapeHtml(p.Id)}" class="text-white hover:text-[#38bdf8] hover:underline">${escapeHtml(p.Name || '')}</a>` : escapeHtml(p.Name || '');
+    const lines = [
+        ['detail.director', 'detail.directors', people.filter(p => p.Type === 'Director').map(personLink)],
+        ['detail.writer', 'detail.writers', people.filter(p => p.Type === 'Writer').map(personLink)],
+        ['detail.studio', 'detail.studios', (item.Studios || []).map(s => escapeHtml(s.Name || s))],
+    ].filter(([, , names]) => names.length > 0);
+    if (lines.length === 0) return '';
+    return `<dl class="jf-credit-lines grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 mb-8 max-w-4xl text-sm">${lines.map(([one, many, names]) =>
+        `<dt class="text-white/50">${t(names.length > 1 ? many : one)}</dt><dd class="text-white/85">${names.join(', ')}</dd>`).join('')}</dl>`;
+}
+
+// Where a provider id leads when the server sent no ExternalUrls for it. TMDb and TheTVDB ids name a page
+// only for movies and series, as Jellyfin's external-id providers have it; null is no link.
+const PROVIDER_URLS = {
+    Imdb: (id) => `https://www.imdb.com/title/${id}`,
+    Tmdb: (id, type) => ({ Movie: `https://www.themoviedb.org/movie/${id}`, Series: `https://www.themoviedb.org/tv/${id}` })[type] || null,
+    Tvdb: (id, type) => ({ Movie: `https://thetvdb.com/dereferrer/movie/${id}`, Series: `https://thetvdb.com/?tab=series&id=${id}` })[type] || null,
+};
+const PROVIDER_NAMES = { Imdb: 'IMDb', Tmdb: 'TMDb', Tvdb: 'TheTVDB' };
+
+// The item's external links: the server's ExternalUrls, then IMDb, TMDb and TheTVDB from ProviderIds where
+// those are missing. Only http(s) links are kept.
+function externalLinks(item) {
+    const links = (item.ExternalUrls || []).filter(l => l?.Name && /^https?:\/\//i.test(l.Url || ''));
+    for (const [key, url] of Object.entries(PROVIDER_URLS)) {
+        const id = item.ProviderIds?.[key];
+        const name = PROVIDER_NAMES[key];
+        if (!id || links.some(l => l.Name === name || l.Name === key)) continue;
+        const built = url(encodeURIComponent(id), item.Type);
+        if (built) links.push({ Name: name, Url: built });
+    }
+    if (item.HomePageUrl && /^https?:\/\//i.test(item.HomePageUrl)) links.unshift({ Name: t('detail.website'), Url: item.HomePageUrl });
+    return links;
+}
+
+function externalLinksHtml(item) {
+    const links = externalLinks(item);
+    if (links.length === 0) return '';
+    return `<p class="jf-external-links mb-8 text-sm"><span class="text-white/50 mr-2">${t('detail.links')}</span>${links.map(l =>
+        `<a href="${escapeHtml(l.Url)}" target="_blank" rel="noopener noreferrer" class="text-[#00a4dc] hover:text-[#38bdf8] hover:underline">${escapeHtml(l.Name)}</a>`).join(', ')}</p>`;
+}
+
+// A language code as a name in the page's language ("eng" -> "English"); the code when there is none
+function languageName(code) {
+    if (!code || code === 'und') return '';
+    try {
+        const name = new Intl.DisplayNames([document.documentElement.lang || 'en'], { type: 'language' }).of(code);
+        return name && name !== 'root' ? name : code;
+    } catch {
+        return code;
+    }
+}
+
+// A stream's label: the server's DisplayTitle, else its language, codec and layout, as Jellyfin builds it
+function streamLabel(stream) {
+    if (stream.DisplayTitle) return stream.DisplayTitle;
+    const parts = [stream.Title, languageName(stream.Language), (stream.Codec || '').toUpperCase()];
+    if (stream.Type === 'Audio') parts.push(stream.ChannelLayout);
+    if (stream.IsForced) parts.push(t('detail.forced'));
+    if (stream.IsDefault) parts.push(t('detail.default'));
+    if (stream.IsExternal) parts.push(t('detail.external'));
+    return parts.filter(Boolean).join(' - ') || t('detail.track_number', { number: stream.Index });
+}
+
+// The versions' labels: each one's name, else the part of its file name the versions do not share (as
+// Jellyfin names "Film - 1080p.mkv" "1080p"), else its resolution
+function versionLabels(sources) {
+    const files = sources.map(s => (s.Path || '').split(/[\\/]/).pop().replace(/\.[^.]+$/, ''));
+    let shared = files.every(Boolean) && files.length > 1 ? files[0].length : 0;
+    for (const file of files) while (shared > 0 && file.slice(0, shared) !== files[0].slice(0, shared)) shared--;
+    // Cut only at a separator, so "Film 1080p" and "Film 10bit" keep "1080p" and "10bit"
+    if (files.some(file => file.length > shared)) shared = files[0].slice(0, shared).search(/[\s\-_.][^\s\-_.]*$/) + 1;
+    return sources.map((source, index) => {
+        if (source.Name) return source.Name;
+        const rest = shared ? files[index].slice(shared).replace(/^[\s\-_.[(]+|[\s)\]]+$/g, '') : '';
+        if (rest) return rest;
+        if (files[index]) return files[index];
+        const video = (source.MediaStreams || []).find(s => s.Type === 'Video');
+        return video?.Height ? `${video.Height}p` : t('detail.version_number', { number: index + 1 });
+    });
+}
+
+// The source a choice plays, with its audio and subtitle streams and the index each select shows: the
+// choice's, else the source's default, else (audio) the first track or (subtitles) off
+function chosenTracks(choice) {
+    const source = choice.sources.find(s => s.Id === choice.mediaSourceId) || choice.sources[0];
+    const streams = source?.MediaStreams || [];
+    const audio = streams.filter(s => s.Type === 'Audio');
+    const subs = streams.filter(s => s.Type === 'Subtitle');
+    const pick = (list, wanted, fallback) => (list.some(s => s.Index === wanted) ? wanted : fallback);
+    const audioDefault = pick(audio, source?.DefaultAudioStreamIndex, (audio.find(s => s.IsDefault) || audio[0])?.Index ?? null);
+    const subDefault = pick(subs, source?.DefaultSubtitleStreamIndex, (subs.find(s => s.IsForced) || subs.find(s => s.IsDefault))?.Index ?? -1);
+    return {
+        source,
+        audio,
+        subs,
+        audioIndex: choice.audioIndex ?? audioDefault,
+        subtitleIndex: choice.subtitleIndex ?? subDefault,
+    };
+}
+
+// The version, audio and subtitle selects. Versions show for more than one source, subtitles when there
+// are any; a single audio track shows disabled, as in Jellyfin Web.
+function trackSelectsHtml(choice) {
+    if (!choice || choice.sources.length === 0) return '';
+    const { source, audio, subs, audioIndex, subtitleIndex } = chosenTracks(choice);
+    const select = (name, label, options, disabled = false) => `
+        <label class="flex flex-col gap-1 text-xs text-white/60 min-w-0">${escapeHtml(label)}
+            <select class="jf-input h-9 !py-0 text-sm max-w-xs" data-track-select="${name}"${disabled ? ' disabled' : ''}>${options}</select>
+        </label>`;
+    const option = (value, label, selected) => `<option value="${escapeHtml(String(value))}"${selected ? ' selected' : ''}>${escapeHtml(label)}</option>`;
+    const parts = [];
+    if (choice.sources.length > 1) {
+        const labels = versionLabels(choice.sources);
+        parts.push(select('version', t('detail.version'), choice.sources.map((s, i) => option(s.Id, labels[i], s === source)).join('')));
+    }
+    if (audio.length > 0) {
+        parts.push(select('audio', t('detail.audio'), audio.map(s => option(s.Index, streamLabel(s), s.Index === audioIndex)).join(''), audio.length === 1));
+    }
+    if (subs.length > 0) {
+        parts.push(select('subtitle', t('detail.subtitles'),
+            option(-1, t('detail.subtitles_off'), subtitleIndex === -1) + subs.map(s => option(s.Index, streamLabel(s), s.Index === subtitleIndex)).join('')));
+    }
+    return parts.join('');
+}
+
+// A change in one of the selects. A new version starts from its own defaults.
+function changeTrackSelect(choice, name, value) {
+    if (name === 'version') return { ...choice, mediaSourceId: value, audioIndex: null, subtitleIndex: null };
+    if (name === 'audio') return { ...choice, audioIndex: Number(value) };
+    if (name === 'subtitle') return { ...choice, subtitleIndex: Number(value) };
+    return choice;
+}
+
+// What the player gets for item `itemId`: the version when there is a choice of them, and each track the
+// user picked. Untouched tracks are left out, so the player's own defaults (remembered tracks) apply.
+function detailSelection(itemId) {
+    if (!detailChoice || detailChoice.itemId !== itemId) return null;
+    const selection = {};
+    if (detailChoice.sources.length > 1) selection.mediaSourceId = chosenTracks(detailChoice).source.Id;
+    if (detailChoice.audioIndex != null) selection.audioIndex = detailChoice.audioIndex;
+    if (detailChoice.subtitleIndex != null) selection.subtitleIndex = detailChoice.subtitleIndex;
+    return selection;
+}
+
+// Media info of one version: its container, size and bitrate, then one entry per stream
+function mediaInfo(source) {
+    if (!source) return null;
+    const kbps = bps => (bps ? t('detail.kbps', { value: Math.round(bps / 1000) }) : '');
+    const mb = bytes => (bytes ? t('detail.megabytes', { value: Math.round(bytes / 1048576) }) : '');
+    const fps = rate => {
+        const [n, d] = String(rate || '').split('/').map(Number);
+        const value = d ? n / d : Number(rate);
+        return value > 0 ? t('detail.fps', { value: Math.round(value * 100) / 100 }) : '';
+    };
+    const yes = flag => (flag ? t('detail.yes') : '');
+    const facts = list => list.filter(([, value]) => value !== '' && value != null);
+    const streams = (source.MediaStreams || []).filter(s => ['Video', 'Audio', 'Subtitle'].includes(s.Type)).map(s => {
+        if (s.Type === 'Video') {
+            return { type: s.Type, title: streamLabel(s), facts: facts([
+                ['detail.codec', (s.Codec || '').toUpperCase()],
+                ['detail.profile', s.Profile],
+                ['detail.resolution', s.Width && s.Height ? `${s.Width}×${s.Height}` : ''],
+                ['detail.framerate', fps(s.RealFrameRate || s.AverageFrameRate)],
+                ['detail.bitrate', kbps(s.BitRate)],
+                ['detail.video_range', s.VideoRange],
+            ]) };
+        }
+        if (s.Type === 'Audio') {
+            return { type: s.Type, title: streamLabel(s), facts: facts([
+                ['detail.language', languageName(s.Language)],
+                ['detail.codec', (s.Codec || '').toUpperCase()],
+                ['detail.layout', s.ChannelLayout || (s.Channels ? String(s.Channels) : '')],
+                ['detail.bitrate', kbps(s.BitRate)],
+                ['detail.default', yes(s.IsDefault)],
+            ]) };
+        }
+        return { type: s.Type, title: streamLabel(s), facts: facts([
+            ['detail.language', languageName(s.Language)],
+            ['detail.codec', (s.Codec || '').toUpperCase()],
+            ['detail.default', yes(s.IsDefault)],
+            ['detail.forced', yes(s.IsForced)],
+            ['detail.external', yes(s.IsExternal)],
+        ]) };
+    });
+    return {
+        facts: facts([
+            ['detail.container', (source.Container || '').toUpperCase()],
+            ['detail.size', mb(source.Size)],
+            ['detail.bitrate', kbps(source.Bitrate)],
+        ]),
+        streams,
+    };
+}
+
+function mediaInfoHtml(source) {
+    const info = mediaInfo(source);
+    if (!info || (info.facts.length === 0 && info.streams.length === 0)) return '';
+    const factList = facts => `<dl class="grid grid-cols-[auto_1fr] gap-x-3 gap-y-0.5">${facts.map(([key, value]) =>
+        `<dt class="text-white/50">${t(key)}</dt><dd class="text-white/85">${escapeHtml(String(value))}</dd>`).join('')}</dl>`;
+    const typeKey = { Video: 'detail.video', Audio: 'detail.audio', Subtitle: 'detail.subtitle' };
+    return `
+        <details class="jf-media-info mb-10 max-w-4xl" data-media-info>
+            <summary class="cursor-pointer text-lg font-bold text-white mb-2">${t('detail.media_info')}</summary>
+            <div class="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 text-xs">
+                ${info.facts.length ? `<div class="rounded-lg bg-white/5 p-3"><h3 class="font-bold text-white mb-1">${t('detail.media_file')}</h3>${factList(info.facts)}</div>` : ''}
+                ${info.streams.map(s => `<div class="rounded-lg bg-white/5 p-3"><h3 class="font-bold text-white mb-1">${t(typeKey[s.type])}: ${escapeHtml(s.title)}</h3>${factList(s.facts)}</div>`).join('')}
+            </div>
+        </details>`;
+}
+
+// A position as h:mm:ss, or m:ss under an hour
+function clockTime(ticks) {
+    const total = Math.floor((ticks || 0) / 1e7);
+    const pad = n => String(n).padStart(2, '0');
+    const h = Math.floor(total / 3600);
+    const m = Math.floor(total / 60) % 60;
+    return h > 0 ? `${h}:${pad(m)}:${pad(total % 60)}` : `${m}:${pad(total % 60)}`;
+}
+
+// The chapters row ("Scenes" in Jellyfin Web): an image where the server has one, the name and start time;
+// a click plays the item from that chapter with the detail page's track choice
+function chaptersHtml(item) {
+    const chapters = item.Chapters || [];
+    if (chapters.length === 0) return '';
+    const id = item.Id;
+    return `
+        <div class="mb-10 jf-chapters">
+            <h2 class="text-xl font-bold mb-4 text-white">${t('detail.chapters')}</h2>
+            <div class="jf-scroll-row pb-2">
+                ${chapters.map((c, index) => {
+                    const name = c.Name || t('detail.chapter_number', { number: index + 1 });
+                    const start = clockTime(c.StartPositionTicks);
+                    const img = c.ImageTag ? API.imageUrl(id, `Chapter/${index}`, { maxWidth: 400, tag: c.ImageTag }) : '';
+                    return `
+                    <button type="button" class="w-56 flex-shrink-0 text-left group" data-action="play" data-id="${escapeHtml(id)}" data-stream-type="Videos" data-title="${escapeHtml(item.Name || '')}" data-start-ticks="${Number(c.StartPositionTicks) || 0}" data-detail-tracks="true">
+                        <div class="relative aspect-video rounded-lg overflow-hidden bg-white/5 mb-1.5 border-2 border-transparent group-hover:border-[#00a4dc] transition-all">
+                            ${img ? `<img src="${img}" alt="" loading="lazy" class="w-full h-full object-cover" onerror="this.style.display='none'">` : `<div class="w-full h-full flex items-center justify-center text-white/30">${icon('Film', { size: 28 })}</div>`}
+                        </div>
+                        <p class="text-xs font-semibold text-white truncate group-hover:text-[#38bdf8] transition-colors">${escapeHtml(name)}</p>
+                        <p class="text-[10px] text-white/50">${start}</p>
+                    </button>`;
+                }).join('')}
+            </div>
+        </div>`;
+}
 
 // --- Detail View Renderer (Movies, TV Series, Music) ---
 async function renderDetail(itemId) {
@@ -56,6 +329,12 @@ async function renderDetail(itemId) {
         const canPlay = ['Movie', 'Episode', 'Audio', 'MusicVideo', 'Video'].includes(type);
         const streamType = type === 'Audio' ? 'Audio' : 'Videos';
         const resumeTicks = streamType === 'Videos' ? resumePositionTicks(item) : 0;
+        detailChoice = canPlay && streamType === 'Videos'
+            ? { itemId: id, sources: item.MediaSources || [], mediaSourceId: null, audioIndex: null, subtitleIndex: null }
+            : null;
+        const isContainerOfEpisodes = type === 'Series' || type === 'Season';
+        const tagline = (item.Taglines || [])[0] || '';
+        const ends = endsAt(item);
 
         // Parallel fetch: Children/Seasons/Episodes AND Similar media
         // Previously these were sequential, causing a waterfall effect
@@ -124,6 +403,8 @@ async function renderDetail(itemId) {
                         }).join('')}
                     </div>
                 </div>`;
+            } else if (type === 'MusicAlbum') {
+                seasonsOrEpisodesHtml = albumTrackList(item, children);
             } else {
                 seasonsOrEpisodesHtml = sectionRow(t('detail.titles'), children);
             }
@@ -202,6 +483,8 @@ async function renderDetail(itemId) {
                             ${officialRating ? `<span class="jf-badge text-[11px] font-bold bg-white/15">${escapeHtml(officialRating)}</span>` : ''}
                             ${runtime ? `<span class="jf-badge text-[11px]">${formatRuntime(runtime)}</span>` : ''}
                             ${rating ? `<span class="jf-badge jf-badge-rating inline-flex items-center gap-0.5 text-[11px]">${icon('Star', { size: 10, class: 'fill-current' })} ${rating.toFixed(1)}</span>` : ''}
+                            ${criticRatingHtml(item)}
+                            ${ends ? `<span class="jf-badge jf-ends-at text-[11px]">${t('detail.ends_at', { time: ends.toLocaleTimeString(document.documentElement.lang || [], { hour: 'numeric', minute: '2-digit' }) })}</span>` : ''}
                         </div>
 
                         ${breadcrumbHtml}
@@ -215,12 +498,12 @@ async function renderDetail(itemId) {
                         <!-- Action Bar -->
                         <div class="flex flex-wrap items-center gap-3">
                             ${canPlay ? `
-                            <button class="jf-btn-primary h-11 !py-0 !px-7 text-sm font-bold shadow-xl" data-action="play" data-id="${escapeHtml(id)}" data-stream-type="${escapeHtml(streamType)}" data-title="${escapeHtml(name)}"${resumeTicks > 0 ? ' data-resume="true"' : ''}>
+                            <button class="jf-btn-primary h-11 !py-0 !px-7 text-sm font-bold shadow-xl" data-action="play" data-id="${escapeHtml(id)}" data-stream-type="${escapeHtml(streamType)}" data-title="${escapeHtml(name)}"${resumeTicks > 0 ? ' data-resume="true"' : ''} data-detail-tracks="true">
                                 ${icon('Play', { size: 20, class: 'fill-current' })}
                                 ${resumeTicks > 0 ? t('detail.resume') : t('common.play')}
                             </button>
                             ${resumeTicks > 0 ? `
-                            <button class="jf-btn-ghost h-11 !py-0 !px-4 text-sm" data-action="play" data-id="${escapeHtml(id)}" data-stream-type="${escapeHtml(streamType)}" data-title="${escapeHtml(name)}" data-from-start="true">
+                            <button class="jf-btn-ghost h-11 !py-0 !px-4 text-sm" data-action="play" data-id="${escapeHtml(id)}" data-stream-type="${escapeHtml(streamType)}" data-title="${escapeHtml(name)}" data-from-start="true" data-detail-tracks="true">
                                 ${t('detail.play_from_beginning')}
                             </button>` : ''}` : ''}
 
@@ -229,31 +512,46 @@ async function renderDetail(itemId) {
                                 <span class="hidden sm:inline text-xs ml-1">${fav ? t('detail.favorite') : t('detail.add_favorite')}</span>
                             </button>
 
-                            <button class="jf-btn-ghost h-11 !py-0 !px-4 text-xs font-semibold" data-action="toggle-played" data-id="${escapeHtml(id)}" data-played="${played}">
-                                ${played ? `<span class="inline-flex items-center gap-1 text-emerald-400">${icon('Check', { size: 14 })} ${t('detail.played')}</span>` : `<span class="inline-flex items-center gap-1 text-white/60">${icon('Circle', { size: 14 })} ${t('detail.unplayed')}</span>`}
+                            <button class="jf-btn-ghost h-11 !py-0 !px-4 text-xs font-semibold" data-action="toggle-played" data-id="${escapeHtml(id)}" data-played="${played}" data-all="${isContainerOfEpisodes}" title="${escapeHtml(playedButtonTitle(isContainerOfEpisodes, played))}">
+                                ${played ? `<span class="inline-flex items-center gap-1 text-emerald-400">${icon('Check', { size: 14 })} ${isContainerOfEpisodes ? t('detail.all_played') : t('detail.played')}</span>` : `<span class="inline-flex items-center gap-1 text-white/60">${icon('Circle', { size: 14 })} ${isContainerOfEpisodes ? t('detail.mark_all_played') : t('detail.unplayed')}</span>`}
                             </button>
 
                             ${API.isAdmin ? `
                             <button class="jf-btn-ghost h-11 !py-0 w-11 !px-0" title="${escapeHtml(t('detail.refresh_metadata'))}" aria-label="${escapeHtml(t('detail.refresh_metadata'))}" data-action="refresh-item" data-id="${escapeHtml(id)}">
                                 ${icon('RefreshCw', { size: 18, class: 'jf-busy-spin' })}
+                            </button>
+                            <button class="jf-btn-ghost h-11 !py-0 w-11 !px-0 hover:!text-rose-400" title="${escapeHtml(t('detail.delete_item'))}" aria-label="${escapeHtml(t('detail.delete_item'))}" data-action="delete-item" data-id="${escapeHtml(id)}" data-name="${escapeHtml(name)}" data-type="${escapeHtml(type)}" data-parent-id="${escapeHtml(deleteParentId(item))}">
+                                ${icon('Trash2', { size: 18 })}
                             </button>` : ''}
                         </div>
+                        ${detailChoice ? `<div id="detail-track-selects" class="flex flex-wrap gap-3 mt-4">${trackSelectsHtml(detailChoice)}</div>` : ''}
                     </div>
                 </div>
             </div>
 
             <!-- Overview section -->
-            ${overview ? `
-            <div class="mb-10 max-w-4xl">
+            ${overview || tagline ? `
+            <div class="mb-8 max-w-4xl">
+                ${tagline ? `<h3 class="jf-tagline text-base sm:text-lg italic text-white/85 mb-2">${escapeHtml(tagline)}</h3>` : ''}
+                ${overview ? `
                 <h2 class="text-lg font-bold mb-2 text-white">${t('detail.overview')}</h2>
-                <p class="text-white/75 text-sm sm:text-base leading-relaxed">${escapeHtml(overview)}</p>
+                <p class="text-white/75 text-sm sm:text-base leading-relaxed">${escapeHtml(overview)}</p>` : ''}
             </div>` : ''}
+
+            ${externalLinksHtml(item)}
+            ${creditLinesHtml(item)}
+
+            <!-- Media info of the chosen version -->
+            <div id="detail-media-info">${detailChoice ? mediaInfoHtml(chosenTracks(detailChoice).source) : ''}</div>
 
             <!-- Cast & Crew -->
             ${castHtml}
 
             <!-- Seasons / Episodes -->
             ${seasonsOrEpisodesHtml}
+
+            <!-- Chapters -->
+            ${canPlay && streamType === 'Videos' ? chaptersHtml(item) : ''}
 
             <!-- Similar Titles -->
             ${similarHtml}
@@ -324,18 +622,66 @@ async function toggleFavorite(id, current) {
     }
 }
 
-async function togglePlayed(id, current) {
+// A series or season marks all its episodes; the server applies the mark to each of them
+function playedButtonTitle(all, played) {
+    if (all) return played ? t('detail.mark_all_unplayed') : t('detail.mark_all_played');
+    return played ? t('detail.mark_unplayed') : t('detail.mark_played');
+}
+
+async function togglePlayed(id, current, all = false) {
     try {
         if (current) await API.markUnplayed(id);
         else await API.markPlayed(id);
         // Marking changes the item's (and a show's episodes') watch data, so drop the cached lists before re-rendering
         API.invalidateCache('/Items');
         API.invalidateCache('/Shows');
-        toast(current ? t('detail.marked_unplayed') : t('detail.marked_played'));
+        if (all) toast(current ? t('detail.all_marked_unplayed') : t('detail.all_marked_played'));
+        else toast(current ? t('detail.marked_unplayed') : t('detail.marked_played'));
         if (currentDetailId === id) renderDetail(id);
     } catch (e) {
         toast(e.message, 'error');
     }
 }
 
-export { currentDetailId, renderDetail, renderPerson, toggleFavorite, togglePlayed };
+// The page an item's deletion leaves for: its season, series or album, else home
+function deleteParentId(item) {
+    const parent = item.SeasonId || item.SeriesId || item.AlbumId || '';
+    return parent === item.Id ? '' : parent;
+}
+
+// Admin: removes the item (and what is under it) after a confirmation. The button carries the item's own
+// name, type and parent. A collection or playlist is gone for good; anything else only leaves the library,
+// and its files stay.
+async function deleteItemFromDetail({ id, name = '', type = '', parentId = '' }) {
+    const permanent = type === 'BoxSet' || type === 'Playlist';
+    if (!confirm(t(permanent ? 'detail.delete_confirm_permanent' : 'detail.delete_confirm', { name }))) return;
+    try {
+        await API.deleteItem(id);
+        API.invalidateCache('/Items');
+        API.invalidateCache('/Shows');
+        toast(t('detail.deleted', { name }));
+        navigate(...(parentId ? ['detail', parentId] : ['home']));
+    } catch (e) {
+        toast(t('detail.delete_failed', { message: e.message }), 'error');
+    }
+}
+
+// The version, audio and subtitle selects: a new version redraws the selects and the media info for it
+document.addEventListener('change', e => {
+    const name = e.target.dataset?.trackSelect;
+    if (!name || !detailChoice) return;
+    detailChoice = changeTrackSelect(detailChoice, name, e.target.value);
+    if (name !== 'version') return;
+    const selects = $('detail-track-selects');
+    if (selects) selects.innerHTML = trackSelectsHtml(detailChoice);
+    const info = $('detail-media-info');
+    if (info) {
+        const open = info.querySelector('details')?.open;
+        info.innerHTML = mediaInfoHtml(chosenTracks(detailChoice).source);
+        if (open) info.querySelector('details').open = true;
+    }
+});
+
+export {
+    currentDetailId, renderDetail, renderPerson, toggleFavorite, togglePlayed, deleteItemFromDetail, detailSelection,
+};

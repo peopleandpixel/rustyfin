@@ -3245,6 +3245,7 @@ const B124_WEB_MODULES: &[&str] = &[
     "jellyfin-import.js",
     "library-admin.js",
     "library.js",
+    "music.js",
     "player.js",
     "plugins.js",
     "router.js",
@@ -23316,6 +23317,19 @@ fn b171_next_episode() {
     b124_node_test("b171_next_episode.mjs");
 }
 
+// The web client's item page: credits, ratings, media info, track pickers, chapters, links, "mark all
+// played" and delete (tests/web/r3item_detail.mjs), and the pickers' choice in the player
+// (tests/web/r3item_play.mjs)
+#[test]
+fn r3item_detail() {
+    b124_node_test("r3item_detail.mjs");
+}
+
+#[test]
+fn r3item_play() {
+    b124_node_test("r3item_play.mjs");
+}
+
 // The web client's autoplay switch is Jellyfin's UserConfiguration.EnableNextEpisodeAutoPlay: each
 // key a user saves comes back from /Users/Me with the value sent (the server may add defaults), and
 // a save built as the client builds it (the current configuration plus the flag) keeps the others.
@@ -23372,6 +23386,27 @@ fn b152_library_pages() {
 #[test]
 fn b152_library_grid() {
     b124_node_test("b152_library_grid.mjs");
+}
+
+// R3 music and home: the web client's album page, music library tabs, home rows and search
+#[test]
+fn r3music_album() {
+    b124_node_test("r3music_album.mjs");
+}
+
+#[test]
+fn r3music_tabs() {
+    b124_node_test("r3music_tabs.mjs");
+}
+
+#[test]
+fn r3home_rows() {
+    b124_node_test("r3home_rows.mjs");
+}
+
+#[test]
+fn r3search_typeahead() {
+    b124_node_test("r3search_typeahead.mjs");
 }
 
 #[test]
