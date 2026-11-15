@@ -194,3 +194,54 @@ test('a saved value the server no longer lists stays checked, and values are esc
         ['Years', '2001', false], ['Years', '1999', true],
     ]);
 });
+
+test('preference saves go one at a time, in order, so the last one is kept', async () => {
+    const pending = [];
+    const sent = [];
+    const toasts = [];
+    const context = vm.createContext({
+        t: (key, opts) => (opts ? `${key}|${JSON.stringify(opts)}` : key),
+        toast: (msg, type) => toasts.push([msg, type]),
+        API: {
+            userId: 'u1',
+            saveDisplayPreferences: (id, client, body) => {
+                sent.push([id, client, body.SortBy]);
+                return new Promise((resolve, reject) => pending.push({ resolve, reject }));
+            },
+        },
+    });
+    vm.runInContext(
+        `${slice('const LIBRARY_SORTS = [', '\n];\n')}
+         ${slice('const LIBRARY_FILTER_PARAMS = ', ';\n')}
+         ${slice('const LIBRARY_PREFS_CLIENT = ', ';\n')}
+         ${slice('function librarySort(')}
+         ${slice('function libraryFilterQuery(')}
+         ${slice('function libraryPrefsToDisplay(')}
+         ${slice('let librarySaves = ', ';\n')}
+         ${slice('function saveLibraryPrefs(')}
+         const libraryPrefsCache = new Map();
+         var libraryPrefs;
+         this.save = sort => { libraryPrefs = { sort, reversed: false, filters: {} }; saveLibraryPrefs('films'); };
+         this.cached = key => libraryPrefsCache.get(key);`,
+        context,
+    );
+    const tick = () => new Promise(resolve => setImmediate(resolve));
+    context.save('SortName,ProductionYear:Ascending');
+    context.save('PremiereDate,SortName,ProductionYear:Descending');
+    context.save('DateCreated,SortName,ProductionYear:Descending');
+    await tick();
+    // Only the first is on its way; the session copy already has the last.
+    assert.deepEqual(sent, [['films', 'rustyfin', 'SortName,ProductionYear']]);
+    assert.equal(context.cached('u1:films').sort, 'DateCreated,SortName,ProductionYear:Descending');
+    // A failed save is reported and the next one still goes.
+    pending[0].reject(new Error('offline'));
+    await tick();
+    assert.equal(sent.length, 2);
+    assert.deepEqual(toasts, [['library.prefs_save_failed|{"message":"offline"}', 'error']]);
+    pending[1].resolve({});
+    await tick();
+    assert.deepEqual(sent.map(([, , sortBy]) => sortBy), [
+        'SortName,ProductionYear', 'PremiereDate,SortName,ProductionYear', 'DateCreated,SortName,ProductionYear',
+    ]);
+    pending[2].resolve({});
+});

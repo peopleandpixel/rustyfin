@@ -490,6 +490,8 @@ const LIBRARY_PREFS_CLIENT = 'rustyfin';
 // loaded library's, keyed by user and library
 let libraryPrefs = libraryPrefsFromDisplay(null);
 const libraryPrefsCache = new Map();
+// The pending preference saves: each waits for the one before, so the server keeps the last
+let librarySaves = Promise.resolve();
 
 // --- Infinite Scroll via IntersectionObserver ---
 let infiniteScrollObserver = null;
@@ -654,7 +656,7 @@ async function renderLibrary(libId) {
                         ${t('library.filters')}
                         <span id="lib-filter-count" class="jf-filter-count"${filterCount ? '' : ' hidden'}>${filterCount}</span>
                     </button>
-                    <div id="lib-filter-menu" popover class="jf-filter-menu" aria-label="${escapeHtml(t('library.filters'))}">
+                    <div id="lib-filter-menu" popover role="dialog" class="jf-filter-menu" aria-label="${escapeHtml(t('library.filters'))}">
                         ${libraryFilterMenu(contentType, filterLists, libraryPrefs.filters)}
                     </div>
                     <button id="lib-filter-clear" type="button" class="jf-btn-ghost inline-flex items-center gap-1.5 !py-1.5 !px-3 text-xs" data-action="clear-library-filters" data-id="${escapeHtml(libId)}"${filterCount ? '' : ' hidden'}>
@@ -754,10 +756,13 @@ async function loadLibraryPrefs(libId) {
     return libraryPrefsCache.get(key);
 }
 
-// Keeps the open library's sort and filters, for this session and on the server
+// Keeps the open library's sort and filters, for this session and on the server. Saves go one at a
+// time in the order they were made, so a slow earlier save can't land after a later one.
 function saveLibraryPrefs(libId) {
     libraryPrefsCache.set(`${API.userId}:${libId}`, libraryPrefs);
-    API.saveDisplayPreferences(libId, LIBRARY_PREFS_CLIENT, libraryPrefsToDisplay(libId, libraryPrefs))
+    const body = libraryPrefsToDisplay(libId, libraryPrefs);
+    librarySaves = librarySaves
+        .then(() => API.saveDisplayPreferences(libId, LIBRARY_PREFS_CLIENT, body))
         .catch(e => toast(t('library.prefs_save_failed', { message: e.message }), 'error'));
 }
 
