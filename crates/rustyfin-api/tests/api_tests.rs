@@ -29841,6 +29841,123 @@ async fn b17_scheduler_scan_reports_progress_without_task_events() {
 
 // R3 tasks: a running task's state and progress in /ScheduledTasks and on the socket
 
+// Turning trickplay on in the web client's Options dialog takes effect whatever was stored before
+// and whoever wrote it: no row (as the Jellyfin import leaves a library), Rustyfin's name off,
+// Jellyfin's name off, both names disagreeing, or a row that can't be read. The dialog reads the
+// options, ticks the four image toggles and saves `{Id, LibraryOptions}` with Rustyfin's names only
+// (api.js saveLibraryOptions), and the trickplay task then works on the library.
+#[tokio::test]
+async fn r3tasks_dialog_turns_trickplay_on_over_any_stored_options() {
+    let priors: [(&str, Option<&str>); 5] = [
+        ("none", None),
+        (
+            "rustyfin off",
+            Some(r#"{"EnableTrickplay":false,"EnableRealtimeMonitor":false}"#),
+        ),
+        (
+            "jellyfin off",
+            Some(r#"{"EnableTrickplayImageExtraction":false}"#),
+        ),
+        (
+            "both names",
+            Some(
+                r#"{"EnableTrickplay":false,"EnableTrickplayImageExtraction":false,"EnableChapterImageExtraction":true}"#,
+            ),
+        ),
+        ("unreadable", Some("not json")),
+    ];
+    for (prior, stored) in priors {
+        let state = test_state().await;
+        let app = app(state.clone());
+        let (owner, _, _, _) = g1_owner_and_viewer(&state, &app).await;
+        let lib = create_library_via_api(&app, &state, &owner, "R3 Tasks Dialog", "Movies").await;
+        let key = format!("library_options_{lib}");
+        sqlx::query("DELETE FROM configuration WHERE key = ?1")
+            .bind(&key)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        if let Some(stored) = stored {
+            sqlx::query("INSERT INTO configuration (key, value) VALUES (?1, ?2)")
+                .bind(&key)
+                .bind(stored)
+                .execute(&state.db)
+                .await
+                .unwrap();
+        }
+
+        // The dialog: read the options, set the four toggles, drop Jellyfin's names, save.
+        let (status, mut options) = send_authed(
+            &app,
+            "GET",
+            &format!("/Library/{lib}/Options"),
+            &owner,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{prior}: {options}");
+        let fields = options.as_object_mut().unwrap();
+        fields.insert("EnableTrickplay".into(), true.into());
+        fields.insert(
+            "ExtractTrickplayImagesDuringLibraryScan".into(),
+            false.into(),
+        );
+        fields.insert("EnableChapterExtraction".into(), false.into());
+        fields.insert("ExtractChapterImagesDuringLibraryScan".into(), false.into());
+        fields.remove("EnableTrickplayImageExtraction");
+        fields.remove("EnableChapterImageExtraction");
+        let body = serde_json::json!({ "Id": lib, "LibraryOptions": options }).to_string();
+        let uri = "/Library/VirtualFolders/LibraryOptions";
+        let (status, answer) = send_authed(&app, "POST", uri, &owner, Some(&body)).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{prior}: {answer}");
+
+        // Stored once, under Rustyfin's name only
+        let row: String = sqlx::query_scalar("SELECT value FROM configuration WHERE key = ?1")
+            .bind(&key)
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        let row: serde_json::Value = serde_json::from_str(&row).unwrap();
+        assert_eq!(row["EnableTrickplay"], true, "{prior}: {row}");
+        assert!(
+            row.get("EnableTrickplayImageExtraction").is_none(),
+            "{prior}: {row}"
+        );
+
+        // The trickplay task works on the library now
+        let (status, _) = send_authed(
+            &app,
+            "POST",
+            "/ScheduledTasks/Running/RefreshTrickplayImages",
+            &owner,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let mut result = serde_json::Value::Null;
+        for _ in 0..500 {
+            let (_, task) = send_authed(
+                &app,
+                "GET",
+                "/ScheduledTasks/RefreshTrickplayImages",
+                &owner,
+                None,
+            )
+            .await;
+            if task["State"] == "Idle" && !task["LastExecutionResult"].is_null() {
+                result = task["LastExecutionResult"].clone();
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(result["Status"], "Completed", "{prior}: {result}");
+        assert_eq!(
+            result["ErrorMessage"], "Made the trickplay images of 0 videos",
+            "{prior}: the task found the library on"
+        );
+    }
+}
+
 // Jellyfin's POST /Library/VirtualFolders/LibraryOptions saves a library's options: 204, and the
 // options read back, under Jellyfin's names or Rustyfin's.
 #[tokio::test]
