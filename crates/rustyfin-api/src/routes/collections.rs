@@ -54,19 +54,60 @@ async fn get_collections(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<Vec<CollectionDto>>, ApiError> {
-    let collections =
+    let mut collections =
         rustyfin_db::repo_collection::get_collections(&state.db_ro, claims.sub).await?;
+    let hidden = HiddenItems::for_caller(&state, &claims).await?;
+    for collection in &mut collections {
+        visible_collection_count(&state, &hidden, collection).await?;
+    }
     Ok(Json(collections))
 }
 
 async fn get_collection(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    Extension(claims): Extension<Claims>,
 ) -> Result<Json<CollectionDto>, ApiError> {
-    let collection = rustyfin_db::repo_collection::get_collection(&state.db_ro, id)
+    let mut collection = rustyfin_db::repo_collection::get_collection(&state.db_ro, id)
         .await?
         .ok_or_else(|| ApiError::NotFound("Collection not found".to_string()))?;
+    let hidden = HiddenItems::for_caller(&state, &claims).await?;
+    visible_collection_count(&state, &hidden, &mut collection).await?;
     Ok(Json(collection))
+}
+
+/// For a user with parental limits, a collection's `ChildCount` counts only the items they may
+/// see, as its item list shows them.
+async fn visible_collection_count(
+    state: &AppState,
+    hidden: &HiddenItems,
+    collection: &mut CollectionDto,
+) -> Result<(), ApiError> {
+    if hidden.is_restricted() {
+        let mut items =
+            rustyfin_db::repo_collection::get_collection_items(&state.db_ro, collection.id).await?;
+        hidden.retain(&mut items, |i| i.id);
+        collection.child_count = items.len() as i64;
+    }
+    Ok(())
+}
+
+/// The same for a playlist the caller can read.
+async fn visible_playlist_count(
+    state: &AppState,
+    claims: &Claims,
+    hidden: &HiddenItems,
+    playlist: &mut PlaylistDto,
+) -> Result<(), ApiError> {
+    if hidden.is_restricted() {
+        let caller = playlist_caller(claims);
+        let mut items =
+            rustyfin_db::repo_playlist::get_playlist_items(&state.db_ro, playlist.id, caller)
+                .await?;
+        hidden.retain(&mut items, |i| i.id);
+        playlist.child_count = items.len() as i64;
+    }
+    Ok(())
 }
 
 async fn delete_collection(
@@ -139,7 +180,11 @@ async fn get_playlists(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<Vec<PlaylistDto>>, ApiError> {
-    let playlists = rustyfin_db::repo_playlist::get_playlists(&state.db_ro, claims.sub).await?;
+    let mut playlists = rustyfin_db::repo_playlist::get_playlists(&state.db_ro, claims.sub).await?;
+    let hidden = HiddenItems::for_caller(&state, &claims).await?;
+    for playlist in &mut playlists {
+        visible_playlist_count(&state, &claims, &hidden, playlist).await?;
+    }
     Ok(Json(playlists))
 }
 
@@ -162,9 +207,11 @@ async fn get_playlist(
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<PlaylistDto>, ApiError> {
     let caller = playlist_caller(&claims);
-    let playlist = rustyfin_db::repo_playlist::get_playlist(&state.db_ro, id, caller)
+    let mut playlist = rustyfin_db::repo_playlist::get_playlist(&state.db_ro, id, caller)
         .await?
         .ok_or_else(playlist_not_found)?;
+    let hidden = HiddenItems::for_caller(&state, &claims).await?;
+    visible_playlist_count(&state, &claims, &hidden, &mut playlist).await?;
     Ok(Json(playlist))
 }
 

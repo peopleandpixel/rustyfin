@@ -237,7 +237,9 @@ pub fn parental_ratings() -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// Jellyfin's `UnratedItem` values, the kinds of unrated item a user can be kept from.
+/// Jellyfin's `UnratedItem` values, the kinds of unrated item a user can be kept from. All are
+/// accepted, as Jellyfin Web may send any of them, but `LiveTvChannel`, `LiveTvProgram` and
+/// `ChannelContent` are kept without effect: the Live TV routes don't apply parental limits.
 pub const UNRATED_ITEM_KINDS: [&str; 9] = [
     "Movie",
     "Trailer",

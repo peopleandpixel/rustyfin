@@ -588,10 +588,17 @@ async fn hls_segment_legacy(
     State(state): State<AppState>,
     Path((id, segment)): Path<(Uuid, String)>,
 ) -> Result<Response, ApiError> {
+    // `{id}` must be an item, which the parental gate has already checked for the caller. A
+    // session's playback id (whose directory sits beside the items') is not one, so another
+    // user's session can't be read through this route by its playback id.
+    let not_found = || ApiError::NotFound(format!("Segment {segment} not found for item {id}"));
+    rustyfin_db::repo_media::get_item_by_id(&state.db_ro, id)
+        .await?
+        .ok_or_else(not_found)?;
     let segment_path = state
         .transcode_manager
         .legacy_segment_path(id, &segment)
-        .ok_or_else(|| ApiError::NotFound(format!("Segment {segment} not found for item {id}")))?;
+        .ok_or_else(not_found)?;
 
     let data = tokio::fs::read(&segment_path)
         .await
