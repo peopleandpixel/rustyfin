@@ -310,13 +310,13 @@ pub async fn batch_upsert_images(
     Ok(())
 }
 
-/// The local images of a library's items whose path is in `scope`. Remote images are left out, as
-/// they have no file to stamp.
+/// The local images of a library's items whose path is in `scope`, each with whether it is its
+/// item's own file (a photo's Primary). Remote images are left out, as they have no file to stamp.
 pub async fn get_local_images_in_scope(
     pool: &SqlitePool,
     library_id: Uuid,
     scope: &PathScope,
-) -> Result<Vec<ItemImage>, sqlx::Error> {
+) -> Result<Vec<(ItemImage, bool)>, sqlx::Error> {
     let rows = sqlx::query_as::<
         _,
         (
@@ -329,9 +329,10 @@ pub async fn get_local_images_in_scope(
             Option<i32>,
             Option<String>,
             Option<i64>,
+            bool,
         ),
     >(sqlx::AssertSqlSafe(format!(
-        "SELECT ii.item_id, ii.image_type, ii.image_index, ii.path, ii.provider, ii.width, ii.height, ii.blurhash, ii.stamp
+        "SELECT ii.item_id, ii.image_type, ii.image_index, ii.path, ii.provider, ii.width, ii.height, ii.blurhash, ii.stamp, ii.path = m.path
          FROM item_images AS ii
          JOIN media_items AS m ON m.id = ii.item_id
          WHERE m.library_id = ?1 AND {} AND ii.path NOT GLOB 'http://*' AND ii.path NOT GLOB 'https://*'",
@@ -345,9 +346,9 @@ pub async fn get_local_images_in_scope(
     Ok(rows
         .into_iter()
         .filter_map(
-            |(item_id, img_type, idx, path, provider, w, h, bh, stamp)| {
+            |(item_id, img_type, idx, path, provider, w, h, bh, stamp, own_file)| {
                 let image_type = ImageType::from_str(&img_type)?;
-                Some(ItemImage {
+                let image = ItemImage {
                     item_id: Uuid::parse_str(&item_id).ok()?,
                     image_type,
                     image_index: idx,
@@ -357,7 +358,8 @@ pub async fn get_local_images_in_scope(
                     height: h,
                     blurhash: bh,
                     stamp,
-                })
+                };
+                Some((image, own_file))
             },
         )
         .collect())
