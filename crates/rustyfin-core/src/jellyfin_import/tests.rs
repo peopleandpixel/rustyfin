@@ -286,6 +286,7 @@ fn b20_plan_users_needs_confirmed_matches() {
             name: name.to_string(),
             internal_id: n,
             is_admin: false,
+            parental: None,
         })
         .collect();
     let jf = |name: &str| jf_users.iter().find(|user| user.name == name).unwrap().id;
@@ -376,6 +377,7 @@ fn b36_jf_users(names: &[&str]) -> Vec<JfUser> {
             name: name.to_string(),
             internal_id: n,
             is_admin: false,
+            parental: None,
         })
         .collect()
 }
@@ -515,6 +517,7 @@ fn b20_report_with_code(code: &str) -> ImportReport {
             code: Some(code.to_string()),
             match_kind: None,
             target_account: None,
+            parental_limits: Default::default(),
         }],
         items: ItemReport {
             total: 0,
