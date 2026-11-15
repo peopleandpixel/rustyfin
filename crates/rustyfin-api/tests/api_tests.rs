@@ -20114,6 +20114,12 @@ fn b165_subtitle_tracks() {
     b124_node_test("b165_subtitle_tracks.mjs");
 }
 
+// B170: the player's top bar hides and shows with its bottom controls
+#[test]
+fn b170_player_header_autohide() {
+    b124_node_test("b170_player_header_autohide.mjs");
+}
+
 // B152: library grid images keep up with scrolling (web client)
 #[test]
 fn b152_blurhash_decoder() {

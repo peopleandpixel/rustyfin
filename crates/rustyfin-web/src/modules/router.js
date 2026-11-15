@@ -6,7 +6,7 @@ import { renderHome, renderFavorites } from './home.js';
 import { renderLibrary, stopLibraryLoad, libraryRemember, startGridDiag, jumpToLetter } from './library.js';
 import { currentDetailId, renderDetail, renderPerson, toggleFavorite, togglePlayed } from './item.js';
 import { renderSearch } from './search.js';
-import { playWithResumeChoice, stopPlayback, playItem } from './player.js';
+import { playWithResumeChoice, stopPlayback, playItem, playerAutoHide, onPlayerClosed } from './player.js';
 import { renderSettings } from './settings.js';
 import {
     renderAdmin, showAdminTab, setUserPolicy, removeOidcLinkAsAdmin, copyOidcCallbackUrl, saveOidcAdminSettings,
@@ -219,7 +219,8 @@ window.addEventListener('hashchange', handleHash);
 
 document.addEventListener('DOMContentLoaded', async () => {
     // Every way of closing the player goes through here, so the session is stopped and its position reported once
-    $('player-modal')?.addEventListener('close', () => stopPlayback());
+    if ($('player-modal') && $('video-player')) playerBars = playerAutoHide($('player-modal'), $('video-player'));
+    $('player-modal')?.addEventListener('close', onPlayerClosed);
     window.addEventListener('pagehide', () => stopPlayback());
     updateAuthUI();
     const wizardActive = await checkSetupWizard();
