@@ -18,32 +18,6 @@ function hide(id) {
     el.style.setProperty('display', 'none', 'important');
 }
 
-function initLazyImages(root = document) {
-    // Hover-based full-res image loading: swap thumbnail for full-res on card hover
-    root.querySelectorAll('img.jf-thumb-img[data-full-src]').forEach(img => {
-        if (img.dataset.lazyBound) return;
-        const card = img.closest('.jf-card');
-        if (!card) return;
-        img.dataset.lazyBound = '1';
-
-        card.addEventListener('mouseenter', () => {
-            if (img.dataset.fullLoaded) return;
-            img.dataset.fullLoaded = '1';
-            const fullSrc = img.dataset.fullSrc;
-            const fullImg = new Image();
-            fullImg.decode().then(() => {
-                img.src = fullSrc;
-                img.style.opacity = '1';
-                img.classList.remove('blur-sm', 'scale-105');
-            }).catch(() => {
-                // Full-res failed; keep thumbnail
-                delete img.dataset.fullLoaded;
-            });
-            fullImg.src = fullSrc;
-        }, { once: true });
-    });
-}
-
 // Lucide icon as an SVG string. name is a key of window.lucideIcons (src/icons.js); an unknown name gives ''.
 function icon(name, { size = 16, class: cls = '', label } = {}) {
     const nodes = window.lucideIcons?.[name];
@@ -129,8 +103,7 @@ function formatDurationSeconds(secs) {
 }
 
 export {
-    $, html, show, hide, initLazyImages, icon, toast, escapeHtml, scanRing, updateScanRings, formatRuntime,
-    formatDurationSeconds,
+    $, html, show, hide, icon, toast, escapeHtml, scanRing, updateScanRings, formatRuntime, formatDurationSeconds,
 };
 
 // Shared state that inline handlers or other modules assign: reached through window
