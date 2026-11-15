@@ -17829,6 +17829,12 @@ fn b145_icons() {
     b124_node_test("b145_icons.mjs");
 }
 
+// B170: the player's top bar hides and shows with its bottom controls
+#[test]
+fn b170_player_header_autohide() {
+    b124_node_test("b170_player_header_autohide.mjs");
+}
+
 #[test]
 fn b142_settings_key_inputs_hide_keys() {
     let app_js = b124_web_source("app.js");

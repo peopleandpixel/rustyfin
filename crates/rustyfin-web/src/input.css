@@ -733,11 +733,18 @@ select.jf-input {
   right: 0;
   background: linear-gradient(to top, rgba(0, 0, 0, 0.95) 0%, rgba(0, 0, 0, 0.6) 60%, transparent 100%);
   padding: 1.5rem 1.5rem 1rem;
+}
+
+/* The top bar (title, back and close) hides and shows with the bottom controls */
+.jf-player-topbar,
+.jf-player-controls {
   opacity: 0;
   transition: opacity 0.3s ease;
 }
 
+.jf-player-container:hover .jf-player-topbar,
 .jf-player-container:hover .jf-player-controls,
+.jf-player-topbar.visible,
 .jf-player-controls.visible {
   opacity: 1;
 }
