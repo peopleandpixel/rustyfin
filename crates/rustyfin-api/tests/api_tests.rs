@@ -23316,6 +23316,19 @@ fn b171_next_episode() {
     b124_node_test("b171_next_episode.mjs");
 }
 
+// R3 item pages: the detail page's credits, ratings, media info, track pickers, chapters, links,
+// "mark all played" and delete (tests/web/r3item_detail.mjs), and the pickers' choice in the player
+// (tests/web/r3item_play.mjs)
+#[test]
+fn r3item_detail() {
+    b124_node_test("r3item_detail.mjs");
+}
+
+#[test]
+fn r3item_play() {
+    b124_node_test("r3item_play.mjs");
+}
+
 // The web client's autoplay switch is Jellyfin's UserConfiguration.EnableNextEpisodeAutoPlay: each
 // key a user saves comes back from /Users/Me with the value sent (the server may add defaults), and
 // a save built as the client builds it (the current configuration plus the flag) keeps the others.
