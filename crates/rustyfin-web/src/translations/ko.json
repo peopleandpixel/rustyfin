@@ -138,7 +138,7 @@
         "sort_name_desc": "이름 (힣-가)",
         "sort_release_date": "발행일",
         "sort_date_added": "추가일",
-        "sort_rating": "평점 (★)",
+        "sort_rating": "평점",
         "all_genres": "전체 장르",
         "media_scan_started_for": "{{name}} 미디어 스캔이 시작되었습니다",
         "scan_button": "스캔",
