@@ -33,14 +33,24 @@ function trackDiscGroups(tracks) {
     return groups;
 }
 
-// One track row; a click plays it. The artists show only where they differ from the album artist
-// (a compilation's tracks), as on Jellyfin Web's album page.
-function trackRow(track, { albumArtist = '', showAlbum = false } = {}) {
-    const id = track.Id || track.id;
+// An item's id, in either case the server sends it
+const itemId = item => item.Id || item.id;
+
+// The album's artist names: AlbumArtists, else the single AlbumArtist
+function albumArtistNames(album) {
+    const names = (album.AlbumArtists || []).map(a => a.Name).filter(Boolean);
+    return names.length ? names : [album.AlbumArtist].filter(Boolean);
+}
+
+// One track row; a click plays it. The artists show only where a track has an artist that is not
+// one of the album's artists (a compilation's tracks), as on Jellyfin Web's album page.
+function trackRow(track, { albumArtists = [], showAlbum = false } = {}) {
+    const id = itemId(track);
     const name = track.Name || track.name || '';
-    const artists = (track.Artists || []).join(', ');
+    const trackArtists = track.Artists || [];
+    const own = trackArtists.some(a => !albumArtists.includes(a));
     const sub = [
-        artists && artists !== albumArtist ? artists : '',
+        own ? trackArtists.join(', ') : '',
         showAlbum ? track.Album || '' : '',
     ].filter(Boolean).join(' · ');
     const played = track.UserData?.Played;
@@ -62,12 +72,12 @@ function trackRow(track, { albumArtist = '', showAlbum = false } = {}) {
 // The album page's track list: disc headings only when the album has more than one disc
 function albumTrackList(album, tracks) {
     const groups = trackDiscGroups(tracks);
-    const albumArtist = album.AlbumArtist || '';
+    const albumArtists = albumArtistNames(album);
     const first = groups[0]?.tracks[0];
     // TODO(play queue): Play should hand every track id, in this order, to the player's queue once
     // modules/player.js has one; until then it plays the first track.
     const playAll = first ? `
-        <button class="jf-btn-primary !py-1.5 !px-4 text-xs" data-action="play" data-id="${escapeHtml(first.Id)}" data-stream-type="Audio" data-title="${escapeHtml(first.Name || '')}">
+        <button class="jf-btn-primary !py-1.5 !px-4 text-xs" data-action="play" data-id="${escapeHtml(itemId(first))}" data-stream-type="Audio" data-title="${escapeHtml(first.Name || first.name || '')}">
             ${icon('Play', { size: 14, class: 'fill-current' })} ${t('common.play')}
         </button>` : '';
     return `
@@ -79,7 +89,7 @@ function albumTrackList(album, tracks) {
         ${groups.map(g => `
         <div class="jf-track-disc">
             ${groups.length > 1 ? `<h3 class="text-sm font-semibold text-white/60 mt-4 mb-2">${t('music.disc', { number: g.disc })}</h3>` : ''}
-            ${g.tracks.map(track => trackRow(track, { albumArtist })).join('')}
+            ${g.tracks.map(track => trackRow(track, { albumArtists })).join('')}
         </div>`).join('')}
     </div>`;
 }

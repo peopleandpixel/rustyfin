@@ -88,6 +88,25 @@ test('a one-disc album has no disc heading, and a compilation names each track\'
     assert.ok(html.includes('>Quebec Duo, Kilo Band<'));
 });
 
+test('with several album artists, only a track with an artist outside them names its artists', () => {
+    const { albumTrackList } = sandbox();
+    const html = albumTrackList({ AlbumArtist: 'Kilo Band', AlbumArtists: [{ Name: 'Kilo Band' }, { Name: 'Mike Ensemble' }] }, [
+        { Id: 'a', Name: 'Joint', IndexNumber: 1, Artists: ['Mike Ensemble', 'Kilo Band'] },
+        { Id: 'b', Name: 'Solo', IndexNumber: 2, Artists: ['Mike Ensemble'] },
+        { Id: 'c', Name: 'Guest', IndexNumber: 3, Artists: ['Kilo Band', 'Papa Trio'] },
+    ]);
+    assert.ok(!html.includes('text-white/50">Mike Ensemble, Kilo Band<'), 'both are album artists');
+    assert.ok(!html.includes('text-white/50">Mike Ensemble<'), 'a second album artist alone is not a guest');
+    assert.ok(html.includes('text-white/50">Kilo Band, Papa Trio<'));
+});
+
+test('Play and the rows read the id in either case', () => {
+    const { albumTrackList } = sandbox();
+    const html = albumTrackList({}, [{ id: 'lower', name: 'Lower', IndexNumber: 1 }]);
+    assert.match(html, /class="jf-btn-primary[^"]*" data-action="play" data-id="lower" data-stream-type="Audio" data-title="Lower"/);
+    assert.match(html, /class="jf-track-row[^"]*" data-action="play" data-id="lower"/);
+});
+
 test('an album with no tracks has no Play button', () => {
     const { albumTrackList } = sandbox();
     assert.ok(!albumTrackList({}, []).includes('jf-btn-primary'));
