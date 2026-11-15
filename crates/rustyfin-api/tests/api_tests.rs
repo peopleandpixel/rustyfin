@@ -15859,6 +15859,89 @@ async fn w1filters_display_preferences_keep_sort_and_filters_per_user() {
 }
 
 #[tokio::test]
+async fn w1filters_filter_lists_under_an_item_or_collection() {
+    let state = test_state().await;
+    let (token, library) = w1filters_seed_into(&state).await;
+    let (_, admin) = admin_session(&state).await;
+    let id_of = |name: &'static str| {
+        let db = state.db.clone();
+        async move {
+            let id: String = sqlx::query_scalar("SELECT id FROM media_items WHERE name = ?")
+                .bind(name)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+            uuid::Uuid::parse_str(&id).unwrap()
+        }
+    };
+    let set = |id: uuid::Uuid, genres: &'static str, year: i32| {
+        let db = state.db.clone();
+        async move {
+            sqlx::query("UPDATE media_items SET genres = ?, production_year = ? WHERE id = ?")
+                .bind(genres)
+                .bind(year)
+                .bind(id.to_string())
+                .execute(&db)
+                .await
+                .unwrap();
+        }
+    };
+    // Echo gets a season with an episode; a folder holds a movie; a collection holds Alpha and Bravo.
+    let echo = id_of("Echo").await;
+    let season = j6_add_item(&state, library, Some(echo), "Echo S1", "Season").await;
+    let episode = j6_add_item(&state, library, Some(season), "Echo E1", "Episode").await;
+    set(episode, "Mystery", 2012).await;
+    let folder = j6_add_item(&state, library, None, "Box", "Folder").await;
+    let golf = j6_add_item(&state, library, Some(folder), "Golf", "Movie").await;
+    set(golf, "Western", 1965).await;
+    let collection = uuid::Uuid::new_v4();
+    sqlx::query("INSERT INTO collections (id, name, user_id) VALUES (?, 'Picks', ?)")
+        .bind(collection.to_string())
+        .bind(admin.to_string())
+        .execute(&state.db)
+        .await
+        .unwrap();
+    for name in ["Alpha", "Bravo"] {
+        sqlx::query("INSERT INTO collection_items (collection_id, item_id) VALUES (?, ?)")
+            .bind(collection.to_string())
+            .bind(id_of(name).await.to_string())
+            .execute(&state.db)
+            .await
+            .unwrap();
+    }
+    let app = app(state);
+    let filters = |parent: String| {
+        let (app, token) = (app.clone(), token.clone());
+        async move {
+            let answer = b27_answer(&app, &format!("/Items/Filters{parent}"), &token).await;
+            (answer["Genres"].clone(), answer["Years"].clone())
+        }
+    };
+    use serde_json::json;
+    for (parent, genres, years) in [
+        (echo, json!(["Mystery"]), json!([2012])),
+        (season, json!(["Mystery"]), json!([2012])),
+        (folder, json!(["Western"]), json!([1965])),
+        (
+            collection,
+            json!(["Action", "Comedy", "Drama"]),
+            json!([2002, 2001]),
+        ),
+    ] {
+        assert_eq!(
+            filters(format!("?ParentId={parent}")).await,
+            (genres, years),
+            "{parent}"
+        );
+    }
+    // An id that is none of these lists every library's values, as without a ParentId.
+    assert_eq!(
+        filters(format!("?ParentId={}", uuid::Uuid::new_v4())).await,
+        filters(String::new()).await
+    );
+}
+
+#[tokio::test]
 async fn w1filters_filter_lists_are_the_librarys() {
     let state = test_state().await;
     let (token, library) = w1filters_seed_into(&state).await;

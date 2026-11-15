@@ -2812,11 +2812,12 @@ async fn get_filters(
     State(state): State<AppState>,
     Query(query): Query<FiltersQuery>,
 ) -> Result<Json<FiltersResult>, ApiError> {
-    let library_id = query.parent_id.or(query.parent_id_lower);
+    // A library, an item or a collection; the database works out which.
+    let parent_id = query.parent_id.or(query.parent_id_lower);
     let item_types = query.item_types();
     let cache_key = format!(
         "{}:{}",
-        library_id.map_or("all".to_string(), |id| id.to_string()),
+        parent_id.map_or("all".to_string(), |id| id.to_string()),
         item_types.join(",")
     );
     // Check cache first
@@ -2826,7 +2827,7 @@ async fn get_filters(
         return Ok(Json(filters));
     }
     let (genres, years, official_ratings) =
-        rustyfin_db::repo_media::get_filters(&state.db_ro, library_id, &item_types).await?;
+        rustyfin_db::repo_media::get_filters(&state.db_ro, parent_id, &item_types).await?;
     let result = FiltersResult {
         genres,
         years,

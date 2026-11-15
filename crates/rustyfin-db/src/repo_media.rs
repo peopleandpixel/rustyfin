@@ -1792,17 +1792,48 @@ pub async fn series_ids_with_status(
     qb.build_query_scalar().fetch_all(pool).await
 }
 
+/// The items `/Items/Filters` lists the values of.
+enum FilterScope {
+    All,
+    /// A library's items, by its id.
+    Library(String),
+    /// The descendants of an item, or a collection's items and their descendants, by its id.
+    Under(String),
+}
+
 /// Get filter values from materialized index tables.
-/// Falls back to DISTINCT queries if indexes are empty. The indexes cover every library, so one
-/// library's values always come from the DISTINCT queries.
+/// Falls back to DISTINCT queries if indexes are empty. The indexes cover every library, so the
+/// values under a `parent_id` always come from the DISTINCT queries: a library's items, an item's
+/// descendants (a folder, series or season) or a collection's items and theirs. An id that is none
+/// of these lists every library's values, as before.
 /// `item_types` (`IncludeItemTypes`) narrows the DISTINCT queries to those types.
 pub async fn get_filters(
     pool: &SqlitePool,
-    library_id: Option<Uuid>,
+    parent_id: Option<Uuid>,
     item_types: &[String],
 ) -> Result<(Vec<String>, Vec<i32>, Vec<String>), sqlx::Error> {
-    if library_id.is_some() || !item_types.is_empty() {
-        return get_filters_distinct(pool, library_id, item_types).await;
+    let scope = match parent_id.map(|id| id.to_string()) {
+        None => FilterScope::All,
+        Some(id) => {
+            let (library, item): (bool, bool) = sqlx::query_as(
+                "SELECT EXISTS (SELECT 1 FROM libraries WHERE id = ?1),
+                        EXISTS (SELECT 1 FROM media_items WHERE id = ?1)
+                     OR EXISTS (SELECT 1 FROM collections WHERE id = ?1)",
+            )
+            .bind(&id)
+            .fetch_one(pool)
+            .await?;
+            if library {
+                FilterScope::Library(id)
+            } else if item {
+                FilterScope::Under(id)
+            } else {
+                FilterScope::All
+            }
+        }
+    };
+    if !matches!(scope, FilterScope::All) || !item_types.is_empty() {
+        return get_filters_distinct(pool, &scope, item_types).await;
     }
     // Try materialized index tables first
     let genre_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM filter_genre_index")
@@ -1830,24 +1861,38 @@ pub async fn get_filters(
         Ok((genres, years, ratings))
     } else {
         // Fallback to DISTINCT queries
-        get_filters_distinct(pool, library_id, item_types).await
+        get_filters_distinct(pool, &scope, item_types).await
     }
 }
 
 /// Original DISTINCT-based filter query (fallback when materialized indexes are empty).
 async fn get_filters_distinct(
     pool: &SqlitePool,
-    library_id: Option<Uuid>,
+    scope: &FilterScope,
     item_types: &[String],
 ) -> Result<(Vec<String>, Vec<i32>, Vec<String>), sqlx::Error> {
-    // `SELECT DISTINCT <column> FROM media_items WHERE <column> IS NOT NULL`, in the library and of
-    // the types when given.
+    // `SELECT DISTINCT <column> FROM media_items WHERE <column> IS NOT NULL`, in the scope and of
+    // the types when given. Descendants are walked down parent_id (indexed).
     let distinct = |column: &str| {
-        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(format!(
+        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new("");
+        if let FilterScope::Under(id) = scope {
+            qb.push("WITH RECURSIVE scope(id) AS (SELECT item_id FROM collection_items WHERE collection_id = ")
+                .push_bind(id.clone())
+                .push(" UNION SELECT id FROM media_items WHERE parent_id = ")
+                .push_bind(id.clone())
+                .push(" UNION SELECT m.id FROM media_items m JOIN scope s ON m.parent_id = s.id) ");
+        }
+        qb.push(format!(
             "SELECT DISTINCT {column} FROM media_items WHERE {column} IS NOT NULL"
         ));
-        if let Some(id) = library_id {
-            qb.push(" AND library_id = ").push_bind(id.to_string());
+        match scope {
+            FilterScope::All => {}
+            FilterScope::Library(id) => {
+                qb.push(" AND library_id = ").push_bind(id.clone());
+            }
+            FilterScope::Under(_) => {
+                qb.push(" AND id IN (SELECT id FROM scope)");
+            }
         }
         if !item_types.is_empty() {
             qb.push(" AND media_type IN (");
@@ -1860,10 +1905,10 @@ async fn get_filters_distinct(
         qb
     };
 
-    let genre_strs: Vec<String> = distinct("genres")
-        .build_query_scalar()
-        .fetch_all(pool)
-        .await?;
+    // '[]' is the column's default: a row stored without genres.
+    let mut genres = distinct("genres");
+    genres.push(" AND genres != '[]'");
+    let genre_strs: Vec<String> = genres.build_query_scalar().fetch_all(pool).await?;
     let mut all_genres: Vec<String> = Vec::new();
     for gs in &genre_strs {
         for g in gs.split('|') {
