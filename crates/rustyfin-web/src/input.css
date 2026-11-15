@@ -22,6 +22,9 @@
   --jf-accent: #00a4dc;
   --jf-text-main: #f0f3f8;
   --jf-text-muted: #8b949e;
+  /* Skeletons: anything not painted yet, a step lighter than the surface so it never reads as a
+     black gap */
+  --jf-skeleton: color-mix(in srgb, var(--jf-text-muted) 30%, var(--jf-bg-surface));
 }
 
 [data-theme="dark"] {
@@ -113,29 +116,53 @@ body {
   border-color: var(--jf-border-hover);
 }
 
-/* Library grid. Columns and gap are set here, not with Tailwind classes, because the card
-   height below is computed from them. Breakpoints are Tailwind's sm, md, lg and xl. */
+/* Library grid. Columns and gap are set here, not with Tailwind classes, because the virtual grid
+   reads them to place its cells. Breakpoints are Tailwind's sm, md, lg and xl. */
 .jf-lib-grid {
   --jf-cols: 2;
-  --jf-card-text: calc(2.625rem + 16.5px);
   display: grid;
   grid-template-columns: repeat(var(--jf-cols), minmax(0, 1fr));
   gap: 1rem;
   container-type: inline-size;
 }
-@media (width >= 40rem) { .jf-lib-grid { --jf-cols: 3; --jf-card-text: calc(2.875rem + 16.5px); } }
+@media (width >= 40rem) { .jf-lib-grid { --jf-cols: 3; } }
 @media (width >= 48rem) { .jf-lib-grid { --jf-cols: 4; } }
 @media (width >= 64rem) { .jf-lib-grid { --jf-cols: 5; } }
 @media (width >= 80rem) { .jf-lib-grid { --jf-cols: 7; } }
 
-/* Library grid cards: skip off-screen layout, and keep scroll targets clear of the header.
-   A skipped card must be as tall as a rendered one or jump targets move: the content box is
-   the poster ((column width - 2px border) x 1.5) plus the text body (padding, title line at
-   text-xs or sm:text-sm, mt-0.5, 11px type line). */
-.jf-lib-grid > * {
+/* The library grid is virtual (app.js libraryView): it keeps the whole list's height, and only
+   the cells near the viewport are in it, each placed by the script at its row and column. Its
+   columns and gap above still drive the cell size. Contained, so a cell coming or going lays out
+   only itself. */
+.jf-vgrid {
+  display: block;
+  position: relative;
+  contain: layout;
+}
+/* The grid paints nothing itself: a position whose cell is not made yet shows the page. (A
+   list-tall skeleton background was tried in round 7; its raster over the whole scroll height
+   added to what a fling has to draw.) */
+.jf-vgrid > * {
+  position: absolute;
+  /* No paint containment: it would clip the card's hover lift, shadow, glow and focus outline */
+  contain: layout style;
+}
+/* A lifted or focused card's shadow, glow and outline stay above the cells after it */
+.jf-vgrid > :hover,
+.jf-vgrid > :focus-within {
+  z-index: 1;
+}
+/* A cell holds one card (the link to its item), as tall as the cell */
+.jf-vgrid > * > .jf-card {
+  height: 100%;
+}
+
+/* Other poster grids (favourites, search, a person's titles): off-screen cards skip layout and
+   paint too. Their columns vary, so a card not yet drawn is counted at a typical poster card's
+   height until it has been drawn once ("auto" keeps its real height after that). */
+.jf-card-grid > .jf-card {
   content-visibility: auto;
-  contain-intrinsic-height: auto calc(((100cqw - (var(--jf-cols) - 1) * 1rem) / var(--jf-cols) - 2px) * 1.5 + var(--jf-card-text));
-  scroll-margin-top: 4.5rem;
+  contain-intrinsic-height: auto 17rem;
 }
 
 .jf-poster {
@@ -182,7 +209,7 @@ body {
   opacity: 0;
   z-index: 2;
   pointer-events: none;
-  transition: opacity 0.25s ease, backdrop-filter 0.25s ease;
+  transition: opacity 0.25s ease;
 }
 
 .jf-card:hover .jf-play-overlay {
@@ -221,7 +248,6 @@ body {
   height: 4px;
   z-index: 2;
   background: rgba(0, 0, 0, 0.6);
-  backdrop-filter: blur(4px);
 }
 
 .jf-progress-bar {
@@ -262,6 +288,17 @@ body {
   background: rgba(234, 179, 8, 0.15);
   border-color: rgba(234, 179, 8, 0.3);
   color: #facc15;
+}
+
+/* Badges on cards (the library grid, home rows, other card grids): no backdrop blur, which would
+   give every card a compositing layer of its own; the rating badge's tint goes over a light dark
+   wash instead, standing in for the softening the blur gave. One-off badges (the spotlight, a
+   detail page) keep master's blur. */
+.jf-card .jf-badge {
+  backdrop-filter: none;
+}
+.jf-card .jf-badge-rating {
+  background: linear-gradient(rgba(234, 179, 8, 0.15), rgba(234, 179, 8, 0.15)), rgba(0, 0, 0, 0.2);
 }
 
 /* Hero Spotlight / Featured Banner */
@@ -802,7 +839,6 @@ dialog.modal::backdrop {
 img.jf-lazy-img {
   opacity: 0;
   transition: opacity 0.3s cubic-bezier(0.16, 1, 0.3, 1);
-  will-change: opacity;
 }
 
 img.jf-lazy-img.loaded,
@@ -814,6 +850,13 @@ img.jf-lazy-img:not([data-src]) {
 img.jf-thumb-img {
   transition: opacity 0.2s ease;
 }
+/* In the library grid a picture shows at once: a fade animates each picture's opacity, and the
+   browser gives every fading picture (and what overlaps it) a layer of its own until it ends:
+   29-31 layers mid-fling instead of 8 (B152 round 12) */
+.jf-vgrid img.jf-thumb-img {
+  transition: none;
+}
+
 
 .jf-poster, .jf-poster-backdrop {
   background: linear-gradient(135deg, #151a23 0%, #1e2430 100%);
@@ -821,10 +864,34 @@ img.jf-thumb-img {
   overflow: hidden;
 }
 
+/* A library cell whose item has not arrived: the skeleton colour in the poster box and two bars
+   in place of the title lines (drawn as backgrounds, so the cell keeps a card's exact size) */
+.jf-card-pending .jf-poster {
+  background: var(--jf-skeleton);
+}
+.jf-card-pending .p-3 > * {
+  background: linear-gradient(var(--jf-skeleton), var(--jf-skeleton)) no-repeat left center / 70% 60%;
+  border-radius: 0.25rem;
+}
+.jf-card-pending .p-3 > * + * {
+  background-size: 40% 60%;
+}
+
+/* A card's BlurHash: a tiny bitmap (see paintBlurhashes) stretched over the poster box, under
+   the picture */
+.jf-blurhash {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 0;
+  background-size: 100% 100%;
+}
+
 .jf-poster-skeleton {
   position: absolute;
   inset: 0;
-  background: linear-gradient(90deg, rgba(255, 255, 255, 0.02) 25%, rgba(255, 255, 255, 0.06) 50%, rgba(255, 255, 255, 0.02) 75%);
+  background: linear-gradient(90deg, var(--jf-skeleton) 25%, color-mix(in srgb, var(--jf-skeleton) 85%, var(--jf-text-main)) 50%, var(--jf-skeleton) 75%);
   background-size: 200% 100%;
   animation: jfSkeleton 1.8s infinite;
   z-index: 0;

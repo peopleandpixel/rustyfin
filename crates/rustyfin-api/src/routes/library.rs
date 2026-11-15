@@ -1,4 +1,5 @@
-use axum::extract::{Path, Query, State};
+use crate::query::Query;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
@@ -60,7 +61,7 @@ async fn get_media_folders(
     } else {
         rustyfin_db::repo_library::get_all_libraries(&state.db_ro).await?
     };
-    Ok(Json(libraries_to_views(&libs)))
+    Ok(Json(libraries_to_views(&libs, &state.server_id)))
 }
 
 /// GET /Library/PhysicalPaths - every library folder path
@@ -69,28 +70,50 @@ async fn get_physical_paths(State(state): State<AppState>) -> Result<Json<Vec<St
     Ok(Json(libs.into_iter().flat_map(|l| l.paths).collect()))
 }
 
-pub(crate) fn libraries_to_views(libs: &[Library]) -> Value {
+/// A library as Jellyfin's `CollectionFolder` item: in `/UserViews`, `GET /Items/{library id}` and
+/// an item's ancestors.
+pub(crate) fn library_view(lib: &Library, server_id: &str) -> Value {
+    json!({
+        "Id": lib.id,
+        "Name": lib.name,
+        "ServerId": server_id,
+        "Type": "CollectionFolder",
+        "CollectionType": lib.content_type.jellyfin_collection_type(),
+        "MediaType": "Unknown",
+        "IsFolder": true,
+        "ParentId": Value::Null,
+        "Path": lib.paths.first().cloned().unwrap_or_default(),
+        "LocationType": "FileSystem",
+        "CanDelete": false,
+        "CanDownload": false,
+        "PlayAccess": "Full",
+        "DisplayPreferencesId": lib.id.simple().to_string(),
+        "ChildCount": 0,
+        "ImageTags": {},
+        "BackdropImageTags": [],
+        "ImageBlurHashes": {},
+        "PrimaryImageAspectRatio": 1.7777777777777777,
+        "ProviderIds": {},
+        "ExternalUrls": [],
+        "Genres": [],
+        "Tags": [],
+        "LockedFields": [],
+        "LockData": false,
+        "UserData": {
+            "PlaybackPositionTicks": 0,
+            "PlayCount": 0,
+            "IsFavorite": false,
+            "Played": false,
+            "Key": lib.id.to_string(),
+            "ItemId": lib.id.simple().to_string(),
+        },
+    })
+}
+
+pub(crate) fn libraries_to_views(libs: &[Library], server_id: &str) -> Value {
     let items: Vec<Value> = libs
         .iter()
-        .map(|lib| {
-            json!({
-                "Id": lib.id,
-                "Name": lib.name,
-                "Type": "CollectionFolder",
-                "CollectionType": lib.content_type.jellyfin_collection_type(),
-                "MediaType": "Unknown",
-                "IsFolder": true,
-                "ServerId": "rustyfin",
-                "ParentId": Value::Null,
-                "ChildCount": 0,
-                "UserData": {
-                    "PlaybackPositionTicks": 0,
-                    "PlayCount": 0,
-                    "IsFavorite": false,
-                    "Played": false,
-                },
-            })
-        })
+        .map(|lib| library_view(lib, server_id))
         .collect();
     let count = items.len() as i64;
     json!({
@@ -109,7 +132,7 @@ async fn get_user_views(
         return Ok(Json(cached));
     }
     let libs = rustyfin_db::repo_library::get_all_libraries(&state.db_ro).await?;
-    let views = libraries_to_views(&libs);
+    let views = libraries_to_views(&libs, &state.server_id);
     state
         .cache
         .library_views
@@ -123,7 +146,7 @@ async fn get_user_views_no_user(State(state): State<AppState>) -> Result<Json<Va
         return Ok(Json(cached));
     }
     let libs = rustyfin_db::repo_library::get_all_libraries(&state.db_ro).await?;
-    let views = libraries_to_views(&libs);
+    let views = libraries_to_views(&libs, &state.server_id);
     state
         .cache
         .library_views
@@ -722,7 +745,7 @@ mod tests {
 
     #[test]
     fn test_libraries_to_views_empty() {
-        let result = libraries_to_views(&[]);
+        let result = libraries_to_views(&[], "server");
         assert_eq!(result["Items"].as_array().unwrap().len(), 0);
         assert_eq!(result["TotalRecordCount"], 0);
         assert_eq!(result["StartIndex"], 0);
@@ -736,7 +759,7 @@ mod tests {
             content_type: rustyfin_model::library::LibraryContentType::Movies,
             paths: vec!["/media/movies".to_string()],
         }];
-        let result = libraries_to_views(&libs);
+        let result = libraries_to_views(&libs, "server");
         let items = result["Items"].as_array().unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0]["Name"], "Movies");
@@ -754,7 +777,7 @@ mod tests {
             content_type: rustyfin_model::library::LibraryContentType::TvShows,
             paths: vec!["/media/tv".to_string()],
         }];
-        let result = libraries_to_views(&libs);
+        let result = libraries_to_views(&libs, "server");
         let items = result["Items"].as_array().unwrap();
         assert_eq!(items[0]["CollectionType"], "tvshows");
     }
@@ -767,7 +790,7 @@ mod tests {
             content_type: rustyfin_model::library::LibraryContentType::Music,
             paths: vec!["/media/music".to_string()],
         }];
-        let result = libraries_to_views(&libs);
+        let result = libraries_to_views(&libs, "server");
         let items = result["Items"].as_array().unwrap();
         assert_eq!(items[0]["CollectionType"], "music");
     }
@@ -780,7 +803,7 @@ mod tests {
             content_type: rustyfin_model::library::LibraryContentType::Photos,
             paths: vec!["/media/photos".to_string()],
         }];
-        let result = libraries_to_views(&libs);
+        let result = libraries_to_views(&libs, "server");
         let items = result["Items"].as_array().unwrap();
         assert_eq!(items[0]["CollectionType"], "homevideos");
     }
@@ -793,7 +816,7 @@ mod tests {
             content_type: rustyfin_model::library::LibraryContentType::Mixed,
             paths: vec!["/media/mixed".to_string()],
         }];
-        let result = libraries_to_views(&libs);
+        let result = libraries_to_views(&libs, "server");
         let items = result["Items"].as_array().unwrap();
         assert_eq!(items[0]["CollectionType"], "mixed");
     }
@@ -814,7 +837,7 @@ mod tests {
                 paths: vec!["/media/tv".to_string()],
             },
         ];
-        let result = libraries_to_views(&libs);
+        let result = libraries_to_views(&libs, "server");
         let items = result["Items"].as_array().unwrap();
         assert_eq!(items.len(), 2);
         assert_eq!(result["TotalRecordCount"], 2);
@@ -828,7 +851,7 @@ mod tests {
             content_type: rustyfin_model::library::LibraryContentType::Movies,
             paths: vec!["/media/test".to_string()],
         }];
-        let result = libraries_to_views(&libs);
+        let result = libraries_to_views(&libs, "server");
         let user_data = &result["Items"][0]["UserData"];
         assert_eq!(user_data["PlaybackPositionTicks"], 0);
         assert_eq!(user_data["PlayCount"], 0);
