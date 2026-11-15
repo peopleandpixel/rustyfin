@@ -35,6 +35,7 @@ mod subtitle;
 mod sync_play;
 mod system;
 mod transcode;
+mod trickplay;
 mod users;
 mod websocket;
 
@@ -136,6 +137,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(live_tv::routes())
         .merge(additional::routes())
         .merge(media_segments::routes())
+        .merge(trickplay::routes())
         .merge(dynamic_hls::routes())
         .merge(localization::routes())
         .merge(sync_play::routes())

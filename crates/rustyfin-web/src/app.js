@@ -15,10 +15,11 @@ import { posterLoaded, posterFailed } from './modules/library.js';
 import './modules/item.js';
 import { doSearch } from './modules/search.js';
 import {
-    seekVideo, skipTime, previewSeek, changeAudioTrack, changeSubtitleTrack, closePlayer, togglePlayPause, setVolume,
-    toggleMute, setPlaybackRate, toggleFullscreen,
+    seekVideo, skipTime, previewSeek, changeAudioTrack, changeSubtitleTrack, playerAreaClick, closePlayer,
+    playAdjacentEpisode, playUpNextNow, cancelUpNext, togglePlayPause, setVolume, toggleMute, setPlaybackRate,
+    toggleFullscreen,
 } from './modules/player.js';
-import { changeUiLanguage, handleSaveConfig } from './modules/settings.js';
+import { changeNextEpisodeAutoPlay, changeUiLanguage, handleSaveConfig } from './modules/settings.js';
 import { refreshTasks, openAddUser, closeAddUser, submitAddUser, clearLiveLog, setLogLevel } from './modules/admin.js';
 import {
     jiAddPair, jiForget, jiSetMine, jiSetChoice, jiSetConfirm, jiPreview, jiRun, jiNewCode, jiCopyCodes,
@@ -29,10 +30,11 @@ import { closePluginConfig, savePluginConfig, closePluginPriority, savePluginPri
 Object.assign(window, {
     $, posterLoaded, posterFailed, toast, wizSetUiLanguage, wizApplyPath, wizNext, wizPrev, wizSkipLibrary,
     wizFinishWithoutImport, wizComplete, navigate, toggleUserMenu, closeUserMenu, toggleSidebar, doSearch, seekVideo,
-    skipTime, previewSeek, changeAudioTrack, changeSubtitleTrack, closePlayer, togglePlayPause, setVolume, toggleMute,
-    setPlaybackRate, toggleFullscreen, renderLogin, handleLogin, handleSetupPassword, doLogout, showQuickConnectModal,
-    authorizeQuickConnect, changeUiLanguage, handleSaveConfig, jiAddPair, jiForget, jiSetMine, jiSetChoice,
-    jiSetConfirm, jiPreview, jiRun, jiNewCode, jiCopyCodes, refreshTasks, openAddLibrary, closeAddLibrary,
-    submitAddLibrary, openAddUser, closeAddUser, submitAddUser, clearLiveLog, setLogLevel, closePluginConfig,
-    savePluginConfig, closePluginPriority, savePluginPriority,
+    skipTime, previewSeek, changeAudioTrack, changeSubtitleTrack, playerAreaClick, closePlayer, playAdjacentEpisode,
+    playUpNextNow, cancelUpNext, togglePlayPause, setVolume, toggleMute, setPlaybackRate, toggleFullscreen, renderLogin,
+    handleLogin, handleSetupPassword, doLogout, showQuickConnectModal, authorizeQuickConnect, changeNextEpisodeAutoPlay,
+    changeUiLanguage, handleSaveConfig, jiAddPair, jiForget, jiSetMine, jiSetChoice, jiSetConfirm, jiPreview, jiRun,
+    jiNewCode, jiCopyCodes, refreshTasks, openAddLibrary, closeAddLibrary, submitAddLibrary, openAddUser, closeAddUser,
+    submitAddUser, clearLiveLog, setLogLevel, closePluginConfig, savePluginConfig, closePluginPriority,
+    savePluginPriority,
 });

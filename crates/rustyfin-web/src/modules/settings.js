@@ -100,6 +100,18 @@ async function renderSettings(data) {
                 <p class="text-xs text-white/40 mt-2">${t('settings.display_language_hint')}</p>
             </div>
 
+            <!-- Playback card -->
+            <div class="jf-settings-card">
+                <h3 class="text-base font-bold text-white mb-4 flex items-center gap-2">
+                    <span class="w-2 h-2 rounded-full bg-sky-400"></span>
+                    ${t('settings.playback')}
+                </h3>
+                <label class="flex items-center gap-3 text-sm text-white/80 cursor-pointer">
+                    <input id="pref-next-episode-autoplay" type="checkbox" class="toggle toggle-sm toggle-primary" ${me.Configuration?.EnableNextEpisodeAutoPlay !== false ? 'checked' : ''} onchange="changeNextEpisodeAutoPlay(this)">
+                    ${t('settings.next_episode_autoplay')}
+                </label>
+            </div>
+
             <!-- Change Password card -->
             <div class="jf-settings-card">
                 <h3 class="text-base font-bold text-white mb-4 flex items-center gap-2">
@@ -123,6 +135,22 @@ async function renderSettings(data) {
         $('change-password-form')?.addEventListener('submit', e => handleChangePassword(e, id));
     } catch (e) {
         page.innerHTML = `<div class="p-6 rounded-xl bg-red-500/10 text-red-400">${escapeHtml(e.message)}</div>`;
+    }
+}
+
+// Saves Jellyfin's EnableNextEpisodeAutoPlay into the user's configuration, keeping its other settings
+async function changeNextEpisodeAutoPlay(input) {
+    const enabled = input.checked;
+    input.disabled = true;
+    try {
+        const me = await API.getMe();
+        await API.post(`/Users/${me.Id}/Configuration`, { ...(me.Configuration || {}), EnableNextEpisodeAutoPlay: enabled });
+        toast(t('settings.next_episode_autoplay_saved'));
+    } catch (e) {
+        input.checked = !enabled;
+        toast(e.message, 'error');
+    } finally {
+        input.disabled = false;
     }
 }
 
@@ -189,4 +217,6 @@ async function handleSaveConfig(e) {
 // AccountStatus.UserId has hyphens and a user's Id may not, so account ids are compared without case and hyphens.
 function oidcAccountKey(id) { return String(id).toLowerCase().replace(/-/g, ''); }
 
-export { renderSettings, changeUiLanguage, providerKeyField, handleSaveConfig, oidcAccountKey };
+export {
+    renderSettings, changeNextEpisodeAutoPlay, changeUiLanguage, providerKeyField, handleSaveConfig, oidcAccountKey,
+};

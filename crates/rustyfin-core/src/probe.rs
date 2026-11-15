@@ -132,6 +132,8 @@ struct Disposition {
     default: Option<u8>,
     #[serde(default, deserialize_with = "deserialize_optional_u8")]
     forced: Option<u8>,
+    #[serde(default, deserialize_with = "deserialize_optional_u8")]
+    attached_pic: Option<u8>,
 }
 
 fn deserialize_optional_u32<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
@@ -225,7 +227,6 @@ struct FfprobeFormat {
     duration: Option<String>,
     bit_rate: Option<String>,
     size: Option<String>,
-    #[allow(dead_code)]
     format_name: Option<String>,
     #[allow(dead_code)]
     format_long_name: Option<String>,
@@ -238,14 +239,12 @@ struct FfprobeChapters {
     chapters: Vec<FfprobeChapter>,
 }
 
+/// One entry of ffprobe's `-show_chapters` output. ffprobe writes `id`, `start` and `end` as
+/// JSON numbers and the times as strings, so only the string fields are read; the times carry
+/// the same positions as `start` and `end` over `time_base`.
 #[derive(Debug, Deserialize)]
 struct FfprobeChapter {
-    #[allow(dead_code)]
-    id: Option<String>,
-    time_base: Option<String>,
-    start: Option<String>,
     start_time: Option<String>,
-    end: Option<String>,
     end_time: Option<String>,
     tags: Option<HashMap<String, String>>,
 }
@@ -339,11 +338,14 @@ pub async fn probe_file(path: &str) -> Result<ProbeResult, ProbeError> {
         None
     };
 
-    // Container is the file extension
-    let container = std::path::Path::new(path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|s| s.to_lowercase());
+    let container = container_name(
+        path,
+        format.format_name.as_deref(),
+        // Cover art is a video stream too, but doesn't make the file a video
+        video_streams
+            .iter()
+            .any(|s| s.disposition.as_ref().and_then(|d| d.attached_pic) != Some(1)),
+    );
 
     // Build media streams
     let media_streams: Vec<MediaStream> =
@@ -376,7 +378,7 @@ pub async fn probe_file(path: &str) -> Result<ProbeResult, ProbeError> {
     let audio_tags = extract_audio_tags(&format.tags, &probe.streams);
 
     // Extract chapters
-    let chapters = extract_chapters(path).await;
+    let chapters = read_chapters(path).await;
 
     Ok(ProbeResult {
         source,
@@ -486,9 +488,22 @@ fn extract_album_art(streams: &[FfprobeStream]) -> (Option<Vec<u8>>, Option<Stri
     (None, None)
 }
 
-/// Extract chapter markers from a media file using ffprobe.
-async fn extract_chapters(path: &str) -> Vec<Chapter> {
-    let output = Command::new("ffprobe")
+/// Reads the chapter markers of a media file with ffprobe; none when it can't.
+pub(crate) async fn read_chapters(path: &str) -> Vec<Chapter> {
+    read_chapters_with("ffprobe", path, CHAPTER_READ_TIMEOUT).await
+}
+
+/// The longest one chapter read may take, so a stalled file can't hold up the re-read list.
+const CHAPTER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// `read_chapters` with the ffprobe `program` and a `timeout`, after which ffprobe is killed and
+/// no chapters are given.
+async fn read_chapters_with(
+    program: &str,
+    path: &str,
+    timeout: std::time::Duration,
+) -> Vec<Chapter> {
+    let run = Command::new(program)
         .args([
             "-v",
             "quiet",
@@ -500,83 +515,84 @@ async fn extract_chapters(path: &str) -> Vec<Chapter> {
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await;
-
-    let output = match output {
-        Ok(o) if o.status.success() => o,
-        _ => return Vec::new(),
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    let output = match tokio::time::timeout(timeout, run).await {
+        Ok(Ok(o)) if o.status.success() => o,
+        Ok(_) => return Vec::new(),
+        Err(_) => {
+            warn!(
+                path,
+                "reading the chapters took too long; ffprobe was stopped"
+            );
+            return Vec::new();
+        }
     };
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let chapters: FfprobeChapters = match serde_json::from_str(&stdout) {
+    parse_chapters(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Parses ffprobe's `-show_chapters` JSON into chapters, like Jellyfin: positions are rounded to
+/// the millisecond, and a chapter without a title, or titled with a time ("00:05:00.000", as some
+/// rippers write), is named "Chapter N".
+fn parse_chapters(json: &str) -> Vec<Chapter> {
+    let chapters: FfprobeChapters = match serde_json::from_str(json) {
         Ok(c) => c,
-        Err(_) => return Vec::new(),
+        Err(e) => {
+            warn!("could not read ffprobe's chapters: {}", e);
+            return Vec::new();
+        }
+    };
+    let ticks = |t: &Option<String>| {
+        t.as_deref()
+            .and_then(|t| t.trim().parse::<f64>().ok())
+            .map(|s| (s * 1000.0).round() as i64 * 10_000)
+            .unwrap_or(0)
     };
 
-    let mut result = Vec::new();
-    for (i, ch) in chapters.chapters.iter().enumerate() {
-        // Parse start time from time_base and start, or from start_time directly
-        let start_seconds = ch
-            .start_time
-            .as_ref()
-            .and_then(|t| t.parse::<f64>().ok())
-            .or_else(|| {
-                ch.time_base.as_ref().and_then(|tb| {
-                    let (_, denom) = tb.split_once('/')?;
-                    let denom = denom.parse::<f64>().ok()?;
-                    ch.start
-                        .as_ref()
-                        .and_then(|s| s.parse::<f64>().ok())
-                        .map(|s| s / denom)
-                })
-            })
-            .unwrap_or(0.0);
+    chapters
+        .chapters
+        .iter()
+        .enumerate()
+        .map(|(i, ch)| {
+            let title = ch.tags.as_ref().and_then(|tags| {
+                tags.iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("title"))
+                    .map(|(_, v)| v.trim())
+            });
+            let name = match title {
+                Some(t) if !t.is_empty() && !looks_like_time(t) => t.to_string(),
+                _ => format!("Chapter {}", i + 1),
+            };
+            Chapter {
+                id: uuid::Uuid::new_v4().to_string(),
+                item_id: String::new(), // will be set when saving
+                chapter_number: (i + 1) as i32,
+                name,
+                start_position_ticks: ticks(&ch.start_time),
+                end_position_ticks: ticks(&ch.end_time),
+                image_path: None,
+                image_date_modified: None,
+            }
+        })
+        .collect()
+}
 
-        // Parse end time
-        let end_seconds = ch
-            .end_time
-            .as_ref()
-            .and_then(|t| t.parse::<f64>().ok())
-            .or_else(|| {
-                ch.time_base.as_ref().and_then(|tb| {
-                    let (_, denom) = tb.split_once('/')?;
-                    let denom = denom.parse::<f64>().ok()?;
-                    ch.end
-                        .as_ref()
-                        .and_then(|e| e.parse::<f64>().ok())
-                        .map(|e| e / denom)
-                })
-            })
-            .unwrap_or(0.0);
-
-        // Chapter name from tags
-        let name = ch
-            .tags
-            .as_ref()
-            .and_then(|tags| {
-                tags.get("title").or_else(|| {
-                    tags.iter()
-                        .find(|(k, _)| k.eq_ignore_ascii_case("title"))
-                        .map(|(_, v)| v)
-                })
-            })
-            .cloned()
-            .unwrap_or_else(|| format!("Chapter {}", i + 1));
-
-        result.push(Chapter {
-            id: uuid::Uuid::new_v4().to_string(),
-            item_id: String::new(), // will be set when saving
-            chapter_number: (i + 1) as i32,
-            name,
-            start_position_ticks: (start_seconds * 10_000_000.0) as i64,
-            end_position_ticks: (end_seconds * 10_000_000.0) as i64,
-            image_path: None,
-        });
-    }
-
-    result
+/// Whether a chapter title is a time span such as "00:05:00.000" or "12", the titles Jellyfin
+/// replaces because .NET's `TimeSpan.TryParse` accepts them.
+fn looks_like_time(title: &str) -> bool {
+    let body = title.strip_prefix('-').unwrap_or(title);
+    let mut parts = body.split(':');
+    let count = body.split(':').count();
+    count <= 4
+        && parts.all(|p| {
+            let (whole, frac) = p.split_once('.').unwrap_or((p, "0"));
+            !whole.is_empty()
+                && whole.bytes().all(|b| b.is_ascii_digit())
+                && frac.bytes().all(|b| b.is_ascii_digit())
+                && !frac.is_empty()
+        })
 }
 
 /// Simple base64 decoder (avoids adding a dependency).
@@ -624,6 +640,49 @@ fn tag<'a>(tags: Option<&'a HashMap<String, String>>, key: &str) -> Option<&'a s
         .map(String::as_str)
 }
 
+/// Jellyfin's name for an ffprobe format (ProbeResultNormalizer.NormalizeFormat).
+fn jellyfin_format(name: &str) -> &str {
+    match name {
+        "mpegvideo" => "mpeg",
+        "mpegts" => "ts",
+        "matroska" => "mkv",
+        other => other,
+    }
+}
+
+/// The container of the file at `path`, given ffprobe's `format_name` (a comma-separated list,
+/// "mov,mp4,m4a,3gp,3g2,mj2"). It is the lowercased extension, with MPEG-TS's other extensions
+/// (m2ts, mts) named "ts" as Jellyfin names them. A video file whose extension is not among the
+/// formats ffprobe found (an MPEG program stream named .avi) gets the first format instead, as
+/// Jellyfin does. Rustyfin keeps the extension where it is one of the formats ("mp4", where
+/// Jellyfin says "mov"), since clients' direct play profiles list containers by extension.
+fn container_name(path: &str, format_name: Option<&str>, is_video: bool) -> Option<String> {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_lowercase());
+    let ext = match ext.as_deref() {
+        Some("m2ts" | "mts" | "m2t") => Some("ts".to_string()),
+        _ => ext,
+    };
+    let formats: Vec<&str> = format_name
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|f| !f.is_empty())
+        .map(jellyfin_format)
+        .collect();
+    let Some(&first) = formats.first() else {
+        return ext;
+    };
+    match ext {
+        Some(ext) if !is_video || formats.contains(&ext.as_str()) => Some(ext),
+        // The MP4 family's extensions are all among its formats except m4v
+        Some(ext) if ext == "m4v" && formats.contains(&"mp4") => Some(ext),
+        _ => Some(first.to_string()),
+    }
+}
+
 fn stream_to_model(s: FfprobeStream) -> MediaStream {
     let is_default = s.disposition.as_ref().and_then(|d| d.default).unwrap_or(0) > 0;
     let is_forced = s.disposition.as_ref().and_then(|d| d.forced).unwrap_or(0) > 0;
@@ -636,16 +695,10 @@ fn stream_to_model(s: FfprobeStream) -> MediaStream {
         .map(str::to_string)
         .or(s.title);
 
-    // Determine subtitle type
-    let subtitle_type = if s.codec_type.as_deref() == Some("subtitle") {
-        if s.path.is_some() || s.external.unwrap_or(false) {
-            Some("External".to_string())
-        } else {
-            Some("Embedded".to_string())
-        }
-    } else {
-        None
-    };
+    let stream_type = MediaStream::stream_type(
+        s.codec_type.as_deref().unwrap_or(""),
+        s.codec_name.as_deref(),
+    );
 
     // As in Jellyfin, only the disposition makes a subtitle forced; a title or codec name
     // that says "forced" does not
@@ -674,7 +727,7 @@ fn stream_to_model(s: FfprobeStream) -> MediaStream {
             .as_ref()
             .and_then(|r| r.replace(" Hz", "").parse().ok()),
         profile: s.profile,
-        r#type: subtitle_type,
+        r#type: stream_type,
         aspect_ratio_text: None,
         aspect_ratio: None,
         title,
@@ -749,6 +802,7 @@ async fn probe_and_write(
                 save_runtime_and_chapters(
                     pool,
                     item_id,
+                    path,
                     result.source.run_time_ticks,
                     result.chapters,
                 )
@@ -986,7 +1040,7 @@ async fn probe_and_add_source_internal(
         rustyfin_db::repo_media_source::insert_media_source_with_streams(pool, item_id, &source)
             .await?;
 
-    save_runtime_and_chapters(pool, item_id, source.run_time_ticks, result.chapters).await;
+    save_runtime_and_chapters(pool, item_id, path, source.run_time_ticks, result.chapters).await;
 
     Ok(())
 }
@@ -995,6 +1049,7 @@ async fn probe_and_add_source_internal(
 async fn save_runtime_and_chapters(
     pool: &sqlx::SqlitePool,
     item_id: &uuid::Uuid,
+    path: &str,
     run_time_ticks: Option<i64>,
     mut chapters: Vec<Chapter>,
 ) {
@@ -1007,7 +1062,47 @@ async fn save_runtime_and_chapters(
             .await;
     }
 
-    // Save chapters if any were found
+    // The tile set, chapter images and failed image jobs belong to the file version they were
+    // made from. When this file's size or time differs, they go (the image tasks remove the old
+    // files from disk); when it is the same file probed again, they stay.
+    use rustyfin_db::repo_trickplay as tp;
+    let now = crate::trickplay::file_version(path).await;
+    match tp::get_image_version(pool, *item_id).await {
+        Ok(Some(made_from)) if made_from != now => {
+            let dropped = async {
+                tp::delete_trickplay(pool, *item_id).await?;
+                tp::clear_failures(pool, *item_id).await?;
+                tp::set_image_version(pool, *item_id, None).await
+            };
+            if let Err(e) = dropped.await {
+                warn!("failed to drop the old trickplay tiles: {}", e);
+            }
+        }
+        Ok(_) => {
+            // The same file: chapters at the same start keep their image, or their failure mark.
+            if let Ok(old) = rustyfin_db::repo_chapter::get_chapters(pool, *item_id).await {
+                for ch in &mut chapters {
+                    if let Some(o) = old
+                        .iter()
+                        .find(|o| o.start_position_ticks == ch.start_position_ticks)
+                    {
+                        ch.image_path.clone_from(&o.image_path);
+                        ch.image_date_modified.clone_from(&o.image_date_modified);
+                    }
+                }
+            }
+        }
+        Err(e) => warn!("failed to read the version images were made from: {}", e),
+    }
+    save_chapters(pool, item_id, chapters).await;
+}
+
+/// Saves a probed file's chapters for an item, replacing its old ones; none found keeps them.
+pub(crate) async fn save_chapters(
+    pool: &sqlx::SqlitePool,
+    item_id: &uuid::Uuid,
+    mut chapters: Vec<Chapter>,
+) {
     if !chapters.is_empty() {
         let item_id_str = item_id.to_string();
         // Set the item_id on each chapter
@@ -1032,6 +1127,40 @@ mod tests {
         assert_eq!(gcd(480, 270), 30);
         assert_eq!(gcd(100, 0), 100);
         assert_eq!(gcd(0, 50), 50);
+    }
+
+    #[test]
+    fn r1play_container_names() {
+        let mp4 = Some("mov,mp4,m4a,3gp,3g2,mj2");
+        let mkv = Some("matroska,webm");
+        let cases = [
+            ("/m/a.mkv", mkv, true, "mkv"),
+            ("/m/a.webm", mkv, true, "webm"),
+            ("/m/a.mp4", mp4, true, "mp4"),
+            ("/m/a.M4V", mp4, true, "m4v"),
+            ("/m/a.m2ts", Some("mpegts"), true, "ts"),
+            ("/m/a.mts", Some("mpegts"), true, "ts"),
+            ("/m/a.ts", Some("mpegts"), true, "ts"),
+            // An MPEG program stream named .avi
+            ("/m/a.avi", Some("mpeg"), true, "mpeg"),
+            ("/m/a.avi", Some("avi"), true, "avi"),
+            ("/m/a.mpg", Some("mpegvideo"), true, "mpeg"),
+            // Audio keeps its extension
+            ("/m/a.opus", Some("ogg"), false, "opus"),
+            // No format: the extension
+            ("/m/a.m2ts", None, true, "ts"),
+        ];
+        for (path, format, video, want) in cases {
+            assert_eq!(
+                container_name(path, format, video).as_deref(),
+                Some(want),
+                "{path} {format:?}"
+            );
+        }
+        assert_eq!(
+            container_name("/m/noext", Some("matroska,webm"), true).as_deref(),
+            Some("mkv")
+        );
     }
 
     #[tokio::test]
@@ -1240,5 +1369,77 @@ mod tests {
                 (6, None, false),
             ]
         );
+    }
+
+    // Chapters
+
+    /// ffprobe 7's `-show_chapters` output: `id`, `start` and `end` are numbers.
+    const R2CHAPTERS_FFPROBE: &str = r#"{"chapters": [
+        {"id": 7566774747248968120, "time_base": "1/1000000000", "start": 0,
+         "start_time": "0.000000", "end": 433350000000, "end_time": "433.350000",
+         "tags": {"title": "Opening"}},
+        {"id": -8933400255973827885, "time_base": "1/1000000000", "start": 433350000000,
+         "start_time": "433.350400", "end": 774107000000, "end_time": "774.107000",
+         "tags": {"TITLE": "00:07:13.350"}},
+        {"id": 3, "time_base": "1/1000", "start": 774107, "start_time": "774.107000",
+         "end": 900000, "end_time": "900.000000"}
+    ]}"#;
+
+    #[test]
+    fn r2chapters_parses_numeric_ids_and_positions() {
+        let got = parse_chapters(R2CHAPTERS_FFPROBE);
+        let names: Vec<_> = got.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["Opening", "Chapter 2", "Chapter 3"]);
+        let starts: Vec<_> = got.iter().map(|c| c.start_position_ticks).collect();
+        // Rounded to the millisecond, like Jellyfin.
+        assert_eq!(starts, [0, 4_333_500_000, 7_741_070_000]);
+        assert_eq!(got[2].end_position_ticks, 9_000_000_000);
+        let numbers: Vec<_> = got.iter().map(|c| c.chapter_number).collect();
+        assert_eq!(numbers, [1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn r2chapters_a_stalled_chapter_read_times_out() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("rustyfin_stall_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("ffprobe");
+        std::fs::write(&fake, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let started = std::time::Instant::now();
+        let got = read_chapters_with(
+            fake.to_str().unwrap(),
+            "/no/such.mkv",
+            std::time::Duration::from_millis(300),
+        )
+        .await;
+        assert!(got.is_empty());
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn r2chapters_no_chapters_or_bad_json_gives_none() {
+        assert!(parse_chapters(r#"{"chapters": []}"#).is_empty());
+        assert!(parse_chapters("not json").is_empty());
+    }
+
+    #[test]
+    fn r2chapters_time_titles_are_renamed() {
+        // .NET reads a bare number as days, so Jellyfin renames "1984" too.
+        for t in [
+            "00:05:00.000",
+            "5",
+            "1984",
+            "1:02",
+            "-00:00:01",
+            "1.02:03:04",
+        ] {
+            assert!(looks_like_time(t), "{t}");
+        }
+        for t in ["Chapter 01", "Part 1: Intro", "12:", "Act 2", ""] {
+            assert!(!looks_like_time(t), "{t}");
+        }
     }
 }

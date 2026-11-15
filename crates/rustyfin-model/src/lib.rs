@@ -17,6 +17,7 @@ pub mod notification;
 pub mod oidc;
 pub mod parental;
 pub mod person;
+pub mod photo;
 pub mod playback;
 pub mod playback_info;
 pub mod playlist;
