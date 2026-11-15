@@ -589,11 +589,14 @@ function renderTaskCard(task) {
     let progressHtml = '';
     if (isRunning || isCancelling) {
         const known = typeof progress === 'number' && Number.isFinite(progress);
-        const pct = known ? Math.max(0, Math.min(100, Math.round(progress))) : null;
+        // The bar takes the exact percent; the label one decimal below 10% and whole numbers from
+        // there, both rounded down, so a running task never reads 10.0% early or 100% before it ends
+        const exact = known ? Math.max(0, Math.min(100, progress)) : null;
+        const pct = !known ? null : exact < 10 ? (Math.floor(exact * 10) / 10).toFixed(1) : String(Math.floor(exact));
         const bar = known
-            ? `<div class="h-full bg-gradient-to-r from-[#00a4dc] to-[#38bdf8] rounded-full transition-all duration-500" style="width:${pct}%"></div>`
+            ? `<div class="h-full bg-gradient-to-r from-[#00a4dc] to-[#38bdf8] rounded-full transition-all duration-500" style="width:${exact}%"></div>`
             : '<div class="h-full bg-gradient-to-r from-[#00a4dc] to-[#38bdf8] rounded-full jf-progress-indeterminate"></div>';
-        const aria = known ? `aria-valuemin="0" aria-valuemax="100" aria-valuenow="${pct}"` : '';
+        const aria = known ? `aria-valuemin="0" aria-valuemax="100" aria-valuenow="${exact}" aria-valuetext="${pct}%"` : '';
         progressHtml = `
         <div class="mt-3" data-task-progress="${known ? pct : 'indeterminate'}">
             <div class="flex justify-between text-[10px] text-white/40 mb-1">

@@ -170,8 +170,8 @@ test('a running task with a percent shows Running, its bar at that percent and S
     assert.match(html, /admin\.state_running/);
     assert.match(html, /data-task-progress="42"/);
     assert.match(html, />42%</);
-    assert.match(html, /style="width:42%"/);
-    assert.match(html, /aria-valuenow="42"/);
+    assert.match(html, /style="width:42.4%"/, 'the bar takes the exact percent');
+    assert.match(html, /aria-valuenow="42.4"/);
     assert.match(html, /data-action="stop-task" data-id="LibraryScan" data-name="Scan Media Library">/);
     assert.doesNotMatch(html, /jf-progress-indeterminate/);
 });
@@ -179,8 +179,30 @@ test('a running task with a percent shows Running, its bar at that percent and S
 test('a running task at 0 percent shows 0%, not an unknown percent', () => {
     const { context } = sandbox([]);
     const html = context.fns.renderTaskCard(task('Running', 0));
-    assert.match(html, /data-task-progress="0"/);
-    assert.match(html, />0%</);
+    assert.match(html, /data-task-progress="0.0"/);
+    assert.match(html, />0.0%</);
+    assert.match(html, /style="width:0%"/);
+});
+
+test('below 10% the label has one decimal, from 10% whole numbers, and the bar is exact', () => {
+    const { context } = sandbox([]);
+    const card = progress => context.fns.renderTaskCard(task('Running', progress));
+    for (const [progress, label, width] of [
+        [0.4, '0.4', '0.4'],
+        [1.6666666666666667, '1.6', '1.6666666666666667'],
+        [9.96, '9.9', '9.96'],
+        [10, '10', '10'],
+        [10.8, '10', '10.8'],
+        [99.7, '99', '99.7'],
+        [100, '100', '100'],
+    ]) {
+        const html = card(progress);
+        assert.match(html, new RegExp(`>${label.replace('.', '\\.')}%<`), `${progress}`);
+        assert.match(html, new RegExp(`style="width:${width.replace('.', '\\.')}%"`), `${progress}`);
+        assert.match(html, new RegExp(`aria-valuetext="${label.replace('.', '\\.')}%"`), `${progress}`);
+    }
+    // A cancelling task's percent reads the same way
+    assert.match(context.fns.renderTaskCard(task('Cancelling', 3.25)), />3\.2%</);
 });
 
 test('a running task with no percent shows Running and an indeterminate bar', () => {
