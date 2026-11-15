@@ -70,13 +70,22 @@ fn default_source_type() -> String {
 pub struct MediaStream {
     /// Index of the stream within the media source
     pub index: i32,
-    /// Codec name (e.g., "h264", "aac", "ass")
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Codec name as ffprobe gives it (e.g., "h264", "aac", "hdmv_pgs_subtitle"); sent with
+    /// Jellyfin's names for picture subtitles (see `jellyfin_codec`)
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_jellyfin_codec"
+    )]
     pub codec: Option<String>,
-    /// Codec type: "Video", "Audio", "Subtitle"
+    /// Codec type as ffprobe gives it: "video", "audio", "subtitle", "data". Rustyfin's own
+    /// field; Jellyfin clients read `Type`
     pub codec_type: String,
-    /// Language code (e.g., "eng", "deu")
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Language code as the file tags it (e.g., "eng", "ger"); sent as ISO 639-2/T, as Jellyfin
+    /// does (see `jellyfin_language`)
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_jellyfin_language"
+    )]
     pub language: Option<String>,
     /// Time base fraction (e.g., "1/1000")
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -114,7 +123,7 @@ pub struct MediaStream {
     pub sample_rate: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
-    /// Subtitle type: "External", "Embedded", "EmbedTimeCodes", "ExternalUrl"
+    /// Jellyfin's MediaStreamType: "Video", "Audio", "Subtitle" or "Data" (see `stream_type`)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub r#type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -197,5 +206,114 @@ impl MediaStream {
             is_default: self.is_default,
             is_forced: self.is_forced,
         }
+    }
+
+    /// Jellyfin's MediaStreamType for an ffprobe codec type: "Video", "Audio", "Subtitle" or
+    /// "Data"; None for any other (an attachment, which Jellyfin leaves out of MediaStreams).
+    pub fn stream_type(codec_type: &str) -> Option<String> {
+        let kind = match codec_type.to_ascii_lowercase().as_str() {
+            "video" => "Video",
+            "audio" => "Audio",
+            "subtitle" => "Subtitle",
+            "data" => "Data",
+            _ => return None,
+        };
+        Some(kind.to_string())
+    }
+}
+
+/// The name Jellyfin gives a codec: its own names for ffprobe's picture and teletext subtitle
+/// codecs (ProbeResultNormalizer.NormalizeSubtitleCodec), any other name unchanged.
+pub fn jellyfin_codec(codec: &str) -> &str {
+    match codec.to_ascii_lowercase().as_str() {
+        "dvb_subtitle" => "DVBSUB",
+        "dvb_teletext" => "DVBTXT",
+        "dvd_subtitle" => "DVDSUB",
+        "hdmv_pgs_subtitle" => "PGSSUB",
+        _ => codec,
+    }
+}
+
+/// The ISO 639-2 bibliographic codes and their terminology codes, which Jellyfin reports.
+const BIBLIOGRAPHIC_LANGUAGES: [(&str, &str); 20] = [
+    ("alb", "sqi"),
+    ("arm", "hye"),
+    ("baq", "eus"),
+    ("bur", "mya"),
+    ("chi", "zho"),
+    ("cze", "ces"),
+    ("dut", "nld"),
+    ("fre", "fra"),
+    ("geo", "kat"),
+    ("ger", "deu"),
+    ("gre", "ell"),
+    ("ice", "isl"),
+    ("mac", "mkd"),
+    ("mao", "mri"),
+    ("may", "msa"),
+    ("per", "fas"),
+    ("rum", "ron"),
+    ("slo", "slk"),
+    ("tib", "bod"),
+    ("wel", "cym"),
+];
+
+/// A language code as Jellyfin reports it: an ISO 639-2 bibliographic code (as Matroska files
+/// tag them, "ger") becomes the terminology code ("deu"); any other code is unchanged.
+pub fn jellyfin_language(language: &str) -> &str {
+    BIBLIOGRAPHIC_LANGUAGES
+        .iter()
+        .find(|(b, _)| b.eq_ignore_ascii_case(language))
+        .map_or(language, |(_, t)| t)
+}
+
+fn serialize_jellyfin_codec<S: serde::Serializer>(
+    codec: &Option<String>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    codec.as_deref().map(jellyfin_codec).serialize(serializer)
+}
+
+fn serialize_jellyfin_language<S: serde::Serializer>(
+    language: &Option<String>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    language
+        .as_deref()
+        .map(jellyfin_language)
+        .serialize(serializer)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn r1play_stream_json_uses_jellyfin_names() {
+        let stream = MediaStream {
+            codec: Some("hdmv_pgs_subtitle".into()),
+            codec_type: "subtitle".into(),
+            language: Some("ger".into()),
+            r#type: MediaStream::stream_type("subtitle"),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&stream).unwrap();
+        assert_eq!(json["Codec"], "PGSSUB");
+        assert_eq!(json["Language"], "deu");
+        assert_eq!(json["Type"], "Subtitle");
+        // Rustyfin's own field stays for its web client
+        assert_eq!(json["CodecType"], "subtitle");
+    }
+
+    #[test]
+    fn r1play_unlisted_codes_pass_through() {
+        assert_eq!(jellyfin_codec("subrip"), "subrip");
+        assert_eq!(jellyfin_codec("ass"), "ass");
+        assert_eq!(jellyfin_language("eng"), "eng");
+        assert_eq!(jellyfin_language("CHI"), "zho");
+        assert_eq!(jellyfin_language("und"), "und");
+        assert_eq!(MediaStream::stream_type("Audio").as_deref(), Some("Audio"));
+        assert_eq!(MediaStream::stream_type("data").as_deref(), Some("Data"));
+        assert_eq!(MediaStream::stream_type("attachment"), None);
     }
 }

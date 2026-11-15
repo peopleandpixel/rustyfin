@@ -92,7 +92,6 @@ struct MediaStreamRow {
     channel_layout: Option<String>,
     sample_rate: Option<u32>,
     profile: Option<String>,
-    r#type: Option<String>,
     aspect_ratio_text: Option<String>,
     aspect_ratio: Option<f64>,
     title: Option<String>,
@@ -109,6 +108,8 @@ struct MediaStreamRow {
 
 impl From<MediaStreamRow> for MediaStream {
     fn from(r: MediaStreamRow) -> Self {
+        // The stored type is ignored: older probes wrote "Embedded" or "External" there
+        let stream_type = MediaStream::stream_type(&r.codec_type);
         Self {
             index: r.index,
             codec: r.codec,
@@ -129,7 +130,7 @@ impl From<MediaStreamRow> for MediaStream {
             channel_layout: r.channel_layout,
             sample_rate: r.sample_rate,
             profile: r.profile,
-            r#type: r.r#type,
+            r#type: stream_type,
             aspect_ratio_text: r.aspect_ratio_text,
             aspect_ratio: r.aspect_ratio,
             title: r.title,
@@ -246,7 +247,8 @@ pub async fn insert_media_stream(
     Ok(())
 }
 
-/// Get all media sources for an item, with their streams.
+/// Get all media sources for an item, with their streams. The source of the item's own file comes
+/// first, then the others widest first, as Jellyfin orders versions, then by path.
 pub async fn get_media_sources(
     pool: &SqlitePool,
     item_id: &Uuid,
@@ -254,7 +256,9 @@ pub async fn get_media_sources(
     let sources: Vec<MediaSourceRow> = sqlx::query_as(
         "SELECT id, item_id, uid, container, protocol, path, type, run_time_ticks, size, \
          bitrate, video_bitrate, audio_bitrate, width, height, aspect_ratio, is_remote, media_state \
-         FROM media_sources WHERE item_id = ?",
+         FROM media_sources WHERE item_id = ?1 \
+         ORDER BY path = (SELECT path FROM media_items WHERE id = ?1) DESC, \
+         COALESCE(width, 0) DESC, path, id",
     )
     .bind(item_id.to_string())
     .fetch_all(pool)
@@ -269,10 +273,11 @@ pub async fn get_media_sources(
             let streams: Vec<MediaStreamRow> = sqlx::query_as(
                 "SELECT stream_index as [index], codec, codec_type, language, time_base, codec_time_base, codec_tag, \
                  is_external, path, width, height, average_frame_rate, real_frame_rate, bit_rate, \
-                 bit_depth, channels, channel_layout, sample_rate, profile, type, aspect_ratio_text, \
+                 bit_depth, channels, channel_layout, sample_rate, profile, aspect_ratio_text, \
                  aspect_ratio, title, color_space, color_transfer, color_primaries, color_range, \
                  localized_uri, is_default, is_forced, is_interlaced, embedded_bitmaps \
-                 FROM media_streams WHERE source_id = ? ORDER BY stream_index",
+                 FROM media_streams WHERE source_id = ? AND LOWER(codec_type) <> 'attachment' \
+                 ORDER BY stream_index",
             )
             .bind(sid.to_string())
             .fetch_all(pool)
@@ -312,7 +317,8 @@ pub async fn get_media_sources_with_item_check(
          ms.width, ms.height, ms.aspect_ratio, ms.is_remote, ms.media_state \
          FROM media_sources ms \
          INNER JOIN media_items mi ON mi.id = ms.item_id \
-         WHERE ms.item_id = ?",
+         WHERE ms.item_id = ? \
+         ORDER BY ms.path = mi.path DESC, COALESCE(ms.width, 0) DESC, ms.path, ms.id",
     )
     .bind(item_id.to_string())
     .fetch_all(pool)
@@ -345,10 +351,11 @@ pub async fn get_media_sources_with_item_check(
         let query_str = format!(
             "SELECT stream_index as [index], codec, codec_type, language, time_base, codec_time_base, codec_tag, \
              is_external, path, width, height, average_frame_rate, real_frame_rate, bit_rate, \
-             bit_depth, channels, channel_layout, sample_rate, profile, type, aspect_ratio_text, \
+             bit_depth, channels, channel_layout, sample_rate, profile, aspect_ratio_text, \
              aspect_ratio, title, color_space, color_transfer, color_primaries, color_range, \
              localized_uri, is_default, is_forced, is_interlaced, embedded_bitmaps, source_id \
-             FROM media_streams WHERE source_id IN ({}) ORDER BY source_id, stream_index",
+             FROM media_streams WHERE source_id IN ({}) AND LOWER(codec_type) <> 'attachment' \
+             ORDER BY source_id, stream_index",
             in_clause
         );
 
@@ -382,7 +389,6 @@ pub async fn get_media_sources_with_item_check(
                     channel_layout: row.channel_layout,
                     sample_rate: row.sample_rate,
                     profile: row.profile,
-                    r#type: row.r#type,
                     aspect_ratio_text: row.aspect_ratio_text,
                     aspect_ratio: row.aspect_ratio,
                     title: row.title,
@@ -431,7 +437,6 @@ struct MediaStreamRowWithSource {
     channel_layout: Option<String>,
     sample_rate: Option<u32>,
     profile: Option<String>,
-    r#type: Option<String>,
     aspect_ratio_text: Option<String>,
     aspect_ratio: Option<f64>,
     title: Option<String>,
@@ -711,14 +716,17 @@ pub async fn get_media_sources_batch(
              mst.path as stream_path, mst.width as stream_width, mst.height as stream_height, \
              mst.average_frame_rate, mst.real_frame_rate, mst.bit_rate, mst.bit_depth, \
              mst.channels, mst.channel_layout, mst.sample_rate, mst.profile, \
-             mst.type as stream_type, mst.aspect_ratio_text, mst.aspect_ratio as stream_aspect_ratio, \
+             mst.aspect_ratio_text, mst.aspect_ratio as stream_aspect_ratio, \
              mst.title, mst.color_space, mst.color_transfer, mst.color_primaries, mst.color_range, \
              mst.localized_uri, mst.is_default, mst.is_forced, mst.is_interlaced, mst.embedded_bitmaps, \
              mst.stream_index as stream_index_num \
              FROM media_sources ms \
              LEFT JOIN media_streams mst ON mst.source_id = ms.id \
+             AND LOWER(mst.codec_type) <> 'attachment' \
+             LEFT JOIN media_items mi ON mi.id = ms.item_id \
              WHERE ms.item_id IN ({}) \
-             ORDER BY ms.item_id, ms.id, mst.stream_index",
+             ORDER BY ms.item_id, ms.path = mi.path DESC, COALESCE(ms.width, 0) DESC, ms.path, \
+             ms.id, mst.stream_index",
             in_clause
         );
 
@@ -791,7 +799,7 @@ pub async fn get_media_sources_batch(
                     channel_layout: row.channel_layout.clone(),
                     sample_rate: row.sample_rate,
                     profile: row.profile.clone(),
-                    r#type: row.stream_type.clone(),
+                    r#type: MediaStream::stream_type(row.codec_type.as_deref().unwrap_or("")),
                     aspect_ratio_text: row.aspect_ratio_text.clone(),
                     aspect_ratio: row.stream_aspect_ratio,
                     title: row.title.clone(),
@@ -853,7 +861,6 @@ struct BatchSourceStreamRow {
     channel_layout: Option<String>,
     sample_rate: Option<u32>,
     profile: Option<String>,
-    stream_type: Option<String>,
     aspect_ratio_text: Option<String>,
     stream_aspect_ratio: Option<f64>,
     title: Option<String>,

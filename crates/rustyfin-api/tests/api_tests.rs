@@ -26871,7 +26871,7 @@ async fn b22_playback_info_lists_external_subtitles() {
         (&streams[4], "srt", Some("eng"), &srt),
     ] {
         assert_eq!(stream["CodecType"], "subtitle", "{stream}");
-        assert_eq!(stream["Type"], "External", "{stream}");
+        assert_eq!(stream["Type"], "Subtitle", "{stream}");
         assert_eq!(stream["IsExternal"], true, "{stream}");
         assert_eq!(stream["Codec"], codec, "{stream}");
         assert_eq!(stream["Language"].as_str(), language, "{stream}");

@@ -219,7 +219,7 @@ pub(crate) async fn external_streams(source: &MediaSourceResponse) -> Vec<MediaS
             language: file.language,
             is_external: true,
             path: Some(file.path.to_string_lossy().into_owned()),
-            r#type: Some("External".to_string()),
+            r#type: MediaStream::stream_type("subtitle"),
             ..Default::default()
         })
         .collect()
@@ -899,7 +899,7 @@ mod tests {
         );
         for stream in &streams {
             assert_eq!(stream.codec_type, "subtitle");
-            assert_eq!(stream.r#type.as_deref(), Some("External"));
+            assert_eq!(stream.r#type.as_deref(), Some("Subtitle"));
             assert!(stream.is_external);
             assert!(!stream.is_default && !stream.is_forced);
             assert_eq!(stream.title, None);

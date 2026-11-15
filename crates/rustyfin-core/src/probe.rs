@@ -132,6 +132,8 @@ struct Disposition {
     default: Option<u8>,
     #[serde(default, deserialize_with = "deserialize_optional_u8")]
     forced: Option<u8>,
+    #[serde(default, deserialize_with = "deserialize_optional_u8")]
+    attached_pic: Option<u8>,
 }
 
 fn deserialize_optional_u32<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
@@ -225,7 +227,6 @@ struct FfprobeFormat {
     duration: Option<String>,
     bit_rate: Option<String>,
     size: Option<String>,
-    #[allow(dead_code)]
     format_name: Option<String>,
     #[allow(dead_code)]
     format_long_name: Option<String>,
@@ -339,11 +340,14 @@ pub async fn probe_file(path: &str) -> Result<ProbeResult, ProbeError> {
         None
     };
 
-    // Container is the file extension
-    let container = std::path::Path::new(path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|s| s.to_lowercase());
+    let container = container_name(
+        path,
+        format.format_name.as_deref(),
+        // Cover art is a video stream too, but doesn't make the file a video
+        video_streams
+            .iter()
+            .any(|s| s.disposition.as_ref().and_then(|d| d.attached_pic) != Some(1)),
+    );
 
     // Build media streams
     let media_streams: Vec<MediaStream> =
@@ -624,6 +628,49 @@ fn tag<'a>(tags: Option<&'a HashMap<String, String>>, key: &str) -> Option<&'a s
         .map(String::as_str)
 }
 
+/// Jellyfin's name for an ffprobe format (ProbeResultNormalizer.NormalizeFormat).
+fn jellyfin_format(name: &str) -> &str {
+    match name {
+        "mpegvideo" => "mpeg",
+        "mpegts" => "ts",
+        "matroska" => "mkv",
+        other => other,
+    }
+}
+
+/// The container of the file at `path`, given ffprobe's `format_name` (a comma-separated list,
+/// "mov,mp4,m4a,3gp,3g2,mj2"). It is the lowercased extension, with MPEG-TS's other extensions
+/// (m2ts, mts) named "ts" as Jellyfin names them. A video file whose extension is not among the
+/// formats ffprobe found (an MPEG program stream named .avi) gets the first format instead, as
+/// Jellyfin does. Rustyfin keeps the extension where it is one of the formats ("mp4", where
+/// Jellyfin says "mov"), since clients' direct play profiles list containers by extension.
+fn container_name(path: &str, format_name: Option<&str>, is_video: bool) -> Option<String> {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_lowercase());
+    let ext = match ext.as_deref() {
+        Some("m2ts" | "mts" | "m2t") => Some("ts".to_string()),
+        _ => ext,
+    };
+    let formats: Vec<&str> = format_name
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|f| !f.is_empty())
+        .map(jellyfin_format)
+        .collect();
+    let Some(&first) = formats.first() else {
+        return ext;
+    };
+    match ext {
+        Some(ext) if !is_video || formats.contains(&ext.as_str()) => Some(ext),
+        // The MP4 family's extensions are all among its formats except m4v
+        Some(ext) if ext == "m4v" && formats.contains(&"mp4") => Some(ext),
+        _ => Some(first.to_string()),
+    }
+}
+
 fn stream_to_model(s: FfprobeStream) -> MediaStream {
     let is_default = s.disposition.as_ref().and_then(|d| d.default).unwrap_or(0) > 0;
     let is_forced = s.disposition.as_ref().and_then(|d| d.forced).unwrap_or(0) > 0;
@@ -636,16 +683,7 @@ fn stream_to_model(s: FfprobeStream) -> MediaStream {
         .map(str::to_string)
         .or(s.title);
 
-    // Determine subtitle type
-    let subtitle_type = if s.codec_type.as_deref() == Some("subtitle") {
-        if s.path.is_some() || s.external.unwrap_or(false) {
-            Some("External".to_string())
-        } else {
-            Some("Embedded".to_string())
-        }
-    } else {
-        None
-    };
+    let stream_type = MediaStream::stream_type(s.codec_type.as_deref().unwrap_or(""));
 
     // As in Jellyfin, only the disposition makes a subtitle forced; a title or codec name
     // that says "forced" does not
@@ -674,7 +712,7 @@ fn stream_to_model(s: FfprobeStream) -> MediaStream {
             .as_ref()
             .and_then(|r| r.replace(" Hz", "").parse().ok()),
         profile: s.profile,
-        r#type: subtitle_type,
+        r#type: stream_type,
         aspect_ratio_text: None,
         aspect_ratio: None,
         title,
@@ -1032,6 +1070,40 @@ mod tests {
         assert_eq!(gcd(480, 270), 30);
         assert_eq!(gcd(100, 0), 100);
         assert_eq!(gcd(0, 50), 50);
+    }
+
+    #[test]
+    fn r1play_container_names() {
+        let mp4 = Some("mov,mp4,m4a,3gp,3g2,mj2");
+        let mkv = Some("matroska,webm");
+        let cases = [
+            ("/m/a.mkv", mkv, true, "mkv"),
+            ("/m/a.webm", mkv, true, "webm"),
+            ("/m/a.mp4", mp4, true, "mp4"),
+            ("/m/a.M4V", mp4, true, "m4v"),
+            ("/m/a.m2ts", Some("mpegts"), true, "ts"),
+            ("/m/a.mts", Some("mpegts"), true, "ts"),
+            ("/m/a.ts", Some("mpegts"), true, "ts"),
+            // An MPEG program stream named .avi
+            ("/m/a.avi", Some("mpeg"), true, "mpeg"),
+            ("/m/a.avi", Some("avi"), true, "avi"),
+            ("/m/a.mpg", Some("mpegvideo"), true, "mpeg"),
+            // Audio keeps its extension
+            ("/m/a.opus", Some("ogg"), false, "opus"),
+            // No format: the extension
+            ("/m/a.m2ts", None, true, "ts"),
+        ];
+        for (path, format, video, want) in cases {
+            assert_eq!(
+                container_name(path, format, video).as_deref(),
+                Some(want),
+                "{path} {format:?}"
+            );
+        }
+        assert_eq!(
+            container_name("/m/noext", Some("matroska,webm"), true).as_deref(),
+            Some("mkv")
+        );
     }
 
     #[tokio::test]
