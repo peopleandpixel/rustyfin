@@ -7768,6 +7768,7 @@ async fn b21_settings_defaults() {
             "PublicUrl": "",
             "CallbackUrl": "",
             "AllowPasswordSignIn": true,
+            "MismatchedOrigin": null,
         })
     );
 }
@@ -8016,7 +8017,7 @@ async fn b21_info_is_public_and_minimal() {
         info().await,
         (
             StatusCode::OK,
-            serde_json::json!({ "Enabled": false, "ButtonLabel": "" })
+            serde_json::json!({ "Enabled": false, "ButtonLabel": "", "PublicUrl": "" })
         )
     );
     let body = b21_settings_body(&t.op, serde_json::json!({ "ButtonLabel": "Pocket ID" }));
@@ -8026,7 +8027,11 @@ async fn b21_info_is_public_and_minimal() {
         info().await,
         (
             StatusCode::OK,
-            serde_json::json!({ "Enabled": true, "ButtonLabel": "Pocket ID" })
+            serde_json::json!({
+                "Enabled": true,
+                "ButtonLabel": "Pocket ID",
+                "PublicUrl": B21_PUBLIC_URL
+            })
         )
     );
 }
@@ -8310,6 +8315,261 @@ async fn b21_start_reports_a_provider_that_is_down() {
     assert!(!body.contains(B21_CLIENT_SECRET));
     t.op.with(|st| st.down = false);
     t.start().await;
+}
+
+// B156: single sign-on started from an address other than the public URL
+
+/// `POST /Auth/Oidc/Start` with extra headers, as a browser on another address sends it.
+async fn b156_start(
+    t: &B21,
+    headers: &[(&str, &str)],
+) -> (StatusCode, axum::http::HeaderMap, String) {
+    let mut req = request("POST", "/Auth/Oidc/Start", None, None);
+    for (name, value) in headers {
+        req.headers_mut().insert(
+            axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+            value.parse().unwrap(),
+        );
+    }
+    t.raw(req).await
+}
+
+#[tokio::test]
+async fn b156_start_from_another_origin_is_refused() {
+    let t = b21_on(serde_json::json!({})).await;
+    assert_eq!(
+        t.settings().await["MismatchedOrigin"],
+        serde_json::Value::Null
+    );
+    let (status, headers, body) = b156_start(
+        &t,
+        &[
+            ("origin", "https://flix.example"),
+            ("sec-fetch-site", "same-origin"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(
+        b21_header(&headers, "set-cookie"),
+        "",
+        "no flow from another address"
+    );
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        json["Detail"].as_str().unwrap().contains(B21_PUBLIC_URL),
+        "the refusal names the address to use: {body}"
+    );
+    assert_eq!(
+        t.settings().await["MismatchedOrigin"],
+        "https://flix.example",
+        "the admin sees where sign-ins come from"
+    );
+
+    // The profile's link is refused the same way.
+    let mut req = request("POST", "/Auth/Oidc/Link", Some(&t.admin), None);
+    req.headers_mut()
+        .insert("origin", "http://10.0.0.5:8096".parse().unwrap());
+    req.headers_mut()
+        .insert("sec-fetch-site", "same-origin".parse().unwrap());
+    let (status, headers, _) = t.raw(req).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(b21_header(&headers, "set-cookie"), "");
+    assert_eq!(
+        t.settings().await["MismatchedOrigin"],
+        "http://10.0.0.5:8096"
+    );
+
+    // Saving the settings clears the warning.
+    let (status, saved) = t.save(serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(saved["MismatchedOrigin"], serde_json::Value::Null);
+    assert_eq!(
+        t.settings().await["MismatchedOrigin"],
+        serde_json::Value::Null
+    );
+
+    // Other addresses, a port-only difference included, are refused (the public URL is
+    // http://rf.test:8121).
+    for origin in [
+        "http://rf.test",
+        "http://rf.test:80",
+        "https://rf.test:8121",
+        "http://other.test:8121",
+        "http://rf.test:8122/web/",
+    ] {
+        let (status, headers, _) = b156_start(&t, &[("origin", origin)]).await;
+        assert_eq!(status, StatusCode::CONFLICT, "from {origin}");
+        assert_eq!(b21_header(&headers, "set-cookie"), "", "from {origin}");
+    }
+}
+
+#[tokio::test]
+async fn b156_only_a_same_origin_start_is_noted() {
+    let t = b21_on(serde_json::json!({})).await;
+    let noted = || async { t.settings().await["MismatchedOrigin"].clone() };
+
+    // A cross-site page or a request without Sec-Fetch-Site is refused but not noted.
+    for fetch_site in [Some("cross-site"), Some("same-site"), Some("none"), None] {
+        let mut headers = vec![("origin", "https://attacker.example")];
+        if let Some(value) = fetch_site {
+            headers.push(("sec-fetch-site", value));
+        }
+        let (status, _, _) = b156_start(&t, &headers).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{fetch_site:?}");
+        assert_eq!(noted().await, serde_json::Value::Null, "{fetch_site:?}");
+    }
+
+    // The web client on another address posts same-origin: noted.
+    let (status, _, _) = b156_start(
+        &t,
+        &[
+            ("origin", "https://flix.example"),
+            ("sec-fetch-site", "same-origin"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(noted().await, "https://flix.example");
+
+    // A later cross-site request does not overwrite it.
+    let (status, _, _) = b156_start(
+        &t,
+        &[
+            ("origin", "https://attacker.example"),
+            ("sec-fetch-site", "cross-site"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(noted().await, "https://flix.example");
+
+    // The noted value is capped.
+    let long_host = vec!["a".repeat(60); 6].join(".");
+    let origin = format!("https://{long_host}.example");
+    let (status, _, _) = b156_start(
+        &t,
+        &[("origin", &origin), ("sec-fetch-site", "same-origin")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let noted = noted().await;
+    let noted = noted.as_str().expect("an origin is noted");
+    assert!(noted.len() <= 300, "noted {} bytes", noted.len());
+    assert!(origin.starts_with(noted));
+}
+
+#[tokio::test]
+async fn b156_start_from_the_public_origin_goes_on() {
+    let t = b21_on(serde_json::json!({})).await;
+    // The public URL's own address in any spelling, an Origin with a path (only its origin
+    // counts), and Origins that name no web address (null, garbled, another scheme), which are
+    // not checked, like a request without one.
+    for origin in [
+        "http://rf.test:8121",
+        "http://RF.test:8121",
+        "http://rf.test:8121/web/",
+        "null",
+        "not a url",
+        "http//rf.test",
+        "file:///etc/passwd",
+        "chrome-extension://abcdef",
+    ] {
+        let (status, headers, body) = b156_start(&t, &[("origin", origin)]).await;
+        let flow = b21_flow(status, &headers, &body);
+        assert_eq!(flow.param("redirect_uri"), B21_CALLBACK, "from {origin}");
+    }
+    assert_eq!(
+        t.settings().await["MismatchedOrigin"],
+        serde_json::Value::Null
+    );
+
+    // Under a path prefix, the origin is the public URL's scheme, host and port.
+    let (status, _) = t
+        .save(serde_json::json!({ "PublicUrl": "https://media.example/jf" }))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, headers, body) = b156_start(&t, &[("origin", "https://media.example")]).await;
+    let flow = b21_flow(status, &headers, &body);
+    assert_eq!(
+        flow.param("redirect_uri"),
+        "https://media.example/jf/Auth/Oidc/Callback"
+    );
+    let (status, _, _) = b156_start(&t, &[("origin", "http://media.example")]).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "another scheme is another address"
+    );
+
+    // A default port matches its absence, on either side.
+    for (public_url, origin) in [
+        ("https://media.example:443", "https://media.example"),
+        ("https://media.example", "https://media.example:443"),
+        ("http://media.example:80/jf", "http://media.example"),
+    ] {
+        let (status, _) = t.save(serde_json::json!({ "PublicUrl": public_url })).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, headers, body) = b156_start(&t, &[("origin", origin)]).await;
+        b21_flow(status, &headers, &body);
+    }
+}
+
+#[tokio::test]
+async fn b156_start_without_origin_and_matching_link_go_on() {
+    let t = b21_on(serde_json::json!({})).await;
+    // No Origin at all, as from a non-browser client: not checked.
+    let (status, headers, body) = t.start_raw().await;
+    let flow = b21_flow(status, &headers, &body);
+    assert_eq!(flow.param("redirect_uri"), B21_CALLBACK);
+
+    // A link from the public URL's own address starts.
+    let mut req = request("POST", "/Auth/Oidc/Link", Some(&t.admin), None);
+    req.headers_mut()
+        .insert("origin", B21_PUBLIC_URL.parse().unwrap());
+    req.headers_mut()
+        .insert("sec-fetch-site", "same-origin".parse().unwrap());
+    let (status, headers, body) = t.raw(req).await;
+    let flow = b21_flow(status, &headers, &body);
+    assert_eq!(flow.param("redirect_uri"), B21_CALLBACK);
+    assert_eq!(
+        t.settings().await["MismatchedOrigin"],
+        serde_json::Value::Null
+    );
+}
+
+#[tokio::test]
+async fn b156_forwarded_headers_never_move_the_flow() {
+    let t = b21_on(serde_json::json!({})).await;
+    let forged = [
+        ("origin", B21_PUBLIC_URL),
+        ("host", "evil.example"),
+        ("x-forwarded-host", "evil.example"),
+        ("x-forwarded-proto", "https"),
+    ];
+    let (status, headers, body) = b156_start(&t, &forged).await;
+    let flow = b21_flow(status, &headers, &body);
+    assert_eq!(flow.param("redirect_uri"), B21_CALLBACK);
+    assert!(!body.contains("evil.example"));
+    let location = t
+        .approve(&flow, b21_user("fwd-sub", "fwd"), B21Sign::Key(0))
+        .await;
+    assert_eq!(location, format!("{B21_PUBLIC_URL}/web/#login/oidc"));
+
+    // A forged forwarded origin does not make a matching sign-in look mismatched either.
+    let (status, _, _) = b156_start(
+        &t,
+        &[
+            ("x-forwarded-host", "evil.example"),
+            ("x-forwarded-proto", "https"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        t.settings().await["MismatchedOrigin"],
+        serde_json::Value::Null
+    );
 }
 
 #[tokio::test]

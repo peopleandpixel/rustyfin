@@ -19,7 +19,9 @@ use super::auth::{start_session, token_device};
 use crate::error::ApiError;
 use crate::oidc::flow::{FLOW_LIFETIME, Flow, FlowKind};
 use crate::oidc::signin::{self, SignInError};
-use crate::oidc::{callback_url, cookie_path, discover, effective_scopes, settings_answer};
+use crate::oidc::{
+    callback_url, cookie_path, discover, effective_scopes, origin_of, settings_answer,
+};
 use crate::state::AppState;
 
 pub fn public_routes() -> Router<AppState> {
@@ -54,15 +56,24 @@ pub fn protected_routes() -> Router<AppState> {
 
 async fn info(State(state): State<AppState>) -> Result<Json<OidcInfo>, ApiError> {
     let config = rustyfin_db::repo_oidc::get_settings(&state.db).await?;
+    let public_url = if config.enabled {
+        config.public_url
+    } else {
+        String::new()
+    };
     Ok(Json(OidcInfo {
         enabled: config.enabled,
         button_label: config.button_label,
+        public_url,
     }))
 }
 
 async fn read_settings(State(state): State<AppState>) -> Result<Json<OidcSettings>, ApiError> {
     let config = rustyfin_db::repo_oidc::get_settings(&state.db).await?;
-    Ok(Json(settings_answer(&config)))
+    Ok(Json(settings_answer(
+        &config,
+        state.oidc.mismatched_origin(),
+    )))
 }
 
 /// Saves the sent fields over the saved ones. The body is read as a JSON value first and then
@@ -88,7 +99,7 @@ async fn save_settings(
     }
     rustyfin_db::repo_oidc::save_settings(&state.db, &next).await?;
     state.oidc.forget().await;
-    Ok(Json(settings_answer(&next)))
+    Ok(Json(settings_answer(&next, None)))
 }
 
 /// The checks a save must pass when OIDC is on (AC3). Nothing is checked while it is off.
@@ -135,9 +146,10 @@ struct CallbackQuery {
 }
 
 /// `POST /Auth/Oidc/Start` – starts a sign-in: the provider's authorization URL, and the flow cookie.
-async fn start(State(state): State<AppState>) -> Result<Response, ApiError> {
+async fn start(State(state): State<AppState>, headers: HeaderMap) -> Result<Response, ApiError> {
     let config = rustyfin_db::repo_oidc::get_settings(&state.db).await?;
     ensure_on(&config)?;
+    ensure_origin(&state, &config, &headers)?;
     begin(&state, config, FlowKind::SignIn).await
 }
 
@@ -146,9 +158,11 @@ async fn start(State(state): State<AppState>) -> Result<Response, ApiError> {
 async fn link_start(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
+    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let config = rustyfin_db::repo_oidc::get_settings(&state.db).await?;
     ensure_on(&config)?;
+    ensure_origin(&state, &config, &headers)?;
     if rustyfin_db::repo_oidc::user_has_link(&state.db, claims.sub).await? {
         return Err(ApiError::Conflict(
             "This account is already linked to the provider.".to_string(),
@@ -165,6 +179,48 @@ fn ensure_on(config: &OidcConfig) -> Result<(), ApiError> {
     Err(ApiError::BadRequest(
         "OIDC sign-in is turned off.".to_string(),
     ))
+}
+
+/// Refuses a flow that a browser starts from an address other than the public URL's (B156). The
+/// provider sends the browser back to the public URL, where this browser has no flow cookie (and
+/// maybe another session), so the flow could only fail there. The refusal is a 409 the sign-in
+/// page explains.
+///
+/// The address is noted for the admin's warning only when the browser says the request comes
+/// from the page's own address (`Sec-Fetch-Site: same-origin`), as the web client's does. A
+/// cross-site page is refused all the same and can't put an address of its choosing in front of
+/// the admin. A non-browser client can send that header itself, so the warning only reports the
+/// refusal, escaped and capped, and never advises adopting the address.
+///
+/// The browser's `Origin` header only chooses between going on and this refusal: the redirect URI
+/// and the return address always come from the public URL, so no request header (`Host`,
+/// `Origin`, `X-Forwarded-*`) can move where the provider sends the code or the user lands.
+/// Without an `Origin` (or with `null`), as from a non-browser client, nothing is checked.
+fn ensure_origin(
+    state: &AppState,
+    config: &OidcConfig,
+    headers: &HeaderMap,
+) -> Result<(), ApiError> {
+    let Some(origin) = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .and_then(origin_of)
+    else {
+        return Ok(());
+    };
+    if origin_of(&config.public_url).as_deref() == Some(origin.as_str()) {
+        return Ok(());
+    }
+    let same_origin = headers
+        .get("sec-fetch-site")
+        .is_some_and(|value| value.as_bytes() == b"same-origin");
+    if same_origin {
+        state.oidc.note_mismatched_origin(origin);
+    }
+    Err(ApiError::Conflict(format!(
+        "Single sign-on is set up for {}. Open Rustyfin at that address to sign in.",
+        config.public_url
+    )))
 }
 
 /// Starts a flow of `kind`: the provider's authorization URL, and the flow cookie.
