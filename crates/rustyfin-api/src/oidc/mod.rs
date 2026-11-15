@@ -48,6 +48,13 @@ pub fn callback_url(public_url: &str) -> String {
     }
 }
 
+/// The origin (`scheme://host[:port]`, lowercased, without a default port) of an http(s) URL, else
+/// `None`. Compares the public URL with the address a browser sends in its `Origin` header (B156).
+pub fn origin_of(url: &str) -> Option<String> {
+    let url = reqwest::Url::parse(url).ok()?;
+    matches!(url.scheme(), "http" | "https").then(|| url.origin().ascii_serialization())
+}
+
 /// The path the flow cookie is sent on: the public URL's path, then `/Auth/Oidc`. A URL that does
 /// not parse gives `/Auth/Oidc`.
 pub fn cookie_path(public_url: &str) -> String {
@@ -115,9 +122,10 @@ pub fn claim_username(claims: &Value, claim: &str) -> Option<String> {
     (!name.is_empty()).then(|| name.to_string())
 }
 
-/// The settings as the admin sees them. The secret shows only as set or not, and the two
-/// read-only fields are computed here.
-pub fn settings_answer(config: &OidcConfig) -> OidcSettings {
+/// The settings as the admin sees them. The secret shows only as set or not, and the read-only
+/// fields are computed here. `mismatched_origin` is the last address a sign-in was refused from
+/// because it is not the public URL's (B156).
+pub fn settings_answer(config: &OidcConfig, mismatched_origin: Option<String>) -> OidcSettings {
     OidcSettings {
         enabled: config.enabled,
         issuer_url: config.issuer_url.clone(),
@@ -133,6 +141,7 @@ pub fn settings_answer(config: &OidcConfig) -> OidcSettings {
         public_url: config.public_url.clone(),
         callback_url: callback_url(&config.public_url),
         allow_password_sign_in: config.allow_password_sign_in,
+        mismatched_origin,
     }
 }
 
@@ -268,6 +277,9 @@ fn strings_of(doc: &Value, key: &str) -> Option<Vec<String>> {
     })
 }
 
+/// The longest noted mismatched origin: a scheme, a 253-byte host name and a port fit.
+const MISMATCHED_ORIGIN_MAX: usize = 300;
+
 /// The HTTP client for the provider and the checked provider. Cloning shares the cache.
 #[derive(Clone)]
 pub struct OidcState {
@@ -277,6 +289,9 @@ pub struct OidcState {
     provider: Arc<RwLock<Option<Arc<Provider>>>>,
     /// The sign-in flows in progress (see `flow`).
     flows: Arc<Mutex<FlowStore>>,
+    /// The last address a flow was refused from because it is not the public URL's (B156). Kept
+    /// for the admin's warning until the settings are saved.
+    mismatched_origin: Arc<Mutex<Option<String>>>,
 }
 
 impl OidcState {
@@ -290,12 +305,36 @@ impl OidcState {
             http,
             provider: Arc::new(RwLock::new(None)),
             flows: Arc::new(Mutex::new(FlowStore::default())),
+            mismatched_origin: Arc::new(Mutex::new(None)),
         }
     }
 
-    /// Empties the cache, so the next sign-in fetches the provider again.
+    /// Forgets what the old settings left: the provider cache, so the next sign-in fetches the
+    /// provider again, and the noted mismatched origin.
     pub async fn forget(&self) {
         *self.provider.write().await = None;
+        *self.mismatch() = None;
+    }
+
+    fn mismatch(&self) -> std::sync::MutexGuard<'_, Option<String>> {
+        self.mismatched_origin
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Notes `origin` as the last address a flow was refused from (B156), cut to
+    /// `MISMATCHED_ORIGIN_MAX` bytes. An origin is ASCII (IDNs are in punycode), so the cut never
+    /// splits a character.
+    pub fn note_mismatched_origin(&self, mut origin: String) {
+        if origin.len() > MISMATCHED_ORIGIN_MAX && origin.is_char_boundary(MISMATCHED_ORIGIN_MAX) {
+            origin.truncate(MISMATCHED_ORIGIN_MAX);
+        }
+        *self.mismatch() = Some(origin);
+    }
+
+    /// The last address a flow was refused from since the settings were saved, if any.
+    pub fn mismatched_origin(&self) -> Option<String> {
+        self.mismatch().clone()
     }
 
     /// The checked provider for `issuer_url`: the cached one while it is fresh, else fetched now.
