@@ -1,11 +1,13 @@
-use axum::extract::{ConnectInfo, Path, Query, State};
+use crate::query::Query;
+use axum::extract::{ConnectInfo, Path, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use rustyfin_model::auth::Claims;
 use rustyfin_model::server_info::{
-    EndpointInfo, FullServerInfo, LogFile, ServerConfiguration, ServerInfo,
+    EndpointInfo, FullServerInfo, JELLYFIN_API_VERSION, JELLYFIN_PRODUCT_NAME, LogFile,
+    ServerConfiguration, ServerInfo,
 };
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -78,22 +80,63 @@ async fn ping() -> &'static str {
     "\"Rustyfin\""
 }
 
-async fn get_public_info(State(state): State<AppState>) -> Result<Json<ServerInfo>, ApiError> {
+/// The address clients reach this server at, Jellyfin's `LocalAddress` (as its
+/// `GetSmartApiUrl`): `RUSTYFIN_PUBLISHED_URL` when set; else the request's Host, with `https`
+/// when `X-Forwarded-Proto` says so and `http` otherwise; else the bind address, with
+/// `localhost` for an unspecified IP (`0.0.0.0` is no address a client can use). No trailing `/`.
+pub(crate) fn local_address(state: &AppState, headers: &axum::http::HeaderMap) -> String {
+    if let Some(published) = &state.published_url {
+        return published.trim().trim_end_matches('/').to_string();
+    }
+    let host = headers
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .map(str::trim)
+        .filter(|h| {
+            !h.is_empty()
+                && h.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b".-:[]_".contains(&b))
+        });
+    if let Some(host) = host {
+        let https = headers
+            .get("x-forwarded-proto")
+            .and_then(|p| p.to_str().ok())
+            .is_some_and(|p| p.trim().eq_ignore_ascii_case("https"));
+        let scheme = if https { "https" } else { "http" };
+        return format!("{scheme}://{host}");
+    }
+    match state.bind_addr.parse::<SocketAddr>() {
+        Ok(addr) if addr.ip().is_unspecified() => format!("http://localhost:{}", addr.port()),
+        _ => format!("http://{}", state.bind_addr),
+    }
+}
+
+async fn get_public_info(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<ServerInfo>, ApiError> {
     let startup_wizard_completed = rustyfin_db::repo_user::users_exist(&state.db_ro).await?;
+    let local_address = local_address(&state, &headers);
     let config = state.config.read().await;
     Ok(Json(ServerInfo {
+        local_address: Some(local_address),
         server_name: config.server_name.clone(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
+        version: JELLYFIN_API_VERSION.to_string(),
+        product_name: JELLYFIN_PRODUCT_NAME.to_string(),
+        operating_system: String::new(),
         id: state.server_id.to_string(),
         startup_wizard_completed,
+        rustyfin_version: env!("CARGO_PKG_VERSION").to_string(),
     }))
 }
 
 async fn get_full_info(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Json<FullServerInfo>, ApiError> {
     let startup_wizard_completed = rustyfin_db::repo_user::users_exist(&state.db_ro).await?;
+    let local_address = local_address(&state, &headers);
     let config = state.config.read().await;
     let log_path = state.data_dir.join("logs").to_string_lossy().to_string();
     let cache_path = state.data_dir.join("cache").to_string_lossy().to_string();
@@ -103,9 +146,11 @@ async fn get_full_info(
 
     Ok(Json(FullServerInfo {
         server_name: config.server_name.clone(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
+        version: JELLYFIN_API_VERSION.to_string(),
+        product_name: JELLYFIN_PRODUCT_NAME.to_string(),
         id: state.server_id.to_string(),
         startup_wizard_completed,
+        rustyfin_version: env!("CARGO_PKG_VERSION").to_string(),
         operating_system: os,
         has_pending_restart: false,
         has_update_available: false,
@@ -115,9 +160,9 @@ async fn get_full_info(
         can_launch_web_browser: false,
         program_data_path,
         web_socket_port_number: config.public_port,
-        local_address: format!("http://{}", state.bind_addr),
+        local_addresses: Some(vec![local_address.clone()]),
+        local_address,
         remote_end_point: Some(format!("http://{}", addr)),
-        local_addresses: Some(vec![format!("http://{}", state.bind_addr)]),
         package_version: Some(env!("CARGO_PKG_VERSION").to_string()),
     }))
 }
@@ -150,7 +195,7 @@ async fn get_endpoint(
     Json(EndpointInfo {
         is_local,
         is_in_network,
-        local_address: format!("http://{}", state.bind_addr),
+        local_address: local_address(&state, req.headers()),
         remote_address: remote_ip,
     })
 }

@@ -292,6 +292,12 @@ pub async fn save_refresh_changes(
         read.end_date.map(|d| d.to_rfc3339()),
         updated.end_date.map(|d| d.to_rfc3339()),
     );
+    scalar_change(
+        &mut changes,
+        "premiere_date",
+        read.premiere_date.map(|d| d.to_rfc3339()),
+        updated.premiere_date.map(|d| d.to_rfc3339()),
+    );
     scalar_change(&mut changes, "budget", read.budget, updated.budget);
     scalar_change(&mut changes, "revenue", read.revenue, updated.revenue);
     scalar_change(
@@ -1077,9 +1083,18 @@ fn build_filtered_query(
 
     // Build the static base WHERE clause for single-value params.
     // Uses (? IS NULL OR ? = '' OR col = ?) pattern so the query string is always identical.
+    // ParentId (binds: pid, pid, recursive, pid, pid, recursive, pid, pid, pid), as in Jellyfin:
+    // recursive gives every item of a library or every descendant of an item; otherwise a
+    // library's top-level items or an item's children.
     let base_where = "
-        (? IS NULL OR ? = '' OR (? = 1 AND library_id IN (SELECT DISTINCT library_id FROM media_items WHERE parent_id = ? OR id = ?))
-         OR ? = 0 AND (? IS NULL OR ? = '' OR parent_id = ?))
+        (? IS NULL OR ? = ''
+         OR (? = 1 AND (library_id = ? OR id IN (
+             WITH RECURSIVE sub(id) AS (
+                 SELECT id FROM media_items WHERE parent_id = ?
+                 UNION SELECT m.id FROM media_items m JOIN sub ON m.parent_id = sub.id)
+             SELECT id FROM sub)))
+         OR (? = 0 AND (parent_id = ?
+             OR (parent_id IS NULL AND library_id = ? AND EXISTS (SELECT 1 FROM libraries WHERE id = ?)))))
         AND (? IS NULL OR ? = '' OR library_id = ?)
         AND (? IS NULL OR ? = '' OR name LIKE ?)
         AND (? IS NULL OR ? = '' OR (? = '#' AND (sort_name < 'A' OR sort_name > 'z')) OR (? != '#' AND (sort_name LIKE ? OR name LIKE ?)))
@@ -2049,28 +2064,60 @@ pub async fn get_library_episodes(
 }
 
 /// Get items with playback position > 0 (resume items) for a specific user
+/// What `get_user_resume_items` lists: Jellyfin's resume query filters. Types are stored media
+/// types (Jellyfin item kinds); `parent_id` is a library, or an item up to two levels above.
+#[derive(Debug, Default, Clone)]
+pub struct ResumeFilter {
+    pub include_types: Vec<String>,
+    pub exclude_types: Vec<String>,
+    pub parent_id: Option<Uuid>,
+    pub start_index: i64,
+    pub limit: Option<i64>,
+}
+
+/// The user's resumable items (a resume point above 0), newest play first, as Jellyfin's
+/// `/UserItems/Resume` lists them: one page of them and the count of all that match.
 pub async fn get_user_resume_items(
     pool: &SqlitePool,
     user_id: Uuid,
-    limit: i64,
-) -> Result<Vec<MediaItem>, sqlx::Error> {
+    filter: &ResumeFilter,
+) -> Result<(Vec<MediaItem>, i64), sqlx::Error> {
     let uid = user_id.to_string();
-    let rows = sqlx::query_as::<_, MediaItemRow>(
+    let parent = filter.parent_id.map(|p| p.to_string());
+    let include = serde_json::to_string(&filter.include_types).unwrap_or_default();
+    let exclude = serde_json::to_string(&filter.exclude_types).unwrap_or_default();
+    // ?1 user, ?2 parent, ?3 include list, ?4 exclude list (JSON arrays; empty means no filter).
+    let from = "FROM media_items m \
+         INNER JOIN user_item_data u ON u.item_id = m.id AND u.user_id = ?1 \
+         WHERE u.playback_position_ticks > 0 \
+         AND (?2 IS NULL OR m.library_id = ?2 OR m.parent_id = ?2 \
+              OR m.parent_id IN (SELECT id FROM media_items WHERE parent_id = ?2)) \
+         AND (json_array_length(?3) = 0 OR m.media_type IN (SELECT value FROM json_each(?3))) \
+         AND m.media_type NOT IN (SELECT value FROM json_each(?4))";
+    let total: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) {from}")))
+        .bind(&uid)
+        .bind(parent.as_deref())
+        .bind(&include)
+        .bind(&exclude)
+        .fetch_one(pool)
+        .await?;
+    let rows = sqlx::query_as::<_, MediaItemRow>(sqlx::AssertSqlSafe(format!(
         "SELECT m.id, m.name, m.sort_name, m.overview, m.media_type, m.path, m.parent_id, m.library_id, \
          m.production_year, m.community_rating, m.official_rating, m.genres, m.date_created, \
          m.premiere_date, m.runtime_ticks, m.index_number, m.parent_index_number, m.index_number_end, m.location_type, m.tmdb_id, m.tvdb_id, \
          m.tags, m.status, m.original_language, m.tagline, m.production_countries, m.budget, m.revenue, \
          m.homepage, m.end_date, m.vote_count, m.popularity \
-         FROM media_items m \
-         INNER JOIN user_item_data u ON u.item_id = m.id AND u.user_id = ? \
-         WHERE u.playback_position_ticks > 0 \
-         ORDER BY u.last_played_date DESC LIMIT ?",
-    )
+         {from} ORDER BY u.last_played_date DESC, m.sort_name LIMIT ?5 OFFSET ?6"
+    )))
     .bind(&uid)
-    .bind(limit)
+    .bind(parent.as_deref())
+    .bind(&include)
+    .bind(&exclude)
+    .bind(filter.limit.unwrap_or(-1))
+    .bind(filter.start_index.max(0))
     .fetch_all(pool)
     .await?;
-    Ok(rows.into_iter().map(Into::into).collect())
+    Ok((rows.into_iter().map(Into::into).collect(), total))
 }
 
 #[derive(sqlx::FromRow)]
@@ -3008,6 +3055,131 @@ pub async fn get_studios_for_item(
     .bind(&iid)
     .fetch_all(pool)
     .await
+}
+
+/// Studios of many items at once, for list answers: item id -> (studio_id, studio_name).
+pub async fn get_studios_for_items(
+    pool: &SqlitePool,
+    item_ids: &[uuid::Uuid],
+) -> Result<std::collections::HashMap<String, Vec<(String, String)>>, sqlx::Error> {
+    let mut out: std::collections::HashMap<String, Vec<(String, String)>> =
+        std::collections::HashMap::new();
+    for chunk in item_ids.chunks(500) {
+        let mut qb = QueryBuilder::<sqlx::Sqlite>::new(
+            "SELECT ist.item_id, s.id, s.name FROM item_studios ist \
+             JOIN studios s ON s.id = ist.studio_id WHERE ist.item_id IN (",
+        );
+        let mut sep = qb.separated(", ");
+        for id in chunk {
+            sep.push_bind(id.to_string());
+        }
+        qb.push(") ORDER BY ist.rowid");
+        let rows: Vec<(String, String, String)> = qb.build_query_as().fetch_all(pool).await?;
+        for (item, id, name) in rows {
+            out.entry(item).or_default().push((id, name));
+        }
+    }
+    Ok(out)
+}
+
+/// IMDb ids of many items at once (`item_metadata_extras`), for list answers.
+pub async fn get_imdb_ids_for_items(
+    pool: &SqlitePool,
+    item_ids: &[uuid::Uuid],
+) -> Result<std::collections::HashMap<String, String>, sqlx::Error> {
+    let mut out = std::collections::HashMap::new();
+    for chunk in item_ids.chunks(500) {
+        let mut qb = QueryBuilder::<sqlx::Sqlite>::new(
+            "SELECT item_id, imdb_id FROM item_metadata_extras \
+             WHERE imdb_id IS NOT NULL AND imdb_id != '' AND item_id IN (",
+        );
+        let mut sep = qb.separated(", ");
+        for id in chunk {
+            sep.push_bind(id.to_string());
+        }
+        qb.push(")");
+        let rows: Vec<(String, String)> = qb.build_query_as().fetch_all(pool).await?;
+        out.extend(rows);
+    }
+    Ok(out)
+}
+
+/// Stores a provider's IMDb id for an item that has none yet; an id already stored (by an
+/// import, an NFO or an earlier refresh) stays. Returns whether it was written.
+pub async fn set_imdb_id_if_missing(
+    pool: &SqlitePool,
+    item_id: uuid::Uuid,
+    imdb_id: &str,
+) -> Result<bool, sqlx::Error> {
+    let done = sqlx::query(
+        "INSERT INTO item_metadata_extras (item_id, imdb_id) VALUES (?, ?) \
+         ON CONFLICT(item_id) DO UPDATE SET imdb_id = excluded.imdb_id \
+         WHERE item_metadata_extras.imdb_id IS NULL OR item_metadata_extras.imdb_id = ''",
+    )
+    .bind(item_id.to_string())
+    .bind(imdb_id)
+    .execute(pool)
+    .await?;
+    Ok(done.rows_affected() > 0)
+}
+
+/// Records that a metadata provider answered for these items now (`provider_refreshed_at`).
+pub async fn mark_provider_refreshed(
+    pool: &SqlitePool,
+    item_ids: &[Uuid],
+) -> Result<(), sqlx::Error> {
+    let now = Utc::now().to_rfc3339();
+    for id in item_ids {
+        sqlx::query(
+            "INSERT INTO item_metadata_extras (item_id, provider_refreshed_at) VALUES (?, ?) \
+             ON CONFLICT(item_id) DO UPDATE SET provider_refreshed_at = excluded.provider_refreshed_at",
+        )
+        .bind(id.to_string())
+        .bind(&now)
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
+/// The ids among `item_ids` that a metadata provider has answered for (`mark_provider_refreshed`).
+pub async fn provider_refreshed_ids(
+    pool: &SqlitePool,
+    item_ids: &[Uuid],
+) -> Result<std::collections::HashSet<Uuid>, sqlx::Error> {
+    let mut out = std::collections::HashSet::new();
+    for chunk in item_ids.chunks(500) {
+        let mut qb = QueryBuilder::<sqlx::Sqlite>::new(
+            "SELECT item_id FROM item_metadata_extras \
+             WHERE provider_refreshed_at IS NOT NULL AND item_id IN (",
+        );
+        let mut sep = qb.separated(", ");
+        for id in chunk {
+            sep.push_bind(id.to_string());
+        }
+        qb.push(")");
+        let rows: Vec<(String,)> = qb.build_query_as().fetch_all(pool).await?;
+        out.extend(rows.into_iter().filter_map(|(id,)| id.parse::<Uuid>().ok()));
+    }
+    Ok(out)
+}
+
+/// Whether an item's metadata is locked against a refresh changing `field` (Jellyfin's
+/// LockData, or the field in LockedFields).
+pub async fn is_field_locked(
+    pool: &SqlitePool,
+    item_id: uuid::Uuid,
+    field: &str,
+) -> Result<bool, sqlx::Error> {
+    let row: Option<(i64, String)> = sqlx::query_as(
+        "SELECT lock_data, locked_fields FROM item_metadata_extras WHERE item_id = ?",
+    )
+    .bind(item_id.to_string())
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.is_some_and(|(lock, fields)| {
+        lock != 0 || fields.split('|').any(|f| f.eq_ignore_ascii_case(field))
+    }))
 }
 
 /// Get the last media added date for a folder (max date_created of children).

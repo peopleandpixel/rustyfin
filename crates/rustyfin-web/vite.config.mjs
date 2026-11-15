@@ -22,7 +22,6 @@ function cacheVersionPlugin() {
       // Global (non-module) scripts: copy as <stem>-<hash8>.js
       const scripts = {
         'api.js': join(__dirname, 'src', 'api.js'),
-        'app.js': join(__dirname, 'src', 'app.js'),
         'hls.min.js': join(__dirname, 'node_modules', 'hls.js', 'dist', 'hls.min.js'),
       };
       const hashed = {};
@@ -43,7 +42,6 @@ function cacheVersionPlugin() {
       const htmlPath = join(distDir, 'index.html');
       let html = readFileSync(htmlPath, 'utf8')
         .replace('src="./api.js"', `src="/web/assets/${hashed['api.js']}"`)
-        .replace('src="./app.js"', `src="/web/assets/${hashed['app.js']}"`)
         .replace('src="/web/assets/hls.min.js"', `src="/web/assets/${hashed['hls.min.js']}"`);
 
       // Cache version: hash over the final asset names, so it changes whenever any asset does
