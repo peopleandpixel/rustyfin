@@ -23382,6 +23382,11 @@ fn r3music_album() {
 }
 
 #[test]
+fn r3music_tabs() {
+    b124_node_test("r3music_tabs.mjs");
+}
+
+#[test]
 fn b152_service_worker() {
     b124_node_test("b152_service_worker.mjs");
 }

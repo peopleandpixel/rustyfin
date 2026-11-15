@@ -1,6 +1,8 @@
 // Music: the album page's track list, and a music library's tabs (albums, album artists, artists,
 // songs and genres)
-import { icon, escapeHtml } from './util.js';
+import { $, icon, toast, escapeHtml } from './util.js';
+import { createCardElement } from './cards.js';
+import { setupInfiniteScroll, destroyInfiniteScroll, addInfiniteScrollSentinel } from './library.js';
 
 // --- Album track list ---
 
@@ -82,4 +84,157 @@ function albumTrackList(album, tracks) {
     </div>`;
 }
 
-export { trackDuration, trackDiscGroups, trackRow, albumTrackList };
+// --- Music library tabs ---
+
+// Jellyfin Web's music library tabs, in its order. Albums is the library's own grid (library.js);
+// the others are drawn here. A genre opens its albums ('genre', at library/<id>/genres/<genre id>).
+const MUSIC_TABS = [
+    ['albums', 'music.tab_albums'],
+    ['albumartists', 'music.tab_album_artists'],
+    ['artists', 'music.tab_artists'],
+    ['songs', 'music.tab_songs'],
+    ['genres', 'music.tab_genres'],
+];
+const MUSIC_PAGE_SIZE = 100;
+// The tab last shown per library, which opening the library again shows, as in Jellyfin Web
+const musicTabMemory = new Map();
+// Drops the pages of a tab that was left meanwhile
+let musicGen = 0;
+
+// The tab a library route shows: the one it names, else the one last shown, else Albums
+function musicTab(libId, tab, sub) {
+    if (tab === 'genres' && sub) return 'genre';
+    if (MUSIC_TABS.some(([key]) => key === tab)) return tab;
+    return musicTabMemory.get(libId) || 'albums';
+}
+
+function rememberMusicTab(libId, tab) {
+    musicTabMemory.set(libId, tab === 'genre' ? 'genres' : tab);
+}
+
+function musicTabBar(libId, active) {
+    if (active === 'genre') active = 'genres';
+    return `
+    <nav class="jf-tabs" role="tablist" aria-label="${escapeHtml(t('music.tabs'))}">
+        ${MUSIC_TABS.map(([key, label]) => `
+        <button type="button" role="tab" class="jf-tab" aria-selected="${key === active}" data-action="navigate" data-page="library" data-id="${escapeHtml(`${libId}/${key}`)}">${t(label)}</button>`).join('')}
+    </nav>`;
+}
+
+// The request for one page of a tab: the artist lists and genres have their own endpoints, songs
+// and a genre's albums come from /Items
+function musicTabRequest(libId, tab, start, genreId) {
+    const paging = { StartIndex: start, Limit: MUSIC_PAGE_SIZE };
+    switch (tab) {
+    case 'albumartists':
+        return { path: '/Artists/AlbumArtists', query: { ParentId: libId, ...paging } };
+    case 'artists':
+        return { path: '/Artists', query: { ParentId: libId, ...paging } };
+    case 'genres':
+        return { path: '/MusicGenres', query: { ParentId: libId, SortBy: 'SortName', SortOrder: 'Ascending', ...paging } };
+    case 'songs':
+        return {
+            path: '/Items',
+            query: { ParentId: libId, IncludeItemTypes: 'Audio', Recursive: true, SortBy: 'SortName', SortOrder: 'Ascending', ...paging },
+        };
+    case 'genre':
+        return {
+            path: '/Items',
+            query: {
+                ParentId: libId, IncludeItemTypes: 'MusicAlbum', Recursive: true, GenreIds: genreId,
+                SortBy: 'SortName', SortOrder: 'Ascending', Fields: 'PrimaryImageAspectRatio', ...paging,
+            },
+        };
+    default:
+        return null;
+    }
+}
+
+// Adds one page of a tab: songs as track rows, genres as tiles that open their albums, artists and
+// albums as cards
+function appendMusicItems(container, libId, tab, items) {
+    if (tab === 'songs') {
+        container.insertAdjacentHTML('beforeend', items.map(it => trackRow(it, { showAlbum: true })).join(''));
+    } else if (tab === 'genres') {
+        container.insertAdjacentHTML('beforeend', items.map(g => `
+        <div class="jf-card p-5 min-h-[96px] flex items-end bg-gradient-to-br from-amber-600/30 to-orange-500/5" data-action="navigate" data-page="library" data-id="${escapeHtml(`${libId}/genres/${g.Id}`)}">
+            <p class="font-bold text-white truncate">${escapeHtml(g.Name || '')}</p>
+        </div>`).join(''));
+    } else {
+        const frag = document.createDocumentFragment();
+        for (const it of items) {
+            const card = createCardElement(it);
+            if (card) frag.appendChild(card);
+        }
+        container.appendChild(frag);
+    }
+}
+
+// Draws a music library tab other than Albums, a page at a time as the list scrolls
+async function renderMusicTab(libId, libName, tab, genreId) {
+    const session = API.token;
+    const gen = ++musicGen;
+    rememberMusicTab(libId, tab);
+    destroyInfiniteScroll();
+    const page = $('page-library');
+    page.classList.remove('jf-with-rail');
+    const listClass = tab === 'songs'
+        ? 'flex flex-col'
+        : 'grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-7 gap-4';
+    page.innerHTML = `
+    <div class="jf-page">
+        <div class="mb-4 pb-4 border-b border-white/10">
+            <div class="flex items-center gap-2">
+                <span class="inline-flex">${icon('Music', { size: 28 })}</span>
+                <h1 class="text-2xl lg:text-3xl font-extrabold text-white tracking-tight">${escapeHtml(libName)}</h1>
+            </div>
+            <p id="music-count" class="text-xs text-white/40 mt-1">${t('common.loading')}</p>
+        </div>
+        ${musicTabBar(libId, tab)}
+        ${tab === 'genre' ? '<h2 id="music-genre" class="text-xl font-bold text-white mb-4"></h2>' : ''}
+        <div id="music-items" class="${listClass}"></div>
+        <div id="music-more"></div>
+    </div>`;
+    if (tab === 'genre') {
+        API.cachedGet(`/MusicGenres?ParentId=${encodeURIComponent(libId)}`).then(data => {
+            const genre = (data.Items || []).find(g => g.Id === genreId);
+            if (genre && gen === musicGen && $('music-genre')) $('music-genre').textContent = genre.Name;
+        }).catch(() => {});
+    }
+
+    let start = 0;
+    // Loads the next page; answers the total, or null once the tab was left
+    const loadMore = async () => {
+        const { path, query } = musicTabRequest(libId, tab, start, genreId);
+        const data = await API.cachedGet(`${path}?${new URLSearchParams(query)}`);
+        if (gen !== musicGen || API.token !== session || !$('music-items')) return null;
+        const items = data.Items || [];
+        appendMusicItems($('music-items'), libId, tab, items);
+        start += items.length;
+        const total = data.TotalRecordCount ?? start;
+        if (start >= total || !items.length) {
+            destroyInfiniteScroll();
+            $('music-more')?.replaceChildren();
+        }
+        return total;
+    };
+    try {
+        const total = await loadMore();
+        if (total == null) return;
+        $('music-count').textContent = t('library.item_count', { count: total });
+        if (!total) {
+            $('music-items').outerHTML = `<div class="text-center py-20 text-white/40">${t('library.empty')}</div>`;
+        } else if (start < total) {
+            addInfiniteScrollSentinel($('music-more'));
+            setupInfiniteScroll(() => loadMore().catch(e => toast(t('common.error_message', { message: e.message }), 'error')));
+        }
+    } catch (e) {
+        if (gen !== musicGen || API.token !== session) return;
+        $('music-items').outerHTML = `<div class="p-6 rounded-xl bg-red-500/10 text-red-400">${escapeHtml(e.message)}</div>`;
+    }
+}
+
+export {
+    trackDuration, trackDiscGroups, trackRow, albumTrackList, MUSIC_TABS, musicTab, rememberMusicTab, musicTabBar,
+    musicTabRequest, renderMusicTab,
+};

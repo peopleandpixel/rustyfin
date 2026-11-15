@@ -480,7 +480,13 @@
     },
     "music": {
         "tracks_count": "Titel ({{count}})",
-        "disc": "CD {{number}}"
+        "disc": "CD {{number}}",
+        "tabs": "Ansichten der Musikbibliothek",
+        "tab_albums": "Alben",
+        "tab_album_artists": "Albuminterpreten",
+        "tab_artists": "Interpreten",
+        "tab_songs": "Titel",
+        "tab_genres": "Genres"
     },
     "oidc": {
         "sign_in_default": "Mit Single Sign-on anmelden",

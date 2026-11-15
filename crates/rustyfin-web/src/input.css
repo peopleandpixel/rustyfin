@@ -827,6 +827,35 @@ select.jf-input {
   transform: translateX(4px);
 }
 
+/* A music library's tabs (albums, artists, songs, genres) */
+.jf-tabs {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 1.5rem;
+  padding-bottom: 0.5rem;
+  overflow-x: auto;
+}
+
+.jf-tab {
+  padding: 0.5rem 1rem;
+  border-radius: 0.75rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+  white-space: nowrap;
+  background: rgb(255 255 255 / 0.05);
+  color: rgb(255 255 255 / 0.6);
+  transition: background 0.15s ease;
+}
+
+.jf-tab:hover {
+  background: rgb(255 255 255 / 0.1);
+}
+
+.jf-tab[aria-selected="true"] {
+  background: #00a4dc;
+  color: #fff;
+}
+
 /* Album and song track rows: number, title, length */
 .jf-track-row {
   display: flex;

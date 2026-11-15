@@ -3,6 +3,7 @@
 import { $, icon, toast, escapeHtml, scanRing } from './util.js';
 import { createCardElement } from './cards.js';
 import { hashRoute } from './router.js';
+import { musicTab, rememberMusicTab, musicTabBar, renderMusicTab } from './music.js';
 let currentLibraryId = null;
 
 
@@ -570,7 +571,10 @@ function addInfiniteScrollSentinel(container) {
 }
 
 // --- Library Explorer Page Renderer (with pagination) ---
-async function renderLibrary(libId) {
+// The route is a library id, then for a music library its tab (library/<id>/songs) and, for a
+// genre, its id (library/<id>/genres/<genre id>)
+async function renderLibrary(route) {
+    const [libId, tab, sub] = String(route || '').split('/');
     const session = API.token;
     currentLibraryId = libId;
     const page = $('page-library');
@@ -581,6 +585,14 @@ async function renderLibrary(libId) {
     const contentType = lib?.content_type || lib?.Content_type || lib?.ContentType || '';
     const libIcon = contentType === 'Movies' ? 'Film' : contentType === 'TvShows' ? 'Tv' : contentType === 'Music' ? 'Music' : 'Folder';
     const headerIcon = { Movies: 'Film', TvShows: 'Tv', Music: 'Music' }[lib?.content_type] || 'Folder';
+    // A music library's tabs other than Albums are drawn by music.js; Albums is this grid
+    const musicView = contentType === 'Music' ? musicTab(libId, tab, sub) : null;
+    if (musicView && musicView !== 'albums') {
+        stopLibraryLoad();
+        renderMusicTab(libId, libName, musicView, sub);
+        return;
+    }
+    if (musicView) rememberMusicTab(libId, 'albums');
     
     page.innerHTML = `
     <div class="jf-page">
@@ -671,6 +683,8 @@ async function renderLibrary(libId) {
                     </button>
                 </div>
             </div>
+
+            ${musicView ? musicTabBar(libId, 'albums') : ''}
 
             <!-- Media Grid Container -->
             <div id="lib-grid-container"></div>
@@ -1907,7 +1921,7 @@ window.addEventListener('resize', scheduleRailUpdate);
 
 export {
     currentLibraryId, blurhashTint, posterLoaded, posterFailed, LIBRARY_PAGE_SIZE, setupInfiniteScroll,
-    destroyInfiniteScroll, renderLibrary, stopLibraryLoad, libraryRefreshInPlace, libraryRemember, startGridDiag,
+    destroyInfiniteScroll, addInfiniteScrollSentinel, renderLibrary, stopLibraryLoad, libraryRefreshInPlace, libraryRemember, startGridDiag,
     jumpToLetter, clearLibraryFilters,
 };
 

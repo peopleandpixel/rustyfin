@@ -480,7 +480,13 @@
     },
     "music": {
         "tracks_count": "Tracks ({{count}})",
-        "disc": "Disc {{number}}"
+        "disc": "Disc {{number}}",
+        "tabs": "Music library views",
+        "tab_albums": "Albums",
+        "tab_album_artists": "Album Artists",
+        "tab_artists": "Artists",
+        "tab_songs": "Songs",
+        "tab_genres": "Genres"
     },
     "oidc": {
         "sign_in_default": "Sign in with single sign-on",
