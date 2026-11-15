@@ -2527,23 +2527,52 @@ async fn b118_validate_path_admin_only_after_owner() {
 
 // B124: wizard Enter. Enter in a wizard field does what the step's primary button does.
 // "app.js" stands for the whole client: the entry app.js and then every module in
-// src/modules/, by file name, so a check finds a function whichever module holds it.
+// src/modules/, in the order below, so a check finds a function whichever module holds it.
+// A missing, empty or unlisted module fails here, so a "no longer uses X" check can't pass
+// on a part of the client.
+const B124_WEB_MODULES: &[&str] = &[
+    "admin.js",
+    "auth.js",
+    "cards.js",
+    "home.js",
+    "item.js",
+    "jellyfin-import.js",
+    "library-admin.js",
+    "library.js",
+    "player.js",
+    "plugins.js",
+    "router.js",
+    "search.js",
+    "settings.js",
+    "util.js",
+    "wizard.js",
+];
+
 fn b124_web_source(file: &str) -> String {
     let src = format!("{}/../rustyfin-web/src", env!("CARGO_MANIFEST_DIR"));
-    let read = |path: &str| std::fs::read_to_string(path).unwrap();
+    let read = |path: &str| {
+        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("web client source {path}: {e}"))
+    };
     if file != "app.js" {
         return read(&format!("{src}/{file}"));
     }
-    let mut modules: Vec<_> = std::fs::read_dir(format!("{src}/modules"))
-        .into_iter()
-        .flatten()
-        .map(|e| e.unwrap().path())
-        .filter(|p| p.extension().is_some_and(|x| x == "js"))
+    let mut found: Vec<String> = std::fs::read_dir(format!("{src}/modules"))
+        .unwrap_or_else(|e| panic!("{src}/modules: {e}"))
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name.ends_with(".js"))
         .collect();
-    modules.sort();
+    found.sort();
+    let mut listed: Vec<String> = B124_WEB_MODULES.iter().map(|m| m.to_string()).collect();
+    listed.sort();
+    assert_eq!(
+        found, listed,
+        "src/modules/ holds exactly the listed modules"
+    );
     let mut all = read(&format!("{src}/app.js"));
-    for path in modules {
-        all.push_str(&read(path.to_str().unwrap()));
+    for module in B124_WEB_MODULES {
+        let text = read(&format!("{src}/modules/{module}"));
+        assert!(text.contains("function "), "{module} has no functions");
+        all.push_str(&text);
     }
     all
 }
