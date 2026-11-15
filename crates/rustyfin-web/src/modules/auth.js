@@ -45,9 +45,13 @@ function showLoginError(message) {
     show('login-error');
 }
 
+// The address sign-ins must start from, from the last Info call (B156).
+let oidcPublicUrl = '';
+
 // Adds the provider button below the sign-in form when OIDC is on. A failed Info call counts as off.
 async function loadOidcSignIn() {
     const info = await API.oidcInfo().catch(() => null);
+    oidcPublicUrl = info?.PublicUrl || '';
     const box = $('oidc-sign-in');
     if (!info?.Enabled || !box) return;
     const label = (info.ButtonLabel || '').trim() || t('oidc.sign_in_default');
@@ -59,8 +63,18 @@ async function startOidcSignIn() {
         const { AuthorizationUrl } = await API.oidcStart();
         goToOidcProvider(AuthorizationUrl);
     } catch (err) {
-        showLoginError(err.message);
+        // 409: this page is open at another address than the one the provider sends users back to
+        showLoginError(err.status === 409 && oidcPublicUrl ? t('oidc.error.wrong_address', { url: oidcPublicUrl }) : err.message);
     }
+}
+
+// Leaves a return from the provider for the home page when this page is signed in already (a session
+// from before), so it never ends on the sign-in form inside the signed-in page. The entry is replaced,
+// so Back does not return to the provider's answer.
+function leaveOidcReturnSignedIn(errorMessage) {
+    if (errorMessage) toast(errorMessage, 'error');
+    history.replaceState(null, '', '#home');
+    navigate('home');
 }
 
 // The flow is single-use, so the browser's return to #login/oidc is completed once per page load.
@@ -71,10 +85,15 @@ async function completeOidcSignIn() {
     oidcCompleteStarted = true;
     const completed = await API.oidcComplete().then(() => true, () => false);
     if (!completed) {
+        if (API.isLoggedIn()) {
+            leaveOidcReturnSignedIn(t('oidc.complete_failed'));
+            return;
+        }
         showLoginError(t('oidc.complete_failed'));
         history.replaceState(null, '', '#login');
         return;
     }
+    history.replaceState(null, '', '#home');
     await finishSignIn();
 }
 
@@ -143,6 +162,11 @@ function oidcCardHtml(enabled, account) {
 let pendingSetup = null; // { username, code } of an imported user's one-time code; memory only
 function renderLogin(data) {
     pendingSetup = null;
+    const oidcError = oidcErrorCode(data);
+    if (oidcError !== null && API.isLoggedIn()) {
+        leaveOidcReturnSignedIn(oidcErrorText(oidcError));
+        return;
+    }
     html('page-login', `
     <div class="flex justify-center items-center min-h-[70vh] jf-page px-4">
         <div class="w-full max-w-sm p-8 rounded-2xl bg-[#131822] border border-white/10 shadow-2xl">
@@ -169,7 +193,6 @@ function renderLogin(data) {
         </div>
     </div>`);
     loadOidcSignIn();
-    const oidcError = oidcErrorCode(data);
     if (data === 'oidc') completeOidcSignIn();
     else if (oidcError !== null) showLoginError(oidcErrorText(oidcError));
 }

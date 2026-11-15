@@ -1,5 +1,5 @@
 // Item and person detail pages, favourite and played toggles
-import { $, initLazyImages, icon, toast, escapeHtml, formatRuntime } from './util.js';
+import { $, icon, toast, escapeHtml, formatRuntime } from './util.js';
 import { backdropUrl, createCardElement, sectionRow } from './cards.js';
 import { resumePositionTicks } from './player.js';
 let currentDetailId = null;
@@ -292,7 +292,7 @@ async function renderPerson(personId) {
             ${items.length > 0 ? `
             <div>
                 <h2 class="text-xl font-bold text-white mb-4">${t('person.known_for', { count: items.length })}</h2>
-                <div id="person-known-grid" class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-7 gap-4"></div>
+                <div id="person-known-grid" class="jf-card-grid grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-7 gap-4"></div>
             </div>` : `<p class="text-white/40">${t('person.no_items')}</p>`}
         </div>`;
         // Populate KnownFor grid using DocumentFragment
@@ -306,7 +306,6 @@ async function renderPerson(personId) {
                 });
                 gridEl.appendChild(fragment);
             }
-            initLazyImages();
         }
     } catch (e) {
         page.innerHTML = `<div class="p-6 rounded-xl bg-red-500/10 text-red-400">${escapeHtml(e.message)}</div>`;

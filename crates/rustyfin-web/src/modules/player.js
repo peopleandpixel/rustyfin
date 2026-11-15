@@ -161,6 +161,8 @@ async function openStream(session, startTicks) {
         hlsInstance = new Hls({
             enableWorker: true,
             lowLatencyMode: false,
+            // The subtitle menu doesn't list captions in the stream, so they couldn't be turned off
+            enableCEA708Captions: false,
             startPosition: 0,
         });
         hlsInstance.loadSource(url);
@@ -334,9 +336,31 @@ function isImageSubtitle(codec) {
     return c.includes('pgs') || ['dvd_subtitle', 'dvdsub', 'vobsub', 'dvb_subtitle', 'dvbsub', 'xsub', 'sup'].includes(c);
 }
 
-// Removes the text subtitle track that showTextSubtitle added
+// The text track of the subtitle that showTextSubtitle added, if any
+function playerSubtitleTrack(video) {
+    return video.querySelector('track[data-player-subtitle]')?.track || null;
+}
+
+// Disables every text track but the player's own subtitle. A track left from an earlier playback,
+// or one that hls.js or the browser adds for captions in the stream, is not in the subtitle menu,
+// so it would stay on screen while the menu says Off. No HLS manifest carries subtitle renditions
+// today; if one ever does, exempt the picked rendition here
+function disableOtherTextTracks(video) {
+    const own = playerSubtitleTrack(video);
+    for (const track of Array.from(video.textTracks || [])) {
+        if (track !== own && track.mode !== 'disabled') track.mode = 'disabled';
+    }
+}
+
+// Removes the text subtitle track that showTextSubtitle added, disabled first: a browser may keep
+// showing the cues of a removed track that was showing
 function clearTextSubtitle() {
-    $('video-player').querySelectorAll('track[data-player-subtitle]').forEach(track => track.remove());
+    const video = $('video-player');
+    video.querySelectorAll('track[data-player-subtitle]').forEach(track => {
+        track.track.mode = 'disabled';
+        track.remove();
+    });
+    disableOtherTextTracks(video);
 }
 
 // Adds the chosen text subtitle as WebVTT; without a label, hls.js leaves the track alone
@@ -356,6 +380,7 @@ function showTextSubtitle(session) {
     });
     $('video-player').appendChild(track);
     track.track.mode = 'showing';
+    disableOtherTextTracks($('video-player'));
 }
 
 // Language name in the page's language; und, mis, mul and zxx name no language
@@ -593,6 +618,8 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
     }, 8000);
 
     // Video events for custom UI
+    // A text track added during the playback (captions that hls.js finds in the stream) stays off
+    video.textTracks.onaddtrack = () => disableOtherTextTracks(video);
     video.ontimeupdate = () => {
         if (activePlayback === session) updatePlayerControls(session);
     };
