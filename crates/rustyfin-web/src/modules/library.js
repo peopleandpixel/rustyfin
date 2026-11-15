@@ -5,8 +5,8 @@ import { createCardElement } from './cards.js';
 import { hashRoute } from './router.js';
 import { musicTab, rememberMusicTab, musicTabBar, renderMusicTab } from './music.js';
 let currentLibraryId = null;
-// The route of the music tab shown (library/<this>), while one other than Albums is shown
-let musicRoute = null;
+// The route shown (library/<this>): the library id, then a music library's tab and genre
+let currentLibraryRoute = null;
 
 
 // --- BlurHash previews (https://blurha.sh): cards paint the server's ImageBlurHashes at once ---
@@ -579,6 +579,7 @@ async function renderLibrary(route) {
     const [libId, tab, sub] = String(route || '').split('/');
     const session = API.token;
     currentLibraryId = libId;
+    currentLibraryRoute = route;
     const page = $('page-library');
     
     // Show skeleton grid immediately for instant visual feedback
@@ -589,10 +590,10 @@ async function renderLibrary(route) {
     const headerIcon = { Movies: 'Film', TvShows: 'Tv', Music: 'Music' }[lib?.content_type] || 'Folder';
     // A music library's tabs other than Albums are drawn by music.js; Albums is this grid
     const musicView = contentType === 'Music' ? musicTab(libId, tab, sub) : null;
-    musicRoute = null;
     if (musicView && musicView !== 'albums') {
         stopLibraryLoad();
-        musicRoute = musicView === 'genre' ? `${libId}/genres/${sub}` : `${libId}/${musicView}`;
+        // A scan refresh draws this tab again (see library-admin.js), not the one last shown
+        currentLibraryRoute = musicView === 'genre' ? `${libId}/genres/${sub}` : `${libId}/${musicView}`;
         renderMusicTab(libId, libName, musicView, sub);
         return;
     }
@@ -1231,11 +1232,7 @@ function libraryFillCell(i) {
 // page comes); the cards on screen stay meanwhile, and the index is asked again once things
 // settle. Returns false when no list is open.
 function libraryRefreshInPlace() {
-    // A music tab other than Albums is drawn again where it is: same tab, same genre
-    if (musicRoute) {
-        renderLibrary(musicRoute);
-        return true;
-    }
+
     if (!libraryView || libraryTotal == null) return false;
     for (const controller of libraryInFlight.values()) controller.abort();
     libraryInFlight = new Map();
@@ -1929,7 +1926,7 @@ window.addEventListener('scroll', scheduleRailUpdate, { passive: true });
 window.addEventListener('resize', scheduleRailUpdate);
 
 export {
-    currentLibraryId, blurhashTint, posterLoaded, posterFailed, LIBRARY_PAGE_SIZE, setupInfiniteScroll,
+    currentLibraryId, currentLibraryRoute, blurhashTint, posterLoaded, posterFailed, LIBRARY_PAGE_SIZE, setupInfiniteScroll,
     destroyInfiniteScroll, addInfiniteScrollSentinel, renderLibrary, stopLibraryLoad, libraryRefreshInPlace, libraryRemember, startGridDiag,
     jumpToLetter, clearLibraryFilters,
 };

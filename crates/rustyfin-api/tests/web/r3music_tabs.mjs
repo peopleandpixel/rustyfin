@@ -185,15 +185,16 @@ test('the library page hands every music tab but Albums to music.js, and shows t
     assert.ok(library.includes("import { musicTab, rememberMusicTab, musicTabBar, renderMusicTab } from './music.js';"));
     assert.match(library, /async function renderLibrary\(route\) \{\s*const \[libId, tab, sub\] = String\(route \|\| ''\)\.split\('\/'\);/);
     assert.match(library, /const musicView = contentType === 'Music' \? musicTab\(libId, tab, sub\) : null;/);
-    assert.match(library, /if \(musicView && musicView !== 'albums'\) \{\s*stopLibraryLoad\(\);\s*musicRoute = [^;]+;\s*renderMusicTab\(libId, libName, musicView, sub\);\s*return;/);
+    assert.match(library, /if \(musicView && musicView !== 'albums'\) \{\s*stopLibraryLoad\(\);\s*\/\/[^\n]*\n\s*currentLibraryRoute = [^;]+;\s*renderMusicTab\(libId, libName, musicView, sub\);\s*return;/);
     assert.ok(library.includes("${musicView ? musicTabBar(libId, 'albums') : ''}"));
 });
 
 test('a scan refresh draws the music tab shown again, genre included, not the library\'s first view', () => {
-    assert.ok(library.includes("musicRoute = musicView === 'genre' ? `${libId}/genres/${sub}` : `${libId}/${musicView}`;"));
-    assert.match(library, /function libraryRefreshInPlace\(\) \{[^}]*if \(musicRoute\) \{\s*renderLibrary\(musicRoute\);\s*return true;/);
-    // Every other view clears it first
-    assert.ok(library.indexOf('musicRoute = null;') < library.indexOf('musicRoute = musicView ==='));
+    assert.match(library, /currentLibraryId = libId;\s*currentLibraryRoute = route;/);
+    assert.ok(library.includes("currentLibraryRoute = musicView === 'genre' ? `${libId}/genres/${sub}` : `${libId}/${musicView}`;"));
+    assert.match(library, /export \{\s*currentLibraryId, currentLibraryRoute,/);
+    // A music tab has no grid view, so the refresh falls through to drawing the route again
+    assert.match(read('modules/library-admin.js'), /if \(!libraryRefreshInPlace\(\)\) renderLibrary\(currentLibraryRoute\);/);
 });
 
 test('the tab names are in English and German', () => {
