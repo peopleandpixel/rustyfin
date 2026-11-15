@@ -172,9 +172,12 @@ enum PlayedUpdate {
 /// unplayed, one that does not (Audio, Photo) starts played, and folders are left alone.
 fn played_on_start(media_type: MediaType) -> PlayedUpdate {
     match media_type {
-        MediaType::Series | MediaType::Season | MediaType::MusicAlbum | MediaType::Genre => {
-            PlayedUpdate::Keep(false)
-        }
+        MediaType::Series
+        | MediaType::Season
+        | MediaType::MusicAlbum
+        | MediaType::Genre
+        | MediaType::BoxSet
+        | MediaType::Playlist => PlayedUpdate::Keep(false),
         MediaType::Audio | MediaType::Photo => PlayedUpdate::Assign(true),
         _ => PlayedUpdate::Assign(false),
     }

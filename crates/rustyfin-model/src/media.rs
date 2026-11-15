@@ -126,6 +126,9 @@ pub enum MediaType {
     MusicAlbum,
     Photo,
     Genre,
+    /// A collection: Jellyfin's `BoxSet`.
+    BoxSet,
+    Playlist,
     Unknown,
 }
 
@@ -142,6 +145,8 @@ impl std::str::FromStr for MediaType {
             "MusicAlbum" => Ok(MediaType::MusicAlbum),
             "Photo" => Ok(MediaType::Photo),
             "Genre" => Ok(MediaType::Genre),
+            "BoxSet" => Ok(MediaType::BoxSet),
+            "Playlist" => Ok(MediaType::Playlist),
             _ => Ok(MediaType::Unknown),
         }
     }
@@ -165,6 +170,8 @@ impl MediaType {
             MediaType::MusicAlbum => "MusicAlbum",
             MediaType::Photo => "Photo",
             MediaType::Genre => "Genre",
+            MediaType::BoxSet => "BoxSet",
+            MediaType::Playlist => "Playlist",
             MediaType::Unknown => "Folder",
         }
     }
@@ -176,7 +183,7 @@ impl MediaType {
             MediaType::Series | MediaType::Season => "Unknown",
             MediaType::Audio | MediaType::MusicAlbum => "Audio",
             MediaType::Photo => "Photo",
-            MediaType::Genre => "Unknown",
+            MediaType::Genre | MediaType::BoxSet | MediaType::Playlist => "Unknown",
             MediaType::Unknown => "Unknown",
         }
     }
@@ -184,7 +191,12 @@ impl MediaType {
     pub fn is_folder(self) -> bool {
         matches!(
             self,
-            MediaType::Series | MediaType::Season | MediaType::MusicAlbum | MediaType::Genre
+            MediaType::Series
+                | MediaType::Season
+                | MediaType::MusicAlbum
+                | MediaType::Genre
+                | MediaType::BoxSet
+                | MediaType::Playlist
         )
     }
 }

@@ -7,11 +7,12 @@ use rustyfin_core::tmdb_client::TmdbApi;
 use rustyfin_model::auth::Claims;
 use rustyfin_model::media::{FiltersResult, MediaItem, QueryResult};
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::json;
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
 use crate::error::ApiError;
+use crate::routes::collections::Container;
 use crate::routes::playback::{path_user, query_user};
 use crate::state::AppState;
 
@@ -1359,7 +1360,8 @@ pub(crate) async fn enrich_items(
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/Items", get(get_items))
-        .route("/Items/{id}", get(get_item))
+        // DELETE checks the caller itself: a playlist's owner may delete it, as in Jellyfin.
+        .route("/Items/{id}", get(get_item).delete(delete_item))
         .route("/Items/{id}/Children", get(get_children))
         .route("/Items/{id}/Similar", get(get_similar))
         .route("/Items/Latest", get(get_latest))
@@ -1391,7 +1393,6 @@ pub fn routes() -> Router<AppState> {
 pub fn admin_routes() -> Router<AppState> {
     Router::new()
         .route("/Items", delete(delete_items))
-        .route("/Items/{id}", delete(delete_item))
         .route("/Items/{id}/Images/{image_type}", delete(delete_item_image))
         .route(
             "/Items/{id}/Images/{image_type}/{image_index}",
@@ -1792,6 +1793,47 @@ async fn get_items(
     let start_index = query.start_index();
     let limit = query.limit();
 
+    // Collections and playlists live outside media_items: a list of only those kinds, or one of
+    // them as ParentId, is answered from their own tables.
+    let mut parent_id = query.parent_id();
+    let mut collection_ids = None;
+    if let Some(id) = parent_id {
+        match super::collections::container_of(&state, id, &claims).await? {
+            Some(Container::Playlist) => {
+                let limit = Some(limit as usize);
+                let entries = super::collections::playlist_entries(
+                    &state,
+                    id,
+                    &claims,
+                    start_index as usize,
+                    limit,
+                );
+                return entries.await.map(Json);
+            }
+            Some(Container::Collection(ids)) => {
+                parent_id = None;
+                collection_ids = Some(ids);
+            }
+            None => {}
+        }
+    } else if let Some(kinds) = media_types.as_ref().filter(|kinds| {
+        !kinds.is_empty()
+            && kinds.iter().all(|kind| {
+                kind.eq_ignore_ascii_case("BoxSet") || kind.eq_ignore_ascii_case("Playlist")
+            })
+    }) {
+        let wants = |name: &str| kinds.iter().any(|kind| kind.eq_ignore_ascii_case(name));
+        let listing = super::collections::container_listing(
+            &state,
+            &claims,
+            wants("BoxSet"),
+            wants("Playlist"),
+            start_index as usize,
+            limit as usize,
+        );
+        return listing.await.map(Json);
+    }
+
     // If IsMovie/IsSeries is set, constrain media_type
     let constrained_media_types: Option<Vec<String>> = if let Some(true) = query.is_movie() {
         Some(vec!["\"Movie\"".to_string()])
@@ -1802,16 +1844,23 @@ async fn get_items(
     };
 
     // GenreIds and StudioIds keep the items with one of those genres and one of those studios.
-    let item_ids = rustyfin_db::repo_by_name::item_ids_with(
+    let mut item_ids = rustyfin_db::repo_by_name::item_ids_with(
         &state.db_ro,
         &parse_ids(query.genre_ids()),
         &parse_ids(query.studio_ids()),
     )
     .await?;
+    if let Some(ids) = collection_ids {
+        let ids = ids.iter().map(Uuid::to_string);
+        item_ids = Some(match item_ids {
+            Some(with) => ids.filter(|id| with.contains(id)).collect(),
+            None => ids.collect(),
+        });
+    }
 
     let (items, total) = rustyfin_db::repo_media::get_items_filtered(
         &state.db_ro,
-        query.parent_id(),
+        parent_id,
         query.library_id(),
         constrained_media_types.as_deref(),
         exclude_media_types.as_deref(),
@@ -1902,9 +1951,13 @@ async fn get_item(
     let mut item = match cached {
         Some(cached) => cached,
         None => {
-            let mut item = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, id)
-                .await?
-                .ok_or(ApiError::NotFound("item not found".into()))?;
+            let Some(mut item) = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, id).await?
+            else {
+                return super::collections::container_details(&state, id, &claims)
+                    .await?
+                    .map(Json)
+                    .ok_or(ApiError::NotFound("item not found".into()));
+            };
             let _ = populate_media_source_single(&state.db_ro, &mut item).await;
             // Enrich with all response fields, without any user's watch data
             let tmdb = state.tmdb.api(None);
@@ -1951,12 +2004,21 @@ async fn get_item(
 async fn delete_item(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-) -> Result<Json<Value>, ApiError> {
+    Extension(claims): Extension<Claims>,
+) -> Result<Response, ApiError> {
+    if let Some(status) = super::collections::delete_container(&state, id, &claims).await? {
+        return Ok(status.into_response());
+    }
+    if !claims.is_admin {
+        return Err(ApiError::Forbidden(
+            "Administrator access is required.".to_string(),
+        ));
+    }
     let deleted = rustyfin_db::repo_media::delete_item(&state.db, id).await?;
     if !deleted {
         return Err(ApiError::NotFound("item not found".into()));
     }
-    Ok(Json(json!({ "status": "ok" })))
+    Ok(Json(json!({ "status": "ok" })).into_response())
 }
 
 async fn get_children(

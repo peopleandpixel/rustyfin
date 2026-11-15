@@ -22005,6 +22005,245 @@ async fn b38_a_users_own_playlist_works_and_is_hidden_from_others() {
     );
 }
 
+// R2 collections: collections and playlists as Jellyfin clients use them
+// Jellyfin Web creates and edits collections with query parameters and no body, lists them as
+// BoxSet items and their contents with ParentId, and edits playlists by PlaylistItemId.
+
+/// The ids `GET /Items?<query>` lists for `token`, in order, and the PlaylistItemIds beside them.
+async fn r2collections_listed(
+    app: &axum::Router,
+    token: &str,
+    query: &str,
+) -> (Vec<String>, Vec<Option<String>>) {
+    let (status, list) = send_authed(app, "GET", &format!("/Items?{query}"), token, None).await;
+    assert_eq!(status, StatusCode::OK, "{query}: {list}");
+    let items = list["Items"].as_array().unwrap();
+    (
+        items
+            .iter()
+            .map(|i| i["Id"].as_str().unwrap().to_string())
+            .collect(),
+        items
+            .iter()
+            .map(|i| i["PlaylistItemId"].as_str().map(str::to_string))
+            .collect(),
+    )
+}
+
+/// The item ids and entry ids of a playlist, from `GET /Playlists/{id}/Items`.
+async fn r2collections_entries(
+    app: &axum::Router,
+    token: &str,
+    playlist: &str,
+) -> (Vec<String>, Vec<String>) {
+    let uri = format!("/Playlists/{playlist}/Items");
+    let (status, list) = send_authed(app, "GET", &uri, token, None).await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let items = list["Items"].as_array().unwrap();
+    let ids = items
+        .iter()
+        .map(|i| i["Id"].as_str().unwrap().to_string())
+        .collect();
+    let entries = items
+        .iter()
+        .map(|i| {
+            i["PlaylistItemId"]
+                .as_str()
+                .expect("PlaylistItemId")
+                .to_string()
+        })
+        .collect();
+    (ids, entries)
+}
+
+#[tokio::test]
+async fn r2collections_a_collection_made_with_query_parameters_works_end_to_end() {
+    let w = b38_world().await;
+    let (app, admin, bob, m) = (&w.app, &w.admin.0, &w.bob.0, &w.movies);
+
+    let uri = format!("/Collections?Name=R2%20set&Ids={},{}", m[0], m[1]);
+    let (status, created) = send_authed(app, "POST", &uri, admin, None).await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let cid = created["Id"].as_str().unwrap().to_string();
+
+    let parent = format!("ParentId={cid}");
+    let (ids, _) = r2collections_listed(app, admin, &parent).await;
+    assert_eq!(ids.len(), 2, "{ids:?}");
+
+    let add = format!("/Collections/{cid}/Items?Ids={}", m[2]);
+    assert_eq!(
+        send_authed(app, "POST", &add, admin, None).await.0,
+        StatusCode::NO_CONTENT
+    );
+    let remove = format!("/Collections/{cid}/Items?Ids={}", m[0]);
+    assert_eq!(
+        send_authed(app, "DELETE", &remove, admin, None).await.0,
+        StatusCode::NO_CONTENT
+    );
+    let (mut ids, _) = r2collections_listed(app, bob, &parent).await;
+    ids.sort();
+    let mut want = vec![m[1].clone(), m[2].clone()];
+    want.sort();
+    assert_eq!(ids, want, "every user sees a collection's items");
+
+    let (boxsets, _) =
+        r2collections_listed(app, bob, "IncludeItemTypes=BoxSet&Recursive=true").await;
+    assert_eq!(boxsets, vec![cid.clone()]);
+    let (status, item) = send_authed(app, "GET", &format!("/Items/{cid}"), bob, None).await;
+    assert_eq!(status, StatusCode::OK, "{item}");
+    assert_eq!(item["Type"], "BoxSet");
+    assert_eq!(item["IsFolder"], true);
+    assert_eq!(item["ChildCount"], 2);
+
+    let gone = format!("/Collections/{}/Items?Ids={}", uuid::Uuid::new_v4(), m[0]);
+    assert_eq!(
+        send_authed(app, "POST", &gone, admin, None).await.0,
+        StatusCode::NOT_FOUND
+    );
+    let bad = format!("/Collections?Name=x&Ids={},nope", m[0]);
+    assert_eq!(
+        send_authed(app, "POST", &bad, admin, None).await.0,
+        StatusCode::BAD_REQUEST
+    );
+
+    let item_uri = format!("/Items/{cid}");
+    assert_eq!(
+        send_authed(app, "DELETE", &item_uri, bob, None).await.0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        send_authed(app, "DELETE", &item_uri, admin, None).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        send_authed(app, "GET", &item_uri, admin, None).await.0,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn r2collections_playlist_entries_have_ids_and_can_be_moved_and_removed() {
+    let w = b38_world().await;
+    let (app, alice, bob, pl, m) = (&w.app, &w.alice.0, &w.bob.0, &w.playlist, &w.movies);
+
+    let add = format!("/Playlists/{pl}/Items?Ids={}", m[2]);
+    assert_eq!(
+        send_authed(app, "POST", &add, alice, None).await.0,
+        StatusCode::NO_CONTENT
+    );
+    let (ids, entries) = r2collections_entries(app, alice, pl).await;
+    assert_eq!(ids, vec![m[0].clone(), m[1].clone(), m[2].clone()]);
+    let mut distinct = entries.clone();
+    distinct.sort();
+    distinct.dedup();
+    assert_eq!(distinct.len(), 3, "{entries:?}");
+    assert!(entries.iter().all(|e| !m.contains(e)), "{entries:?}");
+
+    let move_uri = format!("/Playlists/{pl}/Items/{}/Move/0", entries[2]);
+    assert_eq!(
+        send_authed(app, "POST", &move_uri, bob, None).await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        send_authed(app, "POST", &move_uri, alice, None).await.0,
+        StatusCode::NO_CONTENT
+    );
+    let (ids, _) = r2collections_entries(app, alice, pl).await;
+    assert_eq!(ids, vec![m[2].clone(), m[0].clone(), m[1].clone()]);
+    let unknown = format!("/Playlists/{pl}/Items/{}/Move/0", uuid::Uuid::new_v4());
+    assert_eq!(
+        send_authed(app, "POST", &unknown, alice, None).await.0,
+        StatusCode::NOT_FOUND
+    );
+
+    let remove = format!("/Playlists/{pl}/Items?EntryIds={}", entries[0]);
+    assert_eq!(
+        send_authed(app, "DELETE", &remove, bob, None).await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        send_authed(app, "DELETE", &remove, alice, None).await.0,
+        StatusCode::NO_CONTENT
+    );
+    let (listed, listed_entries) =
+        r2collections_listed(app, alice, &format!("ParentId={pl}")).await;
+    assert_eq!(listed, vec![m[2].clone(), m[1].clone()]);
+    assert!(listed_entries.iter().all(Option::is_some));
+    let (hidden, _) = r2collections_listed(app, bob, &format!("ParentId={pl}")).await;
+    assert!(
+        !hidden.contains(&m[2]),
+        "another user's playlist lists nothing: {hidden:?}"
+    );
+
+    let (playlists, _) = r2collections_listed(app, alice, "IncludeItemTypes=Playlist").await;
+    assert_eq!(playlists, vec![pl.clone()]);
+    let (playlists, _) = r2collections_listed(app, bob, "IncludeItemTypes=Playlist").await;
+    assert!(playlists.is_empty(), "{playlists:?}");
+}
+
+#[tokio::test]
+async fn r2collections_playlists_take_query_parameters_and_owners_delete_them_as_items() {
+    let w = b38_world().await;
+    let (app, alice, bob, admin, pl, m) = (
+        &w.app,
+        &w.alice.0,
+        &w.bob.0,
+        &w.admin.0,
+        &w.playlist,
+        &w.movies,
+    );
+
+    let uri = format!(
+        "/Playlists?Name=Mine&Ids={}&Ids={}&UserId={}&MediaType=Video",
+        m[1], m[0], w.bob.1
+    );
+    let (status, created) = send_authed(app, "POST", &uri, bob, None).await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let mine = created["Id"].as_str().unwrap().to_string();
+    let (ids, _) = r2collections_entries(app, bob, &mine).await;
+    assert_eq!(ids, vec![m[1].clone(), m[0].clone()]);
+    let other = format!("/Playlists?Name=Theirs&UserId={}", w.alice.1);
+    assert_eq!(
+        send_authed(app, "POST", &other, bob, None).await.0,
+        StatusCode::FORBIDDEN
+    );
+
+    let item_uri = format!("/Items/{pl}");
+    assert_eq!(
+        send_authed(app, "DELETE", &item_uri, bob, None).await.0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        send_authed(app, "GET", &format!("/Playlists/{pl}"), alice, None)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        send_authed(app, "DELETE", &item_uri, alice, None).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        send_authed(app, "GET", &format!("/Playlists/{pl}"), alice, None)
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        send_authed(app, "DELETE", &format!("/Items/{mine}"), admin, None)
+            .await
+            .0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        send_authed(app, "DELETE", &format!("/Items/{}", m[0]), alice, None)
+            .await
+            .0,
+        StatusCode::FORBIDDEN,
+        "media items stay administrator-only"
+    );
+}
+
 // B93: home row cards
 // The web client's Continue Watching and Next Up cards pick a landscape picture by tag, so the
 // items must carry what it falls back to. Next Up items are enriched for the caller as Resume items
