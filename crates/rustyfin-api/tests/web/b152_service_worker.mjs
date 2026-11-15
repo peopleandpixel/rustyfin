@@ -1,13 +1,16 @@
 // B152: the service worker's image cache. Runs src/sw.js in a vm sandbox against a fake Cache
 // Storage and fetch, and drives it with install/activate/message/fetch events.
-// Usage: node b152_service_worker.mjs PATH/TO/app.js (run by api_tests.rs b152_service_worker).
+// Usage: node b152_service_worker.mjs PATH/TO/client-source.js (run by api_tests.rs b152_service_worker).
+// sw.js and api.js are read from the web client's src/, next to this crate, since the path given is
+// the client's combined source in a temp dir.
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import path from 'node:path';
+
 import test from 'node:test';
 import vm from 'node:vm';
 
-const source = fs.readFileSync(path.join(path.dirname(process.argv[2]), 'sw.js'), 'utf8');
+const WEB_SRC = new URL('../../../rustyfin-web/src/', import.meta.url);
+const source = fs.readFileSync(new URL('sw.js', WEB_SRC), 'utf8');
 const ORIGIN = 'http://server.test';
 
 class FakeCache {
@@ -126,7 +129,7 @@ test('sign-out and another user empty the cache; nothing is kept while signed ou
 });
 
 test('the page names the owner on sign-in and sign-out, and signed out empties the cache itself', async () => {
-    const api = fs.readFileSync(path.join(path.dirname(process.argv[2]), 'api.js'), 'utf8');
+    const api = fs.readFileSync(new URL('api.js', WEB_SRC), 'utf8');
     const method = name => {
         const start = api.indexOf(`\n    ${name}`);
         assert.ok(start >= 0, `api.js has ${name}`);
