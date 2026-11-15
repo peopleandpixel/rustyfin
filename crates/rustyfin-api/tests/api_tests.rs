@@ -4623,6 +4623,75 @@ async fn r1auth_branding_is_public() {
     }
 }
 
+/// Case variants reach the route with its guards: signed-in routes need a token, admin routes an
+/// administrator, and another user's items need that user or an administrator.
+#[tokio::test]
+async fn r1auth_case_variants_keep_their_guards() {
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    let (user_token, _) = j6_user_session(&state).await;
+    for uri in [
+        "/USERS".to_string(),
+        "/users/me".to_string(),
+        format!("/items/{}", lib.movie),
+        format!("/ITEMS/{}/ANCESTORS", lib.movie),
+    ] {
+        let (status, _) = r1auth_send(&state, "GET", &uri, None, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri}");
+    }
+    for uri in ["/Auth/Keys", "/auth/keys", "/AUTH/KEYS"] {
+        let (status, _) = r1auth_get(&state, uri, &user_token).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
+        let (status, _) = r1auth_get(&state, uri, &lib.token).await;
+        assert_eq!(status, StatusCode::OK, "{uri} as an administrator");
+    }
+    for uri in [
+        format!("/Users/{}/Items/{}", lib.admin, lib.movie),
+        format!("/users/{}/items/{}", lib.admin, lib.movie),
+        format!("/UserItems/Resume?userId={}", lib.admin),
+    ] {
+        let (status, _) = r1auth_get(&state, &uri, &user_token).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
+    }
+}
+
+/// `/Users/{userId}/Items/{itemId}` answers with the path user's watch data, as Jellyfin does.
+#[tokio::test]
+async fn r1auth_user_item_carries_the_path_users_data() {
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    let (user_token, user) = j6_user_session(&state).await;
+    let (status, _) = r1auth_send(
+        &state,
+        "POST",
+        &format!("/Users/{user}/PlayedItems/{}", lib.movie),
+        Some(&user_token),
+        None,
+    )
+    .await;
+    assert!(status.is_success(), "{status}");
+    let (status, item) = r1auth_get(
+        &state,
+        &format!("/Users/{user}/Items/{}", lib.movie),
+        &lib.token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{item}");
+    assert_eq!(item["UserData"]["Played"], true);
+    let (_, item) = r1auth_get(&state, &format!("/Items/{}", lib.movie), &lib.token).await;
+    assert_ne!(
+        item["UserData"]["Played"], true,
+        "the administrator's own data"
+    );
+    let (_, item) = r1auth_get(
+        &state,
+        &format!("/Users/{}/Items/{}", lib.admin, lib.movie),
+        &lib.token,
+    )
+    .await;
+    assert_ne!(item["UserData"]["Played"], true);
+}
+
 /// B146: ParentId narrows to the parent's items, as in Jellyfin.
 #[tokio::test]
 async fn r1auth_parent_id_filters_seasons_and_episodes() {

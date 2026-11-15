@@ -1894,7 +1894,12 @@ async fn get_item(
     Path(id): Path<Uuid>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Response, ApiError> {
-    match media_item(&state, id, &claims).await {
+    item_or_library(&state, id, claims.sub).await
+}
+
+/// The media item `id` with `user`'s watch data, or the library `id` as its view.
+async fn item_or_library(state: &AppState, id: Uuid, user: Uuid) -> Result<Response, ApiError> {
+    match media_item(state, id, user).await {
         Err(ApiError::NotFound(message)) => {
             match rustyfin_db::repo_library::get_library_by_id(&state.db_ro, id).await? {
                 Some(lib) => {
@@ -1913,12 +1918,12 @@ async fn get_user_item(
     Path((user_id, item_id)): Path<(Uuid, Uuid)>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Response, ApiError> {
-    path_user(&state, &claims, user_id).await?;
-    get_item(State(state), Path(item_id), Extension(claims)).await
+    let user = path_user(&state, &claims, user_id).await?;
+    item_or_library(&state, item_id, user).await
 }
 
-/// The media item `id` with `claims`' user's watch data.
-async fn media_item(state: &AppState, id: Uuid, claims: &Claims) -> Result<MediaItem, ApiError> {
+/// The media item `id` with `user`'s watch data.
+async fn media_item(state: &AppState, id: Uuid, user: Uuid) -> Result<MediaItem, ApiError> {
     let id_str = id.to_string();
     // The details every user sees; the requester's watch data is added below. A scan that reads
     // a file again replaces the item's sources, with new ids, so a cached copy is served only
@@ -1966,16 +1971,15 @@ async fn media_item(state: &AppState, id: Uuid, claims: &Claims) -> Result<Media
         }
     };
     let folder = is_episode_folder(&item);
-    let stored = rustyfin_db::repo_playback::get_user_item_data(&state.db_ro, claims.sub, id)
+    let stored = rustyfin_db::repo_playback::get_user_item_data(&state.db_ro, user, id)
         .await
         .ok();
     if let Some(user_data) = stored.or_else(|| folder.then(Default::default)) {
         apply_user_data(&mut item, user_data);
         if folder {
-            let counts =
-                rustyfin_db::repo_playback::get_unplayed_counts(&state.db_ro, claims.sub, &[id])
-                    .await
-                    .unwrap_or_default();
+            let counts = rustyfin_db::repo_playback::get_unplayed_counts(&state.db_ro, user, &[id])
+                .await
+                .unwrap_or_default();
             let key = id.to_string();
             apply_unplayed_counts(&mut item, counts.get(&key).copied().unwrap_or((0, 0)));
         }
