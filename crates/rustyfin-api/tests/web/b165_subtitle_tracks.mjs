@@ -40,7 +40,10 @@ function fakeVideo() {
             return track;
         },
     };
+    // The mode each track had when it was removed
+    video.removedModes = [];
     video.removeChild = el => {
+        video.removedModes.push(el.track.mode);
         children.splice(children.indexOf(el), 1);
         // A removed track leaves the list, but keeps its mode
         video.textTracks.splice(video.textTracks.indexOf(el.track), 1);
@@ -111,6 +114,8 @@ test('Off disables the own track before removing it, and any other track', () =>
     assert.equal(own.mode, 'disabled');
     assert.equal(captions.mode, 'disabled');
     assert.equal(video.querySelector('track[data-player-subtitle]'), null);
+    // The own track was already disabled when it was removed, not only afterwards
+    assert.deepEqual(video.removedModes, ['disabled']);
 });
 
 test('a burned-in picture subtitle leaves no text track showing', () => {
@@ -133,5 +138,16 @@ test('a track added during the playback is disabled, the own one kept', () => {
 
 test('the player turns off captions that hls.js would add, and watches for added tracks', () => {
     assert.match(slice('async function openStream('), /enableCEA708Captions: false/);
-    assert.match(source, /video\.textTracks\.onaddtrack = \(\) => disableOtherTextTracks\(video\);/);
+    // playItem wires the handler; run that statement on a fake video and add a track late
+    const hookup = /video\.textTracks\.onaddtrack = [^\n]+/.exec(slice('async function playItem('));
+    assert.ok(hookup, 'playItem sets video.textTracks.onaddtrack');
+    const { context, video } = sandbox();
+    context.video = video;
+    vm.runInContext(hookup[0], context);
+    context.showTextSubtitle(session(2));
+    const own = video.querySelector('track[data-player-subtitle]').track;
+    const late = video.addTextTrack('CC1');
+    video.textTracks.onaddtrack({ track: late });
+    assert.equal(late.mode, 'disabled');
+    assert.equal(own.mode, 'showing');
 });

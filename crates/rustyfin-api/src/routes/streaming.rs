@@ -112,26 +112,25 @@ async fn video_file(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Item {id} not found")))?;
     let Some(requested) = requested_source_id(params) else {
-        validate_path_against_library(&state.db_ro, &item.library_id, &item.path).await?;
+        validate_path_against_library(state, &item.library_id, &item.path).await?;
         return Ok(item.path);
     };
     let sources = rustyfin_db::repo_media_source::get_media_sources(&state.db_ro, &id).await?;
     match select_version(id, &sources, Some(requested))? {
         Version::Primary => {
-            validate_path_against_library(&state.db_ro, &item.library_id, &item.path).await?;
+            validate_path_against_library(state, &item.library_id, &item.path).await?;
             Ok(item.path)
         }
         Version::Source(index) => {
-            validate_path_against_library(&state.db_ro, &item.library_id, &sources[index].path)
-                .await?;
+            validate_path_against_library(state, &item.library_id, &sources[index].path).await?;
             Ok(sources[index].path.clone())
         }
     }
 }
 
-/// Resolves `.` and `..` in an absolute path without touching the filesystem,
-/// so symlinks are kept. Returns `None` for a relative path or one whose `..`
-/// climbs above the root.
+/// An absolute path with `.` components dropped, so symlinks are kept. `None` for a relative
+/// path, or for one with a `..` component: the kernel resolves `..` after following a link, so
+/// `lib/link/sub/../../x` can leave the library although it looks like it stays inside.
 fn lexical_normalize(path: &FilePath) -> Option<std::path::PathBuf> {
     use std::path::Component;
     if !path.is_absolute() {
@@ -141,20 +140,16 @@ fn lexical_normalize(path: &FilePath) -> Option<std::path::PathBuf> {
     for component in path.components() {
         match component {
             Component::CurDir => {}
-            Component::ParentDir => {
-                if !out.pop() {
-                    return None;
-                }
-            }
+            Component::ParentDir => return None,
             other => out.push(other),
         }
     }
     Some(out)
 }
 
-/// True when `file_path` lies under `lib_path`, either as written (a file
-/// reached through a symlink inside the library, which Jellyfin also serves)
-/// or after resolving symlinks on both sides.
+/// True when `file_path` lies under `lib_path`, either as written (a file reached through a
+/// symlink inside the library, which Jellyfin also serves) or after resolving symlinks on both
+/// sides. A path with a `..` component never passes as written.
 fn path_is_under_library(file_path: &FilePath, canonical_file: &FilePath, lib_path: &str) -> bool {
     let lib = FilePath::new(lib_path);
     if let (Some(file_lex), Some(lib_lex)) = (lexical_normalize(file_path), lexical_normalize(lib))
@@ -166,31 +161,41 @@ fn path_is_under_library(file_path: &FilePath, canonical_file: &FilePath, lib_pa
         .is_ok_and(|canonical_lib| canonical_file.starts_with(canonical_lib))
 }
 
-/// Validates that `file_path` is inside one of the library's configured paths.
-/// This prevents path traversal if the database is compromised.
+/// Whether `file_path` may be streamed from a library with `lib_paths`: it must lie under one of
+/// them (see `path_is_under_library`), and its target must not be inside Rustyfin's data dir
+/// (database, config, cache, logs, transcodes, plugins), even when a link in the library points
+/// there, unless that target is itself inside a library path.
+fn path_allowed(file_path: &str, lib_paths: &[String], data_dir: &FilePath) -> bool {
+    let raw = FilePath::new(file_path);
+    let canonical = raw.canonicalize().unwrap_or_else(|_| raw.to_path_buf());
+    if !lib_paths
+        .iter()
+        .any(|lib_path| path_is_under_library(raw, &canonical, lib_path))
+    {
+        return false;
+    }
+    let in_data_dir = data_dir
+        .canonicalize()
+        .is_ok_and(|data| canonical.starts_with(data));
+    !in_data_dir
+        || lib_paths.iter().any(|lib_path| {
+            FilePath::new(lib_path)
+                .canonicalize()
+                .is_ok_and(|lib| canonical.starts_with(lib))
+        })
+}
+
+/// Validates that `file_path` is inside one of the library's configured paths and not a link
+/// into the server's own data. This prevents path traversal if the database is compromised.
 async fn validate_path_against_library(
-    pool: &sqlx::SqlitePool,
+    state: &AppState,
     library_id: &uuid::Uuid,
     file_path: &str,
 ) -> Result<(), ApiError> {
-    let canonical = std::path::Path::new(file_path)
-        .canonicalize()
-        .ok()
-        .or_else(|| Some(std::path::Path::new(file_path).to_path_buf()));
-
-    let Some(canonical) = canonical else {
-        tracing::debug!("could not resolve path '{}' for validation", file_path);
-        return Ok(());
-    };
-
-    if let Ok(Some(library)) = rustyfin_db::repo_library::get_library_by_id(pool, *library_id).await
+    if let Ok(Some(library)) =
+        rustyfin_db::repo_library::get_library_by_id(&state.db_ro, *library_id).await
     {
-        let raw = FilePath::new(file_path);
-        if library
-            .paths
-            .iter()
-            .any(|lib_path| path_is_under_library(raw, &canonical, lib_path))
-        {
+        if path_allowed(file_path, &library.paths, &state.data_dir) {
             return Ok(());
         }
         // Path not under any library path — log and reject
@@ -249,7 +254,7 @@ async fn head_stream(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Item {id} not found")))?;
 
-    validate_path_against_library(&state.db_ro, &item.library_id, &item.path).await?;
+    validate_path_against_library(&state, &item.library_id, &item.path).await?;
     head_file(&item.path).await
 }
 
@@ -283,7 +288,7 @@ async fn stream_file(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Item {id} not found")))?;
 
-    validate_path_against_library(&state.db_ro, &item.library_id, &item.path).await?;
+    validate_path_against_library(&state, &item.library_id, &item.path).await?;
     serve_file(item.path, &headers).await
 }
 
@@ -469,7 +474,7 @@ fn mime_from_path(path: &str) -> String {
         "mov" => "video/quicktime",
         "wmv" => "video/x-ms-wmv",
         "flv" => "video/x-flv",
-        "ts" | "m2ts" | "mts" => "video/mp2t",
+        "ts" | "m2ts" | "mts" | "m2t" => "video/mp2t",
         "mpg" | "mpeg" => "video/mpeg",
         "3gp" => "video/3gpp",
         // Audio
@@ -1573,6 +1578,7 @@ mod tests {
     fn r1play_mime_m2ts_and_mts() {
         assert_eq!(mime_from_path("/path/to/video.m2ts"), "video/mp2t");
         assert_eq!(mime_from_path("/path/to/VIDEO.MTS"), "video/mp2t");
+        assert_eq!(mime_from_path("/path/to/video.m2t"), "video/mp2t");
     }
 
     #[test]
@@ -1608,6 +1614,57 @@ mod tests {
         ));
         assert_eq!(lexical_normalize(FilePath::new("/../x")), None);
         assert_eq!(lexical_normalize(FilePath::new("rel/x")), None);
+    }
+
+    #[test]
+    fn r1play_dotdot_after_a_link_is_rejected() {
+        // lib/link -> /dir/srv/a; lib/link/sub/../../x reads /dir/srv/x, outside the library,
+        // although dropping the `..` pairs as written gives lib/x
+        let dir = TempDir::new();
+        let lib = dir.path().join("lib");
+        let target = dir.path().join("srv/a");
+        std::fs::create_dir_all(&lib).unwrap();
+        std::fs::create_dir_all(target.join("sub")).unwrap();
+        std::fs::write(dir.path().join("srv/x"), b"x").unwrap();
+        std::os::unix::fs::symlink(&target, lib.join("link")).unwrap();
+        let file = lib.join("link/sub/../../x");
+        let canonical = file.canonicalize().unwrap();
+        assert_eq!(canonical, dir.path().join("srv/x").canonicalize().unwrap());
+        assert!(!path_is_under_library(
+            &file,
+            &canonical,
+            lib.to_str().unwrap()
+        ));
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let libs = [lib.to_str().unwrap().to_string()];
+        assert!(!path_allowed(file.to_str().unwrap(), &libs, &data));
+    }
+
+    #[test]
+    fn r1play_link_into_the_data_dir_is_refused() {
+        let dir = TempDir::new();
+        let lib = dir.path().join("lib");
+        let data = dir.path().join("data");
+        let elsewhere = dir.path().join("elsewhere");
+        for d in [&lib, &data, &elsewhere] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(data.join("rustyfin.db"), b"x").unwrap();
+        std::fs::write(elsewhere.join("movie.mkv"), b"x").unwrap();
+        std::os::unix::fs::symlink(data.join("rustyfin.db"), lib.join("db.mkv")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, lib.join("Movie")).unwrap();
+        let libs = [lib.to_str().unwrap().to_string()];
+        let path = |p: &str| lib.join(p).to_str().unwrap().to_string();
+        assert!(!path_allowed(&path("db.mkv"), &libs, &data));
+        assert!(path_allowed(&path("Movie/movie.mkv"), &libs, &data));
+        // A library inside the data dir still serves its own files
+        let inner = data.join("media");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(inner.join("clip.mkv"), b"x").unwrap();
+        let inner_libs = [inner.to_str().unwrap().to_string()];
+        let clip = inner.join("clip.mkv");
+        assert!(path_allowed(clip.to_str().unwrap(), &inner_libs, &data));
     }
 
     #[test]

@@ -2530,7 +2530,8 @@ function playerSubtitleTrack(video) {
 
 // Disables every text track but the player's own subtitle. A track left from an earlier playback,
 // or one that hls.js or the browser adds for captions in the stream, is not in the subtitle menu,
-// so it would stay on screen while the menu says Off
+// so it would stay on screen while the menu says Off. No HLS manifest carries subtitle renditions
+// today; if one ever does, exempt the picked rendition here
 function disableOtherTextTracks(video) {
     const own = playerSubtitleTrack(video);
     for (const track of Array.from(video.textTracks || [])) {

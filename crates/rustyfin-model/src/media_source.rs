@@ -123,7 +123,8 @@ pub struct MediaStream {
     pub sample_rate: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
-    /// Jellyfin's MediaStreamType: "Video", "Audio", "Subtitle" or "Data" (see `stream_type`)
+    /// Jellyfin's MediaStreamType: "Video", "EmbeddedImage", "Audio", "Subtitle" or "Data" (see
+    /// `stream_type`)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub r#type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
