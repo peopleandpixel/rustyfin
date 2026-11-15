@@ -573,9 +573,19 @@ struct UserItemQuery {
     #[serde(default, alias = "UserId")]
     user_id: Option<Uuid>,
     #[serde(default, alias = "DatePlayed")]
-    date_played: Option<chrono::DateTime<chrono::Utc>>,
+    date_played: Option<String>,
     #[serde(default, alias = "Likes")]
     likes: Option<bool>,
+}
+
+impl UserItemQuery {
+    /// `datePlayed` in any form clients send (`parse_client_date`); one that doesn't parse is
+    /// ignored, so the item is still marked, on today's date, as Jellyfin's binder falls back.
+    fn date_played(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.date_played
+            .as_deref()
+            .and_then(rustyfin_model::playback::parse_client_date)
+    }
 }
 
 /// The user a 10.9 route acts for (`query_user`), and a 404 for an item that is no media item.
@@ -632,7 +642,7 @@ async fn user_mark_played(
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<UserItemDataDto>, ApiError> {
     let user_id = query_user_item(&state, &claims, q.user_id, item_id).await?;
-    played(&state, user_id, item_id, q.date_played).await
+    played(&state, user_id, item_id, q.date_played()).await
 }
 
 async fn user_mark_unplayed(
@@ -813,7 +823,7 @@ async fn mark_played(
 ) -> Result<Json<UserItemDataDto>, ApiError> {
     let user_id = path_user(&state, &claims, user_id).await?;
     require_item(&state, item_id).await?;
-    played(&state, user_id, item_id, q.date_played).await
+    played(&state, user_id, item_id, q.date_played()).await
 }
 
 async fn mark_unplayed(

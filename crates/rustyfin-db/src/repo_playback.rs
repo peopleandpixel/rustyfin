@@ -511,7 +511,8 @@ pub async fn set_favorite(
 
 /// Sets the fields `update` carries and keeps the others (Jellyfin's UserDataManager.SaveUserData
 /// for `POST /UserItems/{itemId}/UserData`). A Series or Season is written as stored; its answer
-/// is derived from its episodes by the caller.
+/// is derived from its episodes by the caller. `LastPlayedDate` is stored in RFC 3339 like every
+/// other writer's (`parse_client_date`), and dropped when it doesn't parse.
 pub async fn update_user_data(
     pool: &SqlitePool,
     user_id: Uuid,
@@ -539,7 +540,13 @@ pub async fn update_user_data(
     .bind(update.is_favorite)
     .bind(update.likes)
     .bind(update.played)
-    .bind(update.last_played_date.as_deref())
+    .bind(
+        update
+            .last_played_date
+            .as_deref()
+            .and_then(rustyfin_model::playback::parse_client_date)
+            .map(|date| date.to_rfc3339()),
+    )
     .execute(pool)
     .await?;
 

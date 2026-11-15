@@ -98,6 +98,28 @@ impl UserItemDataDto {
     }
 }
 
+/// Reads a date a client sends for a play: RFC 3339 with an offset, an ISO date-time without one
+/// (Jellyfin's Kotlin SDK), or jellyfin-apiclient's `yyyyMMddHHmmss`; the forms without an offset
+/// are taken as UTC. An offset's `+` left unescaped in a query string arrives as a space and is read
+/// back. Anything else is None, so the caller uses its default, as Jellyfin's binder does.
+pub fn parse_client_date(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    use chrono::{DateTime, NaiveDateTime, Utc};
+    let value = value.trim();
+    for candidate in [value.to_string(), value.replace(' ', "+")] {
+        if let Ok(date) = DateTime::parse_from_rfc3339(&candidate) {
+            return Some(date.with_timezone(&Utc));
+        }
+    }
+    [
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%d %H:%M:%S%.f",
+        "%Y%m%d%H%M%S",
+    ]
+    .iter()
+    .find_map(|format| NaiveDateTime::parse_from_str(value, format).ok())
+    .map(|naive| naive.and_utc())
+}
+
 /// The fields `POST /UserItems/{itemId}/UserData` may set (Jellyfin's UpdateUserItemDataDto).
 /// Each field that is present replaces the stored value; absent ones are kept.
 #[derive(Debug, Clone, Default, Deserialize)]

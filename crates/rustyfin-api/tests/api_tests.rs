@@ -13256,6 +13256,177 @@ async fn r1watch_marking_played_takes_the_date_and_clears_the_resume_point() {
 }
 
 #[tokio::test]
+async fn r1watch_date_played_takes_every_client_form_and_never_refuses() {
+    let b = B110::new().await;
+    let (film, user) = (b.film, b.user);
+    let new = format!("/UserPlayedItems/{film}");
+    let legacy = format!("/Users/{user}/PlayedItems/{film}");
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    // (route, query, the stored date's first 19 characters, or only today's date)
+    let cases = [
+        (
+            &new,
+            "datePlayed=2020-01-02T03:04:05Z",
+            "2020-01-02T03:04:05",
+        ),
+        (
+            &legacy,
+            "DatePlayed=2020-01-02T05:04:05%2B02:00",
+            "2020-01-02T03:04:05",
+        ),
+        // An offset's unescaped `+` arrives as a space.
+        (
+            &new,
+            "datePlayed=2020-01-02T05:04:05+02:00",
+            "2020-01-02T03:04:05",
+        ),
+        // The Kotlin SDK: ISO without an offset, taken as UTC.
+        (
+            &new,
+            "datePlayed=2020-01-02T03:04:05",
+            "2020-01-02T03:04:05",
+        ),
+        (
+            &legacy,
+            "DatePlayed=2020-01-02T03:04:05.1234567",
+            "2020-01-02T03:04:05",
+        ),
+        // jellyfin-apiclient's yyyyMMddHHmmss.
+        (&legacy, "DatePlayed=20200102030405", "2020-01-02T03:04:05"),
+        (&new, "datePlayed=20200102030405", "2020-01-02T03:04:05"),
+        // Anything else is ignored: marked played now.
+        (&legacy, "DatePlayed=yesterday", today.as_str()),
+        (&new, "datePlayed=", today.as_str()),
+    ];
+    let mut actual = Vec::new();
+    for (route, query, _) in &cases {
+        r1watch_send(&b, "DELETE", &new, None).await;
+        let uri = format!("{route}?{query}");
+        let (status, data) = r1watch_send(&b, "POST", &uri, None).await;
+        let date = data["LastPlayedDate"].as_str().unwrap_or("").to_string();
+        let expected_len = cases.iter().find(|c| c.1 == *query).unwrap().2.len();
+        actual.push((
+            uri,
+            status,
+            data["Played"].as_bool(),
+            date.get(..expected_len).unwrap_or("").to_string(),
+        ));
+    }
+    let expected: Vec<_> = cases
+        .iter()
+        .map(|(route, query, date)| {
+            (
+                format!("{route}?{query}"),
+                StatusCode::OK,
+                Some(true),
+                date.to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(actual, expected);
+}
+
+#[tokio::test]
+async fn r1watch_user_data_post_stores_last_played_date_as_rfc3339() {
+    let b = B110::new().await;
+    let film = b.film;
+    let uri = format!("/UserItems/{film}/UserData");
+    let stored = |b: &B110| {
+        let db = b.state.db.clone();
+        async move {
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT last_played_date FROM user_item_data WHERE item_id = ?",
+            )
+            .bind(film.to_string())
+            .fetch_one(&db)
+            .await
+            .unwrap()
+        }
+    };
+    // A client's 7-digit fraction is stored as the other writers store dates.
+    let body = serde_json::json!({ "LastPlayedDate": "2024-01-01T00:00:00.0000000Z" });
+    r1watch_send(&b, "POST", &uri, Some(body)).await;
+    assert_eq!(
+        stored(&b).await.as_deref(),
+        Some("2024-01-01T00:00:00+00:00")
+    );
+    // One that doesn't parse is dropped and the stored date kept.
+    let body = serde_json::json!({ "LastPlayedDate": "not a date", "IsFavorite": true });
+    let (status, data) = r1watch_send(&b, "POST", &uri, Some(body)).await;
+    assert_eq!(
+        (status, data["IsFavorite"].as_bool()),
+        (StatusCode::OK, Some(true))
+    );
+    assert_eq!(
+        stored(&b).await.as_deref(),
+        Some("2024-01-01T00:00:00+00:00")
+    );
+}
+
+#[tokio::test]
+async fn r1watch_a_non_admin_cannot_act_for_another_user() {
+    let b = B110::new().await;
+    let (film, owner) = (b.film, b.user);
+    add_user(&b.state, "r1viewer", "viewerpass", false).await;
+    let (viewer, _) = login(&b.app, "r1viewer", "viewerpass").await.unwrap();
+    let body = r#"{"Played":true,"IsFavorite":true,"PlaybackPositionTicks":5}"#;
+    let cases = [
+        (
+            "POST",
+            format!("/UserPlayedItems/{film}?userId={owner}"),
+            None,
+        ),
+        (
+            "DELETE",
+            format!("/UserPlayedItems/{film}?userId={owner}"),
+            None,
+        ),
+        (
+            "POST",
+            format!("/UserFavoriteItems/{film}?userId={owner}"),
+            None,
+        ),
+        (
+            "GET",
+            format!("/UserItems/{film}/UserData?userId={owner}"),
+            None,
+        ),
+        (
+            "POST",
+            format!("/UserItems/{film}/UserData?userId={owner}"),
+            Some(body),
+        ),
+        (
+            "POST",
+            format!("/UserItems/{film}/Rating?userId={owner}&likes=true"),
+            None,
+        ),
+        ("GET", format!("/UserItems/Resume?userId={owner}"), None),
+    ];
+    let mut actual = Vec::new();
+    for (method, uri, body) in &cases {
+        let (status, _) = send_authed(&b.app, method, uri, &viewer, *body).await;
+        actual.push((*method, uri.as_str(), status));
+    }
+    let expected: Vec<_> = cases
+        .iter()
+        .map(|(method, uri, _)| (*method, uri.as_str(), StatusCode::FORBIDDEN))
+        .collect();
+    assert_eq!(actual, expected);
+    // The owner's data is unchanged.
+    let (_, data) = r1watch_send(&b, "GET", &format!("/UserItems/{film}/UserData"), None).await;
+    assert_eq!(
+        (
+            data["Played"].as_bool(),
+            data["IsFavorite"].as_bool(),
+            data["PlaybackPositionTicks"].as_i64(),
+            data["Likes"].as_bool(),
+        ),
+        (Some(false), Some(false), Some(0), None)
+    );
+}
+
+#[tokio::test]
 async fn r1watch_user_data_post_sets_only_the_fields_sent() {
     let b = B110::new().await;
     let (film, user) = (b.film, b.user);
