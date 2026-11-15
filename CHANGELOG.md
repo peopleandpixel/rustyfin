@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Web client search as you type**: The header search box searches once typing pauses for half a second, as Jellyfin Web does, without a history entry per term; Enter still searches at once. Results are grouped by type in Jellyfin Web's order (movies, shows, episodes, people, playlists, artists, albums, songs, videos, photos, audiobooks, books, collections), each type asked for on its own so none crowds out the others, and a person's card opens the person page.
 - **Web client home rows**: The home page has a "Recently Added in <library>" row per library instead of one mixed row, each with a link to its library, and resumes audio in its own Continue Listening row next to Continue Watching, as Jellyfin Web does.
 - **Web client music library tabs**: A music library has Jellyfin Web's tabs: Albums, Album Artists, Artists, Songs and Genres. Songs play from their row, a genre opens its albums, the lists load a page at a time as they scroll, and the library opens on the tab last shown.
 - **Web client album page**: An album lists its tracks in disc and track order, with a heading per disc on multi-disc albums, each track's number and length, and its artists on compilations. A click on a track plays it.

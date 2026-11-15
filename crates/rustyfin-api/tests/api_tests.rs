@@ -23392,6 +23392,11 @@ fn r3home_rows() {
 }
 
 #[test]
+fn r3search_typeahead() {
+    b124_node_test("r3search_typeahead.mjs");
+}
+
+#[test]
 fn b152_service_worker() {
     b124_node_test("b152_service_worker.mjs");
 }
