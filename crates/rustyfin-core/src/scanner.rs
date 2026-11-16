@@ -1102,6 +1102,7 @@ async fn scan_flat_library(
                     kind: naming::ExtraKind::Part,
                     owner_name: String::new(),
                     owner_paths: vec![first.clone()],
+                    of_episode: false,
                 }));
                 stack_names.insert(first.clone(), stack.name);
             }
