@@ -17774,7 +17774,7 @@ async fn r3extras2_an_old_extras_season_becomes_series_extras_and_goes() {
         None,
     )
     .await;
-    assert_eq!(r3extras_ids(&features), [episode.clone()]);
+    assert_eq!(r3extras_ids(&features), std::slice::from_ref(&episode));
     let (_, item) = send_authed(
         &app,
         "GET",
