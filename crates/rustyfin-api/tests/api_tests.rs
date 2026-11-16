@@ -31014,11 +31014,11 @@ async fn r3users2_public_users_outside_the_network_need_remote_access() {
             serde_json::json!({ "EnableRemoteAccess": false }),
         )
         .await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(status, StatusCode::OK);
     let (status, _) = t
         .policy(&t.owner, &t.ada_id, serde_json::json!({ "IsHidden": true }))
         .await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(status, StatusCode::OK);
 
     let local = r3users2_public(&t.app).await;
     assert!(
