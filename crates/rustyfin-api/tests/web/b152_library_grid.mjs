@@ -93,6 +93,9 @@ const forgotten = [];
 const context = vm.createContext({
     document: { createElement: tag => new El(tag), activeElement: null },
     createCardElement,
+    // The default view (posters): a card shows the Primary picture
+    cardImage: item => (item.ImageTags?.Primary ? { tag: item.ImageTags.Primary } : null),
+    bannerImage: () => null,
     railLetter: item => (item.Name || '#')[0].toUpperCase(),
     posterLoader: { forget: c => forgotten.push(c) },
     AbortController,
@@ -105,6 +108,7 @@ vm.runInContext([
     'var calls = { changed: [], loaded: [], scheduled: 0 };',
     'var librarySettle = null, libraryLastScroll = -1e9, libraryLastSpeed = 0, performance = { now: () => 0 };',
     'var libraryIndexHashRetries = 0, libraryIndexAt = null, libraryFlyingNow = false, libraryIndexMissing = null;',
+    "var libraryPrefs = { view: { layout: 'poster', size: 'medium' } }, currentLibraryTab = '';",
     // Frames are kept until a test runs them (flushFrames)
     'var frames = []; function requestAnimationFrame(f) { frames.push(f); } function flushFrames() { while (frames.length) frames.shift()(); }',
     // Timers are kept, so a test can see what was queued, cleared or run
@@ -130,7 +134,8 @@ vm.runInContext([
         'async function loadLibraryPage(', 'function libraryUpdate(', 'function libraryFlying(',
         'function libraryScrollSpeed(', 'function blurhashAverage(', 'function stopLibraryLoad(',
         'function libraryRowsAhead(', 'function blurhashTint(', 'function librarySize(', 'function libraryHasHash(',
-        'function libraryFlyingLimit('].map(fn),
+        'function libraryFlyingLimit(', 'function libraryShape(', 'function libraryCardOptions(',
+        'function libraryPlaceholder(', 'function libraryPictureTag('].map(fn),
     // Stand-ins for what the tests drive by hand
     'function scheduleLibraryUpdate() { calls.scheduled++; }',
     'function scheduleRailUpdate() {}',

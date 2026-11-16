@@ -3331,26 +3331,60 @@ async fn get_item_collections(
     }))
 }
 
-/// DELETE /Items/{id}/Images/{imageType}
+/// DELETE /Items/{id}/Images/{imageType}?imageIndex=: the item's images of that type, or the one
+/// at imageIndex. 204, or 404 for an unknown item, as in Jellyfin.
 async fn delete_item_image(
     State(state): State<AppState>,
-    Path((id, _image_type)): Path<(Uuid, String)>,
-) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
-    rustyfin_db::repo_media::delete_item_image(&state.db, id, &_image_type)
-        .await
-        .ok();
-    Ok((StatusCode::OK, Json(serde_json::json!({}))))
+    Path((id, image_type)): Path<(Uuid, String)>,
+    Query(params): Query<Vec<(String, String)>>,
+) -> Result<StatusCode, ApiError> {
+    match crate::query::first_value(&params, "imageIndex") {
+        Some(index) => {
+            let index = index
+                .parse()
+                .map_err(|_| ApiError::BadRequest(format!("invalid imageIndex: {index}")))?;
+            remove_item_image(&state, id, &image_type, Some(index)).await
+        }
+        None => remove_item_image(&state, id, &image_type, None).await,
+    }
 }
 
 /// DELETE /Items/{id}/Images/{imageType}/{imageIndex}
 async fn delete_item_image_index(
     State(state): State<AppState>,
-    Path((id, _image_type, _index)): Path<(Uuid, String, i32)>,
-) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
-    rustyfin_db::repo_media::delete_item_image_index(&state.db, id, &_image_type, _index)
-        .await
-        .ok();
-    Ok((StatusCode::OK, Json(serde_json::json!({}))))
+    Path((id, image_type, index)): Path<(Uuid, String, i32)>,
+) -> Result<StatusCode, ApiError> {
+    remove_item_image(&state, id, &image_type, Some(index)).await
+}
+
+async fn remove_item_image(
+    state: &AppState,
+    id: Uuid,
+    image_type: &str,
+    index: Option<i32>,
+) -> Result<StatusCode, ApiError> {
+    rustyfin_db::repo_media::get_item_by_id(&state.db, id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("item not found".into()))?;
+    let image_type = rustyfin_model::image::ImageType::from_str(image_type)
+        .ok_or_else(|| ApiError::BadRequest(format!("unknown image type: {image_type}")))?;
+    match index {
+        Some(index) => {
+            rustyfin_db::repo_media::delete_item_image_index(
+                &state.db,
+                id,
+                image_type.as_str(),
+                index,
+            )
+            .await?
+        }
+        None => {
+            rustyfin_db::repo_media::delete_item_image(&state.db, id, image_type.as_str()).await?
+        }
+    }
+    state.cache.invalidate_item(&id.to_string());
+    state.image_cache.invalidate_item(&id.to_string());
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// DELETE /Items/{id}/AlternateSources

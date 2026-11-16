@@ -13,8 +13,10 @@ import {
 } from './modules/auth.js';
 import './modules/home.js';
 import { posterLoaded, posterFailed } from './modules/library.js';
+import './modules/genres.js';
 import './modules/music.js';
 import './modules/item.js';
+import './modules/metadata-admin.js';
 import { doSearch } from './modules/search.js';
 import {
     seekVideo, skipTime, previewSeek, changeAudioTrack, changeSubtitleTrack, playerAreaClick, closePlayer,
@@ -25,6 +27,7 @@ import {
 } from './modules/player.js';
 import './modules/playerprefs.js';
 import './modules/queue.js';
+import './modules/cardmenu.js';
 import {
     changeNextEpisodeAutoPlay, changeUiLanguage, handleSaveConfig, changeUserConfig, changeUserPref, changeHomeSection,
     changeSubtitleAppearance, changeLatestLibrary, chooseProfileImage, deleteProfileImage,
