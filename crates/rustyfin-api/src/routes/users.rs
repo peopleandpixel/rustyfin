@@ -170,7 +170,9 @@ async fn get_public_users(
             .is_none_or(|p| !p.access.is_hidden && (local || p.access.enable_remote_access))
     }) {
         let primary_image_tag = tags.get(&u.id).cloned();
-        let has_password = needs_password(&u.password_hash).await;
+        // Outside the local network every user reads as having a password, so the internet isn't
+        // shown which accounts open with an empty one (they still sign in with it, as in Jellyfin)
+        let has_password = !local || !rustyfin_auth::is_empty_password_hash(&u.password_hash);
         out.push(PublicUserDto {
             primary_image_tag,
             has_password,
@@ -181,28 +183,14 @@ async fn get_public_users(
     Ok(Json(out))
 }
 
-/// Whether signing in as a user takes a password, for Jellyfin Web's tiles: false only when the
-/// stored password is the empty one, so the tile signs in at a click. An empty hash means password
-/// sign-in is off for the user (a setup code, single sign-on), so the tile asks. Each hash is
-/// checked once (one Argon2 verify) and remembered, so the public list does no hashing per request.
-async fn needs_password(hash: &str) -> bool {
-    static CHECKED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, bool>>> =
-        std::sync::OnceLock::new();
-    if hash.is_empty() {
-        return true;
-    }
-    let checked = CHECKED.get_or_init(Default::default);
-    if let Some(needs) = checked.lock().ok().and_then(|m| m.get(hash).copied()) {
-        return needs;
-    }
-    let needs = !rustyfin_auth::verify_password("", hash)
-        .await
-        .unwrap_or(false);
-    if let Ok(mut m) = checked.lock() {
-        m.insert(hash.to_string(), needs);
-    }
-    needs
+/// Whether the client is on the local network (see `resolve_client`). Password resets start and
+/// finish only there.
+fn client_is_local(state: &AppState, peer: SocketAddr, headers: &HeaderMap) -> bool {
+    resolve_client(peer.ip(), headers, &state.known_proxies).is_local()
 }
+
+/// The message for a reset PIN or reset sent from outside the local network.
+const RESET_IN_NETWORK_REQUIRED: &str = "A password reset is possible only from the local network.";
 
 async fn create_user(
     State(state): State<AppState>,
@@ -627,7 +615,7 @@ async fn forgot_password(
 
     // Outside the local network Jellyfin answers InNetworkRequired for every name, so the answer
     // tells only where the client is, and names no path on the server.
-    if !resolve_client(peer.ip(), &headers, &state.known_proxies).is_local() {
+    if !client_is_local(&state, peer, &headers) {
         tokio::time::sleep_until(deadline).await;
         return Ok(Json(ForgotPasswordResult {
             action: "InNetworkRequired".to_string(),
@@ -721,10 +709,20 @@ fn write_reset_file(path: &std::path::Path, contents: &str) -> Result<(), ApiErr
 
 /// Redeem a reset PIN (no username). Success: set the user's password to the PIN itself, revoke all
 /// their tokens, delete the reset file, return `{Success:true, UsersReset:[name]}`. No match → 404.
+/// Outside the local network the PIN is not tried, so wrong guesses from the internet can neither
+/// spend the attempt limit nor void the open resets; the answer is Jellyfin's failed
+/// `PinRedeemResult`.
 async fn reset_password_pin(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(req): Json<ForgotPasswordPinRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    if !client_is_local(&state, peer, &headers) {
+        return Ok(Json(
+            serde_json::json!({ "Success": false, "UsersReset": [] }),
+        ));
+    }
     let uid = rustyfin_auth::redeem_reset_pin(&state.db, &req.pin)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?
@@ -768,8 +766,14 @@ fn remove_reset_pin_files(data_dir: &std::path::Path, name: &str) {
 
 async fn reset_password(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(req): Json<ResetPasswordRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // As for the PIN redeem: from outside the local network no PIN is tried
+    if !client_is_local(&state, peer, &headers) {
+        return Err(ApiError::Forbidden(RESET_IN_NETWORK_REQUIRED.to_string()));
+    }
     // Look up the user by username. An unknown user gets the wrong-PIN error, so the response does
     // not reveal whether the account exists.
     let user = rustyfin_db::repo_user::find_user_for_sign_in(&state.db, &req.username)

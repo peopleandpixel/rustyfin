@@ -174,6 +174,19 @@ test('the PIN step resets the password, clears the field, and never logs the PIN
     assert.ok(!box.consoleLines.some(l => l.includes('1A-2B')), 'the PIN is never logged');
 });
 
+test('outside the local network the PIN step says to try from home', async () => {
+    const box = sandbox({ api: { async redeemResetPin() { return { Success: false, UsersReset: [] }; } } });
+    box.fns.renderLogin('forgot-pin');
+    const message = fakeElement();
+    const input = fakeElement({ value: 'AA-BB-CC-DD' });
+    box.elements['forgot-pin'] = input;
+    box.elements['forgot-message'] = message;
+    await box.fns.submitForgotPin(submitEvent());
+    assert.equal(message.textContent, 'login.forgot_in_network');
+    assert.equal(input.value, '');
+    assert.doesNotMatch(box.pages.at(-1), /pin_done/);
+});
+
 test('a wrong, expired or used PIN says so', async () => {
     const box = sandbox({ api: { async redeemResetPin() { const e = new Error('invalid or expired PIN'); e.status = 404; throw e; } } });
     box.fns.renderLogin('forgot-pin');

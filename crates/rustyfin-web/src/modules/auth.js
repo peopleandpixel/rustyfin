@@ -378,8 +378,13 @@ async function submitForgotPin(e) {
     button.disabled = true;
     try {
         const result = await API.redeemResetPin(pin);
-        // The PIN is the new password now; it stays on the screen only in the field the user typed it in
         input.value = '';
+        // Outside the local network the server tries no PIN, and answers Jellyfin's failed result
+        if (result.Success === false) {
+            forgotMessage(t('login.forgot_in_network'), 'error');
+            return;
+        }
+        // The PIN is the new password now
         const names = (result.UsersReset || []).join(', ');
         html('page-login', loginCard(t('login.pin_done_title'), t('login.pin_done_text', { names }), `
             <button type="button" class="jf-btn-primary w-full !py-3 font-bold text-sm" data-login="back">${escapeHtml(t('login.back_to_sign_in'))}</button>`));
