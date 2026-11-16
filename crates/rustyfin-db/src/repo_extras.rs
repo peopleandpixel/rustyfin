@@ -156,6 +156,29 @@ pub async fn release_extras(
     Ok(done.rows_affected())
 }
 
+/// Makes every stored extra of `library_id` in `scope` a library item again, keeping its id and user data:
+/// for a scan that reads no extras (a library whose content type no longer has them). A video becomes
+/// `video_type`; a theme song stays `Audio`. Returns how many were released.
+pub async fn release_all_extras(
+    pool: &SqlitePool,
+    library_id: Uuid,
+    scope: &PathScope,
+    video_type: &str,
+) -> Result<u64, sqlx::Error> {
+    let done = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE media_items SET extra_type = NULL, owner_id = NULL,
+                media_type = CASE media_type WHEN 'Audio' THEN 'Audio' ELSE ?3 END
+         WHERE library_id = ?1 AND extra_type IS NOT NULL AND {}",
+        scope.sql("path", 2)
+    )))
+    .bind(library_id.to_string())
+    .bind(scope.param())
+    .bind(video_type)
+    .execute(pool)
+    .await?;
+    Ok(done.rows_affected())
+}
+
 /// The extras of `owner` whose extra type is one of `types`, by name: their ids and extra types.
 pub async fn extras_of(
     pool: &SqlitePool,

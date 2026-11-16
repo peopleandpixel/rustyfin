@@ -955,6 +955,22 @@ async fn scan_flat_library(
     // The files in extras folders that aren't that folder's kind of media, with their owner folder.
     let mut skipped_extras: Vec<(PathBuf, PathBuf)> = Vec::new();
     let reads_extras = matches!(library.content_type, LibraryContentType::Movies);
+    // A library that reads no extras (its content type can't be edited today, so this guards stored data
+    // from elsewhere) has none: each stored extra becomes a library item again, keeping its id and user
+    // data, before the reconcile could add a second row at its path.
+    if !reads_extras {
+        let video_type =
+            detect_media_type("mkv", &library.content_type).map_or("Video", MediaType::item_kind);
+        let released =
+            rustyfin_db::repo_extras::release_all_extras(pool, library.id, &filter, video_type)
+                .await?;
+        if released > 0 {
+            tracing::info!(
+                "library '{}' reads no extras: {released} stored extras are library items again",
+                library.name
+            );
+        }
+    }
 
     // Every file that the walks returned, every folder they could not list, and every symlink
     // loop they skipped. The removal at the end of the scan needs all three.

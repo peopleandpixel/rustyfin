@@ -17072,6 +17072,104 @@ async fn r3extras_parental_limits_and_deletes_reach_extras() {
     let _ = lib;
 }
 
+/// Regression: a library that reads no extras (here a movie library scanned as Mixed) makes its stored
+/// extras library items again, keeping their ids and user data, instead of adding a second row at each path.
+/// A released `Delta (2003)-trailer.mkv` is then a version of Delta, as a Mixed scan reads it, and its row
+/// merges into Delta's with its user data.
+#[tokio::test]
+async fn r3extras_a_library_without_extras_releases_its_stored_ones() {
+    let state = test_state().await;
+    let Some((lib, _)) = r3extras_library(
+        &state,
+        "r3extras mixed",
+        &[
+            "Delta (2003)/Delta (2003).mkv",
+            "Delta (2003)/Delta (2003)-trailer.mkv",
+            "Delta (2003)/featurettes/Making Of.mkv",
+            "Delta (2003)/theme.mp3",
+        ],
+    )
+    .await
+    else {
+        return;
+    };
+    let rows = |name: &'static str| {
+        let db = state.db.clone();
+        async move {
+            sqlx::query_as::<_, (String, String, Option<String>)>(
+                "SELECT id, media_type, extra_type FROM media_items \
+                 WHERE path LIKE '%' || ? ORDER BY id",
+            )
+            .bind(name)
+            .fetch_all(&db)
+            .await
+            .unwrap()
+        }
+    };
+    let trailer = rows("Delta (2003)-trailer.mkv").await;
+    assert_eq!(trailer.len(), 1);
+    assert_eq!(trailer[0].2.as_deref(), Some("Trailer"));
+    let feature = rows("Making Of.mkv").await;
+    assert_eq!(feature[0].2.as_deref(), Some("Featurette"));
+    let user = add_user(&state, "r3x-mixed", "pw", false).await;
+    for id in [&trailer[0].0, &feature[0].0] {
+        sqlx::query("INSERT INTO user_item_data (user_id, item_id, played) VALUES (?, ?, 1)")
+            .bind(user.to_string())
+            .bind(id)
+            .execute(&state.db)
+            .await
+            .unwrap();
+    }
+    let delta = rows("Delta (2003).mkv").await[0].0.clone();
+
+    let mixed = rustyfin_model::library::Library {
+        content_type: rustyfin_model::library::LibraryContentType::Mixed,
+        ..lib.clone()
+    };
+    r3extras_rescan(&state, &mixed).await;
+    assert_eq!(
+        rows("Making Of.mkv").await,
+        [(feature[0].0.clone(), "Movie".to_string(), None)],
+        "one row, the same id, now a movie"
+    );
+    let hidden: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM media_items WHERE extra_type IS NOT NULL")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+    assert_eq!(hidden, 0, "no extra is left hidden");
+    // The trailer is a version of Delta now: one movie row holds both files, with the trailer's user data.
+    let holders: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT item_id FROM media_sources \
+         WHERE path LIKE '%/Delta (2003).mkv' OR path LIKE '%/Delta (2003)-trailer.mkv'",
+    )
+    .fetch_all(&state.db)
+    .await
+    .unwrap();
+    assert_eq!(holders.len(), 1, "{holders:?}");
+    assert!(
+        holders[0] == delta || holders[0] == trailer[0].0,
+        "one of the two rows survives: {holders:?}"
+    );
+    let theme = rows("theme.mp3").await;
+    assert_eq!(theme.len(), 1, "{theme:?}");
+    assert_eq!(
+        (theme[0].1.as_str(), theme[0].2.as_deref()),
+        ("Audio", None)
+    );
+    for id in [&feature[0].0, &holders[0]] {
+        let played: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM user_item_data WHERE item_id = ? AND user_id = ? AND played = 1",
+        )
+        .bind(id)
+        .bind(user.to_string())
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(played, 1, "the user data stays with {id}");
+    }
+}
+
 /// Regression: in a folder of several films, `B-short.mkv` names none of them, so it is a film of its own and
 /// not an extra of the first; when another film's file goes, or another film is deleted through the API, B
 /// keeps its item and user data. A suffix that names a film (`A-trailer.mkv`) is that film's extra, and

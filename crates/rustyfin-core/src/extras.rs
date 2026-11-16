@@ -236,6 +236,8 @@ pub async fn sync_extras(
     let stored = repo_extras::items_by_path(pool, library.id, scope).await?;
 
     let mut new_items: Vec<(MediaItem, String, &'static str)> = Vec::new();
+    // The extras whose owner isn't stored (a show folder whose series or season isn't): warned about once.
+    let mut unowned: Vec<String> = Vec::new();
     let mut seen: HashSet<&Path> = HashSet::new();
     for extra in found {
         if !seen.insert(extra.path.as_path()) {
@@ -261,9 +263,7 @@ pub async fn sync_extras(
         match (owner, stored.get(&path)) {
             // No owner (a show folder whose series isn't stored): the file is left as it is, and a stored
             // row is never deleted here.
-            (None, _) => {
-                tracing::debug!("{path} looks like an extra but has no owner; left as it is");
-            }
+            (None, _) => unowned.push(path),
             (Some(owner), Some(row)) => {
                 if row.extra_type.as_deref() != Some(kind) || row.owner_id.as_deref() != Some(owner)
                 {
@@ -309,6 +309,22 @@ pub async fn sync_extras(
                 new_items.push((item, owner.to_string(), kind));
             }
         }
+    }
+    if !unowned.is_empty() {
+        const SHOWN: usize = 10;
+        let more = unowned.len().saturating_sub(SHOWN);
+        tracing::warn!(
+            "library '{}': {} extras have no stored series, season or movie to belong to and stay hidden \
+             until one is scanned: {}{}",
+            library.name,
+            unowned.len(),
+            unowned[..unowned.len().min(SHOWN)].join(", "),
+            if more > 0 {
+                format!(" and {more} more")
+            } else {
+                String::new()
+            }
+        );
     }
     if new_items.is_empty() {
         return Ok(plans);
