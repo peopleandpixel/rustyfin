@@ -794,7 +794,7 @@ async function renderLibrary(route) {
             ${currentLibraryScope?.ParentId ? folderCrumbs(libId, libName, currentLibraryScope) : ''}
 
             <!-- Media Grid Container -->
-            <div id="lib-grid-container"></div>
+            <div id="lib-grid-container" data-multiselect></div>
         </div>`;
         $('lib-sort')?.addEventListener('change', () => libraryControlsChanged(libId));
         $('lib-sort-reverse')?.addEventListener('click', e => {

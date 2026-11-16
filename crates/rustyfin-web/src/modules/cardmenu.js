@@ -260,8 +260,12 @@ function addToDialog(kind) {
     return dialog;
 }
 
-async function openAddTo(el, kind) {
-    const id = el.dataset.id;
+function openAddTo(el, kind) {
+    return openAddToIds([el.dataset.id], kind);
+}
+
+// The add dialog for several items at once (the library's multi-select, multiselect.js); `done` runs after an add
+async function openAddToIds(ids, kind, done = null) {
     let lists = [];
     try {
         const answer = kind === 'playlist' ? await API.getPlaylists() : await API.getCollections();
@@ -290,8 +294,8 @@ async function openAddTo(el, kind) {
     const select = dialog.querySelector('select');
     const name = dialog.querySelector('input');
     select.addEventListener('change', () => { name.hidden = !!select.value; });
-    dialog.onclose = () => {
-        if (dialog.returnValue === 'ok') addTo(kind, id, select.value, name.value.trim());
+    dialog.onclose = async () => {
+        if (dialog.returnValue === 'ok' && await addTo(kind, ids, select.value, name.value.trim())) done?.();
     };
     // A reused dialog keeps the last returnValue; Escape must not read as the last OK
     dialog.returnValue = '';
@@ -299,24 +303,29 @@ async function openAddTo(el, kind) {
     (lists.length ? select : name).focus();
 }
 
+// Adds the item `id` (or the items of an array) to the playlist or collection `target`, or to a new one named `name`.
+// Resolves true when they were added.
 async function addTo(kind, id, target, name) {
+    const ids = [].concat(id);
     try {
         let listName = name;
         if (target) {
-            await (kind === 'playlist' ? API.addToPlaylist(target, [id]) : API.addToCollection(target, [id]));
+            await (kind === 'playlist' ? API.addToPlaylist(target, ids) : API.addToCollection(target, ids));
             const option = document.querySelector(`#card-add-dialog option[value="${CSS.escape(target)}"]`);
             listName = option?.textContent || '';
         } else {
             if (!name) {
                 toast(t('cards.name_required'), 'error');
-                return;
+                return false;
             }
-            await (kind === 'playlist' ? API.createPlaylist(name, [id]) : API.createCollection(name, [id]));
+            await (kind === 'playlist' ? API.createPlaylist(name, ids) : API.createCollection(name, ids));
         }
         API.invalidateCache('/Items');
         toast(t('cards.added_to', { name: listName }));
+        return true;
     } catch (e) {
         toast(e.message, 'error');
+        return false;
     }
 }
 
@@ -342,7 +351,10 @@ function cardPointerDown(e) {
     press.timer = setTimeout(() => {
         longPress = null;
         longPressAt = Date.now();
-        openCardMenu(card, press);
+        // A grid with multi-select (multiselect.js) takes the long press to select the card, as Jellyfin Web's
+        const claim = new CustomEvent('jf-card-longpress', { cancelable: true, detail: { card } });
+        document.dispatchEvent(claim);
+        if (!claim.defaultPrevented) openCardMenu(card, press);
     }, LONG_PRESS_MS);
     longPress = press;
 }
@@ -377,6 +389,6 @@ document.addEventListener('click', cardClickAfterLongPress, true);
 
 export {
     cardMenuCommands, cardMenuHtml, openCardMenu, toggleCardPlayed, toggleCardFavorite, setCardLikes, playCardItem, instantMixUrl, playInstantMix,
-    openAddTo, addTo, userDataChanged, cardPointerDown, cardPointerMove, cardContextMenu, cardClickAfterLongPress,
+    openAddTo, openAddToIds, addTo, userDataChanged, cardPointerDown, cardPointerMove, cardContextMenu, cardClickAfterLongPress,
     cancelLongPress, LONG_PRESS_MS,
 };
