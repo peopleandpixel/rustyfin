@@ -26,6 +26,10 @@ import {
     folderBrowserSelect, closeFolderBrowser, addLibraryPathRow, removeLibraryPathRow, initScanProgressWebSocket,
 } from './library-admin.js';
 import { openPluginConfig, openPluginPriority } from './plugins.js';
+import {
+    openUserEditor, closeUserEditor, showUserEditorTab, addUserEditorTag, removeUserEditorTag, addUserEditorSchedule,
+    removeUserEditorSchedule, saveUserEditor, setUserEditorPassword,
+} from './user-editor.js';
 import { openRefreshDialog, openIdentifyDialog, openImageEditor, openMetadataEditor } from './metadata-admin.js';
 let currentPage = 'home';
 
@@ -171,6 +175,17 @@ const clickActions = {
     'delete-user': el => { if (confirm(t('admin.delete_user_confirm'))) API.deleteUser(el.dataset.id).then(() => renderAdmin()); },
     'set-user-admin': el => setUserPolicy(el, { IsAdministrator: el.checked }),
     'set-user-disabled': el => setUserPolicy(el, { IsDisabled: el.checked }),
+    // The user editor (user-editor.js)
+    'edit-user': el => openUserEditor(el.dataset.id),
+    'user-editor-tab': el => showUserEditorTab(el),
+    'user-editor-all-folders': el => $('user-editor-folders')?.classList.toggle('hidden', el.checked),
+    'user-editor-add-tag': el => addUserEditorTag(el.dataset.kind),
+    'user-editor-remove-tag': el => removeUserEditorTag(el.dataset.kind, Number(el.dataset.index)),
+    'user-editor-add-schedule': () => addUserEditorSchedule(),
+    'user-editor-remove-schedule': el => removeUserEditorSchedule(Number(el.dataset.index)),
+    'user-editor-save': el => saveUserEditor(el),
+    'user-editor-password': el => setUserEditorPassword(el),
+    'user-editor-close': () => closeUserEditor(),
     'delete-library': el => deleteLibraryFromAdmin(el.dataset.id),
     'toggle-realtime-monitor': el => toggleRealtimeMonitor(el),
     'library-options': el => openLibraryOptions(el.dataset.id, el.dataset.name),

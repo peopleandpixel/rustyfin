@@ -3260,6 +3260,7 @@ const B124_WEB_MODULES: &[&str] = &[
     "search.js",
     "sessions.js",
     "settings.js",
+    "user-editor.js",
     "user-settings.js",
     "util.js",
     "wizard.js",
@@ -33278,6 +33279,12 @@ async fn r3livelog_keep_alive_frames_are_jellyfins() {
 #[test]
 fn r3livelog_web_view() {
     b124_node_test("r3livelog_view.mjs");
+}
+
+// The administrator's user editor shows and reads back a whole policy (tests/web/r3parental_user_editor.mjs).
+#[test]
+fn r3parental_web_user_editor() {
+    b124_node_test("r3parental_user_editor.mjs");
 }
 
 
