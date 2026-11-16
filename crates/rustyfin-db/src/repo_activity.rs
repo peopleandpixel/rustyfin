@@ -32,9 +32,30 @@ pub async fn get_activity_log(
     start_index: i64,
     limit: i64,
 ) -> Result<ActivityLogResult, sqlx::Error> {
-    let total: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM activity_log")
-        .fetch_one(pool)
-        .await?;
+    query_activity_log(pool, start_index, limit, None, None).await
+}
+
+/// One page of the activity log, newest first, as Jellyfin's `GET /System/ActivityLog/Entries`:
+/// only entries at or after `min_date` (an ISO 8601 date) when given, and with `has_user_id`,
+/// only the entries that name a user (`true`) or that name none (`false`). Dates come back as
+/// ISO 8601 UTC (`2026-11-15T08:30:00.000Z`).
+pub async fn query_activity_log(
+    pool: &SqlitePool,
+    start_index: i64,
+    limit: i64,
+    min_date: Option<&str>,
+    has_user_id: Option<bool>,
+) -> Result<ActivityLogResult, sqlx::Error> {
+    // Both queries filter alike: ?1 the earliest date, ?2 whether the entry names a user.
+    let total: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM activity_log
+         WHERE (?1 IS NULL OR julianday(date) >= julianday(?1))
+           AND (?2 IS NULL OR (?2 = (user_id IS NOT NULL AND user_id != '')))",
+    )
+    .bind(min_date)
+    .bind(has_user_id)
+    .fetch_one(pool)
+    .await?;
 
     let rows = sqlx::query_as::<
         _,
@@ -49,11 +70,16 @@ pub async fn get_activity_log(
             String,
         ),
     >(
-        "SELECT id, name, type, user_id, item_id, severity, overview, date
+        "SELECT id, name, type, user_id, item_id, severity, overview,
+                strftime('%Y-%m-%dT%H:%M:%fZ', date)
          FROM activity_log
-         ORDER BY date DESC
-         LIMIT ?1 OFFSET ?2",
+         WHERE (?1 IS NULL OR julianday(date) >= julianday(?1))
+           AND (?2 IS NULL OR (?2 = (user_id IS NOT NULL AND user_id != '')))
+         ORDER BY date DESC, id DESC
+         LIMIT ?3 OFFSET ?4",
     )
+    .bind(min_date)
+    .bind(has_user_id)
     .bind(limit)
     .bind(start_index)
     .fetch_all(pool)
@@ -74,7 +100,18 @@ pub async fn get_activity_log(
             })
             .collect(),
         total_record_count: total.0,
+        start_index,
     })
+}
+
+/// Deletes the activity log entries older than `days` days; returns how many went.
+pub async fn delete_activity_older_than(pool: &SqlitePool, days: u32) -> Result<u64, sqlx::Error> {
+    let done =
+        sqlx::query("DELETE FROM activity_log WHERE julianday(date) < julianday('now') - ?1")
+            .bind(i64::from(days))
+            .execute(pool)
+            .await?;
+    Ok(done.rows_affected())
 }
 
 #[cfg(test)]

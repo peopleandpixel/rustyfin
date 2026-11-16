@@ -1,4 +1,4 @@
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -18,9 +18,18 @@ pub fn routes() -> Router<AppState> {
         )
 }
 
-async fn get_scheduled_tasks(State(state): State<AppState>) -> Json<Vec<ScheduledTaskInfo>> {
-    let tasks = state.task_scheduler.get_all_tasks().await;
-    Json(tasks)
+/// GET /ScheduledTasks - every task; `isHidden` keeps only the tasks with that `IsHidden`, as in
+/// Jellyfin (none is hidden).
+async fn get_scheduled_tasks(
+    State(state): State<AppState>,
+    Query(params): Query<Vec<(String, String)>>,
+) -> Result<Json<Vec<ScheduledTaskInfo>>, ApiError> {
+    let is_hidden = crate::query::bool_param(&params, "isHidden")?;
+    let mut tasks = state.task_scheduler.get_all_tasks().await;
+    if let Some(hidden) = is_hidden {
+        tasks.retain(|t| t.is_hidden == hidden);
+    }
+    Ok(Json(tasks))
 }
 
 async fn set_task_triggers(

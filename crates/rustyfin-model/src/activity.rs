@@ -19,4 +19,5 @@ pub struct ActivityLogEntry {
 pub struct ActivityLogResult {
     pub items: Vec<ActivityLogEntry>,
     pub total_record_count: i64,
+    pub start_index: i64,
 }

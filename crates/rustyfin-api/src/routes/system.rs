@@ -141,6 +141,26 @@ async fn get_full_info(
     let log_path = state.data_dir.join("logs").to_string_lossy().to_string();
     let cache_path = state.data_dir.join("cache").to_string_lossy().to_string();
     let program_data_path = state.data_dir.to_string_lossy().to_string();
+    let metadata_path = state
+        .data_dir
+        .join("metadata")
+        .to_string_lossy()
+        .to_string();
+    let transcoding_temp_path = state
+        .data_dir
+        .join("cache")
+        .join("transcode")
+        .to_string_lossy()
+        .to_string();
+    let cast_receiver_applications = config
+        .other
+        .get("CastReceiverApplications")
+        .cloned()
+        .or_else(|| {
+            rustyfin_model::server_info::jellyfin_server_defaults()
+                .remove("CastReceiverApplications")
+        })
+        .unwrap_or_else(|| serde_json::json!([]));
 
     let os = std::env::consts::OS.to_string();
 
@@ -164,6 +184,27 @@ async fn get_full_info(
         local_address,
         remote_end_point: Some(format!("http://{}", addr)),
         package_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        is_shutting_down: *state.shutdown_tx.borrow(),
+        supports_library_monitor: true,
+        items_by_name_path: metadata_path.clone(),
+        internal_metadata_path: metadata_path,
+        transcoding_temp_path,
+        web_path: std::env::var("RUSTYFIN_WEBCLIENT_DIR").unwrap_or_default(),
+        encoder_location: if std::env::var_os("RUSTYFIN_FFMPEG_PATH").is_some() {
+            "Custom"
+        } else {
+            "System"
+        }
+        .to_string(),
+        system_architecture: match std::env::consts::ARCH {
+            "x86_64" => "X64",
+            "aarch64" => "Arm64",
+            "x86" => "X86",
+            "arm" => "Arm",
+            other => other,
+        }
+        .to_string(),
+        cast_receiver_applications,
     }))
 }
 
@@ -217,10 +258,21 @@ async fn configuration_json(
         hide_secrets(&mut config);
     }
     let mut json = serde_json::to_value(&config).map_err(|e| ApiError::Internal(e.to_string()))?;
+    let defaults = rustyfin_model::server_info::jellyfin_server_defaults();
     if let Some(obj) = json.as_object_mut() {
         // A key still waiting to be saved is in the config, but is never returned.
         for field in ["TmdbApiKey", "OmdbApiKey", "FanartApiKey"] {
             obj.remove(field);
+        }
+        // Fields that are neither Rustyfin's nor Jellyfin's go to administrators only.
+        if !is_admin {
+            for field in config.other.keys().filter(|f| !defaults.contains_key(*f)) {
+                obj.remove(field);
+            }
+        }
+        // Jellyfin's fields that no client has saved yet get Jellyfin's defaults.
+        for (field, value) in defaults {
+            obj.entry(field).or_insert(value);
         }
     }
     if is_admin && let Some(obj) = json.as_object_mut() {
@@ -287,10 +339,206 @@ async fn save_config_file(path: PathBuf, config: ServerConfiguration) -> Result<
     .map_err(|e| ApiError::Internal(e.to_string()))
 }
 
+/// The largest configuration document stored, as JSON: the server settings, the encoding settings.
+const MAX_CONFIG_BYTES: usize = 256 * 1024;
+
+/// Refuses, with 413, a document `what` whose JSON is over `MAX_CONFIG_BYTES`.
+fn ensure_config_size(what: &str, document: &impl serde::Serialize) -> Result<(), ApiError> {
+    let size = serde_json::to_vec(document)
+        .map_err(|e| ApiError::Internal(e.to_string()))?
+        .len();
+    if size > MAX_CONFIG_BYTES {
+        return Err(ApiError::PayloadTooLarge(format!(
+            "{what}: {size} bytes is over the {MAX_CONFIG_BYTES}-byte limit"
+        )));
+    }
+    Ok(())
+}
+
+/// Every field name the server settings know: Rustyfin's, the provider keys and their flags, and
+/// Jellyfin's.
+fn known_config_fields() -> Vec<String> {
+    let mut names: Vec<String> = match serde_json::to_value(ServerConfiguration::default()) {
+        Ok(serde_json::Value::Object(map)) => map.into_iter().map(|(k, _)| k).collect(),
+        _ => Vec::new(),
+    };
+    names.extend(
+        [
+            "TmdbApiKey",
+            "OmdbApiKey",
+            "FanartApiKey",
+            "TmdbApiKeySet",
+            "OmdbApiKeySet",
+            "FanartApiKeySet",
+        ]
+        .map(String::from),
+    );
+    names.extend(
+        rustyfin_model::server_info::jellyfin_server_defaults()
+            .into_iter()
+            .map(|(k, _)| k),
+    );
+    names
+}
+
+/// The known field name `key` matches without case, else `key` as given.
+fn canonical_field(key: &str, known: &[String]) -> String {
+    known
+        .iter()
+        .find(|k| k.eq_ignore_ascii_case(key))
+        .cloned()
+        .unwrap_or_else(|| key.to_string())
+}
+
+/// Renames the fields of a posted configuration to the known field each matches without case, as
+/// Jellyfin reads JSON, so `tmdbApiKey` is the TMDb key (saved to its plugin, never stored or
+/// returned) rather than an unknown field. A field in the exact case wins over a variant.
+fn canonical_fields(body: serde_json::Value) -> serde_json::Value {
+    let serde_json::Value::Object(map) = body else {
+        return body;
+    };
+    let known = known_config_fields();
+    let mut out = serde_json::Map::new();
+    for (key, value) in map {
+        let canonical = canonical_field(&key, &known);
+        if canonical == key {
+            out.insert(canonical, value);
+        } else {
+            out.entry(canonical).or_insert(value);
+        }
+    }
+    serde_json::Value::Object(out)
+}
+
+/// Drops the fields that `configuration_json` works out on each GET, so a client that posts the
+/// whole configuration back doesn't store them.
+fn drop_computed_fields(config: &mut ServerConfiguration) {
+    for field in ["TmdbApiKeySet", "OmdbApiKeySet", "FanartApiKeySet"] {
+        config.other.remove(field);
+    }
+}
+
+/// Jellyfin's named configuration `encoding` (`EncodingOptions`): Jellyfin 12.4.0's defaults with
+/// Rustyfin's ffmpeg and transcode folder, under what a client saved (`encoding.json` in the data
+/// directory). Rustyfin's transcoder takes its settings per request and from the environment, so
+/// these are kept for Jellyfin Web, not acted on.
+const ENCODING_KEY: &str = "encoding";
+
+fn encoding_path(state: &AppState) -> std::path::PathBuf {
+    state.data_dir.join("encoding.json")
+}
+
+async fn encoding_configuration(state: &AppState) -> Result<serde_json::Value, ApiError> {
+    let ffmpeg = std::env::var("RUSTYFIN_FFMPEG_PATH").unwrap_or_else(|_| "ffmpeg".to_string());
+    let transcode_dir = state.data_dir.join("cache").join("transcode");
+    use serde_json::json;
+    let mut options: serde_json::Map<String, serde_json::Value> = [
+        ("EncodingThreadCount", json!(-1)),
+        (
+            "TranscodingTempPath",
+            json!(transcode_dir.to_string_lossy()),
+        ),
+        ("FallbackFontPath", json!("")),
+        ("EnableFallbackFont", json!(false)),
+        ("EnableAudioVbr", json!(false)),
+        ("DownMixAudioBoost", json!(2)),
+        ("DownMixStereoAlgorithm", json!("None")),
+        ("MaxMuxingQueueSize", json!(2048)),
+        ("EnableThrottling", json!(false)),
+        ("ThrottleDelaySeconds", json!(180)),
+        ("EnableSegmentDeletion", json!(false)),
+        ("SegmentKeepSeconds", json!(720)),
+        ("HardwareAccelerationType", json!("none")),
+        ("EncoderAppPath", json!(ffmpeg)),
+        ("EncoderAppPathDisplay", json!(ffmpeg)),
+        ("VaapiDevice", json!("/dev/dri/renderD128")),
+        ("QsvDevice", json!("")),
+        ("EnableTonemapping", json!(false)),
+        ("EnableVppTonemapping", json!(false)),
+        ("EnableVideoToolboxTonemapping", json!(false)),
+        ("TonemappingAlgorithm", json!("bt2390")),
+        ("TonemappingMode", json!("auto")),
+        ("TonemappingRange", json!("auto")),
+        ("TonemappingDesat", json!(0)),
+        ("TonemappingPeak", json!(100)),
+        ("TonemappingParam", json!(0)),
+        ("VppTonemappingBrightness", json!(16)),
+        ("VppTonemappingContrast", json!(1)),
+        ("H264Crf", json!(23)),
+        ("H265Crf", json!(28)),
+        ("EncoderPreset", json!("auto")),
+        ("DeinterlaceDoubleRate", json!(false)),
+        ("DeinterlaceMethod", json!("yadif")),
+        ("EnableDecodingColorDepth10Hevc", json!(true)),
+        ("EnableDecodingColorDepth10Vp9", json!(true)),
+        ("EnableDecodingColorDepth10HevcRext", json!(false)),
+        ("EnableDecodingColorDepth12HevcRext", json!(false)),
+        ("EnableEnhancedNvdecDecoder", json!(true)),
+        ("PreferSystemNativeHwDecoder", json!(true)),
+        ("EnableIntelLowPowerH264HwEncoder", json!(false)),
+        ("EnableIntelLowPowerHevcHwEncoder", json!(false)),
+        ("EnableHardwareEncoding", json!(true)),
+        ("AllowHevcEncoding", json!(false)),
+        ("AllowAv1Encoding", json!(false)),
+        ("EnableSubtitleExtraction", json!(true)),
+        ("SubtitleExtractionTimeoutMinutes", json!(30)),
+        ("HlsAudioSeekStrategy", json!("TrimCopiedAudio")),
+        ("HardwareDecodingCodecs", json!(["h264", "vc1"])),
+        (
+            "AllowOnDemandMetadataBasedKeyframeExtractionForExtensions",
+            json!(["mkv"]),
+        ),
+    ]
+    .into_iter()
+    .map(|(field, value)| (field.to_string(), value))
+    .collect();
+    let saved = match tokio::fs::read_to_string(encoding_path(state)).await {
+        Ok(text) => serde_json::from_str::<serde_json::Value>(&text).unwrap_or_else(|e| {
+            tracing::warn!("ignoring an unreadable encoding.json: {e}");
+            serde_json::Value::Null
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::Value::Null,
+        Err(e) => return Err(ApiError::Internal(e.to_string())),
+    };
+    if let serde_json::Value::Object(saved) = saved {
+        options.extend(saved);
+    }
+    Ok(serde_json::Value::Object(options))
+}
+
+async fn save_encoding_configuration(
+    state: &AppState,
+    body: serde_json::Value,
+) -> Result<(), ApiError> {
+    if !body.is_object() {
+        return Err(ApiError::BadRequest(
+            "encoding: the body must be a JSON object".to_string(),
+        ));
+    }
+    ensure_config_size(ENCODING_KEY, &body)?;
+    let path = encoding_path(state);
+    let text =
+        serde_json::to_string_pretty(&body).map_err(|e| ApiError::Internal(e.to_string()))?;
+    tokio::task::spawn_blocking(move || {
+        // Each save writes its own temp file, so two saves at once never write the same file;
+        // the last rename wins.
+        let tmp = path.with_file_name(format!("encoding.json.{}.tmp", uuid::Uuid::new_v4()));
+        std::fs::write(&tmp, text)?;
+        std::fs::rename(&tmp, &path)
+    })
+    .await
+    .map_err(|e| ApiError::Internal(e.to_string()))?
+    .map_err(|e| ApiError::Internal(e.to_string()))
+}
+
 async fn update_configuration(
     State(state): State<AppState>,
-    Json(mut new_config): Json<ServerConfiguration>,
+    Json(body): Json<serde_json::Value>,
 ) -> Result<StatusCode, ApiError> {
+    let mut new_config: ServerConfiguration = serde_json::from_value(canonical_fields(body))
+        .map_err(|e| ApiError::BadRequest(format!("configuration: {e}")))?;
+    drop_computed_fields(&mut new_config);
+    ensure_config_size("configuration", &new_config)?;
     let posted = [
         new_config.tmdb_api_key.is_some(),
         new_config.omdb_api_key.is_some(),
@@ -850,6 +1098,9 @@ async fn get_configuration_by_key(
     Extension(claims): Extension<Claims>,
     Path(key): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    if key.eq_ignore_ascii_case(ENCODING_KEY) {
+        return Ok(Json(encoding_configuration(&state).await?));
+    }
     let json = configuration_json(&state, claims.is_admin).await?;
     Ok(Json(
         json.get(&key).cloned().unwrap_or(serde_json::json!({})),
@@ -862,17 +1113,26 @@ async fn update_configuration_by_key(
     Path(key): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<StatusCode, ApiError> {
+    if key.eq_ignore_ascii_case(ENCODING_KEY) {
+        save_encoding_configuration(&state, body).await?;
+        tracing::info!("configuration key updated: {}", key);
+        return Ok(StatusCode::NO_CONTENT);
+    }
     // Start from the current config. The read lock is released before the keys are saved.
     let current = state.config.read().await;
     let json = serde_json::to_value(&*current).map_err(|e| ApiError::Internal(e.to_string()))?;
     drop(current);
 
-    // Merge the body into the config at the specified key path
+    // Merge the body into the config at the specified key path, the known field it names
+    // without case.
+    let key = canonical_field(&key, &known_config_fields());
     let merged = merge_json_values(json, &key, body);
 
     // Parse back into ServerConfiguration
     let mut new_config: ServerConfiguration =
         serde_json::from_value(merged).map_err(|e| ApiError::BadRequest(format!("{key}: {e}")))?;
+    drop_computed_fields(&mut new_config);
+    ensure_config_size("configuration", &new_config)?;
 
     // Provider keys go to their plugin configs, and are cleared from the config before it is
     // stored. A failed save returns here, before the config is written.

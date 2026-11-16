@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct StartupConfiguration {
+    #[serde(rename = "UICulture")]
     pub ui_culture: String,
     pub metadata_country_code: String,
     pub preferred_metadata_language: String,
@@ -13,6 +14,7 @@ pub struct StartupConfiguration {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct StartupConfigurationUpdate {
+    #[serde(rename = "UICulture")]
     pub ui_culture: Option<String>,
     pub metadata_country_code: Option<String>,
     pub preferred_metadata_language: Option<String>,

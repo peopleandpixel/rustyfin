@@ -151,6 +151,14 @@ async fn create_user(
     if !rustyfin_db::repo_user::create_user_unless_taken(&state.db, &user).await? {
         return Err(ApiError::BadRequest("user already exists".into()));
     }
+    super::activity::record(
+        &state,
+        &format!("User {} has been created", user.name),
+        "UserCreated",
+        Some(user.id),
+        "Information",
+    )
+    .await;
     Ok(Json(UserDto::new(
         user,
         UserFlags::default(),
@@ -177,10 +185,21 @@ async fn remove_user(state: &AppState, claims: &Claims, id: Uuid) -> Result<(), 
         return Err(ApiError::BadRequest("cannot delete yourself".into()));
     }
 
+    let name = rustyfin_db::repo_user::get_user_by_id(&state.db, id)
+        .await?
+        .map(|u| u.name);
     let deleted = rustyfin_db::repo_user::delete_user(&state.db, id).await?;
     if !deleted {
         return Err(ApiError::NotFound("user not found".into()));
     }
+    super::activity::record(
+        state,
+        &format!("User {} has been deleted", name.unwrap_or_default()),
+        "UserDeleted",
+        Some(id),
+        "Information",
+    )
+    .await;
 
     Ok(())
 }
@@ -242,6 +261,14 @@ async fn change_password(
     rustyfin_auth::revoke_user_tokens(&state.db, id, keep.as_deref())
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
+    super::activity::record(
+        &state,
+        &format!("Password has been changed for user {}", user.name),
+        "UserPasswordChanged",
+        Some(id),
+        "Information",
+    )
+    .await;
 
     Ok(Json(serde_json::json!({})))
 }

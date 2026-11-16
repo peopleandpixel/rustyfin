@@ -24,6 +24,10 @@ pub const TASK_DB_VACUUM: &str = "DatabaseVacuum";
 pub const TASK_CHAPTER_IMAGES: &str = "RefreshChapterImages";
 /// Jellyfin's key for its trickplay task.
 pub const TASK_TRICKPLAY: &str = "RefreshTrickplayImages";
+pub const TASK_CLEAN_ACTIVITY_LOG: &str = "CleanActivityLog";
+
+/// Jellyfin's default `ActivityLogRetentionDays`.
+const DEFAULT_ACTIVITY_LOG_RETENTION_DAYS: u32 = 30;
 
 /// Default interval: 12 hours in .NET ticks (1 tick = 100ns)
 const TICKS_12H: u64 = 12 * 60 * 60 * 10_000_000;
@@ -99,6 +103,8 @@ impl TaskScheduler {
             TaskEntry {
                 info: ScheduledTaskInfo {
                     id: TASK_LIBRARY_SCAN.to_string(),
+                    key: "RefreshLibrary".to_string(),
+                    is_hidden: false,
                     name: "Scan Media Library".to_string(),
                     description: "Scans all libraries for new and updated media files.".to_string(),
                     category: "Library".to_string(),
@@ -121,6 +127,9 @@ impl TaskScheduler {
             TaskEntry {
                 info: ScheduledTaskInfo {
                     id: TASK_METADATA_REFRESH.to_string(),
+                    // Jellyfin has no task like it; its refresh runs inside RefreshLibrary.
+                    key: TASK_METADATA_REFRESH.to_string(),
+                    is_hidden: false,
                     name: "Refresh Metadata".to_string(),
                     description:
                         "Fills in metadata for media items that are not identified yet, from local and remote sources."
@@ -141,6 +150,8 @@ impl TaskScheduler {
             TaskEntry {
                 info: ScheduledTaskInfo {
                     id: TASK_TRANSCODE_CLEANUP.to_string(),
+                    key: "DeleteTranscodeFiles".to_string(),
+                    is_hidden: false,
                     name: "Transcode Cache Cleanup".to_string(),
                     description: "Removes old transcoded files from the cache directory."
                         .to_string(),
@@ -164,6 +175,9 @@ impl TaskScheduler {
             TaskEntry {
                 info: ScheduledTaskInfo {
                     id: TASK_INTRO_DETECTION.to_string(),
+                    // Jellyfin's Media Segment Scan, which finds intros and outros the same way.
+                    key: "TaskExtractMediaSegments".to_string(),
+                    is_hidden: false,
                     name: "Detect Intros and Outros".to_string(),
                     description: "Analyzes episodes to detect intro and outro segments for skip functionality.".to_string(),
                     category: "Library".to_string(),
@@ -186,6 +200,8 @@ impl TaskScheduler {
             TaskEntry {
                 info: ScheduledTaskInfo {
                     id: TASK_DB_VACUUM.to_string(),
+                    key: "OptimizeDatabaseTask".to_string(),
+                    is_hidden: false,
                     name: "Database Maintenance".to_string(),
                     description:
                         "Runs VACUUM to defragment the SQLite database and reclaim disk space."
@@ -222,6 +238,8 @@ impl TaskScheduler {
                 TaskEntry {
                     info: ScheduledTaskInfo {
                         id: id.to_string(),
+                        key: id.to_string(),
+                        is_hidden: false,
                         name: name.to_string(),
                         description: description.to_string(),
                         category: "Library".to_string(),
@@ -238,6 +256,32 @@ impl TaskScheduler {
                 },
             );
         }
+
+        // Activity log cleanup, as Jellyfin's Clean Activity Log task
+        tasks.insert(
+            TASK_CLEAN_ACTIVITY_LOG.to_string(),
+            TaskEntry {
+                info: ScheduledTaskInfo {
+                    id: TASK_CLEAN_ACTIVITY_LOG.to_string(),
+                    key: TASK_CLEAN_ACTIVITY_LOG.to_string(),
+                    is_hidden: false,
+                    name: "Clean Activity Log".to_string(),
+                    description:
+                        "Deletes activity log entries older than the configured age (ActivityLogRetentionDays)."
+                            .to_string(),
+                    category: "Maintenance".to_string(),
+                    state: TaskState::Idle,
+                    current_progress_percentage: None,
+                    triggers: vec![TaskTriggerInfo {
+                        trigger_type: "IntervalTrigger".to_string(),
+                        interval_ticks: Some(TICKS_24H),
+                        time_of_day_ticks: None,
+                        max_runtime_ticks: None,
+                    }],
+                    last_execution_result: None,
+                },
+            },
+        );
 
         let changes = ChangeQueue::new(db.clone());
         let watcher = LibraryWatcher::new(db.clone(), changes.clone(), (*data_dir).clone());
@@ -332,6 +376,10 @@ impl TaskScheduler {
                     let id = id.to_string();
                     tokio::spawn(async move { sched.run_video_images(&id).await });
                 }
+                TASK_CLEAN_ACTIVITY_LOG => {
+                    let sched = self.clone();
+                    tokio::spawn(async move { sched.run_clean_activity_log().await });
+                }
                 _ => {}
             }
             true
@@ -387,10 +435,75 @@ impl TaskScheduler {
     }
 
     async fn set_task_result(&self, id: &str, result: TaskResult) {
-        let mut tasks = self.tasks.write().await;
-        if let Some(entry) = tasks.get_mut(id) {
+        let failed = (result.status == TaskCompletionStatus::Failed)
+            .then(|| result.error_message.clone().unwrap_or_default());
+        let name = {
+            let mut tasks = self.tasks.write().await;
+            let Some(entry) = tasks.get_mut(id) else {
+                return;
+            };
             entry.info.last_execution_result = Some(result);
+            entry.info.name.clone()
+        };
+        // A failed task goes in the activity log, as in Jellyfin.
+        if let Some(error) = failed
+            && let Err(e) = rustyfin_db::repo_activity::log_activity(
+                &self.db,
+                &format!("{name} failed"),
+                "TaskFailed",
+                None,
+                None,
+                "Error",
+                Some(&error).filter(|e| !e.is_empty()).map(String::as_str),
+            )
+            .await
+        {
+            tracing::warn!("could not write the activity log: {e}");
         }
+    }
+
+    /// The configured `ActivityLogRetentionDays` from config.json, else Jellyfin's 30.
+    async fn activity_log_retention_days(&self) -> u32 {
+        let Ok(text) = tokio::fs::read_to_string(self.data_dir.join("config.json")).await else {
+            return DEFAULT_ACTIVITY_LOG_RETENTION_DAYS;
+        };
+        serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|v| v.get("ActivityLogRetentionDays")?.as_u64())
+            .and_then(|d| u32::try_from(d).ok())
+            .unwrap_or(DEFAULT_ACTIVITY_LOG_RETENTION_DAYS)
+    }
+
+    /// Deletes the activity log entries older than the retention age. A retention of 0 keeps
+    /// every entry.
+    async fn run_clean_activity_log(&self) {
+        self.set_task_state(TASK_CLEAN_ACTIVITY_LOG, TaskState::Running)
+            .await;
+        let start = Utc::now();
+        let days = self.activity_log_retention_days().await;
+        let outcome = if days == 0 {
+            Ok(0)
+        } else {
+            rustyfin_db::repo_activity::delete_activity_older_than(&self.db, days).await
+        };
+        let (status, error_message) = match outcome {
+            Ok(removed) => {
+                if removed > 0 {
+                    tracing::info!("activity log cleanup: removed {removed} entries");
+                }
+                (TaskCompletionStatus::Completed, None)
+            }
+            Err(e) => (TaskCompletionStatus::Failed, Some(e.to_string())),
+        };
+        let result = TaskResult {
+            status,
+            error_message,
+            start_time_utc: start.to_rfc3339(),
+            end_time_utc: Utc::now().to_rfc3339(),
+        };
+        self.set_task_result(TASK_CLEAN_ACTIVITY_LOG, result).await;
+        self.set_task_state(TASK_CLEAN_ACTIVITY_LOG, TaskState::Idle)
+            .await;
     }
 
     async fn get_interval_for_task(&self, id: &str) -> Option<std::time::Duration> {
@@ -940,6 +1053,24 @@ impl TaskScheduler {
                     }
                     Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+
+        // Activity log cleanup loop
+        let sched = self.clone();
+        let mut rx = shutdown_rx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(900)).await;
+            loop {
+                sched.run_clean_activity_log().await;
+                let interval = sched
+                    .get_interval_for_task(TASK_CLEAN_ACTIVITY_LOG)
+                    .await
+                    .unwrap_or(std::time::Duration::from_secs(24 * 3600));
+                tokio::select! {
+                    _ = tokio::time::sleep(interval) => {}
+                    _ = rx.wait_for(|v| *v) => break,
                 }
             }
         });

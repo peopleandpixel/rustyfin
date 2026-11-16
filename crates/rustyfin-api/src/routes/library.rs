@@ -46,6 +46,28 @@ pub fn admin_routes() -> Router<AppState> {
     Router::new()
         .route("/Library/VirtualFolders/{id}/Refresh", post(scan_library))
         .route("/Library/Refresh", post(refresh_all))
+        .route("/Library/MediaFolders", get(get_media_folders))
+        .route("/Library/PhysicalPaths", get(get_physical_paths))
+}
+
+/// GET /Library/MediaFolders - the libraries as Jellyfin's collection folders. `isHidden=true`
+/// gives none: no library is hidden.
+async fn get_media_folders(
+    State(state): State<AppState>,
+    Query(params): Query<Vec<(String, String)>>,
+) -> Result<Json<Value>, ApiError> {
+    let libs = if crate::query::bool_param(&params, "isHidden")? == Some(true) {
+        Vec::new()
+    } else {
+        rustyfin_db::repo_library::get_all_libraries(&state.db_ro).await?
+    };
+    Ok(Json(libraries_to_views(&libs, &state.server_id)))
+}
+
+/// GET /Library/PhysicalPaths - every library folder path
+async fn get_physical_paths(State(state): State<AppState>) -> Result<Json<Vec<String>>, ApiError> {
+    let libs = rustyfin_db::repo_library::get_all_libraries(&state.db_ro).await?;
+    Ok(Json(libs.into_iter().flat_map(|l| l.paths).collect()))
 }
 
 /// A library as Jellyfin's `CollectionFolder` item: in `/UserViews`, `GET /Items/{library id}` and
@@ -132,13 +154,33 @@ async fn get_user_views_no_user(State(state): State<AppState>) -> Result<Json<Va
     Ok(Json(views))
 }
 
-/// A library in `GET /Library/VirtualFolders`, with its saved options.
+/// A library in `GET /Library/VirtualFolders`, with its saved options. Rustyfin's `Id`,
+/// `ContentType` and `Paths` come with Jellyfin's `VirtualFolderInfo` names for them.
 #[derive(Serialize)]
 #[serde(rename_all = "PascalCase")]
 struct LibraryWithOptions {
     #[serde(flatten)]
     library: Library,
     library_options: LibraryOptions,
+    item_id: Uuid,
+    collection_type: Option<&'static str>,
+    locations: Vec<String>,
+    refresh_status: &'static str,
+}
+
+impl LibraryWithOptions {
+    fn new(library: Library, library_options: LibraryOptions) -> Self {
+        Self {
+            item_id: library.id,
+            // Jellyfin gives a mixed library no collection type.
+            collection_type: Some(library.content_type.jellyfin_collection_type())
+                .filter(|t| *t != "mixed"),
+            locations: library.paths.clone(),
+            refresh_status: "Idle",
+            library,
+            library_options,
+        }
+    }
 }
 
 async fn get_libraries(
@@ -149,10 +191,7 @@ async fn get_libraries(
     for library in libs {
         let library_options =
             rustyfin_db::repo_library::get_library_options(&state.db_ro, library.id).await?;
-        items.push(LibraryWithOptions {
-            library,
-            library_options,
-        });
+        items.push(LibraryWithOptions::new(library, library_options));
     }
     Ok(Json(items))
 }
