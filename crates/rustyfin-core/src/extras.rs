@@ -466,8 +466,9 @@ async fn is_missing(path: &str) -> bool {
 /// file `file`, with the size and modification time `stamp`, of the owner `owner`, is after a rename or a
 /// move: the only one whose source has that stamp and the same kind of media (a rename or move within a
 /// disk keeps both, even to another owner), else the only one of the same owner with the same file name (a
-/// file moved into another extras folder). Main items follow their files the same way
-/// (`scan_sync::takes_over`).
+/// file moved into another extras folder) whose stamp isn't known to differ: a re-downloaded trailer with
+/// the old one's name is a new file and starts with no user data. Main items follow their files the same
+/// way (`scan_sync::takes_over`).
 fn heir_extra(
     gone: &[(&str, &repo_extras::PathRow)],
     file: &Path,
@@ -495,7 +496,10 @@ fn heir_extra(
         (0..gone.len())
             .filter(|&i| {
                 let (old, row) = gone[i];
-                row.owner_id.as_deref() == Some(owner) && Path::new(old).file_name() == Some(name)
+                let differs = matches!((row.stamp, stamp), (Some(was), Some(is)) if was != is);
+                row.owner_id.as_deref() == Some(owner)
+                    && Path::new(old).file_name() == Some(name)
+                    && !differs
             })
             .collect(),
     )
@@ -803,7 +807,7 @@ mod tests {
         assert_eq!(heir("/m/C/extras/dos.mkv", Some((200, 7)), "C"), Some(1));
         // A theme song is never a video's heir.
         assert_eq!(heir("/m/A/theme.mp3", Some((100, 7)), "A"), None);
-        // Moved into another extras folder of its owner, with a new time: by its name.
+        // Moved into another extras folder of its owner, its old stamp unknown: by its name.
         assert_eq!(
             heir("/m/B/featurettes/three.mkv", Some((1, 1)), "B"),
             Some(2)
@@ -811,6 +815,10 @@ mod tests {
         assert_eq!(heir("/m/C/three.mkv", None, "C"), None, "another owner");
         // A new file is no one's heir.
         assert_eq!(heir("/m/A/featurettes/new.mkv", Some((5, 5)), "A"), None);
+        // A new file with a gone one's name and another modification time (a re-download) is not its heir;
+        // with no stamp on either side, the name is enough.
+        assert_eq!(heir("/m/A/trailers/one.mkv", Some((100, 8)), "A"), None);
+        assert_eq!(heir("/m/A/trailers/one.mkv", None, "A"), Some(0));
         // Two gone extras with the stamp: neither.
         let twin = row("A", Some((100, 7)));
         let gone = [("/m/A/x.mkv", &a), ("/m/A/y.mkv", &twin)];

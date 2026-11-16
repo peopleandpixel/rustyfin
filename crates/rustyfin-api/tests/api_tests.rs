@@ -17659,6 +17659,131 @@ async fn r3extras2_a_renamed_or_moved_extra_keeps_its_watch_state() {
     .unwrap();
     r3extras_rescan(&state, &lib).await;
     check("Uno", "Unknown", "Beta").await;
+    // Replaced by another file of that name in another extras folder (a re-downloaded trailer, with another
+    // modification time): a new item, with no user data.
+    std::fs::remove_file(beta.join("extras/Uno.mkv")).unwrap();
+    let fresh = beta.join("trailers/Uno.mkv");
+    assert!(r3extras_media(&fresh, false));
+    std::fs::File::options()
+        .write(true)
+        .open(&fresh)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000))
+        .unwrap();
+    r3extras_rescan(&state, &lib).await;
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT id, extra_type FROM media_items WHERE library_id = ? AND extra_type IS NOT NULL",
+    )
+    .bind(lib.id.to_string())
+    .fetch_all(&state.db)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_ne!(rows[0].0, extra, "a re-downloaded file is a new item");
+    assert_eq!(rows[0].1, "Trailer");
+    let (_, item) = send_authed(
+        &app,
+        "GET",
+        &format!("/Users/{user}/Items/{}", rows[0].0),
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(item["UserData"]["Played"], false, "{item}");
+}
+
+/// A show's `Extras` folder that an older scan stored as a specials season: the next scan makes its
+/// episodes the series' extras, keeping their ids and user data, and removes the season left empty.
+#[tokio::test]
+async fn r3extras2_an_old_extras_season_becomes_series_extras_and_goes() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, user) = admin_session(&state).await;
+    let root = std::path::PathBuf::from(media_folder(&state, "r3extras2 old extras"));
+    let show = root.join("Show");
+    if !r3extras_media(&show.join("Season 1/S01E01.mkv"), false) {
+        return;
+    }
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: "R3 Extras2 Old".to_string(),
+        content_type: rustyfin_model::library::LibraryContentType::TvShows,
+        paths: vec![root.to_str().unwrap().to_string()],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    r3extras_rescan(&state, &lib).await;
+    let series = r3extras2_id(&state, &lib, "Show").await;
+
+    // What an older scan stored for `Show/Extras/Gag Reel.mkv`: season 0 at the folder, an episode in it.
+    let gag = show.join("Extras/Gag Reel.mkv");
+    assert!(r3extras_media(&gag, false));
+    let season = uuid::Uuid::new_v4().to_string();
+    let episode = uuid::Uuid::new_v4().to_string();
+    for (id, name, media_type, path, parent, index) in [
+        (&season, "Extras", "Season", show.join("Extras"), &series, 0),
+        (&episode, "Gag Reel", "Episode", gag.clone(), &season, 1),
+    ] {
+        sqlx::query(
+            "INSERT INTO media_items (id, library_id, name, media_type, path, parent_id, index_number)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(lib.id.to_string())
+        .bind(name)
+        .bind(media_type)
+        .bind(path.to_str().unwrap())
+        .bind(parent)
+        .bind(index)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    }
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        &format!("/Users/{user}/PlayedItems/{episode}"),
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    r3extras_rescan(&state, &lib).await;
+    let rows = r3extras_rows(&state, &lib).await;
+    assert_eq!(
+        rows,
+        [
+            (
+                "Gag Reel".to_string(),
+                "Video".to_string(),
+                Some("Unknown".to_string())
+            ),
+            ("S01E01".to_string(), "Episode".to_string(), None),
+            ("Season 1".to_string(), "Season".to_string(), None),
+            ("Show".to_string(), "Series".to_string(), None),
+        ],
+        "the empty Extras season is gone"
+    );
+    let (_, features) = send_authed(
+        &app,
+        "GET",
+        &format!("/Items/{series}/SpecialFeatures"),
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(r3extras_ids(&features), [episode.clone()]);
+    let (_, item) = send_authed(
+        &app,
+        "GET",
+        &format!("/Users/{user}/Items/{episode}"),
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(item["UserData"]["Played"], true, "{item}");
 }
 
 #[tokio::test]

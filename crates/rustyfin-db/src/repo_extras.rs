@@ -286,23 +286,19 @@ pub async fn extra_counts(
         .collect())
 }
 
-/// The ids of the library items (not extras) that have an extra with one of `types` (`has`), or that have
-/// none (`!has`): `/Items?HasTrailer`, `HasSpecialFeature`, `HasThemeSong` and `HasThemeVideo`.
-pub async fn item_ids_by_extras(
+/// The ids of the items that own an extra with one of `types`: `/Items?HasTrailer`, `HasSpecialFeature`,
+/// `HasThemeSong` and `HasThemeVideo` keep (true) or leave out (false) these. Only owners are read, so the
+/// list is as long as the items that have such extras, never the whole library.
+pub async fn owners_with_extras(
     pool: &SqlitePool,
     types: &[&str],
-    has: bool,
 ) -> Result<Vec<String>, sqlx::Error> {
     let types = serde_json::to_string(types).unwrap_or_else(|_| "[]".to_string());
     sqlx::query_scalar(
-        "SELECT m.id FROM media_items AS m
-         WHERE m.extra_type IS NULL
-           AND EXISTS (SELECT 1 FROM media_items AS e
-                       WHERE e.owner_id = m.id
-                         AND e.extra_type IN (SELECT value FROM json_each(?1))) = ?2",
+        "SELECT DISTINCT owner_id FROM media_items
+         WHERE owner_id IS NOT NULL AND extra_type IN (SELECT value FROM json_each(?1))",
     )
     .bind(types)
-    .bind(has)
     .fetch_all(pool)
     .await
 }

@@ -2348,6 +2348,21 @@ fn parse_ids(value: Option<&str>) -> Vec<Uuid> {
 }
 
 /// The ids of `kept` (all items when `None`) that are also in `ids`.
+/// The hidden items' filter (`HiddenItems::json`: `{"h": [ids], "l": [libraries]}`) that also hides `ids`.
+fn hide_also(hidden: Option<String>, ids: Vec<String>) -> Option<String> {
+    if ids.is_empty() {
+        return hidden;
+    }
+    let mut filter = hidden
+        .and_then(|json| serde_json::from_str::<Value>(&json).ok())
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    let mut all: Vec<Value> = filter["h"].as_array().cloned().unwrap_or_default();
+    all.extend(ids.into_iter().map(Value::String));
+    filter["h"] = Value::Array(all);
+    Some(filter.to_string())
+}
+
 fn narrow_ids(kept: Option<Vec<String>>, ids: Vec<String>) -> Vec<String> {
     match kept {
         Some(kept) => {
@@ -2514,7 +2529,9 @@ async fn get_items(
         item_ids = Some(narrow_ids(item_ids, ids));
     }
     // HasTrailer, HasSpecialFeature, HasThemeSong and HasThemeVideo: by the item's own extras, the way
-    // LocalTrailerCount and SpecialFeatureCount count them.
+    // LocalTrailerCount and SpecialFeatureCount count them. True keeps only their owners; false leaves the
+    // owners out with the hidden items, so neither reads the ids of the whole library.
+    let mut without: Vec<String> = Vec::new();
     for (has, types) in [
         (query.has_trailer(), &["Trailer"][..]),
         (query.has_special_feature(), SPECIAL_FEATURE_TYPES),
@@ -2522,13 +2539,16 @@ async fn get_items(
         (query.has_theme_video(), &["ThemeVideo"][..]),
     ] {
         if let Some(has) = has {
-            let ids =
-                rustyfin_db::repo_extras::item_ids_by_extras(&state.db_ro, types, has).await?;
-            item_ids = Some(narrow_ids(item_ids, ids));
+            let ids = rustyfin_db::repo_extras::owners_with_extras(&state.db_ro, types).await?;
+            if has {
+                item_ids = Some(narrow_ids(item_ids, ids));
+            } else {
+                without.extend(ids);
+            }
         }
     }
     let hidden = HiddenItems::for_caller(&state, &claims).await?;
-    let hidden_json = hidden.json();
+    let hidden_json = hide_also(hidden.json(), without);
 
     let (items, total) = rustyfin_db::repo_media::get_items_filtered(
         &state.db_ro,
