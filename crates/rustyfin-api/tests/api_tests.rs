@@ -2423,7 +2423,7 @@ async fn r2admin_encoding_configuration() {
         encoding["TranscodingTempPath"]
             .as_str()
             .unwrap()
-            .ends_with("transcode"),
+            .ends_with("transcodes"),
         "{encoding}"
     );
 
@@ -2455,6 +2455,150 @@ async fn r2admin_encoding_configuration() {
     // The main configuration has no "encoding" field.
     let (_, config) = send_authed(&app, "GET", "/System/Configuration", &admin, None).await;
     assert!(config.get("encoding").is_none(), "{config}");
+}
+
+// ── r3transcoding: encoding options reach the transcoder ──
+
+// The dashboard's Playback tab shows and reads back the encoding options and the resume and
+// bitrate settings (tests/web/r3transcoding_playback_admin.mjs).
+#[test]
+fn r3transcoding_web_playback_admin() {
+    b124_node_test("r3transcoding_playback_admin.mjs");
+}
+
+#[tokio::test]
+async fn r3transcoding_encoding_options_round_trip_and_reach_the_transcoder() {
+    use rustyfin_core::encoding::HardwareAccelerationType;
+    let (state, app, admin, (bob, _), _path) = r2admin_world().await;
+    // Any signed-in user reads them, as in Jellyfin, but not the devices and paths
+    let (status, public) =
+        send_authed(&app, "GET", "/System/Configuration/encoding", &bob, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(public["H264Crf"], 23, "{public}");
+    assert_eq!(public["HardwareAccelerationType"], "none", "{public}");
+    for private in [
+        "VaapiDevice",
+        "QsvDevice",
+        "TranscodingTempPath",
+        "EncoderAppPath",
+        "EncoderAppPathDisplay",
+        "FallbackFontPath",
+    ] {
+        assert!(public.get(private).is_none(), "{private} in {public}");
+    }
+    // Only administrators save them
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        "/System/Configuration/encoding",
+        &bob,
+        Some("{}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    // The defaults match the transcode folder in use
+    let (_, mut encoding) =
+        send_authed(&app, "GET", "/System/Configuration/encoding", &admin, None).await;
+    assert_eq!(
+        encoding["TranscodingTempPath"],
+        state
+            .transcode_manager
+            .cache_root()
+            .to_string_lossy()
+            .as_ref(),
+        "{encoding}"
+    );
+
+    encoding["HardwareAccelerationType"] = serde_json::json!("vaapi");
+    encoding["VaapiDevice"] = serde_json::json!("/dev/dri/renderD129");
+    encoding["HardwareDecodingCodecs"] = serde_json::json!(["h264", "hevc"]);
+    encoding["H264Crf"] = serde_json::json!(19);
+    encoding["EncoderPreset"] = serde_json::json!("slow");
+    encoding["EncodingThreadCount"] = serde_json::json!(3);
+    encoding["AllowHevcEncoding"] = serde_json::json!(true);
+    encoding["EnableTonemapping"] = serde_json::json!(true);
+    encoding["DownMixStereoAlgorithm"] = serde_json::json!("Dave750");
+    encoding["EnableThrottling"] = serde_json::json!(true);
+    encoding["R3FutureOption"] = serde_json::json!({ "Nested": [1, "two"] });
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        "/System/Configuration/encoding",
+        &admin,
+        Some(&encoding.to_string()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, saved) = send_authed(&app, "GET", "/System/Configuration/encoding", &admin, None).await;
+    // Everything comes back as it was posted, unknown fields included
+    assert_eq!(saved, encoding);
+
+    let settings = state.transcode_manager.encoding_settings();
+    assert_eq!(
+        settings.hardware_acceleration,
+        HardwareAccelerationType::Vaapi
+    );
+    assert_eq!(settings.vaapi_device, "/dev/dri/renderD129");
+    assert_eq!(settings.hardware_decoding_codecs, ["h264", "hevc"]);
+    assert_eq!(settings.h264_crf, 19);
+    assert_eq!(settings.encoder_preset, "slow");
+    assert_eq!(settings.thread_count, 3);
+    assert!(settings.allow_hevc_encoding && settings.enable_tonemapping);
+    assert_eq!(settings.downmix_stereo_algorithm, "Dave750");
+
+    // A user who isn't an administrator doesn't see the saved device either
+    let (_, public) = send_authed(&app, "GET", "/System/Configuration/encoding", &bob, None).await;
+    assert!(public.get("VaapiDevice").is_none(), "{public}");
+    assert_eq!(public["H264Crf"], 19, "{public}");
+
+    // Out-of-range numbers, unknown enum values and bad devices are refused, and nothing changes
+    for (field, value) in [
+        ("H264Crf", serde_json::json!(60)),
+        ("EncodingThreadCount", serde_json::json!(-5)),
+        ("HardwareAccelerationType", serde_json::json!("cuda")),
+        ("EncoderPreset", serde_json::json!("turbo")),
+        ("DownMixStereoAlgorithm", serde_json::json!("Surround")),
+        ("TonemappingAlgorithm", serde_json::json!("aces")),
+        (
+            "VaapiDevice",
+            serde_json::json!("/dev/dri/renderD128,driver=iHD"),
+        ),
+        ("QsvDevice", serde_json::json!("renderD128")),
+    ] {
+        let mut bad = encoding.clone();
+        bad[field] = value;
+        let (status, _) = send_authed(
+            &app,
+            "POST",
+            "/System/Configuration/encoding",
+            &admin,
+            Some(&bad.to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{field}");
+    }
+    assert_eq!(state.transcode_manager.encoding_settings().h264_crf, 19);
+
+    // A type Rustyfin stores only is saved without an error, and transcodes in software
+    encoding["HardwareAccelerationType"] = serde_json::json!("videotoolbox");
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        "/System/Configuration/encoding",
+        &admin,
+        Some(&encoding.to_string()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let settings = state.transcode_manager.encoding_settings();
+    assert_eq!(
+        settings.hardware_acceleration,
+        HardwareAccelerationType::VideoToolbox
+    );
+    assert_eq!(
+        settings.hardware_acceleration.transcoder_accel(),
+        rustyfin_core::transcode::HwAccel::None
+    );
 }
 
 #[tokio::test]
@@ -3253,6 +3397,7 @@ const B124_WEB_MODULES: &[&str] = &[
     "library.js",
     "metadata-admin.js",
     "music.js",
+    "playback-admin.js",
     "player.js",
     "playerprefs.js",
     "plugins.js",
