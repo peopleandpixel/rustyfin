@@ -32,15 +32,23 @@ async fn get_scheduled_tasks(
     Ok(Json(tasks))
 }
 
+/// POST /ScheduledTasks/{taskId}/Triggers - replaces the task's triggers (daily, weekly,
+/// interval, startup) and keeps them over a restart: 204. A trigger the scheduler cannot use is
+/// 400, an unknown task 404.
 async fn set_task_triggers(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(triggers): Json<Vec<TaskTriggerInfo>>,
 ) -> Result<StatusCode, ApiError> {
-    if state.task_scheduler.set_triggers(&id, triggers).await {
-        Ok(StatusCode::NO_CONTENT)
-    } else {
-        Err(ApiError::NotFound(format!("task '{}' not found", id)))
+    if let Some(problem) = triggers.iter().find_map(|t| t.validate().err()) {
+        return Err(ApiError::BadRequest(problem));
+    }
+    match state.task_scheduler.set_triggers(&id, triggers).await {
+        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        Ok(false) => Err(ApiError::NotFound(format!("task '{}' not found", id))),
+        Err(e) => Err(ApiError::Internal(format!(
+            "The triggers apply now but could not be saved: {e}"
+        ))),
     }
 }
 

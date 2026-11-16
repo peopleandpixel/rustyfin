@@ -36,8 +36,13 @@ pub fn setup_routes() -> Router<AppState> {
         .route("/Library/VirtualFolders/{id}", delete(remove_library))
         .route(
             "/Library/VirtualFolders/Paths",
-            delete(remove_library_paths),
+            post(add_media_path).delete(remove_library_paths),
         )
+        .route(
+            "/Library/VirtualFolders/Paths/Update",
+            post(update_media_path),
+        )
+        .route("/Library/VirtualFolders/Name", post(rename_virtual_folder))
         .route(
             "/Library/{id}/Options",
             get(get_library_options).post(update_library_options),
@@ -651,45 +656,251 @@ async fn update_virtual_folder_options(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// DELETE /Library/VirtualFolders/Paths - Remove library paths
+/// Whether two library names are the same without case, in any script (not only ASCII).
+fn same_name(a: &str, b: &str) -> bool {
+    a.to_lowercase() == b.to_lowercase()
+}
+
+/// Whether two folder paths name the same folder: a trailing `/` makes no difference.
+fn same_folder(a: &str, b: &str) -> bool {
+    let trim = |p: &str| match p.trim_end_matches('/') {
+        "" if p.starts_with('/') => "/".to_string(),
+        t => t.to_string(),
+    };
+    trim(a) == trim(b)
+}
+
+/// The library named `name`, as Jellyfin finds a virtual folder by name: exact, else without case.
+async fn library_named(state: &AppState, name: &str) -> Result<Library, ApiError> {
+    let libs = rustyfin_db::repo_library::get_all_libraries(&state.db).await?;
+    let exact = libs.iter().position(|l| l.name == name);
+    let index = exact.or_else(|| libs.iter().position(|l| same_name(&l.name, name)));
+    index
+        .map(|i| libs[i].clone())
+        .ok_or_else(|| ApiError::NotFound(format!("The library \"{name}\" does not exist.")))
+}
+
+/// Saves a library's new folders, and scans it in the background when `refresh` asks to.
+async fn store_paths(
+    state: &AppState,
+    lib: &Library,
+    paths: &[String],
+    refresh: bool,
+) -> Result<(), ApiError> {
+    rustyfin_db::repo_library::update_library_paths(&state.db, lib.id, paths).await?;
+    state.cache.invalidate_library_lists();
+    state.task_scheduler.watcher().libraries_changed();
+    if refresh {
+        scan_in_background(state, lib.id);
+    }
+    Ok(())
+}
+
+/// Starts a scan of the library `id` that the request does not wait for (`refreshLibrary=true`).
+fn scan_in_background(state: &AppState, id: Uuid) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        if let Err(e) = scan_library(State(state), Path(id)).await {
+            tracing::warn!(library = %id, error = ?e, "library scan after a library change failed");
+        }
+    });
+}
+
+/// Jellyfin's `MediaPathInfo`.
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "PascalCase")]
+struct MediaPathInfo {
+    #[serde(default)]
+    path: Option<String>,
+}
+
+/// Jellyfin's `AddMediaPathDto` and `UpdateMediaPathRequestDto`: the library's name and a folder,
+/// in `Path` or `PathInfo.Path`.
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct MediaPathBody {
+    name: String,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    path_info: Option<MediaPathInfo>,
+}
+
+impl MediaPathBody {
+    fn folder(&self) -> Result<String, ApiError> {
+        self.path
+            .clone()
+            .or_else(|| self.path_info.as_ref().and_then(|p| p.path.clone()))
+            .filter(|p| !p.trim().is_empty())
+            .ok_or_else(|| ApiError::BadRequest("Path or PathInfo.Path is required".into()))
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct RefreshQuery {
+    #[serde(default, rename = "refreshLibrary", alias = "RefreshLibrary")]
+    refresh_library: bool,
+}
+
+/// POST /Library/VirtualFolders/Paths - adds a folder to the library `Name`. Answers 204; an
+/// unknown library is 404, a folder the server cannot use or one the library has already is 400.
+async fn add_media_path(
+    State(state): State<AppState>,
+    Query(q): Query<RefreshQuery>,
+    Json(body): Json<MediaPathBody>,
+) -> Result<StatusCode, ApiError> {
+    let folder = body.folder()?;
+    let lib = library_named(&state, &body.name).await?;
+    if let Some((_, sentence)) = path_problem(&folder).await {
+        return Err(ApiError::BadRequest(sentence));
+    }
+    if lib.paths.iter().any(|p| same_folder(p, &folder)) {
+        return Err(ApiError::BadRequest(format!(
+            "The folder \"{folder}\" is already in the library."
+        )));
+    }
+    let mut paths = lib.paths.clone();
+    paths.push(folder);
+    store_paths(&state, &lib, &paths, q.refresh_library).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// POST /Library/VirtualFolders/Paths/Update - Jellyfin's update of one folder's `PathInfo`, found
+/// by its path. Rustyfin keeps no other folder settings, so it checks the folder and answers 204.
+/// An unknown library is 404, a folder the library does not have is 400.
+async fn update_media_path(
+    State(state): State<AppState>,
+    Json(body): Json<MediaPathBody>,
+) -> Result<StatusCode, ApiError> {
+    let folder = body.folder()?;
+    let lib = library_named(&state, &body.name).await?;
+    if !lib.paths.iter().any(|p| same_folder(p, &folder)) {
+        return Err(ApiError::BadRequest(format!(
+            "The library has no folder \"{folder}\"."
+        )));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// The query of DELETE /Library/VirtualFolders/Paths.
+#[derive(Deserialize, Default)]
+struct RemovePathQuery {
+    #[serde(default, alias = "Name")]
+    name: Option<String>,
+    #[serde(default, alias = "Path")]
+    path: Option<String>,
+    #[serde(default, rename = "refreshLibrary", alias = "RefreshLibrary")]
+    refresh_library: bool,
+}
+
+/// Saves the library without the folders `removed`. A library keeps at least one folder: taking
+/// its last is 400.
+async fn remove_folders(
+    state: &AppState,
+    lib: &Library,
+    removed: &[&str],
+    refresh: bool,
+) -> Result<(), ApiError> {
+    let kept: Vec<String> = lib
+        .paths
+        .iter()
+        .filter(|p| !removed.iter().any(|r| same_folder(p, r)))
+        .cloned()
+        .collect();
+    if kept.is_empty() {
+        return Err(ApiError::BadRequest(
+            "A library needs at least one folder; delete the library instead.".into(),
+        ));
+    }
+    store_paths(state, lib, &kept, refresh).await?;
+    // Their items leave the library now: a scan prunes only under the folders it still has
+    for folder in lib.paths.iter().filter(|p| !kept.contains(p)) {
+        let gone =
+            rustyfin_core::scan_sync::remove_items_under(&state.db, lib.id, folder, &kept).await?;
+        tracing::info!(library = %lib.id, folder, gone, "removed the items of a folder taken out of the library");
+    }
+    state.cache.invalidate_library_lists();
+    Ok(())
+}
+
+/// DELETE /Library/VirtualFolders/Paths?name=&path= - Jellyfin's removal of one folder from a
+/// library: 204, 404 for an unknown library or a folder it does not have, 400 for its last
+/// folder. Rustyfin's earlier body (`{LibraryId, Paths}`) still works and answers `{}`.
 async fn remove_library_paths(
     State(state): State<AppState>,
-    Json(body): Json<serde_json::Value>,
-) -> Result<Json<Value>, ApiError> {
-    // Extract libraryId and paths from the request body
+    Query(q): Query<RemovePathQuery>,
+    body: axum::body::Bytes,
+) -> Result<axum::response::Response, ApiError> {
+    use axum::response::IntoResponse;
+    if let (Some(name), Some(path)) = (&q.name, &q.path) {
+        let lib = library_named(&state, name).await?;
+        if !lib.paths.iter().any(|p| same_folder(p, path)) {
+            return Err(ApiError::NotFound(format!(
+                "The library has no folder \"{path}\"."
+            )));
+        }
+        remove_folders(&state, &lib, &[path.as_str()], q.refresh_library).await?;
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    }
+
+    let body: Value = serde_json::from_slice(&body)
+        .map_err(|_| ApiError::BadRequest("name and path are required".into()))?;
     let library_id = body
         .get("LibraryId")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| ApiError::BadRequest("LibraryId is required".to_string()))?;
+        .ok_or_else(|| ApiError::BadRequest("name and path are required".into()))?;
+    let lib_id = Uuid::parse_str(library_id)
+        .map_err(|e| ApiError::BadRequest(format!("Invalid LibraryId: {}", e)))?;
     let paths = body
         .get("Paths")
         .and_then(|v| v.as_array())
         .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<&str>>())
         .unwrap_or_default();
-
-    let lib_id = Uuid::parse_str(library_id)
-        .map_err(|e| ApiError::BadRequest(format!("Invalid LibraryId: {}", e)))?;
-
-    // Get the current library
-    let lib = rustyfin_db::repo_library::get_library_by_id(&state.db_ro, lib_id)
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?
+    let lib = rustyfin_db::repo_library::get_library_by_id(&state.db, lib_id)
+        .await?
         .ok_or_else(|| ApiError::NotFound("Library not found".to_string()))?;
+    remove_folders(&state, &lib, &paths, false).await?;
+    Ok(Json(json!({})).into_response())
+}
 
-    // Remove the specified paths
-    let new_paths: Vec<String> = lib
-        .paths
-        .into_iter()
-        .filter(|p| !paths.contains(&p.as_str()))
-        .collect();
+/// The query of POST /Library/VirtualFolders/Name.
+#[derive(Deserialize, Default)]
+struct RenameQuery {
+    #[serde(default, alias = "Name")]
+    name: Option<String>,
+    #[serde(default, rename = "newName", alias = "NewName")]
+    new_name: Option<String>,
+    #[serde(default, rename = "refreshLibrary", alias = "RefreshLibrary")]
+    refresh_library: bool,
+}
 
-    // Update the library
-    rustyfin_db::repo_library::update_library_paths(&state.db, lib_id, &new_paths)
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
-    state.task_scheduler.watcher().libraries_changed();
-
-    Ok(Json(json!({})))
+/// POST /Library/VirtualFolders/Name?name=&newName= - renames a library: 204. A missing or blank
+/// name is 400, an unknown library 404, and a name another library has already 400, as Jellyfin.
+async fn rename_virtual_folder(
+    State(state): State<AppState>,
+    Query(q): Query<RenameQuery>,
+) -> Result<StatusCode, ApiError> {
+    let name = q.name.as_deref().map(str::trim).unwrap_or_default();
+    let new_name = q.new_name.as_deref().map(str::trim).unwrap_or_default();
+    if name.is_empty() || new_name.is_empty() {
+        return Err(ApiError::BadRequest("name and newName are required".into()));
+    }
+    let lib = library_named(&state, name).await?;
+    let libs = rustyfin_db::repo_library::get_all_libraries(&state.db).await?;
+    if libs
+        .iter()
+        .any(|l| l.id != lib.id && same_name(&l.name, new_name))
+    {
+        return Err(ApiError::BadRequest(format!(
+            "A library named \"{new_name}\" already exists."
+        )));
+    }
+    rustyfin_db::repo_library::rename_library(&state.db, lib.id, new_name).await?;
+    state.cache.invalidate_library_lists();
+    if q.refresh_library {
+        scan_in_background(&state, lib.id);
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// GET /Library/ModifiedVolumes - Get modified volumes
@@ -808,6 +1019,23 @@ async fn browse_directories(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn r3admin_folders_match_with_or_without_a_trailing_slash() {
+        assert!(same_folder("/media/films", "/media/films/"));
+        assert!(same_folder("/media/films//", "/media/films"));
+        assert!(same_folder("/", "/"));
+        assert!(!same_folder("/media/films", "/media/film"));
+        assert!(!same_folder("/media/Films", "/media/films"));
+    }
+
+    #[test]
+    fn r3admin_names_match_without_case_in_any_script() {
+        assert!(same_name("Filme", "FILME"));
+        assert!(same_name("Ärzte", "ärzte"));
+        assert!(same_name("ΤΑΙΝΊΕΣ", "ταινίες"));
+        assert!(!same_name("Films", "Shows"));
+    }
 
     #[test]
     fn test_libraries_to_views_empty() {

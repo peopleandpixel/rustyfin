@@ -27,7 +27,7 @@ Rustyfin wird über Umgebungsvariablen konfiguriert. Es sind keine Konfiguration
 | `RUSTYFIN_NETWORK_READ_JOBS` | Wie viele Hintergrundaufträge, die eine ganze Mediendatei lesen (Intro-Erkennung, Trickplay-Bilder, wenn nicht zu Schlüsselbildern gesprungen wird), gleichzeitig von einer Netzwerkfreigabe lesen. Ein solcher Lesevorgang lastet die Leitung meist schon aus; weitere gleichzeitig bringen nur Suchzugriffe und Speicherbedarf. Als lokal gelten die Dateisysteme, die auch die Ordnerüberwachung als lokal kennt (ext4, xfs, btrfs, zfs usw.), und FUSE-Pools aus lokalen Platten: `fuse.mergerfs` und `fuse.shfs` (die Benutzerfreigaben von Unraid). Alles andere gilt als Netzwerkfreigabe: NFS, SMB, FUSE-Einhängungen entfernter Speicher wie rclone (`fuse.rclone`) und sshfs (`fuse.sshfs`) sowie ein Dateisystem, dessen Typ sich nicht lesen lässt. Für eine schnelle Netzwerkfreigabe kann man den Wert erhöhen; lokale Platten begrenzt nur `RUSTYFIN_IMAGE_JOBS`. Erlaubt sind 1 bis 16 | 1 |
 | `RUST_LOG` | Log-Level-Filter (z.B. `debug`, `info`, `rustyfin=trace`) | `info` |
 | `RUSTYFIN_LOG_HISTORY` | Anzahl der letzten Log-Zeilen, die das Live-Log der Verwaltung beim Öffnen erhält (`0` behält keine, höchstens `100000`; je Zeile bis zu 8 KiB) | `1000` |
-| `TZ` | Zeitzone des Servers (z.B. `Europe/Berlin`). Die Zugriffszeiten der Benutzer gelten in dieser Zeit, siehe [Zugriffszeiten](#zugriffszeiten) | Zeitzone des Systems; in einem Container ohne `TZ` meist UTC |
+| `TZ` | Zeitzone des Servers (z.B. `Europe/Berlin`). Die Zugriffszeiten der Benutzer und die täglichen und wöchentlichen Auslöser der geplanten Aufgaben gelten in dieser Zeit, siehe [Zugriffszeiten](#zugriffszeiten) und [Geplante Aufgaben](#geplante-aufgaben) | Zeitzone des Systems; in einem Container ohne `TZ` meist UTC |
 
 ## Beispielkonfigurationen
 
@@ -158,7 +158,19 @@ curl -H "Authorization: MediaBrowser Token=<api-key>" \
 
 ### Quick Connect
 
-Quick Connect ermöglicht die Anmeldung ohne Passwort über einen temporären Code. Diese Funktion ist standardmäßig aktiviert.
+Quick Connect ermöglicht die Anmeldung ohne Passwort über einen temporären Code. Diese Funktion ist standardmäßig aktiviert; ausschalten lässt sie sich im Dashboard unter Allgemein (`QuickConnectAvailable`). Ist sie aus, antworten ihre Endpunkte mit 401. Eine `config.json` aus einer älteren Version, in der die Einstellung noch nichts bewirkte, behält Quick Connect beim ersten Start einmalig an.
+
+### Geplante Aufgaben
+
+Jede geplante Aufgabe (Dashboard → Aufgaben → Auslöser) läuft, wenn einer ihrer Auslöser es sagt, wie bei Jellyfin:
+
+- **Intervall**: in diesem Abstand nach dem Ende des letzten Laufs;
+- **Täglich** und **Wöchentlich**: zu dieser Uhrzeit (am gewählten Wochentag) in der **Ortszeit des Servers**. In Docker ist das ohne `TZ` UTC: Setze `TZ` (z.B. `TZ=Europe/Berlin`), sonst läuft eine Aufgabe für „03:00“ um 03:00 UTC;
+- **Beim Start**: einmal kurz nach dem Start des Servers. Ein Lauf von Hand verbraucht ihn nicht.
+
+Eine Aufgabe ohne Auslöser läuft nur, wenn sie von Hand gestartet wird. Läuft eine Aufgabe schon, wird ein weiterer Start (von Hand oder durch einen Auslöser) übersprungen. Geänderte Auslöser stehen in `scheduled_task_triggers.json` im Datenverzeichnis, nur für die Aufgaben, deren Auslöser von den eingebauten abweichen.
+
+`MaxRuntimeTicks` eines Auslösers begrenzt die Laufzeit eines von Auslösern gestarteten Laufs bei den Kapitelbildern, den Trickplay-Bildern und der Intro-Erkennung: danach wird der Lauf angehalten wie mit „Stopp“. Bei den anderen Aufgaben wird der Wert nur gespeichert.
 
 ### Zugriffszeiten
 
