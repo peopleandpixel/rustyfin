@@ -12,6 +12,7 @@ import {
 } from './modules/auth.js';
 import './modules/home.js';
 import { posterLoaded, posterFailed } from './modules/library.js';
+import './modules/music.js';
 import './modules/item.js';
 import { doSearch } from './modules/search.js';
 import {

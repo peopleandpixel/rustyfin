@@ -827,6 +827,66 @@ select.jf-input {
   transform: translateX(4px);
 }
 
+/* A music library's tabs (albums, artists, songs, genres) */
+.jf-tabs {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 1.5rem;
+  padding-bottom: 0.5rem;
+  overflow-x: auto;
+}
+
+.jf-tab {
+  padding: 0.5rem 1rem;
+  border-radius: 0.75rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+  white-space: nowrap;
+  background: rgb(255 255 255 / 0.05);
+  color: rgb(255 255 255 / 0.6);
+  transition: background 0.15s ease;
+}
+
+.jf-tab:hover {
+  background: rgb(255 255 255 / 0.1);
+}
+
+.jf-tab[aria-selected="true"] {
+  background: #00a4dc;
+  color: #fff;
+}
+
+/* Album and song track rows: number, title, length */
+.jf-track-row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.5rem 0.75rem;
+  border-radius: 0.5rem;
+  cursor: pointer;
+}
+
+.jf-track-row:hover,
+.jf-track-row:focus-visible {
+  background: var(--jf-bg-surface);
+}
+
+.jf-track-number {
+  width: 2rem;
+  flex-shrink: 0;
+  text-align: right;
+  font-size: 0.8rem;
+  color: rgb(255 255 255 / 0.5);
+  font-variant-numeric: tabular-nums;
+}
+
+.jf-track-duration {
+  flex-shrink: 0;
+  font-size: 0.75rem;
+  color: rgb(255 255 255 / 0.5);
+  font-variant-numeric: tabular-nums;
+}
+
 /* Player Custom Overlay */
 .jf-player-container {
   position: relative;

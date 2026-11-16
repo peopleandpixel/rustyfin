@@ -139,7 +139,7 @@
     },
     "nav": {
         "toggle_menu": "Menü ein-/ausblenden",
-        "search_placeholder": "Filme, Serien, Musik suchen… (Drücke Enter)",
+        "search_placeholder": "Filme, Serien, Musik suchen…",
         "connect": "Connect",
         "add_new_library": "Neue Bibliothek hinzufügen",
         "signed_in": "Angemeldet",
@@ -426,6 +426,8 @@
         "more_info": "Details & Info",
         "my_media": "Meine Bibliotheken",
         "continue_watching": "Weiterschauen",
+        "continue_listening": "Weiterhören",
+        "latest_in": "Neu in {{name}}",
         "next_up": "Als Nächstes (Serien)",
         "recently_added": "Zuletzt hinzugefügt",
         "empty_title": "Deine Bibliothek ist noch leer",
@@ -476,7 +478,30 @@
     },
     "search": {
         "no_results": "Keine Treffer für „{{term}}\"",
-        "results_for": "Suchergebnisse für „{{term}}\" ({{count}})"
+        "results_for": "Suchergebnisse für „{{term}}\" ({{count}})",
+        "section_movies": "Filme",
+        "section_shows": "Serien",
+        "section_episodes": "Episoden",
+        "section_people": "Personen",
+        "section_playlists": "Wiedergabelisten",
+        "section_artists": "Interpreten",
+        "section_albums": "Alben",
+        "section_songs": "Titel",
+        "section_videos": "Videos",
+        "section_photos": "Fotos",
+        "section_audiobooks": "Hörbücher",
+        "section_books": "Bücher",
+        "section_collections": "Sammlungen"
+    },
+    "music": {
+        "tracks_count": "Titel ({{count}})",
+        "disc": "CD {{number}}",
+        "tabs": "Ansichten der Musikbibliothek",
+        "tab_albums": "Alben",
+        "tab_album_artists": "Albuminterpreten",
+        "tab_artists": "Interpreten",
+        "tab_songs": "Titel",
+        "tab_genres": "Genres"
     },
     "oidc": {
         "sign_in_default": "Mit Single Sign-on anmelden",

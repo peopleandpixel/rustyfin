@@ -43,6 +43,7 @@ function sandbox({ page = 'detail', detailId = 'item-1', refresh, listOpen = fal
     vm.runInContext(
         `var currentPage = ${JSON.stringify(page)}; var currentDetailId = ${JSON.stringify(detailId)};
          var currentLibraryId = 'lib-1';
+         var currentLibraryRoute = 'lib-1';
          ${slice('function icon(')}
          ${slice('async function refreshItemMetadata(')}
          ${slice('function refreshViewAfterLibraryChange(')}
