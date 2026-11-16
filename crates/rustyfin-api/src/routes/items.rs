@@ -2107,6 +2107,12 @@ struct ItemsQuery {
     has_special_feature: Option<bool>,
     #[serde(rename = "hasSpecialFeature")]
     has_special_feature_lower: Option<bool>,
+    has_trailer: Option<bool>,
+    #[serde(rename = "hasTrailer")]
+    has_trailer_lower: Option<bool>,
+    has_theme_video: Option<bool>,
+    #[serde(rename = "hasThemeVideo")]
+    has_theme_video_lower: Option<bool>,
     subtitle_language: Option<String>,
     #[serde(rename = "subtitleLanguage")]
     subtitle_language_lower: Option<String>,
@@ -2359,6 +2365,12 @@ impl ItemsQuery {
     fn has_special_feature(&self) -> Option<bool> {
         self.has_special_feature.or(self.has_special_feature_lower)
     }
+    fn has_trailer(&self) -> Option<bool> {
+        self.has_trailer.or(self.has_trailer_lower)
+    }
+    fn has_theme_video(&self) -> Option<bool> {
+        self.has_theme_video.or(self.has_theme_video_lower)
+    }
     /// The subtitle languages to filter by: Jellyfin's comma list `SubtitleLanguages`, else the
     /// single `SubtitleLanguage` Rustyfin took before. Each code is matched in all its spellings,
     /// so `ger` and `deu` find the same items.
@@ -2404,6 +2416,21 @@ fn parse_ids(value: Option<&str>) -> Vec<Uuid> {
 }
 
 /// The ids of `kept` (all items when `None`) that are also in `ids`.
+/// The hidden items' filter (`HiddenItems::json`: `{"h": [ids], "l": [libraries]}`) that also hides `ids`.
+fn hide_also(hidden: Option<String>, ids: Vec<String>) -> Option<String> {
+    if ids.is_empty() {
+        return hidden;
+    }
+    let mut filter = hidden
+        .and_then(|json| serde_json::from_str::<Value>(&json).ok())
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    let mut all: Vec<Value> = filter["h"].as_array().cloned().unwrap_or_default();
+    all.extend(ids.into_iter().map(Value::String));
+    filter["h"] = Value::Array(all);
+    Some(filter.to_string())
+}
+
 fn narrow_ids(kept: Option<Vec<String>>, ids: Vec<String>) -> Vec<String> {
     match kept {
         Some(kept) => {
@@ -2575,8 +2602,27 @@ async fn get_items(
                 .await?;
         item_ids = Some(narrow_ids(item_ids, ids));
     }
+    // HasTrailer, HasSpecialFeature, HasThemeSong and HasThemeVideo: by the item's own extras, the way
+    // LocalTrailerCount and SpecialFeatureCount count them. True keeps only their owners; false leaves the
+    // owners out with the hidden items, so neither reads the ids of the whole library.
+    let mut without: Vec<String> = Vec::new();
+    for (has, types) in [
+        (query.has_trailer(), &["Trailer"][..]),
+        (query.has_special_feature(), SPECIAL_FEATURE_TYPES),
+        (query.has_theme_song(), &["ThemeSong"][..]),
+        (query.has_theme_video(), &["ThemeVideo"][..]),
+    ] {
+        if let Some(has) = has {
+            let ids = rustyfin_db::repo_extras::owners_with_extras(&state.db_ro, types).await?;
+            if has {
+                item_ids = Some(narrow_ids(item_ids, ids));
+            } else {
+                without.extend(ids);
+            }
+        }
+    }
     let hidden = HiddenItems::for_caller(&state, &claims).await?;
-    let hidden_json = hidden.json();
+    let hidden_json = hide_also(hidden.json(), without);
 
     let (items, total) = rustyfin_db::repo_media::get_items_filtered(
         &state.db_ro,

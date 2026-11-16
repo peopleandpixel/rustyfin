@@ -393,8 +393,9 @@ async function renderDetail(itemId) {
         // Parallel fetch: Children/Seasons/Episodes AND Similar media
         // Previously these were sequential, causing a waterfall effect
         const isContainer = ['Series', 'Season', 'MusicAlbum', 'Folder'].includes(type);
-        // The extras: trailer files for the Trailer button, and special features on movie, series and season pages
-        const showsSpecials = ['Movie', 'Series', 'Season'].includes(type);
+        // The extras: trailer files for the Trailer button, and special features on movie, series, season and
+        // episode pages
+        const showsSpecials = ['Movie', 'Series', 'Season', 'Episode'].includes(type);
         const [childrenData, similarData, localTrailers, specialFeatures] = await Promise.all([
             isContainer ? API.getChildren(id).catch(() => ({ Items: [] })) : Promise.resolve({ Items: [] }),
             API.getSimilar(id).catch(() => ({ Items: [] })),
