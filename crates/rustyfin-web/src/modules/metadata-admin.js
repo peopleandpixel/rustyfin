@@ -35,7 +35,8 @@ function splitList(text) {
 }
 
 // The metadata editor's form values as Jellyfin's item update (POST /Items/{id}). A blank field clears it;
-// an unticked field in "Fields a refresh may change" is locked.
+// an unticked field in "Fields a refresh may change" is locked. The sort title goes only when it was
+// changed, as a blank one sets the sort name back to the title's.
 function itemUpdateBody(values) {
     const text = v => String(v ?? '').trim() || null;
     const number = v => {
@@ -43,10 +44,11 @@ function itemUpdateBody(values) {
         return Number.isFinite(n) ? n : null;
     };
     const year = Number.parseInt(values.year, 10);
+    const sortChanged = text(values.sortName) !== text(values.sortNameBefore);
     return {
         Name: text(values.name),
         OriginalTitle: text(values.originalTitle),
-        ForcedSortName: text(values.sortName),
+        ...(sortChanged ? { ForcedSortName: text(values.sortName) } : {}),
         Overview: text(values.overview),
         Taglines: text(values.tagline) ? [text(values.tagline)] : [],
         ProductionYear: Number.isFinite(year) ? year : null,
@@ -400,6 +402,7 @@ async function openMetadataEditor(id) {
         e.preventDefault();
         const values = Object.fromEntries(['name', 'originalTitle', 'sortName', 'overview', 'tagline', 'year', 'premiereDate',
             'officialRating', 'communityRating', 'criticRating', 'genres', 'tags'].map(name => [name, form[name].value]));
+        values.sortNameBefore = item.ForcedSortName;
         values.lockData = form.lockData.checked;
         values.enabled = Object.fromEntries(LOCKABLE_FIELDS.map(name => [name, form[`enabled-${name}`].checked]));
         try {

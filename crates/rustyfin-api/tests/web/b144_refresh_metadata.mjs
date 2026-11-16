@@ -36,7 +36,10 @@ function sandbox({ page = 'detail', detailId = 'item-1', refresh, listOpen = fal
         renderHome: () => log.push(['renderHome']),
         setTimeout: (fn, ms) => { timers.push([fn, ms]); return timers.length; },
         API: {
-            refreshItem: id => { log.push(['refreshItem', id]); return refresh ? refresh() : Promise.resolve({ status: 'ok' }); },
+            refreshItem: (id, options) => {
+                log.push(options === undefined ? ['refreshItem', id] : ['refreshItem', id, options]);
+                return refresh ? refresh() : Promise.resolve({ status: 'ok' });
+            },
             invalidateCache: prefix => log.push(['invalidateCache', prefix]),
         },
     });
@@ -137,6 +140,28 @@ test('when the refresh ends, the caches are dropped, the open page re-renders an
     assert.deepEqual(log.find(e => e[0] === 'renderDetail'), ['renderDetail', 'item-1']);
     assert.deepEqual(log.find(e => e[0] === 'toast'), ['toast', 'detail.metadata_refreshed', 'success']);
     assert.ok(!log.some(e => e[0] === 'toast' && e[1] === 'detail.metadata_refreshing'), 'no "Refreshing…" toast after the fact');
+});
+
+test("the refresh dialog's options reach the request's query", async () => {
+    const { context, log } = sandbox();
+    const options = { MetadataRefreshMode: 'FullRefresh', ImageRefreshMode: 'FullRefresh', ReplaceAllMetadata: true, ReplaceAllImages: false };
+    await context.refreshItemMetadata(fakeButton(), 'item-1', options);
+    assert.deepEqual(JSON.parse(JSON.stringify(log.find(e => e[0] === 'refreshItem'))), ['refreshItem', 'item-1', options]);
+    // api.js's refreshItem turns them into the query of the POST
+    const api = fs.readFileSync(new URL('../../../rustyfin-web/src/api.js', import.meta.url), 'utf8');
+    const start = api.indexOf('    refreshItem(id, options) {');
+    assert.ok(start >= 0, 'api.js has refreshItem(id, options)');
+    const method = api.slice(start, api.indexOf('\n    },\n', start) + 7);
+    const posts = [];
+    const client = vm.runInNewContext(`({ post(path, body, init) { posts.push([path, body, init]); return 'sent'; },\n${method} })`,
+        { posts, URLSearchParams, AbortSignal: { timeout: ms => `timeout ${ms}` } });
+    client.refreshItem('item-1', options);
+    client.refreshItem('item-2');
+    assert.deepEqual(posts.map(p => p[0]), [
+        '/Items/item-1/Refresh?MetadataRefreshMode=FullRefresh&ImageRefreshMode=FullRefresh&ReplaceAllMetadata=true&ReplaceAllImages=false',
+        '/Items/item-2/Refresh',
+    ]);
+    assert.equal(posts[0][2].signal, 'timeout 120000');
 });
 
 test('a page the user has left is not re-rendered, but the toast still shows', async () => {

@@ -72,10 +72,13 @@ test('the metadata editor saves Jellyfin-shaped fields and locks the unticked fi
         genres: 'Drama, comedy, , drama', tags: '', lockData: false, enabled,
     }));
     assert.deepEqual(body, {
-        Name: 'Alpha', OriginalTitle: null, ForcedSortName: null, Overview: 'Text', Taglines: ['Go'],
+        Name: 'Alpha', OriginalTitle: null, Overview: 'Text', Taglines: ['Go'],
         ProductionYear: 2001, PremiereDate: '2001-05-04T00:00:00.0000000Z', CommunityRating: 7.5, CriticRating: null,
         OfficialRating: 'PG-13', Genres: ['Drama', 'comedy'], Tags: [], LockData: false, LockedFields: ['Overview', 'Cast'],
     });
+    // A sort title goes when it changed; clearing one sends null
+    assert.equal(plain(fns.itemUpdateBody({ name: 'A', sortName: 'a, the', enabled: {} })).ForcedSortName, 'a, the');
+    assert.equal(plain(fns.itemUpdateBody({ name: 'A', sortName: '', sortNameBefore: 'x', enabled: {} })).ForcedSortName, null);
     const locked = plain(fns.itemUpdateBody({ name: 'A', year: '', lockData: true, enabled: {} }));
     assert.equal(locked.LockData, true);
     assert.equal(locked.ProductionYear, null);
