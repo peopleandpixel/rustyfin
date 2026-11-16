@@ -6,7 +6,7 @@ use axum::routing::{delete, get};
 use axum::{Extension, Json, Router};
 use rustyfin_core::tmdb_client::TmdbApi;
 use rustyfin_model::auth::Claims;
-use rustyfin_model::media::{FiltersResult, MediaItem, QueryResult};
+use rustyfin_model::media::{FiltersResult, MediaItem, MediaType, QueryResult};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sqlx::SqlitePool;
@@ -3204,46 +3204,116 @@ struct LimitQuery {
     limit: Option<i64>,
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct LatestQuery {
-    limit: Option<i64>,
-    include_item_types: Option<String>,
-    #[serde(rename = "includeItemTypes")]
-    include_item_types_lower: Option<String>,
-    parent_id: Option<Uuid>,
-    #[serde(rename = "parentId")]
-    parent_id_lower: Option<Uuid>,
-}
-
 async fn get_latest(
     State(state): State<AppState>,
-    Query(query): Query<LatestQuery>,
+    Query(params): Query<Vec<(String, String)>>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<Vec<MediaItem>>, ApiError> {
-    let limit = query.limit.unwrap_or(20);
-    let media_type = query
-        .include_item_types
-        .as_deref()
-        .or(query.include_item_types_lower.as_deref())
-        .map(|s| format!("\"{}\"", s.split(',').next().unwrap_or("").trim()));
-    let library_id = query.parent_id.or(query.parent_id_lower);
-    let hidden = HiddenItems::for_caller(&state, &claims).await?.json();
-    let mut items = rustyfin_db::repo_media::get_latest_items(
-        &state.db_ro,
-        limit,
-        media_type.as_deref(),
-        library_id,
-        hidden.as_deref(),
+    let user = query_user(
+        &state,
+        &claims,
+        crate::query::uuid_param(&params, "userId")?,
     )
-    .await?;
+    .await?
+    .unwrap_or(claims.sub);
+    latest_page(&state, &claims, user, &params).await
+}
+
+/// The "Latest" row (`/Items/Latest`, `/Users/{userId}/Items/Latest`), as Jellyfin's
+/// `UserLibraryController.GetLatestMedia` builds it: `isPlayed` (unset means unplayed only when
+/// the user's `HidePlayedInLatest` is on, and is ignored for a music library), `groupItems`
+/// (default true: two or more new episodes of a series show as the series, new tracks as their
+/// album, each with `ChildCount`), `limit` (default 20) entries, and without `parentId` the
+/// user's `LatestItemsExcludes` libraries left out.
+async fn latest_page(
+    state: &AppState,
+    claims: &Claims,
+    user: Uuid,
+    params: &[(String, String)],
+) -> Result<Json<Vec<MediaItem>>, ApiError> {
+    use crate::query::{bool_param, count_param, item_kinds, parent_param};
+    let limit = count_param(params, "limit")?.unwrap_or(20);
+    let group_items = bool_param(params, "groupItems")?.unwrap_or(true);
+    let library_id = parent_param(params, "parentId")?;
+    let config = rustyfin_db::repo_user::get_user_by_id(&state.db_ro, user)
+        .await?
+        .map(|u| rustyfin_model::user::jellyfin_configuration(&u.configuration))
+        .unwrap_or_default();
+    let mut is_played = bool_param(params, "isPlayed")?;
+    if is_played.is_none() && config["HidePlayedInLatest"].as_bool() != Some(false) {
+        is_played = Some(false);
+    }
+    let mut exclude_libraries = Vec::new();
+    if let Some(library_id) = library_id {
+        let library =
+            rustyfin_db::repo_library::get_library_by_id(&state.db_ro, library_id).await?;
+        if library
+            .is_some_and(|l| l.content_type == rustyfin_model::library::LibraryContentType::Music)
+        {
+            is_played = None;
+        }
+    } else {
+        exclude_libraries = config["LatestItemsExcludes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|id| id.as_str().and_then(|id| Uuid::parse_str(id).ok()))
+            .collect();
+    }
+    let filter = rustyfin_db::repo_media::LatestFilter {
+        user_id: Some(user),
+        item_types: item_kinds(params, "includeItemTypes")
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        library_id,
+        exclude_libraries,
+        is_played,
+        limit: (limit as i64).saturating_mul(5),
+        hidden_ids_json: HiddenItems::for_caller(state, claims).await?.json(),
+    };
+    let candidates = rustyfin_db::repo_media::get_latest_items(&state.db_ro, &filter).await?;
+
+    // Jellyfin's UserViewManager.GetLatestItems: group by container in first-seen order, up to
+    // `limit` groups.
+    let mut groups: Vec<(Option<Uuid>, Vec<MediaItem>)> = Vec::new();
+    for (item, container) in candidates {
+        if groups.len() >= limit {
+            break;
+        }
+        match container.filter(|_| group_items) {
+            Some(id) => match groups.iter_mut().find(|(c, _)| *c == Some(id)) {
+                Some((_, members)) => members.push(item),
+                None => groups.push((Some(id), vec![item])),
+            },
+            None => groups.push((None, vec![item])),
+        }
+    }
+    let mut items = Vec::with_capacity(groups.len());
+    let mut child_counts = Vec::with_capacity(groups.len());
+    for (container, mut members) in groups {
+        let container = match container {
+            Some(id) => rustyfin_db::repo_media::get_item_by_id(&state.db_ro, id).await?,
+            None => None,
+        };
+        match container {
+            Some(c) if members.len() > 1 || c.media_type == MediaType::MusicAlbum => {
+                child_counts.push(members.len() as i32);
+                items.push(c);
+            }
+            _ => {
+                child_counts.push(0);
+                items.push(members.swap_remove(0));
+            }
+        }
+    }
     // Enrich latest items using batch queries
     // Skip blurhash for list views to avoid per-item disk I/O
     let tmdb = state.tmdb.api(None);
     enrich_items(
         &state.db_ro,
         &state.server_id,
-        Some(claims.sub),
+        Some(user),
         &mut items,
         &state.http_client,
         tmdb.as_ref(),
@@ -3251,6 +3321,10 @@ async fn get_latest(
         true, // skip_blurhash for list views
     )
     .await;
+    // Jellyfin sets ChildCount on every entry: the new items in a group, else 0.
+    for (item, count) in items.iter_mut().zip(child_counts) {
+        item.child_count = Some(count);
+    }
     Ok(Json(items))
 }
 
@@ -3274,6 +3348,18 @@ async fn resume_page(
     query: &ResumeQuery,
 ) -> Result<Json<QueryResult>, ApiError> {
     let start_index = query.start_index.unwrap_or(0).max(0);
+    let exclude_active =
+        ResumeQuery::flag("excludeActiveSessions", &query.exclude_active_sessions)?
+            .unwrap_or(false);
+    let count_total =
+        ResumeQuery::flag("enableTotalRecordCount", &query.enable_total_record_count)?
+            .unwrap_or(true);
+    // Jellyfin's `excludeActiveSessions`: leave out what the user's sessions are playing.
+    let exclude_ids = if exclude_active {
+        crate::sessions::now_playing_items(state, user).await?
+    } else {
+        Vec::new()
+    };
     let filter = rustyfin_db::repo_media::ResumeFilter {
         include_types: query.include_types(),
         exclude_types: csv(query.exclude_item_types.as_deref()),
@@ -3281,6 +3367,7 @@ async fn resume_page(
         start_index,
         limit: query.limit.filter(|l| *l >= 0),
         hidden_ids_json: HiddenItems::for_caller(state, claims).await?.json(),
+        exclude_ids,
     };
     let (mut items, total) =
         rustyfin_db::repo_media::get_user_resume_items(&state.db_ro, user, &filter).await?;
@@ -3300,7 +3387,7 @@ async fn resume_page(
     .await;
     Ok(Json(QueryResult {
         items,
-        total_record_count: total,
+        total_record_count: if count_total { total } else { 0 },
         start_index,
     }))
 }
@@ -3334,9 +3421,23 @@ struct ResumeQuery {
     exclude_item_types: Option<String>,
     #[serde(default, alias = "MediaTypes")]
     media_types: Option<String>,
+    #[serde(default, alias = "ExcludeActiveSessions")]
+    exclude_active_sessions: Option<String>,
+    #[serde(default, alias = "EnableTotalRecordCount")]
+    enable_total_record_count: Option<String>,
 }
 
 impl ResumeQuery {
+    /// A boolean parameter (`true`/`false` in any case; blank is unset).
+    fn flag(name: &str, value: &Option<String>) -> Result<Option<bool>, ApiError> {
+        value
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(|v| crate::query::parse_bool(name, v))
+            .transpose()
+    }
+
     /// The stored types to list: `IncludeItemTypes`, narrowed to those of `MediaTypes`. Empty means
     /// any type; when the two leave nothing, a type no item has, so nothing is listed.
     fn include_types(&self) -> Vec<String> {
@@ -3490,11 +3591,12 @@ async fn get_user_items(
 
 async fn get_user_latest(
     State(state): State<AppState>,
-    Path(_user_id): Path<Uuid>,
-    Query(query): Query<LatestQuery>,
+    Path(user_id): Path<Uuid>,
+    Query(params): Query<Vec<(String, String)>>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<Vec<MediaItem>>, ApiError> {
-    get_latest(State(state), Query(query), Extension(claims)).await
+    let user = path_user(&state, &claims, user_id).await?;
+    latest_page(&state, &claims, user, &params).await
 }
 
 async fn get_user_resume(
