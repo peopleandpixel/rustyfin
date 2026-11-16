@@ -1,7 +1,8 @@
 // The player's remembered tracks and keys: the next episode starts with the last one's audio and subtitle
 // tracks (by language, a same-titled track first, as Jellyfin Web's autoSetNextTracks) only while the user
 // keeps RememberAudioSelections and RememberSubtitleSelections on; a remembered subtitle is not used while
-// SubtitleMode is None; C and S toggle subtitles; a focused menu or text field keeps every key.
+// SubtitleMode is None; C and S toggle subtitles; a focused text field keeps every key, a menu only
+// when focused by keyboard.
 // Usage: node r3prefs_player.mjs (run by api_tests.rs r3prefs_player).
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -121,13 +122,23 @@ test('the keys: C and S toggle subtitles; Jellyfin Web\'s Shift+N and Shift+P st
     assert.equal(context.playerKeyAction({ key: 'C', code: 'KeyC', shiftKey: true }), null);
 });
 
-test('a focused menu, text field or editable area keeps every key, focused by mouse or keyboard', () => {
+test('a text field keeps every key; a menu or button only when focused by keyboard; the sliders never', () => {
     const start = playerJs.indexOf('// Global Keyboard Shortcuts');
     const handler = playerJs.slice(start, playerJs.indexOf('\n});\n', start) + 5);
+    // Matches the selector lists the handler uses: tag, [attr] or [attr="v"], and :not([attr="v"])
+    const attrMatches = (el, spec) => {
+        const [, name, value] = /^\[([\w-]+)(?:="([^"]*)")?\]$/.exec(spec);
+        return value === undefined ? name in el.attrs : el.attrs[name] === value;
+    };
+    const partMatches = (el, part) => {
+        const [, tag, attrs, not] = /^([a-z]*)((?:\[[^\]]+\])*)(?::not\((\[[^\]]+\])\))?$/.exec(part.trim());
+        return (!tag || tag === el.tag) && (attrs.match(/\[[^\]]+\]/g) || []).every(a => attrMatches(el, a))
+            && !(not && attrMatches(el, not));
+    };
     class Element {
-        constructor(tag, keyboard) { this.tag = tag; this.keyboard = keyboard; }
+        constructor(tag, keyboard, attrs = {}) { this.tag = tag; this.keyboard = keyboard; this.attrs = attrs; }
         matches(selector) { return selector === ':focus-visible' && this.keyboard; }
-        closest(selector) { return selector.split(', ').some(part => part.startsWith(this.tag)) ? this : null; }
+        closest(selector) { return selector.split(',').some(part => partMatches(this, part)) ? this : null; }
     }
     let listener = null;
     const calls = [];
@@ -145,16 +156,24 @@ test('a focused menu, text field or editable area keeps every key, focused by mo
         listener(e);
         return e.prevented;
     };
-    for (const tag of ['select', 'textarea', 'input', '[contenteditable']) {
+    const keys = [' ', 'ArrowUp', '5', 'c'];
+    const fields = [['textarea'], ['input', { type: 'text' }], ['input', {}], ['div', { contenteditable: 'true' }]];
+    for (const [tag, attrs] of fields) {
         for (const keyboard of [true, false]) {
-            for (const key of [' ', 'ArrowUp', '5', 'c']) assert.equal(press(key, new Element(tag, keyboard)), false, `${tag} ${key}`);
+            for (const key of keys) assert.equal(press(key, new Element(tag, keyboard, attrs)), false, `${tag} ${key}`);
         }
     }
+    for (const tag of ['select', 'button']) {
+        for (const key of keys) assert.equal(press(key, new Element(tag, true)), false, `${tag} by keyboard ${key}`);
+    }
     assert.deepEqual(calls, []);
-    assert.equal(press('c', new Element('button', false)), true);
-    assert.equal(press(' ', new Element('button', true)), false);
+    // A menu opened with the mouse and closed again, a clicked button, the seek and volume sliders
+    // (focused either way) and a non-editable area give the keys to the player
+    const players = [new Element('select', false), new Element('button', false), new Element('input', true, { type: 'range' }),
+        new Element('input', false, { type: 'range' }), new Element('div', false, { contenteditable: 'false' })];
+    for (const target of players) assert.equal(press('ArrowUp', target), true, `${target.tag} ${JSON.stringify(target.attrs)}`);
+    assert.equal(press(' ', new Element('select', false)), true);
+    assert.deepEqual(calls, ['action', 'action', 'action', 'action', 'action', 'play']);
     assert.equal(press('Escape', new Element('select', true)), false);
-    assert.deepEqual(calls, ['action', 'close']);
-    // A menu chosen with the mouse lets go of focus, so the keys work again
-    assert.match(playerJs, /if \(!e\.target\.matches\?\.\(':focus-visible'\)\) e\.target\.blur\?\.\(\);/);
+    assert.equal(calls.at(-1), 'close');
 });

@@ -900,14 +900,7 @@ function playerAutoHide(modal, video, delay = 3000) {
     container.addEventListener('pointerleave', e => { if (e.pointerType !== 'touch') hide(); });
     container.addEventListener('focusin', show);
     container.addEventListener('focusout', e => { if (isSelect(e)) openMenu = null; });
-    // A menu keeps the player's keys while it has focus, so one chosen with the mouse lets go of it
-    container.addEventListener('change', e => {
-        if (isSelect(e)) {
-            openMenu = null;
-            if (!e.target.matches?.(':focus-visible')) e.target.blur?.();
-        }
-        show();
-    });
+    container.addEventListener('change', e => { if (isSelect(e)) openMenu = null; show(); });
     // Runs after the player's shortcuts: a key they took (Space, Alt+Left/Right) opened no popup
     document.addEventListener('keydown', e => {
         if (!modal.open) return;
@@ -2068,12 +2061,13 @@ document.addEventListener('keydown', e => {
     if ($('player-modal')?.open) {
         if (e.key === 'Escape') { closePlayer(); return; }
         if (e.ctrlKey || e.altKey || e.metaKey) return;
-        // A menu or text field keeps its keys (Space, arrows, letters, digits) whenever it has focus; a
-        // button or link only when focused by keyboard. After a click or tap on a button, and on the seek
-        // and volume sliders, the player's keys work.
+        // A text field keeps its keys (Space, arrows, letters, digits) whenever it has focus; a menu,
+        // button or link only when focused by keyboard, so a menu opened with the mouse and closed again
+        // gives the keys back. After a click or tap, and on the seek and volume sliders, the player's
+        // keys work.
         const target = e.target instanceof Element ? e.target : null;
-        const typing = target?.closest('select, textarea, input:not([type="range"]), [contenteditable="true"]');
-        const onControl = target && e.target.matches(':focus-visible') && target.closest('button, a[href]');
+        const typing = target?.closest('textarea, input:not([type="range"]), [contenteditable="true"]');
+        const onControl = target && e.target.matches(':focus-visible') && target.closest('button, select, a[href]');
         if (typing || onControl) return;
         if (e.code === 'Space') {
             e.preventDefault();
