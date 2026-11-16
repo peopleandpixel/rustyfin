@@ -5,6 +5,7 @@ import { currentPage } from './router.js';
 import { renderHome } from './home.js';
 import { currentDetailId, renderDetail, versionLabels } from './item.js';
 import { clearQueue, queueNeighbours, playQueueStep } from './queue.js';
+import { stopThemeSong } from './theme-media.js';
 import {
     trackPrefs, defaultTracks, defaultSubtitleIndex as preferredSubtitleIndex, subtitleAppearance, saveSubtitleAppearance,
     subtitleCss, stepSubtitleOffset, qualityOptions, bitrateLabel, maxStreamingBitrate, setMaxStreamingBitrate,
@@ -601,8 +602,9 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
     playLoading = request;
     if (!queued) clearQueue();
 
-    // Report a session that is still playing as stopped before starting another
+    // Report a session that is still playing as stopped before starting another; a theme song stops too
     stopPlayback();
+    stopThemeSong();
 
     // Destroy any existing HLS instance
     if (hlsInstance) {

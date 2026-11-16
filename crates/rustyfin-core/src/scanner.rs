@@ -11,6 +11,7 @@ use tokio::fs;
 use tokio::sync::{Mutex, MutexGuard};
 use uuid::Uuid;
 
+use crate::extras;
 use crate::local_images;
 use crate::naming;
 use crate::nfo_parser;
@@ -949,6 +950,27 @@ async fn scan_flat_library(
     let mut new_plans: Vec<(Uuid, Vec<probe::ProbeStep>)> = Vec::new();
     // The video files of each folder. They are grouped into movies after the walk.
     let mut movie_files: BTreeMap<PathBuf, Vec<PathBuf>> = BTreeMap::new();
+    // The trailers, special features and theme media of the movies. They are stored after the movies.
+    let mut found_extras: Vec<extras::FoundExtra> = Vec::new();
+    // The files in extras folders that aren't that folder's kind of media, with their owner folder.
+    let mut skipped_extras: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let reads_extras = matches!(library.content_type, LibraryContentType::Movies);
+    // A library that reads no extras (its content type can't be edited today, so this guards stored data
+    // from elsewhere) has none: each stored extra becomes a library item again, keeping its id and user
+    // data, before the reconcile could add a second row at its path.
+    if !reads_extras {
+        let video_type =
+            detect_media_type("mkv", &library.content_type).map_or("Video", MediaType::item_kind);
+        let released =
+            rustyfin_db::repo_extras::release_all_extras(pool, library.id, &filter, video_type)
+                .await?;
+        if released > 0 {
+            tracing::info!(
+                "library '{}' reads no extras: {released} stored extras are library items again",
+                library.name
+            );
+        }
+    }
 
     // Every file that the walks returned, every folder they could not list, and every symlink
     // loop they skipped. The removal at the end of the scan needs all three.
@@ -970,6 +992,19 @@ async fn scan_flat_library(
         loops.extend(loop_dirs);
 
         for file_path_buf in files {
+            if reads_extras {
+                match extras::classify_movie_file(&file_path_buf, path) {
+                    extras::Classified::Extra(found) => {
+                        found_extras.push(found);
+                        continue;
+                    }
+                    extras::Classified::Skip { owner_dir } => {
+                        skipped_extras.push((file_path_buf, owner_dir));
+                        continue;
+                    }
+                    extras::Classified::No => {}
+                }
+            }
             let ext = file_path_buf
                 .extension()
                 .and_then(|e| e.to_str())
@@ -1043,6 +1078,58 @@ async fn scan_flat_library(
             new_items.push(item);
         }
     }
+
+    // An extra belongs to a movie next to it on disk (`extras::owning_group`). One with no such movie (the
+    // `Featurettes/` of a folder that only groups other folders, or `B-short.mkv` among several films that
+    // it doesn't name) is a movie file like any other, and a stored extra there becomes a movie again,
+    // keeping its id.
+    let is_root = |folder: &Path| library.paths.iter().any(|p| Path::new(p) == folder);
+    let folder_groups: HashMap<PathBuf, Vec<naming::VersionGroup>> = movie_files
+        .iter()
+        .map(|(folder, files)| {
+            let groups = naming::group_movie_files(folder, files, is_root(folder));
+            (folder.clone(), groups)
+        })
+        .collect();
+    let movie_folders: HashSet<PathBuf> = movie_files.keys().cloned().collect();
+    let mut released: Vec<String> = Vec::new();
+    let mut owned_extras: Vec<extras::FoundExtra> = Vec::new();
+    let unowned_files = found_extras
+        .into_iter()
+        .filter_map(|mut extra| {
+            let owner = folder_groups
+                .get(&extra.owner_dir)
+                .and_then(|groups| extras::owning_group(&extra, groups, is_root(&extra.owner_dir)));
+            match owner {
+                Some(group) => {
+                    extra.owner_paths = group.files.clone();
+                    owned_extras.push(extra);
+                    None
+                }
+                None => Some(extra.path),
+            }
+        })
+        .chain(
+            skipped_extras
+                .into_iter()
+                .filter(|(_, owner_dir)| !movie_folders.contains(owner_dir))
+                .map(|(file, _)| file),
+        );
+    for file in unowned_files {
+        let is_video = file.extension().is_some_and(|e| {
+            VIDEO_EXTENSIONS.contains(&e.to_string_lossy().to_lowercase().as_str())
+        });
+        if let (true, Some(folder)) = (is_video, file.parent()) {
+            released.push(file.to_string_lossy().into_owned());
+            movie_files
+                .entry(folder.to_path_buf())
+                .or_default()
+                .push(file);
+        }
+    }
+    let found_extras = owned_extras;
+    // A failure here stops the scan: the reconcile would otherwise add a second movie at the same path.
+    rustyfin_db::repo_extras::release_extras(pool, library.id, &released, "Movie").await?;
 
     // Group the movie files of each folder into movies, then reconcile them with the items
     let mut movie_groups: Vec<naming::VersionGroup> = Vec::new();
@@ -1135,6 +1222,12 @@ async fn scan_flat_library(
         }
     }
 
+    // The extras, now that their movies are stored. A failure is logged, not returned.
+    match extras::sync_extras(pool, library, &filter, &found_extras).await {
+        Ok(extra_plans) => plans.extend(extra_plans),
+        Err(e) => tracing::error!("failed to save the extras of '{}': {e}", library.name),
+    }
+
     tracing::info!(
         "scanned library '{}': {} new items added ({} existing items unchanged)",
         library.name,
@@ -1209,6 +1302,8 @@ async fn scan_tv_library(
     // Each series that the walks met, by id: its folder's path and name, and its seasons with their
     // folder's name and number. Series and seasons stored under older rules are settled from these.
     let mut series_folders: BTreeMap<Uuid, SeriesWalk> = BTreeMap::new();
+    // The trailers, special features and theme media of the series and seasons, stored after them.
+    let mut found_extras: Vec<extras::FoundExtra> = Vec::new();
 
     // Every file that the walks returned, every folder they could not list, and every symlink
     // loop they skipped. The removal at the end of the scan needs all three.
@@ -1247,6 +1342,16 @@ async fn scan_tv_library(
         let mut skipped_ext = 0u32;
         for file_path_buf in files {
             scanned_files += 1;
+            match extras::classify_tv_file(&file_path_buf, path) {
+                extras::Classified::Extra(mut found) => {
+                    // The series or season folder; it owns the extra once it is stored.
+                    found.owner_paths = vec![found.owner_dir.clone()];
+                    found_extras.push(found);
+                    continue;
+                }
+                extras::Classified::Skip { .. } => continue,
+                extras::Classified::No => {}
+            }
             if !is_episode_file(&file_path_buf) {
                 skipped_ext += 1;
                 continue;
@@ -1606,6 +1711,12 @@ async fn scan_tv_library(
             count += new_episodes.len() as u32;
             new_item_ids.extend(new_episodes.iter().map(|item| item.id));
         }
+    }
+
+    // The extras, now that their series and seasons are stored. A failure is logged, not returned.
+    match extras::sync_extras(pool, library, &filter, &found_extras).await {
+        Ok(extra_plans) => plans.extend(extra_plans),
+        Err(e) => tracing::error!("failed to save the extras of '{}': {e}", library.name),
     }
 
     tracing::info!(
@@ -2531,7 +2642,7 @@ pub(crate) async fn path_date(path: &Path) -> Option<DateTime<Utc>> {
 }
 
 /// When the item at `path` was added, as `path_date` gives it. Now, if that is None.
-async fn date_added(path: &Path) -> DateTime<Utc> {
+pub(crate) async fn date_added(path: &Path) -> DateTime<Utc> {
     path_date(path).await.unwrap_or_else(Utc::now)
 }
 

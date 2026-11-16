@@ -5,6 +5,7 @@ import { resumePositionTicks } from './player.js';
 import { navigate } from './router.js';
 import { albumTrackList } from './music.js';
 import { containerSectionHtml, renderContainerItems } from './collections.js';
+import { playThemeSong } from './theme-media.js';
 let currentDetailId = null;
 let activeItem = null;
 // The detail page's version, audio and subtitle choice: { itemId, sources, mediaSourceId, audioIndex,
@@ -279,6 +280,56 @@ function chaptersHtml(item) {
         </div>`;
 }
 
+// Jellyfin's ExtraType of a special feature, as its label's i18n key
+const EXTRA_TYPE_KEYS = {
+    BehindTheScenes: 'detail.extra_behind_the_scenes',
+    DeletedScene: 'detail.extra_deleted_scene',
+    Interview: 'detail.extra_interview',
+    Scene: 'detail.extra_scene',
+    Sample: 'detail.extra_sample',
+    Short: 'detail.extra_short',
+    Featurette: 'detail.extra_featurette',
+    Clip: 'detail.extra_clip',
+};
+
+// The Trailer button, as Jellyfin Web's: a local trailer plays in the player; without one, the first remote
+// trailer (YouTube, from the metadata) opens in a new tab
+function trailerButtonHtml(item, localTrailers) {
+    const label = `${icon('Film', { size: 18 })} ${t('detail.trailer')}`;
+    const cls = 'jf-btn-ghost h-11 !py-0 !px-4 text-sm';
+    const local = localTrailers[0];
+    if (local) {
+        return `<button class="${cls}" data-action="play" data-id="${escapeHtml(local.Id)}" data-stream-type="Videos" data-title="${escapeHtml(local.Name || item.Name || '')}" data-from-start="true" data-trailer="true">${label}</button>`;
+    }
+    const remote = (item.RemoteTrailers || []).find(r => /^https?:\/\//i.test(r.Url || ''));
+    if (!remote) return '';
+    return `<a class="${cls}" href="${escapeHtml(remote.Url)}" target="_blank" rel="noopener noreferrer" data-trailer="true" title="${escapeHtml(remote.Name || t('detail.trailer'))}">${label}</a>`;
+}
+
+// The special features row: each one plays in the player
+function specialFeaturesHtml(features) {
+    if (features.length === 0) return '';
+    return `
+        <div class="mb-10 jf-special-features">
+            <h2 class="text-xl font-bold mb-4 text-white">${t('detail.special_features')}</h2>
+            <div class="jf-scroll-row pb-2">
+                ${features.map(f => {
+                    const img = f.ImageTags?.Primary ? API.imageUrl(f.Id, 'Primary', { maxWidth: 400, tag: f.ImageTags.Primary }) : '';
+                    const kind = EXTRA_TYPE_KEYS[f.ExtraType] ? t(EXTRA_TYPE_KEYS[f.ExtraType]) : '';
+                    const runtime = formatRuntime(f.RunTimeTicks);
+                    return `
+                    <button type="button" class="w-56 flex-shrink-0 text-left group" data-action="play" data-id="${escapeHtml(f.Id)}" data-stream-type="Videos" data-title="${escapeHtml(f.Name || '')}">
+                        <div class="relative aspect-video rounded-lg overflow-hidden bg-white/5 mb-1.5 border-2 border-transparent group-hover:border-[#00a4dc] transition-all">
+                            ${img ? `<img src="${img}" alt="" loading="lazy" class="w-full h-full object-cover" onerror="this.style.display='none'">` : `<div class="w-full h-full flex items-center justify-center text-white/30">${icon('Film', { size: 28 })}</div>`}
+                        </div>
+                        <p class="text-xs font-semibold text-white truncate group-hover:text-[#38bdf8] transition-colors">${escapeHtml(f.Name || '')}</p>
+                        <p class="text-[10px] text-white/50">${[kind, runtime].filter(Boolean).map(escapeHtml).join(' · ')}</p>
+                    </button>`;
+                }).join('')}
+            </div>
+        </div>`;
+}
+
 // --- Detail View Renderer (Movies, TV Series, Music) ---
 async function renderDetail(itemId) {
     const session = API.token;
@@ -342,9 +393,13 @@ async function renderDetail(itemId) {
         // Parallel fetch: Children/Seasons/Episodes AND Similar media
         // Previously these were sequential, causing a waterfall effect
         const isContainer = ['Series', 'Season', 'MusicAlbum', 'Folder'].includes(type);
-        const [childrenData, similarData] = await Promise.all([
+        // The extras: trailer files for the Trailer button, and special features on movie, series and season pages
+        const showsSpecials = ['Movie', 'Series', 'Season'].includes(type);
+        const [childrenData, similarData, localTrailers, specialFeatures] = await Promise.all([
             isContainer ? API.getChildren(id).catch(() => ({ Items: [] })) : Promise.resolve({ Items: [] }),
-            API.getSimilar(id).catch(() => ({ Items: [] }))
+            API.getSimilar(id).catch(() => ({ Items: [] })),
+            item.LocalTrailerCount > 0 ? API.getLocalTrailers(id).catch(() => []) : Promise.resolve([]),
+            showsSpecials && item.SpecialFeatureCount > 0 ? API.getSpecialFeatures(id).catch(() => []) : Promise.resolve([]),
         ]);
         if (API.token !== session) return;
 
@@ -518,6 +573,7 @@ async function renderDetail(itemId) {
                                 ${icon('Shuffle', { size: 18 })}
                                 ${t('player.shuffle')}
                             </button>` : ''}
+                            ${trailerButtonHtml(item, Array.isArray(localTrailers) ? localTrailers : [])}
 
                             <button class="jf-btn-ghost h-11 !py-0 w-11 !px-0 sm:w-auto sm:!px-4 text-sm" title="${escapeHtml(t('detail.toggle_favorite'))}" aria-label="${escapeHtml(t('detail.toggle_favorite'))}" data-action="toggle-favorite" data-id="${escapeHtml(id)}" data-favorite="${fav}">
                                 ${icon('Heart', { size: 18, class: fav ? 'text-rose-500 fill-current' : 'text-white/60' })}
@@ -570,6 +626,9 @@ async function renderDetail(itemId) {
             <!-- Seasons / Episodes -->
             ${seasonsOrEpisodesHtml}
 
+            <!-- Special features -->
+            ${specialFeaturesHtml(Array.isArray(specialFeatures) ? specialFeatures : [])}
+
             <!-- A collection's or playlist's items (collections.js) -->
             ${containerSectionHtml(item)}
 
@@ -580,6 +639,7 @@ async function renderDetail(itemId) {
             ${similarHtml}
         </div>`;
         if (type === 'BoxSet' || type === 'Playlist') renderContainerItems(item);
+        playThemeSong(id, () => currentDetailId === itemId && API.token === session);
     } catch (e) {
         if (API.token !== session) return;
         page.innerHTML = `<div class="p-6 rounded-xl bg-red-500/10 text-red-400">${escapeHtml(e.message)}</div>`;

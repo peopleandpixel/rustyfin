@@ -125,7 +125,8 @@ pub async fn remove_not_collected(
     let mut parents: HashSet<String> = HashSet::new();
     let mut removed = 0;
 
-    for (id, parent_id, verdict) in judge_in_scope(pool, library, scope, &mut removal).await? {
+    for (id, parent_id, verdict) in judge_in_scope(pool, library, scope, &mut removal, true).await?
+    {
         match verdict {
             Verdict::Keep => {}
             Verdict::Unlisted(root) => {
@@ -382,14 +383,27 @@ async fn judge_in_scope(
     library: &Library,
     scope: &PathScope,
     removal: &mut Removal<'_>,
+    with_extras: bool,
 ) -> Result<Vec<(String, Option<String>, Verdict)>, sqlx::Error> {
     let library_id = library.id.to_string();
     let mut judged = Vec::new();
-    for &media_type in scanned_types(&library.content_type) {
+    // The library's own items by type, then (`with_extras`) its extras, whatever their type. `?2` NULL
+    // picks the extras.
+    let mut kinds: Vec<Option<&str>> = scanned_types(&library.content_type)
+        .iter()
+        .map(|&media_type| Some(media_type))
+        .collect();
+    if with_extras {
+        kinds.push(None);
+    }
+    for media_type in kinds {
         let rows: Vec<(String, String, Option<String>)> =
             sqlx::query_as(sqlx::AssertSqlSafe(format!(
                 "SELECT id, path, parent_id FROM media_items
-                 WHERE library_id = ?1 AND media_type = ?2 AND {}",
+                 WHERE library_id = ?1
+                   AND ((?2 IS NULL AND extra_type IS NOT NULL)
+                        OR (media_type = ?2 AND extra_type IS NULL))
+                   AND {}",
                 scope.sql("path", 3)
             )))
             .bind(library_id.as_str())
@@ -417,7 +431,7 @@ pub async fn gone_items(
     loops: &[PathBuf],
 ) -> Result<HashSet<String>, sqlx::Error> {
     let mut removal = Removal::new(library, collected, unreadable, loops);
-    Ok(judge_in_scope(pool, library, scope, &mut removal)
+    Ok(judge_in_scope(pool, library, scope, &mut removal, false)
         .await?
         .into_iter()
         .filter(|(_, _, verdict)| *verdict == Verdict::Gone)
