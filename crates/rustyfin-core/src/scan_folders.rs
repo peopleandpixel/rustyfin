@@ -5,11 +5,17 @@
 //!
 //! A scan runs `sync_folders` after it has removed what it no longer collects: it adds the folders
 //! that are missing, moves files and folders under the right one, and deletes the folders that no
-//! longer hold anything. A folder keeps its id while its path stays.
+//! longer hold anything. A folder's id comes from its library and path (UUID v5), so it is the same
+//! whenever the folder is listed again, even after it briefly held nothing.
+//!
+//! A scan of part of a library (one folder, or the files directly in a library path) looks only
+//! at the files in that part, the folders in it and the folders above it, and deletes only folders
+//! in that part.
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
+use rustyfin_db::repo_media::PathScope;
 use rustyfin_model::library::{Library, LibraryContentType};
 use rustyfin_model::media::{MediaItem, MediaType};
 use sqlx::SqlitePool;
@@ -44,11 +50,13 @@ pub struct FolderPlan {
 }
 
 /// Plans the folders of a library with these `roots`, from its `files` (id, path, parent folder's
-/// path today) and its stored `folders` (id, path, parent folder's path today)
+/// path today) and its stored `folders` (id, path, parent folder's path today). Only a folder that
+/// `deletable` accepts is deleted when no file needs it; any other is left as it is.
 pub fn plan_folders(
     roots: &[PathBuf],
     files: &[(String, PathBuf, Option<PathBuf>)],
     folders: &[(String, PathBuf, Option<PathBuf>)],
+    deletable: impl Fn(&Path) -> bool,
 ) -> FolderPlan {
     let mut wanted: BTreeSet<PathBuf> = BTreeSet::new();
     let mut plan = FolderPlan::default();
@@ -73,7 +81,9 @@ pub fn plan_folders(
     let mut gone: Vec<&(String, PathBuf, Option<PathBuf>)> = Vec::new();
     for folder @ (id, path, parent) in folders {
         if !wanted.contains(path) {
-            gone.push(folder);
+            if deletable(path) {
+                gone.push(folder);
+            }
             continue;
         }
         let holder = holding_folder(roots, path);
@@ -87,38 +97,53 @@ pub fn plan_folders(
     plan
 }
 
-/// The library's items of `types` (or its folders): id, path and the path of the item it points at
+type Row = (String, PathBuf, Option<PathBuf>);
+
+/// The library's files and folders that a pass over `scope` reads, in one query: the items in
+/// scope, and the folders above it. Each is (id, path, path of the item it points at).
 async fn rows(
     pool: &SqlitePool,
     library: &Library,
-    folders: bool,
-) -> Result<Vec<(String, PathBuf, Option<PathBuf>)>, sqlx::Error> {
+    scope: &PathScope,
+) -> Result<(Vec<Row>, Vec<Row>), sqlx::Error> {
     let types = crate::scan_sync::scanned_types(&library.content_type);
-    let wanted = |kind: &str| {
-        if folders {
-            kind == "Folder"
-        } else {
-            types.contains(&kind)
+    let rows: Vec<(String, String, String, Option<String>)> =
+        sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT m.id, m.path, m.media_type, p.path FROM media_items AS m
+             LEFT JOIN media_items AS p ON p.id = m.parent_id
+             WHERE m.library_id = ?1 AND m.extra_type IS NULL
+               AND ({in_scope}
+                    OR (m.media_type = 'Folder' AND substr(?2, 1, length(m.path) + 1) = m.path || '/'))",
+            in_scope = scope.sql("m.path", 2),
+        )))
+        .bind(library.id.to_string())
+        .bind(scope.param())
+        .fetch_all(pool)
+        .await?;
+    let (mut files, mut folders) = (Vec::new(), Vec::new());
+    for (id, path, kind, parent) in rows {
+        let row = (id, PathBuf::from(path), parent.map(PathBuf::from));
+        if kind == "Folder" {
+            folders.push(row);
+        } else if types.contains(&kind.as_str()) {
+            files.push(row);
         }
-    };
-    let rows: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
-        "SELECT m.id, m.path, m.media_type, p.path FROM media_items AS m
-         LEFT JOIN media_items AS p ON p.id = m.parent_id
-         WHERE m.library_id = ?1 AND m.extra_type IS NULL",
-    )
-    .bind(library.id.to_string())
-    .fetch_all(pool)
-    .await?;
-    Ok(rows
-        .into_iter()
-        .filter(|(_, _, kind, _)| wanted(kind))
-        .map(|(id, path, _, parent)| (id, PathBuf::from(path), parent.map(PathBuf::from)))
-        .collect())
+    }
+    Ok((files, folders))
+}
+
+/// A folder's id: a UUID v5 of its path, in the namespace of its library's id
+pub fn folder_id(library: Uuid, path: &Path) -> Uuid {
+    Uuid::new_v5(&library, path.to_string_lossy().as_bytes())
 }
 
 /// Brings the library's `Folder` items in line with its files (see the module comment). Returns how
 /// many folders were added and deleted. Does nothing for a library that doesn't browse folders.
-pub async fn sync_folders(pool: &SqlitePool, library: &Library) -> Result<(u32, u32), sqlx::Error> {
+pub async fn sync_folders(
+    pool: &SqlitePool,
+    library: &Library,
+    scope: &PathScope,
+) -> Result<(u32, u32), sqlx::Error> {
     if !browses_folders(&library.content_type) {
         return Ok((0, 0));
     }
@@ -127,9 +152,13 @@ pub async fn sync_folders(pool: &SqlitePool, library: &Library) -> Result<(u32, 
         .iter()
         .map(|p| PathBuf::from(p.trim_end_matches('/')))
         .collect();
-    let files = rows(pool, library, false).await?;
-    let folders = rows(pool, library, true).await?;
-    let plan = plan_folders(&roots, &files, &folders);
+    let (files, folders) = rows(pool, library, scope).await?;
+    // The files directly in a library path have no folder: a pass over them deletes none
+    let plan = plan_folders(&roots, &files, &folders, |path| match scope {
+        PathScope::All => true,
+        PathScope::Under(_) => scope.contains(&path.to_string_lossy()),
+        PathScope::DirectlyIn(_) => false,
+    });
 
     let mut ids: HashMap<PathBuf, Uuid> = folders
         .iter()
@@ -143,7 +172,7 @@ pub async fn sync_folders(pool: &SqlitePool, library: &Library) -> Result<(u32, 
             .unwrap_or_default();
         let parent_id = holding_folder(&roots, path).and_then(|p| ids.get(&p).copied());
         let item = MediaItem {
-            id: Uuid::new_v4(),
+            id: folder_id(library.id, path),
             sort_name: crate::scanner::auto_sort_name(MediaType::Folder, &name, None, None),
             name,
             media_type: MediaType::Folder,
@@ -206,7 +235,7 @@ mod tests {
             file("c", "/lib/Trips/y.mp4", None),
             file("d", "/more/Family/z.jpg", None),
         ];
-        let plan = plan_folders(&roots, &files, &[]);
+        let plan = plan_folders(&roots, &files, &[], |_| true);
         assert_eq!(
             plan.add,
             [p("/lib/Trips"), p("/lib/Trips/2024"), p("/more/Family")]
@@ -236,7 +265,7 @@ mod tests {
             file("f3", "/lib/Old", None),
             file("f4", "/lib/Old/Deeper", Some("/lib/Old")),
         ];
-        let plan = plan_folders(&roots, &files, &folders);
+        let plan = plan_folders(&roots, &files, &folders, |_| true);
         assert!(plan.add.is_empty());
         assert_eq!(
             plan.move_to,
@@ -250,8 +279,37 @@ mod tests {
 
     #[test]
     fn a_file_outside_every_root_gets_no_folder() {
-        let plan = plan_folders(&[p("/lib")], &[file("a", "/elsewhere/x/y.jpg", None)], &[]);
+        let plan = plan_folders(
+            &[p("/lib")],
+            &[file("a", "/elsewhere/x/y.jpg", None)],
+            &[],
+            |_| true,
+        );
         assert_eq!(plan, FolderPlan::default());
+    }
+
+    #[test]
+    fn a_scoped_pass_deletes_only_folders_in_its_scope() {
+        // A scan of /lib/Trips/2024 sees no files: 2024 goes, Trips above it stays
+        let folders = [
+            file("f1", "/lib/Trips", None),
+            file("f2", "/lib/Trips/2024", Some("/lib/Trips")),
+        ];
+        let scope = PathScope::Under("/lib/Trips/2024".to_string());
+        let plan = plan_folders(&[p("/lib")], &[], &folders, |path| {
+            scope.contains(&path.to_string_lossy())
+        });
+        assert_eq!(plan.delete, ["f2"]);
+        assert!(plan.add.is_empty() && plan.move_to.is_empty());
+    }
+
+    #[test]
+    fn a_folder_id_follows_its_library_and_path() {
+        let (lib, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let id = folder_id(lib, Path::new("/lib/Trips"));
+        assert_eq!(id, folder_id(lib, Path::new("/lib/Trips")));
+        assert_ne!(id, folder_id(lib, Path::new("/lib/Trips/2024")));
+        assert_ne!(id, folder_id(other, Path::new("/lib/Trips")));
     }
 
     #[test]

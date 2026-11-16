@@ -318,6 +318,35 @@ pub fn visible_sql(id: &str, lib: &str, param: &str) -> String {
     )
 }
 
+/// How many of each folder's children in `folders` the user may see, by folder id (a folder with
+/// none is left out). For a user without limits, every child counts.
+pub async fn visible_child_counts(
+    pool: &SqlitePool,
+    user: Uuid,
+    folders: &[Uuid],
+) -> Result<std::collections::HashMap<String, i64>, sqlx::Error> {
+    let policy = get_policy(pool, user).await?;
+    let filter = if policy.is_restricted() {
+        let hidden = hidden_item_ids(pool, &policy).await?;
+        filter_json(&hidden, policy.enabled_folders())
+    } else {
+        None
+    };
+    let ids = serde_json::to_string(&folders.iter().map(Uuid::to_string).collect::<Vec<_>>())
+        .unwrap_or_else(|_| "[]".to_string());
+    let rows: Vec<(String, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT parent_id, COUNT(*) FROM media_items
+         WHERE parent_id IN (SELECT value FROM json_each(?1)) AND extra_type IS NULL AND {visible}
+         GROUP BY parent_id",
+        visible = visible_sql("id", "library_id", "?2"),
+    )))
+    .bind(ids)
+    .bind(filter)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().collect())
+}
+
 /// Whether the policy hides this item: it or an item above it fails. An id that isn't a media
 /// item (a library, person, genre or collection) is never hidden by this check.
 pub async fn is_item_hidden(

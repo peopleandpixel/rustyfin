@@ -1108,6 +1108,20 @@ pub(crate) async fn enrich_items_with(
             .await
             .unwrap_or_default()
     };
+    // A photo or mixed library's folders count only the children the user may see
+    let plain_folders: Vec<Uuid> = items
+        .iter()
+        .filter(|item| item.media_type == rustyfin_model::media::MediaType::Folder)
+        .map(|item| item.id)
+        .collect();
+    let visible_folder_counts = match user_id {
+        Some(user) if !plain_folders.is_empty() => {
+            rustyfin_db::repo_parental::visible_child_counts(pool, user, &plain_folders)
+                .await
+                .unwrap_or_default()
+        }
+        _ => std::collections::HashMap::new(),
+    };
 
     // Batch query 6: All images for all items - populates image_tags. Only the image types and
     // counts the answer sends are read (one row an item for a Primary-only list).
@@ -1550,6 +1564,11 @@ pub(crate) async fn enrich_items_with(
                 } else {
                     None
                 };
+            }
+            if item.media_type == rustyfin_model::media::MediaType::Folder && user_id.is_some() {
+                item.child_count = visible_folder_counts
+                    .get(&item.id.to_string())
+                    .map(|&n| n as i32);
             }
             item.display_order = Some("SortName".to_string());
         }
@@ -2815,6 +2834,13 @@ pub(crate) async fn media_item(
             item
         }
     };
+    // A photo or mixed library's folder counts only the children this user may see (the cached
+    // details count every child)
+    if item.media_type == rustyfin_model::media::MediaType::Folder {
+        let counts =
+            rustyfin_db::repo_parental::visible_child_counts(&state.db_ro, user, &[id]).await?;
+        item.child_count = counts.get(&id.to_string()).map(|&n| n as i32);
+    }
     let folder = is_episode_folder(&item);
     let stored = rustyfin_db::repo_playback::get_user_item_data(&state.db_ro, user, id)
         .await
@@ -3535,6 +3561,8 @@ async fn get_ancestors(
     Path(id): Path<Uuid>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<Vec<Value>>, ApiError> {
+    // `item_gate` has answered 404 already when the caller's limits hide the item; an item they
+    // may see has only visible items above it
     let item = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, id)
         .await?
         .ok_or(ApiError::NotFound("item not found".into()))?;

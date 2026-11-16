@@ -1242,7 +1242,7 @@ async fn scan_flat_library(
     let mut removed =
         remove_uncollected(pool, library, &filter, &collected, &unreadable, &loops).await;
     // A photo or mixed library's subfolders, as Jellyfin's Folder items. A failure is logged, not returned.
-    match crate::scan_folders::sync_folders(pool, library).await {
+    match crate::scan_folders::sync_folders(pool, library, &filter).await {
         Ok((added, deleted)) => {
             count += added;
             removed += deleted;
