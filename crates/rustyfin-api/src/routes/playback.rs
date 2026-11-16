@@ -165,19 +165,30 @@ async fn reported_runtime(
     Ok(version.or(item.runtime_ticks))
 }
 
+/// The token of the request, for finding its session.
+type Token = Option<Extension<rustyfin_auth::RequestToken>>;
+
+/// The caller's session, from the request's token.
+async fn caller_session(state: &AppState, token: &Token) -> Result<Option<String>, ApiError> {
+    let token = token.as_ref().map(|Extension(rt)| rt.0.as_str());
+    crate::sessions::for_token(state, token).await
+}
+
 async fn playing(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
+    token: Token,
     Json(req): Json<PlaybackStartInfo>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    report_start(state, claims, req).await?;
-    Ok(Json(serde_json::json!({})))
+) -> Result<StatusCode, ApiError> {
+    report_start(state, claims, token, req).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Records a playback start for the caller (`POST /Sessions/Playing` and `POST /PlayingItems/{id}`).
 async fn report_start(
     state: AppState,
     claims: Claims,
+    token: Token,
     req: PlaybackStartInfo,
 ) -> Result<(), ApiError> {
     tracing::debug!(
@@ -223,25 +234,20 @@ async fn report_start(
         .await?;
     }
 
-    let now_playing = if is_media {
-        serde_json::json!({
-            "Id": req.item_id.to_string(),
-            "Name": req.item_name.as_deref().unwrap_or(""),
-        })
-    } else {
-        serde_json::Value::Null
-    };
-    // Broadcast SessionChanged event so clients see the now-playing item update
-    broadcast_event(
-        &state,
-        WsEvent::SessionChanged {
-            data: serde_json::json!({
-                "UserId": claims.sub.to_string(),
-                "NowPlayingItem": now_playing,
-            }),
-        },
-    )
-    .await;
+    // The session's now-playing item and play state
+    if is_media && let Some(session) = caller_session(&state, &token).await? {
+        let report = crate::sessions::Report {
+            user_id: claims.sub,
+            item_id: req.item_id,
+            position_ticks: req.position_ticks,
+            is_paused: Some(false),
+            media_source_id: req.media_source_id.as_deref(),
+            audio_stream_index: req.audio_stream_index,
+            subtitle_stream_index: req.subtitle_stream_index,
+            fields: &req.play_state,
+        };
+        crate::sessions::playing(&state, &session, report, true).await;
+    }
 
     Ok(())
 }
@@ -249,10 +255,11 @@ async fn report_start(
 async fn playing_progress(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
+    token: Token,
     Json(req): Json<PlaybackProgressInfo>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    report_progress(state, claims, req).await?;
-    Ok(Json(serde_json::json!({})))
+) -> Result<StatusCode, ApiError> {
+    report_progress(state, claims, token, req).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Records a playback progress report for the caller (`/Sessions/Playing/Progress` and
@@ -260,6 +267,7 @@ async fn playing_progress(
 async fn report_progress(
     state: AppState,
     claims: Claims,
+    token: Token,
     req: PlaybackProgressInfo,
 ) -> Result<(), ApiError> {
     tracing::debug!(
@@ -307,27 +315,19 @@ async fn report_progress(
         .await?;
     }
 
-    let now_playing = if is_media {
-        serde_json::json!({
-            "Id": req.item_id.to_string(),
-            "Name": req.item_name.as_deref().unwrap_or(""),
-            "PositionTicks": req.position_ticks,
-        })
-    } else {
-        serde_json::Value::Null
-    };
-    // Broadcast SessionChanged event with updated playback position
-    broadcast_event(
-        &state,
-        WsEvent::SessionChanged {
-            data: serde_json::json!({
-                "UserId": claims.sub.to_string(),
-                "NowPlayingItem": now_playing,
-                "IsPaused": req.is_paused.unwrap_or(false),
-            }),
-        },
-    )
-    .await;
+    if is_media && let Some(session) = caller_session(&state, &token).await? {
+        let report = crate::sessions::Report {
+            user_id: claims.sub,
+            item_id: req.item_id,
+            position_ticks: req.position_ticks,
+            is_paused: req.is_paused,
+            media_source_id: req.media_source_id.as_deref(),
+            audio_stream_index: req.audio_stream_index,
+            subtitle_stream_index: req.subtitle_stream_index,
+            fields: &req.play_state,
+        };
+        crate::sessions::playing(&state, &session, report, false).await;
+    }
 
     Ok(())
 }
@@ -335,10 +335,11 @@ async fn report_progress(
 async fn playing_stopped(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
+    token: Token,
     Json(req): Json<PlaybackStopInfo>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    report_stop(state, claims, req).await?;
-    Ok(Json(serde_json::json!({})))
+) -> Result<StatusCode, ApiError> {
+    report_stop(state, claims, token, req).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Records a playback stop for the caller (`/Sessions/Playing/Stopped` and
@@ -346,6 +347,7 @@ async fn playing_stopped(
 async fn report_stop(
     state: AppState,
     claims: Claims,
+    token: Token,
     req: PlaybackStopInfo,
 ) -> Result<(), ApiError> {
     tracing::debug!(
@@ -356,56 +358,55 @@ async fn report_stop(
         subtitle = ?req.subtitle_stream_index,
         "Playback stopped"
     );
+    record_stop(&state, claims.sub, &req).await?;
+    if let Some(session) = caller_session(&state, &token).await? {
+        crate::sessions::stopped(&state, &session).await;
+    }
+
+    Ok(())
+}
+
+/// The watch data of a stop: `user`'s position, played state and track choice for the item, by
+/// Jellyfin's play state rules. Also stops a stalled playback (`sessions::expire`).
+pub(crate) async fn record_stop(
+    state: &AppState,
+    user: Uuid,
+    req: &PlaybackStopInfo,
+) -> Result<(), ApiError> {
     // Same as `playing`: a non-media id stores nothing.
     let item = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, req.item_id).await?;
-    let is_media = item.is_some();
-    let runtime = match &item {
-        Some(item) => reported_runtime(&state, item, req.media_source_id.as_deref()).await?,
-        None => None,
+    let Some(item) = item else {
+        return Ok(());
     };
-    if is_media {
-        // Jellyfin's OnPlaybackStopped returns before touching user data for a failed playback.
-        if req.failed != Some(true) {
-            rustyfin_db::repo_playback::record_playback_stop(
-                &state.db,
-                claims.sub,
-                req.item_id,
-                req.position_ticks,
-                runtime,
-            )
-            .await?;
-        }
-
-        let (audio, subtitle) = reported_choices(
-            &state,
-            req.item_id,
-            req.media_source_id.as_deref(),
-            req.audio_stream_index,
-            req.subtitle_stream_index,
-        )
-        .await?;
-        rustyfin_db::repo_playback::save_stream_choice(
+    let runtime = reported_runtime(state, &item, req.media_source_id.as_deref()).await?;
+    // Jellyfin's OnPlaybackStopped returns before touching user data for a failed playback.
+    if req.failed != Some(true) {
+        rustyfin_db::repo_playback::record_playback_stop(
             &state.db,
-            claims.sub,
+            user,
             req.item_id,
-            audio.as_ref(),
-            subtitle.as_ref(),
+            req.position_ticks,
+            runtime,
         )
         .await?;
     }
 
-    // Broadcast SessionChanged event to clear now-playing item
-    broadcast_event(
-        &state,
-        WsEvent::SessionChanged {
-            data: serde_json::json!({
-                "UserId": claims.sub.to_string(),
-                "NowPlayingItem": null,
-            }),
-        },
+    let (audio, subtitle) = reported_choices(
+        state,
+        req.item_id,
+        req.media_source_id.as_deref(),
+        req.audio_stream_index,
+        req.subtitle_stream_index,
     )
-    .await;
-
+    .await?;
+    rustyfin_db::repo_playback::save_stream_choice(
+        &state.db,
+        user,
+        req.item_id,
+        audio.as_ref(),
+        subtitle.as_ref(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -433,10 +434,12 @@ async fn playing_item_start(
     Extension(claims): Extension<Claims>,
     Path(item_id): Path<Uuid>,
     Query(query): Query<PlayingItemQuery>,
+    token: Token,
 ) -> Result<StatusCode, ApiError> {
     report_start(
         state,
         claims,
+        token,
         PlaybackStartInfo {
             item_id,
             item_name: None,
@@ -444,6 +447,7 @@ async fn playing_item_start(
             media_source_id: query.media_source_id,
             audio_stream_index: query.audio_stream_index,
             subtitle_stream_index: query.subtitle_stream_index,
+            play_state: Default::default(),
         },
     )
     .await?;
@@ -456,10 +460,12 @@ async fn playing_item_progress(
     Extension(claims): Extension<Claims>,
     Path(item_id): Path<Uuid>,
     Query(query): Query<PlayingItemQuery>,
+    token: Token,
 ) -> Result<StatusCode, ApiError> {
     report_progress(
         state,
         claims,
+        token,
         PlaybackProgressInfo {
             item_id,
             item_name: None,
@@ -468,6 +474,7 @@ async fn playing_item_progress(
             media_source_id: query.media_source_id,
             audio_stream_index: query.audio_stream_index,
             subtitle_stream_index: query.subtitle_stream_index,
+            play_state: Default::default(),
         },
     )
     .await?;
@@ -480,10 +487,12 @@ async fn playing_item_stop(
     Extension(claims): Extension<Claims>,
     Path(item_id): Path<Uuid>,
     Query(query): Query<PlayingItemQuery>,
+    token: Token,
 ) -> Result<StatusCode, ApiError> {
     report_stop(
         state,
         claims,
+        token,
         PlaybackStopInfo {
             item_id,
             item_name: None,
@@ -492,6 +501,7 @@ async fn playing_item_stop(
             audio_stream_index: query.audio_stream_index,
             subtitle_stream_index: query.subtitle_stream_index,
             failed: None,
+            play_state: Default::default(),
         },
     )
     .await?;
@@ -504,8 +514,9 @@ async fn legacy_playing_item_start(
     claims: Extension<Claims>,
     Path((_user_id, item_id)): Path<(String, Uuid)>,
     query: Query<PlayingItemQuery>,
+    token: Token,
 ) -> Result<StatusCode, ApiError> {
-    playing_item_start(state, claims, Path(item_id), query).await
+    playing_item_start(state, claims, Path(item_id), query, token).await
 }
 
 async fn legacy_playing_item_progress(
@@ -513,8 +524,9 @@ async fn legacy_playing_item_progress(
     claims: Extension<Claims>,
     Path((_user_id, item_id)): Path<(String, Uuid)>,
     query: Query<PlayingItemQuery>,
+    token: Token,
 ) -> Result<StatusCode, ApiError> {
-    playing_item_progress(state, claims, Path(item_id), query).await
+    playing_item_progress(state, claims, Path(item_id), query, token).await
 }
 
 async fn legacy_playing_item_stop(
@@ -522,8 +534,9 @@ async fn legacy_playing_item_stop(
     claims: Extension<Claims>,
     Path((_user_id, item_id)): Path<(String, Uuid)>,
     query: Query<PlayingItemQuery>,
+    token: Token,
 ) -> Result<StatusCode, ApiError> {
-    playing_item_stop(state, claims, Path(item_id), query).await
+    playing_item_stop(state, claims, Path(item_id), query, token).await
 }
 
 /// The path's user, when the caller may act for them: that user or an administrator (Jellyfin's

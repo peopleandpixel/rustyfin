@@ -4,6 +4,7 @@ import { currentPage } from './router.js';
 import { serverVersion } from './wizard.js';
 import { oidcAccountKey } from './settings.js';
 import { jiPanelHtml, loadJellyfinImport } from './jellyfin-import.js';
+import { sessionsPanelHtml, followSessions, unfollowSessions } from './sessions.js';
 
 async function renderAdmin(tab) {
     const page = $('page-admin');
@@ -221,27 +222,7 @@ async function renderAdmin(tab) {
             <!-- Tab 5: Sessions -->
             <div id="admin-sessions" class="hidden jf-settings-card">
                 <h3 class="font-bold text-white text-base mb-4">${t('admin.active_sessions')}</h3>
-                <div class="overflow-x-auto">
-                    <table class="w-full text-left text-xs">
-                        <thead>
-                            <tr class="text-white/40 border-b border-white/10">
-                                <th class="pb-3 font-semibold">${t('admin.user')}</th>
-                                <th class="pb-3 font-semibold">${t('admin.device')}</th>
-                                <th class="pb-3 font-semibold">${t('admin.client')}</th>
-                                <th class="pb-3 font-semibold">${t('admin.activity')}</th>
-                            </tr>
-                        </thead>
-                        <tbody class="divide-y divide-white/5">
-                            ${sessions.map(s => `
-                            <tr>
-                                <td class="py-3 font-bold text-white">${escapeHtml(s.UserName || s.user_name || '–')}</td>
-                                <td class="py-3 text-white/70">${escapeHtml(s.DeviceName || s.device_name || t('admin.browser'))}</td>
-                                <td class="py-3 text-white/50">${escapeHtml(s.Client || s.client || 'Rustyfin Web')}</td>
-                                <td class="py-3 text-white/40">${escapeHtml(s.LastActivityDate || s.last_activity_date || '–')}</td>
-                            </tr>`).join('')}
-                        </tbody>
-                    </table>
-                </div>
+                ${sessionsPanelHtml(sessions)}
             </div>
 
             <!-- Tab 5: Activity Log -->
@@ -305,6 +286,8 @@ function showAdminTab(btn, tabId) {
     else stopTaskPolling();
     if (tabId === 'admin-activity') loadActivityLog();
     if (tabId === 'admin-livelog') initLiveLog();
+    if (tabId === 'admin-sessions') followSessions();
+    else unfollowSessions();
     if (tabId === 'admin-signin') loadOidcAdminTab();
     if (tabId === 'admin-import') loadJellyfinImport();
 }

@@ -240,10 +240,13 @@ async fn remove_user(state: &AppState, claims: &Claims, id: Uuid) -> Result<(), 
     let name = rustyfin_db::repo_user::get_user_by_id(&state.db, id)
         .await?
         .map(|u| u.name);
+    let ended = rustyfin_db::repo_session::session_ids(&state.db, Some(id), None).await?;
     let deleted = rustyfin_db::repo_user::delete_user(&state.db, id).await?;
     if !deleted {
         return Err(ApiError::NotFound("user not found".into()));
     }
+    crate::sessions::forget_all(&ended);
+    crate::sessions::changed(state);
     // The profile picture's folder; its rows went with the user
     let _ =
         tokio::fs::remove_dir_all(state.data_dir.join("users").join(id.simple().to_string())).await;

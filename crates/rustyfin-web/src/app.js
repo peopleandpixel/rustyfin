@@ -27,6 +27,8 @@ import {
 } from './modules/player.js';
 import './modules/playerprefs.js';
 import './modules/queue.js';
+import './modules/remote.js';
+import { sessionControl, openPlayOn, playOnSession } from './modules/sessions.js';
 import './modules/cardmenu.js';
 import {
     changeNextEpisodeAutoPlay, changeUiLanguage, handleSaveConfig, changeUserConfig, changeUserPref, changeHomeSection,
@@ -54,6 +56,6 @@ Object.assign(window, {
     jiNewCode, jiCopyCodes, refreshTasks, openAddLibrary, closeAddLibrary, submitAddLibrary, closeLibraryOptions,
     submitLibraryOptions, openAddUser, closeAddUser,
     submitAddUser, clearLiveLog, setLogLevel, closePluginConfig, savePluginConfig, closePluginPriority,
-    savePluginPriority, changeUserConfig, changeUserPref, changeHomeSection, changeSubtitleAppearance, changeLatestLibrary,
-    chooseProfileImage, deleteProfileImage,
+    savePluginPriority, sessionControl, openPlayOn, playOnSession, changeUserConfig, changeUserPref, changeHomeSection,
+    changeSubtitleAppearance, changeLatestLibrary, chooseProfileImage, deleteProfileImage,
 });

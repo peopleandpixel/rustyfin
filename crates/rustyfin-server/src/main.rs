@@ -563,7 +563,7 @@ async fn main() {
         });
     }
 
-    let cleanup_db = state.db.clone();
+    let session_state = state.clone();
     let sighup_config = state.config.clone();
     let sighup_data_dir = state.data_dir.clone();
     let sighup_changes = state.task_scheduler.changes().clone();
@@ -647,18 +647,14 @@ async fn main() {
     let local_addr = listener.local_addr().expect("failed to get local address");
     tracing::info!("rustyfin listening on {}", local_addr);
 
-    // Background task: cleanup expired sessions every 5 minutes
+    // Background task: end idle sessions and stalled playbacks once a minute
     {
-        let db = cleanup_db;
+        let state = session_state;
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
             loop {
                 interval.tick().await;
-                match rustyfin_db::repo_session::cleanup_expired_sessions(&db, 30).await {
-                    Ok(n) if n > 0 => tracing::info!("cleaned up {n} expired sessions"),
-                    Err(e) => tracing::warn!("session cleanup error: {e}"),
-                    _ => {}
-                }
+                rustyfin_api::sessions::expire(&state).await;
             }
         });
     }

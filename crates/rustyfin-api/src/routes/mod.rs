@@ -12,7 +12,7 @@ mod dlna_streaming;
 mod dynamic_hls;
 mod encoding_manager;
 mod images;
-mod items;
+pub(crate) mod items;
 mod jellyfin_import;
 pub(crate) mod library;
 mod library_monitor;
@@ -23,7 +23,7 @@ mod metadata_admin;
 mod oidc;
 mod packages;
 mod persons;
-mod playback;
+pub(crate) mod playback;
 mod plugins;
 mod quick_connect;
 mod scheduled_tasks;
@@ -38,7 +38,7 @@ mod system;
 mod transcode;
 mod trickplay;
 mod users;
-mod websocket;
+pub(crate) mod websocket;
 
 pub use startup::{StartupOwner, settle_owner_at_startup};
 

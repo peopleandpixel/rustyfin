@@ -216,9 +216,12 @@ async fn delete_device(
     Path(device_id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     // Sign the device out like DELETE /Devices?id=: its sessions, its tokens, then the row
+    let ended = rustyfin_db::repo_session::session_ids(&state.db, None, Some(&device_id)).await?;
     rustyfin_db::repo_session::delete_device(&state.db, &device_id)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
+    crate::sessions::forget_all(&ended);
+    crate::sessions::changed(&state);
 
     Ok(StatusCode::OK)
 }

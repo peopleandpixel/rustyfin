@@ -2707,7 +2707,11 @@ async fn get_user_item(
 }
 
 /// The media item `id` with `user`'s watch data.
-async fn media_item(state: &AppState, id: Uuid, user: Uuid) -> Result<MediaItem, ApiError> {
+pub(crate) async fn media_item(
+    state: &AppState,
+    id: Uuid,
+    user: Uuid,
+) -> Result<MediaItem, ApiError> {
     let id_str = id.to_string();
     // The details every user sees; the requester's watch data is added below. A scan that reads
     // a file again replaces the item's sources, with new ids, so a cached copy is served only

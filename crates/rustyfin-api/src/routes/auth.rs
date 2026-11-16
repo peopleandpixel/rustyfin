@@ -132,7 +132,31 @@ pub(crate) async fn start_session(
     user: User,
     token: String,
 ) -> AuthResponse {
-    let session_id = Uuid::new_v4();
+    // A user keeps their session on a device across sign-ins. Another user signing in with the
+    // same device id gets a session of their own, never this one.
+    let existing = match device.device_id.as_str() {
+        "" => None,
+        id => rustyfin_db::repo_session::find_device_session(&state.db, user.id, id)
+            .await
+            .ok()
+            .flatten(),
+    };
+    // The user's other sessions on the device are replaced below; their play state goes with them
+    if !device.device_id.is_empty() {
+        let ids = rustyfin_db::repo_session::session_ids(
+            &state.db,
+            Some(user.id),
+            Some(&device.device_id),
+        )
+        .await
+        .unwrap_or_default();
+        for id in ids.iter().filter(|id| Some(*id) != existing.as_ref()) {
+            crate::sessions::forget(id);
+        }
+    }
+    let session_id = existing
+        .and_then(|id| Uuid::parse_str(&id).ok())
+        .unwrap_or_else(Uuid::new_v4);
     super::activity::record(
         state,
         &format!("{} successfully authenticated", user.name),
@@ -156,6 +180,7 @@ pub(crate) async fn start_session(
     )
     .await
     .ok();
+    crate::sessions::changed(state);
 
     let session_info = AuthSessionInfo {
         id: session_id.to_string(),
