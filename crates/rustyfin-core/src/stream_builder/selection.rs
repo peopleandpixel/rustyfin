@@ -69,14 +69,34 @@ pub struct AudioIndexSource {
     pub default: bool,
     /// An audio language was preferred: only streams in the default stream's language are.
     pub language: bool,
+    /// The user's remembered track is the default: it is the only candidate.
+    pub user: bool,
 }
 
 impl SourceFacts {
     /// Sets the default audio and subtitle streams and the subtitle scores from a user's
-    /// settings, as Jellyfin does for a video when no remembered track applies (a remembered
-    /// track reaches the builder as the request's index instead).
+    /// settings, as Jellyfin does for a video when no remembered track applies.
     pub fn apply_preferences(&mut self, prefs: &TrackPreferences) {
-        if prefs.original_language_audio && prefs.play_default_audio_track {
+        self.apply_preferences_and_remembered(prefs, None, None);
+    }
+
+    /// As `apply_preferences`, with the user's remembered audio and subtitle streams (already
+    /// checked against this source; subtitle -1 is off) as the defaults where given, as Jellyfin's
+    /// `SetDefaultAudioAndSubtitleStreamIndices` does: the subtitle default then follows the
+    /// remembered audio's language.
+    pub fn apply_preferences_and_remembered(
+        &mut self,
+        prefs: &TrackPreferences,
+        audio: Option<i32>,
+        subtitle: Option<i32>,
+    ) {
+        if let Some(index) = audio {
+            self.default_audio_stream_index = Some(index);
+            self.audio_index_source = Some(AudioIndexSource {
+                user: true,
+                ..AudioIndexSource::default()
+            });
+        } else if prefs.original_language_audio && prefs.play_default_audio_track {
             // The item's original language isn't known, so no language is preferred
             self.default_audio_stream_index = default_audio_index(&self.streams, &[], true);
             self.audio_index_source = Some(AudioIndexSource::default());
@@ -89,6 +109,7 @@ impl SourceFacts {
             self.audio_index_source = Some(AudioIndexSource {
                 default: prefs.play_default_audio_track,
                 language: !prefs.audio_languages.is_empty(),
+                user: false,
             });
         }
         let audio_language = self.default_audio_stream_index.and_then(|index| {
@@ -99,8 +120,9 @@ impl SourceFacts {
         });
         let languages = &prefs.subtitle_languages;
         let mode = prefs.subtitle_mode;
-        self.default_subtitle_stream_index =
-            default_subtitle_index(&self.streams, languages, mode, audio_language.as_deref());
+        self.default_subtitle_stream_index = subtitle.or_else(|| {
+            default_subtitle_index(&self.streams, languages, mode, audio_language.as_deref())
+        });
         set_subtitle_scores(
             &mut self.streams,
             languages,
@@ -450,7 +472,7 @@ mod tests {
             source.audio_index_source,
             Some(AudioIndexSource {
                 default: true,
-                language: false
+                ..AudioIndexSource::default()
             })
         );
         assert_eq!(source.default_subtitle_stream_index, Some(3));
@@ -467,8 +489,8 @@ mod tests {
         assert_eq!(
             source.audio_index_source,
             Some(AudioIndexSource {
-                default: false,
-                language: true
+                language: true,
+                ..AudioIndexSource::default()
             })
         );
         assert_eq!(source.default_subtitle_stream_index, None);

@@ -182,13 +182,16 @@ async fn playback_info(
     let mut reasons = Vec::new();
     for index in chosen {
         let mut source = sources[index].clone();
-        let audio_stream_index = dto.audio_stream_index.or_else(|| {
-            let choice = remembered_audio.as_ref()?;
-            super::remembered_stream(&source, "Audio", choice)
-        });
+        // Remembered tracks become the source's defaults, as Jellyfin's
+        // SetDefaultAudioAndSubtitleStreamIndices sets them before the stream builder runs, so
+        // they play whether or not the request names the source
+        let remembered_audio_index = remembered_audio
+            .as_ref()
+            .and_then(|choice| super::remembered_stream(&source, "Audio", choice));
+        let audio_stream_index = dto.audio_stream_index.or(remembered_audio_index);
         // A remembered subtitle counts unless subtitles are off, and under "only forced" only
         // when it is off or a forced stream, as in Jellyfin
-        let subtitle_stream_index = dto.subtitle_stream_index.or_else(|| {
+        let remembered_subtitle_index = (|| {
             let choice = remembered_subtitle.as_ref()?;
             match preferences.subtitle_mode {
                 SubtitleMode::None => None,
@@ -201,7 +204,8 @@ async fn playback_info(
                             .any(|s| s.index == index && s.is_forced)
                 }),
             }
-        });
+        })();
+        let subtitle_stream_index = dto.subtitle_stream_index.or(remembered_subtitle_index);
         // The loader's flags are a placeholder; the device data below decides them when present
         // ForceRemoteSourceTranscoding: a remote source (a URL) is never played as it is
         let may_direct = !(access.force_remote_source_transcoding && source.is_remote);
@@ -238,7 +242,11 @@ async fn playback_info(
                 };
                 let mut facts = SourceFacts::from(&source);
                 if kind == MediaKind::Video {
-                    facts.apply_preferences(&preferences);
+                    facts.apply_preferences_and_remembered(
+                        &preferences,
+                        remembered_audio_index,
+                        remembered_subtitle_index,
+                    );
                 }
                 let data = device_data(&facts, profile, &request);
                 reasons.push((
