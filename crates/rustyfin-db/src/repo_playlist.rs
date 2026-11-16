@@ -352,7 +352,7 @@ pub async fn delete_playlist(
 ) -> Result<bool, sqlx::Error> {
     let pid = id.to_string();
     let owner = owner_filter(caller);
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     sqlx::query(
         "DELETE FROM playlist_items WHERE playlist_id = ?1 AND EXISTS (
             SELECT 1 FROM playlists WHERE id = ?1 AND (?2 IS NULL OR user_id = ?2))",

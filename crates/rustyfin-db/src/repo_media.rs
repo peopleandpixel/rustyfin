@@ -448,7 +448,7 @@ pub async fn batch_upsert_media_items(
         return Ok(());
     }
 
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
 
     // Disable filter triggers during batch insert to avoid write amplification.
     // Each trigger fires COUNT(*) on the entire table per row, which is expensive.
@@ -1853,7 +1853,7 @@ pub async fn get_similar_items(
 /// Rebuild materialized filter index tables from media_items.
 /// Call after scanning or bulk operations to keep indexes up-to-date.
 pub async fn rebuild_filter_indexes(pool: &SqlitePool) -> Result<(), sqlx::Error> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
 
     // Clear existing indexes
     sqlx::query("DELETE FROM filter_genre_index")
@@ -2365,7 +2365,7 @@ pub async fn upsert_music_tags_read(
     if reads.is_empty() {
         return Ok(());
     }
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     for (item_id, size, mtime) in reads {
         sqlx::query(
             "INSERT INTO music_tags_read (item_id, size, mtime) VALUES (?1, ?2, ?3)
@@ -3843,7 +3843,7 @@ pub async fn recompute_sort_names(
 
     let mut changed = 0;
     let mut pending = 0;
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     for (id, name, sort_name, kind, parent_index, index, forced) in rows {
         let media_type = match kind.as_str() {
             "Folder" => MediaType::Unknown,
@@ -3873,7 +3873,7 @@ pub async fn recompute_sort_names(
         pending += 1;
         if pending >= SORT_BATCH {
             tx.commit().await?;
-            tx = pool.begin().await?;
+            tx = pool.begin_with("BEGIN IMMEDIATE").await?;
             pending = 0;
         }
     }
@@ -3942,7 +3942,7 @@ pub async fn replace_item_studios(
     names: &[String],
 ) -> Result<(), sqlx::Error> {
     let item = item_id.to_string();
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     sqlx::query("DELETE FROM item_studios WHERE item_id = ?")
         .bind(&item)
         .execute(&mut *tx)

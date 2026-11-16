@@ -83,8 +83,12 @@ impl IntoResponse for ApiError {
 }
 
 impl From<sqlx::Error> for ApiError {
+    /// `?` passes its own place as the caller, which names the handler line in the log.
+    #[track_caller]
     fn from(e: sqlx::Error) -> Self {
-        tracing::error!(error = %e, "database error");
+        let at = std::panic::Location::caller();
+        rustyfin_db::pool_watch::note_error(&e, at);
+        tracing::error!(error = %e, %at, "database error");
         Self::Internal("An internal database error occurred.".to_string())
     }
 }

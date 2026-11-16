@@ -68,7 +68,7 @@ pub async fn link_music_artists(
     if links.is_empty() {
         return Ok(());
     }
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     for (item_id, kind, names) in links {
         for (order, name) in names.iter().enumerate() {
             let person_id = music_artist_person_id(name).to_string();

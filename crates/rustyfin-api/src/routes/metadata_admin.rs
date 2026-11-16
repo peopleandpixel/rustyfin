@@ -680,7 +680,7 @@ async fn update_item(
     }
     // The forced sort name and the sort name made from it are saved together: when another
     // write changed the name or sort name since the read, neither is.
-    let mut tx = state.db.begin().await?;
+    let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
     let written =
         rustyfin_db::repo_media::save_refresh_changes_on(&mut tx, &item, &updated).await?;
     let sort_saved = updated.sort_name == item.sort_name || written.contains(&"sort_name");

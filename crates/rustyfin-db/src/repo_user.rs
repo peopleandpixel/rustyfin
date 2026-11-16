@@ -323,7 +323,7 @@ pub async fn update_password(
     password_hash: &str,
 ) -> Result<bool, sqlx::Error> {
     let id = id.to_string();
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     let result = sqlx::query("UPDATE users SET password_hash = ? WHERE id = ?")
         .bind(password_hash)
         .bind(&id)

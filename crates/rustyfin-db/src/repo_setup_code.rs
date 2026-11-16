@@ -18,7 +18,7 @@ pub async fn create_user_with_code(
     let is_admin = user.is_administrator as i32;
     let config = user.configuration.to_string();
 
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     sqlx::query(
         "INSERT INTO users (id, name, password_hash, is_administrator, created_at, configuration) VALUES (?, ?, ?, ?, ?, ?)",
     )

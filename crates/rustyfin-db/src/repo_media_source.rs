@@ -623,7 +623,7 @@ pub async fn insert_media_source_with_streams(
     item_id: &Uuid,
     source: &MediaSourceResponse,
 ) -> Result<Uuid, sqlx::Error> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     let id = insert_source_with_streams(&mut tx, item_id, source).await?;
     tx.commit().await?;
     Ok(id)
