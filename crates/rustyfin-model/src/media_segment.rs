@@ -25,6 +25,9 @@ impl SegmentType {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct MediaSegment {
+    /// The segment's id
+    #[serde(default)]
+    pub id: String,
     /// Item ID this segment belongs to
     pub item_id: String,
     /// Type of segment

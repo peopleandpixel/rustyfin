@@ -2493,6 +2493,7 @@ impl From<MediaItemRow> for MediaItem {
             parent_logo_image_tag: None,
             parent_logo_item_id: None,
             screenshot_image_tags: Vec::new(),
+            trickplay: None,
             image_blur_hashes: std::collections::HashMap::new(),
             video_3_d_format: None,
             play_access: None,

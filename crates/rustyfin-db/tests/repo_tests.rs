@@ -2152,6 +2152,7 @@ async fn test_save_chapters_keeps_the_old_ones_when_it_fails() {
         start_position_ticks: i64::from(number - 1) * 10_000_000,
         end_position_ticks: i64::from(number) * 10_000_000,
         image_path: None,
+        image_date_modified: None,
     };
     rustyfin_db::repo_chapter::save_chapters(
         &pool,
