@@ -220,7 +220,7 @@ async fn delete_device(
     rustyfin_db::repo_session::delete_device(&state.db, &device_id)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
-    crate::sessions::forget_all(&ended);
+    crate::sessions::forget_all(&state, &ended);
     crate::sessions::changed(&state);
 
     Ok(StatusCode::OK)

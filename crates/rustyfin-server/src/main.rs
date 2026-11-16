@@ -463,6 +463,7 @@ async fn main() {
         jellyfin_import: Default::default(),
         directory_listings: Default::default(),
         file_guard: Default::default(),
+        session_runtime: Default::default(),
     };
 
     // A scheduled library scan clears the same caches as a scan from the API or the monitor.

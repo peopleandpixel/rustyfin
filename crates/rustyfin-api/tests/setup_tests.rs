@@ -86,6 +86,7 @@ async fn test_state() -> (AppState, DataDir) {
         jellyfin_import: Default::default(),
         directory_listings: Default::default(),
         file_guard: Default::default(),
+        session_runtime: Default::default(),
     };
     (state, DataDir(data_dir))
 }

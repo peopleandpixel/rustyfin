@@ -77,6 +77,8 @@ pub struct AppState {
     pub directory_listings: DirectoryListings,
     /// What the file checks keep between requests (see `FileGuardCache`).
     pub file_guard: FileGuardCache,
+    /// What is playing on each session (see `sessions::SessionRuntime`).
+    pub session_runtime: crate::sessions::SessionRuntime,
 }
 
 /// What the stored-path checks keep between requests, so a stream, subtitle or image request

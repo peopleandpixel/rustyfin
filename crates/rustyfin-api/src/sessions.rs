@@ -4,7 +4,7 @@
 //! as in Jellyfin, and is gone after a restart.
 
 use std::collections::HashMap;
-use std::sync::{LazyLock, RwLock};
+use std::sync::{Arc, RwLock};
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -100,10 +100,23 @@ struct Runtime {
     last_check_in: Option<DateTime<Utc>>,
 }
 
-static RUNTIME: LazyLock<RwLock<HashMap<String, Runtime>>> = LazyLock::new(Default::default);
+/// What the server keeps in memory about its sessions, by session id. One per `AppState`, so
+/// servers in one process (the tests) never see or sweep each other's sessions.
+#[derive(Debug, Clone, Default)]
+pub struct SessionRuntime(Arc<RwLock<HashMap<String, Runtime>>>);
 
-fn runtime() -> std::sync::RwLockWriteGuard<'static, HashMap<String, Runtime>> {
-    RUNTIME.write().unwrap_or_else(|e| e.into_inner())
+impl SessionRuntime {
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, HashMap<String, Runtime>> {
+        self.0.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<String, Runtime>> {
+        self.0.write().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+fn runtime(state: &AppState) -> std::sync::RwLockWriteGuard<'_, HashMap<String, Runtime>> {
+    state.session_runtime.write()
 }
 
 /// Tells the sockets that follow the sessions (`SessionsStart`) that the list changed.
@@ -189,7 +202,7 @@ fn apply(play_state: &mut PlayState, report: &Report<'_>) {
 /// Records a start or progress report of a media item on `session_id`.
 pub async fn playing(state: &AppState, session_id: &str, report: Report<'_>, start: bool) {
     let (position, paused) = {
-        let mut all = runtime();
+        let mut all = runtime(state);
         let rt = all.entry(session_id.to_string()).or_default();
         let same_item = rt
             .playing
@@ -235,7 +248,7 @@ pub async fn playing(state: &AppState, session_id: &str, report: Report<'_>, sta
 /// Ends the session's playback: no now-playing item, and the play state back to idle.
 pub async fn stopped(state: &AppState, session_id: &str) {
     {
-        let mut all = runtime();
+        let mut all = runtime(state);
         let rt = all.entry(session_id.to_string()).or_default();
         rt.playing = None;
         rt.play_state = PlayState::default();
@@ -249,28 +262,25 @@ pub async fn stopped(state: &AppState, session_id: &str) {
 }
 
 /// `POST /Sessions/Playing/Ping`: the client is still playing.
-pub fn ping(session_id: &str) {
-    if let Some(rt) = runtime().get_mut(session_id) {
+pub fn ping(state: &AppState, session_id: &str) {
+    if let Some(rt) = runtime(state).get_mut(session_id) {
         rt.last_check_in = Some(Utc::now());
     }
 }
 
 /// Drops what the server keeps in memory about a session that has ended.
-pub fn forget(session_id: &str) {
-    runtime().remove(session_id);
+pub fn forget(state: &AppState, session_id: &str) {
+    runtime(state).remove(session_id);
 }
 
 /// Whether the server keeps anything in memory for `session_id` (for tests).
-pub fn tracks(session_id: &str) -> bool {
-    RUNTIME
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .contains_key(session_id)
+pub fn tracks(state: &AppState, session_id: &str) -> bool {
+    state.session_runtime.read().contains_key(session_id)
 }
 
 /// Forgets the sessions `ids`, after they are deleted.
-pub fn forget_all(ids: &[String]) {
-    let mut all = runtime();
+pub fn forget_all(state: &AppState, ids: &[String]) {
+    let mut all = runtime(state);
     for id in ids {
         all.remove(id);
     }
@@ -288,9 +298,14 @@ pub struct Stalled {
 
 /// Takes out the playbacks of the sessions in `ended`, and those without a report for
 /// `PLAYBACK_IDLE_MINUTES`, and forgets the sessions in `ended` and those not in `known`.
-fn sweep(ended: &[String], known: Option<&[String]>, now: DateTime<Utc>) -> Vec<Stalled> {
+fn sweep(
+    state: &AppState,
+    ended: &[String],
+    known: Option<&[String]>,
+    now: DateTime<Utc>,
+) -> Vec<Stalled> {
     let cutoff = now - chrono::Duration::minutes(PLAYBACK_IDLE_MINUTES);
-    let mut all = runtime();
+    let mut all = runtime(state);
     let mut stalled = Vec::new();
     for (id, rt) in all.iter_mut() {
         let gone = ended.contains(id) || known.is_some_and(|k| !k.contains(id));
@@ -380,7 +395,7 @@ pub async fn expire_at(state: &AppState, now: DateTime<Utc>) {
     let known: Option<Vec<String>> = sessions
         .as_ref()
         .map(|s| s.iter().map(|s| s.id.clone()).collect());
-    let stalled = sweep(&ended, known.as_deref(), now);
+    let stalled = sweep(state, &ended, known.as_deref(), now);
     for s in &stalled {
         let device = sessions
             .as_ref()
@@ -437,7 +452,7 @@ pub async fn list(
 /// One session as Jellyfin's `SessionInfoDto`.
 async fn dto(state: &AppState, s: &SessionInfo, viewer: Uuid, socket: bool) -> serde_json::Value {
     let (playing, play_state, check_in) = {
-        let all = RUNTIME.read().unwrap_or_else(|e| e.into_inner());
+        let all = state.session_runtime.read();
         match all.get(&s.id) {
             Some(rt) => (rt.playing.clone(), rt.play_state.clone(), rt.last_check_in),
             None => (None, PlayState::default(), None),

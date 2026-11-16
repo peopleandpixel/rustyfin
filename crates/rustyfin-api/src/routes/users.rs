@@ -252,7 +252,7 @@ async fn remove_user(state: &AppState, claims: &Claims, id: Uuid) -> Result<(), 
     if !deleted {
         return Err(ApiError::NotFound("user not found".into()));
     }
-    crate::sessions::forget_all(&ended);
+    crate::sessions::forget_all(state, &ended);
     crate::sessions::changed(state);
     // The profile picture's folder; its rows went with the user
     let _ =
