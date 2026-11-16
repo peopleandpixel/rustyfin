@@ -98,6 +98,7 @@ test('closing the player resets the bars and leaves fullscreen when the page hol
             hideSkipSegment: () => {},
             hideTrickplay: () => {},
             clearMediaSession: () => {},
+            togglePlaybackStats: () => {},
             playerBars: { reset: () => calls.push('reset') },
             document: {
                 fullscreenElement: full ? {} : null,

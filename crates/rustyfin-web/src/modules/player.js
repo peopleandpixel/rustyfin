@@ -886,6 +886,7 @@ function onPlayerClosed() {
     resetEpisodeNav();
     hideSkipSegment();
     hideTrickplay();
+    togglePlaybackStats(false);
     clearMediaSession();
     playerBars?.reset();
     if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
@@ -1297,6 +1298,109 @@ function playerKeyAction(e) {
     case 'g': return () => changeSubtitleOffset(-1);
     case 'h': return () => changeSubtitleOffset(1);
     default: return null;
+    }
+}
+
+// --- Playback info: Jellyfin Web's player stats overlay, refreshed every second while it shows ---
+let statsTimer = null;
+
+// Why the server transcodes, in Jellyfin's TranscodeReasons names, as far as the client can tell: what this
+// browser can't play, a burned-in subtitle, or a source over the quality limit
+function transcodeReasons(session, codecs, limit) {
+    if (session.playMethod !== 'Transcode') return [];
+    const source = session.sources.find(s => s.Id === session.mediaSourceId) || {};
+    const video = session.streams.find(s => isStreamType(s, 'video'));
+    const audio = findStream(session, 'audio', session.audioIndex);
+    const name = c => {
+        const codec = (c || '').toLowerCase();
+        return { avc: 'h264', h265: 'hevc', hvc1: 'hevc', mp4a: 'aac' }[codec] || codec;
+    };
+    const reasons = [];
+    if (!['mp4', 'm4v', 'webm', 'mkv', 'mka', 'mov'].some(c => (source.Container || '').toLowerCase().split(',').includes(c))) reasons.push('ContainerNotSupported');
+    if (video && !codecs.video.includes(name(video.Codec))) reasons.push('VideoCodecNotSupported');
+    if (audio && !codecs.audio.includes(name(audio.Codec))) reasons.push('AudioCodecNotSupported');
+    if (session.burnedIn) reasons.push('SubtitleCodecNotSupported');
+    if (limit && source.Bitrate > limit) reasons.push('ContainerBitrateExceedsLimit');
+    return reasons;
+}
+
+// Seconds buffered ahead of the playing point
+function bufferedAhead(video) {
+    const ranges = video.buffered;
+    for (let i = 0; i < (ranges?.length || 0); i++) {
+        if (ranges.start(i) <= video.currentTime + 0.5 && ranges.end(i) >= video.currentTime) return ranges.end(i) - video.currentTime;
+    }
+    return 0;
+}
+
+const formatBitrate = bps => (bps > 0 ? bitrateLabel(Math.round(bps / 1e4) * 1e4) : '');
+
+// The overlay's sections and rows as [label, value]; empty values are left out
+function playbackStats(session, video, { codecs, limit, hls = null }) {
+    const source = session.sources.find(s => s.Id === session.mediaSourceId) || {};
+    const v = session.streams.find(s => isStreamType(s, 'video'));
+    const a = findStream(session, 'audio', session.audioIndex);
+    const sub = findStream(session, 'subtitle', session.subtitleIndex);
+    const quality = video.getVideoPlaybackQuality?.();
+    const methods = { DirectPlay: 'player.direct_play', DirectStream: 'player.direct_stream', Transcode: 'player.hls_transcode' };
+    const level = hls?.levels?.[hls.currentLevel];
+    const playback = [
+        ['player.stats_player', hls ? 'HTML video (hls.js)' : 'HTML video'],
+        ['player.stats_play_method', session.playMethod ? t(methods[session.playMethod]) : ''],
+        ['player.stats_reasons', transcodeReasons(session, codecs, limit).map(r => t(`player.reason_${r}`)).join(', ')],
+        ['player.quality', limit ? bitrateLabel(limit) : t('player.quality_auto')],
+        ['player.stats_stream_bitrate', formatBitrate(level?.bitrate)],
+        ['player.stats_resolution', video.videoWidth ? `${video.videoWidth}×${video.videoHeight}` : ''],
+        ['player.stats_dropped', quality ? `${quality.droppedVideoFrames} / ${quality.totalVideoFrames}` : ''],
+        ['player.stats_buffer', `${bufferedAhead(video).toFixed(1)} s`],
+    ];
+    const media = [
+        ['player.stats_container', (source.Container || '').toUpperCase()],
+        ['player.stats_size', source.Size > 0 ? `${(source.Size / 1048576).toFixed(1)} MiB` : ''],
+        ['player.stats_bitrate', formatBitrate(source.Bitrate)],
+        ['player.stats_video', v ? [(v.Codec || '').toUpperCase(), v.Profile, v.Width && `${v.Width}×${v.Height}`, v.BitDepth && `${v.BitDepth} bit`, formatBitrate(v.BitRate)].filter(Boolean).join(' · ') : ''],
+        ['player.stats_audio', a ? [(a.Codec || '').toUpperCase(), a.Language, a.ChannelLayout || (a.Channels && t('player.track_channels', { count: a.Channels })), formatBitrate(a.BitRate)].filter(Boolean).join(' · ') : ''],
+        ['player.stats_subtitles', sub ? [(sub.Codec || '').toUpperCase(), sub.Language, t(session.burnedIn ? 'player.stats_burned_in' : 'player.stats_text')].filter(Boolean).join(' · ') : ''],
+    ];
+    return [['player.playback_info', playback], ['player.stats_original', media]]
+        .map(([title, rows]) => [title, rows.filter(([, value]) => value)]);
+}
+
+function renderPlaybackStats() {
+    const session = activePlayback;
+    const body = $('player-stats-body');
+    if (!body || !session || session.streamType !== 'Videos') return;
+    const sections = playbackStats(session, $('video-player'), { codecs: API.playableCodecs(), limit: maxStreamingBitrate(), hls: hlsInstance });
+    body.replaceChildren(...sections.map(([title, rows]) => {
+        const section = document.createElement('section');
+        const heading = document.createElement('h4');
+        heading.className = 'jf-player-menu-heading';
+        heading.textContent = t(title);
+        const list = document.createElement('dl');
+        for (const [label, value] of rows) {
+            const dt = document.createElement('dt');
+            dt.textContent = t(label);
+            const dd = document.createElement('dd');
+            dd.textContent = value;
+            list.append(dt, dd);
+        }
+        section.append(heading, list);
+        return section;
+    }));
+}
+
+// Shows or hides the overlay (on: true or false; none toggles)
+function togglePlaybackStats(on) {
+    const panel = $('player-stats');
+    if (!panel) return;
+    const show = typeof on === 'boolean' ? on : panel.hidden;
+    panel.hidden = !show;
+    clearInterval(statsTimer);
+    statsTimer = null;
+    if (show) {
+        closePlayerSettings();
+        renderPlaybackStats();
+        statsTimer = setInterval(renderPlaybackStats, 1000);
     }
 }
 
@@ -1781,6 +1885,7 @@ export {
     playUpNextNow, cancelUpNext, togglePlayPause, setVolume, toggleMute, setPlaybackRate, toggleFullscreen,
     togglePictureInPicture, skipSegment, hoverSeek, hideTrickplay, renderPlayerSettings, setSubtitleAppearance,
     changeSubtitleOffset, changeQuality, changeVersion, changeAspectRatio, renderChapterMenu, changeSegmentAction,
+    togglePlaybackStats,
 };
 
 // Shared state that inline handlers or other modules assign: reached through window

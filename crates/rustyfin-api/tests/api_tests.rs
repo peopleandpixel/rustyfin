@@ -23369,6 +23369,12 @@ fn r3playercore_segments() {
     b124_node_test("r3playercore_segments.mjs");
 }
 
+// R3 core player: the Playback info overlay (play method, transcode reasons, codecs, buffer, dropped frames)
+#[test]
+fn r3playercore_stats() {
+    b124_node_test("r3playercore_stats.mjs");
+}
+
 // The web client's item page: credits, ratings, media info, track pickers, chapters, links, "mark all
 // played" and delete (tests/web/r3item_detail.mjs), and the pickers' choice in the player
 // (tests/web/r3item_play.mjs)
