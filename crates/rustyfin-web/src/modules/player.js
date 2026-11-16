@@ -753,7 +753,8 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
             video.removeAttribute('src');
             video.load();
             clearTextSubtitle();
-            if (activePlayback === null && !playLoading) updateNowPlaying(null);
+            // A song that ended leaves the bar to onended, which plays the next or ends the music
+            if (activePlayback === null && !playLoading && !session.ended) updateNowPlaying(null);
             return reported;
         },
     };
@@ -803,6 +804,7 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
 
     video.onended = () => {
         if (activePlayback !== session) return;
+        session.ended = true;
         session.stop();
         upNextAtEnd(session);
         // The last song of the queue: the music is over (nothing next started loading)

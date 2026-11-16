@@ -115,7 +115,8 @@ test('the end of the queue ends the music; the next song keeps the bar up', () =
     const play = slice('async function playItem(');
     assert.match(play, /playLoading = request;/);
     assert.match(play, /session\.streamType === 'Audio' && !playLoading && !activePlayback\) endNowPlaying\(\)/);
-    assert.match(play, /if \(activePlayback === null && !playLoading\) updateNowPlaying\(null\)/);
+    assert.match(play, /if \(activePlayback === null && !playLoading && !session\.ended\) updateNowPlaying\(null\)/);
+    assert.match(play, /session\.ended = true;\s+session\.stop\(\);/);
     const { context, elements, calls } = sandbox(null);
     elements['now-playing'] = { hidden: false };
     vm.runInContext('endNowPlaying()', context);
