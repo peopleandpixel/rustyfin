@@ -6,6 +6,7 @@ import { renderGenreRows, genreNameOf } from './genres.js';
 import { hashRoute } from './router.js';
 import { musicTab, rememberMusicTab, musicTabBar, renderMusicTab } from './music.js';
 import { KINDS, renderContainerPage, renderCollectionsTab } from './collections.js';
+import { renderPhotoLibrary } from './photos.js';
 let currentLibraryId = null;
 // The route shown (library/<this>): the library id, then a music library's tab and genre
 let currentLibraryRoute = null;
@@ -637,6 +638,13 @@ async function renderLibrary(route) {
     const contentType = lib?.content_type || lib?.Content_type || lib?.ContentType || '';
     const libIcon = contentType === 'Movies' ? 'Film' : contentType === 'TvShows' ? 'Tv' : contentType === 'Music' ? 'Music' : 'Folder';
     const headerIcon = { Movies: 'Film', TvShows: 'Tv', Music: 'Music' }[lib?.content_type] || 'Folder';
+    // A photo library browses its folders in place: library/<id>/folder/<path> (photos.js)
+    if (contentType === 'Photos') {
+        stopLibraryLoad();
+        destroyInfiniteScroll();
+        renderPhotoLibrary(lib, libId, tab === 'folder' ? String(route).split('/').slice(2) : []);
+        return;
+    }
     // A music library's tabs other than Albums are drawn by music.js; Albums is this grid
     const musicView = contentType === 'Music' ? musicTab(libId, tab, sub) : null;
     if (musicView && musicView !== 'albums') {

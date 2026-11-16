@@ -3,7 +3,7 @@ import { $, icon, toast, escapeHtml, scanRing } from './util.js';
 import { backdropUrl, createCardElement, sectionRow } from './cards.js';
 import { serverVersion } from './wizard.js';
 import { LIBRARY_PAGE_SIZE, setupInfiniteScroll, destroyInfiniteScroll } from './library.js';
-import { loadUserSettings, homeSections, showsInLatest } from './user-settings.js';
+import { loadUserSettings, homeSections, showsInLatest, arrangeLibraries } from './user-settings.js';
 import { containerTilesHtml, revealContainerTiles } from './collections.js';
 
 // --- Home Page Renderer ---
@@ -86,16 +86,17 @@ async function renderHome() {
 
     try {
         let libsError = null;
-        const libsRequest = API.getLibraries().catch(err => { libsError = err; return null; });
-        // The user's home screen settings: the sections' order, and the libraries left out of "Latest"
+        // The user's home screen settings: the sections' order, the libraries' order (OrderedViews),
+        // those hidden from My Media (MyMediaExcludes) and those left out of "Latest"
         const settingsLoad = loadUserSettings().catch(() => null);
+        const libsRequest = API.getLibraries().catch(err => { libsError = err; return null; });
+        const homeLibs = Promise.all([libsRequest, settingsLoad]).then(([libs]) => arrangeLibraries(libs, { hide: true }));
         const [resumeData, resumeAudioData, nextUpData, latestRows, libsData] = await Promise.all([
             API.cachedGet(resumeUrl('Video')).catch(() => ({ Items: [] })),
             API.cachedGet(resumeUrl('Audio')).catch(() => ({ Items: [] })),
             (API.getNextUp ? API.getNextUp(12) : Promise.resolve({ Items: [] })).catch(() => ({ Items: [] })),
-            Promise.all([libsRequest, settingsLoad])
-                .then(([libs]) => fetchLatestRows((libs || []).filter(lib => showsInLatest(lib.id || lib.Id)))),
-            libsRequest,
+            homeLibs.then(libs => fetchLatestRows(libs.filter(lib => showsInLatest(lib.id || lib.Id)))),
+            homeLibs,
         ]);
         if (API.token !== session) return;
 
@@ -103,7 +104,7 @@ async function renderHome() {
         const resumeAudio = resumeAudioData.Items || resumeAudioData.items || [];
         const nextUp = nextUpData.Items || nextUpData.items || [];
         const latest = latestRows.find(row => row.items.length)?.items || [];
-        if (!libsError) libraries = libsData || [];
+        if (!libsError) libraries = (await libsRequest) || [];
 
         let c = '<div class="jf-page space-y-8">';
 
@@ -117,8 +118,8 @@ async function renderHome() {
             const spRating = spotlightItem.CommunityRating || spotlightItem.community_rating;
             const spType = spotlightItem.Type || spotlightItem.type || 'Movie';
             const spBackdrop = backdropUrl(spotlightItem, 1920);
-            const canPlay = ['Movie', 'Episode', 'Audio', 'MusicVideo', 'Video'].includes(spType);
-            const streamType = spType === 'Audio' ? 'Audio' : 'Videos';
+            const canPlay = ['Movie', 'Episode', 'Audio', 'MusicVideo', 'Video', 'Photo'].includes(spType);
+            const streamType = spType === 'Audio' ? 'Audio' : spType === 'Photo' ? 'Photo' : 'Videos';
 
             c += `
             <div class="jf-spotlight mb-10">
@@ -158,7 +159,7 @@ async function renderHome() {
                 </div>
                 <p class="text-sm text-red-400">${t('library.list_failed', { message: escapeHtml(libsError.message) })}</p>
             </div>`;
-        } else if (libraries.length > 0) {
+        } else if (libsData.length > 0) {
             tiles = `
             <div class="mb-10">
                 <div class="flex items-center gap-2 mb-4">
@@ -166,7 +167,7 @@ async function renderHome() {
                     <h2 class="text-lg lg:text-xl font-bold tracking-tight text-white">${t('home.my_media')}</h2>
                 </div>
                 <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-4">
-                    ${libraries.map(lib => {
+                    ${libsData.map(lib => {
                         const libId = lib.id || lib.Id;
                         const libName = lib.name || lib.Name;
                         const libType = lib.content_type || lib.ContentType || 'Mixed';

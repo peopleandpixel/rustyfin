@@ -32,9 +32,10 @@ import './modules/remote.js';
 import { sessionControl, openPlayOn, playOnSession } from './modules/sessions.js';
 import './modules/cardmenu.js';
 import './modules/collections.js';
+import './modules/photos.js';
 import {
     changeNextEpisodeAutoPlay, changeUiLanguage, handleSaveConfig, changeUserConfig, changeUserPref, changeHomeSection,
-    changeSubtitleAppearance, changeLatestLibrary, chooseProfileImage, deleteProfileImage,
+    changeSubtitleAppearance, changeLatestLibrary, changeMyMediaLibrary, chooseProfileImage, deleteProfileImage,
 } from './modules/settings.js';
 import './modules/playback-admin.js';
 import {
@@ -64,6 +65,6 @@ Object.assign(window, {
     submitLibraryOptions, openAddUser, closeAddUser,
     submitAddUser, clearLiveLog, setLogLevel, closePluginConfig, savePluginConfig, closePluginPriority,
     savePluginPriority, sessionControl, openPlayOn, playOnSession, changeUserConfig, changeUserPref, changeHomeSection,
-    changeSubtitleAppearance, changeLatestLibrary, chooseProfileImage, deleteProfileImage, saveGeneralSettings,
+    changeSubtitleAppearance, changeLatestLibrary, changeMyMediaLibrary, chooseProfileImage, deleteProfileImage, saveGeneralSettings,
     addLibraryFolder, renameLibrary, addTaskTrigger, showTriggerFields,
 });
