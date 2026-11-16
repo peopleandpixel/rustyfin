@@ -14,7 +14,8 @@ use uuid::Uuid;
 /// is read again anyway.
 ///
 /// 2: a video stream's codec level, its bit depth from the pixel format when ffprobe gives no
-/// sample size, its anamorphic flag and its interlaced flag, which the playback decision tests.
+/// sample size, its anamorphic flag and its interlaced flag, and a Matroska stream's bit rate
+/// from its statistics tags, which the playback decision reads.
 pub const PROBE_VERSION: i64 = 2;
 
 // ---------------------------------------------------------------------------

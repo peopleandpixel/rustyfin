@@ -740,6 +740,13 @@ fn stream_to_model(s: FfprobeStream) -> MediaStream {
                 .then(|| s.pix_fmt.as_deref().and_then(pixel_format_bit_depth))
                 .flatten()
         });
+    // A Matroska stream has no bit rate of its own; its statistics tags carry one
+    let is_audio = s.codec_type.as_deref() == Some("audio");
+    let bit_rate = s.bit_rate.filter(|rate| *rate > 0).or_else(|| {
+        (is_video || is_audio)
+            .then(|| tag_bit_rate(s.tags.as_ref()))
+            .flatten()
+    });
     let level = s
         .level
         .filter(|level| is_video && *level > 0)
@@ -769,7 +776,7 @@ fn stream_to_model(s: FfprobeStream) -> MediaStream {
         height: s.height,
         average_frame_rate: s.avg_frame_rate,
         real_frame_rate: s.r_frame_rate,
-        bit_rate: s.bit_rate,
+        bit_rate,
         bit_depth,
         channels: s.channels,
         channel_layout: s.channel_layout,
@@ -794,6 +801,35 @@ fn stream_to_model(s: FfprobeStream) -> MediaStream {
         level,
         is_anamorphic,
     }
+}
+
+/// A stream's bit rate from its Matroska statistics tags, as Jellyfin reads it: `BPS`, else
+/// `NUMBER_OF_BYTES` over `DURATION` when the stream lasts a second or more. The `-eng` variants
+/// that mkvmerge writes come first.
+fn tag_bit_rate(tags: Option<&HashMap<String, String>>) -> Option<u32> {
+    let either = |name: &str| tag(tags, &format!("{name}-eng")).or_else(|| tag(tags, name));
+    if let Some(bps) = either("BPS").and_then(|bps| bps.trim().parse::<u32>().ok()) {
+        return Some(bps).filter(|bps| *bps > 0);
+    }
+    let bytes: u64 = either("NUMBER_OF_BYTES")?.trim().parse().ok()?;
+    let seconds = either("DURATION").and_then(duration_seconds)?;
+    if seconds < 1.0 {
+        return None;
+    }
+    let bps = (bytes as f64 * 8.0 / seconds).round();
+    (bps > 0.0 && bps <= f64::from(u32::MAX)).then_some(bps as u32)
+}
+
+/// Seconds in a Matroska `DURATION` tag, `HH:MM:SS.fraction`.
+fn duration_seconds(text: &str) -> Option<f64> {
+    let mut parts = text.trim().split(':');
+    let hours: f64 = parts.next()?.parse().ok()?;
+    let minutes: f64 = parts.next()?.parse().ok()?;
+    let seconds: f64 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(hours * 3600.0 + minutes * 60.0 + seconds)
 }
 
 /// The bit depth that Jellyfin reads from a pixel format when ffprobe gives no sample size.
@@ -1482,6 +1518,34 @@ mod tests {
                 (None, Some(8), Some(false), false),
                 (None, None, None, false),
             ]
+        );
+    }
+
+    /// A Matroska stream's bit rate comes from its `BPS` tag, else from its byte count over its
+    /// duration, as Jellyfin reads them; ffprobe's own bit rate wins.
+    #[test]
+    fn r3decisions_matroska_streams_take_their_bit_rate_from_tags() {
+        let json = r#"{"streams": [
+            {"index": 0, "codec_name": "hevc", "codec_type": "video",
+                "tags": {"BPS-eng": "48082772", "BPS": "1"}},
+            {"index": 1, "codec_name": "dts", "codec_type": "audio",
+                "tags": {"NUMBER_OF_BYTES": "1000000", "DURATION": "00:00:08.000000000"}},
+            {"index": 2, "codec_name": "ac3", "codec_type": "audio", "bit_rate": "640000",
+                "tags": {"BPS": "1"}},
+            {"index": 3, "codec_name": "aac", "codec_type": "audio",
+                "tags": {"NUMBER_OF_BYTES": "10", "DURATION": "00:00:00.500000000"}},
+            {"index": 4, "codec_name": "subrip", "codec_type": "subtitle", "tags": {"BPS": "90"}}
+        ]}"#;
+        let parsed: FfprobeOutput = serde_json::from_str(json).expect("should parse");
+        let rates: Vec<_> = parsed
+            .streams
+            .into_iter()
+            .map(stream_to_model)
+            .map(|s| s.bit_rate)
+            .collect();
+        assert_eq!(
+            rates,
+            vec![Some(48_082_772), Some(1_000_000), Some(640_000), None, None]
         );
     }
 
