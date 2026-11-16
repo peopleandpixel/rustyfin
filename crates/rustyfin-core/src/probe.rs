@@ -147,8 +147,14 @@ struct SideData {
 /// The Dolby Vision configuration record in a stream's side data, as Jellyfin reads it; empty
 /// when there is none.
 fn dovi_config(side_data: Option<&[SideData]>) -> DoviConfig {
-    side_data
-        .unwrap_or_default()
+    let side_data = side_data.unwrap_or_default();
+    // HDR10+ dynamic metadata (SMPTE 2094-40), where the stream's side data lists it
+    let hdr10_plus = side_data.iter().any(|d| {
+        d.side_data_type
+            .as_deref()
+            .is_some_and(|t| t.contains("2094-40"))
+    });
+    let mut config = side_data
         .iter()
         .find(|d| {
             d.side_data_type
@@ -164,8 +170,13 @@ fn dovi_config(side_data: Option<&[SideData]>) -> DoviConfig {
             el_present_flag: d.el_present_flag,
             bl_present_flag: d.bl_present_flag,
             dv_bl_signal_compatibility_id: d.dv_bl_signal_compatibility_id,
+            hdr10_plus_present_flag: None,
         })
-        .unwrap_or_default()
+        .unwrap_or_default();
+    if hdr10_plus {
+        config.hdr10_plus_present_flag = Some(true);
+    }
+    config
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -297,6 +308,56 @@ struct FfprobeChapter {
 
 /// Probe a media file using ffprobe and return the parsed result.
 pub async fn probe_file(path: &str) -> Result<ProbeResult, ProbeError> {
+    let mut result = probe_streams(path).await?;
+    // A video's subtitle files are stored with its streams, as Jellyfin stores them at scan
+    // time: the numbering clients see then holds until the next scan
+    if result
+        .source
+        .media_streams
+        .iter()
+        .any(|s| s.codec_type.eq_ignore_ascii_case("video"))
+    {
+        let media_path = std::path::PathBuf::from(path);
+        let found = tokio::task::spawn_blocking(move || {
+            crate::subtitle::discover_external_subtitles(&media_path)
+        })
+        .await
+        .unwrap_or_default();
+        add_external_subtitles(&mut result.source, found);
+    }
+    Ok(result)
+}
+
+/// Adds the external subtitle files `found` to `source`'s streams, after its embedded streams,
+/// in file-name order. Their stored index follows the embedded ones; PlaybackInfo numbers them
+/// first, as Jellyfin does.
+pub fn add_external_subtitles(
+    source: &mut MediaSourceResponse,
+    found: Vec<crate::subtitle::ExternalSubtitle>,
+) {
+    let next = source
+        .media_streams
+        .iter()
+        .map(|s| s.index)
+        .max()
+        .unwrap_or(-1)
+        + 1;
+    for (k, file) in found.into_iter().enumerate() {
+        source.media_streams.push(MediaStream {
+            index: next + k as i32,
+            codec: Some(file.format),
+            codec_type: "subtitle".to_string(),
+            language: file.language,
+            is_external: true,
+            path: Some(file.path.to_string_lossy().into_owned()),
+            r#type: MediaStream::stream_type("subtitle", None),
+            ..Default::default()
+        });
+    }
+}
+
+/// Probes `path` with ffprobe: its embedded streams, format, tags and chapters.
+async fn probe_streams(path: &str) -> Result<ProbeResult, ProbeError> {
     let output = Command::new("ffprobe")
         .args([
             "-v",

@@ -9,7 +9,7 @@ use std::time::UNIX_EPOCH;
 
 use chrono::{DateTime, FixedOffset, Utc};
 use rustyfin_db::repo_media::{PathScope, SORT_NAME_KEPT};
-use rustyfin_db::repo_media_source::PROBE_VERSION;
+use rustyfin_db::repo_media_source::{AUDIO_PROBE_VERSION, PROBE_VERSION};
 use rustyfin_model::library::{Library, LibraryContentType};
 use rustyfin_model::media::{LocationType, MediaType};
 use rustyfin_model::metadata::ExternalMetadata;
@@ -645,7 +645,7 @@ pub(crate) async fn outdated_audio_sources(
         scope.sql("s.path", 3)
     )))
     .bind(library_id.to_string())
-    .bind(PROBE_VERSION)
+    .bind(AUDIO_PROBE_VERSION)
     .bind(scope.param())
     .fetch_all(pool)
     .await?;
@@ -684,6 +684,28 @@ struct SourceRow {
     modified: Option<i64>,
     /// The [`PROBE_VERSION`] of the probe that wrote the source.
     probe_version: i64,
+    /// The paths of the external subtitle files the probe stored, joined by U+001F
+    externals: Option<String>,
+}
+
+impl SourceRow {
+    /// Whether the subtitle files beside the source's file differ from the ones its probe stored
+    /// (one added, removed or renamed). Only the folder is listed; no file is read.
+    fn externals_changed(&self) -> bool {
+        let mut stored: Vec<&str> = self
+            .externals
+            .as_deref()
+            .map(|paths| paths.split('\u{1f}').filter(|p| !p.is_empty()).collect())
+            .unwrap_or_default();
+        stored.sort_unstable();
+        let found = crate::subtitle::discover_external_subtitles(std::path::Path::new(&self.path));
+        let mut found: Vec<String> = found
+            .into_iter()
+            .map(|sub| sub.path.to_string_lossy().into_owned())
+            .collect();
+        found.sort_unstable();
+        !found.iter().map(String::as_str).eq(stored.iter().copied())
+    }
 }
 
 /// The fields that a group gives its item, by media type.
@@ -1208,7 +1230,9 @@ async fn reconcile_groups(
     .fetch_all(pool)
     .await?;
     let sources: Vec<SourceRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT s.item_id, s.path, s.run_time_ticks, s.size, s.modified, s.probe_version
+        "SELECT s.item_id, s.path, s.run_time_ticks, s.size, s.modified, s.probe_version,
+                (SELECT group_concat(st.path, char(31)) FROM media_streams AS st
+                 WHERE st.source_id = s.id AND st.is_external = 1) AS externals
          FROM media_sources AS s
          JOIN media_items AS m ON m.id = s.item_id
          WHERE m.library_id = ?1 AND m.media_type = ?2 AND {loaded}
@@ -1634,10 +1658,14 @@ async fn settle_group(
     let outdated = sources.iter().any(|source| {
         source.probe_version < PROBE_VERSION && !is_known_failure(&source.path, failures)
     });
+    // A subtitle file added beside a video, or removed, is stored by a probe, as Jellyfin finds
+    // it on a scan; only the folder is listed
+    let subtitles_changed = sources.iter().any(|source| source.externals_changed());
     let settled = others.is_empty()
         && survivor.path == primary
         && source_paths_match
         && !changed
+        && !subtitles_changed
         && (probeable.is_empty() || runtime_match);
     let steady = settled && !(outdated && rereads.open().await);
     let steps = if steady {

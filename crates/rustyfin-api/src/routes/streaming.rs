@@ -614,9 +614,26 @@ async fn video_stream_answer(
     // The remote bitrate limit, before the copy decision
     query.video_bitrate = caller.bitrate(query.video_bitrate);
     let mut profile = super::transcode::progressive_video_profile(query, params, source);
-    if let Some(channels) = progressive::channel_limit(params) {
-        profile.audio_channels = Some(channels);
-    }
+    // The channels: never more than the client's limit, the played track's or the encoder's
+    let track = profile
+        .audio_stream_index
+        .and_then(|index| {
+            source?
+                .media_streams
+                .iter()
+                .find(|s| !s.is_external && u32::try_from(s.index) == Ok(index))
+        })
+        .or_else(|| {
+            source?
+                .media_streams
+                .iter()
+                .find(|s| s.codec_type.eq_ignore_ascii_case("audio"))
+        });
+    profile.audio_channels = progressive::output_channels(
+        progressive::channel_limit(params),
+        track.and_then(|s| s.channels),
+        &profile.audio_codec,
+    );
     let container = container
         .or_else(|| param("Container").map(str::to_string))
         .or_else(|| source.and_then(|s| s.container.clone()))
@@ -732,10 +749,12 @@ async fn audio_stream_answer(
             .unwrap_or_default()
             .into_iter()
             .next();
-    let Some(source) = source else {
+    let Some(mut source) = source else {
         // A track that was never probed plays as it is
         return Ok(Served::File(path));
     };
+    // The numbers a client sends (AudioStreamIndex) are PlaybackInfo's
+    crate::routes::subtitle::number_streams(&mut source);
     let codec = source
         .media_streams
         .iter()
@@ -1526,7 +1545,6 @@ async fn video_playback_info(
     // EnablePlaybackRemuxing, no transcode without EnableVideoPlaybackTranscoding, and no direct
     // play of a remote source with ForceRemoteSourceTranscoding
     let access = crate::parental::caller_access(&state, &claims).await?;
-    let mut media_sources = media_sources;
     for source in media_sources.iter_mut() {
         source.supports_direct_play &=
             !(access.force_remote_source_transcoding && source.is_remote);

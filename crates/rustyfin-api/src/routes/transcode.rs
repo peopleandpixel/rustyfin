@@ -741,7 +741,7 @@ pub(crate) async fn to_file_numbering(
     source: Option<&MediaSourceResponse>,
 ) -> TranscodeQuery {
     let externals = match source {
-        Some(source) => crate::routes::subtitle::external_count(source).await,
+        Some(source) => crate::routes::subtitle::external_count(source),
         None => 0,
     };
     let convert = |index: Option<i32>| {

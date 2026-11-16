@@ -36043,15 +36043,17 @@ async fn r3playback_subtitle_routes_refuse_files_out_of_the_library() {
             &[("video", "h264")],
         )
         .await;
+        r3gaps2_store_subtitles(&state, id).await;
     }
     let app = app(state);
 
-    // The subtitle beside the film is served by all three routes
+    // The subtitle beside the film is served by all three routes (stream 0: Jellyfin numbers
+    // the files the scan stored first)
     let routes = |id: uuid::Uuid| {
         [
             format!("/Videos/{id}/Subtitles/0/Stream"),
             format!("/Videos/{id}/Subtitles/0?Format=vtt"),
-            format!("/Videos/{id}/{id}/Subtitles/1/Stream.vtt"),
+            format!("/Videos/{id}/{id}/Subtitles/0/Stream.vtt"),
         ]
     };
     for uri in routes(good_id) {
@@ -37174,7 +37176,7 @@ async fn b22_insert_source(
     container: &str,
     streams: serde_json::Value,
 ) -> String {
-    let source: rustyfin_model::media_source::MediaSourceResponse =
+    let mut source: rustyfin_model::media_source::MediaSourceResponse =
         serde_json::from_value(serde_json::json!({
             "Id": uuid::Uuid::new_v4().to_string(),
             "Uid": uuid::Uuid::new_v4().to_string(),
@@ -37184,10 +37186,42 @@ async fn b22_insert_source(
             "MediaStreams": streams,
         }))
         .unwrap();
+    // The subtitle files beside the video, stored as the scan stores them
+    let found = rustyfin_core::subtitle::discover_external_subtitles(file);
+    rustyfin_core::probe::add_external_subtitles(&mut source, found);
     rustyfin_db::repo_media_source::insert_media_source_with_streams(&state.db, &item, &source)
         .await
         .unwrap()
         .to_string()
+}
+
+/// Stores the subtitle files beside the file of each of `item`'s sources with its streams, as a
+/// scan stores them (`probe::add_external_subtitles`).
+async fn r3gaps2_store_subtitles(state: &AppState, item: uuid::Uuid) {
+    for source in rustyfin_db::repo_media_source::get_media_sources(&state.db, &item)
+        .await
+        .unwrap()
+    {
+        let mut with = source.clone();
+        let stored: Vec<String> = source
+            .media_streams
+            .iter()
+            .filter_map(|s| s.path.clone())
+            .collect();
+        let found = rustyfin_core::subtitle::discover_external_subtitles(std::path::Path::new(
+            &source.path,
+        ))
+        .into_iter()
+        .filter(|sub| !stored.contains(&sub.path.to_string_lossy().into_owned()))
+        .collect();
+        rustyfin_core::probe::add_external_subtitles(&mut with, found);
+        let source_id = uuid::Uuid::parse_str(&source.id).unwrap();
+        for stream in &with.media_streams[source.media_streams.len()..] {
+            rustyfin_db::repo_media_source::insert_media_stream(&state.db, &source_id, stream)
+                .await
+                .unwrap();
+        }
+    }
 }
 
 /// Makes `B22 Film.mkv` in the media folder `folder`: 5 s of video (stream 0), FLAC audio (1)
@@ -37268,9 +37302,10 @@ async fn b22_subtitle_vtt_converts_embedded_and_external_subtitles() {
     let cache = state.data_dir.join("cache").join("subtitle-vtt");
     let app = app(state);
 
-    // The embedded stream 2, then the external files after the highest index, in name order
+    // Jellyfin's numbering: the external files first, in name order (eng 0, ger 1), then the
+    // embedded streams after them (the subtitle, stream 2 of the file, is 4)
     let vtt = |index: i32| format!("/Videos/{id}/{msid}/Subtitles/{index}/Stream.vtt");
-    let (status, content_type, embedded) = b22_get(&app, &vtt(2), &token).await;
+    let (status, content_type, embedded) = b22_get(&app, &vtt(4), &token).await;
     assert_eq!(status, StatusCode::OK, "{embedded}");
     assert_eq!(content_type, "text/vtt; charset=utf-8");
     assert!(embedded.starts_with("WEBVTT"), "{embedded}");
@@ -37281,7 +37316,7 @@ async fn b22_subtitle_vtt_converts_embedded_and_external_subtitles() {
         "{embedded}"
     );
 
-    let (status, _, body) = b22_get(&app, &vtt(3), &token).await;
+    let (status, _, body) = b22_get(&app, &vtt(0), &token).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(
         body.contains("External English") && !body.contains("Embedded"),
@@ -37289,13 +37324,13 @@ async fn b22_subtitle_vtt_converts_embedded_and_external_subtitles() {
     );
 
     // Windows-1252 text arrives as UTF-8; the format matches without case
-    let uri = format!("/Videos/{id}/{msid}/Subtitles/4/Stream.VTT");
+    let uri = format!("/Videos/{id}/{msid}/Subtitles/1/Stream.VTT");
     let (status, _, body) = b22_get(&app, &uri, &token).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body.contains("Grüße"), "{body}");
 
     // The item's own id, sent without dashes as clients do, names its primary source
-    let uri = format!("/Videos/{id}/{}/Subtitles/2/Stream.vtt", id.simple());
+    let uri = format!("/Videos/{id}/{}/Subtitles/4/Stream.vtt", id.simple());
     let (status, _, body) = b22_get(&app, &uri, &token).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body, embedded);
@@ -37309,11 +37344,12 @@ async fn b22_subtitle_vtt_converts_embedded_and_external_subtitles() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let cached = std::fs::read_to_string(cache.join(format!("v1-{msid}-2.vtt"))).unwrap();
+    let cached = std::fs::read_to_string(cache.join(format!("v1-{msid}-4.vtt"))).unwrap();
     let (stamp, text) = cached.split_once('\n').unwrap();
     let (hash, rest) = stamp.split_once('-').unwrap();
     assert_eq!(hash.len(), 16, "{stamp}");
-    assert_eq!(rest, format!("{}-{mtime}", meta.len()));
+    // ... and the stream in the file it was made from
+    assert_eq!(rest, format!("{}-{mtime}-m0:2", meta.len()));
     assert_eq!(text, embedded);
     let names: Vec<String> = std::fs::read_dir(&cache)
         .unwrap()
@@ -37345,7 +37381,8 @@ async fn b22_subtitle_vtt_moves_cues_back_by_the_start() {
     };
     // The same stream as SubRip, as a client with an srt subtitle profile asks for it, whole and
     // moved the same way
-    let srt = format!("/Videos/{id}/{msid}/Subtitles/2/Stream.srt");
+    // (the embedded subtitle is 4: the two external files come first)
+    let srt = format!("/Videos/{id}/{msid}/Subtitles/4/Stream.srt");
     let (status, content_type, body) = b22_get(&app, &srt, &token).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(content_type, "application/x-subrip; charset=utf-8");
@@ -37353,7 +37390,7 @@ async fn b22_subtitle_vtt_moves_cues_back_by_the_start() {
         body.contains("00:00:01,000 --> 00:00:02,000\nEmbedded one"),
         "{body}"
     );
-    let srt = format!("/Videos/{id}/{msid}/Subtitles/2/15000000/Stream.srt");
+    let srt = format!("/Videos/{id}/{msid}/Subtitles/4/15000000/Stream.srt");
     let (status, _, body) = b22_get(&app, &srt, &token).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(
@@ -37365,7 +37402,7 @@ async fn b22_subtitle_vtt_moves_cues_back_by_the_start() {
         "{body}"
     );
 
-    let (status, content_type, body) = b22_get(&app, &at(2, 15_000_000), &token).await;
+    let (status, content_type, body) = b22_get(&app, &at(4, 15_000_000), &token).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(content_type, "text/vtt; charset=utf-8");
     assert!(body.starts_with("WEBVTT"), "{body}");
@@ -37379,7 +37416,7 @@ async fn b22_subtitle_vtt_moves_cues_back_by_the_start() {
     );
 
     // An external file moves the same way
-    let (status, _, body) = b22_get(&app, &at(3, 15_000_000), &token).await;
+    let (status, _, body) = b22_get(&app, &at(0, 15_000_000), &token).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(
         body.contains("00:00:00.000 --> 00:00:00.500\nExternal English"),
@@ -37387,7 +37424,7 @@ async fn b22_subtitle_vtt_moves_cues_back_by_the_start() {
     );
 
     // After the last cue: the header alone
-    let (status, _, body) = b22_get(&app, &at(2, 50_000_000), &token).await;
+    let (status, _, body) = b22_get(&app, &at(4, 50_000_000), &token).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(
         body.starts_with("WEBVTT") && !body.contains("-->"),
@@ -37395,9 +37432,9 @@ async fn b22_subtitle_vtt_moves_cues_back_by_the_start() {
     );
 
     // A start of 0 is the whole subtitle
-    let whole = format!("/Videos/{id}/{msid}/Subtitles/2/Stream.vtt");
+    let whole = format!("/Videos/{id}/{msid}/Subtitles/4/Stream.vtt");
     let (_, _, whole) = b22_get(&app, &whole, &token).await;
-    let (status, _, body) = b22_get(&app, &at(2, 0), &token).await;
+    let (status, _, body) = b22_get(&app, &at(4, 0), &token).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body, whole);
 }
@@ -37494,10 +37531,12 @@ async fn b22_subtitle_vtt_strips_ass_blocks() {
         Dialogue: 0,0:00:03.00,0:00:04.00,Default,,0,0,0,,{\\i1}Plain{\\i0} {note}text\n";
     let ass_file = file.parent().unwrap().join("B22 Film.jpn.ass");
     std::fs::write(ass_file, script).unwrap();
+    // A rescan stores the new file after the others
+    r3gaps2_store_subtitles(&state, id).await;
     let app = app(state);
 
-    // The external files follow the embedded stream 2 in name order: eng 3, ger 4, jpn 5
-    let uri = format!("/Videos/{id}/{msid}/Subtitles/5/Stream.vtt");
+    // The external files come first: eng 0, ger 1, then jpn 2, which the rescan added
+    let uri = format!("/Videos/{id}/{msid}/Subtitles/2/Stream.vtt");
     let (status, _, body) = b22_get(&app, &uri, &token).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body.contains("Doom") && body.contains("Plain"), "{body}");
@@ -37517,8 +37556,8 @@ async fn b22_subtitle_vtt_cache_keeps_one_file_per_stream() {
     let eng = std::path::PathBuf::from(media_folder(&state, "b22-cache")).join("B22 Film.eng.srt");
     let app = app(state);
 
-    // External English is stream 3
-    let uri = format!("/Videos/{id}/{msid}/Subtitles/3/Stream.vtt");
+    // External English is stream 0
+    let uri = format!("/Videos/{id}/{msid}/Subtitles/0/Stream.vtt");
     let (status, _, body) = b22_get(&app, &uri, &token).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body.contains("External English"), "{body}");
@@ -37566,8 +37605,8 @@ async fn b22_subtitle_vtt_refuses_a_huge_file() {
         .unwrap();
     let app = app(state);
 
-    // The WebVTT of stream 3 and the file itself are both too large
-    let vtt_uri = format!("/Videos/{id}/{msid}/Subtitles/3/Stream.vtt");
+    // The WebVTT of stream 0 and the file itself are both too large
+    let vtt_uri = format!("/Videos/{id}/{msid}/Subtitles/0/Stream.vtt");
     let (vtt, _, _) = b22_get(&app, &vtt_uri, &token).await;
     let (file, _, _) = b22_get(&app, &format!("/Videos/{id}/Subtitles/0/Stream"), &token).await;
     assert_eq!(
@@ -37831,6 +37870,7 @@ async fn r3playback_item_streams_list_external_subtitle_files() {
         &[("video", "h264"), ("audio", "aac"), ("subtitle", "subrip")],
     )
     .await;
+    r3gaps2_store_subtitles(&state, id).await;
     let app = app(state);
 
     let external = |streams: &serde_json::Value| -> Vec<(i64, String)> {
@@ -37847,8 +37887,9 @@ async fn r3playback_item_streams_list_external_subtitle_files() {
             })
             .collect()
     };
+    // Numbered first, as Jellyfin numbers the files the scan found
     let srt = folder.join("R3 Film.en.srt").to_str().unwrap().to_string();
-    let expected = vec![(3, srt)];
+    let expected = vec![(0, srt)];
 
     for uri in [
         format!("/Items/{id}"),
@@ -37909,7 +37950,7 @@ async fn b22_playback_info_lists_external_subtitles() {
     b22_insert_source(&state, id, &file, "mkv", streams).await;
     let app = app(state);
 
-    // The files beside the video follow its streams, in name order
+    // The files beside the video come first, in name order, as Jellyfin numbers them
     let uri = format!("/Videos/{id}/PlaybackInfo");
     let (status, body) = send(&app, request("GET", &uri, Some(&token), None)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -37919,10 +37960,11 @@ async fn b22_playback_info_lists_external_subtitles() {
         .map(|s| s["Index"].as_i64().unwrap())
         .collect();
     assert_eq!(indexes, [0, 1, 2, 3, 4], "{body}");
-    assert_eq!(streams[2]["IsExternal"], false);
+    assert_eq!(streams[4]["IsExternal"], false);
+    assert_eq!(streams[4]["Codec"], "subrip");
     for (stream, codec, language, path) in [
-        (&streams[3], "ass", None, &ass),
-        (&streams[4], "srt", Some("eng"), &srt),
+        (&streams[0], "ass", None, &ass),
+        (&streams[1], "srt", Some("eng"), &srt),
     ] {
         assert_eq!(stream["CodecType"], "subtitle", "{stream}");
         assert_eq!(stream["Type"], "Subtitle", "{stream}");
@@ -39030,14 +39072,21 @@ async fn b20_defaults_after_rescan(
     before: serde_json::Value,
     after: serde_json::Value,
 ) -> B20Defaults {
+    // The German tracks, as a client numbers them: with the German subtitle an external file,
+    // Jellyfin numbers it 0 and the embedded streams after it
+    let external = before
+        .as_array()
+        .is_some_and(|streams| streams.iter().any(|s| s["IsExternal"] == true));
+    let (audio, subtitle) = if external { (3, 0) } else { (2, 4) };
     let item = b20_movie(state, name, before).await;
     let body = serde_json::json!({
-        "ItemId": item, "PositionTicks": 0, "AudioStreamIndex": 2, "SubtitleStreamIndex": 4,
+        "ItemId": item, "PositionTicks": 0, "AudioStreamIndex": audio,
+        "SubtitleStreamIndex": subtitle,
     });
     b20_report(app, token, "/Progress", body).await;
     assert_eq!(
         b20_only_defaults(app, token, item).await,
-        b20_both(2, 4),
+        b20_both(audio, subtitle),
         "{name}: before the rescan"
     );
     rustyfin_db::repo_media_source::delete_media_sources(&state.db, &item)
@@ -39124,13 +39173,13 @@ async fn b20_rescan_offers_only_the_chosen_streams() {
             "External",
             external("/subs/B20 Ext.ger.srt"),
             external("/subs/B20 Ext.fre.srt"),
-            (Some(serde_json::json!(2)), None),
+            (Some(serde_json::json!(3)), None),
         ),
         (
             "External Moved",
             external("/subs/B20 Ext.ger.srt"),
             external("/elsewhere/B20 Ext.ger.srt"),
-            kept.clone(),
+            b20_both(3, 0),
         ),
     ];
     let mut wrong = Vec::new();
@@ -45133,6 +45182,7 @@ async fn j2_subtitles_get_deliveries() {
         "1\n00:00:01,000 --> 00:00:02,000\nJ2 cue\n",
     )
     .unwrap();
+    r3gaps2_store_subtitles(&state, item).await;
     let app = app(state);
     let (token, _) = g2_login_device(&app, "j2-subs", "j2-pass", "j2-device")
         .await

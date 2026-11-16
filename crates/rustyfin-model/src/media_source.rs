@@ -195,6 +195,9 @@ pub struct DoviConfig {
     pub bl_present_flag: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dv_bl_signal_compatibility_id: Option<i32>,
+    /// Whether the stream's side data carries HDR10+ (SMPTE 2094-40) metadata
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hdr10_plus_present_flag: Option<bool>,
 }
 
 impl DoviConfig {
@@ -259,8 +262,10 @@ impl MediaStream {
     /// Jellyfin's VideoRange and VideoRangeType of a video stream, as its
     /// `MediaStream.GetVideoColorRange` gives them; None for a stream that isn't video. Dolby
     /// Vision (a profile 5, 7, 8 or 10 record with RPU and base layer, or a `dovi`, `dvh1`,
-    /// `dvhe` or `dav1` tag) is typed by its profile and base layer compatibility; else the
-    /// colour transfer gives HDR10 (PQ) or HLG, and anything else is SDR.
+    /// `dvhe` or `dav1` tag) is typed by its profile and base layer compatibility: a
+    /// compatibility id the profile doesn't define (8.6, 10.6, ...) is DOVIInvalid, and HDR10+
+    /// metadata makes DOVIWithHDR10Plus or DOVIWithELHDR10Plus. Else HDR10+ metadata is HDR10Plus,
+    /// the colour transfer gives HDR10 (PQ) or HLG, and anything else is SDR.
     pub fn video_range(&self) -> Option<(&'static str, &'static str)> {
         if !self.codec_type.eq_ignore_ascii_case("video") {
             return None;
@@ -275,15 +280,24 @@ impl MediaStream {
         let dovi_flags = dv.rpu_present_flag == Some(1)
             && dv.bl_present_flag == Some(1)
             && matches!(dv.dv_bl_signal_compatibility_id, Some(0 | 1 | 2 | 4 | 6));
+        let hdr10_plus = dv.hdr10_plus_present_flag == Some(true);
         if (dovi_profile && dovi_flags) || matches!(tag.as_str(), "dovi" | "dvh1" | "dvhe" | "dav1")
         {
             return Some(match (dv.dv_profile, dv.dv_bl_signal_compatibility_id) {
+                (Some(5), _) => ("HDR", "DOVI"),
+                (Some(7), _) if hdr10_plus => ("HDR", "DOVIWithELHDR10Plus"),
                 (Some(7), _) => ("HDR", "DOVIWithEL"),
-                (Some(8 | 10), Some(1 | 6)) => ("HDR", "DOVIWithHDR10"),
+                (Some(8 | 10), Some(1)) if hdr10_plus => ("HDR", "DOVIWithHDR10Plus"),
+                (Some(8 | 10), Some(1)) => ("HDR", "DOVIWithHDR10"),
                 (Some(8 | 10), Some(4)) => ("HDR", "DOVIWithHLG"),
                 (Some(8 | 10), Some(2)) => ("SDR", "DOVIWithSDR"),
+                (Some(10), Some(0)) => ("HDR", "DOVI"),
+                (Some(8 | 10), _) => ("HDR", "DOVIInvalid"),
                 _ => ("HDR", "DOVI"),
             });
+        }
+        if hdr10_plus {
+            return Some(("HDR", "HDR10Plus"));
         }
         let transfer = self.color_transfer.as_deref().unwrap_or_default();
         Some(match transfer.to_ascii_lowercase().as_str() {
@@ -429,6 +443,18 @@ mod tests {
         assert_eq!(range(&dv(8, 4)), ("HDR", "DOVIWithHLG"));
         assert_eq!(range(&dv(8, 2)), ("SDR", "DOVIWithSDR"));
         assert_eq!(range(&dv(5, 0)), ("HDR", "DOVI"));
+        assert_eq!(range(&dv(10, 0)), ("HDR", "DOVI"));
+        // Compatibility ids the profile doesn't define
+        assert_eq!(range(&dv(8, 6)), ("HDR", "DOVIInvalid"));
+        assert_eq!(range(&dv(10, 6)), ("HDR", "DOVIInvalid"));
+        let mut plus = dv(8, 1);
+        plus.dovi.hdr10_plus_present_flag = Some(true);
+        assert_eq!(range(&plus), ("HDR", "DOVIWithHDR10Plus"));
+        plus.dovi = DoviConfig {
+            hdr10_plus_present_flag: Some(true),
+            ..DoviConfig::default()
+        };
+        assert_eq!(range(&plus), ("HDR", "HDR10Plus"));
         let mut tagged = dv(0, 0);
         tagged.dovi = DoviConfig::default();
         assert_eq!(range(&tagged), ("HDR", "HDR10"));

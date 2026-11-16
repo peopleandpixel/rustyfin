@@ -66,7 +66,8 @@ fn container_codec(container: &str) -> Option<&'static str> {
 }
 
 /// The audio stream a request plays: the one at `AudioStreamIndex`, else the default, else the
-/// first.
+/// first. `source` is numbered as PlaybackInfo numbers it (`subtitle::number_streams`), the
+/// numbers a client sends.
 fn audio_stream<'a>(
     params: &HashMap<String, String>,
     source: &'a MediaSourceResponse,
@@ -89,7 +90,7 @@ fn audio_stream<'a>(
 /// encoded with the first asked-for codec Rustyfin encodes (`AudioCodec`, else the container's),
 /// at `AudioBitrate` (else `MaxAudioBitrate`, else `MaxStreamingBitrate`; MP3 at most 320 kbps),
 /// with no more channels than the source or the limit, and the limit's sample rate when the
-/// source's is higher.
+/// source's is higher. `source` is numbered as PlaybackInfo numbers it.
 pub(super) fn audio_profile(
     params: &HashMap<String, String>,
     source: Option<&MediaSourceResponse>,
@@ -109,17 +110,21 @@ pub(super) fn audio_profile(
             wanted.push(implied.to_string());
         }
     }
-    let codec = wanted
-        .iter()
-        .find(|codec| audio_encoder(codec).is_some())
-        .ok_or_else(|| {
-            ApiError::BadRequest(format!(
-                "No audio codec Rustyfin encodes is asked for in {container}"
-            ))
-        })?;
-    let encoder = audio_encoder(codec).unwrap_or("aac");
+    let encoders: Vec<&'static str> = wanted.iter().filter_map(|c| audio_encoder(c)).collect();
+    if encoders.is_empty() {
+        return Err(ApiError::BadRequest(format!(
+            "No audio codec Rustyfin encodes is asked for in {container}"
+        )));
+    }
 
     let stream = source.and_then(|source| audio_stream(params, source));
+    let externals = source.map_or(0, |source| {
+        source
+            .media_streams
+            .iter()
+            .filter(|s| s.is_external)
+            .count() as i32
+    });
     let source_channels = stream.and_then(|s| s.channels);
     let source_rate = stream.and_then(|s| s.sample_rate);
     let source_bitrate = stream
@@ -134,7 +139,10 @@ pub(super) fn audio_profile(
 
     let mut profile = TranscodeProfile {
         audio_only: true,
-        audio_stream_index: stream.and_then(|s| u32::try_from(s.index).ok()),
+        // ffmpeg maps the stream by its index in the file
+        audio_stream_index: stream
+            .and_then(|s| crate::routes::subtitle::file_index(s.index, externals))
+            .and_then(|index| u32::try_from(index).ok()),
         start_time_ticks: param(params, "StartTimeTicks")
             .and_then(|v| v.parse().ok())
             .unwrap_or(0),
@@ -148,7 +156,8 @@ pub(super) fn audio_profile(
         (Some(_), None) => false,
         (None, _) => true,
     };
-    if source_codec.as_deref() == Some(codec.as_str())
+    // The track's own codec, when the client lists it, is copied within the limits
+    if source_codec.as_ref().is_some_and(|c| wanted.contains(c))
         && fits(bitrate, source_bitrate)
         && fits(channels, source_channels)
         && fits(rate, source_rate)
@@ -157,22 +166,68 @@ pub(super) fn audio_profile(
         return Ok(profile);
     }
 
+    // Else the first listed codec Rustyfin encodes; under a bitrate limit the first lossy one,
+    // as a lossless encode can't keep to a bitrate
+    let encoder = encoders
+        .iter()
+        .copied()
+        .find(|e| bitrate.is_none() || !matches!(*e, "flac" | "alac" | "pcm_s16le"))
+        .unwrap_or(encoders[0]);
     profile.audio_codec = encoder.to_string();
     let max_kbps = if encoder == "libmp3lame" { 320 } else { 512 };
     profile.max_audio_bitrate_kbps = bitrate.map_or(192, |bps| (bps / 1000).clamp(32, max_kbps));
-    // MP3 has at most two channels; never more than the source has
-    let encoder_channels = if encoder == "libmp3lame" {
-        Some(2)
-    } else {
-        None
+    profile.audio_channels = output_channels(channels, source_channels, encoder);
+    profile.audio_sample_rate = output_sample_rate(rate, source_rate, encoder);
+    Ok(profile)
+}
+
+/// The channels of an encoded audio stream: the fewest of the client's limit, the source's and
+/// what the encoder writes (MP3 and MP2 stereo, AC-3 5.1, the others 7.1), so a stream is never
+/// upmixed and ffmpeg never asks an encoder for more than it takes. Stereo when nothing is known.
+pub(super) fn output_channels(
+    limit: Option<u32>,
+    source: Option<u32>,
+    encoder: &str,
+) -> Option<u32> {
+    let encoder_max = match encoder {
+        "libmp3lame" | "mp2" => 2,
+        "ac3" | "eac3" => 6,
+        _ => 8,
     };
-    profile.audio_channels = [channels, source_channels, encoder_channels]
+    if limit.is_none() && source.is_none() {
+        return Some(2);
+    }
+    [limit, source, Some(encoder_max)]
         .into_iter()
         .flatten()
+        .filter(|&channels| channels > 0)
         .min()
-        .or(Some(2));
-    profile.audio_sample_rate = rate.filter(|&rate| source_rate.is_none_or(|src| src > rate));
-    Ok(profile)
+}
+
+/// The sample rate of an encoded audio stream: the client's limit (0 is none) when the source's
+/// is higher or unknown, snapped down to a rate the encoder takes (Opus 48, 24, 16, 12 or 8 kHz;
+/// MP3 the MPEG rates); None keeps the source's rate, which ffmpeg fits to the encoder itself.
+pub(super) fn output_sample_rate(
+    limit: Option<u32>,
+    source: Option<u32>,
+    encoder: &str,
+) -> Option<u32> {
+    let limit = limit.filter(|&rate| rate > 0)?;
+    if source.is_some_and(|source| source <= limit) {
+        return None;
+    }
+    let rates: &[u32] = match encoder {
+        "libopus" => &[48000, 24000, 16000, 12000, 8000],
+        "libmp3lame" => &[48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000],
+        _ => return Some(limit),
+    };
+    Some(
+        rates
+            .iter()
+            .copied()
+            .find(|&rate| rate <= limit)
+            .unwrap_or(rates[rates.len() - 1]),
+    )
 }
 
 /// One progressive transcode to start.
@@ -305,6 +360,7 @@ pub(super) async fn respond(
         .await
         .map_err(|e| match e {
             TranscodeError::Stopped => ApiError::NotFound("The play session was stopped".into()),
+            e @ TranscodeError::TooMany(_) => ApiError::ServiceUnavailable(e.to_string()),
             e => ApiError::Internal(format!("Transcode failed: {e}")),
         })?;
     let guard = EndOnDrop {
@@ -411,15 +467,49 @@ mod tests {
         )
         .unwrap();
         assert!(profile.copy_audio);
-        // ... but not past a bitrate limit
+        // Under a limit above the track's bitrate it is copied too
         let profile = audio_profile(
-            &query(&[("AudioCodec", "flac"), ("AudioBitrate", "320000")]),
+            &query(&[("AudioCodec", "flac,mp3"), ("AudioBitrate", "2000000")]),
             Some(&flac_source(2, 44100)),
-            "flac",
+            "mka",
+        )
+        .unwrap();
+        assert!(profile.copy_audio);
+        // Past the limit it is encoded, to the lossy codec the client lists, at the limit
+        let profile = audio_profile(
+            &query(&[("AudioCodec", "flac,mp3"), ("AudioBitrate", "320000")]),
+            Some(&flac_source(2, 44100)),
+            "mka",
         )
         .unwrap();
         assert!(!profile.copy_audio);
-        assert_eq!(profile.audio_codec, "flac");
+        assert_eq!(profile.audio_codec, "libmp3lame");
+        assert_eq!(profile.max_audio_bitrate_kbps, 320);
+    }
+
+    /// Channels: never above the limit, the source or the encoder; sample rates: a limit of 0
+    /// is none, and the limit snaps down to a rate the encoder takes.
+    #[test]
+    fn r3gaps2_channels_and_rates_fit_the_encoder() {
+        assert_eq!(output_channels(Some(6), Some(2), "aac"), Some(2));
+        assert_eq!(output_channels(Some(6), Some(6), "libmp3lame"), Some(2));
+        assert_eq!(output_channels(Some(2), Some(6), "ac3"), Some(2));
+        assert_eq!(output_channels(None, Some(8), "ac3"), Some(6));
+        assert_eq!(output_channels(None, None, "aac"), Some(2));
+        assert_eq!(output_sample_rate(Some(0), Some(96000), "aac"), None);
+        assert_eq!(
+            output_sample_rate(Some(44100), Some(96000), "libopus"),
+            Some(24000)
+        );
+        assert_eq!(
+            output_sample_rate(Some(44100), Some(96000), "libmp3lame"),
+            Some(44100)
+        );
+        assert_eq!(
+            output_sample_rate(Some(48000), Some(44100), "libopus"),
+            None
+        );
+        assert_eq!(output_sample_rate(Some(5000), None, "libopus"), Some(8000));
     }
 
     /// A codec Rustyfin doesn't encode is a 400.

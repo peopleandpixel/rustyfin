@@ -17,8 +17,15 @@ use uuid::Uuid;
 /// sample size, its anamorphic flag and its interlaced flag, and a Matroska stream's bit rate
 /// from its statistics tags, which the playback decision reads.
 ///
-/// 3: a video stream's Dolby Vision configuration record, which its VideoRangeType is read from.
+/// 3: a video stream's Dolby Vision configuration record, which its VideoRangeType is read from,
+/// and a video's external subtitle files, stored as its streams. Neither touches audio files, so
+/// audio sources are read again only below [`AUDIO_PROBE_VERSION`].
 pub const PROBE_VERSION: i64 = 3;
+
+/// The last [`PROBE_VERSION`] that changed what a probe stores for an audio file. A scan reads an
+/// audio source again only when an older probe wrote it, so a video-only change doesn't re-read
+/// a music library from its share.
+pub const AUDIO_PROBE_VERSION: i64 = 2;
 
 // ---------------------------------------------------------------------------
 // MediaSource DB row

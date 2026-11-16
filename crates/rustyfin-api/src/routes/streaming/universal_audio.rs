@@ -164,10 +164,15 @@ async fn decide(
     let item = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Item {id} not found")))?;
-    let sources =
+    let mut sources =
         rustyfin_db::repo_media_source::get_media_sources_with_item_check(&state.db_ro, &id)
             .await
             .unwrap_or_default();
+    // Numbered as PlaybackInfo numbers them, so the stream indexes in the transcode URL (and
+    // the HLS redirect) are the ones the client knows
+    for source in sources.iter_mut() {
+        crate::routes::subtitle::number_streams(source);
+    }
     let requested = requested_source_id(params);
     let source = match select_version(id, &sources, requested)? {
         Version::Primary => sources.first(),

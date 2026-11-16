@@ -181,7 +181,13 @@ pub struct TranscodeManager {
     /// The PlaySessionIds stopped lately (in ASCII lower case) and when each was stopped
     stopped: Arc<std::sync::Mutex<HashMap<String, Instant>>>,
     stop_memory: Duration, // 60 s; unit tests shorten it
+    /// The most progressive transcodes that run at once (`MAX_PROGRESSIVE`); unit tests lower it
+    max_progressive: usize,
 }
+
+/// The most progressive transcodes that run at once. Each is one client's playback, so this is
+/// well above a household's streams and well below what fills the CPU with encodes.
+const MAX_PROGRESSIVE: usize = 8;
 
 impl TranscodeManager {
     pub fn new(data_dir: &Path) -> Self {
@@ -194,6 +200,7 @@ impl TranscodeManager {
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             stopped: Arc::new(std::sync::Mutex::new(HashMap::new())),
             stop_memory: Duration::from_secs(60),
+            max_progressive: MAX_PROGRESSIVE,
         }
     }
 
@@ -501,6 +508,31 @@ impl TranscodeManager {
         }
         if !play_session_id.is_empty() && self.recently_stopped(play_session_id) {
             return Err(TranscodeError::Stopped);
+        }
+        // A client that asks again (a seek, a retry) for the same item in the same play session
+        // (else from the same device) has left its older job: that one ends
+        let replaced: Vec<Uuid> = self
+            .sessions
+            .iter()
+            .filter(|e| {
+                let s = e.value();
+                s.progressive
+                    && s.item_id == item_id
+                    && (!play_session_id.is_empty() || !device_id.is_empty())
+                    && same_key(s, play_session_id, device_id)
+            })
+            .map(|e| *e.key())
+            .collect();
+        for id in replaced {
+            self.stop_session(id).await;
+        }
+        let running = self
+            .sessions
+            .iter()
+            .filter(|e| e.value().progressive)
+            .count();
+        if running >= self.max_progressive {
+            return Err(TranscodeError::TooMany(self.max_progressive));
         }
         let playback_id = Uuid::new_v4();
         let args = build_progressive_args(input_path, format, profile);
@@ -1443,6 +1475,9 @@ pub enum TranscodeError {
 
     #[error("the play session was stopped")]
     Stopped,
+
+    #[error("{0} progressive transcodes are running, the most the server runs at once")]
+    TooMany(usize),
 }
 
 // ---------------------------------------------------------------------------
@@ -3230,6 +3265,39 @@ exec sleep 30
         assert!(matches!(read, Ok(Ok(0))), "the pipe ends with the stop");
         assert!(!mgr.is_active(item).await);
         assert!(!mgr.end_progressive(playback).await, "already gone");
+    }
+
+    /// A new progressive job of the same item and play session (else device) replaces the old
+    /// one; other sessions keep theirs, and past the cap a start fails.
+    #[tokio::test]
+    async fn r3gaps2_progressive_jobs_are_replaced_and_capped() {
+        let (_dir, mut mgr) = fake_manager("piped", Duration::from_secs(5));
+        mgr.max_progressive = 2;
+        let item = Uuid::new_v4();
+        let profile = TranscodeProfile::default();
+        let start = |ps: &'static str, dev: &'static str| {
+            let mgr = mgr.clone();
+            let profile = profile.clone();
+            async move {
+                mgr.start_progressive(item, "/in.flac", &profile, "mp3", ps, dev)
+                    .await
+                    .map(|(id, _)| id)
+            }
+        };
+        let first = start("ps-a", "").await.unwrap();
+        let second = start("ps-a", "").await.unwrap();
+        assert!(!mgr.end_progressive(first).await, "the seek replaced it");
+        let by_device = start("", "dev-b").await.unwrap();
+        // Two run (ps-a's second and dev-b's): a third client is refused
+        assert!(matches!(
+            start("ps-c", "").await,
+            Err(TranscodeError::TooMany(2))
+        ));
+        // dev-b asking again replaces its own job, within the cap
+        let again = start("", "dev-b").await.unwrap();
+        assert!(!mgr.end_progressive(by_device).await);
+        assert!(mgr.end_progressive(second).await);
+        assert!(mgr.end_progressive(again).await);
     }
 
     /// Ending a progressive transcode (the client went away) kills its ffmpeg.
