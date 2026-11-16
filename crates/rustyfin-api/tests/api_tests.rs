@@ -17355,6 +17355,312 @@ async fn r3extras_show_extras_belong_to_series_and_seasons() {
     assert_eq!(types, ["Episode", "Season", "Series"], "{all}");
 }
 
+// R3 extras round 2: TV extras, the Has* filters, renamed and moved extras
+
+/// The `Name`s of the items in a JSON list, sorted.
+fn r3extras2_names(body: &serde_json::Value) -> Vec<String> {
+    let mut names: Vec<String> = body["Items"]
+        .as_array()
+        .or_else(|| body.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|i| i["Name"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+/// The id of the item of `lib` named `name` that is not an extra.
+async fn r3extras2_id(
+    state: &AppState,
+    lib: &rustyfin_model::library::Library,
+    name: &str,
+) -> String {
+    sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE library_id = ? AND name = ? AND extra_type IS NULL",
+    )
+    .bind(lib.id.to_string())
+    .bind(name)
+    .fetch_one(&state.db)
+    .await
+    .unwrap_or_else(|e| panic!("{name}: {e}"))
+}
+
+/// A show's `Extras` folder holds the series' extras, as in Jellyfin, while `Specials` is season 0. An
+/// episode's suffix files and its episode folder's extras folders are its extras, never episodes; a suffix
+/// file that names no episode next to it stays an episode. The episode pages' counts and lists show them,
+/// and `HasSpecialFeature` finds the series and episodes that have some.
+#[tokio::test]
+async fn r3extras2_tv_extras_belong_to_series_seasons_and_episodes() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, user) = admin_session(&state).await;
+    let root = std::path::PathBuf::from(media_folder(&state, "r3extras2 shows"));
+    let show = root.join("Show");
+    if !r3extras_media(&show.join("Season 1/S01E01.mkv"), false) {
+        return;
+    }
+    for file in [
+        "Extras/Gag Reel.mkv",
+        "Specials/S00E01.mkv",
+        "Season 1/S01E01-featurette.mkv",
+        "Season 1/S01E02/S01E02.mkv",
+        "Season 1/S01E02/behind the scenes/On Set.mkv",
+        "Season 1/S01E09-short.mkv",
+        "Season 1/trailers/Season Teaser.mkv",
+    ] {
+        assert!(r3extras_media(&show.join(file), false));
+    }
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: "R3 Extras2 Shows".to_string(),
+        content_type: rustyfin_model::library::LibraryContentType::TvShows,
+        paths: vec![root.to_str().unwrap().to_string()],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    r3extras_rescan(&state, &lib).await;
+
+    let get = |uri: String| {
+        let app = app.clone();
+        let token = token.clone();
+        async move {
+            let (status, body) = send_authed(&app, "GET", &uri, &token, None).await;
+            assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+            body
+        }
+    };
+    // The episodes: the specials' one, and the suffix file that names no episode next to it.
+    let episodes = get(format!(
+        "/Items?ParentId={}&Recursive=true&IncludeItemTypes=Episode",
+        lib.id
+    ))
+    .await;
+    assert_eq!(
+        r3extras2_names(&episodes),
+        ["S00E01", "S01E01", "S01E02", "S01E09-short"],
+        "{episodes}"
+    );
+    let seasons = get(format!(
+        "/Items?ParentId={}&Recursive=true&IncludeItemTypes=Season",
+        lib.id
+    ))
+    .await;
+    assert_eq!(
+        seasons["TotalRecordCount"], 2,
+        "Season 1 and Specials: {seasons}"
+    );
+
+    let series = r3extras2_id(&state, &lib, "Show").await;
+    let season = r3extras2_id(&state, &lib, "Season 1").await;
+    let e1 = r3extras2_id(&state, &lib, "S01E01").await;
+    let e2 = r3extras2_id(&state, &lib, "S01E02").await;
+    let features = |id: String| get(format!("/Items/{id}/SpecialFeatures"));
+    assert_eq!(r3extras_types(&features(series.clone()).await), ["Unknown"]);
+    assert_eq!(r3extras_types(&features(e1.clone()).await), ["Featurette"]);
+    assert_eq!(
+        r3extras_types(&features(e2.clone()).await),
+        ["BehindTheScenes"]
+    );
+    assert_eq!(
+        r3extras_types(&get(format!("/Items/{season}/LocalTrailers")).await),
+        ["Trailer"]
+    );
+    let (_, item) = send_authed(
+        &app,
+        "GET",
+        &format!("/Users/{user}/Items/{e1}"),
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(item["SpecialFeatureCount"], 1, "{item}");
+    assert_eq!(item["LocalTrailerCount"], 0, "{item}");
+
+    let with = get(format!(
+        "/Items?ParentId={}&Recursive=true&HasSpecialFeature=true",
+        lib.id
+    ))
+    .await;
+    assert_eq!(
+        r3extras2_names(&with),
+        ["S01E01", "S01E02", "Show"],
+        "{with}"
+    );
+    let trailers = get(format!(
+        "/Items?ParentId={}&Recursive=true&hasTrailer=true",
+        lib.id
+    ))
+    .await;
+    assert_eq!(r3extras2_names(&trailers), ["Season 1"], "{trailers}");
+}
+
+/// `/Items?HasTrailer`, `HasSpecialFeature`, `HasThemeSong` and `HasThemeVideo` keep the items with (true) or
+/// without (false) that kind of extra, each counted as `LocalTrailerCount` and `SpecialFeatureCount` count them.
+#[tokio::test]
+async fn r3extras2_has_filters_find_items_by_their_extras() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let Some((lib, _)) = r3extras_library(
+        &state,
+        "r3extras2 filters",
+        &[
+            "Alpha/Alpha.mkv",
+            "Alpha/Alpha-trailer.mkv",
+            "Alpha/theme.mp3",
+            "Beta/Beta.mkv",
+            "Beta/backdrops/Loop.mkv",
+            "Gamma/Gamma.mkv",
+            "Gamma/featurettes/Making Of.mkv",
+            "Delta/Delta.mkv",
+        ],
+    )
+    .await
+    else {
+        return;
+    };
+    let names = |filter: &'static str| {
+        let app = app.clone();
+        let token = token.clone();
+        let uri = format!("/Items?ParentId={}&Recursive=true&{filter}", lib.id);
+        async move {
+            let (status, body) = send_authed(&app, "GET", &uri, &token, None).await;
+            assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+            r3extras2_names(&body)
+        }
+    };
+    assert_eq!(names("HasTrailer=true").await, ["Alpha"]);
+    assert_eq!(names("hasTrailer=false").await, ["Beta", "Delta", "Gamma"]);
+    assert_eq!(names("HasThemeSong=true").await, ["Alpha"]);
+    assert_eq!(names("HasThemeVideo=true").await, ["Beta"]);
+    assert_eq!(names("HasSpecialFeature=true").await, ["Gamma"]);
+    assert_eq!(
+        names("HasSpecialFeature=false").await,
+        ["Alpha", "Beta", "Delta"]
+    );
+    assert_eq!(
+        names("HasTrailer=false&HasThemeVideo=false").await,
+        ["Delta", "Gamma"]
+    );
+    assert_eq!(
+        names("HasTrailer=true&HasThemeVideo=true").await,
+        Vec::<String>::new()
+    );
+}
+
+/// An extra that is renamed, or moved to another extras folder or owner, keeps its id and so its user data,
+/// as main items do; it takes its new name, type and owner. A new extra file is a new item.
+#[tokio::test]
+async fn r3extras2_a_renamed_or_moved_extra_keeps_its_watch_state() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, user) = admin_session(&state).await;
+    let Some((lib, root)) = r3extras_library(
+        &state,
+        "r3extras2 moves",
+        &[
+            "Alpha/Alpha.mkv",
+            "Alpha/featurettes/One.mkv",
+            "Beta/Beta.mkv",
+        ],
+    )
+    .await
+    else {
+        return;
+    };
+    let extra: String = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE library_id = ? AND extra_type IS NOT NULL",
+    )
+    .bind(lib.id.to_string())
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        &format!("/Users/{user}/PlayedItems/{extra}"),
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let check = |name: &'static str, extra_type: &'static str, owner: &'static str| {
+        let state = state.clone();
+        let app = app.clone();
+        let token = token.clone();
+        let extra = extra.clone();
+        let lib = lib.clone();
+        async move {
+            let rows: Vec<(String, String, String, String)> = sqlx::query_as(
+                "SELECT id, name, extra_type, owner_id FROM media_items
+                 WHERE library_id = ? AND extra_type IS NOT NULL",
+            )
+            .bind(lib.id.to_string())
+            .fetch_all(&state.db)
+            .await
+            .unwrap();
+            let owner_id = r3extras2_id(&state, &lib, owner).await;
+            assert_eq!(
+                rows,
+                [(
+                    extra.clone(),
+                    name.to_string(),
+                    extra_type.to_string(),
+                    owner_id
+                )]
+            );
+            let (_, item) = send_authed(
+                &app,
+                "GET",
+                &format!("/Users/{user}/Items/{extra}"),
+                &token,
+                None,
+            )
+            .await;
+            assert_eq!(item["UserData"]["Played"], true, "{item}");
+            assert!(
+                item["MediaSources"][0]["Path"]
+                    .as_str()
+                    .is_some_and(|p| p.ends_with(&format!("{name}.mkv"))),
+                "{item}"
+            );
+        }
+    };
+    let alpha = root.join("Alpha");
+    // Renamed in its folder.
+    std::fs::rename(
+        alpha.join("featurettes/One.mkv"),
+        alpha.join("featurettes/Uno.mkv"),
+    )
+    .unwrap();
+    r3extras_rescan(&state, &lib).await;
+    check("Uno", "Featurette", "Alpha").await;
+    // Moved to another extras folder.
+    std::fs::create_dir_all(alpha.join("behind the scenes")).unwrap();
+    std::fs::rename(
+        alpha.join("featurettes/Uno.mkv"),
+        alpha.join("behind the scenes/Uno.mkv"),
+    )
+    .unwrap();
+    r3extras_rescan(&state, &lib).await;
+    check("Uno", "BehindTheScenes", "Alpha").await;
+    // Moved to another movie.
+    let beta = root.join("Beta");
+    std::fs::create_dir_all(beta.join("extras")).unwrap();
+    std::fs::rename(
+        alpha.join("behind the scenes/Uno.mkv"),
+        beta.join("extras/Uno.mkv"),
+    )
+    .unwrap();
+    r3extras_rescan(&state, &lib).await;
+    check("Uno", "Unknown", "Beta").await;
+}
+
 #[tokio::test]
 async fn j5_odd_values_list_without_error_and_bad_parameters_give_400() {
     use rustyfin_model::library::LibraryContentType;

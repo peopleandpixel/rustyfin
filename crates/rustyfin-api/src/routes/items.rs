@@ -2039,6 +2039,12 @@ struct ItemsQuery {
     has_special_feature: Option<bool>,
     #[serde(rename = "hasSpecialFeature")]
     has_special_feature_lower: Option<bool>,
+    has_trailer: Option<bool>,
+    #[serde(rename = "hasTrailer")]
+    has_trailer_lower: Option<bool>,
+    has_theme_video: Option<bool>,
+    #[serde(rename = "hasThemeVideo")]
+    has_theme_video_lower: Option<bool>,
     subtitle_language: Option<String>,
     #[serde(rename = "subtitleLanguage")]
     subtitle_language_lower: Option<String>,
@@ -2291,6 +2297,12 @@ impl ItemsQuery {
     fn has_special_feature(&self) -> Option<bool> {
         self.has_special_feature.or(self.has_special_feature_lower)
     }
+    fn has_trailer(&self) -> Option<bool> {
+        self.has_trailer.or(self.has_trailer_lower)
+    }
+    fn has_theme_video(&self) -> Option<bool> {
+        self.has_theme_video.or(self.has_theme_video_lower)
+    }
     /// The subtitle languages to filter by: Jellyfin's comma list `SubtitleLanguages`, else the
     /// single `SubtitleLanguage` Rustyfin took before. Each code is matched in all its spellings,
     /// so `ger` and `deu` find the same items.
@@ -2500,6 +2512,20 @@ async fn get_items(
             rustyfin_db::repo_media::item_ids_with_subtitle_language(&state.db_ro, &languages)
                 .await?;
         item_ids = Some(narrow_ids(item_ids, ids));
+    }
+    // HasTrailer, HasSpecialFeature, HasThemeSong and HasThemeVideo: by the item's own extras, the way
+    // LocalTrailerCount and SpecialFeatureCount count them.
+    for (has, types) in [
+        (query.has_trailer(), &["Trailer"][..]),
+        (query.has_special_feature(), SPECIAL_FEATURE_TYPES),
+        (query.has_theme_song(), &["ThemeSong"][..]),
+        (query.has_theme_video(), &["ThemeVideo"][..]),
+    ] {
+        if let Some(has) = has {
+            let ids =
+                rustyfin_db::repo_extras::item_ids_by_extras(&state.db_ro, types, has).await?;
+            item_ids = Some(narrow_ids(item_ids, ids));
+        }
     }
     let hidden = HiddenItems::for_caller(&state, &claims).await?;
     let hidden_json = hidden.json();
