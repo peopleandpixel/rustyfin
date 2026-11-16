@@ -3625,6 +3625,7 @@ const B124_WEB_MODULES: &[&str] = &[
     "library-admin.js",
     "library.js",
     "libtabs.js",
+    "lyrics.js",
     "metadata-admin.js",
     "multiselect.js",
     "music.js",
@@ -50983,6 +50984,7 @@ async fn r3music2_lyrics_read_upload_and_delete() {
     let (admin, _) = admin_session(&state).await;
     let (user, _) = j6_user_session(&state).await;
     let pool = state.db.clone();
+    let cache = state.cache.clone();
     let uploads = state.data_dir.join("metadata").join("lyrics");
     let app = app(state);
 
@@ -51010,6 +51012,8 @@ async fn r3music2_lyrics_read_upload_and_delete() {
     rustyfin_core::lyrics::sync_sidecars(&pool, library, &rustyfin_db::repo_media::PathScope::All)
         .await
         .unwrap();
+    // A scan drops the cached answers when it ends; this test runs only its lyric-file pass.
+    cache.invalidate_on_scan();
     let item = b27_answer(&app, &format!("/Items/{synced}"), &admin).await;
     assert_eq!(has(&item), true, "{item}");
     let list = b27_answer(
