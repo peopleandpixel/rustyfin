@@ -98,6 +98,13 @@ impl Codec {
 
 const START: [u8; 4] = [0, 0, 0, 1];
 
+#[cfg(test)]
+thread_local! {
+    /// Set by a test: the back half of each frame's slice data is scrambled on its way out, as
+    /// a damaged file or a bad rewrite would leave it.
+    pub(crate) static DAMAGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Turns key frame packets into a raw Annex B stream; see the module docs.
 pub(crate) struct KeyFrameStream {
     codec: Codec,
@@ -174,7 +181,15 @@ impl KeyFrameStream {
                     _ => {}
                 },
             }
-            let nal = self.nal(nal.to_vec())?;
+            #[allow(unused_mut)]
+            let mut nal = self.nal(nal.to_vec())?;
+            #[cfg(test)]
+            if DAMAGE.get() && pictures > 0 {
+                let half = nal.len() / 2;
+                for b in &mut nal[half..] {
+                    *b ^= 0x5a;
+                }
+            }
             out.extend_from_slice(&START);
             out.extend_from_slice(&nal);
         }
@@ -235,7 +250,10 @@ fn hvcc(data: &[u8]) -> Option<(usize, Vec<&[u8]>)> {
         at += 2;
         for _ in 0..count {
             let len = usize::from(u16::from_be_bytes([*data.get(at)?, *data.get(at + 1)?]));
-            sets.push(data.get(at + 2..at + 2 + len)?);
+            let set = data.get(at + 2..at + 2 + len)?;
+            if hevc_layer(set) == 0 {
+                sets.push(set);
+            }
             at += 2 + len;
         }
     }
