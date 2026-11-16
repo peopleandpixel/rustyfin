@@ -91,6 +91,8 @@
         "folder_removed": "Folder removed; the library is being scanned.",
         "folders_scan_note": "Each change starts a scan of the library.",
         "last_folder": "A library needs at least one folder.",
+        "remove_folder_title": "Remove this folder?",
+        "remove_folder_text": "{{path}} leaves the library. Its items, with their watched state and other user data, are removed from the library at the scan that follows. The files on disk are not touched.",
         "library_change_failed": "The library could not be changed: {{message}}",
         "triggers": "Triggers",
         "triggers_title": "Triggers of {{name}}",

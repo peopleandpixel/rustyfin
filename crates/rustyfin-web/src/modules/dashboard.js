@@ -274,7 +274,9 @@ function addLibraryFolder(e) {
     return changeLibrary(name => API.post('/Library/VirtualFolders/Paths?refreshLibrary=true', { Name: name, PathInfo: { Path: path } }), 'dashboard.folder_added');
 }
 
-function removeLibraryFolder(path) {
+// Asks first: the folder's items, with their watched state, leave the library; the files stay
+async function removeLibraryFolder(path) {
+    if (!await confirmDialog(t('dashboard.remove_folder_title'), t('dashboard.remove_folder_text', { path }), t('dashboard.remove'))) return;
     const q = name => new URLSearchParams({ name, path, refreshLibrary: 'true' });
     return changeLibrary(name => API.del(`/Library/VirtualFolders/Paths?${q(name)}`), 'dashboard.folder_removed');
 }

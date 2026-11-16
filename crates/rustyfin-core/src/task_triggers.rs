@@ -7,8 +7,11 @@ use rustyfin_model::scheduled_task::{DAYS_OF_WEEK, TaskTriggerInfo};
 /// Where a task stands for its triggers.
 #[derive(Debug, Clone, Copy)]
 pub struct TriggerClock {
-    /// The task's last run end, if it ran since the server started.
+    /// The task's last run end, if it ran since the server started (by its triggers or by hand).
     pub last_end: Option<DateTime<Utc>>,
+    /// Whether the task's own loop has run it since the start. Only such a run uses up a
+    /// startup trigger; a run started by hand does not.
+    pub loop_ran: bool,
     /// When a task that has not run yet runs for an interval or a startup trigger (the server's
     /// start plus the task's own delay).
     pub first: DateTime<Utc>,
@@ -45,7 +48,7 @@ pub fn next_due<Tz: TimeZone>(
                     .position(|d| Some(*d) == t.day_of_week.as_deref())?;
                 next_local(tz, since, t.time_of_day_ticks?, Some(day as u32))
             }
-            "StartupTrigger" => clock.last_end.is_none().then_some(clock.first),
+            "StartupTrigger" => (!clock.loop_ran).then_some(clock.first),
             _ => None,
         })
         .min()
@@ -99,6 +102,7 @@ mod tests {
         let started = at(started);
         TriggerClock {
             last_end: last_end.map(at),
+            loop_ran: last_end.is_some(),
             first: started + Duration::seconds(60),
             interval_from: None,
             started,
@@ -176,6 +180,20 @@ mod tests {
             Some(at("2026-11-16T12:00:00Z"))
         );
         assert_eq!(next_due(&Utc, &[], &c), None);
+    }
+
+    #[test]
+    fn r3admin_a_run_by_hand_does_not_use_up_the_startup_trigger() {
+        let startup = TaskTriggerInfo {
+            trigger_type: "StartupTrigger".into(),
+            ..TaskTriggerInfo::interval(0)
+        };
+        let mut by_hand = clock("2026-11-16T10:00:00Z", Some("2026-11-16T10:00:30Z"));
+        by_hand.loop_ran = false;
+        assert_eq!(
+            next_due(&Utc, std::slice::from_ref(&startup), &by_hand),
+            Some(at("2026-11-16T10:01:00Z"))
+        );
     }
 
     #[test]

@@ -96,6 +96,17 @@ docker compose logs -f rustyfin
 docker compose down
 ```
 
+### Neustart und Herunterfahren aus dem Dashboard
+
+Rustyfin startet sich nicht selbst neu. Beide Knöpfe beenden den Prozess sauber (laufende Transkodierungen und ffmpeg-Läufe der geplanten Aufgaben werden beendet, die Datenbank geschlossen), aber mit verschiedenem Exit-Code:
+
+| Aktion | Exit-Code | `restart: always` | `restart: unless-stopped` | `restart: on-failure` |
+|---|---|---|---|---|
+| **Neu starten** (`POST /System/Restart`) | `75` | startet neu | startet neu | startet neu |
+| **Herunterfahren** (`POST /System/Shutdown`) | `0` | startet neu | startet neu | bleibt aus |
+
+Mit `always` oder `unless-stopped` (wie in den Beispielen oben) wirkt Herunterfahren also wie ein Neustart; ganz aus bleibt der Container dann nur mit `docker compose stop`. Soll Herunterfahren den Server wirklich anhalten, nimm `restart: on-failure`: Dann startet nur ein Neustart (Exit-Code 75) oder ein Absturz ihn wieder. Unter systemd gilt dasselbe mit `Restart=on-failure`.
+
 ## Volumes
 
 | Volume | Beschreibung |

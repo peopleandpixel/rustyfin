@@ -26,7 +26,7 @@ pub enum TaskState {
     Cancelling,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "PascalCase")]
 pub struct TaskTriggerInfo {
     #[serde(rename = "Type")]

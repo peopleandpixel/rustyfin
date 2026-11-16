@@ -91,6 +91,8 @@
         "folder_removed": "Ordner entfernt; die Bibliothek wird durchsucht.",
         "folders_scan_note": "Jede Änderung startet eine Durchsuchung der Bibliothek.",
         "last_folder": "Eine Bibliothek braucht mindestens einen Ordner.",
+        "remove_folder_title": "Diesen Ordner entfernen?",
+        "remove_folder_text": "{{path}} wird aus der Bibliothek entfernt. Seine Einträge werden mit ihrem Gesehen-Status und den übrigen Benutzerdaten bei der folgenden Durchsuchung aus der Bibliothek entfernt. Die Dateien auf dem Datenträger bleiben unberührt.",
         "library_change_failed": "Die Bibliothek konnte nicht geändert werden: {{message}}",
         "triggers": "Auslöser",
         "triggers_title": "Auslöser von {{name}}",

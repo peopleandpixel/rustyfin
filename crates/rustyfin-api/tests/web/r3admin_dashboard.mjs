@@ -192,6 +192,26 @@ test('the library editor sends Jellyfin\'s folder and rename requests', async ()
     assert.match(admin, /data-action="edit-library"/);
 });
 
+test('removing a folder asks first, saying its items and watched state go and the files stay', async () => {
+    const lib = { Name: 'Films', ItemId: 'abcd-1', Locations: ['/m/a', '/m/b'] };
+    const editor = element({ showModal() { this.open = true; } });
+    const confirm = element({ showModal() { this.returnValue = 'cancel'; this.listeners.close?.(); } });
+    const s = sandbox({ api: { 'GET /Library/VirtualFolders': [lib] }, elements: { 'library-editor': editor, 'dashboard-confirm': confirm } });
+    await s.fns.openLibraryEditor('abcd-1');
+    s.calls.length = 0;
+    await s.fns.removeLibraryFolder('/m/b');
+    same(s.calls, [], 'a cancelled removal sends nothing');
+    assert.match(confirm.innerHTML, /dashboard\.remove_folder_text\|\{&quot;path&quot;:&quot;\/m\/b&quot;\}/);
+    for (const lang of ['en', 'de']) {
+        const strings = JSON.parse(read(`translations/${lang}.json`)).dashboard;
+        assert.ok(strings.remove_folder_title, lang);
+        assert.match(strings.remove_folder_text, /\{\{path\}\}/, lang);
+    }
+    const en = JSON.parse(read('translations/en.json')).dashboard.remove_folder_text;
+    assert.match(en, /watched state/);
+    assert.match(en, /files on disk are not touched/);
+});
+
 test('triggers are read from the form in Jellyfin\'s shape and shown in words', () => {
     const { fns } = sandbox();
     const form = type => ({ elements: { Type: { value: type }, TimeOfDay: { value: '03:30' }, DayOfWeek: { value: 'Sunday' }, Interval: { value: '45' } } });

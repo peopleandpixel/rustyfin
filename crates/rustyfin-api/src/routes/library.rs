@@ -656,11 +656,25 @@ async fn update_virtual_folder_options(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Whether two library names are the same without case, in any script (not only ASCII).
+fn same_name(a: &str, b: &str) -> bool {
+    a.to_lowercase() == b.to_lowercase()
+}
+
+/// Whether two folder paths name the same folder: a trailing `/` makes no difference.
+fn same_folder(a: &str, b: &str) -> bool {
+    let trim = |p: &str| match p.trim_end_matches('/') {
+        "" if p.starts_with('/') => "/".to_string(),
+        t => t.to_string(),
+    };
+    trim(a) == trim(b)
+}
+
 /// The library named `name`, as Jellyfin finds a virtual folder by name: exact, else without case.
 async fn library_named(state: &AppState, name: &str) -> Result<Library, ApiError> {
     let libs = rustyfin_db::repo_library::get_all_libraries(&state.db).await?;
     let exact = libs.iter().position(|l| l.name == name);
-    let index = exact.or_else(|| libs.iter().position(|l| l.name.eq_ignore_ascii_case(name)));
+    let index = exact.or_else(|| libs.iter().position(|l| same_name(&l.name, name)));
     index
         .map(|i| libs[i].clone())
         .ok_or_else(|| ApiError::NotFound(format!("The library \"{name}\" does not exist.")))
@@ -740,7 +754,7 @@ async fn add_media_path(
     if let Some((_, sentence)) = path_problem(&folder).await {
         return Err(ApiError::BadRequest(sentence));
     }
-    if lib.paths.contains(&folder) {
+    if lib.paths.iter().any(|p| same_folder(p, &folder)) {
         return Err(ApiError::BadRequest(format!(
             "The folder \"{folder}\" is already in the library."
         )));
@@ -760,7 +774,7 @@ async fn update_media_path(
 ) -> Result<StatusCode, ApiError> {
     let folder = body.folder()?;
     let lib = library_named(&state, &body.name).await?;
-    if !lib.paths.contains(&folder) {
+    if !lib.paths.iter().any(|p| same_folder(p, &folder)) {
         return Err(ApiError::BadRequest(format!(
             "The library has no folder \"{folder}\"."
         )));
@@ -779,9 +793,39 @@ struct RemovePathQuery {
     refresh_library: bool,
 }
 
+/// Saves the library without the folders `removed`. A library keeps at least one folder: taking
+/// its last is 400.
+async fn remove_folders(
+    state: &AppState,
+    lib: &Library,
+    removed: &[&str],
+    refresh: bool,
+) -> Result<(), ApiError> {
+    let kept: Vec<String> = lib
+        .paths
+        .iter()
+        .filter(|p| !removed.iter().any(|r| same_folder(p, r)))
+        .cloned()
+        .collect();
+    if kept.is_empty() {
+        return Err(ApiError::BadRequest(
+            "A library needs at least one folder; delete the library instead.".into(),
+        ));
+    }
+    store_paths(state, lib, &kept, refresh).await?;
+    // Their items leave the library now: a scan prunes only under the folders it still has
+    for folder in lib.paths.iter().filter(|p| !kept.contains(p)) {
+        let gone =
+            rustyfin_core::scan_sync::remove_items_under(&state.db, lib.id, folder, &kept).await?;
+        tracing::info!(library = %lib.id, folder, gone, "removed the items of a folder taken out of the library");
+    }
+    state.cache.invalidate_library_lists();
+    Ok(())
+}
+
 /// DELETE /Library/VirtualFolders/Paths?name=&path= - Jellyfin's removal of one folder from a
-/// library: 204, 404 for an unknown library or a folder it does not have. Rustyfin's earlier
-/// body (`{LibraryId, Paths}`) still works and answers `{}`.
+/// library: 204, 404 for an unknown library or a folder it does not have, 400 for its last
+/// folder. Rustyfin's earlier body (`{LibraryId, Paths}`) still works and answers `{}`.
 async fn remove_library_paths(
     State(state): State<AppState>,
     Query(q): Query<RemovePathQuery>,
@@ -790,13 +834,12 @@ async fn remove_library_paths(
     use axum::response::IntoResponse;
     if let (Some(name), Some(path)) = (&q.name, &q.path) {
         let lib = library_named(&state, name).await?;
-        if !lib.paths.contains(path) {
+        if !lib.paths.iter().any(|p| same_folder(p, path)) {
             return Err(ApiError::NotFound(format!(
                 "The library has no folder \"{path}\"."
             )));
         }
-        let paths: Vec<String> = lib.paths.iter().filter(|p| *p != path).cloned().collect();
-        store_paths(&state, &lib, &paths, q.refresh_library).await?;
+        remove_folders(&state, &lib, &[path.as_str()], q.refresh_library).await?;
         return Ok(StatusCode::NO_CONTENT.into_response());
     }
 
@@ -816,13 +859,7 @@ async fn remove_library_paths(
     let lib = rustyfin_db::repo_library::get_library_by_id(&state.db, lib_id)
         .await?
         .ok_or_else(|| ApiError::NotFound("Library not found".to_string()))?;
-    let new_paths: Vec<String> = lib
-        .paths
-        .iter()
-        .filter(|p| !paths.contains(&p.as_str()))
-        .cloned()
-        .collect();
-    store_paths(&state, &lib, &new_paths, false).await?;
+    remove_folders(&state, &lib, &paths, false).await?;
     Ok(Json(json!({})).into_response())
 }
 
@@ -852,7 +889,7 @@ async fn rename_virtual_folder(
     let libs = rustyfin_db::repo_library::get_all_libraries(&state.db).await?;
     if libs
         .iter()
-        .any(|l| l.id != lib.id && l.name.eq_ignore_ascii_case(new_name))
+        .any(|l| l.id != lib.id && same_name(&l.name, new_name))
     {
         return Err(ApiError::BadRequest(format!(
             "A library named \"{new_name}\" already exists."
@@ -982,6 +1019,23 @@ async fn browse_directories(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn r3admin_folders_match_with_or_without_a_trailing_slash() {
+        assert!(same_folder("/media/films", "/media/films/"));
+        assert!(same_folder("/media/films//", "/media/films"));
+        assert!(same_folder("/", "/"));
+        assert!(!same_folder("/media/films", "/media/film"));
+        assert!(!same_folder("/media/Films", "/media/films"));
+    }
+
+    #[test]
+    fn r3admin_names_match_without_case_in_any_script() {
+        assert!(same_name("Filme", "FILME"));
+        assert!(same_name("Ärzte", "ärzte"));
+        assert!(same_name("ΤΑΙΝΊΕΣ", "ταινίες"));
+        assert!(!same_name("Films", "Shows"));
+    }
 
     #[test]
     fn test_libraries_to_views_empty() {

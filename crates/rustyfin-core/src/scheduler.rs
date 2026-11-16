@@ -37,6 +37,14 @@ const TICKS_12H: u64 = 12 * 60 * 60 * 10_000_000;
 /// Default interval: 24 hours in .NET ticks
 const TICKS_24H: u64 = 24 * 60 * 60 * 10_000_000;
 
+/// Logs a start skipped because the task runs already (by its triggers or by hand).
+fn skipped(id: &str) {
+    tracing::info!(
+        task = id,
+        "the task is running already, so this start is skipped"
+    );
+}
+
 /// The callback that runs when a scheduled library scan ends.
 type OnScan = Arc<dyn Fn() + Send + Sync>;
 
@@ -62,7 +70,31 @@ pub struct TaskScheduler {
     progress: Arc<HashMap<String, TaskProgress>>,
     /// Woken when a task's triggers change, so its loop works out its next run again.
     triggers_changed: Arc<tokio::sync::Notify>,
+    /// Each task's built-in triggers. Only triggers that differ from them are saved, so a later
+    /// change of the defaults reaches the tasks an admin never edited.
+    default_triggers: Arc<HashMap<String, Vec<TaskTriggerInfo>>>,
+    /// The tasks running now, started by their triggers or by hand: a second start is skipped.
+    running: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
+
+/// A task's claim on running, from `TaskScheduler::claim` until it is dropped.
+struct RunClaim {
+    running: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    id: String,
+}
+
+impl Drop for RunClaim {
+    fn drop(&mut self) {
+        self.running
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.id);
+    }
+}
+
+/// The tasks a run can be stopped in (their ffmpeg killed): `MaxRuntimeTicks` applies to them.
+/// The others store it only.
+const STOPPABLE_TASKS: [&str; 3] = [TASK_CHAPTER_IMAGES, TASK_TRICKPLAY, TASK_INTRO_DETECTION];
 
 /// The file, in the data folder, that keeps the triggers set through the API, by task id.
 const TRIGGERS_FILE: &str = "scheduled_task_triggers.json";
@@ -282,6 +314,10 @@ impl TaskScheduler {
             .collect();
         let changes = ChangeQueue::new(db.clone());
         let watcher = LibraryWatcher::new(db.clone(), changes.clone(), (*data_dir).clone());
+        let default_triggers: HashMap<String, Vec<TaskTriggerInfo>> = tasks
+            .iter()
+            .map(|(id, e)| (id.clone(), e.info.triggers.clone()))
+            .collect();
         for (id, triggers) in saved_triggers(&data_dir) {
             if let Some(entry) = tasks.get_mut(&id) {
                 entry.info.triggers = triggers;
@@ -300,6 +336,41 @@ impl TaskScheduler {
             image_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
             progress: Arc::new(progress),
             triggers_changed: Arc::new(tokio::sync::Notify::new()),
+            default_triggers: Arc::new(default_triggers),
+            running: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        }
+    }
+
+    /// Claims the task `id` for one run; None when a run of it is going on already.
+    fn claim(&self, id: &str) -> Option<RunClaim> {
+        let mut running = self.running.lock().unwrap_or_else(|e| e.into_inner());
+        running.insert(id.to_string()).then(|| RunClaim {
+            running: self.running.clone(),
+            id: id.to_string(),
+        })
+    }
+
+    /// The shortest `MaxRuntimeTicks` of the task's triggers, for a task that can be stopped.
+    async fn max_runtime(&self, id: &str) -> Option<std::time::Duration> {
+        if !STOPPABLE_TASKS.contains(&id) {
+            return None;
+        }
+        let tasks = self.tasks.read().await;
+        tasks
+            .get(id)?
+            .info
+            .triggers
+            .iter()
+            .filter_map(|t| t.max_runtime_ticks)
+            .filter(|t| *t > 0)
+            .min()
+            .map(|t| std::time::Duration::from_micros(t / 10))
+    }
+
+    /// Stops every image task and intro detection that runs, killing their ffmpeg (at shutdown).
+    pub fn cancel_runs(&self) {
+        for cancel in self.image_runs.lock().unwrap().values() {
+            cancel.cancel();
         }
     }
 
@@ -356,8 +427,9 @@ impl TaskScheduler {
     }
 
     /// Replaces a task's triggers and saves them in the data folder, so they hold after a
-    /// restart. Ok(false) for an unknown task; Err when the file could not be written (the new
-    /// triggers apply until the server stops).
+    /// restart. Only the tasks whose triggers differ from the built-in ones are saved. Ok(false)
+    /// for an unknown task; Err when the file could not be written (the new triggers apply until
+    /// the server stops).
     pub async fn set_triggers(
         &self,
         id: &str,
@@ -370,8 +442,11 @@ impl TaskScheduler {
         };
         entry.info.triggers = triggers;
         self.triggers_changed.notify_waiters();
-        let all: HashMap<&String, &Vec<TaskTriggerInfo>> =
-            tasks.iter().map(|(id, e)| (id, &e.info.triggers)).collect();
+        let all: HashMap<&String, &Vec<TaskTriggerInfo>> = tasks
+            .iter()
+            .filter(|(id, e)| self.default_triggers.get(*id) != Some(&e.info.triggers))
+            .map(|(id, e)| (id, &e.info.triggers))
+            .collect();
         let json = serde_json::to_vec_pretty(&all).map_err(std::io::Error::other)?;
         let path = self.data_dir.join(TRIGGERS_FILE);
         let tmp = path.with_extension("json.tmp");
@@ -529,6 +604,9 @@ impl TaskScheduler {
     /// Deletes the activity log entries older than the retention age. A retention of 0 keeps
     /// every entry.
     async fn run_clean_activity_log(&self) {
+        let Some(_claim) = self.claim(TASK_CLEAN_ACTIVITY_LOG) else {
+            return skipped(TASK_CLEAN_ACTIVITY_LOG);
+        };
         self.set_task_state(TASK_CLEAN_ACTIVITY_LOG, TaskState::Running)
             .await;
         let start = Utc::now();
@@ -605,6 +683,23 @@ impl TaskScheduler {
         }
     }
 
+    /// Runs a run the triggers started. Past the task's `MaxRuntimeTicks` it is stopped, as Stop
+    /// does (a task in `STOPPABLE_TASKS` only); a run started by hand has no limit, as in Jellyfin.
+    async fn run_limited(&self, id: &str, run: impl std::future::Future<Output = bool>) -> bool {
+        let Some(limit) = self.max_runtime(id).await else {
+            return run.await;
+        };
+        tokio::pin!(run);
+        tokio::select! {
+            done = &mut run => done,
+            _ = tokio::time::sleep(limit) => {
+                tracing::info!(task = id, ?limit, "the task ran past its MaxRuntimeTicks; stopping it");
+                self.stop_task(id).await;
+                run.await
+            }
+        }
+    }
+
     /// Runs the task each time its triggers say, until shutdown. A task that has not run yet runs
     /// `delay` after the start for an interval or startup trigger, or one interval after the
     /// start when `interval_from_start`. `run` returns false for a run put off, tried again
@@ -625,6 +720,7 @@ impl TaskScheduler {
         let started = Utc::now();
         let mut clock = crate::task_triggers::TriggerClock {
             last_end: None,
+            loop_ran: false,
             first: started + chrono::Duration::from_std(delay).unwrap_or_default(),
             interval_from: interval_from_start.then_some(started),
             started,
@@ -634,19 +730,23 @@ impl TaskScheduler {
                 if !sched.wait_for_trigger(id, clock, &mut rx).await {
                     break;
                 }
-                while !run(sched.clone()).await {
+                while !sched.run_limited(id, run(sched.clone())).await {
                     tokio::select! {
                         _ = tokio::time::sleep(VACUUM_RETRY) => {}
                         _ = rx.wait_for(|v| *v) => return,
                     }
                 }
                 clock.last_end = Some(Utc::now());
+                clock.loop_ran = true;
             }
         });
     }
 
     /// Run the library scan task once
     async fn run_library_scan(&self) {
+        let Some(_claim) = self.claim(TASK_LIBRARY_SCAN) else {
+            return skipped(TASK_LIBRARY_SCAN);
+        };
         self.set_task_state(TASK_LIBRARY_SCAN, TaskState::Running)
             .await;
         let start = Utc::now();
@@ -932,6 +1032,9 @@ impl TaskScheduler {
 
     /// Run metadata refresh for all items across all libraries
     async fn run_metadata_refresh(&self) {
+        let Some(_claim) = self.claim(TASK_METADATA_REFRESH) else {
+            return skipped(TASK_METADATA_REFRESH);
+        };
         self.set_task_state(TASK_METADATA_REFRESH, TaskState::Running)
             .await;
         let start = Utc::now();
@@ -1087,6 +1190,9 @@ impl TaskScheduler {
 
     /// Clean up old transcode cache files
     async fn run_transcode_cleanup(&self) {
+        let Some(_claim) = self.claim(TASK_TRANSCODE_CLEANUP) else {
+            return skipped(TASK_TRANSCODE_CLEANUP);
+        };
         self.set_task_state(TASK_TRANSCODE_CLEANUP, TaskState::Running)
             .await;
         let start = Utc::now();
@@ -1282,6 +1388,11 @@ impl TaskScheduler {
     /// while a scan or an image run is going: false then. It holds `SCAN_LOCK` throughout, so a
     /// scan that starts meanwhile waits for it.
     async fn run_db_vacuum(&self) -> bool {
+        // A run going on already: this start is done, not put off
+        let Some(_claim) = self.claim(TASK_DB_VACUUM) else {
+            skipped(TASK_DB_VACUUM);
+            return true;
+        };
         let no_scan = crate::scanner::SCAN_LOCK.try_lock();
         let blockers = self.vacuum_blockers(no_scan.is_err()).await;
         if !blockers.is_empty() {
@@ -1511,6 +1622,107 @@ mod tests {
             .await
             .unwrap();
         (TaskScheduler::new(db, Arc::new(dir.clone())), dir)
+    }
+
+    #[tokio::test]
+    async fn r3admin_a_task_runs_once_at_a_time() {
+        let (sched, dir) = r3tasks_scheduler().await;
+        let claim = sched.claim(TASK_CLEAN_ACTIVITY_LOG).expect("free");
+        assert!(sched.claim(TASK_CLEAN_ACTIVITY_LOG).is_none());
+        // A start, by hand or by the triggers, while it runs does nothing
+        sched.run_clean_activity_log().await;
+        assert!(
+            sched
+                .get_task(TASK_CLEAN_ACTIVITY_LOG)
+                .await
+                .unwrap()
+                .last_execution_result
+                .is_none()
+        );
+        // A VACUUM that runs already: the second start is done, not put off, and records nothing
+        let vacuum = sched.claim(TASK_DB_VACUUM).expect("free");
+        assert!(sched.run_db_vacuum().await);
+        assert!(
+            sched
+                .get_task(TASK_DB_VACUUM)
+                .await
+                .unwrap()
+                .last_execution_result
+                .is_none()
+        );
+        drop(vacuum);
+        drop(claim);
+        sched.run_clean_activity_log().await;
+        assert!(
+            sched
+                .get_task(TASK_CLEAN_ACTIVITY_LOG)
+                .await
+                .unwrap()
+                .last_execution_result
+                .is_some()
+        );
+        assert!(
+            sched.claim(TASK_CLEAN_ACTIVITY_LOG).is_some(),
+            "free again after the run"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn r3admin_only_edited_triggers_are_saved() {
+        let (sched, dir) = r3tasks_scheduler().await;
+        let file = dir.join(TRIGGERS_FILE);
+        let edited = vec![TaskTriggerInfo::interval(TICKS_12H)];
+        assert!(
+            sched
+                .set_triggers(TASK_DB_VACUUM, edited.clone())
+                .await
+                .unwrap()
+        );
+        let saved: HashMap<String, Vec<TaskTriggerInfo>> =
+            serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        assert_eq!(saved.keys().collect::<Vec<_>>(), [TASK_DB_VACUUM]);
+        assert_eq!(saved[TASK_DB_VACUUM], edited);
+        // Back to its defaults: nothing is saved for it any more
+        let defaults = vec![TaskTriggerInfo::interval(TICKS_24H)];
+        assert!(sched.set_triggers(TASK_DB_VACUUM, defaults).await.unwrap());
+        let saved: HashMap<String, Vec<TaskTriggerInfo>> =
+            serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        assert!(saved.is_empty(), "{saved:?}");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn r3admin_max_runtime_stops_a_triggered_image_run() {
+        let (sched, dir) = r3tasks_scheduler().await;
+        let limited = TaskTriggerInfo {
+            max_runtime_ticks: Some(1_000_000), // 100 ms
+            ..TaskTriggerInfo::interval(TICKS_24H)
+        };
+        sched
+            .set_triggers(TASK_TRICKPLAY, vec![limited.clone()])
+            .await
+            .unwrap();
+        let cancel = sched.begin_image_run(TASK_TRICKPLAY).await.unwrap();
+        let seen = cancel.clone();
+        let started = std::time::Instant::now();
+        let done = sched
+            .run_limited(TASK_TRICKPLAY, async move {
+                while !seen.is_cancelled() {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                true
+            })
+            .await;
+        assert!(done && cancel.is_cancelled());
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        // A task that can't be stopped stores the limit only
+        sched
+            .set_triggers(TASK_LIBRARY_SCAN, vec![limited])
+            .await
+            .unwrap();
+        assert!(sched.max_runtime(TASK_LIBRARY_SCAN).await.is_none());
+        std::fs::remove_dir_all(dir).ok();
     }
 
     /// The status and message of task `id`'s last run.

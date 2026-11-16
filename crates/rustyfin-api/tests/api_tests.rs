@@ -46596,9 +46596,14 @@ async fn r3admin_library_folders_are_added_updated_and_removed_by_name() {
         r3admin_locations(&app, &token, "R3Films").await.unwrap(),
         [first.clone(), second.clone()]
     );
-    // The same folder again, a missing folder, an unknown library
+    // The same folder again (also with a trailing slash), a missing folder, an unknown library
     assert_eq!(
         post("/Library/VirtualFolders/Paths", add).await,
+        StatusCode::BAD_REQUEST
+    );
+    let slash = serde_json::json!({ "Name": "R3Films", "Path": format!("{second}/") });
+    assert_eq!(
+        post("/Library/VirtualFolders/Paths", slash).await,
         StatusCode::BAD_REQUEST
     );
     let missing = format!("{first}/not-there");
@@ -46630,12 +46635,12 @@ async fn r3admin_library_folders_are_added_updated_and_removed_by_name() {
         StatusCode::BAD_REQUEST
     );
 
-    // DELETE ?name=&path=: 204, then 404 for a folder the library no longer has
-    // The test folders' paths need no escaping in a query
+    // DELETE ?name=&path=: 204 (the path matched with a trailing slash), then 404 for a folder
+    // the library no longer has. The test folders' paths need no escaping in a query
     let q = |path: &str| {
         format!("/Library/VirtualFolders/Paths?name=R3Films&path={path}&refreshLibrary=false")
     };
-    let (status, _) = send_authed(&app, "DELETE", &q(&second), &token, None).await;
+    let (status, _) = send_authed(&app, "DELETE", &q(&format!("{second}/")), &token, None).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
     assert_eq!(
         r3admin_locations(&app, &token, "R3Films").await.unwrap(),
@@ -46644,7 +46649,9 @@ async fn r3admin_library_folders_are_added_updated_and_removed_by_name() {
     let (status, _) = send_authed(&app, "DELETE", &q(&second), &token, None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
-    // Rustyfin's earlier body form still removes folders
+    // The last folder stays, in either form: 400
+    let (status, _) = send_authed(&app, "DELETE", &q(&first), &token, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
     let id = rustyfin_db::repo_library::get_all_libraries(&state.db)
         .await
         .unwrap()[0]
@@ -46658,13 +46665,96 @@ async fn r3admin_library_folders_are_added_updated_and_removed_by_name() {
         Some(&body),
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
-    assert!(
-        r3admin_locations(&app, &token, "R3Films")
-            .await
-            .unwrap()
-            .is_empty()
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        r3admin_locations(&app, &token, "R3Films").await.unwrap(),
+        std::slice::from_ref(&first)
     );
+
+    // Rustyfin's earlier body form still removes folders
+    assert_eq!(
+        post(
+            "/Library/VirtualFolders/Paths",
+            serde_json::json!({ "Name": "R3Films", "Path": second })
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    let body = serde_json::json!({ "LibraryId": id, "Paths": [second] }).to_string();
+    let (status, _) = send_authed(
+        &app,
+        "DELETE",
+        "/Library/VirtualFolders/Paths",
+        &token,
+        Some(&body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        r3admin_locations(&app, &token, "R3Films").await.unwrap(),
+        std::slice::from_ref(&first)
+    );
+}
+
+#[tokio::test]
+async fn r3admin_removing_a_folder_removes_its_items_and_their_user_data() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, user) = admin_session(&state).await;
+    let keep = media_folder(&state, "r3keep");
+    let gone = media_folder(&state, "r3gone");
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: "R3Two".into(),
+        content_type: rustyfin_model::library::LibraryContentType::Movies,
+        paths: vec![keep.clone(), format!("{gone}/")],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    let mut ids = Vec::new();
+    for path in [
+        format!("{keep}/A.mkv"),
+        format!("{gone}/B.mkv"),
+        format!("{gone}/sub/C.mkv"),
+    ] {
+        let id = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO media_items (id, library_id, name, media_type, path) VALUES (?, ?, 'x', 'Movie', ?)")
+            .bind(id.to_string())
+            .bind(lib.id.to_string())
+            .bind(&path)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        ids.push(id);
+    }
+    // A watched mark on an item that goes
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        &format!("/Users/{user}/PlayedItems/{}", ids[1]),
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The folder named without its trailing slash
+    let uri = format!("/Library/VirtualFolders/Paths?name=R3Two&path={gone}");
+    let (status, _) = send_authed(&app, "DELETE", &uri, &token, None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let left: Vec<String> = sqlx::query_scalar("SELECT id FROM media_items WHERE library_id = ?")
+        .bind(lib.id.to_string())
+        .fetch_all(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(left, [ids[0].to_string()]);
+    let marks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM user_item_data WHERE item_id = ?")
+        .bind(ids[1].to_string())
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(marks, 0);
 }
 
 #[tokio::test]
@@ -46700,6 +46790,12 @@ async fn r3admin_library_is_renamed() {
 
     assert_eq!(
         rename("name=R3%20Movies&newName=r3shows").await,
+        StatusCode::BAD_REQUEST
+    );
+    // Names clash without case beyond ASCII too: "R3ÄRZTE" is "r3ärzte"
+    create_library_via_api(&app, &state, &token, "R3ÄRZTE", "Movies").await;
+    assert_eq!(
+        rename("name=R3Shows&newName=r3%C3%A4rzte").await,
         StatusCode::BAD_REQUEST
     );
     assert_eq!(
@@ -46825,6 +46921,15 @@ async fn r3admin_quick_connect_follows_the_setting() {
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
     assert_eq!(enabled().await, false);
+    // The saved file carries this build's version, so the next start keeps the admin's false
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(state.data_dir.join("config.json")).unwrap())
+            .unwrap();
+    assert_eq!(saved["QuickConnectAvailable"], false);
+    assert_eq!(
+        saved["RustyfinConfigVersion"],
+        rustyfin_model::server_info::CONFIG_VERSION
+    );
     let (status, _) = send(&app, request("POST", "/QuickConnect/Initiate", None, None)).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     let (status, _) = send_authed(
@@ -46920,6 +47025,21 @@ async fn r3admin_shutdown_answers_204_and_info_says_shutting_down() {
     assert!(*rx.borrow_and_update());
     let (_, info) = send_authed(&app, "GET", "/System/Info", &token, None).await;
     assert_eq!(info["IsShuttingDown"], true);
+}
+
+#[tokio::test]
+async fn r3admin_restart_stops_with_the_restart_exit_code() {
+    let state = test_state().await;
+    let mut rx = state.shutdown_tx.subscribe();
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let (status, _) = send_authed(&app, "POST", "/System/Restart", &token, None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(*rx.borrow_and_update(), "the server stops");
+    // Not 0, so Docker `on-failure` and systemd `Restart=on-failure` start it again. (A
+    // shutdown's 0 is checked on a running server: this flag is per process.)
+    assert_eq!(rustyfin_api::routes::exit_code(), 75);
+    assert_eq!(rustyfin_api::routes::RESTART_EXIT_CODE, 75);
 }
 
 #[test]
