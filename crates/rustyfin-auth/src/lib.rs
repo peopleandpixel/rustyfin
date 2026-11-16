@@ -231,7 +231,7 @@ fn generate_token() -> String {
 }
 
 /// Hex SHA-256 of a token. Only this hash is stored, so a database leak exposes no live token.
-fn token_hash(token: &str) -> String {
+pub fn token_hash(token: &str) -> String {
     Sha256::digest(token.as_bytes())
         .iter()
         .map(|b| format!("{b:02x}"))

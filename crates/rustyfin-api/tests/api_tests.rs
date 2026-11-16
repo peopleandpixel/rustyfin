@@ -48052,8 +48052,19 @@ fn r3cast_request(
     token: &str,
     body: Option<serde_json::Value>,
 ) -> Request<Body> {
+    r3cast_request_from(R3CAST_DEVICE, method, uri, token, body)
+}
+
+/// `r3cast_request` from the receiver with device id `device`.
+fn r3cast_request_from(
+    device: &str,
+    method: &str,
+    uri: &str,
+    token: &str,
+    body: Option<serde_json::Value>,
+) -> Request<Body> {
     let auth = format!(
-        r#"MediaBrowser Client="Chromecast", Device="Living%20Room", DeviceId="{R3CAST_DEVICE}", Version="3.0.0", Token="{token}""#
+        r#"MediaBrowser Client="Chromecast", Device="Living%20Room", DeviceId="{device}", Version="3.0.0", Token="{token}""#
     );
     let builder = Request::builder()
         .method(method)
@@ -48186,27 +48197,106 @@ async fn r3cast_bitrate_test_answers_the_bytes_asked_for() {
         raw("/Playback/BitrateTest", None).await.0,
         StatusCode::UNAUTHORIZED
     );
+    // The largest size states its length up front; the body streams (not read here)
+    let req = request(
+        "GET",
+        "/Playback/BitrateTest?size=100000000",
+        Some(&token),
+        None,
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()["content-length"], "100000000");
 }
 
-// The web client casts to the receiver app the user's CastReceiverId names, from the server's
-// CastReceiverApplications; the receiver reads the user with only its own header
+/// The ids of the sessions on `device`, straight from the database.
+async fn r3cast_sessions_on(state: &AppState, device: &str) -> Vec<String> {
+    sqlx::query_scalar("SELECT id FROM sessions WHERE device_id = ?1")
+        .bind(device)
+        .fetch_all(&state.db)
+        .await
+        .unwrap()
+}
+
+// One token keeps at most four sessions for other devices: a fifth device ends the least recently
+// active of them, and a device it already has keeps its session
 #[tokio::test]
-async fn r3cast_receiver_application_ids_and_header_auth() {
+async fn r3cast_a_token_keeps_at_most_four_receiver_sessions() {
     let state = test_state().await;
     let app = app(state.clone());
-    let (_, web, _) = r3s_owner(&app).await;
-    let (status, me) = send(&app, r3cast_request("GET", "/Users/Me", &web, None)).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(me["Configuration"]["CastReceiverId"], "F007D354");
-    assert!(me["Configuration"]["EnableNextEpisodeAutoPlay"].is_boolean());
-    let (_, info) = send(&app, request("GET", "/System/Info", Some(&web), None)).await;
-    let ids: Vec<_> = info["CastReceiverApplications"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|a| a["Id"].as_str().unwrap().to_string())
-        .collect();
-    assert_eq!(ids, ["F007D354", "6F511C87"]);
+    let (ctl, web, _) = r3s_owner(&app).await;
+    let caps = |device: &str| {
+        let body =
+            serde_json::json!({ "PlayableMediaTypes": ["Video"], "SupportsMediaControl": true });
+        r3cast_request_from(
+            device,
+            "POST",
+            "/Sessions/Capabilities/Full",
+            &web,
+            Some(body),
+        )
+    };
+    for device in ["cast-1", "cast-2", "cast-3", "cast-4"] {
+        assert_eq!(send(&app, caps(device)).await.0, StatusCode::NO_CONTENT);
+    }
+    // cast-3 is the least recently active; cast-1 is used again and keeps its one session
+    sqlx::query(
+        "UPDATE sessions SET last_activity = '2000-01-01 00:00:00' WHERE device_id = 'cast-3'",
+    )
+    .execute(&state.db)
+    .await
+    .unwrap();
+    let first = r3cast_sessions_on(&state, "cast-1").await;
+    assert_eq!(send(&app, caps("cast-1")).await.0, StatusCode::NO_CONTENT);
+    assert_eq!(r3cast_sessions_on(&state, "cast-1").await, first);
+
+    assert_eq!(send(&app, caps("cast-5")).await.0, StatusCode::NO_CONTENT);
+    assert!(r3cast_sessions_on(&state, "cast-3").await.is_empty());
+    for device in ["cast-1", "cast-2", "cast-4", "cast-5"] {
+        assert_eq!(
+            r3cast_sessions_on(&state, device).await.len(),
+            1,
+            "{device}"
+        );
+    }
+    // The token's own device and other tokens are not counted
+    assert!(!r3s_session(&app, &ctl, "r3s-tgt").await.is_null());
+    assert!(!r3s_session(&app, &ctl, "r3s-ctl").await.is_null());
+}
+
+// A receiver's session ends with the token it was made with: on sign-out, and on revocation
+#[tokio::test]
+async fn r3cast_receiver_sessions_end_with_their_token() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (ctl, web, _) = r3s_owner(&app).await;
+    let req = r3cast_request(
+        "POST",
+        "/Sessions/Capabilities/Full",
+        &web,
+        Some(serde_json::json!({})),
+    );
+    assert_eq!(send(&app, req).await.0, StatusCode::NO_CONTENT);
+    assert!(!r3s_session(&app, &ctl, R3CAST_DEVICE).await.is_null());
+    let req = request("POST", "/Sessions/Logout", Some(&web), None);
+    assert_eq!(send(&app, req).await.0, StatusCode::NO_CONTENT);
+    assert!(r3cast_sessions_on(&state, R3CAST_DEVICE).await.is_empty());
+    assert!(r3s_session(&app, &ctl, R3CAST_DEVICE).await.is_null());
+
+    // A revoked token (no sign-out) takes its receiver session with it too
+    let (web, _) = r3s_login(&app, "owner", "ownerpass", "r3s-tgt").await;
+    let req = r3cast_request(
+        "POST",
+        "/Sessions/Capabilities/Full",
+        &web,
+        Some(serde_json::json!({})),
+    );
+    assert_eq!(send(&app, req).await.0, StatusCode::NO_CONTENT);
+    assert_eq!(r3cast_sessions_on(&state, R3CAST_DEVICE).await.len(), 1);
+    rustyfin_auth::revoke_token(&state.db, &web).await.unwrap();
+    assert!(r3cast_sessions_on(&state, R3CAST_DEVICE).await.is_empty());
+    // The controller's own session is untouched
+    assert!(!r3s_session(&app, &ctl, "r3s-ctl").await.is_null());
 }
 
 // The web client's Cast sender: the SDK loads only on demand, one picker lists Cast devices and

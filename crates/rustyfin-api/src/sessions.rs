@@ -168,8 +168,14 @@ pub async fn for_token(state: &AppState, token: Option<&str>) -> Result<Option<S
     for_request(state, token, None).await
 }
 
+/// How many sessions for other devices one token keeps; a new one beyond this ends the token's
+/// least recently active one, so a token can't fill the session list.
+pub const MAX_STATED_SESSIONS: usize = 4;
+
 /// `for_token` for a request whose header names a device: another device id than the token's
-/// gets that device's session, with the header's client, device name and version.
+/// gets that device's session, with the header's client, device name and version. That session
+/// belongs to the token (it ends when the token does), and a token keeps at most
+/// `MAX_STATED_SESSIONS` of them.
 pub async fn for_request(
     state: &AppState,
     token: Option<&str>,
@@ -182,6 +188,7 @@ pub async fn for_request(
     else {
         return Ok(None);
     };
+    let mut via_token = None;
     if let Some(StatedDevice(stated)) = stated
         && !stated.device_id.is_empty()
         && stated.device_id != device.device_id
@@ -193,6 +200,7 @@ pub async fn for_request(
             app_name: or(&stated.app_name, &device.app_name),
             app_version: or(&stated.app_version, &device.app_version),
         };
+        via_token = Some(rustyfin_auth::token_hash(token));
     }
     if let Some(id) =
         rustyfin_db::repo_session::find_device_session(&state.db, user_id, &device.device_id)
@@ -204,6 +212,15 @@ pub async fn for_request(
     let Some(user) = rustyfin_db::repo_user::get_user_by_id(&state.db_ro, user_id).await? else {
         return Ok(None);
     };
+    if let Some(hash) = &via_token {
+        let mut held = rustyfin_db::repo_session::token_sessions(&state.db, hash).await?;
+        let over = (held.len() + 1).saturating_sub(MAX_STATED_SESSIONS);
+        let oldest: Vec<String> = held.drain(..over).collect();
+        for old in &oldest {
+            rustyfin_db::repo_session::delete_session(&state.db, old).await?;
+        }
+        forget_all(state, &oldest);
+    }
     let id = Uuid::new_v4();
     rustyfin_db::repo_session::create_session(
         &state.db,
@@ -217,6 +234,9 @@ pub async fn for_request(
         "{}",
     )
     .await?;
+    if let Some(hash) = &via_token {
+        rustyfin_db::repo_session::set_session_token(&state.db, &id.to_string(), hash).await?;
+    }
     changed(state);
     Ok(Some(id.to_string()))
 }

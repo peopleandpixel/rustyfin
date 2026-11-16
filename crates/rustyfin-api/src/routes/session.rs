@@ -136,8 +136,9 @@ async fn logout_session(
     token: Option<Extension<rustyfin_auth::RequestToken>>,
 ) -> Result<StatusCode, ApiError> {
     if let Some(Extension(rt)) = token {
-        // The sessions the logout ends, so their play state goes with them
-        let ended = match rustyfin_auth::token_device(&state.db, &rt.0).await? {
+        // The sessions the logout ends, so their play state goes with them: the device's, and the
+        // ones the token made for other devices (a Cast receiver), which end with the token
+        let mut ended = match rustyfin_auth::token_device(&state.db, &rt.0).await? {
             Some((user, device)) => {
                 rustyfin_db::repo_session::session_ids(
                     &state.db,
@@ -148,6 +149,10 @@ async fn logout_session(
             }
             None => Vec::new(),
         };
+        ended.extend(
+            rustyfin_db::repo_session::token_sessions(&state.db, &rustyfin_auth::token_hash(&rt.0))
+                .await?,
+        );
         rustyfin_auth::logout(&state.db, &rt.0).await?;
         crate::sessions::forget_all(&state, &ended);
         crate::sessions::changed(&state);

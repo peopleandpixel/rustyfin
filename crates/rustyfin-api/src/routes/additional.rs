@@ -440,23 +440,36 @@ async fn get_bitrate_test(
                 ))
             })?,
     };
+    // One shared chunk, sent as often as `size` needs: a large test costs no memory per request
+    let chunk = BITRATE_TEST_CHUNK.clone();
+    let step = chunk.len() as u64;
+    let chunks = (0..size.div_ceil(step)).map(move |i| {
+        let len = step.min(size - i * step) as usize;
+        Ok::<_, std::convert::Infallible>(chunk.slice(..len))
+    });
     Ok((
-        [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
-        bitrate_test_bytes(size as usize),
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "application/octet-stream".to_string(),
+            ),
+            (axum::http::header::CONTENT_LENGTH, size.to_string()),
+        ],
+        axum::body::Body::from_stream(futures_util::stream::iter(chunks)),
     )
         .into_response())
 }
 
-/// `len` bytes that don't compress, so a compressing proxy can't shorten the test (xorshift).
-fn bitrate_test_bytes(len: usize) -> Vec<u8> {
-    let mut x: u64 = 0x9E37_79B9_7F4A_7C15 ^ len as u64;
-    let mut out = Vec::with_capacity(len + 8);
-    while out.len() < len {
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        out.extend_from_slice(&x.to_le_bytes());
-    }
-    out.truncate(len);
-    out
-}
+/// 64 KiB that don't compress (xorshift), so a compressing proxy can't shorten the test.
+static BITRATE_TEST_CHUNK: std::sync::LazyLock<axum::body::Bytes> =
+    std::sync::LazyLock::new(|| {
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut out = Vec::with_capacity(64 * 1024);
+        while out.len() < 64 * 1024 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        axum::body::Bytes::from(out)
+    });
