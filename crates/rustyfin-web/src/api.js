@@ -507,13 +507,13 @@ const API = {
         };
         return this._playableCodecs;
     },
-    // Universal endpoint returns the optimal playback URL
+    // Universal endpoint returns the optimal playback URL. No PlaySessionId is sent: the server
+    // keeps a client's id, and one fixed per device would tie every load to the last one stopped.
     async getUniversalVideoUrl(itemId, params = {}) {
         const q = new URLSearchParams({
             MaxStreamingBitrate: params.maxBitrate || '100000000',
             EnableDirectPlay: params.enableDirectPlay !== false ? 'true' : 'false',
             EnableDirectStream: params.enableDirectStream !== false ? 'true' : 'false',
-            PlaySessionId: 'web-' + (localStorage.getItem('rustyfin_device_id') || 'browser'),
         });
         const codecs = this.playableCodecs();
         q.set('VideoCodecs', codecs.video.join(','));
