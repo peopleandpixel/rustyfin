@@ -160,6 +160,16 @@ test('a page with another or no theme replaces or stops it; a page left meanwhil
     assert.equal(f.audios.length, 2, 'the page was left before the songs loaded');
 });
 
+test('playback that starts while the theme song loads keeps it from starting over the video', async () => {
+    const f = themeSandbox();
+    const loading = f.playThemeSong('m1');
+    f.stopThemeSong(); // playItem's stop, before the theme songs answered
+    await loading;
+    assert.equal(f.audios.length, 0, 'no song starts after the stop');
+    await f.playThemeSong('m1');
+    assert.equal(f.audios.length, 1, 'a later page plays it again');
+});
+
 test('leaving item pages or starting playback stops the theme song', () => {
     const navigate = slice(router, 'function navigate(');
     assert.match(navigate, /if \(page !== 'detail'\) stopThemeSong\(\);/);

@@ -7,12 +7,15 @@ import { userSetting } from './user-settings.js';
 const THEME_VOLUME = 0.3;
 
 let theme = null; // { ownerId, audio }
+// Each stop counts up, so a theme song still loading when playback starts (or the page is left) never starts
+let stops = 0;
 
 function themeSongsEnabled() {
     return userSetting('enableThemeSongs', 'false') === 'true';
 }
 
 function stopThemeSong() {
+    stops++;
     if (!theme) return;
     const { audio } = theme;
     theme = null;
@@ -28,13 +31,14 @@ async function playThemeSong(itemId, stillHere = () => true) {
         stopThemeSong();
         return;
     }
+    const stopsBefore = stops;
     let result;
     try {
         result = await API.getThemeSongs(itemId);
     } catch {
         return;
     }
-    if (!stillHere()) return;
+    if (!stillHere() || stops !== stopsBefore) return;
     const song = (result?.Items || [])[0];
     if (!song) {
         stopThemeSong();
