@@ -1104,6 +1104,26 @@ async fn scan_flat_library(
             }
         }
     }
+    // A stored part that is no part now (its stack broke up: part 1 renamed or deleted) is a movie
+    // again, keeping its id, so the reconcile below finds it at its path instead of adding a second
+    // movie there. A part whose file is gone becomes a movie that the removal then deletes.
+    let stale_parts: Vec<String> = if reads_extras {
+        let parts: HashSet<String> = part_extras
+            .iter()
+            .map(|part| part.path.to_string_lossy().into_owned())
+            .collect();
+        rustyfin_db::repo_extras::items_by_path(pool, library.id, &filter)
+            .await?
+            .into_iter()
+            .filter(|(path, row)| {
+                row.extra_type.as_deref() == Some(naming::ExtraKind::Part.as_str())
+                    && !parts.contains(path)
+            })
+            .map(|(path, _)| path)
+            .collect()
+    } else {
+        Vec::new()
+    };
     let folder_groups: HashMap<PathBuf, Vec<naming::VersionGroup>> = movie_files
         .iter()
         .map(|(folder, files)| {
@@ -1112,7 +1132,7 @@ async fn scan_flat_library(
         })
         .collect();
     let movie_folders: HashSet<PathBuf> = movie_files.keys().cloned().collect();
-    let mut released: Vec<String> = Vec::new();
+    let mut released: Vec<String> = stale_parts;
     let mut owned_extras: Vec<extras::FoundExtra> = Vec::new();
     let unowned_files = found_extras
         .into_iter()
