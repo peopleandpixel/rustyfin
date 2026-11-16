@@ -18,6 +18,7 @@ import './modules/genres.js';
 import './modules/music.js';
 import './modules/item.js';
 import './modules/metadata-admin.js';
+import './modules/subtitle-admin.js';
 import { doSearch } from './modules/search.js';
 import {
     seekVideo, skipTime, previewSeek, changeAudioTrack, changeSubtitleTrack, playerAreaClick, closePlayer,
