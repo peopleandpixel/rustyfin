@@ -109,11 +109,19 @@ function airDayTitle(date, now = new Date()) {
     return date.toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric' });
 }
 
+// An episode's air date. A date with no time of day (or midnight UTC, as servers store a premiere
+// date) is that calendar day here, not the evening before west of UTC.
+function airDate(value) {
+    const day = /^(\d{4})-(\d{2})-(\d{2})(?:T00:00:00(?:\.0+)?(?:Z|[+-]00:?00)?)?$/.exec(value || '');
+    if (day) return new Date(Number(day[1]), Number(day[2]) - 1, Number(day[3]));
+    return value ? new Date(value) : null;
+}
+
 // The upcoming episodes in a row per day they air, in order; one with no date goes last
 function upcomingGroups(items, now = new Date()) {
     const groups = new Map();
     for (const item of items) {
-        const date = item.PremiereDate ? new Date(item.PremiereDate) : null;
+        const date = airDate(item.PremiereDate);
         const title = date && !Number.isNaN(date.getTime()) ? airDayTitle(date, now) : t('library.date_unknown');
         if (!groups.has(title)) groups.set(title, []);
         groups.get(title).push(item);

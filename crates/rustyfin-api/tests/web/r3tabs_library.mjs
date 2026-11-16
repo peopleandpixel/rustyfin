@@ -214,6 +214,15 @@ test('Upcoming: the library\'s episodes still to air, in a row per day', async (
     assert.deepEqual(groups.map(([title, items]) => [title, items.map(i => i.Id)]),
         [['library.today', ['e1']], ['library.tomorrow', ['e2', 'e3']], ['library.date_unknown', ['e4']]]);
 
+    // A date-only premiere, or midnight UTC, is that calendar day wherever the client is
+    const dated = plain(s.fns.upcomingGroups([
+        { Id: 'd1', PremiereDate: '2026-11-17' },
+        { Id: 'd2', PremiereDate: '2026-11-17T00:00:00.0000000Z' },
+        { Id: 'd3', PremiereDate: '2026-11-16T00:00:00+00:00' },
+    ], now));
+    assert.deepEqual(dated.map(([title, items]) => [title, items.map(i => i.Id)]),
+        [['library.tomorrow', ['d1', 'd2']], ['library.today', ['d3']]]);
+
     const tab = tabsSandbox({ '/Shows/Upcoming': { Items: [] } });
     await tab.fns.renderUpcoming('shows', 'Shows', 'TvShows', '<nav>');
     assert.equal(query(tab.gets[0]).ParentId, 'shows');
