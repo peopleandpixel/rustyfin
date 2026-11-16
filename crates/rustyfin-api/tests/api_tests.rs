@@ -19331,9 +19331,10 @@ async fn b110_a_failed_stop_leaves_the_watch_data_alone() {
             .unwrap();
         b.start(item).await;
         b.progress(item, B110_HOUR / 2).await;
-        // What the progress left: the film's resume point, or the item without a runtime played
+        // What the progress left: the film's resume point; the item without a runtime as the
+        // start left it
         let after_progress = if item == b.unknown {
-            (true, 1, 0, true)
+            (false, 1, 0, true)
         } else {
             (false, 1, B110_HOUR / 2, true)
         };
@@ -19450,8 +19451,11 @@ async fn b110_progress_near_the_end_marks_played() {
     // Past 90% the item is played and leaves no resume point, as if the client never stops.
     b.progress(b.film, B110_HOUR * 95 / 100).await;
     assert_eq!(b.stored(b.film).await, (true, 1, 0, true));
-    // Progress on an item with no runtime marks it played, without counting a play.
+    // Progress on an item whose runtime isn't known yet (not probed) changes nothing; Jellyfin
+    // would count it played to the end, which only a stop does here.
     b.progress(b.unknown, 5_000).await;
+    assert_eq!(b.stored(b.unknown).await, (false, 0, 0, false));
+    b.stop(b.unknown, Some(5_000)).await;
     assert_eq!(b.stored(b.unknown).await, (true, 0, 0, true));
 }
 
@@ -46632,6 +46636,25 @@ async fn r3gaps3_progress_and_stop_follow_the_configured_resume_rules() {
     assert_eq!(b.stored(e1).await, (true, 1, 0, true));
 }
 
+/// An item without a played flag in Jellyfin (a photo, a genre) keeps no resume point and stays
+/// unplayed after progress and stop reports.
+#[tokio::test]
+async fn r3gaps3_items_without_a_played_status_stay_unplayed() {
+    let b = B110::new().await;
+    let photos = j5_library(
+        &b.state,
+        "R3 Photos",
+        rustyfin_model::library::LibraryContentType::Mixed,
+    )
+    .await;
+    let photo = j5_item(&b.state, photos, None, "R3 Photo", "Photo", "", None).await;
+    b110_set(&b.state, photo, Some(B110_HOUR), None, None).await;
+    b.progress(photo, B110_HOUR / 2).await;
+    assert_eq!(b.stored(photo).await, (false, 0, 0, true));
+    b.stop(photo, None).await;
+    assert_eq!(b.stored(photo).await, (false, 1, 0, true));
+}
+
 #[tokio::test]
 async fn r3gaps3_default_resume_rules_apply_when_none_are_saved() {
     let b = B110::new().await;
@@ -46682,16 +46705,31 @@ async fn r3gaps3_pictures_outside_the_libraries_and_data_dir_are_refused() {
 
     let (status, _) = r3playback_get(&app, &uri, &token).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "a picture in no library");
+    let read_at = || *state.file_guard.library_roots_read_at.read().unwrap();
+    let first_read = read_at().expect("the refusal read the library paths");
 
-    // Once its folder is a library, the picture shows: the kept library paths are read again
+    // Its folder becomes a library behind the API's back: refused pictures don't read the
+    // library paths again within 30 s, so it stays refused and nothing is read
     r3playback_insert_item(
         &state,
         &elsewhere,
         elsewhere.join("Other.mkv").to_str().unwrap(),
     )
     .await;
+    for _ in 0..3 {
+        let (status, _) = r3playback_get(&app, &uri, &token).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "the kept library paths are used"
+        );
+    }
+    assert_eq!(read_at(), Some(first_read));
+
+    // A library added through the API drops the kept paths, so the picture shows at once
+    create_library_via_api(&app, &state, &token, "R3gaps3 Other", "Movies").await;
     let (status, body) = r3playback_get(&app, &uri, &token).await;
-    assert_eq!(status, StatusCode::OK, "a picture in a library added since");
+    assert_eq!(status, StatusCode::OK, "the library paths are read again");
     assert!(body.starts_with(b"\x89PNG"));
 }
 

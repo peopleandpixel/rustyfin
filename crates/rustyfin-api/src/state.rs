@@ -95,6 +95,9 @@ pub struct FileGuardCache {
     pub owned_files: Arc<tokio::sync::OnceCell<Vec<PathBuf>>>,
     pub library_roots: Arc<std::sync::RwLock<Option<Arc<Vec<LibraryRoot>>>>>,
     pub owned_set: Arc<std::sync::RwLock<Option<KeptOwnedSet>>>,
+    /// When the library paths were last read, which limits how often refused pictures read them
+    /// again.
+    pub library_roots_read_at: Arc<std::sync::RwLock<Option<std::time::Instant>>>,
 }
 
 /// A resolved `OwnedSet` and when it was resolved.

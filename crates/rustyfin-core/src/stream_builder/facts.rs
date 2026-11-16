@@ -79,8 +79,9 @@ pub struct SourceFacts {
     pub default_audio_stream_index: Option<i32>,
     /// The default subtitle stream index, picked from the subtitle streams.
     pub default_subtitle_stream_index: Option<i32>,
-    /// Which user settings picked the default audio stream; none until they are applied.
-    pub audio_index_source: AudioIndexSource,
+    /// Which user settings picked the default audio stream; None until they are applied
+    /// (`SourceFacts::apply_preferences`).
+    pub audio_index_source: Option<AudioIndexSource>,
 }
 
 impl Default for SourceFacts {
@@ -97,7 +98,7 @@ impl Default for SourceFacts {
             supports_transcoding: true,
             default_audio_stream_index: None,
             default_subtitle_stream_index: None,
-            audio_index_source: AudioIndexSource::default(),
+            audio_index_source: None,
         }
     }
 }
@@ -105,7 +106,8 @@ impl Default for SourceFacts {
 impl From<&MediaSourceResponse> for SourceFacts {
     /// Reads the facts that the conditions can test from a source response.
     fn from(source: &MediaSourceResponse) -> Self {
-        let streams: Vec<StreamFacts> = source.media_streams.iter().map(stream_facts).collect();
+        let mut streams: Vec<StreamFacts> = source.media_streams.iter().map(stream_facts).collect();
+        estimate_missing_bit_rates(&mut streams, source.bitrate);
         // Jellyfin's pick for a user with the default settings
         let default_subtitle_stream_index =
             default_subtitle_index(&streams, &[], SubtitleMode::Default, None);
@@ -124,7 +126,7 @@ impl From<&MediaSourceResponse> for SourceFacts {
             supports_transcoding: source.supports_transcoding,
             default_audio_stream_index: None,
             default_subtitle_stream_index,
-            audio_index_source: AudioIndexSource::default(),
+            audio_index_source: None,
         }
     }
 }
@@ -156,6 +158,70 @@ fn stream_facts(stream: &MediaStream) -> StreamFacts {
         is_forced: stream.is_forced,
         path: stream.path.clone(),
         score: None,
+    }
+}
+
+/// Whether a video stream is a picture (cover art), which Jellyfin counts as an embedded image.
+fn is_picture(stream: &StreamFacts) -> bool {
+    ["mjpeg", "png", "gif", "webp"].contains(&stream.codec.as_str())
+}
+
+/// Jellyfin's fallback bit rate for an audio stream that ffprobe gives none, by codec and
+/// channels (its probe's `GetEstimatedAudioBitrate`). None for other codecs or no channels.
+fn estimated_audio_bit_rate(codec: &str, profile: Option<&str>, channels: i32) -> Option<i32> {
+    if channels < 1 {
+        return None;
+    }
+    let multichannel = channels > 2;
+    let pick = |many: i32, few: i32| if multichannel { many } else { few };
+    let lossless_dts = profile.is_some_and(|p| p.to_ascii_lowercase().contains("hd ma"));
+    match codec {
+        "aac" | "mp3" | "mp2" => Some(pick(320_000, 192_000)),
+        "ac3" | "eac3" => Some(pick(640_000, 192_000)),
+        "dts" | "dca" if lossless_dts => channels.checked_mul(700_000),
+        "dts" | "dca" => Some(pick(1_509_000, 768_000)),
+        "opus" => Some(pick(256_000, 128_000)),
+        "vorbis" => Some(pick(320_000, 160_000)),
+        "wmav1" | "wmav2" | "wmapro" => Some(pick(384_000, 192_000)),
+        "flac" | "alac" => channels.checked_mul(480_000),
+        "truehd" | "mlp" => channels.checked_mul(700_000),
+        _ => None,
+    }
+}
+
+/// Fills in the bit rates a video's probe left out, as Jellyfin's probe does, from the stored
+/// codecs, channels and container bit rate (so no file is read again): each audio stream gets
+/// the estimate for its codec (`estimated_audio_bit_rate`), then a lone video stream gets the
+/// container's bit rate less the other embedded streams', when every audio bit rate is known and
+/// something is left. A source without a video stream (an audio file) is left as it is.
+fn estimate_missing_bit_rates(streams: &mut [StreamFacts], total_bitrate: Option<u32>) {
+    let is_video = |s: &StreamFacts| s.kind == StreamKind::Video && !is_picture(s);
+    let videos = streams.iter().filter(|s| is_video(s)).count();
+    if videos == 0 {
+        return;
+    }
+    for stream in streams.iter_mut() {
+        if stream.kind == StreamKind::Audio && stream.bit_rate.is_none() {
+            stream.bit_rate = stream.channels.and_then(|channels| {
+                estimated_audio_bit_rate(&stream.codec, stream.profile.as_deref(), channels)
+            });
+        }
+    }
+    let Some(total) = total_bitrate.filter(|_| videos == 1) else {
+        return;
+    };
+    let others = || streams.iter().filter(|s| !is_video(s) && !s.is_external);
+    let audio_known = others()
+        .filter(|s| s.kind == StreamKind::Audio)
+        .all(|s| s.bit_rate.is_some());
+    let used: i64 = others().filter_map(|s| s.bit_rate).map(i64::from).sum();
+    let left = i64::from(total) - used;
+    if let Some(video) = streams.iter_mut().find(|s| is_video(s))
+        && video.bit_rate.is_none()
+        && audio_known
+        && left > 0
+    {
+        video.bit_rate = i32::try_from(left).ok();
     }
 }
 
@@ -206,4 +272,112 @@ fn parse_frame_rate(text: &str) -> Option<f32> {
 /// transfer function, and anything else SDR (`MediaStream::video_range`).
 fn range_type(stream: &MediaStream) -> &'static str {
     stream.video_range().map_or("SDR", |(_, kind)| kind)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stream(
+        kind: StreamKind,
+        codec: &str,
+        channels: Option<i32>,
+        bit_rate: Option<i32>,
+    ) -> StreamFacts {
+        StreamFacts {
+            kind,
+            codec: codec.to_string(),
+            channels,
+            bit_rate,
+            ..Default::default()
+        }
+    }
+
+    /// Audio streams without a bit rate get Jellyfin's estimate by codec and channels, and the
+    /// lone video stream gets the container's bit rate less the audio, as in Jellyfin 12.4.0
+    /// (mono AAC 192 kbps, stereo FLAC 960 kbps). Cover art is no video stream.
+    #[test]
+    fn r3gaps3_missing_bit_rates_are_estimated_as_jellyfin_does() {
+        let mut dts = stream(StreamKind::Audio, "dts", Some(6), None);
+        dts.profile = Some("DTS-HD MA".to_string());
+        let mut streams = vec![
+            stream(StreamKind::Video, "h264", None, None),
+            stream(StreamKind::Audio, "aac", Some(1), None),
+            stream(StreamKind::Audio, "flac", Some(2), None),
+            dts,
+            stream(StreamKind::Audio, "truehd", Some(8), None),
+            stream(StreamKind::Audio, "eac3", Some(6), Some(256_000)),
+            stream(StreamKind::Subtitle, "subrip", None, None),
+            stream(StreamKind::Video, "mjpeg", None, None),
+        ];
+        estimate_missing_bit_rates(&mut streams, Some(20_000_000));
+        let rates: Vec<_> = streams.iter().map(|s| s.bit_rate).collect();
+        assert_eq!(
+            rates,
+            vec![
+                Some(20_000_000 - 192_000 - 960_000 - 4_200_000 - 5_600_000 - 256_000),
+                Some(192_000),
+                Some(960_000),
+                Some(4_200_000),
+                Some(5_600_000),
+                Some(256_000),
+                None,
+                None
+            ]
+        );
+    }
+
+    /// The video keeps no bit rate when an audio bit rate stays unknown, when nothing is left,
+    /// or without a container bit rate; a known one is kept; an audio file is left alone.
+    #[test]
+    fn r3gaps3_video_bit_rate_is_estimated_only_when_it_can_be() {
+        let estimate = |audio: StreamFacts, video_rate, total| {
+            let mut streams = vec![stream(StreamKind::Video, "h264", None, video_rate), audio];
+            estimate_missing_bit_rates(&mut streams, total);
+            (streams[0].bit_rate, streams[1].bit_rate)
+        };
+        let pcm = stream(StreamKind::Audio, "pcm_s16le", Some(2), None);
+        let aac = stream(StreamKind::Audio, "aac", Some(2), None);
+        assert_eq!(estimate(pcm, None, Some(5_000_000)), (None, None));
+        assert_eq!(
+            estimate(aac.clone(), None, Some(192_000)),
+            (None, Some(192_000))
+        );
+        assert_eq!(estimate(aac.clone(), None, None), (None, Some(192_000)));
+        assert_eq!(
+            estimate(aac.clone(), Some(1000), Some(5_000_000)),
+            (Some(1000), Some(192_000))
+        );
+        let mut song = vec![aac];
+        estimate_missing_bit_rates(&mut song, Some(320_000));
+        assert_eq!(song[0].bit_rate, None);
+    }
+
+    /// The estimate reaches the facts the decisions read; the stored source is unchanged.
+    #[test]
+    fn r3gaps3_source_facts_carry_the_estimates() {
+        let mut source: MediaSourceResponse = serde_json::from_value(serde_json::json!({
+            "Id": "s", "Uid": "s", "Protocol": "File", "Path": "/m/a.mkv", "Bitrate": 205_621
+        }))
+        .unwrap();
+        source.media_streams = vec![
+            MediaStream {
+                index: 1,
+                codec: Some("h264".to_string()),
+                codec_type: "video".to_string(),
+                ..Default::default()
+            },
+            MediaStream {
+                index: 2,
+                codec: Some("aac".to_string()),
+                codec_type: "audio".to_string(),
+                channels: Some(1),
+                ..Default::default()
+            },
+        ];
+        let facts = SourceFacts::from(&source);
+        let rates: Vec<_> = facts.streams.iter().map(|s| s.bit_rate).collect();
+        assert_eq!(rates, vec![Some(13_621), Some(192_000)]);
+        assert_eq!(source.media_streams[1].bit_rate, None);
+    }
 }

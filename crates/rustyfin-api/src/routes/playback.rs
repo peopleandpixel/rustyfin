@@ -289,13 +289,14 @@ async fn report_progress(
         Some(item) => reported_runtime(&state, item, req.media_source_id.as_deref()).await?,
         None => None,
     };
-    if is_media {
+    if let Some(item) = &item {
         if let Some(position) = req.position_ticks {
             let rules = state.config.read().await.resume_rules();
             rustyfin_db::repo_playback::record_playback_progress(
                 &state.db,
                 claims.sub,
                 req.item_id,
+                item.media_type,
                 position,
                 runtime,
                 &rules,
@@ -392,6 +393,7 @@ pub(crate) async fn record_stop(
             &state.db,
             user,
             req.item_id,
+            item.media_type,
             req.position_ticks,
             runtime,
             &rules,

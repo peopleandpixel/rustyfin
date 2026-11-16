@@ -244,26 +244,35 @@ pub async fn record_playback_start(
     .await
 }
 
+/// Whether an item of `media_type` has a played flag (Jellyfin's `SupportsPlayedStatus`): videos,
+/// audio and folders do; a photo or a genre (a plain `BaseItem` in Jellyfin) does not, so a
+/// report leaves it unplayed with no resume point.
+pub fn supports_played_status(media_type: MediaType) -> bool {
+    !matches!(media_type, MediaType::Photo | MediaType::Genre)
+}
+
 /// A client reported progress: stores the resume position and raises the played flag as
-/// `update_play_state` decides with the server's resume `rules`.
+/// `update_play_state` decides with the server's resume `rules`. An item whose runtime isn't
+/// known yet (its probe hasn't run) is left alone: Jellyfin would count it played to the end,
+/// which a stop still does.
 pub async fn record_playback_progress(
     pool: &SqlitePool,
     user_id: Uuid,
     item_id: Uuid,
+    media_type: MediaType,
     position_ticks: i64,
     runtime_ticks: Option<i64>,
     rules: &ResumeRules,
 ) -> Result<(), sqlx::Error> {
-    let (position, played) = update_play_state(rules, runtime_ticks, position_ticks);
-    write_playback_state(
-        pool,
-        user_id,
-        item_id,
-        position,
-        PlayedUpdate::Keep(played),
-        0,
-    )
-    .await
+    let played = if !supports_played_status(media_type) {
+        (0, PlayedUpdate::Assign(false))
+    } else if runtime_ticks.is_some_and(|rt| rt > 0) {
+        let (position, played) = update_play_state(rules, runtime_ticks, position_ticks);
+        (position, PlayedUpdate::Keep(played))
+    } else {
+        return Ok(());
+    };
+    write_playback_state(pool, user_id, item_id, played.0, played.1, 0).await
 }
 
 /// A client reported playback stopped. With a position, `update_play_state` decides with the
@@ -273,6 +282,7 @@ pub async fn record_playback_stop(
     pool: &SqlitePool,
     user_id: Uuid,
     item_id: Uuid,
+    media_type: MediaType,
     position_ticks: Option<i64>,
     runtime_ticks: Option<i64>,
     rules: &ResumeRules,
@@ -284,15 +294,13 @@ pub async fn record_playback_stop(
         }
         None => (0, true, 1),
     };
-    write_playback_state(
-        pool,
-        user_id,
-        item_id,
-        position,
-        PlayedUpdate::Keep(played),
-        play_count_delta,
-    )
-    .await
+    // Without a played flag: no resume point and unplayed, the play still counted
+    let (position, played) = if supports_played_status(media_type) {
+        (position, PlayedUpdate::Keep(played))
+    } else {
+        (0, PlayedUpdate::Assign(false))
+    };
+    write_playback_state(pool, user_id, item_id, position, played, play_count_delta).await
 }
 
 /// A remembered track: the index of the stream a user chose, with the key of that stream when it

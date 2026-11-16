@@ -201,11 +201,26 @@ struct OwnedPaths {
 
 impl OwnedPaths {
     /// The two forms of `path`: resolved, when that works, and as configured, made absolute.
-    fn forms(path: &FilePath) -> Vec<std::path::PathBuf> {
-        path.canonicalize()
+    /// A resolve that fails for another reason than a missing file clears `clean`.
+    fn forms(path: &FilePath, clean: &std::cell::Cell<bool>) -> Vec<std::path::PathBuf> {
+        Self::resolved(path, clean)
             .into_iter()
             .chain(std::path::absolute(path))
             .collect()
+    }
+
+    /// `path` resolved. None when it can't be; a failure other than a missing file (a share
+    /// that didn't answer, a permission) clears `clean`.
+    fn resolved(path: &FilePath, clean: &std::cell::Cell<bool>) -> Option<std::path::PathBuf> {
+        match path.canonicalize() {
+            Ok(real) => Some(real),
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    clean.set(false);
+                }
+                None
+            }
+        }
     }
 
     /// `path` with `suffix` added to its file name.
@@ -250,16 +265,26 @@ impl OwnedPaths {
         }
     }
 
+    /// The set `resolve_checked` makes, for tests.
+    #[cfg(test)]
+    fn resolve(&self) -> OwnedSet {
+        self.resolve_checked().0
+    }
+
     /// Resolves every owned path, which reads the file system: the data dir's forms, each owned
     /// folder that resolves, and each owned file in each form with its SQLite siblings. Checks
-    /// then compare paths only (`OwnedSet::owns_in`).
-    fn resolve(&self) -> OwnedSet {
-        let data_forms = Self::forms(&self.data_dir);
+    /// then compare paths only (`OwnedSet::owns_in`). Also says whether every path resolved or
+    /// was missing: a set with a path that failed otherwise lacks that path's resolved form, so
+    /// it isn't kept (see `owned_set`).
+    fn resolve_checked(&self) -> (OwnedSet, bool) {
+        let clean = std::cell::Cell::new(true);
+        let data_forms = Self::forms(&self.data_dir, &clean);
         let linked_dirs = data_forms
             .iter()
             .flat_map(|data| {
+                let clean = &clean;
                 OWNED_DATA_DIRS.iter().filter_map(move |dir| {
-                    let real = data.join(dir).canonicalize().ok()?;
+                    let real = Self::resolved(&data.join(dir), clean)?;
                     Some((dir.to_string(), real))
                 })
             })
@@ -267,26 +292,42 @@ impl OwnedPaths {
         let mut files = std::collections::HashSet::new();
         let data_files = OWNED_DATA_FILES.iter().map(|name| self.data_dir.join(name));
         for file in self.files.iter().cloned().chain(data_files) {
-            files.extend(Self::forms(&file));
+            files.extend(Self::forms(&file, &clean));
+            let real = Self::resolved(&file, &clean);
             for suffix in DATABASE_SIBLINGS {
-                files.extend(Self::forms(&Self::with_suffix(&file, suffix)));
+                files.extend(Self::forms(&Self::with_suffix(&file, suffix), &clean));
                 // SQLite keeps the siblings beside the file a link resolves to
-                if let Ok(real) = file.canonicalize() {
-                    files.insert(Self::with_suffix(&real, suffix));
+                if let Some(real) = &real {
+                    files.insert(Self::with_suffix(real, suffix));
                 }
             }
         }
-        OwnedSet {
+        let set = OwnedSet {
             data_forms,
             linked_dirs,
             files,
-        }
+        };
+        (set, clean.get())
     }
 
     /// Whether the resolved `target` is one of these owned paths (resolving them first).
     #[cfg(test)]
     fn owns(&self, target: &FilePath) -> bool {
         self.resolve().owns(target)
+    }
+}
+
+/// The owned set to use and whether to keep it: a `fresh` set that resolved cleanly replaces
+/// the kept one; one with a failed path is used only when nothing is kept, and not kept, so the
+/// next request resolves again. The previous set keeps the folders the failed resolve lost.
+fn choose_owned_set(
+    kept: Option<Arc<OwnedSet>>,
+    fresh: OwnedSet,
+    clean: bool,
+) -> (Arc<OwnedSet>, bool) {
+    match kept {
+        Some(kept) if !clean => (kept, false),
+        _ => (Arc::new(fresh), clean),
     }
 }
 
@@ -473,12 +514,23 @@ async fn owned_set(state: &AppState) -> Option<Arc<OwnedSet>> {
         return Some(set);
     }
     let owned = owned_paths(state).await;
-    let set = Arc::new(
-        tokio::task::spawn_blocking(move || owned.resolve())
-            .await
-            .ok()?,
-    );
-    *state.file_guard.owned_set.write().unwrap() = Some((std::time::Instant::now(), set.clone()));
+    let (fresh, clean) = tokio::task::spawn_blocking(move || owned.resolve_checked())
+        .await
+        .ok()?;
+    let kept = state
+        .file_guard
+        .owned_set
+        .read()
+        .unwrap()
+        .as_ref()
+        .map(|(_, set)| set.clone());
+    let (set, keep) = choose_owned_set(kept, fresh, clean);
+    if keep {
+        *state.file_guard.owned_set.write().unwrap() =
+            Some((std::time::Instant::now(), set.clone()));
+    } else {
+        tracing::warn!("an owned path could not be resolved; the owned paths are resolved again");
+    }
     Some(set)
 }
 
@@ -500,7 +552,29 @@ async fn library_roots(state: &AppState, refresh: bool) -> Arc<Vec<LibraryRoot>>
             .unwrap_or_default(),
     );
     *state.file_guard.library_roots.write().unwrap() = Some(roots.clone());
+    *state.file_guard.library_roots_read_at.write().unwrap() = Some(std::time::Instant::now());
     roots
+}
+
+/// Drops the kept library paths, so the next check reads them again. The library routes call it
+/// after a library is added, removed or given other folders.
+pub(crate) fn forget_library_roots(state: &AppState) {
+    *state.file_guard.library_roots.write().unwrap() = None;
+}
+
+/// How often refused pictures may read the library paths again: a page of missing or
+/// out-of-library pictures then costs one database read, not one per picture.
+const IMAGE_ROOTS_REFRESH: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Whether a picture refused as outside the libraries may read the library paths again: they
+/// were read more than `IMAGE_ROOTS_REFRESH` ago.
+fn image_roots_may_refresh(state: &AppState) -> bool {
+    state
+        .file_guard
+        .library_roots_read_at
+        .read()
+        .unwrap()
+        .is_none_or(|at| at.elapsed() >= IMAGE_ROOTS_REFRESH)
 }
 
 /// The data-dir folders that hold no pictures, so the image routes never read from them. The
@@ -618,7 +692,8 @@ fn image_path_allowed(file_path: &str, lib_paths: &[String], owned: &OwnedPaths)
 
 /// The resolved path of a stored image that may be served (see `checked_image_path`), which the
 /// caller opens. The checks read the file system, so they run on a blocking thread. The library
-/// paths are kept between requests and read again once before a picture outside them is refused.
+/// paths are kept between requests; a picture outside them reads them again before it is refused
+/// only when they are older than `IMAGE_ROOTS_REFRESH`.
 pub(crate) async fn validate_image_path(
     state: &AppState,
     file_path: &str,
@@ -638,7 +713,9 @@ pub(crate) async fn validate_image_path(
                 .unwrap_or(Err(ImageRefusal::Refused));
         match checked {
             Ok(path) => return Ok(path.to_string_lossy().into_owned()),
-            Err(ImageRefusal::OutsideRoots) if !refresh => continue,
+            Err(ImageRefusal::OutsideRoots) if !refresh && image_roots_may_refresh(state) => {
+                continue;
+            }
             Err(_) => break,
         }
     }
@@ -2822,6 +2899,51 @@ mod tests {
             let target = FilePath::new("/r1play-missing/data").join(name);
             assert!(!owned.owns(&target), "{name}");
         }
+    }
+
+    /// A data folder whose resolve fails for another reason than a missing file (here a link
+    /// into a folder that may not be entered) makes the set unclean; missing folders don't.
+    #[test]
+    fn r3gaps3_a_failed_resolve_is_reported() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new();
+        let data = dir.path().join("data");
+        let locked = dir.path().join("locked");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(locked.join("inner")).unwrap();
+        assert!(
+            owned(&data, &[]).resolve_checked().1,
+            "missing folders are fine"
+        );
+
+        std::os::unix::fs::symlink(locked.join("inner"), data.join("transcodes")).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let entered = std::fs::read_dir(&locked).is_ok();
+        let (set, clean) = owned(&data, &[]).resolve_checked();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if entered {
+            // Run as root, which enters any folder: nothing fails to resolve
+            return;
+        }
+        assert!(!clean);
+        assert!(!set.linked_dirs.iter().any(|(name, _)| name == "transcodes"));
+    }
+
+    /// An unclean resolve keeps the previous set and isn't kept itself; with nothing kept it is
+    /// used once. A clean one replaces the kept set.
+    #[test]
+    fn r3gaps3_an_unclean_owned_set_is_not_kept() {
+        let previous = Arc::new(OwnedSet {
+            linked_dirs: vec![("transcodes".to_string(), "/fast/transcodes".into())],
+            ..Default::default()
+        });
+        let fresh = OwnedSet::default();
+        let (set, keep) = choose_owned_set(Some(previous.clone()), fresh.clone(), false);
+        assert!(Arc::ptr_eq(&set, &previous) && !keep);
+        let (set, keep) = choose_owned_set(None, fresh.clone(), false);
+        assert!(*set == fresh && !keep);
+        let (set, keep) = choose_owned_set(Some(previous), fresh.clone(), true);
+        assert!(*set == fresh && keep);
     }
 
     #[test]

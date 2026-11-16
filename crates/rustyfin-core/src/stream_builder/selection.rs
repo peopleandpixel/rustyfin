@@ -79,17 +79,17 @@ impl SourceFacts {
         if prefs.original_language_audio && prefs.play_default_audio_track {
             // The item's original language isn't known, so no language is preferred
             self.default_audio_stream_index = default_audio_index(&self.streams, &[], true);
-            self.audio_index_source = AudioIndexSource::default();
+            self.audio_index_source = Some(AudioIndexSource::default());
         } else {
             self.default_audio_stream_index = default_audio_index(
                 &self.streams,
                 &prefs.audio_languages,
                 prefs.play_default_audio_track,
             );
-            self.audio_index_source = AudioIndexSource {
+            self.audio_index_source = Some(AudioIndexSource {
                 default: prefs.play_default_audio_track,
                 language: !prefs.audio_languages.is_empty(),
-            };
+            });
         }
         let audio_language = self.default_audio_stream_index.and_then(|index| {
             self.streams
@@ -448,10 +448,10 @@ mod tests {
         assert_eq!(source.default_audio_stream_index, Some(1));
         assert_eq!(
             source.audio_index_source,
-            AudioIndexSource {
+            Some(AudioIndexSource {
                 default: true,
                 language: false
-            }
+            })
         );
         assert_eq!(source.default_subtitle_stream_index, Some(3));
 
@@ -464,7 +464,13 @@ mod tests {
         };
         source.apply_preferences(&prefs);
         assert_eq!(source.default_audio_stream_index, Some(2));
-        assert!(source.audio_index_source.language && !source.audio_index_source.default);
+        assert_eq!(
+            source.audio_index_source,
+            Some(AudioIndexSource {
+                default: false,
+                language: true
+            })
+        );
         assert_eq!(source.default_subtitle_stream_index, None);
     }
 

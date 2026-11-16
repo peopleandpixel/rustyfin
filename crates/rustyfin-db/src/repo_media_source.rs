@@ -20,11 +20,7 @@ use uuid::Uuid;
 /// 3: a video stream's Dolby Vision configuration record, which its VideoRangeType is read from,
 /// and a video's external subtitle files, stored as its streams. Neither touches audio files, so
 /// audio sources are read again only below [`AUDIO_PROBE_VERSION`].
-///
-/// 4: a video's stream bit rates that ffprobe leaves out, estimated as Jellyfin's probe does
-/// (an audio stream's by its codec and channels, the video stream's from the container's).
-/// Audio files are left as they are.
-pub const PROBE_VERSION: i64 = 4;
+pub const PROBE_VERSION: i64 = 3;
 
 /// The last [`PROBE_VERSION`] that changed what a probe stores for an audio file. A scan reads an
 /// audio source again only when an older probe wrote it, so a video-only change doesn't re-read
@@ -946,4 +942,66 @@ struct BatchSourceStreamRow {
     is_anamorphic: Option<bool>,
     dovi_config: Option<String>,
     stream_index_num: Option<i32>,
+}
+
+#[cfg(test)]
+mod r3gaps3_tests {
+    /// Migration 099 renames stored external subtitle codecs to the ones ffprobe reads (and
+    /// Jellyfin reports), in any case, and leaves embedded streams and other codecs alone.
+    #[tokio::test]
+    async fn r3gaps3_external_subtitle_codecs_take_ffprobe_names() {
+        let pool = crate::test_pool().await;
+        let mut conn = pool.acquire().await.unwrap();
+        sqlx::query("PRAGMA foreign_keys = OFF")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        let rows = [
+            ("a", "srt", true),
+            ("b", "VTT", true),
+            ("c", "ssa", true),
+            ("d", "ass", true),
+            ("e", "srt", false),
+            ("f", "sub", true),
+        ];
+        for (id, codec, external) in rows {
+            sqlx::query(
+                "INSERT INTO media_streams (id, source_id, codec, codec_type, is_external, \
+                 stream_index) VALUES (?, 'src', ?, 'subtitle', ?, 0)",
+            )
+            .bind(id)
+            .bind(codec)
+            .bind(external)
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        }
+        sqlx::raw_sql(include_str!(
+            "../migrations/099_external_subtitle_codecs.sql"
+        ))
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        let codecs: Vec<(String, String)> = sqlx::query_as(
+            "SELECT id, codec FROM media_streams WHERE source_id = 'src' ORDER BY id",
+        )
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap();
+        let codecs: Vec<(&str, &str)> = codecs
+            .iter()
+            .map(|(id, codec)| (id.as_str(), codec.as_str()))
+            .collect();
+        assert_eq!(
+            codecs,
+            [
+                ("a", "subrip"),
+                ("b", "webvtt"),
+                ("c", "ass"),
+                ("d", "ass"),
+                ("e", "srt"),
+                ("f", "sub")
+            ]
+        );
+    }
 }
