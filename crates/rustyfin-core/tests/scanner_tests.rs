@@ -1205,17 +1205,17 @@ async fn movie_titles_are_clean() {
             "Hazel Mirrors",
             Some(2012),
         ),
-        (
-            "The Tin Ladle ()/The Tin Ladle (2023) WEBDL-2160p.mkv",
-            "The Tin Ladle",
-            Some(2023),
-        ),
+        ("The Attic.avi", "The Attic", None),
         (
             "The Mangle (2013)/the.mangle.2013.720p.bluray.x264.dts-quillgrp.mkv",
             "The Mangle",
             Some(2013),
         ),
-        ("The Attic.avi", "The Attic", None),
+        (
+            "The Tin Ladle ()/The Tin Ladle (2023) WEBDL-2160p.mkv",
+            "The Tin Ladle",
+            Some(2023),
+        ),
     ];
     for (rel, _, _) in files {
         touch(&root, rel);
@@ -1362,8 +1362,8 @@ async fn upgrade_from_old_state_matches_fresh_scan() {
         &lib,
         &[
             (arvel_uhd, &[arvel_uhd, arvel]),
-            (pudding, &[pudding, pudding_cut]),
             (vane_uhd, &[vane_uhd, vane_cd1, vane_cd2]),
+            (pudding, &[pudding, pudding_cut]),
             (seven, &[seven]),
             (mangle, &[mangle, scene]),
         ],
