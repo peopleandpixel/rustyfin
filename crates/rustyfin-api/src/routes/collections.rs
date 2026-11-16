@@ -780,7 +780,13 @@ fn container_item(
 ) -> MediaItem {
     MediaItem {
         id,
-        sort_name: Some(name.to_lowercase()),
+        sort_name: Some(rustyfin_model::sort_name::item_sort_name(
+            media_type,
+            &name,
+            None,
+            None,
+            &rustyfin_model::sort_name::current_rules(),
+        )),
         name,
         media_type,
         child_count: Some(child_count as i32),

@@ -303,7 +303,7 @@ pub async fn search_persons(
         let item = MediaItem {
             id: uuid::Uuid::parse_str(&id).unwrap_or_default(),
             name: name.clone(),
-            sort_name: Some(name.to_lowercase()),
+            sort_name: Some(rustyfin_model::sort_name::person_sort_name(&name)),
             overview: None,
             media_type: rustyfin_model::media::MediaType::Unknown,
             path: String::new(),

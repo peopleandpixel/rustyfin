@@ -5272,6 +5272,235 @@ async fn b152_a_card_index_has_only_what_a_card_shows() {
     );
 }
 
+// R3 sort names: "The Matrix" sorts and files under M, as in Jellyfin
+
+#[tokio::test]
+async fn r3sortname_items_sort_and_filter_by_jellyfins_sort_name() {
+    let state = test_state().await;
+    let folder = media_folder(&state, "r3 sort names");
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: "R3 Sort Names".to_string(),
+        content_type: rustyfin_model::library::LibraryContentType::Movies,
+        paths: vec![folder.clone()],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    // Stored as before 094: the lowercased name
+    let mut ids = HashMap::new();
+    for name in ["Nemo", "The Matrix", "Lion", "28 Days", "Zodiac", "Theory"] {
+        let id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO media_items (id, library_id, name, sort_name, media_type, path) \
+             VALUES (?, ?, ?, ?, 'Movie', ?)",
+        )
+        .bind(id.to_string())
+        .bind(lib.id.to_string())
+        .bind(name)
+        .bind(name.to_lowercase())
+        .bind(format!("{folder}/{name}.mkv"))
+        .execute(&state.db)
+        .await
+        .unwrap();
+        ids.insert(name, id);
+    }
+    rustyfin_api::sort_names::apply(&state).await;
+    let (admin, _) = admin_session(&state).await;
+    let app = app(state.clone());
+
+    let names = |body: &serde_json::Value| -> Vec<String> {
+        body["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["Name"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let list = |query: String| {
+        let (app, admin) = (app.clone(), admin.clone());
+        async move {
+            let (status, body) = send_authed(
+                &app,
+                "GET",
+                &format!(
+                    "/Items?LibraryId={}&Recursive=true&SortBy=SortName&Fields=SortName{query}",
+                    lib.id
+                ),
+                &admin,
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            body
+        }
+    };
+    let body = list(String::new()).await;
+    assert_eq!(
+        names(&body),
+        ["28 Days", "Lion", "The Matrix", "Nemo", "Theory", "Zodiac"]
+    );
+    let matrix = body["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["Name"] == "The Matrix")
+        .unwrap();
+    assert_eq!(matrix["SortName"], "matrix");
+    // The letters go by the sort name only, as in Jellyfin; '#' holds what starts with no letter,
+    // and Z holds Zodiac
+    assert_eq!(
+        names(&list("&NameStartsWith=M".into()).await),
+        ["The Matrix"]
+    );
+    assert_eq!(names(&list("&NameStartsWith=T".into()).await), ["Theory"]);
+    assert_eq!(
+        names(&list("&NameStartsWith=%23".into()).await),
+        ["28 Days"]
+    );
+    assert_eq!(names(&list("&NameStartsWith=Z".into()).await), ["Zodiac"]);
+    assert_eq!(
+        names(&list("&NameStartsWithOrGreater=N".into()).await),
+        ["Nemo", "Theory", "Zodiac"]
+    );
+
+    // The editor's forced sort name is returned as written and sorts the item; clearing it
+    // brings the automatic one back
+    let matrix_id = ids["The Matrix"];
+    let save = |body: serde_json::Value| {
+        let (app, admin) = (app.clone(), admin.clone());
+        async move {
+            let (status, text) = send_authed(
+                &app,
+                "POST",
+                &format!("/Items/{matrix_id}"),
+                &admin,
+                Some(&body.to_string()),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NO_CONTENT, "{text}");
+        }
+    };
+    save(serde_json::json!({"ForcedSortName": "Zzz Matrix"})).await;
+    let (status, item) =
+        send_authed(&app, "GET", &format!("/Items/{matrix_id}"), &admin, None).await;
+    assert_eq!(status, StatusCode::OK, "{item}");
+    assert_eq!(item["ForcedSortName"], "Zzz Matrix");
+    assert_eq!(item["SortName"], "zzz matrix");
+    assert_eq!(
+        names(&list(String::new()).await).last().unwrap(),
+        "The Matrix"
+    );
+    // A rescan's save keeps it
+    let mut rescanned = rustyfin_db::repo_media::get_item_by_id(&state.db, matrix_id)
+        .await
+        .unwrap()
+        .unwrap();
+    rescanned.sort_name = Some("matrix".to_string());
+    rustyfin_db::repo_media::upsert_media_item(&state.db, &rescanned)
+        .await
+        .unwrap();
+    assert_eq!(
+        names(&list(String::new()).await).last().unwrap(),
+        "The Matrix"
+    );
+    save(serde_json::json!({"ForcedSortName": ""})).await;
+    let (_, item) = send_authed(&app, "GET", &format!("/Items/{matrix_id}"), &admin, None).await;
+    assert!(item["ForcedSortName"].is_null(), "{item}");
+    assert_eq!(item["SortName"], "matrix");
+}
+
+/// The sort lists round-trip through /System/Configuration, and saving other ones makes the
+/// stored sort names again. The extra word is one no other test's names hold, since the rules
+/// are the process's.
+#[tokio::test]
+async fn r3sortname_sort_rules_round_trip_and_remake_sort_names() {
+    let state = test_state().await;
+    let folder = media_folder(&state, "r3 sort rules");
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: "R3 Sort Rules".to_string(),
+        content_type: rustyfin_model::library::LibraryContentType::Movies,
+        paths: vec![folder.clone()],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    let id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO media_items (id, library_id, name, sort_name, media_type, path) \
+         VALUES (?, ?, 'Qzxv Sorted', 'qzxv sorted', 'Movie', ?)",
+    )
+    .bind(id.to_string())
+    .bind(lib.id.to_string())
+    .bind(format!("{folder}/q.mkv"))
+    .execute(&state.db)
+    .await
+    .unwrap();
+    rustyfin_api::sort_names::apply(&state).await;
+    let (admin, _) = admin_session(&state).await;
+    let app = app(state.clone());
+
+    let (status, mut config) =
+        send_authed(&app, "GET", "/System/Configuration", &admin, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        config["SortRemoveWords"],
+        serde_json::json!(["the", "a", "an"])
+    );
+    assert_eq!(
+        config["SortRemoveCharacters"],
+        serde_json::json!([",", "&", "-", "{", "}", "'"])
+    );
+    assert_eq!(
+        config["SortReplaceCharacters"],
+        serde_json::json!([".", "+", "%"])
+    );
+
+    let sort_name = || async {
+        rustyfin_db::repo_media::get_item_by_id(&state.db, id)
+            .await
+            .unwrap()
+            .unwrap()
+            .sort_name
+    };
+    assert_eq!(sort_name().await.as_deref(), Some("qzxv sorted"));
+    config["SortRemoveWords"] = serde_json::json!(["the", "a", "an", "qzxv"]);
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        "/System/Configuration",
+        &admin,
+        Some(&config.to_string()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, saved) = send_authed(&app, "GET", "/System/Configuration", &admin, None).await;
+    assert_eq!(saved["SortRemoveWords"], config["SortRemoveWords"]);
+    // The pass runs in the background
+    let mut remade = None;
+    for _ in 0..100 {
+        remade = sort_name().await;
+        if remade.as_deref() == Some("sorted") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(remade.as_deref(), Some("sorted"));
+
+    // Jellyfin's lists again
+    config["SortRemoveWords"] = serde_json::json!(["the", "a", "an"]);
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        "/System/Configuration",
+        &admin,
+        Some(&config.to_string()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
 // B152 round 10: the card index lists the same items as the normal list for a user who isn't an
 // administrator, per-user filters included (Rustyfin has no library-access or parental-rating
 // limits; the per-user favourites are the per-user filter there is), and an episode card carries
@@ -35116,10 +35345,23 @@ async fn r3playback_universal_keeps_the_clients_play_session_id() {
         let (_, body) = send(&app, request("GET", &lower, Some(&token), None)).await;
         assert_eq!(body["PlaySessionId"], decoded.trim(), "{lower}");
     }
-    let uri = format!("/Audio/{song}/universal?PlaySessionId=client-audio");
-    let (status, body) = send(&app, request("GET", &uri, Some(&token), None)).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["PlaySessionId"], "client-audio");
+    // Universal audio answers with audio, as Jellyfin's does: its HLS transcode keeps the id
+    let uri = format!(
+        "/Audio/{song}/universal?Container=mp3&TranscodingContainer=ts&TranscodingProtocol=hls\
+         &AudioCodec=aac&PlaySessionId=client-audio"
+    );
+    let req = Request::builder()
+        .uri(&uri)
+        .header("Authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FOUND, "{uri}");
+    let location = resp.headers()["location"].to_str().unwrap();
+    assert!(
+        location.contains("PlaySessionId=client-audio"),
+        "{location}"
+    );
 
     // No id, or a blank one: a new id each call
     let mut ids = std::collections::HashSet::new();
@@ -36082,6 +36324,28 @@ async fn b22_subtitle_vtt_moves_cues_back_by_the_start() {
     let at = |index: i32, ticks: i64| {
         format!("/Videos/{id}/{msid}/Subtitles/{index}/{ticks}/Stream.vtt")
     };
+    // The same stream as SubRip, as a client with an srt subtitle profile asks for it, whole and
+    // moved the same way
+    let srt = format!("/Videos/{id}/{msid}/Subtitles/2/Stream.srt");
+    let (status, content_type, body) = b22_get(&app, &srt, &token).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(content_type, "application/x-subrip; charset=utf-8");
+    assert!(
+        body.contains("00:00:01,000 --> 00:00:02,000\nEmbedded one"),
+        "{body}"
+    );
+    let srt = format!("/Videos/{id}/{msid}/Subtitles/2/15000000/Stream.srt");
+    let (status, _, body) = b22_get(&app, &srt, &token).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.starts_with("1\n00:00:00,000 --> 00:00:00,500\nEmbedded one"),
+        "{body}"
+    );
+    assert!(
+        body.contains("2\n00:00:01,500 --> 00:00:02,500\nEmbedded two"),
+        "{body}"
+    );
+
     let (status, content_type, body) = b22_get(&app, &at(2, 15_000_000), &token).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(content_type, "text/vtt; charset=utf-8");
@@ -36138,9 +36402,11 @@ async fn b22_subtitle_vtt_refuses_bad_requests() {
 
     let other = uuid::Uuid::new_v4();
     let cases = [
-        // Only WebVTT is served
+        // Only the text formats the endpoint writes (vtt, srt, subrip, ass, ssa) are served; an
+        // srt of a text stream plays (b22_subtitle_vtt_moves_cues_back_by_the_start). This
+        // fixture's file isn't written, so only refusals made before the file is opened fit here.
         (
-            format!("/Videos/{id}/{msid}/Subtitles/3/Stream.srt"),
+            format!("/Videos/{id}/{msid}/Subtitles/3/Stream.smi"),
             StatusCode::BAD_REQUEST,
         ),
         // A picture subtitle has no text: players burn it in
@@ -42622,7 +42888,8 @@ async fn b20_import_metadata_replaces_with_jellyfins() {
     );
     assert_eq!(b20_fields(&w.state, m.show).await, b20_show_fields());
     assert_eq!(b20_fields(&w.state, m.e1).await, b20_e1_fields());
-    let e3 = serde_json::json!({ "sort_name": "show 1x03" });
+    // An episode's sort name is Jellyfin's: season and episode number, then the name
+    let e3 = serde_json::json!({ "sort_name": "001 - 0003 - Show 1x03" });
     assert_eq!(
         b20_fields(&w.state, m.e3).await,
         b20_expect("Show 1x03", e3),
@@ -43688,10 +43955,10 @@ async fn j2_chrome_profile_sets_the_device_data() {
         &token,
     );
     let expected = format!(
-        "/Videos/{hi10}/main.m3u8?DeviceId=j2-device&MediaSourceId={hi10_source}&VideoCodec=h264\
-         &AudioCodec=aac&AudioStreamIndex=1&VideoBitrate=119872&AudioBitrate=128\
+        "/Videos/{hi10}/master.m3u8?DeviceId=j2-device&MediaSourceId={hi10_source}&VideoCodec=h264\
+         &AudioCodec=aac&AudioStreamIndex=1&VideoBitrate=119872000&AudioBitrate=128000\
          &AudioSampleRate=48000&MaxFramerate=24&SegmentContainer=ts&MinSegments=1\
-         &PlaySessionId={ps}&api_key=<token>&TranscodingMaxAudioChannels=2&RequireAvc=false\
+         &PlaySessionId={ps}&ApiKey=<token>&TranscodingMaxAudioChannels=2&RequireAvc=false\
          &EnableAudioVbrEncoding=true&h264-videobitdepth=10\
          &h264-profile=high,main,baseline,constrainedbaseline&h264-audiochannels=2\
          &aac-profile=lc&h264-rangetype=SDR&h264-level=52&h264-deinterlace=true\
@@ -43713,7 +43980,7 @@ async fn j2_chrome_profile_sets_the_device_data() {
         &token,
     );
     assert!(
-        url.starts_with(&format!("/Videos/{p422}/main.m3u8?")),
+        url.starts_with(&format!("/Videos/{p422}/master.m3u8?")),
         "{url}"
     );
 
@@ -43875,7 +44142,7 @@ async fn j2_subtitles_get_deliveries() {
         assert_eq!(subtitle["IsExternalUrl"], false, "stream {index}");
         let url = j2_hide(subtitle["DeliveryUrl"].as_str().unwrap_or_default(), &token);
         let expected =
-            format!("/Videos/{item}/{source_id}/Subtitles/{index}/0/Stream.vtt?api_key=<token>");
+            format!("/Videos/{item}/{source_id}/Subtitles/{index}/0/Stream.vtt?ApiKey=<token>");
         assert_eq!(url, expected, "stream {index}");
     }
     for index in [0, 1] {
@@ -43934,7 +44201,7 @@ async fn j2_audio_items_use_the_audio_profiles() {
         &token,
     );
     assert!(
-        url.starts_with(&format!("/Videos/{ac3}/main.m3u8?")),
+        url.starts_with(&format!("/Videos/{ac3}/master.m3u8?")),
         "{url}"
     );
     assert!(url.contains("&AudioCodec=aac&"), "{url}");
@@ -44011,10 +44278,10 @@ async fn j2_profile_comes_from_the_device_capabilities() {
         sources[0]["TranscodingUrl"].as_str().unwrap_or_default(),
         &token,
     );
-    let start = format!("/Videos/{item}/main.m3u8?DeviceId=j2-caps-device&");
+    let start = format!("/Videos/{item}/master.m3u8?DeviceId=j2-caps-device&");
     assert!(url.starts_with(&start), "{url}");
     assert!(
-        url.contains(&format!("&PlaySessionId={ps}&api_key=<token>&")),
+        url.contains(&format!("&PlaySessionId={ps}&ApiKey=<token>&")),
         "{url}"
     );
     let body = serde_json::json!({ "MaxStreamingBitrate": 120_000_000 });
@@ -44219,6 +44486,170 @@ async fn j2_odd_requests_never_fail_the_server() {
     }
 }
 
+// R3 decisions: universal audio
+
+/// `GET {uri}` with `token`: the status, the Location header and the body.
+async fn r3decisions_get(
+    app: &axum::Router,
+    uri: &str,
+    token: &str,
+) -> (StatusCode, Option<String>, Vec<u8>) {
+    r3decisions_send(app, "GET", uri, token).await.0
+}
+
+/// `{method} {uri}` with `token`: (status, Location, body) and the Content-Type.
+async fn r3decisions_send(
+    app: &axum::Router,
+    method: &str,
+    uri: &str,
+    token: &str,
+) -> ((StatusCode, Option<String>, Vec<u8>), Option<String>) {
+    let req = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("Authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let header = |name: &str| {
+        resp.headers()
+            .get(name)
+            .map(|v| v.to_str().unwrap().to_string())
+    };
+    let (location, content_type) = (header("location"), header("content-type"));
+    let body = resp
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .to_vec();
+    ((status, location, body), content_type)
+}
+
+/// `/Audio/{id}/universal` answers with audio, as Jellyfin's does, not with JSON: the file when
+/// the query's containers take it, else the HLS transcode the stream builder chose.
+#[tokio::test]
+async fn r3decisions_universal_audio_plays_the_file_or_the_hls_transcode() {
+    let state = test_state().await;
+    add_user(&state, "r3d-audio", "r3d-pass", true).await;
+    let (song, _, _) = j2_item(
+        &state,
+        "r3d-song",
+        "Audio",
+        "flac",
+        j2_song("flac", 900_000),
+    )
+    .await;
+    let transcodes = state.transcode_manager.clone();
+    let app = app(state);
+    let (token, _) = g2_login_device(&app, "r3d-audio", "r3d-pass", "r3d-device")
+        .await
+        .unwrap();
+
+    // Jellyfin Web on Chrome takes FLAC: the file itself
+    let (status, location, body) = r3decisions_get(
+        &app,
+        &format!(
+            "/Audio/{song}/universal?Container=opus,webm|opus,mp3,aac,m4a|aac,flac\
+             &TranscodingContainer=mp4&TranscodingProtocol=hls&AudioCodec=aac\
+             &MaxStreamingBitrate=140000000"
+        ),
+        &token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(location, None);
+    assert_eq!(body.len(), 1000);
+
+    // A client that takes only MP3 and AAC over HLS gets the transcode, in its play session
+    let hls = format!(
+        "/audio/{song}/universal?container=mp3,aac&transcodingContainer=ts\
+         &transcodingProtocol=hls&audioCodec=aac&maxStreamingBitrate=320000\
+         &PlaySessionId=r3d-session"
+    );
+    // Jellyfin Web asks HEAD first: the playlist's type, and no transcode starts
+    let ((status, location, _), content_type) = r3decisions_send(&app, "HEAD", &hls, &token).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(location, None);
+    assert_eq!(
+        content_type.as_deref(),
+        Some("application/vnd.apple.mpegurl")
+    );
+    assert!(
+        !transcodes.is_active(song).await,
+        "HEAD started a transcode"
+    );
+    let (status, location, _) = r3decisions_get(&app, &hls, &token).await;
+    assert_eq!(status, StatusCode::FOUND);
+    let location = location.unwrap();
+    assert!(
+        location.starts_with(&format!("/Videos/{song}/master.m3u8?")),
+        "{location}"
+    );
+    assert!(location.contains("AudioCodec=aac"), "{location}");
+    assert!(location.contains("AudioOnly=true"), "{location}");
+    assert!(location.contains("PlaySessionId=r3d-session"), "{location}");
+    // HEAD of a file the client plays as it is: the file's headers
+    let ((status, _, _), content_type) = r3decisions_send(
+        &app,
+        "HEAD",
+        &format!("/Audio/{song}/universal?Container=flac&MaxStreamingBitrate=140000000"),
+        &token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(content_type.as_deref(), Some("audio/flac"));
+
+    // No MaxStreamingBitrate: Jellyfin's default profile limit (8 Mbps) applies, as in
+    // UniversalAudioController, so this 10 Mbps file is transcoded, over HLS when allowed
+    let (status, location, _) = r3decisions_get(
+        &app,
+        &format!(
+            "/Audio/{song}/universal?Container=flac&TranscodingContainer=ts\
+             &TranscodingProtocol=hls&AudioCodec=aac"
+        ),
+        &token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FOUND);
+    assert!(location.unwrap().contains("ContainerBitrateExceedsLimit"));
+
+    // A progressive transcode isn't available: 400 that says so, not the FLAC as it is
+    let (status, _, body) = r3decisions_get(
+        &app,
+        &format!(
+            "/Audio/{song}/universal?Container=mp3&TranscodingContainer=mp3\
+             &TranscodingProtocol=http&AudioCodec=mp3"
+        ),
+        &token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(String::from_utf8_lossy(&body).contains("HLS only"));
+
+    // stream.{container} answered 500, as its second path parameter failed the extractor. An MP3
+    // request for the FLAC track is a 400 now; the track's own codec, or static, gets the file.
+    let (status, _, body) = r3decisions_get(
+        &app,
+        &format!("/Audio/{song}/stream.mp3?AudioCodec=mp3&AudioBitrate=192000"),
+        &token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(String::from_utf8_lossy(&body).contains("HLS only"));
+    for uri in [
+        format!("/Audio/{song}/stream.flac"),
+        format!("/Audio/{song}/stream.mp3?static=true"),
+        format!("/Audio/{song}/stream?AudioCodec=flac,mp3"),
+    ] {
+        let (status, _, body) = r3decisions_get(&app, &uri, &token).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert_eq!(body.len(), 1000, "{uri}");
+    }
+}
+
 #[tokio::test]
 async fn j2_old_routes_answer_as_before() {
     let state = test_state().await;
@@ -44240,7 +44671,8 @@ async fn j2_old_routes_answer_as_before() {
         format!("/Videos/{video}/PlaybackInfo"),
         format!("/Videos/{video}/Universal?VideoCodecs=h264&AudioCodecs=aac"),
         format!("/Audio/{song}/PlaybackInfo"),
-        format!("/Audio/{song}/universal?Container=mp3,flac"),
+        // The test file claims 10 Mbps, over the default 8 Mbps limit; real clients send theirs
+        format!("/Audio/{song}/universal?Container=mp3,flac&MaxStreamingBitrate=140000000"),
     ];
     let before = j2_answers(&app, &routes, &token).await;
     for (uri, (status, _)) in routes.iter().zip(&before) {

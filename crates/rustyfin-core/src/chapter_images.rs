@@ -1,9 +1,10 @@
 //! Chapter images, and the one-time re-read of chapters for videos probed before they were read.
 //!
 //! Chapter images are made only by the "Extract Chapter Images" task, never on a request, one
-//! image job at a time (`trickplay::ffmpeg_lock`). Each is a frame at the chapter's start, saved
-//! as `<data dir>/chapters/<item id>/<start ticks>.jpg`. A chapter whose image fails is marked
-//! with an empty path; the mark lasts until the file changes, as a re-probe replaces the chapters.
+//! item at a time, as one image job (`trickplay::image_job`). Each is a frame at the chapter's
+//! start, saved as `<data dir>/chapters/<item id>/<start ticks>.jpg`. A chapter whose image fails
+//! is marked with an empty path; the mark lasts until the file changes, as a re-probe replaces
+//! the chapters.
 
 use std::path::{Path, PathBuf};
 
@@ -12,7 +13,7 @@ use tokio::fs;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::trickplay::{Cancel, ffmpeg_lock, run_ffmpeg};
+use crate::trickplay::{Cancel, image_job, run_ffmpeg};
 
 /// The widest a chapter image is made, in pixels.
 const MAX_WIDTH: u32 = 640;
@@ -27,7 +28,7 @@ pub fn image_path(data_dir: &Path, item_id: Uuid, start_ticks: i64) -> PathBuf {
 
 /// Makes the images of item `item_id`'s chapters that have none tried yet, from its file at
 /// `path`, and returns how many it made. A chapter whose image can't be made is marked so it isn't
-/// tried again. Waits for `ffmpeg_lock`. Once `cancel` fires it stops, marking nothing.
+/// tried again. Waits for an `image_job`. Once `cancel` fires it stops, marking nothing.
 pub async fn extract_for_item(
     pool: &SqlitePool,
     data_dir: &Path,
@@ -40,7 +41,9 @@ pub async fn extract_for_item(
         .map_err(|e| format!("could not read the chapters: {e}"))?;
     let mut made = 0;
     let mut tried = false;
-    let _one_at_a_time = ffmpeg_lock().lock().await;
+    let Some(_job) = image_job(cancel).await else {
+        return Ok(made);
+    };
     for chapter in chapters.iter().filter(|c| c.image_path.is_none()) {
         let file = image_path(data_dir, item_id, chapter.start_position_ticks);
         let made_ok = match extract_one(path, chapter.start_position_ticks, &file, cancel).await {

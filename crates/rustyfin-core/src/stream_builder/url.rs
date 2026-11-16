@@ -63,15 +63,10 @@ impl StreamOptions {
     }
 }
 
-/// A bitrate in bits per second, as the URL writes it: kilobits per second, rounded down.
-fn kbps(bits_per_second: i32) -> i64 {
-    i64::from(bits_per_second) / 1000
-}
-
 impl StreamInfo {
     /// The transcode URL for this stream, as Jellyfin's `StreamInfo.ToUrl` writes it for an HLS
-    /// transcode. The path is `/Videos/{item}/main.m3u8`, the token goes in `api_key`, and the
-    /// bitrates are in kbps. Empty ids and tokens are left out.
+    /// transcode. The path is `/Videos/{item}/master.m3u8`, also for audio, the token goes in
+    /// `ApiKey`, and the bitrates are in bits per second. Empty ids and tokens are left out.
     pub(super) fn to_url(&self) -> String {
         let mut params: Vec<String> = Vec::new();
         if !self.device_id.is_empty() {
@@ -98,10 +93,10 @@ impl StreamInfo {
             params.push(format!("SubtitleStreamIndex={index}"));
         }
         if let Some(bitrate) = self.video_bitrate {
-            params.push(format!("VideoBitrate={}", kbps(bitrate)));
+            params.push(format!("VideoBitrate={bitrate}"));
         }
         if let Some(bitrate) = self.audio_bitrate {
-            params.push(format!("AudioBitrate={}", kbps(bitrate)));
+            params.push(format!("AudioBitrate={bitrate}"));
         }
         if let Some(rate) = self.audio_sample_rate {
             params.push(format!("AudioSampleRate={rate}"));
@@ -131,7 +126,7 @@ impl StreamInfo {
             params.push(format!("PlaySessionId={}", self.play_session_id));
         }
         if !self.access_token.is_empty() {
-            params.push(format!("api_key={}", self.access_token));
+            params.push(format!("ApiKey={}", self.access_token));
         }
         if self.require_non_anamorphic {
             params.push("RequireNonAnamorphic=True".to_string());
@@ -178,7 +173,7 @@ impl StreamInfo {
             params.push("AudioOnly=true".to_string());
         }
 
-        let path = format!("/Videos/{}/main.m3u8", self.item_id);
+        let path = format!("/Videos/{}/master.m3u8", self.item_id);
         if params.is_empty() {
             path
         } else {

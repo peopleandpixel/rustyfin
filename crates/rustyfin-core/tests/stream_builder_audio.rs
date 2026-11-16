@@ -179,20 +179,21 @@ fn untouched(source: &SourceFacts, flags: (bool, bool, bool)) -> DeviceData {
 }
 
 /// The URL of an audio transcode for `dev1`, source `src1`, session `ps1` and token `tok`. `media`
-/// holds the parameters between MediaSourceId and PlaySessionId, `rest` those after `api_key`.
+/// holds the parameters between MediaSourceId and PlaySessionId, `rest` those after `ApiKey`.
 /// `AudioOnly=true` comes last.
 fn audio_url(media: &[&str], rest: &[&str]) -> String {
     let mut params = vec!["DeviceId=dev1", "MediaSourceId=src1"];
     params.extend_from_slice(media);
-    params.extend_from_slice(&["PlaySessionId=ps1", "api_key=tok"]);
+    params.extend_from_slice(&["PlaySessionId=ps1", "ApiKey=tok"]);
     params.extend_from_slice(rest);
     params.push("AudioOnly=true");
-    format!("/Videos/{ITEM}/main.m3u8?{}", params.join("&"))
+    format!("/Videos/{ITEM}/master.m3u8?{}", params.join("&"))
 }
 
-/// chrome-linux's transcode to AAC at `kbps` in MPEG-TS segments, for `why`.
+/// chrome-linux's transcode to AAC at `kbps` in MPEG-TS segments, for `why`. The URL writes the
+/// bitrate in bits per second.
 fn chrome_aac_url(kbps: u32, why: &str) -> String {
-    let bitrate = format!("AudioBitrate={kbps}");
+    let bitrate = format!("AudioBitrate={}", kbps * 1000);
     let why = format!("TranscodeReasons={why}");
     audio_url(
         &[
@@ -341,8 +342,8 @@ fn chrome_transcodes_alac_to_aac_over_hls() {
 
     // The whole URL once, written out, so that the helpers can't hide a mistake.
     let url = format!(
-        "/Videos/{ITEM}/main.m3u8?DeviceId=dev1&MediaSourceId=src1&AudioCodec=aac\
-         &AudioBitrate=384&SegmentContainer=ts&MinSegments=1&PlaySessionId=ps1&api_key=tok\
+        "/Videos/{ITEM}/master.m3u8?DeviceId=dev1&MediaSourceId=src1&AudioCodec=aac\
+         &AudioBitrate=384000&SegmentContainer=ts&MinSegments=1&PlaySessionId=ps1&ApiKey=tok\
          &TranscodingMaxAudioChannels=2&RequireAvc=false&EnableAudioVbrEncoding=true\
          &TranscodeReasons=AudioCodecNotSupported&AudioOnly=true"
     );
@@ -430,7 +431,11 @@ fn the_reasons_check_the_container_without_the_matroska_rule() {
             "mkv,webm",
             TranscodeReasons::default(),
             audio_url(
-                &["AudioCodec=aac", "AudioBitrate=192", "SegmentContainer=ts"],
+                &[
+                    "AudioCodec=aac",
+                    "AudioBitrate=192000",
+                    "SegmentContainer=ts"
+                ],
                 &["RequireAvc=false", "EnableAudioVbrEncoding=true"],
             )
         )
@@ -514,11 +519,11 @@ fn the_transcode_bitrate_falls_back_to_the_limit_and_then_128k() {
         )
     };
     let cases = [
-        (json!(256_000), json!(null), "AudioBitrate=256"),
-        (json!(null), json!(null), "AudioBitrate=128"),
-        (json!(256_000), json!(192_000), "AudioBitrate=192"),
-        (json!(160_000), json!(192_000), "AudioBitrate=160"),
-        (json!(null), json!(320_000), "AudioBitrate=320"),
+        (json!(256_000), json!(null), "AudioBitrate=256000"),
+        (json!(null), json!(null), "AudioBitrate=128000"),
+        (json!(256_000), json!(192_000), "AudioBitrate=192000"),
+        (json!(160_000), json!(192_000), "AudioBitrate=160000"),
+        (json!(null), json!(320_000), "AudioBitrate=320000"),
     ];
     for (max, music, kbps) in cases {
         let player = mp3_player(max.clone(), music.clone());
@@ -537,7 +542,7 @@ fn the_transcode_bitrate_falls_back_to_the_limit_and_then_128k() {
     let player = mp3_player(json!(256_000), json!(192_000));
     assert_eq!(
         device_data(&flac, &player, &capped),
-        transcode("flac", unsupported(), url("AudioBitrate=64"))
+        transcode("flac", unsupported(), url("AudioBitrate=64000"))
     );
 }
 
@@ -557,7 +562,7 @@ fn audio_codec_profiles_shape_the_transcode() {
     );
     let capped = [
         "AudioCodec=aac",
-        "AudioBitrate=192",
+        "AudioBitrate=192000",
         "AudioSampleRate=44100",
         "SegmentContainer=ts",
     ];
@@ -602,7 +607,7 @@ fn audio_codec_profiles_shape_the_transcode() {
     let url = audio_url(
         &[
             "AudioCodec=aac",
-            "AudioBitrate=64",
+            "AudioBitrate=64000",
             "AudioSampleRate=44100",
             "SegmentContainer=ts",
         ],
@@ -625,7 +630,11 @@ fn a_failed_audio_codec_profile_blocks_direct_play() {
     // container. A failure is a reason, and the file is transcoded.
     let surround = track("flac", audio("flac", 6, 2_000_000));
     let url = audio_url(
-        &["AudioCodec=aac", "AudioBitrate=384", "SegmentContainer=ts"],
+        &[
+            "AudioCodec=aac",
+            "AudioBitrate=384000",
+            "SegmentContainer=ts",
+        ],
         &[
             "TranscodingMaxAudioChannels=2",
             "RequireAvc=false",
@@ -675,7 +684,7 @@ fn only_an_hls_streaming_audio_profile_transcodes() {
     let url = audio_url(
         &[
             "AudioCodec=aac",
-            "AudioBitrate=192",
+            "AudioBitrate=192000",
             "SegmentContainer=mp4",
             "SegmentLength=6",
             "MinSegments=2",
@@ -752,7 +761,7 @@ fn with_direct_play_off_a_playable_file_is_transcoded_without_a_reason() {
     let url = audio_url(
         &[
             "AudioCodec=aac",
-            "AudioBitrate=384",
+            "AudioBitrate=384000",
             "SegmentContainer=ts",
             "MinSegments=1",
         ],
@@ -908,7 +917,7 @@ fn the_url_takes_the_copy_suffixes_but_no_subtitle_or_burn_in() {
     let url = audio_url(
         &[
             "AudioCodec=aac",
-            "AudioBitrate=384",
+            "AudioBitrate=384000",
             "SegmentContainer=ts",
             "MinSegments=1",
             "StartTimeTicks=600000000",
@@ -1070,7 +1079,7 @@ fn odd_audio_inputs_do_not_panic() {
                         );
                         if let Some(url) = &data.transcoding_url {
                             assert!(
-                                url.starts_with(&format!("/Videos/{ITEM}/main.m3u8?")),
+                                url.starts_with(&format!("/Videos/{ITEM}/master.m3u8?")),
                                 "{label}: {url}"
                             );
                             assert!(url.ends_with("&AudioOnly=true"), "{label}: {url}");

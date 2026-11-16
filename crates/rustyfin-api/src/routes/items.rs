@@ -327,6 +327,7 @@ async fn enrich_item(
         if let Some(imdb) = extras.imdb_id {
             item.provider_ids.set("Imdb".to_string(), imdb);
         }
+        item.forced_sort_name = extras.forced_sort_name.filter(|s| !s.trim().is_empty());
         item.lock_data = extras.lock_data;
         item.locked_fields = extras
             .locked_fields

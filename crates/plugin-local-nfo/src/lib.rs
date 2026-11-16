@@ -200,6 +200,7 @@ fn parse_nfo_content(content: &str) -> Option<ExternalMetadata> {
                     match in_tag.as_str() {
                         "title" => nfo.title = Some(text),
                         "originaltitle" => nfo.original_title = Some(text),
+                        "sorttitle" => nfo.sort_title = Some(text),
                         "plot" => nfo.plot = Some(text),
                         "year" => nfo.year = Some(text),
                         "rating" => nfo.rating = Some(text),
@@ -276,6 +277,7 @@ fn parse_nfo_content(content: &str) -> Option<ExternalMetadata> {
 
     Some(ExternalMetadata {
         name: title,
+        sort_title: nfo.sort_title.filter(|s| !s.trim().is_empty()),
         overview,
         production_year: year,
         community_rating: rating,
@@ -309,6 +311,7 @@ fn parse_nfo_content(content: &str) -> Option<ExternalMetadata> {
 struct NfoFile {
     title: Option<String>,
     original_title: Option<String>,
+    sort_title: Option<String>,
     plot: Option<String>,
     year: Option<String>,
     rating: Option<String>,

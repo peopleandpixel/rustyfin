@@ -18,6 +18,7 @@ use crate::error::ApiError;
 use crate::state::{AppState, LibraryRoot};
 
 mod media_info;
+mod universal_audio;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -39,8 +40,8 @@ pub fn routes() -> Router<AppState> {
             "/Audio/{id}/stream.{container}",
             get(stream_audio).head(head_stream),
         )
-        .route("/Audio/{id}/universal", get(audio_universal))
         .route("/Audio/{id}/PlaybackInfo", get(audio_playback_info))
+        .merge(universal_audio::routes())
 }
 
 // ---------------------------------------------------------------------------
@@ -593,24 +594,97 @@ async fn head_video(
     head_file(&file_path).await
 }
 
-async fn stream_audio(
-    state: State<AppState>,
-    path: Path<Uuid>,
-    headers: HeaderMap,
-) -> Result<Response, ApiError> {
-    stream_file(state, path, headers).await
+/// The path of an audio stream route: the item, and the container of `stream.{container}`.
+#[derive(Deserialize)]
+struct AudioPath {
+    id: Uuid,
+    container: Option<String>,
 }
 
-async fn head_stream(
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-) -> Result<Response, ApiError> {
+/// The track file that `/Audio/{id}/stream` and `stream.{container}` serve. Without `static=true`,
+/// a request that names codecs (`AudioCodec`, else the URL's container) the track's codec and
+/// container aren't among asks for a transcode, which Jellyfin makes progressively. Rustyfin's
+/// transcoder writes HLS only, so that is a 400 that says so, not the file as it is (FLAC for an
+/// MP3 client).
+async fn audio_stream_file(
+    state: &AppState,
+    AudioPath { id, container }: AudioPath,
+    params: &HashMap<String, String>,
+) -> Result<String, ApiError> {
     let item = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Item {id} not found")))?;
+    // The resolved path, which the file is opened by
+    let path = validate_path_against_library(state, &item.path).await?;
 
-    let path = validate_path_against_library(&state, &item.path).await?;
-    head_file(&path).await
+    let param = |name: &str| {
+        params
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.trim())
+            .filter(|value| !value.is_empty())
+    };
+    if param("static").is_some_and(|v| v.eq_ignore_ascii_case("true")) {
+        return Ok(path);
+    }
+    let wanted: Vec<String> = param("AudioCodec")
+        .or(container.as_deref())
+        .unwrap_or_default()
+        .split(',')
+        .map(|codec| codec.trim().to_ascii_lowercase())
+        .filter(|codec| !codec.is_empty())
+        .collect();
+    if wanted.is_empty() {
+        return Ok(path);
+    }
+    let source =
+        rustyfin_db::repo_media_source::get_media_sources_with_item_check(&state.db_ro, &id)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .next();
+    let Some(source) = source else {
+        // A track that was never probed plays as it is
+        return Ok(path);
+    };
+    let codec = source
+        .media_streams
+        .iter()
+        .find(|s| s.codec_type.eq_ignore_ascii_case("audio"))
+        .and_then(|s| s.codec.as_deref())
+        .map(str::to_ascii_lowercase);
+    let source_container = source.container.as_deref().map(str::to_ascii_lowercase);
+    let takes = |name: &Option<String>| name.as_ref().is_some_and(|n| wanted.contains(n));
+    if takes(&codec) || takes(&source_container) {
+        return Ok(path);
+    }
+    Err(ApiError::BadRequest(format!(
+        "Item {id} is {} and the request asks for {}: Rustyfin transcodes audio over HLS only, so \
+         use /Audio/{id}/universal with TranscodingProtocol=hls",
+        codec.as_deref().unwrap_or("of an unknown codec"),
+        wanted.join(",")
+    )))
+}
+
+/// `GET /Audio/{id}/stream` and `stream.{container}`: the track's file (see `audio_stream_file`).
+async fn stream_audio(
+    State(state): State<AppState>,
+    Path(path): Path<AudioPath>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let file_path = audio_stream_file(&state, path, &params).await?;
+    serve_file(file_path, &headers).await
+}
+
+/// `HEAD` of the audio stream routes: the headers of the file that `GET` serves.
+async fn head_stream(
+    State(state): State<AppState>,
+    Path(path): Path<AudioPath>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Response, ApiError> {
+    let file_path = audio_stream_file(&state, path, &params).await?;
+    head_file(&file_path).await
 }
 
 /// The headers of a `HEAD` for the file at `file_path`: its type, its length, and that byte
@@ -632,19 +706,6 @@ async fn head_file(file_path: &str) -> Result<Response, ApiError> {
         ],
     )
         .into_response())
-}
-
-async fn stream_file(
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-    headers: HeaderMap,
-) -> Result<Response, ApiError> {
-    let item = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, id)
-        .await?
-        .ok_or_else(|| ApiError::NotFound(format!("Item {id} not found")))?;
-
-    let path = validate_path_against_library(&state, &item.path).await?;
-    serve_file(path, &headers).await
 }
 
 /// Serves the file at `file_path` for a request with `headers`: the whole file, or the byte range,
@@ -847,143 +908,6 @@ fn mime_from_path(path: &str) -> String {
         _ => "application/octet-stream",
     }
     .to_string()
-}
-
-// ---------------------------------------------------------------------------
-// Audio Universal Endpoint
-// ---------------------------------------------------------------------------
-
-/// Query parameters for the universal audio endpoint
-#[derive(Debug, Default)]
-#[allow(dead_code)]
-struct AudioUniversalQuery {
-    max_audio_bitrate: Option<u32>,
-    audio_stream_index: Option<u32>,
-    start_time_ticks: Option<i64>,
-    is_live: bool,
-    media_source_id: Option<String>,
-    device_id: Option<String>,
-    audio_codec: Option<String>,
-    enable_remote_media: bool,
-    enable_direct_play: bool,
-    enable_direct_stream: bool,
-}
-
-impl From<HashMap<String, String>> for AudioUniversalQuery {
-    fn from(params: HashMap<String, String>) -> Self {
-        Self {
-            max_audio_bitrate: params.get("MaxAudioBitrate").and_then(|v| v.parse().ok()),
-            audio_stream_index: params.get("AudioStreamIndex").and_then(|v| v.parse().ok()),
-            start_time_ticks: params.get("StartTimeTicks").and_then(|v| v.parse().ok()),
-            is_live: params
-                .get("IsLive")
-                .map(|v| v.parse().unwrap_or(false))
-                .unwrap_or(false),
-            media_source_id: params.get("MediaSourceId").cloned(),
-            device_id: params.get("DeviceId").cloned(),
-            audio_codec: params.get("AudioCodec").cloned(),
-            enable_remote_media: params
-                .get("EnableRemoteMedia")
-                .map(|v| v.parse().unwrap_or(true))
-                .unwrap_or(true),
-            enable_direct_play: params
-                .get("EnableDirectPlay")
-                .map(|v| v.parse().unwrap_or(true))
-                .unwrap_or(true),
-            enable_direct_stream: params
-                .get("EnableDirectStream")
-                .map(|v| v.parse().unwrap_or(true))
-                .unwrap_or(true),
-        }
-    }
-}
-
-/// `GET /Audio/{id}/universal` — Primary music playback endpoint.
-/// Returns a StreamingResponse with media sources and direct play/transcode URLs.
-async fn audio_universal(
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-    Query(params): Query<HashMap<String, String>>,
-) -> Result<Response, ApiError> {
-    // The client's play session id, else a new one
-    let play_session_id =
-        requested_play_session_id(&params).unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let query = AudioUniversalQuery::from(params);
-
-    // Single query: verify item exists and fetch media sources with streams
-    let media_sources =
-        rustyfin_db::repo_media_source::get_media_sources_with_item_check(&state.db_ro, &id)
-            .await
-            .ok_or_else(|| ApiError::NotFound(format!("Audio item {id} not found")))?;
-
-    // Select the appropriate media source
-    let selected_source = if let Some(ref source_id) = query.media_source_id {
-        media_sources
-            .iter()
-            .find(|s| s.id == *source_id)
-            .cloned()
-            .or_else(|| media_sources.first().cloned())
-    } else {
-        media_sources.first().cloned()
-    };
-
-    // Determine if direct play is possible
-    let can_direct_play = query.enable_direct_play
-        && selected_source
-            .as_ref()
-            .is_some_and(|s| s.supports_direct_play);
-
-    // Build the URL for direct play or transcoding
-    let url = if can_direct_play {
-        // Direct play URL
-        Some(format!(
-            "/Audio/{}/stream?MediaSourceId={}",
-            id,
-            selected_source
-                .as_ref()
-                .map_or("".to_string(), |s| s.id.clone())
-        ))
-    } else if query.enable_direct_stream {
-        // Direct stream URL
-        Some(format!("/Audio/{}/stream", id))
-    } else {
-        // Transcode URL (HLS)
-        let mut url = format!(
-            "/Videos/{}/main.m3u8?DeviceId={}",
-            id,
-            query.device_id.unwrap_or_default()
-        );
-        if let Some(bitrate) = query.max_audio_bitrate {
-            url.push_str(&format!("&MaxAudioBitrate={}", bitrate));
-        }
-        if let Some(codec) = &query.audio_codec {
-            url.push_str(&format!("&AudioCodec={}", codec));
-        }
-        Some(url)
-    };
-
-    // Update media sources with direct play flags based on client capabilities
-    let mut response_sources = media_sources.clone();
-    for source in &mut response_sources {
-        source.supports_direct_play = query.enable_direct_play && source.supports_direct_play;
-        source.supports_direct_stream = query.enable_direct_stream && source.supports_direct_stream;
-        source.supports_transcoding = true;
-    }
-
-    let response = rustyfin_model::playback_info::StreamingResponse {
-        media_sources: response_sources,
-        url,
-        analyze_duration_linear_percent: 100,
-        play_session_id: Some(play_session_id),
-    };
-
-    Ok((
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "application/json")],
-        serde_json::to_string(&response)
-            .map_err(|e| ApiError::Internal(format!("Serialization error: {e}")))?,
-    )
-        .into_response())
 }
 
 /// `GET /Audio/{id}/PlaybackInfo` — Returns playback info for an audio item.
