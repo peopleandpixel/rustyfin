@@ -66,7 +66,7 @@ function sandbox(setting = 'short') {
         episodeTrackCarry: () => ({}),
         playQueueStep: () => {},
     });
-    vm.runInContext(`let watchRun = { start: Date.now(), played: new Set() }; let lastInput = Date.now();
+    vm.runInContext(`let watchRun = { start: Date.now(), played: new Set() }; let lastInput = Date.now(); let stillWatchingAsking = false;
         ${['function trackStillWatching(', 'function askStillWatching(', 'function playEpisode('].map(slice).join('\n')}
         this.fns = { trackStillWatching, playEpisode };
         this.run = () => watchRun; this.input = t => { lastInput = t; };`, context);
@@ -96,8 +96,10 @@ test('due: the player pauses and asks; Continue plays on with a new run', async 
     context.fns.trackStillWatching(EP('e2'), true);
     context.now = 61 * 60e3;
     context.input(context.now);
-    context.fns.playEpisode({ streamType: 'Videos' }, EP('e3'));
+    context.fns.playEpisode({ streamType: 'Videos' }, EP('e3'), { autoplay: true });
     assert.deepEqual(log, ['pause', 'ask']);
+    context.fns.playEpisode({ streamType: 'Videos' }, EP('e3'));
+    assert.deepEqual(log, ['pause', 'ask'], 'a second next while the prompt is open does nothing');
     answer('continue');
     await flush();
     assert.deepEqual(log, ['pause', 'ask', 'play e3']);
@@ -108,19 +110,29 @@ test('Stop (or Escape) closes the player; not due plays straight on', async () =
     const { context, log, answer } = sandbox();
     context.fns.trackStillWatching(EP('e1'), false);
     context.now = 61 * 60e3;
-    context.fns.playEpisode({ streamType: 'Videos' }, EP('e2'));
+    context.fns.playEpisode({ streamType: 'Videos' }, EP('e2'), { autoplay: true });
     answer('');
     await flush();
     assert.deepEqual(log, ['pause', 'ask', 'close'], 'idle for an hour: asked');
     const fresh = sandbox();
     fresh.context.fns.trackStillWatching(EP('e1'), false);
     fresh.context.now = 10 * 60e3;
-    fresh.context.fns.playEpisode({ streamType: 'Videos' }, EP('e2'));
+    fresh.context.fns.playEpisode({ streamType: 'Videos' }, EP('e2'), { autoplay: true });
     assert.deepEqual(fresh.log, ['play e2']);
     const off = sandbox('disabled');
     off.context.now = 10 * H;
-    off.context.fns.playEpisode({ streamType: 'Videos' }, EP('e2'));
+    off.context.fns.playEpisode({ streamType: 'Videos' }, EP('e2'), { autoplay: true });
     assert.deepEqual(off.log, ['play e2']);
+});
+
+test('a manual next (button, key, Play now) never asks', () => {
+    const { context, log } = sandbox();
+    context.fns.trackStillWatching(EP('e1'), false);
+    context.now = 10 * H;
+    context.fns.playEpisode({ streamType: 'Videos' }, EP('e2'));
+    assert.deepEqual(log, ['play e2']);
+    assert.match(slice('function upNextTick('), /playUpNextNow\(true\)/);
+    assert.match(slice('function playUpNextNow('), /autoplay: autoplay === true/);
 });
 
 test('the wiring: playItem tracks the run, the menu and the dialog exist', () => {

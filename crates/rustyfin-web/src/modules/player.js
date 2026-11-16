@@ -8,7 +8,7 @@ import { clearQueue, queueNeighbours, playQueueStep } from './queue.js';
 import {
     trackPrefs, defaultTracks, defaultSubtitleIndex as preferredSubtitleIndex, subtitleAppearance, saveSubtitleAppearance,
     subtitleCss, stepSubtitleOffset, qualityOptions, bitrateLabel, maxStreamingBitrate, setMaxStreamingBitrate,
-    AUTO_BITRATE, aspectRatio, setAspectRatio, SEGMENT_TYPES, segmentAction, setSegmentAction, stillWatchingSetting,
+    aspectRatio, setAspectRatio, SEGMENT_TYPES, segmentAction, setSegmentAction, stillWatchingSetting,
     setStillWatchingSetting, stillWatchingDue,
 } from './playerprefs.js';
 let playerReportInterval = null;
@@ -22,6 +22,8 @@ let activePlayback = null;
 let pendingStop = Promise.resolve();
 // Incremented by each playItem call, so a call that finishes loading after a newer one gives up
 let playRequest = 0;
+// The playItem call still loading, or 0
+let playLoading = 0;
 // True while the seek bar is being dragged, so the timeline does not move the thumb
 let seekDragging = false;
 
@@ -111,8 +113,9 @@ async function openStream(session, startTicks) {
                 mediaSourceId: session.mediaSourceId,
                 audioStreamIndex: session.audioIndex,
                 subtitleStreamIndex: session.subtitleIndex,
-                // The quality chosen on this device (the settings menu); Auto lets the source play as it is
-                maxBitrate: maxStreamingBitrate() || AUTO_BITRATE,
+                // The quality chosen on this device (the settings menu); Auto sends no limit, as a high one would
+                // keep a high-bitrate source (a 4K remux) from playing directly
+                maxBitrate: maxStreamingBitrate() || undefined,
             });
             if (!current()) return;
             if (data && data.url) {
@@ -453,7 +456,8 @@ function setSubtitleAppearance(field, value) {
 function applySubtitleOffset(session) {
     const el = $('video-player')?.querySelector('track[data-player-subtitle]');
     const cues = el?.track?.cues;
-    if (!el || !cues || activePlayback !== session) return;
+    // No cues yet (a restart's track still loading): its load event applies the offset then
+    if (!el || !cues?.length || activePlayback !== session) return;
     const delta = session.subtitleOffset - Number(el.dataset.offset || 0);
     if (!delta) return;
     for (const cue of Array.from(cues)) {
@@ -585,6 +589,8 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
     const modal = $('player-modal');
     if (!video || !modal) return;
     const request = ++playRequest;
+    // Until this load gives up or plays, a song that stops for it keeps the now-playing bar up (no flicker)
+    playLoading = request;
     if (!queued) clearQueue();
 
     // Report a session that is still playing as stopped before starting another
@@ -636,7 +642,10 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
         streamType === 'Videos' ? API.getMe().catch(() => null) : null,
     ]);
     // Closed (videos) or replaced while loading
-    if ((!modal.open && streamType !== 'Audio') || request !== playRequest) return;
+    if ((!modal.open && streamType !== 'Audio') || request !== playRequest) {
+        if (request === playRequest) playLoading = 0;
+        return;
+    }
     const prefs = trackPrefs(me?.Configuration);
     if (!title && item?.Name) $('player-title').textContent = item.Name;
     // An episode the user started begins a new run; one played on from the last (with its tracks) adds to it
@@ -744,11 +753,12 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
             video.removeAttribute('src');
             video.load();
             clearTextSubtitle();
-            if (activePlayback === null) updateNowPlaying(null);
+            if (activePlayback === null && !playLoading) updateNowPlaying(null);
             return reported;
         },
     };
     activePlayback = session;
+    playLoading = 0;
     updateNowPlaying(session, item);
     session.trickplay = trickplayInfo(item, session.mediaSourceId);
     renderChapters(session);
@@ -795,6 +805,8 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
         if (activePlayback !== session) return;
         session.stop();
         upNextAtEnd(session);
+        // The last song of the queue: the music is over (nothing next started loading)
+        if (session.streamType === 'Audio' && !playLoading && !activePlayback) endNowPlaying();
     };
 
     await openStream(session, startTicks);
@@ -1062,11 +1074,15 @@ function updateEpisodeButtons() {
 
 // Plays a neighbour from its start with this item's track languages; finished reports this one as watched.
 // In a queue the neighbour is the queue's previous or next item.
-function playEpisode(session, episode, { finished = false } = {}) {
-    if (session.streamType !== 'Audio' && episode?.Type === 'Episode' && stillWatchingDue(stillWatchingSetting(),
+// autoplay: the next-episode card's countdown ran out, the only time the still-watching prompt may ask
+function playEpisode(session, episode, { finished = false, autoplay = false } = {}) {
+    if (stillWatchingAsking) return;
+    if (autoplay && session.streamType !== 'Audio' && episode?.Type === 'Episode' && stillWatchingDue(stillWatchingSetting(),
         { now: Date.now(), sessionStart: watchRun.start, lastInput, played: watchRun.played.size })) {
         $('video-player')?.pause();
+        stillWatchingAsking = true;
         askStillWatching().then(keepWatching => {
+            stillWatchingAsking = false;
             if (!keepWatching) return closePlayer();
             watchRun = { start: Date.now(), played: new Set() };
             lastInput = Date.now();
@@ -1148,14 +1164,15 @@ function renderUpNextCountdown() {
 function upNextTick() {
     if (!upNext) return;
     upNext.remaining -= 1;
-    if (upNext.remaining <= 0) playUpNextNow();
+    if (upNext.remaining <= 0) playUpNextNow(true);
     else renderUpNextCountdown();
 }
 
-function playUpNextNow() {
+// autoplay: the countdown ran out (Play now and the card's button pass nothing)
+function playUpNextNow(autoplay = false) {
     const nav = upNext?.nav;
     hideUpNext();
-    if (nav?.next) playEpisode(nav.session, nav.next, { finished: true });
+    if (nav?.next) playEpisode(nav.session, nav.next, { finished: true, autoplay: autoplay === true });
 }
 
 // Cancel closes the card for this episode, which then ends as usual
@@ -1374,17 +1391,24 @@ function openFullPlayer() {
 // The bar's ×: the music stops, the queue ends and the bar goes
 function stopNowPlaying() {
     stopPlayback();
+    endNowPlaying();
+    const modal = $('player-modal');
+    if (modal?.open) modal.close();
+}
+
+// The music is over: no queue, no OS media controls, no bar
+function endNowPlaying() {
     clearQueue();
     resetEpisodeNav();
     clearMediaSession();
     updateNowPlaying(null);
-    const modal = $('player-modal');
-    if (modal?.open) modal.close();
 }
 
 // --- Are you still watching? Jellyfin Web's prompt before the next episode, off unless the user turns it on.
 // The run starts with an episode the user plays; it counts the episodes played on from there. ---
 let watchRun = { start: Date.now(), played: new Set() };
+// True while the prompt is open, so a second next (a key, the card) can't play past it
+let stillWatchingAsking = false;
 // The last key, pointer or wheel input, in ms
 let lastInput = Date.now();
 for (const type of ['pointerdown', 'pointermove', 'keydown', 'wheel', 'touchstart']) {

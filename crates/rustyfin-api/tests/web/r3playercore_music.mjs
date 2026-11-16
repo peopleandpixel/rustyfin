@@ -49,7 +49,7 @@ function sandbox(active = null) {
         setMediaSessionHandler: () => {},
     });
     vm.runInContext(`${['function episodeNumberLabel(', 'function itemPicture(', 'function itemArtist(', 'function updateNowPlaying(',
-        'function updateNowPlayingProgress(', 'function openFullPlayer(', 'function stopNowPlaying(', 'function onPlayerClosed(',
+        'function updateNowPlayingProgress(', 'function openFullPlayer(', 'function stopNowPlaying(', 'function endNowPlaying(', 'function onPlayerClosed(',
         'function updateEpisodeButtons('].map(slice).join('\n')}
         this.fns = { itemPicture, updateNowPlaying, openFullPlayer, stopNowPlaying, onPlayerClosed, updateEpisodeButtons };
         this.setNav = n => { episodeNav = n; };`, context);
@@ -109,6 +109,18 @@ test('the bar\'s previous and next follow the queue', () => {
     assert.equal(elements['now-playing-prev'].hidden, false);
     assert.equal(elements['now-playing-prev'].disabled, true);
     assert.equal(elements['now-playing-next'].disabled, false);
+});
+
+test('the end of the queue ends the music; the next song keeps the bar up', () => {
+    const play = slice('async function playItem(');
+    assert.match(play, /playLoading = request;/);
+    assert.match(play, /session\.streamType === 'Audio' && !playLoading && !activePlayback\) endNowPlaying\(\)/);
+    assert.match(play, /if \(activePlayback === null && !playLoading\) updateNowPlaying\(null\)/);
+    const { context, elements, calls } = sandbox(null);
+    elements['now-playing'] = { hidden: false };
+    vm.runInContext('endNowPlaying()', context);
+    assert.deepEqual(calls, ['clear queue', 'reset nav', 'clear media session']);
+    assert.equal(elements['now-playing'].hidden, true);
 });
 
 test('playItem leaves the full player shut for music and shows the bar', () => {

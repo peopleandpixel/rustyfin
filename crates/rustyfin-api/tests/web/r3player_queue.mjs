@@ -63,6 +63,7 @@ function sandbox({ responses = {}, me = { Configuration: {} } } = {}) {
     vm.runInContext(
         `let playQueue = null; ${decl(queueJs, 'QUEUE_LIMIT')} ${decl(queueJs, 'SERIES_LIMIT')}
          var activePlayback = null; let episodeNav = null; let upNext = null; const UP_NEXT_SECONDS = 10;
+         let stillWatchingAsking = false;
          ${QUEUE.map(h => slice(queueJs, h)).join('\n')}
          ${NAV.map(h => slice(playerJs, h)).join('\n')}
          this.fns = { queueQuery, queueStartIndex, playContainer, playQueueAt, queueNeighbours, playQueueStep, clearQueue,

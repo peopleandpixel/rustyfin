@@ -121,6 +121,20 @@ test('H and G move the cues by the change since the last offset, and say so', ()
     assert.ok(Math.abs(cues[0].startTime - 9.5) < 1e-9);
 });
 
+test('an offset set before the cues load is applied once they load', () => {
+    const { context, cues, trackEl } = sandbox();
+    const session = { subtitleOffset: 0.5 };
+    context.setActive(session);
+    const loaded = trackEl.track.cues;
+    trackEl.track.cues = [];
+    context.fns.applySubtitleOffset(session);
+    assert.equal(trackEl.dataset.offset, undefined, 'nothing marked applied while there are no cues');
+    trackEl.track.cues = loaded;
+    context.fns.applySubtitleOffset(session);
+    assert.ok(Math.abs(cues[0].startTime - 9.5) < 1e-9);
+    assert.equal(trackEl.dataset.offset, '0.5');
+});
+
 test('without a text subtitle the offset stays and the player says why', () => {
     const { context, elements } = sandbox();
     const session = { subtitleOffset: 0 };

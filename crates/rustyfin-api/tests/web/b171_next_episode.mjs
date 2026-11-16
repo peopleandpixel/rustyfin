@@ -71,6 +71,7 @@ function sandbox({ episodes = SERIES, me = { Id: 'u1', Configuration: {} }, segm
         stillWatchingDue: () => false,
         watchRun: { start: 0, played: new Set() },
         lastInput: 0,
+        stillWatchingAsking: false,
     });
     vm.runInContext(
         `var activePlayback = null; let episodeNav = null; let upNext = null; const UP_NEXT_SECONDS = 10;

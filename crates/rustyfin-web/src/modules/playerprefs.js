@@ -200,8 +200,6 @@ function setSegmentAction(type, action) {
 // --- Quality: Jellyfin Web's steps; 0 is Auto. The choice is the device's. ---
 const BITRATE_STEPS = [120e6, 80e6, 60e6, 40e6, 20e6, 15e6, 10e6, 8e6, 6e6, 4e6, 3e6, 1.5e6, 720e3, 420e3];
 const QUALITY_KEY = 'maxStreamingBitrate';
-// Auto asks for up to 100 Mbps, which lets anything the browser plays play directly
-const AUTO_BITRATE = 100e6;
 
 function bitrateLabel(bps) {
     return bps >= 1e6 ? `${bps / 1e6} Mbps` : `${bps / 1e3} kbps`;
@@ -263,7 +261,7 @@ export {
     languageCode, sameLanguage, trackPrefs, defaultAudioIndex, defaultSubtitleIndex, defaultTracks,
     subtitleAppearance, saveSubtitleAppearance, subtitleCss, APPEARANCE_DEFAULTS, SUBTITLE_SIZES, SUBTITLE_FONTS,
     SUBTITLE_SHADOWS, stepSubtitleOffset, SEGMENT_TYPES, SEGMENT_ACTIONS, segmentAction, setSegmentAction,
-    BITRATE_STEPS, AUTO_BITRATE, bitrateLabel, qualityOptions, maxStreamingBitrate, setMaxStreamingBitrate,
+    BITRATE_STEPS, bitrateLabel, qualityOptions, maxStreamingBitrate, setMaxStreamingBitrate,
     ASPECT_RATIOS, aspectRatio, setAspectRatio, STILL_WATCHING, stillWatchingSetting, setStillWatchingSetting,
     stillWatchingDue,
 };

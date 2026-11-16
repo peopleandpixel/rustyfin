@@ -128,6 +128,30 @@ test('another version restarts at the same point with the same languages', () =>
     assert.deepEqual(restarts, [42], 'the same version does nothing');
 });
 
+// api.js's Universal request in a sandbox: Auto (no limit) sends no MaxStreamingBitrate, so a high-bitrate source
+// can play directly; a chosen step sends it
+test('Auto sends no MaxStreamingBitrate; a chosen quality does', async () => {
+    const apiJs = read('api.js');
+    const urls = [];
+    const ctx = vm.createContext({
+        window: { location: { origin: 'http://srv' } },
+        localStorage: { getItem: () => null },
+        URLSearchParams,
+    });
+    vm.runInContext(`${apiJs}\nthis.API = API;`, ctx);
+    ctx.API.playableCodecs = () => ({ video: ['h264'], audio: ['aac'] });
+    ctx.API.get = path => { urls.push(path); return Promise.resolve({ Url: '/x' }); };
+    await ctx.API.getUniversalVideoUrl('i1', { maxBitrate: undefined });
+    await ctx.API.getUniversalVideoUrl('i1', { maxBitrate: 3e6 });
+    assert.doesNotMatch(urls[0], /MaxStreamingBitrate/);
+    assert.match(urls[1], /MaxStreamingBitrate=3000000/);
+});
+
+test('the overlay names a bitrate reason only under a chosen limit', () => {
+    assert.match(slice('function playbackStats('), /transcodeReasons\(session, codecs, limit\)/);
+    assert.match(slice('function transcodeReasons('), /if \(limit && source\.Bitrate > limit\) reasons\.push\('ContainerBitrateExceedsLimit'\)/);
+});
+
 test('the aspect ratio sets the video\'s object-fit', () => {
     const { context, elements } = sandbox();
     context.fns.changeAspectRatio('fill');
@@ -138,7 +162,7 @@ test('the aspect ratio sets the video\'s object-fit', () => {
 
 test('the stream request carries the limit and keeps the chosen version', () => {
     const open = slice('async function openStream(');
-    assert.match(open, /maxBitrate: maxStreamingBitrate\(\) \|\| AUTO_BITRATE/);
+    assert.match(open, /maxBitrate: maxStreamingBitrate\(\) \|\| undefined/);
     assert.match(open, /session\.mediaSourceId = session\.mediaSourceId \|\| mediaSourceId/);
     for (const id of ['player-quality', 'player-version', 'player-aspect']) assert.match(html, new RegExp(`id="${id}"`));
 });
