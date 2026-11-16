@@ -6,12 +6,13 @@ import { oidcAccountKey } from './settings.js';
 import { jiPanelHtml, loadJellyfinImport } from './jellyfin-import.js';
 import { sessionsPanelHtml, followSessions, unfollowSessions } from './sessions.js';
 import { playbackPanelHtml, loadPlaybackAdmin } from './playback-admin.js';
+import { dlnaPanelHtml, loadDlnaAdmin } from './dlna-admin.js';
 import { serverDetailsHtml, generalPanelHtml, loadGeneralSettings, triggerSummary } from './dashboard.js';
 
 // The dashboard's tab panels, in the order of their tab buttons
 const ADMIN_TABS = [
     'admin-overview', 'admin-general', 'admin-users', 'admin-libs', 'admin-playback', 'admin-tasks', 'admin-plugins',
-    'admin-sessions', 'admin-activity', 'admin-livelog', 'admin-signin', 'admin-import',
+    'admin-sessions', 'admin-activity', 'admin-livelog', 'admin-signin', 'admin-import', 'admin-dlna',
 ];
 
 async function renderAdmin(tab) {
@@ -37,7 +38,7 @@ async function renderAdmin(tab) {
         ]);
         const accountById = new Map(accounts.map(a => [oidcAccountKey(a.UserId), a]));
 
-        const tabs = [t('admin.overview'), t('dashboard.general'), t('admin.users'), t('admin.libraries'), t('admin.playback'), t('admin.tasks'), t('admin.plugins'), t('admin.sessions'), t('admin.activity_log_tab'), t('admin.live_log'), t('oidc.admin_tab'), t('jellyfin_import.tab')];
+        const tabs = [t('admin.overview'), t('dashboard.general'), t('admin.users'), t('admin.libraries'), t('admin.playback'), t('admin.tasks'), t('admin.plugins'), t('admin.sessions'), t('admin.activity_log_tab'), t('admin.live_log'), t('oidc.admin_tab'), t('jellyfin_import.tab'), t('dlna_admin.tab')];
         const tabIds = ADMIN_TABS;
 
         page.innerHTML = `
@@ -276,6 +277,9 @@ async function renderAdmin(tab) {
             ${playbackPanelHtml()}
 
             ${jiPanelHtml()}
+
+            <!-- DLNA: the server switch and the user DLNA devices browse as, filled by loadDlnaAdmin -->
+            ${dlnaPanelHtml()}
         </div>`;
         // #admin/import opens the import tab (the wizard's last step sends the admin there), and
         // #admin/playback the playback tab
@@ -309,6 +313,7 @@ function showAdminTab(btn, tabId) {
     if (tabId === 'admin-playback') loadPlaybackAdmin();
     if (tabId === 'admin-general') loadGeneralSettings();
     if (tabId === 'admin-import') loadJellyfinImport();
+    if (tabId === 'admin-dlna') loadDlnaAdmin();
 }
 
 // An administrator changes another user's role or disabled state. The checkbox is disabled while the request runs, the users list cache is dropped, and the users tab is shown again after the page is rendered.

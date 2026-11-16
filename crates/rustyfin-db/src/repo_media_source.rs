@@ -351,6 +351,32 @@ pub async fn get_media_source_ids(
         .await
 }
 
+/// Each item's Container, from its first media source in `get_media_sources`' order, by item id
+/// as stored; items without a known container have no entry.
+pub async fn first_containers(
+    pool: &SqlitePool,
+    item_ids: &[Uuid],
+) -> Result<std::collections::HashMap<String, String>, sqlx::Error> {
+    let mut containers = std::collections::HashMap::new();
+    if item_ids.is_empty() {
+        return Ok(containers);
+    }
+    let ids = serde_json::Value::from(item_ids.iter().map(Uuid::to_string).collect::<Vec<_>>());
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT s.item_id, s.container FROM media_sources s \
+         JOIN media_items m ON m.id = s.item_id \
+         WHERE s.item_id IN (SELECT value FROM json_each(?1)) AND COALESCE(s.container, '') != '' \
+         ORDER BY s.item_id, s.path = m.path DESC, COALESCE(s.width, 0) DESC, s.path, s.id",
+    )
+    .bind(ids.to_string())
+    .fetch_all(pool)
+    .await?;
+    for (item, container) in rows {
+        containers.entry(item).or_insert(container);
+    }
+    Ok(containers)
+}
+
 /// Verify that a media item exists and fetch its media sources with streams in a single round-trip.
 /// Returns None if the item does not exist.
 /// Eliminates the N+1 pattern in streaming endpoints where get_item_by_id and get_media_sources

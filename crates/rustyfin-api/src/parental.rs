@@ -190,6 +190,51 @@ pub async fn policy(
     Ok(policy.is_restricted().then_some(policy))
 }
 
+/// What `user` may see, as the SQL filter `HiddenItems::json` makes, for code that has a user id
+/// but no claims (item details and counts, the DLNA user). Without a user it is the caller's, so a
+/// list asked for without user data still counts only what the caller may see. `None` for the API
+/// key and a user without limits; a policy or hidden set that can't be read hides everything.
+pub async fn user_filter(pool: &sqlx::SqlitePool, user: Option<Uuid>) -> Option<String> {
+    let request = REQUEST_POLICY
+        .try_with(|(id, policy)| (*id, policy.clone()))
+        .ok();
+    let policy = match (user, request) {
+        (Some(user), Some((id, policy))) if id == user => policy,
+        (None, Some((_, policy))) => policy,
+        (None, None) => return None,
+        (Some(user), _) if user.is_nil() => return None,
+        (Some(user), _) => match rustyfin_db::repo_parental::get_policy(pool, user).await {
+            Ok(policy) => Arc::new(policy),
+            Err(_) => return hide_everything(),
+        },
+    };
+    if !policy.is_restricted() {
+        return None;
+    }
+    match rustyfin_db::repo_parental::hidden_item_ids(pool, &policy).await {
+        Ok(stored) => rustyfin_db::repo_parental::filter_json(&stored, policy.enabled_folders()),
+        Err(_) => hide_everything(),
+    }
+}
+
+/// Whether `user`'s limits let them see the item; false when the policy can't be read.
+pub async fn user_sees(state: &AppState, user: Uuid, item_id: Uuid) -> bool {
+    if user.is_nil() {
+        return true;
+    }
+    match user_policy(state, user).await {
+        Ok(policy) => rustyfin_db::repo_parental::is_item_hidden(&state.db_ro, &policy, item_id)
+            .await
+            .is_ok_and(|hidden| !hidden),
+        Err(_) => false,
+    }
+}
+
+/// A filter that no item passes: no library may be seen.
+fn hide_everything() -> Option<String> {
+    rustyfin_db::repo_parental::filter_json(&HashSet::new(), Some(&[]))
+}
+
 /// An entry of a list that `HiddenItems::retain` filters: its id and its library.
 pub trait Listed {
     fn item_id(&self) -> Uuid;
@@ -220,17 +265,21 @@ pub struct HiddenItems {
 
 impl HiddenItems {
     pub async fn for_caller(state: &AppState, claims: &Claims) -> Result<Self, ApiError> {
-        if claims.sub.is_nil() {
-            return Ok(Self::default());
-        }
-        Self::for_user(state, claims.sub).await
+        Self::for_policy(state, policy(state, claims).await?).await
     }
 
-    /// The items hidden from `user`, for a route that answers for a user other than the caller
-    /// (an administrator's `userId`).
+    /// The items hidden from `user`: for a route that answers for a user other than the caller (an
+    /// administrator's `userId`), or for a client that doesn't sign in (the DLNA server's user).
     pub async fn for_user(state: &AppState, user: Uuid) -> Result<Self, ApiError> {
         let policy = user_policy(state, user).await?;
-        match policy.is_restricted().then_some(policy) {
+        Self::for_policy(state, policy.is_restricted().then_some(policy)).await
+    }
+
+    async fn for_policy(
+        state: &AppState,
+        policy: Option<Arc<ParentalPolicy>>,
+    ) -> Result<Self, ApiError> {
+        match policy {
             None => Ok(Self::default()),
             Some(policy) => {
                 let stored =

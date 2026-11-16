@@ -123,8 +123,14 @@ async fn get_now_playing_item(
         let owner =
             rustyfin_db::repo_session::get_session_user_id(&state.db_ro, &session_id).await?;
         check_control(&claims, owner, "Session")?;
-        let now_playing =
+        let mut now_playing =
             rustyfin_db::repo_session::get_now_playing_item(&state.db_ro, &session_id).await?;
+        // An item the caller's limits hide is not named.
+        if let Some(item) = &now_playing
+            && !crate::parental::user_sees(&state, claims.sub, item.id).await
+        {
+            now_playing = None;
+        }
         Ok(Json(now_playing))
     } else {
         Ok(Json(None))

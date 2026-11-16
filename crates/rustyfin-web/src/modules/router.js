@@ -31,6 +31,7 @@ import {
 } from './library-admin.js';
 import { openPluginConfig, openPluginPriority } from './plugins.js';
 import { savePlaybackSettings } from './playback-admin.js';
+import { saveDlnaSettings } from './dlna-admin.js';
 import { serverPower, openLibraryEditor, removeLibraryFolder, openTriggerEditor, removeTaskTrigger } from './dashboard.js';
 import {
     openUserEditor, closeUserEditor, showUserEditorTab, addUserEditorTag, removeUserEditorTag, addUserEditorSchedule,
@@ -232,6 +233,7 @@ const clickActions = {
     'oidc-copy-callback': () => copyOidcCallbackUrl(),
     'oidc-save-settings': () => saveOidcAdminSettings(),
     'playback-save': () => savePlaybackSettings(),
+    'dlna-save': () => saveDlnaSettings(),
     'plugin-edit-config': el => openPluginConfig(el.dataset.pluginId),
     'plugin-edit-priority': el => openPluginPriority(el.dataset.pluginId),
 };

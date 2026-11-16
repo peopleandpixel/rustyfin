@@ -46,6 +46,7 @@ import {
     changeSubtitleAppearance, changeLatestLibrary, chooseProfileImage, deleteProfileImage,
 } from './modules/settings.js';
 import './modules/playback-admin.js';
+import './modules/dlna-admin.js';
 import {
     saveGeneralSettings, addLibraryFolder, renameLibrary, addTaskTrigger, showTriggerFields,
 } from './modules/dashboard.js';

@@ -3625,18 +3625,24 @@ pub async fn get_last_scan_time(
     Ok(row.and_then(|r| r.0.parse().ok()))
 }
 
-/// Count items by media type for a given parent (folder counts).
+/// Count items by media type for a given parent (folder counts), only the children that pass
+/// `visible` (a `repo_parental::filter_json` filter; `None` counts every child).
 pub async fn count_items_by_type(
     pool: &SqlitePool,
     parent_id: uuid::Uuid,
+    visible: Option<&str>,
 ) -> Result<Vec<(String, i64)>, sqlx::Error> {
     let pid = parent_id.to_string();
-    sqlx::query_as::<_, (String, i64)>(
-        "SELECT media_type, COUNT(*) FROM media_items WHERE parent_id = ? GROUP BY media_type",
-    )
-    .bind(&pid)
-    .fetch_all(pool)
-    .await
+    let sql = format!(
+        "SELECT media_type, COUNT(*) FROM media_items WHERE parent_id = ?1 AND {} \
+         GROUP BY media_type",
+        crate::repo_parental::visible_sql("id", "library_id", "?2"),
+    );
+    sqlx::query_as::<_, (String, i64)>(sqlx::AssertSqlSafe(sql))
+        .bind(&pid)
+        .bind(visible)
+        .fetch_all(pool)
+        .await
 }
 
 /// Get a parent item by ID (for inherited image tags and series info).
@@ -4244,10 +4250,12 @@ pub async fn get_last_media_added(
     Ok(row.and_then(|r| r.0.parse().ok()))
 }
 
-/// Batch-get folder counts for multiple parent IDs at once.
+/// Batch-get folder counts for multiple parent IDs at once, counting the children that pass
+/// `visible` (see `count_items_by_type`).
 pub async fn get_folder_counts_batch(
     pool: &SqlitePool,
     parent_ids: &[uuid::Uuid],
+    visible: Option<&str>,
 ) -> Result<std::collections::HashMap<String, std::collections::HashMap<String, i64>>, sqlx::Error>
 {
     if parent_ids.is_empty() {
@@ -4256,7 +4264,7 @@ pub async fn get_folder_counts_batch(
     let mut results: std::collections::HashMap<String, std::collections::HashMap<String, i64>> =
         std::collections::HashMap::new();
     for pid in parent_ids {
-        let counts = count_items_by_type(pool, *pid).await?;
+        let counts = count_items_by_type(pool, *pid, visible).await?;
         let mut map = std::collections::HashMap::new();
         for (media_type, count) in counts {
             map.insert(media_type, count);

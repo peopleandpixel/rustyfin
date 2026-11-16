@@ -542,12 +542,22 @@ pub async fn list(
 
 /// One session as Jellyfin's `SessionInfoDto`.
 async fn dto(state: &AppState, s: &SessionInfo, viewer: Uuid, socket: bool) -> serde_json::Value {
-    let (playing, play_state, check_in) = {
+    let (playing, mut play_state, check_in) = {
         let all = state.session_runtime.read();
         match all.get(&s.id) {
             Some(rt) => (rt.playing.clone(), rt.play_state.clone(), rt.last_check_in),
             None => (None, PlayState::default(), None),
         }
+    };
+    // An item the viewer's limits hide (an administrator with limits sees every session) is left
+    // out with everything that names it: the play state's source, the playlist entry, the queue.
+    let playing = match playing {
+        Some(p) if !crate::parental::user_sees(state, viewer, p.item_id).await => {
+            play_state.media_source_id = None;
+            play_state.live_stream_id = None;
+            None
+        }
+        playing => playing,
     };
     let caps = &s.capabilities;
     let media_control = caps.supports_media_control.unwrap_or(false);
