@@ -27002,6 +27002,164 @@ async fn b23_each_key_sorts_both_ways_with_missing_values_and_ties_as_in_jellyfi
     }
 }
 
+// R3 cards: the sorts Jellyfin Web's library sort menus offer beyond the b23 keys: parental rating,
+// the caller's play count and date played, a series' newest episode and last played episode, and
+// an episode's series name
+#[tokio::test]
+async fn r3cards_library_sort_keys() {
+    let state = test_state().await;
+    let movies = rustyfin_model::library::LibraryContentType::Movies;
+    let (token, user_id, ids) = b23_library(&state, movies, &b23_movies()).await;
+    let library_id: String = sqlx::query_scalar("SELECT library_id FROM media_items WHERE id = ?")
+        .bind(ids[0].to_string())
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    for (i, rating) in [(0, "R"), (1, "PG"), (2, "G")] {
+        sqlx::query("UPDATE media_items SET official_rating = ? WHERE id = ?")
+            .bind(rating)
+            .bind(ids[i].to_string())
+            .execute(&state.db)
+            .await
+            .unwrap();
+    }
+    let user_data = |item: String, plays: i64, played_at: &'static str, favorite: bool| {
+        sqlx::query(
+            "INSERT INTO user_item_data (user_id, item_id, play_count, last_played_date, is_favorite) \
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(user_id.to_string())
+        .bind(item)
+        .bind(plays)
+        .bind(played_at)
+        .bind(favorite)
+    };
+    for (i, plays, at, favorite) in [
+        (3, 5, "2024-05-01T00:00:00Z", true),
+        (4, 2, "2024-06-01T00:00:00Z", false),
+        (5, 1, "2024-01-01T00:00:00Z", true),
+    ] {
+        user_data(ids[i].to_string(), plays, at, favorite)
+            .execute(&state.db)
+            .await
+            .unwrap();
+    }
+    // Two series, each with a season and an episode: Zulu was added last, but Yankee has the newer
+    // episode; the user last played Zulu's
+    let mut episodes = Vec::new();
+    for (n, (name, added, episode_added)) in [
+        ("Zulu", "2024-09-01T00:00:00Z", "2025-01-01T00:00:00Z"),
+        ("Yankee", "2024-02-01T00:00:00Z", "2025-06-01T00:00:00Z"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let series = uuid::Uuid::from_u128(0x3ca0_0000 + n as u128);
+        let season = uuid::Uuid::from_u128(0x3cb0_0000 + n as u128);
+        let episode = uuid::Uuid::from_u128(0x3cc0_0000 + n as u128);
+        for (id, parent, item_name, media_type, date) in [
+            (series, None, name.to_string(), "Series", added),
+            (season, Some(series), format!("{name} S1"), "Season", added),
+            (
+                episode,
+                Some(season),
+                "a".to_string(),
+                "Episode",
+                episode_added,
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO media_items (id, library_id, parent_id, name, sort_name, media_type, path, \
+                 date_created) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(id.to_string())
+            .bind(&library_id)
+            .bind(parent.map(|p| p.to_string()))
+            .bind(&item_name)
+            .bind(item_name.to_lowercase())
+            .bind(media_type)
+            .bind(format!("/r3cards/{id}"))
+            .bind(date)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        }
+        episodes.push(episode);
+    }
+    user_data(episodes[0].to_string(), 1, "2025-07-01T00:00:00Z", false)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    let app = app(state);
+    let movie_list = "/Items?Recursive=true&IncludeItemTypes=Movie";
+    let first = |order: Vec<usize>, picked: &[usize]| -> Vec<usize> {
+        order.into_iter().filter(|i| picked.contains(i)).collect()
+    };
+    let order = b23_order(
+        &app,
+        &token,
+        &format!("{movie_list}&SortBy=OfficialRating,SortName&SortOrder=Ascending"),
+        &ids,
+    )
+    .await;
+    assert_eq!(first(order, &[0, 1, 2]), [2, 1, 0], "G, PG, R");
+    let order = b23_order(
+        &app,
+        &token,
+        &format!("{movie_list}&SortBy=PlayCount,SortName&SortOrder=Descending"),
+        &ids,
+    )
+    .await;
+    assert_eq!(order[..3], [3, 4, 5], "most played first");
+    let order = b23_order(
+        &app,
+        &token,
+        &format!("{movie_list}&SortBy=DatePlayed,SortName&SortOrder=Descending"),
+        &ids,
+    )
+    .await;
+    assert_eq!(order[..3], [4, 3, 5], "last played first");
+    // The sort's user bind follows the filter's
+    let order = b23_order(
+        &app,
+        &token,
+        &format!("{movie_list}&Filters=IsFavorite&SortBy=PlayCount&SortOrder=Ascending"),
+        &ids,
+    )
+    .await;
+    assert_eq!(order, [5, 3], "favourites by play count");
+    let series_list = "/Items?Recursive=true&IncludeItemTypes=Series";
+    let names = |sort: &str| format!("{series_list}&SortBy={sort}&SortOrder=Descending");
+    assert_eq!(
+        b23_names(&app, &token, &names("DateCreated,SortName")).await,
+        ["Zulu", "Yankee"]
+    );
+    assert_eq!(
+        b23_names(&app, &token, &names("DateLastContentAdded,SortName")).await,
+        ["Yankee", "Zulu"],
+        "newest episode first"
+    );
+    assert_eq!(
+        b23_names(&app, &token, &names("SeriesDatePlayed,SortName")).await,
+        ["Zulu", "Yankee"],
+        "last watched first"
+    );
+    let listed: Vec<String> = b23_items(
+        &app,
+        &token,
+        "/Items?Recursive=true&IncludeItemTypes=Episode&SortBy=SeriesSortName,SortName&SortOrder=Ascending",
+    )
+    .await
+    .iter()
+    .map(|item| item["Id"].as_str().unwrap().to_string())
+    .collect();
+    assert_eq!(
+        listed,
+        [episodes[1].to_string(), episodes[0].to_string()],
+        "Yankee's episode first"
+    );
+}
+
 #[tokio::test]
 async fn b23_comma_lists_apply_in_order_on_both_item_lists() {
     let state = test_state().await;

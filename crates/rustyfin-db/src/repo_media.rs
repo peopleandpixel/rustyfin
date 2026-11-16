@@ -791,6 +791,18 @@ enum SortKey {
     ParentIndexNumber,
     IndexNumber,
     Random,
+    OfficialRating,
+    /// The newest date_created of a folder's children and grandchildren (a series' episodes), else
+    /// the item's own
+    DateLastContentAdded,
+    /// An episode's series' sort name, else its own
+    SeriesSortName,
+    /// The caller's play count of the item (bound user id)
+    PlayCount,
+    /// When the caller last played the item (bound user id)
+    DatePlayed,
+    /// When the caller last played one of a series' episodes (bound user id)
+    SeriesDatePlayed,
     /// Dropped after the keys are paired with the orders, so it never reaches a clause.
     Default,
     /// Any other key; it orders by `sort_name`.
@@ -812,6 +824,12 @@ impl SortKey {
             "parentindexnumber" => SortKey::ParentIndexNumber,
             "indexnumber" => SortKey::IndexNumber,
             "random" => SortKey::Random,
+            "officialrating" => SortKey::OfficialRating,
+            "datelastcontentadded" => SortKey::DateLastContentAdded,
+            "seriessortname" => SortKey::SeriesSortName,
+            "playcount" => SortKey::PlayCount,
+            "dateplayed" => SortKey::DatePlayed,
+            "seriesdateplayed" => SortKey::SeriesDatePlayed,
             _ => SortKey::Other,
         }
     }
@@ -832,8 +850,54 @@ impl SortKey {
             SortKey::ParentIndexNumber => "parent_index_number",
             SortKey::IndexNumber => "index_number",
             SortKey::Random => "ROWID",
+            SortKey::OfficialRating => "official_rating",
+            SortKey::DateLastContentAdded => concat!(
+                "COALESCE((SELECT MAX(d) FROM (",
+                "SELECT c.date_created AS d FROM media_items c WHERE c.parent_id = media_items.id ",
+                "UNION ALL SELECT g.date_created FROM media_items c ",
+                "JOIN media_items g ON g.parent_id = c.id WHERE c.parent_id = media_items.id)), ",
+                "date_created)"
+            ),
+            SortKey::SeriesSortName => concat!(
+                "COALESCE((SELECT p.sort_name FROM media_items p ",
+                "WHERE p.id = media_items.parent_id AND p.media_type = 'Series'), ",
+                "(SELECT g.sort_name FROM media_items p JOIN media_items g ON g.id = p.parent_id ",
+                "WHERE p.id = media_items.parent_id AND p.media_type = 'Season'), sort_name)"
+            ),
+            SortKey::PlayCount => concat!(
+                "COALESCE((SELECT ud.play_count FROM user_item_data ud ",
+                "WHERE ud.item_id = media_items.id AND ud.user_id = ?), 0)"
+            ),
+            SortKey::DatePlayed => concat!(
+                "(SELECT ud.last_played_date FROM user_item_data ud ",
+                "WHERE ud.item_id = media_items.id AND ud.user_id = ?)"
+            ),
+            SortKey::SeriesDatePlayed => concat!(
+                "(SELECT MAX(ud.last_played_date) FROM user_item_data ud WHERE ud.user_id = ? ",
+                "AND ud.item_id IN (SELECT c.id FROM media_items c WHERE c.parent_id = media_items.id ",
+                "UNION ALL SELECT g.id FROM media_items c JOIN media_items g ON g.parent_id = c.id ",
+                "WHERE c.parent_id = media_items.id))"
+            ),
         }
     }
+
+    /// Whether the key's expression binds the caller's user id (one `?`).
+    fn binds_user(self) -> bool {
+        matches!(
+            self,
+            SortKey::PlayCount | SortKey::DatePlayed | SortKey::SeriesDatePlayed
+        )
+    }
+}
+
+/// How many user id binds the ORDER BY clause of `sort_by` and `sort_order` takes, after the
+/// filters' binds and before LIMIT and OFFSET.
+fn order_user_binds(sort_by: &str, sort_order: &str) -> usize {
+    let terms = parse_sort(sort_by, sort_order);
+    if is_random_sort(&terms) {
+        return 0;
+    }
+    terms.iter().filter(|term| term.key.binds_user()).count()
 }
 
 /// One sort key with its direction.
@@ -1537,6 +1601,11 @@ pub async fn get_items_filtered(
     }
     if is_unplayed.is_some() {
         data_q = data_q.bind(&played_folders).bind(&uid_str);
+    }
+
+    // The user-scoped sort keys (play count, date played)
+    for _ in 0..order_user_binds(sort_by_str, sort_order_str) {
+        data_q = data_q.bind(&uid_str);
     }
 
     // Pagination
