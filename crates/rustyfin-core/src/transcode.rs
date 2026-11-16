@@ -135,6 +135,10 @@ enum StartPoll {
 const IDLE_LIMIT: Duration = Duration::from_secs(30 * 60);
 /// How many of ffmpeg's last stderr lines are kept for error reports.
 const STDERR_TAIL_LINES: usize = 20;
+/// How often a playlist wait looks at how much ffmpeg has written.
+const PROGRESS_CHECK: Duration = Duration::from_millis(500);
+/// The longest a playlist wait runs, as a multiple of `playlist_wait`, however ffmpeg progresses.
+const MAX_WAIT_FACTOR: u32 = 10;
 
 // ---------------------------------------------------------------------------
 // Transcode manager
@@ -187,7 +191,8 @@ impl TranscodeManager {
     /// Start the HLS transcode of `input_path` for a request, or reuse the item's transcode of
     /// the same input file, the same play session (else device) and the same profile. Returns the
     /// playlist path and the playback id once ffmpeg has written the playlist. Fails when ffmpeg
-    /// exits first, or when no playlist appears within `playlist_wait`; ffmpeg then keeps running.
+    /// exits first, or when ffmpeg writes nothing for `playlist_wait` before the playlist (or the
+    /// wait reaches `MAX_WAIT_FACTOR` times that); ffmpeg then keeps running.
     /// A play session stopped less than `stop_memory` ago fails at once with `Stopped`.
     pub async fn start_transcode(
         &self,
@@ -223,8 +228,15 @@ impl TranscodeManager {
             }
         };
 
-        // Poll without the lock, so other requests can start their transcodes meanwhile
-        let deadline = std::time::Instant::now() + self.playlist_wait;
+        // Poll without the lock, so other requests can start their transcodes meanwhile. The
+        // wait runs while ffmpeg makes progress, as Jellyfin waits while its transcode runs: each
+        // time its output grows, the wait starts again. A slow transcode (a burn-in slower than
+        // real time) still gets its first segment out; one that writes nothing for
+        // `playlist_wait`, or none in `MAX_WAIT_FACTOR` times that, times out.
+        let started = std::time::Instant::now();
+        let mut last_progress = started;
+        let mut written = 0;
+        let mut next_check = started + PROGRESS_CHECK;
         loop {
             match self.poll_session(playback_id) {
                 StartPoll::Ready(playlist) => return Ok((playlist, playback_id)),
@@ -236,11 +248,43 @@ impl TranscodeManager {
                 }
                 StartPoll::Running => {}
             }
-            if std::time::Instant::now() >= deadline {
+            let now = std::time::Instant::now();
+            if now >= next_check {
+                next_check = now + PROGRESS_CHECK;
+                let size = self.output_bytes(playback_id).await;
+                if size > written {
+                    written = size;
+                    last_progress = now;
+                }
+            }
+            if now.duration_since(last_progress) >= self.playlist_wait
+                || now.duration_since(started) >= self.playlist_wait * MAX_WAIT_FACTOR
+            {
                 return Err(TranscodeError::PlaylistTimeout);
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+    }
+
+    /// The bytes ffmpeg has written so far in the session's directory; 0 when it is gone.
+    async fn output_bytes(&self, playback_id: Uuid) -> u64 {
+        let Some(dir) = self
+            .sessions
+            .get(&playback_id)
+            .map(|session| session.output_dir.clone())
+        else {
+            return 0;
+        };
+        let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
+            return 0;
+        };
+        let mut total = 0;
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if let Ok(meta) = entry.metadata().await {
+                total += meta.len();
+            }
+        }
+        total
     }
 
     /// The item's session of `input_path` that a request with these names reuses.
@@ -1892,6 +1936,29 @@ exit 1
     /// Never writes a playlist.
     const FAKE_SLOW: &str = "#!/bin/sh\nexec sleep 30\n";
 
+    /// Writes its first segment slowly, a little every 0.3 s for 3 s, then the playlist: a
+    /// transcode slower than real time that still makes progress.
+    const FAKE_PROGRESSING: &str = r#"#!/bin/sh
+for last; do :; done
+dir=$(dirname "$last")
+i=0
+while [ "$i" -lt 10 ]; do
+    printf 'chunk' >> "$dir/segment_0000.ts"
+    sleep 0.3
+    i=$((i + 1))
+done
+printf '#EXTM3U\n#EXTINF:6.0,\nsegment_0000.ts\n' > "$last"
+exec sleep 30
+"#;
+
+    /// Writes a little of its first segment, then nothing more.
+    const FAKE_STALLED: &str = r#"#!/bin/sh
+for last; do :; done
+dir=$(dirname "$last")
+printf 'chunk' > "$dir/segment_0000.ts"
+exec sleep 30
+"#;
+
     /// Writes about 260 KiB to stderr before its playlist; with stderr piped and never read it
     /// blocks for good once the 64 KiB pipe is full.
     const FAKE_NOISY: &str = r#"#!/bin/sh
@@ -1922,6 +1989,8 @@ exec sleep 30
                 ("fail", FAKE_FAIL),
                 ("slow", FAKE_SLOW),
                 ("noisy", FAKE_NOISY),
+                ("progressing", FAKE_PROGRESSING),
+                ("stalled", FAKE_STALLED),
             ] {
                 // Rename into place: another test process may be running the old file.
                 let tmp = dir.join(format!("{name}.{}", std::process::id()));
@@ -2269,6 +2338,39 @@ exec sleep 30
             "{retry:?}"
         );
         assert_eq!(mgr.sessions.len(), 1);
+        mgr.stop_all().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_playlist_wait_runs_while_ffmpeg_makes_progress() {
+        // Its first segment takes 3 s, three times the wait; it grows all the while
+        let (_dir, mgr) = fake_manager("progressing", Duration::from_secs(1));
+        let item = Uuid::new_v4();
+        let started = std::time::Instant::now();
+        let (playlist, _) = start(&mgr, item, "psid", "").await.unwrap();
+        assert!(playlist.ends_with("main.m3u8"));
+        assert!(
+            started.elapsed() >= Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        mgr.stop_all().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_playlist_wait_ends_when_ffmpeg_stops_writing() {
+        let (_dir, mgr) = fake_manager("stalled", Duration::from_secs(1));
+        let item = Uuid::new_v4();
+        let started = std::time::Instant::now();
+        let err = start(&mgr, item, "psid", "").await.unwrap_err();
+        let waited = started.elapsed();
+        assert!(matches!(err, TranscodeError::PlaylistTimeout), "{err:?}");
+        assert!(
+            waited >= Duration::from_secs(1) && waited < Duration::from_secs(4),
+            "{waited:?}"
+        );
         mgr.stop_all().await;
     }
 
