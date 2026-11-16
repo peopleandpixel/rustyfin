@@ -41,12 +41,10 @@ async fn main() {
         .map(|v| v == "1" || v == "true")
         .unwrap_or(false);
 
-    // The live log keeps the last lines (RUSTYFIN_LOG_HISTORY, default 1000) for a view that
-    // opens later.
-    let log_history = std::env::var("RUSTYFIN_LOG_HISTORY")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(log_stream::DEFAULT_LOG_HISTORY);
+    // The live log keeps the last lines (RUSTYFIN_LOG_HISTORY, default 1000, at most 100,000) for
+    // a view that opens later. A bad value is logged once the logger is up.
+    let (log_history, log_history_warning) =
+        log_stream::history_size(std::env::var("RUSTYFIN_LOG_HISTORY").ok().as_deref());
     let live_log = log_stream::LogHistory::new(log_history);
     let log_layer = LogStreamLayer::new(live_log.clone());
 
@@ -66,6 +64,9 @@ async fn main() {
             .finish()
             .with(log_layer)
             .init();
+    }
+    if let Some(warning) = log_history_warning {
+        tracing::warn!("{warning}");
     }
 
     let data_dir = data_dir();

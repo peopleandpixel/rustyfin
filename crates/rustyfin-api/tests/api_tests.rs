@@ -19698,6 +19698,7 @@ async fn b103_log_reaches(state: &AppState, socket: &mut G1cSocket) -> bool {
         level: "INFO".to_string(),
         message: "b103: a server log line".to_string(),
         target: None,
+        seq: None,
     };
     state
         .ws_broadcast
@@ -28787,6 +28788,7 @@ async fn g1c_session_events_reach_only_their_owner_and_admins() {
         level: "INFO".to_string(),
         message: format!("g1c: a log line naming {owner_id}"),
         target: None,
+        seq: None,
     };
     let events = [
         WsEvent::SessionChanged {
@@ -30296,6 +30298,7 @@ fn r3livelog_line(message: &str) -> rustyfin_model::ws_event::LogMessageData {
         level: "INFO".to_string(),
         message: message.to_string(),
         target: Some("rustyfin_core::scanner".to_string()),
+        seq: None,
     }
 }
 
@@ -30345,6 +30348,63 @@ async fn r3livelog_socket_replays_the_history_before_new_lines() {
     };
     state.ws_broadcast.send(marker).unwrap();
     assert_eq!(other.until_end().await, Vec::<String>::new());
+}
+
+/// Pushes a log line, then the "g1c-end" marker after the line has had time to arrive, and says
+/// whether `socket` got the line.
+async fn r3livelog_reaches(state: &AppState, socket: &mut G1cSocket, message: &str) -> bool {
+    state.live_log.push(r3livelog_line(message));
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let marker = WsEvent::LibraryChanged {
+        data: serde_json::json!({ "LibraryName": "g1c-end" }),
+    };
+    state.ws_broadcast.send(marker).unwrap();
+    socket
+        .until_end()
+        .await
+        .iter()
+        .any(|frame| frame == "LogMessage")
+}
+
+// A demoted administrator's live log stops once the socket rechecks the token, every 5 s.
+#[tokio::test]
+async fn r3livelog_a_demoted_administrator_stops_getting_lines() {
+    let t = b103().await;
+    let addr = b17_serve(&t.app).await;
+    let mut socket = G1cSocket::open(addr, &t.ada).await;
+    r3tasks_send(&mut socket, r#"{"MessageType":"LiveLogStart"}"#).await;
+    assert!(
+        r3livelog_reaches(&t.state, &mut socket, "before").await,
+        "an administrator's live log gets new lines"
+    );
+
+    let demote = serde_json::json!({ "IsAdministrator": false });
+    assert_eq!(
+        t.policy(&t.owner, &t.ada_id, demote).await.0,
+        StatusCode::OK
+    );
+    // The socket rechecks its token every 5 s; allow three rounds.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    while r3livelog_reaches(&t.state, &mut socket, "after").await {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "ada's live log still gets lines 15 s after her demotion"
+        );
+    }
+}
+
+// POST /System/LogLevel stores the live log's level, and GET gives it back.
+#[tokio::test]
+async fn r3livelog_log_level_post_is_kept() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, _, _) = g1_owner_and_viewer(&state, &app).await;
+    let body = r#"{"LogLevel":"Debug"}"#;
+    let (status, answer) = send_authed(&app, "POST", "/System/LogLevel", &owner, Some(body)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{answer}");
+    let (status, level) = send_authed(&app, "GET", "/System/LogLevel", &owner, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(level, serde_json::json!({ "LogLevel": "debug" }));
 }
 
 // The live log view's rows, level filter, cap and scrolling (tests/web/r3livelog_view.mjs).

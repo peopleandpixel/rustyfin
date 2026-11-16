@@ -81,6 +81,10 @@ pub struct LogMessageData {
     /// Target module (optional)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
+    /// The line's place in the server's log, increasing by one per line; the live log view clears
+    /// up to it. None for a line that is not in the log, such as a "lines skipped" notice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
 }
 
 /// The `Data` of a `RefreshProgress` event: one library's scan.

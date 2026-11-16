@@ -16,6 +16,16 @@ use rustyfin_model::ws_event::LogMessageData;
 /// another count.
 pub const DEFAULT_LOG_HISTORY: usize = 1000;
 
+/// The most lines `RUSTYFIN_LOG_HISTORY` may keep.
+pub const MAX_LOG_HISTORY: usize = 100_000;
+
+/// The longest message a line keeps, in bytes; a longer one is cut at a character boundary and
+/// ends in [`TRUNCATED`].
+pub const MAX_MESSAGE_BYTES: usize = 8 * 1024;
+
+/// The end of a message cut at [`MAX_MESSAGE_BYTES`].
+pub const TRUNCATED: &str = "…(truncated)";
+
 /// The live lines a view may fall behind by before it misses some; it is then told how many.
 const LIVE_CAPACITY: usize = 1024;
 
@@ -25,29 +35,45 @@ const LIVE_CAPACITY: usize = 1024;
 /// pushes log lines out of a view's queue.
 #[derive(Clone)]
 pub struct LogHistory {
-    lines: Arc<Mutex<VecDeque<LogMessageData>>>,
+    ring: Arc<Mutex<Ring>>,
     capacity: usize,
     tx: broadcast::Sender<LogMessageData>,
 }
 
+struct Ring {
+    lines: VecDeque<LogMessageData>,
+    /// The next line's `Seq`
+    next_seq: u64,
+}
+
 impl LogHistory {
+    /// A history of up to `capacity` lines, at most [`MAX_LOG_HISTORY`].
     pub fn new(capacity: usize) -> Self {
         let (tx, _) = broadcast::channel(LIVE_CAPACITY);
         Self {
-            lines: Arc::new(Mutex::new(VecDeque::with_capacity(capacity))),
-            capacity,
+            ring: Arc::new(Mutex::new(Ring {
+                lines: VecDeque::new(),
+                // Starts at the time in microseconds, so a restarted server's lines still number
+                // after the ones a view saw before the restart.
+                next_seq: Utc::now().timestamp_micros().max(0) as u64,
+            })),
+            capacity: capacity.min(MAX_LOG_HISTORY),
             tx,
         }
     }
 
-    /// Keeps `line` in the history and sends it to the connected views.
-    pub fn push(&self, line: LogMessageData) {
-        let mut lines = self.lines.lock().unwrap_or_else(|e| e.into_inner());
+    /// Numbers `line`, cuts its message to [`MAX_MESSAGE_BYTES`], keeps it in the history and
+    /// sends it to the connected views.
+    pub fn push(&self, mut line: LogMessageData) {
+        truncate_message(&mut line.message);
+        let mut ring = self.ring.lock().unwrap_or_else(|e| e.into_inner());
+        line.seq = Some(ring.next_seq);
+        ring.next_seq += 1;
         if self.capacity > 0 {
-            if lines.len() == self.capacity {
-                lines.pop_front();
+            if ring.lines.len() == self.capacity {
+                ring.lines.pop_front();
             }
-            lines.push_back(line.clone());
+            ring.lines.push_back(line.clone());
         }
         // Sent under the lock, so that `subscribe` sees each line in its history or on its
         // receiver, never in both and never in neither.
@@ -56,8 +82,44 @@ impl LogHistory {
 
     /// The lines kept so far, oldest first, and a receiver for the lines after them.
     pub fn subscribe(&self) -> (Vec<LogMessageData>, broadcast::Receiver<LogMessageData>) {
-        let lines = self.lines.lock().unwrap_or_else(|e| e.into_inner());
-        (lines.iter().cloned().collect(), self.tx.subscribe())
+        let ring = self.ring.lock().unwrap_or_else(|e| e.into_inner());
+        (ring.lines.iter().cloned().collect(), self.tx.subscribe())
+    }
+}
+
+/// Cuts `message` to [`MAX_MESSAGE_BYTES`] at a character boundary and marks the cut.
+fn truncate_message(message: &mut String) {
+    if message.len() <= MAX_MESSAGE_BYTES {
+        return;
+    }
+    let mut end = MAX_MESSAGE_BYTES;
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    message.truncate(end);
+    message.push_str(TRUNCATED);
+}
+
+/// The history size `RUSTYFIN_LOG_HISTORY` asks for, clamped to [`MAX_LOG_HISTORY`], and a
+/// warning to log when the value is not a number or is clamped.
+pub fn history_size(value: Option<&str>) -> (usize, Option<String>) {
+    let Some(value) = value else {
+        return (DEFAULT_LOG_HISTORY, None);
+    };
+    match value.trim().parse::<usize>() {
+        Ok(n) if n > MAX_LOG_HISTORY => (
+            MAX_LOG_HISTORY,
+            Some(format!(
+                "RUSTYFIN_LOG_HISTORY={n} is more than {MAX_LOG_HISTORY}; keeping {MAX_LOG_HISTORY} log lines"
+            )),
+        ),
+        Ok(n) => (n, None),
+        Err(_) => (
+            DEFAULT_LOG_HISTORY,
+            Some(format!(
+                "RUSTYFIN_LOG_HISTORY={value:?} is not a number of lines; keeping {DEFAULT_LOG_HISTORY}"
+            )),
+        ),
     }
 }
 
@@ -74,6 +136,7 @@ pub fn skipped_line(count: u64) -> LogMessageData {
         level: "WARN".to_string(),
         message: format!("{count} log lines skipped: the live log fell behind"),
         target: Some(module_path!().to_string()),
+        seq: None,
     }
 }
 
@@ -267,6 +330,7 @@ where
             level: level_name(meta.level()).to_string(),
             message,
             target: Some(meta.target().to_string()),
+            seq: None,
         });
     }
 }
@@ -383,5 +447,38 @@ mod tests {
         assert_eq!(level_name_for(None), "trace");
         let filter = tracing_subscriber::EnvFilter::new("warn,rustyfin_core=debug");
         assert_eq!(level_name_for(filter.max_level_hint()), "debug");
+    }
+
+    #[test]
+    fn r3livelog_lines_are_numbered_in_order_and_long_messages_cut() {
+        let history = LogHistory::new(10);
+        let long = "é".repeat(MAX_MESSAGE_BYTES); // two bytes each
+        let subscriber = tracing_subscriber::registry().with(LogStreamLayer::new(history.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("short");
+            tracing::info!("{long}");
+        });
+        let (lines, _) = history.subscribe();
+        let (first, second) = (lines[0].seq.unwrap(), lines[1].seq.unwrap());
+        assert_eq!(second, first + 1);
+        assert_eq!(lines[0].message, "short");
+        let cut = &lines[1].message;
+        assert!(cut.ends_with(TRUNCATED), "{}", &cut[cut.len() - 20..]);
+        assert_eq!(cut.len(), MAX_MESSAGE_BYTES + TRUNCATED.len());
+        assert!(cut.starts_with("éé"));
+    }
+
+    #[test]
+    fn r3livelog_history_size_is_clamped_and_a_bad_value_warns() {
+        assert_eq!(history_size(None), (DEFAULT_LOG_HISTORY, None));
+        assert_eq!(history_size(Some("250")), (250, None));
+        assert_eq!(history_size(Some("0")), (0, None));
+        let (n, warning) = history_size(Some("5000000"));
+        assert_eq!(n, MAX_LOG_HISTORY);
+        assert!(warning.unwrap().contains("100000"));
+        let (n, warning) = history_size(Some("lots"));
+        assert_eq!(n, DEFAULT_LOG_HISTORY);
+        assert!(warning.unwrap().contains("\"lots\""));
+        assert_eq!(LogHistory::new(usize::MAX).capacity, MAX_LOG_HISTORY);
     }
 }

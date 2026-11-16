@@ -705,12 +705,9 @@ async fn set_log_level(
     let level = req.LogLevel.to_lowercase();
     match level.as_str() {
         "trace" | "debug" | "info" | "warn" | "error" => {
-            let level_clone = level.clone();
-            state
-                .log_level_tx
-                .send(level)
-                .map_err(|e| ApiError::Internal(format!("Failed to update log level: {}", e)))?;
-            tracing::info!(level = ?level_clone, "log level updated");
+            // send_replace stores the level also when no one watches it; send would fail then.
+            state.log_level_tx.send_replace(level.clone());
+            tracing::info!(level = ?level, "log level updated");
             Ok(StatusCode::NO_CONTENT)
         }
         _ => Err(ApiError::BadRequest(format!(
