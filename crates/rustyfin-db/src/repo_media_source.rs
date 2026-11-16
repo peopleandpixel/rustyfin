@@ -521,6 +521,23 @@ pub async fn delete_media_source(pool: &SqlitePool, source_id: &Uuid) -> Result<
     Ok(())
 }
 
+/// Deletes the external subtitle stream that reads `path` from an item's sources.
+pub async fn delete_external_stream(
+    pool: &SqlitePool,
+    item_id: &Uuid,
+    path: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "DELETE FROM media_streams WHERE is_external = 1 AND path = ? \
+         AND source_id IN (SELECT id FROM media_sources WHERE item_id = ?)",
+    )
+    .bind(path)
+    .bind(item_id.to_string())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Insert one media source and all its streams on an open connection. Returns the source ID.
 async fn insert_source_with_streams(
     conn: &mut sqlx::SqliteConnection,

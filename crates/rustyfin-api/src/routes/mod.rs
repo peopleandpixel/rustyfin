@@ -12,6 +12,7 @@ mod dlna_streaming;
 mod dynamic_hls;
 mod encoding_manager;
 mod images;
+mod item_download;
 pub(crate) mod items;
 mod jellyfin_import;
 pub(crate) mod library;
@@ -125,6 +126,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(library::routes())
         .merge(items::routes())
         .merge(images::routes())
+        .merge(item_download::routes())
         .merge(quick_connect::routes())
         .merge(
             streaming::routes()

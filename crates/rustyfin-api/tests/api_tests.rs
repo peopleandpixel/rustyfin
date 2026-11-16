@@ -48037,3 +48037,410 @@ async fn r3admin_restart_stops_with_the_restart_exit_code() {
 fn r3admin_web_dashboard() {
     b124_node_test("r3admin_dashboard.mjs");
 }
+
+// R3 item pages 2: download, the metadata editor's provider ids, and subtitle upload and delete.
+
+#[test]
+fn r3item2_web() {
+    b124_node_test("r3item2_web.mjs");
+}
+
+/// A library in the test's data dir with one movie whose file holds 4000 known bytes, and one
+/// series (a folder). Returns the library folder, the movie, the series and the file's bytes.
+async fn r3item2_library(
+    state: &AppState,
+) -> (std::path::PathBuf, uuid::Uuid, uuid::Uuid, Vec<u8>) {
+    let library = std::path::PathBuf::from(media_folder(state, "r3item2"));
+    std::fs::create_dir_all(library.join("Quill Harbor (2031)")).unwrap();
+    let bytes: Vec<u8> = (0..4000u32).map(|i| (i % 251) as u8).collect();
+    let file = library.join("Quill Harbor (2031)/Quill Harbor (2031).mkv");
+    std::fs::write(&file, &bytes).unwrap();
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: "R3 item pages".to_string(),
+        content_type: rustyfin_model::library::LibraryContentType::Movies,
+        paths: vec![library.to_str().unwrap().to_string()],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    let mut ids = Vec::new();
+    for (media_type, path) in [
+        ("Movie", file.clone()),
+        ("Series", library.join("Some Series")),
+    ] {
+        let id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO media_items (id, library_id, name, media_type, path) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(id.to_string())
+        .bind(lib.id.to_string())
+        .bind("Quill Harbor")
+        .bind(media_type)
+        .bind(path.to_str().unwrap())
+        .execute(&state.db)
+        .await
+        .unwrap();
+        ids.push(id);
+    }
+    // The movie's source, for the streams an upload adds
+    let source = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO media_sources (id, item_id, uid, container, path) VALUES (?, ?, ?, 'mkv', ?)",
+    )
+    .bind(source.to_string())
+    .bind(ids[0].to_string())
+    .bind(source.simple().to_string())
+    .bind(file.to_str().unwrap())
+    .execute(&state.db)
+    .await
+    .unwrap();
+    (library, ids[0], ids[1], bytes)
+}
+
+/// Sends a request and returns the status, the response headers and the body.
+async fn r3item2_send(
+    app: &axum::Router,
+    method: &str,
+    uri: &str,
+    token: &str,
+    body: Option<serde_json::Value>,
+) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+    let resp = app
+        .clone()
+        .oneshot(request(method, uri, Some(token), body))
+        .await
+        .unwrap();
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let bytes = resp
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .to_vec();
+    (status, headers, bytes)
+}
+
+fn r3item2_json(bytes: &[u8]) -> serde_json::Value {
+    serde_json::from_slice(bytes).unwrap_or(serde_json::Value::Null)
+}
+
+/// `/Items/{id}/Download`: the file with an attachment name and byte ranges for a user with
+/// EnableContentDownloading (on for a new user, as in Jellyfin), `CanDownload` on the item, 400
+/// for a folder, 404 for an unknown item, 403 once the policy is off, and the activity log entry.
+#[tokio::test]
+async fn r3item2_download_follows_the_policy() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, viewer, viewer_id) = g1_owner_and_viewer(&state, &app).await;
+    let (_, movie, series, bytes) = r3item2_library(&state).await;
+
+    let (_, _, user) =
+        r3item2_send(&app, "GET", &format!("/Users/{viewer_id}"), &viewer, None).await;
+    assert_eq!(
+        r3item2_json(&user)["Policy"]["EnableContentDownloading"],
+        true
+    );
+    let (_, _, item) = r3item2_send(&app, "GET", &format!("/Items/{movie}"), &viewer, None).await;
+    assert_eq!(r3item2_json(&item)["CanDownload"], true);
+    let (_, _, folder) =
+        r3item2_send(&app, "GET", &format!("/Items/{series}"), &viewer, None).await;
+    assert_eq!(r3item2_json(&folder)["CanDownload"], false);
+
+    let uri = format!("/Items/{movie}/Download");
+    let (status, headers, body) = r3item2_send(&app, "GET", &uri, &viewer, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, bytes);
+    let disposition = headers["content-disposition"].to_str().unwrap();
+    assert!(disposition.starts_with("attachment;"), "{disposition}");
+    assert!(
+        disposition.contains("filename=\"Quill Harbor (2031).mkv\""),
+        "{disposition}"
+    );
+    let (status, range, part) = g4_get_range(&app, &uri, &viewer, "bytes=10-19").await;
+    assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(range.as_deref(), Some("bytes 10-19/4000"));
+    assert_eq!(part, bytes[10..20]);
+
+    let (status, _, _) = r3item2_send(
+        &app,
+        "GET",
+        &format!("/Items/{series}/Download"),
+        &viewer,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let unknown = format!("/Items/{}/Download", uuid::Uuid::new_v4());
+    let (status, _, _) = r3item2_send(&app, "GET", &unknown, &viewer, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (_, _, log) = r3item2_send(&app, "GET", "/System/ActivityLog/Entries", &owner, None).await;
+    let log = r3item2_json(&log);
+    assert!(
+        log["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["Type"] == "UserDownloadingContent"),
+        "{log}"
+    );
+
+    // The administrator turns downloading off for the viewer
+    let (status, _, _) = r3item2_send(
+        &app,
+        "POST",
+        &format!("/Users/{viewer_id}/Policy"),
+        &owner,
+        Some(serde_json::json!({ "EnableContentDownloading": false })),
+    )
+    .await;
+    assert!(status.is_success(), "{status}");
+    let (status, _, _) = r3item2_send(&app, "GET", &uri, &viewer, None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (_, _, item) = r3item2_send(&app, "GET", &format!("/Items/{movie}"), &viewer, None).await;
+    assert_eq!(r3item2_json(&item)["CanDownload"], false);
+    let (_, _, user) =
+        r3item2_send(&app, "GET", &format!("/Users/{viewer_id}"), &viewer, None).await;
+    assert_eq!(
+        r3item2_json(&user)["Policy"]["EnableContentDownloading"],
+        false
+    );
+    // The owner still may
+    let (status, _, _) = r3item2_send(&app, "GET", &uri, &owner, None).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+/// The metadata editor's ProviderIds, EndDate, Studios and People save; a blank id clears it and
+/// a TMDb id that isn't a number is refused; `/Items/{id}/MetadataEditor` lists the ids to edit.
+#[tokio::test]
+async fn r3item2_editor_saves_provider_ids_and_lists_them() {
+    let server = g12_server(None, None).await;
+    let id = server.insert_movie().await;
+    let (status, body) = server
+        .send(
+            "POST",
+            &format!("/Items/{id}"),
+            Some(
+                serde_json::json!({
+                    "ProviderIds": { "Tmdb": "424242", "Imdb": "tt7654321" },
+                    "EndDate": "2032-02-03T00:00:00.0000000Z",
+                    "Studios": [{ "Name": "Lantern Works" }],
+                    "People": [{ "Name": "Pat Example", "Role": "Keeper", "Type": "Actor" }],
+                })
+                .to_string(),
+            ),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let (_, text) = server.send("GET", &format!("/Items/{id}"), None).await;
+    let dto: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(dto["ProviderIds"]["Tmdb"], "424242", "{dto}");
+    assert_eq!(dto["ProviderIds"]["Imdb"], "tt7654321");
+    assert!(dto["EndDate"].as_str().unwrap().starts_with("2032-02-03"));
+    assert_eq!(dto["Studios"][0]["Name"], "Lantern Works");
+    assert_eq!(dto["People"][0]["Name"], "Pat Example");
+    assert_eq!(dto["People"][0]["Role"], "Keeper");
+
+    // A blank id clears it, a missing one too; another field leaves them alone
+    let (status, _) = server
+        .send(
+            "POST",
+            &format!("/Items/{id}"),
+            Some(serde_json::json!({ "ProviderIds": { "Imdb": "  " } }).to_string()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, text) = server.send("GET", &format!("/Items/{id}"), None).await;
+    let dto: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(dto["ProviderIds"], serde_json::json!({}), "{dto}");
+    assert_eq!(server.item(id).await.tmdb_id, None);
+
+    let (status, _) = server
+        .send(
+            "POST",
+            &format!("/Items/{id}"),
+            Some(serde_json::json!({ "ProviderIds": { "Tmdb": "abc" } }).to_string()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let editor = server
+        .json(
+            "GET",
+            &format!("/Items/{id}/MetadataEditor"),
+            serde_json::Value::Null,
+        )
+        .await;
+    let keys: Vec<&str> = editor["ExternalIdInfos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|info| info["Key"].as_str().unwrap())
+        .collect();
+    assert_eq!(keys, ["Tmdb", "Imdb"], "{editor}");
+    assert!(
+        !editor["ParentalRatingOptions"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(!editor["Cultures"].as_array().unwrap().is_empty());
+    assert!(!editor["Countries"].as_array().unwrap().is_empty());
+    assert_eq!(editor["ContentTypeOptions"], serde_json::json!([]));
+}
+
+/// Subtitle upload saves `<video>.<lang>[.forced].<ext>` beside the video (a taken name gets a
+/// counter) and adds the stream; delete removes the file and the stream; the remote search is
+/// Jellyfin's empty list (no provider) and a remote download 404s; all of them are admin-only.
+#[tokio::test]
+async fn r3item2_subtitle_upload_delete_and_search() {
+    use base64::Engine as _;
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, viewer, _) = g1_owner_and_viewer(&state, &app).await;
+    let (library, movie, series, _) = r3item2_library(&state).await;
+    let folder = library.join("Quill Harbor (2031)");
+    let srt = "1\n00:00:01,000 --> 00:00:02,000\nHello\n";
+    let upload = serde_json::json!({
+        "Language": "eng",
+        "Format": "srt",
+        "IsForced": true,
+        "IsHearingImpaired": false,
+        "Data": base64::engine::general_purpose::STANDARD.encode(srt),
+    });
+    let uri = format!("/Videos/{movie}/Subtitles");
+
+    let (status, _, _) = r3item2_send(&app, "POST", &uri, &viewer, Some(upload.clone())).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    for _ in 0..2 {
+        let (status, _, body) =
+            r3item2_send(&app, "POST", &uri, &owner, Some(upload.clone())).await;
+        assert_eq!(
+            status,
+            StatusCode::NO_CONTENT,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+    let first = folder.join("Quill Harbor (2031).eng.forced.srt");
+    let second = folder.join("Quill Harbor (2031).eng.forced.1.srt");
+    assert_eq!(std::fs::read_to_string(&first).unwrap(), srt);
+    assert!(second.is_file());
+
+    let externals = |sources: Vec<rustyfin_model::media_source::MediaSourceResponse>| {
+        sources[0]
+            .media_streams
+            .iter()
+            .filter(|s| s.is_external)
+            .map(|s| {
+                (
+                    s.language.clone().unwrap_or_default(),
+                    s.is_forced,
+                    s.path.clone().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let streams = externals(
+        rustyfin_db::repo_media_source::get_media_sources(&state.db, &movie)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(streams.len(), 2, "{streams:?}");
+    assert!(
+        streams
+            .iter()
+            .all(|(lang, forced, _)| lang == "eng" && *forced)
+    );
+
+    // Refused: a format the scan doesn't read, a language with a path in it, a folder item
+    for (body, target) in [
+        (
+            serde_json::json!({"Language": "eng", "Format": "exe", "Data": "aGk="}),
+            movie,
+        ),
+        (
+            serde_json::json!({"Language": "../x", "Format": "srt", "Data": "aGk="}),
+            movie,
+        ),
+        (
+            serde_json::json!({"Language": "eng", "Format": "srt", "Data": "not base64!"}),
+            movie,
+        ),
+        (upload.clone(), series),
+    ] {
+        let (status, _, _) = r3item2_send(
+            &app,
+            "POST",
+            &format!("/Videos/{target}/Subtitles"),
+            &owner,
+            Some(body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    // Stream 0, the first external file, as PlaybackInfo numbers it
+    let (status, _, _) = r3item2_send(
+        &app,
+        "DELETE",
+        &format!("/Videos/{movie}/Subtitles/0"),
+        &viewer,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _, body) = r3item2_send(
+        &app,
+        "DELETE",
+        &format!("/Videos/{movie}/Subtitles/0"),
+        &owner,
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    let left = externals(
+        rustyfin_db::repo_media_source::get_media_sources(&state.db, &movie)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(left.len(), 1, "{left:?}");
+    let gone = streams
+        .iter()
+        .find(|(_, _, path)| !left.iter().any(|(_, _, kept)| kept == path))
+        .unwrap();
+    assert!(!std::path::Path::new(&gone.2).exists());
+    let (status, _, _) = r3item2_send(
+        &app,
+        "DELETE",
+        &format!("/Videos/{movie}/Subtitles/7"),
+        &owner,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let search = format!("/Items/{movie}/RemoteSearch/Subtitles/eng");
+    let (status, _, body) = r3item2_send(&app, "GET", &search, &owner, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(r3item2_json(&body), serde_json::json!([]));
+    let (status, _, _) = r3item2_send(&app, "GET", &search, &viewer, None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _, _) = r3item2_send(
+        &app,
+        "POST",
+        &format!("/Items/{movie}/RemoteSearch/Subtitles/some-id"),
+        &owner,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}

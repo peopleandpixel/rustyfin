@@ -1079,7 +1079,10 @@ async fn head_file(file_path: &str) -> Result<Response, ApiError> {
 
 /// Serves the file at `file_path` for a request with `headers`: the whole file, or the byte range,
 /// 304 or 416 that the headers ask for.
-async fn serve_file(file_path: String, headers: &HeaderMap) -> Result<Response, ApiError> {
+pub(crate) async fn serve_file(
+    file_path: String,
+    headers: &HeaderMap,
+) -> Result<Response, ApiError> {
     let content_type = mime_from_path(&file_path);
 
     // Open file first, then get metadata from the file handle — avoids a separate stat() syscall

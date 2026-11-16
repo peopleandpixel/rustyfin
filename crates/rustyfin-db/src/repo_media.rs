@@ -3629,6 +3629,23 @@ pub async fn set_imdb_id_if_missing(
     Ok(done.rows_affected() > 0)
 }
 
+/// Sets an item's IMDb id, as the metadata editor saves it; `None` clears it.
+pub async fn set_imdb_id(
+    pool: &SqlitePool,
+    item_id: uuid::Uuid,
+    imdb_id: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO item_metadata_extras (item_id, imdb_id) VALUES (?, ?) \
+         ON CONFLICT(item_id) DO UPDATE SET imdb_id = excluded.imdb_id",
+    )
+    .bind(item_id.to_string())
+    .bind(imdb_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Records that a metadata provider answered for these items now (`provider_refreshed_at`).
 pub async fn mark_provider_refreshed(
     pool: &SqlitePool,
