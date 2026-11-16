@@ -52,6 +52,9 @@ pub struct UserDto {
     /// Jellyfin's `UserPolicy` (`jellyfin_policy`).
     #[serde(default)]
     pub policy: serde_json::Value,
+    /// The profile picture's tag, left out when the user has none, as in Jellyfin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_image_tag: Option<String>,
 }
 
 impl UserDto {
@@ -72,6 +75,7 @@ impl UserDto {
             last_login_date: u.last_login_date,
             configuration: jellyfin_configuration(&u.configuration),
             policy: jellyfin_policy(u.is_administrator, flags.is_disabled, parental),
+            primary_image_tag: None,
         }
     }
 }
@@ -173,6 +177,9 @@ pub fn jellyfin_configuration(stored: &serde_json::Value) -> serde_json::Value {
 pub struct PublicUserDto {
     pub id: Uuid,
     pub name: String,
+    /// The profile picture's tag, left out when the user has none, as in Jellyfin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_image_tag: Option<String>,
 }
 
 impl From<User> for PublicUserDto {
@@ -180,6 +187,7 @@ impl From<User> for PublicUserDto {
         Self {
             id: u.id,
             name: u.name,
+            primary_image_tag: None,
         }
     }
 }

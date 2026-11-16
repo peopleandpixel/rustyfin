@@ -192,8 +192,18 @@ pub(crate) async fn start_session(
             Default::default()
         });
 
+    let primary_image_tag = super::users::primary_image_tag(&state.db, user.id)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "could not read the user's picture for the sign-in answer");
+            None
+        });
+
     AuthResponse {
-        user: UserDto::new(user, flags, &state.server_id, &parental),
+        user: UserDto {
+            primary_image_tag,
+            ..UserDto::new(user, flags, &state.server_id, &parental)
+        },
         session_info,
         access_token: token,
         server_id: state.server_id.to_string(),

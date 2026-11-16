@@ -666,7 +666,8 @@ pub async fn get_user_images(
     Ok(rows)
 }
 
-/// Save a user image
+/// Saves a user's image of `image_type`, replacing the one before. Returns the new row's id, which
+/// is the image's tag, and the files of the rows it replaced.
 pub async fn save_user_image(
     pool: &SqlitePool,
     user_id: Uuid,
@@ -674,9 +675,17 @@ pub async fn save_user_image(
     path: &str,
     width: Option<i32>,
     height: Option<i32>,
-) -> Result<String, sqlx::Error> {
-    let id = uuid::Uuid::new_v4().to_string();
+) -> Result<(String, Vec<String>), sqlx::Error> {
+    let id = uuid::Uuid::new_v4().simple().to_string();
     let uid = user_id.to_string();
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let old: Vec<String> = sqlx::query_scalar(
+        "DELETE FROM user_images WHERE user_id = ?1 AND image_type = ?2 RETURNING path",
+    )
+    .bind(&uid)
+    .bind(image_type)
+    .fetch_all(&mut *tx)
+    .await?;
     sqlx::query(
         "INSERT INTO user_images (id, user_id, image_type, path, width, height) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
     )
@@ -686,24 +695,56 @@ pub async fn save_user_image(
     .bind(path)
     .bind(width)
     .bind(height)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
-    Ok(id)
+    tx.commit().await?;
+    Ok((id, old))
 }
 
-/// Delete a user image
+/// Deletes a user's image of `image_type` and returns the files it had.
 pub async fn delete_user_image(
     pool: &SqlitePool,
     user_id: Uuid,
     image_type: &str,
-) -> Result<(), sqlx::Error> {
+) -> Result<Vec<String>, sqlx::Error> {
     let uid = user_id.to_string();
-    sqlx::query("DELETE FROM user_images WHERE user_id = ?1 AND image_type = ?2")
-        .bind(&uid)
-        .bind(image_type)
-        .execute(pool)
-        .await?;
-    Ok(())
+    sqlx::query_scalar(
+        "DELETE FROM user_images WHERE user_id = ?1 AND image_type = ?2 RETURNING path",
+    )
+    .bind(&uid)
+    .bind(image_type)
+    .fetch_all(pool)
+    .await
+}
+
+/// The file and tag of a user's image of `image_type`, if the user has one.
+pub async fn user_image(
+    pool: &SqlitePool,
+    user_id: Uuid,
+    image_type: &str,
+) -> Result<Option<(String, String)>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT path, id FROM user_images WHERE user_id = ?1 AND image_type = ?2
+         ORDER BY date_created DESC LIMIT 1",
+    )
+    .bind(user_id.to_string())
+    .bind(image_type)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Each user's primary image tag, for the users that have a profile picture.
+pub async fn primary_image_tags(
+    pool: &SqlitePool,
+) -> Result<std::collections::HashMap<Uuid, String>, sqlx::Error> {
+    let rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT user_id, id FROM user_images WHERE image_type = 'Primary'")
+            .fetch_all(pool)
+            .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(user, tag)| Some((Uuid::parse_str(&user).ok()?, tag)))
+        .collect())
 }
 
 /// Get user access schedules (parental control periods)

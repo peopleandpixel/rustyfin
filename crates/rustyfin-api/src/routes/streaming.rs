@@ -916,6 +916,8 @@ struct VideoPlaybackInfoQuery {
     width: Option<i32>,
     height: Option<i32>,
     max_streaming_bitrate: Option<u32>,
+    /// Jellyfin's SubtitleMethod: "Encode" asks for the subtitle to be burned in, text ones too
+    subtitle_method: Option<String>,
     segment_time: Option<u32>,
     profile: Option<String>,
     max_video_bit_depth: Option<u32>,
@@ -974,6 +976,7 @@ impl From<HashMap<String, String>> for VideoPlaybackInfoQuery {
             max_streaming_bitrate: params
                 .get("MaxStreamingBitrate")
                 .and_then(|v| v.parse().ok()),
+            subtitle_method: params.get("SubtitleMethod").cloned(),
             segment_time: params.get("SegmentTime").and_then(|v| v.parse().ok()),
             profile: params.get("Profile").cloned(),
             max_video_bit_depth: params.get("MaxVideoBitDepth").and_then(|v| v.parse().ok()),
@@ -1014,14 +1017,20 @@ fn track_needs(
         }
         _ => false,
     };
-    // Picture subtitles are burned in by the transcode, text ones are drawn by the browser
+    // Picture subtitles are burned in by the transcode, text ones are drawn by the browser unless
+    // the request asks for them burned in too (SubtitleMethod=Encode)
+    let encode = query
+        .subtitle_method
+        .as_deref()
+        .is_some_and(|method| method.eq_ignore_ascii_case("encode"));
     let burn_in = match query.subtitle_stream_index {
         Some(wanted) if wanted >= 0 => source.media_streams.iter().any(|s| {
             s.index == wanted
                 && is_stream_type(s, "Subtitle")
-                && s.codec
-                    .as_deref()
-                    .is_some_and(rustyfin_core::subtitle::is_image_subtitle)
+                && (encode
+                    || s.codec
+                        .as_deref()
+                        .is_some_and(rustyfin_core::subtitle::is_image_subtitle))
         }),
         _ => false,
     };
@@ -1101,13 +1110,15 @@ async fn video_universal(
         if let Some(source) = media_sources.get(index) {
             url.push_str(&format!("&MediaSourceId={}", source.id));
         }
-        if let Some(bitrate) = query.max_video_bitrate {
-            url.push_str(&format!("&VideoBitrate={}", bitrate));
-        } else if let Some(kbps) = streaming_video_kbps(
+        // The transcode's VideoBitrate is in kbps; Jellyfin's MaxVideoBitrate is in bits/s. With
+        // both limits the lower one wins.
+        let max_video_kbps = query.max_video_bitrate.map(|bps| (bps / 1000).max(1));
+        let streaming_kbps = streaming_video_kbps(
             query.max_streaming_bitrate,
             media_sources.get(index).and_then(|source| source.bitrate),
-        ) {
-            url.push_str(&format!("&VideoBitrate={}", kbps));
+        );
+        if let Some(bitrate) = [max_video_kbps, streaming_kbps].into_iter().flatten().min() {
+            url.push_str(&format!("&VideoBitrate={}", bitrate));
         }
         if let Some(bitrate) = query.max_audio_bitrate {
             url.push_str(&format!("&AudioBitrate={}", bitrate));
@@ -1227,9 +1238,18 @@ async fn video_playback_info(
         source.supports_transcoding = i == index && supports_transcoding;
     }
 
-    // The caller's remembered tracks become each source's defaults, where the source has them
+    // The caller's remembered tracks become each source's defaults, where the source has them and
+    // the user keeps Jellyfin's RememberAudioSelections and RememberSubtitleSelections on
     let (remembered_audio, remembered_subtitle) =
         rustyfin_db::repo_playback::get_stream_choice(&state.db_ro, claims.sub, id).await?;
+    let config = rustyfin_db::repo_user::get_user_by_id(&state.db_ro, claims.sub)
+        .await?
+        .map(|user| rustyfin_model::user::jellyfin_configuration(&user.configuration))
+        .unwrap_or_default();
+    let remembers = |key: &str| config.get(key).and_then(|v| v.as_bool()) != Some(false);
+    let remembered_audio = remembered_audio.filter(|_| remembers("RememberAudioSelections"));
+    let remembered_subtitle =
+        remembered_subtitle.filter(|_| remembers("RememberSubtitleSelections"));
     let media_sources: Vec<rustyfin_model::playback_info::PlaybackMediaSource> = media_sources
         .into_iter()
         .map(|source| {

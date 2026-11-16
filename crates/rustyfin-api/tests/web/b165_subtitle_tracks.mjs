@@ -76,6 +76,8 @@ function sandbox() {
          ${slice('function isStreamType(')}
          ${slice('function findStream(')}
          ${slice('function isImageSubtitle(')}
+         ${slice('function burnsIn(')}
+         function burnsInSubtitle(codec, isImage) { return isImage; } // the default burn-in mode
          ${slice('function playerSubtitleTrack(')}
          ${slice('function disableOtherTextTracks(')}
          ${slice('function clearTextSubtitle(')}

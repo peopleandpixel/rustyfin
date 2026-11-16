@@ -3,6 +3,7 @@
 // inline on*="" handlers (index.html and rendered markup) call as globals.
 import { $, toast } from './modules/util.js';
 import './modules/cards.js';
+import './modules/user-settings.js';
 import { navigate, toggleUserMenu, closeUserMenu, toggleSidebar } from './modules/router.js';
 import {
     wizSetUiLanguage, wizApplyPath, wizNext, wizPrev, wizSkipLibrary, wizFinishWithoutImport, wizComplete,
@@ -27,7 +28,10 @@ import {
 import './modules/playerprefs.js';
 import './modules/queue.js';
 import './modules/cardmenu.js';
-import { changeNextEpisodeAutoPlay, changeUiLanguage, handleSaveConfig } from './modules/settings.js';
+import {
+    changeNextEpisodeAutoPlay, changeUiLanguage, handleSaveConfig, changeUserConfig, changeUserPref, changeHomeSection,
+    changeSubtitleAppearance, changeLatestLibrary, chooseProfileImage, deleteProfileImage,
+} from './modules/settings.js';
 import { refreshTasks, openAddUser, closeAddUser, submitAddUser, clearLiveLog, setLogLevel } from './modules/admin.js';
 import {
     jiAddPair, jiForget, jiSetMine, jiSetChoice, jiSetConfirm, jiPreview, jiRun, jiNewCode, jiCopyCodes,
@@ -50,5 +54,6 @@ Object.assign(window, {
     jiNewCode, jiCopyCodes, refreshTasks, openAddLibrary, closeAddLibrary, submitAddLibrary, closeLibraryOptions,
     submitLibraryOptions, openAddUser, closeAddUser,
     submitAddUser, clearLiveLog, setLogLevel, closePluginConfig, savePluginConfig, closePluginPriority,
-    savePluginPriority,
+    savePluginPriority, changeUserConfig, changeUserPref, changeHomeSection, changeSubtitleAppearance, changeLatestLibrary,
+    chooseProfileImage, deleteProfileImage,
 });

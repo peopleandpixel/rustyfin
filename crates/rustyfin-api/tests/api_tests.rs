@@ -3257,6 +3257,7 @@ const B124_WEB_MODULES: &[&str] = &[
     "router.js",
     "search.js",
     "settings.js",
+    "user-settings.js",
     "util.js",
     "wizard.js",
 ];
@@ -24386,6 +24387,161 @@ async fn b171_user_configuration_keeps_next_episode_autoplay() {
     assert_eq!(saved["SubtitleMode"], "Always");
 }
 
+// R3 settings: profile pictures, as Jellyfin's /UserImage. A user sets their own (base64 body, as
+// Jellyfin Web sends it, or the raw file on the older /Users/{id}/Images/Primary), it is served
+// without sign-in, its tag is the user's PrimaryImageTag, and a new picture replaces the old file.
+#[tokio::test]
+async fn r3settings_profile_image() {
+    use base64::Engine as _;
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, owner_id, viewer, viewer_id) = g1_owner_and_viewer(&state, &app).await;
+    let png: &[u8] = b"\x89PNG\r\n\x1a\n-not-a-real-png-but-a-signature";
+    let jpeg: &[u8] = b"\xFF\xD8\xFF\xE0-jpeg-body";
+    let upload = |uri: String, token: &str, body: Vec<u8>| {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "image/png")
+            .body(Body::from(body))
+            .unwrap()
+    };
+    let me_tag = || async {
+        let (_, me) = send(&app, request("GET", "/Users/Me", Some(&viewer), None)).await;
+        me.get("PrimaryImageTag").cloned()
+    };
+    // An anonymous GET: status, content type, cache control and body
+    let fetch = |uri: String| {
+        let app = app.clone();
+        async move {
+            let resp = app.oneshot(request("GET", &uri, None, None)).await.unwrap();
+            let status = resp.status();
+            let header = |name: &str| {
+                resp.headers()
+                    .get(name)
+                    .map(|v| v.to_str().unwrap().to_string())
+            };
+            let (content_type, cache) = (header("content-type"), header("cache-control"));
+            let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+            (status, content_type, cache, bytes.to_vec())
+        }
+    };
+    let image = || async {
+        let (status, content_type, _, bytes) =
+            fetch(format!("/UserImage?userId={viewer_id}")).await;
+        (status, content_type, bytes)
+    };
+    let files = || {
+        let dir = state.data_dir.join("users").join(
+            uuid::Uuid::parse_str(&viewer_id)
+                .unwrap()
+                .simple()
+                .to_string(),
+        );
+        std::fs::read_dir(dir).map(|d| d.count()).unwrap_or(0)
+    };
+
+    assert_eq!(me_tag().await, None);
+    assert_eq!(image().await.0, StatusCode::NOT_FOUND);
+
+    let encoded = base64::engine::general_purpose::STANDARD.encode(png);
+    let uri = format!("/UserImage?userId={viewer_id}");
+    let (status, _) = send(&app, upload(uri.clone(), &viewer, encoded.into_bytes())).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let first = me_tag().await.expect("a tag after the upload");
+    let (status, content_type, bytes) = image().await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(content_type.as_deref(), Some("image/png"));
+    assert_eq!(bytes, png);
+    let (_, users) = send(&app, request("GET", "/Users", Some(&owner), None)).await;
+    let listed = users
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["Id"].as_str().unwrap().replace('-', "") == viewer_id.replace('-', ""))
+        .unwrap();
+    assert_eq!(listed["PrimaryImageTag"], first);
+    let (_, public) = send(&app, request("GET", "/Users/Public", None, None)).await;
+    let listed = public
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["Id"].as_str().unwrap().replace('-', "") == viewer_id.replace('-', ""))
+        .unwrap();
+    assert_eq!(listed["PrimaryImageTag"], first);
+
+    // Only a URL with the tag is cached for long; the older GET serves the same picture, also anonymously
+    let tag = first.as_str().unwrap();
+    let (_, _, cache, _) = fetch(format!("/UserImage?userId={viewer_id}")).await;
+    assert_eq!(cache.as_deref(), Some("no-cache"));
+    let (_, _, cache, _) = fetch(format!("/UserImage?userId={viewer_id}&tag={tag}")).await;
+    assert_eq!(cache.as_deref(), Some("public, max-age=31536000"));
+    let (status, content_type, cache, bytes) =
+        fetch(format!("/Users/{viewer_id}/Images/Primary?tag={tag}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(content_type.as_deref(), Some("image/png"));
+    assert_eq!(cache.as_deref(), Some("public, max-age=31536000"));
+    assert_eq!(bytes, png);
+    let (status, ..) = fetch(format!("/Users/{viewer_id}/Images/Backdrop")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Someone else's picture is the user's own or an administrator's to change; a non-image is refused
+    let theirs = format!("/UserImage?userId={owner_id}");
+    let (status, _) = send(&app, upload(theirs, &viewer, png.to_vec())).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = send(&app, upload(uri.clone(), &viewer, b"hello".to_vec())).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(me_tag().await.as_ref(), Some(&first));
+
+    // The older route takes the raw file, for the Primary image only; the new picture gets a new
+    // tag and the old file goes
+    let backdrop = format!("/Users/{viewer_id}/Images/Backdrop");
+    let (status, _) = send(&app, upload(backdrop, &viewer, jpeg.to_vec())).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let legacy = format!("/Users/{viewer_id}/Images/Primary");
+    let (status, _) = send(&app, upload(legacy, &viewer, jpeg.to_vec())).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let second = me_tag().await.expect("a tag after the second upload");
+    assert_ne!(second, first);
+    let (_, content_type, bytes) = image().await;
+    assert_eq!(content_type.as_deref(), Some("image/jpeg"));
+    assert_eq!(bytes, jpeg);
+    assert_eq!(files(), 1);
+
+    let (status, _) = send(&app, request("DELETE", &uri, Some(&viewer), None)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(me_tag().await, None);
+    assert_eq!(image().await.0, StatusCode::NOT_FOUND);
+    assert_eq!(files(), 0);
+}
+
+// R3 settings: an administrator may set and delete another user's profile picture.
+#[tokio::test]
+async fn r3settings_admin_sets_another_users_picture() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _owner_id, viewer, viewer_id) = g1_owner_and_viewer(&state, &app).await;
+    let png: &[u8] = b"\x89PNG\r\n\x1a\n-admin-upload";
+    let uri = format!("/UserImage?userId={viewer_id}");
+    let req = Request::builder()
+        .method("POST")
+        .uri(&uri)
+        .header("Authorization", format!("Bearer {owner}"))
+        .header("Content-Type", "image/png")
+        .body(Body::from(png.to_vec()))
+        .unwrap();
+    let (status, _) = send(&app, req).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, me) = send(&app, request("GET", "/Users/Me", Some(&viewer), None)).await;
+    assert!(me["PrimaryImageTag"].is_string(), "{me}");
+
+    let (status, _) = send(&app, request("DELETE", &uri, Some(&owner), None)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, me) = send(&app, request("GET", "/Users/Me", Some(&viewer), None)).await;
+    assert!(me.get("PrimaryImageTag").is_none(), "{me}");
+}
+
 // B152: library grid images keep up with scrolling (web client)
 #[test]
 fn b152_blurhash_decoder() {
@@ -24426,6 +24582,24 @@ fn r3music_tabs() {
 #[test]
 fn r3home_rows() {
     b124_node_test("r3home_rows.mjs");
+}
+
+// R3 settings: the home screen follows the user's section order and Recently Added libraries
+#[test]
+fn r3settings_home() {
+    b124_node_test("r3settings_home.mjs");
+}
+
+// R3 settings: the settings page saves each setting where Jellyfin keeps it
+#[test]
+fn r3settings_page() {
+    b124_node_test("r3settings_page.mjs");
+}
+
+// R3 settings: the device settings reach the player; device over account, as in Jellyfin Web
+#[test]
+fn r3settings_device() {
+    b124_node_test("r3settings_device.mjs");
 }
 
 #[test]
@@ -34523,6 +34697,74 @@ async fn b22_universal(
     (url, body["MediaSources"][0].clone())
 }
 
+// R3 settings: the web client's maximum streaming bitrate and subtitle burn-in settings. A file
+// above MaxStreamingBitrate is transcoded, at that rate less the audio; SubtitleMethod=Encode burns
+// in a text subtitle too.
+#[tokio::test]
+async fn r3settings_universal_bitrate_and_burn_in() {
+    let state = test_state().await;
+    let _dir = G4Dir(state.data_dir.to_path_buf());
+    let (token, _) = admin_session(&state).await;
+    let folder = std::path::PathBuf::from(media_folder(&state, "r3-universal"));
+    let file = folder.join("R3 Bitrate.mp4");
+    std::fs::write(&file, b"r3").unwrap();
+    let id = g4_insert_item(&state, "Movie", &file).await;
+    let source: rustyfin_model::media_source::MediaSourceResponse =
+        serde_json::from_value(serde_json::json!({
+            "Id": uuid::Uuid::new_v4().to_string(),
+            "Uid": uuid::Uuid::new_v4().to_string(),
+            "Container": "mp4",
+            "Protocol": "File",
+            "Path": file.to_str().unwrap(),
+            "Bitrate": 20_000_000,
+            "MediaStreams": [
+                { "Index": 0, "CodecType": "video", "Codec": "h264" },
+                { "Index": 1, "CodecType": "audio", "Codec": "aac", "IsDefault": true },
+                { "Index": 2, "CodecType": "subtitle", "Codec": "subrip" },
+            ],
+        }))
+        .unwrap();
+    rustyfin_db::repo_media_source::insert_media_source_with_streams(&state.db, &id, &source)
+        .await
+        .unwrap();
+    let app = app(state);
+    let m3u8 = format!("/Videos/{id}/main.m3u8?");
+
+    // A limit above the file's bitrate plays it directly, and a high limit adds no video bitrate
+    let (url, _) = b22_universal(&app, &token, id, "&MaxStreamingBitrate=100000000").await;
+    assert!(url.contains("Static=true"), "{url}");
+    let query = "&MaxStreamingBitrate=100000000&EnableDirectPlay=false&EnableDirectStream=false";
+    let (url, _) = b22_universal(&app, &token, id, query).await;
+    assert!(url.starts_with(&m3u8), "{url}");
+    assert!(!url.contains("VideoBitrate"), "{url}");
+
+    // 4 Mbps: below the file's 20, so a transcode at 4000 less 192 kbps of audio
+    let (url, source) = b22_universal(&app, &token, id, "&MaxStreamingBitrate=4000000").await;
+    assert!(url.starts_with(&m3u8), "{url}");
+    assert!(url.contains("&VideoBitrate=3808"), "{url}");
+    assert_eq!(source["SupportsDirectPlay"], false);
+
+    // MaxVideoBitrate is in bits/s like Jellyfin's; with both limits the lower one wins
+    let query = "&MaxVideoBitrate=2000000&EnableDirectPlay=false&EnableDirectStream=false";
+    let (url, _) = b22_universal(&app, &token, id, query).await;
+    assert!(url.contains("&VideoBitrate=2000&"), "{url}");
+    let query = "&MaxVideoBitrate=6000000&MaxStreamingBitrate=4000000";
+    let (url, _) = b22_universal(&app, &token, id, query).await;
+    assert!(url.contains("&VideoBitrate=3808&"), "{url}");
+    let query = "&MaxVideoBitrate=2000000&MaxStreamingBitrate=4000000";
+    let (url, _) = b22_universal(&app, &token, id, query).await;
+    assert!(url.contains("&VideoBitrate=2000&"), "{url}");
+
+    // A text subtitle is drawn by the browser unless the request asks for it burned in
+    let (url, _) = b22_universal(&app, &token, id, "&SubtitleStreamIndex=2").await;
+    assert!(url.contains("Static=true"), "{url}");
+    let query = "&SubtitleStreamIndex=2&SubtitleMethod=Encode";
+    let (url, _) = b22_universal(&app, &token, id, query).await;
+    assert!(url.starts_with(&m3u8), "{url}");
+    assert!(url.contains("&SubtitleStreamIndex=2"), "{url}");
+    assert!(url.contains("&SubtitleMethod=Encode"), "{url}");
+}
+
 #[tokio::test]
 async fn b22_universal_sends_other_tracks_to_a_transcode() {
     let state = test_state().await;
@@ -35521,6 +35763,38 @@ async fn b20_playback_info_defaults_from_progress_report() {
 
     let stored = b20_stored_tracks(&state, &user.to_string(), item).await;
     assert_eq!(stored, (Some(2), Some(4)));
+    assert_eq!(b20_only_defaults(&app, &token, item).await, b20_both(2, 4));
+}
+
+// R3 settings: Jellyfin's RememberAudioSelections and RememberSubtitleSelections. Turned off, the
+// remembered track of that kind is no longer the item's default; the choice stays stored.
+#[tokio::test]
+async fn r3settings_playback_info_follows_remember_flags() {
+    let state = test_state().await;
+    let _dir = G1cDataDir(state.data_dir.to_path_buf());
+    let app = app(state.clone());
+    let (token, user) = admin_session(&state).await;
+    let item = b20_movie(&state, "R3 Remember", b20_full_streams()).await;
+    let body = serde_json::json!({
+        "ItemId": item, "PositionTicks": 0, "AudioStreamIndex": 2, "SubtitleStreamIndex": 4,
+    });
+    b20_report(&app, &token, "/Progress", body).await;
+    let configure = |config: serde_json::Value| {
+        let uri = format!("/Users/{user}/Configuration");
+        let req = request("POST", &uri, Some(&token), Some(config));
+        let app = app.clone();
+        async move { assert!(send(&app, req).await.0.is_success()) }
+    };
+
+    configure(serde_json::json!({ "RememberAudioSelections": false })).await;
+    let defaults = b20_only_defaults(&app, &token, item).await;
+    assert_eq!(defaults, (None, Some(serde_json::json!(4))));
+
+    configure(serde_json::json!({ "RememberSubtitleSelections": false })).await;
+    let defaults = b20_only_defaults(&app, &token, item).await;
+    assert_eq!(defaults, (Some(serde_json::json!(2)), None));
+
+    configure(serde_json::json!({})).await;
     assert_eq!(b20_only_defaults(&app, &token, item).await, b20_both(2, 4));
 }
 
