@@ -306,7 +306,8 @@ struct FfprobeChapter {
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Probe a media file using ffprobe and return the parsed result.
+/// Probe a media file using ffprobe and return the parsed result. One ffprobe run reads the
+/// format, the streams and the chapters, at a low CPU priority.
 pub async fn probe_file(path: &str) -> Result<ProbeResult, ProbeError> {
     let mut result = probe_streams(path).await?;
     // A video's subtitle files are stored with its streams, as Jellyfin stores them at scan
@@ -356,23 +357,27 @@ pub fn add_external_subtitles(
     }
 }
 
-/// Probes `path` with ffprobe: its embedded streams, format, tags and chapters.
+/// Probes `path` with ffprobe: its embedded streams, format, tags and chapters, in one run at a
+/// low CPU priority.
 async fn probe_streams(path: &str) -> Result<ProbeResult, ProbeError> {
-    let output = Command::new("ffprobe")
-        .args([
-            "-v",
-            "quiet",
-            "-print_format",
-            "json",
-            "-show_format",
-            "-show_streams",
-            "-i",
-            path,
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
+    let mut cmd = Command::new("ffprobe");
+    cmd.args([
+        "-v",
+        "quiet",
+        "-print_format",
+        "json",
+        "-show_format",
+        "-show_streams",
+        "-show_chapters",
+        "-i",
+        path,
+    ])
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .kill_on_drop(true);
+    crate::media_reads::lower_priority(&mut cmd);
+    let output = cmd
         .output()
         .await
         .map_err(|e| ProbeError::FfprobeNotFound(e.to_string()))?;
@@ -482,7 +487,7 @@ async fn probe_streams(path: &str) -> Result<ProbeResult, ProbeError> {
     let audio_tags = extract_audio_tags(&format.tags, &probe.streams);
 
     // Extract chapters
-    let chapters = read_chapters(path).await;
+    let chapters = parse_chapters(&stdout);
 
     // The codec of the attached picture (cover art) stream, if the file has one.
     let attached_picture_codec = probe
@@ -1115,6 +1120,17 @@ async fn run_probe_step(
         warn!("failed to store the stamp of '{}': {}", path, e);
     }
     (result, has_source)
+}
+
+/// `probe_file` under a permit of the global probe limit.
+pub async fn probe_file_bounded(path: String) -> Result<ProbeResult, ProbeError> {
+    let _permit = probe_semaphore().acquire().await;
+    probe_file(&path).await
+}
+
+/// The global limit on ffprobe runs at once (`RUSTYFIN_MAX_PROBES`).
+pub fn max_probes() -> usize {
+    get_max_probes()
 }
 
 /// Spawn a bounded probe task that respects the global concurrency limit.

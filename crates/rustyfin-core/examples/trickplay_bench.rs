@@ -72,6 +72,11 @@ async fn main() {
             std::process::exit(2);
         }
     };
+    println!(
+        "jobs\t{}\tcpus\t{}",
+        rustyfin_core::trickplay::image_jobs(),
+        std::thread::available_parallelism().map_or(0, |n| n.get())
+    );
     let started = Instant::now();
     for group in groups {
         let lib = library(&pool, &dir, group).await;
