@@ -48099,6 +48099,7 @@ async fn r3music2_lyrics_read_upload_and_delete() {
     let (admin, _) = admin_session(&state).await;
     let (user, _) = j6_user_session(&state).await;
     let pool = state.db.clone();
+    let uploads = state.data_dir.join("metadata").join("lyrics");
     let app = app(state);
 
     let lyrics = b27_answer(&app, &format!("/Audio/{synced}/Lyrics"), &user).await;
@@ -48173,6 +48174,69 @@ async fn r3music2_lyrics_read_upload_and_delete() {
         assert_eq!(has(&item), false, "{item}");
     }
     assert!(!sidecar.exists());
+
+    // An uploaded file goes with its item.
+    let (status, body) = r3music2_send(&app, "POST", &upload, &admin, "again").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let uploaded = uploads.join(format!("{}.txt", plain.simple()));
+    assert!(uploaded.exists());
+    let (status, body) =
+        send_authed(&app, "DELETE", &format!("/Items/{plain}"), &admin, None).await;
+    assert!(status.is_success(), "{status}: {body}");
+    assert!(!uploaded.exists());
+}
+
+/// A track that a user's parental limit hides answers 404 on `/Audio/{id}/Lyrics` and as an
+/// instant mix's seed, and stays out of another track's mix; the administrator gets both.
+#[tokio::test]
+async fn r3music2_hidden_track_has_no_lyrics_or_mix() {
+    let state = test_state().await;
+    let library = j6_library(&state, "Music").await;
+    let loud = r3music2_track(&state, library, None, "Loud Track", "Noise Pop").await;
+    let calm = r3music2_track(&state, library, None, "Calm Track", "Noise Pop").await;
+    sqlx::query("UPDATE media_items SET official_rating = 'R' WHERE id = ?")
+        .bind(loud.to_string())
+        .execute(&state.db)
+        .await
+        .unwrap();
+    let dir = state.data_dir.join("media").join("r3music2");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("Loud Track.lrc"), "[00:01.00]Loud line\n").unwrap();
+
+    let app = app(state.clone());
+    let (admin, _) = admin_session(&state).await;
+    let kid = add_user(&state, "r3m2-kid", "r3m2-pass", false).await;
+    let (_, user) = send_authed(&app, "GET", &format!("/Users/{kid}"), &admin, None).await;
+    let mut policy = user["Policy"].clone();
+    policy["MaxParentalRating"] = 10.into();
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        &format!("/Users/{kid}/Policy"),
+        &admin,
+        Some(&policy.to_string()),
+    )
+    .await;
+    assert!(status.is_success(), "{status}");
+    let (token, _) = login(&app, "r3m2-kid", "r3m2-pass").await.unwrap();
+
+    for uri in [
+        format!("/Audio/{loud}/Lyrics"),
+        format!("/Songs/{loud}/InstantMix"),
+        format!("/Items/{loud}/InstantMix"),
+    ] {
+        let (status, body) = send_authed(&app, "GET", &uri, &token, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}: {body}");
+        b27_answer(&app, &uri, &admin).await;
+    }
+    let mix = b27_answer(&app, &format!("/Items/{calm}/InstantMix"), &token).await;
+    assert_eq!(r3music2_ids(&mix), [calm.to_string()], "{mix}");
+    let mix = b27_answer(&app, &format!("/Items/{calm}/InstantMix"), &admin).await;
+    assert_eq!(
+        r3music2_ids(&mix),
+        [calm.to_string(), loud.to_string()],
+        "{mix}"
+    );
 }
 
 /// Ids of the `Items` of an answer, in order.

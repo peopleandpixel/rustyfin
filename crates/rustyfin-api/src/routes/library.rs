@@ -319,8 +319,10 @@ async fn remove_library(
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>, ApiError> {
     let covers = rustyfin_core::local_images::embedded_cover_paths(&state.db, id).await;
+    let lyrics = rustyfin_core::lyrics::uploads_in_library(&state.db, id).await;
     rustyfin_db::repo_library::delete_library(&state.db, id).await?;
     rustyfin_core::local_images::remove_orphaned_covers(&state.db, &covers).await;
+    rustyfin_core::lyrics::remove_orphaned_uploads(&state.db, &lyrics).await;
     state.cache.invalidate_library_lists();
     crate::routes::streaming::forget_library_roots(&state);
     state.task_scheduler.watcher().libraries_changed();

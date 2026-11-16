@@ -8,11 +8,11 @@
 use axum::extract::{Path, Query, State};
 use axum::routing::get;
 use axum::{Extension, Json, Router};
-use rustyfin_db::repo_by_name::{ByNameKind, by_name_id};
+use rustyfin_db::repo_by_name::ByNameKind;
 use rustyfin_db::repo_instant_mix as mix;
 use rustyfin_model::auth::Claims;
 use rustyfin_model::media::{MediaItem, MediaType, QueryResult};
-use std::collections::HashSet;
+
 use uuid::Uuid;
 
 use super::items::{ImageOptions, enrich_items_with};
@@ -186,27 +186,14 @@ async fn mix_track_ids(
     genres: &[String],
     first: Option<Uuid>,
 ) -> Result<Vec<Uuid>, ApiError> {
-    let pool = &state.db_ro;
-    let kept: Option<HashSet<String>> = if genres.is_empty() {
-        None
-    } else {
-        let ids: Vec<Uuid> = genres
-            .iter()
-            .map(|name| by_name_id(ByNameKind::MusicGenre, name))
-            .collect();
-        rustyfin_db::repo_by_name::item_ids_with(pool, &ids, &[])
+    let visible = hidden.json();
+    Ok(
+        mix::mix_tracks(&state.db_ro, genres, visible.as_deref(), MIX_SIZE)
             .await?
-            .map(|ids| ids.into_iter().collect())
-    };
-    Ok(mix::all_tracks(pool)
-        .await?
-        .into_iter()
-        .filter(|(id, _)| kept.as_ref().is_none_or(|k| k.contains(&id.to_string())))
-        .filter(|(id, library)| !hidden.hides(*id, *library))
-        .map(|(id, _)| id)
-        .take(MIX_SIZE)
-        .filter(|id| Some(*id) != first)
-        .collect())
+            .into_iter()
+            .filter(|id| Some(*id) != first)
+            .collect(),
+    )
 }
 
 async fn answer(

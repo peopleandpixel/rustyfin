@@ -2500,8 +2500,10 @@ async fn scan_music_library(
 
     // Remove the items that this scan no longer collects. A failure is logged, not returned.
     let covers = local_images::embedded_cover_paths(pool, library.id).await;
+    let uploads = crate::lyrics::uploads_in_library(pool, library.id).await;
     let removed = remove_uncollected(pool, library, &filter, &collected, &unreadable, &loops).await;
     local_images::remove_orphaned_covers(pool, &covers).await;
+    crate::lyrics::remove_orphaned_uploads(pool, &uploads).await;
     // The lyric files beside the tracks, as Jellyfin finds them on a scan, for their HasLyrics.
     if let Err(e) = crate::lyrics::sync_sidecars(pool, library.id, &filter).await {
         tracing::error!(

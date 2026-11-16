@@ -15,6 +15,16 @@ pub const LYRIC_EXTENSIONS: [&str; 3] = ["lrc", "elrc", "txt"];
 
 const TICKS_PER_MS: i64 = 10_000;
 
+/// The most timestamps one LRC line is read with; later ones are ignored.
+pub const MAX_STAMPS_PER_LINE: usize = 100;
+/// The most timed lines a file gives.
+pub const MAX_TIMED_LINES: usize = 10_000;
+/// The most text, in bytes, that the timed lines of a file hold together, so that a line repeated
+/// by many stamps can't grow the lyrics much past the file's own size.
+pub const MAX_TIMED_TEXT_BYTES: usize = 4 * 1024 * 1024;
+/// How far after a `<` the `>` of a word stamp may be (`<mm:ss.xxx>` is at most a few digits).
+const WORD_STAMP_MAX_LEN: usize = 16;
+
 /// Parses the lyric file `name` (only its extension is read) with `content`, as Jellyfin's parsers
 /// do: an `.lrc` or `.elrc` file as timed lines when it has any, else every file as plain lines.
 /// `None` for another extension.
@@ -66,14 +76,17 @@ pub fn parse_lrc(content: &str) -> Option<LyricDto> {
         ..Default::default()
     };
     let mut timed: Vec<(i64, String)> = Vec::new();
-    for line in content.lines() {
+    let mut text_bytes = 0usize;
+    'lines: for line in content.lines() {
         let mut rest = line.trim();
         let mut stamps = Vec::new();
         while let Some(tag_end) = rest.strip_prefix('[').and_then(|r| r.find(']')) {
             let tag = &rest[1..=tag_end];
             rest = rest[tag_end + 2..].trim_start();
             if let Some(ms) = parse_time(tag) {
-                stamps.push(ms);
+                if stamps.len() < MAX_STAMPS_PER_LINE {
+                    stamps.push(ms);
+                }
             } else if let Some((key, value)) = tag.split_once(':') {
                 set_header(&mut metadata, key.trim(), value.trim());
             }
@@ -83,6 +96,10 @@ pub fn parse_lrc(content: &str) -> Option<LyricDto> {
         }
         let text = strip_word_stamps(rest);
         for ms in stamps {
+            if timed.len() >= MAX_TIMED_LINES || text_bytes + text.len() > MAX_TIMED_TEXT_BYTES {
+                break 'lines;
+            }
+            text_bytes += text.len();
             timed.push((ms, text.clone()));
         }
     }
@@ -95,7 +112,10 @@ pub fn parse_lrc(content: &str) -> Option<LyricDto> {
         .into_iter()
         .map(|(ms, text)| LyricLine {
             text,
-            start: Some((ms - offset_ms).max(0) * TICKS_PER_MS),
+            start: ms
+                .saturating_sub(offset_ms)
+                .max(0)
+                .checked_mul(TICKS_PER_MS),
         })
         .collect();
     Some(LyricDto { metadata, lyrics })
@@ -120,7 +140,7 @@ fn set_header(metadata: &mut LyricMetadata, key: &str, value: &str) {
                 .trim_start_matches('+')
                 .parse::<i64>()
                 .ok()
-                .map(|ms| ms * TICKS_PER_MS)
+                .and_then(|ms| ms.checked_mul(TICKS_PER_MS))
         }
         _ => {}
     }
@@ -145,27 +165,35 @@ fn parse_time(tag: &str) -> Option<i64> {
     }
     let min: i64 = min.parse().ok()?;
     let sec: i64 = sec.parse().ok()?;
-    let frac_ms = match frac.len() {
-        0 => 0,
-        1 => frac.parse::<i64>().ok()? * 100,
-        2 => frac.parse::<i64>().ok()? * 10,
-        _ => frac.parse::<i64>().ok()?,
-    };
-    Some((min * 60 + sec) * 1000 + frac_ms)
+    let frac_ms: i64 = frac.parse().unwrap_or(0) * 10_i64.pow(3 - frac.len() as u32);
+    min.checked_mul(60)?
+        .checked_add(sec)?
+        .checked_mul(1000)?
+        .checked_add(frac_ms)
+        // A start in ticks must fit too.
+        .filter(|ms| ms.checked_mul(TICKS_PER_MS).is_some())
 }
 
+/// The text without its word stamps. A `>` is looked for only a few bytes after each `<`, so a
+/// line of `<` without `>` takes linear time.
 fn strip_word_stamps(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(open) = rest.find('<') {
-        match rest[open..].find('>') {
-            Some(close) if parse_time(&rest[open + 1..open + close]).is_some() => {
+        let after = &rest[open + 1..];
+        let close = after
+            .char_indices()
+            .take(WORD_STAMP_MAX_LEN)
+            .find(|(_, c)| *c == '>')
+            .map(|(i, _)| i);
+        match close {
+            Some(close) if parse_time(&after[..close]).is_some() => {
                 out.push_str(&rest[..open]);
-                rest = &rest[open + close + 1..];
+                rest = &after[close + 1..];
             }
             _ => {
                 out.push_str(&rest[..=open]);
-                rest = &rest[open + 1..];
+                rest = after;
             }
         }
     }
@@ -193,12 +221,27 @@ pub fn sidecars_among(audio: &Path, files: &[PathBuf]) -> Vec<PathBuf> {
             let named_like = base == stem
                 || base
                     .strip_prefix(&stem)
-                    .is_some_and(|rest| rest.starts_with('.'));
+                    .and_then(|rest| rest.strip_prefix('.'))
+                    .is_some_and(is_language);
             named_like.then(|| (rank, f.clone()))
         })
         .collect();
     found.sort();
     found.into_iter().map(|(_, f)| f).collect()
+}
+
+/// Whether the middle part of a lyric file name is a language: 2 or 3 letters, optionally with a
+/// region (`en`, `eng`, `pt-BR`, `zh_Hant`), so that `Song.live.lrc` is not `Song.flac`'s.
+fn is_language(part: &str) -> bool {
+    let (lang, region) = match part.split_once(['-', '_']) {
+        Some((lang, region)) => (lang, Some(region)),
+        None => (part, None),
+    };
+    (2..=3).contains(&lang.len())
+        && lang.bytes().all(|b| b.is_ascii_alphabetic())
+        && region.is_none_or(|r| {
+            (2..=4).contains(&r.len()) && r.bytes().all(|b| b.is_ascii_alphanumeric())
+        })
 }
 
 /// The lyric files beside the track at `audio`, as [`sidecars_among`] picks them. Reads its folder.
@@ -262,6 +305,27 @@ pub async fn read_lyrics_tag(path: &str) -> Option<String> {
         .ok()?;
     let parsed: Output = serde_json::from_slice(&output.stdout).ok()?;
     lyrics_tag(&parsed.format?.tags?)
+}
+
+/// The uploaded lyric files of `library`'s items, read before a removal for
+/// [`remove_orphaned_uploads`]. Empty when the query fails, so nothing is deleted then.
+pub async fn uploads_in_library(pool: &SqlitePool, library: Uuid) -> Vec<String> {
+    rustyfin_db::repo_lyrics::uploads_in_library(pool, library)
+        .await
+        .unwrap_or_default()
+}
+
+/// Deletes the uploaded lyric files among `paths` that no item has any more: their items were
+/// deleted (the `item_lyrics` rows go with them). A failed check keeps the file.
+pub async fn remove_orphaned_uploads(pool: &SqlitePool, paths: &[String]) {
+    for path in paths {
+        if let Ok(false) = rustyfin_db::repo_lyrics::still_uploaded(pool, path).await
+            && let Err(e) = tokio::fs::remove_file(path).await
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!("failed to delete the lyric file '{}': {}", path, e);
+        }
+    }
 }
 
 /// Records the lyric file beside each audio item of `library` within `scope`, reading each folder
@@ -371,6 +435,8 @@ mod tests {
             "01 song.en.LRC",
             "01 Song.lrc",
             "01 Songs.lrc",
+            "01 Song.live.lrc",
+            "01 Song.pt-BR.txt",
             "02 Other.lrc",
             "cover.jpg",
         ]
@@ -382,9 +448,41 @@ mod tests {
             vec![
                 dir.join("01 Song.lrc"),
                 dir.join("01 song.en.LRC"),
+                dir.join("01 Song.pt-BR.txt"),
                 dir.join("01 Song.txt")
             ]
         );
+    }
+
+    #[test]
+    fn r3music2_pathological_lrc_stays_bounded() {
+        // ~100k stamps before a long text: the line is kept at most MAX_STAMPS_PER_LINE times.
+        let text = "x".repeat(200_000);
+        let content = format!("{}{text}\n", "[00:01.00]".repeat(100_000));
+        let dto = parse_lrc(&content).unwrap();
+        assert_eq!(
+            dto.lyrics.len(),
+            MAX_STAMPS_PER_LINE.min(MAX_TIMED_TEXT_BYTES / text.len())
+        );
+        // Many short stamped lines stop at MAX_TIMED_LINES.
+        let many = "[00:01]a\n".repeat(MAX_TIMED_LINES + 50);
+        assert_eq!(parse_lrc(&many).unwrap().lyrics.len(), MAX_TIMED_LINES);
+        // Times and offsets too large for ticks are not read, nor do they overflow.
+        let huge =
+            parse_lrc("[offset:-99999999999999999]\n[99999999999999:00]big\n[00:01]ok").unwrap();
+        assert_eq!(huge.lyrics, vec![line("ok", Some(10_000_000))]);
+        assert_eq!(huge.metadata.offset, None);
+    }
+
+    #[test]
+    fn r3music2_word_stamp_stripping_is_linear() {
+        let start = std::time::Instant::now();
+        let angles = "<".repeat(1_000_000);
+        assert_eq!(strip_word_stamps(&angles).len(), 1_000_000);
+        let then_close = format!("{}>", "<".repeat(1_000_000));
+        assert_eq!(strip_word_stamps(&then_close).len(), 1_000_001);
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(strip_word_stamps("a <b> <00:01.2>c <x"), "a <b> c <x");
     }
 
     #[test]

@@ -122,6 +122,31 @@ pub async fn set_sidecars(
     tx.commit().await
 }
 
+/// The uploaded lyric files of the items of `library`, so that the ones whose item a removal
+/// deletes can be deleted after it (see [`still_uploaded`]).
+pub async fn uploads_in_library(
+    pool: &SqlitePool,
+    library: Uuid,
+) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT l.uploaded_path FROM item_lyrics AS l JOIN media_items AS m ON m.id = l.item_id \
+         WHERE m.library_id = ? AND l.uploaded_path IS NOT NULL",
+    )
+    .bind(library.to_string())
+    .fetch_all(pool)
+    .await
+}
+
+/// Whether an item still has `path` as its uploaded lyric file.
+pub async fn still_uploaded(pool: &SqlitePool, path: &str) -> Result<bool, sqlx::Error> {
+    let found: Option<i64> =
+        sqlx::query_scalar("SELECT 1 FROM item_lyrics WHERE uploaded_path = ? LIMIT 1")
+            .bind(path)
+            .fetch_optional(pool)
+            .await?;
+    Ok(found.is_some())
+}
+
 /// The audio items of `library` within `scope`, as id -> (file path, stored sidecar path).
 pub async fn audio_sidecars(
     pool: &SqlitePool,

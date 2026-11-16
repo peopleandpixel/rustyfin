@@ -3067,10 +3067,19 @@ async fn delete_item(
             "This user may not delete media.".to_string(),
         ));
     }
+    // The uploaded lyric files of the item and the items under it go with them.
+    let library = rustyfin_db::repo_media::get_item_by_id(&state.db, id)
+        .await?
+        .map(|item| item.library_id);
+    let lyrics = match library {
+        Some(library) => rustyfin_core::lyrics::uploads_in_library(&state.db, library).await,
+        None => Vec::new(),
+    };
     let deleted = rustyfin_db::repo_media::delete_item(&state.db, id).await?;
     if !deleted {
         return Err(ApiError::NotFound("item not found".into()));
     }
+    rustyfin_core::lyrics::remove_orphaned_uploads(&state.db, &lyrics).await;
     // The items under it lose theirs at the image tasks' next run.
     rustyfin_core::trickplay::remove_item_files(&state.data_dir, id).await;
     Ok(Json(json!({ "status": "ok" })).into_response())

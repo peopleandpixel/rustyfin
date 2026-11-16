@@ -51,7 +51,13 @@ fn upload_dir(state: &AppState) -> std::path::PathBuf {
     state.data_dir.join("metadata").join("lyrics")
 }
 
+/// The lyrics in the file at `path`; a file larger than an upload may be is not read.
 async fn read_file(path: &std::path::Path) -> Option<LyricDto> {
+    let size = tokio::fs::metadata(path).await.ok()?.len();
+    if size > MAX_LYRIC_BYTES as u64 {
+        tracing::warn!("skipped the lyric file '{}': {size} bytes", path.display());
+        return None;
+    }
     let bytes = tokio::fs::read(path).await.ok()?;
     let content = String::from_utf8_lossy(&bytes);
     lyrics::parse_file(&path.to_string_lossy(), &content)
@@ -80,7 +86,9 @@ pub(crate) async fn item_lyrics(state: &AppState, item: &MediaItem) -> Option<Ly
     // A probe that recorded no lyrics tag saves running ffprobe; an item no probe of this version
     // has read yet has no row, so its tag is read.
     if stored.as_ref().is_none_or(|s| s.embedded) {
-        let tag = lyrics::read_lyrics_tag(&item.path).await?;
+        let tag = lyrics::read_lyrics_tag(&item.path)
+            .await
+            .filter(|tag| tag.len() <= MAX_LYRIC_BYTES)?;
         return Some(lyrics::parse_tag(&tag));
     }
     None
