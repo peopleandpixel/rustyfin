@@ -26229,6 +26229,14 @@ async fn r3parental_items_carry_the_fields_jellyfin_web_reads() {
         .unwrap_or_else(|| panic!("{body}"));
     assert_eq!(studio["UserData"]["IsFavorite"], false, "{studio}");
     assert_eq!(studio["UserData"]["ItemId"], studio["Id"], "{studio}");
+    // As in Jellyfin: not with EnableUserData=false, and never on the genre lists.
+    for uri in ["/Studios?EnableUserData=false", "/Genres", "/MusicGenres"] {
+        let (status, body) = w.get(&w.kid, uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert!(!body.to_string().contains("UserData"), "{uri}: {body}");
+    }
+    let (_, genres) = w.get(&w.kid, "/Genres").await;
+    assert!(genres.to_string().contains("Family"), "{genres}");
 }
 
 // ── G1: authorization ──
