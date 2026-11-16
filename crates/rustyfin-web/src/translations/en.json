@@ -818,7 +818,27 @@
         "tab_album_artists": "Album Artists",
         "tab_artists": "Artists",
         "tab_songs": "Songs",
-        "tab_genres": "Genres"
+        "tab_genres": "Genres",
+        "tab_playlists": "Playlists"
+    },
+    "collections": {
+        "collections": "Collections",
+        "playlists": "Playlists",
+        "new_collection": "New collection",
+        "new_playlist": "New playlist",
+        "no_collections": "No collections yet. Add a movie to one from its menu.",
+        "no_playlists": "No playlists yet. Add an item to one from its menu.",
+        "create": "Create",
+        "public_playlist": "Allow every user to see this playlist",
+        "items_count_one": "{{count}} item",
+        "items_count_other": "{{count}} items",
+        "collection_empty": "This collection is empty.",
+        "playlist_empty": "This playlist is empty.",
+        "drag_to_reorder": "Drag to reorder",
+        "remove_from_playlist": "Remove from playlist",
+        "remove_from_collection": "Remove from collection",
+        "removed_from_playlist": "Removed from the playlist",
+        "removed_from_collection": "Removed from the collection"
     },
     "oidc": {
         "sign_in_default": "Sign in with single sign-on",

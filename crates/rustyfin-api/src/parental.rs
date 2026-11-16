@@ -66,6 +66,11 @@ impl HiddenItems {
         self.restricted
     }
 
+    /// The hidden item ids.
+    pub fn ids(&self) -> &HashSet<Uuid> {
+        &self.ids
+    }
+
     pub fn hides(&self, id: Uuid) -> bool {
         self.ids.contains(&id)
     }
