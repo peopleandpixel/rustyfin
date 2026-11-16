@@ -12,7 +12,11 @@ use uuid::Uuid;
 /// subtitle's forced flag from its disposition alone, as in Jellyfin. That rule changed before
 /// version 1 shipped, so it kept version 1: every source that a title made forced is older, and
 /// is read again anyway.
-pub const PROBE_VERSION: i64 = 1;
+///
+/// 2: a video stream's codec level, its bit depth from the pixel format when ffprobe gives no
+/// sample size, its anamorphic flag and its interlaced flag, and a Matroska stream's bit rate
+/// from its statistics tags, which the playback decision reads.
+pub const PROBE_VERSION: i64 = 2;
 
 // ---------------------------------------------------------------------------
 // MediaSource DB row
@@ -104,6 +108,9 @@ struct MediaStreamRow {
     is_forced: bool,
     is_interlaced: bool,
     embedded_bitmaps: bool,
+    /// 007's INTEGER column; ffprobe's levels are whole numbers
+    level: Option<i64>,
+    is_anamorphic: Option<bool>,
 }
 
 impl From<MediaStreamRow> for MediaStream {
@@ -143,6 +150,8 @@ impl From<MediaStreamRow> for MediaStream {
             is_forced: r.is_forced,
             is_interlaced: r.is_interlaced,
             embedded_bitmaps: r.embedded_bitmaps,
+            level: r.level.map(|level| level as f64),
+            is_anamorphic: r.is_anamorphic,
         }
     }
 }
@@ -204,8 +213,9 @@ pub async fn insert_media_stream(
           is_external, path, width, height, average_frame_rate, real_frame_rate, bit_rate, \
           bit_depth, channels, channel_layout, sample_rate, profile, type, aspect_ratio_text, \
           aspect_ratio, title, color_space, color_transfer, color_primaries, color_range, \
-          localized_uri, is_default, is_forced, is_interlaced, embedded_bitmaps, stream_index) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          localized_uri, is_default, is_forced, is_interlaced, embedded_bitmaps, stream_index, \
+          level, is_anamorphic) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&source_id_str)
@@ -241,6 +251,8 @@ pub async fn insert_media_stream(
     .bind(stream.is_interlaced)
     .bind(stream.embedded_bitmaps)
     .bind(stream.index)
+    .bind(stream.level.map(|level| level.round() as i64))
+    .bind(stream.is_anamorphic)
     .execute(pool)
     .await?;
 
@@ -275,7 +287,8 @@ pub async fn get_media_sources(
                  is_external, path, width, height, average_frame_rate, real_frame_rate, bit_rate, \
                  bit_depth, channels, channel_layout, sample_rate, profile, aspect_ratio_text, \
                  aspect_ratio, title, color_space, color_transfer, color_primaries, color_range, \
-                 localized_uri, is_default, is_forced, is_interlaced, embedded_bitmaps \
+                 localized_uri, is_default, is_forced, is_interlaced, embedded_bitmaps, level, \
+                 is_anamorphic \
                  FROM media_streams WHERE source_id = ? AND LOWER(codec_type) <> 'attachment' \
                  ORDER BY stream_index",
             )
@@ -353,7 +366,8 @@ pub async fn get_media_sources_with_item_check(
              is_external, path, width, height, average_frame_rate, real_frame_rate, bit_rate, \
              bit_depth, channels, channel_layout, sample_rate, profile, aspect_ratio_text, \
              aspect_ratio, title, color_space, color_transfer, color_primaries, color_range, \
-             localized_uri, is_default, is_forced, is_interlaced, embedded_bitmaps, source_id \
+             localized_uri, is_default, is_forced, is_interlaced, embedded_bitmaps, source_id, \
+             level, is_anamorphic \
              FROM media_streams WHERE source_id IN ({}) AND LOWER(codec_type) <> 'attachment' \
              ORDER BY source_id, stream_index",
             in_clause
@@ -401,6 +415,8 @@ pub async fn get_media_sources_with_item_check(
                     is_forced: row.is_forced,
                     is_interlaced: row.is_interlaced,
                     embedded_bitmaps: row.embedded_bitmaps,
+                    level: row.level,
+                    is_anamorphic: row.is_anamorphic,
                 }
                 .into();
                 stream_map.entry(row.source_id).or_default().push(stream);
@@ -449,6 +465,9 @@ struct MediaStreamRowWithSource {
     is_forced: bool,
     is_interlaced: bool,
     embedded_bitmaps: bool,
+    /// 007's INTEGER column; ffprobe's levels are whole numbers
+    level: Option<i64>,
+    is_anamorphic: Option<bool>,
 }
 
 /// Delete all media sources and streams for an item.
@@ -518,8 +537,9 @@ async fn insert_source_with_streams(
               is_external, path, width, height, average_frame_rate, real_frame_rate, bit_rate, \
               bit_depth, channels, channel_layout, sample_rate, profile, type, aspect_ratio_text, \
               aspect_ratio, title, color_space, color_transfer, color_primaries, color_range, \
-              localized_uri, is_default, is_forced, is_interlaced, embedded_bitmaps, stream_index) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              localized_uri, is_default, is_forced, is_interlaced, embedded_bitmaps, stream_index, \
+              level, is_anamorphic) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&stream_id)
         .bind(&id)
@@ -555,6 +575,8 @@ async fn insert_source_with_streams(
         .bind(stream.is_interlaced)
         .bind(stream.embedded_bitmaps)
         .bind(stream.index)
+        .bind(stream.level.map(|level| level.round() as i64))
+        .bind(stream.is_anamorphic)
         .execute(&mut *conn)
         .await?;
     }
@@ -719,6 +741,7 @@ pub async fn get_media_sources_batch(
              mst.aspect_ratio_text, mst.aspect_ratio as stream_aspect_ratio, \
              mst.title, mst.color_space, mst.color_transfer, mst.color_primaries, mst.color_range, \
              mst.localized_uri, mst.is_default, mst.is_forced, mst.is_interlaced, mst.embedded_bitmaps, \
+             mst.level, mst.is_anamorphic, \
              mst.stream_index as stream_index_num \
              FROM media_sources ms \
              LEFT JOIN media_streams mst ON mst.source_id = ms.id \
@@ -815,6 +838,8 @@ pub async fn get_media_sources_batch(
                     is_forced: row.is_forced.unwrap_or(false),
                     is_interlaced: row.is_interlaced.unwrap_or(false),
                     embedded_bitmaps: row.embedded_bitmaps.unwrap_or(false),
+                    level: row.level.map(|level| level as f64),
+                    is_anamorphic: row.is_anamorphic,
                 };
                 source.media_streams.push(stream);
             }
@@ -876,5 +901,8 @@ struct BatchSourceStreamRow {
     is_forced: Option<bool>,
     is_interlaced: Option<bool>,
     embedded_bitmaps: Option<bool>,
+    /// 007's INTEGER column; ffprobe's levels are whole numbers
+    level: Option<i64>,
+    is_anamorphic: Option<bool>,
     stream_index_num: Option<i32>,
 }

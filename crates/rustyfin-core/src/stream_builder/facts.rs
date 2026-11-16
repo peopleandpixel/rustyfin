@@ -18,7 +18,7 @@ pub struct StreamFacts {
     pub codec: String,
     /// The codec profile as the source reports it.
     pub profile: Option<String>,
-    /// The codec level. The source doesn't report one here, so this is always `None`.
+    /// The codec level, as ffprobe gives it.
     pub level: Option<f64>,
     /// The codec tag as the source reports it.
     pub codec_tag: Option<String>,
@@ -36,6 +36,8 @@ pub struct StreamFacts {
     pub range_type: Option<String>,
     /// Whether the video is interlaced. Video streams only.
     pub is_interlaced: Option<bool>,
+    /// Whether the video's pixels are not square. Video streams only.
+    pub is_anamorphic: Option<bool>,
     /// The number of audio channels.
     pub channels: Option<i32>,
     /// The audio sample rate in hertz.
@@ -128,7 +130,7 @@ fn stream_facts(stream: &MediaStream) -> StreamFacts {
         kind,
         codec: stream.codec.as_deref().unwrap_or_default().to_lowercase(),
         profile: stream.profile.clone(),
-        level: None,
+        level: stream.level,
         codec_tag: stream.codec_tag.clone(),
         width: to_i32(stream.width),
         height: to_i32(stream.height),
@@ -137,6 +139,7 @@ fn stream_facts(stream: &MediaStream) -> StreamFacts {
         frame_rate: frame_rate(stream),
         range_type: is_video.then(|| range_type(stream).to_string()),
         is_interlaced: is_video.then_some(stream.is_interlaced),
+        is_anamorphic: stream.is_anamorphic.filter(|_| is_video),
         channels: to_i32(stream.channels),
         sample_rate: to_i32(stream.sample_rate),
         language: stream.language.clone(),

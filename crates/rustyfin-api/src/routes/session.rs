@@ -662,7 +662,8 @@ mod tests {
         // Nothing at all is an empty report, not an error
         let caps = capabilities_from_query(&[], b"").unwrap();
         assert_eq!(caps.playable_media_types, None);
-        assert_eq!(caps.supports_media_control, None);
+        // Jellyfin's SupportsMediaControl is a plain bool, false when the client doesn't send it
+        assert_eq!(caps.supports_media_control, Some(false));
     }
 
     #[test]

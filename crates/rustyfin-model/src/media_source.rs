@@ -155,6 +155,13 @@ pub struct MediaStream {
     /// Whether subtitles have embedded bitmaps
     #[serde(default)]
     pub embedded_bitmaps: bool,
+    /// The codec level as ffprobe gives it (e.g. 41 for H.264 4.1, 153 for HEVC 5.1). Video only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<f64>,
+    /// Whether the video's pixels are not square (a sample aspect ratio other than 1:1). Video
+    /// only; unknown when ffprobe gives no sample aspect ratio.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_anamorphic: Option<bool>,
 }
 
 /// What identifies a media stream across rescans. A remembered track choice is offered only where
