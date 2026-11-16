@@ -10,11 +10,12 @@ use rustyfin_model::auth::Claims;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path as FilePath;
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use uuid::Uuid;
 
 use crate::error::ApiError;
-use crate::state::AppState;
+use crate::state::{AppState, LibraryRoot};
 
 mod media_info;
 
@@ -57,6 +58,19 @@ pub(crate) enum Version {
 
 /// The request's MediaSourceId (name matched in any ASCII case), trimmed. None when absent or
 /// blank.
+/// The PlaySessionId a request sends, trimmed; None when it sends none or a blank one. Jellyfin's
+/// Universal routes keep the client's id, so `DELETE /Videos/ActiveEncodings?PlaySessionId=` with
+/// that id stops the transcode.
+fn requested_play_session_id(params: &HashMap<String, String>) -> Option<String> {
+    params
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("PlaySessionId"))
+        .map(|(_, value)| value.trim())
+        .filter(|value| !value.is_empty())
+        .min()
+        .map(str::to_string)
+}
+
 pub(crate) fn requested_source_id(params: &HashMap<String, String>) -> Option<&str> {
     params
         .iter()
@@ -113,53 +127,13 @@ async fn video_file(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Item {id} not found")))?;
     let Some(requested) = requested_source_id(params) else {
-        validate_path_against_library(state, &item.library_id, &item.path).await?;
-        return Ok(item.path);
+        return validate_path_against_library(state, &item.path).await;
     };
     let sources = rustyfin_db::repo_media_source::get_media_sources(&state.db_ro, &id).await?;
     match select_version(id, &sources, Some(requested))? {
-        Version::Primary => {
-            validate_path_against_library(state, &item.library_id, &item.path).await?;
-            Ok(item.path)
-        }
-        Version::Source(index) => {
-            validate_path_against_library(state, &item.library_id, &sources[index].path).await?;
-            Ok(sources[index].path.clone())
-        }
+        Version::Primary => validate_path_against_library(state, &item.path).await,
+        Version::Source(index) => validate_path_against_library(state, &sources[index].path).await,
     }
-}
-
-/// An absolute path with `.` components dropped, so symlinks are kept. `None` for a relative
-/// path, or for one with a `..` component: the kernel resolves `..` after following a link, so
-/// `lib/link/sub/../../x` can leave the library although it looks like it stays inside.
-fn lexical_normalize(path: &FilePath) -> Option<std::path::PathBuf> {
-    use std::path::Component;
-    if !path.is_absolute() {
-        return None;
-    }
-    let mut out = std::path::PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => return None,
-            other => out.push(other),
-        }
-    }
-    Some(out)
-}
-
-/// True when `file_path` lies under `lib_path`, either as written (a file reached through a
-/// symlink inside the library, which Jellyfin also serves) or after resolving symlinks on both
-/// sides. A path with a `..` component never passes as written.
-fn path_is_under_library(file_path: &FilePath, canonical_file: &FilePath, lib_path: &str) -> bool {
-    let lib = FilePath::new(lib_path);
-    if let (Some(file_lex), Some(lib_lex)) = (lexical_normalize(file_path), lexical_normalize(lib))
-        && file_lex.starts_with(&lib_lex)
-    {
-        return true;
-    }
-    lib.canonicalize()
-        .is_ok_and(|canonical_lib| canonical_file.starts_with(canonical_lib))
 }
 
 /// Whether a stored path has a `..` component. Such a path is refused before anything is
@@ -256,8 +230,9 @@ impl OwnedPaths {
             || lower.starts_with("passwordreset-") && lower.ends_with(".json")
     }
 
-    /// Whether the resolved `target` lies in the data dir form `data` as an owned file.
-    fn owned_by_name(data: &FilePath, target: &FilePath) -> bool {
+    /// Whether the resolved `target` lies in the data dir form `data` as an owned file, counting
+    /// the folders in `dirs` as owned.
+    fn owned_by_name(data: &FilePath, target: &FilePath, dirs: &[&str]) -> bool {
         let Ok(rest) = target.strip_prefix(data) else {
             return false;
         };
@@ -266,9 +241,7 @@ impl OwnedPaths {
             return false;
         };
         if parts.next().is_some() {
-            OWNED_DATA_DIRS
-                .iter()
-                .any(|dir| dir.eq_ignore_ascii_case(&first))
+            dirs.iter().any(|dir| dir.eq_ignore_ascii_case(&first))
         } else {
             Self::is_owned_data_file(&first)
         }
@@ -276,16 +249,22 @@ impl OwnedPaths {
 
     /// Whether the resolved `target` is one of these owned paths.
     fn owns(&self, target: &FilePath) -> bool {
+        self.owns_in(target, &OWNED_DATA_DIRS)
+    }
+
+    /// Whether the resolved `target` is one of these owned paths, counting only the data-dir
+    /// folders in `dirs` as owned.
+    fn owns_in(&self, target: &FilePath, dirs: &[&str]) -> bool {
         let data_forms = Self::forms(&self.data_dir);
         if data_forms
             .iter()
-            .any(|data| Self::owned_by_name(data, target))
+            .any(|data| Self::owned_by_name(data, target, dirs))
         {
             return true;
         }
         // Owned folders that are links out of the data dir
         let linked_dir = data_forms.iter().any(|data| {
-            OWNED_DATA_DIRS.iter().any(|dir| {
+            dirs.iter().any(|dir| {
                 data.join(dir)
                     .canonicalize()
                     .is_ok_and(|real| target != real && target.starts_with(&real))
@@ -310,28 +289,88 @@ impl OwnedPaths {
     }
 }
 
-/// Whether `file_path` may be streamed from a library with `lib_paths`. It is refused when:
+/// An absolute path with `.` components dropped, so symlinks are kept. `None` for a relative
+/// path, or for one with a `..` component: the kernel resolves `..` after following a link, so
+/// `lib/link/sub/../../x` can leave the library although it looks like it stays inside.
+fn lexical_normalize(path: &FilePath) -> Option<std::path::PathBuf> {
+    use std::path::Component;
+    if !path.is_absolute() {
+        return None;
+    }
+    let mut out = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => return None,
+            other => out.push(other),
+        }
+    }
+    Some(out)
+}
+
+/// The resolved path of `file_path` when it may be streamed from libraries at `roots`; None when
+/// it is refused:
 /// - it has a `..` component;
 /// - resolving its links fails;
-/// - it lies under none of `lib_paths`, as written or after resolving links (see
-///   `path_is_under_library`);
+/// - it lies under none of `roots`, as written or resolved. With `strict` (the server's
+///   `RefuseLinksOutOfLibraries`) the resolved target must lie under one: a link inside a library
+///   that points out of every library is refused, one into another library plays. Without it, a
+///   path under a library as written is enough, as Jellyfin follows such links too;
 /// - its resolved target is a path Rustyfin owns (see `OwnedPaths`). Other files inside the
 ///   data dir, such as media kept at `<data>/media`, may be streamed.
-fn path_allowed(file_path: &str, lib_paths: &[String], owned: &OwnedPaths) -> bool {
+///
+/// Callers open the returned path, not `file_path`, so a link changed after the check can't
+/// lead elsewhere.
+fn checked_path(
+    file_path: &str,
+    roots: &[LibraryRoot],
+    owned: &OwnedPaths,
+    strict: bool,
+) -> Option<std::path::PathBuf> {
     let raw = FilePath::new(file_path);
     if has_parent_dir(raw) {
-        return false;
+        return None;
     }
-    let Ok(canonical) = raw.canonicalize() else {
-        return false;
-    };
-    if !lib_paths
+    let canonical = raw.canonicalize().ok()?;
+    let resolved_inside = roots
         .iter()
-        .any(|lib_path| path_is_under_library(raw, &canonical, lib_path))
-    {
-        return false;
+        .filter_map(|root| root.resolved.as_ref())
+        .any(|root| canonical.starts_with(root));
+    let written_inside = !strict
+        && lexical_normalize(raw).is_some_and(|written| {
+            roots
+                .iter()
+                .filter_map(|root| root.written.as_ref())
+                .any(|root| written.starts_with(root))
+        });
+    if !(resolved_inside || written_inside) || owned.owns(&canonical) {
+        return None;
     }
-    !owned.owns(&canonical)
+    Some(canonical)
+}
+
+/// Whether `file_path` may be streamed from libraries at `lib_paths` by default (see
+/// `checked_path`).
+#[cfg(test)]
+fn path_allowed(file_path: &str, lib_paths: &[String], owned: &OwnedPaths) -> bool {
+    checked_path(file_path, &library_roots_of(lib_paths), owned, false).is_some()
+}
+
+/// Whether `file_path` may be streamed with `RefuseLinksOutOfLibraries` on.
+#[cfg(test)]
+fn path_allowed_strict(file_path: &str, lib_paths: &[String], owned: &OwnedPaths) -> bool {
+    checked_path(file_path, &library_roots_of(lib_paths), owned, true).is_some()
+}
+
+/// `paths` as written and resolved.
+fn library_roots_of(paths: &[String]) -> Vec<LibraryRoot> {
+    paths
+        .iter()
+        .map(|path| LibraryRoot {
+            written: lexical_normalize(FilePath::new(path)),
+            resolved: FilePath::new(path).canonicalize().ok(),
+        })
+        .collect()
 }
 
 /// The file of the server's main database, as SQLite reports it; None for an in-memory one.
@@ -345,26 +384,14 @@ async fn database_file(pool: &sqlx::SqlitePool) -> Option<std::path::PathBuf> {
         .map(std::path::PathBuf::from)
 }
 
-/// Validates that `file_path` is inside one of the library's configured paths and not a link
-/// into the server's own data (see `path_allowed`). This prevents path traversal if the
-/// database is compromised.
-async fn validate_path_against_library(
-    state: &AppState,
-    library_id: &uuid::Uuid,
-    file_path: &str,
-) -> Result<(), ApiError> {
-    if has_parent_dir(FilePath::new(file_path)) {
-        tracing::warn!("streaming path '{}' has a '..' component", file_path);
-        return Err(ApiError::NotFound(
-            "File is outside configured library paths".to_string(),
-        ));
-    }
-    if let Ok(Some(library)) =
-        rustyfin_db::repo_library::get_library_by_id(&state.db_ro, *library_id).await
-    {
-        let owned = OwnedPaths {
-            data_dir: state.data_dir.to_path_buf(),
-            files: database_file(&state.db_ro)
+/// The paths this server owns: its data dir, its database file and its TLS files. The files are
+/// read once and kept (see `FileGuardCache`).
+async fn owned_paths(state: &AppState) -> OwnedPaths {
+    let files = state
+        .file_guard
+        .owned_files
+        .get_or_init(|| async {
+            database_file(&state.db_ro)
                 .await
                 .into_iter()
                 .chain(
@@ -373,28 +400,176 @@ async fn validate_path_against_library(
                         .filter_map(std::env::var_os)
                         .map(std::path::PathBuf::from),
                 )
-                .collect(),
-        };
-        if path_allowed(file_path, &library.paths, &owned) {
-            return Ok(());
-        }
-        // Path not under any library path — log and reject
-        tracing::warn!(
-            "streaming path '{}' is outside library paths for library {}",
-            file_path,
-            library_id
-        );
-        return Err(ApiError::NotFound(
-            "File is outside configured library paths".to_string(),
-        ));
+                .collect()
+        })
+        .await
+        .clone();
+    OwnedPaths {
+        data_dir: state.data_dir.to_path_buf(),
+        files,
     }
-    // If we can't find the library, we still allow the stream (backward compatibility)
-    // but log a warning
-    tracing::debug!(
-        "could not find library {} for path validation, allowing stream",
-        library_id
+}
+
+/// Every library's paths, resolved: the kept ones, or read from the database when there are
+/// none yet or `refresh` is set (see `FileGuardCache`).
+async fn library_roots(state: &AppState, refresh: bool) -> Arc<Vec<LibraryRoot>> {
+    if !refresh && let Some(roots) = state.file_guard.library_roots.read().unwrap().clone() {
+        return roots;
+    }
+    let paths: Vec<String> = rustyfin_db::repo_library::get_all_libraries(&state.db_ro)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .flat_map(|library| library.paths)
+        .collect();
+    let roots = Arc::new(
+        tokio::task::spawn_blocking(move || library_roots_of(&paths))
+            .await
+            .unwrap_or_default(),
     );
-    Ok(())
+    *state.file_guard.library_roots.write().unwrap() = Some(roots.clone());
+    roots
+}
+
+/// The data-dir folders that hold no pictures, so the image routes never read from them. The
+/// other owned folders (`cache`, `metadata`, `images`, `trickplay`) keep the server's pictures.
+const NON_IMAGE_DATA_DIRS: [&str; 5] = [
+    "logs",
+    "transcodes",
+    "plugins",
+    "backups",
+    "jellyfin-import-copy",
+];
+
+/// Whether `head`, the first bytes of a file, start like a picture: JPEG, PNG, GIF, WebP, BMP,
+/// ICO, TIFF, JPEG XL, an ISO media picture (AVIF, HEIF by their brands) or SVG.
+fn looks_like_image(head: &[u8]) -> bool {
+    const MAGIC: [&[u8]; 10] = [
+        b"\xFF\xD8\xFF",
+        b"\x89PNG\r\n\x1A\n",
+        b"GIF87a",
+        b"GIF89a",
+        b"BM",
+        b"\x00\x00\x01\x00",
+        b"II*\x00",
+        b"MM\x00*",
+        b"\xFF\x0A",
+        b"\x00\x00\x00\x0CJXL ",
+    ];
+    if MAGIC.iter().any(|magic| head.starts_with(magic)) {
+        return true;
+    }
+    let webp = head.starts_with(b"RIFF") && head.get(8..12) == Some(b"WEBP".as_slice());
+    // An ISO media file is a picture only with a picture brand: MP4, MOV and M4A are not
+    const IMAGE_BRANDS: [&[u8]; 6] = [b"avif", b"avis", b"heic", b"heix", b"mif1", b"msf1"];
+    let iso_media = head.get(4..8) == Some(b"ftyp".as_slice())
+        && head
+            .get(8..12)
+            .is_some_and(|brand| IMAGE_BRANDS.contains(&brand));
+    if webp || iso_media {
+        return true;
+    }
+    // SVG is text: an XML declaration or an <svg> tag first, and an <svg> tag in the head
+    let text = String::from_utf8_lossy(head);
+    let text = text.trim_start_matches('\u{FEFF}').trim_start();
+    (text.starts_with("<?xml") || text.starts_with("<svg")) && text.contains("<svg")
+}
+
+/// Whether the image routes may read `file_path`. Pictures live in library folders, in the data
+/// dir and in folders an import points at, so there is no library to hold them to. The file is
+/// refused when:
+/// - its path is relative or has a `..` component, or its links can't be resolved;
+/// - its resolved target is a path this server owns, other than a picture folder (see
+///   `NON_IMAGE_DATA_DIRS`): the database, config, TLS files, logs, backups and so on;
+/// - it does not start like a picture (see `looks_like_image`).
+///
+/// Returns the resolved path, which the caller opens.
+fn checked_image_path(file_path: &str, owned: &OwnedPaths) -> Option<std::path::PathBuf> {
+    use std::io::Read;
+
+    let raw = FilePath::new(file_path);
+    if !raw.is_absolute() || has_parent_dir(raw) {
+        return None;
+    }
+    let canonical = raw.canonicalize().ok()?;
+    if owned.owns_in(&canonical, &NON_IMAGE_DATA_DIRS) {
+        return None;
+    }
+    let mut head = [0u8; 512];
+    let mut read = 0;
+    if let Ok(mut file) = std::fs::File::open(&canonical) {
+        while read < head.len() {
+            match file.read(&mut head[read..]) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => read += n,
+            }
+        }
+    }
+    looks_like_image(&head[..read]).then_some(canonical)
+}
+
+/// Whether the image routes may read `file_path` (see `checked_image_path`).
+#[cfg(test)]
+fn image_path_allowed(file_path: &str, owned: &OwnedPaths) -> bool {
+    checked_image_path(file_path, owned).is_some()
+}
+
+/// The resolved path of a stored image that may be served (see `checked_image_path`), which the
+/// caller opens. The checks read the file system, so they run on a blocking thread; no database
+/// query runs.
+pub(crate) async fn validate_image_path(
+    state: &AppState,
+    file_path: &str,
+) -> Result<String, ApiError> {
+    let owned = owned_paths(state).await;
+    let path = file_path.to_string();
+    let checked = tokio::task::spawn_blocking(move || checked_image_path(&path, &owned))
+        .await
+        .ok()
+        .flatten();
+    match checked {
+        Some(path) => Ok(path.to_string_lossy().into_owned()),
+        None => {
+            tracing::warn!("image path '{}' is refused", file_path);
+            Err(ApiError::NotFound("image not found".to_string()))
+        }
+    }
+}
+
+/// The resolved path of `file_path` when it lies in a library and is none of the server's own
+/// files (see `checked_path`, strict when the server's `RefuseLinksOutOfLibraries` is on); the
+/// caller opens that path. This prevents path traversal if the
+/// database is compromised. The library paths are kept between requests and read again once
+/// before a path is refused, so a library added since counts.
+pub(crate) async fn validate_path_against_library(
+    state: &AppState,
+    file_path: &str,
+) -> Result<String, ApiError> {
+    let refused = || {
+        tracing::warn!(
+            "streaming path '{}' is outside the library paths",
+            file_path
+        );
+        ApiError::NotFound("File is outside configured library paths".to_string())
+    };
+    if has_parent_dir(FilePath::new(file_path)) {
+        return Err(refused());
+    }
+    let owned = Arc::new(owned_paths(state).await);
+    let strict = state.config.read().await.refuse_links_out_of_libraries;
+    for refresh in [false, true] {
+        let roots = library_roots(state, refresh).await;
+        let (path, owned) = (file_path.to_string(), owned.clone());
+        let checked =
+            tokio::task::spawn_blocking(move || checked_path(&path, &roots, &owned, strict))
+                .await
+                .ok()
+                .flatten();
+        if let Some(path) = checked {
+            return Ok(path.to_string_lossy().into_owned());
+        }
+    }
+    Err(refused())
 }
 
 /// `GET /Videos/{id}/stream` and `stream.{container}`: the file of the requested version.
@@ -434,8 +609,8 @@ async fn head_stream(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Item {id} not found")))?;
 
-    validate_path_against_library(&state, &item.library_id, &item.path).await?;
-    head_file(&item.path).await
+    let path = validate_path_against_library(&state, &item.path).await?;
+    head_file(&path).await
 }
 
 /// The headers of a `HEAD` for the file at `file_path`: its type, its length, and that byte
@@ -468,8 +643,8 @@ async fn stream_file(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Item {id} not found")))?;
 
-    validate_path_against_library(&state, &item.library_id, &item.path).await?;
-    serve_file(item.path, &headers).await
+    let path = validate_path_against_library(&state, &item.path).await?;
+    serve_file(path, &headers).await
 }
 
 /// Serves the file at `file_path` for a request with `headers`: the whole file, or the byte range,
@@ -730,6 +905,9 @@ async fn audio_universal(
     Path(id): Path<Uuid>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Response, ApiError> {
+    // The client's play session id, else a new one
+    let play_session_id =
+        requested_play_session_id(&params).unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let query = AudioUniversalQuery::from(params);
 
     // Single query: verify item exists and fetch media sources with streams
@@ -748,9 +926,6 @@ async fn audio_universal(
     } else {
         media_sources.first().cloned()
     };
-
-    // Generate playback session ID
-    let play_session_id = uuid::Uuid::new_v4().to_string();
 
     // Determine if direct play is possible
     let can_direct_play = query.enable_direct_play
@@ -916,11 +1091,17 @@ struct VideoPlaybackInfoQuery {
     width: Option<i32>,
     height: Option<i32>,
     max_streaming_bitrate: Option<u32>,
+    /// Jellyfin's SubtitleMethod: "Encode" asks for the subtitle to be burned in, text ones too
+    subtitle_method: Option<String>,
     segment_time: Option<u32>,
     profile: Option<String>,
     max_video_bit_depth: Option<u32>,
     h264_profile: Option<String>,
     h264_video_bit_depth: Option<String>,
+    hevc_profile: Option<String>,
+    hevc_video_bit_depth: Option<String>,
+    hevc_level: Option<String>,
+    hevc_range_type: Option<String>,
 }
 
 impl From<HashMap<String, String>> for VideoPlaybackInfoQuery {
@@ -974,11 +1155,16 @@ impl From<HashMap<String, String>> for VideoPlaybackInfoQuery {
             max_streaming_bitrate: params
                 .get("MaxStreamingBitrate")
                 .and_then(|v| v.parse().ok()),
+            subtitle_method: params.get("SubtitleMethod").cloned(),
             segment_time: params.get("SegmentTime").and_then(|v| v.parse().ok()),
             profile: params.get("Profile").cloned(),
             max_video_bit_depth: params.get("MaxVideoBitDepth").and_then(|v| v.parse().ok()),
             h264_profile: params.get("h264-profile").cloned(),
             h264_video_bit_depth: params.get("h264-videobitdepth").cloned(),
+            hevc_profile: params.get("hevc-profile").cloned(),
+            hevc_video_bit_depth: params.get("hevc-videobitdepth").cloned(),
+            hevc_level: params.get("hevc-level").cloned(),
+            hevc_range_type: params.get("hevc-rangetype").cloned(),
         }
     }
 }
@@ -1014,14 +1200,20 @@ fn track_needs(
         }
         _ => false,
     };
-    // Picture subtitles are burned in by the transcode, text ones are drawn by the browser
+    // Picture subtitles are burned in by the transcode, text ones are drawn by the browser unless
+    // the request asks for them burned in too (SubtitleMethod=Encode)
+    let encode = query
+        .subtitle_method
+        .as_deref()
+        .is_some_and(|method| method.eq_ignore_ascii_case("encode"));
     let burn_in = match query.subtitle_stream_index {
         Some(wanted) if wanted >= 0 => source.media_streams.iter().any(|s| {
             s.index == wanted
                 && is_stream_type(s, "Subtitle")
-                && s.codec
-                    .as_deref()
-                    .is_some_and(rustyfin_core::subtitle::is_image_subtitle)
+                && (encode
+                    || s.codec
+                        .as_deref()
+                        .is_some_and(rustyfin_core::subtitle::is_image_subtitle))
         }),
         _ => false,
     };
@@ -1049,10 +1241,10 @@ async fn video_universal(
         Version::Primary => 0,
         Version::Source(index) => index,
     };
+    // The client's play session id, else a new one: the client stops its transcode by it
+    let play_session_id =
+        requested_play_session_id(&params).unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let query = VideoPlaybackInfoQuery::from(params);
-
-    // Generate playback session ID
-    let play_session_id = uuid::Uuid::new_v4().to_string();
 
     // The tracks the request names that a direct play or stream would not carry
     let needs = match media_sources.get(index) {
@@ -1101,7 +1293,14 @@ async fn video_universal(
         if let Some(source) = media_sources.get(index) {
             url.push_str(&format!("&MediaSourceId={}", source.id));
         }
-        if let Some(bitrate) = query.max_video_bitrate {
+        // The transcode's VideoBitrate is in kbps; Jellyfin's MaxVideoBitrate is in bits/s. With
+        // both limits the lower one wins.
+        let max_video_kbps = query.max_video_bitrate.map(|bps| (bps / 1000).max(1));
+        let streaming_kbps = streaming_video_kbps(
+            query.max_streaming_bitrate,
+            media_sources.get(index).and_then(|source| source.bitrate),
+        );
+        if let Some(bitrate) = [max_video_kbps, streaming_kbps].into_iter().flatten().min() {
             url.push_str(&format!("&VideoBitrate={}", bitrate));
         }
         if let Some(bitrate) = query.max_audio_bitrate {
@@ -1134,7 +1333,23 @@ async fn video_universal(
         if let Some(seg_time) = query.segment_time {
             url.push_str(&format!("&SegmentTime={}", seg_time));
         }
-        url.push_str(&format!("&PlaySessionId={}", play_session_id));
+        // What the client states about the video it takes, which decides a stream copy
+        if let Some(depth) = query.max_video_bit_depth {
+            url.push_str(&format!("&MaxVideoBitDepth={depth}"));
+        }
+        for (name, value) in [
+            ("hevc-profile", &query.hevc_profile),
+            ("hevc-videobitdepth", &query.hevc_video_bit_depth),
+            ("hevc-level", &query.hevc_level),
+            ("hevc-rangetype", &query.hevc_range_type),
+        ] {
+            if let Some(value) = value.as_deref().filter(|v| !v.trim().is_empty()) {
+                let encoded: String = form_urlencoded::byte_serialize(value.as_bytes()).collect();
+                url.push_str(&format!("&{name}={encoded}"));
+            }
+        }
+        let encoded: String = form_urlencoded::byte_serialize(play_session_id.as_bytes()).collect();
+        url.push_str(&format!("&PlaySessionId={encoded}"));
         Some(url)
     } else {
         None
@@ -1222,9 +1437,18 @@ async fn video_playback_info(
         source.supports_transcoding = i == index && supports_transcoding;
     }
 
-    // The caller's remembered tracks become each source's defaults, where the source has them
+    // The caller's remembered tracks become each source's defaults, where the source has them and
+    // the user keeps Jellyfin's RememberAudioSelections and RememberSubtitleSelections on
     let (remembered_audio, remembered_subtitle) =
         rustyfin_db::repo_playback::get_stream_choice(&state.db_ro, claims.sub, id).await?;
+    let config = rustyfin_db::repo_user::get_user_by_id(&state.db_ro, claims.sub)
+        .await?
+        .map(|user| rustyfin_model::user::jellyfin_configuration(&user.configuration))
+        .unwrap_or_default();
+    let remembers = |key: &str| config.get(key).and_then(|v| v.as_bool()) != Some(false);
+    let remembered_audio = remembered_audio.filter(|_| remembers("RememberAudioSelections"));
+    let remembered_subtitle =
+        remembered_subtitle.filter(|_| remembers("RememberSubtitleSelections"));
     let media_sources: Vec<rustyfin_model::playback_info::PlaybackMediaSource> = media_sources
         .into_iter()
         .map(|source| {
@@ -1461,7 +1685,32 @@ fn check_direct_play(
         return false;
     }
 
+    // The client's quality limit holds for direct play too, as in Jellyfin
+    if let Some(max_bitrate) = query.max_streaming_bitrate
+        && let Some(total_bitrate) = source.bitrate
+        && total_bitrate > max_bitrate
+    {
+        return false;
+    }
+
     true
+}
+
+/// The video bitrate in kbps (the HLS transcode's `VideoBitrate` unit) for a transcode under the client's
+/// `MaxStreamingBitrate` in bits per second: the limit less the transcoded audio. As in Jellyfin, a source
+/// over the limit is encoded up to the limit (so the video is never copied above it), and a limit below the
+/// transcode's default bitrate lowers it. A source that fits a high limit, or no limit, keeps the default.
+fn streaming_video_kbps(
+    max_streaming_bitrate: Option<u32>,
+    source_bitrate: Option<u32>,
+) -> Option<u32> {
+    let default = rustyfin_core::transcode::TranscodeProfile::default();
+    let limit = max_streaming_bitrate?;
+    let kbps = (limit / 1000)
+        .saturating_sub(default.max_audio_bitrate_kbps)
+        .max(64);
+    let over_limit = source_bitrate.is_some_and(|bitrate| bitrate > limit);
+    (over_limit || kbps < default.max_video_bitrate_kbps).then_some(kbps)
 }
 
 /// Check if a media source can be directly streamed (re-muxed without transcoding).
@@ -1766,34 +2015,88 @@ mod tests {
         let dir = TempDir::new();
         let lib = dir.path().join("lib");
         let outside = dir.path().join("elsewhere");
-        std::fs::create_dir_all(&lib).unwrap();
-        std::fs::create_dir_all(&outside).unwrap();
+        let data = dir.path().join("data");
+        for d in [&lib, &outside, &data] {
+            std::fs::create_dir_all(d).unwrap();
+        }
         std::fs::write(outside.join("movie.mkv"), b"x").unwrap();
         std::os::unix::fs::symlink(&outside, lib.join("Movie")).unwrap();
         let file = lib.join("Movie/movie.mkv");
-        let canonical = file.canonicalize().unwrap();
-        assert!(path_is_under_library(
-            &file,
-            &canonical,
-            lib.to_str().unwrap()
+        let libs = [lib.to_str().unwrap().to_string()];
+        assert!(path_allowed(
+            file.to_str().unwrap(),
+            &libs,
+            &owned(&data, &[])
         ));
+    }
+
+    #[test]
+    fn r3playback_links_out_of_every_library_follow_the_setting() {
+        // A link that sits inside a library but points out of every library plays by default,
+        // and is refused with RefuseLinksOutOfLibraries; one into another library plays either
+        // way. The checked path is the resolved one, which the caller opens.
+        let dir = TempDir::new();
+        let lib = dir.path().join("lib");
+        let outside = dir.path().join("elsewhere");
+        let data = dir.path().join("data");
+        for d in [&lib, &outside, &data] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(outside.join("movie.mkv"), b"x").unwrap();
+        std::os::unix::fs::symlink(&outside, lib.join("Movie")).unwrap();
+        std::os::unix::fs::symlink(outside.join("movie.mkv"), lib.join("film.mkv")).unwrap();
+        let s = |p: std::path::PathBuf| p.to_str().unwrap().to_string();
+        let one = [s(lib.clone())];
+        let both = [s(lib.clone()), s(outside.clone())];
+        let target = Some(outside.join("movie.mkv").canonicalize().unwrap());
+        for file in [lib.join("Movie/movie.mkv"), lib.join("film.mkv")] {
+            let file = s(file);
+            for strict in [false, true] {
+                let checked =
+                    checked_path(&file, &library_roots_of(&one), &owned(&data, &[]), strict);
+                assert_eq!(
+                    checked,
+                    if strict { None } else { target.clone() },
+                    "{file} {strict}"
+                );
+                let checked =
+                    checked_path(&file, &library_roots_of(&both), &owned(&data, &[]), strict);
+                assert_eq!(checked, target, "{file} {strict}");
+            }
+        }
+        // A link to the server's own files and `..` are refused either way
+        std::fs::write(data.join("rustyfin.db"), b"x").unwrap();
+        std::os::unix::fs::symlink(data.join("rustyfin.db"), lib.join("db.mkv")).unwrap();
+        for file in [
+            s(lib.join("db.mkv")),
+            format!("{}/../elsewhere/movie.mkv", lib.display()),
+        ] {
+            assert!(!path_allowed(&file, &both, &owned(&data, &[])), "{file}");
+            assert!(
+                !path_allowed_strict(&file, &both, &owned(&data, &[])),
+                "{file}"
+            );
+        }
     }
 
     #[test]
     fn r1play_dotdot_escape_is_rejected() {
         let dir = TempDir::new();
         let lib = dir.path().join("lib");
+        let data = dir.path().join("data");
         std::fs::create_dir_all(&lib).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
         std::fs::write(dir.path().join("secret.mkv"), b"x").unwrap();
-        let file = lib.join("../secret.mkv");
-        let canonical = file.canonicalize().unwrap();
-        assert!(!path_is_under_library(
-            &file,
-            &canonical,
-            lib.to_str().unwrap()
-        ));
-        assert_eq!(lexical_normalize(FilePath::new("/../x")), None);
-        assert_eq!(lexical_normalize(FilePath::new("rel/x")), None);
+        std::fs::write(lib.join("in.mkv"), b"x").unwrap();
+        let libs = [lib.to_str().unwrap().to_string()];
+        // Even `..` that stays inside the library is refused before anything resolves
+        for file in [lib.join("../secret.mkv"), lib.join("../lib/in.mkv")] {
+            assert!(!path_allowed(
+                file.to_str().unwrap(),
+                &libs,
+                &owned(&data, &[])
+            ));
+        }
     }
 
     #[test]
@@ -1810,11 +2113,6 @@ mod tests {
         let file = lib.join("link/sub/../../x");
         let canonical = file.canonicalize().unwrap();
         assert_eq!(canonical, dir.path().join("srv/x").canonicalize().unwrap());
-        assert!(!path_is_under_library(
-            &file,
-            &canonical,
-            lib.to_str().unwrap()
-        ));
         let data = dir.path().join("data");
         std::fs::create_dir_all(&data).unwrap();
         let libs = [lib.to_str().unwrap().to_string()];
@@ -1882,6 +2180,17 @@ mod tests {
             &libs,
             &owned(&data, &[])
         ));
+        // With RefuseLinksOutOfLibraries the link out of every library is refused
+        assert!(!path_allowed_strict(
+            &path("Movie/movie.mkv"),
+            &libs,
+            &owned(&data, &[])
+        ));
+        assert!(!path_allowed_strict(
+            &path("db.mkv"),
+            &libs,
+            &owned(&data, &[])
+        ));
         // A library kept inside the data dir (Docker /data with /data/media) still plays
         let inner = data.join("media");
         std::fs::create_dir_all(&inner).unwrap();
@@ -1893,6 +2202,106 @@ mod tests {
             &inner_libs,
             &owned(&data, &[]),
         ));
+    }
+
+    const R3_JPEG: &[u8] = b"\xFF\xD8\xFF\xE0\x00\x10JFIF\x00";
+    const R3_PNG: &[u8] = b"\x89PNG\r\n\x1A\n\x00\x00\x00\x0DIHDR";
+
+    #[test]
+    fn r3playback_pictures_are_told_from_other_files() {
+        for head in [
+            R3_JPEG,
+            R3_PNG,
+            b"GIF89a\x01\x00".as_slice(),
+            b"RIFF\x24\x00\x00\x00WEBPVP8 ".as_slice(),
+            b"\x00\x00\x00\x1Cftypavif".as_slice(),
+            b"\x00\x00\x00\x18ftypheic".as_slice(),
+            b"\x00\x00\x00\x18ftypmif1".as_slice(),
+            b"BM\x36\x00".as_slice(),
+            b"<?xml version=\"1.0\"?>\n<svg xmlns=\"http://www.w3.org/2000/svg\"/>".as_slice(),
+            b"\xEF\xBB\xBF  <svg viewBox=\"0 0 1 1\"></svg>".as_slice(),
+        ] {
+            assert!(looks_like_image(head), "{head:?}");
+        }
+        for head in [
+            b"SQLite format 3\x00".as_slice(),
+            b"{\"ServerName\":\"x\"}".as_slice(),
+            b"-----BEGIN PRIVATE KEY-----".as_slice(),
+            b"root:x:0:0:root:/root:/bin/bash".as_slice(),
+            b"<?xml version=\"1.0\"?><movie/>".as_slice(),
+            b"\x1A\x45\xDF\xA3".as_slice(),
+            b"".as_slice(),
+            b"RIFF\x24\x00\x00\x00WAVEfmt ".as_slice(),
+            // MP4, MOV and M4A share the ISO box but are not pictures
+            b"\x00\x00\x00\x20ftypisom".as_slice(),
+            b"\x00\x00\x00\x14ftypqt  ".as_slice(),
+            b"\x00\x00\x00\x20ftypM4A ".as_slice(),
+            b"\x00\x00\x00\x08ftyp".as_slice(),
+        ] {
+            assert!(!looks_like_image(head), "{head:?}");
+        }
+    }
+
+    #[test]
+    fn r3playback_image_paths_refuse_owned_files_links_and_other_files() {
+        let dir = TempDir::new();
+        let lib = dir.path().join("lib");
+        let data = dir.path().join("data");
+        let import = dir.path().join("jellyfin").join("metadata");
+        for d in [&lib, &data, &import] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        for sub in ["metadata", "images", "cache", "logs", "backups", "plugins"] {
+            std::fs::create_dir_all(data.join(sub)).unwrap();
+        }
+        let tls = dir.path().join("key.pem");
+        std::fs::write(&tls, b"-----BEGIN PRIVATE KEY-----").unwrap();
+        std::fs::write(data.join("rustyfin.db"), b"SQLite format 3\x00").unwrap();
+        std::fs::write(data.join("config.json"), b"{}").unwrap();
+        let owned = owned(&data, &[&tls]);
+        let s = |p: &std::path::Path| p.to_str().unwrap().to_string();
+
+        // Pictures beside the media, in the server's picture folders and in an imported folder
+        let poster = lib.join("poster.jpg");
+        std::fs::write(&poster, R3_JPEG).unwrap();
+        for folder in ["metadata", "images", "cache"] {
+            let file = data.join(folder).join("a.png");
+            std::fs::write(&file, R3_PNG).unwrap();
+            assert!(image_path_allowed(&s(&file), &owned), "{folder}");
+        }
+        let imported = import.join("folder.jpg");
+        std::fs::write(&imported, R3_JPEG).unwrap();
+        assert!(image_path_allowed(&s(&poster), &owned));
+        assert!(image_path_allowed(&s(&imported), &owned));
+        // A link to a picture elsewhere still shows, as Jellyfin follows links too
+        std::os::unix::fs::symlink(&imported, lib.join("fanart.jpg")).unwrap();
+        assert!(image_path_allowed(&s(&lib.join("fanart.jpg")), &owned));
+
+        // The database, config and TLS key, stored or reached by a link with a picture's name
+        for (name, target) in [
+            ("db.jpg", data.join("rustyfin.db")),
+            ("config.jpg", data.join("config.json")),
+            ("key.jpg", tls.clone()),
+        ] {
+            std::os::unix::fs::symlink(&target, lib.join(name)).unwrap();
+            assert!(!image_path_allowed(&s(&lib.join(name)), &owned), "{name}");
+            assert!(!image_path_allowed(&s(&target), &owned), "{name}");
+        }
+        // A picture in a folder that holds none (logs, backups, plugins) is refused all the same
+        for folder in ["logs", "backups", "plugins"] {
+            let file = data.join(folder).join("b.jpg");
+            std::fs::write(&file, R3_JPEG).unwrap();
+            assert!(!image_path_allowed(&s(&file), &owned), "{folder}");
+        }
+        // A file that is no picture, `..`, a relative path and a missing file are refused
+        let text = lib.join("notes.jpg");
+        std::fs::write(&text, b"root:x:0:0:root:/root:/bin/bash").unwrap();
+        assert!(!image_path_allowed(&s(&text), &owned));
+        let dotdot = format!("{}/../lib/poster.jpg", lib.display());
+        assert!(!image_path_allowed(&dotdot, &owned));
+        assert!(!image_path_allowed("poster.jpg", &owned));
+        assert!(!image_path_allowed(&s(&lib.join("missing.jpg")), &owned));
+        assert!(!image_path_allowed(&s(&lib), &owned));
     }
 
     #[test]
@@ -1954,12 +2363,31 @@ mod tests {
                 "{name}"
             );
         }
+        // Another file there plays; with RefuseLinksOutOfLibraries only when its folder is a
+        // library too
+        let both = [libs[0].clone(), db_dir.to_str().unwrap().to_string()];
         assert!(path_allowed(
             &path("other.db"),
             &libs,
             &owned(&data, &[&db])
         ));
-        assert!(path_allowed(&path("main.db"), &libs, &owned(&data, &[])));
+        assert!(!path_allowed_strict(
+            &path("other.db"),
+            &libs,
+            &owned(&data, &[&db])
+        ));
+        assert!(path_allowed(
+            &path("other.db"),
+            &both,
+            &owned(&data, &[&db])
+        ));
+        for name in ["main.db", "main.db-wal", "main.db-shm"] {
+            assert!(
+                !path_allowed(&path(name), &both, &owned(&data, &[&db])),
+                "{name}"
+            );
+        }
+        assert!(path_allowed(&path("main.db"), &both, &owned(&data, &[])));
     }
 
     #[test]
@@ -2054,7 +2482,15 @@ mod tests {
         for refused in ["key.mkv", "db.mkv", "wal.mkv", "shm.mkv"] {
             assert!(!path_allowed(&path(refused), &libs, &owned), "{refused}");
         }
+        // Another file there plays; with RefuseLinksOutOfLibraries only when its folder is a
+        // library too
+        let both = [libs[0].clone(), store.to_str().unwrap().to_string()];
+        for refused in ["key.mkv", "db.mkv", "wal.mkv", "shm.mkv"] {
+            assert!(!path_allowed(&path(refused), &both, &owned), "{refused}");
+        }
         assert!(path_allowed(&path("other.mkv"), &libs, &owned));
+        assert!(!path_allowed_strict(&path("other.mkv"), &libs, &owned));
+        assert!(path_allowed_strict(&path("other.mkv"), &both, &owned));
     }
 
     #[test]

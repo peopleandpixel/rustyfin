@@ -3,8 +3,14 @@ import { $, icon, formatDurationSeconds } from './util.js';
 import { cardImage } from './cards.js';
 import { currentPage } from './router.js';
 import { renderHome } from './home.js';
-import { currentDetailId, renderDetail } from './item.js';
+import { currentDetailId, renderDetail, versionLabels } from './item.js';
 import { clearQueue, queueNeighbours, playQueueStep } from './queue.js';
+import {
+    trackPrefs, defaultTracks, defaultSubtitleIndex as preferredSubtitleIndex, subtitleAppearance, saveSubtitleAppearance,
+    subtitleCss, stepSubtitleOffset, qualityOptions, bitrateLabel, maxStreamingBitrate, setMaxStreamingBitrate,
+    aspectRatio, setAspectRatio, SEGMENT_TYPES, segmentAction, setSegmentAction, stillWatchingSetting,
+    setStillWatchingSetting, stillWatchingDue, burnsInSubtitle,
+} from './playerprefs.js';
 let playerReportInterval = null;
 let playerBars = null;
 
@@ -16,6 +22,8 @@ let activePlayback = null;
 let pendingStop = Promise.resolve();
 // Incremented by each playItem call, so a call that finishes loading after a newer one gives up
 let playRequest = 0;
+// The playItem call still loading, or 0
+let playLoading = 0;
 // True while the seek bar is being dragged, so the timeline does not move the thumb
 let seekDragging = false;
 
@@ -91,7 +99,7 @@ async function openStream(session, startTicks) {
     const startSeconds = startTicks / 1e7;
     // Capture the subtitle before the request so a change made during it sees this load's burn-in
     const requestedSubtitle = session.subtitleIndex;
-    session.burnedIn = streamType === 'Videos' && isImageSubtitle(findStream(session, 'subtitle', requestedSubtitle)?.Codec);
+    session.burnedIn = streamType === 'Videos' && burnsIn(findStream(session, 'subtitle', requestedSubtitle)?.Codec);
 
     let url;
     let isHls = false;
@@ -105,6 +113,11 @@ async function openStream(session, startTicks) {
                 mediaSourceId: session.mediaSourceId,
                 audioStreamIndex: session.audioIndex,
                 subtitleStreamIndex: session.subtitleIndex,
+                // The quality chosen on this device (the settings menu); Auto sends no limit, as a high one would
+                // keep a high-bitrate source (a 4K remux) from playing directly
+                maxBitrate: maxStreamingBitrate() || undefined,
+                // A text subtitle that the device's burn-in setting burns in is asked for as Encode
+                subtitleMethod: session.burnedIn ? 'Encode' : undefined,
             });
             if (!current()) return;
             if (data && data.url) {
@@ -150,8 +163,11 @@ async function openStream(session, startTicks) {
     session.startAt = startSeconds;
     session.isHls = isHls;
     session.playSessionId = playSessionId;
-    session.mediaSourceId = mediaSourceId || session.mediaSourceId;
-    session.burnedIn = isHls && isImageSubtitle(findStream(session, 'subtitle', requestedSubtitle)?.Codec);
+    // Universal lists every version, the first one first: the requested version stays the session's
+    session.mediaSourceId = session.mediaSourceId || mediaSourceId;
+    session.playMethod = isHls ? 'Transcode' : (url.includes('Static=true') ? 'DirectPlay' : 'DirectStream');
+    updateQualityTag();
+    session.burnedIn = isHls && burnsIn(findStream(session, 'subtitle', requestedSubtitle)?.Codec);
 
     video.onerror = () => {
         if (!current()) return;
@@ -324,7 +340,7 @@ function changeSubtitleTrack(value) {
     const session = activePlayback;
     if (!session) return;
     session.subtitleIndex = Number(value);
-    if (session.burnedIn || isImageSubtitle(findStream(session, 'subtitle', session.subtitleIndex)?.Codec)) {
+    if (session.burnedIn || burnsIn(findStream(session, 'subtitle', session.subtitleIndex)?.Codec)) {
         clearTextSubtitle();
         session.tracksChanged = true;
         scheduleRestart(session, session.position());
@@ -347,6 +363,12 @@ function findStream(session, type, index) {
 function isImageSubtitle(codec) {
     const c = (codec || '').toLowerCase();
     return c.includes('pgs') || ['dvd_subtitle', 'dvdsub', 'vobsub', 'dvb_subtitle', 'dvbsub', 'xsub', 'sup'].includes(c);
+}
+
+// Whether the transcode burns in a subtitle of this codec: picture ones, and text ones the device's
+// burn-in setting (Jellyfin Web's subtitleburnin) names
+function burnsIn(codec) {
+    return burnsInSubtitle(codec, isImageSubtitle(codec));
 }
 
 // The text track of the subtitle that showTextSubtitle added, if any
@@ -374,13 +396,15 @@ function clearTextSubtitle() {
         track.remove();
     });
     disableOtherTextTracks(video);
+    renderSubtitleCues();
 }
 
-// Adds the chosen text subtitle as WebVTT; without a label, hls.js leaves the track alone
+// Adds the chosen text subtitle as WebVTT; without a label, hls.js leaves the track alone. The track stays
+// hidden: the player draws its cues itself (renderSubtitleCues), in the user's subtitle appearance and offset.
 function showTextSubtitle(session) {
     clearTextSubtitle();
     const stream = findStream(session, 'subtitle', session.subtitleIndex);
-    if (!session.mediaSourceId || !stream || isImageSubtitle(stream.Codec)) return;
+    if (!session.mediaSourceId || !stream || burnsIn(stream.Codec)) return;
     const track = document.createElement('track');
     track.kind = 'subtitles';
     track.dataset.playerSubtitle = '1';
@@ -391,9 +415,96 @@ function showTextSubtitle(session) {
     track.addEventListener('error', () => {
         if (activePlayback === session) $('player-subtitle').textContent = t('player.subtitles_error');
     });
+    // The cues load once the track is on; the offset in force moves them then
+    track.addEventListener('load', () => applySubtitleOffset(session));
     $('video-player').appendChild(track);
-    track.track.mode = 'showing';
+    track.track.mode = 'hidden';
+    track.track.oncuechange = renderSubtitleCues;
     disableOtherTextTracks($('video-player'));
+}
+
+// --- Text subtitles on screen: Jellyfin Web's custom subtitle rendering, appearance and offset ---
+// Draws the active cues of the player's track, one line each, in the subtitle window
+function renderSubtitleCues() {
+    const win = $('player-subtitle-window');
+    if (!win) return;
+    const track = playerSubtitleTrack($('video-player'));
+    const cues = track && track.mode !== 'disabled' ? Array.from(track.activeCues || []) : [];
+    win.replaceChildren(...cues.map(cue => {
+        const line = document.createElement('div');
+        const text = document.createElement('span');
+        text.className = 'jf-subtitle-text';
+        // getCueAsHTML keeps the cue's italics and bold and never runs markup
+        text.append(typeof cue.getCueAsHTML === 'function' ? cue.getCueAsHTML() : document.createTextNode(cue.text || ''));
+        line.append(text);
+        return line;
+    }));
+}
+
+// The user's subtitle look on the subtitle window and on the settings preview
+function applySubtitleAppearance() {
+    const css = subtitleCss(subtitleAppearance());
+    for (const [id, withWindow] of [['player-subtitle-window', true], ['player-subtitle-preview', false]]) {
+        const el = $(id);
+        if (!el) continue;
+        const { backgroundColor, ...text } = css.text;
+        Object.assign(el.style, text, withWindow ? css.window : {});
+        el.style.setProperty('--jf-subtitle-bg', backgroundColor);
+    }
+}
+
+// One appearance field from the settings panel; the subtitles on screen follow at once
+function setSubtitleAppearance(field, value) {
+    saveSubtitleAppearance({ [field]: field === 'verticalPosition' ? Number(value) : value });
+    applySubtitleAppearance();
+}
+
+// Moves the cues of the player's track by the change since the offset last applied to them. A positive offset
+// shows them earlier, as Jellyfin Web's subtitle sync does.
+function applySubtitleOffset(session) {
+    const el = $('video-player')?.querySelector('track[data-player-subtitle]');
+    const cues = el?.track?.cues;
+    // No cues yet (a restart's track still loading): its load event applies the offset then
+    if (!el || !cues?.length || activePlayback !== session) return;
+    const delta = session.subtitleOffset - Number(el.dataset.offset || 0);
+    if (!delta) return;
+    for (const cue of Array.from(cues)) {
+        cue.startTime -= delta;
+        cue.endTime -= delta;
+    }
+    el.dataset.offset = String(session.subtitleOffset);
+    renderSubtitleCues();
+}
+
+// G and H, and the panel's buttons: 0.1 s earlier (1) or later (-1); 0 resets. Text subtitles only.
+function changeSubtitleOffset(step) {
+    const session = activePlayback;
+    if (!session) return;
+    if (!playerSubtitleTrack($('video-player'))) {
+        showPlayerOsd(t('player.subtitle_offset_text_only'));
+        return;
+    }
+    session.subtitleOffset = step === 0 ? 0 : stepSubtitleOffset(session.subtitleOffset, step);
+    applySubtitleOffset(session);
+    const label = formatOffset(session.subtitleOffset);
+    showPlayerOsd(t('player.subtitle_offset_value', { offset: label }));
+    const value = $('player-subtitle-offset');
+    if (value) value.textContent = label;
+}
+
+function formatOffset(seconds) {
+    return `${seconds > 0 ? '+' : ''}${seconds.toFixed(1)} s`;
+}
+
+// A short message over the video (offset, skipped segment), gone after 1.5 s
+let osdTimer = null;
+function showPlayerOsd(text) {
+    const osd = $('player-osd');
+    if (!osd) return;
+    osd.textContent = text;
+    osd.hidden = false;
+    clearTimeout(osdTimer);
+    osdTimer = setTimeout(() => { osd.hidden = true; }, 1500);
 }
 
 // Language name in the page's language; und, mis, mul and zxx name no language
@@ -446,8 +557,10 @@ function subtitleTrackLabel(s) {
     return trackTitle(s.Title, tags) || t('player.track_undefined');
 }
 
-// Jellyfin's Default mode: external first, then forced in the audio's language, forced, default
-function defaultSubtitleIndex(subs, chosenAudio) {
+// Jellyfin's Default mode: external first, then forced in the audio's language, forced, default. With the user's
+// preferences, their SubtitleMode and language decide (playerprefs.js).
+function defaultSubtitleIndex(subs, chosenAudio, prefs = null) {
+    if (prefs) return preferredSubtitleIndex(subs, chosenAudio, prefs);
     const audioLang = (chosenAudio?.Language || '').toLowerCase();
     let best = null;
     let bestKey = 0;
@@ -484,6 +597,8 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
     const modal = $('player-modal');
     if (!video || !modal) return;
     const request = ++playRequest;
+    // Until this load gives up or plays, a song that stops for it keeps the now-playing bar up (no flicker)
+    playLoading = request;
     if (!queued) clearQueue();
 
     // Report a session that is still playing as stopped before starting another
@@ -503,21 +618,25 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
     $('player-seek').value = 0;
     seekDragging = false;
     clearTextSubtitle();
+    applySubtitleAppearance();
+    applyAspectRatio();
+    closePlayerSettings();
     renderTrackMenus(null);
     resetEpisodeNav();
     hideSkipSegment();
     hideTrickplay();
 
-    // Show modal immediately while loading
-    if (!modal.open) {
+    // Show modal immediately while loading; music plays under the now-playing bar instead
+    if (!modal.open && streamType !== 'Audio') {
         if (typeof modal.showModal === 'function') modal.showModal();
         else modal.setAttribute('open', '');
     }
 
     // Read the resume point only after the Stopped report, so it includes the position just saved
     await pendingStop;
-    // The item gives the resume point and PlaybackInfo the tracks; a failed PlaybackInfo leaves no menus
-    const [item, info] = await Promise.all([
+    // The item gives the resume point, PlaybackInfo the tracks and the user's configuration the track preferences;
+    // a failed PlaybackInfo leaves no menus
+    const [item, info, me] = await Promise.all([
         API.get('/Items/' + itemId).catch(e => {
             console.warn('Could not load item for resume point:', e);
             return null;
@@ -528,29 +647,32 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
                 return null;
             })
             : null,
+        streamType === 'Videos' ? API.getMe().catch(() => null) : null,
     ]);
-    if (!modal.open || request !== playRequest) return; // closed or replaced while loading
+    // Closed (videos) or replaced while loading
+    if ((!modal.open && streamType !== 'Audio') || request !== playRequest) {
+        if (request === playRequest) playLoading = 0;
+        return;
+    }
+    const prefs = trackPrefs(me?.Configuration);
     if (!title && item?.Name) $('player-title').textContent = item.Name;
+    // An episode the user started begins a new run; one played on from the last (with its tracks) adds to it
+    trackStillWatching(item, !!carry);
 
     const startTicks = selection?.startTicks ?? ((streamType !== 'Videos' || fromStart) ? 0 : resumePositionTicks(item));
     const runtimeTicks = item?.RunTimeTicks || 0;
 
-    // Track choices as Jellyfin's defaults pick them; with no PlaybackInfo there are none
+    // Track choices as Jellyfin's defaults pick them from the user's preferences; with no PlaybackInfo there are none
     const source = info?.MediaSources?.find(s => s.Id === selection?.mediaSourceId) || info?.MediaSources?.[0];
     const streams = source?.MediaStreams || [];
     const audioStreams = streams.filter(s => isStreamType(s, 'audio'));
     const subStreams = streams.filter(s => isStreamType(s, 'subtitle'));
-    const defaultAudio = source?.DefaultAudioStreamIndex;
-    const chosenAudio = audioStreams.find(s => s.Index === defaultAudio) || audioStreams.find(s => s.IsDefault) || audioStreams[0] || null;
     let audioIndex = null;
     let subtitleIndex = null;
     if (source) {
-        audioIndex = chosenAudio ? chosenAudio.Index : null;
-        const defaultSub = source.DefaultSubtitleStreamIndex;
-        // The server's choice for this item (a remembered one, or off) wins over the client's default
-        const serverSubtitle = defaultSub === -1 || subStreams.some(s => s.Index === defaultSub);
-        subtitleIndex = serverSubtitle ? defaultSub : defaultSubtitleIndex(subStreams, chosenAudio);
-        ({ audioIndex, subtitleIndex } = carriedTracks(streams, carry, audioIndex, subtitleIndex, serverSubtitle));
+        // The server's remembered tracks for this item win where the user keeps them (Remember*Selections)
+        const defaults = defaultTracks(source, prefs);
+        ({ audioIndex, subtitleIndex } = carriedTracks(streams, carry, defaults.audioIndex, defaults.subtitleIndex, defaults.subtitleFromServer, prefs));
         if (audioStreams.some(s => s.Index === selection?.audioIndex)) audioIndex = selection.audioIndex;
         if (selection?.subtitleIndex === -1 || subStreams.some(s => s.Index === selection?.subtitleIndex)) subtitleIndex = selection.subtitleIndex;
     }
@@ -567,6 +689,9 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
         playSessionId: null,
         mediaSourceId: source?.Id || null,
         streams,
+        sources: info?.MediaSources || [],
+        item,
+        prefs,
         // The item's chapters (PageUp, PageDown), and its tile sets for the seek bar's thumbnails
         chapters: item?.Chapters || [],
         trickplay: null,
@@ -574,6 +699,8 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
         segmentsLoad: null,
         audioIndex,
         subtitleIndex,
+        // Seconds the text subtitles show earlier (G, H); each playback starts at 0, as in Jellyfin Web
+        subtitleOffset: 0,
         burnedIn: false,
         tracksChanged: false,
         loads: 0,
@@ -639,11 +766,16 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
             video.removeAttribute('src');
             video.load();
             clearTextSubtitle();
+            // A song that ended leaves the bar to onended, which plays the next or ends the music
+            if (activePlayback === null && !playLoading && !session.ended) updateNowPlaying(null);
             return reported;
         },
     };
     activePlayback = session;
+    playLoading = 0;
+    updateNowPlaying(session, item);
     session.trickplay = trickplayInfo(item, session.mediaSourceId);
+    renderChapters(session);
     renderTrackMenus(session);
     if (streamType === 'Videos') session.segmentsLoad = loadMediaSegments(session);
     loadEpisodeNav(session, item);
@@ -665,6 +797,7 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
     video.ontimeupdate = () => {
         if (activePlayback !== session) return;
         updatePlayerControls(session);
+        updateNowPlayingProgress(session);
         checkUpNext(session);
         checkSkipSegment(session);
         updateMediaPosition(session);
@@ -679,10 +812,16 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
         if (slider) slider.value = video.volume;
     };
 
+    // An item without a runtime gets its chapter marks once the stream's length is known
+    video.ondurationchange = () => { if (activePlayback === session && !session.runtime) renderChapters(session); };
+
     video.onended = () => {
         if (activePlayback !== session) return;
+        session.ended = true;
         session.stop();
         upNextAtEnd(session);
+        // The last song of the queue: the music is over (nothing next started loading)
+        if (session.streamType === 'Audio' && !playLoading && !activePlayback) endNowPlaying();
     };
 
     await openStream(session, startTicks);
@@ -774,13 +913,20 @@ function playerAutoHide(modal, video, delay = 3000) {
 }
 
 // The dialog closed: stop the session and the queue, reset the bars, and leave fullscreen, which the dialog
-// may hold, and picture-in-picture
+// may hold, and picture-in-picture. Music plays on under the now-playing bar.
 function onPlayerClosed() {
+    if (activePlayback?.streamType === 'Audio') {
+        closePlayerSettings();
+        playerBars?.reset();
+        if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+        return;
+    }
     stopPlayback();
     clearQueue();
     resetEpisodeNav();
     hideSkipSegment();
     hideTrickplay();
+    togglePlaybackStats(false);
     clearMediaSession();
     playerBars?.reset();
     if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
@@ -842,7 +988,7 @@ function episodeTrackCarry(session) {
 // As in Jellyfin: a track in the last episode's language, else the default this episode picked. When
 // the audio changes and no subtitle carries over, the default subtitle is picked again for that audio,
 // unless the subtitle is the server's choice for this episode (subtitleFromServer), off included.
-function carriedTracks(streams, carry, audioIndex, subtitleIndex, subtitleFromServer = false) {
+function carriedTracks(streams, carry, audioIndex, subtitleIndex, subtitleFromServer = false, prefs = null) {
     if (!carry) return { audioIndex, subtitleIndex };
     const inLanguage = (type, language) => (language
         ? streams.filter(s => isStreamType(s, type) && (s.Language || '').toLowerCase() === language)
@@ -856,7 +1002,7 @@ function carriedTracks(streams, carry, audioIndex, subtitleIndex, subtitleFromSe
     const sameKind = subs.filter(s => !!s.IsForced === carry.subtitleForced);
     const pickedSub = sameKind.find(s => s.Index === subtitleIndex) || sameKind.find(s => s.IsDefault) || sameKind[0] || subs[0];
     if (pickedSub) subtitleIndex = pickedSub.Index;
-    else if (audioChanged && !subtitleFromServer) subtitleIndex = defaultSubtitleIndex(streams.filter(s => isStreamType(s, 'subtitle')), pickedAudio);
+    else if (audioChanged && !subtitleFromServer) subtitleIndex = defaultSubtitleIndex(streams.filter(s => isStreamType(s, 'subtitle')), pickedAudio, prefs);
     return { audioIndex, subtitleIndex };
 }
 
@@ -932,11 +1078,33 @@ function updateEpisodeButtons() {
         button.title = label;
         button.setAttribute?.('aria-label', label);
     }
+    // The now-playing bar's previous and next follow the queue
+    for (const [id, item] of [['now-playing-prev', episodeNav?.prev], ['now-playing-next', episodeNav?.next]]) {
+        const button = $(id);
+        if (!button) continue;
+        button.hidden = !episodeNav;
+        button.disabled = !item;
+    }
 }
 
 // Plays a neighbour from its start with this item's track languages; finished reports this one as watched.
 // In a queue the neighbour is the queue's previous or next item.
-function playEpisode(session, episode, { finished = false } = {}) {
+// autoplay: the next-episode card's countdown ran out, the only time the still-watching prompt may ask
+function playEpisode(session, episode, { finished = false, autoplay = false } = {}) {
+    if (stillWatchingAsking) return;
+    if (autoplay && session.streamType !== 'Audio' && episode?.Type === 'Episode' && stillWatchingDue(stillWatchingSetting(),
+        { now: Date.now(), sessionStart: watchRun.start, lastInput, played: watchRun.played.size })) {
+        $('video-player')?.pause();
+        stillWatchingAsking = true;
+        askStillWatching().then(keepWatching => {
+            stillWatchingAsking = false;
+            if (!keepWatching) return closePlayer();
+            watchRun = { start: Date.now(), played: new Set() };
+            lastInput = Date.now();
+            playEpisode(session, episode, { finished });
+        });
+        return;
+    }
     const carry = session.streamType !== 'Audio' ? episodeTrackCarry(session) : null;
     if (finished) session.finished = true;
     const nav = episodeNav;
@@ -1011,14 +1179,15 @@ function renderUpNextCountdown() {
 function upNextTick() {
     if (!upNext) return;
     upNext.remaining -= 1;
-    if (upNext.remaining <= 0) playUpNextNow();
+    if (upNext.remaining <= 0) playUpNextNow(true);
     else renderUpNextCountdown();
 }
 
-function playUpNextNow() {
+// autoplay: the countdown ran out (Play now and the card's button pass nothing)
+function playUpNextNow(autoplay = false) {
     const nav = upNext?.nav;
     hideUpNext();
-    if (nav?.next) playEpisode(nav.session, nav.next, { finished: true });
+    if (nav?.next) playEpisode(nav.session, nav.next, { finished: true, autoplay: autoplay === true });
 }
 
 // Cancel closes the card for this episode, which then ends as usual
@@ -1044,8 +1213,9 @@ function togglePlayPause() {
 }
 
 function updatePlayIcon(isPlaying) {
-    const slot = $('player-play-icon');
-    if (slot) {
+    for (const id of ['player-play-icon', 'now-playing-play-icon']) {
+        const slot = $(id);
+        if (!slot) continue;
         slot.innerHTML = isPlaying
             ? icon('Pause', { size: 20, class: 'w-5 h-5 fill-current' })
             : icon('Play', { size: 20, class: 'w-5 h-5 ml-0.5 fill-current' });
@@ -1189,7 +1359,198 @@ function playerKeyAction(e) {
     case 'End': return () => seekPercent(100);
     case 'PageUp': return nextChapter;
     case 'PageDown': return previousChapter;
+    case 'g': return () => changeSubtitleOffset(-1);
+    case 'h': return () => changeSubtitleOffset(1);
     default: return null;
+    }
+}
+
+// --- Now playing: music plays under a bar on every page (Jellyfin Web's now-playing bar); the full player
+// opens from it and closing it leaves the music playing ---
+// Shows the bar for a song with its title, artists and art, and gives the full player the art; null hides it
+function updateNowPlaying(session, item = null) {
+    const bar = $('now-playing');
+    const audio = session?.streamType === 'Audio';
+    const video = $('video-player');
+    const picture = audio ? itemPicture(item) : null;
+    const art = picture ? API.imageUrl(picture.id, 'Primary', { maxHeight: 512, tag: picture.tag }) : '';
+    if (video) {
+        if (art) video.poster = art;
+        else video.removeAttribute?.('poster');
+    }
+    if (!bar) return;
+    bar.hidden = !audio;
+    document.body.classList.toggle('jf-has-now-playing', audio);
+    if (!audio) return;
+    $('now-playing-title').textContent = item?.Name || $('player-title').textContent;
+    $('now-playing-artist').textContent = itemArtist(item);
+    const img = $('now-playing-img');
+    img.hidden = !art;
+    if (art) img.src = API.imageUrl(picture.id, 'Primary', { maxHeight: 96, tag: picture.tag });
+    updateNowPlayingProgress(session);
+}
+
+function updateNowPlayingProgress(session) {
+    if (session.streamType !== 'Audio' || $('now-playing')?.hidden) return;
+    const total = session.total();
+    const pos = session.position();
+    if (!seekDragging) $('now-playing-seek').value = total > 0 ? Math.min(100, pos / total * 100) : 0;
+    $('now-playing-time').textContent = `${formatDurationSeconds(pos)} / ${formatDurationSeconds(total)}`;
+}
+
+function openFullPlayer() {
+    const modal = $('player-modal');
+    if (modal && !modal.open) modal.showModal();
+}
+
+// The bar's ×: the music stops, the queue ends and the bar goes
+function stopNowPlaying() {
+    stopPlayback();
+    endNowPlaying();
+    const modal = $('player-modal');
+    if (modal?.open) modal.close();
+}
+
+// The music is over: no queue, no OS media controls, no bar
+function endNowPlaying() {
+    clearQueue();
+    resetEpisodeNav();
+    clearMediaSession();
+    updateNowPlaying(null);
+}
+
+// --- Are you still watching? Jellyfin Web's prompt before the next episode, off unless the user turns it on.
+// The run starts with an episode the user plays; it counts the episodes played on from there. ---
+let watchRun = { start: Date.now(), played: new Set() };
+// True while the prompt is open, so a second next (a key, the card) can't play past it
+let stillWatchingAsking = false;
+// The last key, pointer or wheel input, in ms
+let lastInput = Date.now();
+for (const type of ['pointerdown', 'pointermove', 'keydown', 'wheel', 'touchstart']) {
+    document.addEventListener(type, () => { lastInput = Date.now(); }, { capture: true, passive: true });
+}
+
+function trackStillWatching(item, continued) {
+    if (item?.Type !== 'Episode') return;
+    if (!continued) watchRun = { start: Date.now(), played: new Set() };
+    watchRun.played.add(item.Id);
+}
+
+// Resolves true for Continue watching, false for Stop watching (Escape too)
+function askStillWatching() {
+    const dialog = $('still-watching');
+    if (!dialog) return Promise.resolve(true);
+    dialog.returnValue = '';
+    return new Promise(resolve => {
+        dialog.addEventListener('close', () => resolve(dialog.returnValue === 'continue'), { once: true });
+        dialog.showModal();
+    });
+}
+
+function changeStillWatching(value) {
+    setStillWatchingSetting(value);
+}
+
+// --- Playback info: Jellyfin Web's player stats overlay, refreshed every second while it shows ---
+let statsTimer = null;
+
+// Why the server transcodes, in Jellyfin's TranscodeReasons names, as far as the client can tell: what this
+// browser can't play, a burned-in subtitle, or a source over the quality limit
+function transcodeReasons(session, codecs, limit) {
+    if (session.playMethod !== 'Transcode') return [];
+    const source = session.sources.find(s => s.Id === session.mediaSourceId) || {};
+    const video = session.streams.find(s => isStreamType(s, 'video'));
+    const audio = findStream(session, 'audio', session.audioIndex);
+    const name = c => {
+        const codec = (c || '').toLowerCase();
+        return { avc: 'h264', h265: 'hevc', hvc1: 'hevc', mp4a: 'aac' }[codec] || codec;
+    };
+    const reasons = [];
+    if (!['mp4', 'm4v', 'webm', 'mkv', 'mka', 'mov'].some(c => (source.Container || '').toLowerCase().split(',').includes(c))) reasons.push('ContainerNotSupported');
+    if (video && !codecs.video.includes(name(video.Codec))) reasons.push('VideoCodecNotSupported');
+    if (audio && !codecs.audio.includes(name(audio.Codec))) reasons.push('AudioCodecNotSupported');
+    if (session.burnedIn) reasons.push('SubtitleCodecNotSupported');
+    if (limit && source.Bitrate > limit) reasons.push('ContainerBitrateExceedsLimit');
+    return reasons;
+}
+
+// Seconds buffered ahead of the playing point
+function bufferedAhead(video) {
+    const ranges = video.buffered;
+    for (let i = 0; i < (ranges?.length || 0); i++) {
+        if (ranges.start(i) <= video.currentTime + 0.5 && ranges.end(i) >= video.currentTime) return ranges.end(i) - video.currentTime;
+    }
+    return 0;
+}
+
+const formatBitrate = bps => (bps > 0 ? bitrateLabel(Math.round(bps / 1e4) * 1e4) : '');
+
+// The overlay's sections and rows as [label, value]; empty values are left out
+function playbackStats(session, video, { codecs, limit, hls = null }) {
+    const source = session.sources.find(s => s.Id === session.mediaSourceId) || {};
+    const v = session.streams.find(s => isStreamType(s, 'video'));
+    const a = findStream(session, 'audio', session.audioIndex);
+    const sub = findStream(session, 'subtitle', session.subtitleIndex);
+    const quality = video.getVideoPlaybackQuality?.();
+    const methods = { DirectPlay: 'player.direct_play', DirectStream: 'player.direct_stream', Transcode: 'player.hls_transcode' };
+    const level = hls?.levels?.[hls.currentLevel];
+    const playback = [
+        ['player.stats_player', hls ? 'HTML video (hls.js)' : 'HTML video'],
+        ['player.stats_play_method', session.playMethod ? t(methods[session.playMethod]) : ''],
+        ['player.stats_reasons', transcodeReasons(session, codecs, limit).map(r => t(`player.reason_${r}`)).join(', ')],
+        ['player.quality', limit ? bitrateLabel(limit) : t('player.quality_auto')],
+        ['player.stats_stream_bitrate', formatBitrate(level?.bitrate)],
+        ['player.stats_resolution', video.videoWidth ? `${video.videoWidth}×${video.videoHeight}` : ''],
+        ['player.stats_dropped', quality ? `${quality.droppedVideoFrames} / ${quality.totalVideoFrames}` : ''],
+        ['player.stats_buffer', `${bufferedAhead(video).toFixed(1)} s`],
+    ];
+    const media = [
+        ['player.stats_container', (source.Container || '').toUpperCase()],
+        ['player.stats_size', source.Size > 0 ? `${(source.Size / 1048576).toFixed(1)} MiB` : ''],
+        ['player.stats_bitrate', formatBitrate(source.Bitrate)],
+        ['player.stats_video', v ? [(v.Codec || '').toUpperCase(), v.Profile, v.Width && `${v.Width}×${v.Height}`, v.BitDepth && `${v.BitDepth} bit`, formatBitrate(v.BitRate)].filter(Boolean).join(' · ') : ''],
+        ['player.stats_audio', a ? [(a.Codec || '').toUpperCase(), a.Language, a.ChannelLayout || (a.Channels && t('player.track_channels', { count: a.Channels })), formatBitrate(a.BitRate)].filter(Boolean).join(' · ') : ''],
+        ['player.stats_subtitles', sub ? [(sub.Codec || '').toUpperCase(), sub.Language, t(session.burnedIn ? 'player.stats_burned_in' : 'player.stats_text')].filter(Boolean).join(' · ') : ''],
+    ];
+    return [['player.playback_info', playback], ['player.stats_original', media]]
+        .map(([title, rows]) => [title, rows.filter(([, value]) => value)]);
+}
+
+function renderPlaybackStats() {
+    const session = activePlayback;
+    const body = $('player-stats-body');
+    if (!body || !session || session.streamType !== 'Videos') return;
+    const sections = playbackStats(session, $('video-player'), { codecs: API.playableCodecs(), limit: maxStreamingBitrate(), hls: hlsInstance });
+    body.replaceChildren(...sections.map(([title, rows]) => {
+        const section = document.createElement('section');
+        const heading = document.createElement('h4');
+        heading.className = 'jf-player-menu-heading';
+        heading.textContent = t(title);
+        const list = document.createElement('dl');
+        for (const [label, value] of rows) {
+            const dt = document.createElement('dt');
+            dt.textContent = t(label);
+            const dd = document.createElement('dd');
+            dd.textContent = value;
+            list.append(dt, dd);
+        }
+        section.append(heading, list);
+        return section;
+    }));
+}
+
+// Shows or hides the overlay (on: true or false; none toggles)
+function togglePlaybackStats(on) {
+    const panel = $('player-stats');
+    if (!panel) return;
+    const show = typeof on === 'boolean' ? on : panel.hidden;
+    panel.hidden = !show;
+    clearInterval(statsTimer);
+    statsTimer = null;
+    if (show) {
+        closePlayerSettings();
+        renderPlaybackStats();
+        statsTimer = setInterval(renderPlaybackStats, 1000);
     }
 }
 
@@ -1222,16 +1583,27 @@ const hasMediaSession = () => typeof navigator !== 'undefined' && 'mediaSession'
 // The artwork sizes Jellyfin Web offers, largest first (Firefox on Linux takes the first)
 const ARTWORK_SIZES = [512, 384, 256, 192, 128, 96];
 
+// The item's picture, else its album's or series', else the parent's that Jellyfin names
+function itemPicture(item) {
+    if (item?.ImageTags?.Primary) return { id: item.Id, tag: item.ImageTags.Primary };
+    if (item?.AlbumId && item.AlbumPrimaryImageTag) return { id: item.AlbumId, tag: item.AlbumPrimaryImageTag };
+    if (item?.SeriesId && item.SeriesPrimaryImageTag) return { id: item.SeriesId, tag: item.SeriesPrimaryImageTag };
+    if (item?.ParentPrimaryImageItemId && item.ParentPrimaryImageTag) return { id: item.ParentPrimaryImageItemId, tag: item.ParentPrimaryImageTag };
+    return null;
+}
+
+// An episode under its series, a song under its artists
+function itemArtist(item) {
+    return item?.Type === 'Episode'
+        ? [item.SeriesName, episodeNumberLabel(item)].filter(Boolean).join(' · ')
+        : (item?.Artists?.length ? item.Artists.join(', ') : item?.AlbumArtist || '');
+}
+
 // Title, artist, album and artwork as Jellyfin Web shows them: an episode under its series, a song under its
 // artists and album. The artwork is the item's picture, else its album's or series'.
 function mediaSessionMetadata(item, title) {
-    const artist = item?.Type === 'Episode'
-        ? [item.SeriesName, episodeNumberLabel(item)].filter(Boolean).join(' · ')
-        : (item?.Artists?.length ? item.Artists.join(', ') : item?.AlbumArtist || '');
-    let picture = null;
-    if (item?.ImageTags?.Primary) picture = { id: item.Id, tag: item.ImageTags.Primary };
-    else if (item?.AlbumId && item.AlbumPrimaryImageTag) picture = { id: item.AlbumId, tag: item.AlbumPrimaryImageTag };
-    else if (item?.SeriesId && item.SeriesPrimaryImageTag) picture = { id: item.SeriesId, tag: item.SeriesPrimaryImageTag };
+    const artist = itemArtist(item);
+    const picture = itemPicture(item);
     const artwork = picture
         ? ARTWORK_SIZES.map(size => ({ src: API.imageUrl(picture.id, 'Primary', { maxHeight: size, tag: picture.tag }), sizes: `${size}x${size}` }))
         : [];
@@ -1290,14 +1662,14 @@ function bindMediaSession() {
     const video = () => $('video-player');
     setMediaSessionHandler('play', () => video()?.play());
     setMediaSessionHandler('pause', () => video()?.pause());
-    setMediaSessionHandler('stop', closePlayer);
+    setMediaSessionHandler('stop', () => (activePlayback?.streamType === 'Audio' ? stopNowPlaying() : closePlayer()));
     setMediaSessionHandler('seekbackward', d => skipTime(-(d?.seekOffset || 10)));
     setMediaSessionHandler('seekforward', d => skipTime(d?.seekOffset || 30));
     setMediaSessionHandler('seekto', d => { if (activePlayback && Number.isFinite(d?.seekTime)) seekTo(activePlayback, d.seekTime); });
 }
 
-// --- Skip intro and outro: Jellyfin Web asks to skip each media segment of these types ---
-const SKIP_SEGMENT_TYPES = ['Intro', 'Outro'];
+// --- Media segments: per type, Jellyfin Web skips them, asks to skip them (intros and outros by default) or
+// does nothing (segmentAction in playerprefs.js) ---
 // The button shows for 8 s from the segment's start, and while the bars show
 const SKIP_PROMPT_MS = 8000;
 // skipPrompt: the segment the button offers to skip, while it shows
@@ -1306,10 +1678,10 @@ let skipPrompt = null;
 const segmentStart = s => (s.StartTicks ?? s.SegmentStartTicks ?? 0) / 1e7;
 const segmentEnd = s => (s.EndTicks ?? s.SegmentEndTicks ?? 0) / 1e7;
 
-// The segment to offer at seconds: an intro or outro of 3 s or more. An outro that runs to the end of an item
-// with a next one is left to the next-episode card, as in Jellyfin.
-function skippableSegment(segments, seconds, total, hasNext) {
-    return (segments || []).find(s => SKIP_SEGMENT_TYPES.includes(s.Type)
+// The segment to act on at seconds: one of 3 s or more whose type the user skips or is asked about. An outro that
+// runs to the end of an item with a next one is left to the next-episode card, as in Jellyfin.
+function skippableSegment(segments, seconds, total, hasNext, actionOf = segmentAction) {
+    return (segments || []).find(s => SEGMENT_TYPES.includes(s.Type) && actionOf(s.Type) !== 'None'
         && segmentEnd(s) - segmentStart(s) >= 3
         && seconds >= segmentStart(s) && seconds < segmentEnd(s)
         && !(s.Type === 'Outro' && hasNext && total > 0 && segmentEnd(s) >= total - 1)) || null;
@@ -1324,13 +1696,39 @@ async function checkSkipSegment(session) {
     const segment = skippableSegment(segments, session.position(), session.total(), hasNext);
     if (segment === skipPrompt?.segment) return;
     hideSkipSegment();
-    if (segment) showSkipSegment(segment);
+    if (!segment) return;
+    // Skip: once per segment and playback, so seeking back into it plays it
+    if (segmentAction(segment.Type) === 'Skip') {
+        if (session.skipped?.has(segment)) return;
+        (session.skipped ||= new Set()).add(segment);
+        showPlayerOsd(t('player.segment_skipped', { type: segmentTypeName(segment.Type) }));
+        if (session.position() < segmentEnd(segment) - 1) seekTo(session, segmentEnd(segment));
+        return;
+    }
+    showSkipSegment(segment);
+}
+
+function segmentTypeName(type) {
+    return t(`player.segment_${type.toLowerCase()}`);
+}
+
+// The menu's Media segments section: one action per type
+function renderSegmentSettings() {
+    for (const type of SEGMENT_TYPES) {
+        const select = $(`player-segment-${type.toLowerCase()}`);
+        if (select) select.value = segmentAction(type);
+    }
+}
+
+function changeSegmentAction(type, action) {
+    setSegmentAction(type, action);
+    hideSkipSegment();
 }
 
 function showSkipSegment(segment) {
     const button = $('player-skip-segment');
     if (!button) return;
-    button.textContent = t('player.skip_segment', { type: t(`player.segment_${segment.Type.toLowerCase()}`) });
+    button.textContent = t('player.skip_segment', { type: segmentTypeName(segment.Type) });
     button.classList.remove('jf-skip-expired');
     button.hidden = false;
     skipPrompt = { segment, timer: setTimeout(() => button.classList.add('jf-skip-expired'), SKIP_PROMPT_MS) };
@@ -1397,6 +1795,12 @@ function showTrickplay(percent) {
         img.style.backgroundPosition = `-${thumb.x}px -${thumb.y}px`;
     }
     $('player-trickplay-time').textContent = formatDurationSeconds(seconds);
+    const chapter = chapterAt(session.chapters, seconds);
+    const name = $('player-trickplay-chapter');
+    if (name) {
+        name.textContent = chapter?.Name || '';
+        name.hidden = !chapter?.Name;
+    }
     bubble.style.left = `${Math.min(Math.max(percent, 0), 100)}%`;
     bubble.hidden = false;
 }
@@ -1412,6 +1816,192 @@ function hoverSeek(e) {
     if (!activePlayback || !rect?.width) return;
     showTrickplay(Math.min(Math.max((e.clientX - rect.left) / rect.width, 0), 1) * 100);
 }
+
+// --- Chapters: marks on the seek bar, the chapters menu, and the chapter's name over the seek preview ---
+function chapterStart(c) {
+    return (c.StartPositionTicks ?? c.StartTicks ?? 0) / 1e7;
+}
+
+// The chapter playing at seconds: the last one that started by then
+function chapterAt(chapters, seconds) {
+    let found = null;
+    for (const c of [...(chapters || [])].sort((a, b) => chapterStart(a) - chapterStart(b))) {
+        if (chapterStart(c) <= seconds) found = c;
+    }
+    return found;
+}
+
+// A mark at each chapter start after the first, as Jellyfin Web's seek bar shows them; the menu for two or more
+function renderChapters(session) {
+    const chapters = [...(session?.chapters || [])].sort((a, b) => chapterStart(a) - chapterStart(b));
+    const total = session ? session.total() : 0;
+    const marks = $('player-chapter-marks');
+    if (marks) {
+        marks.replaceChildren(...(total > 0 ? chapters.filter(c => chapterStart(c) > 0 && chapterStart(c) < total) : []).map(c => {
+            const mark = document.createElement('span');
+            mark.className = 'jf-chapter-mark';
+            mark.style.left = `${chapterStart(c) / total * 100}%`;
+            return mark;
+        }));
+    }
+    const list = $('player-chapters-list');
+    if (list) {
+        list.replaceChildren(...chapters.map((c, i) => {
+            const button = document.createElement('button');
+            button.type = 'button';
+            button.className = 'jf-chapter-item';
+            const name = document.createElement('span');
+            name.className = 'truncate';
+            name.textContent = c.Name || t('player.chapter_number', { number: i + 1 });
+            const time = document.createElement('span');
+            time.className = 'font-mono text-white/60';
+            time.textContent = formatDurationSeconds(chapterStart(c));
+            button.append(name, time);
+            button.onclick = () => playChapter(chapterStart(c));
+            return button;
+        }));
+    }
+    const menu = $('player-chapters');
+    if (menu) {
+        menu.hidden = chapters.length < 2;
+        if (menu.hidden) menu.open = false;
+    }
+}
+
+// Marks the chapter playing now when the menu opens
+function renderChapterMenu(open) {
+    const session = activePlayback;
+    if (!open || !session) return;
+    const chapters = [...session.chapters].sort((a, b) => chapterStart(a) - chapterStart(b));
+    const current = chapterAt(chapters, session.position());
+    const buttons = $('player-chapters-list')?.children || [];
+    chapters.forEach((c, i) => buttons[i]?.setAttribute('aria-current', String(c === current)));
+}
+
+function playChapter(seconds) {
+    const menu = $('player-chapters');
+    if (menu) menu.open = false;
+    if (activePlayback) seekTo(activePlayback, seconds);
+}
+
+// --- The settings menu (the gear): fills its fields from the playback and the stored settings when it opens ---
+function renderPlayerSettings(open) {
+    if (!open) return;
+    const menu = $('player-settings');
+    const appearance = subtitleAppearance();
+    for (const field of menu?.querySelectorAll('#player-settings-subtitles [name]') || []) {
+        field.value = String(appearance[field.name] ?? '');
+    }
+    const offset = $('player-subtitle-offset');
+    if (offset) offset.textContent = formatOffset(activePlayback?.subtitleOffset || 0);
+    applySubtitleAppearance();
+    renderPlaybackSettings(activePlayback);
+    renderSegmentSettings();
+    const still = $('player-still-watching');
+    if (still) still.value = stillWatchingSetting();
+}
+
+// --- Quality, version and aspect ratio: the menu's Playback section ---
+// The source's video bitrate, which bounds the quality steps offered
+function sourceVideoBitrate(session) {
+    const video = session.streams.find(s => isStreamType(s, 'video'));
+    const source = session.sources.find(s => s.Id === session.mediaSourceId);
+    return video?.BitRate || source?.Bitrate || 0;
+}
+
+function renderPlaybackSettings(session) {
+    const isVideo = !!session && session.streamType === 'Videos';
+    const quality = $('player-quality');
+    if (quality) {
+        const video = session?.streams.find(s => isStreamType(s, 'video'));
+        const steps = isVideo ? qualityOptions(sourceVideoBitrate(session), video?.Codec) : [0];
+        const current = maxStreamingBitrate();
+        // A limit chosen for another item stays, and shows, even where this item lists no such step
+        if (!steps.includes(current)) steps.push(current);
+        quality.replaceChildren(...steps.map(b => new Option(b ? bitrateLabel(b) : t('player.quality_auto'), b)));
+        quality.value = String(current);
+    }
+    const sources = isVideo ? session.sources : [];
+    const version = $('player-version');
+    if (version) {
+        const labels = versionLabels(sources);
+        version.replaceChildren(...sources.map((s, i) => new Option(labels[i], s.Id)));
+        version.value = session?.mediaSourceId || '';
+    }
+    const show = (id, on) => { const row = $(id); if (row) row.hidden = !on; };
+    show('player-quality-row', isVideo);
+    show('player-version-row', sources.length > 1);
+    show('player-aspect-row', isVideo);
+    const aspect = $('player-aspect');
+    if (aspect) aspect.value = aspectRatio();
+}
+
+// The top bar's tag: how the item plays and the quality limit
+function updateQualityTag() {
+    const tag = $('player-quality-tag');
+    const session = activePlayback;
+    if (!tag) return;
+    tag.hidden = !session || session.streamType !== 'Videos';
+    const limit = maxStreamingBitrate();
+    tag.textContent = limit ? bitrateLabel(limit) : t('player.quality_auto');
+}
+
+// A new quality limit restarts the stream at the same point, as Jellyfin Web does
+function changeQuality(value) {
+    setMaxStreamingBitrate(Number(value));
+    updateQualityTag();
+    const session = activePlayback;
+    if (!session || session.streamType !== 'Videos') return;
+    session.tracksChanged = true;
+    scheduleRestart(session, session.position());
+}
+
+// Another version plays from the same point, keeping the audio and subtitle languages where it has them
+function changeVersion(id) {
+    const session = activePlayback;
+    const source = session?.sources.find(s => s.Id === id);
+    if (!source || id === session.mediaSourceId) return;
+    const carry = episodeTrackCarry(session);
+    const position = session.position();
+    session.mediaSourceId = id;
+    session.streams = source.MediaStreams || [];
+    const defaults = defaultTracks(source, session.prefs);
+    ({ audioIndex: session.audioIndex, subtitleIndex: session.subtitleIndex } = carriedTracks(session.streams, carry,
+        defaults.audioIndex, defaults.subtitleIndex, defaults.subtitleFromServer, session.prefs));
+    session.trickplay = trickplayInfo(session.item, id);
+    clearTextSubtitle();
+    renderTrackMenus(session);
+    renderPlaybackSettings(session);
+    session.tracksChanged = true;
+    scheduleRestart(session, position);
+}
+
+function applyAspectRatio() {
+    const video = $('video-player');
+    const value = aspectRatio();
+    if (video) video.style.objectFit = value === 'auto' ? '' : value;
+}
+
+function changeAspectRatio(value) {
+    setAspectRatio(value);
+    applyAspectRatio();
+}
+
+const PLAYER_MENUS = ['player-settings', 'player-chapters'];
+function closePlayerSettings() {
+    for (const id of PLAYER_MENUS) {
+        const menu = $(id);
+        if (menu) menu.open = false;
+    }
+}
+
+// A click or tap outside an open menu closes it
+document.addEventListener('pointerdown', e => {
+    for (const id of PLAYER_MENUS) {
+        const menu = $(id);
+        if (menu?.open && !menu.contains(e.target)) menu.open = false;
+    }
+});
 
 function toggleFullscreen() {
     const video = $('video-player');
@@ -1467,7 +2057,9 @@ export {
     resumePositionTicks, playWithResumeChoice, stopPlayback, seekVideo, skipTime, previewSeek, changeAudioTrack,
     changeSubtitleTrack, playItem, playerAutoHide, onPlayerClosed, playerAreaClick, closePlayer, playAdjacentEpisode,
     playUpNextNow, cancelUpNext, togglePlayPause, setVolume, toggleMute, setPlaybackRate, toggleFullscreen,
-    togglePictureInPicture, skipSegment, hoverSeek, hideTrickplay,
+    togglePictureInPicture, skipSegment, hoverSeek, hideTrickplay, renderPlayerSettings, setSubtitleAppearance,
+    changeSubtitleOffset, changeQuality, changeVersion, changeAspectRatio, renderChapterMenu, changeSegmentAction,
+    togglePlaybackStats, changeStillWatching, openFullPlayer, stopNowPlaying,
 };
 
 // Shared state that inline handlers or other modules assign: reached through window

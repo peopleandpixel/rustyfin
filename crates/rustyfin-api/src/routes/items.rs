@@ -42,6 +42,12 @@ async fn populate_media_sources(
             .unwrap_or_default();
         item.media_sources = sources;
     }
+    // The subtitle files beside each source, each folder read once
+    let mut sources: Vec<_> = items
+        .iter_mut()
+        .flat_map(|item| item.media_sources.iter_mut())
+        .collect();
+    crate::routes::subtitle::add_external_streams(&mut sources).await;
     Ok(())
 }
 
@@ -52,6 +58,8 @@ async fn populate_media_source_single(
 ) -> Result<(), ApiError> {
     let sources = rustyfin_db::repo_media_source::get_media_sources(pool, &item.id).await?;
     item.media_sources = sources;
+    let mut sources: Vec<_> = item.media_sources.iter_mut().collect();
+    crate::routes::subtitle::add_external_streams(&mut sources).await;
     Ok(())
 }
 
@@ -2002,6 +2010,10 @@ struct ItemsQuery {
     subtitle_language: Option<String>,
     #[serde(rename = "subtitleLanguage")]
     subtitle_language_lower: Option<String>,
+    /// Jellyfin's SubtitleLanguages: the items with a subtitle in one of these languages
+    subtitle_languages: Option<String>,
+    #[serde(rename = "subtitleLanguages")]
+    subtitle_languages_lower: Option<String>,
     enable_auto_hide: Option<bool>,
     #[serde(rename = "enableAutoHide")]
     enable_auto_hide_lower: Option<bool>,
@@ -2247,10 +2259,22 @@ impl ItemsQuery {
     fn has_special_feature(&self) -> Option<bool> {
         self.has_special_feature.or(self.has_special_feature_lower)
     }
-    fn subtitle_language(&self) -> Option<&str> {
-        self.subtitle_language
+    /// The subtitle languages to filter by: Jellyfin's comma list `SubtitleLanguages`, else the
+    /// single `SubtitleLanguage` Rustyfin took before. Each code is matched in all its spellings,
+    /// so `ger` and `deu` find the same items.
+    fn subtitle_languages(&self) -> Option<Vec<String>> {
+        let list = self
+            .subtitle_languages
             .as_deref()
-            .or(self.subtitle_language_lower.as_deref())
+            .or(self.subtitle_languages_lower.as_deref())
+            .or(self.subtitle_language.as_deref())
+            .or(self.subtitle_language_lower.as_deref())?;
+        let forms: Vec<String> = list
+            .split(',')
+            .filter(|code| !code.trim().is_empty())
+            .flat_map(rustyfin_model::media_source::language_forms)
+            .collect();
+        (!forms.is_empty()).then_some(forms)
     }
     fn enable_auto_hide(&self) -> bool {
         self.enable_auto_hide
@@ -2416,6 +2440,12 @@ async fn get_items(
     if let Some(statuses) = query.series_status() {
         let statuses: Vec<&str> = statuses.split(',').map(str::trim).collect();
         let ids = rustyfin_db::repo_media::series_ids_with_status(&state.db_ro, &statuses).await?;
+        item_ids = Some(narrow_ids(item_ids, ids));
+    }
+    if let Some(languages) = query.subtitle_languages() {
+        let ids =
+            rustyfin_db::repo_media::item_ids_with_subtitle_language(&state.db_ro, &languages)
+                .await?;
         item_ids = Some(narrow_ids(item_ids, ids));
     }
     let hidden = HiddenItems::for_caller(&state, &claims).await?;
@@ -3335,26 +3365,60 @@ async fn get_item_collections(
     }))
 }
 
-/// DELETE /Items/{id}/Images/{imageType}
+/// DELETE /Items/{id}/Images/{imageType}?imageIndex=: the item's images of that type, or the one
+/// at imageIndex. 204, or 404 for an unknown item, as in Jellyfin.
 async fn delete_item_image(
     State(state): State<AppState>,
-    Path((id, _image_type)): Path<(Uuid, String)>,
-) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
-    rustyfin_db::repo_media::delete_item_image(&state.db, id, &_image_type)
-        .await
-        .ok();
-    Ok((StatusCode::OK, Json(serde_json::json!({}))))
+    Path((id, image_type)): Path<(Uuid, String)>,
+    Query(params): Query<Vec<(String, String)>>,
+) -> Result<StatusCode, ApiError> {
+    match crate::query::first_value(&params, "imageIndex") {
+        Some(index) => {
+            let index = index
+                .parse()
+                .map_err(|_| ApiError::BadRequest(format!("invalid imageIndex: {index}")))?;
+            remove_item_image(&state, id, &image_type, Some(index)).await
+        }
+        None => remove_item_image(&state, id, &image_type, None).await,
+    }
 }
 
 /// DELETE /Items/{id}/Images/{imageType}/{imageIndex}
 async fn delete_item_image_index(
     State(state): State<AppState>,
-    Path((id, _image_type, _index)): Path<(Uuid, String, i32)>,
-) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
-    rustyfin_db::repo_media::delete_item_image_index(&state.db, id, &_image_type, _index)
-        .await
-        .ok();
-    Ok((StatusCode::OK, Json(serde_json::json!({}))))
+    Path((id, image_type, index)): Path<(Uuid, String, i32)>,
+) -> Result<StatusCode, ApiError> {
+    remove_item_image(&state, id, &image_type, Some(index)).await
+}
+
+async fn remove_item_image(
+    state: &AppState,
+    id: Uuid,
+    image_type: &str,
+    index: Option<i32>,
+) -> Result<StatusCode, ApiError> {
+    rustyfin_db::repo_media::get_item_by_id(&state.db, id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("item not found".into()))?;
+    let image_type = rustyfin_model::image::ImageType::from_str(image_type)
+        .ok_or_else(|| ApiError::BadRequest(format!("unknown image type: {image_type}")))?;
+    match index {
+        Some(index) => {
+            rustyfin_db::repo_media::delete_item_image_index(
+                &state.db,
+                id,
+                image_type.as_str(),
+                index,
+            )
+            .await?
+        }
+        None => {
+            rustyfin_db::repo_media::delete_item_image(&state.db, id, image_type.as_str()).await?
+        }
+    }
+    state.cache.invalidate_item(&id.to_string());
+    state.image_cache.invalidate_item(&id.to_string());
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// DELETE /Items/{id}/AlternateSources
