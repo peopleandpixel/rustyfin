@@ -865,7 +865,9 @@ async fn pipe_key_frames(
         return Err("ffprobe or ffmpeg has no pipe".to_string());
     };
     let feed = async move {
-        let mut lines = BufReader::with_capacity(1 << 16, packets).lines();
+        let mut lines = BufReader::with_capacity(1 << 16, packets);
+        // One buffer for every line: a 4K key frame takes thousands
+        let mut line = Vec::with_capacity(128);
         let (mut packet, mut key, mut fed) = (Vec::new(), false, 0);
         let mut out = Vec::new();
         let mut send = async |packet: &mut Vec<u8>, key: bool| -> Result<(), String> {
@@ -881,18 +883,30 @@ async fn pipe_key_frames(
                 .map_err(|e| format!("ffmpeg stopped reading the key frames: {e}"))
         };
         // Each packet: flags=K__, then data=, its hex dump and an empty line
-        while let Some(line) = lines.next_line().await.map_err(|e| e.to_string())? {
-            if let Some(flags) = line.strip_prefix("flags=") {
+        loop {
+            line.clear();
+            let read = lines
+                .read_until(b'\n', &mut line)
+                .await
+                .map_err(|e| e.to_string())?;
+            if read == 0 {
+                break;
+            }
+            let text = line.trim_ascii_end();
+            if let Some(flags) = text.strip_prefix(b"flags=") {
                 if fed > 0 {
                     send(&mut packet, key).await?;
                 }
-                key = flags.starts_with('K');
+                key = flags.starts_with(b"K");
                 fed += 1;
-            } else if !line.is_empty()
-                && line != "data="
-                && !key_frames::hex_line(&line, &mut packet)
+            } else if !text.is_empty()
+                && text != b"data="
+                && !key_frames::hex_line(text, &mut packet)
             {
-                return Err(format!("ffprobe printed {line:?}"));
+                return Err(format!(
+                    "ffprobe printed {:?}",
+                    String::from_utf8_lossy(text)
+                ));
             }
         }
         if fed > 0 {

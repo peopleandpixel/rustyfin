@@ -20,38 +20,53 @@ pub(crate) const NOT_ALONE: &str = "a key frame that doesn't decode alone";
 
 /// Adds the bytes of one line of ffprobe's `-show_data` hex dump to `out`, as
 /// `00000010: 0227 e584 0006 5d3c  .'....]<`. False, and nothing added, when it isn't one.
-pub(crate) fn hex_line(line: &str, out: &mut Vec<u8>) -> bool {
-    let b = line.as_bytes();
-    if b.len() < 10 || b[8] != b':' || !b[..8].iter().all(u8::is_ascii_hexdigit) {
-        return false;
-    }
-    // The hex columns end where the text column starts, two spaces on
-    let hex = &line[10..];
-    let hex = hex.split("  ").next().unwrap_or_default();
-    let digits: Vec<u8> = hex.bytes().filter(|c| *c != b' ').collect();
-    if !digits.len().is_multiple_of(2) {
+/// It allocates nothing beyond `out`, as a 4K key frame takes thousands of lines.
+pub(crate) fn hex_line(line: &[u8], out: &mut Vec<u8>) -> bool {
+    if line.len() < 10 || line[8] != b':' || !line[..8].iter().all(u8::is_ascii_hexdigit) {
         return false;
     }
     let start = out.len();
-    for pair in digits.chunks(2) {
-        let (Some(hi), Some(lo)) = (hex_digit(pair[0]), hex_digit(pair[1])) else {
+    let mut high: Option<u8> = None;
+    let mut rest = &line[10..];
+    // The hex columns end where the text column starts, two spaces on
+    while let [c, tail @ ..] = rest {
+        rest = tail;
+        if *c == b' ' {
+            if tail.first() == Some(&b' ') {
+                break;
+            }
+            continue;
+        }
+        let Some(nibble) = hex_digit(*c) else {
             out.truncate(start);
             return false;
         };
-        out.push(hi << 4 | lo);
+        match high.take() {
+            Some(h) => out.push(h << 4 | nibble),
+            None => high = Some(nibble),
+        }
+    }
+    if high.is_some() {
+        out.truncate(start);
+        return false;
     }
     true
 }
 
 fn hex_digit(c: u8) -> Option<u8> {
-    (c as char).to_digit(16).map(|d| d as u8)
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// The bytes of a whole `-show_data` hex dump, such as a stream's `extradata`.
 pub(crate) fn hex_dump(text: &str) -> Vec<u8> {
     let mut out = Vec::new();
     for line in text.lines() {
-        hex_line(line.trim_start(), &mut out);
+        hex_line(line.trim_start().as_bytes(), &mut out);
     }
     out
 }
@@ -139,6 +154,12 @@ impl KeyFrameStream {
             if nal.is_empty() {
                 continue;
             }
+            // HEVC layers above the base (MV-HEVC's second view, a Dolby Vision enhancement
+            // layer) are left out: the base layer decodes alone, and theirs would reuse its
+            // parameter set ids and keep their own, unrewritten, POCs
+            if self.codec == Codec::Hevc && hevc_layer(nal) != 0 {
+                continue;
+            }
             match self.codec {
                 Codec::H264 => match nal[0] & 0x1f {
                     5 => pictures += 1,
@@ -169,6 +190,14 @@ impl KeyFrameStream {
             Codec::H264 => Ok(nal),
             Codec::Hevc => self.hevc.nal(nal),
         }
+    }
+}
+
+/// An HEVC NAL unit's `nuh_layer_id`; 0, the base layer, for a unit too short to have one.
+fn hevc_layer(nal: &[u8]) -> u8 {
+    match nal {
+        [a, b, ..] => (a & 1) << 5 | b >> 3,
+        _ => 0,
     }
 }
 
@@ -242,18 +271,19 @@ impl HevcPoc {
     fn nal(&mut self, nal: Vec<u8>) -> Result<Vec<u8>, String> {
         let kind = (nal.first().copied().unwrap_or_default() >> 1) & 0x3f;
         let bad = |what: &str| format!("{NOT_ALONE}: its {what} can't be read");
+        let payload = nal.get(2..).unwrap_or_default();
         match kind {
             33 => {
-                let (id, sps) = parse_sps(&unescape(&nal[2..])).ok_or_else(|| bad("SPS"))?;
+                let (id, sps) = parse_sps(&unescape(payload)).ok_or_else(|| bad("SPS"))?;
                 self.sps.insert(id, sps);
                 Ok(nal)
             }
             34 => {
-                let (id, pps) = parse_pps(&unescape(&nal[2..])).ok_or_else(|| bad("PPS"))?;
+                let (id, pps) = parse_pps(&unescape(payload)).ok_or_else(|| bad("PPS"))?;
                 self.pps.insert(id, pps);
                 Ok(nal)
             }
-            16..=21 if nal.len() > 2 => self.slice(nal, kind).ok_or_else(|| bad("slice header")),
+            16..=21 => self.slice(nal, kind).ok_or_else(|| bad("slice header")),
             _ => Ok(nal),
         }
     }
@@ -261,7 +291,7 @@ impl HevcPoc {
     /// Gives an IRAP slice its POC LSB: 0 after an IDR, which resets the count, else a quarter
     /// of the range on from the last picture's.
     fn slice(&mut self, nal: Vec<u8>, kind: u8) -> Option<Vec<u8>> {
-        let mut rbsp = unescape(&nal[2..]);
+        let mut rbsp = unescape(nal.get(2..)?);
         let mut r = Bits::new(&rbsp);
         let first = r.flag()?;
         r.skip(1)?; // no_output_of_prior_pics_flag, as every IRAP slice has
@@ -305,7 +335,7 @@ impl HevcPoc {
                 rbsp[p / 8] &= !mask;
             }
         }
-        let mut out = nal[..2].to_vec();
+        let mut out = nal.get(..2)?.to_vec();
         escape(&rbsp, &mut out);
         Some(out)
     }
@@ -344,16 +374,18 @@ fn parse_sps(rbsp: &[u8]) -> Option<(u32, Sps)> {
     }
     r.ue()?;
     r.ue()?; // bit depths
-    let poc_lsb_bits = r.ue()? + 4;
+    // log2_max_pic_order_cnt_lsb_minus4: 0 to 12
+    let poc_lsb_bits = Some(r.ue()?).filter(|&n| n <= 12)? + 4;
     let all_layers = r.flag()?;
     for _ in if all_layers { 0 } else { sub_layers }..=sub_layers {
         r.ue()?;
         r.ue()?;
         r.ue()?;
     }
-    let min_cb = r.ue()? + 3;
-    let ctb = min_cb + r.ue()?;
-    if poc_lsb_bits > 16 || ctb > 6 {
+    // The CTB size, log2: 4 to 6
+    let min_cb = r.ue()?.checked_add(3)?;
+    let ctb = min_cb.checked_add(r.ue()?)?;
+    if !(4..=6).contains(&ctb) {
         return None;
     }
     let side = |n: u32| n.div_ceil(1 << ctb);
@@ -465,11 +497,11 @@ mod tests {
     fn r3trickplay_hex_dump_lines_parse() {
         let mut out = Vec::new();
         assert!(hex_line(
-            "00000000: 0164 0029 ffe1 0018 6764 0029 acd9 4078  .d.)....gd.)..@x",
+            b"00000000: 0164 0029 ffe1 0018 6764 0029 acd9 4078  .d.)....gd.)..@x",
             &mut out
         ));
         assert!(hex_line(
-            "00000020: 0100 0668 e938 6cb2 2c                   ...h.8l.,",
+            b"00000020: 0100 0668 e938 6cb2 2c                   ...h.8l.,",
             &mut out
         ));
         assert_eq!(out.len(), 25);
@@ -478,9 +510,118 @@ mod tests {
             &out[16..],
             &[0x01, 0x00, 0x06, 0x68, 0xe9, 0x38, 0x6c, 0xb2, 0x2c]
         );
-        assert!(!hex_line("pts_time=2.920000", &mut out));
-        assert!(!hex_line("data=", &mut out));
+        assert!(!hex_line(b"pts_time=2.920000", &mut out));
+        assert!(!hex_line(b"data=", &mut out));
+        // Not hex, an odd digit, and a multi-byte character where the hex starts
+        assert!(!hex_line(b"00000030: 01zz", &mut out));
+        assert!(!hex_line(b"00000030: 012", &mut out));
+        assert!(!hex_line("00000030:\u{e9}0102".as_bytes(), &mut out));
         assert_eq!(out.len(), 25);
+    }
+
+    /// An HEVC NAL unit header of `kind` in `layer`, then `payload`.
+    fn hevc_nal(kind: u8, layer: u8, payload: &[u8]) -> Vec<u8> {
+        let mut nal = vec![kind << 1 | layer >> 5, (layer & 0x1f) << 3 | 1];
+        nal.extend_from_slice(payload);
+        nal
+    }
+
+    /// `nals` as one packet with 4-byte lengths.
+    fn packet(nals: &[Vec<u8>]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for nal in nals {
+            out.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+            out.extend_from_slice(nal);
+        }
+        out
+    }
+
+    /// A minimal `hvcC` record with 4-byte lengths and no parameter sets.
+    fn empty_hvcc() -> Vec<u8> {
+        let mut config = vec![1];
+        config.extend([0; 20]);
+        config.extend([0xff, 0]);
+        config
+    }
+
+    #[test]
+    fn r3trickplay_hevc_upper_layers_are_left_out() {
+        let mut stream = KeyFrameStream::new(Codec::Hevc, &empty_hvcc()).unwrap();
+        let mut out = Vec::new();
+        // Only a layer-1 picture: no base layer frame, so refused
+        let e = stream
+            .push(&packet(&[hevc_nal(21, 1, &[0x80])]), &mut out)
+            .unwrap_err();
+        assert!(e.starts_with(NOT_ALONE), "{e}");
+        // A layer-1 SPS and PPS that can't be read, and a layer-1 non-IRAP slice: none is
+        // parsed or counted, nor sent on
+        out.clear();
+        let base = hevc_nal(36, 0, &[]); // an end of sequence, sent on as it is
+        let upper = [
+            hevc_nal(33, 1, &[0xff]),
+            hevc_nal(34, 1, &[]),
+            hevc_nal(1, 1, &[0x80]),
+        ];
+        let mut nals = upper.to_vec();
+        nals.push(base.clone());
+        let e = stream.push(&packet(&nals), &mut out).unwrap_err();
+        assert!(e.contains("a packet without a frame"), "{e}");
+        assert_eq!(out, [&[0, 0, 0, 1][..], &base].concat());
+        assert_eq!(hevc_layer(&hevc_nal(33, 63, &[])), 63);
+        assert_eq!(hevc_layer(&[0x42]), 0);
+    }
+
+    #[test]
+    fn r3trickplay_garbage_never_panics() {
+        // xorshift: the same bytes on every run
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut out = Vec::new();
+        for round in 0..20_000 {
+            let len = (next() % 48) as usize;
+            let bytes: Vec<u8> = (0..len).map(|_| next() as u8).collect();
+            // Parameter sets, IRAP slices and anything else, cut anywhere, in every layer
+            let kind = [32, 33, 34, 16, 19, 21, 1, 62][round % 8];
+            let layer = if round % 16 == 0 { 1 } else { 0 };
+            let nal = hevc_nal(kind, layer, &bytes);
+            let cut = &nal[..(next() as usize % (nal.len() + 1))];
+            let mut hevc = KeyFrameStream::new(Codec::Hevc, &empty_hvcc()).unwrap();
+            for nal in [&nal[..], cut] {
+                let _ = hevc.push(&packet(&[nal.to_vec()]), &mut out);
+            }
+            // Raw bytes as a packet, as a decoder configuration, and as a dump line
+            let _ = hevc.push(&bytes, &mut out);
+            let mut h264 = KeyFrameStream::new(
+                Codec::H264,
+                &[
+                    1, 0x64, 0, 0x29, 0xff, 0xe1, 0, 2, 0x67, 0x64, 1, 0, 2, 0x68, 0xe9,
+                ],
+            )
+            .unwrap();
+            let _ = h264.push(&bytes, &mut out);
+            let _ = KeyFrameStream::new(Codec::Hevc, &bytes);
+            let _ = KeyFrameStream::new(Codec::H264, &bytes);
+            let mut line = b"00000000: ".to_vec();
+            line.extend_from_slice(&bytes);
+            hex_line(&line, &mut out);
+            out.clear();
+        }
+        // The parsers on their own, past every field's limit
+        for _ in 0..20_000 {
+            let len = (next() % 40) as usize;
+            let rbsp: Vec<u8> = (0..len).map(|_| next() as u8).collect();
+            let _ = parse_sps(&rbsp);
+            let _ = parse_pps(&rbsp);
+            let _ = unescape(&rbsp);
+        }
+        // Exp-Golomb numbers too long to be one; a CTB of 8 pixels
+        assert!(parse_sps(&[0; 40]).is_none());
+        assert!(parse_sps(&[0xff; 40]).is_none());
     }
 
     #[test]
