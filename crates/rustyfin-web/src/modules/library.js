@@ -6,6 +6,7 @@ import { renderGenreRows, genreNameOf } from './genres.js';
 import { hashRoute } from './router.js';
 import { musicTab, rememberMusicTab, musicTabBar, renderMusicTab } from './music.js';
 import { KINDS, renderContainerPage, renderCollectionsTab } from './collections.js';
+import { renderPhotoLibrary } from './photos.js';
 import { renderSuggestions, renderUpcoming, renderStudios, studioNameOf } from './libtabs.js';
 let currentLibraryId = null;
 // The route shown (library/<this>): the library id, then a music library's tab and genre
@@ -641,6 +642,13 @@ async function renderLibrary(route) {
     const contentType = lib?.content_type || lib?.Content_type || lib?.ContentType || '';
     const libIcon = contentType === 'Movies' ? 'Film' : contentType === 'TvShows' ? 'Tv' : contentType === 'Music' ? 'Music' : 'Folder';
     const headerIcon = { Movies: 'Film', TvShows: 'Tv', Music: 'Music' }[lib?.content_type] || 'Folder';
+    // A photo library browses its folders in place: library/<id>/folder/<folder id> (photos.js)
+    if (contentType === 'Photos') {
+        stopLibraryLoad();
+        destroyInfiniteScroll();
+        renderPhotoLibrary(lib, libId, tab === 'folder' && sub ? sub : '');
+        return;
+    }
     // A music library's tabs other than Albums are drawn by music.js; Albums is this grid
     const musicView = contentType === 'Music' ? musicTab(libId, tab, sub) : null;
     if (musicView && musicView !== 'albums') {
@@ -865,15 +873,20 @@ function libraryViewCustom(view) {
     return custom;
 }
 
-// The DisplayPreferences body that saves a library's sort and filters; the server keeps the whole body
+// The CustomPrefs keys a library list writes. The server merges CustomPrefs key by key, as
+// Jellyfin does, so a key this save leaves unset is sent as null to clear it.
+const LIBRARY_CUSTOM_KEYS = [...Object.keys(LIBRARY_FILTER_PARAMS), 'ViewMode', 'ImageType', 'CardSize'];
+
+// The DisplayPreferences body that saves a library's sort, filters and view
 function libraryPrefsToDisplay(libId, prefs) {
     const { sortBy, sortOrder } = librarySort(prefs);
+    const set = { ...libraryFilterQuery(prefs.filters), ...libraryViewCustom(prefs.view) };
     return {
         Id: libId,
         Client: LIBRARY_PREFS_CLIENT,
         SortBy: sortBy,
         SortOrder: sortOrder,
-        CustomPrefs: { ...libraryFilterQuery(prefs.filters), ...libraryViewCustom(prefs.view) },
+        CustomPrefs: Object.fromEntries(LIBRARY_CUSTOM_KEYS.map(k => [k, set[k] ?? null])),
         RememberIndexing: false,
         RememberSorting: true,
         PrimaryImageHeight: 0,

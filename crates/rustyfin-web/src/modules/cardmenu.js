@@ -3,6 +3,7 @@
 import { icon, toast, escapeHtml } from './util.js';
 import { applyCardUserData } from './cards.js';
 import { playQueueAt } from './queue.js';
+import { openPhotoViewer } from './photos.js';
 
 const PLAYABLE = ['Movie', 'Episode', 'Audio', 'MusicVideo', 'Video', 'AudioBook', 'Trailer'];
 const CONTAINERS = ['Series', 'Season', 'MusicAlbum', 'MusicArtist', 'BoxSet', 'Playlist', 'Folder', 'CollectionFolder'];
@@ -221,7 +222,8 @@ async function setCardLikes(el, likes) {
 // Play from the menu: the item alone, through the queue (resume or start over, as any Play asks)
 function playCardItem(el) {
     const item = menuItems.get(el.dataset.id);
-    if (item) playQueueAt([item], 0);
+    if (item?.Type === 'Photo') openPhotoViewer([item], 0);
+    else if (item) playQueueAt([item], 0);
 }
 
 // The request for an item's Instant mix: similar songs, the item itself first for a song

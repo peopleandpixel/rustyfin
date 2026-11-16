@@ -362,11 +362,17 @@ const API = {
     setupJellyfinPreview(sourcePath) { return this.post('/Startup/JellyfinImport/Preview', { SourcePath: sourcePath }); },
 
     // Libraries
-    getLibraries() {
+    // includeHidden: also the libraries the user hid from My Media (Jellyfin's includeHidden)
+    getLibraries({ includeHidden = false } = {}) {
         if (this.isAdmin) return this.get('/Library/VirtualFolders');
         // /Library/VirtualFolders is for administrators; other users get the same libraries from their views.
+        return this.getUserViews({ includeHidden });
+    },
+    // The user's libraries as the server lists them for My Media: in their order (OrderedViews),
+    // without those hidden from My Media (MyMediaExcludes) unless includeHidden
+    getUserViews({ includeHidden = false } = {}) {
         const types = { movies: 'Movies', tvshows: 'TvShows', music: 'Music', homevideos: 'Photos' };
-        return this.get('/UserViews').then(views => (views.Items || []).map(v => ({
+        return this.get(includeHidden ? '/UserViews?IncludeHidden=true' : '/UserViews').then(views => (views.Items || []).map(v => ({
             id: v.Id,
             name: v.Name,
             content_type: types[v.CollectionType] || 'Mixed',

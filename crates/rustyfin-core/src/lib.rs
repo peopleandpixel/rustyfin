@@ -21,6 +21,7 @@ pub mod nfo_parser;
 pub mod photo_info;
 pub mod plugin_manager;
 pub mod probe;
+pub mod scan_folders;
 pub mod scan_progress;
 pub mod scan_sync;
 pub mod scanner;

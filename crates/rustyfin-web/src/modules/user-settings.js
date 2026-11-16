@@ -78,16 +78,22 @@ function userConfiguration() {
     return loaded?.userId === API.userId ? loaded.config : {};
 }
 
-// Saves CustomPrefs values (strings; null or '' removes one), keeping the other settings
+// Saves CustomPrefs values (strings; null or '' removes one), keeping the other settings. A removed
+// one is sent as null: the server merges CustomPrefs key by key, as Jellyfin does.
 async function saveUserSettings(values) {
     const settings = await loadUserSettings();
     const customPrefs = { ...settings.prefs.CustomPrefs };
+    const sent = { ...customPrefs };
     for (const [name, value] of Object.entries(values)) {
-        if (value == null || value === '') delete customPrefs[name];
-        else customPrefs[name] = String(value);
+        if (value == null || value === '') {
+            delete customPrefs[name];
+            sent[name] = null;
+        } else {
+            customPrefs[name] = sent[name] = String(value);
+        }
     }
     const prefs = { ...settings.prefs, CustomPrefs: customPrefs };
-    await API.post(prefsPath(settings.userId), prefs);
+    await API.post(prefsPath(settings.userId), { ...prefs, CustomPrefs: sent });
     settings.prefs = prefs;
     for (const [name, value] of Object.entries(values)) {
         if (name in DEVICE_SETTINGS) setDeviceSetting(name, value, DEVICE_SETTINGS[name]);
@@ -133,10 +139,30 @@ function homeSlotValues(index, section, get = userSetting) {
     return Object.fromEntries(slots.map((value, i) => [`homesection${i}`, value]));
 }
 
+const libraryKey = id => String(id).toLowerCase().replace(/-/g, '');
+
 // Whether a library's newest items get a "Recently Added" row (UserConfiguration.LatestItemsExcludes)
 function showsInLatest(libraryId, config = userConfiguration()) {
-    const key = id => String(id).toLowerCase().replace(/-/g, '');
-    return !(config.LatestItemsExcludes || []).some(id => key(id) === key(libraryId));
+    return !(config.LatestItemsExcludes || []).some(id => libraryKey(id) === libraryKey(libraryId));
+}
+
+// Whether a library shows in "My Media" and the home page (not in UserConfiguration.MyMediaExcludes)
+function showsInMyMedia(libraryId, config = userConfiguration()) {
+    return !(config.MyMediaExcludes || []).some(id => libraryKey(id) === libraryKey(libraryId));
+}
+
+// The libraries in the user's order, as the server's /UserViews: those UserConfiguration.OrderedViews
+// names first, in its order, then the others in theirs (the settings page lists them so)
+function arrangeLibraries(libs, { config = userConfiguration() } = {}) {
+    const order = (config.OrderedViews || []).map(libraryKey);
+    const rank = lib => {
+        const at = order.indexOf(libraryKey(lib.id || lib.Id));
+        return at < 0 ? Infinity : at;
+    };
+    return (libs || [])
+        .map((lib, i) => [lib, i])
+        .sort((a, b) => (rank(a[0]) - rank(b[0])) || (a[1] - b[1]))
+        .map(([lib]) => lib);
 }
 
 // Jellyfin Web's enableBackdrops. Rustyfin has always shown them, so it stays on unless turned off
@@ -168,6 +194,6 @@ function applyUserSettings() {
 
 export {
     HOME_SECTIONS, HOME_SLOT_DEFAULTS, homeSlots, homeSlotValues, loadUserSettings, userSetting, userConfiguration, saveUserSettings, saveUserConfiguration,
-    homeSections, showsInLatest, showBackdrops, applyUserSettings, avatarUrl, showAvatar, SCREENSAVER_BACKDROP,
-    DEFAULT_IDLE_SECONDS, SCREENSAVER_TIMES,
+    homeSections, showsInLatest, showsInMyMedia, arrangeLibraries, libraryKey, showBackdrops, applyUserSettings, avatarUrl,
+    showAvatar, SCREENSAVER_BACKDROP, DEFAULT_IDLE_SECONDS, SCREENSAVER_TIMES,
 };

@@ -3630,6 +3630,7 @@ const B124_WEB_MODULES: &[&str] = &[
     "metadata-admin.js",
     "multiselect.js",
     "music.js",
+    "photos.js",
     "playback-admin.js",
     "player.js",
     "playerprefs.js",
@@ -29379,6 +29380,516 @@ fn r3home_rows() {
 #[test]
 fn r3settings_home() {
     b124_node_test("r3settings_home.mjs");
+}
+
+// R3 photos and home: the photo library's folders, the viewer and slideshow, and the home layout
+// settings (homesection0..n, OrderedViews, MyMediaExcludes, LatestItemsExcludes)
+#[test]
+fn r3photos_web() {
+    b124_node_test("r3photos_library.mjs");
+    b124_node_test("r3photos_home.mjs");
+}
+
+/// The names `uri` lists as views, in order
+async fn r3photos_view_names(app: &axum::Router, token: &str, uri: &str) -> Vec<String> {
+    let (status, views) = send_authed(app, "GET", uri, token, None).await;
+    assert_eq!(status, StatusCode::OK, "{uri}: {views}");
+    let items = views["Items"].as_array().unwrap();
+    assert_eq!(views["TotalRecordCount"], items.len(), "{uri}");
+    items
+        .iter()
+        .map(|v| v["Name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// The names, types and ids of the items `uri` lists, in order
+async fn r3photos_list(
+    app: &axum::Router,
+    token: &str,
+    uri: &str,
+) -> Vec<(String, String, String)> {
+    let (status, body) = send_authed(app, "GET", uri, token, None).await;
+    assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+    body["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| {
+            let s = |k: &str| i[k].as_str().unwrap_or_default().to_string();
+            (s("Name"), s("Type"), s("Id"))
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn r3photos_library_subfolders_are_folder_items() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let lib = create_library_via_api(&app, &state, &token, "R3PF", "Photos").await;
+    let root = std::path::PathBuf::from(media_folder(&state, "r3pf"));
+    for file in [
+        "top.jpg",
+        "Trips/2024/b.jpg",
+        "Trips/2024/a.jpg",
+        "Trips/c.jpg",
+    ] {
+        let path = root.join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"").unwrap();
+    }
+    std::fs::create_dir_all(root.join("Empty")).unwrap();
+    let refresh = format!("/Library/VirtualFolders/{lib}/Refresh");
+    let (status, body) = send_authed(&app, "POST", &refresh, &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // The library's top: its folder, then its photo; a folder with no media gets no item
+    let names = |list: &[(String, String, String)]| -> Vec<(String, String)> {
+        list.iter()
+            .map(|(n, t, _)| (n.clone(), t.clone()))
+            .collect()
+    };
+    let order = "SortBy=IsFolder,SortName&SortOrder=Ascending";
+    let top = r3photos_list(&app, &token, &format!("/Items?ParentId={lib}&{order}")).await;
+    assert_eq!(
+        names(&top),
+        [
+            ("Trips".into(), "Folder".into()),
+            ("top".into(), "Photo".into())
+        ]
+    );
+    let trips = top[0].2.clone();
+    let (_, folder) = send_authed(&app, "GET", &format!("/Items/{trips}"), &token, None).await;
+    assert_eq!(folder["IsFolder"], true);
+    assert_eq!(folder["Type"], "Folder");
+
+    let inside = r3photos_list(&app, &token, &format!("/Items?ParentId={trips}&{order}")).await;
+    assert_eq!(
+        names(&inside),
+        [
+            ("2024".into(), "Folder".into()),
+            ("c".into(), "Photo".into())
+        ]
+    );
+    let year = inside[0].2.clone();
+    let photos = r3photos_list(&app, &token, &format!("/Items?ParentId={year}&{order}")).await;
+    assert_eq!(
+        names(&photos),
+        [("a".into(), "Photo".into()), ("b".into(), "Photo".into())]
+    );
+    let (_, a) = send_authed(
+        &app,
+        "GET",
+        &format!("/Items/{}", photos[0].2),
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(a["ParentId"].as_str(), Some(year.as_str()));
+    // A folder's ancestors: the folders above it, nearest first, then the library
+    let ancestors = r3photos_list_plain(&app, &token, &format!("/Items/{year}/Ancestors")).await;
+    assert_eq!(ancestors[0], trips);
+    assert!(ancestors.contains(&lib.to_string()), "{ancestors:?}");
+    // Recursively, the library still lists every photo
+    let all = r3photos_list(
+        &app,
+        &token,
+        &format!("/Items?ParentId={lib}&Recursive=true&IncludeItemTypes=Photo"),
+    )
+    .await;
+    assert_eq!(all.len(), 4);
+    // Latest lists the photos, never the folders (Jellyfin asks IsFolder = false there)
+    let (_, latest) = send_authed(
+        &app,
+        "GET",
+        &format!("/Items/Latest?ParentId={lib}"),
+        &token,
+        None,
+    )
+    .await;
+    let latest = latest.as_array().unwrap();
+    assert_eq!(latest.len(), 4, "{latest:?}");
+    assert!(latest.iter().all(|i| i["Type"] == "Photo"));
+
+    // A folder whose files are gone goes; the others keep their ids
+    std::fs::remove_dir_all(root.join("Trips/2024")).unwrap();
+    let (status, _) = send_authed(&app, "POST", &refresh, &token, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let top = r3photos_list(&app, &token, &format!("/Items?ParentId={lib}&{order}")).await;
+    assert_eq!(top[0].2, trips);
+    let inside = r3photos_list(&app, &token, &format!("/Items?ParentId={trips}&{order}")).await;
+    assert_eq!(names(&inside), [("c".into(), "Photo".into())]);
+    let (status, _) = send_authed(&app, "GET", &format!("/Items/{year}"), &token, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// Writes empty files at `files` under `root` (a scan lists them by name)
+fn r3photos_files(root: &std::path::Path, files: &[&str]) {
+    for file in files {
+        let path = root.join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"").unwrap();
+    }
+}
+
+/// The id of the folder named `name` that `parent` lists
+async fn r3photos_folder(
+    app: &axum::Router,
+    token: &str,
+    parent: &str,
+    name: &str,
+) -> Option<String> {
+    r3photos_list(app, token, &format!("/Items?ParentId={parent}"))
+        .await
+        .into_iter()
+        .find(|(n, t, _)| n == name && t == "Folder")
+        .map(|(_, _, id)| id)
+}
+
+#[tokio::test]
+async fn r3photos_mixed_folders_keep_ids_and_go_when_emptied() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let lib = create_library_via_api(&app, &state, &token, "R3PX", "Mixed").await;
+    let root = std::path::PathBuf::from(media_folder(&state, "r3px"));
+    r3photos_files(&root, &["Trips/a.jpg", "Home/b.jpg", "Home/Garden/c.jpg"]);
+    let refresh = format!("/Library/VirtualFolders/{lib}/Refresh");
+    let scan = || async {
+        let (status, body) = send_authed(&app, "POST", &refresh, &token, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    };
+    scan().await;
+    let lib_id = lib.to_string();
+    let trips = r3photos_folder(&app, &token, &lib_id, "Trips")
+        .await
+        .unwrap();
+    let home = r3photos_folder(&app, &token, &lib_id, "Home")
+        .await
+        .unwrap();
+    let garden = r3photos_folder(&app, &token, &home, "Garden")
+        .await
+        .unwrap();
+
+    // A rescan keeps every folder's id
+    scan().await;
+    assert_eq!(
+        r3photos_folder(&app, &token, &lib_id, "Trips")
+            .await
+            .unwrap(),
+        trips
+    );
+    assert_eq!(
+        r3photos_folder(&app, &token, &home, "Garden")
+            .await
+            .unwrap(),
+        garden
+    );
+
+    // A folder whose only photo is gone goes, and so does nothing else
+    std::fs::remove_file(root.join("Trips/a.jpg")).unwrap();
+    scan().await;
+    assert_eq!(r3photos_folder(&app, &token, &lib_id, "Trips").await, None);
+    let (status, _) = send_authed(&app, "GET", &format!("/Items/{trips}"), &token, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        r3photos_folder(&app, &token, &lib_id, "Home")
+            .await
+            .unwrap(),
+        home
+    );
+
+    // The photo back: the folder comes back with the same id
+    r3photos_files(&root, &["Trips/a.jpg"]);
+    scan().await;
+    assert_eq!(
+        r3photos_folder(&app, &token, &lib_id, "Trips")
+            .await
+            .unwrap(),
+        trips
+    );
+}
+
+#[tokio::test]
+async fn r3photos_folder_counts_and_ancestors_follow_access() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (admin, _) = admin_session(&state).await;
+    let lib = create_library_via_api(&app, &state, &admin, "R3PA2", "Photos").await;
+    let root = std::path::PathBuf::from(media_folder(&state, "r3pa2"));
+    r3photos_files(
+        &root,
+        &["Album/one.jpg", "Album/two.jpg", "Album/Inner/three.jpg"],
+    );
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        &format!("/Library/VirtualFolders/{lib}/Refresh"),
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    sqlx::query("UPDATE media_items SET tags = 'Private' WHERE name = 'two'")
+        .execute(&state.db)
+        .await
+        .unwrap();
+    let album = r3photos_folder(&app, &admin, &lib.to_string(), "Album")
+        .await
+        .unwrap();
+    let inner = r3photos_folder(&app, &admin, &album, "Inner")
+        .await
+        .unwrap();
+
+    // A user who may not see the "Private" tag, and one without this library
+    let set_policy = |user: String, change: serde_json::Value| {
+        let (app, admin) = (app.clone(), admin.clone());
+        async move {
+            let (_, got) = send_authed(&app, "GET", &format!("/Users/{user}"), &admin, None).await;
+            let mut policy = got["Policy"].clone();
+            for (k, v) in change.as_object().unwrap() {
+                policy[k] = v.clone();
+            }
+            let uri = format!("/Users/{user}/Policy");
+            let (status, _) =
+                send_authed(&app, "POST", &uri, &admin, Some(&policy.to_string())).await;
+            assert!(status.is_success(), "{status}");
+        }
+    };
+    let kid = add_user(&state, "r3p-kid", "r3p-pass", false).await;
+    set_policy(
+        kid.to_string(),
+        serde_json::json!({ "BlockedTags": ["Private"] }),
+    )
+    .await;
+    let other = add_user(&state, "r3p-other", "r3p-pass", false).await;
+    set_policy(
+        other.to_string(),
+        serde_json::json!({ "EnableAllFolders": false, "EnabledFolders": [] }),
+    )
+    .await;
+    let (kid_token, _) = login(&app, "r3p-kid", "r3p-pass").await.unwrap();
+    let (other_token, _) = login(&app, "r3p-other", "r3p-pass").await.unwrap();
+
+    // ChildCount: the folder's details and a list count only what the user may see
+    let count = |token: String, uri: String| {
+        let app = app.clone();
+        async move { send_authed(&app, "GET", &uri, &token, None).await.1["ChildCount"].clone() }
+    };
+    assert_eq!(count(admin.clone(), format!("/Items/{album}")).await, 3);
+    assert_eq!(count(kid_token.clone(), format!("/Items/{album}")).await, 2);
+    let (_, listed) = send_authed(
+        &app,
+        "GET",
+        &format!("/Items?ParentId={lib}"),
+        &kid_token,
+        None,
+    )
+    .await;
+    let album_row = listed["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["Id"] == album.as_str())
+        .cloned()
+        .unwrap();
+    assert_eq!(album_row["ChildCount"], 2);
+
+    // Ancestors: a visible folder's way up for the kid; not found without the library
+    let (status, up) = send_authed(
+        &app,
+        "GET",
+        &format!("/Items/{inner}/Ancestors"),
+        &kid_token,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(up[0]["Id"], album.as_str());
+    let (status, _) = send_authed(
+        &app,
+        "GET",
+        &format!("/Items/{inner}/Ancestors"),
+        &other_token,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) =
+        send_authed(&app, "GET", &format!("/Items/{album}"), &other_token, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// The ids of the items `uri` answers with as a plain array
+async fn r3photos_list_plain(app: &axum::Router, token: &str, uri: &str) -> Vec<String> {
+    let (status, body) = send_authed(app, "GET", uri, token, None).await;
+    assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+    let items = body
+        .as_array()
+        .or_else(|| body["Items"].as_array())
+        .unwrap();
+    items
+        .iter()
+        .map(|i| i["Id"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn r3photos_movie_libraries_get_no_folder_items() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let lib = create_library_via_api(&app, &state, &token, "R3PM", "Movies").await;
+    let root = std::path::PathBuf::from(media_folder(&state, "r3pm"));
+    std::fs::create_dir_all(root.join("Some Film (2001)")).unwrap();
+    std::fs::write(root.join("Some Film (2001)/Some Film (2001).mkv"), b"").unwrap();
+    let refresh = format!("/Library/VirtualFolders/{lib}/Refresh");
+    let (status, body) = send_authed(&app, "POST", &refresh, &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let folders = r3photos_list(
+        &app,
+        &token,
+        &format!("/Items?ParentId={lib}&Recursive=true&IncludeItemTypes=Folder"),
+    )
+    .await;
+    assert!(folders.is_empty(), "{folders:?}");
+    let top = r3photos_list(&app, &token, &format!("/Items?ParentId={lib}")).await;
+    assert_eq!(top.len(), 1);
+    assert_eq!(top[0].1, "Movie");
+}
+
+#[tokio::test]
+async fn r3photos_library_type_homevideos_is_accepted() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    for (name, kind) in [("R3HV1", "HomeVideos"), ("R3HV2", "homevideos")] {
+        let body = serde_json::json!({
+            "Name": name,
+            "ContentType": kind,
+            "Paths": [media_folder(&state, &name.to_lowercase())],
+        })
+        .to_string();
+        let (status, created) =
+            send_authed(&app, "POST", "/Library/VirtualFolders", &token, Some(&body)).await;
+        assert_eq!(status, StatusCode::OK, "{kind}: {created}");
+        assert_eq!(created["ContentType"], "Photos", "{kind}");
+    }
+    let (_, views) = send_authed(&app, "GET", "/UserViews", &token, None).await;
+    let kinds: Vec<_> = views["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["CollectionType"].clone())
+        .collect();
+    assert_eq!(kinds, ["homevideos", "homevideos"]);
+    // A type Rustyfin doesn't have is still refused
+    let body = serde_json::json!({"Name": "R3HV3", "ContentType": "books", "Paths": [media_folder(&state, "r3hv3")]})
+        .to_string();
+    let (status, _) =
+        send_authed(&app, "POST", "/Library/VirtualFolders", &token, Some(&body)).await;
+    assert!(status.is_client_error(), "{status}");
+}
+
+#[tokio::test]
+async fn r3photos_home_settings_round_trip() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, user) = admin_session(&state).await;
+    let a = create_library_via_api(&app, &state, &token, "R3PA", "Movies").await;
+    let b = create_library_via_api(&app, &state, &token, "R3PB", "Photos").await;
+    // UserConfiguration's library lists come back as saved, ids in Jellyfin's dashed form
+    let (_, me) = send_authed(&app, "GET", &format!("/Users/{user}"), &token, None).await;
+    let mut config = me["Configuration"].clone();
+    config["OrderedViews"] = serde_json::json!([b, a]);
+    config["LatestItemsExcludes"] = serde_json::json!([b]);
+    config["MyMediaExcludes"] = serde_json::json!([a]);
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        &format!("/Users/{user}/Configuration"),
+        &token,
+        Some(&config.to_string()),
+    )
+    .await;
+    assert!(status.is_success(), "{status}");
+    let (_, me) = send_authed(&app, "GET", &format!("/Users/{user}"), &token, None).await;
+    for key in ["OrderedViews", "LatestItemsExcludes", "MyMediaExcludes"] {
+        assert_eq!(me["Configuration"][key], config[key], "{key}");
+    }
+
+    // The usersettings CustomPrefs come back from a body with only some fields, and a null value
+    // (a cleared setting in Jellyfin Web) is dropped
+    let prefs = format!("/DisplayPreferences/usersettings?userId={user}&client=emby");
+    let body = r#"{"Id":"usersettings","CustomPrefs":{"homesection0":"latestmedia","homesection1":"none","homesection2":null}}"#;
+    let (status, _) = send_authed(&app, "POST", &prefs, &token, Some(body)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, got) = send_authed(&app, "GET", &prefs, &token, None).await;
+    assert_eq!(
+        got["CustomPrefs"],
+        serde_json::json!({"homesection0": "latestmedia", "homesection1": "none"})
+    );
+    assert_eq!(got["Client"], "emby");
+    assert_eq!(got["SortBy"], "SortName");
+
+    // A POST without CustomPrefs keeps the saved ones; one with some changes only those, as
+    // Jellyfin merges them key by key (null removes one)
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        &prefs,
+        &token,
+        Some(r#"{"SortBy":"DateCreated"}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, got) = send_authed(&app, "GET", &prefs, &token, None).await;
+    assert_eq!(got["SortBy"], "DateCreated");
+    assert_eq!(
+        got["CustomPrefs"],
+        serde_json::json!({"homesection0": "latestmedia", "homesection1": "none"})
+    );
+    let body = r#"{"CustomPrefs":{"homesection1":null,"homesection3":"nextup"}}"#;
+    let (status, _) = send_authed(&app, "POST", &prefs, &token, Some(body)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, got) = send_authed(&app, "GET", &prefs, &token, None).await;
+    assert_eq!(
+        got["CustomPrefs"],
+        serde_json::json!({"homesection0": "latestmedia", "homesection3": "nextup"})
+    );
+}
+
+#[tokio::test]
+async fn r3photos_user_views_follow_ordered_views() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, user) = admin_session(&state).await;
+    let mut ids = Vec::new();
+    for name in ["R3VA", "R3VB", "R3VC"] {
+        ids.push(create_library_via_api(&app, &state, &token, name, "Movies").await);
+    }
+    let all = r3photos_view_names(&app, &token, "/UserViews").await;
+    let own: Vec<_> = all
+        .iter()
+        .filter(|n| n.starts_with("R3V"))
+        .cloned()
+        .collect();
+    assert_eq!(own, ["R3VA", "R3VB", "R3VC"]);
+
+    // OrderedViews puts C then A first (dashless, upper-case ids match too); B, unnamed, follows.
+    // (MyMediaExcludes and includeHidden are the client queues change's, tested there.)
+    let (_, me) = send_authed(&app, "GET", &format!("/Users/{user}"), &token, None).await;
+    let mut config = me["Configuration"].clone();
+    config["OrderedViews"] =
+        serde_json::json!([ids[2].simple().to_string().to_uppercase(), ids[0]]);
+    let uri = format!("/Users/{user}/Configuration");
+    let (status, _) = send_authed(&app, "POST", &uri, &token, Some(&config.to_string())).await;
+    assert!(status.is_success(), "{status}");
+
+    let shown = r3photos_view_names(&app, &token, "/UserViews").await;
+    assert_eq!(shown, ["R3VC", "R3VA", "R3VB"]);
+    let per_user = r3photos_view_names(&app, &token, &format!("/Users/{user}/Views")).await;
+    assert_eq!(per_user, shown);
 }
 
 // R3 settings: the settings page saves each setting where Jellyfin keeps it

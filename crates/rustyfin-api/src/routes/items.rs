@@ -3845,6 +3845,8 @@ async fn get_ancestors(
     Path(id): Path<Uuid>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<Vec<Value>>, ApiError> {
+    // `item_gate` has answered 404 already when the caller's limits hide the item; an item they
+    // may see has only visible items above it
     let item = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, id)
         .await?
         .ok_or(ApiError::NotFound("item not found".into()))?;

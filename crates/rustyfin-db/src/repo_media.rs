@@ -889,6 +889,8 @@ enum SortKey {
     DatePlayed,
     /// When the caller last played one of a series' episodes (bound user id)
     SeriesDatePlayed,
+    /// Folders before the rest, as Jellyfin's IsFolder comparer (a folder is 0, anything else 1)
+    IsFolder,
     /// Dropped after the keys are paired with the orders, so it never reaches a clause.
     Default,
     /// Any other key; it orders by `sort_name`.
@@ -916,6 +918,7 @@ impl SortKey {
             "playcount" => SortKey::PlayCount,
             "dateplayed" => SortKey::DatePlayed,
             "seriesdateplayed" => SortKey::SeriesDatePlayed,
+            "isfolder" => SortKey::IsFolder,
             _ => SortKey::Other,
         }
     }
@@ -936,6 +939,10 @@ impl SortKey {
             SortKey::ParentIndexNumber => "parent_index_number",
             SortKey::IndexNumber => "index_number",
             SortKey::Random => "ROWID",
+            SortKey::IsFolder => concat!(
+                "CASE WHEN media_items.media_type IN ('Series', 'Season', 'MusicAlbum', 'MusicArtist', 'Genre', ",
+                "'BoxSet', 'Playlist', 'Folder') THEN 0 ELSE 1 END"
+            ),
             // The rating's parental score (Jellyfin's ParentalRatingValue) from a bound JSON
             // object of each stored rating's score; an unrated item has none
             SortKey::OfficialRating => {
@@ -3999,10 +4006,7 @@ pub async fn classify_legacy_sort_names(pool: &SqlitePool) -> Result<u64, sqlx::
         if name.is_ascii() || sort == name.to_lowercase() {
             continue;
         }
-        let media_type = match kind.as_str() {
-            "Folder" => MediaType::Unknown,
-            other => other.parse().unwrap_or(MediaType::Unknown),
-        };
+        let media_type = kind.parse().unwrap_or(MediaType::Unknown);
         if sort == item_sort_name(media_type, &name, parent_index, index, &rules) {
             continue;
         }
@@ -4065,10 +4069,7 @@ pub async fn recompute_sort_names(
     let mut pending = 0;
     let mut tx = crate::begin_write(pool).await?;
     for (id, name, sort_name, kind, parent_index, index, forced) in rows {
-        let media_type = match kind.as_str() {
-            "Folder" => MediaType::Unknown,
-            other => other.parse().unwrap_or(MediaType::Unknown),
-        };
+        let media_type = kind.parse().unwrap_or(MediaType::Unknown);
         let forced = forced.filter(|s| !s.trim().is_empty());
         if media_type == MediaType::Season && forced.is_none() {
             continue;
@@ -4308,6 +4309,11 @@ mod tests {
         assert_eq!(
             order_by("CommunityRating", "Descending"),
             "ORDER BY community_rating DESC, sort_name ASC, id DESC"
+        );
+        // IsFolder puts folders first, as Jellyfin Web's folder lists ask for
+        assert!(
+            order_by("IsFolder,SortName", "Ascending")
+                .starts_with("ORDER BY CASE WHEN media_items.media_type IN ('Series', 'Season', 'MusicAlbum', 'MusicArtist', 'Genre', 'BoxSet', 'Playlist', 'Folder') THEN 0 ELSE 1 END ASC, sort_name ASC, id ASC")
         );
         assert_eq!(
             order_by("ProductionYear,SortName", "Sideways,Descending"),
