@@ -410,6 +410,29 @@ fn canonical_fields(body: serde_json::Value) -> serde_json::Value {
     serde_json::Value::Object(out)
 }
 
+/// The stored configuration with the posted fields `body` (an object) over it, so a POST that
+/// sends only some fields keeps every other setting, the startup wizard's state among them.
+/// Jellyfin Web posts the whole object it fetched, which this leaves as it is. The provider keys
+/// are left out of the stored side: one is set only when the request posts it.
+async fn merged_over_current(
+    state: &AppState,
+    body: serde_json::Value,
+) -> Result<serde_json::Value, ApiError> {
+    let mut current = state.config.read().await.clone();
+    current.tmdb_api_key = None;
+    current.omdb_api_key = None;
+    current.fanart_api_key = None;
+    let mut merged = match serde_json::to_value(current) {
+        Ok(serde_json::Value::Object(map)) => map,
+        Ok(_) => serde_json::Map::new(),
+        Err(e) => return Err(ApiError::Internal(e.to_string())),
+    };
+    if let serde_json::Value::Object(posted) = body {
+        merged.extend(posted);
+    }
+    Ok(serde_json::Value::Object(merged))
+}
+
 /// Drops the fields that `configuration_json` works out on each GET, so a client that posts the
 /// whole configuration back doesn't store them, and sets this build's config version.
 fn drop_computed_fields(config: &mut ServerConfiguration) {
@@ -490,7 +513,14 @@ async fn update_configuration(
     State(state): State<AppState>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<StatusCode, ApiError> {
-    let mut new_config: ServerConfiguration = serde_json::from_value(canonical_fields(body))
+    let body = canonical_fields(body);
+    if !body.is_object() {
+        return Err(ApiError::BadRequest(
+            "configuration: the body must be a JSON object".to_string(),
+        ));
+    }
+    let merged = merged_over_current(&state, body).await?;
+    let mut new_config: ServerConfiguration = serde_json::from_value(merged)
         .map_err(|e| ApiError::BadRequest(format!("configuration: {e}")))?;
     drop_computed_fields(&mut new_config);
     ensure_config_size("configuration", &new_config)?;

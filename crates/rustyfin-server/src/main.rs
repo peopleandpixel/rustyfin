@@ -143,8 +143,15 @@ async fn main() {
         }
     };
 
-    // Load or create server configuration
-    let mut config = load_config(&data_dir);
+    // Load or create server configuration. A file that can't be read is kept and the server
+    // doesn't start: defaults would lose the settings it holds, and show the startup wizard.
+    let mut config = match load_config(&data_dir) {
+        Ok(config) => config,
+        Err(e) => {
+            tracing::error!("{e}. Fix or remove the file; the server does not start without it.");
+            std::process::exit(1);
+        }
+    };
     // Sort names made from here on use the configuration's rules
     rustyfin_model::sort_name::set_rules(config.sort_rules());
 
@@ -736,7 +743,13 @@ async fn main() {
                 loop {
                     if sig.recv().await.is_some() {
                         tracing::info!("SIGHUP received, reloading configuration");
-                        let new_config = load_config(&data_dir);
+                        let new_config = match load_config(&data_dir) {
+                            Ok(new_config) => new_config,
+                            Err(e) => {
+                                tracing::error!("{e}; the configuration in use is kept");
+                                continue;
+                            }
+                        };
                         let mut cfg = config.write().await;
                         *cfg = new_config;
                         changes.set_delay(std::time::Duration::from_secs(u64::from(
@@ -850,37 +863,10 @@ async fn shutdown_signal() -> &'static str {
     }
 }
 
-fn load_config(data_dir: &std::path::Path) -> ServerConfiguration {
-    let config_path = data_dir.join("config.json");
-    if config_path.exists() {
-        match std::fs::read_to_string(&config_path) {
-            Ok(content) => match serde_json::from_str::<ServerConfiguration>(&content) {
-                Ok(mut cfg) => {
-                    tracing::info!("loaded configuration from {}", config_path.display());
-                    // A file from an older Rustyfin is brought up to date once, and saved so
-                    if cfg.upgrade()
-                        && let Err(e) =
-                            rustyfin_core::config_file::write_config_atomic(&config_path, &cfg)
-                    {
-                        tracing::warn!("could not save the upgraded config.json: {}", e);
-                    }
-                    return cfg;
-                }
-                Err(e) => {
-                    tracing::warn!("failed to parse config.json, using defaults: {}", e);
-                }
-            },
-            Err(e) => {
-                tracing::warn!("failed to read config.json, using defaults: {}", e);
-            }
-        }
-    }
-    let cfg = ServerConfiguration::default();
-    // Persist default config
-    if let Ok(json) = serde_json::to_string_pretty(&cfg) {
-        std::fs::write(&config_path, &json).ok();
-    }
-    cfg
+fn load_config(
+    data_dir: &std::path::Path,
+) -> Result<ServerConfiguration, rustyfin_core::config_file::LoadError> {
+    rustyfin_core::config_file::load_config(&data_dir.join("config.json"))
 }
 
 fn load_tls_config(cert_path: &str, key_path: &str) -> rustls::ServerConfig {

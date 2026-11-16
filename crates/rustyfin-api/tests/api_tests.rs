@@ -3051,6 +3051,196 @@ async fn test_delete_library_updates_every_list_and_keeps_others() {
     assert_eq!(remaining_items, ["Film item"]);
 }
 
+// R3 core reliability: deletes, configuration saves
+
+/// Inserts a media item row; `parent` and `owner` as given.
+async fn r3rel_insert_item(
+    state: &AppState,
+    library: uuid::Uuid,
+    name: &str,
+    kind: &str,
+    parent: Option<uuid::Uuid>,
+    owner: Option<uuid::Uuid>,
+) -> uuid::Uuid {
+    let id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO media_items (id, library_id, name, media_type, path, parent_id, owner_id) \
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(id.to_string())
+    .bind(library.to_string())
+    .bind(name)
+    .bind(kind)
+    .bind(format!("/media/{name}.mkv"))
+    .bind(parent.map(|p| p.to_string()))
+    .bind(owner.map(|o| o.to_string()))
+    .execute(&state.db)
+    .await
+    .unwrap();
+    id
+}
+
+/// Gives `user` a resume point and a favourite on `item`.
+async fn r3rel_play_state(state: &AppState, user: uuid::Uuid, item: uuid::Uuid) {
+    sqlx::query(
+        "INSERT INTO user_item_data (user_id, item_id, playback_position_ticks, play_count, \
+         is_favorite, played) VALUES (?, ?, 600000000, 1, 1, 0)",
+    )
+    .bind(user.to_string())
+    .bind(item.to_string())
+    .execute(&state.db)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn r3rel_deleting_a_library_with_play_state_removes_it_whole_and_unknown_ids_are_404() {
+    let state = test_state().await;
+    let (token, user_id) = admin_session(&state).await;
+    let app = app(state.clone());
+
+    let films = create_library_via_api(&app, &state, &token, "Films", "Movies").await;
+    let shows = create_library_via_api(&app, &state, &token, "Shows", "TvShows").await;
+    let series = r3rel_insert_item(&state, shows, "Show", "Series", None, None).await;
+    let season = r3rel_insert_item(&state, shows, "Season 1", "Season", Some(series), None).await;
+    let episode =
+        r3rel_insert_item(&state, shows, "Episode 1", "Episode", Some(season), None).await;
+    let film = r3rel_insert_item(&state, films, "Film", "Movie", None, None).await;
+    // An extra in the other library that a Shows item owns loses its owner, not its row.
+    let extra = r3rel_insert_item(&state, films, "Trailer", "Movie", None, Some(series)).await;
+    for item in [series, episode, film] {
+        r3rel_play_state(&state, user_id, item).await;
+    }
+
+    let (status, body) = send_authed(
+        &app,
+        "DELETE",
+        &format!("/Library/VirtualFolders/{shows}"),
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "delete Shows: {body}");
+    assert_eq!(stored_library_names(&state).await, ["Films"]);
+    let mut items: Vec<String> = sqlx::query_scalar("SELECT id FROM media_items")
+        .fetch_all(&state.db)
+        .await
+        .unwrap();
+    items.sort();
+    let mut expected = vec![film.to_string(), extra.to_string()];
+    expected.sort();
+    assert_eq!(items, expected);
+    let owner: Option<String> = sqlx::query_scalar("SELECT owner_id FROM media_items WHERE id = ?")
+        .bind(extra.to_string())
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(owner, None);
+    let data: Vec<String> = sqlx::query_scalar("SELECT item_id FROM user_item_data")
+        .fetch_all(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        data,
+        [film.to_string()],
+        "only the Films play state is left"
+    );
+
+    // The same id again, and an id that never was a library, answer 404 as in Jellyfin.
+    for id in [shows, uuid::Uuid::new_v4()] {
+        let (status, body) = send_authed(
+            &app,
+            "DELETE",
+            &format!("/Library/VirtualFolders/{id}"),
+            &token,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "delete {id}: {body}");
+    }
+    assert_eq!(stored_library_names(&state).await, ["Films"]);
+}
+
+#[tokio::test]
+async fn r3rel_deleting_an_item_with_play_state_works_and_unknown_ids_are_404() {
+    let state = test_state().await;
+    let (token, user_id) = admin_session(&state).await;
+    let app = app(state.clone());
+    let films = create_library_via_api(&app, &state, &token, "Films", "Movies").await;
+    let film = r3rel_insert_item(&state, films, "Film", "Movie", None, None).await;
+    let kept = r3rel_insert_item(&state, films, "Kept", "Movie", None, None).await;
+    r3rel_play_state(&state, user_id, film).await;
+    r3rel_play_state(&state, user_id, kept).await;
+
+    let (status, body) = send_authed(&app, "DELETE", &format!("/Items/{film}"), &token, None).await;
+    assert!(status.is_success(), "delete: {status} {body}");
+    let data: Vec<String> = sqlx::query_scalar("SELECT item_id FROM user_item_data")
+        .fetch_all(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(data, [kept.to_string()]);
+
+    for id in [film, uuid::Uuid::new_v4()] {
+        let (status, body) =
+            send_authed(&app, "DELETE", &format!("/Items/{id}"), &token, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "delete {id}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn r3rel_a_partial_configuration_post_keeps_every_other_setting() {
+    let state = test_state().await;
+    let (admin, _) = admin_session(&state).await;
+    let app = app(state.clone());
+    let (_, config) = send_authed(&app, "GET", "/System/Configuration", &admin, None).await;
+    let mut full = config.clone();
+    full["ServerName"] = serde_json::json!("Kept Server");
+    full["IsStartupWizardCompleted"] = serde_json::json!(true);
+    full["UICulture"] = serde_json::json!("de-DE");
+    full["MaxResumePct"] = serde_json::json!(85);
+    let (status, body) = send_authed(
+        &app,
+        "POST",
+        "/System/Configuration",
+        &admin,
+        Some(&full.to_string()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    // Only one field, in another case: the rest stays as saved, in memory and on disk.
+    let (status, body) = send_authed(
+        &app,
+        "POST",
+        "/System/Configuration",
+        &admin,
+        Some(r#"{"minResumePct":12}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let (_, config) = send_authed(&app, "GET", "/System/Configuration", &admin, None).await;
+    assert_eq!(config["MinResumePct"], 12, "{config}");
+    assert_eq!(config["ServerName"], "Kept Server", "{config}");
+    assert_eq!(config["IsStartupWizardCompleted"], true, "{config}");
+    assert_eq!(config["UICulture"], "de-DE", "{config}");
+    assert_eq!(config["MaxResumePct"], 85, "{config}");
+    let saved: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(state.data_dir.join("config.json")).unwrap())
+            .unwrap();
+    assert_eq!(saved["ServerName"], "Kept Server", "{saved}");
+    assert_eq!(saved["IsStartupWizardCompleted"], true, "{saved}");
+    assert_eq!(saved["MinResumePct"], 12, "{saved}");
+
+    // A body that isn't an object changes nothing.
+    for bad in ["[]", "\"x\""] {
+        let (status, body) =
+            send_authed(&app, "POST", "/System/Configuration", &admin, Some(bad)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {body}");
+    }
+    let (_, config) = send_authed(&app, "GET", "/System/Configuration", &admin, None).await;
+    assert_eq!(config["ServerName"], "Kept Server", "{config}");
+}
+
 #[tokio::test]
 async fn test_failed_library_create_changes_no_list() {
     let state = test_state().await;
@@ -33007,6 +33197,104 @@ async fn g1c_list_user_data_is_the_callers() {
                 n + 1
             );
         }
+    }
+}
+
+// R3 core reliability: lists for another user
+
+#[tokio::test]
+async fn r3rel_a_list_for_another_user_has_that_users_filters_and_data() {
+    let state = test_state().await;
+    let _dir = G1cDataDir(state.data_dir.to_path_buf());
+    let app = app(state.clone());
+    let (owner, owner_id, viewer, viewer_id) = g1_owner_and_viewer(&state, &app).await;
+    let m = g1c_insert_movies(&state, 4).await;
+    let db = &state.db;
+    let (o, v): (uuid::Uuid, uuid::Uuid) = (owner_id.parse().unwrap(), viewer_id.parse().unwrap());
+    // The owner: favorite 1, part-way through 2. The viewer: favorite 3, part-way through 4,
+    // played 1.
+    rustyfin_db::repo_playback::set_favorite(db, o, m[0], true)
+        .await
+        .unwrap();
+    rustyfin_db::repo_playback::update_playback_position(db, o, m[1], 2000)
+        .await
+        .unwrap();
+    rustyfin_db::repo_playback::set_favorite(db, v, m[2], true)
+        .await
+        .unwrap();
+    rustyfin_db::repo_playback::update_playback_position(db, v, m[3], 4000)
+        .await
+        .unwrap();
+    rustyfin_db::repo_playback::mark_played(db, v, m[0])
+        .await
+        .unwrap();
+
+    let base = "Recursive=true&IncludeItemTypes=Movie";
+    // (who asks, for which user, filter, the movies listed)
+    let (owner, viewer) = (owner.as_str(), viewer.as_str());
+    let (owner_id, viewer_id) = (owner_id.as_str(), viewer_id.as_str());
+    let cases: [(&str, &str, &str, &[usize]); 10] = [
+        (owner, "", "Filters=IsFavorite", &[1]),
+        (owner, "", "Filters=IsResumable", &[2]),
+        (viewer, "", "Filters=IsFavorite", &[3]),
+        (viewer, "", "filters=IsResumable", &[4]),
+        (owner, viewer_id, "IsFavorite=true", &[3]),
+        (owner, viewer_id, "Filters=IsResumable", &[4]),
+        (owner, viewer_id, "IsPlayed=true", &[1]),
+        (owner, viewer_id, "IsUnplayed=true", &[2, 3, 4]),
+        (owner, owner_id, "IsFavorite=true", &[1]),
+        (viewer, viewer_id, "IsPlayed=true", &[1]),
+    ];
+    for (token, user, filter, numbers) in cases {
+        let mut uris = vec![format!("/Items?{base}&{filter}&userId={user}")];
+        if !user.is_empty() {
+            uris.push(format!("/Users/{user}/Items?{base}&{filter}"));
+        }
+        for uri in uris {
+            let (status, items, total) = g1c_list(&app, &uri, token).await;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            assert_eq!(g1c_sorted_ids(&items), g1c_movies(&m, numbers), "{uri}");
+            assert_eq!(total, numbers.len() as i64, "{uri}");
+        }
+    }
+
+    // The owner's list for the viewer carries the viewer's user data.
+    for uri in [
+        format!("/Users/{viewer_id}/Items?{base}"),
+        format!("/Items?{base}&UserId={viewer_id}"),
+    ] {
+        let (status, items, _) = g1c_list(&app, &uri, owner).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert_eq!(items.len(), 4, "{uri}");
+        for item in &items {
+            let n = m.iter().position(|movie| *movie == g1c_id(item)).unwrap();
+            let expected = [
+                (true, false, 0),
+                (false, false, 0),
+                (false, true, 0),
+                (false, false, 4000),
+            ][n];
+            // Movie 2 has no row of the viewer's: no data, or the empty data
+            let got = g1c_user_data(item).unwrap_or((false, false, 0));
+            assert_eq!(got, expected, "{uri}: movie {}", n + 1);
+        }
+    }
+
+    // A user who isn't an administrator lists only their own; an unknown user is 404.
+    for uri in [
+        format!("/Users/{owner_id}/Items?{base}"),
+        format!("/Items?{base}&userId={owner_id}"),
+    ] {
+        let (status, _, _) = g1c_list(&app, &uri, viewer).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
+    }
+    let unknown = uuid::Uuid::new_v4();
+    for uri in [
+        format!("/Users/{unknown}/Items?{base}"),
+        format!("/Items?{base}&userId={unknown}"),
+    ] {
+        let (status, _, _) = g1c_list(&app, &uri, owner).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
     }
 }
 
