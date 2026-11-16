@@ -21,6 +21,14 @@ pub fn routes() -> Router<AppState> {
         .route("/Shows/{seriesId}/Episodes", get(get_episodes))
 }
 
+/// Keeps the episodes of the library `parent_id` names (all when `None`), as a library's own
+/// Next Up and Upcoming rows ask with `ParentId`
+fn in_library(episodes: &mut Vec<MediaItem>, parent_id: Option<Uuid>) {
+    if let Some(library) = parent_id {
+        episodes.retain(|e| e.library_id == library);
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[allow(dead_code)]
@@ -53,6 +61,7 @@ async fn next_up(
     HiddenItems::for_caller(&state, &claims)
         .await?
         .retain(&mut episodes);
+    in_library(&mut episodes, q.parent_id);
 
     let total = episodes.len() as i64;
     let end = start_index.saturating_add(limit).min(episodes.len());
@@ -101,14 +110,29 @@ async fn upcoming(
     HiddenItems::for_caller(&state, &claims)
         .await?
         .retain(&mut episodes);
+    in_library(&mut episodes, q.parent_id);
 
     let total = episodes.len() as i64;
     let end = start_index.saturating_add(limit).min(episodes.len());
-    let items: Vec<MediaItem> = if start_index < episodes.len() {
+    let mut items: Vec<MediaItem> = if start_index < episodes.len() {
         episodes[start_index..end].to_vec()
     } else {
         Vec::new()
     };
+
+    // Enrich the page as Next Up does, so its cards get their series and pictures
+    let tmdb = state.tmdb.api(None);
+    enrich_items(
+        &state.db_ro,
+        &state.server_id,
+        user_id,
+        &mut items,
+        &state.http_client,
+        tmdb.as_ref(),
+        &state.data_dir,
+        true,
+    )
+    .await;
 
     Ok(Json(QueryResult {
         items,

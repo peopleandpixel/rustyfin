@@ -1072,6 +1072,30 @@ select.jf-input {
   color: #fff;
 }
 
+/* A folder's breadcrumbs in a library of mixed content: the library, the folders above, the folder */
+.jf-crumbs {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.375rem;
+  margin-bottom: 1.25rem;
+  font-size: 0.875rem;
+  color: rgb(255 255 255 / 0.4);
+}
+
+.jf-crumb {
+  color: rgb(255 255 255 / 0.7);
+}
+
+button.jf-crumb:hover {
+  color: #00a4dc;
+}
+
+.jf-crumb[aria-current="page"] {
+  color: #fff;
+  font-weight: 600;
+}
+
 /* Album and song track rows: number, title, length */
 .jf-track-row {
   display: flex;

@@ -15,6 +15,7 @@ import {
 import './modules/home.js';
 import { posterLoaded, posterFailed } from './modules/library.js';
 import './modules/genres.js';
+import './modules/libtabs.js';
 import './modules/music.js';
 import './modules/item.js';
 import './modules/metadata-admin.js';
