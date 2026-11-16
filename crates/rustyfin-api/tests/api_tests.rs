@@ -40860,6 +40860,99 @@ async fn j2_odd_requests_never_fail_the_server() {
     }
 }
 
+// R3 decisions: universal audio
+
+/// `GET {uri}` with `token`: the status, the Location header and the body.
+async fn r3decisions_get(
+    app: &axum::Router,
+    uri: &str,
+    token: &str,
+) -> (StatusCode, Option<String>, Vec<u8>) {
+    let req = Request::builder()
+        .uri(uri)
+        .header("Authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let location = resp
+        .headers()
+        .get("location")
+        .map(|v| v.to_str().unwrap().to_string());
+    let body = resp
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .to_vec();
+    (status, location, body)
+}
+
+/// `/Audio/{id}/universal` answers with audio, as Jellyfin's does, not with JSON: the file when
+/// the query's containers take it, else the HLS transcode the stream builder chose.
+#[tokio::test]
+async fn r3decisions_universal_audio_plays_the_file_or_the_hls_transcode() {
+    let state = test_state().await;
+    add_user(&state, "r3d-audio", "r3d-pass", true).await;
+    let (song, _, _) = j2_item(
+        &state,
+        "r3d-song",
+        "Audio",
+        "flac",
+        j2_song("flac", 900_000),
+    )
+    .await;
+    let app = app(state);
+    let (token, _) = g2_login_device(&app, "r3d-audio", "r3d-pass", "r3d-device")
+        .await
+        .unwrap();
+
+    // Jellyfin Web on Chrome takes FLAC: the file itself
+    let (status, location, body) = r3decisions_get(
+        &app,
+        &format!(
+            "/Audio/{song}/universal?Container=opus,webm|opus,mp3,aac,m4a|aac,flac\
+             &TranscodingContainer=mp4&TranscodingProtocol=hls&AudioCodec=aac\
+             &MaxStreamingBitrate=140000000"
+        ),
+        &token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(location, None);
+    assert_eq!(body.len(), 1000);
+
+    // A client that takes only MP3 and AAC over HLS gets the transcode
+    let (status, location, _) = r3decisions_get(
+        &app,
+        &format!(
+            "/audio/{song}/universal?container=mp3,aac&transcodingContainer=ts\
+             &transcodingProtocol=hls&audioCodec=aac&maxStreamingBitrate=320000"
+        ),
+        &token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FOUND);
+    let location = location.unwrap();
+    assert!(
+        location.starts_with(&format!("/Videos/{song}/master.m3u8?")),
+        "{location}"
+    );
+    assert!(location.contains("AudioCodec=aac"), "{location}");
+    assert!(location.contains("AudioOnly=true"), "{location}");
+
+    // stream.{container} answered 500, as its second path parameter failed the extractor
+    let (status, _, body) = r3decisions_get(
+        &app,
+        &format!("/Audio/{song}/stream.mp3?AudioCodec=mp3&AudioBitrate=192000"),
+        &token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.len(), 1000);
+}
+
 #[tokio::test]
 async fn j2_old_routes_answer_as_before() {
     let state = test_state().await;
