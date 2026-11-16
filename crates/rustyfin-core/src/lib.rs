@@ -6,6 +6,7 @@ pub mod encoding;
 pub mod image_proxy;
 pub mod image_warmer;
 pub mod jellyfin_import;
+mod key_frames;
 pub mod library_monitor;
 pub mod library_watch;
 pub mod local_images;
