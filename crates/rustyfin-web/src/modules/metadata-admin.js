@@ -40,7 +40,8 @@ function splitList(text) {
 // The metadata editor's form values as Jellyfin's item update (POST /Items/{id}). A blank field clears it;
 // an unticked field in "Fields a refresh may change" is locked. The sort title goes only when it was
 // changed, as a blank one sets the sort name back to the title's. The provider ids the form shows go over
-// the item's others; people without a name are dropped.
+// the item's others; people without a name are dropped. The studios go as the item had them unless the
+// field was edited, so a studio with a comma in its name stays whole.
 function itemUpdateBody(values) {
     const text = v => String(v ?? '').trim() || null;
     const number = v => {
@@ -66,7 +67,8 @@ function itemUpdateBody(values) {
         OfficialRating: text(values.officialRating),
         Genres: splitList(values.genres),
         Tags: splitList(values.tags),
-        Studios: splitList(values.studios).map(Name => ({ Name })),
+        Studios: (Array.isArray(values.studioNames) && String(values.studios ?? '') === String(values.studiosBefore ?? '')
+            ? values.studioNames : splitList(values.studios)).map(Name => ({ Name })),
         People: (values.people || [])
             .map(p => ({ Name: text(p.name), Role: text(p.role), Type: p.type || 'Actor' }))
             .filter(p => p.Name),
@@ -374,14 +376,23 @@ async function openImageEditor(id) {
 }
 
 // The metadata editor: title, overview, dates, ratings, genres, tags and the locks
-// One row of the editor's people: name, role and kind, and a button that removes the row
+// A person kind's label; a kind without a translation shows as the server names it
+function personTypeLabel(kind) {
+    const key = `metadata.person_${kind}`;
+    const label = t(key);
+    return label === key ? kind : label;
+}
+
+// One row of the editor's people: name, role and kind, and a button that removes the row. A kind
+// the list doesn't have (Conductor, Lyricist, ...) is added as an option, so it stays as it was.
 function personRowHtml(person = {}) {
-    const type = PERSON_TYPES.includes(person.Type) ? person.Type : 'Actor';
+    const type = String(person.Type || 'Actor');
+    const kinds = PERSON_TYPES.includes(type) ? PERSON_TYPES : [...PERSON_TYPES, type];
     return `<div class="grid grid-cols-[1fr_1fr_auto_auto] gap-2 items-center" data-person>
         <input class="jf-input w-full" data-person-name aria-label="${escapeHtml(t('metadata.person_name'))}" placeholder="${escapeHtml(t('metadata.person_name'))}" value="${escapeHtml(person.Name ?? '')}">
         <input class="jf-input w-full" data-person-role aria-label="${escapeHtml(t('metadata.person_role'))}" placeholder="${escapeHtml(t('metadata.person_role'))}" value="${escapeHtml(person.Role ?? '')}">
-        <select class="jf-input" data-person-type aria-label="${escapeHtml(t('metadata.person_type'))}">${PERSON_TYPES.map(kind =>
-            `<option value="${kind}"${kind === type ? ' selected' : ''}>${escapeHtml(t(`metadata.person_${kind}`))}</option>`).join('')}</select>
+        <select class="jf-input" data-person-type aria-label="${escapeHtml(t('metadata.person_type'))}">${kinds.map(kind =>
+            `<option value="${escapeHtml(kind)}"${kind === type ? ' selected' : ''}>${escapeHtml(personTypeLabel(kind))}</option>`).join('')}</select>
         <button type="button" class="jf-btn-ghost !px-2 text-xs" data-remove-person title="${escapeHtml(t('metadata.remove_person'))}" aria-label="${escapeHtml(t('metadata.remove_person'))}">${icon('X', { size: 14 })}</button>
     </div>`;
 }
@@ -460,6 +471,8 @@ async function openMetadataEditor(id) {
             'officialRating', 'communityRating', 'criticRating', 'genres', 'tags', 'studios'].map(name => [name, form[name].value]));
         if (hasEndDate) values.endDate = form.endDate.value;
         values.sortNameBefore = item.ForcedSortName;
+        values.studioNames = (item.Studios || []).map(s => s.Name);
+        values.studiosBefore = values.studioNames.join(', ');
         values.people = [...people.querySelectorAll('[data-person]')].map(row => ({
             name: row.querySelector('[data-person-name]').value,
             role: row.querySelector('[data-person-role]').value,

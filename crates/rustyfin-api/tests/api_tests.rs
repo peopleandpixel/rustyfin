@@ -49225,3 +49225,111 @@ async fn r3item2_subtitle_upload_delete_and_search() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+/// A subtitle file of about 3 MB uploads: the JSON body (the file in base64, about 4 MB) is past
+/// the server's default request limit, which the upload route raises.
+#[tokio::test]
+async fn r3item2_subtitle_upload_takes_3_mb() {
+    use base64::Engine as _;
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, _, _) = g1_owner_and_viewer(&state, &app).await;
+    let (library, movie, _, _) = r3item2_library(&state).await;
+    let cue = "1\n00:00:01,000 --> 00:00:02,000\nA line of subtitle text that repeats\n\n";
+    let srt = cue.repeat(3 * 1024 * 1024 / cue.len() + 1);
+    assert!(srt.len() > 3 * 1024 * 1024);
+    let upload = serde_json::json!({
+        "Language": "eng",
+        "Format": "srt",
+        "Data": base64::engine::general_purpose::STANDARD.encode(&srt),
+    });
+    let (status, _, body) = r3item2_send(
+        &app,
+        "POST",
+        &format!("/Videos/{movie}/Subtitles"),
+        &owner,
+        Some(upload),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    let saved = library.join("Quill Harbor (2031)/Quill Harbor (2031).eng.srt");
+    assert_eq!(std::fs::metadata(&saved).unwrap().len(), srt.len() as u64);
+}
+
+/// An item the caller's library access hides answers 404 on Download and on subtitle delete, as
+/// for an unknown item, also for an administrator with limits; the file stays.
+#[tokio::test]
+async fn r3item2_hidden_items_are_404_on_download_and_subtitle_delete() {
+    use base64::Engine as _;
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, viewer, viewer_id) = g1_owner_and_viewer(&state, &app).await;
+    let (library, movie, _, _) = r3item2_library(&state).await;
+    let limited_id = add_user(&state, "r3item2-limited", "limitedpass", true).await;
+    let (limited, _) = login(&app, "r3item2-limited", "limitedpass").await.unwrap();
+
+    // An external subtitle, stream 0
+    let upload = serde_json::json!({
+        "Language": "eng",
+        "Format": "srt",
+        "Data": base64::engine::general_purpose::STANDARD.encode("1\n00:00:01,000 --> 00:00:02,000\nHi\n"),
+    });
+    let (status, _, _) = r3item2_send(
+        &app,
+        "POST",
+        &format!("/Videos/{movie}/Subtitles"),
+        &owner,
+        Some(upload),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let subtitle = library.join("Quill Harbor (2031)/Quill Harbor (2031).eng.srt");
+    assert!(subtitle.is_file());
+
+    // Both users see no library
+    for user in [viewer_id.clone(), limited_id.to_string()] {
+        let (status, _, _) = r3item2_send(
+            &app,
+            "POST",
+            &format!("/Users/{user}/Policy"),
+            &owner,
+            Some(serde_json::json!({ "EnableAllFolders": false, "EnabledFolders": [] })),
+        )
+        .await;
+        assert!(status.is_success(), "{status}");
+    }
+    let (status, _, _) = r3item2_send(
+        &app,
+        "GET",
+        &format!("/Items/{movie}/Download"),
+        &viewer,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _, _) = r3item2_send(
+        &app,
+        "DELETE",
+        &format!("/Videos/{movie}/Subtitles/0"),
+        &limited,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(subtitle.is_file(), "a hidden item's subtitle stays");
+    // The owner, without limits, still may
+    let (status, _, _) = r3item2_send(
+        &app,
+        "GET",
+        &format!("/Items/{movie}/Download"),
+        &owner,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}

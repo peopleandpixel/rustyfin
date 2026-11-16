@@ -53,6 +53,23 @@ pub(crate) async fn can_download(state: &AppState, user: Uuid, item: &MediaItem)
         .is_ok_and(|policy| policy.access.enable_content_downloading)
 }
 
+/// Whether the request resumes a download already logged: a byte range that doesn't start at 0.
+/// A client that downloads with `Range: bytes=0-` starts one.
+fn resumes(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::RANGE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|range| {
+            let start = range
+                .trim()
+                .strip_prefix("bytes=")
+                .and_then(|spec| spec.split(',').next())
+                .and_then(|first| first.trim().split('-').next())
+                .map(str::trim);
+            start != Some("0")
+        })
+}
+
 /// `attachment` with the file's name, quotes dropped as Jellyfin drops them, and its UTF-8 form.
 fn content_disposition(path: &str) -> Option<HeaderValue> {
     let name = std::path::Path::new(path)
@@ -62,7 +79,7 @@ fn content_disposition(path: &str) -> Option<HeaderValue> {
     let ascii: String = name
         .chars()
         .map(|c| {
-            if c.is_ascii() && !c.is_ascii_control() {
+            if c.is_ascii() && !c.is_ascii_control() && c != '\\' {
                 c
             } else {
                 '_'
@@ -113,8 +130,7 @@ async fn download_item(
             "Item does not support downloading".into(),
         ));
     }
-    // A range request resumes a download already logged
-    if !claims.sub.is_nil() && !headers.contains_key(header::RANGE) {
+    if !claims.sub.is_nil() && !resumes(&headers) {
         let name = format!("{} is downloading {}", claims.name, item.name);
         super::activity::record(
             &state,
@@ -140,11 +156,27 @@ mod tests {
 
     #[test]
     fn r3item2_content_disposition_names_the_file() {
-        let value = content_disposition("/m/Films/Zébra \"Quay\".mkv").unwrap();
+        let value = content_disposition("/m/Films/Zébra \"Quay\\x\".mkv").unwrap();
         assert_eq!(
             value.to_str().unwrap(),
-            "attachment; filename=\"Z_bra Quay.mkv\"; filename*=UTF-8''Z%C3%A9bra%20Quay.mkv"
+            "attachment; filename=\"Z_bra Quay_x.mkv\"; filename*=UTF-8''Z%C3%A9bra%20Quay%5Cx.mkv"
         );
+    }
+
+    #[test]
+    fn r3item2_a_range_from_0_starts_a_download() {
+        let with = |range: Option<&str>| {
+            let mut headers = HeaderMap::new();
+            if let Some(range) = range {
+                headers.insert(header::RANGE, HeaderValue::from_str(range).unwrap());
+            }
+            resumes(&headers)
+        };
+        assert!(!with(None));
+        assert!(!with(Some("bytes=0-")));
+        assert!(!with(Some("bytes=0-1023")));
+        assert!(with(Some("bytes=1024-")));
+        assert!(with(Some("bytes=-500")));
     }
 
     #[test]
