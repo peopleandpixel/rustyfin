@@ -134,6 +134,8 @@ pub async fn refresh_item_metadata_with(
     let mut nfo_named = false;
     let nfo_path = match item.media_type {
         MediaType::Series => nfo_parser::find_series_nfo(media_path),
+        MediaType::MusicAlbum => nfo_parser::find_folder_nfo(media_path, "album.nfo"),
+        MediaType::MusicArtist => nfo_parser::find_folder_nfo(media_path, "artist.nfo"),
         _ => nfo_parser::find_nfo_for_media(media_path),
     };
     if let Some(nfo_path) = nfo_path
@@ -725,12 +727,39 @@ async fn apply_metadata_to_item(
         && updated.name != new_name
     {
         updated.name = new_name.to_string();
-        // An episode sorts by its numbers; its sort name stays
-        if updated.media_type != MediaType::Episode {
-            updated.sort_name = Some(new_name.to_lowercase());
-        }
         changed = true;
         tracing::debug!("updated name '{}' to '{}'", before.name, new_name);
+    }
+    // The sort name: an NFO's <sorttitle> forces one, as in Jellyfin; else a forced one stays and
+    // any other is made again from the name. A locked one (whole item, Name or SortName) and a
+    // season's stay.
+    if !locks.sort_name_locked() && updated.media_type != MediaType::Season {
+        let mut forced = rustyfin_db::repo_media::forced_sort_name(pool, updated.id)
+            .await
+            .map_err(|e| e.to_string())?;
+        if let Some(sort_title) = meta.sort_title.as_deref().map(str::trim)
+            && !sort_title.is_empty()
+            && forced.as_deref() != Some(sort_title)
+        {
+            rustyfin_db::repo_media::set_forced_sort_name(pool, updated.id, Some(sort_title))
+                .await
+                .map_err(|e| e.to_string())?;
+            forced = Some(sort_title.to_string());
+        }
+        let sort_name = match forced.as_deref() {
+            Some(forced) => rustyfin_model::sort_name::forced_sort_name(forced),
+            None => rustyfin_model::sort_name::item_sort_name(
+                updated.media_type,
+                &updated.name,
+                updated.parent_index_number,
+                updated.index_number,
+                &rustyfin_model::sort_name::current_rules(),
+            ),
+        };
+        if updated.sort_name.as_deref() != Some(sort_name.as_str()) {
+            updated.sort_name = Some(sort_name);
+            changed = true;
+        }
     }
     if updated.premiere_date.is_none()
         && open("PremiereDate")

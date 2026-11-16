@@ -2558,6 +2558,81 @@ async fn b34_concurrent_refresh_saves_hit_no_lock_errors() {
         .expect("the search index matches the items");
 }
 
+// ── R3: sort names ──
+
+/// The metadata editor saves a forced sort name while a refresh that read the item earlier is
+/// still running. The refresh's later save of a new name and sort name changes neither: the edit
+/// wins, and the refresh's other fields still save.
+#[tokio::test]
+async fn r3sortname_an_edit_during_a_refresh_keeps_its_sort_name() {
+    let db = test_pool().await;
+    let lib = make_library("Movies", LibraryContentType::Movies);
+    rustyfin_db::repo_library::create_library(&db.pool, &lib)
+        .await
+        .unwrap();
+    let mut item = make_movie(lib.id, "Matrix");
+    item.sort_name = Some("matrix".to_string());
+    rustyfin_db::repo_media::upsert_media_item(&db.pool, &item)
+        .await
+        .unwrap();
+    let get = |id| {
+        let pool = db.pool.clone();
+        async move {
+            rustyfin_db::repo_media::get_item_by_id(&pool, id)
+                .await
+                .unwrap()
+                .unwrap()
+        }
+    };
+
+    // The refresh reads the item and finds a new title
+    let read = get(item.id).await;
+    let mut refreshed = read.clone();
+    refreshed.name = "The Matrix".to_string();
+    refreshed.sort_name = Some("matrix".to_string());
+    refreshed.overview = Some("A hacker learns the truth.".to_string());
+
+    // Meanwhile the editor forces a sort name, as POST /Items/{id} saves it
+    let edit_read = get(item.id).await;
+    let mut edited = edit_read.clone();
+    edited.sort_name = Some("matrix, the 0000000001".to_string());
+    rustyfin_db::repo_media::set_forced_sort_name(&db.pool, item.id, Some("Matrix, The 1"))
+        .await
+        .unwrap();
+    let written = rustyfin_db::repo_media::save_refresh_changes(&db.pool, &edit_read, &edited)
+        .await
+        .unwrap();
+    assert_eq!(written, ["name", "sort_name"]);
+
+    let written = rustyfin_db::repo_media::save_refresh_changes(&db.pool, &read, &refreshed)
+        .await
+        .unwrap();
+    assert_eq!(written, ["overview"]);
+    let after = get(item.id).await;
+    assert_eq!(after.name, "Matrix");
+    assert_eq!(after.sort_name.as_deref(), Some("matrix, the 0000000001"));
+    assert_eq!(
+        after.overview.as_deref(),
+        Some("A hacker learns the truth.")
+    );
+
+    // The other order: the refresh renames first, then the editor's save, read before it,
+    // does not undo the new name
+    let read = get(item.id).await;
+    let mut refreshed = read.clone();
+    refreshed.name = "The Matrix".to_string();
+    rustyfin_db::repo_media::save_refresh_changes(&db.pool, &read, &refreshed)
+        .await
+        .unwrap();
+    let mut stale_edit = read.clone();
+    stale_edit.sort_name = Some("matrix".to_string());
+    let written = rustyfin_db::repo_media::save_refresh_changes(&db.pool, &read, &stale_edit)
+        .await
+        .unwrap();
+    assert!(written.is_empty());
+    assert_eq!(get(item.id).await.name, "The Matrix");
+}
+
 // ── B20: one-time setup codes ──
 
 async fn b20_password(pool: &SqlitePool, user: Uuid) -> String {

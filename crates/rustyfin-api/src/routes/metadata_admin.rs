@@ -626,15 +626,28 @@ async fn update_item(
     if let Some(name) = field(&body, "Name").and_then(text_value) {
         updated.name = name;
     }
-    // A ForcedSortName sets the sort name; an empty one clears it back to the name's
-    let forced_sort = field(&body, "ForcedSortName");
-    if updated.name != item.name || forced_sort.is_some() {
-        updated.sort_name = match forced_sort.and_then(text_value) {
-            Some(sort) => Some(sort),
-            // An episode sorts by its numbers; its sort name stays
-            None if item.media_type == MediaType::Episode => item.sort_name.clone(),
-            None => Some(updated.name.to_lowercase()),
-        };
+    // A ForcedSortName sets the forced sort name and an empty one clears it. The sort name is
+    // made from the forced one, or else from the name, as Jellyfin's SortName is; a season keeps
+    // its own.
+    let forced_now = rustyfin_db::repo_media::forced_sort_name(&state.db, id).await?;
+    let forced = match field(&body, "ForcedSortName") {
+        Some(value) => text_value(value),
+        None => forced_now.clone(),
+    };
+    if forced != forced_now {
+        rustyfin_db::repo_media::set_forced_sort_name(&state.db, id, forced.as_deref()).await?;
+    }
+    if forced.is_some() || item.media_type != MediaType::Season {
+        updated.sort_name = Some(match forced.as_deref() {
+            Some(forced) => rustyfin_model::sort_name::forced_sort_name(forced),
+            None => rustyfin_model::sort_name::item_sort_name(
+                updated.media_type,
+                &updated.name,
+                updated.parent_index_number,
+                updated.index_number,
+                &rustyfin_model::sort_name::current_rules(),
+            ),
+        });
     }
     if let Some(value) = field(&body, "Overview") {
         updated.overview = text_value(value);

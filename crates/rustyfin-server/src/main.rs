@@ -145,6 +145,8 @@ async fn main() {
 
     // Load or create server configuration
     let mut config = load_config(&data_dir);
+    // Sort names made from here on use the configuration's rules
+    rustyfin_model::sort_name::set_rules(config.sort_rules());
 
     tracing::info!("initializing database at {}", db_url);
     let pool = rustyfin_db::init_db(&db_url)
@@ -506,6 +508,13 @@ async fn main() {
     {
         let state = state.clone();
         tokio::spawn(async move { rustyfin_api::date_backfill::run(&state).await });
+    }
+
+    // Background task: makes the stored sort names again when the sort rules changed (or once
+    // after migration 094)
+    {
+        let state = state.clone();
+        tokio::spawn(async move { rustyfin_api::sort_names::apply(&state).await });
     }
 
     // Extract HTTP port for discovery services

@@ -5271,6 +5271,235 @@ async fn b152_a_card_index_has_only_what_a_card_shows() {
     );
 }
 
+// R3 sort names: "The Matrix" sorts and files under M, as in Jellyfin
+
+#[tokio::test]
+async fn r3sortname_items_sort_and_filter_by_jellyfins_sort_name() {
+    let state = test_state().await;
+    let folder = media_folder(&state, "r3 sort names");
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: "R3 Sort Names".to_string(),
+        content_type: rustyfin_model::library::LibraryContentType::Movies,
+        paths: vec![folder.clone()],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    // Stored as before 094: the lowercased name
+    let mut ids = HashMap::new();
+    for name in ["Nemo", "The Matrix", "Lion", "28 Days", "Zodiac", "Theory"] {
+        let id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO media_items (id, library_id, name, sort_name, media_type, path) \
+             VALUES (?, ?, ?, ?, 'Movie', ?)",
+        )
+        .bind(id.to_string())
+        .bind(lib.id.to_string())
+        .bind(name)
+        .bind(name.to_lowercase())
+        .bind(format!("{folder}/{name}.mkv"))
+        .execute(&state.db)
+        .await
+        .unwrap();
+        ids.insert(name, id);
+    }
+    rustyfin_api::sort_names::apply(&state).await;
+    let (admin, _) = admin_session(&state).await;
+    let app = app(state.clone());
+
+    let names = |body: &serde_json::Value| -> Vec<String> {
+        body["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["Name"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let list = |query: String| {
+        let (app, admin) = (app.clone(), admin.clone());
+        async move {
+            let (status, body) = send_authed(
+                &app,
+                "GET",
+                &format!(
+                    "/Items?LibraryId={}&Recursive=true&SortBy=SortName&Fields=SortName{query}",
+                    lib.id
+                ),
+                &admin,
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            body
+        }
+    };
+    let body = list(String::new()).await;
+    assert_eq!(
+        names(&body),
+        ["28 Days", "Lion", "The Matrix", "Nemo", "Theory", "Zodiac"]
+    );
+    let matrix = body["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["Name"] == "The Matrix")
+        .unwrap();
+    assert_eq!(matrix["SortName"], "matrix");
+    // The letters go by the sort name only, as in Jellyfin; '#' holds what starts with no letter,
+    // and Z holds Zodiac
+    assert_eq!(
+        names(&list("&NameStartsWith=M".into()).await),
+        ["The Matrix"]
+    );
+    assert_eq!(names(&list("&NameStartsWith=T".into()).await), ["Theory"]);
+    assert_eq!(
+        names(&list("&NameStartsWith=%23".into()).await),
+        ["28 Days"]
+    );
+    assert_eq!(names(&list("&NameStartsWith=Z".into()).await), ["Zodiac"]);
+    assert_eq!(
+        names(&list("&NameStartsWithOrGreater=N".into()).await),
+        ["Nemo", "Theory", "Zodiac"]
+    );
+
+    // The editor's forced sort name is returned as written and sorts the item; clearing it
+    // brings the automatic one back
+    let matrix_id = ids["The Matrix"];
+    let save = |body: serde_json::Value| {
+        let (app, admin) = (app.clone(), admin.clone());
+        async move {
+            let (status, text) = send_authed(
+                &app,
+                "POST",
+                &format!("/Items/{matrix_id}"),
+                &admin,
+                Some(&body.to_string()),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NO_CONTENT, "{text}");
+        }
+    };
+    save(serde_json::json!({"ForcedSortName": "Zzz Matrix"})).await;
+    let (status, item) =
+        send_authed(&app, "GET", &format!("/Items/{matrix_id}"), &admin, None).await;
+    assert_eq!(status, StatusCode::OK, "{item}");
+    assert_eq!(item["ForcedSortName"], "Zzz Matrix");
+    assert_eq!(item["SortName"], "zzz matrix");
+    assert_eq!(
+        names(&list(String::new()).await).last().unwrap(),
+        "The Matrix"
+    );
+    // A rescan's save keeps it
+    let mut rescanned = rustyfin_db::repo_media::get_item_by_id(&state.db, matrix_id)
+        .await
+        .unwrap()
+        .unwrap();
+    rescanned.sort_name = Some("matrix".to_string());
+    rustyfin_db::repo_media::upsert_media_item(&state.db, &rescanned)
+        .await
+        .unwrap();
+    assert_eq!(
+        names(&list(String::new()).await).last().unwrap(),
+        "The Matrix"
+    );
+    save(serde_json::json!({"ForcedSortName": ""})).await;
+    let (_, item) = send_authed(&app, "GET", &format!("/Items/{matrix_id}"), &admin, None).await;
+    assert!(item["ForcedSortName"].is_null(), "{item}");
+    assert_eq!(item["SortName"], "matrix");
+}
+
+/// The sort lists round-trip through /System/Configuration, and saving other ones makes the
+/// stored sort names again. The extra word is one no other test's names hold, since the rules
+/// are the process's.
+#[tokio::test]
+async fn r3sortname_sort_rules_round_trip_and_remake_sort_names() {
+    let state = test_state().await;
+    let folder = media_folder(&state, "r3 sort rules");
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: "R3 Sort Rules".to_string(),
+        content_type: rustyfin_model::library::LibraryContentType::Movies,
+        paths: vec![folder.clone()],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    let id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO media_items (id, library_id, name, sort_name, media_type, path) \
+         VALUES (?, ?, 'Qzxv Sorted', 'qzxv sorted', 'Movie', ?)",
+    )
+    .bind(id.to_string())
+    .bind(lib.id.to_string())
+    .bind(format!("{folder}/q.mkv"))
+    .execute(&state.db)
+    .await
+    .unwrap();
+    rustyfin_api::sort_names::apply(&state).await;
+    let (admin, _) = admin_session(&state).await;
+    let app = app(state.clone());
+
+    let (status, mut config) =
+        send_authed(&app, "GET", "/System/Configuration", &admin, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        config["SortRemoveWords"],
+        serde_json::json!(["the", "a", "an"])
+    );
+    assert_eq!(
+        config["SortRemoveCharacters"],
+        serde_json::json!([",", "&", "-", "{", "}", "'"])
+    );
+    assert_eq!(
+        config["SortReplaceCharacters"],
+        serde_json::json!([".", "+", "%"])
+    );
+
+    let sort_name = || async {
+        rustyfin_db::repo_media::get_item_by_id(&state.db, id)
+            .await
+            .unwrap()
+            .unwrap()
+            .sort_name
+    };
+    assert_eq!(sort_name().await.as_deref(), Some("qzxv sorted"));
+    config["SortRemoveWords"] = serde_json::json!(["the", "a", "an", "qzxv"]);
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        "/System/Configuration",
+        &admin,
+        Some(&config.to_string()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, saved) = send_authed(&app, "GET", "/System/Configuration", &admin, None).await;
+    assert_eq!(saved["SortRemoveWords"], config["SortRemoveWords"]);
+    // The pass runs in the background
+    let mut remade = None;
+    for _ in 0..100 {
+        remade = sort_name().await;
+        if remade.as_deref() == Some("sorted") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(remade.as_deref(), Some("sorted"));
+
+    // Jellyfin's lists again
+    config["SortRemoveWords"] = serde_json::json!(["the", "a", "an"]);
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        "/System/Configuration",
+        &admin,
+        Some(&config.to_string()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
 // B152 round 10: the card index lists the same items as the normal list for a user who isn't an
 // administrator, per-user filters included (Rustyfin has no library-access or parental-rating
 // limits; the per-user favourites are the per-user filter there is), and an episode card carries
@@ -42275,7 +42504,8 @@ async fn b20_import_metadata_replaces_with_jellyfins() {
     );
     assert_eq!(b20_fields(&w.state, m.show).await, b20_show_fields());
     assert_eq!(b20_fields(&w.state, m.e1).await, b20_e1_fields());
-    let e3 = serde_json::json!({ "sort_name": "show 1x03" });
+    // An episode's sort name is Jellyfin's: season and episode number, then the name
+    let e3 = serde_json::json!({ "sort_name": "001 - 0003 - Show 1x03" });
     assert_eq!(
         b20_fields(&w.state, m.e3).await,
         b20_expect("Show 1x03", e3),

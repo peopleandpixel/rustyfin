@@ -8,6 +8,7 @@ struct NfoMovie {
     title: Option<String>,
     #[serde(alias = "originaltitle")]
     original_title: Option<String>,
+    sorttitle: Option<String>,
     plot: Option<String>,
     year: Option<i32>,
     rating: Option<f64>,
@@ -119,6 +120,7 @@ pub async fn parse_nfo(nfo_path: &Path) -> Option<ExternalMetadata> {
         let imdb_id = nfo.provider_id("imdb").filter(|v| v.starts_with("tt"));
         return Some(ExternalMetadata {
             name: nfo.title.or(nfo.original_title),
+            sort_title: nfo.sorttitle.filter(|s| !s.trim().is_empty()),
             overview: nfo.plot,
             production_year: nfo.year,
             community_rating: nfo.rating,
@@ -168,6 +170,13 @@ pub fn find_nfo_for_media(media_path: &Path) -> Option<std::path::PathBuf> {
     }
 
     None
+}
+
+/// The NFO inside a music folder: `album.nfo` in an album's, `artist.nfo` in an artist's, where
+/// Jellyfin reads them (`AlbumNfoProvider`, `ArtistNfoProvider`).
+pub fn find_folder_nfo(dir: &Path, file_name: &str) -> Option<std::path::PathBuf> {
+    let p = dir.join(file_name);
+    p.exists().then_some(p)
 }
 
 /// The `tvshow.nfo` inside the series folder `series_dir`, where Jellyfin 12.4 reads it
