@@ -705,7 +705,9 @@ pub async fn delete_item(pool: &SqlitePool, id: Uuid) -> Result<bool, sqlx::Erro
     Ok(root_deleted)
 }
 
-/// Get latest items using a single static SQL query for plan reuse.
+/// Get latest items using a single static SQL query for plan reuse. A photo or mixed library's
+/// folders are left out unless `media_type` asks for them, as Jellyfin's latest query sets
+/// IsFolder = false when it names no type.
 /// Uses NULL-coalescing to avoid dynamic SQL string concatenation,
 /// so SQLite can always reuse the same query plan.
 pub async fn get_latest_items(
@@ -723,6 +725,7 @@ pub async fn get_latest_items(
          homepage, end_date, vote_count, popularity \
          FROM media_items \
          WHERE (?1 IS NULL OR media_type = ?1) \
+         AND (?1 IS NOT NULL OR media_type != 'Folder') \
          AND (?2 IS NULL OR library_id = ?2) \
          AND extra_type IS NULL \
          AND {visible} \

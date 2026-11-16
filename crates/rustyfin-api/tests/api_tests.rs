@@ -26986,6 +26986,18 @@ async fn r3photos_library_subfolders_are_folder_items() {
     )
     .await;
     assert_eq!(all.len(), 4);
+    // Latest lists the photos, never the folders (Jellyfin asks IsFolder = false there)
+    let (_, latest) = send_authed(
+        &app,
+        "GET",
+        &format!("/Items/Latest?ParentId={lib}"),
+        &token,
+        None,
+    )
+    .await;
+    let latest = latest.as_array().unwrap();
+    assert_eq!(latest.len(), 4, "{latest:?}");
+    assert!(latest.iter().all(|i| i["Type"] == "Photo"));
 
     // A folder whose files are gone goes; the others keep their ids
     std::fs::remove_dir_all(root.join("Trips/2024")).unwrap();
