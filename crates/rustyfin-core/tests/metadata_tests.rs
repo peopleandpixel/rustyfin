@@ -1118,3 +1118,328 @@ async fn r3perf_refresh_keeps_the_hash_of_an_unchanged_local_image() {
         "{again:?}"
     );
 }
+
+// ── R3 metadata follow-ups ──
+
+/// Lookups that refuse the key, counting the by-id calls.
+struct R3Refused(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl rustyfin_model::metadata::MetadataLookups for R3Refused {
+    fn movie_by_id(&self, _: i64) -> R1Lookup<'_, rustyfin_model::metadata::ExternalMetadata> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async { Err(rustyfin_model::metadata::LookupFailed::Unauthorized) })
+    }
+    fn series_by_id(&self, _: i64) -> R1Lookup<'_, rustyfin_model::metadata::ExternalMetadata> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async { Err(rustyfin_model::metadata::LookupFailed::Unauthorized) })
+    }
+    fn search_series(
+        &self,
+        _: &str,
+        _: Option<i32>,
+    ) -> R1Lookup<'_, rustyfin_model::metadata::ExternalMetadata> {
+        Box::pin(async { Err(rustyfin_model::metadata::LookupFailed::Unauthorized) })
+    }
+    fn season(&self, _: i64, _: i32) -> R1Lookup<'_, rustyfin_model::metadata::SeasonMetadata> {
+        Box::pin(async { Err(rustyfin_model::metadata::LookupFailed::Unauthorized) })
+    }
+}
+
+/// A provider's image call repeats its by-id lookup (TMDb's images come with the details), so
+/// after that lookup failed it isn't made: a refused key costs one request per item, not two.
+#[tokio::test]
+async fn r3meta_a_failed_lookup_is_not_repeated_for_images() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let fx = Fixture::new().await;
+    let mut item = fx.movie("R3 Refused", None).await;
+    item.tmdb_id = Some(7001);
+    rustyfin_db::repo_media::upsert_media_item(&fx.pool, &item)
+        .await
+        .unwrap();
+    let pm = rustyfin_core::plugin_manager::PluginManager::new(&PathBuf::from("."));
+    let images = Arc::new(AtomicUsize::new(0));
+    let counted = images.clone();
+    pm.register_metadata_provider(
+        "r3".to_string(),
+        "r3".to_string(),
+        rustyfin_model::plugin::PluginStatus::Active,
+        |_: &reqwest::Client, _: &str, _: Option<i32>| -> R1Found { Box::pin(async { None }) },
+        |_: &reqwest::Client, _: &str| -> R1Found { Box::pin(async { None }) },
+        move |_: &reqwest::Client,
+              _: Option<i64>,
+              _: Option<i64>,
+              _: MediaType|
+              -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Vec<rustyfin_model::metadata::MetadataImage>>
+                    + Send,
+            >,
+        > {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Vec::new() })
+        },
+    )
+    .await;
+    let lookups = Arc::new(AtomicUsize::new(0));
+    pm.register_metadata_lookups("r3", Arc::new(R3Refused(lookups.clone())))
+        .await;
+
+    let outcome = rustyfin_core::metadata::refresh_item_metadata_with(
+        &fx.pool,
+        &reqwest::Client::new(),
+        &item,
+        &pm,
+        rustyfin_core::metadata::RefreshOptions::TASK,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        outcome,
+        rustyfin_core::metadata::RefreshOutcome::Unauthorized
+    );
+    assert_eq!(lookups.load(Ordering::SeqCst), 1);
+    assert_eq!(images.load(Ordering::SeqCst), 0);
+}
+
+/// Fake TMDb lookups for the OMDb tests: a movie and a series with IMDb ids, and a season whose
+/// episodes have no genres and no rating, as TMDb's episodes have none.
+struct R3Tmdb;
+
+impl rustyfin_model::metadata::MetadataLookups for R3Tmdb {
+    fn movie_by_id(&self, _: i64) -> R1Lookup<'_, rustyfin_model::metadata::ExternalMetadata> {
+        r1scan_answer(async {
+            Some(rustyfin_model::metadata::ExternalMetadata {
+                name: Some("Paper Harbor".to_string()),
+                imdb_id: Some("tt0000601".to_string()),
+                genres: Some(vec!["Drama".to_string()]),
+                ..Default::default()
+            })
+        })
+    }
+    fn series_by_id(&self, _: i64) -> R1Lookup<'_, rustyfin_model::metadata::ExternalMetadata> {
+        r1scan_answer(async {
+            Some(rustyfin_model::metadata::ExternalMetadata {
+                name: Some("Glass Orchard".to_string()),
+                imdb_id: Some("tt0000501".to_string()),
+                official_rating: Some("TV-MA".to_string()),
+                ..Default::default()
+            })
+        })
+    }
+    fn search_series(
+        &self,
+        _: &str,
+        _: Option<i32>,
+    ) -> R1Lookup<'_, rustyfin_model::metadata::ExternalMetadata> {
+        r1scan_answer(async { None })
+    }
+    fn season(&self, _: i64, _: i32) -> R1Lookup<'_, rustyfin_model::metadata::SeasonMetadata> {
+        use rustyfin_model::metadata::{ExternalMetadata, SeasonMetadata};
+        r1scan_answer(async {
+            Some(SeasonMetadata {
+                meta: ExternalMetadata::default(),
+                episodes: (1..=2)
+                    .map(|n| {
+                        let name = Some(format!("Orchard Part {n}"));
+                        (
+                            n,
+                            ExternalMetadata {
+                                name,
+                                ..Default::default()
+                            },
+                        )
+                    })
+                    .collect(),
+            })
+        })
+    }
+}
+
+/// A stub OMDb: a movie by IMDb id, and season 1 of a series with full episode details. Counts
+/// the requests.
+async fn r3meta_omdb_stub() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    use axum::response::IntoResponse;
+    let hits: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+    let seen = hits.clone();
+    let handle = move |uri: axum::http::Uri| {
+        let seen = seen.clone();
+        async move {
+            let query = uri.query().unwrap_or_default().to_string();
+            seen.lock().unwrap().push(query.clone());
+            let has = |pair: &str| query.split('&').any(|p| p == pair);
+            if !has("apikey=r3-omdb-key") {
+                return (
+                    axum::http::StatusCode::UNAUTHORIZED,
+                    axum::Json(serde_json::json!({"Response": "False"})),
+                )
+                    .into_response();
+            }
+            let body = if has("i=tt0000601") {
+                serde_json::json!({"Title": "Paper Harbor", "Rated": "PG-13",
+                                   "Genre": "Comedy", "Response": "True"})
+            } else if has("i=tt0000501") && has("season=1") && has("detail=full") {
+                serde_json::json!({"Season": "1", "Response": "True", "Episodes": [
+                    {"Title": "OMDb Part 1", "Episode": "1", "Rated": "TV-MA",
+                     "Genre": "Drama, Mystery", "imdbID": "tt0000511"},
+                    {"Title": "OMDb Part 2", "Episode": "2", "Rated": "N/A",
+                     "Genre": "Drama", "imdbID": "tt0000512"}
+                ]})
+            } else {
+                serde_json::json!({"Response": "False", "Error": "Incorrect IMDb ID."})
+            };
+            axum::Json(body).into_response()
+        }
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let app = axum::Router::new().fallback(handle);
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (origin, hits)
+}
+
+/// A plugin manager with the fake TMDb, then OMDb (its lookups against `origin`, with `key`).
+async fn r3meta_manager(
+    origin: &str,
+    key: Option<&str>,
+) -> rustyfin_core::plugin_manager::PluginManager {
+    use std::sync::{Arc, Mutex};
+    let pm = rustyfin_core::plugin_manager::PluginManager::new(&PathBuf::from("."));
+    for name in ["r3tmdb", "omdb"] {
+        pm.register_metadata_provider(
+            name.to_string(),
+            name.to_string(),
+            rustyfin_model::plugin::PluginStatus::Active,
+            |_: &reqwest::Client, _: &str, _: Option<i32>| -> R1Found { Box::pin(async { None }) },
+            |_: &reqwest::Client, _: &str| -> R1Found { Box::pin(async { None }) },
+            |_: &reqwest::Client,
+             _: Option<i64>,
+             _: Option<i64>,
+             _: MediaType|
+             -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Vec<rustyfin_model::metadata::MetadataImage>>
+                        + Send,
+                >,
+            > { Box::pin(async { Vec::new() }) },
+        )
+        .await;
+    }
+    pm.register_metadata_lookups("r3tmdb", Arc::new(R3Tmdb))
+        .await;
+    let http = reqwest::Client::builder().no_proxy().build().unwrap();
+    let key = Arc::new(Mutex::new(key.map(String::from)));
+    pm.register_imdb_lookups(
+        "omdb",
+        Arc::new(plugin_omdb::OmdbLookups::new(http, origin, key)),
+    )
+    .await;
+    pm
+}
+
+/// Jellyfin's bundled OMDb provider runs after TMDb and fills only what is still missing: a
+/// movie's rating that TMDb has no US certification for, and the genres and rating of episodes,
+/// which TMDb's episodes lack, from the series' season list ("N/A" is no value). Every OMDb answer
+/// is cached: a second refresh asks nothing again.
+#[tokio::test]
+async fn r3meta_omdb_fills_missing_movie_and_episode_ratings_and_genres() {
+    let fx = Fixture::new().await;
+    let pool = &fx.pool;
+    let (origin, hits) = r3meta_omdb_stub().await;
+    let pm = r3meta_manager(&origin, Some("r3-omdb-key")).await;
+    let client = reqwest::Client::new();
+
+    let mut movie = fx.movie("Paper Harbor", None).await;
+    movie.official_rating = None;
+    movie.tmdb_id = Some(6001);
+    rustyfin_db::repo_media::upsert_media_item(pool, &movie)
+        .await
+        .unwrap();
+    rustyfin_core::metadata::refresh_item_metadata(pool, &client, &movie, &pm)
+        .await
+        .unwrap();
+    let after = stored(pool, movie.id).await;
+    assert_eq!(after.official_rating.as_deref(), Some("PG-13"));
+    assert_eq!(after.genres, ["Drama"], "TMDb's genres stay");
+
+    let root = fx.dir.join("film").join("Glass Orchard");
+    let base = MediaItem {
+        library_id: fx.library_id,
+        date_created: Utc.with_ymd_and_hms(2020, 1, 2, 3, 4, 5).unwrap(),
+        ..MediaItem::default_dto_fields()
+    };
+    let series = MediaItem {
+        id: Uuid::new_v4(),
+        name: "Glass Orchard".to_string(),
+        media_type: MediaType::Series,
+        path: root.to_string_lossy().into_owned(),
+        tmdb_id: Some(5001),
+        ..base.clone()
+    };
+    let season = MediaItem {
+        id: Uuid::new_v4(),
+        name: "Season 1".to_string(),
+        media_type: MediaType::Season,
+        path: root.join("Season 1").to_string_lossy().into_owned(),
+        parent_id: Some(series.id),
+        index_number: Some(1),
+        ..base.clone()
+    };
+    let episode = |n: i32| MediaItem {
+        id: Uuid::new_v4(),
+        name: format!("Glass Orchard - S01E0{n}"),
+        media_type: MediaType::Episode,
+        path: root
+            .join(format!("Season 1/Glass Orchard - S01E0{n}.mkv"))
+            .to_string_lossy()
+            .into_owned(),
+        parent_id: Some(season.id),
+        index_number: Some(n),
+        parent_index_number: Some(1),
+        ..base.clone()
+    };
+    let (first, second) = (episode(1), episode(2));
+    for item in [&series, &season, &first, &second] {
+        rustyfin_db::repo_media::upsert_media_item(pool, item)
+            .await
+            .unwrap();
+    }
+    rustyfin_core::metadata::refresh_item_metadata(pool, &client, &series, &pm)
+        .await
+        .unwrap();
+
+    let first_after = stored(pool, first.id).await;
+    assert_eq!(first_after.name, "Orchard Part 1", "TMDb's name stays");
+    assert_eq!(first_after.genres, ["Drama", "Mystery"]);
+    assert_eq!(first_after.official_rating.as_deref(), Some("TV-MA"));
+    let second_after = stored(pool, second.id).await;
+    assert_eq!(second_after.genres, ["Drama"]);
+    assert_eq!(second_after.official_rating, None, "N/A is no rating");
+    let asked = hits.lock().unwrap().len();
+    // The movie, the series by id, and season 1 once for both episodes
+    assert_eq!(asked, 3, "{:?}", hits.lock().unwrap());
+
+    // Everything again: all from the cache
+    rustyfin_core::metadata::refresh_item_metadata(pool, &client, &series, &pm)
+        .await
+        .unwrap();
+    rustyfin_core::metadata::refresh_item_metadata(pool, &client, &after, &pm)
+        .await
+        .unwrap();
+    assert_eq!(hits.lock().unwrap().len(), asked);
+
+    // Without a key, OMDb is not asked and nothing fails
+    let keyless = r3meta_manager(&origin, None).await;
+    let mut other = fx.movie("Paper Harbor Two", None).await;
+    other.official_rating = None;
+    other.tmdb_id = Some(6002);
+    rustyfin_db::repo_media::upsert_media_item(pool, &other)
+        .await
+        .unwrap();
+    rustyfin_core::metadata::refresh_item_metadata(pool, &client, &other, &keyless)
+        .await
+        .unwrap();
+    assert_eq!(stored(pool, other.id).await.official_rating, None);
+    assert_eq!(hits.lock().unwrap().len(), asked);
+}

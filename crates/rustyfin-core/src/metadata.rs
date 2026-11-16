@@ -204,6 +204,7 @@ pub async fn refresh_item_metadata_with(
                 all_answered: true,
                 unauthorized: false,
             };
+            fill_from_imdb(pool, &mut working, &providers).await?;
             if item.media_type == MediaType::Series && working.tmdb_id.is_some() && !asked.failed {
                 children =
                     refresh_series_children(pool, &working, &providers, options.force).await?;
@@ -379,6 +380,10 @@ async fn refresh_from_providers(
     let media_type = working.media_type;
 
     for provider in providers {
+        // A provider with IMDb lookups (OMDb) fills after the others, in `fill_from_imdb`
+        if provider.imdb_lookups.is_some() {
+            continue;
+        }
         let mut meta = None;
         let by_id = provider.lookups.is_some() && working.tmdb_id.is_some();
         if let (Some(lookups), Some(id)) = (&provider.lookups, working.tmdb_id) {
@@ -435,6 +440,11 @@ async fn refresh_from_providers(
             }
         }
 
+        // A provider with lookups gives its images with the details it found. When it found
+        // nothing (a failure, no key, a 404, no match), asking for images would only repeat
+        // that lookup.
+        let images_from_lookup = provider.lookups.is_some();
+        let found = meta.is_some();
         if let Some(meta) = meta {
             apply_metadata_to_item(pool, working, &meta, replace_name).await?;
             store_images_batch(
@@ -447,6 +457,9 @@ async fn refresh_from_providers(
             .await?;
         }
 
+        if images_from_lookup && !found {
+            continue;
+        }
         // Fetch additional images from this provider
         let images =
             (provider.get_images)(client, working.tmdb_id, working.tvdb_id, media_type).await;
@@ -466,6 +479,74 @@ async fn refresh_from_providers(
         failed,
         unauthorized,
     })
+}
+
+/// The IMDb id stored for an item (by a provider, an NFO or an import).
+async fn stored_imdb_id(pool: &SqlitePool, id: Uuid) -> Result<Option<String>, String> {
+    let ids = rustyfin_db::repo_media::get_imdb_ids_for_items(pool, &[id])
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(ids.get(&id.to_string()).cloned())
+}
+
+/// Fill what is still missing on a movie or series from the providers with IMDb lookups
+/// (Jellyfin's OMDb provider, after TMDb): e.g. a movie's rating when TMDb has no US
+/// certification. Without an IMDb id, or when the lookup fails, nothing changes.
+async fn fill_from_imdb(
+    pool: &SqlitePool,
+    working: &mut MediaItem,
+    providers: &[MetadataProviderHandle],
+) -> Result<(), String> {
+    if !providers.iter().any(|p| p.imdb_lookups.is_some()) {
+        return Ok(());
+    }
+    let Some(imdb_id) = stored_imdb_id(pool, working.id).await? else {
+        return Ok(());
+    };
+    for lookups in providers.iter().filter_map(|p| p.imdb_lookups.as_ref()) {
+        match lookups.by_imdb_id(&imdb_id).await {
+            Ok(Some(meta)) => apply_metadata_to_item(pool, working, &meta, false).await?,
+            Ok(None) => {}
+            Err(e) => tracing::debug!("IMDb lookup of {imdb_id} failed: {e:?}"),
+        }
+    }
+    Ok(())
+}
+
+/// Fill what is still missing on an episode from the providers with IMDb lookups: its series'
+/// season list (one cached request per season), matched by episode number. This is where
+/// Jellyfin's episodes get their genres and rating (OMDb's), which TMDb's episodes lack.
+async fn fill_episode_from_imdb(
+    pool: &SqlitePool,
+    episode: Uuid,
+    series_imdb_id: &str,
+    season_number: i32,
+    providers: &[MetadataProviderHandle],
+) -> Result<(), String> {
+    for lookups in providers.iter().filter_map(|p| p.imdb_lookups.as_ref()) {
+        let season = match lookups.season(series_imdb_id, season_number).await {
+            Ok(Some(season)) => season,
+            Ok(None) => continue,
+            Err(e) => {
+                tracing::debug!("IMDb season lookup of {series_imdb_id} failed: {e:?}");
+                continue;
+            }
+        };
+        // The stored episode, as the earlier providers left it
+        let Some(mut working) = rustyfin_db::repo_media::get_item_by_id(pool, episode)
+            .await
+            .map_err(|e| e.to_string())?
+        else {
+            return Ok(());
+        };
+        let Some(number) = working.index_number else {
+            return Ok(());
+        };
+        if let Some((_, meta)) = season.episodes.iter().find(|(n, _)| *n == number) {
+            apply_metadata_to_item(pool, &mut working, meta, false).await?;
+        }
+    }
+    Ok(())
 }
 
 /// The series that a season or episode belongs to, and the season number: an episode's parent is
@@ -546,6 +627,12 @@ async fn refresh_from_season(
             replace_name,
         )
         .await?;
+    }
+    if working.media_type == MediaType::Episode
+        && providers.iter().any(|p| p.imdb_lookups.is_some())
+        && let Some(imdb_id) = stored_imdb_id(pool, series.id).await?
+    {
+        fill_episode_from_imdb(pool, working.id, &imdb_id, season_number, providers).await?;
     }
     if answered && !failed {
         rustyfin_db::repo_media::mark_provider_refreshed(pool, &[working.id])
@@ -704,6 +791,15 @@ async fn refresh_series_children(
                 !keep_name,
             )
             .await?;
+        }
+    }
+    if providers.iter().any(|p| p.imdb_lookups.is_some())
+        && let Some(imdb_id) = stored_imdb_id(pool, series.id).await?
+    {
+        for (target, number) in &targets {
+            if target.media_type == MediaType::Episode {
+                fill_episode_from_imdb(pool, target.id, &imdb_id, *number, providers).await?;
+            }
         }
     }
     let ids: Vec<Uuid> = targets

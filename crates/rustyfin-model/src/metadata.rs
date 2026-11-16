@@ -117,6 +117,14 @@ pub trait MetadataLookups: Send + Sync {
     }
 }
 
+/// Lookups by IMDb id (OMDb's), asked after the provider that identified the item: a movie's or
+/// series' details, and a series' season with its episodes. Their answers fill only what is
+/// still missing, as a later provider does in Jellyfin.
+pub trait ImdbLookups: Send + Sync {
+    fn by_imdb_id(&self, imdb_id: &str) -> LookupFuture<'_, ExternalMetadata>;
+    fn season(&self, series_imdb_id: &str, season_number: i32) -> LookupFuture<'_, SeasonMetadata>;
+}
+
 /// One match of a provider search: Jellyfin's RemoteSearchResult, with the provider's own id.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RemoteSearchHit {

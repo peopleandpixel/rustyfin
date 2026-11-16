@@ -20,7 +20,7 @@ use plugin_trakt::MetadataProviderRegistrar as TraktRegistrar;
 use plugin_tvdb::MetadataProviderRegistrar as TvdbRegistrar;
 use plugin_webhook::NotificationProviderRegistrar as WebhookRegistrar;
 use rustyfin_model::media::{MediaItem, MediaType};
-use rustyfin_model::metadata::{ExternalMetadata, MetadataImage, MetadataLookups};
+use rustyfin_model::metadata::{ExternalMetadata, ImdbLookups, MetadataImage, MetadataLookups};
 use rustyfin_model::plugin::{
     NotificationPriority, Plugin, PluginConfiguration, PluginInfo, PluginStatus, PluginType,
     SubtitleResult,
@@ -220,6 +220,8 @@ pub struct MetadataProviderHandle {
     pub get_images: GetImagesFn,
     /// Lookups by id, by year and by season, when the provider offers them (TMDb)
     pub lookups: Option<Arc<dyn MetadataLookups>>,
+    /// Lookups by IMDb id (OMDb), asked after the other providers to fill what is missing
+    pub imdb_lookups: Option<Arc<dyn ImdbLookups>>,
 }
 
 /// Subtitle provider handle stored in the plugin manager.
@@ -698,6 +700,7 @@ impl PluginManager {
             search_tv: Arc::new(search_tv),
             get_images: Arc::new(get_images),
             lookups: None,
+            imdb_lookups: None,
         });
         inner.metadata_providers.sort_by_key(|h| h.priority);
         tracing::info!(
@@ -1173,6 +1176,18 @@ impl PluginManager {
             handle.lookups = Some(lookups.clone());
         }
     }
+
+    /// Attaches IMDb-id lookups to the metadata provider registered as `provider_name`.
+    pub async fn register_imdb_lookups(&self, provider_name: &str, lookups: Arc<dyn ImdbLookups>) {
+        let mut inner = self.inner.write().await;
+        for handle in inner
+            .metadata_providers
+            .iter_mut()
+            .filter(|h| h.provider_name == provider_name)
+        {
+            handle.imdb_lookups = Some(lookups.clone());
+        }
+    }
 }
 
 // ── MetadataProviderRegistrar trait implementations ──
@@ -1282,6 +1297,10 @@ impl OmdbRegistrar for PluginManager {
             get_images,
         )
         .await;
+    }
+
+    async fn register_imdb_lookups(&self, provider_name: String, lookups: Arc<dyn ImdbLookups>) {
+        PluginManager::register_imdb_lookups(self, &provider_name, lookups).await;
     }
 }
 
