@@ -2,7 +2,8 @@
 //! reads run at once from a network share.
 //!
 //! Background ffmpeg and ffprobe runs at a low CPU priority, so playback transcodes come first.
-//! A job that reads a whole file (intro detection) is bound by the network when the file is on a
+//! A job that reads a whole file (intro detection, and trickplay tiles where they don't seek to
+//! key frames) is bound by the network when the file is on a
 //! network share: one such read can fill the link, and more at once only add seeks and memory.
 //! So at most `RUSTYFIN_NETWORK_READ_JOBS` of them (default 1) run at once from network shares;
 //! reads from local disks are bounded by the image job slots alone.
