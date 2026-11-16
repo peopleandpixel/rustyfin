@@ -3397,6 +3397,7 @@ const B124_WEB_MODULES: &[&str] = &[
     "library-admin.js",
     "library.js",
     "metadata-admin.js",
+    "multiselect.js",
     "music.js",
     "playback-admin.js",
     "player.js",
@@ -3405,6 +3406,7 @@ const B124_WEB_MODULES: &[&str] = &[
     "queue.js",
     "remote.js",
     "router.js",
+    "screensaver.js",
     "search.js",
     "sessions.js",
     "settings.js",
@@ -26619,6 +26621,26 @@ fn r3metadata_web() {
 #[test]
 fn r3cards_cards() {
     b124_node_test("r3cards_cards.mjs");
+}
+
+// The sign-in page's user tiles, Manual login, Forgot password and its PIN step, and Switch user
+// (tests/web/r3users2_login.mjs)
+#[test]
+fn r3users2_login() {
+    b124_node_test("r3users2_login.mjs");
+}
+
+// Multi-select and bulk actions in the library grid (tests/web/r3users2_multiselect.mjs)
+#[test]
+fn r3users2_multiselect() {
+    b124_node_test("r3users2_multiselect.mjs");
+}
+
+// The backdrop screensaver: off by default, after the idle time, never during playback
+// (tests/web/r3users2_screensaver.mjs)
+#[test]
+fn r3users2_screensaver() {
+    b124_node_test("r3users2_screensaver.mjs");
 }
 
 // The web client's library page: the sort menu per list, view settings, the Episodes and Genres tabs

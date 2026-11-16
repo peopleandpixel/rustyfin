@@ -10,7 +10,7 @@ import {
     wizSetUiLanguage, wizApplyPath, wizNext, wizPrev, wizSkipLibrary, wizFinishWithoutImport, wizComplete,
 } from './modules/wizard.js';
 import {
-    renderLogin, handleLogin, handleSetupPassword, doLogout, showQuickConnectModal, authorizeQuickConnect,
+    renderLogin, handleLogin, handleSetupPassword, doLogout, switchUser, showQuickConnectModal, authorizeQuickConnect,
 } from './modules/auth.js';
 import './modules/home.js';
 import { posterLoaded, posterFailed } from './modules/library.js';
@@ -32,6 +32,8 @@ import './modules/remote.js';
 import { sessionControl, openPlayOn, playOnSession } from './modules/sessions.js';
 import './modules/cardmenu.js';
 import './modules/collections.js';
+import './modules/multiselect.js';
+import './modules/screensaver.js';
 import {
     changeNextEpisodeAutoPlay, changeUiLanguage, handleSaveConfig, changeUserConfig, changeUserPref, changeHomeSection,
     changeSubtitleAppearance, changeLatestLibrary, chooseProfileImage, deleteProfileImage,
@@ -58,7 +60,7 @@ Object.assign(window, {
     togglePictureInPicture, skipSegment, hoverSeek, hideTrickplay, renderPlayerSettings, setSubtitleAppearance,
     changeSubtitleOffset, changeQuality, changeVersion, changeAspectRatio, renderChapterMenu, changeSegmentAction,
     togglePlaybackStats, changeStillWatching, openFullPlayer, stopNowPlaying, renderLogin,
-    handleLogin, handleSetupPassword, doLogout, showQuickConnectModal, authorizeQuickConnect, changeNextEpisodeAutoPlay,
+    handleLogin, handleSetupPassword, doLogout, switchUser, showQuickConnectModal, authorizeQuickConnect, changeNextEpisodeAutoPlay,
     changeUiLanguage, handleSaveConfig, jiAddPair, jiForget, jiSetMine, jiSetChoice, jiSetConfirm, jiPreview, jiRun,
     jiNewCode, jiCopyCodes, refreshTasks, openAddLibrary, closeAddLibrary, submitAddLibrary, closeLibraryOptions,
     submitLibraryOptions, openAddUser, closeAddUser,

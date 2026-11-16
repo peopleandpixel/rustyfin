@@ -779,7 +779,7 @@ async function renderLibrary(route) {
             ${videoTabs ? libraryTabBar(libId, contentType, currentLibraryGenre ? 'genres' : currentLibraryTab || 'main') : ''}
 
             <!-- Media Grid Container -->
-            <div id="lib-grid-container"></div>
+            <div id="lib-grid-container" data-multiselect></div>
         </div>`;
         $('lib-sort')?.addEventListener('change', () => libraryControlsChanged(libId));
         $('lib-sort-reverse')?.addEventListener('click', e => {

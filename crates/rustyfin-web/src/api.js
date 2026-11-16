@@ -328,6 +328,10 @@ const API = {
     },
 
     // OpenID Connect. Start and Link answer with the provider's AuthorizationUrl.
+    // The sign-in page's user tiles, and Jellyfin's forgot-password steps (the PIN is never kept or logged)
+    publicUsers() { return this.get('/Users/Public'); },
+    forgotPassword(name) { return this.post('/Users/ForgotPassword', { EnteredUsername: name }); },
+    redeemResetPin(pin) { return this.post('/Users/ForgotPassword/Pin', { Pin: pin }); },
     oidcInfo() { return this.get('/Auth/Oidc/Info'); },
     oidcStart() { return this.post('/Auth/Oidc/Start'); },
     oidcLink() { return this.post('/Auth/Oidc/Link'); },
