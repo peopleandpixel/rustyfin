@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 use crate::error::ApiError;
 use crate::parental::HiddenItems;
+use crate::routes::collections::Container;
 use crate::routes::playback::{path_user, query_user};
 use crate::state::AppState;
 
@@ -1635,7 +1636,8 @@ pub(crate) async fn enrich_items_with(
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/Items", get(get_items))
-        .route("/Items/{id}", get(get_item))
+        // DELETE checks the caller itself: a playlist's owner may delete it, as in Jellyfin.
+        .route("/Items/{id}", get(get_item).delete(delete_item))
         .route("/Items/{id}/Children", get(get_children))
         .route("/Items/{id}/Similar", get(get_similar))
         .route("/Items/Latest", get(get_latest))
@@ -1666,7 +1668,6 @@ pub fn routes() -> Router<AppState> {
 pub fn admin_routes() -> Router<AppState> {
     Router::new()
         .route("/Items", delete(delete_items))
-        .route("/Items/{id}", delete(delete_item))
         .route("/Items/{id}/Images/{image_type}", delete(delete_item_image))
         .route(
             "/Items/{id}/Images/{image_type}/{image_index}",
@@ -2176,6 +2177,47 @@ async fn get_items(
     let start_index = query.start_index();
     let limit = query.limit();
 
+    // Collections and playlists live outside media_items: a list of only those kinds, or one of
+    // them as ParentId, is answered from their own tables.
+    let mut parent_id = query.parent_id();
+    let mut collection_ids = None;
+    if let Some(id) = parent_id {
+        match super::collections::container_of(&state, id, &claims).await? {
+            Some(Container::Playlist) => {
+                let limit = Some(limit as usize);
+                let entries = super::collections::playlist_entries(
+                    &state,
+                    id,
+                    &claims,
+                    start_index as usize,
+                    limit,
+                );
+                return entries.await.map(|r| Json(r).into_response());
+            }
+            Some(Container::Collection(ids)) => {
+                parent_id = None;
+                collection_ids = Some(ids);
+            }
+            None => {}
+        }
+    } else if let Some(kinds) = media_types.as_ref().filter(|kinds| {
+        !kinds.is_empty()
+            && kinds.iter().all(|kind| {
+                kind.eq_ignore_ascii_case("BoxSet") || kind.eq_ignore_ascii_case("Playlist")
+            })
+    }) {
+        let wants = |name: &str| kinds.iter().any(|kind| kind.eq_ignore_ascii_case(name));
+        let listing = super::collections::container_listing(
+            &state,
+            &claims,
+            wants("BoxSet"),
+            wants("Playlist"),
+            start_index as usize,
+            limit as usize,
+        );
+        return listing.await.map(|r| Json(r).into_response());
+    }
+
     // If IsMovie/IsSeries is set, constrain media_type
     let constrained_media_types: Option<Vec<String>> = if let Some(true) = query.is_movie() {
         Some(vec!["\"Movie\"".to_string()])
@@ -2192,7 +2234,12 @@ async fn get_items(
         &parse_ids(query.studio_ids()),
     )
     .await?;
-    // IsResumable and SeriesStatus narrow the same id list. IsResumable=false filters nothing.
+    // A collection as ParentId, IsResumable and SeriesStatus narrow the same id list.
+    // IsResumable=false filters nothing.
+    if let Some(ids) = collection_ids {
+        let ids = ids.iter().map(Uuid::to_string).collect();
+        item_ids = Some(narrow_ids(item_ids, ids));
+    }
     if is_resumable == Some(true) {
         let ids = rustyfin_db::repo_media::resumable_item_ids(&state.db_ro, claims.sub).await?;
         item_ids = Some(narrow_ids(item_ids, ids));
@@ -2207,7 +2254,7 @@ async fn get_items(
 
     let (items, total) = rustyfin_db::repo_media::get_items_filtered(
         &state.db_ro,
-        query.parent_id(),
+        parent_id,
         query.library_id(),
         constrained_media_types.as_deref(),
         exclude_media_types.as_deref(),
@@ -2417,17 +2464,28 @@ async fn get_item(
     Path(id): Path<Uuid>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Response, ApiError> {
-    item_or_library(&state, id, claims.sub).await
+    item_or_library(&state, id, claims.sub, &claims).await
 }
 
-/// The media item `id` with `user`'s watch data, or the library `id` as its view.
-async fn item_or_library(state: &AppState, id: Uuid, user: Uuid) -> Result<Response, ApiError> {
+/// The media item `id` with `user`'s watch data, the library `id` as its view, or the collection
+/// or playlist `id` (a playlist only when `claims`' caller may see it).
+async fn item_or_library(
+    state: &AppState,
+    id: Uuid,
+    user: Uuid,
+    claims: &Claims,
+) -> Result<Response, ApiError> {
     match media_item(state, id, user).await {
         Err(ApiError::NotFound(message)) => {
-            match rustyfin_db::repo_library::get_library_by_id(&state.db_ro, id).await? {
-                Some(lib) => {
-                    Ok(Json(super::library::library_view(&lib, &state.server_id)).into_response())
-                }
+            if let Some(lib) =
+                rustyfin_db::repo_library::get_library_by_id(&state.db_ro, id).await?
+            {
+                return Ok(
+                    Json(super::library::library_view(&lib, &state.server_id)).into_response()
+                );
+            }
+            match super::collections::container_details(state, id, claims).await? {
+                Some(item) => Ok(Json(item).into_response()),
                 None => Err(ApiError::NotFound(message)),
             }
         }
@@ -2442,7 +2500,7 @@ async fn get_user_item(
     Extension(claims): Extension<Claims>,
 ) -> Result<Response, ApiError> {
     let user = path_user(&state, &claims, user_id).await?;
-    item_or_library(&state, item_id, user).await
+    item_or_library(&state, item_id, user, &claims).await
 }
 
 /// The media item `id` with `user`'s watch data.
@@ -2549,14 +2607,23 @@ async fn get_theme_list(Path(id): Path<Uuid>) -> Json<Value> {
 async fn delete_item(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-) -> Result<Json<Value>, ApiError> {
+    Extension(claims): Extension<Claims>,
+) -> Result<Response, ApiError> {
+    if let Some(status) = super::collections::delete_container(&state, id, &claims).await? {
+        return Ok(status.into_response());
+    }
+    if !claims.is_admin {
+        return Err(ApiError::Forbidden(
+            "Administrator access is required.".to_string(),
+        ));
+    }
     let deleted = rustyfin_db::repo_media::delete_item(&state.db, id).await?;
     if !deleted {
         return Err(ApiError::NotFound("item not found".into()));
     }
     // The items under it lose theirs at the image tasks' next run.
     rustyfin_core::trickplay::remove_item_files(&state.data_dir, id).await;
-    Ok(Json(json!({ "status": "ok" })))
+    Ok(Json(json!({ "status": "ok" })).into_response())
 }
 
 async fn get_children(

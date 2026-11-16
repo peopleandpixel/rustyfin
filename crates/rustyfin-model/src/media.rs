@@ -183,6 +183,9 @@ pub enum MediaType {
     /// A video that is neither a movie nor an episode, as in a home videos library: Jellyfin's `Video`.
     Video,
     Genre,
+    /// A collection: Jellyfin's `BoxSet`.
+    BoxSet,
+    Playlist,
     Unknown,
 }
 
@@ -200,6 +203,8 @@ impl std::str::FromStr for MediaType {
             "Photo" => Ok(MediaType::Photo),
             "Video" => Ok(MediaType::Video),
             "Genre" => Ok(MediaType::Genre),
+            "BoxSet" => Ok(MediaType::BoxSet),
+            "Playlist" => Ok(MediaType::Playlist),
             _ => Ok(MediaType::Unknown),
         }
     }
@@ -224,6 +229,8 @@ impl MediaType {
             MediaType::Photo => "Photo",
             MediaType::Video => "Video",
             MediaType::Genre => "Genre",
+            MediaType::BoxSet => "BoxSet",
+            MediaType::Playlist => "Playlist",
             MediaType::Unknown => "Folder",
         }
     }
@@ -235,7 +242,7 @@ impl MediaType {
             MediaType::Series | MediaType::Season => "Unknown",
             MediaType::Audio | MediaType::MusicAlbum => "Audio",
             MediaType::Photo => "Photo",
-            MediaType::Genre => "Unknown",
+            MediaType::Genre | MediaType::BoxSet | MediaType::Playlist => "Unknown",
             MediaType::Unknown => "Unknown",
         }
     }
@@ -243,7 +250,12 @@ impl MediaType {
     pub fn is_folder(self) -> bool {
         matches!(
             self,
-            MediaType::Series | MediaType::Season | MediaType::MusicAlbum | MediaType::Genre
+            MediaType::Series
+                | MediaType::Season
+                | MediaType::MusicAlbum
+                | MediaType::Genre
+                | MediaType::BoxSet
+                | MediaType::Playlist
         )
     }
 }
