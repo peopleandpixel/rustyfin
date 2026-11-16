@@ -104,12 +104,15 @@ async fn suggestions(
     .into_response())
 }
 
+/// Reads the names a query parameter lists.
+type ParamReader = fn(&[(String, String)], &str) -> Vec<&'static str>;
+
 /// The names the entries under any of `keys` name (`read` gives them, ignoring case), each
 /// once, or `None` when none is named.
 fn named_list(
     params: &[(String, String)],
     keys: &[&str],
-    read: fn(&[(String, String)], &str) -> Vec<&'static str>,
+    read: ParamReader,
 ) -> Option<Vec<String>> {
     let mut names: Vec<String> = keys
         .iter()
