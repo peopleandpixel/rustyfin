@@ -446,6 +446,7 @@ async fn main() {
         oidc: rustyfin_api::oidc::OidcState::new(),
         jellyfin_import: Default::default(),
         directory_listings: Default::default(),
+        file_guard: Default::default(),
     };
 
     // A scheduled library scan clears the same caches as a scan from the API or the monitor.
@@ -472,11 +473,11 @@ async fn main() {
                 signal = shutdown_signal() => tracing::info!("{signal} received, shutting down"),
                 _ = shutdown_rx.wait_for(|v| *v) => {}
             }
-            transcodes.stop_all().await;
+            // No transcode starts after this
+            transcodes.shutdown().await;
             let _ = shutdown_tx.send(true);
             tokio::time::sleep(SHUTDOWN_GRACE).await;
             tracing::info!("connections still open after the shutdown grace, exiting");
-            transcodes.stop_all().await;
             std::process::exit(0);
         });
     }
@@ -784,8 +785,9 @@ async fn main() {
         .expect("server error");
     }
 
-    // The shutdown task has stopped the transcodes already; one started meanwhile stops here
-    transcodes.stop_all().await;
+    // The shutdown task has stopped the transcodes and closed the manager; this is the same for
+    // a shutdown that reached here first
+    transcodes.shutdown().await;
     tracing::info!("server stopped");
 }
 

@@ -159,6 +159,8 @@ pub struct TranscodeManager {
     ffmpeg: PathBuf,         // "ffmpeg"; unit tests point it at a fake script
     playlist_wait: Duration, // 30 s; unit tests shorten it
     start_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Set under `start_lock` by `shutdown`: no transcode starts after it
+    closed: Arc<std::sync::atomic::AtomicBool>,
     /// The PlaySessionIds stopped lately (in ASCII lower case) and when each was stopped
     stopped: Arc<std::sync::Mutex<HashMap<String, Instant>>>,
     stop_memory: Duration, // 60 s; unit tests shorten it
@@ -172,6 +174,7 @@ impl TranscodeManager {
             ffmpeg: PathBuf::from("ffmpeg"),
             playlist_wait: Duration::from_secs(30),
             start_lock: Arc::new(tokio::sync::Mutex::new(())),
+            closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             stopped: Arc::new(std::sync::Mutex::new(HashMap::new())),
             stop_memory: Duration::from_secs(60),
         }
@@ -212,6 +215,11 @@ impl TranscodeManager {
     ) -> Result<(PathBuf, Uuid), TranscodeError> {
         let playback_id = {
             let _lock = self.start_lock.lock().await;
+            if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(TranscodeError::FfmpegFailed(
+                    "the server is shutting down".into(),
+                ));
+            }
             if !play_session_id.is_empty() && self.recently_stopped(play_session_id) {
                 return Err(TranscodeError::Stopped);
             }
@@ -323,8 +331,9 @@ impl TranscodeManager {
             .is_some_and(|session| session.profile == *profile)
     }
 
-    /// Touch a session that can still serve (its playlist exists or its ffmpeg runs) and
-    /// return true. Returns false for any other session.
+    /// Whether a session can still serve (its playlist exists or its ffmpeg runs). One whose
+    /// playlist exists is touched; one still waiting for it is not, so a client that keeps
+    /// retrying a hung ffmpeg doesn't keep it from the idle cleanup.
     fn touch_live_session(&self, playback_id: Uuid) -> bool {
         let Some(mut session) = self.sessions.get_mut(&playback_id) else {
             return false;
@@ -333,11 +342,11 @@ impl TranscodeManager {
             .child
             .as_mut()
             .is_some_and(|child| !matches!(child.try_wait(), Ok(Some(_))));
-        let live = running || session.output_dir.join("main.m3u8").exists();
-        if live {
+        let ready = session.output_dir.join("main.m3u8").exists();
+        if ready {
             session.last_access = Instant::now();
         }
-        live
+        running || ready
     }
 
     /// Look at a starting session without waiting.
@@ -389,13 +398,29 @@ impl TranscodeManager {
             args.join(" ")
         );
 
-        let spawned = Command::new(&self.ffmpeg)
+        let mut command = Command::new(&self.ffmpeg);
+        command
             .args(&args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn();
+            .kill_on_drop(true);
+        // Its own process group, which a stop kills whole; and on Linux it dies with the server,
+        // even a killed one
+        #[cfg(unix)]
+        command.process_group(0);
+        #[cfg(target_os = "linux")]
+        // SAFETY: prctl is async-signal-safe and touches only the child's own state. The signal
+        // follows the spawning thread, a tokio worker that lives as long as the runtime.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let spawned = command.spawn();
         let mut child = match spawned {
             Ok(child) => child,
             Err(e) => {
@@ -513,6 +538,17 @@ impl TranscodeManager {
             .unwrap()
             .get(&play_session_id.to_ascii_lowercase())
             .is_some_and(|at| at.elapsed() < self.stop_memory)
+    }
+
+    /// Stop all running transcodes and start no more: the server is shutting down. The flag is
+    /// set under the start lock, so a start in progress either finishes before (and is stopped
+    /// here) or sees it.
+    pub async fn shutdown(&self) {
+        {
+            let _lock = self.start_lock.lock().await;
+            self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        self.stop_all().await;
     }
 
     /// Stop all running transcodes.
@@ -677,6 +713,14 @@ fn same_key(session: &TranscodeSession, play_session_id: &str, device_id: &str) 
 /// Kill a removed session's ffmpeg and delete its files.
 async fn end_session(mut session: TranscodeSession) {
     if let Some(mut child) = session.child.take() {
+        // ffmpeg leads its own process group: kill the group, then reap ffmpeg
+        #[cfg(unix)]
+        if let Some(pid) = child.id().and_then(|pid| i32::try_from(pid).ok()) {
+            // SAFETY: kill only sends a signal; the group is the one ffmpeg was started in
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        }
         let _ = child.kill().await;
     }
     let _ = tokio::fs::remove_dir_all(&session.output_dir).await;
@@ -2302,6 +2346,17 @@ printf '#EXTM3U\n#EXTINF:6.0,\nsegment_0000.ts\n' > "$last"
 exec sleep 30
 "#;
 
+    /// Starts a grandchild in its own process group, notes its pid, then serves like `good`.
+    const FAKE_FAMILY: &str = r#"#!/bin/sh
+for last; do :; done
+dir=$(dirname "$last")
+sleep 30 &
+echo $! > "$dir/grandchild.pid"
+printf 'g4' > "$dir/segment_0000.ts"
+printf '#EXTM3U\n#EXTINF:6.0,\nsegment_0000.ts\n' > "$last"
+wait
+"#;
+
     /// Writes a little of its first segment, then nothing more.
     const FAKE_STALLED: &str = r#"#!/bin/sh
 for last; do :; done
@@ -2342,6 +2397,7 @@ exec sleep 30
                 ("noisy", FAKE_NOISY),
                 ("progressing", FAKE_PROGRESSING),
                 ("stalled", FAKE_STALLED),
+                ("family", FAKE_FAMILY),
             ] {
                 // Rename into place: another test process may be running the old file.
                 let tmp = dir.join(format!("{name}.{}", std::process::id()));
@@ -2707,6 +2763,70 @@ exec sleep 30
             started.elapsed()
         );
         mgr.stop_all().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_shutdown_refuses_new_starts() {
+        let (_dir, mgr) = fake_manager("good", Duration::from_secs(10));
+        let item = Uuid::new_v4();
+        start(&mgr, item, "psid-1", "").await.unwrap();
+        mgr.shutdown().await;
+        assert!(!mgr.is_active(item).await);
+        let after = start(&mgr, item, "psid-2", "").await;
+        assert!(
+            matches!(after, Err(TranscodeError::FfmpegFailed(_))),
+            "{after:?}"
+        );
+        assert_eq!(mgr.sessions.len(), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_a_stop_kills_ffmpegs_whole_process_group() {
+        let (_dir, mgr) = fake_manager("family", Duration::from_secs(10));
+        let item = Uuid::new_v4();
+        let (playlist, _) = start(&mgr, item, "psid", "").await.unwrap();
+        let pid_file = playlist.parent().unwrap().join("grandchild.pid");
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // SAFETY: signal 0 only asks whether the process exists
+        let alive = |pid| unsafe { libc::kill(pid, 0) } == 0;
+        assert!(alive(pid));
+        mgr.stop_all().await;
+        // The grandchild got SIGKILL with its group; give the kernel a moment to end it
+        let mut gone = false;
+        for _ in 0..50 {
+            // Reap it if it became our zombie; otherwise this does nothing
+            // SAFETY: waitpid on one pid with WNOHANG never blocks
+            unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+            if !alive(pid) {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(gone, "the grandchild {pid} outlived the stop");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_retrying_a_hung_ffmpeg_does_not_keep_it_from_cleanup() {
+        let (_dir, mgr) = fake_manager("slow", Duration::from_millis(300));
+        let item = Uuid::new_v4();
+        assert!(start(&mgr, item, "psid", "").await.is_err());
+        let first = mgr.sessions.iter().next().unwrap().last_access;
+        assert!(start(&mgr, item, "psid", "").await.is_err());
+        let after_retry = mgr.sessions.iter().next().unwrap().last_access;
+        assert_eq!(first, after_retry, "a retry touched the hung session");
+        let removed = mgr
+            .cleanup_idle_sessions(Instant::now(), Duration::from_millis(500))
+            .await;
+        assert_eq!(removed, 1);
+        assert!(!mgr.is_active(item).await);
     }
 
     #[cfg(unix)]
