@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use rustyfin_core::media_segments::{self, DetectionConfig};
+use rustyfin_core::trickplay::Cancel;
 use rustyfin_model::library::{Library, LibraryContentType};
 use sqlx::SqlitePool;
 use uuid::Uuid;
@@ -287,5 +288,260 @@ async fn detect_and_save_clears_stale_segments() {
         segments.is_empty(),
         "a run that finds no intro or outro kept {segments:?}"
     );
+    pool.close().await;
+}
+
+// Background task speed: intro detection decodes each file once.
+
+/// The silencedetect and blackdetect results ffmpeg logs when run with `args`, without the
+/// filter instance addresses, in order.
+fn detect_events(args: &[String]) -> Vec<String> {
+    let out = Command::new("ffmpeg")
+        .arg("-nostdin")
+        .args(args)
+        .output()
+        .expect("run ffmpeg");
+    assert!(out.status.success(), "ffmpeg failed: {args:?}");
+    String::from_utf8_lossy(&out.stderr)
+        .lines()
+        .filter(|l| l.contains("[silencedetect") || l.contains("[blackdetect"))
+        .map(|l| {
+            let kind = if l.contains("[silencedetect") {
+                "silence"
+            } else {
+                "black"
+            };
+            format!("{kind} {}", l.split_once("] ").map_or(l, |(_, rest)| rest))
+        })
+        .collect()
+}
+
+#[test]
+fn r3perf_one_pass_finds_what_the_two_passes_found() {
+    if !have_ffmpeg() {
+        eprintln!("skip: ffmpeg not found");
+        return;
+    }
+    let dir = TempDir::new("segments");
+    let clip = make_quoted_clip(&dir.0);
+    let config = DetectionConfig::default();
+
+    let mut two: Vec<String> = detect_events(&media_segments::silence_detect_args(&clip, &config))
+        .into_iter()
+        .filter(|e| e.starts_with("silence"))
+        .collect();
+    two.extend(detect_events(&media_segments::black_detect_args(
+        &clip, &config,
+    )));
+    let mut one = detect_events(&media_segments::segment_detect_args(&clip, &config, 2));
+    two.sort();
+    one.sort();
+    assert!(
+        two.iter().any(|e| e.starts_with("silence")) && two.iter().any(|e| e.starts_with("black")),
+        "the clip has both kinds: {two:?}"
+    );
+    assert_eq!(one, two);
+}
+
+#[test]
+fn r3perf_one_pass_args_run_both_filters_on_the_default_streams() {
+    let path = quoted_path();
+    let args = media_segments::segment_detect_args(&path, &DetectionConfig::default(), 3);
+    assert_eq!(
+        args,
+        [
+            "-threads",
+            "3",
+            "-nostdin",
+            "-i",
+            path.as_str(),
+            "-af",
+            "silencedetect=noise=-40dB:d=2,ametadata=mode=print",
+            "-vf",
+            "blackdetect=d=2:pix_th=0.1",
+            "-f",
+            "null",
+            "-",
+        ]
+    );
+    let args = media_segments::segment_detect_args(&path, &DetectionConfig::default(), 0);
+    assert_eq!(args[..3], ["-nostdin", "-i", path.as_str()]);
+}
+
+#[tokio::test]
+async fn r3perf_a_file_without_video_still_fails_detection() {
+    if !have_ffmpeg() {
+        eprintln!("skip: ffmpeg not found");
+        return;
+    }
+    let dir = TempDir::new("segments");
+    let clip = dir.0.join("audio only.mka");
+    let status = Command::new("ffmpeg")
+        .args(["-nostdin", "-loglevel", "error", "-y", "-f", "lavfi", "-i"])
+        .arg("sine=frequency=440:sample_rate=48000:d=20")
+        .args(["-c:a", "aac"])
+        .arg(&clip)
+        .status()
+        .expect("run ffmpeg");
+    assert!(status.success());
+
+    let got =
+        media_segments::detect_segments(clip.to_str().unwrap(), 20.0, &DetectionConfig::default())
+            .await;
+    assert!(got.is_err(), "an audio-only file gave {got:?}");
+}
+
+#[tokio::test]
+async fn r3perf_all_episodes_are_detected_and_counted() {
+    if !have_ffmpeg() {
+        eprintln!("skip: ffmpeg not found");
+        return;
+    }
+    let dir = TempDir::new("segments");
+    let clip = make_quoted_clip(&dir.0);
+    let (pool, first) = episode_db(&dir.0, &clip).await;
+    // Two more episodes of the same file, and one without a runtime, which is skipped.
+    let library: String = sqlx::query_scalar("SELECT library_id FROM media_items LIMIT 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let mut ids = vec![first];
+    for (n, runtime) in [(2, Some(600_000_000i64)), (3, Some(600_000_000)), (4, None)] {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO media_items (id, name, media_type, path, library_id, runtime_ticks)
+             VALUES (?1, ?2, 'Episode', ?3, ?4, ?5)",
+        )
+        .bind(id.to_string())
+        .bind(format!("Episode {n}"))
+        .bind(format!("{clip}#{n}"))
+        .bind(&library)
+        .bind(runtime)
+        .execute(&pool)
+        .await
+        .unwrap();
+        // The paths must differ; they all name the same file through a link.
+        let link = format!("{clip}#{n}");
+        std::os::unix::fs::symlink(&clip, &link).unwrap();
+        if runtime.is_some() {
+            ids.push(id);
+        }
+    }
+
+    let progress = rustyfin_core::task_progress::TaskProgress::new();
+    let count =
+        media_segments::detect_for_all_episodes_with_progress(&pool, &progress, &Cancel::new())
+            .await
+            .unwrap();
+    assert_eq!(count, 3);
+    for id in ids {
+        let segments = rustyfin_db::repo_media_segment::get_media_segments(&pool, id)
+            .await
+            .unwrap();
+        let types: Vec<&str> = segments.iter().map(|s| s.segment_type.as_str()).collect();
+        assert_eq!(types, ["Intro", "Outro"], "episode {id}");
+    }
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn r3perf_an_unchanged_episode_is_not_detected_again() {
+    if !have_ffmpeg() {
+        eprintln!("skip: ffmpeg not found");
+        return;
+    }
+    let dir = TempDir::new("segments");
+    let clip = make_quoted_clip(&dir.0);
+    let (pool, item_id) = episode_db(&dir.0, &clip).await;
+    let progress = rustyfin_core::task_progress::TaskProgress::new();
+    let intro_start = || async {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT segment_start_ticks FROM media_segments
+             WHERE item_id = ?1 AND segment_type = 'Intro'",
+        )
+        .bind(item_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+    };
+
+    let count =
+        media_segments::detect_for_all_episodes_with_progress(&pool, &progress, &Cancel::new())
+            .await
+            .unwrap();
+    assert_eq!(count, 1);
+    let detected = intro_start().await;
+
+    // A mark on the stored intro survives the next run: the unchanged file isn't read again.
+    sqlx::query("UPDATE media_segments SET segment_start_ticks = 12345 WHERE item_id = ?1")
+        .bind(item_id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let count =
+        media_segments::detect_for_all_episodes_with_progress(&pool, &progress, &Cancel::new())
+            .await
+            .unwrap();
+    assert_eq!(count, 1, "an unchanged episode counts as processed");
+    assert_eq!(intro_start().await, 12345);
+
+    // A changed file is detected again.
+    std::fs::File::options()
+        .write(true)
+        .open(&clip)
+        .unwrap()
+        .set_modified(
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000),
+        )
+        .unwrap();
+    media_segments::detect_for_all_episodes_with_progress(&pool, &progress, &Cancel::new())
+        .await
+        .unwrap();
+    assert_eq!(intro_start().await, detected);
+
+    // An unchanged file detected by an older detection is detected again.
+    sqlx::query("UPDATE media_segments SET segment_start_ticks = 12345 WHERE item_id = ?1")
+        .bind(item_id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE media_segment_scans SET detector_version = ?1")
+        .bind(media_segments::DETECTOR_VERSION - 1)
+        .execute(&pool)
+        .await
+        .unwrap();
+    media_segments::detect_for_all_episodes_with_progress(&pool, &progress, &Cancel::new())
+        .await
+        .unwrap();
+    assert_eq!(intro_start().await, detected);
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn r3perf_a_cancelled_run_starts_no_episode_and_records_nothing() {
+    if !have_ffmpeg() {
+        eprintln!("skip: ffmpeg not found");
+        return;
+    }
+    let dir = TempDir::new("segments");
+    let clip = make_quoted_clip(&dir.0);
+    let (pool, item_id) = episode_db(&dir.0, &clip).await;
+    let cancel = Cancel::new();
+    cancel.cancel();
+    let progress = rustyfin_core::task_progress::TaskProgress::new();
+    let count = media_segments::detect_for_all_episodes_with_progress(&pool, &progress, &cancel)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+    assert!(
+        rustyfin_db::repo_media_segment::detected_versions(&pool)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let segments = rustyfin_db::repo_media_segment::get_media_segments(&pool, item_id)
+        .await
+        .unwrap();
+    assert!(segments.is_empty(), "{segments:?}");
     pool.close().await;
 }
