@@ -3242,6 +3242,7 @@ const B124_WEB_MODULES: &[&str] = &[
     "auth.js",
     "cardmenu.js",
     "cards.js",
+    "genres.js",
     "home.js",
     "item.js",
     "jellyfin-import.js",
@@ -23357,6 +23358,13 @@ fn r3item_play() {
 #[test]
 fn r3cards_cards() {
     b124_node_test("r3cards_cards.mjs");
+}
+
+// The web client's library page: the sort menu per list, view settings, the Episodes and Genres tabs
+// (tests/web/r3cards_library.mjs)
+#[test]
+fn r3cards_library() {
+    b124_node_test("r3cards_library.mjs");
 }
 
 // The web client's autoplay switch is Jellyfin's UserConfiguration.EnableNextEpisodeAutoPlay: each
