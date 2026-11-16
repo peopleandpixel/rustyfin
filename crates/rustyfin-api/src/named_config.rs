@@ -173,11 +173,7 @@ fn validate_network(options: &Map<String, Value>) -> Result<(), String> {
         }
     }
     for proxy in strings(options, "KnownProxies") {
-        if crate::middleware::parse_known_proxies(proxy).is_empty() {
-            return Err(format!(
-                "KnownProxies: {proxy:?} is not an IP address or a CIDR range"
-            ));
-        }
+        known_proxy(proxy).map_err(|e| format!("KnownProxies: {e}"))?;
     }
     for entry in strings(options, "PublishedServerUriBySubnet") {
         if !entry.contains('=') {
@@ -185,6 +181,23 @@ fn validate_network(options: &Map<String, Value>) -> Result<(), String> {
                 "PublishedServerUriBySubnet: {entry:?} is not \"subnet=url\""
             ));
         }
+    }
+    Ok(())
+}
+
+/// Checks one known proxy entry: exactly one IP address or CIDR range, never every address (a
+/// `/0` range would let any client set its own address through `X-Forwarded-For`).
+fn known_proxy(entry: &str) -> Result<(), String> {
+    let nets = crate::middleware::parse_known_proxies(entry);
+    if entry.contains(',') || nets.len() != 1 {
+        return Err(format!(
+            "{entry:?} is not one IP address or CIDR range (one per entry)"
+        ));
+    }
+    if nets[0].prefix_len() == 0 {
+        return Err(format!(
+            "{entry:?} trusts every address; list the proxy's own address or network"
+        ));
     }
     Ok(())
 }
@@ -277,6 +290,32 @@ pub fn network_startup(data_dir: &Path) -> NetworkStartup {
     }
 }
 
+/// The address the server listens on: `RUSTYFIN_BIND` (`env`) when set, else the saved one when
+/// it can be bound now, else every address on port 8096. A saved address that can't be bound (a
+/// typo, an address the machine no longer has, a port in use) is logged, so a bad save never
+/// locks the administrator out.
+pub fn startup_bind(env: Option<String>, saved: Option<String>) -> String {
+    const DEFAULT: &str = "0.0.0.0:8096";
+    if let Some(env) = env {
+        return env;
+    }
+    let Some(saved) = saved else {
+        return DEFAULT.to_string();
+    };
+    match std::net::TcpListener::bind(&saved) {
+        Ok(probe) => {
+            drop(probe);
+            saved
+        }
+        Err(e) => {
+            tracing::error!(
+                "can't listen on the saved network address {saved} ({e}); listening on {DEFAULT} instead"
+            );
+            DEFAULT.to_string()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,12 +342,42 @@ mod tests {
     }
 
     #[test]
+    fn r3dash3_startup_bind_falls_back_from_an_unusable_saved_address() {
+        let env = Some("127.0.0.1:1".to_string());
+        assert_eq!(startup_bind(env, Some("bad".into())), "127.0.0.1:1");
+        assert_eq!(startup_bind(None, None), "0.0.0.0:8096");
+        assert_eq!(
+            startup_bind(None, Some("127.0.0.1:0".into())),
+            "127.0.0.1:0"
+        );
+        let busy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let taken = busy.local_addr().unwrap().to_string();
+        assert_eq!(startup_bind(None, Some(taken)), "0.0.0.0:8096");
+        assert_eq!(
+            startup_bind(None, Some("999.1.1.1:8096".into())),
+            "0.0.0.0:8096"
+        );
+    }
+
+    #[test]
     fn r3dash3_network_validation() {
         let check = |v: Value| validate_network(v.as_object().unwrap());
         assert!(check(json!({"InternalHttpPort": 8096, "KnownProxies": ["10.0.0.0/8"]})).is_ok());
         assert!(check(json!({"InternalHttpPort": 0})).is_err());
         assert!(check(json!({"InternalHttpPort": "8096"})).is_err());
         assert!(check(json!({"KnownProxies": ["proxy.lan"]})).is_err());
+        for bad in [
+            "10.0.0.1,10.0.0.2",
+            "10.0.0.1, nope",
+            "0.0.0.0/0",
+            "::/0",
+            "",
+        ] {
+            assert!(check(json!({ "KnownProxies": [bad] })).is_err(), "{bad}");
+        }
+        assert!(check(json!({"KnownProxies": ["::1", "fd00::/8", "192.168.1.2"]})).is_ok());
+        let e = check(json!({"KnownProxies": ["0.0.0.0/0"]})).unwrap_err();
+        assert!(e.contains("every address"), "{e}");
         assert!(check(json!({"LocalNetworkAddresses": ["nope"]})).is_err());
         assert!(check(json!({"PublishedServerUriBySubnet": ["https://x"]})).is_err());
     }

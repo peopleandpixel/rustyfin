@@ -111,7 +111,14 @@ async fn main() {
         {
             Ok(Some(name)) => tracing::info!("restored the backup {name}"),
             Ok(None) => {}
-            Err(e) => tracing::error!("the staged restore failed: {e}"),
+            Err(e @ rustyfin_api::backup_archive::RestoreError::RolledBack(_)) => {
+                tracing::error!("the staged restore failed: {e}")
+            }
+            // Starting on an empty database would let anyone claim the owner account
+            Err(e @ rustyfin_api::backup_archive::RestoreError::Fatal(_)) => {
+                tracing::error!("the staged restore failed, so the server won't start: {e}");
+                std::process::exit(1);
+            }
         }
     }
 
@@ -131,10 +138,8 @@ async fn main() {
     let network = rustyfin_api::named_config::network_startup(&data_dir);
 
     // IPv6 dual-stack: use [::]:8096 to listen on both IPv4 and IPv6
-    let bind_addr = std::env::var("RUSTYFIN_BIND")
-        .ok()
-        .or(network.bind)
-        .unwrap_or_else(|| "0.0.0.0:8096".to_string());
+    let bind_addr =
+        rustyfin_api::named_config::startup_bind(std::env::var("RUSTYFIN_BIND").ok(), network.bind);
 
     let tls_cert = std::env::var("RUSTYFIN_TLS_CERT").ok();
     let tls_key = std::env::var("RUSTYFIN_TLS_KEY").ok();
