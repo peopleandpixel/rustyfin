@@ -32208,12 +32208,12 @@ async fn r3playback_hls_input_outside_the_library_is_refused() {
     // A link that sits in the library but points out of every library
     std::os::unix::fs::symlink(&film, lib.join("Out.mkv")).unwrap();
     let s = |p: &std::path::Path| p.to_str().unwrap().to_string();
+    let out_id = r3playback_insert_item(&state, &lib, &s(&lib.join("Out.mkv"))).await;
     let mut ids = Vec::new();
     for path in [
         s(&film),
         s(&db),
         s(&lib.join("Linked.mkv")),
-        s(&lib.join("Out.mkv")),
         format!("{}/../r3-outside/Film.mkv", lib.display()),
     ] {
         ids.push(r3playback_insert_item(&state, &lib, &path).await);
@@ -32246,6 +32246,41 @@ async fn r3playback_hls_input_outside_the_library_is_refused() {
     let uri = format!("/Videos/{inside_id}/stream?Static=true");
     let (status, _) = r3playback_get(&app, &uri, &token).await;
     assert_eq!(status, StatusCode::OK);
+
+    // The link out of every library plays by default, as Jellyfin follows links
+    let out = format!("/Videos/{out_id}/stream?Static=true");
+    let (status, _) = r3playback_get(&app, &out, &token).await;
+    assert_eq!(status, StatusCode::OK, "default");
+    // RefuseLinksOutOfLibraries round-trips through /System/Configuration and refuses it
+    let (_, mut config) = send(
+        &app,
+        request("GET", "/System/Configuration", Some(&token), None),
+    )
+    .await;
+    assert_eq!(config["RefuseLinksOutOfLibraries"], false);
+    config["RefuseLinksOutOfLibraries"] = serde_json::json!(true);
+    let (status, _) = send(
+        &app,
+        request("POST", "/System/Configuration", Some(&token), Some(config)),
+    )
+    .await;
+    assert!(status.is_success(), "{status}");
+    let (_, config) = send(
+        &app,
+        request("GET", "/System/Configuration", Some(&token), None),
+    )
+    .await;
+    assert_eq!(config["RefuseLinksOutOfLibraries"], true);
+    let (status, _) = r3playback_get(&app, &out, &token).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "on");
+    let uri = format!("/Videos/{out_id}/main.m3u8?PlaySessionId=r3-out");
+    let (status, _) = r3playback_get(&app, &uri, &token).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "on: hls");
+    assert!(!manager.is_active(out_id).await);
+    // A file of its own in the library still plays with it on
+    let uri = format!("/Videos/{inside_id}/stream?Static=true");
+    let (status, _) = r3playback_get(&app, &uri, &token).await;
+    assert_eq!(status, StatusCode::OK, "on: own file");
     manager.stop_all().await;
 }
 
@@ -32681,6 +32716,11 @@ async fn r3playback_universal_passes_the_hevc_limits_on() {
 #[test]
 fn r3playback_web_session_id() {
     b124_node_test("r3playback_session_id.mjs");
+}
+
+#[test]
+fn r3playback_web_link_setting() {
+    b124_node_test("r3playback_link_setting.mjs");
 }
 
 #[tokio::test]

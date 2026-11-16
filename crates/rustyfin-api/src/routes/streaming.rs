@@ -15,7 +15,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use uuid::Uuid;
 
 use crate::error::ApiError;
-use crate::state::AppState;
+use crate::state::{AppState, LibraryRoot};
 
 mod media_info;
 
@@ -289,12 +289,33 @@ impl OwnedPaths {
     }
 }
 
-/// The resolved path of `file_path` when it may be streamed from libraries at the resolved
-/// `roots`; None when it is refused:
+/// An absolute path with `.` components dropped, so symlinks are kept. `None` for a relative
+/// path, or for one with a `..` component: the kernel resolves `..` after following a link, so
+/// `lib/link/sub/../../x` can leave the library although it looks like it stays inside.
+fn lexical_normalize(path: &FilePath) -> Option<std::path::PathBuf> {
+    use std::path::Component;
+    if !path.is_absolute() {
+        return None;
+    }
+    let mut out = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => return None,
+            other => out.push(other),
+        }
+    }
+    Some(out)
+}
+
+/// The resolved path of `file_path` when it may be streamed from libraries at `roots`; None when
+/// it is refused:
 /// - it has a `..` component;
 /// - resolving its links fails;
-/// - its resolved target lies under none of `roots`: a link inside a library that points out of
-///   every library is refused, one to another library's file plays;
+/// - it lies under none of `roots`, as written or resolved. With `strict` (the server's
+///   `RefuseLinksOutOfLibraries`) the resolved target must lie under one: a link inside a library
+///   that points out of every library is refused, one into another library plays. Without it, a
+///   path under a library as written is enough, as Jellyfin follows such links too;
 /// - its resolved target is a path Rustyfin owns (see `OwnedPaths`). Other files inside the
 ///   data dir, such as media kept at `<data>/media`, may be streamed.
 ///
@@ -302,31 +323,53 @@ impl OwnedPaths {
 /// lead elsewhere.
 fn checked_path(
     file_path: &str,
-    roots: &[std::path::PathBuf],
+    roots: &[LibraryRoot],
     owned: &OwnedPaths,
+    strict: bool,
 ) -> Option<std::path::PathBuf> {
     let raw = FilePath::new(file_path);
     if has_parent_dir(raw) {
         return None;
     }
     let canonical = raw.canonicalize().ok()?;
-    if !roots.iter().any(|root| canonical.starts_with(root)) || owned.owns(&canonical) {
+    let resolved_inside = roots
+        .iter()
+        .filter_map(|root| root.resolved.as_ref())
+        .any(|root| canonical.starts_with(root));
+    let written_inside = !strict
+        && lexical_normalize(raw).is_some_and(|written| {
+            roots
+                .iter()
+                .filter_map(|root| root.written.as_ref())
+                .any(|root| written.starts_with(root))
+        });
+    if !(resolved_inside || written_inside) || owned.owns(&canonical) {
         return None;
     }
     Some(canonical)
 }
 
-/// Whether `file_path` may be streamed from libraries at `lib_paths` (see `checked_path`).
+/// Whether `file_path` may be streamed from libraries at `lib_paths` by default (see
+/// `checked_path`).
 #[cfg(test)]
 fn path_allowed(file_path: &str, lib_paths: &[String], owned: &OwnedPaths) -> bool {
-    checked_path(file_path, &resolved_roots(lib_paths), owned).is_some()
+    checked_path(file_path, &library_roots_of(lib_paths), owned, false).is_some()
 }
 
-/// `paths` resolved; one that can't be resolved is left out.
-fn resolved_roots(paths: &[String]) -> Vec<std::path::PathBuf> {
+/// Whether `file_path` may be streamed with `RefuseLinksOutOfLibraries` on.
+#[cfg(test)]
+fn path_allowed_strict(file_path: &str, lib_paths: &[String], owned: &OwnedPaths) -> bool {
+    checked_path(file_path, &library_roots_of(lib_paths), owned, true).is_some()
+}
+
+/// `paths` as written and resolved.
+fn library_roots_of(paths: &[String]) -> Vec<LibraryRoot> {
     paths
         .iter()
-        .filter_map(|path| FilePath::new(path).canonicalize().ok())
+        .map(|path| LibraryRoot {
+            written: lexical_normalize(FilePath::new(path)),
+            resolved: FilePath::new(path).canonicalize().ok(),
+        })
         .collect()
 }
 
@@ -369,7 +412,7 @@ async fn owned_paths(state: &AppState) -> OwnedPaths {
 
 /// Every library's paths, resolved: the kept ones, or read from the database when there are
 /// none yet or `refresh` is set (see `FileGuardCache`).
-async fn library_roots(state: &AppState, refresh: bool) -> Arc<Vec<std::path::PathBuf>> {
+async fn library_roots(state: &AppState, refresh: bool) -> Arc<Vec<LibraryRoot>> {
     if !refresh && let Some(roots) = state.file_guard.library_roots.read().unwrap().clone() {
         return roots;
     }
@@ -380,7 +423,7 @@ async fn library_roots(state: &AppState, refresh: bool) -> Arc<Vec<std::path::Pa
         .flat_map(|library| library.paths)
         .collect();
     let roots = Arc::new(
-        tokio::task::spawn_blocking(move || resolved_roots(&paths))
+        tokio::task::spawn_blocking(move || library_roots_of(&paths))
             .await
             .unwrap_or_default(),
     );
@@ -494,7 +537,8 @@ pub(crate) async fn validate_image_path(
 }
 
 /// The resolved path of `file_path` when it lies in a library and is none of the server's own
-/// files (see `checked_path`); the caller opens that path. This prevents path traversal if the
+/// files (see `checked_path`, strict when the server's `RefuseLinksOutOfLibraries` is on); the
+/// caller opens that path. This prevents path traversal if the
 /// database is compromised. The library paths are kept between requests and read again once
 /// before a path is refused, so a library added since counts.
 pub(crate) async fn validate_path_against_library(
@@ -512,13 +556,15 @@ pub(crate) async fn validate_path_against_library(
         return Err(refused());
     }
     let owned = Arc::new(owned_paths(state).await);
+    let strict = state.config.read().await.refuse_links_out_of_libraries;
     for refresh in [false, true] {
         let roots = library_roots(state, refresh).await;
         let (path, owned) = (file_path.to_string(), owned.clone());
-        let checked = tokio::task::spawn_blocking(move || checked_path(&path, &roots, &owned))
-            .await
-            .ok()
-            .flatten();
+        let checked =
+            tokio::task::spawn_blocking(move || checked_path(&path, &roots, &owned, strict))
+                .await
+                .ok()
+                .flatten();
         if let Some(path) = checked {
             return Ok(path.to_string_lossy().into_owned());
         }
@@ -1945,9 +1991,30 @@ mod tests {
     }
 
     #[test]
-    fn r3playback_a_link_out_of_every_library_is_refused() {
-        // A link that sits inside a library but points out of every library is refused; one
-        // that points into another library plays
+    fn r1play_symlinked_file_inside_library_is_allowed() {
+        let dir = TempDir::new();
+        let lib = dir.path().join("lib");
+        let outside = dir.path().join("elsewhere");
+        let data = dir.path().join("data");
+        for d in [&lib, &outside, &data] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(outside.join("movie.mkv"), b"x").unwrap();
+        std::os::unix::fs::symlink(&outside, lib.join("Movie")).unwrap();
+        let file = lib.join("Movie/movie.mkv");
+        let libs = [lib.to_str().unwrap().to_string()];
+        assert!(path_allowed(
+            file.to_str().unwrap(),
+            &libs,
+            &owned(&data, &[])
+        ));
+    }
+
+    #[test]
+    fn r3playback_links_out_of_every_library_follow_the_setting() {
+        // A link that sits inside a library but points out of every library plays by default,
+        // and is refused with RefuseLinksOutOfLibraries; one into another library plays either
+        // way. The checked path is the resolved one, which the caller opens.
         let dir = TempDir::new();
         let lib = dir.path().join("lib");
         let outside = dir.path().join("elsewhere");
@@ -1961,14 +2028,33 @@ mod tests {
         let s = |p: std::path::PathBuf| p.to_str().unwrap().to_string();
         let one = [s(lib.clone())];
         let both = [s(lib.clone()), s(outside.clone())];
+        let target = Some(outside.join("movie.mkv").canonicalize().unwrap());
         for file in [lib.join("Movie/movie.mkv"), lib.join("film.mkv")] {
-            assert!(!path_allowed(&s(file.clone()), &one, &owned(&data, &[])));
-            // The checked path is the resolved one, which the caller opens
-            let checked =
-                checked_path(&s(file.clone()), &resolved_roots(&both), &owned(&data, &[]));
-            assert_eq!(
-                checked,
-                Some(outside.join("movie.mkv").canonicalize().unwrap())
+            let file = s(file);
+            for strict in [false, true] {
+                let checked =
+                    checked_path(&file, &library_roots_of(&one), &owned(&data, &[]), strict);
+                assert_eq!(
+                    checked,
+                    if strict { None } else { target.clone() },
+                    "{file} {strict}"
+                );
+                let checked =
+                    checked_path(&file, &library_roots_of(&both), &owned(&data, &[]), strict);
+                assert_eq!(checked, target, "{file} {strict}");
+            }
+        }
+        // A link to the server's own files and `..` are refused either way
+        std::fs::write(data.join("rustyfin.db"), b"x").unwrap();
+        std::os::unix::fs::symlink(data.join("rustyfin.db"), lib.join("db.mkv")).unwrap();
+        for file in [
+            s(lib.join("db.mkv")),
+            format!("{}/../elsewhere/movie.mkv", lib.display()),
+        ] {
+            assert!(!path_allowed(&file, &both, &owned(&data, &[])), "{file}");
+            assert!(
+                !path_allowed_strict(&file, &both, &owned(&data, &[])),
+                "{file}"
             );
         }
     }
@@ -2069,16 +2155,20 @@ mod tests {
         let libs = [lib.to_str().unwrap().to_string()];
         let path = |p: &str| lib.join(p).to_str().unwrap().to_string();
         assert!(!path_allowed(&path("db.mkv"), &libs, &owned(&data, &[])));
-        // A link out of every library is refused; into another library it plays
-        assert!(!path_allowed(
+        assert!(path_allowed(
             &path("Movie/movie.mkv"),
             &libs,
             &owned(&data, &[])
         ));
-        let both = [libs[0].clone(), elsewhere.to_str().unwrap().to_string()];
-        assert!(path_allowed(
+        // With RefuseLinksOutOfLibraries the link out of every library is refused
+        assert!(!path_allowed_strict(
             &path("Movie/movie.mkv"),
-            &both,
+            &libs,
+            &owned(&data, &[])
+        ));
+        assert!(!path_allowed_strict(
+            &path("db.mkv"),
+            &libs,
             &owned(&data, &[])
         ));
         // A library kept inside the data dir (Docker /data with /data/media) still plays
@@ -2253,9 +2343,15 @@ mod tests {
                 "{name}"
             );
         }
-        // Another file there plays when its folder is a library too
+        // Another file there plays; with RefuseLinksOutOfLibraries only when its folder is a
+        // library too
         let both = [libs[0].clone(), db_dir.to_str().unwrap().to_string()];
-        assert!(!path_allowed(
+        assert!(path_allowed(
+            &path("other.db"),
+            &libs,
+            &owned(&data, &[&db])
+        ));
+        assert!(!path_allowed_strict(
             &path("other.db"),
             &libs,
             &owned(&data, &[&db])
@@ -2366,13 +2462,15 @@ mod tests {
         for refused in ["key.mkv", "db.mkv", "wal.mkv", "shm.mkv"] {
             assert!(!path_allowed(&path(refused), &libs, &owned), "{refused}");
         }
-        // Another file there plays when its folder is a library too
+        // Another file there plays; with RefuseLinksOutOfLibraries only when its folder is a
+        // library too
         let both = [libs[0].clone(), store.to_str().unwrap().to_string()];
         for refused in ["key.mkv", "db.mkv", "wal.mkv", "shm.mkv"] {
             assert!(!path_allowed(&path(refused), &both, &owned), "{refused}");
         }
-        assert!(!path_allowed(&path("other.mkv"), &libs, &owned));
-        assert!(path_allowed(&path("other.mkv"), &both, &owned));
+        assert!(path_allowed(&path("other.mkv"), &libs, &owned));
+        assert!(!path_allowed_strict(&path("other.mkv"), &libs, &owned));
+        assert!(path_allowed_strict(&path("other.mkv"), &both, &owned));
     }
 
     #[test]

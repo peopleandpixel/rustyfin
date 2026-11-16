@@ -133,6 +133,8 @@
         "key_clear": "Remove saved key",
         "save_config": "Save configuration",
         "server_config_updated": "Server configuration updated",
+        "refuse_links_out": "Refuse links that leave the libraries",
+        "refuse_links_out_help": "Off: a file reached through a link inside a library plays even when the link points outside every library, as with link folders from download tools. On: the linked file must also lie in a library.",
         "playback": "Playback",
         "next_episode_autoplay": "Play next episode automatically",
         "next_episode_autoplay_saved": "Playback setting saved"

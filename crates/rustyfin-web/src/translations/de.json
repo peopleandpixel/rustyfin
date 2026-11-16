@@ -133,6 +133,8 @@
         "key_clear": "Gespeicherten Schlüssel entfernen",
         "save_config": "Konfiguration speichern",
         "server_config_updated": "Server-Konfiguration aktualisiert",
+        "refuse_links_out": "Verknüpfungen aus den Bibliotheken hinaus ablehnen",
+        "refuse_links_out_help": "Aus: Eine Datei, die über eine Verknüpfung in einer Bibliothek erreicht wird, wird auch dann abgespielt, wenn die Verknüpfung aus allen Bibliotheken hinausführt, etwa bei Verknüpfungsordnern von Download-Programmen. An: Die verknüpfte Datei muss ebenfalls in einer Bibliothek liegen.",
         "playback": "Wiedergabe",
         "next_episode_autoplay": "Nächste Folge automatisch abspielen",
         "next_episode_autoplay_saved": "Wiedergabe-Einstellung gespeichert"

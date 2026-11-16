@@ -87,5 +87,13 @@ pub struct AppState {
 #[derive(Clone, Default)]
 pub struct FileGuardCache {
     pub owned_files: Arc<tokio::sync::OnceCell<Vec<PathBuf>>>,
-    pub library_roots: Arc<std::sync::RwLock<Option<Arc<Vec<PathBuf>>>>>,
+    pub library_roots: Arc<std::sync::RwLock<Option<Arc<Vec<LibraryRoot>>>>>,
+}
+
+/// A library path as the file checks keep it: as written (made absolute, `.` dropped; None when
+/// it has a `..` or is relative) and resolved (None when it can't be).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LibraryRoot {
+    pub written: Option<PathBuf>,
+    pub resolved: Option<PathBuf>,
 }
