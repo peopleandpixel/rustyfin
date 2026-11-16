@@ -1,5 +1,7 @@
 use rustyfin_model::media::MediaType;
 use rustyfin_model::playback::UserItemDataDto;
+
+use crate::writer::ExecuteWrite;
 use sqlx::SqlitePool;
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -119,7 +121,7 @@ pub async fn update_playback_position(
     .bind(&iid)
     .bind(position_ticks)
     .bind(&now)
-    .execute(pool)
+    .execute_write(pool)
     .await?;
 
     Ok(())
@@ -220,7 +222,7 @@ async fn write_playback_state(
     .bind(play_count_delta)
     .bind(&now)
     .bind(assign)
-    .execute(pool)
+    .execute_write(pool)
     .await?;
 
     Ok(())
@@ -338,7 +340,7 @@ pub async fn save_stream_choice(
     .bind(subtitle.map(|choice| choice.index))
     .bind(audio.and_then(|choice| choice.key.as_deref()))
     .bind(subtitle.and_then(|choice| choice.key.as_deref()))
-    .execute(pool)
+    .execute_write(pool)
     .await?;
 
     Ok(())
@@ -406,7 +408,7 @@ pub async fn mark_played_on(
     let uid = user_id.to_string();
     let iid = item_id.to_string();
     let now = date_played.unwrap_or_else(chrono::Utc::now).to_rfc3339();
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::begin_write(pool).await?;
 
     sqlx::query(
         "INSERT INTO user_item_data (user_id, item_id, played, play_count, last_played_date) \
@@ -454,7 +456,7 @@ pub async fn mark_unplayed(
 ) -> Result<UserItemDataDto, sqlx::Error> {
     let uid = user_id.to_string();
     let iid = item_id.to_string();
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::begin_write(pool).await?;
 
     sqlx::query(
         "INSERT INTO user_item_data (user_id, item_id, played, play_count) \
@@ -507,7 +509,7 @@ pub async fn set_favorite(
     .bind(&uid)
     .bind(&iid)
     .bind(favorite)
-    .execute(pool)
+    .execute_write(pool)
     .await?;
 
     get_user_item_data(pool, user_id, item_id).await
@@ -551,7 +553,7 @@ pub async fn update_user_data(
             .and_then(rustyfin_model::playback::parse_client_date)
             .map(|date| date.to_rfc3339()),
     )
-    .execute(pool)
+    .execute_write(pool)
     .await?;
 
     get_user_item_data(pool, user_id, item_id).await
@@ -582,7 +584,7 @@ pub async fn set_user_rating(
             .bind(&iid)
             .bind(liked_int)
             .bind(rating)
-            .execute(pool)
+            .execute_write(pool)
             .await?;
         }
         (Some(liked), None) => {
@@ -596,7 +598,7 @@ pub async fn set_user_rating(
             .bind(&uid)
             .bind(&iid)
             .bind(liked_int)
-            .execute(pool)
+            .execute_write(pool)
             .await?;
         }
         (None, Some(rating)) => {
@@ -609,7 +611,7 @@ pub async fn set_user_rating(
             .bind(&uid)
             .bind(&iid)
             .bind(rating)
-            .execute(pool)
+            .execute_write(pool)
             .await?;
         }
         (None, None) => {
@@ -621,7 +623,7 @@ pub async fn set_user_rating(
             )
             .bind(&uid)
             .bind(&iid)
-            .execute(pool)
+            .execute_write(pool)
             .await?;
         }
     }
@@ -683,7 +685,7 @@ pub async fn pin_episode(
                 .bind(season_index.and_then(|s| s.0))
                 .bind(ep_index)
                 .bind(&now)
-                .execute(pool)
+                .execute_write(pool)
                 .await?;
             }
         }
@@ -722,7 +724,7 @@ pub async fn update_last_activity_date(
         .bind(&uid)
         .bind(&now)
         .bind(&iid)
-        .execute(pool)
+        .execute_write(pool)
         .await?;
     }
 
@@ -846,7 +848,7 @@ pub async fn clear_user_rating(
     )
     .bind(&uid)
     .bind(&iid)
-    .execute(pool)
+    .execute_write(pool)
     .await?;
     Ok(())
 }

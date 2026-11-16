@@ -317,7 +317,7 @@ pub async fn batch_upsert_images(
         return Ok(());
     }
     // The write lock is taken first, as the scan's other writes do (see write_probe_outcome).
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let mut tx = crate::begin_write(pool).await?;
     for img in images {
         let id_str = img.item_id.to_string();
         let type_str = img.image_type.as_str();
@@ -484,7 +484,7 @@ pub async fn update_image_versions(
         return Ok(());
     }
     // The write lock is taken first, as the scan's other writes do (see write_probe_outcome).
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let mut tx = crate::begin_write(pool).await?;
     for img in images {
         sqlx::query(
             "UPDATE item_images SET stamp = ?, width = ?, height = ?, blurhash = ?

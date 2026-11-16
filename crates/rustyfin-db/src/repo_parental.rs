@@ -97,8 +97,10 @@ pub async fn set_policy(
     user_id: Uuid,
     policy: &ParentalPolicy,
 ) -> Result<bool, sqlx::Error> {
-    let mut conn = pool.acquire().await?;
-    write_policy(&mut conn, user_id, policy).await
+    let mut tx = crate::begin_write(pool).await?;
+    let written = write_policy(&mut tx, user_id, policy).await?;
+    tx.commit().await?;
+    Ok(written)
 }
 
 /// `set_policy` on a connection or in a transaction.

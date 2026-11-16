@@ -21,6 +21,8 @@ pub const TASK_METADATA_REFRESH: &str = "MetadataRefresh";
 pub const TASK_TRANSCODE_CLEANUP: &str = "TranscodeCacheCleanup";
 pub const TASK_INTRO_DETECTION: &str = "IntroDetection";
 pub const TASK_DB_VACUUM: &str = "DatabaseVacuum";
+/// How soon a scheduled VACUUM put off for a scan or an image run is tried again.
+const VACUUM_RETRY: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 /// Jellyfin's key for its chapter image task.
 pub const TASK_CHAPTER_IMAGES: &str = "RefreshChapterImages";
 /// Jellyfin's key for its trickplay task.
@@ -1214,11 +1216,15 @@ impl TaskScheduler {
             // Start VACUUM at a quiet time (after 2 hours initial delay, then daily)
             tokio::time::sleep(std::time::Duration::from_secs(7200)).await;
             loop {
-                sched.run_db_vacuum().await;
-                let interval = sched
-                    .get_interval_for_task(TASK_DB_VACUUM)
-                    .await
-                    .unwrap_or(std::time::Duration::from_secs(24 * 3600));
+                // A VACUUM put off for a scan or an image run is tried again a little later
+                let interval = if sched.run_db_vacuum().await {
+                    sched
+                        .get_interval_for_task(TASK_DB_VACUUM)
+                        .await
+                        .unwrap_or(std::time::Duration::from_secs(24 * 3600))
+                } else {
+                    VACUUM_RETRY
+                };
                 tokio::select! {
                     _ = tokio::time::sleep(interval) => {}
                     _ = rx.wait_for(|v| *v) => break,
@@ -1227,8 +1233,60 @@ impl TaskScheduler {
         });
     }
 
-    /// Run SQLite VACUUM to defragment the database
-    async fn run_db_vacuum(&self) {
+    /// The running work a VACUUM would hold up: it holds the write lock throughout, so their
+    /// writes would wait and then fail. `scan_lock_held`: whether `SCAN_LOCK` is held, as by the
+    /// scans started outside the scheduler.
+    async fn vacuum_blockers(&self, scan_lock_held: bool) -> Vec<String> {
+        let mut blockers = Vec::new();
+        for id in [
+            TASK_LIBRARY_SCAN,
+            TASK_METADATA_REFRESH,
+            TASK_INTRO_DETECTION,
+            TASK_CHAPTER_IMAGES,
+            TASK_TRICKPLAY,
+        ] {
+            if let Some(task) = self.get_task(id).await
+                && task.state != TaskState::Idle
+            {
+                blockers.push(task.name);
+            }
+        }
+        let scan_listed = self
+            .get_task(TASK_LIBRARY_SCAN)
+            .await
+            .is_some_and(|task| task.state != TaskState::Idle);
+        if !scan_listed && scan_lock_held {
+            blockers.push("a library scan".to_string());
+        }
+        blockers
+    }
+
+    /// Run SQLite VACUUM to defragment the database. Put off, with the task's result saying so,
+    /// while a scan or an image run is going: false then. It holds `SCAN_LOCK` throughout, so a
+    /// scan that starts meanwhile waits for it.
+    async fn run_db_vacuum(&self) -> bool {
+        let no_scan = crate::scanner::SCAN_LOCK.try_lock();
+        let blockers = self.vacuum_blockers(no_scan.is_err()).await;
+        if !blockers.is_empty() {
+            let now = Utc::now().to_rfc3339();
+            let why = format!("Put off while this runs: {}", blockers.join(", "));
+            tracing::info!("Database VACUUM: {why}");
+            self.set_task_result(
+                TASK_DB_VACUUM,
+                TaskResult {
+                    status: TaskCompletionStatus::Aborted,
+                    error_message: Some(why),
+                    start_time_utc: now.clone(),
+                    end_time_utc: now,
+                },
+            )
+            .await;
+            return false;
+        }
+        // No blockers: the lock was free, and is this run's until it returns.
+        let Ok(_no_scan) = no_scan else {
+            return false;
+        };
         self.set_task_state(TASK_DB_VACUUM, TaskState::Running)
             .await;
         let start = Utc::now();
@@ -1255,7 +1313,7 @@ impl TaskScheduler {
                 )
                 .await;
                 self.set_task_state(TASK_DB_VACUUM, TaskState::Idle).await;
-                return;
+                return true;
             }
             Err(e) => {
                 let end = Utc::now();
@@ -1270,7 +1328,7 @@ impl TaskScheduler {
                 )
                 .await;
                 self.set_task_state(TASK_DB_VACUUM, TaskState::Idle).await;
-                return;
+                return true;
             }
         }
 
@@ -1299,6 +1357,7 @@ impl TaskScheduler {
 
         self.set_task_result(TASK_DB_VACUUM, result).await;
         self.set_task_state(TASK_DB_VACUUM, TaskState::Idle).await;
+        true
     }
 }
 
@@ -1446,6 +1505,47 @@ mod tests {
             .last_execution_result
             .unwrap();
         (result.status, result.error_message.unwrap_or_default())
+    }
+
+    // VACUUM holds the write lock throughout, so it waits for scans and image runs to end.
+    #[tokio::test]
+    async fn r3dbpool_vacuum_waits_for_scans_and_image_runs() {
+        let (sched, dir) = r3tasks_scheduler().await;
+        let name = |id| {
+            let sched = sched.clone();
+            async move { sched.get_task(id).await.unwrap().name }
+        };
+        assert!(sched.vacuum_blockers(false).await.is_empty());
+        assert_eq!(
+            sched.vacuum_blockers(true).await,
+            ["a library scan".to_string()]
+        );
+
+        sched
+            .set_task_state(TASK_TRICKPLAY, TaskState::Running)
+            .await;
+        assert_eq!(
+            sched.vacuum_blockers(true).await,
+            [name(TASK_TRICKPLAY).await, "a library scan".to_string()]
+        );
+        sched
+            .set_task_state(TASK_LIBRARY_SCAN, TaskState::Running)
+            .await;
+        assert_eq!(
+            sched.vacuum_blockers(true).await,
+            [name(TASK_LIBRARY_SCAN).await, name(TASK_TRICKPLAY).await],
+            "the scan is named once"
+        );
+
+        assert!(!sched.run_db_vacuum().await, "put off");
+        let (status, why) = r3perf_last(&sched, TASK_DB_VACUUM).await;
+        assert_eq!(status, TaskCompletionStatus::Aborted);
+        assert!(why.starts_with("Put off while this runs: "), "{why}");
+        assert_eq!(
+            sched.get_task(TASK_DB_VACUUM).await.unwrap().state,
+            TaskState::Idle
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

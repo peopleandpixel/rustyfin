@@ -256,8 +256,9 @@ pub async fn set_share(
     user_id: Uuid,
     can_edit: bool,
 ) -> Result<(), sqlx::Error> {
-    let mut conn = pool.acquire().await?;
-    insert_share(&mut conn, playlist_id, user_id, can_edit).await
+    let mut tx = crate::begin_write(pool).await?;
+    insert_share(&mut tx, playlist_id, user_id, can_edit).await?;
+    tx.commit().await
 }
 
 async fn insert_share(
@@ -300,7 +301,7 @@ pub async fn replace_shares(
     playlist_id: Uuid,
     shares: &[PlaylistUserPermissions],
 ) -> Result<(), sqlx::Error> {
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let mut tx = crate::begin_write(pool).await?;
     replace_shares_on(&mut tx, playlist_id, shares).await?;
     tx.commit().await
 }
@@ -326,8 +327,9 @@ pub async fn set_open_access(
     playlist_id: Uuid,
     open: bool,
 ) -> Result<(), sqlx::Error> {
-    let mut conn = pool.acquire().await?;
-    set_open_access_on(&mut conn, playlist_id, open).await
+    let mut tx = crate::begin_write(pool).await?;
+    set_open_access_on(&mut tx, playlist_id, open).await?;
+    tx.commit().await
 }
 
 async fn set_open_access_on(
@@ -352,7 +354,7 @@ pub async fn delete_playlist(
 ) -> Result<bool, sqlx::Error> {
     let pid = id.to_string();
     let owner = owner_filter(caller);
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::begin_write(pool).await?;
     sqlx::query(
         "DELETE FROM playlist_items WHERE playlist_id = ?1 AND EXISTS (
             SELECT 1 FROM playlists WHERE id = ?1 AND (?2 IS NULL OR user_id = ?2))",
@@ -391,7 +393,7 @@ pub async fn add_items_to_playlist(
 ) -> Result<(), sqlx::Error> {
     let pid = playlist_id.to_string();
     let owner = owner_filter(caller);
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let mut tx = crate::begin_write(pool).await?;
     let sql = format!(
         "SELECT COALESCE(MAX(pi.sort_order), -1) + 1 FROM playlists p
          LEFT JOIN playlist_items pi ON pi.playlist_id = p.id
@@ -526,7 +528,7 @@ pub async fn move_playlist_item(
     let pid = playlist_id.to_string();
     // Take the write lock before reading, so a write committed between the read and the
     // renumbering can't fail the move with SQLITE_BUSY_SNAPSHOT.
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let mut tx = crate::begin_write(pool).await?;
     let owner = owner_filter(caller);
     let sql = format!(
         "SELECT pi.item_id FROM playlist_items pi
@@ -602,7 +604,7 @@ pub async fn update_playlist_with(
 ) -> Result<bool, sqlx::Error> {
     let pid = id.to_string();
     let owner = owner_filter(caller);
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let mut tx = crate::begin_write(pool).await?;
     let sql = format!(
         "UPDATE playlists AS p SET name = COALESCE(?1, p.name), media_type = COALESCE(?2, p.media_type)
          WHERE p.id = ?3 AND {edit}",

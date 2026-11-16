@@ -44,7 +44,7 @@ pub async fn save_chapters(
     chapters: Vec<Chapter>,
 ) -> Result<(), sqlx::Error> {
     let item_id_str = item_id.to_string();
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::begin_write(pool).await?;
     // Delete existing chapters
     sqlx::query("DELETE FROM chapters WHERE item_id = ?1")
         .bind(&item_id_str)

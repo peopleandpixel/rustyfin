@@ -32,7 +32,7 @@ where
 /// and the insert run in one IMMEDIATE transaction, so two callers cannot both take a name.
 /// Returns false when the name is taken.
 pub async fn create_user_unless_taken(pool: &SqlitePool, user: &User) -> Result<bool, sqlx::Error> {
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let mut tx = crate::begin_write(pool).await?;
     let names: Vec<String> = sqlx::query_scalar("SELECT name FROM users")
         .fetch_all(&mut *tx)
         .await?;
@@ -201,7 +201,7 @@ pub async fn all_user_flags(
 pub async fn promote_earliest_admin_to_owner(
     pool: &SqlitePool,
 ) -> Result<Option<User>, sqlx::Error> {
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let mut tx = crate::begin_write(pool).await?;
 
     let has_owner: bool =
         sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM users WHERE is_owner = 1)")
@@ -257,7 +257,7 @@ async fn claim_owner_in_tx(
     name: &str,
     password_hash: &str,
 ) -> Result<OwnerClaim, sqlx::Error> {
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let mut tx = crate::begin_write(pool).await?;
 
     let has_users: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM users)")
         .fetch_one(&mut *tx)
@@ -295,7 +295,7 @@ pub async fn update_last_login(pool: &SqlitePool, id: Uuid) -> Result<(), sqlx::
 /// action, so the rows that reference the user go first. Returns whether the users row existed.
 pub async fn delete_user(pool: &SqlitePool, id: Uuid) -> Result<bool, sqlx::Error> {
     let id = id.to_string();
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let mut tx = crate::begin_write(pool).await?;
     for sql in [
         "DELETE FROM user_item_data WHERE user_id = ?",
         "DELETE FROM pinned_episodes WHERE user_id = ?",
@@ -323,7 +323,7 @@ pub async fn update_password(
     password_hash: &str,
 ) -> Result<bool, sqlx::Error> {
     let id = id.to_string();
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::begin_write(pool).await?;
     let result = sqlx::query("UPDATE users SET password_hash = ? WHERE id = ?")
         .bind(password_hash)
         .bind(&id)
@@ -402,7 +402,7 @@ pub async fn set_policy_with(
     is_disabled: Option<bool>,
     limits: Option<&rustyfin_model::parental::ParentalPolicy>,
 ) -> Result<PolicyChange, sqlx::Error> {
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let mut tx = crate::begin_write(pool).await?;
 
     let current: Option<(bool, bool)> =
         sqlx::query_as("SELECT is_administrator, is_disabled FROM users WHERE id = ?")
@@ -626,7 +626,7 @@ pub async fn rename_user_unless_taken(
     id: Uuid,
     name: &str,
 ) -> Result<Renamed, sqlx::Error> {
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let mut tx = crate::begin_write(pool).await?;
     let rows: Vec<(String, String)> = sqlx::query_as("SELECT id, name FROM users")
         .fetch_all(&mut *tx)
         .await?;
@@ -723,7 +723,7 @@ pub async fn save_user_image(
 ) -> Result<(String, Vec<String>), sqlx::Error> {
     let id = uuid::Uuid::new_v4().simple().to_string();
     let uid = user_id.to_string();
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let mut tx = crate::begin_write(pool).await?;
     let old: Vec<String> = sqlx::query_scalar(
         "DELETE FROM user_images WHERE user_id = ?1 AND image_type = ?2 RETURNING path",
     )
@@ -956,7 +956,7 @@ pub async fn validate_password_reset_pin(
 ) -> Result<Option<Uuid>, sqlx::Error> {
     let uid = user_id.to_string();
     let now = chrono::Utc::now().to_rfc3339();
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let mut tx = crate::begin_write(pool).await?;
     let deleted: Option<(String,)> = sqlx::query_as(
         "DELETE FROM password_reset_pins WHERE id = (\
          SELECT id FROM password_reset_pins \
@@ -994,7 +994,7 @@ pub async fn redeem_reset_pin(
     pin_hash: &str,
 ) -> Result<Option<Uuid>, sqlx::Error> {
     let now = chrono::Utc::now().to_rfc3339();
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let mut tx = crate::begin_write(pool).await?;
     let deleted: Option<(String,)> = sqlx::query_as(
         "DELETE FROM password_reset_pins WHERE id = (\
          SELECT id FROM password_reset_pins \

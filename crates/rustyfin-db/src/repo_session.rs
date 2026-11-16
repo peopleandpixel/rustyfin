@@ -1,5 +1,7 @@
 use chrono::{NaiveDateTime, TimeZone, Utc};
 use sqlx::SqlitePool;
+
+use crate::writer::ExecuteWrite;
 use uuid::Uuid;
 
 use rustyfin_model::media::MediaItem;
@@ -38,7 +40,7 @@ pub async fn upsert_session(
     .bind(device_name)
     .bind(app_name)
     .bind(app_version)
-    .execute(pool)
+    .execute_write(pool)
     .await?;
     Ok(())
 }
@@ -58,7 +60,7 @@ pub async fn update_session_now_playing(
     .bind(position_ticks)
     .bind(is_paused)
     .bind(session_id)
-    .execute(pool)
+    .execute_write(pool)
     .await?;
     Ok(())
 }
@@ -178,7 +180,7 @@ pub async fn session_device_ids(
 pub async fn touch_session(pool: &SqlitePool, session_id: &str) -> Result<(), sqlx::Error> {
     sqlx::query("UPDATE sessions SET last_activity = datetime('now') WHERE id = ?1")
         .bind(session_id)
-        .execute(pool)
+        .execute_write(pool)
         .await?;
     Ok(())
 }
@@ -203,7 +205,7 @@ pub async fn expire_sessions(
         )
         .bind(&id)
         .bind(format!("-{timeout_minutes} minutes"))
-        .execute(pool)
+        .execute_write(pool)
         .await?
         .rows_affected();
         if gone > 0 {
@@ -216,7 +218,7 @@ pub async fn expire_sessions(
 pub async fn delete_session(pool: &SqlitePool, session_id: &str) -> Result<(), sqlx::Error> {
     sqlx::query("DELETE FROM sessions WHERE id = ?1")
         .bind(session_id)
-        .execute(pool)
+        .execute_write(pool)
         .await?;
     Ok(())
 }
@@ -227,7 +229,7 @@ pub async fn delete_sessions_by_device(
 ) -> Result<(), sqlx::Error> {
     sqlx::query("DELETE FROM sessions WHERE device_id = ?1")
         .bind(device_id)
-        .execute(pool)
+        .execute_write(pool)
         .await?;
     Ok(())
 }
@@ -240,7 +242,7 @@ pub async fn delete_sessions_by_user_device(
     sqlx::query("DELETE FROM sessions WHERE user_id = ? AND device_id = ?")
         .bind(user_id.to_string())
         .bind(device_id)
-        .execute(pool)
+        .execute_write(pool)
         .await?;
     Ok(())
 }
@@ -251,7 +253,7 @@ pub async fn cleanup_expired_sessions(
 ) -> Result<u64, sqlx::Error> {
     let result = sqlx::query("DELETE FROM sessions WHERE last_activity < datetime('now', ?1)")
         .bind(format!("-{timeout_minutes} minutes"))
-        .execute(pool)
+        .execute_write(pool)
         .await?;
     Ok(result.rows_affected())
 }
@@ -282,7 +284,7 @@ pub async fn upsert_device(
     .bind(app_name)
     .bind(app_version)
     .bind(&uid)
-    .execute(pool)
+    .execute_write(pool)
     .await?;
     Ok(())
 }
@@ -317,7 +319,7 @@ pub async fn delete_device(pool: &SqlitePool, device_id: &str) -> Result<(), sql
     super::repo_token::delete_device_tokens(pool, device_id).await?;
     sqlx::query("DELETE FROM devices WHERE id = ?1")
         .bind(device_id)
-        .execute(pool)
+        .execute_write(pool)
         .await?;
     Ok(())
 }
@@ -342,7 +344,7 @@ pub async fn create_session(
             .bind(&uid)
             .bind(device_id)
             .bind(&sid)
-            .execute(pool)
+            .execute_write(pool)
             .await?;
     }
     sqlx::query(
@@ -362,7 +364,7 @@ pub async fn create_session(
     .bind(client)
     .bind(app_version)
     .bind(capabilities)
-    .execute(pool)
+    .execute_write(pool)
     .await?;
 
     // Also upsert device
@@ -382,7 +384,7 @@ pub async fn update_session_capabilities(
     )
     .bind(capabilities)
     .bind(session_id)
-    .execute(pool)
+    .execute_write(pool)
     .await?;
     Ok(())
 }
@@ -403,7 +405,7 @@ pub async fn update_device_capabilities(
     .bind(capabilities)
     .bind(user_id.to_string())
     .bind(device_id)
-    .execute(pool)
+    .execute_write(pool)
     .await?;
     Ok(result.rows_affected())
 }

@@ -13,6 +13,7 @@ Rustyfin wird über Umgebungsvariablen konfiguriert. Es sind keine Konfiguration
 | `RUSTYFIN_BIND` | Adresse und Port, auf dem der Server lauscht | `0.0.0.0:8096` |
 | `RUSTYFIN_DATA` | Datenverzeichnis (Datenbank, Cache, Konfiguration, Logs) | `~/.rustyfin` |
 | `RUSTYFIN_DB` | SQLite-Datenbank-URL | `sqlite://<data_dir>/rustyfin.db?mode=rwc` |
+| `RUSTYFIN_DB_CACHE_KIB` | Seitencache jeder Datenbankverbindung in KiB. Jede Verbindung hat ihren eigenen: die Verbindungen des Hauptpools (`RUSTYFIN_DB_POOL_SIZE`, Standard 10) und des Lesepools (10) belegen zusammen höchstens ihre Anzahl mal diesen Wert. Lesezugriffe auf die ersten 256 MiB der Datenbank laufen über Memory-Mapping und brauchen den Cache nicht; ein größerer Wert hilft nur bei größeren Datenbanken und kostet auf Hosts mit wenig Speicher Swap. Erlaubt sind 64 bis 1048576; ein ungültiger Wert wird im Log gemeldet und durch den Standard ersetzt | `4096` (4 MiB) |
 | `RUSTYFIN_SECRET` | Veraltet und ohne Wirkung — Access-Token werden serverseitig gespeichert und überstehen Neustarts | *(ungenutzt)* |
 | `RUSTYFIN_SERVER_ID` | Eindeutige Server-Kennung | Stabil; in `<data_dir>/server_id` gespeichert |
 | `RUSTYFIN_API_KEY` | Statischer API-Key für externe Integrationen (ein leerer Wert schaltet ihn ab) | *(deaktiviert)* |

@@ -126,7 +126,7 @@ async fn run_batches(
         // The batch and the marker go in one short transaction. A short batch is the last one.
         let finished = (rows.len() as u64) < u64::from(batch_size);
         let next = rows.last().map(|row| row.0.clone()).unwrap_or_default();
-        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = rustyfin_db::begin_write(pool).await?;
         let mut batch_moved: u64 = 0;
         for (id, path, stored, date) in &moves {
             batch_moved += sqlx::query(

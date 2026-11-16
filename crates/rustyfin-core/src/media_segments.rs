@@ -8,6 +8,7 @@ use sqlx::SqlitePool;
 use uuid::Uuid;
 
 use crate::trickplay::Cancel;
+use rustyfin_db::busy::retry_busy_until;
 
 /// The version of the detection: its ffmpeg pass, `DetectionConfig::default()` and how the
 /// segments are picked from what ffmpeg finds. Raise it with any change to those, so the next run
@@ -570,49 +571,36 @@ async fn detect_and_save_with_threads(
     let (intro, outro) =
         detect_segments_with_threads(path, duration_seconds, &config, threads, cancel).await?;
 
-    // Drop results from earlier runs now that detection has succeeded.
-    sqlx::query(
-        "DELETE FROM media_segments WHERE item_id = ?1 AND segment_type IN ('Intro', 'Outro')",
-    )
-    .bind(item_id.to_string())
-    .execute(pool)
-    .await
-    .map_err(|e| format!("Failed to clear old segments: {}", e))?;
-
-    // Save intro if detected
-    if let Some(seg) = intro {
-        let start_ticks = (seg.start * 10_000_000.0) as i64;
-        let end_ticks = (seg.end * 10_000_000.0) as i64;
-        rustyfin_db::repo_media_segment::save_media_segment(
-            pool,
-            item_id,
-            "Intro",
-            start_ticks,
-            end_ticks,
+    // Replace the results of earlier runs now that detection has succeeded.
+    let ticks = |seg: &DetectedSegment| {
+        (
+            (seg.start * 10_000_000.0) as i64,
+            (seg.end * 10_000_000.0) as i64,
         )
-        .await
-        .map_err(|e| format!("Failed to save intro segment: {}", e))?;
+    };
+    let (intro_ticks, outro_ticks) = (intro.as_ref().map(ticks), outro.as_ref().map(ticks));
+    retry_busy_until(
+        "saving detected segments",
+        || cancel.cancelled(),
+        || {
+            rustyfin_db::repo_media_segment::replace_detected_segments(
+                pool,
+                item_id,
+                intro_ticks,
+                outro_ticks,
+            )
+        },
+    )
+    .await
+    .map_err(|e| format!("Failed to save the segments: {}", e))?;
 
+    if let Some(seg) = intro {
         info!(
             "Item {}: Intro detected {:.1}s - {:.1}s",
             item_id, seg.start, seg.end
         );
     }
-
-    // Save outro if detected
     if let Some(seg) = outro {
-        let start_ticks = (seg.start * 10_000_000.0) as i64;
-        let end_ticks = (seg.end * 10_000_000.0) as i64;
-        rustyfin_db::repo_media_segment::save_media_segment(
-            pool,
-            item_id,
-            "Outro",
-            start_ticks,
-            end_ticks,
-        )
-        .await
-        .map_err(|e| format!("Failed to save outro segment: {}", e))?;
-
         info!(
             "Item {}: Outro detected {:.1}s - {:.1}s",
             item_id, seg.start, seg.end
@@ -728,8 +716,14 @@ pub async fn detect_for_all_episodes_with_progress(
                 // An unreadable file (version 0) is never recorded, so it is tried again.
                 Ok(()) if (size, modified) == (0, 0) => true,
                 Ok(()) => {
-                    let stored = rustyfin_db::repo_media_segment::set_detected_version(
-                        &pool, item_id, version,
+                    let stored = retry_busy_until(
+                        "recording a segment detection",
+                        || cancel.cancelled(),
+                        || {
+                            rustyfin_db::repo_media_segment::set_detected_version(
+                                &pool, item_id, version,
+                            )
+                        },
                     )
                     .await;
                     if let Err(e) = stored {
