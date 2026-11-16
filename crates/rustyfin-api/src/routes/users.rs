@@ -47,7 +47,11 @@ pub fn routes() -> Router<AppState> {
         .route("/Users", get(get_users))
         .route("/Users/Me", get(get_me))
         .route("/Users/{userId}", get(get_user))
-        .route("/Users/{userId}", put(update_user_name))
+        // Jellyfin's UpdateUser is a POST of the whole UserDto; only its Name is read.
+        .route(
+            "/Users/{userId}",
+            put(update_user_name).post(update_user_name),
+        )
         .route("/Users/{userId}/Password", post(change_password))
         .route("/Users/{userId}/Configuration", post(update_configuration))
         .route("/Users/{userId}/Images", get(get_user_images))
@@ -153,9 +157,12 @@ async fn get_public_users(
 ) -> Result<Json<Vec<PublicUserDto>>, ApiError> {
     let users = rustyfin_db::repo_user::get_public_users(&state.db_ro).await?;
     let tags = rustyfin_db::repo_user::primary_image_tags(&state.db_ro).await?;
+    // A hidden user (IsHidden) signs in by typing the name, as in Jellyfin.
+    let policies = rustyfin_db::repo_parental::all_policies(&state.db_ro).await?;
     Ok(Json(
         users
             .into_iter()
+            .filter(|u| !policies.get(&u.id).is_some_and(|p| p.access.is_hidden))
             .map(|u| {
                 let primary_image_tag = tags.get(&u.id).cloned();
                 PublicUserDto {
@@ -331,10 +338,12 @@ async fn change_password(
     Ok(Json(serde_json::json!({})))
 }
 
-/// Sets an account's administrator and disabled flags. Administrators only. Refuses, with 403, to
-/// change the owner's role or state, to remove or disable one's own administrator rights or account,
-/// to disable an administrator, and to leave no enabled administrator. Disabling an account deletes its
-/// tokens, sessions and devices.
+/// Sets an account's administrator and disabled flags and its parental and access policy.
+/// Administrators only. Refuses, with 403, to change the owner's role or state, to remove or disable
+/// one's own administrator rights or account, to take away the owner's or one's own remote access or
+/// add an access schedule to them, to disable an administrator, to leave no enabled administrator,
+/// and to leave no enabled administrator with remote access. Disabling an account deletes its tokens,
+/// sessions and devices.
 async fn update_policy(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
@@ -355,12 +364,22 @@ async fn update_policy(
     }
 
     // Checked before anything is stored, so a policy that can't be kept changes nothing.
-    let parental = parental_policy(
-        &req,
-        rustyfin_db::repo_parental::get_policy(&state.db, id).await?,
-    )?;
+    let stored = rustyfin_db::repo_parental::get_policy(&state.db, id).await?;
+    let parental = parental_policy(&req, stored.clone())?;
+    // A change that would lock the account out: remote access taken away, or a new schedule
+    let locks_out = (stored.access.enable_remote_access && !parental.access.enable_remote_access)
+        || (!parental.access.access_schedules.is_empty()
+            && parental.access.access_schedules != stored.access.access_schedules);
+    let is_owner = rustyfin_db::repo_user::is_owner(&state.db, id).await?;
+    if locks_out && (is_owner || claims.sub == id) {
+        return Err(ApiError::Forbidden(if is_owner {
+            "The server owner's remote access and access times cannot be limited.".into()
+        } else {
+            "You cannot limit your own remote access or access times.".into()
+        }));
+    }
 
-    if rustyfin_db::repo_user::is_owner(&state.db, id).await? {
+    if is_owner {
         if req.is_administrator == Some(false) {
             return Err(ApiError::Forbidden(
                 "The server owner must stay an administrator.".into(),
@@ -386,9 +405,15 @@ async fn update_policy(
         }
     }
 
-    let change =
-        rustyfin_db::repo_user::set_policy(&state.db, id, req.is_administrator, req.is_disabled)
-            .await?;
+    // The flags and the parental and access policy are stored in one transaction.
+    let change = rustyfin_db::repo_user::set_policy_with(
+        &state.db,
+        id,
+        req.is_administrator,
+        req.is_disabled,
+        Some(&parental),
+    )
+    .await?;
     match change {
         PolicyChange::Done => {}
         PolicyChange::NotFound => return Err(ApiError::NotFound("user not found".into())),
@@ -407,25 +432,88 @@ async fn update_policy(
                 "There must be at least one enabled administrator.".into(),
             ));
         }
-    }
-    if !rustyfin_db::repo_parental::set_policy(&state.db, id, &parental).await? {
-        return Err(ApiError::NotFound("user not found".into()));
+        PolicyChange::NoRemoteAdmin => {
+            return Err(ApiError::Forbidden(
+                "There must be at least one enabled administrator who may sign in remotely.".into(),
+            ));
+        }
     }
 
     Ok(Json(serde_json::json!({})))
 }
 
-/// The stored parental policy with the request's fields over it. An unknown kind of unrated item
-/// is refused, and so are access schedules, which Rustyfin doesn't enforce: an administrator is
-/// told the limit wasn't kept instead of believing it was.
+/// The stored parental and access policy with the request's fields over it. An unknown kind of
+/// unrated item, a schedule with an unknown day or hours out of order, and a negative limit are
+/// refused, so an administrator is told a limit wasn't kept instead of believing it was. Library
+/// ids are stored in one spelling; one that isn't an id is dropped, which shows less, not more.
 fn parental_policy(
     req: &UpdatePolicyRequest,
     mut policy: ParentalPolicy,
 ) -> Result<ParentalPolicy, ApiError> {
-    if req.access_schedules.as_ref().is_some_and(|s| !s.is_empty()) {
-        return Err(ApiError::BadRequest(
-            "Access schedules are not supported.".into(),
-        ));
+    let access = &mut policy.access;
+    if let Some(schedules) = &req.access_schedules {
+        access.access_schedules = schedules
+            .iter()
+            .map(|s| {
+                s.validated().ok_or_else(|| {
+                    ApiError::BadRequest(format!(
+                        "Invalid access schedule: {} {} to {}",
+                        s.day_of_week, s.start_hour, s.end_hour
+                    ))
+                })
+            })
+            .collect::<Result<_, _>>()?;
+    }
+    if let Some(folders) = &req.enabled_folders {
+        let mut ids: Vec<String> = Vec::new();
+        for id in folders
+            .iter()
+            .filter_map(|f| Uuid::parse_str(f.trim()).ok())
+        {
+            if !ids.contains(&id.to_string()) {
+                ids.push(id.to_string());
+            }
+        }
+        access.enabled_folders = ids;
+    }
+    if req.max_active_sessions.is_some_and(|n| n < 0)
+        || req.remote_client_bitrate_limit.is_some_and(|n| n < 0)
+    {
+        return Err(ApiError::BadRequest("Limits cannot be negative.".into()));
+    }
+    let set = |field: &mut bool, value: Option<bool>| {
+        if let Some(value) = value {
+            *field = value;
+        }
+    };
+    set(&mut access.enable_all_folders, req.enable_all_folders);
+    set(&mut access.is_hidden, req.is_hidden);
+    set(&mut access.enable_remote_access, req.enable_remote_access);
+    set(&mut access.enable_media_playback, req.enable_media_playback);
+    set(
+        &mut access.enable_audio_playback_transcoding,
+        req.enable_audio_playback_transcoding,
+    );
+    set(
+        &mut access.enable_video_playback_transcoding,
+        req.enable_video_playback_transcoding,
+    );
+    set(
+        &mut access.enable_playback_remuxing,
+        req.enable_playback_remuxing,
+    );
+    set(
+        &mut access.force_remote_source_transcoding,
+        req.force_remote_source_transcoding,
+    );
+    if req.enable_content_deletion.is_some() {
+        access.enable_content_deletion = req.enable_content_deletion;
+    }
+    if let Some(n) = req.max_active_sessions {
+        access.max_active_sessions = n;
+    }
+    if let Some(n) = req.remote_client_bitrate_limit {
+        access.remote_client_bitrate_limit = n;
     }
     if let Some(max) = req.max_parental_rating {
         policy.max_parental_rating = max;

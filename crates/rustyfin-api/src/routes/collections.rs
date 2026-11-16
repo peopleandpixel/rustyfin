@@ -123,7 +123,8 @@ async fn visible_collection_count(
         let mut ids =
             rustyfin_db::repo_collection::get_collection_item_ids(&state.db_ro, collection.id)
                 .await?;
-        hidden.retain(&mut ids, |i| *i);
+        // Ratings, tags and library access alike
+        hidden.retain_ids(state, &mut ids).await?;
         collection.child_count = ids.len() as i64;
         return Ok(!ids.is_empty());
     }
@@ -142,7 +143,7 @@ async fn visible_playlist_count(
         let mut items =
             rustyfin_db::repo_playlist::get_playlist_items(&state.db_ro, playlist.id, caller)
                 .await?;
-        hidden.retain(&mut items, |i| i.id);
+        hidden.retain(&mut items);
         playlist.child_count = items.len() as i64;
     }
     Ok(())
@@ -259,7 +260,7 @@ async fn get_collection_items(
         .await?
         .ok_or_else(collection_not_found)?;
     let mut items = rustyfin_db::repo_collection::get_collection_items(&state.db_ro, id).await?;
-    hidden.retain(&mut items, |i| i.id);
+    hidden.retain(&mut items);
     let count = items.len() as i64;
     Ok(Json(QueryResult {
         items,
@@ -324,7 +325,7 @@ async fn get_playlist(
     visible_playlist_count(&state, &claims, &hidden, &mut playlist).await?;
     let mut ids =
         rustyfin_db::repo_playlist::get_playlist_item_ids(&state.db_ro, id, caller).await?;
-    hidden.retain(&mut ids, |i| *i);
+    hidden.retain_ids(&state, &mut ids).await?;
     playlist.item_ids = Some(ids);
     Ok(Json(playlist))
 }
@@ -425,7 +426,7 @@ pub(crate) async fn playlist_entries(
     let mut all = rustyfin_db::repo_playlist::get_playlist_items(&state.db_ro, id, caller).await?;
     HiddenItems::for_caller(state, claims)
         .await?
-        .retain(&mut all, |i| i.id);
+        .retain(&mut all);
     if shuffle {
         rustyfin_db::repo_media::shuffle(&mut all);
     }
@@ -518,7 +519,13 @@ async fn update_playlist(
 
     ensure_playlist_editable(&state, id, &claims).await?;
     // An editor with parental limits sends the entries they see; the hidden ones stay
+    let caller = playlist_caller(&claims);
     let hidden = HiddenItems::for_caller(&state, &claims).await?;
+    // The entries hidden from the caller, now or among those sent
+    let mut ids =
+        rustyfin_db::repo_playlist::get_playlist_item_ids(&state.db_ro, id, caller).await?;
+    ids.extend(item_ids.iter().flatten().copied());
+    let hidden = hidden.hidden_among(&state, &ids).await?;
     let update = rustyfin_db::repo_playlist::PlaylistUpdate {
         name,
         media_type,
@@ -526,15 +533,8 @@ async fn update_playlist(
         shares: shares.as_deref(),
         public,
     };
-    let caller = playlist_caller(&claims);
-    if !rustyfin_db::repo_playlist::update_playlist_with(
-        &state.db,
-        id,
-        &update,
-        hidden.ids(),
-        caller,
-    )
-    .await?
+    if !rustyfin_db::repo_playlist::update_playlist_with(&state.db, id, &update, &hidden, caller)
+        .await?
     {
         return Err(playlist_not_found());
     }
@@ -596,8 +596,14 @@ async fn move_playlist_item(
     ensure_playlist_editable(&state, playlist_id, &claims).await?;
     let item_id = rustyfin_db::repo_playlist::entry_item(playlist_id, entry);
     // The index counts the entries the caller sees: an editor with parental limits sees fewer
-    let hidden = HiddenItems::for_caller(&state, &claims).await?;
-    if hidden.hides(item_id) {
+    let caller = playlist_caller(&claims);
+    let ids = rustyfin_db::repo_playlist::get_playlist_item_ids(&state.db_ro, playlist_id, caller)
+        .await?;
+    let hidden = HiddenItems::for_caller(&state, &claims)
+        .await?
+        .hidden_among(&state, &ids)
+        .await?;
+    if hidden.contains(&item_id) {
         return Err(ApiError::NotFound("Playlist item not found".to_string()));
     }
     let moved = rustyfin_db::repo_playlist::move_playlist_item(
@@ -605,8 +611,8 @@ async fn move_playlist_item(
         playlist_id,
         item_id,
         new_index,
-        hidden.ids(),
-        playlist_caller(&claims),
+        &hidden,
+        caller,
     )
     .await?;
     if !moved {

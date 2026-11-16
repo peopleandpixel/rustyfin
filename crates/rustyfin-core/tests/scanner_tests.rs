@@ -3467,7 +3467,7 @@ async fn b28_a_new_year_or_rating_still_moves_the_filter_counts() {
 /// The ids of the items a search for `query` finds, in every library.
 #[cfg(target_os = "linux")]
 async fn b28_found(pool: &SqlitePool, query: &str) -> Vec<Uuid> {
-    rustyfin_db::repo_search::hint_candidates(pool, query, None)
+    rustyfin_db::repo_search::hint_candidates(pool, query, None, None)
         .await
         .unwrap()
         .into_iter()

@@ -36,6 +36,7 @@ import {
     changeSubtitleAppearance, changeLatestLibrary, chooseProfileImage, deleteProfileImage,
 } from './modules/settings.js';
 import { refreshTasks, openAddUser, closeAddUser, submitAddUser, clearLiveLog, setLogLevel } from './modules/admin.js';
+import './modules/user-editor.js';
 import {
     jiAddPair, jiForget, jiSetMine, jiSetChoice, jiSetConfirm, jiPreview, jiRun, jiNewCode, jiCopyCodes,
 } from './modules/jellyfin-import.js';

@@ -122,10 +122,9 @@ async fn list_of(
 ) -> Result<Json<ByNameList>, ApiError> {
     let mut query = ListQuery::parse(params)?;
     query_user(state, claims, query.user_id).await?;
-    query.filter.hidden_items = HiddenItems::for_caller(state, claims)
-        .await?
-        .stored_ids()
-        .clone();
+    let hidden = HiddenItems::for_caller(state, claims).await?;
+    query.filter.hidden_items = hidden.stored_ids().clone();
+    query.filter.libraries = hidden.libraries();
     let kind =
         if kind == ByNameKind::Genre && is_music_library(state, query.filter.parent_id).await? {
             ByNameKind::MusicGenre
@@ -159,10 +158,15 @@ async fn single_of(
     )
     .await?;
     let hidden = HiddenItems::for_caller(state, claims).await?;
-    let entry =
-        repo_by_name::get_by_name_hiding(&state.db_ro, kind, name, hidden.stored_ids().clone())
-            .await?
-            .ok_or_else(|| ApiError::NotFound(format!("{} not found", kind.as_str())))?;
+    let entry = repo_by_name::get_by_name_hiding(
+        &state.db_ro,
+        kind,
+        name,
+        hidden.stored_ids().clone(),
+        hidden.libraries(),
+    )
+    .await?
+    .ok_or_else(|| ApiError::NotFound(format!("{} not found", kind.as_str())))?;
     Ok(Json(ByNameDto::new(entry, state.server_id.as_str(), true)))
 }
 
@@ -203,6 +207,7 @@ impl ListQuery {
             start_index: count_param(params, "StartIndex")?.unwrap_or(0),
             limit: count_param(params, "Limit")?,
             hidden_items: Default::default(),
+            libraries: None,
         };
         Ok(Self {
             filter,

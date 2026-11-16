@@ -163,6 +163,17 @@ pub async fn session_ids(
     .await
 }
 
+/// The device id of each session `user_id` has, one entry per session.
+pub async fn session_device_ids(
+    pool: &SqlitePool,
+    user_id: Uuid,
+) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar("SELECT COALESCE(device_id, '') FROM sessions WHERE user_id = ?1")
+        .bind(user_id.to_string())
+        .fetch_all(pool)
+        .await
+}
+
 /// Marks the session active now.
 pub async fn touch_session(pool: &SqlitePool, session_id: &str) -> Result<(), sqlx::Error> {
     sqlx::query("UPDATE sessions SET last_activity = datetime('now') WHERE id = ?1")

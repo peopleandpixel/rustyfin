@@ -20,6 +20,8 @@ fn normalize_fts_query(query: &str) -> String {
 /// these.
 pub struct HintCandidate {
     pub id: Uuid,
+    /// The library the item is in; nil when the stored id doesn't parse.
+    pub library_id: Uuid,
     pub name: String,
     /// The `media_type` as stored. It may be a name that is not a `BaseItemKind`.
     pub kind: String,
@@ -61,7 +63,7 @@ fn is_fts_query_error(e: &sqlx::Error) -> bool {
 /// item itself. `UNION` (not `UNION ALL`) ends a walk that runs into a cycle of parents.
 const HINT_FTS_SQL: &str =
     "SELECT m.id, m.name, m.media_type, m.production_year, m.runtime_ticks, m.tags,
-            m.index_number, m.parent_index_number, m.end_date, m.status
+            m.index_number, m.parent_index_number, m.end_date, m.status, m.library_id
      FROM media_items m
      JOIN media_items_fts f ON f.rowid = m.rowid
      WHERE media_items_fts MATCH ?1
@@ -71,12 +73,13 @@ const HINT_FTS_SQL: &str =
                 UNION
                 SELECT c.id FROM media_items c JOIN below b ON c.parent_id = b.id
             )
-            SELECT id FROM below)))";
+            SELECT id FROM below)))
+       AND (?3 IS NULL OR m.library_id IN (SELECT value FROM json_each(?3)))";
 
 /// The LIKE fallback of `HINT_FTS_SQL`. `?1` is the `query%` prefix pattern.
 const HINT_LIKE_SQL: &str =
     "SELECT m.id, m.name, m.media_type, m.production_year, m.runtime_ticks, m.tags,
-            m.index_number, m.parent_index_number, m.end_date, m.status
+            m.index_number, m.parent_index_number, m.end_date, m.status, m.library_id
      FROM media_items m
      WHERE m.name LIKE ?1
        AND (?2 IS NULL OR m.library_id = ?2 OR (m.id <> ?2 AND m.id IN (
@@ -85,7 +88,8 @@ const HINT_LIKE_SQL: &str =
                 UNION
                 SELECT c.id FROM media_items c JOIN below b ON c.parent_id = b.id
             )
-            SELECT id FROM below)))";
+            SELECT id FROM below)))
+       AND (?3 IS NULL OR m.library_id IN (SELECT value FROM json_each(?3)))";
 
 type HintRow = (
     String,
@@ -98,21 +102,26 @@ type HintRow = (
     Option<i32>,
     Option<String>,
     Option<String>,
+    String,
 );
 
 /// Every library item that a hints search for `term` (trimmed) matches inside `parent`. The match
 /// is FTS5 over the names, overviews and genres, with the name prefix as the fallback when FTS5
 /// rejects the query. The result is neither ordered nor limited.
+/// The items whose name matches `term`, under `parent` when given, and in one of `libraries` (a
+/// JSON array of library ids) when given.
 pub async fn hint_candidates(
     pool: &SqlitePool,
     term: &str,
     parent: Option<Uuid>,
+    libraries: Option<&str>,
 ) -> Result<Vec<HintCandidate>, sqlx::Error> {
     let scope = parent.map(|id| id.to_string());
     let fts_query = normalize_fts_query(term);
     let rows = sqlx::query_as::<_, HintRow>(HINT_FTS_SQL)
         .bind(&fts_query)
         .bind(scope.clone())
+        .bind(libraries)
         .fetch_all(pool)
         .await;
 
@@ -124,6 +133,7 @@ pub async fn hint_candidates(
             sqlx::query_as::<_, HintRow>(HINT_LIKE_SQL)
                 .bind(&like_prefix)
                 .bind(scope)
+                .bind(libraries)
                 .fetch_all(pool)
                 .await?
         }
@@ -144,9 +154,11 @@ pub async fn hint_candidates(
                 parent_index_number,
                 end_date,
                 status,
+                library_id,
             )| {
                 Some(HintCandidate {
                     id: Uuid::parse_str(&id).ok()?,
+                    library_id: Uuid::parse_str(&library_id).unwrap_or_default(),
                     name,
                     kind,
                     tags: split_tags(tags.as_deref()),
@@ -361,7 +373,9 @@ mod tests {
     #[tokio::test]
     async fn test_search_hints_empty() {
         let pool = crate::test_pool().await;
-        let hints = hint_candidates(&pool, "nonexistent", None).await.unwrap();
+        let hints = hint_candidates(&pool, "nonexistent", None, None)
+            .await
+            .unwrap();
         assert!(hints.is_empty());
     }
 
