@@ -373,8 +373,15 @@ async fn enrich_item(
             .map(|(name, url)| rustyfin_model::media::ExternalUrl { name, url })
             .collect();
         item.trailer_count = Some(item.remote_trailers.len() as i32);
-        item.local_trailer_count = Some(0);
     }
+    // The local trailers and special features (extras).
+    let (trailers, specials) = rustyfin_db::repo_extras::extra_counts(pool, &[item.id.to_string()])
+        .await
+        .ok()
+        .and_then(|counts| counts.into_values().next())
+        .unwrap_or_default();
+    item.local_trailer_count = Some(trailers);
+    item.special_feature_count = Some(specials);
 
     // Parallel queries: images, chapters, trickplay, user_data, people, studios
     // These are independent and can run concurrently instead of sequentially.
@@ -1803,6 +1810,20 @@ pub(crate) async fn enrich_items_with(
         }
     }
 
+    // The local trailers and special features (extras), in one query.
+    let ids: Vec<String> = items.iter().map(|item| item.id.to_string()).collect();
+    let counts = rustyfin_db::repo_extras::extra_counts(pool, &ids)
+        .await
+        .unwrap_or_default();
+    for item in items.iter_mut() {
+        let (trailers, specials) = counts
+            .get(&item.id.to_string())
+            .copied()
+            .unwrap_or_default();
+        item.local_trailer_count = Some(trailers);
+        item.special_feature_count = Some(specials);
+    }
+
     for item in items.iter_mut() {
         images.apply(item);
     }
@@ -1822,8 +1843,18 @@ pub fn routes() -> Router<AppState> {
         .route("/Items/Filters2", get(get_filters2))
         .route("/Items/{id}/Intros", get(get_intros))
         .route("/Items/{id}/ThemeMedia", get(get_theme_media))
-        .route("/Items/{id}/ThemeSongs", get(get_theme_list))
-        .route("/Items/{id}/ThemeVideos", get(get_theme_list))
+        .route("/Items/{id}/ThemeSongs", get(get_theme_songs))
+        .route("/Items/{id}/ThemeVideos", get(get_theme_videos))
+        .route("/Items/{id}/LocalTrailers", get(get_local_trailers))
+        .route("/Items/{id}/SpecialFeatures", get(get_special_features))
+        .route(
+            "/Users/{userId}/Items/{itemId}/LocalTrailers",
+            get(get_user_local_trailers),
+        )
+        .route(
+            "/Users/{userId}/Items/{itemId}/SpecialFeatures",
+            get(get_user_special_features),
+        )
         .route("/Users/{userId}/Items/{itemId}", get(get_user_item))
         .route("/Users/{userId}/Items/{itemId}/Intros", get(get_intros))
         .route("/Users/{userId}/Items", get(get_user_items))
@@ -2811,28 +2842,185 @@ async fn get_intros() -> Json<Value> {
     Json(empty_result())
 }
 
-/// An empty `ThemeMediaResult` for `id`.
-fn empty_theme_result(id: Uuid) -> Value {
+/// The extra types that Jellyfin lists as special features (`BaseItem.DisplayExtraTypes`).
+const SPECIAL_FEATURE_TYPES: &[&str] = &[
+    "Unknown",
+    "BehindTheScenes",
+    "Clip",
+    "DeletedScene",
+    "Interview",
+    "Sample",
+    "Scene",
+    "Featurette",
+    "Short",
+];
+
+/// The extras of `owner` with one of `types`, as full items for `user_id`, each with its `ExtraType`.
+async fn extra_items(
+    state: &AppState,
+    owner: Uuid,
+    user_id: Uuid,
+    types: &[&str],
+) -> Result<Vec<MediaItem>, ApiError> {
+    let extras = rustyfin_db::repo_extras::extras_of(&state.db_ro, owner, types).await?;
+    let mut items = Vec::with_capacity(extras.len());
+    for (id, extra_type) in extras {
+        if let Some(mut item) = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, id).await? {
+            item.extra_type = Some(extra_type);
+            items.push(item);
+        }
+    }
+    let tmdb = state.tmdb.api(None);
+    enrich_items(
+        &state.db_ro,
+        &state.server_id,
+        Some(user_id),
+        &mut items,
+        &state.http_client,
+        tmdb.as_ref(),
+        &state.data_dir,
+        true,
+    )
+    .await;
+    for item in &mut items {
+        item.media_sources =
+            rustyfin_db::repo_media_source::get_media_sources(&state.db_ro, &item.id).await?;
+    }
+    Ok(items)
+}
+
+/// 404 unless `id` is an item.
+async fn require_item(state: &AppState, id: Uuid) -> Result<MediaItem, ApiError> {
+    rustyfin_db::repo_media::get_item_by_id(&state.db_ro, id)
+        .await?
+        .ok_or(ApiError::NotFound("Item not found".into()))
+}
+
+/// GET /Items/{id}/LocalTrailers: the item's trailer files, a bare array as in Jellyfin.
+async fn get_local_trailers(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<Vec<MediaItem>>, ApiError> {
+    require_item(&state, id).await?;
+    Ok(Json(
+        extra_items(&state, id, claims.sub, &["Trailer"]).await?,
+    ))
+}
+
+/// GET /Users/{userId}/Items/{itemId}/LocalTrailers.
+async fn get_user_local_trailers(
+    state: State<AppState>,
+    Path((_user, id)): Path<(Uuid, Uuid)>,
+    claims: Extension<Claims>,
+) -> Result<Json<Vec<MediaItem>>, ApiError> {
+    get_local_trailers(state, Path(id), claims).await
+}
+
+/// GET /Items/{id}/SpecialFeatures: the item's special features (behind the scenes, featurettes, deleted
+/// scenes and the other extras that are not trailers or themes), a bare array as in Jellyfin.
+async fn get_special_features(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<Vec<MediaItem>>, ApiError> {
+    require_item(&state, id).await?;
+    Ok(Json(
+        extra_items(&state, id, claims.sub, SPECIAL_FEATURE_TYPES).await?,
+    ))
+}
+
+/// GET /Users/{userId}/Items/{itemId}/SpecialFeatures.
+async fn get_user_special_features(
+    state: State<AppState>,
+    Path((_user, id)): Path<(Uuid, Uuid)>,
+    claims: Extension<Claims>,
+) -> Result<Json<Vec<MediaItem>>, ApiError> {
+    get_special_features(state, Path(id), claims).await
+}
+
+/// A `ThemeMediaResult`: the theme items of `owner`.
+fn theme_result(owner: Uuid, items: Vec<MediaItem>) -> Value {
     json!({
-        "Items": [],
-        "TotalRecordCount": 0,
+        "TotalRecordCount": items.len(),
+        "Items": items,
         "StartIndex": 0,
-        "OwnerId": id.simple().to_string(),
+        "OwnerId": owner.simple().to_string(),
     })
 }
 
-/// GET /Items/{id}/ThemeMedia: Rustyfin has no theme songs or videos.
-async fn get_theme_media(Path(id): Path<Uuid>) -> Json<Value> {
-    Json(json!({
-        "ThemeVideosResult": empty_theme_result(id),
-        "ThemeSongsResult": empty_theme_result(id),
-        "SoundtrackSongsResult": empty_theme_result(id),
-    }))
+/// The theme items (`ThemeSong` or `ThemeVideo`) of `id`, with their owner. With `inherit`, an item with none
+/// takes those of the nearest item above it (an episode its season's or series', as Jellyfin's
+/// `inheritFromParent`); the owner is `id` when none has any.
+async fn theme_items(
+    state: &AppState,
+    id: Uuid,
+    user_id: Uuid,
+    kind: &str,
+    inherit: bool,
+) -> Result<(Uuid, Vec<MediaItem>), ApiError> {
+    let item = require_item(state, id).await?;
+    let mut owner = Some(item.id);
+    // A parent chain is a few levels deep; the cap stops a cycle in bad data.
+    for _ in 0..8 {
+        let Some(current) = owner else { break };
+        let items = extra_items(state, current, user_id, &[kind]).await?;
+        if !items.is_empty() {
+            return Ok((current, items));
+        }
+        if !inherit {
+            break;
+        }
+        owner = rustyfin_db::repo_media::get_item_parent_id(&state.db_ro, current).await?;
+    }
+    Ok((id, Vec::new()))
 }
 
-/// GET /Items/{id}/ThemeSongs and /Items/{id}/ThemeVideos.
-async fn get_theme_list(Path(id): Path<Uuid>) -> Json<Value> {
-    Json(empty_theme_result(id))
+/// Whether `inheritFromParent` is true.
+fn inherits(params: &[(String, String)]) -> bool {
+    crate::query::first_value(params, "inheritFromParent")
+        .is_some_and(|v| v.eq_ignore_ascii_case("true"))
+}
+
+/// GET /Items/{id}/ThemeMedia: the item's theme songs and videos. Rustyfin has no soundtrack songs.
+async fn get_theme_media(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Extension(claims): Extension<Claims>,
+    Query(params): Query<Vec<(String, String)>>,
+) -> Result<Json<Value>, ApiError> {
+    let inherit = inherits(&params);
+    let (video_owner, videos) = theme_items(&state, id, claims.sub, "ThemeVideo", inherit).await?;
+    let (song_owner, songs) = theme_items(&state, id, claims.sub, "ThemeSong", inherit).await?;
+    Ok(Json(json!({
+        "ThemeVideosResult": theme_result(video_owner, videos),
+        "ThemeSongsResult": theme_result(song_owner, songs),
+        "SoundtrackSongsResult": theme_result(id, Vec::new()),
+    })))
+}
+
+/// GET /Items/{id}/ThemeSongs.
+async fn get_theme_songs(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Extension(claims): Extension<Claims>,
+    Query(params): Query<Vec<(String, String)>>,
+) -> Result<Json<Value>, ApiError> {
+    let (owner, items) =
+        theme_items(&state, id, claims.sub, "ThemeSong", inherits(&params)).await?;
+    Ok(Json(theme_result(owner, items)))
+}
+
+/// GET /Items/{id}/ThemeVideos.
+async fn get_theme_videos(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Extension(claims): Extension<Claims>,
+    Query(params): Query<Vec<(String, String)>>,
+) -> Result<Json<Value>, ApiError> {
+    let (owner, items) =
+        theme_items(&state, id, claims.sub, "ThemeVideo", inherits(&params)).await?;
+    Ok(Json(theme_result(owner, items)))
 }
 
 async fn delete_item(

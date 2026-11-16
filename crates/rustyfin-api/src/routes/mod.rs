@@ -41,6 +41,7 @@ mod users;
 pub(crate) mod websocket;
 
 pub use startup::{StartupOwner, settle_owner_at_startup};
+pub use system::{RESTART_EXIT_CODE, exit_code};
 
 use axum::Router;
 use axum::middleware as axum_mw;

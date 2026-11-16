@@ -12,6 +12,7 @@ import {
 import { renderSearch } from './search.js';
 import { playWithResumeChoice, stopPlayback, playItem, playerAutoHide, onPlayerClosed } from './player.js';
 import { playContainer } from './queue.js';
+import { stopThemeSong } from './theme-media.js';
 import {
     openCardMenu, toggleCardPlayed, toggleCardFavorite, setCardLikes, playCardItem, openAddTo,
 } from './cardmenu.js';
@@ -28,6 +29,7 @@ import {
 } from './library-admin.js';
 import { openPluginConfig, openPluginPriority } from './plugins.js';
 import { savePlaybackSettings } from './playback-admin.js';
+import { serverPower, openLibraryEditor, removeLibraryFolder, openTriggerEditor, removeTaskTrigger } from './dashboard.js';
 import {
     openUserEditor, closeUserEditor, showUserEditorTab, addUserEditorTag, removeUserEditorTag, addUserEditorSchedule,
     removeUserEditorSchedule, saveUserEditor, setUserEditorPassword,
@@ -45,6 +47,8 @@ function navigate(page, data, { fromHistory = false } = {}) {
     libraryRemember();
     if (page !== 'library') stopLibraryLoad();
     libraryRestore = fromHistory && page === 'library';
+    // A theme song plays only on item pages; the next item page keeps or replaces it
+    if (page !== 'detail') stopThemeSong();
     document.querySelectorAll('[id^="page-"]').forEach(el => el.classList.add('hidden'));
     const el = $('page-' + page);
     if (el) {
@@ -195,6 +199,13 @@ const clickActions = {
     'delete-library': el => deleteLibraryFromAdmin(el.dataset.id),
     'toggle-realtime-monitor': el => toggleRealtimeMonitor(el),
     'library-options': el => openLibraryOptions(el.dataset.id, el.dataset.name),
+    // The dashboard's server pieces (dashboard.js)
+    'server-restart': () => serverPower('restart'),
+    'server-shutdown': () => serverPower('shutdown'),
+    'edit-library': el => openLibraryEditor(el.dataset.id),
+    'library-remove-path': el => removeLibraryFolder(el.dataset.path),
+    'edit-triggers': el => openTriggerEditor(el.dataset.id),
+    'task-remove-trigger': el => removeTaskTrigger(Number(el.dataset.index)),
     'start-task': el => startTaskAction(el.dataset.id, el.dataset.name),
     'stop-task': el => stopTaskAction(el.dataset.id, el.dataset.name),
     'browse-path': el => openFolderBrowser(el.closest('.path-field').querySelector('[data-path-field]')),

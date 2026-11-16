@@ -30,6 +30,27 @@ function lastSeen(date) {
     return rtf.format(Math.round(secs / 3600), 'hour');
 }
 
+// Jellyfin's TranscodeReasons name in words: "VideoCodecNotSupported" reads "Video codec not supported"
+function reasonText(reason) {
+    const words = String(reason).replace(/([a-z0-9])([A-Z])/g, '$1 $2').toLowerCase();
+    return words.charAt(0).toUpperCase() + words.slice(1);
+}
+
+// What a transcode does and why, from the session's TranscodingInfo: the codecs (or Direct) and the reasons
+function transcodeDetails(info) {
+    if (!info) return '';
+    const video = info.IsVideoDirect ? t('remote.direct') : (info.VideoCodec || '').toUpperCase();
+    const audio = info.IsAudioDirect ? t('remote.direct') : [(info.AudioCodec || '').toUpperCase(), info.AudioChannels ? `${info.AudioChannels}ch` : ''].filter(Boolean).join(' ');
+    const parts = [];
+    if (video) parts.push(`${t('remote.video')}: ${video}`);
+    if (audio) parts.push(`${t('remote.audio')}: ${audio}`);
+    if (info.HardwareAccelerationType) parts.push(info.HardwareAccelerationType.toUpperCase());
+    const reasons = (info.TranscodeReasons || []).map(reasonText);
+    return `
+            ${parts.length ? `<p class="text-white/50 text-[11px]" data-transcode-codecs>${escapeHtml(parts.join(' · '))}</p>` : ''}
+            ${reasons.length ? `<p class="text-amber-300/80 text-[11px]" data-transcode-reasons>${escapeHtml(reasons.join(', '))}</p>` : ''}`;
+}
+
 function controlButton(id, action, label, iconName) {
     return `<button type="button" class="jf-icon-btn !w-8 !h-8" title="${escapeHtml(label)}" aria-label="${escapeHtml(label)}"
         onclick="sessionControl('${escapeHtml(id)}', '${action}')">${icon(iconName, { size: 16, class: 'w-4 h-4' })}</button>`;
@@ -51,7 +72,8 @@ function sessionCard(s) {
             <div class="h-1 rounded bg-white/10 my-1.5" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.round(pct)}">
                 <div class="h-1 rounded bg-[#00a4dc]" style="width:${pct.toFixed(1)}%"></div>
             </div>
-            <p class="text-white/50 text-[11px]">${formatDurationSeconds(pos)}${total > 0 ? ' / ' + formatDurationSeconds(total) : ''}${method ? ' · ' + escapeHtml(method) : ''}</p>`;
+            <p class="text-white/50 text-[11px]">${formatDurationSeconds(pos)}${total > 0 ? ' / ' + formatDurationSeconds(total) : ''}${method ? ' · ' + escapeHtml(method) : ''}</p>
+            ${ps.PlayMethod === 'Transcode' ? transcodeDetails(s.TranscodingInfo) : ''}`;
     }
     const controls = [];
     if (item && s.SupportsMediaControl) {

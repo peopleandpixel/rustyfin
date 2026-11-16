@@ -559,7 +559,7 @@ pub async fn get_items_by_library(
          premiere_date, runtime_ticks, index_number, parent_index_number, index_number_end, location_type, tmdb_id, tvdb_id, \
          tags, status, original_language, tagline, production_countries, budget, revenue, \
          homepage, end_date, vote_count, popularity \
-         FROM media_items WHERE library_id = ? ORDER BY sort_name, name",
+         FROM media_items WHERE library_id = ? AND extra_type IS NULL ORDER BY sort_name, name",
     )
     .bind(library_id.to_string())
     .fetch_all(pool)
@@ -637,10 +637,19 @@ pub async fn count_children(pool: &SqlitePool, parent_id: Uuid) -> Result<i64, s
 /// Deletes the item `id` on `conn`, which the caller holds in a write transaction. It does not
 /// check for child items. These references to media_items have no ON DELETE CASCADE, so they go
 /// first. Returns whether the media_items row existed.
+///
+/// The item's extras (the trailers, special features and themes it owns) are detached, not deleted:
+/// their files are still there (no delete removes a file), so they lose their owner and stay out of
+/// the listings until the next scan gives them an owner again or reads them as library items. An
+/// extra whose own file is gone is removed by the scan, as any item is.
 pub async fn delete_item_rows_in(
     conn: &mut SqliteConnection,
     id: &str,
 ) -> Result<bool, sqlx::Error> {
+    sqlx::query("UPDATE media_items SET owner_id = NULL WHERE owner_id = ?1")
+        .bind(id)
+        .execute(&mut *conn)
+        .await?;
     sqlx::query("DELETE FROM pinned_episodes WHERE series_id=?1 OR episode_id=?1 OR season_id=?1")
         .bind(id)
         .execute(&mut *conn)
@@ -715,6 +724,7 @@ pub async fn get_latest_items(
          FROM media_items \
          WHERE (?1 IS NULL OR media_type = ?1) \
          AND (?2 IS NULL OR library_id = ?2) \
+         AND extra_type IS NULL \
          AND {visible} \
          ORDER BY date_created DESC LIMIT ?3",
         visible = crate::repo_parental::visible_sql("id", "library_id", "?4"),
@@ -1224,7 +1234,8 @@ fn build_filtered_query(
     // Uses (? IS NULL OR ? = '' OR col = ?) pattern so the query string is always identical.
     // ParentId (binds: pid, pid, recursive, pid, pid, recursive, pid, pid, pid), as in Jellyfin:
     // recursive gives every item of a library or every descendant of an item; otherwise a
-    // library's top-level items or an item's children.
+    // library's top-level items or an item's children. Extras (trailers, special features, theme
+    // media) are left out unless they are asked for by id, as in Jellyfin.
     let base_where = "
         (? IS NULL OR ? = ''
          OR (? = 1 AND (library_id = ? OR id IN (
@@ -1244,7 +1255,7 @@ fn build_filtered_query(
         AND (? IS NULL OR ? = '' OR date_created >= ?)
         AND (? IS NULL OR runtime_ticks >= ?)
         AND (? IS NULL OR runtime_ticks <= ?)
-        AND (? IS NULL OR id IN (SELECT value FROM json_each(?)))
+        AND ((? IS NULL AND extra_type IS NULL) OR id IN (SELECT value FROM json_each(?)))
         AND (? IS NULL OR (id NOT IN (SELECT value FROM json_each(?, '$.h'))
              AND (json_type(?, '$.l') IS NOT 'array' OR library_id IN (SELECT value FROM json_each(?, '$.l')))))
     ";
@@ -1710,7 +1721,7 @@ pub async fn get_similar_items(
          tags, status, original_language, tagline, production_countries, budget, revenue, \
          homepage, end_date, vote_count, popularity \
          FROM media_items \
-         WHERE media_type = ? AND id != ? AND library_id = ? \
+         WHERE media_type = ? AND id != ? AND library_id = ? AND extra_type IS NULL \
          LIMIT 200",
     )
     .bind(&media_type)
@@ -1814,7 +1825,7 @@ pub async fn get_similar_items(
     if scored.is_empty() {
         // Fallback: random items of the same media type if no scored items
         let total: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM media_items WHERE media_type = ? AND id != ? AND library_id = ?",
+            "SELECT COUNT(*) FROM media_items WHERE media_type = ? AND id != ? AND library_id = ? AND extra_type IS NULL",
         )
         .bind(&media_type)
         .bind(item.id.to_string())
@@ -1833,7 +1844,7 @@ pub async fn get_similar_items(
              premiere_date, runtime_ticks, index_number, parent_index_number, index_number_end, location_type, tmdb_id, tvdb_id, \
              tags, status, original_language, tagline, production_countries, budget, revenue, \
              homepage, end_date, vote_count, popularity \
-             FROM media_items WHERE media_type = ? AND id != ? AND library_id = ? \
+             FROM media_items WHERE media_type = ? AND id != ? AND library_id = ? AND extra_type IS NULL \
              ORDER BY ROWID LIMIT ? OFFSET ?",
         )
         .bind(&media_type)
@@ -2563,7 +2574,7 @@ pub async fn get_user_resume_items(
     // ?5 the hidden ids (NULL for none).
     let from = "FROM media_items m \
          INNER JOIN user_item_data u ON u.item_id = m.id AND u.user_id = ?1 \
-         WHERE u.playback_position_ticks > 0 \
+         WHERE u.playback_position_ticks > 0 AND m.extra_type IS NULL \
          AND (?2 IS NULL OR m.library_id = ?2 OR m.parent_id = ?2 \
               OR m.parent_id IN (SELECT id FROM media_items WHERE parent_id = ?2)) \
          AND (json_array_length(?3) = 0 OR m.media_type IN (SELECT value FROM json_each(?3))) \

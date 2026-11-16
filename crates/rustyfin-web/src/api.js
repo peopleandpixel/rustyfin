@@ -416,6 +416,10 @@ const API = {
         return this.cachedGet(`/Items/${id}/Children?${q.toString()}`);
     },
     getSimilar(id) { return this.cachedGet(`/Items/${id}/Similar`); },
+    // An item's extras: trailer files, special features (bare arrays) and theme songs (a ThemeMediaResult)
+    getLocalTrailers(id) { return this.cachedGet(`/Items/${id}/LocalTrailers`); },
+    getSpecialFeatures(id) { return this.cachedGet(`/Items/${id}/SpecialFeatures`); },
+    getThemeSongs(id) { return this.get(`/Items/${id}/ThemeSongs?inheritFromParent=true`); },
     getLatest(limit = 20) { return this.cachedGet(`/Items/Latest?Limit=${limit}`); },
     getResume(limit = 12) { return this.cachedGet(`/Items/Resume?Limit=${limit}`); },
     getNextUp(limit = 12) { return this.cachedGet(`/Shows/NextUp?Limit=${limit}`); },

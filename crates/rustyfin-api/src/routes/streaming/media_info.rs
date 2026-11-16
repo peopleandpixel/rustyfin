@@ -8,7 +8,7 @@ use axum::extract::{Path, State};
 use axum::routing::get;
 use axum::{Extension, Json};
 use rustyfin_core::stream_builder::{
-    DeviceData, MediaKind, SourceFacts, StreamRequest, device_data,
+    DeviceData, MediaKind, SourceFacts, StreamRequest, SubtitleMode, device_data,
 };
 use rustyfin_model::auth::Claims;
 use rustyfin_model::device_profile::{DeviceProfile, ProfileError, SubtitleDeliveryMethod};
@@ -174,20 +174,32 @@ async fn playback_info(
     // SetDefaultAudioAndSubtitleStreamIndices makes them the sources' defaults
     let (remembered_audio, remembered_subtitle) =
         super::remembered_choices(state, claims.sub, item_id).await?;
+    // The caller's track settings, which pick a video's default tracks otherwise
+    let preferences = super::track_preferences(state, claims.sub).await?;
 
     let play_session_id = Uuid::new_v4().simple().to_string();
     let mut media_sources = Vec::with_capacity(chosen.len());
+    let mut reasons = Vec::new();
     for index in chosen {
         let mut source = sources[index].clone();
         let audio_stream_index = dto.audio_stream_index.or_else(|| {
             let choice = remembered_audio.as_ref()?;
             super::remembered_stream(&source, "Audio", choice)
         });
+        // A remembered subtitle counts unless subtitles are off, and under "only forced" only
+        // when it is off or a forced stream, as in Jellyfin
         let subtitle_stream_index = dto.subtitle_stream_index.or_else(|| {
             let choice = remembered_subtitle.as_ref()?;
-            match choice.index {
-                -1 => Some(-1),
-                _ => super::remembered_stream(&source, "Subtitle", choice),
+            match preferences.subtitle_mode {
+                SubtitleMode::None => None,
+                _ if choice.index == -1 => Some(-1),
+                mode => super::remembered_stream(&source, "Subtitle", choice).filter(|&index| {
+                    mode != SubtitleMode::OnlyForced
+                        || source
+                            .media_streams
+                            .iter()
+                            .any(|s| s.index == index && s.is_forced)
+                }),
             }
         });
         // The loader's flags are a placeholder; the device data below decides them when present
@@ -224,7 +236,19 @@ async fn playback_info(
                     play_session_id: play_session_id.clone(),
                     access_token: token.unwrap_or_default().to_string(),
                 };
-                let data = device_data(&SourceFacts::from(&source), profile, &request);
+                let mut facts = SourceFacts::from(&source);
+                if kind == MediaKind::Video {
+                    facts.apply_preferences(&preferences);
+                }
+                let data = device_data(&facts, profile, &request);
+                reasons.push((
+                    source.id.clone(),
+                    data.transcode_reasons
+                        .names()
+                        .into_iter()
+                        .map(String::from)
+                        .collect(),
+                ));
                 patch_source(&source, &data)
             }
         };
@@ -232,6 +256,10 @@ async fn playback_info(
             .push(value.map_err(|e| ApiError::Internal(format!("Serialization error: {e}")))?);
     }
 
+    // The dashboard's sessions show why a playback transcodes
+    state
+        .transcode_manager
+        .note_reasons(&play_session_id, reasons);
     Ok(ItemsPlaybackInfoResponse {
         media_sources,
         play_session_id: Some(play_session_id),

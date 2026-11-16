@@ -48,6 +48,52 @@ pub async fn delete_item_in(conn: &mut SqliteConnection, id: &str) -> Result<boo
     Ok(true)
 }
 
+/// Deletes the items of the library `library_id` under `folder` (a folder taken out of the
+/// library) that no folder in `kept` holds, with their user data. A scan never reaches them, as
+/// it prunes only under the library's folders. Children go before their parents. Returns how
+/// many were deleted.
+pub async fn remove_items_under(
+    pool: &SqlitePool,
+    library_id: Uuid,
+    folder: &str,
+    kept: &[String],
+) -> Result<u32, sqlx::Error> {
+    let under = |path: &str, root: &str| {
+        let root = root.trim_end_matches('/');
+        path == root || path.starts_with(&format!("{root}/"))
+    };
+    let root = folder.trim_end_matches('/');
+    let mut removed = 0;
+    loop {
+        // The items with no children left, under the folder
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT id, path FROM media_items m WHERE library_id = ?1 \
+             AND (path = ?2 OR substr(path, 1, length(?3)) = ?3) \
+             AND NOT EXISTS (SELECT 1 FROM media_items c WHERE c.parent_id = m.id)",
+        )
+        .bind(library_id.to_string())
+        .bind(root)
+        .bind(format!("{root}/"))
+        .fetch_all(pool)
+        .await?;
+        let gone: Vec<String> = rows
+            .into_iter()
+            .filter(|(_, path)| under(path, folder) && !kept.iter().any(|k| under(path, k)))
+            .map(|(id, _)| id)
+            .collect();
+        let mut deleted = 0;
+        for id in &gone {
+            if delete_item(pool, id).await? {
+                deleted += 1;
+            }
+        }
+        removed += deleted;
+        if deleted == 0 {
+            return Ok(removed);
+        }
+    }
+}
+
 /// Deletes the items of `library` whose path is in `scope` that the scan did not collect, and returns how
 /// many were deleted. `PathScope::All` covers the whole library.
 ///
@@ -79,7 +125,8 @@ pub async fn remove_not_collected(
     let mut parents: HashSet<String> = HashSet::new();
     let mut removed = 0;
 
-    for (id, parent_id, verdict) in judge_in_scope(pool, library, scope, &mut removal).await? {
+    for (id, parent_id, verdict) in judge_in_scope(pool, library, scope, &mut removal, true).await?
+    {
         match verdict {
             Verdict::Keep => {}
             Verdict::Unlisted(root) => {
@@ -336,14 +383,27 @@ async fn judge_in_scope(
     library: &Library,
     scope: &PathScope,
     removal: &mut Removal<'_>,
+    with_extras: bool,
 ) -> Result<Vec<(String, Option<String>, Verdict)>, sqlx::Error> {
     let library_id = library.id.to_string();
     let mut judged = Vec::new();
-    for &media_type in scanned_types(&library.content_type) {
+    // The library's own items by type, then (`with_extras`) its extras, whatever their type. `?2` NULL
+    // picks the extras.
+    let mut kinds: Vec<Option<&str>> = scanned_types(&library.content_type)
+        .iter()
+        .map(|&media_type| Some(media_type))
+        .collect();
+    if with_extras {
+        kinds.push(None);
+    }
+    for media_type in kinds {
         let rows: Vec<(String, String, Option<String>)> =
             sqlx::query_as(sqlx::AssertSqlSafe(format!(
                 "SELECT id, path, parent_id FROM media_items
-                 WHERE library_id = ?1 AND media_type = ?2 AND {}",
+                 WHERE library_id = ?1
+                   AND ((?2 IS NULL AND extra_type IS NOT NULL)
+                        OR (media_type = ?2 AND extra_type IS NULL))
+                   AND {}",
                 scope.sql("path", 3)
             )))
             .bind(library_id.as_str())
@@ -371,7 +431,7 @@ pub async fn gone_items(
     loops: &[PathBuf],
 ) -> Result<HashSet<String>, sqlx::Error> {
     let mut removal = Removal::new(library, collected, unreadable, loops);
-    Ok(judge_in_scope(pool, library, scope, &mut removal)
+    Ok(judge_in_scope(pool, library, scope, &mut removal, false)
         .await?
         .into_iter()
         .filter(|(_, _, verdict)| *verdict == Verdict::Gone)

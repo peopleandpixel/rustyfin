@@ -736,10 +736,37 @@ async fn scan_skips_ignored_dirs_and_files() {
         paths(&fx.pool, &film, "Movie").await,
         [
             "Amadeus (1984)/Amadeus (1984).mkv",
-            "Amadeus (1984)/Featurettes/Making Of.mkv",
             "Argo (2012)/Argo (2012).mkv",
             "Sample Movie (2010)/Sample Movie (2010).mkv",
         ]
+    );
+    // `Featurettes/` next to a movie holds its extras, as in Jellyfin: not a library item, but Amadeus's.
+    let owned: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT e.path, e.extra_type, o.path FROM media_items e \
+         JOIN media_items o ON o.id = e.owner_id WHERE e.library_id = ?",
+    )
+    .bind(film.id.to_string())
+    .fetch_all(&fx.pool)
+    .await
+    .unwrap();
+    let film_root = root_of(&film);
+    let rel = |p: &str| {
+        Path::new(p)
+            .strip_prefix(&film_root)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    };
+    assert_eq!(
+        owned
+            .iter()
+            .map(|(e, kind, o)| (rel(e), kind.clone(), rel(o)))
+            .collect::<Vec<_>>(),
+        [(
+            "Amadeus (1984)/Featurettes/Making Of.mkv".to_string(),
+            "Featurette".to_string(),
+            "Amadeus (1984)/Amadeus (1984).mkv".to_string(),
+        )]
     );
     assert_eq!(
         paths(&fx.pool, &tv, "Episode").await,

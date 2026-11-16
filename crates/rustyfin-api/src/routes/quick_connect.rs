@@ -46,9 +46,23 @@ pub fn routes() -> Router<AppState> {
     Router::new().route("/QuickConnect/Authorize", post(authorize))
 }
 
-/// `GET /QuickConnect/Enabled` – whether Quick Connect is enabled.
-async fn quick_connect_enabled() -> Json<bool> {
-    Json(true)
+/// Whether the server's `QuickConnectAvailable` turns Quick Connect on.
+async fn enabled(state: &AppState) -> bool {
+    state.config.read().await.quick_connect_available
+}
+
+/// Jellyfin's answer while Quick Connect is off: 401.
+async fn require_enabled(state: &AppState) -> Result<(), ApiError> {
+    if enabled(state).await {
+        Ok(())
+    } else {
+        Err(ApiError::Unauthorized)
+    }
+}
+
+/// `GET /QuickConnect/Enabled` – whether Quick Connect is enabled (`QuickConnectAvailable`).
+async fn quick_connect_enabled(State(state): State<AppState>) -> Json<bool> {
+    Json(enabled(&state).await)
 }
 
 /// `POST /QuickConnect/Initiate` – create a new quick connect request. Answers 429 when
@@ -59,6 +73,7 @@ async fn initiate(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Result<Json<QuickConnectResult>, ApiError> {
+    require_enabled(&state).await?;
     let secret = Uuid::new_v4().to_string().replace("-", "");
     let client_key = resolve_client(peer.ip(), &headers, &state.known_proxies).limiter_key();
 
@@ -106,6 +121,7 @@ async fn connect(
     State(state): State<AppState>,
     Query(q): Query<ConnectQuery>,
 ) -> Result<Json<QuickConnectResult>, ApiError> {
+    require_enabled(&state).await?;
     let store = state.quick_connect.read().await;
     let result = store
         .get(&q.secret)
@@ -145,6 +161,7 @@ async fn authorize(
     Extension(claims): Extension<Claims>,
     Query(q): Query<AuthorizeQuery>,
 ) -> Result<Json<bool>, ApiError> {
+    require_enabled(&state).await?;
     let client = resolve_client(peer.ip(), &headers, &state.known_proxies);
     let counted = !client.is_exempt();
     let key = client.limiter_key();

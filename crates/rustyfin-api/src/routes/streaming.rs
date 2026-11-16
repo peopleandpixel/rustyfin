@@ -15,7 +15,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use uuid::Uuid;
 
 use crate::error::ApiError;
-use crate::state::{AppState, LibraryRoot};
+use crate::state::{AppState, LibraryRoot, OwnedSet};
 
 mod media_info;
 mod progressive;
@@ -201,11 +201,26 @@ struct OwnedPaths {
 
 impl OwnedPaths {
     /// The two forms of `path`: resolved, when that works, and as configured, made absolute.
-    fn forms(path: &FilePath) -> Vec<std::path::PathBuf> {
-        path.canonicalize()
+    /// A resolve that fails for another reason than a missing file clears `clean`.
+    fn forms(path: &FilePath, clean: &std::cell::Cell<bool>) -> Vec<std::path::PathBuf> {
+        Self::resolved(path, clean)
             .into_iter()
             .chain(std::path::absolute(path))
             .collect()
+    }
+
+    /// `path` resolved. None when it can't be; a failure other than a missing file (a share
+    /// that didn't answer, a permission) clears `clean`.
+    fn resolved(path: &FilePath, clean: &std::cell::Cell<bool>) -> Option<std::path::PathBuf> {
+        match path.canonicalize() {
+            Ok(real) => Some(real),
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    clean.set(false);
+                }
+                None
+            }
+        }
     }
 
     /// `path` with `suffix` added to its file name.
@@ -250,45 +265,99 @@ impl OwnedPaths {
         }
     }
 
-    /// Whether the resolved `target` is one of these owned paths.
+    /// The set `resolve_checked` makes, for tests.
+    #[cfg(test)]
+    fn resolve(&self) -> OwnedSet {
+        self.resolve_checked().0
+    }
+
+    /// Resolves every owned path, which reads the file system: the data dir's forms, each owned
+    /// folder that resolves, and each owned file in each form with its SQLite siblings. Checks
+    /// then compare paths only (`OwnedSet::owns_in`). Also says whether every path resolved or
+    /// was missing: a set with a path that failed otherwise lacks that path's resolved form, so
+    /// it isn't kept (see `owned_set`).
+    fn resolve_checked(&self) -> (OwnedSet, bool) {
+        let clean = std::cell::Cell::new(true);
+        let data_forms = Self::forms(&self.data_dir, &clean);
+        let linked_dirs = data_forms
+            .iter()
+            .flat_map(|data| {
+                let clean = &clean;
+                OWNED_DATA_DIRS.iter().filter_map(move |dir| {
+                    let real = Self::resolved(&data.join(dir), clean)?;
+                    Some((dir.to_string(), real))
+                })
+            })
+            .collect();
+        let mut files = std::collections::HashSet::new();
+        let data_files = OWNED_DATA_FILES.iter().map(|name| self.data_dir.join(name));
+        for file in self.files.iter().cloned().chain(data_files) {
+            files.extend(Self::forms(&file, &clean));
+            let real = Self::resolved(&file, &clean);
+            for suffix in DATABASE_SIBLINGS {
+                files.extend(Self::forms(&Self::with_suffix(&file, suffix), &clean));
+                // SQLite keeps the siblings beside the file a link resolves to
+                if let Some(real) = &real {
+                    files.insert(Self::with_suffix(real, suffix));
+                }
+            }
+        }
+        let set = OwnedSet {
+            data_forms,
+            linked_dirs,
+            files,
+        };
+        (set, clean.get())
+    }
+
+    /// Whether the resolved `target` is one of these owned paths (resolving them first).
+    #[cfg(test)]
+    fn owns(&self, target: &FilePath) -> bool {
+        self.resolve().owns(target)
+    }
+}
+
+/// The owned set to use and whether to keep it: a `fresh` set that resolved cleanly replaces
+/// the kept one; one with a failed path is used only when nothing is kept, and not kept, so the
+/// next request resolves again. The previous set keeps the folders the failed resolve lost.
+fn choose_owned_set(
+    kept: Option<Arc<OwnedSet>>,
+    fresh: OwnedSet,
+    clean: bool,
+) -> (Arc<OwnedSet>, bool) {
+    match kept {
+        Some(kept) if !clean => (kept, false),
+        _ => (Arc::new(fresh), clean),
+    }
+}
+
+impl OwnedSet {
+    /// Whether the resolved `target` is one of these owned paths. No file system read.
     fn owns(&self, target: &FilePath) -> bool {
         self.owns_in(target, &OWNED_DATA_DIRS)
     }
 
     /// Whether the resolved `target` is one of these owned paths, counting only the data-dir
-    /// folders in `dirs` as owned.
+    /// folders in `dirs` as owned. No file system read.
     fn owns_in(&self, target: &FilePath, dirs: &[&str]) -> bool {
-        let data_forms = Self::forms(&self.data_dir);
-        if data_forms
+        if self
+            .data_forms
             .iter()
-            .any(|data| Self::owned_by_name(data, target, dirs))
+            .any(|data| OwnedPaths::owned_by_name(data, target, dirs))
         {
             return true;
         }
         // Owned folders that are links out of the data dir
-        let linked_dir = data_forms.iter().any(|data| {
-            dirs.iter().any(|dir| {
-                data.join(dir)
-                    .canonicalize()
-                    .is_ok_and(|real| target != real && target.starts_with(&real))
-            })
+        let linked_dir = self.linked_dirs.iter().any(|(name, real)| {
+            dirs.iter().any(|dir| dir == name) && target != real && target.starts_with(real)
         });
-        if linked_dir {
-            return true;
-        }
         // Owned files by full path, each as configured and resolved, with its SQLite siblings
-        let data_files = OWNED_DATA_FILES.iter().map(|name| self.data_dir.join(name));
-        self.files.iter().cloned().chain(data_files).any(|file| {
-            let mut candidates = Self::forms(&file);
-            for suffix in DATABASE_SIBLINGS {
-                candidates.extend(Self::forms(&Self::with_suffix(&file, suffix)));
-                // SQLite keeps the siblings beside the file a link resolves to
-                if let Ok(real) = file.canonicalize() {
-                    candidates.push(Self::with_suffix(&real, suffix));
-                }
-            }
-            candidates.iter().any(|candidate| candidate == target)
-        })
+        linked_dir || self.files.contains(target)
+    }
+
+    /// Whether the resolved `target` lies in the data dir.
+    fn in_data_dir(&self, target: &FilePath) -> bool {
+        self.data_forms.iter().any(|data| target.starts_with(data))
     }
 }
 
@@ -327,7 +396,7 @@ fn lexical_normalize(path: &FilePath) -> Option<std::path::PathBuf> {
 fn checked_path(
     file_path: &str,
     roots: &[LibraryRoot],
-    owned: &OwnedPaths,
+    owned: &OwnedSet,
     strict: bool,
 ) -> Option<std::path::PathBuf> {
     let raw = FilePath::new(file_path);
@@ -335,6 +404,15 @@ fn checked_path(
         return None;
     }
     let canonical = raw.canonicalize().ok()?;
+    if !in_roots(raw, &canonical, roots, strict) || owned.owns(&canonical) {
+        return None;
+    }
+    Some(canonical)
+}
+
+/// Whether a file at `raw`, resolved to `canonical`, lies in one of the libraries at `roots`:
+/// resolved, or, without `strict`, as written.
+fn in_roots(raw: &FilePath, canonical: &FilePath, roots: &[LibraryRoot], strict: bool) -> bool {
     let resolved_inside = roots
         .iter()
         .filter_map(|root| root.resolved.as_ref())
@@ -346,23 +424,32 @@ fn checked_path(
                 .filter_map(|root| root.written.as_ref())
                 .any(|root| written.starts_with(root))
         });
-    if !(resolved_inside || written_inside) || owned.owns(&canonical) {
-        return None;
-    }
-    Some(canonical)
+    resolved_inside || written_inside
 }
 
 /// Whether `file_path` may be streamed from libraries at `lib_paths` by default (see
 /// `checked_path`).
 #[cfg(test)]
 fn path_allowed(file_path: &str, lib_paths: &[String], owned: &OwnedPaths) -> bool {
-    checked_path(file_path, &library_roots_of(lib_paths), owned, false).is_some()
+    checked_path(
+        file_path,
+        &library_roots_of(lib_paths),
+        &owned.resolve(),
+        false,
+    )
+    .is_some()
 }
 
 /// Whether `file_path` may be streamed with `RefuseLinksOutOfLibraries` on.
 #[cfg(test)]
 fn path_allowed_strict(file_path: &str, lib_paths: &[String], owned: &OwnedPaths) -> bool {
-    checked_path(file_path, &library_roots_of(lib_paths), owned, true).is_some()
+    checked_path(
+        file_path,
+        &library_roots_of(lib_paths),
+        &owned.resolve(),
+        true,
+    )
+    .is_some()
 }
 
 /// `paths` as written and resolved.
@@ -413,6 +500,40 @@ async fn owned_paths(state: &AppState) -> OwnedPaths {
     }
 }
 
+/// How long a resolved `OwnedSet` is used before the owned paths are resolved again, so an owned
+/// folder linked elsewhere while the server runs counts within this time.
+const OWNED_SET_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The owned paths, resolved: the kept set while it is younger than `OWNED_SET_MAX_AGE`, else
+/// resolved again on a blocking thread and kept (see `FileGuardCache`). None when resolving
+/// failed, which refuses the path.
+async fn owned_set(state: &AppState) -> Option<Arc<OwnedSet>> {
+    if let Some((at, set)) = state.file_guard.owned_set.read().unwrap().clone()
+        && at.elapsed() < OWNED_SET_MAX_AGE
+    {
+        return Some(set);
+    }
+    let owned = owned_paths(state).await;
+    let (fresh, clean) = tokio::task::spawn_blocking(move || owned.resolve_checked())
+        .await
+        .ok()?;
+    let kept = state
+        .file_guard
+        .owned_set
+        .read()
+        .unwrap()
+        .as_ref()
+        .map(|(_, set)| set.clone());
+    let (set, keep) = choose_owned_set(kept, fresh, clean);
+    if keep {
+        *state.file_guard.owned_set.write().unwrap() =
+            Some((std::time::Instant::now(), set.clone()));
+    } else {
+        tracing::warn!("an owned path could not be resolved; the owned paths are resolved again");
+    }
+    Some(set)
+}
+
 /// Every library's paths, resolved: the kept ones, or read from the database when there are
 /// none yet or `refresh` is set (see `FileGuardCache`).
 async fn library_roots(state: &AppState, refresh: bool) -> Arc<Vec<LibraryRoot>> {
@@ -431,7 +552,29 @@ async fn library_roots(state: &AppState, refresh: bool) -> Arc<Vec<LibraryRoot>>
             .unwrap_or_default(),
     );
     *state.file_guard.library_roots.write().unwrap() = Some(roots.clone());
+    *state.file_guard.library_roots_read_at.write().unwrap() = Some(std::time::Instant::now());
     roots
+}
+
+/// Drops the kept library paths, so the next check reads them again. The library routes call it
+/// after a library is added, removed or given other folders.
+pub(crate) fn forget_library_roots(state: &AppState) {
+    *state.file_guard.library_roots.write().unwrap() = None;
+}
+
+/// How often refused pictures may read the library paths again: a page of missing or
+/// out-of-library pictures then costs one database read, not one per picture.
+const IMAGE_ROOTS_REFRESH: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Whether a picture refused as outside the libraries may read the library paths again: they
+/// were read more than `IMAGE_ROOTS_REFRESH` ago.
+fn image_roots_may_refresh(state: &AppState) -> bool {
+    state
+        .file_guard
+        .library_roots_read_at
+        .read()
+        .unwrap()
+        .is_none_or(|at| at.elapsed() >= IMAGE_ROOTS_REFRESH)
 }
 
 /// The data-dir folders that hold no pictures, so the image routes never read from them. The
@@ -478,25 +621,44 @@ fn looks_like_image(head: &[u8]) -> bool {
     (text.starts_with("<?xml") || text.starts_with("<svg")) && text.contains("<svg")
 }
 
-/// Whether the image routes may read `file_path`. Pictures live in library folders, in the data
-/// dir and in folders an import points at, so there is no library to hold them to. The file is
-/// refused when:
+/// Why the image routes refuse a stored picture path.
+#[derive(Debug, PartialEq, Eq)]
+enum ImageRefusal {
+    /// It lies in no library and not in the data dir; libraries read again may hold it.
+    OutsideRoots,
+    /// Anything else (see `checked_image_path`).
+    Refused,
+}
+
+/// Whether the image routes may read `file_path`. Pictures live in library folders (a poster
+/// beside a film) and in the data dir (downloaded, extracted, uploaded and imported pictures).
+/// The file is refused when:
 /// - its path is relative or has a `..` component, or its links can't be resolved;
+/// - it lies in none of the libraries at `roots` (as streams count them, `strict` being the
+///   server's `RefuseLinksOutOfLibraries`) and not in the data dir;
 /// - its resolved target is a path this server owns, other than a picture folder (see
 ///   `NON_IMAGE_DATA_DIRS`): the database, config, TLS files, logs, backups and so on;
 /// - it does not start like a picture (see `looks_like_image`).
 ///
 /// Returns the resolved path, which the caller opens.
-fn checked_image_path(file_path: &str, owned: &OwnedPaths) -> Option<std::path::PathBuf> {
+fn checked_image_path(
+    file_path: &str,
+    owned: &OwnedSet,
+    roots: &[LibraryRoot],
+    strict: bool,
+) -> Result<std::path::PathBuf, ImageRefusal> {
     use std::io::Read;
 
     let raw = FilePath::new(file_path);
     if !raw.is_absolute() || has_parent_dir(raw) {
-        return None;
+        return Err(ImageRefusal::Refused);
     }
-    let canonical = raw.canonicalize().ok()?;
+    let canonical = raw.canonicalize().map_err(|_| ImageRefusal::Refused)?;
     if owned.owns_in(&canonical, &NON_IMAGE_DATA_DIRS) {
-        return None;
+        return Err(ImageRefusal::Refused);
+    }
+    if !owned.in_data_dir(&canonical) && !in_roots(raw, &canonical, roots, strict) {
+        return Err(ImageRefusal::OutsideRoots);
     }
     let mut head = [0u8; 512];
     let mut read = 0;
@@ -508,35 +670,56 @@ fn checked_image_path(file_path: &str, owned: &OwnedPaths) -> Option<std::path::
             }
         }
     }
-    looks_like_image(&head[..read]).then_some(canonical)
+    if looks_like_image(&head[..read]) {
+        Ok(canonical)
+    } else {
+        Err(ImageRefusal::Refused)
+    }
 }
 
-/// Whether the image routes may read `file_path` (see `checked_image_path`).
+/// Whether the image routes may read `file_path` from libraries at `lib_paths` (see
+/// `checked_image_path`).
 #[cfg(test)]
-fn image_path_allowed(file_path: &str, owned: &OwnedPaths) -> bool {
-    checked_image_path(file_path, owned).is_some()
+fn image_path_allowed(file_path: &str, lib_paths: &[String], owned: &OwnedPaths) -> bool {
+    checked_image_path(
+        file_path,
+        &owned.resolve(),
+        &library_roots_of(lib_paths),
+        false,
+    )
+    .is_ok()
 }
 
 /// The resolved path of a stored image that may be served (see `checked_image_path`), which the
-/// caller opens. The checks read the file system, so they run on a blocking thread; no database
-/// query runs.
+/// caller opens. The checks read the file system, so they run on a blocking thread. The library
+/// paths are kept between requests; a picture outside them reads them again before it is refused
+/// only when they are older than `IMAGE_ROOTS_REFRESH`.
 pub(crate) async fn validate_image_path(
     state: &AppState,
     file_path: &str,
 ) -> Result<String, ApiError> {
-    let owned = owned_paths(state).await;
-    let path = file_path.to_string();
-    let checked = tokio::task::spawn_blocking(move || checked_image_path(&path, &owned))
-        .await
-        .ok()
-        .flatten();
-    match checked {
-        Some(path) => Ok(path.to_string_lossy().into_owned()),
-        None => {
-            tracing::warn!("image path '{}' is refused", file_path);
-            Err(ApiError::NotFound("image not found".to_string()))
+    let refused = || {
+        tracing::warn!("image path '{}' is refused", file_path);
+        ApiError::NotFound("image not found".to_string())
+    };
+    let owned = owned_set(state).await.ok_or_else(refused)?;
+    let strict = state.config.read().await.refuse_links_out_of_libraries;
+    for refresh in [false, true] {
+        let roots = library_roots(state, refresh).await;
+        let (path, owned) = (file_path.to_string(), owned.clone());
+        let checked =
+            tokio::task::spawn_blocking(move || checked_image_path(&path, &owned, &roots, strict))
+                .await
+                .unwrap_or(Err(ImageRefusal::Refused));
+        match checked {
+            Ok(path) => return Ok(path.to_string_lossy().into_owned()),
+            Err(ImageRefusal::OutsideRoots) if !refresh && image_roots_may_refresh(state) => {
+                continue;
+            }
+            Err(_) => break,
         }
     }
+    Err(refused())
 }
 
 /// The resolved path of `file_path` when it lies in a library and is none of the server's own
@@ -558,7 +741,7 @@ pub(crate) async fn validate_path_against_library(
     if has_parent_dir(FilePath::new(file_path)) {
         return Err(refused());
     }
-    let owned = Arc::new(owned_paths(state).await);
+    let owned = owned_set(state).await.ok_or_else(refused)?;
     let strict = state.config.read().await.refuse_links_out_of_libraries;
     for refresh in [false, true] {
         let roots = library_roots(state, refresh).await;
@@ -1710,6 +1893,33 @@ pub(crate) async fn remembered_choices(
     ))
 }
 
+/// The user's settings that pick a video's default tracks (`PlayDefaultAudioTrack`,
+/// `AudioLanguagePreference`, `SubtitleMode`, `SubtitleLanguagePreference`), with Jellyfin's
+/// defaults for the ones not stored and the languages normalized as Jellyfin does.
+pub(crate) async fn track_preferences(
+    state: &AppState,
+    user: Uuid,
+) -> Result<rustyfin_core::stream_builder::TrackPreferences, ApiError> {
+    use rustyfin_core::stream_builder::{SubtitleMode, TrackPreferences};
+    let config = rustyfin_db::repo_user::get_user_by_id(&state.db_ro, user)
+        .await?
+        .map(|user| rustyfin_model::user::jellyfin_configuration(&user.configuration))
+        .unwrap_or_default();
+    let text = |key: &str| config.get(key).and_then(|v| v.as_str()).unwrap_or_default();
+    let audio = text("AudioLanguagePreference");
+    let languages = crate::routes::localization::normalize_language;
+    Ok(TrackPreferences {
+        play_default_audio_track: config
+            .get("PlayDefaultAudioTrack")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true),
+        original_language_audio: audio.eq_ignore_ascii_case("OriginalLanguage"),
+        audio_languages: languages(audio),
+        subtitle_mode: SubtitleMode::parse(text("SubtitleMode")),
+        subtitle_languages: languages(text("SubtitleLanguagePreference")),
+    })
+}
+
 /// The index of the stream of `kind` ("Audio", "Subtitle") in `source` that a remembered choice
 /// names: the stream at the choice's index whose key is the one stored with it, else the one
 /// stream with that key (the numbering moved: Jellyfin numbers external subtitle files first,
@@ -2189,15 +2399,23 @@ mod tests {
         for file in [lib.join("Movie/movie.mkv"), lib.join("film.mkv")] {
             let file = s(file);
             for strict in [false, true] {
-                let checked =
-                    checked_path(&file, &library_roots_of(&one), &owned(&data, &[]), strict);
+                let checked = checked_path(
+                    &file,
+                    &library_roots_of(&one),
+                    &owned(&data, &[]).resolve(),
+                    strict,
+                );
                 assert_eq!(
                     checked,
                     if strict { None } else { target.clone() },
                     "{file} {strict}"
                 );
-                let checked =
-                    checked_path(&file, &library_roots_of(&both), &owned(&data, &[]), strict);
+                let checked = checked_path(
+                    &file,
+                    &library_roots_of(&both),
+                    &owned(&data, &[]).resolve(),
+                    strict,
+                );
                 assert_eq!(checked, target, "{file} {strict}");
             }
         }
@@ -2397,8 +2615,11 @@ mod tests {
         std::fs::write(data.join("config.json"), b"{}").unwrap();
         let owned = owned(&data, &[&tls]);
         let s = |p: &std::path::Path| p.to_str().unwrap().to_string();
+        let libs = [s(&lib)];
+        let image_path_allowed =
+            |file: &str, owned: &OwnedPaths| image_path_allowed(file, &libs, owned);
 
-        // Pictures beside the media, in the server's picture folders and in an imported folder
+        // Pictures beside the media and in the server's picture folders
         let poster = lib.join("poster.jpg");
         std::fs::write(&poster, R3_JPEG).unwrap();
         for folder in ["metadata", "images", "cache"] {
@@ -2406,11 +2627,13 @@ mod tests {
             std::fs::write(&file, R3_PNG).unwrap();
             assert!(image_path_allowed(&s(&file), &owned), "{folder}");
         }
+        assert!(image_path_allowed(&s(&poster), &owned));
+        // A picture in no library and outside the data dir is refused (an import copies its
+        // pictures into the data dir)
         let imported = import.join("folder.jpg");
         std::fs::write(&imported, R3_JPEG).unwrap();
-        assert!(image_path_allowed(&s(&poster), &owned));
-        assert!(image_path_allowed(&s(&imported), &owned));
-        // A link to a picture elsewhere still shows, as Jellyfin follows links too
+        assert!(!image_path_allowed(&s(&imported), &owned));
+        // A link in a library to a picture elsewhere still shows, as Jellyfin follows links too
         std::os::unix::fs::symlink(&imported, lib.join("fanart.jpg")).unwrap();
         assert!(image_path_allowed(&s(&lib.join("fanart.jpg")), &owned));
 
@@ -2676,6 +2899,51 @@ mod tests {
             let target = FilePath::new("/r1play-missing/data").join(name);
             assert!(!owned.owns(&target), "{name}");
         }
+    }
+
+    /// A data folder whose resolve fails for another reason than a missing file (here a link
+    /// into a folder that may not be entered) makes the set unclean; missing folders don't.
+    #[test]
+    fn r3gaps3_a_failed_resolve_is_reported() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new();
+        let data = dir.path().join("data");
+        let locked = dir.path().join("locked");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(locked.join("inner")).unwrap();
+        assert!(
+            owned(&data, &[]).resolve_checked().1,
+            "missing folders are fine"
+        );
+
+        std::os::unix::fs::symlink(locked.join("inner"), data.join("transcodes")).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let entered = std::fs::read_dir(&locked).is_ok();
+        let (set, clean) = owned(&data, &[]).resolve_checked();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if entered {
+            // Run as root, which enters any folder: nothing fails to resolve
+            return;
+        }
+        assert!(!clean);
+        assert!(!set.linked_dirs.iter().any(|(name, _)| name == "transcodes"));
+    }
+
+    /// An unclean resolve keeps the previous set and isn't kept itself; with nothing kept it is
+    /// used once. A clean one replaces the kept set.
+    #[test]
+    fn r3gaps3_an_unclean_owned_set_is_not_kept() {
+        let previous = Arc::new(OwnedSet {
+            linked_dirs: vec![("transcodes".to_string(), "/fast/transcodes".into())],
+            ..Default::default()
+        });
+        let fresh = OwnedSet::default();
+        let (set, keep) = choose_owned_set(Some(previous.clone()), fresh.clone(), false);
+        assert!(Arc::ptr_eq(&set, &previous) && !keep);
+        let (set, keep) = choose_owned_set(None, fresh.clone(), false);
+        assert!(*set == fresh && !keep);
+        let (set, keep) = choose_owned_set(Some(previous), fresh.clone(), true);
+        assert!(*set == fresh && keep);
     }
 
     #[test]

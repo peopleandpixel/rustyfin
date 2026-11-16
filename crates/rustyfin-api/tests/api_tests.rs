@@ -3389,6 +3389,7 @@ const B124_WEB_MODULES: &[&str] = &[
     "cardmenu.js",
     "cards.js",
     "collections.js",
+    "dashboard.js",
     "genres.js",
     "home.js",
     "item.js",
@@ -3407,6 +3408,7 @@ const B124_WEB_MODULES: &[&str] = &[
     "search.js",
     "sessions.js",
     "settings.js",
+    "theme-media.js",
     "user-editor.js",
     "user-settings.js",
     "util.js",
@@ -16589,6 +16591,770 @@ async fn j5_genre_ids_survive_a_rescan_that_replaces_the_items() {
     assert_eq!(again, years);
 }
 
+// R3 item extras: local trailers, special features and theme media
+
+/// Writes a one-second video (`audio` false) or MP3 over `file` with ffmpeg. False when ffmpeg isn't there.
+fn r3extras_media(file: &std::path::Path, audio: bool) -> bool {
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    if audio {
+        r3gaps2_make_media(file, &["sine=duration=1"], &["-c:a", "libmp3lame"])
+    } else {
+        r3gaps2_make_media(
+            file,
+            &["testsrc=size=64x48:rate=5:duration=1", "sine=duration=1"],
+            &["-c:v", "mpeg4", "-c:a", "mp2"],
+        )
+    }
+}
+
+/// The `Id`s of a JSON array of items, or of its `Items`.
+fn r3extras_ids(body: &serde_json::Value) -> Vec<String> {
+    body.as_array()
+        .or_else(|| body["Items"].as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|i| i["Id"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The `ExtraType`s of a JSON array of items, sorted.
+fn r3extras_types(body: &serde_json::Value) -> Vec<String> {
+    let mut types: Vec<String> = body
+        .as_array()
+        .or_else(|| body["Items"].as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|i| i["ExtraType"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    types.sort();
+    types
+}
+
+/// A movie's trailer files (by suffix and in `trailers/`), extras folders and themes become its extras, as in
+/// Jellyfin: they are never library items, `LocalTrailers` and `SpecialFeatures` list them as bare arrays with
+/// their `ExtraType` and media sources, the item counts them, and `ThemeSongs`/`ThemeVideos`/`ThemeMedia` give
+/// the themes. A trailer that an older scan stored as a movie becomes an extra, and a deleted extra goes.
+#[tokio::test]
+async fn r3extras_movie_extras_are_found_listed_and_kept_out_of_the_library() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let root = std::path::PathBuf::from(media_folder(&state, "r3extras movies"));
+    let film = root.join("Alpha (2001)");
+    if !r3extras_media(&film.join("Alpha (2001).mkv"), false) {
+        return;
+    }
+    for (file, audio) in [
+        ("Alpha (2001)-trailer.mkv", false),
+        ("featurettes/Making Of.mkv", false),
+        ("behind the scenes/On Set.mkv", false),
+        ("Alpha (2001)-deleted.mkv", false),
+        ("theme.mp3", true),
+        ("backdrops/Loop.mkv", false),
+    ] {
+        assert!(r3extras_media(&film.join(file), audio));
+    }
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: "R3 Extras Movies".to_string(),
+        content_type: rustyfin_model::library::LibraryContentType::Movies,
+        paths: vec![root.to_str().unwrap().to_string()],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    rustyfin_core::scanner::scan_library(&state.db, &lib)
+        .await
+        .unwrap();
+    rustyfin_core::scanner::wait_for_idle().await;
+
+    // The library lists the movie alone, whatever the types asked for.
+    for uri in [
+        format!("/Items?ParentId={}&Recursive=true", lib.id),
+        format!("/Items?ParentId={}", lib.id),
+        "/Items?Recursive=true&IncludeItemTypes=Video,Audio,Trailer".to_string(),
+        "/Items?Recursive=true&searchTerm=Making".to_string(),
+        "/Items/Latest?Limit=50".to_string(),
+    ] {
+        let (status, body) = send_authed(&app, "GET", &uri, &token, None).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        let names: Vec<&str> = body
+            .as_array()
+            .or_else(|| body["Items"].as_array())
+            .unwrap()
+            .iter()
+            .filter_map(|i| i["Name"].as_str())
+            .collect();
+        assert!(
+            names.iter().all(|n| *n == "Alpha"),
+            "{uri} lists an extra: {names:?}"
+        );
+    }
+    let movies = j5_movie_ids(&state).await;
+    assert_eq!(movies.len(), 1, "one movie, not one per extra");
+    let movie = movies[0].clone();
+
+    let (status, item) = send_authed(&app, "GET", &format!("/Items/{movie}"), &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{item}");
+    assert_eq!(item["LocalTrailerCount"], 1, "{item}");
+    assert_eq!(item["SpecialFeatureCount"], 3, "{item}");
+
+    let (status, trailers) = send_authed(
+        &app,
+        "GET",
+        &format!("/Items/{movie}/LocalTrailers"),
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{trailers}");
+    assert!(trailers.is_array(), "a bare array: {trailers}");
+    assert_eq!(r3extras_types(&trailers), ["Trailer"]);
+    assert_eq!(trailers[0]["Name"], "Alpha (2001)-trailer");
+    assert!(
+        trailers[0]["MediaSources"]
+            .as_array()
+            .is_some_and(|s| !s.is_empty()),
+        "the trailer was probed: {trailers}"
+    );
+    let trailer = trailers[0]["Id"].as_str().unwrap().to_string();
+    // The trailer plays like any item.
+    let (status, info) = send_authed(
+        &app,
+        "GET",
+        &format!("/Items/{trailer}/PlaybackInfo"),
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{info}");
+    let (status, _) = send_authed(
+        &app,
+        "GET",
+        &format!("/Users/{}/Items/{movie}/LocalTrailers", uuid::Uuid::nil()),
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, specials) = send_authed(
+        &app,
+        "GET",
+        &format!("/Items/{movie}/SpecialFeatures"),
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{specials}");
+    assert_eq!(
+        r3extras_types(&specials),
+        ["BehindTheScenes", "DeletedScene", "Featurette"]
+    );
+
+    let (status, songs) = send_authed(
+        &app,
+        "GET",
+        &format!("/Items/{movie}/ThemeSongs"),
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{songs}");
+    assert_eq!(songs["OwnerId"], movie.replace('-', ""));
+    assert_eq!(songs["TotalRecordCount"], 1);
+    assert_eq!(songs["Items"][0]["Type"], "Audio");
+    assert_eq!(songs["Items"][0]["ExtraType"], "ThemeSong");
+    let (_, media) = send_authed(
+        &app,
+        "GET",
+        &format!("/Items/{movie}/ThemeMedia?inheritFromParent=true"),
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(r3extras_types(&media["ThemeVideosResult"]), ["ThemeVideo"]);
+    assert_eq!(r3extras_types(&media["ThemeSongsResult"]), ["ThemeSong"]);
+    assert_eq!(media["SoundtrackSongsResult"]["TotalRecordCount"], 0);
+
+    // An unknown item is a 404.
+    let (status, _) = send_authed(
+        &app,
+        "GET",
+        &format!("/Items/{}/SpecialFeatures", uuid::Uuid::new_v4()),
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // A trailer that an older scan stored as a movie becomes an extra again, with the same id.
+    sqlx::query(
+        "UPDATE media_items SET media_type = 'Movie', extra_type = NULL, owner_id = NULL WHERE id = ?",
+    )
+    .bind(&trailer)
+    .execute(&state.db)
+    .await
+    .unwrap();
+    // A deleted special feature goes.
+    std::fs::remove_file(film.join("featurettes/Making Of.mkv")).unwrap();
+    rustyfin_core::scanner::scan_library(&state.db, &lib)
+        .await
+        .unwrap();
+    rustyfin_core::scanner::wait_for_idle().await;
+    assert_eq!(j5_movie_ids(&state).await, std::slice::from_ref(&movie));
+    let (_, trailers) = send_authed(
+        &app,
+        "GET",
+        &format!("/Items/{movie}/LocalTrailers"),
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(r3extras_ids(&trailers), [trailer]);
+    let (_, item) = send_authed(&app, "GET", &format!("/Items/{movie}"), &token, None).await;
+    assert_eq!(item["SpecialFeatureCount"], 2, "{item}");
+
+    // Deleting the movie detaches its extras (their files are still there), and the next scan, which finds
+    // the movie again, gives them back to it.
+    let (status, _) = send_authed(&app, "DELETE", &format!("/Items/{movie}"), &token, None).await;
+    assert!(status.is_success(), "{status}");
+    let (owned, detached): (i64, i64) = sqlx::query_as(
+        "SELECT SUM(owner_id = ?1), SUM(owner_id IS NULL AND extra_type IS NOT NULL) FROM media_items",
+    )
+    .bind(&movie)
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    assert_eq!(
+        (owned, detached),
+        (0, 5),
+        "the extras are kept, without an owner"
+    );
+    rustyfin_core::scanner::scan_library(&state.db, &lib)
+        .await
+        .unwrap();
+    rustyfin_core::scanner::wait_for_idle().await;
+    let again = j5_movie_ids(&state).await;
+    assert_eq!(again.len(), 1);
+    let (_, item) = send_authed(&app, "GET", &format!("/Items/{}", again[0]), &token, None).await;
+    assert_eq!(item["LocalTrailerCount"], 1, "{item}");
+    assert_eq!(item["SpecialFeatureCount"], 2, "{item}");
+}
+
+/// Creates a movie library on `media/<name>` holding `files` (paths in it; `.mp3` is audio), scans it and waits
+/// for the probes. `None` without ffmpeg.
+async fn r3extras_library(
+    state: &AppState,
+    name: &str,
+    files: &[&str],
+) -> Option<(rustyfin_model::library::Library, std::path::PathBuf)> {
+    let root = std::path::PathBuf::from(media_folder(state, name));
+    for file in files {
+        if !r3extras_media(&root.join(file), file.ends_with(".mp3")) {
+            return None;
+        }
+    }
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: name.to_string(),
+        content_type: rustyfin_model::library::LibraryContentType::Movies,
+        paths: vec![root.to_str().unwrap().to_string()],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    r3extras_rescan(state, &lib).await;
+    Some((lib, root))
+}
+
+async fn r3extras_rescan(state: &AppState, lib: &rustyfin_model::library::Library) {
+    rustyfin_core::scanner::scan_library(&state.db, lib)
+        .await
+        .unwrap();
+    rustyfin_core::scanner::wait_for_idle().await;
+}
+
+/// `(name, media type, extra type)` of every item of `lib`, sorted.
+async fn r3extras_rows(
+    state: &AppState,
+    lib: &rustyfin_model::library::Library,
+) -> Vec<(String, String, Option<String>)> {
+    sqlx::query_as(
+        "SELECT name, media_type, extra_type FROM media_items WHERE library_id = ? ORDER BY name",
+    )
+    .bind(lib.id.to_string())
+    .fetch_all(&state.db)
+    .await
+    .unwrap()
+}
+
+/// Regression: extras-named folders directly in the library root, and the extras folder of a folder that only
+/// groups other folders, hold movies, not extras; their movies are scanned as movies and never deleted. A stored
+/// extra whose movie file goes becomes a movie again with the same id, and every extra is stored with its type
+/// and owner at once.
+#[tokio::test]
+async fn r3extras_root_and_grouping_extras_folders_hold_movies() {
+    let state = test_state().await;
+    let Some((lib, root)) = r3extras_library(
+        &state,
+        "r3extras roots",
+        &[
+            "Shorts/Film A (2001).mkv",
+            "Other/Film B (2002).mkv",
+            "Extras/Film C (2003).mkv",
+            "Clips/theme.mp3",
+            "Collection/Featurettes/Film D (2004).mkv",
+            "Collection/Film E (2005)/Film E (2005).mkv",
+            "Gamma (2006)/Gamma (2006).mkv",
+            "Gamma (2006)/extras/Bonus.mkv",
+        ],
+    )
+    .await
+    else {
+        return;
+    };
+    let movie = |name: &str| (name.to_string(), "Movie".to_string(), None);
+    let bonus = (
+        "Bonus".to_string(),
+        "Video".to_string(),
+        Some("Unknown".to_string()),
+    );
+    let expected = vec![
+        bonus.clone(),
+        movie("Film A"),
+        movie("Film B"),
+        movie("Film C"),
+        movie("Film D"),
+        movie("Film E"),
+        movie("Gamma"),
+    ];
+    assert_eq!(r3extras_rows(&state, &lib).await, expected);
+    // A second scan keeps them all.
+    r3extras_rescan(&state, &lib).await;
+    assert_eq!(r3extras_rows(&state, &lib).await, expected);
+    let unowned: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_items WHERE (extra_type IS NULL) <> (owner_id IS NULL)",
+    )
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    assert_eq!(unowned, 0, "an extra without an owner, or the reverse");
+
+    // Gamma's own file goes: its extra is a movie of its own again, with the same id.
+    let bonus_id: String = sqlx::query_scalar("SELECT id FROM media_items WHERE name = 'Bonus'")
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    std::fs::remove_file(root.join("Gamma (2006)/Gamma (2006).mkv")).unwrap();
+    r3extras_rescan(&state, &lib).await;
+    let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT id, media_type, extra_type FROM media_items WHERE path LIKE '%Bonus.mkv'",
+    )
+    .fetch_all(&state.db)
+    .await
+    .unwrap();
+    assert_eq!(rows, [(bonus_id, "Movie".to_string(), None)]);
+}
+
+/// Regression: a parental limit that hides a movie hides its extras too, in listings by id and by id path,
+/// and an extra with no rating takes its owner's. The scan's removal (`scan_sync::delete_item`) deletes an
+/// item's extras with it.
+#[tokio::test]
+async fn r3extras_parental_limits_and_deletes_reach_extras() {
+    let state = test_state().await;
+    let Some((lib, _)) = r3extras_library(
+        &state,
+        "r3extras parental",
+        &[
+            "Rough (2001)/Rough (2001).mkv",
+            "Rough (2001)/Rough (2001)-trailer.mkv",
+            "Mild (2002)/Mild (2002).mkv",
+            "Mild (2002)/trailer.mkv",
+        ],
+    )
+    .await
+    else {
+        return;
+    };
+    let id_of = |sql: &'static str| {
+        let db = state.db.clone();
+        async move {
+            sqlx::query_scalar::<_, String>(sql)
+                .fetch_one(&db)
+                .await
+                .unwrap()
+        }
+    };
+    let rough = id_of("SELECT id FROM media_items WHERE name = 'Rough'").await;
+    let rough_trailer =
+        id_of("SELECT id FROM media_items WHERE name = 'Rough (2001)-trailer'").await;
+    let mild_trailer = id_of("SELECT id FROM media_items WHERE name = 'trailer'").await;
+    sqlx::query("UPDATE media_items SET official_rating = CASE name WHEN 'Rough' THEN 'R' ELSE 'PG' END WHERE media_type = 'Movie'")
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+    let app = app(state.clone());
+    let (admin, _) = admin_session(&state).await;
+    let kid = add_user(&state, "r3x-kid", "r3x-pass", false).await;
+    let (_, user) = send_authed(&app, "GET", &format!("/Users/{kid}"), &admin, None).await;
+    let mut policy = user["Policy"].clone();
+    policy["MaxParentalRating"] = 10.into();
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        &format!("/Users/{kid}/Policy"),
+        &admin,
+        Some(&policy.to_string()),
+    )
+    .await;
+    assert!(status.is_success(), "{status}");
+    let (token, _) = login(&app, "r3x-kid", "r3x-pass").await.unwrap();
+
+    // The hidden set that listings filter by holds the hidden movie's trailer, not the other one.
+    let rated = rustyfin_model::parental::ParentalPolicy {
+        max_parental_rating: Some(10),
+        ..Default::default()
+    };
+    let hidden = rustyfin_db::repo_parental::hidden_item_ids(&state.db, &rated)
+        .await
+        .unwrap();
+    assert!(
+        hidden.contains(&rough) && hidden.contains(&rough_trailer),
+        "{hidden:?}"
+    );
+    assert!(!hidden.contains(&mild_trailer), "{hidden:?}");
+    // With allowed tags, an extra follows its owner's tags rather than counting as a top-level item.
+    sqlx::query("UPDATE media_items SET tags = 'Kids' WHERE name = 'Mild'")
+        .execute(&state.db)
+        .await
+        .unwrap();
+    let tagged = rustyfin_model::parental::ParentalPolicy {
+        allowed_tags: vec!["Kids".to_string()],
+        ..Default::default()
+    };
+    let hidden = rustyfin_db::repo_parental::hidden_item_ids(&state.db, &tagged)
+        .await
+        .unwrap();
+    assert!(hidden.contains(&rough_trailer), "{hidden:?}");
+    assert!(!hidden.contains(&mild_trailer), "{hidden:?}");
+    for uri in [
+        format!("/Items/{rough_trailer}"),
+        format!("/Items/{rough}/LocalTrailers"),
+    ] {
+        let (status, body) = send_authed(&app, "GET", &uri, &token, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}: {body}");
+    }
+    let (status, _) =
+        send_authed(&app, "GET", &format!("/Items/{mild_trailer}"), &token, None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The scan's removal of the movie detaches its trailer, whose file is still there; it isn't deleted.
+    assert!(
+        rustyfin_core::scan_sync::delete_item(&state.db, &rough)
+            .await
+            .unwrap()
+    );
+    let trailer: Vec<(Option<String>, Option<String>)> =
+        sqlx::query_as("SELECT owner_id, extra_type FROM media_items WHERE id = ?")
+            .bind(&rough_trailer)
+            .fetch_all(&state.db)
+            .await
+            .unwrap();
+    assert_eq!(trailer, [(None, Some("Trailer".to_string()))]);
+    let _ = lib;
+}
+
+/// Regression: a library that reads no extras (here a movie library scanned as Mixed) makes its stored
+/// extras library items again, keeping their ids and user data, instead of adding a second row at each path.
+/// A released `Delta (2003)-trailer.mkv` is then a version of Delta, as a Mixed scan reads it, and its row
+/// merges into Delta's with its user data.
+#[tokio::test]
+async fn r3extras_a_library_without_extras_releases_its_stored_ones() {
+    let state = test_state().await;
+    let Some((lib, _)) = r3extras_library(
+        &state,
+        "r3extras mixed",
+        &[
+            "Delta (2003)/Delta (2003).mkv",
+            "Delta (2003)/Delta (2003)-trailer.mkv",
+            "Delta (2003)/featurettes/Making Of.mkv",
+            "Delta (2003)/theme.mp3",
+        ],
+    )
+    .await
+    else {
+        return;
+    };
+    let rows = |name: &'static str| {
+        let db = state.db.clone();
+        async move {
+            sqlx::query_as::<_, (String, String, Option<String>)>(
+                "SELECT id, media_type, extra_type FROM media_items \
+                 WHERE path LIKE '%' || ? ORDER BY id",
+            )
+            .bind(name)
+            .fetch_all(&db)
+            .await
+            .unwrap()
+        }
+    };
+    let trailer = rows("Delta (2003)-trailer.mkv").await;
+    assert_eq!(trailer.len(), 1);
+    assert_eq!(trailer[0].2.as_deref(), Some("Trailer"));
+    let feature = rows("Making Of.mkv").await;
+    assert_eq!(feature[0].2.as_deref(), Some("Featurette"));
+    let user = add_user(&state, "r3x-mixed", "pw", false).await;
+    for id in [&trailer[0].0, &feature[0].0] {
+        sqlx::query("INSERT INTO user_item_data (user_id, item_id, played) VALUES (?, ?, 1)")
+            .bind(user.to_string())
+            .bind(id)
+            .execute(&state.db)
+            .await
+            .unwrap();
+    }
+    let delta = rows("Delta (2003).mkv").await[0].0.clone();
+
+    let mixed = rustyfin_model::library::Library {
+        content_type: rustyfin_model::library::LibraryContentType::Mixed,
+        ..lib.clone()
+    };
+    r3extras_rescan(&state, &mixed).await;
+    assert_eq!(
+        rows("Making Of.mkv").await,
+        [(feature[0].0.clone(), "Movie".to_string(), None)],
+        "one row, the same id, now a movie"
+    );
+    let hidden: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM media_items WHERE extra_type IS NOT NULL")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+    assert_eq!(hidden, 0, "no extra is left hidden");
+    // The trailer is a version of Delta now: one movie row holds both files, with the trailer's user data.
+    let holders: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT item_id FROM media_sources \
+         WHERE path LIKE '%/Delta (2003).mkv' OR path LIKE '%/Delta (2003)-trailer.mkv'",
+    )
+    .fetch_all(&state.db)
+    .await
+    .unwrap();
+    assert_eq!(holders.len(), 1, "{holders:?}");
+    assert!(
+        holders[0] == delta || holders[0] == trailer[0].0,
+        "one of the two rows survives: {holders:?}"
+    );
+    let theme = rows("theme.mp3").await;
+    assert_eq!(theme.len(), 1, "{theme:?}");
+    assert_eq!(
+        (theme[0].1.as_str(), theme[0].2.as_deref()),
+        ("Audio", None)
+    );
+    for id in [&feature[0].0, &holders[0]] {
+        let played: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM user_item_data WHERE item_id = ? AND user_id = ? AND played = 1",
+        )
+        .bind(id)
+        .bind(user.to_string())
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(played, 1, "the user data stays with {id}");
+    }
+}
+
+/// Regression: in a folder of several films, `B-short.mkv` names none of them, so it is a film of its own and
+/// not an extra of the first; when another film's file goes, or another film is deleted through the API, B
+/// keeps its item and user data. A suffix that names a film (`A-trailer.mkv`) is that film's extra, and
+/// deleting the film detaches it rather than deleting it.
+#[tokio::test]
+async fn r3extras_a_film_in_a_folder_of_several_is_never_lost() {
+    let state = test_state().await;
+    let Some((lib, root)) = r3extras_library(
+        &state,
+        "r3extras shelf",
+        &[
+            "Shelf/A.mkv",
+            "Shelf/B-short.mkv",
+            "Shelf/C.mkv",
+            "Shelf/A-trailer.mkv",
+        ],
+    )
+    .await
+    else {
+        return;
+    };
+    let id_at = |name: &'static str| {
+        let db = state.db.clone();
+        async move {
+            sqlx::query_as::<_, (String, String, Option<String>)>(
+                "SELECT id, media_type, owner_id FROM media_items WHERE name = ?",
+            )
+            .bind(name)
+            .fetch_all(&db)
+            .await
+            .unwrap()
+        }
+    };
+    let a = id_at("A").await[0].0.clone();
+    let b = id_at("B-short").await;
+    assert_eq!(b.len(), 1);
+    assert_eq!(
+        (b[0].1.as_str(), b[0].2.as_deref()),
+        ("Movie", None),
+        "B is a film"
+    );
+    let b = b[0].0.clone();
+    let trailer = id_at("A-trailer").await;
+    assert_eq!(
+        trailer[0].2.as_deref(),
+        Some(a.as_str()),
+        "A-trailer is A's"
+    );
+    let trailer = trailer[0].0.clone();
+    let user = add_user(&state, "r3x-shelf", "pw", false).await;
+    sqlx::query("INSERT INTO user_item_data (user_id, item_id, played) VALUES (?, ?, 1)")
+        .bind(user.to_string())
+        .bind(&b)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    let b_kept = || {
+        let db = state.db.clone();
+        let b = b.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM media_items m JOIN user_item_data u ON u.item_id = m.id \
+                 WHERE m.id = ? AND m.media_type = 'Movie' AND m.extra_type IS NULL",
+            )
+            .bind(&b)
+            .fetch_one(&db)
+            .await
+            .unwrap()
+        }
+    };
+
+    // A's file goes: the scan removes A, and B and its user data stay.
+    std::fs::remove_file(root.join("Shelf/A.mkv")).unwrap();
+    r3extras_rescan(&state, &lib).await;
+    assert!(id_at("A").await.is_empty(), "A is gone");
+    assert_eq!(b_kept().await, 1, "B keeps its item and user data");
+    // A's trailer, with no film left to belong to among several, is a film of its own now, same id.
+    let now = id_at("A-trailer").await;
+    assert_eq!(
+        (now[0].0.as_str(), now[0].1.as_str(), now[0].2.as_deref()),
+        (trailer.as_str(), "Movie", None)
+    );
+
+    // C deleted through the API: B stays.
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let c = id_at("C").await[0].0.clone();
+    let (status, _) = send_authed(&app, "DELETE", &format!("/Items/{c}"), &token, None).await;
+    assert!(status.is_success(), "{status}");
+    assert_eq!(b_kept().await, 1, "B keeps its item and user data");
+}
+
+/// A show's extras folders and themes belong to its series or season; an episode's page inherits the series'
+/// theme song with `inheritFromParent`, and the specials season `Extras` stays a season.
+#[tokio::test]
+async fn r3extras_show_extras_belong_to_series_and_seasons() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let root = std::path::PathBuf::from(media_folder(&state, "r3extras shows"));
+    let show = root.join("Show");
+    if !r3extras_media(&show.join("Season 1/Show S01E01.mkv"), false) {
+        return;
+    }
+    for (file, audio) in [
+        ("theme.mp3", true),
+        ("trailers/Teaser.mkv", false),
+        ("Season 1/deleted scenes/Cut.mkv", false),
+        ("interviews/Cast.mkv", false),
+    ] {
+        assert!(r3extras_media(&show.join(file), audio));
+    }
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: "R3 Extras Shows".to_string(),
+        content_type: rustyfin_model::library::LibraryContentType::TvShows,
+        paths: vec![root.to_str().unwrap().to_string()],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    rustyfin_core::scanner::scan_library(&state.db, &lib)
+        .await
+        .unwrap();
+    rustyfin_core::scanner::wait_for_idle().await;
+
+    let id_of = |media_type: &'static str| {
+        let db = state.db.clone();
+        async move {
+            let ids: Vec<String> = sqlx::query_scalar(
+                "SELECT id FROM media_items WHERE media_type = ? AND extra_type IS NULL",
+            )
+            .bind(media_type)
+            .fetch_all(&db)
+            .await
+            .unwrap();
+            assert_eq!(ids.len(), 1, "one {media_type}: {ids:?}");
+            ids[0].clone()
+        }
+    };
+    let series = id_of("Series").await;
+    let season = id_of("Season").await;
+    let episode = id_of("Episode").await;
+
+    let get = |uri: String| {
+        let app = app.clone();
+        let token = token.clone();
+        async move {
+            let (status, body) = send_authed(&app, "GET", &uri, &token, None).await;
+            assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+            body
+        }
+    };
+    assert_eq!(
+        r3extras_types(&get(format!("/Items/{series}/LocalTrailers")).await),
+        ["Trailer"]
+    );
+    assert_eq!(
+        r3extras_types(&get(format!("/Items/{series}/SpecialFeatures")).await),
+        ["Interview"]
+    );
+    assert_eq!(
+        r3extras_types(&get(format!("/Items/{season}/SpecialFeatures")).await),
+        ["DeletedScene"]
+    );
+    let inherited = get(format!(
+        "/Items/{episode}/ThemeSongs?inheritFromParent=true"
+    ))
+    .await;
+    assert_eq!(inherited["OwnerId"], series.replace('-', ""));
+    assert_eq!(r3extras_types(&inherited), ["ThemeSong"]);
+    let own = get(format!("/Items/{episode}/ThemeSongs")).await;
+    assert_eq!(own["OwnerId"], episode.replace('-', ""));
+    assert_eq!(own["TotalRecordCount"], 0);
+    let all = get(format!("/Items?ParentId={}&Recursive=true", lib.id)).await;
+    let mut types: Vec<&str> = all["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|i| i["Type"].as_str())
+        .collect();
+    types.sort();
+    assert_eq!(types, ["Episode", "Season", "Series"], "{all}");
+}
+
 #[tokio::test]
 async fn j5_odd_values_list_without_error_and_bad_parameters_give_400() {
     use rustyfin_model::library::LibraryContentType;
@@ -18413,9 +19179,12 @@ async fn b40_session_reports_on_a_movie_work_as_before() {
     assert_eq!(b.film_data().await, (0, false, Some(1), Some(3), true));
     assert_eq!(b40_session_changes(&mut events), []);
 
-    // Progress stores the position; a missing subtitle index keeps the stored one.
+    // Progress stores the position; a missing subtitle index keeps the stored one. The film gets
+    // its hour first: without a runtime, Jellyfin's UpdatePlayState counts any report as played
+    // to the end (B110).
+    b110_set(&b.state, b.film, Some(B110_HOUR), None, None).await;
     let body = serde_json::json!({
-        "ItemId": film, "ItemName": "B40 Film", "PositionTicks": 5000, "IsPaused": true,
+        "ItemId": film, "ItemName": "B40 Film", "PositionTicks": B110_HOUR / 4, "IsPaused": true,
         "AudioStreamIndex": 2,
     });
     let (status, answer) = b.post("/Sessions/Playing/Progress", body).await;
@@ -18423,11 +19192,13 @@ async fn b40_session_reports_on_a_movie_work_as_before() {
         (status, answer),
         (StatusCode::NO_CONTENT, serde_json::Value::Null)
     );
-    assert_eq!(b.film_data().await, (5000, false, Some(2), Some(3), true));
+    assert_eq!(
+        b.film_data().await,
+        (B110_HOUR / 4, false, Some(2), Some(3), true)
+    );
 
-    // Stop midway through the film's hour stores the stop position (B110: without a runtime it
-    // would count as played to the end) and subtitles off, and clears now playing.
-    b110_set(&b.state, b.film, Some(B110_HOUR), None, None).await;
+    // Stop midway through the film's hour stores the stop position and subtitles off, and
+    // clears now playing.
     let body = serde_json::json!({
         "ItemId": film, "PositionTicks": B110_HOUR / 2, "SubtitleStreamIndex": -1,
     });
@@ -19325,17 +20096,21 @@ async fn b110_a_failed_stop_leaves_the_watch_data_alone() {
             .await
             .unwrap();
         b.start(item).await;
-        b.progress(item, 5_000).await;
+        b.progress(item, B110_HOUR / 2).await;
+        // What the progress left: the film's resume point; the item without a runtime as the
+        // start left it
+        let after_progress = if item == b.unknown {
+            (false, 1, 0, true)
+        } else {
+            (false, 1, B110_HOUR / 2, true)
+        };
+        assert_eq!(b.stored(item).await, after_progress, "{item}");
         let mut body = serde_json::json!({ "ItemId": item, "Failed": true });
         if let Some(ticks) = ticks {
             body["PositionTicks"] = serde_json::json!(ticks);
         }
         b.post("/Sessions/Playing/Stopped", body).await;
-        assert_eq!(
-            b.stored(item).await,
-            (false, 1, 5_000, true),
-            "{item} {ticks:?}"
-        );
+        assert_eq!(b.stored(item).await, after_progress, "{item} {ticks:?}");
     }
     // `Failed: false` is an ordinary stop.
     let body = serde_json::json!({ "ItemId": b.unknown, "PositionTicks": 0, "Failed": false });
@@ -19433,17 +20208,21 @@ async fn b110_the_reported_versions_runtime_decides() {
 async fn b110_progress_near_the_end_marks_played() {
     let b = B110::new().await;
     b.start(b.film).await;
-    // A resume point during play is kept as reported, even under 5%.
+    // Progress follows the same rules as a stop (Jellyfin's OnPlaybackProgress calls
+    // UpdatePlayState): under 5% no resume point is kept.
     b.progress(b.film, 1_000).await;
-    assert_eq!(b.stored(b.film).await, (false, 1, 1_000, true));
+    assert_eq!(b.stored(b.film).await, (false, 1, 0, true));
     b.progress(b.film, B110_HOUR / 2).await;
     assert_eq!(b.stored(b.film).await, (false, 1, B110_HOUR / 2, true));
     // Past 90% the item is played and leaves no resume point, as if the client never stops.
     b.progress(b.film, B110_HOUR * 95 / 100).await;
     assert_eq!(b.stored(b.film).await, (true, 1, 0, true));
-    // Progress on an item with no runtime stores the position and leaves it unplayed.
+    // Progress on an item whose runtime isn't known yet (not probed) changes nothing; Jellyfin
+    // would count it played to the end, which only a stop does here.
     b.progress(b.unknown, 5_000).await;
-    assert_eq!(b.stored(b.unknown).await, (false, 0, 5_000, true));
+    assert_eq!(b.stored(b.unknown).await, (false, 0, 0, false));
+    b.stop(b.unknown, Some(5_000)).await;
+    assert_eq!(b.stored(b.unknown).await, (true, 0, 0, true));
 }
 
 #[tokio::test]
@@ -19454,7 +20233,7 @@ async fn b110_played_items_leave_continue_watching_and_next_up_moves_on() {
     let next_up = format!("/Shows/NextUp?userId={}&seriesId={}", b.user, b.series);
     for item in [b.film, e1] {
         b.start(item).await;
-        b.progress(item, 1_000_000_000).await;
+        b.progress(item, B110_HOUR / 4).await;
     }
     let mut listed = b.ids(&resume).await;
     listed.sort();
@@ -25819,6 +26598,13 @@ fn r3item_detail() {
 #[test]
 fn r3item_play() {
     b124_node_test("r3item_play.mjs");
+}
+
+// R3 item extras: the Trailer button, the Special Features row and theme songs in the web client
+// (tests/web/r3extras_web.mjs)
+#[test]
+fn r3extras_web() {
+    b124_node_test("r3extras_web.mjs");
 }
 
 // R3 metadata: the admin's refresh, Identify, image and metadata editor dialogs in the web client
@@ -33511,20 +34297,35 @@ async fn b29_ok(
     assert!(status.is_success(), "{method} {uri}: {status} {json}");
 }
 
-/// The user saves a resume point at `ticks` on the item.
-async fn b29_progress(app: &axum::Router, token: &str, item: uuid::Uuid, ticks: i64) {
-    let body = serde_json::json!({ "ItemId": item, "PositionTicks": ticks });
-    b29_ok(app, token, "POST", "/Sessions/Playing/Progress", Some(body)).await;
+/// Stores a resume point at `ticks` on the item for the user, as written straight into the
+/// database. A progress report would apply the resume rules, which clear so small a position
+/// (and mark an item without a runtime played).
+async fn b29_progress(state: &AppState, user_id: &str, item: uuid::Uuid, ticks: i64) {
+    rustyfin_db::repo_playback::update_playback_position(
+        &state.db,
+        user_id.parse().unwrap(),
+        item,
+        ticks,
+    )
+    .await
+    .unwrap();
 }
 
-/// The user marks the item played and favorite, then saves a resume point at `ticks` on it.
-/// Marking played clears the resume point, as in Jellyfin, so the progress comes after.
-async fn b29_watch(app: &axum::Router, token: &str, user_id: &str, item: uuid::Uuid, ticks: i64) {
+/// The user marks the item played and favorite, then a resume point at `ticks` is stored on it.
+/// Marking played clears the resume point, as in Jellyfin, so the resume point comes after.
+async fn b29_watch(
+    app: &axum::Router,
+    state: &AppState,
+    token: &str,
+    user_id: &str,
+    item: uuid::Uuid,
+    ticks: i64,
+) {
     for route in ["PlayedItems", "FavoriteItems"] {
         let uri = format!("/Users/{user_id}/{route}/{item}");
         b29_ok(app, token, "POST", &uri, None).await;
     }
-    b29_progress(app, token, item, ticks).await;
+    b29_progress(state, user_id, item, ticks).await;
 }
 
 /// `GET /Items/{id}?userId=` as the token's user: asserts a 200 and returns the details.
@@ -33578,8 +34379,8 @@ async fn b29_each_user_gets_their_own_watch_data_in_item_details() {
     let (a, a_id, b, b_id) = g1_owner_and_viewer(&state, &app).await;
     for (kind, item, runtime) in b29_items(&state).await {
         // A watched it; B saved a resume point of its own.
-        b29_watch(&app, &a, &a_id, item, 1234).await;
-        b29_progress(&app, &b, item, 5000).await;
+        b29_watch(&app, &state, &a, &a_id, item, 1234).await;
+        b29_progress(&state, &b_id, item, 5000).await;
         let first = b29_details(&app, &a, &a_id, item).await;
         assert_eq!(
             g1c_user_data(&first),
@@ -33660,7 +34461,7 @@ async fn b29_a_change_to_watch_data_shows_on_the_next_request() {
                 "{kind}: after {change}"
             );
         }
-        b29_progress(&app, &a, item, 4321).await;
+        b29_progress(&state, &a_id, item, 4321).await;
         let details = b29_details(&app, &a, &a_id, item).await;
         assert_eq!(
             g1c_user_data(&details),
@@ -33693,8 +34494,8 @@ async fn b29_cached_item_details_equal_fresh_ones() {
     let (a, a_id, b, b_id) = g1_owner_and_viewer(&state, &app).await;
     let mut cached = Vec::new();
     for (kind, item, _) in b29_items(&state).await {
-        b29_watch(&app, &a, &a_id, item, 1234).await;
-        b29_progress(&app, &b, item, 5000).await;
+        b29_watch(&app, &state, &a, &a_id, item, 1234).await;
+        b29_progress(&state, &b_id, item, 5000).await;
         let key = item.to_string();
         state.cache.item_details.invalidate(&key);
         let a_fresh = b29_details(&app, &a, &a_id, item).await;
@@ -33722,7 +34523,7 @@ async fn b29_item_details_never_reach_the_l2_table() {
     let (a, a_id, b, b_id) = g1_owner_and_viewer(&state, &before_restart).await;
     let items = b29_items(&state).await;
     let photo = items.iter().find(|(kind, ..)| *kind == "Photo").unwrap().1;
-    b29_watch(&before_restart, &a, &a_id, photo, 1234).await;
+    b29_watch(&before_restart, &state, &a, &a_id, photo, 1234).await;
     let details = b29_details(&before_restart, &a, &a_id, photo).await;
     // The L2 copy is saved in the background.
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -38140,7 +38941,7 @@ async fn b22_playback_info_lists_external_subtitles() {
     assert_eq!(streams[4]["Codec"], "subrip");
     for (stream, codec, language, path) in [
         (&streams[0], "ass", None, &ass),
-        (&streams[1], "srt", Some("eng"), &srt),
+        (&streams[1], "subrip", Some("eng"), &srt),
     ] {
         assert_eq!(stream["CodecType"], "subtitle", "{stream}");
         assert_eq!(stream["Type"], "Subtitle", "{stream}");
@@ -46549,4 +47350,690 @@ async fn j2_audio_transcode_plays_without_a_header() {
     let stop = format!("/Videos/ActiveEncodings?PlaySessionId={ps}");
     let (status, _) = send(&app, request("DELETE", &stop, Some(&token), None)).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+// R3 playback gaps 3: the server's resume rules decide progress and stop reports, and the
+// stored-path checks keep their resolved owned paths and confine pictures to the libraries and
+// the data dir
+
+/// Sets resume rules in the server configuration, as a client saving them would.
+async fn r3gaps3_resume_rules(state: &AppState, rules: &[(&str, i64)]) {
+    let mut config = state.config.write().await;
+    for (key, value) in rules {
+        config
+            .other
+            .insert(key.to_string(), serde_json::json!(value));
+    }
+}
+
+#[tokio::test]
+async fn r3gaps3_progress_and_stop_follow_the_configured_resume_rules() {
+    let b = B110::new().await;
+    // A 1 h film; under the defaults 10 % would keep a resume point and 60 % too
+    r3gaps3_resume_rules(
+        &b.state,
+        &[
+            ("MinResumePct", 20),
+            ("MaxResumePct", 50),
+            ("MinResumeDurationSeconds", 3600),
+        ],
+    )
+    .await;
+    let film = b.film.to_string();
+    b.start(b.film).await;
+    b.progress(b.film, B110_HOUR / 10).await;
+    assert_eq!(b.stored(b.film).await, (false, 1, 0, true));
+    assert_eq!(
+        b.details_fields(b.film).await,
+        (film.clone(), Some(false), None, None)
+    );
+    // 30 %: kept, and PlayedPercentage follows it
+    b.progress(b.film, B110_HOUR * 3 / 10).await;
+    assert_eq!(b.stored(b.film).await, (false, 1, B110_HOUR * 3 / 10, true));
+    assert_eq!(
+        b.details_fields(b.film).await,
+        (film.clone(), Some(false), None, Some(30.0))
+    );
+    // 60 %: past MaxResumePct 50, so played with no resume point
+    b.stop(b.film, Some(B110_HOUR * 6 / 10)).await;
+    assert_eq!(b.stored(b.film).await, (true, 1, 0, true));
+    assert_eq!(
+        b.details_fields(b.film).await,
+        (film, Some(true), None, None)
+    );
+
+    // A 30 min episode is under MinResumeDurationSeconds (1 h): stopped midway, it is played
+    let [e1, ..] = b.episodes;
+    b.start(e1).await;
+    b.stop(e1, Some(B110_HOUR / 4)).await;
+    assert_eq!(b.stored(e1).await, (true, 1, 0, true));
+}
+
+/// An item without a played flag in Jellyfin (a photo, a genre) keeps no resume point and stays
+/// unplayed after progress and stop reports.
+#[tokio::test]
+async fn r3gaps3_items_without_a_played_status_stay_unplayed() {
+    let b = B110::new().await;
+    let photos = j5_library(
+        &b.state,
+        "R3 Photos",
+        rustyfin_model::library::LibraryContentType::Mixed,
+    )
+    .await;
+    let photo = j5_item(&b.state, photos, None, "R3 Photo", "Photo", "", None).await;
+    b110_set(&b.state, photo, Some(B110_HOUR), None, None).await;
+    b.progress(photo, B110_HOUR / 2).await;
+    assert_eq!(b.stored(photo).await, (false, 0, 0, true));
+    b.stop(photo, None).await;
+    assert_eq!(b.stored(photo).await, (false, 1, 0, true));
+}
+
+#[tokio::test]
+async fn r3gaps3_default_resume_rules_apply_when_none_are_saved() {
+    let b = B110::new().await;
+    // A 30 min episode stopped at 50 % keeps its resume point under the defaults
+    let [e1, ..] = b.episodes;
+    b.start(e1).await;
+    b.stop(e1, Some(B110_HOUR / 4)).await;
+    assert_eq!(b.stored(e1).await, (false, 1, B110_HOUR / 4, true));
+    // A value that isn't a number keeps the default
+    b.state
+        .config
+        .write()
+        .await
+        .other
+        .insert("MaxResumePct".to_string(), serde_json::json!("high"));
+    b.progress(e1, B110_HOUR * 95 / 200).await;
+    assert_eq!(b.stored(e1).await, (true, 1, 0, true));
+}
+
+#[tokio::test]
+async fn r3gaps3_pictures_outside_the_libraries_and_data_dir_are_refused() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let lib = std::path::PathBuf::from(media_folder(&state, "r3gaps3-images"));
+    std::fs::write(lib.join("Film.mkv"), vec![7u8; 500]).unwrap();
+    let id = r3playback_insert_item(&state, &lib, lib.join("Film.mkv").to_str().unwrap()).await;
+    // A folder outside the data dir and outside every library, then made a library
+    let elsewhere = std::env::temp_dir().join(format!("rustyfin_r3gaps3_{}", uuid::Uuid::new_v4()));
+    remove_when_test_ends(&elsewhere);
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::fs::write(elsewhere.join("poster.png"), TINY_PNG).unwrap();
+    let img = rustyfin_model::image::ItemImage {
+        item_id: id,
+        image_type: rustyfin_model::image::ImageType::Primary,
+        image_index: 0,
+        path: elsewhere.join("poster.png").to_str().unwrap().to_string(),
+        provider: "local".to_string(),
+        width: None,
+        height: None,
+        blurhash: None,
+        stamp: None,
+    };
+    rustyfin_db::repo_image::upsert_image(&state.db, &img)
+        .await
+        .unwrap();
+    let app = app(state.clone());
+    let uri = format!("/Items/{id}/Images/Primary");
+
+    let (status, _) = r3playback_get(&app, &uri, &token).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "a picture in no library");
+    let read_at = || *state.file_guard.library_roots_read_at.read().unwrap();
+    let first_read = read_at().expect("the refusal read the library paths");
+
+    // Its folder becomes a library behind the API's back: refused pictures don't read the
+    // library paths again within 30 s, so it stays refused and nothing is read
+    r3playback_insert_item(
+        &state,
+        &elsewhere,
+        elsewhere.join("Other.mkv").to_str().unwrap(),
+    )
+    .await;
+    for _ in 0..3 {
+        let (status, _) = r3playback_get(&app, &uri, &token).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "the kept library paths are used"
+        );
+    }
+    assert_eq!(read_at(), Some(first_read));
+
+    // A library added through the API drops the kept paths, so the picture shows at once
+    create_library_via_api(&app, &state, &token, "R3gaps3 Other", "Movies").await;
+    let (status, body) = r3playback_get(&app, &uri, &token).await;
+    assert_eq!(status, StatusCode::OK, "the library paths are read again");
+    assert!(body.starts_with(b"\x89PNG"));
+}
+
+#[tokio::test]
+async fn r3gaps3_owned_paths_are_resolved_once_and_kept() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let lib = std::path::PathBuf::from(media_folder(&state, "r3gaps3-owned"));
+    std::fs::write(lib.join("Film.mkv"), vec![7u8; 500]).unwrap();
+    let id = r3playback_insert_item(&state, &lib, lib.join("Film.mkv").to_str().unwrap()).await;
+    // A link in the library to the server's database
+    let linked = r3playback_insert_item(&state, &lib, lib.join("db.mkv").to_str().unwrap()).await;
+    std::os::unix::fs::symlink(state.data_dir.join("test.db"), lib.join("db.mkv")).unwrap();
+    let app = app(state.clone());
+    let kept = || state.file_guard.owned_set.read().unwrap().clone();
+    assert!(kept().is_none());
+
+    let uri = format!("/Videos/{id}/stream?static=true");
+    let (status, _) = r3playback_get(&app, &uri, &token).await;
+    assert_eq!(status, StatusCode::OK);
+    let (first_at, first) = kept().expect("the owned set is kept");
+    assert!(
+        first
+            .data_forms
+            .iter()
+            .any(|d| state.data_dir.starts_with(d) || d.starts_with(&*state.data_dir))
+    );
+
+    // The next requests use the same set, and it still refuses the server's own files
+    let (status, _) = r3playback_get(&app, &uri, &token).await;
+    assert_eq!(status, StatusCode::OK);
+    let refused = format!("/Videos/{linked}/stream?static=true");
+    let (status, body) = r3playback_get(&app, &refused, &token).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(!body.starts_with(b"SQLite format"));
+    let (again_at, again) = kept().unwrap();
+    assert!(Arc::ptr_eq(&first, &again));
+    assert_eq!(first_at, again_at);
+}
+
+// R3 admin dashboard 2: library folders and name, task triggers, Quick Connect, sessions, shutdown
+
+/// The `Locations` of the library `name` in `GET /Library/VirtualFolders`, or None without it.
+async fn r3admin_locations(app: &axum::Router, token: &str, name: &str) -> Option<Vec<String>> {
+    let (status, libs) = send_authed(app, "GET", "/Library/VirtualFolders", token, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let lib = libs.as_array()?.iter().find(|l| l["Name"] == name)?.clone();
+    Some(
+        lib["Locations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p.as_str().unwrap().to_string())
+            .collect(),
+    )
+}
+
+#[tokio::test]
+async fn r3admin_library_folders_are_added_updated_and_removed_by_name() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    create_library_via_api(&app, &state, &token, "R3Films", "Movies").await;
+    let first = media_folder(&state, "r3films");
+    let second = media_folder(&state, "r3films-more");
+    let post = |uri: &str, body: serde_json::Value| {
+        let (app, token, uri) = (app.clone(), token.clone(), uri.to_string());
+        async move {
+            send_authed(&app, "POST", &uri, &token, Some(&body.to_string()))
+                .await
+                .0
+        }
+    };
+
+    // Jellyfin's AddMediaPathDto: the folder in PathInfo.Path, or in Path
+    let add = serde_json::json!({ "Name": "R3Films", "PathInfo": { "Path": second } });
+    assert_eq!(
+        post("/Library/VirtualFolders/Paths", add.clone()).await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        r3admin_locations(&app, &token, "R3Films").await.unwrap(),
+        [first.clone(), second.clone()]
+    );
+    // The same folder again (also with a trailing slash), a missing folder, an unknown library
+    assert_eq!(
+        post("/Library/VirtualFolders/Paths", add).await,
+        StatusCode::BAD_REQUEST
+    );
+    let slash = serde_json::json!({ "Name": "R3Films", "Path": format!("{second}/") });
+    assert_eq!(
+        post("/Library/VirtualFolders/Paths", slash).await,
+        StatusCode::BAD_REQUEST
+    );
+    let missing = format!("{first}/not-there");
+    let body = serde_json::json!({ "Name": "R3Films", "Path": missing });
+    assert_eq!(
+        post("/Library/VirtualFolders/Paths", body).await,
+        StatusCode::BAD_REQUEST
+    );
+    let body = serde_json::json!({ "Name": "Nope", "Path": second });
+    assert_eq!(
+        post("/Library/VirtualFolders/Paths", body).await,
+        StatusCode::NOT_FOUND
+    );
+    let body = serde_json::json!({ "Name": "R3Films" });
+    assert_eq!(
+        post("/Library/VirtualFolders/Paths", body).await,
+        StatusCode::BAD_REQUEST
+    );
+
+    // Paths/Update: a folder of the library answers 204, another one 400
+    let update = serde_json::json!({ "Name": "R3Films", "PathInfo": { "Path": second } });
+    assert_eq!(
+        post("/Library/VirtualFolders/Paths/Update", update).await,
+        StatusCode::NO_CONTENT
+    );
+    let update = serde_json::json!({ "Name": "R3Films", "PathInfo": { "Path": missing } });
+    assert_eq!(
+        post("/Library/VirtualFolders/Paths/Update", update).await,
+        StatusCode::BAD_REQUEST
+    );
+
+    // DELETE ?name=&path=: 204 (the path matched with a trailing slash), then 404 for a folder
+    // the library no longer has. The test folders' paths need no escaping in a query
+    let q = |path: &str| {
+        format!("/Library/VirtualFolders/Paths?name=R3Films&path={path}&refreshLibrary=false")
+    };
+    let (status, _) = send_authed(&app, "DELETE", &q(&format!("{second}/")), &token, None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        r3admin_locations(&app, &token, "R3Films").await.unwrap(),
+        std::slice::from_ref(&first)
+    );
+    let (status, _) = send_authed(&app, "DELETE", &q(&second), &token, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // The last folder stays, in either form: 400
+    let (status, _) = send_authed(&app, "DELETE", &q(&first), &token, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let id = rustyfin_db::repo_library::get_all_libraries(&state.db)
+        .await
+        .unwrap()[0]
+        .id;
+    let body = serde_json::json!({ "LibraryId": id, "Paths": [first] }).to_string();
+    let (status, _) = send_authed(
+        &app,
+        "DELETE",
+        "/Library/VirtualFolders/Paths",
+        &token,
+        Some(&body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        r3admin_locations(&app, &token, "R3Films").await.unwrap(),
+        std::slice::from_ref(&first)
+    );
+
+    // Rustyfin's earlier body form still removes folders
+    assert_eq!(
+        post(
+            "/Library/VirtualFolders/Paths",
+            serde_json::json!({ "Name": "R3Films", "Path": second })
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    let body = serde_json::json!({ "LibraryId": id, "Paths": [second] }).to_string();
+    let (status, _) = send_authed(
+        &app,
+        "DELETE",
+        "/Library/VirtualFolders/Paths",
+        &token,
+        Some(&body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        r3admin_locations(&app, &token, "R3Films").await.unwrap(),
+        std::slice::from_ref(&first)
+    );
+}
+
+#[tokio::test]
+async fn r3admin_removing_a_folder_removes_its_items_and_their_user_data() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, user) = admin_session(&state).await;
+    let keep = media_folder(&state, "r3keep");
+    let gone = media_folder(&state, "r3gone");
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: "R3Two".into(),
+        content_type: rustyfin_model::library::LibraryContentType::Movies,
+        paths: vec![keep.clone(), format!("{gone}/")],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    let mut ids = Vec::new();
+    for path in [
+        format!("{keep}/A.mkv"),
+        format!("{gone}/B.mkv"),
+        format!("{gone}/sub/C.mkv"),
+    ] {
+        let id = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO media_items (id, library_id, name, media_type, path) VALUES (?, ?, 'x', 'Movie', ?)")
+            .bind(id.to_string())
+            .bind(lib.id.to_string())
+            .bind(&path)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        ids.push(id);
+    }
+    // A watched mark on an item that goes
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        &format!("/Users/{user}/PlayedItems/{}", ids[1]),
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The folder named without its trailing slash
+    let uri = format!("/Library/VirtualFolders/Paths?name=R3Two&path={gone}");
+    let (status, _) = send_authed(&app, "DELETE", &uri, &token, None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let left: Vec<String> = sqlx::query_scalar("SELECT id FROM media_items WHERE library_id = ?")
+        .bind(lib.id.to_string())
+        .fetch_all(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(left, [ids[0].to_string()]);
+    let marks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM user_item_data WHERE item_id = ?")
+        .bind(ids[1].to_string())
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(marks, 0);
+}
+
+#[tokio::test]
+async fn r3admin_library_is_renamed() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    create_library_via_api(&app, &state, &token, "R3Films", "Movies").await;
+    create_library_via_api(&app, &state, &token, "R3Shows", "TvShows").await;
+    let rename = |q: &str| {
+        let (app, token, uri) = (
+            app.clone(),
+            token.clone(),
+            format!("/Library/VirtualFolders/Name?{q}"),
+        );
+        async move { send_authed(&app, "POST", &uri, &token, None).await.0 }
+    };
+    assert_eq!(
+        rename("name=R3Films&newName=R3%20Movies").await,
+        StatusCode::NO_CONTENT
+    );
+    assert!(r3admin_locations(&app, &token, "R3 Movies").await.is_some());
+    assert!(r3admin_locations(&app, &token, "R3Films").await.is_none());
+    // The views show the new name
+    let (_, views) = send_authed(&app, "GET", "/UserViews", &token, None).await;
+    let names: Vec<_> = views["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["Name"].clone())
+        .collect();
+    assert!(names.contains(&"R3 Movies".into()), "{names:?}");
+
+    assert_eq!(
+        rename("name=R3%20Movies&newName=r3shows").await,
+        StatusCode::BAD_REQUEST
+    );
+    // Names clash without case beyond ASCII too: "R3ÄRZTE" is "r3ärzte"
+    create_library_via_api(&app, &state, &token, "R3ÄRZTE", "Movies").await;
+    assert_eq!(
+        rename("name=R3Shows&newName=r3%C3%A4rzte").await,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        rename("name=Nope&newName=Other").await,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(rename("name=R3Shows").await, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        rename("name=R3Shows&newName=%20").await,
+        StatusCode::BAD_REQUEST
+    );
+}
+
+#[tokio::test]
+async fn r3admin_task_triggers_are_checked_kept_and_read_after_a_restart() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    const HOUR: u64 = 36_000_000_000;
+    let triggers = serde_json::json!([
+        { "Type": "DailyTrigger", "TimeOfDayTicks": 3 * HOUR },
+        { "Type": "WeeklyTrigger", "TimeOfDayTicks": 2 * HOUR, "DayOfWeek": "Sunday" },
+        { "Type": "IntervalTrigger", "IntervalTicks": HOUR / 2 },
+        { "Type": "StartupTrigger" },
+    ]);
+    let post = |id: &str, body: serde_json::Value| {
+        let (app, token, uri) = (
+            app.clone(),
+            token.clone(),
+            format!("/ScheduledTasks/{id}/Triggers"),
+        );
+        async move {
+            send_authed(&app, "POST", &uri, &token, Some(&body.to_string()))
+                .await
+                .0
+        }
+    };
+    assert_eq!(
+        post("LibraryScan", triggers.clone()).await,
+        StatusCode::NO_CONTENT
+    );
+    let (_, task) = send_authed(&app, "GET", "/ScheduledTasks/LibraryScan", &token, None).await;
+    let got = &task["Triggers"];
+    assert_eq!(got.as_array().map(Vec::len), Some(4));
+    assert_eq!(got[0]["Type"], "DailyTrigger");
+    assert_eq!(got[0]["TimeOfDayTicks"], 3 * HOUR);
+    assert_eq!(got[1]["DayOfWeek"], "Sunday");
+    assert_eq!(got[2]["IntervalTicks"], HOUR / 2);
+    assert_eq!(got[3]["Type"], "StartupTrigger");
+
+    // A trigger the scheduler can't use is refused, and the saved ones stay
+    for bad in [
+        serde_json::json!([{ "Type": "WeeklyTrigger", "TimeOfDayTicks": 0 }]),
+        serde_json::json!([{ "Type": "WeeklyTrigger", "TimeOfDayTicks": 0, "DayOfWeek": "Someday" }]),
+        serde_json::json!([{ "Type": "DailyTrigger" }]),
+        serde_json::json!([{ "Type": "DailyTrigger", "TimeOfDayTicks": 24 * HOUR }]),
+        serde_json::json!([{ "Type": "IntervalTrigger", "IntervalTicks": 0 }]),
+        serde_json::json!([{ "Type": "SometimesTrigger" }]),
+    ] {
+        assert_eq!(
+            post("LibraryScan", bad.clone()).await,
+            StatusCode::BAD_REQUEST,
+            "{bad}"
+        );
+    }
+    assert_eq!(
+        post("NoSuchTask", serde_json::json!([])).await,
+        StatusCode::NOT_FOUND
+    );
+    let kept = state.task_scheduler.get_task("LibraryScan").await.unwrap();
+    assert_eq!(kept.triggers.len(), 4);
+
+    // A new scheduler on the same data folder (a restart) reads them; other tasks keep theirs
+    let restarted =
+        rustyfin_core::scheduler::TaskScheduler::new(state.db.clone(), state.data_dir.clone());
+    let after = restarted.get_task("LibraryScan").await.unwrap();
+    assert_eq!(
+        serde_json::to_value(&after.triggers).unwrap(),
+        serde_json::to_value(&kept.triggers).unwrap()
+    );
+    let vacuum = restarted.get_task("DatabaseVacuum").await.unwrap();
+    assert_eq!(vacuum.triggers[0].trigger_type, "IntervalTrigger");
+
+    // An empty list is kept too: the task then runs only when started
+    assert_eq!(
+        post("LibraryScan", serde_json::json!([])).await,
+        StatusCode::NO_CONTENT
+    );
+    let restarted =
+        rustyfin_core::scheduler::TaskScheduler::new(state.db.clone(), state.data_dir.clone());
+    assert!(
+        restarted
+            .get_task("LibraryScan")
+            .await
+            .unwrap()
+            .triggers
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn r3admin_quick_connect_follows_the_setting() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let enabled = || async {
+        send(&app, request("GET", "/QuickConnect/Enabled", None, None))
+            .await
+            .1
+    };
+    assert_eq!(enabled().await, true, "on by default, as in Jellyfin");
+
+    let (_, mut config) = send_authed(&app, "GET", "/System/Configuration", &token, None).await;
+    assert_eq!(config["QuickConnectAvailable"], true);
+    config["QuickConnectAvailable"] = false.into();
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        "/System/Configuration",
+        &token,
+        Some(&config.to_string()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(enabled().await, false);
+    // The saved file carries this build's version, so the next start keeps the admin's false
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(state.data_dir.join("config.json")).unwrap())
+            .unwrap();
+    assert_eq!(saved["QuickConnectAvailable"], false);
+    assert_eq!(
+        saved["RustyfinConfigVersion"],
+        rustyfin_model::server_info::CONFIG_VERSION
+    );
+    let (status, _) = send(&app, request("POST", "/QuickConnect/Initiate", None, None)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        "/QuickConnect/Authorize?code=123456",
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn r3admin_transcoding_sessions_show_their_transcoding_info() {
+    let state = test_state().await;
+    add_user(&state, "r3a-chrome", "r3a-pass", true).await;
+    let (hi10, hi10_source, _) =
+        j2_item(&state, "r3a-hi10", "Movie", "mp4", j2_h264("High 10", 10)).await;
+    let app = app(state);
+    let (token, _) = g2_login_device(&app, "r3a-chrome", "r3a-pass", "r3a-device")
+        .await
+        .unwrap();
+    let chrome = serde_json::json!({ "DeviceProfile": j2_chrome_profile() });
+    let uri = format!("/Items/{hi10}/PlaybackInfo");
+    let (sources, ps) = j2_play(&app, "POST", &uri, &token, Some(chrome)).await;
+    assert_eq!(j2_reasons(&sources[0]), ["VideoProfileNotSupported"]);
+
+    let session = || async {
+        let (status, list) =
+            send_authed(&app, "GET", "/Sessions?DeviceId=r3a-device", &token, None).await;
+        assert_eq!(status, StatusCode::OK);
+        list[0].clone()
+    };
+    let report = |method: &str| {
+        serde_json::json!({
+            "ItemId": hi10, "PositionTicks": 0, "PlaySessionId": ps, "MediaSourceId": hi10_source,
+            "PlayMethod": method, "CanSeek": true,
+        })
+        .to_string()
+    };
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        "/Sessions/Playing",
+        &token,
+        Some(&report("Transcode")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let s = session().await;
+    assert_eq!(s["PlayState"]["PlayMethod"], "Transcode");
+    assert_eq!(
+        s["TranscodingInfo"]["TranscodeReasons"],
+        serde_json::json!(["VideoProfileNotSupported"]),
+        "{s}"
+    );
+    assert_eq!(s["TranscodingInfo"]["IsVideoDirect"], false);
+
+    // A direct play has none
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        "/Sessions/Playing",
+        &token,
+        Some(&report("DirectPlay")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(session().await.get("TranscodingInfo").is_none());
+}
+
+#[tokio::test]
+async fn r3admin_shutdown_answers_204_and_info_says_shutting_down() {
+    let state = test_state().await;
+    let mut rx = state.shutdown_tx.subscribe();
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let (_, info) = send_authed(&app, "GET", "/System/Info", &token, None).await;
+    assert_eq!(info["IsShuttingDown"], false);
+    for key in [
+        "CachePath",
+        "InternalMetadataPath",
+        "TranscodingTempPath",
+        "LogPath",
+        "ProgramDataPath",
+    ] {
+        assert!(info[key].as_str().is_some_and(|p| !p.is_empty()), "{key}");
+    }
+    assert_eq!(info["HasPendingRestart"], false);
+    let (status, _) = send_authed(&app, "POST", "/System/Shutdown", &token, None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(*rx.borrow_and_update());
+    let (_, info) = send_authed(&app, "GET", "/System/Info", &token, None).await;
+    assert_eq!(info["IsShuttingDown"], true);
+}
+
+#[tokio::test]
+async fn r3admin_restart_stops_with_the_restart_exit_code() {
+    let state = test_state().await;
+    let mut rx = state.shutdown_tx.subscribe();
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let (status, _) = send_authed(&app, "POST", "/System/Restart", &token, None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(*rx.borrow_and_update(), "the server stops");
+    // Not 0, so Docker `on-failure` and systemd `Restart=on-failure` start it again. (A
+    // shutdown's 0 is checked on a running server: this flag is per process.)
+    assert_eq!(rustyfin_api::routes::exit_code(), 75);
+    assert_eq!(rustyfin_api::routes::RESTART_EXIT_CODE, 75);
+}
+
+#[test]
+fn r3admin_web_dashboard() {
+    b124_node_test("r3admin_dashboard.mjs");
 }

@@ -254,7 +254,8 @@ function dateLocaleLabel(tag) {
 function displaySettingsHtml() {
     const dateOptions = [{ value: '', label: t('settings.date_format_auto') }, ...DATE_LOCALES.map(tag => ({ value: tag, label: dateLocaleLabel(tag) }))];
     return selectHtml(t('settings.date_format'), 'id="pref-datetimelocale" data-pref="datetimelocale" onchange="changeUserPref(this)"', dateOptions, userSetting('datetimelocale', ''))
-        + toggleHtml(t('settings.show_backdrops'), 'id="pref-backdrops" data-pref="enableBackdrops" onchange="changeUserPref(this)"', userSetting('enableBackdrops', 'true') !== 'false');
+        + toggleHtml(t('settings.show_backdrops'), 'id="pref-backdrops" data-pref="enableBackdrops" onchange="changeUserPref(this)"', userSetting('enableBackdrops', 'true') !== 'false')
+        + toggleHtml(t('settings.play_theme_songs'), 'id="pref-theme-songs" data-pref="enableThemeSongs" onchange="changeUserPref(this)"', userSetting('enableThemeSongs', 'false') === 'true');
 }
 
 function homeSettingsHtml(config, libraries) {
@@ -449,9 +450,19 @@ function providerKeyField(value, clear) {
     return undefined;
 }
 
+// POST /System/Configuration replaces the whole configuration, so the form's fields go over the
+// configuration as it is now; the fields the form doesn't show are kept.
 async function handleSaveConfig(e) {
     e.preventDefault();
+    let current;
+    try {
+        current = await API.getConfig();
+    } catch (err) {
+        toast(err.message, 'error');
+        return;
+    }
     const body = {
+        ...current,
         ServerName: $('cfg-server-name')?.value || 'Rustyfin',
         PreferredMetadataLanguage: $('cfg-meta-lang')?.value || 'de',
         PublicPort: parseInt($('cfg-port')?.value) || 8096,

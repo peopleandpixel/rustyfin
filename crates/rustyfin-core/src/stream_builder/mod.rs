@@ -4,6 +4,7 @@
 mod audio;
 pub mod conditions;
 mod facts;
+mod selection;
 mod subtitles;
 mod url;
 mod video;
@@ -15,6 +16,7 @@ use rustyfin_model::device_profile::{
 };
 
 pub use facts::{SourceFacts, StreamFacts};
+pub use selection::{AudioIndexSource, SubtitleMode, TrackPreferences};
 
 /// How a stream is delivered. The order matches Jellyfin's values 0, 1 and 2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]

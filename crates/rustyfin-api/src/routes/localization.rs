@@ -111,6 +111,33 @@ fn cultures() -> Vec<CultureDto> {
         .collect()
 }
 
+/// A user's language preference as Jellyfin's `MediaSourceManager.NormalizeLanguage` reads it:
+/// the three-letter codes of the culture it names (by name, two- or three-letter code, any case),
+/// the preference itself when it names none, and nothing when it is empty.
+pub(crate) fn normalize_language(language: &str) -> Vec<String> {
+    if language.is_empty() {
+        return Vec::new();
+    }
+    let found = cultures().into_iter().find(|culture| {
+        [
+            culture.name,
+            culture.two_letter_iso_language_name,
+            culture.three_letter_iso_language_name,
+        ]
+        .iter()
+        .chain(culture.three_letter_iso_language_names.iter())
+        .any(|code| !code.is_empty() && code.eq_ignore_ascii_case(language))
+    });
+    match found {
+        Some(culture) => culture
+            .three_letter_iso_language_names
+            .iter()
+            .map(|code| code.to_string())
+            .collect(),
+        None => vec![language.to_string()],
+    }
+}
+
 fn countries() -> Vec<CountryInfo> {
     COUNTRIES
         .lines()
@@ -291,4 +318,23 @@ async fn get_options(_state: State<AppState>) -> Result<Json<LocalizationOptions
     Ok(Json(LocalizationOptions {
         subtitle_languages: languages,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_language;
+
+    /// A preference names a culture by any of its codes and becomes its three-letter codes; one
+    /// that names none is kept, and an empty one is no preference.
+    #[test]
+    fn r3gaps3_language_preferences_normalize_as_jellyfin() {
+        assert_eq!(normalize_language("en"), vec!["eng"]);
+        assert_eq!(normalize_language("ENG"), vec!["eng"]);
+        assert_eq!(normalize_language("ger"), vec!["deu", "ger"]);
+        assert_eq!(
+            normalize_language("OriginalLanguage"),
+            vec!["OriginalLanguage"]
+        );
+        assert!(normalize_language("").is_empty());
+    }
 }
