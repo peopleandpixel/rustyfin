@@ -148,8 +148,9 @@ async fn serve_image(
     }
 
     // A stored path is read only when it is a picture outside the server's own files
+    // The check gives the resolved path, which is read from here on
     if !(img.path.starts_with("http://") || img.path.starts_with("https://")) {
-        crate::routes::streaming::validate_image_path(state, &img.path).await?;
+        img.path = crate::routes::streaming::validate_image_path(state, &img.path).await?;
     }
 
     // A stored size spares the header read, but counts only when both sides are known.

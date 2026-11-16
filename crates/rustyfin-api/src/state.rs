@@ -75,4 +75,17 @@ pub struct AppState {
     pub jellyfin_import: rustyfin_core::jellyfin_import::ImportJob,
     /// Permits for the folder listings that run at once (see `DirectoryListings`).
     pub directory_listings: DirectoryListings,
+    /// What the file checks keep between requests (see `FileGuardCache`).
+    pub file_guard: FileGuardCache,
+}
+
+/// What the stored-path checks keep between requests, so a stream, subtitle or image request
+/// runs no database query for them: the files the server owns outside its data dir (its
+/// database, TLS key and certificate), read once, and every library's paths, resolved. The
+/// roots are read again when a path falls outside the ones held, so a library added or changed
+/// since counts at once.
+#[derive(Clone, Default)]
+pub struct FileGuardCache {
+    pub owned_files: Arc<tokio::sync::OnceCell<Vec<PathBuf>>>,
+    pub library_roots: Arc<std::sync::RwLock<Option<Arc<Vec<PathBuf>>>>>,
 }

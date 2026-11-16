@@ -95,6 +95,7 @@ async fn test_state() -> AppState {
         oidc: rustyfin_api::oidc::OidcState::new(),
         jellyfin_import: Default::default(),
         directory_listings: Default::default(),
+        file_guard: Default::default(),
     }
 }
 
@@ -32155,16 +32156,23 @@ async fn r3playback_hls_input_outside_the_library_is_refused() {
     std::fs::write(&film, vec![7u8; 500]).unwrap();
     let db = state.data_dir.join("test.db");
     std::os::unix::fs::symlink(&db, lib.join("Linked.mkv")).unwrap();
+    // A link that sits in the library but points out of every library
+    std::os::unix::fs::symlink(&film, lib.join("Out.mkv")).unwrap();
     let s = |p: &std::path::Path| p.to_str().unwrap().to_string();
     let mut ids = Vec::new();
     for path in [
         s(&film),
         s(&db),
         s(&lib.join("Linked.mkv")),
+        s(&lib.join("Out.mkv")),
         format!("{}/../r3-outside/Film.mkv", lib.display()),
     ] {
         ids.push(r3playback_insert_item(&state, &lib, &path).await);
     }
+    // A file of its own in the library passes the check (ffmpeg then fails on its bytes)
+    let inside = lib.join("In.mkv");
+    std::fs::write(&inside, vec![7u8; 500]).unwrap();
+    let inside_id = r3playback_insert_item(&state, &lib, &s(&inside)).await;
     let manager = state.transcode_manager.clone();
     let app = app(state);
 
@@ -32173,7 +32181,23 @@ async fn r3playback_hls_input_outside_the_library_is_refused() {
         let (status, _) = r3playback_get(&app, &uri, &token).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{id}");
         assert!(!manager.is_active(id).await, "{id}: ffmpeg started");
+        // The direct stream refuses the same paths
+        let uri = format!("/Videos/{id}/stream?Static=true");
+        let (status, _) = r3playback_get(&app, &uri, &token).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{id}: stream");
     }
+    let uri = format!("/Videos/{inside_id}/main.m3u8?PlaySessionId=r3-inside");
+    let (status, body) = r3playback_get(&app, &uri, &token).await;
+    assert_ne!(
+        status,
+        StatusCode::NOT_FOUND,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    let uri = format!("/Videos/{inside_id}/stream?Static=true");
+    let (status, _) = r3playback_get(&app, &uri, &token).await;
+    assert_eq!(status, StatusCode::OK);
+    manager.stop_all().await;
 }
 
 #[tokio::test]
@@ -32254,6 +32278,10 @@ async fn r3playback_image_routes_serve_pictures_only() {
     std::fs::write(lib.join("poster.png"), TINY_PNG).unwrap();
     std::os::unix::fs::symlink(&db, lib.join("backdrop.jpg")).unwrap();
     std::fs::write(lib.join("notes.jpg"), b"not a picture at all").unwrap();
+    // An MP4 renamed .jpg: an ISO media file without a picture brand
+    let mut mp4 = b"\x00\x00\x00\x20ftypisom\x00\x00\x02\x00isomiso2avc1mp41".to_vec();
+    mp4.extend(vec![0u8; 64]);
+    std::fs::write(lib.join("clip.jpg"), &mp4).unwrap();
     std::fs::write(state.data_dir.join("logs").join("logo.png"), TINY_PNG).unwrap();
     std::fs::create_dir_all(state.data_dir.join("metadata")).unwrap();
     std::fs::write(state.data_dir.join("metadata").join("art.png"), TINY_PNG).unwrap();
@@ -32277,6 +32305,11 @@ async fn r3playback_image_routes_serve_pictures_only() {
             StatusCode::NOT_FOUND,
         ),
         (ImageType::Thumb, s(db.clone()), StatusCode::NOT_FOUND),
+        (
+            ImageType::Screenshot,
+            s(lib.join("clip.jpg")),
+            StatusCode::NOT_FOUND,
+        ),
         (
             ImageType::Banner,
             s(lib.join("notes.jpg")),

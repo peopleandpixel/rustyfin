@@ -105,13 +105,14 @@ async fn get_subtitle(
 
 /// The external subtitle file `index` beside an item's file. The item's file and the subtitle
 /// file must both pass the library check the streams use, so neither a stored path nor a link
-/// beside it reads a file outside the library or one the server owns.
+/// beside it reads a file outside the library or one the server owns. The returned subtitle's
+/// path is the resolved one, which the caller opens.
 async fn external_subtitle(
     state: &AppState,
     item: &rustyfin_model::media::MediaItem,
     index: usize,
 ) -> Result<rustyfin_core::subtitle::ExternalSubtitle, ApiError> {
-    validate_path_against_library(state, &item.library_id, &item.path).await?;
+    validate_path_against_library(state, &item.path).await?;
     let media_path = PathBuf::from(&item.path);
     let sub = tokio::task::spawn_blocking(move || discover_external_subtitles(&media_path))
         .await
@@ -119,8 +120,11 @@ async fn external_subtitle(
         .into_iter()
         .find(|s| s.index == index)
         .ok_or_else(|| ApiError::NotFound(format!("Subtitle index {index} not found")))?;
-    validate_path_against_library(state, &item.library_id, &sub.path.to_string_lossy()).await?;
-    Ok(sub)
+    let path = validate_path_against_library(state, &sub.path.to_string_lossy()).await?;
+    Ok(rustyfin_core::subtitle::ExternalSubtitle {
+        path: PathBuf::from(path),
+        ..sub
+    })
 }
 
 #[derive(Debug, Serialize)]
@@ -336,11 +340,9 @@ async fn subtitle_vtt(
     } else {
         (PathBuf::from(&source.path), format!("0:{index}"))
     };
-    // The input is read only when the streams' library check passes for it
-    let item = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, id)
-        .await?
-        .ok_or_else(|| ApiError::NotFound(format!("Item {id} not found")))?;
-    validate_path_against_library(state, &item.library_id, &input.to_string_lossy()).await?;
+    // The input is read only when the streams' library check passes for it, by its resolved path
+    let input =
+        PathBuf::from(validate_path_against_library(state, &input.to_string_lossy()).await?);
     let meta = tokio::fs::metadata(&input).await.map_err(|e| {
         tracing::warn!("Cannot read the subtitle source {}: {e}", input.display());
         ApiError::Internal("Cannot read the subtitle source".to_string())
