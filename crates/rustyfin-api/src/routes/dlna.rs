@@ -12,6 +12,7 @@ use rustyfin_core::dlna;
 use rustyfin_model::media::MediaType;
 
 use crate::error::ApiError;
+use crate::parental::HiddenItems;
 use crate::state::AppState;
 
 pub fn routes() -> Router<AppState> {
@@ -85,9 +86,15 @@ async fn content_directory_control(
             .and_then(|v| v.parse().ok())
             .unwrap_or(20);
 
+        // DLNA devices don't sign in: they browse as the configured DLNA user, with that user's
+        // library access and parental limits, and see nothing without one.
+        let Some(hidden) = dlna_user_limits(&state).await? else {
+            return Ok(soap_response("Browse", &build_browse_response("", 0, 0)));
+        };
         let didl = if object_id == "0" {
             // Root: return libraries as containers
-            let libraries = rustyfin_db::repo_library::get_all_libraries(&state.db_ro).await?;
+            let mut libraries = rustyfin_db::repo_library::get_all_libraries(&state.db_ro).await?;
+            libraries.retain(|lib| !hidden.hides(lib.id, lib.id));
             let mut items_xml = String::new();
             for lib in &libraries {
                 items_xml.push_str(&format!(
@@ -105,6 +112,7 @@ async fn content_directory_control(
             // Return metadata for a single object
             if let Ok(id) = object_id.parse::<uuid::Uuid>() {
                 if let Ok(Some(item)) = rustyfin_db::repo_media::get_item_by_id(&state.db, id).await
+                    && !hidden.hides(item.id, item.library_id)
                 {
                     let item_xml = media_item_to_didl(&item, &state.bind_addr);
                     build_browse_response(&item_xml, 1, 1)
@@ -117,20 +125,23 @@ async fn content_directory_control(
         } else {
             // BrowseDirectChildren: list children of a container
             if let Ok(parent_id) = object_id.parse::<uuid::Uuid>() {
-                let items = rustyfin_db::repo_media::get_children_paged(
-                    &state.db_ro,
-                    parent_id,
-                    start_index,
-                    requested_count,
-                )
-                .await?;
-                let total =
-                    rustyfin_db::repo_media::count_children(&state.db_ro, parent_id).await?;
+                // Every child (a negative limit is none in SQLite), so the user's limits apply
+                // before the page and the total.
+                let mut items =
+                    rustyfin_db::repo_media::get_children_paged(&state.db_ro, parent_id, 0, -1)
+                        .await?;
+                hidden.retain(&mut items);
+                let total = items.len();
+                let page: Vec<_> = items
+                    .iter()
+                    .skip(start_index.max(0) as usize)
+                    .take(requested_count.max(0) as usize)
+                    .collect();
                 let mut items_xml = String::new();
-                for item in &items {
+                for item in &page {
                     items_xml.push_str(&media_item_to_didl(item, &state.bind_addr));
                 }
-                build_browse_response(&items_xml, items.len(), total as usize)
+                build_browse_response(&items_xml, page.len(), total)
             } else {
                 build_browse_response("", 0, 0)
             }
@@ -149,6 +160,23 @@ async fn content_directory_control(
     } else {
         Ok((StatusCode::BAD_REQUEST, "Unknown SOAP action").into_response())
     }
+}
+
+/// The limits of the DLNA user (`DlnaDefaultUserId`), or `None` when none is set or the user is
+/// gone or disabled.
+async fn dlna_user_limits(state: &AppState) -> Result<Option<HiddenItems>, ApiError> {
+    let configured = state.config.read().await.dlna_default_user_id.clone();
+    let Some(user) = configured.and_then(|id| uuid::Uuid::parse_str(id.trim()).ok()) else {
+        return Ok(None);
+    };
+    if rustyfin_db::repo_user::get_user_by_id(&state.db_ro, user)
+        .await?
+        .is_none()
+        || rustyfin_db::repo_user::is_disabled(&state.db_ro, user).await?
+    {
+        return Ok(None);
+    }
+    Ok(Some(HiddenItems::for_user(state, user).await?))
 }
 
 async fn connection_manager_control(body: String) -> Response {

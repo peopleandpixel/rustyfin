@@ -24778,6 +24778,592 @@ async fn r3parental_jellyfin_import_carries_library_access() {
     );
 }
 
+// ── R3 parental follow-ups: counts, sessions, DLNA, IsMovie/IsSeries and list fields ──
+// A visible series or season counts only the episodes the user may see; a session never names an
+// item the viewer may not see; the DLNA server browses as its configured user; IsMovie and
+// IsSeries filter as in Jellyfin; and list and detail items carry the fields Jellyfin Web reads.
+
+impl R2Parental {
+    /// A TV-MA episode, "Kind Late Episode", in the TV-G "Kind Season": with
+    /// `MaxParentalRating: 10` the season stays visible and this episode is hidden by its own
+    /// rating.
+    async fn late_episode(&self) -> uuid::Uuid {
+        let id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO media_items (id, library_id, name, media_type, path, parent_id, \
+             official_rating, index_number, parent_index_number) \
+             VALUES (?, ?, 'Kind Late Episode', 'Episode', ?, ?, 'TV-MA', 2, 1)",
+        )
+        .bind(id.to_string())
+        .bind(self.library_id().await)
+        .bind(format!("/nowhere/{id}.mkv"))
+        .bind(self.id("Kind Season").to_string())
+        .execute(&self.state.db)
+        .await
+        .unwrap();
+        id
+    }
+
+    /// Gives the kid the password "kidpw" (which signs them out everywhere).
+    async fn reset_kid_password(&self) {
+        let uri = format!("/Users/{}/Password", self.kid_id);
+        let body = serde_json::json!({ "NewPw": "kidpw" });
+        let (status, _) = send(
+            &self.app,
+            request("POST", &uri, Some(&self.admin), Some(body)),
+        )
+        .await;
+        assert!(status.is_success(), "password reset: {status}");
+    }
+
+    /// A token from the kid's sign-in on `device`, so requests with it belong to a session.
+    async fn kid_device(&self, device: &str) -> String {
+        let (status, body) = send(&self.app, r3parental_login("kid", "kidpw", device)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body["AccessToken"].as_str().unwrap().to_string()
+    }
+
+    /// Changes server configuration fields as the administrator.
+    async fn configure(&self, changes: serde_json::Value) {
+        let (status, mut config) = self.get(&self.admin, "/System/Configuration").await;
+        assert_eq!(status, StatusCode::OK);
+        for (key, value) in changes.as_object().unwrap() {
+            config[key] = value.clone();
+        }
+        let req = request(
+            "POST",
+            "/System/Configuration",
+            Some(&self.admin),
+            Some(config),
+        );
+        assert!(send(&self.app, req).await.0.is_success());
+    }
+
+    /// The DLNA ContentDirectory's answer to a Browse of `object` with `flag`.
+    async fn dlna_browse(&self, object: &str, flag: &str) -> String {
+        let body = format!(
+            concat!(
+                r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">"#,
+                r#"<s:Body><u:Browse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1">"#,
+                "<ObjectID>{}</ObjectID><BrowseFlag>{}</BrowseFlag><Filter>*</Filter>",
+                "<StartingIndex>0</StartingIndex><RequestedCount>50</RequestedCount>",
+                "<SortCriteria></SortCriteria></u:Browse></s:Body></s:Envelope>"
+            ),
+            object, flag
+        );
+        let req = Request::builder()
+            .method("POST")
+            .uri("/dlna/control/ContentDirectory")
+            .header("Content-Type", "text/xml")
+            .header(
+                "SOAPACTION",
+                r#""urn:schemas-upnp-org:service:ContentDirectory:1#Browse""#,
+            )
+            .body(Body::from(body))
+            .unwrap();
+        let (status, text) = g1_send_raw(&self.app, req).await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        text
+    }
+}
+
+/// The `(ChildCount, UserData.UnplayedItemCount)` of an item.
+fn r3parental_counts(item: &serde_json::Value) -> (serde_json::Value, serde_json::Value) {
+    (
+        item["ChildCount"].clone(),
+        item["UserData"]["UnplayedItemCount"].clone(),
+    )
+}
+
+#[tokio::test]
+async fn r3parental_series_and_season_counts_leave_out_hidden_episodes() {
+    let w = r2parental().await;
+    w.late_episode().await;
+    let (season, show) = (w.id("Kind Season"), w.id("Kind Show"));
+    let one = format!("/Items/{season}");
+    let both = (serde_json::json!(2), serde_json::json!(2));
+    // The administrator first, so the details cache, shared by every user, holds the season.
+    assert_eq!(r3parental_counts(&w.get(&w.admin, &one).await.1), both);
+    assert_eq!(
+        r3parental_counts(&w.get(&w.kid, &one).await.1),
+        both,
+        "no limits yet"
+    );
+
+    w.set_policy(serde_json::json!({ "MaxParentalRating": 10 }))
+        .await;
+    let visible = (serde_json::json!(1), serde_json::json!(1));
+    assert_eq!(r3parental_counts(&w.get(&w.kid, &one).await.1), visible);
+    assert_eq!(
+        r3parental_counts(&w.get(&w.admin, &one).await.1),
+        both,
+        "the cache still counts every episode for the administrator"
+    );
+    let (_, series) = w.get(&w.kid, &format!("/Items/{show}")).await;
+    assert_eq!(series["UserData"]["UnplayedItemCount"], 1, "{series}");
+
+    // Lists count the same, with and without user data.
+    for uri in [
+        format!("/Items?ParentId={show}"),
+        format!("/Items?ParentId={show}&EnableUserData=false"),
+    ] {
+        let (status, body) = w.get(&w.kid, &uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        let entry = body["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["Name"] == "Kind Season")
+            .unwrap_or_else(|| panic!("{uri}: {body}"))
+            .clone();
+        assert_eq!(entry["ChildCount"], 1, "{uri}: {entry}");
+        if !uri.contains("EnableUserData") {
+            assert_eq!(entry["UserData"]["UnplayedItemCount"], 1, "{uri}: {entry}");
+        }
+    }
+
+    // The one episode the kid may see played: the season is played for them.
+    let played = format!("/Users/{}/PlayedItems/{}", w.kid_id, w.id("Kind Episode"));
+    let (status, data) = send(&w.app, request("POST", &played, Some(&w.kid), None)).await;
+    assert_eq!(status, StatusCode::OK, "{data}");
+    let (_, body) = w.get(&w.kid, &one).await;
+    assert_eq!(body["UserData"]["UnplayedItemCount"], 0, "{body}");
+    assert_eq!(body["UserData"]["Played"], true, "{body}");
+}
+
+#[tokio::test]
+async fn r3parental_session_now_playing_never_names_a_hidden_item() {
+    let w = r2parental().await;
+    w.reset_kid_password().await;
+    let play = |token: &str, item: uuid::Uuid| {
+        request(
+            "POST",
+            "/Sessions/Playing",
+            Some(token),
+            Some(serde_json::json!({ "ItemId": item, "PositionTicks": 0 })),
+        )
+    };
+    let session = |all: &serde_json::Value, device: &str| {
+        all.as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["DeviceId"] == device)
+            .cloned()
+            .unwrap_or_else(|| panic!("no session on {device}: {all}"))
+    };
+
+    // The kid, without limits yet, plays Rough; the administrator sees it.
+    let kid = w.kid_device("r3parental-np-a").await;
+    assert_eq!(
+        send(&w.app, play(&kid, w.id("Rough"))).await.0,
+        StatusCode::NO_CONTENT
+    );
+    let (_, all) = w.get(&w.admin, "/Sessions").await;
+    assert_eq!(
+        session(&all, "r3parental-np-a")["NowPlayingItem"]["Name"],
+        "Rough"
+    );
+
+    // An administrator with limits sees the session, but not the item it plays.
+    let (_, me) = w.get(&w.admin, "/Users/Me").await;
+    let admin_policy = format!("/Users/{}/Policy", me["Id"].as_str().unwrap());
+    let body = serde_json::json!({ "MaxParentalRating": 10 });
+    let (status, answer) = send(
+        &w.app,
+        request("POST", &admin_policy, Some(&w.admin), Some(body)),
+    )
+    .await;
+    assert!(status.is_success(), "{status} {answer}");
+    let (_, all) = w.get(&w.admin, "/Sessions").await;
+    let s = session(&all, "r3parental-np-a");
+    assert!(s["NowPlayingItem"].is_null(), "{s}");
+    assert!(!all.to_string().contains("Rough"), "{all}");
+    let uri = format!(
+        "/Sessions/Playing/NowPlayingItem?SessionId={}",
+        s["Id"].as_str().unwrap()
+    );
+    let (status, body) = w.get(&w.admin, &uri).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.is_null(), "{body}");
+
+    // A limited user's report of a hidden item sets no now-playing item and stores nothing.
+    w.set_policy(serde_json::json!({ "MaxParentalRating": 10 }))
+        .await;
+    let kid = w.kid_device("r3parental-np-b").await;
+    let edgy = w.id("Edgy");
+    assert_eq!(
+        send(&w.app, play(&kid, edgy)).await.0,
+        StatusCode::NO_CONTENT
+    );
+    let (_, mine) = w.get(&kid, "/Sessions").await;
+    assert!(
+        session(&mine, "r3parental-np-b")["NowPlayingItem"].is_null(),
+        "{mine}"
+    );
+    for name in ["Edgy", "Rough"] {
+        assert!(!mine.to_string().contains(name), "{name}: {mine}");
+    }
+    let rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM user_item_data WHERE user_id = ? AND item_id = ?")
+            .bind(w.kid_id.to_string())
+            .bind(edgy.to_string())
+            .fetch_one(&w.state.db)
+            .await
+            .unwrap();
+    assert_eq!(rows, 0, "a hidden item's play stores nothing");
+
+    // A visible item is reported as before.
+    assert_eq!(
+        send(&w.app, play(&kid, w.id("Gentle"))).await.0,
+        StatusCode::NO_CONTENT
+    );
+    let (_, mine) = w.get(&kid, "/Sessions").await;
+    assert_eq!(
+        session(&mine, "r3parental-np-b")["NowPlayingItem"]["Name"],
+        "Gentle"
+    );
+}
+
+#[tokio::test]
+async fn r3parental_dlna_browses_as_the_dlna_user_with_its_limits() {
+    let w = r2parental().await;
+    let lib = w.library_id().await;
+    w.other_library().await;
+    w.late_episode().await;
+    w.configure(serde_json::json!({ "EnableDlnaServer": true }))
+        .await;
+    let gentle = w.id("Gentle").to_string();
+    let rough = w.id("Rough").to_string();
+    let kind_season = w.id("Kind Season").to_string();
+    let grim_season = w.id("Grim Season").to_string();
+
+    // No DLNA user: DLNA devices don't sign in, so nothing is listed.
+    let root = w.dlna_browse("0", "BrowseDirectChildren").await;
+    assert!(root.contains("<TotalMatches>0</TotalMatches>"), "{root}");
+    assert!(!root.contains("Parental"), "{root}");
+    let one = w.dlna_browse(&gentle, "BrowseMetadata").await;
+    assert!(!one.contains("Gentle"), "{one}");
+
+    // The kid as the DLNA user, without limits: everything.
+    w.configure(serde_json::json!({ "DlnaDefaultUserId": w.kid_id.to_string() }))
+        .await;
+    let root = w.dlna_browse("0", "BrowseDirectChildren").await;
+    assert!(
+        root.contains("Parental") && root.contains("Elsewhere"),
+        "{root}"
+    );
+    let one = w.dlna_browse(&rough, "BrowseMetadata").await;
+    assert!(one.contains("Rough"), "{one}");
+
+    // With the kid's limits: one library, and nothing their rating hides.
+    w.set_policy(serde_json::json!({
+        "MaxParentalRating": 10, "EnableAllFolders": false, "EnabledFolders": [lib]
+    }))
+    .await;
+    let root = w.dlna_browse("0", "BrowseDirectChildren").await;
+    assert!(root.contains("Parental"), "{root}");
+    assert!(!root.contains("Elsewhere"), "{root}");
+    assert!(root.contains("<TotalMatches>1</TotalMatches>"), "{root}");
+    let one = w.dlna_browse(&rough, "BrowseMetadata").await;
+    assert!(!one.contains("Rough"), "{one}");
+    let one = w.dlna_browse(&gentle, "BrowseMetadata").await;
+    assert!(one.contains("Gentle"), "{one}");
+    let children = w.dlna_browse(&kind_season, "BrowseDirectChildren").await;
+    assert!(children.contains("Kind Episode"), "{children}");
+    assert!(!children.contains("Kind Late Episode"), "{children}");
+    assert!(
+        children.contains("<TotalMatches>1</TotalMatches>"),
+        "{children}"
+    );
+    let children = w.dlna_browse(&grim_season, "BrowseDirectChildren").await;
+    assert!(
+        children.contains("<TotalMatches>0</TotalMatches>"),
+        "{children}"
+    );
+
+    // A DLNA user that doesn't exist lists nothing.
+    w.configure(serde_json::json!({ "DlnaDefaultUserId": uuid::Uuid::new_v4().to_string() }))
+        .await;
+    let root = w.dlna_browse("0", "BrowseDirectChildren").await;
+    assert!(root.contains("<TotalMatches>0</TotalMatches>"), "{root}");
+}
+
+#[tokio::test]
+async fn r3parental_person_lists_leave_out_people_only_in_hidden_items() {
+    let w = r2parental().await;
+    let mut people = HashMap::new();
+    for (person, item) in [("Gina Gentle", "Gentle"), ("Rhea Rough", "Rough")] {
+        let id = uuid::Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO people (id, name) VALUES (?, ?)")
+            .bind(&id)
+            .bind(person)
+            .execute(&w.state.db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO item_people (item_id, person_id) VALUES (?, ?)")
+            .bind(w.id(item).to_string())
+            .bind(&id)
+            .execute(&w.state.db)
+            .await
+            .unwrap();
+        people.insert(person, id);
+    }
+    w.set_policy(serde_json::json!({ "MaxParentalRating": 10 }))
+        .await;
+    let (_, listed) = w.get(&w.kid, "/Persons").await;
+    assert!(listed.to_string().contains("Gina Gentle"), "{listed}");
+    assert!(!listed.to_string().contains("Rhea Rough"), "{listed}");
+    let (_, listed) = w.get(&w.admin, "/Persons").await;
+    assert!(listed.to_string().contains("Rhea Rough"), "{listed}");
+    let one = format!("/Persons/{}", people["Rhea Rough"]);
+    assert_eq!(w.get(&w.kid, &one).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(w.get(&w.admin, &one).await.0, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn r3parental_is_movie_and_is_series_filter_as_jellyfin_and_latest_types_match() {
+    let w = r2parental().await;
+    let all = w.names(&w.admin, "/Items?Recursive=true").await;
+    let movies = w
+        .names(&w.admin, "/Items?Recursive=true&IncludeItemTypes=Movie")
+        .await;
+    assert!(movies.0.contains(&"Gentle".to_string()), "{movies:?}");
+    // Library items are never Live TV programs: IsMovie=true filters nothing when the include
+    // types are empty or name Movie, and keeps nothing for other types; IsSeries=true keeps
+    // nothing; false filters nothing.
+    for (uri, expected) in [
+        ("/Items?Recursive=true&IsMovie=true", &all),
+        ("/Items?Recursive=true&IsMovie=false", &all),
+        ("/Items?Recursive=true&IsSeries=false", &all),
+        (
+            "/Items?Recursive=true&IsMovie=true&IncludeItemTypes=Movie",
+            &movies,
+        ),
+    ] {
+        assert_eq!(&w.names(&w.admin, uri).await, expected, "{uri}");
+    }
+    for uri in [
+        "/Items?Recursive=true&IsMovie=true&IncludeItemTypes=Series",
+        "/Items?Recursive=true&IsSeries=true",
+        "/Items?Recursive=true&IsSeries=true&IncludeItemTypes=Series",
+    ] {
+        assert_eq!(w.names(&w.admin, uri).await.1, 0, "{uri}");
+    }
+
+    // Latest with a type lists that type.
+    let (latest, _) = w
+        .names(&w.admin, "/Items/Latest?IncludeItemTypes=Movie&Limit=50")
+        .await;
+    assert!(latest.contains(&"Gentle".to_string()), "{latest:?}");
+    assert!(!latest.contains(&"Kind Show".to_string()), "{latest:?}");
+    let (latest, _) = w
+        .names(&w.admin, "/Items/Latest?IncludeItemTypes=Series&Limit=50")
+        .await;
+    assert!(latest.contains(&"Kind Show".to_string()), "{latest:?}");
+    assert!(!latest.contains(&"Gentle".to_string()), "{latest:?}");
+
+    // The kid's limits still apply.
+    w.set_policy(serde_json::json!({ "MaxParentalRating": 10 }))
+        .await;
+    for uri in [
+        "/Items?Recursive=true&IsMovie=true&IncludeItemTypes=Movie",
+        "/Items/Latest?IncludeItemTypes=Movie&Limit=50",
+    ] {
+        let (names, _) = w.names(&w.kid, uri).await;
+        assert!(names.contains(&"Gentle".to_string()), "{uri}: {names:?}");
+        assert!(!names.contains(&"Rough".to_string()), "{uri}: {names:?}");
+    }
+}
+
+#[tokio::test]
+async fn r3parental_items_carry_the_fields_jellyfin_web_reads() {
+    let w = r2parental().await;
+    let gentle = w.id("Gentle");
+    let lib = w.library_id().await;
+    // An H.264 1080p MKV with a 5.1 AC-3 English track and a forced German SubRip track, a
+    // premiere date, a 1000 by 500 primary image and a studio.
+    let path: String = sqlx::query_scalar("SELECT path FROM media_items WHERE id = ?")
+        .bind(gentle.to_string())
+        .fetch_one(&w.state.db)
+        .await
+        .unwrap();
+    let source = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO media_sources (id, item_id, uid, container, path) VALUES (?, ?, ?, 'mkv', ?)",
+    )
+    .bind(&source)
+    .bind(gentle.to_string())
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(&path)
+    .execute(&w.state.db)
+    .await
+    .unwrap();
+    type Stream = (
+        i32,
+        &'static str,
+        &'static str,
+        Option<&'static str>,
+        Option<i32>,
+        Option<i32>,
+        Option<i32>,
+        Option<&'static str>,
+        bool,
+        bool,
+    );
+    let streams: [Stream; 3] = [
+        (
+            0,
+            "h264",
+            "video",
+            None,
+            Some(1920),
+            Some(1080),
+            None,
+            None,
+            true,
+            false,
+        ),
+        (
+            1,
+            "ac3",
+            "audio",
+            Some("eng"),
+            None,
+            None,
+            Some(6),
+            Some("5.1"),
+            true,
+            false,
+        ),
+        (
+            2,
+            "subrip",
+            "subtitle",
+            Some("ger"),
+            None,
+            None,
+            None,
+            None,
+            false,
+            true,
+        ),
+    ];
+    for (index, codec, kind, language, width, height, channels, layout, default, forced) in streams
+    {
+        sqlx::query(
+            "INSERT INTO media_streams (id, source_id, stream_index, codec, codec_type, language, \
+             width, height, channels, channel_layout, is_default, is_forced) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(&source)
+        .bind(index)
+        .bind(codec)
+        .bind(kind)
+        .bind(language)
+        .bind(width)
+        .bind(height)
+        .bind(channels)
+        .bind(layout)
+        .bind(default)
+        .bind(forced)
+        .execute(&w.state.db)
+        .await
+        .unwrap();
+    }
+    for sql in [
+        "UPDATE media_items SET premiere_date = '2001-05-04T00:00:00Z' WHERE id = ?",
+        "UPDATE item_images SET width = 1000, height = 500 WHERE item_id = ? AND image_type = 'Primary'",
+    ] {
+        sqlx::query(sql)
+            .bind(gentle.to_string())
+            .execute(&w.state.db)
+            .await
+            .unwrap();
+    }
+    j5_studio(&w.state, gentle, "Gentle Films").await;
+
+    let find = |body: &serde_json::Value, uri: &str| {
+        body.get("Items")
+            .unwrap_or(body)
+            .as_array()
+            .unwrap_or_else(|| panic!("{uri}: {body}"))
+            .iter()
+            .find(|i| i["Name"] == "Gentle")
+            .cloned()
+            .unwrap_or_else(|| panic!("{uri}: no Gentle in {body}"))
+    };
+    for uri in [
+        "/Items?Recursive=true&IncludeItemTypes=Movie",
+        "/Items/Latest?Limit=50",
+    ] {
+        let (status, body) = w.get(&w.kid, uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        let item = find(&body, uri);
+        assert_eq!(item["Container"], "mkv", "{uri}: {item}");
+        assert_eq!(item["PrimaryImageAspectRatio"], 2.0, "{uri}: {item}");
+        assert!(
+            item["PremiereDate"]
+                .as_str()
+                .is_some_and(|d| d.starts_with("2001-05-04")),
+            "{uri}: {item}"
+        );
+        assert_eq!(item["ParentId"], lib.as_str(), "{uri}: {item}");
+        assert_eq!(item["UserData"]["Played"], false, "{uri}: {item}");
+        // Every movie has UserData, played or not.
+        for entry in body.get("Items").unwrap_or(&body).as_array().unwrap() {
+            assert!(entry["UserData"].is_object(), "{uri}: {entry}");
+        }
+    }
+    // Fields given empty: no optional field, PrimaryImageAspectRatio included.
+    let uri = "/Items?Recursive=true&IncludeItemTypes=Movie&Fields=";
+    let item = find(&w.get(&w.kid, uri).await.1, uri);
+    assert!(item.get("PrimaryImageAspectRatio").is_none(), "{item}");
+    assert!(item["UserData"].is_object(), "{item}");
+
+    // Details: the streams' DisplayTitle and the source's Name.
+    let (status, item) = w.get(&w.kid, &format!("/Items/{gentle}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(item["Container"], "mkv", "{item}");
+    assert_eq!(item["ParentId"], lib.as_str(), "{item}");
+    assert_eq!(item["PrimaryImageAspectRatio"], 2.0, "{item}");
+    let source = &item["MediaSources"][0];
+    assert_eq!(source["Name"], "Gentle", "{source}");
+    let streams = source["MediaStreams"].as_array().unwrap();
+    let titles: Vec<&str> = streams
+        .iter()
+        .map(|s| s["DisplayTitle"].as_str().unwrap_or("?"))
+        .collect();
+    assert_eq!(
+        titles,
+        [
+            "1080p H264 SDR",
+            "English - Dolby Digital - 5.1 - Default",
+            "German - Forced - SUBRIP",
+        ],
+        "{source}"
+    );
+    let kinds: Vec<&str> = streams
+        .iter()
+        .map(|s| s["Type"].as_str().unwrap_or("?"))
+        .collect();
+    assert_eq!(kinds, ["Video", "Audio", "Subtitle"]);
+    assert_eq!(streams[1]["Language"], "eng");
+
+    // The studio list's entries have UserData.
+    let (status, body) = w.get(&w.kid, "/Studios").await;
+    assert_eq!(status, StatusCode::OK);
+    let studio = body["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["Name"] == "Gentle Films")
+        .cloned()
+        .unwrap_or_else(|| panic!("{body}"));
+    assert_eq!(studio["UserData"]["IsFavorite"], false, "{studio}");
+    assert_eq!(studio["UserData"]["ItemId"], studio["Id"], "{studio}");
+}
+
 // ── G1: authorization ──
 // Admin endpoints answer 401 without a valid token and 403 to a non-admin. Setup endpoints are
 // open only while the server has no users. Names taken from a request stay inside their directory.

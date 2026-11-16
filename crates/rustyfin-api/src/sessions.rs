@@ -492,11 +492,15 @@ async fn dto(state: &AppState, s: &SessionInfo, viewer: Uuid, socket: bool) -> s
         "SupportedCommands": commands,
     });
     if let Some(p) = playing {
-        // The full item, as Jellyfin sends it; an item gone since the start is left out.
-        if let Ok(item) = crate::routes::items::media_item(state, p.item_id, viewer).await {
+        // The full item, as Jellyfin sends it; an item gone since the start is left out, and so
+        // is one the viewer's limits hide (an administrator with limits sees every session),
+        // with the queue.
+        let shown = crate::parental::user_sees(state, viewer, p.item_id).await;
+        if shown && let Ok(item) = crate::routes::items::media_item(state, p.item_id, viewer).await
+        {
             out["NowPlayingItem"] = serde_json::to_value(item).unwrap_or_default();
         }
-        if let Some(queue) = p.queue {
+        if shown && let Some(queue) = p.queue {
             out["NowPlayingQueue"] = queue;
         }
         if let Some(id) = p.playlist_item_id {
