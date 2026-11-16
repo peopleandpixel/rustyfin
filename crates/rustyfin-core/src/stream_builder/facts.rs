@@ -3,6 +3,7 @@
 use rustyfin_model::media_source::{MediaSourceResponse, MediaStream};
 
 use super::StreamKind;
+use super::selection::{AudioIndexSource, SubtitleMode, default_subtitle_index};
 
 /// One stream of a media source, reduced to the fields the conditions test.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -49,6 +50,9 @@ pub struct StreamFacts {
     pub is_forced: bool,
     /// The file path of an external stream.
     pub path: Option<String>,
+    /// Jellyfin's subtitle score, for the subtitle streams the user's subtitle mode would load
+    /// (`SourceFacts::apply_preferences`); None for the others.
+    pub score: Option<i32>,
 }
 
 /// A media source, reduced to the facts the conditions test.
@@ -70,10 +74,13 @@ pub struct SourceFacts {
     pub supports_direct_stream: bool,
     /// Whether the source can be transcoded.
     pub supports_transcoding: bool,
-    /// The default audio stream index. It isn't derived, so this is always `None`.
+    /// The default audio stream index: None until a user's settings pick one
+    /// (`SourceFacts::apply_preferences`).
     pub default_audio_stream_index: Option<i32>,
     /// The default subtitle stream index, picked from the subtitle streams.
     pub default_subtitle_stream_index: Option<i32>,
+    /// Which user settings picked the default audio stream; none until they are applied.
+    pub audio_index_source: AudioIndexSource,
 }
 
 impl Default for SourceFacts {
@@ -90,6 +97,7 @@ impl Default for SourceFacts {
             supports_transcoding: true,
             default_audio_stream_index: None,
             default_subtitle_stream_index: None,
+            audio_index_source: AudioIndexSource::default(),
         }
     }
 }
@@ -98,7 +106,9 @@ impl From<&MediaSourceResponse> for SourceFacts {
     /// Reads the facts that the conditions can test from a source response.
     fn from(source: &MediaSourceResponse) -> Self {
         let streams: Vec<StreamFacts> = source.media_streams.iter().map(stream_facts).collect();
-        let default_subtitle_stream_index = default_subtitle(&streams);
+        // Jellyfin's pick for a user with the default settings
+        let default_subtitle_stream_index =
+            default_subtitle_index(&streams, &[], SubtitleMode::Default, None);
         Self {
             id: source.id.clone(),
             container: source
@@ -114,6 +124,7 @@ impl From<&MediaSourceResponse> for SourceFacts {
             supports_transcoding: source.supports_transcoding,
             default_audio_stream_index: None,
             default_subtitle_stream_index,
+            audio_index_source: AudioIndexSource::default(),
         }
     }
 }
@@ -144,6 +155,7 @@ fn stream_facts(stream: &MediaStream) -> StreamFacts {
         is_default: stream.is_default,
         is_forced: stream.is_forced,
         path: stream.path.clone(),
+        score: None,
     }
 }
 
@@ -194,16 +206,4 @@ fn parse_frame_rate(text: &str) -> Option<f32> {
 /// transfer function, and anything else SDR (`MediaStream::video_range`).
 fn range_type(stream: &MediaStream) -> &'static str {
     stream.video_range().map_or("SDR", |(_, kind)| kind)
-}
-
-/// The default subtitle index. Among the subtitles that are external, forced or default, it
-/// takes the first by external, then forced, then default, then index. Plain subtitles are
-/// never picked.
-fn default_subtitle(streams: &[StreamFacts]) -> Option<i32> {
-    streams
-        .iter()
-        .filter(|s| s.kind == StreamKind::Subtitle)
-        .filter(|s| s.is_external || s.is_forced || s.is_default)
-        .min_by_key(|s| (!s.is_external, !s.is_forced, !s.is_default, s.index))
-        .map(|s| s.index)
 }

@@ -12,8 +12,8 @@ use super::conditions::{self, AudioFacts, VideoFacts};
 use super::subtitles;
 use super::url::StreamOptions;
 use super::{
-    PlayMethod, SourceFacts, StreamFacts, StreamKind, StreamRequest, TranscodeReason,
-    TranscodeReasons,
+    AudioIndexSource, PlayMethod, SourceFacts, StreamFacts, StreamKind, StreamRequest,
+    TranscodeReason, TranscodeReasons,
 };
 
 /// The stream info that a transcoding URL is written from: Jellyfin's `StreamInfo`, for the fields
@@ -990,30 +990,60 @@ fn audio_stream_at(source: &SourceFacts, index: i32) -> Option<&StreamFacts> {
         .find(|s| s.kind == StreamKind::Audio && s.index == index)
 }
 
-/// The audio streams that the transcode may pick from (Jellyfin's `candidateAudioStreams` when
-/// the source has no audio index source). An explicit request index, or no audio stream, leaves
-/// only the chosen stream. Otherwise every audio stream counts, or only the default ones when the
-/// chosen stream is a default.
+/// The audio streams that the transcode may pick from (Jellyfin's `candidateAudioStreams`, SB
+/// 672-708). An explicit request index (a remembered track comes as one), or no audio stream,
+/// leaves only the chosen stream. With no user settings applied, every audio stream counts, or
+/// only the default ones when the chosen stream is a default. A preferred language limits them
+/// to the chosen stream's language, and to its default streams with PlayDefaultAudioTrack (all
+/// default streams when it has none); PlayDefaultAudioTrack alone limits them to the default
+/// streams, which can leave none.
 fn audio_candidates<'a>(
     source: &'a SourceFacts,
     audio: Option<&'a StreamFacts>,
     requested: Option<i32>,
 ) -> Vec<&'a StreamFacts> {
-    let Some(first) = audio else {
-        return Vec::new();
+    let explicit = requested.is_some_and(|index| index >= 0);
+    let mut candidates: Vec<&StreamFacts> = audio.into_iter().collect();
+    if explicit {
+        return candidates;
+    }
+    let audio_streams = || {
+        source
+            .streams
+            .iter()
+            .filter(|s| s.kind == StreamKind::Audio)
     };
-    if requested.is_some_and(|index| index >= 0) {
-        return vec![first];
+    let flags = source.audio_index_source;
+    if flags == AudioIndexSource::default()
+        && let Some(first) = audio
+    {
+        candidates = if first.is_default {
+            audio_streams().filter(|s| s.is_default).collect()
+        } else {
+            audio_streams().collect()
+        };
     }
-    let audio_streams = source
-        .streams
-        .iter()
-        .filter(|s| s.kind == StreamKind::Audio);
-    if first.is_default {
-        audio_streams.filter(|s| s.is_default).collect()
-    } else {
-        audio_streams.collect()
+    if flags.language {
+        let language = audio.and_then(|a| a.language.as_deref());
+        candidates = audio_streams()
+            .filter(|s| s.language.as_deref() == language)
+            .collect();
+        if flags.default {
+            let in_language: Vec<&StreamFacts> = candidates
+                .iter()
+                .copied()
+                .filter(|s| s.is_default)
+                .collect();
+            candidates = if in_language.is_empty() {
+                audio_streams().filter(|s| s.is_default).collect()
+            } else {
+                in_language
+            };
+        }
+    } else if flags.default {
+        candidates = audio_streams().filter(|s| s.is_default).collect();
     }
+    candidates
 }
 
 /// Jellyfin's `SetStreamInfoOptionsFromTranscodingProfile`: copies the transcoding profile's
@@ -1451,7 +1481,7 @@ pub(super) fn plan_video(source: &SourceFacts, options: &VideoOptions<'_>) -> Vi
             .or(source.default_audio_stream_index),
     );
     let candidates = audio_candidates(source, audio, options.audio_stream_index);
-    let subtitle_index = subtitles::chosen_index(source, options.subtitle_stream_index);
+    let subtitle_index = subtitles::chosen_index(source, options.subtitle_stream_index, profile);
     let subtitle = subtitles::subtitle_stream(source, subtitle_index);
 
     let exceeded = bitrate_limit_exceeded(source, i64::from(options.max_bitrate.unwrap_or(0)));

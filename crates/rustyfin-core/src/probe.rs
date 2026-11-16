@@ -329,6 +329,18 @@ pub async fn probe_file(path: &str) -> Result<ProbeResult, ProbeError> {
     Ok(result)
 }
 
+/// The codec ffprobe reads from an external subtitle file with `extension`, which Jellyfin
+/// reports as the stream's codec: `subrip` for `.srt`, `webvtt` for `.vtt` and `ass` for both
+/// `.ass` and `.ssa`. Another extension is kept as it is.
+fn external_subtitle_codec(extension: &str) -> String {
+    match extension.to_ascii_lowercase().as_str() {
+        "srt" => "subrip".to_string(),
+        "vtt" => "webvtt".to_string(),
+        "ass" | "ssa" => "ass".to_string(),
+        other => other.to_string(),
+    }
+}
+
 /// Adds the external subtitle files `found` to `source`'s streams, after its embedded streams,
 /// in file-name order. Their stored index follows the embedded ones; PlaybackInfo numbers them
 /// first, as Jellyfin does.
@@ -346,7 +358,7 @@ pub fn add_external_subtitles(
     for (k, file) in found.into_iter().enumerate() {
         source.media_streams.push(MediaStream {
             index: next + k as i32,
-            codec: Some(file.format),
+            codec: Some(external_subtitle_codec(&file.format)),
             codec_type: "subtitle".to_string(),
             language: file.language,
             is_external: true,
@@ -408,25 +420,30 @@ async fn probe_streams(path: &str) -> Result<ProbeResult, ProbeError> {
         .iter()
         .filter(|s| s.codec_type.as_deref() == Some("video"))
         .collect();
-    let audio_streams: Vec<&FfprobeStream> = probe
-        .streams
+
+    // Cover art is a video stream too, but doesn't make the file a video
+    let is_video_file = video_streams
         .iter()
-        .filter(|s| s.codec_type.as_deref() == Some("audio"))
-        .collect();
+        .any(|s| s.disposition.as_ref().and_then(|d| d.attached_pic) != Some(1));
 
-    let video_bitrate: u32 = video_streams.iter().filter_map(|s| s.bit_rate).sum();
-    let video_bitrate = if video_bitrate == 0 {
-        None
-    } else {
-        Some(video_bitrate)
-    };
+    // Build media streams. A video's streams that ffprobe gives no bit rate get Jellyfin's
+    // estimates; an audio file's are left as they are, so a music library isn't read again
+    let mut media_streams: Vec<MediaStream> =
+        probe.streams.iter().cloned().map(stream_to_model).collect();
+    if is_video_file {
+        estimate_missing_bit_rates(&mut media_streams, total_bitrate);
+    }
 
-    let audio_bitrate: u32 = audio_streams.iter().filter_map(|s| s.bit_rate).sum();
-    let audio_bitrate = if audio_bitrate == 0 {
-        None
-    } else {
-        Some(audio_bitrate)
+    let sum_of = |kind: &str| -> Option<u32> {
+        let sum: u32 = media_streams
+            .iter()
+            .filter(|s| s.codec_type == kind)
+            .filter_map(|s| s.bit_rate)
+            .sum();
+        (sum > 0).then_some(sum)
     };
+    let video_bitrate = sum_of("video");
+    let audio_bitrate = sum_of("audio");
 
     // Get video dimensions from the first video stream
     let (width, height): (Option<u32>, Option<u32>) = video_streams
@@ -447,18 +464,7 @@ async fn probe_streams(path: &str) -> Result<ProbeResult, ProbeError> {
         None
     };
 
-    let container = container_name(
-        path,
-        format.format_name.as_deref(),
-        // Cover art is a video stream too, but doesn't make the file a video
-        video_streams
-            .iter()
-            .any(|s| s.disposition.as_ref().and_then(|d| d.attached_pic) != Some(1)),
-    );
-
-    // Build media streams
-    let media_streams: Vec<MediaStream> =
-        probe.streams.iter().cloned().map(stream_to_model).collect();
+    let container = container_name(path, format.format_name.as_deref(), is_video_file);
 
     let source = MediaSourceResponse {
         id: uuid::Uuid::new_v4().to_string(),
@@ -910,6 +916,63 @@ fn stream_to_model(s: FfprobeStream) -> MediaStream {
     };
     stream.fill_video_range();
     stream
+}
+
+/// Jellyfin's fallback bit rate for an audio stream that ffprobe gives none, by codec and
+/// channels (its probe's `GetEstimatedAudioBitrate`). None for other codecs or no channels.
+fn estimated_audio_bit_rate(codec: &str, profile: Option<&str>, channels: u32) -> Option<u32> {
+    if channels < 1 {
+        return None;
+    }
+    let multichannel = channels > 2;
+    let pick = |many: u32, few: u32| if multichannel { many } else { few };
+    let lossless_dts = profile.is_some_and(|p| p.to_ascii_lowercase().contains("hd ma"));
+    match codec.to_ascii_lowercase().as_str() {
+        "aac" | "mp3" | "mp2" => Some(pick(320_000, 192_000)),
+        "ac3" | "eac3" => Some(pick(640_000, 192_000)),
+        "dts" | "dca" if lossless_dts => channels.checked_mul(700_000),
+        "dts" | "dca" => Some(pick(1_509_000, 768_000)),
+        "opus" => Some(pick(256_000, 128_000)),
+        "vorbis" => Some(pick(320_000, 160_000)),
+        "wmav1" | "wmav2" | "wmapro" => Some(pick(384_000, 192_000)),
+        "flac" | "alac" => channels.checked_mul(480_000),
+        "truehd" | "mlp" => channels.checked_mul(700_000),
+        _ => None,
+    }
+}
+
+/// Fills in the bit rates ffprobe leaves out, as Jellyfin's probe does: each audio stream gets
+/// the estimate for its codec (`estimated_audio_bit_rate`), then a lone video stream gets the
+/// container's bit rate less the other embedded streams', when every audio bit rate is known and
+/// something is left.
+fn estimate_missing_bit_rates(streams: &mut [MediaStream], total_bitrate: Option<u32>) {
+    for stream in streams.iter_mut() {
+        if stream.r#type.as_deref() == Some("Audio") && stream.bit_rate.is_none() {
+            stream.bit_rate = stream.codec.as_deref().and_then(|codec| {
+                estimated_audio_bit_rate(codec, stream.profile.as_deref(), stream.channels?)
+            });
+        }
+    }
+    let Some(total) = total_bitrate else {
+        return;
+    };
+    let is_video = |s: &MediaStream| s.r#type.as_deref() == Some("Video");
+    if streams.iter().filter(|s| is_video(s)).count() != 1 {
+        return;
+    }
+    let others = || streams.iter().filter(|s| !is_video(s) && !s.is_external);
+    let audio_known = others()
+        .filter(|s| s.r#type.as_deref() == Some("Audio"))
+        .all(|s| s.bit_rate.is_some());
+    let used: u64 = others().filter_map(|s| s.bit_rate).map(u64::from).sum();
+    let left = u64::from(total).saturating_sub(used);
+    if let Some(video) = streams.iter_mut().find(|s| is_video(s))
+        && video.bit_rate.is_none()
+        && audio_known
+        && left > 0
+    {
+        video.bit_rate = u32::try_from(left).ok();
+    }
 }
 
 /// A stream's bit rate from its Matroska statistics tags, as Jellyfin reads it: `BPS`, else
@@ -1667,6 +1730,78 @@ mod tests {
             rates,
             vec![Some(48_082_772), Some(1_000_000), Some(640_000), None, None]
         );
+    }
+
+    fn r3gaps3_streams(json: &str) -> Vec<MediaStream> {
+        let parsed: FfprobeOutput = serde_json::from_str(json).expect("should parse");
+        parsed.streams.into_iter().map(stream_to_model).collect()
+    }
+
+    /// Audio streams without a bit rate get Jellyfin's estimate by codec and channels, and the
+    /// lone video stream gets the container's bit rate less the audio, as in Jellyfin 12.4.0
+    /// (mono AAC 192 kbps, stereo FLAC 960 kbps).
+    #[test]
+    fn r3gaps3_missing_bit_rates_are_estimated_as_jellyfin_does() {
+        let mut streams = r3gaps3_streams(
+            r#"{"streams": [
+            {"index": 0, "codec_name": "h264", "codec_type": "video"},
+            {"index": 1, "codec_name": "aac", "codec_type": "audio", "channels": 1},
+            {"index": 2, "codec_name": "flac", "codec_type": "audio", "channels": 2},
+            {"index": 3, "codec_name": "dts", "codec_type": "audio", "channels": 6,
+                "profile": "DTS-HD MA"},
+            {"index": 4, "codec_name": "truehd", "codec_type": "audio", "channels": 8},
+            {"index": 5, "codec_name": "eac3", "codec_type": "audio", "channels": 6,
+                "bit_rate": "256000"},
+            {"index": 6, "codec_name": "subrip", "codec_type": "subtitle"}
+        ]}"#,
+        );
+        estimate_missing_bit_rates(&mut streams, Some(20_000_000));
+        let rates: Vec<_> = streams.iter().map(|s| s.bit_rate).collect();
+        assert_eq!(
+            rates,
+            vec![
+                Some(20_000_000 - 192_000 - 960_000 - 4_200_000 - 5_600_000 - 256_000),
+                Some(192_000),
+                Some(960_000),
+                Some(4_200_000),
+                Some(5_600_000),
+                Some(256_000),
+                None
+            ]
+        );
+    }
+
+    /// The video stream keeps no bit rate when an audio bit rate stays unknown, when nothing is
+    /// left of the container's, or when there is no container bit rate; a known one is kept.
+    #[test]
+    fn r3gaps3_video_bit_rate_is_estimated_only_when_it_can_be() {
+        let unknown_audio = r#"{"streams": [
+            {"index": 0, "codec_name": "h264", "codec_type": "video"},
+            {"index": 1, "codec_name": "pcm_s16le", "codec_type": "audio", "channels": 2}
+        ]}"#;
+        let mut streams = r3gaps3_streams(unknown_audio);
+        estimate_missing_bit_rates(&mut streams, Some(5_000_000));
+        assert_eq!(streams[0].bit_rate, None);
+        assert_eq!(streams[1].bit_rate, None);
+
+        let aac = r#"{"streams": [
+            {"index": 0, "codec_name": "h264", "codec_type": "video"},
+            {"index": 1, "codec_name": "aac", "codec_type": "audio", "channels": 2}
+        ]}"#;
+        let mut streams = r3gaps3_streams(aac);
+        estimate_missing_bit_rates(&mut streams, Some(192_000));
+        assert_eq!(streams[0].bit_rate, None, "nothing left for the video");
+        let mut streams = r3gaps3_streams(aac);
+        estimate_missing_bit_rates(&mut streams, None);
+        assert_eq!(streams[0].bit_rate, None, "no container bit rate");
+
+        let known = r#"{"streams": [
+            {"index": 0, "codec_name": "h264", "codec_type": "video", "bit_rate": "1000"},
+            {"index": 1, "codec_name": "aac", "codec_type": "audio", "channels": 2}
+        ]}"#;
+        let mut streams = r3gaps3_streams(known);
+        estimate_missing_bit_rates(&mut streams, Some(5_000_000));
+        assert_eq!(streams[0].bit_rate, Some(1000));
     }
 
     // Chapters

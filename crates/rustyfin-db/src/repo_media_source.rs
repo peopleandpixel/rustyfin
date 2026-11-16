@@ -20,7 +20,11 @@ use uuid::Uuid;
 /// 3: a video stream's Dolby Vision configuration record, which its VideoRangeType is read from,
 /// and a video's external subtitle files, stored as its streams. Neither touches audio files, so
 /// audio sources are read again only below [`AUDIO_PROBE_VERSION`].
-pub const PROBE_VERSION: i64 = 3;
+///
+/// 4: a video's stream bit rates that ffprobe leaves out, estimated as Jellyfin's probe does
+/// (an audio stream's by its codec and channels, the video stream's from the container's).
+/// Audio files are left as they are.
+pub const PROBE_VERSION: i64 = 4;
 
 /// The last [`PROBE_VERSION`] that changed what a probe stores for an audio file. A scan reads an
 /// audio source again only when an older probe wrote it, so a video-only change doesn't re-read

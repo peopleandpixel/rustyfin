@@ -86,10 +86,28 @@ pub struct AppState {
 /// database, TLS key and certificate), read once, and every library's paths, resolved. The
 /// roots are read again when a path falls outside the ones held, so a library added or changed
 /// since counts at once.
+///
+/// The owned paths are also kept resolved (`OwnedSet`), with the time they were resolved, so a
+/// request compares paths instead of resolving about ninety of them; they are resolved again
+/// once they are a minute old.
 #[derive(Clone, Default)]
 pub struct FileGuardCache {
     pub owned_files: Arc<tokio::sync::OnceCell<Vec<PathBuf>>>,
     pub library_roots: Arc<std::sync::RwLock<Option<Arc<Vec<LibraryRoot>>>>>,
+    pub owned_set: Arc<std::sync::RwLock<Option<KeptOwnedSet>>>,
+}
+
+/// A resolved `OwnedSet` and when it was resolved.
+pub type KeptOwnedSet = (std::time::Instant, Arc<OwnedSet>);
+
+/// The paths the server owns, resolved once (`routes::streaming` builds and reads it): the data
+/// dir's forms, each owned data-dir folder that resolves (by name, with its target), and every
+/// owned file in each form, with its SQLite siblings.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OwnedSet {
+    pub data_forms: Vec<PathBuf>,
+    pub linked_dirs: Vec<(String, PathBuf)>,
+    pub files: std::collections::HashSet<PathBuf>,
 }
 
 /// A library path as the file checks keep it: as written (made absolute, `.` dropped; None when

@@ -18413,9 +18413,12 @@ async fn b40_session_reports_on_a_movie_work_as_before() {
     assert_eq!(b.film_data().await, (0, false, Some(1), Some(3), true));
     assert_eq!(b40_session_changes(&mut events), []);
 
-    // Progress stores the position; a missing subtitle index keeps the stored one.
+    // Progress stores the position; a missing subtitle index keeps the stored one. The film gets
+    // its hour first: without a runtime, Jellyfin's UpdatePlayState counts any report as played
+    // to the end (B110).
+    b110_set(&b.state, b.film, Some(B110_HOUR), None, None).await;
     let body = serde_json::json!({
-        "ItemId": film, "ItemName": "B40 Film", "PositionTicks": 5000, "IsPaused": true,
+        "ItemId": film, "ItemName": "B40 Film", "PositionTicks": B110_HOUR / 4, "IsPaused": true,
         "AudioStreamIndex": 2,
     });
     let (status, answer) = b.post("/Sessions/Playing/Progress", body).await;
@@ -18423,11 +18426,13 @@ async fn b40_session_reports_on_a_movie_work_as_before() {
         (status, answer),
         (StatusCode::NO_CONTENT, serde_json::Value::Null)
     );
-    assert_eq!(b.film_data().await, (5000, false, Some(2), Some(3), true));
+    assert_eq!(
+        b.film_data().await,
+        (B110_HOUR / 4, false, Some(2), Some(3), true)
+    );
 
-    // Stop midway through the film's hour stores the stop position (B110: without a runtime it
-    // would count as played to the end) and subtitles off, and clears now playing.
-    b110_set(&b.state, b.film, Some(B110_HOUR), None, None).await;
+    // Stop midway through the film's hour stores the stop position and subtitles off, and
+    // clears now playing.
     let body = serde_json::json!({
         "ItemId": film, "PositionTicks": B110_HOUR / 2, "SubtitleStreamIndex": -1,
     });
@@ -19325,17 +19330,20 @@ async fn b110_a_failed_stop_leaves_the_watch_data_alone() {
             .await
             .unwrap();
         b.start(item).await;
-        b.progress(item, 5_000).await;
+        b.progress(item, B110_HOUR / 2).await;
+        // What the progress left: the film's resume point, or the item without a runtime played
+        let after_progress = if item == b.unknown {
+            (true, 1, 0, true)
+        } else {
+            (false, 1, B110_HOUR / 2, true)
+        };
+        assert_eq!(b.stored(item).await, after_progress, "{item}");
         let mut body = serde_json::json!({ "ItemId": item, "Failed": true });
         if let Some(ticks) = ticks {
             body["PositionTicks"] = serde_json::json!(ticks);
         }
         b.post("/Sessions/Playing/Stopped", body).await;
-        assert_eq!(
-            b.stored(item).await,
-            (false, 1, 5_000, true),
-            "{item} {ticks:?}"
-        );
+        assert_eq!(b.stored(item).await, after_progress, "{item} {ticks:?}");
     }
     // `Failed: false` is an ordinary stop.
     let body = serde_json::json!({ "ItemId": b.unknown, "PositionTicks": 0, "Failed": false });
@@ -19433,17 +19441,18 @@ async fn b110_the_reported_versions_runtime_decides() {
 async fn b110_progress_near_the_end_marks_played() {
     let b = B110::new().await;
     b.start(b.film).await;
-    // A resume point during play is kept as reported, even under 5%.
+    // Progress follows the same rules as a stop (Jellyfin's OnPlaybackProgress calls
+    // UpdatePlayState): under 5% no resume point is kept.
     b.progress(b.film, 1_000).await;
-    assert_eq!(b.stored(b.film).await, (false, 1, 1_000, true));
+    assert_eq!(b.stored(b.film).await, (false, 1, 0, true));
     b.progress(b.film, B110_HOUR / 2).await;
     assert_eq!(b.stored(b.film).await, (false, 1, B110_HOUR / 2, true));
     // Past 90% the item is played and leaves no resume point, as if the client never stops.
     b.progress(b.film, B110_HOUR * 95 / 100).await;
     assert_eq!(b.stored(b.film).await, (true, 1, 0, true));
-    // Progress on an item with no runtime stores the position and leaves it unplayed.
+    // Progress on an item with no runtime marks it played, without counting a play.
     b.progress(b.unknown, 5_000).await;
-    assert_eq!(b.stored(b.unknown).await, (false, 0, 5_000, true));
+    assert_eq!(b.stored(b.unknown).await, (true, 0, 0, true));
 }
 
 #[tokio::test]
@@ -19454,7 +19463,7 @@ async fn b110_played_items_leave_continue_watching_and_next_up_moves_on() {
     let next_up = format!("/Shows/NextUp?userId={}&seriesId={}", b.user, b.series);
     for item in [b.film, e1] {
         b.start(item).await;
-        b.progress(item, 1_000_000_000).await;
+        b.progress(item, B110_HOUR / 4).await;
     }
     let mut listed = b.ids(&resume).await;
     listed.sort();
@@ -33511,20 +33520,35 @@ async fn b29_ok(
     assert!(status.is_success(), "{method} {uri}: {status} {json}");
 }
 
-/// The user saves a resume point at `ticks` on the item.
-async fn b29_progress(app: &axum::Router, token: &str, item: uuid::Uuid, ticks: i64) {
-    let body = serde_json::json!({ "ItemId": item, "PositionTicks": ticks });
-    b29_ok(app, token, "POST", "/Sessions/Playing/Progress", Some(body)).await;
+/// Stores a resume point at `ticks` on the item for the user, as written straight into the
+/// database. A progress report would apply the resume rules, which clear so small a position
+/// (and mark an item without a runtime played).
+async fn b29_progress(state: &AppState, user_id: &str, item: uuid::Uuid, ticks: i64) {
+    rustyfin_db::repo_playback::update_playback_position(
+        &state.db,
+        user_id.parse().unwrap(),
+        item,
+        ticks,
+    )
+    .await
+    .unwrap();
 }
 
-/// The user marks the item played and favorite, then saves a resume point at `ticks` on it.
-/// Marking played clears the resume point, as in Jellyfin, so the progress comes after.
-async fn b29_watch(app: &axum::Router, token: &str, user_id: &str, item: uuid::Uuid, ticks: i64) {
+/// The user marks the item played and favorite, then a resume point at `ticks` is stored on it.
+/// Marking played clears the resume point, as in Jellyfin, so the resume point comes after.
+async fn b29_watch(
+    app: &axum::Router,
+    state: &AppState,
+    token: &str,
+    user_id: &str,
+    item: uuid::Uuid,
+    ticks: i64,
+) {
     for route in ["PlayedItems", "FavoriteItems"] {
         let uri = format!("/Users/{user_id}/{route}/{item}");
         b29_ok(app, token, "POST", &uri, None).await;
     }
-    b29_progress(app, token, item, ticks).await;
+    b29_progress(state, user_id, item, ticks).await;
 }
 
 /// `GET /Items/{id}?userId=` as the token's user: asserts a 200 and returns the details.
@@ -33578,8 +33602,8 @@ async fn b29_each_user_gets_their_own_watch_data_in_item_details() {
     let (a, a_id, b, b_id) = g1_owner_and_viewer(&state, &app).await;
     for (kind, item, runtime) in b29_items(&state).await {
         // A watched it; B saved a resume point of its own.
-        b29_watch(&app, &a, &a_id, item, 1234).await;
-        b29_progress(&app, &b, item, 5000).await;
+        b29_watch(&app, &state, &a, &a_id, item, 1234).await;
+        b29_progress(&state, &b_id, item, 5000).await;
         let first = b29_details(&app, &a, &a_id, item).await;
         assert_eq!(
             g1c_user_data(&first),
@@ -33660,7 +33684,7 @@ async fn b29_a_change_to_watch_data_shows_on_the_next_request() {
                 "{kind}: after {change}"
             );
         }
-        b29_progress(&app, &a, item, 4321).await;
+        b29_progress(&state, &a_id, item, 4321).await;
         let details = b29_details(&app, &a, &a_id, item).await;
         assert_eq!(
             g1c_user_data(&details),
@@ -33693,8 +33717,8 @@ async fn b29_cached_item_details_equal_fresh_ones() {
     let (a, a_id, b, b_id) = g1_owner_and_viewer(&state, &app).await;
     let mut cached = Vec::new();
     for (kind, item, _) in b29_items(&state).await {
-        b29_watch(&app, &a, &a_id, item, 1234).await;
-        b29_progress(&app, &b, item, 5000).await;
+        b29_watch(&app, &state, &a, &a_id, item, 1234).await;
+        b29_progress(&state, &b_id, item, 5000).await;
         let key = item.to_string();
         state.cache.item_details.invalidate(&key);
         let a_fresh = b29_details(&app, &a, &a_id, item).await;
@@ -33722,7 +33746,7 @@ async fn b29_item_details_never_reach_the_l2_table() {
     let (a, a_id, b, b_id) = g1_owner_and_viewer(&state, &before_restart).await;
     let items = b29_items(&state).await;
     let photo = items.iter().find(|(kind, ..)| *kind == "Photo").unwrap().1;
-    b29_watch(&before_restart, &a, &a_id, photo, 1234).await;
+    b29_watch(&before_restart, &state, &a, &a_id, photo, 1234).await;
     let details = b29_details(&before_restart, &a, &a_id, photo).await;
     // The L2 copy is saved in the background.
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -38140,7 +38164,7 @@ async fn b22_playback_info_lists_external_subtitles() {
     assert_eq!(streams[4]["Codec"], "subrip");
     for (stream, codec, language, path) in [
         (&streams[0], "ass", None, &ass),
-        (&streams[1], "srt", Some("eng"), &srt),
+        (&streams[1], "subrip", Some("eng"), &srt),
     ] {
         assert_eq!(stream["CodecType"], "subtitle", "{stream}");
         assert_eq!(stream["Type"], "Subtitle", "{stream}");
@@ -46549,4 +46573,161 @@ async fn j2_audio_transcode_plays_without_a_header() {
     let stop = format!("/Videos/ActiveEncodings?PlaySessionId={ps}");
     let (status, _) = send(&app, request("DELETE", &stop, Some(&token), None)).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+// R3 playback gaps 3: the server's resume rules decide progress and stop reports, and the
+// stored-path checks keep their resolved owned paths and confine pictures to the libraries and
+// the data dir
+
+/// Sets resume rules in the server configuration, as a client saving them would.
+async fn r3gaps3_resume_rules(state: &AppState, rules: &[(&str, i64)]) {
+    let mut config = state.config.write().await;
+    for (key, value) in rules {
+        config
+            .other
+            .insert(key.to_string(), serde_json::json!(value));
+    }
+}
+
+#[tokio::test]
+async fn r3gaps3_progress_and_stop_follow_the_configured_resume_rules() {
+    let b = B110::new().await;
+    // A 1 h film; under the defaults 10 % would keep a resume point and 60 % too
+    r3gaps3_resume_rules(
+        &b.state,
+        &[
+            ("MinResumePct", 20),
+            ("MaxResumePct", 50),
+            ("MinResumeDurationSeconds", 3600),
+        ],
+    )
+    .await;
+    let film = b.film.to_string();
+    b.start(b.film).await;
+    b.progress(b.film, B110_HOUR / 10).await;
+    assert_eq!(b.stored(b.film).await, (false, 1, 0, true));
+    assert_eq!(
+        b.details_fields(b.film).await,
+        (film.clone(), Some(false), None, None)
+    );
+    // 30 %: kept, and PlayedPercentage follows it
+    b.progress(b.film, B110_HOUR * 3 / 10).await;
+    assert_eq!(b.stored(b.film).await, (false, 1, B110_HOUR * 3 / 10, true));
+    assert_eq!(
+        b.details_fields(b.film).await,
+        (film.clone(), Some(false), None, Some(30.0))
+    );
+    // 60 %: past MaxResumePct 50, so played with no resume point
+    b.stop(b.film, Some(B110_HOUR * 6 / 10)).await;
+    assert_eq!(b.stored(b.film).await, (true, 1, 0, true));
+    assert_eq!(
+        b.details_fields(b.film).await,
+        (film, Some(true), None, None)
+    );
+
+    // A 30 min episode is under MinResumeDurationSeconds (1 h): stopped midway, it is played
+    let [e1, ..] = b.episodes;
+    b.start(e1).await;
+    b.stop(e1, Some(B110_HOUR / 4)).await;
+    assert_eq!(b.stored(e1).await, (true, 1, 0, true));
+}
+
+#[tokio::test]
+async fn r3gaps3_default_resume_rules_apply_when_none_are_saved() {
+    let b = B110::new().await;
+    // A 30 min episode stopped at 50 % keeps its resume point under the defaults
+    let [e1, ..] = b.episodes;
+    b.start(e1).await;
+    b.stop(e1, Some(B110_HOUR / 4)).await;
+    assert_eq!(b.stored(e1).await, (false, 1, B110_HOUR / 4, true));
+    // A value that isn't a number keeps the default
+    b.state
+        .config
+        .write()
+        .await
+        .other
+        .insert("MaxResumePct".to_string(), serde_json::json!("high"));
+    b.progress(e1, B110_HOUR * 95 / 200).await;
+    assert_eq!(b.stored(e1).await, (true, 1, 0, true));
+}
+
+#[tokio::test]
+async fn r3gaps3_pictures_outside_the_libraries_and_data_dir_are_refused() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let lib = std::path::PathBuf::from(media_folder(&state, "r3gaps3-images"));
+    std::fs::write(lib.join("Film.mkv"), vec![7u8; 500]).unwrap();
+    let id = r3playback_insert_item(&state, &lib, lib.join("Film.mkv").to_str().unwrap()).await;
+    // A folder outside the data dir and outside every library, then made a library
+    let elsewhere = std::env::temp_dir().join(format!("rustyfin_r3gaps3_{}", uuid::Uuid::new_v4()));
+    remove_when_test_ends(&elsewhere);
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::fs::write(elsewhere.join("poster.png"), TINY_PNG).unwrap();
+    let img = rustyfin_model::image::ItemImage {
+        item_id: id,
+        image_type: rustyfin_model::image::ImageType::Primary,
+        image_index: 0,
+        path: elsewhere.join("poster.png").to_str().unwrap().to_string(),
+        provider: "local".to_string(),
+        width: None,
+        height: None,
+        blurhash: None,
+        stamp: None,
+    };
+    rustyfin_db::repo_image::upsert_image(&state.db, &img)
+        .await
+        .unwrap();
+    let app = app(state.clone());
+    let uri = format!("/Items/{id}/Images/Primary");
+
+    let (status, _) = r3playback_get(&app, &uri, &token).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "a picture in no library");
+
+    // Once its folder is a library, the picture shows: the kept library paths are read again
+    r3playback_insert_item(
+        &state,
+        &elsewhere,
+        elsewhere.join("Other.mkv").to_str().unwrap(),
+    )
+    .await;
+    let (status, body) = r3playback_get(&app, &uri, &token).await;
+    assert_eq!(status, StatusCode::OK, "a picture in a library added since");
+    assert!(body.starts_with(b"\x89PNG"));
+}
+
+#[tokio::test]
+async fn r3gaps3_owned_paths_are_resolved_once_and_kept() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let lib = std::path::PathBuf::from(media_folder(&state, "r3gaps3-owned"));
+    std::fs::write(lib.join("Film.mkv"), vec![7u8; 500]).unwrap();
+    let id = r3playback_insert_item(&state, &lib, lib.join("Film.mkv").to_str().unwrap()).await;
+    // A link in the library to the server's database
+    let linked = r3playback_insert_item(&state, &lib, lib.join("db.mkv").to_str().unwrap()).await;
+    std::os::unix::fs::symlink(state.data_dir.join("test.db"), lib.join("db.mkv")).unwrap();
+    let app = app(state.clone());
+    let kept = || state.file_guard.owned_set.read().unwrap().clone();
+    assert!(kept().is_none());
+
+    let uri = format!("/Videos/{id}/stream?static=true");
+    let (status, _) = r3playback_get(&app, &uri, &token).await;
+    assert_eq!(status, StatusCode::OK);
+    let (first_at, first) = kept().expect("the owned set is kept");
+    assert!(
+        first
+            .data_forms
+            .iter()
+            .any(|d| state.data_dir.starts_with(d) || d.starts_with(&*state.data_dir))
+    );
+
+    // The next requests use the same set, and it still refuses the server's own files
+    let (status, _) = r3playback_get(&app, &uri, &token).await;
+    assert_eq!(status, StatusCode::OK);
+    let refused = format!("/Videos/{linked}/stream?static=true");
+    let (status, body) = r3playback_get(&app, &refused, &token).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(!body.starts_with(b"SQLite format"));
+    let (again_at, again) = kept().unwrap();
+    assert!(Arc::ptr_eq(&first, &again));
+    assert_eq!(first_at, again_at);
 }

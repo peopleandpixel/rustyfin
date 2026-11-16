@@ -957,7 +957,7 @@ fn range_types_come_from_the_codec_tag_and_transfer() {
 }
 
 #[test]
-fn the_default_subtitle_is_external_then_forced_then_default() {
+fn the_default_subtitle_is_external_then_default_then_forced() {
     let pick = |streams: Vec<MediaStream>| {
         SourceFacts::from(&media_source(Some("mkv"), streams)).default_subtitle_stream_index
     };
@@ -968,11 +968,12 @@ fn the_default_subtitle_is_external_then_forced_then_default() {
         subtitle_stream(2, false, false, false),
     ];
     assert_eq!(pick(plain), None);
-    let forced_over_default = vec![
+    // Jellyfin's MediaStreamSelector sorts default streams before forced ones
+    let default_over_forced = vec![
         subtitle_stream(1, false, false, true),
         subtitle_stream(2, false, true, false),
     ];
-    assert_eq!(pick(forced_over_default), Some(2));
+    assert_eq!(pick(default_over_forced), Some(1));
     let external_first = vec![
         subtitle_stream(1, false, true, true),
         subtitle_stream(2, true, false, false),

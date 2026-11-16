@@ -188,12 +188,17 @@ pub(super) fn subtitle_stream(source: &SourceFacts, index: Option<i32>) -> Optio
 }
 
 /// The subtitle index that the plan uses (SB 660-664): the request's index when it is -1 or names
-/// a subtitle stream of `source`, else the source's default subtitle index.
-pub(super) fn chosen_index(source: &SourceFacts, requested: Option<i32>) -> Option<i32> {
+/// a subtitle stream of `source`, else StreamBuilder's default subtitle, which prefers an
+/// external delivery among top-scored streams (`selection::builder_default_subtitle`).
+pub(super) fn chosen_index(
+    source: &SourceFacts,
+    requested: Option<i32>,
+    profile: &DeviceProfile,
+) -> Option<i32> {
     match requested {
         Some(-1) => Some(-1),
         Some(index) if subtitle_stream(source, Some(index)).is_some() => Some(index),
-        _ => source.default_subtitle_stream_index,
+        _ => super::selection::builder_default_subtitle(source, &profile.subtitle_profiles),
     }
 }
 

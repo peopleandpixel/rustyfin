@@ -1,5 +1,6 @@
 use rustyfin_model::media::MediaType;
 use rustyfin_model::playback::UserItemDataDto;
+use rustyfin_model::server_info::ResumeRules;
 
 use crate::writer::ExecuteWrite;
 use sqlx::SqlitePool;
@@ -127,41 +128,35 @@ pub async fn update_playback_position(
     Ok(())
 }
 
-/// Jellyfin's default resume rules (MinResumePct, MaxResumePct, MinResumeDurationSeconds). Fixed,
-/// not settings.
-const MIN_RESUME_PCT: i128 = 5;
-const MAX_RESUME_PCT: i128 = 90;
-const MIN_RESUME_DURATION_TICKS: i128 = 300 * 10_000_000;
-
-/// Whether a position is past `MaxResumePct` of the runtime, or at its end. Needs a runtime above 0.
-fn past_resume_end(position: i64, runtime: i64) -> bool {
-    let pos = position as i128;
-    let rt = runtime as i128;
-    pos * 100 > MAX_RESUME_PCT * rt || pos >= rt
-}
-
-/// The resume position and played flag after a client reports playback stopped at `position`.
-/// Follows Jellyfin's UserDataManager.UpdatePlayState: past `MaxResumePct` (or at the end) the item
-/// is played with no resume point; before `MinResumePct` the resume point is cleared and the played
-/// flag kept; a short item (under `MinResumeDuration`) stopped in the middle counts as played;
-/// otherwise the position is kept. An item with no runtime above 0 counts as played.
-pub fn play_state_after_stop(runtime: Option<i64>, position: i64) -> (i64, bool) {
-    match runtime.filter(|rt| *rt > 0) {
-        None => (0, true),
-        Some(rt) if past_resume_end(position, rt) => (0, true),
-        Some(rt) if (position as i128) * 100 < MIN_RESUME_PCT * rt as i128 => (0, false),
-        Some(rt) if (rt as i128) < MIN_RESUME_DURATION_TICKS => (0, true),
-        Some(_) => (position, false),
+/// The resume position, and whether the item is now played, after a client reports a position
+/// in a progress or stopped report. Follows Jellyfin's `UserDataManager.UpdatePlayState` with the
+/// server's resume rules (`ServerConfiguration::resume_rules`):
+/// - before `MinResumePct` of the runtime, the resume point is cleared;
+/// - past `MaxResumePct`, or within the last second, the item is played with no resume point;
+/// - otherwise an item shorter than `MinResumeDurationSeconds` is played with no resume point,
+///   and a longer one keeps the position;
+/// - an item with no runtime above 0 is played with no resume point.
+///
+/// Played is only ever raised here, never cleared. A position of 0 or less keeps no resume point.
+/// Rustyfin has no audiobook items, so the audiobook rules don't apply.
+pub fn update_play_state(rules: &ResumeRules, runtime: Option<i64>, position: i64) -> (i64, bool) {
+    let Some(runtime) = runtime.filter(|rt| *rt > 0) else {
+        return (0, true);
+    };
+    if position <= 0 {
+        return (0, false);
     }
-}
-
-/// The resume position and played flag after a progress report. Only playing past `MaxResumePct`
-/// (or to the end) changes anything: the item is played with no resume point. Otherwise the reported
-/// position is kept and the played flag is left alone.
-fn play_state_after_progress(runtime: Option<i64>, position: i64) -> (i64, bool) {
-    match runtime.filter(|rt| *rt > 0) {
-        Some(rt) if past_resume_end(position, rt) => (0, true),
-        _ => (position, false),
+    let (pos, rt) = (i128::from(position), i128::from(runtime));
+    if pos * 100 < i128::from(rules.min_resume_pct) * rt {
+        (0, false)
+    } else if pos * 100 > i128::from(rules.max_resume_pct) * rt
+        || pos >= rt - 10_000_000
+        // Short items stopped midway count as played
+        || rt < i128::from(rules.min_resume_duration_seconds) * 10_000_000
+    {
+        (0, true)
+    } else {
+        (position, false)
     }
 }
 
@@ -249,16 +244,17 @@ pub async fn record_playback_start(
     .await
 }
 
-/// A client reported progress: stores the position, or marks the item played with no resume point
-/// once it is past `MaxResumePct`.
+/// A client reported progress: stores the resume position and raises the played flag as
+/// `update_play_state` decides with the server's resume `rules`.
 pub async fn record_playback_progress(
     pool: &SqlitePool,
     user_id: Uuid,
     item_id: Uuid,
     position_ticks: i64,
     runtime_ticks: Option<i64>,
+    rules: &ResumeRules,
 ) -> Result<(), sqlx::Error> {
-    let (position, played) = play_state_after_progress(runtime_ticks, position_ticks);
+    let (position, played) = update_play_state(rules, runtime_ticks, position_ticks);
     write_playback_state(
         pool,
         user_id,
@@ -270,18 +266,20 @@ pub async fn record_playback_progress(
     .await
 }
 
-/// A client reported playback stopped. With a position, `play_state_after_stop` decides. Without
-/// one, Jellyfin assumes the item was played to the end: the item is played and the play counted.
+/// A client reported playback stopped. With a position, `update_play_state` decides with the
+/// server's resume `rules`. Without one, Jellyfin assumes the item was played to the end: the
+/// item is played and the play counted.
 pub async fn record_playback_stop(
     pool: &SqlitePool,
     user_id: Uuid,
     item_id: Uuid,
     position_ticks: Option<i64>,
     runtime_ticks: Option<i64>,
+    rules: &ResumeRules,
 ) -> Result<(), sqlx::Error> {
     let (position, played, play_count_delta) = match position_ticks {
         Some(position) => {
-            let (position, played) = play_state_after_stop(runtime_ticks, position);
+            let (position, played) = update_play_state(rules, runtime_ticks, position);
             (position, played, 0)
         }
         None => (0, true, 1),
@@ -859,53 +857,82 @@ mod tests {
 
     const HOUR: i64 = 36_000_000_000;
 
+    /// The play state under Jellyfin's default resume rules.
+    fn state(runtime: Option<i64>, position: i64) -> (i64, bool) {
+        update_play_state(&ResumeRules::default(), runtime, position)
+    }
+
     #[test]
     fn stop_past_the_end_marks_played_without_a_resume_point() {
-        assert_eq!(play_state_after_stop(Some(HOUR), HOUR), (0, true));
-        assert_eq!(
-            play_state_after_stop(Some(HOUR), HOUR * 91 / 100),
-            (0, true)
-        );
-        assert_eq!(
-            play_state_after_stop(Some(HOUR), HOUR * 90 / 100),
-            (HOUR * 90 / 100, false)
-        );
+        assert_eq!(state(Some(HOUR), HOUR), (0, true));
+        assert_eq!(state(Some(HOUR), HOUR * 91 / 100), (0, true));
+        assert_eq!(state(Some(HOUR), HOUR * 90 / 100), (HOUR * 90 / 100, false));
     }
 
     #[test]
     fn stop_before_five_percent_clears_the_resume_point() {
-        assert_eq!(play_state_after_stop(Some(HOUR), 0), (0, false));
-        assert_eq!(play_state_after_stop(Some(HOUR), -5), (0, false));
-        assert_eq!(play_state_after_stop(Some(HOUR), HOUR / 100), (0, false));
+        assert_eq!(state(Some(HOUR), 0), (0, false));
+        assert_eq!(state(Some(HOUR), -5), (0, false));
+        assert_eq!(state(Some(HOUR), HOUR / 100), (0, false));
     }
 
     #[test]
     fn short_item_stopped_midway_counts_as_played() {
         let short = 299 * 10_000_000;
-        assert_eq!(play_state_after_stop(Some(short), short / 2), (0, true));
+        assert_eq!(state(Some(short), short / 2), (0, true));
         let exact = 300 * 10_000_000;
-        assert_eq!(
-            play_state_after_stop(Some(exact), exact / 2),
-            (exact / 2, false)
-        );
+        assert_eq!(state(Some(exact), exact / 2), (exact / 2, false));
     }
 
     #[test]
     fn unknown_runtime_counts_as_played() {
-        assert_eq!(play_state_after_stop(None, 5_000), (0, true));
-        assert_eq!(play_state_after_stop(Some(0), 5_000), (0, true));
+        assert_eq!(state(None, 5_000), (0, true));
+        assert_eq!(state(Some(0), 5_000), (0, true));
     }
 
+    /// The server's own MinResumePct, MaxResumePct and MinResumeDurationSeconds decide, not
+    /// Jellyfin's defaults.
     #[test]
-    fn progress_only_marks_played_past_the_end() {
+    fn r3gaps3_configured_resume_rules_decide() {
+        let rules = ResumeRules {
+            min_resume_pct: 20,
+            max_resume_pct: 50,
+            min_resume_duration_seconds: 2 * 3600,
+            ..ResumeRules::default()
+        };
+        let state = |runtime, position| update_play_state(&rules, Some(runtime), position);
+        // 10 %: kept under the defaults, before MinResumePct 20 here
+        assert_eq!(state(4 * HOUR, 4 * HOUR / 10), (0, false));
+        // 60 %: past MaxResumePct 50
+        assert_eq!(state(4 * HOUR, 4 * HOUR * 6 / 10), (0, true));
+        // 30 % of 4 hours: kept
         assert_eq!(
-            play_state_after_progress(Some(HOUR), HOUR / 2),
-            (HOUR / 2, false)
+            state(4 * HOUR, 4 * HOUR * 3 / 10),
+            (4 * HOUR * 3 / 10, false)
+        );
+        // 30 % of 1 hour: shorter than MinResumeDurationSeconds (2 hours), so played
+        assert_eq!(state(HOUR, HOUR * 3 / 10), (0, true));
+
+        let no_minimum = ResumeRules {
+            min_resume_pct: 0,
+            max_resume_pct: 100,
+            min_resume_duration_seconds: 0,
+            ..ResumeRules::default()
+        };
+        assert_eq!(
+            update_play_state(&no_minimum, Some(HOUR), HOUR / 100),
+            (HOUR / 100, false)
         );
         assert_eq!(
-            play_state_after_progress(Some(HOUR), HOUR * 95 / 100),
+            update_play_state(&no_minimum, Some(HOUR), HOUR * 99 / 100),
+            (HOUR * 99 / 100, false)
+        );
+        assert_eq!(update_play_state(&no_minimum, Some(HOUR), HOUR), (0, true));
+        // The last second counts as the end
+        let near_end = HOUR - 5_000_000;
+        assert_eq!(
+            update_play_state(&no_minimum, Some(HOUR), near_end),
             (0, true)
         );
-        assert_eq!(play_state_after_progress(None, HOUR), (HOUR, false));
     }
 }
