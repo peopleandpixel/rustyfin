@@ -2819,9 +2819,16 @@ async fn delete_item(
     if let Some(status) = super::collections::delete_container(&state, id, &claims).await? {
         return Ok(status.into_response());
     }
-    if !claims.is_admin {
+    // Jellyfin's EnableContentDeletion; left unset, administrators may and others not.
+    let may_delete = claims.sub.is_nil()
+        || rustyfin_db::repo_parental::get_policy(&state.db_ro, claims.sub)
+            .await?
+            .access
+            .enable_content_deletion
+            .unwrap_or(claims.is_admin);
+    if !may_delete {
         return Err(ApiError::Forbidden(
-            "Administrator access is required.".to_string(),
+            "This user may not delete media.".to_string(),
         ));
     }
     let deleted = rustyfin_db::repo_media::delete_item(&state.db, id).await?;

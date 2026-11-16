@@ -289,8 +289,9 @@ pub fn unrated_kind(media_type: &str) -> Option<&'static str> {
         .unwrap_or(Some("Other"))
 }
 
-/// A user's parental limits, the `UserPolicy` fields of that name.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// A user's limits on what they see: the parental `UserPolicy` fields, and in `access` the
+/// libraries, schedules and features an administrator allows them.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ParentalPolicy {
     /// The highest rating score the user may see; `None` for no limit.
     pub max_parental_rating: Option<i32>,
@@ -302,12 +303,28 @@ pub struct ParentalPolicy {
     pub blocked_tags: Vec<String>,
     /// When not empty, only items under a top-level item with one of these tags are shown.
     pub allowed_tags: Vec<String>,
+    /// Library access, access schedules and the feature switches.
+    pub access: AccessPolicy,
 }
 
 impl ParentalPolicy {
     /// True when the policy hides anything.
     pub fn is_restricted(&self) -> bool {
-        self.limits_ratings() || !self.blocked_tags.is_empty() || !self.allowed_tags.is_empty()
+        self.limits_ratings()
+            || !self.blocked_tags.is_empty()
+            || !self.allowed_tags.is_empty()
+            || self.enabled_folders().is_some()
+    }
+
+    /// The library ids the user may see, or `None` for all of them.
+    pub fn enabled_folders(&self) -> Option<&[String]> {
+        (!self.access.enable_all_folders).then_some(self.access.enabled_folders.as_slice())
+    }
+
+    /// Whether the user may see library `id` (compared without case, as ids may be stored either way).
+    pub fn allows_folder(&self, id: &str) -> bool {
+        self.enabled_folders()
+            .is_none_or(|ids| ids.iter().any(|f| f.eq_ignore_ascii_case(id)))
     }
 
     /// True when ratings matter: a maximum, or a kind of unrated item to hide.
@@ -369,6 +386,149 @@ impl ParentalPolicy {
         );
         policy.insert("BlockedTags".into(), self.blocked_tags.clone().into());
         policy.insert("AllowedTags".into(), self.allowed_tags.clone().into());
+        if let Ok(serde_json::Value::Object(access)) = serde_json::to_value(&self.access) {
+            for (key, value) in access {
+                // EnableContentDeletion left unset follows the administrator flag already written.
+                if !value.is_null() {
+                    policy.insert(key, value);
+                }
+            }
+        }
+    }
+}
+
+/// The `UserPolicy` fields on access that an administrator sets per user, stored as given. The
+/// defaults are Jellyfin's for a new user.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct AccessPolicy {
+    /// Left out of the public user list on the sign-in page.
+    pub is_hidden: bool,
+    /// May sign in and use the server from outside the local network.
+    pub enable_remote_access: bool,
+    pub enable_media_playback: bool,
+    pub enable_audio_playback_transcoding: bool,
+    pub enable_video_playback_transcoding: bool,
+    /// May play a stream that is remuxed without transcoding (Jellyfin's direct stream).
+    pub enable_playback_remuxing: bool,
+    pub force_remote_source_transcoding: bool,
+    /// May delete media items. `None` until set: administrators may, others not.
+    pub enable_content_deletion: Option<bool>,
+    /// The most sessions the user may have at once; 0 for no limit.
+    pub max_active_sessions: i32,
+    /// The highest bitrate a client outside the local network may stream at; 0 for no limit.
+    pub remote_client_bitrate_limit: i64,
+    pub enable_all_folders: bool,
+    /// The library ids the user may see while `enable_all_folders` is off.
+    pub enabled_folders: Vec<String>,
+    /// When not empty, the times a user who isn't an administrator may use the server.
+    pub access_schedules: Vec<AccessSchedule>,
+}
+
+impl Default for AccessPolicy {
+    fn default() -> Self {
+        Self {
+            is_hidden: false,
+            enable_remote_access: true,
+            enable_media_playback: true,
+            enable_audio_playback_transcoding: true,
+            enable_video_playback_transcoding: true,
+            enable_playback_remuxing: true,
+            force_remote_source_transcoding: false,
+            enable_content_deletion: None,
+            max_active_sessions: 0,
+            remote_client_bitrate_limit: 0,
+            enable_all_folders: true,
+            enabled_folders: Vec::new(),
+            access_schedules: Vec::new(),
+        }
+    }
+}
+
+impl AccessPolicy {
+    /// Jellyfin's `User.IsParentalScheduleAllowed`: with no schedule any time is allowed, else
+    /// the local `weekday` and `hour` (hours since midnight, with fractions) must fall within one.
+    pub fn schedule_allows(&self, weekday: chrono::Weekday, hour: f64) -> bool {
+        self.access_schedules.is_empty()
+            || self
+                .access_schedules
+                .iter()
+                .any(|s| s.covers_day(weekday) && hour >= s.start_hour && hour <= s.end_hour)
+    }
+
+    /// `schedule_allows` at the server's local time now.
+    pub fn schedule_allows_now(&self) -> bool {
+        use chrono::{Datelike, Timelike};
+        let now = chrono::Local::now();
+        let hour = f64::from(now.hour())
+            + f64::from(now.minute()) / 60.0
+            + f64::from(now.second()) / 3600.0;
+        self.schedule_allows(now.weekday(), hour)
+    }
+}
+
+/// Jellyfin's `DynamicDayOfWeek` values.
+pub const SCHEDULE_DAYS: [&str; 10] = [
+    "Sunday",
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+    "Everyday",
+    "Weekday",
+    "Weekend",
+];
+
+/// One period of Jellyfin's `AccessSchedule`: a day (or Everyday, Weekday, Weekend) and the hours
+/// from `start_hour` to `end_hour`, both 0 to 24, in halves or any fraction.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct AccessSchedule {
+    pub day_of_week: String,
+    pub start_hour: f64,
+    pub end_hour: f64,
+}
+
+impl AccessSchedule {
+    /// The schedule with its day in Jellyfin's spelling, or `None` when the day is unknown or the
+    /// hours aren't an ordered range within 0 to 24.
+    pub fn validated(&self) -> Option<Self> {
+        let day = SCHEDULE_DAYS
+            .iter()
+            .find(|d| d.eq_ignore_ascii_case(self.day_of_week.trim()))?;
+        let hours = 0.0..=24.0;
+        (hours.contains(&self.start_hour)
+            && hours.contains(&self.end_hour)
+            && self.start_hour <= self.end_hour)
+            .then(|| Self {
+                day_of_week: (*day).to_string(),
+                ..self.clone()
+            })
+    }
+
+    fn covers_day(&self, weekday: chrono::Weekday) -> bool {
+        use chrono::Weekday::*;
+        match self.day_of_week.as_str() {
+            "Everyday" => true,
+            "Weekday" => !matches!(weekday, Sat | Sun),
+            "Weekend" => matches!(weekday, Sat | Sun),
+            day => day == weekday_name(weekday),
+        }
+    }
+}
+
+fn weekday_name(weekday: chrono::Weekday) -> &'static str {
+    use chrono::Weekday::*;
+    match weekday {
+        Sun => "Sunday",
+        Mon => "Monday",
+        Tue => "Tuesday",
+        Wed => "Wednesday",
+        Thu => "Thursday",
+        Fri => "Friday",
+        Sat => "Saturday",
     }
 }
 
@@ -476,5 +636,71 @@ mod tests {
         assert_eq!(pg["Value"], 10);
         assert_eq!(pg["RatingScore"]["score"], 10);
         assert_eq!(list.last().unwrap()["Name"], "Banned");
+    }
+
+    fn schedule(day: &str, start: f64, end: f64) -> AccessSchedule {
+        AccessSchedule {
+            day_of_week: day.into(),
+            start_hour: start,
+            end_hour: end,
+        }
+    }
+
+    #[test]
+    fn r3parental_schedule_matches_jellyfin_days_and_hours() {
+        use chrono::Weekday::*;
+        let open = AccessPolicy::default();
+        assert!(
+            open.schedule_allows(Mon, 3.0),
+            "no schedule allows any time"
+        );
+        let policy = AccessPolicy {
+            access_schedules: vec![
+                schedule("Weekday", 8.0, 17.5),
+                schedule("Sunday", 10.0, 12.0),
+            ],
+            ..AccessPolicy::default()
+        };
+        assert!(policy.schedule_allows(Mon, 8.0), "start hour is inclusive");
+        assert!(policy.schedule_allows(Fri, 17.5), "end hour is inclusive");
+        assert!(!policy.schedule_allows(Fri, 17.6));
+        assert!(
+            !policy.schedule_allows(Sat, 9.0),
+            "Weekday leaves out Saturday"
+        );
+        assert!(policy.schedule_allows(Sun, 11.0));
+        assert!(!policy.schedule_allows(Sun, 13.0));
+        let all = AccessPolicy {
+            access_schedules: vec![schedule("Everyday", 0.0, 24.0)],
+            ..AccessPolicy::default()
+        };
+        assert!(all.schedule_allows(Sat, 23.9));
+    }
+
+    #[test]
+    fn r3parental_schedule_validation() {
+        assert_eq!(
+            schedule("weekend", 1.0, 2.0)
+                .validated()
+                .unwrap()
+                .day_of_week,
+            "Weekend"
+        );
+        assert!(schedule("Someday", 1.0, 2.0).validated().is_none());
+        assert!(schedule("Monday", 5.0, 4.0).validated().is_none());
+        assert!(schedule("Monday", -1.0, 4.0).validated().is_none());
+        assert!(schedule("Monday", 0.0, 24.5).validated().is_none());
+    }
+
+    #[test]
+    fn r3parental_library_access_restricts() {
+        let mut policy = ParentalPolicy::default();
+        assert!(!policy.is_restricted());
+        assert!(policy.allows_folder("abc"));
+        policy.access.enable_all_folders = false;
+        policy.access.enabled_folders = vec!["ABC".into()];
+        assert!(policy.is_restricted());
+        assert!(policy.allows_folder("abc"));
+        assert!(!policy.allows_folder("def"));
     }
 }

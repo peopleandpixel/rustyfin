@@ -126,14 +126,18 @@ pub async fn get_music_artists(
     link_kind: &str,
     item_type: &str,
     library: Option<Uuid>,
+    hidden_ids_json: Option<&str>,
 ) -> Result<Vec<MediaItem>, sqlx::Error> {
     let library = library.map(|id| id.to_string());
+    // `hidden_ids_json` (a JSON array of item ids a user may not see) leaves out the artists whose
+    // every linked item is hidden.
     let query = format!(
         "SELECT {}, p.name FROM people p
          WHERE p.id IN (
              SELECT ip.person_id FROM item_people ip
              JOIN media_items mi ON mi.id = ip.item_id
              WHERE ip.type = ? AND mi.media_type = ? AND (? IS NULL OR mi.library_id = ?)
+               AND (? IS NULL OR mi.id NOT IN (SELECT value FROM json_each(?)))
          )
          ORDER BY p.name COLLATE NOCASE",
         artist_id_sql("?")
@@ -145,6 +149,8 @@ pub async fn get_music_artists(
         .bind(item_type)
         .bind(&library)
         .bind(&library)
+        .bind(hidden_ids_json)
+        .bind(hidden_ids_json)
         .fetch_all(pool)
         .await?;
 
@@ -228,6 +234,22 @@ pub async fn album_track_artists_batch(
         }
     }
     Ok(map)
+}
+
+/// The ids of the people linked to at least one item outside `hidden_ids_json` (a JSON array of
+/// item ids a user may not see).
+pub async fn visible_people(
+    pool: &SqlitePool,
+    hidden_ids_json: &str,
+) -> Result<std::collections::HashSet<String>, sqlx::Error> {
+    let ids: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT person_id FROM item_people \
+         WHERE item_id NOT IN (SELECT value FROM json_each(?))",
+    )
+    .bind(hidden_ids_json)
+    .fetch_all(pool)
+    .await?;
+    Ok(ids.into_iter().collect())
 }
 
 pub async fn get_all_persons(pool: &SqlitePool) -> Result<Vec<NameIdPair>, sqlx::Error> {

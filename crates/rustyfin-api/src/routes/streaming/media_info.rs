@@ -17,11 +17,13 @@ use rustyfin_model::items_playback_info::{
 };
 use rustyfin_model::media::MediaType;
 use rustyfin_model::media_source::MediaSourceResponse;
+use rustyfin_model::parental::AccessPolicy;
 use serde_json::Value;
 use uuid::Uuid;
 
 use super::{Version, select_version};
 use crate::error::ApiError;
+use crate::middleware::ClientIsLocal;
 use crate::state::AppState;
 
 /// The PlaybackInfo routes of an item.
@@ -38,6 +40,7 @@ async fn get_items_playback_info(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
     token: Option<Extension<rustyfin_auth::RequestToken>>,
+    local: Option<Extension<ClientIsLocal>>,
     Path(id): Path<String>,
     Query(pairs): Query<Vec<(String, String)>>,
 ) -> Result<Json<ItemsPlaybackInfoResponse>, ApiError> {
@@ -47,7 +50,8 @@ async fn get_items_playback_info(
         .collect();
     let dto = PlaybackInfoDto::from_query_pairs(&user_pairs).map_err(bad_request)?;
     let token = token.map(|Extension(rt)| rt.0);
-    let answer = playback_info(&state, &claims, token.as_deref(), &id, dto, false).await?;
+    let local = local.is_none_or(|Extension(ClientIsLocal(l))| l);
+    let answer = playback_info(&state, &claims, token.as_deref(), &id, dto, false, local).await?;
     Ok(Json(answer))
 }
 
@@ -57,6 +61,7 @@ async fn post_items_playback_info(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
     token: Option<Extension<rustyfin_auth::RequestToken>>,
+    local: Option<Extension<ClientIsLocal>>,
     Path(id): Path<String>,
     Query(pairs): Query<Vec<(String, String)>>,
     body: Bytes,
@@ -65,7 +70,8 @@ async fn post_items_playback_info(
     let from_body = PlaybackInfoDto::from_body(&body).map_err(bad_request)?;
     let dto = from_query.or_body(from_body);
     let token = token.map(|Extension(rt)| rt.0);
-    let answer = playback_info(&state, &claims, token.as_deref(), &id, dto, true).await?;
+    let local = local.is_none_or(|Extension(ClientIsLocal(l))| l);
+    let answer = playback_info(&state, &claims, token.as_deref(), &id, dto, true, local).await?;
     Ok(Json(answer))
 }
 
@@ -75,7 +81,9 @@ fn bad_request(err: ProfileError) -> ApiError {
 }
 
 /// The PlaybackInfo answer for item `id`. `with_profile` is set for POST, which may decide per
-/// device; GET answers without device data.
+/// device; GET answers without device data. The user's policy applies as in Jellyfin: without
+/// playback the answer is `NotAllowed`; without transcoding or remuxing for the item's kind the
+/// sources don't offer it; a client outside the local network gets at most the remote bitrate limit.
 async fn playback_info(
     state: &AppState,
     claims: &Claims,
@@ -83,6 +91,7 @@ async fn playback_info(
     id: &str,
     mut dto: PlaybackInfoDto,
     with_profile: bool,
+    local: bool,
 ) -> Result<ItemsPlaybackInfoResponse, ApiError> {
     let item_id =
         Uuid::parse_str(id).map_err(|_| ApiError::NotFound(format!("Item {id} not found")))?;
@@ -95,6 +104,32 @@ async fn playback_info(
     } else {
         MediaKind::Video
     };
+    let access = if claims.sub.is_nil() {
+        AccessPolicy::default()
+    } else {
+        rustyfin_db::repo_parental::get_policy(&state.db_ro, claims.sub)
+            .await?
+            .access
+    };
+    if !access.enable_media_playback {
+        return Ok(ItemsPlaybackInfoResponse {
+            media_sources: Vec::new(),
+            play_session_id: None,
+            error_code: Some(PlaybackErrorCode::NotAllowed),
+        });
+    }
+    let may_transcode = match kind {
+        MediaKind::Audio => access.enable_audio_playback_transcoding,
+        _ => access.enable_video_playback_transcoding,
+    };
+    let may_remux = access.enable_playback_remuxing;
+    if !local && access.remote_client_bitrate_limit > 0 {
+        let limit = access
+            .remote_client_bitrate_limit
+            .try_into()
+            .unwrap_or(i32::MAX);
+        dto.max_streaming_bitrate = Some(dto.max_streaming_bitrate.map_or(limit, |b| b.min(limit)));
+    }
 
     let mut sources =
         rustyfin_db::repo_media_source::get_media_sources_with_item_check(&state.db_ro, &item_id)
@@ -148,8 +183,8 @@ async fn playback_info(
         let mut source = sources[index].clone();
         // The loader's flags are a placeholder; the device data below decides them when present
         source.supports_direct_play = true;
-        source.supports_direct_stream = true;
-        source.supports_transcoding = true;
+        source.supports_direct_stream = may_remux;
+        source.supports_transcoding = may_transcode;
         let value = match &profile {
             None => serde_json::to_value(&source),
             Some(profile) => {
@@ -167,8 +202,8 @@ async fn playback_info(
                     subtitle_stream_index: dto.subtitle_stream_index,
                     max_audio_channels: dto.max_audio_channels,
                     enable_direct_play: dto.enable_direct_play.unwrap_or(true),
-                    enable_direct_stream: dto.enable_direct_stream.unwrap_or(true),
-                    enable_transcoding: dto.enable_transcoding.unwrap_or(true),
+                    enable_direct_stream: dto.enable_direct_stream.unwrap_or(true) && may_remux,
+                    enable_transcoding: dto.enable_transcoding.unwrap_or(true) && may_transcode,
                     allow_video_stream_copy: dto.allow_video_stream_copy.unwrap_or(true),
                     allow_audio_stream_copy: dto.allow_audio_stream_copy.unwrap_or(true),
                     always_burn_in_subtitle: dto

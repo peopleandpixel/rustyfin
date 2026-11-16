@@ -3193,7 +3193,7 @@ pub async fn get_album_artists(
     pool: &SqlitePool,
     library: Option<uuid::Uuid>,
 ) -> Result<Vec<MediaItem>, sqlx::Error> {
-    crate::repo_person::get_music_artists(pool, "AlbumArtist", "MusicAlbum", library).await
+    crate::repo_person::get_music_artists(pool, "AlbumArtist", "MusicAlbum", library, None).await
 }
 
 /// Get genres by name

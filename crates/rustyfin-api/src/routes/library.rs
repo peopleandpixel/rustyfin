@@ -2,8 +2,9 @@ use crate::query::Query;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{delete, get, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use rustyfin_core::scan_progress::ScanTicket;
+use rustyfin_model::auth::Claims;
 use rustyfin_model::library::{
     CreateLibraryRequest, Library, LibraryOptions, LibraryOptionsUpdate,
 };
@@ -131,33 +132,44 @@ pub(crate) fn libraries_to_views(libs: &[Library], server_id: &str) -> Value {
 
 async fn get_user_views(
     State(state): State<AppState>,
-    Path(_user_id): Path<Uuid>,
+    Extension(claims): Extension<Claims>,
+    Path(user_id): Path<Uuid>,
 ) -> Result<Json<Value>, ApiError> {
-    // Check cache first
-    if let Some(cached) = state.cache.library_views.get("views") {
-        return Ok(Json(cached));
-    }
-    let libs = rustyfin_db::repo_library::get_all_libraries(&state.db_ro).await?;
-    let views = libraries_to_views(&libs, &state.server_id);
-    state
-        .cache
-        .library_views
-        .insert("views".to_string(), views.clone());
-    Ok(Json(views))
+    // An administrator may look at another user's views; anyone else gets their own.
+    let user = if claims.is_admin { user_id } else { claims.sub };
+    Ok(Json(views_for(&state, user).await?))
 }
 
-async fn get_user_views_no_user(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    // Check cache first
-    if let Some(cached) = state.cache.library_views.get("views") {
-        return Ok(Json(cached));
+async fn get_user_views_no_user(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(views_for(&state, claims.sub).await?))
+}
+
+/// Every library as a view (cached for all users), less those `user`'s library access leaves out.
+async fn views_for(state: &AppState, user: Uuid) -> Result<Value, ApiError> {
+    let mut views = match state.cache.library_views.get("views") {
+        Some(cached) => cached,
+        None => {
+            let libs = rustyfin_db::repo_library::get_all_libraries(&state.db_ro).await?;
+            let views = libraries_to_views(&libs, &state.server_id);
+            state
+                .cache
+                .library_views
+                .insert("views".to_string(), views.clone());
+            views
+        }
+    };
+    let policy = rustyfin_db::repo_parental::get_policy(&state.db_ro, user).await?;
+    if policy.enabled_folders().is_some()
+        && let Some(items) = views.get_mut("Items").and_then(Value::as_array_mut)
+    {
+        items.retain(|v| v["Id"].as_str().is_some_and(|id| policy.allows_folder(id)));
+        let count = items.len();
+        views["TotalRecordCount"] = count.into();
     }
-    let libs = rustyfin_db::repo_library::get_all_libraries(&state.db_ro).await?;
-    let views = libraries_to_views(&libs, &state.server_id);
-    state
-        .cache
-        .library_views
-        .insert("views".to_string(), views.clone());
-    Ok(Json(views))
+    Ok(views)
 }
 
 /// A library in `GET /Library/VirtualFolders`, with its saved options. Rustyfin's `Id`,

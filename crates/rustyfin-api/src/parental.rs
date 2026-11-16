@@ -12,11 +12,93 @@ use axum::extract::{RawPathParams, Request, State};
 use axum::middleware::Next;
 use axum::response::Response;
 use rustyfin_model::auth::Claims;
-use rustyfin_model::parental::ParentalPolicy;
+use rustyfin_model::parental::{AccessPolicy, ParentalPolicy};
 use uuid::Uuid;
 
 use crate::error::ApiError;
 use crate::state::AppState;
+
+/// Jellyfin's `DefaultAuthorizationHandler` checks for every authenticated request: a user
+/// without remote access is refused outside the local network, and a user who isn't an
+/// administrator is refused outside their access schedule, in the server's local time. The API
+/// key has no limits.
+pub async fn check_access(state: &AppState, claims: &Claims, local: bool) -> Result<(), ApiError> {
+    if claims.sub.is_nil() {
+        return Ok(());
+    }
+    let policy = rustyfin_db::repo_parental::get_policy(&state.db_ro, claims.sub).await?;
+    access_allowed(&policy.access, claims.is_admin, local)
+}
+
+/// Whether a user with this access policy may use the server now (see `check_access`).
+pub fn access_allowed(access: &AccessPolicy, is_admin: bool, local: bool) -> Result<(), ApiError> {
+    if !local && !access.enable_remote_access {
+        return Err(ApiError::Forbidden(
+            "Remote access is not allowed for this user.".into(),
+        ));
+    }
+    if !is_admin && !access.schedule_allows_now() {
+        return Err(ApiError::Forbidden(
+            "User is not allowed access at this time.".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// The checks of a sign-in, before a token is issued: `access_allowed`, and Jellyfin's
+/// `MaxActiveSessions`, counting the user's sessions on other devices than this one, which the
+/// sign-in replaces.
+pub async fn check_sign_in(
+    state: &AppState,
+    user: &rustyfin_model::user::User,
+    device_id: &str,
+    local: bool,
+) -> Result<(), ApiError> {
+    let access = rustyfin_db::repo_parental::get_policy(&state.db, user.id)
+        .await?
+        .access;
+    access_allowed(&access, user.is_administrator, local)?;
+    if access.max_active_sessions > 0 {
+        let others = rustyfin_db::repo_session::session_device_ids(&state.db, user.id)
+            .await?
+            .into_iter()
+            .filter(|d| d.is_empty() || d != device_id)
+            .count();
+        if others >= access.max_active_sessions as usize {
+            return Err(ApiError::Forbidden(format!(
+                "{} has reached the maximum of {} active sessions.",
+                user.name, access.max_active_sessions
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Middleware for the stream, transcode and HLS routes: a user whose policy has no media
+/// playback gets 403. PlaybackInfo passes, and answers Jellyfin's `NotAllowed` itself.
+pub async fn require_playback(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    if let Some(claims) = req.extensions().get::<Claims>()
+        && !claims.sub.is_nil()
+        && !req
+            .uri()
+            .path()
+            .to_ascii_lowercase()
+            .ends_with("/playbackinfo")
+        && !rustyfin_db::repo_parental::get_policy(&state.db_ro, claims.sub)
+            .await?
+            .access
+            .enable_media_playback
+    {
+        return Err(ApiError::Forbidden(
+            "Media playback is not allowed for this user.".into(),
+        ));
+    }
+    Ok(next.run(req).await)
+}
 
 /// The caller's parental policy, or `None` when it hides nothing.
 pub async fn policy(state: &AppState, claims: &Claims) -> Result<Option<ParentalPolicy>, ApiError> {

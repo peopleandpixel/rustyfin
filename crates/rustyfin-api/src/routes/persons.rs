@@ -23,19 +23,47 @@ pub fn routes() -> Router<AppState> {
         .merge(by_name::routes())
 }
 
-async fn get_persons(State(state): State<AppState>) -> Result<Json<Vec<NameIdPair>>, ApiError> {
-    let persons = rustyfin_db::repo_person::get_all_persons(&state.db_ro).await?;
+async fn get_persons(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<Vec<NameIdPair>>, ApiError> {
+    let mut persons = rustyfin_db::repo_person::get_all_persons(&state.db_ro).await?;
+    if let Some(visible) = visible_people(&state, &claims).await? {
+        persons.retain(|p| visible.contains(&p.id));
+    }
     Ok(Json(persons))
 }
 
 async fn get_person(
     Path(id): Path<String>,
     State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
 ) -> Result<Json<PersonDto>, ApiError> {
     let person = rustyfin_db::repo_person::get_person(&state.db_ro, &id)
         .await?
         .ok_or_else(|| ApiError::NotFound("Person not found".to_string()))?;
+    if let Some(visible) = visible_people(&state, &claims).await?
+        && !visible.contains(&id)
+    {
+        return Err(ApiError::NotFound("Person not found".to_string()));
+    }
     Ok(Json(person))
+}
+
+/// For a caller with limits, the ids of the people linked to an item they may see; `None` for a
+/// caller without limits, who sees everyone.
+pub(crate) async fn visible_people(
+    state: &AppState,
+    claims: &Claims,
+) -> Result<Option<std::collections::HashSet<String>>, ApiError> {
+    let hidden = HiddenItems::for_caller(state, claims).await?;
+    if !hidden.is_restricted() {
+        return Ok(None);
+    }
+    let json = hidden.json().unwrap_or_else(|| "[]".into());
+    Ok(Some(
+        rustyfin_db::repo_person::visible_people(&state.db_ro, &json).await?,
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -129,14 +157,17 @@ fn filter_artists(all: Vec<MediaItem>, query: &ArtistsQuery) -> Vec<MediaItem> {
     kept
 }
 
-/// One page of the music artists linked as `link_kind` to items of `item_type`. A `ParentId`
-/// that is not a library id is ignored; `TotalRecordCount` counts all matches before paging.
+/// One page of the music artists linked as `link_kind` to items of `item_type` the caller may
+/// see. A `ParentId` that is not a library id is ignored; `TotalRecordCount` counts all matches
+/// before paging.
 pub(crate) async fn music_artists_page(
     state: &AppState,
+    claims: &Claims,
     query: &ArtistsQuery,
     link_kind: &str,
     item_type: &str,
 ) -> Result<QueryResult, ApiError> {
+    let hidden = HiddenItems::for_caller(state, claims).await?.json();
     let mut library = None;
     if let Some(id) = query
         .parent_id
@@ -148,9 +179,14 @@ pub(crate) async fn music_artists_page(
     {
         library = Some(id);
     }
-    let all =
-        rustyfin_db::repo_person::get_music_artists(&state.db_ro, link_kind, item_type, library)
-            .await?;
+    let all = rustyfin_db::repo_person::get_music_artists(
+        &state.db_ro,
+        link_kind,
+        item_type,
+        library,
+        hidden.as_deref(),
+    )
+    .await?;
     let all = filter_artists(all, query);
     let total = all.len() as i64;
     let start = query.start_index.unwrap_or(0).max(0);
@@ -178,9 +214,10 @@ pub(crate) async fn music_artists_page(
 
 async fn get_artists(
     State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
     Query(query): Query<ArtistsQuery>,
 ) -> Result<Json<QueryResult>, ApiError> {
     Ok(Json(
-        music_artists_page(&state, &query, "Artist", "Audio").await?,
+        music_artists_page(&state, &claims, &query, "Artist", "Audio").await?,
     ))
 }

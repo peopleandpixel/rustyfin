@@ -155,7 +155,7 @@ pub fn parse_provider_ids(text: &str) -> ProviderIds {
 }
 
 /// A Jellyfin user (spec 2.5).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct JfUser {
     pub id: Uuid,
     pub name: String,

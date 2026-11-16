@@ -21821,7 +21821,7 @@ async fn r2parental_policy_is_kept_and_returned() {
     for bad in [
         serde_json::json!({ "MaxParentalRating": 13, "BlockUnratedItems": ["Cartoons"] }),
         serde_json::json!({ "MaxParentalRating": 13, "AccessSchedules": [
-            { "DayOfWeek": "Everyday", "StartHour": 8, "EndHour": 20 }
+            { "DayOfWeek": "Someday", "StartHour": 8, "EndHour": 20 }
         ] }),
     ] {
         let (status, _) = send(&w.app, request("POST", &uri, Some(&w.admin), Some(bad))).await;
@@ -22608,6 +22608,558 @@ async fn r2parental_jellyfin_import_carries_parental_limits() {
         alice["Policy"]["MaxParentalRating"],
         serde_json::Value::Null
     );
+}
+
+// ── R3 parental: library access, access schedules and the user policy switches ──
+// EnableAllFolders/EnabledFolders hide other libraries on every route, as parental limits do;
+// AccessSchedules, EnableRemoteAccess, the playback switches and MaxActiveSessions are enforced
+// where Jellyfin enforces them.
+
+impl R2Parental {
+    /// The fixture's library id.
+    async fn library_id(&self) -> String {
+        sqlx::query_scalar("SELECT library_id FROM media_items WHERE id = ?")
+            .bind(self.id("Gentle").to_string())
+            .fetch_one(&self.state.db)
+            .await
+            .unwrap()
+    }
+
+    /// A second library, "Elsewhere", with one G-rated movie, "Far Away"; returns the library's
+    /// id and the movie's.
+    async fn other_library(&self) -> (uuid::Uuid, uuid::Uuid) {
+        let folder = self.state.data_dir.join("media").join("r3elsewhere");
+        std::fs::create_dir_all(&folder).unwrap();
+        let lib = rustyfin_model::library::Library {
+            id: uuid::Uuid::new_v4(),
+            name: "Elsewhere".to_string(),
+            content_type: rustyfin_model::library::LibraryContentType::Movies,
+            paths: vec![folder.to_string_lossy().to_string()],
+        };
+        rustyfin_db::repo_library::create_library(&self.state.db, &lib)
+            .await
+            .unwrap();
+        self.state.cache.library_views.invalidate_all();
+        let movie = uuid::Uuid::new_v4();
+        let path = folder.join("Far Away.mkv");
+        std::fs::write(&path, b"r3parental video bytes").unwrap();
+        sqlx::query(
+            "INSERT INTO media_items (id, library_id, name, media_type, path, official_rating, \
+             genres) VALUES (?, ?, 'Far Away', 'Movie', ?, 'G', 'Family')",
+        )
+        .bind(movie.to_string())
+        .bind(lib.id.to_string())
+        .bind(path.to_string_lossy().to_string())
+        .execute(&self.state.db)
+        .await
+        .unwrap();
+        (lib.id, movie)
+    }
+}
+
+/// The weekday names Jellyfin uses, Monday first.
+const R3PARENTAL_DAYS: [&str; 7] = [
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+    "Sunday",
+];
+
+/// A sign-in with a device id, as Jellyfin Web sends it.
+fn r3parental_login(name: &str, pw: &str, device: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/Users/AuthenticateByName")
+        .header("Content-Type", "application/json")
+        .header(
+            "X-Emby-Authorization",
+            format!(
+                "MediaBrowser Client=\"Test\", Device=\"Test\", DeviceId=\"{device}\", Version=\"1\""
+            ),
+        )
+        .body(Body::from(
+            serde_json::json!({ "Username": name, "Pw": pw }).to_string(),
+        ))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn r3parental_access_fields_round_trip_through_the_policy() {
+    let w = r2parental().await;
+    let user_uri = format!("/Users/{}", w.kid_id);
+    let (_, user) = w.get(&w.admin, &user_uri).await;
+    let p = &user["Policy"];
+    assert_eq!(p["EnableAllFolders"], true);
+    assert_eq!(p["EnabledFolders"], serde_json::json!([]));
+    assert_eq!(p["AccessSchedules"], serde_json::json!([]));
+    assert_eq!(p["IsHidden"], false);
+    assert_eq!(p["EnableRemoteAccess"], true);
+    assert_eq!(p["EnableContentDeletion"], false);
+    assert_eq!(p["MaxActiveSessions"], 0);
+
+    // The whole policy, as Jellyfin Web posts it back, with every switch it shows changed.
+    let lib = w.library_id().await;
+    let simple = uuid::Uuid::parse_str(&lib).unwrap().simple().to_string();
+    let mut policy = p.clone();
+    for (key, value) in [
+        ("IsHidden", serde_json::json!(true)),
+        ("EnableRemoteAccess", serde_json::json!(false)),
+        ("EnableMediaPlayback", serde_json::json!(false)),
+        ("EnableAudioPlaybackTranscoding", serde_json::json!(false)),
+        ("EnableVideoPlaybackTranscoding", serde_json::json!(false)),
+        ("EnablePlaybackRemuxing", serde_json::json!(false)),
+        ("ForceRemoteSourceTranscoding", serde_json::json!(true)),
+        ("EnableContentDeletion", serde_json::json!(true)),
+        ("MaxActiveSessions", serde_json::json!(3)),
+        ("RemoteClientBitrateLimit", serde_json::json!(4_000_000)),
+        ("EnableAllFolders", serde_json::json!(false)),
+        // Jellyfin Web sends ids without dashes; they are kept in one spelling.
+        (
+            "EnabledFolders",
+            serde_json::json!([simple, lib, "not-an-id"]),
+        ),
+        (
+            "AccessSchedules",
+            serde_json::json!([{ "Id": 0, "UserId": w.kid_id, "DayOfWeek": "weekday",
+                "StartHour": 7.5, "EndHour": 20 }]),
+        ),
+    ] {
+        policy[key] = value;
+    }
+    w.set_policy(policy.clone()).await;
+    let (_, user) = w.get(&w.admin, &user_uri).await;
+    let got = &user["Policy"];
+    for key in [
+        "IsHidden",
+        "EnableRemoteAccess",
+        "EnableMediaPlayback",
+        "EnableAudioPlaybackTranscoding",
+        "EnableVideoPlaybackTranscoding",
+        "EnablePlaybackRemuxing",
+        "ForceRemoteSourceTranscoding",
+        "EnableContentDeletion",
+        "MaxActiveSessions",
+        "RemoteClientBitrateLimit",
+        "EnableAllFolders",
+    ] {
+        assert_eq!(got[key], policy[key], "{key}");
+    }
+    assert_eq!(got["EnabledFolders"], serde_json::json!([lib]));
+    assert_eq!(
+        got["AccessSchedules"],
+        serde_json::json!([{ "DayOfWeek": "Weekday", "StartHour": 7.5, "EndHour": 20.0 }])
+    );
+
+    // A policy without the fields keeps them.
+    w.set_policy(serde_json::json!({ "MaxParentalRating": 10 }))
+        .await;
+    let (_, user) = w.get(&w.admin, &user_uri).await;
+    assert_eq!(user["Policy"]["EnableAllFolders"], false);
+    assert_eq!(user["Policy"]["MaxActiveSessions"], 3);
+
+    // What can't be kept is refused, and nothing changes.
+    let uri = format!("/Users/{}/Policy", w.kid_id);
+    for bad in [
+        serde_json::json!({ "AccessSchedules": [{ "DayOfWeek": "Someday", "StartHour": 1, "EndHour": 2 }] }),
+        serde_json::json!({ "AccessSchedules": [{ "DayOfWeek": "Monday", "StartHour": 9, "EndHour": 8 }] }),
+        serde_json::json!({ "AccessSchedules": [{ "DayOfWeek": "Monday", "StartHour": 0, "EndHour": 25 }] }),
+        serde_json::json!({ "MaxActiveSessions": -1 }),
+        serde_json::json!({ "RemoteClientBitrateLimit": -5 }),
+    ] {
+        let (status, _) = send(
+            &w.app,
+            request("POST", &uri, Some(&w.admin), Some(bad.clone())),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+    }
+    let (_, user) = w.get(&w.admin, &user_uri).await;
+    assert_eq!(user["Policy"]["AccessSchedules"][0]["DayOfWeek"], "Weekday");
+
+    // A hidden user is left out of the sign-in page's list.
+    let (status, public) = send(&w.app, request("GET", "/Users/Public", None, None)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !public
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|u| u["Name"] == "kid"),
+        "{public}"
+    );
+}
+
+#[tokio::test]
+async fn r3parental_only_an_administrator_changes_a_policy() {
+    let w = r2parental().await;
+    let (other_token, other_id) = {
+        let other = rustyfin_model::user::User {
+            id: uuid::Uuid::new_v4(),
+            name: "other".to_string(),
+            password_hash: String::new(),
+            is_administrator: false,
+            created_at: chrono::Utc::now(),
+            last_login_date: None,
+            configuration: serde_json::Value::Null,
+        };
+        rustyfin_db::repo_user::create_user(&w.state.db, &other)
+            .await
+            .unwrap();
+        let token = rustyfin_auth::create_token(&w.state.db, &other, &Default::default())
+            .await
+            .unwrap();
+        (token, other.id)
+    };
+    w.set_policy(serde_json::json!({ "EnableAllFolders": false, "EnabledFolders": [] }))
+        .await;
+    // Neither the limited user nor another user may lift or set a limit, their own or another's.
+    for (token, target) in [
+        (&w.kid, w.kid_id),
+        (&other_token, w.kid_id),
+        (&other_token, other_id),
+        (&w.kid, other_id),
+    ] {
+        for body in [
+            serde_json::json!({ "EnableAllFolders": true }),
+            serde_json::json!({ "IsAdministrator": true }),
+            serde_json::json!({ "AccessSchedules": [] }),
+        ] {
+            let uri = format!("/Users/{target}/Policy");
+            let (status, _) = send(&w.app, request("POST", &uri, Some(token), Some(body))).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
+        }
+    }
+    let (_, user) = w.get(&w.admin, &format!("/Users/{}", w.kid_id)).await;
+    assert_eq!(user["Policy"]["EnableAllFolders"], false);
+    assert_eq!(user["Policy"]["IsAdministrator"], false);
+
+    // The only administrator can't remove their own rights, nor disable themselves.
+    let (_, admin) = w.get(&w.admin, "/Users/Me").await;
+    let admin_id = admin["Id"].as_str().unwrap().to_string();
+    for body in [
+        serde_json::json!({ "IsAdministrator": false }),
+        serde_json::json!({ "IsDisabled": true }),
+    ] {
+        let uri = format!("/Users/{admin_id}/Policy");
+        let (status, _) = send(&w.app, request("POST", &uri, Some(&w.admin), Some(body))).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+    let (status, admin) = w.get(&w.admin, "/Users/Me").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(admin["Policy"]["IsAdministrator"], true);
+}
+
+#[tokio::test]
+async fn r3parental_library_access_hides_other_libraries_on_every_route() {
+    let w = r2parental().await;
+    let (other_lib, far) = w.other_library().await;
+    let views = "/UserViews";
+    assert_eq!(w.names(&w.kid, views).await.1, 2, "no limits yet");
+    let (names, _) = w
+        .names(&w.kid, "/Items?Recursive=true&IncludeItemTypes=Movie")
+        .await;
+    assert!(names.contains(&"Far Away".to_string()));
+
+    let lib = w.library_id().await;
+    w.set_policy(serde_json::json!({ "EnableAllFolders": false, "EnabledFolders": [lib] }))
+        .await;
+    assert_eq!(
+        w.names(&w.kid, views).await,
+        (vec!["Parental".to_string()], 1)
+    );
+    assert_eq!(
+        w.names(&w.kid, &format!("/Users/{}/Views", w.kid_id))
+            .await
+            .1,
+        1
+    );
+    assert_eq!(w.names(&w.admin, views).await.1, 2, "the administrator");
+
+    // Lists, search, latest and the by-name lists leave the other library out.
+    for uri in [
+        "/Items?Recursive=true&IncludeItemTypes=Movie".to_string(),
+        format!("/Items?Recursive=true&ParentId={other_lib}"),
+        "/Search/Hints?SearchTerm=Far".to_string(),
+        "/Items?Recursive=true&SearchTerm=Far".to_string(),
+        format!("/Items/Latest?ParentId={other_lib}"),
+        "/Items/Latest".to_string(),
+        "/Genres".to_string(),
+    ] {
+        let (status, body) = w.get(&w.kid, &uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert!(
+            !body.to_string().contains("Far Away"),
+            "{uri} lists the other library: {body}"
+        );
+        let (_, body) = w.get(&w.admin, &uri).await;
+        assert!(
+            body.to_string().contains("Far Away") || uri == "/Genres",
+            "{uri} for the administrator: {body}"
+        );
+    }
+    let (_, genres) = w
+        .get(&w.kid, &format!("/Genres?ParentId={other_lib}"))
+        .await;
+    assert_eq!(genres["TotalRecordCount"], 0, "{genres}");
+
+    // Every id-based route answers 404 for the other library and its items.
+    for uri in [
+        format!("/Items/{other_lib}"),
+        format!("/Items/{far}"),
+        format!("/Users/{}/Items/{far}", w.kid_id),
+        format!("/Items/{far}/PlaybackInfo"),
+        format!("/Videos/{far}/stream"),
+        format!("/Videos/{far}/main.m3u8"),
+        format!("/Items/{far}/Images"),
+        format!("/Items/{far}/Similar"),
+        format!("/Items/{far}/Ancestors"),
+        format!("/UserItems/{far}/UserData"),
+        format!("/Items/{other_lib}/Children"),
+    ] {
+        let (status, body) = w.get(&w.kid, &uri).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}: {body}");
+    }
+    for uri in [format!("/Items/{other_lib}"), format!("/Items/{far}")] {
+        assert_eq!(w.get(&w.admin, &uri).await.0, StatusCode::OK, "{uri}");
+    }
+    // Writes on the hidden item are refused too.
+    let (status, _) = send(
+        &w.app,
+        request(
+            "POST",
+            &format!("/UserPlayedItems/{far}"),
+            Some(&w.kid),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    // The allowed library still serves.
+    let gentle = w.id("Gentle");
+    assert_eq!(
+        w.get(&w.kid, &format!("/Items/{gentle}")).await.0,
+        StatusCode::OK
+    );
+
+    // No library at all: nothing is listed.
+    w.set_policy(serde_json::json!({ "EnabledFolders": [] }))
+        .await;
+    assert_eq!(w.names(&w.kid, views).await.1, 0);
+    assert_eq!(
+        w.names(&w.kid, "/Items?Recursive=true").await.1,
+        0,
+        "no items without a library"
+    );
+}
+
+#[tokio::test]
+async fn r3parental_music_artist_lists_honour_parental_limits() {
+    let w = r2parental().await;
+    let mut tracks = HashMap::new();
+    for (name, rating, artist) in [("Lullaby", "G", "Soft Singer"), ("Rage", "R", "Loud Band")] {
+        let album = uuid::Uuid::new_v4();
+        let track = uuid::Uuid::new_v4();
+        let lib = w.library_id().await;
+        for (id, kind, parent) in [(album, "MusicAlbum", None), (track, "Audio", Some(album))] {
+            sqlx::query(
+                "INSERT INTO media_items (id, library_id, name, media_type, path, parent_id, \
+                 official_rating) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(id.to_string())
+            .bind(&lib)
+            .bind(format!("{name} {kind}"))
+            .bind(kind)
+            .bind(format!("/nowhere/{id}"))
+            .bind(parent.map(|p: uuid::Uuid| p.to_string()))
+            .bind(rating)
+            .execute(&w.state.db)
+            .await
+            .unwrap();
+        }
+        r2music_link(&w.state, track, artist, "Artist", 0).await;
+        r2music_link(&w.state, album, artist, "AlbumArtist", 0).await;
+        tracks.insert(artist, track);
+    }
+    for uri in ["/Artists", "/Artists/AlbumArtists"] {
+        let (names, total) = w.names(&w.kid, uri).await;
+        assert_eq!(
+            (names, total),
+            (r2parental_names(&["Loud Band", "Soft Singer"]), 2),
+            "{uri}"
+        );
+    }
+    w.set_policy(serde_json::json!({ "MaxParentalRating": 10 }))
+        .await;
+    for uri in [
+        "/Artists",
+        "/Artists/AlbumArtists",
+        "/Artists?SearchTerm=Band",
+        "/Artists/AlbumArtists?StartIndex=0&Limit=10",
+    ] {
+        let (status, body) = w.get(&w.kid, uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert!(!body.to_string().contains("Loud Band"), "{uri}: {body}");
+        let (_, body) = w.get(&w.admin, uri).await;
+        assert!(
+            body.to_string().contains("Loud Band"),
+            "admin {uri}: {body}"
+        );
+    }
+    assert_eq!(
+        w.names(&w.kid, "/Artists").await,
+        (vec!["Soft Singer".to_string()], 1)
+    );
+    let (_, body) = w.get(&w.kid, "/Artists/Loud").await;
+    assert_eq!(body["TotalRecordCount"], 0, "{body}");
+    let (_, body) = w.get(&w.kid, "/Persons").await;
+    assert!(!body.to_string().contains("Loud Band"), "{body}");
+    // The hidden track's routes answer 404.
+    let rage = tracks["Loud Band"];
+    for uri in [
+        format!("/Items/{rage}"),
+        format!("/Audio/{rage}/stream"),
+        format!("/Audio/{rage}/universal"),
+    ] {
+        assert_eq!(w.get(&w.kid, &uri).await.0, StatusCode::NOT_FOUND, "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn r3parental_access_schedule_refuses_sign_in_and_requests_outside_it() {
+    use chrono::Datelike;
+    let w = r2parental().await;
+    let uri = format!("/Users/{}/Password", w.kid_id);
+    let body = serde_json::json!({ "NewPw": "kidpw" });
+    let (status, _) = send(&w.app, request("POST", &uri, Some(&w.admin), Some(body))).await;
+    assert!(status.is_success(), "admin password reset: {status}");
+    // The reset signs the kid out everywhere; this is their new token.
+    let (kid, _) = login(&w.app, "kid", "kidpw").await.unwrap();
+
+    // A schedule for tomorrow only: outside it now, in the server's local time.
+    let today = chrono::Local::now().weekday().num_days_from_monday() as usize;
+    let tomorrow = R3PARENTAL_DAYS[(today + 1) % 7];
+    w.set_policy(serde_json::json!({ "AccessSchedules": [
+        { "DayOfWeek": tomorrow, "StartHour": 0, "EndHour": 24 }
+    ] }))
+    .await;
+    let (status, _) = send(&w.app, r3parental_login("kid", "kidpw", "dev-a")).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "sign-in outside the schedule"
+    );
+    let gentle = w.id("Gentle");
+    for uri in [
+        "/Users/Me".to_string(),
+        format!("/Items/{gentle}"),
+        format!("/Videos/{gentle}/stream"),
+        format!("/Items/{gentle}/PlaybackInfo"),
+    ] {
+        assert_eq!(w.get(&kid, &uri).await.0, StatusCode::FORBIDDEN, "{uri}");
+    }
+    // An administrator's schedule doesn't apply to them.
+    assert_eq!(w.get(&w.admin, "/Users/Me").await.0, StatusCode::OK);
+
+    // Today, all day: allowed again.
+    w.set_policy(serde_json::json!({ "AccessSchedules": [
+        { "DayOfWeek": R3PARENTAL_DAYS[today], "StartHour": 0, "EndHour": 24 }
+    ] }))
+    .await;
+    assert_eq!(w.get(&kid, "/Users/Me").await.0, StatusCode::OK);
+    let (status, _) = send(&w.app, r3parental_login("kid", "kidpw", "dev-a")).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn r3parental_remote_access_playback_and_session_limits() {
+    let w = r2parental().await;
+    let remote = remote_app(w.state.clone());
+    let gentle = w.id("Gentle");
+    let uri = format!("/Users/{}/Password", w.kid_id);
+    let body = serde_json::json!({ "NewPw": "kidpw" });
+    send(&w.app, request("POST", &uri, Some(&w.admin), Some(body))).await;
+    let (kid, _) = login(&w.app, "kid", "kidpw").await.unwrap();
+    let w = R2Parental { kid, ..w };
+
+    // Remote access off: refused from outside the local network, sign-in included.
+    w.set_policy(serde_json::json!({ "EnableRemoteAccess": false }))
+        .await;
+    let (status, _) = send(&remote, request("GET", "/Users/Me", Some(&w.kid), None)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = send(&remote, r3parental_login("kid", "kidpw", "dev-r")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(w.get(&w.kid, "/Users/Me").await.0, StatusCode::OK, "local");
+    w.set_policy(serde_json::json!({ "EnableRemoteAccess": true }))
+        .await;
+    let (status, _) = send(&remote, request("GET", "/Users/Me", Some(&w.kid), None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Playback off: PlaybackInfo answers NotAllowed and the streams 403.
+    w.set_policy(serde_json::json!({ "EnableMediaPlayback": false }))
+        .await;
+    let (status, body) = w
+        .get(&w.kid, &format!("/Items/{gentle}/PlaybackInfo"))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["ErrorCode"], "NotAllowed", "{body}");
+    for uri in [
+        format!("/Videos/{gentle}/stream"),
+        format!("/Videos/{gentle}/main.m3u8"),
+    ] {
+        assert_eq!(w.get(&w.kid, &uri).await.0, StatusCode::FORBIDDEN, "{uri}");
+    }
+    assert!(
+        w.get(&w.admin, &format!("/Videos/{gentle}/stream"))
+            .await
+            .0
+            .is_success()
+    );
+
+    // Transcoding and remuxing off: the sources don't offer them.
+    w.set_policy(serde_json::json!({ "EnableMediaPlayback": true,
+        "EnableVideoPlaybackTranscoding": false, "EnablePlaybackRemuxing": false }))
+        .await;
+    b110_source(&w.state, gentle, 600_000_000).await;
+    let (_, body) = w
+        .get(&w.kid, &format!("/Items/{gentle}/PlaybackInfo"))
+        .await;
+    assert_eq!(body["ErrorCode"], serde_json::Value::Null, "{body}");
+    assert_eq!(body["MediaSources"].as_array().unwrap().len(), 1, "{body}");
+    for source in body["MediaSources"].as_array().unwrap() {
+        assert_eq!(source["SupportsTranscoding"], false, "{source}");
+        assert_eq!(source["SupportsDirectStream"], false, "{source}");
+    }
+
+    // At most two sessions, one of them the sign-in above: a third device is refused; a device
+    // that has a session signs in again.
+    w.set_policy(serde_json::json!({ "MaxActiveSessions": 2 }))
+        .await;
+    let (status, _) = send(&w.app, r3parental_login("kid", "kidpw", "dev-a")).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send(&w.app, r3parental_login("kid", "kidpw", "dev-b")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = send(&w.app, r3parental_login("kid", "kidpw", "dev-a")).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Deletion allowed: the user may delete an item.
+    let edgy = w.id("Edgy");
+    let (status, _) = send(
+        &w.app,
+        request("DELETE", &format!("/Items/{edgy}"), Some(&w.kid), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "not allowed by default");
+    w.set_policy(serde_json::json!({ "EnableContentDeletion": true }))
+        .await;
+    let (status, _) = send(
+        &w.app,
+        request("DELETE", &format!("/Items/{edgy}"), Some(&w.kid), None),
+    )
+    .await;
+    assert!(status.is_success(), "{status}");
 }
 
 // ── G1: authorization ──
@@ -32727,6 +33279,7 @@ async fn r3livelog_keep_alive_frames_are_jellyfins() {
 fn r3livelog_web_view() {
     b124_node_test("r3livelog_view.mjs");
 }
+
 
 // ── B18: one scan per run, and Scan all's order ──
 // A manual scan of a library that Scan all has queued but not reached runs at once, and Scan all
