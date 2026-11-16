@@ -134,6 +134,10 @@ async fn list_of(
     let with_counts = query.item_counts || !query.filter.include_item_types.is_empty();
     let ByNamePage { items, total } = repo_by_name::list(&state.db_ro, kind, &query.filter).await?;
     // Each entry's UserData for the user, as Jellyfin sends it: the stored data, else defaults.
+    // Jellyfin's genre and music genre lists never send it (their controllers turn user data
+    // off); the studio and year lists send it unless `EnableUserData=false`.
+    let user = user
+        .filter(|_| query.user_data && !matches!(kind, ByNameKind::Genre | ByNameKind::MusicGenre));
     let mut user_data = match user {
         Some(user) => {
             let ids: Vec<Uuid> = items.iter().map(|entry| entry.id).collect();
@@ -205,6 +209,8 @@ struct ListQuery {
     total_count: bool,
     /// `Fields=ItemCounts` turns the count fields on even without an item-type filter.
     item_counts: bool,
+    /// `EnableUserData=false` leaves out each entry's UserData.
+    user_data: bool,
 }
 
 impl ListQuery {
@@ -234,6 +240,7 @@ impl ListQuery {
             item_counts: list_values(params, "Fields", ',')
                 .iter()
                 .any(|field| field.eq_ignore_ascii_case("ItemCounts")),
+            user_data: bool_param(params, "EnableUserData")?.unwrap_or(true),
         })
     }
 }
