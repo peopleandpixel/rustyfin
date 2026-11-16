@@ -220,7 +220,17 @@ pub struct HiddenItems {
 
 impl HiddenItems {
     pub async fn for_caller(state: &AppState, claims: &Claims) -> Result<Self, ApiError> {
-        match policy(state, claims).await? {
+        if claims.sub.is_nil() {
+            return Ok(Self::default());
+        }
+        Self::for_user(state, claims.sub).await
+    }
+
+    /// The items hidden from `user`, for a route that answers for a user other than the caller
+    /// (an administrator's `userId`).
+    pub async fn for_user(state: &AppState, user: Uuid) -> Result<Self, ApiError> {
+        let policy = user_policy(state, user).await?;
+        match policy.is_restricted().then_some(policy) {
             None => Ok(Self::default()),
             Some(policy) => {
                 let stored =

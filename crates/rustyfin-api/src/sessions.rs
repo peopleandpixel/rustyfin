@@ -488,6 +488,17 @@ pub async fn expire_at(state: &AppState, now: DateTime<Utc>) {
     }
 }
 
+/// The items `user`'s active sessions are playing now.
+pub async fn now_playing_items(state: &AppState, user: Uuid) -> Result<Vec<Uuid>, ApiError> {
+    let sessions = rustyfin_db::repo_session::get_active_sessions(&state.db_ro).await?;
+    let all = state.session_runtime.read();
+    Ok(sessions
+        .iter()
+        .filter(|s| s.user_id == user)
+        .filter_map(|s| all.get(&s.id)?.playing.as_ref().map(|p| p.item_id))
+        .collect())
+}
+
 /// `GET /Sessions` filters.
 #[derive(Debug, Default)]
 pub struct Filter {
