@@ -124,16 +124,76 @@ pub fn changed(state: &AppState) {
     let _ = state.ws_broadcast.send(WsEvent::SessionsChanged);
 }
 
+/// The device a request's `MediaBrowser` authorization header names, when it names a device id.
+/// A Cast receiver signs its requests with the sender's token and its own `DeviceId`, so its
+/// playback is a session of its own, as in Jellyfin (whose header values win over the token's).
+#[derive(Debug, Clone)]
+pub struct StatedDevice(pub rustyfin_auth::TokenDevice);
+
+/// The request's token and stated device, as a handler argument, for finding its session.
+#[derive(Debug, Clone, Default)]
+pub struct Caller {
+    token: Option<String>,
+    stated: Option<StatedDevice>,
+}
+
+impl<S: Send + Sync> axum::extract::FromRequestParts<S> for Caller {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(Self {
+            token: parts
+                .extensions
+                .get::<rustyfin_auth::RequestToken>()
+                .map(|t| t.0.clone()),
+            stated: parts.extensions.get::<StatedDevice>().cloned(),
+        })
+    }
+}
+
+impl Caller {
+    /// The caller's session (see `for_request`).
+    pub async fn session(&self, state: &AppState) -> Result<Option<String>, ApiError> {
+        for_request(state, self.token.as_deref(), self.stated.as_ref()).await
+    }
+}
+
 /// The session of the request's token: its device's session, made again when it has expired
 /// (Jellyfin's `LogSessionActivity`), and marked active. `None` for the API key and for a token
 /// without a device.
 pub async fn for_token(state: &AppState, token: Option<&str>) -> Result<Option<String>, ApiError> {
+    for_request(state, token, None).await
+}
+
+/// `for_token` for a request whose header names a device: another device id than the token's
+/// gets that device's session, with the header's client, device name and version.
+pub async fn for_request(
+    state: &AppState,
+    token: Option<&str>,
+    stated: Option<&StatedDevice>,
+) -> Result<Option<String>, ApiError> {
     let Some(token) = token else {
         return Ok(None);
     };
-    let Some((user_id, device)) = rustyfin_auth::token_device(&state.db_ro, token).await? else {
+    let Some((user_id, mut device)) = rustyfin_auth::token_device(&state.db_ro, token).await?
+    else {
         return Ok(None);
     };
+    if let Some(StatedDevice(stated)) = stated
+        && !stated.device_id.is_empty()
+        && stated.device_id != device.device_id
+    {
+        let or = |stated: &str, own: &str| if stated.is_empty() { own } else { stated }.to_string();
+        device = rustyfin_auth::TokenDevice {
+            device_id: stated.device_id.clone(),
+            device_name: or(&stated.device_name, &device.device_name),
+            app_name: or(&stated.app_name, &device.app_name),
+            app_version: or(&stated.app_version, &device.app_version),
+        };
+    }
     if let Some(id) =
         rustyfin_db::repo_session::find_device_session(&state.db, user_id, &device.device_id)
             .await?

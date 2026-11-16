@@ -416,16 +416,47 @@ async fn get_playlists_instant_mix(
     ))
 }
 
-/// GET /Playback/BitrateTest — Returns a URL for bitrate testing
+/// Jellyfin's default and largest `size` for the bitrate test.
+const BITRATE_TEST_DEFAULT: u64 = 102_400;
+const BITRATE_TEST_MAX: u64 = 100_000_000;
+
+/// GET /Playback/BitrateTest?size=: `size` bytes of noise as `application/octet-stream`, as
+/// Jellyfin answers. Clients (the Cast receiver, Jellyfin Web) time the download to choose a
+/// streaming bitrate. `size` defaults to 102400 and must be 1 to 100000000.
 async fn get_bitrate_test(
-    State(_state): State<AppState>,
-) -> Result<(StatusCode, Json<serde_json::Value>), crate::error::ApiError> {
-    // Return a small test file URL for bitrate testing
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Result<axum::response::Response, crate::error::ApiError> {
+    use axum::response::IntoResponse;
+    let size = match q.iter().find(|(k, _)| k.eq_ignore_ascii_case("size")) {
+        None => BITRATE_TEST_DEFAULT,
+        Some((_, v)) => v
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|n| (1..=BITRATE_TEST_MAX).contains(n))
+            .ok_or_else(|| {
+                crate::error::ApiError::BadRequest(format!(
+                    "The field size must be between 1 and {BITRATE_TEST_MAX}."
+                ))
+            })?,
+    };
     Ok((
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "Url": "/Playback/BitrateTestStream",
-            "MaxBitrate": null
-        })),
-    ))
+        [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+        bitrate_test_bytes(size as usize),
+    )
+        .into_response())
+}
+
+/// `len` bytes that don't compress, so a compressing proxy can't shorten the test (xorshift).
+fn bitrate_test_bytes(len: usize) -> Vec<u8> {
+    let mut x: u64 = 0x9E37_79B9_7F4A_7C15 ^ len as u64;
+    let mut out = Vec::with_capacity(len + 8);
+    while out.len() < len {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        out.extend_from_slice(&x.to_le_bytes());
+    }
+    out.truncate(len);
+    out
 }

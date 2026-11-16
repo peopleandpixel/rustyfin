@@ -48037,3 +48037,173 @@ async fn r3admin_restart_stops_with_the_restart_exit_code() {
 fn r3admin_web_dashboard() {
     b124_node_test("r3admin_dashboard.mjs");
 }
+
+// R3 cast: the Jellyfin Cast receiver signs its calls with the sender's token and its own
+// `MediaBrowser` header (Client "Chromecast", DeviceId the receiver name in base64), as the
+// jellyfin-chromecast receiver's SDK client does
+
+const R3CAST_DEVICE: &str = "TGl2aW5nIFJvb20=";
+
+/// A request as the receiver sends it: the token inside its `Authorization` header.
+fn r3cast_request(
+    method: &str,
+    uri: &str,
+    token: &str,
+    body: Option<serde_json::Value>,
+) -> Request<Body> {
+    let auth = format!(
+        r#"MediaBrowser Client="Chromecast", Device="Living%20Room", DeviceId="{R3CAST_DEVICE}", Version="3.0.0", Token="{token}""#
+    );
+    let builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("Authorization", auth);
+    match body {
+        Some(body) => builder
+            .header("Content-Type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap(),
+        None => builder.body(Body::empty()).unwrap(),
+    }
+}
+
+// The receiver's capabilities and play reports land on a session of its own device, never on the
+// session of the web client whose token it was handed
+#[tokio::test]
+async fn r3cast_receiver_reports_are_a_session_of_their_own() {
+    let state = test_state().await;
+    let _dir = G1cDataDir(state.data_dir.to_path_buf());
+    let app = app(state.clone());
+    let (ctl, web, _) = r3s_owner(&app).await;
+    let m = g1c_insert_movies(&state, 1).await;
+    let caps = "/Sessions/Capabilities?playableMediaTypes=Video&supportedCommands=Play&supportsMediaControl=true";
+    assert_eq!(
+        r3s_post(&app, &web, caps, None).await,
+        StatusCode::NO_CONTENT
+    );
+
+    let full = serde_json::json!({
+        "PlayableMediaTypes": ["Audio", "Video"], "SupportsMediaControl": true,
+        "SupportsPersistentIdentifier": false, "DeviceProfile": { "MaxStreamingBitrate": 10_000_000 },
+    });
+    let req = r3cast_request("POST", "/Sessions/Capabilities/Full", &web, Some(full));
+    assert_eq!(send(&app, req).await.0, StatusCode::NO_CONTENT);
+    let cast = r3s_session(&app, &ctl, R3CAST_DEVICE).await;
+    assert_eq!(cast["Client"], "Chromecast");
+    assert_eq!(cast["DeviceName"], "Living Room");
+    assert_eq!(cast["ApplicationVersion"], "3.0.0");
+    assert_eq!(
+        cast["PlayableMediaTypes"],
+        serde_json::json!(["Audio", "Video"])
+    );
+    let own = r3s_session(&app, &ctl, "r3s-tgt").await;
+    assert_eq!(
+        own["PlayableMediaTypes"],
+        serde_json::json!(["Video"]),
+        "the web session keeps its own"
+    );
+    assert_ne!(own["Id"], cast["Id"]);
+
+    let start = serde_json::json!({
+        "ItemId": m[0], "PositionTicks": 50_000_000, "PlaySessionId": "r3cast-play", "CanSeek": true,
+        "PlayMethod": "DirectStream", "IsPaused": false, "AudioStreamIndex": 1, "SubtitleStreamIndex": -1,
+    });
+    let req = r3cast_request("POST", "/Sessions/Playing", &web, Some(start));
+    assert_eq!(send(&app, req).await.0, StatusCode::NO_CONTENT);
+    let cast = r3s_session(&app, &ctl, R3CAST_DEVICE).await;
+    assert_eq!(cast["NowPlayingItem"]["Id"], m[0].to_string().as_str());
+    assert_eq!(cast["PlayState"]["PositionTicks"], 50_000_000);
+    assert!(
+        r3s_session(&app, &ctl, "r3s-tgt")
+            .await
+            .get("NowPlayingItem")
+            .is_none()
+    );
+
+    let progress = serde_json::json!({ "ItemId": m[0], "PositionTicks": 70_000_000, "IsPaused": true,
+        "PlaySessionId": "r3cast-play" });
+    let req = r3cast_request("POST", "/Sessions/Playing/Progress", &web, Some(progress));
+    assert_eq!(send(&app, req).await.0, StatusCode::NO_CONTENT);
+    let ping = "/Sessions/Playing/Ping?playSessionId=r3cast-play";
+    assert_eq!(
+        send(&app, r3cast_request("POST", ping, &web, None)).await.0,
+        StatusCode::NO_CONTENT
+    );
+    let ps = r3s_session(&app, &ctl, R3CAST_DEVICE).await["PlayState"].clone();
+    assert_eq!(
+        (ps["PositionTicks"].clone(), ps["IsPaused"].clone()),
+        (70_000_000.into(), true.into())
+    );
+
+    let stop = serde_json::json!({ "ItemId": m[0], "PositionTicks": 70_000_000, "PlaySessionId": "r3cast-play" });
+    let req = r3cast_request("POST", "/Sessions/Playing/Stopped", &web, Some(stop));
+    assert_eq!(send(&app, req).await.0, StatusCode::NO_CONTENT);
+    assert!(
+        r3s_session(&app, &ctl, R3CAST_DEVICE)
+            .await
+            .get("NowPlayingItem")
+            .is_none()
+    );
+}
+
+// The receiver times GET /Playback/BitrateTest?size= to choose its bitrate: Jellyfin answers
+// that many bytes of application/octet-stream, 102400 without a size, 400 outside 1..=100000000
+#[tokio::test]
+async fn r3cast_bitrate_test_answers_the_bytes_asked_for() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let app = app(state);
+    let raw = |uri: &str, token: Option<&str>| {
+        let req = request("GET", uri, token, None);
+        let app = app.clone();
+        async move {
+            let resp = app.oneshot(req).await.unwrap();
+            let status = resp.status();
+            let kind = resp
+                .headers()
+                .get("content-type")
+                .map(|v| v.to_str().unwrap().to_string());
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            (status, kind, body.len())
+        }
+    };
+    let (status, kind, len) = raw("/Playback/BitrateTest?size=500000", Some(&token)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(kind.as_deref(), Some("application/octet-stream"));
+    assert_eq!(len, 500_000);
+    assert_eq!(raw("/Playback/BitrateTest", Some(&token)).await.2, 102_400);
+    assert_eq!(raw("/playback/bitratetest?Size=7", Some(&token)).await.2, 7);
+    for bad in ["0", "100000001", "big"] {
+        let uri = format!("/Playback/BitrateTest?size={bad}");
+        assert_eq!(
+            raw(&uri, Some(&token)).await.0,
+            StatusCode::BAD_REQUEST,
+            "size={bad}"
+        );
+    }
+    assert_eq!(
+        raw("/Playback/BitrateTest", None).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+// The web client casts to the receiver app the user's CastReceiverId names, from the server's
+// CastReceiverApplications; the receiver reads the user with only its own header
+#[tokio::test]
+async fn r3cast_receiver_application_ids_and_header_auth() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (_, web, _) = r3s_owner(&app).await;
+    let (status, me) = send(&app, r3cast_request("GET", "/Users/Me", &web, None)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(me["Configuration"]["CastReceiverId"], "F007D354");
+    assert!(me["Configuration"]["EnableNextEpisodeAutoPlay"].is_boolean());
+    let (_, info) = send(&app, request("GET", "/System/Info", Some(&web), None)).await;
+    let ids: Vec<_> = info["CastReceiverApplications"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["Id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(ids, ["F007D354", "6F511C87"]);
+}
