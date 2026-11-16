@@ -509,12 +509,13 @@ const API = {
     },
     // Universal endpoint returns the optimal playback URL
     async getUniversalVideoUrl(itemId, params = {}) {
+        // No maxBitrate (the player's Auto) sends no limit, so any source the browser plays can play directly
         const q = new URLSearchParams({
-            MaxStreamingBitrate: params.maxBitrate || '100000000',
             EnableDirectPlay: params.enableDirectPlay !== false ? 'true' : 'false',
             EnableDirectStream: params.enableDirectStream !== false ? 'true' : 'false',
             PlaySessionId: 'web-' + (localStorage.getItem('rustyfin_device_id') || 'browser'),
         });
+        if (params.maxBitrate > 0) q.set('MaxStreamingBitrate', params.maxBitrate);
         const codecs = this.playableCodecs();
         q.set('VideoCodecs', codecs.video.join(','));
         q.set('AudioCodecs', codecs.audio.join(','));
