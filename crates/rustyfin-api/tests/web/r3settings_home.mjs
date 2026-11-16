@@ -37,6 +37,9 @@ function sandbox({ config = {}, prefs = {} } = {}) {
         escapeHtml: s => String(s),
         scanRing: () => '',
         backdropUrl: () => '',
+        // collections.js's Collections and Playlists tiles
+        containerTilesHtml: () => '',
+        revealContainerTiles: async () => {},
         serverVersion: '0',
         $: id => (id === 'page-home' ? page : null),
         libraries: [],

@@ -115,11 +115,11 @@ function containerTilesHtml() {
 }
 
 async function revealContainerTiles() {
-    const tile = document.querySelector('[data-container-tile="collections"]');
-    if (!tile) return;
     try {
+        const tile = document.querySelector('[data-container-tile="collections"]');
+        if (!tile) return;
         const data = await API.cachedGet('/Items?IncludeItemTypes=BoxSet&Recursive=true&Limit=0');
-        if (data.TotalRecordCount > 0) tile.classList.remove('hidden');
+        if (data?.TotalRecordCount > 0) tile.classList.remove('hidden');
     } catch { /* no tile */ }
 }
 

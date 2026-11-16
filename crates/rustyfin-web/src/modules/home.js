@@ -228,7 +228,8 @@ async function renderHome() {
 
         c += '</div>';
         page.innerHTML = c;
-        revealContainerTiles();
+        // The Collections tile is extra: its lookup failing changes nothing else on the page
+        revealContainerTiles().catch(() => {});
     } catch (e) {
         if (API.token !== session) return;
         page.innerHTML = `<div class="p-6 rounded-xl bg-red-500/10 border border-red-500/20 text-red-400 jf-page">${t('home.load_failed', { message: escapeHtml(e.message) })}</div>`;

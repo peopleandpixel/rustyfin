@@ -34,7 +34,7 @@ function sandbox(answers = {}, { libs = LIBS } = {}) {
         backdropUrl: () => '',
         // collections.js's Collections and Playlists tiles
         containerTilesHtml: () => '',
-        revealContainerTiles: () => {},
+        revealContainerTiles: async () => {},
         serverVersion: '0',
         $: id => (id === 'page-home' ? page : null),
         libraries: [],
