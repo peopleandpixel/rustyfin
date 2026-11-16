@@ -23,7 +23,7 @@ Rustyfin wird über Umgebungsvariablen konfiguriert. Es sind keine Konfiguration
 | `RUSTYFIN_RATE_LIMIT` | Erlaubte Anmelde- und Passwort-Reset-Versuche pro Zeitfenster, pro Client-IP (`0` deaktiviert) | `10` |
 | `RUSTYFIN_RATE_WINDOW` | Zeitfenster der Ratenbegrenzung in Sekunden | `60` |
 | `RUST_LOG` | Log-Level-Filter (z.B. `debug`, `info`, `rustyfin=trace`) | `info` |
-| `RUSTYFIN_LOG_HISTORY` | Anzahl der letzten Log-Zeilen, die das Live-Log der Verwaltung beim Öffnen erhält (`0` behält keine) | `1000` |
+| `RUSTYFIN_LOG_HISTORY` | Anzahl der letzten Log-Zeilen, die das Live-Log der Verwaltung beim Öffnen erhält (`0` behält keine, höchstens `100000`; je Zeile bis zu 8 KiB) | `1000` |
 
 ## Beispielkonfigurationen
 
