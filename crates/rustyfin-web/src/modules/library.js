@@ -873,20 +873,17 @@ function libraryViewCustom(view) {
     return custom;
 }
 
-// The CustomPrefs keys a library list writes. The server merges CustomPrefs key by key, as
-// Jellyfin does, so a key this save leaves unset is sent as null to clear it.
-const LIBRARY_CUSTOM_KEYS = [...Object.keys(LIBRARY_FILTER_PARAMS), 'ViewMode', 'ImageType', 'CardSize'];
-
-// The DisplayPreferences body that saves a library's sort, filters and view
+// The DisplayPreferences body that saves a library's sort, filters and view. The server replaces
+// the stored CustomPrefs with these, as Jellyfin 12.4 does; they are the whole set this list's
+// preferences hold, so an unset filter is simply left out.
 function libraryPrefsToDisplay(libId, prefs) {
     const { sortBy, sortOrder } = librarySort(prefs);
-    const set = { ...libraryFilterQuery(prefs.filters), ...libraryViewCustom(prefs.view) };
     return {
         Id: libId,
         Client: LIBRARY_PREFS_CLIENT,
         SortBy: sortBy,
         SortOrder: sortOrder,
-        CustomPrefs: Object.fromEntries(LIBRARY_CUSTOM_KEYS.map(k => [k, set[k] ?? null])),
+        CustomPrefs: { ...libraryFilterQuery(prefs.filters), ...libraryViewCustom(prefs.view) },
         RememberIndexing: false,
         RememberSorting: true,
         PrimaryImageHeight: 0,

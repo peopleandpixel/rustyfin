@@ -78,22 +78,20 @@ function userConfiguration() {
     return loaded?.userId === API.userId ? loaded.config : {};
 }
 
-// Saves CustomPrefs values (strings; null or '' removes one), keeping the other settings. A removed
-// one is sent as null: the server merges CustomPrefs key by key, as Jellyfin does.
+// Saves CustomPrefs values (strings; null or '' removes one), keeping every other setting. A POST
+// replaces the whole stored set, as in Jellyfin 12.4, so the set is read again first (another
+// browser or app may have saved since) and posted back in full with these changes.
 async function saveUserSettings(values) {
     const settings = await loadUserSettings();
+    const fresh = await API.get(prefsPath(settings.userId), { cache: 'no-store' }).catch(() => null);
+    if (fresh) settings.prefs = { ...fresh, CustomPrefs: { ...(fresh.CustomPrefs || {}) } };
     const customPrefs = { ...settings.prefs.CustomPrefs };
-    const sent = { ...customPrefs };
     for (const [name, value] of Object.entries(values)) {
-        if (value == null || value === '') {
-            delete customPrefs[name];
-            sent[name] = null;
-        } else {
-            customPrefs[name] = sent[name] = String(value);
-        }
+        if (value == null || value === '') delete customPrefs[name];
+        else customPrefs[name] = String(value);
     }
     const prefs = { ...settings.prefs, CustomPrefs: customPrefs };
-    await API.post(prefsPath(settings.userId), { ...prefs, CustomPrefs: sent });
+    await API.post(prefsPath(settings.userId), prefs);
     settings.prefs = prefs;
     for (const [name, value] of Object.entries(values)) {
         if (name in DEVICE_SETTINGS) setDeviceSetting(name, value, DEVICE_SETTINGS[name]);

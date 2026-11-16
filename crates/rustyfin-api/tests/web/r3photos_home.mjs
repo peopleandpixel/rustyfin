@@ -75,7 +75,7 @@ function sandbox({ config = {}, prefs = {}, views = LIBS } = {}) {
     });
     vm.runInContext(`${source}
         Object.assign(this, { renderHome, arrangeLibraries, showsInMyMedia, homeLibrariesHtml, changeMyMediaLibrary,
-            changeLatestLibrary, loadUserSettings });`, context);
+            changeLatestLibrary, loadUserSettings, saveUserSettings });`, context);
     return { context, gets, posts, toasts, rows: () => [...rows], page };
 }
 
@@ -140,6 +140,19 @@ test('turning a library\'s My Media switch off and on saves MyMediaExcludes, kee
     await s.context.changeMyMediaLibrary(input);
     assert.deepEqual(s.posts.at(-1)[1].MyMediaExcludes, ['bbbb2222']);
     assert.equal(input.dataset.saved, 'true');
+});
+
+test('a home layout save posts the whole stored CustomPrefs set, read again first, as a POST replaces it', async () => {
+    const stored = { homesection0: 'resume', enableBackdrops: 'false' };
+    const s = sandbox({ prefs: stored });
+    await s.context.loadUserSettings();
+    // Another browser saves a setting meanwhile
+    stored.datetimelocale = 'de-DE';
+    await s.context.saveUserSettings({ homesection1: 'nextup', homesection0: '' });
+    const [url, body] = s.posts.at(-1);
+    assert.equal(url, '/DisplayPreferences/usersettings?userId=u1&client=emby');
+    // Cleared keys are left out, not sent as null (Jellyfin 12.4 would store the null)
+    assert.deepEqual(body.CustomPrefs, { enableBackdrops: 'false', datetimelocale: 'de-DE', homesection1: 'nextup' });
 });
 
 test('every new string is in English and German', () => {

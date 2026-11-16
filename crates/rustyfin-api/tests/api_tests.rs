@@ -28813,8 +28813,8 @@ async fn r3photos_home_settings_round_trip() {
         assert_eq!(me["Configuration"][key], config[key], "{key}");
     }
 
-    // The usersettings CustomPrefs come back from a body with only some fields, and a null value
-    // (a cleared setting in Jellyfin Web) is dropped
+    // The usersettings CustomPrefs come back from a body with only some fields; a null value is
+    // kept and given back as null, as Jellyfin 12.4 stores it
     let prefs = format!("/DisplayPreferences/usersettings?userId={user}&client=emby");
     let body = r#"{"Id":"usersettings","CustomPrefs":{"homesection0":"latestmedia","homesection1":"none","homesection2":null}}"#;
     let (status, _) = send_authed(&app, "POST", &prefs, &token, Some(body)).await;
@@ -28822,13 +28822,21 @@ async fn r3photos_home_settings_round_trip() {
     let (_, got) = send_authed(&app, "GET", &prefs, &token, None).await;
     assert_eq!(
         got["CustomPrefs"],
-        serde_json::json!({"homesection0": "latestmedia", "homesection1": "none"})
+        serde_json::json!({"homesection0": "latestmedia", "homesection1": "none", "homesection2": null})
     );
     assert_eq!(got["Client"], "emby");
     assert_eq!(got["SortBy"], "SortName");
 
-    // A POST without CustomPrefs keeps the saved ones; one with some changes only those, as
-    // Jellyfin merges them key by key (null removes one)
+    // As in Jellyfin 12.4 (DisplayPreferencesManager), a POST replaces the whole set: its
+    // CustomPrefs are all there is afterwards, and one without CustomPrefs leaves none
+    let body = r#"{"CustomPrefs":{"homesection1":null,"homesection3":"nextup"}}"#;
+    let (status, _) = send_authed(&app, "POST", &prefs, &token, Some(body)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, got) = send_authed(&app, "GET", &prefs, &token, None).await;
+    assert_eq!(
+        got["CustomPrefs"],
+        serde_json::json!({"homesection1": null, "homesection3": "nextup"})
+    );
     let (status, _) = send_authed(
         &app,
         "POST",
@@ -28840,18 +28848,7 @@ async fn r3photos_home_settings_round_trip() {
     assert_eq!(status, StatusCode::NO_CONTENT);
     let (_, got) = send_authed(&app, "GET", &prefs, &token, None).await;
     assert_eq!(got["SortBy"], "DateCreated");
-    assert_eq!(
-        got["CustomPrefs"],
-        serde_json::json!({"homesection0": "latestmedia", "homesection1": "none"})
-    );
-    let body = r#"{"CustomPrefs":{"homesection1":null,"homesection3":"nextup"}}"#;
-    let (status, _) = send_authed(&app, "POST", &prefs, &token, Some(body)).await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
-    let (_, got) = send_authed(&app, "GET", &prefs, &token, None).await;
-    assert_eq!(
-        got["CustomPrefs"],
-        serde_json::json!({"homesection0": "latestmedia", "homesection3": "nextup"})
-    );
+    assert_eq!(got["CustomPrefs"], serde_json::json!({}));
 }
 
 #[tokio::test]
