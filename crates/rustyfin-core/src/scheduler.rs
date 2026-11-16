@@ -58,7 +58,7 @@ pub struct TaskScheduler {
     on_scan: Arc<std::sync::RwLock<Option<OnScan>>>,
     plugin_manager: crate::plugin_manager::PluginManager,
     http_client: reqwest::Client,
-    /// The image tasks running, each with the handle that stops it.
+    /// The image tasks and intro detection running, each with the handle that stops it.
     image_runs: Arc<std::sync::Mutex<HashMap<String, crate::trickplay::Cancel>>>,
     /// Each task's percent done, shown while it runs.
     progress: Arc<HashMap<String, TaskProgress>>,
@@ -449,20 +449,6 @@ impl TaskScheduler {
         tracing::info!("All scheduled tasks restarted");
     }
 
-    /// Marks task `id` Running, unless a run of it is under way: false then, and the caller
-    /// doesn't run it.
-    async fn begin_run(&self, id: &str) -> bool {
-        let mut tasks = self.tasks.write().await;
-        let Some(entry) = tasks.get_mut(id) else {
-            return false;
-        };
-        if matches!(entry.info.state, TaskState::Running | TaskState::Cancelling) {
-            return false;
-        }
-        self.apply_state(entry, TaskState::Running);
-        true
-    }
-
     async fn set_task_state(&self, id: &str, state: TaskState) {
         let mut tasks = self.tasks.write().await;
         if let Some(entry) = tasks.get_mut(id) {
@@ -790,45 +776,73 @@ impl TaskScheduler {
         }
     }
 
-    /// Run intro/outro detection for all episodes
-    async fn run_intro_detection(&self) {
-        // A second run at once (the daily one and one started by hand) would decode every episode
-        // again.
-        if !self.begin_run(TASK_INTRO_DETECTION).await {
-            tracing::info!("intro detection is running already, so this run is skipped");
-            return;
+    /// Runs `work` as a run of task `id` that Stop cancels, registered like the image runs, unless
+    /// a run of it is still listed (a stopped one included, until it has wound down): false then,
+    /// and nothing runs. The work runs in its own task, so a panic in it ends the run as failed
+    /// instead of leaving it listed; the run is unlisted and marked Idle however it ends.
+    async fn run_stoppable<F, Fut>(&self, id: &str, work: F) -> bool
+    where
+        F: FnOnce(crate::trickplay::Cancel) -> Fut,
+        Fut: std::future::Future<Output = Result<String, String>> + Send + 'static,
+    {
+        /// Aborts the work if the run itself is dropped (at shutdown), so it never runs unlisted.
+        struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+        impl<T> Drop for AbortOnDrop<T> {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
         }
+
+        let Some(cancel) = self.begin_image_run(id).await else {
+            return false;
+        };
         let start = Utc::now();
+        let mut handle = AbortOnDrop(tokio::spawn(work(cancel.clone())));
+        let result = match (&mut handle.0).await {
+            Ok(result) => result,
+            Err(e) => Err(format!("the run stopped unexpectedly: {e}")),
+        };
+        let (status, message) = match result {
+            Ok(message) if cancel.is_cancelled() => (TaskCompletionStatus::Cancelled, message),
+            Ok(message) => (TaskCompletionStatus::Completed, message),
+            Err(e) => {
+                tracing::warn!(task = id, error = %e, "task failed");
+                (TaskCompletionStatus::Failed, e)
+            }
+        };
+        self.set_task_result(
+            id,
+            TaskResult {
+                status,
+                error_message: Some(message),
+                start_time_utc: start.to_rfc3339(),
+                end_time_utc: Utc::now().to_rfc3339(),
+            },
+        )
+        .await;
+        self.end_image_run(id).await;
+        true
+    }
 
+    /// Run intro/outro detection for all episodes. A second run at once (the daily one and one
+    /// started by hand) would decode every episode again, so a run that finds one listed does
+    /// nothing; Stop cancels the run, killing its ffmpeg.
+    async fn run_intro_detection(&self) {
+        let db = self.db.clone();
         let progress = self.progress_of(TASK_INTRO_DETECTION);
-        let result =
-            match crate::media_segments::detect_for_all_episodes_with_progress(&self.db, &progress)
-                .await
-            {
-                Ok(count) => {
-                    let end = Utc::now();
-                    tracing::info!("Intro detection completed: {} episodes processed", count);
-                    TaskResult {
-                        status: TaskCompletionStatus::Completed,
-                        error_message: Some(format!("Processed {} episodes", count)),
-                        start_time_utc: start.to_rfc3339(),
-                        end_time_utc: end.to_rfc3339(),
-                    }
-                }
-                Err(e) => {
-                    let end = Utc::now();
-                    TaskResult {
-                        status: TaskCompletionStatus::Failed,
-                        error_message: Some(e),
-                        start_time_utc: start.to_rfc3339(),
-                        end_time_utc: end.to_rfc3339(),
-                    }
-                }
-            };
-
-        self.set_task_result(TASK_INTRO_DETECTION, result).await;
-        self.set_task_state(TASK_INTRO_DETECTION, TaskState::Idle)
+        let ran = self
+            .run_stoppable(TASK_INTRO_DETECTION, move |cancel| async move {
+                let count = crate::media_segments::detect_for_all_episodes_with_progress(
+                    &db, &progress, &cancel,
+                )
+                .await?;
+                tracing::info!("Intro detection completed: {} episodes processed", count);
+                Ok(format!("Processed {} episodes", count))
+            })
             .await;
+        if !ran {
+            tracing::info!("intro detection is running already, so this run is skipped");
+        }
     }
 
     /// Run metadata refresh for all items across all libraries
@@ -1423,24 +1437,116 @@ mod tests {
         (TaskScheduler::new(db, Arc::new(dir.clone())), dir)
     }
 
-    #[tokio::test]
-    async fn r3perf_intro_detection_does_not_start_while_it_runs() {
-        let (sched, dir) = r3tasks_scheduler().await;
-        sched
-            .set_task_state(TASK_INTRO_DETECTION, TaskState::Running)
-            .await;
-        sched.run_intro_detection().await;
-        let task = sched.get_task(TASK_INTRO_DETECTION).await.unwrap();
-        assert_eq!(task.state, TaskState::Running, "the first run is still on");
-        assert!(task.last_execution_result.is_none(), "no second run ended");
+    /// The status and message of task `id`'s last run.
+    async fn r3perf_last(sched: &TaskScheduler, id: &str) -> (TaskCompletionStatus, String) {
+        let result = sched
+            .get_task(id)
+            .await
+            .unwrap()
+            .last_execution_result
+            .unwrap();
+        (result.status, result.error_message.unwrap_or_default())
+    }
 
-        sched
-            .set_task_state(TASK_INTRO_DETECTION, TaskState::Idle)
+    #[tokio::test]
+    async fn r3perf_stop_then_start_does_not_overlap_a_winding_down_run() {
+        let (sched, dir) = r3tasks_scheduler().await;
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let first = {
+            let sched = sched.clone();
+            tokio::spawn(async move {
+                sched
+                    .run_stoppable(TASK_INTRO_DETECTION, |cancel| async move {
+                        // Stopped, it still takes a while to wind down.
+                        cancel.cancelled().await;
+                        let _ = released.await;
+                        Ok("first".to_string())
+                    })
+                    .await
+            })
+        };
+        while sched.get_task(TASK_INTRO_DETECTION).await.unwrap().state != TaskState::Running {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(sched.stop_task(TASK_INTRO_DETECTION).await);
+        // Restart marks every task Idle, but the run is still listed.
+        sched.restart().await;
+        let second = sched
+            .run_stoppable(TASK_INTRO_DETECTION, |_| async { Ok("second".to_string()) })
             .await;
+        assert!(!second, "a second run started while the first wound down");
         sched.run_intro_detection().await;
+        assert!(
+            sched
+                .get_task(TASK_INTRO_DETECTION)
+                .await
+                .unwrap()
+                .last_execution_result
+                .is_none(),
+            "no run ended yet"
+        );
+
+        release.send(()).unwrap();
+        assert!(first.await.unwrap());
+        assert_eq!(
+            r3perf_last(&sched, TASK_INTRO_DETECTION).await,
+            (TaskCompletionStatus::Cancelled, "first".to_string())
+        );
         let task = sched.get_task(TASK_INTRO_DETECTION).await.unwrap();
         assert_eq!(task.state, TaskState::Idle);
-        assert!(task.last_execution_result.is_some(), "an idle task runs");
+        // Once it has ended, the next run starts.
+        assert!(
+            sched
+                .run_stoppable(TASK_INTRO_DETECTION, |_| async { Ok("next".to_string()) })
+                .await
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn r3perf_a_panic_or_an_error_ends_the_run() {
+        let (sched, dir) = r3tasks_scheduler().await;
+        assert!(
+            sched
+                .run_stoppable(TASK_INTRO_DETECTION, |_| async {
+                    if std::hint::black_box(true) {
+                        panic!("detection panicked");
+                    }
+                    Ok(String::new())
+                })
+                .await
+        );
+        let (status, message) = r3perf_last(&sched, TASK_INTRO_DETECTION).await;
+        assert_eq!(status, TaskCompletionStatus::Failed);
+        assert!(message.contains("unexpectedly"), "{message}");
+        assert_eq!(
+            sched.get_task(TASK_INTRO_DETECTION).await.unwrap().state,
+            TaskState::Idle
+        );
+
+        assert!(
+            sched
+                .run_stoppable(TASK_INTRO_DETECTION, |_| async {
+                    Err("no episodes".to_string())
+                })
+                .await,
+            "a run after a panic starts"
+        );
+        assert_eq!(
+            r3perf_last(&sched, TASK_INTRO_DETECTION).await,
+            (TaskCompletionStatus::Failed, "no episodes".to_string())
+        );
+        assert!(
+            sched
+                .run_stoppable(TASK_INTRO_DETECTION, |_| async { Ok("done".to_string()) })
+                .await,
+            "a run after an error starts"
+        );
+        assert_eq!(
+            r3perf_last(&sched, TASK_INTRO_DETECTION).await,
+            (TaskCompletionStatus::Completed, "done".to_string())
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

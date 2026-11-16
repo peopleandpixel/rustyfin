@@ -7,6 +7,16 @@ use sqlx::Row;
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
+use crate::trickplay::Cancel;
+
+/// The version of the detection: its ffmpeg pass, `DetectionConfig::default()` and how the
+/// segments are picked from what ffmpeg finds. Raise it with any change to those, so the next run
+/// detects every episode again instead of skipping the unchanged files.
+pub const DETECTOR_VERSION: i64 = 1;
+
+/// The error of a detection stopped by its run's cancel.
+const CANCELLED: &str = "cancelled";
+
 /// Detect theme songs across episodes of a series.
 ///
 /// Uses a simple audio fingerprinting approach: extracts audio from the first 30 seconds
@@ -236,15 +246,17 @@ pub async fn detect_segments(
     duration_seconds: f64,
     config: &DetectionConfig,
 ) -> Result<(Option<DetectedSegment>, Option<DetectedSegment>), String> {
-    detect_segments_with_threads(path, duration_seconds, config, 0).await
+    detect_segments_with_threads(path, duration_seconds, config, 0, &Cancel::new()).await
 }
 
-/// `detect_segments` with `threads` decoder threads (0: ffmpeg's choice).
+/// `detect_segments` with `threads` decoder threads (0: ffmpeg's choice). Once `cancel` fires,
+/// ffmpeg is killed and it fails with "cancelled".
 async fn detect_segments_with_threads(
     path: &str,
     duration_seconds: f64,
     config: &DetectionConfig,
     threads: usize,
+    cancel: &Cancel,
 ) -> Result<(Option<DetectedSegment>, Option<DetectedSegment>), String> {
     let mut cmd = Command::new("ffmpeg");
     cmd.args(segment_detect_args(path, config, threads))
@@ -253,10 +265,11 @@ async fn detect_segments_with_threads(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     crate::media_reads::lower_priority(&mut cmd);
-    let output = cmd
-        .output()
-        .await
-        .map_err(|e| format!("FFmpeg not found: {}", e))?;
+    // Dropping the output future kills ffmpeg (kill_on_drop).
+    let output = tokio::select! {
+        output = cmd.output() => output.map_err(|e| format!("FFmpeg not found: {}", e))?,
+        _ = cancel.cancelled() => return Err(CANCELLED.to_string()),
+    };
     let stderr = String::from_utf8_lossy(&output.stderr);
     if !output.status.success() {
         return Err(format!("FFmpeg segment detection failed: {}", stderr));
@@ -535,7 +548,7 @@ pub async fn detect_and_save(
     path: &str,
     duration_seconds: f64,
 ) -> Result<(), String> {
-    detect_and_save_with_threads(pool, item_id, path, duration_seconds, 0).await
+    detect_and_save_with_threads(pool, item_id, path, duration_seconds, 0, &Cancel::new()).await
 }
 
 /// `detect_and_save` with `threads` decoder threads (0: ffmpeg's choice).
@@ -545,6 +558,7 @@ async fn detect_and_save_with_threads(
     path: &str,
     duration_seconds: f64,
     threads: usize,
+    cancel: &Cancel,
 ) -> Result<(), String> {
     let config = DetectionConfig::default();
 
@@ -554,7 +568,7 @@ async fn detect_and_save_with_threads(
     );
 
     let (intro, outro) =
-        detect_segments_with_threads(path, duration_seconds, &config, threads).await?;
+        detect_segments_with_threads(path, duration_seconds, &config, threads, cancel).await?;
 
     // Drop results from earlier runs now that detection has succeeded.
     sqlx::query(
@@ -610,18 +624,24 @@ async fn detect_and_save_with_threads(
 
 /// Batch detect segments for all episodes in a library.
 pub async fn detect_for_all_episodes(pool: &SqlitePool) -> Result<usize, String> {
-    detect_for_all_episodes_with_progress(pool, &crate::task_progress::TaskProgress::new()).await
+    let progress = crate::task_progress::TaskProgress::new();
+    detect_for_all_episodes_with_progress(pool, &progress, &Cancel::new()).await
 }
 
 /// `detect_for_all_episodes`, reporting the share of the episodes looked at on `progress`.
 /// Episodes run in parallel, each holding one of the image job slots (`trickplay::image_job`,
 /// shared with trickplay and chapter images); an episode on a network share also holds one of the
 /// `media_reads::network_read_jobs`, since its whole file is read. An episode whose file is the
-/// same version (size and modified time) as at its last successful detection is skipped, and
-/// counts as processed: its segments are those of that file.
+/// same version (size and modified time) as at its last successful detection by this
+/// `DETECTOR_VERSION` is skipped, and counts as processed: its segments are those of that file.
+///
+/// Once `cancel` fires, no more episodes start and the running ones' ffmpeg is killed; an episode
+/// whose segments are being written finishes writing. No database connection is held while ffmpeg
+/// runs or a slot is awaited: every statement runs on its own.
 pub async fn detect_for_all_episodes_with_progress(
     pool: &SqlitePool,
     progress: &crate::task_progress::TaskProgress,
+    cancel: &Cancel,
 ) -> Result<usize, String> {
     // Get all episodes with paths and runtime
     let episodes: Vec<(String, String, Option<i64>)> = sqlx::query(
@@ -649,6 +669,9 @@ pub async fn detect_for_all_episodes_with_progress(
     let mut running = tokio::task::JoinSet::new();
     progress.report_count(0, total);
     for (id_str, path, runtime_ticks) in episodes {
+        if cancel.is_cancelled() {
+            break;
+        }
         let item_id = match Uuid::parse_str(&id_str) {
             Ok(id) => id,
             Err(e) => {
@@ -671,7 +694,8 @@ pub async fn detect_for_all_episodes_with_progress(
         };
 
         // Read before the detection, so a file changed while it runs is detected again next time.
-        let version = crate::trickplay::file_version(&path).await;
+        let (size, modified) = crate::trickplay::file_version(&path).await;
+        let version = (size, modified, DETECTOR_VERSION);
         if detected.get(&id_str) == Some(&version) {
             unchanged += 1;
             count += 1;
@@ -688,15 +712,21 @@ pub async fn detect_for_all_episodes_with_progress(
                 progress.report_count(done, total);
             }
         }
-        let pool = pool.clone();
+        let (pool, cancel) = (pool.clone(), cancel.clone());
         running.spawn(async move {
-            // The network read first, so a waiting episode holds no image job slot. The task has no
-            // stop yet, so the slot's cancel never fires.
-            let _read = crate::media_reads::whole_file_read(std::path::Path::new(&path)).await;
-            let _slot = crate::trickplay::image_job(&crate::trickplay::Cancel::new()).await;
-            match detect_and_save_with_threads(&pool, item_id, &path, duration, threads).await {
+            // The network read first, so a waiting episode holds no image job slot.
+            let _read = tokio::select! {
+                read = crate::media_reads::whole_file_read(std::path::Path::new(&path)) => read,
+                _ = cancel.cancelled() => return false,
+            };
+            let Some(_slot) = crate::trickplay::image_job(&cancel).await else {
+                return false;
+            };
+            match detect_and_save_with_threads(&pool, item_id, &path, duration, threads, &cancel)
+                .await
+            {
                 // An unreadable file (version 0) is never recorded, so it is tried again.
-                Ok(()) if version == (0, 0) => true,
+                Ok(()) if (size, modified) == (0, 0) => true,
                 Ok(()) => {
                     let stored = rustyfin_db::repo_media_segment::set_detected_version(
                         &pool, item_id, version,
@@ -707,6 +737,7 @@ pub async fn detect_for_all_episodes_with_progress(
                     }
                     true
                 }
+                Err(e) if e == CANCELLED => false,
                 Err(e) => {
                     warn!("Failed to detect segments for {}: {}", id_str, e);
                     false

@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use rustyfin_core::media_segments::{self, DetectionConfig};
+use rustyfin_core::trickplay::Cancel;
 use rustyfin_model::library::{Library, LibraryContentType};
 use sqlx::SqlitePool;
 use uuid::Uuid;
@@ -428,9 +429,10 @@ async fn r3perf_all_episodes_are_detected_and_counted() {
     }
 
     let progress = rustyfin_core::task_progress::TaskProgress::new();
-    let count = media_segments::detect_for_all_episodes_with_progress(&pool, &progress)
-        .await
-        .unwrap();
+    let count =
+        media_segments::detect_for_all_episodes_with_progress(&pool, &progress, &Cancel::new())
+            .await
+            .unwrap();
     assert_eq!(count, 3);
     for id in ids {
         let segments = rustyfin_db::repo_media_segment::get_media_segments(&pool, id)
@@ -463,9 +465,10 @@ async fn r3perf_an_unchanged_episode_is_not_detected_again() {
         .unwrap()
     };
 
-    let count = media_segments::detect_for_all_episodes_with_progress(&pool, &progress)
-        .await
-        .unwrap();
+    let count =
+        media_segments::detect_for_all_episodes_with_progress(&pool, &progress, &Cancel::new())
+            .await
+            .unwrap();
     assert_eq!(count, 1);
     let detected = intro_start().await;
 
@@ -475,9 +478,10 @@ async fn r3perf_an_unchanged_episode_is_not_detected_again() {
         .execute(&pool)
         .await
         .unwrap();
-    let count = media_segments::detect_for_all_episodes_with_progress(&pool, &progress)
-        .await
-        .unwrap();
+    let count =
+        media_segments::detect_for_all_episodes_with_progress(&pool, &progress, &Cancel::new())
+            .await
+            .unwrap();
     assert_eq!(count, 1, "an unchanged episode counts as processed");
     assert_eq!(intro_start().await, 12345);
 
@@ -490,9 +494,54 @@ async fn r3perf_an_unchanged_episode_is_not_detected_again() {
             std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000),
         )
         .unwrap();
-    media_segments::detect_for_all_episodes_with_progress(&pool, &progress)
+    media_segments::detect_for_all_episodes_with_progress(&pool, &progress, &Cancel::new())
         .await
         .unwrap();
     assert_eq!(intro_start().await, detected);
+
+    // An unchanged file detected by an older detection is detected again.
+    sqlx::query("UPDATE media_segments SET segment_start_ticks = 12345 WHERE item_id = ?1")
+        .bind(item_id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE media_segment_scans SET detector_version = ?1")
+        .bind(media_segments::DETECTOR_VERSION - 1)
+        .execute(&pool)
+        .await
+        .unwrap();
+    media_segments::detect_for_all_episodes_with_progress(&pool, &progress, &Cancel::new())
+        .await
+        .unwrap();
+    assert_eq!(intro_start().await, detected);
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn r3perf_a_cancelled_run_starts_no_episode_and_records_nothing() {
+    if !have_ffmpeg() {
+        eprintln!("skip: ffmpeg not found");
+        return;
+    }
+    let dir = TempDir::new("segments");
+    let clip = make_quoted_clip(&dir.0);
+    let (pool, item_id) = episode_db(&dir.0, &clip).await;
+    let cancel = Cancel::new();
+    cancel.cancel();
+    let progress = rustyfin_core::task_progress::TaskProgress::new();
+    let count = media_segments::detect_for_all_episodes_with_progress(&pool, &progress, &cancel)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+    assert!(
+        rustyfin_db::repo_media_segment::detected_versions(&pool)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let segments = rustyfin_db::repo_media_segment::get_media_segments(&pool, item_id)
+        .await
+        .unwrap();
+    assert!(segments.is_empty(), "{segments:?}");
     pool.close().await;
 }

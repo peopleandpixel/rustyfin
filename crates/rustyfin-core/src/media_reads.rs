@@ -3,10 +3,15 @@
 //!
 //! Background ffmpeg and ffprobe runs at a low CPU priority, so playback transcodes come first.
 //! A job that reads a whole file (intro detection) is bound by the network when the file is on a
-//! network share (NFS, SMB and other filesystems that aren't known local ones): one such read
-//! can fill the link, and more at once only add seeks and memory. So at most
-//! `RUSTYFIN_NETWORK_READ_JOBS` of them (default 1) run at once from network shares; reads from
-//! local disks are bounded by the image job slots alone.
+//! network share: one such read can fill the link, and more at once only add seeks and memory.
+//! So at most `RUSTYFIN_NETWORK_READ_JOBS` of them (default 1) run at once from network shares;
+//! reads from local disks are bounded by the image job slots alone.
+//!
+//! A filesystem counts as local when the library watcher knows it as local (ext4, xfs, btrfs,
+//! zfs and the like), or when it is a FUSE pool of local disks (`fuse.mergerfs`, and `fuse.shfs`,
+//! Unraid's user shares). Everything else counts as a network share: NFS, SMB, and FUSE mounts of
+//! remote storage such as rclone (`fuse.rclone`) and sshfs (`fuse.sshfs`), and a filesystem whose
+//! type can't be read.
 
 use std::path::Path;
 use std::sync::OnceLock;
@@ -45,12 +50,19 @@ pub fn network_read_jobs() -> usize {
     })
 }
 
-/// Whether `path` is on a filesystem that isn't a known local one (a network share, or one
-/// whose type can't be read).
+/// FUSE filesystems that pool local disks, so their reads are local ones.
+const POOLED_LOCAL_FUSE: &[&str] = &["fuse.mergerfs", "fuse.shfs"];
+
+/// Whether a filesystem of type `fs_type` is read like a local disk.
+pub fn is_local_read_fs_type(fs_type: &str) -> bool {
+    crate::library_watch::is_local_fs_type(fs_type) || POOLED_LOCAL_FUSE.contains(&fs_type)
+}
+
+/// Whether `path` is on a filesystem that isn't read like a local disk (`is_local_read_fs_type`):
+/// a network share, or one whose type can't be read.
 pub fn on_network_share(path: &Path) -> bool {
     let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    !crate::library_watch::fs_type_of(&path)
-        .is_some_and(|fs| crate::library_watch::is_local_fs_type(&fs))
+    !crate::library_watch::fs_type_of(&path).is_some_and(|fs| is_local_read_fs_type(&fs))
 }
 
 /// A permit for one whole-file read of `path`: one of the `network_read_jobs` when the file is on a
@@ -84,5 +96,23 @@ mod tests {
         assert!(!on_network_share(&std::env::temp_dir()));
         assert!((1..=4).contains(&decode_threads()));
         assert!((1..=16).contains(&network_read_jobs()));
+    }
+
+    #[test]
+    fn r3perf_pooled_local_disks_are_local_and_remote_fuse_mounts_are_not() {
+        for local in ["ext4", "zfs", "fuse.mergerfs", "fuse.shfs"] {
+            assert!(is_local_read_fs_type(local), "{local}");
+        }
+        for network in [
+            "nfs",
+            "nfs4",
+            "cifs",
+            "smb3",
+            "fuse.rclone",
+            "fuse.sshfs",
+            "fuse",
+        ] {
+            assert!(!is_local_read_fs_type(network), "{network}");
+        }
     }
 }
