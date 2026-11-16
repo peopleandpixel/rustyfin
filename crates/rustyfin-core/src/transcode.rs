@@ -73,6 +73,11 @@ pub struct TranscodeProfile {
     /// An image subtitle burned in with an overlay. It wins over the text burn-in, and it turns
     /// the video copy and hardware acceleration off.
     pub image_subtitle: Option<ImageSubtitle>,
+    /// Deinterlace the video (`bwdif`). It turns the video copy and hardware acceleration off.
+    pub deinterlace: bool,
+    /// Scale non-square pixels to square ones (`scale=iw*sar:ih,setsar=1`, even width). It turns
+    /// the video copy and hardware acceleration off.
+    pub square_pixels: bool,
 }
 
 impl Default for TranscodeProfile {
@@ -95,6 +100,8 @@ impl Default for TranscodeProfile {
             copy_audio: false,
             start_time_ticks: 0,
             image_subtitle: None,
+            deinterlace: false,
+            square_pixels: false,
         }
     }
 }
@@ -705,7 +712,8 @@ fn subtitles_filter(input: &str, sub_idx: u32, start_time_ticks: i64) -> String 
     }
 }
 
-fn build_ffmpeg_args(
+/// The ffmpeg arguments of an HLS transcode of `input` with `profile`.
+pub fn build_ffmpeg_args(
     input: &str,
     playlist_output: &str,
     segment_pattern: &str,
@@ -717,18 +725,21 @@ fn build_ffmpeg_args(
     args.push("-y".to_string());
     args.extend(["-hide_banner".to_string(), "-nostats".to_string()]);
 
-    // An image subtitle is overlaid in software, so it turns hardware acceleration off
+    // An image subtitle is overlaid in software, and deinterlacing and square pixels are software
+    // filters, so each turns hardware acceleration off
     let image_subtitle = profile.image_subtitle.filter(|_| !profile.audio_only);
-    let hw_accel = if image_subtitle.is_some() {
+    let software_filters = profile.deinterlace || profile.square_pixels;
+    let hw_accel = if image_subtitle.is_some() || software_filters {
         HwAccel::None
     } else {
         profile.hw_accel
     };
 
-    // Burn-in and the overlay need a re-encode, so they turn the video copy off
+    // Burn-in, the overlay and the software filters need a re-encode, so they turn the copy off
     let copy_video = profile.copy_video
         && !profile.audio_only
         && !profile.burn_subtitles
+        && !software_filters
         && image_subtitle.is_none();
 
     // Hardware acceleration input flags (skip for audio-only and copied video)
@@ -814,8 +825,15 @@ fn build_ffmpeg_args(
                 profile.max_width, profile.max_height
             ),
             HwAccel::None => format!(
-                "scale='min({},iw)':'min({},ih)':force_original_aspect_ratio=decrease,format=yuv420p",
-                profile.max_width, profile.max_height
+                "{}{}scale='min({},iw)':'min({},ih)':force_original_aspect_ratio=decrease,format=yuv420p",
+                if profile.deinterlace { "bwdif=0," } else { "" },
+                if profile.square_pixels {
+                    "scale=trunc(iw*sar/2)*2:ih,setsar=1,"
+                } else {
+                    ""
+                },
+                profile.max_width,
+                profile.max_height
             ),
         };
 

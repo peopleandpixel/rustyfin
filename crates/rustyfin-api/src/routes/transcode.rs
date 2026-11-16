@@ -74,27 +74,73 @@ pub struct TranscodeQuery {
     /// that is not a number does not fail the whole query.
     #[serde(rename = "h264-videobitdepth")]
     pub h264_video_bit_depth: Option<String>,
+    /// Jellyfin's RequireNonAnamorphic: the client needs square pixels. Jellyfin writes "True",
+    /// so it is read as text.
+    pub require_non_anamorphic: Option<String>,
+    /// Jellyfin's DeInterlace: the client needs progressive video.
+    pub de_interlace: Option<String>,
+    /// Jellyfin's Level: the highest codec level the client takes, when no `{codec}-level` says.
+    pub level: Option<String>,
+    /// The codec-qualified options (`h264-level`, `h264-deinterlace`, ...), names lowercased.
+    /// The route fills them from the raw query (`with_codec_options`).
+    #[serde(skip)]
+    pub codec_options: HashMap<String, String>,
 }
 
-/// A URL's VideoBitrate in kbps. Jellyfin writes bits per second; a value under 100000, too low
-/// for bits per second, is kbps, as Rustyfin's transcode URLs wrote it before.
-fn video_kbps(value: u32) -> u32 {
-    if value < 100_000 { value } else { value / 1000 }
+/// Whether a query value says true, in any case.
+fn truthy(value: Option<&str>) -> bool {
+    value.is_some_and(|v| v.trim().eq_ignore_ascii_case("true"))
 }
 
-/// A URL's AudioBitrate in kbps: bits per second, or kbps under 8000 (see `video_kbps`).
-fn audio_kbps(value: u32) -> u32 {
-    if value < 8_000 { value } else { value / 1000 }
+impl TranscodeQuery {
+    /// The query with its codec-qualified options (any name with a `-`) from `params`.
+    fn with_codec_options(mut self, params: &HashMap<String, String>) -> Self {
+        self.codec_options = params
+            .iter()
+            .filter(|(name, _)| name.contains('-'))
+            .map(|(name, value)| (name.to_ascii_lowercase(), value.clone()))
+            .collect();
+        self
+    }
+
+    /// The option `{codec}-{name}`.
+    fn codec_option(&self, codec: &str, name: &str) -> Option<&str> {
+        self.codec_options
+            .get(&format!("{codec}-{name}"))
+            .map(String::as_str)
+    }
+
+    /// The highest level the client takes for `codec`: `{codec}-level`, else `Level`.
+    fn max_level(&self, codec: &str) -> Option<f64> {
+        self.codec_option(codec, "level")
+            .or(self.level.as_deref())
+            .and_then(|level| level.trim().parse().ok())
+    }
+
+    /// Whether the client needs `codec` deinterlaced: `{codec}-deinterlace` or `DeInterlace`.
+    fn wants_deinterlaced(&self, codec: &str) -> bool {
+        truthy(self.codec_option(codec, "deinterlace")) || truthy(self.de_interlace.as_deref())
+    }
+
+    /// Whether the client needs square pixels (`RequireNonAnamorphic`).
+    fn wants_square_pixels(&self) -> bool {
+        truthy(self.require_non_anamorphic.as_deref())
+    }
+}
+
+/// A URL bitrate in kbps. The URL writes bits per second, as Jellyfin's does.
+fn kbps(bits_per_second: u32) -> u32 {
+    bits_per_second / 1000
 }
 
 impl TranscodeQuery {
     fn into_profile(self) -> TranscodeProfile {
         let mut p = TranscodeProfile::default();
         if let Some(v) = self.video_bitrate {
-            p.max_video_bitrate_kbps = video_kbps(v);
+            p.max_video_bitrate_kbps = kbps(v);
         }
         if let Some(v) = self.audio_bitrate {
-            p.max_audio_bitrate_kbps = audio_kbps(v);
+            p.max_audio_bitrate_kbps = kbps(v);
         }
         if let Some(v) = self.max_width {
             p.max_width = v;
@@ -139,6 +185,9 @@ struct SourceInfo {
     width: Option<u32>,
     height: Option<u32>,
     video_bitrate: Option<u32>, // bits/s: stream, else source video_bitrate, else source bitrate
+    video_level: Option<f64>,   // the codec level, as ffprobe gives it
+    interlaced: bool,
+    anamorphic: bool,
     audio: Vec<Track>,          // audio streams, in stream order
     audio_bitrate: Option<u32>, // bits/s: the source's audio_bitrate, for a track without its own
     subtitles: Vec<Track>,      // embedded subtitle streams, in stream order
@@ -176,6 +225,9 @@ impl SourceInfo {
                 .and_then(|s| s.bit_rate)
                 .or(source.video_bitrate)
                 .or(source.bitrate),
+            video_level: video.and_then(|s| s.level),
+            interlaced: video.is_some_and(|s| s.is_interlaced),
+            anamorphic: video.is_some_and(|s| s.is_anamorphic == Some(true)),
             audio,
             audio_bitrate: source.audio_bitrate,
             subtitles,
@@ -215,11 +267,10 @@ fn size_fits(limit: Option<u32>, size: Option<u32>) -> bool {
     limit.is_none_or(|max| size.is_some_and(|s| s <= max))
 }
 
-/// Whether a source bitrate (bits/s) is known and within a client limit (kbps).
+/// Whether a source bitrate is known and within a client limit, both in bits per second.
 /// No limit always fits.
-fn bitrate_fits(limit_kbps: Option<u32>, bits_per_sec: Option<u32>) -> bool {
-    limit_kbps
-        .is_none_or(|kbps| bits_per_sec.is_some_and(|bps| u64::from(bps) <= u64::from(kbps) * 1000))
+fn bitrate_fits(limit: Option<u32>, bits_per_sec: Option<u32>) -> bool {
+    limit.is_none_or(|max| bits_per_sec.is_some_and(|bps| bps <= max))
 }
 
 /// Whether a profile name marks a 10-bit, 4:2:2 or 4:4:4 stream (e.g. "High 10", "High 4:2:2").
@@ -402,14 +453,19 @@ fn stream_copy(query: &TranscodeQuery, source: &SourceInfo) -> (bool, bool) {
         )
         && size_fits(query.max_width, source.width)
         && size_fits(query.max_height, source.height)
-        && bitrate_fits(query.video_bitrate.map(video_kbps), source.video_bitrate);
+        && bitrate_fits(query.video_bitrate, source.video_bitrate)
+        // Jellyfin's codec conditions: a level over the client's, interlacing it can't show, or
+        // non-square pixels it can't scale all need an encode
+        && source
+            .video_level
+            .zip(query.max_level("h264"))
+            .is_none_or(|(level, max)| level <= max)
+        && !(source.interlaced && query.wants_deinterlaced("h264"))
+        && !(source.anamorphic && query.wants_square_pixels());
     let copy_audio = audio.is_some_and(|track| {
         track.codec == "aac"
             && client_takes(query.audio_codec.as_deref(), &["aac", "mp4a"])
-            && bitrate_fits(
-                query.audio_bitrate.map(audio_kbps),
-                track.bitrate.or(source.audio_bitrate),
-            )
+            && bitrate_fits(query.audio_bitrate, track.bitrate.or(source.audio_bitrate))
     });
     (copy_video, copy_audio)
 }
@@ -419,7 +475,13 @@ fn stream_copy(query: &TranscodeQuery, source: &SourceInfo) -> (bool, bool) {
 fn transcode_profile(query: TranscodeQuery, source: &SourceInfo) -> TranscodeProfile {
     let (copy_video, copy_audio) = stream_copy(&query, source);
     let tracks = choose_tracks(&query, source);
+    // An encode deinterlaces an interlaced source, as Jellyfin's does, and makes the pixels
+    // square when the client asks
+    let deinterlace = !copy_video && source.interlaced;
+    let square_pixels = !copy_video && source.anamorphic && query.wants_square_pixels();
     let mut profile = query.into_profile();
+    profile.deinterlace = deinterlace;
+    profile.square_pixels = square_pixels;
     profile.copy_video = copy_video;
     profile.copy_audio = copy_audio;
     profile.audio_stream_index = tracks.audio;
@@ -459,6 +521,7 @@ async fn hls_master_playlist(
     Query(params): Query<HashMap<String, String>>,
     RawQuery(raw_query): RawQuery,
 ) -> Result<Response, ApiError> {
+    let query = query.with_codec_options(&params);
     let item = rustyfin_db::repo_media::get_item_by_id(&state.db, id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Item {id} not found")))?;
@@ -707,6 +770,9 @@ mod tests {
             width: Some(1920),
             height: Some(1080),
             video_bitrate: Some(8_000_000),
+            video_level: Some(41.0),
+            interlaced: false,
+            anamorphic: false,
             audio: audio.iter().zip(1..).map(|(c, i)| track(i, c)).collect(),
             audio_bitrate: Some(192_000),
             subtitles: Vec::new(),
@@ -743,7 +809,13 @@ mod tests {
     /// The query a playlist request with `params` carries, parsed as the route parses it.
     fn query(params: &str) -> TranscodeQuery {
         let uri = format!("/Videos/item/main.m3u8?{params}").parse().unwrap();
-        Query::<TranscodeQuery>::try_from_uri(&uri).unwrap().0
+        let map = Query::<HashMap<String, String>>::try_from_uri(&uri)
+            .unwrap()
+            .0;
+        Query::<TranscodeQuery>::try_from_uri(&uri)
+            .unwrap()
+            .0
+            .with_codec_options(&map)
     }
 
     /// The lists of a browser that plays H.264 but not AC3.
@@ -765,10 +837,68 @@ mod tests {
         assert_eq!(TranscodeQuery::default().into_profile().start_time_ticks, 0);
     }
 
-    /// The bitrates are bits per second, as in Jellyfin: the TranscodingUrl writes them so, and
-    /// Universal passes a client's MaxVideoBitrate and MaxAudioBitrate through as VideoBitrate and
-    /// AudioBitrate. Before, 4000000 read as kbps capped nothing. The kbps that Rustyfin's own
-    /// URLs wrote before still read as kbps.
+    /// The bitrates are bits per second, always, as in Jellyfin: the TranscodingUrl writes them
+    /// so, and Universal passes a client's MaxVideoBitrate and MaxAudioBitrate through as
+    /// VideoBitrate and AudioBitrate. Before, 4000000 read as kbps capped nothing.
+    /// The URLs the stream builder writes for a level the client can't play, interlaced video
+    /// or non-square pixels give an encode with the matching filters, down to the ffmpeg
+    /// arguments; before, the route read none of those options and copied the video.
+    #[test]
+    fn r3decisions_level_scan_and_shape_requests_encode() {
+        let args_for = |params: &str, source: SourceInfo| {
+            let profile = transcode_profile(query(params), &source);
+            rustyfin_core::transcode::build_ffmpeg_args(
+                "/in.mkv",
+                "/out/main.m3u8",
+                "/out/seg_%04d.ts",
+                &profile,
+            )
+        };
+        let copies = |args: &[String]| args.windows(2).any(|w| w[0] == "-c:v" && w[1] == "copy");
+        let filter = |args: &[String]| {
+            args.windows(2)
+                .find(|w| w[0] == "-vf")
+                .map(|w| w[1].clone())
+                .unwrap_or_default()
+        };
+        let lists = "VideoCodec=h264&AudioCodec=aac";
+
+        // Level 4.1 fits h264-level=41 and Level=51, so the video is copied
+        for within in ["h264-level=41", "Level=51"] {
+            let args = args_for(&format!("{lists}&{within}"), h264_with(&["aac"]));
+            assert!(copies(&args), "{within}: {args:?}");
+        }
+        // Over h264-level=40, or Level=40 with no h264 option: encoded
+        for over in ["h264-level=40", "Level=40", "H264-Level=40"] {
+            let args = args_for(&format!("{lists}&{over}"), h264_with(&["aac"]));
+            assert!(!copies(&args), "{over}: {args:?}");
+            assert!(args.iter().any(|a| a == "libx264"), "{over}: {args:?}");
+        }
+
+        // Interlaced video for a client that asks for progressive: encoded and deinterlaced
+        let interlaced = SourceInfo {
+            interlaced: true,
+            ..h264_with(&["aac"])
+        };
+        let args = args_for(&format!("{lists}&h264-deinterlace=true"), interlaced);
+        assert!(!copies(&args), "{args:?}");
+        assert!(filter(&args).starts_with("bwdif=0,"), "{args:?}");
+
+        // Non-square pixels with RequireNonAnamorphic=True: encoded and scaled to square pixels
+        let anamorphic = || SourceInfo {
+            anamorphic: true,
+            ..h264_with(&["aac"])
+        };
+        let args = args_for(&format!("{lists}&RequireNonAnamorphic=True"), anamorphic());
+        assert!(!copies(&args), "{args:?}");
+        assert!(
+            filter(&args).starts_with("scale=trunc(iw*sar/2)*2:ih,setsar=1,"),
+            "{args:?}"
+        );
+        // Without the request the same file is copied
+        assert!(copies(&args_for(lists, anamorphic())));
+    }
+
     #[test]
     fn r3decisions_url_bitrates_are_bits_per_second() {
         let profile = query("VideoBitrate=4000000&AudioBitrate=192000").into_profile();
@@ -777,9 +907,10 @@ mod tests {
         let profile = query("VideoBitrate=119616000&AudioBitrate=384000").into_profile();
         assert_eq!(profile.max_video_bitrate_kbps, 119_616);
         assert_eq!(profile.max_audio_bitrate_kbps, 384);
-        let legacy = query("VideoBitrate=4000&AudioBitrate=192").into_profile();
-        assert_eq!(legacy.max_video_bitrate_kbps, 4000);
-        assert_eq!(legacy.max_audio_bitrate_kbps, 192);
+        // No guessing from the size: 4000 is 4 kbit/s
+        let small = query("VideoBitrate=4000&AudioBitrate=192").into_profile();
+        assert_eq!(small.max_video_bitrate_kbps, 4);
+        assert_eq!(small.max_audio_bitrate_kbps, 0);
 
         // A video at 6 Mbit/s is over a 4 Mbit/s cap, so it isn't copied
         let source = SourceInfo {
@@ -834,8 +965,8 @@ mod tests {
         let query = TranscodeQuery {
             max_width: Some(1920),
             max_height: Some(1080),
-            video_bitrate: Some(8000),
-            audio_bitrate: Some(192),
+            video_bitrate: Some(8_000_000),
+            audio_bitrate: Some(192_000),
             ..browser_query()
         };
         assert_eq!(stream_copy(&query, &h264_with(&["aac"])), (true, true));
@@ -898,14 +1029,14 @@ mod tests {
             ..h264_with(&["aac"])
         };
         encoded(query, source);
-        // Over VideoBitrate (kbps), or of unknown bitrate
+        // Over VideoBitrate (bits per second), or of unknown bitrate
         let query = TranscodeQuery {
-            video_bitrate: Some(4000),
+            video_bitrate: Some(4_000_000),
             ..browser_query()
         };
         encoded(query, h264_with(&["aac"]));
         let query = TranscodeQuery {
-            video_bitrate: Some(20000),
+            video_bitrate: Some(20_000_000),
             ..browser_query()
         };
         let source = SourceInfo {
@@ -958,14 +1089,14 @@ mod tests {
             ..browser_query()
         };
         assert!(!copied(query, h264_with(&["aac"])));
-        // Over AudioBitrate (kbps), or of unknown bitrate
+        // Over AudioBitrate (bits per second), or of unknown bitrate
         let query = TranscodeQuery {
-            audio_bitrate: Some(128),
+            audio_bitrate: Some(128_000),
             ..browser_query()
         };
         assert!(!copied(query, h264_with(&["aac"])));
         let query = TranscodeQuery {
-            audio_bitrate: Some(320),
+            audio_bitrate: Some(320_000),
             ..browser_query()
         };
         let source = SourceInfo {
@@ -1016,7 +1147,7 @@ mod tests {
             ..h264_with(&[])
         };
         let query = TranscodeQuery {
-            audio_bitrate: Some(128),
+            audio_bitrate: Some(128_000),
             ..browser_query()
         };
         assert!(copied(query, source));
