@@ -7,14 +7,16 @@ import {
     renderLibrary, stopLibraryLoad, libraryRemember, startGridDiag, jumpToLetter, clearLibraryFilters,
 } from './library.js';
 import {
-    currentDetailId, renderDetail, renderPerson, toggleFavorite, togglePlayed, deleteItemFromDetail, detailSelection,
+    currentDetailId, renderDetail, renderPerson, toggleFavorite, togglePlayed, deleteItemFromDetail, detailSelection, shareItem,
 } from './item.js';
 import { renderSearch } from './search.js';
-import { playWithResumeChoice, stopPlayback, playItem, playerAutoHide, onPlayerClosed } from './player.js';
+import {
+    playWithResumeChoice, stopPlayback, playItem, playerAutoHide, onPlayerClosed, seekToTicks,
+} from './player.js';
 import { playContainer } from './queue.js';
 import { stopThemeSong } from './theme-media.js';
 import {
-    openCardMenu, toggleCardPlayed, toggleCardFavorite, setCardLikes, playCardItem, openAddTo,
+    openCardMenu, toggleCardPlayed, toggleCardFavorite, setCardLikes, playCardItem, playInstantMix, openAddTo,
 } from './cardmenu.js';
 import { playAlbumFrom } from './music.js';
 import { playContainerFrom, removeFromContainer, openNewContainer } from './collections.js';
@@ -36,6 +38,7 @@ import {
     removeUserEditorSchedule, saveUserEditor, setUserEditorPassword,
 } from './user-editor.js';
 import { openRefreshDialog, openIdentifyDialog, openImageEditor, openMetadataEditor } from './metadata-admin.js';
+import { openSubtitleEditor } from './subtitle-admin.js';
 let currentPage = 'home';
 
 // --- Navigation & Routing ---
@@ -169,6 +172,9 @@ const clickActions = {
     'card-like': el => setCardLikes(el, true),
     'card-dislike': el => setCardLikes(el, false),
     'card-play': el => playCardItem(el),
+    'card-instant-mix': el => playInstantMix(el),
+    // A timed lyric line seeks the song to its start (ticks), lyrics.js
+    'seek-lyric': el => seekToTicks(Number(el.dataset.start)),
     'card-add-playlist': el => openAddTo(el, 'playlist'),
     'card-add-collection': el => openAddTo(el, 'collection'),
     // Collections and playlists (collections.js)
@@ -182,6 +188,8 @@ const clickActions = {
     'edit-metadata': el => openMetadataEditor(el.dataset.id),
     'identify-item': el => openIdentifyDialog(el.dataset.id),
     'edit-images': el => openImageEditor(el.dataset.id),
+    'edit-subtitles': el => openSubtitleEditor(el.dataset.id),
+    'share-item': el => shareItem(el.dataset),
     'admin-tab': el => showAdminTab(el, el.dataset.tab),
     'delete-user': el => { if (confirm(t('admin.delete_user_confirm'))) API.deleteUser(el.dataset.id).then(() => renderAdmin()); },
     'set-user-admin': el => setUserPolicy(el, { IsAdministrator: el.checked }),

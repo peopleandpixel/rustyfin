@@ -74,7 +74,8 @@ test('the metadata editor saves Jellyfin-shaped fields and locks the unticked fi
     assert.deepEqual(body, {
         Name: 'Alpha', OriginalTitle: null, Overview: 'Text', Taglines: ['Go'],
         ProductionYear: 2001, PremiereDate: '2001-05-04T00:00:00.0000000Z', CommunityRating: 7.5, CriticRating: null,
-        OfficialRating: 'PG-13', Genres: ['Drama', 'comedy'], Tags: [], LockData: false, LockedFields: ['Overview', 'Cast'],
+        OfficialRating: 'PG-13', Genres: ['Drama', 'comedy'], Tags: [], Studios: [], People: [], ProviderIds: {},
+        LockData: false, LockedFields: ['Overview', 'Cast'],
     });
     // A sort title goes when it changed; clearing one sends null
     assert.equal(plain(fns.itemUpdateBody({ name: 'A', sortName: 'a, the', enabled: {} })).ForcedSortName, 'a, the');

@@ -268,7 +268,8 @@ impl HiddenItems {
         Self::for_policy(state, policy(state, claims).await?).await
     }
 
-    /// The items hidden from `user`, for a client that doesn't sign in (the DLNA server's user).
+    /// The items hidden from `user`: for a route that answers for a user other than the caller (an
+    /// administrator's `userId`), or for a client that doesn't sign in (the DLNA server's user).
     pub async fn for_user(state: &AppState, user: Uuid) -> Result<Self, ApiError> {
         let policy = user_policy(state, user).await?;
         Self::for_policy(state, policy.is_restricted().then_some(policy)).await

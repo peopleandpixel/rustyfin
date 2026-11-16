@@ -169,10 +169,9 @@ async fn reported_runtime(
     Ok(version.or(item.runtime_ticks))
 }
 
-/// The token of the request, for finding its session.
-type Token = Option<Extension<rustyfin_auth::RequestToken>>;
+/// The token of the request and the device its header names, for finding its session.
+type Token = crate::sessions::Caller;
 
-/// The caller's session, from the request's token.
 /// The item a playback report names, or `None` for an id that is no media item or one `user`'s
 /// limits hide. Such a report stores nothing and sets no now-playing item, so a limited user can't
 /// read a hidden item's name back from their session.
@@ -191,9 +190,9 @@ async fn reported_item(
     Ok(item)
 }
 
+/// The caller's session, from the request's token and stated device.
 async fn caller_session(state: &AppState, token: &Token) -> Result<Option<String>, ApiError> {
-    let token = token.as_ref().map(|Extension(rt)| rt.0.as_str());
-    crate::sessions::for_token(state, token).await
+    token.session(state).await
 }
 
 async fn playing(

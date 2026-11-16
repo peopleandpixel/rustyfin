@@ -6,7 +6,7 @@ use axum::routing::{delete, get};
 use axum::{Extension, Json, Router};
 use rustyfin_core::tmdb_client::TmdbApi;
 use rustyfin_model::auth::Claims;
-use rustyfin_model::media::{FiltersResult, MediaItem, QueryResult};
+use rustyfin_model::media::{FiltersResult, MediaItem, MediaType, QueryResult};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sqlx::SqlitePool;
@@ -337,6 +337,14 @@ async fn enrich_item(
     // Container: the first media source's, as Jellyfin sends it
     if item.container.is_none() {
         item.container = item.media_sources.first().and_then(|s| s.container.clone());
+    }
+
+    // Jellyfin sends HasLyrics on audio items only
+    if item.media_type == rustyfin_model::media::MediaType::Audio {
+        let with_lyrics = rustyfin_db::repo_lyrics::with_lyrics(pool, &[item.id])
+            .await
+            .unwrap_or_default();
+        item.has_lyrics = Some(!with_lyrics.is_empty());
     }
 
     // Type flags
@@ -1057,6 +1065,23 @@ pub(crate) async fn enrich_items_with(
         for item in items.iter_mut() {
             if let Some(info) = photos.get(&item.id) {
                 apply_photo_info(item, info);
+            }
+        }
+    }
+
+    // Batch query 3a': which audio items have lyrics; Jellyfin sends HasLyrics on audio only
+    let audio_ids: Vec<Uuid> = items
+        .iter()
+        .filter(|item| item.media_type == rustyfin_model::media::MediaType::Audio)
+        .map(|item| item.id)
+        .collect();
+    if !audio_ids.is_empty() {
+        let with_lyrics = rustyfin_db::repo_lyrics::with_lyrics(pool, &audio_ids)
+            .await
+            .unwrap_or_default();
+        for item in items.iter_mut() {
+            if item.media_type == rustyfin_model::media::MediaType::Audio {
+                item.has_lyrics = Some(with_lyrics.contains(&item.id.to_string()));
             }
         }
     }
@@ -1874,7 +1899,7 @@ pub(crate) async fn enrich_items_with(
 
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route("/Items", get(get_items))
+        .route("/Items", get(get_items_for_query_user))
         // DELETE checks the caller itself: a playlist's owner may delete it, as in Jellyfin.
         .route("/Items/{id}", get(get_item).delete(delete_item))
         .route("/Items/{id}/Children", get(get_children))
@@ -2082,6 +2107,12 @@ struct ItemsQuery {
     has_special_feature: Option<bool>,
     #[serde(rename = "hasSpecialFeature")]
     has_special_feature_lower: Option<bool>,
+    has_trailer: Option<bool>,
+    #[serde(rename = "hasTrailer")]
+    has_trailer_lower: Option<bool>,
+    has_theme_video: Option<bool>,
+    #[serde(rename = "hasThemeVideo")]
+    has_theme_video_lower: Option<bool>,
     subtitle_language: Option<String>,
     #[serde(rename = "subtitleLanguage")]
     subtitle_language_lower: Option<String>,
@@ -2334,6 +2365,12 @@ impl ItemsQuery {
     fn has_special_feature(&self) -> Option<bool> {
         self.has_special_feature.or(self.has_special_feature_lower)
     }
+    fn has_trailer(&self) -> Option<bool> {
+        self.has_trailer.or(self.has_trailer_lower)
+    }
+    fn has_theme_video(&self) -> Option<bool> {
+        self.has_theme_video.or(self.has_theme_video_lower)
+    }
     /// The subtitle languages to filter by: Jellyfin's comma list `SubtitleLanguages`, else the
     /// single `SubtitleLanguage` Rustyfin took before. Each code is matched in all its spellings,
     /// so `ger` and `deu` find the same items.
@@ -2379,6 +2416,21 @@ fn parse_ids(value: Option<&str>) -> Vec<Uuid> {
 }
 
 /// The ids of `kept` (all items when `None`) that are also in `ids`.
+/// The hidden items' filter (`HiddenItems::json`: `{"h": [ids], "l": [libraries]}`) that also hides `ids`.
+fn hide_also(hidden: Option<String>, ids: Vec<String>) -> Option<String> {
+    if ids.is_empty() {
+        return hidden;
+    }
+    let mut filter = hidden
+        .and_then(|json| serde_json::from_str::<Value>(&json).ok())
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    let mut all: Vec<Value> = filter["h"].as_array().cloned().unwrap_or_default();
+    all.extend(ids.into_iter().map(Value::String));
+    filter["h"] = Value::Array(all);
+    Some(filter.to_string())
+}
+
 fn narrow_ids(kept: Option<Vec<String>>, ids: Vec<String>) -> Vec<String> {
     match kept {
         Some(kept) => {
@@ -2550,8 +2602,27 @@ async fn get_items(
                 .await?;
         item_ids = Some(narrow_ids(item_ids, ids));
     }
+    // HasTrailer, HasSpecialFeature, HasThemeSong and HasThemeVideo: by the item's own extras, the way
+    // LocalTrailerCount and SpecialFeatureCount count them. True keeps only their owners; false leaves the
+    // owners out with the hidden items, so neither reads the ids of the whole library.
+    let mut without: Vec<String> = Vec::new();
+    for (has, types) in [
+        (query.has_trailer(), &["Trailer"][..]),
+        (query.has_special_feature(), SPECIAL_FEATURE_TYPES),
+        (query.has_theme_song(), &["ThemeSong"][..]),
+        (query.has_theme_video(), &["ThemeVideo"][..]),
+    ] {
+        if let Some(has) = has {
+            let ids = rustyfin_db::repo_extras::owners_with_extras(&state.db_ro, types).await?;
+            if has {
+                item_ids = Some(narrow_ids(item_ids, ids));
+            } else {
+                without.extend(ids);
+            }
+        }
+    }
     let hidden = HiddenItems::for_caller(&state, &claims).await?;
-    let hidden_json = hidden.json();
+    let hidden_json = hide_also(hidden.json(), without);
 
     let (items, total) = rustyfin_db::repo_media::get_items_filtered(
         &state.db_ro,
@@ -2895,6 +2966,7 @@ pub(crate) async fn media_item(
             apply_unplayed_counts(&mut item, counts.get(&key).copied().unwrap_or((0, 0)));
         }
     }
+    item.can_download = super::item_download::can_download(state, user, &item).await;
     Ok(item)
 }
 
@@ -3108,10 +3180,19 @@ async fn delete_item(
             "This user may not delete media.".to_string(),
         ));
     }
+    // The uploaded lyric files of the item and the items under it go with them.
+    let library = rustyfin_db::repo_media::get_item_by_id(&state.db, id)
+        .await?
+        .map(|item| item.library_id);
+    let lyrics = match library {
+        Some(library) => rustyfin_core::lyrics::uploads_in_library(&state.db, library).await,
+        None => Vec::new(),
+    };
     let deleted = rustyfin_db::repo_media::delete_item(&state.db, id).await?;
     if !deleted {
         return Err(ApiError::NotFound("item not found".into()));
     }
+    rustyfin_core::lyrics::remove_orphaned_uploads(&state.db, &lyrics).await;
     // The items under it lose theirs at the image tasks' next run.
     rustyfin_core::trickplay::remove_item_files(&state.data_dir, id).await;
     Ok(Json(json!({ "status": "ok" })).into_response())
@@ -3270,47 +3351,135 @@ struct LimitQuery {
     limit: Option<i64>,
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct LatestQuery {
-    limit: Option<i64>,
-    include_item_types: Option<String>,
-    #[serde(rename = "includeItemTypes")]
-    include_item_types_lower: Option<String>,
-    parent_id: Option<Uuid>,
-    #[serde(rename = "parentId")]
-    parent_id_lower: Option<Uuid>,
-}
-
 async fn get_latest(
     State(state): State<AppState>,
-    Query(query): Query<LatestQuery>,
+    Query(params): Query<Vec<(String, String)>>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<Vec<MediaItem>>, ApiError> {
-    let limit = query.limit.unwrap_or(20);
-    let media_type = query
-        .include_item_types
-        .as_deref()
-        .or(query.include_item_types_lower.as_deref())
-        .map(|s| s.split(',').next().unwrap_or("").trim().to_string())
-        .filter(|kind| !kind.is_empty());
-    let library_id = query.parent_id.or(query.parent_id_lower);
-    let hidden = HiddenItems::for_caller(&state, &claims).await?.json();
-    let mut items = rustyfin_db::repo_media::get_latest_items(
-        &state.db_ro,
-        limit,
-        media_type.as_deref(),
-        library_id,
-        hidden.as_deref(),
+    let user = query_user(
+        &state,
+        &claims,
+        crate::query::uuid_param(&params, "userId")?,
     )
-    .await?;
+    .await?
+    .unwrap_or(claims.sub);
+    latest_page(&state, user, &params).await
+}
+
+/// The "Latest" row (`/Items/Latest`, `/Users/{userId}/Items/Latest`), as Jellyfin's
+/// `UserLibraryController.GetLatestMedia` builds it, for `user` and what that user may see:
+/// `isPlayed` (unset means unplayed only when the user's `HidePlayedInLatest` is on; ignored
+/// when a music library is read), `groupItems`
+/// (default true: two or more new episodes of a series show as the series, new tracks as their
+/// album, each with `ChildCount`), `limit` (default 20) entries, and without `parentId` the
+/// user's `LatestItemsExcludes` libraries left out.
+async fn latest_page(
+    state: &AppState,
+    user: Uuid,
+    params: &[(String, String)],
+) -> Result<Json<Vec<MediaItem>>, ApiError> {
+    use crate::query::{bool_param, count_param, item_kinds, parent_param};
+    let limit = count_param(params, "limit")?.unwrap_or(20);
+    let group_items = bool_param(params, "groupItems")?.unwrap_or(true);
+    let library_id = parent_param(params, "parentId")?;
+    let config = rustyfin_db::repo_user::get_user_by_id(&state.db_ro, user)
+        .await?
+        .map(|u| rustyfin_model::user::jellyfin_configuration(&u.configuration))
+        .unwrap_or_default();
+    let mut is_played = bool_param(params, "isPlayed")?;
+    if is_played.is_none() && config["HidePlayedInLatest"].as_bool() != Some(false) {
+        is_played = Some(false);
+    }
+    let mut exclude_libraries = Vec::new();
+    if let Some(library_id) = library_id {
+        let library =
+            rustyfin_db::repo_library::get_library_by_id(&state.db_ro, library_id).await?;
+        if library
+            .is_some_and(|l| l.content_type == rustyfin_model::library::LibraryContentType::Music)
+        {
+            is_played = None;
+        }
+    } else {
+        exclude_libraries = config["LatestItemsExcludes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|id| id.as_str().and_then(|id| Uuid::parse_str(id).ok()))
+            .collect();
+        // Jellyfin ignores the played filter when any library the row reads is music.
+        let policy = crate::parental::user_policy(state, user).await?;
+        let libraries = rustyfin_db::repo_library::get_all_libraries(&state.db_ro).await?;
+        if libraries.iter().any(|l| {
+            l.content_type == rustyfin_model::library::LibraryContentType::Music
+                && !exclude_libraries.contains(&l.id)
+                && policy.allows_folder(&l.id.to_string())
+        }) {
+            is_played = None;
+        }
+    }
+    let mut filter = rustyfin_db::repo_media::LatestFilter {
+        user_id: Some(user),
+        item_types: item_kinds(params, "includeItemTypes")
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        library_id,
+        exclude_libraries,
+        is_played,
+        limit: (limit as i64).saturating_mul(5).max(1),
+        offset: 0,
+        hidden_ids_json: HiddenItems::for_user(state, user).await?.json(),
+    };
+
+    // Jellyfin's UserViewManager.GetLatestItems: group by container in first-seen order, up to
+    // `limit` groups. Pages of candidates are read until there are `limit` groups, so a series
+    // with many new episodes doesn't leave the row short.
+    let mut groups: Vec<(Option<Uuid>, Vec<MediaItem>)> = Vec::new();
+    'pages: while groups.len() < limit {
+        let candidates = rustyfin_db::repo_media::get_latest_items(&state.db_ro, &filter).await?;
+        let last_page = (candidates.len() as i64) < filter.limit;
+        for (item, container) in candidates {
+            if groups.len() >= limit {
+                break 'pages;
+            }
+            match container.filter(|_| group_items) {
+                Some(id) => match groups.iter_mut().find(|(c, _)| *c == Some(id)) {
+                    Some((_, members)) => members.push(item),
+                    None => groups.push((Some(id), vec![item])),
+                },
+                None => groups.push((None, vec![item])),
+            }
+        }
+        if last_page {
+            break;
+        }
+        filter.offset += filter.limit;
+    }
+    let mut items = Vec::with_capacity(groups.len());
+    let mut child_counts = Vec::with_capacity(groups.len());
+    for (container, mut members) in groups {
+        let container = match container {
+            Some(id) => rustyfin_db::repo_media::get_item_by_id(&state.db_ro, id).await?,
+            None => None,
+        };
+        match container {
+            Some(c) if members.len() > 1 || c.media_type == MediaType::MusicAlbum => {
+                child_counts.push(members.len() as i32);
+                items.push(c);
+            }
+            _ => {
+                child_counts.push(0);
+                items.push(members.swap_remove(0));
+            }
+        }
+    }
     // Enrich latest items using batch queries
     // Skip blurhash for list views to avoid per-item disk I/O
     let tmdb = state.tmdb.api(None);
     enrich_items(
         &state.db_ro,
         &state.server_id,
-        Some(claims.sub),
+        Some(user),
         &mut items,
         &state.http_client,
         tmdb.as_ref(),
@@ -3318,6 +3487,10 @@ async fn get_latest(
         true, // skip_blurhash for list views
     )
     .await;
+    // Jellyfin sets ChildCount on every entry: the new items in a group, else 0.
+    for (item, count) in items.iter_mut().zip(child_counts) {
+        item.child_count = Some(count);
+    }
     Ok(Json(items))
 }
 
@@ -3341,6 +3514,18 @@ async fn resume_page(
     query: &ResumeQuery,
 ) -> Result<Json<QueryResult>, ApiError> {
     let start_index = query.start_index.unwrap_or(0).max(0);
+    let exclude_active =
+        ResumeQuery::flag("excludeActiveSessions", &query.exclude_active_sessions)?
+            .unwrap_or(false);
+    let count_total =
+        ResumeQuery::flag("enableTotalRecordCount", &query.enable_total_record_count)?
+            .unwrap_or(true);
+    // Jellyfin's `excludeActiveSessions`: leave out what the user's sessions are playing.
+    let exclude_ids = if exclude_active {
+        crate::sessions::now_playing_items(state, user).await?
+    } else {
+        Vec::new()
+    };
     let filter = rustyfin_db::repo_media::ResumeFilter {
         include_types: query.include_types(),
         exclude_types: csv(query.exclude_item_types.as_deref()),
@@ -3348,6 +3533,7 @@ async fn resume_page(
         start_index,
         limit: query.limit.filter(|l| *l >= 0),
         hidden_ids_json: HiddenItems::for_caller(state, claims).await?.json(),
+        exclude_ids,
     };
     let (mut items, total) =
         rustyfin_db::repo_media::get_user_resume_items(&state.db_ro, user, &filter).await?;
@@ -3367,7 +3553,7 @@ async fn resume_page(
     .await;
     Ok(Json(QueryResult {
         items,
-        total_record_count: total,
+        total_record_count: if count_total { total } else { 0 },
         start_index,
     }))
 }
@@ -3401,9 +3587,23 @@ struct ResumeQuery {
     exclude_item_types: Option<String>,
     #[serde(default, alias = "MediaTypes")]
     media_types: Option<String>,
+    #[serde(default, alias = "ExcludeActiveSessions")]
+    exclude_active_sessions: Option<String>,
+    #[serde(default, alias = "EnableTotalRecordCount")]
+    enable_total_record_count: Option<String>,
 }
 
 impl ResumeQuery {
+    /// A boolean parameter (`true`/`false` in any case; blank is unset).
+    fn flag(name: &str, value: &Option<String>) -> Result<Option<bool>, ApiError> {
+        value
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(|v| crate::query::parse_bool(name, v))
+            .transpose()
+    }
+
     /// The stored types to list: `IncludeItemTypes`, narrowed to those of `MediaTypes`. Empty means
     /// any type; when the two leave nothing, a type no item has, so nothing is listed.
     fn include_types(&self) -> Vec<String> {
@@ -3544,24 +3744,60 @@ async fn get_filters2(
     Ok(Json(json!({ "Genres": genres, "Tags": [] })))
 }
 
-// User-specific item endpoints (same as global for now; user-specific status comes in Phase 2)
-async fn get_user_items(
+/// The claims a list answers for: the user `user_id` names, under `path_user`'s rules, with that
+/// user's administrator flag, so their play state, favourites, filters and access apply, as in
+/// Jellyfin. No user, the nil id or the caller's own id leaves the claims as they are.
+async fn claims_for_user(
+    state: &AppState,
+    claims: Claims,
+    user_id: Option<Uuid>,
+) -> Result<Claims, ApiError> {
+    let Some(user_id) = user_id.filter(|id| !id.is_nil() && *id != claims.sub) else {
+        return Ok(claims);
+    };
+    path_user(state, &claims, user_id).await?;
+    let user = rustyfin_db::repo_user::get_user_by_id(&state.db_ro, user_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("user not found".into()))?;
+    Ok(Claims {
+        sub: user_id,
+        name: user.name,
+        is_admin: user.is_administrator,
+        ..claims
+    })
+}
+
+/// GET /Items, for the user a `userId` names.
+async fn get_items_for_query_user(
     State(state): State<AppState>,
-    Path(_user_id): Path<Uuid>,
-    Query(query): Query<ItemsQuery>,
+    Query(params): Query<Vec<(String, String)>>,
+    query: Query<ItemsQuery>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Response, ApiError> {
-    // Delegate to get_items with the user's claims
-    get_items(State(state), Query(query), Extension(claims)).await
+    let user_id = crate::query::uuid_param(&params, "userId")?;
+    let claims = claims_for_user(&state, claims, user_id).await?;
+    get_items(State(state), query, Extension(claims)).await
+}
+
+/// GET /Users/{userId}/Items, for that user.
+async fn get_user_items(
+    State(state): State<AppState>,
+    Path(user_id): Path<Uuid>,
+    query: Query<ItemsQuery>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Response, ApiError> {
+    let claims = claims_for_user(&state, claims, Some(user_id)).await?;
+    get_items(State(state), query, Extension(claims)).await
 }
 
 async fn get_user_latest(
     State(state): State<AppState>,
-    Path(_user_id): Path<Uuid>,
-    Query(query): Query<LatestQuery>,
+    Path(user_id): Path<Uuid>,
+    Query(params): Query<Vec<(String, String)>>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<Vec<MediaItem>>, ApiError> {
-    get_latest(State(state), Query(query), Extension(claims)).await
+    let user = path_user(&state, &claims, user_id).await?;
+    latest_page(&state, user, &params).await
 }
 
 async fn get_user_resume(

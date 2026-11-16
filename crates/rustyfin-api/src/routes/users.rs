@@ -152,27 +152,45 @@ async fn get_user(
     }))
 }
 
+/// The sign-in page's user tiles. As in Jellyfin, a hidden user (IsHidden) signs in by typing the
+/// name, and a client outside the local network sees only the users with remote access.
 async fn get_public_users(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
 ) -> Result<Json<Vec<PublicUserDto>>, ApiError> {
     let users = rustyfin_db::repo_user::get_public_users(&state.db_ro).await?;
     let tags = rustyfin_db::repo_user::primary_image_tags(&state.db_ro).await?;
-    // A hidden user (IsHidden) signs in by typing the name, as in Jellyfin.
     let policies = rustyfin_db::repo_parental::all_policies(&state.db_ro).await?;
-    Ok(Json(
-        users
-            .into_iter()
-            .filter(|u| !policies.get(&u.id).is_some_and(|p| p.access.is_hidden))
-            .map(|u| {
-                let primary_image_tag = tags.get(&u.id).cloned();
-                PublicUserDto {
-                    primary_image_tag,
-                    ..PublicUserDto::from(u)
-                }
-            })
-            .collect(),
-    ))
+    let local = resolve_client(peer.ip(), &headers, &state.known_proxies).is_local();
+    let mut out = Vec::with_capacity(users.len());
+    for u in users.into_iter().filter(|u| {
+        policies
+            .get(&u.id)
+            .is_none_or(|p| !p.access.is_hidden && (local || p.access.enable_remote_access))
+    }) {
+        let primary_image_tag = tags.get(&u.id).cloned();
+        // Outside the local network every user reads as having a password, so the internet isn't
+        // shown which accounts open with an empty one (they still sign in with it, as in Jellyfin)
+        let has_password = !local || !rustyfin_auth::is_empty_password_hash(&u.password_hash);
+        out.push(PublicUserDto {
+            primary_image_tag,
+            has_password,
+            has_configured_password: has_password,
+            ..PublicUserDto::from(u)
+        });
+    }
+    Ok(Json(out))
 }
+
+/// Whether the client is on the local network (see `resolve_client`). Password resets start and
+/// finish only there.
+fn client_is_local(state: &AppState, peer: SocketAddr, headers: &HeaderMap) -> bool {
+    resolve_client(peer.ip(), headers, &state.known_proxies).is_local()
+}
+
+/// The message for a reset PIN or reset sent from outside the local network.
+const RESET_IN_NETWORK_REQUIRED: &str = "A password reset is possible only from the local network.";
 
 async fn create_user(
     State(state): State<AppState>,
@@ -506,6 +524,10 @@ fn parental_policy(
         &mut access.force_remote_source_transcoding,
         req.force_remote_source_transcoding,
     );
+    set(
+        &mut access.enable_content_downloading,
+        req.enable_content_downloading,
+    );
     if req.enable_content_deletion.is_some() {
         access.enable_content_deletion = req.enable_content_deletion;
     }
@@ -578,12 +600,13 @@ async fn update_configuration(
 /// timing reveals neither whether the name exists nor whether the reset work was slow.
 const FORGOT_PASSWORD_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// Start a password reset. The response is uniform whether or not the user exists, so it never
-/// reveals account existence, and it never contains the PIN. The PIN is written (mode 0600 on Unix)
+/// Start a password reset. A client outside the local network gets `InNetworkRequired`, as in
+/// Jellyfin. On the local network the response is uniform whether or not the user exists, so it
+/// never reveals account existence, and it never contains the PIN. The PIN is written (mode 0600 on Unix)
 /// to a file under the data dir ONLY when the user exists AND the resolved client (see
 /// `resolve_client`) is on the local network AND the user has no pending or voided reset, since a
-/// new request never replaces an open reset. Every other request gets the same 200 with a file path
-/// that is not created. Every answer comes `FORGOT_PASSWORD_DELAY` (250 ms) after the request
+/// new request never replaces an open reset. Every other local request gets the same 200 with a
+/// file path that is not created. Every answer comes `FORGOT_PASSWORD_DELAY` (250 ms) after the request
 /// reached the handler. The reset work runs in its own task: it finishes before the answer when it
 /// is quick, and in the background when it takes longer.
 async fn forgot_password(
@@ -593,27 +616,36 @@ async fn forgot_password(
     Json(req): Json<ForgotPasswordRequest>,
 ) -> Result<Json<ForgotPasswordResult>, ApiError> {
     let deadline = tokio::time::Instant::now() + FORGOT_PASSWORD_DELAY;
+
+    // Outside the local network Jellyfin answers InNetworkRequired for every name, so the answer
+    // tells only where the client is, and names no path on the server.
+    if !client_is_local(&state, peer, &headers) {
+        tokio::time::sleep_until(deadline).await;
+        return Ok(Json(ForgotPasswordResult {
+            action: "InNetworkRequired".to_string(),
+            pin_file: String::new(),
+            pin_expiration_date: None,
+        }));
+    }
+
     let pin_path = state
         .data_dir
         .join(rustyfin_auth::reset_pin_filename(&req.entered_username));
     let expires_at = (Utc::now() + chrono::Duration::minutes(30)).to_rfc3339();
-
-    if resolve_client(peer.ip(), &headers, &state.known_proxies).is_local() {
-        let handle = tokio::spawn(issue_reset_pin(
-            state.db.clone(),
-            req.entered_username.clone(),
-            pin_path.clone(),
-            expires_at.clone(),
-        ));
-        // Waited for only until the deadline; a slower task is detached and finishes alone.
-        let _ = tokio::time::timeout_at(deadline, handle).await;
-    }
+    let handle = tokio::spawn(issue_reset_pin(
+        state.db.clone(),
+        req.entered_username.clone(),
+        pin_path.clone(),
+        expires_at.clone(),
+    ));
+    // Waited for only until the deadline; a slower task is detached and finishes alone.
+    let _ = tokio::time::timeout_at(deadline, handle).await;
     tokio::time::sleep_until(deadline).await;
 
     Ok(Json(ForgotPasswordResult {
         action: "PinCode".to_string(),
         pin_file: pin_path.to_string_lossy().into_owned(),
-        pin_expiration_date: expires_at,
+        pin_expiration_date: Some(expires_at),
     }))
 }
 
@@ -681,10 +713,20 @@ fn write_reset_file(path: &std::path::Path, contents: &str) -> Result<(), ApiErr
 
 /// Redeem a reset PIN (no username). Success: set the user's password to the PIN itself, revoke all
 /// their tokens, delete the reset file, return `{Success:true, UsersReset:[name]}`. No match → 404.
+/// Outside the local network the PIN is not tried, so wrong guesses from the internet can neither
+/// spend the attempt limit nor void the open resets; the answer is Jellyfin's failed
+/// `PinRedeemResult`.
 async fn reset_password_pin(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(req): Json<ForgotPasswordPinRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    if !client_is_local(&state, peer, &headers) {
+        return Ok(Json(
+            serde_json::json!({ "Success": false, "UsersReset": [] }),
+        ));
+    }
     let uid = rustyfin_auth::redeem_reset_pin(&state.db, &req.pin)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?
@@ -728,8 +770,14 @@ fn remove_reset_pin_files(data_dir: &std::path::Path, name: &str) {
 
 async fn reset_password(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(req): Json<ResetPasswordRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // As for the PIN redeem: from outside the local network no PIN is tried
+    if !client_is_local(&state, peer, &headers) {
+        return Err(ApiError::Forbidden(RESET_IN_NETWORK_REQUIRED.to_string()));
+    }
     // Look up the user by username. An unknown user gets the wrong-PIN error, so the response does
     // not reveal whether the account exists.
     let user = rustyfin_db::repo_user::find_user_for_sign_in(&state.db, &req.username)
