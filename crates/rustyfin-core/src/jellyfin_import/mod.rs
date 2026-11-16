@@ -164,6 +164,9 @@ pub struct UserRow {
     pub target_account: Option<SuggestedMatch>,
     /// What becomes of the user's Jellyfin parental limits.
     pub parental_limits: ParentalLimits,
+    /// The Jellyfin libraries (folder names, or `?<id>`) the user may see in Jellyfin that the
+    /// import matched to no Rustyfin library: the created account doesn't get them.
+    pub libraries_not_carried: Vec<String>,
 }
 
 /// What an import does with a Jellyfin user's parental limits (rating maximum, blocked unrated
@@ -456,7 +459,15 @@ async fn plan_report(
     if let Some(handle) = handle {
         create_users(db, &mut users, rustyfin_users, handle).await?;
     }
-    carry_parental_limits(db, &mut users, &prepared.snapshot.users, handle.is_some()).await?;
+    carry_parental_limits(
+        db,
+        &mut users,
+        &prepared.snapshot.users,
+        &prepared.folders,
+        &path_mappings,
+        handle.is_some(),
+    )
+    .await?;
     let importing: HashSet<Uuid> = users
         .iter()
         .filter(|user| matches!(user.action, UserAction::Match | UserAction::Create))
@@ -781,8 +792,13 @@ async fn carry_parental_limits(
     db: &SqlitePool,
     users: &mut [UserRow],
     jf_users: &[JfUser],
+    folders: &[source::LibraryFolder],
+    pairs: &[PathMapping],
     run: bool,
 ) -> Result<(), ImportError> {
+    let libraries = rustyfin_db::repo_library::get_all_libraries(db)
+        .await
+        .map_err(ImportError::Db)?;
     for row in users.iter_mut() {
         let Some(user) = jf_users.iter().find(|user| user.id == row.jellyfin_id) else {
             continue;
@@ -793,22 +809,100 @@ async fn carry_parental_limits(
         } else {
             row.action == UserAction::Create
         };
+        let mut policy = user.parental.clone().unwrap_or_default();
+        if let Some(access) = &user.access {
+            policy.access = access.clone();
+            if !access.enable_all_folders {
+                let (ids, not_carried) =
+                    map_libraries(&access.enabled_folders, folders, pairs, &libraries);
+                policy.access.enabled_folders = ids;
+                row.libraries_not_carried = not_carried;
+            }
+        }
+        let limited = policy.is_restricted()
+            || !policy.access.enable_remote_access
+            || !policy.access.access_schedules.is_empty();
         row.parental_limits = match &user.parental {
+            // Ratings and tags unread: whether the user had limits is unknown; a created
+            // account still gets the access part below
             None => ParentalLimits::Unknown,
-            Some(policy) if !policy.is_restricted() => ParentalLimits::None,
-            Some(_) if created => ParentalLimits::Carried,
-            Some(_) => ParentalLimits::NotCarried,
+            Some(_) if !limited => ParentalLimits::None,
+            Some(_) if !created => ParentalLimits::NotCarried,
+            Some(_) => ParentalLimits::Carried,
         };
         if run
-            && row.parental_limits == ParentalLimits::Carried
-            && let (Some(policy), Some(account)) = (&user.parental, row.user_id)
+            && created
+            && limited
+            && let Some(account) = row.user_id
         {
-            rustyfin_db::repo_parental::set_policy(db, account, policy)
+            rustyfin_db::repo_parental::set_policy(db, account, &policy)
                 .await
                 .map_err(ImportError::Db)?;
         }
     }
     Ok(())
+}
+
+/// The Rustyfin libraries a Jellyfin user's `EnabledFolders` (library folder names) allow, and
+/// the Jellyfin libraries that match none. A Rustyfin library is allowed only when every one of
+/// its paths lies within the translated media paths of an allowed Jellyfin library, so the
+/// account never sees more than it did in Jellyfin; what can't be matched is left out.
+fn map_libraries(
+    enabled: &[String],
+    folders: &[source::LibraryFolder],
+    pairs: &[PathMapping],
+    libraries: &[rustyfin_model::library::Library],
+) -> (Vec<String>, Vec<String>) {
+    let within = |path: &str, root: &str| {
+        let (path, root) = (path.trim_end_matches('/'), root.trim_end_matches('/'));
+        path == root
+            || path
+                .strip_prefix(root)
+                .is_some_and(|rest| rest.starts_with('/'))
+    };
+    let mut ids = Vec::new();
+    let mut not_carried = Vec::new();
+    // The translated media paths of each allowed Jellyfin library
+    let roots: Vec<(&String, Vec<String>)> = enabled
+        .iter()
+        .map(|name| {
+            let paths = folders
+                .iter()
+                .find(|f| !name.starts_with('?') && f.name == *name)
+                .map(|f| {
+                    f.mblinks
+                        .iter()
+                        .filter_map(|link| paths::translate_path(link, pairs))
+                        .collect()
+                })
+                .unwrap_or_default();
+            (name, paths)
+        })
+        .collect();
+    let all_roots: Vec<&String> = roots.iter().flat_map(|(_, p)| p).collect();
+    for lib in libraries {
+        if !lib.paths.is_empty()
+            && lib
+                .paths
+                .iter()
+                .all(|p| all_roots.iter().any(|root| within(p, root)))
+        {
+            ids.push(lib.id.to_string());
+        }
+    }
+    for (name, paths) in &roots {
+        let matched = libraries.iter().any(|lib| {
+            ids.contains(&lib.id.to_string())
+                && lib
+                    .paths
+                    .iter()
+                    .any(|p| paths.iter().any(|root| within(p, root)))
+        });
+        if !matched {
+            not_carried.push((*name).clone());
+        }
+    }
+    (ids, not_carried)
 }
 
 /// The Users stage of a run (spec 2.7, 2.26): each row to create is matched again against

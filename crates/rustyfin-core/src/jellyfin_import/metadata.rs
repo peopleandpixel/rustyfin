@@ -388,8 +388,12 @@ fn field_writes(
         Some(&row.name),
         blank(Some(row.name.as_str())),
     );
-    // The sort name is lowercased; Replace compares the lowercased values.
-    let forced = text(meta.forced_sort_name.as_deref()).map(|sort| sort.to_lowercase());
+    // A forced sort name gives Jellyfin's lowercased, padded sort name; Replace compares the
+    // lowercased values.
+    let forced_raw = text(meta.forced_sort_name.as_deref());
+    let forced = forced_raw
+        .as_deref()
+        .map(rustyfin_model::sort_name::forced_sort_name);
     let sort_now = row
         .sort_name
         .as_deref()
@@ -401,16 +405,33 @@ fn field_writes(
         sort_now.as_ref(),
         blank(row.sort_name.as_deref()),
     );
-    // Not counted: a written name also moves a sort name that tracked the old name, when Jellyfin
-    // has no forced sort name (spec 5.4).
+    // Not counted: a written name also moves a sort name that tracked the old name, when neither
+    // Jellyfin nor Rustyfin has a forced sort name (spec 5.4).
+    let media_type = match row.media_type.as_str() {
+        "Folder" => rustyfin_model::media::MediaType::Unknown,
+        kind => kind
+            .parse()
+            .unwrap_or(rustyfin_model::media::MediaType::Unknown),
+    };
+    let auto_of = |name: &str| {
+        rustyfin_model::sort_name::item_sort_name(
+            media_type,
+            name,
+            row.parent_index_number,
+            row.index_number,
+            &rustyfin_model::sort_name::current_rules(),
+        )
+    };
     let old_lower = row.name.to_lowercase();
     let sort_auto = match &name {
         Some(new)
             if forced.is_none()
+                && row.forced_sort_name.is_none()
                 && (row.sort_name.is_none()
-                    || row.sort_name.as_deref() == Some(old_lower.as_str())) =>
+                    || row.sort_name.as_deref() == Some(old_lower.as_str())
+                    || row.sort_name.as_deref() == Some(auto_of(&row.name).as_str())) =>
         {
-            Some(new.to_lowercase())
+            Some(auto_of(new))
         }
         _ => None,
     };
@@ -536,6 +557,7 @@ fn field_writes(
     let item = (item_fields > 0 || sort_auto.is_some()).then(|| ItemWrite {
         id,
         name: name.unwrap_or_else(|| row.name.clone()),
+        forced_sort_name: sort_jf.as_ref().and(forced_raw.clone()),
         sort_name: sort_jf.or(sort_auto).or_else(|| row.sort_name.clone()),
         overview: overview.or_else(|| row.overview.clone()),
         tagline: tagline.or_else(|| row.tagline.clone()),

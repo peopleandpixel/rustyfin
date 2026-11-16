@@ -5,7 +5,7 @@
 
 use rustyfin_model::device_profile::{
     CodecProfile, CodecType, DeviceProfile, DirectPlayProfile, EncodingContext, ProfileCondition,
-    ProfileType, StreamProtocol, TranscodingProfile,
+    ProfileType, TranscodingProfile,
 };
 
 use super::conditions::{self, AudioFacts};
@@ -212,12 +212,12 @@ pub(super) fn plan_audio(source: &SourceFacts, options: &VideoOptions<'_>) -> Op
         });
     }
 
-    // The transcode (SB 166-224): the first HLS streaming profile of Type Audio.
-    let Some(tp) = profile.transcoding_profiles.iter().find(|tp| {
-        tp.r#type == ProfileType::Audio
-            && tp.context == EncodingContext::Streaming
-            && tp.protocol == StreamProtocol::Hls
-    }) else {
+    // The transcode (SB 166-224): the first streaming profile of Type Audio, HLS or progressive
+    let Some(tp) = profile
+        .transcoding_profiles
+        .iter()
+        .find(|tp| tp.r#type == ProfileType::Audio && tp.context == EncodingContext::Streaming)
+    else {
         return Some(VideoPlan {
             direct_play: false,
             container: source.container.clone(),

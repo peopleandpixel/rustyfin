@@ -14,15 +14,17 @@
 
 use std::collections::HashSet;
 
-use rustyfin_model::parental::{ParentalPolicy, UNRATED_KIND_OF_TYPE, item_tag_keys, rating_score};
+use rustyfin_model::parental::{
+    AccessPolicy, ParentalPolicy, UNRATED_KIND_OF_TYPE, item_tag_keys, rating_score,
+};
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
 /// Reads a user's parental policy. An unknown user, or the API key's nil id, has none.
 pub async fn get_policy(pool: &SqlitePool, user_id: Uuid) -> Result<ParentalPolicy, sqlx::Error> {
-    let row: Option<(Option<i32>, Option<i32>, String, String, String)> = sqlx::query_as(
+    let row: Option<Row> = sqlx::query_as(
         "SELECT max_parental_rating, max_parental_sub_rating, block_unrated_items, blocked_tags, \
-         allowed_tags FROM users WHERE id = ?",
+         allowed_tags, access_policy FROM users WHERE id = ?",
     )
     .bind(user_id.to_string())
     .fetch_optional(pool)
@@ -34,34 +36,58 @@ pub async fn get_policy(pool: &SqlitePool, user_id: Uuid) -> Result<ParentalPoli
 pub async fn all_policies(
     pool: &SqlitePool,
 ) -> Result<std::collections::HashMap<Uuid, ParentalPolicy>, sqlx::Error> {
-    let rows: Vec<(String, Option<i32>, Option<i32>, String, String, String)> = sqlx::query_as(
+    let rows: Vec<(
+        String,
+        Option<i32>,
+        Option<i32>,
+        String,
+        String,
+        String,
+        String,
+    )> = sqlx::query_as(
         "SELECT id, max_parental_rating, max_parental_sub_rating, block_unrated_items, \
-         blocked_tags, allowed_tags FROM users",
+             blocked_tags, allowed_tags, access_policy FROM users",
     )
     .fetch_all(pool)
     .await?;
     Ok(rows
         .into_iter()
-        .filter_map(|(id, max, sub, unrated, blocked, allowed)| {
+        .filter_map(|(id, max, sub, unrated, blocked, allowed, access)| {
             Some((
                 Uuid::parse_str(&id).ok()?,
-                policy_from_row((max, sub, unrated, blocked, allowed)),
+                policy_from_row((max, sub, unrated, blocked, allowed, access)),
             ))
         })
         .collect())
 }
 
-fn policy_from_row(
-    (max, sub, unrated, blocked, allowed): (Option<i32>, Option<i32>, String, String, String),
-) -> ParentalPolicy {
-    // Only set_policy writes these columns, always as JSON arrays of strings.
+type Row = (Option<i32>, Option<i32>, String, String, String, String);
+
+fn policy_from_row((max, sub, unrated, blocked, allowed, access): Row) -> ParentalPolicy {
+    // Only set_policy writes these columns: JSON arrays of strings, and an AccessPolicy object.
     let list = |s: &str| serde_json::from_str::<Vec<String>>(s).unwrap_or_default();
+    let access = serde_json::from_str::<AccessPolicy>(&access).unwrap_or_else(|e| {
+        // Fail closed: an unreadable policy shows no library, allows no remote access and, by a
+        // schedule whose day is none, no time for a user who isn't an administrator.
+        tracing::warn!(error = %e, "unreadable access policy; the user is locked out");
+        AccessPolicy {
+            enable_all_folders: false,
+            enable_remote_access: false,
+            access_schedules: vec![rustyfin_model::parental::AccessSchedule {
+                day_of_week: "Never".into(),
+                start_hour: 0.0,
+                end_hour: 0.0,
+            }],
+            ..AccessPolicy::default()
+        }
+    });
     ParentalPolicy {
         max_parental_rating: max,
         max_parental_sub_rating: sub,
         block_unrated_items: list(&unrated),
         blocked_tags: list(&blocked),
         allowed_tags: list(&allowed),
+        access,
     }
 }
 
@@ -71,18 +97,30 @@ pub async fn set_policy(
     user_id: Uuid,
     policy: &ParentalPolicy,
 ) -> Result<bool, sqlx::Error> {
+    let mut conn = pool.acquire().await?;
+    write_policy(&mut conn, user_id, policy).await
+}
+
+/// `set_policy` on a connection or in a transaction.
+pub async fn write_policy(
+    conn: &mut sqlx::SqliteConnection,
+    user_id: Uuid,
+    policy: &ParentalPolicy,
+) -> Result<bool, sqlx::Error> {
     let json = |v: &[String]| serde_json::Value::from(v.to_vec()).to_string();
     let done = sqlx::query(
         "UPDATE users SET max_parental_rating = ?, max_parental_sub_rating = ?, \
-         block_unrated_items = ?, blocked_tags = ?, allowed_tags = ? WHERE id = ?",
+         block_unrated_items = ?, blocked_tags = ?, allowed_tags = ?, access_policy = ? \
+         WHERE id = ?",
     )
     .bind(policy.max_parental_rating)
     .bind(policy.max_parental_sub_rating)
     .bind(json(&policy.block_unrated_items))
     .bind(json(&policy.blocked_tags))
     .bind(json(&policy.allowed_tags))
+    .bind(serde_json::to_string(&policy.access).unwrap_or_else(|_| "{}".into()))
     .bind(user_id.to_string())
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     Ok(done.rows_affected() > 0)
 }
@@ -209,13 +247,14 @@ fn fails_on_tags(
     top_level && !allowed.is_empty() && !item_tag_keys(tags).any(|t| allowed.contains(&t))
 }
 
-/// Every item the policy hides, the items under them included, by id as stored. Empty when the
-/// policy hides nothing.
+/// Every item the policy's ratings and tags hide, the items under them included, by id as stored.
+/// Empty when they hide nothing. Library access isn't in this set: `filter_json` and
+/// `visible_sql` apply it per library, which stays small however many items a library holds.
 pub async fn hidden_item_ids(
     pool: &SqlitePool,
     policy: &ParentalPolicy,
 ) -> Result<HashSet<String>, sqlx::Error> {
-    if !policy.is_restricted() {
+    if !policy.filters_items() {
         return Ok(HashSet::new());
     }
     let blocked: HashSet<String> = policy.blocked_tag_keys().into_iter().collect();
@@ -247,6 +286,32 @@ pub async fn hidden_item_ids(
     Ok(ids.into_iter().collect())
 }
 
+/// What a limited user may see, as one JSON parameter for `visible_sql`: `h`, the ids the ratings
+/// and tags hide, and `l`, the library ids the user may see (null for every library). `None` when
+/// nothing is hidden.
+pub fn filter_json(hidden: &HashSet<String>, folders: Option<&[String]>) -> Option<String> {
+    if hidden.is_empty() && folders.is_none() {
+        return None;
+    }
+    let folders = folders.map(|ids| {
+        ids.iter()
+            .map(|id| id.to_ascii_lowercase())
+            .collect::<Vec<_>>()
+    });
+    Some(serde_json::json!({ "h": hidden, "l": folders }).to_string())
+}
+
+/// The SQL condition that an item (id column `id`, library column `lib`) passes the filter
+/// `filter_json` made, bound as `param` (a numbered parameter such as `?4`, which may appear more
+/// than once). A NULL filter passes every item.
+pub fn visible_sql(id: &str, lib: &str, param: &str) -> String {
+    format!(
+        "({param} IS NULL OR ({id} NOT IN (SELECT value FROM json_each({param}, '$.h')) \
+         AND (json_type({param}, '$.l') IS NOT 'array' \
+              OR {lib} IN (SELECT value FROM json_each({param}, '$.l')))))"
+    )
+}
+
 /// Whether the policy hides this item: it or an item above it fails. An id that isn't a media
 /// item (a library, person, genre or collection) is never hidden by this check.
 pub async fn is_item_hidden(
@@ -255,6 +320,22 @@ pub async fn is_item_hidden(
     item_id: Uuid,
 ) -> Result<bool, sqlx::Error> {
     if !policy.is_restricted() {
+        return Ok(false);
+    }
+    if policy.enabled_folders().is_some() {
+        // A library, or an item in one, that the user may not see.
+        let library: Option<String> = sqlx::query_scalar(
+            "SELECT library_id FROM media_items WHERE id = ?1 \
+             UNION ALL SELECT id FROM libraries WHERE id = ?1 LIMIT 1",
+        )
+        .bind(item_id.to_string())
+        .fetch_optional(pool)
+        .await?;
+        if library.is_some_and(|lib| !policy.allows_folder(&lib)) {
+            return Ok(true);
+        }
+    }
+    if !policy.filters_items() {
         return Ok(false);
     }
     // The item and every item above it, nearest first.
@@ -369,6 +450,7 @@ mod tests {
             block_unrated_items: vec!["Movie".into()],
             blocked_tags: vec!["horror".into()],
             allowed_tags: vec!["kids".into()],
+            access: Default::default(),
         }
     }
 

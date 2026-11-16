@@ -112,6 +112,7 @@ const MUSIC_TABS = [
     ['albums', 'music.tab_albums'],
     ['albumartists', 'music.tab_album_artists'],
     ['artists', 'music.tab_artists'],
+    ['playlists', 'music.tab_playlists'],
     ['songs', 'music.tab_songs'],
     ['genres', 'music.tab_genres'],
 ];
@@ -162,6 +163,15 @@ function musicTabRequest(libId, tab, start, genreId) {
         return { path: '/Artists', query: { ParentId: libId, ...paging } };
     case 'genres':
         return { path: '/MusicGenres', query: { ParentId: libId, SortBy: 'SortName', SortOrder: 'Ascending', ...paging } };
+    // The playlists holding the library's music (the server's library-scoped listing)
+    case 'playlists':
+        return {
+            path: '/Items',
+            query: {
+                ParentId: libId, IncludeItemTypes: 'Playlist', Recursive: true, SortBy: 'SortName', SortOrder: 'Ascending',
+                Fields: 'ChildCount', ...paging,
+            },
+        };
     case 'songs':
         return {
             path: '/Items',

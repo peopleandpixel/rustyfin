@@ -26,6 +26,7 @@ Rustyfin wird über Umgebungsvariablen konfiguriert. Es sind keine Konfiguration
 | `RUSTYFIN_NETWORK_READ_JOBS` | Wie viele Hintergrundaufträge, die eine ganze Mediendatei lesen (Intro-Erkennung), gleichzeitig von einer Netzwerkfreigabe lesen. Ein solcher Lesevorgang lastet die Leitung meist schon aus; weitere gleichzeitig bringen nur Suchzugriffe und Speicherbedarf. Als lokal gelten die Dateisysteme, die auch die Ordnerüberwachung als lokal kennt (ext4, xfs, btrfs, zfs usw.), und FUSE-Pools aus lokalen Platten: `fuse.mergerfs` und `fuse.shfs` (die Benutzerfreigaben von Unraid). Alles andere gilt als Netzwerkfreigabe: NFS, SMB, FUSE-Einhängungen entfernter Speicher wie rclone (`fuse.rclone`) und sshfs (`fuse.sshfs`) sowie ein Dateisystem, dessen Typ sich nicht lesen lässt. Für eine schnelle Netzwerkfreigabe kann man den Wert erhöhen; lokale Platten begrenzt nur `RUSTYFIN_IMAGE_JOBS`. Erlaubt sind 1 bis 16 | 1 |
 | `RUST_LOG` | Log-Level-Filter (z.B. `debug`, `info`, `rustyfin=trace`) | `info` |
 | `RUSTYFIN_LOG_HISTORY` | Anzahl der letzten Log-Zeilen, die das Live-Log der Verwaltung beim Öffnen erhält (`0` behält keine, höchstens `100000`; je Zeile bis zu 8 KiB) | `1000` |
+| `TZ` | Zeitzone des Servers (z.B. `Europe/Berlin`). Die Zugriffszeiten der Benutzer gelten in dieser Zeit, siehe [Zugriffszeiten](#zugriffszeiten) | Zeitzone des Systems; in einem Container ohne `TZ` meist UTC |
 
 ## Beispielkonfigurationen
 
@@ -141,6 +142,10 @@ curl -H "Authorization: MediaBrowser Token=<api-key>" \
 ### Quick Connect
 
 Quick Connect ermöglicht die Anmeldung ohne Passwort über einen temporären Code. Diese Funktion ist standardmäßig aktiviert.
+
+### Zugriffszeiten
+
+Ein Administrator kann einem Benutzer Zugriffszeiten geben (Verwaltung → Benutzer → Bearbeiten → Jugendschutz). Außerhalb dieser Zeiten kann sich ein Benutzer, der kein Administrator ist, nicht anmelden, und jede Anfrage wird mit 403 abgelehnt, wie bei Jellyfin. Die Zeiten gelten in der Ortszeit des Servers: Setze `TZ` (z.B. `TZ=Europe/Berlin`), sonst rechnet ein Container meist in UTC. Das Docker-Image enthält die Zeitzonendaten (`tzdata`).
 
 ## Logging
 

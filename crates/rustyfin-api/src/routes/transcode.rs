@@ -10,7 +10,9 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use rustyfin_core::subtitle::is_image_subtitle;
-use rustyfin_core::transcode::{HwAccel, ImageSubtitle, TranscodeError, TranscodeProfile};
+use rustyfin_core::transcode::{
+    HwAccel, ImageSubtitle, TranscodeError, TranscodeProfile, audio_encoder, video_encoder,
+};
 use rustyfin_model::media_source::{MediaSourceResponse, MediaStream};
 
 use super::streaming::{
@@ -731,6 +733,87 @@ fn transcode_profile(query: TranscodeQuery, source: &SourceInfo) -> TranscodePro
     profile
 }
 
+/// The query's track indexes, which a client writes in Jellyfin's numbering (external subtitle
+/// files first), as indexes in `source`'s file. An external subtitle names no stream of the
+/// file: no burn-in.
+pub(crate) async fn to_file_numbering(
+    mut query: TranscodeQuery,
+    source: Option<&MediaSourceResponse>,
+) -> TranscodeQuery {
+    let externals = match source {
+        Some(source) => crate::routes::subtitle::external_count(source),
+        None => 0,
+    };
+    let convert = |index: Option<i32>| {
+        index.map(|index| crate::routes::subtitle::file_index(index, externals).unwrap_or(-1))
+    };
+    query.audio_stream_index = convert(query.audio_stream_index);
+    query.subtitle_stream_index = convert(query.subtitle_stream_index);
+    query
+}
+
+/// The profile of a progressive video transcode (`/Videos/{id}/stream` without `static=true`):
+/// the HLS rules for tracks, burn-in and the H.264/AAC copies, then the client's own codec lists.
+/// A listed source codec is copied (the video only without a burn-in and within the size and
+/// bitrate limits), and what is encoded uses the first listed codec Rustyfin encodes, else H.264
+/// and AAC.
+pub(crate) fn progressive_video_profile(
+    query: TranscodeQuery,
+    params: &HashMap<String, String>,
+    source: Option<&MediaSourceResponse>,
+) -> TranscodeProfile {
+    let query = query.with_codec_options(params);
+    let info = source.map_or_else(SourceInfo::default, SourceInfo::from_source);
+    let listed = |list: Option<&str>| -> Vec<String> {
+        list.unwrap_or_default()
+            .split(',')
+            .map(|codec| codec.trim().to_ascii_lowercase())
+            .filter(|codec| !codec.is_empty())
+            .collect()
+    };
+    let video_codecs = listed(query.video_codec.as_deref());
+    let audio_codecs = listed(query.audio_codec.as_deref());
+    let tracks = choose_tracks(&query, &info);
+    let audio_track = tracks
+        .audio
+        .and_then(|index| info.audio.iter().find(|track| track.index == index));
+    let fits_video = size_fits(query.max_width, info.width)
+        && size_fits(query.max_height, info.height)
+        && bitrate_fits(query.video_bitrate, info.video_bitrate);
+    let audio_fits = audio_track.is_some_and(|track| {
+        bitrate_fits(query.audio_bitrate, track.bitrate.or(info.audio_bitrate))
+    });
+    let mut profile = transcode_profile(query, &info);
+    if !profile.copy_video
+        && tracks.burn_in.is_none()
+        && !profile.audio_only
+        && !info.interlaced
+        && fits_video
+        && info
+            .video_codec
+            .as_ref()
+            .is_some_and(|codec| video_codecs.contains(codec) && !is_hevc(&info))
+        && !matches!(info.video_codec.as_deref(), Some("h264" | "avc" | "avc1"))
+    {
+        profile.copy_video = true;
+    }
+    if !profile.copy_audio
+        && audio_fits
+        && audio_track.is_some_and(|track| audio_codecs.contains(&track.codec))
+    {
+        profile.copy_audio = true;
+    }
+    if let Some(encoder) = video_codecs.iter().find_map(|c| video_encoder(c)) {
+        profile.video_codec = encoder.to_string();
+    }
+    if let Some(encoder) = audio_codecs.iter().find_map(|c| audio_encoder(c)) {
+        profile.audio_codec = encoder.to_string();
+    }
+    // One output file, no segments
+    profile.fmp4 = false;
+    profile
+}
+
 /// ffmpeg's input for `version` of an item at `item_path`, and the source whose streams decide
 /// stream copy.
 fn hls_input<'a>(
@@ -746,6 +829,8 @@ fn hls_input<'a>(
 
 async fn hls_master_playlist(
     State(state): State<AppState>,
+    claims: Option<axum::Extension<rustyfin_model::auth::Claims>>,
+    local: Option<axum::Extension<crate::middleware::ClientIsLocal>>,
     Path(id): Path<Uuid>,
     Query(query): Query<TranscodeQuery>,
     Query(params): Query<HashMap<String, String>>,
@@ -766,6 +851,7 @@ async fn hls_master_playlist(
     // ffmpeg reads only a file that the streams' library check passes, by its resolved path
     let input_path = validate_path_against_library(&state, input_path).await?;
     let input_path = input_path.as_str();
+    let mut query = to_file_numbering(query, source).await;
 
     // Copy only what the client plays; with no source to read, nothing is copied
     let mut info = source.map_or_else(SourceInfo::default, SourceInfo::from_source);
@@ -773,8 +859,26 @@ async fn hls_master_playlist(
     if is_hevc(&info) && client_lists(query.video_codec.as_deref(), &HEVC_NAMES) {
         info.hevc = hevc_facts(input_path).await;
     }
+    // The caller's policy: the remote bitrate limit before the copy decision, then whether the
+    // stream that decision makes (a transcode or a remux) is allowed
+    let access = match &claims {
+        Some(axum::Extension(claims)) => crate::parental::caller_access(&state, claims).await?,
+        None => Default::default(),
+    };
+    let local = local.is_none_or(|axum::Extension(l)| l.0);
+    if matches!(item.media_type, rustyfin_model::media::MediaType::Audio) {
+        query.audio_bitrate = crate::parental::remote_bitrate(&access, local, query.audio_bitrate);
+    } else {
+        query.video_bitrate = crate::parental::remote_bitrate(&access, local, query.video_bitrate);
+    }
     let tracks = choose_tracks(&query, &info);
     let (copy_video, copy_audio) = stream_copy(&query, &info);
+    crate::parental::check_conversion(
+        &access,
+        matches!(item.media_type, rustyfin_model::media::MediaType::Audio),
+        copy_video,
+        copy_audio,
+    )?;
     // Every playlist reload passes here; the manager logs the ffmpeg command when it starts one
     tracing::debug!(
         item = %id,

@@ -17,8 +17,8 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use uuid::Uuid;
 
 use rustyfin_core::subtitle::{
-    OpenSubtitlesConfig, discover_external_subtitles, download_subtitle, is_image_subtitle,
-    shift_srt, shift_vtt, srt_to_vtt, strip_ass_blocks,
+    OpenSubtitlesConfig, download_subtitle, is_image_subtitle, shift_srt, shift_vtt, srt_to_vtt,
+    strip_ass_blocks,
 };
 use rustyfin_model::media_source::{MediaSourceResponse, MediaStream};
 
@@ -113,17 +113,30 @@ async fn external_subtitle(
     index: usize,
 ) -> Result<rustyfin_core::subtitle::ExternalSubtitle, ApiError> {
     validate_path_against_library(state, &item.path).await?;
-    let media_path = PathBuf::from(&item.path);
-    let sub = tokio::task::spawn_blocking(move || discover_external_subtitles(&media_path))
-        .await
-        .unwrap_or_default()
+    // The item's first source, numbered as PlaybackInfo numbers it: `index` is a stream number
+    // a client got there, and names an external file
+    let mut source = rustyfin_db::repo_media_source::get_media_sources(&state.db_ro, &item.id)
+        .await?
         .into_iter()
-        .find(|s| s.index == index)
+        .next()
         .ok_or_else(|| ApiError::NotFound(format!("Subtitle index {index} not found")))?;
-    let path = validate_path_against_library(state, &sub.path.to_string_lossy()).await?;
+    number_streams(&mut source);
+    let stream = source
+        .media_streams
+        .into_iter()
+        .find(|s| usize::try_from(s.index) == Ok(index) && s.is_external)
+        .ok_or_else(|| ApiError::NotFound(format!("Subtitle index {index} not found")))?;
+    let stored = stream.path.unwrap_or_default();
+    let path = validate_path_against_library(state, &stored).await?;
+    let format = std::path::Path::new(&stored)
+        .extension()
+        .map(|ext| ext.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
     Ok(rustyfin_core::subtitle::ExternalSubtitle {
         path: PathBuf::from(path),
-        ..sub
+        language: stream.language,
+        format,
+        index,
     })
 }
 
@@ -201,89 +214,60 @@ async fn source_subtitle_vtt_from(
     subtitle_vtt(&state, id, &media_source_id, index, start_ticks, &format).await
 }
 
-/// The external subtitle files of `source` that its streams do not list, as subtitle streams
-/// numbered after the highest stream index, in file-name order. The directory is read on a
-/// blocking thread, so the async workers do not wait on it; a failed task gives no files.
-pub(crate) async fn external_streams(source: &MediaSourceResponse) -> Vec<MediaStream> {
-    let media_path = PathBuf::from(&source.path);
-    let found = tokio::task::spawn_blocking(move || discover_external_subtitles(&media_path))
-        .await
-        .unwrap_or_default();
-    streams_of(source, found)
-}
-
-/// How many folders `add_external_streams` reads at once.
-const FOLDER_READS_AT_ONCE: usize = 8;
-
-/// Adds to each of `sources` the external subtitle streams `external_streams` gives it, reading
-/// each folder once however many sources sit in it, at most `FOLDER_READS_AT_ONCE` at a time.
+/// Numbers each of `sources` as Jellyfin does (`number_streams`).
 pub(crate) async fn add_external_streams(sources: &mut [&mut MediaSourceResponse]) {
-    use futures_util::StreamExt;
-
-    let mut folders: Vec<PathBuf> = sources
-        .iter()
-        .filter_map(|source| std::path::Path::new(&source.path).parent())
-        .map(PathBuf::from)
-        .collect();
-    folders.sort();
-    folders.dedup();
-    let listings: HashMap<PathBuf, Vec<PathBuf>> = futures_util::stream::iter(folders)
-        .map(|folder| async move {
-            let read = folder.clone();
-            let files = tokio::task::spawn_blocking(move || {
-                rustyfin_core::subtitle::subtitle_files_in(&read)
-            })
-            .await
-            .unwrap_or_default();
-            (folder, files)
-        })
-        .buffer_unordered(FOLDER_READS_AT_ONCE)
-        .collect()
-        .await;
     for source in sources.iter_mut() {
-        let media_path = std::path::Path::new(&source.path);
-        let Some(files) = media_path.parent().and_then(|folder| listings.get(folder)) else {
-            continue;
-        };
-        let found = rustyfin_core::subtitle::external_subtitles_among(media_path, files);
-        let streams = streams_of(source, found);
-        source.media_streams.extend(streams);
+        number_streams(source);
     }
 }
 
-/// `found`, the external subtitle files of `source`, as subtitle streams: those its streams
-/// don't list, numbered after its highest stream index.
-fn streams_of(
-    source: &MediaSourceResponse,
-    found: Vec<rustyfin_core::subtitle::ExternalSubtitle>,
-) -> Vec<MediaStream> {
-    let listed: Vec<PathBuf> = source
+/// Numbers `source`'s streams as Jellyfin does (`number_streams`).
+pub(crate) async fn with_external_streams(source: &mut MediaSourceResponse) {
+    number_streams(source);
+}
+
+/// Numbers a stored source's streams as Jellyfin does: its external subtitle files first (0, 1,
+/// ..., in the order the scan stored them), then the embedded streams, each at its index in the
+/// file plus the number of external files. The streams are listed in that order. The external
+/// files are the ones the last scan found, as in Jellyfin, so a file added since doesn't move
+/// the numbers a client has; no folder is read. `file_index` turns a number back.
+pub(crate) fn number_streams(source: &mut MediaSourceResponse) {
+    let streams = std::mem::take(&mut source.media_streams);
+    let (mut external, embedded): (Vec<_>, Vec<_>) =
+        streams.into_iter().partition(|stream| stream.is_external);
+    external.sort_by_key(|stream| stream.index);
+    let count = external.len() as i32;
+    for (k, stream) in external.iter_mut().enumerate() {
+        stream.index = k as i32;
+    }
+    source.media_streams = external;
+    source
+        .media_streams
+        .extend(embedded.into_iter().map(|stream| MediaStream {
+            index: stream.index + count,
+            ..stream
+        }));
+}
+
+/// How many external subtitle streams a stored `source` has: the embedded streams come after
+/// them in Jellyfin's numbering.
+pub(crate) fn external_count(source: &MediaSourceResponse) -> i32 {
+    source
         .media_streams
         .iter()
-        .filter_map(|stream| stream.path.as_deref().map(PathBuf::from))
-        .collect();
-    let first = source
-        .media_streams
-        .iter()
-        .map(|stream| stream.index)
-        .max()
-        .unwrap_or(-1)
-        + 1;
-    found
-        .into_iter()
-        .filter(|file| !listed.contains(&file.path))
-        .enumerate()
-        .map(|(k, file)| MediaStream {
-            index: first + k as i32,
-            codec: Some(file.format),
-            codec_type: "subtitle".to_string(),
-            language: file.language,
-            is_external: true,
-            path: Some(file.path.to_string_lossy().into_owned()),
-            r#type: MediaStream::stream_type("subtitle", None),
-            ..Default::default()
-        })
-        .collect()
+        .filter(|s| s.is_external)
+        .count() as i32
+}
+
+/// The index in the file of the embedded stream a client names by `index` in Jellyfin's
+/// numbering, with `externals` external streams before the embedded ones. A negative index stays
+/// as it is (no stream, or the default); an external stream's is None.
+pub(crate) fn file_index(index: i32, externals: i32) -> Option<i32> {
+    match index {
+        index if index < 0 => Some(index),
+        index if index < externals => None,
+        index => Some(index - externals),
+    }
 }
 
 /// The WebVTT of subtitle stream `index` of media source `media_source_id` of item `id`, from
@@ -325,12 +309,18 @@ async fn subtitle_vtt(
         ))
     })?;
 
-    // The stream: an embedded one, or an external one, which must name its file
-    let external = external_streams(source).await;
-    let stream = source
+    // The stream, in Jellyfin's numbering: an embedded one, or an external one, which must name
+    // its file
+    let mut numbered = source.clone();
+    with_external_streams(&mut numbered).await;
+    let externals = numbered
         .media_streams
         .iter()
-        .chain(&external)
+        .filter(|s| s.is_external)
+        .count() as i32;
+    let stream = numbered
+        .media_streams
+        .iter()
         .find(|s| s.index == index && s.codec_type.eq_ignore_ascii_case("subtitle"))
         .filter(|s| !s.is_external || s.path.is_some())
         .ok_or_else(|| ApiError::NotFound(format!("Subtitle stream {index} not found")))?;
@@ -346,7 +336,10 @@ async fn subtitle_vtt(
         let path = stream.path.as_deref().unwrap_or_default();
         (PathBuf::from(path), "0:s:0".to_string())
     } else {
-        (PathBuf::from(&source.path), format!("0:{index}"))
+        (
+            PathBuf::from(&source.path),
+            format!("0:{}", index - externals),
+        )
     };
     // The input is read only when the streams' library check passes for it, by its resolved path
     let input =
@@ -378,10 +371,11 @@ async fn subtitle_vtt(
         })
         .collect();
     let cache_dir = state.data_dir.join("cache").join("subtitle-vtt");
-    // One cache file per stream; its stamp names the input it was made from
+    // One cache file per stream; its stamp names the input it was made from and the stream in
+    // the file (`m`), so a file cached under the old numbering (external files last) is made again
     let cache_file = cache_dir.join(format!("v1-{source_key}-{index}.{}", output.extension));
     let input_hash = fnv1a(input.as_os_str().as_encoded_bytes());
-    let stamp = format!("{input_hash:016x}-{}-{mtime}", meta.len());
+    let stamp = format!("{input_hash:016x}-{}-{mtime}-m{map}", meta.len());
 
     // The WebVTT text: from the cache, or from one ffmpeg conversion per cache file at a time
     let text = match read_cached(&cache_file, &stamp).await {
@@ -918,6 +912,7 @@ async fn download_remote_subtitle(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustyfin_core::subtitle::discover_external_subtitles;
     use rustyfin_model::media_source::{MediaSourceResponse, MediaStream};
     use std::path::Path;
     use std::sync::atomic::AtomicUsize;
@@ -985,32 +980,35 @@ mod tests {
         "Other.srt",
     ];
 
-    #[tokio::test]
-    async fn test_external_streams_follow_the_highest_index() {
+    /// The scan stores a video's subtitle files after its streams, in file-name order, as
+    /// external subtitle streams (`probe::add_external_subtitles`).
+    #[test]
+    fn r3gaps2_the_scan_stores_the_subtitle_files() {
         let folder = Folder::with(&FILES);
-        let source = source(
+        let mut stored = source(
             &folder,
             json!([
                 { "Index": 0, "CodecType": "video", "Codec": "h264" },
-                { "Index": 2, "CodecType": "subtitle", "Codec": "subrip" },
                 { "Index": 1, "CodecType": "audio", "Codec": "aac" },
+                { "Index": 2, "CodecType": "subtitle", "Codec": "subrip" },
             ]),
         );
-        let streams = external_streams(&source).await;
+        let found = discover_external_subtitles(Path::new(&folder.path("Film.mkv")));
+        rustyfin_core::probe::add_external_subtitles(&mut stored, found);
         let (eng, ger, plain) = (
             folder.path("Film.eng.srt"),
             folder.path("Film.ger.ass"),
             folder.path("Film.srt"),
         );
         assert_eq!(
-            summary(&streams),
+            summary(&stored.media_streams[3..]),
             vec![
                 (3, Some("srt"), Some("eng"), Some(eng.as_str())),
                 (4, Some("ass"), Some("ger"), Some(ger.as_str())),
                 (5, Some("srt"), None, Some(plain.as_str())),
             ]
         );
-        for stream in &streams {
+        for stream in &stored.media_streams[3..] {
             assert_eq!(stream.codec_type, "subtitle");
             assert_eq!(stream.r#type.as_deref(), Some("Subtitle"));
             assert!(stream.is_external);
@@ -1019,88 +1017,51 @@ mod tests {
         }
     }
 
+    /// Jellyfin's numbering: the stored external files first, then the embedded streams moved
+    /// up by their count, in that order; `file_index` and `external_count` turn it back. A file
+    /// added beside the video since the scan changes nothing (no folder is read).
     #[tokio::test]
-    async fn test_external_streams_skip_files_the_source_lists() {
+    async fn r3gaps2_external_subtitles_are_numbered_first() {
         let folder = Folder::with(&FILES);
-        let source = source(
+        let mut stored = source(
             &folder,
             json!([
                 { "Index": 0, "CodecType": "video", "Codec": "h264" },
-                {
-                    "Index": 7,
-                    "CodecType": "subtitle",
-                    "Codec": "srt",
-                    "IsExternal": true,
-                    "Path": folder.path("Film.eng.srt"),
-                },
+                { "Index": 1, "CodecType": "audio", "Codec": "aac" },
+                { "Index": 2, "CodecType": "subtitle", "Codec": "subrip" },
             ]),
         );
-        let (ger, plain) = (folder.path("Film.ger.ass"), folder.path("Film.srt"));
+        let found = discover_external_subtitles(Path::new(&folder.path("Film.mkv")));
+        rustyfin_core::probe::add_external_subtitles(&mut stored, found);
+        std::fs::write(folder.path("Film.added-later.srt"), "").unwrap();
+        let mut numbered = stored.clone();
+        with_external_streams(&mut numbered).await;
+        let order: Vec<(i32, bool, Option<&str>)> = numbered
+            .media_streams
+            .iter()
+            .map(|s| (s.index, s.is_external, s.codec.as_deref()))
+            .collect();
         assert_eq!(
-            summary(&external_streams(&source).await),
+            order,
             vec![
-                (8, Some("ass"), Some("ger"), Some(ger.as_str())),
-                (9, Some("srt"), None, Some(plain.as_str())),
+                (0, true, Some("srt")),
+                (1, true, Some("ass")),
+                (2, true, Some("srt")),
+                (3, false, Some("h264")),
+                (4, false, Some("aac")),
+                (5, false, Some("subrip")),
             ]
         );
-    }
+        assert_eq!(external_count(&stored), 3);
+        assert_eq!(file_index(5, 3), Some(2));
+        assert_eq!(file_index(4, 3), Some(1));
+        assert_eq!(file_index(1, 3), None);
+        assert_eq!(file_index(-1, 3), Some(-1));
 
-    #[tokio::test]
-    async fn r3playback_folders_read_once_give_the_same_streams() {
-        // Two films in one folder, one in another, and a source whose folder is gone
-        let shared = Folder::with(&[
-            "Film.mkv",
-            "Film.en.srt",
-            "Other.mkv",
-            "Other.de.ass",
-            "Other.srt",
-        ]);
-        let alone = Folder::with(&["Film.mkv", "Film.fr.vtt"]);
-        let with_path = |folder: &Folder, name: &str, streams: serde_json::Value| {
-            let mut source = source(folder, streams);
-            source.path = folder.path(name);
-            source
-        };
-        let mut sources = vec![
-            with_path(
-                &shared,
-                "Film.mkv",
-                json!([{"Index": 0, "CodecType": "video"}]),
-            ),
-            with_path(&shared, "Other.mkv", json!([])),
-            with_path(&alone, "Film.mkv", json!([])),
-        ];
-        let mut gone = sources[2].clone();
-        gone.path = "/nonexistent-r3/Film.mkv".to_string();
-        sources.push(gone);
-        let mut expected = Vec::new();
-        for source in &sources {
-            expected.push(external_streams(source).await);
-        }
-        let mut batched = sources.clone();
-        let mut refs: Vec<&mut MediaSourceResponse> = batched.iter_mut().collect();
-        add_external_streams(&mut refs).await;
-        for (i, (source, before)) in batched.iter().zip(&sources).enumerate() {
-            let added = &source.media_streams[before.media_streams.len()..];
-            assert_eq!(summary(added), summary(&expected[i]), "source {i}");
-        }
-        assert_eq!(expected[1].len(), 2);
-        assert!(expected[3].is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_external_streams_of_a_source_without_streams_start_at_zero() {
-        let folder = Folder::with(&FILES);
-        let indexes: Vec<i32> = external_streams(&source(&folder, json!([])))
-            .await
-            .iter()
-            .map(|s| s.index)
-            .collect();
-        assert_eq!(indexes, vec![0, 1, 2]);
-
-        // No subtitle files: nothing
-        let bare = Folder::with(&["Film.mkv"]);
-        assert!(external_streams(&source(&bare, json!([]))).await.is_empty());
+        // A source without subtitle files keeps its numbers
+        let mut bare = source(&folder, json!([{ "Index": 0, "CodecType": "video" }]));
+        with_external_streams(&mut bare).await;
+        assert_eq!(bare.media_streams[0].index, 0);
     }
 
     #[test]

@@ -94,6 +94,7 @@ pub fn plan_users(
                 match_kind: None,
                 target_account: None,
                 parental_limits: Default::default(),
+                libraries_not_carried: Vec::new(),
             }
         })
         .collect();

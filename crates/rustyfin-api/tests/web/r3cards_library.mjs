@@ -175,7 +175,7 @@ test('the view menu and the tab bars', () => {
     assert.deepEqual([...tv.matchAll(/data-id="([^"]+)"/g)].map(m => m[1]), ['shows', 'shows/episodes', 'shows/genres']);
     assert.match(tv, /aria-selected="true" data-action="navigate" data-page="library" data-id="shows\/episodes"/);
     const films = fns.libraryTabBar('films', 'Movies', 'main');
-    assert.deepEqual([...films.matchAll(/data-id="([^"]+)"/g)].map(m => m[1]), ['films', 'films/genres']);
+    assert.deepEqual([...films.matchAll(/data-id="([^"]+)"/g)].map(m => m[1]), ['films', 'films/collections', 'films/genres']);
     assert.match(films, /library.tab_movies/);
 });
 

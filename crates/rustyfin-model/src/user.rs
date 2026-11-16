@@ -80,13 +80,13 @@ impl UserDto {
     }
 }
 
-/// Jellyfin's `UserPolicy` for an account. Rustyfin has no per-user library, device or feature
-/// restrictions, so every access flag is on but downloading, which Rustyfin has no route for; the
-/// flags for what only administrators may do here (deleting items, managing collections and
-/// subtitles, controlling others' sessions) follow `is_admin`. The parental fields
-/// (`MaxParentalRating`, `MaxParentalSubRating`, `BlockUnratedItems`, `BlockedTags`,
-/// `AllowedTags`) come from `parental`. `POST /Users/{id}/Policy` reads back `IsAdministrator`,
-/// `IsDisabled` and those parental fields.
+/// Jellyfin's `UserPolicy` for an account. Rustyfin has no per-user device or channel
+/// restrictions, so those flags are on, and downloading is off, which Rustyfin has no route for;
+/// the flags for what only administrators may do here (managing collections and subtitles,
+/// controlling others' sessions) follow `is_admin`. The parental fields and the access fields
+/// (libraries, schedules, hidden, remote access, playback, transcoding, deletion, session and
+/// bitrate limits) come from `parental`, and `POST /Users/{id}/Policy` reads them back with
+/// `IsAdministrator` and `IsDisabled`.
 pub fn jellyfin_policy(
     is_admin: bool,
     is_disabled: bool,
@@ -223,8 +223,20 @@ pub struct UpdatePolicyRequest {
     pub blocked_tags: Option<Option<Vec<String>>>,
     #[serde(default, deserialize_with = "present")]
     pub allowed_tags: Option<Option<Vec<String>>>,
-    #[serde(default)]
-    pub access_schedules: Option<Vec<serde_json::Value>>,
+    /// The access fields (`AccessPolicy`): absent or null leaves the stored value.
+    pub access_schedules: Option<Vec<crate::parental::AccessSchedule>>,
+    pub enable_all_folders: Option<bool>,
+    pub enabled_folders: Option<Vec<String>>,
+    pub is_hidden: Option<bool>,
+    pub enable_remote_access: Option<bool>,
+    pub enable_media_playback: Option<bool>,
+    pub enable_audio_playback_transcoding: Option<bool>,
+    pub enable_video_playback_transcoding: Option<bool>,
+    pub enable_playback_remuxing: Option<bool>,
+    pub force_remote_source_transcoding: Option<bool>,
+    pub enable_content_deletion: Option<bool>,
+    pub max_active_sessions: Option<i32>,
+    pub remote_client_bitrate_limit: Option<i64>,
 }
 
 /// A field that is present, null or not: `Some(None)` for null, while an absent field stays `None`.

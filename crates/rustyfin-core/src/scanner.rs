@@ -1011,7 +1011,7 @@ async fn scan_flat_library(
             let item = MediaItem {
                 id: Uuid::new_v4(),
                 name: file_name.clone(),
-                sort_name: Some(file_name.to_lowercase()),
+                sort_name: auto_sort_name(media_type, &file_name, None, None),
                 overview: None,
                 media_type,
                 path: file_path.clone(),
@@ -1069,7 +1069,7 @@ async fn scan_flat_library(
                 let item = MediaItem {
                     id: Uuid::new_v4(),
                     name: group.title.clone(),
-                    sort_name: Some(group.title.to_lowercase()),
+                    sort_name: auto_sort_name(MediaType::Movie, &group.title, None, None),
                     overview: None,
                     media_type: MediaType::Movie,
                     path,
@@ -1297,7 +1297,7 @@ async fn scan_tv_library(
                 };
                 let series_item = MediaItem {
                     id,
-                    sort_name: Some(name.to_lowercase()),
+                    sort_name: auto_sort_name(MediaType::Series, &name, None, None),
                     name,
                     overview: None,
                     media_type: MediaType::Series,
@@ -1556,8 +1556,13 @@ async fn scan_tv_library(
                 let date_created = date_added(Path::new(&path)).await;
                 let item = MediaItem {
                     id: Uuid::new_v4(),
+                    sort_name: auto_sort_name(
+                        MediaType::Episode,
+                        &name,
+                        group.parent_index_number,
+                        group.index_number,
+                    ),
                     name: name.clone(),
-                    sort_name: Some(name.to_lowercase()),
                     overview: None,
                     media_type: MediaType::Episode,
                     path,
@@ -2107,7 +2112,7 @@ async fn scan_music_library(
                     let artist_item = MediaItem {
                         id,
                         name: artist_name.clone(),
-                        sort_name: Some(artist_name.to_lowercase()),
+                        sort_name: auto_sort_name(MediaType::MusicArtist, artist_name, None, None),
                         overview: None,
                         media_type: MediaType::MusicArtist,
                         path: artist_dir.clone(),
@@ -2149,7 +2154,12 @@ async fn scan_music_library(
                 let album_item = MediaItem {
                     id,
                     name: effective_album_name.clone(),
-                    sort_name: Some(effective_album_name.to_lowercase()),
+                    sort_name: auto_sort_name(
+                        MediaType::MusicAlbum,
+                        &effective_album_name,
+                        None,
+                        None,
+                    ),
                     overview: None,
                     media_type: MediaType::MusicAlbum,
                     path: album_dir.clone(),
@@ -2212,10 +2222,16 @@ async fn scan_music_library(
                 continue;
             }
 
+            let parent_index_number = disc_from_tag.or(disc_from_dir);
             let item = MediaItem {
                 id: Uuid::new_v4(),
+                sort_name: auto_sort_name(
+                    MediaType::Audio,
+                    &item_name,
+                    parent_index_number,
+                    track_number,
+                ),
                 name: item_name,
-                sort_name: Some(file_name.to_lowercase()),
                 overview: None,
                 media_type: MediaType::Audio,
                 path: file_path_buf.to_string_lossy().to_string(),
@@ -2229,7 +2245,7 @@ async fn scan_music_library(
                 premiere_date: None,
                 runtime_ticks: None,
                 index_number: track_number,
-                parent_index_number: disc_from_tag.or(disc_from_dir),
+                parent_index_number,
                 media_sources: Vec::new(),
                 ..MediaItem::default_dto_fields()
             };
@@ -2787,9 +2803,22 @@ fn parse_season_number(name: &str, series_folder: &str) -> Option<i32> {
     naming::is_specials_folder(name, series_folder).then_some(0)
 }
 
-/// The sort name that the scan gives a season numbered `number`.
-pub(crate) fn season_sort_name(number: Option<i32>) -> String {
-    format!("season {:04}", number.unwrap_or(1))
+pub(crate) use rustyfin_model::sort_name::season_sort_name;
+
+/// The sort name Jellyfin makes for a new item, with the server's sort rules.
+pub(crate) fn auto_sort_name(
+    media_type: MediaType,
+    name: &str,
+    parent_index_number: Option<i32>,
+    index_number: Option<i32>,
+) -> Option<String> {
+    Some(rustyfin_model::sort_name::item_sort_name(
+        media_type,
+        name,
+        parent_index_number,
+        index_number,
+        &rustyfin_model::sort_name::current_rules(),
+    ))
 }
 
 #[cfg(test)]

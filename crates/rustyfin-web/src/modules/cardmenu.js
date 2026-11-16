@@ -19,7 +19,9 @@ const currentRoute = () => globalThis.location?.hash ?? '';
 
 // The menu's commands for an item, in Jellyfin Web's order: [{ action, label, icon, ...data }] with
 // 'separator' entries between the groups. Actions other than the card-* ones are the router's.
-function cardMenuCommands(item, isAdmin) {
+// `shownIn` is the collection or playlist the card is shown in ({ id, type, canEdit, entryId }),
+// whose editors get Remove from it.
+function cardMenuCommands(item, isAdmin, shownIn = null) {
     const type = item.Type || '';
     const data = item.UserData || {};
     const container = !!item.IsFolder || CONTAINERS.includes(type);
@@ -44,6 +46,14 @@ function cardMenuCommands(item, isAdmin) {
     commands.push('separator');
     if (PLAYLIST_TYPES.includes(type)) commands.push({ action: 'card-add-playlist', label: t('cards.add_to_playlist'), icon: 'ListPlus' });
     if (isAdmin && COLLECTION_TYPES.includes(type)) commands.push({ action: 'card-add-collection', label: t('cards.add_to_collection'), icon: 'FolderPlus' });
+    if (shownIn?.canEdit && shownIn.id !== item.Id) {
+        const playlist = shownIn.type === 'Playlist';
+        commands.push({
+            action: 'card-remove-from', icon: 'Trash2',
+            label: t(playlist ? 'collections.remove_from_playlist' : 'collections.remove_from_collection'),
+            containerId: shownIn.id, containerType: shownIn.type, entryId: shownIn.entryId || undefined,
+        });
+    }
     commands.push('separator');
     if ((type === 'Episode' || type === 'Season') && item.SeriesId) {
         commands.push({ action: 'navigate', label: t('cards.go_to_series'), icon: 'Tv', page: 'detail', target: item.SeriesId });
@@ -75,7 +85,8 @@ function cardMenuHtml(item, commands) {
         if (c === 'separator') return '<hr>';
         const data = [
             ['action', c.action], ['id', c.target || id], ['page', c.page], ['played', c.played], ['favorite', c.favorite],
-            ['name', c.name], ['type', c.type], ['parent-id', c.parentId],
+            ['name', c.name], ['type', c.type], ['parent-id', c.parentId], ['container-id', c.containerId],
+            ['container-type', c.containerType], ['entry-id', c.entryId],
         ].filter(([, v]) => v !== undefined).map(([k, v]) => ` data-${k}="${escapeHtml(String(v))}"`).join('');
         const role = c.checked === undefined ? 'menuitem' : 'menuitemcheckbox';
         const checked = c.checked === undefined ? '' : ` aria-checked="${c.checked}"`;
@@ -128,7 +139,7 @@ async function openCardMenu(el, point = null) {
     menuItems.clear();
     menuItems.set(item.Id, item);
     const menu = menuElement();
-    menu.innerHTML = cardMenuHtml(item, cardMenuCommands(item, API.isAdmin));
+    menu.innerHTML = cardMenuHtml(item, cardMenuCommands(item, API.isAdmin, menuContainer(el)));
     if (menu.matches(':popover-open')) menu.hidePopover();
     menu.style.left = '0px';
     menu.style.top = '0px';
@@ -139,6 +150,18 @@ async function openCardMenu(el, point = null) {
     menu.style.left = `${Math.max(8, Math.min(x, innerWidth - box.width - 8))}px`;
     menu.style.top = `${Math.max(8, y + box.height > innerHeight - 8 ? y - box.height - (point ? 0 : anchor.height + 8) : y)}px`;
     menu.querySelector('[data-action]')?.focus();
+}
+
+// The collection or playlist a card is shown in, from its page's section (collections.js)
+function menuContainer(el) {
+    const holder = el.closest?.('[data-container-id]');
+    if (!holder) return null;
+    return {
+        id: holder.dataset.containerId,
+        type: holder.dataset.containerType,
+        canEdit: holder.dataset.canEdit === 'true',
+        entryId: el.closest('[data-entry-id]')?.dataset.entryId || '',
+    };
 }
 
 // User data changed: every card of the item redraws its marks, the cached lists go, and open
@@ -216,6 +239,8 @@ async function openAddTo(el, kind) {
     try {
         const answer = kind === 'playlist' ? await API.getPlaylists() : await API.getCollections();
         lists = Array.isArray(answer) ? answer : answer.Items || [];
+        // Only the playlists the user may change: their own and those shared with them to edit
+        if (kind === 'playlist') lists = lists.filter(l => l.CanEdit !== false);
     } catch (e) {
         toast(e.message, 'error');
         return;

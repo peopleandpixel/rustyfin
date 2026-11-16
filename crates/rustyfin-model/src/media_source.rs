@@ -162,6 +162,49 @@ pub struct MediaStream {
     /// only; unknown when ffprobe gives no sample aspect ratio.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub is_anamorphic: Option<bool>,
+    /// The Dolby Vision configuration record ffprobe reads from the stream. Video only.
+    #[serde(flatten)]
+    pub dovi: DoviConfig,
+    /// Jellyfin's VideoRange ("SDR", "HDR") of a video stream (`MediaStream::video_range`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_range: Option<String>,
+    /// Jellyfin's VideoRangeType ("SDR", "HDR10", "HLG", "DOVI", "DOVIWithHDR10", ...) of a
+    /// video stream (`MediaStream::video_range`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_range_type: Option<String>,
+}
+
+/// A Dolby Vision configuration record, as ffprobe reads it from a stream's side data and as
+/// Jellyfin's MediaStream sends it (`DvVersionMajor`, ..., `DvBlSignalCompatibilityId`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct DoviConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dv_version_major: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dv_version_minor: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dv_profile: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dv_level: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rpu_present_flag: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub el_present_flag: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bl_present_flag: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dv_bl_signal_compatibility_id: Option<i32>,
+    /// Whether the stream's side data carries HDR10+ (SMPTE 2094-40) metadata
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hdr10_plus_present_flag: Option<bool>,
+}
+
+impl DoviConfig {
+    /// Whether the record is empty (the stream has none).
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// What identifies a media stream across rescans. A remembered track choice is offered only where
@@ -214,6 +257,61 @@ impl MediaStream {
             is_default: self.is_default,
             is_forced: self.is_forced,
         }
+    }
+
+    /// Jellyfin's VideoRange and VideoRangeType of a video stream, as its
+    /// `MediaStream.GetVideoColorRange` gives them; None for a stream that isn't video. Dolby
+    /// Vision (a profile 5, 7, 8 or 10 record with RPU and base layer, or a `dovi`, `dvh1`,
+    /// `dvhe` or `dav1` tag) is typed by its profile and base layer compatibility: a
+    /// compatibility id the profile doesn't define (8.6, 10.6, ...) is DOVIInvalid, and HDR10+
+    /// metadata makes DOVIWithHDR10Plus or DOVIWithELHDR10Plus. Else HDR10+ metadata is HDR10Plus,
+    /// the colour transfer gives HDR10 (PQ) or HLG, and anything else is SDR.
+    pub fn video_range(&self) -> Option<(&'static str, &'static str)> {
+        if !self.codec_type.eq_ignore_ascii_case("video") {
+            return None;
+        }
+        let dv = &self.dovi;
+        let tag = self
+            .codec_tag
+            .as_deref()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let dovi_profile = matches!(dv.dv_profile, Some(5 | 7 | 8 | 10));
+        let dovi_flags = dv.rpu_present_flag == Some(1)
+            && dv.bl_present_flag == Some(1)
+            && matches!(dv.dv_bl_signal_compatibility_id, Some(0 | 1 | 2 | 4 | 6));
+        let hdr10_plus = dv.hdr10_plus_present_flag == Some(true);
+        if (dovi_profile && dovi_flags) || matches!(tag.as_str(), "dovi" | "dvh1" | "dvhe" | "dav1")
+        {
+            return Some(match (dv.dv_profile, dv.dv_bl_signal_compatibility_id) {
+                (Some(5), _) => ("HDR", "DOVI"),
+                (Some(7), _) if hdr10_plus => ("HDR", "DOVIWithELHDR10Plus"),
+                (Some(7), _) => ("HDR", "DOVIWithEL"),
+                (Some(8 | 10), Some(1)) if hdr10_plus => ("HDR", "DOVIWithHDR10Plus"),
+                (Some(8 | 10), Some(1)) => ("HDR", "DOVIWithHDR10"),
+                (Some(8 | 10), Some(4)) => ("HDR", "DOVIWithHLG"),
+                (Some(8 | 10), Some(2)) => ("SDR", "DOVIWithSDR"),
+                (Some(10), Some(0)) => ("HDR", "DOVI"),
+                (Some(8 | 10), _) => ("HDR", "DOVIInvalid"),
+                _ => ("HDR", "DOVI"),
+            });
+        }
+        if hdr10_plus {
+            return Some(("HDR", "HDR10Plus"));
+        }
+        let transfer = self.color_transfer.as_deref().unwrap_or_default();
+        Some(match transfer.to_ascii_lowercase().as_str() {
+            "smpte2084" => ("HDR", "HDR10"),
+            "arib-std-b67" => ("HDR", "HLG"),
+            _ => ("SDR", "SDR"),
+        })
+    }
+
+    /// Sets `video_range` and `video_range_type` from the stream (`video_range`).
+    pub fn fill_video_range(&mut self) {
+        let range = self.video_range();
+        self.video_range = range.map(|(range, _)| range.to_string());
+        self.video_range_type = range.map(|(_, kind)| kind.to_string());
     }
 
     /// Jellyfin's MediaStreamType for an ffprobe codec type and codec: "Video", "EmbeddedImage"
@@ -318,6 +416,67 @@ fn serialize_jellyfin_language<S: serde::Serializer>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn dv(profile: i32, compat: i32) -> MediaStream {
+        MediaStream {
+            codec_type: "video".into(),
+            color_transfer: Some("smpte2084".into()),
+            dovi: DoviConfig {
+                dv_profile: Some(profile),
+                dv_bl_signal_compatibility_id: Some(compat),
+                rpu_present_flag: Some(1),
+                bl_present_flag: Some(1),
+                el_present_flag: Some(i32::from(profile == 7)),
+                ..DoviConfig::default()
+            },
+            ..MediaStream::default()
+        }
+    }
+
+    /// Jellyfin's VideoRangeType: Dolby Vision by profile and base layer (the reference server
+    /// types a profile 7 file with compatibility 6 as DOVIWithEL), else the transfer.
+    #[test]
+    fn r3gaps2_video_range_types_dolby_vision_as_jellyfin() {
+        let range = |s: &MediaStream| s.video_range().unwrap();
+        assert_eq!(range(&dv(7, 6)), ("HDR", "DOVIWithEL"));
+        assert_eq!(range(&dv(8, 1)), ("HDR", "DOVIWithHDR10"));
+        assert_eq!(range(&dv(8, 4)), ("HDR", "DOVIWithHLG"));
+        assert_eq!(range(&dv(8, 2)), ("SDR", "DOVIWithSDR"));
+        assert_eq!(range(&dv(5, 0)), ("HDR", "DOVI"));
+        assert_eq!(range(&dv(10, 0)), ("HDR", "DOVI"));
+        // Compatibility ids the profile doesn't define
+        assert_eq!(range(&dv(8, 6)), ("HDR", "DOVIInvalid"));
+        assert_eq!(range(&dv(10, 6)), ("HDR", "DOVIInvalid"));
+        let mut plus = dv(8, 1);
+        plus.dovi.hdr10_plus_present_flag = Some(true);
+        assert_eq!(range(&plus), ("HDR", "DOVIWithHDR10Plus"));
+        plus.dovi = DoviConfig {
+            hdr10_plus_present_flag: Some(true),
+            ..DoviConfig::default()
+        };
+        assert_eq!(range(&plus), ("HDR", "HDR10Plus"));
+        let mut tagged = dv(0, 0);
+        tagged.dovi = DoviConfig::default();
+        assert_eq!(range(&tagged), ("HDR", "HDR10"));
+        tagged.codec_tag = Some("dvh1".into());
+        assert_eq!(range(&tagged), ("HDR", "DOVI"));
+        let audio = MediaStream {
+            codec_type: "audio".into(),
+            ..MediaStream::default()
+        };
+        assert_eq!(audio.video_range(), None);
+
+        // The JSON carries Jellyfin's names
+        let mut stream = dv(8, 1);
+        stream.fill_video_range();
+        let json = serde_json::to_value(&stream).unwrap();
+        assert_eq!(json["DvProfile"], 8);
+        assert_eq!(json["DvBlSignalCompatibilityId"], 1);
+        assert_eq!(json["VideoRange"], "HDR");
+        assert_eq!(json["VideoRangeType"], "DOVIWithHDR10");
+        let back: MediaStream = serde_json::from_value(json).unwrap();
+        assert_eq!(back.dovi, stream.dovi);
+    }
 
     #[test]
     fn r1play_stream_json_uses_jellyfin_names() {

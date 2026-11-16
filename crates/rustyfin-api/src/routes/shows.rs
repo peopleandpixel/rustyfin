@@ -52,7 +52,7 @@ async fn next_up(
         rustyfin_db::repo_media::get_next_up(&state.db_ro, user_id, series_id).await?;
     HiddenItems::for_caller(&state, &claims)
         .await?
-        .retain(&mut episodes, |i| i.id);
+        .retain(&mut episodes);
 
     let total = episodes.len() as i64;
     let end = start_index.saturating_add(limit).min(episodes.len());
@@ -100,7 +100,7 @@ async fn upcoming(
     };
     HiddenItems::for_caller(&state, &claims)
         .await?
-        .retain(&mut episodes, |i| i.id);
+        .retain(&mut episodes);
 
     let total = episodes.len() as i64;
     let end = start_index.saturating_add(limit).min(episodes.len());
@@ -138,7 +138,7 @@ async fn get_seasons(
         .collect();
     HiddenItems::for_caller(&state, &claims)
         .await?
-        .retain(&mut seasons, |i| i.id);
+        .retain(&mut seasons);
     let total = seasons.len() as i64;
 
     let tmdb_key = state
@@ -207,7 +207,7 @@ async fn get_episodes(
     };
     HiddenItems::for_caller(&state, &claims)
         .await?
-        .retain(&mut episodes, |i| i.id);
+        .retain(&mut episodes);
 
     let total = episodes.len() as i64;
     let start = q.start_index.unwrap_or(0).max(0) as usize;
