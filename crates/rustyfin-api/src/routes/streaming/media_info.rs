@@ -8,7 +8,7 @@ use axum::extract::{Path, State};
 use axum::routing::get;
 use axum::{Extension, Json};
 use rustyfin_core::stream_builder::{
-    DeviceData, MediaKind, SourceFacts, StreamRequest, SubtitleMode, device_data,
+    DeviceData, MediaKind, SourceFacts, StreamRequest, device_data,
 };
 use rustyfin_model::auth::Claims;
 use rustyfin_model::device_profile::{DeviceProfile, ProfileError, SubtitleDeliveryMethod};
@@ -189,22 +189,16 @@ async fn playback_info(
             .as_ref()
             .and_then(|choice| super::remembered_stream(&source, "Audio", choice));
         let audio_stream_index = dto.audio_stream_index.or(remembered_audio_index);
-        // A remembered subtitle counts unless subtitles are off, and under "only forced" only
-        // when it is off or a forced stream, as in Jellyfin
-        let remembered_subtitle_index = (|| {
-            let choice = remembered_subtitle.as_ref()?;
-            match preferences.subtitle_mode {
-                SubtitleMode::None => None,
-                _ if choice.index == -1 => Some(-1),
-                mode => super::remembered_stream(&source, "Subtitle", choice).filter(|&index| {
-                    mode != SubtitleMode::OnlyForced
-                        || source
-                            .media_streams
-                            .iter()
-                            .any(|s| s.index == index && s.is_forced)
-                }),
+        // A remembered subtitle (remembered_choices leaves it out under SubtitleMode None) counts
+        // in every other mode, "only forced" included, as Jellyfin's SetDefaultSubtitleStreamIndex
+        // checks only that the stream is still there; the same rule as GET /Videos/{id}/PlaybackInfo
+        let remembered_subtitle_index = remembered_subtitle.as_ref().and_then(|choice| {
+            if choice.index == -1 {
+                Some(-1)
+            } else {
+                super::remembered_stream(&source, "Subtitle", choice)
             }
-        })();
+        });
         let subtitle_stream_index = dto.subtitle_stream_index.or(remembered_subtitle_index);
         // The loader's flags are a placeholder; the device data below decides them when present
         // ForceRemoteSourceTranscoding: a remote source (a URL) is never played as it is

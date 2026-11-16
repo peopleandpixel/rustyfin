@@ -39939,6 +39939,104 @@ async fn r3prefs_post_playback_info_plays_remembered_and_requested_audio() {
     assert_eq!(remembered, (serde_json::json!(2), serde_json::json!(4)));
 }
 
+/// The `(DefaultAudioStreamIndex, DefaultSubtitleStreamIndex)` of POST /Items/{id}/PlaybackInfo
+/// with a device that takes H.264/AAC in MKV and `subrip` subtitles as external files, naming no
+/// MediaSourceId.
+async fn r3prefs_post_defaults(
+    app: &axum::Router,
+    token: &str,
+    item: uuid::Uuid,
+) -> (serde_json::Value, serde_json::Value) {
+    let body = serde_json::json!({ "DeviceProfile": {
+        "DirectPlayProfiles": [{ "Container": "mkv", "Type": "Video", "VideoCodec": "h264", "AudioCodec": "aac" }],
+        "SubtitleProfiles": [{ "Format": "subrip", "Method": "External" }],
+    } });
+    let req = request(
+        "POST",
+        &format!("/Items/{item}/PlaybackInfo"),
+        Some(token),
+        Some(body),
+    );
+    let (status, body) = send(app, req).await;
+    assert!(status.is_success(), "{body}");
+    let source = &body["MediaSources"][0];
+    (
+        source["DefaultAudioStreamIndex"].clone(),
+        source["DefaultSubtitleStreamIndex"].clone(),
+    )
+}
+
+// R3 player preferences: subtitles the user turned off stay off in POST PlaybackInfo when two
+// subtitles tie on Jellyfin's score and the device takes them as external files. As in Jellyfin,
+// a remembered subtitle is not scored, so the builder's tie-break can't pick one.
+#[tokio::test]
+async fn r3prefs_post_playback_info_keeps_remembered_subtitles_off_on_a_tie() {
+    let state = test_state().await;
+    let _dir = G1cDataDir(state.data_dir.to_path_buf());
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let streams = serde_json::json!([
+        { "Index": 0, "Codec": "h264", "CodecType": "Video" },
+        { "Index": 1, "Codec": "aac", "CodecType": "Audio", "Language": "eng", "IsDefault": true },
+        { "Index": 2, "Codec": "subrip", "CodecType": "Subtitle", "Language": "eng", "IsDefault": true },
+        { "Index": 3, "Codec": "subrip", "CodecType": "Subtitle", "Language": "eng", "IsDefault": true },
+    ]);
+    let item = b20_movie(&state, "R3 Prefs Tie", streams).await;
+    assert_eq!(
+        r3prefs_post_defaults(&app, &token, item).await.1,
+        serde_json::json!(2)
+    );
+
+    let body = serde_json::json!({
+        "ItemId": item, "PositionTicks": 0, "AudioStreamIndex": 1, "SubtitleStreamIndex": -1,
+    });
+    b20_report(&app, &token, "/Progress", body).await;
+    assert_eq!(
+        r3prefs_post_defaults(&app, &token, item).await.1,
+        serde_json::json!(-1)
+    );
+    let body = serde_json::json!({
+        "ItemId": item, "PositionTicks": 0, "AudioStreamIndex": 1, "SubtitleStreamIndex": 3,
+    });
+    b20_report(&app, &token, "/Progress", body).await;
+    assert_eq!(
+        r3prefs_post_defaults(&app, &token, item).await.1,
+        serde_json::json!(3)
+    );
+}
+
+// R3 player preferences: under SubtitleMode OnlyForced a remembered full subtitle is still the
+// default, in GET /Videos/{id}/PlaybackInfo and POST /Items/{id}/PlaybackInfo alike, as Jellyfin's
+// SetDefaultSubtitleStreamIndex skips a remembered subtitle only under None.
+#[tokio::test]
+async fn r3prefs_remembered_subtitle_kept_under_only_forced() {
+    let state = test_state().await;
+    let _dir = G1cDataDir(state.data_dir.to_path_buf());
+    let app = app(state.clone());
+    let (token, user) = admin_session(&state).await;
+    let streams = serde_json::json!([
+        { "Index": 0, "Codec": "h264", "CodecType": "Video" },
+        { "Index": 1, "Codec": "aac", "CodecType": "Audio", "Language": "eng", "IsDefault": true },
+        { "Index": 2, "Codec": "subrip", "CodecType": "Subtitle", "Language": "eng", "IsForced": true },
+        { "Index": 3, "Codec": "subrip", "CodecType": "Subtitle", "Language": "eng" },
+    ]);
+    let item = b20_movie(&state, "R3 Prefs Forced", streams).await;
+    let body = serde_json::json!({
+        "ItemId": item, "PositionTicks": 0, "AudioStreamIndex": 1, "SubtitleStreamIndex": 3,
+    });
+    b20_report(&app, &token, "/Progress", body).await;
+    let uri = format!("/Users/{user}/Configuration");
+    let config = serde_json::json!({ "SubtitleMode": "OnlyForced" });
+    let req = request("POST", &uri, Some(&token), Some(config));
+    assert!(send(&app, req).await.0.is_success());
+
+    assert_eq!(b20_only_defaults(&app, &token, item).await, b20_both(1, 3));
+    assert_eq!(
+        r3prefs_post_defaults(&app, &token, item).await.1,
+        serde_json::json!(3)
+    );
+}
+
 #[tokio::test]
 async fn b20_playback_info_without_choice_omits_defaults() {
     let state = test_state().await;

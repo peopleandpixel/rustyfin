@@ -118,11 +118,17 @@ impl SourceFacts {
                 .find(|s| s.kind == StreamKind::Audio && s.index == index)
                 .and_then(|s| s.language.clone())
         });
+        // A remembered subtitle (off included) is the default and nothing is scored, as Jellyfin's
+        // SetDefaultSubtitleStreamIndex returns before scoring, so the builder's tie-break for an
+        // external stream can't replace it
+        if subtitle.is_some() {
+            self.default_subtitle_stream_index = subtitle;
+            return;
+        }
         let languages = &prefs.subtitle_languages;
         let mode = prefs.subtitle_mode;
-        self.default_subtitle_stream_index = subtitle.or_else(|| {
-            default_subtitle_index(&self.streams, languages, mode, audio_language.as_deref())
-        });
+        self.default_subtitle_stream_index =
+            default_subtitle_index(&self.streams, languages, mode, audio_language.as_deref());
         set_subtitle_scores(
             &mut self.streams,
             languages,
@@ -522,5 +528,45 @@ mod tests {
         };
         assert_eq!(builder_default_subtitle(&source, &[srt]), Some(3));
         assert_eq!(builder_default_subtitle(&source, &[]), Some(2));
+    }
+
+    /// A remembered subtitle, off included, is not scored, as Jellyfin's
+    /// SetDefaultSubtitleStreamIndex returns first: the builder's tie-break for an external
+    /// delivery can't replace it.
+    #[test]
+    fn r3prefs_remembered_subtitle_survives_tied_scores() {
+        let streams = vec![
+            audio(1, Some("eng"), true),
+            sub(2, Some("eng"), "d"),
+            sub(3, Some("eng"), "d"),
+        ];
+        let subrip = SubtitleProfile {
+            format: "subrip".to_string(),
+            method: SubtitleDeliveryMethod::External,
+            didl_mode: String::new(),
+            language: String::new(),
+            container: String::new(),
+        };
+        let prefs = TrackPreferences::default();
+        let mut source = SourceFacts {
+            streams,
+            ..Default::default()
+        };
+        // Not remembered: the two default streams tie and the first external delivery wins
+        source.apply_preferences(&prefs);
+        assert_eq!(
+            builder_default_subtitle(&source, &[subrip.clone()]),
+            Some(2)
+        );
+        for remembered in [-1, 3] {
+            for stream in &mut source.streams {
+                stream.score = None;
+            }
+            source.apply_preferences_and_remembered(&prefs, None, Some(remembered));
+            assert_eq!(
+                builder_default_subtitle(&source, &[subrip.clone()]),
+                Some(remembered)
+            );
+        }
     }
 }
