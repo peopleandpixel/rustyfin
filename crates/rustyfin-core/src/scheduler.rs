@@ -98,6 +98,10 @@ pub struct TaskScheduler {
     default_triggers: Arc<HashMap<String, Vec<TaskTriggerInfo>>>,
     /// The tasks running now, started by their triggers or by hand: a second start is skipped.
     running: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Held while the triggers file is written, and the results file: one save at a time, each
+    /// of the state as it is once the lock is taken, so the last save is never an older state.
+    saving_triggers: Arc<tokio::sync::Mutex<()>>,
+    saving_results: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// A task's claim on running, from `TaskScheduler::claim` until it is dropped.
@@ -147,12 +151,53 @@ fn load_saved<T: serde::de::DeserializeOwned>(
     })
 }
 
-/// The triggers saved in `data_dir`, by task id. A task whose saved triggers are only its
-/// built-in triggers from before the defaults followed Jellyfin's (every task but the library
-/// scan ran each 24 hours, and an early build saved every task's triggers) takes the new
-/// defaults: the saved ones are taken as never edited.
+/// The version of the triggers file this build writes. A file without one is from before the
+/// defaults followed Jellyfin's.
+const TRIGGERS_VERSION: u32 = 2;
+
+/// The triggers file: the edited tasks' triggers by task id, with the file's version.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct SavedTriggers<T> {
+    version: u32,
+    triggers: HashMap<String, T>,
+}
+
+/// The triggers file's text for `triggers`.
+fn triggers_json<T: serde::Serialize>(triggers: HashMap<String, T>) -> std::io::Result<Vec<u8>> {
+    serde_json::to_vec_pretty(&SavedTriggers {
+        version: TRIGGERS_VERSION,
+        triggers,
+    })
+    .map_err(std::io::Error::other)
+}
+
+/// The triggers saved in `data_dir`, by task id.
+///
+/// A file without a version is migrated once, then written again with one: a task whose saved
+/// triggers are only its built-in triggers from before the defaults followed Jellyfin's (every
+/// task but the library scan ran each 24 hours, and an early build saved every task's triggers)
+/// takes the new defaults, as never edited. A versioned file holds only edits and is kept as is.
 fn saved_triggers(data_dir: &std::path::Path) -> HashMap<String, Vec<TaskTriggerInfo>> {
-    let mut saved: HashMap<String, Vec<TaskTriggerInfo>> = load_saved(data_dir, TRIGGERS_FILE);
+    let value: serde_json::Value = match load_saved::<serde_json::Value>(data_dir, TRIGGERS_FILE) {
+        map if map.is_empty() => return HashMap::new(),
+        map => serde_json::Value::Object(map.into_iter().collect()),
+    };
+    if value.get("Version").is_some() {
+        return serde_json::from_value::<SavedTriggers<Vec<TaskTriggerInfo>>>(value)
+            .map(|f| f.triggers)
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "task triggers unreadable; using the defaults");
+                HashMap::new()
+            });
+    }
+    let mut saved: HashMap<String, Vec<TaskTriggerInfo>> = match serde_json::from_value(value) {
+        Ok(saved) => saved,
+        Err(e) => {
+            tracing::warn!(error = %e, "task triggers unreadable; using the defaults");
+            return HashMap::new();
+        }
+    };
     let old_default = [TaskTriggerInfo::interval(TICKS_24H)];
     saved.retain(|id, triggers| {
         !([
@@ -166,14 +211,31 @@ fn saved_triggers(data_dir: &std::path::Path) -> HashMap<String, Vec<TaskTrigger
         .contains(&id.as_str())
             && triggers[..] == old_default)
     });
+    let written = triggers_json(saved.clone())
+        .and_then(|json| write_atomic_sync(&data_dir.join(TRIGGERS_FILE), &json));
+    if let Err(e) = written {
+        tracing::warn!(error = %e, "could not save the migrated task triggers");
+    }
     saved
 }
 
-/// Writes `bytes` to `path` through a temporary file, so a crash never leaves half a file.
-async fn write_atomic(path: &std::path::Path, bytes: Vec<u8>) -> std::io::Result<()> {
+/// Writes `bytes` to `path` through a temporary file synced to disk, so a crash never leaves half
+/// a file.
+fn write_atomic_sync(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
     let tmp = path.with_extension("json.tmp");
-    tokio::fs::write(&tmp, bytes).await?;
-    tokio::fs::rename(&tmp, path).await
+    let mut file = std::fs::File::create(&tmp)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&tmp, path)
+}
+
+/// `write_atomic_sync` off the async runtime.
+async fn write_atomic(path: std::path::PathBuf, bytes: Vec<u8>) -> std::io::Result<()> {
+    tokio::task::spawn_blocking(move || write_atomic_sync(&path, &bytes))
+        .await
+        .map_err(std::io::Error::other)?
 }
 
 impl TaskScheduler {
@@ -412,6 +474,8 @@ impl TaskScheduler {
             triggers_changed: Arc::new(tokio::sync::Notify::new()),
             default_triggers: Arc::new(default_triggers),
             running: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            saving_triggers: Arc::default(),
+            saving_results: Arc::default(),
         }
     }
 
@@ -509,20 +573,26 @@ impl TaskScheduler {
         id: &str,
         triggers: Vec<TaskTriggerInfo>,
     ) -> Result<bool, std::io::Error> {
-        // The lock is held until the file is written, so two saves never write it at once.
-        let mut tasks = self.tasks.write().await;
-        let Some(entry) = tasks.get_mut(id) else {
-            return Ok(false);
-        };
-        entry.info.triggers = triggers;
+        {
+            let mut tasks = self.tasks.write().await;
+            let Some(entry) = tasks.get_mut(id) else {
+                return Ok(false);
+            };
+            entry.info.triggers = triggers;
+        }
         self.triggers_changed.notify_waiters();
-        let all: HashMap<&String, &Vec<TaskTriggerInfo>> = tasks
-            .iter()
-            .filter(|(id, e)| self.default_triggers.get(*id) != Some(&e.info.triggers))
-            .map(|(id, e)| (id, &e.info.triggers))
-            .collect();
-        let json = serde_json::to_vec_pretty(&all).map_err(std::io::Error::other)?;
-        write_atomic(&self.data_dir.join(TRIGGERS_FILE), json).await?;
+        let _saving = self.saving_triggers.lock().await;
+        let json = {
+            let tasks = self.tasks.read().await;
+            triggers_json(
+                tasks
+                    .iter()
+                    .filter(|(id, e)| self.default_triggers.get(*id) != Some(&e.info.triggers))
+                    .map(|(id, e)| (id.clone(), e.info.triggers.clone()))
+                    .collect(),
+            )?
+        };
+        write_atomic(self.data_dir.join(TRIGGERS_FILE), json).await?;
         Ok(true)
     }
 
@@ -637,26 +707,31 @@ impl TaskScheduler {
         let failed = (result.status == TaskCompletionStatus::Failed)
             .then(|| result.error_message.clone().unwrap_or_default());
         let name = {
-            // The lock is held until the file is written, so two saves never write it at once.
             let mut tasks = self.tasks.write().await;
             let Some(entry) = tasks.get_mut(id) else {
                 return;
             };
             entry.info.last_execution_result = Some(result);
-            let name = entry.info.name.clone();
-            let all: HashMap<&String, &TaskResult> = tasks
-                .iter()
-                .filter_map(|(id, e)| Some((id, e.info.last_execution_result.as_ref()?)))
-                .collect();
-            let saved = match serde_json::to_vec_pretty(&all) {
-                Ok(json) => write_atomic(&self.data_dir.join(RESULTS_FILE), json).await,
-                Err(e) => Err(std::io::Error::other(e)),
-            };
-            if let Err(e) = saved {
-                tracing::warn!(task = id, error = %e, "could not save the task's last result");
-            }
-            name
+            entry.info.name.clone()
         };
+        let saved = {
+            let _saving = self.saving_results.lock().await;
+            let json = {
+                let tasks = self.tasks.read().await;
+                let all: HashMap<&String, &TaskResult> = tasks
+                    .iter()
+                    .filter_map(|(id, e)| Some((id, e.info.last_execution_result.as_ref()?)))
+                    .collect();
+                serde_json::to_vec_pretty(&all)
+            };
+            match json {
+                Ok(json) => write_atomic(self.data_dir.join(RESULTS_FILE), json).await,
+                Err(e) => Err(std::io::Error::other(e)),
+            }
+        };
+        if let Err(e) = saved {
+            tracing::warn!(task = id, error = %e, "could not save the task's last result");
+        }
         // A failed task goes in the activity log, as in Jellyfin.
         if let Some(error) = failed
             && let Err(e) = rustyfin_db::repo_activity::log_activity(
@@ -722,7 +797,8 @@ impl TaskScheduler {
     }
 
     /// When the task's triggers next run it; `clock.last_end` is the later of its loop's last run
-    /// and its last recorded result (a run started by hand counts).
+    /// and its last recorded result (a run started by hand counts). A recorded end in the future
+    /// (the clock was ahead when it was saved) counts as now.
     async fn next_due(
         &self,
         id: &str,
@@ -734,7 +810,7 @@ impl TaskScheduler {
             .last_execution_result
             .as_ref()
             .and_then(|r| chrono::DateTime::parse_from_rfc3339(&r.end_time_utc).ok())
-            .map(|t| t.with_timezone(&Utc));
+            .map(|t| t.with_timezone(&Utc).min(Utc::now()));
         clock.last_end = clock.last_end.max(recorded);
         crate::task_triggers::next_due(&chrono::Local, &info.triggers, &clock)
     }
@@ -1765,16 +1841,72 @@ mod tests {
                 .await
                 .unwrap()
         );
-        let saved: HashMap<String, Vec<TaskTriggerInfo>> =
-            serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        let saved = r3sched_saved_file(&file);
         assert_eq!(saved.keys().collect::<Vec<_>>(), [TASK_DB_VACUUM]);
         assert_eq!(saved[TASK_DB_VACUUM], edited);
         // Back to its defaults: nothing is saved for it any more
         let defaults = vec![TaskTriggerInfo::interval(TICKS_6H)];
         assert!(sched.set_triggers(TASK_DB_VACUUM, defaults).await.unwrap());
-        let saved: HashMap<String, Vec<TaskTriggerInfo>> =
-            serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        let saved = r3sched_saved_file(&file);
         assert!(saved.is_empty(), "{saved:?}");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// The triggers in a saved triggers file, which must carry this build's version.
+    fn r3sched_saved_file(file: &std::path::Path) -> HashMap<String, Vec<TaskTriggerInfo>> {
+        let saved: SavedTriggers<Vec<TaskTriggerInfo>> =
+            serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap();
+        assert_eq!(saved.version, TRIGGERS_VERSION);
+        saved.triggers
+    }
+
+    #[tokio::test]
+    async fn r3sched_a_saved_24_hour_interval_in_a_versioned_file_is_an_edit() {
+        let (sched, dir) = r3tasks_scheduler().await;
+        let daily_ish = vec![TaskTriggerInfo::interval(TICKS_24H)];
+        assert!(
+            sched
+                .set_triggers(TASK_TRICKPLAY, daily_ish.clone())
+                .await
+                .unwrap()
+        );
+        for _ in 0..2 {
+            let restarted = TaskScheduler::new(sched.db.clone(), Arc::new(dir.clone()));
+            assert_eq!(
+                restarted.get_task(TASK_TRICKPLAY).await.unwrap().triggers,
+                daily_ish
+            );
+        }
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn r3sched_a_saved_end_in_the_future_counts_as_now() {
+        let (sched, dir) = r3tasks_scheduler().await;
+        let ahead = Utc::now() + chrono::Duration::days(3);
+        sched
+            .set_task_result(
+                TASK_LIBRARY_SCAN,
+                TaskResult {
+                    status: TaskCompletionStatus::Completed,
+                    error_message: None,
+                    start_time_utc: ahead.to_rfc3339(),
+                    end_time_utc: ahead.to_rfc3339(),
+                },
+            )
+            .await;
+        let started = Utc::now();
+        let clock = crate::task_triggers::TriggerClock {
+            last_end: None,
+            loop_ran: false,
+            first: started + chrono::Duration::seconds(60),
+            interval_from: None,
+            started,
+        };
+        let due = sched.next_due(TASK_LIBRARY_SCAN, clock).await.unwrap();
+        let after = Utc::now() + chrono::Duration::hours(12);
+        assert!(due <= after, "due {due}, not 12 hours from now");
+        assert!(due >= started + chrono::Duration::hours(12), "due {due}");
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -1934,6 +2066,10 @@ mod tests {
         // A task whose old default was not 24 hours keeps a saved 24 hours: it was edited
         assert_eq!(triggers(TASK_METADATA_REFRESH).await, old_default);
         assert!(triggers(TASK_CLEAN_ACTIVITY_LOG).await.is_empty());
+        // The file is migrated once: written again with a version, without the old defaults
+        let saved = r3sched_saved_file(&dir.join(TRIGGERS_FILE));
+        assert!(!saved.contains_key(TASK_TRICKPLAY), "{saved:?}");
+        assert_eq!(saved[TASK_CHAPTER_IMAGES], edited);
         std::fs::remove_dir_all(dir).ok();
     }
 
