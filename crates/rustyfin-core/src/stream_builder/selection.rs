@@ -555,7 +555,7 @@ mod tests {
         // Not remembered: the two default streams tie and the first external delivery wins
         source.apply_preferences(&prefs);
         assert_eq!(
-            builder_default_subtitle(&source, &[subrip.clone()]),
+            builder_default_subtitle(&source, std::slice::from_ref(&subrip)),
             Some(2)
         );
         for remembered in [-1, 3] {
@@ -564,7 +564,7 @@ mod tests {
             }
             source.apply_preferences_and_remembered(&prefs, None, Some(remembered));
             assert_eq!(
-                builder_default_subtitle(&source, &[subrip.clone()]),
+                builder_default_subtitle(&source, std::slice::from_ref(&subrip)),
                 Some(remembered)
             );
         }
