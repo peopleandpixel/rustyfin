@@ -8,7 +8,7 @@ import { clearQueue, queueNeighbours, playQueueStep } from './queue.js';
 import {
     trackPrefs, defaultTracks, defaultSubtitleIndex as preferredSubtitleIndex, subtitleAppearance, saveSubtitleAppearance,
     subtitleCss, stepSubtitleOffset, qualityOptions, bitrateLabel, maxStreamingBitrate, setMaxStreamingBitrate,
-    AUTO_BITRATE, aspectRatio, setAspectRatio,
+    AUTO_BITRATE, aspectRatio, setAspectRatio, SEGMENT_TYPES, segmentAction, setSegmentAction,
 } from './playerprefs.js';
 let playerReportInterval = null;
 let playerBars = null;
@@ -1403,8 +1403,8 @@ function bindMediaSession() {
     setMediaSessionHandler('seekto', d => { if (activePlayback && Number.isFinite(d?.seekTime)) seekTo(activePlayback, d.seekTime); });
 }
 
-// --- Skip intro and outro: Jellyfin Web asks to skip each media segment of these types ---
-const SKIP_SEGMENT_TYPES = ['Intro', 'Outro'];
+// --- Media segments: per type, Jellyfin Web skips them, asks to skip them (intros and outros by default) or
+// does nothing (segmentAction in playerprefs.js) ---
 // The button shows for 8 s from the segment's start, and while the bars show
 const SKIP_PROMPT_MS = 8000;
 // skipPrompt: the segment the button offers to skip, while it shows
@@ -1413,10 +1413,10 @@ let skipPrompt = null;
 const segmentStart = s => (s.StartTicks ?? s.SegmentStartTicks ?? 0) / 1e7;
 const segmentEnd = s => (s.EndTicks ?? s.SegmentEndTicks ?? 0) / 1e7;
 
-// The segment to offer at seconds: an intro or outro of 3 s or more. An outro that runs to the end of an item
-// with a next one is left to the next-episode card, as in Jellyfin.
-function skippableSegment(segments, seconds, total, hasNext) {
-    return (segments || []).find(s => SKIP_SEGMENT_TYPES.includes(s.Type)
+// The segment to act on at seconds: one of 3 s or more whose type the user skips or is asked about. An outro that
+// runs to the end of an item with a next one is left to the next-episode card, as in Jellyfin.
+function skippableSegment(segments, seconds, total, hasNext, actionOf = segmentAction) {
+    return (segments || []).find(s => SEGMENT_TYPES.includes(s.Type) && actionOf(s.Type) !== 'None'
         && segmentEnd(s) - segmentStart(s) >= 3
         && seconds >= segmentStart(s) && seconds < segmentEnd(s)
         && !(s.Type === 'Outro' && hasNext && total > 0 && segmentEnd(s) >= total - 1)) || null;
@@ -1431,13 +1431,39 @@ async function checkSkipSegment(session) {
     const segment = skippableSegment(segments, session.position(), session.total(), hasNext);
     if (segment === skipPrompt?.segment) return;
     hideSkipSegment();
-    if (segment) showSkipSegment(segment);
+    if (!segment) return;
+    // Skip: once per segment and playback, so seeking back into it plays it
+    if (segmentAction(segment.Type) === 'Skip') {
+        if (session.skipped?.has(segment)) return;
+        (session.skipped ||= new Set()).add(segment);
+        showPlayerOsd(t('player.segment_skipped', { type: segmentTypeName(segment.Type) }));
+        if (session.position() < segmentEnd(segment) - 1) seekTo(session, segmentEnd(segment));
+        return;
+    }
+    showSkipSegment(segment);
+}
+
+function segmentTypeName(type) {
+    return t(`player.segment_${type.toLowerCase()}`);
+}
+
+// The menu's Media segments section: one action per type
+function renderSegmentSettings() {
+    for (const type of SEGMENT_TYPES) {
+        const select = $(`player-segment-${type.toLowerCase()}`);
+        if (select) select.value = segmentAction(type);
+    }
+}
+
+function changeSegmentAction(type, action) {
+    setSegmentAction(type, action);
+    hideSkipSegment();
 }
 
 function showSkipSegment(segment) {
     const button = $('player-skip-segment');
     if (!button) return;
-    button.textContent = t('player.skip_segment', { type: t(`player.segment_${segment.Type.toLowerCase()}`) });
+    button.textContent = t('player.skip_segment', { type: segmentTypeName(segment.Type) });
     button.classList.remove('jf-skip-expired');
     button.hidden = false;
     skipPrompt = { segment, timer: setTimeout(() => button.classList.add('jf-skip-expired'), SKIP_PROMPT_MS) };
@@ -1605,6 +1631,7 @@ function renderPlayerSettings(open) {
     if (offset) offset.textContent = formatOffset(activePlayback?.subtitleOffset || 0);
     applySubtitleAppearance();
     renderPlaybackSettings(activePlayback);
+    renderSegmentSettings();
 }
 
 // --- Quality, version and aspect ratio: the menu's Playback section ---
@@ -1753,7 +1780,7 @@ export {
     changeSubtitleTrack, playItem, playerAutoHide, onPlayerClosed, playerAreaClick, closePlayer, playAdjacentEpisode,
     playUpNextNow, cancelUpNext, togglePlayPause, setVolume, toggleMute, setPlaybackRate, toggleFullscreen,
     togglePictureInPicture, skipSegment, hoverSeek, hideTrickplay, renderPlayerSettings, setSubtitleAppearance,
-    changeSubtitleOffset, changeQuality, changeVersion, changeAspectRatio, renderChapterMenu,
+    changeSubtitleOffset, changeQuality, changeVersion, changeAspectRatio, renderChapterMenu, changeSegmentAction,
 };
 
 // Shared state that inline handlers or other modules assign: reached through window

@@ -611,6 +611,44 @@
                                     </select>
                                 </label>
                             </section>
+                            <section id="player-settings-segments" class="space-y-2">
+                                <h3 class="jf-player-menu-heading" data-i18n="player.media_segments">Media segments</h3>
+                                <label class="jf-player-menu-row"><span data-i18n="player.segment_intro">Intro</span>
+                                    <select id="player-segment-intro" class="jf-player-menu-select" onchange="changeSegmentAction('Intro', this.value)">
+                                        <option value="Skip" data-i18n="player.segment_action_skip">Skip</option>
+                                        <option value="AskToSkip" data-i18n="player.segment_action_ask">Ask to skip</option>
+                                        <option value="None" data-i18n="player.segment_action_none">Nothing</option>
+                                    </select>
+                                </label>
+                                <label class="jf-player-menu-row"><span data-i18n="player.segment_outro">Outro</span>
+                                    <select id="player-segment-outro" class="jf-player-menu-select" onchange="changeSegmentAction('Outro', this.value)">
+                                        <option value="Skip" data-i18n="player.segment_action_skip">Skip</option>
+                                        <option value="AskToSkip" data-i18n="player.segment_action_ask">Ask to skip</option>
+                                        <option value="None" data-i18n="player.segment_action_none">Nothing</option>
+                                    </select>
+                                </label>
+                                <label class="jf-player-menu-row"><span data-i18n="player.segment_recap">Recap</span>
+                                    <select id="player-segment-recap" class="jf-player-menu-select" onchange="changeSegmentAction('Recap', this.value)">
+                                        <option value="Skip" data-i18n="player.segment_action_skip">Skip</option>
+                                        <option value="AskToSkip" data-i18n="player.segment_action_ask">Ask to skip</option>
+                                        <option value="None" data-i18n="player.segment_action_none">Nothing</option>
+                                    </select>
+                                </label>
+                                <label class="jf-player-menu-row"><span data-i18n="player.segment_preview">Preview</span>
+                                    <select id="player-segment-preview" class="jf-player-menu-select" onchange="changeSegmentAction('Preview', this.value)">
+                                        <option value="Skip" data-i18n="player.segment_action_skip">Skip</option>
+                                        <option value="AskToSkip" data-i18n="player.segment_action_ask">Ask to skip</option>
+                                        <option value="None" data-i18n="player.segment_action_none">Nothing</option>
+                                    </select>
+                                </label>
+                                <label class="jf-player-menu-row"><span data-i18n="player.segment_commercial">Commercial</span>
+                                    <select id="player-segment-commercial" class="jf-player-menu-select" onchange="changeSegmentAction('Commercial', this.value)">
+                                        <option value="Skip" data-i18n="player.segment_action_skip">Skip</option>
+                                        <option value="AskToSkip" data-i18n="player.segment_action_ask">Ask to skip</option>
+                                        <option value="None" data-i18n="player.segment_action_none">Nothing</option>
+                                    </select>
+                                </label>
+                            </section>
                             <section id="player-settings-subtitles" class="space-y-2">
                                 <h3 class="jf-player-menu-heading" data-i18n="player.subtitles">Subtitles</h3>
                                 <div class="jf-player-menu-row">

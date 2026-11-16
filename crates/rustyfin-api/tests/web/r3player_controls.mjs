@@ -125,8 +125,13 @@ test('the seek bar wires hover, touch and drag to the preview; playItem reads th
 });
 
 // --- Skip intro and outro ---
-const SKIP = ['function skippableSegment(', 'async function checkSkipSegment(', 'function showSkipSegment(', 'function hideSkipSegment(', 'function skipSegment('];
-const SKIP_PRELUDE = `${decl('SKIP_SEGMENT_TYPES')} ${decl('SKIP_PROMPT_MS')} let skipPrompt = null; ${decl('segmentStart')} ${decl('segmentEnd')}`;
+const SKIP = ['function skippableSegment(', 'async function checkSkipSegment(', 'function showSkipSegment(', 'function hideSkipSegment(', 'function skipSegment(',
+    'function segmentTypeName('];
+// Jellyfin Web's default actions: ask to skip intros and outros, nothing for the rest (playerprefs.js)
+const SKIP_PRELUDE = `${decl('SKIP_PROMPT_MS')} let skipPrompt = null; ${decl('segmentStart')} ${decl('segmentEnd')}
+    const SEGMENT_TYPES = ['Intro', 'Outro', 'Recap', 'Preview', 'Commercial'];
+    const segmentAction = type => (['Intro', 'Outro'].includes(type) ? 'AskToSkip' : 'None');
+    function showPlayerOsd() {}`;
 const seg = (Type, start, end) => ({ Type, StartTicks: start * 1e7, EndTicks: end * 1e7 });
 
 test('an intro or outro of 3 s or more is offered; an outro to the end with a next item is left to the card', () => {
