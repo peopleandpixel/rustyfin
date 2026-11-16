@@ -48037,3 +48037,183 @@ async fn r3admin_restart_stops_with_the_restart_exit_code() {
 fn r3admin_web_dashboard() {
     b124_node_test("r3admin_dashboard.mjs");
 }
+
+// ---- r3items: /Items Ids and ExcludeItemIds, /Localization/Options ----
+
+/// The names of a `/Items`-style answer, in order, and its TotalRecordCount. Panics unless 200.
+async fn r3items_names(app: &axum::Router, uri: &str, token: &str) -> (Vec<String>, i64) {
+    let (status, body) = send_authed(app, "GET", uri, token, None).await;
+    assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+    let names = body["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["Name"].as_str().unwrap().to_string())
+        .collect();
+    (names, body["TotalRecordCount"].as_i64().unwrap())
+}
+
+/// A library of four movies, Alpha to Delta, and their ids in that order.
+async fn r3items_movies(state: &AppState) -> (uuid::Uuid, Vec<uuid::Uuid>) {
+    let lib = j6_library(state, "R3 Items").await;
+    let mut ids = Vec::new();
+    for name in ["Alpha", "Bravo", "Charlie", "Delta"] {
+        ids.push(j6_add_item(state, lib, None, name, "Movie").await);
+    }
+    (lib, ids)
+}
+
+#[tokio::test]
+async fn r3items_ids_list_those_items_in_their_order() {
+    let state = test_state().await;
+    let (_, ids) = r3items_movies(&state).await;
+    let (token, user) = admin_session(&state).await;
+    let app = app(state);
+    let (a, b, c) = (ids[0], ids[1], ids[2]);
+    // Dashed and dashless ids, an unknown one skipped, the order of Ids kept without SortBy.
+    let list = format!("{c},{},{},{b}", a.simple(), uuid::Uuid::new_v4());
+    for uri in [
+        format!("/Items?Ids={list}"),
+        format!("/Users/{user}/Items?ids={list}"),
+    ] {
+        let (names, total) = r3items_names(&app, &uri, &token).await;
+        assert_eq!(names, ["Charlie", "Alpha", "Bravo"], "{uri}");
+        assert_eq!(total, 3, "{uri}");
+    }
+    // Paging follows the order of Ids; SortBy wins over it.
+    let (names, total) = r3items_names(
+        &app,
+        &format!("/Items?Ids={list}&StartIndex=1&Limit=1"),
+        &token,
+    )
+    .await;
+    assert_eq!((names, total), (vec!["Alpha".to_string()], 3));
+    let (names, _) =
+        r3items_names(&app, &format!("/Items?Ids={list}&SortBy=SortName"), &token).await;
+    assert_eq!(names, ["Alpha", "Bravo", "Charlie"]);
+    // Other filters still apply.
+    let (names, total) = r3items_names(
+        &app,
+        &format!("/Items?Ids={list}&IncludeItemTypes=Series&Recursive=true"),
+        &token,
+    )
+    .await;
+    assert_eq!((names.len(), total), (0, 0));
+    // Ids of no item at all: nothing, not every item.
+    let (names, total) = r3items_names(
+        &app,
+        &format!("/Items?Ids={}", uuid::Uuid::new_v4()),
+        &token,
+    )
+    .await;
+    assert_eq!((names.len(), total), (0, 0));
+}
+
+#[tokio::test]
+async fn r3items_exclude_item_ids_drops_those_items() {
+    let state = test_state().await;
+    let (lib, ids) = r3items_movies(&state).await;
+    let (token, _) = admin_session(&state).await;
+    let app = app(state);
+    let uri = format!(
+        "/Items?ParentId={lib}&Recursive=true&ExcludeItemIds={},{}",
+        ids[1].simple(),
+        ids[3]
+    );
+    let (names, total) = r3items_names(&app, &uri, &token).await;
+    assert_eq!((names, total), (vec!["Alpha".into(), "Charlie".into()], 2));
+    let uri = format!("/Items?Ids={},{}&excludeItemIds={}", ids[2], ids[0], ids[2]);
+    let (names, total) = r3items_names(&app, &uri, &token).await;
+    assert_eq!((names, total), (vec!["Alpha".to_string()], 1));
+}
+
+#[tokio::test]
+async fn r3items_ids_keep_the_callers_limits() {
+    let state = test_state().await;
+    let (_, ids) = r3items_movies(&state).await;
+    let other = j6_library(&state, "R3 Items Other").await;
+    let echo = j6_add_item(&state, other, None, "Echo", "Movie").await;
+    sqlx::query("UPDATE media_items SET official_rating = CASE name WHEN 'Bravo' THEN 'R' ELSE 'PG' END WHERE media_type = 'Movie'")
+        .execute(&state.db)
+        .await
+        .unwrap();
+    let app = app(state.clone());
+    let (admin, _) = admin_session(&state).await;
+    let kid = add_user(&state, "r3items-kid", "r3items-pass", false).await;
+    let (_, user) = send_authed(&app, "GET", &format!("/Users/{kid}"), &admin, None).await;
+    let mut policy = user["Policy"].clone();
+    policy["MaxParentalRating"] = 10.into();
+    policy["EnableAllFolders"] = false.into();
+    let movies = r3items_library_of(&state, ids[0]).await;
+    policy["EnabledFolders"] = serde_json::json!([movies]);
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        &format!("/Users/{kid}/Policy"),
+        &admin,
+        Some(&policy.to_string()),
+    )
+    .await;
+    assert!(status.is_success(), "{status}");
+    let (token, _) = login(&app, "r3items-kid", "r3items-pass").await.unwrap();
+    // Bravo is rated above the limit and Echo is in a library the user can't see.
+    let uri = format!("/Items?Ids={},{echo},{},{}", ids[2], ids[1], ids[0]);
+    let (names, total) = r3items_names(&app, &uri, &token).await;
+    assert_eq!((names, total), (vec!["Charlie".into(), "Alpha".into()], 2));
+    let (names, _) = r3items_names(&app, &uri, &admin).await;
+    assert_eq!(names, ["Charlie", "Echo", "Bravo", "Alpha"]);
+}
+
+/// The stored library id of an item.
+async fn r3items_library_of(state: &AppState, item: uuid::Uuid) -> String {
+    sqlx::query_scalar("SELECT library_id FROM media_items WHERE id = ?")
+        .bind(item.to_string())
+        .fetch_one(&state.db)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn r3items_localization_options_are_jellyfins_name_value_list() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let app = app(state);
+    let (status, body) = send_authed(&app, "GET", "/Localization/Options", &token, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let options = body.as_array().expect("a list");
+    assert!(options.len() > 60, "{}", options.len());
+    assert!(options.iter().all(|o| o.as_object().unwrap().len() == 2
+        && o["Name"].is_string()
+        && o["Value"].is_string()));
+    assert!(options.contains(&serde_json::json!({ "Name": "English", "Value": "en-US" })));
+    assert!(options.contains(&serde_json::json!({ "Name": "Deutsch", "Value": "de" })));
+    // Cultures, countries and ratings keep Jellyfin's shapes.
+    let (_, cultures) = send_authed(&app, "GET", "/Localization/Cultures", &token, None).await;
+    let german = cultures
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["TwoLetterISOLanguageName"] == "de")
+        .unwrap();
+    assert_eq!(
+        german["ThreeLetterISOLanguageNames"],
+        serde_json::json!(["deu", "ger"])
+    );
+    assert!(german["Name"].is_string() && german["DisplayName"].is_string());
+    let (_, countries) = send_authed(&app, "GET", "/Localization/Countries", &token, None).await;
+    let us = countries
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["Name"] == "US")
+        .unwrap();
+    assert_eq!(us["TwoLetterISORegionName"], "US");
+    assert_eq!(us["ThreeLetterISORegionName"], "USA");
+    let (_, ratings) =
+        send_authed(&app, "GET", "/Localization/ParentalRatings", &token, None).await;
+    let first = &ratings.as_array().unwrap()[0];
+    assert!(
+        first["Name"].is_string() && first.get("Value").is_some(),
+        "{first}"
+    );
+}

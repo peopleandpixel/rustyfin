@@ -245,79 +245,97 @@ async fn delete_provider(
     Ok(StatusCode::OK)
 }
 
+/// Jellyfin's `LocalizationOption`: a display language the web client is offered.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "PascalCase")]
-struct LocalizationOptions {
-    #[serde(rename = "SubtitleLanguages")]
-    subtitle_languages: Vec<LanguageDto>,
+struct LocalizationOption {
+    name: &'static str,
+    value: &'static str,
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "PascalCase")]
-struct LanguageDto {
-    two_letter_code: String,
-    english_name: String,
-    local_name: String,
-}
+/// The display languages, as `LocalizationManager.GetLocalizationOptions` lists them.
+const LOCALIZATION_OPTIONS: &[(&str, &str)] = &[
+    ("Afrikaans", "af"),
+    ("العربية", "ar"),
+    ("Беларуская", "be"),
+    ("Български", "bg-BG"),
+    ("বাংলা (বাংলাদেশ)", "bn"),
+    ("Català", "ca"),
+    ("Čeština", "cs"),
+    ("Cymraeg", "cy"),
+    ("Dansk", "da"),
+    ("Deutsch", "de"),
+    ("English (United Kingdom)", "en-GB"),
+    ("English", "en-US"),
+    ("Ελληνικά", "el"),
+    ("Esperanto", "eo"),
+    ("Español", "es"),
+    ("Español americano", "es_419"),
+    ("Español (Argentina)", "es-AR"),
+    ("Español (Dominicana)", "es_DO"),
+    ("Español (México)", "es-MX"),
+    ("Eesti", "et"),
+    ("Basque", "eu"),
+    ("فارسی", "fa"),
+    ("Suomi", "fi"),
+    ("Filipino", "fil"),
+    ("Français", "fr"),
+    ("Français (Canada)", "fr-CA"),
+    ("Galego", "gl"),
+    ("Schwiizerdütsch", "gsw"),
+    ("עִבְרִית", "he"),
+    ("हिन्दी", "hi"),
+    ("Hrvatski", "hr"),
+    ("Magyar", "hu"),
+    ("Bahasa Indonesia", "id"),
+    ("Íslenska", "is"),
+    ("Italiano", "it"),
+    ("日本語", "ja"),
+    ("Qazaqşa", "kk"),
+    ("한국어", "ko"),
+    ("Lietuvių", "lt"),
+    ("Latviešu", "lv"),
+    ("Македонски", "mk"),
+    ("മലയാളം", "ml"),
+    ("मराठी", "mr"),
+    ("Bahasa Melayu", "ms"),
+    ("Norsk bokmål", "nb"),
+    ("नेपाली", "ne"),
+    ("Nederlands", "nl"),
+    ("Norsk nynorsk", "nn"),
+    ("ਪੰਜਾਬੀ", "pa"),
+    ("Polski", "pl"),
+    ("Pirate", "pr"),
+    ("Português", "pt"),
+    ("Português (Brasil)", "pt-BR"),
+    ("Português (Portugal)", "pt-PT"),
+    ("Românește", "ro"),
+    ("Русский", "ru"),
+    ("Slovenčina", "sk"),
+    ("Slovenščina", "sl-SI"),
+    ("Shqip", "sq"),
+    ("Српски", "sr"),
+    ("Svenska", "sv"),
+    ("தமிழ்", "ta"),
+    ("తెలుగు", "te"),
+    ("ภาษาไทย", "th"),
+    ("Türkçe", "tr"),
+    ("Українська", "uk"),
+    ("اُردُو", "ur_PK"),
+    ("Tiếng Việt", "vi"),
+    ("汉语 (简体字)", "zh-CN"),
+    ("漢語 (繁體字)", "zh-TW"),
+    ("廣東話 (香港)", "zh-HK"),
+];
 
-async fn get_options(_state: State<AppState>) -> Result<Json<LocalizationOptions>, ApiError> {
-    // Return a default set of common subtitle languages
-    let languages = vec![
-        LanguageDto {
-            two_letter_code: "en".to_string(),
-            english_name: "English".to_string(),
-            local_name: "English".to_string(),
-        },
-        LanguageDto {
-            two_letter_code: "de".to_string(),
-            english_name: "German".to_string(),
-            local_name: "Deutsch".to_string(),
-        },
-        LanguageDto {
-            two_letter_code: "fr".to_string(),
-            english_name: "French".to_string(),
-            local_name: "Français".to_string(),
-        },
-        LanguageDto {
-            two_letter_code: "es".to_string(),
-            english_name: "Spanish".to_string(),
-            local_name: "Español".to_string(),
-        },
-        LanguageDto {
-            two_letter_code: "it".to_string(),
-            english_name: "Italian".to_string(),
-            local_name: "Italiano".to_string(),
-        },
-        LanguageDto {
-            two_letter_code: "ja".to_string(),
-            english_name: "Japanese".to_string(),
-            local_name: "日本語".to_string(),
-        },
-        LanguageDto {
-            two_letter_code: "ko".to_string(),
-            english_name: "Korean".to_string(),
-            local_name: "한국어".to_string(),
-        },
-        LanguageDto {
-            two_letter_code: "pt".to_string(),
-            english_name: "Portuguese".to_string(),
-            local_name: "Português".to_string(),
-        },
-        LanguageDto {
-            two_letter_code: "ru".to_string(),
-            english_name: "Russian".to_string(),
-            local_name: "Русский".to_string(),
-        },
-        LanguageDto {
-            two_letter_code: "zh".to_string(),
-            english_name: "Chinese".to_string(),
-            local_name: "中文".to_string(),
-        },
-    ];
-
-    Ok(Json(LocalizationOptions {
-        subtitle_languages: languages,
-    }))
+/// GET /Localization/Options - the display languages, Jellyfin's list of `{ Name, Value }`
+async fn get_options() -> Json<Vec<LocalizationOption>> {
+    Json(
+        LOCALIZATION_OPTIONS
+            .iter()
+            .map(|&(name, value)| LocalizationOption { name, value })
+            .collect(),
+    )
 }
 
 #[cfg(test)]

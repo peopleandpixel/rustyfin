@@ -2055,6 +2055,13 @@ struct ItemsQuery {
     group_projects: Option<bool>,
     #[serde(rename = "groupProjects")]
     group_projects_lower: Option<bool>,
+    /// Jellyfin's Ids: only these items, in this order when no SortBy is given
+    ids: Option<String>,
+    #[serde(rename = "ids")]
+    ids_lower: Option<String>,
+    exclude_item_ids: Option<String>,
+    #[serde(rename = "excludeItemIds")]
+    exclude_item_ids_lower: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -2085,6 +2092,14 @@ impl ItemsQuery {
     }
     fn sort_by(&self) -> Option<&str> {
         self.sort_by.as_deref().or(self.sort_by_lower.as_deref())
+    }
+    fn ids(&self) -> Option<&str> {
+        self.ids.as_deref().or(self.ids_lower.as_deref())
+    }
+    fn exclude_item_ids(&self) -> Option<&str> {
+        self.exclude_item_ids
+            .as_deref()
+            .or(self.exclude_item_ids_lower.as_deref())
     }
     fn sort_order(&self) -> Option<&str> {
         self.sort_order
@@ -2501,10 +2516,28 @@ async fn get_items(
                 .await?;
         item_ids = Some(narrow_ids(item_ids, ids));
     }
+    // Ids keeps only the listed items (Jellyfin's `InternalItemsQuery.ItemIds`); ids of no item
+    // are skipped, and an empty list filters nothing, as in Jellyfin.
+    let requested = parse_ids(query.ids());
+    if !requested.is_empty() {
+        let ids = requested.iter().map(Uuid::to_string).collect();
+        item_ids = Some(narrow_ids(item_ids, ids));
+    }
     let hidden = HiddenItems::for_caller(&state, &claims).await?;
-    let hidden_json = hidden.json();
+    // ExcludeItemIds drops items as the caller's hidden ones are dropped.
+    let hidden_json = hidden.json_excluding(&parse_ids(query.exclude_item_ids()));
 
-    let (items, total) = rustyfin_db::repo_media::get_items_filtered(
+    // With more than one id and no SortBy, Jellyfin answers in the order of Ids
+    // (`Folder.SortItemsByRequest`): every match is fetched, ordered, then paged here.
+    let in_request_order =
+        requested.len() > 1 && query.sort_by().is_none_or(|s| s.trim().is_empty());
+    let (fetch_start, fetch_limit) = if in_request_order {
+        (0, requested.len() as i64)
+    } else {
+        (start_index, limit)
+    };
+
+    let (mut items, total) = rustyfin_db::repo_media::get_items_filtered(
         &state.db_ro,
         parent_id,
         query.library_id(),
@@ -2517,8 +2550,8 @@ async fn get_items(
         query.name_starts_with_or_greater(),
         query.sort_by(),
         query.sort_order(),
-        start_index,
-        limit,
+        fetch_start,
+        fetch_limit,
         query.recursive(),
         is_favorite,
         is_unplayed,
@@ -2536,6 +2569,18 @@ async fn get_items(
         hidden_json.as_deref(),
     )
     .await?;
+    if in_request_order {
+        let mut position = std::collections::HashMap::new();
+        for (index, id) in requested.iter().enumerate() {
+            position.entry(*id).or_insert(index);
+        }
+        items.sort_by_key(|item| position.get(&item.id).copied().unwrap_or(usize::MAX));
+        items = items
+            .into_iter()
+            .skip(start_index as usize)
+            .take(limit as usize)
+            .collect();
+    }
 
     if query.card_index() {
         let result =
