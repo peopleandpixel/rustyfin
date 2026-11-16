@@ -14,7 +14,15 @@ const HOME_SLOT_DEFAULTS = [
 // The settings Jellyfin Web keeps only on the device, which the player reads there (playerprefs.js):
 // true for those kept per user on the device. The device's value wins, as in Jellyfin Web; the
 // account's fills a device that has none, and a save here writes both.
-const DEVICE_SETTINGS = { maxStreamingBitrate: false, subtitleburnin: false, localplayersubtitleappearance3: true };
+// The screensaver and its idle time are kept per user on the device too (screensaver.js): Jellyfin Web's
+// backdrop screensaver, its default idle time and the idle times the Display settings offer, in seconds.
+const SCREENSAVER_BACKDROP = 'backdropscreensaver';
+const DEFAULT_IDLE_SECONDS = 180;
+const SCREENSAVER_TIMES = [60, 180, 300, 600, 900, 1800];
+const DEVICE_SETTINGS = {
+    maxStreamingBitrate: false, subtitleburnin: false, localplayersubtitleappearance3: true, screensaver: true,
+    screensaverTime: true,
+};
 
 let loaded = null; // { userId, config, prefs }
 let loading = null;
@@ -186,5 +194,6 @@ function applyUserSettings() {
 
 export {
     HOME_SECTIONS, HOME_SLOT_DEFAULTS, homeSlots, homeSlotValues, loadUserSettings, userSetting, userConfiguration, saveUserSettings, saveUserConfiguration,
-    homeSections, showsInLatest, showsInMyMedia, arrangeLibraries, libraryKey, showBackdrops, applyUserSettings, avatarUrl, showAvatar,
+    homeSections, showsInLatest, showsInMyMedia, arrangeLibraries, libraryKey, showBackdrops, applyUserSettings, avatarUrl,
+    showAvatar, SCREENSAVER_BACKDROP, DEFAULT_IDLE_SECONDS, SCREENSAVER_TIMES,
 };

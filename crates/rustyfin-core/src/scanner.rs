@@ -1350,11 +1350,45 @@ async fn scan_tv_library(
             lib_path
         );
 
+        let classes: Vec<extras::Classified> = files
+            .iter()
+            .map(|file| extras::classify_tv_file(file, path))
+            .collect();
+        // The episode files by folder: an episode's extras belong to one of the episodes next to them.
+        let mut episodes_by_dir: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
+        for (file, class) in files.iter().zip(&classes) {
+            if *class == extras::Classified::No
+                && is_episode_file(file)
+                && let Some(dir) = file.parent()
+            {
+                episodes_by_dir
+                    .entry(dir.to_path_buf())
+                    .or_default()
+                    .push(file.clone());
+            }
+        }
+
         let mut scanned_files = 0u32;
         let mut skipped_ext = 0u32;
-        for file_path_buf in files {
+        for (file_path_buf, class) in files.into_iter().zip(classes) {
             scanned_files += 1;
-            match extras::classify_tv_file(&file_path_buf, path) {
+            match class {
+                extras::Classified::Extra(mut found) if found.of_episode => {
+                    let episodes = episodes_by_dir
+                        .get(&found.owner_dir)
+                        .map(Vec::as_slice)
+                        .unwrap_or_default();
+                    found.owner_paths = extras::owning_episode(&found, episodes);
+                    if !found.owner_paths.is_empty() {
+                        found_extras.push(found);
+                        continue;
+                    }
+                    // An episode folder's extras folder with no one episode next to it is skipped; a suffix
+                    // file that names no episode next to it is an episode, as before.
+                    if found.owner_name.trim().is_empty() {
+                        continue;
+                    }
+                }
                 extras::Classified::Extra(mut found) => {
                     // The series or season folder; it owns the extra once it is stored.
                     found.owner_paths = vec![found.owner_dir.clone()];
@@ -2512,8 +2546,18 @@ async fn scan_music_library(
 
     // Remove the items that this scan no longer collects. A failure is logged, not returned.
     let covers = local_images::embedded_cover_paths(pool, library.id).await;
+    let uploads = crate::lyrics::uploads_in_library(pool, library.id).await;
     let removed = remove_uncollected(pool, library, &filter, &collected, &unreadable, &loops).await;
     local_images::remove_orphaned_covers(pool, &covers).await;
+    crate::lyrics::remove_orphaned_uploads(pool, &uploads).await;
+    // The lyric files beside the tracks, as Jellyfin finds them on a scan, for their HasLyrics.
+    if let Err(e) = crate::lyrics::sync_sidecars(pool, library.id, &filter).await {
+        tracing::error!(
+            "failed to record the lyric files of '{}': {}",
+            library.name,
+            e
+        );
+    }
     tracing::info!(
         "scanned music library '{}': {} new items added ({} existing items unchanged)",
         library.name,

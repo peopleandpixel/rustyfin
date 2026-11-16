@@ -51,13 +51,14 @@ function sandbox() {
          ${slice('function libraryPrefsId(')}
          ${slice('function libraryListQuery(')}
          ${slice('function libraryViewMenu(')}
+         ${slice('function libraryTabs(')}
          ${slice('function libraryTabBar(')}
          ${slice('function libraryShape(')}
          ${slice('function libraryCardOptions(')}
          ${slice('function libraryGridClass(')}
          ${slice('function libraryPlaceholder(')}
          ${slice('function libraryPictureTag(')}
-         var currentLibraryTab = '', currentLibraryGenre = null;
+         var currentLibraryTab = '', currentLibraryGenre = null, currentLibraryScope = null;
          var libraryPrefs = libraryPrefsFromDisplay(null);
          this.fns = { librarySorts, libraryList, libraryPrefsFromDisplay, libraryPrefsToDisplay, libraryPrefsId,
              libraryListQuery, libraryViewMenu, libraryTabBar, libraryShape, libraryCardOptions, libraryGridClass,
@@ -176,10 +177,12 @@ test('the view menu and the tab bars', () => {
     assert.match(menu, /name="lib-size" value="large" checked/);
     assert.equal((menu.match(/name="lib-layout"/g) || []).length, 4);
     const tv = fns.libraryTabBar('shows', 'TvShows', 'episodes');
-    assert.deepEqual([...tv.matchAll(/data-id="([^"]+)"/g)].map(m => m[1]), ['shows', 'shows/episodes', 'shows/genres']);
+    assert.deepEqual([...tv.matchAll(/data-id="([^"]+)"/g)].map(m => m[1]),
+        ['shows', 'shows/suggestions', 'shows/upcoming', 'shows/genres', 'shows/studios', 'shows/episodes']);
     assert.match(tv, /aria-selected="true" data-action="navigate" data-page="library" data-id="shows\/episodes"/);
     const films = fns.libraryTabBar('films', 'Movies', 'main');
-    assert.deepEqual([...films.matchAll(/data-id="([^"]+)"/g)].map(m => m[1]), ['films', 'films/collections', 'films/genres']);
+    assert.deepEqual([...films.matchAll(/data-id="([^"]+)"/g)].map(m => m[1]),
+        ['films', 'films/suggestions', 'films/favorites', 'films/collections', 'films/genres']);
     assert.match(films, /library.tab_movies/);
 });
 

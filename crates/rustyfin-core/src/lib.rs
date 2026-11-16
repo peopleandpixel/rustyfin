@@ -11,6 +11,7 @@ mod key_frames;
 pub mod library_monitor;
 pub mod library_watch;
 pub mod local_images;
+pub mod lyrics;
 pub mod mdns;
 pub mod media_reads;
 pub mod media_segments;

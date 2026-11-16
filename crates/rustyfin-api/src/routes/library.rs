@@ -139,17 +139,21 @@ async fn get_user_views(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
     Path(user_id): Path<Uuid>,
+    Query(params): Query<Vec<(String, String)>>,
 ) -> Result<Json<Value>, ApiError> {
     // An administrator may look at another user's views; anyone else gets their own.
     let user = if claims.is_admin { user_id } else { claims.sub };
-    Ok(Json(views_for(&state, user).await?))
+    let include_hidden = crate::query::bool_param(&params, "includeHidden")?.unwrap_or(false);
+    Ok(Json(views_for(&state, user, include_hidden).await?))
 }
 
 async fn get_user_views_no_user(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
+    Query(params): Query<Vec<(String, String)>>,
 ) -> Result<Json<Value>, ApiError> {
-    Ok(Json(views_for(&state, claims.sub).await?))
+    let include_hidden = crate::query::bool_param(&params, "includeHidden")?.unwrap_or(false);
+    Ok(Json(views_for(&state, claims.sub, include_hidden).await?))
 }
 
 /// Orders `views` by the user's `OrderedViews`, as Jellyfin's `UserViewManager`: the libraries it
@@ -173,8 +177,10 @@ fn order_views(views: &mut Value, config: &Value) {
     }
 }
 
-/// Every library as a view (cached for all users), less those `user`'s library access leaves out.
-async fn views_for(state: &AppState, user: Uuid) -> Result<Value, ApiError> {
+/// Every library as a view (cached for all users), in the user's `OrderedViews` order, less those
+/// `user`'s library access leaves out and, unless `include_hidden` (Jellyfin's `includeHidden`),
+/// those in the user's `MyMediaExcludes`.
+async fn views_for(state: &AppState, user: Uuid, include_hidden: bool) -> Result<Value, ApiError> {
     let mut views = match state.cache.library_views.get("views") {
         Some(cached) => cached,
         None => {
@@ -200,6 +206,30 @@ async fn views_for(state: &AppState, user: Uuid) -> Result<Value, ApiError> {
         items.retain(|v| v["Id"].as_str().is_some_and(|id| policy.allows_folder(id)));
         let count = items.len();
         views["TotalRecordCount"] = count.into();
+    }
+    if !include_hidden {
+        let config = rustyfin_db::repo_user::get_user_by_id(&state.db_ro, user)
+            .await?
+            .map(|u| rustyfin_model::user::jellyfin_configuration(&u.configuration))
+            .unwrap_or_default();
+        let excluded: Vec<Uuid> = config["MyMediaExcludes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|id| id.as_str().and_then(|id| Uuid::parse_str(id).ok()))
+            .collect();
+        if !excluded.is_empty()
+            && let Some(items) = views.get_mut("Items").and_then(Value::as_array_mut)
+        {
+            items.retain(|v| {
+                v["Id"]
+                    .as_str()
+                    .and_then(|id| Uuid::parse_str(id).ok())
+                    .is_none_or(|id| !excluded.contains(&id))
+            });
+            let count = items.len();
+            views["TotalRecordCount"] = count.into();
+        }
     }
     Ok(views)
 }
@@ -346,8 +376,13 @@ async fn remove_library(
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>, ApiError> {
     let covers = rustyfin_core::local_images::embedded_cover_paths(&state.db, id).await;
-    rustyfin_db::repo_library::delete_library(&state.db, id).await?;
+    let lyrics = rustyfin_core::lyrics::uploads_in_library(&state.db, id).await;
+    // Jellyfin answers 404 for a library it doesn't have
+    if !rustyfin_db::repo_library::delete_library(&state.db, id).await? {
+        return Err(ApiError::NotFound("library not found".into()));
+    }
     rustyfin_core::local_images::remove_orphaned_covers(&state.db, &covers).await;
+    rustyfin_core::lyrics::remove_orphaned_uploads(&state.db, &lyrics).await;
     state.cache.invalidate_library_lists();
     crate::routes::streaming::forget_library_roots(&state);
     state.task_scheduler.watcher().libraries_changed();
