@@ -34769,10 +34769,23 @@ async fn r3playback_universal_keeps_the_clients_play_session_id() {
         let (_, body) = send(&app, request("GET", &lower, Some(&token), None)).await;
         assert_eq!(body["PlaySessionId"], decoded.trim(), "{lower}");
     }
-    let uri = format!("/Audio/{song}/universal?PlaySessionId=client-audio");
-    let (status, body) = send(&app, request("GET", &uri, Some(&token), None)).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["PlaySessionId"], "client-audio");
+    // Universal audio answers with audio, as Jellyfin's does: its HLS transcode keeps the id
+    let uri = format!(
+        "/Audio/{song}/universal?Container=mp3&TranscodingContainer=ts&TranscodingProtocol=hls\
+         &AudioCodec=aac&PlaySessionId=client-audio"
+    );
+    let req = Request::builder()
+        .uri(&uri)
+        .header("Authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FOUND, "{uri}");
+    let location = resp.headers()["location"].to_str().unwrap();
+    assert!(
+        location.contains("PlaySessionId=client-audio"),
+        "{location}"
+    );
 
     // No id, or a blank one: a new id each call
     let mut ids = std::collections::HashSet::new();
@@ -35735,6 +35748,28 @@ async fn b22_subtitle_vtt_moves_cues_back_by_the_start() {
     let at = |index: i32, ticks: i64| {
         format!("/Videos/{id}/{msid}/Subtitles/{index}/{ticks}/Stream.vtt")
     };
+    // The same stream as SubRip, as a client with an srt subtitle profile asks for it, whole and
+    // moved the same way
+    let srt = format!("/Videos/{id}/{msid}/Subtitles/2/Stream.srt");
+    let (status, content_type, body) = b22_get(&app, &srt, &token).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(content_type, "application/x-subrip; charset=utf-8");
+    assert!(
+        body.contains("00:00:01,000 --> 00:00:02,000\nEmbedded one"),
+        "{body}"
+    );
+    let srt = format!("/Videos/{id}/{msid}/Subtitles/2/15000000/Stream.srt");
+    let (status, _, body) = b22_get(&app, &srt, &token).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.starts_with("1\n00:00:00,000 --> 00:00:00,500\nEmbedded one"),
+        "{body}"
+    );
+    assert!(
+        body.contains("2\n00:00:01,500 --> 00:00:02,500\nEmbedded two"),
+        "{body}"
+    );
+
     let (status, content_type, body) = b22_get(&app, &at(2, 15_000_000), &token).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(content_type, "text/vtt; charset=utf-8");
@@ -35791,9 +35826,11 @@ async fn b22_subtitle_vtt_refuses_bad_requests() {
 
     let other = uuid::Uuid::new_v4();
     let cases = [
-        // Only WebVTT is served
+        // Only the text formats the endpoint writes (vtt, srt, subrip, ass, ssa) are served; an
+        // srt of a text stream plays (b22_subtitle_vtt_moves_cues_back_by_the_start). This
+        // fixture's file isn't written, so only refusals made before the file is opened fit here.
         (
-            format!("/Videos/{id}/{msid}/Subtitles/3/Stream.srt"),
+            format!("/Videos/{id}/{msid}/Subtitles/3/Stream.smi"),
             StatusCode::BAD_REQUEST,
         ),
         // A picture subtitle has no text: players burn it in
@@ -43341,10 +43378,10 @@ async fn j2_chrome_profile_sets_the_device_data() {
         &token,
     );
     let expected = format!(
-        "/Videos/{hi10}/main.m3u8?DeviceId=j2-device&MediaSourceId={hi10_source}&VideoCodec=h264\
-         &AudioCodec=aac&AudioStreamIndex=1&VideoBitrate=119872&AudioBitrate=128\
+        "/Videos/{hi10}/master.m3u8?DeviceId=j2-device&MediaSourceId={hi10_source}&VideoCodec=h264\
+         &AudioCodec=aac&AudioStreamIndex=1&VideoBitrate=119872000&AudioBitrate=128000\
          &AudioSampleRate=48000&MaxFramerate=24&SegmentContainer=ts&MinSegments=1\
-         &PlaySessionId={ps}&api_key=<token>&TranscodingMaxAudioChannels=2&RequireAvc=false\
+         &PlaySessionId={ps}&ApiKey=<token>&TranscodingMaxAudioChannels=2&RequireAvc=false\
          &EnableAudioVbrEncoding=true&h264-videobitdepth=10\
          &h264-profile=high,main,baseline,constrainedbaseline&h264-audiochannels=2\
          &aac-profile=lc&h264-rangetype=SDR&h264-level=52&h264-deinterlace=true\
@@ -43366,7 +43403,7 @@ async fn j2_chrome_profile_sets_the_device_data() {
         &token,
     );
     assert!(
-        url.starts_with(&format!("/Videos/{p422}/main.m3u8?")),
+        url.starts_with(&format!("/Videos/{p422}/master.m3u8?")),
         "{url}"
     );
 
@@ -43528,7 +43565,7 @@ async fn j2_subtitles_get_deliveries() {
         assert_eq!(subtitle["IsExternalUrl"], false, "stream {index}");
         let url = j2_hide(subtitle["DeliveryUrl"].as_str().unwrap_or_default(), &token);
         let expected =
-            format!("/Videos/{item}/{source_id}/Subtitles/{index}/0/Stream.vtt?api_key=<token>");
+            format!("/Videos/{item}/{source_id}/Subtitles/{index}/0/Stream.vtt?ApiKey=<token>");
         assert_eq!(url, expected, "stream {index}");
     }
     for index in [0, 1] {
@@ -43587,7 +43624,7 @@ async fn j2_audio_items_use_the_audio_profiles() {
         &token,
     );
     assert!(
-        url.starts_with(&format!("/Videos/{ac3}/main.m3u8?")),
+        url.starts_with(&format!("/Videos/{ac3}/master.m3u8?")),
         "{url}"
     );
     assert!(url.contains("&AudioCodec=aac&"), "{url}");
@@ -43664,10 +43701,10 @@ async fn j2_profile_comes_from_the_device_capabilities() {
         sources[0]["TranscodingUrl"].as_str().unwrap_or_default(),
         &token,
     );
-    let start = format!("/Videos/{item}/main.m3u8?DeviceId=j2-caps-device&");
+    let start = format!("/Videos/{item}/master.m3u8?DeviceId=j2-caps-device&");
     assert!(url.starts_with(&start), "{url}");
     assert!(
-        url.contains(&format!("&PlaySessionId={ps}&api_key=<token>&")),
+        url.contains(&format!("&PlaySessionId={ps}&ApiKey=<token>&")),
         "{url}"
     );
     let body = serde_json::json!({ "MaxStreamingBitrate": 120_000_000 });
@@ -43872,6 +43909,170 @@ async fn j2_odd_requests_never_fail_the_server() {
     }
 }
 
+// R3 decisions: universal audio
+
+/// `GET {uri}` with `token`: the status, the Location header and the body.
+async fn r3decisions_get(
+    app: &axum::Router,
+    uri: &str,
+    token: &str,
+) -> (StatusCode, Option<String>, Vec<u8>) {
+    r3decisions_send(app, "GET", uri, token).await.0
+}
+
+/// `{method} {uri}` with `token`: (status, Location, body) and the Content-Type.
+async fn r3decisions_send(
+    app: &axum::Router,
+    method: &str,
+    uri: &str,
+    token: &str,
+) -> ((StatusCode, Option<String>, Vec<u8>), Option<String>) {
+    let req = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("Authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let header = |name: &str| {
+        resp.headers()
+            .get(name)
+            .map(|v| v.to_str().unwrap().to_string())
+    };
+    let (location, content_type) = (header("location"), header("content-type"));
+    let body = resp
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .to_vec();
+    ((status, location, body), content_type)
+}
+
+/// `/Audio/{id}/universal` answers with audio, as Jellyfin's does, not with JSON: the file when
+/// the query's containers take it, else the HLS transcode the stream builder chose.
+#[tokio::test]
+async fn r3decisions_universal_audio_plays_the_file_or_the_hls_transcode() {
+    let state = test_state().await;
+    add_user(&state, "r3d-audio", "r3d-pass", true).await;
+    let (song, _, _) = j2_item(
+        &state,
+        "r3d-song",
+        "Audio",
+        "flac",
+        j2_song("flac", 900_000),
+    )
+    .await;
+    let transcodes = state.transcode_manager.clone();
+    let app = app(state);
+    let (token, _) = g2_login_device(&app, "r3d-audio", "r3d-pass", "r3d-device")
+        .await
+        .unwrap();
+
+    // Jellyfin Web on Chrome takes FLAC: the file itself
+    let (status, location, body) = r3decisions_get(
+        &app,
+        &format!(
+            "/Audio/{song}/universal?Container=opus,webm|opus,mp3,aac,m4a|aac,flac\
+             &TranscodingContainer=mp4&TranscodingProtocol=hls&AudioCodec=aac\
+             &MaxStreamingBitrate=140000000"
+        ),
+        &token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(location, None);
+    assert_eq!(body.len(), 1000);
+
+    // A client that takes only MP3 and AAC over HLS gets the transcode, in its play session
+    let hls = format!(
+        "/audio/{song}/universal?container=mp3,aac&transcodingContainer=ts\
+         &transcodingProtocol=hls&audioCodec=aac&maxStreamingBitrate=320000\
+         &PlaySessionId=r3d-session"
+    );
+    // Jellyfin Web asks HEAD first: the playlist's type, and no transcode starts
+    let ((status, location, _), content_type) = r3decisions_send(&app, "HEAD", &hls, &token).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(location, None);
+    assert_eq!(
+        content_type.as_deref(),
+        Some("application/vnd.apple.mpegurl")
+    );
+    assert!(
+        !transcodes.is_active(song).await,
+        "HEAD started a transcode"
+    );
+    let (status, location, _) = r3decisions_get(&app, &hls, &token).await;
+    assert_eq!(status, StatusCode::FOUND);
+    let location = location.unwrap();
+    assert!(
+        location.starts_with(&format!("/Videos/{song}/master.m3u8?")),
+        "{location}"
+    );
+    assert!(location.contains("AudioCodec=aac"), "{location}");
+    assert!(location.contains("AudioOnly=true"), "{location}");
+    assert!(location.contains("PlaySessionId=r3d-session"), "{location}");
+    // HEAD of a file the client plays as it is: the file's headers
+    let ((status, _, _), content_type) = r3decisions_send(
+        &app,
+        "HEAD",
+        &format!("/Audio/{song}/universal?Container=flac&MaxStreamingBitrate=140000000"),
+        &token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(content_type.as_deref(), Some("audio/flac"));
+
+    // No MaxStreamingBitrate: Jellyfin's default profile limit (8 Mbps) applies, as in
+    // UniversalAudioController, so this 10 Mbps file is transcoded, over HLS when allowed
+    let (status, location, _) = r3decisions_get(
+        &app,
+        &format!(
+            "/Audio/{song}/universal?Container=flac&TranscodingContainer=ts\
+             &TranscodingProtocol=hls&AudioCodec=aac"
+        ),
+        &token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FOUND);
+    assert!(location.unwrap().contains("ContainerBitrateExceedsLimit"));
+
+    // A progressive transcode isn't available: 400 that says so, not the FLAC as it is
+    let (status, _, body) = r3decisions_get(
+        &app,
+        &format!(
+            "/Audio/{song}/universal?Container=mp3&TranscodingContainer=mp3\
+             &TranscodingProtocol=http&AudioCodec=mp3"
+        ),
+        &token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(String::from_utf8_lossy(&body).contains("HLS only"));
+
+    // stream.{container} answered 500, as its second path parameter failed the extractor. An MP3
+    // request for the FLAC track is a 400 now; the track's own codec, or static, gets the file.
+    let (status, _, body) = r3decisions_get(
+        &app,
+        &format!("/Audio/{song}/stream.mp3?AudioCodec=mp3&AudioBitrate=192000"),
+        &token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(String::from_utf8_lossy(&body).contains("HLS only"));
+    for uri in [
+        format!("/Audio/{song}/stream.flac"),
+        format!("/Audio/{song}/stream.mp3?static=true"),
+        format!("/Audio/{song}/stream?AudioCodec=flac,mp3"),
+    ] {
+        let (status, _, body) = r3decisions_get(&app, &uri, &token).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert_eq!(body.len(), 1000, "{uri}");
+    }
+}
+
 #[tokio::test]
 async fn j2_old_routes_answer_as_before() {
     let state = test_state().await;
@@ -43893,7 +44094,8 @@ async fn j2_old_routes_answer_as_before() {
         format!("/Videos/{video}/PlaybackInfo"),
         format!("/Videos/{video}/Universal?VideoCodecs=h264&AudioCodecs=aac"),
         format!("/Audio/{song}/PlaybackInfo"),
-        format!("/Audio/{song}/universal?Container=mp3,flac"),
+        // The test file claims 10 Mbps, over the default 8 Mbps limit; real clients send theirs
+        format!("/Audio/{song}/universal?Container=mp3,flac&MaxStreamingBitrate=140000000"),
     ];
     let before = j2_answers(&app, &routes, &token).await;
     for (uri, (status, _)) in routes.iter().zip(&before) {

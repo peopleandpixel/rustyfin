@@ -151,11 +151,16 @@ fn reasons(list: &[R]) -> TranscodeReasons {
 
 /// Subtitle stream `index` of source `src1` delivered as a WebVTT file that starts at `ticks`.
 fn vtt(index: i32, ticks: i64) -> SubtitleDelivery {
+    file(index, ticks, "vtt")
+}
+
+/// Subtitle stream `index` of source `src1` delivered as a `format` file that starts at `ticks`.
+fn file(index: i32, ticks: i64, format: &str) -> SubtitleDelivery {
     SubtitleDelivery {
         index,
         method: M::External,
         url: Some(format!(
-            "/Videos/{ITEM}/src1/Subtitles/{index}/{ticks}/Stream.vtt?api_key=tok"
+            "/Videos/{ITEM}/src1/Subtitles/{index}/{ticks}/Stream.{format}?ApiKey=tok"
         )),
     }
 }
@@ -170,13 +175,13 @@ fn by(index: i32, method: M) -> SubtitleDelivery {
 }
 
 /// The URL of an HLS transcode for `dev1`, source `src1`, session `ps1` and token `tok`. `media`
-/// holds the parameters between MediaSourceId and PlaySessionId, `rest` those after `api_key`.
+/// holds the parameters between MediaSourceId and PlaySessionId, `rest` those after `ApiKey`.
 fn hls_url(media: &[&str], rest: &[&str]) -> String {
     let mut params = vec!["DeviceId=dev1", "MediaSourceId=src1"];
     params.extend_from_slice(media);
-    params.extend_from_slice(&["PlaySessionId=ps1", "api_key=tok"]);
+    params.extend_from_slice(&["PlaySessionId=ps1", "ApiKey=tok"]);
     params.extend_from_slice(rest);
-    format!("/Videos/{ITEM}/main.m3u8?{}", params.join("&"))
+    format!("/Videos/{ITEM}/master.m3u8?{}", params.join("&"))
 }
 
 /// chrome-linux's transcode of [`h264_8bit`] for `why`: the video to 8-bit H.264 High, the audio
@@ -188,8 +193,8 @@ fn chrome_8bit_url(why: &str) -> String {
             "VideoCodec=h264",
             "AudioCodec=aac",
             "AudioStreamIndex=1",
-            "VideoBitrate=119872",
-            "AudioBitrate=128",
+            "VideoBitrate=119872000",
+            "AudioBitrate=128000",
             "AudioSampleRate=48000",
             "MaxFramerate=24",
             "SegmentContainer=ts",
@@ -218,8 +223,8 @@ fn chrome_hi10_url() -> String {
             "VideoCodec=h264",
             "AudioCodec=aac",
             "AudioStreamIndex=1",
-            "VideoBitrate=119872",
-            "AudioBitrate=128",
+            "VideoBitrate=119872000",
+            "AudioBitrate=128000",
             "AudioSampleRate=48000",
             "MaxFramerate=24",
             "SegmentContainer=ts",
@@ -439,11 +444,16 @@ fn the_subtitle_reason_joins_the_video_reasons() {
 }
 
 #[test]
-fn chrome_takes_an_external_ass_file_as_webvtt() {
-    // Jellyfin can't convert ASS; Rustyfin's subtitle endpoint can, so External delivery allows it.
+fn chrome_takes_an_external_ass_file_as_ass() {
+    // Jellyfin Web lists ASS as an External format (it draws it itself), so the file goes out as
+    // ASS, as Jellyfin's GetExternalSubtitleProfile picks a profile in the stream's own format first.
     let movie = plus(h264_8bit("mp4"), vec![external(2, "ass")], Some(2));
     let data = device_data(&movie, &profile("chrome-linux"), &request());
-    let expected = with_subtitles(direct_play("mp4", Some(1)), Some(2), vec![vtt(2, 0)]);
+    let expected = with_subtitles(
+        direct_play("mp4", Some(1)),
+        Some(2),
+        vec![file(2, 0, "ass")],
+    );
     assert_data(&data, &expected);
 }
 
@@ -604,8 +614,8 @@ fn subtitle_formats_match_their_ffmpeg_codec_names() {
     ]));
     let data = device_data(&movie, &embeds, &request());
     assert_eq!(data.play_method, Some(PlayMethod::DirectPlay));
-    // mov_text converts to the srt profile (the second pass). ASS converts to nothing that is
-    // embedded, as in Jellyfin, so it goes out as a WebVTT file.
+    // mov_text converts to the srt profile (the second pass). ASS converts to nothing, as in
+    // Jellyfin: no embedded format and not the WebVTT file, so it is burned in.
     assert_eq!(
         data.subtitles,
         vec![
@@ -615,7 +625,7 @@ fn subtitle_formats_match_their_ffmpeg_codec_names() {
             by(5, M::Embed),
             by(6, M::Embed),
             by(7, M::Embed),
-            vtt(8, 0),
+            by(8, M::Encode),
         ]
     );
 }
@@ -656,12 +666,17 @@ fn hls_subtitle_profiles_are_not_used() {
 }
 
 #[test]
-fn only_webvtt_files_are_delivered() {
-    let srt_files = mkv_player(json!([{"Format": "srt", "Method": "External"}]));
+fn files_go_out_in_the_profiles_format() {
+    // SubRip to an srt profile, as Jellyfin does; a format Rustyfin's endpoint can't write (smi)
+    // is passed over for the next profile.
+    let srt_files = mkv_player(json!([
+        {"Format": "smi", "Method": "External"},
+        {"Format": "srt", "Method": "External"}
+    ]));
     let movie = plus(h264_8bit("mkv"), vec![embedded(2, "subrip")], None);
     let data = device_data(&movie, &srt_files, &request());
     assert_eq!(data.play_method, Some(PlayMethod::DirectPlay));
-    assert_eq!(data.subtitles, vec![by(2, M::Encode)]);
+    assert_eq!(data.subtitles, vec![file(2, 0, "srt")]);
 }
 
 #[test]
@@ -733,8 +748,8 @@ fn tv_transcode_delivers_text_as_webvtt_and_burns_in_images() {
             "VideoCodec=hevc,h264",
             "AudioCodec=aac",
             "AudioStreamIndex=1",
-            "VideoBitrate=39872",
-            "AudioBitrate=128",
+            "VideoBitrate=39872000",
+            "AudioBitrate=128000",
             "AudioSampleRate=48000",
             "MaxFramerate=24",
             "SegmentContainer=ts",

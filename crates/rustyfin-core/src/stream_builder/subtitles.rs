@@ -145,19 +145,36 @@ pub(super) fn subtitle_method(
         }
     }
 
-    // Only WebVTT External profiles count. Hls profiles are skipped: Rustyfin's transcoder
-    // doesn't put subtitles in the manifest. Rustyfin's endpoint converts ASS and SSA to WebVTT,
-    // so every text stream may go out as a file.
-    let external = profiles.iter().any(|p| {
-        p.method == SubtitleDeliveryMethod::External
-            && p.format.eq_ignore_ascii_case("vtt")
-            && supports_language(p, stream.language.as_deref())
-    });
-    if is_text(stream) && external {
+    if external_format(stream, profiles).is_some() {
         SubtitleDeliveryMethod::External
     } else {
         SubtitleDeliveryMethod::Encode
     }
+}
+
+/// The subtitle formats that Rustyfin's subtitle endpoint writes.
+const SERVED_FORMATS: &str = "vtt,webvtt,srt,subrip,ass,ssa";
+
+/// The format in which `stream` goes out as a file: Jellyfin's `GetExternalSubtitleProfile`,
+/// first for a profile in the stream's own format and then for one it converts to, in profile
+/// order. Hls profiles are skipped, since Rustyfin's transcoder doesn't put subtitles in the
+/// manifest, and so are picture streams and formats that Rustyfin's endpoint doesn't write.
+fn external_format<'a>(stream: &StreamFacts, profiles: &'a [SubtitleProfile]) -> Option<&'a str> {
+    if !is_text(stream) {
+        return None;
+    }
+    let candidates = || {
+        profiles.iter().filter(|p| {
+            p.method == SubtitleDeliveryMethod::External
+                && is_text_format(&p.format)
+                && contains_container(SERVED_FORMATS, &p.format)
+                && supports_language(p, stream.language.as_deref())
+        })
+    };
+    candidates()
+        .find(|p| p.format.eq_ignore_ascii_case(&stream.codec))
+        .or_else(|| candidates().find(|p| converts_to(stream, &p.format)))
+        .map(|p| p.format.as_str())
 }
 
 /// The subtitle stream with `index`. Index -1 names no stream, and neither does an index that
@@ -241,7 +258,7 @@ pub(super) fn deliveries(
     let key = if request.access_token.is_empty() {
         String::new()
     } else {
-        format!("?api_key={}", request.access_token)
+        format!("?ApiKey={}", request.access_token)
     };
 
     source
@@ -257,8 +274,9 @@ pub(super) fn deliveries(
                 protocol,
             );
             let url = (method == SubtitleDeliveryMethod::External).then(|| {
+                let format = external_format(stream, &profile.subtitle_profiles).unwrap_or("vtt");
                 format!(
-                    "/Videos/{}/{}/Subtitles/{}/{ticks}/Stream.vtt{key}",
+                    "/Videos/{}/{}/Subtitles/{}/{ticks}/Stream.{format}{key}",
                     request.item_id, source.id, stream.index
                 )
             });
