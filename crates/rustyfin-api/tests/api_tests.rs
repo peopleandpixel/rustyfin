@@ -33695,6 +33695,84 @@ async fn b22_universal_sends_other_tracks_to_a_transcode() {
     assert!(url.contains("&AudioStreamIndex=2"), "{url}");
 }
 
+// R3 playback: an item's MediaStreams list the subtitle files beside its file, as Jellyfin's do,
+// with the same index PlaybackInfo gives them
+#[tokio::test]
+async fn r3playback_item_streams_list_external_subtitle_files() {
+    let state = test_state().await;
+    let (token, user_id) = admin_session(&state).await;
+    let folder = std::path::PathBuf::from(media_folder(&state, "r3external"));
+    let file = folder.join("R3 Film.mkv");
+    std::fs::write(&file, b"r3").unwrap();
+    std::fs::write(
+        folder.join("R3 Film.en.srt"),
+        "1\n00:00:01,000 --> 00:00:02,000\nHi\n",
+    )
+    .unwrap();
+    let id = g4_insert_item(&state, "Movie", &file).await;
+    g4_insert_source(
+        &state,
+        id,
+        "mkv",
+        &file,
+        &[("video", "h264"), ("audio", "aac"), ("subtitle", "subrip")],
+    )
+    .await;
+    let app = app(state);
+
+    let external = |streams: &serde_json::Value| -> Vec<(i64, String)> {
+        streams
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|s| s["IsExternal"] == true)
+            .map(|s| {
+                (
+                    s["Index"].as_i64().unwrap(),
+                    s["Path"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect()
+    };
+    let srt = folder.join("R3 Film.en.srt").to_str().unwrap().to_string();
+    let expected = vec![(3, srt)];
+
+    for uri in [
+        format!("/Items/{id}"),
+        format!("/Users/{user_id}/Items/{id}"),
+    ] {
+        let (status, item) = send(&app, request("GET", &uri, Some(&token), None)).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert_eq!(
+            external(&item["MediaStreams"]),
+            expected,
+            "{uri}: MediaStreams"
+        );
+        assert_eq!(
+            external(&item["MediaSources"][0]["MediaStreams"]),
+            expected,
+            "{uri}: MediaSources"
+        );
+        let subtitle = item["MediaStreams"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["IsExternal"] == true)
+            .unwrap();
+        assert_eq!(subtitle["Type"], "Subtitle", "{uri}");
+    }
+    let uri = format!("/Items?Ids={id}&Fields=MediaSources");
+    let (_, list) = send(&app, request("GET", &uri, Some(&token), None)).await;
+    assert_eq!(
+        external(&list["Items"][0]["MediaSources"][0]["MediaStreams"]),
+        expected
+    );
+    // PlaybackInfo gives the file the same index
+    let uri = format!("/Items/{id}/PlaybackInfo?UserId={user_id}");
+    let (_, info) = send(&app, request("GET", &uri, Some(&token), None)).await;
+    assert_eq!(external(&info["MediaSources"][0]["MediaStreams"]), expected);
+}
+
 #[tokio::test]
 async fn b22_playback_info_lists_external_subtitles() {
     let state = test_state().await;
