@@ -3546,6 +3546,38 @@ pub async fn save_item_extras_edit(
     Ok(())
 }
 
+/// Replaces an item's studios, as an admin's metadata edit lists them.
+pub async fn replace_item_studios(
+    pool: &SqlitePool,
+    item_id: uuid::Uuid,
+    names: &[String],
+) -> Result<(), sqlx::Error> {
+    let item = item_id.to_string();
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM item_studios WHERE item_id = ?")
+        .bind(&item)
+        .execute(&mut *tx)
+        .await?;
+    for name in names {
+        // The id a refresh gives the studio (`metadata::store_studios`)
+        let id = format!("studio-{}", name.to_lowercase().replace(' ', "-"));
+        sqlx::query(
+            "INSERT INTO studios (id, name) VALUES (?1, ?2) \
+             ON CONFLICT(id) DO UPDATE SET name = excluded.name",
+        )
+        .bind(&id)
+        .bind(name)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("INSERT OR IGNORE INTO item_studios (item_id, studio_id) VALUES (?, ?)")
+            .bind(&item)
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await
+}
+
 /// Sets an item's TMDb id, as an admin's Identify chose it. A new id drops the TVDb id that came
 /// with the old one.
 pub async fn set_tmdb_id(
@@ -3566,11 +3598,15 @@ pub async fn set_tmdb_id(
 
 /// Clears what a "replace all metadata" refresh fills again from the providers and keeps no
 /// column for: the IMDb id, the studios (unless locked) and the people (unless "Cast" is locked).
+/// A locked item keeps all of them.
 pub async fn clear_replaceable_links(
     pool: &SqlitePool,
     item_id: uuid::Uuid,
     locks: &ItemLocks,
 ) -> Result<(), sqlx::Error> {
+    if locks.lock_data {
+        return Ok(());
+    }
     let id = item_id.to_string();
     sqlx::query("UPDATE item_metadata_extras SET imdb_id = NULL WHERE item_id = ?")
         .bind(&id)

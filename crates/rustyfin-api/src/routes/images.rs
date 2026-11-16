@@ -25,8 +25,15 @@ pub fn routes() -> Router<AppState> {
 
 /// Administrator-only image/refresh routes. `routes::build_router` wraps them in `require_admin`.
 pub fn admin_routes() -> Router<AppState> {
-    Router::new().route("/Items/{id}/Images/{image_type}", post(upload_item_image))
+    Router::new().route(
+        "/Items/{id}/Images/{image_type}",
+        post(upload_item_image).layer(axum::extract::DefaultBodyLimit::max(UPLOAD_MAX_BYTES)),
+    )
 }
+
+/// The largest upload body: Jellyfin Web sends the picture base64-encoded (4/3 of its size), so
+/// this takes pictures up to about 22 MB.
+const UPLOAD_MAX_BYTES: usize = 30 * 1024 * 1024;
 
 async fn get_item_images(
     State(state): State<AppState>,
@@ -371,17 +378,31 @@ async fn upload_item_image(
         .ok_or_else(|| ApiError::NotFound("item not found".into()))?;
 
     // Jellyfin Web sends the picture base64-encoded, as Jellyfin reads it; other clients may
-    // send the bytes
-    let body = uploaded_image(&body);
+    // send the bytes. Anything else is refused.
+    let body = uploaded_image(&body).ok_or_else(|| {
+        ApiError::BadRequest("the body is not an image, nor base64 of one".into())
+    })?;
+    save_item_image(&state, id, image_type, &body, "upload").await?;
+    Ok(Json(json!({ "status": "ok" })))
+}
 
-    // Save to data_dir/images/{item_id}/{type}.jpg; a backdrop is added after the others
+/// Stores `body` as one of the item's `image_type` pictures, from `provider` ("upload" or
+/// "user"): under data_dir/images/{item_id}/, replacing the type's picture, or added after the
+/// others for a backdrop.
+pub(super) async fn save_item_image(
+    state: &AppState,
+    id: Uuid,
+    image_type: ImageType,
+    body: &[u8],
+    provider: &str,
+) -> Result<(), ApiError> {
     let img_dir = state.data_dir.join("images").join(id.to_string());
     tokio::fs::create_dir_all(&img_dir)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
 
-    let image_index = super::metadata_admin::new_image_index(&state, id, image_type).await?;
-    let ext = detect_image_extension(&body);
+    let image_index = super::metadata_admin::new_image_index(state, id, image_type).await?;
+    let ext = detect_image_extension(body);
     let filename = if image_index == 0 {
         format!("{}.{}", image_type.as_str(), ext)
     } else {
@@ -389,7 +410,7 @@ async fn upload_item_image(
     };
     let file_path = img_dir.join(&filename);
 
-    tokio::fs::write(&file_path, &body)
+    tokio::fs::write(&file_path, body)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
 
@@ -400,7 +421,7 @@ async fn upload_item_image(
         image_type,
         image_index,
         path: file_path.to_string_lossy().to_string(),
-        provider: "upload".to_string(),
+        provider: provider.to_string(),
         width,
         height,
         blurhash: None,
@@ -412,8 +433,7 @@ async fn upload_item_image(
     state.cache.invalidate_item(&id.to_string());
     state.image_cache.invalidate_item(&id.to_string());
     rustyfin_core::image_warmer::kick();
-
-    Ok(Json(json!({ "status": "ok" })))
+    Ok(())
 }
 
 fn guess_content_type(path: &str, resized: bool) -> &'static str {
@@ -435,7 +455,7 @@ fn guess_content_type(path: &str, resized: bool) -> &'static str {
 }
 
 /// Whether `bytes` start like a JPEG, PNG, GIF or WebP file.
-fn looks_like_image(bytes: &[u8]) -> bool {
+pub(super) fn looks_like_image(bytes: &[u8]) -> bool {
     bytes.starts_with(&[0xFF, 0xD8, 0xFF])
         || bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47])
         || bytes.starts_with(b"GIF8")
@@ -443,11 +463,11 @@ fn looks_like_image(bytes: &[u8]) -> bool {
 }
 
 /// An upload's picture: the body itself when it is one, else the picture its base64 text (or
-/// data URL) decodes to, else the body as it came.
-fn uploaded_image(body: &[u8]) -> Vec<u8> {
+/// data URL) decodes to; none for anything else.
+fn uploaded_image(body: &[u8]) -> Option<Vec<u8>> {
     use base64::Engine;
     if looks_like_image(body) {
-        return body.to_vec();
+        return Some(body.to_vec());
     }
     let text: Vec<u8> = body
         .iter()
@@ -458,10 +478,10 @@ fn uploaded_image(body: &[u8]) -> Vec<u8> {
         Some(comma) if text.starts_with(b"data:") => &text[comma + 1..],
         _ => &text[..],
     };
-    match base64::engine::general_purpose::STANDARD.decode(encoded) {
-        Ok(decoded) if looks_like_image(&decoded) => decoded,
-        _ => body.to_vec(),
-    }
+    base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .ok()
+        .filter(|decoded| looks_like_image(decoded))
 }
 
 fn detect_image_extension(bytes: &[u8]) -> &'static str {

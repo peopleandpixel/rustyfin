@@ -76,14 +76,25 @@ pub async fn refresh_item_metadata_with(
     options: RefreshOptions,
 ) -> Result<RefreshOutcome, String> {
     let media_path = Path::new(&item.path);
-    if options.replace_images {
+    // A "replace all" clears only once the provider has answered for the item: a failed lookup,
+    // a missing key or no match leaves the item as it was. The answer is cached, so the
+    // refresh below asks nothing again.
+    let replacing = (options.replace_metadata || options.replace_images)
+        && replacement_answered(client, item, &plugin_manager.metadata_providers().await).await;
+    if (options.replace_metadata || options.replace_images) && !replacing {
+        tracing::warn!(
+            "no provider answered for '{}', so its metadata and images are kept, not replaced",
+            item.name
+        );
+    }
+    if options.replace_images && replacing {
         rustyfin_db::repo_image::delete_replaceable_images(pool, item.id)
             .await
             .map_err(|e| e.to_string())?;
     }
     // Each source fills this copy, so a later source keeps what an earlier one filled
     let mut working = item.clone();
-    if options.replace_metadata {
+    if options.replace_metadata && replacing {
         let locks = rustyfin_db::repo_media::item_locks(pool, item.id)
             .await
             .map_err(|e| e.to_string())?;
@@ -231,6 +242,68 @@ fn clear_unlocked_metadata(item: &mut MediaItem, locks: &rustyfin_db::repo_media
     item.popularity = None;
 }
 
+/// The names a provider search tries, in order: the parsed name, then the file name without
+/// release tags.
+fn search_candidates(item: &MediaItem) -> Vec<String> {
+    let mut candidates: Vec<String> = Vec::new();
+    let parsed = item.name.trim();
+    if !parsed.is_empty() {
+        candidates.push(parsed.to_string());
+    }
+    let cleaned = clean_filename_for_search(&item.path);
+    if !cleaned.is_empty() && !candidates.contains(&cleaned) {
+        candidates.push(cleaned);
+    }
+    candidates
+}
+
+/// Whether the first provider with lookups (TMDb) answers for a movie or series: by its id, or
+/// else by a search for its names, as `refresh_from_providers` asks. Other types, and an item no
+/// such provider answers for (a failure, no key, no match), are never replaced.
+async fn replacement_answered(
+    client: &reqwest::Client,
+    item: &MediaItem,
+    providers: &[MetadataProviderHandle],
+) -> bool {
+    let Some(provider) = providers.iter().find(|p| p.lookups.is_some()) else {
+        return false;
+    };
+    let Some(lookups) = &provider.lookups else {
+        return false;
+    };
+    let series = match item.media_type {
+        MediaType::Movie => false,
+        MediaType::Series => true,
+        _ => return false,
+    };
+    if let Some(id) = item.tmdb_id {
+        let found = if series {
+            lookups.series_by_id(id).await
+        } else {
+            lookups.movie_by_id(id).await
+        };
+        return matches!(found, Ok(Some(_)));
+    }
+    for candidate in search_candidates(item) {
+        let found = if series {
+            matches!(
+                lookups
+                    .search_series(&candidate, item.production_year)
+                    .await,
+                Ok(Some(_))
+            )
+        } else {
+            (provider.search_movie)(client, &candidate, item.production_year)
+                .await
+                .is_some()
+        };
+        if found {
+            return true;
+        }
+    }
+    false
+}
+
 /// How a refresh ended for the caller that runs many of them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefreshOutcome {
@@ -278,15 +351,7 @@ async fn refresh_from_providers(
     let mut unauthorized = false;
     // Candidate names in search order. Jellyfin searches the parsed name first; release
     // tags left in the file name (e.g. "Bluray-1080p") make TMDb find nothing.
-    let mut candidates: Vec<String> = Vec::new();
-    let parsed = working.name.trim();
-    if !parsed.is_empty() {
-        candidates.push(parsed.to_string());
-    }
-    let cleaned = clean_filename_for_search(&working.path);
-    if !cleaned.is_empty() && !candidates.contains(&cleaned) {
-        candidates.push(cleaned);
-    }
+    let candidates = search_candidates(working);
     let media_type = working.media_type;
 
     for provider in providers {

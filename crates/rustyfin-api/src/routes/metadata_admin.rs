@@ -11,7 +11,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use rustyfin_core::metadata::RefreshOptions;
 
-use rustyfin_model::image::{ImageType, ItemImage};
+use rustyfin_model::image::ImageType;
 use rustyfin_model::media::{MediaItem, MediaType};
 use rustyfin_model::metadata::{ExternalMetadata, MetadataLookups, RemoteImage, RemoteSearchHit};
 use serde_json::{Map, Value, json};
@@ -328,6 +328,29 @@ async fn apply_search_result(
     }
     let tmdb_id = tmdb_id_of(&body)
         .ok_or_else(|| ApiError::BadRequest("the result has no Tmdb provider id".into()))?;
+    // The provider must answer for the new id before anything changes: on a failure the item
+    // keeps its id and metadata. The answer is cached for the refresh below.
+    let lookups = lookups(&state)
+        .await
+        .ok_or_else(|| ApiError::ServiceUnavailable("no metadata provider is enabled".into()))?;
+    let answer = if item.media_type == MediaType::Series {
+        lookups.series_by_id(tmdb_id).await
+    } else {
+        lookups.movie_by_id(tmdb_id).await
+    };
+    match answer {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return Err(ApiError::BadRequest(format!(
+                "{TMDB_NAME} has no item with id {tmdb_id}"
+            )));
+        }
+        Err(e) => {
+            return Err(ApiError::BadGateway(format!(
+                "{TMDB_NAME} did not answer: {e:?}"
+            )));
+        }
+    }
     rustyfin_db::repo_media::set_tmdb_id(&state.db, id, tmdb_id).await?;
     let item = item_or_404(&state, id).await?;
     let request = RefreshRequest {
@@ -460,9 +483,76 @@ pub(crate) async fn new_image_index(
         .unwrap_or(0))
 }
 
-/// `POST /Items/{id}/RemoteImages/Download?type=&imageUrl=`: the image becomes the item's (a
-/// backdrop is added). Rustyfin keeps the URL, as for the providers' images, and its image cache
-/// fetches it. A refresh keeps it until one replaces all images. 204.
+/// The most a downloaded image may weigh.
+const DOWNLOAD_MAX_BYTES: usize = 30 * 1024 * 1024;
+
+/// The origins an admin may download an image from: the image provider's (TMDb's image host and
+/// the configured image base URL). Nothing else, so the server fetches no address an admin
+/// names, such as a cloud metadata service or a LAN host.
+fn image_provider_origins(state: &AppState) -> Vec<reqwest::Url> {
+    ["https://image.tmdb.org/", state.tmdb.image_base_url()]
+        .iter()
+        .filter_map(|url| reqwest::Url::parse(url).ok())
+        .collect()
+}
+
+fn same_origin(allowed: &[reqwest::Url], url: &reqwest::Url) -> bool {
+    allowed.iter().any(|a| a.origin() == url.origin())
+}
+
+/// The image at `url`, fetched once with redirects followed only within the allowed origins.
+async fn fetch_provider_image(state: &AppState, url: &str) -> Result<Vec<u8>, ApiError> {
+    let allowed = image_provider_origins(state);
+    let parsed = reqwest::Url::parse(url)
+        .ok()
+        .filter(|u| same_origin(&allowed, u))
+        .ok_or_else(|| ApiError::BadRequest("imageUrl is not an image provider's".into()))?;
+    let redirects = allowed.clone();
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+            if attempt.previous().len() >= 5 {
+                attempt.error("too many redirects")
+            } else if same_origin(&redirects, attempt.url()) {
+                attempt.follow()
+            } else {
+                attempt.stop()
+            }
+        }))
+        .timeout(std::time::Duration::from_secs(30))
+        .user_agent(rustyfin_core::tmdb_client::USER_AGENT)
+        .build()
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let mut resp = client
+        .get(parsed)
+        .send()
+        .await
+        .map_err(|e| ApiError::BadGateway(format!("the image could not be fetched: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(ApiError::BadGateway(format!(
+            "the image host answered {}",
+            resp.status()
+        )));
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| ApiError::BadGateway(format!("the image could not be fetched: {e}")))?
+    {
+        bytes.extend_from_slice(&chunk);
+        if bytes.len() > DOWNLOAD_MAX_BYTES {
+            return Err(ApiError::PayloadTooLarge("the image is too large".into()));
+        }
+    }
+    if !super::images::looks_like_image(&bytes) {
+        return Err(ApiError::BadGateway("the image host sent no image".into()));
+    }
+    Ok(bytes)
+}
+
+/// `POST /Items/{id}/RemoteImages/Download?type=&imageUrl=`: as in Jellyfin, the server downloads
+/// the image once, now, and stores the file as the item's (a backdrop is added). Only the image
+/// provider's hosts are allowed. A refresh keeps it until one replaces all images. 204.
 async fn download_remote_image(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -474,21 +564,9 @@ async fn download_remote_image(
     let image_type = ImageType::from_str(type_name)
         .ok_or_else(|| ApiError::BadRequest(format!("unknown image type: {type_name}")))?;
     let url = first_value(&params, "imageUrl")
-        .filter(|url| url.starts_with("https://") || url.starts_with("http://"))
-        .ok_or_else(|| ApiError::BadRequest("imageUrl must be an http(s) URL".into()))?;
-    let image = ItemImage {
-        item_id: id,
-        image_type,
-        image_index: new_image_index(&state, id, image_type).await?,
-        path: url.to_string(),
-        provider: "user".to_string(),
-        width: None,
-        height: None,
-        blurhash: None,
-        stamp: None,
-    };
-    rustyfin_db::repo_image::upsert_image(&state.db, &image).await?;
-    item_changed(&state, id);
+        .ok_or_else(|| ApiError::BadRequest("imageUrl is required".into()))?;
+    let bytes = fetch_provider_image(&state, url).await?;
+    super::images::save_item_image(&state, id, image_type, &bytes, "user").await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -530,7 +608,8 @@ fn text_value(value: &Value) -> Option<String> {
 /// `POST /Items/{id}`: saves the metadata editor's BaseItemDto, as Jellyfin's ItemUpdateController
 /// does for the fields Rustyfin stores: Name, ForcedSortName, OriginalTitle, Overview, Taglines,
 /// ProductionYear, PremiereDate, EndDate, CommunityRating, CriticRating, OfficialRating, Genres,
-/// Tags, ProductionLocations, LockData and LockedFields. Unlike Jellyfin, a field missing from the
+/// Tags, ProductionLocations, Studios, People, LockData and LockedFields. An empty ForcedSortName
+/// sets the sort name back to the name's. Unlike Jellyfin, a field missing from the
 /// body is kept (null clears it), so a client sending only some fields changes only those; a
 /// client sending the whole item, as Jellyfin Web does, gets Jellyfin's result. 204.
 async fn update_item(
@@ -547,9 +626,10 @@ async fn update_item(
     if let Some(name) = field(&body, "Name").and_then(text_value) {
         updated.name = name;
     }
-    let forced_sort = field(&body, "ForcedSortName").and_then(text_value);
+    // A ForcedSortName sets the sort name; an empty one clears it back to the name's
+    let forced_sort = field(&body, "ForcedSortName");
     if updated.name != item.name || forced_sort.is_some() {
-        updated.sort_name = match forced_sort {
+        updated.sort_name = match forced_sort.and_then(text_value) {
             Some(sort) => Some(sort),
             // An episode sorts by its numbers; its sort name stays
             None if item.media_type == MediaType::Episode => item.sort_name.clone(),
@@ -588,6 +668,30 @@ async fn update_item(
         updated.production_locations = list;
     }
     rustyfin_db::repo_media::save_refresh_changes(&state.db, &item, &updated).await?;
+
+    // Studios ({Name, Id} pairs) and People ({Name, Role, Type}), when given, replace the item's
+    if let Some(list) = field(&body, "Studios").and_then(Value::as_array) {
+        let names: Vec<String> = list
+            .iter()
+            .filter_map(|studio| field_str(studio, "Name").or_else(|| studio.as_str()))
+            .map(str::to_string)
+            .collect();
+        rustyfin_db::repo_media::replace_item_studios(&state.db, id, &names).await?;
+    }
+    if let Some(list) = field(&body, "People").and_then(Value::as_array) {
+        let people: Vec<rustyfin_model::metadata::MetadataPerson> = list
+            .iter()
+            .filter_map(|person| {
+                Some(rustyfin_model::metadata::MetadataPerson {
+                    name: field_str(person, "Name")?.to_string(),
+                    kind: field_str(person, "Type").unwrap_or("Actor").to_string(),
+                    role: field_str(person, "Role").map(str::to_string),
+                    image_url: None,
+                })
+            })
+            .collect();
+        rustyfin_db::repo_person::replace_item_people(&state.db, id, &people).await?;
+    }
 
     let extras = rustyfin_db::repo_jellyfin_import::item_extras(&state.db, id)
         .await?
