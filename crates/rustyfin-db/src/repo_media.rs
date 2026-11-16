@@ -2498,6 +2498,8 @@ impl From<MediaItemRow> for MediaItem {
             video_3_d_format: None,
             play_access: None,
             official_rating_image_tag: None,
+            // Photo fields: filled in from `photo_metadata` by the API
+            ..MediaItem::default_dto_fields()
         }
     }
 }

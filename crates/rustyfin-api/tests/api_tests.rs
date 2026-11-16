@@ -3800,6 +3800,271 @@ async fn b30_photo(state: &AppState) -> uuid::Uuid {
     id
 }
 
+// R2 photos: home videos libraries, photo metadata and photo images
+
+/// `jpeg` with an EXIF APP1 segment after its SOI marker: Make "Canon", Orientation 6 (RightTop) and
+/// DateTime 2018:06:01 10:15:00 in IFD0, little-endian.
+fn r2photos_with_exif(jpeg: &[u8]) -> Vec<u8> {
+    let make = b"Canon\0";
+    let date = b"2018:06:01 10:15:00\0";
+    // Header 8, IFD0 with 3 entries (2 + 36 + 4 = 42) at 8, then the strings at 50.
+    let (make_at, date_at) = (50u32, 50 + make.len() as u32);
+    let mut tiff = b"II*\0".to_vec();
+    tiff.extend(8u32.to_le_bytes());
+    tiff.extend(3u16.to_le_bytes());
+    for (tag, kind, count, value) in [
+        (0x010Fu16, 2u16, make.len() as u32, make_at.to_le_bytes()),
+        (0x0112, 3, 1, [6, 0, 0, 0]),
+        (0x0132, 2, date.len() as u32, date_at.to_le_bytes()),
+    ] {
+        tiff.extend(tag.to_le_bytes());
+        tiff.extend(kind.to_le_bytes());
+        tiff.extend(count.to_le_bytes());
+        tiff.extend(value);
+    }
+    tiff.extend(0u32.to_le_bytes());
+    tiff.extend(make);
+    tiff.extend(date);
+    let mut segment = b"Exif\0\0".to_vec();
+    segment.extend(tiff);
+    let mut out = jpeg[..2].to_vec();
+    out.extend([0xFF, 0xE1]);
+    out.extend(((segment.len() + 2) as u16).to_be_bytes());
+    out.extend(segment);
+    out.extend(&jpeg[2..]);
+    out
+}
+
+/// A home videos library on a new folder with a photo with EXIF, one without, a file that only
+/// claims to be a JPEG, and two videos, scanned once. Returns the library's folder.
+async fn r2photos_library(state: &AppState) -> String {
+    let folder = media_folder(state, "r2 photos");
+    let root = std::path::Path::new(&folder);
+    std::fs::create_dir_all(root.join("Trip")).unwrap();
+    std::fs::create_dir_all(root.join("Party")).unwrap();
+    std::fs::write(
+        root.join("Trip/IMG_0001.jpg"),
+        r2photos_with_exif(&b30_jpeg(40, 30, [255, 0, 0])),
+    )
+    .unwrap();
+    std::fs::write(root.join("scan.jpg"), b30_jpeg(30, 20, [0, 0, 255])).unwrap();
+    std::fs::write(
+        root.join("broken.jpg"),
+        b"\xFF\xD8\xFF\xE1\xFF\xFFnot a jpeg",
+    )
+    .unwrap();
+    std::fs::write(root.join("garden walk.mkv"), b"").unwrap();
+    std::fs::write(root.join("Party/party.mp4"), b"").unwrap();
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: "R2 Home Videos and Photos".to_string(),
+        content_type: rustyfin_model::library::LibraryContentType::Photos,
+        paths: vec![folder.clone()],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    rustyfin_core::scanner::scan_library(&state.db, &lib)
+        .await
+        .unwrap();
+    folder
+}
+
+/// The library's items by file name, from a recursive /Items list.
+async fn r2photos_items(
+    app: &axum::Router,
+    token: &str,
+) -> std::collections::HashMap<String, serde_json::Value> {
+    let (status, list) =
+        send_authed(app, "GET", "/Items?Recursive=true&Fields=Path", token, None).await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    list["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|item| {
+            let path = item["Path"].as_str()?;
+            let name = std::path::Path::new(path).file_name()?.to_str()?;
+            Some((name.to_string(), item.clone()))
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn r2photos_home_videos_are_listed_as_video_items() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    r2photos_library(&state).await;
+    let app = app(state.clone());
+    let items = r2photos_items(&app, &token).await;
+    for (file, name) in [("garden walk.mkv", "garden walk"), ("party.mp4", "party")] {
+        let item = items
+            .get(file)
+            .unwrap_or_else(|| panic!("{file} is not listed: {items:?}"));
+        assert_eq!(item["Type"], "Video", "{item}");
+        assert_eq!(item["MediaType"], "Video", "{item}");
+        assert_eq!(item["Name"], name, "{item}");
+        // Like movies and episodes, a video's details are never cached: re-probes don't clear it.
+        let id = item["Id"].as_str().unwrap();
+        let (status, details) =
+            send_authed(&app, "GET", &format!("/Items/{id}"), &token, None).await;
+        assert_eq!(status, StatusCode::OK, "{details}");
+        assert_eq!(details["Type"], "Video", "{details}");
+        assert!(
+            !state.cache.item_details.contains_key(id),
+            "{file} was cached"
+        );
+    }
+    assert_eq!(items["IMG_0001.jpg"]["Type"], "Photo");
+
+    // Jellyfin's IncludeItemTypes=Video finds them too.
+    let (_, list) = send_authed(
+        &app,
+        "GET",
+        "/Items?Recursive=true&IncludeItemTypes=Video",
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(list["TotalRecordCount"], 2, "{list}");
+}
+
+#[tokio::test]
+async fn r2photos_photo_details_carry_size_and_exif() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    r2photos_library(&state).await;
+    let app = app(state);
+    let items = r2photos_items(&app, &token).await;
+
+    let id = items["IMG_0001.jpg"]["Id"].as_str().unwrap().to_string();
+    let (status, photo) = send_authed(&app, "GET", &format!("/Items/{id}"), &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{photo}");
+    assert_eq!(photo["Width"], 40, "{photo}");
+    assert_eq!(photo["Height"], 30, "{photo}");
+    assert_eq!(photo["CameraMake"], "Canon", "{photo}");
+    assert_eq!(photo["ImageOrientation"], "RightTop", "{photo}");
+    assert_eq!(photo["ProductionYear"], 2018, "{photo}");
+    assert!(
+        photo["PremiereDate"]
+            .as_str()
+            .is_some_and(|d| d.starts_with("2018-06-01T10:15:00")),
+        "{photo}"
+    );
+    // What the file doesn't say is left out, as Jellyfin leaves out a null field.
+    for key in [
+        "CameraModel",
+        "Latitude",
+        "Longitude",
+        "Altitude",
+        "Aperture",
+    ] {
+        assert!(photo.get(key).is_none(), "{key}: {photo}");
+    }
+    // The list carries the same fields.
+    assert_eq!(items["IMG_0001.jpg"]["CameraMake"], "Canon");
+    assert_eq!(items["IMG_0001.jpg"]["Width"], 40);
+
+    // A photo with no EXIF still has its size; a file that isn't a picture has neither.
+    let id = items["scan.jpg"]["Id"].as_str().unwrap().to_string();
+    let (_, scan) = send_authed(&app, "GET", &format!("/Items/{id}"), &token, None).await;
+    assert_eq!(
+        (scan["Width"].clone(), scan["Height"].clone()),
+        (30.into(), 20.into())
+    );
+    assert!(scan.get("CameraMake").is_none(), "{scan}");
+    let id = items["broken.jpg"]["Id"].as_str().unwrap().to_string();
+    let (status, broken) = send_authed(&app, "GET", &format!("/Items/{id}"), &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{broken}");
+    assert!(broken["Width"].is_null(), "{broken}");
+}
+
+#[tokio::test]
+async fn r2photos_a_photo_is_its_own_primary_image() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let folder = r2photos_library(&state).await;
+    let db = state.db.clone();
+    let app = app(state);
+    let items = r2photos_items(&app, &token).await;
+    let photo = &items["IMG_0001.jpg"];
+    assert!(photo["ImageTags"]["Primary"].is_string(), "{photo}");
+    let id = photo["Id"].as_str().unwrap();
+
+    let uri = format!("/Items/{id}/Images/Primary?maxWidth=20");
+    let (status, content_type, bytes) = b30_get(&app, &uri, &token).await;
+    assert_eq!(status, StatusCode::OK, "{uri}");
+    assert_eq!(content_type, "image/jpeg");
+    assert_eq!(b30_picture(&bytes), ((20, 15), "red".to_string()));
+
+    // A rescan keeps one Primary image, and gives one back to a photo that lost it.
+    sqlx::query("DELETE FROM item_images WHERE item_id = ?")
+        .bind(items["scan.jpg"]["Id"].as_str().unwrap())
+        .execute(&db)
+        .await
+        .unwrap();
+    // A sentinel in each photo's row: an unchanged photo keeps it, a rewritten one is read again.
+    sqlx::query("UPDATE photo_metadata SET camera_make = 'Sentinel'")
+        .execute(&db)
+        .await
+        .unwrap();
+    std::fs::write(
+        std::path::Path::new(&folder).join("scan.jpg"),
+        b30_jpeg(32, 20, [0, 0, 255]),
+    )
+    .unwrap();
+    let lib = rustyfin_db::repo_library::get_all_libraries(&db)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|lib| lib.paths == [folder.clone()])
+        .unwrap();
+    rustyfin_core::scanner::scan_library(&db, &lib)
+        .await
+        .unwrap();
+    let make = |file: &str| {
+        let id = items[file]["Id"].as_str().unwrap().to_string();
+        let db = db.clone();
+        async move {
+            sqlx::query_as::<_, (Option<String>, Option<i32>)>(
+                "SELECT camera_make, width FROM photo_metadata WHERE item_id = ?",
+            )
+            .bind(id)
+            .fetch_one(&db)
+            .await
+            .unwrap()
+        }
+    };
+    assert_eq!(
+        make("IMG_0001.jpg").await,
+        (Some("Sentinel".into()), Some(40))
+    );
+    assert_eq!(make("scan.jpg").await, (None, Some(32)));
+    // The rescan keeps exactly the two home videos.
+    let (_, list) = send_authed(
+        &app,
+        "GET",
+        "/Items?Recursive=true&IncludeItemTypes=Video",
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(list["TotalRecordCount"], 2, "{list}");
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM item_images WHERE image_type = 'Primary'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    // IMG_0001 and scan; a file whose header can't be read gets none.
+    assert_eq!(count, 2);
+    let id = items["scan.jpg"]["Id"].as_str().unwrap();
+    let (status, _, _) = b30_get(&app, &format!("/Items/{id}/Images/Primary"), &token).await;
+    assert_eq!(status, StatusCode::OK);
+    let id = items["broken.jpg"]["Id"].as_str().unwrap();
+    let (status, _, _) = b30_get(&app, &format!("/Items/{id}/Images/Primary"), &token).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
 /// The names of the files in the folder of resized copies, sorted; none when it is missing.
 fn b30_copies(state: &AppState) -> Vec<String> {
     let dir = state.data_dir.join("cache").join("images");
