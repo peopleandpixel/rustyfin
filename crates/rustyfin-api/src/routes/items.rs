@@ -2350,6 +2350,103 @@ fn parse_ids(value: Option<&str>) -> Vec<Uuid> {
         .collect()
 }
 
+/// Jellyfin's `Ids` and `ExcludeItemIds` on an item list.
+struct IdsFilter {
+    /// The ids asked for, in order; none filters nothing.
+    requested: Vec<Uuid>,
+    wanted: std::collections::HashSet<Uuid>,
+    excluded: Vec<Uuid>,
+    /// More than one id and no SortBy: the answer keeps the order of Ids, as Jellyfin's
+    /// `Folder.SortItemsByRequest` does.
+    in_request_order: bool,
+}
+
+impl IdsFilter {
+    fn new(query: &ItemsQuery) -> Self {
+        let requested = parse_ids(query.ids());
+        Self {
+            wanted: requested.iter().copied().collect(),
+            excluded: parse_ids(query.exclude_item_ids()),
+            in_request_order: requested.len() > 1
+                && query.sort_by().is_none_or(|s| s.trim().is_empty()),
+            requested,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.requested.is_empty() && self.excluded.is_empty()
+    }
+
+    fn keeps(&self, id: Uuid) -> bool {
+        (self.wanted.is_empty() || self.wanted.contains(&id)) && !self.excluded.contains(&id)
+    }
+
+    /// The items of a whole list that the filter keeps, in the order of Ids when it asks for
+    /// that, then paged.
+    fn page(&self, mut items: Vec<MediaItem>, start: i64, limit: i64) -> QueryResult {
+        items.retain(|item| self.keeps(item.id));
+        if self.in_request_order {
+            let mut position = std::collections::HashMap::new();
+            for (index, id) in self.requested.iter().enumerate() {
+                position.entry(*id).or_insert(index);
+            }
+            items.sort_by_key(|item| position.get(&item.id).copied().unwrap_or(usize::MAX));
+        }
+        let total = items.len() as i64;
+        let items = items
+            .into_iter()
+            .skip(start as usize)
+            .take(limit as usize)
+            .collect();
+        QueryResult {
+            items,
+            total_record_count: total,
+            start_index: start,
+        }
+    }
+}
+
+/// The collections and playlists among the requested ids that aren't media items (`found`), as
+/// `/Items/{id}` answers them: only those the caller may see, and only when the list's types
+/// (`include`, `exclude`) keep `BoxSet` or `Playlist`.
+async fn requested_containers(
+    state: &AppState,
+    claims: &Claims,
+    by_id: &IdsFilter,
+    found: &[MediaItem],
+    include: Option<&[String]>,
+    exclude: Option<&[String]>,
+) -> Result<Vec<MediaItem>, ApiError> {
+    let mut seen: std::collections::HashSet<Uuid> = found.iter().map(|item| item.id).collect();
+    let mut containers = Vec::new();
+    for &id in &by_id.requested {
+        if !by_id.keeps(id) || !seen.insert(id) {
+            continue;
+        }
+        let item = match super::collections::container_details(state, id, claims).await {
+            Ok(Some(item)) => item,
+            Ok(None) | Err(ApiError::NotFound(_)) => continue,
+            Err(e) => return Err(e),
+        };
+        let kind = match item.media_type {
+            rustyfin_model::media::MediaType::BoxSet => "BoxSet",
+            _ => "Playlist",
+        };
+        let names = |types: Option<&[String]>| {
+            types.is_some_and(|types| {
+                types
+                    .iter()
+                    .any(|t| t.trim_matches('"').eq_ignore_ascii_case(kind))
+            })
+        };
+        if include.is_some_and(|types| !types.is_empty()) && !names(include) || names(exclude) {
+            continue;
+        }
+        containers.push(item);
+    }
+    Ok(containers)
+}
+
 /// The ids of `kept` (all items when `None`) that are also in `ids`.
 fn narrow_ids(kept: Option<Vec<String>>, ids: Vec<String>) -> Vec<String> {
     match kept {
@@ -2413,11 +2510,26 @@ async fn get_items(
 
     let start_index = query.start_index();
     let limit = query.limit();
+    let by_id = IdsFilter::new(&query);
+    // With Ids or ExcludeItemIds, a whole listing is fetched, narrowed, ordered, then paged.
+    let (list_start, list_limit) = if by_id.is_empty() {
+        (start_index as usize, limit as usize)
+    } else {
+        (0, usize::MAX)
+    };
+    let narrowed = |list: QueryResult| {
+        if by_id.is_empty() {
+            list
+        } else {
+            by_id.page(list.items, start_index, limit)
+        }
+    };
 
     // Collections and playlists live outside media_items: a list of only those kinds, or one of
     // them as ParentId, is answered from their own tables.
     let mut parent_id = query.parent_id();
     let mut collection_ids = None;
+    let mut in_collection = false;
     let only_containers = media_types.as_ref().filter(|kinds| {
         !kinds.is_empty()
             && kinds.iter().all(|kind| {
@@ -2430,20 +2542,20 @@ async fn get_items(
     if let Some(id) = parent_id {
         match super::collections::container_of(&state, id, &claims).await? {
             Some(Container::Playlist) => {
-                let limit = Some(limit as usize);
                 let entries = super::collections::playlist_entries(
                     &state,
                     id,
                     &claims,
-                    start_index as usize,
-                    limit,
+                    list_start,
+                    Some(list_limit),
                     query
                         .sort_by()
                         .is_some_and(rustyfin_db::repo_media::sorts_randomly),
                 );
-                return entries.await.map(|r| Json(r).into_response());
+                return entries.await.map(|r| Json(narrowed(r)).into_response());
             }
             Some(Container::Collection(ids)) => {
+                in_collection = true;
                 parent_id = None;
                 collection_ids = Some(ids);
             }
@@ -2459,10 +2571,10 @@ async fn get_items(
                     wants("BoxSet"),
                     wants("Playlist"),
                     Some(id),
-                    start_index as usize,
-                    limit as usize,
+                    list_start,
+                    list_limit,
                 );
-                return listing.await.map(|r| Json(r).into_response());
+                return listing.await.map(|r| Json(narrowed(r)).into_response());
             }
             None => {}
         }
@@ -2473,10 +2585,10 @@ async fn get_items(
             wants("BoxSet"),
             wants("Playlist"),
             None,
-            start_index as usize,
-            limit as usize,
+            list_start,
+            list_limit,
         );
-        return listing.await.map(|r| Json(r).into_response());
+        return listing.await.map(|r| Json(narrowed(r)).into_response());
     }
 
     // If IsMovie/IsSeries is set, constrain media_type
@@ -2518,26 +2630,23 @@ async fn get_items(
     }
     // Ids keeps only the listed items (Jellyfin's `InternalItemsQuery.ItemIds`); ids of no item
     // are skipped, and an empty list filters nothing, as in Jellyfin.
-    let requested = parse_ids(query.ids());
-    if !requested.is_empty() {
-        let ids = requested.iter().map(Uuid::to_string).collect();
+    if !by_id.requested.is_empty() {
+        let ids = by_id.requested.iter().map(Uuid::to_string).collect();
         item_ids = Some(narrow_ids(item_ids, ids));
     }
     let hidden = HiddenItems::for_caller(&state, &claims).await?;
     // ExcludeItemIds drops items as the caller's hidden ones are dropped.
-    let hidden_json = hidden.json_excluding(&parse_ids(query.exclude_item_ids()));
+    let hidden_json = hidden.json_excluding(&by_id.excluded);
 
-    // With more than one id and no SortBy, Jellyfin answers in the order of Ids
-    // (`Folder.SortItemsByRequest`): every match is fetched, ordered, then paged here.
-    let in_request_order =
-        requested.len() > 1 && query.sort_by().is_none_or(|s| s.trim().is_empty());
-    let (fetch_start, fetch_limit) = if in_request_order {
-        (0, requested.len() as i64)
-    } else {
+    // With Ids every match is fetched, then merged with the requested collections and
+    // playlists, ordered and paged here.
+    let (fetch_start, fetch_limit) = if by_id.requested.is_empty() {
         (start_index, limit)
+    } else {
+        (0, by_id.requested.len() as i64)
     };
 
-    let (mut items, total) = rustyfin_db::repo_media::get_items_filtered(
+    let (mut items, mut total) = rustyfin_db::repo_media::get_items_filtered(
         &state.db_ro,
         parent_id,
         query.library_id(),
@@ -2569,17 +2678,26 @@ async fn get_items(
         hidden_json.as_deref(),
     )
     .await?;
-    if in_request_order {
-        let mut position = std::collections::HashMap::new();
-        for (index, id) in requested.iter().enumerate() {
-            position.entry(*id).or_insert(index);
+    // Collections and playlists named in Ids are listed as `/Items/{id}` answers them; they are
+    // under no library or collection, so a ParentId or LibraryId leaves them out.
+    let mut containers = std::collections::HashSet::new();
+    if !by_id.requested.is_empty() {
+        if parent_id.is_none() && !in_collection && query.library_id().is_none() {
+            let found = requested_containers(
+                &state,
+                &claims,
+                &by_id,
+                &items,
+                constrained_media_types.as_deref(),
+                exclude_media_types.as_deref(),
+            )
+            .await?;
+            total += found.len() as i64;
+            containers.extend(found.iter().map(|item| item.id));
+            items.extend(found);
         }
-        items.sort_by_key(|item| position.get(&item.id).copied().unwrap_or(usize::MAX));
-        items = items
-            .into_iter()
-            .skip(start_index as usize)
-            .take(limit as usize)
-            .collect();
+        let page = by_id.page(items, start_index, limit);
+        items = page.items;
     }
 
     if query.card_index() {
@@ -2597,6 +2715,12 @@ async fn get_items(
     let need_media_sources = fields
         .iter()
         .any(|f| f.eq_ignore_ascii_case("MediaSources"));
+
+    // The collections and playlists are sent as they are, and only the media items are
+    // enriched; `is_container` keeps their places.
+    let is_container: Vec<bool> = items.iter().map(|i| containers.contains(&i.id)).collect();
+    let (held, items): (Vec<MediaItem>, Vec<MediaItem>) =
+        items.into_iter().partition(|i| containers.contains(&i.id));
 
     let mut items = if need_media_sources {
         let mut items_copy = items;
@@ -2624,6 +2748,13 @@ async fn get_items(
         &query.image_options(),
     )
     .await;
+    if !held.is_empty() {
+        let (mut media, mut held) = (items.into_iter(), held.into_iter());
+        items = is_container
+            .iter()
+            .filter_map(|&c| if c { held.next() } else { media.next() })
+            .collect();
+    }
 
     if minimal {
         return Ok(

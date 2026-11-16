@@ -48066,7 +48066,9 @@ async fn r3items_movies(state: &AppState) -> (uuid::Uuid, Vec<uuid::Uuid>) {
 #[tokio::test]
 async fn r3items_ids_list_those_items_in_their_order() {
     let state = test_state().await;
-    let (_, ids) = r3items_movies(&state).await;
+    let (lib, ids) = r3items_movies(&state).await;
+    let show = j6_add_item(&state, lib, None, "Show", "Series").await;
+    let other = j6_library(&state, "R3 Items Other").await;
     let (token, user) = admin_session(&state).await;
     let app = app(state);
     let (a, b, c) = (ids[0], ids[1], ids[2]);
@@ -48091,10 +48093,19 @@ async fn r3items_ids_list_those_items_in_their_order() {
     let (names, _) =
         r3items_names(&app, &format!("/Items?Ids={list}&SortBy=SortName"), &token).await;
     assert_eq!(names, ["Alpha", "Bravo", "Charlie"]);
-    // Other filters still apply.
+    // Other filters still apply: the types, and a ParentId the items aren't under.
     let (names, total) = r3items_names(
         &app,
-        &format!("/Items?Ids={list}&IncludeItemTypes=Series&Recursive=true"),
+        &format!("/Items?Ids={a},{show}&IncludeItemTypes=Movie"),
+        &token,
+    )
+    .await;
+    assert_eq!((names, total), (vec!["Alpha".to_string()], 1));
+    let (names, total) = r3items_names(&app, &format!("/Items?Ids={show},{a}"), &token).await;
+    assert_eq!((names, total), (vec!["Show".into(), "Alpha".into()], 2));
+    let (names, total) = r3items_names(
+        &app,
+        &format!("/Items?Ids={a}&ParentId={other}&Recursive=true"),
         &token,
     )
     .await;
@@ -48162,6 +48173,103 @@ async fn r3items_ids_keep_the_callers_limits() {
     assert_eq!((names, total), (vec!["Charlie".into(), "Alpha".into()], 2));
     let (names, _) = r3items_names(&app, &uri, &admin).await;
     assert_eq!(names, ["Charlie", "Echo", "Bravo", "Alpha"]);
+}
+
+/// Creates a collection (by query) or a playlist (by body) of `items` as `token`; its id.
+async fn r3items_container(
+    app: &axum::Router,
+    token: &str,
+    playlist: bool,
+    name: &str,
+    items: &[uuid::Uuid],
+) -> String {
+    let ids: Vec<String> = items.iter().map(uuid::Uuid::to_string).collect();
+    let (status, body) = if playlist {
+        let body = serde_json::json!({ "Name": name, "Ids": ids });
+        send_authed(app, "POST", "/Playlists", token, Some(&body.to_string())).await
+    } else {
+        let uri = format!("/Collections?Name={name}&Ids={}", ids.join(","));
+        send_authed(app, "POST", &uri, token, None).await
+    };
+    assert!(status.is_success(), "{status} {body}");
+    body["Id"].as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn r3items_ids_list_collections_and_playlists_with_media() {
+    let state = test_state().await;
+    let (_, ids) = r3items_movies(&state).await;
+    let (admin, _) = admin_session(&state).await;
+    add_user(&state, "r3items-other", "r3items-pass", false).await;
+    let app = app(state);
+    let (other, _) = login(&app, "r3items-other", "r3items-pass").await.unwrap();
+    let set = r3items_container(&app, &admin, false, "Set", &[ids[0], ids[1]]).await;
+    let list = r3items_container(&app, &admin, true, "List", &[ids[2]]).await;
+    let c = ids[2];
+    let uri = format!("/Items?Ids={list},{c},{}", set.replace('-', ""));
+    let (status, body) = send_authed(&app, "GET", &uri, &admin, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let kinds: Vec<(&str, &str)> = body["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| (i["Name"].as_str().unwrap(), i["Type"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            ("List", "Playlist"),
+            ("Charlie", "Movie"),
+            ("Set", "BoxSet")
+        ]
+    );
+    assert_eq!(body["TotalRecordCount"], 3);
+    let (names, total) = r3items_names(&app, &format!("{uri}&StartIndex=1&Limit=1"), &admin).await;
+    assert_eq!((names, total), (vec!["Charlie".to_string()], 3));
+    // The types and ExcludeItemIds apply to them too.
+    let (names, total) = r3items_names(
+        &app,
+        &format!("{uri}&IncludeItemTypes=Movie,BoxSet"),
+        &admin,
+    )
+    .await;
+    assert_eq!((names, total), (vec!["Charlie".into(), "Set".into()], 2));
+    let (names, total) = r3items_names(&app, &format!("{uri}&ExcludeItemIds={set}"), &admin).await;
+    assert_eq!((names, total), (vec!["List".into(), "Charlie".into()], 2));
+    // A playlist the caller can't reach is skipped.
+    let (names, total) = r3items_names(&app, &uri, &other).await;
+    assert_eq!((names, total), (vec!["Charlie".into(), "Set".into()], 2));
+}
+
+#[tokio::test]
+async fn r3items_ids_narrow_collection_and_playlist_listings() {
+    let state = test_state().await;
+    let (_, ids) = r3items_movies(&state).await;
+    let (admin, _) = admin_session(&state).await;
+    let app = app(state);
+    let one = r3items_container(&app, &admin, false, "One", &[ids[0]]).await;
+    r3items_container(&app, &admin, false, "Two", &[ids[1]]).await;
+    let three = r3items_container(&app, &admin, false, "Three", &[ids[2]]).await;
+    // IncludeItemTypes=BoxSet lists only the collections asked for, in the order of Ids.
+    let base = "/Items?IncludeItemTypes=BoxSet&Recursive=true";
+    let (names, total) = r3items_names(&app, &format!("{base}&Ids={three},{one}"), &admin).await;
+    assert_eq!((names, total), (vec!["Three".into(), "One".into()], 2));
+    let (names, total) = r3items_names(&app, &format!("{base}&ExcludeItemIds={one}"), &admin).await;
+    assert_eq!((names, total), (vec!["Three".into(), "Two".into()], 2));
+    // A playlist as ParentId: only its entries asked for, in the order of Ids, then paged.
+    let list = r3items_container(&app, &admin, true, "List", &ids).await;
+    let (a, c, d) = (ids[0], ids[2], ids[3]);
+    let uri = format!("/Items?ParentId={list}&Ids={d},{a},{c}");
+    let (names, total) = r3items_names(&app, &uri, &admin).await;
+    assert_eq!(
+        (names, total),
+        (vec!["Delta".into(), "Alpha".into(), "Charlie".into()], 3)
+    );
+    let (names, total) = r3items_names(&app, &format!("{uri}&StartIndex=2&Limit=5"), &admin).await;
+    assert_eq!((names, total), (vec!["Charlie".to_string()], 3));
+    let uri = format!("/Items?ParentId={list}&ExcludeItemIds={a},{c}");
+    let (names, total) = r3items_names(&app, &uri, &admin).await;
+    assert_eq!((names, total), (vec!["Bravo".into(), "Delta".into()], 2));
 }
 
 /// The stored library id of an item.
