@@ -107,9 +107,25 @@ pub async fn refresh_item_metadata_with(
             .map_err(|e| e.to_string())?;
     }
 
-    // 1. Scan for local images and compute blurhash for each
+    // 1. Scan for local images and compute blurhash for each. An image whose file is unchanged
+    // since its row was stored (same path and stamp) keeps the stored hash, so it isn't read again.
     let mut local_images = local_images::find_local_images(media_path, item.id);
+    let stored = if local_images.is_empty() {
+        Vec::new()
+    } else {
+        rustyfin_db::repo_image::get_images_for_item(pool, item.id)
+            .await
+            .unwrap_or_default()
+    };
     for img in &mut local_images {
+        if img.blurhash.is_none()
+            && img.stamp.is_some()
+            && let Some(known) = stored
+                .iter()
+                .find(|s| s.path == img.path && s.stamp == img.stamp && s.blurhash.is_some())
+        {
+            img.blurhash = known.blurhash.clone();
+        }
         if img.blurhash.is_none()
             && let Some(bh) = crate::image_proxy::compute_blurhash(&img.path, Some(client)).await
         {

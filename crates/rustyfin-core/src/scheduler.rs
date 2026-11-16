@@ -449,6 +449,20 @@ impl TaskScheduler {
         tracing::info!("All scheduled tasks restarted");
     }
 
+    /// Marks task `id` Running, unless a run of it is under way: false then, and the caller
+    /// doesn't run it.
+    async fn begin_run(&self, id: &str) -> bool {
+        let mut tasks = self.tasks.write().await;
+        let Some(entry) = tasks.get_mut(id) else {
+            return false;
+        };
+        if matches!(entry.info.state, TaskState::Running | TaskState::Cancelling) {
+            return false;
+        }
+        self.apply_state(entry, TaskState::Running);
+        true
+    }
+
     async fn set_task_state(&self, id: &str, state: TaskState) {
         let mut tasks = self.tasks.write().await;
         if let Some(entry) = tasks.get_mut(id) {
@@ -778,8 +792,12 @@ impl TaskScheduler {
 
     /// Run intro/outro detection for all episodes
     async fn run_intro_detection(&self) {
-        self.set_task_state(TASK_INTRO_DETECTION, TaskState::Running)
-            .await;
+        // A second run at once (the daily one and one started by hand) would decode every episode
+        // again.
+        if !self.begin_run(TASK_INTRO_DETECTION).await {
+            tracing::info!("intro detection is running already, so this run is skipped");
+            return;
+        }
         let start = Utc::now();
 
         let progress = self.progress_of(TASK_INTRO_DETECTION);
@@ -1403,6 +1421,27 @@ mod tests {
             .await
             .unwrap();
         (TaskScheduler::new(db, Arc::new(dir.clone())), dir)
+    }
+
+    #[tokio::test]
+    async fn r3perf_intro_detection_does_not_start_while_it_runs() {
+        let (sched, dir) = r3tasks_scheduler().await;
+        sched
+            .set_task_state(TASK_INTRO_DETECTION, TaskState::Running)
+            .await;
+        sched.run_intro_detection().await;
+        let task = sched.get_task(TASK_INTRO_DETECTION).await.unwrap();
+        assert_eq!(task.state, TaskState::Running, "the first run is still on");
+        assert!(task.last_execution_result.is_none(), "no second run ended");
+
+        sched
+            .set_task_state(TASK_INTRO_DETECTION, TaskState::Idle)
+            .await;
+        sched.run_intro_detection().await;
+        let task = sched.get_task(TASK_INTRO_DETECTION).await.unwrap();
+        assert_eq!(task.state, TaskState::Idle);
+        assert!(task.last_execution_result.is_some(), "an idle task runs");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

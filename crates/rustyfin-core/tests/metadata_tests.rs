@@ -949,3 +949,64 @@ async fn r1scan_forced_series_refresh_refills_answered_children() {
     assert_eq!(seasons(), 2);
     assert_eq!(stored(pool, episode.id).await.name, "Pilot: One");
 }
+
+// Background task speed: a refresh doesn't read an unchanged local image again.
+
+async fn r3perf_poster_hash(pool: &SqlitePool, item: Uuid) -> Option<String> {
+    sqlx::query_scalar(
+        "SELECT blurhash FROM item_images WHERE item_id = ?1 AND image_type = 'Primary'",
+    )
+    .bind(item.to_string())
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+fn r3perf_write_poster(path: &std::path::Path, side: u32, modified: std::time::SystemTime) {
+    image::RgbImage::from_fn(side, side, |x, y| {
+        image::Rgb([(x * 4) as u8, (y * 4) as u8, 90])
+    })
+    .save(path)
+    .unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
+}
+
+#[tokio::test]
+async fn r3perf_refresh_keeps_the_hash_of_an_unchanged_local_image() {
+    let fx = Fixture::new().await;
+    let item = fx.movie("Pic", None).await;
+    let poster = fx.dir.join("film").join("Pic-poster.jpg");
+    let then = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    r3perf_write_poster(&poster, 64, then);
+
+    refresh(&fx.pool, &item).await;
+    let first = r3perf_poster_hash(&fx.pool, item.id).await;
+    assert!(first.is_some(), "the first refresh hashes the poster");
+
+    // A stored hash for the same file version is kept: the file isn't read again.
+    exec(
+        &fx.pool,
+        "UPDATE item_images SET blurhash = 'kept' WHERE item_id = ?1",
+        &[&item.id.to_string()],
+    )
+    .await;
+    refresh(&fx.pool, &item).await;
+    assert_eq!(
+        r3perf_poster_hash(&fx.pool, item.id).await.as_deref(),
+        Some("kept")
+    );
+
+    // A changed file is hashed again.
+    r3perf_write_poster(&poster, 32, then + std::time::Duration::from_secs(60));
+    refresh(&fx.pool, &item).await;
+    let again = r3perf_poster_hash(&fx.pool, item.id).await;
+    assert!(
+        again.is_some() && again.as_deref() != Some("kept"),
+        "{again:?}"
+    );
+}

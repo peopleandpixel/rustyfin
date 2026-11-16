@@ -132,8 +132,9 @@ async fn extract_one(
     }
 }
 
-/// Makes the missing chapter images of the videos in the libraries `library_ids`, one video at a
-/// time, and returns how many images it made. Stops between videos once `cancel` fires.
+/// Makes the missing chapter images of the videos in the libraries `library_ids`, up to
+/// `image_jobs` videos at once, and returns how many images it made. Starts no more videos once
+/// `cancel` fires, or after an error, which it returns once the running videos have finished.
 pub async fn extract_for_libraries(
     pool: &SqlitePool,
     data_dir: &Path,
@@ -160,7 +161,28 @@ pub async fn extract_for_libraries_with_progress(
         .len();
     let mut done = 0usize;
     progress.report_count(0, total);
-    loop {
+    let jobs = crate::trickplay::image_jobs();
+    let mut running = tokio::task::JoinSet::new();
+    let mut failed: Option<String> = None;
+    // Collects one finished video: its count, or the first error.
+    let finish = |result: Result<Result<u32, String>, tokio::task::JoinError>,
+                  made: &mut u32,
+                  done: &mut usize,
+                  failed: &mut Option<String>| {
+        *done += 1;
+        // Videos added during the run can take it past the total counted at the start
+        progress.report_count((*done).min(total), total);
+        match result {
+            Ok(Ok(n)) => *made += n,
+            Ok(Err(e)) => {
+                failed.get_or_insert(e);
+            }
+            Err(e) => {
+                failed.get_or_insert(format!("a chapter image job failed: {e}"));
+            }
+        }
+    };
+    'videos: loop {
         let batch = rustyfin_db::repo_chapter::items_missing_chapter_images(pool, library_ids, 20)
             .await
             .map_err(|e| format!("could not list videos: {e}"))?;
@@ -168,21 +190,36 @@ pub async fn extract_for_libraries_with_progress(
             break;
         }
         for (item_id, path) in batch {
-            if cancel.is_cancelled() {
-                return Ok(made);
-            }
-            // Videos added during the run can take it past the total counted at the start
-            progress.report_count(done.min(total), total);
-            done += 1;
-            // Every chapter is marked, made or failed, so the loop moves on.
-            match extract_for_item(pool, data_dir, item_id, &path, cancel).await {
-                Ok(n) => made += n,
-                Err(e) => {
-                    warn!(item = %item_id, error = %e, "could not make chapter images");
-                    return Err(e);
+            while running.len() >= jobs {
+                if let Some(result) = running.join_next().await {
+                    finish(result, &mut made, &mut done, &mut failed);
                 }
             }
+            if cancel.is_cancelled() || failed.is_some() {
+                break 'videos;
+            }
+            let (pool, data_dir, cancel) = (pool.clone(), data_dir.to_path_buf(), cancel.clone());
+            running.spawn(async move {
+                let made = extract_for_item(&pool, &data_dir, item_id, &path, &cancel).await;
+                if let Err(e) = &made {
+                    warn!(item = %item_id, error = %e, "could not make chapter images");
+                }
+                made
+            });
         }
+        // Every chapter of a finished video is marked, made or failed, so the next batch moves on.
+        while let Some(result) = running.join_next().await {
+            finish(result, &mut made, &mut done, &mut failed);
+        }
+        if cancel.is_cancelled() || failed.is_some() {
+            break;
+        }
+    }
+    while let Some(result) = running.join_next().await {
+        finish(result, &mut made, &mut done, &mut failed);
+    }
+    if let Some(e) = failed {
+        return Err(e);
     }
     if made > 0 {
         info!(images = made, "made chapter images");

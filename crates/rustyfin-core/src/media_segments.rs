@@ -227,17 +227,53 @@ struct SilenceEvent {
 /// 1. **Silence detection** for outros: Long silence periods near the end of the file indicate credits/outro.
 /// 2. **Black frame detection** for intros/outros: Consecutive black frames at start/end indicate intro/outro boundaries.
 ///
+/// Both filters run in one ffmpeg pass (`segment_detect_args`), so the file is decoded once.
+/// ffmpeg runs at a low CPU priority, with `threads` decoder threads.
+///
 /// Returns a tuple of (intro_segment, outro_segment), where each is None if not detected.
 pub async fn detect_segments(
     path: &str,
     duration_seconds: f64,
     config: &DetectionConfig,
 ) -> Result<(Option<DetectedSegment>, Option<DetectedSegment>), String> {
-    // Detect silence periods (for outro detection)
-    let silence_events = detect_silence(path, config).await?;
+    detect_segments_with_threads(path, duration_seconds, config, 0).await
+}
 
-    // Detect black frames (for intro/outro detection)
-    let black_segments = detect_black_frames(path, config).await?;
+/// `detect_segments` with `threads` decoder threads (0: ffmpeg's choice).
+async fn detect_segments_with_threads(
+    path: &str,
+    duration_seconds: f64,
+    config: &DetectionConfig,
+    threads: usize,
+) -> Result<(Option<DetectedSegment>, Option<DetectedSegment>), String> {
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(segment_detect_args(path, config, threads))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    crate::media_reads::lower_priority(&mut cmd);
+    let output = cmd
+        .output()
+        .await
+        .map_err(|e| format!("FFmpeg not found: {}", e))?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        return Err(format!("FFmpeg segment detection failed: {}", stderr));
+    }
+    // The black frame pass failed on a file without video before the two passes became one.
+    if !has_video_input(&stderr) {
+        return Err(format!(
+            "FFmpeg black frame detection failed: the file has no video stream: {}",
+            stderr
+        ));
+    }
+
+    // Silence periods (for outro detection)
+    let silence_events = parse_silence_events(&stderr);
+
+    // Black frames (for intro/outro detection)
+    let black_segments = parse_black_segments(&stderr);
 
     // Find intro from black frames at the beginning
     let intro = find_intro(&black_segments, duration_seconds, config);
@@ -248,42 +284,67 @@ pub async fn detect_segments(
     Ok((intro, outro))
 }
 
+fn silence_filter(config: &DetectionConfig) -> String {
+    format!(
+        "silencedetect=noise={}dB:d={},ametadata=mode=print",
+        config.silence_noise_threshold, config.min_silence_duration
+    )
+}
+
+fn black_filter(config: &DetectionConfig) -> String {
+    format!(
+        "blackdetect=d={}:pix_th={}",
+        config.min_black_duration, config.black_pixel_threshold
+    )
+}
+
 /// FFmpeg arguments for the silencedetect pass over `path`, one element per argument.
 pub fn silence_detect_args(path: &str, config: &DetectionConfig) -> Vec<String> {
     vec![
         "-i".to_string(),
         path.to_string(),
         "-af".to_string(),
-        format!(
-            "silencedetect=noise={}dB:d={},ametadata=mode=print",
-            config.silence_noise_threshold, config.min_silence_duration
-        ),
+        silence_filter(config),
         "-f".to_string(),
         "null".to_string(),
         "-".to_string(),
     ]
 }
 
-/// Run FFmpeg silencedetect filter and parse the output.
-async fn detect_silence(path: &str, config: &DetectionConfig) -> Result<Vec<SilenceEvent>, String> {
-    let args = silence_detect_args(path, config);
-
-    let output = Command::new("ffmpeg")
-        .args(&args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .map_err(|e| format!("FFmpeg not found: {}", e))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("FFmpeg silence detection failed: {}", stderr));
+/// FFmpeg arguments for the one pass over `path` that runs both the silencedetect and the
+/// blackdetect filter, on the streams each pass picked on its own (ffmpeg's default audio and
+/// video stream). `threads` decoder threads, or ffmpeg's choice for 0.
+pub fn segment_detect_args(path: &str, config: &DetectionConfig, threads: usize) -> Vec<String> {
+    let mut args = Vec::new();
+    if threads > 0 {
+        args.extend(["-threads".to_string(), threads.to_string()]);
     }
+    args.extend([
+        "-nostdin".to_string(),
+        "-i".to_string(),
+        path.to_string(),
+        "-af".to_string(),
+        silence_filter(config),
+        "-vf".to_string(),
+        black_filter(config),
+        "-f".to_string(),
+        "null".to_string(),
+        "-".to_string(),
+    ]);
+    args
+}
 
-    // Parse silence events from stderr
-    let stderr = String::from_utf8_lossy(&output.stderr);
+/// Whether ffmpeg's listing of input #0 in `stderr` has a video stream.
+fn has_video_input(stderr: &str) -> bool {
+    stderr
+        .lines()
+        .skip_while(|l| !l.starts_with("Input #0"))
+        .take_while(|l| !l.starts_with("Output #") && !l.starts_with("Stream mapping"))
+        .any(|l| l.trim_start().starts_with("Stream #0:") && l.contains(": Video:"))
+}
+
+/// The silence events in ffmpeg's `stderr`.
+fn parse_silence_events(stderr: &str) -> Vec<SilenceEvent> {
     let mut events = Vec::new();
 
     for line in stderr.lines() {
@@ -294,7 +355,7 @@ async fn detect_silence(path: &str, config: &DetectionConfig) -> Result<Vec<Sile
         }
     }
 
-    Ok(events)
+    events
 }
 
 /// Parse a single silence detection line from FFmpeg output.
@@ -343,10 +404,7 @@ pub fn black_detect_args(path: &str, config: &DetectionConfig) -> Vec<String> {
         "-i".to_string(),
         path.to_string(),
         "-vf".to_string(),
-        format!(
-            "blackdetect=d={}:pix_th={}",
-            config.min_black_duration, config.black_pixel_threshold
-        ),
+        black_filter(config),
         "-an".to_string(),
         "-f".to_string(),
         "null".to_string(),
@@ -354,29 +412,8 @@ pub fn black_detect_args(path: &str, config: &DetectionConfig) -> Vec<String> {
     ]
 }
 
-/// Run FFmpeg blackdetect filter and parse the output.
-async fn detect_black_frames(
-    path: &str,
-    config: &DetectionConfig,
-) -> Result<Vec<DetectedSegment>, String> {
-    let args = black_detect_args(path, config);
-
-    let output = Command::new("ffmpeg")
-        .args(&args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .map_err(|e| format!("FFmpeg not found: {}", e))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("FFmpeg black frame detection failed: {}", stderr));
-    }
-
-    // Parse black frame events from stderr
-    let stderr = String::from_utf8_lossy(&output.stderr);
+/// The black frame segments in ffmpeg's `stderr`.
+fn parse_black_segments(stderr: &str) -> Vec<DetectedSegment> {
     let mut segments = Vec::new();
     let mut current_start: Option<f64> = None;
 
@@ -413,7 +450,7 @@ async fn detect_black_frames(
         });
     }
 
-    Ok(segments)
+    segments
 }
 
 /// Find intro segment from black frames at the beginning of the file.
@@ -498,6 +535,17 @@ pub async fn detect_and_save(
     path: &str,
     duration_seconds: f64,
 ) -> Result<(), String> {
+    detect_and_save_with_threads(pool, item_id, path, duration_seconds, 0).await
+}
+
+/// `detect_and_save` with `threads` decoder threads (0: ffmpeg's choice).
+async fn detect_and_save_with_threads(
+    pool: &SqlitePool,
+    item_id: Uuid,
+    path: &str,
+    duration_seconds: f64,
+    threads: usize,
+) -> Result<(), String> {
     let config = DetectionConfig::default();
 
     info!(
@@ -505,7 +553,8 @@ pub async fn detect_and_save(
         item_id, duration_seconds
     );
 
-    let (intro, outro) = detect_segments(path, duration_seconds, &config).await?;
+    let (intro, outro) =
+        detect_segments_with_threads(path, duration_seconds, &config, threads).await?;
 
     // Drop results from earlier runs now that detection has succeeded.
     sqlx::query(
@@ -565,6 +614,9 @@ pub async fn detect_for_all_episodes(pool: &SqlitePool) -> Result<usize, String>
 }
 
 /// `detect_for_all_episodes`, reporting the share of the episodes looked at on `progress`.
+/// Episodes run in parallel, each holding one of the image job slots (`trickplay::image_job`,
+/// shared with trickplay and chapter images); an episode on a network share also holds one of the
+/// `media_reads::network_read_jobs`, since its whole file is read.
 pub async fn detect_for_all_episodes_with_progress(
     pool: &SqlitePool,
     progress: &crate::task_progress::TaskProgress,
@@ -583,30 +635,62 @@ pub async fn detect_for_all_episodes_with_progress(
     .await
     .map_err(|e| format!("Failed to fetch episodes: {}", e))?;
 
+    let total = episodes.len();
+    let threads = crate::media_reads::decode_threads();
+    let jobs = crate::trickplay::image_jobs();
     let mut count = 0;
-    for (i, (id_str, path, runtime_ticks)) in episodes.iter().enumerate() {
-        progress.report_count(i, episodes.len());
-        let item_id = match Uuid::parse_str(id_str) {
+    let mut done = 0;
+    let mut running = tokio::task::JoinSet::new();
+    progress.report_count(0, total);
+    for (id_str, path, runtime_ticks) in episodes {
+        let item_id = match Uuid::parse_str(&id_str) {
             Ok(id) => id,
             Err(e) => {
                 warn!("Invalid UUID {}: {}", id_str, e);
+                done += 1;
+                progress.report_count(done, total);
                 continue;
             }
         };
 
         // Calculate duration from runtime_ticks or skip if unknown
         let duration = match runtime_ticks {
-            Some(ticks) if *ticks > 0 => *ticks as f64 / 10_000_000.0,
+            Some(ticks) if ticks > 0 => ticks as f64 / 10_000_000.0,
             _ => {
                 warn!("Skipping {}: no runtime ticks", id_str);
+                done += 1;
+                progress.report_count(done, total);
                 continue;
             }
         };
 
-        match detect_and_save(pool, item_id, path, duration).await {
-            Ok(()) => count += 1,
-            Err(e) => warn!("Failed to detect segments for {}: {}", id_str, e),
+        // At most `jobs` episodes are under way; the ones that finished are counted meanwhile.
+        while running.len() >= jobs {
+            if let Some(finished) = running.join_next().await {
+                count += usize::from(finished.unwrap_or(false));
+                done += 1;
+                progress.report_count(done, total);
+            }
         }
+        let pool = pool.clone();
+        running.spawn(async move {
+            // The network read first, so a waiting episode holds no image job slot. The task has no
+            // stop yet, so the slot's cancel never fires.
+            let _read = crate::media_reads::whole_file_read(std::path::Path::new(&path)).await;
+            let _slot = crate::trickplay::image_job(&crate::trickplay::Cancel::new()).await;
+            match detect_and_save_with_threads(&pool, item_id, &path, duration, threads).await {
+                Ok(()) => true,
+                Err(e) => {
+                    warn!("Failed to detect segments for {}: {}", id_str, e);
+                    false
+                }
+            }
+        });
+    }
+    while let Some(finished) = running.join_next().await {
+        count += usize::from(finished.unwrap_or(false));
+        done += 1;
+        progress.report_count(done, total);
     }
 
     info!("Detected segments for {} episodes", count);
