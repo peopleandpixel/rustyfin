@@ -439,6 +439,13 @@ async fn enrich_item(
         .unwrap_or_default();
     item.local_trailer_count = Some(trailers);
     item.special_feature_count = Some(specials);
+    // A movie split into files: Jellyfin's PartCount, part 1 included.
+    let parts = rustyfin_db::repo_extras::additional_part_count(pool, item.id)
+        .await
+        .unwrap_or(0);
+    if parts > 0 {
+        item.part_count = Some(parts as i32 + 1);
+    }
 
     // Parallel queries: images, chapters, trickplay, user_data, people, studios
     // These are independent and can run concurrently instead of sequentially.
@@ -2994,7 +3001,7 @@ const SPECIAL_FEATURE_TYPES: &[&str] = &[
 ];
 
 /// The extras of `owner` with one of `types`, as full items for `user_id`, each with its `ExtraType`.
-async fn extra_items(
+pub(crate) async fn extra_items(
     state: &AppState,
     owner: Uuid,
     user_id: Uuid,

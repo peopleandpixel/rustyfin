@@ -102,16 +102,20 @@ struct Runtime {
 
 /// What the server keeps in memory about its sessions, by session id. One per `AppState`, so
 /// servers in one process (the tests) never see or sweep each other's sessions.
+/// It also holds the user data changes its sockets are still to be sent.
 #[derive(Debug, Clone, Default)]
-pub struct SessionRuntime(Arc<RwLock<HashMap<String, Runtime>>>);
+pub struct SessionRuntime {
+    sessions: Arc<RwLock<HashMap<String, Runtime>>>,
+    pub(crate) user_data: crate::user_data_changes::Pending,
+}
 
 impl SessionRuntime {
     fn read(&self) -> std::sync::RwLockReadGuard<'_, HashMap<String, Runtime>> {
-        self.0.read().unwrap_or_else(|e| e.into_inner())
+        self.sessions.read().unwrap_or_else(|e| e.into_inner())
     }
 
     fn write(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<String, Runtime>> {
-        self.0.write().unwrap_or_else(|e| e.into_inner())
+        self.sessions.write().unwrap_or_else(|e| e.into_inner())
     }
 }
 
