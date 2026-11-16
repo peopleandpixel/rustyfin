@@ -515,11 +515,12 @@ const API = {
     // Universal endpoint returns the optimal playback URL. No PlaySessionId is sent: the server
     // keeps a client's id, and one fixed per device would tie every load to the last one stopped.
     async getUniversalVideoUrl(itemId, params = {}) {
+        // No maxBitrate (the player's Auto) sends no limit, so any source the browser plays can play directly
         const q = new URLSearchParams({
-            MaxStreamingBitrate: params.maxBitrate || '100000000',
             EnableDirectPlay: params.enableDirectPlay !== false ? 'true' : 'false',
             EnableDirectStream: params.enableDirectStream !== false ? 'true' : 'false',
         });
+        if (params.maxBitrate > 0) q.set('MaxStreamingBitrate', params.maxBitrate);
         const codecs = this.playableCodecs();
         q.set('VideoCodecs', codecs.video.join(','));
         q.set('AudioCodecs', codecs.audio.join(','));
