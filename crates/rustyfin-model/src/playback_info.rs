@@ -7,8 +7,11 @@ use crate::media_source::MediaSourceResponse;
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct PlaybackInfoResponse {
-    /// Media sources for this item
-    #[serde(default)]
+    /// Media sources for this item, each with its Name
+    #[serde(
+        default,
+        serialize_with = "crate::media_source::serialize_named_sources"
+    )]
     pub media_sources: Vec<MediaSourceResponse>,
     /// PlaySessionId for tracking
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -20,8 +23,11 @@ pub struct PlaybackInfoResponse {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct StreamingResponse {
-    /// Media sources for this item
-    #[serde(default)]
+    /// Media sources for this item, each with its Name
+    #[serde(
+        default,
+        serialize_with = "crate::media_source::serialize_named_sources"
+    )]
     pub media_sources: Vec<MediaSourceResponse>,
     /// URL for direct play/stream
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -113,7 +119,10 @@ pub struct VideoPlaybackInfoQuery {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct PlaybackMediaSource {
-    #[serde(flatten)]
+    #[serde(
+        flatten,
+        serialize_with = "crate::media_source::serialize_named_source"
+    )]
     pub source: MediaSourceResponse,
     /// The remembered audio stream, when this source has it
     #[serde(skip_serializing_if = "Option::is_none", default)]
