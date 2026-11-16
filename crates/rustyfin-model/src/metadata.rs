@@ -115,6 +115,11 @@ pub trait MetadataLookups: Send + Sync {
         let _ = (series, id);
         Box::pin(async { Ok(Some(Vec::new())) })
     }
+    /// Forgets the cached answers about a movie's or series' id (a series' seasons included), so
+    /// that a "replace all metadata" refresh asks the provider again.
+    fn forget(&self, series: bool, id: i64) {
+        let _ = (series, id);
+    }
 }
 
 /// Lookups by IMDb id (OMDb's), asked after the provider that identified the item: a movie's or
@@ -123,6 +128,10 @@ pub trait MetadataLookups: Send + Sync {
 pub trait ImdbLookups: Send + Sync {
     fn by_imdb_id(&self, imdb_id: &str) -> LookupFuture<'_, ExternalMetadata>;
     fn season(&self, series_imdb_id: &str, season_number: i32) -> LookupFuture<'_, SeasonMetadata>;
+    /// Forgets the cached answers about an IMDb id (a series' seasons included).
+    fn forget(&self, imdb_id: &str) {
+        let _ = imdb_id;
+    }
 }
 
 /// One match of a provider search: Jellyfin's RemoteSearchResult, with the provider's own id.

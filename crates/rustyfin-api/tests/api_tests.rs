@@ -26016,7 +26016,11 @@ async fn b142_server() -> (AppState, axum::Router, String, String) {
     state.plugin_manager = state.plugin_manager.with_database(state.db.clone());
     let pm = &state.plugin_manager;
     rustyfin_core::plugin_manager::install_tmdb_plugin(pm, state.tmdb.clone()).await;
-    rustyfin_core::plugin_manager::install_omdb_plugin(pm).await;
+    rustyfin_core::plugin_manager::install_omdb_plugin(
+        pm,
+        rustyfin_model::answer_store::AnswerStore::memory_only(),
+    )
+    .await;
     rustyfin_core::plugin_manager::install_fanart_plugin(pm).await;
     let app = app(state.clone());
     let (owner, _, viewer, _) = g1_owner_and_viewer(&state, &app).await;

@@ -1332,7 +1332,12 @@ async fn r3meta_manager(
     let key = Arc::new(Mutex::new(key.map(String::from)));
     pm.register_imdb_lookups(
         "omdb",
-        Arc::new(plugin_omdb::OmdbLookups::new(http, origin, key)),
+        Arc::new(plugin_omdb::OmdbLookups::new(
+            http,
+            origin,
+            key,
+            rustyfin_model::answer_store::AnswerStore::memory_only(),
+        )),
     )
     .await;
     pm
@@ -1442,4 +1447,45 @@ async fn r3meta_omdb_fills_missing_movie_and_episode_ratings_and_genres() {
         .unwrap();
     assert_eq!(stored(pool, other.id).await.official_rating, None);
     assert_eq!(hits.lock().unwrap().len(), asked);
+}
+
+/// OMDb's answers are kept on disk, with no expiry: new lookups over the same dir (a restart) ask
+/// nothing OMDb answered, its "not found" included, and the files never hold the key. `forget` (an
+/// admin's "replace all metadata") makes the next lookup of that id ask again.
+#[tokio::test]
+async fn r3meta_omdb_answers_survive_a_restart() {
+    use rustyfin_model::metadata::ImdbLookups;
+    use std::sync::{Arc, Mutex};
+    let (origin, hits) = r3meta_omdb_stub().await;
+    let dir = std::env::temp_dir().join(format!("rf-omdb-answers-{}", Uuid::new_v4()));
+    let lookups = || {
+        plugin_omdb::OmdbLookups::new(
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            &origin,
+            Arc::new(Mutex::new(Some("r3-omdb-key".to_string()))),
+            rustyfin_model::answer_store::AnswerStore::new(&dir),
+        )
+    };
+    async fn ask(lookups: &plugin_omdb::OmdbLookups) {
+        let movie = lookups.by_imdb_id("tt0000601").await.unwrap().unwrap();
+        assert_eq!(movie.official_rating.as_deref(), Some("PG-13"));
+        let season = lookups.season("tt0000501", 1).await.unwrap().unwrap();
+        assert_eq!(season.episodes.len(), 2);
+        assert!(lookups.by_imdb_id("tt0000999").await.unwrap().is_none());
+    }
+    ask(&lookups()).await;
+    assert_eq!(hits.lock().unwrap().len(), 3);
+
+    let restarted = lookups();
+    ask(&restarted).await;
+    assert_eq!(hits.lock().unwrap().len(), 3, "{:?}", hits.lock().unwrap());
+    for file in std::fs::read_dir(&dir).unwrap() {
+        let text = std::fs::read_to_string(file.unwrap().path()).unwrap();
+        assert!(!text.contains("r3-omdb-key"), "{text}");
+    }
+
+    restarted.forget("tt0000601");
+    ask(&restarted).await;
+    assert_eq!(hits.lock().unwrap().len(), 4);
+    std::fs::remove_dir_all(&dir).unwrap();
 }

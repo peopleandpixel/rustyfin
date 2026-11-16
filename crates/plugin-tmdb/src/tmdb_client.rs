@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use reqwest::Url;
+use rustyfin_model::answer_store::{Answer, AnswerStore};
 use tokio::sync::Semaphore;
 use tokio::time::{Instant, sleep, sleep_until};
 
@@ -19,8 +20,8 @@ pub const ENV_BASE_URL: &str = "RUSTYFIN_TMDB_BASE_URL";
 pub const ENV_IMAGE_BASE_URL: &str = "RUSTYFIN_TMDB_IMAGE_BASE_URL";
 pub const USER_AGENT: &str = concat!("Rustyfin/", env!("CARGO_PKG_VERSION"));
 
+/// Answers kept in memory; every answer is also on disk (`TmdbSettings::cache_dir`).
 const CACHE_CAPACITY: u64 = 10_000;
-const CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const REDACTED: &str = "<redacted>";
 
 /// A TMDb v3 API key or v4 read access token. The value is private to this module.
@@ -71,6 +72,8 @@ pub struct TmdbSettings {
     pub max_retry_after: Duration,
     /// Per attempt.
     pub request_timeout: Duration,
+    /// Where answers are kept across restarts, with no expiry. `None` keeps them in memory only.
+    pub cache_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for TmdbSettings {
@@ -85,6 +88,7 @@ impl Default for TmdbSettings {
             initial_backoff: Duration::from_millis(500),
             max_retry_after: Duration::from_secs(10),
             request_timeout: Duration::from_secs(10),
+            cache_dir: None,
         }
     }
 }
@@ -195,7 +199,10 @@ struct Shared {
     http: reqwest::Client,
     settings: TmdbSettings,
     limiter: Limiter,
-    cache: moka::future::Cache<String, serde_json::Value>,
+    /// Final answers by request (path and query, without the key): the JSON, or `None` for a 404
+    cache: moka::future::Cache<String, Answer>,
+    /// The same answers on disk
+    store: AnswerStore,
 }
 
 /// One per process. Clones share the limiter and cache.
@@ -207,14 +214,39 @@ impl TmdbClient {
         let limiter = Limiter::new(settings.max_concurrent, settings.min_interval);
         let cache = moka::future::Cache::builder()
             .max_capacity(CACHE_CAPACITY)
-            .time_to_live(CACHE_TTL)
+            .support_invalidation_closures()
             .build();
+        let store = match &settings.cache_dir {
+            Some(dir) => AnswerStore::new(dir),
+            None => AnswerStore::memory_only(),
+        };
         TmdbClient(Arc::new(Shared {
             http,
             settings,
             limiter,
             cache,
+            store,
         }))
+    }
+
+    /// Forgets the answers about a movie's or series' id (its details, and a series' seasons), so
+    /// that the next lookup asks TMDb again: for a "replace all metadata" refresh, as Jellyfin's
+    /// bypasses its cache.
+    pub fn forget(&self, series: bool, id: i64) {
+        let root = format!("/{}/{id}", if series { "tv" } else { "movie" });
+        let about = move |key: &str| {
+            key.strip_prefix(root.as_str())
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with(['?', '/']))
+        };
+        let shared = &self.0;
+        let in_memory = about.clone();
+        if let Err(e) = shared
+            .cache
+            .invalidate_entries_if(move |key, _| in_memory(key))
+        {
+            tracing::debug!("TMDb cache: {e}");
+        }
+        shared.store.remove_if(about);
     }
 
     /// The env key if set, else the trimmed non-empty config key, else `None` (TMDb off).
@@ -299,16 +331,37 @@ impl TmdbApi {
             Some(encoded) => format!("{path}?{encoded}"),
             None => path.to_string(),
         };
-        if let Some(value) = shared.cache.get(&cache_key).await {
-            return Ok(value);
+        let known = match shared.cache.get(&cache_key).await {
+            Some(answer) => Some(answer),
+            None => {
+                let stored = shared.store.get(&cache_key);
+                if let Some(answer) = &stored {
+                    shared.cache.insert(cache_key.clone(), answer.clone()).await;
+                }
+                stored
+            }
+        };
+        if let Some(answer) = known {
+            return answer.ok_or_else(|| TmdbError {
+                endpoint: path.to_string(),
+                kind: TmdbErrorKind::Status(404),
+                attempts: 0,
+            });
         }
         if !self.key.is_bearer() {
             url.query_pairs_mut()
                 .append_pair("api_key", self.key.expose());
         }
-        let value = self.send_with_retries(path, &url).await?;
-        shared.cache.insert(cache_key, value.clone()).await;
-        Ok(value)
+        // A final answer, a 404 included, is kept; a failure is not
+        let result = self.send_with_retries(path, &url).await;
+        let answer = match &result {
+            Ok(value) => Some(value.clone()),
+            Err(e) if e.is_not_found() => None,
+            Err(_) => return result,
+        };
+        shared.store.put(&cache_key, &answer);
+        shared.cache.insert(cache_key, answer).await;
+        result
     }
 
     /// `image_base_url` + `file_path` (TMDb file paths start with '/').

@@ -2,6 +2,7 @@
 //!
 //! Fetches metadata from The Open Movie Database.
 
+use rustyfin_model::answer_store::{Answer, AnswerStore};
 use rustyfin_model::media::MediaType;
 use rustyfin_model::metadata::{
     ExternalMetadata, ImdbLookups, LookupFailed, LookupResult, MetadataImage, SeasonMetadata,
@@ -157,24 +158,35 @@ fn omdb_meta(value: &serde_json::Value) -> ExternalMetadata {
 }
 
 /// OMDb's lookups by IMDb id, with the plugin's current key. Every final answer (a title, or
-/// OMDb's "not found") is kept for the life of the process, so OMDb is asked about each title and
-/// season once; a failure is not kept.
+/// OMDb's "not found") is kept in `store`, across restarts and with no expiry, so OMDb is asked
+/// about each title and season once; a failure is not kept.
 pub struct OmdbLookups {
     http: reqwest::Client,
     base_url: String,
     key: Arc<Mutex<Option<String>>>,
     /// By the query without the key
-    answers: moka::future::Cache<String, Option<serde_json::Value>>,
+    answers: moka::future::Cache<String, Answer>,
+    store: AnswerStore,
 }
 
 impl OmdbLookups {
-    /// Lookups against `base_url` (OMDb's, or a stub's), with the key `key` holds at each call.
-    pub fn new(http: reqwest::Client, base_url: &str, key: Arc<Mutex<Option<String>>>) -> Self {
+    /// Lookups against `base_url` (OMDb's, or a stub's), with the key `key` holds at each call,
+    /// keeping the answers in `store`.
+    pub fn new(
+        http: reqwest::Client,
+        base_url: &str,
+        key: Arc<Mutex<Option<String>>>,
+        store: AnswerStore,
+    ) -> Self {
         OmdbLookups {
             http,
             base_url: base_url.trim_end_matches('/').to_string(),
             key,
-            answers: moka::future::Cache::builder().max_capacity(10_000).build(),
+            answers: moka::future::Cache::builder()
+                .max_capacity(10_000)
+                .support_invalidation_closures()
+                .build(),
+            store,
         }
     }
 
@@ -184,8 +196,13 @@ impl OmdbLookups {
         let key = usable_key(&self.key).ok_or(LookupFailed::Unauthorized)?;
         let url = format!("{}/?{query}&apikey={}", self.base_url, urlencoded(&key));
         let http = self.http.clone();
+        let store = self.store.clone();
+        let stored_as = query.clone();
         self.answers
             .try_get_with(query, async move {
+                if let Some(answer) = store.get(&stored_as) {
+                    return Ok(answer);
+                }
                 let resp = http.get(&url).send().await.map_err(|e| {
                     tracing::warn!("OMDb lookup failed: {}", e.without_url());
                     LookupFailed::Transient
@@ -200,11 +217,13 @@ impl OmdbLookups {
                 }
                 let value: serde_json::Value =
                     resp.json().await.map_err(|_| LookupFailed::Transient)?;
-                Ok(value
+                let answer = value
                     .get("Response")
                     .and_then(|r| r.as_str())
                     .filter(|r| r.eq_ignore_ascii_case("true"))
-                    .map(|_| value.clone()))
+                    .map(|_| value.clone());
+                store.put(&stored_as, &answer);
+                Ok(answer)
             })
             .await
             .map_err(|e: Arc<LookupFailed>| *e)
@@ -245,6 +264,18 @@ impl ImdbLookups for OmdbLookups {
                 episodes,
             }))
         })
+    }
+
+    fn forget(&self, imdb_id: &str) {
+        let prefix = format!("i={}&", urlencoded(imdb_id));
+        let in_memory = prefix.clone();
+        if let Err(e) = self
+            .answers
+            .invalidate_entries_if(move |key, _| key.starts_with(&in_memory))
+        {
+            tracing::debug!("OMDb cache: {e}");
+        }
+        self.store.remove_if(|key| key.starts_with(&prefix));
     }
 }
 
@@ -328,9 +359,11 @@ fn usable_key(key: &Mutex<Option<String>>) -> Option<String> {
     key.lock().unwrap().clone().filter(|k| !k.trim().is_empty())
 }
 
-/// Register the OMDb plugin as a metadata provider with the given PluginManager.
+/// Register the OMDb plugin as a metadata provider with the given PluginManager. Its answers are
+/// kept in `store`.
 pub async fn register_omdb_provider<P>(
     plugin: &OmdbPlugin,
+    store: AnswerStore,
     plugin_manager: &P,
 ) -> Result<(), String>
 where
@@ -343,6 +376,7 @@ where
         reqwest::Client::new(),
         OMDB_BASE,
         plugin.api_key.clone(),
+        store,
     ));
 
     let plugin_id = plugin.id().to_string();

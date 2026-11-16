@@ -288,14 +288,26 @@ async fn main() {
         .await;
     }
 
-    // One TMDb client (cache, rate limiter, retries) shared by the provider and AppState.
-    let tmdb = rustyfin_core::tmdb_client::TmdbClient::new(http_client.clone(), tmdb_settings);
+    // One TMDb client (cache, rate limiter, retries) shared by the provider and AppState. The
+    // providers' answers are kept under the data dir's cache, across restarts.
+    let metadata_cache = data_dir_arc.join("cache").join("metadata");
+    let tmdb = rustyfin_core::tmdb_client::TmdbClient::new(
+        http_client.clone(),
+        rustyfin_core::tmdb_client::TmdbSettings {
+            cache_dir: Some(metadata_cache.join("tmdb")),
+            ..tmdb_settings
+        },
+    );
 
     // Register TMDb plugin: enabled by a key (env or saved), also when one is saved later
     rustyfin_core::plugin_manager::install_tmdb_plugin(&plugin_manager_with_db, tmdb.clone()).await;
 
     // Register OMDb and Fanart.tv plugins: enabled by a saved key, also when one is saved later
-    rustyfin_core::plugin_manager::install_omdb_plugin(&plugin_manager_with_db).await;
+    rustyfin_core::plugin_manager::install_omdb_plugin(
+        &plugin_manager_with_db,
+        rustyfin_model::answer_store::AnswerStore::new(metadata_cache.join("omdb")),
+    )
+    .await;
     rustyfin_core::plugin_manager::install_fanart_plugin(&plugin_manager_with_db).await;
 
     // Register Trakt plugin (disabled by default)

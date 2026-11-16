@@ -1,4 +1,5 @@
 pub mod activity;
+pub mod answer_store;
 pub mod auth;
 pub mod chapter;
 pub mod collection;

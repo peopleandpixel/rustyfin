@@ -76,6 +76,7 @@ pub async fn refresh_item_metadata_with(
     options: RefreshOptions,
 ) -> Result<RefreshOutcome, String> {
     let media_path = Path::new(&item.path);
+
     // A "replace all" clears only once the provider has answered for the item: a failed lookup,
     // a missing key or no match leaves the item as it was. The answer is cached, so the
     // refresh below asks nothing again.
@@ -479,6 +480,36 @@ async fn refresh_from_providers(
         failed,
         unauthorized,
     })
+}
+
+/// Forgets the providers' cached answers about a movie or series (a series' seasons included),
+/// by its TMDb id and its IMDb id, so that its next refresh asks them again: for an explicit
+/// "replace all metadata" refresh, as Jellyfin's bypasses its cache. Nothing else forgets.
+pub async fn forget_cached_answers(
+    pool: &SqlitePool,
+    item: &MediaItem,
+    plugin_manager: &PluginManager,
+) -> Result<(), String> {
+    let providers = plugin_manager.metadata_providers().await;
+    let series = match item.media_type {
+        MediaType::Movie => false,
+        MediaType::Series => true,
+        _ => return Ok(()),
+    };
+    let imdb_id = if providers.iter().any(|p| p.imdb_lookups.is_some()) {
+        stored_imdb_id(pool, item.id).await?
+    } else {
+        None
+    };
+    for provider in &providers {
+        if let (Some(lookups), Some(id)) = (&provider.lookups, item.tmdb_id) {
+            lookups.forget(series, id);
+        }
+        if let (Some(lookups), Some(imdb_id)) = (&provider.imdb_lookups, &imdb_id) {
+            lookups.forget(imdb_id);
+        }
+    }
+    Ok(())
 }
 
 /// The IMDb id stored for an item (by a provider, an NFO or an import).

@@ -935,13 +935,11 @@ async fn client_errors_are_not_retried() {
 // ── Cache ──
 
 #[tokio::test]
-async fn only_successes_are_cached() {
-    let stub = start_stub(Duration::ZERO, |path, seen| {
-        if path == "/movie/600" && seen == 0 {
-            Reply::Status(404)
-        } else {
-            ok(path)
-        }
+async fn only_final_answers_are_cached() {
+    let stub = start_stub(Duration::ZERO, |path, seen| match path {
+        "/movie/600" if seen == 0 => Reply::Status(422),
+        "/movie/601" => Reply::Status(404),
+        _ => ok(path),
     })
     .await;
     let client = TmdbClient::new(http(), stub.fast_settings());
@@ -951,6 +949,12 @@ async fn only_successes_are_cached() {
     assert!(api.get_json("/movie/600", &[]).await.is_ok());
     assert!(api.get_json("/movie/600", &[]).await.is_ok());
     assert_eq!(stub.hits_for("/movie/600").len(), 2);
+    // A 404 is a final answer: kept, and given again as a 404
+    for _ in 0..2 {
+        let err = api.get_json("/movie/601", &[]).await.unwrap_err();
+        assert!(err.is_not_found());
+    }
+    assert_eq!(stub.hits_for("/movie/601").len(), 1);
     // The cache key includes the query.
     let alpha_2001 = [("query", "Alpha"), ("year", "2001")];
     api.get_json("/search/movie", &alpha_2001).await.unwrap();
@@ -1054,4 +1058,48 @@ async fn logs_never_contain_the_key() {
         final_failures, 2,
         "one warn line per final failure (one per key)"
     );
+}
+
+// ── Answers across restarts ──
+
+/// Answers are kept on disk under the cache dir, with no expiry: a new client over the same dir
+/// (a restart) asks nothing it has an answer for, a 404 included. The files never hold the key.
+/// `forget` (an admin's "replace all metadata") makes the next lookup of that id ask again.
+#[tokio::test]
+async fn r3meta_answers_survive_a_restart() {
+    let stub = start_stub(Duration::ZERO, |path, _| match path {
+        "/tv/801" => Reply::Status(404),
+        _ => ok(path),
+    })
+    .await;
+    let dir = std::env::temp_dir().join(format!("rf-tmdb-answers-{}", uuid::Uuid::new_v4()));
+    let settings = || TmdbSettings {
+        cache_dir: Some(dir.clone()),
+        ..stub.fast_settings()
+    };
+    let ask = |client: &TmdbClient| {
+        let api = client.api(None).unwrap();
+        async move {
+            let found = api.get_json("/movie/800", &[("append", "credits")]).await;
+            let gone = api.get_json("/tv/801", &[]).await;
+            assert!(found.is_ok());
+            assert!(gone.unwrap_err().is_not_found());
+        }
+    };
+    ask(&TmdbClient::new(http(), settings())).await;
+    assert_eq!(stub.hits().len(), 2);
+
+    let restarted = TmdbClient::new(http(), settings());
+    ask(&restarted).await;
+    assert_eq!(stub.hits().len(), 2, "{:?}", stub.hits_for("/movie/800"));
+    for file in std::fs::read_dir(&dir).unwrap() {
+        let text = std::fs::read_to_string(file.unwrap().path()).unwrap();
+        assert!(!text.contains(KEY), "{text}");
+    }
+
+    restarted.forget(false, 800);
+    ask(&restarted).await;
+    assert_eq!(stub.hits_for("/movie/800").len(), 2);
+    assert_eq!(stub.hits_for("/tv/801").len(), 1);
+    std::fs::remove_dir_all(&dir).unwrap();
 }

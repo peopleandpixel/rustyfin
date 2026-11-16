@@ -264,11 +264,14 @@ pub async fn install_tmdb_plugin(pm: &PluginManager, client: crate::tmdb_client:
 
 /// Install the built-in OMDb plugin. It is enabled by a saved `api_key` unless a saved status says
 /// otherwise. A key saved later through the plugin's configuration enables it at once, without a
-/// restart.
-pub async fn install_omdb_plugin(pm: &PluginManager) {
+/// restart. Its answers are kept in `store`.
+pub async fn install_omdb_plugin(
+    pm: &PluginManager,
+    store: rustyfin_model::answer_store::AnswerStore,
+) {
     let plugin = Arc::new(plugin_omdb::OmdbPlugin::default());
     install_keyed_plugin(pm, plugin, "OMDb", false, None, move |p| async move {
-        plugin_omdb::register_omdb_provider(&p, pm).await
+        plugin_omdb::register_omdb_provider(&p, store, pm).await
     })
     .await;
 }
