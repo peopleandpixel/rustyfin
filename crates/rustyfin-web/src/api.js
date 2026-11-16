@@ -484,6 +484,17 @@ const API = {
         if (!res.ok) throw await this._requestError('POST', path, res);
     },
     updateItem(id, fields) { return this.post(`/Items/${id}`, fields); },
+    // The metadata editor's choices (provider ids, ratings), as Jellyfin's MetadataEditorInfo
+    getMetadataEditor(id) { return this.get(`/Items/${id}/MetadataEditor`); },
+    getCultures() { return this.get('/Localization/Cultures'); },
+    // Subtitle files beside a video: upload (Jellyfin's UploadSubtitleDto, Data in base64) and delete
+    uploadSubtitle(id, body) { return this.post(`/Videos/${id}/Subtitles`, body); },
+    deleteSubtitle(id, index) { return this.del(`/Videos/${id}/Subtitles/${index}`); },
+    // The item's own file, as Jellyfin's getItemDownloadUrl: a plain link, so the token rides in the query
+    downloadUrl(id) {
+        const q = this.token ? `?api_key=${encodeURIComponent(this.token)}` : '';
+        return `${this.base}/Items/${encodeURIComponent(id)}/Download${q}`;
+    },
 
     // User Items
     getUserItems(params = {}) {

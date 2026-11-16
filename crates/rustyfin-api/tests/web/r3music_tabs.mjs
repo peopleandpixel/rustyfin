@@ -65,9 +65,10 @@ const songs = (start, count) => Array.from({ length: count }, (_, i) => ({
 
 test('the tabs are Jellyfin Web\'s, in its order, and each opens its route', () => {
     const { fns } = sandbox(() => ({}));
-    assert.deepEqual(plain(fns.MUSIC_TABS.map(([key]) => key)), ['albums', 'albumartists', 'artists', 'playlists', 'songs', 'genres']);
+    const tabs = ['suggestions', 'albums', 'albumartists', 'artists', 'playlists', 'songs', 'genres'];
+    assert.deepEqual(plain(fns.MUSIC_TABS.map(([key]) => key)), tabs);
     const bar = fns.musicTabBar('lib1', 'songs');
-    for (const key of ['albums', 'albumartists', 'artists', 'playlists', 'songs', 'genres']) {
+    for (const key of tabs) {
         assert.ok(bar.includes(`data-action="navigate" data-page="library" data-id="lib1/${key}"`), key);
     }
     assert.match(bar, /aria-selected="true"[^>]*data-id="lib1\/songs"/);
@@ -76,15 +77,15 @@ test('the tabs are Jellyfin Web\'s, in its order, and each opens its route', () 
     assert.match(fns.musicTabBar('lib1', 'genre'), /aria-selected="true"[^>]*data-id="lib1\/genres"/);
 });
 
-test('a route names its tab; without one the library opens on its last tab, else Albums', () => {
+test('a route names its tab; without one the library opens on its last tab, else Suggestions', () => {
     const { fns } = sandbox(() => ({}));
-    assert.equal(fns.musicTab('lib1', undefined), 'albums');
+    assert.equal(fns.musicTab('lib1', undefined), 'suggestions');
     assert.equal(fns.musicTab('lib1', 'artists'), 'artists');
     assert.equal(fns.musicTab('lib1', 'genres', 'g1'), 'genre');
-    assert.equal(fns.musicTab('lib1', 'bogus'), 'albums');
+    assert.equal(fns.musicTab('lib1', 'bogus'), 'suggestions');
     fns.rememberMusicTab('lib1', 'songs');
     assert.equal(fns.musicTab('lib1', undefined), 'songs');
-    assert.equal(fns.musicTab('lib2', undefined), 'albums');
+    assert.equal(fns.musicTab('lib2', undefined), 'suggestions');
     fns.rememberMusicTab('lib1', 'genre');
     assert.equal(fns.musicTab('lib1', undefined), 'genres');
 });
@@ -94,9 +95,9 @@ test('signing out forgets the tabs last shown', () => {
     fns.rememberMusicTab('lib1', 'songs');
     assert.equal(fns.musicTab('lib1', undefined), 'songs');
     context.API.token = null;
-    assert.equal(fns.musicTab('lib1', undefined), 'albums');
+    assert.equal(fns.musicTab('lib1', undefined), 'suggestions');
     context.API.token = 'other-user';
-    assert.equal(fns.musicTab('lib1', undefined), 'albums');
+    assert.equal(fns.musicTab('lib1', undefined), 'suggestions');
 });
 
 test('a first page that fails shows the error, not Loading', async () => {

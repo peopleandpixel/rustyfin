@@ -9,7 +9,7 @@ use std::time::UNIX_EPOCH;
 
 use chrono::{DateTime, FixedOffset, Utc};
 use rustyfin_db::repo_media::{PathScope, SORT_NAME_KEPT};
-use rustyfin_db::repo_media_source::{AUDIO_PROBE_VERSION, PROBE_VERSION};
+use rustyfin_db::repo_media_source::{AUDIO_PROBE_VERSION, VIDEO_PROBE_VERSION};
 use rustyfin_model::library::{Library, LibraryContentType};
 use rustyfin_model::media::{LocationType, MediaType};
 use rustyfin_model::metadata::ExternalMetadata;
@@ -687,7 +687,8 @@ impl RereadGate {
 }
 
 /// The audio sources in `scope` that an older probe wrote, as source path -> item id. A scan
-/// reads each such file again, once: the probe stores the current [`PROBE_VERSION`]. A source whose
+/// reads each such file again, once: the probe stores the current
+/// [`rustyfin_db::repo_media_source::PROBE_VERSION`]. A source whose
 /// file failed to probe with the stamp it stores is left out: that file is read again only once it
 /// changes, as the stamp check of a scan finds it.
 pub(crate) async fn outdated_audio_sources(
@@ -742,7 +743,7 @@ struct SourceRow {
     /// The size and modification time of the file when the source was stamped.
     size: Option<i64>,
     modified: Option<i64>,
-    /// The [`PROBE_VERSION`] of the probe that wrote the source.
+    /// The [`rustyfin_db::repo_media_source::PROBE_VERSION`] of the probe that wrote the source.
     probe_version: i64,
     /// The paths of the external subtitle files the probe stored, joined by U+001F
     externals: Option<String>,
@@ -1716,7 +1717,7 @@ async fn settle_group(
     // A source that an older probe wrote is read again, once, for the fields that probe missed. A
     // file that failed to probe is not: it is read again only once it changes.
     let outdated = sources.iter().any(|source| {
-        source.probe_version < PROBE_VERSION && !is_known_failure(&source.path, failures)
+        source.probe_version < VIDEO_PROBE_VERSION && !is_known_failure(&source.path, failures)
     });
     // A subtitle file added beside a video, or removed, is stored by a probe, as Jellyfin finds
     // it on a scan; only the folder is listed

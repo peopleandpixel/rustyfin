@@ -15,9 +15,11 @@ import {
 import './modules/home.js';
 import { posterLoaded, posterFailed } from './modules/library.js';
 import './modules/genres.js';
+import './modules/libtabs.js';
 import './modules/music.js';
 import './modules/item.js';
 import './modules/metadata-admin.js';
+import './modules/subtitle-admin.js';
 import { doSearch } from './modules/search.js';
 import {
     seekVideo, skipTime, previewSeek, changeAudioTrack, changeSubtitleTrack, playerAreaClick, closePlayer,
@@ -28,7 +30,12 @@ import {
 } from './modules/player.js';
 import './modules/playerprefs.js';
 import './modules/queue.js';
+import { toggleLyrics } from './modules/lyrics.js';
 import './modules/remote.js';
+import {
+    castToDevice, stopCasting, castTogglePause, castSeek, castSetVolume, castToggleMute, castAdjacent, castAudioTrack,
+    castSubtitleTrack,
+} from './modules/cast.js';
 import { sessionControl, openPlayOn, playOnSession } from './modules/sessions.js';
 import './modules/cardmenu.js';
 import './modules/collections.js';
@@ -39,6 +46,7 @@ import {
     changeSubtitleAppearance, changeLatestLibrary, chooseProfileImage, deleteProfileImage,
 } from './modules/settings.js';
 import './modules/playback-admin.js';
+import './modules/dlna-admin.js';
 import {
     saveGeneralSettings, addLibraryFolder, renameLibrary, addTaskTrigger, showTriggerFields,
 } from './modules/dashboard.js';
@@ -67,5 +75,7 @@ Object.assign(window, {
     submitAddUser, clearLiveLog, setLogLevel, closePluginConfig, savePluginConfig, closePluginPriority,
     savePluginPriority, sessionControl, openPlayOn, playOnSession, changeUserConfig, changeUserPref, changeHomeSection,
     changeSubtitleAppearance, changeLatestLibrary, chooseProfileImage, deleteProfileImage, saveGeneralSettings,
-    addLibraryFolder, renameLibrary, addTaskTrigger, showTriggerFields,
+    addLibraryFolder, renameLibrary, addTaskTrigger, showTriggerFields, toggleLyrics,
+    castToDevice, stopCasting, castTogglePause,
+    castSeek, castSetVolume, castToggleMute, castAdjacent, castAudioTrack, castSubtitleTrack,
 });

@@ -393,8 +393,9 @@ async function renderDetail(itemId) {
         // Parallel fetch: Children/Seasons/Episodes AND Similar media
         // Previously these were sequential, causing a waterfall effect
         const isContainer = ['Series', 'Season', 'MusicAlbum', 'Folder'].includes(type);
-        // The extras: trailer files for the Trailer button, and special features on movie, series and season pages
-        const showsSpecials = ['Movie', 'Series', 'Season'].includes(type);
+        // The extras: trailer files for the Trailer button, and special features on movie, series, season and
+        // episode pages
+        const showsSpecials = ['Movie', 'Series', 'Season', 'Episode'].includes(type);
         const [childrenData, similarData, localTrailers, specialFeatures] = await Promise.all([
             isContainer ? API.getChildren(id).catch(() => ({ Items: [] })) : Promise.resolve({ Items: [] }),
             API.getSimilar(id).catch(() => ({ Items: [] })),
@@ -584,6 +585,8 @@ async function renderDetail(itemId) {
                                 ${played ? `<span class="inline-flex items-center gap-1 text-emerald-400">${icon('Check', { size: 14 })} ${isContainerOfEpisodes ? t('detail.all_played') : t('detail.played')}</span>` : `<span class="inline-flex items-center gap-1 text-white/60">${icon('Circle', { size: 14 })} ${isContainerOfEpisodes ? t('detail.mark_all_played') : t('detail.unplayed')}</span>`}
                             </button>
 
+                            ${downloadShareButtons(item)}
+
                             ${API.isAdmin ? `
                             <button class="jf-btn-ghost h-11 !py-0 w-11 !px-0" title="${escapeHtml(t('detail.refresh_metadata'))}" aria-label="${escapeHtml(t('detail.refresh_metadata'))}" data-action="refresh-item" data-id="${escapeHtml(id)}">
                                 ${icon('RefreshCw', { size: 18, class: 'jf-busy-spin' })}
@@ -727,11 +730,49 @@ async function togglePlayed(id, current, all = false) {
     }
 }
 
-// Admin: the metadata editor, Identify (for the types the provider knows) and the image editor
+// Download, when the server says the user may (CanDownload: the user's EnableContentDownloading and a
+// file of the item's own), as a plain link Jellyfin Web also uses; and Share, for every item
+function downloadShareButtons(item) {
+    const download = item.CanDownload ? `<a class="jf-btn-ghost h-11 !py-0 w-11 !px-0 inline-flex items-center justify-center" href="${escapeHtml(API.downloadUrl(item.Id))}" download title="${escapeHtml(t('detail.download'))}" aria-label="${escapeHtml(t('detail.download'))}">
+                                ${icon('Download', { size: 18 })}
+                            </a>` : '';
+    return `${download}<button class="jf-btn-ghost h-11 !py-0 w-11 !px-0" title="${escapeHtml(t('detail.share'))}" aria-label="${escapeHtml(t('detail.share'))}" data-action="share-item" data-id="${escapeHtml(item.Id)}" data-name="${escapeHtml(item.Name || '')}">
+                                ${icon('Share2', { size: 18 })}
+                            </button>`;
+}
+
+// The item page's address, for Share
+function itemShareUrl(id) {
+    return `${location.origin}${location.pathname}#detail/${encodeURIComponent(id)}`;
+}
+
+// Share: the system share sheet where the browser has one (as Jellyfin Web does), else the link is
+// copied; where the clipboard is refused too, a prompt shows it to copy by hand
+async function shareItem({ id, name = '' }) {
+    const url = itemShareUrl(id);
+    if (typeof navigator.share === 'function') {
+        try {
+            await navigator.share({ title: name, url });
+            return;
+        } catch (e) {
+            if (e?.name === 'AbortError') return;
+        }
+    }
+    try {
+        await navigator.clipboard.writeText(url);
+        toast(t('detail.share_copied'));
+    } catch {
+        window.prompt(t('detail.share_copy_prompt'), url);
+    }
+}
+
+// Admin: the metadata editor, Identify (for the types the provider knows), the image editor, and the
+// subtitle editor for videos
 function metadataToolButtons(item) {
     const tools = [['edit-metadata', 'Pencil', 'metadata.edit_metadata']];
     if (item.Type === 'Movie' || item.Type === 'Series') tools.push(['identify-item', 'ScanSearch', 'metadata.identify']);
     tools.push(['edit-images', 'Images', 'metadata.edit_images']);
+    if (['Movie', 'Episode', 'Video'].includes(item.Type)) tools.push(['edit-subtitles', 'Captions', 'subtitles.edit']);
     return tools.map(([action, name, key]) => `<button class="jf-btn-ghost h-11 !py-0 w-11 !px-0" title="${escapeHtml(t(key))}" aria-label="${escapeHtml(t(key))}" data-action="${action}" data-id="${escapeHtml(item.Id)}">
                                 ${icon(name, { size: 18 })}
                             </button>`).join('');
@@ -778,5 +819,5 @@ document.addEventListener('change', e => {
 
 export {
     currentDetailId, renderDetail, renderPerson, toggleFavorite, togglePlayed, deleteItemFromDetail, detailSelection,
-    versionLabels,
+    versionLabels, shareItem,
 };

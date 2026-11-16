@@ -524,6 +524,10 @@ fn parental_policy(
         &mut access.force_remote_source_transcoding,
         req.force_remote_source_transcoding,
     );
+    set(
+        &mut access.enable_content_downloading,
+        req.enable_content_downloading,
+    );
     if req.enable_content_deletion.is_some() {
         access.enable_content_deletion = req.enable_content_deletion;
     }

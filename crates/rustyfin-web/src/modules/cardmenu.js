@@ -10,6 +10,9 @@ const CONTAINERS = ['Series', 'Season', 'MusicAlbum', 'MusicArtist', 'BoxSet', '
 const PLAYLIST_TYPES = ['Movie', 'Episode', 'Audio', 'MusicVideo', 'Video', 'Series', 'Season', 'MusicAlbum', 'MusicArtist', 'BoxSet'];
 const COLLECTION_TYPES = ['Movie', 'Series', 'Season', 'Episode', 'MusicAlbum', 'MusicArtist', 'MusicVideo', 'Video'];
 const NO_USER_DATA = ['Person', 'Genre', 'MusicGenre', 'Studio', 'CollectionFolder', 'UserView'];
+// The music items an Instant mix plays a queue of (the server's /Items/{id}/InstantMix takes each of them)
+const INSTANT_MIX_TYPES = ['Audio', 'MusicAlbum', 'MusicArtist', 'MusicGenre', 'Playlist'];
+const INSTANT_MIX_LIMIT = 200;
 
 // The item a context menu was opened for, by id (the menu's play and add commands need its type)
 const menuItems = new Map();
@@ -30,6 +33,7 @@ function cardMenuCommands(item, isAdmin, shownIn = null) {
     if (PLAYABLE.includes(type)) commands.push({ action: 'card-play', label: t('common.play'), icon: 'Play' });
     else if (container) commands.push({ action: 'play-all', label: t('common.play'), icon: 'Play' });
     if (container) commands.push({ action: 'shuffle', label: t('player.shuffle'), icon: 'Shuffle' });
+    if (INSTANT_MIX_TYPES.includes(type)) commands.push({ action: 'card-instant-mix', label: t('cards.instant_mix'), icon: 'ListMusic' });
     commands.push('separator');
     if (!NO_USER_DATA.includes(type)) {
         commands.push({
@@ -220,6 +224,29 @@ function playCardItem(el) {
     if (item) playQueueAt([item], 0);
 }
 
+// The request for an item's Instant mix: similar songs, the item itself first for a song
+function instantMixUrl(id) {
+    const q = new URLSearchParams({ UserId: API.userId || '', Limit: String(INSTANT_MIX_LIMIT) });
+    return `/Items/${encodeURIComponent(id)}/InstantMix?${q}`;
+}
+
+// Plays the Instant mix of a music item as the play queue
+async function playInstantMix(el) {
+    const item = menuItems.get(el.dataset.id);
+    if (!item) return;
+    try {
+        const data = await API.get(instantMixUrl(item.Id));
+        const items = (data?.Items || []).filter(i => !i.IsFolder && i.LocationType !== 'Virtual');
+        if (!items.length) {
+            toast(t('player.queue_empty'), 'error');
+            return;
+        }
+        playQueueAt(items, 0);
+    } catch (e) {
+        toast(t('common.error_message', { message: e.message }), 'error');
+    }
+}
+
 // Add to playlist or collection: a dialog with the existing ones and a new one by name
 function addToDialog(kind) {
     let dialog = document.getElementById('card-add-dialog');
@@ -361,7 +388,7 @@ document.addEventListener('contextmenu', cardContextMenu);
 document.addEventListener('click', cardClickAfterLongPress, true);
 
 export {
-    cardMenuCommands, cardMenuHtml, openCardMenu, toggleCardPlayed, toggleCardFavorite, setCardLikes, playCardItem,
+    cardMenuCommands, cardMenuHtml, openCardMenu, toggleCardPlayed, toggleCardFavorite, setCardLikes, playCardItem, instantMixUrl, playInstantMix,
     openAddTo, openAddToIds, addTo, userDataChanged, cardPointerDown, cardPointerMove, cardContextMenu, cardClickAfterLongPress,
     cancelLongPress, LONG_PRESS_MS,
 };

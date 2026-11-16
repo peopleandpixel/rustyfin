@@ -6,13 +6,17 @@ import { renderGenreRows, genreNameOf } from './genres.js';
 import { hashRoute } from './router.js';
 import { musicTab, rememberMusicTab, musicTabBar, renderMusicTab } from './music.js';
 import { KINDS, renderContainerPage, renderCollectionsTab } from './collections.js';
+import { renderSuggestions, renderUpcoming, renderStudios, studioNameOf } from './libtabs.js';
 let currentLibraryId = null;
 // The route shown (library/<this>): the library id, then a music library's tab and genre
 let currentLibraryRoute = null;
-// The open list's tab ('' for the library's own list, 'episodes'), and the genre it is limited to
-// ({ id, name }, from the Genres tab), or null
+// The open list's tab ('' for the library's own list, 'episodes', 'favorites'), and the genre it is
+// limited to ({ id, name }, from the Genres tab), or null
 let currentLibraryTab = '';
 let currentLibraryGenre = null;
+// What else the open list is limited to, or null: a network's shows ({ StudioIds, name }, from the
+// Networks tab), or in a library of mixed content a folder's items ({ ParentId, name, crumbs })
+let currentLibraryScope = null;
 
 
 // --- BlurHash previews (https://blurha.sh): cards paint the server's ImageBlurHashes at once ---
@@ -647,23 +651,31 @@ async function renderLibrary(route) {
         return;
     }
     if (musicView) rememberMusicTab(libId, 'albums');
-    // A movie or TV library's tabs: its list, a TV library's Episodes, and Genres (rows per genre,
-    // genres.js; a genre's row header opens the list of that genre, library/<id>/genres/<genre id>)
+    // A movie or TV library's tabs (libraryTabBar): its list, Suggestions, Favorites, Upcoming and
+    // Episodes, and Genres and Networks (a genre's row header, or a network's card, opens the list
+    // of that genre or network: library/<id>/genres/<genre id>, library/<id>/studios/<studio id>)
     const videoTabs = contentType === 'Movies' || contentType === 'TvShows';
-    if (videoTabs && tab === 'genres' && !sub) {
-        stopLibraryLoad();
-        renderGenreRows(libId, libName, contentType, libraryTabBar(libId, contentType, 'genres'));
-        return;
-    }
-    // A movie library's Collections tab: the collections holding its movies (collections.js)
-    if (contentType === 'Movies' && tab === 'collections') {
+    const known = videoTabs && libraryTabs(contentType).some(([key]) => key === tab);
+    const rows = {
+        genres: !sub && renderGenreRows,
+        suggestions: renderSuggestions,
+        upcoming: renderUpcoming,
+        studios: !sub && renderStudios,
+        // A movie library's Collections tab: the collections holding its movies (collections.js)
+        collections: (id, name, _, bar) => renderCollectionsTab(id, name, bar),
+    }[known ? tab : ''];
+    if (rows) {
         stopLibraryLoad();
         destroyInfiniteScroll();
-        renderCollectionsTab(libId, libName, libraryTabBar(libId, contentType, 'collections'));
+        rows(libId, libName, contentType, libraryTabBar(libId, contentType, tab));
         return;
     }
-    currentLibraryTab = videoTabs && tab === 'episodes' && contentType === 'TvShows' ? 'episodes' : '';
-    currentLibraryGenre = videoTabs && tab === 'genres' && sub ? { id: sub, name: '' } : null;
+    currentLibraryTab = known && (tab === 'episodes' || tab === 'favorites') ? tab : '';
+    currentLibraryGenre = known && tab === 'genres' && sub ? { id: sub, name: '' } : null;
+    // In a library of mixed content, a folder's card opens the folder here (library/<id>/folder/<folder id>)
+    const mixed = !videoTabs && !musicView;
+    currentLibraryScope = known && tab === 'studios' && sub ? { StudioIds: sub, name: '' }
+        : mixed && tab === 'folder' && sub ? { ParentId: sub, name: '', crumbs: [] } : null;
     const list = libraryList(contentType, currentLibraryTab);
     
     page.innerHTML = `
@@ -697,10 +709,12 @@ async function renderLibrary(route) {
     const [prefs, genreName] = await Promise.all([
         loadLibraryPrefs(libId, list),
         currentLibraryGenre ? genreNameOf(libId, contentType, currentLibraryGenre.id) : '',
+        loadLibraryScope(libId, currentLibraryScope),
     ]);
     if (ticket !== libraryGen || API.token !== session) return;
     libraryPrefs = prefs;
     if (currentLibraryGenre) currentLibraryGenre.name = genreName;
+    const subset = currentLibraryGenre?.name || currentLibraryScope?.name;
     renderLetterRail(libId);
 
     const gen = startLibraryLoad(libId);
@@ -721,7 +735,7 @@ async function renderLibrary(route) {
                 <div>
                     <div class="flex items-center gap-2">
                         <span class="inline-flex">${icon(headerIcon, { size: 28 })}</span>
-                        <h1 class="text-2xl lg:text-3xl font-extrabold text-white tracking-tight">${escapeHtml(currentLibraryGenre?.name ? `${libName}: ${currentLibraryGenre.name}` : libName)}</h1>
+                        <h1 class="text-2xl lg:text-3xl font-extrabold text-white tracking-tight">${escapeHtml(subset && !currentLibraryScope?.ParentId ? `${libName}: ${subset}` : libName)}</h1>
                         ${scanRing(libId, libName, 'w-5 h-5')}
                     </div>
                     <p id="lib-count-label" class="text-xs text-white/40 mt-1">${t('library.item_count', { count: total })}</p>
@@ -776,7 +790,8 @@ async function renderLibrary(route) {
             </div>
 
             ${musicView ? musicTabBar(libId, 'albums') : ''}
-            ${videoTabs ? libraryTabBar(libId, contentType, currentLibraryGenre ? 'genres' : currentLibraryTab || 'main') : ''}
+            ${videoTabs ? libraryTabBar(libId, contentType, currentLibraryGenre ? 'genres' : currentLibraryScope ? 'studios' : currentLibraryTab || 'main') : ''}
+            ${currentLibraryScope?.ParentId ? folderCrumbs(libId, libName, currentLibraryScope) : ''}
 
             <!-- Media Grid Container -->
             <div id="lib-grid-container" data-multiselect></div>
@@ -938,19 +953,24 @@ function libraryViewMenu(view) {
         + group(t('library.view_size'), 'lib-size', LIBRARY_SIZES, view.size);
 }
 
-// A movie or TV library's tabs (as music.js's): its list, Episodes for TV, Collections for movies
-// (Jellyfin Web's order), and Genres
-function libraryTabBar(libId, contentType, active) {
-    const tabs = [
-        ['main', libId, contentType === 'TvShows' ? 'library.tab_shows' : 'library.tab_movies'],
-        ...(contentType === 'TvShows' ? [['episodes', `${libId}/episodes`, 'library.tab_episodes']] : []),
-        ...(contentType === 'Movies' ? [['collections', `${libId}/collections`, 'collections.collections']] : []),
-        ['genres', `${libId}/genres`, 'library.tab_genres'],
+// A movie or TV library's tabs in Jellyfin Web's order, [key, label key]: a movie library's
+// Movies, Suggestions, Favorites, Collections and Genres; a TV library's Shows, Suggestions,
+// Upcoming, Genres, Networks and Episodes. A tab's route is library/<id>/<key>, the first's the id.
+function libraryTabs(contentType) {
+    return contentType === 'TvShows' ? [
+        ['main', 'library.tab_shows'], ['suggestions', 'library.tab_suggestions'], ['upcoming', 'library.tab_upcoming'],
+        ['genres', 'library.tab_genres'], ['studios', 'library.tab_networks'], ['episodes', 'library.tab_episodes'],
+    ] : [
+        ['main', 'library.tab_movies'], ['suggestions', 'library.tab_suggestions'], ['favorites', 'library.tab_favorites'],
+        ['collections', 'collections.collections'], ['genres', 'library.tab_genres'],
     ];
+}
+
+function libraryTabBar(libId, contentType, active) {
     return `
     <nav class="jf-tabs" role="tablist" aria-label="${escapeHtml(t('library.tabs'))}">
-        ${tabs.map(([key, route, label]) => `
-        <button type="button" role="tab" class="jf-tab" aria-selected="${key === active}" data-action="navigate" data-page="library" data-id="${escapeHtml(route)}">${t(label)}</button>`).join('')}
+        ${libraryTabs(contentType).map(([key, label]) => `
+        <button type="button" role="tab" class="jf-tab" aria-selected="${key === active}" data-action="navigate" data-page="library" data-id="${escapeHtml(key === 'main' ? libId : `${libId}/${key}`)}">${t(label)}</button>`).join('')}
     </nav>`;
 }
 
@@ -1042,7 +1062,50 @@ function libraryListQuery(libId) {
         ...libraryFilterQuery(libraryPrefs.filters),
         // A genre's list (the Genres tab's row headers)
         ...(currentLibraryGenre ? { GenreIds: currentLibraryGenre.id } : {}),
+        // A network's shows, or a folder's own items
+        ...(currentLibraryScope?.StudioIds ? { StudioIds: currentLibraryScope.StudioIds } : {}),
+        ...(currentLibraryScope?.ParentId ? { ParentId: currentLibraryScope.ParentId } : {}),
+        // The Favorites tab: the user's favourites, with the filters chosen as well
+        ...(currentLibraryTab === 'favorites' ? { Filters: [libraryFilterQuery(libraryPrefs.filters).Filters, 'IsFavorite'].filter(Boolean).join(',') } : {}),
     };
+}
+
+// Gives the open network or folder its name, and a folder its way down from the library: the
+// folders above it, top first (its ancestors up to the library's own folder)
+async function loadLibraryScope(libId, scope) {
+    if (scope?.StudioIds) scope.name = await studioNameOf(libId, scope.StudioIds);
+    if (!scope?.ParentId) return;
+    const [folder, ancestors] = await Promise.all([
+        API.getItem(scope.ParentId).catch(() => null),
+        API.get(`/Items/${scope.ParentId}/Ancestors`).catch(() => []),
+    ]);
+    scope.name = folder?.Name || '';
+    const above = [];
+    for (const a of Array.isArray(ancestors) ? ancestors : []) {
+        if (a.Id === libId || a.Type === 'CollectionFolder' || a.Type === 'UserRootFolder') break;
+        above.unshift({ id: a.Id, name: a.Name || '' });
+    }
+    scope.crumbs = above;
+}
+
+// A folder's breadcrumbs: the library, the folders above, then the folder itself (not a link)
+function folderCrumbs(libId, libName, scope) {
+    const link = (route, name) => `<button type="button" class="jf-crumb" data-action="navigate" data-page="library" data-id="${escapeHtml(route)}">${escapeHtml(name)}</button>`;
+    const parts = [link(libId, libName), ...scope.crumbs.map(c => link(`${libId}/folder/${c.id}`, c.name)),
+        `<span class="jf-crumb" aria-current="page">${escapeHtml(scope.name)}</span>`];
+    return `<nav class="jf-crumbs" aria-label="${escapeHtml(t('library.folders'))}">${parts.join('<span aria-hidden="true">›</span>')}</nav>`;
+}
+
+// A library card; in a library of mixed content a folder's card opens the folder in place
+function libraryCard(item) {
+    const card = createCardElement(item, '', libraryCardOptions());
+    const lib = libraries.find(l => (l.id || l.Id) === currentLibraryId);
+    const contentType = lib?.content_type || lib?.Content_type || lib?.ContentType || '';
+    if (card && (item.Type || item.type) === 'Folder' && libraryList(contentType) === 'mixed') {
+        card.dataset.page = 'library';
+        card.dataset.id = `${currentLibraryId}/folder/${item.Id || item.id}`;
+    }
+    return card;
 }
 
 // Starts a load: a new generation, with the previous load's requests dropped
@@ -1163,7 +1226,7 @@ function liteCardDiffers(card, item) {
 // elements (already loading or shown) so nothing flashes, and the card element itself (the
 // poster loader tracks it). Only for the same item and picture; another one gets a new card.
 function upgradeCard(card, item) {
-    const full = createCardElement(item, '', libraryCardOptions());
+    const full = libraryCard(item);
     const oldImg = card.querySelector('img.jf-thumb-img');
     const freshImg = full.querySelector('img.jf-thumb-img');
     if (oldImg && freshImg) {
@@ -1293,7 +1356,7 @@ function libraryCellElement(i, tint = false) {
     cell.className = 'jf-vcell';
     let card;
     if (item && !tint) {
-        card = createCardElement(item, '', libraryCardOptions());
+        card = libraryCard(item);
         card.dataset.letter = railLetter(item);
         if (!full) card.dataset.lite = '1';
         card.tabIndex = 0;
