@@ -221,14 +221,28 @@ async function savePlaybackSettings() {
         show('playback-settings-error');
     };
     if (problem) return fail(t(problem));
-    try {
-        await API.post('/System/Configuration/encoding', values.encoding);
-        await API.updateConfig(values.config);
-    } catch (err) {
-        return fail(err.message);
-    }
+    const failure = await postPlaybackSettings(values, API);
+    if (failure?.saved === 'encoding') loaded = { ...loaded, encoding: values.encoding };
+    if (failure) return fail(failure.message);
     loaded = values;
     toast(t('playback_admin.saved'));
+}
+
+// Posts the encoding options, then the server configuration. Null when both are saved; else
+// which part was saved before the failure ('encoding' or null) and a message naming the part
+// that failed.
+async function postPlaybackSettings(values, api) {
+    try {
+        await api.post('/System/Configuration/encoding', values.encoding);
+    } catch (err) {
+        return { saved: null, message: t('playback_admin.error_encoding', { error: err.message }) };
+    }
+    try {
+        await api.updateConfig(values.config);
+    } catch (err) {
+        return { saved: 'encoding', message: t('playback_admin.error_config', { error: err.message }) };
+    }
+    return null;
 }
 
 export { playbackPanelHtml, loadPlaybackAdmin, savePlaybackSettings };

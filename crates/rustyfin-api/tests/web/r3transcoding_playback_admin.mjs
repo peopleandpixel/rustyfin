@@ -28,7 +28,7 @@ function sandbox() {
         hide: () => {},
         toast: () => {},
     });
-    vm.runInContext(`${module}\nthis.api = { playbackSettingsHtml, readPlaybackSettings, playbackSettingsProblem };`, context);
+    vm.runInContext(`${module}\nthis.api = { playbackSettingsHtml, readPlaybackSettings, playbackSettingsProblem, postPlaybackSettings };`, context);
     return context.api;
 }
 
@@ -150,6 +150,32 @@ test('edits land in the encoding options and the server configuration', () => {
     // The original objects are not changed
     assert.equal(encoding.H264Crf, 23);
     assert.equal(config.MinResumePct, 5);
+});
+
+test('a failed save says which part failed', async () => {
+    const { postPlaybackSettings } = sandbox();
+    const values = { encoding: { H264Crf: 20 }, config: { MinResumePct: 5 } };
+    const api = (encodingError, configError) => {
+        const posted = [];
+        return {
+            posted,
+            post: async (path, body) => { if (encodingError) throw new Error(encodingError); posted.push([path, body]); },
+            updateConfig: async body => { if (configError) throw new Error(configError); posted.push(['config', body]); },
+        };
+    };
+    const ok = api();
+    assert.equal(await postPlaybackSettings(values, ok), null);
+    assert.deepEqual(ok.posted.map(([p]) => p), ['/System/Configuration/encoding', 'config']);
+    // The encoding options refused: nothing saved, and the configuration isn't posted
+    const refused = api('encoding: H264Crf: 60 is outside 0 to 51');
+    const first = await postPlaybackSettings(values, refused);
+    assert.equal(first.saved, null);
+    assert.match(first.message, /^Nothing was saved: the transcoding settings were refused \(encoding: H264Crf/);
+    assert.equal(refused.posted.length, 0);
+    // The configuration refused after the options were saved: the message says both
+    const partial = await postPlaybackSettings(values, api(null, 'HTTP 500'));
+    assert.equal(partial.saved, 'encoding');
+    assert.equal(partial.message, 'The transcoding settings were saved, but the resume and streaming settings were not (HTTP 500).');
 });
 
 test('out-of-range values are refused before a save', () => {
