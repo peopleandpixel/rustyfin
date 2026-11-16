@@ -2062,6 +2062,95 @@ struct ItemsQuery {
     exclude_item_ids: Option<String>,
     #[serde(rename = "excludeItemIds")]
     exclude_item_ids_lower: Option<String>,
+    // The other `InternalItemsQuery` conditions (`repo_item_filter::ItemFilter`).
+    #[serde(alias = "personIds")]
+    person_ids: Option<String>,
+    #[serde(alias = "person")]
+    person: Option<String>,
+    /// Accepted and, as in Jellyfin 10.11's item query, without effect.
+    #[serde(alias = "personTypes")]
+    person_types: Option<String>,
+    #[serde(alias = "studios")]
+    studios: Option<String>,
+    #[serde(alias = "artists")]
+    artists: Option<String>,
+    #[serde(alias = "albumArtistIds")]
+    album_artist_ids: Option<String>,
+    #[serde(alias = "contributingArtistIds")]
+    contributing_artist_ids: Option<String>,
+    #[serde(alias = "excludeArtistIds")]
+    exclude_artist_ids: Option<String>,
+    #[serde(alias = "albums")]
+    albums: Option<String>,
+    #[serde(alias = "minCommunityRating")]
+    min_community_rating: Option<f64>,
+    /// Accepted and, as in Jellyfin 10.11's item query, without effect.
+    #[serde(alias = "minCriticRating")]
+    min_critic_rating: Option<f64>,
+    #[serde(alias = "minPremiereDate")]
+    min_premiere_date: Option<String>,
+    #[serde(alias = "maxPremiereDate")]
+    max_premiere_date: Option<String>,
+    #[serde(alias = "isUnaired")]
+    is_unaired: Option<bool>,
+    #[serde(alias = "isMissing")]
+    is_missing: Option<bool>,
+    #[serde(alias = "hasImdbId")]
+    has_imdb_id: Option<bool>,
+    #[serde(alias = "hasTmdbId")]
+    has_tmdb_id: Option<bool>,
+    #[serde(alias = "hasTvdbId")]
+    has_tvdb_id: Option<bool>,
+    #[serde(rename = "IsHD", alias = "IsHd", alias = "isHd", alias = "isHD")]
+    is_hd: Option<bool>,
+    #[serde(rename = "Is4K", alias = "is4K", alias = "is4k")]
+    is_4k: Option<bool>,
+    #[serde(rename = "Is3D", alias = "is3D", alias = "is3d")]
+    is_3d: Option<bool>,
+    #[serde(alias = "minWidth")]
+    min_width: Option<i64>,
+    #[serde(alias = "minHeight")]
+    min_height: Option<i64>,
+    #[serde(alias = "maxWidth")]
+    max_width: Option<i64>,
+    #[serde(alias = "maxHeight")]
+    max_height: Option<i64>,
+    #[serde(alias = "hasOverview")]
+    has_overview: Option<bool>,
+    #[serde(alias = "hasOfficialRating")]
+    has_official_rating: Option<bool>,
+    #[serde(alias = "hasParentalRating")]
+    has_parental_rating: Option<bool>,
+    #[serde(alias = "minOfficialRating")]
+    min_official_rating: Option<String>,
+    #[serde(alias = "maxOfficialRating")]
+    max_official_rating: Option<String>,
+    #[serde(alias = "isLocked")]
+    is_locked: Option<bool>,
+    #[serde(alias = "isPlaceHolder")]
+    is_place_holder: Option<bool>,
+    #[serde(alias = "locationTypes")]
+    location_types: Option<String>,
+    #[serde(alias = "excludeLocationTypes")]
+    exclude_location_types: Option<String>,
+    #[serde(alias = "videoTypes")]
+    video_types: Option<String>,
+    #[serde(alias = "nameLessThan")]
+    name_less_than: Option<String>,
+    #[serde(alias = "indexNumber")]
+    index_number: Option<i64>,
+    #[serde(alias = "parentIndexNumber")]
+    parent_index_number: Option<i64>,
+    #[serde(alias = "imageTypes")]
+    image_types: Option<String>,
+    #[serde(alias = "adjacentTo")]
+    adjacent_to: Option<Uuid>,
+    #[serde(alias = "isKids")]
+    is_kids: Option<bool>,
+    #[serde(alias = "isNews")]
+    is_news: Option<bool>,
+    #[serde(alias = "isSports")]
+    is_sports: Option<bool>,
 }
 
 #[allow(dead_code)]
@@ -2447,6 +2536,186 @@ async fn requested_containers(
     Ok(containers)
 }
 
+/// The values of a Jellyfin pipe-delimited list (`PipeDelimitedCollectionModelBinder`), trimmed,
+/// without empty ones.
+fn pipe_list(value: Option<&str>) -> Vec<String> {
+    value
+        .into_iter()
+        .flat_map(|v| v.split('|'))
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The values of a comma-delimited list, trimmed, without empty ones.
+fn comma_list(value: Option<&str>) -> Vec<String> {
+    value
+        .into_iter()
+        .flat_map(|v| v.split(','))
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// A date query value (RFC 3339, or a date and time without a zone, read as UTC, or a date) as
+/// the UTC instant SQLite's `julianday` reads; 400 when it is none of those, as in Jellyfin.
+fn query_instant(name: &str, value: Option<&str>) -> Result<Option<String>, ApiError> {
+    let Some(value) = value.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    let instant = chrono::DateTime::parse_from_rfc3339(value)
+        .map(|d| d.with_timezone(&chrono::Utc).naive_utc())
+        .or_else(|_| chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S%.f"))
+        .or_else(|_| {
+            chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d")
+                .map(|d| d.and_hms_opt(0, 0, 0).unwrap_or_default())
+        })
+        .map_err(|_| ApiError::BadRequest(format!("invalid {name}: {value}")))?;
+    Ok(Some(instant.format("%Y-%m-%d %H:%M:%S").to_string()))
+}
+
+/// The item types whose Jellyfin `MediaType` (`MediaType::media_kind`) is one of `kinds`; a kind
+/// no item has (`Book`) keeps a type no item has, so it lists nothing.
+fn item_types_of_media_kinds(kinds: &[String]) -> Vec<String> {
+    use rustyfin_model::media::MediaType;
+    const TYPES: [MediaType; 12] = [
+        MediaType::Movie,
+        MediaType::Series,
+        MediaType::Season,
+        MediaType::Episode,
+        MediaType::Audio,
+        MediaType::MusicAlbum,
+        MediaType::MusicArtist,
+        MediaType::Photo,
+        MediaType::Video,
+        MediaType::Genre,
+        MediaType::BoxSet,
+        MediaType::Playlist,
+    ];
+    let mut types: Vec<String> = TYPES
+        .iter()
+        .filter(|t| kinds.iter().any(|k| k.eq_ignore_ascii_case(t.media_kind())))
+        .map(|t| format!("{t:?}"))
+        .collect();
+    if types.is_empty() {
+        types.push("Book".to_string());
+    }
+    types
+}
+
+/// The `InternalItemsQuery` conditions of a list request that `repo_item_filter` answers.
+fn item_filter(query: &ItemsQuery) -> Result<rustyfin_db::repo_item_filter::ItemFilter, ApiError> {
+    let ids = |value: Option<&str>| -> Vec<String> {
+        parse_ids(value).iter().map(Uuid::to_string).collect()
+    };
+    let rating = |value: Option<&str>| {
+        value
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .and_then(rustyfin_model::parental::rating_score)
+    };
+    // IsKids, IsNews and IsSports are the tags of those names, as in Jellyfin.
+    let mut tags = pipe_list(query.tags());
+    let mut exclude_tags = Vec::new();
+    for (flag, tag) in [
+        (query.is_kids, "Kids"),
+        (query.is_news, "News"),
+        (query.is_sports, "Sports"),
+    ] {
+        match flag {
+            Some(true) => tags.push(tag.to_string()),
+            Some(false) => exclude_tags.push(tag.to_string()),
+            None => {}
+        }
+    }
+    // Jellyfin reads the location types as whether an item is virtual (`ItemsController`).
+    let location = comma_list(query.location_types.as_deref());
+    let excluded_locations = comma_list(query.exclude_location_types.as_deref());
+    let virtual_ = |list: &[String]| list.iter().any(|t| t.eq_ignore_ascii_case("Virtual"));
+    let is_virtual = if virtual_(&excluded_locations) {
+        Some(false)
+    } else if !location.is_empty() && location.len() < 4 {
+        Some(virtual_(&location))
+    } else {
+        query.is_missing
+    };
+    let min_rating = rating(query.min_official_rating.as_deref());
+    let max_rating = rating(query.max_official_rating.as_deref());
+    let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    Ok(rustyfin_db::repo_item_filter::ItemFilter {
+        person_ids: ids(query.person_ids.as_deref()),
+        person: query
+            .person
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(str::to_string),
+        studios: pipe_list(query.studios.as_deref()),
+        artist_ids: ids(query.artist_ids()),
+        artist_names: pipe_list(query.artists.as_deref()),
+        album_artist_ids: ids(query.album_artist_ids.as_deref()),
+        contributing_artist_ids: ids(query.contributing_artist_ids.as_deref()),
+        exclude_artist_ids: ids(query.exclude_artist_ids.as_deref()),
+        album_ids: ids(query.album_ids()),
+        album_names: pipe_list(query.albums.as_deref()),
+        tags,
+        exclude_tags,
+        min_community_rating: query.min_community_rating,
+        min_premiere_date: query_instant("MinPremiereDate", query.min_premiere_date.as_deref())?,
+        max_premiere_date: query_instant("MaxPremiereDate", query.max_premiere_date.as_deref())?,
+        unaired: query.is_unaired.map(|unaired| (unaired, now)),
+        has_imdb_id: query.has_imdb_id,
+        has_tmdb_id: query.has_tmdb_id,
+        has_tvdb_id: query.has_tvdb_id,
+        is_hd: query.is_hd,
+        is_4k: query.is_4k,
+        is_3d: query.is_3d,
+        min_width: query.min_width,
+        min_height: query.min_height,
+        max_width: query.max_width,
+        max_height: query.max_height,
+        has_subtitles: query.has_subtitles(),
+        has_overview: query.has_overview,
+        has_official_rating: query.has_official_rating,
+        no_parental_rating: query.has_parental_rating == Some(false)
+            && min_rating.is_none()
+            && max_rating.is_none(),
+        min_rating,
+        max_rating,
+        is_locked: query.is_locked,
+        is_placeholder: query.is_place_holder,
+        is_virtual,
+        video_types: comma_list(query.video_types.as_deref()),
+        name_less_than: query
+            .name_less_than
+            .as_deref()
+            .filter(|n| !n.trim().is_empty())
+            .map(str::to_string),
+        index_number: query.index_number,
+        parent_index_number: query.parent_index_number,
+        image_types: comma_list(query.image_types.as_deref()),
+    })
+}
+
+/// Jellyfin's `AdjacentTo` (`UserViewBuilder.FilterForAdjacency`): the item `id` of the ordered
+/// list and the ones before and after it. When the list doesn't hold it, its first item only,
+/// as Jellyfin's index of -1 gives.
+fn adjacent_items(items: Vec<MediaItem>, id: Uuid) -> Vec<MediaItem> {
+    let index = items.iter().position(|item| item.id == id);
+    let keep = |i: usize| match index {
+        Some(index) => i + 1 == index || i == index || i == index + 1,
+        None => i == 0,
+    };
+    items
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| keep(*i))
+        .map(|(_, item)| item)
+        .collect()
+}
+
 /// The ids of `kept` (all items when `None`) that are also in `ids`.
 fn narrow_ids(kept: Option<Vec<String>>, ids: Vec<String>) -> Vec<String> {
     match kept {
@@ -2489,12 +2758,13 @@ async fn get_items(
     let is_played = flag(query.is_played(), &["IsPlayed"]);
     let is_unplayed = flag(query.is_unplayed(), &["IsUnplayed"]);
     let is_resumable = flag(query.is_resumable(), &["IsResumable"]);
-    let tags: Option<Vec<String>> = query
-        .tags()
-        .map(|s| s.split(',').map(|t| t.trim().to_string()).collect());
+    // Tags (with IsKids, IsNews, IsSports) go to `item_filter`: any of them, or the series'.
+    let tags: Option<Vec<String>> = None;
+    // MediaTypes names Jellyfin's media kinds (Video, Audio, …), kept as the item types of them.
     let media_types_filter: Option<Vec<String>> = query
         .media_types()
-        .map(|s| s.split(',').map(|t| t.trim().to_string()).collect());
+        .map(|s| item_types_of_media_kinds(&comma_list(Some(s))));
+    let conditions = item_filter(&query)?;
     let runtime_parts: Option<(i32, i32)> = query.runtime().map(|s| {
         let parts: Vec<&str> = s.split('-').collect();
         let min = parts
@@ -2628,6 +2898,11 @@ async fn get_items(
                 .await?;
         item_ids = Some(narrow_ids(item_ids, ids));
     }
+    if let Some(ids) =
+        rustyfin_db::repo_item_filter::matching_ids(&state.db_ro, &conditions).await?
+    {
+        item_ids = Some(narrow_ids(item_ids, ids));
+    }
     // Ids keeps only the listed items (Jellyfin's `InternalItemsQuery.ItemIds`); ids of no item
     // are skipped, and an empty list filters nothing, as in Jellyfin.
     if !by_id.requested.is_empty() {
@@ -2640,10 +2915,15 @@ async fn get_items(
 
     // With Ids every match is fetched, then merged with the requested collections and
     // playlists, ordered and paged here.
-    let (fetch_start, fetch_limit) = if by_id.requested.is_empty() {
+    // AdjacentTo picks from the whole ordered list too.
+    let adjacent_to = query.adjacent_to;
+    let whole_list = !by_id.requested.is_empty() || adjacent_to.is_some();
+    let (fetch_start, fetch_limit) = if !whole_list {
         (start_index, limit)
-    } else {
+    } else if adjacent_to.is_none() {
         (0, by_id.requested.len() as i64)
+    } else {
+        (0, i64::MAX)
     };
 
     let (mut items, mut total) = rustyfin_db::repo_media::get_items_filtered(
@@ -2681,8 +2961,12 @@ async fn get_items(
     // Collections and playlists named in Ids are listed as `/Items/{id}` answers them; they are
     // under no library or collection, so a ParentId or LibraryId leaves them out.
     let mut containers = std::collections::HashSet::new();
-    if !by_id.requested.is_empty() {
-        if parent_id.is_none() && !in_collection && query.library_id().is_none() {
+    if whole_list {
+        if !by_id.requested.is_empty()
+            && parent_id.is_none()
+            && !in_collection
+            && query.library_id().is_none()
+        {
             let found = requested_containers(
                 &state,
                 &claims,
@@ -2692,12 +2976,20 @@ async fn get_items(
                 exclude_media_types.as_deref(),
             )
             .await?;
-            total += found.len() as i64;
             containers.extend(found.iter().map(|item| item.id));
             items.extend(found);
         }
-        let page = by_id.page(items, start_index, limit);
-        items = page.items;
+        let mut page = by_id.page(items, 0, i64::MAX);
+        if let Some(id) = adjacent_to {
+            page.items = adjacent_items(page.items, id);
+        }
+        total = page.items.len() as i64;
+        items = page
+            .items
+            .into_iter()
+            .skip(start_index as usize)
+            .take(limit as usize)
+            .collect();
     }
 
     if query.card_index() {

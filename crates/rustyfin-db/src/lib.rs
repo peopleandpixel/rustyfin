@@ -10,6 +10,7 @@ pub mod repo_collection;
 pub mod repo_device;
 pub mod repo_extras;
 pub mod repo_image;
+pub mod repo_item_filter;
 pub mod repo_jellyfin_import;
 pub mod repo_library;
 pub mod repo_live_tv;

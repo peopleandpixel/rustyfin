@@ -48325,3 +48325,434 @@ async fn r3items_localization_options_are_jellyfins_name_value_list() {
         "{first}"
     );
 }
+
+/// The items of the `/Items` filter tests, by made-up name.
+struct R3ItemsLibrary {
+    ids: std::collections::HashMap<&'static str, uuid::Uuid>,
+    /// People: Pat Doe (actor), Band and Guest (artists).
+    pat: uuid::Uuid,
+    band_person: uuid::Uuid,
+    guest: uuid::Uuid,
+}
+
+impl R3ItemsLibrary {
+    fn id(&self, name: &str) -> uuid::Uuid {
+        self.ids[name]
+    }
+}
+
+async fn r3items_sql(state: &AppState, sql: &str) {
+    sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
+        .execute(&state.db)
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"));
+}
+
+/// Movies Alpha (HD, rated PG-13, tagged Kids, with a TMDb and an IMDb id, an overview, a
+/// subtitle, a Primary picture, studio Acme Pictures and actor Pat Doe; locked), Bravo (4K, rated
+/// R, tagged Sports and Drama, premiering in 2030) and Charlie (SD, unrated); series Show (tagged
+/// News, a TVDb id) with season 1 and its episodes 1 to 3 (the third virtual); and album Record
+/// by Band, with tracks Song One (Band) and Song Two (Guest), and a MusicArtist item Band.
+async fn r3items_library(state: &AppState) -> R3ItemsLibrary {
+    let lib = j6_library(state, "R3 Filters").await;
+    let mut ids = std::collections::HashMap::new();
+    for name in ["Alpha", "Bravo", "Charlie"] {
+        ids.insert(name, j6_add_item(state, lib, None, name, "Movie").await);
+    }
+    let show = j6_add_item(state, lib, None, "Show", "Series").await;
+    let season = j6_add_item(state, lib, Some(show), "Season 1", "Season").await;
+    ids.insert("Show", show);
+    ids.insert("Season 1", season);
+    for (n, name) in [(1, "Episode 1"), (2, "Episode 2"), (3, "Episode 3")] {
+        let id = j6_add_item(state, lib, Some(season), name, "Episode").await;
+        r3items_sql(state, &format!("UPDATE media_items SET index_number = {n}, parent_index_number = 1 WHERE id = '{id}'")).await;
+        ids.insert(name, id);
+    }
+    let band = j6_add_item(state, lib, None, "Band", "MusicArtist").await;
+    let record = j6_add_item(state, lib, Some(band), "Record", "MusicAlbum").await;
+    let one = j6_add_item(state, lib, Some(record), "Song One", "Audio").await;
+    let two = j6_add_item(state, lib, Some(record), "Song Two", "Audio").await;
+    for (name, id) in [
+        ("Band", band),
+        ("Record", record),
+        ("Song One", one),
+        ("Song Two", two),
+    ] {
+        ids.insert(name, id);
+    }
+    let (a, b, c) = (ids["Alpha"], ids["Bravo"], ids["Charlie"]);
+    let e3 = ids["Episode 3"];
+    let (pat, band_person, guest) = (
+        uuid::Uuid::new_v4(),
+        uuid::Uuid::new_v4(),
+        uuid::Uuid::new_v4(),
+    );
+    let studio = uuid::Uuid::new_v4();
+    for sql in [
+        format!(
+            "UPDATE media_items SET tmdb_id = 11, overview = 'An overview', community_rating = 8.1, premiere_date = '2001-05-01T00:00:00Z', official_rating = 'PG-13', tags = 'Kids' WHERE id = '{a}'"
+        ),
+        format!(
+            "UPDATE media_items SET community_rating = 5.0, premiere_date = '2030-01-01T00:00:00Z', official_rating = 'R', tags = 'Sports|Drama' WHERE id = '{b}'"
+        ),
+        format!(
+            "UPDATE media_items SET overview = '', premiere_date = '1990-01-01T00:00:00Z' WHERE id = '{c}'"
+        ),
+        format!("UPDATE media_items SET tags = 'News', tvdb_id = 22 WHERE id = '{show}'"),
+        format!("UPDATE media_items SET location_type = 'Virtual' WHERE id = '{e3}'"),
+        format!(
+            "INSERT INTO item_metadata_extras (item_id, imdb_id, lock_data) VALUES ('{a}', 'tt0000001', 1)"
+        ),
+        format!(
+            "INSERT INTO item_images (item_id, image_type, image_index, path) VALUES ('{a}', 'Primary', 0, '/nowhere/a.jpg')"
+        ),
+        format!("INSERT INTO studios (id, name) VALUES ('{studio}', 'Acme Pictures')"),
+        format!("INSERT INTO item_studios (item_id, studio_id) VALUES ('{a}', '{studio}')"),
+        format!(
+            "INSERT INTO people (id, name) VALUES ('{pat}', 'Pat Doe'), ('{band_person}', 'Band'), ('{guest}', 'Guest')"
+        ),
+        format!(
+            "INSERT INTO item_people (item_id, person_id, type) VALUES ('{a}', '{pat}', 'Actor'), ('{one}', '{band_person}', 'Artist'), ('{record}', '{band_person}', 'AlbumArtist'), ('{two}', '{guest}', 'Artist')"
+        ),
+    ] {
+        r3items_sql(state, &sql).await;
+    }
+    // Sources: Alpha 1920x1080 with a subtitle, Bravo 3840x2160, Charlie 640x480 (on its stream).
+    for (item, width, height) in [
+        (a, "1920", "1080"),
+        (b, "3840", "2160"),
+        (c, "NULL", "NULL"),
+    ] {
+        let source = uuid::Uuid::new_v4();
+        r3items_sql(state, &format!("INSERT INTO media_sources (id, item_id, uid, path, width, height) VALUES ('{source}', '{item}', '{source}', '/nowhere/{item}.mkv', {width}, {height})")).await;
+        if item == c {
+            r3items_sql(state, &format!("INSERT INTO media_streams (id, source_id, codec_type, stream_index, width, height) VALUES ('{}', '{source}', 'Video', 0, 640, 480)", uuid::Uuid::new_v4())).await;
+        }
+        if item == a {
+            r3items_sql(state, &format!("INSERT INTO media_streams (id, source_id, codec_type, stream_index, language) VALUES ('{}', '{source}', 'Subtitle', 2, 'eng')", uuid::Uuid::new_v4())).await;
+        }
+    }
+    R3ItemsLibrary {
+        ids,
+        pat,
+        band_person,
+        guest,
+    }
+}
+
+/// The sorted names that `/Items?<params>` lists, every item type unless the params name some.
+async fn r3items_found(app: &axum::Router, token: &str, params: &str) -> Vec<String> {
+    let uri = format!("/Items?Recursive=true&{params}");
+    let (mut names, total) = r3items_names(app, &uri, token).await;
+    assert_eq!(total as usize, names.len(), "{uri}");
+    names.sort();
+    names
+}
+
+/// Runs each `(params, expected names)` case and asserts its sorted names.
+async fn r3items_cases(app: &axum::Router, token: &str, cases: &[(String, &[&str])]) {
+    for (params, expected) in cases {
+        let mut expected: Vec<String> = expected.iter().map(|s| s.to_string()).collect();
+        expected.sort();
+        assert_eq!(
+            r3items_found(app, token, params).await,
+            expected,
+            "{params}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn r3items_people_and_studios_filter_the_list() {
+    let state = test_state().await;
+    let lib = r3items_library(&state).await;
+    let (token, _) = admin_session(&state).await;
+    let app = app(state);
+    let pat = lib.pat;
+    r3items_cases(
+        &app,
+        &token,
+        &[
+            (format!("PersonIds={pat}"), &["Alpha"]),
+            (format!("personIds={}", pat.simple()), &["Alpha"]),
+            ("Person=Pat%20Doe".into(), &["Alpha"]),
+            ("Person=Nobody".into(), &[]),
+            // PersonTypes has no effect, as in Jellyfin 10.11.
+            (format!("PersonIds={pat}&PersonTypes=Director"), &["Alpha"]),
+            ("Studios=acme%20pictures".into(), &["Alpha"]),
+            ("Studios=Other|Acme%20Pictures".into(), &["Alpha"]),
+            ("Studios=Other".into(), &[]),
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn r3items_artists_and_albums_filter_the_list() {
+    let state = test_state().await;
+    let lib = r3items_library(&state).await;
+    let (token, _) = admin_session(&state).await;
+    let app = app(state);
+    let (band_item, band, guest, record) =
+        (lib.id("Band"), lib.band_person, lib.guest, lib.id("Record"));
+    r3items_cases(
+        &app,
+        &token,
+        &[
+            // An artist by its MusicArtist item or its person id: the items credited and their album.
+            (format!("ArtistIds={band_item}"), &["Record", "Song One"]),
+            (
+                format!("ArtistIds={band}&IncludeItemTypes=Audio"),
+                &["Song One"],
+            ),
+            ("Artists=guest&IncludeItemTypes=Audio".into(), &["Song Two"]),
+            (format!("AlbumArtistIds={band}"), &["Record"]),
+            (
+                format!("ContributingArtistIds={guest}&IncludeItemTypes=Audio"),
+                &["Song Two"],
+            ),
+            (
+                format!("ExcludeArtistIds={band}&IncludeItemTypes=Audio"),
+                &["Song Two"],
+            ),
+            (format!("AlbumIds={record}"), &["Song One", "Song Two"]),
+            ("Albums=Record".into(), &["Song One", "Song Two"]),
+            ("Albums=Other".into(), &[]),
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn r3items_provider_ids_text_and_locks_filter_the_list() {
+    let state = test_state().await;
+    r3items_library(&state).await;
+    let (token, _) = admin_session(&state).await;
+    let app = app(state);
+    let movies = "IncludeItemTypes=Movie";
+    r3items_cases(
+        &app,
+        &token,
+        &[
+            ("HasTmdbId=true".into(), &["Alpha"]),
+            (format!("HasTmdbId=false&{movies}"), &["Bravo", "Charlie"]),
+            ("HasImdbId=true".into(), &["Alpha"]),
+            (format!("hasImdbId=false&{movies}"), &["Bravo", "Charlie"]),
+            ("HasTvdbId=true".into(), &["Show"]),
+            (format!("HasOverview=true&{movies}"), &["Alpha"]),
+            (format!("HasOverview=false&{movies}"), &["Bravo", "Charlie"]),
+            (
+                format!("HasOfficialRating=true&{movies}"),
+                &["Alpha", "Bravo"],
+            ),
+            (format!("HasOfficialRating=false&{movies}"), &["Charlie"]),
+            ("IsLocked=true".into(), &["Alpha"]),
+            (format!("IsLocked=false&{movies}"), &["Bravo", "Charlie"]),
+            (format!("IsPlaceHolder=true&{movies}"), &[]),
+            (
+                format!("IsPlaceHolder=false&{movies}"),
+                &["Alpha", "Bravo", "Charlie"],
+            ),
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn r3items_ratings_and_dates_filter_the_list() {
+    let state = test_state().await;
+    r3items_library(&state).await;
+    let (token, _) = admin_session(&state).await;
+    let app = app(state);
+    let movies = "IncludeItemTypes=Movie";
+    r3items_cases(
+        &app,
+        &token,
+        &[
+            ("MinCommunityRating=7".into(), &["Alpha"]),
+            ("MinCommunityRating=5".into(), &["Alpha", "Bravo"]),
+            // MinCriticRating has no effect, as in Jellyfin 10.11.
+            (
+                format!("MinCriticRating=99&{movies}"),
+                &["Alpha", "Bravo", "Charlie"],
+            ),
+            (
+                "MinPremiereDate=2000-01-01&MaxPremiereDate=2010-12-31T23:59:59Z".into(),
+                &["Alpha"],
+            ),
+            (
+                "MinPremiereDate=2020-01-01T00:00:00.000Z".into(),
+                &["Bravo"],
+            ),
+            ("MaxPremiereDate=1995-01-01".into(), &["Charlie"]),
+            (format!("IsUnaired=true&{movies}"), &["Bravo"]),
+            (format!("IsUnaired=false&{movies}"), &["Alpha", "Charlie"]),
+            // A rating range keeps the unrated items, as in Jellyfin.
+            (
+                format!("MaxOfficialRating=PG-13&{movies}"),
+                &["Alpha", "Charlie"],
+            ),
+            (
+                format!("MinOfficialRating=R&{movies}"),
+                &["Bravo", "Charlie"],
+            ),
+            (format!("HasParentalRating=false&{movies}"), &["Charlie"]),
+            (
+                format!("HasParentalRating=true&{movies}"),
+                &["Alpha", "Bravo", "Charlie"],
+            ),
+        ],
+    )
+    .await;
+    let (status, _) =
+        send_authed(&app, "GET", "/Items?MinPremiereDate=someday", &token, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn r3items_picture_size_streams_and_images_filter_the_list() {
+    let state = test_state().await;
+    r3items_library(&state).await;
+    let (token, _) = admin_session(&state).await;
+    let app = app(state);
+    let movies = "IncludeItemTypes=Movie";
+    r3items_cases(
+        &app,
+        &token,
+        &[
+            ("IsHD=true".into(), &["Alpha"]),
+            ("isHd=false".into(), &["Charlie"]),
+            ("Is4K=true".into(), &["Bravo"]),
+            ("IsHD=true&Is4K=true".into(), &["Alpha", "Bravo"]),
+            ("MinWidth=1000".into(), &["Alpha", "Bravo"]),
+            ("MaxWidth=2000".into(), &["Alpha", "Charlie"]),
+            ("MinHeight=2000".into(), &["Bravo"]),
+            ("MaxHeight=1080".into(), &["Alpha", "Charlie"]),
+            ("HasSubtitles=true".into(), &["Alpha"]),
+            (
+                format!("HasSubtitles=false&{movies}"),
+                &["Bravo", "Charlie"],
+            ),
+            (format!("Is3D=true&{movies}"), &[]),
+            (
+                format!("Is3D=false&{movies}"),
+                &["Alpha", "Bravo", "Charlie"],
+            ),
+            (
+                format!("VideoTypes=VideoFile&{movies}"),
+                &["Alpha", "Bravo", "Charlie"],
+            ),
+            ("VideoTypes=VideoFile&IncludeItemTypes=Audio".into(), &[]),
+            (format!("VideoTypes=Iso&{movies}"), &[]),
+            ("ImageTypes=Primary".into(), &["Alpha"]),
+            ("ImageTypes=Backdrop,Logo".into(), &[]),
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn r3items_tags_media_types_and_flags_filter_the_list() {
+    let state = test_state().await;
+    r3items_library(&state).await;
+    let (token, _) = admin_session(&state).await;
+    let app = app(state);
+    let episodes = "IncludeItemTypes=Episode";
+    r3items_cases(
+        &app,
+        &token,
+        &[
+            // Tags are pipe-delimited and any of them matches, any case; an episode has its series'.
+            ("Tags=kids".into(), &["Alpha"]),
+            ("Tags=Sports|Kids".into(), &["Alpha", "Bravo"]),
+            ("Tags=Drama".into(), &["Bravo"]),
+            (
+                format!("Tags=News&{episodes}"),
+                &["Episode 1", "Episode 2", "Episode 3"],
+            ),
+            ("IsKids=true".into(), &["Alpha"]),
+            ("IsSports=true".into(), &["Bravo"]),
+            (format!("IsNews=false&{episodes}"), &[]),
+            (
+                "IsNews=false&IncludeItemTypes=Movie".into(),
+                &["Alpha", "Bravo", "Charlie"],
+            ),
+            // MediaTypes names media kinds.
+            (
+                "MediaTypes=Audio&IncludeItemTypes=Audio,Movie".into(),
+                &["Song One", "Song Two"],
+            ),
+            (
+                "MediaTypes=Video&IncludeItemTypes=Movie,Episode,Audio".into(),
+                &[
+                    "Alpha",
+                    "Bravo",
+                    "Charlie",
+                    "Episode 1",
+                    "Episode 2",
+                    "Episode 3",
+                ],
+            ),
+            ("MediaTypes=Book".into(), &[]),
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn r3items_numbers_names_locations_and_adjacency_filter_the_list() {
+    let state = test_state().await;
+    let lib = r3items_library(&state).await;
+    let (token, _) = admin_session(&state).await;
+    let app = app(state);
+    let season = lib.id("Season 1");
+    let episodes = "IncludeItemTypes=Episode";
+    r3items_cases(
+        &app,
+        &token,
+        &[
+            (format!("ParentId={season}&IndexNumber=2"), &["Episode 2"]),
+            (
+                format!("ParentIndexNumber=1&{episodes}"),
+                &["Episode 1", "Episode 2", "Episode 3"],
+            ),
+            (format!("ParentIndexNumber=2&{episodes}"), &[]),
+            (
+                "NameLessThan=bravo&IncludeItemTypes=Movie".into(),
+                &["Alpha"],
+            ),
+            (format!("IsMissing=true&{episodes}"), &["Episode 3"]),
+            (
+                format!("ExcludeLocationTypes=Virtual&{episodes}"),
+                &["Episode 1", "Episode 2"],
+            ),
+            (format!("LocationTypes=Virtual&{episodes}"), &["Episode 3"]),
+            (
+                format!("LocationTypes=FileSystem&{episodes}"),
+                &["Episode 1", "Episode 2"],
+            ),
+        ],
+    )
+    .await;
+    // AdjacentTo: the item and its neighbours in the ordered list.
+    let ordered = |adjacent: uuid::Uuid| {
+        format!("/Items?ParentId={season}&SortBy=SortName&AdjacentTo={adjacent}")
+    };
+    let (names, total) = r3items_names(&app, &ordered(lib.id("Episode 2")), &token).await;
+    assert_eq!(
+        (names, total),
+        (
+            vec!["Episode 1".into(), "Episode 2".into(), "Episode 3".into()],
+            3
+        )
+    );
+    let (names, total) = r3items_names(&app, &ordered(lib.id("Episode 1")), &token).await;
+    assert_eq!(
+        (names, total),
+        (vec!["Episode 1".into(), "Episode 2".into()], 2)
+    );
+    let (names, _) = r3items_names(&app, &ordered(lib.id("Episode 3")), &token).await;
+    assert_eq!(names, ["Episode 2", "Episode 3"]);
+    let (names, _) = r3items_names(&app, &ordered(uuid::Uuid::new_v4()), &token).await;
+    assert_eq!(names, ["Episode 1"]);
+}
