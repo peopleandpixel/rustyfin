@@ -1286,6 +1286,10 @@ async fn r3meta_omdb_stub() -> (String, std::sync::Arc<std::sync::Mutex<Vec<Stri
                     {"Title": "OMDb Part 2", "Episode": "2", "Rated": "N/A",
                      "Genre": "Drama", "imdbID": "tt0000512"}
                 ]})
+            } else if has("i=tt0000777") {
+                serde_json::json!({"Response": "False", "Error": "Request limit reached!"})
+            } else if has("i=tt0000888") {
+                serde_json::json!({"Response": "False", "Error": "Movie not found!"})
             } else {
                 serde_json::json!({"Response": "False", "Error": "Incorrect IMDb ID."})
             };
@@ -1479,13 +1483,50 @@ async fn r3meta_omdb_answers_survive_a_restart() {
     let restarted = lookups();
     ask(&restarted).await;
     assert_eq!(hits.lock().unwrap().len(), 3, "{:?}", hits.lock().unwrap());
-    for file in std::fs::read_dir(&dir).unwrap() {
-        let text = std::fs::read_to_string(file.unwrap().path()).unwrap();
-        assert!(!text.contains("r3-omdb-key"), "{text}");
+    // One folder per IMDb id, one file per answer
+    let mut files = 0;
+    for folder in std::fs::read_dir(&dir).unwrap() {
+        for file in std::fs::read_dir(folder.unwrap().path()).unwrap() {
+            let text = std::fs::read_to_string(file.unwrap().path()).unwrap();
+            assert!(!text.contains("r3-omdb-key"), "{text}");
+            files += 1;
+        }
     }
+    assert_eq!(files, 3);
 
-    restarted.forget("tt0000601");
+    restarted.forget("tt0000601").await;
     ask(&restarted).await;
     assert_eq!(hits.lock().unwrap().len(), 4);
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Only OMDb's own "not found" messages ("Incorrect IMDb ID.", "… not found!") are kept as
+/// answers; any other `"Response": "False"` (e.g. a rate limit) is a failure, asked again.
+#[tokio::test]
+async fn r3meta_omdb_keeps_only_real_not_found_answers() {
+    use rustyfin_model::metadata::{ImdbLookups, LookupFailed};
+    use std::sync::{Arc, Mutex};
+    let (origin, hits) = r3meta_omdb_stub().await;
+    let lookups = plugin_omdb::OmdbLookups::new(
+        reqwest::Client::builder().no_proxy().build().unwrap(),
+        &origin,
+        Arc::new(Mutex::new(Some("r3-omdb-key".to_string()))),
+        rustyfin_model::answer_store::AnswerStore::memory_only(),
+    );
+    for _ in 0..2 {
+        assert!(lookups.by_imdb_id("tt0000888").await.unwrap().is_none());
+        assert!(lookups.by_imdb_id("tt0000999").await.unwrap().is_none());
+        let limited = lookups.by_imdb_id("tt0000777").await;
+        assert_eq!(limited.unwrap_err(), LookupFailed::Transient);
+    }
+    let asked = |id: &str| {
+        let pair = format!("i={id}");
+        let hits = hits.lock().unwrap();
+        hits.iter()
+            .filter(|q| q.split('&').any(|p| p == pair))
+            .count()
+    };
+    assert_eq!(asked("tt0000888"), 1);
+    assert_eq!(asked("tt0000999"), 1);
+    assert_eq!(asked("tt0000777"), 2);
 }

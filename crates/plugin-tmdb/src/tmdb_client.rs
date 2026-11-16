@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use reqwest::Url;
-use rustyfin_model::answer_store::{Answer, AnswerStore};
+use rustyfin_model::answer_store::{AnswerStore, Stored, now_secs};
 use tokio::sync::Semaphore;
 use tokio::time::{Instant, sleep, sleep_until};
 
@@ -74,6 +74,8 @@ pub struct TmdbSettings {
     pub request_timeout: Duration,
     /// Where answers are kept across restarts, with no expiry. `None` keeps them in memory only.
     pub cache_dir: Option<std::path::PathBuf>,
+    /// How long a search that found nothing counts; a search that found something counts for good.
+    pub empty_search_ttl: Duration,
 }
 
 impl Default for TmdbSettings {
@@ -89,6 +91,7 @@ impl Default for TmdbSettings {
             max_retry_after: Duration::from_secs(10),
             request_timeout: Duration::from_secs(10),
             cache_dir: None,
+            empty_search_ttl: Duration::from_secs(7 * 24 * 60 * 60),
         }
     }
 }
@@ -199,8 +202,9 @@ struct Shared {
     http: reqwest::Client,
     settings: TmdbSettings,
     limiter: Limiter,
-    /// Final answers by request (path and query, without the key): the JSON, or `None` for a 404
-    cache: moka::future::Cache<String, Answer>,
+    /// Final answers by request (path and query, without the key), with their owner: the JSON,
+    /// or `None` for a 404
+    cache: moka::future::Cache<String, (String, Stored)>,
     /// The same answers on disk
     store: AnswerStore,
 }
@@ -232,21 +236,26 @@ impl TmdbClient {
     /// Forgets the answers about a movie's or series' id (its details, and a series' seasons), so
     /// that the next lookup asks TMDb again: for a "replace all metadata" refresh, as Jellyfin's
     /// bypasses its cache.
-    pub fn forget(&self, series: bool, id: i64) {
-        let root = format!("/{}/{id}", if series { "tv" } else { "movie" });
-        let about = move |key: &str| {
-            key.strip_prefix(root.as_str())
-                .is_some_and(|rest| rest.is_empty() || rest.starts_with(['?', '/']))
-        };
+    pub async fn forget(&self, series: bool, id: i64) {
+        self.forget_owner(format!("{}-{id}", kind(series))).await;
+    }
+
+    /// Forgets the answers of the searches for `title` (any year), so that the next search for it
+    /// asks TMDb again: for a "replace all metadata" refresh of an item with no TMDb id.
+    pub async fn forget_search(&self, series: bool, title: &str) {
+        self.forget_owner(search_owner(kind(series), title)).await;
+    }
+
+    async fn forget_owner(&self, owner: String) {
         let shared = &self.0;
-        let in_memory = about.clone();
+        let target = owner.clone();
         if let Err(e) = shared
             .cache
-            .invalidate_entries_if(move |key, _| in_memory(key))
+            .invalidate_entries_if(move |_, (filed, _)| *filed == target)
         {
             tracing::debug!("TMDb cache: {e}");
         }
-        shared.store.remove_if(about);
+        shared.store.forget(&owner).await;
     }
 
     /// The env key if set, else the trimmed non-empty config key, else `None` (TMDb off).
@@ -309,6 +318,25 @@ impl TmdbApi {
         path: &str,
         query: &[(&str, &str)],
     ) -> Result<serde_json::Value, TmdbError> {
+        self.get_json_with(path, query, false).await
+    }
+
+    /// `get_json` that asks TMDb even when an answer is cached, and keeps the new answer: for an
+    /// admin's manual search (Identify).
+    pub async fn get_json_fresh(
+        &self,
+        path: &str,
+        query: &[(&str, &str)],
+    ) -> Result<serde_json::Value, TmdbError> {
+        self.get_json_with(path, query, true).await
+    }
+
+    async fn get_json_with(
+        &self,
+        path: &str,
+        query: &[(&str, &str)],
+        fresh: bool,
+    ) -> Result<serde_json::Value, TmdbError> {
         let shared: &Shared = &self.client.0;
         let mut url = match Url::parse(&format!("{}{path}", shared.settings.api_base_url)) {
             Ok(url) => url,
@@ -331,18 +359,30 @@ impl TmdbApi {
             Some(encoded) => format!("{path}?{encoded}"),
             None => path.to_string(),
         };
-        let known = match shared.cache.get(&cache_key).await {
-            Some(answer) => Some(answer),
-            None => {
-                let stored = shared.store.get(&cache_key);
-                if let Some(answer) = &stored {
-                    shared.cache.insert(cache_key.clone(), answer.clone()).await;
+        let owner = owner_of(path, query);
+        let known = if fresh {
+            None
+        } else {
+            match shared.cache.get(&cache_key).await {
+                Some((_, stored)) => Some(stored),
+                None => {
+                    let stored = shared.store.get(&owner, &cache_key).await;
+                    if let Some(stored) = &stored {
+                        let entry = (owner.clone(), stored.clone());
+                        shared.cache.insert(cache_key.clone(), entry).await;
+                    }
+                    stored
                 }
-                stored
             }
         };
-        if let Some(answer) = known {
-            return answer.ok_or_else(|| TmdbError {
+        // An empty search counts for `empty_search_ttl` only: the title may be listed later
+        let still_good = |stored: &Stored| {
+            !is_empty_search(path, &stored.answer)
+                || now_secs().saturating_sub(stored.stored_at)
+                    < shared.settings.empty_search_ttl.as_secs()
+        };
+        if let Some(stored) = known.filter(still_good) {
+            return stored.answer.ok_or_else(|| TmdbError {
                 endpoint: path.to_string(),
                 kind: TmdbErrorKind::Status(404),
                 attempts: 0,
@@ -359,8 +399,12 @@ impl TmdbApi {
             Err(e) if e.is_not_found() => None,
             Err(_) => return result,
         };
-        shared.store.put(&cache_key, &answer);
-        shared.cache.insert(cache_key, answer).await;
+        shared.store.put(&owner, &cache_key, &answer).await;
+        let stored = Stored {
+            answer,
+            stored_at: now_secs(),
+        };
+        shared.cache.insert(cache_key, (owner, stored)).await;
         result
     }
 
@@ -569,6 +613,47 @@ impl Failure {
     fn is_rate_limited(&self) -> bool {
         self.kind == TmdbErrorKind::Status(429)
     }
+}
+
+/// TMDb's path word for a movie or a series.
+fn kind(series: bool) -> &'static str {
+    if series { "tv" } else { "movie" }
+}
+
+/// The owner of the searches of `kind` ("movie", "tv") for `title`, whatever the year.
+fn search_owner(kind: &str, title: &str) -> String {
+    format!("search-{kind}/{}", title.trim().to_lowercase())
+}
+
+/// What a request is about, which files its answer: a movie's or series' id ("movie-603",
+/// "tv-1399", with its seasons, credits and videos), the title a search asked for, or "other".
+fn owner_of(path: &str, query: &[(&str, &str)]) -> String {
+    let mut parts = path.trim_start_matches('/').split('/');
+    match (parts.next(), parts.next()) {
+        (Some("search"), Some(kind)) => {
+            let title = query
+                .iter()
+                .find(|(name, _)| *name == "query")
+                .map_or("", |(_, value)| value);
+            search_owner(kind, title)
+        }
+        (Some(kind @ ("movie" | "tv" | "person")), Some(id))
+            if !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            format!("{kind}-{id}")
+        }
+        _ => "other".to_string(),
+    }
+}
+
+/// A search answer with no results.
+fn is_empty_search(path: &str, answer: &Option<serde_json::Value>) -> bool {
+    path.starts_with("/search/")
+        && answer
+            .as_ref()
+            .and_then(|value| value.get("results"))
+            .and_then(|results| results.as_array())
+            .is_none_or(|results| results.is_empty())
 }
 
 /// Wait before retry `retry` (1-based): `initial_backoff × 2^(retry-1)`.

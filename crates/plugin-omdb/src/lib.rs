@@ -5,7 +5,8 @@
 use rustyfin_model::answer_store::{Answer, AnswerStore};
 use rustyfin_model::media::MediaType;
 use rustyfin_model::metadata::{
-    ExternalMetadata, ImdbLookups, LookupFailed, LookupResult, MetadataImage, SeasonMetadata,
+    ExternalMetadata, Forgetting, ImdbLookups, LookupFailed, LookupResult, MetadataImage,
+    SeasonMetadata,
 };
 use rustyfin_model::plugin::{Plugin, PluginType};
 use serde::Deserialize;
@@ -192,16 +193,18 @@ impl OmdbLookups {
 
     /// `GET {base}/?{query}&apikey=…`: the answer, `None` for OMDb's "Response": "False". One
     /// request for concurrent callers of the same query.
-    async fn get(&self, query: String) -> LookupResult<serde_json::Value> {
+    /// The answer to `query`, about `imdb_id` (under which it is filed).
+    async fn get(&self, imdb_id: &str, query: String) -> LookupResult<serde_json::Value> {
         let key = usable_key(&self.key).ok_or(LookupFailed::Unauthorized)?;
         let url = format!("{}/?{query}&apikey={}", self.base_url, urlencoded(&key));
         let http = self.http.clone();
         let store = self.store.clone();
         let stored_as = query.clone();
+        let owner = imdb_id.to_string();
         self.answers
             .try_get_with(query, async move {
-                if let Some(answer) = store.get(&stored_as) {
-                    return Ok(answer);
+                if let Some(stored) = store.get(&owner, &stored_as).await {
+                    return Ok(stored.answer);
                 }
                 let resp = http.get(&url).send().await.map_err(|e| {
                     tracing::warn!("OMDb lookup failed: {}", e.without_url());
@@ -217,12 +220,20 @@ impl OmdbLookups {
                 }
                 let value: serde_json::Value =
                     resp.json().await.map_err(|_| LookupFailed::Transient)?;
-                let answer = value
+                let found = value
                     .get("Response")
                     .and_then(|r| r.as_str())
-                    .filter(|r| r.eq_ignore_ascii_case("true"))
-                    .map(|_| value.clone());
-                store.put(&stored_as, &answer);
+                    .is_some_and(|r| r.eq_ignore_ascii_case("true"));
+                let answer = if found {
+                    Some(value)
+                } else if is_not_found(&value) {
+                    None
+                } else {
+                    // Any other refusal ("Request limit reached!", a bad key) is not an answer
+                    tracing::warn!("OMDb lookup failed: {}", error_text(&value));
+                    return Err(LookupFailed::Transient);
+                };
+                store.put(&owner, &stored_as, &answer).await;
                 Ok(answer)
             })
             .await
@@ -230,12 +241,29 @@ impl OmdbLookups {
     }
 }
 
+/// OMDb's own "not found" answers: "Incorrect IMDb ID.", "Movie not found!", "Series or episode
+/// not found!".
+fn is_not_found(value: &serde_json::Value) -> bool {
+    let error = error_text(value);
+    error.eq_ignore_ascii_case("Incorrect IMDb ID.") || error.ends_with("not found!")
+}
+
+/// OMDb's `Error` text.
+fn error_text(value: &serde_json::Value) -> &str {
+    value
+        .get("Error")
+        .and_then(|e| e.as_str())
+        .unwrap_or("")
+        .trim()
+}
+
 type Lookup<'a, T> = Pin<Box<dyn Future<Output = LookupResult<T>> + Send + 'a>>;
 
 impl ImdbLookups for OmdbLookups {
     fn by_imdb_id(&self, imdb_id: &str) -> Lookup<'_, ExternalMetadata> {
         let query = format!("i={}&plot=short&r=json", urlencoded(imdb_id));
-        Box::pin(async move { Ok(self.get(query).await?.as_ref().map(omdb_meta)) })
+        let imdb_id = imdb_id.to_string();
+        Box::pin(async move { Ok(self.get(&imdb_id, query).await?.as_ref().map(omdb_meta)) })
     }
 
     fn season(&self, series_imdb_id: &str, season_number: i32) -> Lookup<'_, SeasonMetadata> {
@@ -243,8 +271,9 @@ impl ImdbLookups for OmdbLookups {
             "i={}&season={season_number}&detail=full",
             urlencoded(series_imdb_id)
         );
+        let series_imdb_id = series_imdb_id.to_string();
         Box::pin(async move {
-            let Some(season) = self.get(query).await? else {
+            let Some(season) = self.get(&series_imdb_id, query).await? else {
                 return Ok(None);
             };
             let episodes = season
@@ -266,16 +295,18 @@ impl ImdbLookups for OmdbLookups {
         })
     }
 
-    fn forget(&self, imdb_id: &str) {
+    fn forget(&self, imdb_id: &str) -> Forgetting<'_> {
         let prefix = format!("i={}&", urlencoded(imdb_id));
-        let in_memory = prefix.clone();
-        if let Err(e) = self
-            .answers
-            .invalidate_entries_if(move |key, _| key.starts_with(&in_memory))
-        {
-            tracing::debug!("OMDb cache: {e}");
-        }
-        self.store.remove_if(|key| key.starts_with(&prefix));
+        let imdb_id = imdb_id.to_string();
+        Box::pin(async move {
+            if let Err(e) = self
+                .answers
+                .invalidate_entries_if(move |key, _| key.starts_with(&prefix))
+            {
+                tracing::debug!("OMDb cache: {e}");
+            }
+            self.store.forget(&imdb_id).await;
+        })
     }
 }
 

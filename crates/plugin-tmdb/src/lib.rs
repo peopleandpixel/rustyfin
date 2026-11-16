@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex};
 use crate::tmdb_client::{TmdbApi, TmdbClient};
 use rustyfin_model::media::MediaType;
 use rustyfin_model::metadata::{
-    ExternalMetadata, LookupFailed, LookupResult, MetadataImage, MetadataLookups, MetadataPerson,
-    RemoteImage, RemoteSearchHit, SeasonMetadata,
+    ExternalMetadata, Forgetting, LookupFailed, LookupResult, MetadataImage, MetadataLookups,
+    MetadataPerson, RemoteImage, RemoteSearchHit, SeasonMetadata,
 };
 use rustyfin_model::plugin::{Plugin, PluginStatus, PluginType};
 use serde::Deserialize;
@@ -130,15 +130,22 @@ impl MetadataLookups for TmdbLookups {
         })
     }
 
-    fn forget(&self, series: bool, id: i64) {
-        self.client.forget(series, id);
-        if series
-            && let Err(e) = self
-                .seasons
-                .invalidate_entries_if(move |key, _| key.0 == id)
-        {
-            tracing::debug!("TMDb season cache: {e}");
-        }
+    fn forget(&self, series: bool, id: i64) -> Forgetting<'_> {
+        Box::pin(async move {
+            self.client.forget(series, id).await;
+            if series
+                && let Err(e) = self
+                    .seasons
+                    .invalidate_entries_if(move |key, _| key.0 == id)
+            {
+                tracing::debug!("TMDb season cache: {e}");
+            }
+        })
+    }
+
+    fn forget_search(&self, series: bool, title: &str) -> Forgetting<'_> {
+        let title = title.to_string();
+        Box::pin(async move { self.client.forget_search(series, &title).await })
     }
 
     fn images(&self, series: bool, id: i64) -> Answer<'_, Vec<RemoteImage>> {
@@ -882,8 +889,11 @@ async fn search_hits(
     } else {
         "/search/movie"
     };
-    let Some(json) = final_json(tmdb, endpoint, &query).await? else {
-        return Ok(None);
+    // An admin's manual search always asks TMDb, and keeps the answer for the scans
+    let json = match tmdb.get_json_fresh(endpoint, &query).await {
+        Ok(json) => json,
+        Err(e) if e.is_not_found() => return Ok(None),
+        Err(e) => return Err(e),
     };
     let Ok(resp) = serde_json::from_value::<TmdbSearchResult>(json) else {
         return Ok(None);

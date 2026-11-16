@@ -1092,14 +1092,123 @@ async fn r3meta_answers_survive_a_restart() {
     let restarted = TmdbClient::new(http(), settings());
     ask(&restarted).await;
     assert_eq!(stub.hits().len(), 2, "{:?}", stub.hits_for("/movie/800"));
-    for file in std::fs::read_dir(&dir).unwrap() {
-        let text = std::fs::read_to_string(file.unwrap().path()).unwrap();
-        assert!(!text.contains(KEY), "{text}");
+    // One folder per owner, one file per answer
+    let mut files = 0;
+    for folder in std::fs::read_dir(&dir).unwrap() {
+        for file in std::fs::read_dir(folder.unwrap().path()).unwrap() {
+            let text = std::fs::read_to_string(file.unwrap().path()).unwrap();
+            assert!(!text.contains(KEY), "{text}");
+            files += 1;
+        }
     }
+    assert_eq!(files, 2);
 
-    restarted.forget(false, 800);
+    restarted.forget(false, 800).await;
     ask(&restarted).await;
     assert_eq!(stub.hits_for("/movie/800").len(), 2);
     assert_eq!(stub.hits_for("/tv/801").len(), 1);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A stub whose movie search finds a title and whose TV search finds nothing.
+async fn search_stub() -> Stub {
+    start_stub(Duration::ZERO, |path, _| match path {
+        "/search/movie" => Reply::Json(json!({"results": [{"id": 1, "title": "Lantern"}]})),
+        "/search/tv" => Reply::Json(json!({"results": []})),
+        _ => ok(path),
+    })
+    .await
+}
+
+/// A search that found something is kept for good; one that found nothing counts for
+/// `empty_search_ttl` only (7 days), so a title listed later is found, across restarts too.
+#[tokio::test]
+async fn r3meta_empty_searches_expire_found_ones_stay() {
+    let stub = search_stub().await;
+    let dir = std::env::temp_dir().join(format!("rf-tmdb-search-{}", uuid::Uuid::new_v4()));
+    let client = |ttl: Duration| {
+        TmdbClient::new(
+            http(),
+            TmdbSettings {
+                cache_dir: Some(dir.clone()),
+                empty_search_ttl: ttl,
+                ..stub.fast_settings()
+            },
+        )
+    };
+    let week = Duration::from_secs(7 * 24 * 60 * 60);
+    assert_eq!(TmdbSettings::default().empty_search_ttl, week);
+    let search = |client: TmdbClient| async move {
+        let api = client.api(None).unwrap();
+        api.get_json("/search/movie", &[("query", "Lantern")])
+            .await
+            .unwrap();
+        api.get_json("/search/tv", &[("query", "Lantern")])
+            .await
+            .unwrap();
+    };
+    search(client(week)).await;
+    search(client(week)).await;
+    assert_eq!(stub.hits().len(), 2, "both kept within the week");
+    // Once the empty answer is older than its time, only it is asked again
+    search(client(Duration::ZERO)).await;
+    assert_eq!(stub.hits_for("/search/movie").len(), 1);
+    assert_eq!(stub.hits_for("/search/tv").len(), 2);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// An admin's manual search (Identify) always asks TMDb, and keeps its answer for the scans.
+#[tokio::test]
+async fn r3meta_a_manual_search_asks_again_and_is_kept() {
+    let stub = search_stub().await;
+    let client = TmdbClient::new(http(), stub.fast_settings());
+    let api = client.api(None).unwrap();
+    let query = [("query", "Lantern")];
+    api.get_json("/search/movie", &query).await.unwrap();
+    api.get_json_fresh("/search/movie", &query).await.unwrap();
+    api.get_json_fresh("/search/movie", &query).await.unwrap();
+    assert_eq!(stub.hits_for("/search/movie").len(), 3);
+    api.get_json("/search/movie", &query).await.unwrap();
+    assert_eq!(stub.hits_for("/search/movie").len(), 3);
+}
+
+/// "Replace all metadata" on an item with no TMDb id forgets the searches for its title, any
+/// year and any case, and only them.
+#[tokio::test]
+async fn r3meta_forgetting_a_title_asks_its_searches_again() {
+    let stub = search_stub().await;
+    let dir = std::env::temp_dir().join(format!("rf-tmdb-forget-{}", uuid::Uuid::new_v4()));
+    let client = TmdbClient::new(
+        http(),
+        TmdbSettings {
+            cache_dir: Some(dir.clone()),
+            ..stub.fast_settings()
+        },
+    );
+    let api = client.api(None).unwrap();
+    let lantern = [("query", "Lantern"), ("year", "2001")];
+    let other = [("query", "Harbor")];
+    api.get_json("/search/movie", &lantern).await.unwrap();
+    api.get_json("/search/movie", &other).await.unwrap();
+    client.forget_search(true, "Lantern").await;
+    api.get_json("/search/movie", &lantern).await.unwrap();
+    assert_eq!(
+        stub.hits_for("/search/movie").len(),
+        2,
+        "a TV forget keeps movies"
+    );
+
+    client.forget_search(false, " lantern ").await;
+    let restarted = TmdbClient::new(
+        http(),
+        TmdbSettings {
+            cache_dir: Some(dir.clone()),
+            ..stub.fast_settings()
+        },
+    );
+    let api = restarted.api(None).unwrap();
+    api.get_json("/search/movie", &lantern).await.unwrap();
+    api.get_json("/search/movie", &other).await.unwrap();
+    assert_eq!(stub.hits_for("/search/movie").len(), 3);
     std::fs::remove_dir_all(&dir).unwrap();
 }

@@ -483,7 +483,8 @@ async fn refresh_from_providers(
 }
 
 /// Forgets the providers' cached answers about a movie or series (a series' seasons included),
-/// by its TMDb id and its IMDb id, so that its next refresh asks them again: for an explicit
+/// by its TMDb id and its IMDb id, or the searches for its names when it has no TMDb id, so that
+/// its next refresh asks them again: for an explicit
 /// "replace all metadata" refresh, as Jellyfin's bypasses its cache. Nothing else forgets.
 pub async fn forget_cached_answers(
     pool: &SqlitePool,
@@ -502,11 +503,19 @@ pub async fn forget_cached_answers(
         None
     };
     for provider in &providers {
-        if let (Some(lookups), Some(id)) = (&provider.lookups, item.tmdb_id) {
-            lookups.forget(series, id);
+        if let Some(lookups) = &provider.lookups {
+            match item.tmdb_id {
+                Some(id) => lookups.forget(series, id).await,
+                // Not identified yet: its searches ask again
+                None => {
+                    for title in search_candidates(item) {
+                        lookups.forget_search(series, &title).await;
+                    }
+                }
+            }
         }
         if let (Some(lookups), Some(imdb_id)) = (&provider.imdb_lookups, &imdb_id) {
-            lookups.forget(imdb_id);
+            lookups.forget(imdb_id).await;
         }
     }
     Ok(())
