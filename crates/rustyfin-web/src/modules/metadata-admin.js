@@ -371,7 +371,8 @@ async function openMetadataEditor(id) {
         ${field('name', t('metadata.title'), item.Name, 'required')}
         <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
             ${field('originalTitle', t('metadata.original_title'), item.OriginalTitle)}
-            ${field('sortName', t('metadata.sort_title'), item.ForcedSortName)}
+            ${field('sortName', t('metadata.sort_title'), item.ForcedSortName,
+                item.ForcedSortName ? '' : `placeholder="${escapeHtml(item.SortName ?? '')}"`)}
         </div>
         <div><label class="${LABEL}" for="md-ed-overview">${escapeHtml(t('metadata.overview'))}</label>
             <textarea id="md-ed-overview" name="overview" rows="5" class="jf-input w-full">${escapeHtml(item.Overview || '')}</textarea></div>
