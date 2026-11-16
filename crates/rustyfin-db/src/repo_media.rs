@@ -319,6 +319,12 @@ pub async fn save_refresh_changes(
         read.popularity,
         updated.popularity,
     );
+    text_change(
+        &mut changes,
+        "tags",
+        Some(read.tags.join("|")),
+        Some(updated.tags.join("|")),
+    );
 
     if read.name != updated.name || read.sort_name != updated.sort_name {
         changes.push(RefreshChange::Names {
@@ -3593,15 +3599,149 @@ pub async fn is_field_locked(
     item_id: uuid::Uuid,
     field: &str,
 ) -> Result<bool, sqlx::Error> {
+    Ok(item_locks(pool, item_id).await?.locked(field))
+}
+
+/// An item's metadata locks: Jellyfin's LockData and LockedFields (MetadataField names such as
+/// "Name", "Overview", "Genres", "OfficialRating", "Cast", "Studios", "Tags").
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ItemLocks {
+    pub lock_data: bool,
+    pub fields: Vec<String>,
+}
+
+impl ItemLocks {
+    /// Whether a refresh may not change `field`: the whole item is locked, or the field is.
+    pub fn locked(&self, field: &str) -> bool {
+        self.lock_data || self.fields.iter().any(|f| f.eq_ignore_ascii_case(field))
+    }
+}
+
+/// An item's locks; none when it has no extras row.
+pub async fn item_locks(pool: &SqlitePool, item_id: uuid::Uuid) -> Result<ItemLocks, sqlx::Error> {
     let row: Option<(i64, String)> = sqlx::query_as(
         "SELECT lock_data, locked_fields FROM item_metadata_extras WHERE item_id = ?",
     )
     .bind(item_id.to_string())
     .fetch_optional(pool)
     .await?;
-    Ok(row.is_some_and(|(lock, fields)| {
-        lock != 0 || fields.split('|').any(|f| f.eq_ignore_ascii_case(field))
-    }))
+    Ok(row
+        .map(|(lock, fields)| ItemLocks {
+            lock_data: lock != 0,
+            fields: fields
+                .split('|')
+                .filter(|f| !f.is_empty())
+                .map(str::to_string)
+                .collect(),
+        })
+        .unwrap_or_default())
+}
+
+/// What an admin's metadata edit stores outside `media_items`: the original title, the critic
+/// rating and the locks.
+pub async fn save_item_extras_edit(
+    pool: &SqlitePool,
+    item_id: uuid::Uuid,
+    original_title: Option<&str>,
+    critic_rating: Option<f64>,
+    locks: &ItemLocks,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO item_metadata_extras (item_id, original_title, critic_rating, lock_data, \
+         locked_fields) VALUES (?, ?, ?, ?, ?) \
+         ON CONFLICT(item_id) DO UPDATE SET original_title = excluded.original_title, \
+         critic_rating = excluded.critic_rating, lock_data = excluded.lock_data, \
+         locked_fields = excluded.locked_fields",
+    )
+    .bind(item_id.to_string())
+    .bind(original_title)
+    .bind(critic_rating)
+    .bind(locks.lock_data)
+    .bind(locks.fields.join("|"))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Replaces an item's studios, as an admin's metadata edit lists them.
+pub async fn replace_item_studios(
+    pool: &SqlitePool,
+    item_id: uuid::Uuid,
+    names: &[String],
+) -> Result<(), sqlx::Error> {
+    let item = item_id.to_string();
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM item_studios WHERE item_id = ?")
+        .bind(&item)
+        .execute(&mut *tx)
+        .await?;
+    for name in names {
+        // The id a refresh gives the studio (`metadata::store_studios`)
+        let id = format!("studio-{}", name.to_lowercase().replace(' ', "-"));
+        sqlx::query(
+            "INSERT INTO studios (id, name) VALUES (?1, ?2) \
+             ON CONFLICT(id) DO UPDATE SET name = excluded.name",
+        )
+        .bind(&id)
+        .bind(name)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("INSERT OR IGNORE INTO item_studios (item_id, studio_id) VALUES (?, ?)")
+            .bind(&item)
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await
+}
+
+/// Sets an item's TMDb id, as an admin's Identify chose it. A new id drops the TVDb id that came
+/// with the old one.
+pub async fn set_tmdb_id(
+    pool: &SqlitePool,
+    item_id: uuid::Uuid,
+    tmdb_id: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE media_items SET tvdb_id = CASE WHEN tmdb_id IS ?1 THEN tvdb_id ELSE NULL END, \
+         tmdb_id = ?1 WHERE id = ?2",
+    )
+    .bind(tmdb_id)
+    .bind(item_id.to_string())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Clears what a "replace all metadata" refresh fills again from the providers and keeps no
+/// column for: the IMDb id, the studios (unless locked) and the people (unless "Cast" is locked).
+/// A locked item keeps all of them.
+pub async fn clear_replaceable_links(
+    pool: &SqlitePool,
+    item_id: uuid::Uuid,
+    locks: &ItemLocks,
+) -> Result<(), sqlx::Error> {
+    if locks.lock_data {
+        return Ok(());
+    }
+    let id = item_id.to_string();
+    sqlx::query("UPDATE item_metadata_extras SET imdb_id = NULL WHERE item_id = ?")
+        .bind(&id)
+        .execute(pool)
+        .await?;
+    if !locks.locked("Studios") {
+        sqlx::query("DELETE FROM item_studios WHERE item_id = ?")
+            .bind(&id)
+            .execute(pool)
+            .await?;
+    }
+    if !locks.locked("Cast") {
+        sqlx::query("DELETE FROM item_people WHERE item_id = ?")
+            .bind(&id)
+            .execute(pool)
+            .await?;
+    }
+    Ok(())
 }
 
 /// Get the last media added date for a folder (max date_created of children).

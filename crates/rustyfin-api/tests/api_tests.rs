@@ -3248,6 +3248,7 @@ const B124_WEB_MODULES: &[&str] = &[
     "jellyfin-import.js",
     "library-admin.js",
     "library.js",
+    "metadata-admin.js",
     "music.js",
     "player.js",
     "playerprefs.js",
@@ -14250,6 +14251,936 @@ impl G12Server {
     }
 }
 
+// R3 metadata: an admin's refresh modes, Identify, remote images, image upload and delete, and the
+// metadata editor's save, against the stub TMDb above (no live TMDb).
+
+impl G12Server {
+    /// The stub's requests to `path` so far.
+    fn hits_to(&self, path: &str) -> usize {
+        self.hits().iter().filter(|hit| hit.path == path).count()
+    }
+
+    async fn item(&self, id: uuid::Uuid) -> rustyfin_model::media::MediaItem {
+        rustyfin_db::repo_media::get_item_by_id(&self.db, id)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    async fn json(&self, method: &str, uri: &str, body: serde_json::Value) -> serde_json::Value {
+        let (status, text) = self.send(method, uri, Some(body.to_string())).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {text}");
+        serde_json::from_str(&text).unwrap()
+    }
+}
+
+#[tokio::test]
+async fn r3metadata_identify_lists_matches_and_applies_one() {
+    let server = g12_server(Some("r3-key"), None).await;
+    let id = server.insert_movie().await;
+    let search = serde_json::json!({
+        "SearchInfo": {"Name": "Alpha Film", "Year": 2001},
+        "ItemId": id.to_string(),
+    });
+    let results = server
+        .json("POST", "/Items/RemoteSearch/Movie", search.clone())
+        .await;
+    assert_eq!(results[0]["Name"], "Alpha Film", "{results}");
+    assert_eq!(results[0]["ProviderIds"]["Tmdb"], "9001");
+    assert_eq!(results[0]["SearchProviderName"], "TheMovieDb");
+    // The same search again comes from the TMDb client's cache
+    server
+        .json("POST", "/Items/RemoteSearch/Movie", search)
+        .await;
+    assert_eq!(server.hits_to("/search/movie"), 1);
+
+    // A TMDb id is looked up directly
+    let by_id = server
+        .json(
+            "POST",
+            "/Items/RemoteSearch/Movie",
+            serde_json::json!({"SearchInfo": {"Name": "x", "ProviderIds": {"Tmdb": "9001"}}}),
+        )
+        .await;
+    assert_eq!(by_id.as_array().unwrap().len(), 1, "{by_id}");
+    assert_eq!(by_id[0]["ProductionYear"], 2001);
+    assert_eq!(by_id[0]["PremiereDate"], "2001-05-04T00:00:00.0000000Z");
+    assert!(
+        by_id[0]["ImageUrl"]
+            .as_str()
+            .unwrap()
+            .ends_with("/g12-poster.jpg")
+    );
+    // A type TMDb has no search for gets none
+    let none = server
+        .json(
+            "POST",
+            "/Items/RemoteSearch/MusicAlbum",
+            serde_json::json!({"SearchInfo": {"Name": "Alpha Film"}}),
+        )
+        .await;
+    assert_eq!(none, serde_json::json!([]));
+
+    let (status, body) = server
+        .send(
+            "POST",
+            &format!("/Items/RemoteSearch/Apply/{id}"),
+            Some(by_id[0].to_string()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let item = server.item(id).await;
+    assert_eq!(item.tmdb_id, Some(9001));
+    assert_eq!(item.overview.as_deref(), Some("G12 stub overview"));
+    assert_eq!(item.official_rating.as_deref(), Some("PG-13"));
+    // The lookup, the apply's refresh and its images shared one details request
+    assert_eq!(server.hits_to("/movie/9001"), 1);
+
+    let (status, _) = server
+        .send(
+            "POST",
+            &format!("/Items/RemoteSearch/Apply/{id}"),
+            Some(serde_json::json!({"Name": "No ids"}).to_string()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn r3metadata_refresh_modes_follow_jellyfin_and_keep_locked_fields() {
+    let server = g12_server(Some("r3-key"), None).await;
+    let id = server.insert_movie().await;
+
+    // None asks no provider; an unknown mode is refused
+    let (status, _) = server
+        .send(
+            "POST",
+            &format!("/Items/{id}/Refresh?MetadataRefreshMode=None&ImageRefreshMode=None"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(server.hits().is_empty(), "{:?}", server.hits());
+    let (status, _) = server
+        .send(
+            "POST",
+            &format!("/Items/{id}/Refresh?MetadataRefreshMode=Sometimes"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // The admin's own values, the overview locked
+    let (status, body) = server
+        .send(
+            "POST",
+            &format!("/Items/{id}"),
+            Some(
+                serde_json::json!({
+                    "Overview": "My own overview",
+                    "OfficialRating": "R",
+                    "LockedFields": ["Overview"],
+                })
+                .to_string(),
+            ),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    // "Search for missing metadata" fills only what is missing
+    let missing = format!(
+        "/Items/{id}/Refresh?MetadataRefreshMode=FullRefresh&ImageRefreshMode=FullRefresh\
+         &ReplaceAllMetadata=false&ReplaceAllImages=false"
+    );
+    let (status, _) = server.send("POST", &missing, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let item = server.item(id).await;
+    assert_eq!(item.tmdb_id, Some(9001));
+    assert_eq!(item.official_rating.as_deref(), Some("R"));
+    assert_eq!(item.overview.as_deref(), Some("My own overview"));
+
+    // "Replace all metadata" replaces what isn't locked
+    let all = missing.replace("ReplaceAllMetadata=false", "ReplaceAllMetadata=true");
+    let (status, _) = server.send("POST", &all, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let item = server.item(id).await;
+    assert_eq!(item.official_rating.as_deref(), Some("PG-13"));
+    assert_eq!(item.overview.as_deref(), Some("My own overview"));
+    assert_eq!(item.production_year, Some(2001));
+
+    // The lock shows on the item, as Jellyfin Web's editor reads it
+    let (_, text) = server.send("GET", &format!("/Items/{id}"), None).await;
+    let dto: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        dto["LockedFields"],
+        serde_json::json!(["Overview"]),
+        "{dto}"
+    );
+
+    // A locked item keeps everything
+    server
+        .send(
+            "POST",
+            &format!("/Items/{id}"),
+            Some(serde_json::json!({"OfficialRating": "R", "LockData": true}).to_string()),
+        )
+        .await;
+    server.send("POST", &all, None).await;
+    assert_eq!(server.item(id).await.official_rating.as_deref(), Some("R"));
+}
+
+#[tokio::test]
+async fn r3metadata_update_item_saves_the_editor_fields() {
+    let server = g12_server(None, None).await;
+    let id = server.insert_movie().await;
+    let (status, body) = server
+        .send(
+            "POST",
+            &format!("/Items/{id}"),
+            Some(
+                serde_json::json!({
+                    "Name": "Edited Film",
+                    "OriginalTitle": "Film Original",
+                    "Overview": "Edited overview",
+                    "ProductionYear": 1999,
+                    "PremiereDate": "1999-03-31T00:00:00.0000000Z",
+                    "CommunityRating": 7.5,
+                    "CriticRating": 88,
+                    "OfficialRating": "PG",
+                    "Genres": ["Drama", "Comedy", "drama"],
+                    "Tags": ["favourite"],
+                    "LockData": false,
+                    "LockedFields": ["Name", "Genres"],
+                })
+                .to_string(),
+            ),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let (_, text) = server.send("GET", &format!("/Items/{id}"), None).await;
+    let dto: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(dto["Name"], "Edited Film", "{dto}");
+    assert_eq!(dto["OriginalTitle"], "Film Original");
+    assert_eq!(dto["Overview"], "Edited overview");
+    assert_eq!(dto["ProductionYear"], 1999);
+    assert!(
+        dto["PremiereDate"]
+            .as_str()
+            .unwrap()
+            .starts_with("1999-03-31")
+    );
+    assert_eq!(dto["CommunityRating"], 7.5);
+    assert_eq!(dto["CriticRating"], 88.0);
+    assert_eq!(dto["OfficialRating"], "PG");
+    assert_eq!(dto["Genres"], serde_json::json!(["Drama", "Comedy"]));
+    assert_eq!(dto["Tags"], serde_json::json!(["favourite"]));
+    assert_eq!(dto["LockedFields"], serde_json::json!(["Name", "Genres"]));
+    assert_eq!(dto["LockData"], false);
+
+    // A field the body leaves out stays; null clears one
+    server
+        .send(
+            "POST",
+            &format!("/Items/{id}"),
+            Some(serde_json::json!({"Overview": null}).to_string()),
+        )
+        .await;
+    let item = server.item(id).await;
+    assert_eq!(item.overview, None);
+    assert_eq!(item.name, "Edited Film");
+    assert_eq!(item.production_year, Some(1999));
+
+    let (status, _) = server
+        .send(
+            "POST",
+            &format!("/Items/{}", uuid::Uuid::new_v4()),
+            Some("{}".into()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn r3metadata_remote_images_download_and_replace() {
+    let server = r3md_server("ok", Some("r3-key")).await;
+    let id = server.insert_movie().await;
+    server.refresh(id).await;
+
+    let images = server
+        .json(
+            "GET",
+            &format!("/Items/{id}/RemoteImages"),
+            serde_json::Value::Null,
+        )
+        .await;
+    assert_eq!(images["TotalRecordCount"], 2, "{images}");
+    assert_eq!(images["Providers"], serde_json::json!(["TheMovieDb"]));
+    let first = &images["Images"][0];
+    assert_eq!(first["Type"], "Primary");
+    assert_eq!(first["ProviderName"], "TheMovieDb");
+    assert!(
+        first["Url"]
+            .as_str()
+            .unwrap()
+            .ends_with("/original/g12-poster.jpg")
+    );
+    assert!(
+        first["ThumbnailUrl"]
+            .as_str()
+            .unwrap()
+            .ends_with("/w300/g12-poster.jpg")
+    );
+    let backdrops = server
+        .json(
+            "GET",
+            &format!("/Items/{id}/RemoteImages?type=Backdrop&limit=5"),
+            serde_json::Value::Null,
+        )
+        .await;
+    assert_eq!(backdrops["TotalRecordCount"], 1, "{backdrops}");
+    let providers = server
+        .json(
+            "GET",
+            &format!("/Items/{id}/RemoteImages/Providers"),
+            serde_json::Value::Null,
+        )
+        .await;
+    assert_eq!(providers[0]["Name"], "TheMovieDb");
+
+    // The chosen image stays through a refresh, until one replaces all images
+    let chosen = format!("{}/t/p/original/r3-chosen.jpg", server.origin);
+    let (status, _) = server
+        .send(
+            "POST",
+            &format!("/Items/{id}/RemoteImages/Download?type=Primary&imageUrl={chosen}"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let primary = |images: Vec<rustyfin_model::image::ItemImage>| {
+        images
+            .into_iter()
+            .find(|image| {
+                image.image_type == rustyfin_model::image::ImageType::Primary
+                    && image.image_index == 0
+            })
+            .unwrap()
+    };
+    let stored = rustyfin_db::repo_image::get_images_for_item(&server.db, id)
+        .await
+        .unwrap();
+    let image = primary(stored);
+    assert_eq!(image.provider, "user");
+    // Downloaded once, now, and stored as a file
+    assert_eq!(
+        std::fs::read(&image.path).unwrap(),
+        b30_jpeg(4, 6, [1, 2, 3])
+    );
+    server.refresh(id).await;
+    let stored = rustyfin_db::repo_image::get_images_for_item(&server.db, id)
+        .await
+        .unwrap();
+    assert_eq!(primary(stored).provider, "user");
+    let (status, _) = server
+        .send(
+            "POST",
+            &format!(
+                "/Items/{id}/Refresh?MetadataRefreshMode=FullRefresh&ImageRefreshMode=FullRefresh\
+                 &ReplaceAllImages=true"
+            ),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let stored = rustyfin_db::repo_image::get_images_for_item(&server.db, id)
+        .await
+        .unwrap();
+    let image = primary(stored);
+    assert_eq!(image.provider, "tmdb");
+    assert!(image.path.ends_with("/g12-poster.jpg"));
+
+    let (status, _) = server
+        .send(
+            "POST",
+            &format!("/Items/{id}/RemoteImages/Download?type=Primary&imageUrl=file:///etc/passwd"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// A stub TMDb whose answers follow `mode`: "ok" (Alpha Film, 9001 and 9002), "fail" (500 for
+/// everything) or "empty" (no search match, 404 for every id). Its images are a small JPEG, and
+/// "/t/p/original/to-meta" and "to-lan" redirect to a cloud metadata address and to `lan`.
+async fn r3md_stub(mode: Arc<std::sync::Mutex<String>>, lan: String) -> String {
+    use axum::response::IntoResponse;
+    let handle = move |uri: axum::http::Uri| {
+        let mode = mode.lock().unwrap().clone();
+        let lan = lan.clone();
+        async move {
+            let path = uri.path().to_string();
+            if let Some(image) = path.strip_prefix("/t/p/original/") {
+                return match image {
+                    "to-meta" => axum::response::Redirect::temporary(
+                        "http://169.254.169.254/latest/meta-data/",
+                    )
+                    .into_response(),
+                    "to-lan" => {
+                        axum::response::Redirect::temporary(&format!("{lan}/x.jpg")).into_response()
+                    }
+                    "text.jpg" => "not an image".into_response(),
+                    _ => b30_jpeg(4, 6, [1, 2, 3]).into_response(),
+                };
+            }
+            if mode == "fail" {
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+            let body = match (mode.as_str(), path.as_str()) {
+                ("ok", "/3/search/movie") => {
+                    serde_json::json!({"results": [{"id": 9001, "title": "Alpha Film"}]})
+                }
+                ("empty", "/3/search/movie") => serde_json::json!({"results": []}),
+                ("ok", "/3/movie/9001" | "/3/movie/9002") => serde_json::json!({
+                    "id": 9001,
+                    "title": "Alpha Film",
+                    "overview": "G12 stub overview",
+                    "original_language": "en",
+                    "release_date": "2001-05-04",
+                    "imdb_id": "tt9001",
+                    "production_companies": [{"id": 5, "name": "G12 Pictures"}],
+                    "credits": {"cast": [{"id": 77, "name": "Dana Actor", "character": "Self",
+                                          "profile_path": "/g12-dana.jpg"}],
+                                "crew": []},
+                    "releases": {"countries": [{"iso_3166_1": "US", "certification": "PG-13"}]},
+                    "images": {
+                        "posters": [{"file_path": "/g12-poster.jpg"}],
+                        "backdrops": [{"file_path": "/g12-backdrop.jpg"}]
+                    }
+                }),
+                _ => return StatusCode::NOT_FOUND.into_response(),
+            };
+            axum::Json(body).into_response()
+        }
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let stub = axum::Router::new().fallback(handle);
+    tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
+    origin
+}
+
+/// A "LAN host": answers every request with an image and counts them.
+async fn r3md_lan() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    use axum::response::IntoResponse;
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = hits.clone();
+    let stub = axum::Router::new().fallback(move || {
+        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        async { b30_jpeg(4, 6, [9, 9, 9]).into_response() }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
+    (origin, hits)
+}
+
+/// A server whose TMDb is `r3md_stub` in `mode`, with `key` as its env key, no retries.
+async fn r3md_server(mode: &str, key: Option<&str>) -> G12Server {
+    r3md_server_with(
+        Arc::new(std::sync::Mutex::new(mode.to_string())),
+        key,
+        String::new(),
+    )
+    .await
+}
+
+async fn r3md_server_with(
+    mode: Arc<std::sync::Mutex<String>>,
+    key: Option<&str>,
+    lan: String,
+) -> G12Server {
+    use rustyfin_core::tmdb_client::{TmdbClient, TmdbKey, TmdbSettings};
+    let origin = r3md_stub(mode, lan).await;
+    let mut state = test_state().await;
+    let settings = TmdbSettings {
+        api_base_url: format!("{origin}/3"),
+        image_base_url: format!("{origin}/t/p/original"),
+        env_key: key.and_then(TmdbKey::new),
+        min_interval: std::time::Duration::from_millis(1),
+        max_retries: 0,
+        ..TmdbSettings::default()
+    };
+    let http = reqwest::Client::builder().no_proxy().build().unwrap();
+    state.tmdb = TmdbClient::new(http, settings);
+    state.plugin_manager = state.plugin_manager.with_database(state.db.clone());
+    rustyfin_core::plugin_manager::install_tmdb_plugin(&state.plugin_manager, state.tmdb.clone())
+        .await;
+    let username = format!("admin_{}", uuid::Uuid::new_v4().simple());
+    rustyfin_auth::create_initial_user(&state.db, &username, "admin")
+        .await
+        .unwrap();
+    let user = rustyfin_db::repo_user::get_user_by_name(&state.db, &username)
+        .await
+        .unwrap()
+        .unwrap();
+    let token = rustyfin_auth::create_token(&state.db, &user, &Default::default())
+        .await
+        .unwrap();
+    G12Server {
+        origin,
+        hits: G12Hits::default(),
+        token,
+        db: state.db.clone(),
+        data_dir: state.data_dir.clone(),
+        image_cache: state.image_cache.clone(),
+        app: app(state),
+    }
+}
+
+/// The admin's metadata on a movie: an overview, a rating, a genre, a person, a studio, an IMDb
+/// id, a chosen image and (`tmdb`) a TMDb id.
+async fn r3md_seed(server: &G12Server, tmdb: Option<i64>) -> uuid::Uuid {
+    let id = server.insert_movie().await;
+    sqlx::query(
+        "UPDATE media_items SET overview = 'Old overview', official_rating = 'R', \
+         genres = 'Drama', tmdb_id = ? WHERE id = ?",
+    )
+    .bind(tmdb)
+    .bind(id.to_string())
+    .execute(&server.db)
+    .await
+    .unwrap();
+    let person = rustyfin_model::metadata::MetadataPerson {
+        name: "Old Actor".into(),
+        kind: "Actor".into(),
+        role: None,
+        image_url: None,
+    };
+    rustyfin_db::repo_person::set_item_people_if_none(&server.db, id, &[person])
+        .await
+        .unwrap();
+    rustyfin_db::repo_media::replace_item_studios(&server.db, id, &["Old Studio".into()])
+        .await
+        .unwrap();
+    rustyfin_db::repo_media::set_imdb_id_if_missing(&server.db, id, "tt0001")
+        .await
+        .unwrap();
+    let image = rustyfin_model::image::ItemImage {
+        item_id: id,
+        image_type: rustyfin_model::image::ImageType::Primary,
+        image_index: 0,
+        path: "/r3/old-primary.jpg".into(),
+        provider: "user".into(),
+        width: None,
+        height: None,
+        blurhash: None,
+        stamp: None,
+    };
+    rustyfin_db::repo_image::upsert_image(&server.db, &image)
+        .await
+        .unwrap();
+    id
+}
+
+/// What `r3md_seed` stored: (overview, rating, tmdb id, people, studios, IMDb id, images).
+async fn r3md_kept(
+    server: &G12Server,
+    id: uuid::Uuid,
+) -> (
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    i64,
+    i64,
+    String,
+    usize,
+) {
+    let item = server.item(id).await;
+    let count = |sql: &'static str| {
+        let db = server.db.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(sql)
+                .bind(id.to_string())
+                .fetch_one(&db)
+                .await
+                .unwrap()
+        }
+    };
+    let imdb: Option<String> =
+        sqlx::query_scalar("SELECT imdb_id FROM item_metadata_extras WHERE item_id = ?")
+            .bind(id.to_string())
+            .fetch_one(&server.db)
+            .await
+            .unwrap();
+    let images = rustyfin_db::repo_image::get_images_for_item(&server.db, id)
+        .await
+        .unwrap()
+        .len();
+    (
+        item.overview,
+        item.official_rating,
+        item.tmdb_id,
+        count("SELECT COUNT(*) FROM item_people WHERE item_id = ?").await,
+        count("SELECT COUNT(*) FROM item_studios WHERE item_id = ?").await,
+        imdb.unwrap_or_default(),
+        images,
+    )
+}
+
+#[tokio::test]
+async fn r3metadata_replace_all_keeps_everything_when_the_provider_does_not_answer() {
+    let replace_all = "MetadataRefreshMode=FullRefresh&ImageRefreshMode=FullRefresh\
+                       &ReplaceAllMetadata=true&ReplaceAllImages=true";
+    // The provider fails, has no key, or (for an item it must search) finds no match
+    for (mode, key, tmdb) in [
+        ("fail", Some("r3-key"), Some(9001)),
+        ("ok", None, Some(9001)),
+        ("empty", Some("r3-key"), None),
+        ("empty", Some("r3-key"), Some(9001)),
+    ] {
+        let server = r3md_server(mode, key).await;
+        let id = r3md_seed(&server, tmdb).await;
+        let before = r3md_kept(&server, id).await;
+        assert_eq!(before.3, 1, "seeded");
+        let (status, body) = server
+            .send("POST", &format!("/Items/{id}/Refresh?{replace_all}"), None)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{mode}: {body}");
+        assert_eq!(
+            r3md_kept(&server, id).await,
+            before,
+            "{mode} {key:?} {tmdb:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn r3metadata_apply_keeps_the_old_id_and_data_when_the_provider_does_not_answer() {
+    for (mode, key, status) in [
+        ("fail", Some("r3-key"), StatusCode::BAD_GATEWAY),
+        ("empty", Some("r3-key"), StatusCode::BAD_REQUEST),
+        ("ok", None, StatusCode::SERVICE_UNAVAILABLE),
+    ] {
+        let server = r3md_server(mode, key).await;
+        let id = r3md_seed(&server, Some(9001)).await;
+        let before = r3md_kept(&server, id).await;
+        let result = serde_json::json!({"Name": "Other", "ProviderIds": {"Tmdb": "9002"}});
+        let (got, body) = server
+            .send(
+                "POST",
+                &format!("/Items/RemoteSearch/Apply/{id}"),
+                Some(result.to_string()),
+            )
+            .await;
+        assert_eq!(got, status, "{mode}: {body}");
+        assert_eq!(r3md_kept(&server, id).await, before, "{mode}");
+    }
+    // Once the provider answers, the new id and its metadata replace the old
+    let server = r3md_server("ok", Some("r3-key")).await;
+    let id = r3md_seed(&server, Some(9001)).await;
+    let result = serde_json::json!({"Name": "Alpha Film", "ProviderIds": {"Tmdb": "9002"}});
+    let (got, body) = server
+        .send(
+            "POST",
+            &format!("/Items/RemoteSearch/Apply/{id}"),
+            Some(result.to_string()),
+        )
+        .await;
+    assert_eq!(got, StatusCode::NO_CONTENT, "{body}");
+    let (overview, rating, tmdb, people, _, imdb, _) = r3md_kept(&server, id).await;
+    assert_eq!(overview.as_deref(), Some("G12 stub overview"));
+    assert_eq!(rating.as_deref(), Some("PG-13"));
+    assert_eq!((tmdb, people, imdb.as_str()), (Some(9002), 1, "tt9001"));
+}
+
+#[tokio::test]
+async fn r3metadata_clearing_links_keeps_a_locked_item_s() {
+    use rustyfin_db::repo_media::{ItemLocks, clear_replaceable_links};
+    let server = r3md_server("ok", None).await;
+    let id = r3md_seed(&server, None).await;
+    let before = r3md_kept(&server, id).await;
+    let locked = ItemLocks {
+        lock_data: true,
+        fields: Vec::new(),
+    };
+    clear_replaceable_links(&server.db, id, &locked)
+        .await
+        .unwrap();
+    assert_eq!(r3md_kept(&server, id).await, before);
+    // A locked Cast keeps the people only
+    let cast = ItemLocks {
+        lock_data: false,
+        fields: vec!["Cast".into()],
+    };
+    clear_replaceable_links(&server.db, id, &cast)
+        .await
+        .unwrap();
+    let (.., people, studios, imdb, _) = r3md_kept(&server, id).await;
+    assert_eq!((people, studios, imdb.as_str()), (1, 0, ""));
+}
+
+#[tokio::test]
+async fn r3metadata_download_fetches_only_from_the_image_provider() {
+    let (lan, lan_hits) = r3md_lan().await;
+    let mode = Arc::new(std::sync::Mutex::new("ok".to_string()));
+    let server = r3md_server_with(mode, Some("r3-key"), lan.clone()).await;
+    let id = server.insert_movie().await;
+    let download = |url: String| {
+        let uri = format!(
+            "/Items/{id}/RemoteImages/Download?type=Primary&imageUrl={}",
+            urlencoding(&url)
+        );
+        let server = &server;
+        async move { server.send("POST", &uri, None).await.0 }
+    };
+    for (url, status) in [
+        (
+            "http://169.254.169.254/latest/meta-data/".to_string(),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "http://127.0.0.1:9/x.jpg".to_string(),
+            StatusCode::BAD_REQUEST,
+        ),
+        (format!("{lan}/x.jpg"), StatusCode::BAD_REQUEST),
+        (
+            "http://192.168.1.10/x.jpg".to_string(),
+            StatusCode::BAD_REQUEST,
+        ),
+        ("file:///etc/passwd".to_string(), StatusCode::BAD_REQUEST),
+        // An allowed host that redirects elsewhere is not followed
+        (
+            format!("{}/t/p/original/to-meta", server.origin),
+            StatusCode::BAD_GATEWAY,
+        ),
+        (
+            format!("{}/t/p/original/to-lan", server.origin),
+            StatusCode::BAD_GATEWAY,
+        ),
+        (
+            format!("{}/t/p/original/text.jpg", server.origin),
+            StatusCode::BAD_GATEWAY,
+        ),
+    ] {
+        assert_eq!(download(url.clone()).await, status, "{url}");
+    }
+    assert_eq!(lan_hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(
+        rustyfin_db::repo_image::get_images_for_item(&server.db, id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let ok = format!("{}/t/p/original/chosen.jpg", server.origin);
+    assert_eq!(download(ok).await, StatusCode::NO_CONTENT);
+    let stored = rustyfin_db::repo_image::get_images_for_item(&server.db, id)
+        .await
+        .unwrap();
+    assert_eq!(stored.len(), 1);
+    assert!(
+        stored[0]
+            .path
+            .starts_with(&*server.data_dir.to_string_lossy())
+    );
+}
+
+/// `text` percent-encoded for a query value.
+fn urlencoding(text: &str) -> String {
+    text.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn r3metadata_upload_takes_5_mb_and_refuses_a_non_image() {
+    use base64::Engine;
+    let server = g12_server(None, None).await;
+    let id = server.insert_movie().await;
+    let mut picture = b30_jpeg(4, 6, [10, 20, 30]);
+    picture.resize(5 * 1024 * 1024, 0);
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&picture);
+    let (status, body) = server
+        .send(
+            "POST",
+            &format!("/Items/{id}/Images/Primary"),
+            Some(encoded),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    for junk in ["hello", "aGVsbG8="] {
+        let (status, _) = server
+            .send(
+                "POST",
+                &format!("/Items/{id}/Images/Primary"),
+                Some(junk.into()),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{junk}");
+    }
+}
+
+#[tokio::test]
+async fn r3metadata_editor_sort_name_people_and_studios() {
+    let server = g12_server(None, None).await;
+    let id = server.insert_movie().await;
+    let save = |body: serde_json::Value| {
+        let server = &server;
+        async move {
+            let (status, text) = server
+                .send("POST", &format!("/Items/{id}"), Some(body.to_string()))
+                .await;
+            assert_eq!(status, StatusCode::NO_CONTENT, "{text}");
+        }
+    };
+    save(serde_json::json!({"ForcedSortName": "film, alpha"})).await;
+    assert_eq!(
+        server.item(id).await.sort_name.as_deref(),
+        Some("film, alpha")
+    );
+    // An empty one clears it back to the name's
+    save(serde_json::json!({"ForcedSortName": ""})).await;
+    assert_eq!(
+        server.item(id).await.sort_name.as_deref(),
+        Some("alpha film")
+    );
+    save(serde_json::json!({
+        "People": [{"Name": "Dana Actor", "Role": "Self", "Type": "Actor"},
+                   {"Name": "Rob Director", "Type": "Director"}],
+        "Studios": [{"Name": "R3 Pictures", "Id": "x"}],
+    }))
+    .await;
+    let (_, text) = server.send("GET", &format!("/Items/{id}"), None).await;
+    let dto: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let people: Vec<_> = dto["People"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| (p["Name"].clone(), p["Type"].clone()))
+        .collect();
+    assert_eq!(
+        people,
+        [
+            (serde_json::json!("Dana Actor"), serde_json::json!("Actor")),
+            (
+                serde_json::json!("Rob Director"),
+                serde_json::json!("Director")
+            )
+        ],
+        "{dto}"
+    );
+    assert_eq!(dto["Studios"][0]["Name"], "R3 Pictures", "{dto}");
+    // An empty list clears them
+    save(serde_json::json!({"People": [], "Studios": []})).await;
+    let (_, text) = server.send("GET", &format!("/Items/{id}"), None).await;
+    let dto: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert!(dto["People"].as_array().is_none_or(Vec::is_empty), "{dto}");
+    assert!(dto["Studios"].as_array().is_none_or(Vec::is_empty), "{dto}");
+}
+
+#[tokio::test]
+async fn r3metadata_upload_takes_base64_and_delete_answers_204() {
+    use base64::Engine;
+    let server = g12_server(None, None).await;
+    let id = server.insert_movie().await;
+    let picture = b30_jpeg(4, 6, [10, 20, 30]);
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&picture);
+    for _ in 0..2 {
+        let (status, body) = server
+            .send(
+                "POST",
+                &format!("/Items/{id}/Images/Backdrop"),
+                Some(encoded.clone()),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let backdrops: Vec<_> = rustyfin_db::repo_image::get_images_for_item(&server.db, id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|image| image.image_type == rustyfin_model::image::ImageType::Backdrop)
+        .collect();
+    assert_eq!(backdrops.len(), 2, "a backdrop is added: {backdrops:?}");
+    let saved = std::fs::read(&backdrops[0].path).unwrap();
+    assert_eq!(saved, picture, "the upload is stored decoded");
+
+    let (status, _) = server
+        .send(
+            "DELETE",
+            &format!("/Items/{id}/Images/Backdrop?imageIndex=1"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let left = rustyfin_db::repo_image::get_images_for_item(&server.db, id)
+        .await
+        .unwrap();
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].image_index, 0);
+    let (status, _) = server
+        .send("DELETE", &format!("/Items/{id}/Images/Backdrop"), None)
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = server
+        .send(
+            "DELETE",
+            &format!("/Items/{}/Images/Primary", uuid::Uuid::new_v4()),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn r3metadata_tools_are_admin_only() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, viewer, _) = g1_owner_and_viewer(&state, &app).await;
+    let item = uuid::Uuid::new_v4();
+    let search = Some(serde_json::json!({"SearchInfo": {"Name": "Alpha"}}));
+    let routes = [
+        (
+            "POST",
+            format!("/Items/{item}"),
+            Some(serde_json::json!({})),
+            true,
+        ),
+        (
+            "POST",
+            "/Items/RemoteSearch/Movie".to_string(),
+            search.clone(),
+            true,
+        ),
+        (
+            "POST",
+            format!("/Items/RemoteSearch/Apply/{item}"),
+            search,
+            true,
+        ),
+        ("GET", format!("/Items/{item}/RemoteImages"), None, true),
+        (
+            "GET",
+            format!("/Items/{item}/RemoteImages/Providers"),
+            None,
+            true,
+        ),
+        (
+            "POST",
+            format!(
+                "/Items/{item}/RemoteImages/Download?type=Primary&imageUrl=https://x.test/a.jpg"
+            ),
+            None,
+            true,
+        ),
+    ];
+    g1_check_admin_routes(&app, &routes, &owner, &viewer).await;
+}
+
 #[tokio::test]
 async fn test_g12_env_tmdb_key_not_in_configuration() {
     let server = g12_server(Some(G12_ENV_KEY), None).await;
@@ -23400,6 +24331,13 @@ fn r3item_detail() {
 #[test]
 fn r3item_play() {
     b124_node_test("r3item_play.mjs");
+}
+
+// R3 metadata: the admin's refresh, Identify, image and metadata editor dialogs in the web client
+// (tests/web/r3metadata_admin.mjs)
+#[test]
+fn r3metadata_web() {
+    b124_node_test("r3metadata_admin.mjs");
 }
 
 // The web client's cards: badges, played, favourite and menu buttons, the context menu, likes

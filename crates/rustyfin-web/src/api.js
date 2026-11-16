@@ -435,7 +435,47 @@ const API = {
     },
     deleteItem(id) { return this.del(`/Items/${id}`); },
     // The server answers only when the refresh is done; a slow one ends in a TimeoutError, and the server keeps going
-    refreshItem(id) { return this.post(`/Items/${id}/Refresh`, undefined, { signal: AbortSignal.timeout(120000) }); },
+    // options: Jellyfin's MetadataRefreshMode, ImageRefreshMode, ReplaceAllMetadata and ReplaceAllImages
+    refreshItem(id, options) {
+        const q = options ? '?' + new URLSearchParams(options).toString() : '';
+        return this.post(`/Items/${id}/Refresh${q}`, undefined, { signal: AbortSignal.timeout(120000) });
+    },
+
+    // Admin metadata tools (Jellyfin's identify, image editor and metadata editor)
+    remoteSearch(type, searchInfo, itemId) {
+        return this.post(`/Items/RemoteSearch/${type}`, { SearchInfo: searchInfo, ItemId: itemId });
+    },
+    applySearchResult(id, result, replaceAllImages) {
+        return this.post(`/Items/RemoteSearch/Apply/${id}?ReplaceAllImages=${!!replaceAllImages}`, result,
+            { signal: AbortSignal.timeout(120000) });
+    },
+    getItemImages(id) { return this.get(`/Items/${id}/Images`); },
+    getRemoteImages(id, params = {}) {
+        return this.get(`/Items/${id}/RemoteImages?` + new URLSearchParams(params).toString());
+    },
+    downloadRemoteImage(id, type, imageUrl) {
+        return this.post(`/Items/${id}/RemoteImages/Download?` + new URLSearchParams({ type, imageUrl }).toString());
+    },
+    deleteItemImage(id, type, index) {
+        return this.del(`/Items/${id}/Images/${type}?imageIndex=${encodeURIComponent(index)}`);
+    },
+    // The picture goes base64-encoded with its own type, as Jellyfin Web sends it
+    async uploadItemImage(id, type, file) {
+        const data = await new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(String(reader.result).split(',')[1] || '');
+            reader.onerror = () => reject(reader.error);
+            reader.readAsDataURL(file);
+        });
+        const path = `/Items/${id}/Images/${type}`;
+        const res = await fetch(this.base + path, {
+            method: 'POST',
+            headers: { ...this.headers(), 'Content-Type': file.type || 'image/jpeg' },
+            body: data,
+        });
+        if (!res.ok) throw await this._requestError('POST', path, res);
+    },
+    updateItem(id, fields) { return this.post(`/Items/${id}`, fields); },
 
     // User Items
     getUserItems(params = {}) {

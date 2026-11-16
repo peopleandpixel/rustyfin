@@ -96,6 +96,49 @@ pub trait MetadataLookups: Send + Sync {
     fn series_by_id(&self, id: i64) -> LookupFuture<'_, ExternalMetadata>;
     fn search_series(&self, name: &str, year: Option<i32>) -> LookupFuture<'_, ExternalMetadata>;
     fn season(&self, series_id: i64, season_number: i32) -> LookupFuture<'_, SeasonMetadata>;
+    /// Every match of a name search, for an admin's Identify (`series` picks the TV search).
+    /// A provider without a list search answers with none.
+    fn search_all(
+        &self,
+        series: bool,
+        name: &str,
+        year: Option<i32>,
+    ) -> LookupFuture<'_, Vec<RemoteSearchHit>> {
+        let _ = (series, name, year);
+        Box::pin(async { Ok(Some(Vec::new())) })
+    }
+    /// Every image the provider has for a movie's or series' id, for an admin's image editor.
+    fn images(&self, series: bool, id: i64) -> LookupFuture<'_, Vec<RemoteImage>> {
+        let _ = (series, id);
+        Box::pin(async { Ok(Some(Vec::new())) })
+    }
+}
+
+/// One match of a provider search: Jellyfin's RemoteSearchResult, with the provider's own id.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RemoteSearchHit {
+    pub id: i64,
+    pub name: String,
+    pub production_year: Option<i32>,
+    /// `YYYY-MM-DD`
+    pub premiere_date: Option<String>,
+    pub overview: Option<String>,
+    pub image_url: Option<String>,
+}
+
+/// One image a provider offers: Jellyfin's RemoteImageInfo.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RemoteImage {
+    /// Jellyfin's ImageType: "Primary", "Backdrop", "Logo"
+    pub image_type: String,
+    pub url: String,
+    pub thumbnail_url: Option<String>,
+    pub width: Option<i32>,
+    pub height: Option<i32>,
+    /// ISO 639-1, or none for an image without text
+    pub language: Option<String>,
+    pub community_rating: Option<f64>,
+    pub vote_count: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

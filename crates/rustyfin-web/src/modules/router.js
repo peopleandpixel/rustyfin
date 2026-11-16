@@ -26,6 +26,7 @@ import {
     folderBrowserSelect, closeFolderBrowser, addLibraryPathRow, removeLibraryPathRow, initScanProgressWebSocket,
 } from './library-admin.js';
 import { openPluginConfig, openPluginPriority } from './plugins.js';
+import { openRefreshDialog, openIdentifyDialog, openImageEditor, openMetadataEditor } from './metadata-admin.js';
 let currentPage = 'home';
 
 // --- Navigation & Routing ---
@@ -97,7 +98,8 @@ function startScanWithToast(request, startedMessage) {
 }
 
 // The refresh answers only when the server has finished, so the button stays busy until then, and the open page is re-rendered from fresh data.
-async function refreshItemMetadata(button, id) {
+// `options` is the refresh dialog's query (Jellyfin's refresh modes).
+async function refreshItemMetadata(button, id, options) {
     if (button.disabled) return;
     const busy = t('detail.metadata_refreshing');
     button.disabled = true;
@@ -106,7 +108,7 @@ async function refreshItemMetadata(button, id) {
     button.setAttribute('aria-label', busy);
     button.setAttribute('title', busy);
     try {
-        await API.refreshItem(id);
+        await API.refreshItem(id, options);
         API.invalidateCache('/Items');
         API.invalidateCache('/Shows');
         toast(t('detail.metadata_refreshed'));
@@ -161,7 +163,10 @@ const clickActions = {
     'toggle-favorite': el => toggleFavorite(el.dataset.id, el.dataset.favorite === 'true'),
     'toggle-played': el => togglePlayed(el.dataset.id, el.dataset.played === 'true', el.dataset.all === 'true'),
     'delete-item': el => deleteItemFromDetail(el.dataset),
-    'refresh-item': el => refreshItemMetadata(el, el.dataset.id),
+    'refresh-item': el => openRefreshDialog(options => refreshItemMetadata(el, el.dataset.id, options)),
+    'edit-metadata': el => openMetadataEditor(el.dataset.id),
+    'identify-item': el => openIdentifyDialog(el.dataset.id),
+    'edit-images': el => openImageEditor(el.dataset.id),
     'admin-tab': el => showAdminTab(el, el.dataset.tab),
     'delete-user': el => { if (confirm(t('admin.delete_user_confirm'))) API.deleteUser(el.dataset.id).then(() => renderAdmin()); },
     'set-user-admin': el => setUserPolicy(el, { IsAdministrator: el.checked }),
