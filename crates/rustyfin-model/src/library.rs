@@ -3,13 +3,33 @@ use uuid::Uuid;
 
 use crate::media::MediaType;
 
+/// A library's kind. Read from Rustyfin's names (`Photos`) or Jellyfin's collection types
+/// (`homevideos`, `HomeVideos`, `photos`, ...) in any case; written as Rustyfin's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String")]
 pub enum LibraryContentType {
     Movies,
     TvShows,
     Music,
     Photos,
     Mixed,
+}
+
+impl TryFrom<String> for LibraryContentType {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        match value.to_ascii_lowercase().as_str() {
+            "movies" => Ok(Self::Movies),
+            "tvshows" => Ok(Self::TvShows),
+            "music" => Ok(Self::Music),
+            "photos" | "homevideos" => Ok(Self::Photos),
+            "mixed" => Ok(Self::Mixed),
+            _ => Err(format!(
+                "unknown library type \"{value}\": expected Movies, TvShows, Music, HomeVideos (Photos) or Mixed"
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -197,6 +217,23 @@ impl LibraryContentType {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn content_type_reads_jellyfin_collection_types() {
+        let read = |s: &str| serde_json::from_value::<LibraryContentType>(serde_json::json!(s));
+        for name in ["HomeVideos", "homevideos", "Photos", "photos"] {
+            assert_eq!(read(name).unwrap(), LibraryContentType::Photos, "{name}");
+        }
+        assert_eq!(read("tvshows").unwrap(), LibraryContentType::TvShows);
+        assert_eq!(read("MOVIES").unwrap(), LibraryContentType::Movies);
+        assert_eq!(read("Mixed").unwrap(), LibraryContentType::Mixed);
+        assert!(read("books").is_err());
+        // Written as before
+        assert_eq!(
+            serde_json::to_value(LibraryContentType::Photos).unwrap(),
+            "Photos"
+        );
+    }
 
     #[test]
     fn r2chapters_options_take_either_name_and_prefer_jellyfins() {

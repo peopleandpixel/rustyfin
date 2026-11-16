@@ -718,7 +718,10 @@ async fn restamp_local_images(
 
 /// `batch_upsert_media_items`, tried again while another writer holds the lock: it is one
 /// transaction, so a try that failed wrote nothing.
-async fn upsert_items(pool: &SqlitePool, items: &[MediaItem]) -> Result<(), sqlx::Error> {
+pub(crate) async fn upsert_items(
+    pool: &SqlitePool,
+    items: &[MediaItem],
+) -> Result<(), sqlx::Error> {
     rustyfin_db::busy::retry_busy("saving scanned items", || {
         rustyfin_db::repo_media::batch_upsert_media_items(pool, items)
     })
@@ -1236,7 +1239,16 @@ async fn scan_flat_library(
     );
 
     // Remove the items that this scan no longer collects. A failure is logged, not returned.
-    let removed = remove_uncollected(pool, library, &filter, &collected, &unreadable, &loops).await;
+    let mut removed =
+        remove_uncollected(pool, library, &filter, &collected, &unreadable, &loops).await;
+    // A photo or mixed library's subfolders, as Jellyfin's Folder items. A failure is logged, not returned.
+    match crate::scan_folders::sync_folders(pool, library).await {
+        Ok((added, deleted)) => {
+            count += added;
+            removed += deleted;
+        }
+        Err(e) => tracing::error!("failed to save the folders of '{}': {e}", library.name),
+    }
     spawn_plans_under_lock(
         pool.clone(),
         guard,

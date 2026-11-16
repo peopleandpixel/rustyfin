@@ -26890,6 +26890,186 @@ async fn r3photos_view_names(app: &axum::Router, token: &str, uri: &str) -> Vec<
         .collect()
 }
 
+/// The names, types and ids of the items `uri` lists, in order
+async fn r3photos_list(
+    app: &axum::Router,
+    token: &str,
+    uri: &str,
+) -> Vec<(String, String, String)> {
+    let (status, body) = send_authed(app, "GET", uri, token, None).await;
+    assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+    body["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| {
+            let s = |k: &str| i[k].as_str().unwrap_or_default().to_string();
+            (s("Name"), s("Type"), s("Id"))
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn r3photos_library_subfolders_are_folder_items() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let lib = create_library_via_api(&app, &state, &token, "R3PF", "Photos").await;
+    let root = std::path::PathBuf::from(media_folder(&state, "r3pf"));
+    for file in [
+        "top.jpg",
+        "Trips/2024/b.jpg",
+        "Trips/2024/a.jpg",
+        "Trips/c.jpg",
+    ] {
+        let path = root.join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"").unwrap();
+    }
+    std::fs::create_dir_all(root.join("Empty")).unwrap();
+    let refresh = format!("/Library/VirtualFolders/{lib}/Refresh");
+    let (status, body) = send_authed(&app, "POST", &refresh, &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // The library's top: its folder, then its photo; a folder with no media gets no item
+    let names = |list: &[(String, String, String)]| -> Vec<(String, String)> {
+        list.iter()
+            .map(|(n, t, _)| (n.clone(), t.clone()))
+            .collect()
+    };
+    let order = "SortBy=IsFolder,SortName&SortOrder=Ascending";
+    let top = r3photos_list(&app, &token, &format!("/Items?ParentId={lib}&{order}")).await;
+    assert_eq!(
+        names(&top),
+        [
+            ("Trips".into(), "Folder".into()),
+            ("top".into(), "Photo".into())
+        ]
+    );
+    let trips = top[0].2.clone();
+    let (_, folder) = send_authed(&app, "GET", &format!("/Items/{trips}"), &token, None).await;
+    assert_eq!(folder["IsFolder"], true);
+    assert_eq!(folder["Type"], "Folder");
+
+    let inside = r3photos_list(&app, &token, &format!("/Items?ParentId={trips}&{order}")).await;
+    assert_eq!(
+        names(&inside),
+        [
+            ("2024".into(), "Folder".into()),
+            ("c".into(), "Photo".into())
+        ]
+    );
+    let year = inside[0].2.clone();
+    let photos = r3photos_list(&app, &token, &format!("/Items?ParentId={year}&{order}")).await;
+    assert_eq!(
+        names(&photos),
+        [("a".into(), "Photo".into()), ("b".into(), "Photo".into())]
+    );
+    let (_, a) = send_authed(
+        &app,
+        "GET",
+        &format!("/Items/{}", photos[0].2),
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(a["ParentId"].as_str(), Some(year.as_str()));
+    // A folder's ancestors: the folders above it, nearest first, then the library
+    let ancestors = r3photos_list_plain(&app, &token, &format!("/Items/{year}/Ancestors")).await;
+    assert_eq!(ancestors[0], trips);
+    assert!(ancestors.contains(&lib.to_string()), "{ancestors:?}");
+    // Recursively, the library still lists every photo
+    let all = r3photos_list(
+        &app,
+        &token,
+        &format!("/Items?ParentId={lib}&Recursive=true&IncludeItemTypes=Photo"),
+    )
+    .await;
+    assert_eq!(all.len(), 4);
+
+    // A folder whose files are gone goes; the others keep their ids
+    std::fs::remove_dir_all(root.join("Trips/2024")).unwrap();
+    let (status, _) = send_authed(&app, "POST", &refresh, &token, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let top = r3photos_list(&app, &token, &format!("/Items?ParentId={lib}&{order}")).await;
+    assert_eq!(top[0].2, trips);
+    let inside = r3photos_list(&app, &token, &format!("/Items?ParentId={trips}&{order}")).await;
+    assert_eq!(names(&inside), [("c".into(), "Photo".into())]);
+    let (status, _) = send_authed(&app, "GET", &format!("/Items/{year}"), &token, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// The ids of the items `uri` answers with as a plain array
+async fn r3photos_list_plain(app: &axum::Router, token: &str, uri: &str) -> Vec<String> {
+    let (status, body) = send_authed(app, "GET", uri, token, None).await;
+    assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+    let items = body
+        .as_array()
+        .or_else(|| body["Items"].as_array())
+        .unwrap();
+    items
+        .iter()
+        .map(|i| i["Id"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn r3photos_movie_libraries_get_no_folder_items() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let lib = create_library_via_api(&app, &state, &token, "R3PM", "Movies").await;
+    let root = std::path::PathBuf::from(media_folder(&state, "r3pm"));
+    std::fs::create_dir_all(root.join("Some Film (2001)")).unwrap();
+    std::fs::write(root.join("Some Film (2001)/Some Film (2001).mkv"), b"").unwrap();
+    let refresh = format!("/Library/VirtualFolders/{lib}/Refresh");
+    let (status, body) = send_authed(&app, "POST", &refresh, &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let folders = r3photos_list(
+        &app,
+        &token,
+        &format!("/Items?ParentId={lib}&Recursive=true&IncludeItemTypes=Folder"),
+    )
+    .await;
+    assert!(folders.is_empty(), "{folders:?}");
+    let top = r3photos_list(&app, &token, &format!("/Items?ParentId={lib}")).await;
+    assert_eq!(top.len(), 1);
+    assert_eq!(top[0].1, "Movie");
+}
+
+#[tokio::test]
+async fn r3photos_library_type_homevideos_is_accepted() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    for (name, kind) in [("R3HV1", "HomeVideos"), ("R3HV2", "homevideos")] {
+        let body = serde_json::json!({
+            "Name": name,
+            "ContentType": kind,
+            "Paths": [media_folder(&state, &name.to_lowercase())],
+        })
+        .to_string();
+        let (status, created) =
+            send_authed(&app, "POST", "/Library/VirtualFolders", &token, Some(&body)).await;
+        assert_eq!(status, StatusCode::OK, "{kind}: {created}");
+        assert_eq!(created["ContentType"], "Photos", "{kind}");
+    }
+    let (_, views) = send_authed(&app, "GET", "/UserViews", &token, None).await;
+    let kinds: Vec<_> = views["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["CollectionType"].clone())
+        .collect();
+    assert_eq!(kinds, ["homevideos", "homevideos"]);
+    // A type Rustyfin doesn't have is still refused
+    let body = serde_json::json!({"Name": "R3HV3", "ContentType": "books", "Paths": [media_folder(&state, "r3hv3")]})
+        .to_string();
+    let (status, _) =
+        send_authed(&app, "POST", "/Library/VirtualFolders", &token, Some(&body)).await;
+    assert!(status.is_client_error(), "{status}");
+}
+
 #[tokio::test]
 async fn r3photos_home_settings_round_trip() {
     let state = test_state().await;

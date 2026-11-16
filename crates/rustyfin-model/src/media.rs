@@ -187,6 +187,9 @@ pub enum MediaType {
     /// A collection: Jellyfin's `BoxSet`.
     BoxSet,
     Playlist,
+    /// A subfolder of a photo, home videos or mixed library: Jellyfin's `Folder`. It has no file of
+    /// its own; its files and subfolders point at it through `parent_id`.
+    Folder,
     Unknown,
 }
 
@@ -207,6 +210,7 @@ impl std::str::FromStr for MediaType {
             "Genre" => Ok(MediaType::Genre),
             "BoxSet" => Ok(MediaType::BoxSet),
             "Playlist" => Ok(MediaType::Playlist),
+            "Folder" => Ok(MediaType::Folder),
             _ => Ok(MediaType::Unknown),
         }
     }
@@ -234,7 +238,7 @@ impl MediaType {
             MediaType::Genre => "Genre",
             MediaType::BoxSet => "BoxSet",
             MediaType::Playlist => "Playlist",
-            MediaType::Unknown => "Folder",
+            MediaType::Folder | MediaType::Unknown => "Folder",
         }
     }
 
@@ -246,7 +250,7 @@ impl MediaType {
             MediaType::Audio | MediaType::MusicAlbum | MediaType::MusicArtist => "Audio",
             MediaType::Photo => "Photo",
             MediaType::Genre | MediaType::BoxSet | MediaType::Playlist => "Unknown",
-            MediaType::Unknown => "Unknown",
+            MediaType::Folder | MediaType::Unknown => "Unknown",
         }
     }
 
@@ -260,6 +264,7 @@ impl MediaType {
                 | MediaType::Genre
                 | MediaType::BoxSet
                 | MediaType::Playlist
+                | MediaType::Folder
         )
     }
 }
