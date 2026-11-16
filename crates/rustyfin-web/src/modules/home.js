@@ -4,6 +4,7 @@ import { backdropUrl, createCardElement, sectionRow } from './cards.js';
 import { serverVersion } from './wizard.js';
 import { LIBRARY_PAGE_SIZE, setupInfiniteScroll, destroyInfiniteScroll } from './library.js';
 import { loadUserSettings, homeSections, showsInLatest } from './user-settings.js';
+import { containerTilesHtml, revealContainerTiles } from './collections.js';
 
 // --- Home Page Renderer ---
 
@@ -195,6 +196,7 @@ async function renderHome() {
                             </div>
                         </div>`;
                     }).join('')}
+                    ${containerTilesHtml()}
                 </div>
             </div>`;
         }
@@ -226,6 +228,7 @@ async function renderHome() {
 
         c += '</div>';
         page.innerHTML = c;
+        revealContainerTiles();
     } catch (e) {
         if (API.token !== session) return;
         page.innerHTML = `<div class="p-6 rounded-xl bg-red-500/10 border border-red-500/20 text-red-400 jf-page">${t('home.load_failed', { message: escapeHtml(e.message) })}</div>`;

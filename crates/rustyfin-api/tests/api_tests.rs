@@ -3243,6 +3243,7 @@ const B124_WEB_MODULES: &[&str] = &[
     "auth.js",
     "cardmenu.js",
     "cards.js",
+    "collections.js",
     "genres.js",
     "home.js",
     "item.js",
@@ -24675,6 +24676,13 @@ fn r3music_album() {
 #[test]
 fn r3music_tabs() {
     b124_node_test("r3music_tabs.mjs");
+}
+
+// R3 collections: the web client's collection and playlist lists, pages, Remove and reordering
+// (tests/web/r3collections_web.mjs)
+#[test]
+fn r3collections_web() {
+    b124_node_test("r3collections_web.mjs");
 }
 
 #[test]

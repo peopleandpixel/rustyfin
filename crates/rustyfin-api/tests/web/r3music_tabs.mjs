@@ -65,9 +65,9 @@ const songs = (start, count) => Array.from({ length: count }, (_, i) => ({
 
 test('the tabs are Jellyfin Web\'s, in its order, and each opens its route', () => {
     const { fns } = sandbox(() => ({}));
-    assert.deepEqual(plain(fns.MUSIC_TABS.map(([key]) => key)), ['albums', 'albumartists', 'artists', 'songs', 'genres']);
+    assert.deepEqual(plain(fns.MUSIC_TABS.map(([key]) => key)), ['albums', 'albumartists', 'artists', 'playlists', 'songs', 'genres']);
     const bar = fns.musicTabBar('lib1', 'songs');
-    for (const key of ['albums', 'albumartists', 'artists', 'songs', 'genres']) {
+    for (const key of ['albums', 'albumartists', 'artists', 'playlists', 'songs', 'genres']) {
         assert.ok(bar.includes(`data-action="navigate" data-page="library" data-id="lib1/${key}"`), key);
     }
     assert.match(bar, /aria-selected="true"[^>]*data-id="lib1\/songs"/);

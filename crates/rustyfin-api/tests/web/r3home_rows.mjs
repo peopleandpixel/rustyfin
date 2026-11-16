@@ -32,6 +32,9 @@ function sandbox(answers = {}, { libs = LIBS } = {}) {
         escapeHtml: s => String(s),
         scanRing: () => '',
         backdropUrl: () => '',
+        // collections.js's Collections and Playlists tiles
+        containerTilesHtml: () => '',
+        revealContainerTiles: () => {},
         serverVersion: '0',
         $: id => (id === 'page-home' ? page : null),
         libraries: [],

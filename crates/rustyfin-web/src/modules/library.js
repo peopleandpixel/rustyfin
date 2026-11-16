@@ -5,6 +5,7 @@ import { createCardElement, cardImage, bannerImage } from './cards.js';
 import { renderGenreRows, genreNameOf } from './genres.js';
 import { hashRoute } from './router.js';
 import { musicTab, rememberMusicTab, musicTabBar, renderMusicTab } from './music.js';
+import { KINDS, renderContainerPage, renderCollectionsTab } from './collections.js';
 let currentLibraryId = null;
 // The route shown (library/<this>): the library id, then a music library's tab and genre
 let currentLibraryRoute = null;
@@ -622,6 +623,13 @@ async function renderLibrary(route) {
     currentLibraryId = libId;
     currentLibraryRoute = route;
     const page = $('page-library');
+    // The Collections and Playlists views (library/collections, library/playlists): collections.js
+    if (KINDS[libId]) {
+        stopLibraryLoad();
+        destroyInfiniteScroll();
+        renderContainerPage(libId);
+        return;
+    }
     
     // Show skeleton grid immediately for instant visual feedback
     const lib = libraries.find(l => (l.id || l.Id) === libId);
@@ -645,6 +653,13 @@ async function renderLibrary(route) {
     if (videoTabs && tab === 'genres' && !sub) {
         stopLibraryLoad();
         renderGenreRows(libId, libName, contentType, libraryTabBar(libId, contentType, 'genres'));
+        return;
+    }
+    // A movie library's Collections tab: the collections holding its movies (collections.js)
+    if (contentType === 'Movies' && tab === 'collections') {
+        stopLibraryLoad();
+        destroyInfiniteScroll();
+        renderCollectionsTab(libId, libName, libraryTabBar(libId, contentType, 'collections'));
         return;
     }
     currentLibraryTab = videoTabs && tab === 'episodes' && contentType === 'TvShows' ? 'episodes' : '';
@@ -923,11 +938,13 @@ function libraryViewMenu(view) {
         + group(t('library.view_size'), 'lib-size', LIBRARY_SIZES, view.size);
 }
 
-// A movie or TV library's tabs (as music.js's): its list, Episodes for TV, and Genres
+// A movie or TV library's tabs (as music.js's): its list, Episodes for TV, Collections for movies
+// (Jellyfin Web's order), and Genres
 function libraryTabBar(libId, contentType, active) {
     const tabs = [
         ['main', libId, contentType === 'TvShows' ? 'library.tab_shows' : 'library.tab_movies'],
         ...(contentType === 'TvShows' ? [['episodes', `${libId}/episodes`, 'library.tab_episodes']] : []),
+        ...(contentType === 'Movies' ? [['collections', `${libId}/collections`, 'collections.collections']] : []),
         ['genres', `${libId}/genres`, 'library.tab_genres'],
     ];
     return `

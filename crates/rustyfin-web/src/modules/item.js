@@ -4,6 +4,7 @@ import { backdropUrl, createCardElement, sectionRow } from './cards.js';
 import { resumePositionTicks } from './player.js';
 import { navigate } from './router.js';
 import { albumTrackList } from './music.js';
+import { containerSectionHtml, renderContainerItems } from './collections.js';
 let currentDetailId = null;
 let activeItem = null;
 // The detail page's version, audio and subtitle choice: { itemId, sources, mediaSourceId, audioIndex,
@@ -535,6 +536,13 @@ async function renderDetail(itemId) {
                             <button class="jf-btn-ghost h-11 !py-0 w-11 !px-0 hover:!text-rose-400" title="${escapeHtml(t('detail.delete_item'))}" aria-label="${escapeHtml(t('detail.delete_item'))}" data-action="delete-item" data-id="${escapeHtml(id)}" data-name="${escapeHtml(name)}" data-type="${escapeHtml(type)}" data-parent-id="${escapeHtml(deleteParentId(item))}">
                                 ${icon('Trash2', { size: 18 })}
                             </button>` : ''}
+                            ${!API.isAdmin && type === 'Playlist' && item.CanDelete ? `
+                            <button class="jf-btn-ghost h-11 !py-0 w-11 !px-0 hover:!text-rose-400" title="${escapeHtml(t('detail.delete_item'))}" aria-label="${escapeHtml(t('detail.delete_item'))}" data-action="delete-item" data-id="${escapeHtml(id)}" data-name="${escapeHtml(name)}" data-type="${escapeHtml(type)}" data-parent-id="">
+                                ${icon('Trash2', { size: 18 })}
+                            </button>` : ''}
+                            <button class="jf-btn-ghost h-11 !py-0 w-11 !px-0" title="${escapeHtml(t('cards.more'))}" aria-label="${escapeHtml(t('cards.more'))}" aria-haspopup="menu" data-action="card-menu" data-id="${escapeHtml(id)}">
+                                ${icon('EllipsisVertical', { size: 18 })}
+                            </button>
                         </div>
                         ${detailChoice ? `<div id="detail-track-selects" class="flex flex-wrap gap-3 mt-4">${trackSelectsHtml(detailChoice)}</div>` : ''}
                     </div>
@@ -562,12 +570,16 @@ async function renderDetail(itemId) {
             <!-- Seasons / Episodes -->
             ${seasonsOrEpisodesHtml}
 
+            <!-- A collection's or playlist's items (collections.js) -->
+            ${containerSectionHtml(item)}
+
             <!-- Chapters -->
             ${canPlay && streamType === 'Videos' ? chaptersHtml(item) : ''}
 
             <!-- Similar Titles -->
             ${similarHtml}
         </div>`;
+        if (type === 'BoxSet' || type === 'Playlist') renderContainerItems(item);
     } catch (e) {
         if (API.token !== session) return;
         page.innerHTML = `<div class="p-6 rounded-xl bg-red-500/10 text-red-400">${escapeHtml(e.message)}</div>`;

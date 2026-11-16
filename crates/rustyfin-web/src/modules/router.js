@@ -16,6 +16,7 @@ import {
     openCardMenu, toggleCardPlayed, toggleCardFavorite, setCardLikes, playCardItem, openAddTo,
 } from './cardmenu.js';
 import { playAlbumFrom } from './music.js';
+import { playContainerFrom, removeFromContainer, openNewContainer } from './collections.js';
 import { renderSettings } from './settings.js';
 import {
     renderAdmin, showAdminTab, setUserPolicy, removeOidcLinkAsAdmin, copyOidcCallbackUrl, saveOidcAdminSettings,
@@ -160,6 +161,10 @@ const clickActions = {
     'card-play': el => playCardItem(el),
     'card-add-playlist': el => openAddTo(el, 'playlist'),
     'card-add-collection': el => openAddTo(el, 'collection'),
+    // Collections and playlists (collections.js)
+    'card-remove-from': el => removeFromContainer(el),
+    'playlist-play-from': el => playContainerFrom(el),
+    'new-container': el => openNewContainer(el),
     'toggle-favorite': el => toggleFavorite(el.dataset.id, el.dataset.favorite === 'true'),
     'toggle-played': el => togglePlayed(el.dataset.id, el.dataset.played === 'true', el.dataset.all === 'true'),
     'delete-item': el => deleteItemFromDetail(el.dataset),
