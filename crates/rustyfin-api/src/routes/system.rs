@@ -420,8 +420,9 @@ fn drop_computed_fields(config: &mut ServerConfiguration) {
 
 /// Jellyfin's named configuration `encoding` (`EncodingOptions`): Jellyfin 12.4.0's defaults with
 /// Rustyfin's ffmpeg and transcode folder, under what a client saved (`encoding.json` in the data
-/// directory). Fields Rustyfin doesn't know are kept as they came. Administrators only: it names
-/// the server's devices and paths. The transcoder acts on the fields
+/// directory). Fields Rustyfin doesn't know are kept as they came. Any signed-in user reads them,
+/// without the devices and paths (`PRIVATE_FIELDS`); only administrators save them, and a save
+/// with an invalid value is refused (`validate_options`). The transcoder acts on the fields
 /// `rustyfin_core::encoding::EncodingSettings` reads; the others are stored only.
 const ENCODING_KEY: &str = "encoding";
 
@@ -450,19 +451,17 @@ async fn encoding_options(
     Ok(options)
 }
 
-async fn encoding_configuration(state: &AppState) -> Result<serde_json::Value, ApiError> {
-    Ok(serde_json::Value::Object(encoding_options(state).await?))
-}
-
 async fn save_encoding_configuration(
     state: &AppState,
     body: serde_json::Value,
 ) -> Result<(), ApiError> {
-    if !body.is_object() {
+    let Some(options) = body.as_object() else {
         return Err(ApiError::BadRequest(
             "encoding: the body must be a JSON object".to_string(),
         ));
-    }
+    };
+    rustyfin_core::encoding::validate_options(options)
+        .map_err(|e| ApiError::BadRequest(format!("encoding: {e}")))?;
     ensure_config_size(ENCODING_KEY, &body)?;
     let path = encoding_path(state);
     let text =
@@ -1055,12 +1054,17 @@ async fn get_configuration_by_key(
     Path(key): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     if key.eq_ignore_ascii_case(ENCODING_KEY) {
+        // Any signed-in user reads them, as in Jellyfin; the devices and paths only an
+        // administrator
+        let mut options = encoding_options(&state).await?;
         if !claims.is_admin {
-            return Err(ApiError::Forbidden(
-                "the encoding options are for administrators".to_string(),
-            ));
+            options.retain(|name, _| {
+                !rustyfin_core::encoding::PRIVATE_FIELDS
+                    .iter()
+                    .any(|private| name.eq_ignore_ascii_case(private))
+            });
         }
-        return Ok(Json(encoding_configuration(&state).await?));
+        return Ok(Json(serde_json::Value::Object(options)));
     }
     let json = configuration_json(&state, claims.is_admin).await?;
     Ok(Json(

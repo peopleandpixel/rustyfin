@@ -102,6 +102,9 @@ pub struct TranscodeProfile {
     pub source_hdr: Option<encoding::HdrTransfer>,
     /// The channels of the played audio track, which decide the stereo downmix
     pub source_audio_channels: Option<u32>,
+    /// The source video's width and height, from which a device scale gets its exact output
+    /// size; None scales by expression
+    pub source_size: Option<(u32, u32)>,
 }
 
 impl Default for TranscodeProfile {
@@ -135,6 +138,7 @@ impl Default for TranscodeProfile {
             source_bit_depth: None,
             source_hdr: None,
             source_audio_channels: None,
+            source_size: None,
         }
     }
 }
@@ -205,11 +209,44 @@ pub struct TranscodeManager {
     settings: Arc<std::sync::RwLock<EncodingSettings>>,
     /// What the ffmpeg build offers, probed the first time a transcode needs to know
     capabilities: Arc<tokio::sync::OnceCell<FfmpegCapabilities>>,
-    /// Set when a hardware transcode failed and the same transcode ran in software: later
-    /// transcodes run in software until the options are saved again
-    hardware_failed: Arc<std::sync::atomic::AtomicBool>,
+    /// Which transcodes failed on the device; forgotten when the options are saved again
+    hardware: Arc<std::sync::Mutex<HardwareHealth>>,
     /// The warnings logged once, until the options are saved again
     warned: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+}
+
+/// The hardware failures the manager remembers. A file whose hardware transcode failed (and
+/// then ran in software) is transcoded in software from then on. Only the device's own setup
+/// failing `DEVICE_FAILURE_LIMIT` times in a row turns the hardware off for every transcode; a
+/// hardware transcode that starts resets that count.
+#[derive(Debug, Default)]
+struct HardwareHealth {
+    failed_inputs: std::collections::HashSet<String>,
+    device_failures: u32,
+    off: bool,
+}
+
+/// How many device setup failures in a row turn the hardware off.
+const DEVICE_FAILURE_LIMIT: u32 = 3;
+
+/// The most files remembered as failing on the device; past it the memory starts again.
+const FAILED_INPUTS_LIMIT: usize = 1000;
+
+/// Whether ffmpeg's last stderr lines say the device itself could not be opened (no driver,
+/// no render node, no CUDA), as opposed to one file or one encode session failing.
+fn device_setup_failed(stderr: &str) -> bool {
+    [
+        "Device creation failed",
+        "Failed to initialise VAAPI connection",
+        "No VA display found",
+        "Cannot load libcuda",
+        "Could not dynamically load CUDA",
+        "cuInit(0) failed",
+        "Error creating a MFX session",
+        "Failed to create a VAAPI device",
+    ]
+    .iter()
+    .any(|marker| stderr.contains(marker))
 }
 
 /// The most progressive transcodes that run at once. Each is one client's playback, so this is
@@ -230,7 +267,7 @@ impl TranscodeManager {
             max_progressive: MAX_PROGRESSIVE,
             settings: Arc::new(std::sync::RwLock::new(EncodingSettings::default())),
             capabilities: Arc::new(tokio::sync::OnceCell::new()),
-            hardware_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            hardware: Arc::new(std::sync::Mutex::new(HardwareHealth::default())),
             warned: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         }
     }
@@ -256,16 +293,45 @@ impl TranscodeManager {
             .clone()
     }
 
-    /// Replace the encoding options. A hardware failure noted before is forgotten, so the
+    /// Replace the encoding options. The hardware failures noted before are forgotten, so the
     /// hardware is tried again, and the warnings may be logged again.
     pub fn set_encoding_settings(&self, settings: EncodingSettings) {
         *self.settings.write().unwrap_or_else(|e| e.into_inner()) = settings;
-        self.hardware_failed
-            .store(false, std::sync::atomic::Ordering::SeqCst);
+        *self.hardware_health() = HardwareHealth::default();
         self.warned
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+    }
+
+    fn hardware_health(&self) -> std::sync::MutexGuard<'_, HardwareHealth> {
+        self.hardware.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Note how a hardware transcode of `input` went. A failure (whose software retry started)
+    /// sends that file to software from then on; a device setup failure also counts towards
+    /// turning the hardware off, which a hardware start resets.
+    fn note_hardware_result(&self, input: &str, failure: Option<&str>) {
+        let mut health = self.hardware_health();
+        let Some(message) = failure else {
+            health.device_failures = 0;
+            return;
+        };
+        if health.failed_inputs.len() >= FAILED_INPUTS_LIMIT {
+            health.failed_inputs.clear();
+        }
+        health.failed_inputs.insert(input.to_string());
+        warn!("hardware transcoding of {input} failed, it is transcoded in software: {message}");
+        if device_setup_failed(message) {
+            health.device_failures += 1;
+            if health.device_failures >= DEVICE_FAILURE_LIMIT && !health.off {
+                health.off = true;
+                warn!(
+                    "the hardware device failed to open {DEVICE_FAILURE_LIMIT} times in a row: \
+                     transcoding in software until the encoding options are saved again"
+                );
+            }
+        }
     }
 
     /// Log `message` as a warning the first time `key` is seen.
@@ -288,18 +354,19 @@ impl TranscodeManager {
 
     /// `profile` with the server's encoding options. Hardware acceleration the ffmpeg build
     /// lacks (its hwaccel or its encoder) and a tonemap without zscale fall back to software,
-    /// with a warning once; after a hardware failure everything runs in software.
-    async fn prepare(&self, profile: &TranscodeProfile) -> TranscodeProfile {
+    /// with a warning once. A file that failed on the device, and every file once the device
+    /// itself keeps failing to open, runs in software.
+    async fn prepare(&self, profile: &TranscodeProfile, input: &str) -> TranscodeProfile {
         let mut p = profile.clone();
         p.encoding = self.encoding_settings();
         let encodes_video = !p.audio_only && !p.copy_video;
         let accel = configured_accel(&p);
         if encodes_video && accel != HwAccel::None {
-            if self
-                .hardware_failed
-                .load(std::sync::atomic::Ordering::SeqCst)
             {
-                return software_profile(&p);
+                let health = self.hardware_health();
+                if health.off || health.failed_inputs.contains(input) {
+                    return software_profile(&p);
+                }
             }
             let caps = self.capabilities().await;
             let hwaccel = match accel {
@@ -367,8 +434,9 @@ impl TranscodeManager {
     /// wait reaches `MAX_WAIT_FACTOR` times that); ffmpeg then keeps running.
     /// A play session stopped less than `stop_memory` ago fails at once with `Stopped`.
     ///
-    /// A hardware transcode that fails is run again in software; when that one starts, the
-    /// hardware is turned off for later transcodes and a warning is logged once.
+    /// A hardware transcode whose ffmpeg exits with an error is run again in software; when
+    /// that one starts, the file is transcoded in software from then on (see `HardwareHealth`).
+    /// A stop or the shutdown is never retried.
     pub async fn start_transcode(
         &self,
         item_id: Uuid,
@@ -377,27 +445,27 @@ impl TranscodeManager {
         play_session_id: &str,
         device_id: &str,
     ) -> Result<(PathBuf, Uuid), TranscodeError> {
-        let profile = self.prepare(profile).await;
+        let profile = self.prepare(profile, input_path).await;
         let started = self
             .start_prepared(item_id, input_path, &profile, play_session_id, device_id)
             .await;
+        if !uses_hardware(&profile) {
+            return started;
+        }
         match started {
-            Err(TranscodeError::FfmpegFailed(message)) if uses_hardware(&profile) => {
+            Err(TranscodeError::FfmpegFailed(message)) => {
                 let software = software_profile(&profile);
                 let retried = self
                     .start_prepared(item_id, input_path, &software, play_session_id, device_id)
                     .await;
-                if retried.is_ok()
-                    && !self
-                        .hardware_failed
-                        .swap(true, std::sync::atomic::Ordering::SeqCst)
-                {
-                    warn!(
-                        "hardware transcoding failed, falling back to software until the \
-                         encoding options are saved again: {message}"
-                    );
+                if retried.is_ok() {
+                    self.note_hardware_result(input_path, Some(&message));
                 }
                 retried
+            }
+            Ok(started) => {
+                self.note_hardware_result(input_path, None);
+                Ok(started)
             }
             started => started,
         }
@@ -414,9 +482,7 @@ impl TranscodeManager {
         let playback_id = {
             let _lock = self.start_lock.lock().await;
             if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
-                return Err(TranscodeError::FfmpegFailed(
-                    "the server is shutting down".into(),
-                ));
+                return Err(TranscodeError::ShuttingDown);
             }
             if !play_session_id.is_empty() && self.recently_stopped(play_session_id) {
                 return Err(TranscodeError::Stopped);
@@ -457,9 +523,7 @@ impl TranscodeManager {
                 StartPoll::Exited(status) => {
                     return Err(self.ffmpeg_exited(playback_id, status).await);
                 }
-                StartPoll::Gone => {
-                    return Err(TranscodeError::FfmpegFailed("transcode stopped".into()));
-                }
+                StartPoll::Gone => return Err(TranscodeError::Stopped),
                 StartPoll::Running => {}
             }
             let now = std::time::Instant::now();
@@ -674,12 +738,10 @@ impl TranscodeManager {
         play_session_id: &str,
         device_id: &str,
     ) -> Result<(Uuid, tokio::process::ChildStdout), TranscodeError> {
-        let profile = &self.prepare(profile).await;
+        let profile = &self.prepare(profile, input_path).await;
         let _lock = self.start_lock.lock().await;
         if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
-            return Err(TranscodeError::FfmpegFailed(
-                "the server is shutting down".into(),
-            ));
+            return Err(TranscodeError::ShuttingDown);
         }
         if !play_session_id.is_empty() && self.recently_stopped(play_session_id) {
             return Err(TranscodeError::Stopped);
@@ -787,7 +849,7 @@ impl TranscodeManager {
             .get_mut(&playback_id)
             .map(|mut s| (s.stderr_task.take(), s.stderr_tail.clone()))
         else {
-            return TranscodeError::FfmpegFailed("transcode stopped".into());
+            return TranscodeError::Stopped;
         };
         // The reader ends once ffmpeg has closed stderr; the timeout only bounds a stuck reader
         if let Some(task) = stderr_task {
@@ -1322,7 +1384,9 @@ fn hardware_decodes(profile: &TranscodeProfile) -> bool {
         codec => codec,
     };
     let deep = profile.source_bit_depth.is_some_and(|depth| depth > 8);
+    // No VAAPI, QSV or NVDEC decoder takes 10-bit H.264 (Hi10P): Jellyfin decodes it in software
     settings.hardware_decoding_codecs.iter().any(|c| c == codec)
+        && !(deep && codec == "h264")
         && !(deep && codec == "hevc" && !settings.enable_decoding_color_depth_10_hevc)
         && !(deep && codec == "vp9" && !settings.enable_decoding_color_depth_10_vp9)
 }
@@ -1430,20 +1494,24 @@ fn ffmpeg_args(input: &str, output: Output<'_>, profile: &TranscodeProfile) -> V
     // one turns hardware acceleration off. Deinterlacing, square pixels and the tonemap are
     // software filters, so they turn it off too.
     let image_subtitle = profile.image_subtitle.filter(|_| !profile.audio_only);
-    let tonemap = profile.source_hdr.filter(|_| settings.enable_tonemapping);
+
+    // Burn-in, the overlay, deinterlacing and square pixels need a re-encode, so they turn the
+    // copy off. The tonemap doesn't: an HDR video a client takes as it is stays copied.
+    let copy_video = profile.copy_video
+        && !profile.audio_only
+        && !profile.burn_subtitles
+        && !profile.deinterlace
+        && !profile.square_pixels
+        && image_subtitle.is_none();
+    let tonemap = profile
+        .source_hdr
+        .filter(|_| settings.enable_tonemapping && !copy_video && !profile.audio_only);
     let software_filters = profile.deinterlace || profile.square_pixels || tonemap.is_some();
     let hw_accel = match image_subtitle {
         _ if software_filters => HwAccel::None,
         Some(sub) if sub.video_size.is_none() => HwAccel::None,
         _ => configured_accel(profile),
     };
-
-    // Burn-in, the overlay and the software filters need a re-encode, so they turn the copy off
-    let copy_video = profile.copy_video
-        && !profile.audio_only
-        && !profile.burn_subtitles
-        && !software_filters
-        && image_subtitle.is_none();
 
     // The encoder: the device's for the profile's codec with `EnableHardwareEncoding`, else the
     // profile's own. The device decodes the codecs `HardwareDecodingCodecs` lists.
@@ -1504,12 +1572,12 @@ fn ffmpeg_args(input: &str, output: Output<'_>, profile: &TranscodeProfile) -> V
             Some(crf) => args.extend(["-crf".to_string(), crf.to_string()]),
             None => args.extend(["-b:v".to_string(), format!("{kbps}k")]),
         }
-        args.extend([
-            "-maxrate".to_string(),
-            format!("{kbps}k"),
-            "-bufsize".to_string(),
-            format!("{}k", kbps * 2),
-        ]);
+        // SVT-AV1 takes no -maxrate: equal to -b:v ffmpeg asks it for CBR, which it refuses in
+        // its random-access mode
+        if video_encoder != "libsvtav1" {
+            args.extend(["-maxrate".to_string(), format!("{kbps}k")]);
+        }
+        args.extend(["-bufsize".to_string(), format!("{}k", kbps * 2)]);
         if settings.thread_count > 0 {
             args.extend(["-threads".to_string(), settings.thread_count.to_string()]);
         }
@@ -1521,7 +1589,16 @@ fn ffmpeg_args(input: &str, output: Output<'_>, profile: &TranscodeProfile) -> V
             format!("'min({},iw)'", profile.max_width),
             format!("'min({},ih)'", profile.max_height),
         );
-        let device_scale = hw_scale(plan.accel, &w, &h, true);
+        // The device scales to the exact output size when the source's is known; else by
+        // expression, QSV (which can't keep the aspect within both limits) by height
+        let device_scale = match profile.source_size {
+            Some(size) => {
+                let (w, h) = output_size(size, profile.max_width, profile.max_height);
+                hw_scale(plan.accel, &w.to_string(), &h.to_string(), false)
+            }
+            None if plan.accel == HwAccel::Qsv => hw_scale(plan.accel, "-1", &h, false),
+            None => hw_scale(plan.accel, &w, &h, true),
+        };
         let software_scale = format!(
             "{}{}scale={w}:{h}:force_original_aspect_ratio=decrease,{}",
             if profile.deinterlace { "bwdif=0," } else { "" },
@@ -1790,8 +1867,12 @@ pub enum TranscodeError {
     #[error("ffmpeg has not written a playlist yet")]
     PlaylistTimeout,
 
+    /// The play session was stopped, or its transcode ended while it started
     #[error("the play session was stopped")]
     Stopped,
+
+    #[error("the server is shutting down")]
+    ShuttingDown,
 
     #[error("{0} progressive transcodes are running, the most the server runs at once")]
     TooMany(usize),
@@ -2528,7 +2609,7 @@ mod tests {
         (
             HwAccel::Qsv,
             "h264_qsv",
-            "scale_qsv=w='min(1920,iw)':h='min(1080,ih)':format=nv12",
+            "scale_qsv=w=-1:h='min(1080,ih)':format=nv12",
         ),
     ];
 
@@ -3423,7 +3504,7 @@ exec sleep 30
         assert!(!mgr.is_active(item).await);
         let after = start(&mgr, item, "psid-2", "").await;
         assert!(
-            matches!(after, Err(TranscodeError::FfmpegFailed(_))),
+            matches!(after, Err(TranscodeError::ShuttingDown)),
             "{after:?}"
         );
         assert_eq!(mgr.sessions.len(), 0);
@@ -4080,22 +4161,84 @@ exec sleep 30
             hardware_acceleration: encoding::HardwareAccelerationType::Vaapi,
             ..Default::default()
         });
+        let profile = TranscodeProfile::default();
+        let hw = |input: &'static str| {
+            let mgr = mgr.clone();
+            let profile = profile.clone();
+            async move { uses_hardware(&mgr.prepare(&profile, input).await) }
+        };
         let item = Uuid::new_v4();
         let (_, id) = start(&mgr, item, "psid-a", "dev").await.unwrap();
-        assert!(
-            mgr.hardware_failed
-                .load(std::sync::atomic::Ordering::SeqCst)
-        );
         let used = mgr.sessions.get(&id).unwrap().profile.clone();
         assert!(!uses_hardware(&used), "{used:?}");
-        // Later transcodes start in software at once
-        let next = mgr.prepare(&TranscodeProfile::default()).await;
-        assert!(!uses_hardware(&next));
+        // That file runs in software from then on; other files still try the device
+        assert!(!hw("/in.mkv").await);
+        assert!(hw("/other.mkv").await);
+        // The device failing to open on three files in a row turns it off for every file
+        for input in ["/b.mkv", "/c.mkv"] {
+            mgr.start_transcode(Uuid::new_v4(), input, &profile, "", "")
+                .await
+                .unwrap();
+        }
+        assert!(mgr.hardware_health().off);
+        assert!(!hw("/other.mkv").await);
         // Saving the options tries the hardware again
         mgr.set_encoding_settings(mgr.encoding_settings());
-        assert!(uses_hardware(
-            &mgr.prepare(&TranscodeProfile::default()).await
-        ));
+        assert!(hw("/in.mkv").await && hw("/other.mkv").await);
+        mgr.stop_all().await;
+    }
+
+    #[test]
+    fn r3transcoding_one_file_or_session_limit_never_turns_hardware_off() {
+        let dir = TestDir(std::env::temp_dir().join(format!("rustyfin-r3h-{}", Uuid::new_v4())));
+        let mgr = TranscodeManager::new(&dir.0);
+        // The NVENC session limit and an undecodable file are not the device failing to open
+        for i in 0..10 {
+            mgr.note_hardware_result(
+                &format!("/f{i}.mkv"),
+                Some("OpenEncodeSessionEx failed: incompatible client key (21)"),
+            );
+            mgr.note_hardware_result("/bad.mkv", Some("Invalid data found when processing input"));
+        }
+        assert!(!mgr.hardware_health().off);
+        assert_eq!(mgr.hardware_health().device_failures, 0);
+        // Device failures count only in a row: a hardware start resets them
+        let device = "Device creation failed: -22.";
+        mgr.note_hardware_result("/a.mkv", Some(device));
+        mgr.note_hardware_result("/b.mkv", Some(device));
+        mgr.note_hardware_result("/ok.mkv", None);
+        mgr.note_hardware_result("/c.mkv", Some(device));
+        mgr.note_hardware_result("/d.mkv", Some(device));
+        assert!(!mgr.hardware_health().off);
+        mgr.note_hardware_result("/e.mkv", Some(device));
+        assert!(mgr.hardware_health().off);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn r3transcoding_a_stop_while_starting_on_hardware_is_not_retried() {
+        let (_dir, mgr) = fake_manager("slow", Duration::from_secs(10));
+        mgr.capabilities.set(FfmpegCapabilities::default()).unwrap();
+        mgr.set_encoding_settings(EncodingSettings {
+            hardware_acceleration: encoding::HardwareAccelerationType::Vaapi,
+            ..Default::default()
+        });
+        let item = Uuid::new_v4();
+        // No PlaySessionId: the stop goes by device, and nothing refuses a later start
+        let starting = {
+            let mgr = mgr.clone();
+            tokio::spawn(async move { start(&mgr, item, "", "dev-r3").await })
+        };
+        while mgr.sessions.is_empty() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(mgr.stop_play_session(None, "", "dev-r3").await, 1);
+        let result = starting.await.unwrap();
+        assert!(matches!(result, Err(TranscodeError::Stopped)), "{result:?}");
+        // No software transcode started after the stop, and the file isn't marked as failing
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(mgr.sessions.len(), 0);
+        assert!(mgr.hardware_health().failed_inputs.is_empty());
     }
 
     #[tokio::test]
@@ -4114,13 +4257,18 @@ exec sleep 30
             enable_tonemapping: true,
             ..Default::default()
         });
-        let p = mgr.prepare(&TranscodeProfile::default()).await;
+        let p = mgr.prepare(&TranscodeProfile::default(), "/in.mkv").await;
         assert!(uses_hardware(&p) && !p.encoding.enable_hardware_encoding);
         let hdr = TranscodeProfile {
             source_hdr: Some(encoding::HdrTransfer::Hlg),
             ..Default::default()
         };
-        assert!(!mgr.prepare(&hdr).await.encoding.enable_tonemapping);
+        assert!(
+            !mgr.prepare(&hdr, "/in.mkv")
+                .await
+                .encoding
+                .enable_tonemapping
+        );
         // No vaapi hwaccel at all: software
         let mgr = TranscodeManager::new(&dir.0);
         mgr.capabilities
@@ -4134,7 +4282,126 @@ exec sleep 30
             ..Default::default()
         });
         assert!(!uses_hardware(
-            &mgr.prepare(&TranscodeProfile::default()).await
+            &mgr.prepare(&TranscodeProfile::default(), "/in.mkv").await
+        ));
+    }
+
+    #[test]
+    fn r3transcoding_10bit_h264_decodes_in_software() {
+        use encoding::HardwareAccelerationType::{Nvenc, Qsv, Vaapi};
+        for accel in [Vaapi, Qsv, Nvenc] {
+            let mut profile = hw_profile(accel, "h264", |_| {});
+            profile.source_bit_depth = Some(10);
+            let args = args_for(&profile);
+            assert!(
+                !args.contains(&"-hwaccel".to_string()),
+                "{accel:?}: {args:?}"
+            );
+            // Still encoded on the device
+            assert!(
+                args.iter().any(|a| a.starts_with("h264_")),
+                "{accel:?}: {args:?}"
+            );
+            profile.source_bit_depth = Some(8);
+            assert!(args_for(&profile).contains(&"-hwaccel".to_string()));
+        }
+    }
+
+    #[test]
+    fn r3transcoding_tonemapping_never_turns_a_copy_off() {
+        let profile = TranscodeProfile {
+            copy_video: true,
+            source_hdr: Some(encoding::HdrTransfer::Pq),
+            encoding: EncodingSettings {
+                enable_tonemapping: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let args = args_for(&profile);
+        assert!(has_pair(&args, "-c:v", "copy"), "{args:?}");
+        assert!(!args.iter().any(|a| a.contains("tonemap")), "{args:?}");
+        // Encoded anyway (a burn-in), the HDR video is tonemapped
+        let burned = TranscodeProfile {
+            burn_subtitles: true,
+            ..profile
+        };
+        let args = args_for(&burned);
+        assert!(has_pair(&args, "-c:v", "libx264"), "{args:?}");
+        assert!(
+            args.iter().any(|a| a.contains("tonemap=tonemap")),
+            "{args:?}"
+        );
+    }
+
+    #[test]
+    fn r3transcoding_svtav1_gets_no_maxrate() {
+        let profile = TranscodeProfile {
+            video_codec: "libsvtav1".into(),
+            fmp4: true,
+            ..Default::default()
+        };
+        let args = args_for(&profile);
+        assert!(has_pair(&args, "-b:v", "8000k"), "{args:?}");
+        assert!(has_pair(&args, "-bufsize", "16000k"), "{args:?}");
+        assert!(!args.contains(&"-maxrate".to_string()), "{args:?}");
+        assert_eq!(values(&args, "-preset"), ["8"]);
+    }
+
+    /// The SVT-AV1 arguments encode in the installed ffmpeg; with `-maxrate` equal to `-b:v`
+    /// (CBR) libsvtav1 refuses to start.
+    #[test]
+    fn r3transcoding_svtav1_args_encode_in_ffmpeg() {
+        if !have_ffmpeg("r3transcoding_svtav1_args_encode_in_ffmpeg") {
+            return;
+        }
+        let encoders = std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-encoders"])
+            .output()
+            .unwrap();
+        if !String::from_utf8_lossy(&encoders.stdout).contains("libsvtav1") {
+            eprintln!("skipped: ffmpeg has no libsvtav1");
+            return;
+        }
+        let dir = TestDir(std::env::temp_dir().join(format!("rustyfin-r3av1-{}", Uuid::new_v4())));
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let input = dir.0.join("in.mp4");
+        let make = "-f lavfi -i testsrc2=size=320x240:rate=25 -f lavfi -i sine=frequency=440 -t 2 \
+                    -c:v libx264 -pix_fmt yuv420p -c:a aac";
+        let mut args: Vec<String> = make.split_whitespace().map(String::from).collect();
+        args.push(input.to_str().unwrap().to_string());
+        run_ffmpeg(&args, true);
+        let profile = TranscodeProfile {
+            video_codec: "libsvtav1".into(),
+            fmp4: true,
+            max_video_bitrate_kbps: 1000,
+            ..Default::default()
+        };
+        let out = transcode_into(&dir.0, "av1", &input, &profile);
+        assert!(out.join("init.mp4").is_file());
+    }
+
+    #[test]
+    fn r3transcoding_device_scale_keeps_the_aspect() {
+        use encoding::HardwareAccelerationType::{Nvenc, Qsv, Vaapi};
+        // A 2.4:1 4K source within 1920x1080 is 1920x800 on every device
+        for (accel, scale) in [
+            (Vaapi, "scale_vaapi=w=1920:h=800:format=nv12"),
+            (Qsv, "scale_qsv=w=1920:h=800:format=nv12"),
+            (Nvenc, "scale_cuda=w=1920:h=800:format=nv12"),
+        ] {
+            let mut profile = hw_profile(accel, "h264", |_| {});
+            profile.source_size = Some((3840, 1600));
+            let args = args_for(&profile);
+            assert!(has_pair(&args, "-vf", scale), "{accel:?}: {args:?}");
+        }
+        // A small source is not scaled up
+        let mut profile = hw_profile(Qsv, "h264", |_| {});
+        profile.source_size = Some((1280, 534));
+        assert!(has_pair(
+            &args_for(&profile),
+            "-vf",
+            "scale_qsv=w=1280:h=534:format=nv12"
         ));
     }
 }

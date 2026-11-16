@@ -361,7 +361,9 @@ pub(super) async fn respond(
         .await
         .map_err(|e| match e {
             TranscodeError::Stopped => ApiError::NotFound("The play session was stopped".into()),
-            e @ TranscodeError::TooMany(_) => ApiError::ServiceUnavailable(e.to_string()),
+            e @ (TranscodeError::TooMany(_) | TranscodeError::ShuttingDown) => {
+                ApiError::ServiceUnavailable(e.to_string())
+            }
             e => ApiError::Internal(format!("Transcode failed: {e}")),
         })?;
     let guard = EndOnDrop {

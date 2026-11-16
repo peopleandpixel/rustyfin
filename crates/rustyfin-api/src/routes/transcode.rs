@@ -747,6 +747,7 @@ fn transcode_profile_with(
     profile.source_video_codec = source.video_codec.clone();
     profile.source_bit_depth = source.video_bit_depth;
     profile.source_hdr = source.hdr;
+    profile.source_size = source.width.zip(source.height);
     profile.source_audio_channels = tracks
         .audio
         .and_then(|index| source.audio.iter().find(|track| track.index == index))
@@ -984,6 +985,9 @@ async fn hls_master_playlist(
         }
         Err(TranscodeError::Stopped) => {
             return Err(ApiError::NotFound("The play session was stopped".into()));
+        }
+        Err(e @ TranscodeError::ShuttingDown) => {
+            return Err(ApiError::ServiceUnavailable(e.to_string()));
         }
         Err(TranscodeError::FfmpegFailed(msg)) => {
             return Err(ApiError::Internal(format!("Transcode failed: {msg}")));
@@ -2212,6 +2216,7 @@ mod tests {
         assert_eq!(p.source_bit_depth, Some(10));
         assert_eq!(p.source_hdr, Some(HdrTransfer::Pq));
         assert_eq!(p.source_audio_channels, Some(6));
+        assert_eq!(p.source_size, Some((1920, 1080)));
     }
 
     #[test]

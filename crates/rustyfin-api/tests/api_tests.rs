@@ -2469,9 +2469,23 @@ fn r3transcoding_web_playback_admin() {
 async fn r3transcoding_encoding_options_round_trip_and_reach_the_transcoder() {
     use rustyfin_core::encoding::HardwareAccelerationType;
     let (state, app, admin, (bob, _), _path) = r2admin_world().await;
-    // Administrators only, both ways
-    let (status, _) = send_authed(&app, "GET", "/System/Configuration/encoding", &bob, None).await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    // Any signed-in user reads them, as in Jellyfin, but not the devices and paths
+    let (status, public) =
+        send_authed(&app, "GET", "/System/Configuration/encoding", &bob, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(public["H264Crf"], 23, "{public}");
+    assert_eq!(public["HardwareAccelerationType"], "none", "{public}");
+    for private in [
+        "VaapiDevice",
+        "QsvDevice",
+        "TranscodingTempPath",
+        "EncoderAppPath",
+        "EncoderAppPathDisplay",
+        "FallbackFontPath",
+    ] {
+        assert!(public.get(private).is_none(), "{private} in {public}");
+    }
+    // Only administrators save them
     let (status, _) = send_authed(
         &app,
         "POST",
@@ -2530,6 +2544,39 @@ async fn r3transcoding_encoding_options_round_trip_and_reach_the_transcoder() {
     assert_eq!(settings.thread_count, 3);
     assert!(settings.allow_hevc_encoding && settings.enable_tonemapping);
     assert_eq!(settings.downmix_stereo_algorithm, "Dave750");
+
+    // A user who isn't an administrator doesn't see the saved device either
+    let (_, public) = send_authed(&app, "GET", "/System/Configuration/encoding", &bob, None).await;
+    assert!(public.get("VaapiDevice").is_none(), "{public}");
+    assert_eq!(public["H264Crf"], 19, "{public}");
+
+    // Out-of-range numbers, unknown enum values and bad devices are refused, and nothing changes
+    for (field, value) in [
+        ("H264Crf", serde_json::json!(60)),
+        ("EncodingThreadCount", serde_json::json!(-5)),
+        ("HardwareAccelerationType", serde_json::json!("cuda")),
+        ("EncoderPreset", serde_json::json!("turbo")),
+        ("DownMixStereoAlgorithm", serde_json::json!("Surround")),
+        ("TonemappingAlgorithm", serde_json::json!("aces")),
+        (
+            "VaapiDevice",
+            serde_json::json!("/dev/dri/renderD128,driver=iHD"),
+        ),
+        ("QsvDevice", serde_json::json!("renderD128")),
+    ] {
+        let mut bad = encoding.clone();
+        bad[field] = value;
+        let (status, _) = send_authed(
+            &app,
+            "POST",
+            "/System/Configuration/encoding",
+            &admin,
+            Some(&bad.to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{field}");
+    }
+    assert_eq!(state.transcode_manager.encoding_settings().h264_crf, 19);
 
     // A type Rustyfin stores only is saved without an error, and transcodes in software
     encoding["HardwareAccelerationType"] = serde_json::json!("videotoolbox");

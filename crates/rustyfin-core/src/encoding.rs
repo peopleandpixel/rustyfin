@@ -252,6 +252,110 @@ impl EncodingSettings {
     }
 }
 
+/// The fields that name the server's devices, paths and programs. Users who aren't
+/// administrators get the options without them.
+pub const PRIVATE_FIELDS: [&str; 6] = [
+    "VaapiDevice",
+    "QsvDevice",
+    "TranscodingTempPath",
+    "EncoderAppPath",
+    "EncoderAppPathDisplay",
+    "FallbackFontPath",
+];
+
+/// Why a client's options can't be saved: a CRF outside 0–51, a thread count outside -1–256,
+/// an enum value Jellyfin doesn't define (hardware type, preset, downmix, tonemapping), or a
+/// device that isn't an absolute path free of `,` and `=` (which would end ffmpeg's
+/// `-init_hw_device` value). Missing and null fields are fine; names match without case.
+pub fn validate_options(options: &Map<String, Value>) -> Result<(), String> {
+    let present = |key: &str| field(options, key).filter(|v| !v.is_null());
+    for (key, min, max) in [
+        ("H264Crf", 0, 51),
+        ("H265Crf", 0, 51),
+        ("EncodingThreadCount", -1, 256),
+    ] {
+        if let Some(value) = present(key) {
+            let n = number(options, key)
+                .filter(|n| n.fract() == 0.0)
+                .ok_or_else(|| format!("{key}: {value} is not a whole number"))?;
+            if n < f64::from(min) || n > f64::from(max) {
+                return Err(format!("{key}: {n} is outside {min} to {max}"));
+            }
+        }
+    }
+    const ENUMS: [(&str, &[&str]); 6] = [
+        (
+            "HardwareAccelerationType",
+            &[
+                "none",
+                "amf",
+                "qsv",
+                "nvenc",
+                "v4l2m2m",
+                "vaapi",
+                "videotoolbox",
+                "rkmpp",
+            ],
+        ),
+        (
+            "EncoderPreset",
+            &[
+                "auto",
+                "placebo",
+                "veryslow",
+                "slower",
+                "slow",
+                "medium",
+                "fast",
+                "faster",
+                "veryfast",
+                "superfast",
+                "ultrafast",
+            ],
+        ),
+        (
+            "DownMixStereoAlgorithm",
+            &["none", "dave750", "nightmodedialogue", "rfc7845", "ac4"],
+        ),
+        (
+            "TonemappingAlgorithm",
+            &[
+                "none", "clip", "linear", "gamma", "reinhard", "hable", "mobius", "bt2390",
+            ],
+        ),
+        ("TonemappingRange", &["auto", "tv", "pc"]),
+        ("TonemappingMode", &["auto", "max", "rgb", "lum", "itp"]),
+    ];
+    for (key, allowed) in ENUMS {
+        if let Some(value) = present(key) {
+            let known = value
+                .as_str()
+                .is_some_and(|v| allowed.contains(&v.to_ascii_lowercase().as_str()));
+            if !known {
+                return Err(format!(
+                    "{key}: {value} is not one of {}",
+                    allowed.join(", ")
+                ));
+            }
+        }
+    }
+    for key in ["VaapiDevice", "QsvDevice"] {
+        if let Some(value) = present(key) {
+            let path = value
+                .as_str()
+                .ok_or_else(|| format!("{key}: {value} is not a path"))?;
+            if !path.is_empty()
+                && (!path.starts_with('/') || path.contains([',', '=']) || path.contains('\0'))
+            {
+                return Err(format!(
+                    "{key}: {path:?} must be an absolute path without ',' or '='"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Jellyfin 12.4.0's defaults for every `EncodingOptions` field, with Rustyfin's ffmpeg and
 /// transcode folder.
 pub fn default_options(ffmpeg: &str, transcode_dir: &Path) -> Map<String, Value> {
@@ -709,6 +813,44 @@ mod tests {
         assert_eq!(s.downmix_audio_boost, 1.5);
         assert!(s.allow_hevc_encoding);
         assert_eq!(s.transcoding_temp_path, None);
+    }
+
+    #[test]
+    fn r3transcoding_validation_refuses_bad_values() {
+        let check = |v: Value| validate_options(v.as_object().unwrap());
+        // The defaults, case-insensitive enums and nulls pass
+        assert_eq!(
+            validate_options(&default_options("ffmpeg", Path::new("/t"))),
+            Ok(())
+        );
+        assert_eq!(
+            check(
+                json!({ "hardwareaccelerationtype": "VAAPI", "EncoderPreset": null,
+                          "DownMixStereoAlgorithm": "Dave750", "QsvDevice": "" })
+            ),
+            Ok(())
+        );
+        for bad in [
+            json!({ "H264Crf": 52 }),
+            json!({ "H265Crf": -1 }),
+            json!({ "H264Crf": 20.5 }),
+            json!({ "H264Crf": "high" }),
+            json!({ "EncodingThreadCount": -2 }),
+            json!({ "EncodingThreadCount": 1000 }),
+            json!({ "HardwareAccelerationType": "cuda" }),
+            json!({ "HardwareAccelerationType": 3 }),
+            json!({ "EncoderPreset": "turbo" }),
+            json!({ "DownMixStereoAlgorithm": "Surround" }),
+            json!({ "TonemappingAlgorithm": "aces" }),
+            json!({ "TonemappingRange": "full" }),
+            json!({ "TonemappingMode": "rgbx" }),
+            json!({ "VaapiDevice": "renderD128" }),
+            json!({ "VaapiDevice": "/dev/dri/renderD128,driver=iHD" }),
+            json!({ "QsvDevice": "/dev/dri/x=y" }),
+            json!({ "QsvDevice": 1 }),
+        ] {
+            assert!(check(bad.clone()).is_err(), "{bad}");
+        }
     }
 
     #[test]
