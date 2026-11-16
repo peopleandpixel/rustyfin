@@ -31108,16 +31108,17 @@ async fn r3users2_forgot_password_outside_the_network_is_in_network_required() {
     assert!(login(&local_app, "owner", &pin).await.is_some());
 }
 
-/// The ways a client outside the local network reaches the reset routes: a public peer, a public
-/// peer claiming a local address in X-Forwarded-For, and a local peer that isn't a listed proxy
-/// passing on a public address.
-fn r3users2_remote_clients(
-    state: &AppState,
-) -> Vec<(
+/// A labelled remote client: its router and the headers it sends.
+type R3users2RemoteClient = (
     &'static str,
     axum::Router,
     Vec<(&'static str, &'static str)>,
-)> {
+);
+
+/// The ways a client outside the local network reaches the reset routes: a public peer, a public
+/// peer claiming a local address in X-Forwarded-For, and a local peer that isn't a listed proxy
+/// passing on a public address.
+fn r3users2_remote_clients(state: &AppState) -> Vec<R3users2RemoteClient> {
     let public = || {
         build_router(state.clone()).layer(MockConnectInfo(
             "203.0.113.5:4000".parse::<SocketAddr>().unwrap(),
