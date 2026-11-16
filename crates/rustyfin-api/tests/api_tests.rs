@@ -26533,6 +26533,13 @@ fn r3player_controls() {
     b124_node_test("r3player_controls.mjs");
 }
 
+// R3 player preferences: the next episode's tracks follow the Remember settings and match by language
+// and title; C and S toggle subtitles; a focused menu or text field keeps the player's keys
+#[test]
+fn r3prefs_player() {
+    b124_node_test("r3prefs_player.mjs");
+}
+
 // The album page's Play queues every track in disc and track order; a track plays the album from it
 #[test]
 fn r3player_album() {
@@ -39846,6 +39853,90 @@ async fn r3settings_playback_info_follows_remember_flags() {
 
     configure(serde_json::json!({})).await;
     assert_eq!(b20_only_defaults(&app, &token, item).await, b20_both(2, 4));
+}
+
+// R3 player preferences: as in Jellyfin's MediaSourceManager, a remembered subtitle is not the
+// default while the user's SubtitleMode is None; the remembered audio still is.
+#[tokio::test]
+async fn r3prefs_remembered_subtitle_skipped_when_subtitle_mode_none() {
+    let state = test_state().await;
+    let _dir = G1cDataDir(state.data_dir.to_path_buf());
+    let app = app(state.clone());
+    let (token, user) = admin_session(&state).await;
+    let item = b20_movie(&state, "R3 Prefs None", b20_full_streams()).await;
+    let body = serde_json::json!({
+        "ItemId": item, "PositionTicks": 0, "AudioStreamIndex": 2, "SubtitleStreamIndex": 4,
+    });
+    b20_report(&app, &token, "/Progress", body).await;
+    let uri = format!("/Users/{user}/Configuration");
+    let config = serde_json::json!({ "SubtitleMode": "None" });
+    let req = request("POST", &uri, Some(&token), Some(config));
+    assert!(send(&app, req).await.0.is_success());
+
+    let (audio, subtitle) = b20_only_defaults(&app, &token, item).await;
+    assert_eq!(audio, Some(serde_json::json!(2)));
+    assert_ne!(subtitle, Some(serde_json::json!(4)));
+}
+
+// R3 player preferences: POST /Items/{id}/PlaybackInfo, which Jellyfin apps call, plays the
+// remembered tracks whether or not the request names the source (they are the source's defaults,
+// as in Jellyfin), while a requested index counts only with the source's MediaSourceId.
+#[tokio::test]
+async fn r3prefs_post_playback_info_plays_remembered_and_requested_audio() {
+    let state = test_state().await;
+    let _dir = G1cDataDir(state.data_dir.to_path_buf());
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let streams = serde_json::json!([
+        { "Index": 0, "Codec": "h264", "CodecType": "Video" },
+        { "Index": 1, "Codec": "aac", "CodecType": "Audio", "Language": "eng", "IsDefault": true },
+        { "Index": 2, "Codec": "aac", "CodecType": "Audio", "Language": "ger" },
+        { "Index": 3, "Codec": "subrip", "CodecType": "Subtitle", "Language": "eng" },
+        { "Index": 4, "Codec": "subrip", "CodecType": "Subtitle", "Language": "ger" },
+    ]);
+    let item = b20_movie(&state, "R3 Prefs Post", streams).await;
+    let profile = serde_json::json!({
+        "DirectPlayProfiles": [{ "Container": "mkv", "Type": "Video", "VideoCodec": "h264", "AudioCodec": "aac" }],
+        "TranscodingProfiles": [{ "Container": "ts", "Type": "Video", "VideoCodec": "h264", "AudioCodec": "aac", "Protocol": "hls" }],
+        "SubtitleProfiles": [{ "Format": "srt", "Method": "External" }],
+    });
+    let post = |body: serde_json::Value| {
+        let req = request(
+            "POST",
+            &format!("/Items/{item}/PlaybackInfo"),
+            Some(&token),
+            Some(body),
+        );
+        let app = app.clone();
+        async move {
+            let (status, body) = send(&app, req).await;
+            assert!(status.is_success(), "{body}");
+            let source = &body["MediaSources"][0];
+            (
+                source["DefaultAudioStreamIndex"].clone(),
+                source["DefaultSubtitleStreamIndex"].clone(),
+            )
+        }
+    };
+    let unnamed =
+        post(serde_json::json!({ "DeviceProfile": profile, "AudioStreamIndex": 2 })).await;
+    assert_eq!(unnamed.0, serde_json::json!(1));
+    let req = request(
+        "GET",
+        &format!("/Items/{item}/PlaybackInfo"),
+        Some(&token),
+        None,
+    );
+    let source_id = send(&app, req).await.1["MediaSources"][0]["Id"].clone();
+    let named = serde_json::json!({ "DeviceProfile": profile, "AudioStreamIndex": 2, "MediaSourceId": source_id });
+    assert_eq!(post(named).await.0, serde_json::json!(2));
+
+    let body = serde_json::json!({
+        "ItemId": item, "PositionTicks": 0, "AudioStreamIndex": 2, "SubtitleStreamIndex": 4,
+    });
+    b20_report(&app, &token, "/Progress", body).await;
+    let remembered = post(serde_json::json!({ "DeviceProfile": profile })).await;
+    assert_eq!(remembered, (serde_json::json!(2), serde_json::json!(4)));
 }
 
 #[tokio::test]

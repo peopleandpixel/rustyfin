@@ -1874,7 +1874,8 @@ fn client_takes_h264_video(
 }
 
 /// The audio and subtitle choices `user` last made for `item`, each where the user keeps
-/// Jellyfin's RememberAudioSelections and RememberSubtitleSelections on.
+/// Jellyfin's RememberAudioSelections and RememberSubtitleSelections on. As in Jellyfin, a
+/// remembered subtitle is not offered while the user's SubtitleMode is None.
 pub(crate) async fn remembered_choices(
     state: &AppState,
     user: Uuid,
@@ -1887,9 +1888,10 @@ pub(crate) async fn remembered_choices(
         .map(|user| rustyfin_model::user::jellyfin_configuration(&user.configuration))
         .unwrap_or_default();
     let remembers = |key: &str| config.get(key).and_then(|v| v.as_bool()) != Some(false);
+    let subtitles_off = config.get("SubtitleMode").and_then(|v| v.as_str()) == Some("None");
     Ok((
         audio.filter(|_| remembers("RememberAudioSelections")),
-        subtitle.filter(|_| remembers("RememberSubtitleSelections")),
+        subtitle.filter(|_| remembers("RememberSubtitleSelections") && !subtitles_off),
     ))
 }
 
