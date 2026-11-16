@@ -37,9 +37,10 @@ pub struct FoundExtra {
 pub enum Classified {
     /// An extra.
     Extra(FoundExtra),
-    /// A file in an extras folder that is not that folder's kind of media (a video in `theme-music/`): it is
-    /// neither an extra nor a library item.
-    Skip,
+    /// A file in an extras folder that is not that folder's kind of media (a video in `theme-music/`). Next to
+    /// a movie (in `owner_dir`) it is neither an extra nor a library item; otherwise the scan reads it as
+    /// before.
+    Skip { owner_dir: PathBuf },
     /// Not an extra: the scan reads it as before.
     No,
 }
@@ -66,7 +67,9 @@ fn in_extras_dir(file: &Path, owner_dir: &Path, kind: ExtraKind) -> Classified {
         is_video(file)
     };
     if !fits {
-        return Classified::Skip;
+        return Classified::Skip {
+            owner_dir: owner_dir.to_path_buf(),
+        };
     }
     Classified::Extra(FoundExtra {
         path: file.to_path_buf(),
@@ -103,7 +106,9 @@ fn by_name(file: &Path, owner_dir: &Path, suffixes: bool) -> Classified {
     }
 }
 
-/// What `file`, under the movie library root `root`, is.
+/// What `file`, under the movie library root `root`, is by its path alone. An extras folder directly in the
+/// root (`Movies/Shorts/`) is a folder of movies, not of extras. The scan keeps an extra only when its owner
+/// folder holds a movie of its own (see `scanner::scan_flat_library`).
 pub fn classify_movie_file(file: &Path, root: &Path) -> Classified {
     let Some(parent) = file.parent() else {
         return Classified::No;
@@ -113,6 +118,7 @@ pub fn classify_movie_file(file: &Path, root: &Path) -> Classified {
             .file_name()
             .and_then(|name| naming::extra_dir_kind(&name.to_string_lossy()))
         && let Some(owner_dir) = parent.parent()
+        && owner_dir != root
         && owner_dir.starts_with(root)
     {
         return in_extras_dir(file, owner_dir, kind);
@@ -142,7 +148,9 @@ pub fn classify_tv_file(file: &Path, root: &Path) -> Classified {
         }
         return match n {
             3 | 4 => in_extras_dir(file, parent.parent().unwrap_or(root), kind),
-            _ => Classified::Skip,
+            _ => Classified::Skip {
+                owner_dir: parent.to_path_buf(),
+            },
         };
     }
     // A file directly in a series or season folder.
@@ -154,8 +162,7 @@ pub fn classify_tv_file(file: &Path, root: &Path) -> Classified {
 
 /// The owner of `extra` among the items in its folder (`candidates`: id and lower-case file stem, in path
 /// order). A suffix's name picks the item whose file stem is that name, else the first whose stem starts with
-/// it; otherwise, or when none does, a folder with one item gives that one. A folder-wide extra (no name) in a
-/// folder with several goes to the first.
+/// it; otherwise the first item owns it.
 fn pick_owner<'a>(candidates: &'a [(String, String)], extra: &FoundExtra) -> Option<&'a str> {
     let wanted = extra.owner_name.trim().to_lowercase();
     if !wanted.is_empty()
@@ -170,11 +177,7 @@ fn pick_owner<'a>(candidates: &'a [(String, String)], extra: &FoundExtra) -> Opt
     {
         return Some(id);
     }
-    match candidates {
-        [(id, _)] => Some(id),
-        [(id, _), ..] if wanted.is_empty() => Some(id),
-        _ => None,
-    }
+    candidates.first().map(|(id, _)| id.as_str())
 }
 
 /// Stores the extras that a scan of `library` found in `scope`: each gets the owner its folder and name give
@@ -236,10 +239,10 @@ pub async fn sync_extras(
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
         match (owner, stored.get(&path)) {
-            (None, None) => {}
-            (None, Some(row)) => {
-                tracing::info!("removing {path}: it is an extra with no owner");
-                crate::scan_sync::delete_item(pool, &row.id).await?;
+            // No owner (a show folder whose series isn't stored): the file is left as it is, and a stored
+            // row is never deleted here.
+            (None, _) => {
+                tracing::debug!("{path} looks like an extra but has no owner; left as it is");
             }
             (Some(owner), Some(row)) => {
                 if row.extra_type.as_deref() != Some(kind) || row.owner_id.as_deref() != Some(owner)
@@ -284,21 +287,12 @@ pub async fn sync_extras(
     if new_items.is_empty() {
         return Ok(plans);
     }
-    let items: Vec<MediaItem> = new_items.iter().map(|(item, _, _)| item.clone()).collect();
+    // Each row is written with its owner and extra type, all in one transaction.
     rustyfin_db::busy::retry_busy("saving extras", || {
-        rustyfin_db::repo_media::batch_upsert_media_items(pool, &items)
+        repo_extras::insert_extras(pool, &new_items)
     })
     .await?;
-    for (item, owner, kind) in &new_items {
-        repo_extras::set_extra(
-            pool,
-            &item.id.to_string(),
-            owner,
-            kind,
-            item.media_type.item_kind(),
-            &item.name,
-        )
-        .await?;
+    for (item, _, _) in &new_items {
         plans.push((item.id, vec![ProbeStep::Primary(item.path.clone())]));
     }
     tracing::info!("library '{}': {} new extras", library.name, new_items.len());
@@ -391,7 +385,25 @@ mod tests {
             c("/m/A/backdrops/loop.mp4"),
             extra("/m/A/backdrops/loop.mp4", "/m/A", ExtraKind::ThemeVideo, "")
         );
-        assert_eq!(c("/m/A/theme-music/clip.mkv"), Classified::Skip);
+        assert_eq!(
+            c("/m/A/theme-music/clip.mkv"),
+            Classified::Skip {
+                owner_dir: PathBuf::from("/m/A")
+            }
+        );
+        // An extras folder in the root holds movies.
+        assert_eq!(c("/m/Shorts/Film.mkv"), Classified::No);
+        assert_eq!(c("/m/Extras/Film (2001).mkv"), Classified::No);
+        // A grouping folder's extras folder is read as extras here; the scan checks for a movie next to it.
+        assert_eq!(
+            c("/m/Collection/Featurettes/x.mkv"),
+            extra(
+                "/m/Collection/Featurettes/x.mkv",
+                "/m/Collection",
+                ExtraKind::Featurette,
+                ""
+            )
+        );
         assert_eq!(c("/m/A/A (2020).mkv"), Classified::No);
         assert_eq!(c("/m/A/notes.mp3"), Classified::No);
         // An extras folder that is the library root itself is a movie folder.
@@ -453,7 +465,7 @@ mod tests {
         assert_eq!(pick_owner(&one, &found("Movie (2020)")), Some("a"));
         assert_eq!(pick_owner(&one, &found("Other")), Some("a"));
         assert_eq!(pick_owner(&two, &found("Beta")), Some("b"));
-        assert_eq!(pick_owner(&two, &found("Gamma")), None);
+        assert_eq!(pick_owner(&two, &found("Gamma")), Some("a"));
         assert_eq!(pick_owner(&two, &found("")), Some("a"));
         assert_eq!(pick_owner(&[], &found("")), None);
         // The exact name wins over a longer one that sorts first.

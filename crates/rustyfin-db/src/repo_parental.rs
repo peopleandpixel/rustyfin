@@ -170,13 +170,15 @@ const FAILS_SQL: &str = "(r.id IN (SELECT value FROM json_each(?5)) \
          WHEN r.eff IN (SELECT value FROM json_each(?2)) THEN 0 \
          ELSE 1 END))";
 
-/// Every item the policy in `?1`-`?5` hides: the failing ones and everything under them.
+/// Every item the policy in `?1`-`?5` hides: the failing ones and everything under them, extras (an
+/// owner's trailers, special features and themes) included.
 fn hidden_sql() -> String {
     format!(
         "WITH RECURSIVE rated AS ({rated}), \
          failing(id) AS (SELECT r.id FROM rated r WHERE {FAILS_SQL}), \
          hidden(id) AS (SELECT id FROM failing \
-             UNION SELECT c.id FROM media_items c JOIN hidden h ON c.parent_id = h.id) \
+             UNION SELECT c.id FROM media_items c JOIN hidden h ON c.parent_id = h.id \
+             UNION SELECT c.id FROM media_items c JOIN hidden h ON c.owner_id = h.id) \
          SELECT id FROM hidden",
         rated = rated_select(""),
     )
@@ -190,12 +192,13 @@ fn chain_fails_sql() -> String {
     )
 }
 
-/// The rows `FAILS_SQL` reads: every media item `m`, or those `filter` (a WHERE clause) keeps.
+/// The rows `FAILS_SQL` reads: every media item `m`, or those `filter` (a WHERE clause) keeps. An
+/// extra with no rating of its own takes its owner's, as an item takes its parent's.
 fn rated_select(filter: &str) -> String {
     format!(
         "SELECT m.id AS id, {kind} AS kind, COALESCE({own}, {parent}, {grandparent}) AS eff \
          FROM media_items m \
-         LEFT JOIN media_items mp ON mp.id = m.parent_id \
+         LEFT JOIN media_items mp ON mp.id = COALESCE(m.parent_id, m.owner_id) \
          LEFT JOIN media_items mg ON mg.id = mp.parent_id {filter}",
         kind = unrated_kind_sql("m.media_type"),
         own = rating_sql("m"),
@@ -263,9 +266,10 @@ pub async fn hidden_item_ids(
     let allowed: HashSet<String> = policy.allowed_tag_keys().into_iter().collect();
     let mut tag_failures = Vec::new();
     if !blocked.is_empty() || !allowed.is_empty() {
+        // An extra is not a top-level item: its owner's tags decide (`hidden_sql` hides it with its owner).
         let rows: Vec<(String, String, bool)> = sqlx::query_as(
-            "SELECT id, tags, parent_id IS NULL FROM media_items \
-             WHERE tags != '' OR (? AND parent_id IS NULL)",
+            "SELECT id, tags, parent_id IS NULL AND owner_id IS NULL FROM media_items \
+             WHERE tags != '' OR (? AND parent_id IS NULL AND owner_id IS NULL)",
         )
         .bind(!allowed.is_empty())
         .fetch_all(pool)

@@ -952,6 +952,8 @@ async fn scan_flat_library(
     let mut movie_files: BTreeMap<PathBuf, Vec<PathBuf>> = BTreeMap::new();
     // The trailers, special features and theme media of the movies. They are stored after the movies.
     let mut found_extras: Vec<extras::FoundExtra> = Vec::new();
+    // The files in extras folders that aren't that folder's kind of media, with their owner folder.
+    let mut skipped_extras: Vec<(PathBuf, PathBuf)> = Vec::new();
     let reads_extras = matches!(library.content_type, LibraryContentType::Movies);
 
     // Every file that the walks returned, every folder they could not list, and every symlink
@@ -980,7 +982,10 @@ async fn scan_flat_library(
                         found_extras.push(found);
                         continue;
                     }
-                    extras::Classified::Skip => continue,
+                    extras::Classified::Skip { owner_dir } => {
+                        skipped_extras.push((file_path_buf, owner_dir));
+                        continue;
+                    }
                     extras::Classified::No => {}
                 }
             }
@@ -1056,6 +1061,50 @@ async fn scan_flat_library(
             new_plans.push((item.id, vec![probe::ProbeStep::Primary(item.path.clone())]));
             new_items.push(item);
         }
+    }
+
+    // An extra belongs to the movie next to it: one whose owner folder holds no movie video of its own (the
+    // `Featurettes/` of a folder that only groups other folders) is a movie file like any other, and a stored
+    // extra there becomes a movie again, keeping its id.
+    let movie_folders: HashSet<PathBuf> = movie_files.keys().cloned().collect();
+    let mut released: Vec<String> = Vec::new();
+    let mut owned_extras: Vec<extras::FoundExtra> = Vec::new();
+    let unowned_files = found_extras
+        .into_iter()
+        .filter_map(|extra| {
+            if movie_folders.contains(&extra.owner_dir) {
+                owned_extras.push(extra);
+                None
+            } else {
+                Some(extra.path)
+            }
+        })
+        .chain(
+            skipped_extras
+                .into_iter()
+                .filter(|(_, owner_dir)| !movie_folders.contains(owner_dir))
+                .map(|(file, _)| file),
+        );
+    for file in unowned_files {
+        let is_video = file.extension().is_some_and(|e| {
+            VIDEO_EXTENSIONS.contains(&e.to_string_lossy().to_lowercase().as_str())
+        });
+        if let (true, Some(folder)) = (is_video, file.parent()) {
+            released.push(file.to_string_lossy().into_owned());
+            movie_files
+                .entry(folder.to_path_buf())
+                .or_default()
+                .push(file);
+        }
+    }
+    let found_extras = owned_extras;
+    if let Err(e) =
+        rustyfin_db::repo_extras::release_extras(pool, library.id, &released, "Movie").await
+    {
+        tracing::error!(
+            "failed to make the extras of '{}' movies again: {e}",
+            library.name
+        );
     }
 
     // Group the movie files of each folder into movies, then reconcile them with the items
@@ -1274,7 +1323,7 @@ async fn scan_tv_library(
                     found_extras.push(found);
                     continue;
                 }
-                extras::Classified::Skip => continue,
+                extras::Classified::Skip { .. } => continue,
                 extras::Classified::No => {}
             }
             if !is_episode_file(&file_path_buf) {

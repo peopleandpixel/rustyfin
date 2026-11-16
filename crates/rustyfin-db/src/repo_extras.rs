@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 
+use rustyfin_model::media::MediaItem;
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
@@ -100,6 +101,64 @@ pub async fn set_extra(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Adds new extras, each `(item, owner id, extra type)`, in one write transaction: a row is written with
+/// its owner and extra type, so no listing ever sees an extra as a library item.
+pub async fn insert_extras(
+    pool: &SqlitePool,
+    extras: &[(MediaItem, String, &str)],
+) -> Result<(), sqlx::Error> {
+    if extras.is_empty() {
+        return Ok(());
+    }
+    let mut tx = crate::begin_write(pool).await?;
+    for (item, owner, extra_type) in extras {
+        sqlx::query(
+            "INSERT INTO media_items
+                 (id, name, sort_name, media_type, path, library_id, genres, date_created,
+                  location_type, extra_type, owner_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, '', ?7, ?8, ?9, ?10)",
+        )
+        .bind(item.id.to_string())
+        .bind(&item.name)
+        .bind(&item.sort_name)
+        .bind(item.media_type.item_kind())
+        .bind(&item.path)
+        .bind(item.library_id.to_string())
+        .bind(item.date_created.to_rfc3339())
+        .bind(item.location_type.as_str())
+        .bind(*extra_type)
+        .bind(owner)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await
+}
+
+/// Makes the stored extras of `library_id` at `paths` library items of type `media_type` again, keeping
+/// their ids and user data: a file that is no longer an extra (its folder no longer holds its movie).
+pub async fn release_extras(
+    pool: &SqlitePool,
+    library_id: Uuid,
+    paths: &[String],
+    media_type: &str,
+) -> Result<u64, sqlx::Error> {
+    if paths.is_empty() {
+        return Ok(0);
+    }
+    let paths = serde_json::to_string(paths).unwrap_or_else(|_| "[]".to_string());
+    let done = sqlx::query(
+        "UPDATE media_items SET extra_type = NULL, owner_id = NULL, media_type = ?3
+         WHERE library_id = ?1 AND extra_type IS NOT NULL
+           AND path IN (SELECT value FROM json_each(?2))",
+    )
+    .bind(library_id.to_string())
+    .bind(paths)
+    .bind(media_type)
+    .execute(pool)
+    .await?;
+    Ok(done.rows_affected())
 }
 
 /// The extras of `owner` whose extra type is one of `types`, by name: their ids and extra types.
