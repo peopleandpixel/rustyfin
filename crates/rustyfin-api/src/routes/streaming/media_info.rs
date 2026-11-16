@@ -17,7 +17,7 @@ use rustyfin_model::items_playback_info::{
 };
 use rustyfin_model::media::MediaType;
 use rustyfin_model::media_source::MediaSourceResponse;
-use rustyfin_model::parental::AccessPolicy;
+
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -104,13 +104,7 @@ async fn playback_info(
     } else {
         MediaKind::Video
     };
-    let access = if claims.sub.is_nil() {
-        AccessPolicy::default()
-    } else {
-        rustyfin_db::repo_parental::get_policy(&state.db_ro, claims.sub)
-            .await?
-            .access
-    };
+    let access = crate::parental::caller_access(state, claims).await?;
     if !access.enable_media_playback {
         return Ok(ItemsPlaybackInfoResponse {
             media_sources: Vec::new(),
@@ -182,7 +176,9 @@ async fn playback_info(
     for index in chosen {
         let mut source = sources[index].clone();
         // The loader's flags are a placeholder; the device data below decides them when present
-        source.supports_direct_play = true;
+        // ForceRemoteSourceTranscoding: a remote source (a URL) is never played as it is
+        let may_direct = !(access.force_remote_source_transcoding && source.is_remote);
+        source.supports_direct_play = may_direct;
         source.supports_direct_stream = may_remux;
         source.supports_transcoding = may_transcode;
         let value = match &profile {
@@ -201,7 +197,7 @@ async fn playback_info(
                     audio_stream_index: dto.audio_stream_index,
                     subtitle_stream_index: dto.subtitle_stream_index,
                     max_audio_channels: dto.max_audio_channels,
-                    enable_direct_play: dto.enable_direct_play.unwrap_or(true),
+                    enable_direct_play: dto.enable_direct_play.unwrap_or(true) && may_direct,
                     enable_direct_stream: dto.enable_direct_stream.unwrap_or(true) && may_remux,
                     enable_transcoding: dto.enable_transcoding.unwrap_or(true) && may_transcode,
                     allow_video_stream_copy: dto.allow_video_stream_copy.unwrap_or(true),

@@ -67,10 +67,17 @@ fn policy_from_row((max, sub, unrated, blocked, allowed, access): Row) -> Parent
     // Only set_policy writes these columns: JSON arrays of strings, and an AccessPolicy object.
     let list = |s: &str| serde_json::from_str::<Vec<String>>(s).unwrap_or_default();
     let access = serde_json::from_str::<AccessPolicy>(&access).unwrap_or_else(|e| {
-        // Fail closed: an unreadable policy shows no library rather than every one.
-        tracing::warn!(error = %e, "unreadable access policy; the user sees no library");
+        // Fail closed: an unreadable policy shows no library, allows no remote access and, by a
+        // schedule whose day is none, no time for a user who isn't an administrator.
+        tracing::warn!(error = %e, "unreadable access policy; the user is locked out");
         AccessPolicy {
             enable_all_folders: false,
+            enable_remote_access: false,
+            access_schedules: vec![rustyfin_model::parental::AccessSchedule {
+                day_of_week: "Never".into(),
+                start_hour: 0.0,
+                end_hour: 0.0,
+            }],
             ..AccessPolicy::default()
         }
     });
@@ -90,6 +97,16 @@ pub async fn set_policy(
     user_id: Uuid,
     policy: &ParentalPolicy,
 ) -> Result<bool, sqlx::Error> {
+    let mut conn = pool.acquire().await?;
+    write_policy(&mut conn, user_id, policy).await
+}
+
+/// `set_policy` on a connection or in a transaction.
+pub async fn write_policy(
+    conn: &mut sqlx::SqliteConnection,
+    user_id: Uuid,
+    policy: &ParentalPolicy,
+) -> Result<bool, sqlx::Error> {
     let json = |v: &[String]| serde_json::Value::from(v.to_vec()).to_string();
     let done = sqlx::query(
         "UPDATE users SET max_parental_rating = ?, max_parental_sub_rating = ?, \
@@ -103,7 +120,7 @@ pub async fn set_policy(
     .bind(json(&policy.allowed_tags))
     .bind(serde_json::to_string(&policy.access).unwrap_or_else(|_| "{}".into()))
     .bind(user_id.to_string())
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     Ok(done.rows_affected() > 0)
 }
@@ -130,31 +147,28 @@ fn rating_sql(alias: &str) -> String {
     )
 }
 
-/// The policy as the SQL parameters `?1` to `?6` of the queries below: whether ratings are
+/// The policy as the SQL parameters `?1` to `?5` of the queries below: whether ratings are
 /// limited, the stored ratings within the limit, the stored ratings that count as unrated, the
-/// unrated kinds to hide, the ids that fail on their tags (JSON arrays), and the libraries the
-/// user may see (a JSON array, NULL for all).
+/// unrated kinds to hide, and the ids that fail on their tags (JSON arrays).
 struct Params {
     limits_ratings: bool,
     allowed: String,
     unrated: String,
     block_unrated: String,
     tag_failures: String,
-    folders: Option<String>,
 }
 
-/// Whether the `r` row (id, kind, lib, eff = rating with inheritance) fails the policy in
-/// `?1`-`?6`. The lists are bound parameters, not columns, so each `IN (SELECT ... json_each(?n))`
-/// is an uncorrelated subquery that SQLite builds once per statement rather than once per row.
+/// Whether the `r` row (id, kind, eff = rating with inheritance) fails the policy in `?1`-`?5`.
+/// The lists are bound parameters, not columns, so each `IN (SELECT ... json_each(?n))` is an
+/// uncorrelated subquery that SQLite builds once per statement rather than once per row.
 const FAILS_SQL: &str = "(r.id IN (SELECT value FROM json_each(?5)) \
-     OR (?6 IS NOT NULL AND lower(r.lib) NOT IN (SELECT lower(value) FROM json_each(?6))) \
      OR (?1 = 1 AND CASE \
          WHEN r.eff IS NULL OR r.eff IN (SELECT value FROM json_each(?3)) \
              THEN COALESCE(r.kind IN (SELECT value FROM json_each(?4)), 0) \
          WHEN r.eff IN (SELECT value FROM json_each(?2)) THEN 0 \
          ELSE 1 END))";
 
-/// Every item the policy in `?1`-`?6` hides: the failing ones and everything under them.
+/// Every item the policy in `?1`-`?5` hides: the failing ones and everything under them.
 fn hidden_sql() -> String {
     format!(
         "WITH RECURSIVE rated AS ({rated}), \
@@ -166,19 +180,18 @@ fn hidden_sql() -> String {
     )
 }
 
-/// Whether any of the items in the JSON array `?7` fails the policy in `?1`-`?6`.
+/// Whether any of the items in the JSON array `?6` fails the policy in `?1`-`?5`.
 fn chain_fails_sql() -> String {
     format!(
         "WITH rated AS ({rated}) SELECT EXISTS (SELECT 1 FROM rated r WHERE {FAILS_SQL})",
-        rated = rated_select("WHERE m.id IN (SELECT value FROM json_each(?7))"),
+        rated = rated_select("WHERE m.id IN (SELECT value FROM json_each(?6))"),
     )
 }
 
 /// The rows `FAILS_SQL` reads: every media item `m`, or those `filter` (a WHERE clause) keeps.
 fn rated_select(filter: &str) -> String {
     format!(
-        "SELECT m.id AS id, {kind} AS kind, m.library_id AS lib, \
-         COALESCE({own}, {parent}, {grandparent}) AS eff \
+        "SELECT m.id AS id, {kind} AS kind, COALESCE({own}, {parent}, {grandparent}) AS eff \
          FROM media_items m \
          LEFT JOIN media_items mp ON mp.id = m.parent_id \
          LEFT JOIN media_items mg ON mg.id = mp.parent_id {filter}",
@@ -217,7 +230,6 @@ async fn params(
         unrated: json(unrated),
         block_unrated: json(policy.block_unrated_items.clone()),
         tag_failures: json(tag_failures.to_vec()),
-        folders: policy.enabled_folders().map(|ids| json(ids.to_vec())),
     })
 }
 
@@ -235,13 +247,14 @@ fn fails_on_tags(
     top_level && !allowed.is_empty() && !item_tag_keys(tags).any(|t| allowed.contains(&t))
 }
 
-/// Every item the policy hides, the items under them included, by id as stored. Empty when the
-/// policy hides nothing.
+/// Every item the policy's ratings and tags hide, the items under them included, by id as stored.
+/// Empty when they hide nothing. Library access isn't in this set: `filter_json` and
+/// `visible_sql` apply it per library, which stays small however many items a library holds.
 pub async fn hidden_item_ids(
     pool: &SqlitePool,
     policy: &ParentalPolicy,
 ) -> Result<HashSet<String>, sqlx::Error> {
-    if !policy.is_restricted() {
+    if !policy.filters_items() {
         return Ok(HashSet::new());
     }
     let blocked: HashSet<String> = policy.blocked_tag_keys().into_iter().collect();
@@ -268,10 +281,35 @@ pub async fn hidden_item_ids(
         .bind(&p.unrated)
         .bind(&p.block_unrated)
         .bind(&p.tag_failures)
-        .bind(&p.folders)
         .fetch_all(pool)
         .await?;
     Ok(ids.into_iter().collect())
+}
+
+/// What a limited user may see, as one JSON parameter for `visible_sql`: `h`, the ids the ratings
+/// and tags hide, and `l`, the library ids the user may see (null for every library). `None` when
+/// nothing is hidden.
+pub fn filter_json(hidden: &HashSet<String>, folders: Option<&[String]>) -> Option<String> {
+    if hidden.is_empty() && folders.is_none() {
+        return None;
+    }
+    let folders = folders.map(|ids| {
+        ids.iter()
+            .map(|id| id.to_ascii_lowercase())
+            .collect::<Vec<_>>()
+    });
+    Some(serde_json::json!({ "h": hidden, "l": folders }).to_string())
+}
+
+/// The SQL condition that an item (id column `id`, library column `lib`) passes the filter
+/// `filter_json` made, bound as `param` (a numbered parameter such as `?4`, which may appear more
+/// than once). A NULL filter passes every item.
+pub fn visible_sql(id: &str, lib: &str, param: &str) -> String {
+    format!(
+        "({param} IS NULL OR ({id} NOT IN (SELECT value FROM json_each({param}, '$.h')) \
+         AND (json_type({param}, '$.l') IS NOT 'array' \
+              OR {lib} IN (SELECT value FROM json_each({param}, '$.l')))))"
+    )
 }
 
 /// Whether the policy hides this item: it or an item above it fails. An id that isn't a media
@@ -296,6 +334,9 @@ pub async fn is_item_hidden(
         if library.is_some_and(|lib| !policy.allows_folder(&lib)) {
             return Ok(true);
         }
+    }
+    if !policy.filters_items() {
+        return Ok(false);
     }
     // The item and every item above it, nearest first.
     let chain: Vec<(String, String, bool)> = sqlx::query_as(
@@ -329,7 +370,6 @@ pub async fn is_item_hidden(
         .bind(&p.unrated)
         .bind(&p.block_unrated)
         .bind(&p.tag_failures)
-        .bind(&p.folders)
         .bind(serde_json::Value::from(ids).to_string())
         .fetch_one(pool)
         .await?;

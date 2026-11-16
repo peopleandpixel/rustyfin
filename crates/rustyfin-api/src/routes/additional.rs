@@ -66,7 +66,7 @@ async fn get_recommendations(
         .map_err(|e| crate::error::ApiError::Internal(e.to_string()))?;
     HiddenItems::for_caller(&state, &claims)
         .await?
-        .retain(&mut items, |i| i.id);
+        .retain(&mut items);
 
     let total = items.len() as i64;
     Ok((
@@ -95,7 +95,7 @@ async fn get_featured(
         .map_err(|e| crate::error::ApiError::Internal(e.to_string()))?;
     HiddenItems::for_caller(&state, &claims)
         .await?
-        .retain(&mut items, |i| i.id);
+        .retain(&mut items);
 
     let total = items.len() as i64;
     Ok((
@@ -133,7 +133,7 @@ async fn get_instant_mix(
     let mut items = rustyfin_db::repo_media::get_similar_items(&state.db_ro, &source, 50)
         .await
         .map_err(|e| crate::error::ApiError::Internal(e.to_string()))?;
-    hidden.retain(&mut items, |i| i.id);
+    hidden.retain(&mut items);
 
     let total = items.len() as i64;
     Ok((
@@ -166,7 +166,7 @@ async fn get_albums_instant_mix(
     let mut items = rustyfin_db::repo_media::get_similar_items(&state.db_ro, &source, 50)
         .await
         .map_err(|e| crate::error::ApiError::Internal(e.to_string()))?;
-    hidden.retain(&mut items, |i| i.id);
+    hidden.retain(&mut items);
     let total = items.len() as i64;
     Ok((
         StatusCode::OK,
@@ -198,7 +198,7 @@ async fn get_albums_similar(
     let mut items = rustyfin_db::repo_media::get_similar_items(&state.db_ro, &source, 20)
         .await
         .map_err(|e| crate::error::ApiError::Internal(e.to_string()))?;
-    hidden.retain(&mut items, |i| i.id);
+    hidden.retain(&mut items);
     let total = items.len() as i64;
     Ok((
         StatusCode::OK,
@@ -230,7 +230,7 @@ async fn get_artists_instant_mix(
     let mut items = rustyfin_db::repo_media::get_similar_items(&state.db_ro, &source, 50)
         .await
         .map_err(|e| crate::error::ApiError::Internal(e.to_string()))?;
-    hidden.retain(&mut items, |i| i.id);
+    hidden.retain(&mut items);
     let total = items.len() as i64;
     Ok((
         StatusCode::OK,
@@ -262,7 +262,7 @@ async fn get_artists_similar(
     let mut items = rustyfin_db::repo_media::get_similar_items(&state.db_ro, &source, 20)
         .await
         .map_err(|e| crate::error::ApiError::Internal(e.to_string()))?;
-    hidden.retain(&mut items, |i| i.id);
+    hidden.retain(&mut items);
     let total = items.len() as i64;
     Ok((
         StatusCode::OK,
@@ -340,7 +340,7 @@ async fn get_movies_similar(
     let mut items = rustyfin_db::repo_media::get_similar_items(&state.db_ro, &source, 20)
         .await
         .map_err(|e| crate::error::ApiError::Internal(e.to_string()))?;
-    hidden.retain(&mut items, |i| i.id);
+    hidden.retain(&mut items);
     let total = items.len() as i64;
     Ok((
         StatusCode::OK,
@@ -372,7 +372,7 @@ async fn get_shows_similar(
     let mut items = rustyfin_db::repo_media::get_similar_items(&state.db_ro, &source, 20)
         .await
         .map_err(|e| crate::error::ApiError::Internal(e.to_string()))?;
-    hidden.retain(&mut items, |i| i.id);
+    hidden.retain(&mut items);
     let total = items.len() as i64;
     Ok((
         StatusCode::OK,
@@ -404,7 +404,7 @@ async fn get_playlists_instant_mix(
     let mut items = rustyfin_db::repo_media::get_similar_items(&state.db_ro, &source, 50)
         .await
         .map_err(|e| crate::error::ApiError::Internal(e.to_string()))?;
-    hidden.retain(&mut items, |i| i.id);
+    hidden.retain(&mut items);
     let total = items.len() as i64;
     Ok((
         StatusCode::OK,

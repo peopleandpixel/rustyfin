@@ -688,7 +688,7 @@ pub async fn get_latest_items(
     library_id: Option<Uuid>,
     hidden_ids_json: Option<&str>,
 ) -> Result<Vec<MediaItem>, sqlx::Error> {
-    let rows = sqlx::query_as::<_, MediaItemRow>(
+    let rows = sqlx::query_as::<_, MediaItemRow>(sqlx::AssertSqlSafe(format!(
         "SELECT id, name, sort_name, overview, media_type, path, parent_id, library_id, \
          production_year, community_rating, official_rating, genres, date_created, \
          premiere_date, runtime_ticks, index_number, parent_index_number, index_number_end, location_type, tmdb_id, tvdb_id, \
@@ -697,9 +697,10 @@ pub async fn get_latest_items(
          FROM media_items \
          WHERE (?1 IS NULL OR media_type = ?1) \
          AND (?2 IS NULL OR library_id = ?2) \
-         AND (?4 IS NULL OR id NOT IN (SELECT value FROM json_each(?4))) \
+         AND {visible} \
          ORDER BY date_created DESC LIMIT ?3",
-    )
+        visible = crate::repo_parental::visible_sql("id", "library_id", "?4"),
+    )))
     .bind(media_type)
     .bind(library_id.map(|u| u.to_string()))
     .bind(limit)
@@ -1226,7 +1227,8 @@ fn build_filtered_query(
         AND (? IS NULL OR runtime_ticks >= ?)
         AND (? IS NULL OR runtime_ticks <= ?)
         AND (? IS NULL OR id IN (SELECT value FROM json_each(?)))
-        AND (? IS NULL OR id NOT IN (SELECT value FROM json_each(?)))
+        AND (? IS NULL OR (id NOT IN (SELECT value FROM json_each(?, '$.h'))
+             AND (json_type(?, '$.l') IS NOT 'array' OR library_id IN (SELECT value FROM json_each(?, '$.l')))))
     ";
 
     // Combine base WHERE with array filter WHERE parts
@@ -1460,6 +1462,8 @@ pub async fn get_items_filtered(
         .bind(&item_ids_json)
         .bind(&item_ids_json)
         .bind(hidden_ids_json)
+        .bind(hidden_ids_json)
+        .bind(hidden_ids_json)
         .bind(hidden_ids_json);
 
     // Array filter params
@@ -1578,6 +1582,8 @@ pub async fn get_items_filtered(
         .bind(&max_ticks)
         .bind(&item_ids_json)
         .bind(&item_ids_json)
+        .bind(hidden_ids_json)
+        .bind(hidden_ids_json)
         .bind(hidden_ids_json)
         .bind(hidden_ids_json);
 
@@ -2139,9 +2145,14 @@ async fn get_filters_distinct(
             qb.push(")");
         }
         if let Some(hidden) = hidden_ids_json {
+            // The filter of repo_parental::filter_json, bound once for each use.
             qb.push(" AND id NOT IN (SELECT value FROM json_each(")
                 .push_bind(hidden.to_string())
-                .push("))");
+                .push(", '$.h')) AND (json_type(")
+                .push_bind(hidden.to_string())
+                .push(", '$.l') IS NOT 'array' OR library_id IN (SELECT value FROM json_each(")
+                .push_bind(hidden.to_string())
+                .push(", '$.l')))");
         }
         qb
     };
@@ -2543,7 +2554,11 @@ pub async fn get_user_resume_items(
               OR m.parent_id IN (SELECT id FROM media_items WHERE parent_id = ?2)) \
          AND (json_array_length(?3) = 0 OR m.media_type IN (SELECT value FROM json_each(?3))) \
          AND m.media_type NOT IN (SELECT value FROM json_each(?4)) \
-         AND (?5 IS NULL OR m.id NOT IN (SELECT value FROM json_each(?5)))";
+         AND {visible}";
+    let from = from.replace(
+        "{visible}",
+        &crate::repo_parental::visible_sql("m.id", "m.library_id", "?5"),
+    );
     let hidden = filter.hidden_ids_json.as_deref();
     let total: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) {from}")))
         .bind(&uid)

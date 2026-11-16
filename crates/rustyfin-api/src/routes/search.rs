@@ -506,14 +506,20 @@ async fn search_hints(
         &request.exclude_item_types,
         request.flags,
     );
-    let candidates =
-        rustyfin_db::repo_search::hint_candidates(&state.db_ro, &request.term, request.parent)
-            .await?;
+    let candidates = rustyfin_db::repo_search::hint_candidates(
+        &state.db_ro,
+        &request.term,
+        request.parent,
+        hidden.libraries_json().as_deref(),
+    )
+    .await?;
     let mut hits: Vec<(u8, HintCandidate)> = candidates
         .into_iter()
         .filter_map(|candidate| {
             let kind = stored_kind(&candidate.kind);
-            if hidden.hides(candidate.id) || !request.keeps(&filter, kind, &candidate.tags) {
+            if hidden.hides(candidate.id, candidate.library_id)
+                || !request.keeps(&filter, kind, &candidate.tags)
+            {
                 return None;
             }
             Some((match_score(&clean_term, &candidate.name), candidate))
@@ -618,7 +624,7 @@ async fn full_search(
     };
     let mut items =
         rustyfin_db::repo_search::search_items(&state.db_ro, term, &kinds, fetch).await?;
-    hidden.retain(&mut items, |i| i.id);
+    hidden.retain(&mut items);
 
     let total = items.len() as i64;
     let page: Vec<MediaItem> = items.into_iter().skip(start).take(limit).collect();

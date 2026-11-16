@@ -161,7 +161,7 @@ async fn views_for(state: &AppState, user: Uuid) -> Result<Value, ApiError> {
             views
         }
     };
-    let policy = rustyfin_db::repo_parental::get_policy(&state.db_ro, user).await?;
+    let policy = crate::parental::user_policy(state, user).await?;
     if policy.enabled_folders().is_some()
         && let Some(items) = views.get_mut("Items").and_then(Value::as_array_mut)
     {

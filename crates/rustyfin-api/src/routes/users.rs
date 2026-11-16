@@ -338,10 +338,12 @@ async fn change_password(
     Ok(Json(serde_json::json!({})))
 }
 
-/// Sets an account's administrator and disabled flags. Administrators only. Refuses, with 403, to
-/// change the owner's role or state, to remove or disable one's own administrator rights or account,
-/// to disable an administrator, and to leave no enabled administrator. Disabling an account deletes its
-/// tokens, sessions and devices.
+/// Sets an account's administrator and disabled flags and its parental and access policy.
+/// Administrators only. Refuses, with 403, to change the owner's role or state, to remove or disable
+/// one's own administrator rights or account, to take away the owner's or one's own remote access or
+/// add an access schedule to them, to disable an administrator, to leave no enabled administrator,
+/// and to leave no enabled administrator with remote access. Disabling an account deletes its tokens,
+/// sessions and devices.
 async fn update_policy(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
@@ -362,12 +364,22 @@ async fn update_policy(
     }
 
     // Checked before anything is stored, so a policy that can't be kept changes nothing.
-    let parental = parental_policy(
-        &req,
-        rustyfin_db::repo_parental::get_policy(&state.db, id).await?,
-    )?;
+    let stored = rustyfin_db::repo_parental::get_policy(&state.db, id).await?;
+    let parental = parental_policy(&req, stored.clone())?;
+    // A change that would lock the account out: remote access taken away, or a new schedule
+    let locks_out = (stored.access.enable_remote_access && !parental.access.enable_remote_access)
+        || (!parental.access.access_schedules.is_empty()
+            && parental.access.access_schedules != stored.access.access_schedules);
+    let is_owner = rustyfin_db::repo_user::is_owner(&state.db, id).await?;
+    if locks_out && (is_owner || claims.sub == id) {
+        return Err(ApiError::Forbidden(if is_owner {
+            "The server owner's remote access and access times cannot be limited.".into()
+        } else {
+            "You cannot limit your own remote access or access times.".into()
+        }));
+    }
 
-    if rustyfin_db::repo_user::is_owner(&state.db, id).await? {
+    if is_owner {
         if req.is_administrator == Some(false) {
             return Err(ApiError::Forbidden(
                 "The server owner must stay an administrator.".into(),
@@ -393,9 +405,15 @@ async fn update_policy(
         }
     }
 
-    let change =
-        rustyfin_db::repo_user::set_policy(&state.db, id, req.is_administrator, req.is_disabled)
-            .await?;
+    // The flags and the parental and access policy are stored in one transaction.
+    let change = rustyfin_db::repo_user::set_policy_with(
+        &state.db,
+        id,
+        req.is_administrator,
+        req.is_disabled,
+        Some(&parental),
+    )
+    .await?;
     match change {
         PolicyChange::Done => {}
         PolicyChange::NotFound => return Err(ApiError::NotFound("user not found".into())),
@@ -414,9 +432,11 @@ async fn update_policy(
                 "There must be at least one enabled administrator.".into(),
             ));
         }
-    }
-    if !rustyfin_db::repo_parental::set_policy(&state.db, id, &parental).await? {
-        return Err(ApiError::NotFound("user not found".into()));
+        PolicyChange::NoRemoteAdmin => {
+            return Err(ApiError::Forbidden(
+                "There must be at least one enabled administrator who may sign in remotely.".into(),
+            ));
+        }
     }
 
     Ok(Json(serde_json::json!({})))

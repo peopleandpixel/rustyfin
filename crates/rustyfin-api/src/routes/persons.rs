@@ -93,7 +93,7 @@ async fn get_person_items(
     let mut items = rustyfin_db::repo_person::get_person_items(&state.db_ro, &id).await?;
     HiddenItems::for_caller(&state, &claims)
         .await?
-        .retain(&mut items, |i| i.id);
+        .retain(&mut items);
     let total = items.len() as i64;
     Ok(Json(QueryResult {
         items,

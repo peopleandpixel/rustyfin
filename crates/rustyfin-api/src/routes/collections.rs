@@ -95,7 +95,7 @@ async fn visible_collection_count(
     if hidden.is_restricted() {
         let mut items =
             rustyfin_db::repo_collection::get_collection_items(&state.db_ro, collection.id).await?;
-        hidden.retain(&mut items, |i| i.id);
+        hidden.retain(&mut items);
         collection.child_count = items.len() as i64;
     }
     Ok(())
@@ -113,7 +113,7 @@ async fn visible_playlist_count(
         let mut items =
             rustyfin_db::repo_playlist::get_playlist_items(&state.db_ro, playlist.id, caller)
                 .await?;
-        hidden.retain(&mut items, |i| i.id);
+        hidden.retain(&mut items);
         playlist.child_count = items.len() as i64;
     }
     Ok(())
@@ -228,7 +228,7 @@ async fn get_collection_items(
     let mut items = rustyfin_db::repo_collection::get_collection_items(&state.db_ro, id).await?;
     HiddenItems::for_caller(&state, &claims)
         .await?
-        .retain(&mut items, |i| i.id);
+        .retain(&mut items);
     let count = items.len() as i64;
     Ok(Json(QueryResult {
         items,
@@ -379,7 +379,7 @@ pub(crate) async fn playlist_entries(
     let mut all = rustyfin_db::repo_playlist::get_playlist_items(&state.db_ro, id, caller).await?;
     HiddenItems::for_caller(state, claims)
         .await?
-        .retain(&mut all, |i| i.id);
+        .retain(&mut all);
     if shuffle {
         rustyfin_db::repo_media::shuffle(&mut all);
     }

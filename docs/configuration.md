@@ -24,6 +24,7 @@ Rustyfin wird über Umgebungsvariablen konfiguriert. Es sind keine Konfiguration
 | `RUSTYFIN_RATE_WINDOW` | Zeitfenster der Ratenbegrenzung in Sekunden | `60` |
 | `RUST_LOG` | Log-Level-Filter (z.B. `debug`, `info`, `rustyfin=trace`) | `info` |
 | `RUSTYFIN_LOG_HISTORY` | Anzahl der letzten Log-Zeilen, die das Live-Log der Verwaltung beim Öffnen erhält (`0` behält keine, höchstens `100000`; je Zeile bis zu 8 KiB) | `1000` |
+| `TZ` | Zeitzone des Servers (z.B. `Europe/Berlin`). Die Zugriffszeiten der Benutzer gelten in dieser Zeit, siehe [Zugriffszeiten](#zugriffszeiten) | Zeitzone des Systems; in einem Container ohne `TZ` meist UTC |
 
 ## Beispielkonfigurationen
 
@@ -139,6 +140,10 @@ curl -H "Authorization: MediaBrowser Token=<api-key>" \
 ### Quick Connect
 
 Quick Connect ermöglicht die Anmeldung ohne Passwort über einen temporären Code. Diese Funktion ist standardmäßig aktiviert.
+
+### Zugriffszeiten
+
+Ein Administrator kann einem Benutzer Zugriffszeiten geben (Verwaltung → Benutzer → Bearbeiten → Jugendschutz). Außerhalb dieser Zeiten kann sich ein Benutzer, der kein Administrator ist, nicht anmelden, und jede Anfrage wird mit 403 abgelehnt, wie bei Jellyfin. Die Zeiten gelten in der Ortszeit des Servers: Setze `TZ` (z.B. `TZ=Europe/Berlin`), sonst rechnet ein Container meist in UTC. Das Docker-Image enthält die Zeitzonendaten (`tzdata`).
 
 ## Logging
 

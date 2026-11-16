@@ -74,13 +74,26 @@ pub async fn require_auth(
 ) -> Result<Response, ApiError> {
     let (claims, token) = request_claims(&state, req.headers(), req.uri()).await?;
     let local = resolve_client(addr.ip(), req.headers(), &state.known_proxies).is_local();
-    crate::parental::check_access(&state, &claims, local).await?;
+    // The caller's policy, read once: checked here (Jellyfin's DefaultAuthorizationHandler: remote
+    // access and the access schedule) and kept for the request's other checks.
+    let policy = if claims.sub.is_nil() {
+        None
+    } else {
+        let policy = rustyfin_db::repo_parental::get_policy(&state.db_ro, claims.sub).await?;
+        crate::parental::access_allowed(&policy.access, claims.is_admin, local)?;
+        Some((claims.sub, std::sync::Arc::new(policy)))
+    };
     req.extensions_mut().insert(ClientIsLocal(local));
     req.extensions_mut().insert(claims);
     if let Some(t) = token {
         req.extensions_mut().insert(rustyfin_auth::RequestToken(t));
     }
-    Ok(next.run(req).await)
+    Ok(match policy {
+        Some((user, policy)) => {
+            crate::parental::with_request_policy(user, policy, next.run(req)).await
+        }
+        None => next.run(req).await,
+    })
 }
 
 /// Guards the setup wizard routes. While the server has no users, anyone may use them. After that, only an

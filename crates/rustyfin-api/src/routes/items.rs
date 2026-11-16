@@ -2821,9 +2821,8 @@ async fn delete_item(
     }
     // Jellyfin's EnableContentDeletion; left unset, administrators may and others not.
     let may_delete = claims.sub.is_nil()
-        || rustyfin_db::repo_parental::get_policy(&state.db_ro, claims.sub)
+        || crate::parental::caller_access(&state, &claims)
             .await?
-            .access
             .enable_content_deletion
             .unwrap_or(claims.is_admin);
     if !may_delete {
@@ -2849,7 +2848,7 @@ async fn get_children(
     let mut children = rustyfin_db::repo_media::get_children(&state.db_ro, id).await?;
     HiddenItems::for_caller(&state, &claims)
         .await?
-        .retain(&mut children, |i| i.id);
+        .retain(&mut children);
     let total = children.len() as i64;
 
     // Only populate media_sources when explicitly requested
@@ -2930,7 +2929,7 @@ async fn get_similar(
                 .flatten()
                 .map(|row| row.into());
 
-            if let Some(local_item) = local_item.filter(|i| !hidden.hides(i.id)) {
+            if let Some(local_item) = local_item.filter(|i| !hidden.hides(i.id, i.library_id)) {
                 similar.push(local_item);
             }
         }
@@ -2953,7 +2952,9 @@ async fn get_similar(
             if similar.len() >= limit {
                 break;
             }
-            if !existing_ids.contains(&local_item.id.to_string()) && !hidden.hides(local_item.id) {
+            if !existing_ids.contains(&local_item.id.to_string())
+                && !hidden.hides(local_item.id, local_item.library_id)
+            {
                 similar.push(local_item);
             }
         }

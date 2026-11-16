@@ -56,6 +56,8 @@ struct WsMessage {
 }
 
 async fn ws_handler(
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    headers: axum::http::HeaderMap,
     Query(query): Query<WsQuery>,
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
@@ -77,11 +79,18 @@ async fn ws_handler(
             ApiError::Unauthorized
         })?;
 
-    // The configured API key or a valid user token opens the socket
-    let authenticated = state.api_key.as_ref().is_some_and(|key| token == **key)
-        || rustyfin_auth::validate_token(&state.db_ro, &token)
-            .await
-            .is_ok();
+    // The configured API key or a valid user token opens the socket; a user's token only within
+    // their remote access and access schedule, as every other request
+    let authenticated = if state.api_key.as_ref().is_some_and(|key| token == **key) {
+        true
+    } else if let Ok(claims) = rustyfin_auth::validate_token(&state.db_ro, &token).await {
+        let local =
+            crate::middleware::resolve_client(peer.ip(), &headers, &state.known_proxies).is_local();
+        crate::parental::check_access(&state, &claims, local).await?;
+        true
+    } else {
+        false
+    };
 
     if !authenticated {
         tracing::warn!("WebSocket: unauthenticated connection attempt");
@@ -479,6 +488,8 @@ pub async fn broadcast_event(state: &AppState, event: rustyfin_model::ws_event::
 struct Viewer {
     user_id: uuid::Uuid,
     is_admin: bool,
+    /// The libraries the user may see, as stored; `None` for every library.
+    libraries: Option<std::collections::HashSet<String>>,
 }
 
 /// The socket's user, from the token it connected with. The API key counts as an administrator.
@@ -487,16 +498,26 @@ async fn socket_viewer(state: &AppState, token: &str) -> Viewer {
         return Viewer {
             user_id: uuid::Uuid::nil(),
             is_admin: true,
+            libraries: None,
         };
     }
     match rustyfin_auth::validate_token(&state.db_ro, token).await {
         Ok(claims) => Viewer {
             user_id: claims.sub,
             is_admin: claims.is_admin,
+            // An unreadable policy shows no library.
+            libraries: match rustyfin_db::repo_parental::get_policy(&state.db_ro, claims.sub).await
+            {
+                Ok(policy) => policy
+                    .enabled_folders()
+                    .map(|ids| ids.iter().map(|id| id.to_ascii_lowercase()).collect()),
+                Err(_) => Some(Default::default()),
+            },
         },
         Err(_) => Viewer {
             user_id: uuid::Uuid::nil(),
             is_admin: false,
+            libraries: Some(Default::default()),
         },
     }
 }
@@ -518,13 +539,36 @@ fn receives(viewer: &Viewer, event: &rustyfin_model::ws_event::WsEvent) -> bool 
                     .is_some_and(|id| !id.is_nil() && id == viewer.user_id)
         }
         WsEvent::LogMessage { .. } => viewer.is_admin,
+        // A library the user's library access leaves out
+        WsEvent::LibraryChanged { data } => viewer.libraries.as_ref().is_none_or(|libs| {
+            data["LibraryId"]
+                .as_str()
+                .is_some_and(|id| libs.contains(&id.to_ascii_lowercase()))
+        }),
         _ => true,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::is_api_key;
+    use super::{Viewer, is_api_key, receives};
+
+    #[test]
+    fn r3parental_library_changes_reach_only_users_who_may_see_the_library() {
+        use rustyfin_model::ws_event::WsEvent;
+        let event = |id: &str| WsEvent::LibraryChanged {
+            data: serde_json::json!({ "LibraryId": id, "LibraryName": "L" }),
+        };
+        let viewer = |libraries: Option<&[&str]>| Viewer {
+            user_id: uuid::Uuid::new_v4(),
+            is_admin: false,
+            libraries: libraries.map(|ids| ids.iter().map(|id| id.to_string()).collect()),
+        };
+        assert!(receives(&viewer(None), &event("a")));
+        assert!(receives(&viewer(Some(&["a"])), &event("A")));
+        assert!(!receives(&viewer(Some(&["a"])), &event("b")));
+        assert!(!receives(&viewer(Some(&[])), &event("a")));
+    }
 
     #[test]
     fn g2c_only_the_api_key_skips_the_token_recheck() {

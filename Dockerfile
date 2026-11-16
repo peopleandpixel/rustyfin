@@ -42,7 +42,7 @@ RUN set -eux; \
         intel=intel-media-va-driver-non-free; \
     fi; \
     apt-get update; \
-    apt-get install -y --no-install-recommends ca-certificates curl ffmpeg mesa-va-drivers ${intel:-}; \
+    apt-get install -y --no-install-recommends ca-certificates curl ffmpeg mesa-va-drivers tzdata ${intel:-}; \
     rm -rf /var/lib/apt/lists/*
 
 RUN useradd -r -s /bin/false -m -d /data rustyfin

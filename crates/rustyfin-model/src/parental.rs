@@ -316,6 +316,11 @@ impl ParentalPolicy {
             || self.enabled_folders().is_some()
     }
 
+    /// True when ratings or tags hide items (library access aside).
+    pub fn filters_items(&self) -> bool {
+        self.limits_ratings() || !self.blocked_tags.is_empty() || !self.allowed_tags.is_empty()
+    }
+
     /// The library ids the user may see, or `None` for all of them.
     pub fn enabled_folders(&self) -> Option<&[String]> {
         (!self.access.enable_all_folders).then_some(self.access.enabled_folders.as_slice())
