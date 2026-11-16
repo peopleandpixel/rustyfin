@@ -48662,17 +48662,19 @@ async fn r3items_tags_media_types_and_flags_filter_the_list() {
         &app,
         &token,
         &[
-            // Tags are pipe-delimited and any of them matches, any case; an episode has its series'.
+            // Tags are pipe-delimited and any of them matches, any case; an episode's own tags
+            // only, as Jellyfin 10.11 reads Tags.
             ("Tags=kids".into(), &["Alpha"]),
             ("Tags=Sports|Kids".into(), &["Alpha", "Bravo"]),
             ("Tags=Drama".into(), &["Bravo"]),
-            (
-                format!("Tags=News&{episodes}"),
-                &["Episode 1", "Episode 2", "Episode 3"],
-            ),
+            (format!("Tags=News&{episodes}"), &[]),
+            ("Tags=News".into(), &["Show"]),
             ("IsKids=true".into(), &["Alpha"]),
             ("IsSports=true".into(), &["Bravo"]),
-            (format!("IsNews=false&{episodes}"), &[]),
+            (
+                format!("IsNews=false&{episodes}"),
+                &["Episode 1", "Episode 2", "Episode 3"],
+            ),
             (
                 "IsNews=false&IncludeItemTypes=Movie".into(),
                 &["Alpha", "Bravo", "Charlie"],
@@ -48755,4 +48757,112 @@ async fn r3items_numbers_names_locations_and_adjacency_filter_the_list() {
     assert_eq!(names, ["Episode 2", "Episode 3"]);
     let (names, _) = r3items_names(&app, &ordered(uuid::Uuid::new_v4()), &token).await;
     assert_eq!(names, ["Episode 1"]);
+}
+
+#[tokio::test]
+async fn r3items_filters_keep_the_callers_parental_limit() {
+    let state = test_state().await;
+    let lib = r3items_library(&state).await;
+    let app = app(state.clone());
+    let (admin, _) = admin_session(&state).await;
+    let kid = add_user(&state, "r3items-limited", "r3items-pass", false).await;
+    let (_, user) = send_authed(&app, "GET", &format!("/Users/{kid}"), &admin, None).await;
+    let mut policy = user["Policy"].clone();
+    policy["MaxParentalRating"] = 10.into();
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        &format!("/Users/{kid}/Policy"),
+        &admin,
+        Some(&policy.to_string()),
+    )
+    .await;
+    assert!(status.is_success(), "{status}");
+    let (token, _) = login(&app, "r3items-limited", "r3items-pass")
+        .await
+        .unwrap();
+    // Pat Doe, Acme Pictures, the TMDb id and the HD picture are only on Alpha (PG-13), which
+    // the limit hides: no row and a count of 0, not the hidden item.
+    let pat = lib.pat;
+    for params in [
+        format!("PersonIds={pat}"),
+        "Studios=Acme%20Pictures".to_string(),
+        "HasTmdbId=true".to_string(),
+        "IsHD=true".to_string(),
+        "MaxOfficialRating=PG-13&IncludeItemTypes=Movie&HasOverview=true".to_string(),
+    ] {
+        assert_eq!(
+            r3items_found(&app, &token, &params).await,
+            Vec::<String>::new(),
+            "{params}"
+        );
+        assert_eq!(
+            r3items_found(&app, &admin, &params).await,
+            ["Alpha"],
+            "{params}"
+        );
+    }
+    // A hidden item as AdjacentTo: as an item the list doesn't hold.
+    let uri = format!(
+        "/Items?Recursive=true&IncludeItemTypes=Movie&SortBy=SortName&AdjacentTo={}",
+        lib.id("Alpha")
+    );
+    let (names, total) = r3items_names(&app, &uri, &token).await;
+    assert_eq!((names, total), (vec!["Charlie".to_string()], 1));
+}
+
+#[tokio::test]
+async fn r3items_camel_case_names_counts_and_last_saved() {
+    let state = test_state().await;
+    let lib = r3items_library(&state).await;
+    r3items_sql(
+        &state,
+        &format!(
+            "UPDATE media_items SET genres = 'Drama|Comedy' WHERE id = '{}'",
+            lib.id("Bravo")
+        ),
+    )
+    .await;
+    let (token, _) = admin_session(&state).await;
+    let app = app(state);
+    // The camelCase names Jellyfin's SDKs send.
+    let (names, total) = r3items_names(
+        &app,
+        "/Items?recursive=true&includeItemTypes=Movie&sortBy=SortName&limit=1",
+        &token,
+    )
+    .await;
+    assert_eq!((names, total), (vec!["Alpha".to_string()], 3));
+    r3items_cases(
+        &app,
+        &token,
+        &[
+            ("genres=Comedy".into(), &["Bravo"]),
+            ("tags=Drama".into(), &["Bravo"]),
+            ("Genres=Horror|Drama".into(), &["Bravo"]),
+        ],
+    )
+    .await;
+    // EnableTotalRecordCount=false: the count is the items returned.
+    let (names, total) = r3items_names(
+        &app,
+        "/Items?Recursive=true&IncludeItemTypes=Movie&Limit=2&enableTotalRecordCount=false",
+        &token,
+    )
+    .await;
+    assert_eq!((names.len(), total), (2, 2));
+    // Every item was added just now.
+    let movies = "IncludeItemTypes=Movie";
+    r3items_cases(
+        &app,
+        &token,
+        &[
+            (
+                format!("MinDateLastSaved=2000-01-01T00:00:00Z&{movies}"),
+                &["Alpha", "Bravo", "Charlie"],
+            ),
+            (format!("minDateLastSavedForUser=2999-01-01&{movies}"), &[]),
+        ],
+    )
+    .await;
 }

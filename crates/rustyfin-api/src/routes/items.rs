@@ -1902,6 +1902,7 @@ struct ItemsQuery {
     exclude_item_types: Option<String>,
     #[serde(rename = "excludeItemTypes")]
     exclude_item_types_lower: Option<String>,
+    #[serde(alias = "genres")]
     genres: Option<String>,
     years: Option<String>,
     #[serde(rename = "years")]
@@ -1918,6 +1919,7 @@ struct ItemsQuery {
     start_index: Option<i64>,
     #[serde(rename = "startIndex")]
     start_index_lower: Option<i64>,
+    #[serde(alias = "limit")]
     limit: Option<i64>,
     name_starts_with: Option<String>,
     #[serde(rename = "nameStartsWith")]
@@ -1991,7 +1993,9 @@ struct ItemsQuery {
     album_ids: Option<String>,
     #[serde(rename = "albumIds")]
     album_ids_lower: Option<String>,
+    #[serde(alias = "tags")]
     tags: Option<String>,
+    #[serde(alias = "features")]
     features: Option<String>,
     official_ratings: Option<String>,
     #[serde(rename = "officialRatings")]
@@ -2017,6 +2021,7 @@ struct ItemsQuery {
     date_created: Option<String>,
     #[serde(rename = "dateCreated")]
     date_created_lower: Option<String>,
+    #[serde(alias = "runtime")]
     runtime: Option<String>,
     video_codecs: Option<String>,
     #[serde(rename = "videoCodecs")]
@@ -2151,6 +2156,13 @@ struct ItemsQuery {
     is_news: Option<bool>,
     #[serde(alias = "isSports")]
     is_sports: Option<bool>,
+    /// False: TotalRecordCount is the number of items returned, as in Jellyfin.
+    #[serde(alias = "enableTotalRecordCount")]
+    enable_total_record_count: Option<bool>,
+    #[serde(alias = "minDateLastSaved")]
+    min_date_last_saved: Option<String>,
+    #[serde(alias = "minDateLastSavedForUser")]
+    min_date_last_saved_for_user: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -2665,6 +2677,17 @@ fn item_filter(query: &ItemsQuery) -> Result<rustyfin_db::repo_item_filter::Item
         min_community_rating: query.min_community_rating,
         min_premiere_date: query_instant("MinPremiereDate", query.min_premiere_date.as_deref())?,
         max_premiere_date: query_instant("MaxPremiereDate", query.max_premiere_date.as_deref())?,
+        // Both compare the item's last save in Jellyfin 10.11; the later bound wins.
+        min_date_last_saved: query_instant(
+            "MinDateLastSaved",
+            query.min_date_last_saved.as_deref(),
+        )?
+        .into_iter()
+        .chain(query_instant(
+            "MinDateLastSavedForUser",
+            query.min_date_last_saved_for_user.as_deref(),
+        )?)
+        .max(),
         unaired: query.is_unaired.map(|unaired| (unaired, now)),
         has_imdb_id: query.has_imdb_id,
         has_tmdb_id: query.has_tmdb_id,
@@ -2898,11 +2921,8 @@ async fn get_items(
                 .await?;
         item_ids = Some(narrow_ids(item_ids, ids));
     }
-    if let Some(ids) =
-        rustyfin_db::repo_item_filter::matching_ids(&state.db_ro, &conditions).await?
-    {
-        item_ids = Some(narrow_ids(item_ids, ids));
-    }
+    // The other conditions join the list's own SQL, beside the parental limits and the count.
+    let extra = rustyfin_db::repo_item_filter::filter_sql(&state.db_ro, &conditions).await?;
     // Ids keeps only the listed items (Jellyfin's `InternalItemsQuery.ItemIds`); ids of no item
     // are skipped, and an empty list filters nothing, as in Jellyfin.
     if !by_id.requested.is_empty() {
@@ -2915,15 +2935,17 @@ async fn get_items(
 
     // With Ids every match is fetched, then merged with the requested collections and
     // playlists, ordered and paged here.
-    // AdjacentTo picks from the whole ordered list too.
+    // AdjacentTo: the SQL finds the item and its neighbours, but in the order of Ids it is
+    // picked here from that short list.
     let adjacent_to = query.adjacent_to;
     let whole_list = !by_id.requested.is_empty() || adjacent_to.is_some();
+    let sql_adjacent_to = adjacent_to.filter(|_| by_id.requested.is_empty());
     let (fetch_start, fetch_limit) = if !whole_list {
         (start_index, limit)
-    } else if adjacent_to.is_none() {
-        (0, by_id.requested.len() as i64)
+    } else if by_id.requested.is_empty() {
+        (0, 3)
     } else {
-        (0, i64::MAX)
+        (0, by_id.requested.len() as i64)
     };
 
     let (mut items, mut total) = rustyfin_db::repo_media::get_items_filtered(
@@ -2956,6 +2978,8 @@ async fn get_items(
         Some(claims.sub),
         item_ids.as_deref(),
         hidden_json.as_deref(),
+        extra.as_ref(),
+        sql_adjacent_to,
     )
     .await?;
     // Collections and playlists named in Ids are listed as `/Items/{id}` answers them; they are
@@ -2980,7 +3004,7 @@ async fn get_items(
             items.extend(found);
         }
         let mut page = by_id.page(items, 0, i64::MAX);
-        if let Some(id) = adjacent_to {
+        if let Some(id) = adjacent_to.filter(|_| !by_id.requested.is_empty()) {
             page.items = adjacent_items(page.items, id);
         }
         total = page.items.len() as i64;
@@ -2990,6 +3014,10 @@ async fn get_items(
             .skip(start_index as usize)
             .take(limit as usize)
             .collect();
+    }
+
+    if query.enable_total_record_count == Some(false) {
+        total = items.len() as i64;
     }
 
     if query.card_index() {

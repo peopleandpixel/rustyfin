@@ -1,10 +1,10 @@
 //! The `/Items` conditions of Jellyfin's `InternalItemsQuery` that `repo_media::get_items_filtered`
 //! has no clause for: people, studios and artists by name or id, provider ids, picture size,
-//! ratings, flags and numbers. `matching_ids` answers all of them with one query of bound
-//! parameters; the list then keeps those ids (with parental limits and the count in its own SQL).
+//! ratings, flags and numbers. `filter_sql` makes them one SQL condition with bound values, which
+//! the list query adds to its own, beside the parental limits and the count.
 
 use rustyfin_model::parental::{RatingScore, rating_score};
-use sqlx::{QueryBuilder, Sqlite, SqlitePool};
+use sqlx::SqlitePool;
 
 /// Jellyfin's `HDWidth`, `UHDWidth` and `UHDHeight` (`BaseItemRepository`).
 const HD_WIDTH: i64 = 1200;
@@ -50,6 +50,9 @@ pub struct ItemFilter {
     /// RFC 3339 instants (`MinPremiereDate`, `MaxPremiereDate`).
     pub min_premiere_date: Option<String>,
     pub max_premiere_date: Option<String>,
+    /// `MinDateLastSaved(ForUser)`: an item is last saved when it was added or a metadata
+    /// provider last refreshed it, whichever is later; no other write is timestamped.
+    pub min_date_last_saved: Option<String>,
     /// `IsUnaired`: premiered at or after this instant (true) or before it (false).
     pub unaired: Option<(bool, String)>,
     pub has_imdb_id: Option<bool>,
@@ -104,6 +107,7 @@ impl ItemFilter {
             && self.min_community_rating.is_none()
             && self.min_premiere_date.is_none()
             && self.max_premiere_date.is_none()
+            && self.min_date_last_saved.is_none()
             && self.unaired.is_none()
             && self.has_imdb_id.is_none()
             && self.has_tmdb_id.is_none()
@@ -132,108 +136,125 @@ impl ItemFilter {
     }
 }
 
-/// Pushes `(a, b, …)` with each value bound.
-fn push_list<T>(qb: &mut QueryBuilder<Sqlite>, values: impl IntoIterator<Item = T>)
-where
-    T: for<'t> sqlx::Encode<'t, Sqlite> + sqlx::Type<Sqlite>,
-{
-    qb.push("(");
-    let mut list = qb.separated(", ");
-    for value in values {
-        list.push_bind(value);
-    }
-    list.push_unseparated(")");
+/// A value bound to the condition, in the order of its `?`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Bound {
+    Text(String),
+    Int(i64),
+    Real(f64),
 }
 
-/// Pushes ` AND id [NOT] IN (…)`: the items credited, as one of `types`, to an artist of the same
-/// name as one of `ids` (a `MusicArtist` item or a person) or one of `names`, and the albums
-/// holding such an item.
-fn push_artists(
-    qb: &mut QueryBuilder<Sqlite>,
-    ids: &[String],
-    names: &[String],
-    types: &[&'static str],
-    negate: bool,
-) {
-    qb.push(if negate {
-        " AND id NOT IN ("
-    } else {
-        " AND id IN ("
-    });
-    // The credited items, then the albums of the credited tracks.
-    for (i, (column, kind)) in [
-        ("ip.item_id", "1"),
-        ("t.parent_id", "t.media_type = 'Audio'"),
-    ]
-    .iter()
-    .enumerate()
-    {
-        if i > 0 {
-            qb.push(" UNION ");
+/// The conditions as one SQL condition on a `media_items` row (unaliased, as
+/// `repo_media::get_items_filtered` reads the table), with its values in order. Every list is
+/// bound once, as a JSON array read with `json_each`, so no list can reach SQLite's limit on
+/// parameters.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FilterSql {
+    pub sql: String,
+    pub binds: Vec<Bound>,
+}
+
+impl FilterSql {
+    fn push(&mut self, sql: &str) {
+        self.sql.push_str(sql);
+    }
+
+    fn text(&mut self, value: impl Into<String>) {
+        self.sql.push('?');
+        self.binds.push(Bound::Text(value.into()));
+    }
+
+    fn int(&mut self, value: i64) {
+        self.sql.push('?');
+        self.binds.push(Bound::Int(value));
+    }
+
+    /// `(SELECT value FROM json_each(?))`, with `values` bound as one JSON array.
+    fn list<S: Into<String>>(&mut self, values: impl IntoIterator<Item = S>) {
+        let values: Vec<String> = values.into_iter().map(Into::into).collect();
+        self.push("(SELECT value FROM json_each(");
+        self.text(serde_json::Value::from(values).to_string());
+        self.push("))");
+    }
+
+    /// ` AND (<expr>) = <wanted>` for a yes/no condition.
+    fn flag(&mut self, expr: &str, wanted: Option<bool>) {
+        if let Some(wanted) = wanted {
+            self.push(&format!(" AND ({expr}) = "));
+            self.int(wanted.into());
         }
-        qb.push(format!(
-            "SELECT {column} FROM item_people ip JOIN people p ON p.id = ip.person_id \
-             JOIN media_items t ON t.id = ip.item_id WHERE {column} IS NOT NULL AND {kind} \
-             AND ip.type IN "
-        ));
-        push_list(qb, types.iter().copied());
-        qb.push(" AND lower(p.name) IN (SELECT lower(name) FROM people WHERE id IN ");
-        push_list(qb, ids.to_vec());
-        qb.push(" UNION SELECT lower(name) FROM media_items WHERE media_type = 'MusicArtist' AND id IN ");
-        push_list(qb, ids.to_vec());
-        qb.push(" UNION SELECT value FROM json_each(");
-        let names: Vec<String> = names.iter().map(|n| n.to_lowercase()).collect();
-        qb.push_bind(serde_json::Value::from(names).to_string());
-        qb.push("))");
     }
-    qb.push(")");
-}
 
-/// Pushes whether the `tags` of the row `alias` hold one of `tags`, any case.
-fn push_tag_match(qb: &mut QueryBuilder<Sqlite>, alias: &str, tags: &[String]) {
-    qb.push("(");
-    for (i, tag) in tags.iter().enumerate() {
-        if i > 0 {
-            qb.push(" OR ");
+    /// ` AND id [NOT] IN (…)`: the items credited, as one of `types`, to an artist of the same
+    /// name as one of `ids` (a `MusicArtist` item or a person) or one of `names`, and the albums
+    /// holding such a track.
+    fn artists(&mut self, ids: &[String], names: &[String], types: &[&str], negate: bool) {
+        self.push(if negate {
+            " AND id NOT IN ("
+        } else {
+            " AND id IN ("
+        });
+        // The credited items, then the albums of the credited tracks.
+        for (i, (column, kind)) in [
+            ("ip.item_id", "1"),
+            ("t.parent_id", "t.media_type = 'Audio'"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            if i > 0 {
+                self.push(" UNION ");
+            }
+            self.push(&format!(
+                "SELECT {column} FROM item_people ip JOIN people p ON p.id = ip.person_id \
+                 JOIN media_items t ON t.id = ip.item_id WHERE {column} IS NOT NULL AND {kind} \
+                 AND ip.type IN "
+            ));
+            self.list(types.iter().copied());
+            self.push(" AND lower(p.name) IN (SELECT lower(name) FROM people WHERE id IN ");
+            self.list(ids.iter().cloned());
+            self.push(" UNION SELECT lower(name) FROM media_items WHERE media_type = 'MusicArtist' AND id IN ");
+            self.list(ids.iter().cloned());
+            self.push(" UNION SELECT value FROM json_each(");
+            let names: Vec<String> = names.iter().map(|n| n.to_lowercase()).collect();
+            self.text(serde_json::Value::from(names).to_string());
+            self.push("))");
         }
-        let escaped = tag
-            .to_lowercase()
-            .replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_");
-        qb.push(format!("('|' || lower({alias}.tags) || '|') LIKE "));
-        qb.push_bind(format!("%|{escaped}|%"));
-        qb.push(" ESCAPE '\\'");
+        self.push(")");
     }
-    qb.push(")");
-}
 
-/// Pushes whether the item or its series (for a season or an episode) has one of `tags`.
-fn push_tags(qb: &mut QueryBuilder<Sqlite>, tags: &[String]) {
-    qb.push("(");
-    push_tag_match(qb, "media_items", tags);
-    qb.push(
-        " OR (media_items.media_type IN ('Season', 'Episode') AND EXISTS (SELECT 1 FROM media_items s \
-         WHERE s.media_type = 'Series' AND (s.id = media_items.parent_id OR s.id = \
-         (SELECT x.parent_id FROM media_items x WHERE x.id = media_items.parent_id)) AND ",
-    );
-    push_tag_match(qb, "s", tags);
-    qb.push(")))");
-}
-
-/// Pushes ` AND (<expr>) = <wanted>` for a yes/no condition.
-fn push_flag(qb: &mut QueryBuilder<Sqlite>, expr: &str, wanted: Option<bool>) {
-    if let Some(wanted) = wanted {
-        qb.push(format!(" AND ({expr}) = "));
-        qb.push_bind(wanted);
+    /// Whether the item's own tags hold one of `tags`, any case (Jellyfin's `Tags`; only its
+    /// `IncludeInheritedTags` reads the series' tags too).
+    fn tags(&mut self, tags: &[String]) {
+        self.push("EXISTS (SELECT 1 FROM json_each(");
+        self.text(
+            serde_json::Value::from(tags.iter().map(|t| t.to_lowercase()).collect::<Vec<_>>())
+                .to_string(),
+        );
+        self.push(
+            ") wanted WHERE instr('|' || lower(media_items.tags) || '|', '|' || wanted.value || '|') > 0)",
+        );
     }
 }
 
-/// The stored ratings the rating conditions leave out: those with a score outside
-/// `min_rating`..`max_rating`, or with any score when only unrated items are wanted.
+/// The rating Jellyfin's `InheritedParentalRatingValue` reads: the item's own, else its
+/// parent's (an extra's owner's), else its grandparent's, as `repo_parental` inherits it; NULL
+/// when none is set.
+const INHERITED_RATING_SQL: &str = "COALESCE(\
+     NULLIF(TRIM(COALESCE(media_items.official_rating, '')), ''), \
+     (SELECT NULLIF(TRIM(COALESCE(p.official_rating, '')), '') FROM media_items p \
+      WHERE p.id = COALESCE(media_items.parent_id, media_items.owner_id)), \
+     (SELECT NULLIF(TRIM(COALESCE(g.official_rating, '')), '') FROM media_items p \
+      JOIN media_items g ON g.id = p.parent_id \
+      WHERE p.id = COALESCE(media_items.parent_id, media_items.owner_id)))";
+
+/// The ratings (trimmed, as `INHERITED_RATING_SQL` reads them) the rating conditions leave out:
+/// those with a score outside `min_rating`..`max_rating`, or with any score when only unrated
+/// items are wanted.
 async fn excluded_ratings(pool: &SqlitePool, f: &ItemFilter) -> Result<Vec<String>, sqlx::Error> {
     let ratings: Vec<String> = sqlx::query_scalar(
-        "SELECT DISTINCT official_rating FROM media_items WHERE official_rating IS NOT NULL",
+        "SELECT DISTINCT TRIM(official_rating) FROM media_items \
+         WHERE TRIM(COALESCE(official_rating, '')) != ''",
     )
     .fetch_all(pool)
     .await?;
@@ -252,44 +273,44 @@ async fn excluded_ratings(pool: &SqlitePool, f: &ItemFilter) -> Result<Vec<Strin
         .collect())
 }
 
-/// The ids of the items that meet every condition of `f`, or `None` when it has none.
-pub async fn matching_ids(
+/// The conditions of `f` as one SQL condition, or `None` when it has none.
+pub async fn filter_sql(
     pool: &SqlitePool,
     f: &ItemFilter,
-) -> Result<Option<Vec<String>>, sqlx::Error> {
+) -> Result<Option<FilterSql>, sqlx::Error> {
     if f.is_empty() {
         return Ok(None);
     }
-    // Extras are listed only when asked for by id, so they are never among the matches.
-    let mut qb: QueryBuilder<Sqlite> =
-        QueryBuilder::new("SELECT id FROM media_items WHERE extra_type IS NULL");
+    let mut q = FilterSql {
+        sql: "(1 = 1".to_string(),
+        binds: Vec::new(),
+    };
     if !f.person_ids.is_empty() {
-        qb.push(
+        q.push(
             " AND id IN (SELECT ip.item_id FROM item_people ip JOIN people p ON p.id = ip.person_id \
              WHERE p.name IN (SELECT name FROM people WHERE id IN ",
         );
-        push_list(&mut qb, f.person_ids.clone());
-        qb.push("))");
+        q.list(f.person_ids.iter().cloned());
+        q.push("))");
     }
     if let Some(person) = &f.person {
-        qb.push(
+        q.push(
             " AND id IN (SELECT ip.item_id FROM item_people ip JOIN people p ON p.id = ip.person_id \
              WHERE p.name = ",
         );
-        qb.push_bind(person.clone());
-        qb.push(")");
+        q.text(person.clone());
+        q.push(")");
     }
     if !f.studios.is_empty() {
-        qb.push(
+        q.push(
             " AND id IN (SELECT s.item_id FROM item_studios s JOIN studios st ON st.id = s.studio_id \
              WHERE lower(st.name) IN ",
         );
-        push_list(&mut qb, f.studios.iter().map(|s| s.to_lowercase()));
-        qb.push(")");
+        q.list(f.studios.iter().map(|s| s.to_lowercase()));
+        q.push(")");
     }
     if !f.artist_ids.is_empty() || !f.artist_names.is_empty() {
-        push_artists(
-            &mut qb,
+        q.artists(
             &f.artist_ids,
             &f.artist_names,
             &["Artist", "AlbumArtist"],
@@ -297,80 +318,78 @@ pub async fn matching_ids(
         );
     }
     if !f.album_artist_ids.is_empty() {
-        push_artists(&mut qb, &f.album_artist_ids, &[], &["AlbumArtist"], false);
+        q.artists(&f.album_artist_ids, &[], &["AlbumArtist"], false);
     }
     if !f.contributing_artist_ids.is_empty() {
-        push_artists(&mut qb, &f.contributing_artist_ids, &[], &["Artist"], false);
+        q.artists(&f.contributing_artist_ids, &[], &["Artist"], false);
     }
     if !f.exclude_artist_ids.is_empty() {
-        push_artists(
-            &mut qb,
-            &f.exclude_artist_ids,
-            &[],
-            &["Artist", "AlbumArtist"],
-            true,
-        );
+        q.artists(&f.exclude_artist_ids, &[], &["Artist", "AlbumArtist"], true);
     }
     if !f.album_ids.is_empty() {
-        qb.push(" AND parent_id IN ");
-        push_list(&mut qb, f.album_ids.clone());
+        q.push(" AND parent_id IN ");
+        q.list(f.album_ids.iter().cloned());
     }
     if !f.album_names.is_empty() {
-        qb.push(" AND parent_id IN (SELECT id FROM media_items WHERE media_type = 'MusicAlbum' AND name IN ");
-        push_list(&mut qb, f.album_names.clone());
-        qb.push(")");
+        q.push(" AND parent_id IN (SELECT id FROM media_items WHERE media_type = 'MusicAlbum' AND name IN ");
+        q.list(f.album_names.iter().cloned());
+        q.push(")");
     }
     if !f.tags.is_empty() {
-        qb.push(" AND ");
-        push_tags(&mut qb, &f.tags);
+        q.push(" AND ");
+        q.tags(&f.tags);
     }
     if !f.exclude_tags.is_empty() {
-        qb.push(" AND NOT ");
-        push_tags(&mut qb, &f.exclude_tags);
+        q.push(" AND NOT ");
+        q.tags(&f.exclude_tags);
     }
     if let Some(min) = f.min_community_rating {
-        qb.push(" AND community_rating >= ");
-        qb.push_bind(min);
+        q.push(" AND community_rating >= ?");
+        q.binds.push(Bound::Real(min));
     }
-    if let Some(min) = &f.min_premiere_date {
-        qb.push(" AND julianday(premiere_date) >= julianday(");
-        qb.push_bind(min.clone());
-        qb.push(")");
+    for (op, date) in [(">=", &f.min_premiere_date), ("<=", &f.max_premiere_date)] {
+        if let Some(date) = date {
+            q.push(&format!(" AND julianday(premiere_date) {op} julianday("));
+            q.text(date.clone());
+            q.push(")");
+        }
     }
-    if let Some(max) = &f.max_premiere_date {
-        qb.push(" AND julianday(premiere_date) <= julianday(");
-        qb.push_bind(max.clone());
-        qb.push(")");
+    if let Some(min) = &f.min_date_last_saved {
+        q.push(
+            " AND MAX(COALESCE(julianday(date_created), 0), COALESCE((SELECT julianday(e.provider_refreshed_at) \
+             FROM item_metadata_extras e WHERE e.item_id = media_items.id), 0)) >= julianday(",
+        );
+        q.text(min.clone());
+        q.push(")");
     }
     if let Some((unaired, now)) = &f.unaired {
-        qb.push(if *unaired {
+        q.push(if *unaired {
             " AND julianday(premiere_date) >= julianday("
         } else {
             " AND julianday(premiere_date) < julianday("
         });
-        qb.push_bind(now.clone());
-        qb.push(")");
+        q.text(now.clone());
+        q.push(")");
     }
-    push_flag(
-        &mut qb,
+    q.flag(
         "EXISTS (SELECT 1 FROM item_metadata_extras e WHERE e.item_id = media_items.id \
          AND COALESCE(e.imdb_id, '') != '')",
         f.has_imdb_id,
     );
-    push_flag(&mut qb, "tmdb_id IS NOT NULL", f.has_tmdb_id);
-    push_flag(&mut qb, "tvdb_id IS NOT NULL", f.has_tvdb_id);
+    q.flag("tmdb_id IS NOT NULL", f.has_tmdb_id);
+    q.flag("tvdb_id IS NOT NULL", f.has_tvdb_id);
     if f.is_hd.is_some() || f.is_4k.is_some() {
         // Jellyfin's bands: SD under HD_WIDTH, HD from it up to 4K, 4K from UHD width or height.
         let uhd = format!("({WIDTH_SQL} >= {UHD_WIDTH} OR {HEIGHT_SQL} >= {UHD_HEIGHT})");
-        qb.push(" AND ((");
-        qb.push_bind(f.is_hd == Some(false));
-        qb.push(format!(" AND {WIDTH_SQL} < {HD_WIDTH}) OR ("));
-        qb.push_bind(f.is_hd == Some(true));
-        qb.push(format!(
+        q.push(" AND ((");
+        q.int((f.is_hd == Some(false)).into());
+        q.push(&format!(" AND {WIDTH_SQL} < {HD_WIDTH}) OR ("));
+        q.int((f.is_hd == Some(true)).into());
+        q.push(&format!(
             " AND {WIDTH_SQL} >= {HD_WIDTH} AND NOT {uhd}) OR ("
         ));
-        qb.push_bind(f.is_4k == Some(true));
-        qb.push(format!(" AND {uhd}))"));
+        q.int((f.is_4k == Some(true)).into());
+        q.push(&format!(" AND {uhd}))"));
     }
     for (sql, value) in [
         (format!(" AND {WIDTH_SQL} >= "), f.min_width),
@@ -379,70 +398,91 @@ pub async fn matching_ids(
         (format!(" AND {HEIGHT_SQL} <= "), f.max_height),
     ] {
         if let Some(value) = value {
-            qb.push(sql);
-            qb.push_bind(value);
+            q.push(&sql);
+            q.int(value);
         }
     }
     if f.is_3d == Some(true) || f.is_placeholder == Some(true) {
-        qb.push(" AND 0");
+        q.push(" AND 0");
     }
-    push_flag(
-        &mut qb,
+    q.flag(
         "EXISTS (SELECT 1 FROM media_streams st JOIN media_sources ms ON ms.id = st.source_id \
          WHERE ms.item_id = media_items.id AND lower(st.codec_type) = 'subtitle')",
         f.has_subtitles,
     );
-    push_flag(&mut qb, "COALESCE(overview, '') != ''", f.has_overview);
-    push_flag(
-        &mut qb,
-        "COALESCE(official_rating, '') != ''",
-        f.has_official_rating,
-    );
+    q.flag("COALESCE(overview, '') != ''", f.has_overview);
+    q.flag("COALESCE(official_rating, '') != ''", f.has_official_rating);
     if f.no_parental_rating || f.min_rating.is_some() || f.max_rating.is_some() {
         let excluded = excluded_ratings(pool, f).await?;
         if !excluded.is_empty() {
-            qb.push(" AND (official_rating IS NULL OR official_rating NOT IN ");
-            push_list(&mut qb, excluded);
-            qb.push(")");
+            q.push(&format!(
+                " AND ({INHERITED_RATING_SQL} IS NULL OR {INHERITED_RATING_SQL} NOT IN "
+            ));
+            q.list(excluded);
+            q.push(")");
         }
     }
-    push_flag(
-        &mut qb,
+    q.flag(
         "COALESCE((SELECT e.lock_data FROM item_metadata_extras e \
          WHERE e.item_id = media_items.id), 0) != 0",
         f.is_locked,
     );
-    push_flag(&mut qb, "location_type = 'Virtual'", f.is_virtual);
+    q.flag("location_type = 'Virtual'", f.is_virtual);
     if !f.video_types.is_empty() {
         let video_file = f
             .video_types
             .iter()
             .any(|t| t.eq_ignore_ascii_case("VideoFile"));
-        qb.push(if video_file {
+        q.push(if video_file {
             " AND media_type IN ('Movie', 'Episode', 'Video')"
         } else {
             " AND 0"
         });
     }
     if let Some(name) = &f.name_less_than {
-        qb.push(" AND lower(COALESCE(sort_name, name)) < ");
-        qb.push_bind(name.to_lowercase());
+        q.push(" AND lower(COALESCE(sort_name, name)) < ");
+        q.text(name.to_lowercase());
     }
     if let Some(index) = f.index_number {
-        qb.push(" AND index_number = ");
-        qb.push_bind(index);
+        q.push(" AND index_number = ");
+        q.int(index);
     }
     if let Some(index) = f.parent_index_number {
-        qb.push(" AND parent_index_number = ");
-        qb.push_bind(index);
+        q.push(" AND parent_index_number = ");
+        q.int(index);
     }
     if !f.image_types.is_empty() {
-        qb.push(" AND id IN (SELECT item_id FROM item_images WHERE lower(image_type) IN ");
-        push_list(&mut qb, f.image_types.iter().map(|t| t.to_lowercase()));
-        qb.push(")");
+        q.push(" AND id IN (SELECT item_id FROM item_images WHERE lower(image_type) IN ");
+        q.list(f.image_types.iter().map(|t| t.to_lowercase()));
+        q.push(")");
     }
-    let ids: Vec<String> = qb.build_query_scalar().fetch_all(pool).await?;
-    Ok(Some(ids))
+    q.push(")");
+    Ok(Some(q))
+}
+
+/// The ids of the items, not extras, that meet every condition of `f`, or `None` when it has
+/// none: `filter_sql` on its own, for the tests.
+#[cfg(test)]
+pub async fn matching_ids(
+    pool: &SqlitePool,
+    f: &ItemFilter,
+) -> Result<Option<Vec<String>>, sqlx::Error> {
+    let Some(filter) = filter_sql(pool, f).await? else {
+        return Ok(None);
+    };
+    let sql = format!(
+        "SELECT id FROM media_items WHERE extra_type IS NULL AND {}",
+        filter.sql
+    );
+    let mut query = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql));
+    for bound in filter.binds {
+        query = match bound {
+            Bound::Text(v) => query.bind(v),
+            Bound::Int(v) => query.bind(v),
+            Bound::Real(v) => query.bind(v),
+        };
+    }
+    Ok(Some(query.fetch_all(pool).await?))
 }
 
 #[cfg(test)]
@@ -490,7 +530,10 @@ mod tests {
                 "UPDATE media_items SET tmdb_id = 1, overview = 'o', community_rating = 8.1, premiere_date = '2001-05-01T00:00:00Z', official_rating = 'PG-13', tags = 'Kids' WHERE id = 'a'",
                 "UPDATE media_items SET community_rating = 5, premiere_date = '2030-01-01T00:00:00Z', official_rating = 'R', tags = 'Sports|Drama' WHERE id = 'b'",
                 "UPDATE media_items SET overview = '' WHERE id = 'c'",
-                "UPDATE media_items SET tags = 'News', tvdb_id = 2 WHERE id = 's'",
+                "UPDATE media_items SET tags = 'News', tvdb_id = 2, official_rating = 'TV-MA' WHERE id = 's'",
+                "UPDATE media_items SET date_created = '2000-01-01T00:00:00+00:00'",
+                "UPDATE media_items SET date_created = '2026-01-01T00:00:00+00:00' WHERE id = 'a'",
+                "INSERT INTO item_metadata_extras (item_id, provider_refreshed_at) VALUES ('b', '2026-02-01T10:00:00.123456+00:00')",
                 "UPDATE media_items SET index_number = CAST(substr(id, 2) AS INTEGER), parent_index_number = 1 WHERE id LIKE 'e_'",
                 "UPDATE media_items SET location_type = 'Virtual' WHERE id = 'e3'",
                 "UPDATE media_items SET extra_type = 'Trailer', owner_id = 'a', tags = 'Kids' WHERE id = 'x'",
@@ -625,7 +668,7 @@ mod tests {
                     tags: list(&["News"]),
                     ..Default::default()
                 },
-                &["e1", "e2", "e3", "n", "s"],
+                &["s"],
             ),
             (
                 ItemFilter {
@@ -737,7 +780,7 @@ mod tests {
                     has_official_rating: Some(true),
                     ..Default::default()
                 },
-                &["a", "b"],
+                &["a", "b", "s"],
             ),
             (
                 ItemFilter {
@@ -819,7 +862,8 @@ mod tests {
             },
         )
         .await;
-        assert!(kept.contains(&"a".to_string()) && !kept.contains(&"e1".to_string()));
+        assert!(kept.contains(&"a".to_string()) && kept.contains(&"e1".to_string()));
+        assert!(!kept.contains(&"s".to_string()));
         let kept = found(
             &pool,
             ItemFilter {
@@ -853,5 +897,44 @@ mod tests {
             movies(found(&pool, ranged(None, None, true)).await),
             list(&["c"])
         );
+        // Seasons and episodes take the series' rating, as Jellyfin's inherited rating.
+        let shows = |ids: Vec<String>| -> Vec<String> {
+            ids.into_iter()
+                .filter(|id| ["s", "n", "e1", "e2", "e3"].contains(&id.as_str()))
+                .collect()
+        };
+        assert!(shows(found(&pool, ranged(None, Some("PG-13"), false)).await).is_empty());
+        assert_eq!(
+            shows(found(&pool, ranged(Some("TV-MA"), None, false)).await),
+            list(&["e1", "e2", "e3", "n", "s"])
+        );
+        assert!(shows(found(&pool, ranged(None, None, true)).await).is_empty());
+        // Last saved: added, or refreshed by a metadata provider, whichever is later.
+        let saved = |min: &str| ItemFilter {
+            min_date_last_saved: Some(min.to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            found(&pool, saved("2025-06-01 00:00:00")).await,
+            list(&["a", "b"])
+        );
+        assert_eq!(
+            found(&pool, saved("2026-01-15 00:00:00")).await,
+            list(&["b"])
+        );
+        // A list of 10,000 ids is one bound value, under SQLite's limit on parameters.
+        let mut many: Vec<String> = (0..10_000).map(|i| format!("missing-{i}")).collect();
+        many.push("pat".to_string());
+        let wide = ItemFilter {
+            person_ids: many.clone(),
+            album_ids: many,
+            ..Default::default()
+        };
+        assert!(found(&pool, wide.clone()).await.is_empty());
+        let wide = ItemFilter {
+            album_ids: Vec::new(),
+            ..wide
+        };
+        assert_eq!(found(&pool, wide).await, list(&["a"]));
     }
 }

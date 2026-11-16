@@ -1094,6 +1094,9 @@ fn order_by_clause(terms: &[SortTerm]) -> String {
 /// The key is built here, from the filter this call renders, so no caller can pair a key with a
 /// different filter.
 #[allow(clippy::too_many_arguments)]
+/// The start of the filtered count query; its WHERE clause follows.
+const COUNT_SQL_PREFIX: &str = "SELECT COUNT(*) as cnt FROM media_items WHERE ";
+
 fn build_filtered_query(
     recursive: bool,
     media_types: Option<&[String]>,
@@ -1108,6 +1111,7 @@ fn build_filtered_query(
     is_played: Option<bool>,
     sort_by: &str,
     sort_order: &str,
+    extra_sql: Option<&str>,
 ) -> (String, String) {
     let cache_key = filter_cache_key(
         media_types.map(|t| t.len()).unwrap_or(0),
@@ -1128,7 +1132,7 @@ fn build_filtered_query(
     // Check cache first: a hit needs a stored shape equal to this one, not just an equal hash.
     {
         let cache = FILTER_QUERY_CACHE.lock();
-        if let Some((count_sql, data_sql)) = cache.get(&cache_key) {
+        if let Some((count_sql, data_sql)) = cache.get(&cache_key).filter(|_| extra_sql.is_none()) {
             return (count_sql.clone(), data_sql.clone());
         }
     }
@@ -1229,6 +1233,10 @@ fn build_filtered_query(
     } else if is_unplayed == Some(false) {
         where_parts.push(PLAYED_CLAUSE.to_string());
     }
+    // The `repo_item_filter` condition, bound last; such a query isn't cached, as its text varies.
+    if let Some(extra) = extra_sql {
+        where_parts.push(extra.to_string());
+    }
 
     // Build the static base WHERE clause for single-value params.
     // Uses (? IS NULL OR ? = '' OR col = ?) pattern so the query string is always identical.
@@ -1275,10 +1283,7 @@ fn build_filtered_query(
         order_by_clause(&terms)
     };
 
-    let count_sql = format!(
-        "SELECT COUNT(*) as cnt FROM media_items WHERE {}{}",
-        base_where, array_where
-    );
+    let count_sql = format!("{COUNT_SQL_PREFIX}{base_where}{array_where}");
     let data_sql = format!(
         "SELECT id, name, sort_name, overview, media_type, path, parent_id, library_id, \
          production_year, community_rating, official_rating, genres, date_created, \
@@ -1292,7 +1297,8 @@ fn build_filtered_query(
     // Cache the result, unless the SQL is too long to keep or the cache is full.
     {
         let mut cache = FILTER_QUERY_CACHE.lock();
-        if count_sql.len() + data_sql.len() <= FILTER_QUERY_MAX_CACHED_SQL
+        if extra_sql.is_none()
+            && count_sql.len() + data_sql.len() <= FILTER_QUERY_MAX_CACHED_SQL
             && cache.len() < FILTER_QUERY_CACHE_CAP
         {
             cache.insert(cache_key, (count_sql.clone(), data_sql.clone()));
@@ -1370,6 +1376,8 @@ pub async fn get_items_filtered(
     user_id: Option<Uuid>,
     item_ids: Option<&[String]>,
     hidden_ids_json: Option<&str>,
+    extra: Option<&crate::repo_item_filter::FilterSql>,
+    adjacent_to: Option<Uuid>,
 ) -> Result<(Vec<MediaItem>, i64), sqlx::Error> {
     // Convert options to strings for the (? IS NULL OR ? = '' OR col = ?) pattern
     let pid_str = parent_id.map(|u| u.to_string()).unwrap_or_default();
@@ -1438,246 +1446,148 @@ pub async fn get_items_filtered(
         is_played,
         &sort_by_str,
         &sort_order_str,
+        extra.map(|e| e.sql.as_str()),
     );
 
     // Recursive flag: 1 = recursive, 0 = non-recursive
     let recursive_flag = if recursive { 1i64 } else { 0i64 };
 
-    // Build count query — single-value params use the (? IS NULL OR ? = '' OR col = ?) pattern
-    let mut count_q = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(count_sql));
-    // Base single-value params (same order in both count and data queries)
-    count_q = count_q
-        .bind(&pid_str)
-        .bind(&pid_str)
-        .bind(&recursive_flag)
-        .bind(&pid_str)
-        .bind(&pid_str)
-        .bind(&recursive_flag)
-        .bind(&pid_str)
-        .bind(&pid_str)
-        .bind(&pid_str)
-        .bind(&lid_str)
-        .bind(&lid_str)
-        .bind(&lid_str)
-        .bind(&search_like)
-        .bind(&search_like)
-        .bind(&search_like)
-        .bind(&starts_with_str)
-        .bind(&starts_with_str)
-        .bind(&starts_with_str)
-        .bind(&starts_with_str)
-        .bind(&starts_with_like)
-        .bind(&starts_with_or_greater_str)
-        .bind(&starts_with_or_greater_str)
-        .bind(&starts_with_or_greater_str)
-        .bind(&sd_str)
-        .bind(&sd_str)
-        .bind(&sd_str)
-        .bind(&ed_str)
-        .bind(&ed_str)
-        .bind(&ed_str)
-        .bind(&pd_str)
-        .bind(&pd_str)
-        .bind(&pd_str)
-        .bind(&dc_str)
-        .bind(&dc_str)
-        .bind(&dc_str)
-        .bind(&min_ticks)
-        .bind(&min_ticks)
-        .bind(&max_ticks)
-        .bind(&max_ticks)
-        .bind(&item_ids_json)
-        .bind(&item_ids_json)
-        .bind(hidden_ids_json)
-        .bind(hidden_ids_json)
-        .bind(hidden_ids_json)
-        .bind(hidden_ids_json);
+    // The WHERE clause's binds, in build_filtered_query's order: the same for the count, the page
+    // and the AdjacentTo position.
+    macro_rules! bind_filters {
+        ($query:expr) => {{
+            let mut q = $query;
+            q = q
+                .bind(&pid_str)
+                .bind(&pid_str)
+                .bind(&recursive_flag)
+                .bind(&pid_str)
+                .bind(&pid_str)
+                .bind(&recursive_flag)
+                .bind(&pid_str)
+                .bind(&pid_str)
+                .bind(&pid_str)
+                .bind(&lid_str)
+                .bind(&lid_str)
+                .bind(&lid_str)
+                .bind(&search_like)
+                .bind(&search_like)
+                .bind(&search_like)
+                .bind(&starts_with_str)
+                .bind(&starts_with_str)
+                .bind(&starts_with_str)
+                .bind(&starts_with_str)
+                .bind(&starts_with_like)
+                .bind(&starts_with_or_greater_str)
+                .bind(&starts_with_or_greater_str)
+                .bind(&starts_with_or_greater_str)
+                .bind(&sd_str)
+                .bind(&sd_str)
+                .bind(&sd_str)
+                .bind(&ed_str)
+                .bind(&ed_str)
+                .bind(&ed_str)
+                .bind(&pd_str)
+                .bind(&pd_str)
+                .bind(&pd_str)
+                .bind(&dc_str)
+                .bind(&dc_str)
+                .bind(&dc_str)
+                .bind(&min_ticks)
+                .bind(&min_ticks)
+                .bind(&max_ticks)
+                .bind(&max_ticks)
+                .bind(&item_ids_json)
+                .bind(&item_ids_json)
+                .bind(hidden_ids_json)
+                .bind(hidden_ids_json)
+                .bind(hidden_ids_json)
+                .bind(hidden_ids_json);
 
-    // Array filter params
-    if let Some(types) = media_types {
-        if !types.is_empty() {
-            for t in types {
-                count_q = count_q.bind(t);
+            // Array filter params
+            if let Some(types) = media_types {
+                if !types.is_empty() {
+                    for t in types {
+                        q = q.bind(t);
+                    }
+                }
             }
-        }
-    }
-    if let Some(types) = exclude_media_types {
-        if !types.is_empty() {
-            for t in types {
-                count_q = count_q.bind(t);
+            if let Some(types) = exclude_media_types {
+                if !types.is_empty() {
+                    for t in types {
+                        q = q.bind(t);
+                    }
+                }
             }
-        }
-    }
-    if let Some(genre_list) = genres {
-        for g in genre_list {
-            // 4 binds per genre: exact match, start, middle, end
-            count_q = count_q
-                .bind(g)
-                .bind(format!("{}|%", g))
-                .bind(format!("%|{}", g))
-                .bind(format!("%|{}|%", g));
-        }
-    }
-    if let Some(year_list) = years {
-        if !year_list.is_empty() {
-            for y in year_list {
-                count_q = count_q.bind(*y);
+            if let Some(genre_list) = genres {
+                for g in genre_list {
+                    // 4 binds per genre: exact match, start, middle, end
+                    q = q
+                        .bind(g)
+                        .bind(format!("{}|%", g))
+                        .bind(format!("%|{}", g))
+                        .bind(format!("%|{}|%", g));
+                }
             }
-        }
-    }
-    if let Some(ratings) = official_ratings {
-        if !ratings.is_empty() {
-            for r in ratings {
-                count_q = count_q.bind(r);
+            if let Some(year_list) = years {
+                if !year_list.is_empty() {
+                    for y in year_list {
+                        q = q.bind(*y);
+                    }
+                }
             }
-        }
-    }
-    if let Some(tag_list) = tags {
-        for tag in tag_list {
-            // 4 binds per tag: exact match, start, middle, end
-            count_q = count_q
-                .bind(tag)
-                .bind(format!("{}|%", tag))
-                .bind(format!("%|{}", tag))
-                .bind(format!("%|{}|%", tag));
-        }
-    }
-    if let Some(mt_filter) = media_types_filter {
-        if !mt_filter.is_empty() {
-            for mt in mt_filter {
-                count_q = count_q.bind(mt);
+            if let Some(ratings) = official_ratings {
+                if !ratings.is_empty() {
+                    for r in ratings {
+                        q = q.bind(r);
+                    }
+                }
             }
-        }
-    }
-    // The user_id for an IsFavorite clause, and the played series and seasons and the user_id for
-    // an IsPlayed / IsUnplayed clause, in build_filtered_query's order.
-    if is_favorite.is_some() {
-        count_q = count_q.bind(&uid_str);
-    }
-    if is_played.is_some() {
-        count_q = count_q.bind(&played_folders).bind(&uid_str);
-    }
-    if is_unplayed.is_some() {
-        count_q = count_q.bind(&played_folders).bind(&uid_str);
+            if let Some(tag_list) = tags {
+                for tag in tag_list {
+                    // 4 binds per tag: exact match, start, middle, end
+                    q = q
+                        .bind(tag)
+                        .bind(format!("{}|%", tag))
+                        .bind(format!("%|{}", tag))
+                        .bind(format!("%|{}|%", tag));
+                }
+            }
+            if let Some(mt_filter) = media_types_filter {
+                if !mt_filter.is_empty() {
+                    for mt in mt_filter {
+                        q = q.bind(mt);
+                    }
+                }
+            }
+            // The user_id for an IsFavorite clause, and the played series and seasons and the user_id for
+            // an IsPlayed / IsUnplayed clause, in build_filtered_query's order.
+            if is_favorite.is_some() {
+                q = q.bind(&uid_str);
+            }
+            if is_played.is_some() {
+                q = q.bind(&played_folders).bind(&uid_str);
+            }
+            if is_unplayed.is_some() {
+                q = q.bind(&played_folders).bind(&uid_str);
+            }
+
+            // The `repo_item_filter` condition's values, last as its condition is.
+            for bound in extra.map(|e| e.binds.as_slice()).unwrap_or_default() {
+                q = match bound {
+                    crate::repo_item_filter::Bound::Text(v) => q.bind(v.clone()),
+                    crate::repo_item_filter::Bound::Int(v) => q.bind(*v),
+                    crate::repo_item_filter::Bound::Real(v) => q.bind(*v),
+                };
+            }
+            q
+        }};
     }
 
-    let total: i64 = count_q.fetch_one(pool).await.unwrap_or(0);
-
-    // Build data query — same bind order as count query
-    let mut data_q = sqlx::query_as::<_, MediaItemRow>(sqlx::AssertSqlSafe(data_sql));
-    data_q = data_q
-        .bind(&pid_str)
-        .bind(&pid_str)
-        .bind(&recursive_flag)
-        .bind(&pid_str)
-        .bind(&pid_str)
-        .bind(&recursive_flag)
-        .bind(&pid_str)
-        .bind(&pid_str)
-        .bind(&pid_str)
-        .bind(&lid_str)
-        .bind(&lid_str)
-        .bind(&lid_str)
-        .bind(&search_like)
-        .bind(&search_like)
-        .bind(&search_like)
-        .bind(&starts_with_str)
-        .bind(&starts_with_str)
-        .bind(&starts_with_str)
-        .bind(&starts_with_str)
-        .bind(&starts_with_like)
-        .bind(&starts_with_or_greater_str)
-        .bind(&starts_with_or_greater_str)
-        .bind(&starts_with_or_greater_str)
-        .bind(&sd_str)
-        .bind(&sd_str)
-        .bind(&sd_str)
-        .bind(&ed_str)
-        .bind(&ed_str)
-        .bind(&ed_str)
-        .bind(&pd_str)
-        .bind(&pd_str)
-        .bind(&pd_str)
-        .bind(&dc_str)
-        .bind(&dc_str)
-        .bind(&dc_str)
-        .bind(&min_ticks)
-        .bind(&min_ticks)
-        .bind(&max_ticks)
-        .bind(&max_ticks)
-        .bind(&item_ids_json)
-        .bind(&item_ids_json)
-        .bind(hidden_ids_json)
-        .bind(hidden_ids_json)
-        .bind(hidden_ids_json)
-        .bind(hidden_ids_json);
-
-    // Array filter params (same order as count query)
-    if let Some(types) = media_types {
-        if !types.is_empty() {
-            for t in types {
-                data_q = data_q.bind(t);
-            }
-        }
-    }
-    if let Some(types) = exclude_media_types {
-        if !types.is_empty() {
-            for t in types {
-                data_q = data_q.bind(t);
-            }
-        }
-    }
-    if let Some(genre_list) = genres {
-        for g in genre_list {
-            // 4 binds per genre: exact match, start, middle, end
-            data_q = data_q
-                .bind(g)
-                .bind(format!("{}|%", g))
-                .bind(format!("%|{}", g))
-                .bind(format!("%|{}|%", g));
-        }
-    }
-    if let Some(year_list) = years {
-        if !year_list.is_empty() {
-            for y in year_list {
-                data_q = data_q.bind(*y);
-            }
-        }
-    }
-    if let Some(ratings) = official_ratings {
-        if !ratings.is_empty() {
-            for r in ratings {
-                data_q = data_q.bind(r);
-            }
-        }
-    }
-    if let Some(tag_list) = tags {
-        for tag in tag_list {
-            // 4 binds per tag: exact match, start, middle, end
-            data_q = data_q
-                .bind(tag)
-                .bind(format!("{}|%", tag))
-                .bind(format!("%|{}", tag))
-                .bind(format!("%|{}|%", tag));
-        }
-    }
-    if let Some(mt_filter) = media_types_filter {
-        if !mt_filter.is_empty() {
-            for mt in mt_filter {
-                data_q = data_q.bind(mt);
-            }
-        }
-    }
-    // Same user_id binds as the count query, for the same clauses.
-    if is_favorite.is_some() {
-        data_q = data_q.bind(&uid_str);
-    }
-    if is_played.is_some() {
-        data_q = data_q.bind(&played_folders).bind(&uid_str);
-    }
-    if is_unplayed.is_some() {
-        data_q = data_q.bind(&played_folders).bind(&uid_str);
-    }
+    let count_q = bind_filters!(sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(
+        count_sql.clone()
+    )));
+    let mut total: i64 = count_q.fetch_one(pool).await.unwrap_or(0);
 
     // The sort keys' binds: the user id (play count, date played), the rating scores
     let order_binds = order_binds(sort_by_str, sort_order_str);
@@ -1686,17 +1596,60 @@ pub async fn get_items_filtered(
     } else {
         String::new()
     };
-    for bind in order_binds {
-        data_q = match bind {
-            OrderBind::UserId => data_q.bind(uid_str.clone()),
-            OrderBind::RatingScores => data_q.bind(scores.clone()),
+    macro_rules! bind_order {
+        ($query:expr) => {{
+            let mut q = $query;
+            for bind in &order_binds {
+                q = match bind {
+                    OrderBind::UserId => q.bind(uid_str.clone()),
+                    OrderBind::RatingScores => q.bind(scores.clone()),
+                };
+            }
+            q
+        }};
+    }
+
+    // AdjacentTo (Jellyfin's `FilterForAdjacency`): the item's place in the ordered list, then
+    // only it and its neighbours; the first item alone when the list doesn't hold it.
+    let (mut start_index, mut limit) = (start_index, limit);
+    if let Some(id) = adjacent_to {
+        let terms = parse_sort(sort_by_str, sort_order_str);
+        let order_clause = if is_random_sort(&terms) {
+            "ORDER BY RANDOM()".to_string()
+        } else {
+            order_by_clause(&terms)
+        };
+        let where_sql = count_sql
+            .strip_prefix(COUNT_SQL_PREFIX)
+            .expect("the count query starts with COUNT_SQL_PREFIX");
+        // The CTE keeps the WHERE binds before the order binds, as in the page query.
+        let position_sql = format!(
+            "WITH m AS (SELECT * FROM media_items WHERE {where_sql}) \
+             SELECT n FROM (SELECT id, ROW_NUMBER() OVER ({order_clause}) - 1 AS n \
+             FROM m AS media_items) WHERE id = ?"
+        );
+        let position_q = bind_filters!(sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(
+            position_sql
+        )));
+        let position = bind_order!(position_q)
+            .bind(id.to_string())
+            .fetch_optional(pool)
+            .await?;
+        (start_index, limit) = match position {
+            Some(0) => (0, 2),
+            Some(n) => (n - 1, 3),
+            None => (0, 1),
         };
     }
 
-    // Pagination
-    data_q = data_q.bind(limit).bind(start_index);
-
+    let data_q = bind_filters!(sqlx::query_as::<_, MediaItemRow>(sqlx::AssertSqlSafe(
+        data_sql
+    )));
+    let data_q = bind_order!(data_q).bind(limit).bind(start_index);
     let rows = data_q.fetch_all(pool).await?;
+    if adjacent_to.is_some() {
+        total = rows.len() as i64;
+    }
     Ok((rows.into_iter().map(Into::into).collect(), total))
 }
 
@@ -4204,7 +4157,7 @@ mod tests {
         let build = |genres: Option<&[String]>, sort_by: &str, sort_order: &str| {
             super::build_filtered_query(
                 true, None, None, genres, None, None, None, None, None, None, None, sort_by,
-                sort_order,
+                sort_order, None,
             )
         };
         // Lists that parse to the same terms share an entry. Different terms never do, even when
@@ -4287,7 +4240,7 @@ mod tests {
         let build = |include: Option<&[String]>, exclude: Option<&[String]>| {
             super::build_filtered_query(
                 true, include, exclude, None, None, None, None, None, fav, None, None, sort_by,
-                sort_order,
+                sort_order, None,
             )
         };
         let one = || build(Some(included.as_slice()), None);
@@ -4357,6 +4310,7 @@ mod tests {
                 r.is_played,
                 r.sort_by,
                 r.sort_order,
+                None,
             )
         }
         /// The length of a list, or 0 for no list.
