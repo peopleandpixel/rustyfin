@@ -35748,6 +35748,28 @@ async fn b22_subtitle_vtt_moves_cues_back_by_the_start() {
     let at = |index: i32, ticks: i64| {
         format!("/Videos/{id}/{msid}/Subtitles/{index}/{ticks}/Stream.vtt")
     };
+    // The same stream as SubRip, as a client with an srt subtitle profile asks for it, whole and
+    // moved the same way
+    let srt = format!("/Videos/{id}/{msid}/Subtitles/2/Stream.srt");
+    let (status, content_type, body) = b22_get(&app, &srt, &token).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(content_type, "application/x-subrip; charset=utf-8");
+    assert!(
+        body.contains("00:00:01,000 --> 00:00:02,000\nEmbedded one"),
+        "{body}"
+    );
+    let srt = format!("/Videos/{id}/{msid}/Subtitles/2/15000000/Stream.srt");
+    let (status, _, body) = b22_get(&app, &srt, &token).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.starts_with("1\n00:00:00,000 --> 00:00:00,500\nEmbedded one"),
+        "{body}"
+    );
+    assert!(
+        body.contains("2\n00:00:01,500 --> 00:00:02,500\nEmbedded two"),
+        "{body}"
+    );
+
     let (status, content_type, body) = b22_get(&app, &at(2, 15_000_000), &token).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(content_type, "text/vtt; charset=utf-8");
@@ -35804,9 +35826,11 @@ async fn b22_subtitle_vtt_refuses_bad_requests() {
 
     let other = uuid::Uuid::new_v4();
     let cases = [
-        // Only WebVTT is served
+        // Only the text formats the endpoint writes (vtt, srt, subrip, ass, ssa) are served; an
+        // srt of a text stream plays (b22_subtitle_vtt_moves_cues_back_by_the_start). This
+        // fixture's file isn't written, so only refusals made before the file is opened fit here.
         (
-            format!("/Videos/{id}/{msid}/Subtitles/3/Stream.srt"),
+            format!("/Videos/{id}/{msid}/Subtitles/3/Stream.smi"),
             StatusCode::BAD_REQUEST,
         ),
         // A picture subtitle has no text: players burn it in
