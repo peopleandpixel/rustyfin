@@ -455,4 +455,176 @@ mod tests {
         upgraded.close().await;
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    async fn r3sortname_sort(pool: &SqlitePool, id: &str) -> (Option<String>, Option<String>) {
+        sqlx::query_as(
+            "SELECT m.sort_name, e.forced_sort_name FROM media_items m \
+             LEFT JOIN item_metadata_extras e ON e.item_id = m.id WHERE m.id = ?",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn r3sortname_094_keeps_forced_sort_names_and_the_pass_remakes_the_rest() {
+        // Before 094 a forced sort name was only media_items.sort_name, as typed; an automatic
+        // one was the lowercased name.
+        let dir = temp_dir();
+        let old = dir.join("old.db");
+        let pool = plain_pool(&old).await;
+        subset(93).run(&pool).await.unwrap();
+        for statement in [
+            "INSERT INTO libraries (id, name, content_type) VALUES ('lib', 'Film', 'movies')",
+            "INSERT INTO media_items (id, library_id, name, sort_name, media_type, path) VALUES \
+             ('matrix', 'lib', 'The Matrix', 'the matrix', 'Movie', '/m/1.mkv'), \
+             ('alpha', 'lib', 'The Alpha', 'Alpha, The', 'Movie', '/m/2.mkv'), \
+             ('algen', 'lib', 'Ålgen', 'ålgen', 'Movie', '/m/3.mkv'), \
+             ('elk', 'lib', 'Élan', 'Zebra', 'Movie', '/m/4.mkv'), \
+             ('ole', 'lib', 'Ølé', 'ole', 'Movie', '/m/7.mkv'), \
+             ('locked', 'lib', 'The Locked', 'the locked', 'Movie', '/m/5.mkv'), \
+             ('ep', 'lib', 'The Pilot', 'show s01e02', 'Episode', '/m/6.mkv'), \
+             ('season', 'lib', 'Season 1', 'season 0001', 'Season', '/m/s1')",
+            "UPDATE media_items SET parent_index_number = 1, index_number = 2 WHERE id = 'ep'",
+            "INSERT INTO item_metadata_extras (item_id, locked_fields) VALUES ('locked', 'Name')",
+        ] {
+            sqlx::query(statement).execute(&pool).await.unwrap();
+        }
+        pool.close().await;
+
+        let upgraded = init_db(old.to_str().unwrap()).await.unwrap();
+        assert_eq!(
+            r3sortname_sort(&upgraded, "alpha").await,
+            (Some("Alpha, The".into()), Some("Alpha, The".into())),
+            "094 keeps a sort name that is not the lowercased name as the forced one"
+        );
+        for id in ["matrix", "algen", "elk", "ole", "locked", "ep", "season"] {
+            assert_eq!(r3sortname_sort(&upgraded, id).await.1, None, "{id}");
+        }
+
+        // The startup step: Rust lowercases what SQLite cannot. 'ålgen' was automatic, and so
+        // is 'ole', the sort name made from 'Ølé'; 'Zebra' was forced. It runs once.
+        assert_eq!(
+            repo_media::classify_legacy_sort_names(&upgraded)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            r3sortname_sort(&upgraded, "elk").await,
+            (Some("Zebra".into()), Some("Zebra".into()))
+        );
+        assert_eq!(
+            repo_media::classify_legacy_sort_names(&upgraded)
+                .await
+                .unwrap(),
+            0
+        );
+
+        let rules = rustyfin_model::sort_name::SortRules::default();
+        let changed = repo_media::recompute_sort_names(&upgraded, &rules)
+            .await
+            .unwrap();
+        let expect = [
+            ("matrix", "matrix", None),
+            ("alpha", "alpha, the", Some("Alpha, The")),
+            ("algen", "algen", None),
+            ("elk", "zebra", Some("Zebra")),
+            ("ole", "ole", None),
+            // A lock doesn't keep a sort name: it is made from the (kept) name, as in Jellyfin
+            ("locked", "locked", None),
+            ("ep", "001 - 0002 - The Pilot", None),
+            ("season", "season 0001", None),
+        ];
+        for (id, sort, forced) in expect {
+            assert_eq!(
+                r3sortname_sort(&upgraded, id).await,
+                (Some(sort.to_string()), forced.map(str::to_string)),
+                "{id}"
+            );
+        }
+        assert_eq!(changed, 6);
+        assert_eq!(
+            repo_media::recompute_sort_names(&upgraded, &rules)
+                .await
+                .unwrap(),
+            0,
+            "the same rules leave the sort names alone"
+        );
+
+        // Other rules make them again
+        let rules = rustyfin_model::sort_name::SortRules {
+            remove_words: vec![],
+            ..Default::default()
+        };
+        assert_eq!(
+            repo_media::recompute_sort_names(&upgraded, &rules)
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            r3sortname_sort(&upgraded, "matrix").await.0.as_deref(),
+            Some("the matrix")
+        );
+        upgraded.close().await;
+    }
+
+    #[tokio::test]
+    async fn r3sortname_an_upsert_keeps_only_a_forced_sort_name() {
+        let pool = test_pool().await;
+        let lib = uuid::Uuid::new_v4();
+        insert_test_library(&pool, lib).await;
+        let mut items = Vec::new();
+        for name in ["Forced", "Locked", "Free"] {
+            let mut item = rustyfin_model::media::MediaItem::default_dto_fields();
+            item.id = uuid::Uuid::new_v4();
+            item.library_id = lib;
+            item.name = name.to_string();
+            item.sort_name = Some("stored".to_string());
+            item.path = format!("/m/{name}.mkv");
+            repo_media::upsert_media_item(&pool, &item).await.unwrap();
+            items.push(item);
+        }
+        repo_media::set_forced_sort_name(&pool, items[0].id, Some("Stored"))
+            .await
+            .unwrap();
+        let locks = repo_media::ItemLocks {
+            lock_data: false,
+            fields: vec!["SortName".to_string()],
+        };
+        repo_media::save_item_extras_edit(&pool, items[1].id, None, None, &locks)
+            .await
+            .unwrap();
+        for item in &mut items {
+            item.sort_name = Some("rescanned".to_string());
+        }
+        repo_media::batch_upsert_media_items(&pool, &items[..2])
+            .await
+            .unwrap();
+        repo_media::upsert_media_item(&pool, &items[2])
+            .await
+            .unwrap();
+        let sorts: Vec<Option<String>> = r3sortname_sorts(&pool, &items).await;
+        assert_eq!(
+            sorts,
+            [
+                Some("stored".into()),
+                Some("rescanned".into()),
+                Some("rescanned".into())
+            ]
+        );
+    }
+
+    async fn r3sortname_sorts(
+        pool: &SqlitePool,
+        items: &[rustyfin_model::media::MediaItem],
+    ) -> Vec<Option<String>> {
+        let mut sorts = Vec::new();
+        for item in items {
+            sorts.push(r3sortname_sort(pool, &item.id.to_string()).await.0);
+        }
+        sorts
+    }
 }

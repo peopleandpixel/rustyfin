@@ -214,6 +214,8 @@ pub struct ByNameFilter {
     /// Item ids, as stored, that are neither counted nor make an entry: those a user's parental
     /// limits hide.
     pub hidden_items: HashSet<String>,
+    /// The library ids, as stored, whose items count; `None` for every library.
+    pub libraries: Option<HashSet<String>>,
 }
 
 /// One page of a list.
@@ -244,6 +246,10 @@ pub async fn list(
         if row.in_scope
             && passes_type_filters(filter, row.media)
             && !filter.hidden_items.contains(&row.item)
+            && filter
+                .libraries
+                .as_ref()
+                .is_none_or(|libs| libs.contains(&row.library))
         {
             group.items.insert(row.item, row.media);
         }
@@ -284,16 +290,17 @@ pub async fn get_by_name(
     kind: ByNameKind,
     name: &str,
 ) -> Result<Option<ByNameEntry>, sqlx::Error> {
-    get_by_name_hiding(pool, kind, name, HashSet::new()).await
+    get_by_name_hiding(pool, kind, name, HashSet::new(), None).await
 }
 
-/// `get_by_name` counting only the items not in `hidden_items` (ids as stored); an entry whose
-/// items are all hidden is `None`.
+/// `get_by_name` counting only the items not in `hidden_items` (ids as stored) and, when
+/// `libraries` is given, in one of those libraries; an entry whose items are all hidden is `None`.
 pub async fn get_by_name_hiding(
     pool: &SqlitePool,
     kind: ByNameKind,
     name: &str,
     hidden_items: HashSet<String>,
+    libraries: Option<HashSet<String>>,
 ) -> Result<Option<ByNameEntry>, sqlx::Error> {
     // A year is its positive number, so `01999` finds 1999, while `0`, `-5` and `abc` find nothing.
     let folded = match kind {
@@ -309,6 +316,7 @@ pub async fn get_by_name_hiding(
     }
     let filter = ByNameFilter {
         hidden_items,
+        libraries,
         ..Default::default()
     };
     let page = list(pool, kind, &filter).await?;
@@ -410,6 +418,7 @@ impl Group {
 /// One item and one of its names, as `name_rows` reads them.
 struct NameRow {
     item: String,
+    library: String,
     media: MediaType,
     name: String,
     /// Whether the item is in the scope of the list.
@@ -427,7 +436,7 @@ const GENRE_ROWS: &str = "WITH RECURSIVE sub(id) AS (
         UNION SELECT c.id FROM media_items c JOIN sub ON c.parent_id = sub.id)
     SELECT m.id, m.media_type, m.genres,
         CASE WHEN ?1 IS NULL OR (m.id <> ?1 AND (m.library_id = ?1 OR m.id IN (SELECT id FROM sub)))
-            THEN 1 ELSE 0 END
+            THEN 1 ELSE 0 END, m.library_id
     FROM media_items m
     WHERE typeof(m.id) = 'text' AND typeof(m.media_type) = 'text' AND typeof(m.genres) = 'text'
         AND m.genres NOT IN ('', '[]')";
@@ -438,7 +447,7 @@ const STUDIO_ROWS: &str = "WITH RECURSIVE sub(id) AS (
         UNION SELECT c.id FROM media_items c JOIN sub ON c.parent_id = sub.id)
     SELECT s.name, m.id, m.media_type,
         CASE WHEN ?1 IS NULL OR (m.id <> ?1 AND (m.library_id = ?1 OR m.id IN (SELECT id FROM sub)))
-            THEN 1 ELSE 0 END
+            THEN 1 ELSE 0 END, m.library_id
     FROM item_studios i
     JOIN studios s ON s.id = i.studio_id
     JOIN media_items m ON m.id = i.item_id
@@ -450,7 +459,7 @@ const YEAR_ROWS: &str = "WITH RECURSIVE sub(id) AS (
         UNION SELECT c.id FROM media_items c JOIN sub ON c.parent_id = sub.id)
     SELECT m.id, m.media_type, m.production_year,
         CASE WHEN ?1 IS NULL OR (m.id <> ?1 AND (m.library_id = ?1 OR m.id IN (SELECT id FROM sub)))
-            THEN 1 ELSE 0 END
+            THEN 1 ELSE 0 END, m.library_id
     FROM media_items m
     WHERE typeof(m.id) = 'text' AND typeof(m.media_type) = 'text'
       AND typeof(m.production_year) = 'integer' AND m.production_year > 0";
@@ -462,8 +471,9 @@ async fn name_rows(
     parent_id: Option<Uuid>,
 ) -> Result<Vec<NameRow>, sqlx::Error> {
     let parent = parent_id.map(|id| id.to_string());
-    let row = |item: String, media: &str, name: String, scope: i64| NameRow {
+    let row = |item: String, library: String, media: &str, name: String, scope: i64| NameRow {
         item,
+        library,
         media: stored_media_type(media),
         name,
         in_scope: scope != 0,
@@ -471,35 +481,35 @@ async fn name_rows(
     let mut rows = Vec::new();
     match kind {
         ByNameKind::Genre | ByNameKind::MusicGenre => {
-            let found = sqlx::query_as::<_, (String, String, String, i64)>(GENRE_ROWS)
+            let found = sqlx::query_as::<_, (String, String, String, i64, String)>(GENRE_ROWS)
                 .bind(parent)
                 .fetch_all(pool)
                 .await?;
-            for (item, media, genres, scope) in found {
+            for (item, media, genres, scope, library) in found {
                 for name in split_genres(&genres) {
-                    rows.push(row(item.clone(), &media, name, scope));
+                    rows.push(row(item.clone(), library.clone(), &media, name, scope));
                 }
             }
         }
         ByNameKind::Studio => {
-            let found = sqlx::query_as::<_, (String, String, String, i64)>(STUDIO_ROWS)
+            let found = sqlx::query_as::<_, (String, String, String, i64, String)>(STUDIO_ROWS)
                 .bind(parent)
                 .fetch_all(pool)
                 .await?;
-            for (name, item, media, scope) in found {
+            for (name, item, media, scope, library) in found {
                 let name = name.trim();
                 if !name.is_empty() {
-                    rows.push(row(item, &media, name.to_string(), scope));
+                    rows.push(row(item, library, &media, name.to_string(), scope));
                 }
             }
         }
         ByNameKind::Year => {
-            let found = sqlx::query_as::<_, (String, String, i64, i64)>(YEAR_ROWS)
+            let found = sqlx::query_as::<_, (String, String, i64, i64, String)>(YEAR_ROWS)
                 .bind(parent)
                 .fetch_all(pool)
                 .await?;
-            for (item, media, year, scope) in found {
-                rows.push(row(item, &media, year.to_string(), scope));
+            for (item, media, year, scope, library) in found {
+                rows.push(row(item, library, &media, year.to_string(), scope));
             }
         }
         // Music artists are people; their names come from `repo_person`, not from items.

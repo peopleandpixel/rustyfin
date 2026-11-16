@@ -180,11 +180,6 @@ pub fn image_jobs() -> usize {
     })
 }
 
-/// The decoder threads of each image job's ffmpeg: the CPUs shared out among the jobs, 1 to 4.
-fn decode_threads() -> usize {
-    (cpus() / image_jobs()).clamp(1, 4)
-}
-
 /// Held by a running image job: one of the `image_jobs` permits, and a shared hold on the lock
 /// that `sweep_unused_files` takes alone. Transcodes don't take it.
 pub(crate) struct ImageJob {
@@ -257,14 +252,7 @@ async fn run_tool(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    #[cfg(unix)]
-    // SAFETY: the hook only makes the nice(2) system call, which is async-signal-safe.
-    unsafe {
-        cmd.pre_exec(|| {
-            libc::nice(10);
-            Ok(())
-        });
-    }
+    crate::media_reads::lower_priority(&mut cmd);
     // Dropping the output future kills ffmpeg (kill_on_drop).
     let output = tokio::select! {
         out = tokio::time::timeout(FFMPEG_TIMEOUT, cmd.output()) => match out {
@@ -308,7 +296,7 @@ fn attempts() -> &'static std::sync::Mutex<std::collections::HashMap<String, u32
 }
 
 /// Makes the tile set of the video at `path`, an item's file, and saves it. The old set, if any,
-/// is replaced only once the new one is complete. Waits for an `image_job`.
+/// is replaced only once the new one is complete. Waits for an `image_job` (`make_tiles`).
 pub async fn generate(
     pool: &SqlitePool,
     data_dir: &Path,
@@ -316,9 +304,6 @@ pub async fn generate(
     path: &str,
     cancel: &Cancel,
 ) -> Result<TrickplayInfo, String> {
-    let Some(_job) = image_job(cancel).await else {
-        return Err("cancelled".to_string());
-    };
     *attempts()
         .lock()
         .unwrap()
@@ -458,7 +443,7 @@ impl Probe {
     /// The decoder threads for reading this video whole: at most 2 above 1080p, as each frame
     /// thread holds frames of its own and 4K ones are large.
     fn threads(&self) -> usize {
-        let threads = decode_threads();
+        let threads = crate::media_reads::decode_threads();
         if self.above_1080p() {
             threads.min(2)
         } else {
@@ -763,6 +748,12 @@ enum Reading {
 /// info. A video in a container with an index (Matroska, MP4) that seeking reads much less of is
 /// read a key frame at a time (`seek_tiles`); others, and any that seeking fails on, are read
 /// whole (`tile_run`). Both make the same thumbnails.
+///
+/// Seeking holds an `image_job`. Reading whole first takes a network read
+/// (`media_reads::whole_file_read`, for a file on a network share), then an `image_job`: the
+/// order intro detection takes them in, so neither waits on the other while holding what the
+/// other needs. Seeking needs no network read: it reads a small part of the file, and its tiles
+/// are bounded by `seek_tile_slots`.
 async fn make_tiles(
     path: &str,
     work: &Path,
@@ -780,6 +771,9 @@ async fn make_tiles(
         Reading::Stream => None,
     };
     if let Some(p) = seek {
+        let Some(_job) = image_job(cancel).await else {
+            return Err("cancelled".to_string());
+        };
         match seek_tiles(path, p, work, tiles, cancel).await {
             Ok(n) => count = n,
             Err(e) if cancel.is_cancelled() => return Err(e),
@@ -795,7 +789,17 @@ async fn make_tiles(
         return Err("the video can't be seeked".to_string());
     }
     if count == 0 {
-        let threads = probed.as_ref().map_or(decode_threads(), Probe::threads);
+        // The seek's job, if any, is given back first: see above for the order
+        let _read = tokio::select! {
+            read = crate::media_reads::whole_file_read(Path::new(path)) => read,
+            _ = cancel.cancelled() => return Err("cancelled".to_string()),
+        };
+        let Some(_job) = image_job(cancel).await else {
+            return Err("cancelled".to_string());
+        };
+        let threads = probed
+            .as_ref()
+            .map_or(crate::media_reads::decode_threads(), Probe::threads);
         count = tile_run(path, work, tiles, true, threads, cancel).await?;
         if count == 0 {
             // A file whose packets carry no key frame flags loses them all to the thinning

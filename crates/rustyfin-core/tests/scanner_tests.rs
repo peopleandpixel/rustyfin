@@ -397,7 +397,10 @@ fn names(items: &[ItemState]) -> Vec<Names> {
 
 /// The names that a scan gives the movie at `path` titled `title`.
 fn titled(path: &str, title: &str, year: Option<i64>) -> Names {
-    let sort_name = Some(title.to_lowercase());
+    let sort_name = Some(rustyfin_model::sort_name::create_sort_name(
+        title,
+        &Default::default(),
+    ));
     (path.to_string(), title.to_string(), sort_name, year)
 }
 
@@ -584,7 +587,10 @@ fn tv_fields(items: &[ItemState]) -> Vec<TvFields> {
 /// The Series at `path`, as a scan names it.
 fn series_row(path: &str) -> TvFields {
     let name = path.to_string();
-    let sort_name = Some(path.to_lowercase());
+    let sort_name = Some(rustyfin_model::sort_name::create_sort_name(
+        path,
+        &Default::default(),
+    ));
     (
         "Series".into(),
         path.into(),
@@ -616,7 +622,13 @@ fn episode_row(path: &str, index: Option<i64>, season: i64, season_path: &str) -
         "Episode".into(),
         path.into(),
         stem.into(),
-        Some(stem.to_lowercase()),
+        Some(rustyfin_model::sort_name::item_sort_name(
+            rustyfin_model::media::MediaType::Episode,
+            stem,
+            Some(season as i32),
+            index.map(|i| i as i32),
+            &Default::default(),
+        )),
         index,
         Some(season),
         Some(season_path.into()),
@@ -3455,7 +3467,7 @@ async fn b28_a_new_year_or_rating_still_moves_the_filter_counts() {
 /// The ids of the items a search for `query` finds, in every library.
 #[cfg(target_os = "linux")]
 async fn b28_found(pool: &SqlitePool, query: &str) -> Vec<Uuid> {
-    rustyfin_db::repo_search::hint_candidates(pool, query, None)
+    rustyfin_db::repo_search::hint_candidates(pool, query, None, None)
         .await
         .unwrap()
         .into_iter()
@@ -6005,6 +6017,60 @@ async fn b18_rescan_rereads_changed_movies() {
         b18_source_ids(pool, &lib).await,
         after,
         "a rescan probed a file that did not change"
+    );
+}
+
+/// ffmpeg. The scan stores a video's subtitle files with its streams, as Jellyfin numbers them
+/// from what the scan found: a file added later reaches the streams on the next scan, which
+/// probes only that video again, and a scan with nothing new probes nothing.
+#[tokio::test]
+async fn r3gaps2_the_scan_stores_subtitle_files() {
+    if !have_ffmpeg() {
+        eprintln!("skipped: needs ffmpeg and ffprobe");
+        return;
+    }
+    let fx = Fixture::new().await;
+    let lib = fx.library("film", LibraryContentType::Movies).await;
+    let pool = &fx.pool;
+    let root = root_of(&lib);
+    write_films(&fx, &root);
+    let heat = "Heat (1995)/Heat (1995).mkv";
+    std::fs::write(root.join("Heat (1995)/Heat (1995).eng.srt"), "").unwrap();
+    scan_idle(pool, &lib).await;
+    let externals = |pool: &SqlitePool| {
+        let pool = pool.clone();
+        let path = root.join(heat).to_str().unwrap().to_string();
+        async move {
+            let rows: Vec<(String,)> = sqlx::query_as(
+                "SELECT st.path FROM media_streams AS st
+                 JOIN media_sources AS s ON s.id = st.source_id
+                 WHERE s.path = ?1 AND st.is_external = 1 ORDER BY st.stream_index",
+            )
+            .bind(path)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            rows.into_iter()
+                .map(|(p,)| p.rsplit('/').next().unwrap().to_string())
+                .collect::<Vec<_>>()
+        }
+    };
+    assert_eq!(externals(pool).await, ["Heat (1995).eng.srt"]);
+
+    let before = b18_source_ids(pool, &lib).await;
+    std::fs::write(root.join("Heat (1995)/Heat (1995).ger.srt"), "").unwrap();
+    scan_idle(pool, &lib).await;
+    let after = b18_source_ids(pool, &lib).await;
+    assert_eq!(b18_reprobed(&before, &after), [heat]);
+    assert_eq!(
+        externals(pool).await,
+        ["Heat (1995).eng.srt", "Heat (1995).ger.srt"]
+    );
+    scan_idle(pool, &lib).await;
+    assert_eq!(
+        b18_source_ids(pool, &lib).await,
+        after,
+        "nothing new, no probe"
     );
 }
 
@@ -9535,7 +9601,7 @@ async fn b32_series_folders_give_a_name_a_year_and_their_tvshow_nfo() {
     );
     assert_eq!(
         shown("1923 (2022)").await,
-        B32Shown::plain("1923", "1923", Some(2022))
+        B32Shown::plain("1923", "0000001923", Some(2022))
     );
     assert_eq!(
         shown("Plain Show").await,

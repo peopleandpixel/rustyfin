@@ -84,6 +84,11 @@ pub struct TranscodeProfile {
     pub fmp4: bool,
     /// The codec tag of a copied video stream, such as `hvc1`, which Apple players need for HEVC
     pub video_tag: Option<String>,
+    /// The channels of an encoded audio stream; None is stereo
+    pub audio_channels: Option<u32>,
+    /// The sample rate of an encoded audio stream; None keeps the source's where the encoder
+    /// takes it
+    pub audio_sample_rate: Option<u32>,
 }
 
 impl Default for TranscodeProfile {
@@ -110,6 +115,8 @@ impl Default for TranscodeProfile {
             square_pixels: false,
             fmp4: false,
             video_tag: None,
+            audio_channels: None,
+            audio_sample_rate: None,
         }
     }
 }
@@ -132,6 +139,9 @@ struct TranscodeSession {
     stderr_tail: Arc<std::sync::Mutex<VecDeque<String>>>,
     last_access: Instant, // last playlist or segment request
     profile: TranscodeProfile,
+    /// A progressive transcode, piped to one HTTP response: it ends with the response, so the
+    /// idle cleanup and the HLS reuse leave it alone
+    progressive: bool,
 }
 
 /// What a starting session looked like when it was polled.
@@ -171,7 +181,13 @@ pub struct TranscodeManager {
     /// The PlaySessionIds stopped lately (in ASCII lower case) and when each was stopped
     stopped: Arc<std::sync::Mutex<HashMap<String, Instant>>>,
     stop_memory: Duration, // 60 s; unit tests shorten it
+    /// The most progressive transcodes that run at once (`MAX_PROGRESSIVE`); unit tests lower it
+    max_progressive: usize,
 }
+
+/// The most progressive transcodes that run at once. Each is one client's playback, so this is
+/// well above a household's streams and well below what fills the CPU with encodes.
+const MAX_PROGRESSIVE: usize = 8;
 
 impl TranscodeManager {
     pub fn new(data_dir: &Path) -> Self {
@@ -184,6 +200,7 @@ impl TranscodeManager {
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             stopped: Arc::new(std::sync::Mutex::new(HashMap::new())),
             stop_memory: Duration::from_secs(60),
+            max_progressive: MAX_PROGRESSIVE,
         }
     }
 
@@ -322,7 +339,8 @@ impl TranscodeManager {
             .iter()
             .find(|e| {
                 let session = e.value();
-                session.item_id == item_id
+                !session.progressive
+                    && session.item_id == item_id
                     && session.input_path == input_path
                     && same_key(session, play_session_id, device_id)
             })
@@ -405,29 +423,7 @@ impl TranscodeManager {
             args.join(" ")
         );
 
-        let mut command = Command::new(&self.ffmpeg);
-        command
-            .args(&args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        // Its own process group, which a stop kills whole; and on Linux it dies with the server,
-        // even a killed one
-        #[cfg(unix)]
-        command.process_group(0);
-        #[cfg(target_os = "linux")]
-        // SAFETY: prctl is async-signal-safe and touches only the child's own state. The signal
-        // follows the spawning thread, a tokio worker that lives as long as the runtime.
-        unsafe {
-            command.pre_exec(|| {
-                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        let spawned = command.spawn();
+        let spawned = self.ffmpeg_command(&args, Stdio::null()).spawn();
         let mut child = match spawned {
             Ok(child) => child,
             Err(e) => {
@@ -457,9 +453,156 @@ impl TranscodeManager {
                 stderr_tail,
                 last_access: Instant::now(),
                 profile: profile.clone(),
+                progressive: false,
             },
         );
         Ok(playback_id)
+    }
+
+    /// The ffmpeg command for `args`: stderr piped, killed on drop, in its own process group,
+    /// which a stop kills whole; and on Linux it dies with the server, even a killed one.
+    fn ffmpeg_command(&self, args: &[String], stdout: Stdio) -> Command {
+        let mut command = Command::new(&self.ffmpeg);
+        command
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(stdout)
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        #[cfg(unix)]
+        command.process_group(0);
+        #[cfg(target_os = "linux")]
+        // SAFETY: prctl is async-signal-safe and touches only the child's own state. The signal
+        // follows the spawning thread, a tokio worker that lives as long as the runtime.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        command
+    }
+
+    /// Start a progressive transcode of `input_path`: ffmpeg writes `format` (an ffmpeg muxer)
+    /// to its stdout, which the caller sends as the response. Jellyfin's progressive jobs work
+    /// so (`TranscodingJobType.Progressive`). Each request gets its own ffmpeg; it is registered
+    /// like an HLS session, so a stop by PlaySessionId or DeviceId and the shutdown kill it. The
+    /// caller ends it with `end_progressive` when the response ends or the client goes away.
+    /// A play session stopped less than `stop_memory` ago fails at once with `Stopped`.
+    pub async fn start_progressive(
+        &self,
+        item_id: Uuid,
+        input_path: &str,
+        profile: &TranscodeProfile,
+        format: &str,
+        play_session_id: &str,
+        device_id: &str,
+    ) -> Result<(Uuid, tokio::process::ChildStdout), TranscodeError> {
+        let _lock = self.start_lock.lock().await;
+        if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(TranscodeError::FfmpegFailed(
+                "the server is shutting down".into(),
+            ));
+        }
+        if !play_session_id.is_empty() && self.recently_stopped(play_session_id) {
+            return Err(TranscodeError::Stopped);
+        }
+        // A client that asks again (a seek, a retry) for the same item in the same play session
+        // (else from the same device) has left its older job: that one ends
+        let replaced: Vec<Uuid> = self
+            .sessions
+            .iter()
+            .filter(|e| {
+                let s = e.value();
+                s.progressive
+                    && s.item_id == item_id
+                    && (!play_session_id.is_empty() || !device_id.is_empty())
+                    && same_key(s, play_session_id, device_id)
+            })
+            .map(|e| *e.key())
+            .collect();
+        for id in replaced {
+            self.stop_session(id).await;
+        }
+        let running = self
+            .sessions
+            .iter()
+            .filter(|e| e.value().progressive)
+            .count();
+        if running >= self.max_progressive {
+            return Err(TranscodeError::TooMany(self.max_progressive));
+        }
+        let playback_id = Uuid::new_v4();
+        let args = build_progressive_args(input_path, format, profile);
+        info!(
+            item_id = %item_id,
+            playback_id = %playback_id,
+            "Starting progressive transcode: ffmpeg {}",
+            args.join(" ")
+        );
+        let mut child = self
+            .ffmpeg_command(&args, Stdio::piped())
+            .spawn()
+            .map_err(|e| TranscodeError::FfmpegNotFound(e.to_string()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| TranscodeError::Io("ffmpeg has no stdout".into()))?;
+        let stderr_tail = Arc::new(std::sync::Mutex::new(VecDeque::new()));
+        let stderr_task = child
+            .stderr
+            .take()
+            .map(|stderr| tokio::spawn(drain_stderr(stderr, playback_id, stderr_tail.clone())));
+        self.sessions.insert(
+            playback_id,
+            TranscodeSession {
+                item_id,
+                playback_id,
+                input_path: input_path.to_string(),
+                play_session_id: play_session_id.to_string(),
+                device_id: device_id.to_string(),
+                // Never created: the output is the pipe
+                output_dir: self.cache_root.join(playback_id.to_string()),
+                child: Some(child),
+                stderr_task,
+                stderr_tail,
+                last_access: Instant::now(),
+                profile: profile.clone(),
+                progressive: true,
+            },
+        );
+        Ok((playback_id, stdout))
+    }
+
+    /// End the progressive transcode `playback_id`: kill its ffmpeg if it still runs. False
+    /// when it was already gone (stopped, or ended before).
+    pub async fn end_progressive(&self, playback_id: Uuid) -> bool {
+        self.stop_session(playback_id).await
+    }
+
+    /// Why the progressive transcode `playback_id` wrote nothing: ffmpeg's exit and its last
+    /// stderr lines, once it has exited (waited for up to 2 s). The session is ended.
+    pub async fn progressive_failure(&self, playback_id: Uuid) -> TranscodeError {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let status = match self.sessions.get_mut(&playback_id) {
+                Some(mut session) => session
+                    .child
+                    .as_mut()
+                    .and_then(|c| c.try_wait().ok().flatten()),
+                None => return TranscodeError::Stopped,
+            };
+            if let Some(status) = status {
+                return self.ffmpeg_exited(playback_id, status).await;
+            }
+            if Instant::now() >= deadline {
+                self.stop_session(playback_id).await;
+                return TranscodeError::FfmpegFailed("ffmpeg wrote nothing".into());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     /// ffmpeg exited before writing a playlist: drop the session and return its last stderr lines.
@@ -627,7 +770,7 @@ impl TranscodeManager {
         let latest = self
             .sessions
             .iter()
-            .filter(|e| e.value().item_id == item_id)
+            .filter(|e| !e.value().progressive && e.value().item_id == item_id)
             .max_by_key(|e| e.value().last_access)
             .map(|e| *e.key());
         if let Some(playback_id) = latest
@@ -683,7 +826,10 @@ impl TranscodeManager {
         let idle: Vec<Uuid> = self
             .sessions
             .iter()
-            .filter(|e| now.saturating_duration_since(e.value().last_access) > max_idle)
+            .filter(|e| {
+                !e.value().progressive
+                    && now.saturating_duration_since(e.value().last_access) > max_idle
+            })
             .map(|e| *e.key())
             .collect();
 
@@ -770,6 +916,70 @@ async fn drain_stderr<R: tokio::io::AsyncRead + Unpin>(
 // ---------------------------------------------------------------------------
 // FFmpeg argument builder
 // ---------------------------------------------------------------------------
+
+/// Whether an ffmpeg audio encoder is lossless, so takes no bitrate.
+fn is_lossless_encoder(encoder: &str) -> bool {
+    matches!(encoder, "flac" | "alac") || encoder.starts_with("pcm_")
+}
+
+/// The ffmpeg encoder for an audio codec a client names (`mp3`, `aac`, `opus`, ...), as
+/// Jellyfin's `EncodingHelper.GetAudioEncoder` picks it; None for a codec Rustyfin doesn't
+/// encode.
+pub fn audio_encoder(codec: &str) -> Option<&'static str> {
+    Some(match codec.to_ascii_lowercase().as_str() {
+        "mp3" => "libmp3lame",
+        "aac" | "mp4a" => "aac",
+        "opus" => "libopus",
+        "vorbis" => "libvorbis",
+        "flac" => "flac",
+        "alac" => "alac",
+        "ac3" => "ac3",
+        "eac3" => "eac3",
+        "mp2" => "mp2",
+        "wav" | "pcm" | "pcm_s16le" => "pcm_s16le",
+        _ => return None,
+    })
+}
+
+/// The ffmpeg encoder for a video codec a client names; None for a codec Rustyfin doesn't
+/// encode.
+pub fn video_encoder(codec: &str) -> Option<&'static str> {
+    Some(match codec.to_ascii_lowercase().as_str() {
+        "h264" | "avc" | "avc1" => "libx264",
+        "hevc" | "h265" | "hvc1" | "hev1" => "libx265",
+        "vp8" => "libvpx",
+        "vp9" => "libvpx-vp9",
+        "mpeg4" => "mpeg4",
+        "mpeg2video" => "mpeg2video",
+        _ => return None,
+    })
+}
+
+/// The ffmpeg muxer and the content type of a progressive transcode into `container`, as
+/// Jellyfin names them; None for a container it can't stream.
+pub fn progressive_format(
+    container: &str,
+    audio_only: bool,
+) -> Option<(&'static str, &'static str)> {
+    Some(
+        match (container.to_ascii_lowercase().as_str(), audio_only) {
+            ("mp3", _) => ("mp3", "audio/mpeg"),
+            ("aac" | "adts", _) => ("adts", "audio/aac"),
+            ("m4a" | "m4b", _) | ("mp4", true) => ("mp4", "audio/mp4"),
+            ("ogg" | "oga" | "opus", _) => ("ogg", "audio/ogg"),
+            ("webma", _) | ("webm", true) => ("webm", "audio/webm"),
+            ("flac", _) => ("flac", "audio/flac"),
+            ("wav", _) => ("wav", "audio/wav"),
+            ("mka", _) | ("mkv" | "matroska", true) => ("matroska", "audio/x-matroska"),
+            ("ts" | "mpegts" | "m2ts", _) => ("mpegts", "video/mp2t"),
+            ("mkv" | "matroska", false) => ("matroska", "video/x-matroska"),
+            ("mp4" | "m4v", false) => ("mp4", "video/mp4"),
+            ("webm", false) => ("webm", "video/webm"),
+            ("avi", _) => ("avi", "video/x-msvideo"),
+            _ => return None,
+        },
+    )
+}
 
 /// Ticks as seconds with milliseconds truncated, in integer math (`600.000`)
 fn seconds_text(ticks: i64) -> String {
@@ -870,6 +1080,41 @@ pub fn build_ffmpeg_args(
     segment_pattern: &str,
     profile: &TranscodeProfile,
 ) -> Vec<String> {
+    ffmpeg_args(
+        input,
+        Output::Hls {
+            playlist: playlist_output,
+            segments: segment_pattern,
+        },
+        profile,
+    )
+}
+
+/// The ffmpeg arguments of a progressive transcode: the encode of `build_ffmpeg_args`, written
+/// to stdout in the muxer `format` (`mp3`, `adts`, `mp4`, `mpegts`, ...). MP4 is fragmented, as
+/// a pipe can't be seeked back to write the index. Metadata and chapters are dropped, as
+/// Jellyfin's progressive audio does (`-map_metadata -1 -map_chapters -1`).
+pub fn build_progressive_args(
+    input: &str,
+    format: &str,
+    profile: &TranscodeProfile,
+) -> Vec<String> {
+    ffmpeg_args(input, Output::Pipe { format }, profile)
+}
+
+/// Where ffmpeg writes.
+#[derive(Clone, Copy)]
+enum Output<'a> {
+    /// An HLS playlist and its segments.
+    Hls {
+        playlist: &'a str,
+        segments: &'a str,
+    },
+    /// Stdout, in this muxer.
+    Pipe { format: &'a str },
+}
+
+fn ffmpeg_args(input: &str, output: Output<'_>, profile: &TranscodeProfile) -> Vec<String> {
     let mut args: Vec<String> = Vec::new();
 
     // Overwrite output without asking; keep the banner and progress lines out of stderr
@@ -1040,15 +1285,46 @@ pub fn build_ffmpeg_args(
     if profile.copy_audio {
         args.extend(["-c:a".to_string(), "copy".to_string()]);
     } else {
+        args.extend(["-c:a".to_string(), profile.audio_codec.clone()]);
+        // A lossless encoder has no bitrate to set
+        if !is_lossless_encoder(&profile.audio_codec) {
+            args.extend([
+                "-b:a".to_string(),
+                format!("{}k", profile.max_audio_bitrate_kbps),
+            ]);
+        }
         args.extend([
-            "-c:a".to_string(),
-            profile.audio_codec.clone(),
-            "-b:a".to_string(),
-            format!("{}k", profile.max_audio_bitrate_kbps),
             "-ac".to_string(),
-            "2".to_string(),
+            profile.audio_channels.unwrap_or(2).to_string(),
         ]);
+        if let Some(rate) = profile.audio_sample_rate {
+            args.extend(["-ar".to_string(), rate.to_string()]);
+        }
     }
+
+    let (playlist_output, segment_pattern) = match output {
+        Output::Hls { playlist, segments } => (playlist, segments),
+        Output::Pipe { format } => {
+            // Preset for speed (skip for HW accel, audio-only and copied video)
+            if hw_accel == HwAccel::None && !profile.audio_only && !copy_video {
+                args.extend(["-preset".to_string(), "veryfast".to_string()]);
+            }
+            if profile.start_time_ticks > 0 && (copy_video || profile.copy_audio) {
+                args.extend(["-copypriorss".to_string(), "0".to_string()]);
+            }
+            args.extend(
+                ["-map_metadata", "-1", "-map_chapters", "-1", "-f", format].map(str::to_string),
+            );
+            if format == "mp4" {
+                args.extend([
+                    "-movflags".to_string(),
+                    "frag_keyframe+empty_moov+default_base_moof".to_string(),
+                ]);
+            }
+            args.push("pipe:1".to_string());
+            return args;
+        }
+    };
 
     // An encoded video gets a key frame at each segment start, as Jellyfin forces them. The
     // muxer cuts a segment only at a key frame, so without them the first segment (which the
@@ -1199,6 +1475,9 @@ pub enum TranscodeError {
 
     #[error("the play session was stopped")]
     Stopped,
+
+    #[error("{0} progressive transcodes are running, the most the server runs at once")]
+    TooMany(usize),
 }
 
 // ---------------------------------------------------------------------------
@@ -1231,6 +1510,7 @@ mod tests {
                 stderr_tail: Arc::new(std::sync::Mutex::new(VecDeque::new())),
                 last_access: Instant::now(),
                 profile: TranscodeProfile::default(),
+                progressive: false,
             },
         );
         // By the item's id the session's file is served; by the playback id it isn't.
@@ -2355,6 +2635,9 @@ exit 1
     /// Never writes a playlist.
     const FAKE_SLOW: &str = "#!/bin/sh\nexec sleep 30\n";
 
+    /// A progressive transcode: writes to stdout, then runs on.
+    const FAKE_PIPED: &str = "#!/bin/sh\nprintf 'r3gaps2'\nexec sleep 30\n";
+
     /// Writes its first segment slowly, a little every 0.3 s for 3 s, then the playlist: a
     /// transcode slower than real time that still makes progress.
     const FAKE_PROGRESSING: &str = r#"#!/bin/sh
@@ -2422,6 +2705,7 @@ exec sleep 30
                 ("progressing", FAKE_PROGRESSING),
                 ("stalled", FAKE_STALLED),
                 ("family", FAKE_FAMILY),
+                ("piped", FAKE_PIPED),
             ] {
                 // Rename into place: another test process may be running the old file.
                 let tmp = dir.join(format!("{name}.{}", std::process::id()));
@@ -2947,5 +3231,154 @@ exec sleep 30
             "a legacy segment request touches the session"
         );
         mgr.stop_all().await;
+    }
+
+    /// A progressive transcode writes to the pipe the caller reads; a stop by PlaySessionId
+    /// kills it (the pipe ends), and the idle cleanup and an HLS start of the same play session
+    /// leave it alone.
+    #[tokio::test]
+    async fn r3gaps2_progressive_pipes_and_stops_by_play_session() {
+        use tokio::io::AsyncReadExt;
+        let (_dir, mgr) = fake_manager("piped", Duration::from_secs(5));
+        let item = Uuid::new_v4();
+        let profile = TranscodeProfile {
+            audio_only: true,
+            ..TranscodeProfile::default()
+        };
+        let (playback, mut stdout) = mgr
+            .start_progressive(item, "/in.flac", &profile, "mp3", "ps-1", "dev-1")
+            .await
+            .unwrap();
+        let mut first = [0u8; 7];
+        stdout.read_exact(&mut first).await.unwrap();
+        assert_eq!(&first, b"r3gaps2");
+        assert!(mgr.is_active(item).await);
+        // Idle for longer than the limit: still running, as its response is
+        let later = Instant::now() + Duration::from_secs(3600);
+        assert_eq!(mgr.cleanup_idle_sessions(later, IDLE_LIMIT).await, 0);
+        assert_eq!(mgr.find_session(item, "/in.flac", "ps-1", "dev-1"), None);
+
+        assert_eq!(mgr.stop_play_session(None, "ps-1", "").await, 1);
+        let mut rest = Vec::new();
+        let read =
+            tokio::time::timeout(Duration::from_secs(5), stdout.read_to_end(&mut rest)).await;
+        assert!(matches!(read, Ok(Ok(0))), "the pipe ends with the stop");
+        assert!(!mgr.is_active(item).await);
+        assert!(!mgr.end_progressive(playback).await, "already gone");
+    }
+
+    /// A new progressive job of the same item and play session (else device) replaces the old
+    /// one; other sessions keep theirs, and past the cap a start fails.
+    #[tokio::test]
+    async fn r3gaps2_progressive_jobs_are_replaced_and_capped() {
+        let (_dir, mut mgr) = fake_manager("piped", Duration::from_secs(5));
+        mgr.max_progressive = 2;
+        let item = Uuid::new_v4();
+        let profile = TranscodeProfile::default();
+        let start = |ps: &'static str, dev: &'static str| {
+            let mgr = mgr.clone();
+            let profile = profile.clone();
+            async move {
+                mgr.start_progressive(item, "/in.flac", &profile, "mp3", ps, dev)
+                    .await
+                    .map(|(id, _)| id)
+            }
+        };
+        let first = start("ps-a", "").await.unwrap();
+        let second = start("ps-a", "").await.unwrap();
+        assert!(!mgr.end_progressive(first).await, "the seek replaced it");
+        let by_device = start("", "dev-b").await.unwrap();
+        // Two run (ps-a's second and dev-b's): a third client is refused
+        assert!(matches!(
+            start("ps-c", "").await,
+            Err(TranscodeError::TooMany(2))
+        ));
+        // dev-b asking again replaces its own job, within the cap
+        let again = start("", "dev-b").await.unwrap();
+        assert!(!mgr.end_progressive(by_device).await);
+        assert!(mgr.end_progressive(second).await);
+        assert!(mgr.end_progressive(again).await);
+    }
+
+    /// Ending a progressive transcode (the client went away) kills its ffmpeg.
+    #[tokio::test]
+    async fn r3gaps2_progressive_ends_on_request() {
+        let (_dir, mgr) = fake_manager("piped", Duration::from_secs(5));
+        let item = Uuid::new_v4();
+        let (playback, _stdout) = mgr
+            .start_progressive(
+                item,
+                "/in.flac",
+                &TranscodeProfile::default(),
+                "mpegts",
+                "",
+                "",
+            )
+            .await
+            .unwrap();
+        assert!(mgr.end_progressive(playback).await);
+        assert!(!mgr.is_active(item).await);
+    }
+
+    /// The progressive arguments: the encode, then the muxer to stdout; no HLS options; the
+    /// channels and sample rate asked for; no bitrate for a lossless encoder; fragmented MP4.
+    #[test]
+    fn r3gaps2_progressive_args() {
+        let profile = TranscodeProfile {
+            audio_only: true,
+            audio_codec: "libmp3lame".into(),
+            max_audio_bitrate_kbps: 320,
+            audio_channels: Some(1),
+            audio_sample_rate: Some(44100),
+            ..TranscodeProfile::default()
+        };
+        let args = build_progressive_args("/in.flac", "mp3", &profile);
+        assert!(has_pair(&args, "-c:a", "libmp3lame"));
+        assert!(has_pair(&args, "-b:a", "320k"));
+        assert!(has_pair(&args, "-ac", "1"));
+        assert!(has_pair(&args, "-ar", "44100"));
+        assert!(has_pair(&args, "-f", "mp3"));
+        assert!(args.contains(&"-vn".to_string()));
+        assert_eq!(args.last().unwrap(), "pipe:1");
+        assert!(!args.iter().any(|a| a.starts_with("-hls")));
+
+        let flac = TranscodeProfile {
+            audio_codec: "flac".into(),
+            ..profile.clone()
+        };
+        assert!(!build_progressive_args("/in.flac", "flac", &flac).contains(&"-b:a".to_string()));
+
+        let video = TranscodeProfile::default();
+        let args = build_progressive_args("/in.mkv", "mp4", &video);
+        assert!(has_pair(
+            &args,
+            "-movflags",
+            "frag_keyframe+empty_moov+default_base_moof"
+        ));
+        assert!(has_pair(&args, "-c:v", "libx264"));
+        assert!(has_pair(&args, "-ac", "2"));
+        assert!(!args.iter().any(|a| a.starts_with("-force_key_frames")));
+        // HLS keeps stereo and no sample rate by default
+        let hls = build_ffmpeg_args("/in.mkv", "/o/main.m3u8", "/o/s_%04d.ts", &video);
+        assert!(has_pair(&hls, "-ac", "2") && !hls.contains(&"-ar".to_string()));
+    }
+
+    #[test]
+    fn r3gaps2_progressive_formats_and_encoders() {
+        assert_eq!(progressive_format("mp3", true), Some(("mp3", "audio/mpeg")));
+        assert_eq!(progressive_format("AAC", true), Some(("adts", "audio/aac")));
+        assert_eq!(
+            progressive_format("ts", false),
+            Some(("mpegts", "video/mp2t"))
+        );
+        assert_eq!(
+            progressive_format("mkv", false),
+            Some(("matroska", "video/x-matroska"))
+        );
+        assert_eq!(progressive_format("mp4", true), Some(("mp4", "audio/mp4")));
+        assert_eq!(progressive_format("rm", false), None);
+        assert_eq!(audio_encoder("MP3"), Some("libmp3lame"));
+        assert_eq!(audio_encoder("dts"), None);
+        assert_eq!(video_encoder("hevc"), Some("libx265"));
     }
 }

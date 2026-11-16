@@ -16,6 +16,7 @@ import {
     openCardMenu, toggleCardPlayed, toggleCardFavorite, setCardLikes, playCardItem, openAddTo,
 } from './cardmenu.js';
 import { playAlbumFrom } from './music.js';
+import { playContainerFrom, removeFromContainer, openNewContainer } from './collections.js';
 import { renderSettings } from './settings.js';
 import {
     renderAdmin, showAdminTab, setUserPolicy, removeOidcLinkAsAdmin, copyOidcCallbackUrl, saveOidcAdminSettings,
@@ -26,6 +27,10 @@ import {
     folderBrowserSelect, closeFolderBrowser, addLibraryPathRow, removeLibraryPathRow, initScanProgressWebSocket,
 } from './library-admin.js';
 import { openPluginConfig, openPluginPriority } from './plugins.js';
+import {
+    openUserEditor, closeUserEditor, showUserEditorTab, addUserEditorTag, removeUserEditorTag, addUserEditorSchedule,
+    removeUserEditorSchedule, saveUserEditor, setUserEditorPassword,
+} from './user-editor.js';
 import { openRefreshDialog, openIdentifyDialog, openImageEditor, openMetadataEditor } from './metadata-admin.js';
 let currentPage = 'home';
 
@@ -160,6 +165,10 @@ const clickActions = {
     'card-play': el => playCardItem(el),
     'card-add-playlist': el => openAddTo(el, 'playlist'),
     'card-add-collection': el => openAddTo(el, 'collection'),
+    // Collections and playlists (collections.js)
+    'card-remove-from': el => removeFromContainer(el),
+    'playlist-play-from': el => playContainerFrom(el),
+    'new-container': el => openNewContainer(el),
     'toggle-favorite': el => toggleFavorite(el.dataset.id, el.dataset.favorite === 'true'),
     'toggle-played': el => togglePlayed(el.dataset.id, el.dataset.played === 'true', el.dataset.all === 'true'),
     'delete-item': el => deleteItemFromDetail(el.dataset),
@@ -171,6 +180,17 @@ const clickActions = {
     'delete-user': el => { if (confirm(t('admin.delete_user_confirm'))) API.deleteUser(el.dataset.id).then(() => renderAdmin()); },
     'set-user-admin': el => setUserPolicy(el, { IsAdministrator: el.checked }),
     'set-user-disabled': el => setUserPolicy(el, { IsDisabled: el.checked }),
+    // The user editor (user-editor.js)
+    'edit-user': el => openUserEditor(el.dataset.id),
+    'user-editor-tab': el => showUserEditorTab(el),
+    'user-editor-all-folders': el => $('user-editor-folders')?.classList.toggle('hidden', el.checked),
+    'user-editor-add-tag': el => addUserEditorTag(el.dataset.kind),
+    'user-editor-remove-tag': el => removeUserEditorTag(el.dataset.kind, Number(el.dataset.index)),
+    'user-editor-add-schedule': () => addUserEditorSchedule(),
+    'user-editor-remove-schedule': el => removeUserEditorSchedule(Number(el.dataset.index)),
+    'user-editor-save': el => saveUserEditor(el),
+    'user-editor-password': el => setUserEditorPassword(el),
+    'user-editor-close': () => closeUserEditor(),
     'delete-library': el => deleteLibraryFromAdmin(el.dataset.id),
     'toggle-realtime-monitor': el => toggleRealtimeMonitor(el),
     'library-options': el => openLibraryOptions(el.dataset.id, el.dataset.name),

@@ -67,16 +67,33 @@ async fn request_claims(
 }
 
 pub async fn require_auth(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
     mut req: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
     let (claims, token) = request_claims(&state, req.headers(), req.uri()).await?;
+    let local = resolve_client(addr.ip(), req.headers(), &state.known_proxies).is_local();
+    // The caller's policy, read once: checked here (Jellyfin's DefaultAuthorizationHandler: remote
+    // access and the access schedule) and kept for the request's other checks.
+    let policy = if claims.sub.is_nil() {
+        None
+    } else {
+        let policy = rustyfin_db::repo_parental::get_policy(&state.db_ro, claims.sub).await?;
+        crate::parental::access_allowed(&policy.access, claims.is_admin, local)?;
+        Some((claims.sub, std::sync::Arc::new(policy)))
+    };
+    req.extensions_mut().insert(ClientIsLocal(local));
     req.extensions_mut().insert(claims);
     if let Some(t) = token {
         req.extensions_mut().insert(rustyfin_auth::RequestToken(t));
     }
-    Ok(next.run(req).await)
+    Ok(match policy {
+        Some((user, policy)) => {
+            crate::parental::with_request_policy(user, policy, next.run(req)).await
+        }
+        None => next.run(req).await,
+    })
 }
 
 /// Guards the setup wizard routes. While the server has no users, anyone may use them. After that, only an
@@ -102,6 +119,7 @@ pub async fn require_setup_or_admin(
 /// Jellyfin's FirstTimeSetupOrDefault: open while the server has no users, then any signed-in
 /// user (401 without a valid token).
 pub async fn require_setup_or_auth(
+    connect: ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
     req: Request,
     next: Next,
@@ -109,8 +127,12 @@ pub async fn require_setup_or_auth(
     if !rustyfin_db::repo_user::users_exist(&state.db).await? {
         return Ok(next.run(req).await);
     }
-    require_auth(State(state), req, next).await
+    require_auth(connect, State(state), req, next).await
 }
+
+/// Whether an authenticated request comes from the local network, set by `require_auth`.
+#[derive(Debug, Clone, Copy)]
+pub struct ClientIsLocal(pub bool);
 
 /// Guards the administrator routes. It runs after `require_auth`, which inserts the claims, so a
 /// request without claims gets 401. A logged-in user who is not an administrator gets 403. The

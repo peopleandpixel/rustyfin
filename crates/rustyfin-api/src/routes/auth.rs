@@ -1,4 +1,6 @@
-use axum::extract::State;
+use std::net::SocketAddr;
+
+use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, HeaderValue};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
@@ -29,6 +31,7 @@ pub fn routes() -> Router<AppState> {
 const SETUP_REQUIRED_HEADER: &str = "x-rustyfin-setup-required";
 
 async fn login(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(req): Json<LoginRequest>,
@@ -71,6 +74,8 @@ async fn login(
     if !password_allowed(&state.db, &config, &user).await? {
         return Err(ApiError::Forbidden(PASSWORD_SIGN_IN_OFF.to_string()));
     }
+    let local = is_local(&state, peer, &headers);
+    crate::parental::check_sign_in(&state, &user, &device.device_id, local).await?;
     let (user, token) = rustyfin_auth::issue_login_token(&state.db, user.id, &device).await?;
     Ok(Json(start_session(&state, &device, user, token).await).into_response())
 }
@@ -78,6 +83,7 @@ async fn login(
 /// `POST /Users/AuthenticateWithQuickConnect` – signs in with the secret of a Quick Connect request
 /// that a user approved, as that user (AC26). Public, but behind the login rate limit.
 async fn quick_connect_sign_in(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
@@ -88,6 +94,10 @@ async fn quick_connect_sign_in(
         .ok_or_else(|| ApiError::BadRequest("Secret is required.".to_string()))?;
     let approver = quick_connect::redeem(&state, secret).await?;
     let device = token_device(&headers);
+    if let Some(user) = rustyfin_db::repo_user::get_user_by_id(&state.db, approver).await? {
+        let local = is_local(&state, peer, &headers);
+        crate::parental::check_sign_in(&state, &user, &device.device_id, local).await?;
+    }
     let (user, token) = rustyfin_auth::authenticate_approved(&state.db, approver, &device).await?;
     Ok(Json(start_session(&state, &device, user, token).await))
 }
@@ -95,6 +105,7 @@ async fn quick_connect_sign_in(
 /// `POST /Users/AuthenticateWithSetupCode` (B20 3.3): a pending user's code sets the new password
 /// and signs in. It is routed with the login endpoints, so the login rate limit covers it.
 async fn login_with_setup_code(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(req): Json<SetupCodeLoginRequest>,
@@ -109,9 +120,16 @@ async fn login_with_setup_code(
     if !password_allowed(&state.db, &config, verified.user()).await? {
         return Err(ApiError::Forbidden(PASSWORD_SIGN_IN_OFF.to_string()));
     }
+    let local = is_local(&state, peer, &headers);
+    crate::parental::check_sign_in(&state, verified.user(), &device.device_id, local).await?;
     let (user, token) =
         rustyfin_auth::redeem_setup_code(&state.db, verified, &req.new_pw, &device).await?;
     Ok(Json(start_session(&state, &device, user, token).await))
+}
+
+/// Whether a sign-in comes from the local network.
+fn is_local(state: &AppState, peer: SocketAddr, headers: &HeaderMap) -> bool {
+    crate::middleware::resolve_client(peer.ip(), headers, &state.known_proxies).is_local()
 }
 
 /// The device of a sign-in, from its `X-Emby-Authorization` header.

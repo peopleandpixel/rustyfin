@@ -615,9 +615,14 @@ const API = {
     createCollection(name, ids) { return this.post('/Collections', { Name: name, Ids: ids }); },
     getPlaylists() { return this.get('/Playlists'); },
     createPlaylist(name, ids) { return this.post('/Playlists', { Name: name, ItemIds: ids }); },
-    getPlaylistItems(id) { return this.get(`/Playlists/${id}/Items`); },
+    getPlaylist(id) { return this.get(`/Playlists/${encodeURIComponent(id)}`, { cache: 'no-store' }); },
+    getPlaylistItems(id) { return this.get(`/Playlists/${encodeURIComponent(id)}/Items`, { cache: 'no-store' }); },
     addToPlaylist(id, ids) { return this.post(`/Playlists/${encodeURIComponent(id)}/Items?Ids=${ids.map(encodeURIComponent).join(',')}&UserId=${this.userId}`); },
+    // Jellyfin's calls: entries by PlaylistItemId, and a move to an index
+    removeFromPlaylist(id, entryIds) { return this.del(`/Playlists/${encodeURIComponent(id)}/Items?EntryIds=${entryIds.map(encodeURIComponent).join(',')}`); },
+    movePlaylistItem(id, entryId, index) { return this.post(`/Playlists/${encodeURIComponent(id)}/Items/${encodeURIComponent(entryId)}/Move/${index}`); },
     addToCollection(id, ids) { return this.post(`/Collections/${encodeURIComponent(id)}/Items?Ids=${ids.map(encodeURIComponent).join(',')}`); },
+    removeFromCollection(id, ids) { return this.del(`/Collections/${encodeURIComponent(id)}/Items?Ids=${ids.map(encodeURIComponent).join(',')}`); },
 
     // Scheduled Tasks
     getTasks() { return this.get('/ScheduledTasks'); },

@@ -102,14 +102,36 @@ pub async fn refresh_item_metadata_with(
         rustyfin_db::repo_media::save_refresh_changes(pool, item, &working)
             .await
             .map_err(|e| e.to_string())?;
+        // Jellyfin's replace takes the sources' ForcedSortName too, none unless an NFO has one
+        if !locks.forced_sort_name_locked() {
+            rustyfin_db::repo_media::set_forced_sort_name(pool, item.id, None)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
         rustyfin_db::repo_media::clear_replaceable_links(pool, item.id, &locks)
             .await
             .map_err(|e| e.to_string())?;
     }
 
-    // 1. Scan for local images and compute blurhash for each
+    // 1. Scan for local images and compute blurhash for each. An image whose file is unchanged
+    // since its row was stored (same path and stamp) keeps the stored hash, so it isn't read again.
     let mut local_images = local_images::find_local_images(media_path, item.id);
+    let stored = if local_images.is_empty() {
+        Vec::new()
+    } else {
+        rustyfin_db::repo_image::get_images_for_item(pool, item.id)
+            .await
+            .unwrap_or_default()
+    };
     for img in &mut local_images {
+        if img.blurhash.is_none()
+            && img.stamp.is_some()
+            && let Some(known) = stored
+                .iter()
+                .find(|s| s.path == img.path && s.stamp == img.stamp && s.blurhash.is_some())
+        {
+            img.blurhash = known.blurhash.clone();
+        }
         if img.blurhash.is_none()
             && let Some(bh) = crate::image_proxy::compute_blurhash(&img.path, Some(client)).await
         {
@@ -134,6 +156,8 @@ pub async fn refresh_item_metadata_with(
     let mut nfo_named = false;
     let nfo_path = match item.media_type {
         MediaType::Series => nfo_parser::find_series_nfo(media_path),
+        MediaType::MusicAlbum => nfo_parser::find_folder_nfo(media_path, "album.nfo"),
+        MediaType::MusicArtist => nfo_parser::find_folder_nfo(media_path, "artist.nfo"),
         _ => nfo_parser::find_nfo_for_media(media_path),
     };
     if let Some(nfo_path) = nfo_path
@@ -725,12 +749,41 @@ async fn apply_metadata_to_item(
         && updated.name != new_name
     {
         updated.name = new_name.to_string();
-        // An episode sorts by its numbers; its sort name stays
-        if updated.media_type != MediaType::Episode {
-            updated.sort_name = Some(new_name.to_lowercase());
-        }
         changed = true;
         tracing::debug!("updated name '{}' to '{}'", before.name, new_name);
+    }
+    // The sort name, as Jellyfin's: made from the forced sort name, or else from the name. An
+    // NFO's <sorttitle> becomes the forced sort name when there is none (a "replace all" clears
+    // it first) and no lock (whole item, Name or SortName) keeps it. A season with none keeps
+    // its own.
+    let mut forced = rustyfin_db::repo_media::forced_sort_name(pool, updated.id)
+        .await
+        .map_err(|e| e.to_string())?;
+    if forced.is_none()
+        && !locks.forced_sort_name_locked()
+        && let Some(sort_title) = meta.sort_title.as_deref().map(str::trim)
+        && !sort_title.is_empty()
+    {
+        rustyfin_db::repo_media::set_forced_sort_name(pool, updated.id, Some(sort_title))
+            .await
+            .map_err(|e| e.to_string())?;
+        forced = Some(sort_title.to_string());
+    }
+    if forced.is_some() || updated.media_type != MediaType::Season {
+        let sort_name = match forced.as_deref() {
+            Some(forced) => rustyfin_model::sort_name::forced_sort_name(forced),
+            None => rustyfin_model::sort_name::item_sort_name(
+                updated.media_type,
+                &updated.name,
+                updated.parent_index_number,
+                updated.index_number,
+                &rustyfin_model::sort_name::current_rules(),
+            ),
+        };
+        if updated.sort_name.as_deref() != Some(sort_name.as_str()) {
+            updated.sort_name = Some(sort_name);
+            changed = true;
+        }
     }
     if updated.premiere_date.is_none()
         && open("PremiereDate")

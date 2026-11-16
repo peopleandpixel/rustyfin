@@ -327,6 +327,7 @@ async fn enrich_item(
         if let Some(imdb) = extras.imdb_id {
             item.provider_ids.set("Imdb".to_string(), imdb);
         }
+        item.forced_sort_name = extras.forced_sort_name.filter(|s| !s.trim().is_empty());
         item.lock_data = extras.lock_data;
         item.locked_fields = extras
             .locked_fields
@@ -2371,6 +2372,15 @@ async fn get_items(
     // them as ParentId, is answered from their own tables.
     let mut parent_id = query.parent_id();
     let mut collection_ids = None;
+    let only_containers = media_types.as_ref().filter(|kinds| {
+        !kinds.is_empty()
+            && kinds.iter().all(|kind| {
+                kind.eq_ignore_ascii_case("BoxSet") || kind.eq_ignore_ascii_case("Playlist")
+            })
+    });
+    let wants = |name: &str| {
+        only_containers.is_some_and(|kinds| kinds.iter().any(|k| k.eq_ignore_ascii_case(name)))
+    };
     if let Some(id) = parent_id {
         match super::collections::container_of(&state, id, &claims).await? {
             Some(Container::Playlist) => {
@@ -2391,20 +2401,32 @@ async fn get_items(
                 parent_id = None;
                 collection_ids = Some(ids);
             }
+            // The collections or playlists under a library: those holding its items
+            None if only_containers.is_some()
+                && rustyfin_db::repo_library::get_library_by_id(&state.db_ro, id)
+                    .await?
+                    .is_some() =>
+            {
+                let listing = super::collections::container_listing(
+                    &state,
+                    &claims,
+                    wants("BoxSet"),
+                    wants("Playlist"),
+                    Some(id),
+                    start_index as usize,
+                    limit as usize,
+                );
+                return listing.await.map(|r| Json(r).into_response());
+            }
             None => {}
         }
-    } else if let Some(kinds) = media_types.as_ref().filter(|kinds| {
-        !kinds.is_empty()
-            && kinds.iter().all(|kind| {
-                kind.eq_ignore_ascii_case("BoxSet") || kind.eq_ignore_ascii_case("Playlist")
-            })
-    }) {
-        let wants = |name: &str| kinds.iter().any(|kind| kind.eq_ignore_ascii_case(name));
+    } else if only_containers.is_some() {
         let listing = super::collections::container_listing(
             &state,
             &claims,
             wants("BoxSet"),
             wants("Playlist"),
+            None,
             start_index as usize,
             limit as usize,
         );
@@ -2496,7 +2518,9 @@ async fn get_items(
         .fields()
         .map(|s| s.split(',').map(|f| f.trim()).collect::<Vec<&str>>())
         .unwrap_or_default();
-    let need_media_sources = fields.contains(&"MediaSources");
+    let need_media_sources = fields
+        .iter()
+        .any(|f| f.eq_ignore_ascii_case("MediaSources"));
 
     let mut items = if need_media_sources {
         let mut items_copy = items;
@@ -2819,9 +2843,15 @@ async fn delete_item(
     if let Some(status) = super::collections::delete_container(&state, id, &claims).await? {
         return Ok(status.into_response());
     }
-    if !claims.is_admin {
+    // Jellyfin's EnableContentDeletion; left unset, administrators may and others not.
+    let may_delete = claims.sub.is_nil()
+        || crate::parental::caller_access(&state, &claims)
+            .await?
+            .enable_content_deletion
+            .unwrap_or(claims.is_admin);
+    if !may_delete {
         return Err(ApiError::Forbidden(
-            "Administrator access is required.".to_string(),
+            "This user may not delete media.".to_string(),
         ));
     }
     let deleted = rustyfin_db::repo_media::delete_item(&state.db, id).await?;
@@ -2842,7 +2872,7 @@ async fn get_children(
     let mut children = rustyfin_db::repo_media::get_children(&state.db_ro, id).await?;
     HiddenItems::for_caller(&state, &claims)
         .await?
-        .retain(&mut children, |i| i.id);
+        .retain(&mut children);
     let total = children.len() as i64;
 
     // Only populate media_sources when explicitly requested
@@ -2850,7 +2880,9 @@ async fn get_children(
         .fields()
         .map(|s| s.split(',').map(|f| f.trim()).collect::<Vec<&str>>())
         .unwrap_or_default();
-    let need_media_sources = fields.contains(&"MediaSources");
+    let need_media_sources = fields
+        .iter()
+        .any(|f| f.eq_ignore_ascii_case("MediaSources"));
 
     let mut items = if need_media_sources {
         let mut children_copy = children;
@@ -2923,7 +2955,7 @@ async fn get_similar(
                 .flatten()
                 .map(|row| row.into());
 
-            if let Some(local_item) = local_item.filter(|i| !hidden.hides(i.id)) {
+            if let Some(local_item) = local_item.filter(|i| !hidden.hides(i.id, i.library_id)) {
                 similar.push(local_item);
             }
         }
@@ -2946,7 +2978,9 @@ async fn get_similar(
             if similar.len() >= limit {
                 break;
             }
-            if !existing_ids.contains(&local_item.id.to_string()) && !hidden.hides(local_item.id) {
+            if !existing_ids.contains(&local_item.id.to_string())
+                && !hidden.hides(local_item.id, local_item.library_id)
+            {
                 similar.push(local_item);
             }
         }

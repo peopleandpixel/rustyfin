@@ -102,11 +102,15 @@ async fn reported_choices(
     let named = media_source_id.and_then(|id| Uuid::parse_str(id).ok());
     let needs_streams =
         audio.is_some_and(|index| index >= 0) || subtitle.is_some_and(|index| index >= 0);
-    let sources = if needs_streams {
+    let mut sources = if needs_streams {
         rustyfin_db::repo_media_source::get_media_sources(&state.db, &item_id).await?
     } else {
         Vec::new()
     };
+    // The client's indexes are Jellyfin's numbering, external subtitle files first
+    for source in sources.iter_mut() {
+        crate::routes::subtitle::with_external_streams(source).await;
+    }
     let choose = |kind: &str, index: Option<i32>| {
         index.map(|index| StreamChoice {
             index,

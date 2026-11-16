@@ -268,6 +268,7 @@ pub async fn search_movie(
 
     Some(ExternalMetadata {
         name: Some(details.title),
+        sort_title: None,
         overview: details.overview,
         production_year,
         community_rating: details.rating,
@@ -341,6 +342,7 @@ pub async fn search_tv(
 
     Some(ExternalMetadata {
         name: Some(details.title),
+        sort_title: None,
         overview: details.overview,
         production_year,
         community_rating: details.rating,

@@ -125,14 +125,28 @@ pub fn build_router(state: AppState) -> Router {
         .merge(items::routes())
         .merge(images::routes())
         .merge(quick_connect::routes())
-        .merge(streaming::routes().route_layer(axum_mw::from_fn_with_state(
-            state.clone(),
-            rate_limit_resource,
-        )))
-        .merge(transcode::routes().route_layer(axum_mw::from_fn_with_state(
-            state.clone(),
-            rate_limit_resource,
-        )))
+        .merge(
+            streaming::routes()
+                .route_layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    rate_limit_resource,
+                ))
+                .route_layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    crate::parental::require_playback,
+                )),
+        )
+        .merge(
+            transcode::routes()
+                .route_layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    rate_limit_resource,
+                ))
+                .route_layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    crate::parental::require_playback,
+                )),
+        )
         .merge(playback::routes())
         .merge(subtitle::routes())
         .merge(session::routes())
@@ -147,7 +161,12 @@ pub fn build_router(state: AppState) -> Router {
         .merge(additional::routes())
         .merge(media_segments::routes())
         .merge(trickplay::routes())
-        .merge(dynamic_hls::routes())
+        .merge(
+            dynamic_hls::routes().route_layer(axum_mw::from_fn_with_state(
+                state.clone(),
+                crate::parental::require_playback,
+            )),
+        )
         .merge(localization::routes())
         .merge(sync_play::routes())
         .merge(oidc::protected_routes())

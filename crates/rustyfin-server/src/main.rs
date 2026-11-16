@@ -145,11 +145,20 @@ async fn main() {
 
     // Load or create server configuration
     let mut config = load_config(&data_dir);
+    // Sort names made from here on use the configuration's rules
+    rustyfin_model::sort_name::set_rules(config.sort_rules());
 
     tracing::info!("initializing database at {}", db_url);
     let pool = rustyfin_db::init_db(&db_url)
         .await
         .expect("failed to initialize database");
+    // Once after migration 094, before any scan can rewrite them: the forced sort names of the
+    // items whose names SQLite cannot lowercase. The remake itself runs in the background below.
+    match rustyfin_db::repo_media::classify_legacy_sort_names(&pool).await {
+        Ok(0) => {}
+        Ok(kept) => tracing::info!("sort names: kept {kept} forced sort names from before 094"),
+        Err(e) => tracing::warn!("sort names: could not keep the forced sort names: {e}"),
+    }
 
     // Read-only pool for query-heavy operations (PRAGMA query_only = ON)
     let pool_ro = rustyfin_db::init_read_only_db(&db_url)
@@ -506,6 +515,13 @@ async fn main() {
     {
         let state = state.clone();
         tokio::spawn(async move { rustyfin_api::date_backfill::run(&state).await });
+    }
+
+    // Background task: makes the stored sort names again when the sort rules changed (or once
+    // after migration 094)
+    {
+        let state = state.clone();
+        tokio::spawn(async move { rustyfin_api::sort_names::apply(&state).await });
     }
 
     // Extract HTTP port for discovery services

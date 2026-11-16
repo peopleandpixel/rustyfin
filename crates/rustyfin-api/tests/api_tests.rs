@@ -3243,6 +3243,7 @@ const B124_WEB_MODULES: &[&str] = &[
     "auth.js",
     "cardmenu.js",
     "cards.js",
+    "collections.js",
     "genres.js",
     "home.js",
     "item.js",
@@ -3260,6 +3261,7 @@ const B124_WEB_MODULES: &[&str] = &[
     "search.js",
     "sessions.js",
     "settings.js",
+    "user-editor.js",
     "user-settings.js",
     "util.js",
     "wizard.js",
@@ -5269,6 +5271,235 @@ async fn b152_a_card_index_has_only_what_a_card_shows() {
             .contains_key("CanDelete"),
         "{jellyfin}"
     );
+}
+
+// R3 sort names: "The Matrix" sorts and files under M, as in Jellyfin
+
+#[tokio::test]
+async fn r3sortname_items_sort_and_filter_by_jellyfins_sort_name() {
+    let state = test_state().await;
+    let folder = media_folder(&state, "r3 sort names");
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: "R3 Sort Names".to_string(),
+        content_type: rustyfin_model::library::LibraryContentType::Movies,
+        paths: vec![folder.clone()],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    // Stored as before 094: the lowercased name
+    let mut ids = HashMap::new();
+    for name in ["Nemo", "The Matrix", "Lion", "28 Days", "Zodiac", "Theory"] {
+        let id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO media_items (id, library_id, name, sort_name, media_type, path) \
+             VALUES (?, ?, ?, ?, 'Movie', ?)",
+        )
+        .bind(id.to_string())
+        .bind(lib.id.to_string())
+        .bind(name)
+        .bind(name.to_lowercase())
+        .bind(format!("{folder}/{name}.mkv"))
+        .execute(&state.db)
+        .await
+        .unwrap();
+        ids.insert(name, id);
+    }
+    rustyfin_api::sort_names::apply(&state).await;
+    let (admin, _) = admin_session(&state).await;
+    let app = app(state.clone());
+
+    let names = |body: &serde_json::Value| -> Vec<String> {
+        body["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["Name"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let list = |query: String| {
+        let (app, admin) = (app.clone(), admin.clone());
+        async move {
+            let (status, body) = send_authed(
+                &app,
+                "GET",
+                &format!(
+                    "/Items?LibraryId={}&Recursive=true&SortBy=SortName&Fields=SortName{query}",
+                    lib.id
+                ),
+                &admin,
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            body
+        }
+    };
+    let body = list(String::new()).await;
+    assert_eq!(
+        names(&body),
+        ["28 Days", "Lion", "The Matrix", "Nemo", "Theory", "Zodiac"]
+    );
+    let matrix = body["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["Name"] == "The Matrix")
+        .unwrap();
+    assert_eq!(matrix["SortName"], "matrix");
+    // The letters go by the sort name only, as in Jellyfin; '#' holds what starts with no letter,
+    // and Z holds Zodiac
+    assert_eq!(
+        names(&list("&NameStartsWith=M".into()).await),
+        ["The Matrix"]
+    );
+    assert_eq!(names(&list("&NameStartsWith=T".into()).await), ["Theory"]);
+    assert_eq!(
+        names(&list("&NameStartsWith=%23".into()).await),
+        ["28 Days"]
+    );
+    assert_eq!(names(&list("&NameStartsWith=Z".into()).await), ["Zodiac"]);
+    assert_eq!(
+        names(&list("&NameStartsWithOrGreater=N".into()).await),
+        ["Nemo", "Theory", "Zodiac"]
+    );
+
+    // The editor's forced sort name is returned as written and sorts the item; clearing it
+    // brings the automatic one back
+    let matrix_id = ids["The Matrix"];
+    let save = |body: serde_json::Value| {
+        let (app, admin) = (app.clone(), admin.clone());
+        async move {
+            let (status, text) = send_authed(
+                &app,
+                "POST",
+                &format!("/Items/{matrix_id}"),
+                &admin,
+                Some(&body.to_string()),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NO_CONTENT, "{text}");
+        }
+    };
+    save(serde_json::json!({"ForcedSortName": "Zzz Matrix"})).await;
+    let (status, item) =
+        send_authed(&app, "GET", &format!("/Items/{matrix_id}"), &admin, None).await;
+    assert_eq!(status, StatusCode::OK, "{item}");
+    assert_eq!(item["ForcedSortName"], "Zzz Matrix");
+    assert_eq!(item["SortName"], "zzz matrix");
+    assert_eq!(
+        names(&list(String::new()).await).last().unwrap(),
+        "The Matrix"
+    );
+    // A rescan's save keeps it
+    let mut rescanned = rustyfin_db::repo_media::get_item_by_id(&state.db, matrix_id)
+        .await
+        .unwrap()
+        .unwrap();
+    rescanned.sort_name = Some("matrix".to_string());
+    rustyfin_db::repo_media::upsert_media_item(&state.db, &rescanned)
+        .await
+        .unwrap();
+    assert_eq!(
+        names(&list(String::new()).await).last().unwrap(),
+        "The Matrix"
+    );
+    save(serde_json::json!({"ForcedSortName": ""})).await;
+    let (_, item) = send_authed(&app, "GET", &format!("/Items/{matrix_id}"), &admin, None).await;
+    assert!(item["ForcedSortName"].is_null(), "{item}");
+    assert_eq!(item["SortName"], "matrix");
+}
+
+/// The sort lists round-trip through /System/Configuration, and saving other ones makes the
+/// stored sort names again. The extra word is one no other test's names hold, since the rules
+/// are the process's.
+#[tokio::test]
+async fn r3sortname_sort_rules_round_trip_and_remake_sort_names() {
+    let state = test_state().await;
+    let folder = media_folder(&state, "r3 sort rules");
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: "R3 Sort Rules".to_string(),
+        content_type: rustyfin_model::library::LibraryContentType::Movies,
+        paths: vec![folder.clone()],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    let id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO media_items (id, library_id, name, sort_name, media_type, path) \
+         VALUES (?, ?, 'Qzxv Sorted', 'qzxv sorted', 'Movie', ?)",
+    )
+    .bind(id.to_string())
+    .bind(lib.id.to_string())
+    .bind(format!("{folder}/q.mkv"))
+    .execute(&state.db)
+    .await
+    .unwrap();
+    rustyfin_api::sort_names::apply(&state).await;
+    let (admin, _) = admin_session(&state).await;
+    let app = app(state.clone());
+
+    let (status, mut config) =
+        send_authed(&app, "GET", "/System/Configuration", &admin, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        config["SortRemoveWords"],
+        serde_json::json!(["the", "a", "an"])
+    );
+    assert_eq!(
+        config["SortRemoveCharacters"],
+        serde_json::json!([",", "&", "-", "{", "}", "'"])
+    );
+    assert_eq!(
+        config["SortReplaceCharacters"],
+        serde_json::json!([".", "+", "%"])
+    );
+
+    let sort_name = || async {
+        rustyfin_db::repo_media::get_item_by_id(&state.db, id)
+            .await
+            .unwrap()
+            .unwrap()
+            .sort_name
+    };
+    assert_eq!(sort_name().await.as_deref(), Some("qzxv sorted"));
+    config["SortRemoveWords"] = serde_json::json!(["the", "a", "an", "qzxv"]);
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        "/System/Configuration",
+        &admin,
+        Some(&config.to_string()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, saved) = send_authed(&app, "GET", "/System/Configuration", &admin, None).await;
+    assert_eq!(saved["SortRemoveWords"], config["SortRemoveWords"]);
+    // The pass runs in the background
+    let mut remade = None;
+    for _ in 0..100 {
+        remade = sort_name().await;
+        if remade.as_deref() == Some("sorted") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(remade.as_deref(), Some("sorted"));
+
+    // Jellyfin's lists again
+    config["SortRemoveWords"] = serde_json::json!(["the", "a", "an"]);
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        "/System/Configuration",
+        &admin,
+        Some(&config.to_string()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
 }
 
 // B152 round 10: the card index lists the same items as the normal list for a user who isn't an
@@ -21821,7 +22052,7 @@ async fn r2parental_policy_is_kept_and_returned() {
     for bad in [
         serde_json::json!({ "MaxParentalRating": 13, "BlockUnratedItems": ["Cartoons"] }),
         serde_json::json!({ "MaxParentalRating": 13, "AccessSchedules": [
-            { "DayOfWeek": "Everyday", "StartHour": 8, "EndHour": 20 }
+            { "DayOfWeek": "Someday", "StartHour": 8, "EndHour": 20 }
         ] }),
     ] {
         let (status, _) = send(&w.app, request("POST", &uri, Some(&w.admin), Some(bad))).await;
@@ -22607,6 +22838,1018 @@ async fn r2parental_jellyfin_import_carries_parental_limits() {
     assert_eq!(
         alice["Policy"]["MaxParentalRating"],
         serde_json::Value::Null
+    );
+}
+
+// ── R3 parental: library access, access schedules and the user policy switches ──
+// EnableAllFolders/EnabledFolders hide other libraries on every route, as parental limits do;
+// AccessSchedules, EnableRemoteAccess, the playback switches and MaxActiveSessions are enforced
+// where Jellyfin enforces them.
+
+impl R2Parental {
+    /// The fixture's library id.
+    async fn library_id(&self) -> String {
+        sqlx::query_scalar("SELECT library_id FROM media_items WHERE id = ?")
+            .bind(self.id("Gentle").to_string())
+            .fetch_one(&self.state.db)
+            .await
+            .unwrap()
+    }
+
+    /// A second library, "Elsewhere", with one G-rated movie, "Far Away"; returns the library's
+    /// id and the movie's.
+    async fn other_library(&self) -> (uuid::Uuid, uuid::Uuid) {
+        let folder = self.state.data_dir.join("media").join("r3elsewhere");
+        std::fs::create_dir_all(&folder).unwrap();
+        let lib = rustyfin_model::library::Library {
+            id: uuid::Uuid::new_v4(),
+            name: "Elsewhere".to_string(),
+            content_type: rustyfin_model::library::LibraryContentType::Movies,
+            paths: vec![folder.to_string_lossy().to_string()],
+        };
+        rustyfin_db::repo_library::create_library(&self.state.db, &lib)
+            .await
+            .unwrap();
+        self.state.cache.library_views.invalidate_all();
+        let movie = uuid::Uuid::new_v4();
+        let path = folder.join("Far Away.mkv");
+        std::fs::write(&path, b"r3parental video bytes").unwrap();
+        sqlx::query(
+            "INSERT INTO media_items (id, library_id, name, media_type, path, official_rating, \
+             genres) VALUES (?, ?, 'Far Away', 'Movie', ?, 'G', 'Family')",
+        )
+        .bind(movie.to_string())
+        .bind(lib.id.to_string())
+        .bind(path.to_string_lossy().to_string())
+        .execute(&self.state.db)
+        .await
+        .unwrap();
+        (lib.id, movie)
+    }
+}
+
+/// The weekday names Jellyfin uses, Monday first.
+const R3PARENTAL_DAYS: [&str; 7] = [
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+    "Sunday",
+];
+
+/// A sign-in with a device id, as Jellyfin Web sends it.
+fn r3parental_login(name: &str, pw: &str, device: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/Users/AuthenticateByName")
+        .header("Content-Type", "application/json")
+        .header(
+            "X-Emby-Authorization",
+            format!(
+                "MediaBrowser Client=\"Test\", Device=\"Test\", DeviceId=\"{device}\", Version=\"1\""
+            ),
+        )
+        .body(Body::from(
+            serde_json::json!({ "Username": name, "Pw": pw }).to_string(),
+        ))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn r3parental_access_fields_round_trip_through_the_policy() {
+    let w = r2parental().await;
+    let user_uri = format!("/Users/{}", w.kid_id);
+    let (_, user) = w.get(&w.admin, &user_uri).await;
+    let p = &user["Policy"];
+    assert_eq!(p["EnableAllFolders"], true);
+    assert_eq!(p["EnabledFolders"], serde_json::json!([]));
+    assert_eq!(p["AccessSchedules"], serde_json::json!([]));
+    assert_eq!(p["IsHidden"], false);
+    assert_eq!(p["EnableRemoteAccess"], true);
+    assert_eq!(p["EnableContentDeletion"], false);
+    assert_eq!(p["MaxActiveSessions"], 0);
+
+    // The whole policy, as Jellyfin Web posts it back, with every switch it shows changed.
+    let lib = w.library_id().await;
+    let simple = uuid::Uuid::parse_str(&lib).unwrap().simple().to_string();
+    let mut policy = p.clone();
+    for (key, value) in [
+        ("IsHidden", serde_json::json!(true)),
+        ("EnableRemoteAccess", serde_json::json!(false)),
+        ("EnableMediaPlayback", serde_json::json!(false)),
+        ("EnableAudioPlaybackTranscoding", serde_json::json!(false)),
+        ("EnableVideoPlaybackTranscoding", serde_json::json!(false)),
+        ("EnablePlaybackRemuxing", serde_json::json!(false)),
+        ("ForceRemoteSourceTranscoding", serde_json::json!(true)),
+        ("EnableContentDeletion", serde_json::json!(true)),
+        ("MaxActiveSessions", serde_json::json!(3)),
+        ("RemoteClientBitrateLimit", serde_json::json!(4_000_000)),
+        ("EnableAllFolders", serde_json::json!(false)),
+        // Jellyfin Web sends ids without dashes; they are kept in one spelling.
+        (
+            "EnabledFolders",
+            serde_json::json!([simple, lib, "not-an-id"]),
+        ),
+        (
+            "AccessSchedules",
+            serde_json::json!([{ "Id": 0, "UserId": w.kid_id, "DayOfWeek": "weekday",
+                "StartHour": 7.5, "EndHour": 20 }]),
+        ),
+    ] {
+        policy[key] = value;
+    }
+    w.set_policy(policy.clone()).await;
+    let (_, user) = w.get(&w.admin, &user_uri).await;
+    let got = &user["Policy"];
+    for key in [
+        "IsHidden",
+        "EnableRemoteAccess",
+        "EnableMediaPlayback",
+        "EnableAudioPlaybackTranscoding",
+        "EnableVideoPlaybackTranscoding",
+        "EnablePlaybackRemuxing",
+        "ForceRemoteSourceTranscoding",
+        "EnableContentDeletion",
+        "MaxActiveSessions",
+        "RemoteClientBitrateLimit",
+        "EnableAllFolders",
+    ] {
+        assert_eq!(got[key], policy[key], "{key}");
+    }
+    assert_eq!(got["EnabledFolders"], serde_json::json!([lib]));
+    assert_eq!(
+        got["AccessSchedules"],
+        serde_json::json!([{ "DayOfWeek": "Weekday", "StartHour": 7.5, "EndHour": 20.0 }])
+    );
+
+    // A policy without the fields keeps them.
+    w.set_policy(serde_json::json!({ "MaxParentalRating": 10 }))
+        .await;
+    let (_, user) = w.get(&w.admin, &user_uri).await;
+    assert_eq!(user["Policy"]["EnableAllFolders"], false);
+    assert_eq!(user["Policy"]["MaxActiveSessions"], 3);
+
+    // What can't be kept is refused, and nothing changes.
+    let uri = format!("/Users/{}/Policy", w.kid_id);
+    for bad in [
+        serde_json::json!({ "AccessSchedules": [{ "DayOfWeek": "Someday", "StartHour": 1, "EndHour": 2 }] }),
+        serde_json::json!({ "AccessSchedules": [{ "DayOfWeek": "Monday", "StartHour": 9, "EndHour": 8 }] }),
+        serde_json::json!({ "AccessSchedules": [{ "DayOfWeek": "Monday", "StartHour": 0, "EndHour": 25 }] }),
+        serde_json::json!({ "MaxActiveSessions": -1 }),
+        serde_json::json!({ "RemoteClientBitrateLimit": -5 }),
+    ] {
+        let (status, _) = send(
+            &w.app,
+            request("POST", &uri, Some(&w.admin), Some(bad.clone())),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+    }
+    let (_, user) = w.get(&w.admin, &user_uri).await;
+    assert_eq!(user["Policy"]["AccessSchedules"][0]["DayOfWeek"], "Weekday");
+
+    // A hidden user is left out of the sign-in page's list.
+    let (status, public) = send(&w.app, request("GET", "/Users/Public", None, None)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !public
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|u| u["Name"] == "kid"),
+        "{public}"
+    );
+}
+
+#[tokio::test]
+async fn r3parental_only_an_administrator_changes_a_policy() {
+    let w = r2parental().await;
+    let (other_token, other_id) = {
+        let other = rustyfin_model::user::User {
+            id: uuid::Uuid::new_v4(),
+            name: "other".to_string(),
+            password_hash: String::new(),
+            is_administrator: false,
+            created_at: chrono::Utc::now(),
+            last_login_date: None,
+            configuration: serde_json::Value::Null,
+        };
+        rustyfin_db::repo_user::create_user(&w.state.db, &other)
+            .await
+            .unwrap();
+        let token = rustyfin_auth::create_token(&w.state.db, &other, &Default::default())
+            .await
+            .unwrap();
+        (token, other.id)
+    };
+    w.set_policy(serde_json::json!({ "EnableAllFolders": false, "EnabledFolders": [] }))
+        .await;
+    // Neither the limited user nor another user may lift or set a limit, their own or another's.
+    for (token, target) in [
+        (&w.kid, w.kid_id),
+        (&other_token, w.kid_id),
+        (&other_token, other_id),
+        (&w.kid, other_id),
+    ] {
+        for body in [
+            serde_json::json!({ "EnableAllFolders": true }),
+            serde_json::json!({ "IsAdministrator": true }),
+            serde_json::json!({ "AccessSchedules": [] }),
+        ] {
+            let uri = format!("/Users/{target}/Policy");
+            let (status, _) = send(&w.app, request("POST", &uri, Some(token), Some(body))).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
+        }
+    }
+    let (_, user) = w.get(&w.admin, &format!("/Users/{}", w.kid_id)).await;
+    assert_eq!(user["Policy"]["EnableAllFolders"], false);
+    assert_eq!(user["Policy"]["IsAdministrator"], false);
+
+    // The only administrator can't remove their own rights, nor disable themselves.
+    let (_, admin) = w.get(&w.admin, "/Users/Me").await;
+    let admin_id = admin["Id"].as_str().unwrap().to_string();
+    for body in [
+        serde_json::json!({ "IsAdministrator": false }),
+        serde_json::json!({ "IsDisabled": true }),
+    ] {
+        let uri = format!("/Users/{admin_id}/Policy");
+        let (status, _) = send(&w.app, request("POST", &uri, Some(&w.admin), Some(body))).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+    let (status, admin) = w.get(&w.admin, "/Users/Me").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(admin["Policy"]["IsAdministrator"], true);
+}
+
+#[tokio::test]
+async fn r3parental_library_access_hides_other_libraries_on_every_route() {
+    let w = r2parental().await;
+    let (other_lib, far) = w.other_library().await;
+    let views = "/UserViews";
+    assert_eq!(w.names(&w.kid, views).await.1, 2, "no limits yet");
+    let (names, _) = w
+        .names(&w.kid, "/Items?Recursive=true&IncludeItemTypes=Movie")
+        .await;
+    assert!(names.contains(&"Far Away".to_string()));
+
+    let lib = w.library_id().await;
+    w.set_policy(serde_json::json!({ "EnableAllFolders": false, "EnabledFolders": [lib] }))
+        .await;
+    assert_eq!(
+        w.names(&w.kid, views).await,
+        (vec!["Parental".to_string()], 1)
+    );
+    assert_eq!(
+        w.names(&w.kid, &format!("/Users/{}/Views", w.kid_id))
+            .await
+            .1,
+        1
+    );
+    assert_eq!(w.names(&w.admin, views).await.1, 2, "the administrator");
+
+    // Lists, search, latest and the by-name lists leave the other library out.
+    for uri in [
+        "/Items?Recursive=true&IncludeItemTypes=Movie".to_string(),
+        format!("/Items?Recursive=true&ParentId={other_lib}"),
+        "/Search/Hints?SearchTerm=Far".to_string(),
+        "/Items?Recursive=true&SearchTerm=Far".to_string(),
+        format!("/Items/Latest?ParentId={other_lib}"),
+        "/Items/Latest".to_string(),
+        "/Genres".to_string(),
+    ] {
+        let (status, body) = w.get(&w.kid, &uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert!(
+            !body.to_string().contains("Far Away"),
+            "{uri} lists the other library: {body}"
+        );
+        let (_, body) = w.get(&w.admin, &uri).await;
+        assert!(
+            body.to_string().contains("Far Away") || uri == "/Genres",
+            "{uri} for the administrator: {body}"
+        );
+    }
+    let (_, genres) = w
+        .get(&w.kid, &format!("/Genres?ParentId={other_lib}"))
+        .await;
+    assert_eq!(genres["TotalRecordCount"], 0, "{genres}");
+
+    // Every id-based route answers 404 for the other library and its items.
+    for uri in [
+        format!("/Items/{other_lib}"),
+        format!("/Items/{far}"),
+        format!("/Users/{}/Items/{far}", w.kid_id),
+        format!("/Items/{far}/PlaybackInfo"),
+        format!("/Videos/{far}/stream"),
+        format!("/Videos/{far}/main.m3u8"),
+        format!("/Items/{far}/Images"),
+        format!("/Items/{far}/Similar"),
+        format!("/Items/{far}/Ancestors"),
+        format!("/UserItems/{far}/UserData"),
+        format!("/Items/{other_lib}/Children"),
+    ] {
+        let (status, body) = w.get(&w.kid, &uri).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}: {body}");
+    }
+    for uri in [format!("/Items/{other_lib}"), format!("/Items/{far}")] {
+        assert_eq!(w.get(&w.admin, &uri).await.0, StatusCode::OK, "{uri}");
+    }
+    // Writes on the hidden item are refused too.
+    let (status, _) = send(
+        &w.app,
+        request(
+            "POST",
+            &format!("/UserPlayedItems/{far}"),
+            Some(&w.kid),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    // The allowed library still serves.
+    let gentle = w.id("Gentle");
+    assert_eq!(
+        w.get(&w.kid, &format!("/Items/{gentle}")).await.0,
+        StatusCode::OK
+    );
+
+    // No library at all: nothing is listed.
+    w.set_policy(serde_json::json!({ "EnabledFolders": [] }))
+        .await;
+    assert_eq!(w.names(&w.kid, views).await.1, 0);
+    assert_eq!(
+        w.names(&w.kid, "/Items?Recursive=true").await.1,
+        0,
+        "no items without a library"
+    );
+}
+
+#[tokio::test]
+async fn r3parental_music_artist_lists_honour_parental_limits() {
+    let w = r2parental().await;
+    let mut tracks = HashMap::new();
+    for (name, rating, artist) in [("Lullaby", "G", "Soft Singer"), ("Rage", "R", "Loud Band")] {
+        let album = uuid::Uuid::new_v4();
+        let track = uuid::Uuid::new_v4();
+        let lib = w.library_id().await;
+        for (id, kind, parent) in [(album, "MusicAlbum", None), (track, "Audio", Some(album))] {
+            sqlx::query(
+                "INSERT INTO media_items (id, library_id, name, media_type, path, parent_id, \
+                 official_rating) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(id.to_string())
+            .bind(&lib)
+            .bind(format!("{name} {kind}"))
+            .bind(kind)
+            .bind(format!("/nowhere/{id}"))
+            .bind(parent.map(|p: uuid::Uuid| p.to_string()))
+            .bind(rating)
+            .execute(&w.state.db)
+            .await
+            .unwrap();
+        }
+        r2music_link(&w.state, track, artist, "Artist", 0).await;
+        r2music_link(&w.state, album, artist, "AlbumArtist", 0).await;
+        tracks.insert(artist, track);
+    }
+    for uri in ["/Artists", "/Artists/AlbumArtists"] {
+        let (names, total) = w.names(&w.kid, uri).await;
+        assert_eq!(
+            (names, total),
+            (r2parental_names(&["Loud Band", "Soft Singer"]), 2),
+            "{uri}"
+        );
+    }
+    w.set_policy(serde_json::json!({ "MaxParentalRating": 10 }))
+        .await;
+    for uri in [
+        "/Artists",
+        "/Artists/AlbumArtists",
+        "/Artists?SearchTerm=Band",
+        "/Artists/AlbumArtists?StartIndex=0&Limit=10",
+    ] {
+        let (status, body) = w.get(&w.kid, uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert!(!body.to_string().contains("Loud Band"), "{uri}: {body}");
+        let (_, body) = w.get(&w.admin, uri).await;
+        assert!(
+            body.to_string().contains("Loud Band"),
+            "admin {uri}: {body}"
+        );
+    }
+    assert_eq!(
+        w.names(&w.kid, "/Artists").await,
+        (vec!["Soft Singer".to_string()], 1)
+    );
+    let (_, body) = w.get(&w.kid, "/Artists/Loud").await;
+    assert_eq!(body["TotalRecordCount"], 0, "{body}");
+    let (_, body) = w.get(&w.kid, "/Persons").await;
+    assert!(!body.to_string().contains("Loud Band"), "{body}");
+    // The hidden track's routes answer 404.
+    let rage = tracks["Loud Band"];
+    for uri in [
+        format!("/Items/{rage}"),
+        format!("/Audio/{rage}/stream"),
+        format!("/Audio/{rage}/universal"),
+    ] {
+        assert_eq!(w.get(&w.kid, &uri).await.0, StatusCode::NOT_FOUND, "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn r3parental_access_schedule_refuses_sign_in_and_requests_outside_it() {
+    use chrono::Datelike;
+    let w = r2parental().await;
+    let uri = format!("/Users/{}/Password", w.kid_id);
+    let body = serde_json::json!({ "NewPw": "kidpw" });
+    let (status, _) = send(&w.app, request("POST", &uri, Some(&w.admin), Some(body))).await;
+    assert!(status.is_success(), "admin password reset: {status}");
+    // The reset signs the kid out everywhere; this is their new token.
+    let (kid, _) = login(&w.app, "kid", "kidpw").await.unwrap();
+
+    // A schedule for tomorrow only: outside it now, in the server's local time.
+    let today = chrono::Local::now().weekday().num_days_from_monday() as usize;
+    let tomorrow = R3PARENTAL_DAYS[(today + 1) % 7];
+    w.set_policy(serde_json::json!({ "AccessSchedules": [
+        { "DayOfWeek": tomorrow, "StartHour": 0, "EndHour": 24 }
+    ] }))
+    .await;
+    let (status, _) = send(&w.app, r3parental_login("kid", "kidpw", "dev-a")).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "sign-in outside the schedule"
+    );
+    let gentle = w.id("Gentle");
+    for uri in [
+        "/Users/Me".to_string(),
+        format!("/Items/{gentle}"),
+        format!("/Videos/{gentle}/stream"),
+        format!("/Items/{gentle}/PlaybackInfo"),
+    ] {
+        assert_eq!(w.get(&kid, &uri).await.0, StatusCode::FORBIDDEN, "{uri}");
+    }
+    // An administrator's schedule doesn't apply to them.
+    assert_eq!(w.get(&w.admin, "/Users/Me").await.0, StatusCode::OK);
+
+    // Today, all day: allowed again.
+    w.set_policy(serde_json::json!({ "AccessSchedules": [
+        { "DayOfWeek": R3PARENTAL_DAYS[today], "StartHour": 0, "EndHour": 24 }
+    ] }))
+    .await;
+    assert_eq!(w.get(&kid, "/Users/Me").await.0, StatusCode::OK);
+    let (status, _) = send(&w.app, r3parental_login("kid", "kidpw", "dev-a")).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+/// Timings of list routes for a user limited to one small library while another holds 50,000
+/// items. Ignored in normal runs; `cargo test ... r3parental_library_filter_timing -- --ignored
+/// --nocapture` prints them.
+#[tokio::test]
+#[ignore]
+async fn r3parental_library_filter_timing() {
+    let w = r2parental().await;
+    let (other_lib, _) = w.other_library().await;
+    sqlx::query(
+        "INSERT INTO media_items (id, library_id, name, media_type, path) \
+         WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 50000) \
+         SELECT printf('%08x-0000-4000-8000-%012x', i, i), ?, 'Bulk ' || i, 'Movie', \
+         '/nowhere/bulk/' || i || '.mkv' FROM n",
+    )
+    .bind(other_lib.to_string())
+    .execute(&w.state.db)
+    .await
+    .unwrap();
+    let lib = w.library_id().await;
+    w.set_policy(serde_json::json!({ "EnableAllFolders": false, "EnabledFolders": [lib] }))
+        .await;
+    for uri in [
+        "/Items?Recursive=true&IncludeItemTypes=Movie&Limit=50",
+        "/Items/Latest",
+        "/Search/Hints?SearchTerm=Bulk",
+        "/Genres",
+        "/Artists",
+    ] {
+        let mut times = Vec::new();
+        for _ in 0..5 {
+            let start = std::time::Instant::now();
+            let (status, body) = w.get(&w.kid, uri).await;
+            times.push(start.elapsed().as_secs_f64() * 1000.0);
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            assert!(!body.to_string().contains("Bulk 1\""), "{uri}");
+        }
+        times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        println!("r3parental timing {uri}: median {:.1} ms", times[2]);
+    }
+}
+
+#[tokio::test]
+async fn r3parental_remote_access_playback_and_session_limits() {
+    let w = r2parental().await;
+    let remote = remote_app(w.state.clone());
+    let gentle = w.id("Gentle");
+    let uri = format!("/Users/{}/Password", w.kid_id);
+    let body = serde_json::json!({ "NewPw": "kidpw" });
+    send(&w.app, request("POST", &uri, Some(&w.admin), Some(body))).await;
+    let (kid, _) = login(&w.app, "kid", "kidpw").await.unwrap();
+    let w = R2Parental { kid, ..w };
+
+    // Remote access off: refused from outside the local network, sign-in included.
+    w.set_policy(serde_json::json!({ "EnableRemoteAccess": false }))
+        .await;
+    let (status, _) = send(&remote, request("GET", "/Users/Me", Some(&w.kid), None)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = send(&remote, r3parental_login("kid", "kidpw", "dev-r")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(w.get(&w.kid, "/Users/Me").await.0, StatusCode::OK, "local");
+    w.set_policy(serde_json::json!({ "EnableRemoteAccess": true }))
+        .await;
+    let (status, _) = send(&remote, request("GET", "/Users/Me", Some(&w.kid), None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Playback off: PlaybackInfo answers NotAllowed and the streams 403.
+    w.set_policy(serde_json::json!({ "EnableMediaPlayback": false }))
+        .await;
+    let (status, body) = w
+        .get(&w.kid, &format!("/Items/{gentle}/PlaybackInfo"))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["ErrorCode"], "NotAllowed", "{body}");
+    for uri in [
+        format!("/Videos/{gentle}/stream"),
+        format!("/Videos/{gentle}/main.m3u8"),
+    ] {
+        assert_eq!(w.get(&w.kid, &uri).await.0, StatusCode::FORBIDDEN, "{uri}");
+    }
+    assert!(
+        w.get(&w.admin, &format!("/Videos/{gentle}/stream"))
+            .await
+            .0
+            .is_success()
+    );
+
+    // Transcoding and remuxing off: the sources don't offer them.
+    w.set_policy(serde_json::json!({ "EnableMediaPlayback": true,
+        "EnableVideoPlaybackTranscoding": false, "EnablePlaybackRemuxing": false }))
+        .await;
+    b110_source(&w.state, gentle, 600_000_000).await;
+    let (_, body) = w
+        .get(&w.kid, &format!("/Items/{gentle}/PlaybackInfo"))
+        .await;
+    assert_eq!(body["ErrorCode"], serde_json::Value::Null, "{body}");
+    assert_eq!(body["MediaSources"].as_array().unwrap().len(), 1, "{body}");
+    for source in body["MediaSources"].as_array().unwrap() {
+        assert_eq!(source["SupportsTranscoding"], false, "{source}");
+        assert_eq!(source["SupportsDirectStream"], false, "{source}");
+    }
+
+    // At most two sessions, one of them the sign-in above: a third device is refused; a device
+    // that has a session signs in again.
+    w.set_policy(serde_json::json!({ "MaxActiveSessions": 2 }))
+        .await;
+    let (status, _) = send(&w.app, r3parental_login("kid", "kidpw", "dev-a")).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send(&w.app, r3parental_login("kid", "kidpw", "dev-b")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = send(&w.app, r3parental_login("kid", "kidpw", "dev-a")).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Deletion allowed: the user may delete an item.
+    let edgy = w.id("Edgy");
+    let (status, _) = send(
+        &w.app,
+        request("DELETE", &format!("/Items/{edgy}"), Some(&w.kid), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "not allowed by default");
+    w.set_policy(serde_json::json!({ "EnableContentDeletion": true }))
+        .await;
+    let (status, _) = send(
+        &w.app,
+        request("DELETE", &format!("/Items/{edgy}"), Some(&w.kid), None),
+    )
+    .await;
+    assert!(status.is_success(), "{status}");
+}
+
+#[tokio::test]
+async fn r3parental_library_access_applies_to_a_shared_playlist() {
+    let w = r2parental().await;
+    let (_, far) = w.other_library().await;
+    let (gentle, pleasant) = (w.id("Gentle"), w.id("Pleasant"));
+    let body = serde_json::json!({ "Name": "Mixed", "Ids": [gentle, far, pleasant],
+        "MediaType": "Video" });
+    let (status, created) = send(
+        &w.app,
+        request("POST", "/Playlists", Some(&w.admin), Some(body)),
+    )
+    .await;
+    assert!(status.is_success(), "{created}");
+    let pl = created["Id"].as_str().unwrap().to_string();
+    let share = format!("/Playlists/{pl}/Users/{}?CanEdit=true", w.kid_id);
+    assert!(
+        send(&w.app, request("POST", &share, Some(&w.admin), None))
+            .await
+            .0
+            .is_success()
+    );
+    let lib = w.library_id().await;
+    w.set_policy(serde_json::json!({ "EnableAllFolders": false, "EnabledFolders": [lib] }))
+        .await;
+
+    let items = format!("/Playlists/{pl}/Items");
+    assert_eq!(
+        w.names(&w.kid, &items).await,
+        (r2parental_names(&["Gentle", "Pleasant"]), 2)
+    );
+    assert_eq!(w.names(&w.admin, &items).await.1, 3);
+    let (_, one) = w.get(&w.kid, &format!("/Playlists/{pl}")).await;
+    assert_eq!(
+        one["ItemIds"],
+        serde_json::json!([gentle, pleasant]),
+        "{one}"
+    );
+    let (_, listed) = w.get(&w.kid, "/Playlists").await;
+    let entry = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["Id"] == pl.as_str())
+        .unwrap_or_else(|| panic!("{listed}"))
+        .clone();
+    assert_eq!(entry["ChildCount"], 2, "{entry}");
+    for uri in [
+        format!("/Items/{far}"),
+        format!("/Users/{}/Items/{far}", w.kid_id),
+    ] {
+        assert_eq!(w.get(&w.kid, &uri).await.0, StatusCode::NOT_FOUND, "{uri}");
+    }
+
+    // The editor moves by the index they see: Pleasant to the front; Far Away keeps its place
+    // between the entries the kid sees.
+    let (_, entries) = w.get(&w.kid, &items).await;
+    let pleasant_entry = entries["Items"][1]["PlaylistItemId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mv = format!("/Playlists/{pl}/Items/{pleasant_entry}/Move/0");
+    assert!(
+        send(&w.app, request("POST", &mv, Some(&w.kid), None))
+            .await
+            .0
+            .is_success()
+    );
+    let (_, all) = w.get(&w.admin, &format!("/Playlists/{pl}")).await;
+    assert_eq!(all["ItemIds"].as_array().unwrap().len(), 3, "{all}");
+    assert_eq!(all["ItemIds"][0], serde_json::json!(pleasant), "{all}");
+    assert!(
+        all["ItemIds"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!(far))
+    );
+    // An entry the kid can't see can't be moved by its id.
+    let far_entry = {
+        let (_, entries) = w.get(&w.admin, &items).await;
+        entries["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["Id"] == serde_json::json!(far))
+            .unwrap()["PlaylistItemId"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let mv = format!("/Playlists/{pl}/Items/{far_entry}/Move/0");
+    assert_eq!(
+        send(&w.app, request("POST", &mv, Some(&w.kid), None))
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    // Saving the list the kid sees keeps the hidden entry.
+    let body = serde_json::json!({ "Ids": [gentle, pleasant] });
+    let uri = format!("/Playlists/{pl}");
+    assert!(
+        send(&w.app, request("POST", &uri, Some(&w.kid), Some(body)))
+            .await
+            .0
+            .is_success()
+    );
+    let (_, all) = w.get(&w.admin, &uri).await;
+    assert!(
+        all["ItemIds"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!(far)),
+        "{all}"
+    );
+}
+
+#[tokio::test]
+async fn r3parental_library_access_applies_to_collections() {
+    let w = r2parental().await;
+    let (_, far) = w.other_library().await;
+    let gentle = w.id("Gentle");
+    let mut ids = Vec::new();
+    for (name, items) in [("Both", vec![gentle, far]), ("Elsewhere only", vec![far])] {
+        let uri = format!(
+            "/Collections?Name={}&Ids={}",
+            name.replace(' ', "%20"),
+            items
+                .iter()
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let (status, created) = send(&w.app, request("POST", &uri, Some(&w.admin), None)).await;
+        assert!(status.is_success(), "{created}");
+        ids.push(created["Id"].as_str().unwrap().to_string());
+    }
+    let lib = w.library_id().await;
+    w.set_policy(serde_json::json!({ "EnableAllFolders": false, "EnabledFolders": [lib] }))
+        .await;
+
+    let (both, only) = (&ids[0], &ids[1]);
+    assert_eq!(
+        w.names(&w.kid, &format!("/Collections/{both}/Items")).await,
+        (vec!["Gentle".to_string()], 1)
+    );
+    assert_eq!(
+        w.names(&w.admin, &format!("/Collections/{both}/Items"))
+            .await
+            .1,
+        2
+    );
+    let (_, one) = w.get(&w.kid, &format!("/Collections/{both}")).await;
+    assert_eq!(one["ChildCount"], 1, "{one}");
+    // Every item of it is in a library the kid can't see: the collection is hidden from them.
+    assert_eq!(
+        w.get(&w.kid, &format!("/Collections/{only}")).await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        w.get(&w.kid, &format!("/Collections/{only}/Items")).await.0,
+        StatusCode::NOT_FOUND
+    );
+    let (_, listed) = w.get(&w.kid, "/Collections").await;
+    assert!(!listed.to_string().contains(only.as_str()), "{listed}");
+    assert!(listed.to_string().contains(both.as_str()), "{listed}");
+    assert_eq!(
+        w.get(&w.admin, &format!("/Collections/{only}")).await.0,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn r3parental_transcoding_off_refuses_a_direct_hls_request() {
+    let w = r2parental().await;
+    let gentle = w.id("Gentle");
+    let hls = format!("/Videos/{gentle}/main.m3u8?VideoBitRate=1000000&VideoCodec=h264");
+    // The fixture's files can't be transcoded, so the administrator gets past the guard to an
+    // ffmpeg error; the guard answers before ffmpeg starts.
+    let (admin_status, _) = w.get(&w.admin, &hls).await;
+    assert_ne!(admin_status, StatusCode::FORBIDDEN);
+    for policy in [
+        serde_json::json!({ "EnableVideoPlaybackTranscoding": false }),
+        serde_json::json!({ "EnableVideoPlaybackTranscoding": true,
+            "EnablePlaybackRemuxing": false }),
+    ] {
+        w.set_policy(policy.clone()).await;
+        let (status, body) = w.get(&w.kid, &hls).await;
+        if policy["EnableVideoPlaybackTranscoding"] == false {
+            assert_eq!(status, StatusCode::FORBIDDEN, "{policy}: {body}");
+        } else {
+            // A transcode (nothing here can be copied) needs no remuxing.
+            assert_eq!(status, admin_status, "{policy}: {body}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn r3parental_owner_and_self_keep_remote_access_and_a_remote_admin_stays() {
+    let w = r2parental().await;
+    let (_, me) = w.get(&w.admin, "/Users/Me").await;
+    let owner = me["Id"].as_str().unwrap().to_string();
+    // The owner, who is also the caller here, can't be limited.
+    for body in [
+        serde_json::json!({ "EnableRemoteAccess": false }),
+        serde_json::json!({ "AccessSchedules": [
+            { "DayOfWeek": "Everyday", "StartHour": 0, "EndHour": 1 }
+        ] }),
+        serde_json::json!({ "IsDisabled": true }),
+    ] {
+        let uri = format!("/Users/{owner}/Policy");
+        let (status, _) = send(&w.app, request("POST", &uri, Some(&w.admin), Some(body))).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+    let (_, me) = w.get(&w.admin, "/Users/Me").await;
+    assert_eq!(me["Policy"]["EnableRemoteAccess"], true);
+    assert_eq!(me["Policy"]["AccessSchedules"], serde_json::json!([]));
+
+    // Two administrators without an owner: x takes y's remote access; y may not then take x's,
+    // which would leave no administrator who can sign in remotely, nor limit their own.
+    sqlx::query("UPDATE users SET is_owner = 0")
+        .execute(&w.state.db)
+        .await
+        .unwrap();
+    let x = add_user(&w.state, "x-admin", "xpass", true).await;
+    let y = add_user(&w.state, "y-admin", "ypass", true).await;
+    sqlx::query("UPDATE users SET is_administrator = 0 WHERE id = ?")
+        .bind(me["Id"].as_str().unwrap())
+        .execute(&w.state.db)
+        .await
+        .unwrap();
+    let (xt, _) = login(&w.app, "x-admin", "xpass").await.unwrap();
+    let (yt, _) = login(&w.app, "y-admin", "ypass").await.unwrap();
+    let off = serde_json::json!({ "EnableRemoteAccess": false });
+    let (status, _) = send(
+        &w.app,
+        request(
+            "POST",
+            &format!("/Users/{y}/Policy"),
+            Some(&xt),
+            Some(off.clone()),
+        ),
+    )
+    .await;
+    assert!(status.is_success(), "{status}");
+    for (token, target) in [(&yt, x), (&xt, x)] {
+        let (status, body) = send(
+            &w.app,
+            request(
+                "POST",
+                &format!("/Users/{target}/Policy"),
+                Some(token),
+                Some(off.clone()),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    }
+    let (_, x_user) = w.get(&xt, &format!("/Users/{x}")).await;
+    assert_eq!(x_user["Policy"]["EnableRemoteAccess"], true);
+    // Removing the only remote administrator's rights is refused too.
+    let (status, _) = send(
+        &w.app,
+        request(
+            "POST",
+            &format!("/Users/{x}/Policy"),
+            Some(&yt),
+            Some(serde_json::json!({ "IsAdministrator": false })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn r3parental_flags_and_access_are_stored_together() {
+    let w = r2parental().await;
+    // A refused flag change (disabling an administrator) stores none of the access fields.
+    let other = add_user(&w.state, "other-admin", "pw", true).await;
+    let uri = format!("/Users/{other}/Policy");
+    let body = serde_json::json!({ "IsDisabled": true, "EnableAllFolders": false,
+        "EnabledFolders": [], "MaxActiveSessions": 4 });
+    let (status, _) = send(&w.app, request("POST", &uri, Some(&w.admin), Some(body))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (_, user) = w.get(&w.admin, &format!("/Users/{other}")).await;
+    assert_eq!(user["Policy"]["EnableAllFolders"], true);
+    assert_eq!(user["Policy"]["MaxActiveSessions"], 0);
+}
+
+#[tokio::test]
+async fn r3parental_unreadable_access_policy_fails_closed() {
+    let w = r2parental().await;
+    sqlx::query("UPDATE users SET access_policy = 'not json' WHERE id = ?")
+        .bind(w.kid_id.to_string())
+        .execute(&w.state.db)
+        .await
+        .unwrap();
+    // Outside every schedule: refused.
+    assert_eq!(w.get(&w.kid, "/Users/Me").await.0, StatusCode::FORBIDDEN);
+    let policy = rustyfin_db::repo_parental::get_policy(&w.state.db, w.kid_id)
+        .await
+        .unwrap();
+    assert!(!policy.access.enable_remote_access);
+    assert!(!policy.access.enable_all_folders);
+    assert!(policy.access.enabled_folders.is_empty());
+    assert!(!policy.access.schedule_allows_now());
+}
+
+#[tokio::test]
+async fn r3parental_socket_refused_outside_the_schedule() {
+    use chrono::Datelike;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let w = r2parental().await;
+    let today = chrono::Local::now().weekday().num_days_from_monday() as usize;
+    w.set_policy(serde_json::json!({ "AccessSchedules": [
+        { "DayOfWeek": R3PARENTAL_DAYS[(today + 1) % 7], "StartHour": 0, "EndHour": 24 }
+    ] }))
+    .await;
+    let addr = b17_serve(&w.app).await;
+    let status_of = |token: String| async move {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let request = format!(
+            "GET /socket?api_key={token} HTTP/1.1\r\nHost: {addr}\r\nConnection: Upgrade\r\n\
+             Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut line = String::new();
+        tokio::io::BufReader::new(stream)
+            .read_line(&mut line)
+            .await
+            .unwrap();
+        line
+    };
+    assert!(
+        status_of(w.kid.clone()).await.contains(" 403 "),
+        "the kid's socket"
+    );
+    assert!(
+        status_of(w.admin.clone()).await.contains(" 101 "),
+        "the administrator's socket"
+    );
+}
+
+#[tokio::test]
+async fn r3parental_jellyfin_import_carries_library_access() {
+    let mut w = b20_world().await;
+    w.source.users.push(jf::JfUser::new(5, "Kiddo", false));
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+    let db = sqlx::SqlitePool::connect(&format!(
+        "sqlite:{}",
+        install.join("data").join("jellyfin.db").display()
+    ))
+    .await
+    .unwrap();
+    let movies_folder = uuid::Uuid::new_v4();
+    let unknown = uuid::Uuid::new_v4();
+    let folder_path = install.join("root").join("default").join("Movies");
+    for sql in [
+        "ALTER TABLE Users ADD COLUMN MaxParentalRatingScore INTEGER".to_string(),
+        "CREATE TABLE Preferences (Id INTEGER PRIMARY KEY, UserId TEXT, Kind INTEGER, Value TEXT)"
+            .to_string(),
+        "CREATE TABLE AccessSchedules (Id INTEGER PRIMARY KEY, UserId TEXT, DayOfWeek INTEGER, \
+         StartHour REAL, EndHour REAL)"
+            .to_string(),
+        format!(
+            "INSERT INTO BaseItems (Id, Type, Name, Path) VALUES ('{}', \
+             'MediaBrowser.Controller.Entities.CollectionFolder', 'Movies', '{}')",
+            movies_folder.to_string().to_uppercase(),
+            folder_path.display()
+        ),
+        "INSERT INTO Permissions (UserId, Kind, Value) SELECT Id, 16, 0 FROM Users WHERE Username = 'Kiddo'"
+            .to_string(),
+        "INSERT INTO Permissions (UserId, Kind, Value) SELECT Id, 4, 0 FROM Users WHERE Username = 'Kiddo'"
+            .to_string(),
+        format!(
+            "INSERT INTO Preferences (UserId, Kind, Value) SELECT Id, 5, '{}|{}' FROM Users \
+             WHERE Username = 'Kiddo'",
+            movies_folder.simple(),
+            unknown.simple()
+        ),
+        "INSERT INTO AccessSchedules (UserId, DayOfWeek, StartHour, EndHour) \
+         SELECT Id, 8, 7, 19.5 FROM Users WHERE Username = 'Kiddo'"
+            .to_string(),
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(sql)).execute(&db).await.unwrap();
+    }
+    db.close().await;
+
+    let mut body = b20_body(&w, &install);
+    body["UserIds"] = serde_json::json!([w.source.user("Kiddo").id]);
+    let report = b20_run(&w, body).await;
+    let row = report["Users"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["Name"] == "Kiddo")
+        .unwrap()
+        .clone();
+    // Limited by library, remote access and schedule only: carried, not "None".
+    assert_eq!(row["ParentalLimits"], "Carried", "{row}");
+    assert_eq!(
+        row["LibrariesNotCarried"],
+        serde_json::json!([format!("?{}", unknown.simple())])
+    );
+    let movies: String = sqlx::query_scalar("SELECT id FROM libraries WHERE name = 'Movies'")
+        .fetch_one(&w.state.db)
+        .await
+        .unwrap();
+    let kiddo = row["UserId"].as_str().unwrap();
+    let (_, user) = send_authed(&w.app, "GET", &format!("/Users/{kiddo}"), &w.token, None).await;
+    let policy = &user["Policy"];
+    assert_eq!(policy["EnableAllFolders"], false);
+    assert_eq!(policy["EnabledFolders"], serde_json::json!([movies]));
+    assert_eq!(policy["EnableRemoteAccess"], false);
+    assert_eq!(
+        policy["AccessSchedules"],
+        serde_json::json!([{ "DayOfWeek": "Weekday", "StartHour": 7.0, "EndHour": 19.5 }])
     );
 }
 
@@ -24675,6 +25918,13 @@ fn r3music_album() {
 #[test]
 fn r3music_tabs() {
     b124_node_test("r3music_tabs.mjs");
+}
+
+// R3 collections: the web client's collection and playlist lists, pages, Remove and reordering
+// (tests/web/r3collections_web.mjs)
+#[test]
+fn r3collections_web() {
+    b124_node_test("r3collections_web.mjs");
 }
 
 #[test]
@@ -28954,10 +30204,11 @@ async fn b38_the_owner_keeps_full_access() {
     let (status, users) =
         send_authed(app, "GET", &format!("/Playlists/{pl}/Users"), token, None).await;
     assert_eq!((status, users), (StatusCode::OK, serde_json::json!([])));
+    // The owner has no share of their own: a 404, as Jellyfin answers it.
     let uri = format!("/Playlists/{pl}/Users/{}", w.alice.1);
     assert_eq!(
         send_authed(app, "GET", &uri, token, None).await.0,
-        StatusCode::OK
+        StatusCode::NOT_FOUND
     );
     let uri = format!("/Playlists/{pl}/Users/{}", w.bob.1);
     assert_eq!(
@@ -29094,6 +30345,344 @@ async fn b38_a_users_own_playlist_works_and_is_hidden_from_others() {
         send_authed(app, "GET", &uri, bob, None).await.0,
         StatusCode::NOT_FOUND
     );
+}
+
+// R3 collections: playlist sharing, as Jellyfin's Shares and OpenAccess, and collections that
+// follow parental limits and libraries
+
+#[tokio::test]
+async fn r3collections_a_shared_playlist_is_read_by_readers_and_changed_by_editors() {
+    let w = b38_world().await;
+    let (app, alice, bob, pl, m) = (&w.app, &w.alice.0, &w.bob.0, &w.playlist, &w.movies);
+    let bob_id = w.bob.1;
+    let share = format!("/Playlists/{pl}/Users/{bob_id}");
+    let items = format!("/Playlists/{pl}/Items");
+    let add = format!(r#"{{"Ids":["{}"]}}"#, m[2]);
+    let (_, entries) = send_authed(app, "GET", &items, alice, None).await;
+    let entry = entries["Items"][1]["PlaylistItemId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mv = format!("/Playlists/{pl}/Items/{entry}/Move/0");
+    let one_uri = format!("/Playlists/{pl}");
+    let users_uri = format!("/Playlists/{pl}/Users");
+    let alice_share = format!("/Playlists/{pl}/Users/{}", w.alice.1);
+
+    // Shared to read only: bob reads it and finds it listed, but changes nothing.
+    let uri = format!("{share}?CanEdit=false");
+    assert_eq!(
+        send_authed(app, "POST", &uri, alice, None).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(b38_view(app, bob, pl).await.4, m[..2].to_vec());
+    assert_eq!(b38_listed(app, bob).await, vec![pl.clone()]);
+    let (listed, _) = r2collections_listed(app, bob, "IncludeItemTypes=Playlist").await;
+    assert_eq!(listed, vec![pl.clone()]);
+    let (_, one) = send_authed(app, "GET", &format!("/Playlists/{pl}"), bob, None).await;
+    assert_eq!(one["CanEdit"], false);
+    assert_eq!(one["OpenAccess"], false);
+    assert_eq!(one["ItemIds"], serde_json::json!(m[..2].to_vec()));
+    assert_eq!(
+        one["Shares"],
+        serde_json::json!([{ "UserId": bob_id, "CanEdit": false }])
+    );
+    let (status, me) = send_authed(app, "GET", &share, bob, None).await;
+    assert_eq!((status, &me["CanEdit"]), (StatusCode::OK, &false.into()));
+    // As in Jellyfin: the owner asks about anyone; the owner has no share, so a 404.
+    let (status, his) = send_authed(app, "GET", &share, alice, None).await;
+    assert_eq!((status, &his["CanEdit"]), (StatusCode::OK, &false.into()));
+    assert_eq!(
+        send_authed(app, "GET", &alice_share, alice, None).await.0,
+        StatusCode::NOT_FOUND
+    );
+    let pl_item = format!("/Items/{pl}");
+    for (method, uri, body) in [
+        ("POST", items.as_str(), Some(add.as_str())),
+        ("DELETE", items.as_str(), Some(add.as_str())),
+        ("POST", mv.as_str(), None),
+        ("POST", one_uri.as_str(), Some(r#"{"Name":"Mine"}"#)),
+        ("GET", users_uri.as_str(), None),
+        ("GET", alice_share.as_str(), None),
+        ("DELETE", share.as_str(), None),
+        ("DELETE", one_uri.as_str(), None),
+        ("DELETE", pl_item.as_str(), None),
+    ] {
+        let (status, answer) = send_authed(app, method, uri, bob, body).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "bob {method} {uri}: {answer}"
+        );
+    }
+    assert_eq!(b38_view(app, alice, pl).await.4, m[..2].to_vec());
+
+    // Shared to edit: bob adds and moves, but still may not delete it.
+    let uri = format!("{share}?CanEdit=true");
+    assert_eq!(
+        send_authed(app, "POST", &uri, alice, None).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        send_authed(app, "POST", &items, bob, Some(&add)).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        send_authed(app, "POST", &mv, bob, None).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        b38_view(app, alice, pl).await.4,
+        vec![m[1].clone(), m[0].clone(), m[2].clone()]
+    );
+    let (status, users) =
+        send_authed(app, "GET", &format!("/Playlists/{pl}/Users"), bob, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(users[0]["CanEdit"], true);
+    // An editor may ask about other users, but still may not delete it.
+    assert_eq!(
+        send_authed(app, "GET", &alice_share, bob, None).await.0,
+        StatusCode::NOT_FOUND
+    );
+    for uri in [&one_uri, &pl_item] {
+        assert_eq!(
+            send_authed(app, "DELETE", uri, bob, None).await.0,
+            StatusCode::FORBIDDEN,
+            "bob DELETE {uri}"
+        );
+    }
+    let (_, item) = send_authed(app, "GET", &format!("/Items/{pl}"), bob, None).await;
+    assert_eq!(item["CanDelete"], false);
+
+    // Unshared: bob is a stranger again.
+    assert_eq!(
+        send_authed(app, "DELETE", &share, alice, None).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(b38_view(app, bob, pl).await.0, StatusCode::NOT_FOUND);
+    assert!(b38_listed(app, bob).await.is_empty());
+}
+
+#[tokio::test]
+async fn r3collections_a_public_playlist_is_read_by_all_and_changed_by_its_owner() {
+    let w = b38_world().await;
+    let (app, alice, bob, pl, m) = (&w.app, &w.alice.0, &w.bob.0, &w.playlist, &w.movies);
+    let uri = format!("/Playlists/{pl}");
+    let body = format!(
+        r#"{{"IsPublic":true,"Ids":["{}","{}"],"Users":[]}}"#,
+        m[2], m[0]
+    );
+    assert_eq!(
+        send_authed(app, "POST", &uri, alice, Some(&body)).await.0,
+        StatusCode::NO_CONTENT
+    );
+    let view = b38_view(app, bob, pl).await;
+    assert_eq!(view.0, StatusCode::OK);
+    assert_eq!(view.4, vec![m[2].clone(), m[0].clone()]);
+    let (_, one) = send_authed(app, "GET", &uri, bob, None).await;
+    assert_eq!(
+        (&one["OpenAccess"], &one["CanEdit"]),
+        (&true.into(), &false.into())
+    );
+    assert_eq!(b38_listed(app, bob).await, vec![pl.clone()]);
+    let add = format!(r#"{{"Ids":["{}"]}}"#, m[1]);
+    let items = format!("/Playlists/{pl}/Items");
+    assert_eq!(
+        send_authed(app, "POST", &items, bob, Some(&add)).await.0,
+        StatusCode::FORBIDDEN
+    );
+
+    // A playlist made public and shared at creation.
+    let body = format!(
+        r#"{{"Name":"Open","Ids":["{}"],"IsPublic":false,"Users":[{{"UserId":"{}","CanEdit":true}}]}}"#,
+        m[0], w.bob.1
+    );
+    let (status, made) = send_authed(app, "POST", "/Playlists", alice, Some(&body)).await;
+    assert_eq!(status, StatusCode::OK, "{made}");
+    let made = made["Id"].as_str().unwrap();
+    let (_, one) = send_authed(app, "GET", &format!("/Playlists/{made}"), bob, None).await;
+    assert_eq!(
+        (&one["OpenAccess"], &one["CanEdit"]),
+        (&false.into(), &true.into())
+    );
+}
+
+#[tokio::test]
+async fn r3collections_library_parents_list_the_collections_and_playlists_holding_its_items() {
+    let w = b38_world().await;
+    let (app, admin, alice, m) = (&w.app, &w.admin.0, &w.alice.0, &w.movies);
+    let (_, folders) = send_authed(app, "GET", "/Library/VirtualFolders", admin, None).await;
+    let lib = folders[0]["ItemId"].as_str().unwrap().to_string();
+    let uri = format!("/Collections?Name=Set&Ids={}", m[0]);
+    let (_, set) = send_authed(app, "POST", &uri, admin, None).await;
+    let set = set["Id"].as_str().unwrap().to_string();
+    let (_, empty) = send_authed(app, "POST", "/Collections?Name=Empty", admin, None).await;
+    let empty = empty["Id"].as_str().unwrap().to_string();
+
+    let under = |kinds: &str| format!("ParentId={lib}&IncludeItemTypes={kinds}&Recursive=true");
+    assert_eq!(
+        r2collections_listed(app, alice, &under("BoxSet")).await.0,
+        vec![set.clone()]
+    );
+    assert_eq!(
+        r2collections_listed(app, alice, &under("Playlist")).await.0,
+        vec![w.playlist.clone()]
+    );
+    let mut both = vec![set.clone(), empty.clone()];
+    both.sort();
+    let (mut all, _) = r2collections_listed(app, alice, "IncludeItemTypes=BoxSet").await;
+    all.sort();
+    assert_eq!(all, both);
+    // GET /Collections lists every collection, not only the caller's.
+    let (_, listed) = send_authed(app, "GET", "/Collections", alice, None).await;
+    assert_eq!(listed.as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn r3collections_a_collection_of_only_hidden_items_is_hidden() {
+    let w = r2parental().await;
+    w.set_policy(serde_json::json!({ "MaxParentalRating": 10 }))
+        .await;
+    let make = |name: &str, ids: Vec<uuid::Uuid>| serde_json::json!({ "Name": name, "Ids": ids });
+    let mut made = Vec::new();
+    for body in [
+        make("Rough only", vec![w.id("Rough")]),
+        make("Mixed", vec![w.id("Rough"), w.id("Gentle")]),
+    ] {
+        let (status, c) = send(
+            &w.app,
+            request("POST", "/Collections", Some(&w.admin), Some(body)),
+        )
+        .await;
+        assert!(status.is_success(), "{status} {c}");
+        made.push(c["Id"].as_str().unwrap().to_string());
+    }
+    let (rough, mixed) = (&made[0], &made[1]);
+
+    let (_, listed) = w.get(&w.kid, "/Collections").await;
+    let names: Vec<_> = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["Name"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(names, vec!["Mixed".to_string()]);
+    assert_eq!(
+        w.names(&w.kid, "/Items?IncludeItemTypes=BoxSet").await,
+        (vec!["Mixed".to_string()], 1)
+    );
+    for uri in [
+        format!("/Items/{rough}"),
+        format!("/Collections/{rough}"),
+        format!("/Collections/{rough}/Items"),
+        format!("/Items?ParentId={rough}"),
+    ] {
+        assert_eq!(w.get(&w.kid, &uri).await.0, StatusCode::NOT_FOUND, "{uri}");
+        assert_eq!(w.get(&w.admin, &uri).await.0, StatusCode::OK, "{uri}");
+    }
+    assert_eq!(
+        w.names(&w.kid, &format!("/Items?ParentId={mixed}")).await,
+        (vec!["Gentle".to_string()], 1)
+    );
+    assert_eq!(
+        w.names(&w.admin, "/Items?IncludeItemTypes=BoxSet").await.1,
+        2
+    );
+}
+
+/// The names of a playlist's entries in order, and their PlaylistItemIds, as `token` sees them.
+async fn r3collections_entries(
+    w: &R2Parental,
+    token: &str,
+    pl: &str,
+) -> (Vec<String>, Vec<String>) {
+    let (status, list) = w.get(token, &format!("/Playlists/{pl}/Items")).await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let items = list["Items"].as_array().unwrap();
+    let field = |key: &str| {
+        items
+            .iter()
+            .map(|i| i[key].as_str().unwrap().to_string())
+            .collect()
+    };
+    (field("Name"), field("PlaylistItemId"))
+}
+
+#[tokio::test]
+async fn r3collections_an_editor_with_parental_limits_moves_and_replaces_only_what_they_see() {
+    let w = r2parental().await;
+    w.set_policy(serde_json::json!({ "MaxParentalRating": 10 }))
+        .await;
+    let names = ["Gentle", "Rough", "Pleasant", "Edgy", "Spooky"];
+    let body = serde_json::json!({ "Name": "Shared", "Ids": names.map(|n| w.id(n)) });
+    let (status, made) = send(
+        &w.app,
+        request("POST", "/Playlists", Some(&w.admin), Some(body)),
+    )
+    .await;
+    assert!(status.is_success(), "{status} {made}");
+    let pl = made["Id"].as_str().unwrap().to_string();
+    let share = format!("/Playlists/{pl}/Users/{}?CanEdit=true", w.kid_id);
+    let (status, _) = send(&w.app, request("POST", &share, Some(&w.admin), None)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let strs = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+    let (seen, entries) = r3collections_entries(&w, &w.kid, &pl).await;
+    assert_eq!(seen, strs(&["Gentle", "Pleasant", "Spooky"]));
+    // The listing counts only what the kid sees.
+    let (_, listed) = w.get(&w.kid, "/Items?IncludeItemTypes=Playlist").await;
+    assert_eq!(listed["Items"][0]["ChildCount"], 3);
+
+    // Spooky to the kid's first place: before Gentle, the hidden entries kept in place.
+    let mv = format!("/Playlists/{pl}/Items/{}/Move/0", entries[2]);
+    let (status, _) = send(&w.app, request("POST", &mv, Some(&w.kid), None)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        r3collections_entries(&w, &w.kid, &pl).await.0,
+        strs(&["Spooky", "Gentle", "Pleasant"])
+    );
+    assert_eq!(
+        r3collections_entries(&w, &w.admin, &pl).await.0,
+        strs(&["Spooky", "Gentle", "Rough", "Pleasant", "Edgy"])
+    );
+    // Spooky to the kid's index 1: before Pleasant, so after the hidden Rough.
+    let (_, entries) = r3collections_entries(&w, &w.kid, &pl).await;
+    let mv = format!("/Playlists/{pl}/Items/{}/Move/1", entries[0]);
+    let (status, _) = send(&w.app, request("POST", &mv, Some(&w.kid), None)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        r3collections_entries(&w, &w.kid, &pl).await.0,
+        strs(&["Gentle", "Spooky", "Pleasant"])
+    );
+    // A hidden entry can't be moved by the kid.
+    let (all, all_entries) = r3collections_entries(&w, &w.admin, &pl).await;
+    let rough = &all_entries[all.iter().position(|n| n == "Rough").unwrap()];
+    let mv = format!("/Playlists/{pl}/Items/{rough}/Move/0");
+    let (status, _) = send(&w.app, request("POST", &mv, Some(&w.kid), None)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Replacing the entries with Ids keeps the ones the kid can't see.
+    let body = serde_json::json!({ "Ids": [w.id("Pleasant"), w.id("Gentle")] });
+    let (status, answer) = send(
+        &w.app,
+        request(
+            "POST",
+            &format!("/Playlists/{pl}"),
+            Some(&w.kid),
+            Some(body),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{answer}");
+    assert_eq!(
+        r3collections_entries(&w, &w.kid, &pl).await.0,
+        strs(&["Pleasant", "Gentle"])
+    );
+    let (mut kept, _) = r3collections_entries(&w, &w.admin, &pl).await;
+    assert_eq!(kept.len(), 4);
+    kept.sort();
+    assert_eq!(kept, strs(&["Edgy", "Gentle", "Pleasant", "Rough"]));
+    let (_, listed) = w.get(&w.kid, "/Items?IncludeItemTypes=Playlist").await;
+    assert_eq!(listed["Items"][0]["ChildCount"], 2);
 }
 
 // R2 collections: collections and playlists as Jellyfin clients use them
@@ -32728,6 +34317,12 @@ fn r3livelog_web_view() {
     b124_node_test("r3livelog_view.mjs");
 }
 
+// The administrator's user editor shows and reads back a whole policy (tests/web/r3parental_user_editor.mjs).
+#[test]
+fn r3parental_web_user_editor() {
+    b124_node_test("r3parental_user_editor.mjs");
+}
+
 // ── B18: one scan per run, and Scan all's order ──
 // A manual scan of a library that Scan all has queued but not reached runs at once, and Scan all
 // leaves that library to it, so its ring follows one scan and one Completed comes after the 100.
@@ -34448,15 +36043,17 @@ async fn r3playback_subtitle_routes_refuse_files_out_of_the_library() {
             &[("video", "h264")],
         )
         .await;
+        r3gaps2_store_subtitles(&state, id).await;
     }
     let app = app(state);
 
-    // The subtitle beside the film is served by all three routes
+    // The subtitle beside the film is served by all three routes (stream 0: Jellyfin numbers
+    // the files the scan stored first)
     let routes = |id: uuid::Uuid| {
         [
             format!("/Videos/{id}/Subtitles/0/Stream"),
             format!("/Videos/{id}/Subtitles/0?Format=vtt"),
-            format!("/Videos/{id}/{id}/Subtitles/1/Stream.vtt"),
+            format!("/Videos/{id}/{id}/Subtitles/0/Stream.vtt"),
         ]
     };
     for uri in routes(good_id) {
@@ -35579,7 +37176,7 @@ async fn b22_insert_source(
     container: &str,
     streams: serde_json::Value,
 ) -> String {
-    let source: rustyfin_model::media_source::MediaSourceResponse =
+    let mut source: rustyfin_model::media_source::MediaSourceResponse =
         serde_json::from_value(serde_json::json!({
             "Id": uuid::Uuid::new_v4().to_string(),
             "Uid": uuid::Uuid::new_v4().to_string(),
@@ -35589,10 +37186,42 @@ async fn b22_insert_source(
             "MediaStreams": streams,
         }))
         .unwrap();
+    // The subtitle files beside the video, stored as the scan stores them
+    let found = rustyfin_core::subtitle::discover_external_subtitles(file);
+    rustyfin_core::probe::add_external_subtitles(&mut source, found);
     rustyfin_db::repo_media_source::insert_media_source_with_streams(&state.db, &item, &source)
         .await
         .unwrap()
         .to_string()
+}
+
+/// Stores the subtitle files beside the file of each of `item`'s sources with its streams, as a
+/// scan stores them (`probe::add_external_subtitles`).
+async fn r3gaps2_store_subtitles(state: &AppState, item: uuid::Uuid) {
+    for source in rustyfin_db::repo_media_source::get_media_sources(&state.db, &item)
+        .await
+        .unwrap()
+    {
+        let mut with = source.clone();
+        let stored: Vec<String> = source
+            .media_streams
+            .iter()
+            .filter_map(|s| s.path.clone())
+            .collect();
+        let found = rustyfin_core::subtitle::discover_external_subtitles(std::path::Path::new(
+            &source.path,
+        ))
+        .into_iter()
+        .filter(|sub| !stored.contains(&sub.path.to_string_lossy().into_owned()))
+        .collect();
+        rustyfin_core::probe::add_external_subtitles(&mut with, found);
+        let source_id = uuid::Uuid::parse_str(&source.id).unwrap();
+        for stream in &with.media_streams[source.media_streams.len()..] {
+            rustyfin_db::repo_media_source::insert_media_stream(&state.db, &source_id, stream)
+                .await
+                .unwrap();
+        }
+    }
 }
 
 /// Makes `B22 Film.mkv` in the media folder `folder`: 5 s of video (stream 0), FLAC audio (1)
@@ -35673,9 +37302,10 @@ async fn b22_subtitle_vtt_converts_embedded_and_external_subtitles() {
     let cache = state.data_dir.join("cache").join("subtitle-vtt");
     let app = app(state);
 
-    // The embedded stream 2, then the external files after the highest index, in name order
+    // Jellyfin's numbering: the external files first, in name order (eng 0, ger 1), then the
+    // embedded streams after them (the subtitle, stream 2 of the file, is 4)
     let vtt = |index: i32| format!("/Videos/{id}/{msid}/Subtitles/{index}/Stream.vtt");
-    let (status, content_type, embedded) = b22_get(&app, &vtt(2), &token).await;
+    let (status, content_type, embedded) = b22_get(&app, &vtt(4), &token).await;
     assert_eq!(status, StatusCode::OK, "{embedded}");
     assert_eq!(content_type, "text/vtt; charset=utf-8");
     assert!(embedded.starts_with("WEBVTT"), "{embedded}");
@@ -35686,7 +37316,7 @@ async fn b22_subtitle_vtt_converts_embedded_and_external_subtitles() {
         "{embedded}"
     );
 
-    let (status, _, body) = b22_get(&app, &vtt(3), &token).await;
+    let (status, _, body) = b22_get(&app, &vtt(0), &token).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(
         body.contains("External English") && !body.contains("Embedded"),
@@ -35694,13 +37324,13 @@ async fn b22_subtitle_vtt_converts_embedded_and_external_subtitles() {
     );
 
     // Windows-1252 text arrives as UTF-8; the format matches without case
-    let uri = format!("/Videos/{id}/{msid}/Subtitles/4/Stream.VTT");
+    let uri = format!("/Videos/{id}/{msid}/Subtitles/1/Stream.VTT");
     let (status, _, body) = b22_get(&app, &uri, &token).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body.contains("Grüße"), "{body}");
 
     // The item's own id, sent without dashes as clients do, names its primary source
-    let uri = format!("/Videos/{id}/{}/Subtitles/2/Stream.vtt", id.simple());
+    let uri = format!("/Videos/{id}/{}/Subtitles/4/Stream.vtt", id.simple());
     let (status, _, body) = b22_get(&app, &uri, &token).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body, embedded);
@@ -35714,11 +37344,12 @@ async fn b22_subtitle_vtt_converts_embedded_and_external_subtitles() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let cached = std::fs::read_to_string(cache.join(format!("v1-{msid}-2.vtt"))).unwrap();
+    let cached = std::fs::read_to_string(cache.join(format!("v1-{msid}-4.vtt"))).unwrap();
     let (stamp, text) = cached.split_once('\n').unwrap();
     let (hash, rest) = stamp.split_once('-').unwrap();
     assert_eq!(hash.len(), 16, "{stamp}");
-    assert_eq!(rest, format!("{}-{mtime}", meta.len()));
+    // ... and the stream in the file it was made from
+    assert_eq!(rest, format!("{}-{mtime}-m0:2", meta.len()));
     assert_eq!(text, embedded);
     let names: Vec<String> = std::fs::read_dir(&cache)
         .unwrap()
@@ -35750,7 +37381,8 @@ async fn b22_subtitle_vtt_moves_cues_back_by_the_start() {
     };
     // The same stream as SubRip, as a client with an srt subtitle profile asks for it, whole and
     // moved the same way
-    let srt = format!("/Videos/{id}/{msid}/Subtitles/2/Stream.srt");
+    // (the embedded subtitle is 4: the two external files come first)
+    let srt = format!("/Videos/{id}/{msid}/Subtitles/4/Stream.srt");
     let (status, content_type, body) = b22_get(&app, &srt, &token).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(content_type, "application/x-subrip; charset=utf-8");
@@ -35758,7 +37390,7 @@ async fn b22_subtitle_vtt_moves_cues_back_by_the_start() {
         body.contains("00:00:01,000 --> 00:00:02,000\nEmbedded one"),
         "{body}"
     );
-    let srt = format!("/Videos/{id}/{msid}/Subtitles/2/15000000/Stream.srt");
+    let srt = format!("/Videos/{id}/{msid}/Subtitles/4/15000000/Stream.srt");
     let (status, _, body) = b22_get(&app, &srt, &token).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(
@@ -35770,7 +37402,7 @@ async fn b22_subtitle_vtt_moves_cues_back_by_the_start() {
         "{body}"
     );
 
-    let (status, content_type, body) = b22_get(&app, &at(2, 15_000_000), &token).await;
+    let (status, content_type, body) = b22_get(&app, &at(4, 15_000_000), &token).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(content_type, "text/vtt; charset=utf-8");
     assert!(body.starts_with("WEBVTT"), "{body}");
@@ -35784,7 +37416,7 @@ async fn b22_subtitle_vtt_moves_cues_back_by_the_start() {
     );
 
     // An external file moves the same way
-    let (status, _, body) = b22_get(&app, &at(3, 15_000_000), &token).await;
+    let (status, _, body) = b22_get(&app, &at(0, 15_000_000), &token).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(
         body.contains("00:00:00.000 --> 00:00:00.500\nExternal English"),
@@ -35792,7 +37424,7 @@ async fn b22_subtitle_vtt_moves_cues_back_by_the_start() {
     );
 
     // After the last cue: the header alone
-    let (status, _, body) = b22_get(&app, &at(2, 50_000_000), &token).await;
+    let (status, _, body) = b22_get(&app, &at(4, 50_000_000), &token).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(
         body.starts_with("WEBVTT") && !body.contains("-->"),
@@ -35800,9 +37432,9 @@ async fn b22_subtitle_vtt_moves_cues_back_by_the_start() {
     );
 
     // A start of 0 is the whole subtitle
-    let whole = format!("/Videos/{id}/{msid}/Subtitles/2/Stream.vtt");
+    let whole = format!("/Videos/{id}/{msid}/Subtitles/4/Stream.vtt");
     let (_, _, whole) = b22_get(&app, &whole, &token).await;
-    let (status, _, body) = b22_get(&app, &at(2, 0), &token).await;
+    let (status, _, body) = b22_get(&app, &at(4, 0), &token).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body, whole);
 }
@@ -35899,10 +37531,12 @@ async fn b22_subtitle_vtt_strips_ass_blocks() {
         Dialogue: 0,0:00:03.00,0:00:04.00,Default,,0,0,0,,{\\i1}Plain{\\i0} {note}text\n";
     let ass_file = file.parent().unwrap().join("B22 Film.jpn.ass");
     std::fs::write(ass_file, script).unwrap();
+    // A rescan stores the new file after the others
+    r3gaps2_store_subtitles(&state, id).await;
     let app = app(state);
 
-    // The external files follow the embedded stream 2 in name order: eng 3, ger 4, jpn 5
-    let uri = format!("/Videos/{id}/{msid}/Subtitles/5/Stream.vtt");
+    // The external files come first: eng 0, ger 1, then jpn 2, which the rescan added
+    let uri = format!("/Videos/{id}/{msid}/Subtitles/2/Stream.vtt");
     let (status, _, body) = b22_get(&app, &uri, &token).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body.contains("Doom") && body.contains("Plain"), "{body}");
@@ -35922,8 +37556,8 @@ async fn b22_subtitle_vtt_cache_keeps_one_file_per_stream() {
     let eng = std::path::PathBuf::from(media_folder(&state, "b22-cache")).join("B22 Film.eng.srt");
     let app = app(state);
 
-    // External English is stream 3
-    let uri = format!("/Videos/{id}/{msid}/Subtitles/3/Stream.vtt");
+    // External English is stream 0
+    let uri = format!("/Videos/{id}/{msid}/Subtitles/0/Stream.vtt");
     let (status, _, body) = b22_get(&app, &uri, &token).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body.contains("External English"), "{body}");
@@ -35971,8 +37605,8 @@ async fn b22_subtitle_vtt_refuses_a_huge_file() {
         .unwrap();
     let app = app(state);
 
-    // The WebVTT of stream 3 and the file itself are both too large
-    let vtt_uri = format!("/Videos/{id}/{msid}/Subtitles/3/Stream.vtt");
+    // The WebVTT of stream 0 and the file itself are both too large
+    let vtt_uri = format!("/Videos/{id}/{msid}/Subtitles/0/Stream.vtt");
     let (vtt, _, _) = b22_get(&app, &vtt_uri, &token).await;
     let (file, _, _) = b22_get(&app, &format!("/Videos/{id}/Subtitles/0/Stream"), &token).await;
     assert_eq!(
@@ -36236,6 +37870,7 @@ async fn r3playback_item_streams_list_external_subtitle_files() {
         &[("video", "h264"), ("audio", "aac"), ("subtitle", "subrip")],
     )
     .await;
+    r3gaps2_store_subtitles(&state, id).await;
     let app = app(state);
 
     let external = |streams: &serde_json::Value| -> Vec<(i64, String)> {
@@ -36252,8 +37887,9 @@ async fn r3playback_item_streams_list_external_subtitle_files() {
             })
             .collect()
     };
+    // Numbered first, as Jellyfin numbers the files the scan found
     let srt = folder.join("R3 Film.en.srt").to_str().unwrap().to_string();
-    let expected = vec![(3, srt)];
+    let expected = vec![(0, srt)];
 
     for uri in [
         format!("/Items/{id}"),
@@ -36314,7 +37950,7 @@ async fn b22_playback_info_lists_external_subtitles() {
     b22_insert_source(&state, id, &file, "mkv", streams).await;
     let app = app(state);
 
-    // The files beside the video follow its streams, in name order
+    // The files beside the video come first, in name order, as Jellyfin numbers them
     let uri = format!("/Videos/{id}/PlaybackInfo");
     let (status, body) = send(&app, request("GET", &uri, Some(&token), None)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -36324,10 +37960,11 @@ async fn b22_playback_info_lists_external_subtitles() {
         .map(|s| s["Index"].as_i64().unwrap())
         .collect();
     assert_eq!(indexes, [0, 1, 2, 3, 4], "{body}");
-    assert_eq!(streams[2]["IsExternal"], false);
+    assert_eq!(streams[4]["IsExternal"], false);
+    assert_eq!(streams[4]["Codec"], "subrip");
     for (stream, codec, language, path) in [
-        (&streams[3], "ass", None, &ass),
-        (&streams[4], "srt", Some("eng"), &srt),
+        (&streams[0], "ass", None, &ass),
+        (&streams[1], "srt", Some("eng"), &srt),
     ] {
         assert_eq!(stream["CodecType"], "subtitle", "{stream}");
         assert_eq!(stream["Type"], "Subtitle", "{stream}");
@@ -37435,14 +39072,21 @@ async fn b20_defaults_after_rescan(
     before: serde_json::Value,
     after: serde_json::Value,
 ) -> B20Defaults {
+    // The German tracks, as a client numbers them: with the German subtitle an external file,
+    // Jellyfin numbers it 0 and the embedded streams after it
+    let external = before
+        .as_array()
+        .is_some_and(|streams| streams.iter().any(|s| s["IsExternal"] == true));
+    let (audio, subtitle) = if external { (3, 0) } else { (2, 4) };
     let item = b20_movie(state, name, before).await;
     let body = serde_json::json!({
-        "ItemId": item, "PositionTicks": 0, "AudioStreamIndex": 2, "SubtitleStreamIndex": 4,
+        "ItemId": item, "PositionTicks": 0, "AudioStreamIndex": audio,
+        "SubtitleStreamIndex": subtitle,
     });
     b20_report(app, token, "/Progress", body).await;
     assert_eq!(
         b20_only_defaults(app, token, item).await,
-        b20_both(2, 4),
+        b20_both(audio, subtitle),
         "{name}: before the rescan"
     );
     rustyfin_db::repo_media_source::delete_media_sources(&state.db, &item)
@@ -37529,13 +39173,13 @@ async fn b20_rescan_offers_only_the_chosen_streams() {
             "External",
             external("/subs/B20 Ext.ger.srt"),
             external("/subs/B20 Ext.fre.srt"),
-            (Some(serde_json::json!(2)), None),
+            (Some(serde_json::json!(3)), None),
         ),
         (
             "External Moved",
             external("/subs/B20 Ext.ger.srt"),
             external("/elsewhere/B20 Ext.ger.srt"),
-            kept.clone(),
+            b20_both(3, 0),
         ),
     ];
     let mut wrong = Vec::new();
@@ -42312,7 +43956,8 @@ async fn b20_import_metadata_replaces_with_jellyfins() {
     );
     assert_eq!(b20_fields(&w.state, m.show).await, b20_show_fields());
     assert_eq!(b20_fields(&w.state, m.e1).await, b20_e1_fields());
-    let e3 = serde_json::json!({ "sort_name": "show 1x03" });
+    // An episode's sort name is Jellyfin's: season and episode number, then the name
+    let e3 = serde_json::json!({ "sort_name": "001 - 0003 - Show 1x03" });
     assert_eq!(
         b20_fields(&w.state, m.e3).await,
         b20_expect("Show 1x03", e3),
@@ -43537,6 +45182,7 @@ async fn j2_subtitles_get_deliveries() {
         "1\n00:00:01,000 --> 00:00:02,000\nJ2 cue\n",
     )
     .unwrap();
+    r3gaps2_store_subtitles(&state, item).await;
     let app = app(state);
     let (token, _) = g2_login_device(&app, "j2-subs", "j2-pass", "j2-device")
         .await
@@ -43546,9 +45192,10 @@ async fn j2_subtitles_get_deliveries() {
     let (sources, _) = j2_play(&app, "POST", &uri, &token, Some(body)).await;
     let source = &sources[0];
 
-    // The file beside the video is the default subtitle; Chrome shows it over the direct play
+    // The file beside the video is the default subtitle; Chrome shows it over the direct play.
+    // Jellyfin numbers it first (0), and the embedded streams after it (1, 2, 3).
     assert_eq!(source["SupportsDirectPlay"], true);
-    assert_eq!(source["DefaultSubtitleStreamIndex"], 3);
+    assert_eq!(source["DefaultSubtitleStreamIndex"], 0);
     let streams = source["MediaStreams"]
         .as_array()
         .cloned()
@@ -43559,7 +45206,7 @@ async fn j2_subtitles_get_deliveries() {
             .find(|s| s["Index"] == index)
             .unwrap_or_else(|| panic!("no stream {index}"))
     };
-    for index in [2, 3] {
+    for index in [3, 0] {
         let subtitle = stream(index);
         assert_eq!(subtitle["DeliveryMethod"], "External", "stream {index}");
         assert_eq!(subtitle["IsExternalUrl"], false, "stream {index}");
@@ -43568,7 +45215,7 @@ async fn j2_subtitles_get_deliveries() {
             format!("/Videos/{item}/{source_id}/Subtitles/{index}/0/Stream.vtt?ApiKey=<token>");
         assert_eq!(url, expected, "stream {index}");
     }
-    for index in [0, 1] {
+    for index in [1, 2] {
         assert!(
             stream(index).get("DeliveryMethod").is_none(),
             "stream {index}"
@@ -43576,7 +45223,7 @@ async fn j2_subtitles_get_deliveries() {
     }
 
     // The external file loads as WebVTT without a header
-    let url = stream(3)["DeliveryUrl"].as_str().unwrap_or_default();
+    let url = stream(0)["DeliveryUrl"].as_str().unwrap_or_default();
     let (status, _, data) = g4_get(&app, url).await;
     assert_eq!(status, StatusCode::OK);
     let text = String::from_utf8_lossy(&data);
@@ -43584,6 +45231,10 @@ async fn j2_subtitles_get_deliveries() {
         text.starts_with("WEBVTT") && text.contains("J2 cue"),
         "{text}"
     );
+    // The embedded stream, now 3, is stream 2 of the file
+    let url = stream(3)["DeliveryUrl"].as_str().unwrap_or_default();
+    let (status, _, _) = g4_get(&app, url).await;
+    assert_ne!(status, StatusCode::NOT_FOUND, "{url}");
 }
 
 #[tokio::test]
@@ -44039,7 +45690,8 @@ async fn r3decisions_universal_audio_plays_the_file_or_the_hls_transcode() {
     assert_eq!(status, StatusCode::FOUND);
     assert!(location.unwrap().contains("ContainerBitrateExceedsLimit"));
 
-    // A progressive transcode isn't available: 400 that says so, not the FLAC as it is
+    // A progressive transcode is made (r3gaps2_progressive_audio_and_video_transcodes plays one);
+    // the 1000 zero bytes here aren't audio, so ffmpeg fails, and says so
     let (status, _, body) = r3decisions_get(
         &app,
         &format!(
@@ -44049,19 +45701,26 @@ async fn r3decisions_universal_audio_plays_the_file_or_the_hls_transcode() {
         &token,
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert!(String::from_utf8_lossy(&body).contains("HLS only"));
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert!(String::from_utf8_lossy(&body).contains("Transcode failed"));
 
     // stream.{container} answered 500, as its second path parameter failed the extractor. An MP3
-    // request for the FLAC track is a 400 now; the track's own codec, or static, gets the file.
+    // request for the FLAC track is a progressive transcode now; the track's own codec, or
+    // static, gets the file.
     let (status, _, body) = r3decisions_get(
         &app,
         &format!("/Audio/{song}/stream.mp3?AudioCodec=mp3&AudioBitrate=192000"),
         &token,
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert!(String::from_utf8_lossy(&body).contains("HLS only"));
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(String::from_utf8_lossy(&body).contains("Transcode failed"));
+    assert!(!transcodes.is_active(song).await, "a failed job is gone");
     for uri in [
         format!("/Audio/{song}/stream.flac"),
         format!("/Audio/{song}/stream.mp3?static=true"),
@@ -44071,6 +45730,423 @@ async fn r3decisions_universal_audio_plays_the_file_or_the_hls_transcode() {
         assert_eq!(status, StatusCode::OK, "{uri}");
         assert_eq!(body.len(), 1000, "{uri}");
     }
+}
+
+/// A library whose folders are links to media outside it (as a library of chosen films linked
+/// from a media share is): a static read with a byte range gets the file, with the default link
+/// setting; refusing links out of libraries refuses it.
+#[cfg(unix)]
+#[tokio::test]
+async fn r3gaps2_static_reads_follow_links_out_of_the_library() {
+    let state = test_state().await;
+    add_user(&state, "r3g2-link", "r3g2-pass", true).await;
+    let outside = std::env::temp_dir().join(format!("r3g2-share-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(outside.join("Film (2020)")).unwrap();
+    let bytes: Vec<u8> = (0..4000u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(outside.join("Film (2020)/Film (2020).mkv"), &bytes).unwrap();
+    std::fs::write(outside.join("Song.flac"), &bytes).unwrap();
+    // The library: a folder link and a file link into the share
+    let library = std::path::PathBuf::from(media_folder(&state, "r3g2-linked"));
+    std::os::unix::fs::symlink(outside.join("Film (2020)"), library.join("Film (2020)")).unwrap();
+    std::os::unix::fs::symlink(outside.join("Song.flac"), library.join("Song.flac")).unwrap();
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: "R3G2 linked".to_string(),
+        content_type: rustyfin_model::library::LibraryContentType::Movies,
+        paths: vec![library.to_str().unwrap().to_string()],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    let mut ids = Vec::new();
+    for (media_type, path) in [
+        ("Movie", library.join("Film (2020)/Film (2020).mkv")),
+        ("Audio", library.join("Song.flac")),
+    ] {
+        let id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO media_items (id, library_id, name, media_type, path) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(id.to_string())
+        .bind(lib.id.to_string())
+        .bind("linked")
+        .bind(media_type)
+        .bind(path.to_str().unwrap())
+        .execute(&state.db)
+        .await
+        .unwrap();
+        ids.push(id);
+    }
+    let config = state.config.clone();
+    let app = app(state);
+    let (token, _) = g2_login_device(&app, "r3g2-link", "r3g2-pass", "r3g2-device")
+        .await
+        .unwrap();
+
+    let uris = [
+        format!("/Videos/{}/stream.mkv?static=true", ids[0]),
+        format!("/Videos/{}/stream", ids[0]),
+        format!("/Audio/{}/stream?static=true", ids[1]),
+    ];
+    for uri in &uris {
+        let (status, range, body) = g4_get_range(&app, uri, &token, "bytes=1000-1999").await;
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT, "{uri}");
+        assert_eq!(range.as_deref(), Some("bytes 1000-1999/4000"), "{uri}");
+        assert_eq!(body, bytes[1000..2000], "{uri}");
+    }
+
+    // The stricter setting refuses links that leave the libraries
+    config.write().await.refuse_links_out_of_libraries = true;
+    let (status, _, _) = g4_get_range(&app, &uris[0], &token, "bytes=0-9").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let _ = std::fs::remove_dir_all(&outside);
+}
+
+/// The user policy on the progressive routes, as on the HLS route: a re-encode needs the
+/// transcoding switch (403), a copy needs remuxing (403), a hidden library's item is 404 on the
+/// stream routes and leaves /Items, and a remote caller's bitrate limit caps the decision.
+#[tokio::test]
+async fn r3gaps2_progressive_routes_follow_the_user_policy() {
+    let state = test_state().await;
+    add_user(&state, "r3g2-admin", "r3g2-pass", true).await;
+    let kid = add_user(&state, "r3g2-kid", "r3g2-pass", false).await;
+    let (song, _, flac) = j2_item(
+        &state,
+        "r3g2-psong",
+        "Audio",
+        "flac",
+        j2_song("flac", 900_000),
+    )
+    .await;
+    if !r3gaps2_make_media(
+        &flac,
+        &["sine=frequency=440:sample_rate=48000:duration=5"],
+        &["-ac", "2", "-c:a", "flac"],
+    ) {
+        return;
+    }
+    let (movie, _, mkv) = j2_item(
+        &state,
+        "r3g2-pmovie",
+        "Movie",
+        "mkv",
+        serde_json::json!([
+            {"Index": 0, "Codec": "mpeg4", "CodecType": "Video", "Width": 160, "Height": 120},
+            {"Index": 1, "Codec": "mp2", "CodecType": "Audio", "Channels": 1, "IsDefault": true},
+        ]),
+    )
+    .await;
+    assert!(r3gaps2_make_media(
+        &mkv,
+        &["testsrc=size=160x120:rate=10:duration=2", "sine=duration=2"],
+        &["-c:v", "mpeg4", "-c:a", "mp2"],
+    ));
+    let song_library: String =
+        sqlx::query_scalar("SELECT library_id FROM media_items WHERE id = ?")
+            .bind(song.to_string())
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+    let local = app(state.clone());
+    let remote = remote_app(state);
+    let (admin, _) = g2_login_device(&local, "r3g2-admin", "r3g2-pass", "r3g2-a")
+        .await
+        .unwrap();
+    let (token, _) = g2_login_device(&local, "r3g2-kid", "r3g2-pass", "r3g2-k")
+        .await
+        .unwrap();
+    let set_policy = |policy: serde_json::Value| {
+        let local = local.clone();
+        let admin = admin.clone();
+        async move {
+            let uri = format!("/Users/{kid}/Policy");
+            let (status, body) =
+                send(&local, request("POST", &uri, Some(&admin), Some(policy))).await;
+            assert!(status.is_success(), "{uri}: {status} {body}");
+        }
+    };
+    let status_of = |app: &axum::Router, method: &str, uri: String| {
+        let app = app.clone();
+        let token = token.clone();
+        let method = method.to_string();
+        async move { r3decisions_send(&app, &method, &uri, &token).await.0.0 }
+    };
+    let mp3 = format!("/Audio/{song}/stream.mp3?AudioCodec=mp3");
+    let universal = format!(
+        "/Audio/{song}/universal?Container=mp3&TranscodingContainer=mp3\
+         &TranscodingProtocol=http&AudioCodec=mp3"
+    );
+    let video = format!("/Videos/{movie}/stream.ts?static=false&VideoCodec=h264&AudioCodec=aac");
+    let flac_copy = format!("/Audio/{song}/stream.flac?AudioCodec=flac&AudioBitrate=100000000");
+
+    // No transcoding: every re-encode is 403, GET and HEAD; the file itself still plays
+    set_policy(serde_json::json!({
+        "EnableAudioPlaybackTranscoding": false,
+        "EnableVideoPlaybackTranscoding": false,
+    }))
+    .await;
+    for (method, uri) in [
+        ("GET", &mp3),
+        ("HEAD", &mp3),
+        ("GET", &universal),
+        ("GET", &video),
+    ] {
+        assert_eq!(
+            status_of(&local, method, uri.clone()).await,
+            StatusCode::FORBIDDEN,
+            "{method} {uri}"
+        );
+    }
+    assert_eq!(
+        status_of(&local, "GET", format!("/Audio/{song}/stream?static=true")).await,
+        StatusCode::OK
+    );
+
+    // No remuxing: a copy is 403, an encode plays
+    set_policy(serde_json::json!({
+        "EnableAudioPlaybackTranscoding": true,
+        "EnableVideoPlaybackTranscoding": true,
+        "EnablePlaybackRemuxing": false,
+    }))
+    .await;
+    assert_eq!(
+        status_of(&local, "GET", flac_copy.clone()).await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(status_of(&local, "GET", mp3.clone()).await, StatusCode::OK);
+
+    // A remote caller's limit caps the universal decision: the FLAC it would play as it is is
+    // transcoded to MP3 within the limit
+    let flac_universal = format!(
+        "/Audio/{song}/universal?Container=flac,mp3&TranscodingContainer=mp3\
+         &TranscodingProtocol=http&AudioCodec=mp3&MaxStreamingBitrate=140000000"
+    );
+    let ((_, _, _), content_type) = r3decisions_send(&remote, "GET", &flac_universal, &token).await;
+    assert_eq!(content_type.as_deref(), Some("audio/flac"), "no limit yet");
+    set_policy(serde_json::json!({
+        "EnablePlaybackRemuxing": true,
+        "RemoteClientBitrateLimit": 128000,
+    }))
+    .await;
+    let ((status, _, body), content_type) =
+        r3decisions_send(&remote, "GET", &flac_universal, &token).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(content_type.as_deref(), Some("audio/mpeg"));
+    assert!(body.starts_with(b"ID3") || body.starts_with(&[0xFF]));
+    let ((_, _, _), content_type) = r3decisions_send(&local, "GET", &flac_universal, &token).await;
+    assert_eq!(
+        content_type.as_deref(),
+        Some("audio/flac"),
+        "local callers have no limit"
+    );
+
+    // Library access: the song's library hidden, its streams are 404 and /Items leaves it out
+    set_policy(serde_json::json!({ "EnableAllFolders": false, "EnabledFolders": [] })).await;
+    for uri in [&mp3, &universal] {
+        assert_eq!(
+            status_of(&local, "GET", uri.clone()).await,
+            StatusCode::NOT_FOUND,
+            "{uri}"
+        );
+    }
+    let (status, body) = send(
+        &local,
+        request(
+            "GET",
+            "/Items?Recursive=true&Fields=MediaSources",
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !body.to_string().contains(&song.to_string()),
+        "a hidden item leaves /Items"
+    );
+    set_policy(serde_json::json!({ "EnableAllFolders": false, "EnabledFolders": [song_library] }))
+        .await;
+    let (_, body) = send(
+        &local,
+        request(
+            "GET",
+            "/Items?Recursive=true&Fields=MediaSources&IncludeItemTypes=Audio",
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    let items = body["Items"].as_array().cloned().unwrap_or_default();
+    assert_eq!(items.len(), 1, "{body}");
+    assert!(
+        items[0]["MediaSources"]
+            .as_array()
+            .is_some_and(|s| !s.is_empty())
+    );
+}
+
+/// Writes a real media file over `file` with ffmpeg's lavfi `inputs` and output `args`. False
+/// when ffmpeg isn't there.
+fn r3gaps2_make_media(file: &std::path::Path, inputs: &[&str], args: &[&str]) -> bool {
+    let mut command = std::process::Command::new("ffmpeg");
+    command.args(["-y", "-hide_banner", "-loglevel", "error"]);
+    for input in inputs {
+        command.args(["-f", "lavfi", "-i", input]);
+    }
+    command.args(args).arg(file);
+    match command.status() {
+        Ok(status) => {
+            assert!(
+                status.success(),
+                "ffmpeg could not write {}",
+                file.display()
+            );
+            true
+        }
+        Err(_) => {
+            eprintln!("skipped: no ffmpeg");
+            false
+        }
+    }
+}
+
+/// Progressive (HTTP) transcodes, as Jellyfin's progressive jobs: FLAC to MP3 for an HTTP-only
+/// universal client and for `stream.mp3`, a chunked body of MP3 frames; HEAD starts nothing;
+/// the job is registered, a stop by PlaySessionId ends the body, and a client that goes away
+/// kills ffmpeg. `/Videos/{id}/stream.ts?static=false` sends MPEG-TS.
+#[tokio::test]
+async fn r3gaps2_progressive_audio_and_video_transcodes() {
+    let state = test_state().await;
+    add_user(&state, "r3g2-audio", "r3g2-pass", true).await;
+    let (song, _, flac) = j2_item(
+        &state,
+        "r3g2-song",
+        "Audio",
+        "flac",
+        j2_song("flac", 900_000),
+    )
+    .await;
+    // Two minutes of tone: more MP3 than a pipe holds, so ffmpeg runs until it is read or killed
+    if !r3gaps2_make_media(
+        &flac,
+        &["sine=frequency=440:sample_rate=48000:duration=120"],
+        &["-ac", "2", "-c:a", "flac"],
+    ) {
+        return;
+    }
+    let (movie, _, mkv) = j2_item(
+        &state,
+        "r3g2-movie",
+        "Movie",
+        "mkv",
+        serde_json::json!([
+            {"Index": 0, "Codec": "mpeg4", "CodecType": "Video", "Width": 160, "Height": 120},
+            {"Index": 1, "Codec": "mp2", "CodecType": "Audio", "Channels": 1, "IsDefault": true},
+        ]),
+    )
+    .await;
+    assert!(r3gaps2_make_media(
+        &mkv,
+        &["testsrc=size=160x120:rate=10:duration=2", "sine=duration=2"],
+        &["-c:v", "mpeg4", "-c:a", "mp2"],
+    ));
+    let transcodes = state.transcode_manager.clone();
+    let app = app(state);
+    let (token, _) = g2_login_device(&app, "r3g2-audio", "r3g2-pass", "r3g2-device")
+        .await
+        .unwrap();
+    let is_mp3 = |body: &[u8]| body.starts_with(b"ID3") || body.starts_with(&[0xFF]);
+
+    // HEAD: the type, and no job
+    let universal = format!(
+        "/Audio/{song}/universal?Container=mp3&TranscodingContainer=mp3\
+         &TranscodingProtocol=http&AudioCodec=mp3&MaxStreamingBitrate=192000\
+         &PlaySessionId=r3g2-ps"
+    );
+    let ((status, _, _), content_type) = r3decisions_send(&app, "HEAD", &universal, &token).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(content_type.as_deref(), Some("audio/mpeg"));
+    assert!(
+        !transcodes.is_active(song).await,
+        "HEAD started a transcode"
+    );
+
+    // GET: MP3 as it is made; the job is registered and a stop by PlaySessionId ends the body
+    let request = |uri: &str| {
+        Request::builder()
+            .uri(uri)
+            .header("Authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap()
+    };
+    let resp = app.clone().oneshot(request(&universal)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()["content-type"], "audio/mpeg");
+    assert!(resp.headers().get("content-length").is_none(), "chunked");
+    let mut body = resp.into_body();
+    let first = body.frame().await.unwrap().unwrap().into_data().unwrap();
+    assert!(is_mp3(&first), "{:?}", &first[..4]);
+    assert!(transcodes.is_active(song).await, "the job is registered");
+    let stop = Request::builder()
+        .method("DELETE")
+        .uri("/Videos/ActiveEncodings?PlaySessionId=r3g2-ps&DeviceId=r3g2-device")
+        .header("Authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(stop).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+    let rest = tokio::time::timeout(std::time::Duration::from_secs(10), body.collect())
+        .await
+        .expect("the body ends with the stop");
+    assert!(rest.is_ok());
+    assert!(!transcodes.is_active(song).await);
+
+    // stream.mp3: the same, and a client that goes away kills ffmpeg
+    let resp = app
+        .clone()
+        .oneshot(request(&format!(
+            "/Audio/{song}/stream.mp3?AudioCodec=mp3&AudioBitrate=192000"
+        )))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()["content-type"], "audio/mpeg");
+    let mut body = resp.into_body();
+    let first = body.frame().await.unwrap().unwrap().into_data().unwrap();
+    assert!(is_mp3(&first));
+    assert!(transcodes.is_active(song).await);
+    drop(body);
+    let mut gone = false;
+    for _ in 0..50 {
+        if !transcodes.is_active(song).await {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(gone, "ffmpeg outlived its client");
+
+    // The track's own codec without limits, or static, is still the file
+    let (status, _, body) =
+        r3decisions_get(&app, &format!("/Audio/{song}/stream.flac"), &token).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.len() as u64, std::fs::metadata(&flac).unwrap().len());
+
+    // Video: static=false transcodes; without static and codecs, the file
+    let (status, _, body) = r3decisions_get(
+        &app,
+        &format!("/Videos/{movie}/stream.ts?static=false&VideoCodec=h264&AudioCodec=aac"),
+        &token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.first(), Some(&0x47), "MPEG-TS sync byte");
+    let (status, _, body) = r3decisions_get(&app, &format!("/Videos/{movie}/stream"), &token).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.len() as u64, std::fs::metadata(&mkv).unwrap().len());
+    assert!(!transcodes.is_active(movie).await);
 }
 
 #[tokio::test]

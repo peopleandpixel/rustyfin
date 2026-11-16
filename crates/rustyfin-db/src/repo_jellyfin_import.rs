@@ -335,6 +335,11 @@ pub struct ItemMetadata {
     pub imdb_id: Option<String>,
     pub lock_data: bool,
     pub locked_fields: String,
+    /// The item's type, numbers and forced sort name, to make its sort name.
+    pub media_type: String,
+    pub parent_index_number: Option<i32>,
+    pub index_number: Option<i32>,
+    pub forced_sort_name: Option<String>,
 }
 
 /// An `item_people` row with its person's name (spec 5.7), in the order the item DTOs show them.
@@ -381,6 +386,8 @@ pub struct ItemExtras {
     pub imdb_id: Option<String>,
     pub lock_data: bool,
     pub locked_fields: String,
+    /// Jellyfin's ForcedSortName.
+    pub forced_sort_name: Option<String>,
 }
 
 /// A media item's metadata columns after the import (spec 5.4): every value the UPDATE binds.
@@ -400,6 +407,9 @@ pub struct ItemWrite {
     pub tags: String,
     pub tmdb_id: Option<i64>,
     pub tvdb_id: Option<i64>,
+    /// Jellyfin's ForcedSortName as written, when the sort name is written from it: it becomes
+    /// the item's forced sort name.
+    pub forced_sort_name: Option<String>,
 }
 
 /// An item's extras columns the import sets (spec 5.4); the lock columns are never written.
@@ -492,7 +502,8 @@ pub async fn metadata_state(pool: &SqlitePool) -> Result<MetadataState, sqlx::Er
         "SELECT m.id, m.name, m.sort_name, m.overview, m.tagline, m.official_rating, \
          m.community_rating, m.premiere_date, m.end_date, m.production_year, m.genres, m.tags, \
          m.tmdb_id, m.tvdb_id, e.original_title, e.critic_rating, e.imdb_id, \
-         COALESCE(e.lock_data, 0) AS lock_data, COALESCE(e.locked_fields, '') AS locked_fields \
+         COALESCE(e.lock_data, 0) AS lock_data, COALESCE(e.locked_fields, '') AS locked_fields, \
+         m.media_type, m.parent_index_number, m.index_number, e.forced_sort_name \
          FROM media_items m LEFT JOIN item_metadata_extras e ON e.item_id = m.id",
     )
     .fetch_all(pool)
@@ -536,20 +547,31 @@ pub async fn metadata_state(pool: &SqlitePool) -> Result<MetadataState, sqlx::Er
 
 /// An item's extras (spec 5.5, 5.6), or None when it has no `item_metadata_extras` row.
 pub async fn item_extras(pool: &SqlitePool, item: Uuid) -> Result<Option<ItemExtras>, sqlx::Error> {
-    let row = sqlx::query_as::<_, (Option<String>, Option<f64>, Option<String>, bool, String)>(
-        "SELECT original_title, critic_rating, imdb_id, lock_data, locked_fields \
-         FROM item_metadata_extras WHERE item_id = ?",
+    type Row = (
+        Option<String>,
+        Option<f64>,
+        Option<String>,
+        bool,
+        String,
+        Option<String>,
+    );
+    let row = sqlx::query_as::<_, Row>(
+        "SELECT original_title, critic_rating, imdb_id, lock_data, locked_fields, \
+         forced_sort_name FROM item_metadata_extras WHERE item_id = ?",
     )
     .bind(item.to_string())
     .fetch_optional(pool)
     .await?;
     Ok(row.map(
-        |(original_title, critic_rating, imdb_id, lock_data, locked_fields)| ItemExtras {
-            original_title,
-            critic_rating,
-            imdb_id,
-            lock_data,
-            locked_fields,
+        |(original_title, critic_rating, imdb_id, lock_data, locked_fields, forced_sort_name)| {
+            ItemExtras {
+                original_title,
+                critic_rating,
+                imdb_id,
+                lock_data,
+                locked_fields,
+                forced_sort_name,
+            }
         },
     ))
 }
@@ -590,6 +612,16 @@ pub async fn write_metadata(pool: &SqlitePool, writes: &MetadataWrites) -> Resul
         .bind(item.id.to_string())
         .execute(&mut *tx)
         .await?;
+        if let Some(forced) = &item.forced_sort_name {
+            sqlx::query(
+                "INSERT INTO item_metadata_extras (item_id, forced_sort_name) VALUES (?, ?) \
+                 ON CONFLICT(item_id) DO UPDATE SET forced_sort_name = excluded.forced_sort_name",
+            )
+            .bind(item.id.to_string())
+            .bind(forced)
+            .execute(&mut *tx)
+            .await?;
+        }
     }
     for extras in &writes.extras {
         sqlx::query(

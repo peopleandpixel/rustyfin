@@ -1011,7 +1011,7 @@ async fn scan_flat_library(
             let item = MediaItem {
                 id: Uuid::new_v4(),
                 name: file_name.clone(),
-                sort_name: Some(file_name.to_lowercase()),
+                sort_name: auto_sort_name(media_type, &file_name, None, None),
                 overview: None,
                 media_type,
                 path: file_path.clone(),
@@ -1069,7 +1069,7 @@ async fn scan_flat_library(
                 let item = MediaItem {
                     id: Uuid::new_v4(),
                     name: group.title.clone(),
-                    sort_name: Some(group.title.to_lowercase()),
+                    sort_name: auto_sort_name(MediaType::Movie, &group.title, None, None),
                     overview: None,
                     media_type: MediaType::Movie,
                     path,
@@ -1297,7 +1297,7 @@ async fn scan_tv_library(
                 };
                 let series_item = MediaItem {
                     id,
-                    sort_name: Some(name.to_lowercase()),
+                    sort_name: auto_sort_name(MediaType::Series, &name, None, None),
                     name,
                     overview: None,
                     media_type: MediaType::Series,
@@ -1556,8 +1556,13 @@ async fn scan_tv_library(
                 let date_created = date_added(Path::new(&path)).await;
                 let item = MediaItem {
                     id: Uuid::new_v4(),
+                    sort_name: auto_sort_name(
+                        MediaType::Episode,
+                        &name,
+                        group.parent_index_number,
+                        group.index_number,
+                    ),
                     name: name.clone(),
-                    sort_name: Some(name.to_lowercase()),
                     overview: None,
                     media_type: MediaType::Episode,
                     path,
@@ -1715,6 +1720,68 @@ fn artists_and_album_artist(
             (artists, album_artist)
         }
         None => (Vec::new(), None),
+    }
+}
+
+fn is_audio_file(path: &Path) -> bool {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    AUDIO_EXTENSIONS.contains(&ext.as_str())
+}
+
+/// Probes files ahead of a loop that needs their results one by one, in a given order: up to
+/// `ahead` probes run at once (each under the global probe limit), and `next` hands back the
+/// results in the order of the files, so the loop stores exactly what probing each file itself
+/// would. Probes still running when it is dropped are stopped.
+struct ProbeAhead {
+    paths: std::vec::IntoIter<String>,
+    running: std::collections::VecDeque<(
+        String,
+        tokio::task::JoinHandle<Result<probe::ProbeResult, probe::ProbeError>>,
+    )>,
+}
+
+impl ProbeAhead {
+    fn new(paths: Vec<String>, ahead: usize) -> Self {
+        let mut this = Self {
+            paths: paths.into_iter(),
+            running: std::collections::VecDeque::new(),
+        };
+        for _ in 0..ahead.max(1) {
+            this.start_next();
+        }
+        this
+    }
+
+    fn start_next(&mut self) {
+        if let Some(path) = self.paths.next() {
+            let handle = tokio::spawn(probe::probe_file_bounded(path.clone()));
+            self.running.push_back((path, handle));
+        }
+    }
+
+    /// The probe of `path`, the next file in order. A file out of order is probed on its own.
+    async fn next(&mut self, path: &str) -> Result<probe::ProbeResult, probe::ProbeError> {
+        if self.running.front().is_some_and(|(p, _)| p == path)
+            && let Some((_, handle)) = self.running.pop_front()
+        {
+            self.start_next();
+            if let Ok(result) = handle.await {
+                return result;
+            }
+        }
+        probe::probe_file(path).await
+    }
+}
+
+impl Drop for ProbeAhead {
+    fn drop(&mut self) {
+        for (_, handle) in &self.running {
+            handle.abort();
+        }
     }
 }
 
@@ -1908,6 +1975,16 @@ async fn scan_music_library(
 
         let mut scanned_files = 0u32;
         let mut skipped_ext = 0u32;
+        // The new audio files, which the loop below reads in this order, are probed ahead of it.
+        let mut probes = ProbeAhead::new(
+            files
+                .iter()
+                .filter(|f| is_audio_file(f))
+                .map(|f| f.to_string_lossy().to_string())
+                .filter(|f| !existing_paths.contains(f))
+                .collect(),
+            probe::max_probes(),
+        );
         for file_path_buf in files {
             // Every file the loop visits counts, skipped ones included.
             ticket.advance(1);
@@ -1974,8 +2051,8 @@ async fn scan_music_library(
                 artist_dir,
             } = music_dirs(path, &file_path_buf);
 
-            // First, probe the file synchronously to get audio tags for metadata
-            let probe_result = probe::probe_file(&file_path).await;
+            // First, probe the file to get audio tags for metadata
+            let probe_result = probes.next(&file_path).await;
             let (
                 _has_audio_tags,
                 artist_name_from_tag,
@@ -2035,7 +2112,7 @@ async fn scan_music_library(
                     let artist_item = MediaItem {
                         id,
                         name: artist_name.clone(),
-                        sort_name: Some(artist_name.to_lowercase()),
+                        sort_name: auto_sort_name(MediaType::MusicArtist, artist_name, None, None),
                         overview: None,
                         media_type: MediaType::MusicArtist,
                         path: artist_dir.clone(),
@@ -2077,7 +2154,12 @@ async fn scan_music_library(
                 let album_item = MediaItem {
                     id,
                     name: effective_album_name.clone(),
-                    sort_name: Some(effective_album_name.to_lowercase()),
+                    sort_name: auto_sort_name(
+                        MediaType::MusicAlbum,
+                        &effective_album_name,
+                        None,
+                        None,
+                    ),
                     overview: None,
                     media_type: MediaType::MusicAlbum,
                     path: album_dir.clone(),
@@ -2140,10 +2222,16 @@ async fn scan_music_library(
                 continue;
             }
 
+            let parent_index_number = disc_from_tag.or(disc_from_dir);
             let item = MediaItem {
                 id: Uuid::new_v4(),
+                sort_name: auto_sort_name(
+                    MediaType::Audio,
+                    &item_name,
+                    parent_index_number,
+                    track_number,
+                ),
                 name: item_name,
-                sort_name: Some(file_name.to_lowercase()),
                 overview: None,
                 media_type: MediaType::Audio,
                 path: file_path_buf.to_string_lossy().to_string(),
@@ -2157,7 +2245,7 @@ async fn scan_music_library(
                 premiere_date: None,
                 runtime_ticks: None,
                 index_number: track_number,
-                parent_index_number: disc_from_tag.or(disc_from_dir),
+                parent_index_number,
                 media_sources: Vec::new(),
                 ..MediaItem::default_dto_fields()
             };
@@ -2715,9 +2803,22 @@ fn parse_season_number(name: &str, series_folder: &str) -> Option<i32> {
     naming::is_specials_folder(name, series_folder).then_some(0)
 }
 
-/// The sort name that the scan gives a season numbered `number`.
-pub(crate) fn season_sort_name(number: Option<i32>) -> String {
-    format!("season {:04}", number.unwrap_or(1))
+pub(crate) use rustyfin_model::sort_name::season_sort_name;
+
+/// The sort name Jellyfin makes for a new item, with the server's sort rules.
+pub(crate) fn auto_sort_name(
+    media_type: MediaType,
+    name: &str,
+    parent_index_number: Option<i32>,
+    index_number: Option<i32>,
+) -> Option<String> {
+    Some(rustyfin_model::sort_name::item_sort_name(
+        media_type,
+        name,
+        parent_index_number,
+        index_number,
+        &rustyfin_model::sort_name::current_rules(),
+    ))
 }
 
 #[cfg(test)]
@@ -2748,6 +2849,57 @@ mod tests {
         // Any other error, here a symlink loop, says nothing about the folder.
         assert_eq!(season_location(&at("loop")).await, None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn r3perf_probes_ahead_come_back_in_file_order() {
+        let have_ffmpeg = std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !have_ffmpeg {
+            eprintln!("skip: ffmpeg not found");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("r3perf-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _cleanup = TempDir(dir.clone());
+        let mut paths = Vec::new();
+        for n in 0..7 {
+            let path = dir.join(format!("{n}.mp3"));
+            let status = std::process::Command::new("ffmpeg")
+                .args(["-nostdin", "-loglevel", "error", "-y", "-f", "lavfi", "-i"])
+                .arg(format!(
+                    "sine=frequency={}:duration={}",
+                    300 + n * 50,
+                    1 + n % 3
+                ))
+                .args(["-metadata", &format!("title=Song {n}")])
+                .arg(&path)
+                .status()
+                .unwrap();
+            assert!(status.success());
+            paths.push(path.to_string_lossy().into_owned());
+        }
+        let title = |r: Result<probe::ProbeResult, probe::ProbeError>| {
+            r.unwrap().audio_tags.and_then(|t| t.title)
+        };
+
+        // Three at a time; the results come back in the files' order.
+        let mut ahead = ProbeAhead::new(paths[..6].to_vec(), 3);
+        for (n, path) in paths[..6].iter().enumerate() {
+            assert_eq!(
+                title(ahead.next(path).await),
+                Some(format!("Song {n}")),
+                "{path}"
+            );
+        }
+        // A file that wasn't queued is probed on its own.
+        assert_eq!(title(ahead.next(&paths[6]).await), Some("Song 6".into()));
+        drop(ahead);
+        // Dropping it with probes still queued stops them.
+        let ahead = ProbeAhead::new(paths.clone(), 4);
+        drop(ahead);
     }
 
     /// A temp dir, removed when the test ends, whether it passed or not.
