@@ -5,6 +5,7 @@ import { serverVersion } from './wizard.js';
 import { oidcAccountKey } from './settings.js';
 import { jiPanelHtml, loadJellyfinImport } from './jellyfin-import.js';
 import { sessionsPanelHtml, followSessions, unfollowSessions } from './sessions.js';
+import { playbackPanelHtml, loadPlaybackAdmin } from './playback-admin.js';
 
 async function renderAdmin(tab) {
     const page = $('page-admin');
@@ -29,8 +30,8 @@ async function renderAdmin(tab) {
         ]);
         const accountById = new Map(accounts.map(a => [oidcAccountKey(a.UserId), a]));
 
-        const tabs = [t('admin.overview'), t('admin.users'), t('admin.libraries'), t('admin.tasks'), t('admin.plugins'), t('admin.sessions'), t('admin.activity_log_tab'), t('admin.live_log'), t('oidc.admin_tab'), t('jellyfin_import.tab')];
-        const tabIds = ['admin-overview', 'admin-users', 'admin-libs', 'admin-tasks', 'admin-plugins', 'admin-sessions', 'admin-activity', 'admin-livelog', 'admin-signin', 'admin-import'];
+        const tabs = [t('admin.overview'), t('admin.users'), t('admin.libraries'), t('admin.playback'), t('admin.tasks'), t('admin.plugins'), t('admin.sessions'), t('admin.activity_log_tab'), t('admin.live_log'), t('oidc.admin_tab'), t('jellyfin_import.tab')];
+        const tabIds = ['admin-overview', 'admin-users', 'admin-libs', 'admin-playback', 'admin-tasks', 'admin-plugins', 'admin-sessions', 'admin-activity', 'admin-livelog', 'admin-signin', 'admin-import'];
 
         page.innerHTML = `
         <div class="max-w-6xl mx-auto jf-page">
@@ -263,10 +264,15 @@ async function renderAdmin(tab) {
             <!-- Tab 7: Sign-in (OpenID Connect settings, filled by loadOidcAdminTab) -->
             <div id="admin-signin" class="hidden jf-settings-card"></div>
 
+            <!-- Playback: transcoding, resume and streaming settings, filled by loadPlaybackAdmin -->
+            ${playbackPanelHtml()}
+
             ${jiPanelHtml()}
         </div>`;
-        // #admin/import opens the import tab (the wizard's last step sends the admin there)
+        // #admin/import opens the import tab (the wizard's last step sends the admin there), and
+        // #admin/playback the playback tab
         if (tab === 'import') showAdminTab(page.querySelector('[data-tab="admin-import"]'), 'admin-import');
+        if (tab === 'playback') showAdminTab(page.querySelector('[data-tab="admin-playback"]'), 'admin-playback');
     } catch (e) {
         page.innerHTML = `<div class="p-6 rounded-xl bg-red-500/10 text-red-400">${escapeHtml(e.message)}</div>`;
     }
@@ -278,7 +284,7 @@ function showAdminTab(btn, tabId) {
     });
     btn.className = 'px-4 py-2 rounded-xl text-xs font-semibold whitespace-nowrap transition bg-[#00a4dc] text-white shadow-lg';
 
-    ['admin-overview', 'admin-users', 'admin-libs', 'admin-tasks', 'admin-plugins', 'admin-sessions', 'admin-activity', 'admin-livelog', 'admin-signin', 'admin-import'].forEach(id => {
+    ['admin-overview', 'admin-users', 'admin-libs', 'admin-playback', 'admin-tasks', 'admin-plugins', 'admin-sessions', 'admin-activity', 'admin-livelog', 'admin-signin', 'admin-import'].forEach(id => {
         const el = $(id);
         if (el) el.classList.toggle('hidden', id !== tabId);
     });
@@ -290,6 +296,7 @@ function showAdminTab(btn, tabId) {
     if (tabId === 'admin-sessions') followSessions();
     else unfollowSessions();
     if (tabId === 'admin-signin') loadOidcAdminTab();
+    if (tabId === 'admin-playback') loadPlaybackAdmin();
     if (tabId === 'admin-import') loadJellyfinImport();
 }
 

@@ -2458,6 +2458,12 @@ async fn r2admin_encoding_configuration() {
 
 // ── r3transcoding: encoding options reach the transcoder ──
 
+// The dashboard's Playback tab shows and reads back the encoding options and the resume and
+// bitrate settings (tests/web/r3transcoding_playback_admin.mjs).
+#[test]
+fn r3transcoding_web_playback_admin() {
+    b124_node_test("r3transcoding_playback_admin.mjs");
+}
 
 #[tokio::test]
 async fn r3transcoding_encoding_options_round_trip_and_reach_the_transcoder() {
@@ -3343,6 +3349,7 @@ const B124_WEB_MODULES: &[&str] = &[
     "library.js",
     "metadata-admin.js",
     "music.js",
+    "playback-admin.js",
     "player.js",
     "playerprefs.js",
     "plugins.js",

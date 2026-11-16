@@ -35,6 +35,7 @@ import {
     changeNextEpisodeAutoPlay, changeUiLanguage, handleSaveConfig, changeUserConfig, changeUserPref, changeHomeSection,
     changeSubtitleAppearance, changeLatestLibrary, chooseProfileImage, deleteProfileImage,
 } from './modules/settings.js';
+import './modules/playback-admin.js';
 import { refreshTasks, openAddUser, closeAddUser, submitAddUser, clearLiveLog, setLogLevel } from './modules/admin.js';
 import './modules/user-editor.js';
 import {
