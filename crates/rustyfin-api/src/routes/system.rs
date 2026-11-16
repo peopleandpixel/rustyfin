@@ -1090,6 +1090,10 @@ async fn get_configuration_by_key(
         }
         return Ok(Json(serde_json::Value::Object(options)));
     }
+    if crate::named_config::handles(&key) {
+        let options = crate::named_config::load(&state.data_dir, &key, claims.is_admin).await;
+        return Ok(Json(serde_json::Value::Object(options)));
+    }
     let json = configuration_json(&state, claims.is_admin).await?;
     Ok(Json(
         json.get(&key).cloned().unwrap_or(serde_json::json!({})),
@@ -1104,6 +1108,18 @@ async fn update_configuration_by_key(
 ) -> Result<StatusCode, ApiError> {
     if key.eq_ignore_ascii_case(ENCODING_KEY) {
         save_encoding_configuration(&state, body).await?;
+        tracing::info!("configuration key updated: {}", key);
+        return Ok(StatusCode::NO_CONTENT);
+    }
+    if crate::named_config::handles(&key) {
+        use crate::named_config::SaveError;
+        crate::named_config::save(&state.data_dir, &key, body)
+            .await
+            .map_err(|e| match e {
+                SaveError::Invalid(m) => ApiError::BadRequest(m),
+                SaveError::TooLarge(m) => ApiError::PayloadTooLarge(m),
+                SaveError::Io(m) => ApiError::Internal(m),
+            })?;
         tracing::info!("configuration key updated: {}", key);
         return Ok(StatusCode::NO_CONTENT);
     }

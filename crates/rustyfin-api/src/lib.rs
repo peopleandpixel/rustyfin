@@ -1,9 +1,11 @@
 pub mod arr_webhook;
+pub mod backup_archive;
 pub mod cache;
 pub mod date_backfill;
 pub mod error;
 pub mod log_stream;
 pub mod middleware;
+pub mod named_config;
 pub mod oidc;
 pub mod parental;
 pub mod query;
