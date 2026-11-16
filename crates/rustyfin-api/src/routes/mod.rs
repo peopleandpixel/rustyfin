@@ -34,6 +34,7 @@ mod shows;
 mod startup;
 mod streaming;
 mod subtitle;
+mod suggestions;
 mod sync_play;
 mod system;
 mod transcode;
@@ -162,6 +163,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(live_tv::routes())
         .merge(additional::routes())
         .merge(additional_parts::routes())
+        .merge(suggestions::routes())
         .merge(media_segments::routes())
         .merge(trickplay::routes())
         .merge(
