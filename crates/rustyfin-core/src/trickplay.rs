@@ -1233,13 +1233,16 @@ pub async fn generate_for_libraries_with_progress(
     // Videos this run won't try (again): failed now, or before on the same file
     let mut failed: Vec<Uuid> = Vec::new();
     let mut made = 0u32;
-    let total =
-        rustyfin_db::repo_trickplay::items_missing_trickplay(pool, library_ids, WIDTH, &[], -1)
+    // Every video the task covers, and those already done: with a tile set, or a failure on
+    // record. A video with a failure is counted done here, so it isn't counted again when it
+    // is skipped or tried again. The bar so starts where the last run left it.
+    let (total, done) =
+        rustyfin_db::repo_trickplay::trickplay_progress(pool, library_ids, WIDTH, FAILURE_KIND)
             .await
-            .map_err(|e| format!("could not list videos: {e}"))?
-            .len();
-    let mut done = 0usize;
-    progress.report_count(0, total);
+            .map_err(|e| format!("could not count videos: {e}"))?;
+    let total = usize::try_from(total).unwrap_or(usize::MAX);
+    let mut done = usize::try_from(done).unwrap_or(usize::MAX).min(total);
+    progress.report_count(done, total);
     let db = |e: sqlx::Error| format!("could not record a failure: {e}");
     let mut queue = std::collections::VecDeque::new();
     // Up to `image_jobs` videos at once; each task's id maps to its video, path and file version
@@ -1256,7 +1259,7 @@ pub async fn generate_for_libraries_with_progress(
                     // failures
                     let skip: Vec<Uuid> = failed
                         .iter()
-                        .chain(started.values().map(|(id, _, _)| id))
+                        .chain(started.values().map(|(id, _, _, _)| id))
                         .copied()
                         .collect();
                     queue.extend(
@@ -1275,11 +1278,11 @@ pub async fn generate_for_libraries_with_progress(
                     return Ok(None);
                 };
                 let version = file_version(&path).await;
-                let known = get_failure(pool, item_id, FAILURE_KIND).await.map_err(db)?;
-                Ok::<_, String>(Some((item_id, path, version, known == Some(version))))
+                let failure = get_failure(pool, item_id, FAILURE_KIND).await.map_err(db)?;
+                Ok::<_, String>(Some((item_id, path, version, failure)))
             }
             .await;
-            let (item_id, path, version, known) = match next {
+            let (item_id, path, version, failure) = match next {
                 Ok(Some(next)) => next,
                 Ok(None) => break,
                 Err(e) => {
@@ -1287,12 +1290,12 @@ pub async fn generate_for_libraries_with_progress(
                     break;
                 }
             };
-            if known {
+            // Counted done at the start
+            if failure == Some(version) {
                 failed.push(item_id);
-                done += 1;
-                progress.report_count(done.min(total), total);
                 continue;
             }
+            let counted = failure.is_some();
             let (pool, data_dir, cancel, file) = (
                 pool.clone(),
                 data_dir.to_path_buf(),
@@ -1301,7 +1304,7 @@ pub async fn generate_for_libraries_with_progress(
             );
             let task = running
                 .spawn(async move { generate(&pool, &data_dir, item_id, &file, &cancel).await });
-            started.insert(task.id(), (item_id, path, version));
+            started.insert(task.id(), (item_id, path, version, counted));
         }
         let Some(joined) = running.join_next_with_id().await else {
             break;
@@ -1310,12 +1313,14 @@ pub async fn generate_for_libraries_with_progress(
             Ok((task, result)) => (result, task),
             Err(e) => (Err(format!("the tile task failed: {e}")), e.id()),
         };
-        let Some((item_id, path, version)) = started.remove(&task) else {
+        let Some((item_id, path, version, counted)) = started.remove(&task) else {
             continue;
         };
         // Videos added during the run can take it past the total counted at the start
-        done += 1;
-        progress.report_count(done.min(total), total);
+        if !counted {
+            done += 1;
+            progress.report_count(done.min(total), total);
+        }
         let recorded = async {
             match result {
                 Ok(set) => {
@@ -1741,17 +1746,19 @@ mod tests {
                 };
                 made.push((count, thumbnail_marks(&tiles, count)));
             }
-            assert_eq!(made[0].0, made[1].0, "{name}: the same count");
-            for (k, (a, b)) in made[0].1.iter().zip(&made[1].1).enumerate() {
-                // A frame 2 s on is 40 levels brighter on the right; 10 s on, 1.8 on the left
-                assert!(
-                    (a.0 - b.0).abs() <= 1.2 && (a.1 - b.1).abs() <= 8.0,
-                    "{name}: thumbnail {k} differs: {a:?} {b:?}"
-                );
+            for (how, new) in made.iter().enumerate().skip(1) {
+                assert_eq!(made[0].0, new.0, "{name} {how}: the same count");
+                for (k, (a, b)) in made[0].1.iter().zip(&new.1).enumerate() {
+                    // A frame 2 s on is 40 levels brighter on the right; 10 s on, 1.8 on the left
+                    assert!(
+                        (a.0 - b.0).abs() <= 1.2 && (a.1 - b.1).abs() <= 8.0,
+                        "{name} {how}: thumbnail {k} differs: {a:?} {b:?}"
+                    );
+                }
             }
         }
         assert_eq!(
-            thumbnail_marks(&dir.join("work-long.mkv-Seek/tiles"), 111).len(),
+            thumbnail_marks(&dir.join("work-long.mkv-Seek(Raw)/tiles"), 111).len(),
             111
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -1849,6 +1856,91 @@ mod tests {
             .expect("the sweep runs once the job ends")
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn r3trickplay_progress_resumes_where_the_last_run_left_it() {
+        use rustyfin_db::repo_trickplay::{record_failure, save_trickplay};
+        use rustyfin_model::library::{Library, LibraryContentType};
+
+        let dir = std::env::temp_dir().join(format!("r3trickplay-progress-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pool = rustyfin_db::init_db(dir.join("db.sqlite").to_str().unwrap())
+            .await
+            .unwrap();
+        let lib = Library {
+            id: Uuid::new_v4(),
+            name: "Films".to_string(),
+            content_type: LibraryContentType::Movies,
+            paths: vec![dir.to_string_lossy().into_owned()],
+        };
+        rustyfin_db::repo_library::create_library(&pool, &lib)
+            .await
+            .unwrap();
+        // Two made, one failed on the file as it is, one failed on an older file, one to do;
+        // none of the files is there, so the last two fail
+        let items: Vec<Uuid> = (0..5).map(|_| Uuid::new_v4()).collect();
+        for (k, id) in items.iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO media_items (id, name, media_type, path, library_id, runtime_ticks)
+                 VALUES (?1, ?2, 'Movie', ?3, ?4, 600000000)",
+            )
+            .bind(id.to_string())
+            .bind(format!("Film {k}"))
+            .bind(
+                dir.join(format!("missing-{k}.mkv"))
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+            .bind(lib.id.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let set = TrickplayInfo {
+            width: WIDTH,
+            height: 180,
+            tile_width: TILE_SIDE,
+            tile_height: TILE_SIDE,
+            thumbnail_count: 10,
+            interval: INTERVAL_MS,
+            bandwidth: 1,
+        };
+        save_trickplay(&pool, items[0], &set).await.unwrap();
+        save_trickplay(&pool, items[1], &set).await.unwrap();
+        record_failure(&pool, items[2], FAILURE_KIND, (0, 0))
+            .await
+            .unwrap();
+        record_failure(&pool, items[3], FAILURE_KIND, (1, 2))
+            .await
+            .unwrap();
+        let libs = [lib.id.to_string()];
+        let data = dir.join("data");
+
+        // A run stopped before any video starts still shows the 4 of 5 done
+        let progress = crate::task_progress::TaskProgress::new();
+        let cancel = Cancel::new();
+        cancel.cancel();
+        generate_for_libraries_with_progress(&pool, &data, &libs, &cancel, &progress)
+            .await
+            .unwrap();
+        assert_eq!(progress.get(), Some(80.0));
+
+        // A whole run ends at 100%: the older failure, counted done already, isn't counted again
+        let progress = crate::task_progress::TaskProgress::new();
+        let made =
+            generate_for_libraries_with_progress(&pool, &data, &libs, &Cancel::new(), &progress)
+                .await
+                .unwrap();
+        assert_eq!(made, 0);
+        assert_eq!(progress.get(), Some(100.0));
+        // And the next run starts there
+        let progress = crate::task_progress::TaskProgress::new();
+        generate_for_libraries_with_progress(&pool, &data, &libs, &cancel, &progress)
+            .await
+            .unwrap();
+        assert_eq!(progress.get(), Some(100.0));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
