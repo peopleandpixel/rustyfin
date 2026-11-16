@@ -29149,6 +29149,155 @@ async fn g2_login_response_has_fresh_last_login_date() {
     );
 }
 
+// ── R3 users 2: the sign-in page's user tiles and forgot password ──
+
+/// The `GET /Users/Public` answer of `app`, by name.
+async fn r3users2_public(
+    app: &axum::Router,
+) -> std::collections::HashMap<String, serde_json::Value> {
+    let (status, json) = send(app, request("GET", "/Users/Public", None, None)).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    json.as_array()
+        .unwrap()
+        .iter()
+        .map(|u| (u["Name"].as_str().unwrap().to_string(), u.clone()))
+        .collect()
+}
+
+#[tokio::test]
+async fn r3users2_public_users_say_whether_they_have_a_password() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    assert_eq!(
+        post_startup_user(&app, None, "owner", "pw-owner").await,
+        StatusCode::NO_CONTENT
+    );
+    let kid = add_user(&state, "kid", "pw-kid", false).await;
+    sqlx::query("UPDATE users SET password_hash = '' WHERE id = ?")
+        .bind(kid.to_string())
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+    let users = r3users2_public(&app).await;
+    assert_eq!(users["owner"]["HasPassword"], true, "{users:?}");
+    assert_eq!(users["owner"]["HasConfiguredPassword"], true);
+    assert_eq!(users["kid"]["HasPassword"], false, "{users:?}");
+    assert_eq!(users["kid"]["HasConfiguredPassword"], false);
+    // Only what a tile needs: no policy, configuration or hash
+    assert!(users["owner"].get("Policy").is_none());
+    assert!(users["owner"].get("PasswordHash").is_none());
+
+    // A user without a password signs in from the tile with an empty one, as in Jellyfin
+    assert!(login(&app, "kid", "").await.is_some());
+}
+
+#[tokio::test]
+async fn r3users2_public_users_outside_the_network_need_remote_access() {
+    let t = b103().await;
+    let (status, _) = t
+        .policy(
+            &t.owner,
+            &t.bob_id,
+            serde_json::json!({ "EnableRemoteAccess": false }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = t
+        .policy(&t.owner, &t.ada_id, serde_json::json!({ "IsHidden": true }))
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let local = r3users2_public(&t.app).await;
+    assert!(
+        local.contains_key("bob"),
+        "a local client sees bob: {local:?}"
+    );
+    assert!(!local.contains_key("ada"), "a hidden user has no tile");
+
+    let remote_app = build_router(t.state.clone()).layer(MockConnectInfo(
+        "203.0.113.5:4000".parse::<SocketAddr>().unwrap(),
+    ));
+    let remote = r3users2_public(&remote_app).await;
+    assert!(remote.contains_key("karl"), "{remote:?}");
+    assert!(
+        !remote.contains_key("bob"),
+        "a user without remote access has no tile outside the network: {remote:?}"
+    );
+    assert!(!remote.contains_key("ada"));
+}
+
+#[tokio::test]
+async fn r3users2_forgot_password_outside_the_network_is_in_network_required() {
+    let state = test_state().await;
+    let local_app = app(state.clone());
+    assert_eq!(
+        post_startup_user(&local_app, None, "owner", "pw-owner").await,
+        StatusCode::NO_CONTENT
+    );
+    let remote_app = build_router(state.clone()).layer(MockConnectInfo(
+        "203.0.113.5:4000".parse::<SocketAddr>().unwrap(),
+    ));
+    for name in ["owner", "ghost"] {
+        let (status, body) = send(
+            &remote_app,
+            request(
+                "POST",
+                "/Users/ForgotPassword",
+                None,
+                Some(serde_json::json!({ "EnteredUsername": name })),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["Action"], "InNetworkRequired", "{name}: {body}");
+        assert_eq!(body["PinFile"], "", "no server path for a remote client");
+        assert!(body["PinExpirationDate"].is_null());
+    }
+    let pin_files = std::fs::read_dir(&*state.data_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("passwordreset-")
+        })
+        .count();
+    assert_eq!(pin_files, 0, "a remote request writes no PIN file");
+
+    // On the local network the PIN file is written under the configured data dir, single use
+    let (_, body) = send(
+        &local_app,
+        request(
+            "POST",
+            "/Users/ForgotPassword",
+            None,
+            Some(serde_json::json!({ "EnteredUsername": "owner" })),
+        ),
+    )
+    .await;
+    assert_eq!(body["Action"], "PinCode", "{body}");
+    assert!(body["PinExpirationDate"].is_string());
+    let path = std::path::PathBuf::from(body["PinFile"].as_str().unwrap());
+    assert!(path.starts_with(&*state.data_dir), "{path:?}");
+    let pin = await_reset_pin(&path).await.expect("a PIN file");
+    let redeem = |pin: String| {
+        request(
+            "POST",
+            "/Users/ForgotPassword/Pin",
+            None,
+            Some(serde_json::json!({ "Pin": pin })),
+        )
+    };
+    let (status, body) = send(&local_app, redeem(pin.clone())).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["UsersReset"][0], "owner");
+    assert!(!path.exists(), "the redeem removes the PIN file");
+    let (status, _) = send(&local_app, redeem(pin.clone())).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "a PIN is single use");
+    assert!(login(&local_app, "owner", &pin).await.is_some());
+}
+
 // ── G2: reset PIN (R1-01, M-17) ──
 
 #[tokio::test]

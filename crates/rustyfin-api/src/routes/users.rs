@@ -152,17 +152,25 @@ async fn get_user(
     }))
 }
 
+/// The sign-in page's user tiles. As in Jellyfin, a hidden user (IsHidden) signs in by typing the
+/// name, and a client outside the local network sees only the users with remote access.
 async fn get_public_users(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
 ) -> Result<Json<Vec<PublicUserDto>>, ApiError> {
     let users = rustyfin_db::repo_user::get_public_users(&state.db_ro).await?;
     let tags = rustyfin_db::repo_user::primary_image_tags(&state.db_ro).await?;
-    // A hidden user (IsHidden) signs in by typing the name, as in Jellyfin.
     let policies = rustyfin_db::repo_parental::all_policies(&state.db_ro).await?;
+    let local = resolve_client(peer.ip(), &headers, &state.known_proxies).is_local();
     Ok(Json(
         users
             .into_iter()
-            .filter(|u| !policies.get(&u.id).is_some_and(|p| p.access.is_hidden))
+            .filter(|u| {
+                policies
+                    .get(&u.id)
+                    .is_none_or(|p| !p.access.is_hidden && (local || p.access.enable_remote_access))
+            })
             .map(|u| {
                 let primary_image_tag = tags.get(&u.id).cloned();
                 PublicUserDto {
@@ -578,12 +586,13 @@ async fn update_configuration(
 /// timing reveals neither whether the name exists nor whether the reset work was slow.
 const FORGOT_PASSWORD_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// Start a password reset. The response is uniform whether or not the user exists, so it never
-/// reveals account existence, and it never contains the PIN. The PIN is written (mode 0600 on Unix)
+/// Start a password reset. A client outside the local network gets `InNetworkRequired`, as in
+/// Jellyfin. On the local network the response is uniform whether or not the user exists, so it
+/// never reveals account existence, and it never contains the PIN. The PIN is written (mode 0600 on Unix)
 /// to a file under the data dir ONLY when the user exists AND the resolved client (see
 /// `resolve_client`) is on the local network AND the user has no pending or voided reset, since a
-/// new request never replaces an open reset. Every other request gets the same 200 with a file path
-/// that is not created. Every answer comes `FORGOT_PASSWORD_DELAY` (250 ms) after the request
+/// new request never replaces an open reset. Every other local request gets the same 200 with a
+/// file path that is not created. Every answer comes `FORGOT_PASSWORD_DELAY` (250 ms) after the request
 /// reached the handler. The reset work runs in its own task: it finishes before the answer when it
 /// is quick, and in the background when it takes longer.
 async fn forgot_password(
@@ -593,27 +602,36 @@ async fn forgot_password(
     Json(req): Json<ForgotPasswordRequest>,
 ) -> Result<Json<ForgotPasswordResult>, ApiError> {
     let deadline = tokio::time::Instant::now() + FORGOT_PASSWORD_DELAY;
+
+    // Outside the local network Jellyfin answers InNetworkRequired for every name, so the answer
+    // tells only where the client is, and names no path on the server.
+    if !resolve_client(peer.ip(), &headers, &state.known_proxies).is_local() {
+        tokio::time::sleep_until(deadline).await;
+        return Ok(Json(ForgotPasswordResult {
+            action: "InNetworkRequired".to_string(),
+            pin_file: String::new(),
+            pin_expiration_date: None,
+        }));
+    }
+
     let pin_path = state
         .data_dir
         .join(rustyfin_auth::reset_pin_filename(&req.entered_username));
     let expires_at = (Utc::now() + chrono::Duration::minutes(30)).to_rfc3339();
-
-    if resolve_client(peer.ip(), &headers, &state.known_proxies).is_local() {
-        let handle = tokio::spawn(issue_reset_pin(
-            state.db.clone(),
-            req.entered_username.clone(),
-            pin_path.clone(),
-            expires_at.clone(),
-        ));
-        // Waited for only until the deadline; a slower task is detached and finishes alone.
-        let _ = tokio::time::timeout_at(deadline, handle).await;
-    }
+    let handle = tokio::spawn(issue_reset_pin(
+        state.db.clone(),
+        req.entered_username.clone(),
+        pin_path.clone(),
+        expires_at.clone(),
+    ));
+    // Waited for only until the deadline; a slower task is detached and finishes alone.
+    let _ = tokio::time::timeout_at(deadline, handle).await;
     tokio::time::sleep_until(deadline).await;
 
     Ok(Json(ForgotPasswordResult {
         action: "PinCode".to_string(),
         pin_file: pin_path.to_string_lossy().into_owned(),
-        pin_expiration_date: expires_at,
+        pin_expiration_date: Some(expires_at),
     }))
 }
 
