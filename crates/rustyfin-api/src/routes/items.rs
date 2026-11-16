@@ -290,6 +290,14 @@ async fn enrich_item(
     // ServerId
     item.server_id = Some(server_id.to_string());
 
+    // Jellyfin sends HasLyrics on audio items only
+    if item.media_type == rustyfin_model::media::MediaType::Audio {
+        let with_lyrics = rustyfin_db::repo_lyrics::with_lyrics(pool, &[item.id])
+            .await
+            .unwrap_or_default();
+        item.has_lyrics = Some(!with_lyrics.is_empty());
+    }
+
     // Type flags
     item.is_movie = item.media_type == rustyfin_model::media::MediaType::Movie;
     item.is_series = item.media_type == rustyfin_model::media::MediaType::Series;
@@ -1046,6 +1054,23 @@ pub(crate) async fn enrich_items_with(
         for item in items.iter_mut() {
             if let Some(info) = photos.get(&item.id) {
                 apply_photo_info(item, info);
+            }
+        }
+    }
+
+    // Batch query 3a': which audio items have lyrics; Jellyfin sends HasLyrics on audio only
+    let audio_ids: Vec<Uuid> = items
+        .iter()
+        .filter(|item| item.media_type == rustyfin_model::media::MediaType::Audio)
+        .map(|item| item.id)
+        .collect();
+    if !audio_ids.is_empty() {
+        let with_lyrics = rustyfin_db::repo_lyrics::with_lyrics(pool, &audio_ids)
+            .await
+            .unwrap_or_default();
+        for item in items.iter_mut() {
+            if item.media_type == rustyfin_model::media::MediaType::Audio {
+                item.has_lyrics = Some(with_lyrics.contains(&item.id.to_string()));
             }
         }
     }

@@ -10,19 +10,13 @@ use uuid::Uuid;
 use crate::parental::HiddenItems;
 use crate::state::AppState;
 
-/// Additional Jellyfin-compatible controllers: recommendations, featured, instant mix.
+/// Additional Jellyfin-compatible controllers: recommendations, featured, similar items.
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/Movies/Recommendations", get(get_recommendations))
         .route("/Movies/Featured", get(get_featured))
-        .route(
-            "/Users/{userId}/Items/{itemId}/InstantMix",
-            get(get_instant_mix),
-        )
-        // Audio/Music similar endpoints
-        .route("/Albums/{id}/InstantMix", get(get_albums_instant_mix))
+        // Audio/Music similar endpoints; the instant mixes are in `instant_mix`
         .route("/Albums/{id}/Similar", get(get_albums_similar))
-        .route("/Artists/{id}/InstantMix", get(get_artists_instant_mix))
         .route("/Artists/{id}/Similar", get(get_artists_similar))
         .route("/Artists/AlbumArtists", get(get_album_artists))
         // Artists by name
@@ -31,8 +25,6 @@ pub fn routes() -> Router<AppState> {
         .route("/Movies/{id}/Similar", get(get_movies_similar))
         // Shows similar
         .route("/Shows/{id}/Similar", get(get_shows_similar))
-        // Playlists instant mix
-        .route("/Playlists/{id}/InstantMix", get(get_playlists_instant_mix))
         // Playback bitrate test
         .route("/Playback/BitrateTest", get(get_bitrate_test))
 }
@@ -108,76 +100,6 @@ async fn get_featured(
     ))
 }
 
-/// GET /Users/{userId}/Items/{itemId}/InstantMix — Returns an instant mix based on an item.
-/// Generates a playlist of similar items (same genre or similar rating).
-async fn get_instant_mix(
-    State(state): State<AppState>,
-    Path((_user_id, item_id)): Path<(Uuid, Uuid)>,
-    Extension(claims): Extension<Claims>,
-) -> Result<
-    (
-        StatusCode,
-        Json<QueryResult<rustyfin_model::media::MediaItem>>,
-    ),
-    crate::error::ApiError,
-> {
-    // Get the source item to find similar items
-
-    let hidden = HiddenItems::for_caller(&state, &claims).await?;
-    let source = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, item_id)
-        .await
-        .map_err(|e| crate::error::ApiError::Internal(e.to_string()))?
-        .ok_or_else(|| crate::error::ApiError::NotFound("Item not found".to_string()))?;
-
-    // Get similar items based on the source
-    let mut items = rustyfin_db::repo_media::get_similar_items(&state.db_ro, &source, 50)
-        .await
-        .map_err(|e| crate::error::ApiError::Internal(e.to_string()))?;
-    hidden.retain(&mut items);
-
-    let total = items.len() as i64;
-    Ok((
-        StatusCode::OK,
-        Json(QueryResult {
-            items,
-            total_record_count: total,
-            start_index: None,
-        }),
-    ))
-}
-
-/// GET /Albums/{itemId}/InstantMix
-async fn get_albums_instant_mix(
-    State(state): State<AppState>,
-    Path(item_id): Path<Uuid>,
-    Extension(claims): Extension<Claims>,
-) -> Result<
-    (
-        StatusCode,
-        Json<QueryResult<rustyfin_model::media::MediaItem>>,
-    ),
-    crate::error::ApiError,
-> {
-    let hidden = HiddenItems::for_caller(&state, &claims).await?;
-    let source = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, item_id)
-        .await
-        .map_err(|e| crate::error::ApiError::Internal(e.to_string()))?
-        .ok_or_else(|| crate::error::ApiError::NotFound("Album not found".to_string()))?;
-    let mut items = rustyfin_db::repo_media::get_similar_items(&state.db_ro, &source, 50)
-        .await
-        .map_err(|e| crate::error::ApiError::Internal(e.to_string()))?;
-    hidden.retain(&mut items);
-    let total = items.len() as i64;
-    Ok((
-        StatusCode::OK,
-        Json(QueryResult {
-            items,
-            total_record_count: total,
-            start_index: None,
-        }),
-    ))
-}
-
 /// GET /Albums/{itemId}/Similar
 async fn get_albums_similar(
     State(state): State<AppState>,
@@ -196,38 +118,6 @@ async fn get_albums_similar(
         .map_err(|e| crate::error::ApiError::Internal(e.to_string()))?
         .ok_or_else(|| crate::error::ApiError::NotFound("Album not found".to_string()))?;
     let mut items = rustyfin_db::repo_media::get_similar_items(&state.db_ro, &source, 20)
-        .await
-        .map_err(|e| crate::error::ApiError::Internal(e.to_string()))?;
-    hidden.retain(&mut items);
-    let total = items.len() as i64;
-    Ok((
-        StatusCode::OK,
-        Json(QueryResult {
-            items,
-            total_record_count: total,
-            start_index: None,
-        }),
-    ))
-}
-
-/// GET /Artists/{itemId}/InstantMix
-async fn get_artists_instant_mix(
-    State(state): State<AppState>,
-    Path(item_id): Path<Uuid>,
-    Extension(claims): Extension<Claims>,
-) -> Result<
-    (
-        StatusCode,
-        Json<QueryResult<rustyfin_model::media::MediaItem>>,
-    ),
-    crate::error::ApiError,
-> {
-    let hidden = HiddenItems::for_caller(&state, &claims).await?;
-    let source = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, item_id)
-        .await
-        .map_err(|e| crate::error::ApiError::Internal(e.to_string()))?
-        .ok_or_else(|| crate::error::ApiError::NotFound("Artist not found".to_string()))?;
-    let mut items = rustyfin_db::repo_media::get_similar_items(&state.db_ro, &source, 50)
         .await
         .map_err(|e| crate::error::ApiError::Internal(e.to_string()))?;
     hidden.retain(&mut items);
@@ -370,38 +260,6 @@ async fn get_shows_similar(
         .map_err(|e| crate::error::ApiError::Internal(e.to_string()))?
         .ok_or_else(|| crate::error::ApiError::NotFound("Show not found".to_string()))?;
     let mut items = rustyfin_db::repo_media::get_similar_items(&state.db_ro, &source, 20)
-        .await
-        .map_err(|e| crate::error::ApiError::Internal(e.to_string()))?;
-    hidden.retain(&mut items);
-    let total = items.len() as i64;
-    Ok((
-        StatusCode::OK,
-        Json(QueryResult {
-            items,
-            total_record_count: total,
-            start_index: None,
-        }),
-    ))
-}
-
-/// GET /Playlists/{itemId}/InstantMix
-async fn get_playlists_instant_mix(
-    State(state): State<AppState>,
-    Path(item_id): Path<Uuid>,
-    Extension(claims): Extension<Claims>,
-) -> Result<
-    (
-        StatusCode,
-        Json<QueryResult<rustyfin_model::media::MediaItem>>,
-    ),
-    crate::error::ApiError,
-> {
-    let hidden = HiddenItems::for_caller(&state, &claims).await?;
-    let source = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, item_id)
-        .await
-        .map_err(|e| crate::error::ApiError::Internal(e.to_string()))?
-        .ok_or_else(|| crate::error::ApiError::NotFound("Playlist not found".to_string()))?;
-    let mut items = rustyfin_db::repo_media::get_similar_items(&state.db_ro, &source, 50)
         .await
         .map_err(|e| crate::error::ApiError::Internal(e.to_string()))?;
     hidden.retain(&mut items);
