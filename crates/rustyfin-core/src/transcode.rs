@@ -213,6 +213,33 @@ pub struct TranscodeManager {
     hardware: Arc<std::sync::Mutex<HardwareHealth>>,
     /// The warnings logged once, until the options are saved again
     warned: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// The transcode reasons PlaybackInfo gave, by PlaySessionId (in ASCII lower case)
+    reasons: Arc<std::sync::Mutex<HashMap<String, PlannedReasons>>>,
+}
+
+/// The transcode reasons of one PlaybackInfo answer: each media source's that transcodes.
+#[derive(Debug)]
+struct PlannedReasons {
+    at: Instant,
+    sources: Vec<(String, Vec<String>)>,
+}
+
+/// How long the reasons of a PlaybackInfo answer are kept, and how many answers at most.
+const REASONS_KEPT: Duration = Duration::from_secs(12 * 3600);
+const REASONS_LIMIT: usize = 2000;
+
+/// What a session's transcode does, for its `TranscodingInfo` in `/Sessions`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TranscodingSummary {
+    pub video_codec: Option<String>,
+    pub audio_codec: Option<String>,
+    pub is_video_direct: bool,
+    pub is_audio_direct: bool,
+    pub audio_channels: Option<u32>,
+    /// Jellyfin's `HardwareAccelerationType` name, None for software
+    pub hardware_acceleration_type: Option<&'static str>,
+    /// Jellyfin's `TranscodeReasons` names
+    pub reasons: Vec<String>,
 }
 
 /// The hardware failures the manager remembers. A file whose hardware transcode failed (and
@@ -269,7 +296,77 @@ impl TranscodeManager {
             capabilities: Arc::new(tokio::sync::OnceCell::new()),
             hardware: Arc::new(std::sync::Mutex::new(HardwareHealth::default())),
             warned: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            reasons: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Keeps the transcode reasons PlaybackInfo gave for `play_session_id`: the reasons of each
+    /// media source that transcodes. Sources with no reason are left out.
+    pub fn note_reasons(&self, play_session_id: &str, sources: Vec<(String, Vec<String>)>) {
+        let sources: Vec<_> = sources.into_iter().filter(|(_, r)| !r.is_empty()).collect();
+        if play_session_id.is_empty() || sources.is_empty() {
+            return;
+        }
+        let mut all = self.reasons.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        all.retain(|_, p| now.duration_since(p.at) < REASONS_KEPT);
+        if all.len() >= REASONS_LIMIT {
+            all.clear();
+        }
+        all.insert(
+            play_session_id.to_ascii_lowercase(),
+            PlannedReasons { at: now, sources },
+        );
+    }
+
+    /// What the transcode of `play_session_id` does: the running transcode's codecs, and the
+    /// reasons PlaybackInfo gave for `media_source_id` (else for its first source). None when
+    /// neither is known.
+    pub fn transcoding_summary(
+        &self,
+        play_session_id: &str,
+        media_source_id: Option<&str>,
+    ) -> Option<TranscodingSummary> {
+        if play_session_id.is_empty() {
+            return None;
+        }
+        let reasons = {
+            let all = self.reasons.lock().unwrap_or_else(|e| e.into_inner());
+            all.get(&play_session_id.to_ascii_lowercase()).map(|p| {
+                let wanted = media_source_id
+                    .and_then(|id| p.sources.iter().find(|(s, _)| s.eq_ignore_ascii_case(id)));
+                wanted
+                    .or(p.sources.first())
+                    .map(|(_, r)| r.clone())
+                    .unwrap_or_default()
+            })
+        };
+        let running = self.sessions.iter().find_map(|s| {
+            s.play_session_id
+                .eq_ignore_ascii_case(play_session_id)
+                .then(|| s.profile.clone())
+        });
+        if reasons.is_none() && running.is_none() {
+            return None;
+        }
+        let mut summary = TranscodingSummary {
+            reasons: reasons.unwrap_or_default(),
+            ..Default::default()
+        };
+        if let Some(p) = running {
+            summary.video_codec = (!p.audio_only).then(|| p.video_codec.clone());
+            summary.audio_codec = Some(p.audio_codec.clone());
+            summary.is_video_direct = p.copy_video;
+            summary.is_audio_direct = p.copy_audio;
+            summary.audio_channels = p.audio_channels;
+            summary.hardware_acceleration_type = match p.hw_accel {
+                HwAccel::None => None,
+                HwAccel::Vaapi => Some("vaapi"),
+                HwAccel::Nvenc => Some("nvenc"),
+                HwAccel::Qsv => Some("qsv"),
+            };
+        }
+        Some(summary)
     }
 
     /// A manager that writes its transcodes under `root` instead of the data directory's

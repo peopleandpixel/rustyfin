@@ -89,7 +89,8 @@ pub struct ServerConfiguration {
     pub enable_normalized_item_by_name_ids: bool,
     #[serde(default = "default_true")]
     pub is_port_authorized: bool,
-    #[serde(default)]
+    /// Quick Connect: on by default, as in Jellyfin. Off, its routes answer 401.
+    #[serde(default = "default_true")]
     pub quick_connect_available: bool,
     /// The DLNA server: the `/dlna/*` routes and SSDP discovery. Off by default, as in Jellyfin,
     /// where DLNA is an optional plugin.
@@ -313,7 +314,7 @@ impl Default for ServerConfiguration {
             enable_metrics: true,
             enable_normalized_item_by_name_ids: true,
             is_port_authorized: true,
-            quick_connect_available: false,
+            quick_connect_available: true,
             enable_dlna_server: false,
             public_https_port: 8096,
             public_port: 8096,

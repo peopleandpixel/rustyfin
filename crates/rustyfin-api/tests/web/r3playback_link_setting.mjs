@@ -20,7 +20,7 @@ async function saved(checked) {
     const fields = { 'cfg-server-name': { value: 'R3' }, 'cfg-refuse-links': { checked } };
     const context = vm.createContext({
         $: id => fields[id],
-        API: { updateConfig: async body => sent.push(body) },
+        API: { getConfig: async () => ({ QuickConnectAvailable: false }), updateConfig: async body => sent.push(body) },
         toast() {},
         t: key => key,
         renderSettings() {},
@@ -28,6 +28,8 @@ async function saved(checked) {
     vm.runInContext(`${slice(settings, 'function providerKeyField(')}\n${slice(settings, 'async function handleSaveConfig(')}`, context);
     await vm.runInContext('handleSaveConfig', context)({ preventDefault() {} });
     assert.equal(sent.length, 1);
+    // The fields the form doesn't show go back as they were
+    assert.equal(sent[0].QuickConnectAvailable, false);
     return sent[0].RefuseLinksOutOfLibraries;
 }
 

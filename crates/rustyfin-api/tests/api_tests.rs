@@ -3389,6 +3389,7 @@ const B124_WEB_MODULES: &[&str] = &[
     "cardmenu.js",
     "cards.js",
     "collections.js",
+    "dashboard.js",
     "genres.js",
     "home.js",
     "item.js",
@@ -46549,4 +46550,379 @@ async fn j2_audio_transcode_plays_without_a_header() {
     let stop = format!("/Videos/ActiveEncodings?PlaySessionId={ps}");
     let (status, _) = send(&app, request("DELETE", &stop, Some(&token), None)).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+// R3 admin dashboard 2: library folders and name, task triggers, Quick Connect, sessions, shutdown
+
+/// The `Locations` of the library `name` in `GET /Library/VirtualFolders`, or None without it.
+async fn r3admin_locations(app: &axum::Router, token: &str, name: &str) -> Option<Vec<String>> {
+    let (status, libs) = send_authed(app, "GET", "/Library/VirtualFolders", token, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let lib = libs.as_array()?.iter().find(|l| l["Name"] == name)?.clone();
+    Some(
+        lib["Locations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p.as_str().unwrap().to_string())
+            .collect(),
+    )
+}
+
+#[tokio::test]
+async fn r3admin_library_folders_are_added_updated_and_removed_by_name() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    create_library_via_api(&app, &state, &token, "R3Films", "Movies").await;
+    let first = media_folder(&state, "r3films");
+    let second = media_folder(&state, "r3films-more");
+    let post = |uri: &str, body: serde_json::Value| {
+        let (app, token, uri) = (app.clone(), token.clone(), uri.to_string());
+        async move {
+            send_authed(&app, "POST", &uri, &token, Some(&body.to_string()))
+                .await
+                .0
+        }
+    };
+
+    // Jellyfin's AddMediaPathDto: the folder in PathInfo.Path, or in Path
+    let add = serde_json::json!({ "Name": "R3Films", "PathInfo": { "Path": second } });
+    assert_eq!(
+        post("/Library/VirtualFolders/Paths", add.clone()).await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        r3admin_locations(&app, &token, "R3Films").await.unwrap(),
+        [first.clone(), second.clone()]
+    );
+    // The same folder again, a missing folder, an unknown library
+    assert_eq!(
+        post("/Library/VirtualFolders/Paths", add).await,
+        StatusCode::BAD_REQUEST
+    );
+    let missing = format!("{first}/not-there");
+    let body = serde_json::json!({ "Name": "R3Films", "Path": missing });
+    assert_eq!(
+        post("/Library/VirtualFolders/Paths", body).await,
+        StatusCode::BAD_REQUEST
+    );
+    let body = serde_json::json!({ "Name": "Nope", "Path": second });
+    assert_eq!(
+        post("/Library/VirtualFolders/Paths", body).await,
+        StatusCode::NOT_FOUND
+    );
+    let body = serde_json::json!({ "Name": "R3Films" });
+    assert_eq!(
+        post("/Library/VirtualFolders/Paths", body).await,
+        StatusCode::BAD_REQUEST
+    );
+
+    // Paths/Update: a folder of the library answers 204, another one 400
+    let update = serde_json::json!({ "Name": "R3Films", "PathInfo": { "Path": second } });
+    assert_eq!(
+        post("/Library/VirtualFolders/Paths/Update", update).await,
+        StatusCode::NO_CONTENT
+    );
+    let update = serde_json::json!({ "Name": "R3Films", "PathInfo": { "Path": missing } });
+    assert_eq!(
+        post("/Library/VirtualFolders/Paths/Update", update).await,
+        StatusCode::BAD_REQUEST
+    );
+
+    // DELETE ?name=&path=: 204, then 404 for a folder the library no longer has
+    // The test folders' paths need no escaping in a query
+    let q = |path: &str| {
+        format!("/Library/VirtualFolders/Paths?name=R3Films&path={path}&refreshLibrary=false")
+    };
+    let (status, _) = send_authed(&app, "DELETE", &q(&second), &token, None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        r3admin_locations(&app, &token, "R3Films").await.unwrap(),
+        std::slice::from_ref(&first)
+    );
+    let (status, _) = send_authed(&app, "DELETE", &q(&second), &token, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Rustyfin's earlier body form still removes folders
+    let id = rustyfin_db::repo_library::get_all_libraries(&state.db)
+        .await
+        .unwrap()[0]
+        .id;
+    let body = serde_json::json!({ "LibraryId": id, "Paths": [first] }).to_string();
+    let (status, _) = send_authed(
+        &app,
+        "DELETE",
+        "/Library/VirtualFolders/Paths",
+        &token,
+        Some(&body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        r3admin_locations(&app, &token, "R3Films")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn r3admin_library_is_renamed() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    create_library_via_api(&app, &state, &token, "R3Films", "Movies").await;
+    create_library_via_api(&app, &state, &token, "R3Shows", "TvShows").await;
+    let rename = |q: &str| {
+        let (app, token, uri) = (
+            app.clone(),
+            token.clone(),
+            format!("/Library/VirtualFolders/Name?{q}"),
+        );
+        async move { send_authed(&app, "POST", &uri, &token, None).await.0 }
+    };
+    assert_eq!(
+        rename("name=R3Films&newName=R3%20Movies").await,
+        StatusCode::NO_CONTENT
+    );
+    assert!(r3admin_locations(&app, &token, "R3 Movies").await.is_some());
+    assert!(r3admin_locations(&app, &token, "R3Films").await.is_none());
+    // The views show the new name
+    let (_, views) = send_authed(&app, "GET", "/UserViews", &token, None).await;
+    let names: Vec<_> = views["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["Name"].clone())
+        .collect();
+    assert!(names.contains(&"R3 Movies".into()), "{names:?}");
+
+    assert_eq!(
+        rename("name=R3%20Movies&newName=r3shows").await,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        rename("name=Nope&newName=Other").await,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(rename("name=R3Shows").await, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        rename("name=R3Shows&newName=%20").await,
+        StatusCode::BAD_REQUEST
+    );
+}
+
+#[tokio::test]
+async fn r3admin_task_triggers_are_checked_kept_and_read_after_a_restart() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    const HOUR: u64 = 36_000_000_000;
+    let triggers = serde_json::json!([
+        { "Type": "DailyTrigger", "TimeOfDayTicks": 3 * HOUR },
+        { "Type": "WeeklyTrigger", "TimeOfDayTicks": 2 * HOUR, "DayOfWeek": "Sunday" },
+        { "Type": "IntervalTrigger", "IntervalTicks": HOUR / 2 },
+        { "Type": "StartupTrigger" },
+    ]);
+    let post = |id: &str, body: serde_json::Value| {
+        let (app, token, uri) = (
+            app.clone(),
+            token.clone(),
+            format!("/ScheduledTasks/{id}/Triggers"),
+        );
+        async move {
+            send_authed(&app, "POST", &uri, &token, Some(&body.to_string()))
+                .await
+                .0
+        }
+    };
+    assert_eq!(
+        post("LibraryScan", triggers.clone()).await,
+        StatusCode::NO_CONTENT
+    );
+    let (_, task) = send_authed(&app, "GET", "/ScheduledTasks/LibraryScan", &token, None).await;
+    let got = &task["Triggers"];
+    assert_eq!(got.as_array().map(Vec::len), Some(4));
+    assert_eq!(got[0]["Type"], "DailyTrigger");
+    assert_eq!(got[0]["TimeOfDayTicks"], 3 * HOUR);
+    assert_eq!(got[1]["DayOfWeek"], "Sunday");
+    assert_eq!(got[2]["IntervalTicks"], HOUR / 2);
+    assert_eq!(got[3]["Type"], "StartupTrigger");
+
+    // A trigger the scheduler can't use is refused, and the saved ones stay
+    for bad in [
+        serde_json::json!([{ "Type": "WeeklyTrigger", "TimeOfDayTicks": 0 }]),
+        serde_json::json!([{ "Type": "WeeklyTrigger", "TimeOfDayTicks": 0, "DayOfWeek": "Someday" }]),
+        serde_json::json!([{ "Type": "DailyTrigger" }]),
+        serde_json::json!([{ "Type": "DailyTrigger", "TimeOfDayTicks": 24 * HOUR }]),
+        serde_json::json!([{ "Type": "IntervalTrigger", "IntervalTicks": 0 }]),
+        serde_json::json!([{ "Type": "SometimesTrigger" }]),
+    ] {
+        assert_eq!(
+            post("LibraryScan", bad.clone()).await,
+            StatusCode::BAD_REQUEST,
+            "{bad}"
+        );
+    }
+    assert_eq!(
+        post("NoSuchTask", serde_json::json!([])).await,
+        StatusCode::NOT_FOUND
+    );
+    let kept = state.task_scheduler.get_task("LibraryScan").await.unwrap();
+    assert_eq!(kept.triggers.len(), 4);
+
+    // A new scheduler on the same data folder (a restart) reads them; other tasks keep theirs
+    let restarted =
+        rustyfin_core::scheduler::TaskScheduler::new(state.db.clone(), state.data_dir.clone());
+    let after = restarted.get_task("LibraryScan").await.unwrap();
+    assert_eq!(
+        serde_json::to_value(&after.triggers).unwrap(),
+        serde_json::to_value(&kept.triggers).unwrap()
+    );
+    let vacuum = restarted.get_task("DatabaseVacuum").await.unwrap();
+    assert_eq!(vacuum.triggers[0].trigger_type, "IntervalTrigger");
+
+    // An empty list is kept too: the task then runs only when started
+    assert_eq!(
+        post("LibraryScan", serde_json::json!([])).await,
+        StatusCode::NO_CONTENT
+    );
+    let restarted =
+        rustyfin_core::scheduler::TaskScheduler::new(state.db.clone(), state.data_dir.clone());
+    assert!(
+        restarted
+            .get_task("LibraryScan")
+            .await
+            .unwrap()
+            .triggers
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn r3admin_quick_connect_follows_the_setting() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let enabled = || async {
+        send(&app, request("GET", "/QuickConnect/Enabled", None, None))
+            .await
+            .1
+    };
+    assert_eq!(enabled().await, true, "on by default, as in Jellyfin");
+
+    let (_, mut config) = send_authed(&app, "GET", "/System/Configuration", &token, None).await;
+    assert_eq!(config["QuickConnectAvailable"], true);
+    config["QuickConnectAvailable"] = false.into();
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        "/System/Configuration",
+        &token,
+        Some(&config.to_string()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(enabled().await, false);
+    let (status, _) = send(&app, request("POST", "/QuickConnect/Initiate", None, None)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        "/QuickConnect/Authorize?code=123456",
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn r3admin_transcoding_sessions_show_their_transcoding_info() {
+    let state = test_state().await;
+    add_user(&state, "r3a-chrome", "r3a-pass", true).await;
+    let (hi10, hi10_source, _) =
+        j2_item(&state, "r3a-hi10", "Movie", "mp4", j2_h264("High 10", 10)).await;
+    let app = app(state);
+    let (token, _) = g2_login_device(&app, "r3a-chrome", "r3a-pass", "r3a-device")
+        .await
+        .unwrap();
+    let chrome = serde_json::json!({ "DeviceProfile": j2_chrome_profile() });
+    let uri = format!("/Items/{hi10}/PlaybackInfo");
+    let (sources, ps) = j2_play(&app, "POST", &uri, &token, Some(chrome)).await;
+    assert_eq!(j2_reasons(&sources[0]), ["VideoProfileNotSupported"]);
+
+    let session = || async {
+        let (status, list) =
+            send_authed(&app, "GET", "/Sessions?DeviceId=r3a-device", &token, None).await;
+        assert_eq!(status, StatusCode::OK);
+        list[0].clone()
+    };
+    let report = |method: &str| {
+        serde_json::json!({
+            "ItemId": hi10, "PositionTicks": 0, "PlaySessionId": ps, "MediaSourceId": hi10_source,
+            "PlayMethod": method, "CanSeek": true,
+        })
+        .to_string()
+    };
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        "/Sessions/Playing",
+        &token,
+        Some(&report("Transcode")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let s = session().await;
+    assert_eq!(s["PlayState"]["PlayMethod"], "Transcode");
+    assert_eq!(
+        s["TranscodingInfo"]["TranscodeReasons"],
+        serde_json::json!(["VideoProfileNotSupported"]),
+        "{s}"
+    );
+    assert_eq!(s["TranscodingInfo"]["IsVideoDirect"], false);
+
+    // A direct play has none
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        "/Sessions/Playing",
+        &token,
+        Some(&report("DirectPlay")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(session().await.get("TranscodingInfo").is_none());
+}
+
+#[tokio::test]
+async fn r3admin_shutdown_answers_204_and_info_says_shutting_down() {
+    let state = test_state().await;
+    let mut rx = state.shutdown_tx.subscribe();
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let (_, info) = send_authed(&app, "GET", "/System/Info", &token, None).await;
+    assert_eq!(info["IsShuttingDown"], false);
+    for key in [
+        "CachePath",
+        "InternalMetadataPath",
+        "TranscodingTempPath",
+        "LogPath",
+        "ProgramDataPath",
+    ] {
+        assert!(info[key].as_str().is_some_and(|p| !p.is_empty()), "{key}");
+    }
+    assert_eq!(info["HasPendingRestart"], false);
+    let (status, _) = send_authed(&app, "POST", "/System/Shutdown", &token, None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(*rx.borrow_and_update());
+    let (_, info) = send_authed(&app, "GET", "/System/Info", &token, None).await;
+    assert_eq!(info["IsShuttingDown"], true);
+}
+
+#[test]
+fn r3admin_web_dashboard() {
+    b124_node_test("r3admin_dashboard.mjs");
 }
