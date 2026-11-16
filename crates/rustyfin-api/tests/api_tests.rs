@@ -23383,6 +23383,102 @@ async fn b171_user_configuration_keeps_next_episode_autoplay() {
     assert_eq!(saved["SubtitleMode"], "Always");
 }
 
+// R3 settings: profile pictures, as Jellyfin's /UserImage. A user sets their own (base64 body, as
+// Jellyfin Web sends it, or the raw file on the older /Users/{id}/Images/Primary), it is served
+// without sign-in, its tag is the user's PrimaryImageTag, and a new picture replaces the old file.
+#[tokio::test]
+async fn r3settings_profile_image() {
+    use base64::Engine as _;
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, owner_id, viewer, viewer_id) = g1_owner_and_viewer(&state, &app).await;
+    let png: &[u8] = b"\x89PNG\r\n\x1a\n-not-a-real-png-but-a-signature";
+    let jpeg: &[u8] = b"\xFF\xD8\xFF\xE0-jpeg-body";
+    let upload = |uri: String, token: &str, body: Vec<u8>| {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "image/png")
+            .body(Body::from(body))
+            .unwrap()
+    };
+    let me_tag = || async {
+        let (_, me) = send(&app, request("GET", "/Users/Me", Some(&viewer), None)).await;
+        me.get("PrimaryImageTag").cloned()
+    };
+    let image = || async {
+        let uri = format!("/UserImage?userId={viewer_id}");
+        let resp = app
+            .clone()
+            .oneshot(request("GET", &uri, None, None))
+            .await
+            .unwrap();
+        let status = resp.status();
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .map(|v| v.to_str().unwrap().to_string());
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, content_type, bytes.to_vec())
+    };
+    let files = || {
+        let dir = state.data_dir.join("users").join(
+            uuid::Uuid::parse_str(&viewer_id)
+                .unwrap()
+                .simple()
+                .to_string(),
+        );
+        std::fs::read_dir(dir).map(|d| d.count()).unwrap_or(0)
+    };
+
+    assert_eq!(me_tag().await, None);
+    assert_eq!(image().await.0, StatusCode::NOT_FOUND);
+
+    let encoded = base64::engine::general_purpose::STANDARD.encode(png);
+    let uri = format!("/UserImage?userId={viewer_id}");
+    let (status, _) = send(&app, upload(uri.clone(), &viewer, encoded.into_bytes())).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let first = me_tag().await.expect("a tag after the upload");
+    let (status, content_type, bytes) = image().await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(content_type.as_deref(), Some("image/png"));
+    assert_eq!(bytes, png);
+    let (_, users) = send(&app, request("GET", "/Users", Some(&owner), None)).await;
+    let listed = users
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["Id"].as_str().unwrap().replace('-', "") == viewer_id.replace('-', ""))
+        .unwrap();
+    assert_eq!(listed["PrimaryImageTag"], first);
+
+    // Someone else's picture is the user's own or an administrator's to change; a non-image is refused
+    let theirs = format!("/UserImage?userId={owner_id}");
+    let (status, _) = send(&app, upload(theirs, &viewer, png.to_vec())).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = send(&app, upload(uri.clone(), &viewer, b"hello".to_vec())).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(me_tag().await.as_ref(), Some(&first));
+
+    // The older route takes the raw file; the new picture gets a new tag and the old file goes
+    let legacy = format!("/Users/{viewer_id}/Images/Primary");
+    let (status, _) = send(&app, upload(legacy, &viewer, jpeg.to_vec())).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let second = me_tag().await.expect("a tag after the second upload");
+    assert_ne!(second, first);
+    let (_, content_type, bytes) = image().await;
+    assert_eq!(content_type.as_deref(), Some("image/jpeg"));
+    assert_eq!(bytes, jpeg);
+    assert_eq!(files(), 1);
+
+    let (status, _) = send(&app, request("DELETE", &uri, Some(&viewer), None)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(me_tag().await, None);
+    assert_eq!(image().await.0, StatusCode::NOT_FOUND);
+    assert_eq!(files(), 0);
+}
+
 // B152: library grid images keep up with scrolling (web client)
 #[test]
 fn b152_blurhash_decoder() {
