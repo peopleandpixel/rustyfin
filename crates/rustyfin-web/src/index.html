@@ -346,6 +346,10 @@
 
     <!-- Right Actions -->
     <div class="flex items-center gap-2 flex-shrink-0">
+        <!-- Google Cast: shown once a Cast device is found (cast.js) -->
+        <button id="nav-cast" class="hidden jf-icon-btn" title="Play on" aria-label="Play on" data-i18n-title="remote.play_on" data-i18n-aria-label="remote.play_on" onclick="openPlayOn()">
+            <i data-lucide="cast" class="w-5 h-5"></i>
+        </button>
         <!-- Quick Connect badge -->
         <button id="nav-quick-connect" class="hidden sm:inline-flex jf-icon-btn !w-auto px-2.5 text-xs text-white/60 hover:text-white" title="Quick Connect" aria-label="Quick Connect" data-i18n-title="quick_connect.title" data-i18n-aria-label="quick_connect.title" onclick="showQuickConnectModal()">
             <i data-lucide="smartphone" class="w-4 h-4 mr-1 text-[#00a4dc]"></i>

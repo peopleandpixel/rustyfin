@@ -48,6 +48,26 @@
         "video": "Video",
         "audio": "Audio"
     },
+    "cast": {
+        "google_cast": "Google Cast",
+        "choose_device": "Choose a Cast device",
+        "searching": "Looking for Cast devices…",
+        "no_devices": "No Cast devices found",
+        "casting_to": "Casting to {{name}}",
+        "unavailable": "Casting isn't available in this browser.",
+        "connect_failed": "Could not connect to the Cast device.",
+        "playback_error": "The Cast device could not play this item.",
+        "stop": "Stop casting",
+        "previous": "Previous",
+        "next": "Next",
+        "play_pause": "Play or pause",
+        "seek": "Position",
+        "mute": "Mute",
+        "volume": "Volume",
+        "audio": "Audio track",
+        "subtitles": "Subtitles",
+        "subtitles_off": "Off"
+    },
     "dashboard": {
         "general": "General",
         "shutdown": "Shut down",

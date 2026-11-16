@@ -3388,6 +3388,7 @@ const B124_WEB_MODULES: &[&str] = &[
     "auth.js",
     "cardmenu.js",
     "cards.js",
+    "cast.js",
     "collections.js",
     "dashboard.js",
     "genres.js",
@@ -48206,4 +48207,12 @@ async fn r3cast_receiver_application_ids_and_header_auth() {
         .map(|a| a["Id"].as_str().unwrap().to_string())
         .collect();
     assert_eq!(ids, ["F007D354", "6F511C87"]);
+}
+
+// The web client's Cast sender: the SDK loads only on demand, one picker lists Cast devices and
+// sessions, the hand-off carries item, position and tracks, remote controls drive the receiver,
+// and stopping resumes local playback where the receiver was
+#[test]
+fn r3cast_web_sender() {
+    b124_node_test("r3cast_web.mjs");
 }

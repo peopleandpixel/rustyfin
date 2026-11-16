@@ -593,7 +593,14 @@ function renderTrackMenus(session) {
 // queued: the play queue (queue.js) started this item; any other play ends the queue.
 // selection: the detail page's choice, { mediaSourceId, audioIndex, subtitleIndex (-1 is off), startTicks };
 // a field left out keeps the default.
+// Casting (cast.js) takes over playback: while it returns true, the receiver plays the item instead
+let playInterceptor = null;
+function setPlayInterceptor(fn) {
+    playInterceptor = fn;
+}
+
 async function playItem(itemId, streamType = 'Videos', title = '', { fromStart = false, carry = null, queued = false, selection = null } = {}) {
+    if (playInterceptor?.(itemId, streamType, title, { fromStart, selection })) return;
     const video = $('video-player');
     const modal = $('player-modal');
     if (!video || !modal) return;
@@ -2044,10 +2051,13 @@ document.addEventListener('keydown', e => {
     }
 });
 
-// Remote control (remote.js): the playing item and where it is, and a seek to an item time in ticks
+// Remote control (remote.js, cast.js): the playing item, where it is and its tracks, and a seek to an item time in ticks
 function nowPlaying() {
     const s = activePlayback;
-    return s ? { itemId: s.itemId, streamType: s.streamType, positionTicks: Math.round(s.position() * 1e7) } : null;
+    return s ? {
+        itemId: s.itemId, streamType: s.streamType, positionTicks: Math.round(s.position() * 1e7),
+        mediaSourceId: s.mediaSourceId, audioIndex: s.audioIndex, subtitleIndex: s.subtitleIndex,
+    } : null;
 }
 
 function seekToTicks(ticks) {
@@ -2055,7 +2065,7 @@ function seekToTicks(ticks) {
 }
 
 export {
-    nowPlaying, seekToTicks,
+    nowPlaying, seekToTicks, setPlayInterceptor,
     resumePositionTicks, playWithResumeChoice, stopPlayback, seekVideo, skipTime, previewSeek, changeAudioTrack,
     changeSubtitleTrack, playItem, playerAutoHide, onPlayerClosed, playerAreaClick, closePlayer, playAdjacentEpisode,
     playUpNextNow, cancelUpNext, togglePlayPause, setVolume, toggleMute, setPlaybackRate, toggleFullscreen,

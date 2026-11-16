@@ -1,9 +1,10 @@
 // Remote control from this browser: the dashboard's active sessions (now playing, progress, play method, and
 // pause, stop and message controls), kept current by the socket's Sessions messages, and "Play on", which hands
-// the playing item over to another session at the same point.
+// the playing item over to another session at the same point. The picker lists the Cast devices too (cast.js).
 import { $, icon, toast, escapeHtml, formatDurationSeconds } from './util.js';
 import { nowPlaying, closePlayer } from './player.js';
 import { onSocketMessage, sendSocket } from './remote.js';
+import { castSupported, castPickerEntry, refreshPickerEntry } from './cast.js';
 
 // Jellyfin's dashboard lists the sessions active in the last 16 minutes
 const ACTIVE_WITHIN_SECONDS = 960;
@@ -146,7 +147,7 @@ async function sessionControl(id, action) {
     }
 }
 
-// The "Play on" list: the other sessions that take remote control
+// The "Play on" list: Google Cast (in a browser that can cast) and the other sessions that take remote control
 function playOnDialog() {
     let dialog = $('play-on-dialog');
     if (!dialog) {
@@ -159,17 +160,28 @@ function playOnDialog() {
     return dialog;
 }
 
+// A Cast receiver's own session (it reports with this user's token) is reached through the Cast entry
+const isCastReceiver = s => /chromecast/i.test(s.Client || '');
+
 async function openPlayOn() {
-    if (!nowPlaying()) return;
+    const cast = castSupported();
+    if (!nowPlaying() && !cast) return;
+    // The Cast SDK loads now, while the user looks at the list
+    if (cast) refreshPickerEntry();
     let sessions = [];
-    try {
-        sessions = await API.get(`/Sessions?ControllableByUserId=${encodeURIComponent(API.userId)}`);
-    } catch (e) {
-        toast(t('remote.command_failed'), 'error');
-        return;
+    if (nowPlaying()) {
+        try {
+            sessions = await API.get(`/Sessions?ControllableByUserId=${encodeURIComponent(API.userId)}`);
+        } catch (e) {
+            if (!cast) {
+                toast(t('remote.command_failed'), 'error');
+                return;
+            }
+        }
     }
-    const targets = (sessions || []).filter(s => s.DeviceId !== ownDeviceId() && s.SupportsMediaControl && isRecent(s));
-    if (!targets.length) {
+    const targets = (sessions || []).filter(s => s.DeviceId !== ownDeviceId() && s.SupportsMediaControl && isRecent(s)
+        && !isCastReceiver(s));
+    if (!targets.length && !cast) {
         toast(t('remote.no_targets'), 'error');
         return;
     }
@@ -178,6 +190,7 @@ async function openPlayOn() {
         <div class="modal-box bg-[#101827] border border-white/10 max-w-sm">
             <h3 class="font-bold text-white text-base mb-3">${t('remote.play_on')}</h3>
             <ul class="flex flex-col gap-1">
+                ${castPickerEntry()}
                 ${targets.map(s => `<li><button type="button" class="w-full text-left rounded-lg px-3 py-2 hover:bg-white/10 text-white"
                     onclick="playOnSession('${escapeHtml(s.Id)}')">
                     <span class="block text-sm font-semibold">${escapeHtml(s.DeviceName || s.Client || '')}</span>
