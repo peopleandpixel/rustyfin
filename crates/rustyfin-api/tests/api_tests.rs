@@ -9519,6 +9519,16 @@ async fn r3endpoints_user_settings_take_the_user_from_the_query() {
     let uri = format!("/Users/Configuration?userId={owner_id}");
     let req = request("POST", &uri, Some(&viewer), Some(config));
     assert_eq!(send(&app, req).await.0, StatusCode::FORBIDDEN);
+    // So are another user's password and name, and both stay as they were.
+    let uri = format!("/Users/Password?userId={owner_id}");
+    let pw = serde_json::json!({ "CurrentPw": "ownerpass", "NewPw": "taken" });
+    let req = request("POST", &uri, Some(&viewer), Some(pw));
+    assert_eq!(send(&app, req).await.0, StatusCode::FORBIDDEN, "{uri}");
+    let uri = format!("/Users?userId={owner_id}");
+    let name = serde_json::json!({ "Name": "renamed" });
+    let req = request("POST", &uri, Some(&viewer), Some(name));
+    assert_eq!(send(&app, req).await.0, StatusCode::FORBIDDEN, "{uri}");
+    assert!(login(&app, "owner", "ownerpass").await.is_some());
 
     let uri = format!("/Users?userId={viewer_id}");
     let name = serde_json::json!({ "Name": "viewer2" });
@@ -9625,6 +9635,230 @@ async fn r3endpoints_movie_parts_stack_into_one_movie_with_additional_parts() {
     let uri = format!("/Videos/{}/AdditionalParts", uuid::Uuid::new_v4());
     let (status, _) = send_authed(&app, "GET", &uri, &token, None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// A movies library at a new folder `name` under the data dir, created but not scanned.
+async fn r3endpoints_movies_library(
+    state: &AppState,
+    name: &str,
+) -> (std::path::PathBuf, rustyfin_model::library::Library) {
+    let root = std::path::PathBuf::from(media_folder(state, name));
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: name.to_string(),
+        content_type: rustyfin_model::library::LibraryContentType::Movies,
+        paths: vec![root.to_str().unwrap().to_string()],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    (root, lib)
+}
+
+async fn r3endpoints_scan(state: &AppState, lib: &rustyfin_model::library::Library) {
+    rustyfin_core::scanner::scan_library(&state.db, lib)
+        .await
+        .unwrap();
+    rustyfin_core::scanner::wait_for_idle().await;
+}
+
+/// The stored rows of a library: `(id, path file name, media_type, extra_type, owner_id)`, by path.
+async fn r3endpoints_rows(
+    state: &AppState,
+    lib: &rustyfin_model::library::Library,
+) -> Vec<(String, String, String, Option<String>, Option<String>)> {
+    let rows: Vec<(String, String, String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT id, path, media_type, extra_type, owner_id FROM media_items
+         WHERE library_id = ?1 ORDER BY path",
+    )
+    .bind(lib.id.to_string())
+    .fetch_all(&state.db)
+    .await
+    .unwrap();
+    rows.into_iter()
+        .map(|(id, path, kind, extra, owner)| {
+            let file = path.rsplit('/').next().unwrap().to_string();
+            (id, file, kind, extra, owner)
+        })
+        .collect()
+}
+
+/// A stack that breaks up (part 1 deleted) leaves no orphan part: the stored part is the movie again,
+/// with its id, and no second movie is added at its path.
+#[tokio::test]
+async fn r3endpoints_a_broken_stack_makes_its_part_the_movie_again() {
+    let state = test_state().await;
+    let (root, lib) = r3endpoints_movies_library(&state, "r3endpoints broken stack").await;
+    let film = root.join("Copper Vale (2007)");
+    for part in ["cd1", "cd2"] {
+        if !r3extras_media(&film.join(format!("Copper Vale (2007)-{part}.mkv")), false) {
+            return;
+        }
+    }
+    r3endpoints_scan(&state, &lib).await;
+    let rows = r3endpoints_rows(&state, &lib).await;
+    let part = rows
+        .iter()
+        .find(|row| row.1 == "Copper Vale (2007)-cd2.mkv")
+        .unwrap();
+    assert_eq!(part.3.as_deref(), Some("Part"), "{rows:?}");
+    let part_id = part.0.clone();
+
+    std::fs::remove_file(film.join("Copper Vale (2007)-cd1.mkv")).unwrap();
+    r3endpoints_scan(&state, &lib).await;
+    let rows = r3endpoints_rows(&state, &lib).await;
+    assert_eq!(
+        rows,
+        vec![(
+            part_id,
+            "Copper Vale (2007)-cd2.mkv".to_string(),
+            "Movie".to_string(),
+            None,
+            None
+        )],
+        "one movie at the former part's path, with its id"
+    );
+}
+
+/// Two movies that a scan now stacks (an older scan stored part 1 and part 2 as movies of their own):
+/// part 2's watch state is merged into the movie once, and the movie keeps its own resume point.
+#[tokio::test]
+async fn r3endpoints_two_movies_that_stack_merge_their_user_data() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let (root, lib) = r3endpoints_movies_library(&state, "r3endpoints merged parts").await;
+    let film = root.join("Birch Hollow (2011)");
+    let files: Vec<std::path::PathBuf> = ["part1", "part2"]
+        .iter()
+        .map(|p| film.join(format!("Birch Hollow (2011) {p}.mkv")))
+        .collect();
+    for file in &files {
+        if !r3extras_media(file, false) {
+            return;
+        }
+    }
+    // As an older scan left them: two movies, one per file.
+    let ids: Vec<String> = (0..2).map(|_| uuid::Uuid::new_v4().to_string()).collect();
+    for (id, file) in ids.iter().zip(&files) {
+        sqlx::query(
+            "INSERT INTO media_items (id, library_id, name, media_type, path) VALUES (?, ?, ?, 'Movie', ?)",
+        )
+        .bind(id)
+        .bind(lib.id.to_string())
+        .bind("Birch Hollow")
+        .bind(file.to_str().unwrap())
+        .execute(&state.db)
+        .await
+        .unwrap();
+    }
+    let user_data = [
+        serde_json::json!({ "PlaybackPositionTicks": 70_000_000, "PlayCount": 1 }),
+        serde_json::json!({
+            "PlaybackPositionTicks": 90_000_000, "PlayCount": 3, "Played": true,
+            "IsFavorite": true, "LastPlayedDate": "2026-01-02T03:04:05Z"
+        }),
+    ];
+    for (id, data) in ids.iter().zip(user_data) {
+        let uri = format!("/UserItems/{id}/UserData");
+        let body = data.to_string();
+        let (status, answer) = send_authed(&app, "POST", &uri, &token, Some(&body)).await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
+    }
+
+    r3endpoints_scan(&state, &lib).await;
+    let rows = r3endpoints_rows(&state, &lib).await;
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(
+        (rows[0].0.as_str(), rows[0].3.as_deref()),
+        (ids[0].as_str(), None)
+    );
+    assert_eq!(
+        (
+            rows[1].0.as_str(),
+            rows[1].3.as_deref(),
+            rows[1].4.as_deref()
+        ),
+        (ids[1].as_str(), Some("Part"), Some(ids[0].as_str())),
+        "{rows:?}"
+    );
+    let uri = format!("/UserItems/{}/UserData", ids[0]);
+    let (status, data) = send_authed(&app, "GET", &uri, &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{data}");
+    assert_eq!(data["Played"], true, "{data}");
+    assert_eq!(data["IsFavorite"], true, "{data}");
+    assert_eq!(data["PlayCount"], 3, "{data}");
+    assert_eq!(data["PlaybackPositionTicks"], 70_000_000, "{data}");
+    assert!(
+        data["LastPlayedDate"]
+            .as_str()
+            .unwrap()
+            .starts_with("2026-01-02"),
+        "{data}"
+    );
+
+    // Once only: a rescan doesn't merge again.
+    let uri = format!("/UserItems/{}/UserData", ids[0]);
+    let body = serde_json::json!({ "Played": false, "IsFavorite": false }).to_string();
+    assert_eq!(
+        send_authed(&app, "POST", &uri, &token, Some(&body)).await.0,
+        StatusCode::OK
+    );
+    r3endpoints_scan(&state, &lib).await;
+    let (_, data) = send_authed(&app, "GET", &uri, &token, None).await;
+    assert_eq!(data["Played"], false, "{data}");
+    assert_eq!(data["IsFavorite"], false, "{data}");
+}
+
+/// A library whose `-cd1`/`-cd2` files an older scan stored as two versions of one movie: the
+/// rescan keeps the movie and its id, drops the part 2 version, and makes part 2 its part.
+#[tokio::test]
+async fn r3endpoints_parts_stored_as_versions_become_parts_on_rescan() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let (root, lib) = r3endpoints_movies_library(&state, "r3endpoints versions").await;
+    let film = root.join("Slate Harbor (2016)");
+    let cd1 = film.join("Slate Harbor (2016)-cd1.mkv");
+    let cd2 = film.join("Slate Harbor (2016)-cd2.mkv");
+    if !r3extras_media(&cd1, false) {
+        return;
+    }
+    r3endpoints_scan(&state, &lib).await;
+    let movies = j5_movie_ids(&state).await;
+    assert_eq!(movies.len(), 1);
+    let movie = movies[0].clone();
+    // As an older scan left them: part 2 is a second media source (version) of the movie.
+    assert!(r3extras_media(&cd2, false));
+    sqlx::query("INSERT INTO media_sources (id, item_id, uid, path) VALUES (?, ?, ?, ?)")
+        .bind(uuid::Uuid::new_v4().simple().to_string())
+        .bind(&movie)
+        .bind(uuid::Uuid::new_v4().simple().to_string())
+        .bind(cd2.to_str().unwrap())
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+    r3endpoints_scan(&state, &lib).await;
+    assert_eq!(
+        j5_movie_ids(&state).await,
+        vec![movie.clone()],
+        "the same movie"
+    );
+    let (status, item) = send_authed(&app, "GET", &format!("/Items/{movie}"), &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{item}");
+    assert_eq!(item["PartCount"], 2, "{item}");
+    let sources: Vec<&str> = item["MediaSources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["Path"].as_str())
+        .collect();
+    assert_eq!(sources, [cd1.to_str().unwrap()], "{item}");
+    let uri = format!("/Videos/{movie}/AdditionalParts");
+    let (_, parts) = send_authed(&app, "GET", &uri, &token, None).await;
+    assert_eq!(parts["TotalRecordCount"], 1, "{parts}");
+    assert_eq!(parts["Items"][0]["Path"], cd2.to_str().unwrap(), "{parts}");
 }
 
 /// A library under the data dir, holding one item of each `(media_type, name)` pair.
@@ -9847,6 +10081,44 @@ async fn r3endpoints_clientlog_size_limit_is_413() {
         .unwrap();
     let (status, _) = send(&app, req).await;
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+/// Only the newest 50 uploads are kept: an upload deletes the oldest beyond that, and leaves the
+/// server's own log files alone.
+#[tokio::test]
+async fn r3endpoints_clientlog_keeps_the_newest_50_uploads() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let logs_dir = state.data_dir.join("logs");
+    std::fs::create_dir_all(&logs_dir).unwrap();
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    for i in 0..60 {
+        let file =
+            std::fs::File::create(logs_dir.join(format!("upload_old_1_{i:02}.log"))).unwrap();
+        file.set_modified(old + std::time::Duration::from_secs(i))
+            .unwrap();
+    }
+    std::fs::write(logs_dir.join("rustyfin.log"), "server").unwrap();
+    let app = app(state);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/ClientLog/Document")
+        .header("Authorization", format!("Bearer {token}"))
+        .body(Body::from("new"))
+        .unwrap();
+    let (status, json) = send(&app, req).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    let mut uploads: Vec<String> = std::fs::read_dir(&logs_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("upload_"))
+        .collect();
+    uploads.sort();
+    assert_eq!(uploads.len(), 50, "{uploads:?}");
+    assert!(uploads.contains(&json["FileName"].as_str().unwrap().to_string()));
+    // The 11 oldest went: 00 to 10.
+    assert_eq!(uploads[0], "upload_old_1_11.log");
+    assert!(logs_dir.join("rustyfin.log").exists());
 }
 
 /// Inserts a tuner host, a channel on it, and one guide entry on that channel.
