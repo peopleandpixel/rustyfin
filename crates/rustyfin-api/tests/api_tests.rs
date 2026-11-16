@@ -23827,10 +23827,6 @@ async fn r2parental_lists_leave_out_items_above_the_limit() {
     let ids_query = format!("/Items?Ids={},{gentle}", w.id("Rough"));
     let checks = [
         ("/Items/Latest?Limit=100".to_string(), "Rough"),
-        (
-            format!("/Users/{}/Items/Latest?Limit=100", w.kid_id),
-            "Rough",
-        ),
         ("/Search/Hints?searchTerm=Ro".to_string(), "Rough"),
         ("/Search/Hints?searchTerm=Grim".to_string(), "Grim Show"),
         ("/Search?Term=Rough".to_string(), "Rough"),
@@ -23870,6 +23866,13 @@ async fn r2parental_lists_leave_out_items_above_the_limit() {
                 "{uri}: {hidden} in {names:?}"
             );
         }
+    }
+    // The kid's Latest is the kid's, as in Jellyfin, even when the administrator asks for it.
+    let uri = format!("/Users/{}/Items/Latest?Limit=100", w.kid_id);
+    for token in [&w.admin, &w.kid] {
+        let (names, _) = w.names(token, &uri).await;
+        assert!(!names.is_empty(), "{uri}");
+        assert!(!names.contains(&"Rough".to_string()), "{uri}: {names:?}");
     }
 
     assert_eq!(
@@ -51798,7 +51801,21 @@ async fn r3queues_user_views_include_hidden() {
 async fn r3queues_resume_exclude_active_sessions() {
     let state = test_state().await;
     let app = app(state.clone());
-    let (token, user) = admin_session(&state).await;
+    let (_, user) = admin_session(&state).await;
+    // A token with a device, so its reports have a session to play on.
+    let account = rustyfin_db::repo_user::get_user_by_id(&state.db, user)
+        .await
+        .unwrap()
+        .unwrap();
+    let device = rustyfin_auth::TokenDevice {
+        device_id: "r3q-device".to_string(),
+        device_name: "R3Q Phone".to_string(),
+        app_name: "R3Q".to_string(),
+        app_version: "1.0".to_string(),
+    };
+    let token = rustyfin_auth::create_token(&state.db, &account, &device)
+        .await
+        .unwrap();
     let (_, [e1, e2, _]) = g1f_insert_show(&state).await;
     // The start report first: it writes its own play state, which the positions below replace.
     let (status, _) = send(
