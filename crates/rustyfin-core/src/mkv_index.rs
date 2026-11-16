@@ -4,9 +4,12 @@
 //!
 //! A cue point gives a key frame's time, its cluster's position and (as mkvmerge and ffmpeg
 //! write it) the block's position inside the cluster. ffmpeg's backward seek lands on the last
-//! cue at or before the time asked for, so `MkvIndex::pick` does the same. A file whose cue
-//! points lack the block's position, whose track is compressed (header stripping), or that
-//! can't be read as expected gives no index; the caller then lets ffprobe find the frames.
+//! cue at or before the time asked for, so `MkvIndex::pick` does the same. Where the cue points
+//! lack the block's position (older mkvmerge), the cluster is read from its start up to the
+//! video block with the cue's time, which in most such files is the cluster's first. A file
+//! whose track is compressed (header stripping), or that can't be read as expected, gives no
+//! index, and a frame that can't be found an `INDEX_FAILED`; the caller then lets ffprobe find
+//! the frames.
 
 use std::fs::File;
 use std::os::unix::fs::FileExt;
@@ -36,6 +39,7 @@ const CUE_TRACK: u64 = 0xF7;
 const CUE_CLUSTER_POSITION: u64 = 0xF1;
 const CUE_RELATIVE_POSITION: u64 = 0xF0;
 const CLUSTER: u64 = 0x1F43_B675;
+const CLUSTER_TIMESTAMP: u64 = 0xE7;
 const SIMPLE_BLOCK: u64 = 0xA3;
 const BLOCK_GROUP: u64 = 0xA0;
 const BLOCK: u64 = 0xA1;
@@ -48,11 +52,18 @@ const MOST: u64 = 64 << 20;
 pub(crate) struct Cue {
     /// The key frame's time, in seconds.
     pub(crate) seconds: f64,
+    /// The same in the file's timestamp units, as its blocks give it.
+    time: u64,
     /// Where its cluster starts in the file.
     cluster: u64,
-    /// Where its block starts in the cluster's body.
-    relative: u64,
+    /// Where its block starts in the cluster's body, where the cue says.
+    relative: Option<u64>,
 }
+
+/// How far into a cluster `MkvIndex::find_block` reads before it gives up.
+const SCAN_MOST: u64 = 4 << 20;
+/// What `read_frame` reads at a block first: its header and the frame's start.
+const CHUNK: u64 = 32 << 10;
 
 /// The cue points of a Matroska file's first video track, in time order.
 #[derive(Debug)]
@@ -242,7 +253,7 @@ impl MkvIndex {
         None
     }
 
-    /// The cue points of `track`, in time order; `None` if any lacks the block's position.
+    /// The cue points of `track`, in time order.
     fn cue_points(cues: &[u8], track: u64, scale: u64, segment: u64) -> Option<Vec<Cue>> {
         let mut out = Vec::new();
         for (point, fields) in children(cues) {
@@ -269,8 +280,9 @@ impl MkvIndex {
                 }
                 out.push(Cue {
                     seconds: time as f64 * scale as f64 / 1e9,
+                    time,
                     cluster: segment.checked_add(field(CUE_CLUSTER_POSITION)?)?,
-                    relative: field(CUE_RELATIVE_POSITION)?,
+                    relative: field(CUE_RELATIVE_POSITION),
                 });
             }
         }
@@ -294,13 +306,19 @@ impl MkvIndex {
 
     /// Two ranged reads: the cluster's header, then from the block on, the first `CHUNK` bytes
     /// holding its header and the frame's start; the rest of a larger frame follows on from
-    /// there, which a share's read-ahead serves without another seek.
+    /// there, which a share's read-ahead serves without another seek. Without the block's
+    /// position, the cluster is read on from its start instead (`find_block`).
     fn read_frame(&self, file: &File, cue: Cue) -> Option<Vec<u8>> {
-        const CHUNK: u64 = 32 << 10;
         let file_len = file.metadata().ok()?.len();
         let cluster = header(file, cue.cluster, file_len).filter(|e| e.id == CLUSTER)?;
-        let at = cluster.body.checked_add(cue.relative)?;
-        let chunk = read(file, at, CHUNK.min(file_len.checked_sub(at)?))?;
+        // `chunk` holds the file from `at`, the block, on
+        let (at, chunk) = match cue.relative {
+            Some(relative) => {
+                let at = cluster.body.checked_add(relative)?;
+                (at, read(file, at, CHUNK.min(file_len.checked_sub(at)?))?)
+            }
+            None => self.find_block(file, cluster, cue.time, file_len)?,
+        };
         // The SimpleBlock, or the Block among a BlockGroup's children
         let mut block = element(&chunk, at)?;
         let simple = block.id == SIMPLE_BLOCK;
@@ -341,10 +359,84 @@ impl MkvIndex {
         }
         Some(frame)
     }
+
+    /// The video block of `cluster` at `time`, read on from the cluster's start, and the file
+    /// from there on as far as it was read (at least its header). Reads on in one stretch, at
+    /// most `SCAN_MOST`.
+    fn find_block(
+        &self,
+        file: &File,
+        cluster: Element,
+        time: u64,
+        file_len: u64,
+    ) -> Option<(u64, Vec<u8>)> {
+        let end = cluster
+            .size
+            .map_or(file_len, |s| cluster.body.saturating_add(s))
+            .min(file_len)
+            .min(cluster.body + SCAN_MOST);
+        let (mut buf, mut buf_at) = (Vec::new(), cluster.body);
+        let mut cluster_time = None;
+        let mut at = cluster.body;
+        while at < end {
+            // Read on until the element's header, and a block's first bytes, are in `buf`
+            while at + 32 > buf_at + buf.len() as u64 && buf_at + (buf.len() as u64) < end {
+                let from = buf_at + buf.len() as u64;
+                let more = if buf.is_empty() { CHUNK } else { 256 << 10 };
+                buf.extend(read(file, from, more.min(end - from))?);
+            }
+            let offset = usize::try_from(at - buf_at).ok()?;
+            let el = element(buf.get(offset..)?, at)?;
+            let body = usize::try_from(el.body - buf_at).ok()?;
+            match el.id {
+                CLUSTER_TIMESTAMP => cluster_time = uint(buf.get(body..body + el.size? as usize)?),
+                SIMPLE_BLOCK | BLOCK_GROUP => {
+                    // A BlockGroup's Block comes first in it, as muxers write it
+                    let block = if el.id == BLOCK_GROUP {
+                        element(buf.get(body..)?, el.body).filter(|b| b.id == BLOCK)?
+                    } else {
+                        el
+                    };
+                    let head = buf.get(usize::try_from(block.body - buf_at).ok()?..)?;
+                    let (track, track_len) = number(head, false)?;
+                    let relative =
+                        i16::from_be_bytes([*head.get(track_len)?, *head.get(track_len + 1)?]);
+                    let block_time = cluster_time?.checked_add_signed(i64::from(relative))?;
+                    if track == self.track && block_time == time {
+                        return Some((at, buf.split_off(offset)));
+                    }
+                }
+                // A cluster of unknown size ends where the next starts
+                CLUSTER => return None,
+                _ => {}
+            }
+            at = el.body.checked_add(el.size?)?;
+            // Drop what lies behind; past the buffer, the next read goes on from its end
+            let behind = at.min(buf_at + buf.len() as u64) - buf_at;
+            buf.drain(..usize::try_from(behind).ok()?);
+            buf_at += behind;
+        }
+        None
+    }
 }
 
 #[cfg(test)]
 impl MkvIndex {
+    /// The same index without the blocks' positions, as older mkvmerge writes it.
+    pub(crate) fn without_positions(&self) -> Self {
+        Self {
+            track: self.track,
+            cues: self
+                .cues
+                .iter()
+                .map(|c| Cue {
+                    relative: None,
+                    ..*c
+                })
+                .collect(),
+        }
+    }
+
     /// The same index with every cluster `by` bytes off, as a damaged index would be.
     pub(crate) fn shifted(&self, by: u64) -> Self {
         let cues = self
@@ -386,7 +478,8 @@ mod tests {
         let cue = |seconds: f64| Cue {
             seconds,
             cluster: 0,
-            relative: 0,
+            time: 0,
+            relative: Some(0),
         };
         let index = MkvIndex {
             track: 1,

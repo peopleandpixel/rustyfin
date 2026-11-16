@@ -2057,12 +2057,14 @@ mod tests {
             let probed = probe(&clip, &Cancel::new()).await.unwrap().unwrap();
             let index = probed.raw.as_ref().unwrap().index.clone();
             let index = index.expect("ffmpeg writes cues with the block's position");
-            // Through the index; through ffprobe; and through an index whose clusters are all
-            // in the wrong place, which falls back to ffprobe
+            // Through the index; through ffprobe; through an index without the blocks'
+            // positions, which reads each cluster from its start; and through an index whose
+            // clusters are all in the wrong place, which falls back to ffprobe
             let mut made = Vec::new();
             for (name, index) in [
                 ("index", Some(index.clone())),
                 ("ffprobe", None),
+                ("scan", Some(Arc::new(index.without_positions()))),
                 ("broken", Some(Arc::new(index.shifted(7)))),
             ] {
                 let mut p = probed.clone();
@@ -2081,6 +2083,10 @@ mod tests {
             );
             assert!(
                 made[2] == made[1],
+                "{encoder}: scanning the clusters finds them too"
+            );
+            assert!(
+                made[3] == made[1],
                 "{encoder}: a broken index falls back to ffprobe"
             );
             checked += 1;
