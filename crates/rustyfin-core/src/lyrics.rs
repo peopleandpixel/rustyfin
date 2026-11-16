@@ -269,7 +269,7 @@ pub fn lyrics_tag(tags: &HashMap<String, String>) -> Option<String> {
             k == "lyrics" || k.starts_with("lyrics-") || k == "unsyncedlyrics"
         })
         .collect();
-    keys.sort_by_key(|k| (k.to_ascii_lowercase() != "lyrics", k.to_ascii_lowercase()));
+    keys.sort_by_key(|k| (!k.eq_ignore_ascii_case("lyrics"), k.to_ascii_lowercase()));
     keys.into_iter()
         .map(|k| tags[k].trim())
         .find(|v| !v.is_empty())
