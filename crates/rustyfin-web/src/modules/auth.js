@@ -4,6 +4,7 @@ import { currentPage, navigate } from './router.js';
 import { renderSettings } from './settings.js';
 import { loadUserSettings } from './user-settings.js';
 import { jiChoice, jiConfirm, jiShownCodes } from './jellyfin-import.js';
+import { showLoginDisclaimer } from './branding.js';
 import { loadSidebar, initScanProgressWebSocket, stopScanProgressWebSocket } from './library-admin.js';
 
 // --- OpenID Connect: helpers for the sign-in page and the profile ---
@@ -191,9 +192,11 @@ function renderLogin(data) {
                 <div id="login-error" class="text-red-400 text-xs text-center hidden p-2 rounded bg-red-500/10 border border-red-500/20"></div>
             </form>
             <div id="oidc-sign-in"></div>
+            <p id="login-disclaimer" class="hidden mt-6 text-xs text-white/50 text-center whitespace-pre-line"></p>
         </div>
     </div>`);
     loadOidcSignIn();
+    showLoginDisclaimer($('login-disclaimer'));
     if (data === 'oidc') completeOidcSignIn();
     else if (oidcError !== null) showLoginError(oidcErrorText(oidcError));
 }
