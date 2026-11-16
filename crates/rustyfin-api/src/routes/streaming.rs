@@ -1110,10 +1110,11 @@ async fn video_universal(
         if let Some(source) = media_sources.get(index) {
             url.push_str(&format!("&MediaSourceId={}", source.id));
         }
-        if let Some(bitrate) = query
-            .max_video_bitrate
-            .or_else(|| streaming_video_kbps(query.max_streaming_bitrate))
-        {
+        // The transcode's VideoBitrate is in kbps; Jellyfin's MaxVideoBitrate is in bits/s. With
+        // both limits the lower one wins.
+        let max_video_kbps = query.max_video_bitrate.map(|bps| (bps / 1000).max(1));
+        let streaming_kbps = streaming_video_kbps(query.max_streaming_bitrate);
+        if let Some(bitrate) = [max_video_kbps, streaming_kbps].into_iter().flatten().min() {
             url.push_str(&format!("&VideoBitrate={}", bitrate));
         }
         if let Some(bitrate) = query.max_audio_bitrate {
