@@ -136,7 +136,20 @@ async fn logout_session(
     token: Option<Extension<rustyfin_auth::RequestToken>>,
 ) -> Result<StatusCode, ApiError> {
     if let Some(Extension(rt)) = token {
+        // The sessions the logout ends, so their play state goes with them
+        let ended = match rustyfin_auth::token_device(&state.db, &rt.0).await? {
+            Some((user, device)) => {
+                rustyfin_db::repo_session::session_ids(
+                    &state.db,
+                    Some(user),
+                    Some(&device.device_id),
+                )
+                .await?
+            }
+            None => Vec::new(),
+        };
         rustyfin_auth::logout(&state.db, &rt.0).await?;
+        crate::sessions::forget_all(&ended);
         crate::sessions::changed(&state);
     }
     Ok(StatusCode::NO_CONTENT)
@@ -386,7 +399,10 @@ async fn delete_device(
             "Administrator access is required.".to_string(),
         ));
     }
+    let ended = rustyfin_db::repo_session::session_ids(&state.db, None, Some(&q.id)).await?;
     rustyfin_db::repo_session::delete_device(&state.db, &q.id).await?;
+    crate::sessions::forget_all(&ended);
+    crate::sessions::changed(&state);
     Ok(Json(serde_json::json!({})))
 }
 
@@ -400,12 +416,18 @@ async fn send_device_command(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let owner = rustyfin_db::repo_session::get_device_user_id(&state.db_ro, &device_id).await?;
     check_control(&claims, owner, "Device")?;
-    // The device's session, which its sockets joined
-    let session = rustyfin_db::repo_session::find_device_session(&state.db_ro, &device_id)
-        .await?
-        .unwrap_or(device_id.clone());
+    let name = known(GENERAL_COMMANDS, &cmd.name)
+        .ok_or_else(|| bad_request(format!("Unknown command '{}'.", cmd.name)))?;
+    // The device owner's session on it, which its sockets joined
+    let session = match owner {
+        Some(owner) => {
+            rustyfin_db::repo_session::find_device_session(&state.db_ro, owner, &device_id).await?
+        }
+        None => None,
+    }
+    .unwrap_or(device_id.clone());
     let event = general_command(
-        &cmd.name,
+        name,
         claims.sub,
         cmd.arguments.unwrap_or_else(|| serde_json::json!({})),
     );
@@ -533,6 +555,11 @@ async fn update_user_capabilities(
     Ok(())
 }
 
+// Intended behaviour of both capability routes (keep it when merging other changes here):
+// - they store on the request's own session (its user and device), else the user's latest one;
+// - `SupportsMediaControl` is the client's own flag, and `SupportsRemoteControl` follows it, as
+//   Jellyfin's SessionInfo derives it; a socket alone doesn't make a session controllable;
+// - the query form also takes a JSON body; both answer 204.
 /// POST /Sessions/Capabilities: Jellyfin's query-string form (`playableMediaTypes`,
 /// `supportedCommands`, `supportsMediaControl`, `supportsPersistentIdentifier`). A JSON body, as
 /// older Rustyfin clients post, is read too.

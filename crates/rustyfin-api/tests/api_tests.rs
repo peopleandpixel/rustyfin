@@ -29650,6 +29650,221 @@ async fn r3sessions_sessions_messages_follow_sessions_start() {
     }
 }
 
+/// Starts `item` on `token`'s session and returns that session's id, as an administrator sees it.
+async fn r3s_start(
+    app: &axum::Router,
+    admin: &str,
+    token: &str,
+    device: &str,
+    item: uuid::Uuid,
+) -> String {
+    let body =
+        serde_json::json!({ "ItemId": item, "PositionTicks": 0, "PlaySessionId": "r3s-psid" });
+    assert_eq!(
+        r3s_post(app, token, "/Sessions/Playing", Some(body)).await,
+        StatusCode::NO_CONTENT
+    );
+    let s = r3s_session(app, admin, device).await;
+    assert_eq!(s["NowPlayingItem"]["Id"], item.to_string().as_str());
+    s["Id"].as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn r3sessions_two_users_on_one_device_id_have_separate_sessions() {
+    let state = test_state().await;
+    let _dir = G1cDataDir(state.data_dir.to_path_buf());
+    let app = app(state.clone());
+    let addr = r3s_serve(&app).await;
+    let (admin, a_token, a_id) = r3s_owner(&app).await;
+    add_user(&state, "bee", "beepass", false).await;
+    let m = g1c_insert_movies(&state, 1).await;
+    let mut a_socket = G1cSocket::open(addr, &a_token).await;
+    let a_session = r3s_start(&app, &admin, &a_token, "r3s-tgt", m[0]).await;
+
+    // B signs in with A's device id: a session of B's own, and A's stays A's with its playback.
+    let (b_token, b_id) = r3s_login(&app, "bee", "beepass", "r3s-tgt").await;
+    let (_, all) = send(
+        &app,
+        request("GET", "/Sessions?DeviceId=r3s-tgt", Some(&admin), None),
+    )
+    .await;
+    let all = all.as_array().unwrap();
+    assert_eq!(all.len(), 2);
+    let a = all.iter().find(|s| s["UserId"] == a_id.as_str()).unwrap();
+    let b = all.iter().find(|s| s["UserId"] == b_id.as_str()).unwrap();
+    assert_eq!(a["Id"], a_session.as_str());
+    assert_ne!(b["Id"], a_session.as_str());
+    assert_eq!(a["NowPlayingItem"]["Id"], m[0].to_string().as_str());
+    assert!(b.get("NowPlayingItem").is_none());
+
+    // B sees only B's session and cannot control A's.
+    let (_, mine) = send(&app, request("GET", "/Sessions", Some(&b_token), None)).await;
+    assert!(
+        mine.as_array()
+            .unwrap()
+            .iter()
+            .all(|s| s["UserId"] == b_id.as_str())
+    );
+    let uri = format!("/Sessions/{a_session}/Playing/Pause");
+    assert_eq!(
+        r3s_post(&app, &b_token, &uri, None).await,
+        StatusCode::FORBIDDEN
+    );
+
+    // B's reports go to B's session; A's socket gets nothing of B's.
+    let progress = serde_json::json!({ "ItemId": m[0], "PositionTicks": 900, "IsPaused": true });
+    assert_eq!(
+        r3s_post(&app, &b_token, "/Sessions/Playing/Progress", Some(progress)).await,
+        StatusCode::NO_CONTENT
+    );
+    let (_, all) = send(
+        &app,
+        request("GET", "/Sessions?DeviceId=r3s-tgt", Some(&admin), None),
+    )
+    .await;
+    let a = all
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["UserId"] == a_id.as_str())
+        .unwrap()
+        .clone();
+    assert_eq!(a["PlayState"]["PositionTicks"], 0, "A's play state is A's");
+    assert_eq!(a["PlayState"]["IsPaused"], false);
+    // A's socket is still A's session: a command to A's session reaches it.
+    let uri = format!("/Sessions/{a_session}/Command/ToggleMute");
+    assert_eq!(
+        r3s_post(&app, &admin, &uri, None).await,
+        StatusCode::NO_CONTENT
+    );
+    let frame = r3s_next(&mut a_socket, "GeneralCommand").await;
+    assert_eq!(frame["Data"]["Name"], "ToggleMute");
+}
+
+#[tokio::test]
+async fn r3sessions_ended_sessions_leave_no_play_state_behind() {
+    let state = test_state().await;
+    let _dir = G1cDataDir(state.data_dir.to_path_buf());
+    let app = app(state.clone());
+    let (admin, tgt, _) = r3s_owner(&app).await;
+    let user = add_user(&state, "bee", "beepass", false).await;
+    let (bee, _) = r3s_login(&app, "bee", "beepass", "r3s-bee").await;
+    let (gone, _) = r3s_login(&app, "owner", "ownerpass", "r3s-gone").await;
+    let (idle, _) = r3s_login(&app, "owner", "ownerpass", "r3s-idle").await;
+    let m = g1c_insert_movies(&state, 1).await;
+    let ids = [
+        r3s_start(&app, &admin, &tgt, "r3s-tgt", m[0]).await,
+        r3s_start(&app, &admin, &bee, "r3s-bee", m[0]).await,
+        r3s_start(&app, &admin, &gone, "r3s-gone", m[0]).await,
+        r3s_start(&app, &admin, &idle, "r3s-idle", m[0]).await,
+    ];
+    assert!(ids.iter().all(|id| rustyfin_api::sessions::tracks(id)));
+
+    // Logout, deleting the user, deleting the device, and expiry each end one.
+    assert_eq!(
+        r3s_post(&app, &tgt, "/Sessions/Logout", None).await,
+        StatusCode::NO_CONTENT
+    );
+    let (status, _) = send(
+        &app,
+        request("DELETE", &format!("/Users/{user}"), Some(&admin), None),
+    )
+    .await;
+    assert!(status.is_success(), "{status}");
+    let (status, _) = send(
+        &app,
+        request("DELETE", "/Devices?id=r3s-gone", Some(&admin), None),
+    )
+    .await;
+    assert!(status.is_success(), "{status}");
+    sqlx::query("UPDATE sessions SET last_activity = datetime('now', '-31 minutes') WHERE device_id = 'r3s-idle'")
+        .execute(&state.db)
+        .await
+        .unwrap();
+    rustyfin_api::sessions::expire(&state).await;
+    for (what, id) in ["logout", "user deletion", "device deletion", "expiry"]
+        .iter()
+        .zip(&ids)
+    {
+        assert!(
+            !rustyfin_api::sessions::tracks(id),
+            "{what} left play state behind"
+        );
+    }
+}
+
+#[tokio::test]
+async fn r3sessions_a_stalled_playback_is_stopped_like_a_stop_report() {
+    let state = test_state().await;
+    let _dir = G1cDataDir(state.data_dir.to_path_buf());
+    let app = app(state.clone());
+    let (admin, tgt, owner_id) = r3s_owner(&app).await;
+    let m = g1c_insert_movies(&state, 2).await;
+    b110_set(&state, m[0], Some(B110_HOUR), None, None).await;
+    b110_set(&state, m[1], Some(B110_HOUR), None, None).await;
+    r3s_start(&app, &admin, &tgt, "r3s-tgt", m[0]).await;
+    let progress = serde_json::json!({ "ItemId": m[0], "PositionTicks": B110_HOUR / 2 });
+    assert_eq!(
+        r3s_post(&app, &tgt, "/Sessions/Playing/Progress", Some(progress)).await,
+        StatusCode::NO_CONTENT
+    );
+
+    // Not yet stalled: nothing happens.
+    rustyfin_api::sessions::expire(&state).await;
+    assert!(
+        r3s_session(&app, &admin, "r3s-tgt")
+            .await
+            .get("NowPlayingItem")
+            .is_some()
+    );
+
+    // Six minutes on without a report, the playback stops at its last position.
+    let later = chrono::Utc::now() + chrono::Duration::minutes(6);
+    rustyfin_api::sessions::expire_at(&state, later).await;
+    let s = r3s_session(&app, &admin, "r3s-tgt").await;
+    assert!(s.get("NowPlayingItem").is_none());
+    let user_data = |item: uuid::Uuid| {
+        let uri = format!("/Users/{owner_id}/Items/{item}");
+        let req = request("GET", &uri, Some(&admin), None);
+        let app = app.clone();
+        async move { send(&app, req).await.1["UserData"].clone() }
+    };
+    let ud = user_data(m[0]).await;
+    assert_eq!(ud["PlaybackPositionTicks"], B110_HOUR / 2);
+    assert_eq!(ud["Played"], false);
+    assert_eq!(ud["PlayCount"], 1);
+
+    // One stalled near the end counts as played, as a stop there does.
+    r3s_start(&app, &admin, &tgt, "r3s-tgt", m[1]).await;
+    let progress = serde_json::json!({ "ItemId": m[1], "PositionTicks": B110_HOUR - 10_000_000 });
+    assert_eq!(
+        r3s_post(&app, &tgt, "/Sessions/Playing/Progress", Some(progress)).await,
+        StatusCode::NO_CONTENT
+    );
+    rustyfin_api::sessions::expire_at(&state, chrono::Utc::now() + chrono::Duration::minutes(6))
+        .await;
+    let ud = user_data(m[1]).await;
+    assert_eq!(ud["Played"], true);
+    assert_eq!(ud["PlaybackPositionTicks"], 0);
+}
+
+#[tokio::test]
+async fn r3sessions_device_command_takes_only_jellyfin_commands() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (admin, _, _) = r3s_owner(&app).await;
+    let bad = serde_json::json!({ "Name": "Juggle" });
+    assert_eq!(
+        r3s_post(&app, &admin, "/Devices/r3s-tgt/Command", Some(bad)).await,
+        StatusCode::BAD_REQUEST
+    );
+    let good = serde_json::json!({ "Name": "DisplayMessage", "Arguments": {"Text": "hi"} });
+    assert_eq!(
+        r3s_post(&app, &admin, "/Devices/r3s-tgt/Command", Some(good)).await,
+        StatusCode::OK
+    );
+}
+
 #[tokio::test]
 async fn g1c_set_rating_writes_the_path_users_rating() {
     let state = test_state().await;

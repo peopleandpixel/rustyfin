@@ -22,7 +22,7 @@ mod media_segments;
 mod oidc;
 mod packages;
 mod persons;
-mod playback;
+pub(crate) mod playback;
 mod plugins;
 mod quick_connect;
 mod scheduled_tasks;

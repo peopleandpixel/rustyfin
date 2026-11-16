@@ -237,6 +237,7 @@ async fn report_start(
     // The session's now-playing item and play state
     if is_media && let Some(session) = caller_session(&state, &token).await? {
         let report = crate::sessions::Report {
+            user_id: claims.sub,
             item_id: req.item_id,
             position_ticks: req.position_ticks,
             is_paused: Some(false),
@@ -316,6 +317,7 @@ async fn report_progress(
 
     if is_media && let Some(session) = caller_session(&state, &token).await? {
         let report = crate::sessions::Report {
+            user_id: claims.sub,
             item_id: req.item_id,
             position_ticks: req.position_ticks,
             is_paused: req.is_paused,
@@ -356,48 +358,55 @@ async fn report_stop(
         subtitle = ?req.subtitle_stream_index,
         "Playback stopped"
     );
-    // Same as `playing`: a non-media id stores nothing.
-    let item = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, req.item_id).await?;
-    let is_media = item.is_some();
-    let runtime = match &item {
-        Some(item) => reported_runtime(&state, item, req.media_source_id.as_deref()).await?,
-        None => None,
-    };
-    if is_media {
-        // Jellyfin's OnPlaybackStopped returns before touching user data for a failed playback.
-        if req.failed != Some(true) {
-            rustyfin_db::repo_playback::record_playback_stop(
-                &state.db,
-                claims.sub,
-                req.item_id,
-                req.position_ticks,
-                runtime,
-            )
-            .await?;
-        }
-
-        let (audio, subtitle) = reported_choices(
-            &state,
-            req.item_id,
-            req.media_source_id.as_deref(),
-            req.audio_stream_index,
-            req.subtitle_stream_index,
-        )
-        .await?;
-        rustyfin_db::repo_playback::save_stream_choice(
-            &state.db,
-            claims.sub,
-            req.item_id,
-            audio.as_ref(),
-            subtitle.as_ref(),
-        )
-        .await?;
-    }
-
+    record_stop(&state, claims.sub, &req).await?;
     if let Some(session) = caller_session(&state, &token).await? {
         crate::sessions::stopped(&state, &session).await;
     }
 
+    Ok(())
+}
+
+/// The watch data of a stop: `user`'s position, played state and track choice for the item, by
+/// Jellyfin's play state rules. Also stops a stalled playback (`sessions::expire`).
+pub(crate) async fn record_stop(
+    state: &AppState,
+    user: Uuid,
+    req: &PlaybackStopInfo,
+) -> Result<(), ApiError> {
+    // Same as `playing`: a non-media id stores nothing.
+    let item = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, req.item_id).await?;
+    let Some(item) = item else {
+        return Ok(());
+    };
+    let runtime = reported_runtime(state, &item, req.media_source_id.as_deref()).await?;
+    // Jellyfin's OnPlaybackStopped returns before touching user data for a failed playback.
+    if req.failed != Some(true) {
+        rustyfin_db::repo_playback::record_playback_stop(
+            &state.db,
+            user,
+            req.item_id,
+            req.position_ticks,
+            runtime,
+        )
+        .await?;
+    }
+
+    let (audio, subtitle) = reported_choices(
+        state,
+        req.item_id,
+        req.media_source_id.as_deref(),
+        req.audio_stream_index,
+        req.subtitle_stream_index,
+    )
+    .await?;
+    rustyfin_db::repo_playback::save_stream_choice(
+        &state.db,
+        user,
+        req.item_id,
+        audio.as_ref(),
+        subtitle.as_ref(),
+    )
+    .await?;
     Ok(())
 }
 

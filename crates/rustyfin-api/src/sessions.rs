@@ -72,6 +72,8 @@ impl Default for PlayState {
 
 /// One playback report, as `/Sessions/Playing`, `/Progress` and `/Stopped` send it.
 pub struct Report<'a> {
+    /// Who reported it: the user whose watch data a stalled playback's stop updates.
+    pub user_id: Uuid,
     pub item_id: Uuid,
     pub position_ticks: Option<i64>,
     pub is_paused: Option<bool>,
@@ -84,6 +86,7 @@ pub struct Report<'a> {
 /// What a session is playing.
 #[derive(Debug, Clone)]
 struct Playing {
+    user_id: Uuid,
     item_id: Uuid,
     play_session_id: Option<String>,
     playlist_item_id: Option<String>,
@@ -119,7 +122,8 @@ pub async fn for_token(state: &AppState, token: Option<&str>) -> Result<Option<S
         return Ok(None);
     };
     if let Some(id) =
-        rustyfin_db::repo_session::find_device_session(&state.db, &device.device_id).await?
+        rustyfin_db::repo_session::find_device_session(&state.db, user_id, &device.device_id)
+            .await?
     {
         rustyfin_db::repo_session::touch_session(&state.db, &id).await?;
         return Ok(Some(id));
@@ -197,11 +201,13 @@ pub async fn playing(state: &AppState, session_id: &str, report: Report<'_>, sta
         apply(&mut rt.play_state, &report);
         let f = report.fields;
         let playing = rt.playing.get_or_insert(Playing {
+            user_id: report.user_id,
             item_id: report.item_id,
             play_session_id: None,
             playlist_item_id: None,
             queue: None,
         });
+        playing.user_id = report.user_id;
         playing.item_id = report.item_id;
         if f.play_session_id.is_some() {
             playing.play_session_id = f.play_session_id.clone();
@@ -249,27 +255,110 @@ pub fn ping(session_id: &str) {
     }
 }
 
-/// Stops the playbacks that have not reported for `PLAYBACK_IDLE_MINUTES`, and forgets the
-/// sessions in `ended`. Returns the sessions whose playback it stopped.
-pub fn sweep(ended: &[String]) -> Vec<String> {
-    let cutoff = Utc::now() - chrono::Duration::minutes(PLAYBACK_IDLE_MINUTES);
-    let mut all = runtime();
-    for id in ended {
-        all.remove(id);
-    }
-    let mut idle = Vec::new();
-    for (id, rt) in all.iter_mut() {
-        if rt.playing.is_some() && rt.last_check_in.is_some_and(|t| t < cutoff) {
-            rt.playing = None;
-            rt.play_state = PlayState::default();
-            idle.push(id.clone());
-        }
-    }
-    idle
+/// Drops what the server keeps in memory about a session that has ended.
+pub fn forget(session_id: &str) {
+    runtime().remove(session_id);
 }
 
-/// Ends idle sessions and idle playbacks; run once a minute. Sessions with an open socket stay.
+/// Whether the server keeps anything in memory for `session_id` (for tests).
+pub fn tracks(session_id: &str) -> bool {
+    RUNTIME
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(session_id)
+}
+
+/// Forgets the sessions `ids`, after they are deleted.
+pub fn forget_all(ids: &[String]) {
+    let mut all = runtime();
+    for id in ids {
+        all.remove(id);
+    }
+}
+
+/// A playback that stopped reporting, taken out of its session for `stop_stalled`.
+#[derive(Debug)]
+pub struct Stalled {
+    pub session_id: String,
+    pub user_id: Uuid,
+    pub item_id: Uuid,
+    pub play_state: PlayState,
+    pub play_session_id: Option<String>,
+}
+
+/// Takes out the playbacks of the sessions in `ended`, and those without a report for
+/// `PLAYBACK_IDLE_MINUTES`, and forgets the sessions in `ended` and those not in `known`.
+fn sweep(ended: &[String], known: Option<&[String]>, now: DateTime<Utc>) -> Vec<Stalled> {
+    let cutoff = now - chrono::Duration::minutes(PLAYBACK_IDLE_MINUTES);
+    let mut all = runtime();
+    let mut stalled = Vec::new();
+    for (id, rt) in all.iter_mut() {
+        let gone = ended.contains(id) || known.is_some_and(|k| !k.contains(id));
+        let idle = rt.last_check_in.is_some_and(|t| t < cutoff);
+        if (gone || idle)
+            && let Some(p) = rt.playing.take()
+        {
+            stalled.push(Stalled {
+                session_id: id.clone(),
+                user_id: p.user_id,
+                item_id: p.item_id,
+                play_state: std::mem::take(&mut rt.play_state),
+                play_session_id: p.play_session_id,
+            });
+        }
+    }
+    all.retain(|id, _| !ended.contains(id) && known.is_none_or(|k| k.contains(id)));
+    stalled
+}
+
+/// Stops a stalled playback as a `POST /Sessions/Playing/Stopped` at its last known position
+/// would (the position saved, played past the threshold, the play count), and stops its
+/// transcodes.
+async fn stop_stalled(state: &AppState, s: &Stalled, device_id: Option<&str>) {
+    let ps = &s.play_state;
+    let stop = rustyfin_model::playback::PlaybackStopInfo {
+        item_id: s.item_id,
+        item_name: None,
+        position_ticks: ps.position_ticks,
+        media_source_id: ps.media_source_id.clone(),
+        audio_stream_index: ps.audio_stream_index,
+        subtitle_stream_index: ps.subtitle_stream_index,
+        failed: None,
+        play_state: Default::default(),
+    };
+    if let Err(e) = crate::routes::playback::record_stop(state, s.user_id, &stop).await {
+        tracing::warn!("stopping a stalled playback failed: {e:?}");
+    }
+    // The transcodes are found by the reported play session id, else by the device
+    let psid = s.play_session_id.as_deref().unwrap_or("");
+    let device = if psid.is_empty() {
+        device_id.unwrap_or("")
+    } else {
+        ""
+    };
+    if !psid.is_empty() || !device.is_empty() {
+        state
+            .transcode_manager
+            .stop_play_session(Some(s.item_id), psid, device)
+            .await;
+    }
+    let _ = rustyfin_db::repo_session::update_session_now_playing(
+        &state.db,
+        &s.session_id,
+        None,
+        None,
+        false,
+    )
+    .await;
+}
+
+/// Ends idle sessions and stalled playbacks; run once a minute. Sessions with an open socket stay.
 pub async fn expire(state: &AppState) {
+    expire_at(state, Utc::now()).await;
+}
+
+/// `expire` as of `now`, which tests move forward.
+pub async fn expire_at(state: &AppState, now: DateTime<Utc>) {
     let open = crate::routes::websocket::connected_sessions().await;
     let ended =
         match rustyfin_db::repo_session::expire_sessions(&state.db, SESSION_IDLE_MINUTES, &open)
@@ -284,13 +373,22 @@ pub async fn expire(state: &AppState) {
     if !ended.is_empty() {
         tracing::info!("ended {} idle sessions", ended.len());
     }
-    let idle = sweep(&ended);
-    for id in &idle {
-        let _ =
-            rustyfin_db::repo_session::update_session_now_playing(&state.db, id, None, None, false)
-                .await;
+    // The sessions still stored; one deleted elsewhere (a user disabled, say) is forgotten too
+    let sessions = rustyfin_db::repo_session::get_active_sessions(&state.db)
+        .await
+        .ok();
+    let known: Option<Vec<String>> = sessions
+        .as_ref()
+        .map(|s| s.iter().map(|s| s.id.clone()).collect());
+    let stalled = sweep(&ended, known.as_deref(), now);
+    for s in &stalled {
+        let device = sessions
+            .as_ref()
+            .and_then(|all| all.iter().find(|x| x.id == s.session_id))
+            .map(|x| x.device_id.as_str());
+        stop_stalled(state, s, device).await;
     }
-    if !ended.is_empty() || !idle.is_empty() {
+    if !ended.is_empty() || !stalled.is_empty() {
         changed(state);
     }
 }
@@ -411,6 +509,7 @@ mod tests {
         apply(
             &mut ps,
             &Report {
+                user_id: Uuid::nil(),
                 item_id: Uuid::nil(),
                 position_ticks: Some(10),
                 is_paused: None,
@@ -424,6 +523,7 @@ mod tests {
         apply(
             &mut ps,
             &Report {
+                user_id: Uuid::nil(),
                 item_id: Uuid::nil(),
                 position_ticks: Some(20),
                 is_paused: Some(true),
