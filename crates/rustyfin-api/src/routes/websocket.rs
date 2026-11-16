@@ -19,7 +19,8 @@ use rustyfin_model::ws_event::LogMessageData;
 /// Shared state for active WebSocket connections
 #[derive(Default)]
 pub struct WsConnections {
-    /// Map of session ID → broadcast sender for targeted command delivery
+    /// Map of session ID → broadcast sender for targeted command delivery. The sockets of one
+    /// session (a device's tabs) share its sender.
     connections: HashMap<String, broadcast::Sender<rustyfin_model::ws_event::WsEvent>>,
 }
 
@@ -36,7 +37,8 @@ pub fn routes() -> Router<AppState> {
 struct WsQuery {
     #[serde(default)]
     authorization: Option<String>,
-    #[serde(default, alias = "api_key")]
+    // Jellyfin 10.11 reads `ApiKey`; older clients send `api_key`.
+    #[serde(default, alias = "api_key", alias = "ApiKey", alias = "apikey")]
     token: Option<String>,
 }
 
@@ -144,17 +146,35 @@ async fn handle_socket(socket: WebSocket, state: AppState, token: String) {
     let (scans_now, mut scans_rx) = state.task_scheduler.scans().subscribe_with_snapshot();
     let mut viewer = socket_viewer(&state, &token).await;
 
-    // Create a dedicated channel for targeted command delivery to this session
-    let (cmd_tx, mut cmd_rx) = broadcast::channel::<rustyfin_model::ws_event::WsEvent>(16);
-
-    // Generate a session ID for this connection
-    let session_id = uuid::Uuid::new_v4().to_string();
+    // The socket joins its token's device session, so that remote control reaches it; the API
+    // key, and a token without a device, get a session of their own.
+    let device_session = if user_token {
+        crate::sessions::for_token(&state, Some(&token))
+            .await
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+    let session_id = device_session
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
     // Register this connection for targeted command delivery
-    {
+    let mut cmd_rx = {
         let mut connections = WS_CONNECTIONS.write().await;
-        connections.connections.insert(session_id.clone(), cmd_tx);
+        connections
+            .connections
+            .entry(session_id.clone())
+            .or_insert_with(|| broadcast::channel(16).0)
+            .subscribe()
+    };
+    if device_session.is_some() {
+        crate::sessions::changed(&state);
     }
+    // The Sessions frames a SessionsStart asked for: their timer, and whether the list changed
+    let mut sessions_timer: Option<tokio::time::Interval> = None;
+    let mut sessions_dirty = false;
 
     tracing::info!("WebSocket: session {} connected", session_id);
 
@@ -200,6 +220,9 @@ async fn handle_socket(socket: WebSocket, state: AppState, token: String) {
                         if let Ok(incoming) = serde_json::from_str::<WsMessage>(&text) {
                             match incoming.message_type.as_str() {
                                 "KeepAlive" => {
+                                    if device_session.is_some() {
+                                        let _ = rustyfin_db::repo_session::touch_session(&state.db, &session_id).await;
+                                    }
                                     // Jellyfin answers a client's KeepAlive with a KeepAlive
                                     let resp = rustyfin_model::ws_event::WsEvent::KeepAlive;
                                     if let Some(frame) = text_frame(&resp) {
@@ -227,11 +250,17 @@ async fn handle_socket(socket: WebSocket, state: AppState, token: String) {
                                     tracing::debug!("ws: LiveLogStart from a non-administrator ignored");
                                 }
                                 "LiveLogStop" => live_log = None,
-                                "SessionsStart" | "ActivityLogEntryStart" => {
+                                // The session list now, then whenever it changes
+                                "SessionsStart" => {
+                                    sessions_timer = Some(tasks_info_timer(incoming.data.as_ref()));
+                                    sessions_dirty = true;
+                                }
+                                "SessionsStop" => sessions_timer = None,
+                                "ActivityLogEntryStart" => {
                                     // Acknowledge subscription-style messages
                                     tracing::debug!("ws subscription: {}", incoming.message_type);
                                 }
-                                "SessionsStop" | "ActivityLogEntryStop" => {
+                                "ActivityLogEntryStop" => {
                                     tracing::debug!("ws unsubscribe: {}", incoming.message_type);
                                 }
                                 other => {
@@ -279,6 +308,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, token: String) {
             // Handle broadcast events from the server (global events)
             res = broadcast_rx.recv() => {
                 match res {
+                    Ok(rustyfin_model::ws_event::WsEvent::SessionsChanged) => sessions_dirty = true,
                     // Another user's session and playback events, and logs for non-administrators
                     Ok(event) if !receives(&viewer, &event) => {}
                     Ok(event) => {
@@ -314,6 +344,19 @@ async fn handle_socket(socket: WebSocket, state: AppState, token: String) {
                     Err(broadcast::error::RecvError::Closed) => {
                         // Command sender dropped, ignore
                     }
+                }
+            }
+
+            // The session list, at most once a timer tick, when it changed since the last one
+            _ = async { sessions_timer.as_mut().unwrap().tick().await }, if sessions_timer.is_some() && sessions_dirty => {
+                sessions_dirty = false;
+                let list = crate::sessions::list(&state, viewer.user_id, viewer.is_admin, &Default::default()).await;
+                if let Ok(list) = list {
+                    let event = rustyfin_model::ws_event::WsEvent::Sessions { data: serde_json::Value::Array(list) };
+                    if let Some(frame) = text_frame(&event)
+                        && sender.send(frame).await.is_err() {
+                            break;
+                        }
                 }
             }
 
@@ -362,12 +405,42 @@ async fn handle_socket(socket: WebSocket, state: AppState, token: String) {
         }
     }
 
-    // Clean up: unregister this connection
+    // Clean up: unregister the session once its last socket is gone
+    drop(cmd_rx);
     {
         let mut connections = WS_CONNECTIONS.write().await;
-        connections.connections.remove(&session_id);
-        tracing::debug!("WebSocket: unregistered session {}", session_id);
+        if connections
+            .connections
+            .get(&session_id)
+            .is_some_and(|tx| tx.receiver_count() == 0)
+        {
+            connections.connections.remove(&session_id);
+            tracing::debug!("WebSocket: unregistered session {}", session_id);
+        }
     }
+    if device_session.is_some() {
+        crate::sessions::changed(&state);
+    }
+}
+
+/// The sessions that have an open socket.
+pub async fn connected_sessions() -> Vec<String> {
+    WS_CONNECTIONS
+        .read()
+        .await
+        .connections
+        .keys()
+        .cloned()
+        .collect()
+}
+
+/// Sends `event` to the sockets of `session_id`. False when the session has no open socket.
+pub async fn send_to_session(session_id: &str, event: rustyfin_model::ws_event::WsEvent) -> bool {
+    let connections = WS_CONNECTIONS.read().await;
+    connections
+        .connections
+        .get(session_id)
+        .is_some_and(|tx| tx.send(event).is_ok())
 }
 
 /// Sends each log line as a `LogMessage` frame.
@@ -392,47 +465,6 @@ fn text_frame(event: &impl serde::Serialize) -> Option<Message> {
             tracing::warn!(error = %e, "WebSocket: could not serialize an event");
             None
         }
-    }
-}
-
-/// Send a targeted command to a specific session via WebSocket
-pub async fn send_command_to_session(
-    session_id: &str,
-    command: String,
-    arguments: Option<serde_json::Value>,
-) -> bool {
-    let connections = WS_CONNECTIONS.read().await;
-    if let Some(tx) = connections.connections.get(session_id) {
-        let event = rustyfin_model::ws_event::WsEvent::Command {
-            data: rustyfin_model::ws_event::CommandData {
-                command: command.clone(),
-                arguments,
-            },
-        };
-        match tx.send(event) {
-            Ok(_) => {
-                tracing::info!(
-                    "WebSocket: command '{}' sent to session {}",
-                    command,
-                    session_id
-                );
-                true
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "WebSocket: failed to send command to session {}: {}",
-                    session_id,
-                    e
-                );
-                false
-            }
-        }
-    } else {
-        tracing::warn!(
-            "WebSocket: session {} not found for command delivery",
-            session_id
-        );
-        false
     }
 }
 

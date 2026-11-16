@@ -132,7 +132,17 @@ pub(crate) async fn start_session(
     user: User,
     token: String,
 ) -> AuthResponse {
-    let session_id = Uuid::new_v4();
+    // A device keeps its session across sign-ins, as Jellyfin keys sessions by device.
+    let existing = match device.device_id.as_str() {
+        "" => None,
+        id => rustyfin_db::repo_session::find_device_session(&state.db, id)
+            .await
+            .ok()
+            .flatten(),
+    };
+    let session_id = existing
+        .and_then(|id| Uuid::parse_str(&id).ok())
+        .unwrap_or_else(Uuid::new_v4);
     super::activity::record(
         state,
         &format!("{} successfully authenticated", user.name),
@@ -156,6 +166,7 @@ pub(crate) async fn start_session(
     )
     .await
     .ok();
+    crate::sessions::changed(state);
 
     let session_info = AuthSessionInfo {
         id: session_id.to_string(),

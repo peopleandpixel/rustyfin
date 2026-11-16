@@ -77,10 +77,13 @@ pub async fn get_active_sessions(pool: &SqlitePool) -> Result<Vec<SessionInfo>, 
             Option<i64>,
             i64,
             String,
+            String,
+            String,
         ),
     >(
         "SELECT s.id, s.user_id, u.name, s.device_id, s.device_name, s.app_name,
-                s.now_playing_item_id, s.now_playing_position_ticks, s.is_paused, s.last_activity
+                s.now_playing_item_id, s.now_playing_position_ticks, s.is_paused, s.last_activity,
+                s.app_version, s.capabilities
          FROM sessions s
          JOIN users u ON u.id = s.user_id
          ORDER BY s.last_activity DESC",
@@ -118,12 +121,55 @@ pub async fn get_active_sessions(pool: &SqlitePool) -> Result<Vec<SessionInfo>, 
             device_id: r.3,
             device_name: r.4,
             app_name: r.5,
-            app_version: String::new(),
+            app_version: r.10,
             now_playing_item: now_playing,
             last_activity_date: parse_dt(&r.9),
+            capabilities: serde_json::from_str(&r.11).unwrap_or_default(),
         });
     }
     Ok(sessions)
+}
+
+/// The session of `device_id` (Jellyfin keeps one per device), if it has one.
+pub async fn find_device_session(
+    pool: &SqlitePool,
+    device_id: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT id FROM sessions WHERE device_id = ?1 ORDER BY last_activity DESC LIMIT 1",
+    )
+    .bind(device_id)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Marks the session active now.
+pub async fn touch_session(pool: &SqlitePool, session_id: &str) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE sessions SET last_activity = datetime('now') WHERE id = ?1")
+        .bind(session_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Removes the sessions idle for more than `timeout_minutes`, except `keep` (those with an open
+/// socket). Returns the ids removed.
+pub async fn expire_sessions(
+    pool: &SqlitePool,
+    timeout_minutes: i64,
+    keep: &[String],
+) -> Result<Vec<String>, sqlx::Error> {
+    let idle: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM sessions WHERE last_activity < datetime('now', ?1)")
+            .bind(format!("-{timeout_minutes} minutes"))
+            .fetch_all(pool)
+            .await?;
+    let mut removed = Vec::new();
+    for id in idle.into_iter().filter(|id| !keep.contains(id)) {
+        delete_session(pool, &id).await?;
+        removed.push(id);
+    }
+    Ok(removed)
 }
 
 pub async fn delete_session(pool: &SqlitePool, session_id: &str) -> Result<(), sqlx::Error> {
@@ -249,6 +295,14 @@ pub async fn create_session(
 ) -> Result<(), sqlx::Error> {
     let sid = session_id.to_string();
     let uid = user_id.to_string();
+    // One session per device, as in Jellyfin: a sign-in on a device replaces its older sessions.
+    if !device_id.is_empty() {
+        sqlx::query("DELETE FROM sessions WHERE device_id = ?1 AND id != ?2")
+            .bind(device_id)
+            .bind(&sid)
+            .execute(pool)
+            .await?;
+    }
     sqlx::query(
         "INSERT INTO sessions (id, user_id, device_id, device_name, app_name, app_version, last_activity, capabilities)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'), ?7)
