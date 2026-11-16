@@ -3599,6 +3599,7 @@ const B124_WEB_MODULES: &[&str] = &[
     "search.js",
     "sessions.js",
     "settings.js",
+    "subtitle-admin.js",
     "theme-media.js",
     "user-editor.js",
     "user-settings.js",
