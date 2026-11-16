@@ -40363,10 +40363,10 @@ async fn j2_chrome_profile_sets_the_device_data() {
         &token,
     );
     let expected = format!(
-        "/Videos/{hi10}/main.m3u8?DeviceId=j2-device&MediaSourceId={hi10_source}&VideoCodec=h264\
-         &AudioCodec=aac&AudioStreamIndex=1&VideoBitrate=119872&AudioBitrate=128\
+        "/Videos/{hi10}/master.m3u8?DeviceId=j2-device&MediaSourceId={hi10_source}&VideoCodec=h264\
+         &AudioCodec=aac&AudioStreamIndex=1&VideoBitrate=119872000&AudioBitrate=128000\
          &AudioSampleRate=48000&MaxFramerate=24&SegmentContainer=ts&MinSegments=1\
-         &PlaySessionId={ps}&api_key=<token>&TranscodingMaxAudioChannels=2&RequireAvc=false\
+         &PlaySessionId={ps}&ApiKey=<token>&TranscodingMaxAudioChannels=2&RequireAvc=false\
          &EnableAudioVbrEncoding=true&h264-videobitdepth=10\
          &h264-profile=high,main,baseline,constrainedbaseline&h264-audiochannels=2\
          &aac-profile=lc&h264-rangetype=SDR&h264-level=52&h264-deinterlace=true\
@@ -40388,7 +40388,7 @@ async fn j2_chrome_profile_sets_the_device_data() {
         &token,
     );
     assert!(
-        url.starts_with(&format!("/Videos/{p422}/main.m3u8?")),
+        url.starts_with(&format!("/Videos/{p422}/master.m3u8?")),
         "{url}"
     );
 
@@ -40550,7 +40550,7 @@ async fn j2_subtitles_get_deliveries() {
         assert_eq!(subtitle["IsExternalUrl"], false, "stream {index}");
         let url = j2_hide(subtitle["DeliveryUrl"].as_str().unwrap_or_default(), &token);
         let expected =
-            format!("/Videos/{item}/{source_id}/Subtitles/{index}/0/Stream.vtt?api_key=<token>");
+            format!("/Videos/{item}/{source_id}/Subtitles/{index}/0/Stream.vtt?ApiKey=<token>");
         assert_eq!(url, expected, "stream {index}");
     }
     for index in [0, 1] {
@@ -40609,7 +40609,7 @@ async fn j2_audio_items_use_the_audio_profiles() {
         &token,
     );
     assert!(
-        url.starts_with(&format!("/Videos/{ac3}/main.m3u8?")),
+        url.starts_with(&format!("/Videos/{ac3}/master.m3u8?")),
         "{url}"
     );
     assert!(url.contains("&AudioCodec=aac&"), "{url}");
@@ -40652,10 +40652,10 @@ async fn j2_profile_comes_from_the_device_capabilities() {
         sources[0]["TranscodingUrl"].as_str().unwrap_or_default(),
         &token,
     );
-    let start = format!("/Videos/{item}/main.m3u8?DeviceId=j2-caps-device&");
+    let start = format!("/Videos/{item}/master.m3u8?DeviceId=j2-caps-device&");
     assert!(url.starts_with(&start), "{url}");
     assert!(
-        url.contains(&format!("&PlaySessionId={ps}&api_key=<token>&")),
+        url.contains(&format!("&PlaySessionId={ps}&ApiKey=<token>&")),
         "{url}"
     );
     let body = serde_json::json!({ "MaxStreamingBitrate": 120_000_000 });

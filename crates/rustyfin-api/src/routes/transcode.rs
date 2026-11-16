@@ -21,6 +21,8 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         // Jellyfin standard HLS master playlist endpoint
         .route("/Videos/{id}/main.m3u8", get(hls_master_playlist))
+        // The path Jellyfin's TranscodingUrl and its SDKs use; the same playlist
+        .route("/Videos/{id}/master.m3u8", get(hls_master_playlist))
         // Jellyfin HLS segment endpoint: /Videos/{id}/hls/{playbackId}/{type}/{segmentId}.{ext}
         .route(
             "/Videos/{id}/hls/{playback_id}/{segment_type}/{segment}",
@@ -74,14 +76,25 @@ pub struct TranscodeQuery {
     pub h264_video_bit_depth: Option<String>,
 }
 
+/// A URL's VideoBitrate in kbps. Jellyfin writes bits per second; a value under 100000, too low
+/// for bits per second, is kbps, as Rustyfin's transcode URLs wrote it before.
+fn video_kbps(value: u32) -> u32 {
+    if value < 100_000 { value } else { value / 1000 }
+}
+
+/// A URL's AudioBitrate in kbps: bits per second, or kbps under 8000 (see `video_kbps`).
+fn audio_kbps(value: u32) -> u32 {
+    if value < 8_000 { value } else { value / 1000 }
+}
+
 impl TranscodeQuery {
     fn into_profile(self) -> TranscodeProfile {
         let mut p = TranscodeProfile::default();
         if let Some(v) = self.video_bitrate {
-            p.max_video_bitrate_kbps = v;
+            p.max_video_bitrate_kbps = video_kbps(v);
         }
         if let Some(v) = self.audio_bitrate {
-            p.max_audio_bitrate_kbps = v;
+            p.max_audio_bitrate_kbps = audio_kbps(v);
         }
         if let Some(v) = self.max_width {
             p.max_width = v;
@@ -389,11 +402,14 @@ fn stream_copy(query: &TranscodeQuery, source: &SourceInfo) -> (bool, bool) {
         )
         && size_fits(query.max_width, source.width)
         && size_fits(query.max_height, source.height)
-        && bitrate_fits(query.video_bitrate, source.video_bitrate);
+        && bitrate_fits(query.video_bitrate.map(video_kbps), source.video_bitrate);
     let copy_audio = audio.is_some_and(|track| {
         track.codec == "aac"
             && client_takes(query.audio_codec.as_deref(), &["aac", "mp4a"])
-            && bitrate_fits(query.audio_bitrate, track.bitrate.or(source.audio_bitrate))
+            && bitrate_fits(
+                query.audio_bitrate.map(audio_kbps),
+                track.bitrate.or(source.audio_bitrate),
+            )
     });
     (copy_video, copy_audio)
 }
@@ -747,6 +763,39 @@ mod tests {
                 .unwrap();
         assert_eq!(query.into_profile().start_time_ticks, 6_000_000_000);
         assert_eq!(TranscodeQuery::default().into_profile().start_time_ticks, 0);
+    }
+
+    /// The bitrates are bits per second, as in Jellyfin: the TranscodingUrl writes them so, and
+    /// Universal passes a client's MaxVideoBitrate and MaxAudioBitrate through as VideoBitrate and
+    /// AudioBitrate. Before, 4000000 read as kbps capped nothing. The kbps that Rustyfin's own
+    /// URLs wrote before still read as kbps.
+    #[test]
+    fn r3decisions_url_bitrates_are_bits_per_second() {
+        let profile = query("VideoBitrate=4000000&AudioBitrate=192000").into_profile();
+        assert_eq!(profile.max_video_bitrate_kbps, 4000);
+        assert_eq!(profile.max_audio_bitrate_kbps, 192);
+        let profile = query("VideoBitrate=119616000&AudioBitrate=384000").into_profile();
+        assert_eq!(profile.max_video_bitrate_kbps, 119_616);
+        assert_eq!(profile.max_audio_bitrate_kbps, 384);
+        let legacy = query("VideoBitrate=4000&AudioBitrate=192").into_profile();
+        assert_eq!(legacy.max_video_bitrate_kbps, 4000);
+        assert_eq!(legacy.max_audio_bitrate_kbps, 192);
+
+        // A video at 6 Mbit/s is over a 4 Mbit/s cap, so it isn't copied
+        let source = SourceInfo {
+            video_bitrate: Some(6_000_000),
+            ..h264_with(&[])
+        };
+        let capped = TranscodeQuery {
+            video_bitrate: Some(4_000_000),
+            ..browser_query()
+        };
+        assert!(!stream_copy(&capped, &source).0);
+        let roomy = TranscodeQuery {
+            video_bitrate: Some(8_000_000),
+            ..browser_query()
+        };
+        assert!(stream_copy(&roomy, &source).0);
     }
 
     #[test]
