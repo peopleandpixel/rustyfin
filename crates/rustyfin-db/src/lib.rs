@@ -515,7 +515,7 @@ mod tests {
         for statement in [
             "INSERT INTO libraries (id, name, content_type) VALUES ('lib', 'Film', 'movies')",
             "INSERT INTO media_items (id, library_id, name, sort_name, media_type, path) VALUES \
-             ('matrix', 'lib', 'The Matrix', 'the matrix', 'Movie', '/m/1.mkv'), \
+             ('meridian', 'lib', 'The Meridian', 'the meridian', 'Movie', '/m/1.mkv'), \
              ('alpha', 'lib', 'The Alpha', 'Alpha, The', 'Movie', '/m/2.mkv'), \
              ('algen', 'lib', 'Ålgen', 'ålgen', 'Movie', '/m/3.mkv'), \
              ('elk', 'lib', 'Élan', 'Zebra', 'Movie', '/m/4.mkv'), \
@@ -536,7 +536,7 @@ mod tests {
             (Some("Alpha, The".into()), Some("Alpha, The".into())),
             "094 keeps a sort name that is not the lowercased name as the forced one"
         );
-        for id in ["matrix", "algen", "elk", "ole", "locked", "ep", "season"] {
+        for id in ["meridian", "algen", "elk", "ole", "locked", "ep", "season"] {
             assert_eq!(r3sortname_sort(&upgraded, id).await.1, None, "{id}");
         }
 
@@ -564,7 +564,7 @@ mod tests {
             .await
             .unwrap();
         let expect = [
-            ("matrix", "matrix", None),
+            ("meridian", "meridian", None),
             ("alpha", "alpha, the", Some("Alpha, The")),
             ("algen", "algen", None),
             ("elk", "zebra", Some("Zebra")),
@@ -602,8 +602,8 @@ mod tests {
             2
         );
         assert_eq!(
-            r3sortname_sort(&upgraded, "matrix").await.0.as_deref(),
-            Some("the matrix")
+            r3sortname_sort(&upgraded, "meridian").await.0.as_deref(),
+            Some("the meridian")
         );
         upgraded.close().await;
     }

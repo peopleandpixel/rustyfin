@@ -1,5 +1,5 @@
 //! Sort names, as Jellyfin 10.11 makes them (`BaseItem.CreateSortName` and `ModifySortChunks`,
-//! with the `Episode`, `Audio`, `Season` and `Person` overrides): "The Matrix" sorts as "matrix",
+//! with the `Episode`, `Audio`, `Season` and `Person` overrides): "The Meridian" sorts as "meridian",
 //! "Part 2" before "Part 10".
 
 use std::sync::{LazyLock, RwLock};
@@ -214,27 +214,27 @@ mod tests {
 
     #[test]
     fn r3sortname_a_leading_article_is_dropped() {
-        assert_eq!(sort("The Matrix"), "matrix");
-        assert_eq!(sort("A Most Violent Year"), "most violent year");
+        assert_eq!(sort("The Meridian"), "meridian");
+        assert_eq!(sort("A Most Patient Harbor"), "most patient harbor");
         assert_eq!(
             sort("An American Werewolf in London"),
             "american werewolf in london"
         );
-        assert_eq!(sort("  The Matrix  "), "matrix");
+        assert_eq!(sort("  The Meridian  "), "meridian");
     }
 
     #[test]
     fn r3sortname_an_article_without_a_following_space_stays() {
         assert_eq!(sort("Theory of Everything"), "theory of everything");
-        assert_eq!(sort("Alien"), "alien");
+        assert_eq!(sort("Alderlune"), "alderlune");
         assert_eq!(sort("The"), "the");
         assert_eq!(sort("A-Team"), "ateam");
     }
 
     #[test]
     fn r3sortname_articles_inside_and_at_the_end_go_as_in_jellyfin() {
-        assert_eq!(sort("I Saw the Devil"), "i saw devil");
-        assert_eq!(sort("Ichi the Killer"), "ichi killer");
+        assert_eq!(sort("I Met the Tailor"), "i met tailor");
+        assert_eq!(sort("Ishi the Baker"), "ishi baker");
         assert_eq!(sort("Raising a Child"), "raising child");
         assert_eq!(sort("Plan A"), "plan");
         // Only whole words: "a" inside a word stays
@@ -243,7 +243,7 @@ mod tests {
 
     #[test]
     fn r3sortname_numbers_are_padded() {
-        assert_eq!(sort("28 Years Later"), "0000000028 years later");
+        assert_eq!(sort("31 Winters Later"), "0000000031 winters later");
         assert!(sort("Part 2") < sort("Part 10"));
         assert_eq!(sort("Bravo Story (2005)"), "bravo story (0000002005)");
         assert_eq!(sort("12345678901"), "12345678901");
@@ -251,12 +251,12 @@ mod tests {
 
     #[test]
     fn r3sortname_punctuation_is_removed_or_spaced() {
-        assert_eq!(sort("The Queen's Gambit"), "queens gambit");
-        assert_eq!(sort("Mushi-Shi"), "mushishi");
-        assert_eq!(sort("Compartment No. 6"), "compartment no  0000000006");
+        assert_eq!(sort("The Tailor's Wager"), "tailors wager");
+        assert_eq!(sort("Mori-Shu"), "morishu");
+        assert_eq!(sort("Carriage No. 6"), "carriage no  0000000006");
         assert_eq!(
-            sort("Mission: Impossible - Dead Reckoning Part One"),
-            "mission: impossible  dead reckoning part one"
+            sort("Marble: Harbor - Low Tide Part One"),
+            "marble: harbor  low tide part one"
         );
         assert_eq!(
             sort("American Entertainment Partners L.P."),
@@ -288,8 +288,8 @@ mod tests {
             rules.remove_characters,
             SortRules::default().remove_characters
         );
-        assert_eq!(create_sort_name("Die Hard", &rules), "hard");
-        assert_eq!(create_sort_name("The Matrix", &rules), "the matrix");
+        assert_eq!(create_sort_name("Die Harbor", &rules), "harbor");
+        assert_eq!(create_sort_name("The Meridian", &rules), "the meridian");
         assert_ne!(rules.fingerprint(), SortRules::default().fingerprint());
     }
 
@@ -313,9 +313,12 @@ mod tests {
             "season 0002"
         );
         assert_eq!(
-            item_sort_name(MediaType::Movie, "The Matrix", None, None, &rules),
-            "matrix"
+            item_sort_name(MediaType::Movie, "The Meridian", None, None, &rules),
+            "meridian"
         );
-        assert_eq!(forced_sort_name("Matrix, The 2"), "matrix, the 0000000002");
+        assert_eq!(
+            forced_sort_name("Meridian, The 2"),
+            "meridian, the 0000000002"
+        );
     }
 }

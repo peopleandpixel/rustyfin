@@ -1345,7 +1345,7 @@ mod tests {
     fn b32_a_virtual_season_gives_no_path() {
         let made_up = MediaItem {
             media_type: MediaType::Season,
-            path: "/tv/One Night (2023)/Season 1".to_string(),
+            path: "/tv/Owl Hollow (2023)/Season 1".to_string(),
             location_type: LocationType::Virtual,
             ..MediaItem::default_dto_fields()
         };
@@ -1358,7 +1358,7 @@ mod tests {
         };
         let json = serde_json::to_value(&folder).unwrap();
         assert_eq!(json["LocationType"], "FileSystem");
-        assert_eq!(json["Path"], "/tv/One Night (2023)/Season 1");
+        assert_eq!(json["Path"], "/tv/Owl Hollow (2023)/Season 1");
     }
 
     #[test]
@@ -1367,7 +1367,7 @@ mod tests {
         // `Dto/DtoService.cs:1517-1521`).
         let made_up = MediaItem {
             media_type: MediaType::Season,
-            path: "/tv/One Night (2023)/Season 1".to_string(),
+            path: "/tv/Owl Hollow (2023)/Season 1".to_string(),
             location_type: LocationType::Virtual,
             index_number: Some(1),
             ..MediaItem::default_dto_fields()
@@ -1384,7 +1384,7 @@ mod tests {
 
         let double = MediaItem {
             media_type: MediaType::Episode,
-            path: "/tv/One Night (2023)/Season 1/One Night S01E03-E04.mkv".to_string(),
+            path: "/tv/Owl Hollow (2023)/Season 1/Owl Hollow S01E03-E04.mkv".to_string(),
             index_number: Some(3),
             index_number_end: Some(4),
             ..MediaItem::default_dto_fields()

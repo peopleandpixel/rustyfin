@@ -520,7 +520,7 @@ struct R1Lookups(std::sync::Arc<std::sync::Mutex<R1Calls>>);
 fn r1scan_movie_meta() -> rustyfin_model::metadata::ExternalMetadata {
     use rustyfin_model::metadata::{ExternalMetadata, MetadataPerson};
     ExternalMetadata {
-        name: Some("Mission: Impossible".to_string()),
+        name: Some("Marble: Harbor".to_string()),
         tmdb_id: Some(954),
         imdb_id: Some("tt0117060".to_string()),
         premiere_date: Some("1996-05-22".to_string()),
@@ -558,7 +558,7 @@ impl rustyfin_model::metadata::MetadataLookups for R1Lookups {
             .push((name.to_string(), year));
         r1scan_answer(async {
             Some(rustyfin_model::metadata::ExternalMetadata {
-                name: Some("One Night".to_string()),
+                name: Some("Owl Hollow".to_string()),
                 tmdb_id: Some(228527),
                 imdb_id: Some("tt26629692".to_string()),
                 premiere_date: Some("2023-09-01".to_string()),
@@ -676,7 +676,7 @@ async fn r1scan_people(pool: &SqlitePool, id: Uuid) -> Vec<(String, String, Opti
 async fn r1scan_movie_takes_title_imdb_people_and_premiere() {
     let fx = Fixture::new().await;
     let pool = &fx.pool;
-    let read = fx.movie("Mission Impossible", None).await;
+    let read = fx.movie("Marble Harbor", None).await;
     let (pm, calls) = r1scan_manager().await;
     let client = reqwest::Client::new();
 
@@ -685,7 +685,7 @@ async fn r1scan_movie_takes_title_imdb_people_and_premiere() {
         .unwrap();
 
     let after = stored(pool, read.id).await;
-    assert_eq!(after.name, "Mission: Impossible");
+    assert_eq!(after.name, "Marble: Harbor");
     assert_eq!(after.tmdb_id, Some(954));
     assert_eq!(
         after.premiere_date.map(|d| d.date_naive().to_string()),
@@ -705,7 +705,7 @@ async fn r1scan_movie_takes_title_imdb_people_and_premiere() {
         .await
         .unwrap();
     assert_eq!(studios.len(), 1);
-    assert_eq!(calls.lock().unwrap().movie_searches, ["Mission Impossible"]);
+    assert_eq!(calls.lock().unwrap().movie_searches, ["Marble Harbor"]);
 
     // A second refresh asks by id and duplicates nothing
     rustyfin_core::metadata::refresh_item_metadata(pool, &client, &after, &pm)
@@ -842,11 +842,11 @@ async fn r3sortname_refresh_makes_sort_names_from_names_and_reads_sorttitle() {
     }
 
     let after = stored(pool, free.id).await;
-    assert_eq!(after.name, "Mission: Impossible");
-    assert_eq!(after.sort_name.as_deref(), Some("mission: impossible"));
+    assert_eq!(after.name, "Marble: Harbor");
+    assert_eq!(after.sort_name.as_deref(), Some("marble: harbor"));
     for (item, sort) in [
         // Its name isn't locked, so it takes the provider's title
-        (&sort_locked, "mission: impossible"),
+        (&sort_locked, "marble: harbor"),
         (&name_locked, "name lock"),
         (&whole_locked, "whole lock"),
         (&admin_forced, "admin pick"),
@@ -892,7 +892,7 @@ async fn r1scan_series_fills_its_seasons_and_episodes() {
     let pool = &fx.pool;
     let (pm, calls) = r1scan_manager().await;
     let client = reqwest::Client::new();
-    let root = fx.dir.join("film").join("One Night (2023)");
+    let root = fx.dir.join("film").join("Owl Hollow (2023)");
     let base = MediaItem {
         library_id: fx.library_id,
         date_created: Utc.with_ymd_and_hms(2020, 1, 2, 3, 4, 5).unwrap(),
@@ -900,7 +900,7 @@ async fn r1scan_series_fills_its_seasons_and_episodes() {
     };
     let series = MediaItem {
         id: Uuid::new_v4(),
-        name: "One Night".to_string(),
+        name: "Owl Hollow".to_string(),
         media_type: MediaType::Series,
         path: root.to_string_lossy().into_owned(),
         production_year: Some(2023),
@@ -917,10 +917,10 @@ async fn r1scan_series_fills_its_seasons_and_episodes() {
     };
     let episode = MediaItem {
         id: Uuid::new_v4(),
-        name: "One Night - S01E01".to_string(),
+        name: "Owl Hollow - S01E01".to_string(),
         media_type: MediaType::Episode,
         path: root
-            .join("Season 1/One Night - S01E01.mkv")
+            .join("Season 1/Owl Hollow - S01E01.mkv")
             .to_string_lossy()
             .into_owned(),
         parent_id: Some(season.id),
@@ -931,9 +931,9 @@ async fn r1scan_series_fills_its_seasons_and_episodes() {
     // A file holding episodes 1 and 2
     let double = MediaItem {
         id: Uuid::new_v4(),
-        name: "One Night - S01E01-E02".to_string(),
+        name: "Owl Hollow - S01E01-E02".to_string(),
         path: root
-            .join("Season 1/One Night - S01E01-E02.mkv")
+            .join("Season 1/Owl Hollow - S01E01-E02.mkv")
             .to_string_lossy()
             .into_owned(),
         index_number_end: Some(2),
@@ -951,7 +951,7 @@ async fn r1scan_series_fills_its_seasons_and_episodes() {
 
     assert_eq!(
         calls.lock().unwrap().series_searches,
-        [("One Night".to_string(), Some(2023))]
+        [("Owl Hollow".to_string(), Some(2023))]
     );
     let series_after = stored(pool, series.id).await;
     assert_eq!(series_after.tmdb_id, Some(228527));

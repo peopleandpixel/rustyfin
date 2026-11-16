@@ -40,7 +40,7 @@ pub struct HintCandidate {
 }
 
 /// True only when FTS5 cannot parse the search term itself, such as `Star Trek: Discovery*`
-/// (it reads `Trek` as a column) or `Mr. Robot*` (a syntax error). Any other error, such as a
+/// (it reads `Trek` as a column) or `Mr. Lantern*` (a syntax error). Any other error, such as a
 /// missing index, is not a query error and must not fall back to matching names alone.
 fn is_fts_query_error(e: &sqlx::Error) -> bool {
     match e {

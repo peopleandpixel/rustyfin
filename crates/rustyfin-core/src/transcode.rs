@@ -2633,8 +2633,8 @@ mod tests {
     #[test]
     fn test_subtitles_filter_escapes_like_jellyfin() {
         assert_eq!(
-            subtitles_filter("/m/Ocean's Eleven: Redux.mkv", 2, 0),
-            r"subtitles=f='/m/Ocean'\\\''s Eleven\: Redux.mkv':si=2"
+            subtitles_filter("/m/Tansy's Eleven: Redux.mkv", 2, 0),
+            r"subtitles=f='/m/Tansy'\\\''s Eleven\: Redux.mkv':si=2"
         );
         assert_eq!(
             subtitles_filter("/m/Film.mkv", 2, 0),
@@ -2645,7 +2645,7 @@ mod tests {
     #[test]
     fn test_subtitles_filter_paths_reach_ffmpeg_intact() {
         let paths = [
-            "/m/Movies/Ocean's Eleven: Redux (2001).mkv",
+            "/m/Movies/Tansy's Eleven: Redux (2001).mkv",
             r"/m/Movies/back\slash.mkv",
             "/m/Movies/[Group] Show - 01 [1080p].mkv",
             "/m/Movies/Hello, World; Again.mkv",
@@ -2669,7 +2669,7 @@ mod tests {
 
     #[test]
     fn test_build_ffmpeg_args_text_burn_in_escapes_the_input() {
-        let input = "/m/Ocean's Eleven: Redux.mkv";
+        let input = "/m/Tansy's Eleven: Redux.mkv";
         for start_time_ticks in [0, 6_000_000_000] {
             let profile = TranscodeProfile {
                 burn_subtitles: true,
