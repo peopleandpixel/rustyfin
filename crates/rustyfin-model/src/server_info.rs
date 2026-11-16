@@ -323,6 +323,72 @@ impl ServerConfiguration {
     pub fn sort_rules(&self) -> crate::sort_name::SortRules {
         crate::sort_name::SortRules::from_config(&self.other)
     }
+
+    /// The resume rules: `MinResumePct`, `MaxResumePct`, `MinResumeDurationSeconds`,
+    /// `MinAudiobookResume` and `MaxAudiobookResume`, with Jellyfin's defaults for the ones no
+    /// client has saved.
+    pub fn resume_rules(&self) -> ResumeRules {
+        ResumeRules::from_config(&self.other)
+    }
+}
+
+/// When a playback report keeps a resume point and when it marks an item played (Jellyfin's
+/// `UserDataManager.UpdatePlayState` reads these from the server configuration).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResumeRules {
+    /// A position before this share of the runtime keeps no resume point.
+    pub min_resume_pct: i64,
+    /// A position past this share of the runtime marks the item played.
+    pub max_resume_pct: i64,
+    /// An item shorter than this is played once stopped in the middle.
+    pub min_resume_duration_seconds: i64,
+    /// Audiobooks: a position before this many minutes keeps no resume point.
+    pub min_audiobook_resume_minutes: i64,
+    /// Audiobooks: fewer minutes than this left marks the book played.
+    pub max_audiobook_resume_minutes: i64,
+}
+
+impl Default for ResumeRules {
+    /// Jellyfin's defaults.
+    fn default() -> Self {
+        Self {
+            min_resume_pct: 5,
+            max_resume_pct: 90,
+            min_resume_duration_seconds: 300,
+            min_audiobook_resume_minutes: 5,
+            max_audiobook_resume_minutes: 5,
+        }
+    }
+}
+
+impl ResumeRules {
+    /// The rules in a server configuration's JSON fields. A missing value, or one that is not a
+    /// number, keeps Jellyfin's default; a fraction is cut to a whole number.
+    pub fn from_config(fields: &serde_json::Map<String, serde_json::Value>) -> Self {
+        let defaults = Self::default();
+        let number = |key: &str, default: i64| {
+            fields
+                .get(key)
+                .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)))
+                .unwrap_or(default)
+        };
+        Self {
+            min_resume_pct: number("MinResumePct", defaults.min_resume_pct),
+            max_resume_pct: number("MaxResumePct", defaults.max_resume_pct),
+            min_resume_duration_seconds: number(
+                "MinResumeDurationSeconds",
+                defaults.min_resume_duration_seconds,
+            ),
+            min_audiobook_resume_minutes: number(
+                "MinAudiobookResume",
+                defaults.min_audiobook_resume_minutes,
+            ),
+            max_audiobook_resume_minutes: number(
+                "MaxAudiobookResume",
+                defaults.max_audiobook_resume_minutes,
+            ),
+        }
+    }
 }
 
 impl Default for ServerConfiguration {
