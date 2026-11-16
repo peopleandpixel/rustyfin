@@ -488,8 +488,21 @@
         <!-- Video Element -->
         <div class="flex-1 flex items-center justify-center relative bg-black cursor-pointer" onclick="playerAreaClick(event)">
             <video id="video-player" class="w-full h-full max-h-screen object-contain" playsinline preload="auto"></video>
+            <!-- Text subtitles, drawn by the player in the user's subtitle appearance -->
+            <div class="jf-subtitle-overlay" aria-hidden="true"><div id="player-subtitle-window" class="jf-subtitle-window"></div></div>
+            <!-- Short messages: the subtitle offset, a skipped segment -->
+            <p id="player-osd" class="jf-player-osd" role="status" hidden></p>
             <!-- Center Play/Pause indicator animation -->
             <div id="player-center-icon" class="hidden absolute w-20 h-20 rounded-full bg-black/60 backdrop-blur-md flex items-center justify-center pointer-events-none transition-transform duration-200"></div>
+        </div>
+
+        <!-- Playback info (the settings menu): how the item plays, refreshed every second -->
+        <div id="player-stats" class="jf-player-stats" hidden>
+            <div class="flex items-center justify-between mb-2">
+                <h3 class="text-sm font-semibold" data-i18n="player.playback_info">Playback info</h3>
+                <button type="button" class="jf-player-menu-btn" onclick="togglePlaybackStats(false)" title="Close" aria-label="Close" data-i18n-title="common.close" data-i18n-aria-label="common.close">×</button>
+            </div>
+            <div id="player-stats-body" class="flex flex-col gap-2"></div>
         </div>
 
         <!-- Next episode card: near an episode's end, counts down unless autoplay is off -->
@@ -524,8 +537,11 @@
                     <!-- Trickplay thumbnail and time over the point being dragged or hovered -->
                     <div id="player-trickplay" class="absolute bottom-full mb-3 -translate-x-1/2 pointer-events-none flex flex-col items-center gap-1" hidden>
                         <div id="player-trickplay-img" class="rounded border border-white/20 bg-black bg-no-repeat shadow-2xl" hidden></div>
+                        <span id="player-trickplay-chapter" class="text-xs text-white bg-black/70 rounded px-1.5 py-0.5 max-w-60 truncate" hidden></span>
                         <span id="player-trickplay-time" class="text-xs font-mono text-white bg-black/70 rounded px-1.5 py-0.5"></span>
                     </div>
+                    <!-- Chapter starts on the seek bar -->
+                    <div id="player-chapter-marks" class="jf-chapter-marks" aria-hidden="true"></div>
                     <input id="player-seek" type="range" min="0" max="100" value="0" step="0.1" class="w-full range range-xs range-primary accent-[#00a4dc] cursor-pointer"
                            oninput="previewSeek(this.value)" onchange="seekVideo(this.value)" onpointerup="seekDragging = false" onpointercancel="seekDragging = false"
                            onpointerdown="hoverSeek(event)" onpointermove="hoverSeek(event)" onpointerleave="if (!seekDragging) hideTrickplay()">
@@ -573,6 +589,161 @@
                         <i data-lucide="captions" class="w-4 h-4 shrink-0"></i>
                         <select id="player-subs" class="bg-white/10 text-xs text-white rounded px-2 py-1 outline-none border border-white/10 focus-visible:ring-2 focus-visible:ring-[#00a4dc] max-sm:absolute max-sm:inset-0 max-sm:w-full max-sm:opacity-0 sm:max-w-56" title="Choose subtitles" aria-label="Choose subtitles" data-i18n-title="player.choose_subtitles" data-i18n-aria-label="player.choose_subtitles" onchange="changeSubtitleTrack(this.value)"></select>
                     </label>
+                    <!-- Chapters: items with two or more -->
+                    <details id="player-chapters" class="relative" ontoggle="renderChapterMenu(this.open)" hidden>
+                        <summary class="jf-icon-btn list-none cursor-pointer" title="Chapters" aria-label="Chapters" data-i18n-title="player.chapters" data-i18n-aria-label="player.chapters">
+                            <i data-lucide="list" class="w-5 h-5"></i>
+                        </summary>
+                        <div class="jf-player-menu !gap-1">
+                            <h3 class="jf-player-menu-heading" data-i18n="player.chapters">Chapters</h3>
+                            <div id="player-chapters-list" class="flex flex-col gap-0.5"></div>
+                        </div>
+                    </details>
+                    <!-- Player settings: a menu that keeps the bars up while it is open -->
+                    <details id="player-settings" class="relative" ontoggle="renderPlayerSettings(this.open)">
+                        <summary class="jf-icon-btn list-none cursor-pointer" title="Settings" aria-label="Settings" data-i18n-title="player.settings" data-i18n-aria-label="player.settings">
+                            <i data-lucide="settings" class="w-5 h-5"></i>
+                        </summary>
+                        <div class="jf-player-menu">
+                            <section id="player-settings-playback" class="space-y-2">
+                                <h3 class="jf-player-menu-heading" data-i18n="player.playback">Playback</h3>
+                                <label id="player-quality-row" class="jf-player-menu-row"><span data-i18n="player.quality">Quality</span>
+                                    <select id="player-quality" class="jf-player-menu-select" onchange="changeQuality(this.value)"></select>
+                                </label>
+                                <label id="player-version-row" class="jf-player-menu-row" hidden><span data-i18n="player.version">Version</span>
+                                    <select id="player-version" class="jf-player-menu-select" onchange="changeVersion(this.value)"></select>
+                                </label>
+                                <label id="player-aspect-row" class="jf-player-menu-row"><span data-i18n="player.aspect_ratio">Aspect ratio</span>
+                                    <select id="player-aspect" class="jf-player-menu-select" onchange="changeAspectRatio(this.value)">
+                                        <option value="auto" data-i18n="player.aspect_auto">Auto</option>
+                                        <option value="cover" data-i18n="player.aspect_cover">Zoom</option>
+                                        <option value="fill" data-i18n="player.aspect_fill">Stretch</option>
+                                    </select>
+                                </label>
+                                <label class="jf-player-menu-row"><span data-i18n="player.still_watching">Ask if still watching</span>
+                                    <select id="player-still-watching" class="jf-player-menu-select" onchange="changeStillWatching(this.value)">
+                                        <option value="disabled" data-i18n="player.still_watching_off">Never</option>
+                                        <option value="short" data-i18n="player.still_watching_short">2 episodes or 1 h idle</option>
+                                        <option value="default" data-i18n="player.still_watching_default">3 episodes or 1.5 h idle</option>
+                                        <option value="long" data-i18n="player.still_watching_long">5 episodes or 2.5 h idle</option>
+                                        <option value="veryLong" data-i18n="player.still_watching_very_long">8 episodes or 4 h idle</option>
+                                    </select>
+                                </label>
+                                <button id="player-stats-toggle" type="button" class="jf-player-menu-btn w-full text-left !py-1.5" onclick="togglePlaybackStats()" data-i18n="player.playback_info">Playback info</button>
+                            </section>
+                            <section id="player-settings-segments" class="space-y-2">
+                                <h3 class="jf-player-menu-heading" data-i18n="player.media_segments">Media segments</h3>
+                                <label class="jf-player-menu-row"><span data-i18n="player.segment_intro">Intro</span>
+                                    <select id="player-segment-intro" class="jf-player-menu-select" onchange="changeSegmentAction('Intro', this.value)">
+                                        <option value="Skip" data-i18n="player.segment_action_skip">Skip</option>
+                                        <option value="AskToSkip" data-i18n="player.segment_action_ask">Ask to skip</option>
+                                        <option value="None" data-i18n="player.segment_action_none">Nothing</option>
+                                    </select>
+                                </label>
+                                <label class="jf-player-menu-row"><span data-i18n="player.segment_outro">Outro</span>
+                                    <select id="player-segment-outro" class="jf-player-menu-select" onchange="changeSegmentAction('Outro', this.value)">
+                                        <option value="Skip" data-i18n="player.segment_action_skip">Skip</option>
+                                        <option value="AskToSkip" data-i18n="player.segment_action_ask">Ask to skip</option>
+                                        <option value="None" data-i18n="player.segment_action_none">Nothing</option>
+                                    </select>
+                                </label>
+                                <label class="jf-player-menu-row"><span data-i18n="player.segment_recap">Recap</span>
+                                    <select id="player-segment-recap" class="jf-player-menu-select" onchange="changeSegmentAction('Recap', this.value)">
+                                        <option value="Skip" data-i18n="player.segment_action_skip">Skip</option>
+                                        <option value="AskToSkip" data-i18n="player.segment_action_ask">Ask to skip</option>
+                                        <option value="None" data-i18n="player.segment_action_none">Nothing</option>
+                                    </select>
+                                </label>
+                                <label class="jf-player-menu-row"><span data-i18n="player.segment_preview">Preview</span>
+                                    <select id="player-segment-preview" class="jf-player-menu-select" onchange="changeSegmentAction('Preview', this.value)">
+                                        <option value="Skip" data-i18n="player.segment_action_skip">Skip</option>
+                                        <option value="AskToSkip" data-i18n="player.segment_action_ask">Ask to skip</option>
+                                        <option value="None" data-i18n="player.segment_action_none">Nothing</option>
+                                    </select>
+                                </label>
+                                <label class="jf-player-menu-row"><span data-i18n="player.segment_commercial">Commercial</span>
+                                    <select id="player-segment-commercial" class="jf-player-menu-select" onchange="changeSegmentAction('Commercial', this.value)">
+                                        <option value="Skip" data-i18n="player.segment_action_skip">Skip</option>
+                                        <option value="AskToSkip" data-i18n="player.segment_action_ask">Ask to skip</option>
+                                        <option value="None" data-i18n="player.segment_action_none">Nothing</option>
+                                    </select>
+                                </label>
+                            </section>
+                            <section id="player-settings-subtitles" class="space-y-2">
+                                <h3 class="jf-player-menu-heading" data-i18n="player.subtitles">Subtitles</h3>
+                                <div class="jf-player-menu-row">
+                                    <span data-i18n="player.subtitle_offset">Offset (G, H)</span>
+                                    <span class="flex items-center gap-1">
+                                        <button type="button" class="jf-player-menu-btn" onclick="changeSubtitleOffset(-1)" title="Show later (G)" aria-label="Show later (G)" data-i18n-title="player.subtitle_offset_later" data-i18n-aria-label="player.subtitle_offset_later">−</button>
+                                        <span id="player-subtitle-offset" class="font-mono w-14 text-center">0.0 s</span>
+                                        <button type="button" class="jf-player-menu-btn" onclick="changeSubtitleOffset(1)" title="Show earlier (H)" aria-label="Show earlier (H)" data-i18n-title="player.subtitle_offset_earlier" data-i18n-aria-label="player.subtitle_offset_earlier">+</button>
+                                        <button type="button" class="jf-player-menu-btn" onclick="changeSubtitleOffset(0)" data-i18n="player.reset">Reset</button>
+                                    </span>
+                                </div>
+                                <div class="jf-subtitle-preview-box"><span id="player-subtitle-preview" class="jf-subtitle-text" data-i18n="player.subtitle_preview">This is how subtitles look</span></div>
+                                <label class="jf-player-menu-row"><span data-i18n="player.sub_size">Text size</span>
+                                    <select name="textSize" class="jf-player-menu-select" onchange="setSubtitleAppearance(this.name, this.value)">
+                                        <option value="smaller" data-i18n="player.sub_size_smaller">Smaller</option>
+                                        <option value="small" data-i18n="player.sub_size_small">Small</option>
+                                        <option value="" data-i18n="player.sub_size_normal">Normal</option>
+                                        <option value="large" data-i18n="player.sub_size_large">Large</option>
+                                        <option value="larger" data-i18n="player.sub_size_larger">Larger</option>
+                                        <option value="extralarge" data-i18n="player.sub_size_extralarge">Extra large</option>
+                                    </select>
+                                </label>
+                                <label class="jf-player-menu-row"><span data-i18n="player.sub_font">Font</span>
+                                    <select name="font" class="jf-player-menu-select" onchange="setSubtitleAppearance(this.name, this.value)">
+                                        <option value="" data-i18n="player.sub_font_default">Default</option>
+                                        <option value="typewriter" data-i18n="player.sub_font_typewriter">Typewriter</option>
+                                        <option value="print" data-i18n="player.sub_font_print">Print</option>
+                                        <option value="console" data-i18n="player.sub_font_console">Console</option>
+                                        <option value="cursive" data-i18n="player.sub_font_cursive">Cursive</option>
+                                        <option value="casual" data-i18n="player.sub_font_casual">Casual</option>
+                                        <option value="smallcaps" data-i18n="player.sub_font_smallcaps">Small caps</option>
+                                    </select>
+                                </label>
+                                <label class="jf-player-menu-row"><span data-i18n="player.sub_weight">Weight</span>
+                                    <select name="textWeight" class="jf-player-menu-select" onchange="setSubtitleAppearance(this.name, this.value)">
+                                        <option value="normal" data-i18n="player.sub_weight_normal">Normal</option>
+                                        <option value="bold" data-i18n="player.sub_weight_bold">Bold</option>
+                                    </select>
+                                </label>
+                                <label class="jf-player-menu-row"><span data-i18n="player.sub_color">Text colour</span>
+                                    <select name="textColor" class="jf-player-menu-select" onchange="setSubtitleAppearance(this.name, this.value)">
+                                        <option value="#ffffff" data-i18n="player.color_white">White</option>
+                                        <option value="#d3d3d3" data-i18n="player.color_light_gray">Light grey</option>
+                                        <option value="#808080" data-i18n="player.color_gray">Grey</option>
+                                        <option value="#ffff00" data-i18n="player.color_yellow">Yellow</option>
+                                        <option value="#008000" data-i18n="player.color_green">Green</option>
+                                        <option value="#00ffff" data-i18n="player.color_cyan">Cyan</option>
+                                        <option value="#0000ff" data-i18n="player.color_blue">Blue</option>
+                                        <option value="#ff00ff" data-i18n="player.color_magenta">Magenta</option>
+                                        <option value="#ff0000" data-i18n="player.color_red">Red</option>
+                                        <option value="#000000" data-i18n="player.color_black">Black</option>
+                                    </select>
+                                </label>
+                                <label class="jf-player-menu-row"><span data-i18n="player.sub_shadow">Edge</span>
+                                    <select name="dropShadow" class="jf-player-menu-select" onchange="setSubtitleAppearance(this.name, this.value)">
+                                        <option value="" data-i18n="player.sub_shadow_drop">Drop shadow</option>
+                                        <option value="none" data-i18n="player.sub_shadow_none">None</option>
+                                        <option value="raised" data-i18n="player.sub_shadow_raised">Raised</option>
+                                        <option value="depressed" data-i18n="player.sub_shadow_depressed">Depressed</option>
+                                        <option value="uniform" data-i18n="player.sub_shadow_uniform">Outline</option>
+                                    </select>
+                                </label>
+                                <label class="jf-player-menu-row"><span data-i18n="player.sub_background">Background</span>
+                                    <select name="textBackground" class="jf-player-menu-select" onchange="setSubtitleAppearance(this.name, this.value)">
+                                        <option value="transparent" data-i18n="player.sub_background_none">None</option>
+                                        <option value="rgba(0, 0, 0, 0.5)" data-i18n="player.sub_background_translucent">Translucent black</option>
+                                        <option value="#000000" data-i18n="player.color_black">Black</option>
+                                    </select>
+                                </label>
+                                <label class="jf-player-menu-row"><span data-i18n="player.sub_position">Position</span>
+                                    <input name="verticalPosition" type="range" min="-16" max="16" step="1" class="w-32 accent-[#00a4dc]" oninput="setSubtitleAppearance(this.name, this.value)">
+                                </label>
+                            </section>
+                        </div>
+                    </details>
                     <!-- Playback Speed -->
                     <select id="player-speed" class="bg-white/10 text-xs text-white rounded px-2 py-1 outline-none border border-white/10" title="Playback speed (&lt; &gt;)" aria-label="Playback speed (&lt; &gt;)" data-i18n-title="player.speed_tooltip" data-i18n-aria-label="player.speed_tooltip" onchange="setPlaybackRate(this.value)">
                         <option value="0.5">0.5x</option>
@@ -797,6 +968,48 @@
         </form>
     </div>
     <form method="dialog" class="modal-backdrop"><button data-i18n="common.backdrop_close">close</button></form>
+</dialog>
+
+<!-- Now playing: music plays on across pages under this bar; the full player opens from it -->
+<div id="now-playing" class="jf-now-playing" role="region" aria-label="Now playing" data-i18n-aria-label="player.now_playing" hidden>
+    <input id="now-playing-seek" type="range" min="0" max="100" value="0" step="0.1" class="jf-now-playing-seek accent-[#00a4dc]"
+           aria-label="Seek" data-i18n-aria-label="player.seek" oninput="seekDragging = true" onchange="seekVideo(this.value)">
+    <div class="flex items-center gap-2 px-3 py-2">
+        <button type="button" class="flex items-center gap-3 min-w-0 flex-1 text-left" onclick="openFullPlayer()" title="Open player" data-i18n-title="player.open_player">
+            <img id="now-playing-img" class="w-11 h-11 rounded object-cover bg-white/10 shrink-0" alt="">
+            <span class="min-w-0">
+                <span id="now-playing-title" class="block truncate text-sm font-semibold text-white"></span>
+                <span id="now-playing-artist" class="block truncate text-xs text-white/60"></span>
+            </span>
+        </button>
+        <span id="now-playing-time" class="text-xs font-mono text-white/60 max-sm:hidden"></span>
+        <button id="now-playing-prev" type="button" class="jf-icon-btn disabled:opacity-40" onclick="playAdjacentEpisode(-1)" title="Previous" aria-label="Previous" data-i18n-title="player.previous_item" data-i18n-aria-label="player.previous_item" hidden>
+            <i data-lucide="skip-back" class="w-5 h-5"></i>
+        </button>
+        <button type="button" class="jf-icon-btn !bg-[#00a4dc] hover:!bg-[#008fbf] text-white" onclick="togglePlayPause()" title="Play/Pause" aria-label="Play/Pause" data-i18n-title="player.play_pause" data-i18n-aria-label="player.play_pause">
+            <span id="now-playing-play-icon" class="inline-flex"><i data-lucide="play" class="w-5 h-5 ml-0.5 fill-current"></i></span>
+        </button>
+        <button id="now-playing-next" type="button" class="jf-icon-btn disabled:opacity-40" onclick="playAdjacentEpisode(1)" title="Next" aria-label="Next" data-i18n-title="player.next_item" data-i18n-aria-label="player.next_item" hidden>
+            <i data-lucide="skip-forward" class="w-5 h-5"></i>
+        </button>
+        <button type="button" class="jf-icon-btn max-sm:hidden" onclick="openFullPlayer()" title="Open player" aria-label="Open player" data-i18n-title="player.open_player" data-i18n-aria-label="player.open_player">
+            <i data-lucide="maximize" class="w-5 h-5"></i>
+        </button>
+        <button type="button" class="jf-icon-btn" onclick="stopNowPlaying()" title="Stop" aria-label="Stop" data-i18n-title="player.stop" data-i18n-aria-label="player.stop">
+            <i data-lucide="x" class="w-5 h-5"></i>
+        </button>
+    </div>
+</div>
+
+<!-- Are you still watching? Before the next episode, after a long run (the player's settings menu turns it on) -->
+<dialog id="still-watching" class="modal bg-black/70 backdrop-blur-md">
+    <div class="modal-box max-w-xs jf-menu rounded-2xl p-5">
+        <h3 class="text-base font-bold text-white mb-4" data-i18n="player.still_watching_question">Are you still watching?</h3>
+        <form method="dialog" class="flex flex-col gap-2">
+            <button value="continue" class="jf-btn-primary w-full text-sm" autofocus data-i18n="player.still_watching_continue">Continue watching</button>
+            <button value="stop" class="jf-btn-ghost w-full text-sm" data-i18n="player.still_watching_stop">Stop watching</button>
+        </form>
+    </div>
 </dialog>
 
 <!-- Toast notification container -->

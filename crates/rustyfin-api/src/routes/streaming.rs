@@ -1113,7 +1113,10 @@ async fn video_universal(
         // The transcode's VideoBitrate is in kbps; Jellyfin's MaxVideoBitrate is in bits/s. With
         // both limits the lower one wins.
         let max_video_kbps = query.max_video_bitrate.map(|bps| (bps / 1000).max(1));
-        let streaming_kbps = streaming_video_kbps(query.max_streaming_bitrate);
+        let streaming_kbps = streaming_video_kbps(
+            query.max_streaming_bitrate,
+            media_sources.get(index).and_then(|source| source.bitrate),
+        );
         if let Some(bitrate) = [max_video_kbps, streaming_kbps].into_iter().flatten().min() {
             url.push_str(&format!("&VideoBitrate={}", bitrate));
         }
@@ -1395,17 +1398,6 @@ fn has_remembered_stream(
 
 /// Check if a media source can be directly played by the client.
 /// Direct play requires the client to support all codecs without any transcoding.
-/// The transcode's video bitrate in kbps for a client's MaxStreamingBitrate (bits/s): the limit
-/// less the default 192 kbps of audio. None when the limit leaves the transcode's default (8 Mbps)
-/// alone, so a client with a high or no limit transcodes as before.
-fn streaming_video_kbps(max_streaming_bitrate: Option<u32>) -> Option<u32> {
-    let default_kbps = rustyfin_core::transcode::TranscodeProfile::default().max_video_bitrate_kbps;
-    let audio_kbps = rustyfin_core::transcode::TranscodeProfile::default().max_audio_bitrate_kbps;
-    let kbps = (max_streaming_bitrate? / 1000)
-        .saturating_sub(audio_kbps)
-        .max(64);
-    (kbps < default_kbps).then_some(kbps)
-}
 
 fn check_direct_play(
     source: &rustyfin_model::media_source::MediaSourceResponse,
@@ -1427,12 +1419,6 @@ fn check_direct_play(
     }
     // If there's a video item but no video stream info, reject direct play
     if !has_video_stream && source.video_bitrate.is_some() {
-        return false;
-    }
-    // As in Jellyfin, a file above the client's MaxStreamingBitrate is not played directly
-    if let (Some(max), Some(bitrate)) = (query.max_streaming_bitrate, source.bitrate)
-        && bitrate > max
-    {
         return false;
     }
 
@@ -1501,7 +1487,32 @@ fn check_direct_play(
         return false;
     }
 
+    // The client's quality limit holds for direct play too, as in Jellyfin
+    if let Some(max_bitrate) = query.max_streaming_bitrate
+        && let Some(total_bitrate) = source.bitrate
+        && total_bitrate > max_bitrate
+    {
+        return false;
+    }
+
     true
+}
+
+/// The video bitrate in kbps (the HLS transcode's `VideoBitrate` unit) for a transcode under the client's
+/// `MaxStreamingBitrate` in bits per second: the limit less the transcoded audio. As in Jellyfin, a source
+/// over the limit is encoded up to the limit (so the video is never copied above it), and a limit below the
+/// transcode's default bitrate lowers it. A source that fits a high limit, or no limit, keeps the default.
+fn streaming_video_kbps(
+    max_streaming_bitrate: Option<u32>,
+    source_bitrate: Option<u32>,
+) -> Option<u32> {
+    let default = rustyfin_core::transcode::TranscodeProfile::default();
+    let limit = max_streaming_bitrate?;
+    let kbps = (limit / 1000)
+        .saturating_sub(default.max_audio_bitrate_kbps)
+        .max(64);
+    let over_limit = source_bitrate.is_some_and(|bitrate| bitrate > limit);
+    (over_limit || kbps < default.max_video_bitrate_kbps).then_some(kbps)
 }
 
 /// Check if a media source can be directly streamed (re-muxed without transcoding).

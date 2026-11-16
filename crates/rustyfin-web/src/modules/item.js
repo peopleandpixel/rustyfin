@@ -695,4 +695,5 @@ document.addEventListener('change', e => {
 
 export {
     currentDetailId, renderDetail, renderPerson, toggleFavorite, togglePlayed, deleteItemFromDetail, detailSelection,
+    versionLabels,
 };

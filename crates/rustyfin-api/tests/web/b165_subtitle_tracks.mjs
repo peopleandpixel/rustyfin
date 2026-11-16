@@ -71,7 +71,9 @@ function sandbox() {
         },
     });
     vm.runInContext(
-        `${slice('function isStreamType(')}
+        `function renderSubtitleCues() {}
+         function applySubtitleOffset() {}
+         ${slice('function isStreamType(')}
          ${slice('function findStream(')}
          ${slice('function isImageSubtitle(')}
          ${slice('function playerSubtitleTrack(')}
@@ -101,7 +103,7 @@ test('a chosen text subtitle shows alone', () => {
     const stale = video.addTextTrack('');
     context.showTextSubtitle(session(2));
     const own = video.querySelector('track[data-player-subtitle]').track;
-    assert.equal(own.mode, 'showing');
+    assert.equal(own.mode, 'hidden', 'on, and drawn by the player (renderSubtitleCues)');
     assert.equal(stale.mode, 'disabled');
 });
 
@@ -133,7 +135,7 @@ test('a track added during the playback is disabled, the own one kept', () => {
     const late = video.addTextTrack('CC1');
     context.disableOtherTextTracks(video);
     assert.equal(late.mode, 'disabled');
-    assert.equal(own.mode, 'showing');
+    assert.equal(own.mode, 'hidden', 'on, and drawn by the player (renderSubtitleCues)');
 });
 
 test('the player turns off captions that hls.js would add, and watches for added tracks', () => {
@@ -149,5 +151,5 @@ test('the player turns off captions that hls.js would add, and watches for added
     const late = video.addTextTrack('CC1');
     video.textTracks.onaddtrack({ track: late });
     assert.equal(late.mode, 'disabled');
-    assert.equal(own.mode, 'showing');
+    assert.equal(own.mode, 'hidden', 'on, and drawn by the player (renderSubtitleCues)');
 });
