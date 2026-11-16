@@ -2,6 +2,7 @@
 // Entry of the web client: loads its modules in order, then exposes the functions that
 // inline on*="" handlers (index.html and rendered markup) call as globals.
 import { $, toast } from './modules/util.js';
+import './modules/branding.js';
 import './modules/cards.js';
 import './modules/user-settings.js';
 import './modules/theme-media.js';
@@ -48,6 +49,8 @@ import {
 } from './modules/settings.js';
 import './modules/playback-admin.js';
 import './modules/dlna-admin.js';
+import './modules/server-admin.js';
+import './modules/library-options.js';
 import {
     saveGeneralSettings, addLibraryFolder, renameLibrary, addTaskTrigger, showTriggerFields,
 } from './modules/dashboard.js';

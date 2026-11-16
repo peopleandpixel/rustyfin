@@ -381,6 +381,29 @@ pub async fn token_device(
     ))
 }
 
+/// A new API key: stored by its hash, with its last four characters as the hint. Returns its id
+/// and the key, which only this caller ever sees.
+pub async fn create_api_key(
+    pool: &SqlitePool,
+    app_name: &str,
+) -> Result<(String, String), AuthError> {
+    let key = generate_token();
+    let id = Uuid::new_v4().simple().to_string();
+    let hint = &key[key.len() - 4..];
+    rustyfin_db::repo_api_key::insert(pool, &id, &token_hash(&key), hint, app_name).await?;
+    Ok((id, key))
+}
+
+/// Whether `key` is a live API key; one that is gets its last activity recorded.
+pub async fn validate_api_key(pool: &SqlitePool, key: &str) -> Result<bool, AuthError> {
+    Ok(rustyfin_db::repo_api_key::use_key(pool, &token_hash(key)).await?)
+}
+
+/// Revokes the API key with this id, or this key. Returns whether one was revoked.
+pub async fn revoke_api_key(pool: &SqlitePool, id_or_key: &str) -> Result<bool, AuthError> {
+    Ok(rustyfin_db::repo_api_key::delete(pool, id_or_key, &token_hash(id_or_key)).await?)
+}
+
 /// Revokes a single token.
 pub async fn revoke_token(pool: &SqlitePool, token: &str) -> Result<(), AuthError> {
     repo_token::delete_token(pool, &token_hash(token)).await?;

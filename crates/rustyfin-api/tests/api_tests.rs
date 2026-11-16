@@ -3613,6 +3613,7 @@ async fn b118_validate_path_admin_only_after_owner() {
 const B124_WEB_MODULES: &[&str] = &[
     "admin.js",
     "auth.js",
+    "branding.js",
     "cardmenu.js",
     "cards.js",
     "cast.js",
@@ -3624,6 +3625,7 @@ const B124_WEB_MODULES: &[&str] = &[
     "item.js",
     "jellyfin-import.js",
     "library-admin.js",
+    "library-options.js",
     "library.js",
     "libtabs.js",
     "lyrics.js",
@@ -3640,6 +3642,7 @@ const B124_WEB_MODULES: &[&str] = &[
     "router.js",
     "screensaver.js",
     "search.js",
+    "server-admin.js",
     "sessions.js",
     "settings.js",
     "subtitle-admin.js",
@@ -53579,4 +53582,538 @@ async fn r3queues_next_up_cutoff_reads_finished_plays() {
     assert_eq!(r3queues_ids(&body), Vec::<uuid::Uuid>::new());
     let (_, body) = r3queues_get(&app, &token, "/Shows/NextUp?nextUpDateCutoff=2010-01-01").await;
     assert_eq!(r3queues_ids(&body), vec![e2]);
+}
+
+// r3dash3: admin dashboard 3 (library options, networking, API keys, devices, branding, backups)
+
+// Every LibraryOptions field Jellyfin Web sends is stored and returned, with Jellyfin's names for
+// chapter images and trickplay and its defaults for the fields never saved.
+#[tokio::test]
+async fn r3dash3_library_options_round_trip_every_field() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, viewer, _) = g1_owner_and_viewer(&state, &app).await;
+    let lib = create_library_via_api(&app, &state, &owner, "R3 Dash3 Options", "Movies").await;
+    let (_, before) = send_authed(
+        &app,
+        "GET",
+        &format!("/Library/{lib}/Options"),
+        &owner,
+        None,
+    )
+    .await;
+    assert_eq!(before["SeasonZeroDisplayName"], "Specials", "{before}");
+    assert_eq!(before["EnableInternetProviders"], true, "{before}");
+    assert_eq!(before["AllowEmbeddedSubtitles"], "AllowAll", "{before}");
+    assert_eq!(before["EnableTrickplayImageExtraction"], false, "{before}");
+
+    let sent = serde_json::json!({
+        "EnableRealtimeMonitor": false,
+        "EnableChapterImageExtraction": true,
+        "PreferredMetadataLanguage": "de",
+        "MetadataCountryCode": "DE",
+        "SaveLocalMetadata": true,
+        "AutomaticRefreshIntervalDays": 90,
+        "EnableEmbeddedTitles": true,
+        "MetadataSavers": ["Nfo"],
+        "AllowEmbeddedSubtitles": "AllowText",
+        "SubtitleDownloadLanguages": ["deu"],
+        "TypeOptions": [{
+            "Type": "Movie",
+            "MetadataFetchers": ["OMDb"],
+            "MetadataFetcherOrder": ["OMDb", "TMDb"],
+            "ImageFetchers": ["TMDb"],
+            "ImageFetcherOrder": ["TMDb"],
+            "ImageOptions": [{ "Type": "Backdrop", "Limit": 3, "MinWidth": 1280 }],
+        }],
+        "PathInfos": [{ "Path": "/stale/copy" }],
+    });
+    let body = serde_json::json!({ "Id": lib, "LibraryOptions": sent }).to_string();
+    let (status, answer) = send_authed(
+        &app,
+        "POST",
+        "/Library/VirtualFolders/LibraryOptions",
+        &owner,
+        Some(&body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{answer}");
+    let (_, saved) = send_authed(
+        &app,
+        "GET",
+        &format!("/Library/{lib}/Options"),
+        &owner,
+        None,
+    )
+    .await;
+    for (field, value) in sent.as_object().unwrap() {
+        if field == "PathInfos" {
+            continue;
+        }
+        assert_eq!(&saved[field], value, "{field}: {saved}");
+    }
+    assert_eq!(saved["EnableChapterExtraction"], true, "{saved}");
+    assert!(saved.get("PathInfos").is_none(), "{saved}");
+    let (_, folders) = send_authed(&app, "GET", "/Library/VirtualFolders", &owner, None).await;
+    let folder = folders
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["ItemId"] == lib.to_string())
+        .unwrap();
+    assert_eq!(folder["LibraryOptions"]["TypeOptions"], sent["TypeOptions"]);
+    assert_eq!(folder["LibraryOptions"]["EnableRealtimeMonitor"], false);
+
+    // Jellyfin Web posts back what it read, both names included: nothing changes
+    let body = serde_json::json!({ "Id": lib, "LibraryOptions": saved }).to_string();
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        "/Library/VirtualFolders/LibraryOptions",
+        &owner,
+        Some(&body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, again) = send_authed(
+        &app,
+        "GET",
+        &format!("/Library/{lib}/Options"),
+        &owner,
+        None,
+    )
+    .await;
+    assert_eq!(again, saved);
+
+    let (status, _) = send_authed(
+        &app,
+        "GET",
+        &format!("/Library/{lib}/Options"),
+        &viewer,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn r3dash3_available_options_are_jellyfin_shaped() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, viewer, _) = g1_owner_and_viewer(&state, &app).await;
+    let (status, tv) = send_authed(
+        &app,
+        "GET",
+        "/Libraries/AvailableOptions?libraryContentType=tvshows&isNewLibrary=false",
+        &owner,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{tv}");
+    assert_eq!(tv["MetadataSavers"][0]["Name"], "Nfo", "{tv}");
+    assert!(tv["SubtitleFetchers"].is_array(), "{tv}");
+    assert!(tv["LyricFetchers"].is_array(), "{tv}");
+    assert!(tv["MediaSegmentProviders"].is_array(), "{tv}");
+    let types: Vec<&str> = tv["TypeOptions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["Type"].as_str().unwrap())
+        .collect();
+    assert_eq!(types, ["Series", "Season", "Episode"]);
+    for t in tv["TypeOptions"].as_array().unwrap() {
+        assert!(t["MetadataFetchers"].is_array(), "{t}");
+        assert!(t["ImageFetchers"].is_array(), "{t}");
+        assert!(
+            t["SupportedImageTypes"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("Primary"))
+        );
+        assert!(t["DefaultImageOptions"].is_array(), "{t}");
+    }
+    let (_, movies) = send_authed(
+        &app,
+        "GET",
+        "/Libraries/AvailableOptions?libraryContentType=movies",
+        &owner,
+        None,
+    )
+    .await;
+    assert_eq!(movies["TypeOptions"][0]["Type"], "Movie", "{movies}");
+    let (status, _) = send_authed(&app, "GET", "/Libraries/AvailableOptions", &viewer, None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+// The named configuration `network` has Jellyfin's NetworkConfiguration shape, stores what an
+// administrator saves (unknown fields too), refuses bad values, and hides the certificate
+// password from other users.
+#[tokio::test]
+async fn r3dash3_network_configuration_round_trips() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, viewer, _) = g1_owner_and_viewer(&state, &app).await;
+    let uri = "/System/Configuration/network";
+    let (status, net) = send_authed(&app, "GET", uri, &owner, None).await;
+    assert_eq!(status, StatusCode::OK);
+    for field in [
+        "BaseUrl",
+        "EnableHttps",
+        "RequireHttps",
+        "CertificatePath",
+        "InternalHttpPort",
+        "InternalHttpsPort",
+        "PublicHttpPort",
+        "PublicHttpsPort",
+        "AutoDiscovery",
+        "EnableUPnP",
+        "EnableIPv4",
+        "EnableIPv6",
+        "EnableRemoteAccess",
+        "LocalNetworkSubnets",
+        "LocalNetworkAddresses",
+        "KnownProxies",
+        "IgnoreVirtualInterfaces",
+        "VirtualInterfaceNames",
+        "EnablePublishedServerUriByRequest",
+        "PublishedServerUriBySubnet",
+        "RemoteIPFilter",
+        "IsRemoteIPFilterBlacklist",
+    ] {
+        assert!(net.get(field).is_some(), "{field}: {net}");
+    }
+    assert_eq!(net["InternalHttpPort"], 8096);
+
+    let mut changed = net.clone();
+    changed["InternalHttpPort"] = serde_json::json!(8300);
+    changed["KnownProxies"] = serde_json::json!(["10.0.0.0/8"]);
+    changed["CertificatePassword"] = serde_json::json!("cert-secret");
+    changed["SomeFutureField"] = serde_json::json!(7);
+    let (status, answer) = send_authed(&app, "POST", uri, &owner, Some(&changed.to_string())).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{answer}");
+    let (_, saved) = send_authed(&app, "GET", uri, &owner, None).await;
+    assert_eq!(saved, changed);
+    let startup = rustyfin_api::named_config::network_startup(&state.data_dir);
+    assert_eq!(startup.bind.as_deref(), Some("0.0.0.0:8300"));
+    assert_eq!(startup.known_proxies.as_deref(), Some("10.0.0.0/8"));
+
+    let (_, seen) = send_authed(&app, "GET", uri, &viewer, None).await;
+    assert_eq!(seen["CertificatePassword"], "", "{seen}");
+    assert_eq!(seen["InternalHttpPort"], 8300);
+
+    for bad in [
+        serde_json::json!({ "InternalHttpPort": 70000 }),
+        serde_json::json!({ "KnownProxies": ["not an address"] }),
+        serde_json::json!([1, 2]),
+    ] {
+        let (status, _) = send_authed(&app, "POST", uri, &owner, Some(&bad.to_string())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+    }
+    let (status, _) = send_authed(&app, "POST", uri, &viewer, Some(&changed.to_string())).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (_, kept) = send_authed(&app, "GET", uri, &owner, None).await;
+    assert_eq!(kept, changed);
+}
+
+// Branding saved through the named configuration `branding` is what the anonymous branding
+// endpoints answer.
+#[tokio::test]
+async fn r3dash3_branding_is_saved_and_served_before_sign_in() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, viewer, _) = g1_owner_and_viewer(&state, &app).await;
+    let body = serde_json::json!({
+        "LoginDisclaimer": "Family server",
+        "CustomCss": ".x { color: red; }",
+        "SplashscreenEnabled": true,
+    });
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        "/System/Configuration/branding",
+        &owner,
+        Some(&body.to_string()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        "/System/Configuration/branding",
+        &viewer,
+        Some(&serde_json::json!({ "CustomCss": "" }).to_string()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let (status, config) = send(&app, request("GET", "/Branding/Configuration", None, None)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(config, body);
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/Branding/Css")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        resp.headers()["content-type"]
+            .to_str()
+            .unwrap()
+            .starts_with("text/css")
+    );
+    let css = resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&css[..], b".x { color: red; }");
+}
+
+// An API key is created once (its key in that answer only), listed by a hint, works as an
+// administrator's credentials, and stops working when revoked.
+#[tokio::test]
+async fn r3dash3_api_keys_create_list_use_revoke() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, viewer, _) = g1_owner_and_viewer(&state, &app).await;
+    let (status, created) =
+        send_authed(&app, "POST", "/Auth/Keys?app=Test%20App", &owner, None).await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let key = created["AccessToken"].as_str().unwrap().to_string();
+    let id = created["Id"].as_str().unwrap().to_string();
+    assert_eq!(key.len(), 32);
+
+    let (status, list) = send_authed(&app, "GET", "/Auth/Keys", &owner, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(list["TotalRecordCount"], 1, "{list}");
+    let item = &list["Items"][0];
+    assert_eq!(item["Id"], id.as_str());
+    assert_eq!(item["AppName"], "Test App");
+    assert_eq!(item["AccessToken"], format!("…{}", &key[28..]));
+    assert!(!list.to_string().contains(&key), "{list}");
+
+    // The key is an administrator's credentials
+    let (status, users) = send_authed(&app, "GET", "/Users", &key, None).await;
+    assert_eq!(status, StatusCode::OK, "{users}");
+    let (_, list) = send_authed(&app, "GET", "/Auth/Keys", &owner, None).await;
+    assert!(list["Items"][0]["DateLastActivity"].is_string(), "{list}");
+
+    let (status, _) = send_authed(&app, "POST", "/Auth/Keys", &owner, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "app is required");
+    let (status, _) = send_authed(&app, "POST", "/Auth/Keys?app=x", &viewer, None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = send_authed(&app, "DELETE", &format!("/Auth/Keys/{id}"), &viewer, None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let (status, _) = send_authed(&app, "DELETE", &format!("/Auth/Keys/{id}"), &owner, None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = send_authed(&app, "GET", "/Users", &key, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = send_authed(&app, "DELETE", &format!("/Auth/Keys/{id}"), &owner, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Jellyfin revokes by the key itself
+    let (_, created) = send_authed(&app, "POST", "/Auth/Keys?app=Other", &owner, None).await;
+    let key = created["AccessToken"].as_str().unwrap();
+    let (status, _) = send_authed(&app, "DELETE", &format!("/Auth/Keys/{key}"), &owner, None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, list) = send_authed(&app, "GET", "/Auth/Keys", &owner, None).await;
+    assert_eq!(list["TotalRecordCount"], 0, "{list}");
+}
+
+// GET /Devices answers 200 and lists the device a user signed in with; it can be renamed.
+#[tokio::test]
+async fn r3dash3_devices_lists_a_signed_in_device() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, _, _) = g1_owner_and_viewer(&state, &app).await;
+    let req = Request::builder()
+        .method("POST")
+        .uri("/Users/AuthenticateByName")
+        .header("Content-Type", "application/json")
+        .header(
+            "X-Emby-Authorization",
+            r#"MediaBrowser Client="Test TV", Device="Lounge", DeviceId="r3dash3-tv", Version="1.2.3""#,
+        )
+        .body(Body::from(
+            serde_json::json!({ "Username": "viewer", "Pw": "viewerpass" }).to_string(),
+        ))
+        .unwrap();
+    let (status, _) = send(&app, req).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, devices) = send_authed(&app, "GET", "/Devices", &owner, None).await;
+    assert_eq!(status, StatusCode::OK, "{devices}");
+    let tv = devices["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["Id"] == "r3dash3-tv")
+        .unwrap_or_else(|| panic!("{devices}"));
+    assert_eq!(tv["Name"], "Lounge");
+    assert_eq!(tv["AppName"], "Test TV");
+    assert_eq!(tv["LastUserName"], "viewer");
+
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        "/Devices/Options?id=r3dash3-tv",
+        &owner,
+        Some(r#"{"CustomName":"Kids TV"}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, info) = send_authed(&app, "GET", "/Devices/Info?id=r3dash3-tv", &owner, None).await;
+    assert_eq!(info["CustomName"], "Kids TV");
+    let (status, _) = send_authed(&app, "DELETE", "/Devices?id=r3dash3-tv", &owner, None).await;
+    assert!(status.is_success(), "{status}");
+    let (_, devices) = send_authed(&app, "GET", "/Devices", &owner, None).await;
+    assert!(!devices.to_string().contains("r3dash3-tv"), "{devices}");
+}
+
+// A backup is a Jellyfin-shaped manifest over one SQLite file in the data dir: created, listed,
+// downloaded, staged for a restore, and restored with its settings files at the next start.
+#[tokio::test]
+async fn r3dash3_backups_create_list_download_restore() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, viewer, _) = g1_owner_and_viewer(&state, &app).await;
+    std::fs::write(
+        state.data_dir.join("branding.json"),
+        r#"{"LoginDisclaimer":"then"}"#,
+    )
+    .unwrap();
+    let (status, manifest) = send_authed(
+        &app,
+        "POST",
+        "/Backup/Create",
+        &owner,
+        Some(r#"{"Metadata":true,"Trickplay":false,"Subtitles":false}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{manifest}");
+    let name = manifest["Path"].as_str().unwrap().to_string();
+    assert!(
+        name.starts_with("rustyfin-backup-") && name.ends_with(".db"),
+        "{name}"
+    );
+    assert!(manifest["ServerVersion"].is_string());
+    assert!(manifest["BackupEngineVersion"].is_string());
+    assert!(manifest["DateCreated"].is_string());
+    assert_eq!(manifest["Options"]["Database"], true);
+    assert_eq!(
+        manifest["Options"]["Metadata"], false,
+        "images are not backed up"
+    );
+    assert!(state.data_dir.join("backups").join(&name).is_file());
+
+    let (_, list) = send_authed(&app, "GET", "/Backup", &owner, None).await;
+    assert_eq!(list, serde_json::json!([manifest]));
+    let (_, one) = send_authed(
+        &app,
+        "GET",
+        &format!("/Backup/Manifest?path={name}"),
+        &owner,
+        None,
+    )
+    .await;
+    assert_eq!(one, manifest);
+    for path in ["../test.db", "%2Fetc%2Fpasswd", "nope.db"] {
+        let (status, _) = send_authed(
+            &app,
+            "GET",
+            &format!("/Backup/Download?path={path}"),
+            &owner,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+    }
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/Backup/Download?path={name}"))
+                .header("Authorization", format!("Bearer {owner}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        resp.headers()["content-disposition"]
+            .to_str()
+            .unwrap()
+            .contains(&name)
+    );
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    assert!(bytes.starts_with(b"SQLite format 3\0"));
+    let (status, _) = send_authed(&app, "GET", "/Backup", &viewer, None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Staged, then done at the next start against a database file in the data dir
+    std::fs::write(
+        state.data_dir.join("branding.json"),
+        r#"{"LoginDisclaimer":"now"}"#,
+    )
+    .unwrap();
+    let body = serde_json::json!({ "ArchiveFileName": name }).to_string();
+    let (status, answer) = send_authed(&app, "POST", "/Backup/Restore", &owner, Some(&body)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{answer}");
+    let db = state.data_dir.join("restored.db");
+    std::fs::write(&db, b"the database before the restore").unwrap();
+    let restored = rustyfin_api::backup_archive::apply_pending_restore(&state.data_dir, &db)
+        .await
+        .unwrap();
+    assert_eq!(restored.as_deref(), Some(name.as_str()));
+    assert_eq!(
+        std::fs::read_to_string(state.data_dir.join("branding.json")).unwrap(),
+        r#"{"LoginDisclaimer":"then"}"#
+    );
+    let kept: Vec<_> = std::fs::read_dir(state.data_dir.join("backups"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().starts_with("pre-restore-"))
+        .collect();
+    assert_eq!(kept.len(), 1);
+    let pool = rustyfin_db::init_db(db.to_str().unwrap()).await.unwrap();
+    let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(users, 2);
+    let leftover: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE name = 'rustyfin_backup'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(leftover, 0);
+    // Nothing staged any more
+    let again = rustyfin_api::backup_archive::apply_pending_restore(&state.data_dir, &db)
+        .await
+        .unwrap();
+    assert_eq!(again, None);
+
+    let (status, _) = send_authed(&app, "DELETE", &format!("/Backup/{name}"), &owner, None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, list) = send_authed(&app, "GET", "/Backup", &owner, None).await;
+    assert_eq!(list, serde_json::json!([]));
+    let restore = serde_json::json!({ "ArchiveFileName": "../test.db" }).to_string();
+    let (status, _) = send_authed(&app, "POST", "/Backup/Restore", &owner, Some(&restore)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// The dashboard's Networking, API keys, Devices, Branding and Backups tabs
+// (tests/web/r3dash3_server_admin.mjs).
+#[test]
+fn r3dash3_web_server_admin() {
+    b124_node_test("r3dash3_server_admin.mjs");
+}
+
+// The library options editor (tests/web/r3dash3_library_options.mjs).
+#[test]
+fn r3dash3_web_library_options() {
+    b124_node_test("r3dash3_library_options.mjs");
 }

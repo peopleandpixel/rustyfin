@@ -4,6 +4,7 @@ import { currentPage, navigate, closeUserMenu } from './router.js';
 import { renderSettings } from './settings.js';
 import { loadUserSettings } from './user-settings.js';
 import { jiChoice, jiConfirm, jiShownCodes } from './jellyfin-import.js';
+import { showLoginDisclaimer } from './branding.js';
 import { loadSidebar, initScanProgressWebSocket, stopScanProgressWebSocket } from './library-admin.js';
 
 // --- OpenID Connect: helpers for the sign-in page and the profile ---
@@ -177,6 +178,7 @@ function loginCard(title, subtitle, body, wide = false) {
                 <p class="text-white/40 text-xs mt-1">${escapeHtml(subtitle)}</p>
             </div>
             ${body}
+            <p id="login-disclaimer" class="hidden mt-6 text-xs text-white/50 text-center whitespace-pre-line"></p>
         </div>
     </div>`;
 }
@@ -242,6 +244,7 @@ function showLoginStep(step, name = '') {
         tiles,
     ));
     loadOidcSignIn();
+    showLoginDisclaimer($('login-disclaimer'));
     if (tiles) document.querySelector('#page-login [data-login="user"]')?.focus();
     else (name ? $('login-pass') : $('login-user'))?.focus();
 }

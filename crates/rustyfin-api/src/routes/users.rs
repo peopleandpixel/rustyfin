@@ -83,7 +83,7 @@ pub fn admin_routes() -> Router<AppState> {
         .route("/Users/{userId}", delete(delete_user_by_id))
         .route("/Users/{userId}/Delete", post(delete_user))
         .route("/Users/{userId}/Policy", post(update_policy))
-        .route("/Auth/Keys", get(get_auth_keys))
+        .route("/Auth/Keys", get(get_auth_keys).post(create_auth_key))
         .route("/Auth/Keys/{key}", delete(delete_auth_key))
         .route("/Auth/Providers", get(get_auth_providers))
         .route(
@@ -977,18 +977,76 @@ async fn delete_user_by_id(
 }
 
 /// GET /Auth/Keys - List API keys
-async fn get_auth_keys(
-    State(_state): State<AppState>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    Ok(Json(serde_json::json!([])))
+async fn get_auth_keys(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+    let keys = rustyfin_db::repo_api_key::list(&state.db_ro).await?;
+    // Jellyfin's `QueryResult<AuthenticationInfo>`. Only a key's hash is stored, so `AccessToken`
+    // is its last four characters after an ellipsis; `Id` names the key to revoke.
+    let items: Vec<serde_json::Value> = keys
+        .into_iter()
+        .map(|k| {
+            serde_json::json!({
+                "Id": k.id,
+                "AccessToken": format!("…{}", k.hint),
+                "AppName": k.app_name,
+                "AppVersion": "",
+                "DeviceId": "",
+                "DeviceName": "",
+                "UserId": uuid::Uuid::nil(),
+                "IsActive": true,
+                "DateCreated": k.date_created,
+                "DateRevoked": null,
+                "DateLastActivity": k.date_last_activity.unwrap_or_else(|| k.date_created.clone()),
+                "UserName": null,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({
+        "Items": items,
+        "TotalRecordCount": items.len(),
+        "StartIndex": 0,
+    })))
 }
 
-/// DELETE /Auth/Keys/{key} - Revoke API key
-async fn delete_auth_key(
-    State(_state): State<AppState>,
-    Path(_key): Path<String>,
+/// The longest app name of an API key, in bytes.
+const MAX_KEY_APP_NAME_BYTES: usize = 256;
+
+/// POST /Auth/Keys?app= - creates an API key for the app. Jellyfin answers 204; Rustyfin also
+/// returns `{Id, AccessToken}`, the only time the key is shown. The key is never logged.
+async fn create_auth_key(
+    State(state): State<AppState>,
+    Query(params): Query<Vec<(String, String)>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    Ok(Json(serde_json::json!({})))
+    let app = crate::query::first_value(&params, "app")
+        .map(str::trim)
+        .filter(|a| !a.is_empty())
+        .ok_or_else(|| ApiError::BadRequest("app is required".to_string()))?;
+    if app.len() > MAX_KEY_APP_NAME_BYTES {
+        return Err(ApiError::BadRequest(format!(
+            "app: longer than {MAX_KEY_APP_NAME_BYTES} bytes"
+        )));
+    }
+    let (id, key) = rustyfin_auth::create_api_key(&state.db, app)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    tracing::info!("API key created for {app}");
+    Ok(Json(
+        serde_json::json!({ "Id": id, "AccessToken": key, "AppName": app }),
+    ))
+}
+
+/// DELETE /Auth/Keys/{key} - revokes the API key with this id, or this key (Jellyfin's form):
+/// 204, or 404 for an unknown one
+async fn delete_auth_key(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let revoked = rustyfin_auth::revoke_api_key(&state.db, &key)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    if !revoked {
+        return Err(ApiError::NotFound("API key not found".to_string()));
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// GET /Auth/Providers - List authentication providers

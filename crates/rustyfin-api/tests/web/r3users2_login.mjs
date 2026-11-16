@@ -35,6 +35,8 @@ function sandbox({ users = [], api = {} } = {}) {
         show: () => {}, hide: () => {},
         toast: (msg, kind) => log.push(['toast', msg, kind || 'ok']),
         navigate: (page, data) => log.push(['navigate', page, data]),
+        // The login disclaimer (branding.js, r3dash3_server_admin.mjs)
+        showLoginDisclaimer: () => {},
         closeUserMenu: () => log.push(['close-menu']),
         loadUserSettings: () => {}, loadSidebar: async () => {},
         initScanProgressWebSocket: () => {}, stopScanProgressWebSocket: () => {},

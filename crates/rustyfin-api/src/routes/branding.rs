@@ -1,13 +1,15 @@
-//! Jellyfin's anonymous branding endpoints, which Jellyfin Web loads before sign-in. Rustyfin has
-//! no branding settings, so they answer Jellyfin's defaults.
+//! Jellyfin's anonymous branding endpoints, which Jellyfin Web loads before sign-in. They answer
+//! the named configuration `branding` (see `named_config`), which administrators save through
+//! `POST /System/Configuration/branding`.
 
 use axum::extract::State;
 use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
-use serde::Serialize;
+use serde_json::Value;
 
+use crate::named_config::{BRANDING_KEY, load};
 use crate::state::AppState;
 
 pub fn routes() -> Router<AppState> {
@@ -18,28 +20,31 @@ pub fn routes() -> Router<AppState> {
         .route("/Branding/Splashscreen", get(get_splashscreen))
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "PascalCase")]
-struct BrandingOptions {
-    login_disclaimer: String,
-    custom_css: String,
-    splashscreen_enabled: bool,
+/// GET /Branding/Configuration - Jellyfin's `BrandingOptionsDto`
+async fn get_branding(State(state): State<AppState>) -> Json<Value> {
+    let options = load(&state.data_dir, BRANDING_KEY, false).await;
+    let text = |field: &str| options.get(field).and_then(Value::as_str).unwrap_or("");
+    Json(serde_json::json!({
+        "LoginDisclaimer": text("LoginDisclaimer"),
+        "CustomCss": text("CustomCss"),
+        "SplashscreenEnabled": options.get("SplashscreenEnabled").and_then(Value::as_bool).unwrap_or(false),
+    }))
 }
 
-/// GET /Branding/Configuration
-async fn get_branding() -> Json<BrandingOptions> {
-    Json(BrandingOptions {
-        login_disclaimer: String::new(),
-        custom_css: String::new(),
-        splashscreen_enabled: false,
-    })
-}
-
-/// GET /Branding/Css and /Branding/Css.css
-async fn get_branding_css() -> impl IntoResponse {
+/// GET /Branding/Css and /Branding/Css.css - the custom CSS
+async fn get_branding_css(State(state): State<AppState>) -> impl IntoResponse {
+    let options = load(&state.data_dir, BRANDING_KEY, false).await;
+    let css = options
+        .get("CustomCss")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     (
-        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
-        String::new(),
+        [
+            (header::CONTENT_TYPE, "text/css; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        css,
     )
 }
 
