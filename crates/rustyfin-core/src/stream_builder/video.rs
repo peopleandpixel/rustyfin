@@ -12,8 +12,8 @@ use super::conditions::{self, AudioFacts, VideoFacts};
 use super::subtitles;
 use super::url::StreamOptions;
 use super::{
-    PlayMethod, SourceFacts, StreamFacts, StreamKind, StreamRequest, TranscodeReason,
-    TranscodeReasons,
+    AudioIndexSource, PlayMethod, SourceFacts, StreamFacts, StreamKind, StreamRequest,
+    TranscodeReason, TranscodeReasons,
 };
 
 /// The stream info that a transcoding URL is written from: Jellyfin's `StreamInfo`, for the fields
@@ -990,30 +990,63 @@ fn audio_stream_at(source: &SourceFacts, index: i32) -> Option<&StreamFacts> {
         .find(|s| s.kind == StreamKind::Audio && s.index == index)
 }
 
-/// The audio streams that the transcode may pick from (Jellyfin's `candidateAudioStreams` when
-/// the source has no audio index source). An explicit request index, or no audio stream, leaves
-/// only the chosen stream. Otherwise every audio stream counts, or only the default ones when the
-/// chosen stream is a default.
+/// The audio streams that the transcode may pick from (Jellyfin's `candidateAudioStreams`, SB
+/// 672-708). An explicit request index (a remembered track comes as one), or no audio stream,
+/// leaves only the chosen stream. Then, by the settings that chose the default audio:
+/// - none applied (`None`), or applied with neither PlayDefaultAudioTrack nor a preferred
+///   language (Jellyfin's `AudioIndexSource.None`): every audio stream, or only the default ones
+///   when the chosen stream is a default;
+/// - a preferred language: the streams in the chosen stream's language, and with
+///   PlayDefaultAudioTrack its default ones (all default streams when it has none);
+/// - PlayDefaultAudioTrack alone: the default streams, which can leave none, so a file whose
+///   audio isn't flagged default has it re-encoded, as in Jellyfin.
 fn audio_candidates<'a>(
     source: &'a SourceFacts,
     audio: Option<&'a StreamFacts>,
     requested: Option<i32>,
 ) -> Vec<&'a StreamFacts> {
-    let Some(first) = audio else {
-        return Vec::new();
+    let explicit = requested.is_some_and(|index| index >= 0);
+    let mut candidates: Vec<&StreamFacts> = audio.into_iter().collect();
+    if explicit {
+        return candidates;
+    }
+    let audio_streams = || {
+        source
+            .streams
+            .iter()
+            .filter(|s| s.kind == StreamKind::Audio)
     };
-    if requested.is_some_and(|index| index >= 0) {
-        return vec![first];
+    let flags = source.audio_index_source.unwrap_or_default();
+    if flags == AudioIndexSource::default()
+        && let Some(first) = audio
+    {
+        candidates = if first.is_default {
+            audio_streams().filter(|s| s.is_default).collect()
+        } else {
+            audio_streams().collect()
+        };
     }
-    let audio_streams = source
-        .streams
-        .iter()
-        .filter(|s| s.kind == StreamKind::Audio);
-    if first.is_default {
-        audio_streams.filter(|s| s.is_default).collect()
-    } else {
-        audio_streams.collect()
+    if flags.language {
+        let language = audio.and_then(|a| a.language.as_deref());
+        candidates = audio_streams()
+            .filter(|s| s.language.as_deref() == language)
+            .collect();
+        if flags.default {
+            let in_language: Vec<&StreamFacts> = candidates
+                .iter()
+                .copied()
+                .filter(|s| s.is_default)
+                .collect();
+            candidates = if in_language.is_empty() {
+                audio_streams().filter(|s| s.is_default).collect()
+            } else {
+                in_language
+            };
+        }
+    } else if flags.default {
+        candidates = audio_streams().filter(|s| s.is_default).collect();
     }
+    candidates
 }
 
 /// Jellyfin's `SetStreamInfoOptionsFromTranscodingProfile`: copies the transcoding profile's
@@ -1451,7 +1484,7 @@ pub(super) fn plan_video(source: &SourceFacts, options: &VideoOptions<'_>) -> Vi
             .or(source.default_audio_stream_index),
     );
     let candidates = audio_candidates(source, audio, options.audio_stream_index);
-    let subtitle_index = subtitles::chosen_index(source, options.subtitle_stream_index);
+    let subtitle_index = subtitles::chosen_index(source, options.subtitle_stream_index, profile);
     let subtitle = subtitles::subtitle_stream(source, subtitle_index);
 
     let exceeded = bitrate_limit_exceeded(source, i64::from(options.max_bitrate.unwrap_or(0)));
@@ -1523,5 +1556,85 @@ pub(super) fn plan_video(source: &SourceFacts, options: &VideoOptions<'_>) -> Vi
         audio_stream_index,
         subtitle_stream_index: subtitle_index,
         transcode,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn audio(index: i32, language: &str, is_default: bool) -> StreamFacts {
+        StreamFacts {
+            index,
+            kind: StreamKind::Audio,
+            codec: "aac".to_string(),
+            language: Some(language.to_string()),
+            is_default,
+            ..Default::default()
+        }
+    }
+
+    /// The copy candidates in each settings state (SB 672-708), as stream indexes.
+    fn candidates(
+        flags: Option<AudioIndexSource>,
+        chosen: i32,
+        streams: &[StreamFacts],
+    ) -> Vec<i32> {
+        let source = SourceFacts {
+            streams: streams.to_vec(),
+            audio_index_source: flags,
+            ..Default::default()
+        };
+        let audio = source.streams.iter().find(|s| s.index == chosen);
+        audio_candidates(&source, audio, None)
+            .iter()
+            .map(|s| s.index)
+            .collect()
+    }
+
+    /// Settings not applied and settings applied with neither PlayDefaultAudioTrack nor a
+    /// language are the same state in Jellyfin (`AudioIndexSource.None`): all streams, or only
+    /// the default ones when the chosen stream is a default. PlayDefaultAudioTrack alone keeps
+    /// the default streams, none when no stream is flagged default; a language keeps that
+    /// language's streams.
+    #[test]
+    fn r3gaps3_audio_candidates_follow_the_applied_settings() {
+        let mixed = [
+            audio(1, "jpn", true),
+            audio(2, "eng", false),
+            audio(3, "eng", true),
+        ];
+        let unflagged = [audio(1, "jpn", false), audio(2, "eng", false)];
+        let none_set = Some(AudioIndexSource::default());
+        for flags in [None, none_set] {
+            assert_eq!(candidates(flags, 1, &mixed), [1, 3], "{flags:?}");
+            assert_eq!(candidates(flags, 2, &mixed), [1, 2, 3], "{flags:?}");
+            assert_eq!(candidates(flags, 1, &unflagged), [1, 2], "{flags:?}");
+        }
+        let default = Some(AudioIndexSource {
+            default: true,
+            language: false,
+        });
+        assert_eq!(candidates(default, 2, &mixed), [1, 3]);
+        assert!(candidates(default, 1, &unflagged).is_empty());
+        let language = Some(AudioIndexSource {
+            default: false,
+            language: true,
+        });
+        assert_eq!(candidates(language, 2, &mixed), [2, 3]);
+        let both = Some(AudioIndexSource {
+            default: true,
+            language: true,
+        });
+        assert_eq!(candidates(both, 2, &mixed), [3]);
+        assert_eq!(candidates(both, 2, &unflagged), Vec::<i32>::new());
+        // An explicit index keeps only the chosen stream
+        let source = SourceFacts {
+            streams: mixed.to_vec(),
+            audio_index_source: default,
+            ..Default::default()
+        };
+        let chosen = source.streams.iter().find(|s| s.index == 2);
+        assert_eq!(audio_candidates(&source, chosen, Some(2)).len(), 1);
     }
 }

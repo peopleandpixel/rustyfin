@@ -329,6 +329,18 @@ pub async fn probe_file(path: &str) -> Result<ProbeResult, ProbeError> {
     Ok(result)
 }
 
+/// The codec ffprobe reads from an external subtitle file with `extension`, which Jellyfin
+/// reports as the stream's codec: `subrip` for `.srt`, `webvtt` for `.vtt` and `ass` for both
+/// `.ass` and `.ssa` (migration 099 renames the ones stored before). Another extension is kept.
+fn external_subtitle_codec(extension: &str) -> String {
+    match extension.to_ascii_lowercase().as_str() {
+        "srt" => "subrip".to_string(),
+        "vtt" => "webvtt".to_string(),
+        "ass" | "ssa" => "ass".to_string(),
+        other => other.to_string(),
+    }
+}
+
 /// Adds the external subtitle files `found` to `source`'s streams, after its embedded streams,
 /// in file-name order. Their stored index follows the embedded ones; PlaybackInfo numbers them
 /// first, as Jellyfin does.
@@ -346,7 +358,7 @@ pub fn add_external_subtitles(
     for (k, file) in found.into_iter().enumerate() {
         source.media_streams.push(MediaStream {
             index: next + k as i32,
-            codec: Some(file.format),
+            codec: Some(external_subtitle_codec(&file.format)),
             codec_type: "subtitle".to_string(),
             language: file.language,
             is_external: true,

@@ -289,6 +289,7 @@ async fn create_library(
     };
     rustyfin_db::repo_library::create_library(&state.db, &lib).await?;
     state.cache.invalidate_library_lists();
+    crate::routes::streaming::forget_library_roots(&state);
     if let Some(options) = &req.library_options {
         rustyfin_db::repo_library::set_library_options(&state.db, lib.id, options).await?;
     }
@@ -321,6 +322,7 @@ async fn remove_library(
     rustyfin_db::repo_library::delete_library(&state.db, id).await?;
     rustyfin_core::local_images::remove_orphaned_covers(&state.db, &covers).await;
     state.cache.invalidate_library_lists();
+    crate::routes::streaming::forget_library_roots(&state);
     state.task_scheduler.watcher().libraries_changed();
     Ok(Json(json!({ "status": "ok" })))
 }
@@ -689,6 +691,7 @@ async fn store_paths(
 ) -> Result<(), ApiError> {
     rustyfin_db::repo_library::update_library_paths(&state.db, lib.id, paths).await?;
     state.cache.invalidate_library_lists();
+    crate::routes::streaming::forget_library_roots(state);
     state.task_scheduler.watcher().libraries_changed();
     if refresh {
         scan_in_background(state, lib.id);

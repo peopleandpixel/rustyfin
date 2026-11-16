@@ -1003,9 +1003,9 @@ mod tests {
         assert_eq!(
             summary(&stored.media_streams[3..]),
             vec![
-                (3, Some("srt"), Some("eng"), Some(eng.as_str())),
+                (3, Some("subrip"), Some("eng"), Some(eng.as_str())),
                 (4, Some("ass"), Some("ger"), Some(ger.as_str())),
-                (5, Some("srt"), None, Some(plain.as_str())),
+                (5, Some("subrip"), None, Some(plain.as_str())),
             ]
         );
         for stream in &stored.media_streams[3..] {
@@ -1044,9 +1044,9 @@ mod tests {
         assert_eq!(
             order,
             vec![
-                (0, true, Some("srt")),
+                (0, true, Some("subrip")),
                 (1, true, Some("ass")),
-                (2, true, Some("srt")),
+                (2, true, Some("subrip")),
                 (3, false, Some("h264")),
                 (4, false, Some("aac")),
                 (5, false, Some("subrip")),
