@@ -67,20 +67,15 @@ fn wait_exit(child: &mut Child, limit: Duration, log: &Path) -> ExitStatus {
     }
 }
 
-#[test]
-fn r3rel_sigterm_stops_the_server_gracefully_and_quickly() {
-    let data = DataDir::new("sigterm");
-    let log = data.0.join("server.log");
-    let port = free_port();
-    let mut child = start(&data.0, port, &log);
-
-    // Up once it accepts connections; the probe's connection is closed again at once.
+/// Waits until the server accepts connections on `port`; the probe's connection is closed again
+/// at once.
+fn wait_listening(child: &mut Child, port: u16, log: &Path) {
     let start_wait = Instant::now();
     while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
         if let Some(status) = child.try_wait().unwrap() {
             panic!(
                 "the server exited at start ({status}); log:\n{}",
-                std::fs::read_to_string(&log).unwrap_or_default()
+                std::fs::read_to_string(log).unwrap_or_default()
             );
         }
         if start_wait.elapsed() > Duration::from_secs(120) {
@@ -90,13 +85,43 @@ fn r3rel_sigterm_stops_the_server_gracefully_and_quickly() {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+}
 
-    let sent = Instant::now();
-    let kill = Command::new("kill")
-        .args(["-TERM", &child.id().to_string()])
+fn signal(child: &Child, name: &str) {
+    let sent = Command::new("kill")
+        .args([&format!("-{name}"), &child.id().to_string()])
         .status()
         .unwrap();
-    assert!(kill.success());
+    assert!(sent.success());
+}
+
+/// The body of `GET {uri}` over a connection of its own.
+fn get(port: u16, uri: &str) -> String {
+    use std::io::{Read, Write};
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    write!(
+        stream,
+        "GET {uri} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    response
+}
+
+#[test]
+fn r3rel_sigterm_stops_the_server_gracefully_and_quickly() {
+    let data = DataDir::new("sigterm");
+    let log = data.0.join("server.log");
+    let port = free_port();
+    let mut child = start(&data.0, port, &log);
+    wait_listening(&mut child, port, &log);
+
+    let sent = Instant::now();
+    signal(&child, "TERM");
     // Docker and systemd send SIGKILL 10 s after SIGTERM; with nothing open it is far quicker.
     let status = wait_exit(&mut child, Duration::from_secs(9), &log);
     let text = std::fs::read_to_string(&log).unwrap();
@@ -107,6 +132,45 @@ fn r3rel_sigterm_stops_the_server_gracefully_and_quickly() {
     // The database was closed whole: SQLite removes its WAL at the last close.
     assert!(data.0.join("rustyfin.db").exists());
     assert!(!data.0.join("rustyfin.db-wal").exists(), "{text}");
+}
+
+#[test]
+fn r3rel_a_sighup_with_a_broken_config_keeps_the_settings_in_use() {
+    let data = DataDir::new("sighup");
+    let log = data.0.join("server.log");
+    let config = data.0.join("config.json");
+    std::fs::write(
+        &config,
+        r#"{"ServerName":"Kept Name","IsStartupWizardCompleted":true}"#,
+    )
+    .unwrap();
+    let port = free_port();
+    let mut child = start(&data.0, port, &log);
+    wait_listening(&mut child, port, &log);
+    assert!(get(port, "/System/Info/Public").contains("\"Kept Name\""));
+
+    let bad = "{\"ServerName\": \"Other Name\",, }";
+    std::fs::write(&config, bad).unwrap();
+    signal(&child, "HUP");
+    let waited = Instant::now();
+    while !std::fs::read_to_string(&log)
+        .unwrap()
+        .contains("the configuration in use is kept")
+    {
+        assert!(
+            waited.elapsed() < Duration::from_secs(10),
+            "no reload error; log:\n{}",
+            std::fs::read_to_string(&log).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let info = get(port, "/System/Info/Public");
+    assert!(info.contains("\"Kept Name\""), "{info}");
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), bad);
+
+    signal(&child, "TERM");
+    let status = wait_exit(&mut child, Duration::from_secs(9), &log);
+    assert!(status.success(), "{status}");
 }
 
 #[test]

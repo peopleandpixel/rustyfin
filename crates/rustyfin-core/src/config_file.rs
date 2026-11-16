@@ -8,9 +8,10 @@ use std::path::{Path, PathBuf};
 use rustyfin_model::server_info::ServerConfiguration;
 
 /// Write the config as pretty JSON to a temporary file of its own in the same directory, flush it
-/// to disk, then rename it over `path`. The temporary file is left behind only if the rename
-/// fails. The file gets this build's `RustyfinConfigVersion`, so what it holds is never upgraded
-/// again.
+/// to disk, rename it over `path`, then flush the directory, so the rename survives a crash. The
+/// temporary file is removed when any step fails. On Unix the file is readable by the server's
+/// user only (0600), as it can hold a provider key waiting to be saved. The file gets this
+/// build's `RustyfinConfigVersion`, so what it holds is never upgraded again.
 pub fn write_config_atomic(path: &Path, config: &ServerConfiguration) -> std::io::Result<()> {
     let mut json = serde_json::to_value(config).map_err(std::io::Error::other)?;
     json["RustyfinConfigVersion"] = rustyfin_model::server_info::CONFIG_VERSION.into();
@@ -19,11 +20,29 @@ pub fn write_config_atomic(path: &Path, config: &ServerConfiguration) -> std::io
     let mut tmp_name = path.as_os_str().to_owned();
     tmp_name.push(format!(".{}.tmp", uuid::Uuid::new_v4().simple()));
     let tmp = PathBuf::from(tmp_name);
-    let mut file = std::fs::File::create(&tmp)?;
-    file.write_all(json.as_bytes())?;
-    file.sync_all()?;
-    drop(file);
-    std::fs::rename(&tmp, path)
+    let written = (|| {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = options.open(&tmp)?;
+        file.write_all(json.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, path)
+    })();
+    if let Err(e) = written {
+        std::fs::remove_file(&tmp).ok();
+        return Err(e);
+    }
+    // Best effort: some file systems can't flush a directory, and the new file is in place
+    #[cfg(unix)]
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty())
+        && let Ok(dir) = std::fs::File::open(dir)
+    {
+        dir.sync_all().ok();
+    }
+    Ok(())
 }
 
 /// Why `config.json` wasn't loaded. The file is left as it was.
@@ -161,6 +180,68 @@ mod tests {
         let config = load_config(&path).unwrap();
         assert_eq!(config.server_name, "Mine");
         assert!(config.is_startup_wizard_completed);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn r3rel_saves_at_once_each_write_their_own_file_and_one_wins_whole() {
+        let dir = r3rel_dir("config-at-once");
+        let path = dir.join("config.json");
+        let names: Vec<String> = (0..8)
+            .map(|n| format!("server-{n}-{}", "x".repeat(4096)))
+            .collect();
+        std::thread::scope(|scope| {
+            for name in &names {
+                let path = &path;
+                scope.spawn(move || {
+                    for _ in 0..10 {
+                        let config = ServerConfiguration {
+                            server_name: name.clone(),
+                            ..ServerConfiguration::default()
+                        };
+                        write_config_atomic(path, &config).unwrap();
+                    }
+                });
+            }
+        });
+        let config = load_config(&path).unwrap();
+        assert!(names.contains(&config.server_name));
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left, ["config.json"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn r3rel_a_saved_config_is_readable_by_its_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = r3rel_dir("config-mode");
+        let path = dir.join("config.json");
+        std::fs::write(&path, "{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_config_atomic(&path, &ServerConfiguration::default()).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "{mode:o}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn r3rel_a_failed_save_leaves_no_temporary_file() {
+        let dir = r3rel_dir("config-failed-save");
+        // A folder with a file in it where config.json should be: the rename fails
+        let path = dir.join("config.json");
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("keep"), "x").unwrap();
+        assert!(write_config_atomic(&path, &ServerConfiguration::default()).is_err());
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left, ["config.json"]);
+        assert!(path.join("keep").exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

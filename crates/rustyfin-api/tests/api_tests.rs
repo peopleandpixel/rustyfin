@@ -3241,6 +3241,42 @@ async fn r3rel_a_partial_configuration_post_keeps_every_other_setting() {
     assert_eq!(config["ServerName"], "Kept Server", "{config}");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r3rel_partial_configuration_posts_at_once_both_survive() {
+    let state = test_state().await;
+    let (admin, _) = admin_session(&state).await;
+    let app = app(state.clone());
+    for round in 0..10 {
+        let name = format!(r#"{{"ServerName":"Round {round}"}}"#);
+        let pct = format!(r#"{{"MinResumePct":{}}}"#, round + 1);
+        let by_key = format!(r#""Culture {round}""#);
+        let (a, b, c) = tokio::join!(
+            send_authed(&app, "POST", "/System/Configuration", &admin, Some(&name)),
+            send_authed(&app, "POST", "/System/Configuration", &admin, Some(&pct)),
+            send_authed(
+                &app,
+                "POST",
+                "/System/Configuration/UICulture",
+                &admin,
+                Some(&by_key)
+            ),
+        );
+        for (status, body) in [a, b, c] {
+            assert_eq!(status, StatusCode::NO_CONTENT, "round {round}: {body}");
+        }
+        let (_, config) = send_authed(&app, "GET", "/System/Configuration", &admin, None).await;
+        let saved: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(state.data_dir.join("config.json")).unwrap(),
+        )
+        .unwrap();
+        for (what, value) in [("memory", &config), ("disk", &saved)] {
+            assert_eq!(value["ServerName"], format!("Round {round}"), "{what}");
+            assert_eq!(value["MinResumePct"], round + 1, "{what}");
+            assert_eq!(value["UICulture"], format!("Culture {round}"), "{what}");
+        }
+    }
+}
+
 #[tokio::test]
 async fn test_failed_library_create_changes_no_list() {
     let state = test_state().await;
