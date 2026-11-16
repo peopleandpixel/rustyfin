@@ -121,7 +121,7 @@ async fn list_of(
     kind: ByNameKind,
 ) -> Result<Json<ByNameList>, ApiError> {
     let mut query = ListQuery::parse(params)?;
-    query_user(state, claims, query.user_id).await?;
+    let user = query_user(state, claims, query.user_id).await?;
     let hidden = HiddenItems::for_caller(state, claims).await?;
     query.filter.hidden_items = hidden.stored_ids().clone();
     query.filter.libraries = hidden.libraries();
@@ -133,10 +133,28 @@ async fn list_of(
         };
     let with_counts = query.item_counts || !query.filter.include_item_types.is_empty();
     let ByNamePage { items, total } = repo_by_name::list(&state.db_ro, kind, &query.filter).await?;
+    // Each entry's UserData for the user, as Jellyfin sends it: the stored data, else defaults.
+    let mut user_data = match user {
+        Some(user) => {
+            let ids: Vec<Uuid> = items.iter().map(|entry| entry.id).collect();
+            rustyfin_db::repo_playback::get_user_item_data_batch(&state.db_ro, user, &ids).await?
+        }
+        None => Default::default(),
+    };
     Ok(Json(ByNameList {
         items: items
             .into_iter()
-            .map(|entry| ByNameDto::new(entry, state.server_id.as_str(), with_counts))
+            .map(|entry| {
+                let data = user.map(|_| {
+                    user_data
+                        .remove(&entry.id.to_string())
+                        .unwrap_or_default()
+                        .for_item(entry.id)
+                });
+                let mut dto = ByNameDto::new(entry, state.server_id.as_str(), with_counts);
+                dto.user_data = data;
+                dto
+            })
             .collect(),
         total_record_count: if query.total_count { total } else { 0 },
         start_index: query.filter.start_index,
@@ -251,6 +269,8 @@ struct ByNameDto {
     kind: &'static str,
     #[serde(flatten)]
     counts: Option<CountsDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user_data: Option<rustyfin_model::playback::UserItemDataDto>,
     image_tags: BTreeMap<String, String>,
     backdrop_image_tags: Vec<String>,
     image_blur_hashes: BTreeMap<String, String>,
@@ -302,6 +322,7 @@ impl ByNameDto {
             channel_id: None,
             kind: entry.kind.as_str(),
             counts,
+            user_data: None,
             image_tags: BTreeMap::new(),
             backdrop_image_tags: Vec::new(),
             image_blur_hashes: BTreeMap::new(),

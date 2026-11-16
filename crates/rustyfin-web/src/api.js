@@ -328,6 +328,10 @@ const API = {
     },
 
     // OpenID Connect. Start and Link answer with the provider's AuthorizationUrl.
+    // The sign-in page's user tiles, and Jellyfin's forgot-password steps (the PIN is never kept or logged)
+    publicUsers() { return this.get('/Users/Public'); },
+    forgotPassword(name) { return this.post('/Users/ForgotPassword', { EnteredUsername: name }); },
+    redeemResetPin(pin) { return this.post('/Users/ForgotPassword/Pin', { Pin: pin }); },
     oidcInfo() { return this.get('/Auth/Oidc/Info'); },
     oidcStart() { return this.post('/Auth/Oidc/Start'); },
     oidcLink() { return this.post('/Auth/Oidc/Link'); },
@@ -480,6 +484,17 @@ const API = {
         if (!res.ok) throw await this._requestError('POST', path, res);
     },
     updateItem(id, fields) { return this.post(`/Items/${id}`, fields); },
+    // The metadata editor's choices (provider ids, ratings), as Jellyfin's MetadataEditorInfo
+    getMetadataEditor(id) { return this.get(`/Items/${id}/MetadataEditor`); },
+    getCultures() { return this.get('/Localization/Cultures'); },
+    // Subtitle files beside a video: upload (Jellyfin's UploadSubtitleDto, Data in base64) and delete
+    uploadSubtitle(id, body) { return this.post(`/Videos/${id}/Subtitles`, body); },
+    deleteSubtitle(id, index) { return this.del(`/Videos/${id}/Subtitles/${index}`); },
+    // The item's own file, as Jellyfin's getItemDownloadUrl: a plain link, so the token rides in the query
+    downloadUrl(id) {
+        const q = this.token ? `?api_key=${encodeURIComponent(this.token)}` : '';
+        return `${this.base}/Items/${encodeURIComponent(id)}/Download${q}`;
+    },
 
     // User Items
     getUserItems(params = {}) {

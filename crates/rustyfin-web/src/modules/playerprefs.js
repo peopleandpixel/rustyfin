@@ -103,7 +103,8 @@ function defaultSubtitleIndex(streams, audio, prefs) {
     return pick ? pick.Index : -1;
 }
 
-// The tracks a source starts with: the server's remembered ones where the user keeps them, else the rules above
+// The tracks a source starts with: the server's remembered ones where the user keeps them (a remembered
+// subtitle not while SubtitleMode is None, as in Jellyfin), else the rules above
 function defaultTracks(source, prefs) {
     const streams = source?.MediaStreams || [];
     const audio = streams.filter(s => isType(s, 'audio'));
@@ -114,7 +115,7 @@ function defaultTracks(source, prefs) {
         : defaultAudioIndex(streams, prefs);
     const chosenAudio = audio.find(s => s.Index === audioIndex) || null;
     const rememberedSub = source?.DefaultSubtitleStreamIndex;
-    const subtitleFromServer = prefs?.rememberSubtitles !== false
+    const subtitleFromServer = prefs?.rememberSubtitles !== false && prefs?.subtitleMode !== 'None'
         && (rememberedSub === -1 || subs.some(s => s.Index === rememberedSub));
     const subtitleIndex = subtitleFromServer ? rememberedSub : defaultSubtitleIndex(streams, chosenAudio, prefs);
     return { audioIndex, subtitleIndex, subtitleFromServer };

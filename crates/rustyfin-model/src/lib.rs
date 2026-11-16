@@ -10,6 +10,7 @@ pub mod environment;
 pub mod image;
 pub mod items_playback_info;
 pub mod library;
+pub mod lyrics;
 pub mod media;
 pub mod media_segment;
 pub mod media_source;

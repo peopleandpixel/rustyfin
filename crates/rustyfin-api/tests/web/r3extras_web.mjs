@@ -85,7 +85,7 @@ test('the Special Features row plays each feature and labels its kind', () => {
 test('the item page asks for extras only when the item has some, and plays the theme song', () => {
     const render = slice(item, 'async function renderDetail(');
     assert.match(render, /item\.LocalTrailerCount > 0 \? API\.getLocalTrailers\(id\)/);
-    assert.match(render, /\['Movie', 'Series', 'Season'\]\.includes\(type\)/);
+    assert.match(render, /\['Movie', 'Series', 'Season', 'Episode'\]\.includes\(type\)/);
     assert.match(render, /showsSpecials && item\.SpecialFeatureCount > 0 \? API\.getSpecialFeatures\(id\)/);
     assert.match(render, /trailerButtonHtml\(item,/);
     assert.match(render, /specialFeaturesHtml\(/);

@@ -30,6 +30,7 @@ const TMDB_IMAGE_TYPES: [&str; 3] = ["Primary", "Backdrop", "Logo"];
 pub fn admin_routes() -> Router<AppState> {
     Router::new()
         .route("/Items/{id}", post(update_item))
+        .route("/Items/{id}/MetadataEditor", get(metadata_editor))
         .route("/Items/{id}/Refresh", post(refresh_item))
         .route("/Items/RemoteSearch/Apply/{id}", post(apply_search_result))
         .route("/Items/RemoteSearch/{kind}", post(remote_search))
@@ -611,10 +612,69 @@ fn text_value(value: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The provider ids the metadata editor offers for an item, as Jellyfin's `ExternalIdInfo`: the
+/// ones Rustyfin stores (TMDb, IMDb, TVDb) for the types their providers know.
+fn external_id_infos(media_type: MediaType) -> Vec<Value> {
+    let info = |name: &str, key: &str, kind: Option<&str>, url: &str| json!({ "Name": name, "Key": key, "Type": kind, "UrlFormatString": url });
+    let tmdb = |kind: &str, path: &str| {
+        info(
+            "TheMovieDb",
+            "Tmdb",
+            Some(kind),
+            &format!("https://www.themoviedb.org/{path}/{{0}}"),
+        )
+    };
+    let imdb = || info("IMDb", "Imdb", None, "https://www.imdb.com/title/{0}");
+    let tvdb = |kind: &str| {
+        info(
+            "TheTVDB",
+            "Tvdb",
+            Some(kind),
+            "https://thetvdb.com/dereferrer/series/{0}",
+        )
+    };
+    match media_type {
+        MediaType::Movie => vec![tmdb("Movie", "movie"), imdb()],
+        MediaType::Series => vec![tmdb("Series", "tv"), imdb(), tvdb("Series")],
+        MediaType::Episode => vec![imdb(), tvdb("Episode")],
+        MediaType::Season => vec![tvdb("Season")],
+        _ => Vec::new(),
+    }
+}
+
+/// `GET /Items/{id}/MetadataEditor`: Jellyfin's `MetadataEditorInfo`, the choices its metadata
+/// editor offers: parental ratings, countries, cultures and the item's provider ids. A content
+/// type is set only on a library folder, which this item never is.
+async fn metadata_editor(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    let item = item_or_404(&state, id).await?;
+    Ok(Json(json!({
+        "ParentalRatingOptions": rustyfin_model::parental::parental_ratings(),
+        "Countries": super::localization::countries(),
+        "Cultures": super::localization::cultures(),
+        "ExternalIdInfos": external_id_infos(item.media_type),
+        "ContentType": null,
+        "ContentTypeOptions": [],
+    })))
+}
+
+/// A numeric provider id (TMDb, TVDb) in a ProviderIds object; `None` when blank or missing.
+fn numeric_provider_id(ids: &Value, key: &str) -> Result<Option<i64>, ApiError> {
+    field_str(ids, key)
+        .map(|text| {
+            text.parse::<i64>()
+                .map_err(|_| ApiError::BadRequest(format!("The {key} id must be a number")))
+        })
+        .transpose()
+}
+
 /// `POST /Items/{id}`: saves the metadata editor's BaseItemDto, as Jellyfin's ItemUpdateController
 /// does for the fields Rustyfin stores: Name, ForcedSortName, OriginalTitle, Overview, Taglines,
 /// ProductionYear, PremiereDate, EndDate, CommunityRating, CriticRating, OfficialRating, Genres,
-/// Tags, ProductionLocations, Studios, People, LockData and LockedFields. An empty ForcedSortName
+/// Tags, ProductionLocations, Studios, People, ProviderIds (Tmdb, Tvdb, Imdb), LockData and
+/// LockedFields. An empty ForcedSortName
 /// sets the sort name back to the name's. Unlike Jellyfin, a field missing from the
 /// body is kept (null clears it), so a client sending only some fields changes only those; a
 /// client sending the whole item, as Jellyfin Web does, gets Jellyfin's result. 204.
@@ -684,6 +744,15 @@ async fn update_item(
     if let Some(list) = field(&body, "ProductionLocations").and_then(string_list) {
         updated.production_locations = list;
     }
+    // ProviderIds, when given, replace the item's: a key left out or blank clears that id
+    let imdb = match field(&body, "ProviderIds").filter(|ids| ids.is_object()) {
+        Some(ids) => {
+            updated.tmdb_id = numeric_provider_id(ids, "Tmdb")?;
+            updated.tvdb_id = numeric_provider_id(ids, "Tvdb")?;
+            Some(field_str(ids, "Imdb").map(str::to_string))
+        }
+        None => None,
+    };
     // The forced sort name and the sort name made from it are saved together: when another
     // write changed the name or sort name since the read, neither is.
     let mut tx = rustyfin_db::begin_write(&state.db).await?;
@@ -694,6 +763,9 @@ async fn update_item(
         rustyfin_db::repo_media::set_forced_sort_name_on(&mut tx, id, forced.as_deref()).await?;
     }
     tx.commit().await?;
+    if let Some(imdb) = imdb {
+        rustyfin_db::repo_media::set_imdb_id(&state.db, id, imdb.as_deref()).await?;
+    }
 
     // Studios ({Name, Id} pairs) and People ({Name, Role, Type}), when given, replace the item's
     if let Some(list) = field(&body, "Studios").and_then(Value::as_array) {
