@@ -1033,6 +1033,8 @@ struct VideoPlaybackInfoQuery {
     h264_video_bit_depth: Option<String>,
     hevc_profile: Option<String>,
     hevc_video_bit_depth: Option<String>,
+    hevc_level: Option<String>,
+    hevc_range_type: Option<String>,
 }
 
 impl From<HashMap<String, String>> for VideoPlaybackInfoQuery {
@@ -1093,6 +1095,8 @@ impl From<HashMap<String, String>> for VideoPlaybackInfoQuery {
             h264_video_bit_depth: params.get("h264-videobitdepth").cloned(),
             hevc_profile: params.get("hevc-profile").cloned(),
             hevc_video_bit_depth: params.get("hevc-videobitdepth").cloned(),
+            hevc_level: params.get("hevc-level").cloned(),
+            hevc_range_type: params.get("hevc-rangetype").cloned(),
         }
     }
 }
@@ -1255,6 +1259,8 @@ async fn video_universal(
         for (name, value) in [
             ("hevc-profile", &query.hevc_profile),
             ("hevc-videobitdepth", &query.hevc_video_bit_depth),
+            ("hevc-level", &query.hevc_level),
+            ("hevc-rangetype", &query.hevc_range_type),
         ] {
             if let Some(value) = value.as_deref().filter(|v| !v.trim().is_empty()) {
                 let encoded: String = form_urlencoded::byte_serialize(value.as_bytes()).collect();

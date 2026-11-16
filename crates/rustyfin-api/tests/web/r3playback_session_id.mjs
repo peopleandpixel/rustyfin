@@ -58,6 +58,12 @@ test('the Universal call states the HEVC bit depth the browser decodes', async (
     assert.equal(await depth({ video: ['h264', 'hevc'], audio: ['aac'], hevcMain10: false }), '8');
     // A browser without HEVC states nothing about it
     assert.equal(await depth({ video: ['h264'], audio: ['aac'], hevcMain10: false }), null);
+    // The level it states, conservatively at most 4.1
+    const level = async codecs => (await universalQuery({}, codecs)).query.get('hevc-level');
+    assert.equal(await level({ video: ['hevc'], audio: [], hevcMain10: true, hevcLevel: 123 }), '123');
+    assert.equal(await level({ video: ['hevc'], audio: [], hevcMain10: true }), '93');
+    assert.equal(await level({ video: ['h264'], audio: [], hevcLevel: 123 }), null);
+    assert.match(api, /hevcLevel: \[123, 120, 93\]\.find\(/);
     const probe = api.slice(api.indexOf('playableCodecs() {'), api.indexOf('getUniversalVideoUrl('));
     assert.match(probe, /hevcMain10: canPlay\('video\/mp4; codecs="hvc1\.2\.4\./);
 });

@@ -32558,7 +32558,8 @@ async fn r3playback_universal_passes_the_hevc_limits_on() {
 
     let uri = format!(
         "/Videos/{id}/Universal?VideoCodecs=h264,hevc&AudioCodecs=aac\
-         &hevc-videobitdepth=10&hevc-profile=main,main%2010&MaxVideoBitDepth=10"
+         &hevc-videobitdepth=10&hevc-profile=main,main%2010&MaxVideoBitDepth=10\
+         &hevc-level=123&hevc-rangetype=SDR,HDR10"
     );
     let (status, body) = send(&app, request("GET", &uri, Some(&token), None)).await;
     assert_eq!(status, StatusCode::OK);
@@ -32569,6 +32570,8 @@ async fn r3playback_universal_passes_the_hevc_limits_on() {
         "MaxVideoBitDepth=10",
         "hevc-videobitdepth=10",
         "hevc-profile=main%2Cmain+10",
+        "hevc-level=123",
+        "hevc-rangetype=SDR%2CHDR10",
     ] {
         assert!(url.contains(part), "{part} in {url}");
     }
