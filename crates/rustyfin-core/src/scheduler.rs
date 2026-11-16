@@ -32,10 +32,33 @@ pub const TASK_CLEAN_ACTIVITY_LOG: &str = "CleanActivityLog";
 /// Jellyfin's default `ActivityLogRetentionDays`.
 const DEFAULT_ACTIVITY_LOG_RETENTION_DAYS: u32 = 30;
 
-/// Default interval: 12 hours in .NET ticks (1 tick = 100ns)
-const TICKS_12H: u64 = 12 * 60 * 60 * 10_000_000;
-/// Default interval: 24 hours in .NET ticks
-const TICKS_24H: u64 = 24 * 60 * 60 * 10_000_000;
+/// One hour in .NET ticks (1 tick = 100ns)
+const TICKS_1H: u64 = 60 * 60 * 10_000_000;
+const TICKS_6H: u64 = 6 * TICKS_1H;
+const TICKS_12H: u64 = 12 * TICKS_1H;
+const TICKS_24H: u64 = 24 * TICKS_1H;
+
+/// A trigger that runs the task at `hour` o'clock each day, server time.
+fn daily_at(hour: u64) -> TaskTriggerInfo {
+    TaskTriggerInfo {
+        trigger_type: "DailyTrigger".to_string(),
+        interval_ticks: None,
+        time_of_day_ticks: Some(hour * TICKS_1H),
+        day_of_week: None,
+        max_runtime_ticks: None,
+    }
+}
+
+/// A trigger that runs the task once after each server start.
+fn at_startup() -> TaskTriggerInfo {
+    TaskTriggerInfo {
+        trigger_type: "StartupTrigger".to_string(),
+        interval_ticks: None,
+        time_of_day_ticks: None,
+        day_of_week: None,
+        max_runtime_ticks: None,
+    }
+}
 
 /// Logs a start skipped because the task runs already (by its triggers or by hand).
 fn skipped(id: &str) {
@@ -99,21 +122,58 @@ const STOPPABLE_TASKS: [&str; 3] = [TASK_CHAPTER_IMAGES, TASK_TRICKPLAY, TASK_IN
 /// The file, in the data folder, that keeps the triggers set through the API, by task id.
 const TRIGGERS_FILE: &str = "scheduled_task_triggers.json";
 
-/// The triggers saved in `data_dir`, by task id. A missing or unreadable file keeps the defaults.
-fn saved_triggers(data_dir: &std::path::Path) -> HashMap<String, Vec<TaskTriggerInfo>> {
-    let path = data_dir.join(TRIGGERS_FILE);
+/// The file, in the data folder, that keeps each task's last result, by task id, so a restart
+/// neither forgets when a task last ran nor runs it again at once.
+const RESULTS_FILE: &str = "scheduled_task_results.json";
+
+/// A map by task id saved in `data_dir`. A missing file is empty; an unreadable one is logged and
+/// taken as empty, so the server still starts.
+fn load_saved<T: serde::de::DeserializeOwned>(
+    data_dir: &std::path::Path,
+    file: &str,
+) -> HashMap<String, T> {
+    let path = data_dir.join(file);
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return HashMap::new(),
         Err(e) => {
-            tracing::warn!(path = %path.display(), error = %e, "could not read the task triggers");
+            tracing::warn!(path = %path.display(), error = %e, "could not read the saved task state");
             return HashMap::new();
         }
     };
     serde_json::from_str(&text).unwrap_or_else(|e| {
-        tracing::warn!(path = %path.display(), error = %e, "task triggers unreadable; using the defaults");
+        tracing::warn!(path = %path.display(), error = %e, "saved task state unreadable; starting without it");
         HashMap::new()
     })
+}
+
+/// The triggers saved in `data_dir`, by task id. A task whose saved triggers are only its
+/// built-in triggers from before the defaults followed Jellyfin's (every task but the library
+/// scan ran each 24 hours, and an early build saved every task's triggers) takes the new
+/// defaults: the saved ones are taken as never edited.
+fn saved_triggers(data_dir: &std::path::Path) -> HashMap<String, Vec<TaskTriggerInfo>> {
+    let mut saved: HashMap<String, Vec<TaskTriggerInfo>> = load_saved(data_dir, TRIGGERS_FILE);
+    let old_default = [TaskTriggerInfo::interval(TICKS_24H)];
+    saved.retain(|id, triggers| {
+        !([
+            TASK_TRANSCODE_CLEANUP,
+            TASK_INTRO_DETECTION,
+            TASK_DB_VACUUM,
+            TASK_CHAPTER_IMAGES,
+            TASK_TRICKPLAY,
+            TASK_CLEAN_ACTIVITY_LOG,
+        ]
+        .contains(&id.as_str())
+            && triggers[..] == old_default)
+    });
+    saved
+}
+
+/// Writes `bytes` to `path` through a temporary file, so a crash never leaves half a file.
+async fn write_atomic(path: &std::path::Path, bytes: Vec<u8>) -> std::io::Result<()> {
+    let tmp = path.with_extension("json.tmp");
+    tokio::fs::write(&tmp, bytes).await?;
+    tokio::fs::rename(&tmp, path).await
 }
 
 impl TaskScheduler {
@@ -208,7 +268,8 @@ impl TaskScheduler {
                     category: "Maintenance".to_string(),
                     state: TaskState::Idle,
                     current_progress_percentage: None,
-                    triggers: vec![TaskTriggerInfo::interval(TICKS_24H)],
+                    // As Jellyfin: once after each start, then every 24 hours
+                    triggers: vec![at_startup(), TaskTriggerInfo::interval(TICKS_24H)],
                     last_execution_result: None,
                 },
             },
@@ -228,13 +289,13 @@ impl TaskScheduler {
                     category: "Library".to_string(),
                     state: TaskState::Idle,
                     current_progress_percentage: None,
-                    triggers: vec![TaskTriggerInfo::interval(TICKS_24H)],
+                    triggers: vec![TaskTriggerInfo::interval(TICKS_12H)],
                     last_execution_result: None,
                 },
             },
         );
 
-        // Database VACUUM - runs nightly to defragment SQLite
+        // Database VACUUM, every 6 hours as Jellyfin's Optimize database task
         tasks.insert(
             TASK_DB_VACUUM.to_string(),
             TaskEntry {
@@ -249,23 +310,30 @@ impl TaskScheduler {
                     category: "Maintenance".to_string(),
                     state: TaskState::Idle,
                     current_progress_percentage: None,
-                    triggers: vec![TaskTriggerInfo::interval(TICKS_24H)],
+                    triggers: vec![TaskTriggerInfo::interval(TICKS_6H)],
                     last_execution_result: None,
                 },
             },
         );
 
-        // Chapter images and trickplay tiles: nightly, for the libraries that turn them on
-        for (id, name, description) in [
+        // Chapter images and trickplay tiles: nightly, for the libraries that turn them on. As
+        // Jellyfin: chapter images at 02:00 for at most 4 hours, trickplay at 03:00.
+        let chapter_images = TaskTriggerInfo {
+            max_runtime_ticks: Some(4 * TICKS_1H),
+            ..daily_at(2)
+        };
+        for (id, name, description, trigger) in [
             (
                 TASK_CHAPTER_IMAGES,
                 "Extract Chapter Images",
                 "Creates thumbnails for videos that have chapters, in the libraries that turn chapter images on.",
+                chapter_images,
             ),
             (
                 TASK_TRICKPLAY,
                 "Generate Trickplay Images",
                 "Creates trickplay images for videos, in the libraries that turn trickplay on.",
+                daily_at(3),
             ),
         ] {
             tasks.insert(
@@ -280,7 +348,7 @@ impl TaskScheduler {
                         category: "Library".to_string(),
                         state: TaskState::Idle,
                         current_progress_percentage: None,
-                        triggers: vec![TaskTriggerInfo::interval(TICKS_24H)],
+                        triggers: vec![trigger],
                         last_execution_result: None,
                     },
                 },
@@ -302,7 +370,8 @@ impl TaskScheduler {
                     category: "Maintenance".to_string(),
                     state: TaskState::Idle,
                     current_progress_percentage: None,
-                    triggers: vec![TaskTriggerInfo::interval(TICKS_24H)],
+                    // Like Jellyfin, no trigger by default: it runs when started or scheduled
+                    triggers: vec![],
                     last_execution_result: None,
                 },
             },
@@ -321,6 +390,11 @@ impl TaskScheduler {
         for (id, triggers) in saved_triggers(&data_dir) {
             if let Some(entry) = tasks.get_mut(&id) {
                 entry.info.triggers = triggers;
+            }
+        }
+        for (id, result) in load_saved::<TaskResult>(&data_dir, RESULTS_FILE) {
+            if let Some(entry) = tasks.get_mut(&id) {
+                entry.info.last_execution_result = Some(result);
             }
         }
         Self {
@@ -448,10 +522,7 @@ impl TaskScheduler {
             .map(|(id, e)| (id, &e.info.triggers))
             .collect();
         let json = serde_json::to_vec_pretty(&all).map_err(std::io::Error::other)?;
-        let path = self.data_dir.join(TRIGGERS_FILE);
-        let tmp = path.with_extension("json.tmp");
-        tokio::fs::write(&tmp, json).await?;
-        tokio::fs::rename(&tmp, &path).await?;
+        write_atomic(&self.data_dir.join(TRIGGERS_FILE), json).await?;
         Ok(true)
     }
 
@@ -561,16 +632,30 @@ impl TaskScheduler {
         entry.info.state = state;
     }
 
+    /// Records the end of a run and saves every task's last result in the data folder.
     async fn set_task_result(&self, id: &str, result: TaskResult) {
         let failed = (result.status == TaskCompletionStatus::Failed)
             .then(|| result.error_message.clone().unwrap_or_default());
         let name = {
+            // The lock is held until the file is written, so two saves never write it at once.
             let mut tasks = self.tasks.write().await;
             let Some(entry) = tasks.get_mut(id) else {
                 return;
             };
             entry.info.last_execution_result = Some(result);
-            entry.info.name.clone()
+            let name = entry.info.name.clone();
+            let all: HashMap<&String, &TaskResult> = tasks
+                .iter()
+                .filter_map(|(id, e)| Some((id, e.info.last_execution_result.as_ref()?)))
+                .collect();
+            let saved = match serde_json::to_vec_pretty(&all) {
+                Ok(json) => write_atomic(&self.data_dir.join(RESULTS_FILE), json).await,
+                Err(e) => Err(std::io::Error::other(e)),
+            };
+            if let Err(e) = saved {
+                tracing::warn!(task = id, error = %e, "could not save the task's last result");
+            }
+            name
         };
         // A failed task goes in the activity log, as in Jellyfin.
         if let Some(error) = failed
@@ -1244,8 +1329,9 @@ impl TaskScheduler {
         // The library monitor starts its monitors in the background and returns at once.
         self.watcher.start();
 
-        // Each task runs when its triggers say (by default an interval). A task that has not run
-        // yet runs its own delay after the start, so they do not all start at once.
+        // Each task runs when its triggers say (by default Jellyfin's). An interval or startup
+        // trigger of a task that has not run yet, or whose saved last run is an interval or more
+        // ago, runs the task its own delay after the start, so they do not all start at once.
         let secs = std::time::Duration::from_secs;
         self.spawn_task_loop(
             TASK_LIBRARY_SCAN,
@@ -1345,7 +1431,7 @@ impl TaskScheduler {
             }
         });
 
-        // Database VACUUM: first two hours after the start, at a quiet time. One put off for a
+        // Database VACUUM: two hours after the start at the earliest. One put off for a
         // scan or an image run is tried again a little later.
         self.spawn_task_loop(
             TASK_DB_VACUUM,
@@ -1684,11 +1770,170 @@ mod tests {
         assert_eq!(saved.keys().collect::<Vec<_>>(), [TASK_DB_VACUUM]);
         assert_eq!(saved[TASK_DB_VACUUM], edited);
         // Back to its defaults: nothing is saved for it any more
-        let defaults = vec![TaskTriggerInfo::interval(TICKS_24H)];
+        let defaults = vec![TaskTriggerInfo::interval(TICKS_6H)];
         assert!(sched.set_triggers(TASK_DB_VACUUM, defaults).await.unwrap());
         let saved: HashMap<String, Vec<TaskTriggerInfo>> =
             serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
         assert!(saved.is_empty(), "{saved:?}");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    fn r3sched_triggers(sched_task: &ScheduledTaskInfo) -> serde_json::Value {
+        serde_json::to_value(&sched_task.triggers).unwrap()
+    }
+
+    #[tokio::test]
+    async fn r3sched_the_default_triggers_are_jellyfins() {
+        let (sched, dir) = r3tasks_scheduler().await;
+        let triggers = |id: &'static str| {
+            let sched = sched.clone();
+            async move { r3sched_triggers(&sched.get_task(id).await.unwrap()) }
+        };
+        let json = |t: Vec<TaskTriggerInfo>| serde_json::to_value(t).unwrap();
+        let interval = |hours: u64| TaskTriggerInfo::interval(hours * TICKS_1H);
+        let trigger = |ty: &str, of_day: Option<u64>, max: Option<u64>| TaskTriggerInfo {
+            trigger_type: ty.into(),
+            interval_ticks: None,
+            time_of_day_ticks: of_day.map(|h| h * TICKS_1H),
+            day_of_week: None,
+            max_runtime_ticks: max.map(|h| h * TICKS_1H),
+        };
+        assert_eq!(triggers(TASK_LIBRARY_SCAN).await, json(vec![interval(12)]));
+        assert_eq!(triggers(TASK_METADATA_REFRESH).await, json(vec![]));
+        assert_eq!(
+            triggers(TASK_TRANSCODE_CLEANUP).await,
+            json(vec![trigger("StartupTrigger", None, None), interval(24)])
+        );
+        assert_eq!(
+            triggers(TASK_INTRO_DETECTION).await,
+            json(vec![interval(12)])
+        );
+        assert_eq!(triggers(TASK_DB_VACUUM).await, json(vec![interval(6)]));
+        assert_eq!(
+            triggers(TASK_CHAPTER_IMAGES).await,
+            json(vec![trigger("DailyTrigger", Some(2), Some(4))])
+        );
+        assert_eq!(
+            triggers(TASK_TRICKPLAY).await,
+            json(vec![trigger("DailyTrigger", Some(3), None)])
+        );
+        assert_eq!(triggers(TASK_CLEAN_ACTIVITY_LOG).await, json(vec![]));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn r3sched_last_results_survive_a_restart() {
+        let (sched, dir) = r3tasks_scheduler().await;
+        sched.run_clean_activity_log().await;
+        let ran = sched
+            .get_task(TASK_CLEAN_ACTIVITY_LOG)
+            .await
+            .unwrap()
+            .last_execution_result
+            .unwrap();
+        let end = Utc::now() - chrono::Duration::hours(2);
+        sched
+            .set_task_result(
+                TASK_LIBRARY_SCAN,
+                TaskResult {
+                    status: TaskCompletionStatus::Failed,
+                    error_message: Some("disk gone".into()),
+                    start_time_utc: (end - chrono::Duration::minutes(5)).to_rfc3339(),
+                    end_time_utc: end.to_rfc3339(),
+                },
+            )
+            .await;
+
+        let restarted = TaskScheduler::new(sched.db.clone(), Arc::new(dir.clone()));
+        let last = |id: &'static str| {
+            let restarted = restarted.clone();
+            async move {
+                serde_json::to_value(restarted.get_task(id).await.unwrap().last_execution_result)
+                    .unwrap()
+            }
+        };
+        assert_eq!(
+            last(TASK_CLEAN_ACTIVITY_LOG).await,
+            serde_json::to_value(&ran).unwrap()
+        );
+        let scan = last(TASK_LIBRARY_SCAN).await;
+        assert_eq!(scan["Status"], "Failed");
+        assert_eq!(scan["ErrorMessage"], "disk gone");
+        assert!(last(TASK_TRICKPLAY).await.is_null(), "never ran");
+
+        // The 12 hour interval counts from the saved end, not from the start
+        let started = Utc::now();
+        let clock = crate::task_triggers::TriggerClock {
+            last_end: None,
+            loop_ran: false,
+            first: started + chrono::Duration::seconds(60),
+            interval_from: None,
+            started,
+        };
+        let due = restarted.next_due(TASK_LIBRARY_SCAN, clock).await.unwrap();
+        let saved_end = chrono::DateTime::parse_from_rfc3339(&end.to_rfc3339()).unwrap();
+        assert_eq!(due, saved_end + chrono::Duration::hours(12));
+        // A task that never ran keeps its start-up delay
+        assert_eq!(
+            restarted.next_due(TASK_INTRO_DETECTION, clock).await,
+            Some(clock.first)
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn r3sched_a_corrupt_saved_file_starts_empty() {
+        let (sched, dir) = r3tasks_scheduler().await;
+        std::fs::write(dir.join(RESULTS_FILE), "{ not json").unwrap();
+        std::fs::write(dir.join(TRIGGERS_FILE), "[1, 2").unwrap();
+        let restarted = TaskScheduler::new(sched.db.clone(), Arc::new(dir.clone()));
+        for task in restarted.get_all_tasks().await {
+            assert!(task.last_execution_result.is_none(), "{}", task.id);
+        }
+        let defaults = sched.get_task(TASK_TRICKPLAY).await.unwrap();
+        let trickplay = restarted.get_task(TASK_TRICKPLAY).await.unwrap();
+        assert_eq!(r3sched_triggers(&trickplay), r3sched_triggers(&defaults));
+        // The next run's end writes a good file again
+        restarted.run_clean_activity_log().await;
+        let saved: HashMap<String, TaskResult> =
+            serde_json::from_slice(&std::fs::read(dir.join(RESULTS_FILE)).unwrap()).unwrap();
+        assert_eq!(saved.keys().collect::<Vec<_>>(), [TASK_CLEAN_ACTIVITY_LOG]);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn r3sched_saved_triggers_win_but_old_defaults_give_way() {
+        let (sched, dir) = r3tasks_scheduler().await;
+        let old_default = vec![TaskTriggerInfo::interval(TICKS_24H)];
+        let edited = vec![TaskTriggerInfo::interval(TICKS_6H)];
+        let file: HashMap<&str, Vec<TaskTriggerInfo>> = HashMap::from([
+            // As an early build saved them: every task, with the old 24 hour default
+            (TASK_TRICKPLAY, old_default.clone()),
+            (TASK_DB_VACUUM, old_default.clone()),
+            (
+                TASK_LIBRARY_SCAN,
+                vec![TaskTriggerInfo::interval(TICKS_12H)],
+            ),
+            // Edited by an admin
+            (TASK_CHAPTER_IMAGES, edited.clone()),
+            (TASK_METADATA_REFRESH, old_default.clone()),
+            (TASK_CLEAN_ACTIVITY_LOG, vec![]),
+        ]);
+        std::fs::write(dir.join(TRIGGERS_FILE), serde_json::to_vec(&file).unwrap()).unwrap();
+        let restarted = TaskScheduler::new(sched.db.clone(), Arc::new(dir.clone()));
+        let triggers = |id: &'static str| {
+            let restarted = restarted.clone();
+            async move { restarted.get_task(id).await.unwrap().triggers }
+        };
+        assert_eq!(triggers(TASK_TRICKPLAY).await, vec![daily_at(3)]);
+        assert_eq!(
+            triggers(TASK_DB_VACUUM).await,
+            vec![TaskTriggerInfo::interval(TICKS_6H)]
+        );
+        assert_eq!(triggers(TASK_CHAPTER_IMAGES).await, edited);
+        // A task whose old default was not 24 hours keeps a saved 24 hours: it was edited
+        assert_eq!(triggers(TASK_METADATA_REFRESH).await, old_default);
+        assert!(triggers(TASK_CLEAN_ACTIVITY_LOG).await.is_empty());
         std::fs::remove_dir_all(dir).ok();
     }
 
