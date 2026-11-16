@@ -45752,6 +45752,189 @@ async fn r3gaps2_static_reads_follow_links_out_of_the_library() {
     let _ = std::fs::remove_dir_all(&outside);
 }
 
+/// The user policy on the progressive routes, as on the HLS route: a re-encode needs the
+/// transcoding switch (403), a copy needs remuxing (403), a hidden library's item is 404 on the
+/// stream routes and leaves /Items, and a remote caller's bitrate limit caps the decision.
+#[tokio::test]
+async fn r3gaps2_progressive_routes_follow_the_user_policy() {
+    let state = test_state().await;
+    add_user(&state, "r3g2-admin", "r3g2-pass", true).await;
+    let kid = add_user(&state, "r3g2-kid", "r3g2-pass", false).await;
+    let (song, _, flac) = j2_item(
+        &state,
+        "r3g2-psong",
+        "Audio",
+        "flac",
+        j2_song("flac", 900_000),
+    )
+    .await;
+    if !r3gaps2_make_media(
+        &flac,
+        &["sine=frequency=440:sample_rate=48000:duration=5"],
+        &["-ac", "2", "-c:a", "flac"],
+    ) {
+        return;
+    }
+    let (movie, _, mkv) = j2_item(
+        &state,
+        "r3g2-pmovie",
+        "Movie",
+        "mkv",
+        serde_json::json!([
+            {"Index": 0, "Codec": "mpeg4", "CodecType": "Video", "Width": 160, "Height": 120},
+            {"Index": 1, "Codec": "mp2", "CodecType": "Audio", "Channels": 1, "IsDefault": true},
+        ]),
+    )
+    .await;
+    assert!(r3gaps2_make_media(
+        &mkv,
+        &["testsrc=size=160x120:rate=10:duration=2", "sine=duration=2"],
+        &["-c:v", "mpeg4", "-c:a", "mp2"],
+    ));
+    let song_library: String =
+        sqlx::query_scalar("SELECT library_id FROM media_items WHERE id = ?")
+            .bind(song.to_string())
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+    let local = app(state.clone());
+    let remote = remote_app(state);
+    let (admin, _) = g2_login_device(&local, "r3g2-admin", "r3g2-pass", "r3g2-a")
+        .await
+        .unwrap();
+    let (token, _) = g2_login_device(&local, "r3g2-kid", "r3g2-pass", "r3g2-k")
+        .await
+        .unwrap();
+    let set_policy = |policy: serde_json::Value| {
+        let local = local.clone();
+        let admin = admin.clone();
+        async move {
+            let uri = format!("/Users/{kid}/Policy");
+            let (status, body) =
+                send(&local, request("POST", &uri, Some(&admin), Some(policy))).await;
+            assert!(status.is_success(), "{uri}: {status} {body}");
+        }
+    };
+    let status_of = |app: &axum::Router, method: &str, uri: String| {
+        let app = app.clone();
+        let token = token.clone();
+        let method = method.to_string();
+        async move { r3decisions_send(&app, &method, &uri, &token).await.0.0 }
+    };
+    let mp3 = format!("/Audio/{song}/stream.mp3?AudioCodec=mp3");
+    let universal = format!(
+        "/Audio/{song}/universal?Container=mp3&TranscodingContainer=mp3\
+         &TranscodingProtocol=http&AudioCodec=mp3"
+    );
+    let video = format!("/Videos/{movie}/stream.ts?static=false&VideoCodec=h264&AudioCodec=aac");
+    let flac_copy = format!("/Audio/{song}/stream.flac?AudioCodec=flac&AudioBitrate=100000000");
+
+    // No transcoding: every re-encode is 403, GET and HEAD; the file itself still plays
+    set_policy(serde_json::json!({
+        "EnableAudioPlaybackTranscoding": false,
+        "EnableVideoPlaybackTranscoding": false,
+    }))
+    .await;
+    for (method, uri) in [
+        ("GET", &mp3),
+        ("HEAD", &mp3),
+        ("GET", &universal),
+        ("GET", &video),
+    ] {
+        assert_eq!(
+            status_of(&local, method, uri.clone()).await,
+            StatusCode::FORBIDDEN,
+            "{method} {uri}"
+        );
+    }
+    assert_eq!(
+        status_of(&local, "GET", format!("/Audio/{song}/stream?static=true")).await,
+        StatusCode::OK
+    );
+
+    // No remuxing: a copy is 403, an encode plays
+    set_policy(serde_json::json!({
+        "EnableAudioPlaybackTranscoding": true,
+        "EnableVideoPlaybackTranscoding": true,
+        "EnablePlaybackRemuxing": false,
+    }))
+    .await;
+    assert_eq!(
+        status_of(&local, "GET", flac_copy.clone()).await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(status_of(&local, "GET", mp3.clone()).await, StatusCode::OK);
+
+    // A remote caller's limit caps the universal decision: the FLAC it would play as it is is
+    // transcoded to MP3 within the limit
+    let flac_universal = format!(
+        "/Audio/{song}/universal?Container=flac,mp3&TranscodingContainer=mp3\
+         &TranscodingProtocol=http&AudioCodec=mp3&MaxStreamingBitrate=140000000"
+    );
+    let ((_, _, _), content_type) = r3decisions_send(&remote, "GET", &flac_universal, &token).await;
+    assert_eq!(content_type.as_deref(), Some("audio/flac"), "no limit yet");
+    set_policy(serde_json::json!({
+        "EnablePlaybackRemuxing": true,
+        "RemoteClientBitrateLimit": 128000,
+    }))
+    .await;
+    let ((status, _, body), content_type) =
+        r3decisions_send(&remote, "GET", &flac_universal, &token).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(content_type.as_deref(), Some("audio/mpeg"));
+    assert!(body.starts_with(b"ID3") || body.starts_with(&[0xFF]));
+    let ((_, _, _), content_type) = r3decisions_send(&local, "GET", &flac_universal, &token).await;
+    assert_eq!(
+        content_type.as_deref(),
+        Some("audio/flac"),
+        "local callers have no limit"
+    );
+
+    // Library access: the song's library hidden, its streams are 404 and /Items leaves it out
+    set_policy(serde_json::json!({ "EnableAllFolders": false, "EnabledFolders": [] })).await;
+    for uri in [&mp3, &universal] {
+        assert_eq!(
+            status_of(&local, "GET", uri.clone()).await,
+            StatusCode::NOT_FOUND,
+            "{uri}"
+        );
+    }
+    let (status, body) = send(
+        &local,
+        request(
+            "GET",
+            "/Items?Recursive=true&Fields=MediaSources",
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !body.to_string().contains(&song.to_string()),
+        "a hidden item leaves /Items"
+    );
+    set_policy(serde_json::json!({ "EnableAllFolders": false, "EnabledFolders": [song_library] }))
+        .await;
+    let (_, body) = send(
+        &local,
+        request(
+            "GET",
+            "/Items?Recursive=true&Fields=MediaSources&IncludeItemTypes=Audio",
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    let items = body["Items"].as_array().cloned().unwrap_or_default();
+    assert_eq!(items.len(), 1, "{body}");
+    assert!(
+        items[0]["MediaSources"]
+            .as_array()
+            .is_some_and(|s| !s.is_empty())
+    );
+}
+
 /// Writes a real media file over `file` with ffmpeg's lavfi `inputs` and output `args`. False
 /// when ffmpeg isn't there.
 fn r3gaps2_make_media(file: &std::path::Path, inputs: &[&str], args: &[&str]) -> bool {

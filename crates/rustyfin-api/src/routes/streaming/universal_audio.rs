@@ -148,10 +148,19 @@ fn url_params(url: &str) -> HashMap<String, String> {
 /// sample rate and channels, into the transcoding container.
 async fn decide(
     state: &AppState,
+    caller: &progressive::Caller,
     token: Option<String>,
     id: Uuid,
     params: &HashMap<String, String>,
 ) -> Result<Answer, ApiError> {
+    // A remote caller's bitrate limit caps the client's, before the decision
+    let mut params = params.clone();
+    let requested = number(&params, "MaxStreamingBitrate").and_then(|b| u32::try_from(b).ok());
+    if let Some(bitrate) = caller.bitrate(requested).filter(|b| Some(*b) != requested) {
+        params.retain(|name, _| !name.eq_ignore_ascii_case("MaxStreamingBitrate"));
+        params.insert("MaxStreamingBitrate".to_string(), bitrate.to_string());
+    }
+    let params = &params;
     let item = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Item {id} not found")))?;
@@ -234,13 +243,16 @@ async fn decide(
 /// one playlist route.
 async fn audio_universal(
     State(state): State<AppState>,
+    claims: Option<Extension<rustyfin_model::auth::Claims>>,
+    local: Option<Extension<crate::middleware::ClientIsLocal>>,
     token: Option<Extension<rustyfin_auth::RequestToken>>,
     Path(id): Path<Uuid>,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    match decide(&state, token.map(|Extension(t)| t.0), id, &params).await? {
-        Answer::Served(served) => served.respond(&state, &headers, false).await,
+    let caller = progressive::Caller::of(&state, claims.as_deref(), local.as_deref()).await?;
+    match decide(&state, &caller, token.map(|Extension(t)| t.0), id, &params).await? {
+        Answer::Served(served) => served.respond(&state, &caller, &headers, false).await,
         Answer::Hls(url) => Ok((StatusCode::FOUND, [(header::LOCATION, url)]).into_response()),
     }
 }
@@ -250,13 +262,16 @@ async fn audio_universal(
 /// redirect's GET would start ffmpeg a second time).
 async fn head_universal(
     State(state): State<AppState>,
+    claims: Option<Extension<rustyfin_model::auth::Claims>>,
+    local: Option<Extension<crate::middleware::ClientIsLocal>>,
     token: Option<Extension<rustyfin_auth::RequestToken>>,
     Path(id): Path<Uuid>,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    match decide(&state, token.map(|Extension(t)| t.0), id, &params).await? {
-        Answer::Served(served) => served.respond(&state, &headers, true).await,
+    let caller = progressive::Caller::of(&state, claims.as_deref(), local.as_deref()).await?;
+    match decide(&state, &caller, token.map(|Extension(t)| t.0), id, &params).await? {
+        Answer::Served(served) => served.respond(&state, &caller, &headers, true).await,
         Answer::Hls(_) => Ok((
             StatusCode::OK,
             [(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")],

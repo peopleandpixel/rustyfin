@@ -207,15 +207,75 @@ impl Drop for EndOnDrop {
     }
 }
 
+/// Who asks for a stream: their user policy and whether they are on the local network. The
+/// remote bitrate limit and the transcoding and remuxing switches apply to them, as on the HLS
+/// route.
+pub(crate) struct Caller {
+    pub access: rustyfin_model::parental::AccessPolicy,
+    pub local: bool,
+}
+
+impl Caller {
+    /// The caller of a request: no claims (a test's or the server's own request) has the default
+    /// policy, and a request the middleware didn't mark is local.
+    pub(crate) async fn of(
+        state: &AppState,
+        claims: Option<&rustyfin_model::auth::Claims>,
+        local: Option<&crate::middleware::ClientIsLocal>,
+    ) -> Result<Self, ApiError> {
+        let access = match claims {
+            Some(claims) => crate::parental::caller_access(state, claims).await?,
+            None => Default::default(),
+        };
+        Ok(Self {
+            access,
+            local: local.is_none_or(|local| local.0),
+        })
+    }
+
+    /// A requested bitrate within the remote limit (`parental::remote_bitrate`).
+    pub(crate) fn bitrate(&self, requested: Option<u32>) -> Option<u32> {
+        crate::parental::remote_bitrate(&self.access, self.local, requested)
+    }
+
+    /// `params` with the audio bitrate a progressive audio transcode reads (`AudioBitrate`,
+    /// else `MaxAudioBitrate`, else `MaxStreamingBitrate`) within the remote limit, written as
+    /// `AudioBitrate`. Unchanged when no limit applies.
+    pub(super) fn clamp_audio(&self, params: &HashMap<String, String>) -> HashMap<String, String> {
+        let mut params = params.clone();
+        let requested = number(
+            &params,
+            &["AudioBitrate", "MaxAudioBitrate", "MaxStreamingBitrate"],
+        );
+        let clamped = self.bitrate(requested);
+        if clamped != requested
+            && let Some(bitrate) = clamped
+        {
+            params.retain(|name, _| !name.eq_ignore_ascii_case("AudioBitrate"));
+            params.insert("AudioBitrate".to_string(), bitrate.to_string());
+        }
+        params
+    }
+}
+
 /// The response of a progressive transcode: 200 with the container's type and ffmpeg's output
 /// as a chunked body, once ffmpeg has written its first bytes. HEAD gets the headers only and
-/// starts nothing. A container Rustyfin can't stream is a 400; an ffmpeg that writes nothing is
-/// a 500 with its last stderr lines.
+/// starts nothing. The caller's policy is checked first, as on the HLS route: a transcode that
+/// re-encodes needs the transcoding switch for the item's kind, and one that only copies needs
+/// `EnablePlaybackRemuxing` (403 otherwise). A container Rustyfin can't stream is a 400; an
+/// ffmpeg that writes nothing is a 500 with its last stderr lines.
 pub(super) async fn respond(
     state: &AppState,
+    caller: &Caller,
     job: Job<'_>,
     head: bool,
 ) -> Result<Response, ApiError> {
+    crate::parental::check_conversion(
+        &caller.access,
+        job.profile.audio_only,
+        job.profile.copy_video,
+        job.profile.copy_audio,
+    )?;
     let (format, content_type) = progressive_format(job.container, job.profile.audio_only)
         .ok_or_else(|| {
             ApiError::BadRequest(format!(
@@ -223,9 +283,6 @@ pub(super) async fn respond(
                 job.container
             ))
         })?;
-    // Hook point: the user-policy guard of the HLS route (transcoding and remuxing permissions,
-    // the remote bitrate clamp) belongs here, before anything starts, so it covers every
-    // progressive path (universal audio, /Audio/{id}/stream, /Videos/{id}/stream)
     let headers = [
         (header::CONTENT_TYPE, content_type),
         (header::ACCEPT_RANGES, "none"),

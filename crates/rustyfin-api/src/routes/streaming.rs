@@ -582,6 +582,7 @@ pub(crate) async fn validate_path_against_library(
 /// else the source's (see `progressive_video_profile` for what is copied).
 async fn video_stream_answer(
     state: &AppState,
+    caller: &progressive::Caller,
     VideoPath { id, container }: VideoPath,
     params: &HashMap<String, String>,
     uri: &axum::http::Uri,
@@ -609,7 +610,9 @@ async fn video_stream_answer(
     let query = Query::<super::transcode::TranscodeQuery>::try_from_uri(uri)
         .map_err(|e| ApiError::BadRequest(format!("Invalid transcode query: {e}")))?
         .0;
-    let query = super::transcode::to_file_numbering(query, source).await;
+    let mut query = super::transcode::to_file_numbering(query, source).await;
+    // The remote bitrate limit, before the copy decision
+    query.video_bitrate = caller.bitrate(query.video_bitrate);
     let mut profile = super::transcode::progressive_video_profile(query, params, source);
     if let Some(channels) = progressive::channel_limit(params) {
         profile.audio_channels = Some(channels);
@@ -639,26 +642,32 @@ async fn video_stream_answer(
 /// progressive transcode (see `video_stream_answer`).
 async fn stream_video(
     State(state): State<AppState>,
+    claims: Option<Extension<Claims>>,
+    local: Option<Extension<crate::middleware::ClientIsLocal>>,
     Path(path): Path<VideoPath>,
     Query(params): Query<HashMap<String, String>>,
     uri: axum::http::Uri,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    let served = video_stream_answer(&state, path, &params, &uri).await?;
-    served.respond(&state, &headers, false).await
+    let caller = progressive::Caller::of(&state, claims.as_deref(), local.as_deref()).await?;
+    let served = video_stream_answer(&state, &caller, path, &params, &uri).await?;
+    served.respond(&state, &caller, &headers, false).await
 }
 
 /// `HEAD` of `stream` and `stream.{container}`: the headers that `GET` sends; it starts no
 /// transcode.
 async fn head_video(
     State(state): State<AppState>,
+    claims: Option<Extension<Claims>>,
+    local: Option<Extension<crate::middleware::ClientIsLocal>>,
     Path(path): Path<VideoPath>,
     Query(params): Query<HashMap<String, String>>,
     uri: axum::http::Uri,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    let served = video_stream_answer(&state, path, &params, &uri).await?;
-    served.respond(&state, &headers, true).await
+    let caller = progressive::Caller::of(&state, claims.as_deref(), local.as_deref()).await?;
+    let served = video_stream_answer(&state, &caller, path, &params, &uri).await?;
+    served.respond(&state, &caller, &headers, true).await
 }
 
 /// The path of an audio stream route: the item, and the container of `stream.{container}`.
@@ -687,9 +696,12 @@ const AUDIO_LIMITS: [&str; 6] = [
 /// codec is listed, else the first listed codec's.
 async fn audio_stream_answer(
     state: &AppState,
+    caller: &progressive::Caller,
     AudioPath { id, container }: AudioPath,
     params: &HashMap<String, String>,
 ) -> Result<Served, ApiError> {
+    // A remote caller's bitrate limit counts as one the request sets
+    let params = &caller.clamp_audio(params);
     let item = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Item {id} not found")))?;
@@ -779,6 +791,7 @@ impl Served {
     async fn respond(
         self,
         state: &AppState,
+        caller: &progressive::Caller,
         headers: &HeaderMap,
         head: bool,
     ) -> Result<Response, ApiError> {
@@ -801,7 +814,7 @@ impl Served {
                     play_session_id,
                     device_id,
                 };
-                progressive::respond(state, job, head).await
+                progressive::respond(state, caller, job, head).await
             }
         }
     }
@@ -811,23 +824,29 @@ impl Served {
 /// transcode (see `audio_stream_answer`).
 async fn stream_audio(
     State(state): State<AppState>,
+    claims: Option<Extension<Claims>>,
+    local: Option<Extension<crate::middleware::ClientIsLocal>>,
     Path(path): Path<AudioPath>,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    let served = audio_stream_answer(&state, path, &params).await?;
-    served.respond(&state, &headers, false).await
+    let caller = progressive::Caller::of(&state, claims.as_deref(), local.as_deref()).await?;
+    let served = audio_stream_answer(&state, &caller, path, &params).await?;
+    served.respond(&state, &caller, &headers, false).await
 }
 
 /// `HEAD` of the audio stream routes: the headers that `GET` sends; it starts no transcode.
 async fn head_stream(
     State(state): State<AppState>,
+    claims: Option<Extension<Claims>>,
+    local: Option<Extension<crate::middleware::ClientIsLocal>>,
     Path(path): Path<AudioPath>,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    let served = audio_stream_answer(&state, path, &params).await?;
-    served.respond(&state, &headers, true).await
+    let caller = progressive::Caller::of(&state, claims.as_deref(), local.as_deref()).await?;
+    let served = audio_stream_answer(&state, &caller, path, &params).await?;
+    served.respond(&state, &caller, &headers, true).await
 }
 
 /// The headers of a `HEAD` for the file at `file_path`: its type, its length, and that byte
@@ -1501,6 +1520,18 @@ async fn video_playback_info(
         source.supports_direct_play = i == index && supports_direct_play;
         source.supports_direct_stream = i == index && supports_direct_stream;
         source.supports_transcoding = i == index && supports_transcoding;
+    }
+
+    // The caller's policy, as in /Items/{id}/PlaybackInfo: no remux without
+    // EnablePlaybackRemuxing, no transcode without EnableVideoPlaybackTranscoding, and no direct
+    // play of a remote source with ForceRemoteSourceTranscoding
+    let access = crate::parental::caller_access(&state, &claims).await?;
+    let mut media_sources = media_sources;
+    for source in media_sources.iter_mut() {
+        source.supports_direct_play &=
+            !(access.force_remote_source_transcoding && source.is_remote);
+        source.supports_direct_stream &= access.enable_playback_remuxing;
+        source.supports_transcoding &= access.enable_video_playback_transcoding;
     }
 
     // The caller's remembered tracks become each source's defaults, where the source has them
