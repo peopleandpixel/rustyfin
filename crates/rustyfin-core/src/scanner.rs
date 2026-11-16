@@ -715,6 +715,15 @@ async fn restamp_local_images(
     }
 }
 
+/// `batch_upsert_media_items`, tried again while another writer holds the lock: it is one
+/// transaction, so a try that failed wrote nothing.
+async fn upsert_items(pool: &SqlitePool, items: &[MediaItem]) -> Result<(), sqlx::Error> {
+    rustyfin_db::busy::retry_busy("saving scanned items", || {
+        rustyfin_db::repo_media::batch_upsert_media_items(pool, items)
+    })
+    .await
+}
+
 /// Serializes the scans that write items. Held until the probes they queued have finished.
 pub static SCAN_LOCK: Mutex<()> = Mutex::const_new(());
 
@@ -1095,7 +1104,7 @@ async fn scan_flat_library(
 
     // Batch-insert all new items in a single transaction
     if !new_items.is_empty() {
-        if let Err(e) = rustyfin_db::repo_media::batch_upsert_media_items(pool, &new_items).await {
+        if let Err(e) = upsert_items(pool, &new_items).await {
             tracing::error!("failed to batch insert media items: {}", e);
         } else {
             // Find and save local images for all newly inserted items
@@ -1389,7 +1398,7 @@ async fn scan_tv_library(
         // Batch-insert the new series and seasons in a single transaction. The episodes of the
         // library need their seasons, so this runs before any episode is reconciled.
         if !new_items.is_empty() {
-            rustyfin_db::repo_media::batch_upsert_media_items(pool, &new_items).await?;
+            upsert_items(pool, &new_items).await?;
             // Find and save local images for series and seasons
             let mut all_images: Vec<rustyfin_model::image::ItemImage> = Vec::new();
             for item in &new_items {
@@ -1590,8 +1599,7 @@ async fn scan_tv_library(
     // Batch-insert the new episodes in a single transaction. As in the movie scan, their plans
     // are queued only when the insert succeeds.
     if !new_episodes.is_empty() {
-        if let Err(e) = rustyfin_db::repo_media::batch_upsert_media_items(pool, &new_episodes).await
-        {
+        if let Err(e) = upsert_items(pool, &new_episodes).await {
             tracing::error!("failed to batch insert episodes: {}", e);
         } else {
             plans.append(&mut new_episode_plans);

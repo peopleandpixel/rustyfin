@@ -589,7 +589,7 @@ const PERSON_IMAGE_INSERT: &str = "INSERT INTO person_images \
 /// Applies a metadata run in one transaction (spec 5.10), in this order: items, extras, studios, new
 /// people, links, images. Item columns are only ever set by the UPDATE; the lock columns never are.
 pub async fn write_metadata(pool: &SqlitePool, writes: &MetadataWrites) -> Result<(), sqlx::Error> {
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let mut tx = crate::begin_write(pool).await?;
     for item in &writes.items {
         sqlx::query(
             "UPDATE media_items SET name = ?, sort_name = ?, overview = ?, tagline = ?, \

@@ -143,7 +143,7 @@ pub async fn save_photo_info(
     info: &PhotoInfo,
 ) -> Result<(), sqlx::Error> {
     let id = item_id.to_string();
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let mut tx = crate::begin_write(pool).await?;
     sqlx::query(
         "INSERT OR REPLACE INTO photo_metadata (item_id, stamp, width, height, camera_make, \
          camera_model, software, orientation, exposure_time, focal_length, aperture, \

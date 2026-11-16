@@ -448,7 +448,7 @@ pub async fn batch_upsert_media_items(
         return Ok(());
     }
 
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let mut tx = crate::begin_write(pool).await?;
 
     // Disable filter triggers during batch insert to avoid write amplification.
     // Each trigger fires COUNT(*) on the entire table per row, which is expensive.
@@ -671,7 +671,7 @@ pub async fn delete_item_rows_in(
 pub async fn delete_item(pool: &SqlitePool, id: Uuid) -> Result<bool, sqlx::Error> {
     let root = id.to_string();
     // The write lock is taken first, as in scan_sync::delete_item.
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let mut tx = crate::begin_write(pool).await?;
     let tree: Vec<(String, i64)> = sqlx::query_as(
         "WITH RECURSIVE tree(id, depth) AS (
             SELECT id, 0 FROM media_items WHERE id = ?1
@@ -1853,7 +1853,7 @@ pub async fn get_similar_items(
 /// Rebuild materialized filter index tables from media_items.
 /// Call after scanning or bulk operations to keep indexes up-to-date.
 pub async fn rebuild_filter_indexes(pool: &SqlitePool) -> Result<(), sqlx::Error> {
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let mut tx = crate::begin_write(pool).await?;
 
     // Clear existing indexes
     sqlx::query("DELETE FROM filter_genre_index")
@@ -2365,7 +2365,7 @@ pub async fn upsert_music_tags_read(
     if reads.is_empty() {
         return Ok(());
     }
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let mut tx = crate::begin_write(pool).await?;
     for (item_id, size, mtime) in reads {
         sqlx::query(
             "INSERT INTO music_tags_read (item_id, size, mtime) VALUES (?1, ?2, ?3)
@@ -3756,7 +3756,7 @@ const SORT_BATCH: usize = 500;
 pub async fn classify_legacy_sort_names(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
     use rustyfin_model::sort_name::{current_rules, item_sort_name};
 
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let mut tx = crate::begin_write(pool).await?;
     let done = sqlx::query("DELETE FROM configuration WHERE key = ?")
         .bind(SORT_LEGACY_KEY)
         .execute(&mut *tx)
@@ -3843,7 +3843,7 @@ pub async fn recompute_sort_names(
 
     let mut changed = 0;
     let mut pending = 0;
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let mut tx = crate::begin_write(pool).await?;
     for (id, name, sort_name, kind, parent_index, index, forced) in rows {
         let media_type = match kind.as_str() {
             "Folder" => MediaType::Unknown,
@@ -3873,7 +3873,7 @@ pub async fn recompute_sort_names(
         pending += 1;
         if pending >= SORT_BATCH {
             tx.commit().await?;
-            tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+            tx = crate::begin_write(pool).await?;
             pending = 0;
         }
     }
@@ -3942,7 +3942,7 @@ pub async fn replace_item_studios(
     names: &[String],
 ) -> Result<(), sqlx::Error> {
     let item = item_id.to_string();
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let mut tx = crate::begin_write(pool).await?;
     sqlx::query("DELETE FROM item_studios WHERE item_id = ?")
         .bind(&item)
         .execute(&mut *tx)

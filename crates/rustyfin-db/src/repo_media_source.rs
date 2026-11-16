@@ -623,7 +623,7 @@ pub async fn insert_media_source_with_streams(
     item_id: &Uuid,
     source: &MediaSourceResponse,
 ) -> Result<Uuid, sqlx::Error> {
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let mut tx = crate::begin_write(pool).await?;
     let id = insert_source_with_streams(&mut tx, item_id, source).await?;
     tx.commit().await?;
     Ok(id)
@@ -654,7 +654,7 @@ pub async fn write_probe_outcome(
     // The write lock is taken first. A deferred transaction that reads and then writes fails at
     // once with "database is deadlocked" when another plan commits meanwhile, and busy_timeout
     // does not retry it.
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let mut tx = crate::begin_write(pool).await?;
     let sources: Vec<(String, String, Option<i64>, Option<i64>)> = sqlx::query_as(
         "SELECT id, path, size, modified FROM media_sources WHERE item_id = ?1 ORDER BY rowid",
     )

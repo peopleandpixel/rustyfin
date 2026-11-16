@@ -125,6 +125,53 @@ async fn answers(pool: &SqlitePool) -> bool {
     )
 }
 
+// Two plays marked while another writer (a scan, say) holds the write lock: both wait for it and
+// both count. Their transactions take the lock at BEGIN.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r3dbpool_marking_played_waits_for_a_writer() {
+    use sqlx::Connection;
+    let dir = crate::tests::temp_dir();
+    let path = dir.join("played.db");
+    let path = path.to_str().unwrap();
+    let pool = crate::init_db(path).await.unwrap();
+    let (user, item) = (Uuid::new_v4(), Uuid::new_v4());
+    crate::insert_test_user(&pool, user).await;
+    crate::insert_test_item(&pool, item).await;
+
+    let mut writer = sqlx::SqliteConnection::connect_with(&crate::connect_options(path))
+        .await
+        .unwrap();
+    let mut tx = writer.begin_with("BEGIN IMMEDIATE").await.unwrap();
+    sqlx::query("UPDATE media_items SET overview = 'scanned' WHERE id = ?1")
+        .bind(item.to_string())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let mark = || {
+        let pool = pool.clone();
+        tokio::spawn(
+            async move { crate::repo_playback::mark_played_on(&pool, user, item, None).await },
+        )
+    };
+    let (first, second) = (mark(), mark());
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(!first.is_finished() && !second.is_finished(), "they wait");
+    tx.commit().await.unwrap();
+
+    for marked in [first.await.unwrap(), second.await.unwrap()] {
+        assert!(marked.is_ok(), "{marked:?}");
+    }
+    let plays: i64 = sqlx::query_scalar(
+        "SELECT play_count FROM user_item_data WHERE user_id = ?1 AND item_id = ?2",
+    )
+    .bind(user.to_string())
+    .bind(item.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(plays, 2);
+}
+
 // The nightly database task's integrity check, under that load, never returned on shared-cache
 // connections, and every connection of both pools waited on it for good. Both pools then timed
 // out every request.

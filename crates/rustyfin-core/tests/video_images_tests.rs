@@ -207,6 +207,49 @@ async fn r2chapters_trickplay_and_chapter_images_are_made_once() {
     assert_eq!(again, 0);
 }
 
+// The tiles are made but the database won't take them (it was locked past every retry, say).
+// That is no fault of the video: no failure is recorded, and the next run makes them.
+#[tokio::test]
+async fn r3dbpool_a_tile_set_the_database_refused_is_tried_again() {
+    if !ffmpeg_or_skip() {
+        return;
+    }
+    let dir = TempDir::new("r3dbpool_refused");
+    let clip = make_clip(&dir.0);
+    let data = dir.0.join("data");
+    let (pool, lib, item) = movie_db(&dir.0, &clip).await;
+    let libs = [lib];
+    sqlx::query(
+        "CREATE TRIGGER refuse_tiles BEFORE INSERT ON trickplay_infos \
+         BEGIN SELECT RAISE(ABORT, 'refused'); END",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let made = rustyfin_core::trickplay::generate_for_libraries(&pool, &data, &libs, &go())
+        .await
+        .unwrap();
+    assert_eq!(made, 0);
+    let failure = rustyfin_db::repo_trickplay::get_failure(
+        &pool,
+        item,
+        rustyfin_core::trickplay::FAILURE_KIND,
+    )
+    .await
+    .unwrap();
+    assert_eq!(failure, None, "a database error is not the video's failure");
+
+    sqlx::query("DROP TRIGGER refuse_tiles")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let made = rustyfin_core::trickplay::generate_for_libraries(&pool, &data, &libs, &go())
+        .await
+        .unwrap();
+    assert_eq!(made, 1);
+}
+
 #[tokio::test]
 async fn r2chapters_nothing_is_made_where_a_library_turns_it_off() {
     if !ffmpeg_or_skip() {

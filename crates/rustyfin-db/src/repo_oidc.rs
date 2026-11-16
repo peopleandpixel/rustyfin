@@ -151,7 +151,7 @@ pub async fn settle_sign_in(
     signed_in: Option<(DateTime<Utc>, Option<&str>)>,
     admin_member: bool,
 ) -> Result<Settled, sqlx::Error> {
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let mut tx = crate::begin_write(pool).await?;
     let linked: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM user_oidc_links \
          WHERE user_id = ? AND issuer = ? AND subject = ?)",
@@ -203,7 +203,7 @@ pub async fn create_linked_user(
     now: DateTime<Utc>,
     taken: impl Fn(&str) -> bool,
 ) -> Result<bool, sqlx::Error> {
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let mut tx = crate::begin_write(pool).await?;
     let names: Vec<String> = sqlx::query_scalar("SELECT name FROM users")
         .fetch_all(&mut *tx)
         .await?;
@@ -227,7 +227,7 @@ pub struct Unlinked {
 /// one IMMEDIATE transaction (AC51). The owner and the last enabled administrator keep those rights,
 /// and `admin_kept` says so. Rights given by hand stay.
 pub async fn unlink_account(pool: &SqlitePool, user_id: Uuid) -> Result<Unlinked, sqlx::Error> {
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let mut tx = crate::begin_write(pool).await?;
     let deleted = sqlx::query("DELETE FROM user_oidc_links WHERE user_id = ?")
         .bind(user_id.to_string())
         .execute(&mut *tx)

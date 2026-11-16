@@ -639,8 +639,7 @@ async fn plan_watch_data(
         // progress report saved meanwhile is not overwritten (B20 fix 4). Between the begin and the
         // commit only `tx` is used: a second pool connection would wait on this transaction.
         if let (Some(_), Some(user)) = (handle, owner) {
-            let mut tx = db
-                .begin_with("BEGIN IMMEDIATE")
+            let mut tx = rustyfin_db::begin_write(db)
                 .await
                 .map_err(ImportError::Db)?;
             let (current, changed) = merge_group(&mut *tx, owner, mapped, &mut report).await?;

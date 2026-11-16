@@ -9,7 +9,7 @@ pub async fn create_library(pool: &SqlitePool, lib: &Library) -> Result<(), sqlx
 
 /// Creates all of `libs` in one transaction (B119): a failed insert creates none of them.
 pub async fn create_libraries(pool: &SqlitePool, libs: &[Library]) -> Result<(), sqlx::Error> {
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let mut tx = crate::begin_write(pool).await?;
     for lib in libs {
         insert_library(&mut *tx, lib).await?;
     }

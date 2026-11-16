@@ -62,6 +62,42 @@ pub async fn save_media_segment(
     Ok(())
 }
 
+/// Replaces item `item_id`'s detected intro and outro with `intro` and `outro`, as start and end
+/// ticks, in one transaction: a failed save keeps the old ones.
+pub async fn replace_detected_segments(
+    pool: &SqlitePool,
+    item_id: Uuid,
+    intro: Option<(i64, i64)>,
+    outro: Option<(i64, i64)>,
+) -> Result<(), sqlx::Error> {
+    let item = item_id.to_string();
+    let mut tx = crate::begin_write(pool).await?;
+    sqlx::query(
+        "DELETE FROM media_segments WHERE item_id = ?1 AND segment_type IN ('Intro', 'Outro')",
+    )
+    .bind(&item)
+    .execute(&mut *tx)
+    .await?;
+    for (kind, ticks) in [("Intro", intro), ("Outro", outro)] {
+        let Some((start, end)) = ticks else {
+            continue;
+        };
+        sqlx::query(
+            "INSERT OR REPLACE INTO media_segments
+             (id, item_id, segment_type, segment_start_ticks, segment_end_ticks)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(&item)
+        .bind(kind)
+        .bind(start)
+        .bind(end)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await
+}
+
 /// Delete all media segments for an item.
 pub async fn delete_media_segments(pool: &SqlitePool, item_id: Uuid) -> Result<(), sqlx::Error> {
     let item_id_str = item_id.to_string();
@@ -145,6 +181,30 @@ mod tests {
         let segments = get_media_segments(&pool, item).await.unwrap();
         assert_eq!(segments.len(), 1);
         assert_eq!(segments[0].segment_type, "Intro");
+    }
+
+    #[tokio::test]
+    async fn r3dbpool_replace_detected_segments_keeps_the_other_kinds() {
+        let pool = test_pool().await;
+        let item = Uuid::new_v4();
+        insert_test_item(&pool, item).await;
+        for kind in ["Intro", "Outro", "Recap"] {
+            save_media_segment(&pool, item, kind, 0, 1).await.unwrap();
+        }
+        replace_detected_segments(&pool, item, Some((10, 20)), None)
+            .await
+            .unwrap();
+        let mut got: Vec<_> = get_media_segments(&pool, item)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|s| (s.segment_type, s.segment_start_ticks, s.segment_end_ticks))
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            [("Intro".to_string(), 10, 20), ("Recap".to_string(), 0, 1)]
+        );
     }
 
     #[tokio::test]

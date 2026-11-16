@@ -12,6 +12,7 @@ use std::process::Stdio;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use rustyfin_db::busy::retry_busy;
 use sqlx::SqlitePool;
 use tokio::fs;
 use tokio::process::Command;
@@ -332,11 +333,17 @@ pub async fn generate(
     let _ = fs::remove_dir_all(&work).await;
     moved.map_err(|e| format!("could not move the tiles to {}: {e}", dest.display()))?;
 
-    rustyfin_db::repo_trickplay::save_trickplay(pool, item_id, &made)
-        .await
-        .map_err(|e| format!("could not save the tile set: {e}"))?;
+    retry_busy("saving a trickplay tile set", || {
+        rustyfin_db::repo_trickplay::save_trickplay(pool, item_id, &made)
+    })
+    .await
+    .map_err(|e| format!("{SAVE_FAILED}: {e}"))?;
     Ok(made)
 }
+
+/// The start of the error when the tile set was made but the database would not take it. That
+/// is no fault of the video, so it is tried again on the next run.
+pub const SAVE_FAILED: &str = "could not save the tile set";
 
 /// The packet filter that thins a video's key frames before they are decoded. Of the key frames
 /// in each interval-long window centred on a thumbnail's time, it keeps the first, which the fps
@@ -1035,26 +1042,39 @@ pub async fn generate_for_libraries_with_progress(
             match result {
                 Ok(set) => {
                     made += 1;
-                    clear_failure(pool, item_id, FAILURE_KIND)
-                        .await
-                        .map_err(db)?;
-                    set_image_version(pool, item_id, Some(version))
-                        .await
-                        .map_err(db)?;
+                    retry_busy("clearing a trickplay failure", || {
+                        clear_failure(pool, item_id, FAILURE_KIND)
+                    })
+                    .await
+                    .map_err(db)?;
+                    retry_busy("storing a trickplay file version", || {
+                        set_image_version(pool, item_id, Some(version))
+                    })
+                    .await
+                    .map_err(db)?;
                     info!(item = %item_id, thumbnails = set.thumbnail_count, "made trickplay tiles");
                 }
                 // The other running videos are stopped too, and end up here
                 Err(_) if cancel.is_cancelled() => {}
                 // Not the video's fault: nothing is recorded, so it is tried once ffmpeg is newer
                 Err(e) if e.starts_with(FFMPEG_TOO_OLD) => return Err(e),
+                // Not the video's fault either: nothing is recorded, so the next run tries again
+                Err(e) if e.starts_with(SAVE_FAILED) => {
+                    warn!(item = %item_id, path = %path, error = %e, "could not make trickplay tiles");
+                    failed.push(item_id);
+                }
                 Err(e) => {
                     warn!(item = %item_id, path = %path, error = %e, "could not make trickplay tiles");
-                    record_failure(pool, item_id, FAILURE_KIND, version)
-                        .await
-                        .map_err(db)?;
-                    set_image_version(pool, item_id, Some(version))
-                        .await
-                        .map_err(db)?;
+                    retry_busy("recording a trickplay failure", || {
+                        record_failure(pool, item_id, FAILURE_KIND, version)
+                    })
+                    .await
+                    .map_err(db)?;
+                    retry_busy("storing a trickplay file version", || {
+                        set_image_version(pool, item_id, Some(version))
+                    })
+                    .await
+                    .map_err(db)?;
                     failed.push(item_id);
                 }
             }

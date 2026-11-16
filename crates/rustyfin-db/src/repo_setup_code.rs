@@ -18,7 +18,7 @@ pub async fn create_user_with_code(
     let is_admin = user.is_administrator as i32;
     let config = user.configuration.to_string();
 
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let mut tx = crate::begin_write(pool).await?;
     sqlx::query(
         "INSERT INTO users (id, name, password_hash, is_administrator, created_at, configuration) VALUES (?, ?, ?, ?, ?, ?)",
     )
@@ -108,7 +108,7 @@ pub async fn redeem(
     let id = user.to_string();
     // The write lock is taken up front, as `repo_user::redeem_reset_pin` does, so two redeems of one
     // code queue instead of racing.
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let mut tx = crate::begin_write(pool).await?;
     let deleted = sqlx::query("DELETE FROM user_setup_codes WHERE user_id = ? AND code_hash = ?")
         .bind(&id)
         .bind(code_hash)

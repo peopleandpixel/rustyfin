@@ -406,7 +406,7 @@ pub async fn mark_played_on(
     let uid = user_id.to_string();
     let iid = item_id.to_string();
     let now = date_played.unwrap_or_else(chrono::Utc::now).to_rfc3339();
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let mut tx = crate::begin_write(pool).await?;
 
     sqlx::query(
         "INSERT INTO user_item_data (user_id, item_id, played, play_count, last_played_date) \
@@ -454,7 +454,7 @@ pub async fn mark_unplayed(
 ) -> Result<UserItemDataDto, sqlx::Error> {
     let uid = user_id.to_string();
     let iid = item_id.to_string();
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let mut tx = crate::begin_write(pool).await?;
 
     sqlx::query(
         "INSERT INTO user_item_data (user_id, item_id, played, play_count) \

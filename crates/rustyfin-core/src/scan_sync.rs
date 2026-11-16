@@ -27,7 +27,7 @@ use crate::scanner::{auto_sort_name, parse_year, season_sort_name};
 pub async fn delete_item(pool: &SqlitePool, id: &str) -> Result<bool, sqlx::Error> {
     // The write lock is taken first: under the shared cache, a read-then-write transaction can
     // deadlock with another one, and the busy timeout does not help.
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let mut tx = rustyfin_db::begin_write(pool).await?;
     let deleted = delete_item_in(&mut tx, id).await?;
     tx.commit().await?;
     Ok(deleted)
@@ -861,7 +861,7 @@ pub async fn settle_season_numbers(
     }
 
     let mut changed = 0;
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let mut tx = rustyfin_db::begin_write(pool).await?;
     for (id, number, sort_name, old_number, old_sort_name) in changes {
         // A season that another writer changed since it was read is left to the next scan.
         changed += sqlx::query(
@@ -913,7 +913,7 @@ pub async fn settle_season_folders(
     }
 
     let mut changed = 0;
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let mut tx = rustyfin_db::begin_write(pool).await?;
     for (id, location, old) in changes {
         // A season that another writer changed since it was read is left to the next scan.
         changed += sqlx::query(
@@ -1074,7 +1074,7 @@ pub async fn settle_series(
     }
 
     let mut changed = 0;
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let mut tx = rustyfin_db::begin_write(pool).await?;
     for (new, old) in changes {
         // An item that another writer changed since it was read is left to the next scan. Its images are
         // deleted below either way.
@@ -1586,7 +1586,7 @@ async fn settle_group(
         || parent_id != survivor.parent_id;
 
     if !others.is_empty() || fields_changed {
-        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = rustyfin_db::begin_write(pool).await?;
         for other in others {
             merge_references(&mut tx, &survivor.id, &other.id).await?;
             delete_item_in(&mut tx, &other.id).await?;
