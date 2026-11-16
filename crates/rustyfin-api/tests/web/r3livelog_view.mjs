@@ -97,6 +97,7 @@ const line = (n, level = 'INFO', extra = {}) => ({
     Level: level,
     Target: 'rustyfin_core::scanner',
     Message: `line ${n}`,
+    Seq: 5000 + n,
     ...extra,
 });
 
@@ -123,13 +124,17 @@ test('the client asks for the recent lines on connect and starts over from them'
     assert.equal(context.LiveLog.messages.length, 3);
     assert.equal(container.children.length, 3);
 
-    // After Clear, the replay of a reconnect skips the cleared lines.
+    // After Clear, the replay of a reconnect skips the cleared lines by their Seq, also a later
+    // line with the same timestamp as the last cleared one is kept, and a "lines skipped" notice
+    // (no Seq) always shows.
     context.clearLiveLog();
     again.readyState = 3;
     context.LiveLog.connect();
     FakeSocket.last.open();
-    for (const n of [1, 2, 3, 4]) FakeSocket.last.frame(line(n));
-    assert.deepEqual([...context.LiveLog.messages.map(m => m.Message)], ['line 4']);
+    for (const n of [1, 2, 3]) FakeSocket.last.frame(line(n));
+    FakeSocket.last.frame(line(3, 'INFO', { Message: 'same time', Seq: 5004 }));
+    FakeSocket.last.frame(line(9, 'WARN', { Message: '2 log lines skipped', Seq: undefined }));
+    assert.deepEqual([...context.LiveLog.messages.map(m => m.Message)], ['same time', '2 log lines skipped']);
 });
 
 test('a row shows time, level, target and the message with its fields, all escaped', async () => {

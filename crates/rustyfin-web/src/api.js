@@ -607,8 +607,9 @@ const LiveLog = {
     listeners: [],
     connected: false,
     stopped: false,
-    // The time of the last line before Clear; the replay after a reconnect skips lines up to it
-    clearedAt: 0,
+    // The server's Seq of the last line before Clear; the replay after a reconnect skips lines
+    // up to it
+    clearedSeq: 0,
 
     connect() {
         this.stopped = false;
@@ -651,7 +652,7 @@ const LiveLog = {
     },
 
     add(entry) {
-        if (this.clearedAt && Date.parse(entry.Timestamp) <= this.clearedAt) return;
+        if (typeof entry.Seq === 'number' && entry.Seq <= this.clearedSeq) return;
         this.messages.push(entry);
         if (this.messages.length > this.maxMessages) {
             this.messages.splice(0, this.messages.length - this.maxMessages);
@@ -660,8 +661,9 @@ const LiveLog = {
     },
 
     clear() {
-        const last = this.messages[this.messages.length - 1];
-        if (last) this.clearedAt = Date.parse(last.Timestamp) || this.clearedAt;
+        for (const m of this.messages) {
+            if (typeof m.Seq === 'number' && m.Seq > this.clearedSeq) this.clearedSeq = m.Seq;
+        }
         this.messages = [];
     },
 
