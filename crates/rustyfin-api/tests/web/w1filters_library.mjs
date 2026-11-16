@@ -43,7 +43,7 @@ function sandbox() {
          ${slice('function libraryPrefsToDisplay(')}
          ${slice('function libraryFilterMenu(')}
          ${slice('function libraryListQuery(')}
-         var currentLibraryTab = '', currentLibraryGenre = null;
+         var currentLibraryTab = '', currentLibraryGenre = null, currentLibraryScope = null;
          var libraryPrefs = libraryPrefsFromDisplay(null);
          this.fns = { librarySort, libraryFilterQuery, libraryFilterCount, libraryPrefsFromDisplay,
              libraryPrefsToDisplay, libraryFilterMenu, libraryListQuery };

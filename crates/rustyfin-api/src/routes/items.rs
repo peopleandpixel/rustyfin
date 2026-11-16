@@ -106,9 +106,32 @@ fn apply_unplayed_counts(item: &mut MediaItem, counts: (i64, i64)) {
     data.played = rustyfin_db::repo_playback::folder_played(counts);
 }
 
-/// Set an item's image tags (the first image of each type) and backdrop tags (every backdrop, in
-/// order) from its image rows.
+/// Sets a folder's ChildCount and its per-kind counts from its children's `(type, count)` rows; a
+/// count of zero is left out.
+fn set_folder_counts(item: &mut MediaItem, counts: Vec<(String, i64)>) {
+    let of = |kinds: &[&str]| -> Option<i32> {
+        let n: i64 = counts
+            .iter()
+            .filter(|(kind, _)| kinds.is_empty() || kinds.contains(&kind.as_str()))
+            .map(|(_, n)| n)
+            .sum();
+        (n > 0).then_some(n as i32)
+    };
+    item.song_count = of(&["Audio"]);
+    item.album_count = of(&["MusicAlbum"]);
+    item.movie_count = of(&["Movie"]);
+    item.series_count = of(&["Series"]);
+    item.episode_count = of(&["Episode"]);
+    item.child_count = of(&[]);
+}
+
+/// Set an item's image tags (the first image of each type), backdrop tags (every backdrop, in
+/// order) and PrimaryImageAspectRatio from its image rows.
 pub(crate) fn set_image_tags(item: &mut MediaItem, images: &[rustyfin_model::image::ItemImage]) {
+    item.primary_image_aspect_ratio = images
+        .iter()
+        .find(|img| img.image_type == rustyfin_model::image::ImageType::Primary)
+        .and_then(|img| primary_aspect_ratio(item.media_type, img));
     let mut tags: std::collections::HashMap<rustyfin_model::image::ImageType, String> =
         std::collections::HashMap::new();
     let mut backdrop_tags: Vec<String> = Vec::new();
@@ -121,6 +144,28 @@ pub(crate) fn set_image_tags(item: &mut MediaItem, images: &[rustyfin_model::ima
     }
     item.image_tags = tags;
     item.backdrop_image_tags = backdrop_tags;
+}
+
+/// Jellyfin's PrimaryImageAspectRatio: the primary image's width over its height, or, when its
+/// size isn't known, the kind's usual shape (GetDefaultPrimaryImageAspectRatio).
+fn primary_aspect_ratio(
+    kind: rustyfin_model::media::MediaType,
+    img: &rustyfin_model::image::ItemImage,
+) -> Option<f64> {
+    use rustyfin_model::media::MediaType;
+    match (img.width, img.height) {
+        (Some(width), Some(height)) if width > 0 && height > 0 => {
+            Some(f64::from(width) / f64::from(height))
+        }
+        _ => match kind {
+            MediaType::Movie | MediaType::Series | MediaType::Season | MediaType::BoxSet => {
+                Some(2.0 / 3.0)
+            }
+            MediaType::Episode => Some(16.0 / 9.0),
+            MediaType::Audio | MediaType::MusicAlbum | MediaType::MusicArtist => Some(1.0),
+            _ => None,
+        },
+    }
 }
 
 /// Adds an image's BlurHash to an item, under its type and tag (Jellyfin's ImageBlurHashes).
@@ -289,6 +334,18 @@ async fn enrich_item(
 ) {
     // ServerId
     item.server_id = Some(server_id.to_string());
+    // Container: the first media source's, as Jellyfin sends it
+    if item.container.is_none() {
+        item.container = item.media_sources.first().and_then(|s| s.container.clone());
+    }
+
+    // Jellyfin sends HasLyrics on audio items only
+    if item.media_type == rustyfin_model::media::MediaType::Audio {
+        let with_lyrics = rustyfin_db::repo_lyrics::with_lyrics(pool, &[item.id])
+            .await
+            .unwrap_or_default();
+        item.has_lyrics = Some(!with_lyrics.is_empty());
+    }
 
     // Type flags
     item.is_movie = item.media_type == rustyfin_model::media::MediaType::Movie;
@@ -717,59 +774,12 @@ async fn enrich_item(
             .collect();
     }
 
-    // --- Folder counts (for Series, Season, MusicAlbum, Folder) ---
+    // --- Folder counts (for Series, Season, MusicAlbum, Folder), of every child: `media_item`
+    // caches this item for every user and counts again for a user with limits ---
     if item.media_type.is_folder() {
-        if let Ok(counts) = rustyfin_db::repo_media::count_items_by_type(pool, item.id).await {
-            let mut song_count: i32 = 0;
-            let mut album_count: i32 = 0;
-            let mut movie_count: i32 = 0;
-            let mut series_count: i32 = 0;
-            let mut episode_count: i32 = 0;
-            let mut child_count: i32 = 0;
-
-            for (media_type, count) in counts {
-                let c = count as i32;
-                match media_type.as_str() {
-                    "Audio" => song_count += c,
-                    "MusicAlbum" => album_count += c,
-                    "Movie" => movie_count += c,
-                    "Series" => series_count += c,
-                    "Episode" => episode_count += c,
-                    _ => {}
-                }
-                child_count += c;
-            }
-
-            item.song_count = if song_count > 0 {
-                Some(song_count)
-            } else {
-                None
-            };
-            item.album_count = if album_count > 0 {
-                Some(album_count)
-            } else {
-                None
-            };
-            item.movie_count = if movie_count > 0 {
-                Some(movie_count)
-            } else {
-                None
-            };
-            item.series_count = if series_count > 0 {
-                Some(series_count)
-            } else {
-                None
-            };
-            item.episode_count = if episode_count > 0 {
-                Some(episode_count)
-            } else {
-                None
-            };
-            item.child_count = if child_count > 0 {
-                Some(child_count)
-            } else {
-                None
-            };
+        if let Ok(counts) = rustyfin_db::repo_media::count_items_by_type(pool, item.id, None).await
+        {
+            set_folder_counts(item, counts);
         }
         // Display order for folders
         item.display_order = Some("SortName".to_string());
@@ -893,6 +903,15 @@ async fn enrich_item(
             rustyfin_db::repo_media::get_last_media_added(pool, item.id).await
     {
         item.date_last_media_added = Some(last_added);
+    }
+    set_top_level_parent(item);
+}
+
+/// Jellyfin's ParentId of an item at the top of a library: the library (its CollectionFolder).
+/// An extra keeps none, as it hangs off its owner.
+fn set_top_level_parent(item: &mut MediaItem) {
+    if item.parent_id.is_none() && item.extra_type.is_none() && !item.library_id.is_nil() {
+        item.parent_id = Some(item.library_id);
     }
 }
 
@@ -1050,6 +1069,43 @@ pub(crate) async fn enrich_items_with(
         }
     }
 
+    // Batch query 3a': which audio items have lyrics; Jellyfin sends HasLyrics on audio only
+    let audio_ids: Vec<Uuid> = items
+        .iter()
+        .filter(|item| item.media_type == rustyfin_model::media::MediaType::Audio)
+        .map(|item| item.id)
+        .collect();
+    if !audio_ids.is_empty() {
+        let with_lyrics = rustyfin_db::repo_lyrics::with_lyrics(pool, &audio_ids)
+            .await
+            .unwrap_or_default();
+        for item in items.iter_mut() {
+            if item.media_type == rustyfin_model::media::MediaType::Audio {
+                item.has_lyrics = Some(with_lyrics.contains(&item.id.to_string()));
+            }
+        }
+    }
+
+    // Batch query 3c: each item's Container, from its first media source, as Jellyfin sends it
+    let containers = rustyfin_db::repo_media_source::first_containers(pool, &item_ids)
+        .await
+        .unwrap_or_default();
+    for item in items.iter_mut() {
+        if item.container.is_none() {
+            item.container = containers.get(&item.id.to_string()).cloned();
+        }
+    }
+
+    // What the user may see, for the counts of the folders in the batch; read only with folders.
+    let visible = if items
+        .iter()
+        .any(|item| item.media_type.is_folder() || is_episode_folder(item))
+    {
+        crate::parental::user_filter(pool, user_id).await
+    } else {
+        None
+    };
+
     // Batch query 3b: unplayed episode counts for the Series and Seasons in the batch
     let folder_ids: Vec<Uuid> = items
         .iter()
@@ -1057,11 +1113,14 @@ pub(crate) async fn enrich_items_with(
         .map(|item| item.id)
         .collect();
     let unplayed_map = match user_id {
-        Some(uid) if !folder_ids.is_empty() => {
-            rustyfin_db::repo_playback::get_unplayed_counts(pool, uid, &folder_ids)
-                .await
-                .unwrap_or_default()
-        }
+        Some(uid) if !folder_ids.is_empty() => rustyfin_db::repo_playback::get_unplayed_counts(
+            pool,
+            uid,
+            &folder_ids,
+            visible.as_deref(),
+        )
+        .await
+        .unwrap_or_default(),
         _ => std::collections::HashMap::new(),
     };
 
@@ -1104,7 +1163,7 @@ pub(crate) async fn enrich_items_with(
     let folder_counts_map = if folder_ids.is_empty() {
         std::collections::HashMap::new()
     } else {
-        rustyfin_db::repo_media::get_folder_counts_batch(pool, &folder_ids)
+        rustyfin_db::repo_media::get_folder_counts_batch(pool, &folder_ids, visible.as_deref())
             .await
             .unwrap_or_default()
     };
@@ -1289,6 +1348,10 @@ pub(crate) async fn enrich_items_with(
             }
             item.image_tags = tags;
             item.backdrop_image_tags = backdrop_tags;
+            item.primary_image_aspect_ratio = images
+                .iter()
+                .find(|img| img.image_type == rustyfin_model::image::ImageType::Primary)
+                .and_then(|img| primary_aspect_ratio(item.media_type, img));
         }
 
         // ImageBlurHashes: stored values always (lists paint them at once, as Jellyfin's do); an
@@ -1362,6 +1425,10 @@ pub(crate) async fn enrich_items_with(
                     .unwrap_or((0, 0));
                 apply_unplayed_counts(item, counts);
             }
+        } else if user_id.is_some() {
+            // Jellyfin sends every item's UserData for a user; one never played has the defaults.
+            item.user_data =
+                Some(rustyfin_model::playback::UserItemDataDto::default().for_item(item.id));
         }
 
         // Media source count and streams
@@ -1826,12 +1893,13 @@ pub(crate) async fn enrich_items_with(
 
     for item in items.iter_mut() {
         images.apply(item);
+        set_top_level_parent(item);
     }
 }
 
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route("/Items", get(get_items))
+        .route("/Items", get(get_items_for_query_user))
         // DELETE checks the caller itself: a playlist's owner may delete it, as in Jellyfin.
         .route("/Items/{id}", get(get_item).delete(delete_item))
         .route("/Items/{id}/Children", get(get_children))
@@ -2039,6 +2107,12 @@ struct ItemsQuery {
     has_special_feature: Option<bool>,
     #[serde(rename = "hasSpecialFeature")]
     has_special_feature_lower: Option<bool>,
+    has_trailer: Option<bool>,
+    #[serde(rename = "hasTrailer")]
+    has_trailer_lower: Option<bool>,
+    has_theme_video: Option<bool>,
+    #[serde(rename = "hasThemeVideo")]
+    has_theme_video_lower: Option<bool>,
     subtitle_language: Option<String>,
     #[serde(rename = "subtitleLanguage")]
     subtitle_language_lower: Option<String>,
@@ -2291,6 +2365,12 @@ impl ItemsQuery {
     fn has_special_feature(&self) -> Option<bool> {
         self.has_special_feature.or(self.has_special_feature_lower)
     }
+    fn has_trailer(&self) -> Option<bool> {
+        self.has_trailer.or(self.has_trailer_lower)
+    }
+    fn has_theme_video(&self) -> Option<bool> {
+        self.has_theme_video.or(self.has_theme_video_lower)
+    }
     /// The subtitle languages to filter by: Jellyfin's comma list `SubtitleLanguages`, else the
     /// single `SubtitleLanguage` Rustyfin took before. Each code is matched in all its spellings,
     /// so `ger` and `deu` find the same items.
@@ -2336,6 +2416,21 @@ fn parse_ids(value: Option<&str>) -> Vec<Uuid> {
 }
 
 /// The ids of `kept` (all items when `None`) that are also in `ids`.
+/// The hidden items' filter (`HiddenItems::json`: `{"h": [ids], "l": [libraries]}`) that also hides `ids`.
+fn hide_also(hidden: Option<String>, ids: Vec<String>) -> Option<String> {
+    if ids.is_empty() {
+        return hidden;
+    }
+    let mut filter = hidden
+        .and_then(|json| serde_json::from_str::<Value>(&json).ok())
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    let mut all: Vec<Value> = filter["h"].as_array().cloned().unwrap_or_default();
+    all.extend(ids.into_iter().map(Value::String));
+    filter["h"] = Value::Array(all);
+    Some(filter.to_string())
+}
+
 fn narrow_ids(kept: Option<Vec<String>>, ids: Vec<String>) -> Vec<String> {
     match kept {
         Some(kept) => {
@@ -2464,14 +2559,20 @@ async fn get_items(
         return listing.await.map(|r| Json(r).into_response());
     }
 
-    // If IsMovie/IsSeries is set, constrain media_type
-    let constrained_media_types: Option<Vec<String>> = if let Some(true) = query.is_movie() {
-        Some(vec!["\"Movie\"".to_string()])
-    } else if let Some(true) = query.is_series() {
-        Some(vec!["\"Series\"".to_string()])
-    } else {
-        media_types
-    };
+    // IsMovie and IsSeries are Live TV program flags in Jellyfin, and library items are never
+    // programs (as on /Search/Hints): IsMovie=true keeps the list when the include types are
+    // empty or name Movie or Trailer and empties it otherwise, IsSeries=true empties it, and
+    // false filters nothing.
+    let names_movies = media_types.as_ref().is_none_or(|kinds| {
+        kinds.iter().all(|k| k.is_empty())
+            || kinds
+                .iter()
+                .any(|k| k.eq_ignore_ascii_case("Movie") || k.eq_ignore_ascii_case("Trailer"))
+    });
+    if (query.is_movie() == Some(true) && !names_movies) || query.is_series() == Some(true) {
+        return Ok(Json(empty_result()).into_response());
+    }
+    let constrained_media_types = media_types;
 
     // GenreIds and StudioIds keep the items with one of those genres and one of those studios.
     let mut item_ids = rustyfin_db::repo_by_name::item_ids_with(
@@ -2501,8 +2602,27 @@ async fn get_items(
                 .await?;
         item_ids = Some(narrow_ids(item_ids, ids));
     }
+    // HasTrailer, HasSpecialFeature, HasThemeSong and HasThemeVideo: by the item's own extras, the way
+    // LocalTrailerCount and SpecialFeatureCount count them. True keeps only their owners; false leaves the
+    // owners out with the hidden items, so neither reads the ids of the whole library.
+    let mut without: Vec<String> = Vec::new();
+    for (has, types) in [
+        (query.has_trailer(), &["Trailer"][..]),
+        (query.has_special_feature(), SPECIAL_FEATURE_TYPES),
+        (query.has_theme_song(), &["ThemeSong"][..]),
+        (query.has_theme_video(), &["ThemeVideo"][..]),
+    ] {
+        if let Some(has) = has {
+            let ids = rustyfin_db::repo_extras::owners_with_extras(&state.db_ro, types).await?;
+            if has {
+                item_ids = Some(narrow_ids(item_ids, ids));
+            } else {
+                without.extend(ids);
+            }
+        }
+    }
     let hidden = HiddenItems::for_caller(&state, &claims).await?;
-    let hidden_json = hidden.json();
+    let hidden_json = hide_also(hidden.json(), without);
 
     let (items, total) = rustyfin_db::repo_media::get_items_filtered(
         &state.db_ro,
@@ -2691,6 +2811,7 @@ const OPTIONAL_ITEM_FIELDS: &[&str] = &[
     "OriginalTitle",
     "Etag",
     "ScreenshotImageTags",
+    "PrimaryImageAspectRatio",
 ];
 
 /// The answer to a list request that gives Fields empty (Jellyfin's "no optional fields"): each
@@ -2815,6 +2936,17 @@ pub(crate) async fn media_item(
             item
         }
     };
+    // The cached counts are of every child; a user with limits gets those of what they may see.
+    let visible = match item.media_type.is_folder() {
+        true => crate::parental::user_filter(&state.db_ro, Some(user)).await,
+        false => None,
+    };
+    if visible.is_some()
+        && let Ok(counts) =
+            rustyfin_db::repo_media::count_items_by_type(&state.db_ro, id, visible.as_deref()).await
+    {
+        set_folder_counts(&mut item, counts);
+    }
     let folder = is_episode_folder(&item);
     let stored = rustyfin_db::repo_playback::get_user_item_data(&state.db_ro, user, id)
         .await
@@ -2822,13 +2954,19 @@ pub(crate) async fn media_item(
     if let Some(user_data) = stored.or_else(|| folder.then(Default::default)) {
         apply_user_data(&mut item, user_data);
         if folder {
-            let counts = rustyfin_db::repo_playback::get_unplayed_counts(&state.db_ro, user, &[id])
-                .await
-                .unwrap_or_default();
+            let counts = rustyfin_db::repo_playback::get_unplayed_counts(
+                &state.db_ro,
+                user,
+                &[id],
+                visible.as_deref(),
+            )
+            .await
+            .unwrap_or_default();
             let key = id.to_string();
             apply_unplayed_counts(&mut item, counts.get(&key).copied().unwrap_or((0, 0)));
         }
     }
+    item.can_download = super::item_download::can_download(state, user, &item).await;
     Ok(item)
 }
 
@@ -3042,10 +3180,19 @@ async fn delete_item(
             "This user may not delete media.".to_string(),
         ));
     }
+    // The uploaded lyric files of the item and the items under it go with them.
+    let library = rustyfin_db::repo_media::get_item_by_id(&state.db, id)
+        .await?
+        .map(|item| item.library_id);
+    let lyrics = match library {
+        Some(library) => rustyfin_core::lyrics::uploads_in_library(&state.db, library).await,
+        None => Vec::new(),
+    };
     let deleted = rustyfin_db::repo_media::delete_item(&state.db, id).await?;
     if !deleted {
         return Err(ApiError::NotFound("item not found".into()));
     }
+    rustyfin_core::lyrics::remove_orphaned_uploads(&state.db, &lyrics).await;
     // The items under it lose theirs at the image tasks' next run.
     rustyfin_core::trickplay::remove_item_files(&state.data_dir, id).await;
     Ok(Json(json!({ "status": "ok" })).into_response())
@@ -3597,15 +3744,50 @@ async fn get_filters2(
     Ok(Json(json!({ "Genres": genres, "Tags": [] })))
 }
 
-// User-specific item endpoints (same as global for now; user-specific status comes in Phase 2)
-async fn get_user_items(
+/// The claims a list answers for: the user `user_id` names, under `path_user`'s rules, with that
+/// user's administrator flag, so their play state, favourites, filters and access apply, as in
+/// Jellyfin. No user, the nil id or the caller's own id leaves the claims as they are.
+async fn claims_for_user(
+    state: &AppState,
+    claims: Claims,
+    user_id: Option<Uuid>,
+) -> Result<Claims, ApiError> {
+    let Some(user_id) = user_id.filter(|id| !id.is_nil() && *id != claims.sub) else {
+        return Ok(claims);
+    };
+    path_user(state, &claims, user_id).await?;
+    let user = rustyfin_db::repo_user::get_user_by_id(&state.db_ro, user_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("user not found".into()))?;
+    Ok(Claims {
+        sub: user_id,
+        name: user.name,
+        is_admin: user.is_administrator,
+        ..claims
+    })
+}
+
+/// GET /Items, for the user a `userId` names.
+async fn get_items_for_query_user(
     State(state): State<AppState>,
-    Path(_user_id): Path<Uuid>,
-    Query(query): Query<ItemsQuery>,
+    Query(params): Query<Vec<(String, String)>>,
+    query: Query<ItemsQuery>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Response, ApiError> {
-    // Delegate to get_items with the user's claims
-    get_items(State(state), Query(query), Extension(claims)).await
+    let user_id = crate::query::uuid_param(&params, "userId")?;
+    let claims = claims_for_user(&state, claims, user_id).await?;
+    get_items(State(state), query, Extension(claims)).await
+}
+
+/// GET /Users/{userId}/Items, for that user.
+async fn get_user_items(
+    State(state): State<AppState>,
+    Path(user_id): Path<Uuid>,
+    query: Query<ItemsQuery>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Response, ApiError> {
+    let claims = claims_for_user(&state, claims, Some(user_id)).await?;
+    get_items(State(state), query, Extension(claims)).await
 }
 
 async fn get_user_latest(

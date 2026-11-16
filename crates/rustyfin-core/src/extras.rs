@@ -5,7 +5,9 @@
 //! Movies: `<movie>-trailer.mkv`, `trailer.mkv` and the other suffixes next to the movie, `theme.mp3`, and
 //! the files in its extras folders (`trailers/`, `featurettes/`, `extras/`, `theme-music/`, `backdrops/`
 //! and the rest). Shows: the extras folders of a series or season folder, and `theme.mp3` and `trailer.mkv`
-//! in it. A show's `Extras` folder stays its specials season (`naming::is_specials_folder`).
+//! in it; an episode's suffix files (`S01E01-featurette.mkv`) and its episode folder's extras folders. A
+//! show's `Extras` folder holds the series' extras, as in Jellyfin; `Specials` is its season 0. See
+//! [`classify_tv_file`].
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -30,9 +32,11 @@ pub struct FoundExtra {
     pub kind: ExtraKind,
     /// The owner's name that a suffix names (`Movie (2020)` in `Movie (2020)-trailer.mkv`), else empty.
     pub owner_name: String,
-    /// The paths its owner may be stored at, set by the scan from what is on disk: the files of the movie it
-    /// belongs to, or the series or season folder. Empty: it has no owner.
+    /// The paths its owner may be stored at, set by the scan from what is on disk: the files of the movie or
+    /// episode it belongs to, or the series or season folder. Empty: it has no owner.
     pub owner_paths: Vec<PathBuf>,
+    /// Whether it belongs to an episode in `owner_dir` (see [`owning_episode`]) rather than to the folder.
+    pub of_episode: bool,
 }
 
 /// What a file is to a scan.
@@ -80,6 +84,7 @@ fn in_extras_dir(file: &Path, owner_dir: &Path, kind: ExtraKind) -> Classified {
         kind,
         owner_name: String::new(),
         owner_paths: Vec::new(),
+        of_episode: false,
     })
 }
 
@@ -93,6 +98,7 @@ fn by_name(file: &Path, owner_dir: &Path, suffixes: bool) -> Classified {
             kind: ExtraKind::ThemeSong,
             owner_name: String::new(),
             owner_paths: Vec::new(),
+            of_episode: false,
         });
     }
     if !is_video(file) {
@@ -106,6 +112,7 @@ fn by_name(file: &Path, owner_dir: &Path, suffixes: bool) -> Classified {
                 kind,
                 owner_name,
                 owner_paths: Vec::new(),
+                of_episode: false,
             })
         }
         _ => Classified::No,
@@ -133,6 +140,17 @@ pub fn classify_movie_file(file: &Path, root: &Path) -> Classified {
 }
 
 /// What `file`, under the TV library root `root`, is.
+///
+/// - `Show/<extras folder>/x`: the series' extra. Jellyfin never reads a folder named like an extras folder
+///   as a season (`CoreResolutionIgnoreRule`), so `Show/Extras` holds the series' extras, while `Specials`
+///   and `Show Extras` are its specials season.
+/// - `Show/Season 1/<extras folder>/x`: the season's extra.
+/// - `Show/Season 1/<episode folder>/<extras folder>/x`: an extra of the episode in that folder.
+/// - `theme.mp3`, `trailer.mkv` and `sample.mkv` in a series or season folder: the folder's extra.
+/// - `S01E01-featurette.mkv` and the other suffixes, where the name before the suffix reads as an episode
+///   (`naming::parse_episode`), next to the episodes of a series, season or episode folder: an extra of
+///   that episode. The scan finds the episode among the files next to it ([`owning_episode`]) and reads
+///   the file as an episode, as before, when there is none.
 pub fn classify_tv_file(file: &Path, root: &Path) -> Classified {
     let Ok(rel) = file.strip_prefix(root) else {
         return Classified::No;
@@ -148,12 +166,13 @@ pub fn classify_tv_file(file: &Path, root: &Path) -> Classified {
     if n >= 3
         && let Some(kind) = naming::extra_dir_kind(&parts[n - 2])
     {
-        // `Show/Extras` is the specials season.
-        if n == 3 && naming::is_specials_folder(&parts[1], &parts[0]) {
-            return Classified::No;
-        }
-        return match n {
-            3 | 4 => in_extras_dir(file, parent.parent().unwrap_or(root), kind),
+        let owner_dir = parent.parent().unwrap_or(root);
+        return match (n, in_extras_dir(file, owner_dir, kind)) {
+            (3 | 4, found) => found,
+            (5, Classified::Extra(found)) => Classified::Extra(FoundExtra {
+                of_episode: true,
+                ..found
+            }),
             _ => Classified::Skip {
                 owner_dir: parent.to_path_buf(),
             },
@@ -161,9 +180,67 @@ pub fn classify_tv_file(file: &Path, root: &Path) -> Classified {
     }
     // A file directly in a series or season folder.
     if n == 2 || n == 3 {
-        return by_name(file, parent, false);
+        let found = by_name(file, parent, false);
+        if found != Classified::No {
+            return found;
+        }
+    }
+    // An episode's extra by its suffix, in a series, season or episode folder.
+    if (2..=4).contains(&n)
+        && is_video(file)
+        && let Some((kind, owner_name)) = naming::extra_file_kind(file)
+        && naming::parse_episode(owner_name.trim()).is_some()
+    {
+        return Classified::Extra(FoundExtra {
+            path: file.to_path_buf(),
+            owner_dir: parent.to_path_buf(),
+            kind,
+            owner_name,
+            owner_paths: Vec::new(),
+            of_episode: true,
+        });
     }
     Classified::No
+}
+
+/// The episode files among `episodes` (the episode files in `extra.owner_dir`) that the episode extra `extra`
+/// belongs to. A suffix file (`S01E01-featurette.mkv`) belongs to the files whose stem is the name before its
+/// suffix, in any case, else to those with that name's season and episode numbers. A file in an episode
+/// folder's extras folder belongs to the folder's episode: its files, when they are all one episode. Empty
+/// when there is no such episode, or when the name fits several.
+pub fn owning_episode(extra: &FoundExtra, episodes: &[PathBuf]) -> Vec<PathBuf> {
+    let numbers = |file: &PathBuf| {
+        file.file_stem()
+            .and_then(|stem| naming::parse_episode(&stem.to_string_lossy()))
+            .map(|n| (n.season, n.episode))
+    };
+    let name = extra.owner_name.trim();
+    if name.is_empty() {
+        let first = episodes.first().map(numbers);
+        let one = episodes.len() == 1
+            || first.flatten().is_some() && episodes.iter().all(|f| Some(numbers(f)) == first);
+        return if one { episodes.to_vec() } else { Vec::new() };
+    }
+    let lower = name.to_lowercase();
+    let named: Vec<PathBuf> = episodes
+        .iter()
+        .filter(|f| {
+            f.file_stem()
+                .is_some_and(|s| s.to_string_lossy().to_lowercase() == lower)
+        })
+        .cloned()
+        .collect();
+    if !named.is_empty() {
+        return named;
+    }
+    let Some(wanted) = naming::parse_episode(name).map(|n| (n.season, n.episode)) else {
+        return Vec::new();
+    };
+    episodes
+        .iter()
+        .filter(|f| numbers(f) == Some(wanted))
+        .cloned()
+        .collect()
 }
 
 /// The movie that `extra` belongs to among the movies its folder holds on disk (`groups`, as
@@ -234,6 +311,18 @@ pub async fn sync_extras(
         .collect();
     let owners = repo_extras::owners_at(pool, library.id, &owner_paths).await?;
     let stored = repo_extras::items_by_path(pool, library.id, scope).await?;
+    // The stored extras whose file is gone: a new extra file that is one of them renamed or moved takes it
+    // over (`heir_extra`), so it keeps its id and user data. The others are the removal's.
+    let found_paths: HashSet<String> = found
+        .iter()
+        .map(|e| e.path.to_string_lossy().into_owned())
+        .collect();
+    let mut gone: Vec<(&str, &repo_extras::PathRow)> = Vec::new();
+    for (path, row) in &stored {
+        if row.extra_type.is_some() && !found_paths.contains(path) && is_missing(path).await {
+            gone.push((path.as_str(), row));
+        }
+    }
 
     let mut new_items: Vec<(MediaItem, String, &'static str)> = Vec::new();
     // The extras whose owner isn't stored (a show folder whose series or season isn't): warned about once.
@@ -285,6 +374,33 @@ pub async fn sync_extras(
                 }
             }
             (Some(owner), None) => {
+                let stamp = crate::scan_sync::file_stamp(&path);
+                if let Some(at) = heir_extra(&gone, &extra.path, stamp, owner) {
+                    let (old_path, row) = gone.swap_remove(at);
+                    tracing::info!(
+                        "extra {old_path} is now at {path}; it keeps its id and user data"
+                    );
+                    let old_name = Path::new(old_path)
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    repo_extras::move_extra(
+                        pool,
+                        &row.id,
+                        old_path,
+                        &old_name,
+                        &path,
+                        owner,
+                        kind,
+                        media_type.item_kind(),
+                        &name,
+                    )
+                    .await?;
+                    if let Ok(id) = Uuid::parse_str(&row.id) {
+                        plans.push((id, vec![ProbeStep::Primary(path.clone())]));
+                    }
+                    continue;
+                }
                 let item = MediaItem {
                     id: Uuid::new_v4(),
                     name: name.clone(),
@@ -341,6 +457,54 @@ pub async fn sync_extras(
     Ok(plans)
 }
 
+/// Whether nothing is at `path` any more. A file that can't be read for another reason is still there.
+async fn is_missing(path: &str) -> bool {
+    matches!(tokio::fs::metadata(path).await, Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+}
+
+/// The index in `gone` (stored extras whose file is gone, with their old path) of the one that the new extra
+/// file `file`, with the size and modification time `stamp`, of the owner `owner`, is after a rename or a
+/// move: the only one whose source has that stamp and the same kind of media (a rename or move within a
+/// disk keeps both, even to another owner), else the only one of the same owner with the same file name (a
+/// file moved into another extras folder) whose stamp isn't known to differ: a re-downloaded trailer with
+/// the old one's name is a new file and starts with no user data. Main items follow their files the same
+/// way (`scan_sync::takes_over`).
+fn heir_extra(
+    gone: &[(&str, &repo_extras::PathRow)],
+    file: &Path,
+    stamp: Option<(i64, i64)>,
+    owner: &str,
+) -> Option<usize> {
+    let only = |hits: Vec<usize>| match hits[..] {
+        [one] => Some(one),
+        _ => None,
+    };
+    if let Some(stamp) = stamp {
+        let audio = is_audio(file);
+        let hits = (0..gone.len())
+            .filter(|&i| {
+                let (old, row) = gone[i];
+                row.stamp == Some(stamp) && is_audio(Path::new(old)) == audio
+            })
+            .collect();
+        if let Some(one) = only(hits) {
+            return Some(one);
+        }
+    }
+    let name = file.file_name()?;
+    only(
+        (0..gone.len())
+            .filter(|&i| {
+                let (old, row) = gone[i];
+                let differs = matches!((row.stamp, stamp), (Some(was), Some(is)) if was != is);
+                row.owner_id.as_deref() == Some(owner)
+                    && Path::new(old).file_name() == Some(name)
+                    && !differs
+            })
+            .collect(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,6 +516,7 @@ mod tests {
             kind,
             owner_name: owner_name.to_string(),
             owner_paths: Vec::new(),
+            of_episode: false,
         })
     }
 
@@ -486,10 +651,181 @@ mod tests {
             c("/tv/Show/trailer.mkv"),
             extra("/tv/Show/trailer.mkv", "/tv/Show", ExtraKind::Trailer, "")
         );
-        // The specials season, and episodes with suffix-like names, are not extras.
-        assert_eq!(c("/tv/Show/Extras/S00E01.mkv"), Classified::No);
-        assert_eq!(c("/tv/Show/Season 1/Show S01E01-short.mkv"), Classified::No);
         assert_eq!(c("/tv/Show/Season 1/S01E01.mkv"), Classified::No);
+    }
+
+    fn episode_extra(path: &str, owner_dir: &str, kind: ExtraKind, owner_name: &str) -> Classified {
+        match extra(path, owner_dir, kind, owner_name) {
+            Classified::Extra(found) => Classified::Extra(FoundExtra {
+                of_episode: true,
+                ..found
+            }),
+            other => other,
+        }
+    }
+
+    #[test]
+    fn r3extras2_show_extras_folders_and_episode_extras_follow_jellyfin() {
+        let root = Path::new("/tv");
+        let c = |p: &str| classify_tv_file(Path::new(p), root);
+        // `Extras` in a show is its extras folder, as Jellyfin skips it as a season; `Specials` and
+        // `Show Extras` are season 0.
+        assert_eq!(
+            c("/tv/Show/Extras/Making of.mkv"),
+            extra(
+                "/tv/Show/Extras/Making of.mkv",
+                "/tv/Show",
+                ExtraKind::Unknown,
+                ""
+            )
+        );
+        assert_eq!(
+            c("/tv/Show/Behind The Scenes/b.mkv"),
+            extra(
+                "/tv/Show/Behind The Scenes/b.mkv",
+                "/tv/Show",
+                ExtraKind::BehindTheScenes,
+                ""
+            )
+        );
+        assert_eq!(c("/tv/Show/Specials/S00E01.mkv"), Classified::No);
+        assert_eq!(c("/tv/Show/Show Extras/S00E01.mkv"), Classified::No);
+        assert_eq!(
+            c("/tv/Show/Specials/trailers/t.mkv"),
+            extra(
+                "/tv/Show/Specials/trailers/t.mkv",
+                "/tv/Show/Specials",
+                ExtraKind::Trailer,
+                ""
+            )
+        );
+        // An episode's suffix files, in a season, series or episode folder.
+        assert_eq!(
+            c("/tv/Show/Season 1/Show S01E01-short.mkv"),
+            episode_extra(
+                "/tv/Show/Season 1/Show S01E01-short.mkv",
+                "/tv/Show/Season 1",
+                ExtraKind::Short,
+                "Show S01E01"
+            )
+        );
+        assert_eq!(
+            c("/tv/Show/S01E02-featurette.mkv"),
+            episode_extra(
+                "/tv/Show/S01E02-featurette.mkv",
+                "/tv/Show",
+                ExtraKind::Featurette,
+                "S01E02"
+            )
+        );
+        assert_eq!(
+            c("/tv/Show/Season 1/S01E03/S01E03-deleted.mkv"),
+            episode_extra(
+                "/tv/Show/Season 1/S01E03/S01E03-deleted.mkv",
+                "/tv/Show/Season 1/S01E03",
+                ExtraKind::DeletedScene,
+                "S01E03"
+            )
+        );
+        // A suffix whose name is not an episode's stays an episode file.
+        assert_eq!(c("/tv/Show/Season 1/Pilot-short.mkv"), Classified::No);
+        // An episode folder's extras folder.
+        assert_eq!(
+            c("/tv/Show/Season 1/S01E03/featurettes/f.mkv"),
+            episode_extra(
+                "/tv/Show/Season 1/S01E03/featurettes/f.mkv",
+                "/tv/Show/Season 1/S01E03",
+                ExtraKind::Featurette,
+                ""
+            )
+        );
+        assert_eq!(
+            c("/tv/Show/Season 1/S01E03/A/featurettes/f.mkv"),
+            Classified::Skip {
+                owner_dir: PathBuf::from("/tv/Show/Season 1/S01E03/A/featurettes")
+            }
+        );
+    }
+
+    #[test]
+    fn r3extras2_an_episode_extra_goes_to_the_episode_it_names() {
+        let dir = Path::new("/tv/Show/Season 1");
+        let files =
+            |names: &[&str]| -> Vec<PathBuf> { names.iter().map(|n| dir.join(n)).collect() };
+        let found = |name: &str| FoundExtra {
+            path: dir.join("x.mkv"),
+            owner_dir: dir.to_path_buf(),
+            kind: ExtraKind::Featurette,
+            owner_name: name.to_string(),
+            owner_paths: Vec::new(),
+            of_episode: true,
+        };
+        let season = files(&["Show S01E01.mkv", "Show S01E02.mkv"]);
+        // By stem, in any case, else by season and episode numbers.
+        assert_eq!(
+            owning_episode(&found("show s01e01"), &season),
+            files(&["Show S01E01.mkv"])
+        );
+        assert_eq!(
+            owning_episode(&found("S01E02"), &season),
+            files(&["Show S01E02.mkv"])
+        );
+        assert!(owning_episode(&found("S01E03"), &season).is_empty());
+        assert!(owning_episode(&found("S02E01"), &season).is_empty());
+        // An episode folder's extras: its one episode, in all its files, or none among several.
+        assert!(owning_episode(&found(""), &season).is_empty());
+        let one = files(&["S01E03 - part1.mkv", "S01E03 - part2.mkv"]);
+        assert_eq!(owning_episode(&found(""), &one), one);
+        let single = files(&["Pilot.mkv"]);
+        assert_eq!(owning_episode(&found(""), &single), single);
+        assert!(owning_episode(&found(""), &[]).is_empty());
+    }
+
+    #[test]
+    fn r3extras2_a_renamed_or_moved_extra_is_found_by_its_stamp_or_name() {
+        let row = |owner: &str, stamp: Option<(i64, i64)>| repo_extras::PathRow {
+            id: "id".into(),
+            extra_type: Some("Featurette".into()),
+            owner_id: Some(owner.into()),
+            name: "n".into(),
+            stamp,
+        };
+        let a = row("A", Some((100, 7)));
+        let b = row("A", Some((200, 7)));
+        let c = row("B", None);
+        let gone = [
+            ("/m/A/featurettes/one.mkv", &a),
+            ("/m/A/two-featurette.mkv", &b),
+            ("/m/B/extras/three.mkv", &c),
+        ];
+        let heir = |file: &str, stamp, owner| heir_extra(&gone, Path::new(file), stamp, owner);
+        // Renamed: the same size and time, even under another owner.
+        assert_eq!(
+            heir("/m/A/featurettes/uno.mkv", Some((100, 7)), "A"),
+            Some(0)
+        );
+        assert_eq!(heir("/m/C/extras/dos.mkv", Some((200, 7)), "C"), Some(1));
+        // A theme song is never a video's heir.
+        assert_eq!(heir("/m/A/theme.mp3", Some((100, 7)), "A"), None);
+        // Moved into another extras folder of its owner, its old stamp unknown: by its name.
+        assert_eq!(
+            heir("/m/B/featurettes/three.mkv", Some((1, 1)), "B"),
+            Some(2)
+        );
+        assert_eq!(heir("/m/C/three.mkv", None, "C"), None, "another owner");
+        // A new file is no one's heir.
+        assert_eq!(heir("/m/A/featurettes/new.mkv", Some((5, 5)), "A"), None);
+        // A new file with a gone one's name and another modification time (a re-download) is not its heir;
+        // with no stamp on either side, the name is enough.
+        assert_eq!(heir("/m/A/trailers/one.mkv", Some((100, 8)), "A"), None);
+        assert_eq!(heir("/m/A/trailers/one.mkv", None, "A"), Some(0));
+        // Two gone extras with the stamp: neither.
+        let twin = row("A", Some((100, 7)));
+        let gone = [("/m/A/x.mkv", &a), ("/m/A/y.mkv", &twin)];
+        assert_eq!(
+            heir_extra(&gone, Path::new("/m/A/z.mkv"), Some((100, 7)), "A"),
+            None
+        );
     }
 
     #[test]
@@ -505,6 +841,7 @@ mod tests {
             kind: ExtraKind::Short,
             owner_name: name.to_string(),
             owner_paths: Vec::new(),
+            of_episode: false,
         };
         let owner = |groups: &[naming::VersionGroup], name: &str| {
             owning_group(&found(name), groups, false).map(|g| g.title.clone())

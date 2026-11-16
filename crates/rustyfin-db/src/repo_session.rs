@@ -165,6 +165,34 @@ pub async fn session_ids(
     .await
 }
 
+/// The sessions that the token with hash `token_hash` made for other devices than its own, the
+/// least recently active first.
+pub async fn token_sessions(
+    pool: &SqlitePool,
+    token_hash: &str,
+) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT id FROM sessions WHERE via_token = ?1 ORDER BY last_activity ASC, created_at ASC, id ASC",
+    )
+    .bind(token_hash)
+    .fetch_all(pool)
+    .await
+}
+
+/// Records that the token with hash `token_hash` made the session: the session ends with it.
+pub async fn set_session_token(
+    pool: &SqlitePool,
+    session_id: &str,
+    token_hash: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE sessions SET via_token = ?2 WHERE id = ?1")
+        .bind(session_id)
+        .bind(token_hash)
+        .execute_write(pool)
+        .await?;
+    Ok(())
+}
+
 /// The device id of each session `user_id` has, one entry per session.
 pub async fn session_device_ids(
     pool: &SqlitePool,

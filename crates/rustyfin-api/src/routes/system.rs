@@ -410,6 +410,29 @@ fn canonical_fields(body: serde_json::Value) -> serde_json::Value {
     serde_json::Value::Object(out)
 }
 
+/// The configuration `current` with the posted fields `body` (an object) over it, so a POST that
+/// sends only some fields keeps every other setting, the startup wizard's state among them.
+/// Jellyfin Web posts the whole object it fetched, which this leaves as it is. The provider keys
+/// are left out of the stored side: one is set only when the request posts it.
+fn merged_over(
+    current: &ServerConfiguration,
+    body: serde_json::Value,
+) -> Result<serde_json::Value, ApiError> {
+    let mut current = current.clone();
+    current.tmdb_api_key = None;
+    current.omdb_api_key = None;
+    current.fanart_api_key = None;
+    let mut merged = match serde_json::to_value(current) {
+        Ok(serde_json::Value::Object(map)) => map,
+        Ok(_) => serde_json::Map::new(),
+        Err(e) => return Err(ApiError::Internal(e.to_string())),
+    };
+    if let serde_json::Value::Object(posted) = body {
+        merged.extend(posted);
+    }
+    Ok(serde_json::Value::Object(merged))
+}
+
 /// Drops the fields that `configuration_json` works out on each GET, so a client that posts the
 /// whole configuration back doesn't store them, and sets this build's config version.
 fn drop_computed_fields(config: &mut ServerConfiguration) {
@@ -490,7 +513,18 @@ async fn update_configuration(
     State(state): State<AppState>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<StatusCode, ApiError> {
-    let mut new_config: ServerConfiguration = serde_json::from_value(canonical_fields(body))
+    let body = canonical_fields(body);
+    if !body.is_object() {
+        return Err(ApiError::BadRequest(
+            "configuration: the body must be a JSON object".to_string(),
+        ));
+    }
+    // One save at a time: the write lock is held from the merge through the save and the
+    // assignment, so two saves never merge over the same configuration, memory and disk hold the
+    // same one, and a SIGHUP reload (which takes it too) never puts an older file back.
+    let mut config = state.config.write().await;
+    let merged = merged_over(&config, body)?;
+    let mut new_config: ServerConfiguration = serde_json::from_value(merged)
         .map_err(|e| ApiError::BadRequest(format!("configuration: {e}")))?;
     drop_computed_fields(&mut new_config);
     ensure_config_size("configuration", &new_config)?;
@@ -502,24 +536,20 @@ async fn update_configuration(
     apply_posted_provider_keys(&state, &mut new_config).await?;
 
     // A key field the request left out keeps its in-memory value: a key still waiting to be saved.
-    {
-        let current = state.config.read().await;
-        if !posted[0] {
-            new_config.tmdb_api_key = current.tmdb_api_key.clone();
-        }
-        if !posted[1] {
-            new_config.omdb_api_key = current.omdb_api_key.clone();
-        }
-        if !posted[2] {
-            new_config.fanart_api_key = current.fanart_api_key.clone();
-        }
+    if !posted[0] {
+        new_config.tmdb_api_key = config.tmdb_api_key.clone();
+    }
+    if !posted[1] {
+        new_config.omdb_api_key = config.omdb_api_key.clone();
+    }
+    if !posted[2] {
+        new_config.fanart_api_key = config.fanart_api_key.clone();
     }
 
     // Persist to disk
     save_config_file(state.data_dir.join("config.json"), new_config.clone()).await?;
 
     // Update in-memory. Other sort rules make the stored sort names again, in the background.
-    let mut config = state.config.write().await;
     let sort_rules_changed = config.sort_rules() != new_config.sort_rules();
     *config = new_config;
     if sort_rules_changed {
@@ -1107,10 +1137,10 @@ async fn update_configuration_by_key(
         tracing::info!("configuration key updated: {}", key);
         return Ok(StatusCode::NO_CONTENT);
     }
-    // Start from the current config. The read lock is released before the keys are saved.
-    let current = state.config.read().await;
-    let json = serde_json::to_value(&*current).map_err(|e| ApiError::Internal(e.to_string()))?;
-    drop(current);
+    // Start from the current config. The write lock is held through the save, as in
+    // `update_configuration`, so saves never overlap.
+    let mut config = state.config.write().await;
+    let json = serde_json::to_value(&*config).map_err(|e| ApiError::Internal(e.to_string()))?;
 
     // Merge the body into the config at the specified key path, the known field it names
     // without case.
@@ -1127,7 +1157,8 @@ async fn update_configuration_by_key(
     // stored. A failed save returns here, before the config is written.
     apply_posted_provider_keys(&state, &mut new_config).await?;
 
-    let mut config = state.config.write().await;
+    // Persist to disk, then update in memory
+    save_config_file(state.data_dir.join("config.json"), new_config.clone()).await?;
     *config = new_config;
     state
         .task_scheduler
@@ -1142,10 +1173,6 @@ async fn update_configuration_by_key(
             config.library_monitor_poll_interval.max(1),
         )));
     drop(config);
-
-    // Persist to disk
-    let config = state.config.read().await.clone();
-    save_config_file(state.data_dir.join("config.json"), config).await?;
 
     tracing::info!("configuration key updated: {}", key);
     Ok(StatusCode::NO_CONTENT)

@@ -47,6 +47,8 @@ function sandbox(active = null) {
         togglePlaybackStats: () => {},
         closePlayerSettings: () => calls.push('close menus'),
         setMediaSessionHandler: () => {},
+        setLyricsTrack: () => {},
+        highlightLyrics: () => {},
     });
     vm.runInContext(`${['function episodeNumberLabel(', 'function itemPicture(', 'function itemArtist(', 'function updateNowPlaying(',
         'function updateNowPlayingProgress(', 'function openFullPlayer(', 'function stopNowPlaying(', 'function endNowPlaying(', 'function onPlayerClosed(',

@@ -1079,7 +1079,10 @@ async fn head_file(file_path: &str) -> Result<Response, ApiError> {
 
 /// Serves the file at `file_path` for a request with `headers`: the whole file, or the byte range,
 /// 304 or 416 that the headers ask for.
-async fn serve_file(file_path: String, headers: &HeaderMap) -> Result<Response, ApiError> {
+pub(crate) async fn serve_file(
+    file_path: String,
+    headers: &HeaderMap,
+) -> Result<Response, ApiError> {
     let content_type = mime_from_path(&file_path);
 
     // Open file first, then get metadata from the file handle — avoids a separate stat() syscall
@@ -1874,7 +1877,8 @@ fn client_takes_h264_video(
 }
 
 /// The audio and subtitle choices `user` last made for `item`, each where the user keeps
-/// Jellyfin's RememberAudioSelections and RememberSubtitleSelections on.
+/// Jellyfin's RememberAudioSelections and RememberSubtitleSelections on. As in Jellyfin, a
+/// remembered subtitle is not offered while the user's SubtitleMode is None.
 pub(crate) async fn remembered_choices(
     state: &AppState,
     user: Uuid,
@@ -1887,9 +1891,10 @@ pub(crate) async fn remembered_choices(
         .map(|user| rustyfin_model::user::jellyfin_configuration(&user.configuration))
         .unwrap_or_default();
     let remembers = |key: &str| config.get(key).and_then(|v| v.as_bool()) != Some(false);
+    let subtitles_off = config.get("SubtitleMode").and_then(|v| v.as_str()) == Some("None");
     Ok((
         audio.filter(|_| remembers("RememberAudioSelections")),
-        subtitle.filter(|_| remembers("RememberSubtitleSelections")),
+        subtitle.filter(|_| remembers("RememberSubtitleSelections") && !subtitles_off),
     ))
 }
 
