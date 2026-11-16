@@ -1,5 +1,6 @@
 mod activity;
 mod additional;
+mod additional_parts;
 mod auth;
 mod backup;
 mod branding;
@@ -160,6 +161,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(shows::routes())
         .merge(live_tv::routes())
         .merge(additional::routes())
+        .merge(additional_parts::routes())
         .merge(media_segments::routes())
         .merge(trickplay::routes())
         .merge(

@@ -214,7 +214,7 @@ pub async fn extra_counts(
     let rows: Vec<(String, i64, i64)> = sqlx::query_as(
         "SELECT owner_id,
                 SUM(extra_type = 'Trailer'),
-                SUM(extra_type NOT IN ('Trailer', 'ThemeSong', 'ThemeVideo'))
+                SUM(extra_type NOT IN ('Trailer', 'ThemeSong', 'ThemeVideo', 'Part'))
          FROM media_items
          WHERE owner_id IN (SELECT value FROM json_each(?1))
          GROUP BY owner_id",
@@ -226,6 +226,16 @@ pub async fn extra_counts(
         .into_iter()
         .map(|(owner, trailers, specials)| (owner, (trailers as i32, specials as i32)))
         .collect())
+}
+
+/// How many parts after its first a movie split into files has (extras of type `Part`).
+pub async fn additional_part_count(pool: &SqlitePool, owner: Uuid) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_items WHERE owner_id = ?1 AND extra_type = 'Part'",
+    )
+    .bind(owner.to_string())
+    .fetch_one(pool)
+    .await
 }
 
 /// The owner of the extra `id`, if it is one.

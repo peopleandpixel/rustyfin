@@ -1084,6 +1084,26 @@ async fn scan_flat_library(
     // it doesn't name) is a movie file like any other, and a stored extra there becomes a movie again,
     // keeping its id.
     let is_root = |folder: &Path| library.paths.iter().any(|p| Path::new(p) == folder);
+    // A movie split into files (`movie-cd1.mkv`, `movie-cd2.mkv`) is one movie at its part 1, as in
+    // Jellyfin's StackResolver; the later parts are stored as its parts (`ExtraKind::Part`).
+    let mut part_extras: Vec<extras::FoundExtra> = Vec::new();
+    let mut stack_names: HashMap<PathBuf, String> = HashMap::new();
+    if reads_extras {
+        for (folder, files) in movie_files.iter_mut() {
+            for stack in naming::video_stacks(files) {
+                let (first, rest) = stack.files.split_first().expect("a stack has parts");
+                files.retain(|file| !rest.contains(file));
+                part_extras.extend(rest.iter().map(|part| extras::FoundExtra {
+                    path: part.clone(),
+                    owner_dir: folder.clone(),
+                    kind: naming::ExtraKind::Part,
+                    owner_name: String::new(),
+                    owner_paths: vec![first.clone()],
+                }));
+                stack_names.insert(first.clone(), stack.name);
+            }
+        }
+    }
     let folder_groups: HashMap<PathBuf, Vec<naming::VersionGroup>> = movie_files
         .iter()
         .map(|(folder, files)| {
@@ -1127,7 +1147,8 @@ async fn scan_flat_library(
                 .push(file);
         }
     }
-    let found_extras = owned_extras;
+    let mut found_extras = owned_extras;
+    found_extras.append(&mut part_extras);
     // A failure here stops the scan: the reconcile would otherwise add a second movie at the same path.
     rustyfin_db::repo_extras::release_extras(pool, library.id, &released, "Movie").await?;
 
@@ -1138,7 +1159,18 @@ async fn scan_flat_library(
             .paths
             .iter()
             .any(|p| Path::new(p) == folder.as_path());
-        movie_groups.extend(naming::group_movie_files(folder, files, is_library_root));
+        let mut groups = naming::group_movie_files(folder, files, is_library_root);
+        // In a library root the title comes from the file: a stacked movie's from its stack's name.
+        if is_library_root {
+            for group in &mut groups {
+                if let Some(name) = stack_names.get(&group.files[0]) {
+                    let clean = naming::clean_name(name);
+                    group.title = clean.title;
+                    group.year = clean.year.or(group.year);
+                }
+            }
+        }
+        movie_groups.extend(groups);
     }
     // The items whose file is gone are read first: a group with no owner may take one over.
     let gone =
