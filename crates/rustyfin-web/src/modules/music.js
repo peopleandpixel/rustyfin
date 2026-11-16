@@ -211,9 +211,9 @@ function appendMusicItems(container, libId, tab, items) {
     }
 }
 
-// The Suggestions tab's sections, as Jellyfin Web's music suggestions: the latest songs (grouped into albums by
-// the server), the songs played recently and most often, and a random pick of albums. Each is a request on the
-// user's items; no user, no suggestions.
+// The Suggestions tab's sections, as Jellyfin Web's music suggestions: the albums added last, the songs played
+// recently and most often, and a random pick of albums. Each is a request on the user's items; no user, no
+// suggestions.
 const SUGGESTION_LIMIT = 16;
 function suggestionSections(libId, userId) {
     if (!userId) return [];
@@ -223,7 +223,7 @@ function suggestionSections(libId, userId) {
     return [
         {
             key: 'latest', title: 'music.suggestions_latest',
-            url: `${user}/Items/Latest?${new URLSearchParams({ ParentId: libId, IncludeItemTypes: 'Audio', Limit: SUGGESTION_LIMIT, Fields: common.Fields })}`,
+            url: `${user}/Items?${new URLSearchParams({ ...common, IncludeItemTypes: 'MusicAlbum', SortBy: 'DateCreated', SortOrder: 'Descending' })}`,
         },
         { key: 'recent', title: 'music.suggestions_recent', url: `${user}/Items?${new URLSearchParams({ ...played, SortBy: 'DatePlayed' })}` },
         { key: 'frequent', title: 'music.suggestions_frequent', url: `${user}/Items?${new URLSearchParams({ ...played, SortBy: 'PlayCount' })}` },

@@ -77,9 +77,10 @@ test('the four suggestion requests are built on the user items, in order', () =>
     ]);
     const [latest, recent, frequent, random] = sections.map(s => s.url);
 
-    assert.match(latest, /^\/Users\/u1\/Items\/Latest\?/);
+    assert.match(latest, /^\/Users\/u1\/Items\?/);
     assert.deepEqual(params(latest), {
-        ParentId: 'lib1', IncludeItemTypes: 'Audio', Limit: '16', Fields: 'PrimaryImageAspectRatio',
+        ParentId: 'lib1', Recursive: 'true', Limit: '16', Fields: 'PrimaryImageAspectRatio', IncludeItemTypes: 'MusicAlbum',
+        SortBy: 'DateCreated', SortOrder: 'Descending',
     });
 
     for (const [url, sortBy] of [[recent, 'DatePlayed'], [frequent, 'PlayCount']]) {
@@ -104,7 +105,6 @@ test('no user, no suggestions', () => {
 
 test('the sections are drawn in order, an empty or failed one left out', async () => {
     const answers = {
-        '/Users/u1/Items/Latest?': [{ Id: 'a' }],
         '/Users/u1/Items?ParentId=lib1&Recursive=true&Limit=16&Fields=PrimaryImageAspectRatio&IncludeItemTypes=Audio&Filters=IsPlayed&SortOrder=Descending&SortBy=DatePlayed': { Items: [] },
     };
     const api = {
@@ -114,6 +114,7 @@ test('the sections are drawn in order, an empty or failed one left out', async (
             const hit = Object.keys(answers).find(key => url.startsWith(key));
             if (hit) return answers[hit];
             if (url.includes('SortBy=PlayCount')) return { Items: [{ Id: 'b' }, { Id: 'c' }] };
+            if (url.includes('SortBy=DateCreated')) return { Items: [{ Id: 'a' }] };
             throw new Error('offline');
         },
     };
