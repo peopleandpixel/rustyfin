@@ -1,93 +1,21 @@
-// Photo libraries: their folders browsed in place (library/<id>/folder/<path>), the full-screen
-// photo viewer (zoom, pan, swipe, the EXIF panel) and the slideshow. Rustyfin keeps a photo
-// library's files without folder items, so its folders come from the items' paths.
+// Photo libraries: their folders browsed in place (library/<id>/folder/<folder id>, as a mixed
+// library's), the full-screen photo viewer (zoom, pan, swipe, the EXIF panel) and the slideshow.
+// A folder is the server's Folder item: its photos, videos and subfolders are its children
+// (ParentId), and its breadcrumbs are its ancestors.
 import { $, icon, toast, escapeHtml } from './util.js';
 import { playItem } from './player.js';
 
-// The folder tree of one library, built once per visit of the library
-let photoTree = null; // { libId, session, promise }
 // The selection mode of the open folder: the ids picked for a slideshow
 let photoSelection = null;
 
-// The item types a photo library lists: photos, and home videos that play in the player
-const PHOTO_LIBRARY_TYPES = 'Photo,Video';
 const PHOTO_PAGE = 500;
+const PHOTO_FIELDS = 'PrimaryImageAspectRatio,SortName';
 
-// The folder that holds `path`, relative to the library path it is under ('' at the top); null
-// when it is under none of `roots`
-function relativeFolder(path, roots) {
-    const file = String(path || '').replace(/\\/g, '/');
-    for (const root of roots) {
-        const base = String(root).replace(/\\/g, '/').replace(/\/+$/, '');
-        if (base && file.startsWith(base + '/')) {
-            const rest = file.slice(base.length + 1);
-            const cut = rest.lastIndexOf('/');
-            return cut < 0 ? '' : rest.slice(0, cut);
-        }
-    }
-    return null;
-}
-
-// The library paths: an administrator's library lists them; otherwise the deepest folder that
-// holds every item (one folder holding everything then shows as the top)
-function libraryRoots(lib, items) {
-    const paths = lib?.paths || lib?.Paths || lib?.Locations || [];
-    if (paths.length) return paths;
-    const dirs = items.map(i => String(i.Path || '').replace(/\\/g, '/').split('/').slice(0, -1));
-    if (!dirs.length) return [];
-    let common = dirs[0];
-    for (const dir of dirs) {
-        let n = 0;
-        while (n < common.length && n < dir.length && common[n] === dir[n]) n++;
-        common = common.slice(0, n);
-    }
-    return [common.join('/')];
-}
-
-// Jellyfin's SortName order, with numbers compared as numbers (its AlphanumericComparator)
-const byName = (a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' });
-const itemSortName = item => item.SortName || item.Name || '';
-
-// Each folder's subfolders and items: Map(folder path -> { folders: [name], items: [item] }),
-// each list in Jellyfin's IsFolder,SortName order (folders first, then by sort name)
-function photoFolderTree(items, roots) {
-    const tree = new Map();
-    const node = path => {
-        if (!tree.has(path)) tree.set(path, { folders: new Set(), items: [] });
-        return tree.get(path);
-    };
-    node('');
-    for (const item of items) {
-        const folder = relativeFolder(item.Path, roots);
-        if (folder == null) continue;
-        node(folder).items.push(item);
-        const parts = folder ? folder.split('/') : [];
-        for (let i = 0; i < parts.length; i++) {
-            node(parts.slice(0, i).join('/')).folders.add(parts[i]);
-        }
-    }
-    for (const entry of tree.values()) {
-        entry.folders = [...entry.folders].sort(byName);
-        entry.items.sort((a, b) => byName(itemSortName(a), itemSortName(b)));
-    }
-    return tree;
-}
-
-// The photos of a folder and every folder under it, in the tree's order
-function photosUnder(tree, folder) {
-    const entry = tree.get(folder);
-    if (!entry) return [];
-    const own = entry.items.filter(i => i.Type === 'Photo' || i.MediaType === 'Photo');
-    return own.concat(...entry.folders.map(name => photosUnder(tree, folder ? `${folder}/${name}` : name)));
-}
-
-async function fetchLibraryItems(libId) {
+// Every item a query lists, read PHOTO_PAGE at a time
+async function fetchAll(params) {
     const items = [];
     for (let start = 0; ; start += PHOTO_PAGE) {
-        const q = new URLSearchParams({
-            ParentId: libId, Recursive: 'true', IncludeItemTypes: PHOTO_LIBRARY_TYPES,
-            Fields: 'Path,PrimaryImageAspectRatio,SortName', SortBy: 'SortName', StartIndex: String(start), Limit: String(PHOTO_PAGE),
-        });
+        const q = new URLSearchParams({ ...params, Fields: PHOTO_FIELDS, StartIndex: String(start), Limit: String(PHOTO_PAGE) });
         const page = await API.get(`/Items?${q}`);
         const batch = page.Items || [];
         items.push(...batch);
@@ -95,49 +23,56 @@ async function fetchLibraryItems(libId) {
     }
 }
 
-function loadPhotoTree(lib, libId) {
-    if (photoTree?.libId === libId && photoTree.session === API.token) return photoTree.promise;
-    const promise = fetchLibraryItems(libId).then(items => {
-        const roots = libraryRoots(lib, items);
-        return { tree: photoFolderTree(items, roots) };
-    });
-    photoTree = { libId, session: API.token, promise };
-    promise.catch(() => { if (photoTree?.promise === promise) photoTree = null; });
-    return promise;
+// A folder's own items, as Jellyfin Web lists a folder: subfolders first, then by sort name
+function folderItems(parentId) {
+    return fetchAll({ ParentId: parentId, SortBy: 'IsFolder,SortName', SortOrder: 'Ascending' });
 }
 
-// A folder's route: library/<id>/folder/<each part encoded>
-function folderRoute(libId, folder) {
-    return folder ? `${libId}/folder/${folder.split('/').map(encodeURIComponent).join('/')}` : libId;
+// The photos in a folder and every folder under it, by sort name, for a slideshow
+function photosUnder(parentId) {
+    return fetchAll({ ParentId: parentId, Recursive: 'true', IncludeItemTypes: 'Photo', SortBy: 'SortName', SortOrder: 'Ascending' });
 }
 
-function folderFromRoute(parts) {
-    return parts.map(p => { try { return decodeURIComponent(p); } catch { return p; } }).join('/');
+// A folder's way down from the library: the folders above it, top first, then itself. Its
+// ancestors run up to the library's own folder, where the list stops.
+async function folderTrail(libId, folderId) {
+    const [folder, ancestors] = await Promise.all([
+        API.get(`/Items/${encodeURIComponent(folderId)}`),
+        API.get(`/Items/${encodeURIComponent(folderId)}/Ancestors`).catch(() => []),
+    ]);
+    const above = [];
+    for (const a of ancestors || []) {
+        if (a.Id === libId || a.Type === 'CollectionFolder' || a.Type === 'UserRootFolder') break;
+        above.unshift({ id: a.Id, name: a.Name || '' });
+    }
+    return [...above, { id: folderId, name: folder?.Name || '' }];
 }
 
-function breadcrumbsHtml(libId, libName, folder) {
-    const parts = folder ? folder.split('/') : [];
+// A folder's route: library/<library id>/folder/<folder id>; the library's top is library/<id>
+function folderRoute(libId, folderId) {
+    return folderId ? `${libId}/folder/${folderId}` : libId;
+}
+
+function breadcrumbsHtml(libId, libName, trail) {
     const crumbs = [{ name: libName, route: folderRoute(libId, '') }]
-        .concat(parts.map((name, i) => ({ name, route: folderRoute(libId, parts.slice(0, i + 1).join('/')) })));
+        .concat(trail.map(f => ({ name: f.name, route: folderRoute(libId, f.id) })));
     return crumbs.map((c, i) => i === crumbs.length - 1
         ? `<span class="text-white font-extrabold" aria-current="page">${escapeHtml(c.name)}</span>`
         : `<button type="button" class="text-white/60 hover:text-white" data-action="navigate" data-page="library" data-id="${escapeHtml(c.route)}">${escapeHtml(c.name)}</button><span class="text-white/30">/</span>`).join('');
 }
 
-function folderCardHtml(libId, folder, name, cover) {
-    const img = cover ? `<img alt="" loading="lazy" decoding="async" class="absolute inset-0 w-full h-full object-cover opacity-60" src="${escapeHtml(API.imageUrl(cover.Id, 'Primary', { maxHeight: 360, tag: cover.ImageTags?.Primary }))}">` : '';
-    const path = folder ? `${folder}/${name}` : name;
+function folderCardHtml(libId, folder) {
     return `
-    <div class="jf-card group rf-photo-card" data-action="navigate" data-page="library" data-id="${escapeHtml(folderRoute(libId, path))}" data-type="Folder" tabindex="0" role="link">
-        <div class="jf-poster-backdrop relative bg-white/5">${img}
-            <div class="absolute inset-0 flex items-center justify-center text-white/80">${icon('Folder', { size: 40 })}</div>
+    <div class="jf-card group rf-photo-card" data-action="navigate" data-page="library" data-id="${escapeHtml(folderRoute(libId, folder.Id))}" data-type="Folder" tabindex="0" role="link">
+        <div class="jf-poster-backdrop relative bg-white/5">
+            <div class="absolute inset-0 flex items-center justify-center text-white/70">${icon('Folder', { size: 40 })}</div>
         </div>
-        <div class="p-3"><p class="text-sm font-semibold truncate text-white" title="${escapeHtml(name)}">${escapeHtml(name)}</p></div>
+        <div class="p-3"><p class="text-sm font-semibold truncate text-white" title="${escapeHtml(folder.Name || '')}">${escapeHtml(folder.Name || '')}</p></div>
     </div>`;
 }
 
 function photoCardHtml(item, index) {
-    const isVideo = item.Type === 'Video';
+    const isVideo = item.Type !== 'Photo';
     const tag = item.ImageTags?.Primary;
     const img = tag ? `<img alt="${escapeHtml(item.Name || '')}" loading="lazy" decoding="async" class="absolute inset-0 w-full h-full object-cover" src="${escapeHtml(API.imageUrl(item.Id, 'Primary', { maxHeight: 360, tag }))}">` : '';
     const selected = photoSelection?.has(item.Id);
@@ -153,42 +88,43 @@ function photoCardHtml(item, index) {
 }
 
 // What the open folder shows, for its click handlers
-let openFolder = null; // { libId, folder, entry, tree }
+let openFolder = null; // { lib, libId, folderId, folders, files }
 
-// Draws a photo library's folder: its subfolders, then its photos and videos
-async function renderPhotoLibrary(lib, libId, folderParts = []) {
+// Draws a photo library's folder (folderId; the library's top when empty): its subfolders, then
+// its photos and videos
+async function renderPhotoLibrary(lib, libId, folderId = '') {
     const session = API.token;
     const page = $('page-library');
     const libName = lib?.name || lib?.Name || t('common.library');
-    const folder = folderFromRoute(folderParts);
-    if (openFolder?.libId !== libId || openFolder?.folder !== folder) photoSelection = null;
+    if (openFolder?.libId !== libId || openFolder?.folderId !== folderId) photoSelection = null;
     page.innerHTML = `<div class="jf-page"><div class="flex justify-center py-24"><div class="w-10 h-10 border-3 border-[#00a4dc] border-t-transparent rounded-full animate-spin"></div></div></div>`;
-    let tree;
+    let items;
+    let trail = [];
     try {
-        ({ tree } = await loadPhotoTree(lib, libId));
+        [items, trail] = await Promise.all([
+            folderItems(folderId || libId),
+            folderId ? folderTrail(libId, folderId) : [],
+        ]);
     } catch (err) {
         if (API.token !== session) return;
         page.innerHTML = `<div class="p-10 text-center text-red-400 jf-page">${escapeHtml(err.message)}</div>`;
         return;
     }
-    if (API.token !== session || !location.hash.includes(libId)) return;
-    const entry = tree.get(folder) || { folders: [], items: [] };
-    openFolder = { libId, folder, entry, tree };
-    const hasPhotos = photosUnder(tree, folder).length > 0;
-    const folderCards = entry.folders.map(name => {
-        const sub = folder ? `${folder}/${name}` : name;
-        return folderCardHtml(libId, folder, name, photosUnder(tree, sub)[0]);
-    }).join('');
-    const itemCards = entry.items.map((item, i) => photoCardHtml(item, i)).join('');
+    if (API.token !== session || !location.hash.includes(folderRoute(libId, folderId))) return;
+    const folders = items.filter(i => i.IsFolder);
+    const files = items.filter(i => !i.IsFolder);
+    openFolder = { lib, libId, folderId, folders, files };
+    const hasPhotos = files.some(i => i.Type === 'Photo') || folders.length > 0;
     const btn = (action, iconName, label, extra = '') => `<button type="button" class="jf-btn-secondary !py-2 inline-flex items-center gap-2" data-action="${action}" ${extra}>${icon(iconName, { size: 16 })}<span>${label}</span></button>`;
+    const cards = folders.map(f => folderCardHtml(libId, f)).join('') + files.map((item, i) => photoCardHtml(item, i)).join('');
     page.innerHTML = `
     <div class="jf-page">
         <div class="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-6 pb-4 border-b border-white/10">
             <div>
                 <nav class="flex flex-wrap items-center gap-2 text-xl lg:text-2xl" aria-label="${escapeHtml(t('photos.breadcrumbs'))}">
-                    <span class="inline-flex">${icon('Images', { size: 26 })}</span>${breadcrumbsHtml(libId, libName, folder)}
+                    <span class="inline-flex">${icon('Images', { size: 26 })}</span>${breadcrumbsHtml(libId, libName, trail)}
                 </nav>
-                <p class="text-xs text-white/40 mt-1">${t('photos.counts', { folders: entry.folders.length, items: entry.items.length })}</p>
+                <p class="text-xs text-white/40 mt-1">${t('photos.counts', { folders: folders.length, items: files.length })}</p>
             </div>
             ${hasPhotos ? `<div class="flex flex-wrap gap-2">
                 ${btn('photo-slideshow', 'Play', t('photos.slideshow'))}
@@ -196,7 +132,7 @@ async function renderPhotoLibrary(lib, libId, folderParts = []) {
                 ${btn('photo-select', 'Check', photoSelection ? t('photos.select_done', { n: photoSelection.size }) : t('photos.select'), `aria-pressed="${!!photoSelection}"`)}
             </div>` : ''}
         </div>
-        ${folderCards || itemCards ? `<div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-4" id="photo-grid">${folderCards}${itemCards}</div>`
+        ${cards ? `<div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-4" id="photo-grid">${cards}</div>`
             : `<p class="text-white/50 text-center py-16">${t('photos.empty')}</p>`}
     </div>`;
 }
@@ -204,51 +140,56 @@ async function renderPhotoLibrary(lib, libId, folderParts = []) {
 // A photo card: picks it in selection mode, plays a video, else opens the viewer at it
 function openPhotoCard(el) {
     if (!openFolder) return;
-    const item = openFolder.entry.items[Number(el.dataset.index)];
+    const index = Number(el.dataset.index);
+    const item = openFolder.files[index];
     if (!item) return;
     if (photoSelection) {
         if (photoSelection.has(item.Id)) photoSelection.delete(item.Id);
         else photoSelection.add(item.Id);
-        el.outerHTML = photoCardHtml(item, Number(el.dataset.index));
+        el.outerHTML = photoCardHtml(item, index);
         const button = document.querySelector('[data-action="photo-select"] span');
         if (button) button.textContent = t('photos.select_done', { n: photoSelection.size });
         return;
     }
-    if (item.Type === 'Video') {
+    if (item.Type !== 'Photo') {
         playItem(item.Id, 'Videos', item.Name || '');
         return;
     }
-    const photos = openFolder.entry.items.filter(i => i.Type === 'Photo');
+    const photos = openFolder.files.filter(i => i.Type === 'Photo');
     openPhotoViewer(photos, Math.max(0, photos.indexOf(item)));
 }
 
 function togglePhotoSelection() {
     photoSelection = photoSelection ? null : new Set();
-    if (openFolder) navigateRedraw();
-}
-
-function navigateRedraw() {
-    const lib = (window.libraries || []).find(l => (l.id || l.Id) === openFolder.libId);
-    const parts = openFolder.folder ? openFolder.folder.split('/') : [];
-    renderPhotoLibrary(lib, openFolder.libId, parts.map(encodeURIComponent));
+    if (openFolder) renderPhotoLibrary(openFolder.lib, openFolder.libId, openFolder.folderId);
 }
 
 // The slideshow of the picked photos, else of every photo in and under the open folder
-function startFolderSlideshow(el) {
+async function startFolderSlideshow(el) {
     if (!openFolder) return;
-    const all = photosUnder(openFolder.tree, openFolder.folder);
-    const picked = photoSelection?.size ? all.filter(i => photoSelection.has(i.Id)) : all;
-    if (!picked.length) {
+    const shuffle = el.dataset.shuffle === 'true';
+    let photos;
+    if (photoSelection?.size) {
+        photos = openFolder.files.filter(i => photoSelection.has(i.Id));
+    } else {
+        try {
+            photos = await photosUnder(openFolder.folderId || openFolder.libId);
+        } catch (err) {
+            toast(err.message, 'error');
+            return;
+        }
+    }
+    if (!photos.length) {
         toast(t('photos.empty'), 'error');
         return;
     }
-    openPhotoViewer(picked, 0, { play: true, shuffle: el.dataset.shuffle === 'true' });
+    openPhotoViewer(photos, 0, { play: true, shuffle });
 }
 
 // A photo shown outside a photo library (search, home rows, a detail page): the viewer, with the
 // other photo cards beside it on the page
 async function openPhotoItem(id, el = null) {
-    const cards = el?.closest('.grid, .jf-row, [class*="overflow-x"]')?.querySelectorAll('[data-type="Photo"][data-id]');
+    const cards = el?.closest('.grid, .jf-scroll-row')?.querySelectorAll('[data-type="Photo"][data-id]');
     const ids = cards?.length ? [...new Set([...cards].map(c => c.dataset.id))] : [id];
     try {
         const items = await Promise.all(ids.map(i => API.getItem(i)));
@@ -447,7 +388,8 @@ function bindViewerGestures(el) {
     }, { passive: false });
     stage.addEventListener('dblclick', e => zoomTo(viewer.zoom > 1 ? 1 : 2.5, ...stagePoint(stage, e)));
     stage.addEventListener('pointerdown', e => {
-        stage.setPointerCapture?.(e.pointerId);
+        // Capture keeps a drag that leaves the stage; a pointer the browser no longer tracks throws
+        try { stage.setPointerCapture?.(e.pointerId); } catch {}
         viewer.pointers.set(e.pointerId, [e.clientX, e.clientY]);
         if (viewer.pointers.size === 2) {
             const [a, b] = [...viewer.pointers.values()];
@@ -571,6 +513,6 @@ const photoActions = {
 };
 
 export {
-    renderPhotoLibrary, openPhotoViewer, closePhotoViewer, openPhotoItem, photoActions, photoFolderTree, photosUnder,
-    relativeFolder, libraryRoots, viewingOrder, photoInfoRows, folderRoute,
+    renderPhotoLibrary, openPhotoViewer, closePhotoViewer, openPhotoItem, photoActions, photosUnder, folderTrail,
+    viewingOrder, photoInfoRows, folderRoute,
 };

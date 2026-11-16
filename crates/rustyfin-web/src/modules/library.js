@@ -638,11 +638,11 @@ async function renderLibrary(route) {
     const contentType = lib?.content_type || lib?.Content_type || lib?.ContentType || '';
     const libIcon = contentType === 'Movies' ? 'Film' : contentType === 'TvShows' ? 'Tv' : contentType === 'Music' ? 'Music' : 'Folder';
     const headerIcon = { Movies: 'Film', TvShows: 'Tv', Music: 'Music' }[lib?.content_type] || 'Folder';
-    // A photo library browses its folders in place: library/<id>/folder/<path> (photos.js)
+    // A photo library browses its folders in place: library/<id>/folder/<folder id> (photos.js)
     if (contentType === 'Photos') {
         stopLibraryLoad();
         destroyInfiniteScroll();
-        renderPhotoLibrary(lib, libId, tab === 'folder' ? String(route).split('/').slice(2) : []);
+        renderPhotoLibrary(lib, libId, tab === 'folder' && sub ? sub : '');
         return;
     }
     // A music library's tabs other than Albums are drawn by music.js; Albums is this grid

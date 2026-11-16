@@ -1,8 +1,9 @@
-// R3 photos: a photo library browses its folders in place (library/<id>/folder/<path>), folders
-// first and then photos and videos, each by sort name with numbers as numbers, as Jellyfin's
-// IsFolder,SortName; the viewer's order, shuffle and EXIF panel rows; photos play in the viewer
-// and videos in the player. Runs modules/photos.js in a vm sandbox with the API stubbed, and
-// checks the wiring in cards.js, router.js and library.js as text.
+// R3 photos: a photo library browses the server's Folder items in place (library/<id>/folder/<folder
+// id>, as a mixed library does): a folder's own items asked with Jellyfin Web's IsFolder,SortName
+// order, its breadcrumbs from its ancestors, a slideshow of every photo under it; the viewer's
+// order, shuffle and EXIF panel rows; photos play in the viewer and videos in the player. Runs
+// modules/photos.js in a vm sandbox with the API stubbed, and checks the wiring in cards.js,
+// router.js and library.js as text.
 // Usage: node r3photos_library.mjs (run by api_tests.rs r3photos_web).
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -13,27 +14,28 @@ const WEB_SRC = new URL('../../../rustyfin-web/src/', import.meta.url);
 const read = file => fs.readFileSync(new URL(file, WEB_SRC), 'utf8');
 const strip = text => text.replace(/^import [^;]*;$/gm, '').replace(/^export \{[^}]*\};$/gm, '');
 
-const ROOT = '/media/Photos';
-const item = (id, rel, type = 'Photo', extra = {}) => ({
-    Id: id, Name: rel.split('/').pop().replace(/\.\w+$/, ''), Type: type, MediaType: type === 'Photo' ? 'Photo' : 'Video',
-    Path: `${ROOT}/${rel}`, ImageTags: { Primary: `t${id}` }, ...extra,
+// A library "lib1" with: folders Family (f1) and Holidays (f2, holding 2024 Alps, f3), a photo at
+// the top, and in Family a video and two photos. Lists come back in the order the server sorts.
+const item = (Id, Name, Type, extra = {}) => ({
+    Id, Name, Type, IsFolder: Type === 'Folder', ImageTags: Type === 'Folder' ? {} : { Primary: `t${Id}` }, ...extra,
 });
-const ITEMS = [
-    item('p1', 'Holidays/Beach/beach-10.jpg'),
-    item('p2', 'Holidays/Beach/beach-2.jpg'),
-    item('p3', 'Holidays/2024 Alps/alps-01.jpg'),
-    item('p4', 'Family/kitchen.jpg'),
-    item('v1', 'Family/birthday clip.mp4', 'Video'),
-    item('p5', 'Family/Garden.jpg'),
-    item('p6', 'sunset.jpg'),
-    item('p7', 'holidays 10/x.jpg'),
-    item('p8', 'holidays 9/y.jpg'),
-];
+const CHILDREN = {
+    lib1: [item('f1', 'Family', 'Folder'), item('f2', 'Holidays', 'Folder'), item('p6', 'sunset', 'Photo')],
+    f1: [item('v1', 'birthday clip', 'Video'), item('p5', 'garden', 'Photo'), item('p4', 'kitchen', 'Photo')],
+    f2: [item('f3', '2024 Alps', 'Folder')],
+    f3: [item('p1', 'alps-01', 'Photo'), item('p2', 'alps-02', 'Photo')],
+};
+const ITEMS = { f1: item('f1', 'Family', 'Folder'), f2: item('f2', 'Holidays', 'Folder'), f3: item('f3', '2024 Alps', 'Folder') };
+const ANCESTORS = {
+    f3: [item('f2', 'Holidays', 'Folder'), { Id: 'lib1', Name: 'Pictures', Type: 'CollectionFolder' }, { Id: 'root', Type: 'UserRootFolder' }],
+    f1: [{ Id: 'lib1', Name: 'Pictures', Type: 'CollectionFolder' }],
+};
 
-function sandbox({ items = ITEMS, libPaths = [ROOT] } = {}) {
+function sandbox({ big = 0 } = {}) {
     const gets = [];
     const played = [];
     const page = { innerHTML: '' };
+    const children = { ...CHILDREN, lib1: [...CHILDREN.lib1, ...Array.from({ length: big }, (_, i) => item(`m${i}`, `img-${i}`, 'Photo'))] };
     const context = vm.createContext({
         URLSearchParams,
         t: (key, opts) => (opts ? `${key}|${JSON.stringify(opts)}` : key),
@@ -43,82 +45,93 @@ function sandbox({ items = ITEMS, libPaths = [ROOT] } = {}) {
         $: id => (id === 'page-library' ? page : null),
         location: { hash: '#library/lib1' },
         playItem: (...args) => played.push(args),
-        window: { libraries: [] },
+        window: {},
         document: { querySelector: () => null },
         API: {
             token: 'tok',
             imageUrl: (id, type, opts) => `/Items/${id}/Images/${type}?tag=${opts.tag}`,
             get: async url => {
                 gets.push(url);
-                const q = new URLSearchParams(url.split('?')[1]);
+                const [path, query] = url.split('?');
+                const ancestors = path.match(/^\/Items\/([^/]+)\/Ancestors$/);
+                if (ancestors) return ANCESTORS[ancestors[1]] || [];
+                const one = path.match(/^\/Items\/([^/]+)$/);
+                if (one) return ITEMS[one[1]];
+                const q = new URLSearchParams(query);
+                const under = id => (children[id] || []).flatMap(i => (i.IsFolder ? under(i.Id) : [i]));
+                const all = q.get('Recursive') === 'true'
+                    ? under(q.get('ParentId')).filter(i => i.Type === q.get('IncludeItemTypes'))
+                    : children[q.get('ParentId')] || [];
                 const start = Number(q.get('StartIndex'));
-                const limit = Number(q.get('Limit'));
-                return { Items: items.slice(start, start + limit), TotalRecordCount: items.length };
+                return { Items: all.slice(start, start + Number(q.get('Limit'))), TotalRecordCount: all.length };
             },
         },
     });
     vm.runInContext(`${strip(read('modules/photos.js'))}
-        Object.assign(this, { renderPhotoLibrary, photoFolderTree, photosUnder, relativeFolder, libraryRoots,
-            viewingOrder, photoInfoRows, folderRoute, photoActions, getOpenFolder: () => openFolder });`, context);
-    const lib = { id: 'lib1', name: 'Pictures', content_type: 'Photos', paths: libPaths };
+        Object.assign(this, { renderPhotoLibrary, photosUnder, folderTrail, viewingOrder, photoInfoRows, folderRoute,
+            photoActions, getOpenFolder: () => openFolder });`, context);
+    const lib = { id: 'lib1', name: 'Pictures', content_type: 'Photos' };
     return { context, gets, played, page, lib };
 }
 
 const cardsIn = html => [...html.matchAll(/data-action="(navigate|photo-open)"[^>]*data-id="([^"]+)"/g)].map(m => m[2]);
+const query = url => Object.fromEntries(new URLSearchParams(url.split('?')[1]));
 
-test('a folder lists its subfolders first, then its photos and videos, by name with numbers as numbers', () => {
-    const { context } = sandbox();
-    const tree = context.photoFolderTree(ITEMS, [ROOT]);
-    assert.deepEqual([...tree.get('').folders], ['Family', 'Holidays', 'holidays 9', 'holidays 10']);
-    assert.deepEqual([...tree.get('').items.map(i => i.Id)], ['p6']);
-    assert.deepEqual([...tree.get('Holidays').folders], ['2024 Alps', 'Beach']);
-    assert.deepEqual([...tree.get('Holidays/Beach').items.map(i => i.Id)], ['p2', 'p1'], 'beach-2 before beach-10');
-    assert.deepEqual([...tree.get('Family').items.map(i => i.Id)], ['v1', 'p5', 'p4'], 'case left out');
-    // A slideshow of a folder has every photo in and under it, videos left out
-    assert.deepEqual([...context.photosUnder(tree, 'Holidays').map(i => i.Id)], ['p3', 'p2', 'p1']);
-    assert.deepEqual([...context.photosUnder(tree, '').map(i => i.Id)], ['p6', 'p5', 'p4', 'p3', 'p2', 'p1', 'p8', 'p7']);
-});
-
-test('folders are relative to the library path the file is under; without paths, to the deepest common folder', () => {
-    const { context } = sandbox();
-    assert.equal(context.relativeFolder('/media/Photos/a/b/c.jpg', ['/other', '/media/Photos/']), 'a/b');
-    assert.equal(context.relativeFolder('/media/Photos/c.jpg', ['/media/Photos']), '');
-    assert.equal(context.relativeFolder('/media/PhotosX/c.jpg', ['/media/Photos']), null);
-    assert.deepEqual([...context.libraryRoots({}, ITEMS)], [ROOT]);
-    assert.deepEqual([...context.libraryRoots({ Locations: ['/x'] }, ITEMS)], ['/x']);
-    assert.equal(context.folderRoute('lib1', 'Holidays/2024 Alps'), 'lib1/folder/Holidays/2024%20Alps');
-    assert.equal(context.folderRoute('lib1', ''), 'lib1');
-});
-
-test('the library page draws a folder in place with breadcrumbs, and pages through every item once', async () => {
-    const many = Array.from({ length: 1203 }, (_, i) => item(`m${i}`, `Big/img-${i}.jpg`));
-    const s = sandbox({ items: [...ITEMS, ...many] });
-    await s.context.renderPhotoLibrary(s.lib, 'lib1', []);
-    assert.equal(s.gets.length, 3, 'pages of 500');
-    assert.ok(s.gets.every(u => /ParentId=lib1&Recursive=true&IncludeItemTypes=Photo%2CVideo&Fields=Path/.test(u)), s.gets[0]);
-    assert.deepEqual(cardsIn(s.page.innerHTML), [
-        'lib1/folder/Big', 'lib1/folder/Family', 'lib1/folder/Holidays', 'lib1/folder/holidays%209', 'lib1/folder/holidays%2010', 'p6',
-    ]);
-    assert.match(s.page.innerHTML, /data-action="photo-slideshow"/);
-
-    s.context.location.hash = '#library/lib1/folder/Holidays/2024%20Alps';
-    await s.context.renderPhotoLibrary(s.lib, 'lib1', ['Holidays', '2024%20Alps']);
-    assert.equal(s.gets.length, 3, 'the tree is kept while the library is browsed');
-    assert.deepEqual(cardsIn(s.page.innerHTML), ['lib1', 'lib1/folder/Holidays', 'p3']);
-    assert.match(s.page.innerHTML, /aria-current="page">2024 Alps</);
-});
-
-test('a photo card opens the viewer at it; a video card plays in the player', async () => {
+test('a folder asks for its own items in Jellyfin Web\'s order and shows its subfolders, then its files', async () => {
     const s = sandbox();
-    await s.context.renderPhotoLibrary(s.lib, 'lib1', ['Family']);
+    await s.context.renderPhotoLibrary(s.lib, 'lib1', '');
+    assert.deepEqual(query(s.gets[0]), {
+        ParentId: 'lib1', SortBy: 'IsFolder,SortName', SortOrder: 'Ascending', Fields: 'PrimaryImageAspectRatio,SortName',
+        StartIndex: '0', Limit: '500',
+    });
+    assert.deepEqual(cardsIn(s.page.innerHTML), ['lib1/folder/f1', 'lib1/folder/f2', 'p6']);
+    assert.match(s.page.innerHTML, /data-action="photo-slideshow"/);
+    assert.match(s.page.innerHTML, /aria-current="page">Pictures</);
+});
+
+test('a folder deep down gets breadcrumbs from its ancestors, up to the library', async () => {
+    const s = sandbox();
+    s.context.location.hash = '#library/lib1/folder/f3';
+    await s.context.renderPhotoLibrary(s.lib, 'lib1', 'f3');
+    assert.ok(s.gets.includes('/Items/f3/Ancestors'));
+    assert.deepEqual(cardsIn(s.page.innerHTML), ['lib1', 'lib1/folder/f2', 'p1', 'p2']);
+    assert.match(s.page.innerHTML, /aria-current="page">2024 Alps</);
+    assert.equal(s.context.folderRoute('lib1', 'f3'), 'lib1/folder/f3');
+    assert.equal(s.context.folderRoute('lib1', ''), 'lib1');
+    // A folder page left while it loads isn't drawn
+    const loading = s.context.renderPhotoLibrary(s.lib, 'lib1', 'f1');
+    s.context.location.hash = '#home';
+    await loading;
+    assert.deepEqual(cardsIn(s.page.innerHTML), []);
+});
+
+test('a big folder is read in pages until every item is in', async () => {
+    const s = sandbox({ big: 1203 });
+    await s.context.renderPhotoLibrary(s.lib, 'lib1', '');
+    assert.deepEqual(s.gets.map(u => query(u).StartIndex), ['0', '500', '1000']);
+    assert.equal(cardsIn(s.page.innerHTML).length, 1206);
+});
+
+test('a photo card opens the viewer at it; a video card plays in the player; a slideshow has every photo below', async () => {
+    const s = sandbox();
+    s.context.location.hash = '#library/lib1/folder/f1';
+    await s.context.renderPhotoLibrary(s.lib, 'lib1', 'f1');
     const opened = [];
-    s.context.openPhotoViewer = (items, index) => opened.push([[...items.map(i => i.Id)], index]);
+    s.context.openPhotoViewer = (items, index, opts) => opened.push([[...items.map(i => i.Id)], index, opts?.shuffle ?? null]);
     vm.runInContext('openPhotoViewer = this.openPhotoViewer', s.context);
-    const card = id => ({ dataset: { index: String(s.context.getOpenFolder().entry.items.findIndex(i => i.Id === id)) } });
+    const card = id => ({ dataset: { index: String(s.context.getOpenFolder().files.findIndex(i => i.Id === id)) } });
     s.context.photoActions['photo-open'](card('p4'));
-    assert.deepEqual(opened, [[['p5', 'p4'], 1]]);
+    assert.deepEqual(opened.pop(), [['p5', 'p4'], 1, null]);
     s.context.photoActions['photo-open'](card('v1'));
     assert.deepEqual(s.played, [['v1', 'Videos', 'birthday clip']]);
+
+    s.context.location.hash = '#library/lib1';
+    await s.context.renderPhotoLibrary(s.lib, 'lib1', '');
+    await s.context.photoActions['photo-slideshow']({ dataset: { shuffle: 'true' } });
+    // Every photo below, in the server's order (the stub lists them depth first)
+    assert.deepEqual(opened.pop(), [['p5', 'p4', 'p1', 'p2', 'p6'], 0, true]);
+    assert.deepEqual(query(s.gets.at(-1)).Recursive, 'true');
+    assert.deepEqual(query(s.gets.at(-1)).IncludeItemTypes, 'Photo');
 });
 
 test('the viewing order is the list\'s, or a shuffle that starts at the chosen photo and has every photo once', () => {
