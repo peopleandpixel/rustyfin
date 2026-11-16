@@ -777,10 +777,12 @@ async fn r1scan_locked_or_nfo_name_stays() {
 
 // R3: sort names
 
-/// A refresh gives the provider's title Jellyfin's sort name, takes an NFO's `<sorttitle>` as the
-/// forced sort name, and leaves the sort name of an item locked whole, on Name or on SortName.
+/// A refresh gives the provider's title Jellyfin's sort name and takes an NFO's `<sorttitle>` as
+/// the forced sort name when there is none. As in Jellyfin, a lock keeps the name, and the sort
+/// name follows it; a lock on the item, Name or SortName keeps an NFO from forcing one, and an
+/// admin's forced sort name stays over the NFO's.
 #[tokio::test]
-async fn r3sortname_refresh_keeps_locked_sort_names_and_reads_sorttitle() {
+async fn r3sortname_refresh_makes_sort_names_from_names_and_reads_sorttitle() {
     let fx = Fixture::new().await;
     let pool = &fx.pool;
     let (pm, _) = r1scan_manager().await;
@@ -812,7 +814,28 @@ async fn r3sortname_refresh_keeps_locked_sort_names_and_reads_sorttitle() {
             ),
         )
         .await;
-    for item in [&free, &sort_locked, &name_locked, &whole_locked, &nfo] {
+    const NFO_SORT: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<movie>\n  \
+                            <sorttitle>Nfo Sort</sorttitle>\n</movie>\n";
+    let admin_forced = fx.movie("Admin Forced", Some(NFO_SORT)).await;
+    rustyfin_db::repo_media::set_forced_sort_name(pool, admin_forced.id, Some("Admin Pick"))
+        .await
+        .unwrap();
+    let locked_nfo = fx.movie("Locked Nfo", Some(NFO_SORT)).await;
+    exec(
+        pool,
+        "INSERT INTO item_metadata_extras (item_id, locked_fields) VALUES (?1, 'Name')",
+        &[&locked_nfo.id.to_string()],
+    )
+    .await;
+    for item in [
+        &free,
+        &sort_locked,
+        &name_locked,
+        &whole_locked,
+        &nfo,
+        &admin_forced,
+        &locked_nfo,
+    ] {
         rustyfin_core::metadata::refresh_item_metadata(pool, &client, item, &pm)
             .await
             .unwrap();
@@ -822,9 +845,12 @@ async fn r3sortname_refresh_keeps_locked_sort_names_and_reads_sorttitle() {
     assert_eq!(after.name, "Mission: Impossible");
     assert_eq!(after.sort_name.as_deref(), Some("mission: impossible"));
     for (item, sort) in [
-        (&sort_locked, "the sort lock"),
-        (&name_locked, "the name lock"),
-        (&whole_locked, "the whole lock"),
+        // Its name isn't locked, so it takes the provider's title
+        (&sort_locked, "mission: impossible"),
+        (&name_locked, "name lock"),
+        (&whole_locked, "whole lock"),
+        (&admin_forced, "admin pick"),
+        (&locked_nfo, "locked nfo"),
     ] {
         assert_eq!(
             stored(pool, item.id).await.sort_name.as_deref(),
@@ -844,18 +870,17 @@ async fn r3sortname_refresh_keeps_locked_sort_names_and_reads_sorttitle() {
             .as_deref(),
         Some("Zz Part 2")
     );
-
-    // The recompute pass leaves the locked ones too
-    rustyfin_db::repo_media::recompute_sort_names(
-        pool,
-        &rustyfin_model::sort_name::SortRules::default(),
-    )
-    .await
-    .unwrap();
-    assert_eq!(
-        stored(pool, sort_locked.id).await.sort_name.as_deref(),
-        Some("the sort lock")
-    );
+    for (item, forced) in [(&admin_forced, Some("Admin Pick")), (&locked_nfo, None)] {
+        assert_eq!(
+            rustyfin_db::repo_media::forced_sort_name(pool, item.id)
+                .await
+                .unwrap()
+                .as_deref(),
+            forced,
+            "{}",
+            item.name
+        );
+    }
 }
 
 /// E0-scan-3, B147: a series search sends the folder year; the identified series fills its

@@ -482,6 +482,7 @@ mod tests {
              ('alpha', 'lib', 'The Alpha', 'Alpha, The', 'Movie', '/m/2.mkv'), \
              ('algen', 'lib', 'Ålgen', 'ålgen', 'Movie', '/m/3.mkv'), \
              ('elk', 'lib', 'Élan', 'Zebra', 'Movie', '/m/4.mkv'), \
+             ('ole', 'lib', 'Ølé', 'ole', 'Movie', '/m/7.mkv'), \
              ('locked', 'lib', 'The Locked', 'the locked', 'Movie', '/m/5.mkv'), \
              ('ep', 'lib', 'The Pilot', 'show s01e02', 'Episode', '/m/6.mkv'), \
              ('season', 'lib', 'Season 1', 'season 0001', 'Season', '/m/s1')",
@@ -498,9 +499,28 @@ mod tests {
             (Some("Alpha, The".into()), Some("Alpha, The".into())),
             "094 keeps a sort name that is not the lowercased name as the forced one"
         );
-        for id in ["matrix", "algen", "elk", "locked", "ep", "season"] {
+        for id in ["matrix", "algen", "elk", "ole", "locked", "ep", "season"] {
             assert_eq!(r3sortname_sort(&upgraded, id).await.1, None, "{id}");
         }
+
+        // The startup step: Rust lowercases what SQLite cannot. 'ålgen' was automatic, and so
+        // is 'ole', the sort name made from 'Ølé'; 'Zebra' was forced. It runs once.
+        assert_eq!(
+            repo_media::classify_legacy_sort_names(&upgraded)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            r3sortname_sort(&upgraded, "elk").await,
+            (Some("Zebra".into()), Some("Zebra".into()))
+        );
+        assert_eq!(
+            repo_media::classify_legacy_sort_names(&upgraded)
+                .await
+                .unwrap(),
+            0
+        );
 
         let rules = rustyfin_model::sort_name::SortRules::default();
         let changed = repo_media::recompute_sort_names(&upgraded, &rules)
@@ -509,10 +529,11 @@ mod tests {
         let expect = [
             ("matrix", "matrix", None),
             ("alpha", "alpha, the", Some("Alpha, The")),
-            // Rust lowercases what SQLite cannot: 'ålgen' was automatic, 'Zebra' forced
             ("algen", "algen", None),
             ("elk", "zebra", Some("Zebra")),
-            ("locked", "the locked", None),
+            ("ole", "ole", None),
+            // A lock doesn't keep a sort name: it is made from the (kept) name, as in Jellyfin
+            ("locked", "locked", None),
             ("ep", "001 - 0002 - The Pilot", None),
             ("season", "season 0001", None),
         ];
@@ -523,7 +544,7 @@ mod tests {
                 "{id}"
             );
         }
-        assert_eq!(changed, 5);
+        assert_eq!(changed, 6);
         assert_eq!(
             repo_media::recompute_sort_names(&upgraded, &rules)
                 .await
@@ -541,7 +562,7 @@ mod tests {
             repo_media::recompute_sort_names(&upgraded, &rules)
                 .await
                 .unwrap(),
-            1
+            2
         );
         assert_eq!(
             r3sortname_sort(&upgraded, "matrix").await.0.as_deref(),
@@ -551,7 +572,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn r3sortname_an_upsert_keeps_a_forced_or_locked_sort_name() {
+    async fn r3sortname_an_upsert_keeps_only_a_forced_sort_name() {
         let pool = test_pool().await;
         let lib = uuid::Uuid::new_v4();
         insert_test_library(&pool, lib).await;
@@ -590,7 +611,7 @@ mod tests {
             sorts,
             [
                 Some("stored".into()),
-                Some("stored".into()),
+                Some("rescanned".into()),
                 Some("rescanned".into())
             ]
         );

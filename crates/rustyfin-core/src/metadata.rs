@@ -102,6 +102,12 @@ pub async fn refresh_item_metadata_with(
         rustyfin_db::repo_media::save_refresh_changes(pool, item, &working)
             .await
             .map_err(|e| e.to_string())?;
+        // Jellyfin's replace takes the sources' ForcedSortName too, none unless an NFO has one
+        if !locks.forced_sort_name_locked() {
+            rustyfin_db::repo_media::set_forced_sort_name(pool, item.id, None)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
         rustyfin_db::repo_media::clear_replaceable_links(pool, item.id, &locks)
             .await
             .map_err(|e| e.to_string())?;
@@ -730,22 +736,24 @@ async fn apply_metadata_to_item(
         changed = true;
         tracing::debug!("updated name '{}' to '{}'", before.name, new_name);
     }
-    // The sort name: an NFO's <sorttitle> forces one, as in Jellyfin; else a forced one stays and
-    // any other is made again from the name. A locked one (whole item, Name or SortName) and a
-    // season's stay.
-    if !locks.sort_name_locked() && updated.media_type != MediaType::Season {
-        let mut forced = rustyfin_db::repo_media::forced_sort_name(pool, updated.id)
+    // The sort name, as Jellyfin's: made from the forced sort name, or else from the name. An
+    // NFO's <sorttitle> becomes the forced sort name when there is none (a "replace all" clears
+    // it first) and no lock (whole item, Name or SortName) keeps it. A season with none keeps
+    // its own.
+    let mut forced = rustyfin_db::repo_media::forced_sort_name(pool, updated.id)
+        .await
+        .map_err(|e| e.to_string())?;
+    if forced.is_none()
+        && !locks.forced_sort_name_locked()
+        && let Some(sort_title) = meta.sort_title.as_deref().map(str::trim)
+        && !sort_title.is_empty()
+    {
+        rustyfin_db::repo_media::set_forced_sort_name(pool, updated.id, Some(sort_title))
             .await
             .map_err(|e| e.to_string())?;
-        if let Some(sort_title) = meta.sort_title.as_deref().map(str::trim)
-            && !sort_title.is_empty()
-            && forced.as_deref() != Some(sort_title)
-        {
-            rustyfin_db::repo_media::set_forced_sort_name(pool, updated.id, Some(sort_title))
-                .await
-                .map_err(|e| e.to_string())?;
-            forced = Some(sort_title.to_string());
-        }
+        forced = Some(sort_title.to_string());
+    }
+    if forced.is_some() || updated.media_type != MediaType::Season {
         let sort_name = match forced.as_deref() {
             Some(forced) => rustyfin_model::sort_name::forced_sort_name(forced),
             None => rustyfin_model::sort_name::item_sort_name(

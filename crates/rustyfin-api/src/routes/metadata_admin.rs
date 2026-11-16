@@ -634,9 +634,7 @@ async fn update_item(
         Some(value) => text_value(value),
         None => forced_now.clone(),
     };
-    if forced != forced_now {
-        rustyfin_db::repo_media::set_forced_sort_name(&state.db, id, forced.as_deref()).await?;
-    }
+
     if forced.is_some() || item.media_type != MediaType::Season {
         updated.sort_name = Some(match forced.as_deref() {
             Some(forced) => rustyfin_model::sort_name::forced_sort_name(forced),
@@ -680,7 +678,16 @@ async fn update_item(
     if let Some(list) = field(&body, "ProductionLocations").and_then(string_list) {
         updated.production_locations = list;
     }
-    rustyfin_db::repo_media::save_refresh_changes(&state.db, &item, &updated).await?;
+    // The forced sort name and the sort name made from it are saved together: when another
+    // write changed the name or sort name since the read, neither is.
+    let mut tx = state.db.begin().await?;
+    let written =
+        rustyfin_db::repo_media::save_refresh_changes_on(&mut tx, &item, &updated).await?;
+    let sort_saved = updated.sort_name == item.sort_name || written.contains(&"sort_name");
+    if forced != forced_now && sort_saved {
+        rustyfin_db::repo_media::set_forced_sort_name_on(&mut tx, id, forced.as_deref()).await?;
+    }
+    tx.commit().await?;
 
     // Studios ({Name, Id} pairs) and People ({Name, Role, Type}), when given, replace the item's
     if let Some(list) = field(&body, "Studios").and_then(Value::as_array) {

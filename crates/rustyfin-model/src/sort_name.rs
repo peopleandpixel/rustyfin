@@ -114,7 +114,8 @@ pub fn modify_sort_chunks(name: &str) -> String {
         digits.clear();
     };
     for c in name.chars() {
-        if c.is_ascii_digit() {
+        // .NET's char.IsDigit is Unicode's decimal digits; is_numeric is the closest std test
+        if c.is_numeric() {
             digits.push(c);
         } else {
             if !digits.is_empty() {
@@ -129,12 +130,38 @@ pub fn modify_sort_chunks(name: &str) -> String {
     remove_diacritics(&out)
 }
 
-/// Decomposes, drops the combining marks and recomposes: "dìdi" becomes "didi".
+/// Decomposes, drops the combining marks and recomposes: "dìdi" becomes "didi". Letters that do
+/// not decompose take their base letters, as the Diacritics library Jellyfin uses maps them:
+/// "Søren" becomes "Soren", "Łódź" "Lodz", "Straße" "Strasse".
 fn remove_diacritics(s: &str) -> String {
     if s.is_ascii() {
         return s.to_string();
     }
-    s.nfd().filter(|c| !is_combining_mark(*c)).nfc().collect()
+    let mut out = String::with_capacity(s.len());
+    for c in s.nfd().filter(|c| !is_combining_mark(*c)).nfc() {
+        match c {
+            'ø' => out.push('o'),
+            'Ø' => out.push('O'),
+            'ł' => out.push('l'),
+            'Ł' => out.push('L'),
+            'đ' | 'ð' => out.push('d'),
+            'Đ' | 'Ð' => out.push('D'),
+            'ħ' => out.push('h'),
+            'Ħ' => out.push('H'),
+            'ŧ' => out.push('t'),
+            'Ŧ' => out.push('T'),
+            'ı' => out.push('i'),
+            'æ' => out.push_str("ae"),
+            'Æ' => out.push_str("AE"),
+            'œ' => out.push_str("oe"),
+            'Œ' => out.push_str("OE"),
+            'ß' => out.push_str("ss"),
+            'þ' => out.push_str("th"),
+            'Þ' => out.push_str("TH"),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// The sort name Jellyfin makes for an item of `media_type` named `name`: an episode sorts by
@@ -244,6 +271,13 @@ mod tests {
         assert_eq!(sort("Ça Ira"), "ca ira");
         assert_eq!(sort("Die Hölle"), "die holle");
         assert_eq!(sort("弟弟"), "弟弟");
+        assert_eq!(sort("Søren"), "soren");
+        assert_eq!(sort("Łódź"), "lodz");
+        assert_eq!(sort("Đorđe"), "dorde");
+        assert_eq!(sort("Straße"), "strasse");
+        assert_eq!(sort("Ærø"), "aero");
+        // Other scripts' decimal digits are padded too, as .NET's char.IsDigit takes them
+        assert_eq!(sort("Part ٣"), "part 000000000٣");
     }
 
     #[test]
