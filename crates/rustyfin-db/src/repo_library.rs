@@ -88,6 +88,15 @@ pub async fn update_library_paths(
     Ok(())
 }
 
+pub async fn rename_library(pool: &SqlitePool, id: Uuid, name: &str) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE libraries SET name = ? WHERE id = ?")
+        .bind(name)
+        .bind(id.to_string())
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// The options saved for a library, or the defaults when none are saved.
 pub async fn get_library_options(
     pool: &SqlitePool,

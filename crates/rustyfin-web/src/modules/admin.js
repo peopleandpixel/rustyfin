@@ -6,6 +6,13 @@ import { oidcAccountKey } from './settings.js';
 import { jiPanelHtml, loadJellyfinImport } from './jellyfin-import.js';
 import { sessionsPanelHtml, followSessions, unfollowSessions } from './sessions.js';
 import { playbackPanelHtml, loadPlaybackAdmin } from './playback-admin.js';
+import { serverDetailsHtml, generalPanelHtml, loadGeneralSettings, triggerSummary } from './dashboard.js';
+
+// The dashboard's tab panels, in the order of their tab buttons
+const ADMIN_TABS = [
+    'admin-overview', 'admin-general', 'admin-users', 'admin-libs', 'admin-playback', 'admin-tasks', 'admin-plugins',
+    'admin-sessions', 'admin-activity', 'admin-livelog', 'admin-signin', 'admin-import',
+];
 
 async function renderAdmin(tab) {
     const page = $('page-admin');
@@ -30,8 +37,8 @@ async function renderAdmin(tab) {
         ]);
         const accountById = new Map(accounts.map(a => [oidcAccountKey(a.UserId), a]));
 
-        const tabs = [t('admin.overview'), t('admin.users'), t('admin.libraries'), t('admin.playback'), t('admin.tasks'), t('admin.plugins'), t('admin.sessions'), t('admin.activity_log_tab'), t('admin.live_log'), t('oidc.admin_tab'), t('jellyfin_import.tab')];
-        const tabIds = ['admin-overview', 'admin-users', 'admin-libs', 'admin-playback', 'admin-tasks', 'admin-plugins', 'admin-sessions', 'admin-activity', 'admin-livelog', 'admin-signin', 'admin-import'];
+        const tabs = [t('admin.overview'), t('dashboard.general'), t('admin.users'), t('admin.libraries'), t('admin.playback'), t('admin.tasks'), t('admin.plugins'), t('admin.sessions'), t('admin.activity_log_tab'), t('admin.live_log'), t('oidc.admin_tab'), t('jellyfin_import.tab')];
+        const tabIds = ADMIN_TABS;
 
         page.innerHTML = `
         <div class="max-w-6xl mx-auto jf-page">
@@ -44,8 +51,11 @@ async function renderAdmin(tab) {
                     <button class="jf-btn-ghost !py-1.5 !px-3 text-xs inline-flex items-center gap-1.5" data-action="scan-all">
                         ${icon('Library', { size: 14 })}${t('admin.scan_all')}
                     </button>
-                    <button class="jf-btn-ghost !py-1.5 !px-3 text-xs text-amber-400 hover:text-amber-300 inline-flex items-center gap-1.5" onclick="if(confirm(t('admin.restart_confirm')))API.restart().then(()=>toast(t('admin.restarting')))">
+                    <button class="jf-btn-ghost !py-1.5 !px-3 text-xs text-amber-400 hover:text-amber-300 inline-flex items-center gap-1.5" data-action="server-restart">
                         ${icon('RotateCcw', { size: 14 })}${t('admin.restart')}
+                    </button>
+                    <button class="jf-btn-ghost !py-1.5 !px-3 text-xs text-red-400 hover:text-red-300 inline-flex items-center gap-1.5" data-action="server-shutdown">
+                        ${icon('Power', { size: 14 })}${t('dashboard.shutdown')}
                     </button>
                 </div>
             </div>
@@ -80,15 +90,12 @@ async function renderAdmin(tab) {
                 </div>
 
                 <div class="jf-settings-card">
-                    <h3 class="font-bold text-white text-base mb-4">${t('admin.system_details')}</h3>
-                    <div class="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
-                        <div class="flex justify-between py-2 border-b border-white/5"><span class="text-white/50">${t('admin.operating_system')}</span> <span class="font-mono text-white">${escapeHtml(info.OperatingSystem || 'Linux')}</span></div>
-                        <div class="flex justify-between py-2 border-b border-white/5"><span class="text-white/50">${t('admin.architecture')}</span> <span class="font-mono text-white">${escapeHtml(info.SystemArchitecture || 'x86_64')}</span></div>
-                        <div class="flex justify-between py-2 border-b border-white/5"><span class="text-white/50">${t('admin.program_data')}</span> <span class="font-mono text-white truncate max-w-xs">${escapeHtml(info.ProgramDataPath || '/data')}</span></div>
-                        <div class="flex justify-between py-2 border-b border-white/5"><span class="text-white/50">${t('admin.log_path')}</span> <span class="font-mono text-white truncate max-w-xs">${escapeHtml(info.LogPath || '/data/logs')}</span></div>
-                    </div>
+                    ${serverDetailsHtml(info, info.RustyfinVersion || serverVersion)}
                 </div>
             </div>
+
+            <!-- General: Jellyfin's General page, filled by loadGeneralSettings -->
+            ${generalPanelHtml()}
 
             <!-- Tab 1: Users -->
             <div id="admin-users" class="hidden jf-settings-card">
@@ -164,6 +171,7 @@ async function renderAdmin(tab) {
                                 <td class="py-3"><input type="checkbox" data-action="toggle-realtime-monitor" data-id="${escapeHtml(l.id || l.Id)}" aria-label="${escapeHtml(t('admin.realtime_monitor_for', { name: l.name || l.Name }))}" ${(l.LibraryOptions || {}).EnableRealtimeMonitor === false ? '' : 'checked'} class="w-4 h-4 rounded bg-white/10 border-white/20 text-[#00a4dc]"></td>
                                 <td class="py-3 text-right space-x-2">
                                     <button class="text-[#00a4dc] hover:text-[#38bdf8]" data-action="scan-library-admin" data-id="${escapeHtml(l.id || l.Id)}">${t('admin.scan')}</button>
+                                    <button class="text-[#00a4dc] hover:text-[#38bdf8]" data-action="edit-library" data-id="${escapeHtml(l.id || l.Id)}" aria-label="${escapeHtml(t('dashboard.edit_library_title', { name: l.name || l.Name }))}">${t('dashboard.edit_library')}</button>
                                     <button class="text-[#00a4dc] hover:text-[#38bdf8]" data-action="library-options" data-id="${escapeHtml(l.id || l.Id)}" data-name="${escapeHtml(l.name || l.Name)}" aria-label="${escapeHtml(t('library.options_for', { name: l.name || l.Name }))}">${t('library.options_button')}</button>
                                     <button class="text-red-400 hover:text-red-300" data-action="delete-library" data-id="${escapeHtml(l.id || l.Id)}">${t('common.delete')}</button>
                                 </td>
@@ -273,6 +281,8 @@ async function renderAdmin(tab) {
         // #admin/playback the playback tab
         if (tab === 'import') showAdminTab(page.querySelector('[data-tab="admin-import"]'), 'admin-import');
         if (tab === 'playback') showAdminTab(page.querySelector('[data-tab="admin-playback"]'), 'admin-playback');
+        if (tab === 'general') showAdminTab(page.querySelector('[data-tab="admin-general"]'), 'admin-general');
+        if (tab === 'libraries') showAdminTab(page.querySelector('[data-tab="admin-libs"]'), 'admin-libs');
     } catch (e) {
         page.innerHTML = `<div class="p-6 rounded-xl bg-red-500/10 text-red-400">${escapeHtml(e.message)}</div>`;
     }
@@ -284,7 +294,7 @@ function showAdminTab(btn, tabId) {
     });
     btn.className = 'px-4 py-2 rounded-xl text-xs font-semibold whitespace-nowrap transition bg-[#00a4dc] text-white shadow-lg';
 
-    ['admin-overview', 'admin-users', 'admin-libs', 'admin-playback', 'admin-tasks', 'admin-plugins', 'admin-sessions', 'admin-activity', 'admin-livelog', 'admin-signin', 'admin-import'].forEach(id => {
+    ADMIN_TABS.forEach(id => {
         const el = $(id);
         if (el) el.classList.toggle('hidden', id !== tabId);
     });
@@ -297,6 +307,7 @@ function showAdminTab(btn, tabId) {
     else unfollowSessions();
     if (tabId === 'admin-signin') loadOidcAdminTab();
     if (tabId === 'admin-playback') loadPlaybackAdmin();
+    if (tabId === 'admin-general') loadGeneralSettings();
     if (tabId === 'admin-import') loadJellyfinImport();
 }
 
@@ -548,33 +559,7 @@ function renderTaskCard(task) {
     }
 
     // Trigger info
-    let triggerHtml = '';
-    if (triggers.length) {
-        // Trigger times are .NET ticks: 10,000,000 a second
-        const TICKS_PER_MINUTE = 600000000;
-        const TICKS_PER_HOUR = 60 * TICKS_PER_MINUTE;
-        const triggerTypes = triggers.map(tr => {
-            const type = tr.Type || tr.type || '';
-            if (type.includes('Interval')) {
-                const ticks = tr.IntervalTicks || tr.interval_ticks;
-                if (ticks) {
-                    const hours = Math.round(ticks / TICKS_PER_HOUR);
-                    return t('admin.every_hours', { count: hours });
-                }
-            }
-            // Jellyfin's DailyTrigger and WeeklyTrigger carry the time of day
-            if (type.includes('TimeOfDay') || type.includes('Daily') || type.includes('Weekly')) {
-                const ticks = tr.TimeOfDayTicks ?? tr.time_of_day_ticks;
-                if (typeof ticks === 'number') {
-                    const hour = Math.floor(ticks / TICKS_PER_HOUR) % 24;
-                    const minute = Math.floor(ticks / TICKS_PER_MINUTE) % 60;
-                    return `${hour.toString().padStart(2, '0')}:${minute.toString().padStart(2, '0')}`;
-                }
-            }
-            return escapeHtml(type);
-        });
-        triggerHtml = `<span class="text-white/40 text-[10px]">${icon('Clock', { size: 10, class: 'inline-block align-[-1px]' })} ${triggerTypes.join(', ')}</span>`;
-    }
+    const triggerHtml = `<span class="text-white/40 text-[10px]">${icon('Clock', { size: 10, class: 'inline-block align-[-1px]' })} ${triggers.length ? triggers.map(triggerSummary).join(', ') : t('dashboard.no_triggers')}</span>`;
 
     // Progress bar: the percent when the task reports one, else a sliding stripe
     let progressHtml = '';
@@ -626,6 +611,9 @@ function renderTaskCard(task) {
                             ${icon('Play', { size: 12, class: 'fill-current' })}${t('admin.start')}
                         </button>
                     `}
+                    <button class="jf-btn-ghost text-xs !py-1.5 !px-3 inline-flex items-center gap-1.5" data-action="edit-triggers" data-id="${escapeHtml(id)}">
+                        ${icon('Clock', { size: 12 })}${t('dashboard.triggers')}
+                    </button>
                     <button class="jf-btn-ghost text-xs !py-1.5 !px-3 text-white/40" onclick="refreshTasks()" title="${escapeHtml(t('admin.refresh_status'))}" aria-label="${escapeHtml(t('admin.refresh_status'))}">
                         ${icon('RefreshCw', { size: 14 })}
                     </button>

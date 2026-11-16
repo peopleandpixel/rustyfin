@@ -179,6 +179,7 @@ async fn playback_info(
 
     let play_session_id = Uuid::new_v4().simple().to_string();
     let mut media_sources = Vec::with_capacity(chosen.len());
+    let mut reasons = Vec::new();
     for index in chosen {
         let mut source = sources[index].clone();
         let audio_stream_index = dto.audio_stream_index.or_else(|| {
@@ -240,6 +241,14 @@ async fn playback_info(
                     facts.apply_preferences(&preferences);
                 }
                 let data = device_data(&facts, profile, &request);
+                reasons.push((
+                    source.id.clone(),
+                    data.transcode_reasons
+                        .names()
+                        .into_iter()
+                        .map(String::from)
+                        .collect(),
+                ));
                 patch_source(&source, &data)
             }
         };
@@ -247,6 +256,10 @@ async fn playback_info(
             .push(value.map_err(|e| ApiError::Internal(format!("Serialization error: {e}")))?);
     }
 
+    // The dashboard's sessions show why a playback transcodes
+    state
+        .transcode_manager
+        .note_reasons(&play_session_id, reasons);
     Ok(ItemsPlaybackInfoResponse {
         media_sources,
         play_session_id: Some(play_session_id),

@@ -89,7 +89,8 @@ pub struct ServerConfiguration {
     pub enable_normalized_item_by_name_ids: bool,
     #[serde(default = "default_true")]
     pub is_port_authorized: bool,
-    #[serde(default)]
+    /// Quick Connect: on by default, as in Jellyfin. Off, its routes answer 401.
+    #[serde(default = "default_true")]
     pub quick_connect_available: bool,
     /// The DLNA server: the `/dlna/*` routes and SSDP discovery. Off by default, as in Jellyfin,
     /// where DLNA is an optional plugin.
@@ -139,6 +140,10 @@ pub struct ServerConfiguration {
     /// The language of the server's own messages, as a culture code (Jellyfin's `UICulture`).
     #[serde(rename = "UICulture", default = "default_ui_culture")]
     pub ui_culture: String,
+    /// Which Rustyfin wrote the file, as `CONFIG_VERSION`. A file without it (0) comes from a
+    /// Rustyfin before the version, and `upgrade` brings it up to date once. Every write sets it.
+    #[serde(rename = "RustyfinConfigVersion", default)]
+    pub config_version: u32,
     /// The other fields of Jellyfin's `ServerConfiguration` that a client saved. They are kept and
     /// returned, so Jellyfin Web's settings pages round-trip, but Rustyfin doesn't act on them.
     /// `jellyfin_server_defaults` fills in the ones never saved.
@@ -293,7 +298,26 @@ fn default_library_monitor_poll_interval() -> u32 {
     60
 }
 
+/// The `RustyfinConfigVersion` this build writes.
+/// 1: `QuickConnectAvailable` takes effect. Before it, Quick Connect was always on and the stored
+/// value (false, the old default) did nothing.
+pub const CONFIG_VERSION: u32 = 1;
+
 impl ServerConfiguration {
+    /// Brings a configuration read from an older file up to date; true when it changed. Run once
+    /// at load. A later choice the admin saves carries the current version, so it is kept.
+    pub fn upgrade(&mut self) -> bool {
+        if self.config_version >= CONFIG_VERSION {
+            return false;
+        }
+        if self.config_version < 1 {
+            // Quick Connect was on whatever the file said: it stays on after the upgrade
+            self.quick_connect_available = true;
+        }
+        self.config_version = CONFIG_VERSION;
+        true
+    }
+
     /// The sort rules: `SortRemoveWords`, `SortRemoveCharacters` and `SortReplaceCharacters`, with
     /// Jellyfin's defaults for the ones no client has saved.
     pub fn sort_rules(&self) -> crate::sort_name::SortRules {
@@ -379,7 +403,7 @@ impl Default for ServerConfiguration {
             enable_metrics: true,
             enable_normalized_item_by_name_ids: true,
             is_port_authorized: true,
-            quick_connect_available: false,
+            quick_connect_available: true,
             enable_dlna_server: false,
             public_https_port: 8096,
             public_port: 8096,
@@ -396,6 +420,7 @@ impl Default for ServerConfiguration {
             library_monitor_poll_interval: 60,
             refuse_links_out_of_libraries: false,
             ui_culture: default_ui_culture(),
+            config_version: CONFIG_VERSION,
             other: serde_json::Map::new(),
         }
     }
@@ -419,4 +444,36 @@ pub struct LogFile {
     pub date_modified: String,
     pub name: String,
     pub size: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(json: &str) -> ServerConfiguration {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn r3admin_upgrade_turns_quick_connect_on_once_and_keeps_a_later_choice() {
+        // A file from before the version: the stored false never took effect
+        let mut old = parse(r#"{"ServerName":"Box","QuickConnectAvailable":false}"#);
+        assert_eq!(old.config_version, 0);
+        assert!(old.upgrade());
+        assert!(old.quick_connect_available);
+        assert_eq!(old.config_version, CONFIG_VERSION);
+        assert!(!old.upgrade(), "only once");
+
+        // An admin's false saved by this build stays false
+        let mut chosen = parse(r#"{"QuickConnectAvailable":false,"RustyfinConfigVersion":1}"#);
+        assert!(!chosen.upgrade());
+        assert!(!chosen.quick_connect_available);
+
+        // A new install starts current, with Quick Connect on
+        let fresh = ServerConfiguration::default();
+        assert_eq!(fresh.config_version, CONFIG_VERSION);
+        assert!(fresh.quick_connect_available);
+        let json = serde_json::to_value(&fresh).unwrap();
+        assert_eq!(json["RustyfinConfigVersion"], CONFIG_VERSION);
+    }
 }

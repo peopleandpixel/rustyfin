@@ -503,10 +503,50 @@ async fn dto(state: &AppState, s: &SessionInfo, viewer: Uuid, socket: bool) -> s
             out["PlaylistItemId"] = serde_json::json!(id);
         }
         if let Some(id) = p.play_session_id {
+            if play_state.play_method.as_deref() == Some("Transcode")
+                && let Some(info) = transcoding_info(state, &id, &play_state)
+            {
+                out["TranscodingInfo"] = info;
+            }
             out["PlaySessionId"] = serde_json::json!(id);
         }
     }
     out
+}
+
+/// Jellyfin's `TranscodingInfo` of a transcoding session: the reasons PlaybackInfo gave and what
+/// the running transcode does.
+fn transcoding_info(
+    state: &AppState,
+    play_session_id: &str,
+    play_state: &PlayState,
+) -> Option<serde_json::Value> {
+    let s = state
+        .transcode_manager
+        .transcoding_summary(play_session_id, play_state.media_source_id.as_deref())?;
+    let mut info = serde_json::json!({
+        "IsVideoDirect": s.is_video_direct,
+        "IsAudioDirect": s.is_audio_direct,
+        "TranscodeReasons": s.reasons,
+    });
+    let fields = [
+        ("VideoCodec", s.video_codec.map(serde_json::Value::from)),
+        ("AudioCodec", s.audio_codec.map(serde_json::Value::from)),
+        (
+            "AudioChannels",
+            s.audio_channels.map(serde_json::Value::from),
+        ),
+        (
+            "HardwareAccelerationType",
+            s.hardware_acceleration_type.map(serde_json::Value::from),
+        ),
+    ];
+    for (key, value) in fields {
+        if let Some(value) = value {
+            info[key] = value;
+        }
+    }
+    Some(info)
 }
 
 #[cfg(test)]
