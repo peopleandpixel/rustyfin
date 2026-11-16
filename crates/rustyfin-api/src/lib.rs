@@ -12,4 +12,5 @@ pub mod routes;
 pub mod sessions;
 pub mod sort_names;
 pub mod state;
+pub mod user_data_changes;
 pub mod wizard_import;
