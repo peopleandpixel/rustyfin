@@ -96,6 +96,7 @@ async fn test_state() -> AppState {
         jellyfin_import: Default::default(),
         directory_listings: Default::default(),
         file_guard: Default::default(),
+        session_runtime: Default::default(),
     }
 }
 
@@ -28293,12 +28294,9 @@ async fn g2_legitimate_reset_pin_flow_changes_password_and_revokes_tokens() {
     let pin_file = body["PinFile"]
         .as_str()
         .expect("the response names a PinFile path");
-    let contents = std::fs::read_to_string(pin_file).expect("the PIN file exists on a LAN request");
-    let parsed: serde_json::Value = serde_json::from_str(&contents).unwrap();
-    let pin = parsed["Pin"]
-        .as_str()
-        .expect("a Pin in the file")
-        .to_string();
+    let pin = await_reset_pin(pin_file.as_ref())
+        .await
+        .expect("the PIN file exists on a LAN request");
 
     let (status, body) = send(
         &app,
@@ -28360,9 +28358,7 @@ async fn g2_five_wrong_pin_attempts_void_the_reset() {
     .await;
     assert_eq!(status, StatusCode::OK);
     let pin_file = body["PinFile"].as_str().expect("a PinFile path");
-    let parsed: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(pin_file).unwrap()).unwrap();
-    let real_pin = parsed["Pin"].as_str().unwrap().to_string();
+    let real_pin = await_reset_pin(pin_file.as_ref()).await.unwrap();
 
     for n in 1..=5 {
         let (s, _) = send(
@@ -28592,8 +28588,39 @@ async fn g2f_limited(app: &axum::Router, n: usize, xff: &[&str]) -> usize {
     limited
 }
 
-/// Sends ForgotPassword for `user` with the given XFF lines; returns whether the reset file exists.
+/// Sends ForgotPassword for `user` with the given XFF lines; returns whether the reset file exists
+/// once the answer is in. Only for clients that get no file: those start no reset work.
 async fn g2f_forgot_writes_file(app: &axum::Router, user: &str, xff: &[&str]) -> bool {
+    g2f_forgot_pin_file(app, user, xff).await.exists()
+}
+
+/// `g2f_forgot_writes_file` for clients that get a file (see `await_reset_pin`).
+async fn g2f_forgot_writes_file_soon(app: &axum::Router, user: &str, xff: &[&str]) -> bool {
+    let path = g2f_forgot_pin_file(app, user, xff).await;
+    await_reset_pin(&path).await.is_some()
+}
+
+/// The PIN in the reset file `path`; None when none is there within 10 s. The reset work may
+/// finish after the 250 ms ForgotPassword answer under load, and the file is created before it is
+/// written, so it is read until it parses.
+async fn await_reset_pin(path: &std::path::Path) -> Option<String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let parsed = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+        if let Some(pin) = parsed.as_ref().and_then(|p| p["Pin"].as_str()) {
+            return Some(pin.to_string());
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// Sends ForgotPassword for `user` with the given XFF lines; returns the answer's `PinFile` path.
+async fn g2f_forgot_pin_file(app: &axum::Router, user: &str, xff: &[&str]) -> std::path::PathBuf {
     let mut b = Request::builder()
         .method("POST")
         .uri("/Users/ForgotPassword")
@@ -28612,7 +28639,7 @@ async fn g2f_forgot_writes_file(app: &axum::Router, user: &str, xff: &[&str]) ->
         StatusCode::OK,
         "ForgotPassword is always 200: {body:?}"
     );
-    std::path::Path::new(body["PinFile"].as_str().expect("a PinFile path")).exists()
+    body["PinFile"].as_str().expect("a PinFile path").into()
 }
 
 /// Creates the owner "owner" through the setup wizard.
@@ -28755,7 +28782,7 @@ async fn g2f_lan_gate_uses_the_resolved_client() {
         "a remote client behind a LAN proxy gets no reset file"
     );
     assert!(
-        g2f_forgot_writes_file(&app, "owner", &["203.0.113.5", "192.168.1.5"]).await,
+        g2f_forgot_writes_file_soon(&app, "owner", &["203.0.113.5", "192.168.1.5"]).await,
         "a LAN client behind the same proxy gets one"
     );
 }
@@ -28784,7 +28811,7 @@ async fn g2f_mapped_ipv4_lan_peer_gets_a_reset_file() {
     g2f_with_owner(&state).await;
     let app = g2f_app_from(state, "[::ffff:192.168.1.20]:6113");
     assert!(
-        g2f_forgot_writes_file(&app, "owner", &[]).await,
+        g2f_forgot_writes_file_soon(&app, "owner", &[]).await,
         "a mapped LAN peer gets a reset file"
     );
 }
@@ -28848,12 +28875,9 @@ async fn g2f_start_reset(app: &axum::Router) -> String {
     .await;
     assert_eq!(status, StatusCode::OK);
     let file = body["PinFile"].as_str().expect("a PinFile path");
-    let parsed: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(file).expect("the reset file")).unwrap();
-    parsed["Pin"]
-        .as_str()
-        .expect("a Pin in the file")
-        .to_string()
+    await_reset_pin(file.as_ref())
+        .await
+        .expect("a reset file with a Pin")
 }
 
 /// Redeems `pin` through ForgotPassword/Pin and returns the status.
@@ -29193,7 +29217,9 @@ async fn g2c_direct_loopback_stays_exempt_and_gets_the_reset_file() {
         "direct loopback is exempt"
     );
     assert!(
-        g2c_forgot(&app, "owner", &[]).await.exists(),
+        await_reset_pin(&g2c_forgot(&app, "owner", &[]).await)
+            .await
+            .is_some(),
         "direct loopback is local and gets the reset file"
     );
 }
@@ -29208,7 +29234,9 @@ async fn g2c_direct_lan_client_is_local_only_without_a_forwarding_header() {
         "a LAN peer that sends X-Forwarded-For is not local"
     );
     assert!(
-        g2c_forgot(&app, "owner", &[]).await.exists(),
+        await_reset_pin(&g2c_forgot(&app, "owner", &[]).await)
+            .await
+            .is_some(),
         "the same LAN peer without it stays local"
     );
 }
@@ -32817,7 +32845,10 @@ async fn r3sessions_ended_sessions_leave_no_play_state_behind() {
         r3s_start(&app, &admin, &gone, "r3s-gone", m[0]).await,
         r3s_start(&app, &admin, &idle, "r3s-idle", m[0]).await,
     ];
-    assert!(ids.iter().all(|id| rustyfin_api::sessions::tracks(id)));
+    assert!(
+        ids.iter()
+            .all(|id| rustyfin_api::sessions::tracks(&state, id))
+    );
 
     // Logout, deleting the user, deleting the device, and expiry each end one.
     assert_eq!(
@@ -32846,7 +32877,7 @@ async fn r3sessions_ended_sessions_leave_no_play_state_behind() {
         .zip(&ids)
     {
         assert!(
-            !rustyfin_api::sessions::tracks(id),
+            !rustyfin_api::sessions::tracks(&state, id),
             "{what} left play state behind"
         );
     }

@@ -169,7 +169,7 @@ pub(crate) async fn start_session(
         .await
         .unwrap_or_default();
         for id in ids.iter().filter(|id| Some(*id) != existing.as_ref()) {
-            crate::sessions::forget(id);
+            crate::sessions::forget(state, id);
         }
     }
     let session_id = existing

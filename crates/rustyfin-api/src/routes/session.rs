@@ -149,7 +149,7 @@ async fn logout_session(
             None => Vec::new(),
         };
         rustyfin_auth::logout(&state.db, &rt.0).await?;
-        crate::sessions::forget_all(&ended);
+        crate::sessions::forget_all(&state, &ended);
         crate::sessions::changed(&state);
     }
     Ok(StatusCode::NO_CONTENT)
@@ -167,7 +167,7 @@ async fn playing_ping(
     }
     let token = token.as_ref().map(|Extension(rt)| rt.0.as_str());
     if let Some(session) = crate::sessions::for_token(&state, token).await? {
-        crate::sessions::ping(&session);
+        crate::sessions::ping(&state, &session);
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -401,7 +401,7 @@ async fn delete_device(
     }
     let ended = rustyfin_db::repo_session::session_ids(&state.db, None, Some(&q.id)).await?;
     rustyfin_db::repo_session::delete_device(&state.db, &q.id).await?;
-    crate::sessions::forget_all(&ended);
+    crate::sessions::forget_all(&state, &ended);
     crate::sessions::changed(&state);
     Ok(Json(serde_json::json!({})))
 }

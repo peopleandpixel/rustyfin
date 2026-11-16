@@ -67,9 +67,24 @@ fn append(path: &Path, len: usize) {
 }
 
 /// Waits until a change gets a later modified time than the change before, also where the
-/// kernel's clock for timestamps is coarse.
+/// kernel's clock for timestamps is coarse: rewrites a probe file next to the test trees until
+/// its modified time moves past the one it got first.
 fn tick() {
-    std::thread::sleep(Duration::from_millis(60));
+    let probe = std::env::temp_dir().join(format!("rustyfin_test_tick_{}", Uuid::new_v4()));
+    let stamp = || {
+        std::fs::write(&probe, b"x").unwrap();
+        std::fs::metadata(&probe).unwrap().modified().unwrap()
+    };
+    let first = stamp();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while stamp() <= first {
+        assert!(
+            Instant::now() < deadline,
+            "the modified time did not move within 10 s"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let _ = std::fs::remove_file(&probe);
 }
 
 fn sorted<T: Ord>(mut items: Vec<T>) -> Vec<T> {
@@ -734,6 +749,7 @@ fn an_emptied_library_path_counts_as_unavailable() {
     // An unmounted share leaves its mount point empty.
     let away = tree.outside("away");
     std::fs::create_dir(&away).unwrap();
+    tick();
     for name in ["Heat (1995)", "Alien (1979)"] {
         std::fs::rename(tree.at(name), away.join(name)).unwrap();
     }
