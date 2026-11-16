@@ -1,12 +1,13 @@
 use crate::query::Query;
 use axum::Json;
 use axum::Router;
-use axum::extract::{Path, Request, State};
+use axum::extract::{ConnectInfo, Path, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use std::collections::HashMap;
+use std::net::SocketAddr;
 
 use rustyfin_core::dlna;
 use rustyfin_model::media::MediaType;
@@ -33,14 +34,23 @@ pub fn routes() -> Router<AppState> {
 
 /// While `EnableDlnaServer` is off, the DLNA server's routes answer 404. Checked per request, so
 /// turning it on in the configuration takes effect at once (SSDP discovery starts at the next
-/// restart).
+/// restart). DLNA is a local-network protocol and its routes need no sign-in, so a client outside
+/// the local network gets the same 404: a forwarding header from a peer that isn't a trusted
+/// proxy leaves the client unresolved, which is never local.
 pub async fn require_dlna_enabled(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
     req: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
     if !state.config.read().await.enable_dlna_server {
         return Err(ApiError::NotFound("The DLNA server is turned off.".into()));
+    }
+    let client = crate::middleware::resolve_client(peer.ip(), req.headers(), &state.known_proxies);
+    if !client.is_local() {
+        return Err(ApiError::NotFound(
+            "The DLNA server answers only the local network.".into(),
+        ));
     }
     Ok(next.run(req).await)
 }

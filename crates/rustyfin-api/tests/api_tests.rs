@@ -24841,6 +24841,14 @@ impl R2Parental {
 
     /// The DLNA ContentDirectory's answer to a Browse of `object` with `flag`.
     async fn dlna_browse(&self, object: &str, flag: &str) -> String {
+        let req = Self::dlna_browse_request(object, flag);
+        let (status, text) = g1_send_raw(&self.app, req).await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        text
+    }
+
+    /// A DLNA Browse request of `object` with `flag`.
+    fn dlna_browse_request(object: &str, flag: &str) -> Request<Body> {
         let body = format!(
             concat!(
                 r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">"#,
@@ -24851,7 +24859,7 @@ impl R2Parental {
             ),
             object, flag
         );
-        let req = Request::builder()
+        Request::builder()
             .method("POST")
             .uri("/dlna/control/ContentDirectory")
             .header("Content-Type", "text/xml")
@@ -24860,10 +24868,7 @@ impl R2Parental {
                 r#""urn:schemas-upnp-org:service:ContentDirectory:1#Browse""#,
             )
             .body(Body::from(body))
-            .unwrap();
-        let (status, text) = g1_send_raw(&self.app, req).await;
-        assert_eq!(status, StatusCode::OK, "{text}");
-        text
+            .unwrap()
     }
 }
 
@@ -25119,6 +25124,57 @@ async fn r3parental_dlna_browses_as_the_dlna_user_with_its_limits() {
         children.contains("<TotalMatches>0</TotalMatches>"),
         "{children}"
     );
+
+    // DLNA answers only the local network: a remote peer gets no listing and no stream, and
+    // neither does a forwarding header from a peer that isn't a trusted proxy, remote or not.
+    let remote = remote_app(w.state.clone());
+    let stream_uri = format!("/Dlna/{}/Items/{gentle}/Stream", w.state.server_id);
+    let spoofed = |mut req: Request<Body>| {
+        req.headers_mut()
+            .insert("X-Forwarded-For", "192.168.1.5".parse().unwrap());
+        req
+    };
+    for (app, spoof, label) in [
+        (&remote, false, "remote peer"),
+        (&remote, true, "remote peer, spoofed local X-Forwarded-For"),
+        (
+            &w.app,
+            true,
+            "loopback peer that isn't a trusted proxy, X-Forwarded-For",
+        ),
+    ] {
+        let wrap = |req| if spoof { spoofed(req) } else { req };
+        let browse = R2Parental::dlna_browse_request("0", "BrowseDirectChildren");
+        let (status, text) = g1_send_raw(app, wrap(browse)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{label}: {text}");
+        assert!(!text.contains("Parental"), "{label}: {text}");
+        let get = Request::builder()
+            .uri(&stream_uri)
+            .body(Body::empty())
+            .unwrap();
+        let (status, text) = g1_send_raw(app, wrap(get)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{label}");
+        assert!(!text.contains("r2parental video bytes"), "{label}");
+    }
+    assert_eq!(stream(&gentle, None).await.0, StatusCode::OK, "local still");
+
+    // DLNA switched off: 404 on every DLNA route, the stream included, with a user set.
+    w.configure(serde_json::json!({ "EnableDlnaServer": false }))
+        .await;
+    let browse = R2Parental::dlna_browse_request("0", "BrowseDirectChildren");
+    assert_eq!(g1_send_raw(&w.app, browse).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(stream(&gentle, None).await.0, StatusCode::NOT_FOUND);
+    let description = Request::builder()
+        .uri("/dlna/description.xml")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        g1_send_raw(&w.app, description).await.0,
+        StatusCode::NOT_FOUND
+    );
+    w.configure(serde_json::json!({ "EnableDlnaServer": true }))
+        .await;
+    assert_eq!(stream(&gentle, None).await.0, StatusCode::OK);
 
     // The DLNA user may not play media: nothing streams.
     w.set_policy(serde_json::json!({ "EnableMediaPlayback": false }))
