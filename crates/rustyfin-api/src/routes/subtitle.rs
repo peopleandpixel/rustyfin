@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 use rustyfin_core::subtitle::{
     OpenSubtitlesConfig, discover_external_subtitles, download_subtitle, is_image_subtitle,
-    shift_vtt, srt_to_vtt, strip_ass_blocks,
+    shift_srt, shift_vtt, srt_to_vtt, strip_ass_blocks,
 };
 use rustyfin_model::media_source::{MediaSourceResponse, MediaStream};
 
@@ -243,6 +243,13 @@ async fn subtitle_vtt(
             "Subtitles are served as vtt, srt or ass, not {format}"
         )));
     };
+    // ASS events carry their times in several places (override tags too), so an ASS file isn't
+    // moved; a client that starts a transcode later asks for WebVTT or SubRip
+    if start_ticks > 0 && output.muxer == "ass" {
+        return Err(ApiError::BadRequest(
+            "An ASS subtitle can't start later than 0; ask for vtt or srt".to_string(),
+        ));
+    }
 
     let sources =
         rustyfin_db::repo_media_source::get_media_sources_with_item_check(&state.db_ro, &id)
@@ -355,12 +362,11 @@ async fn subtitle_vtt(
         }
     };
 
-    // Only WebVTT cues move: a start offset comes with a progressive transcode, and the clients
-    // that play one ask for WebVTT
-    let text = if start_ticks > 0 && output.muxer == "webvtt" {
-        shift_vtt(&text, start_ticks)
-    } else {
-        text
+    // The cues move back by the start offset; ASS was refused one above
+    let text = match output.muxer {
+        "webvtt" => shift_vtt(&text, start_ticks),
+        "srt" => shift_srt(&text, start_ticks),
+        _ => text,
     };
     Ok((
         StatusCode::OK,
