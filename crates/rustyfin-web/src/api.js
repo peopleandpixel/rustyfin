@@ -511,7 +511,11 @@ const API = {
     markUnplayed(itemId) { return this.del(`/Users/${this.userId}/PlayedItems/${itemId}`); },
     setFavorite(itemId) { return this.post(`/Users/${this.userId}/FavoriteItems/${itemId}`); },
     unsetFavorite(itemId) { return this.del(`/Users/${this.userId}/FavoriteItems/${itemId}`); },
-    setRating(itemId, rating) { return this.put(`/Users/${this.userId}/Items/${itemId}/Rating`, { Rating: rating }); },
+    // Like (true) or dislike (false) an item, as Jellyfin's POST /UserItems/{id}/Rating?likes=; null clears it
+    setRating(itemId, likes) {
+        const path = `/UserItems/${encodeURIComponent(itemId)}/Rating`;
+        return likes === null ? this.del(path) : this.post(`${path}?likes=${likes ? 'true' : 'false'}`);
+    },
 
     // Streaming & Playback info
     streamUrl(itemId, type = 'Videos') {
@@ -549,12 +553,13 @@ const API = {
     },
     // Universal endpoint returns the optimal playback URL
     async getUniversalVideoUrl(itemId, params = {}) {
+        // No maxBitrate (the player's Auto) sends no limit, so any source the browser plays can play directly
         const q = new URLSearchParams({
-            MaxStreamingBitrate: params.maxBitrate || '100000000',
             EnableDirectPlay: params.enableDirectPlay !== false ? 'true' : 'false',
             EnableDirectStream: params.enableDirectStream !== false ? 'true' : 'false',
             PlaySessionId: 'web-' + (localStorage.getItem('rustyfin_device_id') || 'browser'),
         });
+        if (params.maxBitrate > 0) q.set('MaxStreamingBitrate', params.maxBitrate);
         const codecs = this.playableCodecs();
         q.set('VideoCodecs', codecs.video.join(','));
         q.set('AudioCodecs', codecs.audio.join(','));
@@ -600,6 +605,8 @@ const API = {
     getPlaylists() { return this.get('/Playlists'); },
     createPlaylist(name, ids) { return this.post('/Playlists', { Name: name, ItemIds: ids }); },
     getPlaylistItems(id) { return this.get(`/Playlists/${id}/Items`); },
+    addToPlaylist(id, ids) { return this.post(`/Playlists/${encodeURIComponent(id)}/Items?Ids=${ids.map(encodeURIComponent).join(',')}&UserId=${this.userId}`); },
+    addToCollection(id, ids) { return this.post(`/Collections/${encodeURIComponent(id)}/Items?Ids=${ids.map(encodeURIComponent).join(',')}`); },
 
     // Scheduled Tasks
     getTasks() { return this.get('/ScheduledTasks'); },

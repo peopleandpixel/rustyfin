@@ -52,7 +52,8 @@ function sandbox(heads, globals = {}, prelude = '') {
 }
 
 // --- Trickplay ---
-const TRICKPLAY = ['function trickplayInfo(', 'function trickplayThumb(', 'function showTrickplay(', 'function hideTrickplay(', 'function hoverSeek('];
+const TRICKPLAY = ['function trickplayInfo(', 'function trickplayThumb(', 'function showTrickplay(', 'function hideTrickplay(', 'function hoverSeek(',
+    'function chapterStart(', 'function chapterAt('];
 const sets = {
     160: { Width: 160, Height: 90, TileWidth: 10, TileHeight: 10, ThumbnailCount: 250, Interval: 10000 },
     320: { Width: 320, Height: 180, TileWidth: 10, TileHeight: 10, ThumbnailCount: 250, Interval: 10000 },
@@ -124,8 +125,13 @@ test('the seek bar wires hover, touch and drag to the preview; playItem reads th
 });
 
 // --- Skip intro and outro ---
-const SKIP = ['function skippableSegment(', 'async function checkSkipSegment(', 'function showSkipSegment(', 'function hideSkipSegment(', 'function skipSegment('];
-const SKIP_PRELUDE = `${decl('SKIP_SEGMENT_TYPES')} ${decl('SKIP_PROMPT_MS')} let skipPrompt = null; ${decl('segmentStart')} ${decl('segmentEnd')}`;
+const SKIP = ['function skippableSegment(', 'async function checkSkipSegment(', 'function showSkipSegment(', 'function hideSkipSegment(', 'function skipSegment(',
+    'function segmentTypeName('];
+// Jellyfin Web's default actions: ask to skip intros and outros, nothing for the rest (playerprefs.js)
+const SKIP_PRELUDE = `${decl('SKIP_PROMPT_MS')} let skipPrompt = null; ${decl('segmentStart')} ${decl('segmentEnd')}
+    const SEGMENT_TYPES = ['Intro', 'Outro', 'Recap', 'Preview', 'Commercial'];
+    const segmentAction = type => (['Intro', 'Outro'].includes(type) ? 'AskToSkip' : 'None');
+    function showPlayerOsd() {}`;
 const seg = (Type, start, end) => ({ Type, StartTicks: start * 1e7, EndTicks: end * 1e7 });
 
 test('an intro or outro of 3 s or more is offered; an outro to the end with a next item is left to the card', () => {
@@ -305,7 +311,7 @@ test('the Media Session shows the item and binds Jellyfin Web\'s actions; previo
     const video = { play: () => calls.push('play'), pause: () => calls.push('pause'), playbackRate: 1.5 };
     const box = sandbox(['function mediaSessionMetadata(', 'function updateMediaSession(', 'function setMediaPlaybackState(',
         'function updateMediaPosition(', 'function clearMediaSession(', 'function setMediaSessionHandler(', 'function bindMediaSession(',
-        'function episodeNumberLabel('], {
+        'function episodeNumberLabel(', 'function itemPicture(', 'function itemArtist('], {
         navigator: { mediaSession },
         MediaMetadata: class { constructor(m) { Object.assign(this, m); } },
         closePlayer: () => calls.push('close'),

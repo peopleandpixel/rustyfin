@@ -66,6 +66,12 @@ function sandbox({ episodes = SERIES, me = { Id: 'u1', Configuration: {} }, segm
         queueNeighbours: () => null,
         playQueueStep: () => false,
         setMediaSessionHandler: () => {},
+        // The still-watching prompt is off (r3playercore_still_watching.mjs covers it)
+        stillWatchingSetting: () => 'disabled',
+        stillWatchingDue: () => false,
+        watchRun: { start: 0, played: new Set() },
+        lastInput: 0,
+        stillWatchingAsking: false,
     });
     vm.runInContext(
         `var activePlayback = null; let episodeNav = null; let upNext = null; const UP_NEXT_SECONDS = 10;
@@ -346,7 +352,7 @@ test('after the audio carries over, the default subtitle is picked again for its
     // A subtitle the server remembered for this episode stays, off included
     assert.deepEqual(plain(fns.carriedTracks(next, carry, 1, 5, true)), { audioIndex: 2, subtitleIndex: 5 });
     assert.deepEqual(plain(fns.carriedTracks(next, carry, 1, -1, true)), { audioIndex: 2, subtitleIndex: -1 });
-    assert.match(slice('async function playItem('), /carriedTracks\(streams, carry, audioIndex, subtitleIndex, serverSubtitle\)/);
+    assert.match(slice('async function playItem('), /carriedTracks\(streams, carry, defaults\.audioIndex, defaults\.subtitleIndex, defaults\.subtitleFromServer, prefs\)/);
     // Audio that doesn't change leaves the episode's own subtitle choice alone
     assert.deepEqual(plain(fns.carriedTracks(next, { ...carry, audioLanguage: 'eng' }, 1, -1)), { audioIndex: 1, subtitleIndex: -1 });
 });
@@ -444,7 +450,7 @@ test('Space on a button focused by keyboard works the button; after a click, or 
 
 test('the player wires the block in: reports, stop, ended and fullscreen', () => {
     const play = slice('async function playItem(');
-    assert.match(play, /carriedTracks\(streams, carry, audioIndex, subtitleIndex, serverSubtitle\)/);
+    assert.match(play, /carriedTracks\(streams, carry, defaults\.audioIndex, defaults\.subtitleIndex, defaults\.subtitleFromServer, prefs\)/);
     assert.match(play, /resetEpisodeNav\(\)/);
     assert.match(play, /loadEpisodeNav\(session, item\)/);
     assert.match(play, /checkUpNext\(session\)/);

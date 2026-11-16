@@ -3240,7 +3240,9 @@ async fn b118_validate_path_admin_only_after_owner() {
 const B124_WEB_MODULES: &[&str] = &[
     "admin.js",
     "auth.js",
+    "cardmenu.js",
     "cards.js",
+    "genres.js",
     "home.js",
     "item.js",
     "jellyfin-import.js",
@@ -3249,6 +3251,7 @@ const B124_WEB_MODULES: &[&str] = &[
     "metadata-admin.js",
     "music.js",
     "player.js",
+    "playerprefs.js",
     "plugins.js",
     "queue.js",
     "router.js",
@@ -24269,6 +24272,54 @@ fn r3player_album() {
     b124_node_test("r3player_album.mjs");
 }
 
+// R3 core player: the default tracks from the user's language and subtitle preferences
+#[test]
+fn r3playercore_tracks() {
+    b124_node_test("r3playercore_tracks.mjs");
+}
+
+// R3 core player: text subtitles drawn in the user's appearance, and the subtitle offset (G, H)
+#[test]
+fn r3playercore_subtitles() {
+    b124_node_test("r3playercore_subtitles.mjs");
+}
+
+// R3 core player: quality steps, the version picker and the aspect ratio
+#[test]
+fn r3playercore_playback() {
+    b124_node_test("r3playercore_playback.mjs");
+}
+
+// R3 core player: chapter marks on the seek bar, the chapters menu and the chapter name over the seek preview
+#[test]
+fn r3playercore_chapters() {
+    b124_node_test("r3playercore_chapters.mjs");
+}
+
+// R3 core player: skip, ask or nothing for each media segment type
+#[test]
+fn r3playercore_segments() {
+    b124_node_test("r3playercore_segments.mjs");
+}
+
+// R3 core player: the Playback info overlay (play method, transcode reasons, codecs, buffer, dropped frames)
+#[test]
+fn r3playercore_stats() {
+    b124_node_test("r3playercore_stats.mjs");
+}
+
+// R3 core player: "Are you still watching?" before the next episode after a long run
+#[test]
+fn r3playercore_still_watching() {
+    b124_node_test("r3playercore_still_watching.mjs");
+}
+
+// R3 core player: music under a now-playing bar that stays across pages
+#[test]
+fn r3playercore_music() {
+    b124_node_test("r3playercore_music.mjs");
+}
+
 // The web client's item page: credits, ratings, media info, track pickers, chapters, links, "mark all
 // played" and delete (tests/web/r3item_detail.mjs), and the pickers' choice in the player
 // (tests/web/r3item_play.mjs)
@@ -24287,6 +24338,20 @@ fn r3item_play() {
 #[test]
 fn r3metadata_web() {
     b124_node_test("r3metadata_admin.mjs");
+}
+
+// The web client's cards: badges, played, favourite and menu buttons, the context menu, likes
+// (tests/web/r3cards_cards.mjs)
+#[test]
+fn r3cards_cards() {
+    b124_node_test("r3cards_cards.mjs");
+}
+
+// The web client's library page: the sort menu per list, view settings, the Episodes and Genres tabs
+// (tests/web/r3cards_library.mjs)
+#[test]
+fn r3cards_library() {
+    b124_node_test("r3cards_library.mjs");
 }
 
 // The web client's autoplay switch is Jellyfin's UserConfiguration.EnableNextEpisodeAutoPlay: each
@@ -27938,6 +28003,205 @@ async fn b23_each_key_sorts_both_ways_with_missing_values_and_ties_as_in_jellyfi
             assert_eq!(b23_names(&app, &token, &uri).await, expected, "{uri}");
         }
     }
+}
+
+// R3 cards: the sorts Jellyfin Web's library sort menus offer beyond the b23 keys: parental rating,
+// the caller's play count and date played, a series' newest episode and last played episode, and
+// an episode's series name
+#[tokio::test]
+async fn r3cards_library_sort_keys() {
+    let state = test_state().await;
+    let movies = rustyfin_model::library::LibraryContentType::Movies;
+    let (token, user_id, ids) = b23_library(&state, movies, &b23_movies()).await;
+    let library_id: String = sqlx::query_scalar("SELECT library_id FROM media_items WHERE id = ?")
+        .bind(ids[0].to_string())
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    for (i, rating) in [(0, "R"), (1, "PG"), (2, "G")] {
+        sqlx::query("UPDATE media_items SET official_rating = ? WHERE id = ?")
+            .bind(rating)
+            .bind(ids[i].to_string())
+            .execute(&state.db)
+            .await
+            .unwrap();
+    }
+    let user_data = |item: String, plays: i64, played_at: &'static str, favorite: bool| {
+        sqlx::query(
+            "INSERT INTO user_item_data (user_id, item_id, play_count, last_played_date, is_favorite) \
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(user_id.to_string())
+        .bind(item)
+        .bind(plays)
+        .bind(played_at)
+        .bind(favorite)
+    };
+    for (i, plays, at, favorite) in [
+        (3, 5, "2024-05-01T00:00:00Z", true),
+        (4, 2, "2024-06-01T00:00:00Z", false),
+        (5, 1, "2024-01-01T00:00:00Z", true),
+    ] {
+        user_data(ids[i].to_string(), plays, at, favorite)
+            .execute(&state.db)
+            .await
+            .unwrap();
+    }
+    // Two series, each with a season and an episode: Zulu was added last, but Yankee has the newer
+    // episode; the user last played Zulu's
+    let mut episodes = Vec::new();
+    for (n, (name, added, episode_added)) in [
+        ("Zulu", "2024-09-01T00:00:00Z", "2025-01-01T00:00:00Z"),
+        ("Yankee", "2024-02-01T00:00:00Z", "2025-06-01T00:00:00Z"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let series = uuid::Uuid::from_u128(0x3ca0_0000 + n as u128);
+        let season = uuid::Uuid::from_u128(0x3cb0_0000 + n as u128);
+        let episode = uuid::Uuid::from_u128(0x3cc0_0000 + n as u128);
+        for (id, parent, item_name, media_type, date) in [
+            (series, None, name.to_string(), "Series", added),
+            (season, Some(series), format!("{name} S1"), "Season", added),
+            (
+                episode,
+                Some(season),
+                "a".to_string(),
+                "Episode",
+                episode_added,
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO media_items (id, library_id, parent_id, name, sort_name, media_type, path, \
+                 date_created) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(id.to_string())
+            .bind(&library_id)
+            .bind(parent.map(|p| p.to_string()))
+            .bind(&item_name)
+            .bind(item_name.to_lowercase())
+            .bind(media_type)
+            .bind(format!("/r3cards/{id}"))
+            .bind(date)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        }
+        episodes.push(episode);
+    }
+    user_data(episodes[0].to_string(), 1, "2025-07-01T00:00:00Z", false)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    let app = app(state);
+    let movie_list = "/Items?Recursive=true&IncludeItemTypes=Movie";
+    let first = |order: Vec<usize>, picked: &[usize]| -> Vec<usize> {
+        order.into_iter().filter(|i| picked.contains(i)).collect()
+    };
+    let order = b23_order(
+        &app,
+        &token,
+        &format!("{movie_list}&SortBy=OfficialRating,SortName&SortOrder=Ascending"),
+        &ids,
+    )
+    .await;
+    assert_eq!(first(order, &[0, 1, 2]), [2, 1, 0], "G, PG, R");
+    let order = b23_order(
+        &app,
+        &token,
+        &format!("{movie_list}&SortBy=PlayCount,SortName&SortOrder=Descending"),
+        &ids,
+    )
+    .await;
+    assert_eq!(order[..3], [3, 4, 5], "most played first");
+    let order = b23_order(
+        &app,
+        &token,
+        &format!("{movie_list}&SortBy=DatePlayed,SortName&SortOrder=Descending"),
+        &ids,
+    )
+    .await;
+    assert_eq!(order[..3], [4, 3, 5], "last played first");
+    // The sort's user bind follows the filter's
+    let order = b23_order(
+        &app,
+        &token,
+        &format!("{movie_list}&Filters=IsFavorite&SortBy=PlayCount&SortOrder=Ascending"),
+        &ids,
+    )
+    .await;
+    assert_eq!(order, [5, 3], "favourites by play count");
+    let series_list = "/Items?Recursive=true&IncludeItemTypes=Series";
+    let names = |sort: &str| format!("{series_list}&SortBy={sort}&SortOrder=Descending");
+    assert_eq!(
+        b23_names(&app, &token, &names("DateCreated,SortName")).await,
+        ["Zulu", "Yankee"]
+    );
+    assert_eq!(
+        b23_names(&app, &token, &names("DateLastContentAdded,SortName")).await,
+        ["Yankee", "Zulu"],
+        "newest episode first"
+    );
+    assert_eq!(
+        b23_names(&app, &token, &names("SeriesDatePlayed,SortName")).await,
+        ["Zulu", "Yankee"],
+        "last watched first"
+    );
+    let listed: Vec<String> = b23_items(
+        &app,
+        &token,
+        "/Items?Recursive=true&IncludeItemTypes=Episode&SortBy=SeriesSortName,SortName&SortOrder=Ascending",
+    )
+    .await
+    .iter()
+    .map(|item| item["Id"].as_str().unwrap().to_string())
+    .collect();
+    assert_eq!(
+        listed,
+        [episodes[1].to_string(), episodes[0].to_string()],
+        "Yankee's episode first"
+    );
+}
+
+// R3 cards: the parental rating sort orders by the rating's score, as Jellyfin's
+// ParentalRatingValue, not by its text; unrated items come first ascending, and equal scores go by
+// the rating text
+#[tokio::test]
+async fn r3cards_parental_rating_sort_by_score() {
+    let state = test_state().await;
+    let ratings = ["TV-MA", "PG-13", "NR", "R", "G", "NC-17", "TV-14", "PG"];
+    let movie = |name| B23Item {
+        name,
+        sort_name: name,
+        media_type: "Movie",
+        ..Default::default()
+    };
+    let items: Vec<B23Item> = ratings.iter().map(|r| movie(r)).collect();
+    let movies = rustyfin_model::library::LibraryContentType::Movies;
+    let (token, _, ids) = b23_library(&state, movies, &items).await;
+    for (id, rating) in ids.iter().zip(ratings) {
+        sqlx::query("UPDATE media_items SET official_rating = ? WHERE id = ?")
+            .bind(rating)
+            .bind(id.to_string())
+            .execute(&state.db)
+            .await
+            .unwrap();
+    }
+    let app = app(state);
+    let uri = |order: &str| {
+        format!(
+            "/Items?Recursive=true&IncludeItemTypes=Movie&SortBy=OfficialRating,SortName&SortOrder={order}"
+        )
+    };
+    // R is 17; NC-17 and TV-MA are 17 with a sub score of 1, tied by their text
+    assert_eq!(
+        b23_names(&app, &token, &uri("Ascending")).await,
+        ["NR", "G", "PG", "PG-13", "TV-14", "R", "NC-17", "TV-MA"]
+    );
+    assert_eq!(
+        b23_names(&app, &token, &uri("Descending")).await,
+        ["TV-MA", "NC-17", "R", "TV-14", "PG-13", "PG", "G", "NR"]
+    );
 }
 
 #[tokio::test]
@@ -33157,6 +33421,109 @@ async fn g4_universal_sends_unplayable_audio_to_transcode() {
                 "{uri}: {url}"
             );
             assert_eq!(source["SupportsDirectPlay"], true, "{uri}");
+        }
+    }
+}
+
+// R3 core player: the web player's quality choice. MaxStreamingBitrate below the source's bitrate turns direct
+// play off, and the transcode gets the limit less its audio as VideoBitrate (kbps), above the transcode's
+// 8 Mbps default too, so the video is never copied over the limit. A limit the source fits, or none (the web
+// player's Auto), leaves direct play alone, a 60 Mbps remux included.
+#[tokio::test]
+async fn r3playercore_universal_honours_max_streaming_bitrate() {
+    let state = test_state().await;
+    let _dir = G4Dir(state.data_dir.to_path_buf());
+    let (token, _) = admin_session(&state).await;
+    let folder = media_folder(&state, "r3playercore-quality");
+    let mut items = std::collections::HashMap::new();
+    for bitrate in [4_500_000u32, 20_000_000, 60_000_000] {
+        let file = std::path::Path::new(&folder).join(format!("R3 Quality {bitrate}.mp4"));
+        std::fs::write(&file, b"r3").unwrap();
+        let id = g4_insert_item(&state, "Movie", &file).await;
+        let source: rustyfin_model::media_source::MediaSourceResponse =
+            serde_json::from_value(serde_json::json!({
+                "Id": uuid::Uuid::new_v4().to_string(),
+                "Uid": uuid::Uuid::new_v4().to_string(),
+                "Container": "mp4",
+                "Protocol": "File",
+                "Path": file.to_str().unwrap(),
+                "Bitrate": bitrate,
+                "MediaStreams": [
+                    { "Index": 0, "Codec": "h264", "CodecType": "Video" },
+                    { "Index": 1, "Codec": "aac", "CodecType": "Audio" },
+                ],
+            }))
+            .unwrap();
+        rustyfin_db::repo_media_source::insert_media_source_with_streams(&state.db, &id, &source)
+            .await
+            .unwrap();
+        items.insert(bitrate, id);
+    }
+    let app = app(state);
+
+    let lists = "&VideoCodecs=h264,vp8,vp9,av1&AudioCodecs=aac,mp3,opus,flac";
+    for (source_bitrate, limit, direct, video_bitrate) in [
+        (4_500_000, None, true, None),
+        (4_500_000, Some(100_000_000), true, None),
+        (4_500_000, Some(20_000_000), true, None),
+        (
+            4_500_000,
+            Some(3_000_000),
+            false,
+            Some("VideoBitrate=2808&"),
+        ),
+        (4_500_000, Some(420_000), false, Some("VideoBitrate=228&")),
+        (20_000_000, None, true, None),
+        (
+            20_000_000,
+            Some(3_000_000),
+            false,
+            Some("VideoBitrate=2808&"),
+        ),
+        (
+            20_000_000,
+            Some(15_000_000),
+            false,
+            Some("VideoBitrate=14808&"),
+        ),
+        (20_000_000, Some(40_000_000), true, None),
+        (60_000_000, None, true, None),
+        (
+            60_000_000,
+            Some(3_000_000),
+            false,
+            Some("VideoBitrate=2808&"),
+        ),
+        (
+            60_000_000,
+            Some(15_000_000),
+            false,
+            Some("VideoBitrate=14808&"),
+        ),
+        (
+            60_000_000,
+            Some(40_000_000),
+            false,
+            Some("VideoBitrate=39808&"),
+        ),
+    ] {
+        let id = items[&source_bitrate];
+        let limit = limit
+            .map(|l| format!("MaxStreamingBitrate={l}"))
+            .unwrap_or_default();
+        let uri = format!("/Videos/{id}/Universal?{limit}{lists}");
+        let (status, body) = send(&app, request("GET", &uri, Some(&token), None)).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        let url = body["Url"].as_str().unwrap_or_default();
+        assert_eq!(
+            body["MediaSources"][0]["SupportsDirectPlay"], direct,
+            "{uri}"
+        );
+        if direct {
+            assert!(url.contains("Static=true"), "{uri}: {url}");
+        } else {
+            assert!(url.contains("main.m3u8"), "{uri}: {url}");
+            assert!(url.contains(video_bitrate.unwrap()), "{uri}: {url}");
         }
     }
 }

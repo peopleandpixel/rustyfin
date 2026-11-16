@@ -130,6 +130,49 @@ body {
 @media (width >= 64rem) { .jf-lib-grid { --jf-cols: 5; } }
 @media (width >= 80rem) { .jf-lib-grid { --jf-cols: 7; } }
 
+/* The library's view settings (library.js libraryGridClass): the card shape and size pick the
+   columns per breakpoint. Medium posters are the default above. */
+.jf-lib-grid.jf-shape-poster.jf-size-small { --jf-cols: 3; }
+.jf-lib-grid.jf-shape-poster.jf-size-large { --jf-cols: 2; }
+.jf-lib-grid.jf-shape-backdrop { --jf-cols: 1; }
+.jf-lib-grid.jf-shape-backdrop.jf-size-small { --jf-cols: 2; }
+.jf-lib-grid.jf-shape-banner,
+.jf-lib-grid.jf-shape-list { --jf-cols: 1; }
+@media (width >= 40rem) {
+  .jf-lib-grid.jf-shape-poster.jf-size-small { --jf-cols: 4; }
+  .jf-lib-grid.jf-shape-backdrop { --jf-cols: 2; }
+  .jf-lib-grid.jf-shape-backdrop.jf-size-small { --jf-cols: 3; }
+  .jf-lib-grid.jf-shape-backdrop.jf-size-large { --jf-cols: 1; }
+  .jf-lib-grid.jf-shape-banner.jf-size-small { --jf-cols: 2; }
+}
+@media (width >= 48rem) {
+  .jf-lib-grid.jf-shape-poster.jf-size-small { --jf-cols: 6; }
+  .jf-lib-grid.jf-shape-poster.jf-size-large { --jf-cols: 3; }
+  .jf-lib-grid.jf-shape-backdrop { --jf-cols: 3; }
+  .jf-lib-grid.jf-shape-backdrop.jf-size-small { --jf-cols: 4; }
+  .jf-lib-grid.jf-shape-backdrop.jf-size-large { --jf-cols: 2; }
+  .jf-lib-grid.jf-shape-banner { --jf-cols: 2; }
+  .jf-lib-grid.jf-shape-banner.jf-size-large { --jf-cols: 1; }
+}
+@media (width >= 64rem) {
+  .jf-lib-grid.jf-shape-poster.jf-size-small { --jf-cols: 7; }
+  .jf-lib-grid.jf-shape-poster.jf-size-large { --jf-cols: 4; }
+  .jf-lib-grid.jf-shape-backdrop.jf-size-small { --jf-cols: 5; }
+  .jf-lib-grid.jf-shape-backdrop.jf-size-large { --jf-cols: 2; }
+  .jf-lib-grid.jf-shape-banner.jf-size-small { --jf-cols: 3; }
+}
+@media (width >= 80rem) {
+  .jf-lib-grid.jf-shape-poster.jf-size-small { --jf-cols: 9; }
+  .jf-lib-grid.jf-shape-poster.jf-size-large { --jf-cols: 5; }
+  .jf-lib-grid.jf-shape-backdrop { --jf-cols: 4; }
+  .jf-lib-grid.jf-shape-backdrop.jf-size-small { --jf-cols: 6; }
+  .jf-lib-grid.jf-shape-backdrop.jf-size-large { --jf-cols: 3; }
+  .jf-lib-grid.jf-shape-banner { --jf-cols: 3; }
+  .jf-lib-grid.jf-shape-banner.jf-size-small { --jf-cols: 4; }
+  .jf-lib-grid.jf-shape-banner.jf-size-large { --jf-cols: 2; }
+}
+.jf-lib-grid.jf-shape-list { --jf-cols: 1 !important; gap: 0.5rem; }
+
 /* The library grid is virtual (app.js libraryView): it keeps the whole list's height, and only
    the cells near the viewport are in it, each placed by the script at its row and column. Its
    columns and gap above still drive the cell size. Contained, so a cell coming or going lays out
@@ -237,6 +280,173 @@ body {
 
 .jf-card:hover .jf-play-btn-circle:hover {
   transform: scale(1.15);
+}
+
+/* A card's marks over its picture (cards.js cardMarksHtml): they never take a click */
+.jf-card-marks {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  pointer-events: none;
+}
+
+.jf-card-check,
+.jf-card-count {
+  min-width: 1.5rem;
+  height: 1.5rem;
+  padding: 0 0.35rem;
+  border-radius: 9999px;
+  background: #00a4dc;
+  color: #fff;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.7rem;
+  font-weight: 700;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+}
+
+/* The card's played, favourite and menu buttons, bottom right, shown on hover or focus; on a
+   touch screen only the menu button, always */
+/* A genre row not loaded yet keeps about a row's height, so only the rows near the screen load */
+.jf-genre-slot {
+  min-height: 18rem;
+}
+
+/* A long press on a card opens its menu (cardmenu.js), not iOS's link callout */
+.jf-card[data-id] {
+  -webkit-touch-callout: none;
+}
+
+.jf-card-actions {
+  position: absolute;
+  right: 0.4rem;
+  bottom: 0.5rem;
+  z-index: 4;
+  display: flex;
+  gap: 0.25rem;
+  opacity: 0;
+  transition: opacity 0.2s ease;
+}
+
+.jf-card:hover .jf-card-actions,
+.jf-card:focus-within .jf-card-actions {
+  opacity: 1;
+}
+
+.jf-card-action {
+  width: 2rem;
+  height: 2rem;
+  border-radius: 9999px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: rgba(255, 255, 255, 0.85);
+  background: rgba(0, 0, 0, 0.6);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+}
+
+.jf-card-action:hover {
+  background: rgba(0, 0, 0, 0.85);
+  color: #fff;
+}
+
+.jf-card-action.is-on[data-action="card-played"] {
+  color: #00a4dc;
+}
+
+.jf-card-action.is-on[data-action="card-favorite"] {
+  color: #f43f5e;
+}
+
+.jf-card-action.is-on[data-action="card-favorite"] svg {
+  fill: currentColor;
+}
+
+@media (hover: none) {
+  .jf-card-actions {
+    opacity: 1;
+  }
+  .jf-card-action:not([data-action="card-menu"]) {
+    display: none;
+  }
+}
+
+/* Banner cards (library view settings): Jellyfin's banner shape */
+.jf-poster-banner {
+  aspect-ratio: 1000/185;
+  overflow: hidden;
+  position: relative;
+  border-radius: 0.85rem 0.85rem 0 0;
+  background: linear-gradient(135deg, #151a23 0%, #1e2430 100%);
+}
+
+/* List view rows (library view settings) */
+.jf-card.jf-list-row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.4rem 0.5rem;
+}
+
+.jf-list-thumb {
+  position: relative;
+  flex: none;
+  width: 3rem;
+  aspect-ratio: 2/3;
+  overflow: hidden;
+  border-radius: 0.35rem;
+  background: var(--jf-bg-surface);
+}
+
+.jf-list-thumb .jf-card-check,
+.jf-list-thumb .jf-card-count {
+  transform: scale(0.75);
+  transform-origin: top right;
+}
+
+.jf-list-row .jf-card-actions {
+  position: static;
+  flex: none;
+}
+
+/* The card context menu and the library's view menu: popovers placed by the script */
+.jf-card-menu {
+  position: fixed;
+  inset: auto;
+  margin: 0;
+  min-width: 13rem;
+  max-height: min(80dvh, 32rem);
+  overflow-y: auto;
+  padding: 0.35rem;
+  border: 1px solid var(--jf-border);
+  border-radius: 0.65rem;
+  background: var(--jf-bg-surface);
+  color: var(--jf-text-main);
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.6);
+}
+
+.jf-card-menu [role^="menuitem"] {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.5rem 0.65rem;
+  border-radius: 0.4rem;
+  font-size: 0.85rem;
+  text-align: left;
+}
+
+.jf-card-menu [role^="menuitem"]:hover,
+.jf-card-menu [role^="menuitem"]:focus-visible {
+  background: rgba(255, 255, 255, 0.08);
+  outline: none;
+}
+
+.jf-card-menu hr {
+  margin: 0.3rem 0;
+  border-color: var(--jf-border);
 }
 
 /* Progress bar on cards */
@@ -933,6 +1143,215 @@ select.jf-input {
   cursor: none;
 }
 
+/* Text subtitles: the player draws the cues in the user's appearance (playerprefs.js subtitleCss), which sets
+   the window's font, colour and place; the size scales with the player's height */
+.jf-subtitle-overlay {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  font-size: clamp(14px, 2.4vh, 40px);
+  z-index: 10;
+}
+
+.jf-subtitle-window {
+  position: absolute;
+  left: 5%;
+  right: 5%;
+  text-align: center;
+  line-height: 1.35;
+}
+
+.jf-subtitle-text {
+  white-space: pre-line;
+  padding: 0 0.25em;
+  background-color: var(--jf-subtitle-bg, transparent);
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
+}
+
+.jf-player-osd {
+  position: absolute;
+  top: 5rem;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 40;
+  padding: 0.4rem 0.9rem;
+  border-radius: 0.5rem;
+  background: rgba(0, 0, 0, 0.7);
+  color: #fff;
+  font-size: 0.875rem;
+  pointer-events: none;
+}
+
+/* The player's settings menu (the gear), above the controls */
+.jf-player-menu {
+  position: absolute;
+  bottom: 100%;
+  right: 0;
+  margin-bottom: 0.75rem;
+  width: 21rem;
+  max-width: calc(100vw - 2rem);
+  max-height: 65vh;
+  overflow-y: auto;
+  padding: 0.75rem;
+  border-radius: 0.75rem;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(0, 0, 0, 0.88);
+  backdrop-filter: blur(12px);
+  color: #fff;
+  font-size: 0.8125rem;
+  box-shadow: 0 25px 50px rgba(0, 0, 0, 0.6);
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+#player-settings > summary::-webkit-details-marker,
+#player-chapters > summary::-webkit-details-marker {
+  display: none;
+}
+
+/* Now playing: the music bar along the bottom of every page; the page scrolls clear of it */
+.jf-now-playing {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 60;
+  background: rgba(10, 13, 20, 0.95);
+  backdrop-filter: blur(12px);
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.jf-now-playing-seek {
+  display: block;
+  width: 100%;
+  height: 4px;
+  margin: 0;
+  cursor: pointer;
+}
+
+body.jf-has-now-playing main {
+  padding-bottom: 5rem;
+}
+
+body.jf-has-now-playing #toast-container {
+  bottom: 5.5rem;
+}
+
+/* Playback info: Jellyfin Web's stats overlay, top left under the top bar */
+.jf-player-stats {
+  position: absolute;
+  top: 5.5rem;
+  left: 1rem;
+  z-index: 35;
+  width: 22rem;
+  max-width: calc(100% - 2rem);
+  max-height: calc(100% - 13rem);
+  overflow-y: auto;
+  padding: 0.75rem;
+  border-radius: 0.75rem;
+  background: rgba(0, 0, 0, 0.75);
+  backdrop-filter: blur(8px);
+  color: #fff;
+  font-size: 0.75rem;
+}
+
+.jf-player-stats dl {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.15rem 0.75rem;
+}
+
+.jf-player-stats dt {
+  color: rgba(255, 255, 255, 0.6);
+}
+
+/* Chapter starts over the seek bar's track; the bar takes the pointer */
+.jf-chapter-marks {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 1;
+}
+
+.jf-chapter-mark {
+  position: absolute;
+  top: 50%;
+  width: 3px;
+  height: 0.6rem;
+  border-radius: 1px;
+  background: rgba(255, 255, 255, 0.75);
+  transform: translate(-50%, -50%);
+}
+
+.jf-chapter-item {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.75rem;
+  border-radius: 0.375rem;
+  padding: 0.35rem 0.5rem;
+  text-align: left;
+}
+
+.jf-chapter-item:hover,
+.jf-chapter-item:focus-visible {
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.jf-chapter-item[aria-current="true"] {
+  color: #38bdf8;
+}
+
+.jf-player-menu-heading {
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: rgba(255, 255, 255, 0.55);
+}
+
+.jf-player-menu-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.jf-player-menu-select {
+  max-width: 11rem;
+  border-radius: 0.25rem;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.1);
+  padding: 0.2rem 0.4rem;
+  color: #fff;
+}
+
+.jf-player-menu-select option {
+  background: #111;
+}
+
+.jf-player-menu-btn {
+  min-width: 1.75rem;
+  border-radius: 0.25rem;
+  background: rgba(255, 255, 255, 0.1);
+  padding: 0.15rem 0.45rem;
+}
+
+.jf-player-menu-btn:hover,
+.jf-player-menu-btn[aria-pressed="true"] {
+  background: rgba(0, 164, 220, 0.6);
+}
+
+.jf-subtitle-preview-box {
+  padding: 0.5rem;
+  border-radius: 0.375rem;
+  background: linear-gradient(135deg, #4b5563, #1f2937);
+  text-align: center;
+  line-height: 1.35;
+  font-size: 0.75rem;
+}
+
 /* Animations */
 .jf-page {
   animation: jfFadeUp 0.3s cubic-bezier(0.16, 1, 0.3, 1);
@@ -1020,7 +1439,10 @@ img.jf-thumb-img {
 
 /* A library cell whose item has not arrived: the skeleton colour in the poster box and two bars
    in place of the title lines (drawn as backgrounds, so the cell keeps a card's exact size) */
-.jf-card-pending .jf-poster {
+.jf-card-pending .jf-poster,
+.jf-card-pending .jf-poster-backdrop,
+.jf-card-pending .jf-poster-banner,
+.jf-card-pending .jf-list-thumb {
   background: var(--jf-skeleton);
 }
 .jf-card-pending .p-3 > * {

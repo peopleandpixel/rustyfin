@@ -25,7 +25,13 @@ const choiceEnd = play.indexOf('    // The session owns this playback');
 assert.ok(choiceStart > 0 && choiceEnd > choiceStart, 'playItem has its track choice block');
 const CHOICE = play.slice(choiceStart, choiceEnd);
 
-const context = vm.createContext({});
+// The track rules (playerprefs.js) with no user preferences: Jellyfin's defaults
+const prefsModule = await import(new URL('modules/playerprefs.js', src));
+const context = vm.createContext({
+    defaultTracks: prefsModule.defaultTracks,
+    preferredSubtitleIndex: prefsModule.defaultSubtitleIndex,
+    prefs: prefsModule.trackPrefs(null),
+});
 vm.runInContext(
     `${['function resumePositionTicks(', 'function isStreamType(', 'function defaultSubtitleIndex(', 'function carriedTracks('].map(h => slice(player, h)).join('\n')}
      this.choose = (item, info, { streamType = 'Videos', fromStart = false, carry = null, selection = null } = {}) => {
