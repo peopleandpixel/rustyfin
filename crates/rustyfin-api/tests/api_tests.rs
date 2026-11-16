@@ -40921,6 +40921,40 @@ async fn j2_audio_items_use_the_audio_profiles() {
     assert!(url.ends_with("&AudioOnly=true"), "{url}");
 }
 
+// R3 playback: POST /Sessions/Capabilities takes Jellyfin's query parameters with no body, and
+// answers 204 as Jellyfin does
+#[tokio::test]
+async fn r3playback_capabilities_take_query_parameters_without_a_body() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let app = app(state);
+
+    let uri = "/Sessions/Capabilities?playableMediaTypes=Video,Audio&supportedCommands=Play\
+               &supportsMediaControl=true&supportsPersistentIdentifier=false";
+    let (status, _) = send(&app, request("POST", uri, Some(&token), None)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = send(
+        &app,
+        request("POST", "/Sessions/Capabilities", Some(&token), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    // The JSON body Rustyfin took before still works
+    let body = serde_json::json!({ "PlayableMediaTypes": ["Audio"] });
+    let (status, _) = send(
+        &app,
+        request("POST", "/Sessions/Capabilities", Some(&token), Some(body)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    // A value that is no boolean is refused, and a request without a token too
+    let uri = "/Sessions/Capabilities?supportsMediaControl=maybe";
+    let (status, _) = send(&app, request("POST", uri, Some(&token), None)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = send(&app, request("POST", "/Sessions/Capabilities", None, None)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
 #[tokio::test]
 async fn j2_profile_comes_from_the_device_capabilities() {
     let state = test_state().await;

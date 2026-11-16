@@ -116,7 +116,7 @@ pub struct ClientCapabilities {
 
 /// Request body for POST /Sessions/Capabilities. Jellyfin binds it without regard to case, so
 /// the camelCase names that some clients post are read too.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct SessionCapabilitiesRequest {
     #[serde(default, alias = "playableMediaTypes")]
