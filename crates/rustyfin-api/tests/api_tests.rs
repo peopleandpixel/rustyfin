@@ -6968,7 +6968,8 @@ async fn r1auth_users_have_policy_and_configuration() {
     assert_eq!(policy["IsAdministrator"], false);
     assert_eq!(policy["EnableContentDeletion"], false);
     assert_eq!(policy["EnableMediaPlayback"], true);
-    assert_eq!(policy["EnableContentDownloading"], false);
+    // On for a new user, Jellyfin's UserPolicy default, now that /Items/{id}/Download exists
+    assert_eq!(policy["EnableContentDownloading"], true);
     assert_eq!(policy["EnableAllFolders"], true);
 
     // A Jellyfin client saves the whole policy back; the account keeps its role.
@@ -25136,18 +25137,27 @@ async fn g1_item_admin_routes() {
             true,
         ),
         ("DELETE", format!("/Items/{item}/Subtitles/0"), None, true),
+        // Jellyfin's remote subtitle routes (search by language, download by id), and upload
+        // and delete; the older non-Jellyfin search and download paths are gone
         (
             "GET",
-            format!("/Items/{item}/RemoteSearch/Subtitles"),
+            format!("/Items/{item}/RemoteSearch/Subtitles/eng"),
             None,
             false,
         ),
         (
             "POST",
-            format!("/Videos/{item}/Subtitles/0/Download"),
+            format!("/Items/{item}/RemoteSearch/Subtitles/some-id"),
             None,
             false,
         ),
+        (
+            "POST",
+            format!("/Videos/{item}/Subtitles"),
+            Some(serde_json::json!({"Language": "eng", "Format": "srt", "Data": "aGk="})),
+            false,
+        ),
+        ("DELETE", format!("/Videos/{item}/Subtitles/0"), None, false),
         ("POST", "/Collections?Name=G1".to_string(), None, true),
         ("DELETE", format!("/Collections/{coll}"), None, true),
         (
