@@ -1398,7 +1398,6 @@ fn has_remembered_stream(
 
 /// Check if a media source can be directly played by the client.
 /// Direct play requires the client to support all codecs without any transcoding.
-
 fn check_direct_play(
     source: &rustyfin_model::media_source::MediaSourceResponse,
     query: &VideoPlaybackInfoQuery,
