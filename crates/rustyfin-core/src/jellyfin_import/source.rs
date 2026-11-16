@@ -2713,6 +2713,7 @@ fn importable(type_name: &str) -> Option<(MediaType, String)> {
         "Episode" => MediaType::Episode,
         "Audio" => MediaType::Audio,
         "MusicAlbum" => MediaType::MusicAlbum,
+        "MusicArtist" => MediaType::MusicArtist,
         _ => return None,
     };
     Some((media_type, last.to_string()))

@@ -5,7 +5,7 @@ use axum::{Extension, Json, Router};
 use rustyfin_model::auth::Claims;
 use serde::Deserialize;
 
-use rustyfin_model::media::QueryResult;
+use rustyfin_model::media::{MediaItem, QueryResult};
 use rustyfin_model::person::{NameIdPair, PersonDto};
 
 use crate::error::ApiError;
@@ -74,7 +74,113 @@ async fn get_person_items(
     }))
 }
 
-async fn get_artists(State(state): State<AppState>) -> Result<Json<Vec<NameIdPair>>, ApiError> {
-    let artists = rustyfin_db::repo_person::get_artists(&state.db).await?;
-    Ok(Json(artists))
+/// The Jellyfin paging, filter and library query of the music artist lists (`/Artists`,
+/// `/Artists/AlbumArtists`). Keys are accepted in PascalCase and camelCase; other keys are ignored.
+#[derive(Deserialize)]
+pub(crate) struct ArtistsQuery {
+    #[serde(rename = "ParentId", alias = "parentId")]
+    parent_id: Option<String>,
+    #[serde(rename = "StartIndex", alias = "startIndex")]
+    start_index: Option<i64>,
+    #[serde(rename = "Limit", alias = "limit")]
+    limit: Option<i64>,
+    #[serde(rename = "SearchTerm", alias = "searchTerm")]
+    search_term: Option<String>,
+    #[serde(rename = "NameStartsWith", alias = "nameStartsWith")]
+    name_starts_with: Option<String>,
+    #[serde(rename = "NameStartsWithOrGreater", alias = "nameStartsWithOrGreater")]
+    name_starts_with_or_greater: Option<String>,
+    #[serde(rename = "NameLessThan", alias = "nameLessThan")]
+    name_less_than: Option<String>,
+    #[serde(rename = "SortOrder", alias = "sortOrder")]
+    sort_order: Option<String>,
+}
+
+/// Keeps the artists that pass the name filters, compared case-insensitively. An empty filter
+/// value means no filter.
+fn filter_artists(all: Vec<MediaItem>, query: &ArtistsQuery) -> Vec<MediaItem> {
+    let lowered = |value: &Option<String>| {
+        value
+            .as_deref()
+            .filter(|v| !v.is_empty())
+            .map(str::to_lowercase)
+    };
+    let search = lowered(&query.search_term);
+    let prefix = lowered(&query.name_starts_with);
+    let from = lowered(&query.name_starts_with_or_greater);
+    let before = lowered(&query.name_less_than);
+    let mut kept: Vec<MediaItem> = all
+        .into_iter()
+        .filter(|item| {
+            let name = item.name.to_lowercase();
+            search.as_deref().is_none_or(|s| name.contains(s))
+                && prefix.as_deref().is_none_or(|p| name.starts_with(p))
+                && from.as_deref().is_none_or(|f| name.as_str() >= f)
+                && before.as_deref().is_none_or(|b| name.as_str() < b)
+        })
+        .collect();
+    if query
+        .sort_order
+        .as_deref()
+        .is_some_and(|order| order.eq_ignore_ascii_case("Descending"))
+    {
+        kept.reverse();
+    }
+    kept
+}
+
+/// One page of the music artists linked as `link_kind` to items of `item_type`. A `ParentId`
+/// that is not a library id is ignored; `TotalRecordCount` counts all matches before paging.
+pub(crate) async fn music_artists_page(
+    state: &AppState,
+    query: &ArtistsQuery,
+    link_kind: &str,
+    item_type: &str,
+) -> Result<QueryResult, ApiError> {
+    let mut library = None;
+    if let Some(id) = query
+        .parent_id
+        .as_deref()
+        .and_then(|v| uuid::Uuid::parse_str(v).ok())
+        && rustyfin_db::repo_library::get_library_by_id(&state.db_ro, id)
+            .await?
+            .is_some()
+    {
+        library = Some(id);
+    }
+    let all =
+        rustyfin_db::repo_person::get_music_artists(&state.db_ro, link_kind, item_type, library)
+            .await?;
+    let all = filter_artists(all, query);
+    let total = all.len() as i64;
+    let start = query.start_index.unwrap_or(0).max(0);
+    let count = query.limit.map_or(total, |limit| limit.max(0));
+    let mut items: Vec<_> = all
+        .into_iter()
+        .skip(start as usize)
+        .take(count as usize)
+        .collect();
+    // An artist with a folder item is listed under the folder's id, so its images are the folder's.
+    let ids: Vec<uuid::Uuid> = items.iter().map(|item| item.id).collect();
+    let images =
+        rustyfin_db::repo_image::get_images_batch_of(&state.db_ro, &ids, None, None).await?;
+    for item in &mut items {
+        if let Some(images) = images.get(&item.id.to_string()) {
+            super::items::set_image_tags(item, images);
+        }
+    }
+    Ok(QueryResult {
+        items,
+        total_record_count: total,
+        start_index: start,
+    })
+}
+
+async fn get_artists(
+    State(state): State<AppState>,
+    Query(query): Query<ArtistsQuery>,
+) -> Result<Json<QueryResult>, ApiError> {
+    Ok(Json(
+        music_artists_page(&state, &query, "Artist", "Audio").await?,
+    ))
 }

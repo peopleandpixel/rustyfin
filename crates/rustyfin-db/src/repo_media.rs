@@ -633,6 +633,10 @@ pub async fn delete_item_rows_in(
         .bind(id)
         .execute(&mut *conn)
         .await?;
+    sqlx::query("DELETE FROM music_tags_read WHERE item_id=?1")
+        .bind(id)
+        .execute(&mut *conn)
+        .await?;
     let result = sqlx::query("DELETE FROM media_items WHERE id=?1")
         .bind(id)
         .execute(&mut *conn)
@@ -2110,6 +2114,92 @@ pub async fn get_library_paths(
     Ok(rows)
 }
 
+/// The parent of an item, if it has one.
+pub async fn get_item_parent_id(pool: &SqlitePool, id: Uuid) -> Result<Option<Uuid>, sqlx::Error> {
+    let parent: Option<Option<String>> =
+        sqlx::query_scalar("SELECT parent_id FROM media_items WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_optional(pool)
+            .await?;
+    Ok(parent
+        .flatten()
+        .and_then(|parent| Uuid::parse_str(&parent).ok()))
+}
+
+/// Store the disc number of a track that has none. A disc number already stored is kept.
+pub async fn fill_track_disc(pool: &SqlitePool, track: Uuid, disc: i32) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE media_items SET parent_index_number = ? WHERE id = ? AND parent_index_number IS NULL")
+        .bind(disc)
+        .bind(track.to_string())
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Store the year of an item (a track or an album) that has none. A year already stored is kept.
+pub async fn fill_production_year(
+    pool: &SqlitePool,
+    item: Uuid,
+    year: i32,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE media_items SET production_year = ? WHERE id = ? AND production_year IS NULL",
+    )
+    .bind(year)
+    .bind(item.to_string())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// The audio items of a library whose path is in `scope` whose tags a music scan has read, as item id
+/// to (size, modification time) of the file when it was read.
+pub async fn get_library_music_tags_read(
+    pool: &SqlitePool,
+    library_id: Uuid,
+    scope: &PathScope,
+) -> Result<HashMap<Uuid, (i64, i64)>, sqlx::Error> {
+    let rows: Vec<(String, i64, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT t.item_id, t.size, t.mtime
+         FROM music_tags_read AS t
+         JOIN media_items AS m ON m.id = t.item_id
+         WHERE m.library_id = ?1 AND {}",
+        scope.sql("m.path", 2)
+    )))
+    .bind(library_id.to_string())
+    .bind(scope.param())
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(id, size, mtime)| Uuid::parse_str(&id).ok().map(|id| (id, (size, mtime))))
+        .collect())
+}
+
+/// Records that a music scan read the tags of each item, with the size and modification time of its
+/// file at that time. An item that has a row already gets the new stamp.
+pub async fn upsert_music_tags_read(
+    pool: &SqlitePool,
+    reads: &[(Uuid, i64, i64)],
+) -> Result<(), sqlx::Error> {
+    if reads.is_empty() {
+        return Ok(());
+    }
+    let mut tx = pool.begin().await?;
+    for (item_id, size, mtime) in reads {
+        sqlx::query(
+            "INSERT INTO music_tags_read (item_id, size, mtime) VALUES (?1, ?2, ?3)
+             ON CONFLICT(item_id) DO UPDATE SET size = excluded.size, mtime = excluded.mtime",
+        )
+        .bind(item_id.to_string())
+        .bind(size)
+        .bind(mtime)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await
+}
+
 /// Fetch the source of each audio item of a library whose source path is in `scope`, as (item id, path,
 /// size, modified). The size and modification time are the stamp that the source stores, and are `None`
 /// when it has none.
@@ -2195,7 +2285,7 @@ pub async fn get_library_artists(
 ) -> Result<Vec<(Uuid, String, String)>, sqlx::Error> {
     let rows: Vec<(String, String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT id, path, name FROM media_items \
-         WHERE library_id = ?1 AND media_type = 'MusicAlbum' AND parent_id IS NULL \
+         WHERE library_id = ?1 AND media_type IN ('MusicArtist', 'MusicAlbum') AND parent_id IS NULL \
          AND (path = '' OR {})",
         scope.sql("path", 2)
     )))
@@ -2219,7 +2309,7 @@ pub async fn get_library_artist_id(
 ) -> Result<Option<Uuid>, sqlx::Error> {
     let id: Option<String> = sqlx::query_scalar(
         "SELECT id FROM media_items \
-         WHERE library_id = ? AND media_type = 'MusicAlbum' AND parent_id IS NULL AND path = ?",
+         WHERE library_id = ? AND media_type IN ('MusicArtist', 'MusicAlbum') AND parent_id IS NULL AND path = ?",
     )
     .bind(library_id.to_string())
     .bind(path)
@@ -2941,9 +3031,12 @@ pub async fn get_music_genres(pool: &SqlitePool) -> Result<Vec<MediaItem>, sqlx:
     Ok(items)
 }
 
-/// Get album artists
-pub async fn get_album_artists(_pool: &SqlitePool) -> Result<Vec<MediaItem>, sqlx::Error> {
-    Ok(Vec::new())
+/// Get album artists: the people linked as `AlbumArtist` to music albums (of `library` when set).
+pub async fn get_album_artists(
+    pool: &SqlitePool,
+    library: Option<uuid::Uuid>,
+) -> Result<Vec<MediaItem>, sqlx::Error> {
+    crate::repo_person::get_music_artists(pool, "AlbumArtist", "MusicAlbum", library).await
 }
 
 /// Get genres by name
@@ -3191,14 +3284,14 @@ pub async fn get_album_for_audio(
     parent_id: uuid::Uuid,
 ) -> Result<Option<MediaItem>, sqlx::Error> {
     let pid = parent_id.to_string();
-    let row: Option<(String, String, String)> =
-        sqlx::query_as("SELECT id, name, media_type FROM media_items WHERE id = ?")
+    let row: Option<(String, String, String, Option<String>)> =
+        sqlx::query_as("SELECT id, name, media_type, parent_id FROM media_items WHERE id = ?")
             .bind(&pid)
             .fetch_optional(pool)
             .await?;
 
     match row {
-        Some((id, name, media_type)) if media_type == "MusicAlbum" => {
+        Some((id, name, media_type, album_parent)) if media_type == "MusicAlbum" => {
             let uid = match uuid::Uuid::parse_str(&id) {
                 Ok(u) => u,
                 Err(_) => return Ok(None),
@@ -3210,7 +3303,7 @@ pub async fn get_album_for_audio(
                 overview: None,
                 media_type: MediaType::MusicAlbum,
                 path: String::new(),
-                parent_id: None,
+                parent_id: album_parent.and_then(|p| uuid::Uuid::parse_str(&p).ok()),
                 library_id: uuid::Uuid::nil(),
                 production_year: None,
                 community_rating: None,
@@ -3242,12 +3335,14 @@ pub async fn get_artists_for_audio(
     item_id: uuid::Uuid,
 ) -> Result<Vec<PersonRow>, sqlx::Error> {
     let iid = item_id.to_string();
-    sqlx::query_as::<_, PersonRow>(
-        "SELECT p.id, p.name, ip.role, ip.type, (SELECT pi.path FROM person_images pi WHERE pi.person_id = p.id AND pi.image_type = 'Primary' AND pi.image_index = 0) FROM item_people ip JOIN people p ON p.id = ip.person_id WHERE ip.item_id = ? ORDER BY ip.sort_order IS NULL, ip.sort_order, ip.rowid",
-    )
-    .bind(&iid)
-    .fetch_all(pool)
-    .await
+    let query = format!(
+        "SELECT CASE WHEN ip.type IN ('Artist', 'AlbumArtist') THEN {} ELSE p.id END, p.name, ip.role, ip.type, (SELECT pi.path FROM person_images pi WHERE pi.person_id = p.id AND pi.image_type = 'Primary' AND pi.image_index = 0) FROM item_people ip JOIN people p ON p.id = ip.person_id WHERE ip.item_id = ? ORDER BY ip.sort_order IS NULL, ip.sort_order, ip.rowid",
+        crate::repo_person::item_artist_id_sql()
+    );
+    sqlx::query_as::<_, PersonRow>(sqlx::AssertSqlSafe(query))
+        .bind(&iid)
+        .fetch_all(pool)
+        .await
 }
 
 /// Get studios for a media item.

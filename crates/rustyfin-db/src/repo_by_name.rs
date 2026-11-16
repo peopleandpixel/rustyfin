@@ -7,7 +7,8 @@ use sqlx::SqlitePool;
 use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
-/// The four lists that are read by name.
+/// The four lists that are read by name, and the music artists, whose ids are built the same way.
+/// Music artists are people, so `MusicArtist` has no rows in `list` and `get_by_name`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ByNameKind {
     /// Genres of the items that are not music.
@@ -18,6 +19,8 @@ pub enum ByNameKind {
     Studio,
     /// Production years, named by their number.
     Year,
+    /// Music artists, the ids of their people rows.
+    MusicArtist,
 }
 
 impl ByNameKind {
@@ -28,6 +31,7 @@ impl ByNameKind {
             ByNameKind::MusicGenre => "MusicGenre",
             ByNameKind::Studio => "Studio",
             ByNameKind::Year => "Year",
+            ByNameKind::MusicArtist => "MusicArtist",
         }
     }
 }
@@ -109,7 +113,7 @@ pub fn by_name_id(kind: ByNameKind, name: &str) -> Uuid {
 
 /// `by_name_id` of a name that `fold_name` has already folded.
 fn folded_id(kind: ByNameKind, folded: &str) -> Uuid {
-    // The uuid crate's v5 feature is off (its dependencies are not cached), so the SHA-1 is taken here.
+    // This is the UUIDv5 computed by hand, not `Uuid::new_v5`, so the ids stay what they were.
     let mut hasher = Sha1::new();
     hasher.update(BY_NAME_NAMESPACE.as_bytes());
     hasher.update(format!("{}:{}", kind.as_str(), folded).as_bytes());
@@ -123,7 +127,10 @@ fn folded_id(kind: ByNameKind, folded: &str) -> Uuid {
 /// every other item. Jellyfin picks the id of a genre on an item the same way, by whether the item
 /// has music genres (`Emby.Server.Implementations/Dto/DtoService.cs:1027-1035`).
 pub fn genre_kind_of(media: MediaType) -> ByNameKind {
-    if matches!(media, MediaType::Audio | MediaType::MusicAlbum) {
+    if matches!(
+        media,
+        MediaType::Audio | MediaType::MusicAlbum | MediaType::MusicArtist
+    ) {
         ByNameKind::MusicGenre
     } else {
         ByNameKind::Genre
@@ -495,6 +502,8 @@ async fn name_rows(
                 rows.push(row(item, &media, year.to_string(), scope));
             }
         }
+        // Music artists are people; their names come from `repo_person`, not from items.
+        ByNameKind::MusicArtist => {}
     }
     Ok(rows)
 }
@@ -510,6 +519,7 @@ fn in_kind(kind: ByNameKind, media: MediaType) -> bool {
     match kind {
         ByNameKind::Genre | ByNameKind::MusicGenre => genre_kind_of(media) == kind,
         ByNameKind::Studio | ByNameKind::Year => true,
+        ByNameKind::MusicArtist => false,
     }
 }
 

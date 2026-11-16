@@ -70,6 +70,10 @@ async fn main() {
     std::fs::create_dir_all(data_dir.join("cache/images")).ok();
     std::fs::create_dir_all(data_dir.join("transcodes")).ok();
     std::fs::create_dir_all(data_dir.join("trickplay")).ok();
+    // Embedded cover art is extracted here; the directory is created when the first image is written.
+    rustyfin_core::local_images::set_embedded_images_dir(
+        data_dir.join("metadata").join("embedded"),
+    );
 
     // Validate FFmpeg exists and is accessible
     if let Ok(ffmpeg_path) = std::env::var("RUSTYFIN_FFMPEG_PATH") {

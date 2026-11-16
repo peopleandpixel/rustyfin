@@ -7799,6 +7799,361 @@ async fn j6_hint_fields_for_music() {
     j6_assert_absent(loose, &["AlbumArtist"]);
 }
 
+// Music: artist fields and the artist lists
+
+/// Links `item` to the artist `name` as `kind` ("Artist" or "AlbumArtist"), at `order`, making the
+/// person if needed, as a music scan stores them; returns the person's id.
+async fn r2music_link(
+    state: &AppState,
+    item: uuid::Uuid,
+    name: &str,
+    kind: &str,
+    order: i64,
+) -> String {
+    let existing: Option<String> =
+        sqlx::query_scalar("SELECT id FROM people WHERE name = ? AND type = 'Artist'")
+            .bind(name)
+            .fetch_optional(&state.db)
+            .await
+            .unwrap();
+    let id = match existing {
+        Some(id) => id,
+        None => {
+            let id = uuid::Uuid::new_v4().to_string();
+            sqlx::query("INSERT INTO people (id, name, type) VALUES (?, ?, 'Artist')")
+                .bind(&id)
+                .bind(name)
+                .execute(&state.db)
+                .await
+                .unwrap();
+            id
+        }
+    };
+    sqlx::query(
+        "INSERT INTO item_people (item_id, person_id, type, sort_order) VALUES (?, ?, ?, ?)",
+    )
+    .bind(item.to_string())
+    .bind(&id)
+    .bind(kind)
+    .bind(order)
+    .execute(&state.db)
+    .await
+    .unwrap();
+    id
+}
+
+/// Names of the `Items` of an answer, in order.
+fn r2music_names(answer: &serde_json::Value) -> Vec<String> {
+    answer["Items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no Items in {answer}"))
+        .iter()
+        .map(|item| item["Name"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// Tracks and albums name their artists the way Jellyfin does (Artists as strings,
+/// ArtistItems and AlbumArtists as name and id pairs), and /Artists and /Artists/AlbumArtists list
+/// the track artists and album artists of a library.
+#[tokio::test]
+async fn r2music_artist_fields_and_routes() {
+    let state = test_state().await;
+    let library = j6_library(&state, "Music").await;
+    let other = j6_library(&state, "Other Music").await;
+    let various = j6_add_item(&state, library, None, "Various Artists", "MusicArtist").await;
+    let album = j6_add_item(&state, library, Some(various), "Oscar Hits", "MusicAlbum").await;
+    let duet = j6_add_item(&state, library, Some(album), "Duet", "Audio").await;
+    let solo = j6_add_item(&state, library, Some(album), "Papa Song", "Audio").await;
+    // An artist with a folder item goes by the folder item's id, which owns its images.
+    r2music_link(&state, album, "Various Artists", "AlbumArtist", 0).await;
+    let various_id = various.to_string();
+    let quebec = r2music_link(&state, duet, "Quebec Duo", "Artist", 0).await;
+    let kilo = r2music_link(&state, duet, "Kilo Band", "Artist", 1).await;
+    r2music_link(&state, solo, "Papa Trio", "Artist", 0).await;
+    // An album stored before artists were read: its artist is its parent folder's item.
+    let old_artist = j6_add_item(&state, library, None, "Old Band", "MusicAlbum").await;
+    let old_album = j6_add_item(&state, library, Some(old_artist), "Old Songs", "MusicAlbum").await;
+    let old_track = j6_add_item(&state, library, Some(old_album), "Old Song", "Audio").await;
+    // Another library's artists stay out of this library's lists.
+    let elsewhere = j6_add_item(&state, other, None, "Zulu Album", "MusicAlbum").await;
+    let zulu_track = j6_add_item(&state, other, Some(elsewhere), "Zulu Song", "Audio").await;
+    r2music_link(&state, elsewhere, "Zulu Crew", "AlbumArtist", 0).await;
+    r2music_link(&state, zulu_track, "Zulu Crew", "Artist", 0).await;
+    let (token, _) = admin_session(&state).await;
+    let app = app(state);
+
+    let pair = |name: &str, id: &str| serde_json::json!({"Name": name, "Id": id});
+    let track = b27_answer(&app, &format!("/Items/{duet}"), &token).await;
+    assert_eq!(
+        track["Artists"],
+        serde_json::json!(["Quebec Duo", "Kilo Band"]),
+        "{track}"
+    );
+    let items: Vec<serde_json::Value> = track["ArtistItems"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no ArtistItems in {track}"))
+        .iter()
+        .map(|p| serde_json::json!({"Name": p["Name"], "Id": p["Id"]}))
+        .collect();
+    assert_eq!(
+        items,
+        [pair("Quebec Duo", &quebec), pair("Kilo Band", &kilo)]
+    );
+    assert_eq!(track["AlbumArtist"], "Various Artists", "{track}");
+    assert_eq!(
+        track["AlbumArtists"][0]["Name"], "Various Artists",
+        "{track}"
+    );
+    assert_eq!(
+        track["AlbumArtists"][0]["Id"],
+        various_id.as_str(),
+        "{track}"
+    );
+
+    let detail = b27_answer(&app, &format!("/Items/{album}"), &token).await;
+    assert_eq!(detail["AlbumArtist"], "Various Artists", "{detail}");
+    assert_eq!(
+        detail["AlbumArtists"][0]["Name"], "Various Artists",
+        "{detail}"
+    );
+    // As in Jellyfin, an album's Artists are its tracks' artists, each once.
+    let sorted = |field: &str| -> Vec<String> {
+        let mut names: Vec<String> = detail[field]
+            .as_array()
+            .unwrap_or_else(|| panic!("no {field} in {detail}"))
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .unwrap_or_else(|| v["Name"].as_str().unwrap())
+                    .to_string()
+            })
+            .collect();
+        names.sort();
+        names
+    };
+    assert_eq!(sorted("Artists"), ["Kilo Band", "Papa Trio", "Quebec Duo"]);
+    assert_eq!(
+        sorted("ArtistItems"),
+        ["Kilo Band", "Papa Trio", "Quebec Duo"]
+    );
+
+    // Without links, the album's artist is its parent item, never the album itself.
+    let old = b27_answer(&app, &format!("/Items/{old_track}"), &token).await;
+    assert_eq!(old["AlbumArtist"], "Old Band", "{old}");
+    assert_eq!(old["Artists"], serde_json::json!([]), "{old}");
+
+    let artists = b27_answer(&app, &format!("/Artists?ParentId={library}"), &token).await;
+    assert_eq!(
+        r2music_names(&artists),
+        ["Kilo Band", "Papa Trio", "Quebec Duo"],
+        "{artists}"
+    );
+    assert_eq!(artists["TotalRecordCount"], 3, "{artists}");
+    assert_eq!(artists["Items"][0]["Type"], "MusicArtist", "{artists}");
+    assert_eq!(artists["Items"][0]["Id"], kilo.as_str(), "{artists}");
+    let page = b27_answer(
+        &app,
+        &format!("/Artists?ParentId={library}&StartIndex=1&Limit=1"),
+        &token,
+    )
+    .await;
+    assert_eq!(r2music_names(&page), ["Papa Trio"], "{page}");
+    assert_eq!(page["TotalRecordCount"], 3, "{page}");
+    let everywhere = b27_answer(&app, "/Artists", &token).await;
+    assert_eq!(
+        r2music_names(&everywhere),
+        ["Kilo Band", "Papa Trio", "Quebec Duo", "Zulu Crew"],
+        "{everywhere}"
+    );
+
+    let album_artists = b27_answer(
+        &app,
+        &format!("/Artists/AlbumArtists?ParentId={library}"),
+        &token,
+    )
+    .await;
+    assert_eq!(
+        r2music_names(&album_artists),
+        ["Various Artists"],
+        "{album_artists}"
+    );
+    assert_eq!(
+        album_artists["Items"][0]["Type"], "MusicArtist",
+        "{album_artists}"
+    );
+    assert_eq!(
+        album_artists["Items"][0]["Id"],
+        various_id.as_str(),
+        "{album_artists}"
+    );
+}
+
+/// Every artist id that `/Artists` and a track's `ArtistItems` give opens as a MusicArtist item,
+/// alone or under a user. An artist with a folder item has one id, the folder item's, so its
+/// images show in the list and by id; an artist known only from tags goes by its person id.
+#[tokio::test]
+async fn r2music_artist_ids_open_as_items() {
+    use rustyfin_model::image::ImageType::Primary;
+
+    let state = test_state().await;
+    let library = j6_library(&state, "Music").await;
+    let kilo_folder = j6_add_item(&state, library, None, "Kilo Band", "MusicArtist").await;
+    let album = j6_add_item(
+        &state,
+        library,
+        Some(kilo_folder),
+        "Lima Sessions",
+        "MusicAlbum",
+    )
+    .await;
+    let track = j6_add_item(&state, library, Some(album), "Opening Tone", "Audio").await;
+    r2music_link(&state, album, "Kilo Band", "AlbumArtist", 0).await;
+    r2music_link(&state, track, "Kilo Band", "Artist", 0).await;
+    let papa = r2music_link(&state, track, "Papa Trio", "Artist", 1).await;
+    let image = state.data_dir.join("kilo-band.png");
+    std::fs::write(&image, b30_png(8, 8, [10, 20, 30])).unwrap();
+    b30_set_image(&state, kilo_folder, Primary, &image.to_string_lossy(), None).await;
+    let (token, admin) = admin_session(&state).await;
+    let app = app(state);
+
+    let kilo = kilo_folder.to_string();
+    let listed = b27_answer(&app, &format!("/Artists?ParentId={library}"), &token).await;
+    let ids: Vec<(&str, &str)> = listed["Items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no Items in {listed}"))
+        .iter()
+        .map(|item| (item["Name"].as_str().unwrap(), item["Id"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        ids,
+        [("Kilo Band", kilo.as_str()), ("Papa Trio", papa.as_str())]
+    );
+    assert!(
+        listed["Items"][0]["ImageTags"]["Primary"].is_string(),
+        "the folder's image shows in the list: {listed}"
+    );
+    let details = b27_answer(&app, &format!("/Items/{track}"), &token).await;
+    let items: Vec<&str> = details["ArtistItems"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no ArtistItems in {details}"))
+        .iter()
+        .map(|item| item["Id"].as_str().unwrap())
+        .collect();
+    assert_eq!(items, [kilo.as_str(), papa.as_str()], "{details}");
+    assert_eq!(details["AlbumArtists"][0]["Id"], kilo.as_str(), "{details}");
+
+    for (id, name) in [(kilo.as_str(), "Kilo Band"), (papa.as_str(), "Papa Trio")] {
+        for uri in [format!("/Items/{id}"), format!("/Users/{admin}/Items/{id}")] {
+            let artist = b27_answer(&app, &uri, &token).await;
+            assert_eq!(artist["Id"], id, "{uri}: {artist}");
+            assert_eq!(artist["Name"], name, "{uri}: {artist}");
+            assert_eq!(artist["Type"], "MusicArtist", "{uri}: {artist}");
+        }
+    }
+    b30_image(&app, &token, kilo_folder, "maxWidth=8").await;
+}
+
+/// The artist lists take Jellyfin's search and letter filters, in either letter case, count after
+/// filtering, sort down on request, and accept the other list options clients send. `/Persons`
+/// lists people, not music artists.
+#[tokio::test]
+async fn r2music_artist_lists_filter_like_jellyfin() {
+    let state = test_state().await;
+    let library = j6_library(&state, "Music").await;
+    let album = j6_add_item(&state, library, None, "Mixed", "MusicAlbum").await;
+    for (order, name) in ["Alpha Band", "Beta Crew", "Gamma Alpha", "Delta"]
+        .into_iter()
+        .enumerate()
+    {
+        let track = j6_add_item(&state, library, Some(album), name, "Audio").await;
+        r2music_link(&state, track, name, "Artist", order as i64).await;
+    }
+    r2music_link(&state, album, "Beta Crew", "AlbumArtist", 0).await;
+    sqlx::query("INSERT INTO people (id, name, type) VALUES (?, 'Ann Actor', 'Actor')")
+        .bind(uuid::Uuid::new_v4().to_string())
+        .execute(&state.db)
+        .await
+        .unwrap();
+    let (token, admin) = admin_session(&state).await;
+    let app = app(state);
+
+    let list = async |query: &str| -> (Vec<String>, serde_json::Value) {
+        let answer = b27_answer(
+            &app,
+            &format!("/Artists?ParentId={library}&{query}"),
+            &token,
+        )
+        .await;
+        (r2music_names(&answer), answer["TotalRecordCount"].clone())
+    };
+    let names = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+    assert_eq!(
+        list("SearchTerm=alpha").await,
+        (names(&["Alpha Band", "Gamma Alpha"]), serde_json::json!(2))
+    );
+    assert_eq!(
+        list("searchTerm=ALPHA&limit=1").await,
+        (names(&["Alpha Band"]), serde_json::json!(2))
+    );
+    assert_eq!(list("NameStartsWith=b").await.0, names(&["Beta Crew"]));
+    assert_eq!(list("nameStartsWith=B").await.0, names(&["Beta Crew"]));
+    assert_eq!(
+        list("NameStartsWithOrGreater=c").await.0,
+        names(&["Delta", "Gamma Alpha"])
+    );
+    assert_eq!(
+        list("NameLessThan=c").await.0,
+        names(&["Alpha Band", "Beta Crew"])
+    );
+    assert_eq!(
+        list("SortOrder=Descending").await.0,
+        names(&["Gamma Alpha", "Delta", "Beta Crew", "Alpha Band"])
+    );
+    assert_eq!(
+        list(&format!(
+            "userId={admin}&Fields=PrimaryImageAspectRatio&EnableImages=true&IsFavorite=false&startIndex=1&limit=2"
+        ))
+        .await,
+        (names(&["Beta Crew", "Delta"]), serde_json::json!(4))
+    );
+    let lower = b27_answer(
+        &app,
+        &format!("/Artists?parentId={library}&nameStartsWith=d"),
+        &token,
+    )
+    .await;
+    assert_eq!(r2music_names(&lower), ["Delta"], "{lower}");
+
+    let album_artists = b27_answer(
+        &app,
+        &format!("/Artists/AlbumArtists?ParentId={library}&SearchTerm=crew"),
+        &token,
+    )
+    .await;
+    assert_eq!(
+        r2music_names(&album_artists),
+        ["Beta Crew"],
+        "{album_artists}"
+    );
+    let none = b27_answer(
+        &app,
+        &format!("/Artists/AlbumArtists?ParentId={library}&SearchTerm=alpha"),
+        &token,
+    )
+    .await;
+    assert_eq!(none["TotalRecordCount"], 0, "{none}");
+
+    let persons = b27_answer(&app, "/Persons", &token).await;
+    let persons: Vec<&str> = persons
+        .as_array()
+        .or_else(|| persons["Items"].as_array())
+        .unwrap_or_else(|| panic!("no persons in {persons}"))
+        .iter()
+        .map(|p| p["Name"].as_str().unwrap())
+        .collect();
+    assert_eq!(persons, ["Ann Actor"], "music artists are not persons");
+}
+
 #[tokio::test]
 async fn j6_hint_images_follow_jellyfin() {
     use rustyfin_model::image::ImageType::{Backdrop, Primary, Thumb};

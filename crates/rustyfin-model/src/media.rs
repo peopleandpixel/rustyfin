@@ -179,6 +179,7 @@ pub enum MediaType {
     Episode,
     Audio,
     MusicAlbum,
+    MusicArtist,
     Photo,
     /// A video that is neither a movie nor an episode, as in a home videos library: Jellyfin's `Video`.
     Video,
@@ -200,6 +201,7 @@ impl std::str::FromStr for MediaType {
             "Episode" => Ok(MediaType::Episode),
             "Audio" => Ok(MediaType::Audio),
             "MusicAlbum" => Ok(MediaType::MusicAlbum),
+            "MusicArtist" => Ok(MediaType::MusicArtist),
             "Photo" => Ok(MediaType::Photo),
             "Video" => Ok(MediaType::Video),
             "Genre" => Ok(MediaType::Genre),
@@ -226,6 +228,7 @@ impl MediaType {
             MediaType::Episode => "Episode",
             MediaType::Audio => "Audio",
             MediaType::MusicAlbum => "MusicAlbum",
+            MediaType::MusicArtist => "MusicArtist",
             MediaType::Photo => "Photo",
             MediaType::Video => "Video",
             MediaType::Genre => "Genre",
@@ -240,7 +243,7 @@ impl MediaType {
         match self {
             MediaType::Movie | MediaType::Episode | MediaType::Video => "Video",
             MediaType::Series | MediaType::Season => "Unknown",
-            MediaType::Audio | MediaType::MusicAlbum => "Audio",
+            MediaType::Audio | MediaType::MusicAlbum | MediaType::MusicArtist => "Audio",
             MediaType::Photo => "Photo",
             MediaType::Genre | MediaType::BoxSet | MediaType::Playlist => "Unknown",
             MediaType::Unknown => "Unknown",
@@ -253,6 +256,7 @@ impl MediaType {
             MediaType::Series
                 | MediaType::Season
                 | MediaType::MusicAlbum
+                | MediaType::MusicArtist
                 | MediaType::Genre
                 | MediaType::BoxSet
                 | MediaType::Playlist
@@ -449,13 +453,13 @@ pub struct MediaItem {
     /// Album artist for audio items
     #[serde(default)]
     pub album_artist: Option<String>,
-    /// Album artists array for audio items
+    /// Album artists array for audio and music album items
     #[serde(default)]
-    pub album_artists: Vec<PersonInfo>,
-    /// Artists array for audio items
+    pub album_artists: Vec<GenreItem>,
+    /// Artist names for audio and music album items
     #[serde(default)]
-    pub artists: Vec<PersonInfo>,
-    /// Artist items array
+    pub artists: Vec<String>,
+    /// Artist name and id pairs for audio items
     #[serde(default)]
     pub artist_items: Vec<GenreItem>,
     /// Song count for folders
@@ -1196,6 +1200,16 @@ mod tests {
     #[test]
     fn test_media_type_is_folder_music_album() {
         assert!(MediaType::MusicAlbum.is_folder());
+    }
+
+    #[test]
+    fn test_media_type_music_artist() {
+        assert_eq!(
+            MediaType::from_str("MusicArtist"),
+            Ok(MediaType::MusicArtist)
+        );
+        assert_eq!(MediaType::MusicArtist.item_kind(), "MusicArtist");
+        assert!(MediaType::MusicArtist.is_folder());
     }
 
     #[test]

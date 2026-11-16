@@ -39,6 +39,8 @@ pub struct ProbeResult {
     pub audio_tags: Option<AudioTags>,
     /// Chapter markers extracted from the file
     pub chapters: Vec<Chapter>,
+    /// Codec name of the attached picture (cover art) stream, e.g. `mjpeg` or `png`
+    pub attached_picture_codec: Option<String>,
 }
 
 /// Audio metadata tags extracted from ID3, Vorbis, APEv2, etc.
@@ -269,6 +271,7 @@ pub async fn probe_file(path: &str) -> Result<ProbeResult, ProbeError> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .kill_on_drop(true)
         .output()
         .await
         .map_err(|e| ProbeError::FfprobeNotFound(e.to_string()))?;
@@ -380,10 +383,24 @@ pub async fn probe_file(path: &str) -> Result<ProbeResult, ProbeError> {
     // Extract chapters
     let chapters = read_chapters(path).await;
 
+    // The codec of the attached picture (cover art) stream, if the file has one.
+    let attached_picture_codec = probe
+        .streams
+        .iter()
+        .find(|s| {
+            s.disposition
+                .as_ref()
+                .and_then(|d| d.attached_pic)
+                .unwrap_or(0)
+                > 0
+        })
+        .and_then(|s| s.codec_name.clone());
+
     Ok(ProbeResult {
         source,
         audio_tags,
         chapters,
+        attached_picture_codec,
     })
 }
 

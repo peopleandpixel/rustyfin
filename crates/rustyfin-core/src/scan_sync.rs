@@ -99,10 +99,10 @@ pub async fn remove_not_collected(
         }
     }
 
-    // Seasons come before their series, and albums before their artists, which are MusicAlbums too.
+    // Seasons come before their series, and albums before their artists (MusicArtist, or MusicAlbum in older data).
     let containers: &[&str] = match library.content_type {
         LibraryContentType::TvShows => &["Season", "Series"],
-        LibraryContentType::Music => &["MusicAlbum"],
+        LibraryContentType::Music => &["MusicAlbum", "MusicArtist"],
         _ => &[],
     };
     if !matches!(scope, PathScope::All) {

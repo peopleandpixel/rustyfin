@@ -3132,6 +3132,12 @@ impl std::io::Write for B28Logs {
 /// for one thread misses events from a place another thread logged from first.
 #[cfg(target_os = "linux")]
 fn b28_logged() -> Vec<String> {
+    logged_lines("date added backfill: ")
+}
+
+/// The log lines holding `marker`, from every test in this binary since the first call.
+#[cfg(target_os = "linux")]
+fn logged_lines(marker: &str) -> Vec<String> {
     static LOGS: std::sync::OnceLock<B28Logs> = std::sync::OnceLock::new();
     let logs = LOGS.get_or_init(|| {
         let logs = B28Logs::default();
@@ -3147,7 +3153,7 @@ fn b28_logged() -> Vec<String> {
     });
     let text = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
     text.lines()
-        .filter(|line| line.contains("date added backfill: "))
+        .filter(|line| line.contains(marker))
         .map(str::to_owned)
         .collect()
 }
@@ -4949,6 +4955,690 @@ async fn b18_scheduler_skips_a_library_another_caller_claimed() {
 // configured, each new artist, album and track is one more unit, which its refresh advances, so the
 // percent reaches 99 only at the end. A rescan reuses the artist rows of earlier scans.
 
+// Music: tags, disc folders, artists and embedded covers
+
+/// Writes a one-second FLAC track at `<root>/<rel>` with `tags`, and with an embedded JPEG picture
+/// when `picture` is set.
+fn r2music_track(root: &Path, rel: &str, tags: &[(&str, &str)], picture: bool) -> PathBuf {
+    let path = root.join(rel);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(["-nostdin", "-loglevel", "error", "-y"]).args([
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=duration=1",
+    ]);
+    if picture {
+        cmd.args(["-f", "lavfi", "-i", "color=c=red:s=16x16:d=1"])
+            .args(["-map", "0:a", "-map", "1:v", "-frames:v", "1"])
+            .args(["-c:v", "mjpeg", "-disposition:v", "attached_pic"]);
+    }
+    cmd.args(["-c:a", "flac"]);
+    for (key, value) in tags {
+        cmd.arg("-metadata").arg(format!("{key}={value}"));
+    }
+    let status = cmd.arg(&path).status().expect("run ffmpeg");
+    assert!(
+        status.success(),
+        "ffmpeg could not write {}",
+        path.display()
+    );
+    path
+}
+
+/// The library's rows of `media_type` as (path, name, parent's path, year, index, parent index),
+/// paths relative to its root, sorted.
+async fn r2music_rows(pool: &SqlitePool, lib: &Library, media_type: &str) -> Vec<MusicRow> {
+    let root = root_of(lib);
+    let rows: Vec<MusicRow> = sqlx::query_as(
+        "SELECT a.path, a.name, p.path, a.production_year, a.index_number, a.parent_index_number
+         FROM media_items a LEFT JOIN media_items p ON p.id = a.parent_id
+         WHERE a.library_id = ?1 AND a.media_type = ?2",
+    )
+    .bind(lib.id.to_string())
+    .bind(media_type)
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    let mut out: Vec<_> = rows
+        .into_iter()
+        .map(|(path, name, parent, year, index, disc)| {
+            (
+                rel(&root, &path),
+                name,
+                parent.as_deref().map(|p| rel(&root, p)),
+                year,
+                index,
+                disc,
+            )
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// A music row: path, name, parent's path, year, index and parent index.
+type MusicRow = (
+    String,
+    String,
+    Option<String>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+);
+
+/// The `item_people` links of `kind` as (item path relative to the root, person name, person id),
+/// in item path and credit order.
+async fn r2music_links(
+    pool: &SqlitePool,
+    lib: &Library,
+    kind: &str,
+) -> Vec<(String, String, String)> {
+    let root = root_of(lib);
+    let rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT m.path, p.name, p.id FROM item_people ip
+         JOIN media_items m ON m.id = ip.item_id JOIN people p ON p.id = ip.person_id
+         WHERE m.library_id = ?1 AND ip.type = ?2
+         ORDER BY m.path, ip.sort_order",
+    )
+    .bind(lib.id.to_string())
+    .bind(kind)
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    rows.into_iter()
+        .map(|(path, name, id)| (rel(&root, &path), name, id))
+        .collect()
+}
+
+/// One album per album folder (disc folders are part of it), artist folders are
+/// MusicArtist items named after the folder, years come from `date` tags, disc numbers from tags
+/// or disc folders, and track and album artists are stored as people, once per name.
+#[tokio::test]
+async fn r2music_scan_tags_discs_and_artists() {
+    if !have_ffmpeg() {
+        eprintln!("skipped: needs ffmpeg and ffprobe");
+        return;
+    }
+    let fx = Fixture::new().await;
+    let lib = b18_music_library(&fx, &["music"]).await;
+    let root = root_of(&lib);
+    let tags = |title: &'static str,
+                artist: &'static str,
+                album_artist: Option<&'static str>,
+                album: &'static str,
+                date: &'static str,
+                disc: Option<&'static str>,
+                track: &'static str| {
+        let mut out = vec![
+            ("title", title),
+            ("artist", artist),
+            ("album", album),
+            ("date", date),
+            ("track", track),
+        ];
+        if let Some(a) = album_artist {
+            out.push(("album_artist", a));
+        }
+        if let Some(d) = disc {
+            out.push(("disc", d));
+        }
+        out
+    };
+    r2music_track(
+        &root,
+        "Kilo Band/Lima Sessions/01 - Opening Tone.flac",
+        &tags(
+            "Opening Tone",
+            "Kilo Band",
+            Some("Kilo Band"),
+            "Lima Sessions",
+            "2010",
+            Some("1"),
+            "1",
+        ),
+        false,
+    );
+    r2music_track(
+        &root,
+        "Mike Ensemble/November Nights/Disc 1/01 - Dusk.flac",
+        &tags(
+            "Dusk",
+            "Mike Ensemble",
+            None,
+            "November Nights",
+            "2016-03-01",
+            Some("1/2"),
+            "1",
+        ),
+        false,
+    );
+    r2music_track(
+        &root,
+        "Mike Ensemble/November Nights/Disc 2/01 - Small Hours.flac",
+        &tags(
+            "Small Hours",
+            "Mike Ensemble",
+            None,
+            "November Nights",
+            "2016-03-01",
+            Some("2/2"),
+            "1",
+        ),
+        false,
+    );
+    // No disc tag: the disc folder gives the number.
+    r2music_track(
+        &root,
+        "Mike Ensemble/November Nights/Disc 2/02 - Dawn.flac",
+        &tags(
+            "Dawn",
+            "Mike Ensemble",
+            None,
+            "November Nights",
+            "2016-03-01",
+            None,
+            "2",
+        ),
+        false,
+    );
+    r2music_track(
+        &root,
+        "Various Artists/Oscar Hits/01 - Papa Song.flac",
+        &tags(
+            "Papa Song",
+            "Papa Trio",
+            Some("Various Artists"),
+            "Oscar Hits",
+            "2020",
+            Some("1"),
+            "1",
+        ),
+        false,
+    );
+    r2music_track(
+        &root,
+        "Various Artists/Oscar Hits/02 - Duet.flac",
+        &tags(
+            "Duet",
+            "Quebec Duo; Kilo Band",
+            Some("Various Artists"),
+            "Oscar Hits",
+            "2020",
+            Some("1"),
+            "2",
+        ),
+        false,
+    );
+
+    scan_idle(&fx.pool, &lib).await;
+
+    let artist = |path: &str| (path.to_string(), path.to_string(), None, None, None, None);
+    assert_eq!(
+        r2music_rows(&fx.pool, &lib, "MusicArtist").await,
+        [
+            artist("Kilo Band"),
+            artist("Mike Ensemble"),
+            artist("Various Artists")
+        ]
+    );
+    let album = |path: &str, name: &str, parent: &str, year: i64| {
+        (
+            path.to_string(),
+            name.to_string(),
+            Some(parent.to_string()),
+            Some(year),
+            None,
+            None,
+        )
+    };
+    assert_eq!(
+        r2music_rows(&fx.pool, &lib, "MusicAlbum").await,
+        [
+            album(
+                "Kilo Band/Lima Sessions",
+                "Lima Sessions",
+                "Kilo Band",
+                2010
+            ),
+            album(
+                "Mike Ensemble/November Nights",
+                "November Nights",
+                "Mike Ensemble",
+                2016
+            ),
+            album(
+                "Various Artists/Oscar Hits",
+                "Oscar Hits",
+                "Various Artists",
+                2020
+            ),
+        ]
+    );
+    // (path, parent's path, index, parent index)
+    type Track = (String, Option<String>, Option<i64>, Option<i64>);
+    let tracks: Vec<Track> = r2music_rows(&fx.pool, &lib, "Audio")
+        .await
+        .into_iter()
+        .map(|(path, _, parent, _, index, disc)| (path, parent, index, disc))
+        .collect();
+    let track = |path: &str, parent: &str, index: i64, disc: i64| {
+        (
+            path.to_string(),
+            Some(parent.to_string()),
+            Some(index),
+            Some(disc),
+        )
+    };
+    assert_eq!(
+        tracks,
+        [
+            track(
+                "Kilo Band/Lima Sessions/01 - Opening Tone.flac",
+                "Kilo Band/Lima Sessions",
+                1,
+                1
+            ),
+            track(
+                "Mike Ensemble/November Nights/Disc 1/01 - Dusk.flac",
+                "Mike Ensemble/November Nights",
+                1,
+                1
+            ),
+            track(
+                "Mike Ensemble/November Nights/Disc 2/01 - Small Hours.flac",
+                "Mike Ensemble/November Nights",
+                1,
+                2
+            ),
+            track(
+                "Mike Ensemble/November Nights/Disc 2/02 - Dawn.flac",
+                "Mike Ensemble/November Nights",
+                2,
+                2
+            ),
+            track(
+                "Various Artists/Oscar Hits/01 - Papa Song.flac",
+                "Various Artists/Oscar Hits",
+                1,
+                1
+            ),
+            track(
+                "Various Artists/Oscar Hits/02 - Duet.flac",
+                "Various Artists/Oscar Hits",
+                2,
+                1
+            ),
+        ]
+    );
+
+    let names = |links: &[(String, String, String)]| -> Vec<(String, String)> {
+        links
+            .iter()
+            .map(|(path, name, _)| (path.clone(), name.clone()))
+            .collect()
+    };
+    let link = |path: &str, name: &str| (path.to_string(), name.to_string());
+    let artists = r2music_links(&fx.pool, &lib, "Artist").await;
+    assert_eq!(
+        names(&artists),
+        [
+            link(
+                "Kilo Band/Lima Sessions/01 - Opening Tone.flac",
+                "Kilo Band"
+            ),
+            link(
+                "Mike Ensemble/November Nights/Disc 1/01 - Dusk.flac",
+                "Mike Ensemble"
+            ),
+            link(
+                "Mike Ensemble/November Nights/Disc 2/01 - Small Hours.flac",
+                "Mike Ensemble"
+            ),
+            link(
+                "Mike Ensemble/November Nights/Disc 2/02 - Dawn.flac",
+                "Mike Ensemble"
+            ),
+            link(
+                "Various Artists/Oscar Hits/01 - Papa Song.flac",
+                "Papa Trio"
+            ),
+            link("Various Artists/Oscar Hits/02 - Duet.flac", "Quebec Duo"),
+            link("Various Artists/Oscar Hits/02 - Duet.flac", "Kilo Band"),
+        ]
+    );
+    let album_artists = r2music_links(&fx.pool, &lib, "AlbumArtist").await;
+    assert_eq!(
+        names(&album_artists),
+        [
+            link("Kilo Band/Lima Sessions", "Kilo Band"),
+            link("Mike Ensemble/November Nights", "Mike Ensemble"),
+            link("Various Artists/Oscar Hits", "Various Artists"),
+        ]
+    );
+    // One person per name: Kilo Band is the same person as a track artist and an album artist.
+    let ids: std::collections::HashSet<&str> = artists
+        .iter()
+        .chain(album_artists.iter())
+        .filter(|(_, name, _)| name == "Kilo Band")
+        .map(|(_, _, id)| id.as_str())
+        .collect();
+    assert_eq!(ids.len(), 1, "{artists:?} {album_artists:?}");
+    let people: Vec<(String, String)> =
+        sqlx::query_as("SELECT name, type FROM people ORDER BY name")
+            .fetch_all(&fx.pool)
+            .await
+            .unwrap();
+    let person = |name: &str| (name.to_string(), "Artist".to_string());
+    assert_eq!(
+        people,
+        [
+            person("Kilo Band"),
+            person("Mike Ensemble"),
+            person("Papa Trio"),
+            person("Quebec Duo"),
+            person("Various Artists")
+        ]
+    );
+
+    // A rescan with nothing changed adds nothing.
+    let totals = async || {
+        (
+            count(&fx.pool, "SELECT COUNT(*) FROM media_items").await,
+            count(&fx.pool, "SELECT COUNT(*) FROM people").await,
+            count(&fx.pool, "SELECT COUNT(*) FROM item_people").await,
+        )
+    };
+    let before = totals().await;
+    scan_idle(&fx.pool, &lib).await;
+    assert_eq!(totals().await, before);
+}
+
+/// An album without a cover file gets its Primary image from the embedded picture of a track,
+/// extracted under the server's dir; a cover file still wins, nothing is written into the
+/// library, and the extracted file goes when its album does.
+#[tokio::test]
+async fn r2music_embedded_cover_becomes_album_primary() {
+    if !have_ffmpeg() {
+        eprintln!("skipped: needs ffmpeg and ffprobe");
+        return;
+    }
+    let fx = Fixture::new().await;
+    // Process-wide: no other test in this binary writes tracks with pictures.
+    let embedded = fx.path("embedded");
+    rustyfin_core::local_images::set_embedded_images_dir(embedded.clone());
+    let lib = b18_music_library(&fx, &["music"]).await;
+    let root = root_of(&lib);
+    let tags = |title: &'static str, album: &'static str| {
+        vec![
+            ("title", title),
+            ("artist", "Lima"),
+            ("album", album),
+            ("track", "1"),
+        ]
+    };
+    r2music_track(
+        &root,
+        "Lima/Pictured/01 - One.flac",
+        &tags("One", "Pictured"),
+        true,
+    );
+    r2music_track(
+        &root,
+        "Lima/Covered/01 - Two.flac",
+        &tags("Two", "Covered"),
+        true,
+    );
+    std::fs::copy(
+        root.join("Lima/Covered/01 - Two.flac"),
+        root.join("Lima/Covered/cover.jpg"),
+    )
+    .unwrap();
+    let files_before = tree(&root).len();
+
+    scan_idle(&fx.pool, &lib).await;
+
+    let primary = async |album: &str| -> Option<String> {
+        sqlx::query_scalar(
+            "SELECT i.path FROM item_images i JOIN media_items m ON m.id = i.item_id
+             WHERE m.library_id = ?1 AND m.media_type = 'MusicAlbum' AND m.path = ?2
+             AND i.image_type = 'Primary'",
+        )
+        .bind(lib.id.to_string())
+        .bind(root.join(album).to_str().unwrap())
+        .fetch_optional(&fx.pool)
+        .await
+        .unwrap()
+    };
+    let pictured = primary("Lima/Pictured")
+        .await
+        .expect("the album without a cover file has a Primary image");
+    assert!(
+        Path::new(&pictured).starts_with(&embedded),
+        "{pictured} is not under {}",
+        embedded.display()
+    );
+    assert!(
+        std::fs::metadata(&pictured).unwrap().len() > 0,
+        "{pictured} is empty"
+    );
+    assert_eq!(
+        primary("Lima/Covered").await.as_deref(),
+        root.join("Lima/Covered/cover.jpg").to_str()
+    );
+    assert_eq!(
+        tree(&root).len(),
+        files_before,
+        "the scan wrote into the library"
+    );
+
+    std::fs::remove_dir_all(root.join("Lima/Pictured")).unwrap();
+    scan_idle(&fx.pool, &lib).await;
+    assert_eq!(primary("Lima/Pictured").await, None);
+    assert!(
+        !Path::new(&pictured).exists(),
+        "{pictured} stays after its album is gone"
+    );
+}
+
+/// Folder names Jellyfin reads as discs: a disc prefix and a number, with any text after a space.
+/// `vol`, `volume` and `part` count only below an album folder, so an album named `Part 1` under
+/// its artist stays an album; a word that only starts with a prefix is no disc.
+#[tokio::test]
+async fn r2music_disc_folder_names_like_jellyfin() {
+    if !have_ffmpeg() {
+        eprintln!("skipped: needs ffmpeg and ffprobe");
+        return;
+    }
+    let fx = Fixture::new().await;
+    let lib = b18_music_library(&fx, &["music"]).await;
+    let root = root_of(&lib);
+    let tags = |title: &'static str| vec![("title", title), ("artist", "Kilo Band")];
+    for (rel, title) in [
+        ("Kilo Band/Lima/Disc 1 - Bonus/01 - One.flac", "One"),
+        ("Kilo Band/Lima/CD 2 (Live)/01 - Two.flac", "Two"),
+        ("Kilo Band/Lima/Volume 3/01 - Three.flac", "Three"),
+        ("Kilo Band/Part 1/01 - Four.flac", "Four"),
+        ("Kilo Band/Mike/Discography Extras/01 - Five.flac", "Five"),
+    ] {
+        r2music_track(&root, rel, &tags(title), false);
+    }
+
+    scan_idle(&fx.pool, &lib).await;
+
+    let albums: Vec<String> = r2music_rows(&fx.pool, &lib, "MusicAlbum")
+        .await
+        .into_iter()
+        .map(|row| row.0)
+        .collect();
+    assert_eq!(
+        albums,
+        [
+            "Kilo Band/Lima",
+            "Kilo Band/Mike/Discography Extras",
+            "Kilo Band/Part 1"
+        ]
+    );
+    let discs: Vec<(String, Option<i64>)> = r2music_rows(&fx.pool, &lib, "Audio")
+        .await
+        .into_iter()
+        .map(|row| (row.1, row.5))
+        .collect();
+    assert_eq!(
+        discs,
+        [
+            ("Two".to_string(), Some(2)),
+            ("One".to_string(), Some(1)),
+            ("Three".to_string(), Some(3)),
+            ("Five".to_string(), None),
+            ("Four".to_string(), None),
+        ]
+    );
+}
+
+/// Each picture codec is saved under its own extension; others are not saved.
+#[test]
+fn r2music_cover_extensions_follow_the_codec() {
+    use rustyfin_core::local_images::cover_extension;
+    for (codec, ext) in [
+        ("mjpeg", Some("jpg")),
+        ("png", Some("png")),
+        ("webp", Some("webp")),
+        ("bmp", Some("bmp")),
+        ("gif", Some("gif")),
+        ("tiff", None),
+        ("h264", None),
+    ] {
+        assert_eq!(cover_extension(codec), ext, "{codec}");
+    }
+}
+
+/// A track that gives no artist, whether untagged or unreadable, is read once: rescans skip it
+/// until its file changes.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn r2music_rescan_reads_a_track_without_artists_once() {
+    if !have_ffmpeg() {
+        eprintln!("skipped: needs ffmpeg and ffprobe");
+        return;
+    }
+    logged_lines("");
+    let fx = Fixture::new().await;
+    let lib = b18_music_library(&fx, &["music_untagged"]).await;
+    let root = root_of(&lib);
+    let lone = r2music_track(&root, "Lone.flac", &[], false);
+    std::fs::write(root.join("Broken.flac"), b"not audio").unwrap();
+    // The scanner logs "music library '<name>': read the tags of <n> older tracks again".
+    let reads = || logged_lines("music library 'music_untagged': read the tags of ");
+
+    scan_idle(&fx.pool, &lib).await;
+    scan_idle(&fx.pool, &lib).await;
+    scan_idle(&fx.pool, &lib).await;
+    assert_eq!(
+        reads(),
+        Vec::<String>::new(),
+        "rescans read the tracks again"
+    );
+
+    // A changed file is read again, once.
+    let later = SystemTime::now() + Duration::from_secs(120);
+    std::fs::File::options()
+        .write(true)
+        .open(&lone)
+        .and_then(|f| f.set_modified(later))
+        .unwrap();
+    scan_idle(&fx.pool, &lib).await;
+    scan_idle(&fx.pool, &lib).await;
+    let logged = reads();
+    assert_eq!(logged.len(), 1, "{logged:?}");
+    assert!(
+        logged[0].ends_with("read the tags of 1 older tracks again"),
+        "{logged:?}"
+    );
+}
+
+/// A bounded run gives up after its limit and kills the program.
+#[tokio::test]
+async fn r2music_bounded_run_stops_a_hung_program() {
+    let marker = std::env::temp_dir().join(format!("rustyfin_bounded_{}", Uuid::new_v4()));
+    let mut cmd = tokio::process::Command::new("sh");
+    cmd.arg("-c")
+        .arg(format!("sleep 2; touch '{}'", marker.display()));
+    let started = std::time::Instant::now();
+    let result = rustyfin_core::local_images::run_bounded(cmd, Duration::from_millis(200)).await;
+    let err = result.expect_err("a run past its limit fails");
+    assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{err}");
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        started.elapsed()
+    );
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(!marker.exists(), "the program ran on after the limit");
+}
+
+/// A plain rescan fills in what an older scan left out: track and album artists, disc numbers
+/// and album years, so the Artists lists work without adding the library again.
+#[tokio::test]
+async fn r2music_rescan_fills_in_artists_of_older_scans() {
+    if !have_ffmpeg() {
+        eprintln!("skipped: needs ffmpeg and ffprobe");
+        return;
+    }
+    let fx = Fixture::new().await;
+    let lib = b18_music_library(&fx, &["music"]).await;
+    let root = root_of(&lib);
+    r2music_track(
+        &root,
+        "Various Artists/Oscar Hits/01 - Papa Song.flac",
+        &[
+            ("title", "Papa Song"),
+            ("artist", "Papa Trio"),
+            ("album_artist", "Various Artists"),
+            ("date", "2020"),
+            ("disc", "1"),
+            ("track", "1"),
+        ],
+        false,
+    );
+    scan_idle(&fx.pool, &lib).await;
+    let fresh = (
+        r2music_links(&fx.pool, &lib, "Artist").await,
+        r2music_links(&fx.pool, &lib, "AlbumArtist").await,
+        r2music_rows(&fx.pool, &lib, "Audio").await,
+        r2music_rows(&fx.pool, &lib, "MusicAlbum").await,
+    );
+    assert_eq!(fresh.0.len(), 1, "{fresh:?}");
+
+    // What a scan before artists were read left behind.
+    exec(&fx.pool, "DELETE FROM item_people", &[]).await;
+    exec(&fx.pool, "DELETE FROM people", &[]).await;
+    exec(&fx.pool, "DELETE FROM music_tags_read", &[]).await;
+    exec(
+        &fx.pool,
+        "UPDATE media_items SET parent_index_number = NULL, production_year = NULL WHERE library_id = ?",
+        &[&lib.id.to_string()],
+    )
+    .await;
+    scan_idle(&fx.pool, &lib).await;
+
+    let again = (
+        r2music_links(&fx.pool, &lib, "Artist").await,
+        r2music_links(&fx.pool, &lib, "AlbumArtist").await,
+        r2music_rows(&fx.pool, &lib, "Audio").await,
+        r2music_rows(&fx.pool, &lib, "MusicAlbum").await,
+    );
+    assert_eq!(again, fresh);
+    // Once filled in, a rescan reads nothing again.
+    let before = count(&fx.pool, "SELECT COUNT(*) FROM item_people").await;
+    scan_idle(&fx.pool, &lib).await;
+    assert_eq!(
+        count(&fx.pool, "SELECT COUNT(*) FROM item_people").await,
+        before
+    );
+}
+
 /// A music library whose roots are `<temp dir>/<root>` for each of `roots`, in that order.
 async fn b18_music_library(fx: &Fixture, roots: &[&str]) -> Library {
     let paths = roots
@@ -5007,13 +5697,13 @@ async fn b18_music_frames(
         .collect()
 }
 
-/// The library's `MusicAlbum` rows (artists and albums) as (path, parent's path), relative to its
-/// first root, sorted.
+/// The library's `MusicArtist` and `MusicAlbum` rows (artists and albums) as (path, parent's
+/// path), relative to its first root, sorted.
 async fn b18_music_albums(pool: &SqlitePool, lib: &Library) -> Vec<(String, Option<String>)> {
     let root = root_of(lib);
     let rows: Vec<(String, Option<String>)> = sqlx::query_as(
         "SELECT a.path, p.path FROM media_items a LEFT JOIN media_items p ON p.id = a.parent_id
-         WHERE a.library_id = ?1 AND a.media_type = 'MusicAlbum'",
+         WHERE a.library_id = ?1 AND a.media_type IN ('MusicArtist', 'MusicAlbum')",
     )
     .bind(lib.id.to_string())
     .fetch_all(pool)

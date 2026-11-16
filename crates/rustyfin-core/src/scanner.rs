@@ -6,6 +6,7 @@ use rustyfin_model::media::{LocationType, MediaItem, MediaType};
 use sqlx::SqlitePool;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tokio::fs;
 use tokio::sync::{Mutex, MutexGuard};
 use uuid::Uuid;
@@ -829,6 +830,52 @@ async fn lookup_artist(
     rustyfin_db::repo_media::get_library_artist_id(pool, library_id, path).await
 }
 
+/// The disc number of a disc folder such as `Disc 1 - Bonus`, `CD2`, `disk-03` or `Volume 3`
+/// (case-insensitive), as Jellyfin reads them: the text after the prefix, cut at its first space, must
+/// be digits. `vol`, `volume` and `part` only count when the folder is at least two levels below the
+/// library root (`depth` is the number of path components, file included), so an artist folder named
+/// `Part 1` is not a disc.
+fn disc_folder_number(name: &str, depth: usize) -> Option<i32> {
+    let lower = name.to_ascii_lowercase();
+    // Longer prefixes come first so that `volume` is not read as `vol`.
+    let (rest, needs_album_level) = [
+        ("volume", true),
+        ("vol", true),
+        ("part", true),
+        ("disc", false),
+        ("disk", false),
+        ("cd", false),
+    ]
+    .iter()
+    .find_map(|&(prefix, nested)| lower.strip_prefix(prefix).map(|rest| (rest, nested)))?;
+    if needs_album_level && depth < 4 {
+        return None;
+    }
+    let rest = rest
+        .strip_prefix(|c: char| c == ' ' || c == '-' || c == '_')
+        .unwrap_or(rest);
+    let number = rest.trim().split(' ').next().unwrap_or("");
+    if number.is_empty() || !number.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    number.parse().ok()
+}
+
+/// The year of a track: the `year` tag parsed, else the first four characters of the `date` tag when digits.
+fn tag_year(tags: &probe::AudioTags) -> Option<i32> {
+    tags.year
+        .as_deref()
+        .and_then(|y| y.parse::<i32>().ok())
+        .or_else(|| {
+            let prefix = tags.date.as_deref()?.get(..4)?;
+            if prefix.bytes().all(|b| b.is_ascii_digit()) {
+                prefix.parse().ok()
+            } else {
+                None
+            }
+        })
+}
+
 /// Removes the items of `filter` that the scan no longer collected, and returns how many. A failure
 /// is logged, and counts as none.
 async fn remove_uncollected(
@@ -1573,6 +1620,167 @@ async fn scan_tv_library(
     Ok((changes, new_item_ids))
 }
 
+/// The folders of a music file, read from its place below the library root.
+struct MusicDirs {
+    /// The disc number of the disc folder above the file (`Disc 2`, `CD2`, ...), if there is one.
+    disc: Option<i32>,
+    /// The artist folder above the album folder, if there is one.
+    artist_name: Option<String>,
+    /// The album folder's name, or `Unknown Album` for a file at the root.
+    album_name: String,
+    /// The album folder's path, or the root for a file at the root.
+    album_dir: String,
+    /// The artist folder's path, or empty when there is none.
+    artist_dir: String,
+}
+
+/// Read the artist, album and disc folders of a music file below the library root `root`.
+/// Expected: Artist/Album/track.mp3. Fallback: Album/track.mp3 (no artist).
+/// A disc folder (`Disc 1`, `CD2`, `disk-03`) under an album folder is not an album: its tracks
+/// belong to the album above it, and the disc number is kept for the tracks.
+fn music_dirs(root: &Path, file: &Path) -> MusicDirs {
+    let rel = file.strip_prefix(root).unwrap_or(file);
+    let components: Vec<&str> = rel
+        .components()
+        .filter_map(|c| c.as_os_str().to_str())
+        .collect();
+    let n = components.len();
+    let disc = if n >= 3 {
+        disc_folder_number(components[n - 2], n)
+    } else {
+        None
+    };
+    if n < 2 {
+        // track.mp3 at root
+        return MusicDirs {
+            disc,
+            artist_name: None,
+            album_name: "Unknown Album".to_string(),
+            album_dir: root.to_string_lossy().to_string(),
+            artist_dir: String::new(),
+        };
+    }
+    let album_idx = if disc.is_some() { n - 3 } else { n - 2 };
+    let album_dir = components[..=album_idx]
+        .iter()
+        .fold(root.to_path_buf(), |p, c| p.join(c));
+    // Artist/Album/track.mp3: the folder above the album is the artist
+    let (artist_name, artist_dir) = if album_idx >= 1 {
+        (
+            Some(components[album_idx - 1].to_string()),
+            components[..album_idx]
+                .iter()
+                .fold(root.to_path_buf(), |p, c| p.join(c))
+                .to_string_lossy()
+                .to_string(),
+        )
+    } else {
+        // Album/track.mp3 (no artist directory)
+        (None, String::new())
+    };
+    MusicDirs {
+        disc,
+        artist_name,
+        album_name: components[album_idx].to_string(),
+        album_dir: album_dir.to_string_lossy().to_string(),
+        artist_dir,
+    }
+}
+
+/// The artists of a track and its album artist, from the tags of its probe. The artists are the artist
+/// tag split on `;`, else the album artist tag.
+fn artists_and_album_artist(
+    probe_result: &Result<probe::ProbeResult, probe::ProbeError>,
+) -> (Vec<String>, Option<String>) {
+    match probe_result
+        .as_ref()
+        .ok()
+        .and_then(|r| r.audio_tags.as_ref())
+    {
+        Some(tags) => {
+            let album_artist = tags
+                .album_artist
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let mut artists = tags
+                .artist
+                .as_deref()
+                .map(split_artist_tag)
+                .unwrap_or_default();
+            if artists.is_empty() {
+                artists.extend(album_artist.clone());
+            }
+            (artists, album_artist)
+        }
+        None => (Vec::new(), None),
+    }
+}
+
+/// The time limit for reading the tags of one existing track. A longer probe is dropped, which kills it,
+/// and counts as a failed read.
+const BACKFILL_PROBE_LIMIT: Duration = Duration::from_secs(60);
+
+/// Fill in an existing track that has no artist link: its artists, its album artist, its disc number and
+/// the years of it and its album, as a new track gets them. The track keeps its id and its album keeps its parent.
+async fn fill_track_links(
+    pool: &SqlitePool,
+    track: Uuid,
+    file_path: &str,
+    dirs: &MusicDirs,
+    linked_albums: &mut HashSet<Uuid>,
+) -> Result<(), sqlx::Error> {
+    let probe_result =
+        match tokio::time::timeout(BACKFILL_PROBE_LIMIT, probe::probe_file(file_path)).await {
+            Ok(result) => result,
+            Err(_) => Err(probe::ProbeError::FfprobeFailed(format!(
+                "no result within {BACKFILL_PROBE_LIMIT:?}"
+            ))),
+        };
+    let (artists, album_artist) = artists_and_album_artist(&probe_result);
+    let tags = probe_result
+        .as_ref()
+        .ok()
+        .and_then(|r| r.audio_tags.as_ref());
+    let year = tags.and_then(tag_year);
+    let disc = tags
+        .and_then(|t| t.disc_number)
+        .map(|n| n as i32)
+        .or(dirs.disc);
+
+    if !artists.is_empty() {
+        rustyfin_db::repo_person::link_music_artists(pool, &[(track, "Artist", artists.clone())])
+            .await?;
+    }
+    if let Some(album) = rustyfin_db::repo_media::get_item_parent_id(pool, track).await? {
+        // The album artist: this track's album artist tag, else the artist folder, else its first artist.
+        if !linked_albums.contains(&album) {
+            let album_artist = album_artist
+                .or_else(|| dirs.artist_name.clone())
+                .or_else(|| artists.first().cloned());
+            if let Some(name) = album_artist {
+                rustyfin_db::repo_person::link_music_artists(
+                    pool,
+                    &[(album, "AlbumArtist", vec![name])],
+                )
+                .await?;
+                linked_albums.insert(album);
+            }
+        }
+        if let Some(year) = year {
+            rustyfin_db::repo_media::fill_production_year(pool, album, year).await?;
+        }
+    }
+    if let Some(year) = year {
+        rustyfin_db::repo_media::fill_production_year(pool, track, year).await?;
+    }
+    if let Some(disc) = disc {
+        rustyfin_db::repo_media::fill_track_disc(pool, track, disc).await?;
+    }
+    Ok(())
+}
+
 /// Recursive scan for Music: path/Artist/Album/track files
 /// Builds Artist → Album → Track hierarchy using directory structure and audio tags.
 /// With `counted`, each new artist, album and track reserves one unit of the ticket's total.
@@ -1612,8 +1820,33 @@ async fn scan_music_library(
             .map(|(id, path, size, modified)| (path, (id, size, modified)))
             .collect();
 
+    // The tracks with an artist link, and the albums with an album artist link. An existing track that
+    // is not in the first set is filled in once by a probe (see `fill_track_links`).
+    let linked_tracks =
+        rustyfin_db::repo_person::linked_item_ids(pool, library.id, &filter, "Audio", "Artist")
+            .await?;
+    let mut linked_albums = rustyfin_db::repo_person::linked_item_ids(
+        pool,
+        library.id,
+        &filter,
+        "MusicAlbum",
+        "AlbumArtist",
+    )
+    .await?;
+    // The tracks whose tags a scan has read, with the size and modification time of the file then. A
+    // track without an artist link is read again only when its file differs from these.
+    let tags_read =
+        rustyfin_db::repo_media::get_library_music_tags_read(pool, library.id, &filter).await?;
+    // The existing tracks by path. A track's source may not be written yet (a new track's probe runs
+    // in the background), so the read above is keyed on the track item, not on its source.
+    let audio_tracks =
+        rustyfin_db::repo_media::get_library_items_by_type(pool, library.id, "Audio", &filter)
+            .await?;
+    // The existing tracks whose tags this scan read again.
+    let mut backfilled = 0u32;
+
     // Pre-load the music album rows once for the whole scan, for O(1) ID lookup.
-    // Artists and albums both use MediaType::MusicAlbum in the DB, so artist paths are here too.
+    // Albums are MusicAlbum rows; artists are MusicArtist rows (older scans stored them as MusicAlbum).
     // A scoped scan loads the rows in its scope, and looks up the others when it meets them.
     // album_path -> album_id
     let mut album_map: HashMap<String, Uuid> =
@@ -1668,6 +1901,10 @@ async fn scan_music_library(
     for (path, files) in roots {
         // Collect new items for batch insert in a single transaction
         let mut new_items: Vec<MediaItem> = Vec::new();
+        // The artist links of the new items, written once their batch is stored.
+        let mut music_links: Vec<(Uuid, &str, Vec<String>)> = Vec::new();
+        // Per new album, the first new track whose file has an attached picture, and its codec.
+        let mut embedded_covers: HashMap<Uuid, (String, String)> = HashMap::new();
 
         let mut scanned_files = 0u32;
         let mut skipped_ext = 0u32;
@@ -1710,47 +1947,32 @@ async fn scan_music_library(
                         probe::spawn_probe_and_save(pool.clone(), item_id, file_path.clone());
                     }
                 }
+                // A track without an artist link is read once per file version. A failed or empty
+                // read counts too, so that the track is not read again until its file changes.
+                if let Some(&track) = audio_tracks.get(&file_path)
+                    && !linked_tracks.contains(&track)
+                    && let Some(stamp) = scan_sync::file_stamp(&file_path)
+                    && tags_read.get(&track) != Some(&stamp)
+                {
+                    let dirs = music_dirs(path, &file_path_buf);
+                    fill_track_links(pool, track, &file_path, &dirs, &mut linked_albums).await?;
+                    rustyfin_db::repo_media::upsert_music_tags_read(
+                        pool,
+                        &[(track, stamp.0, stamp.1)],
+                    )
+                    .await?;
+                    backfilled += 1;
+                }
                 continue;
             }
 
-            let rel = file_path_buf.strip_prefix(path).unwrap_or(&file_path_buf);
-            let components: Vec<&str> = rel
-                .components()
-                .filter_map(|c| c.as_os_str().to_str())
-                .collect();
-
-            // Determine artist and album from directory structure
-            // Expected: MusicLibrary/Artist/Album/track.mp3
-            // Fallback: MusicLibrary/Album/track.mp3 (no artist)
-            let (artist_name_from_dir, album_name_from_dir, album_dir, artist_dir) =
-                if components.len() >= 3 {
-                    // Artist/Album/track.mp3
-                    let artist_dir = path.join(components[components.len() - 3]);
-                    let album_dir = file_path_buf.parent().unwrap_or(path);
-                    (
-                        Some(components[components.len() - 3].to_string()),
-                        components[components.len() - 2].to_string(),
-                        album_dir.to_string_lossy().to_string(),
-                        artist_dir.to_string_lossy().to_string(),
-                    )
-                } else if components.len() >= 2 {
-                    // Album/track.mp3 (no artist directory)
-                    let album_dir = file_path_buf.parent().unwrap_or(path);
-                    (
-                        None,
-                        components[components.len() - 2].to_string(),
-                        album_dir.to_string_lossy().to_string(),
-                        String::new(),
-                    )
-                } else {
-                    // track.mp3 at root
-                    (
-                        None,
-                        "Unknown Album".to_string(),
-                        path.to_string_lossy().to_string(),
-                        String::new(),
-                    )
-                };
+            let MusicDirs {
+                disc: disc_from_dir,
+                artist_name: artist_name_from_dir,
+                album_name: album_name_from_dir,
+                album_dir,
+                artist_dir,
+            } = music_dirs(path, &file_path_buf);
 
             // First, probe the file synchronously to get audio tags for metadata
             let probe_result = probe::probe_file(&file_path).await;
@@ -1762,6 +1984,7 @@ async fn scan_music_library(
                 year,
                 track_number,
                 title_from_tag,
+                disc_from_tag,
             ) = if let Ok(result) = &probe_result {
                 if let Some(ref tags) = result.audio_tags {
                     (
@@ -1769,26 +1992,30 @@ async fn scan_music_library(
                         tags.artist.clone().or_else(|| tags.album_artist.clone()),
                         tags.album.clone(),
                         tags.genre.clone(),
-                        tags.year.as_ref().and_then(|y| y.parse::<i32>().ok()),
+                        tag_year(tags),
                         tags.track_number.map(|n| n as i32),
                         tags.title.clone(),
+                        tags.disc_number.map(|n| n as i32),
                     )
                 } else {
-                    (false, None, None, None, None, None, None)
+                    (false, None, None, None, None, None, None, None)
                 }
             } else {
-                (false, None, None, None, None, None, None)
+                (false, None, None, None, None, None, None, None)
             };
+
+            // The track's artists: the artist tag split on `;`, else the album artist tag.
+            let (track_artists, album_artist_tag) = artists_and_album_artist(&probe_result);
 
             // Use tag album name if available, otherwise directory name
             let effective_album_name = album_name_from_tag
                 .clone()
                 .unwrap_or(album_name_from_dir.clone());
 
-            // Resolve artist
-            let effective_artist_name = artist_name_from_tag
+            // Resolve artist: the artist folder's name, else the track's artist tag
+            let effective_artist_name = artist_name_from_dir
                 .clone()
-                .or_else(|| artist_name_from_dir.clone());
+                .or_else(|| artist_name_from_tag.clone());
 
             // Resolve artist ID if we have an artist name
             let artist_id = if let Some(ref artist_name) = effective_artist_name {
@@ -1810,7 +2037,7 @@ async fn scan_music_library(
                         name: artist_name.clone(),
                         sort_name: Some(artist_name.to_lowercase()),
                         overview: None,
-                        media_type: MediaType::MusicAlbum, // Artists use same type as albums in DB
+                        media_type: MediaType::MusicArtist,
                         path: artist_dir.clone(),
                         parent_id: None,
                         library_id: library.id,
@@ -1868,6 +2095,15 @@ async fn scan_music_library(
                     media_sources: Vec::new(),
                     ..MediaItem::default_dto_fields()
                 };
+                // The album artist: this first track's album artist tag, else the artist folder, else
+                // the track's first artist.
+                let album_artist = album_artist_tag
+                    .clone()
+                    .or_else(|| artist_name_from_dir.clone())
+                    .or_else(|| track_artists.first().cloned());
+                if let Some(name) = album_artist {
+                    music_links.push((id, "AlbumArtist", vec![name]));
+                }
                 new_items.push(album_item);
                 album_map.insert(album_dir, id);
                 if counted {
@@ -1921,11 +2157,23 @@ async fn scan_music_library(
                 premiere_date: None,
                 runtime_ticks: None,
                 index_number: track_number,
-                parent_index_number: None,
+                parent_index_number: disc_from_tag.or(disc_from_dir),
                 media_sources: Vec::new(),
                 ..MediaItem::default_dto_fields()
             };
 
+            if !track_artists.is_empty() {
+                music_links.push((item.id, "Artist", track_artists));
+            }
+            if let Some(codec) = probe_result
+                .as_ref()
+                .ok()
+                .and_then(|r| r.attached_picture_codec.clone())
+            {
+                embedded_covers
+                    .entry(album_id)
+                    .or_insert((file_path.clone(), codec));
+            }
             new_items.push(item);
             if counted {
                 ticket.add_total(1);
@@ -1955,10 +2203,18 @@ async fn scan_music_library(
                     ticket.advance(new_items.len());
                 }
             } else {
+                if let Err(e) =
+                    rustyfin_db::repo_person::link_music_artists(pool, &music_links).await
+                {
+                    tracing::error!("failed to link music artists: {}", e);
+                }
                 // Find and save local images for albums (cover art)
                 let mut all_images: Vec<rustyfin_model::image::ItemImage> = Vec::new();
                 for item in &new_items {
-                    if item.media_type == MediaType::MusicAlbum {
+                    if matches!(
+                        item.media_type,
+                        MediaType::MusicAlbum | MediaType::MusicArtist
+                    ) {
                         // For albums, look for images in the album directory
                         let album_dir = std::path::Path::new(&item.path);
                         let images = local_images::find_local_images(album_dir, item.id);
@@ -1970,6 +2226,24 @@ async fn scan_music_library(
                             );
                         }
                         all_images.extend(images);
+                    }
+                }
+                // An album without a local cover takes the embedded cover of its first pictured track.
+                for item in &new_items {
+                    if item.media_type != MediaType::MusicAlbum
+                        || all_images.iter().any(|image| {
+                            image.item_id == item.id
+                                && image.image_type == rustyfin_model::image::ImageType::Primary
+                        })
+                    {
+                        continue;
+                    }
+                    if let Some((track, codec)) = embedded_covers.get(&item.id)
+                        && let Some(image) =
+                            local_images::extract_embedded_cover(Path::new(track), item.id, codec)
+                                .await
+                    {
+                        all_images.push(image);
                     }
                 }
                 if !all_images.is_empty() {
@@ -1989,14 +2263,38 @@ async fn scan_music_library(
                         probe::spawn_probe_and_save(pool.clone(), item.id, item.path.clone());
                     }
                 }
+                // The new tracks were read by the probes above, so they are not read again by a rescan.
+                let tracks_read: Vec<(Uuid, i64, i64)> = new_items
+                    .iter()
+                    .filter(|item| item.media_type == MediaType::Audio)
+                    .filter_map(|item| {
+                        scan_sync::file_stamp(&item.path)
+                            .map(|(size, mtime)| (item.id, size, mtime))
+                    })
+                    .collect();
+                if let Err(e) =
+                    rustyfin_db::repo_media::upsert_music_tags_read(pool, &tracks_read).await
+                {
+                    tracing::error!("failed to record the music tags read: {}", e);
+                }
                 count += new_items.len() as u32;
                 new_item_ids.extend(new_items.iter().map(|item| item.id));
             }
         }
     }
 
+    if backfilled > 0 {
+        tracing::info!(
+            "music library '{}': read the tags of {} older tracks again",
+            library.name,
+            backfilled
+        );
+    }
+
     // Remove the items that this scan no longer collects. A failure is logged, not returned.
+    let covers = local_images::embedded_cover_paths(pool, library.id).await;
     let removed = remove_uncollected(pool, library, &filter, &collected, &unreadable, &loops).await;
+    local_images::remove_orphaned_covers(pool, &covers).await;
     tracing::info!(
         "scanned music library '{}': {} new items added ({} existing items unchanged)",
         library.name,
@@ -2017,6 +2315,18 @@ async fn scan_music_library(
         images: 0,
     };
     Ok((changes, new_item_ids))
+}
+
+/// The artist names in an artist tag: split on `;`, trimmed, empty and repeated names dropped, in
+/// tag order.
+fn split_artist_tag(tag: &str) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for part in tag.split(';').map(str::trim).filter(|p| !p.is_empty()) {
+        if !names.iter().any(|n| n == part) {
+            names.push(part.to_string());
+        }
+    }
+    names
 }
 
 fn detect_media_type(ext: &str, content_type: &LibraryContentType) -> Option<MediaType> {

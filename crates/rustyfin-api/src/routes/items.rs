@@ -100,7 +100,7 @@ fn apply_unplayed_counts(item: &mut MediaItem, counts: (i64, i64)) {
 
 /// Set an item's image tags (the first image of each type) and backdrop tags (every backdrop, in
 /// order) from its image rows.
-fn set_image_tags(item: &mut MediaItem, images: &[rustyfin_model::image::ItemImage]) {
+pub(crate) fn set_image_tags(item: &mut MediaItem, images: &[rustyfin_model::image::ItemImage]) {
     let mut tags: std::collections::HashMap<rustyfin_model::image::ImageType, String> =
         std::collections::HashMap::new();
     let mut backdrop_tags: Vec<String> = Vec::new();
@@ -124,6 +124,61 @@ fn add_blur_hash(item: &mut MediaItem, img: &rustyfin_model::image::ItemImage, h
             rustyfin_core::image_proxy::image_tag(&img.path, img.stamp),
             hash,
         );
+}
+
+/// The album artists of a music album: its `AlbumArtist` links `(person id, name)` in order,
+/// else its parent item when that is a MusicArtist or MusicAlbum, else none.
+fn album_artists_of(
+    links: &[(String, String)],
+    parent: Option<&MediaItem>,
+) -> Vec<rustyfin_model::media::GenreItem> {
+    if !links.is_empty() {
+        return links
+            .iter()
+            .map(|(id, name)| rustyfin_model::media::GenreItem {
+                name: name.clone(),
+                id: id.clone(),
+            })
+            .collect();
+    }
+    match parent {
+        Some(p)
+            if matches!(
+                p.media_type,
+                rustyfin_model::media::MediaType::MusicArtist
+                    | rustyfin_model::media::MediaType::MusicAlbum
+            ) =>
+        {
+            vec![rustyfin_model::media::GenreItem {
+                name: p.name.clone(),
+                id: p.id.to_string(),
+            }]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// The `Artists` and `ArtistItems` of a music album: the distinct artists of its tracks
+/// (`track_artists`, from `album_track_artists_batch`). Without any, the album artists by name and
+/// no items.
+fn album_credit(
+    track_artists: &[(String, String)],
+    album_artists: &[rustyfin_model::media::GenreItem],
+) -> (Vec<String>, Vec<rustyfin_model::media::GenreItem>) {
+    if track_artists.is_empty() {
+        return (
+            album_artists.iter().map(|a| a.name.clone()).collect(),
+            Vec::new(),
+        );
+    }
+    let items: Vec<rustyfin_model::media::GenreItem> = track_artists
+        .iter()
+        .map(|(id, name)| rustyfin_model::media::GenreItem {
+            name: name.clone(),
+            id: id.clone(),
+        })
+        .collect();
+    (items.iter().map(|a| a.name.clone()).collect(), items)
 }
 
 /// Load the image tags of an item read with `get_parent_item` or `get_album_for_audio`, which
@@ -535,17 +590,38 @@ async fn enrich_item(
                 item.parent_art_image_tag = Some(tag.clone());
                 item.parent_art_item_id = Some(album.id);
             }
+            // Album artists: the album's AlbumArtist links, else its parent artist item.
+            let links = rustyfin_db::repo_person::get_links_batch(pool, &[album.id], "AlbumArtist")
+                .await
+                .unwrap_or_default();
+            let album_parent = match album.parent_id {
+                Some(pid) => rustyfin_db::repo_media::get_parent_item(pool, pid)
+                    .await
+                    .ok()
+                    .flatten(),
+                None => None,
+            };
+            let album_links = links
+                .get(&album.id.to_string())
+                .cloned()
+                .unwrap_or_default();
+            item.album_artists = album_artists_of(&album_links, album_parent.as_ref());
+            item.album_artist = item.album_artists.first().map(|a| a.name.clone());
         }
-        // AlbumArtist from album name
-        if item.album_artist.is_none()
-            && let Some(parent_id) = item.parent_id
-            && let Ok(Some(album)) = rustyfin_db::repo_media::get_parent_item(pool, parent_id).await
-        {
-            item.album_artist = Some(album.name.clone());
-        }
-        // Artists from item_people table (already fetched in parallel)
-        if let Ok(artists) = &people_result {
-            item.artists = artists
+        // Artists: the track's Artist links in credit order, already fetched in parallel.
+        if let Ok(rows) = &people_result {
+            let artists: Vec<&rustyfin_db::repo_media::PersonRow> =
+                rows.iter().filter(|row| row.3 == "Artist").collect();
+            item.artists = artists.iter().map(|row| row.1.clone()).collect();
+            item.artist_items = artists
+                .iter()
+                .map(|row| rustyfin_model::media::GenreItem {
+                    name: row.1.clone(),
+                    id: row.0.clone(),
+                })
+                .collect();
+            // Also populate People for audio items
+            item.people = artists
                 .iter()
                 .map(
                     |(pid, name, role, _, primary_path)| rustyfin_model::media::PersonInfo {
@@ -559,10 +635,35 @@ async fn enrich_item(
                     },
                 )
                 .collect();
-            item.album_artists = item.artists.clone();
-            // Also populate People for audio items
-            item.people = item.artists.clone();
         }
+    } else if item.media_type == rustyfin_model::media::MediaType::MusicAlbum {
+        // Album artists from the album's own AlbumArtist links, else its parent artist.
+        let links = rustyfin_db::repo_person::get_links_batch(pool, &[item.id], "AlbumArtist")
+            .await
+            .unwrap_or_default();
+        let parent = match item.parent_id {
+            Some(pid) => rustyfin_db::repo_media::get_parent_item(pool, pid)
+                .await
+                .ok()
+                .flatten(),
+            None => None,
+        };
+        let album_links = links.get(&item.id.to_string()).cloned().unwrap_or_default();
+        item.album_artists = album_artists_of(&album_links, parent.as_ref());
+        item.album_artist = item.album_artists.first().map(|a| a.name.clone());
+        // Artists: the distinct artists of the album's tracks.
+        let track_artists = rustyfin_db::repo_person::album_track_artists_batch(pool, &[item.id])
+            .await
+            .unwrap_or_default();
+        let (artists, artist_items) = album_credit(
+            track_artists
+                .get(&item.id.to_string())
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+            &item.album_artists,
+        );
+        item.artists = artists;
+        item.artist_items = artist_items;
     }
 
     // --- People for all non-audio items (Movie, Episode, Series, etc.) ---
@@ -1018,6 +1119,25 @@ pub(crate) async fn enrich_items_with(
         .unwrap_or_default()
     };
 
+    // Batch query 7b: AlbumArtist links of the music albums that are listed or are parents of
+    // listed items, and the distinct artists of their tracks.
+    let album_link_ids: Vec<Uuid> = parent_map
+        .values()
+        .chain(items.iter())
+        .filter(|item| item.media_type == rustyfin_model::media::MediaType::MusicAlbum)
+        .map(|item| item.id)
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    let album_links_map: std::collections::HashMap<String, Vec<(String, String)>> =
+        rustyfin_db::repo_person::get_links_batch(pool, &album_link_ids, "AlbumArtist")
+            .await
+            .unwrap_or_default();
+    let album_track_artists_map =
+        rustyfin_db::repo_person::album_track_artists_batch(pool, &album_link_ids)
+            .await
+            .unwrap_or_default();
+
     // Batch query: studios and IMDb ids for all items
     let studios_map = rustyfin_db::repo_media::get_studios_for_items(pool, &item_ids)
         .await
@@ -1034,7 +1154,8 @@ pub(crate) async fn enrich_items_with(
             let placeholders: Vec<String> =
                 (1..=chunk_ids.len()).map(|i| format!("?{}", i)).collect();
             let query = format!(
-                "SELECT ip.item_id, p.id, p.name, ip.role, ip.type, (SELECT pi.path FROM person_images pi WHERE pi.person_id = p.id AND pi.image_type = 'Primary' AND pi.image_index = 0) FROM item_people ip JOIN people p ON p.id = ip.person_id WHERE ip.item_id IN ({}) ORDER BY ip.item_id, ip.sort_order IS NULL, ip.sort_order, ip.rowid",
+                "SELECT ip.item_id, CASE WHEN ip.type IN ('Artist', 'AlbumArtist') THEN {} ELSE p.id END, p.name, ip.role, ip.type, (SELECT pi.path FROM person_images pi WHERE pi.person_id = p.id AND pi.image_type = 'Primary' AND pi.image_index = 0) FROM item_people ip JOIN people p ON p.id = ip.person_id WHERE ip.item_id IN ({}) ORDER BY ip.item_id, ip.sort_order IS NULL, ip.sort_order, ip.rowid",
+                rustyfin_db::repo_person::item_artist_id_sql(),
                 placeholders.join(",")
             );
             let mut query_builder = sqlx::query_as::<
@@ -1346,7 +1467,6 @@ pub(crate) async fn enrich_items_with(
         {
             item.album = Some(parent.name.clone());
             item.album_id = Some(parent.id);
-            item.album_artist = Some(parent.name.clone());
             if let Some(tag) = parent
                 .image_tags
                 .get(&rustyfin_model::image::ImageType::Primary)
@@ -1585,11 +1705,57 @@ pub(crate) async fn enrich_items_with(
                     },
                 )
                 .collect();
-            // For audio items, also populate artists
-            if item.media_type == rustyfin_model::media::MediaType::Audio {
-                item.artists = item.people.clone();
-                item.album_artists = item.people.clone();
-            }
+        }
+
+        // --- Music artist fields from the batched links ---
+        if item.media_type == rustyfin_model::media::MediaType::Audio {
+            let own: Vec<(String, String)> = people_map
+                .get(&item.id.to_string())
+                .map(|rows| {
+                    rows.iter()
+                        .filter(|row| row.3 == "Artist")
+                        .map(|row| (row.0.clone(), row.1.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            item.artists = own.iter().map(|(_, name)| name.clone()).collect();
+            item.artist_items = own
+                .iter()
+                .map(|(id, name)| rustyfin_model::media::GenreItem {
+                    name: name.clone(),
+                    id: id.clone(),
+                })
+                .collect();
+            let album = item
+                .parent_id
+                .and_then(|pid| parent_map.get(&pid.to_string()))
+                .filter(|p| p.media_type == rustyfin_model::media::MediaType::MusicAlbum);
+            let album_links = album
+                .and_then(|a| album_links_map.get(&a.id.to_string()))
+                .cloned()
+                .unwrap_or_default();
+            let album_parent = album
+                .and_then(|a| a.parent_id)
+                .and_then(|pid| parent_map.get(&pid.to_string()));
+            item.album_artists = album_artists_of(&album_links, album_parent);
+            item.album_artist = item.album_artists.first().map(|a| a.name.clone());
+        } else if item.media_type == rustyfin_model::media::MediaType::MusicAlbum {
+            let album_links = album_links_map
+                .get(&item.id.to_string())
+                .cloned()
+                .unwrap_or_default();
+            let parent = item
+                .parent_id
+                .and_then(|pid| parent_map.get(&pid.to_string()));
+            item.album_artists = album_artists_of(&album_links, parent);
+            item.album_artist = item.album_artists.first().map(|a| a.name.clone());
+            let track_artists = album_track_artists_map
+                .get(&item.id.to_string())
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let (artists, artist_items) = album_credit(track_artists, &item.album_artists);
+            item.artists = artists;
+            item.artist_items = artist_items;
         }
 
         // --- Studios from batch map, with the ids that /Studios lists (as enrich_item) ---
@@ -2484,8 +2650,12 @@ async fn item_or_library(
                     Json(super::library::library_view(&lib, &state.server_id)).into_response()
                 );
             }
-            match super::collections::container_details(state, id, claims).await? {
-                Some(item) => Ok(Json(item).into_response()),
+            if let Some(item) = super::collections::container_details(state, id, claims).await? {
+                return Ok(Json(item).into_response());
+            }
+            // A music artist without a folder item is listed under its person id.
+            match rustyfin_db::repo_person::music_artist_by_id(&state.db_ro, id).await? {
+                Some(artist) => Ok(Json(artist).into_response()),
                 None => Err(ApiError::NotFound(message)),
             }
         }

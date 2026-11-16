@@ -294,7 +294,9 @@ async fn remove_library(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>, ApiError> {
+    let covers = rustyfin_core::local_images::embedded_cover_paths(&state.db, id).await;
     rustyfin_db::repo_library::delete_library(&state.db, id).await?;
+    rustyfin_core::local_images::remove_orphaned_covers(&state.db, &covers).await;
     state.cache.invalidate_library_lists();
     state.task_scheduler.watcher().libraries_changed();
     Ok(Json(json!({ "status": "ok" })))

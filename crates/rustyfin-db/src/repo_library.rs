@@ -57,6 +57,12 @@ pub async fn get_library_by_id(
 }
 
 pub async fn delete_library(pool: &SqlitePool, id: Uuid) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "DELETE FROM music_tags_read WHERE item_id IN (SELECT id FROM media_items WHERE library_id = ?)",
+    )
+    .bind(id.to_string())
+    .execute(pool)
+    .await?;
     sqlx::query("DELETE FROM media_items WHERE library_id = ?")
         .bind(id.to_string())
         .execute(pool)

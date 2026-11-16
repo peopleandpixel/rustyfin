@@ -13,7 +13,7 @@ use std::time::Instant;
 /// One batch: the items after the last one done, of the kinds a scan dates by their paths.
 const BATCH_SQL: &str = "SELECT id, path, date_created FROM media_items \
     WHERE id > ?1 AND media_type IN ('Movie','Series','Season','Episode', \
-    'Audio','MusicAlbum','Photo') ORDER BY id LIMIT ?2";
+    'Audio','MusicAlbum','MusicArtist','Photo') ORDER BY id LIMIT ?2";
 
 /// What one run of the date added backfill did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
