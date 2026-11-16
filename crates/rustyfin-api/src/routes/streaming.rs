@@ -419,27 +419,96 @@ async fn head_video(
     head_file(&file_path).await
 }
 
-/// `GET /Audio/{id}/stream` and `stream.{container}`: the track's file. The container takes the
-/// same `VideoPath`, so `stream.mp3` no longer fails to extract its path (a 500). Rustyfin has no
-/// progressive transcoder, so a container other than the file's still gets the file.
-async fn stream_audio(
-    state: State<AppState>,
-    Path(VideoPath { id }): Path<VideoPath>,
-    headers: HeaderMap,
-) -> Result<Response, ApiError> {
-    stream_file(state, Path(id), headers).await
+/// The path of an audio stream route: the item, and the container of `stream.{container}`.
+#[derive(Deserialize)]
+struct AudioPath {
+    id: Uuid,
+    container: Option<String>,
 }
 
-async fn head_stream(
-    State(state): State<AppState>,
-    Path(VideoPath { id }): Path<VideoPath>,
-) -> Result<Response, ApiError> {
+/// The track file that `/Audio/{id}/stream` and `stream.{container}` serve. Without `static=true`,
+/// a request that names codecs (`AudioCodec`, else the URL's container) the track's codec and
+/// container aren't among asks for a transcode, which Jellyfin makes progressively. Rustyfin's
+/// transcoder writes HLS only, so that is a 400 that says so, not the file as it is (FLAC for an
+/// MP3 client).
+async fn audio_stream_file(
+    state: &AppState,
+    AudioPath { id, container }: AudioPath,
+    params: &HashMap<String, String>,
+) -> Result<String, ApiError> {
     let item = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Item {id} not found")))?;
+    validate_path_against_library(state, &item.library_id, &item.path).await?;
 
-    validate_path_against_library(&state, &item.library_id, &item.path).await?;
-    head_file(&item.path).await
+    let param = |name: &str| {
+        params
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.trim())
+            .filter(|value| !value.is_empty())
+    };
+    if param("static").is_some_and(|v| v.eq_ignore_ascii_case("true")) {
+        return Ok(item.path);
+    }
+    let wanted: Vec<String> = param("AudioCodec")
+        .or(container.as_deref())
+        .unwrap_or_default()
+        .split(',')
+        .map(|codec| codec.trim().to_ascii_lowercase())
+        .filter(|codec| !codec.is_empty())
+        .collect();
+    if wanted.is_empty() {
+        return Ok(item.path);
+    }
+    let source =
+        rustyfin_db::repo_media_source::get_media_sources_with_item_check(&state.db_ro, &id)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .next();
+    let Some(source) = source else {
+        // A track that was never probed plays as it is
+        return Ok(item.path);
+    };
+    let codec = source
+        .media_streams
+        .iter()
+        .find(|s| s.codec_type.eq_ignore_ascii_case("audio"))
+        .and_then(|s| s.codec.as_deref())
+        .map(str::to_ascii_lowercase);
+    let source_container = source.container.as_deref().map(str::to_ascii_lowercase);
+    let takes = |name: &Option<String>| name.as_ref().is_some_and(|n| wanted.contains(n));
+    if takes(&codec) || takes(&source_container) {
+        return Ok(item.path);
+    }
+    Err(ApiError::BadRequest(format!(
+        "Item {id} is {} and the request asks for {}: Rustyfin transcodes audio over HLS only, so \
+         use /Audio/{id}/universal with TranscodingProtocol=hls",
+        codec.as_deref().unwrap_or("of an unknown codec"),
+        wanted.join(",")
+    )))
+}
+
+/// `GET /Audio/{id}/stream` and `stream.{container}`: the track's file (see `audio_stream_file`).
+async fn stream_audio(
+    State(state): State<AppState>,
+    Path(path): Path<AudioPath>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let file_path = audio_stream_file(&state, path, &params).await?;
+    serve_file(file_path, &headers).await
+}
+
+/// `HEAD` of the audio stream routes: the headers of the file that `GET` serves.
+async fn head_stream(
+    State(state): State<AppState>,
+    Path(path): Path<AudioPath>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Response, ApiError> {
+    let file_path = audio_stream_file(&state, path, &params).await?;
+    head_file(&file_path).await
 }
 
 /// The headers of a `HEAD` for the file at `file_path`: its type, its length, and that byte
@@ -461,19 +530,6 @@ async fn head_file(file_path: &str) -> Result<Response, ApiError> {
         ],
     )
         .into_response())
-}
-
-async fn stream_file(
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-    headers: HeaderMap,
-) -> Result<Response, ApiError> {
-    let item = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, id)
-        .await?
-        .ok_or_else(|| ApiError::NotFound(format!("Item {id} not found")))?;
-
-    validate_path_against_library(&state, &item.library_id, &item.path).await?;
-    serve_file(item.path, &headers).await
 }
 
 /// Serves the file at `file_path` for a request with `headers`: the whole file, or the byte range,

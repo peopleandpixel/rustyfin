@@ -40868,17 +40868,30 @@ async fn r3decisions_get(
     uri: &str,
     token: &str,
 ) -> (StatusCode, Option<String>, Vec<u8>) {
+    r3decisions_send(app, "GET", uri, token).await.0
+}
+
+/// `{method} {uri}` with `token`: (status, Location, body) and the Content-Type.
+async fn r3decisions_send(
+    app: &axum::Router,
+    method: &str,
+    uri: &str,
+    token: &str,
+) -> ((StatusCode, Option<String>, Vec<u8>), Option<String>) {
     let req = Request::builder()
+        .method(method)
         .uri(uri)
         .header("Authorization", format!("Bearer {token}"))
         .body(Body::empty())
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
     let status = resp.status();
-    let location = resp
-        .headers()
-        .get("location")
-        .map(|v| v.to_str().unwrap().to_string());
+    let header = |name: &str| {
+        resp.headers()
+            .get(name)
+            .map(|v| v.to_str().unwrap().to_string())
+    };
+    let (location, content_type) = (header("location"), header("content-type"));
     let body = resp
         .into_body()
         .collect()
@@ -40886,7 +40899,7 @@ async fn r3decisions_get(
         .unwrap()
         .to_bytes()
         .to_vec();
-    (status, location, body)
+    ((status, location, body), content_type)
 }
 
 /// `/Audio/{id}/universal` answers with audio, as Jellyfin's does, not with JSON: the file when
@@ -40903,6 +40916,7 @@ async fn r3decisions_universal_audio_plays_the_file_or_the_hls_transcode() {
         j2_song("flac", 900_000),
     )
     .await;
+    let transcodes = state.transcode_manager.clone();
     let app = app(state);
     let (token, _) = g2_login_device(&app, "r3d-audio", "r3d-pass", "r3d-device")
         .await
@@ -40923,16 +40937,25 @@ async fn r3decisions_universal_audio_plays_the_file_or_the_hls_transcode() {
     assert_eq!(location, None);
     assert_eq!(body.len(), 1000);
 
-    // A client that takes only MP3 and AAC over HLS gets the transcode
-    let (status, location, _) = r3decisions_get(
-        &app,
-        &format!(
-            "/audio/{song}/universal?container=mp3,aac&transcodingContainer=ts\
-             &transcodingProtocol=hls&audioCodec=aac&maxStreamingBitrate=320000"
-        ),
-        &token,
-    )
-    .await;
+    // A client that takes only MP3 and AAC over HLS gets the transcode, in its play session
+    let hls = format!(
+        "/audio/{song}/universal?container=mp3,aac&transcodingContainer=ts\
+         &transcodingProtocol=hls&audioCodec=aac&maxStreamingBitrate=320000\
+         &PlaySessionId=r3d-session"
+    );
+    // Jellyfin Web asks HEAD first: the playlist's type, and no transcode starts
+    let ((status, location, _), content_type) = r3decisions_send(&app, "HEAD", &hls, &token).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(location, None);
+    assert_eq!(
+        content_type.as_deref(),
+        Some("application/vnd.apple.mpegurl")
+    );
+    assert!(
+        !transcodes.is_active(song).await,
+        "HEAD started a transcode"
+    );
+    let (status, location, _) = r3decisions_get(&app, &hls, &token).await;
     assert_eq!(status, StatusCode::FOUND);
     let location = location.unwrap();
     assert!(
@@ -40941,16 +40964,50 @@ async fn r3decisions_universal_audio_plays_the_file_or_the_hls_transcode() {
     );
     assert!(location.contains("AudioCodec=aac"), "{location}");
     assert!(location.contains("AudioOnly=true"), "{location}");
+    assert!(location.contains("PlaySessionId=r3d-session"), "{location}");
+    // HEAD of a file the client plays as it is: the file's headers
+    let ((status, _, _), content_type) = r3decisions_send(
+        &app,
+        "HEAD",
+        &format!("/Audio/{song}/universal?Container=flac&MaxStreamingBitrate=140000000"),
+        &token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(content_type.as_deref(), Some("audio/flac"));
 
-    // stream.{container} answered 500, as its second path parameter failed the extractor
+    // A progressive transcode isn't available: 400 that says so, not the FLAC as it is
+    let (status, _, body) = r3decisions_get(
+        &app,
+        &format!(
+            "/Audio/{song}/universal?Container=mp3&TranscodingContainer=mp3\
+             &TranscodingProtocol=http&AudioCodec=mp3"
+        ),
+        &token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(String::from_utf8_lossy(&body).contains("HLS only"));
+
+    // stream.{container} answered 500, as its second path parameter failed the extractor. An MP3
+    // request for the FLAC track is a 400 now; the track's own codec, or static, gets the file.
     let (status, _, body) = r3decisions_get(
         &app,
         &format!("/Audio/{song}/stream.mp3?AudioCodec=mp3&AudioBitrate=192000"),
         &token,
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body.len(), 1000);
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(String::from_utf8_lossy(&body).contains("HLS only"));
+    for uri in [
+        format!("/Audio/{song}/stream.flac"),
+        format!("/Audio/{song}/stream.mp3?static=true"),
+        format!("/Audio/{song}/stream?AudioCodec=flac,mp3"),
+    ] {
+        let (status, _, body) = r3decisions_get(&app, &uri, &token).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert_eq!(body.len(), 1000, "{uri}");
+    }
 }
 
 #[tokio::test]
@@ -40974,7 +41031,8 @@ async fn j2_old_routes_answer_as_before() {
         format!("/Videos/{video}/PlaybackInfo"),
         format!("/Videos/{video}/Universal?VideoCodecs=h264&AudioCodecs=aac"),
         format!("/Audio/{song}/PlaybackInfo"),
-        format!("/Audio/{song}/universal?Container=mp3,flac"),
+        // The test file claims 10 Mbps, over the default 8 Mbps limit; real clients send theirs
+        format!("/Audio/{song}/universal?Container=mp3,flac&MaxStreamingBitrate=140000000"),
     ];
     let before = j2_answers(&app, &routes, &token).await;
     for (uri, (status, _)) in routes.iter().zip(&before) {

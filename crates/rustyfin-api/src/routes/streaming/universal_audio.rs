@@ -1,7 +1,8 @@
 //! `GET /Audio/{id}/universal`: Jellyfin's universal audio stream, which music clients (Jellyfin
 //! Web and Android, Finamp, Symfonium) play. A port of `UniversalAudioController`: the query's
 //! capabilities become a device profile, the stream builder decides, and the answer is the audio
-//! itself, not JSON: the file when it plays as it is, else the HLS transcode.
+//! itself, not JSON: the file when it plays as it is, else the HLS transcode. A progressive (HTTP)
+//! transcode is refused: Rustyfin's transcoder writes HLS only.
 
 use crate::query::Query;
 use axum::Extension;
@@ -17,14 +18,18 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 use super::{
-    Version, requested_source_id, select_version, serve_file, validate_path_against_library,
+    Version, head_file, requested_source_id, select_version, serve_file,
+    validate_path_against_library,
 };
 use crate::error::ApiError;
 use crate::state::AppState;
 
 /// The universal audio route.
 pub(super) fn routes() -> Router<AppState> {
-    Router::new().route("/Audio/{id}/universal", get(audio_universal))
+    Router::new().route(
+        "/Audio/{id}/universal",
+        get(audio_universal).head(head_universal),
+    )
 }
 
 /// The value of query parameter `name`, in any ASCII case as Jellyfin binds it. Blank is absent.
@@ -117,18 +122,24 @@ pub(super) fn universal_profile(params: &HashMap<String, String>) -> Value {
     profile
 }
 
-/// `GET /Audio/{id}/universal`. The file, with byte ranges, when the query's containers and codecs
-/// take it as it is; else a redirect to the HLS transcode that the stream builder chose. Jellyfin
-/// answers the HLS case with the master playlist itself; a redirect plays the same in the clients
-/// and keeps one playlist route. An HTTP (progressive) transcode isn't available: Rustyfin's
-/// transcoder writes HLS only, so that request gets the file as it is.
-async fn audio_universal(
-    State(state): State<AppState>,
-    token: Option<Extension<rustyfin_auth::RequestToken>>,
-    Path(id): Path<Uuid>,
-    Query(params): Query<HashMap<String, String>>,
-    headers: HeaderMap,
-) -> Result<Response, ApiError> {
+/// What a universal audio request gets.
+enum Answer {
+    /// The file at this path, as it is.
+    File(String),
+    /// The HLS transcode at this URL.
+    Hls(String),
+}
+
+/// The answer to a universal audio request: the file, with byte ranges, when the query's
+/// containers and codecs take it as it is; else the HLS transcode the stream builder chose. A
+/// request that allows only a progressive (HTTP) transcode is refused with 400: Rustyfin's
+/// transcoder writes HLS only, and the file as it is (FLAC for an MP3 client) would not play.
+async fn decide(
+    state: &AppState,
+    token: Option<String>,
+    id: Uuid,
+    params: &HashMap<String, String>,
+) -> Result<Answer, ApiError> {
     let item = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Item {id} not found")))?;
@@ -136,56 +147,90 @@ async fn audio_universal(
         rustyfin_db::repo_media_source::get_media_sources_with_item_check(&state.db_ro, &id)
             .await
             .unwrap_or_default();
-    let requested = requested_source_id(&params);
+    let requested = requested_source_id(params);
     let source = match select_version(id, &sources, requested)? {
         Version::Primary => sources.first(),
         Version::Source(index) => sources.get(index),
     };
     let file_path = source.map_or(item.path.clone(), |source| source.path.clone());
-    validate_path_against_library(&state, &item.library_id, &file_path).await?;
+    validate_path_against_library(state, &item.library_id, &file_path).await?;
     let Some(source) = source else {
         // A track that was never probed plays as it is
-        return serve_file(file_path, &headers).await;
+        return Ok(Answer::File(file_path));
     };
 
-    let profile = DeviceProfile::from_json(&universal_profile(&params))
+    let profile = DeviceProfile::from_json(&universal_profile(params))
         .map_err(|e| ApiError::BadRequest(format!("Invalid universal audio query: {e}")))?;
     let mut facts = SourceFacts::from(source);
     facts.supports_direct_play = true;
     facts.supports_direct_stream = true;
     facts.supports_transcoding = true;
+    // The client's play session, so that its reports and the transcode share one; a new one when
+    // it sends none
+    let play_session_id = param(params, "PlaySessionId")
+        .map_or_else(|| Uuid::new_v4().simple().to_string(), str::to_string);
     let request = StreamRequest {
         item_id: id.to_string(),
         media_kind: MediaKind::Audio,
-        max_bitrate: number(&params, "MaxStreamingBitrate")
+        max_bitrate: number(params, "MaxStreamingBitrate")
             .and_then(|bitrate| i32::try_from(bitrate).ok()),
-        start_time_ticks: number(&params, "StartTimeTicks").unwrap_or(0),
+        start_time_ticks: number(params, "StartTimeTicks").unwrap_or(0),
         media_source_id: requested.map_or_else(String::new, |_| source.id.clone()),
-        max_audio_channels: number(&params, "MaxAudioChannels")
+        max_audio_channels: number(params, "MaxAudioChannels")
             .and_then(|channels| i32::try_from(channels).ok()),
-        device_id: param(&params, "DeviceId").unwrap_or_default().to_string(),
-        play_session_id: Uuid::new_v4().simple().to_string(),
-        access_token: token.map(|Extension(t)| t.0).unwrap_or_default(),
+        device_id: param(params, "DeviceId").unwrap_or_default().to_string(),
+        play_session_id,
+        access_token: token.unwrap_or_default(),
         ..StreamRequest::default()
     };
     let data = device_data(&facts, &profile, &request);
 
     // Jellyfin: "SupportsDirectStream actually means can direct play"
     if data.supports_direct_stream {
-        return serve_file(file_path, &headers).await;
+        return Ok(Answer::File(file_path));
     }
-    match (&data.transcoding_url, data.transcoding_sub_protocol) {
-        (Some(url), StreamProtocol::Hls) => {
-            Ok((StatusCode::FOUND, [(header::LOCATION, url.clone())]).into_response())
-        }
-        _ => {
-            tracing::debug!(
-                item = %id,
-                reasons = ?data.transcode_reasons.names(),
-                "Universal audio asked for a progressive transcode; sending the file as it is"
-            );
-            serve_file(file_path, &headers).await
-        }
+    match (data.transcoding_url, data.transcoding_sub_protocol) {
+        (Some(url), StreamProtocol::Hls) => Ok(Answer::Hls(url)),
+        _ => Err(ApiError::BadRequest(format!(
+            "Item {id} needs a transcode for this client ({}), and Rustyfin transcodes audio over \
+             HLS only: ask with TranscodingProtocol=hls",
+            data.transcode_reasons.names().join(", ")
+        ))),
+    }
+}
+
+/// `GET /Audio/{id}/universal`: the file, or a redirect to the HLS transcode. Jellyfin answers the
+/// HLS case with the master playlist itself; a redirect plays the same in the clients and keeps
+/// one playlist route.
+async fn audio_universal(
+    State(state): State<AppState>,
+    token: Option<Extension<rustyfin_auth::RequestToken>>,
+    Path(id): Path<Uuid>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    match decide(&state, token.map(|Extension(t)| t.0), id, &params).await? {
+        Answer::File(path) => serve_file(path, &headers).await,
+        Answer::Hls(url) => Ok((StatusCode::FOUND, [(header::LOCATION, url)]).into_response()),
+    }
+}
+
+/// `HEAD /Audio/{id}/universal`, which Jellyfin Web sends before it plays: the file's headers, or
+/// the playlist's content type. It starts no transcode (axum would run GET for HEAD, and the
+/// redirect's GET would start ffmpeg a second time).
+async fn head_universal(
+    State(state): State<AppState>,
+    token: Option<Extension<rustyfin_auth::RequestToken>>,
+    Path(id): Path<Uuid>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Response, ApiError> {
+    match decide(&state, token.map(|Extension(t)| t.0), id, &params).await? {
+        Answer::File(path) => head_file(&path).await,
+        Answer::Hls(_) => Ok((
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")],
+        )
+            .into_response()),
     }
 }
 
