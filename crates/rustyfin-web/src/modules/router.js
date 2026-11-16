@@ -3,7 +3,9 @@ import { $, toast } from './util.js';
 import { checkSetupWizard, wizAddManualLibrary } from './wizard.js';
 import { startOidcSignIn, startOidcLink, unlinkOidc, renderLogin, updateAuthUI } from './auth.js';
 import { renderHome, renderFavorites } from './home.js';
-import { renderLibrary, stopLibraryLoad, libraryRemember, startGridDiag, jumpToLetter } from './library.js';
+import {
+    renderLibrary, stopLibraryLoad, libraryRemember, startGridDiag, jumpToLetter, clearLibraryFilters,
+} from './library.js';
 import { currentDetailId, renderDetail, renderPerson, toggleFavorite, togglePlayed } from './item.js';
 import { renderSearch } from './search.js';
 import { playWithResumeChoice, stopPlayback, playItem, playerAutoHide, onPlayerClosed } from './player.js';
@@ -129,6 +131,7 @@ const clickActions = {
     'scan-library-admin': el => startScanWithToast(API.scanLibrary(el.dataset.id), t('admin.scan_started')),
     'scan-all': () => startScanWithToast(API.scanAllLibraries(), t('admin.scanning_all')),
     'jump-letter': el => jumpToLetter(el.dataset.id, el.dataset.letter),
+    'clear-library-filters': el => clearLibraryFilters(el.dataset.id),
     'toggle-favorite': el => toggleFavorite(el.dataset.id, el.dataset.favorite === 'true'),
     'toggle-played': el => togglePlayed(el.dataset.id, el.dataset.played === 'true'),
     'refresh-item': el => refreshItemMetadata(el, el.dataset.id),
