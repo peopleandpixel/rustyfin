@@ -27,6 +27,13 @@ function sandbox() {
     });
     vm.runInContext(
         `${slice('const LIBRARY_SORTS = [', '\n];\n')}
+         ${slice('const LIBRARY_SORT_MENUS = ', '\n};\n')}
+         ${slice('function librarySorts(')}
+         ${slice('function libraryList(')}
+         ${slice('const LIBRARY_LAYOUTS = ', ';\n')}
+         ${slice('const LIBRARY_SIZES = ', ';\n')}
+         ${slice('const LAYOUT_IMAGE_TYPES = ', ';\n')}
+         ${slice('function libraryViewCustom(')}
          ${slice('const LIBRARY_FILTER_PARAMS = ', ';\n')}
          ${slice('const LIBRARY_PREFS_CLIENT = ', ';\n')}
          ${slice('function librarySort(')}
@@ -36,6 +43,7 @@ function sandbox() {
          ${slice('function libraryPrefsToDisplay(')}
          ${slice('function libraryFilterMenu(')}
          ${slice('function libraryListQuery(')}
+         var currentLibraryTab = '', currentLibraryGenre = null;
          var libraryPrefs = libraryPrefsFromDisplay(null);
          this.fns = { librarySort, libraryFilterQuery, libraryFilterCount, libraryPrefsFromDisplay,
              libraryPrefsToDisplay, libraryFilterMenu, libraryListQuery };
@@ -52,6 +60,7 @@ function prefs(filters = {}, sort = 'SortName,ProductionYear:Ascending', reverse
         sort,
         reversed,
         filters: { Filters: [], SeriesStatus: [], Genres: [], OfficialRatings: [], Years: [], ...filters },
+        view: { layout: 'poster', size: 'medium' },
     };
 }
 
@@ -214,13 +223,16 @@ test('preference saves go one at a time, in order, so the last one is kept', asy
         `${slice('const LIBRARY_SORTS = [', '\n];\n')}
          ${slice('const LIBRARY_FILTER_PARAMS = ', ';\n')}
          ${slice('const LIBRARY_PREFS_CLIENT = ', ';\n')}
+         ${slice('const LAYOUT_IMAGE_TYPES = ', ';\n')}
+         ${slice('function libraryViewCustom(')}
+         ${slice('function libraryPrefsId(')}
          ${slice('function librarySort(')}
          ${slice('function libraryFilterQuery(')}
          ${slice('function libraryPrefsToDisplay(')}
          ${slice('let librarySaves = ', ';\n')}
          ${slice('function saveLibraryPrefs(')}
          const libraryPrefsCache = new Map();
-         var libraryPrefs;
+         var libraryPrefs, currentLibraryTab = '';
          this.save = sort => { libraryPrefs = { sort, reversed: false, filters: {} }; saveLibraryPrefs('films'); };
          this.cached = key => libraryPrefsCache.get(key);`,
         context,

@@ -319,6 +319,12 @@ pub async fn save_refresh_changes(
         read.popularity,
         updated.popularity,
     );
+    text_change(
+        &mut changes,
+        "tags",
+        Some(read.tags.join("|")),
+        Some(updated.tags.join("|")),
+    );
 
     if read.name != updated.name || read.sort_name != updated.sort_name {
         changes.push(RefreshChange::Names {
@@ -791,6 +797,18 @@ enum SortKey {
     ParentIndexNumber,
     IndexNumber,
     Random,
+    OfficialRating,
+    /// The newest date_created of a folder's children and grandchildren (a series' episodes), else
+    /// the item's own
+    DateLastContentAdded,
+    /// An episode's series' sort name, else its own
+    SeriesSortName,
+    /// The caller's play count of the item (bound user id)
+    PlayCount,
+    /// When the caller last played the item (bound user id)
+    DatePlayed,
+    /// When the caller last played one of a series' episodes (bound user id)
+    SeriesDatePlayed,
     /// Dropped after the keys are paired with the orders, so it never reaches a clause.
     Default,
     /// Any other key; it orders by `sort_name`.
@@ -812,6 +830,12 @@ impl SortKey {
             "parentindexnumber" => SortKey::ParentIndexNumber,
             "indexnumber" => SortKey::IndexNumber,
             "random" => SortKey::Random,
+            "officialrating" => SortKey::OfficialRating,
+            "datelastcontentadded" => SortKey::DateLastContentAdded,
+            "seriessortname" => SortKey::SeriesSortName,
+            "playcount" => SortKey::PlayCount,
+            "dateplayed" => SortKey::DatePlayed,
+            "seriesdateplayed" => SortKey::SeriesDatePlayed,
             _ => SortKey::Other,
         }
     }
@@ -832,8 +856,89 @@ impl SortKey {
             SortKey::ParentIndexNumber => "parent_index_number",
             SortKey::IndexNumber => "index_number",
             SortKey::Random => "ROWID",
+            // The rating's parental score (Jellyfin's ParentalRatingValue) from a bound JSON
+            // object of each stored rating's score; an unrated item has none
+            SortKey::OfficialRating => {
+                "(SELECT j.value FROM json_each(?) j WHERE j.key = media_items.official_rating)"
+            }
+            SortKey::DateLastContentAdded => concat!(
+                "COALESCE((SELECT MAX(d) FROM (",
+                "SELECT c.date_created AS d FROM media_items c WHERE c.parent_id = media_items.id ",
+                "UNION ALL SELECT g.date_created FROM media_items c ",
+                "JOIN media_items g ON g.parent_id = c.id WHERE c.parent_id = media_items.id)), ",
+                "date_created)"
+            ),
+            SortKey::SeriesSortName => concat!(
+                "COALESCE((SELECT p.sort_name FROM media_items p ",
+                "WHERE p.id = media_items.parent_id AND p.media_type = 'Series'), ",
+                "(SELECT g.sort_name FROM media_items p JOIN media_items g ON g.id = p.parent_id ",
+                "WHERE p.id = media_items.parent_id AND p.media_type = 'Season'), sort_name)"
+            ),
+            SortKey::PlayCount => concat!(
+                "COALESCE((SELECT ud.play_count FROM user_item_data ud ",
+                "WHERE ud.item_id = media_items.id AND ud.user_id = ?), 0)"
+            ),
+            SortKey::DatePlayed => concat!(
+                "(SELECT ud.last_played_date FROM user_item_data ud ",
+                "WHERE ud.item_id = media_items.id AND ud.user_id = ?)"
+            ),
+            SortKey::SeriesDatePlayed => concat!(
+                "(SELECT MAX(ud.last_played_date) FROM user_item_data ud WHERE ud.user_id = ? ",
+                "AND ud.item_id IN (SELECT c.id FROM media_items c WHERE c.parent_id = media_items.id ",
+                "UNION ALL SELECT g.id FROM media_items c JOIN media_items g ON g.parent_id = c.id ",
+                "WHERE c.parent_id = media_items.id))"
+            ),
         }
     }
+
+    /// What the key's expression binds (one `?`), if anything.
+    fn bind(self) -> Option<OrderBind> {
+        match self {
+            SortKey::PlayCount | SortKey::DatePlayed | SortKey::SeriesDatePlayed => {
+                Some(OrderBind::UserId)
+            }
+            SortKey::OfficialRating => Some(OrderBind::RatingScores),
+            _ => None,
+        }
+    }
+}
+
+/// A value the ORDER BY clause binds: the caller's user id, or the scores of the stored ratings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OrderBind {
+    UserId,
+    RatingScores,
+}
+
+/// The binds the ORDER BY clause of `sort_by` and `sort_order` takes, in order, after the
+/// filters' binds and before LIMIT and OFFSET.
+fn order_binds(sort_by: &str, sort_order: &str) -> Vec<OrderBind> {
+    let terms = parse_sort(sort_by, sort_order);
+    if is_random_sort(&terms) {
+        return Vec::new();
+    }
+    terms.iter().filter_map(|term| term.key.bind()).collect()
+}
+
+/// Each stored rating's parental score as a JSON object, `{rating: score * 1000 + sub score}`, for
+/// the OfficialRating sort. Ratings without a score (unrated, unknown) are left out, so they sort
+/// as unrated, before the others in ascending order, as Jellyfin's do.
+async fn rating_scores_json(pool: &SqlitePool) -> Result<String, sqlx::Error> {
+    let ratings: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT official_rating FROM media_items \
+         WHERE official_rating IS NOT NULL AND official_rating != ''",
+    )
+    .fetch_all(pool)
+    .await?;
+    let scores: serde_json::Map<String, serde_json::Value> = ratings
+        .into_iter()
+        .filter_map(|rating| {
+            let score = rustyfin_model::parental::rating_score(&rating)?;
+            let value = i64::from(score.score) * 1000 + i64::from(score.sub_score.unwrap_or(0));
+            Some((rating, value.into()))
+        })
+        .collect();
+    Ok(serde_json::Value::Object(scores).to_string())
 }
 
 /// One sort key with its direction.
@@ -930,6 +1035,10 @@ fn order_by_clause(terms: &[SortTerm]) -> String {
         add(term.key.expr(), dir);
         if i == 0 && term.key == SortKey::SortName {
             add("name", dir);
+        }
+        // Equal scores (PG-13 and TV-14) go by the rating text
+        if term.key == SortKey::OfficialRating {
+            add("official_rating", dir);
         }
     }
     let has_name_key = terms
@@ -1539,6 +1648,20 @@ pub async fn get_items_filtered(
         data_q = data_q.bind(&played_folders).bind(&uid_str);
     }
 
+    // The sort keys' binds: the user id (play count, date played), the rating scores
+    let order_binds = order_binds(sort_by_str, sort_order_str);
+    let scores = if order_binds.contains(&OrderBind::RatingScores) {
+        rating_scores_json(pool).await?
+    } else {
+        String::new()
+    };
+    for bind in order_binds {
+        data_q = match bind {
+            OrderBind::UserId => data_q.bind(uid_str.clone()),
+            OrderBind::RatingScores => data_q.bind(scores.clone()),
+        };
+    }
+
     // Pagination
     data_q = data_q.bind(limit).bind(start_index);
 
@@ -1823,6 +1946,38 @@ pub async fn resumable_item_ids(
 /// The ids of the series whose status is one of Jellyfin's `SeriesStatus` values (`Continuing`,
 /// `Ended`, `Unreleased`). Metadata providers store their own words, so TMDb's map onto them as
 /// Jellyfin's TMDb provider maps them.
+/// How many languages one query of `item_ids_with_subtitle_language` binds, well under
+/// SQLite's limit of bound parameters.
+const LANGUAGES_PER_QUERY: usize = 200;
+
+/// The ids of the items with a subtitle stream whose language is one of `languages`, compared
+/// without ASCII case. The caller passes every spelling it accepts (see
+/// `rustyfin_model::media_source::language_forms`). A long list is asked in chunks.
+pub async fn item_ids_with_subtitle_language(
+    pool: &SqlitePool,
+    languages: &[String],
+) -> Result<Vec<String>, sqlx::Error> {
+    let mut languages: Vec<String> = languages.iter().map(|l| l.to_ascii_lowercase()).collect();
+    languages.sort();
+    languages.dedup();
+    let mut ids = std::collections::BTreeSet::new();
+    for chunk in languages.chunks(LANGUAGES_PER_QUERY) {
+        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+            "SELECT DISTINCT ms.item_id FROM media_streams mst \
+             JOIN media_sources ms ON ms.id = mst.source_id \
+             WHERE LOWER(mst.codec_type) = 'subtitle' AND LOWER(mst.language) IN (",
+        );
+        let mut list = qb.separated(", ");
+        for language in chunk {
+            list.push_bind(language.clone());
+        }
+        qb.push(")");
+        let found: Vec<String> = qb.build_query_scalar().fetch_all(pool).await?;
+        ids.extend(found);
+    }
+    Ok(ids.into_iter().collect())
+}
+
 pub async fn series_ids_with_status(
     pool: &SqlitePool,
     statuses: &[&str],
@@ -3476,15 +3631,149 @@ pub async fn is_field_locked(
     item_id: uuid::Uuid,
     field: &str,
 ) -> Result<bool, sqlx::Error> {
+    Ok(item_locks(pool, item_id).await?.locked(field))
+}
+
+/// An item's metadata locks: Jellyfin's LockData and LockedFields (MetadataField names such as
+/// "Name", "Overview", "Genres", "OfficialRating", "Cast", "Studios", "Tags").
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ItemLocks {
+    pub lock_data: bool,
+    pub fields: Vec<String>,
+}
+
+impl ItemLocks {
+    /// Whether a refresh may not change `field`: the whole item is locked, or the field is.
+    pub fn locked(&self, field: &str) -> bool {
+        self.lock_data || self.fields.iter().any(|f| f.eq_ignore_ascii_case(field))
+    }
+}
+
+/// An item's locks; none when it has no extras row.
+pub async fn item_locks(pool: &SqlitePool, item_id: uuid::Uuid) -> Result<ItemLocks, sqlx::Error> {
     let row: Option<(i64, String)> = sqlx::query_as(
         "SELECT lock_data, locked_fields FROM item_metadata_extras WHERE item_id = ?",
     )
     .bind(item_id.to_string())
     .fetch_optional(pool)
     .await?;
-    Ok(row.is_some_and(|(lock, fields)| {
-        lock != 0 || fields.split('|').any(|f| f.eq_ignore_ascii_case(field))
-    }))
+    Ok(row
+        .map(|(lock, fields)| ItemLocks {
+            lock_data: lock != 0,
+            fields: fields
+                .split('|')
+                .filter(|f| !f.is_empty())
+                .map(str::to_string)
+                .collect(),
+        })
+        .unwrap_or_default())
+}
+
+/// What an admin's metadata edit stores outside `media_items`: the original title, the critic
+/// rating and the locks.
+pub async fn save_item_extras_edit(
+    pool: &SqlitePool,
+    item_id: uuid::Uuid,
+    original_title: Option<&str>,
+    critic_rating: Option<f64>,
+    locks: &ItemLocks,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO item_metadata_extras (item_id, original_title, critic_rating, lock_data, \
+         locked_fields) VALUES (?, ?, ?, ?, ?) \
+         ON CONFLICT(item_id) DO UPDATE SET original_title = excluded.original_title, \
+         critic_rating = excluded.critic_rating, lock_data = excluded.lock_data, \
+         locked_fields = excluded.locked_fields",
+    )
+    .bind(item_id.to_string())
+    .bind(original_title)
+    .bind(critic_rating)
+    .bind(locks.lock_data)
+    .bind(locks.fields.join("|"))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Replaces an item's studios, as an admin's metadata edit lists them.
+pub async fn replace_item_studios(
+    pool: &SqlitePool,
+    item_id: uuid::Uuid,
+    names: &[String],
+) -> Result<(), sqlx::Error> {
+    let item = item_id.to_string();
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM item_studios WHERE item_id = ?")
+        .bind(&item)
+        .execute(&mut *tx)
+        .await?;
+    for name in names {
+        // The id a refresh gives the studio (`metadata::store_studios`)
+        let id = format!("studio-{}", name.to_lowercase().replace(' ', "-"));
+        sqlx::query(
+            "INSERT INTO studios (id, name) VALUES (?1, ?2) \
+             ON CONFLICT(id) DO UPDATE SET name = excluded.name",
+        )
+        .bind(&id)
+        .bind(name)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("INSERT OR IGNORE INTO item_studios (item_id, studio_id) VALUES (?, ?)")
+            .bind(&item)
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await
+}
+
+/// Sets an item's TMDb id, as an admin's Identify chose it. A new id drops the TVDb id that came
+/// with the old one.
+pub async fn set_tmdb_id(
+    pool: &SqlitePool,
+    item_id: uuid::Uuid,
+    tmdb_id: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE media_items SET tvdb_id = CASE WHEN tmdb_id IS ?1 THEN tvdb_id ELSE NULL END, \
+         tmdb_id = ?1 WHERE id = ?2",
+    )
+    .bind(tmdb_id)
+    .bind(item_id.to_string())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Clears what a "replace all metadata" refresh fills again from the providers and keeps no
+/// column for: the IMDb id, the studios (unless locked) and the people (unless "Cast" is locked).
+/// A locked item keeps all of them.
+pub async fn clear_replaceable_links(
+    pool: &SqlitePool,
+    item_id: uuid::Uuid,
+    locks: &ItemLocks,
+) -> Result<(), sqlx::Error> {
+    if locks.lock_data {
+        return Ok(());
+    }
+    let id = item_id.to_string();
+    sqlx::query("UPDATE item_metadata_extras SET imdb_id = NULL WHERE item_id = ?")
+        .bind(&id)
+        .execute(pool)
+        .await?;
+    if !locks.locked("Studios") {
+        sqlx::query("DELETE FROM item_studios WHERE item_id = ?")
+            .bind(&id)
+            .execute(pool)
+            .await?;
+    }
+    if !locks.locked("Cast") {
+        sqlx::query("DELETE FROM item_people WHERE item_id = ?")
+            .bind(&id)
+            .execute(pool)
+            .await?;
+    }
+    Ok(())
 }
 
 /// Get the last media added date for a folder (max date_created of children).

@@ -446,6 +446,7 @@ async fn main() {
         oidc: rustyfin_api::oidc::OidcState::new(),
         jellyfin_import: Default::default(),
         directory_listings: Default::default(),
+        file_guard: Default::default(),
     };
 
     // A scheduled library scan clears the same caches as a scan from the API or the monitor.
@@ -455,6 +456,29 @@ async fn main() {
         task_scheduler.set_on_scan(move || {
             cache.invalidate_on_scan();
             image_cache.invalidate_all();
+        });
+    }
+
+    let transcodes = state.transcode_manager.clone();
+    // Background task: on SIGTERM or SIGINT, or a shutdown from the API, stop every transcode
+    // first, so no ffmpeg outlives the server, then shut down. Open connections (a playing
+    // stream) would hold a graceful shutdown open for good, so the process ends after
+    // SHUTDOWN_GRACE all the same.
+    {
+        let shutdown_tx = state.shutdown_tx.clone();
+        let mut shutdown_rx = state.shutdown_tx.subscribe();
+        let transcodes = transcodes.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                signal = shutdown_signal() => tracing::info!("{signal} received, shutting down"),
+                _ = shutdown_rx.wait_for(|v| *v) => {}
+            }
+            // No transcode starts after this
+            transcodes.shutdown().await;
+            let _ = shutdown_tx.send(true);
+            tokio::time::sleep(SHUTDOWN_GRACE).await;
+            tracing::info!("connections still open after the shutdown grace, exiting");
+            std::process::exit(0);
         });
     }
 
@@ -539,7 +563,7 @@ async fn main() {
         });
     }
 
-    let cleanup_db = state.db.clone();
+    let session_state = state.clone();
     let sighup_config = state.config.clone();
     let sighup_data_dir = state.data_dir.clone();
     let sighup_changes = state.task_scheduler.changes().clone();
@@ -623,18 +647,14 @@ async fn main() {
     let local_addr = listener.local_addr().expect("failed to get local address");
     tracing::info!("rustyfin listening on {}", local_addr);
 
-    // Background task: cleanup expired sessions every 5 minutes
+    // Background task: end idle sessions and stalled playbacks once a minute
     {
-        let db = cleanup_db;
+        let state = session_state;
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
             loop {
                 interval.tick().await;
-                match rustyfin_db::repo_session::cleanup_expired_sessions(&db, 30).await {
-                    Ok(n) if n > 0 => tracing::info!("cleaned up {n} expired sessions"),
-                    Err(e) => tracing::warn!("session cleanup error: {e}"),
-                    _ => {}
-                }
+                rustyfin_api::sessions::expire(&state).await;
             }
         });
     }
@@ -761,7 +781,33 @@ async fn main() {
         .expect("server error");
     }
 
+    // The shutdown task has stopped the transcodes and closed the manager; this is the same for
+    // a shutdown that reached here first
+    transcodes.shutdown().await;
     tracing::info!("server stopped");
+}
+
+/// How long a shutdown waits for open connections before the process ends anyway. Docker and
+/// systemd send SIGKILL 10 s after SIGTERM by default; the transcodes are stopped before this.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Waits for SIGTERM or SIGINT (Ctrl-C) and names the one that came.
+async fn shutdown_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+        let mut int = signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
+        tokio::select! {
+            _ = term.recv() => "SIGTERM",
+            _ = int.recv() => "SIGINT",
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await.ok();
+        "Ctrl-C"
+    }
 }
 
 fn load_config(data_dir: &std::path::Path) -> ServerConfiguration {

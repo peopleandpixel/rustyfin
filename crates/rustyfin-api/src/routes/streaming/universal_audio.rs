@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 use super::{
-    Version, head_file, requested_source_id, select_version, serve_file,
+    Version, head_file, requested_play_session_id, requested_source_id, select_version, serve_file,
     validate_path_against_library,
 };
 use crate::error::ApiError;
@@ -152,8 +152,9 @@ async fn decide(
         Version::Primary => sources.first(),
         Version::Source(index) => sources.get(index),
     };
+    // The resolved path, which the file is opened by
     let file_path = source.map_or(item.path.clone(), |source| source.path.clone());
-    validate_path_against_library(state, &item.library_id, &file_path).await?;
+    let file_path = validate_path_against_library(state, &file_path).await?;
     let Some(source) = source else {
         // A track that was never probed plays as it is
         return Ok(Answer::File(file_path));
@@ -167,8 +168,8 @@ async fn decide(
     facts.supports_transcoding = true;
     // The client's play session, so that its reports and the transcode share one; a new one when
     // it sends none
-    let play_session_id = param(params, "PlaySessionId")
-        .map_or_else(|| Uuid::new_v4().simple().to_string(), str::to_string);
+    let play_session_id =
+        requested_play_session_id(params).unwrap_or_else(|| Uuid::new_v4().simple().to_string());
     let request = StreamRequest {
         item_id: id.to_string(),
         media_kind: MediaKind::Audio,

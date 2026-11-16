@@ -326,6 +326,21 @@ pub async fn search_persons(
     Ok(items)
 }
 
+/// Replaces an item's people with `people`, as an admin's metadata edit lists them (none clears
+/// them).
+pub async fn replace_item_people(
+    pool: &SqlitePool,
+    item_id: uuid::Uuid,
+    people: &[MetadataPerson],
+) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM item_people WHERE item_id = ?")
+        .bind(item_id.to_string())
+        .execute(pool)
+        .await?;
+    set_item_people_if_none(pool, item_id, people).await?;
+    Ok(())
+}
+
 /// Credits `people` on an item that has no people yet, in the given order, in one transaction. A
 /// person is matched by exact name, as the Jellyfin import does, or created; a new person's
 /// photo URL becomes their Primary image. A person listed twice keeps the first credit. Returns

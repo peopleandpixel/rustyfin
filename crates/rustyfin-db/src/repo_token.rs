@@ -49,6 +49,25 @@ pub async fn get_token(
     }))
 }
 
+/// A token's user and device: `(user_id, device_id, device_name, app_name, app_version)`.
+pub async fn get_token_device(
+    pool: &SqlitePool,
+    token_hash: &str,
+) -> Result<Option<(Uuid, String, String, String, String)>, sqlx::Error> {
+    let row = sqlx::query_as::<_, (String, String, String, String, String)>(
+        "SELECT user_id, device_id, device_name, app_name, app_version
+         FROM access_tokens WHERE token_hash = ?",
+    )
+    .bind(token_hash)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.and_then(|(user_id, device_id, name, app, version)| {
+        Uuid::parse_str(&user_id)
+            .ok()
+            .map(|uid| (uid, device_id, name, app, version))
+    }))
+}
+
 pub async fn delete_token(pool: &SqlitePool, token_hash: &str) -> Result<(), sqlx::Error> {
     sqlx::query("DELETE FROM access_tokens WHERE token_hash = ?")
         .bind(token_hash)

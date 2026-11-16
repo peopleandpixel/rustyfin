@@ -1,6 +1,33 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// The play state fields a client reports with a start, progress or stop, beyond the ones each
+/// report reads for watch state. They feed the session's `PlayState` (Jellyfin's `PlayerStateInfo`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ReportedPlayState {
+    #[serde(default)]
+    pub can_seek: Option<bool>,
+    #[serde(default)]
+    pub is_muted: Option<bool>,
+    #[serde(default)]
+    pub volume_level: Option<i32>,
+    #[serde(default)]
+    pub play_method: Option<String>,
+    #[serde(default)]
+    pub play_session_id: Option<String>,
+    #[serde(default)]
+    pub live_stream_id: Option<String>,
+    #[serde(default)]
+    pub repeat_mode: Option<String>,
+    #[serde(default)]
+    pub playback_order: Option<String>,
+    #[serde(default)]
+    pub playlist_item_id: Option<String>,
+    #[serde(default)]
+    pub now_playing_queue: Option<serde_json::Value>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct PlaybackStartInfo {
@@ -15,6 +42,8 @@ pub struct PlaybackStartInfo {
     pub audio_stream_index: Option<i32>,
     #[serde(default)]
     pub subtitle_stream_index: Option<i32>,
+    #[serde(default, flatten)]
+    pub play_state: ReportedPlayState,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,6 +62,8 @@ pub struct PlaybackProgressInfo {
     pub audio_stream_index: Option<i32>,
     #[serde(default)]
     pub subtitle_stream_index: Option<i32>,
+    #[serde(default, flatten)]
+    pub play_state: ReportedPlayState,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,6 +83,8 @@ pub struct PlaybackStopInfo {
     /// The playback errored out; Jellyfin then leaves the item's user data alone.
     #[serde(default)]
     pub failed: Option<bool>,
+    #[serde(default, flatten)]
+    pub play_state: ReportedPlayState,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

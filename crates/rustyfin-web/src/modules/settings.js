@@ -1,6 +1,9 @@
 // The user settings page and the server configuration form
 import { $, toast, escapeHtml } from './util.js';
 import { showOidcLinkResult, oidcCardHtml } from './auth.js';
+import {
+    HOME_SECTIONS, homeSlots, homeSlotValues, loadUserSettings, userSetting, saveUserSettings, saveUserConfiguration, showsInLatest, avatarUrl,
+} from './user-settings.js';
 
 // --- Settings Page Renderer ---
 async function renderSettings(data) {
@@ -9,11 +12,14 @@ async function renderSettings(data) {
     page.innerHTML = '<div class="flex justify-center items-center py-24"><div class="w-10 h-10 border-3 border-[#00a4dc] border-t-transparent rounded-full animate-spin"></div></div>';
 
     try {
-        const [me, config, ssoInfo, ssoAccount] = await Promise.all([
+        const [me, config, ssoInfo, ssoAccount, cultures, libraries] = await Promise.all([
             API.getMe().catch(() => ({})),
             API.getConfig().catch(() => null),
             API.oidcInfo().catch(() => null),
-            API.oidcAccount(API.userId).catch(() => null)
+            API.oidcAccount(API.userId).catch(() => null),
+            API.get('/Localization/Cultures').catch(() => []),
+            API.getLibraries().catch(() => []),
+            loadUserSettings({ force: true }).catch(() => null),
         ]);
 
         const name = me.Name || me.name || API.userName || '';
@@ -59,6 +65,10 @@ async function renderSettings(data) {
                             ${config.FanartApiKeySet ? `<label class="flex items-center gap-2 mt-1 text-xs text-white/70"><input id="cfg-fanart-clear" type="checkbox" class="checkbox checkbox-xs"> ${t('settings.key_clear')}</label>` : ''}
                         </div>
                     </div>
+                    <label class="flex items-start gap-2 text-xs text-white/70">
+                        <input id="cfg-refuse-links" type="checkbox" class="checkbox checkbox-xs mt-0.5" ${config.RefuseLinksOutOfLibraries ? 'checked' : ''}>
+                        <span><span class="font-semibold text-white/80">${t('settings.refuse_links_out')}</span><br>${t('settings.refuse_links_out_help')}</span>
+                    </label>
                     <div class="pt-2">
                         <button type="submit" class="jf-btn-primary text-xs">${t('settings.save_config')}</button>
                     </div>
@@ -76,8 +86,10 @@ async function renderSettings(data) {
 
             <!-- User Profile card -->
             <div class="jf-settings-card flex items-center gap-4">
-                <div class="w-16 h-16 rounded-2xl bg-gradient-to-tr from-[#00a4dc] to-[#38bdf8] flex items-center justify-center text-2xl font-bold text-white shadow-xl">
-                    ${escapeHtml(name[0]?.toUpperCase() || 'U')}
+                <div class="w-16 h-16 rounded-2xl bg-gradient-to-tr from-[#00a4dc] to-[#38bdf8] flex items-center justify-center text-2xl font-bold text-white shadow-xl overflow-hidden shrink-0">
+                    ${me.PrimaryImageTag
+                        ? `<img id="settings-avatar" src="${escapeHtml(avatarUrl(me.PrimaryImageTag))}" alt="" class="w-full h-full object-cover">`
+                        : escapeHtml(name[0]?.toUpperCase() || 'U')}
                 </div>
                 <div>
                     <h2 class="text-lg font-bold text-white">${escapeHtml(name)}</h2>
@@ -85,6 +97,13 @@ async function renderSettings(data) {
                     <span class="inline-block mt-1 text-[10px] font-bold px-2 py-0.5 rounded bg-[#00a4dc]/20 text-[#38bdf8] uppercase">
                         ${API.isAdmin ? t('common.administrator') : t('settings.standard_user')}
                     </span>
+                    <div class="flex flex-wrap gap-2 mt-2">
+                        <label class="jf-btn-ghost !py-1 !px-3 text-xs cursor-pointer">
+                            ${t('settings.profile_image_choose')}
+                            <input id="settings-avatar-file" type="file" accept="image/png,image/jpeg,image/gif,image/webp" class="hidden" onchange="chooseProfileImage(this)">
+                        </label>
+                        ${me.PrimaryImageTag ? `<button type="button" class="jf-btn-ghost !py-1 !px-3 text-xs" onclick="deleteProfileImage()">${t('settings.profile_image_delete')}</button>` : ''}
+                    </div>
                 </div>
             </div>
 
@@ -98,19 +117,14 @@ async function renderSettings(data) {
                     ${uiLanguageOptions().map(o => `<option value="${o.value}" ${o.value === getUiLanguage() ? 'selected' : ''}>${escapeHtml(o.label)}</option>`).join('')}
                 </select>
                 <p class="text-xs text-white/40 mt-2">${t('settings.display_language_hint')}</p>
+                ${displaySettingsHtml()}
             </div>
 
-            <!-- Playback card -->
-            <div class="jf-settings-card">
-                <h3 class="text-base font-bold text-white mb-4 flex items-center gap-2">
-                    <span class="w-2 h-2 rounded-full bg-sky-400"></span>
-                    ${t('settings.playback')}
-                </h3>
-                <label class="flex items-center gap-3 text-sm text-white/80 cursor-pointer">
-                    <input id="pref-next-episode-autoplay" type="checkbox" class="toggle toggle-sm toggle-primary" ${me.Configuration?.EnableNextEpisodeAutoPlay !== false ? 'checked' : ''} onchange="changeNextEpisodeAutoPlay(this)">
-                    ${t('settings.next_episode_autoplay')}
-                </label>
-            </div>
+            ${homeSettingsHtml(me.Configuration || {}, libraries)}
+
+            ${playbackSettingsHtml(me.Configuration || {}, cultures)}
+
+            ${subtitleSettingsHtml(me.Configuration || {}, cultures)}
 
             <!-- Change Password card -->
             <div class="jf-settings-card">
@@ -154,6 +168,253 @@ async function changeNextEpisodeAutoPlay(input) {
     }
 }
 
+// --- Display, home screen, playback and subtitle settings ---
+// The UserConfiguration fields save into /Users/{id}/Configuration; the others are Jellyfin Web's
+// userSettings keys, saved in the "usersettings" display preferences (user-settings.js). Each
+// control saves when it changes, as the autoplay switch does.
+
+// Jellyfin Web's maximum streaming bitrates, in bits per second ('' is Auto)
+const MAX_BITRATES = [
+    120e6, 110e6, 100e6, 90e6, 80e6, 70e6, 60e6, 50e6, 40e6, 30e6, 25e6, 20e6, 15e6, 10e6, 8e6, 6e6, 5e6, 4e6,
+    3e6, 2e6, 1.5e6, 1e6, 720e3, 420e3,
+];
+// Date and time formats offered besides the display language's own ('')
+const DATE_LOCALES = [
+    'en-US', 'en-GB', 'de-DE', 'fr-FR', 'es-ES', 'it-IT', 'nl-NL', 'pl-PL', 'pt-BR', 'ru-RU', 'sv-SE', 'tr-TR',
+    'ja-JP', 'ko-KR', 'zh-CN',
+];
+const SUBTITLE_MODES = ['Default', 'Smart', 'OnlyForced', 'Always', 'None'];
+const SUBTITLE_BURN_IN = ['', 'onlyimageformats', 'allcomplexformats', 'all'];
+// Jellyfin Web's subtitle appearance, kept as JSON under its localplayersubtitleappearance3 key
+const SUBTITLE_APPEARANCE_KEY = 'localplayersubtitleappearance3';
+const SUBTITLE_APPEARANCE = {
+    textSize: ['smaller', 'small', '', 'large', 'larger', 'extralarge'],
+    font: ['', 'typewriter', 'print', 'console', 'cursive', 'casual', 'smallcaps'],
+    textColor: ['#ffffff', '#d3d3d3', '#808080', '#ffff00', '#008000', '#00ffff', '#0000ff', '#ff00ff', '#ff0000', '#000000'],
+    textBackground: ['transparent', '#000000', 'rgba(0, 0, 0, 0.5)'],
+    dropShadow: ['', 'none', 'raised', 'depressed', 'uniform'],
+};
+// The translation key names of the values that are colours
+const SETTING_VALUE_NAMES = {
+    '#ffffff': 'white', '#d3d3d3': 'lightgray', '#808080': 'gray', '#ffff00': 'yellow', '#008000': 'green',
+    '#00ffff': 'cyan', '#0000ff': 'blue', '#ff00ff': 'magenta', '#ff0000': 'red', '#000000': 'black',
+    'transparent': 'transparent', 'rgba(0, 0, 0, 0.5)': 'semiblack',
+};
+
+function settingsCard(title, dot, body) {
+    return `
+            <div class="jf-settings-card">
+                <h3 class="text-base font-bold text-white mb-4 flex items-center gap-2">
+                    <span class="w-2 h-2 rounded-full ${dot}"></span>
+                    ${title}
+                </h3>
+                <div class="space-y-3">${body}</div>
+            </div>`;
+}
+
+function selectHtml(label, attrs, options, value) {
+    const opts = options.map(o => `<option value="${escapeHtml(o.value)}" ${o.value === value ? 'selected' : ''}>${escapeHtml(o.label)}</option>`).join('');
+    return `
+                <label class="block">
+                    <span class="block text-xs font-semibold text-white/70 mb-1">${label}</span>
+                    <select class="jf-input w-full sm:w-72" ${attrs} data-saved="${escapeHtml(value)}">${opts}</select>
+                </label>`;
+}
+
+function toggleHtml(label, attrs, checked) {
+    return `
+                <label class="flex items-center gap-3 text-sm text-white/80 cursor-pointer">
+                    <input type="checkbox" class="toggle toggle-sm toggle-primary" ${attrs} data-saved="${checked}" ${checked ? 'checked' : ''}>
+                    ${label}
+                </label>`;
+}
+
+// The languages for a preference: none, then each culture by its three-letter code
+function languageOptions(cultures) {
+    const list = (Array.isArray(cultures) ? cultures : [])
+        .filter(c => c.ThreeLetterISOLanguageName)
+        .map(c => ({ value: c.ThreeLetterISOLanguageName, label: c.DisplayName || c.Name || c.ThreeLetterISOLanguageName }))
+        .sort((a, b) => a.label.localeCompare(b.label));
+    return [{ value: '', label: t('settings.any_language') }, ...list];
+}
+
+function bitrateLabel(bits) {
+    return bits >= 1e6 ? `${bits / 1e6} Mbps` : `${bits / 1e3} kbps`;
+}
+
+// A locale's name with today's date in its short form, e.g. "English (United Kingdom): 15/11/2026"
+function dateLocaleLabel(tag) {
+    let name = tag;
+    try {
+        name = new Intl.DisplayNames([uiLocale()], { type: 'language' }).of(tag) || tag;
+    } catch {}
+    return `${name}: ${new Date().toLocaleDateString(tag)}`;
+}
+
+function displaySettingsHtml() {
+    const dateOptions = [{ value: '', label: t('settings.date_format_auto') }, ...DATE_LOCALES.map(tag => ({ value: tag, label: dateLocaleLabel(tag) }))];
+    return selectHtml(t('settings.date_format'), 'id="pref-datetimelocale" data-pref="datetimelocale" onchange="changeUserPref(this)"', dateOptions, userSetting('datetimelocale', ''))
+        + toggleHtml(t('settings.show_backdrops'), 'id="pref-backdrops" data-pref="enableBackdrops" onchange="changeUserPref(this)"', userSetting('enableBackdrops', 'true') !== 'false');
+}
+
+function homeSettingsHtml(config, libraries) {
+    const names = {
+        smalllibrarytiles: t('home.my_media'),
+        resume: t('home.continue_watching'),
+        resumeaudio: t('home.continue_listening'),
+        nextup: t('home.next_up'),
+        latestmedia: t('settings.home_latest'),
+    };
+    const options = [...HOME_SECTIONS.map(s => ({ value: s, label: names[s] })), { value: 'none', label: t('settings.home_none') }];
+    // Jellyfin Web's ten slots. A slot holding a section Rustyfin lacks keeps it as an option, so
+    // saving another slot writes it back unchanged.
+    const sections = homeSlots().map((value, i) => selectHtml(
+        t('settings.home_section', { n: i + 1 }),
+        `data-home-slot="${i}" onchange="changeHomeSection(this)"`,
+        options.some(o => o.value === value) ? options : [...options, { value, label: t('settings.home_jellyfin_only', { id: value }) }],
+        value,
+    )).join('');
+    const libs = (libraries || []).map(lib => {
+        const libId = lib.Id || lib.id;
+        return toggleHtml(escapeHtml(lib.Name || lib.name || ''), `data-latest-library="${escapeHtml(libId)}" onchange="changeLatestLibrary(this)"`, showsInLatest(libId, config));
+    }).join('');
+    return settingsCard(t('settings.home'), 'bg-violet-400', sections + (libs ? `
+                <p class="text-xs font-semibold text-white/70 pt-2">${t('settings.home_show_in_latest')}</p>${libs}` : ''));
+}
+
+function playbackSettingsHtml(config, cultures) {
+    const bitrates = [{ value: '', label: t('settings.bitrate_auto') }, ...MAX_BITRATES.map(b => ({ value: String(b), label: bitrateLabel(b) }))];
+    return settingsCard(t('settings.playback'), 'bg-sky-400',
+        selectHtml(t('settings.audio_language'), 'id="pref-audio-language" data-config="AudioLanguagePreference" onchange="changeUserConfig(this)"', languageOptions(cultures), config.AudioLanguagePreference || '')
+        + toggleHtml(t('settings.play_default_audio'), 'data-config="PlayDefaultAudioTrack" onchange="changeUserConfig(this)"', config.PlayDefaultAudioTrack !== false)
+        + selectHtml(t('settings.max_bitrate'), 'id="pref-max-bitrate" data-pref="maxStreamingBitrate" onchange="changeUserPref(this)"', bitrates, userSetting('maxStreamingBitrate', ''))
+        + `
+                <label class="flex items-center gap-3 text-sm text-white/80 cursor-pointer">
+                    <input id="pref-next-episode-autoplay" type="checkbox" class="toggle toggle-sm toggle-primary" ${config.EnableNextEpisodeAutoPlay !== false ? 'checked' : ''} onchange="changeNextEpisodeAutoPlay(this)">
+                    ${t('settings.next_episode_autoplay')}
+                </label>`
+        + toggleHtml(t('settings.remember_audio'), 'data-config="RememberAudioSelections" onchange="changeUserConfig(this)"', config.RememberAudioSelections !== false)
+        + toggleHtml(t('settings.remember_subtitles'), 'data-config="RememberSubtitleSelections" onchange="changeUserConfig(this)"', config.RememberSubtitleSelections !== false));
+}
+
+// The saved subtitle appearance; a broken value counts as none
+function subtitleAppearance() {
+    try {
+        const value = JSON.parse(userSetting(SUBTITLE_APPEARANCE_KEY, '{}'));
+        return value && typeof value === 'object' ? value : {};
+    } catch {
+        return {};
+    }
+}
+
+function subtitleSettingsHtml(config, cultures) {
+    const option = (group, value) => ({ value, label: t(`settings.subtitle_${group}_${SETTING_VALUE_NAMES[value] || value || 'default'}`) });
+    const appearance = subtitleAppearance();
+    const appearanceSelects = Object.entries(SUBTITLE_APPEARANCE).map(([field, values]) => selectHtml(
+        t(`settings.subtitle_${field}`),
+        `data-appearance="${field}" onchange="changeSubtitleAppearance(this)"`,
+        values.map(v => option(field, v)),
+        appearance[field] ?? (field === 'textColor' ? '#ffffff' : field === 'textBackground' ? 'transparent' : ''),
+    )).join('');
+    return settingsCard(t('settings.subtitles'), 'bg-rose-400',
+        selectHtml(t('settings.subtitle_mode'), 'id="pref-subtitle-mode" data-config="SubtitleMode" onchange="changeUserConfig(this)"', SUBTITLE_MODES.map(m => option('mode', m)), config.SubtitleMode || 'Default')
+        + selectHtml(t('settings.subtitle_language'), 'id="pref-subtitle-language" data-config="SubtitleLanguagePreference" onchange="changeUserConfig(this)"', languageOptions(cultures), config.SubtitleLanguagePreference || '')
+        + selectHtml(t('settings.subtitle_burn_in'), 'id="pref-subtitle-burn-in" data-pref="subtitleburnin" onchange="changeUserPref(this)"', SUBTITLE_BURN_IN.map(b => option('burnin', b)), userSetting('subtitleburnin', ''))
+        + `
+                <p class="text-xs font-semibold text-white/70 pt-2">${t('settings.subtitle_appearance')}</p>` + appearanceSelects);
+}
+
+function controlValue(input) {
+    return input.type === 'checkbox' ? String(input.checked) : input.value;
+}
+
+// Saves one control with save(value); a failed save puts the control back and says why
+async function saveControl(input, save) {
+    const value = controlValue(input);
+    input.disabled = true;
+    try {
+        await save(value);
+        input.dataset.saved = value;
+        toast(t('settings.saved'));
+    } catch (e) {
+        if (input.type === 'checkbox') input.checked = input.dataset.saved === 'true';
+        else input.value = input.dataset.saved ?? '';
+        toast(e.message, 'error');
+    } finally {
+        input.disabled = false;
+    }
+}
+
+// A UserConfiguration field: a switch saves true or false, a list its value
+function changeUserConfig(input) {
+    const field = input.dataset.config;
+    return saveControl(input, value => saveUserConfiguration({ [field]: input.type === 'checkbox' ? value === 'true' : value }));
+}
+
+// A userSettings value, stored as a string as Jellyfin Web stores it
+function changeUserPref(input) {
+    return saveControl(input, value => saveUserSettings({ [input.dataset.pref]: value }));
+}
+
+function changeSubtitleAppearance(input) {
+    return saveControl(input, value => saveUserSettings({
+        [SUBTITLE_APPEARANCE_KEY]: JSON.stringify({ ...subtitleAppearance(), [input.dataset.appearance]: value }),
+    }));
+}
+
+// A home section slot: every slot is saved, as Jellyfin Web saves them
+function changeHomeSection(input) {
+    return saveControl(input, value => saveUserSettings(homeSlotValues(Number(input.dataset.homeSlot), value)));
+}
+
+// A library's "Show in Latest" switch: off adds it to UserConfiguration.LatestItemsExcludes
+function changeLatestLibrary(input) {
+    const libId = input.dataset.latestLibrary;
+    return saveControl(input, async value => {
+        const me = await API.getMe();
+        const key = id => String(id).toLowerCase().replace(/-/g, '');
+        const others = (me.Configuration?.LatestItemsExcludes || []).filter(id => key(id) !== key(libId));
+        await saveUserConfiguration({ LatestItemsExcludes: value === 'true' ? others : [...others, libId] });
+    });
+}
+
+// Uploads the chosen picture base64-encoded, as Jellyfin Web sends it to /UserImage
+async function chooseProfileImage(input) {
+    const file = input.files?.[0];
+    if (!file) return;
+    try {
+        const dataUrl = await new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(String(reader.result));
+            reader.onerror = () => reject(reader.error);
+            reader.readAsDataURL(file);
+        });
+        const path = `/UserImage?userId=${encodeURIComponent(API.userId)}`;
+        const res = await fetch(API.base + path, {
+            method: 'POST',
+            headers: { ...API.headers(), 'Content-Type': file.type || 'image/jpeg' },
+            body: dataUrl.slice(dataUrl.indexOf(',') + 1),
+        });
+        if (!res.ok) throw await API._requestError('POST', path, res);
+        toast(t('settings.profile_image_saved'));
+    } catch (e) {
+        toast(e.message, 'error');
+    }
+    await loadUserSettings({ force: true }).catch(() => null);
+    renderSettings();
+}
+
+async function deleteProfileImage() {
+    try {
+        await API.del(`/UserImage?userId=${encodeURIComponent(API.userId)}`);
+        toast(t('settings.profile_image_deleted'));
+    } catch (e) {
+        toast(e.message, 'error');
+    }
+    await loadUserSettings({ force: true }).catch(() => null);
+    renderSettings();
+}
+
 // Pages keep the language they were rendered in, so reload to switch all of them
 async function changeUiLanguage(lng) {
     await setUiLanguage(lng);
@@ -194,6 +455,7 @@ async function handleSaveConfig(e) {
         ServerName: $('cfg-server-name')?.value || 'Rustyfin',
         PreferredMetadataLanguage: $('cfg-meta-lang')?.value || 'de',
         PublicPort: parseInt($('cfg-port')?.value) || 8096,
+        RefuseLinksOutOfLibraries: Boolean($('cfg-refuse-links')?.checked),
         IsStartupWizardCompleted: true
     };
     const keys = {
@@ -219,4 +481,6 @@ function oidcAccountKey(id) { return String(id).toLowerCase().replace(/-/g, '');
 
 export {
     renderSettings, changeNextEpisodeAutoPlay, changeUiLanguage, providerKeyField, handleSaveConfig, oidcAccountKey,
+    changeUserConfig, changeUserPref, changeHomeSection, changeSubtitleAppearance, changeLatestLibrary, chooseProfileImage,
+    deleteProfileImage, homeSettingsHtml, playbackSettingsHtml, subtitleSettingsHtml, displaySettingsHtml,
 };

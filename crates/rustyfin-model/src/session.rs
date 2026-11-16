@@ -15,6 +15,9 @@ pub struct SessionInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub now_playing_item: Option<NowPlayingItem>,
     pub last_activity_date: DateTime<Utc>,
+    /// The capabilities the client last reported for this session.
+    #[serde(skip)]
+    pub capabilities: ClientCapabilities,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,7 +119,7 @@ pub struct ClientCapabilities {
 
 /// Request body for POST /Sessions/Capabilities. Jellyfin binds it without regard to case, so
 /// the camelCase names that some clients post are read too.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct SessionCapabilitiesRequest {
     #[serde(default, alias = "playableMediaTypes")]
@@ -127,15 +130,22 @@ pub struct SessionCapabilitiesRequest {
     pub unsupported_commands: Option<Vec<String>>,
     #[serde(default, alias = "supportedFunctions")]
     pub supported_functions: Option<Vec<String>>,
+    #[serde(default, alias = "supportsMediaControl")]
+    pub supports_media_control: Option<bool>,
+    #[serde(default, alias = "supportsPersistentIdentifier")]
+    pub supports_persistent_identifier: Option<bool>,
     #[serde(default, alias = "deviceProfile")]
     pub device_profile: Option<serde_json::Value>,
 }
 
+/// Jellyfin's `GeneralCommand` body (`POST /Sessions/{id}/Command`). Older Rustyfin clients sent
+/// the name as `Command`, which is still read.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct SessionCommand {
-    pub command: String,
-    #[serde(default)]
+    #[serde(alias = "Command", alias = "name")]
+    pub name: String,
+    #[serde(default, alias = "arguments")]
     pub arguments: Option<serde_json::Value>,
 }
 

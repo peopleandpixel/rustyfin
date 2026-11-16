@@ -1,12 +1,17 @@
 // The library grid: paging, infinite scroll, the letter rail, BlurHash placeholders, the poster loader,
 // and its sort and filters
 import { $, icon, toast, escapeHtml, scanRing } from './util.js';
-import { createCardElement } from './cards.js';
+import { createCardElement, cardImage, bannerImage } from './cards.js';
+import { renderGenreRows, genreNameOf } from './genres.js';
 import { hashRoute } from './router.js';
 import { musicTab, rememberMusicTab, musicTabBar, renderMusicTab } from './music.js';
 let currentLibraryId = null;
 // The route shown (library/<this>): the library id, then a music library's tab and genre
 let currentLibraryRoute = null;
+// The open list's tab ('' for the library's own list, 'episodes'), and the genre it is limited to
+// ({ id, name }, from the Genres tab), or null
+let currentLibraryTab = '';
+let currentLibraryGenre = null;
 
 
 // --- BlurHash previews (https://blurha.sh): cards paint the server's ImageBlurHashes at once ---
@@ -478,13 +483,49 @@ let railAnchor = null;
 let railFrame = 0;
 const LIBRARY_PAGE_SIZE = 50;
 
-// The sorts: an /Items SortBy with its default SortOrder, and the label key
+// The sorts: an /Items SortBy with its default SortOrder, and the label key. The first is the default.
 const LIBRARY_SORTS = [
     ['SortName,ProductionYear:Ascending', 'library.sort_name'],
     ['PremiereDate,SortName,ProductionYear:Descending', 'library.sort_release_date'],
     ['DateCreated,SortName,ProductionYear:Descending', 'library.sort_date_added'],
     ['CommunityRating,SortName,ProductionYear:Descending', 'library.sort_rating'],
+    ['OfficialRating,SortName:Ascending', 'library.sort_parental_rating'],
+    ['PlayCount,SortName:Descending', 'library.sort_play_count'],
+    ['DatePlayed,SortName:Descending', 'library.sort_date_played'],
+    ['Runtime,SortName:Ascending', 'library.sort_runtime'],
+    ['DateLastContentAdded,SortName:Descending', 'library.sort_date_episode_added'],
+    ['SeriesDatePlayed,SortName:Descending', 'library.sort_date_played'],
+    ['SeriesSortName,ParentIndexNumber,IndexNumber:Ascending', 'library.sort_name'],
 ];
+// Each list's sort menu, as Jellyfin Web's per library tab (its sort menu's entries Rustyfin can
+// order by; Random is left out, since the grid pages through one order), by the first SortBy key
+const LIBRARY_SORT_MENUS = {
+    movies: ['SortName', 'CommunityRating', 'DateCreated', 'DatePlayed', 'OfficialRating', 'PlayCount', 'PremiereDate', 'Runtime'],
+    series: ['SortName', 'CommunityRating', 'DateCreated', 'DateLastContentAdded', 'SeriesDatePlayed', 'OfficialRating', 'PremiereDate'],
+    episodes: ['SeriesSortName', 'CommunityRating', 'DateCreated', 'PremiereDate', 'DatePlayed', 'OfficialRating', 'PlayCount', 'Runtime'],
+    albums: ['SortName', 'CommunityRating', 'PremiereDate', 'DateCreated'],
+    boxsets: ['SortName', 'CommunityRating', 'DateCreated', 'OfficialRating', 'PremiereDate'],
+    playlists: ['SortName', 'DateCreated', 'DateLastContentAdded', 'PremiereDate', 'Runtime'],
+    mixed: ['SortName', 'CommunityRating', 'DateCreated', 'DateLastContentAdded', 'DatePlayed', 'OfficialRating', 'PlayCount', 'PremiereDate', 'Runtime'],
+};
+// A list's sorts, in its menu's order: [[value, label key]]
+function librarySorts(list = 'movies') {
+    const keys = LIBRARY_SORT_MENUS[list] || LIBRARY_SORT_MENUS.mixed;
+    return keys.map(key => LIBRARY_SORTS.find(([value]) => value.split(/[,:]/)[0] === key));
+}
+// The list a library tab shows, for its sorts, its item type and its saved preferences
+function libraryList(contentType, tab = '') {
+    if (tab === 'episodes') return 'episodes';
+    return {
+        Movies: 'movies', movies: 'movies', TvShows: 'series', tvshows: 'series', Music: 'albums', music: 'albums',
+        BoxSets: 'boxsets', boxsets: 'boxsets', Playlists: 'playlists', playlists: 'playlists',
+    }[contentType] || 'mixed';
+}
+// The view settings (Jellyfin Web's view menu): the card picture or a list, and the card size
+const LIBRARY_LAYOUTS = [['poster', 'library.view_poster'], ['thumb', 'library.view_thumb'], ['banner', 'library.view_banner'], ['list', 'library.view_list']];
+const LIBRARY_SIZES = [['small', 'library.size_small'], ['medium', 'library.size_medium'], ['large', 'library.size_large']];
+// Saved in CustomPrefs under Jellyfin's ImageType and ViewMode names
+const LAYOUT_IMAGE_TYPES = { poster: 'Primary', thumb: 'Thumb', banner: 'Banner' };
 // Each filter's /Items parameter, with the delimiter Jellyfin Web joins its values with
 const LIBRARY_FILTER_PARAMS = { Filters: ',', SeriesStatus: ',', Genres: '|', OfficialRatings: '|', Years: ',' };
 // The DisplayPreferences client the sort and filters are saved under, one entry per library id
@@ -598,6 +639,17 @@ async function renderLibrary(route) {
         return;
     }
     if (musicView) rememberMusicTab(libId, 'albums');
+    // A movie or TV library's tabs: its list, a TV library's Episodes, and Genres (rows per genre,
+    // genres.js; a genre's row header opens the list of that genre, library/<id>/genres/<genre id>)
+    const videoTabs = contentType === 'Movies' || contentType === 'TvShows';
+    if (videoTabs && tab === 'genres' && !sub) {
+        stopLibraryLoad();
+        renderGenreRows(libId, libName, contentType, libraryTabBar(libId, contentType, 'genres'));
+        return;
+    }
+    currentLibraryTab = videoTabs && tab === 'episodes' && contentType === 'TvShows' ? 'episodes' : '';
+    currentLibraryGenre = videoTabs && tab === 'genres' && sub ? { id: sub, name: '' } : null;
+    const list = libraryList(contentType, currentLibraryTab);
     
     page.innerHTML = `
     <div class="jf-page">
@@ -627,9 +679,13 @@ async function renderLibrary(route) {
     // previous load stops meanwhile
     stopLibraryLoad();
     const ticket = libraryGen;
-    const prefs = await loadLibraryPrefs(libId);
+    const [prefs, genreName] = await Promise.all([
+        loadLibraryPrefs(libId, list),
+        currentLibraryGenre ? genreNameOf(libId, contentType, currentLibraryGenre.id) : '',
+    ]);
     if (ticket !== libraryGen || API.token !== session) return;
     libraryPrefs = prefs;
+    if (currentLibraryGenre) currentLibraryGenre.name = genreName;
     renderLetterRail(libId);
 
     const gen = startLibraryLoad(libId);
@@ -650,7 +706,7 @@ async function renderLibrary(route) {
                 <div>
                     <div class="flex items-center gap-2">
                         <span class="inline-flex">${icon(headerIcon, { size: 28 })}</span>
-                        <h1 class="text-2xl lg:text-3xl font-extrabold text-white tracking-tight">${escapeHtml(libName)}</h1>
+                        <h1 class="text-2xl lg:text-3xl font-extrabold text-white tracking-tight">${escapeHtml(currentLibraryGenre?.name ? `${libName}: ${currentLibraryGenre.name}` : libName)}</h1>
                         ${scanRing(libId, libName, 'w-5 h-5')}
                     </div>
                     <p id="lib-count-label" class="text-xs text-white/40 mt-1">${t('library.item_count', { count: total })}</p>
@@ -660,11 +716,20 @@ async function renderLibrary(route) {
                     <!-- Sort selector, with a toggle that reverses its order -->
                     <div class="flex items-center gap-1">
                         <select id="lib-sort" class="jf-input !py-1.5 text-xs">
-                            ${LIBRARY_SORTS.map(([value, key]) => `<option value="${value}"${value === libraryPrefs.sort ? ' selected' : ''}>${t(key)}</option>`).join('')}
+                            ${librarySorts(list).map(([value, key]) => `<option value="${value}"${value === libraryPrefs.sort ? ' selected' : ''}>${t(key)}</option>`).join('')}
                         </select>
                         <button id="lib-sort-reverse" type="button" class="jf-btn-ghost self-stretch !py-1.5 !px-2 text-xs" aria-pressed="${libraryPrefs.reversed}" title="${escapeHtml(t('library.sort_reverse'))}" aria-label="${escapeHtml(t('library.sort_reverse'))}">
                             ${icon('ArrowDownUp', { size: 16 })}
                         </button>
+                    </div>
+
+                    <!-- View settings: poster, thumb, banner or list, and the card size -->
+                    <button id="lib-view-button" type="button" popovertarget="lib-view-menu" class="jf-btn-ghost inline-flex items-center gap-1.5 !py-1.5 !px-3 text-xs">
+                        ${icon(libraryPrefs.view.layout === 'list' ? 'List' : 'LayoutGrid', { size: 14 })}
+                        ${t('library.view_settings')}
+                    </button>
+                    <div id="lib-view-menu" popover role="dialog" class="jf-filter-menu" aria-label="${escapeHtml(t('library.view_settings'))}">
+                        ${libraryViewMenu(libraryPrefs.view)}
                     </div>
 
                     <!-- Filter menu, and a reset while any filter is on -->
@@ -696,6 +761,7 @@ async function renderLibrary(route) {
             </div>
 
             ${musicView ? musicTabBar(libId, 'albums') : ''}
+            ${videoTabs ? libraryTabBar(libId, contentType, currentLibraryGenre ? 'genres' : currentLibraryTab || 'main') : ''}
 
             <!-- Media Grid Container -->
             <div id="lib-grid-container"></div>
@@ -707,6 +773,7 @@ async function renderLibrary(route) {
             libraryControlsChanged(libId);
         });
         $('lib-filter-menu')?.addEventListener('change', () => libraryControlsChanged(libId));
+        $('lib-view-menu')?.addEventListener('change', () => libraryControlsChanged(libId));
         fillLibraryGrid(items, total);
     } catch (e) {
         if (gen !== libraryGen || API.token !== session) return;
@@ -735,21 +802,37 @@ function libraryFilterCount(filters) {
     return Object.keys(LIBRARY_FILTER_PARAMS).reduce((n, param) => n + (filters[param]?.length || 0), 0);
 }
 
-// Sort and filters from a DisplayPreferences answer: SortBy and SortOrder, and each filter's /Items value in
-// CustomPrefs. Nothing saved, or a sort this client doesn't offer, gives the defaults.
-function libraryPrefsFromDisplay(display) {
+// Sort, filters and view from a DisplayPreferences answer: SortBy and SortOrder, and in CustomPrefs each
+// filter's /Items value, and the view's ViewMode, ImageType and CardSize. Nothing saved, or a sort the
+// list (libraryList) doesn't offer, gives the defaults.
+function libraryPrefsFromDisplay(display, list = 'movies') {
     const sortBy = display?.SortBy || '';
-    const sort = LIBRARY_SORTS.find(([value]) => value.split(':')[0] === sortBy)?.[0];
+    const sorts = librarySorts(list);
+    const sort = sorts.find(([value]) => value.split(':')[0] === sortBy)?.[0];
     const custom = display?.CustomPrefs || {};
     const filters = {};
     for (const [param, delimiter] of Object.entries(LIBRARY_FILTER_PARAMS)) {
         filters[param] = typeof custom[param] === 'string' ? custom[param].split(delimiter).filter(Boolean) : [];
     }
+    const layout = custom.ViewMode === 'list' ? 'list'
+        : Object.keys(LAYOUT_IMAGE_TYPES).find(key => LAYOUT_IMAGE_TYPES[key] === custom.ImageType) || 'poster';
+    const size = LIBRARY_SIZES.some(([key]) => key === custom.CardSize) ? custom.CardSize : 'medium';
     return {
-        sort: sort || LIBRARY_SORTS[0][0],
+        sort: sort || sorts[0][0],
         reversed: !!sort && !!display.SortOrder && display.SortOrder !== sort.split(':')[1],
         filters,
+        view: { layout, size },
     };
+}
+
+// The view's CustomPrefs; the defaults (poster, medium) save nothing
+function libraryViewCustom(view) {
+    const custom = {};
+    if (!view) return custom;
+    if (view.layout === 'list') custom.ViewMode = 'list';
+    else if (view.layout !== 'poster' && LAYOUT_IMAGE_TYPES[view.layout]) custom.ImageType = LAYOUT_IMAGE_TYPES[view.layout];
+    if (view.size && view.size !== 'medium') custom.CardSize = view.size;
+    return custom;
 }
 
 // The DisplayPreferences body that saves a library's sort and filters; the server keeps the whole body
@@ -760,7 +843,7 @@ function libraryPrefsToDisplay(libId, prefs) {
         Client: LIBRARY_PREFS_CLIENT,
         SortBy: sortBy,
         SortOrder: sortOrder,
-        CustomPrefs: libraryFilterQuery(prefs.filters),
+        CustomPrefs: { ...libraryFilterQuery(prefs.filters), ...libraryViewCustom(prefs.view) },
         RememberIndexing: false,
         RememberSorting: true,
         PrimaryImageHeight: 0,
@@ -771,23 +854,31 @@ function libraryPrefsToDisplay(libId, prefs) {
     };
 }
 
-// The user's saved sort and filters for a library, read from the server once per session
-async function loadLibraryPrefs(libId) {
-    const key = `${API.userId}:${libId}`;
+// The DisplayPreferences id a list's preferences are saved under: the library's id, and for a TV
+// library's Episodes tab its own (Jellyfin Web keeps view settings per tab and library too)
+function libraryPrefsId(libId, list = currentLibraryTab) {
+    return list === 'episodes' ? `${libId}-episodes` : libId;
+}
+
+// The user's saved sort, filters and view for a library list, read from the server once per session
+async function loadLibraryPrefs(libId, list) {
+    const id = libraryPrefsId(libId, list);
+    const key = `${API.userId}:${id}`;
     if (!libraryPrefsCache.has(key)) {
-        const display = await API.getDisplayPreferences(libId, LIBRARY_PREFS_CLIENT).catch(() => null);
-        libraryPrefsCache.set(key, libraryPrefsFromDisplay(display));
+        const display = await API.getDisplayPreferences(id, LIBRARY_PREFS_CLIENT).catch(() => null);
+        libraryPrefsCache.set(key, libraryPrefsFromDisplay(display, list));
     }
     return libraryPrefsCache.get(key);
 }
 
-// Keeps the open library's sort and filters, for this session and on the server. Saves go one at a
+// Keeps the open library's sort, filters and view, for this session and on the server. Saves go one at a
 // time in the order they were made, so a slow earlier save can't land after a later one.
 function saveLibraryPrefs(libId) {
-    libraryPrefsCache.set(`${API.userId}:${libId}`, libraryPrefs);
-    const body = libraryPrefsToDisplay(libId, libraryPrefs);
+    const id = libraryPrefsId(libId);
+    libraryPrefsCache.set(`${API.userId}:${id}`, libraryPrefs);
+    const body = libraryPrefsToDisplay(id, libraryPrefs);
     librarySaves = librarySaves
-        .then(() => API.saveDisplayPreferences(libId, LIBRARY_PREFS_CLIENT, body))
+        .then(() => API.saveDisplayPreferences(id, LIBRARY_PREFS_CLIENT, body))
         .catch(e => toast(t('library.prefs_save_failed', { message: e.message }), 'error'));
 }
 
@@ -816,11 +907,68 @@ function libraryFilterMenu(contentType, lists, filters) {
 function libraryControlsPrefs() {
     const filters = Object.fromEntries(Object.keys(LIBRARY_FILTER_PARAMS).map(param => [param, []]));
     for (const box of document.querySelectorAll('#lib-filter-menu input:checked')) filters[box.dataset.param].push(box.value);
+    const checked = name => document.querySelector(`#lib-view-menu input[name="${name}"]:checked`)?.value;
     return {
         sort: $('lib-sort')?.value || LIBRARY_SORTS[0][0],
         reversed: $('lib-sort-reverse')?.getAttribute('aria-pressed') === 'true',
         filters,
+        view: { layout: checked('lib-layout') || 'poster', size: checked('lib-size') || 'medium' },
     };
+}
+
+// The view menu: the layout (poster, thumb, banner or list) and the card size, as radio groups
+function libraryViewMenu(view) {
+    const group = (title, name, options, value) => `<fieldset><legend>${escapeHtml(title)}</legend><div class="jf-filter-options">${options.map(([key, label]) => `<label><input type="radio" name="${name}" value="${key}"${key === value ? ' checked' : ''}><span>${escapeHtml(t(label))}</span></label>`).join('')}</div></fieldset>`;
+    return group(t('library.view_layout'), 'lib-layout', LIBRARY_LAYOUTS, view.layout)
+        + group(t('library.view_size'), 'lib-size', LIBRARY_SIZES, view.size);
+}
+
+// A movie or TV library's tabs (as music.js's): its list, Episodes for TV, and Genres
+function libraryTabBar(libId, contentType, active) {
+    const tabs = [
+        ['main', libId, contentType === 'TvShows' ? 'library.tab_shows' : 'library.tab_movies'],
+        ...(contentType === 'TvShows' ? [['episodes', `${libId}/episodes`, 'library.tab_episodes']] : []),
+        ['genres', `${libId}/genres`, 'library.tab_genres'],
+    ];
+    return `
+    <nav class="jf-tabs" role="tablist" aria-label="${escapeHtml(t('library.tabs'))}">
+        ${tabs.map(([key, route, label]) => `
+        <button type="button" role="tab" class="jf-tab" aria-selected="${key === active}" data-action="navigate" data-page="library" data-id="${escapeHtml(route)}">${t(label)}</button>`).join('')}
+    </nav>`;
+}
+
+// The card shape the open list's view draws: 'poster', 'backdrop' (thumb, and episodes' own
+// pictures), 'banner' or 'list'
+function libraryShape(prefs = libraryPrefs, list = currentLibraryTab) {
+    const layout = prefs.view?.layout || 'poster';
+    if (layout === 'thumb' || (layout === 'poster' && list === 'episodes')) return 'backdrop';
+    return layout;
+}
+
+// createCardElement's options for the shape
+function libraryCardOptions(shape = libraryShape()) {
+    return { poster: { backdrop: false }, backdrop: { backdrop: true }, banner: { banner: true }, list: { list: true } }[shape];
+}
+
+// The grid's classes for the view: its shape and card size set the columns (input.css)
+function libraryGridClass(prefs = libraryPrefs) {
+    return `jf-lib-grid jf-vgrid jf-shape-${libraryShape(prefs)} jf-size-${prefs.view?.size || 'medium'}`;
+}
+
+// A cell whose item has not arrived, in the view's shape; the grid measures its cells by it
+function libraryPlaceholder(shape = libraryShape()) {
+    if (shape === 'list') {
+        return '<div class="jf-card jf-card-pending jf-list-row"><div class="jf-list-thumb"></div><div class="p-3 min-w-0 flex-1"><p class="text-sm">&nbsp;</p><div class="text-xs">&nbsp;</div></div></div>';
+    }
+    const box = { backdrop: 'jf-poster-backdrop', banner: 'jf-poster-banner' }[shape] || 'jf-poster';
+    return LIBRARY_PLACEHOLDER.replace('"jf-poster"', `"${box}"`);
+}
+
+// The picture a full card of `item` shows in the open view, for telling whether a lite card shows it
+function libraryPictureTag(item, shape = libraryShape()) {
+    if (shape === 'banner') return bannerImage(item)?.tag ?? null;
+    if (shape === 'list' || shape === 'poster') return cardImage(item, false)?.tag ?? null;
+    return cardImage(item, true)?.tag ?? null;
 }
 
 // The filter button's count and the reset button follow the chosen filters
@@ -864,10 +1012,8 @@ function libraryListQuery(libId) {
     const lib = libraries.find(l => (l.id || l.Id) === libId);
     const contentType = lib?.content_type || lib?.Content_type || lib?.ContentType || '';
 
-    let includeItemTypes = undefined;
-    if (contentType === 'TvShows') includeItemTypes = 'Series';
-    else if (contentType === 'Music') includeItemTypes = 'MusicAlbum';
-    else if (contentType === 'Movies') includeItemTypes = 'Movie';
+    const list = libraryList(contentType, currentLibraryTab);
+    const includeItemTypes = { movies: 'Movie', series: 'Series', episodes: 'Episode', albums: 'MusicAlbum' }[list];
 
     const { sortBy, sortOrder } = librarySort();
     return {
@@ -877,6 +1023,8 @@ function libraryListQuery(libId) {
         SortOrder: sortOrder,
         Fields: 'PrimaryImageAspectRatio',
         ...libraryFilterQuery(libraryPrefs.filters),
+        // A genre's list (the Genres tab's row headers)
+        ...(currentLibraryGenre ? { GenreIds: currentLibraryGenre.id } : {}),
     };
 }
 
@@ -933,7 +1081,9 @@ async function fetchLibraryPage(startIndex, signal) {
 // An index whose pictures mostly have no BlurHash yet (a server just upgraded computes them in
 // the background) is asked again, LIBRARY_INDEX_HASH_RETRY_MS later, a few times.
 async function loadLibraryIndex(gen) {
-    const params = { ...libraryQuery, EnableUserData: false, EnableImageTypes: 'Primary', ImageTypeLimit: 1, Limit: Math.max(libraryTotal ?? 0, LIBRARY_INDEX_LIMIT) };
+    // Thumb and banner views draw other pictures than the Primary
+    const imageTypes = libraryShape() === 'poster' || libraryShape() === 'list' ? 'Primary' : 'Primary,Thumb,Backdrop,Banner';
+    const params = { ...libraryQuery, EnableUserData: false, EnableImageTypes: imageTypes, ImageTypeLimit: 1, Limit: Math.max(libraryTotal ?? 0, LIBRARY_INDEX_LIMIT) };
     const q = new URLSearchParams();
     for (const [k, v] of Object.entries(params)) {
         if (k !== 'Fields' && v !== undefined && v !== null && v !== '') q.set(k, v);
@@ -996,7 +1146,7 @@ function liteCardDiffers(card, item) {
 // elements (already loading or shown) so nothing flashes, and the card element itself (the
 // poster loader tracks it). Only for the same item and picture; another one gets a new card.
 function upgradeCard(card, item) {
-    const full = createCardElement(item);
+    const full = createCardElement(item, '', libraryCardOptions());
     const oldImg = card.querySelector('img.jf-thumb-img');
     const freshImg = full.querySelector('img.jf-thumb-img');
     if (oldImg && freshImg) {
@@ -1099,7 +1249,7 @@ function libraryMeasure(grid, total) {
     const gap = parseFloat(style.columnGap) || 0;
     const width = grid.clientWidth;
     const probe = document.createElement('div');
-    probe.innerHTML = LIBRARY_PLACEHOLDER;
+    probe.innerHTML = libraryPlaceholder();
     const sample = probe.firstElementChild;
     sample.style.cssText = `visibility:hidden;width:${Math.max(0, (width - (cols - 1) * gap) / cols)}px`;
     grid.appendChild(sample);
@@ -1126,14 +1276,14 @@ function libraryCellElement(i, tint = false) {
     cell.className = 'jf-vcell';
     let card;
     if (item && !tint) {
-        card = createCardElement(item);
+        card = createCardElement(item, '', libraryCardOptions());
         card.dataset.letter = railLetter(item);
         if (!full) card.dataset.lite = '1';
         card.tabIndex = 0;
         card.setAttribute('role', 'link');
     } else {
         const probe = document.createElement('div');
-        probe.innerHTML = LIBRARY_PLACEHOLDER;
+        probe.innerHTML = libraryPlaceholder();
         card = probe.firstElementChild;
         cell.dataset.i = i;
         const tag = item?.ImageTags?.Primary;
@@ -1215,7 +1365,7 @@ function libraryFillCell(i) {
     if (!cell || !item) return;
     const card = cell.firstElementChild;
     const same = card.dataset.id === String(item.Id || item.id)
-        && cardPictureTag(card) === (item.ImageTags?.Primary ?? null);
+        && cardPictureTag(card) === libraryPictureTag(item);
     if (cell.hasAttribute('data-i')) {
         // Mid-flight it stays a (tinted) skeleton; the settle turns it into its card
         if (!libraryFlying()) libraryReplaceCell(i, cell);
@@ -1505,7 +1655,7 @@ function fillLibraryGrid(items, total) {
         container.innerHTML = libraryEmptyHtml();
         return;
     }
-    container.innerHTML = '<div id="lib-grid" class="jf-lib-grid jf-vgrid" role="list"></div>';
+    container.innerHTML = `<div id="lib-grid" class="${libraryGridClass()}" role="list"></div>`;
     const grid = container.firstElementChild;
     grid.setAttribute('aria-label', $('page-library')?.querySelector('h1')?.textContent || t('common.library'));
     const layout = libraryMeasure(grid, total);
@@ -1930,6 +2080,22 @@ function scheduleRailUpdate() {
 }
 window.addEventListener('scroll', scheduleRailUpdate, { passive: true });
 window.addEventListener('resize', scheduleRailUpdate);
+
+// A mark made from a card (cardmenu.js): the open list's loaded item takes it, so a card drawn again
+// from it (scrolled away and back) shows it too
+document.addEventListener('jf-userdata', e => {
+    const { id, data } = e.detail;
+    for (const item of libraryItems) {
+        if (item && String(item.Id || item.id) === String(id)) {
+            const merged = { ...item.UserData, ...data };
+            if (data.Played) {
+                merged.PlayedPercentage = 0;
+                if (merged.UnplayedItemCount) merged.UnplayedItemCount = 0;
+            }
+            item.UserData = merged;
+        }
+    }
+});
 
 export {
     currentLibraryId, currentLibraryRoute, blurhashTint, posterLoaded, posterFailed, LIBRARY_PAGE_SIZE, setupInfiniteScroll,

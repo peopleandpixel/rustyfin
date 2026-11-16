@@ -23,7 +23,7 @@ use rustyfin_core::subtitle::{
 use rustyfin_model::media_source::{MediaSourceResponse, MediaStream};
 
 use crate::error::ApiError;
-use crate::routes::streaming::{Version, select_version};
+use crate::routes::streaming::{Version, select_version, validate_path_against_library};
 use crate::state::AppState;
 
 pub fn routes() -> Router<AppState> {
@@ -72,13 +72,7 @@ async fn get_subtitle(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Item {id} not found")))?;
 
-    let media_path = PathBuf::from(&item.path);
-    let subs = discover_external_subtitles(&media_path);
-
-    let sub = subs
-        .into_iter()
-        .find(|s| s.index == index)
-        .ok_or_else(|| ApiError::NotFound(format!("Subtitle index {index} not found")))?;
+    let sub = external_subtitle(&state, &item, index).await?;
 
     let content = tokio::fs::read_to_string(&sub.path)
         .await
@@ -109,6 +103,30 @@ async fn get_subtitle(
     }
 }
 
+/// The external subtitle file `index` beside an item's file. The item's file and the subtitle
+/// file must both pass the library check the streams use, so neither a stored path nor a link
+/// beside it reads a file outside the library or one the server owns. The returned subtitle's
+/// path is the resolved one, which the caller opens.
+async fn external_subtitle(
+    state: &AppState,
+    item: &rustyfin_model::media::MediaItem,
+    index: usize,
+) -> Result<rustyfin_core::subtitle::ExternalSubtitle, ApiError> {
+    validate_path_against_library(state, &item.path).await?;
+    let media_path = PathBuf::from(&item.path);
+    let sub = tokio::task::spawn_blocking(move || discover_external_subtitles(&media_path))
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .find(|s| s.index == index)
+        .ok_or_else(|| ApiError::NotFound(format!("Subtitle index {index} not found")))?;
+    let path = validate_path_against_library(state, &sub.path.to_string_lossy()).await?;
+    Ok(rustyfin_core::subtitle::ExternalSubtitle {
+        path: PathBuf::from(path),
+        ..sub
+    })
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "PascalCase")]
 #[allow(dead_code)]
@@ -129,13 +147,7 @@ async fn get_subtitle_stream(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Item {id} not found")))?;
 
-    let media_path = PathBuf::from(&item.path);
-    let subs = discover_external_subtitles(&media_path);
-
-    let sub = subs
-        .into_iter()
-        .find(|s| s.index == index)
-        .ok_or_else(|| ApiError::NotFound(format!("Subtitle index {index} not found")))?;
+    let sub = external_subtitle(&state, &item, index).await?;
 
     let file = tokio::fs::File::open(&sub.path)
         .await
@@ -193,6 +205,58 @@ async fn source_subtitle_vtt_from(
 /// numbered after the highest stream index, in file-name order. The directory is read on a
 /// blocking thread, so the async workers do not wait on it; a failed task gives no files.
 pub(crate) async fn external_streams(source: &MediaSourceResponse) -> Vec<MediaStream> {
+    let media_path = PathBuf::from(&source.path);
+    let found = tokio::task::spawn_blocking(move || discover_external_subtitles(&media_path))
+        .await
+        .unwrap_or_default();
+    streams_of(source, found)
+}
+
+/// How many folders `add_external_streams` reads at once.
+const FOLDER_READS_AT_ONCE: usize = 8;
+
+/// Adds to each of `sources` the external subtitle streams `external_streams` gives it, reading
+/// each folder once however many sources sit in it, at most `FOLDER_READS_AT_ONCE` at a time.
+pub(crate) async fn add_external_streams(sources: &mut [&mut MediaSourceResponse]) {
+    use futures_util::StreamExt;
+
+    let mut folders: Vec<PathBuf> = sources
+        .iter()
+        .filter_map(|source| std::path::Path::new(&source.path).parent())
+        .map(PathBuf::from)
+        .collect();
+    folders.sort();
+    folders.dedup();
+    let listings: HashMap<PathBuf, Vec<PathBuf>> = futures_util::stream::iter(folders)
+        .map(|folder| async move {
+            let read = folder.clone();
+            let files = tokio::task::spawn_blocking(move || {
+                rustyfin_core::subtitle::subtitle_files_in(&read)
+            })
+            .await
+            .unwrap_or_default();
+            (folder, files)
+        })
+        .buffer_unordered(FOLDER_READS_AT_ONCE)
+        .collect()
+        .await;
+    for source in sources.iter_mut() {
+        let media_path = std::path::Path::new(&source.path);
+        let Some(files) = media_path.parent().and_then(|folder| listings.get(folder)) else {
+            continue;
+        };
+        let found = rustyfin_core::subtitle::external_subtitles_among(media_path, files);
+        let streams = streams_of(source, found);
+        source.media_streams.extend(streams);
+    }
+}
+
+/// `found`, the external subtitle files of `source`, as subtitle streams: those its streams
+/// don't list, numbered after its highest stream index.
+fn streams_of(
+    source: &MediaSourceResponse,
+    found: Vec<rustyfin_core::subtitle::ExternalSubtitle>,
+) -> Vec<MediaStream> {
     let listed: Vec<PathBuf> = source
         .media_streams
         .iter()
@@ -205,10 +269,6 @@ pub(crate) async fn external_streams(source: &MediaSourceResponse) -> Vec<MediaS
         .max()
         .unwrap_or(-1)
         + 1;
-    let media_path = PathBuf::from(&source.path);
-    let found = tokio::task::spawn_blocking(move || discover_external_subtitles(&media_path))
-        .await
-        .unwrap_or_default();
     found
         .into_iter()
         .filter(|file| !listed.contains(&file.path))
@@ -288,6 +348,9 @@ async fn subtitle_vtt(
     } else {
         (PathBuf::from(&source.path), format!("0:{index}"))
     };
+    // The input is read only when the streams' library check passes for it, by its resolved path
+    let input =
+        PathBuf::from(validate_path_against_library(state, &input.to_string_lossy()).await?);
     let meta = tokio::fs::metadata(&input).await.map_err(|e| {
         tracing::warn!("Cannot read the subtitle source {}: {e}", input.display());
         ApiError::Internal("Cannot read the subtitle source".to_string())
@@ -980,6 +1043,49 @@ mod tests {
                 (9, Some("srt"), None, Some(plain.as_str())),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn r3playback_folders_read_once_give_the_same_streams() {
+        // Two films in one folder, one in another, and a source whose folder is gone
+        let shared = Folder::with(&[
+            "Film.mkv",
+            "Film.en.srt",
+            "Other.mkv",
+            "Other.de.ass",
+            "Other.srt",
+        ]);
+        let alone = Folder::with(&["Film.mkv", "Film.fr.vtt"]);
+        let with_path = |folder: &Folder, name: &str, streams: serde_json::Value| {
+            let mut source = source(folder, streams);
+            source.path = folder.path(name);
+            source
+        };
+        let mut sources = vec![
+            with_path(
+                &shared,
+                "Film.mkv",
+                json!([{"Index": 0, "CodecType": "video"}]),
+            ),
+            with_path(&shared, "Other.mkv", json!([])),
+            with_path(&alone, "Film.mkv", json!([])),
+        ];
+        let mut gone = sources[2].clone();
+        gone.path = "/nonexistent-r3/Film.mkv".to_string();
+        sources.push(gone);
+        let mut expected = Vec::new();
+        for source in &sources {
+            expected.push(external_streams(source).await);
+        }
+        let mut batched = sources.clone();
+        let mut refs: Vec<&mut MediaSourceResponse> = batched.iter_mut().collect();
+        add_external_streams(&mut refs).await;
+        for (i, (source, before)) in batched.iter().zip(&sources).enumerate() {
+            let added = &source.media_streams[before.media_streams.len()..];
+            assert_eq!(summary(added), summary(&expected[i]), "source {i}");
+        }
+        assert_eq!(expected[1].len(), 2);
+        assert!(expected[3].is_empty());
     }
 
     #[tokio::test]

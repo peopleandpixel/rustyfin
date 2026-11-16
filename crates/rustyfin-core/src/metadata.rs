@@ -20,6 +20,12 @@ pub struct RefreshOptions {
     pub season_lookups: bool,
     /// Ask again about a season or episode that a provider already answered for.
     pub force: bool,
+    /// Jellyfin's ReplaceAllMetadata: clear what the sources fill (except locked fields) first, so
+    /// that they fill it again instead of only the missing fields.
+    pub replace_metadata: bool,
+    /// Jellyfin's ReplaceAllImages: drop the providers' and the admin's images first, so that
+    /// the providers' current ones replace them. Images next to the media are found again.
+    pub replace_images: bool,
 }
 
 impl RefreshOptions {
@@ -28,18 +34,24 @@ impl RefreshOptions {
         search: true,
         season_lookups: true,
         force: true,
+        replace_metadata: false,
+        replace_images: false,
     };
     /// A scan's refresh of the items it added.
     pub const SCAN: RefreshOptions = RefreshOptions {
         search: true,
         season_lookups: true,
         force: false,
+        replace_metadata: false,
+        replace_images: false,
     };
     /// The "Refresh metadata" task: by id only.
     pub const TASK: RefreshOptions = RefreshOptions {
         search: false,
         season_lookups: false,
         force: false,
+        replace_metadata: false,
+        replace_images: false,
     };
 }
 
@@ -64,8 +76,36 @@ pub async fn refresh_item_metadata_with(
     options: RefreshOptions,
 ) -> Result<RefreshOutcome, String> {
     let media_path = Path::new(&item.path);
+    // A "replace all" clears only once the provider has answered for the item: a failed lookup,
+    // a missing key or no match leaves the item as it was. The answer is cached, so the
+    // refresh below asks nothing again.
+    let replacing = (options.replace_metadata || options.replace_images)
+        && replacement_answered(client, item, &plugin_manager.metadata_providers().await).await;
+    if (options.replace_metadata || options.replace_images) && !replacing {
+        tracing::warn!(
+            "no provider answered for '{}', so its metadata and images are kept, not replaced",
+            item.name
+        );
+    }
+    if options.replace_images && replacing {
+        rustyfin_db::repo_image::delete_replaceable_images(pool, item.id)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
     // Each source fills this copy, so a later source keeps what an earlier one filled
     let mut working = item.clone();
+    if options.replace_metadata && replacing {
+        let locks = rustyfin_db::repo_media::item_locks(pool, item.id)
+            .await
+            .map_err(|e| e.to_string())?;
+        clear_unlocked_metadata(&mut working, &locks);
+        rustyfin_db::repo_media::save_refresh_changes(pool, item, &working)
+            .await
+            .map_err(|e| e.to_string())?;
+        rustyfin_db::repo_media::clear_replaceable_links(pool, item.id, &locks)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
 
     // 1. Scan for local images and compute blurhash for each
     let mut local_images = local_images::find_local_images(media_path, item.id);
@@ -104,7 +144,7 @@ pub async fn refresh_item_metadata_with(
         apply_metadata_to_item(pool, &mut working, &meta, false).await?;
 
         // Batch-store image URLs from NFO, skipping types that already exist
-        store_images_batch(pool, item.id, &meta.image_urls, "nfo").await?;
+        store_images_batch(pool, item.id, &item.path, &meta.image_urls, "nfo").await?;
     }
     let replace_name = !name_locked && !nfo_named;
 
@@ -130,6 +170,7 @@ pub async fn refresh_item_metadata_with(
                 &providers,
                 replace_name,
                 options.search,
+                item.production_year,
             )
             .await?;
             // A series counts as answered only once its seasons have answered too, since the
@@ -169,6 +210,100 @@ pub async fn refresh_item_metadata_with(
     Ok(outcome)
 }
 
+/// Clears the fields that a "replace all metadata" refresh fills again, except the locked ones.
+/// The name, the provider ids, the runtime (the file's) and the tags (the admin's) stay.
+fn clear_unlocked_metadata(item: &mut MediaItem, locks: &rustyfin_db::repo_media::ItemLocks) {
+    if locks.lock_data {
+        return;
+    }
+    if !locks.locked("Overview") {
+        item.overview = None;
+        item.taglines.clear();
+    }
+    if !locks.locked("Genres") {
+        item.genres.clear();
+    }
+    if !locks.locked("OfficialRating") {
+        item.official_rating = None;
+    }
+    if !locks.locked("ProductionLocations") {
+        item.production_locations.clear();
+    }
+    item.community_rating = None;
+    item.premiere_date = None;
+    item.production_year = None;
+    item.end_date = None;
+    item.status = None;
+    item.original_language = None;
+    item.budget = None;
+    item.revenue = None;
+    item.homepage = None;
+    item.vote_count = None;
+    item.popularity = None;
+}
+
+/// The names a provider search tries, in order: the parsed name, then the file name without
+/// release tags.
+fn search_candidates(item: &MediaItem) -> Vec<String> {
+    let mut candidates: Vec<String> = Vec::new();
+    let parsed = item.name.trim();
+    if !parsed.is_empty() {
+        candidates.push(parsed.to_string());
+    }
+    let cleaned = clean_filename_for_search(&item.path);
+    if !cleaned.is_empty() && !candidates.contains(&cleaned) {
+        candidates.push(cleaned);
+    }
+    candidates
+}
+
+/// Whether the first provider with lookups (TMDb) answers for a movie or series: by its id, or
+/// else by a search for its names, as `refresh_from_providers` asks. Other types, and an item no
+/// such provider answers for (a failure, no key, no match), are never replaced.
+async fn replacement_answered(
+    client: &reqwest::Client,
+    item: &MediaItem,
+    providers: &[MetadataProviderHandle],
+) -> bool {
+    let Some(provider) = providers.iter().find(|p| p.lookups.is_some()) else {
+        return false;
+    };
+    let Some(lookups) = &provider.lookups else {
+        return false;
+    };
+    let series = match item.media_type {
+        MediaType::Movie => false,
+        MediaType::Series => true,
+        _ => return false,
+    };
+    if let Some(id) = item.tmdb_id {
+        let found = if series {
+            lookups.series_by_id(id).await
+        } else {
+            lookups.movie_by_id(id).await
+        };
+        return matches!(found, Ok(Some(_)));
+    }
+    for candidate in search_candidates(item) {
+        let found = if series {
+            matches!(
+                lookups
+                    .search_series(&candidate, item.production_year)
+                    .await,
+                Ok(Some(_))
+            )
+        } else {
+            (provider.search_movie)(client, &candidate, item.production_year)
+                .await
+                .is_some()
+        };
+        if found {
+            return true;
+        }
+    }
+    false
+}
+
 /// How a refresh ended for the caller that runs many of them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefreshOutcome {
@@ -200,8 +335,8 @@ struct ChildrenAnswer {
 /// Identify a movie or series with each provider in turn and apply what it finds. A provider
 /// with lookups (TMDb) fetches an item it already knows by id and never searches for it, even
 /// when the id is gone from TMDb (the item stays as it is, as in Jellyfin); a series search sends
-/// the folder's year. Without `search`, no provider is searched by name. Returns what the
-/// providers with lookups answered.
+/// `year` (the folder's, from before a "replace all" cleared it). Without `search`, no provider is
+/// searched by name. Returns what the providers with lookups answered.
 async fn refresh_from_providers(
     pool: &SqlitePool,
     client: &reqwest::Client,
@@ -209,23 +344,15 @@ async fn refresh_from_providers(
     providers: &[MetadataProviderHandle],
     replace_name: bool,
     search: bool,
+    year: Option<i32>,
 ) -> Result<ProvidersAnswer, String> {
     let mut answered = false;
     let mut failed = false;
     let mut unauthorized = false;
     // Candidate names in search order. Jellyfin searches the parsed name first; release
     // tags left in the file name (e.g. "Bluray-1080p") make TMDb find nothing.
-    let mut candidates: Vec<String> = Vec::new();
-    let parsed = working.name.trim();
-    if !parsed.is_empty() {
-        candidates.push(parsed.to_string());
-    }
-    let cleaned = clean_filename_for_search(&working.path);
-    if !cleaned.is_empty() && !candidates.contains(&cleaned) {
-        candidates.push(cleaned);
-    }
+    let candidates = search_candidates(working);
     let media_type = working.media_type;
-    let year = working.production_year;
 
     for provider in providers {
         let mut meta = None;
@@ -286,14 +413,28 @@ async fn refresh_from_providers(
 
         if let Some(meta) = meta {
             apply_metadata_to_item(pool, working, &meta, replace_name).await?;
-            store_images_batch(pool, working.id, &meta.image_urls, &provider.provider_name).await?;
+            store_images_batch(
+                pool,
+                working.id,
+                &working.path,
+                &meta.image_urls,
+                &provider.provider_name,
+            )
+            .await?;
         }
 
         // Fetch additional images from this provider
         let images =
             (provider.get_images)(client, working.tmdb_id, working.tvdb_id, media_type).await;
         if !images.is_empty() {
-            store_images_batch(pool, working.id, &images, &provider.provider_name).await?;
+            store_images_batch(
+                pool,
+                working.id,
+                &working.path,
+                &images,
+                &provider.provider_name,
+            )
+            .await?;
         }
     }
     Ok(ProvidersAnswer {
@@ -437,7 +578,7 @@ async fn apply_season(
     };
     let meta = &meta;
     apply_metadata_to_item(pool, working, meta, replace_name).await?;
-    store_images_batch(pool, working.id, &meta.image_urls, provider).await
+    store_images_batch(pool, working.id, &working.path, &meta.image_urls, provider).await
 }
 
 /// After a series is identified, fill its seasons and episodes: one season lookup per season.
@@ -563,7 +704,12 @@ async fn apply_metadata_to_item(
     meta: &rustyfin_model::metadata::ExternalMetadata,
     replace_name: bool,
 ) -> Result<(), String> {
-    // Update fields from external metadata
+    // Update fields from external metadata. A locked field (or a locked item) keeps its value,
+    // as in Jellyfin, whatever the source.
+    let locks = rustyfin_db::repo_media::item_locks(pool, updated.id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let open = |field: &str| !locks.locked(field);
     let before = updated.clone();
     let mut changed = false;
 
@@ -572,6 +718,7 @@ async fn apply_metadata_to_item(
     // the name is locked or an NFO has a title. An NFO's title (`replace_name` false) replaces
     // only a name that still looks like a file name. Seasons keep "Season N".
     if (replace_name || looks_like_filename(&updated.name))
+        && open("Name")
         && updated.media_type != MediaType::Season
         && let Some(new_name) = meta.name.as_deref().map(str::trim)
         && !new_name.is_empty()
@@ -586,6 +733,7 @@ async fn apply_metadata_to_item(
         tracing::debug!("updated name '{}' to '{}'", before.name, new_name);
     }
     if updated.premiere_date.is_none()
+        && open("PremiereDate")
         && let Some(date) = meta.premiere_date.as_deref()
         && let Ok(day) =
             chrono::NaiveDate::parse_from_str(date.get(..10).unwrap_or(date), "%Y-%m-%d")
@@ -595,18 +743,21 @@ async fn apply_metadata_to_item(
     }
 
     if updated.overview.is_none()
+        && open("Overview")
         && let Some(ref v) = meta.overview
     {
         updated.overview = Some(v.clone());
         changed = true;
     }
     if updated.production_year.is_none()
+        && open("ProductionYear")
         && let Some(v) = meta.production_year
     {
         updated.production_year = Some(v);
         changed = true;
     }
     if updated.community_rating.is_none()
+        && open("CommunityRating")
         && let Some(v) = meta.community_rating
     {
         updated.community_rating = Some(v);
@@ -617,6 +768,7 @@ async fn apply_metadata_to_item(
         .official_rating
         .as_deref()
         .is_none_or(|r| r.trim().is_empty())
+        && open("OfficialRating")
         && let Some(ref v) = meta.official_rating
         && !v.trim().is_empty()
     {
@@ -624,6 +776,7 @@ async fn apply_metadata_to_item(
         changed = true;
     }
     if updated.genres.is_empty()
+        && open("Genres")
         && let Some(ref v) = meta.genres
         && !v.is_empty()
     {
@@ -631,6 +784,7 @@ async fn apply_metadata_to_item(
         changed = true;
     }
     if updated.runtime_ticks.is_none()
+        && open("Runtime")
         && let Some(v) = meta.runtime_ticks
     {
         updated.runtime_ticks = Some(v);
@@ -649,18 +803,21 @@ async fn apply_metadata_to_item(
         changed = true;
     }
     if updated.status.is_none()
+        && open("Status")
         && let Some(ref v) = meta.status
     {
         updated.status = Some(v.clone());
         changed = true;
     }
     if updated.original_language.is_none()
+        && open("OriginalLanguage")
         && let Some(ref v) = meta.original_language
     {
         updated.original_language = Some(v.clone());
         changed = true;
     }
     if updated.taglines.is_empty()
+        && open("Overview")
         && let Some(ref v) = meta.tagline
         && !v.is_empty()
     {
@@ -668,6 +825,7 @@ async fn apply_metadata_to_item(
         changed = true;
     }
     if updated.production_locations.is_empty()
+        && open("ProductionLocations")
         && let Some(ref v) = meta.production_countries
         && !v.is_empty()
     {
@@ -675,6 +833,7 @@ async fn apply_metadata_to_item(
         changed = true;
     }
     if updated.end_date.is_none()
+        && open("EndDate")
         && let Some(ref v) = meta.end_date
     {
         // Parse end_date string to DateTime<Utc>
@@ -686,18 +845,21 @@ async fn apply_metadata_to_item(
         }
     }
     if updated.budget.is_none()
+        && !locks.lock_data
         && let Some(v) = meta.budget
     {
         updated.budget = Some(v);
         changed = true;
     }
     if updated.revenue.is_none()
+        && !locks.lock_data
         && let Some(v) = meta.revenue
     {
         updated.revenue = Some(v);
         changed = true;
     }
     if updated.homepage.is_none()
+        && !locks.lock_data
         && let Some(ref v) = meta.homepage
         && !v.is_empty()
     {
@@ -705,12 +867,14 @@ async fn apply_metadata_to_item(
         changed = true;
     }
     if updated.vote_count.is_none()
+        && !locks.lock_data
         && let Some(v) = meta.vote_count
     {
         updated.vote_count = Some(v);
         changed = true;
     }
     if updated.popularity.is_none()
+        && !locks.lock_data
         && let Some(v) = meta.popularity
     {
         updated.popularity = Some(v);
@@ -727,6 +891,7 @@ async fn apply_metadata_to_item(
     // Store studios from metadata
     if let Some(ref studios) = meta.studios
         && !studios.is_empty()
+        && open("Studios")
     {
         store_studios(pool, updated.id, studios).await?;
     }
@@ -735,7 +900,9 @@ async fn apply_metadata_to_item(
             .await
             .map_err(|e| e.to_string())?;
     }
-    if let Some(people) = meta.people.as_deref() {
+    if let Some(people) = meta.people.as_deref()
+        && open("Cast")
+    {
         rustyfin_db::repo_person::set_item_people_if_none(pool, updated.id, people)
             .await
             .map_err(|e| e.to_string())?;
@@ -853,15 +1020,54 @@ pub fn clean_filename_for_search(path: &str) -> String {
     cleaned
 }
 
+/// How a provider image is stored: a web URL as it is; a local path (absolute, or relative to the
+/// item's folder) only when it resolves inside that folder, as the resolved path. An NFO's
+/// `<thumb>` can name any file, and the image routes would read it; a path outside the item's
+/// folder, a missing file or any other scheme is dropped.
+fn storable_image_path(url: &str, item_path: &Path) -> Option<String> {
+    let lower = url.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        return Some(url.to_string());
+    }
+    let path = url.strip_prefix("file://").unwrap_or(url);
+    if path.is_empty() || lower.contains("://") {
+        return None;
+    }
+    // The folder an NFO sits in: the item's own folder, or a series' folder
+    let folder = if item_path.is_dir() {
+        item_path
+    } else {
+        item_path.parent()?
+    };
+    let folder = folder.canonicalize().ok()?;
+    let resolved = folder.join(path).canonicalize().ok()?;
+    (resolved.starts_with(&folder) && resolved.is_file())
+        .then(|| resolved.to_string_lossy().into_owned())
+}
+
 /// Batch-store provider images, merging all sources.
 /// Each provider's images get their own image_index slot so multiple providers
 /// can contribute images of the same type (e.g. multiple backdrops from tmdb, fanart, etc.).
 async fn store_images_batch(
     pool: &SqlitePool,
     item_id: Uuid,
+    item_path: &str,
     images: &[rustyfin_model::metadata::MetadataImage],
     provider: &str,
 ) -> Result<(), String> {
+    // A local picture (an NFO's <thumb>) is kept only inside the item's folder, by its resolved
+    // path; a web URL as it is
+    let images: Vec<rustyfin_model::metadata::MetadataImage> = images
+        .iter()
+        .filter_map(|image| {
+            let url = storable_image_path(&image.url, Path::new(item_path))?;
+            Some(rustyfin_model::metadata::MetadataImage {
+                url,
+                ..image.clone()
+            })
+        })
+        .collect();
+    let images = images.as_slice();
     // Group images by base type to assign proper indices
     // Parse image_type strings like "Primary", "Primary_1", "Backdrop", "Backdrop_2"
     let mut type_counts: std::collections::HashMap<
@@ -889,6 +1095,12 @@ async fn store_images_batch(
     // so the client can find it (client defaults to index 0)
     let mut provider_max_indices: std::collections::HashMap<String, i32> =
         std::collections::HashMap::new();
+    // A type the admin uploaded or chose an image for keeps it until a refresh replaces all images
+    let chosen: std::collections::HashSet<&str> = existing_images
+        .iter()
+        .filter(|img| img.provider == "upload" || img.provider == "user")
+        .map(|img| img.image_type.as_str())
+        .collect();
     for img in &existing_images {
         if img.provider == provider {
             let base = img.image_type.as_str().to_string();
@@ -905,9 +1117,10 @@ async fn store_images_batch(
         if let Some(image_type_base) = ImageType::from_str(&base_type) {
             // A type this provider stored before keeps its images, so a refresh that asks the
             // provider again doesn't add the same pictures at new indices
-            if provider_max_indices
-                .get(image_type_base.as_str())
-                .is_some_and(|&max_idx| max_idx >= 0)
+            if chosen.contains(image_type_base.as_str())
+                || provider_max_indices
+                    .get(image_type_base.as_str())
+                    .is_some_and(|&max_idx| max_idx >= 0)
             {
                 continue;
             }
@@ -989,6 +1202,48 @@ async fn store_studios(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn r3playback_nfo_thumbs_stay_in_the_items_folder() {
+        let root = std::env::temp_dir().join(format!("rustyfin-r3thumb-{}", Uuid::new_v4()));
+        let film = root.join("lib").join("Film");
+        let outside = root.join("secret");
+        std::fs::create_dir_all(&film).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(film.join("Film.mkv"), b"x").unwrap();
+        std::fs::write(film.join("poster.jpg"), b"x").unwrap();
+        std::fs::write(outside.join("key.pem"), b"x").unwrap();
+        std::os::unix::fs::symlink(outside.join("key.pem"), film.join("linked.jpg")).unwrap();
+        let media = film.join("Film.mkv");
+        let poster = film.join("poster.jpg").canonicalize().unwrap();
+        let poster = poster.to_str().unwrap();
+
+        // Inside the folder: relative or absolute, stored resolved; web URLs as they are
+        assert_eq!(
+            storable_image_path("poster.jpg", &media).as_deref(),
+            Some(poster)
+        );
+        assert_eq!(storable_image_path(poster, &media).as_deref(), Some(poster));
+        let url = "https://image.tmdb.org/t/p/original/x.jpg";
+        assert_eq!(storable_image_path(url, &media).as_deref(), Some(url));
+        // A series folder is its own folder
+        assert_eq!(
+            storable_image_path("poster.jpg", &film).as_deref(),
+            Some(poster)
+        );
+        // Outside, through `..`, through a link, missing, or another scheme: ignored
+        for thumb in [
+            outside.join("key.pem").to_str().unwrap().to_string(),
+            "../../secret/key.pem".to_string(),
+            "linked.jpg".to_string(),
+            "missing.jpg".to_string(),
+            "smb://nas/poster.jpg".to_string(),
+            String::new(),
+        ] {
+            assert_eq!(storable_image_path(&thumb, &media), None, "{thumb}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     // ── clean_filename_for_search ──
 

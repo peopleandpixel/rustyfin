@@ -8,7 +8,7 @@ use crate::tmdb_client::{TmdbApi, TmdbClient};
 use rustyfin_model::media::MediaType;
 use rustyfin_model::metadata::{
     ExternalMetadata, LookupFailed, LookupResult, MetadataImage, MetadataLookups, MetadataPerson,
-    SeasonMetadata,
+    RemoteImage, RemoteSearchHit, SeasonMetadata,
 };
 use rustyfin_model::plugin::{Plugin, PluginStatus, PluginType};
 use serde::Deserialize;
@@ -115,6 +115,28 @@ impl MetadataLookups for TmdbLookups {
                 })
                 .await
                 .map_err(|e| failure(&e))
+        })
+    }
+
+    fn search_all(
+        &self,
+        series: bool,
+        name: &str,
+        year: Option<i32>,
+    ) -> Answer<'_, Vec<RemoteSearchHit>> {
+        let name = name.to_string();
+        Box::pin(async move {
+            let tmdb = self.api().ok_or(LookupFailed::Unauthorized)?;
+            search_hits(&tmdb, series, &name, year)
+                .await
+                .map_err(|e| failure(&e))
+        })
+    }
+
+    fn images(&self, series: bool, id: i64) -> Answer<'_, Vec<RemoteImage>> {
+        Box::pin(async move {
+            let tmdb = self.api().ok_or(LookupFailed::Unauthorized)?;
+            image_list(&tmdb, series, id).await.map_err(|e| failure(&e))
         })
     }
 }
@@ -655,13 +677,13 @@ struct TmdbSpokenLanguage {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 struct TmdbImage {
     file_path: String,
     width: Option<i32>,
     height: Option<i32>,
     iso_639_1: Option<String>,
     vote_average: Option<f64>,
+    vote_count: Option<i32>,
 }
 
 /// What a movie details call appends, as Jellyfin 12.4's TMDb plugin asks for it, so that one call
@@ -824,6 +846,98 @@ pub async fn search_tv(tmdb: &TmdbApi, name: &str, year: Option<i32>) -> Option<
 
     // Step 2: everything else comes with the details
     series_by_id(tmdb, search_item.id).await
+}
+
+/// Every match of a movie (or, with `series`, a TV) search, in TMDb's order. The request is the
+/// one `search_movie` and `search_tv` send, so the client's cache answers a repeat of either.
+async fn search_hits(
+    tmdb: &TmdbApi,
+    series: bool,
+    name: &str,
+    year: Option<i32>,
+) -> Result<Option<Vec<RemoteSearchHit>>, crate::tmdb_client::TmdbError> {
+    let year_text = year.map(|y| y.to_string());
+    let mut query = vec![("query", name)];
+    if let Some(y) = year_text.as_deref() {
+        query.push((
+            if series {
+                "first_air_date_year"
+            } else {
+                "year"
+            },
+            y,
+        ));
+    }
+    let endpoint = if series {
+        "/search/tv"
+    } else {
+        "/search/movie"
+    };
+    let Some(json) = final_json(tmdb, endpoint, &query).await? else {
+        return Ok(None);
+    };
+    let Ok(resp) = serde_json::from_value::<TmdbSearchResult>(json) else {
+        return Ok(None);
+    };
+    let hits = resp
+        .results
+        .into_iter()
+        .map(|item| {
+            let date = non_empty(item.release_date.or(item.first_air_date));
+            RemoteSearchHit {
+                id: item.id,
+                name: item.title.or(item.name).unwrap_or_default(),
+                production_year: year_of(date.as_deref()),
+                premiere_date: date,
+                overview: non_empty(item.overview),
+                image_url: item.poster_path.map(|p| tmdb.image_url(&p)),
+            }
+        })
+        .collect();
+    Ok(Some(hits))
+}
+
+/// Every poster (Primary), backdrop and logo of a movie's or series' details call, best first, as
+/// `convert_images` ranks them. The call is the one the lookups send, so a refreshed item's images
+/// come from the cache.
+async fn image_list(
+    tmdb: &TmdbApi,
+    series: bool,
+    id: i64,
+) -> Result<Option<Vec<RemoteImage>>, crate::tmdb_client::TmdbError> {
+    let (endpoint, append) = if series {
+        (format!("/tv/{id}"), SERIES_APPEND)
+    } else {
+        (format!("/movie/{id}"), MOVIE_APPEND)
+    };
+    let Some(json) = final_json(tmdb, &endpoint, &[("append_to_response", append)]).await? else {
+        return Ok(None);
+    };
+    let images: TmdbImages = json
+        .get("images")
+        .cloned()
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default();
+    let mut result = Vec::new();
+    for (kind, list, text_first) in [
+        ("Primary", images.posters, true),
+        ("Backdrop", images.backdrops, false),
+        ("Logo", images.logos, true),
+    ] {
+        for image in rank_images(list, text_first) {
+            result.push(RemoteImage {
+                image_type: kind.to_string(),
+                url: tmdb.image_url(&image.file_path),
+                thumbnail_url: Some(tmdb.thumbnail_url(&image.file_path)),
+                width: image.width,
+                height: image.height,
+                language: non_empty(image.iso_639_1),
+                community_rating: image.vote_average,
+                vote_count: image.vote_count,
+            });
+        }
+    }
+    Ok(Some(result))
 }
 
 /// A series' metadata by TMDb id, from one details call.

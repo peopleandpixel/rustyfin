@@ -3,6 +3,7 @@
 // inline on*="" handlers (index.html and rendered markup) call as globals.
 import { $, toast } from './modules/util.js';
 import './modules/cards.js';
+import './modules/user-settings.js';
 import { navigate, toggleUserMenu, closeUserMenu, toggleSidebar } from './modules/router.js';
 import {
     wizSetUiLanguage, wizApplyPath, wizNext, wizPrev, wizSkipLibrary, wizFinishWithoutImport, wizComplete,
@@ -12,16 +13,27 @@ import {
 } from './modules/auth.js';
 import './modules/home.js';
 import { posterLoaded, posterFailed } from './modules/library.js';
+import './modules/genres.js';
 import './modules/music.js';
 import './modules/item.js';
+import './modules/metadata-admin.js';
 import { doSearch } from './modules/search.js';
 import {
     seekVideo, skipTime, previewSeek, changeAudioTrack, changeSubtitleTrack, playerAreaClick, closePlayer,
     playAdjacentEpisode, playUpNextNow, cancelUpNext, togglePlayPause, setVolume, toggleMute, setPlaybackRate,
-    toggleFullscreen, togglePictureInPicture, skipSegment, hoverSeek, hideTrickplay,
+    toggleFullscreen, togglePictureInPicture, skipSegment, hoverSeek, hideTrickplay, renderPlayerSettings,
+    setSubtitleAppearance, changeSubtitleOffset, changeQuality, changeVersion, changeAspectRatio, renderChapterMenu,
+    changeSegmentAction, togglePlaybackStats, changeStillWatching, openFullPlayer, stopNowPlaying,
 } from './modules/player.js';
+import './modules/playerprefs.js';
 import './modules/queue.js';
-import { changeNextEpisodeAutoPlay, changeUiLanguage, handleSaveConfig } from './modules/settings.js';
+import './modules/remote.js';
+import { sessionControl, openPlayOn, playOnSession } from './modules/sessions.js';
+import './modules/cardmenu.js';
+import {
+    changeNextEpisodeAutoPlay, changeUiLanguage, handleSaveConfig, changeUserConfig, changeUserPref, changeHomeSection,
+    changeSubtitleAppearance, changeLatestLibrary, chooseProfileImage, deleteProfileImage,
+} from './modules/settings.js';
 import { refreshTasks, openAddUser, closeAddUser, submitAddUser, clearLiveLog, setLogLevel } from './modules/admin.js';
 import {
     jiAddPair, jiForget, jiSetMine, jiSetChoice, jiSetConfirm, jiPreview, jiRun, jiNewCode, jiCopyCodes,
@@ -36,11 +48,14 @@ Object.assign(window, {
     wizFinishWithoutImport, wizComplete, navigate, toggleUserMenu, closeUserMenu, toggleSidebar, doSearch, seekVideo,
     skipTime, previewSeek, changeAudioTrack, changeSubtitleTrack, playerAreaClick, closePlayer, playAdjacentEpisode,
     playUpNextNow, cancelUpNext, togglePlayPause, setVolume, toggleMute, setPlaybackRate, toggleFullscreen,
-    togglePictureInPicture, skipSegment, hoverSeek, hideTrickplay, renderLogin,
+    togglePictureInPicture, skipSegment, hoverSeek, hideTrickplay, renderPlayerSettings, setSubtitleAppearance,
+    changeSubtitleOffset, changeQuality, changeVersion, changeAspectRatio, renderChapterMenu, changeSegmentAction,
+    togglePlaybackStats, changeStillWatching, openFullPlayer, stopNowPlaying, renderLogin,
     handleLogin, handleSetupPassword, doLogout, showQuickConnectModal, authorizeQuickConnect, changeNextEpisodeAutoPlay,
     changeUiLanguage, handleSaveConfig, jiAddPair, jiForget, jiSetMine, jiSetChoice, jiSetConfirm, jiPreview, jiRun,
     jiNewCode, jiCopyCodes, refreshTasks, openAddLibrary, closeAddLibrary, submitAddLibrary, closeLibraryOptions,
     submitLibraryOptions, openAddUser, closeAddUser,
     submitAddUser, clearLiveLog, setLogLevel, closePluginConfig, savePluginConfig, closePluginPriority,
-    savePluginPriority,
+    savePluginPriority, sessionControl, openPlayOn, playOnSession, changeUserConfig, changeUserPref, changeHomeSection,
+    changeSubtitleAppearance, changeLatestLibrary, chooseProfileImage, deleteProfileImage,
 });
