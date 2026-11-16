@@ -96,6 +96,22 @@ pub async fn get_all_collections(pool: &SqlitePool) -> Result<Vec<CollectionDto>
         .collect())
 }
 
+/// The ids of the collections that hold an item of a library.
+pub async fn collections_in_library(
+    pool: &SqlitePool,
+    library_id: Uuid,
+) -> Result<std::collections::HashSet<Uuid>, sqlx::Error> {
+    let ids = sqlx::query_scalar::<_, String>(
+        "SELECT DISTINCT ci.collection_id FROM collection_items ci
+         JOIN media_items m ON m.id = ci.item_id
+         WHERE m.library_id = ?1",
+    )
+    .bind(library_id.to_string())
+    .fetch_all(pool)
+    .await?;
+    Ok(ids.iter().filter_map(|s| Uuid::parse_str(s).ok()).collect())
+}
+
 /// The item ids of a collection, in collection order.
 pub async fn get_collection_item_ids(
     pool: &SqlitePool,

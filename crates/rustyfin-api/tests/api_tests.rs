@@ -29096,6 +29096,236 @@ async fn b38_a_users_own_playlist_works_and_is_hidden_from_others() {
     );
 }
 
+// R3 collections: playlist sharing, as Jellyfin's Shares and OpenAccess, and collections that
+// follow parental limits and libraries
+
+#[tokio::test]
+async fn r3collections_a_shared_playlist_is_read_by_readers_and_changed_by_editors() {
+    let w = b38_world().await;
+    let (app, alice, bob, pl, m) = (&w.app, &w.alice.0, &w.bob.0, &w.playlist, &w.movies);
+    let bob_id = w.bob.1;
+    let share = format!("/Playlists/{pl}/Users/{bob_id}");
+    let items = format!("/Playlists/{pl}/Items");
+    let add = format!(r#"{{"Ids":["{}"]}}"#, m[2]);
+    let (_, entries) = send_authed(app, "GET", &items, alice, None).await;
+    let entry = entries["Items"][1]["PlaylistItemId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mv = format!("/Playlists/{pl}/Items/{entry}/Move/0");
+    let one_uri = format!("/Playlists/{pl}");
+    let users_uri = format!("/Playlists/{pl}/Users");
+
+    // Shared to read only: bob reads it and finds it listed, but changes nothing.
+    let uri = format!("{share}?CanEdit=false");
+    assert_eq!(
+        send_authed(app, "POST", &uri, alice, None).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(b38_view(app, bob, pl).await.4, m[..2].to_vec());
+    assert_eq!(b38_listed(app, bob).await, vec![pl.clone()]);
+    let (listed, _) = r2collections_listed(app, bob, "IncludeItemTypes=Playlist").await;
+    assert_eq!(listed, vec![pl.clone()]);
+    let (_, one) = send_authed(app, "GET", &format!("/Playlists/{pl}"), bob, None).await;
+    assert_eq!(one["CanEdit"], false);
+    assert_eq!(one["OpenAccess"], false);
+    assert_eq!(one["ItemIds"], serde_json::json!(m[..2].to_vec()));
+    assert_eq!(
+        one["Shares"],
+        serde_json::json!([{ "UserId": bob_id, "CanEdit": false }])
+    );
+    let (status, me) = send_authed(app, "GET", &share, bob, None).await;
+    assert_eq!((status, &me["CanEdit"]), (StatusCode::OK, &false.into()));
+    for (method, uri, body) in [
+        ("POST", items.as_str(), Some(add.as_str())),
+        ("DELETE", items.as_str(), Some(add.as_str())),
+        ("POST", mv.as_str(), None),
+        ("POST", one_uri.as_str(), Some(r#"{"Name":"Mine"}"#)),
+        ("GET", users_uri.as_str(), None),
+        ("DELETE", share.as_str(), None),
+    ] {
+        let (status, answer) = send_authed(app, method, uri, bob, body).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "bob {method} {uri}: {answer}"
+        );
+    }
+    assert_ne!(
+        send_authed(app, "DELETE", &format!("/Playlists/{pl}"), bob, None)
+            .await
+            .0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(b38_view(app, alice, pl).await.4, m[..2].to_vec());
+
+    // Shared to edit: bob adds and moves, but still may not delete it.
+    let uri = format!("{share}?CanEdit=true");
+    assert_eq!(
+        send_authed(app, "POST", &uri, alice, None).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        send_authed(app, "POST", &items, bob, Some(&add)).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        send_authed(app, "POST", &mv, bob, None).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        b38_view(app, alice, pl).await.4,
+        vec![m[1].clone(), m[0].clone(), m[2].clone()]
+    );
+    let (status, users) =
+        send_authed(app, "GET", &format!("/Playlists/{pl}/Users"), bob, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(users[0]["CanEdit"], true);
+    assert_ne!(
+        send_authed(app, "DELETE", &format!("/Playlists/{pl}"), bob, None)
+            .await
+            .0,
+        StatusCode::NO_CONTENT
+    );
+    let (_, item) = send_authed(app, "GET", &format!("/Items/{pl}"), bob, None).await;
+    assert_eq!(item["CanDelete"], false);
+
+    // Unshared: bob is a stranger again.
+    assert_eq!(
+        send_authed(app, "DELETE", &share, alice, None).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(b38_view(app, bob, pl).await.0, StatusCode::NOT_FOUND);
+    assert!(b38_listed(app, bob).await.is_empty());
+}
+
+#[tokio::test]
+async fn r3collections_a_public_playlist_is_read_by_all_and_changed_by_its_owner() {
+    let w = b38_world().await;
+    let (app, alice, bob, pl, m) = (&w.app, &w.alice.0, &w.bob.0, &w.playlist, &w.movies);
+    let uri = format!("/Playlists/{pl}");
+    let body = format!(
+        r#"{{"IsPublic":true,"Ids":["{}","{}"],"Users":[]}}"#,
+        m[2], m[0]
+    );
+    assert_eq!(
+        send_authed(app, "POST", &uri, alice, Some(&body)).await.0,
+        StatusCode::NO_CONTENT
+    );
+    let view = b38_view(app, bob, pl).await;
+    assert_eq!(view.0, StatusCode::OK);
+    assert_eq!(view.4, vec![m[2].clone(), m[0].clone()]);
+    let (_, one) = send_authed(app, "GET", &uri, bob, None).await;
+    assert_eq!(
+        (&one["OpenAccess"], &one["CanEdit"]),
+        (&true.into(), &false.into())
+    );
+    assert_eq!(b38_listed(app, bob).await, vec![pl.clone()]);
+    let add = format!(r#"{{"Ids":["{}"]}}"#, m[1]);
+    let items = format!("/Playlists/{pl}/Items");
+    assert_eq!(
+        send_authed(app, "POST", &items, bob, Some(&add)).await.0,
+        StatusCode::FORBIDDEN
+    );
+
+    // A playlist made public and shared at creation.
+    let body = format!(
+        r#"{{"Name":"Open","Ids":["{}"],"IsPublic":false,"Users":[{{"UserId":"{}","CanEdit":true}}]}}"#,
+        m[0], w.bob.1
+    );
+    let (status, made) = send_authed(app, "POST", "/Playlists", alice, Some(&body)).await;
+    assert_eq!(status, StatusCode::OK, "{made}");
+    let made = made["Id"].as_str().unwrap();
+    let (_, one) = send_authed(app, "GET", &format!("/Playlists/{made}"), bob, None).await;
+    assert_eq!(
+        (&one["OpenAccess"], &one["CanEdit"]),
+        (&false.into(), &true.into())
+    );
+}
+
+#[tokio::test]
+async fn r3collections_library_parents_list_the_collections_and_playlists_holding_its_items() {
+    let w = b38_world().await;
+    let (app, admin, alice, m) = (&w.app, &w.admin.0, &w.alice.0, &w.movies);
+    let (_, folders) = send_authed(app, "GET", "/Library/VirtualFolders", admin, None).await;
+    let lib = folders[0]["ItemId"].as_str().unwrap().to_string();
+    let uri = format!("/Collections?Name=Set&Ids={}", m[0]);
+    let (_, set) = send_authed(app, "POST", &uri, admin, None).await;
+    let set = set["Id"].as_str().unwrap().to_string();
+    let (_, empty) = send_authed(app, "POST", "/Collections?Name=Empty", admin, None).await;
+    let empty = empty["Id"].as_str().unwrap().to_string();
+
+    let under = |kinds: &str| format!("ParentId={lib}&IncludeItemTypes={kinds}&Recursive=true");
+    assert_eq!(
+        r2collections_listed(app, alice, &under("BoxSet")).await.0,
+        vec![set.clone()]
+    );
+    assert_eq!(
+        r2collections_listed(app, alice, &under("Playlist")).await.0,
+        vec![w.playlist.clone()]
+    );
+    let mut both = vec![set.clone(), empty.clone()];
+    both.sort();
+    let (mut all, _) = r2collections_listed(app, alice, "IncludeItemTypes=BoxSet").await;
+    all.sort();
+    assert_eq!(all, both);
+    // GET /Collections lists every collection, not only the caller's.
+    let (_, listed) = send_authed(app, "GET", "/Collections", alice, None).await;
+    assert_eq!(listed.as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn r3collections_a_collection_of_only_hidden_items_is_hidden() {
+    let w = r2parental().await;
+    w.set_policy(serde_json::json!({ "MaxParentalRating": 10 }))
+        .await;
+    let make = |name: &str, ids: Vec<uuid::Uuid>| serde_json::json!({ "Name": name, "Ids": ids });
+    let mut made = Vec::new();
+    for body in [
+        make("Rough only", vec![w.id("Rough")]),
+        make("Mixed", vec![w.id("Rough"), w.id("Gentle")]),
+    ] {
+        let (status, c) = send(
+            &w.app,
+            request("POST", "/Collections", Some(&w.admin), Some(body)),
+        )
+        .await;
+        assert!(status.is_success(), "{status} {c}");
+        made.push(c["Id"].as_str().unwrap().to_string());
+    }
+    let (rough, mixed) = (&made[0], &made[1]);
+
+    let (_, listed) = w.get(&w.kid, "/Collections").await;
+    let names: Vec<_> = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["Name"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(names, vec!["Mixed".to_string()]);
+    assert_eq!(
+        w.names(&w.kid, "/Items?IncludeItemTypes=BoxSet").await,
+        (vec!["Mixed".to_string()], 1)
+    );
+    for uri in [
+        format!("/Items/{rough}"),
+        format!("/Collections/{rough}"),
+        format!("/Collections/{rough}/Items"),
+        format!("/Items?ParentId={rough}"),
+    ] {
+        assert_eq!(w.get(&w.kid, &uri).await.0, StatusCode::NOT_FOUND, "{uri}");
+        assert_eq!(w.get(&w.admin, &uri).await.0, StatusCode::OK, "{uri}");
+    }
+    assert_eq!(
+        w.names(&w.kid, &format!("/Items?ParentId={mixed}")).await,
+        (vec!["Gentle".to_string()], 1)
+    );
+    assert_eq!(
+        w.names(&w.admin, "/Items?IncludeItemTypes=BoxSet").await.1,
+        2
+    );
+}
+
 // R2 collections: collections and playlists as Jellyfin clients use them
 // Jellyfin Web creates and edits collections with query parameters and no body, lists them as
 // BoxSet items and their contents with ParentId, and edits playlists by PlaylistItemId.
