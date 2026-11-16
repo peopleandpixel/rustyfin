@@ -48316,11 +48316,7 @@ async fn r3queues_resume_exclude_active_sessions() {
     let app = app(state.clone());
     let (token, user) = admin_session(&state).await;
     let (_, [e1, e2, _]) = g1f_insert_show(&state).await;
-    for (item, ticks) in [(e1, 40_000_000), (e2, 50_000_000)] {
-        rustyfin_db::repo_playback::update_playback_position(&state.db, user, item, ticks)
-            .await
-            .unwrap();
-    }
+    // The start report first: it writes its own play state, which the positions below replace.
     let (status, _) = send(
         &app,
         request(
@@ -48332,6 +48328,11 @@ async fn r3queues_resume_exclude_active_sessions() {
     )
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
+    for (item, ticks) in [(e1, 40_000_000), (e2, 50_000_000)] {
+        rustyfin_db::repo_playback::update_playback_position(&state.db, user, item, ticks)
+            .await
+            .unwrap();
+    }
     let (_, body) = r3queues_get(&app, &token, "/UserItems/Resume").await;
     let mut ids = r3queues_ids(&body);
     ids.sort();
