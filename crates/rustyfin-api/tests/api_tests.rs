@@ -23082,7 +23082,7 @@ async fn r2parental_lists_leave_out_items_above_the_limit() {
         ),
         ("/Shows/NextUp".to_string(), "Grim Mild Episode"),
         ("/Shows/Upcoming".to_string(), "Grim Mild Episode"),
-        ("/Movies/Recommendations".to_string(), "Rough"),
+        // /Movies/Recommendations draws on a user's history, which this world has none of
         ("/Movies/Featured".to_string(), "Rough"),
         (format!("/Items/{gentle}/Similar"), "Edgy"),
         (format!("/Movies/{gentle}/Similar"), "Edgy"),
@@ -27793,6 +27793,204 @@ async fn g1f_sessions_list_own_unless_admin() {
 }
 
 // ── B15: Next Up ──
+// R3 library tabs: a movie library's Suggestions rows (GET /Movies/Recommendations, Jellyfin's
+// RecommendationDto list) and a TV library's own Next Up and Upcoming (ParentId)
+
+/// Inserts movies `(name, year)` into a new movie library and returns it and the ids by name.
+async fn r3tabs_movies(
+    state: &AppState,
+    name: &str,
+    movies: &[(&str, i32)],
+) -> (uuid::Uuid, HashMap<String, uuid::Uuid>) {
+    let folder = media_folder(state, name);
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: name.to_string(),
+        content_type: rustyfin_model::library::LibraryContentType::Movies,
+        paths: vec![folder.clone()],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    let mut ids = HashMap::new();
+    for (movie, year) in movies {
+        let id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO media_items (id, library_id, name, media_type, path, production_year) \
+             VALUES (?, ?, ?, 'Movie', ?, ?)",
+        )
+        .bind(id.to_string())
+        .bind(lib.id.to_string())
+        .bind(movie)
+        .bind(format!("{folder}/{movie}.mkv"))
+        .bind(year)
+        .execute(&state.db)
+        .await
+        .unwrap();
+        ids.insert(movie.to_string(), id);
+    }
+    (lib.id, ids)
+}
+
+/// The (RecommendationType, BaselineItemName, item names) of each row of `uri`'s answer.
+async fn r3tabs_rows(
+    app: &axum::Router,
+    token: &str,
+    uri: &str,
+) -> Vec<(String, String, Vec<String>)> {
+    let (status, json) = send(app, request("GET", uri, Some(token), None)).await;
+    assert_eq!(status, StatusCode::OK, "{uri}: {json}");
+    json.as_array()
+        .unwrap_or_else(|| panic!("{uri}: an array of rows: {json}"))
+        .iter()
+        .map(|row| {
+            let mut names: Vec<String> = row["Items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|i| i["Name"].as_str().unwrap().to_string())
+                .collect();
+            names.sort();
+            (
+                row["RecommendationType"].as_str().unwrap().to_string(),
+                row["BaselineItemName"].as_str().unwrap().to_string(),
+                names,
+            )
+        })
+        .collect()
+}
+
+// Rows of unplayed movies like the ones the viewer played (newest first) and liked, taking turns,
+// then ordered by kind; CategoryLimit, ItemLimit and ParentId narrow them, and a user with no
+// history gets none.
+#[tokio::test]
+async fn r3tabs_movie_recommendations_are_jellyfin_rows() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, viewer, viewer_id) = g1_owner_and_viewer(&state, &app).await;
+    let viewer_id: uuid::Uuid = viewer_id.parse().unwrap();
+    // Similar here means close in year: the 2000s and the 1960s
+    let (lib, ids) = r3tabs_movies(
+        &state,
+        "R3 Tabs Movies",
+        &[
+            ("Seen", 2000),
+            ("Watched", 2000),
+            ("Near", 2001),
+            ("Nearer", 2000),
+            ("Liked", 1960),
+            ("Old", 1961),
+        ],
+    )
+    .await;
+    for (movie, day) in [("Watched", 1), ("Seen", 2)] {
+        rustyfin_db::repo_playback::mark_played(&state.db, viewer_id, ids[movie])
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE user_item_data SET last_played_date = ? WHERE user_id = ? AND item_id = ?",
+        )
+        .bind(format!("2026-01-{day:02}T20:00:00+00:00"))
+        .bind(viewer_id.to_string())
+        .bind(ids[movie].to_string())
+        .execute(&state.db)
+        .await
+        .unwrap();
+    }
+    rustyfin_db::repo_playback::set_favorite(&state.db, viewer_id, ids["Liked"], true)
+        .await
+        .unwrap();
+
+    let recent = "SimilarToRecentlyPlayed";
+    let rows = r3tabs_rows(
+        &app,
+        &viewer,
+        &format!("/Movies/Recommendations?ParentId={lib}"),
+    )
+    .await;
+    assert_eq!(
+        rows.iter()
+            .map(|(kind, baseline, _)| (kind.as_str(), baseline.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            (recent, "Seen"),
+            (recent, "Watched"),
+            ("SimilarToLikedItem", "Liked")
+        ]
+    );
+    for (_, baseline, items) in &rows {
+        assert!(items.contains(&"Near".to_string()), "{baseline}: {items:?}");
+        assert!(
+            !items
+                .iter()
+                .any(|i| i == "Seen" || i == "Watched" || i == baseline),
+            "played movies and the baseline are left out: {baseline}: {items:?}"
+        );
+    }
+    assert_eq!(
+        r3tabs_rows(
+            &app,
+            &viewer,
+            "/Movies/Recommendations?categoryLimit=2&itemLimit=1"
+        )
+        .await
+        .iter()
+        .map(|(kind, baseline, items)| (kind.as_str(), baseline.as_str(), items.len()))
+        .collect::<Vec<_>>(),
+        vec![(recent, "Seen", 1), ("SimilarToLikedItem", "Liked", 1)],
+        "the two kinds take turns"
+    );
+    let other = uuid::Uuid::new_v4();
+    assert!(
+        r3tabs_rows(
+            &app,
+            &viewer,
+            &format!("/Movies/Recommendations?ParentId={other}")
+        )
+        .await
+        .is_empty()
+    );
+    assert!(
+        r3tabs_rows(&app, &owner, "/Movies/Recommendations")
+            .await
+            .is_empty(),
+        "no history, no rows"
+    );
+}
+
+// A TV library's Next Up and Upcoming list only its own episodes when asked with ParentId.
+#[tokio::test]
+async fn r3tabs_next_up_and_upcoming_keep_to_parent_library() {
+    let s = b15_shows().await;
+    s.play(s.viewer_id, "Hotel S01E01", 1).await;
+    let lib = rustyfin_db::repo_media::get_item_by_id(&s.state.db, s.ids["Hotel"])
+        .await
+        .unwrap()
+        .unwrap()
+        .library_id;
+    let other = uuid::Uuid::new_v4();
+    assert_eq!(
+        s.next_up(&s.viewer, &format!("ParentId={lib}")).await,
+        b15_ok(&["Hotel S01E02"], 1)
+    );
+    assert_eq!(
+        s.next_up(&s.viewer, &format!("parentId={other}")).await,
+        b15_ok(&[], 0)
+    );
+    // Upcoming: an episode that airs tomorrow
+    sqlx::query("UPDATE media_items SET premiere_date = date('now', '+1 day') WHERE id = ?")
+        .bind(s.ids["Quiet S01E02"].to_string())
+        .execute(&s.state.db)
+        .await
+        .unwrap();
+    for (parent, expected) in [(lib, 1), (other, 0)] {
+        let uri = format!("/Shows/Upcoming?ParentId={parent}");
+        let (status, json) = send(&s.app, request("GET", &uri, Some(&s.viewer), None)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["TotalRecordCount"], expected, "{uri}: {json}");
+    }
+}
+
 // GET /Shows/NextUp lists one episode per series the user has started: the first unplayed episode
 // after their highest played one, outside season 0. Series sort newest first by when that episode
 // was played, and StartIndex, Limit and TotalRecordCount count series (Jellyfin's

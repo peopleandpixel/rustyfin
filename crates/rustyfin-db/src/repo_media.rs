@@ -3128,29 +3128,55 @@ pub async fn get_episodes_for_series(
     Ok(rows.into_iter().map(Into::into).collect())
 }
 
-/// Get recommended movies: highly-rated movies sorted by rating
-pub async fn get_recommendations(
+/// A user's movies to base recommendations on, in `library_id` (any library when `None`), as
+/// Jellyfin's MoviesController picks them: the movies played most recently (newest first), or with
+/// `liked` those marked favourite or liked (random order); at most `limit`.
+pub async fn get_recommendation_seeds(
     pool: &SqlitePool,
+    user_id: Uuid,
+    library_id: Option<Uuid>,
+    liked: bool,
     limit: i64,
 ) -> Result<Vec<MediaItem>, sqlx::Error> {
-    let movie_type = "Movie".to_string();
+    let library = library_id.map(|id| id.to_string());
     let rows = sqlx::query_as::<_, MediaItemRow>(
         "SELECT id, name, sort_name, overview, media_type, path, parent_id, library_id, \
          production_year, community_rating, official_rating, genres, date_created, \
          premiere_date, runtime_ticks, index_number, parent_index_number, index_number_end, location_type, tmdb_id, tvdb_id, \
          tags, status, original_language, tagline, production_countries, budget, revenue, \
          homepage, end_date, vote_count, popularity \
-         FROM media_items
-         WHERE media_type = ?
-         AND community_rating >= 7.0
-         ORDER BY community_rating DESC, date_created DESC
-         LIMIT ?",
+         FROM media_items m \
+         JOIN user_item_data u ON u.item_id = m.id AND u.user_id = ? \
+         WHERE m.media_type = 'Movie' AND m.extra_type IS NULL \
+         AND (CASE WHEN ? THEN u.is_favorite = 1 OR u.likes = 1 ELSE u.played = 1 END) \
+         AND (? IS NULL OR m.library_id = ?) \
+         ORDER BY CASE WHEN ? THEN RANDOM() ELSE 0 END, u.last_played_date DESC LIMIT ?",
     )
-    .bind(&movie_type)
+    .bind(user_id.to_string())
+    .bind(liked)
+    .bind(&library)
+    .bind(&library)
+    .bind(liked)
     .bind(limit)
     .fetch_all(pool)
     .await?;
     Ok(rows.into_iter().map(Into::into).collect())
+}
+
+/// The ids of the items `user_id` has played
+pub async fn get_played_ids(
+    pool: &SqlitePool,
+    user_id: Uuid,
+) -> Result<std::collections::HashSet<Uuid>, sqlx::Error> {
+    let ids: Vec<String> =
+        sqlx::query_scalar("SELECT item_id FROM user_item_data WHERE user_id = ? AND played = 1")
+            .bind(user_id.to_string())
+            .fetch_all(pool)
+            .await?;
+    Ok(ids
+        .iter()
+        .filter_map(|id| Uuid::parse_str(id).ok())
+        .collect())
 }
 
 /// Get featured movies: recently added or highly rated
