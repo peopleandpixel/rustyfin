@@ -14247,6 +14247,457 @@ impl G12Server {
     }
 }
 
+// R3 metadata: an admin's refresh modes, Identify, remote images, image upload and delete, and the
+// metadata editor's save, against the stub TMDb above (no live TMDb).
+
+impl G12Server {
+    /// The stub's requests to `path` so far.
+    fn hits_to(&self, path: &str) -> usize {
+        self.hits().iter().filter(|hit| hit.path == path).count()
+    }
+
+    async fn item(&self, id: uuid::Uuid) -> rustyfin_model::media::MediaItem {
+        rustyfin_db::repo_media::get_item_by_id(&self.db, id)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    async fn json(&self, method: &str, uri: &str, body: serde_json::Value) -> serde_json::Value {
+        let (status, text) = self.send(method, uri, Some(body.to_string())).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {text}");
+        serde_json::from_str(&text).unwrap()
+    }
+}
+
+#[tokio::test]
+async fn r3metadata_identify_lists_matches_and_applies_one() {
+    let server = g12_server(Some("r3-key"), None).await;
+    let id = server.insert_movie().await;
+    let search = serde_json::json!({
+        "SearchInfo": {"Name": "Alpha Film", "Year": 2001},
+        "ItemId": id.to_string(),
+    });
+    let results = server
+        .json("POST", "/Items/RemoteSearch/Movie", search.clone())
+        .await;
+    assert_eq!(results[0]["Name"], "Alpha Film", "{results}");
+    assert_eq!(results[0]["ProviderIds"]["Tmdb"], "9001");
+    assert_eq!(results[0]["SearchProviderName"], "TheMovieDb");
+    // The same search again comes from the TMDb client's cache
+    server
+        .json("POST", "/Items/RemoteSearch/Movie", search)
+        .await;
+    assert_eq!(server.hits_to("/search/movie"), 1);
+
+    // A TMDb id is looked up directly
+    let by_id = server
+        .json(
+            "POST",
+            "/Items/RemoteSearch/Movie",
+            serde_json::json!({"SearchInfo": {"Name": "x", "ProviderIds": {"Tmdb": "9001"}}}),
+        )
+        .await;
+    assert_eq!(by_id.as_array().unwrap().len(), 1, "{by_id}");
+    assert_eq!(by_id[0]["ProductionYear"], 2001);
+    assert_eq!(by_id[0]["PremiereDate"], "2001-05-04T00:00:00.0000000Z");
+    assert!(
+        by_id[0]["ImageUrl"]
+            .as_str()
+            .unwrap()
+            .ends_with("/g12-poster.jpg")
+    );
+    // A type TMDb has no search for gets none
+    let none = server
+        .json(
+            "POST",
+            "/Items/RemoteSearch/MusicAlbum",
+            serde_json::json!({"SearchInfo": {"Name": "Alpha Film"}}),
+        )
+        .await;
+    assert_eq!(none, serde_json::json!([]));
+
+    let (status, body) = server
+        .send(
+            "POST",
+            &format!("/Items/RemoteSearch/Apply/{id}"),
+            Some(by_id[0].to_string()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let item = server.item(id).await;
+    assert_eq!(item.tmdb_id, Some(9001));
+    assert_eq!(item.overview.as_deref(), Some("G12 stub overview"));
+    assert_eq!(item.official_rating.as_deref(), Some("PG-13"));
+    // The lookup, the apply's refresh and its images shared one details request
+    assert_eq!(server.hits_to("/movie/9001"), 1);
+
+    let (status, _) = server
+        .send(
+            "POST",
+            &format!("/Items/RemoteSearch/Apply/{id}"),
+            Some(serde_json::json!({"Name": "No ids"}).to_string()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn r3metadata_refresh_modes_follow_jellyfin_and_keep_locked_fields() {
+    let server = g12_server(Some("r3-key"), None).await;
+    let id = server.insert_movie().await;
+
+    // None asks no provider; an unknown mode is refused
+    let (status, _) = server
+        .send(
+            "POST",
+            &format!("/Items/{id}/Refresh?MetadataRefreshMode=None&ImageRefreshMode=None"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(server.hits().is_empty(), "{:?}", server.hits());
+    let (status, _) = server
+        .send(
+            "POST",
+            &format!("/Items/{id}/Refresh?MetadataRefreshMode=Sometimes"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // The admin's own values, the overview locked
+    let (status, body) = server
+        .send(
+            "POST",
+            &format!("/Items/{id}"),
+            Some(
+                serde_json::json!({
+                    "Overview": "My own overview",
+                    "OfficialRating": "R",
+                    "LockedFields": ["Overview"],
+                })
+                .to_string(),
+            ),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    // "Search for missing metadata" fills only what is missing
+    let missing = format!(
+        "/Items/{id}/Refresh?MetadataRefreshMode=FullRefresh&ImageRefreshMode=FullRefresh\
+         &ReplaceAllMetadata=false&ReplaceAllImages=false"
+    );
+    let (status, _) = server.send("POST", &missing, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let item = server.item(id).await;
+    assert_eq!(item.tmdb_id, Some(9001));
+    assert_eq!(item.official_rating.as_deref(), Some("R"));
+    assert_eq!(item.overview.as_deref(), Some("My own overview"));
+
+    // "Replace all metadata" replaces what isn't locked
+    let all = missing.replace("ReplaceAllMetadata=false", "ReplaceAllMetadata=true");
+    let (status, _) = server.send("POST", &all, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let item = server.item(id).await;
+    assert_eq!(item.official_rating.as_deref(), Some("PG-13"));
+    assert_eq!(item.overview.as_deref(), Some("My own overview"));
+    assert_eq!(item.production_year, Some(2001));
+
+    // The lock shows on the item, as Jellyfin Web's editor reads it
+    let (_, text) = server.send("GET", &format!("/Items/{id}"), None).await;
+    let dto: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        dto["LockedFields"],
+        serde_json::json!(["Overview"]),
+        "{dto}"
+    );
+
+    // A locked item keeps everything
+    server
+        .send(
+            "POST",
+            &format!("/Items/{id}"),
+            Some(serde_json::json!({"OfficialRating": "R", "LockData": true}).to_string()),
+        )
+        .await;
+    server.send("POST", &all, None).await;
+    assert_eq!(server.item(id).await.official_rating.as_deref(), Some("R"));
+}
+
+#[tokio::test]
+async fn r3metadata_update_item_saves_the_editor_fields() {
+    let server = g12_server(None, None).await;
+    let id = server.insert_movie().await;
+    let (status, body) = server
+        .send(
+            "POST",
+            &format!("/Items/{id}"),
+            Some(
+                serde_json::json!({
+                    "Name": "Edited Film",
+                    "OriginalTitle": "Film Original",
+                    "Overview": "Edited overview",
+                    "ProductionYear": 1999,
+                    "PremiereDate": "1999-03-31T00:00:00.0000000Z",
+                    "CommunityRating": 7.5,
+                    "CriticRating": 88,
+                    "OfficialRating": "PG",
+                    "Genres": ["Drama", "Comedy", "drama"],
+                    "Tags": ["favourite"],
+                    "LockData": false,
+                    "LockedFields": ["Name", "Genres"],
+                })
+                .to_string(),
+            ),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let (_, text) = server.send("GET", &format!("/Items/{id}"), None).await;
+    let dto: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(dto["Name"], "Edited Film", "{dto}");
+    assert_eq!(dto["OriginalTitle"], "Film Original");
+    assert_eq!(dto["Overview"], "Edited overview");
+    assert_eq!(dto["ProductionYear"], 1999);
+    assert!(
+        dto["PremiereDate"]
+            .as_str()
+            .unwrap()
+            .starts_with("1999-03-31")
+    );
+    assert_eq!(dto["CommunityRating"], 7.5);
+    assert_eq!(dto["CriticRating"], 88.0);
+    assert_eq!(dto["OfficialRating"], "PG");
+    assert_eq!(dto["Genres"], serde_json::json!(["Drama", "Comedy"]));
+    assert_eq!(dto["Tags"], serde_json::json!(["favourite"]));
+    assert_eq!(dto["LockedFields"], serde_json::json!(["Name", "Genres"]));
+    assert_eq!(dto["LockData"], false);
+
+    // A field the body leaves out stays; null clears one
+    server
+        .send(
+            "POST",
+            &format!("/Items/{id}"),
+            Some(serde_json::json!({"Overview": null}).to_string()),
+        )
+        .await;
+    let item = server.item(id).await;
+    assert_eq!(item.overview, None);
+    assert_eq!(item.name, "Edited Film");
+    assert_eq!(item.production_year, Some(1999));
+
+    let (status, _) = server
+        .send(
+            "POST",
+            &format!("/Items/{}", uuid::Uuid::new_v4()),
+            Some("{}".into()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn r3metadata_remote_images_download_and_replace() {
+    let server = g12_server(Some("r3-key"), None).await;
+    let id = server.insert_movie().await;
+    server.refresh(id).await;
+
+    let images = server
+        .json(
+            "GET",
+            &format!("/Items/{id}/RemoteImages"),
+            serde_json::Value::Null,
+        )
+        .await;
+    assert_eq!(images["TotalRecordCount"], 2, "{images}");
+    assert_eq!(images["Providers"], serde_json::json!(["TheMovieDb"]));
+    let first = &images["Images"][0];
+    assert_eq!(first["Type"], "Primary");
+    assert_eq!(first["ProviderName"], "TheMovieDb");
+    assert!(
+        first["Url"]
+            .as_str()
+            .unwrap()
+            .ends_with("/original/g12-poster.jpg")
+    );
+    assert!(
+        first["ThumbnailUrl"]
+            .as_str()
+            .unwrap()
+            .ends_with("/w300/g12-poster.jpg")
+    );
+    let backdrops = server
+        .json(
+            "GET",
+            &format!("/Items/{id}/RemoteImages?type=Backdrop&limit=5"),
+            serde_json::Value::Null,
+        )
+        .await;
+    assert_eq!(backdrops["TotalRecordCount"], 1, "{backdrops}");
+    let providers = server
+        .json(
+            "GET",
+            &format!("/Items/{id}/RemoteImages/Providers"),
+            serde_json::Value::Null,
+        )
+        .await;
+    assert_eq!(providers[0]["Name"], "TheMovieDb");
+
+    // The chosen image stays through a refresh, until one replaces all images
+    let chosen = format!("{}/t/p/original/r3-chosen.jpg", server.origin);
+    let (status, _) = server
+        .send(
+            "POST",
+            &format!("/Items/{id}/RemoteImages/Download?type=Primary&imageUrl={chosen}"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let primary = |images: Vec<rustyfin_model::image::ItemImage>| {
+        images
+            .into_iter()
+            .find(|image| {
+                image.image_type == rustyfin_model::image::ImageType::Primary
+                    && image.image_index == 0
+            })
+            .unwrap()
+    };
+    let stored = rustyfin_db::repo_image::get_images_for_item(&server.db, id)
+        .await
+        .unwrap();
+    assert_eq!(primary(stored).path, chosen);
+    server.refresh(id).await;
+    let stored = rustyfin_db::repo_image::get_images_for_item(&server.db, id)
+        .await
+        .unwrap();
+    assert_eq!(primary(stored).provider, "user");
+    let (status, _) = server
+        .send(
+            "POST",
+            &format!(
+                "/Items/{id}/Refresh?MetadataRefreshMode=FullRefresh&ImageRefreshMode=FullRefresh\
+                 &ReplaceAllImages=true"
+            ),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let stored = rustyfin_db::repo_image::get_images_for_item(&server.db, id)
+        .await
+        .unwrap();
+    let image = primary(stored);
+    assert_eq!(image.provider, "tmdb");
+    assert!(image.path.ends_with("/g12-poster.jpg"));
+
+    let (status, _) = server
+        .send(
+            "POST",
+            &format!("/Items/{id}/RemoteImages/Download?type=Primary&imageUrl=file:///etc/passwd"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn r3metadata_upload_takes_base64_and_delete_answers_204() {
+    use base64::Engine;
+    let server = g12_server(None, None).await;
+    let id = server.insert_movie().await;
+    let picture = b30_jpeg(4, 6, [10, 20, 30]);
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&picture);
+    for _ in 0..2 {
+        let (status, body) = server
+            .send(
+                "POST",
+                &format!("/Items/{id}/Images/Backdrop"),
+                Some(encoded.clone()),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let backdrops: Vec<_> = rustyfin_db::repo_image::get_images_for_item(&server.db, id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|image| image.image_type == rustyfin_model::image::ImageType::Backdrop)
+        .collect();
+    assert_eq!(backdrops.len(), 2, "a backdrop is added: {backdrops:?}");
+    let saved = std::fs::read(&backdrops[0].path).unwrap();
+    assert_eq!(saved, picture, "the upload is stored decoded");
+
+    let (status, _) = server
+        .send(
+            "DELETE",
+            &format!("/Items/{id}/Images/Backdrop?imageIndex=1"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let left = rustyfin_db::repo_image::get_images_for_item(&server.db, id)
+        .await
+        .unwrap();
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].image_index, 0);
+    let (status, _) = server
+        .send("DELETE", &format!("/Items/{id}/Images/Backdrop"), None)
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = server
+        .send(
+            "DELETE",
+            &format!("/Items/{}/Images/Primary", uuid::Uuid::new_v4()),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn r3metadata_tools_are_admin_only() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, viewer, _) = g1_owner_and_viewer(&state, &app).await;
+    let item = uuid::Uuid::new_v4();
+    let search = Some(serde_json::json!({"SearchInfo": {"Name": "Alpha"}}));
+    let routes = [
+        (
+            "POST",
+            format!("/Items/{item}"),
+            Some(serde_json::json!({})),
+            true,
+        ),
+        (
+            "POST",
+            "/Items/RemoteSearch/Movie".to_string(),
+            search.clone(),
+            true,
+        ),
+        (
+            "POST",
+            format!("/Items/RemoteSearch/Apply/{item}"),
+            search,
+            true,
+        ),
+        ("GET", format!("/Items/{item}/RemoteImages"), None, true),
+        (
+            "GET",
+            format!("/Items/{item}/RemoteImages/Providers"),
+            None,
+            true,
+        ),
+        (
+            "POST",
+            format!(
+                "/Items/{item}/RemoteImages/Download?type=Primary&imageUrl=https://x.test/a.jpg"
+            ),
+            None,
+            true,
+        ),
+    ];
+    g1_check_admin_routes(&app, &routes, &owner, &viewer).await;
+}
+
 #[tokio::test]
 async fn test_g12_env_tmdb_key_not_in_configuration() {
     let server = g12_server(Some(G12_ENV_KEY), None).await;

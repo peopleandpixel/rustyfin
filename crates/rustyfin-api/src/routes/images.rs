@@ -25,9 +25,7 @@ pub fn routes() -> Router<AppState> {
 
 /// Administrator-only image/refresh routes. `routes::build_router` wraps them in `require_admin`.
 pub fn admin_routes() -> Router<AppState> {
-    Router::new()
-        .route("/Items/{id}/Images/{image_type}", post(upload_item_image))
-        .route("/Items/{id}/Refresh", post(refresh_item))
+    Router::new().route("/Items/{id}/Images/{image_type}", post(upload_item_image))
 }
 
 async fn get_item_images(
@@ -372,14 +370,23 @@ async fn upload_item_image(
         .await?
         .ok_or_else(|| ApiError::NotFound("item not found".into()))?;
 
-    // Save to data_dir/images/{item_id}/{type}.jpg
+    // Jellyfin Web sends the picture base64-encoded, as Jellyfin reads it; other clients may
+    // send the bytes
+    let body = uploaded_image(&body);
+
+    // Save to data_dir/images/{item_id}/{type}.jpg; a backdrop is added after the others
     let img_dir = state.data_dir.join("images").join(id.to_string());
     tokio::fs::create_dir_all(&img_dir)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
 
+    let image_index = super::metadata_admin::new_image_index(&state, id, image_type).await?;
     let ext = detect_image_extension(&body);
-    let filename = format!("{}.{}", image_type.as_str(), ext);
+    let filename = if image_index == 0 {
+        format!("{}.{}", image_type.as_str(), ext)
+    } else {
+        format!("{}_{}.{}", image_type.as_str(), image_index, ext)
+    };
     let file_path = img_dir.join(&filename);
 
     tokio::fs::write(&file_path, &body)
@@ -391,7 +398,7 @@ async fn upload_item_image(
     let img = ItemImage {
         item_id: id,
         image_type,
-        image_index: 0,
+        image_index,
         path: file_path.to_string_lossy().to_string(),
         provider: "upload".to_string(),
         width,
@@ -402,44 +409,6 @@ async fn upload_item_image(
 
     rustyfin_db::repo_image::upsert_image(&state.db, &img).await?;
     // Drop the answers and the pictures that name the old one
-    state.cache.invalidate_item(&id.to_string());
-    state.image_cache.invalidate_item(&id.to_string());
-    rustyfin_core::image_warmer::kick();
-
-    Ok(Json(json!({ "status": "ok" })))
-}
-
-async fn refresh_item(
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-    axum::extract::RawQuery(query): axum::extract::RawQuery,
-) -> Result<Json<Value>, ApiError> {
-    let item = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, id)
-        .await?
-        .ok_or_else(|| ApiError::NotFound("item not found".into()))?;
-
-    // A refresh that replaces all images tries failed chapter images and trickplay again.
-    let replace_all = query.as_deref().is_some_and(|q| {
-        q.split('&').any(|pair| {
-            pair.split_once('=').is_some_and(|(name, value)| {
-                name.eq_ignore_ascii_case("ReplaceAllImages") && value.eq_ignore_ascii_case("true")
-            })
-        })
-    });
-    if replace_all {
-        rustyfin_db::repo_trickplay::clear_failures(&state.db, id).await?;
-    }
-
-    rustyfin_core::metadata::refresh_item_metadata(
-        &state.db,
-        &state.http_client,
-        &item,
-        &state.plugin_manager,
-    )
-    .await
-    .map_err(ApiError::Internal)?;
-
-    // Invalidate cached item details and images after metadata refresh
     state.cache.invalidate_item(&id.to_string());
     state.image_cache.invalidate_item(&id.to_string());
     rustyfin_core::image_warmer::kick();
@@ -462,6 +431,36 @@ fn guess_content_type(path: &str, resized: bool) -> &'static str {
         "image/bmp"
     } else {
         "image/jpeg"
+    }
+}
+
+/// Whether `bytes` start like a JPEG, PNG, GIF or WebP file.
+fn looks_like_image(bytes: &[u8]) -> bool {
+    bytes.starts_with(&[0xFF, 0xD8, 0xFF])
+        || bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47])
+        || bytes.starts_with(b"GIF8")
+        || (bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP")
+}
+
+/// An upload's picture: the body itself when it is one, else the picture its base64 text (or
+/// data URL) decodes to, else the body as it came.
+fn uploaded_image(body: &[u8]) -> Vec<u8> {
+    use base64::Engine;
+    if looks_like_image(body) {
+        return body.to_vec();
+    }
+    let text: Vec<u8> = body
+        .iter()
+        .copied()
+        .filter(|b| !b.is_ascii_whitespace())
+        .collect();
+    let encoded = match text.iter().position(|&b| b == b',') {
+        Some(comma) if text.starts_with(b"data:") => &text[comma + 1..],
+        _ => &text[..],
+    };
+    match base64::engine::general_purpose::STANDARD.decode(encoded) {
+        Ok(decoded) if looks_like_image(&decoded) => decoded,
+        _ => body.to_vec(),
     }
 }
 

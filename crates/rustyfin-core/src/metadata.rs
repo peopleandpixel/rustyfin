@@ -20,6 +20,12 @@ pub struct RefreshOptions {
     pub season_lookups: bool,
     /// Ask again about a season or episode that a provider already answered for.
     pub force: bool,
+    /// Jellyfin's ReplaceAllMetadata: clear what the sources fill (except locked fields) first, so
+    /// that they fill it again instead of only the missing fields.
+    pub replace_metadata: bool,
+    /// Jellyfin's ReplaceAllImages: drop the providers' and the admin's images first, so that
+    /// the providers' current ones replace them. Images next to the media are found again.
+    pub replace_images: bool,
 }
 
 impl RefreshOptions {
@@ -28,18 +34,24 @@ impl RefreshOptions {
         search: true,
         season_lookups: true,
         force: true,
+        replace_metadata: false,
+        replace_images: false,
     };
     /// A scan's refresh of the items it added.
     pub const SCAN: RefreshOptions = RefreshOptions {
         search: true,
         season_lookups: true,
         force: false,
+        replace_metadata: false,
+        replace_images: false,
     };
     /// The "Refresh metadata" task: by id only.
     pub const TASK: RefreshOptions = RefreshOptions {
         search: false,
         season_lookups: false,
         force: false,
+        replace_metadata: false,
+        replace_images: false,
     };
 }
 
@@ -64,8 +76,25 @@ pub async fn refresh_item_metadata_with(
     options: RefreshOptions,
 ) -> Result<RefreshOutcome, String> {
     let media_path = Path::new(&item.path);
+    if options.replace_images {
+        rustyfin_db::repo_image::delete_replaceable_images(pool, item.id)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
     // Each source fills this copy, so a later source keeps what an earlier one filled
     let mut working = item.clone();
+    if options.replace_metadata {
+        let locks = rustyfin_db::repo_media::item_locks(pool, item.id)
+            .await
+            .map_err(|e| e.to_string())?;
+        clear_unlocked_metadata(&mut working, &locks);
+        rustyfin_db::repo_media::save_refresh_changes(pool, item, &working)
+            .await
+            .map_err(|e| e.to_string())?;
+        rustyfin_db::repo_media::clear_replaceable_links(pool, item.id, &locks)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
 
     // 1. Scan for local images and compute blurhash for each
     let mut local_images = local_images::find_local_images(media_path, item.id);
@@ -130,6 +159,7 @@ pub async fn refresh_item_metadata_with(
                 &providers,
                 replace_name,
                 options.search,
+                item.production_year,
             )
             .await?;
             // A series counts as answered only once its seasons have answered too, since the
@@ -169,6 +199,38 @@ pub async fn refresh_item_metadata_with(
     Ok(outcome)
 }
 
+/// Clears the fields that a "replace all metadata" refresh fills again, except the locked ones.
+/// The name, the provider ids, the runtime (the file's) and the tags (the admin's) stay.
+fn clear_unlocked_metadata(item: &mut MediaItem, locks: &rustyfin_db::repo_media::ItemLocks) {
+    if locks.lock_data {
+        return;
+    }
+    if !locks.locked("Overview") {
+        item.overview = None;
+        item.taglines.clear();
+    }
+    if !locks.locked("Genres") {
+        item.genres.clear();
+    }
+    if !locks.locked("OfficialRating") {
+        item.official_rating = None;
+    }
+    if !locks.locked("ProductionLocations") {
+        item.production_locations.clear();
+    }
+    item.community_rating = None;
+    item.premiere_date = None;
+    item.production_year = None;
+    item.end_date = None;
+    item.status = None;
+    item.original_language = None;
+    item.budget = None;
+    item.revenue = None;
+    item.homepage = None;
+    item.vote_count = None;
+    item.popularity = None;
+}
+
 /// How a refresh ended for the caller that runs many of them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefreshOutcome {
@@ -200,8 +262,8 @@ struct ChildrenAnswer {
 /// Identify a movie or series with each provider in turn and apply what it finds. A provider
 /// with lookups (TMDb) fetches an item it already knows by id and never searches for it, even
 /// when the id is gone from TMDb (the item stays as it is, as in Jellyfin); a series search sends
-/// the folder's year. Without `search`, no provider is searched by name. Returns what the
-/// providers with lookups answered.
+/// `year` (the folder's, from before a "replace all" cleared it). Without `search`, no provider is
+/// searched by name. Returns what the providers with lookups answered.
 async fn refresh_from_providers(
     pool: &SqlitePool,
     client: &reqwest::Client,
@@ -209,6 +271,7 @@ async fn refresh_from_providers(
     providers: &[MetadataProviderHandle],
     replace_name: bool,
     search: bool,
+    year: Option<i32>,
 ) -> Result<ProvidersAnswer, String> {
     let mut answered = false;
     let mut failed = false;
@@ -225,7 +288,6 @@ async fn refresh_from_providers(
         candidates.push(cleaned);
     }
     let media_type = working.media_type;
-    let year = working.production_year;
 
     for provider in providers {
         let mut meta = None;
@@ -563,7 +625,12 @@ async fn apply_metadata_to_item(
     meta: &rustyfin_model::metadata::ExternalMetadata,
     replace_name: bool,
 ) -> Result<(), String> {
-    // Update fields from external metadata
+    // Update fields from external metadata. A locked field (or a locked item) keeps its value,
+    // as in Jellyfin, whatever the source.
+    let locks = rustyfin_db::repo_media::item_locks(pool, updated.id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let open = |field: &str| !locks.locked(field);
     let before = updated.clone();
     let mut changed = false;
 
@@ -572,6 +639,7 @@ async fn apply_metadata_to_item(
     // the name is locked or an NFO has a title. An NFO's title (`replace_name` false) replaces
     // only a name that still looks like a file name. Seasons keep "Season N".
     if (replace_name || looks_like_filename(&updated.name))
+        && open("Name")
         && updated.media_type != MediaType::Season
         && let Some(new_name) = meta.name.as_deref().map(str::trim)
         && !new_name.is_empty()
@@ -586,6 +654,7 @@ async fn apply_metadata_to_item(
         tracing::debug!("updated name '{}' to '{}'", before.name, new_name);
     }
     if updated.premiere_date.is_none()
+        && open("PremiereDate")
         && let Some(date) = meta.premiere_date.as_deref()
         && let Ok(day) =
             chrono::NaiveDate::parse_from_str(date.get(..10).unwrap_or(date), "%Y-%m-%d")
@@ -595,18 +664,21 @@ async fn apply_metadata_to_item(
     }
 
     if updated.overview.is_none()
+        && open("Overview")
         && let Some(ref v) = meta.overview
     {
         updated.overview = Some(v.clone());
         changed = true;
     }
     if updated.production_year.is_none()
+        && open("ProductionYear")
         && let Some(v) = meta.production_year
     {
         updated.production_year = Some(v);
         changed = true;
     }
     if updated.community_rating.is_none()
+        && open("CommunityRating")
         && let Some(v) = meta.community_rating
     {
         updated.community_rating = Some(v);
@@ -617,6 +689,7 @@ async fn apply_metadata_to_item(
         .official_rating
         .as_deref()
         .is_none_or(|r| r.trim().is_empty())
+        && open("OfficialRating")
         && let Some(ref v) = meta.official_rating
         && !v.trim().is_empty()
     {
@@ -624,6 +697,7 @@ async fn apply_metadata_to_item(
         changed = true;
     }
     if updated.genres.is_empty()
+        && open("Genres")
         && let Some(ref v) = meta.genres
         && !v.is_empty()
     {
@@ -631,6 +705,7 @@ async fn apply_metadata_to_item(
         changed = true;
     }
     if updated.runtime_ticks.is_none()
+        && open("Runtime")
         && let Some(v) = meta.runtime_ticks
     {
         updated.runtime_ticks = Some(v);
@@ -649,18 +724,21 @@ async fn apply_metadata_to_item(
         changed = true;
     }
     if updated.status.is_none()
+        && open("Status")
         && let Some(ref v) = meta.status
     {
         updated.status = Some(v.clone());
         changed = true;
     }
     if updated.original_language.is_none()
+        && open("OriginalLanguage")
         && let Some(ref v) = meta.original_language
     {
         updated.original_language = Some(v.clone());
         changed = true;
     }
     if updated.taglines.is_empty()
+        && open("Overview")
         && let Some(ref v) = meta.tagline
         && !v.is_empty()
     {
@@ -668,6 +746,7 @@ async fn apply_metadata_to_item(
         changed = true;
     }
     if updated.production_locations.is_empty()
+        && open("ProductionLocations")
         && let Some(ref v) = meta.production_countries
         && !v.is_empty()
     {
@@ -675,6 +754,7 @@ async fn apply_metadata_to_item(
         changed = true;
     }
     if updated.end_date.is_none()
+        && open("EndDate")
         && let Some(ref v) = meta.end_date
     {
         // Parse end_date string to DateTime<Utc>
@@ -686,18 +766,21 @@ async fn apply_metadata_to_item(
         }
     }
     if updated.budget.is_none()
+        && !locks.lock_data
         && let Some(v) = meta.budget
     {
         updated.budget = Some(v);
         changed = true;
     }
     if updated.revenue.is_none()
+        && !locks.lock_data
         && let Some(v) = meta.revenue
     {
         updated.revenue = Some(v);
         changed = true;
     }
     if updated.homepage.is_none()
+        && !locks.lock_data
         && let Some(ref v) = meta.homepage
         && !v.is_empty()
     {
@@ -705,12 +788,14 @@ async fn apply_metadata_to_item(
         changed = true;
     }
     if updated.vote_count.is_none()
+        && !locks.lock_data
         && let Some(v) = meta.vote_count
     {
         updated.vote_count = Some(v);
         changed = true;
     }
     if updated.popularity.is_none()
+        && !locks.lock_data
         && let Some(v) = meta.popularity
     {
         updated.popularity = Some(v);
@@ -727,6 +812,7 @@ async fn apply_metadata_to_item(
     // Store studios from metadata
     if let Some(ref studios) = meta.studios
         && !studios.is_empty()
+        && open("Studios")
     {
         store_studios(pool, updated.id, studios).await?;
     }
@@ -735,7 +821,9 @@ async fn apply_metadata_to_item(
             .await
             .map_err(|e| e.to_string())?;
     }
-    if let Some(people) = meta.people.as_deref() {
+    if let Some(people) = meta.people.as_deref()
+        && open("Cast")
+    {
         rustyfin_db::repo_person::set_item_people_if_none(pool, updated.id, people)
             .await
             .map_err(|e| e.to_string())?;
@@ -889,6 +977,12 @@ async fn store_images_batch(
     // so the client can find it (client defaults to index 0)
     let mut provider_max_indices: std::collections::HashMap<String, i32> =
         std::collections::HashMap::new();
+    // A type the admin uploaded or chose an image for keeps it until a refresh replaces all images
+    let chosen: std::collections::HashSet<&str> = existing_images
+        .iter()
+        .filter(|img| img.provider == "upload" || img.provider == "user")
+        .map(|img| img.image_type.as_str())
+        .collect();
     for img in &existing_images {
         if img.provider == provider {
             let base = img.image_type.as_str().to_string();
@@ -905,9 +999,10 @@ async fn store_images_batch(
         if let Some(image_type_base) = ImageType::from_str(&base_type) {
             // A type this provider stored before keeps its images, so a refresh that asks the
             // provider again doesn't add the same pictures at new indices
-            if provider_max_indices
-                .get(image_type_base.as_str())
-                .is_some_and(|&max_idx| max_idx >= 0)
+            if chosen.contains(image_type_base.as_str())
+                || provider_max_indices
+                    .get(image_type_base.as_str())
+                    .is_some_and(|&max_idx| max_idx >= 0)
             {
                 continue;
             }

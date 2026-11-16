@@ -316,6 +316,16 @@ impl TmdbApi {
         format!("{}{file_path}", self.client.0.settings.image_base_url)
     }
 
+    /// A 300 px wide copy of `file_path` when the image base URL names TMDb's original size, else
+    /// the image itself.
+    pub fn thumbnail_url(&self, file_path: &str) -> String {
+        let base = &self.client.0.settings.image_base_url;
+        match base.strip_suffix("/original") {
+            Some(root) => format!("{root}/w300{file_path}"),
+            None => self.image_url(file_path),
+        }
+    }
+
     /// Runs attempts until one succeeds, the error is not retryable, or the retries run out.
     async fn send_with_retries(
         &self,
