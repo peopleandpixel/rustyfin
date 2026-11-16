@@ -420,78 +420,23 @@ fn drop_computed_fields(config: &mut ServerConfiguration) {
 
 /// Jellyfin's named configuration `encoding` (`EncodingOptions`): Jellyfin 12.4.0's defaults with
 /// Rustyfin's ffmpeg and transcode folder, under what a client saved (`encoding.json` in the data
-/// directory). Rustyfin's transcoder takes its settings per request and from the environment, so
-/// these are kept for Jellyfin Web, not acted on.
+/// directory). Fields Rustyfin doesn't know are kept as they came. Any signed-in user reads them,
+/// without the devices and paths (`PRIVATE_FIELDS`); only administrators save them, and a save
+/// with an invalid value is refused (`validate_options`). The transcoder acts on the fields
+/// `rustyfin_core::encoding::EncodingSettings` reads; the others are stored only.
 const ENCODING_KEY: &str = "encoding";
 
 fn encoding_path(state: &AppState) -> std::path::PathBuf {
-    state.data_dir.join("encoding.json")
+    state.data_dir.join(rustyfin_core::encoding::ENCODING_FILE)
 }
 
-async fn encoding_configuration(state: &AppState) -> Result<serde_json::Value, ApiError> {
+/// The stored encoding options: the defaults, under what a client saved.
+async fn encoding_options(
+    state: &AppState,
+) -> Result<serde_json::Map<String, serde_json::Value>, ApiError> {
     let ffmpeg = std::env::var("RUSTYFIN_FFMPEG_PATH").unwrap_or_else(|_| "ffmpeg".to_string());
-    let transcode_dir = state.data_dir.join("cache").join("transcode");
-    use serde_json::json;
-    let mut options: serde_json::Map<String, serde_json::Value> = [
-        ("EncodingThreadCount", json!(-1)),
-        (
-            "TranscodingTempPath",
-            json!(transcode_dir.to_string_lossy()),
-        ),
-        ("FallbackFontPath", json!("")),
-        ("EnableFallbackFont", json!(false)),
-        ("EnableAudioVbr", json!(false)),
-        ("DownMixAudioBoost", json!(2)),
-        ("DownMixStereoAlgorithm", json!("None")),
-        ("MaxMuxingQueueSize", json!(2048)),
-        ("EnableThrottling", json!(false)),
-        ("ThrottleDelaySeconds", json!(180)),
-        ("EnableSegmentDeletion", json!(false)),
-        ("SegmentKeepSeconds", json!(720)),
-        ("HardwareAccelerationType", json!("none")),
-        ("EncoderAppPath", json!(ffmpeg)),
-        ("EncoderAppPathDisplay", json!(ffmpeg)),
-        ("VaapiDevice", json!("/dev/dri/renderD128")),
-        ("QsvDevice", json!("")),
-        ("EnableTonemapping", json!(false)),
-        ("EnableVppTonemapping", json!(false)),
-        ("EnableVideoToolboxTonemapping", json!(false)),
-        ("TonemappingAlgorithm", json!("bt2390")),
-        ("TonemappingMode", json!("auto")),
-        ("TonemappingRange", json!("auto")),
-        ("TonemappingDesat", json!(0)),
-        ("TonemappingPeak", json!(100)),
-        ("TonemappingParam", json!(0)),
-        ("VppTonemappingBrightness", json!(16)),
-        ("VppTonemappingContrast", json!(1)),
-        ("H264Crf", json!(23)),
-        ("H265Crf", json!(28)),
-        ("EncoderPreset", json!("auto")),
-        ("DeinterlaceDoubleRate", json!(false)),
-        ("DeinterlaceMethod", json!("yadif")),
-        ("EnableDecodingColorDepth10Hevc", json!(true)),
-        ("EnableDecodingColorDepth10Vp9", json!(true)),
-        ("EnableDecodingColorDepth10HevcRext", json!(false)),
-        ("EnableDecodingColorDepth12HevcRext", json!(false)),
-        ("EnableEnhancedNvdecDecoder", json!(true)),
-        ("PreferSystemNativeHwDecoder", json!(true)),
-        ("EnableIntelLowPowerH264HwEncoder", json!(false)),
-        ("EnableIntelLowPowerHevcHwEncoder", json!(false)),
-        ("EnableHardwareEncoding", json!(true)),
-        ("AllowHevcEncoding", json!(false)),
-        ("AllowAv1Encoding", json!(false)),
-        ("EnableSubtitleExtraction", json!(true)),
-        ("SubtitleExtractionTimeoutMinutes", json!(30)),
-        ("HlsAudioSeekStrategy", json!("TrimCopiedAudio")),
-        ("HardwareDecodingCodecs", json!(["h264", "vc1"])),
-        (
-            "AllowOnDemandMetadataBasedKeyframeExtractionForExtensions",
-            json!(["mkv"]),
-        ),
-    ]
-    .into_iter()
-    .map(|(field, value)| (field.to_string(), value))
-    .collect();
+    let mut options =
+        rustyfin_core::encoding::default_options(&ffmpeg, state.transcode_manager.cache_root());
     let saved = match tokio::fs::read_to_string(encoding_path(state)).await {
         Ok(text) => serde_json::from_str::<serde_json::Value>(&text).unwrap_or_else(|e| {
             tracing::warn!("ignoring an unreadable encoding.json: {e}");
@@ -503,18 +448,20 @@ async fn encoding_configuration(state: &AppState) -> Result<serde_json::Value, A
     if let serde_json::Value::Object(saved) = saved {
         options.extend(saved);
     }
-    Ok(serde_json::Value::Object(options))
+    Ok(options)
 }
 
 async fn save_encoding_configuration(
     state: &AppState,
     body: serde_json::Value,
 ) -> Result<(), ApiError> {
-    if !body.is_object() {
+    let Some(options) = body.as_object() else {
         return Err(ApiError::BadRequest(
             "encoding: the body must be a JSON object".to_string(),
         ));
-    }
+    };
+    rustyfin_core::encoding::validate_options(options)
+        .map_err(|e| ApiError::BadRequest(format!("encoding: {e}")))?;
     ensure_config_size(ENCODING_KEY, &body)?;
     let path = encoding_path(state);
     let text =
@@ -528,7 +475,13 @@ async fn save_encoding_configuration(
     })
     .await
     .map_err(|e| ApiError::Internal(e.to_string()))?
-    .map_err(|e| ApiError::Internal(e.to_string()))
+    .map_err(|e| ApiError::Internal(e.to_string()))?;
+    // New transcodes take the saved options; `TranscodingTempPath` takes effect at the next start
+    let options = encoding_options(state).await?;
+    state.transcode_manager.set_encoding_settings(
+        rustyfin_core::encoding::EncodingSettings::from_options(&options),
+    );
+    Ok(())
 }
 
 async fn update_configuration(
@@ -1101,7 +1054,17 @@ async fn get_configuration_by_key(
     Path(key): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     if key.eq_ignore_ascii_case(ENCODING_KEY) {
-        return Ok(Json(encoding_configuration(&state).await?));
+        // Any signed-in user reads them, as in Jellyfin; the devices and paths only an
+        // administrator
+        let mut options = encoding_options(&state).await?;
+        if !claims.is_admin {
+            options.retain(|name, _| {
+                !rustyfin_core::encoding::PRIVATE_FIELDS
+                    .iter()
+                    .any(|private| name.eq_ignore_ascii_case(private))
+            });
+        }
+        return Ok(Json(serde_json::Value::Object(options)));
     }
     let json = configuration_json(&state, claims.is_admin).await?;
     Ok(Json(

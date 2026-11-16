@@ -27,6 +27,7 @@ import {
     folderBrowserSelect, closeFolderBrowser, addLibraryPathRow, removeLibraryPathRow, initScanProgressWebSocket,
 } from './library-admin.js';
 import { openPluginConfig, openPluginPriority } from './plugins.js';
+import { savePlaybackSettings } from './playback-admin.js';
 import {
     openUserEditor, closeUserEditor, showUserEditorTab, addUserEditorTag, removeUserEditorTag, addUserEditorSchedule,
     removeUserEditorSchedule, saveUserEditor, setUserEditorPassword,
@@ -211,6 +212,7 @@ const clickActions = {
     'oidc-remove-link': el => removeOidcLinkAsAdmin(el),
     'oidc-copy-callback': () => copyOidcCallbackUrl(),
     'oidc-save-settings': () => saveOidcAdminSettings(),
+    'playback-save': () => savePlaybackSettings(),
     'plugin-edit-config': el => openPluginConfig(el.dataset.pluginId),
     'plugin-edit-priority': el => openPluginPriority(el.dataset.pluginId),
 };

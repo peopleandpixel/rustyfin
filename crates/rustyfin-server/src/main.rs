@@ -192,7 +192,14 @@ async fn main() {
 
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
 
-    let transcode_manager = rustyfin_core::transcode::TranscodeManager::new(&data_dir);
+    // The saved encoding options: `TranscodingTempPath` is read here, the others by each new
+    // transcode (and again when they are saved)
+    let encoding = rustyfin_core::encoding::EncodingSettings::load(&data_dir);
+    let mut transcode_manager = rustyfin_core::transcode::TranscodeManager::new(&data_dir);
+    if let Some(root) = encoding.transcoding_temp_path.clone() {
+        transcode_manager = transcode_manager.with_cache_root(root);
+    }
+    transcode_manager.set_encoding_settings(encoding);
     // Start periodic cleanup of stale transcode sessions and old cache directories
     transcode_manager.spawn_cleanup_task();
 
