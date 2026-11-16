@@ -1,7 +1,7 @@
 // Music: the album page's track list, and a music library's tabs (albums, album artists, artists,
 // songs and genres)
 import { $, icon, toast, escapeHtml } from './util.js';
-import { createCardElement } from './cards.js';
+import { createCardElement, sectionRow } from './cards.js';
 import { setupInfiniteScroll, destroyInfiniteScroll, addInfiniteScrollSentinel } from './library.js';
 import { playQueueAt } from './queue.js';
 
@@ -109,6 +109,7 @@ function playAlbumFrom(el) {
 // Jellyfin Web's music library tabs, in its order. Albums is the library's own grid (library.js);
 // the others are drawn here. A genre opens its albums ('genre', at library/<id>/genres/<genre id>).
 const MUSIC_TABS = [
+    ['suggestions', 'music.tab_suggestions'],
     ['albums', 'music.tab_albums'],
     ['albumartists', 'music.tab_album_artists'],
     ['artists', 'music.tab_artists'],
@@ -136,7 +137,7 @@ let musicGen = 0;
 function musicTab(libId, tab, sub) {
     if (tab === 'genres' && sub) return 'genre';
     if (MUSIC_TABS.some(([key]) => key === tab)) return tab;
-    return tabMemory().get(libId) || 'albums';
+    return tabMemory().get(libId) || 'suggestions';
 }
 
 function rememberMusicTab(libId, tab) {
@@ -210,6 +211,42 @@ function appendMusicItems(container, libId, tab, items) {
     }
 }
 
+// The Suggestions tab's sections, as Jellyfin Web's music suggestions: the latest songs (grouped into albums by
+// the server), the songs played recently and most often, and a random pick of albums. Each is a request on the
+// user's items; no user, no suggestions.
+const SUGGESTION_LIMIT = 16;
+function suggestionSections(libId, userId) {
+    if (!userId) return [];
+    const user = `/Users/${encodeURIComponent(userId)}`;
+    const common = { ParentId: libId, Recursive: 'true', Limit: SUGGESTION_LIMIT, Fields: 'PrimaryImageAspectRatio' };
+    const played = { ...common, IncludeItemTypes: 'Audio', Filters: 'IsPlayed', SortOrder: 'Descending' };
+    return [
+        {
+            key: 'latest', title: 'music.suggestions_latest',
+            url: `${user}/Items/Latest?${new URLSearchParams({ ParentId: libId, IncludeItemTypes: 'Audio', Limit: SUGGESTION_LIMIT, Fields: common.Fields })}`,
+        },
+        { key: 'recent', title: 'music.suggestions_recent', url: `${user}/Items?${new URLSearchParams({ ...played, SortBy: 'DatePlayed' })}` },
+        { key: 'frequent', title: 'music.suggestions_frequent', url: `${user}/Items?${new URLSearchParams({ ...played, SortBy: 'PlayCount' })}` },
+        {
+            key: 'random', title: 'music.suggestions_random',
+            url: `${user}/Items?${new URLSearchParams({ ...common, IncludeItemTypes: 'MusicAlbum', SortBy: 'Random' })}`,
+        },
+    ];
+}
+
+// Draws the Suggestions tab's sections into the list; a section with no items is left out
+async function fillSuggestions(libId, gen, session) {
+    const sections = suggestionSections(libId, API.userId);
+    const answers = await Promise.all(sections.map(s => API.cachedGet(s.url).catch(() => null)));
+    if (gen !== musicGen || API.token !== session || !$('music-items')) return;
+    const html = sections.map((s, i) => {
+        const data = answers[i];
+        return sectionRow(t(s.title), Array.isArray(data) ? data : (data?.Items || []));
+    }).join('');
+    $('music-count').textContent = '';
+    $('music-items').innerHTML = html || `<div class="text-center py-20 text-white/40">${t('library.empty')}</div>`;
+}
+
 // Draws a music library tab other than Albums, a page at a time as the list scrolls
 async function renderMusicTab(libId, libName, tab, genreId) {
     const session = API.token;
@@ -218,7 +255,7 @@ async function renderMusicTab(libId, libName, tab, genreId) {
     destroyInfiniteScroll();
     const page = $('page-library');
     page.classList.remove('jf-with-rail');
-    const listClass = tab === 'songs'
+    const listClass = tab === 'songs' || tab === 'suggestions'
         ? 'flex flex-col'
         : 'grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-7 gap-4';
     page.innerHTML = `
@@ -242,6 +279,10 @@ async function renderMusicTab(libId, libName, tab, genreId) {
         }).catch(() => {});
     }
 
+    if (tab === 'suggestions') {
+        await fillSuggestions(libId, gen, session);
+        return;
+    }
     let start = 0;
     // Loads the next page; answers the total, or null once the tab was left
     const loadMore = async () => {
@@ -277,5 +318,5 @@ async function renderMusicTab(libId, libName, tab, genreId) {
 
 export {
     trackDuration, trackDiscGroups, trackRow, albumTrackList, MUSIC_TABS, musicTab, rememberMusicTab, musicTabBar,
-    musicTabRequest, renderMusicTab, playAlbumFrom,
+    musicTabRequest, renderMusicTab, playAlbumFrom, suggestionSections,
 };

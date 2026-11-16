@@ -10,11 +10,13 @@ import {
     currentDetailId, renderDetail, renderPerson, toggleFavorite, togglePlayed, deleteItemFromDetail, detailSelection,
 } from './item.js';
 import { renderSearch } from './search.js';
-import { playWithResumeChoice, stopPlayback, playItem, playerAutoHide, onPlayerClosed } from './player.js';
+import {
+    playWithResumeChoice, stopPlayback, playItem, playerAutoHide, onPlayerClosed, seekToTicks,
+} from './player.js';
 import { playContainer } from './queue.js';
 import { stopThemeSong } from './theme-media.js';
 import {
-    openCardMenu, toggleCardPlayed, toggleCardFavorite, setCardLikes, playCardItem, openAddTo,
+    openCardMenu, toggleCardPlayed, toggleCardFavorite, setCardLikes, playCardItem, playInstantMix, openAddTo,
 } from './cardmenu.js';
 import { playAlbumFrom } from './music.js';
 import { playContainerFrom, removeFromContainer, openNewContainer } from './collections.js';
@@ -168,6 +170,9 @@ const clickActions = {
     'card-like': el => setCardLikes(el, true),
     'card-dislike': el => setCardLikes(el, false),
     'card-play': el => playCardItem(el),
+    'card-instant-mix': el => playInstantMix(el),
+    // A timed lyric line seeks the song to its start (ticks), lyrics.js
+    'seek-lyric': el => seekToTicks(Number(el.dataset.start)),
     'card-add-playlist': el => openAddTo(el, 'playlist'),
     'card-add-collection': el => openAddTo(el, 'collection'),
     // Collections and playlists (collections.js)

@@ -28,6 +28,7 @@ import {
 } from './modules/player.js';
 import './modules/playerprefs.js';
 import './modules/queue.js';
+import { toggleLyrics } from './modules/lyrics.js';
 import './modules/remote.js';
 import { sessionControl, openPlayOn, playOnSession } from './modules/sessions.js';
 import './modules/cardmenu.js';
@@ -65,5 +66,5 @@ Object.assign(window, {
     submitAddUser, clearLiveLog, setLogLevel, closePluginConfig, savePluginConfig, closePluginPriority,
     savePluginPriority, sessionControl, openPlayOn, playOnSession, changeUserConfig, changeUserPref, changeHomeSection,
     changeSubtitleAppearance, changeLatestLibrary, chooseProfileImage, deleteProfileImage, saveGeneralSettings,
-    addLibraryFolder, renameLibrary, addTaskTrigger, showTriggerFields,
+    addLibraryFolder, renameLibrary, addTaskTrigger, showTriggerFields, toggleLyrics,
 });
