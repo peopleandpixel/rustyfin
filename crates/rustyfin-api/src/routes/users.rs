@@ -28,6 +28,10 @@ pub fn public_routes() -> Router<AppState> {
     Router::new()
         .route("/Users/Public", get(get_public_users))
         .route("/UserImage", get(get_user_image_file))
+        .route(
+            "/Users/{userId}/Images/{image_type}",
+            get(get_user_image_legacy),
+        )
 }
 
 /// Endpoints that check a password or reset PIN. Only these are rate limited.
@@ -49,8 +53,7 @@ pub fn routes() -> Router<AppState> {
         .route("/Users/{userId}/Images", get(get_user_images))
         .route(
             "/Users/{userId}/Images/{image_type}",
-            get(get_user_image)
-                .post(post_user_image_legacy)
+            post(post_user_image_legacy)
                 .delete(delete_user_image_legacy)
                 .layer(DefaultBodyLimit::max(USER_IMAGE_BODY_LIMIT)),
         )
@@ -149,7 +152,19 @@ async fn get_public_users(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<PublicUserDto>>, ApiError> {
     let users = rustyfin_db::repo_user::get_public_users(&state.db_ro).await?;
-    Ok(Json(users.into_iter().map(PublicUserDto::from).collect()))
+    let tags = rustyfin_db::repo_user::primary_image_tags(&state.db_ro).await?;
+    Ok(Json(
+        users
+            .into_iter()
+            .map(|u| {
+                let primary_image_tag = tags.get(&u.id).cloned();
+                PublicUserDto {
+                    primary_image_tag,
+                    ..PublicUserDto::from(u)
+                }
+            })
+            .collect(),
+    ))
 }
 
 async fn create_user(
@@ -719,33 +734,6 @@ async fn get_user_images(
     Ok(Json(infos))
 }
 
-async fn get_user_image(
-    State(state): State<AppState>,
-    Path((id, image_type)): Path<(Uuid, String)>,
-) -> Result<Json<UserImageInfo>, ApiError> {
-    let images = rustyfin_db::repo_user::get_user_images(&state.db_ro, id)
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
-
-    // Find the matching image
-    for (image_id, img_type, _width, _height) in images {
-        if img_type == image_type {
-            return Ok(Json(UserImageInfo {
-                user_id: id,
-                image_type,
-                id: image_id,
-            }));
-        }
-    }
-
-    // Return default if not found
-    Ok(Json(UserImageInfo {
-        user_id: id,
-        image_type,
-        id: String::new(),
-    }))
-}
-
 async fn get_security_info(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -890,6 +878,53 @@ const USER_IMAGE_BODY_LIMIT: usize = 20 * 1024 * 1024;
 struct UserImageQuery {
     #[serde(rename = "userId")]
     user_id: Option<Uuid>,
+    /// The picture's tag; a URL with one names that version, so it may be cached for long
+    tag: Option<String>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct ImageTagQuery {
+    tag: Option<String>,
+}
+
+/// Users have only a Primary image, as in Jellyfin; another type is refused.
+fn require_primary(image_type: &str) -> Result<(), ApiError> {
+    if image_type.eq_ignore_ascii_case("Primary") {
+        Ok(())
+    } else {
+        Err(ApiError::BadRequest(format!(
+            "users have no {image_type} image"
+        )))
+    }
+}
+
+/// User `id`'s profile picture: long cached when the URL names its tag, else checked each time.
+async fn serve_user_image(
+    state: &AppState,
+    id: Uuid,
+    tagged: bool,
+) -> Result<axum::response::Response, ApiError> {
+    use axum::response::IntoResponse;
+    let (path, _) = rustyfin_db::repo_user::user_image(&state.db_ro, id, "Primary")
+        .await?
+        .ok_or_else(|| ApiError::NotFound("user has no image".into()))?;
+    let bytes = tokio::fs::read(&path)
+        .await
+        .map_err(|_| ApiError::NotFound("user has no image".into()))?;
+    let content_type = image_format(&bytes).map_or("application/octet-stream", |(_, ct)| ct);
+    let cache = if tagged {
+        "public, max-age=31536000"
+    } else {
+        "no-cache"
+    };
+    Ok((
+        [
+            (axum::http::header::CONTENT_TYPE, content_type),
+            (axum::http::header::CACHE_CONTROL, cache),
+        ],
+        bytes,
+    )
+        .into_response())
 }
 
 /// The image format of `bytes` by its signature: its file extension and content type.
@@ -998,29 +1033,22 @@ async fn get_user_image_file(
     State(state): State<AppState>,
     Query(q): Query<UserImageQuery>,
 ) -> Result<axum::response::Response, ApiError> {
-    use axum::response::IntoResponse;
     let id = q
         .user_id
         .ok_or_else(|| ApiError::BadRequest("userId is required".into()))?;
-    let (path, _) = rustyfin_db::repo_user::user_image(&state.db_ro, id, "Primary")
-        .await?
-        .ok_or_else(|| ApiError::NotFound("user has no image".into()))?;
-    let bytes = tokio::fs::read(&path)
-        .await
-        .map_err(|_| ApiError::NotFound("user has no image".into()))?;
-    let content_type = image_format(&bytes).map_or("application/octet-stream", |(_, ct)| ct);
-    Ok((
-        [
-            (axum::http::header::CONTENT_TYPE, content_type),
-            // The tag changes with the picture, so a URL with a tag can be kept
-            (
-                axum::http::header::CACHE_CONTROL,
-                "public, max-age=31536000",
-            ),
-        ],
-        bytes,
-    )
-        .into_response())
+    serve_user_image(&state, id, q.tag.is_some_and(|t| !t.is_empty())).await
+}
+
+/// GET /Users/{userId}/Images/{imageType} - Jellyfin's older form of GET /UserImage, also without sign-in
+async fn get_user_image_legacy(
+    State(state): State<AppState>,
+    Path((id, image_type)): Path<(Uuid, String)>,
+    Query(q): Query<ImageTagQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    if !image_type.eq_ignore_ascii_case("Primary") {
+        return Err(ApiError::NotFound("user has no image".into()));
+    }
+    serve_user_image(&state, id, q.tag.is_some_and(|t| !t.is_empty())).await
 }
 
 /// POST /UserImage?userId= - set the profile picture (base64 body, as Jellyfin takes it)
@@ -1048,9 +1076,10 @@ async fn delete_user_image(
 async fn post_user_image_legacy(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
-    Path((id, _image_type)): Path<(Uuid, String)>,
+    Path((id, image_type)): Path<(Uuid, String)>,
     body: axum::body::Bytes,
 ) -> Result<StatusCode, ApiError> {
+    require_primary(&image_type)?;
     let id = image_owner(&state, &claims, Some(id)).await?;
     save_user_image(&state, id, &body).await
 }
@@ -1059,8 +1088,9 @@ async fn post_user_image_legacy(
 async fn delete_user_image_legacy(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
-    Path((id, _image_type)): Path<(Uuid, String)>,
+    Path((id, image_type)): Path<(Uuid, String)>,
 ) -> Result<StatusCode, ApiError> {
+    require_primary(&image_type)?;
     let id = image_owner(&state, &claims, Some(id)).await?;
     remove_user_image(&state, id).await
 }

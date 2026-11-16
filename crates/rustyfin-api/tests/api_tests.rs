@@ -23408,20 +23408,26 @@ async fn r3settings_profile_image() {
         let (_, me) = send(&app, request("GET", "/Users/Me", Some(&viewer), None)).await;
         me.get("PrimaryImageTag").cloned()
     };
+    // An anonymous GET: status, content type, cache control and body
+    let fetch = |uri: String| {
+        let app = app.clone();
+        async move {
+            let resp = app.oneshot(request("GET", &uri, None, None)).await.unwrap();
+            let status = resp.status();
+            let header = |name: &str| {
+                resp.headers()
+                    .get(name)
+                    .map(|v| v.to_str().unwrap().to_string())
+            };
+            let (content_type, cache) = (header("content-type"), header("cache-control"));
+            let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+            (status, content_type, cache, bytes.to_vec())
+        }
+    };
     let image = || async {
-        let uri = format!("/UserImage?userId={viewer_id}");
-        let resp = app
-            .clone()
-            .oneshot(request("GET", &uri, None, None))
-            .await
-            .unwrap();
-        let status = resp.status();
-        let content_type = resp
-            .headers()
-            .get("content-type")
-            .map(|v| v.to_str().unwrap().to_string());
-        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-        (status, content_type, bytes.to_vec())
+        let (status, content_type, _, bytes) =
+            fetch(format!("/UserImage?userId={viewer_id}")).await;
+        (status, content_type, bytes)
     };
     let files = || {
         let dir = state.data_dir.join("users").join(
@@ -23453,6 +23459,29 @@ async fn r3settings_profile_image() {
         .find(|u| u["Id"].as_str().unwrap().replace('-', "") == viewer_id.replace('-', ""))
         .unwrap();
     assert_eq!(listed["PrimaryImageTag"], first);
+    let (_, public) = send(&app, request("GET", "/Users/Public", None, None)).await;
+    let listed = public
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["Id"].as_str().unwrap().replace('-', "") == viewer_id.replace('-', ""))
+        .unwrap();
+    assert_eq!(listed["PrimaryImageTag"], first);
+
+    // Only a URL with the tag is cached for long; the older GET serves the same picture, also anonymously
+    let tag = first.as_str().unwrap();
+    let (_, _, cache, _) = fetch(format!("/UserImage?userId={viewer_id}")).await;
+    assert_eq!(cache.as_deref(), Some("no-cache"));
+    let (_, _, cache, _) = fetch(format!("/UserImage?userId={viewer_id}&tag={tag}")).await;
+    assert_eq!(cache.as_deref(), Some("public, max-age=31536000"));
+    let (status, content_type, cache, bytes) =
+        fetch(format!("/Users/{viewer_id}/Images/Primary?tag={tag}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(content_type.as_deref(), Some("image/png"));
+    assert_eq!(cache.as_deref(), Some("public, max-age=31536000"));
+    assert_eq!(bytes, png);
+    let (status, ..) = fetch(format!("/Users/{viewer_id}/Images/Backdrop")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 
     // Someone else's picture is the user's own or an administrator's to change; a non-image is refused
     let theirs = format!("/UserImage?userId={owner_id}");
@@ -23462,7 +23491,11 @@ async fn r3settings_profile_image() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(me_tag().await.as_ref(), Some(&first));
 
-    // The older route takes the raw file; the new picture gets a new tag and the old file goes
+    // The older route takes the raw file, for the Primary image only; the new picture gets a new
+    // tag and the old file goes
+    let backdrop = format!("/Users/{viewer_id}/Images/Backdrop");
+    let (status, _) = send(&app, upload(backdrop, &viewer, jpeg.to_vec())).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
     let legacy = format!("/Users/{viewer_id}/Images/Primary");
     let (status, _) = send(&app, upload(legacy, &viewer, jpeg.to_vec())).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
@@ -23478,6 +23511,32 @@ async fn r3settings_profile_image() {
     assert_eq!(me_tag().await, None);
     assert_eq!(image().await.0, StatusCode::NOT_FOUND);
     assert_eq!(files(), 0);
+}
+
+// R3 settings: an administrator may set and delete another user's profile picture.
+#[tokio::test]
+async fn r3settings_admin_sets_another_users_picture() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _owner_id, viewer, viewer_id) = g1_owner_and_viewer(&state, &app).await;
+    let png: &[u8] = b"\x89PNG\r\n\x1a\n-admin-upload";
+    let uri = format!("/UserImage?userId={viewer_id}");
+    let req = Request::builder()
+        .method("POST")
+        .uri(&uri)
+        .header("Authorization", format!("Bearer {owner}"))
+        .header("Content-Type", "image/png")
+        .body(Body::from(png.to_vec()))
+        .unwrap();
+    let (status, _) = send(&app, req).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, me) = send(&app, request("GET", "/Users/Me", Some(&viewer), None)).await;
+    assert!(me["PrimaryImageTag"].is_string(), "{me}");
+
+    let (status, _) = send(&app, request("DELETE", &uri, Some(&owner), None)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, me) = send(&app, request("GET", "/Users/Me", Some(&viewer), None)).await;
+    assert!(me.get("PrimaryImageTag").is_none(), "{me}");
 }
 
 // B152: library grid images keep up with scrolling (web client)
@@ -33373,6 +33432,17 @@ async fn r3settings_universal_bitrate_and_burn_in() {
     assert!(url.starts_with(&m3u8), "{url}");
     assert!(url.contains("&VideoBitrate=3808"), "{url}");
     assert_eq!(source["SupportsDirectPlay"], false);
+
+    // MaxVideoBitrate is in bits/s like Jellyfin's; with both limits the lower one wins
+    let query = "&MaxVideoBitrate=2000000&EnableDirectPlay=false&EnableDirectStream=false";
+    let (url, _) = b22_universal(&app, &token, id, query).await;
+    assert!(url.contains("&VideoBitrate=2000&"), "{url}");
+    let query = "&MaxVideoBitrate=6000000&MaxStreamingBitrate=4000000";
+    let (url, _) = b22_universal(&app, &token, id, query).await;
+    assert!(url.contains("&VideoBitrate=3808&"), "{url}");
+    let query = "&MaxVideoBitrate=2000000&MaxStreamingBitrate=4000000";
+    let (url, _) = b22_universal(&app, &token, id, query).await;
+    assert!(url.contains("&VideoBitrate=2000&"), "{url}");
 
     // A text subtitle is drawn by the browser unless the request asks for it burned in
     let (url, _) = b22_universal(&app, &token, id, "&SubtitleStreamIndex=2").await;

@@ -177,6 +177,9 @@ pub fn jellyfin_configuration(stored: &serde_json::Value) -> serde_json::Value {
 pub struct PublicUserDto {
     pub id: Uuid,
     pub name: String,
+    /// The profile picture's tag, left out when the user has none, as in Jellyfin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_image_tag: Option<String>,
 }
 
 impl From<User> for PublicUserDto {
@@ -184,6 +187,7 @@ impl From<User> for PublicUserDto {
         Self {
             id: u.id,
             name: u.name,
+            primary_image_tag: None,
         }
     }
 }
