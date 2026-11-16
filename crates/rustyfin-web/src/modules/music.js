@@ -3,6 +3,7 @@
 import { $, icon, toast, escapeHtml } from './util.js';
 import { createCardElement } from './cards.js';
 import { setupInfiniteScroll, destroyInfiniteScroll, addInfiniteScrollSentinel } from './library.js';
+import { playQueueAt } from './queue.js';
 
 // --- Album track list ---
 
@@ -42,9 +43,10 @@ function albumArtistNames(album) {
     return names.length ? names : [album.AlbumArtist].filter(Boolean);
 }
 
-// One track row; a click plays it. The artists show only where a track has an artist that is not
-// one of the album's artists (a compilation's tracks), as on Jellyfin Web's album page.
-function trackRow(track, { albumArtists = [], showAlbum = false } = {}) {
+// One track row; a click plays it, or on an album page plays the album from it (inAlbum). The artists
+// show only where a track has an artist that is not one of the album's artists (a compilation's tracks),
+// as on Jellyfin Web's album page.
+function trackRow(track, { albumArtists = [], showAlbum = false, inAlbum = false } = {}) {
     const id = itemId(track);
     const name = track.Name || track.name || '';
     const trackArtists = track.Artists || [];
@@ -55,7 +57,7 @@ function trackRow(track, { albumArtists = [], showAlbum = false } = {}) {
     ].filter(Boolean).join(' · ');
     const played = track.UserData?.Played;
     return `
-    <div class="jf-track-row group" data-action="play" data-id="${escapeHtml(id)}" data-stream-type="Audio" data-title="${escapeHtml(name)}">
+    <div class="jf-track-row group" data-action="${inAlbum ? 'play-album' : 'play'}" data-id="${escapeHtml(id)}" data-stream-type="Audio" data-title="${escapeHtml(name)}">
         <span class="jf-track-number">
             <span class="group-hover:hidden">${escapeHtml(track.IndexNumber ?? '')}</span>
             <span class="hidden group-hover:inline-flex">${icon('Play', { size: 14, class: 'fill-current' })}</span>
@@ -73,11 +75,9 @@ function trackRow(track, { albumArtists = [], showAlbum = false } = {}) {
 function albumTrackList(album, tracks) {
     const groups = trackDiscGroups(tracks);
     const albumArtists = albumArtistNames(album);
-    const first = groups[0]?.tracks[0];
-    // TODO(play queue): Play should hand every track id, in this order, to the player's queue once
-    // modules/player.js has one; until then it plays the first track.
-    const playAll = first ? `
-        <button class="jf-btn-primary !py-1.5 !px-4 text-xs" data-action="play" data-id="${escapeHtml(itemId(first))}" data-stream-type="Audio" data-title="${escapeHtml(first.Name || first.name || '')}">
+    // Play queues every track in the order listed (playAlbumFrom)
+    const playAll = tracks.length ? `
+        <button class="jf-btn-primary !py-1.5 !px-4 text-xs" data-action="play-album">
             ${icon('Play', { size: 14, class: 'fill-current' })} ${t('common.play')}
         </button>` : '';
     return `
@@ -89,9 +89,19 @@ function albumTrackList(album, tracks) {
         ${groups.map(g => `
         <div class="jf-track-disc">
             ${groups.length > 1 ? `<h3 class="text-sm font-semibold text-white/60 mt-4 mb-2">${t('music.disc', { number: g.disc })}</h3>` : ''}
-            ${g.tracks.map(track => trackRow(track, { albumArtists })).join('')}
+            ${g.tracks.map(track => trackRow(track, { albumArtists, inAlbum: true })).join('')}
         </div>`).join('')}
     </div>`;
+}
+
+// Play on an album page, or a click on one of its tracks: every track of the album, in the order the page
+// lists them (disc, then track), goes to the play queue, which starts at the clicked track or the first
+function playAlbumFrom(el) {
+    const rows = [...(el.closest('#album-tracks')?.querySelectorAll('.jf-track-row[data-id]') || [])];
+    const items = rows.map(row => ({ Id: row.dataset.id, Name: row.dataset.title || '', MediaType: 'Audio' }));
+    if (!items.length) return;
+    const start = el.matches('.jf-track-row') ? items.findIndex(item => item.Id === el.dataset.id) : 0;
+    playQueueAt(items, Math.max(start, 0));
 }
 
 // --- Music library tabs ---
@@ -257,5 +267,5 @@ async function renderMusicTab(libId, libName, tab, genreId) {
 
 export {
     trackDuration, trackDiscGroups, trackRow, albumTrackList, MUSIC_TABS, musicTab, rememberMusicTab, musicTabBar,
-    musicTabRequest, renderMusicTab,
+    musicTabRequest, renderMusicTab, playAlbumFrom,
 };

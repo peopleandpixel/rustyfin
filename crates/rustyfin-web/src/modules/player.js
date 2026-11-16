@@ -4,6 +4,7 @@ import { cardImage } from './cards.js';
 import { currentPage } from './router.js';
 import { renderHome } from './home.js';
 import { currentDetailId, renderDetail } from './item.js';
+import { clearQueue, queueNeighbours, playQueueStep } from './queue.js';
 let playerReportInterval = null;
 let playerBars = null;
 
@@ -54,9 +55,10 @@ function askResumeOrStart(title, ticks) {
 }
 
 // Starts an item from a card or a Play button. A video with a resume point asks first whether to resume.
-// selection: the detail page's version and track choice, passed on to playItem.
-async function playWithResumeChoice(itemId, streamType = 'Videos', title = '', selection = null) {
-    if (streamType !== 'Videos') return playItem(itemId, streamType, title, { selection });
+// selection: the detail page's version and track choice, passed on to playItem. opts go on to playItem too
+// (queued: the play queue's first item); cancelling the choice ends that queue.
+async function playWithResumeChoice(itemId, streamType = 'Videos', title = '', selection = null, opts = {}) {
+    if (streamType !== 'Videos') return playItem(itemId, streamType, title, { ...opts, selection });
     // Read the point after the last Stopped report and uncached, so it includes the position just saved
     await pendingStop;
     let item = null;
@@ -66,10 +68,11 @@ async function playWithResumeChoice(itemId, streamType = 'Videos', title = '', s
         console.warn('Could not load item for resume point:', e);
     }
     const ticks = resumePositionTicks(item);
-    if (ticks <= 0) return playItem(itemId, streamType, title, { selection });
+    if (ticks <= 0) return playItem(itemId, streamType, title, { ...opts, selection });
     const choice = await askResumeOrStart(title || item?.Name || '', ticks);
-    if (choice === 'resume') playItem(itemId, streamType, title, { selection });
-    else if (choice === 'start') playItem(itemId, streamType, title, { fromStart: true, selection });
+    if (choice === 'resume') playItem(itemId, streamType, title, { ...opts, selection });
+    else if (choice === 'start') playItem(itemId, streamType, title, { ...opts, fromStart: true, selection });
+    else if (opts.queued) clearQueue();
 }
 
 // Stops the session that is still playing, if any. Returns the promise of its Stopped report.
@@ -288,6 +291,7 @@ async function restartStream(session, seconds) {
 // Seeks to a point on the bar once the drag ends
 function seekVideo(percent) {
     seekDragging = false;
+    hideTrickplay();
     if (!activePlayback) return;
     seekTo(activePlayback, percent / 100 * activePlayback.total());
 }
@@ -298,11 +302,12 @@ function skipTime(deltaSeconds) {
     seekTo(activePlayback, activePlayback.position() + deltaSeconds);
 }
 
-// Shows the elapsed time under the thumb while the bar is being dragged
+// Shows the elapsed time under the thumb, and the trickplay thumbnail over it, while the bar is being dragged
 function previewSeek(percent) {
     if (!activePlayback) return;
     seekDragging = true;
     $('player-cur-time').textContent = formatDurationSeconds(percent / 100 * activePlayback.total());
+    showTrickplay(Number(percent));
 }
 
 // Picks another audio track and restarts the transcode at the current point
@@ -471,13 +476,15 @@ function renderTrackMenus(session) {
 
 // --- Video Player (Cinema Mode) ---
 // carry: the previous episode's track languages (episodeTrackCarry), chosen again here where they exist.
+// queued: the play queue (queue.js) started this item; any other play ends the queue.
 // selection: the detail page's choice, { mediaSourceId, audioIndex, subtitleIndex (-1 is off), startTicks };
 // a field left out keeps the default.
-async function playItem(itemId, streamType = 'Videos', title = '', { fromStart = false, carry = null, selection = null } = {}) {
+async function playItem(itemId, streamType = 'Videos', title = '', { fromStart = false, carry = null, queued = false, selection = null } = {}) {
     const video = $('video-player');
     const modal = $('player-modal');
     if (!video || !modal) return;
     const request = ++playRequest;
+    if (!queued) clearQueue();
 
     // Report a session that is still playing as stopped before starting another
     stopPlayback();
@@ -498,6 +505,8 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
     clearTextSubtitle();
     renderTrackMenus(null);
     resetEpisodeNav();
+    hideSkipSegment();
+    hideTrickplay();
 
     // Show modal immediately while loading
     if (!modal.open) {
@@ -558,6 +567,11 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
         playSessionId: null,
         mediaSourceId: source?.Id || null,
         streams,
+        // The item's chapters (PageUp, PageDown), and its tile sets for the seek bar's thumbnails
+        chapters: item?.Chapters || [],
+        trickplay: null,
+        segments: [],
+        segmentsLoad: null,
         audioIndex,
         subtitleIndex,
         burnedIn: false,
@@ -624,8 +638,12 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
         },
     };
     activePlayback = session;
+    session.trickplay = trickplayInfo(item, session.mediaSourceId);
     renderTrackMenus(session);
+    if (streamType === 'Videos') session.segmentsLoad = loadMediaSegments(session);
     loadEpisodeNav(session, item);
+    updatePipButton(session);
+    updateMediaSession(session, item, $('player-title').textContent);
 
     // Periodic progress reporting
     if (playerReportInterval) clearInterval(playerReportInterval);
@@ -643,11 +661,13 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
         if (activePlayback !== session) return;
         updatePlayerControls(session);
         checkUpNext(session);
+        checkSkipSegment(session);
+        updateMediaPosition(session);
     };
 
-    video.onplay = () => updatePlayIcon(true);
+    video.onplay = () => { updatePlayIcon(true); setMediaPlaybackState('playing'); };
     video.onplaying = () => { session.failed = false; };
-    video.onpause = () => updatePlayIcon(false);
+    video.onpause = () => { updatePlayIcon(false); setMediaPlaybackState('paused'); };
     video.onvolumechange = () => {
         updateVolumeIcon();
         const slider = $('player-vol');
@@ -748,12 +768,18 @@ function playerAutoHide(modal, video, delay = 3000) {
     };
 }
 
-// The dialog closed: stop the session, reset the bars, and leave fullscreen, which the dialog may hold
+// The dialog closed: stop the session and the queue, reset the bars, and leave fullscreen, which the dialog
+// may hold, and picture-in-picture
 function onPlayerClosed() {
     stopPlayback();
+    clearQueue();
     resetEpisodeNav();
+    hideSkipSegment();
+    hideTrickplay();
+    clearMediaSession();
     playerBars?.reset();
     if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+    if (document.pictureInPictureElement) document.exitPictureInPicture().catch(() => {});
 }
 
 // A click on the video plays or pauses; a tap shows or hides the bars
@@ -770,8 +796,9 @@ function closePlayer() {
     }
 }
 
-// --- Next episode: the control bar's previous/next buttons and the next-episode card (episodes only) ---
-// episodeNav holds the playing episode's neighbours once loaded; upNext is the card while it shows
+// --- Next episode: the control bar's previous/next buttons and the next-episode card ---
+// episodeNav holds the playing item's neighbours once loaded: the play queue's (queue.js) when one plays,
+// else an episode's in its series. upNext is the card while it shows.
 let episodeNav = null;
 let upNext = null;
 const UP_NEXT_SECONDS = 10;
@@ -845,26 +872,37 @@ function upNextStart(total, credits) {
     return total >= 60 ? total - UP_NEXT_SECONDS : null;
 }
 
-// Loads the playing episode's neighbours, the user's autoplay switch and its credits; other items get none
+// The item's media segments (intros, credits), loaded once per session
+function loadMediaSegments(session) {
+    return API.get(`/MediaSegments/${session.itemId}`).then(r => r?.Items || []).catch(() => []);
+}
+
+// Loads the playing item's neighbours, the user's autoplay switch and its credits: an episode's in its series,
+// any item's in the play queue. Other items get none.
 async function loadEpisodeNav(session, item) {
-    if (item?.Type !== 'Episode' || !item.SeriesId) return;
+    const queue = queueNeighbours();
+    const episode = item?.Type === 'Episode' && !!item.SeriesId;
+    if (!queue && !episode) return;
+    const video = session.streamType !== 'Audio';
     const [episodes, me, segments] = await Promise.all([
-        API.get(`/Shows/${item.SeriesId}/Episodes`).then(r => r?.Items || []).catch(e => {
+        queue ? null : API.get(`/Shows/${item.SeriesId}/Episodes`).then(r => r?.Items || []).catch(e => {
             console.warn('Could not load the episode list:', e);
             return [];
         }),
         API.getMe().catch(() => null),
-        API.get(`/MediaSegments/${session.itemId}`).then(r => r?.Items || []).catch(() => []),
+        video ? (session.segmentsLoad ||= loadMediaSegments(session)) : [],
     ]);
     if (activePlayback !== session) return;
-    const { prev, next } = adjacentEpisodes(episodes, session.itemId);
+    const { prev, next } = queue || adjacentEpisodes(episodes, session.itemId);
     episodeNav = {
         session,
         prev,
         next,
-        // Jellyfin's UserConfiguration.EnableNextEpisodeAutoPlay, on unless the user turned it off
-        autoPlay: me?.Configuration?.EnableNextEpisodeAutoPlay !== false,
-        credits: creditsStart(segments, item.Chapters, session.runtime),
+        queue: !!queue,
+        // Jellyfin's UserConfiguration.EnableNextEpisodeAutoPlay, on unless the user turned it off. As in
+        // Jellyfin it holds back the next video only: music plays on.
+        autoPlay: !video || me?.Configuration?.EnableNextEpisodeAutoPlay !== false,
+        credits: video ? creditsStart(segments, item?.Chapters, session.runtime) : null,
         dismissed: false,
     };
     updateEpisodeButtons();
@@ -876,20 +914,31 @@ function resetEpisodeNav() {
     updateEpisodeButtons();
 }
 
-// Previous and next show for episodes only, and are disabled at the series' ends
+// Previous and next show for episodes and queues only, and are disabled at their ends. The OS media
+// controls (Media Session) get them too.
 function updateEpisodeButtons() {
-    for (const [id, episode] of [['player-btn-prev-episode', episodeNav?.prev], ['player-btn-next-episode', episodeNav?.next]]) {
+    for (const [id, episode, step] of [['player-btn-prev-episode', episodeNav?.prev, -1], ['player-btn-next-episode', episodeNav?.next, 1]]) {
+        setMediaSessionHandler(step < 0 ? 'previoustrack' : 'nexttrack', episode ? () => playAdjacentEpisode(step) : null);
         const button = $(id);
         if (!button) continue;
         button.hidden = !episodeNav;
         button.disabled = !episode;
+        const label = t(episodeNav?.queue ? (step < 0 ? 'player.previous_item' : 'player.next_item') : (step < 0 ? 'player.previous_episode' : 'player.next_episode'));
+        button.title = label;
+        button.setAttribute?.('aria-label', label);
     }
 }
 
-// Plays a neighbour from its start with this episode's track languages; finished reports this one as watched
+// Plays a neighbour from its start with this item's track languages; finished reports this one as watched.
+// In a queue the neighbour is the queue's previous or next item.
 function playEpisode(session, episode, { finished = false } = {}) {
-    const carry = episodeTrackCarry(session);
+    const carry = session.streamType !== 'Audio' ? episodeTrackCarry(session) : null;
     if (finished) session.finished = true;
+    const nav = episodeNav;
+    if (nav?.queue && nav.session === session) {
+        playQueueStep(episode === nav.prev ? -1 : 1, carry);
+        return;
+    }
     playItem(episode.Id, 'Videos', episode.Name || '', { fromStart: true, carry });
 }
 
@@ -899,10 +948,11 @@ function playAdjacentEpisode(step) {
     if (episode) playEpisode(nav.session, episode);
 }
 
-// Shows the card from its start time on; seeking back before that hides it again
+// Shows the card from its start time on; seeking back before that hides it again. Music in a queue plays on
+// without a card.
 function checkUpNext(session) {
     const nav = episodeNav;
-    if (!nav || nav.session !== session || !nav.next || nav.dismissed) return;
+    if (!nav || nav.session !== session || !nav.next || nav.dismissed || session.streamType === 'Audio') return;
     const start = upNextStart(session.total(), nav.credits);
     if (start === null) return;
     if (session.position() >= start) {
@@ -912,10 +962,12 @@ function checkUpNext(session) {
     }
 }
 
-// An episode that ended shows the card unless it was cancelled
+// An episode that ended shows the card unless it was cancelled; a song in a queue goes straight on to the next
 function upNextAtEnd(session) {
     const nav = episodeNav;
-    if (nav && nav.session === session && nav.next && !nav.dismissed && !upNext) showUpNext(nav);
+    if (!nav || nav.session !== session || !nav.next || nav.dismissed || upNext) return;
+    if (session.streamType === 'Audio') playEpisode(session, nav.next, { finished: true });
+    else showUpNext(nav);
 }
 
 function episodeNumberLabel(e) {
@@ -934,6 +986,7 @@ function showUpNext(nav) {
     img.hidden = !picture;
     if (picture) img.src = API.imageUrl(picture.id, picture.type, { maxWidth: 320, tag: picture.tag });
     else img.removeAttribute('src');
+    $('player-up-next-heading').textContent = t(episode.Type === 'Episode' ? 'player.next_episode' : 'player.up_next');
     $('player-up-next-number').textContent = episodeNumberLabel(episode);
     $('player-up-next-title').textContent = episode.Name || '';
     upNext = { nav, remaining: UP_NEXT_SECONDS, timer: nav.autoPlay ? setInterval(upNextTick, 1000) : null };
@@ -941,7 +994,8 @@ function showUpNext(nav) {
     renderUpNextCountdown();
     card.hidden = false;
     // Screen readers hear the card once; the ticking countdown is hidden from them
-    $('player-up-next-status').textContent = t(nav.autoPlay ? 'player.up_next_announce' : 'player.up_next_announce_manual',
+    const announce = episode.Type === 'Episode' ? 'player.up_next_announce' : 'player.up_next_item_announce';
+    $('player-up-next-status').textContent = t(nav.autoPlay ? announce : `${announce}_manual`,
         { seconds: UP_NEXT_SECONDS, title: episode.Name || '' });
 }
 
@@ -1030,9 +1084,328 @@ function updateVolumeIcon() {
     }
 }
 
+// The speeds Jellyfin Web offers; < and > step through them
+const PLAYBACK_RATES = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.5, 3, 3.5, 4];
+
+// The default rate too, so the speed stays when the next item loads and the menu stays true
 function setPlaybackRate(rate) {
     const v = $('video-player');
-    if (v) v.playbackRate = parseFloat(rate);
+    if (!v) return;
+    v.playbackRate = v.defaultPlaybackRate = parseFloat(rate);
+    const menu = $('player-speed');
+    if (menu) menu.value = String(v.playbackRate);
+}
+
+// One speed up (1) or down (-1), as Jellyfin Web steps: from a speed it doesn't list, up goes to the slowest
+function stepPlaybackRate(step) {
+    const v = $('video-player');
+    if (!v) return;
+    const index = PLAYBACK_RATES.indexOf(v.playbackRate);
+    setPlaybackRate(PLAYBACK_RATES[Math.min(Math.max(index + step, 0), PLAYBACK_RATES.length - 1)]);
+}
+
+// Volume up or down by delta on Jellyfin's 0-100 scale, which is the cube root of the element's volume
+function stepVolume(delta) {
+    const v = $('video-player');
+    if (!v) return;
+    const level = Math.min(Math.round(Math.cbrt(v.volume) * 100), 100);
+    setVolume(Math.pow(Math.min(Math.max(level + delta, 0), 100) / 100, 3));
+}
+
+// Seeks to a percentage of the item (the 0-9 keys, Home and End)
+function seekPercent(percent) {
+    if (activePlayback) seekTo(activePlayback, percent / 100 * activePlayback.total());
+}
+
+// Steps frames forward or back while paused, at the video's frame rate (24 when unknown), as Jellyfin Web does
+function seekFrames(frames) {
+    const session = activePlayback;
+    const video = $('video-player');
+    if (!session || !video?.paused) return;
+    const stream = session.streams.find(s => isStreamType(s, 'video'));
+    if (!stream) return;
+    const fps = stream.ReferenceFrameRate || stream.RealFrameRate || stream.AverageFrameRate || 24;
+    seekTo(session, session.position() + frames / fps);
+}
+
+// Chapter starts in seconds, in order
+function chapterStarts(session) {
+    return (session.chapters || []).map(c => (c.StartPositionTicks ?? c.StartTicks ?? 0) / 1e7).sort((a, b) => a - b);
+}
+
+// PageUp: the next chapter, else the next item
+function nextChapter() {
+    const session = activePlayback;
+    if (!session) return;
+    const position = session.position();
+    const next = chapterStarts(session).find(start => start > position);
+    if (next !== undefined) seekTo(session, next);
+    else playAdjacentEpisode(1);
+}
+
+// PageDown: the chapter that started over 10 s ago, else the previous item; without one, the first chapter
+function previousChapter() {
+    const session = activePlayback;
+    if (!session) return;
+    let position = session.position() - 10;
+    if (!episodeNav?.prev) position = Math.max(position, 0);
+    const starts = chapterStarts(session).filter(start => start <= position);
+    if (starts.length) seekTo(session, starts[starts.length - 1]);
+    else playAdjacentEpisode(-1);
+}
+
+// The action of a player key, as Jellyfin Web's video player maps them, or null. Shift picks the other action
+// of a key (< and >, previous and next item) and turns the rest off.
+function playerKeyAction(e) {
+    const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+    // The digit keys by position, so they seek on layouts that need Shift for digits (AZERTY) too; with
+    // Shift they are left alone, as AZERTY types the digits there
+    const digit = /^(?:Digit|Numpad)(\d)$/.exec(e.code || '');
+    if (digit) return e.shiftKey ? null : () => seekPercent(Number(digit[1]) * 10);
+    // > and < from their own key (or Shift with . and , on US layouts) change the speed; . and , step frames
+    if (e.key === '>' || (e.shiftKey && e.code === 'Period')) return () => stepPlaybackRate(1);
+    if (e.key === '<' || (e.shiftKey && e.code === 'Comma')) return () => stepPlaybackRate(-1);
+    if (e.key === '.') return () => seekFrames(1);
+    if (e.key === ',') return () => seekFrames(-1);
+    if (e.shiftKey) {
+        if (key === 'n') return () => playAdjacentEpisode(1);
+        if (key === 'p') return () => playAdjacentEpisode(-1);
+        return null;
+    }
+    switch (key) {
+    case 'k': return togglePlayPause;
+    case 'ArrowUp': return () => stepVolume(2);
+    case 'ArrowDown': return () => stepVolume(-2);
+    case 'l': case 'ArrowRight': return () => skipTime(30);
+    case 'j': case 'ArrowLeft': return () => skipTime(-10);
+    case 'f': return toggleFullscreen;
+    case 'm': return toggleMute;
+    case 'Home': return () => seekPercent(0);
+    case 'End': return () => seekPercent(100);
+    case 'PageUp': return nextChapter;
+    case 'PageDown': return previousChapter;
+    default: return null;
+    }
+}
+
+// --- Picture-in-picture: the standard API, or Safari's presentation mode ---
+function pipSupported(video) {
+    return !!(document.pictureInPictureEnabled && video?.requestPictureInPicture)
+        || typeof video?.webkitSetPresentationMode === 'function';
+}
+
+// The button shows for videos where the browser can float them
+function updatePipButton(session) {
+    const button = $('player-btn-pip');
+    if (button) button.hidden = !session || session.streamType === 'Audio' || !pipSupported($('video-player'));
+}
+
+function togglePictureInPicture() {
+    const video = $('video-player');
+    if (!video) return;
+    if (document.pictureInPictureElement) {
+        document.exitPictureInPicture().catch(() => {});
+    } else if (document.pictureInPictureEnabled && video.requestPictureInPicture) {
+        video.requestPictureInPicture().catch(e => console.warn('Picture-in-picture failed:', e));
+    } else if (typeof video.webkitSetPresentationMode === 'function') {
+        video.webkitSetPresentationMode(video.webkitPresentationMode === 'picture-in-picture' ? 'inline' : 'picture-in-picture');
+    }
+}
+
+// --- Media Session: the OS media keys, lock screen and notification show the item and drive the player ---
+const hasMediaSession = () => typeof navigator !== 'undefined' && 'mediaSession' in navigator;
+// The artwork sizes Jellyfin Web offers, largest first (Firefox on Linux takes the first)
+const ARTWORK_SIZES = [512, 384, 256, 192, 128, 96];
+
+// Title, artist, album and artwork as Jellyfin Web shows them: an episode under its series, a song under its
+// artists and album. The artwork is the item's picture, else its album's or series'.
+function mediaSessionMetadata(item, title) {
+    const artist = item?.Type === 'Episode'
+        ? [item.SeriesName, episodeNumberLabel(item)].filter(Boolean).join(' · ')
+        : (item?.Artists?.length ? item.Artists.join(', ') : item?.AlbumArtist || '');
+    let picture = null;
+    if (item?.ImageTags?.Primary) picture = { id: item.Id, tag: item.ImageTags.Primary };
+    else if (item?.AlbumId && item.AlbumPrimaryImageTag) picture = { id: item.AlbumId, tag: item.AlbumPrimaryImageTag };
+    else if (item?.SeriesId && item.SeriesPrimaryImageTag) picture = { id: item.SeriesId, tag: item.SeriesPrimaryImageTag };
+    const artwork = picture
+        ? ARTWORK_SIZES.map(size => ({ src: API.imageUrl(picture.id, 'Primary', { maxHeight: size, tag: picture.tag }), sizes: `${size}x${size}` }))
+        : [];
+    return { title: item?.Name || title || '', artist, album: item?.Album || '', artwork };
+}
+
+function updateMediaSession(session, item, title) {
+    if (!hasMediaSession()) return;
+    bindMediaSession();
+    navigator.mediaSession.metadata = new MediaMetadata(mediaSessionMetadata(item, title));
+    navigator.mediaSession.playbackState = 'paused';
+}
+
+function setMediaPlaybackState(state) {
+    if (hasMediaSession()) navigator.mediaSession.playbackState = state;
+}
+
+// Where the playback is, for the lock screen's progress bar
+function updateMediaPosition(session) {
+    if (!hasMediaSession() || !navigator.mediaSession.setPositionState) return;
+    const duration = session.total();
+    if (!(duration > 0)) return;
+    try {
+        navigator.mediaSession.setPositionState({
+            duration,
+            position: Math.min(Math.max(session.position(), 0), duration),
+            playbackRate: $('video-player').playbackRate || 1,
+        });
+    } catch {
+        // A browser that rejects the state keeps the last one
+    }
+}
+
+// The player closed: no item, and no actions left for the OS to offer
+function clearMediaSession() {
+    if (!hasMediaSession()) return;
+    navigator.mediaSession.metadata = null;
+    navigator.mediaSession.playbackState = 'none';
+    for (const action of MEDIA_SESSION_ACTIONS) setMediaSessionHandler(action, null);
+}
+
+// A null handler removes the action, so the OS hides its button; browsers without an action throw
+function setMediaSessionHandler(action, handler) {
+    if (!hasMediaSession()) return;
+    try {
+        navigator.mediaSession.setActionHandler(action, handler);
+    } catch {
+        // Not supported here
+    }
+}
+
+// The actions Jellyfin Web binds, set for each item and cleared on close; previous and next follow the item's
+// neighbours (updateEpisodeButtons)
+const MEDIA_SESSION_ACTIONS = ['play', 'pause', 'stop', 'seekbackward', 'seekforward', 'seekto', 'previoustrack', 'nexttrack'];
+function bindMediaSession() {
+    const video = () => $('video-player');
+    setMediaSessionHandler('play', () => video()?.play());
+    setMediaSessionHandler('pause', () => video()?.pause());
+    setMediaSessionHandler('stop', closePlayer);
+    setMediaSessionHandler('seekbackward', d => skipTime(-(d?.seekOffset || 10)));
+    setMediaSessionHandler('seekforward', d => skipTime(d?.seekOffset || 30));
+    setMediaSessionHandler('seekto', d => { if (activePlayback && Number.isFinite(d?.seekTime)) seekTo(activePlayback, d.seekTime); });
+}
+
+// --- Skip intro and outro: Jellyfin Web asks to skip each media segment of these types ---
+const SKIP_SEGMENT_TYPES = ['Intro', 'Outro'];
+// The button shows for 8 s from the segment's start, and while the bars show
+const SKIP_PROMPT_MS = 8000;
+// skipPrompt: the segment the button offers to skip, while it shows
+let skipPrompt = null;
+
+const segmentStart = s => (s.StartTicks ?? s.SegmentStartTicks ?? 0) / 1e7;
+const segmentEnd = s => (s.EndTicks ?? s.SegmentEndTicks ?? 0) / 1e7;
+
+// The segment to offer at seconds: an intro or outro of 3 s or more. An outro that runs to the end of an item
+// with a next one is left to the next-episode card, as in Jellyfin.
+function skippableSegment(segments, seconds, total, hasNext) {
+    return (segments || []).find(s => SKIP_SEGMENT_TYPES.includes(s.Type)
+        && segmentEnd(s) - segmentStart(s) >= 3
+        && seconds >= segmentStart(s) && seconds < segmentEnd(s)
+        && !(s.Type === 'Outro' && hasNext && total > 0 && segmentEnd(s) >= total - 1)) || null;
+}
+
+async function checkSkipSegment(session) {
+    if (session.streamType === 'Audio' || !session.segmentsLoad) return;
+    const segments = await session.segmentsLoad;
+    if (activePlayback !== session) return;
+    session.segments = segments;
+    const hasNext = !!(episodeNav?.session === session && episodeNav.next);
+    const segment = skippableSegment(segments, session.position(), session.total(), hasNext);
+    if (segment === skipPrompt?.segment) return;
+    hideSkipSegment();
+    if (segment) showSkipSegment(segment);
+}
+
+function showSkipSegment(segment) {
+    const button = $('player-skip-segment');
+    if (!button) return;
+    button.textContent = t('player.skip_segment', { type: t(`player.segment_${segment.Type.toLowerCase()}`) });
+    button.classList.remove('jf-skip-expired');
+    button.hidden = false;
+    skipPrompt = { segment, timer: setTimeout(() => button.classList.add('jf-skip-expired'), SKIP_PROMPT_MS) };
+}
+
+function hideSkipSegment() {
+    if (skipPrompt) clearTimeout(skipPrompt.timer);
+    skipPrompt = null;
+    const button = $('player-skip-segment');
+    if (button) button.hidden = true;
+}
+
+// Seeks to the segment's end, unless less than a second of it is left
+function skipSegment() {
+    const session = activePlayback;
+    const segment = skipPrompt?.segment;
+    hideSkipSegment();
+    if (session && segment && session.position() < segmentEnd(segment) - 1) seekTo(session, segmentEnd(segment));
+}
+
+// --- Trickplay: the thumbnail above the seek bar while it is dragged or hovered ---
+// The item's tile set for this source: the widest up to a fifth of the screen, else the narrowest, as Jellyfin Web picks
+function trickplayInfo(item, mediaSourceId) {
+    const bySource = item?.Trickplay;
+    if (!bySource) return null;
+    const sets = Object.values(bySource[mediaSourceId] || bySource[item.Id] || Object.values(bySource)[0] || {});
+    if (!sets.length) return null;
+    const screenWidth = (globalThis.screen?.width || 1920) * (globalThis.devicePixelRatio || 1);
+    const fits = sets.filter(s => s.Width <= screenWidth * 0.2).sort((a, b) => b.Width - a.Width);
+    return fits[0] || [...sets].sort((a, b) => a.Width - b.Width)[0];
+}
+
+// The tile image and the thumbnail's place in it at seconds
+function trickplayThumb(info, itemId, mediaSourceId, seconds) {
+    if (!info?.Interval || !info.ThumbnailCount) return null;
+    const index = Math.min(Math.max(Math.floor(seconds * 1000 / info.Interval), 0), info.ThumbnailCount - 1);
+    const perTile = Math.max(info.TileWidth * info.TileHeight, 1);
+    const inTile = index % perTile;
+    const q = new URLSearchParams();
+    if (mediaSourceId) q.set('MediaSourceId', mediaSourceId);
+    if (API.token) q.set('api_key', API.token);
+    return {
+        url: `${API.base}/Videos/${itemId}/Trickplay/${info.Width}/${Math.floor(index / perTile)}.jpg?${q}`,
+        x: (inTile % info.TileWidth) * info.Width,
+        y: Math.floor(inTile / info.TileWidth) * info.Height,
+        width: info.Width,
+        height: info.Height,
+    };
+}
+
+// Shows the thumbnail and time over percent of the bar
+function showTrickplay(percent) {
+    const session = activePlayback;
+    const bubble = $('player-trickplay');
+    if (!session || !bubble) return;
+    const seconds = percent / 100 * session.total();
+    const thumb = trickplayThumb(session.trickplay, session.itemId, session.mediaSourceId, seconds);
+    const img = $('player-trickplay-img');
+    img.hidden = !thumb;
+    if (thumb) {
+        img.style.width = `${thumb.width}px`;
+        img.style.height = `${thumb.height}px`;
+        img.style.backgroundImage = `url("${thumb.url}")`;
+        img.style.backgroundPosition = `-${thumb.x}px -${thumb.y}px`;
+    }
+    $('player-trickplay-time').textContent = formatDurationSeconds(seconds);
+    bubble.style.left = `${Math.min(Math.max(percent, 0), 100)}%`;
+    bubble.hidden = false;
+}
+
+function hideTrickplay() {
+    const bubble = $('player-trickplay');
+    if (bubble) bubble.hidden = true;
+}
+
+// A mouse over the seek bar, or a finger on it, previews that point
+function hoverSeek(e) {
+    const rect = e.currentTarget?.getBoundingClientRect();
+    if (!activePlayback || !rect?.width) return;
+    showTrickplay(Math.min(Math.max((e.clientX - rect.left) / rect.width, 0), 1) * 100);
 }
 
 function toggleFullscreen() {
@@ -1053,19 +1426,24 @@ function toggleFullscreen() {
     }
 }
 
-// Global Keyboard Shortcuts
+// Global Keyboard Shortcuts: Jellyfin Web's video player keys (playerKeyAction). Keys with Ctrl, Alt or Meta
+// are left to the browser.
 document.addEventListener('keydown', e => {
     if ($('player-modal')?.open) {
-        // Space on a button, menu or text field focused by keyboard works that control. After a click or
-        // tap, and on the seek and volume sliders, Space still toggles play.
+        if (e.key === 'Escape') { closePlayer(); return; }
+        if (e.ctrlKey || e.altKey || e.metaKey) return;
+        // A button, menu or text field focused by keyboard keeps its keys (Space, arrows, letters, digits).
+        // After a click or tap, and on the seek and volume sliders, the player's keys work.
         const onControl = e.target instanceof Element && e.target.matches(':focus-visible')
             && e.target.closest('button, select, textarea, a[href], input:not([type="range"])');
-        if (e.code === 'Space' && !onControl) { e.preventDefault(); togglePlayPause(); }
-        if (e.code === 'ArrowLeft') { e.preventDefault(); skipTime(-10); }
-        if (e.code === 'ArrowRight') { e.preventDefault(); skipTime(30); }
-        if (e.key === 'f' || e.key === 'F') { e.preventDefault(); toggleFullscreen(); }
-        if (e.key === 'm' || e.key === 'M') { e.preventDefault(); toggleMute(); }
-        if (e.key === 'Escape') { closePlayer(); }
+        if (onControl) return;
+        if (e.code === 'Space') {
+            e.preventDefault();
+            togglePlayPause();
+            return;
+        }
+        const action = playerKeyAction(e);
+        if (action) { e.preventDefault(); action(); }
     }
 });
 
@@ -1073,6 +1451,7 @@ export {
     resumePositionTicks, playWithResumeChoice, stopPlayback, seekVideo, skipTime, previewSeek, changeAudioTrack,
     changeSubtitleTrack, playItem, playerAutoHide, onPlayerClosed, playerAreaClick, closePlayer, playAdjacentEpisode,
     playUpNextNow, cancelUpNext, togglePlayPause, setVolume, toggleMute, setPlaybackRate, toggleFullscreen,
+    togglePictureInPicture, skipSegment, hoverSeek, hideTrickplay,
 };
 
 // Shared state that inline handlers or other modules assign: reached through window

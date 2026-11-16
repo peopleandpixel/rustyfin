@@ -2357,6 +2357,9 @@ async fn get_items(
                     &claims,
                     start_index as usize,
                     limit,
+                    query
+                        .sort_by()
+                        .is_some_and(rustyfin_db::repo_media::sorts_randomly),
                 );
                 return entries.await.map(|r| Json(r).into_response());
             }

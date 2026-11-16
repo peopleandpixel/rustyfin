@@ -3248,6 +3248,7 @@ const B124_WEB_MODULES: &[&str] = &[
     "music.js",
     "player.js",
     "plugins.js",
+    "queue.js",
     "router.js",
     "search.js",
     "settings.js",
@@ -23317,6 +23318,24 @@ fn b171_next_episode() {
     b124_node_test("b171_next_episode.mjs");
 }
 
+// The web player's play queue (Play all, Shuffle, previous/next)
+#[test]
+fn r3player_queue() {
+    b124_node_test("r3player_queue.mjs");
+}
+
+// The web player's trickplay thumbnails, skip intro, keyboard shortcuts, Media Session and picture-in-picture
+#[test]
+fn r3player_controls() {
+    b124_node_test("r3player_controls.mjs");
+}
+
+// The album page's Play queues every track in disc and track order; a track plays the album from it
+#[test]
+fn r3player_album() {
+    b124_node_test("r3player_album.mjs");
+}
+
 // The web client's item page: credits, ratings, media info, track pickers, chapters, links, "mark all
 // played" and delete (tests/web/r3item_detail.mjs), and the pickers' choice in the player
 // (tests/web/r3item_play.mjs)
@@ -27709,6 +27728,40 @@ async fn r2collections_a_collection_made_with_query_parameters_works_end_to_end(
         send_authed(app, "GET", &item_uri, admin, None).await.0,
         StatusCode::NOT_FOUND
     );
+}
+
+// A web client's Shuffle on a playlist sends ParentId=<playlist>&SortBy=Random, as Jellyfin Web
+// does: the entries come back shuffled, each once, and without SortBy in playlist order.
+#[tokio::test]
+async fn r3player_playlist_parent_honours_random_sort() {
+    let w = b38_world().await;
+    let (app, alice, pl, m) = (&w.app, &w.alice.0, &w.playlist, &w.movies);
+    let add = format!("/Playlists/{pl}/Items?Ids={}", m[2]);
+    assert_eq!(
+        send_authed(app, "POST", &add, alice, None).await.0,
+        StatusCode::NO_CONTENT
+    );
+    let ordered = vec![m[0].clone(), m[1].clone(), m[2].clone()];
+    let (ids, _) = r2collections_listed(app, alice, &format!("ParentId={pl}")).await;
+    assert_eq!(ids, ordered);
+
+    let random = format!("ParentId={pl}&SortBy=Random");
+    let mut orders = std::collections::HashSet::new();
+    for _ in 0..30 {
+        let (ids, entries) = r2collections_listed(app, alice, &random).await;
+        assert!(
+            entries.iter().all(Option::is_some),
+            "still playlist entries"
+        );
+        let mut sorted = ids.clone();
+        sorted.sort();
+        let mut want = ordered.clone();
+        want.sort();
+        assert_eq!(sorted, want, "every entry, once");
+        orders.insert(ids);
+    }
+    // 30 shuffles of three entries all in playlist order would be chance of 6^-30
+    assert!(orders.len() > 1, "the order changes: {orders:?}");
 }
 
 #[tokio::test]

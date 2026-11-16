@@ -681,6 +681,12 @@ async function renderLibrary(route) {
                         ${t('library.clear_filters')}
                     </button>
 
+                    <!-- Plays the library's items in a random order -->
+                    <button class="jf-btn-ghost inline-flex items-center gap-1.5 !py-1.5 !px-3 text-xs" data-action="shuffle" data-id="${escapeHtml(libId)}">
+                        ${icon('Shuffle', { size: 14 })}
+                        ${t('player.shuffle')}
+                    </button>
+
                     <!-- Scan trigger -->
                     <button class="jf-btn-ghost inline-flex items-center gap-1.5 !py-1.5 !px-3 text-xs" data-action="scan-library-page" data-id="${escapeHtml(libId)}" data-name="${escapeHtml(libName)}">
                         ${icon('RefreshCw', { size: 14 })}

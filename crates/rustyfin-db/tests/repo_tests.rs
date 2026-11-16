@@ -612,6 +612,87 @@ async fn test_get_items_filtered_no_overflow() {
     assert_eq!(items[0].id, item_id);
 }
 
+// SortBy=Random shuffles every match, as Jellyfin's does: a page as large as the list holds all of
+// it. (It used to return a window from a random offset, so a web client's Shuffle lost most of the
+// items.) Each request shuffles again, as in Jellyfin, so StartIndex and Limit only bound a page's
+// size: two pages may share items.
+#[tokio::test]
+async fn r3player_random_sort_returns_every_match() {
+    let temp_db = test_pool().await;
+    let pool = temp_db.pool.clone();
+    let lib = make_library("Movies", LibraryContentType::Movies);
+    rustyfin_db::repo_library::create_library(&pool, &lib)
+        .await
+        .unwrap();
+    let mut ids = Vec::new();
+    for i in 0..12 {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO media_items (id, library_id, name, sort_name, media_type, path) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(id.to_string())
+        .bind(lib.id.to_string())
+        .bind(format!("Movie {i:02}"))
+        .bind(format!("movie {i:02}"))
+        .bind("Movie")
+        .bind(format!("/media/movies/{i}.mkv"))
+        .execute(&pool)
+        .await
+        .unwrap();
+        ids.push(id);
+    }
+    ids.sort();
+    let page = |start: i64, limit: i64| {
+        let pool = pool.clone();
+        async move {
+            rustyfin_db::repo_media::get_items_filtered(
+                &pool,
+                None,
+                Some(lib.id),
+                Some(&["Movie".to_string()]),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("Random"),
+                None,
+                start,
+                limit,
+                true,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+        }
+    };
+    for _ in 0..5 {
+        let (items, total) = page(0, 300).await;
+        assert_eq!(total, 12);
+        let mut got: Vec<Uuid> = items.iter().map(|i| i.id).collect();
+        got.sort();
+        assert_eq!(got, ids, "every movie, once");
+    }
+    let (first, _) = page(0, 5).await;
+    let (last, _) = page(10, 5).await;
+    assert_eq!(first.len(), 5);
+    assert_eq!(last.len(), 2, "StartIndex and Limit bound the page");
+}
+
 #[tokio::test]
 async fn test_get_media_sources_batch_and_ordering() {
     let temp_db = test_pool().await;

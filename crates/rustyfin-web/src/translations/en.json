@@ -282,7 +282,19 @@
         "episode_number": "S{{season}}:E{{episode}}",
         "up_next_countdown": "Starts in {{count}} s",
         "up_next_announce": "Next episode in {{seconds}} seconds: {{title}}",
-        "up_next_announce_manual": "Next episode: {{title}}"
+        "up_next_announce_manual": "Next episode: {{title}}",
+        "up_next": "Up next",
+        "up_next_item_announce": "Up next in {{seconds}} seconds: {{title}}",
+        "up_next_item_announce_manual": "Up next: {{title}}",
+        "previous_item": "Previous",
+        "next_item": "Next",
+        "shuffle": "Shuffle",
+        "queue_empty": "Nothing to play here",
+        "skip_segment": "Skip {{type}}",
+        "segment_intro": "Intro",
+        "segment_outro": "Outro",
+        "speed_tooltip": "Playback speed (< >)",
+        "picture_in_picture": "Picture-in-picture"
     },
     "admin": {
         "new_user_title": "New User",
