@@ -15,6 +15,9 @@ use crate::state::AppState;
 /// Jellyfin's `MaxDocumentSize`: a larger upload gets 413.
 const MAX_DOCUMENT_BYTES: usize = 1_000_000;
 
+/// How many uploaded client logs are kept; each upload deletes the oldest beyond this.
+const MAX_KEPT_UPLOADS: usize = 50;
+
 /// The longest client or version name kept in a file name.
 const MAX_NAME_CHARS: usize = 64;
 
@@ -59,8 +62,40 @@ async fn log_document(
     tokio::fs::write(log_dir.join(&file_name), &body)
         .await
         .map_err(|e| ApiError::Internal(format!("the client log could not be written: {e}")))?;
+    prune_uploads(&log_dir).await;
 
     Ok(Json(json!({ "FileName": file_name })))
+}
+
+/// Deletes the oldest uploaded client logs (`upload_*.log`, by modification time, then name) so
+/// that `MAX_KEPT_UPLOADS` remain. A failure only leaves more files.
+async fn prune_uploads(log_dir: &std::path::Path) {
+    let Ok(mut entries) = tokio::fs::read_dir(log_dir).await else {
+        return;
+    };
+    let mut uploads = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !(name.starts_with("upload_") && name.ends_with(".log")) {
+            continue;
+        }
+        if let Ok(meta) = entry.metadata().await
+            && meta.is_file()
+        {
+            let modified = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            uploads.push((modified, name, entry.path()));
+        }
+    }
+    if uploads.len() <= MAX_KEPT_UPLOADS {
+        return;
+    }
+    uploads.sort();
+    let excess = uploads.len() - MAX_KEPT_UPLOADS;
+    for (_, name, path) in uploads.into_iter().take(excess) {
+        if let Err(e) = tokio::fs::remove_file(&path).await {
+            tracing::warn!(file = %name, error = %e, "an old client log could not be deleted");
+        }
+    }
 }
 
 /// Keeps only ASCII alphanumerics, `.` and `-` and turns every other character into `_`. A `..`
