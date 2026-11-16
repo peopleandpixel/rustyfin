@@ -44,7 +44,10 @@ pub fn login_routes() -> Router<AppState> {
 
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route("/Users", get(get_users))
+        // Jellyfin 10.9+ forms take the user from `userId`, or act for the caller.
+        .route("/Users", get(get_users).post(update_query_user))
+        .route("/Users/Password", post(change_query_password))
+        .route("/Users/Configuration", post(update_query_configuration))
         .route("/Users/Me", get(get_me))
         .route("/Users/{userId}", get(get_user))
         // Jellyfin's UpdateUser is a POST of the whole UserDto; only its Name is read.
@@ -971,6 +974,53 @@ struct UserImageQuery {
     user_id: Option<Uuid>,
     /// The picture's tag; a URL with one names that version, so it may be cached for long
     tag: Option<String>,
+}
+
+/// The `userId` of Jellyfin's 10.9+ user settings forms; without it they act for the caller.
+#[derive(Debug, Default, serde::Deserialize)]
+struct UserIdQuery {
+    #[serde(rename = "userId", alias = "UserId")]
+    user_id: Option<Uuid>,
+}
+
+impl UserIdQuery {
+    fn user(&self, claims: &Claims) -> Uuid {
+        self.user_id.unwrap_or(claims.sub)
+    }
+}
+
+/// POST /Users?userId=: `POST /Users/{userId}` for the query's user.
+async fn update_query_user(
+    state: State<AppState>,
+    Query(q): Query<UserIdQuery>,
+    Extension(claims): Extension<Claims>,
+    req: Json<UpdateUserNameRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let id = q.user(&claims);
+    update_user_name(state, Path(id), Extension(claims), req).await
+}
+
+/// POST /Users/Password?userId=: `POST /Users/{userId}/Password` for the query's user.
+async fn change_query_password(
+    state: State<AppState>,
+    Query(q): Query<UserIdQuery>,
+    Extension(claims): Extension<Claims>,
+    token: Option<Extension<rustyfin_auth::RequestToken>>,
+    req: Json<ChangePasswordRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let id = q.user(&claims);
+    change_password(state, Extension(claims), Path(id), token, req).await
+}
+
+/// POST /Users/Configuration?userId=: `POST /Users/{userId}/Configuration` for the query's user.
+async fn update_query_configuration(
+    state: State<AppState>,
+    Query(q): Query<UserIdQuery>,
+    Extension(claims): Extension<Claims>,
+    config: Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let id = q.user(&claims);
+    update_configuration(state, Extension(claims), Path(id), config).await
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
