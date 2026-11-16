@@ -346,7 +346,7 @@ test('after the audio carries over, the default subtitle is picked again for its
     // A subtitle the server remembered for this episode stays, off included
     assert.deepEqual(plain(fns.carriedTracks(next, carry, 1, 5, true)), { audioIndex: 2, subtitleIndex: 5 });
     assert.deepEqual(plain(fns.carriedTracks(next, carry, 1, -1, true)), { audioIndex: 2, subtitleIndex: -1 });
-    assert.match(slice('async function playItem('), /carriedTracks\(streams, carry, audioIndex, subtitleIndex, serverSubtitle\)/);
+    assert.match(slice('async function playItem('), /carriedTracks\(streams, carry, defaults\.audioIndex, defaults\.subtitleIndex, defaults\.subtitleFromServer, prefs\)/);
     // Audio that doesn't change leaves the episode's own subtitle choice alone
     assert.deepEqual(plain(fns.carriedTracks(next, { ...carry, audioLanguage: 'eng' }, 1, -1)), { audioIndex: 1, subtitleIndex: -1 });
 });
@@ -444,7 +444,7 @@ test('Space on a button focused by keyboard works the button; after a click, or 
 
 test('the player wires the block in: reports, stop, ended and fullscreen', () => {
     const play = slice('async function playItem(');
-    assert.match(play, /carriedTracks\(streams, carry, audioIndex, subtitleIndex, serverSubtitle\)/);
+    assert.match(play, /carriedTracks\(streams, carry, defaults\.audioIndex, defaults\.subtitleIndex, defaults\.subtitleFromServer, prefs\)/);
     assert.match(play, /resetEpisodeNav\(\)/);
     assert.match(play, /loadEpisodeNav\(session, item\)/);
     assert.match(play, /checkUpNext\(session\)/);

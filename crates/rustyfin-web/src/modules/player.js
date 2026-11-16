@@ -5,6 +5,7 @@ import { currentPage } from './router.js';
 import { renderHome } from './home.js';
 import { currentDetailId, renderDetail } from './item.js';
 import { clearQueue, queueNeighbours, playQueueStep } from './queue.js';
+import { trackPrefs, defaultTracks, defaultSubtitleIndex as preferredSubtitleIndex } from './playerprefs.js';
 let playerReportInterval = null;
 let playerBars = null;
 
@@ -446,8 +447,10 @@ function subtitleTrackLabel(s) {
     return trackTitle(s.Title, tags) || t('player.track_undefined');
 }
 
-// Jellyfin's Default mode: external first, then forced in the audio's language, forced, default
-function defaultSubtitleIndex(subs, chosenAudio) {
+// Jellyfin's Default mode: external first, then forced in the audio's language, forced, default. With the user's
+// preferences, their SubtitleMode and language decide (playerprefs.js).
+function defaultSubtitleIndex(subs, chosenAudio, prefs = null) {
+    if (prefs) return preferredSubtitleIndex(subs, chosenAudio, prefs);
     const audioLang = (chosenAudio?.Language || '').toLowerCase();
     let best = null;
     let bestKey = 0;
@@ -516,8 +519,9 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
 
     // Read the resume point only after the Stopped report, so it includes the position just saved
     await pendingStop;
-    // The item gives the resume point and PlaybackInfo the tracks; a failed PlaybackInfo leaves no menus
-    const [item, info] = await Promise.all([
+    // The item gives the resume point, PlaybackInfo the tracks and the user's configuration the track preferences;
+    // a failed PlaybackInfo leaves no menus
+    const [item, info, me] = await Promise.all([
         API.get('/Items/' + itemId).catch(e => {
             console.warn('Could not load item for resume point:', e);
             return null;
@@ -528,29 +532,26 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
                 return null;
             })
             : null,
+        streamType === 'Videos' ? API.getMe().catch(() => null) : null,
     ]);
     if (!modal.open || request !== playRequest) return; // closed or replaced while loading
+    const prefs = trackPrefs(me?.Configuration);
     if (!title && item?.Name) $('player-title').textContent = item.Name;
 
     const startTicks = selection?.startTicks ?? ((streamType !== 'Videos' || fromStart) ? 0 : resumePositionTicks(item));
     const runtimeTicks = item?.RunTimeTicks || 0;
 
-    // Track choices as Jellyfin's defaults pick them; with no PlaybackInfo there are none
+    // Track choices as Jellyfin's defaults pick them from the user's preferences; with no PlaybackInfo there are none
     const source = info?.MediaSources?.find(s => s.Id === selection?.mediaSourceId) || info?.MediaSources?.[0];
     const streams = source?.MediaStreams || [];
     const audioStreams = streams.filter(s => isStreamType(s, 'audio'));
     const subStreams = streams.filter(s => isStreamType(s, 'subtitle'));
-    const defaultAudio = source?.DefaultAudioStreamIndex;
-    const chosenAudio = audioStreams.find(s => s.Index === defaultAudio) || audioStreams.find(s => s.IsDefault) || audioStreams[0] || null;
     let audioIndex = null;
     let subtitleIndex = null;
     if (source) {
-        audioIndex = chosenAudio ? chosenAudio.Index : null;
-        const defaultSub = source.DefaultSubtitleStreamIndex;
-        // The server's choice for this item (a remembered one, or off) wins over the client's default
-        const serverSubtitle = defaultSub === -1 || subStreams.some(s => s.Index === defaultSub);
-        subtitleIndex = serverSubtitle ? defaultSub : defaultSubtitleIndex(subStreams, chosenAudio);
-        ({ audioIndex, subtitleIndex } = carriedTracks(streams, carry, audioIndex, subtitleIndex, serverSubtitle));
+        // The server's remembered tracks for this item win where the user keeps them (Remember*Selections)
+        const defaults = defaultTracks(source, prefs);
+        ({ audioIndex, subtitleIndex } = carriedTracks(streams, carry, defaults.audioIndex, defaults.subtitleIndex, defaults.subtitleFromServer, prefs));
         if (audioStreams.some(s => s.Index === selection?.audioIndex)) audioIndex = selection.audioIndex;
         if (selection?.subtitleIndex === -1 || subStreams.some(s => s.Index === selection?.subtitleIndex)) subtitleIndex = selection.subtitleIndex;
     }
@@ -567,6 +568,9 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
         playSessionId: null,
         mediaSourceId: source?.Id || null,
         streams,
+        sources: info?.MediaSources || [],
+        item,
+        prefs,
         // The item's chapters (PageUp, PageDown), and its tile sets for the seek bar's thumbnails
         chapters: item?.Chapters || [],
         trickplay: null,
@@ -837,7 +841,7 @@ function episodeTrackCarry(session) {
 // As in Jellyfin: a track in the last episode's language, else the default this episode picked. When
 // the audio changes and no subtitle carries over, the default subtitle is picked again for that audio,
 // unless the subtitle is the server's choice for this episode (subtitleFromServer), off included.
-function carriedTracks(streams, carry, audioIndex, subtitleIndex, subtitleFromServer = false) {
+function carriedTracks(streams, carry, audioIndex, subtitleIndex, subtitleFromServer = false, prefs = null) {
     if (!carry) return { audioIndex, subtitleIndex };
     const inLanguage = (type, language) => (language
         ? streams.filter(s => isStreamType(s, type) && (s.Language || '').toLowerCase() === language)
@@ -851,7 +855,7 @@ function carriedTracks(streams, carry, audioIndex, subtitleIndex, subtitleFromSe
     const sameKind = subs.filter(s => !!s.IsForced === carry.subtitleForced);
     const pickedSub = sameKind.find(s => s.Index === subtitleIndex) || sameKind.find(s => s.IsDefault) || sameKind[0] || subs[0];
     if (pickedSub) subtitleIndex = pickedSub.Index;
-    else if (audioChanged && !subtitleFromServer) subtitleIndex = defaultSubtitleIndex(streams.filter(s => isStreamType(s, 'subtitle')), pickedAudio);
+    else if (audioChanged && !subtitleFromServer) subtitleIndex = defaultSubtitleIndex(streams.filter(s => isStreamType(s, 'subtitle')), pickedAudio, prefs);
     return { audioIndex, subtitleIndex };
 }
 

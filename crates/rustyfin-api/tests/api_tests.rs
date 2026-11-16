@@ -3248,6 +3248,7 @@ const B124_WEB_MODULES: &[&str] = &[
     "library.js",
     "music.js",
     "player.js",
+    "playerprefs.js",
     "plugins.js",
     "queue.js",
     "router.js",
@@ -23336,6 +23337,12 @@ fn r3player_controls() {
 #[test]
 fn r3player_album() {
     b124_node_test("r3player_album.mjs");
+}
+
+// R3 core player: the default tracks from the user's language and subtitle preferences
+#[test]
+fn r3playercore_tracks() {
+    b124_node_test("r3playercore_tracks.mjs");
 }
 
 // The web client's item page: credits, ratings, media info, track pickers, chapters, links, "mark all
