@@ -67,9 +67,16 @@ function setUiLanguage(lng) {
     return i18next.changeLanguage(lng).then(() => applyTranslations());
 }
 
-// BCP 47 tag for Intl formatting: the regional variant of the UI language
-// from the browser (en-GB), else the language itself
+// The user's date and time format (Jellyfin Web's datetimelocale); '' follows the UI language
+let dateTimeLocale = '';
+function setDateTimeLocale(tag) {
+    dateTimeLocale = tag || '';
+}
+
+// BCP 47 tag for Intl formatting: the user's date and time format, else the regional variant of
+// the UI language from the browser (en-GB), else the language itself
 function uiLocale() {
+    if (dateTimeLocale) return dateTimeLocale;
     const lng = i18next.resolvedLanguage;
     const prefix = lng.toLowerCase() + '-';
     return [i18next.language, ...navigator.languages].find(tag => tag.toLowerCase().startsWith(prefix)) || lng;
@@ -86,6 +93,8 @@ function uiLanguageOptions() {
     }).sort((a, b) => a.label.localeCompare(b.label));
 }
 
-Object.assign(window, { t, applyTranslations, getUiLanguage, setUiLanguage, uiLocale, uiLanguageOptions });
+Object.assign(window, {
+    t, applyTranslations, getUiLanguage, setUiLanguage, uiLocale, uiLanguageOptions, setDateTimeLocale,
+});
 
 applyTranslations();

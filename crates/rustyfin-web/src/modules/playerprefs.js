@@ -257,7 +257,31 @@ function stillWatchingDue(setting, { now, sessionStart, lastInput, played }) {
     return now - sessionStart >= rule.duration && (now - lastInput >= rule.duration || played >= rule.count);
 }
 
+// --- Subtitle burn-in (Jellyfin Web's subtitleburnin, per device) ---
+const BURN_IN_KEY = 'subtitleburnin';
+const BURN_IN_MODES = ['', 'onlyimageformats', 'allcomplexformats', 'all'];
+function subtitleBurnIn() {
+    const value = readSetting(BURN_IN_KEY, '');
+    return BURN_IN_MODES.includes(value) ? value : '';
+}
+// Whether the transcode burns in a subtitle: a picture one always, ASS and SSA too with allcomplexformats,
+// every one with all; otherwise the player draws a text subtitle itself
+function burnsInSubtitle(codec, isImage, mode = subtitleBurnIn()) {
+    if (isImage || mode === 'all') return true;
+    return mode === 'allcomplexformats' && ['ass', 'ssa'].includes((codec || '').toLowerCase());
+}
+
+// A device setting's stored value as it is, for the settings page: per user under `<user id>-<name>`, else
+// under the name (null when unset)
+function deviceSetting(name, perUser = false) {
+    return readSetting(perUser ? userKey(name) : name, null);
+}
+function setDeviceSetting(name, value, perUser = false) {
+    writeSetting(perUser ? userKey(name) : name, value);
+}
+
 export {
+    BURN_IN_MODES, subtitleBurnIn, burnsInSubtitle, deviceSetting, setDeviceSetting,
     languageCode, sameLanguage, trackPrefs, defaultAudioIndex, defaultSubtitleIndex, defaultTracks,
     subtitleAppearance, saveSubtitleAppearance, subtitleCss, APPEARANCE_DEFAULTS, SUBTITLE_SIZES, SUBTITLE_FONTS,
     SUBTITLE_SHADOWS, stepSubtitleOffset, SEGMENT_TYPES, SEGMENT_ACTIONS, segmentAction, setSegmentAction,

@@ -435,7 +435,47 @@ const API = {
     },
     deleteItem(id) { return this.del(`/Items/${id}`); },
     // The server answers only when the refresh is done; a slow one ends in a TimeoutError, and the server keeps going
-    refreshItem(id) { return this.post(`/Items/${id}/Refresh`, undefined, { signal: AbortSignal.timeout(120000) }); },
+    // options: Jellyfin's MetadataRefreshMode, ImageRefreshMode, ReplaceAllMetadata and ReplaceAllImages
+    refreshItem(id, options) {
+        const q = options ? '?' + new URLSearchParams(options).toString() : '';
+        return this.post(`/Items/${id}/Refresh${q}`, undefined, { signal: AbortSignal.timeout(120000) });
+    },
+
+    // Admin metadata tools (Jellyfin's identify, image editor and metadata editor)
+    remoteSearch(type, searchInfo, itemId) {
+        return this.post(`/Items/RemoteSearch/${type}`, { SearchInfo: searchInfo, ItemId: itemId });
+    },
+    applySearchResult(id, result, replaceAllImages) {
+        return this.post(`/Items/RemoteSearch/Apply/${id}?ReplaceAllImages=${!!replaceAllImages}`, result,
+            { signal: AbortSignal.timeout(120000) });
+    },
+    getItemImages(id) { return this.get(`/Items/${id}/Images`); },
+    getRemoteImages(id, params = {}) {
+        return this.get(`/Items/${id}/RemoteImages?` + new URLSearchParams(params).toString());
+    },
+    downloadRemoteImage(id, type, imageUrl) {
+        return this.post(`/Items/${id}/RemoteImages/Download?` + new URLSearchParams({ type, imageUrl }).toString());
+    },
+    deleteItemImage(id, type, index) {
+        return this.del(`/Items/${id}/Images/${type}?imageIndex=${encodeURIComponent(index)}`);
+    },
+    // The picture goes base64-encoded with its own type, as Jellyfin Web sends it
+    async uploadItemImage(id, type, file) {
+        const data = await new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(String(reader.result).split(',')[1] || '');
+            reader.onerror = () => reject(reader.error);
+            reader.readAsDataURL(file);
+        });
+        const path = `/Items/${id}/Images/${type}`;
+        const res = await fetch(this.base + path, {
+            method: 'POST',
+            headers: { ...this.headers(), 'Content-Type': file.type || 'image/jpeg' },
+            body: data,
+        });
+        if (!res.ok) throw await this._requestError('POST', path, res);
+    },
+    updateItem(id, fields) { return this.post(`/Items/${id}`, fields); },
 
     // User Items
     getUserItems(params = {}) {
@@ -471,7 +511,11 @@ const API = {
     markUnplayed(itemId) { return this.del(`/Users/${this.userId}/PlayedItems/${itemId}`); },
     setFavorite(itemId) { return this.post(`/Users/${this.userId}/FavoriteItems/${itemId}`); },
     unsetFavorite(itemId) { return this.del(`/Users/${this.userId}/FavoriteItems/${itemId}`); },
-    setRating(itemId, rating) { return this.put(`/Users/${this.userId}/Items/${itemId}/Rating`, { Rating: rating }); },
+    // Like (true) or dislike (false) an item, as Jellyfin's POST /UserItems/{id}/Rating?likes=; null clears it
+    setRating(itemId, likes) {
+        const path = `/UserItems/${encodeURIComponent(itemId)}/Rating`;
+        return likes === null ? this.del(path) : this.post(`${path}?likes=${likes ? 'true' : 'false'}`);
+    },
 
     // Streaming & Playback info
     streamUrl(itemId, type = 'Videos') {
@@ -533,6 +577,7 @@ const API = {
         if (params.mediaSourceId) q.set('MediaSourceId', params.mediaSourceId);
         if (params.audioStreamIndex != null) q.set('AudioStreamIndex', params.audioStreamIndex);
         if (params.subtitleStreamIndex != null) q.set('SubtitleStreamIndex', params.subtitleStreamIndex);
+        if (params.subtitleMethod) q.set('SubtitleMethod', params.subtitleMethod);
         const data = await this.get(`/Videos/${itemId}/Universal?${q.toString()}`);
         // The player reads `url`; the server sends `Url`
         if (data && !data.url) data.url = data.Url;
@@ -571,6 +616,8 @@ const API = {
     getPlaylists() { return this.get('/Playlists'); },
     createPlaylist(name, ids) { return this.post('/Playlists', { Name: name, ItemIds: ids }); },
     getPlaylistItems(id) { return this.get(`/Playlists/${id}/Items`); },
+    addToPlaylist(id, ids) { return this.post(`/Playlists/${encodeURIComponent(id)}/Items?Ids=${ids.map(encodeURIComponent).join(',')}&UserId=${this.userId}`); },
+    addToCollection(id, ids) { return this.post(`/Collections/${encodeURIComponent(id)}/Items?Ids=${ids.map(encodeURIComponent).join(',')}`); },
 
     // Scheduled Tasks
     getTasks() { return this.get('/ScheduledTasks'); },

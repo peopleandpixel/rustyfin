@@ -2,6 +2,7 @@
 import { $, html, show, hide, toast, escapeHtml } from './util.js';
 import { currentPage, navigate } from './router.js';
 import { renderSettings } from './settings.js';
+import { loadUserSettings } from './user-settings.js';
 import { jiChoice, jiConfirm, jiShownCodes } from './jellyfin-import.js';
 import { loadSidebar, initScanProgressWebSocket, stopScanProgressWebSocket } from './library-admin.js';
 
@@ -133,7 +134,7 @@ function showOidcLinkResult(data) {
 function oidcCardHtml(enabled, account) {
     let body;
     if (account?.Linked) {
-        const linkedAt = account.LinkedAt ? new Date(account.LinkedAt).toLocaleString() : '—';
+        const linkedAt = account.LinkedAt ? new Date(account.LinkedAt).toLocaleString(uiLocale()) : '—';
         const canUnlink = Boolean(account.CanUnlink);
         const reason = account.HasPassword ? t('oidc.unlink_password_off') : t('oidc.unlink_needs_password');
         const linkedAs = t('oidc.linked_as', { name: account.ProviderUsername || '', date: linkedAt });
@@ -309,6 +310,8 @@ function updateAuthUI() {
         if ($('nav-avatar-letter')) $('nav-avatar-letter').textContent = (API.userName || 'U')[0].toUpperCase();
         if ($('nav-user-name')) $('nav-user-name').textContent = API.userName || '';
         if ($('dropdown-username')) $('dropdown-username').textContent = API.userName || '';
+        // The user's settings (once per user): the profile picture, backdrops and date format
+        loadUserSettings();
         show('nav-add-lib');
         if (API.isAdmin) {
             show('nav-admin-link');
