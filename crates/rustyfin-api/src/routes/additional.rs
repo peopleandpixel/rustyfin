@@ -371,16 +371,60 @@ async fn get_shows_similar(
     ))
 }
 
-/// GET /Playback/BitrateTest — Returns a URL for bitrate testing
+/// Jellyfin's default and largest `size` for the bitrate test.
+const BITRATE_TEST_DEFAULT: u64 = 102_400;
+const BITRATE_TEST_MAX: u64 = 100_000_000;
+
+/// GET /Playback/BitrateTest?size=: `size` bytes of noise as `application/octet-stream`, as
+/// Jellyfin answers. Clients (the Cast receiver, Jellyfin Web) time the download to choose a
+/// streaming bitrate. `size` defaults to 102400 and must be 1 to 100000000.
 async fn get_bitrate_test(
-    State(_state): State<AppState>,
-) -> Result<(StatusCode, Json<serde_json::Value>), crate::error::ApiError> {
-    // Return a small test file URL for bitrate testing
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Result<axum::response::Response, crate::error::ApiError> {
+    use axum::response::IntoResponse;
+    let size = match q.iter().find(|(k, _)| k.eq_ignore_ascii_case("size")) {
+        None => BITRATE_TEST_DEFAULT,
+        Some((_, v)) => v
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|n| (1..=BITRATE_TEST_MAX).contains(n))
+            .ok_or_else(|| {
+                crate::error::ApiError::BadRequest(format!(
+                    "The field size must be between 1 and {BITRATE_TEST_MAX}."
+                ))
+            })?,
+    };
+    // One shared chunk, sent as often as `size` needs: a large test costs no memory per request
+    let chunk = BITRATE_TEST_CHUNK.clone();
+    let step = chunk.len() as u64;
+    let chunks = (0..size.div_ceil(step)).map(move |i| {
+        let len = step.min(size - i * step) as usize;
+        Ok::<_, std::convert::Infallible>(chunk.slice(..len))
+    });
     Ok((
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "Url": "/Playback/BitrateTestStream",
-            "MaxBitrate": null
-        })),
-    ))
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "application/octet-stream".to_string(),
+            ),
+            (axum::http::header::CONTENT_LENGTH, size.to_string()),
+        ],
+        axum::body::Body::from_stream(futures_util::stream::iter(chunks)),
+    )
+        .into_response())
 }
+
+/// 64 KiB that don't compress (xorshift), so a compressing proxy can't shorten the test.
+static BITRATE_TEST_CHUNK: std::sync::LazyLock<axum::body::Bytes> =
+    std::sync::LazyLock::new(|| {
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut out = Vec::with_capacity(64 * 1024);
+        while out.len() < 64 * 1024 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        axum::body::Bytes::from(out)
+    });

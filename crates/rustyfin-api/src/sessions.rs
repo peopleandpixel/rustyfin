@@ -124,16 +124,84 @@ pub fn changed(state: &AppState) {
     let _ = state.ws_broadcast.send(WsEvent::SessionsChanged);
 }
 
+/// The device a request's `MediaBrowser` authorization header names, when it names a device id.
+/// A Cast receiver signs its requests with the sender's token and its own `DeviceId`, so its
+/// playback is a session of its own, as in Jellyfin (whose header values win over the token's).
+#[derive(Debug, Clone)]
+pub struct StatedDevice(pub rustyfin_auth::TokenDevice);
+
+/// The request's token and stated device, as a handler argument, for finding its session.
+#[derive(Debug, Clone, Default)]
+pub struct Caller {
+    token: Option<String>,
+    stated: Option<StatedDevice>,
+}
+
+impl<S: Send + Sync> axum::extract::FromRequestParts<S> for Caller {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(Self {
+            token: parts
+                .extensions
+                .get::<rustyfin_auth::RequestToken>()
+                .map(|t| t.0.clone()),
+            stated: parts.extensions.get::<StatedDevice>().cloned(),
+        })
+    }
+}
+
+impl Caller {
+    /// The caller's session (see `for_request`).
+    pub async fn session(&self, state: &AppState) -> Result<Option<String>, ApiError> {
+        for_request(state, self.token.as_deref(), self.stated.as_ref()).await
+    }
+}
+
 /// The session of the request's token: its device's session, made again when it has expired
 /// (Jellyfin's `LogSessionActivity`), and marked active. `None` for the API key and for a token
 /// without a device.
 pub async fn for_token(state: &AppState, token: Option<&str>) -> Result<Option<String>, ApiError> {
+    for_request(state, token, None).await
+}
+
+/// How many sessions for other devices one token keeps; a new one beyond this ends the token's
+/// least recently active one, so a token can't fill the session list.
+pub const MAX_STATED_SESSIONS: usize = 4;
+
+/// `for_token` for a request whose header names a device: another device id than the token's
+/// gets that device's session, with the header's client, device name and version. That session
+/// belongs to the token (it ends when the token does), and a token keeps at most
+/// `MAX_STATED_SESSIONS` of them.
+pub async fn for_request(
+    state: &AppState,
+    token: Option<&str>,
+    stated: Option<&StatedDevice>,
+) -> Result<Option<String>, ApiError> {
     let Some(token) = token else {
         return Ok(None);
     };
-    let Some((user_id, device)) = rustyfin_auth::token_device(&state.db_ro, token).await? else {
+    let Some((user_id, mut device)) = rustyfin_auth::token_device(&state.db_ro, token).await?
+    else {
         return Ok(None);
     };
+    let mut via_token = None;
+    if let Some(StatedDevice(stated)) = stated
+        && !stated.device_id.is_empty()
+        && stated.device_id != device.device_id
+    {
+        let or = |stated: &str, own: &str| if stated.is_empty() { own } else { stated }.to_string();
+        device = rustyfin_auth::TokenDevice {
+            device_id: stated.device_id.clone(),
+            device_name: or(&stated.device_name, &device.device_name),
+            app_name: or(&stated.app_name, &device.app_name),
+            app_version: or(&stated.app_version, &device.app_version),
+        };
+        via_token = Some(rustyfin_auth::token_hash(token));
+    }
     if let Some(id) =
         rustyfin_db::repo_session::find_device_session(&state.db, user_id, &device.device_id)
             .await?
@@ -144,6 +212,15 @@ pub async fn for_token(state: &AppState, token: Option<&str>) -> Result<Option<S
     let Some(user) = rustyfin_db::repo_user::get_user_by_id(&state.db_ro, user_id).await? else {
         return Ok(None);
     };
+    if let Some(hash) = &via_token {
+        let mut held = rustyfin_db::repo_session::token_sessions(&state.db, hash).await?;
+        let over = (held.len() + 1).saturating_sub(MAX_STATED_SESSIONS);
+        let oldest: Vec<String> = held.drain(..over).collect();
+        for old in &oldest {
+            rustyfin_db::repo_session::delete_session(&state.db, old).await?;
+        }
+        forget_all(state, &oldest);
+    }
     let id = Uuid::new_v4();
     rustyfin_db::repo_session::create_session(
         &state.db,
@@ -157,6 +234,9 @@ pub async fn for_token(state: &AppState, token: Option<&str>) -> Result<Option<S
         "{}",
     )
     .await?;
+    if let Some(hash) = &via_token {
+        rustyfin_db::repo_session::set_session_token(&state.db, &id.to_string(), hash).await?;
+    }
     changed(state);
     Ok(Some(id.to_string()))
 }

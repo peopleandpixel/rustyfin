@@ -32,6 +32,10 @@ import './modules/playerprefs.js';
 import './modules/queue.js';
 import { toggleLyrics } from './modules/lyrics.js';
 import './modules/remote.js';
+import {
+    castToDevice, stopCasting, castTogglePause, castSeek, castSetVolume, castToggleMute, castAdjacent, castAudioTrack,
+    castSubtitleTrack,
+} from './modules/cast.js';
 import { sessionControl, openPlayOn, playOnSession } from './modules/sessions.js';
 import './modules/cardmenu.js';
 import './modules/collections.js';
@@ -69,4 +73,6 @@ Object.assign(window, {
     savePluginPriority, sessionControl, openPlayOn, playOnSession, changeUserConfig, changeUserPref, changeHomeSection,
     changeSubtitleAppearance, changeLatestLibrary, chooseProfileImage, deleteProfileImage, saveGeneralSettings,
     addLibraryFolder, renameLibrary, addTaskTrigger, showTriggerFields, toggleLyrics,
+    castToDevice, stopCasting, castTogglePause,
+    castSeek, castSetVolume, castToggleMute, castAdjacent, castAudioTrack, castSubtitleTrack,
 });

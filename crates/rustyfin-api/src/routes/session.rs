@@ -136,8 +136,9 @@ async fn logout_session(
     token: Option<Extension<rustyfin_auth::RequestToken>>,
 ) -> Result<StatusCode, ApiError> {
     if let Some(Extension(rt)) = token {
-        // The sessions the logout ends, so their play state goes with them
-        let ended = match rustyfin_auth::token_device(&state.db, &rt.0).await? {
+        // The sessions the logout ends, so their play state goes with them: the device's, and the
+        // ones the token made for other devices (a Cast receiver), which end with the token
+        let mut ended = match rustyfin_auth::token_device(&state.db, &rt.0).await? {
             Some((user, device)) => {
                 rustyfin_db::repo_session::session_ids(
                     &state.db,
@@ -148,6 +149,10 @@ async fn logout_session(
             }
             None => Vec::new(),
         };
+        ended.extend(
+            rustyfin_db::repo_session::token_sessions(&state.db, &rustyfin_auth::token_hash(&rt.0))
+                .await?,
+        );
         rustyfin_auth::logout(&state.db, &rt.0).await?;
         crate::sessions::forget_all(&state, &ended);
         crate::sessions::changed(&state);
@@ -160,13 +165,12 @@ async fn logout_session(
 async fn playing_ping(
     State(state): State<AppState>,
     Query(q): Pairs,
-    token: Option<Extension<rustyfin_auth::RequestToken>>,
+    caller: crate::sessions::Caller,
 ) -> Result<StatusCode, ApiError> {
     if param(&q, "playSessionId").is_none() {
         return Err(bad_request("The playSessionId field is required."));
     }
-    let token = token.as_ref().map(|Extension(rt)| rt.0.as_str());
-    if let Some(session) = crate::sessions::for_token(&state, token).await? {
+    if let Some(session) = caller.session(&state).await? {
         crate::sessions::ping(&state, &session);
     }
     Ok(StatusCode::NO_CONTENT)
@@ -529,12 +533,12 @@ fn build_capabilities_from_request(req: &SessionCapabilitiesRequest) -> ClientCa
 async fn update_user_capabilities(
     state: &AppState,
     user_id: uuid::Uuid,
-    token: Option<&str>,
+    caller: &crate::sessions::Caller,
     caps: &ClientCapabilities,
 ) -> Result<(), ApiError> {
     let caps_json = serde_json::to_string(caps).map_err(|e| ApiError::Internal(e.to_string()))?;
 
-    if let Some(session) = crate::sessions::for_token(state, token).await? {
+    if let Some(session) = caller.session(state).await? {
         rustyfin_db::repo_session::update_session_capabilities(&state.db, &session, &caps_json)
             .await
             .map_err(|e| ApiError::Internal(e.to_string()))?;
@@ -601,13 +605,12 @@ fn capabilities_from_query(
 async fn session_capabilities(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
-    token: Option<Extension<rustyfin_auth::RequestToken>>,
+    caller: crate::sessions::Caller,
     Query(params): Pairs,
     body: axum::body::Bytes,
 ) -> Result<StatusCode, ApiError> {
     let caps = capabilities_from_query(&params, &body)?;
-    let token = token.as_ref().map(|Extension(rt)| rt.0.as_str());
-    update_user_capabilities(&state, claims.sub, token, &caps).await?;
+    update_user_capabilities(&state, claims.sub, &caller, &caps).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -615,12 +618,11 @@ async fn session_capabilities(
 async fn session_capabilities_full(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
-    token: Option<Extension<rustyfin_auth::RequestToken>>,
+    caller: crate::sessions::Caller,
     Json(req): Json<SessionCapabilitiesRequest>,
 ) -> Result<StatusCode, ApiError> {
     let caps = build_capabilities_from_request(&req);
-    let token = token.as_ref().map(|Extension(rt)| rt.0.as_str());
-    update_user_capabilities(&state, claims.sub, token, &caps).await?;
+    update_user_capabilities(&state, claims.sub, &caller, &caps).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
