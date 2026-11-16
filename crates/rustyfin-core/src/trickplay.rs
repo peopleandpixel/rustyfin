@@ -1661,16 +1661,34 @@ mod tests {
             checked += 1;
         }
         if have_encoder("libx264") {
-            // A raw stream refuses H.264 key frames that aren't IDR frames
-            let clip = timed_clip(&dir, "libx264", &x264_open, &[], "open.mkv");
-            let work = dir.join("work-open");
-            let tiles = work.join("tiles");
-            std::fs::create_dir_all(&tiles).unwrap();
-            let raw = Reading::Seek(Seeking::Raw);
-            let e = make_tiles(&clip.to_string_lossy(), &work, &tiles, raw, &Cancel::new())
-                .await
-                .unwrap_err();
-            assert!(e.starts_with(key_frames::NOT_ALONE), "{e}");
+            // Open-GOP H.264, whose key frames after the first are non-IDR I frames, as on
+            // Blu-rays: the raw stream shows the frames the closed-GOP encode's original pass
+            // does, as both have a key frame every 2 s
+            let open = timed_clip(&dir, "libx264", &x264_open, &[], "open.mkv");
+            let closed = dir.join("libx264-seek.mkv");
+            let mut made = Vec::new();
+            for (clip, raw) in [(&closed, false), (&open, true)] {
+                let work = dir.join(format!("work-open-{raw}"));
+                let tiles = work.join("tiles");
+                std::fs::create_dir_all(&tiles).unwrap();
+                let clip = clip.to_string_lossy();
+                let count = if raw {
+                    let raw = Reading::Seek(Seeking::Raw);
+                    make_tiles(&clip, &work, &tiles, raw, &Cancel::new())
+                        .await
+                        .unwrap()
+                        .thumbnail_count
+                } else {
+                    tile_run(&clip, &work, &tiles, false, 1, &Cancel::new())
+                        .await
+                        .unwrap()
+                };
+                made.push(thumbnail_times(&tiles, count));
+            }
+            assert_eq!(made[0].len(), made[1].len());
+            for (k, (a, b)) in made[0].iter().zip(&made[1]).enumerate() {
+                assert!((a - b).abs() <= 1.0, "open GOP: thumbnail {k} {a} {b}");
+            }
         }
         let _ = std::fs::remove_dir_all(&dir);
         if checked == 0 {
