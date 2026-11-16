@@ -699,6 +699,10 @@ pub struct MediaItem {
     /// GPS altitude in metres, below sea level negative
     #[serde(default)]
     pub altitude: Option<f64>,
+    /// Whether an audio item has lyrics: a lyric file beside it, one uploaded, or a lyrics tag.
+    /// Jellyfin sends it for audio items only.
+    #[serde(default)]
+    pub has_lyrics: Option<bool>,
 }
 
 impl MediaItem {
@@ -860,6 +864,7 @@ impl MediaItem {
             latitude: None,
             longitude: None,
             altitude: None,
+            has_lyrics: None,
         }
     }
 }
@@ -1059,6 +1064,7 @@ impl Serialize for MediaItem {
         some_field!("Latitude", self.latitude);
         some_field!("Longitude", self.longitude);
         some_field!("Altitude", self.altitude);
+        some_field!("HasLyrics", self.has_lyrics);
         s.end()
     }
 }

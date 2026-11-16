@@ -2502,6 +2502,14 @@ async fn scan_music_library(
     let covers = local_images::embedded_cover_paths(pool, library.id).await;
     let removed = remove_uncollected(pool, library, &filter, &collected, &unreadable, &loops).await;
     local_images::remove_orphaned_covers(pool, &covers).await;
+    // The lyric files beside the tracks, as Jellyfin finds them on a scan, for their HasLyrics.
+    if let Err(e) = crate::lyrics::sync_sidecars(pool, library.id, &filter).await {
+        tracing::error!(
+            "failed to record the lyric files of '{}': {}",
+            library.name,
+            e
+        );
+    }
     tracing::info!(
         "scanned music library '{}': {} new items added ({} existing items unchanged)",
         library.name,
