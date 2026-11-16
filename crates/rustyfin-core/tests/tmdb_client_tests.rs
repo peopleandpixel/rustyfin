@@ -607,24 +607,9 @@ async fn at_most_max_concurrent_requests_are_in_flight() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn clones_and_handles_share_one_limiter() {
-    let stub = ok_stub().await;
-    let interval = Duration::from_millis(150);
-    let settings = TmdbSettings {
-        min_interval: interval,
-        ..stub.settings()
-    };
-    let client = TmdbClient::new(http(), settings);
-    let clone = client.clone();
-    let mut requests = paths(&client.api(None).unwrap(), 300..303);
-    requests.extend(paths(&clone.api(Some(CONFIG_KEY)).unwrap(), 303..306));
-    requests.extend(paths(&client.api(None).unwrap(), 306..309));
-    get_all(requests).await;
-    let hits = stub.hits();
-    assert_eq!(hits.len(), 9);
-    assert_spaced(&hits, interval);
-}
+// That clones and handles share one limiter is checked on tokio's paused clock, in plugin-tmdb's
+// `tmdb_client::tests::clones_and_handles_share_one_limiter`: arrival times at a stub drift under
+// load.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_retry_takes_its_own_slot() {

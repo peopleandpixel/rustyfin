@@ -556,3 +556,43 @@ fn transport_failure(err: reqwest::Error, secret: &str) -> Failure {
         retry_after: None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Clones of a client and its handles, whatever their key, take their start slots from one
+    /// limiter. On tokio's paused clock the starts are exactly `min_interval` apart, however
+    /// loaded the machine is.
+    #[tokio::test(start_paused = true)]
+    async fn clones_and_handles_share_one_limiter() {
+        let interval = Duration::from_millis(150);
+        let settings = TmdbSettings {
+            min_interval: interval,
+            ..TmdbSettings::default()
+        };
+        let client = TmdbClient::new(reqwest::Client::new(), settings);
+        let clone = client.clone();
+        let handles = [
+            client.api(Some("first")).unwrap(),
+            clone.api(Some("second")).unwrap(),
+            client.api(Some("first")).unwrap(),
+        ];
+        let begin = Instant::now();
+        let mut tasks = tokio::task::JoinSet::new();
+        for handle in handles.iter().cycle().take(9).cloned() {
+            // The wait `attempt` makes before it sends
+            tasks.spawn(async move {
+                sleep_until(handle.client.0.limiter.reserve()).await;
+                Instant::now()
+            });
+        }
+        let mut starts = Vec::new();
+        while let Some(start) = tasks.join_next().await {
+            starts.push(start.unwrap() - begin);
+        }
+        starts.sort();
+        let want: Vec<Duration> = (0..9).map(|n| interval * n).collect();
+        assert_eq!(starts, want);
+    }
+}
