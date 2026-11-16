@@ -9901,12 +9901,15 @@ async fn r3endpoints_scan(state: &AppState, lib: &rustyfin_model::library::Libra
     rustyfin_core::scanner::wait_for_idle().await;
 }
 
-/// The stored rows of a library: `(id, path file name, media_type, extra_type, owner_id)`, by path.
+/// A stored row: `(id, path file name, media_type, extra_type, owner_id)`.
+type R3endpointsRow = (String, String, String, Option<String>, Option<String>);
+
+/// The stored rows of a library, by path.
 async fn r3endpoints_rows(
     state: &AppState,
     lib: &rustyfin_model::library::Library,
-) -> Vec<(String, String, String, Option<String>, Option<String>)> {
-    let rows: Vec<(String, String, String, Option<String>, Option<String>)> = sqlx::query_as(
+) -> Vec<R3endpointsRow> {
+    let rows: Vec<R3endpointsRow> = sqlx::query_as(
         "SELECT id, path, media_type, extra_type, owner_id FROM media_items
          WHERE library_id = ?1 ORDER BY path",
     )
