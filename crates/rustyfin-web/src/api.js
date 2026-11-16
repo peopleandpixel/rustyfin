@@ -106,6 +106,12 @@ const API = {
     },
 
     authHeader() {
+        // The Jellyfin Android app names the client and device itself (modules/nativeshell.js)
+        const app = window.NativeShell?.AppHost;
+        if (app) {
+            const field = v => String(v ?? '').replace(/"/g, '');
+            return `MediaBrowser Client="${field(app.appName())}", Device="${field(app.deviceName())}", DeviceId="${field(app.deviceId())}", Version="${field(app.appVersion())}"`;
+        }
         return 'MediaBrowser Client="Rustyfin Web", Device="Browser", DeviceId="web-' + (localStorage.getItem('rustyfin_device_id') || this._initDeviceId()) + '", Version="12.0.0"';
     },
 

@@ -27,6 +27,7 @@ import {
     changeSegmentAction, togglePlaybackStats, changeStillWatching, openFullPlayer, stopNowPlaying,
 } from './modules/player.js';
 import './modules/playerprefs.js';
+import { nativeShellCommand } from './modules/nativeshell.js';
 import './modules/queue.js';
 import './modules/remote.js';
 import { sessionControl, openPlayOn, playOnSession } from './modules/sessions.js';
@@ -65,5 +66,5 @@ Object.assign(window, {
     submitAddUser, clearLiveLog, setLogLevel, closePluginConfig, savePluginConfig, closePluginPriority,
     savePluginPriority, sessionControl, openPlayOn, playOnSession, changeUserConfig, changeUserPref, changeHomeSection,
     changeSubtitleAppearance, changeLatestLibrary, chooseProfileImage, deleteProfileImage, saveGeneralSettings,
-    addLibraryFolder, renameLibrary, addTaskTrigger, showTriggerFields,
+    addLibraryFolder, renameLibrary, addTaskTrigger, showTriggerFields, nativeShellCommand,
 });

@@ -14,7 +14,7 @@ import { playWithResumeChoice, stopPlayback, playItem, playerAutoHide, onPlayerC
 import { playContainer } from './queue.js';
 import { stopThemeSong } from './theme-media.js';
 import {
-    openCardMenu, toggleCardPlayed, toggleCardFavorite, setCardLikes, playCardItem, openAddTo,
+    openCardMenu, toggleCardPlayed, toggleCardFavorite, setCardLikes, playCardItem, downloadCardItem, openAddTo,
 } from './cardmenu.js';
 import { playAlbumFrom } from './music.js';
 import { playContainerFrom, removeFromContainer, openNewContainer } from './collections.js';
@@ -168,6 +168,7 @@ const clickActions = {
     'card-like': el => setCardLikes(el, true),
     'card-dislike': el => setCardLikes(el, false),
     'card-play': el => playCardItem(el),
+    'card-download': el => downloadCardItem(el),
     'card-add-playlist': el => openAddTo(el, 'playlist'),
     'card-add-collection': el => openAddTo(el, 'collection'),
     // Collections and playlists (collections.js)

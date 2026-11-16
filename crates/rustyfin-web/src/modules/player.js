@@ -6,6 +6,7 @@ import { renderHome } from './home.js';
 import { currentDetailId, renderDetail, versionLabels } from './item.js';
 import { clearQueue, queueNeighbours, playQueueStep } from './queue.js';
 import { stopThemeSong } from './theme-media.js';
+import { nativeVideoPlayer, playNatively, setNativeNowPlaying } from './nativeshell.js';
 import {
     trackPrefs, defaultTracks, defaultSubtitleIndex as preferredSubtitleIndex, subtitleAppearance, saveSubtitleAppearance,
     subtitleCss, stepSubtitleOffset, qualityOptions, bitrateLabel, maxStreamingBitrate, setMaxStreamingBitrate,
@@ -610,6 +611,12 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
     if (hlsInstance) {
         hlsInstance.destroy();
         hlsInstance = null;
+    }
+
+    // In the Jellyfin Android app, a video plays in the app's player when the user chose that there
+    if (streamType === 'Videos' && nativeVideoPlayer() && await playNatively(itemId, { fromStart, selection, resumeTicks: resumePositionTicks })) {
+        if (request === playRequest) playLoading = 0;
+        return;
     }
 
     $('player-title').textContent = title || t('player.playback');
@@ -1613,6 +1620,7 @@ function mediaSessionMetadata(item, title) {
 }
 
 function updateMediaSession(session, item, title) {
+    setNativeNowPlaying(session, () => mediaSessionMetadata(item, title));
     if (!hasMediaSession()) return;
     bindMediaSession();
     navigator.mediaSession.metadata = new MediaMetadata(mediaSessionMetadata(item, title));
@@ -1641,6 +1649,7 @@ function updateMediaPosition(session) {
 
 // The player closed: no item, and no actions left for the OS to offer
 function clearMediaSession() {
+    setNativeNowPlaying(null);
     if (!hasMediaSession()) return;
     navigator.mediaSession.metadata = null;
     navigator.mediaSession.playbackState = 'none';
