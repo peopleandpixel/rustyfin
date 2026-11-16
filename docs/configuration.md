@@ -67,8 +67,24 @@ Das Datenverzeichnis (`RUSTYFIN_DATA`) enthält:
 ├── rustyfin.db          # SQLite-Datenbank
 ├── cache/               # Bild- und Metadaten-Cache
 │   └── images/          # Gecachte und skalierte Bilder
+├── encoding.json        # Transkodier-Einstellungen (siehe unten)
+├── transcodes/          # Laufende Transkodierungen
 └── logs/                # Log-Dateien
 ```
+
+## Transkodierung und Hardwarebeschleunigung
+
+Die Transkodier-Einstellungen sind Jellyfins `EncodingOptions`: im Dashboard im Tab **Playback**, über die API mit `GET`/`POST /System/Configuration/encoding` (nur Administratoren). Sie liegen in `encoding.json` im Datenverzeichnis; Felder, die Rustyfin nicht kennt, bleiben erhalten. Neue Transkodierungen übernehmen eine Änderung sofort, `TranscodingTempPath` erst nach einem Neustart.
+
+Rustyfin setzt um:
+
+- `EncodingThreadCount` (-1 oder 0: ffmpeg wählt), `EncoderPreset`, `H264Crf` und `H265Crf` (x264/x265 kodieren mit CRF unter dem Bitraten-Limit), `MaxMuxingQueueSize`;
+- `DownMixAudioBoost` und `DownMixStereoAlgorithm` beim Heruntermischen auf Stereo (Dave750 und NightmodeDialogue für 5.1 und 7.1, Rfc7845 für 5.1; Ac4 wird nur gespeichert);
+- `AllowHevcEncoding` und `AllowAv1Encoding`: HEVC bzw. AV1 wird nur kodiert, wenn erlaubt und vom Client zuerst genannt;
+- `EnableTonemapping` mit `TonemappingAlgorithm`, `TonemappingRange`, `TonemappingDesat`, `TonemappingPeak` und `TonemappingParam`: HDR10 und HLG werden in Software (zscale/tonemap) nach SDR abgebildet, auch wenn Hardwarebeschleunigung an ist; `bt2390` läuft als `hable`;
+- `HardwareAccelerationType` `vaapi`, `qsv` und `nvenc` mit `VaapiDevice`, `QsvDevice`, `HardwareDecodingCodecs`, `EnableHardwareEncoding`, `EnableDecodingColorDepth10Hevc` und `EnableDecodingColorDepth10Vp9`. Fehlt ffmpeg die Beschleunigung oder der Encoder, oder scheitert eine HLS-Transkodierung auf dem Gerät, transkodiert Rustyfin in Software und warnt einmal im Log, bis die Einstellungen neu gespeichert werden.
+
+Nur gespeichert, ohne Wirkung: `amf`, `videotoolbox`, `rkmpp` und `v4l2m2m` (Rustyfin transkodiert dann in Software, ohne Fehler), `EnableThrottling`, `ThrottleDelaySeconds`, `EnableSegmentDeletion`, `SegmentKeepSeconds` und die übrigen Felder.
 
 ## Netzwerk
 

@@ -2422,7 +2422,7 @@ async fn r2admin_encoding_configuration() {
         encoding["TranscodingTempPath"]
             .as_str()
             .unwrap()
-            .ends_with("transcode"),
+            .ends_with("transcodes"),
         "{encoding}"
     );
 
@@ -2454,6 +2454,97 @@ async fn r2admin_encoding_configuration() {
     // The main configuration has no "encoding" field.
     let (_, config) = send_authed(&app, "GET", "/System/Configuration", &admin, None).await;
     assert!(config.get("encoding").is_none(), "{config}");
+}
+
+// ── r3transcoding: encoding options reach the transcoder ──
+
+
+#[tokio::test]
+async fn r3transcoding_encoding_options_round_trip_and_reach_the_transcoder() {
+    use rustyfin_core::encoding::HardwareAccelerationType;
+    let (state, app, admin, (bob, _), _path) = r2admin_world().await;
+    // Administrators only, both ways
+    let (status, _) = send_authed(&app, "GET", "/System/Configuration/encoding", &bob, None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        "/System/Configuration/encoding",
+        &bob,
+        Some("{}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    // The defaults match the transcode folder in use
+    let (_, mut encoding) =
+        send_authed(&app, "GET", "/System/Configuration/encoding", &admin, None).await;
+    assert_eq!(
+        encoding["TranscodingTempPath"],
+        state
+            .transcode_manager
+            .cache_root()
+            .to_string_lossy()
+            .as_ref(),
+        "{encoding}"
+    );
+
+    encoding["HardwareAccelerationType"] = serde_json::json!("vaapi");
+    encoding["VaapiDevice"] = serde_json::json!("/dev/dri/renderD129");
+    encoding["HardwareDecodingCodecs"] = serde_json::json!(["h264", "hevc"]);
+    encoding["H264Crf"] = serde_json::json!(19);
+    encoding["EncoderPreset"] = serde_json::json!("slow");
+    encoding["EncodingThreadCount"] = serde_json::json!(3);
+    encoding["AllowHevcEncoding"] = serde_json::json!(true);
+    encoding["EnableTonemapping"] = serde_json::json!(true);
+    encoding["DownMixStereoAlgorithm"] = serde_json::json!("Dave750");
+    encoding["EnableThrottling"] = serde_json::json!(true);
+    encoding["R3FutureOption"] = serde_json::json!({ "Nested": [1, "two"] });
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        "/System/Configuration/encoding",
+        &admin,
+        Some(&encoding.to_string()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, saved) = send_authed(&app, "GET", "/System/Configuration/encoding", &admin, None).await;
+    // Everything comes back as it was posted, unknown fields included
+    assert_eq!(saved, encoding);
+
+    let settings = state.transcode_manager.encoding_settings();
+    assert_eq!(
+        settings.hardware_acceleration,
+        HardwareAccelerationType::Vaapi
+    );
+    assert_eq!(settings.vaapi_device, "/dev/dri/renderD129");
+    assert_eq!(settings.hardware_decoding_codecs, ["h264", "hevc"]);
+    assert_eq!(settings.h264_crf, 19);
+    assert_eq!(settings.encoder_preset, "slow");
+    assert_eq!(settings.thread_count, 3);
+    assert!(settings.allow_hevc_encoding && settings.enable_tonemapping);
+    assert_eq!(settings.downmix_stereo_algorithm, "Dave750");
+
+    // A type Rustyfin stores only is saved without an error, and transcodes in software
+    encoding["HardwareAccelerationType"] = serde_json::json!("videotoolbox");
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        "/System/Configuration/encoding",
+        &admin,
+        Some(&encoding.to_string()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let settings = state.transcode_manager.encoding_settings();
+    assert_eq!(
+        settings.hardware_acceleration,
+        HardwareAccelerationType::VideoToolbox
+    );
+    assert_eq!(
+        settings.hardware_acceleration.transcoder_accel(),
+        rustyfin_core::transcode::HwAccel::None
+    );
 }
 
 #[tokio::test]

@@ -10,6 +10,8 @@ use tokio::process::{Child, Command};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use crate::encoding::{self, EncodingSettings, FfmpegCapabilities};
+
 // ---------------------------------------------------------------------------
 // Transcoding profiles
 // ---------------------------------------------------------------------------
@@ -44,7 +46,7 @@ pub struct ImageSubtitle {
     pub video_size: Option<(u32, u32)>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TranscodeProfile {
     pub max_video_bitrate_kbps: u32,
     pub max_audio_bitrate_kbps: u32,
@@ -89,6 +91,17 @@ pub struct TranscodeProfile {
     /// The sample rate of an encoded audio stream; None keeps the source's where the encoder
     /// takes it
     pub audio_sample_rate: Option<u32>,
+    /// The server's encoding options (threads, presets, CRF, downmix, tonemapping, hardware
+    /// acceleration). The transcode manager sets them when it starts a transcode.
+    pub encoding: EncodingSettings,
+    /// The source video's codec (lowercase) and bit depth, which decide whether the device
+    /// decodes it; an unknown codec is decoded on the device whenever acceleration is on
+    pub source_video_codec: Option<String>,
+    pub source_bit_depth: Option<u32>,
+    /// The source video's HDR transfer (HDR10 or HLG), which tonemapping maps to SDR
+    pub source_hdr: Option<encoding::HdrTransfer>,
+    /// The channels of the played audio track, which decide the stereo downmix
+    pub source_audio_channels: Option<u32>,
 }
 
 impl Default for TranscodeProfile {
@@ -117,6 +130,11 @@ impl Default for TranscodeProfile {
             video_tag: None,
             audio_channels: None,
             audio_sample_rate: None,
+            encoding: EncodingSettings::default(),
+            source_video_codec: None,
+            source_bit_depth: None,
+            source_hdr: None,
+            source_audio_channels: None,
         }
     }
 }
@@ -183,6 +201,15 @@ pub struct TranscodeManager {
     stop_memory: Duration, // 60 s; unit tests shorten it
     /// The most progressive transcodes that run at once (`MAX_PROGRESSIVE`); unit tests lower it
     max_progressive: usize,
+    /// The server's encoding options, which each new transcode takes
+    settings: Arc<std::sync::RwLock<EncodingSettings>>,
+    /// What the ffmpeg build offers, probed the first time a transcode needs to know
+    capabilities: Arc<tokio::sync::OnceCell<FfmpegCapabilities>>,
+    /// Set when a hardware transcode failed and the same transcode ran in software: later
+    /// transcodes run in software until the options are saved again
+    hardware_failed: Arc<std::sync::atomic::AtomicBool>,
+    /// The warnings logged once, until the options are saved again
+    warned: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 /// The most progressive transcodes that run at once. Each is one client's playback, so this is
@@ -201,7 +228,117 @@ impl TranscodeManager {
             stopped: Arc::new(std::sync::Mutex::new(HashMap::new())),
             stop_memory: Duration::from_secs(60),
             max_progressive: MAX_PROGRESSIVE,
+            settings: Arc::new(std::sync::RwLock::new(EncodingSettings::default())),
+            capabilities: Arc::new(tokio::sync::OnceCell::new()),
+            hardware_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            warned: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         }
+    }
+
+    /// A manager that writes its transcodes under `root` instead of the data directory's
+    /// `transcodes` (`TranscodingTempPath`). Only the session directories (named by playback id)
+    /// in it are ever removed.
+    pub fn with_cache_root(mut self, root: PathBuf) -> Self {
+        self.cache_root = root;
+        self
+    }
+
+    /// The directory the transcodes are written under.
+    pub fn cache_root(&self) -> &Path {
+        &self.cache_root
+    }
+
+    /// The encoding options new transcodes take.
+    pub fn encoding_settings(&self) -> EncodingSettings {
+        self.settings
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Replace the encoding options. A hardware failure noted before is forgotten, so the
+    /// hardware is tried again, and the warnings may be logged again.
+    pub fn set_encoding_settings(&self, settings: EncodingSettings) {
+        *self.settings.write().unwrap_or_else(|e| e.into_inner()) = settings;
+        self.hardware_failed
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        self.warned
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
+    /// Log `message` as a warning the first time `key` is seen.
+    fn warn_once(&self, key: &str, message: &str) {
+        if self
+            .warned
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.to_string())
+        {
+            warn!("{message}");
+        }
+    }
+
+    async fn capabilities(&self) -> &FfmpegCapabilities {
+        self.capabilities
+            .get_or_init(|| encoding::probe_capabilities(&self.ffmpeg))
+            .await
+    }
+
+    /// `profile` with the server's encoding options. Hardware acceleration the ffmpeg build
+    /// lacks (its hwaccel or its encoder) and a tonemap without zscale fall back to software,
+    /// with a warning once; after a hardware failure everything runs in software.
+    async fn prepare(&self, profile: &TranscodeProfile) -> TranscodeProfile {
+        let mut p = profile.clone();
+        p.encoding = self.encoding_settings();
+        let encodes_video = !p.audio_only && !p.copy_video;
+        let accel = configured_accel(&p);
+        if encodes_video && accel != HwAccel::None {
+            if self
+                .hardware_failed
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return software_profile(&p);
+            }
+            let caps = self.capabilities().await;
+            let hwaccel = match accel {
+                HwAccel::Vaapi => "vaapi",
+                HwAccel::Qsv => "qsv",
+                HwAccel::Nvenc => "cuda",
+                HwAccel::None => "",
+            };
+            if !caps.has_hwaccel(hwaccel) {
+                self.warn_once(
+                    hwaccel,
+                    &format!("ffmpeg has no {hwaccel} hwaccel: transcoding in software"),
+                );
+                return software_profile(&p);
+            }
+            let encoder = encoding::encoder_family(&p.video_codec)
+                .and_then(|family| encoding::hardware_encoder(accel, family));
+            if p.encoding.enable_hardware_encoding
+                && let Some(encoder) = encoder
+                && !caps.has_encoder(encoder)
+            {
+                self.warn_once(
+                    encoder,
+                    &format!("ffmpeg has no {encoder} encoder: encoding in software"),
+                );
+                p.encoding.enable_hardware_encoding = false;
+            }
+        }
+        if encodes_video && p.encoding.enable_tonemapping && p.source_hdr.is_some() {
+            let caps = self.capabilities().await;
+            if !caps.has_filter("zscale") || !caps.has_filter("tonemap") {
+                self.warn_once(
+                    "tonemap",
+                    "ffmpeg has no zscale or tonemap filter: HDR video is not tonemapped",
+                );
+                p.encoding.enable_tonemapping = false;
+            }
+        }
+        p
     }
 
     /// Spawn a background task that every minute stops idle transcode sessions and removes
@@ -229,7 +366,44 @@ impl TranscodeManager {
     /// exits first, or when ffmpeg writes nothing for `playlist_wait` before the playlist (or the
     /// wait reaches `MAX_WAIT_FACTOR` times that); ffmpeg then keeps running.
     /// A play session stopped less than `stop_memory` ago fails at once with `Stopped`.
+    ///
+    /// A hardware transcode that fails is run again in software; when that one starts, the
+    /// hardware is turned off for later transcodes and a warning is logged once.
     pub async fn start_transcode(
+        &self,
+        item_id: Uuid,
+        input_path: &str,
+        profile: &TranscodeProfile,
+        play_session_id: &str,
+        device_id: &str,
+    ) -> Result<(PathBuf, Uuid), TranscodeError> {
+        let profile = self.prepare(profile).await;
+        let started = self
+            .start_prepared(item_id, input_path, &profile, play_session_id, device_id)
+            .await;
+        match started {
+            Err(TranscodeError::FfmpegFailed(message)) if uses_hardware(&profile) => {
+                let software = software_profile(&profile);
+                let retried = self
+                    .start_prepared(item_id, input_path, &software, play_session_id, device_id)
+                    .await;
+                if retried.is_ok()
+                    && !self
+                        .hardware_failed
+                        .swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    warn!(
+                        "hardware transcoding failed, falling back to software until the \
+                         encoding options are saved again: {message}"
+                    );
+                }
+                retried
+            }
+            started => started,
+        }
+    }
+
+    async fn start_prepared(
         &self,
         item_id: Uuid,
         input_path: &str,
@@ -500,6 +674,7 @@ impl TranscodeManager {
         play_session_id: &str,
         device_id: &str,
     ) -> Result<(Uuid, tokio::process::ChildStdout), TranscodeError> {
+        let profile = &self.prepare(profile).await;
         let _lock = self.start_lock.lock().await;
         if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(TranscodeError::FfmpegFailed(
@@ -951,6 +1126,7 @@ pub fn video_encoder(codec: &str) -> Option<&'static str> {
         "vp9" => "libvpx-vp9",
         "mpeg4" => "mpeg4",
         "mpeg2video" => "mpeg2video",
+        "av1" => "libsvtav1",
         _ => return None,
     })
 }
@@ -1040,36 +1216,32 @@ fn output_size((width, height): (u32, u32), max_width: u32, max_height: u32) -> 
 /// video as it is and the result scaled like any video (`scale_filter`, in software).
 fn image_overlay_graph(
     sub: ImageSubtitle,
-    hw_accel: HwAccel,
+    plan: HwPlan,
     profile: &TranscodeProfile,
+    tonemap: bool,
     scale_filter: &str,
 ) -> String {
     let overlay = "overlay=eof_action=pass:repeatlast=0";
     let index = sub.stream_index;
-    // Deinterlacing and square pixels run in `scale_filter`, after the overlay: the subtitle is
-    // laid over the frame as it is and the whole frame is made progressive and square
+    // Deinterlacing, square pixels and the tonemap run in `scale_filter`, after the overlay: the
+    // subtitle is laid over the frame as it is and the whole frame is made progressive, square
+    // and SDR
     let Some(size) = sub
         .video_size
-        .filter(|_| !profile.deinterlace && !profile.square_pixels)
+        .filter(|_| !profile.deinterlace && !profile.square_pixels && !tonemap)
     else {
         return format!("[0:V:0][1:{index}]{overlay},{scale_filter}[v]");
     };
     let (w, h) = output_size(size, profile.max_width, profile.max_height);
-    let (main, after) = match hw_accel {
-        HwAccel::None => (format!("scale={w}:{h},format=yuv420p"), String::new()),
-        HwAccel::Vaapi => (
-            format!("scale_vaapi=w={w}:h={h}:format=nv12,hwdownload,format=nv12"),
-            ",format=nv12,hwupload".to_string(),
-        ),
-        HwAccel::Nvenc => (
-            format!("scale_cuda=w={w}:h={h}:format=nv12,hwdownload,format=nv12"),
-            ",format=nv12".to_string(),
-        ),
-        HwAccel::Qsv => (
-            format!("scale_qsv=w={w}:h={h}:format=nv12,hwdownload,format=nv12"),
-            ",format=nv12".to_string(),
-        ),
+    let main = if plan.decode {
+        format!(
+            "{},hwdownload,format=nv12",
+            hw_scale(plan.accel, &w.to_string(), &h.to_string(), false)
+        )
+    } else {
+        format!("scale={w}:{h},format=yuv420p")
     };
+    let after = to_hw_encoder(plan);
     format!("[0:V:0]{main}[main];[1:{index}]scale={w}:{h}[sub];[main][sub]{overlay}{after}[v]")
 }
 
@@ -1114,7 +1286,139 @@ enum Output<'a> {
     Pipe { format: &'a str },
 }
 
+/// The acceleration a profile asks for: its own (a request's `HwAccel`), else the server's
+/// `HardwareAccelerationType` when the transcoder implements it.
+fn configured_accel(profile: &TranscodeProfile) -> HwAccel {
+    match profile.hw_accel {
+        HwAccel::None => profile.encoding.hardware_acceleration.transcoder_accel(),
+        accel => accel,
+    }
+}
+
+/// Whether `profile` decodes or encodes video on a device.
+fn uses_hardware(profile: &TranscodeProfile) -> bool {
+    !profile.audio_only && !profile.copy_video && configured_accel(profile) != HwAccel::None
+}
+
+/// `profile` without hardware acceleration.
+fn software_profile(profile: &TranscodeProfile) -> TranscodeProfile {
+    let mut software = profile.clone();
+    software.hw_accel = HwAccel::None;
+    software.encoding.hardware_acceleration = encoding::HardwareAccelerationType::None;
+    software
+}
+
+/// Whether the device decodes the source: its codec is in `HardwareDecodingCodecs`, and a 10-bit
+/// HEVC or VP9 only with `EnableDecodingColorDepth10Hevc`/`Vp9`. An unknown codec is decoded on
+/// the device.
+fn hardware_decodes(profile: &TranscodeProfile) -> bool {
+    let settings = &profile.encoding;
+    let Some(codec) = profile.source_video_codec.as_deref() else {
+        return true;
+    };
+    let codec = match codec {
+        "h265" => "hevc",
+        "avc" => "h264",
+        codec => codec,
+    };
+    let deep = profile.source_bit_depth.is_some_and(|depth| depth > 8);
+    settings.hardware_decoding_codecs.iter().any(|c| c == codec)
+        && !(deep && codec == "hevc" && !settings.enable_decoding_color_depth_10_hevc)
+        && !(deep && codec == "vp9" && !settings.enable_decoding_color_depth_10_vp9)
+}
+
+/// Where the video runs on a device: it is decoded there, encoded there, or both. `accel` is
+/// None when neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HwPlan {
+    accel: HwAccel,
+    decode: bool,
+    encode: bool,
+}
+
+/// The input arguments that open the device, and decode on it with `plan.decode`, as Jellyfin
+/// writes them on Linux.
+fn hw_input_args(plan: HwPlan, settings: &EncodingSettings) -> Vec<String> {
+    let (devices, hwaccel, name) = match plan.accel {
+        HwAccel::Vaapi => (
+            vec![
+                "-init_hw_device".to_string(),
+                format!("vaapi=va:{}", settings.vaapi_device),
+            ],
+            "vaapi",
+            "va",
+        ),
+        HwAccel::Qsv => {
+            let device = if settings.qsv_device.is_empty() {
+                "/dev/dri/renderD128"
+            } else {
+                settings.qsv_device.as_str()
+            };
+            (
+                vec![
+                    "-init_hw_device".to_string(),
+                    format!("vaapi=va:{device}"),
+                    "-init_hw_device".to_string(),
+                    "qsv=qs@va".to_string(),
+                ],
+                "qsv",
+                "qs",
+            )
+        }
+        HwAccel::Nvenc => (
+            vec!["-init_hw_device".to_string(), "cuda=cu:0".to_string()],
+            "cuda",
+            "cu",
+        ),
+        HwAccel::None => return Vec::new(),
+    };
+    let mut args = devices;
+    args.extend(["-filter_hw_device".to_string(), name.to_string()]);
+    if plan.decode {
+        args.extend(
+            [
+                "-hwaccel",
+                hwaccel,
+                "-hwaccel_output_format",
+                hwaccel,
+                "-hwaccel_device",
+                name,
+                "-noautorotate",
+            ]
+            .map(str::to_string),
+        );
+    }
+    args
+}
+
+/// The step that takes software frames to the device's encoder: VAAPI's encoder takes device
+/// frames only, NVENC's and QSV's take NV12 from memory.
+fn to_hw_encoder(plan: HwPlan) -> &'static str {
+    match plan.accel {
+        _ if !plan.encode => "",
+        HwAccel::Vaapi => ",format=nv12,hwupload",
+        HwAccel::Nvenc | HwAccel::Qsv => ",format=nv12",
+        HwAccel::None => "",
+    }
+}
+
+/// The device's scale within `max_width`×`max_height`, to 8-bit NV12 (`w`/`h` are expressions).
+fn hw_scale(accel: HwAccel, w: &str, h: &str, keep_aspect: bool) -> String {
+    let aspect = if keep_aspect {
+        ":force_original_aspect_ratio=decrease"
+    } else {
+        ""
+    };
+    match accel {
+        HwAccel::Vaapi => format!("scale_vaapi=w={w}:h={h}{aspect}:format=nv12"),
+        HwAccel::Nvenc => format!("scale_cuda=w={w}:h={h}{aspect}:format=nv12"),
+        HwAccel::Qsv => format!("scale_qsv=w={w}:h={h}:format=nv12"),
+        HwAccel::None => format!("scale={w}:{h}"),
+    }
+}
+
 fn ffmpeg_args(input: &str, output: Output<'_>, profile: &TranscodeProfile) -> Vec<String> {
+    let settings = &profile.encoding;
     let mut args: Vec<String> = Vec::new();
 
     // Overwrite output without asking; keep the banner and progress lines out of stderr
@@ -1123,14 +1427,15 @@ fn ffmpeg_args(input: &str, output: Output<'_>, profile: &TranscodeProfile) -> V
 
     // An image subtitle is overlaid in software. With hardware acceleration the device decodes
     // and scales to the output size first; that needs the video's size, so a subtitle without
-    // one turns hardware acceleration off. Deinterlacing and square pixels are software filters,
-    // so they turn it off too.
+    // one turns hardware acceleration off. Deinterlacing, square pixels and the tonemap are
+    // software filters, so they turn it off too.
     let image_subtitle = profile.image_subtitle.filter(|_| !profile.audio_only);
-    let software_filters = profile.deinterlace || profile.square_pixels;
+    let tonemap = profile.source_hdr.filter(|_| settings.enable_tonemapping);
+    let software_filters = profile.deinterlace || profile.square_pixels || tonemap.is_some();
     let hw_accel = match image_subtitle {
         _ if software_filters => HwAccel::None,
         Some(sub) if sub.video_size.is_none() => HwAccel::None,
-        _ => profile.hw_accel,
+        _ => configured_accel(profile),
     };
 
     // Burn-in, the overlay and the software filters need a re-encode, so they turn the copy off
@@ -1140,37 +1445,29 @@ fn ffmpeg_args(input: &str, output: Output<'_>, profile: &TranscodeProfile) -> V
         && !software_filters
         && image_subtitle.is_none();
 
+    // The encoder: the device's for the profile's codec with `EnableHardwareEncoding`, else the
+    // profile's own. The device decodes the codecs `HardwareDecodingCodecs` lists.
+    let hw_encoder = (hw_accel != HwAccel::None && settings.enable_hardware_encoding)
+        .then(|| {
+            encoding::encoder_family(&profile.video_codec)
+                .and_then(|family| encoding::hardware_encoder(hw_accel, family))
+        })
+        .flatten();
+    let hw_decode = hw_accel != HwAccel::None && hardware_decodes(profile);
+    let plan = HwPlan {
+        accel: if hw_decode || hw_encoder.is_some() {
+            hw_accel
+        } else {
+            HwAccel::None
+        },
+        decode: hw_decode,
+        encode: hw_encoder.is_some(),
+    };
+    let video_encoder = hw_encoder.unwrap_or(profile.video_codec.as_str());
+
     // Hardware acceleration input flags (skip for audio-only and copied video)
     if !profile.audio_only && !copy_video {
-        match hw_accel {
-            HwAccel::Vaapi => {
-                args.extend([
-                    "-hwaccel".to_string(),
-                    "vaapi".to_string(),
-                    "-hwaccel_output_format".to_string(),
-                    "vaapi".to_string(),
-                    "-vaapi_device".to_string(),
-                    "/dev/dri/renderD128".to_string(),
-                ]);
-            }
-            HwAccel::Nvenc => {
-                args.extend([
-                    "-hwaccel".to_string(),
-                    "cuda".to_string(),
-                    "-hwaccel_output_format".to_string(),
-                    "cuda".to_string(),
-                ]);
-            }
-            HwAccel::Qsv => {
-                args.extend([
-                    "-hwaccel".to_string(),
-                    "qsv".to_string(),
-                    "-hwaccel_output_format".to_string(),
-                    "qsv".to_string(),
-                ]);
-            }
-            HwAccel::None => {}
-        }
+        args.extend(hw_input_args(plan, settings));
     }
 
     // Resume or seek point: an input seek, so output time 0 is the start point
@@ -1198,73 +1495,74 @@ fn ffmpeg_args(input: &str, output: Output<'_>, profile: &TranscodeProfile) -> V
     } else if copy_video {
         args.extend(["-c:v".to_string(), "copy".to_string()]);
     } else {
-        // Video codec
-        let video_codec = match hw_accel {
-            HwAccel::Vaapi => "h264_vaapi".to_string(),
-            HwAccel::Nvenc => "h264_nvenc".to_string(),
-            HwAccel::Qsv => "h264_qsv".to_string(),
-            HwAccel::None => profile.video_codec.clone(),
-        };
-        args.extend(["-c:v".to_string(), video_codec]);
+        args.extend(["-c:v".to_string(), video_encoder.to_string()]);
 
-        // Video bitrate & resolution
+        // Video bitrate: x264 and x265 encode at the CRF under the limit, as Jellyfin's do; the
+        // other encoders keep to the bitrate
+        let kbps = profile.max_video_bitrate_kbps;
+        match encoding::crf(video_encoder, settings) {
+            Some(crf) => args.extend(["-crf".to_string(), crf.to_string()]),
+            None => args.extend(["-b:v".to_string(), format!("{kbps}k")]),
+        }
         args.extend([
-            "-b:v".to_string(),
-            format!("{}k", profile.max_video_bitrate_kbps),
             "-maxrate".to_string(),
-            format!("{}k", profile.max_video_bitrate_kbps),
+            format!("{kbps}k"),
             "-bufsize".to_string(),
-            format!("{}k", profile.max_video_bitrate_kbps * 2),
+            format!("{}k", kbps * 2),
         ]);
+        if settings.thread_count > 0 {
+            args.extend(["-threads".to_string(), settings.thread_count.to_string()]);
+        }
 
         // Scale filter. Its last step makes the frames 8-bit 4:2:0 (NV12 on the hardware
         // encoders): libx264 would keep a 10-bit or 4:2:2 source's format, which browsers
-        // can't decode
-        let scale_filter = match hw_accel {
-            HwAccel::Vaapi => format!(
-                "scale_vaapi=w='min({},iw)':h='min({},ih)':force_original_aspect_ratio=decrease:format=nv12",
-                profile.max_width, profile.max_height
-            ),
-            HwAccel::Nvenc => format!(
-                "scale_cuda=w='min({},iw)':h='min({},ih)':force_original_aspect_ratio=decrease:format=nv12",
-                profile.max_width, profile.max_height
-            ),
-            HwAccel::Qsv => format!(
-                "scale_qsv=w='min({},iw)':h='min({},ih)':format=nv12",
-                profile.max_width, profile.max_height
-            ),
-            HwAccel::None => format!(
-                "{}{}scale='min({},iw)':'min({},ih)':force_original_aspect_ratio=decrease,format=yuv420p",
-                if profile.deinterlace { "bwdif=0," } else { "" },
-                if profile.square_pixels {
-                    "scale=trunc(iw*sar/2)*2:ih,setsar=1,"
-                } else {
-                    ""
-                },
-                profile.max_width,
-                profile.max_height
-            ),
+        // can't decode. HDR video is tonemapped to SDR after the scale, in software.
+        let (w, h) = (
+            format!("'min({},iw)'", profile.max_width),
+            format!("'min({},ih)'", profile.max_height),
+        );
+        let device_scale = hw_scale(plan.accel, &w, &h, true);
+        let software_scale = format!(
+            "{}{}scale={w}:{h}:force_original_aspect_ratio=decrease,{}",
+            if profile.deinterlace { "bwdif=0," } else { "" },
+            if profile.square_pixels {
+                "scale=trunc(iw*sar/2)*2:ih,setsar=1,"
+            } else {
+                ""
+            },
+            if let Some(transfer) = tonemap {
+                encoding::software_tonemap_filter(settings, transfer)
+            } else {
+                "format=yuv420p".to_string()
+            },
+        );
+        // The frames at the output size, in memory (`decoded`) for a software filter
+        let decoded = if plan.decode {
+            format!("{device_scale},hwdownload,format=nv12")
+        } else {
+            software_scale.clone()
         };
 
         // Subtitle burn-in: an image subtitle is overlaid, and it wins over a text burn-in
         if let Some(sub) = image_subtitle {
-            let graph = image_overlay_graph(sub, hw_accel, profile, &scale_filter);
+            let graph = image_overlay_graph(sub, plan, profile, tonemap.is_some(), &software_scale);
             args.extend(["-filter_complex".to_string(), graph]);
         } else if profile.burn_subtitles {
             let sub_idx = profile.subtitle_stream_index.unwrap_or(0);
             let burn = subtitles_filter(input, sub_idx, profile.start_time_ticks);
-            if hw_accel == HwAccel::None {
-                // Software: combine scale + subtitles in one filter chain
-                args.extend(["-vf".to_string(), format!("{scale_filter},{burn}")]);
-            } else {
-                // HW accel: need to download → burn subs → upload (complex, use sw fallback for subs)
-                args.extend([
-                    "-vf".to_string(),
-                    format!("{scale_filter},hwdownload,format=nv12,{burn}"),
-                ]);
-            }
+            args.extend([
+                "-vf".to_string(),
+                format!("{decoded},{burn}{}", to_hw_encoder(plan)),
+            ]);
+        } else if plan.decode && plan.encode {
+            args.extend(["-vf".to_string(), device_scale]);
+        } else if plan.decode {
+            args.extend(["-vf".to_string(), decoded]);
         } else {
-            args.extend(["-vf".to_string(), scale_filter]);
+            args.extend([
+                "-vf".to_string(),
+                format!("{software_scale}{}", to_hw_encoder(plan)),
+            ]);
         }
     }
 
@@ -1293,22 +1591,42 @@ fn ffmpeg_args(input: &str, output: Output<'_>, profile: &TranscodeProfile) -> V
                 format!("{}k", profile.max_audio_bitrate_kbps),
             ]);
         }
-        args.extend([
-            "-ac".to_string(),
-            profile.audio_channels.unwrap_or(2).to_string(),
-        ]);
+        let channels = profile.audio_channels.unwrap_or(2);
+        args.extend(["-ac".to_string(), channels.to_string()]);
         if let Some(rate) = profile.audio_sample_rate {
             args.extend(["-ar".to_string(), rate.to_string()]);
         }
+        // A downmix to stereo takes the stereo algorithm's matrix and the volume boost
+        let downmix = encoding::downmix_filters(settings, profile.source_audio_channels, channels);
+        if !downmix.is_empty() {
+            args.extend(["-af".to_string(), downmix.join(",")]);
+        }
     }
+
+    // ffmpeg's buffer for packets waiting to be muxed (`MaxMuxingQueueSize`)
+    if !profile.audio_only {
+        args.extend([
+            "-max_muxing_queue_size".to_string(),
+            settings.max_muxing_queue_size.to_string(),
+        ]);
+    }
+
+    // The encoder's preset (`EncoderPreset`); none for audio-only, copied video and VAAPI
+    let preset = if !profile.audio_only && !copy_video {
+        encoding::preset_args(video_encoder, &settings.encoder_preset)
+    } else {
+        Vec::new()
+    };
+    // An encoded HEVC in MP4 segments gets the hvc1 tag Apple players need, as a copied one does
+    let encoded_hevc_tag = !profile.audio_only
+        && !copy_video
+        && profile.fmp4
+        && encoding::encoder_family(video_encoder) == Some("hevc");
 
     let (playlist_output, segment_pattern) = match output {
         Output::Hls { playlist, segments } => (playlist, segments),
         Output::Pipe { format } => {
-            // Preset for speed (skip for HW accel, audio-only and copied video)
-            if hw_accel == HwAccel::None && !profile.audio_only && !copy_video {
-                args.extend(["-preset".to_string(), "veryfast".to_string()]);
-            }
+            args.extend(preset);
             if profile.start_time_ticks > 0 && (copy_video || profile.copy_audio) {
                 args.extend(["-copypriorss".to_string(), "0".to_string()]);
             }
@@ -1338,6 +1656,8 @@ fn ffmpeg_args(input: &str, output: Output<'_>, profile: &TranscodeProfile) -> V
     // A copied video keeps the tag the client needs (hvc1 for HEVC on Apple players)
     if copy_video && let Some(tag) = &profile.video_tag {
         args.extend(["-tag:v".to_string(), tag.clone()]);
+    } else if encoded_hevc_tag {
+        args.extend(["-tag:v".to_string(), "hvc1".to_string()]);
     }
 
     // HLS output settings
@@ -1370,10 +1690,7 @@ fn ffmpeg_args(input: &str, output: Output<'_>, profile: &TranscodeProfile) -> V
         "0".to_string(),
     ]);
 
-    // Preset for speed (skip for HW accel, audio-only and copied video)
-    if hw_accel == HwAccel::None && !profile.audio_only && !copy_video {
-        args.extend(["-preset".to_string(), "veryfast".to_string()]);
-    }
+    args.extend(preset);
 
     // A copied stream would start with packets from before the start: drop those
     if profile.start_time_ticks > 0 && (copy_video || profile.copy_audio) {
@@ -1928,10 +2245,13 @@ mod tests {
                 .collect();
             assert!(hwaccel < inputs[0], "{hw_accel:?}: {args:?}");
             assert_eq!(values(&args, "-hwaccel").len(), 1, "{hw_accel:?}");
-            assert!(
-                !args.contains(&"-preset".to_string()),
-                "{hw_accel:?}: {args:?}"
-            );
+            // VAAPI has no preset; NVENC and QSV take the auto preset's
+            let preset = match hw_accel {
+                HwAccel::Nvenc => vec!["p1"],
+                HwAccel::Qsv => vec!["veryfast"],
+                _ => vec![],
+            };
+            assert_eq!(values(&args, "-preset"), preset, "{hw_accel:?}: {args:?}");
         }
         // Without the video's size the overlay stays in software
         let profile = TranscodeProfile {
@@ -2270,18 +2590,24 @@ mod tests {
             has_pair(&args, "-vf", &format!("{SW_SCALE},format=yuv420p,{burn}")),
             "{args:?}"
         );
-        // On hardware the scale makes the frames NV12, which the download keeps
+        // On hardware the scale makes the frames NV12, which the download keeps; they go back
+        // up for VAAPI, whose encoder takes only device frames
         for (hw_accel, _, scale) in HW_SCALES {
             let profile = TranscodeProfile {
                 hw_accel,
                 ..profile.clone()
+            };
+            let after = if hw_accel == HwAccel::Vaapi {
+                ",format=nv12,hwupload"
+            } else {
+                ",format=nv12"
             };
             let args = args_for(&profile);
             assert!(
                 has_pair(
                     &args,
                     "-vf",
-                    &format!("{scale},hwdownload,format=nv12,{burn}")
+                    &format!("{scale},hwdownload,format=nv12,{burn}{after}")
                 ),
                 "{hw_accel:?}: {args:?}"
             );
@@ -2312,10 +2638,11 @@ mod tests {
     }
 
     /// The args the base built for the default profile, before the format step, with the key
-    /// frames forced at segment starts that came later.
+    /// frames forced at segment starts and the default encoding options (CRF 23, the muxing
+    /// queue) that came later.
     fn base_args(input: &str, playlist: &str, segments: &str) -> Vec<String> {
-        "-y -hide_banner -nostats -i INPUT -c:v libx264 -b:v 8000k -maxrate 8000k -bufsize 16000k \
-         -vf SCALE -map 0:V:0? -map 0:a:0? -c:a aac -b:a 192k -ac 2 \
+        "-y -hide_banner -nostats -i INPUT -c:v libx264 -crf 23 -maxrate 8000k -bufsize 16000k \
+         -vf SCALE -map 0:V:0? -map 0:a:0? -c:a aac -b:a 192k -ac 2 -max_muxing_queue_size 2048 \
          -force_key_frames:v expr:gte(t,n_forced*6) -f hls -hls_time 6 \
          -hls_list_size 0 -hls_flags independent_segments -hls_segment_type mpegts \
          -hls_segment_filename SEGMENTS -hls_playlist_type event -start_number 0 \
@@ -2632,6 +2959,18 @@ echo "/in.mkv: Invalid data found when processing input" >&2
 exit 1
 "#;
 
+    /// Fails when asked to open a hardware device, else serves like `good`.
+    const FAKE_HWFAIL: &str = r#"#!/bin/sh
+for a; do
+    case "$a" in -init_hw_device) echo "Device creation failed: -22." >&2; exit 1;; esac
+done
+for last; do :; done
+dir=$(dirname "$last")
+printf 'g4' > "$dir/segment_0000.ts"
+printf '#EXTM3U\n#EXTINF:6.0,\nsegment_0000.ts\n' > "$last"
+exec sleep 30
+"#;
+
     /// Never writes a playlist.
     const FAKE_SLOW: &str = "#!/bin/sh\nexec sleep 30\n";
 
@@ -2706,6 +3045,7 @@ exec sleep 30
                 ("stalled", FAKE_STALLED),
                 ("family", FAKE_FAMILY),
                 ("piped", FAKE_PIPED),
+                ("hwfail", FAKE_HWFAIL),
             ] {
                 // Rename into place: another test process may be running the old file.
                 let tmp = dir.join(format!("{name}.{}", std::process::id()));
@@ -3380,5 +3720,421 @@ exec sleep 30
         assert_eq!(audio_encoder("MP3"), Some("libmp3lame"));
         assert_eq!(audio_encoder("dts"), None);
         assert_eq!(video_encoder("hevc"), Some("libx265"));
+    }
+
+    // ── r3transcoding: encoding options and hardware acceleration ──
+
+    /// A profile with the server's hardware type and a source video of `codec`.
+    fn hw_profile(
+        accel: encoding::HardwareAccelerationType,
+        codec: &str,
+        edit: impl FnOnce(&mut EncodingSettings),
+    ) -> TranscodeProfile {
+        let mut encoding = EncodingSettings {
+            hardware_acceleration: accel,
+            ..Default::default()
+        };
+        edit(&mut encoding);
+        TranscodeProfile {
+            encoding,
+            source_video_codec: Some(codec.to_string()),
+            source_bit_depth: Some(8),
+            ..Default::default()
+        }
+    }
+
+    /// The args before the first input.
+    fn input_args(args: &[String]) -> Vec<&str> {
+        let input = position(args, "-i");
+        args[3..input].iter().map(String::as_str).collect()
+    }
+
+    #[test]
+    fn r3transcoding_vaapi_args_match_jellyfin() {
+        use encoding::HardwareAccelerationType::Vaapi;
+        let profile = hw_profile(Vaapi, "h264", |s| {
+            s.vaapi_device = "/dev/dri/renderD129".into()
+        });
+        let args = args_for(&profile);
+        assert_eq!(
+            input_args(&args),
+            [
+                "-init_hw_device",
+                "vaapi=va:/dev/dri/renderD129",
+                "-filter_hw_device",
+                "va",
+                "-hwaccel",
+                "vaapi",
+                "-hwaccel_output_format",
+                "vaapi",
+                "-hwaccel_device",
+                "va",
+                "-noautorotate",
+            ]
+        );
+        assert!(has_pair(&args, "-c:v", "h264_vaapi"), "{args:?}");
+        assert!(has_pair(&args, "-b:v", "8000k"), "{args:?}");
+        assert!(has_pair(&args, "-vf", HW_SCALES[0].2), "{args:?}");
+        assert!(!args.contains(&"-preset".to_string()), "{args:?}");
+        assert!(!args.contains(&"-crf".to_string()), "{args:?}");
+    }
+
+    #[test]
+    fn r3transcoding_qsv_args_match_jellyfin() {
+        use encoding::HardwareAccelerationType::Qsv;
+        let args = args_for(&hw_profile(Qsv, "h264", |_| {}));
+        assert_eq!(
+            input_args(&args),
+            [
+                "-init_hw_device",
+                "vaapi=va:/dev/dri/renderD128",
+                "-init_hw_device",
+                "qsv=qs@va",
+                "-filter_hw_device",
+                "qs",
+                "-hwaccel",
+                "qsv",
+                "-hwaccel_output_format",
+                "qsv",
+                "-hwaccel_device",
+                "qs",
+                "-noautorotate",
+            ]
+        );
+        assert!(has_pair(&args, "-c:v", "h264_qsv"), "{args:?}");
+        assert!(has_pair(&args, "-vf", HW_SCALES[2].2), "{args:?}");
+        assert_eq!(values(&args, "-preset"), ["veryfast"]);
+        // QsvDevice names the render node
+        let args = args_for(&hw_profile(Qsv, "h264", |s| {
+            s.qsv_device = "/dev/dri/renderD129".into()
+        }));
+        assert!(has_pair(
+            &args,
+            "-init_hw_device",
+            "vaapi=va:/dev/dri/renderD129"
+        ));
+    }
+
+    #[test]
+    fn r3transcoding_nvenc_args_match_jellyfin() {
+        use encoding::HardwareAccelerationType::Nvenc;
+        let args = args_for(&hw_profile(Nvenc, "h264", |s| {
+            s.encoder_preset = "slow".into()
+        }));
+        assert_eq!(
+            input_args(&args),
+            [
+                "-init_hw_device",
+                "cuda=cu:0",
+                "-filter_hw_device",
+                "cu",
+                "-hwaccel",
+                "cuda",
+                "-hwaccel_output_format",
+                "cuda",
+                "-hwaccel_device",
+                "cu",
+                "-noautorotate",
+            ]
+        );
+        assert!(has_pair(&args, "-c:v", "h264_nvenc"), "{args:?}");
+        assert!(has_pair(&args, "-vf", HW_SCALES[1].2), "{args:?}");
+        assert_eq!(values(&args, "-preset"), ["p5"]);
+    }
+
+    #[test]
+    fn r3transcoding_unlisted_codec_decodes_in_software_and_uploads() {
+        use encoding::HardwareAccelerationType::{Nvenc, Qsv, Vaapi};
+        let sw = format!("{SW_SCALE},format=yuv420p");
+        for (accel, encoder, after) in [
+            (Vaapi, "h264_vaapi", ",format=nv12,hwupload"),
+            (Qsv, "h264_qsv", ",format=nv12"),
+            (Nvenc, "h264_nvenc", ",format=nv12"),
+        ] {
+            // HEVC is not in the default HardwareDecodingCodecs (h264, vc1)
+            let args = args_for(&hw_profile(accel, "hevc", |_| {}));
+            assert!(
+                !args.contains(&"-hwaccel".to_string()),
+                "{accel:?}: {args:?}"
+            );
+            assert!(args.contains(&"-init_hw_device".to_string()), "{accel:?}");
+            assert!(has_pair(&args, "-c:v", encoder), "{accel:?}: {args:?}");
+            assert!(
+                has_pair(&args, "-vf", &format!("{sw}{after}")),
+                "{accel:?}: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn r3transcoding_10bit_decode_follows_the_color_depth_options() {
+        use encoding::HardwareAccelerationType::Vaapi;
+        for (codec, on) in [
+            ("hevc", true),
+            ("hevc", false),
+            ("vp9", true),
+            ("vp9", false),
+        ] {
+            let mut profile = hw_profile(Vaapi, codec, |s| {
+                s.hardware_decoding_codecs = vec!["hevc".into(), "vp9".into()];
+                s.enable_decoding_color_depth_10_hevc = on;
+                s.enable_decoding_color_depth_10_vp9 = on;
+            });
+            profile.source_bit_depth = Some(10);
+            let args = args_for(&profile);
+            assert_eq!(
+                args.contains(&"-hwaccel".to_string()),
+                on,
+                "{codec} {on}: {args:?}"
+            );
+            // 8-bit decodes on the device either way
+            profile.source_bit_depth = Some(8);
+            assert!(args_for(&profile).contains(&"-hwaccel".to_string()));
+        }
+    }
+
+    #[test]
+    fn r3transcoding_hardware_encoding_off_downloads_for_x264() {
+        use encoding::HardwareAccelerationType::Vaapi;
+        let args = args_for(&hw_profile(Vaapi, "h264", |s| {
+            s.enable_hardware_encoding = false
+        }));
+        assert!(args.contains(&"-hwaccel".to_string()), "{args:?}");
+        assert!(has_pair(&args, "-c:v", "libx264"), "{args:?}");
+        assert!(has_pair(&args, "-crf", "23"), "{args:?}");
+        assert!(
+            has_pair(
+                &args,
+                "-vf",
+                &format!("{},hwdownload,format=nv12", HW_SCALES[0].2)
+            ),
+            "{args:?}"
+        );
+        assert_eq!(values(&args, "-preset"), ["veryfast"]);
+        // Neither decoded nor encoded on the device: no device at all
+        let args = args_for(&hw_profile(Vaapi, "hevc", |s| {
+            s.enable_hardware_encoding = false
+        }));
+        assert!(!args.contains(&"-init_hw_device".to_string()), "{args:?}");
+    }
+
+    #[test]
+    fn r3transcoding_stored_only_types_transcode_in_software() {
+        use encoding::HardwareAccelerationType::*;
+        let software = args_for(&hw_profile(None, "h264", |_| {}));
+        for accel in [VideoToolbox, Amf, Rkmpp, V4l2m2m] {
+            assert_eq!(
+                args_for(&hw_profile(accel, "h264", |_| {})),
+                software,
+                "{accel:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn r3transcoding_options_reach_the_args() {
+        let profile = TranscodeProfile {
+            encoding: EncodingSettings {
+                thread_count: 4,
+                h264_crf: 18,
+                encoder_preset: "slow".into(),
+                max_muxing_queue_size: 4096,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let args = args_for(&profile);
+        assert!(has_pair(&args, "-threads", "4"), "{args:?}");
+        assert!(has_pair(&args, "-crf", "18"), "{args:?}");
+        assert!(!args.contains(&"-b:v".to_string()), "{args:?}");
+        assert!(has_pair(&args, "-maxrate", "8000k"), "{args:?}");
+        assert_eq!(values(&args, "-preset"), ["slow"]);
+        assert!(
+            has_pair(&args, "-max_muxing_queue_size", "4096"),
+            "{args:?}"
+        );
+        // The default thread count lets ffmpeg choose
+        let args = args_for(&TranscodeProfile::default());
+        assert!(!args.contains(&"-threads".to_string()), "{args:?}");
+        // Progressive output takes them too; audio-only has no muxing queue or preset
+        let piped = build_progressive_args("/in.mkv", "matroska", &profile);
+        assert!(has_pair(&piped, "-crf", "18") && has_pair(&piped, "-preset", "slow"));
+        assert!(has_pair(&piped, "-max_muxing_queue_size", "4096"));
+        let audio = TranscodeProfile {
+            audio_only: true,
+            ..profile.clone()
+        };
+        let piped = build_progressive_args("/in.mkv", "mp3", &audio);
+        assert!(!piped.contains(&"-max_muxing_queue_size".to_string()));
+        assert!(!piped.contains(&"-preset".to_string()));
+    }
+
+    #[test]
+    fn r3transcoding_downmix_reaches_the_audio_args() {
+        let mut profile = TranscodeProfile {
+            source_audio_channels: Some(6),
+            ..Default::default()
+        };
+        assert!(has_pair(&args_for(&profile), "-af", "volume=2"));
+        profile.encoding.downmix_stereo_algorithm = "NightmodeDialogue".into();
+        profile.encoding.downmix_audio_boost = 1.0;
+        assert!(has_pair(
+            &args_for(&profile),
+            "-af",
+            "pan=stereo|c0=c2+0.30*c0+0.30*c4|c1=c2+0.30*c1+0.30*c5"
+        ));
+        // No downmix: stereo source, six output channels, or a copied track
+        for edit in [
+            |p: &mut TranscodeProfile| p.source_audio_channels = Some(2),
+            |p: &mut TranscodeProfile| p.audio_channels = Some(6),
+            |p: &mut TranscodeProfile| p.copy_audio = true,
+        ] {
+            let mut p = profile.clone();
+            edit(&mut p);
+            assert!(!args_for(&p).contains(&"-af".to_string()));
+        }
+    }
+
+    #[test]
+    fn r3transcoding_hevc_encode_in_fmp4_gets_the_hvc1_tag() {
+        let profile = TranscodeProfile {
+            video_codec: "libx265".into(),
+            fmp4: true,
+            ..Default::default()
+        };
+        let args = args_for(&profile);
+        assert!(has_pair(&args, "-c:v", "libx265"), "{args:?}");
+        assert!(has_pair(&args, "-crf", "28"), "{args:?}");
+        assert!(has_pair(&args, "-tag:v", "hvc1"), "{args:?}");
+        // On the device the HEVC encoder is the device's
+        let profile = TranscodeProfile {
+            hw_accel: HwAccel::Nvenc,
+            ..profile
+        };
+        assert!(has_pair(&args_for(&profile), "-c:v", "hevc_nvenc"));
+    }
+
+    #[test]
+    fn r3transcoding_software_tonemap_args() {
+        use encoding::HardwareAccelerationType::Vaapi;
+        let tonemap = encoding::software_tonemap_filter(
+            &EncodingSettings::default(),
+            encoding::HdrTransfer::Pq,
+        );
+        let mut profile = hw_profile(Vaapi, "hevc", |s| {
+            s.enable_tonemapping = true;
+            s.hardware_decoding_codecs = vec!["hevc".into()];
+        });
+        // SDR: no tonemap, on the device
+        let args = args_for(&profile);
+        assert!(!args.iter().any(|a| a.contains("tonemap")), "{args:?}");
+        assert!(args.contains(&"-hwaccel".to_string()));
+        // HDR: tonemapped in software after the scale
+        profile.source_hdr = Some(encoding::HdrTransfer::Pq);
+        let args = args_for(&profile);
+        assert!(
+            has_pair(&args, "-vf", &format!("{SW_SCALE},{tonemap}")),
+            "{args:?}"
+        );
+        assert!(has_pair(&args, "-c:v", "libx264"), "{args:?}");
+        assert!(!args.contains(&"-hwaccel".to_string()), "{args:?}");
+        // Tonemapping off: HDR goes through as before
+        profile.encoding.enable_tonemapping = false;
+        assert!(!args_for(&profile).iter().any(|a| a.contains("tonemap")));
+    }
+
+    /// The software tonemap runs in the installed ffmpeg on a PQ (HDR10) source.
+    #[test]
+    fn r3transcoding_software_tonemap_runs_in_ffmpeg() {
+        if !have_ffmpeg("r3transcoding_software_tonemap_runs_in_ffmpeg") {
+            return;
+        }
+        let dir = TestDir(std::env::temp_dir().join(format!("rustyfin-r3tm-{}", Uuid::new_v4())));
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let input = dir.0.join("hdr.mkv");
+        let make = "-f lavfi -i testsrc2=size=320x240:rate=25 -t 2 -c:v libx265 \
+                    -x265-params log-level=error -pix_fmt yuv420p10le -color_primaries bt2020 \
+                    -color_trc smpte2084 -colorspace bt2020nc";
+        let mut args: Vec<String> = make.split_whitespace().map(String::from).collect();
+        args.push(input.to_str().unwrap().to_string());
+        run_ffmpeg(&args, true);
+        let profile = TranscodeProfile {
+            source_hdr: Some(encoding::HdrTransfer::Pq),
+            encoding: EncodingSettings {
+                enable_tonemapping: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let out = transcode_into(&dir.0, "sdr", &input, &profile);
+        assert!(!segments_in(&out).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn r3transcoding_failed_hardware_falls_back_to_software() {
+        let (_dir, mgr) = fake_manager("hwfail", Duration::from_secs(10));
+        // What the build offers is known here, so no probe runs the fake
+        mgr.capabilities.set(FfmpegCapabilities::default()).unwrap();
+        mgr.set_encoding_settings(EncodingSettings {
+            hardware_acceleration: encoding::HardwareAccelerationType::Vaapi,
+            ..Default::default()
+        });
+        let item = Uuid::new_v4();
+        let (_, id) = start(&mgr, item, "psid-a", "dev").await.unwrap();
+        assert!(
+            mgr.hardware_failed
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+        let used = mgr.sessions.get(&id).unwrap().profile.clone();
+        assert!(!uses_hardware(&used), "{used:?}");
+        // Later transcodes start in software at once
+        let next = mgr.prepare(&TranscodeProfile::default()).await;
+        assert!(!uses_hardware(&next));
+        // Saving the options tries the hardware again
+        mgr.set_encoding_settings(mgr.encoding_settings());
+        assert!(uses_hardware(
+            &mgr.prepare(&TranscodeProfile::default()).await
+        ));
+    }
+
+    #[tokio::test]
+    async fn r3transcoding_missing_encoder_or_filter_falls_back() {
+        let dir = TestDir(std::env::temp_dir().join(format!("rustyfin-r3c-{}", Uuid::new_v4())));
+        let mgr = TranscodeManager::new(&dir.0);
+        mgr.capabilities
+            .set(FfmpegCapabilities {
+                hwaccels: Some(vec!["vaapi".into()]),
+                encoders: Some(["libx264".to_string()].into()),
+                filters: Some(["scale".to_string()].into()),
+            })
+            .unwrap();
+        mgr.set_encoding_settings(EncodingSettings {
+            hardware_acceleration: encoding::HardwareAccelerationType::Vaapi,
+            enable_tonemapping: true,
+            ..Default::default()
+        });
+        let p = mgr.prepare(&TranscodeProfile::default()).await;
+        assert!(uses_hardware(&p) && !p.encoding.enable_hardware_encoding);
+        let hdr = TranscodeProfile {
+            source_hdr: Some(encoding::HdrTransfer::Hlg),
+            ..Default::default()
+        };
+        assert!(!mgr.prepare(&hdr).await.encoding.enable_tonemapping);
+        // No vaapi hwaccel at all: software
+        let mgr = TranscodeManager::new(&dir.0);
+        mgr.capabilities
+            .set(FfmpegCapabilities {
+                hwaccels: Some(vec!["cuda".into()]),
+                ..Default::default()
+            })
+            .unwrap();
+        mgr.set_encoding_settings(EncodingSettings {
+            hardware_acceleration: encoding::HardwareAccelerationType::Vaapi,
+            ..Default::default()
+        });
+        assert!(!uses_hardware(
+            &mgr.prepare(&TranscodeProfile::default()).await
+        ));
     }
 }

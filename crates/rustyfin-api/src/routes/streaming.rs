@@ -613,7 +613,12 @@ async fn video_stream_answer(
     let mut query = super::transcode::to_file_numbering(query, source).await;
     // The remote bitrate limit, before the copy decision
     query.video_bitrate = caller.bitrate(query.video_bitrate);
-    let mut profile = super::transcode::progressive_video_profile(query, params, source);
+    let mut profile = super::transcode::progressive_video_profile(
+        query,
+        params,
+        source,
+        &state.transcode_manager.encoding_settings(),
+    );
     // The channels: never more than the client's limit, the played track's or the encoder's
     let track = profile
         .audio_stream_index

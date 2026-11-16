@@ -146,6 +146,7 @@ pub(super) fn audio_profile(
         start_time_ticks: param(params, "StartTimeTicks")
             .and_then(|v| v.parse().ok())
             .unwrap_or(0),
+        source_audio_channels: source_channels,
         ..TranscodeProfile::default()
     };
     let source_codec = stream

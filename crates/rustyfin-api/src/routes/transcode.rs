@@ -9,6 +9,7 @@ use axum::routing::{delete, get};
 use serde::Deserialize;
 use uuid::Uuid;
 
+use rustyfin_core::encoding::{self, EncodingSettings, HdrTransfer};
 use rustyfin_core::subtitle::is_image_subtitle;
 use rustyfin_core::transcode::{
     HwAccel, ImageSubtitle, TranscodeError, TranscodeProfile, audio_encoder, video_encoder,
@@ -190,6 +191,7 @@ struct Track {
     codec: String,        // lowercase
     bitrate: Option<u32>, // bits/s
     is_default: bool,
+    channels: Option<u32>,
 }
 
 /// What the transcode route knows about the source.
@@ -210,6 +212,8 @@ struct SourceInfo {
     /// What ffprobe says about an HEVC video that a client might take as it is; None until the
     /// file is probed, and a video without it is never copied as HEVC
     hevc: Option<HevcFacts>,
+    /// The video's HDR transfer (HDR10 or HLG), which tonemapping maps to SDR
+    hdr: Option<HdrTransfer>,
 }
 
 /// What decides whether a client takes an HEVC video as it is, read by ffprobe from the file:
@@ -329,6 +333,9 @@ impl SourceInfo {
             audio_bitrate: source.audio_bitrate,
             subtitles,
             hevc: None,
+            hdr: video
+                .and_then(MediaStream::video_range)
+                .and_then(|(_, range_type)| HdrTransfer::from_range_type(range_type)),
         }
     }
 }
@@ -345,6 +352,7 @@ fn source_track(stream: &MediaStream) -> Option<Track> {
             .to_ascii_lowercase(),
         bitrate: stream.bit_rate,
         is_default: stream.is_default,
+        channels: stream.channels,
     })
 }
 
@@ -697,15 +705,57 @@ fn stream_copy(query: &TranscodeQuery, source: &SourceInfo) -> (bool, bool) {
 }
 
 /// The profile of a transcode: the query's settings, the streams it copies, and the tracks it
-/// plays.
+/// plays, with the default encoding options.
+#[cfg(test)]
 fn transcode_profile(query: TranscodeQuery, source: &SourceInfo) -> TranscodeProfile {
+    transcode_profile_with(query, source, &EncodingSettings::default())
+}
+
+/// The encoder of an encoded video: the first codec the client lists that the encoding options
+/// allow (H.264, HEVC with `AllowHevcEncoding`, AV1 with `AllowAv1Encoding`), else H.264.
+fn video_encoder_for(query: &TranscodeQuery, settings: &EncodingSettings) -> &'static str {
+    let listed: Vec<String> = query
+        .video_codec
+        .as_deref()
+        .unwrap_or_default()
+        .split(',')
+        .map(|codec| codec.trim().to_ascii_lowercase())
+        .collect();
+    match encoding::output_video_codec(&listed, settings) {
+        "hevc" => "libx265",
+        "av1" => "libsvtav1",
+        _ => "libx264",
+    }
+}
+
+/// The profile of a transcode: the query's settings, the streams it copies, the tracks it
+/// plays, and what the source's video and audio decide under the encoding options (the video
+/// encoder, the hardware decode, the tonemap and the downmix).
+fn transcode_profile_with(
+    query: TranscodeQuery,
+    source: &SourceInfo,
+    settings: &EncodingSettings,
+) -> TranscodeProfile {
     let (copy_video, copy_audio) = stream_copy(&query, source);
+    let encoder = video_encoder_for(&query, settings);
     let tracks = choose_tracks(&query, source);
     // An encode deinterlaces an interlaced source, as Jellyfin's does, and makes the pixels
     // square when the client asks
     let deinterlace = !copy_video && source.interlaced;
     let square_pixels = !copy_video && source.anamorphic && query.wants_square_pixels();
     let mut profile = query.into_profile();
+    profile.source_video_codec = source.video_codec.clone();
+    profile.source_bit_depth = source.video_bit_depth;
+    profile.source_hdr = source.hdr;
+    profile.source_audio_channels = tracks
+        .audio
+        .and_then(|index| source.audio.iter().find(|track| track.index == index))
+        .and_then(|track| track.channels);
+    // An encoded HEVC or AV1 goes in fragmented MP4 segments, as a copied HEVC does
+    if !copy_video && !profile.audio_only && encoder != "libx264" {
+        profile.video_codec = encoder.to_string();
+        profile.fmp4 = true;
+    }
     profile.deinterlace = deinterlace;
     profile.square_pixels = square_pixels;
     profile.copy_video = copy_video;
@@ -761,6 +811,7 @@ pub(crate) fn progressive_video_profile(
     query: TranscodeQuery,
     params: &HashMap<String, String>,
     source: Option<&MediaSourceResponse>,
+    settings: &EncodingSettings,
 ) -> TranscodeProfile {
     let query = query.with_codec_options(params);
     let info = source.map_or_else(SourceInfo::default, SourceInfo::from_source);
@@ -783,7 +834,7 @@ pub(crate) fn progressive_video_profile(
     let audio_fits = audio_track.is_some_and(|track| {
         bitrate_fits(query.audio_bitrate, track.bitrate.or(info.audio_bitrate))
     });
-    let mut profile = transcode_profile(query, &info);
+    let mut profile = transcode_profile_with(query, &info, settings);
     if !profile.copy_video
         && tracks.burn_in.is_none()
         && !profile.audio_only
@@ -803,8 +854,20 @@ pub(crate) fn progressive_video_profile(
     {
         profile.copy_audio = true;
     }
-    if let Some(encoder) = video_codecs.iter().find_map(|c| video_encoder(c)) {
+    // HEVC and AV1 are encoded only when the encoding options allow them
+    let allowed = |codec: &&String| match codec.as_str() {
+        "hevc" | "h265" | "hvc1" | "hev1" => settings.allow_hevc_encoding,
+        "av1" => settings.allow_av1_encoding,
+        _ => true,
+    };
+    if let Some(encoder) = video_codecs
+        .iter()
+        .filter(allowed)
+        .find_map(|c| video_encoder(c))
+    {
         profile.video_codec = encoder.to_string();
+    } else {
+        profile.video_codec = "libx264".to_string();
     }
     if let Some(encoder) = audio_codecs.iter().find_map(|c| audio_encoder(c)) {
         profile.audio_codec = encoder.to_string();
@@ -902,7 +965,8 @@ async fn hls_master_playlist(
 
     let play_session_id = query.play_session_id.clone().unwrap_or_default();
     let device_id = query.device_id.clone().unwrap_or_default();
-    let profile = transcode_profile(query, &info);
+    let profile =
+        transcode_profile_with(query, &info, &state.transcode_manager.encoding_settings());
 
     let (playlist_path, playback_id) = match state
         .transcode_manager
@@ -1129,6 +1193,7 @@ mod tests {
             audio_bitrate: Some(192_000),
             subtitles: Vec::new(),
             hevc: None,
+            hdr: None,
         }
     }
 
@@ -2083,5 +2148,96 @@ mod tests {
             rewrite_playlist(content, &playback_id, Some("api_key=k")),
             expected
         );
+    }
+
+    // ── r3transcoding: the encoding options in the stream decisions ──
+
+    #[test]
+    fn r3transcoding_hls_encodes_hevc_or_av1_only_when_allowed() {
+        // Over the bitrate cap, so the H.264 source is encoded
+        let source = SourceInfo {
+            video_bitrate: Some(20_000_000),
+            ..h264_with(&["aac"])
+        };
+        let ask = || query("VideoCodec=av1,hevc,h264&VideoBitrate=4000000");
+        let mut settings = EncodingSettings::default();
+        let p = transcode_profile_with(ask(), &source, &settings);
+        assert!(!p.copy_video);
+        assert_eq!(p.video_codec, "libx264");
+        assert!(!p.fmp4);
+        settings.allow_hevc_encoding = true;
+        let p = transcode_profile_with(ask(), &source, &settings);
+        assert_eq!(p.video_codec, "libx265");
+        assert!(p.fmp4, "HEVC goes in fragmented MP4");
+        settings.allow_av1_encoding = true;
+        let p = transcode_profile_with(ask(), &source, &settings);
+        assert_eq!(p.video_codec, "libsvtav1");
+        // A copied video keeps its codec whatever the options say
+        let p = transcode_profile_with(
+            query("VideoCodec=hevc,h264"),
+            &h264_with(&["aac"]),
+            &settings,
+        );
+        assert!(p.copy_video && !p.fmp4);
+    }
+
+    #[test]
+    fn r3transcoding_progressive_encodes_hevc_only_when_allowed() {
+        let params = HashMap::new();
+        let ask = || TranscodeQuery {
+            video_codec: Some("hevc,h264".into()),
+            ..Default::default()
+        };
+        let mut settings = EncodingSettings::default();
+        let p = progressive_video_profile(ask(), &params, None, &settings);
+        assert_eq!(p.video_codec, "libx264");
+        settings.allow_hevc_encoding = true;
+        let p = progressive_video_profile(ask(), &params, None, &settings);
+        assert_eq!(p.video_codec, "libx265");
+        assert!(!p.fmp4, "progressive output has no segments");
+    }
+
+    #[test]
+    fn r3transcoding_profile_carries_the_source_facts() {
+        let mut source = h264_with(&["ac3", "aac"]);
+        source.audio[0].channels = Some(6);
+        source.hdr = Some(HdrTransfer::Pq);
+        source.video_bit_depth = Some(10);
+        let p = transcode_profile_with(
+            query("AudioStreamIndex=1&VideoCodec=h264&VideoBitrate=1000000"),
+            &source,
+            &EncodingSettings::default(),
+        );
+        assert_eq!(p.source_video_codec.as_deref(), Some("h264"));
+        assert_eq!(p.source_bit_depth, Some(10));
+        assert_eq!(p.source_hdr, Some(HdrTransfer::Pq));
+        assert_eq!(p.source_audio_channels, Some(6));
+    }
+
+    #[test]
+    fn r3transcoding_hdr_comes_from_the_video_range() {
+        let source = |transfer: &str| -> MediaSourceResponse {
+            serde_json::from_value(serde_json::json!({
+                "Id": Uuid::new_v4().to_string(),
+                "Uid": "source",
+                "Container": "mkv",
+                "Protocol": "File",
+                "Path": "/films/hdr.mkv",
+                "MediaStreams": [
+                    { "Index": 0, "CodecType": "Video", "Codec": "hevc",
+                      "ColorTransfer": transfer },
+                ],
+            }))
+            .unwrap()
+        };
+        assert_eq!(
+            SourceInfo::from_source(&source("smpte2084")).hdr,
+            Some(HdrTransfer::Pq)
+        );
+        assert_eq!(
+            SourceInfo::from_source(&source("arib-std-b67")).hdr,
+            Some(HdrTransfer::Hlg)
+        );
+        assert_eq!(SourceInfo::from_source(&source("bt709")).hdr, None);
     }
 }
