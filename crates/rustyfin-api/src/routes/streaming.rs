@@ -256,8 +256,9 @@ impl OwnedPaths {
             || lower.starts_with("passwordreset-") && lower.ends_with(".json")
     }
 
-    /// Whether the resolved `target` lies in the data dir form `data` as an owned file.
-    fn owned_by_name(data: &FilePath, target: &FilePath) -> bool {
+    /// Whether the resolved `target` lies in the data dir form `data` as an owned file, counting
+    /// the folders in `dirs` as owned.
+    fn owned_by_name(data: &FilePath, target: &FilePath, dirs: &[&str]) -> bool {
         let Ok(rest) = target.strip_prefix(data) else {
             return false;
         };
@@ -266,9 +267,7 @@ impl OwnedPaths {
             return false;
         };
         if parts.next().is_some() {
-            OWNED_DATA_DIRS
-                .iter()
-                .any(|dir| dir.eq_ignore_ascii_case(&first))
+            dirs.iter().any(|dir| dir.eq_ignore_ascii_case(&first))
         } else {
             Self::is_owned_data_file(&first)
         }
@@ -276,16 +275,22 @@ impl OwnedPaths {
 
     /// Whether the resolved `target` is one of these owned paths.
     fn owns(&self, target: &FilePath) -> bool {
+        self.owns_in(target, &OWNED_DATA_DIRS)
+    }
+
+    /// Whether the resolved `target` is one of these owned paths, counting only the data-dir
+    /// folders in `dirs` as owned.
+    fn owns_in(&self, target: &FilePath, dirs: &[&str]) -> bool {
         let data_forms = Self::forms(&self.data_dir);
         if data_forms
             .iter()
-            .any(|data| Self::owned_by_name(data, target))
+            .any(|data| Self::owned_by_name(data, target, dirs))
         {
             return true;
         }
         // Owned folders that are links out of the data dir
         let linked_dir = data_forms.iter().any(|data| {
-            OWNED_DATA_DIRS.iter().any(|dir| {
+            dirs.iter().any(|dir| {
                 data.join(dir)
                     .canonicalize()
                     .is_ok_and(|real| target != real && target.starts_with(&real))
@@ -345,10 +350,114 @@ async fn database_file(pool: &sqlx::SqlitePool) -> Option<std::path::PathBuf> {
         .map(std::path::PathBuf::from)
 }
 
+/// The paths this server owns: its data dir, its database file and its TLS files.
+async fn owned_paths(state: &AppState) -> OwnedPaths {
+    OwnedPaths {
+        data_dir: state.data_dir.to_path_buf(),
+        files: database_file(&state.db_ro)
+            .await
+            .into_iter()
+            .chain(
+                ["RUSTYFIN_TLS_KEY", "RUSTYFIN_TLS_CERT"]
+                    .into_iter()
+                    .filter_map(std::env::var_os)
+                    .map(std::path::PathBuf::from),
+            )
+            .collect(),
+    }
+}
+
+/// The data-dir folders that hold no pictures, so the image routes never read from them. The
+/// other owned folders (`cache`, `metadata`, `images`, `trickplay`) keep the server's pictures.
+const NON_IMAGE_DATA_DIRS: [&str; 5] = [
+    "logs",
+    "transcodes",
+    "plugins",
+    "backups",
+    "jellyfin-import-copy",
+];
+
+/// Whether `head`, the first bytes of a file, start like a picture: JPEG, PNG, GIF, WebP, BMP,
+/// ICO, TIFF, JPEG XL, an ISO media picture (AVIF, HEIF) or SVG.
+fn looks_like_image(head: &[u8]) -> bool {
+    const MAGIC: [&[u8]; 10] = [
+        b"\xFF\xD8\xFF",
+        b"\x89PNG\r\n\x1A\n",
+        b"GIF87a",
+        b"GIF89a",
+        b"BM",
+        b"\x00\x00\x01\x00",
+        b"II*\x00",
+        b"MM\x00*",
+        b"\xFF\x0A",
+        b"\x00\x00\x00\x0CJXL ",
+    ];
+    if MAGIC.iter().any(|magic| head.starts_with(magic)) {
+        return true;
+    }
+    let webp = head.starts_with(b"RIFF") && head.get(8..12) == Some(b"WEBP".as_slice());
+    let iso_media = head.get(4..8) == Some(b"ftyp".as_slice());
+    if webp || iso_media {
+        return true;
+    }
+    // SVG is text: an XML declaration or an <svg> tag first, and an <svg> tag in the head
+    let text = String::from_utf8_lossy(head);
+    let text = text.trim_start_matches('\u{FEFF}').trim_start();
+    (text.starts_with("<?xml") || text.starts_with("<svg")) && text.contains("<svg")
+}
+
+/// Whether the image routes may read `file_path`. Pictures live in library folders, in the data
+/// dir and in folders an import points at, so there is no library to hold them to. The file is
+/// refused when:
+/// - its path is relative or has a `..` component, or its links can't be resolved;
+/// - its resolved target is a path this server owns, other than a picture folder (see
+///   `NON_IMAGE_DATA_DIRS`): the database, config, TLS files, logs, backups and so on;
+/// - it does not start like a picture (see `looks_like_image`).
+fn image_path_allowed(file_path: &str, owned: &OwnedPaths) -> bool {
+    use std::io::Read;
+
+    let raw = FilePath::new(file_path);
+    if !raw.is_absolute() || has_parent_dir(raw) {
+        return false;
+    }
+    let Ok(canonical) = raw.canonicalize() else {
+        return false;
+    };
+    if owned.owns_in(&canonical, &NON_IMAGE_DATA_DIRS) {
+        return false;
+    }
+    let mut head = [0u8; 512];
+    let mut read = 0;
+    if let Ok(mut file) = std::fs::File::open(&canonical) {
+        while read < head.len() {
+            match file.read(&mut head[read..]) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => read += n,
+            }
+        }
+    }
+    looks_like_image(&head[..read])
+}
+
+/// Validates that a stored image path may be served (see `image_path_allowed`). The checks read
+/// the file system, so they run on a blocking thread.
+pub(crate) async fn validate_image_path(state: &AppState, file_path: &str) -> Result<(), ApiError> {
+    let owned = owned_paths(state).await;
+    let path = file_path.to_string();
+    let allowed = tokio::task::spawn_blocking(move || image_path_allowed(&path, &owned))
+        .await
+        .unwrap_or(false);
+    if allowed {
+        return Ok(());
+    }
+    tracing::warn!("image path '{}' is refused", file_path);
+    Err(ApiError::NotFound("image not found".to_string()))
+}
+
 /// Validates that `file_path` is inside one of the library's configured paths and not a link
 /// into the server's own data (see `path_allowed`). This prevents path traversal if the
 /// database is compromised.
-async fn validate_path_against_library(
+pub(crate) async fn validate_path_against_library(
     state: &AppState,
     library_id: &uuid::Uuid,
     file_path: &str,
@@ -362,19 +471,7 @@ async fn validate_path_against_library(
     if let Ok(Some(library)) =
         rustyfin_db::repo_library::get_library_by_id(&state.db_ro, *library_id).await
     {
-        let owned = OwnedPaths {
-            data_dir: state.data_dir.to_path_buf(),
-            files: database_file(&state.db_ro)
-                .await
-                .into_iter()
-                .chain(
-                    ["RUSTYFIN_TLS_KEY", "RUSTYFIN_TLS_CERT"]
-                        .into_iter()
-                        .filter_map(std::env::var_os)
-                        .map(std::path::PathBuf::from),
-                )
-                .collect(),
-        };
+        let owned = owned_paths(state).await;
         if path_allowed(file_path, &library.paths, &owned) {
             return Ok(());
         }
@@ -1893,6 +1990,99 @@ mod tests {
             &inner_libs,
             &owned(&data, &[]),
         ));
+    }
+
+    const R3_JPEG: &[u8] = b"\xFF\xD8\xFF\xE0\x00\x10JFIF\x00";
+    const R3_PNG: &[u8] = b"\x89PNG\r\n\x1A\n\x00\x00\x00\x0DIHDR";
+
+    #[test]
+    fn r3playback_pictures_are_told_from_other_files() {
+        for head in [
+            R3_JPEG,
+            R3_PNG,
+            b"GIF89a\x01\x00".as_slice(),
+            b"RIFF\x24\x00\x00\x00WEBPVP8 ".as_slice(),
+            b"\x00\x00\x00\x1Cftypavif".as_slice(),
+            b"BM\x36\x00".as_slice(),
+            b"<?xml version=\"1.0\"?>\n<svg xmlns=\"http://www.w3.org/2000/svg\"/>".as_slice(),
+            b"\xEF\xBB\xBF  <svg viewBox=\"0 0 1 1\"></svg>".as_slice(),
+        ] {
+            assert!(looks_like_image(head), "{head:?}");
+        }
+        for head in [
+            b"SQLite format 3\x00".as_slice(),
+            b"{\"ServerName\":\"x\"}".as_slice(),
+            b"-----BEGIN PRIVATE KEY-----".as_slice(),
+            b"root:x:0:0:root:/root:/bin/bash".as_slice(),
+            b"<?xml version=\"1.0\"?><movie/>".as_slice(),
+            b"\x1A\x45\xDF\xA3".as_slice(),
+            b"".as_slice(),
+            b"RIFF\x24\x00\x00\x00WAVEfmt ".as_slice(),
+        ] {
+            assert!(!looks_like_image(head), "{head:?}");
+        }
+    }
+
+    #[test]
+    fn r3playback_image_paths_refuse_owned_files_links_and_other_files() {
+        let dir = TempDir::new();
+        let lib = dir.path().join("lib");
+        let data = dir.path().join("data");
+        let import = dir.path().join("jellyfin").join("metadata");
+        for d in [&lib, &data, &import] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        for sub in ["metadata", "images", "cache", "logs", "backups", "plugins"] {
+            std::fs::create_dir_all(data.join(sub)).unwrap();
+        }
+        let tls = dir.path().join("key.pem");
+        std::fs::write(&tls, b"-----BEGIN PRIVATE KEY-----").unwrap();
+        std::fs::write(data.join("rustyfin.db"), b"SQLite format 3\x00").unwrap();
+        std::fs::write(data.join("config.json"), b"{}").unwrap();
+        let owned = owned(&data, &[&tls]);
+        let s = |p: &std::path::Path| p.to_str().unwrap().to_string();
+
+        // Pictures beside the media, in the server's picture folders and in an imported folder
+        let poster = lib.join("poster.jpg");
+        std::fs::write(&poster, R3_JPEG).unwrap();
+        for folder in ["metadata", "images", "cache"] {
+            let file = data.join(folder).join("a.png");
+            std::fs::write(&file, R3_PNG).unwrap();
+            assert!(image_path_allowed(&s(&file), &owned), "{folder}");
+        }
+        let imported = import.join("folder.jpg");
+        std::fs::write(&imported, R3_JPEG).unwrap();
+        assert!(image_path_allowed(&s(&poster), &owned));
+        assert!(image_path_allowed(&s(&imported), &owned));
+        // A link to a picture elsewhere still shows, as Jellyfin follows links too
+        std::os::unix::fs::symlink(&imported, lib.join("fanart.jpg")).unwrap();
+        assert!(image_path_allowed(&s(&lib.join("fanart.jpg")), &owned));
+
+        // The database, config and TLS key, stored or reached by a link with a picture's name
+        for (name, target) in [
+            ("db.jpg", data.join("rustyfin.db")),
+            ("config.jpg", data.join("config.json")),
+            ("key.jpg", tls.clone()),
+        ] {
+            std::os::unix::fs::symlink(&target, lib.join(name)).unwrap();
+            assert!(!image_path_allowed(&s(&lib.join(name)), &owned), "{name}");
+            assert!(!image_path_allowed(&s(&target), &owned), "{name}");
+        }
+        // A picture in a folder that holds none (logs, backups, plugins) is refused all the same
+        for folder in ["logs", "backups", "plugins"] {
+            let file = data.join(folder).join("b.jpg");
+            std::fs::write(&file, R3_JPEG).unwrap();
+            assert!(!image_path_allowed(&s(&file), &owned), "{folder}");
+        }
+        // A file that is no picture, `..`, a relative path and a missing file are refused
+        let text = lib.join("notes.jpg");
+        std::fs::write(&text, b"root:x:0:0:root:/root:/bin/bash").unwrap();
+        assert!(!image_path_allowed(&s(&text), &owned));
+        let dotdot = format!("{}/../lib/poster.jpg", lib.display());
+        assert!(!image_path_allowed(&dotdot, &owned));
+        assert!(!image_path_allowed("poster.jpg", &owned));
+        assert!(!image_path_allowed(&s(&lib.join("missing.jpg")), &owned));
+        assert!(!image_path_allowed(&s(&lib), &owned));
     }
 
     #[test]

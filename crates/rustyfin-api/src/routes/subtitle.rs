@@ -23,7 +23,7 @@ use rustyfin_core::subtitle::{
 use rustyfin_model::media_source::{MediaSourceResponse, MediaStream};
 
 use crate::error::ApiError;
-use crate::routes::streaming::{Version, select_version};
+use crate::routes::streaming::{Version, select_version, validate_path_against_library};
 use crate::state::AppState;
 
 pub fn routes() -> Router<AppState> {
@@ -72,13 +72,7 @@ async fn get_subtitle(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Item {id} not found")))?;
 
-    let media_path = PathBuf::from(&item.path);
-    let subs = discover_external_subtitles(&media_path);
-
-    let sub = subs
-        .into_iter()
-        .find(|s| s.index == index)
-        .ok_or_else(|| ApiError::NotFound(format!("Subtitle index {index} not found")))?;
+    let sub = external_subtitle(&state, &item, index).await?;
 
     let content = tokio::fs::read_to_string(&sub.path)
         .await
@@ -109,6 +103,26 @@ async fn get_subtitle(
     }
 }
 
+/// The external subtitle file `index` beside an item's file. The item's file and the subtitle
+/// file must both pass the library check the streams use, so neither a stored path nor a link
+/// beside it reads a file outside the library or one the server owns.
+async fn external_subtitle(
+    state: &AppState,
+    item: &rustyfin_model::media::MediaItem,
+    index: usize,
+) -> Result<rustyfin_core::subtitle::ExternalSubtitle, ApiError> {
+    validate_path_against_library(state, &item.library_id, &item.path).await?;
+    let media_path = PathBuf::from(&item.path);
+    let sub = tokio::task::spawn_blocking(move || discover_external_subtitles(&media_path))
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .find(|s| s.index == index)
+        .ok_or_else(|| ApiError::NotFound(format!("Subtitle index {index} not found")))?;
+    validate_path_against_library(state, &item.library_id, &sub.path.to_string_lossy()).await?;
+    Ok(sub)
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "PascalCase")]
 #[allow(dead_code)]
@@ -129,13 +143,7 @@ async fn get_subtitle_stream(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Item {id} not found")))?;
 
-    let media_path = PathBuf::from(&item.path);
-    let subs = discover_external_subtitles(&media_path);
-
-    let sub = subs
-        .into_iter()
-        .find(|s| s.index == index)
-        .ok_or_else(|| ApiError::NotFound(format!("Subtitle index {index} not found")))?;
+    let sub = external_subtitle(&state, &item, index).await?;
 
     let file = tokio::fs::File::open(&sub.path)
         .await
@@ -280,6 +288,11 @@ async fn subtitle_vtt(
     } else {
         (PathBuf::from(&source.path), format!("0:{index}"))
     };
+    // The input is read only when the streams' library check passes for it
+    let item = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Item {id} not found")))?;
+    validate_path_against_library(state, &item.library_id, &input.to_string_lossy()).await?;
     let meta = tokio::fs::metadata(&input).await.map_err(|e| {
         tracing::warn!("Cannot read the subtitle source {}: {e}", input.display());
         ApiError::Internal("Cannot read the subtitle source".to_string())

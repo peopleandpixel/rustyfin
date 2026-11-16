@@ -31998,6 +31998,235 @@ async fn r1play_media_in_the_data_dir_plays_owned_files_are_refused() {
     }
 }
 
+// R3 playback: the HLS input, subtitle and image routes read a stored path only when it passes
+// the checks the direct streams use; pictures, which live outside the libraries too, only when
+// they are pictures and not the server's own files
+
+/// GETs `uri` with a bearer token; returns the status and the body.
+async fn r3playback_get(app: &axum::Router, uri: &str, token: &str) -> (StatusCode, Vec<u8>) {
+    let req = Request::builder()
+        .uri(uri)
+        .header("Authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = resp
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .to_vec();
+    (status, body)
+}
+
+/// A movie library at `lib_dir` with one movie item whose stored path is `file`, which need not
+/// lie in the library.
+async fn r3playback_insert_item(
+    state: &AppState,
+    lib_dir: &std::path::Path,
+    file: &str,
+) -> uuid::Uuid {
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: format!("R3 {}", uuid::Uuid::new_v4().simple()),
+        content_type: rustyfin_model::library::LibraryContentType::Movies,
+        paths: vec![lib_dir.to_str().unwrap().to_string()],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    let item_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO media_items (id, library_id, name, media_type, path) VALUES (?, ?, ?, 'Movie', ?)",
+    )
+    .bind(item_id.to_string())
+    .bind(lib.id.to_string())
+    .bind("R3 Film")
+    .bind(file)
+    .execute(&state.db)
+    .await
+    .unwrap();
+    item_id
+}
+
+#[tokio::test]
+async fn r3playback_hls_input_outside_the_library_is_refused() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let lib = std::path::PathBuf::from(media_folder(&state, "r3hls"));
+    let outside = state.data_dir.join("r3-outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    let film = outside.join("Film.mkv");
+    std::fs::write(&film, vec![7u8; 500]).unwrap();
+    let db = state.data_dir.join("test.db");
+    std::os::unix::fs::symlink(&db, lib.join("Linked.mkv")).unwrap();
+    let s = |p: &std::path::Path| p.to_str().unwrap().to_string();
+    let mut ids = Vec::new();
+    for path in [
+        s(&film),
+        s(&db),
+        s(&lib.join("Linked.mkv")),
+        format!("{}/../r3-outside/Film.mkv", lib.display()),
+    ] {
+        ids.push(r3playback_insert_item(&state, &lib, &path).await);
+    }
+    let manager = state.transcode_manager.clone();
+    let app = app(state);
+
+    for id in ids {
+        let uri = format!("/Videos/{id}/main.m3u8?PlaySessionId=r3-{id}");
+        let (status, _) = r3playback_get(&app, &uri, &token).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{id}");
+        assert!(!manager.is_active(id).await, "{id}: ffmpeg started");
+    }
+}
+
+#[tokio::test]
+async fn r3playback_subtitle_routes_refuse_files_out_of_the_library() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let srt = "1\n00:00:01,000 --> 00:00:02,000\nR3 hello\n";
+    // A subtitle file of its own beside the film
+    let good = std::path::PathBuf::from(media_folder(&state, "r3subs-good"));
+    std::fs::write(good.join("Film.mkv"), vec![7u8; 500]).unwrap();
+    std::fs::write(good.join("Film.en.srt"), srt).unwrap();
+    // A subtitle link beside the film to the database
+    let linked = std::path::PathBuf::from(media_folder(&state, "r3subs-linked"));
+    std::fs::write(linked.join("Film.mkv"), vec![7u8; 500]).unwrap();
+    std::os::unix::fs::symlink(state.data_dir.join("test.db"), linked.join("Film.en.srt")).unwrap();
+    // A film stored outside its library, with a subtitle file beside it
+    let outside = state.data_dir.join("r3-subs-outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("Film.mkv"), vec![7u8; 500]).unwrap();
+    std::fs::write(outside.join("Film.en.srt"), srt).unwrap();
+
+    let s = |p: std::path::PathBuf| p.to_str().unwrap().to_string();
+    let good_id = r3playback_insert_item(&state, &good, &s(good.join("Film.mkv"))).await;
+    let linked_id = r3playback_insert_item(&state, &linked, &s(linked.join("Film.mkv"))).await;
+    let outside_id = r3playback_insert_item(&state, &good, &s(outside.join("Film.mkv"))).await;
+    for (id, dir) in [
+        (good_id, &good),
+        (linked_id, &linked),
+        (outside_id, &outside),
+    ] {
+        g4_insert_source(
+            &state,
+            id,
+            "mkv",
+            &dir.join("Film.mkv"),
+            &[("video", "h264")],
+        )
+        .await;
+    }
+    let app = app(state);
+
+    // The subtitle beside the film is served by all three routes
+    let routes = |id: uuid::Uuid| {
+        [
+            format!("/Videos/{id}/Subtitles/0/Stream"),
+            format!("/Videos/{id}/Subtitles/0?Format=vtt"),
+            format!("/Videos/{id}/{id}/Subtitles/1/Stream.vtt"),
+        ]
+    };
+    for uri in routes(good_id) {
+        let (status, body) = r3playback_get(&app, &uri, &token).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert!(String::from_utf8_lossy(&body).contains("R3 hello"), "{uri}");
+    }
+    // A link to the database and a film outside its library are refused before anything is read
+    for id in [linked_id, outside_id] {
+        for uri in routes(id) {
+            let (status, body) = r3playback_get(&app, &uri, &token).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+            assert!(!body.starts_with(b"SQLite format"), "{uri}: database bytes");
+            assert!(
+                !String::from_utf8_lossy(&body).contains("R3 hello"),
+                "{uri}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn r3playback_image_routes_serve_pictures_only() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let lib = std::path::PathBuf::from(media_folder(&state, "r3images"));
+    std::fs::write(lib.join("Film.mkv"), vec![7u8; 500]).unwrap();
+    let id = r3playback_insert_item(&state, &lib, lib.join("Film.mkv").to_str().unwrap()).await;
+
+    let db = state.data_dir.join("test.db");
+    std::fs::write(lib.join("poster.png"), TINY_PNG).unwrap();
+    std::os::unix::fs::symlink(&db, lib.join("backdrop.jpg")).unwrap();
+    std::fs::write(lib.join("notes.jpg"), b"not a picture at all").unwrap();
+    std::fs::write(state.data_dir.join("logs").join("logo.png"), TINY_PNG).unwrap();
+    std::fs::create_dir_all(state.data_dir.join("metadata")).unwrap();
+    std::fs::write(state.data_dir.join("metadata").join("art.png"), TINY_PNG).unwrap();
+
+    use rustyfin_model::image::ImageType;
+    let s = |p: std::path::PathBuf| p.to_str().unwrap().to_string();
+    let cases = [
+        (
+            ImageType::Primary,
+            s(lib.join("poster.png")),
+            StatusCode::OK,
+        ),
+        (
+            ImageType::Art,
+            s(state.data_dir.join("metadata").join("art.png")),
+            StatusCode::OK,
+        ),
+        (
+            ImageType::Backdrop,
+            s(lib.join("backdrop.jpg")),
+            StatusCode::NOT_FOUND,
+        ),
+        (ImageType::Thumb, s(db.clone()), StatusCode::NOT_FOUND),
+        (
+            ImageType::Banner,
+            s(lib.join("notes.jpg")),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            ImageType::Logo,
+            s(state.data_dir.join("logs").join("logo.png")),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            ImageType::Disc,
+            format!("{}/../r3images/poster.png", lib.display()),
+            StatusCode::NOT_FOUND,
+        ),
+    ];
+    for (image_type, path, _) in &cases {
+        let img = rustyfin_model::image::ItemImage {
+            item_id: id,
+            image_type: *image_type,
+            image_index: 0,
+            path: path.clone(),
+            provider: "local".to_string(),
+            width: None,
+            height: None,
+            blurhash: None,
+            stamp: None,
+        };
+        rustyfin_db::repo_image::upsert_image(&state.db, &img)
+            .await
+            .unwrap();
+    }
+    let app = app(state);
+
+    for (image_type, path, expected) in cases {
+        let uri = format!("/Items/{id}/Images/{}", image_type.as_str());
+        let (status, body) = r3playback_get(&app, &uri, &token).await;
+        assert_eq!(status, expected, "{uri} ({path})");
+        assert!(!body.starts_with(b"SQLite format"), "{uri}: database bytes");
+        assert!(!body.starts_with(b"not a picture"), "{uri}: text bytes");
+    }
+}
+
 #[tokio::test]
 async fn g4_unsatisfiable_ranges_get_416() {
     let state = test_state().await;

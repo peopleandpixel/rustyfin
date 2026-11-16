@@ -13,7 +13,9 @@ use rustyfin_core::subtitle::is_image_subtitle;
 use rustyfin_core::transcode::{HwAccel, ImageSubtitle, TranscodeError, TranscodeProfile};
 use rustyfin_model::media_source::{MediaSourceResponse, MediaStream};
 
-use super::streaming::{Version, requested_source_id, select_version};
+use super::streaming::{
+    Version, requested_source_id, select_version, validate_path_against_library,
+};
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -454,6 +456,8 @@ async fn hls_master_playlist(
             .unwrap_or_default();
     let version = select_version(id, &sources, requested_source_id(&params))?;
     let (input_path, source) = hls_input(&item.path, &sources, version);
+    // ffmpeg reads only a file that the streams' library check passes
+    validate_path_against_library(&state, &item.library_id, input_path).await?;
 
     // Copy only what the client plays; with no source to read, nothing is copied
     let info = source.map_or_else(SourceInfo::default, SourceInfo::from_source);
