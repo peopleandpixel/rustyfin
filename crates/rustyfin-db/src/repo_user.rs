@@ -374,6 +374,9 @@ pub enum PolicyChange {
     PromoteDisabled,
     /// The change would leave no enabled administrator. Nothing changed.
     LastAdmin,
+    /// The change would leave no enabled administrator who may sign in from outside the local
+    /// network (`EnableRemoteAccess`). Nothing changed.
+    NoRemoteAdmin,
 }
 
 /// Sets the administrator and disabled flags. `None` leaves a flag as it is. The checks and the update
@@ -385,6 +388,19 @@ pub async fn set_policy(
     id: Uuid,
     is_administrator: Option<bool>,
     is_disabled: Option<bool>,
+) -> Result<PolicyChange, sqlx::Error> {
+    set_policy_with(pool, id, is_administrator, is_disabled, None).await
+}
+
+/// `set_policy`, also storing the parental and access policy `limits` when given, in the same
+/// transaction, so a refused change stores neither. With `limits`, a change that would leave no
+/// enabled administrator with remote access is refused (`NoRemoteAdmin`).
+pub async fn set_policy_with(
+    pool: &SqlitePool,
+    id: Uuid,
+    is_administrator: Option<bool>,
+    is_disabled: Option<bool>,
+    limits: Option<&rustyfin_model::parental::ParentalPolicy>,
 ) -> Result<PolicyChange, sqlx::Error> {
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
 
@@ -422,6 +438,35 @@ pub async fn set_policy(
         if !others {
             tx.rollback().await?;
             return Ok(PolicyChange::LastAdmin);
+        }
+    }
+
+    if let Some(limits) = limits {
+        // The enabled administrators other than this user who may sign in remotely; this user
+        // counts after the change.
+        let others: Vec<String> = sqlx::query_scalar(
+            "SELECT access_policy FROM users WHERE is_administrator = 1 AND is_disabled = 0 AND id <> ?",
+        )
+        .bind(id.to_string())
+        .fetch_all(&mut *tx)
+        .await?;
+        let remote = |json: &str| {
+            serde_json::from_str::<rustyfin_model::parental::AccessPolicy>(json)
+                .is_ok_and(|a| a.enable_remote_access)
+        };
+        let current: String = sqlx::query_scalar("SELECT access_policy FROM users WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_one(&mut *tx)
+            .await?;
+        let was = cur_admin && !cur_disabled && remote(&current);
+        let will = new_admin && !new_disabled && limits.access.enable_remote_access;
+        if was && !will && !others.iter().any(|json| remote(json)) {
+            tx.rollback().await?;
+            return Ok(PolicyChange::NoRemoteAdmin);
+        }
+        if !crate::repo_parental::write_policy(&mut tx, id, limits).await? {
+            tx.rollback().await?;
+            return Ok(PolicyChange::NotFound);
         }
     }
 

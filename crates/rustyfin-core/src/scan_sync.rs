@@ -8,17 +8,17 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use chrono::{DateTime, FixedOffset, Utc};
-use rustyfin_db::repo_media::PathScope;
+use rustyfin_db::repo_media::{PathScope, SORT_NAME_KEPT};
 use rustyfin_db::repo_media_source::PROBE_VERSION;
 use rustyfin_model::library::{Library, LibraryContentType};
-use rustyfin_model::media::LocationType;
+use rustyfin_model::media::{LocationType, MediaType};
 use rustyfin_model::metadata::ExternalMetadata;
 use sqlx::{SqliteConnection, SqlitePool};
 use uuid::Uuid;
 
 use crate::naming::{self, VersionGroup, is_ignored_dir, is_ignored_file};
 use crate::probe::ProbeStep;
-use crate::scanner::{parse_year, season_sort_name};
+use crate::scanner::{auto_sort_name, parse_year, season_sort_name};
 
 /// Deletes the item `id` and the rows that refer to it, in one transaction.
 ///
@@ -386,6 +386,7 @@ pub struct GoneTrack {
     pub name: String,
     pub sort_name: Option<String>,
     pub index_number: Option<i32>,
+    pub parent_index_number: Option<i32>,
 }
 
 /// The tracks of `library` in `scope` that are gone (see [`gone_items`]). A music scan reads them
@@ -409,9 +410,10 @@ pub async fn gone_tracks(
         name: String,
         sort_name: Option<String>,
         index_number: Option<i32>,
+        parent_index_number: Option<i32>,
     }
     let rows: Vec<TrackRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT id, path, name, sort_name, index_number FROM media_items
+        "SELECT id, path, name, sort_name, index_number, parent_index_number FROM media_items
          WHERE library_id = ?1 AND media_type = ?2 AND {}",
         scope.sql("path", 3)
     )))
@@ -429,6 +431,7 @@ pub async fn gone_tracks(
                 name: row.name,
                 sort_name: row.sort_name,
                 index_number: row.index_number,
+                parent_index_number: row.parent_index_number,
             });
         }
     }
@@ -484,17 +487,23 @@ pub async fn take_over_track(
     } else {
         track.name.as_str()
     };
-    let sort_name = match &track.sort_name {
-        Some(sort_name) if *sort_name != old_stem.to_lowercase() => sort_name.clone(),
-        _ => stem(path).to_lowercase(),
-    };
-    sqlx::query("UPDATE media_items SET path = ?1, name = ?2, sort_name = ?3 WHERE id = ?4")
-        .bind(path)
-        .bind(name)
-        .bind(sort_name)
-        .bind(track.id.to_string())
-        .execute(pool)
-        .await?;
+    // A forced or locked sort name stays.
+    let sort_name = auto_sort_name(
+        MediaType::Audio,
+        name,
+        track.parent_index_number,
+        track.index_number,
+    );
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE media_items SET path = ?1, name = ?2,
+         sort_name = CASE WHEN {SORT_NAME_KEPT} THEN sort_name ELSE ?3 END WHERE id = ?4"
+    )))
+    .bind(path)
+    .bind(name)
+    .bind(sort_name)
+    .bind(track.id.to_string())
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -970,8 +979,12 @@ pub async fn settle_series(
                 if new.name == folder.folder {
                     new.name = title.to_string();
                 }
-                if new.sort_name.as_deref() == Some(&folder.folder.to_lowercase()) {
-                    new.sort_name = Some(title.to_lowercase());
+                // A sort name the scan made from the folder name is made from the title instead
+                if new.sort_name.as_deref() == Some(&folder.folder.to_lowercase())
+                    || new.sort_name
+                        == auto_sort_name(MediaType::Series, &folder.folder, None, None)
+                {
+                    new.sort_name = auto_sort_name(MediaType::Series, title, None, None);
                 }
                 new.production_year = new.production_year.or(Some(year));
             }
@@ -1043,13 +1056,15 @@ pub async fn settle_series(
     for (new, old) in changes {
         // An item that another writer changed since it was read is left to the next scan. Its images are
         // deleted below either way.
-        changed += sqlx::query(
-            "UPDATE media_items SET name = ?1, sort_name = ?2, overview = ?3, production_year = ?4,
+        changed += sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE media_items SET name = ?1,
+                 sort_name = CASE WHEN {SORT_NAME_KEPT} THEN sort_name ELSE ?2 END,
+                 overview = ?3, production_year = ?4,
                  community_rating = ?5, official_rating = ?6, genres = ?7, runtime_ticks = ?8
              WHERE id = ?9 AND name IS ?10 AND sort_name IS ?11 AND overview IS ?12
                  AND production_year IS ?13 AND community_rating IS ?14 AND official_rating IS ?15
-                 AND genres IS ?16 AND runtime_ticks IS ?17",
-        )
+                 AND genres IS ?16 AND runtime_ticks IS ?17"
+        )))
         .bind(&new.name)
         .bind(&new.sort_name)
         .bind(&new.overview)
@@ -1472,7 +1487,7 @@ async fn settle_group(
     let old_stem = Path::new(&survivor.path)
         .file_stem()
         .map(|stem| stem.to_string_lossy().into_owned());
-    let old_stem_lower = old_stem.as_ref().map(|stem| stem.to_lowercase());
+
     let old_year = old_stem.as_deref().and_then(parse_year);
 
     let given_name = match &group.wanted {
@@ -1483,11 +1498,6 @@ async fn settle_group(
         given_name.to_string()
     } else {
         survivor.name.clone()
-    };
-    let sort_name = if survivor.sort_name.is_none() || survivor.sort_name == old_stem_lower {
-        Some(given_name.to_lowercase())
-    } else {
-        survivor.sort_name.clone()
     };
     // A movie takes its year and keeps its episode fields. An episode keeps its year and takes the
     // group's numbers and season.
@@ -1518,6 +1528,30 @@ async fn settle_group(
                 Some(season.to_string()),
             ),
         };
+    // A sort name that the scan made, from the old file stem or from the name and numbers, is
+    // made again; another one is kept, and so is a forced or locked one (the UPDATE below).
+    let media_type = match &group.wanted {
+        Wanted::Movie { .. } => MediaType::Movie,
+        Wanted::Episode { .. } => MediaType::Episode,
+    };
+    let made_by_scan = survivor.sort_name.is_none()
+        || survivor.sort_name == old_stem.as_ref().map(|stem| stem.to_lowercase())
+        || survivor.sort_name
+            == auto_sort_name(
+                media_type,
+                &survivor.name,
+                survivor.parent_index_number,
+                survivor.index_number,
+            )
+        || survivor.sort_name
+            == old_stem
+                .as_deref()
+                .and_then(|stem| auto_sort_name(media_type, stem, None, None));
+    let sort_name = if made_by_scan {
+        auto_sort_name(media_type, &name, parent_index_number, index_number)
+    } else {
+        survivor.sort_name.clone()
+    };
     let fields_changed = survivor.path != primary
         || name != survivor.name
         || sort_name != survivor.sort_name
@@ -1534,11 +1568,13 @@ async fn settle_group(
             delete_item_in(&mut tx, &other.id).await?;
         }
         if fields_changed {
-            sqlx::query(
-                "UPDATE media_items SET path = ?1, name = ?2, sort_name = ?3, production_year = ?4,
-                 index_number = ?5, parent_index_number = ?6, parent_id = ?7, index_number_end = ?8
-                 WHERE id = ?9",
-            )
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "UPDATE media_items SET path = ?1, name = ?2,
+                     sort_name = CASE WHEN {SORT_NAME_KEPT} THEN sort_name ELSE ?3 END,
+                     production_year = ?4, index_number = ?5, parent_index_number = ?6,
+                     parent_id = ?7, index_number_end = ?8
+                     WHERE id = ?9"
+            )))
             .bind(primary)
             .bind(name.as_str())
             .bind(sort_name.as_deref())

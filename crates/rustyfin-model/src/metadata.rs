@@ -5,6 +5,9 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "PascalCase")]
 pub struct ExternalMetadata {
     pub name: Option<String>,
+    /// An NFO's `<sorttitle>`: a forced sort name, as Jellyfin's NFO parsers make it.
+    #[serde(default)]
+    pub sort_title: Option<String>,
     pub overview: Option<String>,
     pub production_year: Option<i32>,
     pub community_rating: Option<f64>,

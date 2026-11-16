@@ -7,7 +7,7 @@ use rustyfin_db::repo_playlist::PlaylistCaller;
 use rustyfin_model::auth::Claims;
 use rustyfin_model::collection::CollectionDto;
 use rustyfin_model::media::{MediaItem, MediaType, QueryResult};
-use rustyfin_model::playlist::PlaylistDto;
+use rustyfin_model::playlist::{PlaylistDto, PlaylistUserPermissions};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -40,7 +40,9 @@ pub fn routes() -> Router<AppState> {
         .route("/Playlists/{id}/Users", get(get_playlist_users))
         .route(
             "/Playlists/{id}/Users/{userId}",
-            get(get_playlist_user).delete(remove_playlist_user),
+            get(get_playlist_user)
+                .post(set_playlist_user)
+                .delete(remove_playlist_user),
         )
 }
 
@@ -59,15 +61,19 @@ pub fn admin_routes() -> Router<AppState> {
         )
 }
 
+/// GET /Collections: every collection the caller may see, by name. Collections are shared by all
+/// users, as in Jellyfin.
 async fn get_collections(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<Vec<CollectionDto>>, ApiError> {
-    let mut collections =
-        rustyfin_db::repo_collection::get_collections(&state.db_ro, claims.sub).await?;
+    let all = rustyfin_db::repo_collection::get_all_collections(&state.db_ro).await?;
     let hidden = HiddenItems::for_caller(&state, &claims).await?;
-    for collection in &mut collections {
-        visible_collection_count(&state, &hidden, collection).await?;
+    let mut collections = Vec::with_capacity(all.len());
+    for mut collection in all {
+        if visible_collection_count(&state, &hidden, &mut collection).await? {
+            collections.push(collection);
+        }
     }
     Ok(Json(collections))
 }
@@ -77,28 +83,52 @@ async fn get_collection(
     Path(id): Path<Uuid>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<CollectionDto>, ApiError> {
-    let mut collection = rustyfin_db::repo_collection::get_collection(&state.db_ro, id)
-        .await?
-        .ok_or_else(|| ApiError::NotFound("Collection not found".to_string()))?;
     let hidden = HiddenItems::for_caller(&state, &claims).await?;
-    visible_collection_count(&state, &hidden, &mut collection).await?;
+    let collection = visible_collection(&state, &hidden, id)
+        .await?
+        .ok_or_else(collection_not_found)?;
     Ok(Json(collection))
 }
 
+fn collection_not_found() -> ApiError {
+    ApiError::NotFound("Collection not found".to_string())
+}
+
+/// A collection the caller may see, with its count of the items they see; None when it doesn't
+/// exist or is hidden from them.
+async fn visible_collection(
+    state: &AppState,
+    hidden: &HiddenItems,
+    id: Uuid,
+) -> Result<Option<CollectionDto>, ApiError> {
+    let Some(mut collection) =
+        rustyfin_db::repo_collection::get_collection(&state.db_ro, id).await?
+    else {
+        return Ok(None);
+    };
+    let visible = visible_collection_count(state, hidden, &mut collection).await?;
+    Ok(visible.then_some(collection))
+}
+
 /// For a user with parental limits, a collection's `ChildCount` counts only the items they may
-/// see, as its item list shows them.
+/// see, as its item list shows them. Answers whether they may see the collection at all: as
+/// Jellyfin's `BoxSet.IsVisible`, an empty one shows, and one whose every item is hidden from
+/// them doesn't.
 async fn visible_collection_count(
     state: &AppState,
     hidden: &HiddenItems,
     collection: &mut CollectionDto,
-) -> Result<(), ApiError> {
-    if hidden.is_restricted() {
-        let mut items =
-            rustyfin_db::repo_collection::get_collection_items(&state.db_ro, collection.id).await?;
-        hidden.retain(&mut items, |i| i.id);
-        collection.child_count = items.len() as i64;
+) -> Result<bool, ApiError> {
+    if hidden.is_restricted() && collection.child_count > 0 {
+        let mut ids =
+            rustyfin_db::repo_collection::get_collection_item_ids(&state.db_ro, collection.id)
+                .await?;
+        // Ratings, tags and library access alike
+        hidden.retain_ids(state, &mut ids).await?;
+        collection.child_count = ids.len() as i64;
+        return Ok(!ids.is_empty());
     }
-    Ok(())
+    Ok(true)
 }
 
 /// The same for a playlist the caller can read.
@@ -113,7 +143,7 @@ async fn visible_playlist_count(
         let mut items =
             rustyfin_db::repo_playlist::get_playlist_items(&state.db_ro, playlist.id, caller)
                 .await?;
-        hidden.retain(&mut items, |i| i.id);
+        hidden.retain(&mut items);
         playlist.child_count = items.len() as i64;
     }
     Ok(())
@@ -217,7 +247,7 @@ async fn ensure_collection(state: &AppState, id: Uuid) -> Result<(), ApiError> {
     rustyfin_db::repo_collection::get_collection(&state.db_ro, id)
         .await?
         .map(|_| ())
-        .ok_or_else(|| ApiError::NotFound("Collection not found".to_string()))
+        .ok_or_else(collection_not_found)
 }
 
 async fn get_collection_items(
@@ -225,10 +255,12 @@ async fn get_collection_items(
     Path(id): Path<Uuid>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<QueryResult>, ApiError> {
-    let mut items = rustyfin_db::repo_collection::get_collection_items(&state.db_ro, id).await?;
-    HiddenItems::for_caller(&state, &claims)
+    let hidden = HiddenItems::for_caller(&state, &claims).await?;
+    visible_collection(&state, &hidden, id)
         .await?
-        .retain(&mut items, |i| i.id);
+        .ok_or_else(collection_not_found)?;
+    let mut items = rustyfin_db::repo_collection::get_collection_items(&state.db_ro, id).await?;
+    hidden.retain(&mut items);
     let count = items.len() as i64;
     Ok(Json(QueryResult {
         items,
@@ -266,7 +298,8 @@ async fn get_playlists(
     Ok(Json(playlists))
 }
 
-/// Administrators reach any playlist; everyone else only their own.
+/// Administrators reach any playlist; everyone else their own, public ones, and ones shared with
+/// them (the repository's access rules tell reading from changing).
 fn playlist_caller(claims: &Claims) -> PlaylistCaller {
     if claims.is_admin {
         PlaylistCaller::Admin
@@ -290,6 +323,10 @@ async fn get_playlist(
         .ok_or_else(playlist_not_found)?;
     let hidden = HiddenItems::for_caller(&state, &claims).await?;
     visible_playlist_count(&state, &claims, &hidden, &mut playlist).await?;
+    let mut ids =
+        rustyfin_db::repo_playlist::get_playlist_item_ids(&state.db_ro, id, caller).await?;
+    hidden.retain_ids(&state, &mut ids).await?;
+    playlist.item_ids = Some(ids);
     Ok(Json(playlist))
 }
 
@@ -300,7 +337,9 @@ async fn delete_playlist(
 ) -> Result<StatusCode, ApiError> {
     let caller = playlist_caller(&claims);
     if !rustyfin_db::repo_playlist::delete_playlist(&state.db, id, caller).await? {
-        return Err(playlist_not_found());
+        // 403 for a playlist the caller reads but doesn't own, 404 for one they can't see
+        ensure_playlist_visible(&state, id, &claims).await?;
+        return Err(playlist_delete_forbidden());
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -331,6 +370,8 @@ async fn create_playlist(
         }
     }
     let media_type = text_param(&params, body, "MediaType");
+    let shares = playlist_users(body)?;
+    let public = flag_param(&params, body, "IsPublic")?;
     let id = Uuid::new_v4();
     rustyfin_db::repo_playlist::create_playlist(
         &state.db,
@@ -341,6 +382,12 @@ async fn create_playlist(
         &item_ids,
     )
     .await?;
+    if let Some(shares) = shares {
+        rustyfin_db::repo_playlist::replace_shares(&state.db, id, &shares).await?;
+    }
+    if let Some(public) = public {
+        rustyfin_db::repo_playlist::set_open_access(&state.db, id, public).await?;
+    }
 
     let pl = rustyfin_db::repo_playlist::get_playlist(&state.db, id, PlaylistCaller::Admin)
         .await?
@@ -379,7 +426,7 @@ pub(crate) async fn playlist_entries(
     let mut all = rustyfin_db::repo_playlist::get_playlist_items(&state.db_ro, id, caller).await?;
     HiddenItems::for_caller(state, claims)
         .await?
-        .retain(&mut all, |i| i.id);
+        .retain(&mut all);
     if shuffle {
         rustyfin_db::repo_media::shuffle(&mut all);
     }
@@ -412,35 +459,85 @@ async fn enrich(state: &AppState, claims: &Claims, items: &mut [MediaItem]) {
     .await;
 }
 
-/// POST /Playlists/{id} - Update playlist
+/// The `Users` of a create or update body (Jellyfin's `PlaylistUserPermissions` list), or None
+/// when the body has none.
+fn playlist_users(body: Option<&Value>) -> Result<Option<Vec<PlaylistUserPermissions>>, ApiError> {
+    let Some(users) = body_field(body, "Users").filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    let users: Vec<PlaylistUserPermissions> = serde_json::from_value(users.clone())
+        .map_err(|e| ApiError::BadRequest(format!("invalid Users: {e}")))?;
+    if users.len() > MAX_IDS {
+        return Err(ApiError::BadRequest(format!(
+            "Users may name at most {MAX_IDS} users"
+        )));
+    }
+    Ok(Some(users))
+}
+
+/// A true or false given for `key` in the query, or else in the body.
+fn flag_param(
+    params: &[(String, String)],
+    body: Option<&Value>,
+    key: &str,
+) -> Result<Option<bool>, ApiError> {
+    if let Some(value) = query::first_value(params, key) {
+        return match value.to_ascii_lowercase().as_str() {
+            "true" => Ok(Some(true)),
+            "false" => Ok(Some(false)),
+            _ => Err(ApiError::BadRequest(format!("{key} must be true or false"))),
+        };
+    }
+    match body_field(body, key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(flag)) => Ok(Some(*flag)),
+        Some(_) => Err(ApiError::BadRequest(format!("{key} must be true or false"))),
+    }
+}
+
+/// POST /Playlists/{id} (Jellyfin's UpdatePlaylistDto): its Name, MediaType, Ids (replacing the
+/// items), Users (replacing the shares) and IsPublic. Its owner, an editor or an administrator.
 async fn update_playlist(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Extension(claims): Extension<Claims>,
-    Json(body): Json<serde_json::Value>,
+    body: Bytes,
 ) -> Result<StatusCode, ApiError> {
-    let name = body
-        .get("Name")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    let media_type = body
-        .get("MediaType")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+    let body = optional_body(&body)?;
+    let body = body.as_ref();
+    let name = body_field(body, "Name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty());
+    let media_type = body_field(body, "MediaType").and_then(Value::as_str);
+    let item_ids = match body_field(body, "Ids") {
+        Some(Value::Null) | None => None,
+        Some(_) => Some(id_list(&[], body, "Ids")?),
+    };
+    let shares = playlist_users(body)?;
+    let public = flag_param(&[], body, "IsPublic")?;
 
-    let found = rustyfin_db::repo_playlist::update_playlist(
-        &state.db,
-        id,
-        name.as_deref(),
-        media_type.as_deref(),
-        playlist_caller(&claims),
-    )
-    .await
-    .map_err(|e| ApiError::Internal(e.to_string()))?;
-    if !found {
+    ensure_playlist_editable(&state, id, &claims).await?;
+    // An editor with parental limits sends the entries they see; the hidden ones stay
+    let caller = playlist_caller(&claims);
+    let hidden = HiddenItems::for_caller(&state, &claims).await?;
+    // The entries hidden from the caller, now or among those sent
+    let mut ids =
+        rustyfin_db::repo_playlist::get_playlist_item_ids(&state.db_ro, id, caller).await?;
+    ids.extend(item_ids.iter().flatten().copied());
+    let hidden = hidden.hidden_among(&state, &ids).await?;
+    let update = rustyfin_db::repo_playlist::PlaylistUpdate {
+        name,
+        media_type,
+        item_ids: item_ids.as_deref(),
+        shares: shares.as_deref(),
+        public,
+    };
+    if !rustyfin_db::repo_playlist::update_playlist_with(&state.db, id, &update, &hidden, caller)
+        .await?
+    {
         return Err(playlist_not_found());
     }
-
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -454,7 +551,7 @@ async fn add_items_to_playlist(
 ) -> Result<StatusCode, ApiError> {
     let body = optional_body(&body)?;
     let item_ids = id_list(&params, body.as_ref(), "Ids")?;
-    ensure_playlist_visible(&state, playlist_id, &claims).await?;
+    ensure_playlist_editable(&state, playlist_id, &claims).await?;
     let caller = playlist_caller(&claims);
     rustyfin_db::repo_playlist::add_items_to_playlist(&state.db, playlist_id, &item_ids, caller)
         .await?;
@@ -476,7 +573,7 @@ async fn remove_items_from_playlist(
         .map(|entry| rustyfin_db::repo_playlist::entry_item(playlist_id, entry))
         .collect();
     item_ids.extend(id_list(&params, body.as_ref(), "Ids")?);
-    ensure_playlist_visible(&state, playlist_id, &claims).await?;
+    ensure_playlist_editable(&state, playlist_id, &claims).await?;
     let caller = playlist_caller(&claims);
     for item_id in item_ids {
         rustyfin_db::repo_playlist::remove_item_from_playlist(
@@ -496,13 +593,26 @@ async fn move_playlist_item(
     Path((playlist_id, entry, new_index)): Path<(Uuid, Uuid, usize)>,
     Extension(claims): Extension<Claims>,
 ) -> Result<StatusCode, ApiError> {
+    ensure_playlist_editable(&state, playlist_id, &claims).await?;
     let item_id = rustyfin_db::repo_playlist::entry_item(playlist_id, entry);
+    // The index counts the entries the caller sees: an editor with parental limits sees fewer
+    let caller = playlist_caller(&claims);
+    let ids = rustyfin_db::repo_playlist::get_playlist_item_ids(&state.db_ro, playlist_id, caller)
+        .await?;
+    let hidden = HiddenItems::for_caller(&state, &claims)
+        .await?
+        .hidden_among(&state, &ids)
+        .await?;
+    if hidden.contains(&item_id) {
+        return Err(ApiError::NotFound("Playlist item not found".to_string()));
+    }
     let moved = rustyfin_db::repo_playlist::move_playlist_item(
         &state.db,
         playlist_id,
         item_id,
         new_index,
-        playlist_caller(&claims),
+        &hidden,
+        caller,
     )
     .await?;
     if !moved {
@@ -516,40 +626,85 @@ async fn ensure_playlist_visible(
     state: &AppState,
     id: Uuid,
     claims: &Claims,
-) -> Result<(), ApiError> {
+) -> Result<PlaylistDto, ApiError> {
     rustyfin_db::repo_playlist::get_playlist(&state.db_ro, id, playlist_caller(claims))
         .await?
-        .map(|_| ())
         .ok_or_else(playlist_not_found)
 }
 
-/// GET /Playlists/{id}/Users - Get playlist users
+/// The check for the routes that change a playlist: 404 unless the caller can see it, and 403
+/// unless they may change it (Jellyfin forbids a user it is shared with to read only).
+async fn ensure_playlist_editable(
+    state: &AppState,
+    id: Uuid,
+    claims: &Claims,
+) -> Result<PlaylistDto, ApiError> {
+    let playlist = ensure_playlist_visible(state, id, claims).await?;
+    if !playlist.can_edit {
+        return Err(ApiError::Forbidden(
+            "You may not change this playlist.".to_string(),
+        ));
+    }
+    Ok(playlist)
+}
+
+/// GET /Playlists/{id}/Users: the users the playlist is shared with. Its editors only.
 async fn get_playlist_users(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Extension(claims): Extension<Claims>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    ensure_playlist_visible(&state, id, &claims).await?;
-    Ok(Json(serde_json::json!([])))
+) -> Result<Json<Vec<PlaylistUserPermissions>>, ApiError> {
+    let playlist = ensure_playlist_editable(&state, id, &claims).await?;
+    Ok(Json(playlist.shares))
 }
 
-/// GET /Playlists/{id}/Users/{userId}
+/// GET /Playlists/{id}/Users/{userId}: a user's share of the playlist, as Jellyfin answers it.
+/// Its owner, an editor or the user asking about themselves may ask (else 403); a user without a
+/// share, the owner too, is a 404.
 async fn get_playlist_user(
     State(state): State<AppState>,
-    Path((id, _user_id)): Path<(Uuid, Uuid)>,
+    Path((id, user_id)): Path<(Uuid, Uuid)>,
     Extension(claims): Extension<Claims>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    ensure_playlist_visible(&state, id, &claims).await?;
-    Ok(Json(serde_json::json!({})))
+) -> Result<Json<PlaylistUserPermissions>, ApiError> {
+    let playlist = ensure_playlist_visible(&state, id, &claims).await?;
+    if !playlist.can_edit && user_id != claims.sub {
+        return Err(ApiError::Forbidden(
+            "You may not see this playlist's users.".to_string(),
+        ));
+    }
+    playlist
+        .shares
+        .into_iter()
+        .find(|share| share.user_id == user_id)
+        .map(Json)
+        .ok_or_else(|| ApiError::NotFound("Playlist user not found".to_string()))
 }
 
-/// DELETE /Playlists/{id}/Users/{userId}
+/// POST /Playlists/{id}/Users/{userId}?CanEdit= (or `CanEdit` in a JSON body): shares the
+/// playlist with a user. Its editors only.
+async fn set_playlist_user(
+    State(state): State<AppState>,
+    Path((id, user_id)): Path<(Uuid, Uuid)>,
+    Extension(claims): Extension<Claims>,
+    Query(params): Params,
+    body: Bytes,
+) -> Result<StatusCode, ApiError> {
+    let body = optional_body(&body)?;
+    let can_edit = flag_param(&params, body.as_ref(), "CanEdit")?.unwrap_or(false);
+    ensure_playlist_editable(&state, id, &claims).await?;
+    rustyfin_db::repo_playlist::set_share(&state.db, id, user_id, can_edit).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// DELETE /Playlists/{id}/Users/{userId}: stops sharing the playlist with a user. Its editors
+/// only.
 async fn remove_playlist_user(
     State(state): State<AppState>,
-    Path((id, _user_id)): Path<(Uuid, Uuid)>,
+    Path((id, user_id)): Path<(Uuid, Uuid)>,
     Extension(claims): Extension<Claims>,
 ) -> Result<StatusCode, ApiError> {
-    ensure_playlist_visible(&state, id, &claims).await?;
+    ensure_playlist_editable(&state, id, &claims).await?;
+    rustyfin_db::repo_playlist::remove_share(&state.db, id, user_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -599,6 +754,7 @@ pub(crate) enum Container {
     Playlist,
 }
 
+/// A collection hidden from the caller by parental limits is a 404, as a hidden item is.
 pub(crate) async fn container_of(
     state: &AppState,
     id: Uuid,
@@ -608,6 +764,10 @@ pub(crate) async fn container_of(
         .await?
         .is_some()
     {
+        let hidden = HiddenItems::for_caller(state, claims).await?;
+        visible_collection(state, &hidden, id)
+            .await?
+            .ok_or_else(collection_not_found)?;
         let ids = rustyfin_db::repo_collection::get_collection_item_ids(&state.db_ro, id).await?;
         return Ok(Some(Container::Collection(ids)));
     }
@@ -626,7 +786,13 @@ fn container_item(
 ) -> MediaItem {
     MediaItem {
         id,
-        sort_name: Some(name.to_lowercase()),
+        sort_name: Some(rustyfin_model::sort_name::item_sort_name(
+            media_type,
+            &name,
+            None,
+            None,
+            &rustyfin_model::sort_name::current_rules(),
+        )),
         name,
         media_type,
         child_count: Some(child_count as i32),
@@ -658,38 +824,78 @@ fn playlist_item(state: &AppState, p: PlaylistDto) -> MediaItem {
     )
 }
 
-/// GET /Items/{id} for a collection, or a playlist the caller sees.
+/// GET /Items/{id} for a collection the caller may see, or a playlist they reach. A collection
+/// hidden from them is a 404.
 pub(crate) async fn container_details(
     state: &AppState,
     id: Uuid,
     claims: &Claims,
 ) -> Result<Option<MediaItem>, ApiError> {
-    if let Some(c) = rustyfin_db::repo_collection::get_collection(&state.db_ro, id).await? {
+    if rustyfin_db::repo_collection::get_collection(&state.db_ro, id)
+        .await?
+        .is_some()
+    {
+        let hidden = HiddenItems::for_caller(state, claims).await?;
+        let c = visible_collection(state, &hidden, id)
+            .await?
+            .ok_or_else(collection_not_found)?;
         return Ok(Some(collection_item(state, c)));
     }
     let playlist =
         rustyfin_db::repo_playlist::get_playlist(&state.db_ro, id, playlist_caller(claims)).await?;
-    Ok(playlist.map(|p| playlist_item(state, p)))
+    Ok(playlist.map(|p| {
+        // Only its owner (or an administrator) may delete it; an editor may not.
+        let can_delete = claims.is_admin || p.user_id == claims.sub;
+        let mut item = playlist_item(state, p);
+        item.can_delete = can_delete;
+        item
+    }))
 }
 
-/// /Items?IncludeItemTypes=BoxSet,Playlist: every collection and the caller's playlists, sorted
-/// by name and paged with StartIndex and Limit; the other filters don't apply.
+/// /Items?IncludeItemTypes=BoxSet,Playlist: the collections the caller may see and the playlists
+/// they reach, sorted by name and paged with StartIndex and Limit. Under a library (`ParentId`),
+/// only those holding an item of it, so a movie library's Collections tab and a music library's
+/// Playlists tab list their own; the other filters don't apply.
 pub(crate) async fn container_listing(
     state: &AppState,
     claims: &Claims,
     collections: bool,
     playlists: bool,
+    library: Option<Uuid>,
     start: usize,
     limit: usize,
 ) -> Result<QueryResult, ApiError> {
     let mut all = Vec::new();
     if collections {
-        for c in rustyfin_db::repo_collection::get_all_collections(&state.db_ro).await? {
-            all.push(collection_item(state, c));
+        let hidden = HiddenItems::for_caller(state, claims).await?;
+        let in_library = match library {
+            Some(lib) => {
+                Some(rustyfin_db::repo_collection::collections_in_library(&state.db_ro, lib).await?)
+            }
+            None => None,
+        };
+        for mut c in rustyfin_db::repo_collection::get_all_collections(&state.db_ro).await? {
+            if in_library.as_ref().is_some_and(|ids| !ids.contains(&c.id)) {
+                continue;
+            }
+            if visible_collection_count(state, &hidden, &mut c).await? {
+                all.push(collection_item(state, c));
+            }
         }
     }
     if playlists {
-        for p in rustyfin_db::repo_playlist::get_playlists(&state.db_ro, claims.sub).await? {
+        let in_library = match library {
+            Some(lib) => {
+                Some(rustyfin_db::repo_playlist::playlists_in_library(&state.db_ro, lib).await?)
+            }
+            None => None,
+        };
+        let hidden = HiddenItems::for_caller(state, claims).await?;
+        for mut p in rustyfin_db::repo_playlist::get_playlists(&state.db_ro, claims.sub).await? {
+            if in_library.as_ref().is_some_and(|ids| !ids.contains(&p.id)) {
+                continue;
+            }
+            visible_playlist_count(state, claims, &hidden, &mut p).await?;
             all.push(playlist_item(state, p));
         }
     }
@@ -725,5 +931,16 @@ pub(crate) async fn delete_container(
     if rustyfin_db::repo_playlist::delete_playlist(&state.db, id, playlist_caller(claims)).await? {
         return Ok(Some(StatusCode::NO_CONTENT));
     }
+    // A playlist the caller reads (public or shared) but doesn't own
+    if rustyfin_db::repo_playlist::get_playlist(&state.db_ro, id, playlist_caller(claims))
+        .await?
+        .is_some()
+    {
+        return Err(playlist_delete_forbidden());
+    }
     Ok(None)
+}
+
+fn playlist_delete_forbidden() -> ApiError {
+    ApiError::Forbidden("Only the playlist's owner may delete it.".to_string())
 }

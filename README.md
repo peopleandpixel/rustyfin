@@ -184,7 +184,7 @@ rustyfin/
 
 ### Prerequisites
 - **Rust 1.85+** (2024 Edition) — `rustup update stable`
-- **FFmpeg** — Required for transcoding and media analysis
+- **FFmpeg** — Required for transcoding and media analysis; trickplay images need FFmpeg 7.0 or newer
 - **SQLite3** dev headers (bundled via `sqlx`)
 
 ### Build & Run

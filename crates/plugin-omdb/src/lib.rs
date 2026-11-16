@@ -93,6 +93,7 @@ pub async fn search(
 
     Some(ExternalMetadata {
         name: resp.title,
+        sort_title: None,
         overview: resp.plot,
         production_year,
         community_rating,

@@ -126,17 +126,23 @@ pub async fn get_music_artists(
     link_kind: &str,
     item_type: &str,
     library: Option<Uuid>,
+    hidden_ids_json: Option<&str>,
 ) -> Result<Vec<MediaItem>, sqlx::Error> {
     let library = library.map(|id| id.to_string());
+    // `hidden_ids_json` (a `repo_parental::filter_json` filter) leaves out the artists whose every
+    // linked item the user may not see.
     let query = format!(
         "SELECT {}, p.name FROM people p
          WHERE p.id IN (
              SELECT ip.person_id FROM item_people ip
              JOIN media_items mi ON mi.id = ip.item_id
              WHERE ip.type = ? AND mi.media_type = ? AND (? IS NULL OR mi.library_id = ?)
+               AND {visible}
          )
          ORDER BY p.name COLLATE NOCASE",
-        artist_id_sql("?")
+        artist_id_sql("?"),
+        // The five `?` above are parameters 1 to 5; the filter is the sixth.
+        visible = crate::repo_parental::visible_sql("mi.id", "mi.library_id", "?6"),
     );
     // The library is bound first for the id, as it comes first in the text.
     let rows = sqlx::query_as::<_, (String, String)>(sqlx::AssertSqlSafe(query))
@@ -145,6 +151,7 @@ pub async fn get_music_artists(
         .bind(item_type)
         .bind(&library)
         .bind(&library)
+        .bind(hidden_ids_json)
         .fetch_all(pool)
         .await?;
 
@@ -230,6 +237,23 @@ pub async fn album_track_artists_batch(
     Ok(map)
 }
 
+/// The ids of the people linked to at least one item a user may see, by the
+/// `repo_parental::filter_json` filter `filter_json`.
+pub async fn visible_people(
+    pool: &SqlitePool,
+    filter_json: &str,
+) -> Result<std::collections::HashSet<String>, sqlx::Error> {
+    let ids: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT DISTINCT ip.person_id FROM item_people ip JOIN media_items m ON m.id = ip.item_id \
+         WHERE {}",
+        crate::repo_parental::visible_sql("m.id", "m.library_id", "?1")
+    )))
+    .bind(filter_json)
+    .fetch_all(pool)
+    .await?;
+    Ok(ids.into_iter().collect())
+}
+
 pub async fn get_all_persons(pool: &SqlitePool) -> Result<Vec<NameIdPair>, sqlx::Error> {
     // Music artists are stored as people of type 'Artist', but Jellyfin lists them only as
     // MusicArtist items, so they are left out here.
@@ -303,7 +327,7 @@ pub async fn search_persons(
         let item = MediaItem {
             id: uuid::Uuid::parse_str(&id).unwrap_or_default(),
             name: name.clone(),
-            sort_name: Some(name.to_lowercase()),
+            sort_name: Some(rustyfin_model::sort_name::person_sort_name(&name)),
             overview: None,
             media_type: rustyfin_model::media::MediaType::Unknown,
             path: String::new(),

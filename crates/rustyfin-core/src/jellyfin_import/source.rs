@@ -14,7 +14,10 @@ use std::time::Duration;
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use rustyfin_model::image::ImageType;
 use rustyfin_model::media::MediaType;
-use rustyfin_model::parental::{ParentalPolicy, UNRATED_ITEM_KINDS, unrated_item_kind};
+use rustyfin_model::parental::{
+    AccessPolicy, AccessSchedule, ParentalPolicy, SCHEDULE_DAYS, UNRATED_ITEM_KINDS,
+    unrated_item_kind,
+};
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{ConnectOptions, SqliteConnection};
 use tokio::sync::MutexGuard;
@@ -155,7 +158,7 @@ pub fn parse_provider_ids(text: &str) -> ProviderIds {
 }
 
 /// A Jellyfin user (spec 2.5).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct JfUser {
     pub id: Uuid,
     pub name: String,
@@ -166,6 +169,11 @@ pub struct JfUser {
     /// without `Users.MaxParentalRatingScore` or `MaxParentalAgeRating`, or without
     /// `Preferences`), so whether the user had limits is unknown.
     pub parental: Option<ParentalPolicy>,
+    /// The user's library access, remote access and access schedules, or `None` when the
+    /// database has no `Permissions` table. `enabled_folders` holds Jellyfin library folder names
+    /// (`root/default/<name>`), or `?<id>` for a library id the import can't name; the import maps
+    /// them to Rustyfin libraries.
+    pub access: Option<AccessPolicy>,
 }
 
 /// A Jellyfin item of one of the spec 2.9 types.
@@ -738,6 +746,116 @@ async fn read_parental_limits(
     Ok(Some(limits))
 }
 
+/// Jellyfin's `PermissionKind` values the import reads beside `IsAdministrator` (0).
+const PERM_ENABLE_REMOTE_ACCESS: i64 = 4;
+const PERM_ENABLE_ALL_FOLDERS: i64 = 16;
+/// Jellyfin's `PreferenceKind.EnabledFolders`.
+const PREF_ENABLED_FOLDERS: i64 = 5;
+
+/// Whether `table` is in the database.
+async fn has_table(conn: &mut SqliteConnection, table: &str) -> Result<bool, sqlx::Error> {
+    let (n,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?")
+            .bind(table)
+            .fetch_one(&mut *conn)
+            .await?;
+    Ok(n > 0)
+}
+
+/// Each user's access policy, by Jellyfin user id: `EnableRemoteAccess` and `EnableAllFolders`
+/// from `Permissions` (true when a user has no row, as for a new Jellyfin user), `EnabledFolders`
+/// from `Preferences` as library folder names (see `JfUser::access`), and `AccessSchedules`.
+/// `None` without a `Permissions` table.
+async fn read_access(
+    conn: &mut SqliteConnection,
+    user_ids: &[Uuid],
+) -> Result<Option<HashMap<Uuid, AccessPolicy>>, sqlx::Error> {
+    if !has_table(conn, "Permissions").await? {
+        return Ok(None);
+    }
+    let mut access: HashMap<Uuid, AccessPolicy> = user_ids
+        .iter()
+        .map(|id| (*id, AccessPolicy::default()))
+        .collect();
+    let perms: Vec<(Option<Vec<u8>>, i64, i64)> =
+        sqlx::query_as("SELECT UserId, Kind, Value FROM Permissions WHERE Kind IN (?, ?)")
+            .bind(PERM_ENABLE_REMOTE_ACCESS)
+            .bind(PERM_ENABLE_ALL_FOLDERS)
+            .fetch_all(&mut *conn)
+            .await?;
+    for (id, kind, value) in perms {
+        if let Some(policy) = guid_column(id.as_deref()).and_then(|id| access.get_mut(&id)) {
+            match kind {
+                PERM_ENABLE_REMOTE_ACCESS => policy.enable_remote_access = value != 0,
+                _ => policy.enable_all_folders = value != 0,
+            }
+        }
+    }
+    // The library folders by id: a CollectionFolder's path is `.../root/default/<name>`.
+    let mut names: HashMap<Uuid, String> = HashMap::new();
+    if has_table(conn, "BaseItems").await? {
+        let rows: Vec<(Option<Vec<u8>>, Option<String>)> = sqlx::query_as(
+            "SELECT Id, Path FROM BaseItems \
+             WHERE Type = 'MediaBrowser.Controller.Entities.CollectionFolder'",
+        )
+        .fetch_all(&mut *conn)
+        .await?;
+        for (id, path) in rows {
+            if let (Some(id), Some(path)) = (guid_column(id.as_deref()), path) {
+                let name = path.trim_end_matches(['/', '\\']);
+                let name = name.rsplit(['/', '\\']).next().unwrap_or(name);
+                names.insert(id, name.to_string());
+            }
+        }
+    }
+    if has_table(conn, "Preferences").await? {
+        let prefs: Vec<(Option<Vec<u8>>, Option<String>)> =
+            sqlx::query_as("SELECT UserId, Value FROM Preferences WHERE Kind = ?")
+                .bind(PREF_ENABLED_FOLDERS)
+                .fetch_all(&mut *conn)
+                .await?;
+        for (id, value) in prefs {
+            if let Some(policy) = guid_column(id.as_deref()).and_then(|id| access.get_mut(&id)) {
+                policy.enabled_folders = value
+                    .unwrap_or_default()
+                    .split(['|', ','])
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .map(
+                        |v| match Uuid::parse_str(v).ok().and_then(|id| names.get(&id)) {
+                            Some(name) => name.clone(),
+                            None => format!("?{v}"),
+                        },
+                    )
+                    .collect();
+            }
+        }
+    }
+    if has_table(conn, "AccessSchedules").await? {
+        let rows: Vec<(Option<Vec<u8>>, i64, f64, f64)> = sqlx::query_as(
+            "SELECT UserId, DayOfWeek, StartHour, EndHour FROM AccessSchedules ORDER BY Id",
+        )
+        .fetch_all(&mut *conn)
+        .await?;
+        for (id, day, start, end) in rows {
+            if let Some(policy) = guid_column(id.as_deref()).and_then(|id| access.get_mut(&id)) {
+                // Jellyfin's DynamicDayOfWeek numbers Sunday to Saturday, Everyday, Weekday,
+                // Weekend, as SCHEDULE_DAYS lists them; an unknown day never allows access.
+                let day = usize::try_from(day)
+                    .ok()
+                    .and_then(|d| SCHEDULE_DAYS.get(d))
+                    .map_or("Never", |d| d);
+                policy.access_schedules.push(AccessSchedule {
+                    day_of_week: day.to_string(),
+                    start_hour: start,
+                    end_hour: end,
+                });
+            }
+        }
+    }
+    Ok(Some(access))
+}
+
 async fn read_jellyfin_db(
     conn: &mut SqliteConnection,
     choice: LayoutChoice,
@@ -754,6 +872,11 @@ async fn read_jellyfin_db(
         .filter_map(|(id,)| guid_column(id.as_deref()))
         .collect();
     let mut parental = read_parental_limits(conn).await?;
+    let user_ids: Vec<Uuid> = user_rows
+        .iter()
+        .filter_map(|(id, _, _)| guid_column(id.as_deref()))
+        .collect();
+    let mut access = read_access(conn, &user_ids).await?;
     let users: Vec<JfUser> = user_rows
         .into_iter()
         .filter_map(|(id, name, internal_id)| {
@@ -766,6 +889,7 @@ async fn read_jellyfin_db(
                 parental: parental
                     .as_mut()
                     .map(|limits| limits.remove(&id).unwrap_or_default()),
+                access: access.as_mut().and_then(|all| all.remove(&id)),
             })
         })
         .collect();

@@ -829,6 +829,8 @@ fn hls_input<'a>(
 
 async fn hls_master_playlist(
     State(state): State<AppState>,
+    claims: Option<axum::Extension<rustyfin_model::auth::Claims>>,
+    local: Option<axum::Extension<crate::middleware::ClientIsLocal>>,
     Path(id): Path<Uuid>,
     Query(query): Query<TranscodeQuery>,
     Query(params): Query<HashMap<String, String>>,
@@ -849,7 +851,7 @@ async fn hls_master_playlist(
     // ffmpeg reads only a file that the streams' library check passes, by its resolved path
     let input_path = validate_path_against_library(&state, input_path).await?;
     let input_path = input_path.as_str();
-    let query = to_file_numbering(query, source).await;
+    let mut query = to_file_numbering(query, source).await;
 
     // Copy only what the client plays; with no source to read, nothing is copied
     let mut info = source.map_or_else(SourceInfo::default, SourceInfo::from_source);
@@ -857,8 +859,26 @@ async fn hls_master_playlist(
     if is_hevc(&info) && client_lists(query.video_codec.as_deref(), &HEVC_NAMES) {
         info.hevc = hevc_facts(input_path).await;
     }
+    // The caller's policy: the remote bitrate limit before the copy decision, then whether the
+    // stream that decision makes (a transcode or a remux) is allowed
+    let access = match &claims {
+        Some(axum::Extension(claims)) => crate::parental::caller_access(&state, claims).await?,
+        None => Default::default(),
+    };
+    let local = local.is_none_or(|axum::Extension(l)| l.0);
+    if matches!(item.media_type, rustyfin_model::media::MediaType::Audio) {
+        query.audio_bitrate = crate::parental::remote_bitrate(&access, local, query.audio_bitrate);
+    } else {
+        query.video_bitrate = crate::parental::remote_bitrate(&access, local, query.video_bitrate);
+    }
     let tracks = choose_tracks(&query, &info);
     let (copy_video, copy_audio) = stream_copy(&query, &info);
+    crate::parental::check_conversion(
+        &access,
+        matches!(item.media_type, rustyfin_model::media::MediaType::Audio),
+        copy_video,
+        copy_audio,
+    )?;
     // Every playlist reload passes here; the manager logs the ffmpeg command when it starts one
     tracing::debug!(
         item = %id,
