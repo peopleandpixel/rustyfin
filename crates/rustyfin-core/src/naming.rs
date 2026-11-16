@@ -90,6 +90,139 @@ pub fn is_trailer_or_sample(path: &Path) -> bool {
     matches!(base, "trailer" | "sample") || ENDINGS.iter().any(|ending| base.ends_with(ending))
 }
 
+/// Jellyfin's `ExtraType`: what an extra (a trailer, special feature or theme) is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ExtraKind {
+    Trailer,
+    ThemeSong,
+    ThemeVideo,
+    BehindTheScenes,
+    DeletedScene,
+    Interview,
+    Scene,
+    Sample,
+    Short,
+    Featurette,
+    Clip,
+    Unknown,
+}
+
+impl ExtraKind {
+    /// The name Jellyfin gives it in `ExtraType`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ExtraKind::Trailer => "Trailer",
+            ExtraKind::ThemeSong => "ThemeSong",
+            ExtraKind::ThemeVideo => "ThemeVideo",
+            ExtraKind::BehindTheScenes => "BehindTheScenes",
+            ExtraKind::DeletedScene => "DeletedScene",
+            ExtraKind::Interview => "Interview",
+            ExtraKind::Scene => "Scene",
+            ExtraKind::Sample => "Sample",
+            ExtraKind::Short => "Short",
+            ExtraKind::Featurette => "Featurette",
+            ExtraKind::Clip => "Clip",
+            ExtraKind::Unknown => "Unknown",
+        }
+    }
+
+    /// Whether it is an audio file (a theme song); every other extra is a video.
+    pub fn is_audio(self) -> bool {
+        self == ExtraKind::ThemeSong
+    }
+
+    /// Whether Jellyfin lists it among the special features (`BaseItem.DisplayExtraTypes`).
+    pub fn is_special_feature(self) -> bool {
+        !matches!(
+            self,
+            ExtraKind::Trailer | ExtraKind::ThemeSong | ExtraKind::ThemeVideo
+        )
+    }
+}
+
+/// The extras folders of Jellyfin's `NamingOptions.VideoExtraRules` (`ExtraRuleType.DirectoryName`), in
+/// lower case. `sample` is skipped whole by `is_ignored_dir`, as in Jellyfin's ignore patterns.
+const EXTRA_DIRS: &[(&str, ExtraKind)] = &[
+    ("trailers", ExtraKind::Trailer),
+    ("backdrops", ExtraKind::ThemeVideo),
+    ("theme-music", ExtraKind::ThemeSong),
+    ("behind the scenes", ExtraKind::BehindTheScenes),
+    ("deleted scenes", ExtraKind::DeletedScene),
+    ("interviews", ExtraKind::Interview),
+    ("scenes", ExtraKind::Scene),
+    ("samples", ExtraKind::Sample),
+    ("shorts", ExtraKind::Short),
+    ("featurettes", ExtraKind::Featurette),
+    ("extras", ExtraKind::Unknown),
+    ("extra", ExtraKind::Unknown),
+    ("other", ExtraKind::Unknown),
+    ("clips", ExtraKind::Clip),
+];
+
+/// The file name endings of `VideoExtraRules` (`ExtraRuleType.Suffix`), in lower case.
+const EXTRA_SUFFIXES: &[(&str, ExtraKind)] = &[
+    ("-trailer", ExtraKind::Trailer),
+    (".trailer", ExtraKind::Trailer),
+    ("_trailer", ExtraKind::Trailer),
+    ("- trailer", ExtraKind::Trailer),
+    ("-sample", ExtraKind::Sample),
+    (".sample", ExtraKind::Sample),
+    ("_sample", ExtraKind::Sample),
+    ("- sample", ExtraKind::Sample),
+    ("-scene", ExtraKind::Scene),
+    ("-clip", ExtraKind::Clip),
+    ("-interview", ExtraKind::Interview),
+    ("-behindthescenes", ExtraKind::BehindTheScenes),
+    ("-deleted", ExtraKind::DeletedScene),
+    ("-deletedscene", ExtraKind::DeletedScene),
+    ("-featurette", ExtraKind::Featurette),
+    ("-short", ExtraKind::Short),
+    ("-extra", ExtraKind::Unknown),
+    ("-other", ExtraKind::Unknown),
+];
+
+/// The kind of extra that the files in a folder called `name` are, if it is an extras folder.
+pub fn extra_dir_kind(name: &str) -> Option<ExtraKind> {
+    let lower = name.to_lowercase();
+    EXTRA_DIRS
+        .iter()
+        .find(|(dir, _)| *dir == lower)
+        .map(|&(_, kind)| kind)
+}
+
+/// The kind of extra that the video file at `path` is by its own name, with the rest of its stem: the owner's
+/// name for a suffix (`Movie (2020)-trailer.mkv` gives `Movie (2020)`), empty for `trailer.mkv`. As
+/// Jellyfin's `ExtraRuleResolver`, the stem's trailing digits are trimmed first, so `trailer2.mkv` is a trailer.
+pub fn extra_file_kind(path: &Path) -> Option<(ExtraKind, String)> {
+    let stem = path.file_stem()?.to_string_lossy();
+    let lower = stem.to_lowercase();
+    let base = lower.trim_end_matches(|c: char| c.is_ascii_digit());
+    match base {
+        "trailer" => return Some((ExtraKind::Trailer, String::new())),
+        "sample" => return Some((ExtraKind::Sample, String::new())),
+        _ => {}
+    }
+    // The longest ending wins, so `-deletedscene` is not read as `-deleted` plus more.
+    EXTRA_SUFFIXES
+        .iter()
+        .filter(|(suffix, _)| base.ends_with(suffix))
+        .max_by_key(|(suffix, _)| suffix.len())
+        .map(|&(suffix, kind)| {
+            let owner = &base[..base.len() - suffix.len()];
+            (kind, stem.chars().take(owner.chars().count()).collect())
+        })
+}
+
+/// Whether the audio file at `path` is a theme song by its name: `theme.mp3`, `theme2.flac` and so on.
+pub fn is_theme_song_file(path: &Path) -> bool {
+    path.file_stem().is_some_and(|stem| {
+        stem.to_string_lossy()
+            .to_lowercase()
+            .trim_end_matches(|c: char| c.is_ascii_digit())
+            == "theme"
+    })
+}
+
 /// Whether the lower-case file name is `word.X` or `*.word.X`, where X is as `is_extension` allows.
 fn is_sample_file(lower: &str, word: &str) -> bool {
     // `word.X`: the whole name.

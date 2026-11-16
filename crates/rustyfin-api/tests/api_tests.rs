@@ -16589,6 +16589,340 @@ async fn j5_genre_ids_survive_a_rescan_that_replaces_the_items() {
     assert_eq!(again, years);
 }
 
+// R3 item extras: local trailers, special features and theme media
+
+/// Writes a one-second video (`audio` false) or MP3 over `file` with ffmpeg. False when ffmpeg isn't there.
+fn r3extras_media(file: &std::path::Path, audio: bool) -> bool {
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    if audio {
+        r3gaps2_make_media(file, &["sine=duration=1"], &["-c:a", "libmp3lame"])
+    } else {
+        r3gaps2_make_media(
+            file,
+            &["testsrc=size=64x48:rate=5:duration=1", "sine=duration=1"],
+            &["-c:v", "mpeg4", "-c:a", "mp2"],
+        )
+    }
+}
+
+/// The `Id`s of a JSON array of items, or of its `Items`.
+fn r3extras_ids(body: &serde_json::Value) -> Vec<String> {
+    body.as_array()
+        .or_else(|| body["Items"].as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|i| i["Id"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The `ExtraType`s of a JSON array of items, sorted.
+fn r3extras_types(body: &serde_json::Value) -> Vec<String> {
+    let mut types: Vec<String> = body
+        .as_array()
+        .or_else(|| body["Items"].as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|i| i["ExtraType"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    types.sort();
+    types
+}
+
+/// A movie's trailer files (by suffix and in `trailers/`), extras folders and themes become its extras, as in
+/// Jellyfin: they are never library items, `LocalTrailers` and `SpecialFeatures` list them as bare arrays with
+/// their `ExtraType` and media sources, the item counts them, and `ThemeSongs`/`ThemeVideos`/`ThemeMedia` give
+/// the themes. A trailer that an older scan stored as a movie becomes an extra, and a deleted extra goes.
+#[tokio::test]
+async fn r3extras_movie_extras_are_found_listed_and_kept_out_of_the_library() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let root = std::path::PathBuf::from(media_folder(&state, "r3extras movies"));
+    let film = root.join("Alpha (2001)");
+    if !r3extras_media(&film.join("Alpha (2001).mkv"), false) {
+        return;
+    }
+    for (file, audio) in [
+        ("Alpha (2001)-trailer.mkv", false),
+        ("featurettes/Making Of.mkv", false),
+        ("behind the scenes/On Set.mkv", false),
+        ("Alpha (2001)-deleted.mkv", false),
+        ("theme.mp3", true),
+        ("backdrops/Loop.mkv", false),
+    ] {
+        assert!(r3extras_media(&film.join(file), audio));
+    }
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: "R3 Extras Movies".to_string(),
+        content_type: rustyfin_model::library::LibraryContentType::Movies,
+        paths: vec![root.to_str().unwrap().to_string()],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    rustyfin_core::scanner::scan_library(&state.db, &lib)
+        .await
+        .unwrap();
+    rustyfin_core::scanner::wait_for_idle().await;
+
+    // The library lists the movie alone, whatever the types asked for.
+    for uri in [
+        format!("/Items?ParentId={}&Recursive=true", lib.id),
+        format!("/Items?ParentId={}", lib.id),
+        "/Items?Recursive=true&IncludeItemTypes=Video,Audio,Trailer".to_string(),
+        "/Items?Recursive=true&searchTerm=Making".to_string(),
+        "/Items/Latest?Limit=50".to_string(),
+    ] {
+        let (status, body) = send_authed(&app, "GET", &uri, &token, None).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        let names: Vec<&str> = body
+            .as_array()
+            .or_else(|| body["Items"].as_array())
+            .unwrap()
+            .iter()
+            .filter_map(|i| i["Name"].as_str())
+            .collect();
+        assert!(
+            names.iter().all(|n| *n == "Alpha"),
+            "{uri} lists an extra: {names:?}"
+        );
+    }
+    let movies = j5_movie_ids(&state).await;
+    assert_eq!(movies.len(), 1, "one movie, not one per extra");
+    let movie = movies[0].clone();
+
+    let (status, item) = send_authed(&app, "GET", &format!("/Items/{movie}"), &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{item}");
+    assert_eq!(item["LocalTrailerCount"], 1, "{item}");
+    assert_eq!(item["SpecialFeatureCount"], 3, "{item}");
+
+    let (status, trailers) = send_authed(
+        &app,
+        "GET",
+        &format!("/Items/{movie}/LocalTrailers"),
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{trailers}");
+    assert!(trailers.is_array(), "a bare array: {trailers}");
+    assert_eq!(r3extras_types(&trailers), ["Trailer"]);
+    assert_eq!(trailers[0]["Name"], "Alpha (2001)-trailer");
+    assert!(
+        trailers[0]["MediaSources"]
+            .as_array()
+            .is_some_and(|s| !s.is_empty()),
+        "the trailer was probed: {trailers}"
+    );
+    let trailer = trailers[0]["Id"].as_str().unwrap().to_string();
+    // The trailer plays like any item.
+    let (status, info) = send_authed(
+        &app,
+        "GET",
+        &format!("/Items/{trailer}/PlaybackInfo"),
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{info}");
+    let (status, _) = send_authed(
+        &app,
+        "GET",
+        &format!("/Users/{}/Items/{movie}/LocalTrailers", uuid::Uuid::nil()),
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, specials) = send_authed(
+        &app,
+        "GET",
+        &format!("/Items/{movie}/SpecialFeatures"),
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{specials}");
+    assert_eq!(
+        r3extras_types(&specials),
+        ["BehindTheScenes", "DeletedScene", "Featurette"]
+    );
+
+    let (status, songs) = send_authed(
+        &app,
+        "GET",
+        &format!("/Items/{movie}/ThemeSongs"),
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{songs}");
+    assert_eq!(songs["OwnerId"], movie.replace('-', ""));
+    assert_eq!(songs["TotalRecordCount"], 1);
+    assert_eq!(songs["Items"][0]["Type"], "Audio");
+    assert_eq!(songs["Items"][0]["ExtraType"], "ThemeSong");
+    let (_, media) = send_authed(
+        &app,
+        "GET",
+        &format!("/Items/{movie}/ThemeMedia?inheritFromParent=true"),
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(r3extras_types(&media["ThemeVideosResult"]), ["ThemeVideo"]);
+    assert_eq!(r3extras_types(&media["ThemeSongsResult"]), ["ThemeSong"]);
+    assert_eq!(media["SoundtrackSongsResult"]["TotalRecordCount"], 0);
+
+    // An unknown item is a 404.
+    let (status, _) = send_authed(
+        &app,
+        "GET",
+        &format!("/Items/{}/SpecialFeatures", uuid::Uuid::new_v4()),
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // A trailer that an older scan stored as a movie becomes an extra again, with the same id.
+    sqlx::query(
+        "UPDATE media_items SET media_type = 'Movie', extra_type = NULL, owner_id = NULL WHERE id = ?",
+    )
+    .bind(&trailer)
+    .execute(&state.db)
+    .await
+    .unwrap();
+    // A deleted special feature goes.
+    std::fs::remove_file(film.join("featurettes/Making Of.mkv")).unwrap();
+    rustyfin_core::scanner::scan_library(&state.db, &lib)
+        .await
+        .unwrap();
+    rustyfin_core::scanner::wait_for_idle().await;
+    assert_eq!(j5_movie_ids(&state).await, std::slice::from_ref(&movie));
+    let (_, trailers) = send_authed(
+        &app,
+        "GET",
+        &format!("/Items/{movie}/LocalTrailers"),
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(r3extras_ids(&trailers), [trailer]);
+    let (_, item) = send_authed(&app, "GET", &format!("/Items/{movie}"), &token, None).await;
+    assert_eq!(item["SpecialFeatureCount"], 2, "{item}");
+
+    // Deleting the movie deletes its extras.
+    let (status, _) = send_authed(&app, "DELETE", &format!("/Items/{movie}"), &token, None).await;
+    assert!(status.is_success(), "{status}");
+    let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM media_items WHERE owner_id = ?")
+        .bind(&movie)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(left, 0);
+}
+
+/// A show's extras folders and themes belong to its series or season; an episode's page inherits the series'
+/// theme song with `inheritFromParent`, and the specials season `Extras` stays a season.
+#[tokio::test]
+async fn r3extras_show_extras_belong_to_series_and_seasons() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let root = std::path::PathBuf::from(media_folder(&state, "r3extras shows"));
+    let show = root.join("Show");
+    if !r3extras_media(&show.join("Season 1/Show S01E01.mkv"), false) {
+        return;
+    }
+    for (file, audio) in [
+        ("theme.mp3", true),
+        ("trailers/Teaser.mkv", false),
+        ("Season 1/deleted scenes/Cut.mkv", false),
+        ("interviews/Cast.mkv", false),
+    ] {
+        assert!(r3extras_media(&show.join(file), audio));
+    }
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: "R3 Extras Shows".to_string(),
+        content_type: rustyfin_model::library::LibraryContentType::TvShows,
+        paths: vec![root.to_str().unwrap().to_string()],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    rustyfin_core::scanner::scan_library(&state.db, &lib)
+        .await
+        .unwrap();
+    rustyfin_core::scanner::wait_for_idle().await;
+
+    let id_of = |media_type: &'static str| {
+        let db = state.db.clone();
+        async move {
+            let ids: Vec<String> = sqlx::query_scalar(
+                "SELECT id FROM media_items WHERE media_type = ? AND extra_type IS NULL",
+            )
+            .bind(media_type)
+            .fetch_all(&db)
+            .await
+            .unwrap();
+            assert_eq!(ids.len(), 1, "one {media_type}: {ids:?}");
+            ids[0].clone()
+        }
+    };
+    let series = id_of("Series").await;
+    let season = id_of("Season").await;
+    let episode = id_of("Episode").await;
+
+    let get = |uri: String| {
+        let app = app.clone();
+        let token = token.clone();
+        async move {
+            let (status, body) = send_authed(&app, "GET", &uri, &token, None).await;
+            assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+            body
+        }
+    };
+    assert_eq!(
+        r3extras_types(&get(format!("/Items/{series}/LocalTrailers")).await),
+        ["Trailer"]
+    );
+    assert_eq!(
+        r3extras_types(&get(format!("/Items/{series}/SpecialFeatures")).await),
+        ["Interview"]
+    );
+    assert_eq!(
+        r3extras_types(&get(format!("/Items/{season}/SpecialFeatures")).await),
+        ["DeletedScene"]
+    );
+    let inherited = get(format!(
+        "/Items/{episode}/ThemeSongs?inheritFromParent=true"
+    ))
+    .await;
+    assert_eq!(inherited["OwnerId"], series.replace('-', ""));
+    assert_eq!(r3extras_types(&inherited), ["ThemeSong"]);
+    let own = get(format!("/Items/{episode}/ThemeSongs")).await;
+    assert_eq!(own["OwnerId"], episode.replace('-', ""));
+    assert_eq!(own["TotalRecordCount"], 0);
+    let all = get(format!("/Items?ParentId={}&Recursive=true", lib.id)).await;
+    let mut types: Vec<&str> = all["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|i| i["Type"].as_str())
+        .collect();
+    types.sort();
+    assert_eq!(types, ["Episode", "Season", "Series"], "{all}");
+}
+
 #[tokio::test]
 async fn j5_odd_values_list_without_error_and_bad_parameters_give_400() {
     use rustyfin_model::library::LibraryContentType;
@@ -25820,6 +26154,7 @@ fn r3item_detail() {
 fn r3item_play() {
     b124_node_test("r3item_play.mjs");
 }
+
 
 // R3 metadata: the admin's refresh, Identify, image and metadata editor dialogs in the web client
 // (tests/web/r3metadata_admin.mjs)

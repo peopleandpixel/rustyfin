@@ -340,12 +340,14 @@ pub async fn is_item_hidden(
     if !policy.filters_items() {
         return Ok(false);
     }
-    // The item and every item above it, nearest first.
+    // The item and every item above it, nearest first. An extra's owner is above it.
     let chain: Vec<(String, String, bool)> = sqlx::query_as(
         "WITH RECURSIVE chain(id, depth) AS (SELECT ?, 0 \
-             UNION ALL SELECT m.parent_id, c.depth + 1 FROM chain c \
-             JOIN media_items m ON m.id = c.id WHERE m.parent_id IS NOT NULL AND c.depth < 64) \
-         SELECT m.id, m.tags, m.parent_id IS NULL FROM chain c JOIN media_items m ON m.id = c.id",
+             UNION ALL SELECT COALESCE(m.parent_id, m.owner_id), c.depth + 1 FROM chain c \
+             JOIN media_items m ON m.id = c.id \
+             WHERE COALESCE(m.parent_id, m.owner_id) IS NOT NULL AND c.depth < 64) \
+         SELECT m.id, m.tags, COALESCE(m.parent_id, m.owner_id) IS NULL \
+         FROM chain c JOIN media_items m ON m.id = c.id",
     )
     .bind(item_id.to_string())
     .fetch_all(pool)

@@ -1,0 +1,466 @@
+//! Extras: local trailers, special features and theme media, found the way Jellyfin finds them
+//! (`NamingOptions.VideoExtraRules`). A scan stores each one as an item with an extra type and an owner
+//! (the movie, series or season it belongs to); library listings never show them.
+//!
+//! Movies: `<movie>-trailer.mkv`, `trailer.mkv` and the other suffixes next to the movie, `theme.mp3`, and
+//! the files in its extras folders (`trailers/`, `featurettes/`, `extras/`, `theme-music/`, `backdrops/`
+//! and the rest). Shows: the extras folders of a series or season folder, and `theme.mp3` and `trailer.mkv`
+//! in it. A show's `Extras` folder stays its specials season (`naming::is_specials_folder`).
+
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+
+use rustyfin_db::repo_extras;
+use rustyfin_db::repo_media::PathScope;
+use rustyfin_model::library::Library;
+use rustyfin_model::media::{MediaItem, MediaType};
+use sqlx::SqlitePool;
+use uuid::Uuid;
+
+use crate::naming::{self, ExtraKind};
+use crate::probe::ProbeStep;
+use crate::scanner::{AUDIO_EXTENSIONS, VIDEO_EXTENSIONS};
+
+/// An extra file that a scan found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FoundExtra {
+    pub path: PathBuf,
+    /// The folder of its owner: the movie's folder, or the series or season folder.
+    pub owner_dir: PathBuf,
+    pub kind: ExtraKind,
+    /// The owner's name that a suffix names (`Movie (2020)` in `Movie (2020)-trailer.mkv`), else empty.
+    pub owner_name: String,
+}
+
+/// What a file is to a scan.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Classified {
+    /// An extra.
+    Extra(FoundExtra),
+    /// A file in an extras folder that is not that folder's kind of media (a video in `theme-music/`): it is
+    /// neither an extra nor a library item.
+    Skip,
+    /// Not an extra: the scan reads it as before.
+    No,
+}
+
+fn extension(path: &Path) -> String {
+    path.extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default()
+}
+
+fn is_video(path: &Path) -> bool {
+    VIDEO_EXTENSIONS.contains(&extension(path).as_str())
+}
+
+fn is_audio(path: &Path) -> bool {
+    AUDIO_EXTENSIONS.contains(&extension(path).as_str())
+}
+
+/// The extra in the extras folder `dir` of kind `kind`, owned by `owner_dir`, when the file's media fits.
+fn in_extras_dir(file: &Path, owner_dir: &Path, kind: ExtraKind) -> Classified {
+    let fits = if kind.is_audio() {
+        is_audio(file)
+    } else {
+        is_video(file)
+    };
+    if !fits {
+        return Classified::Skip;
+    }
+    Classified::Extra(FoundExtra {
+        path: file.to_path_buf(),
+        owner_dir: owner_dir.to_path_buf(),
+        kind,
+        owner_name: String::new(),
+    })
+}
+
+/// A file by its own name: `theme.mp3`, or (`suffixes` false) only `trailer.mkv` and `sample.mkv`, or
+/// (`suffixes` true) also `<name>-trailer.mkv` and the other suffixes.
+fn by_name(file: &Path, owner_dir: &Path, suffixes: bool) -> Classified {
+    if is_audio(file) && naming::is_theme_song_file(file) {
+        return Classified::Extra(FoundExtra {
+            path: file.to_path_buf(),
+            owner_dir: owner_dir.to_path_buf(),
+            kind: ExtraKind::ThemeSong,
+            owner_name: String::new(),
+        });
+    }
+    if !is_video(file) {
+        return Classified::No;
+    }
+    match naming::extra_file_kind(file) {
+        Some((kind, owner_name)) if suffixes || owner_name.is_empty() => {
+            Classified::Extra(FoundExtra {
+                path: file.to_path_buf(),
+                owner_dir: owner_dir.to_path_buf(),
+                kind,
+                owner_name,
+            })
+        }
+        _ => Classified::No,
+    }
+}
+
+/// What `file`, under the movie library root `root`, is.
+pub fn classify_movie_file(file: &Path, root: &Path) -> Classified {
+    let Some(parent) = file.parent() else {
+        return Classified::No;
+    };
+    if parent != root
+        && let Some(kind) = parent
+            .file_name()
+            .and_then(|name| naming::extra_dir_kind(&name.to_string_lossy()))
+        && let Some(owner_dir) = parent.parent()
+        && owner_dir.starts_with(root)
+    {
+        return in_extras_dir(file, owner_dir, kind);
+    }
+    by_name(file, parent, true)
+}
+
+/// What `file`, under the TV library root `root`, is.
+pub fn classify_tv_file(file: &Path, root: &Path) -> Classified {
+    let Ok(rel) = file.strip_prefix(root) else {
+        return Classified::No;
+    };
+    let parts: Vec<String> = rel
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    let n = parts.len();
+    let Some(parent) = file.parent() else {
+        return Classified::No;
+    };
+    if n >= 3
+        && let Some(kind) = naming::extra_dir_kind(&parts[n - 2])
+    {
+        // `Show/Extras` is the specials season.
+        if n == 3 && naming::is_specials_folder(&parts[1], &parts[0]) {
+            return Classified::No;
+        }
+        return match n {
+            3 | 4 => in_extras_dir(file, parent.parent().unwrap_or(root), kind),
+            _ => Classified::Skip,
+        };
+    }
+    // A file directly in a series or season folder.
+    if n == 2 || n == 3 {
+        return by_name(file, parent, false);
+    }
+    Classified::No
+}
+
+/// The owner of `extra` among the items in its folder (`candidates`: id and lower-case file stem, in path
+/// order). A suffix's name picks the item whose file stem is that name, else the first whose stem starts with
+/// it; otherwise, or when none does, a folder with one item gives that one. A folder-wide extra (no name) in a
+/// folder with several goes to the first.
+fn pick_owner<'a>(candidates: &'a [(String, String)], extra: &FoundExtra) -> Option<&'a str> {
+    let wanted = extra.owner_name.trim().to_lowercase();
+    if !wanted.is_empty()
+        && let Some((id, _)) = candidates
+            .iter()
+            .find(|(_, stem)| *stem == wanted)
+            .or_else(|| {
+                candidates
+                    .iter()
+                    .find(|(_, stem)| stem.starts_with(&wanted))
+            })
+    {
+        return Some(id);
+    }
+    match candidates {
+        [(id, _)] => Some(id),
+        [(id, _), ..] if wanted.is_empty() => Some(id),
+        _ => None,
+    }
+}
+
+/// Stores the extras that a scan of `library` found in `scope`: each gets the owner its folder and name give
+/// it. A new extra is added, with a probe plan in the result; a stored item at an extra's path (an extra, or a
+/// movie that an older scan made of a trailer) is updated; and an extra that has no owner is deleted. The
+/// items whose files are gone are the removal's (`scan_sync::remove_not_collected`).
+pub async fn sync_extras(
+    pool: &SqlitePool,
+    library: &Library,
+    scope: &PathScope,
+    found: &[FoundExtra],
+) -> Result<Vec<(Uuid, Vec<ProbeStep>)>, sqlx::Error> {
+    let mut plans = Vec::new();
+    if found.is_empty() {
+        return Ok(plans);
+    }
+    // An item stored at an extra's own path (a trailer that an older scan read as a movie) owns nothing.
+    let extra_paths: HashSet<&Path> = found.iter().map(|e| e.path.as_path()).collect();
+    let mut owners: HashMap<PathBuf, Vec<(String, String)>> = HashMap::new();
+    for row in repo_extras::owner_candidates(pool, library.id).await? {
+        let path = Path::new(&row.path);
+        if extra_paths.contains(path) {
+            continue;
+        }
+        let (dir, stem) = if row.media_type == "Movie" {
+            let stem = path
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_lowercase())
+                .unwrap_or_default();
+            (path.parent().map(Path::to_path_buf), stem)
+        } else {
+            (Some(path.to_path_buf()), String::new())
+        };
+        if let Some(dir) = dir {
+            owners.entry(dir).or_default().push((row.id, stem));
+        }
+    }
+    let stored = repo_extras::items_by_path(pool, library.id, scope).await?;
+
+    let mut new_items: Vec<(MediaItem, String, &'static str)> = Vec::new();
+    let mut seen: HashSet<&Path> = HashSet::new();
+    for extra in found {
+        if !seen.insert(extra.path.as_path()) {
+            continue;
+        }
+        let path = extra.path.to_string_lossy().into_owned();
+        let owner = owners
+            .get(&extra.owner_dir)
+            .and_then(|candidates| pick_owner(candidates, extra));
+        let kind = extra.kind.as_str();
+        let media_type = if extra.kind.is_audio() {
+            MediaType::Audio
+        } else {
+            MediaType::Video
+        };
+        let name = extra
+            .path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        match (owner, stored.get(&path)) {
+            (None, None) => {}
+            (None, Some(row)) => {
+                tracing::info!("removing {path}: it is an extra with no owner");
+                crate::scan_sync::delete_item(pool, &row.id).await?;
+            }
+            (Some(owner), Some(row)) => {
+                if row.extra_type.as_deref() != Some(kind) || row.owner_id.as_deref() != Some(owner)
+                {
+                    repo_extras::set_extra(
+                        pool,
+                        &row.id,
+                        owner,
+                        kind,
+                        media_type.item_kind(),
+                        &name,
+                    )
+                    .await?;
+                }
+            }
+            (Some(owner), None) => {
+                let item = MediaItem {
+                    id: Uuid::new_v4(),
+                    name: name.clone(),
+                    sort_name: Some(name.clone()),
+                    overview: None,
+                    media_type,
+                    path: path.clone(),
+                    parent_id: None,
+                    library_id: library.id,
+                    production_year: None,
+                    community_rating: None,
+                    official_rating: None,
+                    genres: vec![],
+                    date_created: crate::scanner::date_added(&extra.path).await,
+                    premiere_date: None,
+                    runtime_ticks: None,
+                    index_number: None,
+                    parent_index_number: None,
+                    media_sources: Vec::new(),
+                    ..MediaItem::default_dto_fields()
+                };
+                new_items.push((item, owner.to_string(), kind));
+            }
+        }
+    }
+    if new_items.is_empty() {
+        return Ok(plans);
+    }
+    let items: Vec<MediaItem> = new_items.iter().map(|(item, _, _)| item.clone()).collect();
+    rustyfin_db::busy::retry_busy("saving extras", || {
+        rustyfin_db::repo_media::batch_upsert_media_items(pool, &items)
+    })
+    .await?;
+    for (item, owner, kind) in &new_items {
+        repo_extras::set_extra(
+            pool,
+            &item.id.to_string(),
+            owner,
+            kind,
+            item.media_type.item_kind(),
+            &item.name,
+        )
+        .await?;
+        plans.push((item.id, vec![ProbeStep::Primary(item.path.clone())]));
+    }
+    tracing::info!("library '{}': {} new extras", library.name, new_items.len());
+    Ok(plans)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn extra(path: &str, owner_dir: &str, kind: ExtraKind, owner_name: &str) -> Classified {
+        Classified::Extra(FoundExtra {
+            path: PathBuf::from(path),
+            owner_dir: PathBuf::from(owner_dir),
+            kind,
+            owner_name: owner_name.to_string(),
+        })
+    }
+
+    #[test]
+    fn r3extras_movie_files_are_read_by_jellyfins_extra_rules() {
+        let root = Path::new("/m");
+        let c = |p: &str| classify_movie_file(Path::new(p), root);
+        assert_eq!(
+            c("/m/A (2020)/A (2020)-trailer.mkv"),
+            extra(
+                "/m/A (2020)/A (2020)-trailer.mkv",
+                "/m/A (2020)",
+                ExtraKind::Trailer,
+                "A (2020)"
+            )
+        );
+        assert_eq!(
+            c("/m/A (2020)/trailer2.mp4"),
+            extra(
+                "/m/A (2020)/trailer2.mp4",
+                "/m/A (2020)",
+                ExtraKind::Trailer,
+                ""
+            )
+        );
+        assert_eq!(
+            c("/m/A/A-deletedscene.mkv"),
+            extra(
+                "/m/A/A-deletedscene.mkv",
+                "/m/A",
+                ExtraKind::DeletedScene,
+                "A"
+            )
+        );
+        assert_eq!(
+            c("/m/A/Trailers/one.mkv"),
+            extra("/m/A/Trailers/one.mkv", "/m/A", ExtraKind::Trailer, "")
+        );
+        assert_eq!(
+            c("/m/A/behind the scenes/x.mkv"),
+            extra(
+                "/m/A/behind the scenes/x.mkv",
+                "/m/A",
+                ExtraKind::BehindTheScenes,
+                ""
+            )
+        );
+        assert_eq!(
+            c("/m/A/featurettes/x.mkv"),
+            extra("/m/A/featurettes/x.mkv", "/m/A", ExtraKind::Featurette, "")
+        );
+        assert_eq!(
+            c("/m/A/extras/x.mkv"),
+            extra("/m/A/extras/x.mkv", "/m/A", ExtraKind::Unknown, "")
+        );
+        assert_eq!(
+            c("/m/A/A-featurette.mkv"),
+            extra("/m/A/A-featurette.mkv", "/m/A", ExtraKind::Featurette, "A")
+        );
+        assert_eq!(
+            c("/m/A/theme.mp3"),
+            extra("/m/A/theme.mp3", "/m/A", ExtraKind::ThemeSong, "")
+        );
+        assert_eq!(
+            c("/m/A/theme-music/song.flac"),
+            extra(
+                "/m/A/theme-music/song.flac",
+                "/m/A",
+                ExtraKind::ThemeSong,
+                ""
+            )
+        );
+        assert_eq!(
+            c("/m/A/backdrops/loop.mp4"),
+            extra("/m/A/backdrops/loop.mp4", "/m/A", ExtraKind::ThemeVideo, "")
+        );
+        assert_eq!(c("/m/A/theme-music/clip.mkv"), Classified::Skip);
+        assert_eq!(c("/m/A/A (2020).mkv"), Classified::No);
+        assert_eq!(c("/m/A/notes.mp3"), Classified::No);
+        // An extras folder that is the library root itself is a movie folder.
+        assert_eq!(
+            classify_movie_file(Path::new("/m/extras/A.mkv"), Path::new("/m/extras")),
+            Classified::No
+        );
+    }
+
+    #[test]
+    fn r3extras_show_files_are_extras_in_extras_folders_and_by_name_only() {
+        let root = Path::new("/tv");
+        let c = |p: &str| classify_tv_file(Path::new(p), root);
+        assert_eq!(
+            c("/tv/Show/featurettes/x.mkv"),
+            extra(
+                "/tv/Show/featurettes/x.mkv",
+                "/tv/Show",
+                ExtraKind::Featurette,
+                ""
+            )
+        );
+        assert_eq!(
+            c("/tv/Show/Season 1/deleted scenes/x.mkv"),
+            extra(
+                "/tv/Show/Season 1/deleted scenes/x.mkv",
+                "/tv/Show/Season 1",
+                ExtraKind::DeletedScene,
+                ""
+            )
+        );
+        assert_eq!(
+            c("/tv/Show/theme.mp3"),
+            extra("/tv/Show/theme.mp3", "/tv/Show", ExtraKind::ThemeSong, "")
+        );
+        assert_eq!(
+            c("/tv/Show/trailer.mkv"),
+            extra("/tv/Show/trailer.mkv", "/tv/Show", ExtraKind::Trailer, "")
+        );
+        // The specials season, and episodes with suffix-like names, are not extras.
+        assert_eq!(c("/tv/Show/Extras/S00E01.mkv"), Classified::No);
+        assert_eq!(c("/tv/Show/Season 1/Show S01E01-short.mkv"), Classified::No);
+        assert_eq!(c("/tv/Show/Season 1/S01E01.mkv"), Classified::No);
+    }
+
+    #[test]
+    fn r3extras_a_suffix_picks_its_movie_and_a_folder_extra_the_only_one() {
+        let one = vec![("a".to_string(), "movie (2020)".to_string())];
+        let two = vec![
+            ("a".to_string(), "alpha".to_string()),
+            ("b".to_string(), "beta".to_string()),
+        ];
+        let found = |name: &str| FoundExtra {
+            path: PathBuf::from("/x"),
+            owner_dir: PathBuf::from("/"),
+            kind: ExtraKind::Trailer,
+            owner_name: name.to_string(),
+        };
+        assert_eq!(pick_owner(&one, &found("Movie (2020)")), Some("a"));
+        assert_eq!(pick_owner(&one, &found("Other")), Some("a"));
+        assert_eq!(pick_owner(&two, &found("Beta")), Some("b"));
+        assert_eq!(pick_owner(&two, &found("Gamma")), None);
+        assert_eq!(pick_owner(&two, &found("")), Some("a"));
+        assert_eq!(pick_owner(&[], &found("")), None);
+        // The exact name wins over a longer one that sorts first.
+        let versions = vec![
+            ("cut".to_string(), "movie (2020)-directors cut".to_string()),
+            ("m".to_string(), "movie (2020)".to_string()),
+        ];
+        assert_eq!(pick_owner(&versions, &found("Movie (2020)")), Some("m"));
+    }
+}

@@ -11,6 +11,7 @@ use tokio::fs;
 use tokio::sync::{Mutex, MutexGuard};
 use uuid::Uuid;
 
+use crate::extras;
 use crate::local_images;
 use crate::naming;
 use crate::nfo_parser;
@@ -949,6 +950,9 @@ async fn scan_flat_library(
     let mut new_plans: Vec<(Uuid, Vec<probe::ProbeStep>)> = Vec::new();
     // The video files of each folder. They are grouped into movies after the walk.
     let mut movie_files: BTreeMap<PathBuf, Vec<PathBuf>> = BTreeMap::new();
+    // The trailers, special features and theme media of the movies. They are stored after the movies.
+    let mut found_extras: Vec<extras::FoundExtra> = Vec::new();
+    let reads_extras = matches!(library.content_type, LibraryContentType::Movies);
 
     // Every file that the walks returned, every folder they could not list, and every symlink
     // loop they skipped. The removal at the end of the scan needs all three.
@@ -970,6 +974,16 @@ async fn scan_flat_library(
         loops.extend(loop_dirs);
 
         for file_path_buf in files {
+            if reads_extras {
+                match extras::classify_movie_file(&file_path_buf, path) {
+                    extras::Classified::Extra(found) => {
+                        found_extras.push(found);
+                        continue;
+                    }
+                    extras::Classified::Skip => continue,
+                    extras::Classified::No => {}
+                }
+            }
             let ext = file_path_buf
                 .extension()
                 .and_then(|e| e.to_str())
@@ -1135,6 +1149,12 @@ async fn scan_flat_library(
         }
     }
 
+    // The extras, now that their movies are stored. A failure is logged, not returned.
+    match extras::sync_extras(pool, library, &filter, &found_extras).await {
+        Ok(extra_plans) => plans.extend(extra_plans),
+        Err(e) => tracing::error!("failed to save the extras of '{}': {e}", library.name),
+    }
+
     tracing::info!(
         "scanned library '{}': {} new items added ({} existing items unchanged)",
         library.name,
@@ -1209,6 +1229,8 @@ async fn scan_tv_library(
     // Each series that the walks met, by id: its folder's path and name, and its seasons with their
     // folder's name and number. Series and seasons stored under older rules are settled from these.
     let mut series_folders: BTreeMap<Uuid, SeriesWalk> = BTreeMap::new();
+    // The trailers, special features and theme media of the series and seasons, stored after them.
+    let mut found_extras: Vec<extras::FoundExtra> = Vec::new();
 
     // Every file that the walks returned, every folder they could not list, and every symlink
     // loop they skipped. The removal at the end of the scan needs all three.
@@ -1247,6 +1269,14 @@ async fn scan_tv_library(
         let mut skipped_ext = 0u32;
         for file_path_buf in files {
             scanned_files += 1;
+            match extras::classify_tv_file(&file_path_buf, path) {
+                extras::Classified::Extra(found) => {
+                    found_extras.push(found);
+                    continue;
+                }
+                extras::Classified::Skip => continue,
+                extras::Classified::No => {}
+            }
             if !is_episode_file(&file_path_buf) {
                 skipped_ext += 1;
                 continue;
@@ -1606,6 +1636,12 @@ async fn scan_tv_library(
             count += new_episodes.len() as u32;
             new_item_ids.extend(new_episodes.iter().map(|item| item.id));
         }
+    }
+
+    // The extras, now that their series and seasons are stored. A failure is logged, not returned.
+    match extras::sync_extras(pool, library, &filter, &found_extras).await {
+        Ok(extra_plans) => plans.extend(extra_plans),
+        Err(e) => tracing::error!("failed to save the extras of '{}': {e}", library.name),
     }
 
     tracing::info!(
@@ -2531,7 +2567,7 @@ pub(crate) async fn path_date(path: &Path) -> Option<DateTime<Utc>> {
 }
 
 /// When the item at `path` was added, as `path_date` gives it. Now, if that is None.
-async fn date_added(path: &Path) -> DateTime<Utc> {
+pub(crate) async fn date_added(path: &Path) -> DateTime<Utc> {
     path_date(path).await.unwrap_or_else(Utc::now)
 }
 
