@@ -23381,6 +23381,12 @@ fn r3playercore_still_watching() {
     b124_node_test("r3playercore_still_watching.mjs");
 }
 
+// R3 core player: music under a now-playing bar that stays across pages
+#[test]
+fn r3playercore_music() {
+    b124_node_test("r3playercore_music.mjs");
+}
+
 // The web client's item page: credits, ratings, media info, track pickers, chapters, links, "mark all
 // played" and delete (tests/web/r3item_detail.mjs), and the pickers' choice in the player
 // (tests/web/r3item_play.mjs)

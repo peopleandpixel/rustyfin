@@ -1001,6 +1001,34 @@ select.jf-input {
   display: none;
 }
 
+/* Now playing: the music bar along the bottom of every page; the page scrolls clear of it */
+.jf-now-playing {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 60;
+  background: rgba(10, 13, 20, 0.95);
+  backdrop-filter: blur(12px);
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.jf-now-playing-seek {
+  display: block;
+  width: 100%;
+  height: 4px;
+  margin: 0;
+  cursor: pointer;
+}
+
+body.jf-has-now-playing main {
+  padding-bottom: 5rem;
+}
+
+body.jf-has-now-playing #toast-container {
+  bottom: 5.5rem;
+}
+
 /* Playback info: Jellyfin Web's stats overlay, top left under the top bar */
 .jf-player-stats {
   position: absolute;

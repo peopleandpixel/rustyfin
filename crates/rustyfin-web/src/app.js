@@ -20,7 +20,7 @@ import {
     playAdjacentEpisode, playUpNextNow, cancelUpNext, togglePlayPause, setVolume, toggleMute, setPlaybackRate,
     toggleFullscreen, togglePictureInPicture, skipSegment, hoverSeek, hideTrickplay, renderPlayerSettings,
     setSubtitleAppearance, changeSubtitleOffset, changeQuality, changeVersion, changeAspectRatio, renderChapterMenu,
-    changeSegmentAction, togglePlaybackStats, changeStillWatching,
+    changeSegmentAction, togglePlaybackStats, changeStillWatching, openFullPlayer, stopNowPlaying,
 } from './modules/player.js';
 import './modules/playerprefs.js';
 import './modules/queue.js';
@@ -41,7 +41,7 @@ Object.assign(window, {
     playUpNextNow, cancelUpNext, togglePlayPause, setVolume, toggleMute, setPlaybackRate, toggleFullscreen,
     togglePictureInPicture, skipSegment, hoverSeek, hideTrickplay, renderPlayerSettings, setSubtitleAppearance,
     changeSubtitleOffset, changeQuality, changeVersion, changeAspectRatio, renderChapterMenu, changeSegmentAction,
-    togglePlaybackStats, changeStillWatching, renderLogin,
+    togglePlaybackStats, changeStillWatching, openFullPlayer, stopNowPlaying, renderLogin,
     handleLogin, handleSetupPassword, doLogout, showQuickConnectModal, authorizeQuickConnect, changeNextEpisodeAutoPlay,
     changeUiLanguage, handleSaveConfig, jiAddPair, jiForget, jiSetMine, jiSetChoice, jiSetConfirm, jiPreview, jiRun,
     jiNewCode, jiCopyCodes, refreshTasks, openAddLibrary, closeAddLibrary, submitAddLibrary, closeLibraryOptions,

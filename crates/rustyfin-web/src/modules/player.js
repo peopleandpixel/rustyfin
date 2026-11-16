@@ -612,8 +612,8 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
     hideSkipSegment();
     hideTrickplay();
 
-    // Show modal immediately while loading
-    if (!modal.open) {
+    // Show modal immediately while loading; music plays under the now-playing bar instead
+    if (!modal.open && streamType !== 'Audio') {
         if (typeof modal.showModal === 'function') modal.showModal();
         else modal.setAttribute('open', '');
     }
@@ -635,7 +635,8 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
             : null,
         streamType === 'Videos' ? API.getMe().catch(() => null) : null,
     ]);
-    if (!modal.open || request !== playRequest) return; // closed or replaced while loading
+    // Closed (videos) or replaced while loading
+    if ((!modal.open && streamType !== 'Audio') || request !== playRequest) return;
     const prefs = trackPrefs(me?.Configuration);
     if (!title && item?.Name) $('player-title').textContent = item.Name;
     // An episode the user started begins a new run; one played on from the last (with its tracks) adds to it
@@ -743,10 +744,12 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
             video.removeAttribute('src');
             video.load();
             clearTextSubtitle();
+            if (activePlayback === null) updateNowPlaying(null);
             return reported;
         },
     };
     activePlayback = session;
+    updateNowPlaying(session, item);
     session.trickplay = trickplayInfo(item, session.mediaSourceId);
     renderChapters(session);
     renderTrackMenus(session);
@@ -770,6 +773,7 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
     video.ontimeupdate = () => {
         if (activePlayback !== session) return;
         updatePlayerControls(session);
+        updateNowPlayingProgress(session);
         checkUpNext(session);
         checkSkipSegment(session);
         updateMediaPosition(session);
@@ -882,8 +886,14 @@ function playerAutoHide(modal, video, delay = 3000) {
 }
 
 // The dialog closed: stop the session and the queue, reset the bars, and leave fullscreen, which the dialog
-// may hold, and picture-in-picture
+// may hold, and picture-in-picture. Music plays on under the now-playing bar.
 function onPlayerClosed() {
+    if (activePlayback?.streamType === 'Audio') {
+        closePlayerSettings();
+        playerBars?.reset();
+        if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+        return;
+    }
     stopPlayback();
     clearQueue();
     resetEpisodeNav();
@@ -1041,6 +1051,13 @@ function updateEpisodeButtons() {
         button.title = label;
         button.setAttribute?.('aria-label', label);
     }
+    // The now-playing bar's previous and next follow the queue
+    for (const [id, item] of [['now-playing-prev', episodeNav?.prev], ['now-playing-next', episodeNav?.next]]) {
+        const button = $(id);
+        if (!button) continue;
+        button.hidden = !episodeNav;
+        button.disabled = !item;
+    }
 }
 
 // Plays a neighbour from its start with this item's track languages; finished reports this one as watched.
@@ -1164,8 +1181,9 @@ function togglePlayPause() {
 }
 
 function updatePlayIcon(isPlaying) {
-    const slot = $('player-play-icon');
-    if (slot) {
+    for (const id of ['player-play-icon', 'now-playing-play-icon']) {
+        const slot = $(id);
+        if (!slot) continue;
         slot.innerHTML = isPlaying
             ? icon('Pause', { size: 20, class: 'w-5 h-5 fill-current' })
             : icon('Play', { size: 20, class: 'w-5 h-5 ml-0.5 fill-current' });
@@ -1313,6 +1331,55 @@ function playerKeyAction(e) {
     case 'h': return () => changeSubtitleOffset(1);
     default: return null;
     }
+}
+
+// --- Now playing: music plays under a bar on every page (Jellyfin Web's now-playing bar); the full player
+// opens from it and closing it leaves the music playing ---
+// Shows the bar for a song with its title, artists and art, and gives the full player the art; null hides it
+function updateNowPlaying(session, item = null) {
+    const bar = $('now-playing');
+    const audio = session?.streamType === 'Audio';
+    const video = $('video-player');
+    const picture = audio ? itemPicture(item) : null;
+    const art = picture ? API.imageUrl(picture.id, 'Primary', { maxHeight: 512, tag: picture.tag }) : '';
+    if (video) {
+        if (art) video.poster = art;
+        else video.removeAttribute?.('poster');
+    }
+    if (!bar) return;
+    bar.hidden = !audio;
+    document.body.classList.toggle('jf-has-now-playing', audio);
+    if (!audio) return;
+    $('now-playing-title').textContent = item?.Name || $('player-title').textContent;
+    $('now-playing-artist').textContent = itemArtist(item);
+    const img = $('now-playing-img');
+    img.hidden = !art;
+    if (art) img.src = API.imageUrl(picture.id, 'Primary', { maxHeight: 96, tag: picture.tag });
+    updateNowPlayingProgress(session);
+}
+
+function updateNowPlayingProgress(session) {
+    if (session.streamType !== 'Audio' || $('now-playing')?.hidden) return;
+    const total = session.total();
+    const pos = session.position();
+    if (!seekDragging) $('now-playing-seek').value = total > 0 ? Math.min(100, pos / total * 100) : 0;
+    $('now-playing-time').textContent = `${formatDurationSeconds(pos)} / ${formatDurationSeconds(total)}`;
+}
+
+function openFullPlayer() {
+    const modal = $('player-modal');
+    if (modal && !modal.open) modal.showModal();
+}
+
+// The bar's ×: the music stops, the queue ends and the bar goes
+function stopNowPlaying() {
+    stopPlayback();
+    clearQueue();
+    resetEpisodeNav();
+    clearMediaSession();
+    updateNowPlaying(null);
+    const modal = $('player-modal');
+    if (modal?.open) modal.close();
 }
 
 // --- Are you still watching? Jellyfin Web's prompt before the next episode, off unless the user turns it on.
@@ -1477,16 +1544,27 @@ const hasMediaSession = () => typeof navigator !== 'undefined' && 'mediaSession'
 // The artwork sizes Jellyfin Web offers, largest first (Firefox on Linux takes the first)
 const ARTWORK_SIZES = [512, 384, 256, 192, 128, 96];
 
+// The item's picture, else its album's or series', else the parent's that Jellyfin names
+function itemPicture(item) {
+    if (item?.ImageTags?.Primary) return { id: item.Id, tag: item.ImageTags.Primary };
+    if (item?.AlbumId && item.AlbumPrimaryImageTag) return { id: item.AlbumId, tag: item.AlbumPrimaryImageTag };
+    if (item?.SeriesId && item.SeriesPrimaryImageTag) return { id: item.SeriesId, tag: item.SeriesPrimaryImageTag };
+    if (item?.ParentPrimaryImageItemId && item.ParentPrimaryImageTag) return { id: item.ParentPrimaryImageItemId, tag: item.ParentPrimaryImageTag };
+    return null;
+}
+
+// An episode under its series, a song under its artists
+function itemArtist(item) {
+    return item?.Type === 'Episode'
+        ? [item.SeriesName, episodeNumberLabel(item)].filter(Boolean).join(' · ')
+        : (item?.Artists?.length ? item.Artists.join(', ') : item?.AlbumArtist || '');
+}
+
 // Title, artist, album and artwork as Jellyfin Web shows them: an episode under its series, a song under its
 // artists and album. The artwork is the item's picture, else its album's or series'.
 function mediaSessionMetadata(item, title) {
-    const artist = item?.Type === 'Episode'
-        ? [item.SeriesName, episodeNumberLabel(item)].filter(Boolean).join(' · ')
-        : (item?.Artists?.length ? item.Artists.join(', ') : item?.AlbumArtist || '');
-    let picture = null;
-    if (item?.ImageTags?.Primary) picture = { id: item.Id, tag: item.ImageTags.Primary };
-    else if (item?.AlbumId && item.AlbumPrimaryImageTag) picture = { id: item.AlbumId, tag: item.AlbumPrimaryImageTag };
-    else if (item?.SeriesId && item.SeriesPrimaryImageTag) picture = { id: item.SeriesId, tag: item.SeriesPrimaryImageTag };
+    const artist = itemArtist(item);
+    const picture = itemPicture(item);
     const artwork = picture
         ? ARTWORK_SIZES.map(size => ({ src: API.imageUrl(picture.id, 'Primary', { maxHeight: size, tag: picture.tag }), sizes: `${size}x${size}` }))
         : [];
@@ -1545,7 +1623,7 @@ function bindMediaSession() {
     const video = () => $('video-player');
     setMediaSessionHandler('play', () => video()?.play());
     setMediaSessionHandler('pause', () => video()?.pause());
-    setMediaSessionHandler('stop', closePlayer);
+    setMediaSessionHandler('stop', () => (activePlayback?.streamType === 'Audio' ? stopNowPlaying() : closePlayer()));
     setMediaSessionHandler('seekbackward', d => skipTime(-(d?.seekOffset || 10)));
     setMediaSessionHandler('seekforward', d => skipTime(d?.seekOffset || 30));
     setMediaSessionHandler('seekto', d => { if (activePlayback && Number.isFinite(d?.seekTime)) seekTo(activePlayback, d.seekTime); });
@@ -1931,7 +2009,7 @@ export {
     playUpNextNow, cancelUpNext, togglePlayPause, setVolume, toggleMute, setPlaybackRate, toggleFullscreen,
     togglePictureInPicture, skipSegment, hoverSeek, hideTrickplay, renderPlayerSettings, setSubtitleAppearance,
     changeSubtitleOffset, changeQuality, changeVersion, changeAspectRatio, renderChapterMenu, changeSegmentAction,
-    togglePlaybackStats, changeStillWatching,
+    togglePlaybackStats, changeStillWatching, openFullPlayer, stopNowPlaying,
 };
 
 // Shared state that inline handlers or other modules assign: reached through window

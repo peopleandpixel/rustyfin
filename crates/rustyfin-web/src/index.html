@@ -969,6 +969,37 @@
     <form method="dialog" class="modal-backdrop"><button data-i18n="common.backdrop_close">close</button></form>
 </dialog>
 
+<!-- Now playing: music plays on across pages under this bar; the full player opens from it -->
+<div id="now-playing" class="jf-now-playing" role="region" aria-label="Now playing" data-i18n-aria-label="player.now_playing" hidden>
+    <input id="now-playing-seek" type="range" min="0" max="100" value="0" step="0.1" class="jf-now-playing-seek accent-[#00a4dc]"
+           aria-label="Seek" data-i18n-aria-label="player.seek" oninput="seekDragging = true" onchange="seekVideo(this.value)">
+    <div class="flex items-center gap-2 px-3 py-2">
+        <button type="button" class="flex items-center gap-3 min-w-0 flex-1 text-left" onclick="openFullPlayer()" title="Open player" data-i18n-title="player.open_player">
+            <img id="now-playing-img" class="w-11 h-11 rounded object-cover bg-white/10 shrink-0" alt="">
+            <span class="min-w-0">
+                <span id="now-playing-title" class="block truncate text-sm font-semibold text-white"></span>
+                <span id="now-playing-artist" class="block truncate text-xs text-white/60"></span>
+            </span>
+        </button>
+        <span id="now-playing-time" class="text-xs font-mono text-white/60 max-sm:hidden"></span>
+        <button id="now-playing-prev" type="button" class="jf-icon-btn disabled:opacity-40" onclick="playAdjacentEpisode(-1)" title="Previous" aria-label="Previous" data-i18n-title="player.previous_item" data-i18n-aria-label="player.previous_item" hidden>
+            <i data-lucide="skip-back" class="w-5 h-5"></i>
+        </button>
+        <button type="button" class="jf-icon-btn !bg-[#00a4dc] hover:!bg-[#008fbf] text-white" onclick="togglePlayPause()" title="Play/Pause" aria-label="Play/Pause" data-i18n-title="player.play_pause" data-i18n-aria-label="player.play_pause">
+            <span id="now-playing-play-icon" class="inline-flex"><i data-lucide="play" class="w-5 h-5 ml-0.5 fill-current"></i></span>
+        </button>
+        <button id="now-playing-next" type="button" class="jf-icon-btn disabled:opacity-40" onclick="playAdjacentEpisode(1)" title="Next" aria-label="Next" data-i18n-title="player.next_item" data-i18n-aria-label="player.next_item" hidden>
+            <i data-lucide="skip-forward" class="w-5 h-5"></i>
+        </button>
+        <button type="button" class="jf-icon-btn max-sm:hidden" onclick="openFullPlayer()" title="Open player" aria-label="Open player" data-i18n-title="player.open_player" data-i18n-aria-label="player.open_player">
+            <i data-lucide="maximize" class="w-5 h-5"></i>
+        </button>
+        <button type="button" class="jf-icon-btn" onclick="stopNowPlaying()" title="Stop" aria-label="Stop" data-i18n-title="player.stop" data-i18n-aria-label="player.stop">
+            <i data-lucide="x" class="w-5 h-5"></i>
+        </button>
+    </div>
+</div>
+
 <!-- Are you still watching? Before the next episode, after a long run (the player's settings menu turns it on) -->
 <dialog id="still-watching" class="modal bg-black/70 backdrop-blur-md">
     <div class="modal-box max-w-xs jf-menu rounded-2xl p-5">

@@ -99,6 +99,9 @@ test('closing the player resets the bars and leaves fullscreen when the page hol
             hideTrickplay: () => {},
             clearMediaSession: () => {},
             togglePlaybackStats: () => {},
+            // A video, so closing stops it (music plays on under the now-playing bar: r3playercore_music.mjs)
+            activePlayback: { streamType: 'Videos' },
+            closePlayerSettings: () => {},
             playerBars: { reset: () => calls.push('reset') },
             document: {
                 fullscreenElement: full ? {} : null,

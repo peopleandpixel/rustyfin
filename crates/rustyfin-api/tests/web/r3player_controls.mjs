@@ -311,7 +311,7 @@ test('the Media Session shows the item and binds Jellyfin Web\'s actions; previo
     const video = { play: () => calls.push('play'), pause: () => calls.push('pause'), playbackRate: 1.5 };
     const box = sandbox(['function mediaSessionMetadata(', 'function updateMediaSession(', 'function setMediaPlaybackState(',
         'function updateMediaPosition(', 'function clearMediaSession(', 'function setMediaSessionHandler(', 'function bindMediaSession(',
-        'function episodeNumberLabel('], {
+        'function episodeNumberLabel(', 'function itemPicture(', 'function itemArtist('], {
         navigator: { mediaSession },
         MediaMetadata: class { constructor(m) { Object.assign(this, m); } },
         closePlayer: () => calls.push('close'),
