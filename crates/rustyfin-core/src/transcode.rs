@@ -2793,8 +2793,16 @@ exec sleep 30
             .trim()
             .parse()
             .unwrap();
+        // A killed grandchild is reparented, and it stays a zombie until its new parent reaps it
+        // (CI's init may never do), so a zombie counts as gone
+        let zombie = |pid: i32| {
+            std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+                stat.rsplit_once(')')
+                    .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z'))
+            })
+        };
         // SAFETY: signal 0 only asks whether the process exists
-        let alive = |pid| unsafe { libc::kill(pid, 0) } == 0;
+        let alive = |pid| unsafe { libc::kill(pid, 0) } == 0 && !zombie(pid);
         assert!(alive(pid));
         mgr.stop_all().await;
         // The grandchild got SIGKILL with its group; give the kernel a moment to end it
