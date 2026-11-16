@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Web client item pages**: The detail page follows Jellyfin Web's item details more closely.
+  - The tagline above the overview; Director, Writer and Studio lines; the critic rating (fresh at 60% and up); and "Ends at" for a video, counted from the resume point.
+  - Version, audio and subtitle pickers under the Play button. The choice goes to the player, and a picker left alone keeps the player's default (a remembered track, for example).
+  - A collapsible media info section for the chosen version: container, size and bitrate, then each video, audio and subtitle stream.
+  - A Chapters row with the chapter images, where the library makes them. A chapter plays the item from its start.
+  - Links to the item's pages on IMDb, TMDb and TheTVDB. Where the server sends none, they are built from the provider ids (TMDb and TheTVDB for movies and series only).
+  - On a series or season the played button reads "Mark all played" and marks every episode.
+  - Administrators get a Delete button. It asks first and goes to the item's season, series or album afterwards. The question says the files stay on disk, or, for a collection or playlist, that it is gone for good.
 - **Web client search as you type**: The header search box searches once typing pauses for half a second, as Jellyfin Web does, without a history entry per term; Enter still searches at once. Results are grouped by type in Jellyfin Web's order (movies, shows, episodes, people, playlists, artists, albums, songs, videos, photos, audiobooks, books, collections), each type asked for on its own so none crowds out the others, and a person's card opens the person page.
 - **Web client home rows**: The home page has a "Recently Added in <library>" row per library instead of one mixed row, each with a link to its library, and resumes audio in its own Continue Listening row next to Continue Watching, as Jellyfin Web does.
 - **Web client music library tabs**: A music library has Jellyfin Web's tabs: Albums, Album Artists, Artists, Songs and Genres. Songs play from their row, a genre opens its albums, the lists load a page at a time as they scroll, and the library opens on the tab last shown.
