@@ -101,8 +101,7 @@ async fn playback_info(
             .await
             .unwrap_or_default();
     for source in sources.iter_mut() {
-        let external = crate::routes::subtitle::external_streams(source).await;
-        source.media_streams.extend(external);
+        crate::routes::subtitle::with_external_streams(source).await;
     }
 
     // A blank MediaSourceId is absent: every source is answered
@@ -142,10 +141,26 @@ async fn playback_info(
         stored_profile(state, claims, &device_id).await?
     };
 
+    // The caller's remembered tracks, which a request that names none plays, as Jellyfin's
+    // SetDefaultAudioAndSubtitleStreamIndices makes them the sources' defaults
+    let (remembered_audio, remembered_subtitle) =
+        super::remembered_choices(state, claims.sub, item_id).await?;
+
     let play_session_id = Uuid::new_v4().simple().to_string();
     let mut media_sources = Vec::with_capacity(chosen.len());
     for index in chosen {
         let mut source = sources[index].clone();
+        let audio_stream_index = dto.audio_stream_index.or_else(|| {
+            let choice = remembered_audio.as_ref()?;
+            super::remembered_stream(&source, "Audio", choice)
+        });
+        let subtitle_stream_index = dto.subtitle_stream_index.or_else(|| {
+            let choice = remembered_subtitle.as_ref()?;
+            match choice.index {
+                -1 => Some(-1),
+                _ => super::remembered_stream(&source, "Subtitle", choice),
+            }
+        });
         // The loader's flags are a placeholder; the device data below decides them when present
         source.supports_direct_play = true;
         source.supports_direct_stream = true;
@@ -163,8 +178,8 @@ async fn playback_info(
                     } else {
                         String::new()
                     },
-                    audio_stream_index: dto.audio_stream_index,
-                    subtitle_stream_index: dto.subtitle_stream_index,
+                    audio_stream_index,
+                    subtitle_stream_index,
                     max_audio_channels: dto.max_audio_channels,
                     enable_direct_play: dto.enable_direct_play.unwrap_or(true),
                     enable_direct_stream: dto.enable_direct_stream.unwrap_or(true),

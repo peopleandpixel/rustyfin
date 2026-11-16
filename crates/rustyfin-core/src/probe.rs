@@ -29,7 +29,7 @@ fn probe_semaphore() -> &'static Semaphore {
 }
 
 use rustyfin_model::chapter::Chapter;
-use rustyfin_model::media_source::{MediaSourceResponse, MediaStream};
+use rustyfin_model::media_source::{DoviConfig, MediaSourceResponse, MediaStream};
 
 /// Result of probing a media file with ffprobe.
 #[derive(Debug)]
@@ -133,6 +133,39 @@ struct SideData {
     attachment: Option<String>, // base64-encoded image data
     mime_type: Option<String>,
     filename: Option<String>,
+    // The "DOVI configuration record" fields
+    dv_version_major: Option<i32>,
+    dv_version_minor: Option<i32>,
+    dv_profile: Option<i32>,
+    dv_level: Option<i32>,
+    rpu_present_flag: Option<i32>,
+    el_present_flag: Option<i32>,
+    bl_present_flag: Option<i32>,
+    dv_bl_signal_compatibility_id: Option<i32>,
+}
+
+/// The Dolby Vision configuration record in a stream's side data, as Jellyfin reads it; empty
+/// when there is none.
+fn dovi_config(side_data: Option<&[SideData]>) -> DoviConfig {
+    side_data
+        .unwrap_or_default()
+        .iter()
+        .find(|d| {
+            d.side_data_type
+                .as_deref()
+                .is_some_and(|t| t.eq_ignore_ascii_case("DOVI configuration record"))
+        })
+        .map(|d| DoviConfig {
+            dv_version_major: d.dv_version_major,
+            dv_version_minor: d.dv_version_minor,
+            dv_profile: d.dv_profile,
+            dv_level: d.dv_level,
+            rpu_present_flag: d.rpu_present_flag,
+            el_present_flag: d.el_present_flag,
+            bl_present_flag: d.bl_present_flag,
+            dv_bl_signal_compatibility_id: d.dv_bl_signal_compatibility_id,
+        })
+        .unwrap_or_default()
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -762,7 +795,12 @@ fn stream_to_model(s: FfprobeStream) -> MediaStream {
             !order.trim().is_empty() && !order.eq_ignore_ascii_case("progressive")
         });
 
-    MediaStream {
+    let dovi = if is_video {
+        dovi_config(s.side_data_list.as_deref())
+    } else {
+        DoviConfig::default()
+    };
+    let mut stream = MediaStream {
         index: s.index,
         codec: s.codec_name,
         codec_type: s.codec_type.unwrap_or_default(),
@@ -800,7 +838,12 @@ fn stream_to_model(s: FfprobeStream) -> MediaStream {
         embedded_bitmaps: false,
         level,
         is_anamorphic,
-    }
+        dovi,
+        video_range: None,
+        video_range_type: None,
+    };
+    stream.fill_video_range();
+    stream
 }
 
 /// A stream's bit rate from its Matroska statistics tags, as Jellyfin reads it: `BPS`, else

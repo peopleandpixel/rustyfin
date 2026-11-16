@@ -18,6 +18,7 @@ use crate::error::ApiError;
 use crate::state::{AppState, LibraryRoot};
 
 mod media_info;
+mod progressive;
 mod universal_audio;
 
 pub fn routes() -> Router<AppState> {
@@ -111,10 +112,11 @@ pub(crate) fn select_version(
         })
 }
 
-/// The path of a video route. `stream.{container}` has a second parameter, which serde ignores.
+/// The path of a video route: the item, and the container of `stream.{container}`.
 #[derive(Deserialize)]
 struct VideoPath {
     id: Uuid,
+    container: Option<String>,
 }
 
 /// The file that a video request plays: the item's own file, or the file of the version that its
@@ -573,25 +575,90 @@ pub(crate) async fn validate_path_against_library(
     Err(refused())
 }
 
-/// `GET /Videos/{id}/stream` and `stream.{container}`: the file of the requested version.
-async fn stream_video(
-    State(state): State<AppState>,
-    Path(VideoPath { id }): Path<VideoPath>,
-    Query(params): Query<HashMap<String, String>>,
-    headers: HeaderMap,
-) -> Result<Response, ApiError> {
-    let file_path = video_file(&state, id, &params).await?;
-    serve_file(file_path, &headers).await
+/// What `/Videos/{id}/stream` and `stream.{container}` serve. `static=true` gets the file, and
+/// so does a request with no `static` that names no `VideoCodec` and no `AudioCodec` (Rustyfin's
+/// own clients ask so for the file). `static=false`, or codecs without `static`, ask for a
+/// progressive transcode, as Jellyfin makes it: into the URL's container, else `Container`,
+/// else the source's (see `progressive_video_profile` for what is copied).
+async fn video_stream_answer(
+    state: &AppState,
+    VideoPath { id, container }: VideoPath,
+    params: &HashMap<String, String>,
+    uri: &axum::http::Uri,
+) -> Result<Served, ApiError> {
+    let param = |name: &str| progressive::param(params, name);
+    let transcode = match param("static").map(|v| v.eq_ignore_ascii_case("true")) {
+        Some(is_static) => !is_static,
+        None => param("VideoCodec").is_some() || param("AudioCodec").is_some(),
+    };
+    if !transcode {
+        return Ok(Served::File(video_file(state, id, params).await?));
+    }
+    let item = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Item {id} not found")))?;
+    let sources =
+        rustyfin_db::repo_media_source::get_media_sources_with_item_check(&state.db_ro, &id)
+            .await
+            .unwrap_or_default();
+    let (input, source) = match select_version(id, &sources, requested_source_id(params))? {
+        Version::Primary => (item.path.as_str(), sources.first()),
+        Version::Source(index) => (sources[index].path.as_str(), sources.get(index)),
+    };
+    let path = validate_path_against_library(state, input).await?;
+    let query = Query::<super::transcode::TranscodeQuery>::try_from_uri(uri)
+        .map_err(|e| ApiError::BadRequest(format!("Invalid transcode query: {e}")))?
+        .0;
+    let query = super::transcode::to_file_numbering(query, source).await;
+    let mut profile = super::transcode::progressive_video_profile(query, params, source);
+    if let Some(channels) = progressive::channel_limit(params) {
+        profile.audio_channels = Some(channels);
+    }
+    let container = container
+        .or_else(|| param("Container").map(str::to_string))
+        .or_else(|| source.and_then(|s| s.container.clone()))
+        .unwrap_or_else(|| "mkv".to_string());
+    // A probed container may be a list ("mov,mp4,m4a"): its first name
+    let container = container
+        .split(',')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    Ok(Served::Progressive {
+        path,
+        profile: Box::new(profile),
+        container,
+        item_id: id,
+        play_session_id: requested_play_session_id(params).unwrap_or_default(),
+        device_id: param("DeviceId").unwrap_or_default().to_string(),
+    })
 }
 
-/// `HEAD` of `stream` and `stream.{container}`: the headers of the file that `GET` serves.
+/// `GET /Videos/{id}/stream` and `stream.{container}`: the file of the requested version, or its
+/// progressive transcode (see `video_stream_answer`).
+async fn stream_video(
+    State(state): State<AppState>,
+    Path(path): Path<VideoPath>,
+    Query(params): Query<HashMap<String, String>>,
+    uri: axum::http::Uri,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let served = video_stream_answer(&state, path, &params, &uri).await?;
+    served.respond(&state, &headers, false).await
+}
+
+/// `HEAD` of `stream` and `stream.{container}`: the headers that `GET` sends; it starts no
+/// transcode.
 async fn head_video(
     State(state): State<AppState>,
-    Path(VideoPath { id }): Path<VideoPath>,
+    Path(path): Path<VideoPath>,
     Query(params): Query<HashMap<String, String>>,
+    uri: axum::http::Uri,
+    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    let file_path = video_file(&state, id, &params).await?;
-    head_file(&file_path).await
+    let served = video_stream_answer(&state, path, &params, &uri).await?;
+    served.respond(&state, &headers, true).await
 }
 
 /// The path of an audio stream route: the item, and the container of `stream.{container}`.
@@ -601,41 +668,51 @@ struct AudioPath {
     container: Option<String>,
 }
 
-/// The track file that `/Audio/{id}/stream` and `stream.{container}` serve. Without `static=true`,
-/// a request that names codecs (`AudioCodec`, else the URL's container) the track's codec and
-/// container aren't among asks for a transcode, which Jellyfin makes progressively. Rustyfin's
-/// transcoder writes HLS only, so that is a 400 that says so, not the file as it is (FLAC for an
-/// MP3 client).
-async fn audio_stream_file(
+/// The query parameters that limit an audio transcode; a request with one asks for a transcode
+/// even of the track's own codec, as Jellyfin's progressive job copies or re-encodes it.
+const AUDIO_LIMITS: [&str; 6] = [
+    "AudioBitrate",
+    "MaxAudioBitrate",
+    "AudioSampleRate",
+    "MaxAudioSampleRate",
+    "AudioChannels",
+    "MaxAudioChannels",
+];
+
+/// What `/Audio/{id}/stream` and `stream.{container}` serve: the track's file, or a progressive
+/// transcode. `static=true`, or a request that names no codec and no container, gets the file;
+/// so does one whose container (else `AudioCodec` list) the track's container or codec is among
+/// without limits (`AUDIO_LIMITS`). Anything else is transcoded progressively, as Jellyfin
+/// does: into the URL's container, else `Container`, else the track's own container when its
+/// codec is listed, else the first listed codec's.
+async fn audio_stream_answer(
     state: &AppState,
     AudioPath { id, container }: AudioPath,
     params: &HashMap<String, String>,
-) -> Result<String, ApiError> {
+) -> Result<Served, ApiError> {
     let item = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Item {id} not found")))?;
     // The resolved path, which the file is opened by
     let path = validate_path_against_library(state, &item.path).await?;
 
-    let param = |name: &str| {
-        params
-            .iter()
-            .find(|(key, _)| key.eq_ignore_ascii_case(name))
-            .map(|(_, value)| value.trim())
-            .filter(|value| !value.is_empty())
-    };
+    let param = |name: &str| progressive::param(params, name);
     if param("static").is_some_and(|v| v.eq_ignore_ascii_case("true")) {
-        return Ok(path);
+        return Ok(Served::File(path));
     }
-    let wanted: Vec<String> = param("AudioCodec")
-        .or(container.as_deref())
+    let listed: Vec<String> = param("AudioCodec")
         .unwrap_or_default()
         .split(',')
         .map(|codec| codec.trim().to_ascii_lowercase())
         .filter(|codec| !codec.is_empty())
         .collect();
-    if wanted.is_empty() {
-        return Ok(path);
+    let container = container
+        .as_deref()
+        .or(param("Container"))
+        .map(|c| c.trim().to_ascii_lowercase())
+        .filter(|c| !c.is_empty());
+    if listed.is_empty() && container.is_none() {
+        return Ok(Served::File(path));
     }
     let source =
         rustyfin_db::repo_media_source::get_media_sources_with_item_check(&state.db_ro, &id)
@@ -645,7 +722,7 @@ async fn audio_stream_file(
             .next();
     let Some(source) = source else {
         // A track that was never probed plays as it is
-        return Ok(path);
+        return Ok(Served::File(path));
     };
     let codec = source
         .media_streams
@@ -654,37 +731,103 @@ async fn audio_stream_file(
         .and_then(|s| s.codec.as_deref())
         .map(str::to_ascii_lowercase);
     let source_container = source.container.as_deref().map(str::to_ascii_lowercase);
-    let takes = |name: &Option<String>| name.as_ref().is_some_and(|n| wanted.contains(n));
-    if takes(&codec) || takes(&source_container) {
-        return Ok(path);
+    let is = |a: &Option<String>, b: &str| a.as_deref() == Some(b);
+    let container_takes = container
+        .as_deref()
+        .is_none_or(|c| is(&source_container, c) || is(&codec, c));
+    let codecs_take = listed.is_empty() || codec.as_ref().is_some_and(|c| listed.contains(c));
+    let limited = AUDIO_LIMITS.iter().any(|name| param(name).is_some());
+    if container_takes && codecs_take && !limited {
+        return Ok(Served::File(path));
     }
-    Err(ApiError::BadRequest(format!(
-        "Item {id} is {} and the request asks for {}: Rustyfin transcodes audio over HLS only, so \
-         use /Audio/{id}/universal with TranscodingProtocol=hls",
-        codec.as_deref().unwrap_or("of an unknown codec"),
-        wanted.join(",")
-    )))
+
+    let container = match container {
+        Some(container) => container,
+        None if codecs_take => source_container
+            .clone()
+            .unwrap_or_else(|| listed[0].clone()),
+        None => listed[0].clone(),
+    };
+    let profile = progressive::audio_profile(params, Some(&source), &container)?;
+    Ok(Served::Progressive {
+        path,
+        profile: Box::new(profile),
+        container,
+        item_id: id,
+        play_session_id: requested_play_session_id(params).unwrap_or_default(),
+        device_id: param("DeviceId").unwrap_or_default().to_string(),
+    })
 }
 
-/// `GET /Audio/{id}/stream` and `stream.{container}`: the track's file (see `audio_stream_file`).
+/// What a stream route serves.
+enum Served {
+    /// The file at this path, with byte ranges.
+    File(String),
+    /// A progressive transcode.
+    Progressive {
+        path: String,
+        profile: Box<rustyfin_core::transcode::TranscodeProfile>,
+        container: String,
+        item_id: Uuid,
+        play_session_id: String,
+        device_id: String,
+    },
+}
+
+impl Served {
+    /// The response: the file (or its headers for HEAD), or the transcode.
+    async fn respond(
+        self,
+        state: &AppState,
+        headers: &HeaderMap,
+        head: bool,
+    ) -> Result<Response, ApiError> {
+        match self {
+            Served::File(path) if head => head_file(&path).await,
+            Served::File(path) => serve_file(path, headers).await,
+            Served::Progressive {
+                path,
+                profile,
+                container,
+                item_id,
+                play_session_id,
+                device_id,
+            } => {
+                let job = progressive::Job {
+                    item_id,
+                    input_path: &path,
+                    profile: *profile,
+                    container: &container,
+                    play_session_id,
+                    device_id,
+                };
+                progressive::respond(state, job, head).await
+            }
+        }
+    }
+}
+
+/// `GET /Audio/{id}/stream` and `stream.{container}`: the track's file or its progressive
+/// transcode (see `audio_stream_answer`).
 async fn stream_audio(
     State(state): State<AppState>,
     Path(path): Path<AudioPath>,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    let file_path = audio_stream_file(&state, path, &params).await?;
-    serve_file(file_path, &headers).await
+    let served = audio_stream_answer(&state, path, &params).await?;
+    served.respond(&state, &headers, false).await
 }
 
-/// `HEAD` of the audio stream routes: the headers of the file that `GET` serves.
+/// `HEAD` of the audio stream routes: the headers that `GET` sends; it starts no transcode.
 async fn head_stream(
     State(state): State<AppState>,
     Path(path): Path<AudioPath>,
     Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    let file_path = audio_stream_file(&state, path, &params).await?;
-    head_file(&file_path).await
+    let served = audio_stream_answer(&state, path, &params).await?;
+    served.respond(&state, &headers, true).await
 }
 
 /// The headers of a `HEAD` for the file at `file_path`: its type, its length, and that byte
@@ -1317,10 +1460,9 @@ async fn video_playback_info(
             .await
             .ok_or_else(|| ApiError::NotFound(format!("Video item {id} not found")))?;
 
-    // The subtitle files beside each video are listed after its streams
+    // The subtitle files beside each video, numbered before its streams as Jellyfin numbers them
     for source in media_sources.iter_mut() {
-        let external = crate::routes::subtitle::external_streams(source).await;
-        source.media_streams.extend(external);
+        crate::routes::subtitle::with_external_streams(source).await;
     }
 
     // The index of the version the request names; an id that names none is refused
@@ -1361,31 +1503,22 @@ async fn video_playback_info(
         source.supports_transcoding = i == index && supports_transcoding;
     }
 
-    // The caller's remembered tracks become each source's defaults, where the source has them and
-    // the user keeps Jellyfin's RememberAudioSelections and RememberSubtitleSelections on
+    // The caller's remembered tracks become each source's defaults, where the source has them
     let (remembered_audio, remembered_subtitle) =
-        rustyfin_db::repo_playback::get_stream_choice(&state.db_ro, claims.sub, id).await?;
-    let config = rustyfin_db::repo_user::get_user_by_id(&state.db_ro, claims.sub)
-        .await?
-        .map(|user| rustyfin_model::user::jellyfin_configuration(&user.configuration))
-        .unwrap_or_default();
-    let remembers = |key: &str| config.get(key).and_then(|v| v.as_bool()) != Some(false);
-    let remembered_audio = remembered_audio.filter(|_| remembers("RememberAudioSelections"));
-    let remembered_subtitle =
-        remembered_subtitle.filter(|_| remembers("RememberSubtitleSelections"));
+        remembered_choices(&state, claims.sub, id).await?;
     let media_sources: Vec<rustyfin_model::playback_info::PlaybackMediaSource> = media_sources
         .into_iter()
         .map(|source| {
             let default_audio_stream_index = remembered_audio
                 .as_ref()
-                .filter(|choice| has_remembered_stream(&source, "Audio", choice))
-                .map(|choice| choice.index);
-            let default_subtitle_stream_index = remembered_subtitle
-                .as_ref()
-                .filter(|choice| {
-                    choice.index == -1 || has_remembered_stream(&source, "Subtitle", choice)
-                })
-                .map(|choice| choice.index);
+                .and_then(|choice| remembered_stream(&source, "Audio", choice));
+            let default_subtitle_stream_index = remembered_subtitle.as_ref().and_then(|choice| {
+                if choice.index == -1 {
+                    Some(-1)
+                } else {
+                    remembered_stream(&source, "Subtitle", choice)
+                }
+            });
             rustyfin_model::playback_info::PlaybackMediaSource {
                 source,
                 default_audio_stream_index,
@@ -1503,20 +1636,46 @@ fn client_takes_h264_video(
     client_takes_h264(request, video.profile.as_deref(), video.bit_depth)
 }
 
-/// Whether `source` has a stream of `kind` ("Audio", "Subtitle") at the choice's index whose key is
-/// the one stored with the choice. A choice with no stored key never matches.
-fn has_remembered_stream(
+/// The audio and subtitle choices `user` last made for `item`, each where the user keeps
+/// Jellyfin's RememberAudioSelections and RememberSubtitleSelections on.
+pub(crate) async fn remembered_choices(
+    state: &AppState,
+    user: Uuid,
+    item: Uuid,
+) -> Result<(Option<StreamChoice>, Option<StreamChoice>), ApiError> {
+    let (audio, subtitle) =
+        rustyfin_db::repo_playback::get_stream_choice(&state.db_ro, user, item).await?;
+    let config = rustyfin_db::repo_user::get_user_by_id(&state.db_ro, user)
+        .await?
+        .map(|user| rustyfin_model::user::jellyfin_configuration(&user.configuration))
+        .unwrap_or_default();
+    let remembers = |key: &str| config.get(key).and_then(|v| v.as_bool()) != Some(false);
+    Ok((
+        audio.filter(|_| remembers("RememberAudioSelections")),
+        subtitle.filter(|_| remembers("RememberSubtitleSelections")),
+    ))
+}
+
+/// The index of the stream of `kind` ("Audio", "Subtitle") in `source` that a remembered choice
+/// names: the stream at the choice's index whose key is the one stored with it, else the one
+/// stream with that key (the numbering moved: Jellyfin numbers external subtitle files first,
+/// and a choice stored before Rustyfin did names an embedded stream by its index in the file).
+/// A choice with no stored key, or a key several streams share, names none.
+pub(crate) fn remembered_stream(
     source: &rustyfin_model::media_source::MediaSourceResponse,
     kind: &str,
     choice: &StreamChoice,
-) -> bool {
-    let Some(key) = choice.key.as_deref() else {
-        return false;
-    };
-    source
+) -> Option<i32> {
+    let key = choice.key.as_deref()?;
+    let mut keyed = source
         .media_streams
         .iter()
-        .any(|s| s.index == choice.index && is_stream_type(s, kind) && s.identity().key() == key)
+        .filter(|s| is_stream_type(s, kind) && s.identity().key() == key);
+    let first = keyed.next()?;
+    if first.index == choice.index || keyed.clone().any(|s| s.index == choice.index) {
+        return Some(choice.index);
+    }
+    keyed.next().is_none().then_some(first.index)
 }
 
 /// Check if a media source can be directly played by the client.

@@ -728,15 +728,30 @@ fn without_transcoding_or_direct_stream_there_is_no_url() {
 }
 
 #[test]
-fn only_hls_streaming_transcoding_profiles_count() {
+fn streaming_transcoding_profiles_of_either_protocol_count() {
     let why = reasons(&[R::VideoProfileNotSupported]);
 
+    // A progressive (HTTP) profile transcodes too, as in Jellyfin: its URL is
+    // /videos/{id}/stream.{container}, with no segment parameters
     let mut http = profile("chrome-linux");
     for tp in &mut http.transcoding_profiles {
         tp.protocol = StreamProtocol::Http;
     }
     let data = device_data(&h264_hi10("mp4"), &http, &request());
-    assert_data(&data, &unplayable("mp4", why, Some(1)));
+    assert!(data.supports_transcoding);
+    assert_eq!(data.transcoding_sub_protocol, StreamProtocol::Http);
+    let url = data.transcoding_url.unwrap();
+    let container = data.transcoding_container.unwrap();
+    assert!(
+        url.starts_with(&format!(
+            "/videos/11111111-2222-3333-4444-555555555555/stream.{container}?"
+        )),
+        "{url}"
+    );
+    assert!(
+        !url.contains("Segment") && !url.contains("MinSegments"),
+        "{url}"
+    );
 
     let mut static_only = profile("chrome-linux");
     for tp in &mut static_only.transcoding_profiles {

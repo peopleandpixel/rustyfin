@@ -1,4 +1,4 @@
-use rustyfin_model::media_source::{MediaSourceResponse, MediaStream};
+use rustyfin_model::media_source::{DoviConfig, MediaSourceResponse, MediaStream};
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
@@ -16,7 +16,9 @@ use uuid::Uuid;
 /// 2: a video stream's codec level, its bit depth from the pixel format when ffprobe gives no
 /// sample size, its anamorphic flag and its interlaced flag, and a Matroska stream's bit rate
 /// from its statistics tags, which the playback decision reads.
-pub const PROBE_VERSION: i64 = 2;
+///
+/// 3: a video stream's Dolby Vision configuration record, which its VideoRangeType is read from.
+pub const PROBE_VERSION: i64 = 3;
 
 // ---------------------------------------------------------------------------
 // MediaSource DB row
@@ -111,13 +113,14 @@ struct MediaStreamRow {
     /// 007's INTEGER column; ffprobe's levels are whole numbers
     level: Option<i64>,
     is_anamorphic: Option<bool>,
+    dovi_config: Option<String>,
 }
 
 impl From<MediaStreamRow> for MediaStream {
     fn from(r: MediaStreamRow) -> Self {
         // The stored type is ignored: older probes wrote "Embedded" or "External" there
         let stream_type = MediaStream::stream_type(&r.codec_type, r.codec.as_deref());
-        Self {
+        let mut stream = Self {
             index: r.index,
             codec: r.codec,
             codec_type: r.codec_type,
@@ -152,8 +155,26 @@ impl From<MediaStreamRow> for MediaStream {
             embedded_bitmaps: r.embedded_bitmaps,
             level: r.level.map(|level| level as f64),
             is_anamorphic: r.is_anamorphic,
-        }
+            dovi: dovi_of(r.dovi_config.as_deref()),
+            video_range: None,
+            video_range_type: None,
+        };
+        stream.fill_video_range();
+        stream
     }
+}
+
+/// A stream's stored Dolby Vision record (JSON); empty when there is none or it doesn't parse.
+fn dovi_of(json: Option<&str>) -> DoviConfig {
+    json.and_then(|json| serde_json::from_str(json).ok())
+        .unwrap_or_default()
+}
+
+/// The Dolby Vision record to store: JSON, or NULL when the stream has none.
+fn dovi_json(dovi: &DoviConfig) -> Option<String> {
+    (!dovi.is_empty())
+        .then(|| serde_json::to_string(dovi).ok())
+        .flatten()
 }
 
 // ---------------------------------------------------------------------------
@@ -214,8 +235,8 @@ pub async fn insert_media_stream(
           bit_depth, channels, channel_layout, sample_rate, profile, type, aspect_ratio_text, \
           aspect_ratio, title, color_space, color_transfer, color_primaries, color_range, \
           localized_uri, is_default, is_forced, is_interlaced, embedded_bitmaps, stream_index, \
-          level, is_anamorphic) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          level, is_anamorphic, dovi_config) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&source_id_str)
@@ -253,6 +274,7 @@ pub async fn insert_media_stream(
     .bind(stream.index)
     .bind(stream.level.map(|level| level.round() as i64))
     .bind(stream.is_anamorphic)
+    .bind(dovi_json(&stream.dovi))
     .execute(pool)
     .await?;
 
@@ -288,7 +310,7 @@ pub async fn get_media_sources(
                  bit_depth, channels, channel_layout, sample_rate, profile, aspect_ratio_text, \
                  aspect_ratio, title, color_space, color_transfer, color_primaries, color_range, \
                  localized_uri, is_default, is_forced, is_interlaced, embedded_bitmaps, level, \
-                 is_anamorphic \
+                 is_anamorphic, dovi_config \
                  FROM media_streams WHERE source_id = ? AND LOWER(codec_type) <> 'attachment' \
                  ORDER BY stream_index",
             )
@@ -367,7 +389,7 @@ pub async fn get_media_sources_with_item_check(
              bit_depth, channels, channel_layout, sample_rate, profile, aspect_ratio_text, \
              aspect_ratio, title, color_space, color_transfer, color_primaries, color_range, \
              localized_uri, is_default, is_forced, is_interlaced, embedded_bitmaps, source_id, \
-             level, is_anamorphic \
+             level, is_anamorphic, dovi_config \
              FROM media_streams WHERE source_id IN ({}) AND LOWER(codec_type) <> 'attachment' \
              ORDER BY source_id, stream_index",
             in_clause
@@ -417,6 +439,7 @@ pub async fn get_media_sources_with_item_check(
                     embedded_bitmaps: row.embedded_bitmaps,
                     level: row.level,
                     is_anamorphic: row.is_anamorphic,
+                    dovi_config: row.dovi_config,
                 }
                 .into();
                 stream_map.entry(row.source_id).or_default().push(stream);
@@ -468,6 +491,7 @@ struct MediaStreamRowWithSource {
     /// 007's INTEGER column; ffprobe's levels are whole numbers
     level: Option<i64>,
     is_anamorphic: Option<bool>,
+    dovi_config: Option<String>,
 }
 
 /// Delete all media sources and streams for an item.
@@ -538,8 +562,8 @@ async fn insert_source_with_streams(
               bit_depth, channels, channel_layout, sample_rate, profile, type, aspect_ratio_text, \
               aspect_ratio, title, color_space, color_transfer, color_primaries, color_range, \
               localized_uri, is_default, is_forced, is_interlaced, embedded_bitmaps, stream_index, \
-              level, is_anamorphic) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              level, is_anamorphic, dovi_config) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&stream_id)
         .bind(&id)
@@ -577,6 +601,7 @@ async fn insert_source_with_streams(
         .bind(stream.index)
         .bind(stream.level.map(|level| level.round() as i64))
         .bind(stream.is_anamorphic)
+        .bind(dovi_json(&stream.dovi))
         .execute(&mut *conn)
         .await?;
     }
@@ -741,7 +766,7 @@ pub async fn get_media_sources_batch(
              mst.aspect_ratio_text, mst.aspect_ratio as stream_aspect_ratio, \
              mst.title, mst.color_space, mst.color_transfer, mst.color_primaries, mst.color_range, \
              mst.localized_uri, mst.is_default, mst.is_forced, mst.is_interlaced, mst.embedded_bitmaps, \
-             mst.level, mst.is_anamorphic, \
+             mst.level, mst.is_anamorphic, mst.dovi_config, \
              mst.stream_index as stream_index_num \
              FROM media_sources ms \
              LEFT JOIN media_streams mst ON mst.source_id = ms.id \
@@ -799,7 +824,7 @@ pub async fn get_media_sources_batch(
             if row.stream_id.is_some()
                 && let Some(source) = sources.get_mut(source_idx)
             {
-                let stream = MediaStream {
+                let mut stream = MediaStream {
                     index: row.stream_index_num.unwrap_or(0),
                     codec: row.codec.clone(),
                     codec_type: row
@@ -840,7 +865,11 @@ pub async fn get_media_sources_batch(
                     embedded_bitmaps: row.embedded_bitmaps.unwrap_or(false),
                     level: row.level.map(|level| level as f64),
                     is_anamorphic: row.is_anamorphic,
+                    dovi: dovi_of(row.dovi_config.as_deref()),
+                    video_range: None,
+                    video_range_type: None,
                 };
+                stream.fill_video_range();
                 source.media_streams.push(stream);
             }
         }
@@ -904,5 +933,6 @@ struct BatchSourceStreamRow {
     /// 007's INTEGER column; ffprobe's levels are whole numbers
     level: Option<i64>,
     is_anamorphic: Option<bool>,
+    dovi_config: Option<String>,
     stream_index_num: Option<i32>,
 }

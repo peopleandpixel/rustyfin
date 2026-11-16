@@ -660,9 +660,9 @@ fn a_failed_audio_codec_profile_blocks_direct_play() {
 }
 
 #[test]
-fn only_an_hls_streaming_audio_profile_transcodes() {
-    // The first Audio transcoding profile for streaming over HLS. HTTP and Static profiles are
-    // skipped, and a Video profile doesn't count for audio.
+fn the_first_streaming_audio_profile_transcodes() {
+    // The first Audio transcoding profile for streaming, over HTTP or HLS, as in Jellyfin. Static
+    // profiles are skipped, and a Video profile doesn't count for audio.
     let player = custom(json!({
         "MaxStreamingBitrate": 120_000_000,
         "MusicStreamingTranscodingBitrate": 192_000,
@@ -681,24 +681,18 @@ fn only_an_hls_streaming_audio_profile_transcodes() {
         ]
     }));
     let flac = track("flac", audio("flac", 2, 900_000));
-    let url = audio_url(
-        &[
-            "AudioCodec=aac",
-            "AudioBitrate=192000",
-            "SegmentContainer=mp4",
-            "SegmentLength=6",
-            "MinSegments=2",
-        ],
-        &[
-            "RequireAvc=false",
-            "EnableAudioVbrEncoding=true",
-            "TranscodeReasons=ContainerNotSupported,VideoCodecNotSupported,AudioCodecNotSupported",
-        ],
-    );
+    // A progressive transcode's URL, as Jellyfin writes it: /audio/{id}/stream.{container}, no
+    // segment parameters, no AudioOnly
+    let url = "/audio/11111111-2222-3333-4444-555555555555/stream.mp3?DeviceId=dev1\
+               &MediaSourceId=src1&AudioCodec=mp3&AudioBitrate=192000&PlaySessionId=ps1\
+               &ApiKey=tok&RequireAvc=false&EnableAudioVbrEncoding=true\
+               &TranscodeReasons=ContainerNotSupported,VideoCodecNotSupported,AudioCodecNotSupported"
+        .to_string();
     assert_eq!(
         device_data(&flac, &player, &request()),
         DeviceData {
-            transcoding_container: Some("mp4".to_string()),
+            transcoding_container: Some("mp3".to_string()),
+            transcoding_sub_protocol: StreamProtocol::Http,
             ..transcode("flac", unsupported(), url)
         }
     );
@@ -736,10 +730,10 @@ fn without_transcoding_a_file_chrome_cant_play_gets_no_plan() {
         untouched(&alac, (true, true, false))
     );
 
-    // Without an HLS audio transcoding profile, the plan stands: its reasons and no method.
+    // The same with an HTTP audio transcoding profile, which counts as Jellyfin's does
     assert_eq!(
         device_data(&alac, &profile("tv-hevc10-mkv"), &no_transcode),
-        no_play("m4a", (false, false, false), unsupported())
+        untouched(&alac, (true, true, false))
     );
 
     // A file that plays directly still does, and MIH step 4 sets the transcoding flag again.
@@ -860,26 +854,28 @@ fn a_source_without_an_audio_stream_gets_no_plan() {
 }
 
 #[test]
-fn the_tv_profile_has_no_hls_audio_transcode() {
-    // tv-hevc10-mkv transcodes audio to MP3 over HTTP only, which Rustyfin doesn't serve.
+fn the_tv_profile_transcodes_audio_over_http() {
+    // tv-hevc10-mkv transcodes audio to MP3 over HTTP only: a progressive transcode
     let tv = profile("tv-hevc10-mkv");
     let alac = track("m4a", audio("alac", 2, 900_000));
-    assert_eq!(
-        device_data(&alac, &tv, &request()),
-        no_play("m4a", (false, false, false), unsupported())
+    let data = device_data(&alac, &tv, &request());
+    assert!(data.supports_transcoding && !data.supports_direct_play);
+    assert_eq!(data.transcoding_sub_protocol, StreamProtocol::Http);
+    let url = data.transcoding_url.unwrap();
+    assert!(
+        url.starts_with("/audio/11111111-2222-3333-4444-555555555555/stream.mp3?"),
+        "{url}"
     );
 
     let flac = track("flac", audio("flac", 2, 900_000));
-    assert_eq!(device_data(&flac, &tv, &request()), direct("flac", false));
+    assert_eq!(device_data(&flac, &tv, &request()), direct("flac", true));
 
     let big = track("mp3", audio("mp3", 2, 50_000_000));
+    let data = device_data(&big, &tv, &request());
+    assert!(data.supports_transcoding && !data.supports_direct_play);
     assert_eq!(
-        device_data(&big, &tv, &request()),
-        no_play(
-            "mp3",
-            (false, false, false),
-            reasons(&[R::ContainerBitrateExceedsLimit])
-        )
+        data.transcode_reasons,
+        reasons(&[R::ContainerBitrateExceedsLimit])
     );
 }
 
@@ -1078,15 +1074,15 @@ fn odd_audio_inputs_do_not_panic() {
                             "{label}"
                         );
                         if let Some(url) = &data.transcoding_url {
-                            assert!(
-                                url.starts_with(&format!("/Videos/{ITEM}/master.m3u8?")),
-                                "{label}: {url}"
-                            );
-                            assert!(url.ends_with("&AudioOnly=true"), "{label}: {url}");
+                            // HLS, or a progressive transcode (without AudioOnly)
+                            let hls = url.starts_with(&format!("/Videos/{ITEM}/master.m3u8?"));
+                            let http = url.starts_with(&format!("/audio/{ITEM}/stream."));
+                            assert!(hls || http, "{label}: {url}");
+                            assert_eq!(url.ends_with("&AudioOnly=true"), hls, "{label}: {url}");
                             assert!(!url.contains("StreamIndex="), "{label}: {url}");
                             assert_eq!(
-                                data.transcoding_sub_protocol,
-                                StreamProtocol::Hls,
+                                data.transcoding_sub_protocol == StreamProtocol::Hls,
+                                hls,
                                 "{label}"
                             );
                         }

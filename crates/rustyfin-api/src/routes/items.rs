@@ -2496,7 +2496,9 @@ async fn get_items(
         .fields()
         .map(|s| s.split(',').map(|f| f.trim()).collect::<Vec<&str>>())
         .unwrap_or_default();
-    let need_media_sources = fields.contains(&"MediaSources");
+    let need_media_sources = fields
+        .iter()
+        .any(|f| f.eq_ignore_ascii_case("MediaSources"));
 
     let mut items = if need_media_sources {
         let mut items_copy = items;
@@ -2850,7 +2852,9 @@ async fn get_children(
         .fields()
         .map(|s| s.split(',').map(|f| f.trim()).collect::<Vec<&str>>())
         .unwrap_or_default();
-    let need_media_sources = fields.contains(&"MediaSources");
+    let need_media_sources = fields
+        .iter()
+        .any(|f| f.eq_ignore_ascii_case("MediaSources"));
 
     let mut items = if need_media_sources {
         let mut children_copy = children;

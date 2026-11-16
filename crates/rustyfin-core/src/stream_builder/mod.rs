@@ -435,18 +435,17 @@ pub fn device_data(
 
     // Step 4: the flags follow the plan. A direct stream is the direct play here, since the
     // DirectStream branch is off (MIH 280-283). A transcode URL needs an applied profile. The
-    // profile is an HLS streaming one of the request's media kind.
+    // profile is a streaming one of the request's media kind, HLS or progressive.
     let direct = plan.direct_play;
     let transcode_type = match request.media_kind {
         MediaKind::Video => ProfileType::Video,
         MediaKind::Audio => ProfileType::Audio,
     };
-    let profile_has_hls = profile.transcoding_profiles.iter().any(|tp| {
-        tp.r#type == transcode_type
-            && tp.context == EncodingContext::Streaming
-            && tp.protocol == StreamProtocol::Hls
-    });
-    let mut supports_transcoding = plan.transcode.is_some() || profile_has_hls;
+    let profile_has_transcode = profile
+        .transcoding_profiles
+        .iter()
+        .any(|tp| tp.r#type == transcode_type && tp.context == EncodingContext::Streaming);
+    let mut supports_transcoding = plan.transcode.is_some() || profile_has_transcode;
     let mut play_method = direct.then_some(PlayMethod::DirectPlay);
     let mut transcoding_url = None;
     if !direct && supports_transcoding {

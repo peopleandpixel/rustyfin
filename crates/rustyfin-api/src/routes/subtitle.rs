@@ -201,8 +201,9 @@ async fn source_subtitle_vtt_from(
     subtitle_vtt(&state, id, &media_source_id, index, start_ticks, &format).await
 }
 
-/// The external subtitle files of `source` that its streams do not list, as subtitle streams
-/// numbered after the highest stream index, in file-name order. The directory is read on a
+/// The external subtitle files of `source` that its streams do not list, as subtitle streams in
+/// file-name order, numbered after the external streams it lists (from 0 when it lists none), as
+/// Jellyfin numbers external files before the embedded streams. The directory is read on a
 /// blocking thread, so the async workers do not wait on it; a failed task gives no files.
 pub(crate) async fn external_streams(source: &MediaSourceResponse) -> Vec<MediaStream> {
     let media_path = PathBuf::from(&source.path);
@@ -247,12 +248,64 @@ pub(crate) async fn add_external_streams(sources: &mut [&mut MediaSourceResponse
         };
         let found = rustyfin_core::subtitle::external_subtitles_among(media_path, files);
         let streams = streams_of(source, found);
-        source.media_streams.extend(streams);
+        number_streams(source, streams);
+    }
+}
+
+/// Adds the external subtitle streams of `source` (`external_streams`) and numbers its streams
+/// as Jellyfin does (`number_streams`).
+pub(crate) async fn with_external_streams(source: &mut MediaSourceResponse) {
+    let found = external_streams(source).await;
+    number_streams(source, found);
+}
+
+/// Adds `found`, the external streams `streams_of` gave `source`, and numbers the streams as
+/// Jellyfin does: the external subtitle files first (0, 1, ...; those the source lists, then the
+/// found ones), then the embedded streams, each at its index in the file plus the number of
+/// external files. The streams are listed in that order. `file_index` turns a number back.
+pub(crate) fn number_streams(source: &mut MediaSourceResponse, found: Vec<MediaStream>) {
+    let streams = std::mem::take(&mut source.media_streams);
+    let (mut external, embedded): (Vec<_>, Vec<_>) =
+        streams.into_iter().partition(|stream| stream.is_external);
+    external.sort_by_key(|stream| stream.index);
+    external.extend(found);
+    let count = external.len() as i32;
+    for (k, stream) in external.iter_mut().enumerate() {
+        stream.index = k as i32;
+    }
+    source.media_streams = external;
+    source
+        .media_streams
+        .extend(embedded.into_iter().map(|stream| MediaStream {
+            index: stream.index + count,
+            ..stream
+        }));
+}
+
+/// How many external subtitle streams `source` (as stored, without external files added) has
+/// in Jellyfin's numbering: those it lists and the files beside it.
+pub(crate) async fn external_count(source: &MediaSourceResponse) -> i32 {
+    let listed = source
+        .media_streams
+        .iter()
+        .filter(|s| s.is_external)
+        .count();
+    (listed + external_streams(source).await.len()) as i32
+}
+
+/// The index in the file of the embedded stream a client names by `index` in Jellyfin's
+/// numbering, with `externals` external streams before the embedded ones. A negative index stays
+/// as it is (no stream, or the default); an external stream's is None.
+pub(crate) fn file_index(index: i32, externals: i32) -> Option<i32> {
+    match index {
+        index if index < 0 => Some(index),
+        index if index < externals => None,
+        index => Some(index - externals),
     }
 }
 
 /// `found`, the external subtitle files of `source`, as subtitle streams: those its streams
-/// don't list, numbered after its highest stream index.
+/// don't list, numbered after the external streams it lists.
 fn streams_of(
     source: &MediaSourceResponse,
     found: Vec<rustyfin_core::subtitle::ExternalSubtitle>,
@@ -265,10 +318,8 @@ fn streams_of(
     let first = source
         .media_streams
         .iter()
-        .map(|stream| stream.index)
-        .max()
-        .unwrap_or(-1)
-        + 1;
+        .filter(|s| s.is_external)
+        .count() as i32;
     found
         .into_iter()
         .filter(|file| !listed.contains(&file.path))
@@ -325,12 +376,18 @@ async fn subtitle_vtt(
         ))
     })?;
 
-    // The stream: an embedded one, or an external one, which must name its file
-    let external = external_streams(source).await;
-    let stream = source
+    // The stream, in Jellyfin's numbering: an embedded one, or an external one, which must name
+    // its file
+    let mut numbered = source.clone();
+    with_external_streams(&mut numbered).await;
+    let externals = numbered
         .media_streams
         .iter()
-        .chain(&external)
+        .filter(|s| s.is_external)
+        .count() as i32;
+    let stream = numbered
+        .media_streams
+        .iter()
         .find(|s| s.index == index && s.codec_type.eq_ignore_ascii_case("subtitle"))
         .filter(|s| !s.is_external || s.path.is_some())
         .ok_or_else(|| ApiError::NotFound(format!("Subtitle stream {index} not found")))?;
@@ -346,7 +403,10 @@ async fn subtitle_vtt(
         let path = stream.path.as_deref().unwrap_or_default();
         (PathBuf::from(path), "0:s:0".to_string())
     } else {
-        (PathBuf::from(&source.path), format!("0:{index}"))
+        (
+            PathBuf::from(&source.path),
+            format!("0:{}", index - externals),
+        )
     };
     // The input is read only when the streams' library check passes for it, by its resolved path
     let input =
@@ -378,10 +438,11 @@ async fn subtitle_vtt(
         })
         .collect();
     let cache_dir = state.data_dir.join("cache").join("subtitle-vtt");
-    // One cache file per stream; its stamp names the input it was made from
+    // One cache file per stream; its stamp names the input it was made from and the stream in
+    // the file (`m`), so a file cached under the old numbering (external files last) is made again
     let cache_file = cache_dir.join(format!("v1-{source_key}-{index}.{}", output.extension));
     let input_hash = fnv1a(input.as_os_str().as_encoded_bytes());
-    let stamp = format!("{input_hash:016x}-{}-{mtime}", meta.len());
+    let stamp = format!("{input_hash:016x}-{}-{mtime}-m{map}", meta.len());
 
     // The WebVTT text: from the cache, or from one ffmpeg conversion per cache file at a time
     let text = match read_cached(&cache_file, &stamp).await {
@@ -986,7 +1047,7 @@ mod tests {
     ];
 
     #[tokio::test]
-    async fn test_external_streams_follow_the_highest_index() {
+    async fn test_external_streams_are_numbered_from_zero() {
         let folder = Folder::with(&FILES);
         let source = source(
             &folder,
@@ -1005,9 +1066,9 @@ mod tests {
         assert_eq!(
             summary(&streams),
             vec![
-                (3, Some("srt"), Some("eng"), Some(eng.as_str())),
-                (4, Some("ass"), Some("ger"), Some(ger.as_str())),
-                (5, Some("srt"), None, Some(plain.as_str())),
+                (0, Some("srt"), Some("eng"), Some(eng.as_str())),
+                (1, Some("ass"), Some("ger"), Some(ger.as_str())),
+                (2, Some("srt"), None, Some(plain.as_str())),
             ]
         );
         for stream in &streams {
@@ -1039,10 +1100,53 @@ mod tests {
         assert_eq!(
             summary(&external_streams(&source).await),
             vec![
-                (8, Some("ass"), Some("ger"), Some(ger.as_str())),
-                (9, Some("srt"), None, Some(plain.as_str())),
+                (1, Some("ass"), Some("ger"), Some(ger.as_str())),
+                (2, Some("srt"), None, Some(plain.as_str())),
             ]
         );
+    }
+
+    /// Jellyfin's numbering: the external files first (the listed one, then the found ones),
+    /// then the embedded streams moved up by their count, in that order; `file_index` and
+    /// `external_count` turn it back.
+    #[tokio::test]
+    async fn r3gaps2_external_subtitles_are_numbered_first() {
+        let folder = Folder::with(&FILES);
+        let stored = source(
+            &folder,
+            json!([
+                { "Index": 0, "CodecType": "video", "Codec": "h264" },
+                { "Index": 1, "CodecType": "audio", "Codec": "aac" },
+                { "Index": 2, "CodecType": "subtitle", "Codec": "subrip" },
+                {
+                    "Index": 7, "CodecType": "subtitle", "Codec": "srt", "IsExternal": true,
+                    "Path": folder.path("Film.eng.srt"),
+                },
+            ]),
+        );
+        let mut numbered = stored.clone();
+        with_external_streams(&mut numbered).await;
+        let order: Vec<(i32, bool, Option<&str>)> = numbered
+            .media_streams
+            .iter()
+            .map(|s| (s.index, s.is_external, s.codec.as_deref()))
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                (0, true, Some("srt")),
+                (1, true, Some("ass")),
+                (2, true, Some("srt")),
+                (3, false, Some("h264")),
+                (4, false, Some("aac")),
+                (5, false, Some("subrip")),
+            ]
+        );
+        assert_eq!(external_count(&stored).await, 3);
+        assert_eq!(file_index(5, 3), Some(2));
+        assert_eq!(file_index(4, 3), Some(1));
+        assert_eq!(file_index(1, 3), None);
+        assert_eq!(file_index(-1, 3), Some(-1));
     }
 
     #[tokio::test]
@@ -1080,8 +1184,9 @@ mod tests {
         let mut batched = sources.clone();
         let mut refs: Vec<&mut MediaSourceResponse> = batched.iter_mut().collect();
         add_external_streams(&mut refs).await;
-        for (i, (source, before)) in batched.iter().zip(&sources).enumerate() {
-            let added = &source.media_streams[before.media_streams.len()..];
+        for (i, source) in batched.iter().enumerate() {
+            // The external streams come first now
+            let added = &source.media_streams[..expected[i].len()];
             assert_eq!(summary(added), summary(&expected[i]), "source {i}");
         }
         assert_eq!(expected[1].len(), 2);
