@@ -94,6 +94,13 @@ struct FfprobeStream {
     #[serde(default, deserialize_with = "deserialize_optional_u32")]
     bit_rate: Option<u32>,
     bits_per_raw_sample: Option<String>,
+    /// The codec level; ffprobe writes -99 when it has none.
+    #[serde(default, deserialize_with = "deserialize_optional_u32")]
+    level: Option<u32>,
+    pix_fmt: Option<String>,
+    sample_aspect_ratio: Option<String>,
+    display_aspect_ratio: Option<String>,
+    field_order: Option<String>,
     #[serde(default, deserialize_with = "deserialize_optional_u32")]
     channels: Option<u32>,
     channel_layout: Option<String>,
@@ -721,6 +728,40 @@ fn stream_to_model(s: FfprobeStream) -> MediaStream {
     // that says "forced" does not
     let is_forced_sub = s.codec_type.as_deref() == Some("subtitle") && is_forced;
 
+    // Level, bit depth, pixel shape and scan type of a video stream, as Jellyfin's probe reads them
+    let is_video = s.codec_type.as_deref() == Some("video");
+    let bit_depth = s
+        .bits_per_raw_sample
+        .as_ref()
+        .and_then(|b| b.parse().ok())
+        .filter(|depth| *depth > 0)
+        .or_else(|| {
+            is_video
+                .then(|| s.pix_fmt.as_deref().and_then(pixel_format_bit_depth))
+                .flatten()
+        });
+    // A Matroska stream has no bit rate of its own; its statistics tags carry one
+    let is_audio = s.codec_type.as_deref() == Some("audio");
+    let bit_rate = s.bit_rate.filter(|rate| *rate > 0).or_else(|| {
+        (is_video || is_audio)
+            .then(|| tag_bit_rate(s.tags.as_ref()))
+            .flatten()
+    });
+    let level = s
+        .level
+        .filter(|level| is_video && *level > 0)
+        .map(f64::from);
+    let is_anamorphic = is_video.then(|| {
+        is_anamorphic(
+            s.sample_aspect_ratio.as_deref(),
+            s.display_aspect_ratio.as_deref(),
+        )
+    });
+    let is_interlaced = is_video
+        && s.field_order.as_deref().is_some_and(|order| {
+            !order.trim().is_empty() && !order.eq_ignore_ascii_case("progressive")
+        });
+
     MediaStream {
         index: s.index,
         codec: s.codec_name,
@@ -735,8 +776,8 @@ fn stream_to_model(s: FfprobeStream) -> MediaStream {
         height: s.height,
         average_frame_rate: s.avg_frame_rate,
         real_frame_rate: s.r_frame_rate,
-        bit_rate: s.bit_rate,
-        bit_depth: s.bits_per_raw_sample.as_ref().and_then(|b| b.parse().ok()),
+        bit_rate,
+        bit_depth,
         channels: s.channels,
         channel_layout: s.channel_layout,
         sample_rate: s
@@ -755,9 +796,67 @@ fn stream_to_model(s: FfprobeStream) -> MediaStream {
         localized_uri: None,
         is_default,
         is_forced: is_forced_sub,
-        is_interlaced: false,
+        is_interlaced,
         embedded_bitmaps: false,
+        level,
+        is_anamorphic,
     }
+}
+
+/// A stream's bit rate from its Matroska statistics tags, as Jellyfin reads it: `BPS`, else
+/// `NUMBER_OF_BYTES` over `DURATION` when the stream lasts a second or more. The `-eng` variants
+/// that mkvmerge writes come first.
+fn tag_bit_rate(tags: Option<&HashMap<String, String>>) -> Option<u32> {
+    let either = |name: &str| tag(tags, &format!("{name}-eng")).or_else(|| tag(tags, name));
+    if let Some(bps) = either("BPS").and_then(|bps| bps.trim().parse::<u32>().ok()) {
+        return Some(bps).filter(|bps| *bps > 0);
+    }
+    let bytes: u64 = either("NUMBER_OF_BYTES")?.trim().parse().ok()?;
+    let seconds = either("DURATION").and_then(duration_seconds)?;
+    if seconds < 1.0 {
+        return None;
+    }
+    let bps = (bytes as f64 * 8.0 / seconds).round();
+    (bps > 0.0 && bps <= f64::from(u32::MAX)).then_some(bps as u32)
+}
+
+/// Seconds in a Matroska `DURATION` tag, `HH:MM:SS.fraction`.
+fn duration_seconds(text: &str) -> Option<f64> {
+    let mut parts = text.trim().split(':');
+    let hours: f64 = parts.next()?.parse().ok()?;
+    let minutes: f64 = parts.next()?.parse().ok()?;
+    let seconds: f64 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(hours * 3600.0 + minutes * 60.0 + seconds)
+}
+
+/// The bit depth that Jellyfin reads from a pixel format when ffprobe gives no sample size.
+fn pixel_format_bit_depth(pix_fmt: &str) -> Option<u32> {
+    match pix_fmt.to_ascii_lowercase().as_str() {
+        "yuv420p" | "yuv444p" => Some(8),
+        "yuv420p10le" | "yuv444p10le" => Some(10),
+        "yuv420p12le" | "yuv444p12le" => Some(12),
+        _ => None,
+    }
+}
+
+/// Whether a video's pixels are not square, by Jellyfin's rules: a sample aspect ratio that is
+/// set, not near 1:1 and not 0:1 (unknown). A missing or unknown ratio is square.
+fn is_anamorphic(sample_aspect_ratio: Option<&str>, display_aspect_ratio: Option<&str>) -> bool {
+    let sar = sample_aspect_ratio.unwrap_or_default();
+    if sar.is_empty() && display_aspect_ratio.unwrap_or_default().is_empty() {
+        return false;
+    }
+    let near_square = match sar.split_once(':') {
+        Some((num, den)) => match (num.parse::<f64>(), den.parse::<f64>()) {
+            (Ok(num), Ok(den)) if den > 0.0 => (num / den - 1.0).abs() <= 0.01,
+            _ => sar == "1:1",
+        },
+        None => sar == "1:1",
+    };
+    !near_square && !sar.is_empty() && sar != "0:1"
 }
 
 fn gcd(a: u64, b: u64) -> u64 {
@@ -1385,6 +1484,68 @@ mod tests {
                 (5, some("English"), true),
                 (6, None, false),
             ]
+        );
+    }
+
+    /// A video stream's level, bit depth, anamorphic and interlaced flags, as Jellyfin's probe
+    /// reads them: the level when ffprobe gives one (not -99), the bit depth from the pixel format
+    /// without a sample size, non-square pixels, and any field order but progressive.
+    #[test]
+    fn r3decisions_video_level_depth_shape_and_scan() {
+        let json = r#"{"streams": [
+            {"index": 0, "codec_name": "hevc", "codec_type": "video", "profile": "Main 10",
+                "level": 153, "pix_fmt": "yuv420p10le", "sample_aspect_ratio": "1:1",
+                "display_aspect_ratio": "16:9", "field_order": "progressive"},
+            {"index": 1, "codec_name": "h264", "codec_type": "video", "level": 40,
+                "bits_per_raw_sample": "8", "pix_fmt": "yuv420p10le",
+                "sample_aspect_ratio": "32:27", "display_aspect_ratio": "4:3", "field_order": "tt"},
+            {"index": 2, "codec_name": "mpeg4", "codec_type": "video", "level": -99,
+                "pix_fmt": "yuv420p", "sample_aspect_ratio": "0:1", "display_aspect_ratio": "0:1"},
+            {"index": 3, "codec_name": "aac", "codec_type": "audio", "level": 2}
+        ]}"#;
+        let parsed: FfprobeOutput = serde_json::from_str(json).expect("should parse");
+        let streams: Vec<_> = parsed
+            .streams
+            .into_iter()
+            .map(stream_to_model)
+            .map(|s| (s.level, s.bit_depth, s.is_anamorphic, s.is_interlaced))
+            .collect();
+        assert_eq!(
+            streams,
+            vec![
+                (Some(153.0), Some(10), Some(false), false),
+                (Some(40.0), Some(8), Some(true), true),
+                (None, Some(8), Some(false), false),
+                (None, None, None, false),
+            ]
+        );
+    }
+
+    /// A Matroska stream's bit rate comes from its `BPS` tag, else from its byte count over its
+    /// duration, as Jellyfin reads them; ffprobe's own bit rate wins.
+    #[test]
+    fn r3decisions_matroska_streams_take_their_bit_rate_from_tags() {
+        let json = r#"{"streams": [
+            {"index": 0, "codec_name": "hevc", "codec_type": "video",
+                "tags": {"BPS-eng": "48082772", "BPS": "1"}},
+            {"index": 1, "codec_name": "dts", "codec_type": "audio",
+                "tags": {"NUMBER_OF_BYTES": "1000000", "DURATION": "00:00:08.000000000"}},
+            {"index": 2, "codec_name": "ac3", "codec_type": "audio", "bit_rate": "640000",
+                "tags": {"BPS": "1"}},
+            {"index": 3, "codec_name": "aac", "codec_type": "audio",
+                "tags": {"NUMBER_OF_BYTES": "10", "DURATION": "00:00:00.500000000"}},
+            {"index": 4, "codec_name": "subrip", "codec_type": "subtitle", "tags": {"BPS": "90"}}
+        ]}"#;
+        let parsed: FfprobeOutput = serde_json::from_str(json).expect("should parse");
+        let rates: Vec<_> = parsed
+            .streams
+            .into_iter()
+            .map(stream_to_model)
+            .map(|s| s.bit_rate)
+            .collect();
+        assert_eq!(
+            rates,
+            vec![Some(48_082_772), Some(1_000_000), Some(640_000), None, None]
         );
     }
 

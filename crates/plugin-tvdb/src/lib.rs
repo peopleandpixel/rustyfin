@@ -356,6 +356,7 @@ pub async fn search_tv(client: &reqwest::Client, name: &str) -> Option<ExternalM
 
     Some(ExternalMetadata {
         name: Some(show.name),
+        sort_title: None,
         overview: show.summary,
         production_year,
         community_rating,

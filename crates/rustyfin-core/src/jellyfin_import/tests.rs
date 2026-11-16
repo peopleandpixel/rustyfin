@@ -3804,8 +3804,9 @@ async fn b20_snapshot_refuses_a_deep_tree() {
 // Fix round 5, T (re-check 4, point 4 (b)): the progress handler is wired into `open_snapshot` on
 // both paths. A 6x20 shared-page schema DAG (`spinning_schema`) makes the schema load re-walk its
 // leaf for about 90 s; the handler `guard_connection` installs before `read_roots` spends the budget
-// and interrupts the load (SQLITE_INTERRUPT -> "its schema is damaged") well within 5 s. With the
-// handler removed, the load spins past the timeout: that is the red.
+// and interrupts the load (SQLITE_INTERRUPT -> "its schema is damaged") well within the timeout.
+// With the handler removed, the load spins past it: that is the red. The timeout is 30 s, well
+// under the 90 s spin, because a loaded CI runner took over 5 s on the copy path.
 #[tokio::test]
 async fn b20_snapshot_refuses_a_spinning_schema() {
     use std::time::Duration;
@@ -3818,8 +3819,8 @@ async fn b20_snapshot_refuses_a_spinning_schema() {
         let open =
             open_snapshot_with_free(&file, &data.0, JELLYFIN_TABLES, limit, |_| Ok(u64::MAX));
         texts.push(
-            match tokio::time::timeout(Duration::from_secs(5), open).await {
-                Err(_) => "still spinning after 5 s".to_string(),
+            match tokio::time::timeout(Duration::from_secs(30), open).await {
+                Err(_) => "still spinning after 30 s".to_string(),
                 Ok(open) => match open.map(drop) {
                     Ok(()) => "read".to_string(),
                     Err(ImportError::BadSource(text)) => text,

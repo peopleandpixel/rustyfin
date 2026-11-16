@@ -1,0 +1,19 @@
+{
+  "Name": "Direct play all",
+  "MaxStreamingBitrate": 1000000000,
+  "MaxStaticBitrate": 1000000000,
+  "DirectPlayProfiles": [],
+  "TranscodingProfiles": [],
+  "ContainerProfiles": [],
+  "CodecProfiles": [],
+  "SubtitleProfiles": [
+    {
+      "Format": "srt",
+      "Method": "External"
+    },
+    {
+      "Format": "ass",
+      "Method": "External"
+    }
+  ]
+}

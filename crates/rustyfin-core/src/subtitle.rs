@@ -197,6 +197,51 @@ pub fn shift_vtt(vtt: &str, start_ticks: i64) -> String {
     out
 }
 
+/// Moves the cues of a SubRip text back by `start_ticks` (100 ns units), as `shift_vtt` does
+/// WebVTT cues: a cue that has ended by then is dropped, the others start at 0 at the earliest,
+/// and the cues are numbered again from 1. A block without a timing line is dropped. Blocks are
+/// joined by one blank line and the text ends with a newline. A start of 0 or less returns the
+/// text unchanged.
+pub fn shift_srt(srt: &str, start_ticks: i64) -> String {
+    if start_ticks <= 0 {
+        return srt.to_string();
+    }
+    let shift = start_ticks / 10_000;
+    let mut out = String::with_capacity(srt.len());
+    let mut number = 0;
+    for block in vtt_blocks(srt) {
+        // SubRip writes a comma before the milliseconds, WebVTT a dot
+        let block: Vec<String> = block
+            .iter()
+            .map(|line| {
+                if line.contains(" --> ") {
+                    line.replace(',', ".")
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect();
+        let block: Vec<&str> = block.iter().map(String::as_str).collect();
+        let Some(mut lines) = shift_block(&block, shift) else {
+            continue;
+        };
+        let Some(at) = lines.iter().take(2).position(|line| line.contains(" --> ")) else {
+            continue;
+        };
+        lines[at] = lines[at].replace('.', ",");
+        number += 1;
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&format!("{number}\n"));
+        for line in &lines[at..] {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
 /// Takes the ASS override and comment blocks out of a WebVTT text, as no ASS renderer shows them.
 /// In a cue, each `{` ... `}` run on a text line after the timing line is cut out; a `{` with no
 /// `}` after it stays. A text line left empty or only whitespace is removed, and a cue left with no
@@ -566,6 +611,19 @@ mod tests {
         let srt = "1\n00:00:01,000 --> 00:00:02,000\nHello, world";
         let vtt = srt_to_vtt(srt);
         assert!(vtt.contains("Hello, world"));
+    }
+
+    #[test]
+    fn r3decisions_shift_srt_moves_drops_and_renumbers() {
+        let srt = "1\n00:00:01,000 --> 00:00:02,000\nGone\n\n\
+                   2\n00:00:09,500 --> 00:00:12,250\nClipped\n\n\
+                   3\n00:01:00,000 --> 00:01:01,000\nMoved\nTwo lines\n";
+        assert_eq!(
+            shift_srt(srt, 100_000_000),
+            "1\n00:00:00,000 --> 00:00:02,250\nClipped\n\n\
+             2\n00:00:50,000 --> 00:00:51,000\nMoved\nTwo lines\n"
+        );
+        assert_eq!(shift_srt(srt, 0), srt);
     }
 
     #[test]

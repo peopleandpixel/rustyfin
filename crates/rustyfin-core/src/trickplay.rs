@@ -3,9 +3,9 @@
 //! Like Jellyfin, a tile set holds one thumbnail every 10 seconds, 320 pixels wide, laid out 10 by
 //! 10 in each JPEG tile, under `<data dir>/trickplay/<item id>/<width> - 10x10/<index>.jpg`. Tiles
 //! are only made by the "Generate Trickplay Images" task, never on a request. Every trickplay or
-//! chapter-image ffmpeg run holds `ffmpeg_lock`, so one image job runs at a time, alongside any
-//! transcodes. A video that fails is recorded with its file's size and time and is not tried
-//! again until the file changes.
+//! chapter-image job holds an `image_job`, so at most `image_jobs` run at once, at a low CPU
+//! priority so transcodes come first. A video that fails is recorded with its file's size and
+//! time and is not tried again until the file changes.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -15,7 +15,8 @@ use std::time::Duration;
 use sqlx::SqlitePool;
 use tokio::fs;
 use tokio::process::Command;
-use tokio::sync::{Mutex, watch};
+use tokio::sync::{RwLock, RwLockReadGuard, Semaphore, SemaphorePermit, watch};
+use tokio::task::JoinSet;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -87,9 +88,10 @@ pub async fn remove_item_files(data_dir: &Path, item_id: Uuid) {
 }
 
 /// Removes the tile folders of items with no tile set (deleted items, and files that changed) and
-/// the chapter images no chapter names any more. Holds `ffmpeg_lock`, so no job is writing.
+/// the chapter images no chapter names any more. Waits for the running image jobs to end and
+/// keeps new ones from starting, so no job is writing.
 pub async fn sweep_unused_files(pool: &SqlitePool, data_dir: &Path) -> Result<(), String> {
-    let _one_at_a_time = ffmpeg_lock().lock().await;
+    let _no_jobs = image_job_locks().1.write().await;
     let mut trickplay = fs::read_dir(data_dir.join("trickplay")).await.ok();
     while let Some(dir) = trickplay.as_mut() {
         let Some(entry) = dir.next_entry().await.map_err(|e| e.to_string())? else {
@@ -152,11 +154,62 @@ pub async fn sweep_unused_files(pool: &SqlitePool, data_dir: &Path) -> Result<()
     Ok(())
 }
 
-/// Held around every ffmpeg run that makes trickplay tiles or chapter images, so only one image
-/// job runs at a time, whichever task starts it. Transcodes don't take it.
-pub(crate) fn ffmpeg_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
+fn cpus() -> usize {
+    std::thread::available_parallelism().map_or(1, |n| n.get())
+}
+
+/// How many image jobs (a video's trickplay tiles, an item's chapter images) may run at once:
+/// `RUSTYFIN_IMAGE_JOBS`, from 1 to the CPU count, else half the CPUs, from 1 to 4.
+pub fn image_jobs() -> usize {
+    static JOBS: OnceLock<usize> = OnceLock::new();
+    *JOBS.get_or_init(|| {
+        let most = cpus().min(Semaphore::MAX_PERMITS);
+        let default = (cpus() / 2).clamp(1, 4).min(most);
+        match std::env::var("RUSTYFIN_IMAGE_JOBS") {
+            Err(_) => default,
+            Ok(v) => match v.trim().parse::<usize>() {
+                Ok(n) => n.clamp(1, most),
+                Err(_) => {
+                    warn!(value = %v, default, "RUSTYFIN_IMAGE_JOBS is not a whole number");
+                    default
+                }
+            },
+        }
+    })
+}
+
+/// The decoder threads of each image job's ffmpeg: the CPUs shared out among the jobs, 1 to 4.
+fn decode_threads() -> usize {
+    (cpus() / image_jobs()).clamp(1, 4)
+}
+
+/// Held by a running image job: one of the `image_jobs` permits, and a shared hold on the lock
+/// that `sweep_unused_files` takes alone. Transcodes don't take it.
+pub(crate) struct ImageJob {
+    _permit: SemaphorePermit<'static>,
+    _shared: RwLockReadGuard<'static, ()>,
+}
+
+fn image_job_locks() -> &'static (Semaphore, RwLock<()>) {
+    static LOCKS: OnceLock<(Semaphore, RwLock<()>)> = OnceLock::new();
+    LOCKS.get_or_init(|| (Semaphore::new(image_jobs()), RwLock::new(())))
+}
+
+/// Waits for a free image job, and for any sweep to end. `None` once `cancel` fires first.
+pub(crate) async fn image_job(cancel: &Cancel) -> Option<ImageJob> {
+    let (permits, sweep) = image_job_locks();
+    let wait = async {
+        let _permit = permits
+            .acquire()
+            .await
+            .expect("the semaphore is never closed");
+        let _shared = sweep.read().await;
+        ImageJob { _permit, _shared }
+    };
+    tokio::select! {
+        job = wait => Some(job),
+        _ = cancel.cancelled() => None,
+    }
 }
 
 /// The folder of an item's tile set at `width`.
@@ -173,7 +226,8 @@ pub fn tile_path(data_dir: &Path, item_id: Uuid, info: &TrickplayInfo, index: u3
 }
 
 /// Runs ffmpeg with `args`, and fails on a non-zero exit, after `FFMPEG_TIMEOUT`, or when
-/// `cancel` fires, killing ffmpeg. The caller holds `ffmpeg_lock`.
+/// `cancel` fires, killing ffmpeg. The caller holds an `image_job`. ffmpeg runs at a low CPU
+/// priority (nice 10), so playback transcodes come first.
 pub(crate) async fn run_ffmpeg(args: &[&str], cancel: &Cancel) -> Result<(), String> {
     let mut cmd = Command::new("ffmpeg");
     cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y"])
@@ -182,6 +236,14 @@ pub(crate) async fn run_ffmpeg(args: &[&str], cancel: &Cancel) -> Result<(), Str
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    #[cfg(unix)]
+    // SAFETY: the hook only makes the nice(2) system call, which is async-signal-safe.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::nice(10);
+            Ok(())
+        });
+    }
     // Dropping the output future kills ffmpeg (kill_on_drop).
     let output = tokio::select! {
         out = tokio::time::timeout(FFMPEG_TIMEOUT, cmd.output()) => match out {
@@ -199,7 +261,7 @@ pub(crate) async fn run_ffmpeg(args: &[&str], cancel: &Cancel) -> Result<(), Str
     }
 }
 
-/// The JPEG files in `dir`, sorted by name.
+/// The JPEG files in `dir`.
 async fn jpegs(dir: &Path) -> Result<Vec<PathBuf>, String> {
     let mut entries = fs::read_dir(dir).await.map_err(|e| e.to_string())?;
     let mut files = Vec::new();
@@ -209,7 +271,6 @@ async fn jpegs(dir: &Path) -> Result<Vec<PathBuf>, String> {
             files.push(path);
         }
     }
-    files.sort();
     Ok(files)
 }
 
@@ -226,7 +287,7 @@ fn attempts() -> &'static std::sync::Mutex<std::collections::HashMap<String, u32
 }
 
 /// Makes the tile set of the video at `path`, an item's file, and saves it. The old set, if any,
-/// is replaced only once the new one is complete. Waits for `ffmpeg_lock`.
+/// is replaced only once the new one is complete. Waits for an `image_job`.
 pub async fn generate(
     pool: &SqlitePool,
     data_dir: &Path,
@@ -234,7 +295,9 @@ pub async fn generate(
     path: &str,
     cancel: &Cancel,
 ) -> Result<TrickplayInfo, String> {
-    let _one_at_a_time = ffmpeg_lock().lock().await;
+    let Some(_job) = image_job(cancel).await else {
+        return Err("cancelled".to_string());
+    };
     *attempts()
         .lock()
         .unwrap()
@@ -242,17 +305,13 @@ pub async fn generate(
         .or_default() += 1;
     let item_dir = data_dir.join("trickplay").join(item_id.to_string());
     let work = item_dir.join(format!(".work-{WIDTH}"));
-    let thumbs = work.join("thumbs");
     let tiles = work.join("tiles");
     let _ = fs::remove_dir_all(&work).await;
-    fs::create_dir_all(&thumbs)
-        .await
-        .map_err(|e| format!("could not make {}: {e}", thumbs.display()))?;
     fs::create_dir_all(&tiles)
         .await
         .map_err(|e| format!("could not make {}: {e}", tiles.display()))?;
 
-    let result = make_tiles(path, &thumbs, &tiles, cancel).await;
+    let result = make_tiles(path, &work, &tiles, cancel).await;
     let made = match result {
         Ok(made) => made,
         Err(e) => {
@@ -273,80 +332,59 @@ pub async fn generate(
     Ok(made)
 }
 
-/// Makes the thumbnails of `path` in `thumbs`, then the tile images in `tiles`, and returns the
-/// set's info.
+/// The packet filter that thins a video's key frames before they are decoded. Of the key frames
+/// in each interval-long window centred on a thumbnail's time, it keeps the first, which the fps
+/// filter then shows there, and drops the rest and every other packet. Most videos have a key
+/// frame every few seconds, so this decodes a few times fewer frames for the same thumbnails.
+/// Every key frame of the first interval is kept, as before: some HEVC decoders hand the first
+/// frames out of order when the ones between are missing, and the thumbnails start at the first
+/// one. A key frame without a time is kept too. The filter sees the same times as the fps filter,
+/// which ffmpeg starts at 0 for every input. Register 0 holds the next window's centre in seconds,
+/// 4 whether a frame was kept yet, and 5 the first key frame's time.
+///
+/// It runs on the input side (`-bsf:v` before `-i`), which needs FFmpeg 7.0 or newer.
+fn thin_key_frames() -> String {
+    let i = f64::from(INTERVAL_MS) / 1000.0;
+    let next = format!("st(0\\,(round(pts*tb/{i})+1)*{i})");
+    format!(
+        "noise=drop=if(isnan(pts)+not(key)\\,not(key)\\,\
+         if(not(ld(4))\\,st(4\\,1);st(5\\,pts*tb);{next};0\\,\
+         if(lt(pts*tb\\,ld(5)+{i})\\,0\\,\
+         if(gte(pts*tb\\,ld(0)-{i}/2)\\,{next};0\\,1))))"
+    )
+}
+
+/// The start of the error when ffmpeg can't run the key frame thinning.
+pub const FFMPEG_TOO_OLD: &str = "ffmpeg is too old for trickplay images: FFmpeg 7.0 or newer \
+                                  is needed, for bitstream filters on an input";
+
+/// Whether ffmpeg's error `e` means it rejected the thinning: before 7.0, `-bsf` is an output
+/// option only, and ffmpeg says the option "cannot be applied to input url".
+fn rejects_input_bsf(e: &str) -> bool {
+    e.contains("bsf") && e.contains("cannot be applied to input")
+}
+
+/// Makes the tile images of `path` in `tiles`, in one ffmpeg run that also lists the thumbnails
+/// in `work`, and returns the set's info.
 async fn make_tiles(
     path: &str,
-    thumbs: &Path,
+    work: &Path,
     tiles: &Path,
     cancel: &Cancel,
 ) -> Result<TrickplayInfo, String> {
-    // Only key frames are decoded, which is many times faster than every frame; the fps filter
-    // repeats the last one where they are further apart than the interval.
-    let filter = format!("fps=1000/{INTERVAL_MS},scale={WIDTH}:-2");
-    let pattern = thumbs.join("%06d.jpg");
-    let pattern = pattern.to_string_lossy();
-    run_ffmpeg(
-        &[
-            "-threads",
-            "1",
-            "-skip_frame",
-            "nokey",
-            "-i",
-            path,
-            "-map",
-            "0:V:0",
-            "-an",
-            "-sn",
-            "-dn",
-            "-vf",
-            &filter,
-            "-threads",
-            "1",
-            "-qscale:v",
-            "4",
-            "-f",
-            "image2",
-            &pattern,
-        ],
-        cancel,
-    )
-    .await?;
-
-    let thumb_files = jpegs(thumbs).await?;
-    let count = u32::try_from(thumb_files.len()).unwrap_or(u32::MAX);
-    let Some(first) = thumb_files.first() else {
+    let mut count = tile_run(path, work, tiles, true, cancel).await?;
+    if count == 0 {
+        // A file whose packets carry no key frame flags loses them all to the thinning
+        count = tile_run(path, work, tiles, false, cancel).await?;
+    }
+    if count == 0 {
         return Err("ffmpeg made no thumbnails".to_string());
-    };
-    let (width, height) =
-        image::image_dimensions(first).map_err(|e| format!("could not read a thumbnail: {e}"))?;
-
-    let tile = format!("tile={TILE_SIDE}x{TILE_SIDE}");
-    let input = thumbs.join("%06d.jpg");
-    let output = tiles.join("%d.jpg");
-    run_ffmpeg(
-        &[
-            "-framerate",
-            "1",
-            "-start_number",
-            "1",
-            "-i",
-            &input.to_string_lossy(),
-            "-vf",
-            &tile,
-            "-threads",
-            "1",
-            "-qscale:v",
-            "4",
-            "-start_number",
-            "0",
-            "-f",
-            "image2",
-            &output.to_string_lossy(),
-        ],
-        cancel,
-    )
-    .await?;
+    }
+    // The tile filter pads the last image, so every image is a full grid of thumbnails
+    let first = tiles.join("0.jpg");
+    let (tile_w, tile_h) =
+        image::image_dimensions(&first).map_err(|e| format!("could not read a tile: {e}"))?;
+    let (width, height) = (tile_w / TILE_SIDE, tile_h / TILE_SIDE);
 
     let mut info = TrickplayInfo {
         width,
@@ -375,9 +413,86 @@ async fn make_tiles(
     Ok(info)
 }
 
-/// Makes the missing tile sets of the videos in the libraries `library_ids`, one at a time, and
-/// returns how many it made. A video that fails is logged and recorded with its file's version;
-/// it is skipped until the file changes. Stops between videos once `cancel` fires.
+/// Runs ffmpeg once over `path`: one thumbnail per interval, scaled and laid out straight into
+/// the tile images in `tiles`, and a line per thumbnail in `work`'s `frames.crc`. Returns how many
+/// thumbnails it made. Only key frames are decoded, thinned first when `thin` is set; the fps
+/// filter repeats the last one where they are further apart than the interval, and from time 0
+/// (ffmpeg starts every input there), as the old JPEG-per-thumbnail output did.
+async fn tile_run(
+    path: &str,
+    work: &Path,
+    tiles: &Path,
+    thin: bool,
+    cancel: &Cancel,
+) -> Result<u32, String> {
+    let threads = decode_threads().to_string();
+    let thinning = thin_key_frames();
+    let graph = format!(
+        "[0:V:0]fps=1000/{INTERVAL_MS}:start_time=0,scale={WIDTH}:-2,split[t][n];\
+         [t]tile={TILE_SIDE}x{TILE_SIDE}[tiles]"
+    );
+    let output = tiles.join("%d.jpg");
+    let output = output.to_string_lossy();
+    let frames = work.join("frames.crc");
+    let frames_arg = frames.to_string_lossy();
+    // The loop filter only smooths block edges, which the scaling down hides anyway
+    let mut args = vec![
+        "-threads",
+        &threads,
+        "-skip_frame",
+        "nokey",
+        "-skip_loop_filter",
+        "all",
+    ];
+    if thin {
+        args.extend(["-bsf:v", &thinning]);
+    }
+    args.extend([
+        "-i",
+        path,
+        "-filter_complex_threads",
+        "1",
+        "-filter_complex",
+        &graph,
+        "-map",
+        "[tiles]",
+        "-threads",
+        "1",
+        "-qscale:v",
+        "4",
+        "-start_number",
+        "0",
+        "-f",
+        "image2",
+        &output,
+        "-map",
+        "[n]",
+        "-f",
+        "framecrc",
+        &frames_arg,
+    ]);
+    for stale in jpegs(tiles).await? {
+        let _ = fs::remove_file(stale).await;
+    }
+    run_ffmpeg(&args, cancel).await.map_err(|e| {
+        if thin && rejects_input_bsf(&e) {
+            format!("{FFMPEG_TOO_OLD} ({e})")
+        } else {
+            e
+        }
+    })?;
+    let listed = fs::read_to_string(&frames)
+        .await
+        .map_err(|e| format!("could not read {}: {e}", frames.display()))?;
+    let count = listed.lines().filter(|l| !l.starts_with('#')).count();
+    Ok(u32::try_from(count).unwrap_or(u32::MAX))
+}
+
+/// Makes the missing tile sets of the videos in the libraries `library_ids`, up to `image_jobs`
+/// at a time, and returns how many it made. A video that fails is logged and recorded with its
+/// file's version; it is skipped until the file changes. Once `cancel` fires it starts no more
+/// videos and the running ones are stopped. A database error, or ffmpeg too old for the thinning
+/// (`FFMPEG_TOO_OLD`, recorded against no video), ends the run once the running videos end.
 pub async fn generate_for_libraries(
     pool: &SqlitePool,
     data_dir: &Path,
@@ -410,33 +525,84 @@ pub async fn generate_for_libraries_with_progress(
             .len();
     let mut done = 0usize;
     progress.report_count(0, total);
+    let db = |e: sqlx::Error| format!("could not record a failure: {e}");
+    let mut queue = std::collections::VecDeque::new();
+    // Up to `image_jobs` videos at once; each task's id maps to its video, path and file version
+    let mut running = JoinSet::new();
+    let mut started = std::collections::HashMap::new();
+    // After an error no more videos start, and the running ones end before it is returned, so
+    // none is stopped while it swaps its tile set in
+    let mut error: Option<String> = None;
     loop {
-        let batch = rustyfin_db::repo_trickplay::items_missing_trickplay(
-            pool,
-            library_ids,
-            WIDTH,
-            &failed,
-            20,
-        )
-        .await
-        .map_err(|e| format!("could not list videos: {e}"))?;
-        if batch.is_empty() {
-            break;
-        }
-        for (item_id, path, _runtime) in batch {
-            if cancel.is_cancelled() {
-                return Ok(made);
+        while error.is_none() && running.len() < image_jobs() && !cancel.is_cancelled() {
+            let next = async {
+                if queue.is_empty() {
+                    // The videos being made have no tile set yet, so they are skipped like
+                    // failures
+                    let skip: Vec<Uuid> = failed
+                        .iter()
+                        .chain(started.values().map(|(id, _, _)| id))
+                        .copied()
+                        .collect();
+                    queue.extend(
+                        rustyfin_db::repo_trickplay::items_missing_trickplay(
+                            pool,
+                            library_ids,
+                            WIDTH,
+                            &skip,
+                            20,
+                        )
+                        .await
+                        .map_err(|e| format!("could not list videos: {e}"))?,
+                    );
+                }
+                let Some((item_id, path, _runtime)) = queue.pop_front() else {
+                    return Ok(None);
+                };
+                let version = file_version(&path).await;
+                let known = get_failure(pool, item_id, FAILURE_KIND).await.map_err(db)?;
+                Ok::<_, String>(Some((item_id, path, version, known == Some(version))))
             }
-            // Videos added during the run can take it past the total counted at the start
-            progress.report_count(done.min(total), total);
-            done += 1;
-            let version = file_version(&path).await;
-            let db = |e: sqlx::Error| format!("could not record a failure: {e}");
-            if get_failure(pool, item_id, FAILURE_KIND).await.map_err(db)? == Some(version) {
+            .await;
+            let (item_id, path, version, known) = match next {
+                Ok(Some(next)) => next,
+                Ok(None) => break,
+                Err(e) => {
+                    error = Some(e);
+                    break;
+                }
+            };
+            if known {
                 failed.push(item_id);
+                done += 1;
+                progress.report_count(done.min(total), total);
                 continue;
             }
-            match generate(pool, data_dir, item_id, &path, cancel).await {
+            let (pool, data_dir, cancel, file) = (
+                pool.clone(),
+                data_dir.to_path_buf(),
+                cancel.clone(),
+                path.clone(),
+            );
+            let task = running
+                .spawn(async move { generate(&pool, &data_dir, item_id, &file, &cancel).await });
+            started.insert(task.id(), (item_id, path, version));
+        }
+        let Some(joined) = running.join_next_with_id().await else {
+            break;
+        };
+        let (result, task) = match joined {
+            Ok((task, result)) => (result, task),
+            Err(e) => (Err(format!("the tile task failed: {e}")), e.id()),
+        };
+        let Some((item_id, path, version)) = started.remove(&task) else {
+            continue;
+        };
+        // Videos added during the run can take it past the total counted at the start
+        done += 1;
+        progress.report_count(done.min(total), total);
+        let recorded = async {
+            match result {
                 Ok(set) => {
                     made += 1;
                     clear_failure(pool, item_id, FAILURE_KIND)
@@ -447,7 +613,10 @@ pub async fn generate_for_libraries_with_progress(
                         .map_err(db)?;
                     info!(item = %item_id, thumbnails = set.thumbnail_count, "made trickplay tiles");
                 }
-                Err(_) if cancel.is_cancelled() => return Ok(made),
+                // The other running videos are stopped too, and end up here
+                Err(_) if cancel.is_cancelled() => {}
+                // Not the video's fault: nothing is recorded, so it is tried once ffmpeg is newer
+                Err(e) if e.starts_with(FFMPEG_TOO_OLD) => return Err(e),
                 Err(e) => {
                     warn!(item = %item_id, path = %path, error = %e, "could not make trickplay tiles");
                     record_failure(pool, item_id, FAILURE_KIND, version)
@@ -459,14 +628,195 @@ pub async fn generate_for_libraries_with_progress(
                     failed.push(item_id);
                 }
             }
+            Ok(())
+        }
+        .await;
+        if let Err(e) = recorded {
+            error.get_or_insert(e);
         }
     }
-    Ok(made)
+    error.map_or(Ok(made), Err)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn have_ffmpeg(test: &str) -> bool {
+        let here = std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !here {
+            eprintln!("SKIPPED {test}: ffmpeg is not on PATH");
+        }
+        here
+    }
+
+    #[tokio::test]
+    async fn r3trickplay_thinning_keeps_the_thumbnails() {
+        if !have_ffmpeg("r3trickplay_thinning_keeps_the_thumbnails") {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("r3trickplay-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A key frame every 2 s, so the thinning drops four of every five
+        let clip = dir.join("clip.mkv");
+        let status = std::process::Command::new("ffmpeg")
+            .args(["-nostdin", "-loglevel", "error", "-y", "-f", "lavfi", "-i"])
+            .arg("testsrc=duration=95:size=640x360:rate=10")
+            .args(["-c:v", "mpeg4", "-g", "20"])
+            .arg(&clip)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let clip = clip.to_string_lossy();
+        let mut made = Vec::new();
+        for thin in [false, true] {
+            let tiles = dir.join(format!("tiles-{thin}"));
+            std::fs::create_dir_all(&tiles).unwrap();
+            let count = tile_run(&clip, &dir, &tiles, thin, &Cancel::new())
+                .await
+                .unwrap();
+            let size = image::image_dimensions(tiles.join("0.jpg")).unwrap();
+            made.push((count, size, std::fs::read_dir(&tiles).unwrap().count()));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            made[0], made[1],
+            "the same thumbnails with and without thinning"
+        );
+        assert_eq!(made[1], (9, (3200, 1800), 1));
+    }
+
+    /// Whether ffmpeg has the encoder `name`.
+    fn have_encoder(name: &str) -> bool {
+        std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-encoders"])
+            .output()
+            .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains(name))
+    }
+
+    #[tokio::test]
+    async fn r3trickplay_thumbnails_come_from_their_interval() {
+        let test = "r3trickplay_thumbnails_come_from_their_interval";
+        if !have_ffmpeg(test) {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("r3trickplay-times-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 95 s at 10 fps whose brightness tells the time: luma 16 + frame / 5. A key frame every
+        // 2 s; the MPEG-TS copies start at 1000 s, as broadcast recordings start late.
+        let source = "nullsrc=size=320x180:rate=10:duration=95,geq=lum='16+N/5':cb=128:cr=128";
+        let codecs = [
+            (
+                "libx264",
+                vec!["-x264-params", "keyint=20:min-keyint=20:scenecut=0"],
+            ),
+            (
+                "libx265",
+                vec![
+                    "-x265-params",
+                    "keyint=20:min-keyint=20:scenecut=0:log-level=error",
+                ],
+            ),
+        ];
+        let mut checked = 0;
+        for (encoder, params) in &codecs {
+            if !have_encoder(encoder) {
+                eprintln!("SKIPPED {test} for {encoder}: ffmpeg can't encode with it");
+                continue;
+            }
+            for (name, container) in [
+                ("plain.mkv", &[][..]),
+                ("late.ts", &["-output_ts_offset", "1000"][..]),
+            ] {
+                let clip = dir.join(format!("{encoder}-{name}"));
+                let status = std::process::Command::new("ffmpeg")
+                    .args([
+                        "-nostdin",
+                        "-loglevel",
+                        "error",
+                        "-y",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        source,
+                    ])
+                    .args(["-c:v", encoder, "-pix_fmt", "yuv420p"])
+                    .args(params)
+                    .args(container)
+                    .arg(&clip)
+                    .status()
+                    .unwrap();
+                assert!(
+                    status.success(),
+                    "ffmpeg could not write {}",
+                    clip.display()
+                );
+                let tiles = dir.join(format!("tiles-{encoder}-{name}"));
+                std::fs::create_dir_all(&tiles).unwrap();
+                let count = tile_run(&clip.to_string_lossy(), &dir, &tiles, true, &Cancel::new())
+                    .await
+                    .unwrap();
+                assert_eq!(count, 9, "{encoder} {name}");
+                let tile = image::open(tiles.join("0.jpg")).unwrap().to_luma8();
+                for k in 0..count {
+                    // The mean luma of the thumbnail's middle, back from the JPEG's full range
+                    let (x0, y0) = ((k % TILE_SIDE) * 320 + 120, (k / TILE_SIDE) * 180 + 60);
+                    let mut sum = 0.0;
+                    for y in y0..y0 + 60 {
+                        for x in x0..x0 + 80 {
+                            sum += f64::from(tile.get_pixel(x, y)[0]);
+                        }
+                    }
+                    let luma = sum / (60.0 * 80.0) * 219.0 / 255.0;
+                    let seconds = luma * 5.0 / 10.0;
+                    let nominal = f64::from(k * INTERVAL_MS) / 1000.0;
+                    // Half an interval, and a second for the JPEG's rounding
+                    assert!(
+                        (seconds - nominal).abs() <= 6.0,
+                        "{encoder} {name}: thumbnail {k} is from {seconds:.1} s"
+                    );
+                }
+                checked += 1;
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        if checked == 0 {
+            eprintln!("SKIPPED {test}: no H.264 or HEVC encoder, so this test checked nothing");
+        }
+    }
+
+    #[test]
+    fn r3trickplay_names_the_ffmpeg_version_it_needs() {
+        // What FFmpeg 4.4 to 6.1 print for `-bsf:v` before an input
+        let old = "ffmpeg failed: Option bsf:v (A comma-separated list of bitstream filters) \
+                   cannot be applied to input url /media/a.mkv -- you are trying to apply an \
+                   input option to an output file or vice versa. Move this option before the \
+                   file it belongs to.";
+        assert!(rejects_input_bsf(old));
+        assert!(!rejects_input_bsf(
+            "ffmpeg failed: Invalid data found when processing input"
+        ));
+        assert!(FFMPEG_TOO_OLD.contains("FFmpeg 7.0"));
+    }
+
+    #[tokio::test]
+    async fn r3trickplay_sweep_waits_for_running_jobs() {
+        let pool = SqlitePool::connect_lazy("sqlite::memory:").unwrap();
+        let dir = std::env::temp_dir().join(format!("r3trickplay-sweep-{}", Uuid::new_v4()));
+        let job = image_job(&Cancel::new()).await.unwrap();
+        let sweep = tokio::spawn(async move { sweep_unused_files(&pool, &dir).await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!sweep.is_finished(), "the sweep waits for the running job");
+        drop(job);
+        tokio::time::timeout(Duration::from_secs(5), sweep)
+            .await
+            .expect("the sweep runs once the job ends")
+            .unwrap()
+            .unwrap();
+    }
 
     #[tokio::test]
     async fn r2chapters_cancel_kills_the_running_ffmpeg() {

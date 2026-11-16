@@ -327,6 +327,7 @@ async fn enrich_item(
         if let Some(imdb) = extras.imdb_id {
             item.provider_ids.set("Imdb".to_string(), imdb);
         }
+        item.forced_sort_name = extras.forced_sort_name.filter(|s| !s.trim().is_empty());
         item.lock_data = extras.lock_data;
         item.locked_fields = extras
             .locked_fields
@@ -2371,6 +2372,15 @@ async fn get_items(
     // them as ParentId, is answered from their own tables.
     let mut parent_id = query.parent_id();
     let mut collection_ids = None;
+    let only_containers = media_types.as_ref().filter(|kinds| {
+        !kinds.is_empty()
+            && kinds.iter().all(|kind| {
+                kind.eq_ignore_ascii_case("BoxSet") || kind.eq_ignore_ascii_case("Playlist")
+            })
+    });
+    let wants = |name: &str| {
+        only_containers.is_some_and(|kinds| kinds.iter().any(|k| k.eq_ignore_ascii_case(name)))
+    };
     if let Some(id) = parent_id {
         match super::collections::container_of(&state, id, &claims).await? {
             Some(Container::Playlist) => {
@@ -2391,20 +2401,32 @@ async fn get_items(
                 parent_id = None;
                 collection_ids = Some(ids);
             }
+            // The collections or playlists under a library: those holding its items
+            None if only_containers.is_some()
+                && rustyfin_db::repo_library::get_library_by_id(&state.db_ro, id)
+                    .await?
+                    .is_some() =>
+            {
+                let listing = super::collections::container_listing(
+                    &state,
+                    &claims,
+                    wants("BoxSet"),
+                    wants("Playlist"),
+                    Some(id),
+                    start_index as usize,
+                    limit as usize,
+                );
+                return listing.await.map(|r| Json(r).into_response());
+            }
             None => {}
         }
-    } else if let Some(kinds) = media_types.as_ref().filter(|kinds| {
-        !kinds.is_empty()
-            && kinds.iter().all(|kind| {
-                kind.eq_ignore_ascii_case("BoxSet") || kind.eq_ignore_ascii_case("Playlist")
-            })
-    }) {
-        let wants = |name: &str| kinds.iter().any(|kind| kind.eq_ignore_ascii_case(name));
+    } else if only_containers.is_some() {
         let listing = super::collections::container_listing(
             &state,
             &claims,
             wants("BoxSet"),
             wants("Playlist"),
+            None,
             start_index as usize,
             limit as usize,
         );

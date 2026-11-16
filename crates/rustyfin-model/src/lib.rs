@@ -28,6 +28,7 @@ pub mod search;
 pub mod server_info;
 pub mod session;
 pub mod setup;
+pub mod sort_name;
 pub mod trickplay;
 pub mod user;
 pub mod ws_event;

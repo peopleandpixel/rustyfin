@@ -797,6 +797,7 @@ async fn movie_lookup(
 
     Ok(Some(ExternalMetadata {
         name: details.title,
+        sort_title: None,
         overview: details.overview,
         production_year,
         community_rating: details.vote_average,
@@ -1009,6 +1010,7 @@ async fn series_lookup(
 
     Ok(Some(ExternalMetadata {
         name: details.name,
+        sort_title: None,
         overview: details.overview,
         production_year,
         community_rating: details.vote_average,

@@ -122,7 +122,8 @@ run_foreground() {
     fi
 
     # Webclient prüfen
-    if [ ! -f "$SCRIPT_DIR/crates/rustyfin-web/dist/index.html" ]; then
+    # Neu bauen, wenn dist/ fehlt oder eine Quelldatei neuer ist
+    if [ ! -f "$SCRIPT_DIR/crates/rustyfin-web/dist/index.html" ] || [ -n "$(find "$SCRIPT_DIR/crates/rustyfin-web/src" -newer "$SCRIPT_DIR/crates/rustyfin-web/dist/index.html" -print -quit)" ]; then
         build_web
     fi
 
@@ -161,7 +162,8 @@ start_background() {
         fi
     fi
 
-    if [ ! -f "$SCRIPT_DIR/crates/rustyfin-web/dist/index.html" ]; then
+    # Neu bauen, wenn dist/ fehlt oder eine Quelldatei neuer ist
+    if [ ! -f "$SCRIPT_DIR/crates/rustyfin-web/dist/index.html" ] || [ -n "$(find "$SCRIPT_DIR/crates/rustyfin-web/src" -newer "$SCRIPT_DIR/crates/rustyfin-web/dist/index.html" -print -quit)" ]; then
         build_web
     fi
 

@@ -112,13 +112,13 @@ fn reasons(list: &[R]) -> TranscodeReasons {
 }
 
 /// The URL of an HLS transcode for `dev1`, source `src1`, session `ps1` and token `tok`. `media`
-/// holds the parameters between MediaSourceId and PlaySessionId, `rest` those after `api_key`.
+/// holds the parameters between MediaSourceId and PlaySessionId, `rest` those after `ApiKey`.
 fn hls_url(media: &[&str], rest: &[&str]) -> String {
     let mut params = vec!["DeviceId=dev1", "MediaSourceId=src1"];
     params.extend_from_slice(media);
-    params.extend_from_slice(&["PlaySessionId=ps1", "api_key=tok"]);
+    params.extend_from_slice(&["PlaySessionId=ps1", "ApiKey=tok"]);
     params.extend_from_slice(rest);
-    format!("/Videos/{ITEM}/main.m3u8?{}", params.join("&"))
+    format!("/Videos/{ITEM}/master.m3u8?{}", params.join("&"))
 }
 
 /// chrome-linux's transcode of [`h264_hi10`]: the video to 8-bit H.264, the audio copied.
@@ -128,8 +128,8 @@ fn chrome_hi10_url() -> String {
             "VideoCodec=h264",
             "AudioCodec=aac",
             "AudioStreamIndex=1",
-            "VideoBitrate=119872",
-            "AudioBitrate=128",
+            "VideoBitrate=119872000",
+            "AudioBitrate=128000",
             "AudioSampleRate=48000",
             "MaxFramerate=24",
             "SegmentContainer=ts",
@@ -289,8 +289,8 @@ fn chrome_transcodes_hevc_main_10_to_h264() {
             "VideoCodec=h264",
             "AudioCodec=aac",
             "AudioStreamIndex=1",
-            "VideoBitrate=119872",
-            "AudioBitrate=128",
+            "VideoBitrate=119872000",
+            "AudioBitrate=128000",
             "AudioSampleRate=48000",
             "MaxFramerate=24",
             "SegmentContainer=ts",
@@ -330,8 +330,8 @@ fn chrome_transcodes_av1_with_eac3_and_names_both_codecs() {
             "VideoCodec=h264",
             "AudioCodec=aac,mp3",
             "AudioStreamIndex=1",
-            "VideoBitrate=119616",
-            "AudioBitrate=384",
+            "VideoBitrate=119616000",
+            "AudioBitrate=384000",
             "MaxFramerate=24",
             "SegmentContainer=ts",
             "MinSegments=1",
@@ -388,8 +388,8 @@ fn bitrate_over_the_limit_skips_direct_play_and_audio_copy() {
             "VideoCodec=h264",
             "AudioCodec=aac",
             "AudioStreamIndex=1",
-            "VideoBitrate=7872",
-            "AudioBitrate=128",
+            "VideoBitrate=7872000",
+            "AudioBitrate=128000",
             "MaxFramerate=24",
             "MaxWidth=1920",
             "MaxHeight=1080",
@@ -419,8 +419,8 @@ fn resolution_over_the_limit_scales_down() {
             "VideoCodec=h264",
             "AudioCodec=aac",
             "AudioStreamIndex=1",
-            "VideoBitrate=7872",
-            "AudioBitrate=128",
+            "VideoBitrate=7872000",
+            "AudioBitrate=128000",
             "AudioSampleRate=48000",
             "MaxFramerate=24",
             "MaxWidth=1920",
@@ -467,8 +467,8 @@ fn requested_max_bitrate_overrides_the_profile() {
             "VideoCodec=h264",
             "AudioCodec=aac,mp3",
             "AudioStreamIndex=1",
-            "VideoBitrate=2872",
-            "AudioBitrate=128",
+            "VideoBitrate=2872999",
+            "AudioBitrate=128000",
             "MaxFramerate=24",
             "SegmentContainer=ts",
             "MinSegments=1",
@@ -508,8 +508,8 @@ fn tv_transcodes_high_10_h264_and_offers_hevc() {
             "VideoCodec=hevc,h264",
             "AudioCodec=aac",
             "AudioStreamIndex=1",
-            "VideoBitrate=39872",
-            "AudioBitrate=128",
+            "VideoBitrate=39872000",
+            "AudioBitrate=128000",
             "AudioSampleRate=48000",
             "MaxFramerate=24",
             "SegmentContainer=ts",
@@ -555,8 +555,8 @@ fn a_default_audio_track_limits_the_candidates_to_default_tracks() {
             "VideoCodec=hevc,h264",
             "AudioCodec=aac,ac3",
             "AudioStreamIndex=1",
-            "VideoBitrate=39360",
-            "AudioBitrate=640",
+            "VideoBitrate=39360000",
+            "AudioBitrate=640000",
             "MaxFramerate=24",
             "SegmentContainer=ts",
             "MinSegments=2",
@@ -600,8 +600,8 @@ fn chrome_transcodes_when_the_default_audio_is_not_the_first_track() {
             "VideoCodec=h264",
             "AudioCodec=aac",
             "AudioStreamIndex=2",
-            "VideoBitrate=119872",
-            "AudioBitrate=128",
+            "VideoBitrate=119872000",
+            "AudioBitrate=128000",
             "AudioSampleRate=48000",
             "MaxFramerate=24",
             "SegmentContainer=ts",
@@ -663,8 +663,8 @@ fn disabled_direct_play_transcodes_with_direct_play_error() {
             "VideoCodec=h264",
             "AudioCodec=aac",
             "AudioStreamIndex=1",
-            "VideoBitrate=119872",
-            "AudioBitrate=128",
+            "VideoBitrate=119872000",
+            "AudioBitrate=128000",
             "AudioSampleRate=48000",
             "MaxFramerate=24",
             "SegmentContainer=ts",
@@ -802,7 +802,7 @@ fn max_audio_channels_lowers_the_audio_bitrate() {
     let why = reasons(&[R::VideoProfileNotSupported, R::VideoBitDepthNotSupported]);
 
     let data = device_data(&hi10, &tv, &request());
-    let expected = url("VideoBitrate=39360", "AudioBitrate=640");
+    let expected = url("VideoBitrate=39360000", "AudioBitrate=640000");
     assert_data(&data, &transcode("mkv", why, Some(1), expected));
 
     let stereo = StreamRequest {
@@ -810,7 +810,7 @@ fn max_audio_channels_lowers_the_audio_bitrate() {
         ..request()
     };
     let data = device_data(&hi10, &tv, &stereo);
-    let expected = url("VideoBitrate=39616", "AudioBitrate=384");
+    let expected = url("VideoBitrate=39616000", "AudioBitrate=384000");
     assert_data(&data, &transcode("mkv", why, Some(1), expected));
 }
 
@@ -855,8 +855,8 @@ fn extreme_bitrates_do_not_overflow() {
             "VideoCodec=h264",
             "AudioCodec=aac,mp3",
             "AudioStreamIndex=1",
-            "VideoBitrate=2140315",
-            "AudioBitrate=7168",
+            "VideoBitrate=2140315647",
+            "AudioBitrate=7168000",
             "MaxFramerate=24",
             "SegmentContainer=ts",
             "MinSegments=1",
@@ -878,7 +878,7 @@ fn extreme_bitrates_do_not_overflow() {
 
     // A limit of zero or less means no limit, and the video gets the 64 kbps floor.
     let why = reasons(&[R::VideoProfileNotSupported]);
-    let floor = chrome_hi10_url().replace("VideoBitrate=119872", "VideoBitrate=64");
+    let floor = chrome_hi10_url().replace("VideoBitrate=119872000", "VideoBitrate=64000");
     for limit in [-5, i32::MIN] {
         let negative = StreamRequest {
             max_bitrate: Some(limit),
@@ -894,7 +894,7 @@ fn extreme_bitrates_do_not_overflow() {
         ..profile("chrome-linux")
     };
     let data = device_data(&h264_hi10("mp4"), &unlimited, &request());
-    let url = chrome_hi10_url().replace("VideoBitrate=119872&", "");
+    let url = chrome_hi10_url().replace("VideoBitrate=119872000&", "");
     assert_data(&data, &transcode("mp4", why, Some(1), url));
 }
 
@@ -919,8 +919,8 @@ fn transcoding_profile_options_reach_the_url() {
             "VideoCodec=h264",
             "AudioCodec=aac",
             "AudioStreamIndex=1",
-            "VideoBitrate=7872",
-            "AudioBitrate=128",
+            "VideoBitrate=7872000",
+            "AudioBitrate=128000",
             "AudioSampleRate=48000",
             "MaxFramerate=24",
             "MaxWidth=1920",
@@ -976,8 +976,8 @@ fn transcoding_profiles_are_ranked_by_what_can_be_copied() {
             "VideoCodec=hevc,h264",
             "AudioCodec=aac",
             "AudioStreamIndex=1",
-            "VideoBitrate=19872",
-            "AudioBitrate=128",
+            "VideoBitrate=19872000",
+            "AudioBitrate=128000",
             "AudioSampleRate=48000",
             "MaxFramerate=24",
             "SegmentContainer=mp4",
@@ -1009,8 +1009,8 @@ fn transcoding_profiles_are_ranked_by_what_can_be_copied() {
             "VideoCodec=h264",
             "AudioCodec=aac",
             "AudioStreamIndex=1",
-            "VideoBitrate=19872",
-            "AudioBitrate=128",
+            "VideoBitrate=19872000",
+            "AudioBitrate=128000",
             "AudioSampleRate=48000",
             "MaxFramerate=24",
             "SegmentContainer=ts",
@@ -1055,8 +1055,8 @@ fn container_profile_conditions_block_direct_play() {
             "VideoCodec=h264",
             "AudioCodec=aac",
             "AudioStreamIndex=1",
-            "VideoBitrate=19872",
-            "AudioBitrate=128",
+            "VideoBitrate=19872000",
+            "AudioBitrate=128000",
             "AudioSampleRate=48000",
             "MaxFramerate=24",
             "SegmentContainer=ts",
@@ -1093,7 +1093,7 @@ fn empty_ids_are_left_out_of_the_url() {
     params.retain(|param| {
         !matches!(
             param.as_str(),
-            "DeviceId=dev1" | "PlaySessionId=ps1" | "api_key=tok"
+            "DeviceId=dev1" | "PlaySessionId=ps1" | "ApiKey=tok"
         )
     });
     let url = data.transcoding_url.as_deref().expect("a transcoding URL");
@@ -1158,8 +1158,8 @@ fn downmixed_audio_meets_the_apply_conditions_of_its_new_channels() {
             "VideoCodec=h264",
             "AudioCodec=aac",
             "AudioStreamIndex=1",
-            "VideoBitrate=7744",
-            "AudioBitrate=256",
+            "VideoBitrate=7744000",
+            "AudioBitrate=256000",
             "MaxFramerate=24",
             "SegmentContainer=ts",
         ],
@@ -1213,8 +1213,8 @@ fn a_range_type_not_equals_condition_lists_the_other_types_in_jellyfin_order() {
             "VideoCodec=h264",
             "AudioCodec=aac",
             "AudioStreamIndex=1",
-            "VideoBitrate=7872",
-            "AudioBitrate=128",
+            "VideoBitrate=7872000",
+            "AudioBitrate=128000",
             "AudioSampleRate=48000",
             "MaxFramerate=24",
             "MaxWidth=1920",
@@ -1341,7 +1341,7 @@ fn odd_sources_and_requests_do_not_panic() {
                 assert_eq!(data.transcoding_url.is_some(), transcodes, "{data:?}");
                 if let Some(url) = &data.transcoding_url {
                     assert!(
-                        url.starts_with(&format!("/Videos/{ITEM}/main.m3u8?")),
+                        url.starts_with(&format!("/Videos/{ITEM}/master.m3u8?")),
                         "{url}"
                     );
                 }

@@ -275,6 +275,54 @@ impl HiddenItems {
         self.ids.contains(&id) || self.folders.as_ref().is_some_and(|f| !f.contains(&library))
     }
 
+    /// The ids among `ids` that are hidden: by ratings and tags, or, with library access, in a
+    /// library the caller may not see (an id that names no item counts as hidden then). One query
+    /// for the libraries, for lists of ids (collections, playlists) without them.
+    pub async fn hidden_among(
+        &self,
+        state: &AppState,
+        ids: &[Uuid],
+    ) -> Result<HashSet<Uuid>, ApiError> {
+        let mut hidden: HashSet<Uuid> = ids
+            .iter()
+            .filter(|id| self.ids.contains(id))
+            .copied()
+            .collect();
+        if let Some(folders) = &self.folders
+            && !ids.is_empty()
+        {
+            let wanted =
+                serde_json::Value::from(ids.iter().map(Uuid::to_string).collect::<Vec<_>>())
+                    .to_string();
+            let rows: Vec<(String, String)> = sqlx::query_as(
+                "SELECT id, library_id FROM media_items WHERE id IN (SELECT value FROM json_each(?))",
+            )
+            .bind(wanted)
+            .fetch_all(&state.db_ro)
+            .await?;
+            let libraries: std::collections::HashMap<Uuid, Uuid> = rows
+                .into_iter()
+                .filter_map(|(id, lib)| {
+                    Some((Uuid::parse_str(&id).ok()?, Uuid::parse_str(&lib).ok()?))
+                })
+                .collect();
+            hidden.extend(
+                ids.iter()
+                    .filter(|id| libraries.get(id).is_none_or(|lib| !folders.contains(lib))),
+            );
+        }
+        Ok(hidden)
+    }
+
+    /// Drops the hidden ids of a list of item ids (`hidden_among`).
+    pub async fn retain_ids(&self, state: &AppState, ids: &mut Vec<Uuid>) -> Result<(), ApiError> {
+        if self.restricted {
+            let hidden = self.hidden_among(state, ids).await?;
+            ids.retain(|id| !hidden.contains(id));
+        }
+        Ok(())
+    }
+
     /// Drops the hidden entries of a list.
     pub fn retain<T: Listed>(&self, items: &mut Vec<T>) {
         if !self.ids.is_empty() || self.folders.is_some() {

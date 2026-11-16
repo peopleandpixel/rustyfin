@@ -74,6 +74,11 @@ pub struct TranscodeProfile {
     /// the video copy off. Hardware acceleration decodes and scales on the device and overlays in
     /// software; a subtitle of unknown video size turns it off.
     pub image_subtitle: Option<ImageSubtitle>,
+    /// Deinterlace the video (`bwdif`). It turns the video copy and hardware acceleration off.
+    pub deinterlace: bool,
+    /// Scale non-square pixels to square ones (`scale=iw*sar:ih,setsar=1`, even width). It turns
+    /// the video copy and hardware acceleration off.
+    pub square_pixels: bool,
     /// Write fragmented MP4 segments (`init.mp4` and `segment_NNNN.mp4`) instead of MPEG-TS, as
     /// HEVC needs in HLS
     pub fmp4: bool,
@@ -101,6 +106,8 @@ impl Default for TranscodeProfile {
             copy_audio: false,
             start_time_ticks: 0,
             image_subtitle: None,
+            deinterlace: false,
+            square_pixels: false,
             fmp4: false,
             video_tag: None,
         }
@@ -829,7 +836,12 @@ fn image_overlay_graph(
 ) -> String {
     let overlay = "overlay=eof_action=pass:repeatlast=0";
     let index = sub.stream_index;
-    let Some(size) = sub.video_size else {
+    // Deinterlacing and square pixels run in `scale_filter`, after the overlay: the subtitle is
+    // laid over the frame as it is and the whole frame is made progressive and square
+    let Some(size) = sub
+        .video_size
+        .filter(|_| !profile.deinterlace && !profile.square_pixels)
+    else {
         return format!("[0:V:0][1:{index}]{overlay},{scale_filter}[v]");
     };
     let (w, h) = output_size(size, profile.max_width, profile.max_height);
@@ -851,7 +863,8 @@ fn image_overlay_graph(
     format!("[0:V:0]{main}[main];[1:{index}]scale={w}:{h}[sub];[main][sub]{overlay}{after}[v]")
 }
 
-fn build_ffmpeg_args(
+/// The ffmpeg arguments of an HLS transcode of `input` with `profile`.
+pub fn build_ffmpeg_args(
     input: &str,
     playlist_output: &str,
     segment_pattern: &str,
@@ -865,17 +878,21 @@ fn build_ffmpeg_args(
 
     // An image subtitle is overlaid in software. With hardware acceleration the device decodes
     // and scales to the output size first; that needs the video's size, so a subtitle without
-    // one turns hardware acceleration off
+    // one turns hardware acceleration off. Deinterlacing and square pixels are software filters,
+    // so they turn it off too.
     let image_subtitle = profile.image_subtitle.filter(|_| !profile.audio_only);
+    let software_filters = profile.deinterlace || profile.square_pixels;
     let hw_accel = match image_subtitle {
+        _ if software_filters => HwAccel::None,
         Some(sub) if sub.video_size.is_none() => HwAccel::None,
         _ => profile.hw_accel,
     };
 
-    // Burn-in and the overlay need a re-encode, so they turn the video copy off
+    // Burn-in, the overlay and the software filters need a re-encode, so they turn the copy off
     let copy_video = profile.copy_video
         && !profile.audio_only
         && !profile.burn_subtitles
+        && !software_filters
         && image_subtitle.is_none();
 
     // Hardware acceleration input flags (skip for audio-only and copied video)
@@ -972,8 +989,15 @@ fn build_ffmpeg_args(
                 profile.max_width, profile.max_height
             ),
             HwAccel::None => format!(
-                "scale='min({},iw)':'min({},ih)':force_original_aspect_ratio=decrease,format=yuv420p",
-                profile.max_width, profile.max_height
+                "{}{}scale='min({},iw)':'min({},ih)':force_original_aspect_ratio=decrease,format=yuv420p",
+                if profile.deinterlace { "bwdif=0," } else { "" },
+                if profile.square_pixels {
+                    "scale=trunc(iw*sar/2)*2:ih,setsar=1,"
+                } else {
+                    ""
+                },
+                profile.max_width,
+                profile.max_height
             ),
         };
 

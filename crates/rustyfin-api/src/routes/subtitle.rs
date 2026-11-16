@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 use rustyfin_core::subtitle::{
     OpenSubtitlesConfig, discover_external_subtitles, download_subtitle, is_image_subtitle,
-    shift_vtt, srt_to_vtt, strip_ass_blocks,
+    shift_srt, shift_vtt, srt_to_vtt, strip_ass_blocks,
 };
 use rustyfin_model::media_source::{MediaSourceResponse, MediaStream};
 
@@ -297,10 +297,18 @@ async fn subtitle_vtt(
     start_ticks: i64,
     format: &str,
 ) -> Result<Response, ApiError> {
-    if !format.eq_ignore_ascii_case("vtt") {
+    // The format the URL names, as the device profile's External subtitle profile gave it
+    let Some(output) = SubtitleOutput::of(format) else {
         return Err(ApiError::BadRequest(format!(
-            "Subtitles are served as vtt, not {format}"
+            "Subtitles are served as vtt, srt or ass, not {format}"
         )));
+    };
+    // ASS events carry their times in several places (override tags too), so an ASS file isn't
+    // moved; a client that starts a transcode later asks for WebVTT or SubRip
+    if start_ticks > 0 && output.muxer == "ass" {
+        return Err(ApiError::BadRequest(
+            "An ASS subtitle can't start later than 0; ask for vtt or srt".to_string(),
+        ));
     }
 
     let sources =
@@ -371,7 +379,7 @@ async fn subtitle_vtt(
         .collect();
     let cache_dir = state.data_dir.join("cache").join("subtitle-vtt");
     // One cache file per stream; its stamp names the input it was made from
-    let cache_file = cache_dir.join(format!("v1-{source_key}-{index}.vtt"));
+    let cache_file = cache_dir.join(format!("v1-{source_key}-{index}.{}", output.extension));
     let input_hash = fnv1a(input.as_os_str().as_encoded_bytes());
     let stamp = format!("{input_hash:016x}-{}-{mtime}", meta.len());
 
@@ -391,13 +399,17 @@ async fn subtitle_vtt(
                     } else {
                         None
                     };
-                    let text = ffmpeg_vtt(&input, &map, demuxer, cp1252).await?;
-                    // ffmpeg keeps the ASS override and comment blocks as text; no ASS renderer
-                    // shows them
+                    let text = ffmpeg_vtt(&input, &map, demuxer, cp1252, output.muxer).await?;
+                    // ffmpeg keeps the ASS override and comment blocks as text; outside ASS no
+                    // renderer shows them
                     let ass = stream.codec.as_deref().is_some_and(|codec| {
                         codec.eq_ignore_ascii_case("ass") || codec.eq_ignore_ascii_case("ssa")
                     });
-                    let text = if ass { strip_ass_blocks(&text) } else { text };
+                    let text = if ass && output.muxer != "ass" {
+                        strip_ass_blocks(&text)
+                    } else {
+                        text
+                    };
                     match write_cache(&cache_dir, &cache_file, &stamp, &text).await {
                         Ok(()) => sweep_vtt_cache_daily(&cache_dir),
                         Err(e) => {
@@ -413,17 +425,44 @@ async fn subtitle_vtt(
         }
     };
 
-    let vtt = if start_ticks > 0 {
-        shift_vtt(&text, start_ticks)
-    } else {
-        text
+    // The cues move back by the start offset; ASS was refused one above
+    let text = match output.muxer {
+        "webvtt" => shift_vtt(&text, start_ticks),
+        "srt" => shift_srt(&text, start_ticks),
+        _ => text,
     };
     Ok((
         StatusCode::OK,
-        [(header::CONTENT_TYPE, "text/vtt; charset=utf-8")],
-        vtt,
+        [(header::CONTENT_TYPE, output.content_type)],
+        text,
     )
         .into_response())
+}
+
+/// A text format that the subtitle endpoint writes: the ffmpeg muxer, the cache file's extension
+/// and the content type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SubtitleOutput {
+    muxer: &'static str,
+    extension: &'static str,
+    content_type: &'static str,
+}
+
+impl SubtitleOutput {
+    /// The output for a URL's format, the names Jellyfin's subtitle profiles use, in any case.
+    fn of(format: &str) -> Option<Self> {
+        let (muxer, extension, content_type) = match format.to_ascii_lowercase().as_str() {
+            "vtt" | "webvtt" => ("webvtt", "vtt", "text/vtt; charset=utf-8"),
+            "srt" | "subrip" => ("srt", "srt", "application/x-subrip; charset=utf-8"),
+            "ass" | "ssa" => ("ass", "ass", "text/x-ssa; charset=utf-8"),
+            _ => return None,
+        };
+        Some(Self {
+            muxer,
+            extension,
+            content_type,
+        })
+    }
 }
 
 /// The ffmpeg demuxer of the external subtitle file `path`, by its extension in lower case; None
@@ -438,7 +477,8 @@ fn subtitle_demuxer(path: &std::path::Path) -> Option<&'static str> {
     }
 }
 
-/// The ffmpeg arguments that write subtitle stream `map` of `input` as WebVTT on stdout. Input
+/// The ffmpeg arguments that write subtitle stream `map` of `input` on stdout with `muxer`
+/// (`webvtt`, `srt` or `ass`). Input
 /// options go before `-i`: `-sub_charenc CP1252` when `cp1252`, and `-f {demuxer}` when a demuxer
 /// is given. The forced format keeps ffmpeg from reading an external file by its content (a
 /// playlist or concat list named `.srt` would open other files or URLs), and only local files
@@ -448,6 +488,7 @@ fn vtt_args(
     map: &str,
     demuxer: Option<&str>,
     cp1252: bool,
+    muxer: &str,
 ) -> Vec<OsString> {
     let mut args: Vec<OsString> = ["-nostdin", "-v", "error", "-protocol_whitelist", "file"]
         .map(OsString::from)
@@ -460,7 +501,7 @@ fn vtt_args(
     }
     args.push("-i".into());
     args.push(input.into());
-    args.extend(["-map", map, "-f", "webvtt", "-"].map(OsString::from));
+    args.extend(["-map", map, "-f", muxer, "-"].map(OsString::from));
     args
 }
 
@@ -472,9 +513,10 @@ async fn ffmpeg_vtt(
     map: &str,
     demuxer: Option<&str>,
     cp1252: bool,
+    muxer: &str,
 ) -> Result<String, ApiError> {
     let mut command = tokio::process::Command::new("ffmpeg");
-    command.args(vtt_args(input, map, demuxer, cp1252));
+    command.args(vtt_args(input, map, demuxer, cp1252, muxer));
     let stderr = match run_capped(&mut command, MAX_SUBTITLE_BYTES, VTT_TIME_LIMIT).await {
         Ok(RunEnd::Exited { status, stdout, .. }) if status.success() => {
             match String::from_utf8(stdout) {
@@ -753,7 +795,7 @@ fn sweep_vtt_cache(dir: &std::path::Path, now: SystemTime, max_bytes: u64) -> us
         let age = now.duration_since(read).unwrap_or_default();
         let stale = if name.ends_with(".tmp") {
             age > HOUR
-        } else if name.ends_with(".vtt") {
+        } else if is_cached_text(&name) {
             !name.starts_with("v1-") || age > THIRTY_DAYS
         } else {
             false
@@ -762,7 +804,7 @@ fn sweep_vtt_cache(dir: &std::path::Path, now: SystemTime, max_bytes: u64) -> us
             if std::fs::remove_file(&path).is_ok() {
                 removed += 1;
             }
-        } else if name.starts_with("v1-") && name.ends_with(".vtt") {
+        } else if name.starts_with("v1-") && is_cached_text(&name) {
             kept.push((read, meta.len(), path));
         }
     }
@@ -779,6 +821,13 @@ fn sweep_vtt_cache(dir: &std::path::Path, now: SystemTime, max_bytes: u64) -> us
         }
     }
     removed
+}
+
+/// Whether `name` is a subtitle text that the cache holds: WebVTT, SubRip or ASS.
+fn is_cached_text(name: &str) -> bool {
+    [".vtt", ".srt", ".ass"]
+        .iter()
+        .any(|extension| name.ends_with(extension))
 }
 
 /// The most the WebVTT cache may hold, in bytes: the sweep removes the least recently read past it.
@@ -1065,10 +1114,16 @@ mod tests {
 
     #[test]
     fn test_vtt_args_force_the_external_format() {
-        let args: Vec<String> = vtt_args(Path::new("/media/film.srt"), "0:s:0", Some("srt"), false)
-            .into_iter()
-            .map(|arg| arg.into_string().unwrap())
-            .collect();
+        let args: Vec<String> = vtt_args(
+            Path::new("/media/film.srt"),
+            "0:s:0",
+            Some("srt"),
+            false,
+            "webvtt",
+        )
+        .into_iter()
+        .map(|arg| arg.into_string().unwrap())
+        .collect();
         let input = args.iter().position(|arg| arg == "-i").unwrap();
         let before = &args[..input];
         assert!(before.windows(2).any(|p| p[0] == "-f" && p[1] == "srt"));
@@ -1083,10 +1138,11 @@ mod tests {
 
     #[test]
     fn test_vtt_args_let_ffmpeg_probe_an_embedded_stream() {
-        let args: Vec<String> = vtt_args(Path::new("/media/film.mkv"), "0:3", None, false)
-            .into_iter()
-            .map(|arg| arg.into_string().unwrap())
-            .collect();
+        let args: Vec<String> =
+            vtt_args(Path::new("/media/film.mkv"), "0:3", None, false, "webvtt")
+                .into_iter()
+                .map(|arg| arg.into_string().unwrap())
+                .collect();
         let input = args.iter().position(|arg| arg == "-i").unwrap();
         assert!(!args[..input].iter().any(|arg| arg == "-f"));
         assert_eq!(args[input + 2..], ["-map", "0:3", "-f", "webvtt", "-"]);
@@ -1094,10 +1150,16 @@ mod tests {
 
     #[test]
     fn test_vtt_args_read_cp1252() {
-        let args: Vec<String> = vtt_args(Path::new("/media/film.srt"), "0:s:0", Some("srt"), true)
-            .into_iter()
-            .map(|arg| arg.into_string().unwrap())
-            .collect();
+        let args: Vec<String> = vtt_args(
+            Path::new("/media/film.srt"),
+            "0:s:0",
+            Some("srt"),
+            true,
+            "webvtt",
+        )
+        .into_iter()
+        .map(|arg| arg.into_string().unwrap())
+        .collect();
         let input = args.iter().position(|arg| arg == "-i").unwrap();
         let before = &args[..input];
         assert!(

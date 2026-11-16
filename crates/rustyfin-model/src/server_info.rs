@@ -293,6 +293,14 @@ fn default_library_monitor_poll_interval() -> u32 {
     60
 }
 
+impl ServerConfiguration {
+    /// The sort rules: `SortRemoveWords`, `SortRemoveCharacters` and `SortReplaceCharacters`, with
+    /// Jellyfin's defaults for the ones no client has saved.
+    pub fn sort_rules(&self) -> crate::sort_name::SortRules {
+        crate::sort_name::SortRules::from_config(&self.other)
+    }
+}
+
 impl Default for ServerConfiguration {
     fn default() -> Self {
         Self {

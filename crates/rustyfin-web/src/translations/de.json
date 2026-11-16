@@ -818,7 +818,27 @@
         "tab_album_artists": "Albuminterpreten",
         "tab_artists": "Interpreten",
         "tab_songs": "Titel",
-        "tab_genres": "Genres"
+        "tab_genres": "Genres",
+        "tab_playlists": "Wiedergabelisten"
+    },
+    "collections": {
+        "collections": "Sammlungen",
+        "playlists": "Wiedergabelisten",
+        "new_collection": "Neue Sammlung",
+        "new_playlist": "Neue Wiedergabeliste",
+        "no_collections": "Noch keine Sammlungen. Füge einen Film über sein Menü einer Sammlung hinzu.",
+        "no_playlists": "Noch keine Wiedergabelisten. Füge einen Titel über sein Menü einer Wiedergabeliste hinzu.",
+        "create": "Erstellen",
+        "public_playlist": "Allen Benutzern diese Wiedergabeliste zeigen",
+        "items_count_one": "{{count}} Eintrag",
+        "items_count_other": "{{count}} Einträge",
+        "collection_empty": "Diese Sammlung ist leer.",
+        "playlist_empty": "Diese Wiedergabeliste ist leer.",
+        "drag_to_reorder": "Zum Umsortieren ziehen",
+        "remove_from_playlist": "Aus der Wiedergabeliste entfernen",
+        "remove_from_collection": "Aus der Sammlung entfernen",
+        "removed_from_playlist": "Aus der Wiedergabeliste entfernt",
+        "removed_from_collection": "Aus der Sammlung entfernt"
     },
     "oidc": {
         "sign_in_default": "Mit Single Sign-on anmelden",

@@ -14,7 +14,8 @@ use uuid::Uuid;
 /// Saves an item. An existing item is updated in place, so it keeps its rowid, which the search
 /// index is keyed on, and the rows that reference it; `INSERT OR REPLACE` deleted it first, and
 /// the delete cascaded to them. It also keeps its stored date added (`date_created`), because
-/// callers can save copies they read earlier.
+/// callers can save copies they read earlier. It keeps its stored sort name too while that is
+/// made from a forced sort name (`item_metadata_extras.forced_sort_name`).
 pub async fn upsert_media_item(pool: &SqlitePool, item: &MediaItem) -> Result<(), sqlx::Error> {
     let id = item.id.to_string();
     let parent_id = item.parent_id.map(|p| p.to_string());
@@ -38,7 +39,9 @@ pub async fn upsert_media_item(pool: &SqlitePool, item: &MediaItem) -> Result<()
           ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, \
           ?28, ?29, ?30, ?31, ?32) \
          ON CONFLICT(id) DO UPDATE SET \
-          name = excluded.name, sort_name = excluded.sort_name, overview = excluded.overview, \
+          name = excluded.name, sort_name = CASE WHEN EXISTS (SELECT 1 FROM item_metadata_extras e \
+               WHERE e.item_id = excluded.id AND e.forced_sort_name IS NOT NULL) \
+              THEN media_items.sort_name ELSE excluded.sort_name END, overview = excluded.overview, \
           media_type = excluded.media_type, path = excluded.path, parent_id = excluded.parent_id, \
           library_id = excluded.library_id, production_year = excluded.production_year, \
           community_rating = excluded.community_rating, \
@@ -219,6 +222,17 @@ fn push_guard(qb: &mut QueryBuilder<Sqlite>, change: &RefreshChange) {
 /// when no column changed or the row no longer passes any guard.
 pub async fn save_refresh_changes(
     pool: &SqlitePool,
+    read: &MediaItem,
+    updated: &MediaItem,
+) -> Result<Vec<&'static str>, sqlx::Error> {
+    let mut conn = pool.acquire().await?;
+    save_refresh_changes_on(&mut conn, read, updated).await
+}
+
+/// [`save_refresh_changes`] on one connection, so a caller can put it in a transaction with
+/// other writes.
+pub async fn save_refresh_changes_on(
+    conn: &mut SqliteConnection,
     read: &MediaItem,
     updated: &MediaItem,
 ) -> Result<Vec<&'static str>, sqlx::Error> {
@@ -403,7 +417,7 @@ pub async fn save_refresh_changes(
     }
 
     // fetch_all steps the statement to completion, so a commit error is returned here.
-    let rows = qb.build().fetch_all(pool).await?;
+    let rows = qb.build().fetch_all(&mut *conn).await?;
     let mut written = Vec::new();
     if let Some(row) = rows.first() {
         for (i, change) in changes.iter().enumerate() {
@@ -465,7 +479,9 @@ pub async fn batch_upsert_media_items(
               homepage, end_date, vote_count, popularity) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT(id) DO UPDATE SET \
-              name = excluded.name, sort_name = excluded.sort_name, overview = excluded.overview, \
+              name = excluded.name, sort_name = CASE WHEN EXISTS (SELECT 1 FROM item_metadata_extras e \
+               WHERE e.item_id = excluded.id AND e.forced_sort_name IS NOT NULL) \
+              THEN media_items.sort_name ELSE excluded.sort_name END, overview = excluded.overview, \
               media_type = excluded.media_type, path = excluded.path, \
               parent_id = excluded.parent_id, library_id = excluded.library_id, \
               production_year = excluded.production_year, \
@@ -1218,8 +1234,8 @@ fn build_filtered_query(
              OR (parent_id IS NULL AND library_id = ? AND EXISTS (SELECT 1 FROM libraries WHERE id = ?)))))
         AND (? IS NULL OR ? = '' OR library_id = ?)
         AND (? IS NULL OR ? = '' OR name LIKE ?)
-        AND (? IS NULL OR ? = '' OR (? = '#' AND (sort_name < 'A' OR sort_name > 'z')) OR (? != '#' AND (sort_name LIKE ? OR name LIKE ?)))
-        AND (? IS NULL OR ? = '' OR sort_name >= ? OR name >= ?)
+        AND (? IS NULL OR ? = '' OR (? = '#' AND (lower(sort_name) < 'a' OR lower(sort_name) >= '{')) OR (? != '#' AND sort_name LIKE ?))
+        AND (? IS NULL OR ? = '' OR lower(sort_name) >= lower(?))
         AND (? IS NULL OR ? = '' OR premiere_date >= ?)
         AND (? IS NULL OR ? = '' OR premiere_date <= ?)
         AND (? IS NULL OR ? = '' OR premiere_date >= ?)
@@ -1438,8 +1454,6 @@ pub async fn get_items_filtered(
         .bind(&starts_with_str)
         .bind(&starts_with_str)
         .bind(&starts_with_like)
-        .bind(&starts_with_like)
-        .bind(&starts_with_or_greater_str)
         .bind(&starts_with_or_greater_str)
         .bind(&starts_with_or_greater_str)
         .bind(&starts_with_or_greater_str)
@@ -1559,8 +1573,6 @@ pub async fn get_items_filtered(
         .bind(&starts_with_str)
         .bind(&starts_with_str)
         .bind(&starts_with_like)
-        .bind(&starts_with_like)
-        .bind(&starts_with_or_greater_str)
         .bind(&starts_with_or_greater_str)
         .bind(&starts_with_or_greater_str)
         .bind(&starts_with_or_greater_str)
@@ -3232,7 +3244,10 @@ pub async fn get_genres_by_name(
                 let item = MediaItem {
                     id: uuid::Uuid::new_v4(),
                     name: g.clone(),
-                    sort_name: Some(g.to_lowercase()),
+                    sort_name: Some(rustyfin_model::sort_name::create_sort_name(
+                        &g,
+                        &rustyfin_model::sort_name::current_rules(),
+                    )),
                     overview: None,
                     media_type: MediaType::Genre,
                     path: String::new(),
@@ -3274,7 +3289,10 @@ pub async fn get_studios_by_name(
         let item = MediaItem {
             id: uuid::Uuid::new_v4(),
             name: row.clone(),
-            sort_name: Some(row.to_lowercase()),
+            sort_name: Some(rustyfin_model::sort_name::create_sort_name(
+                row,
+                &rustyfin_model::sort_name::current_rules(),
+            )),
             overview: None,
             media_type: MediaType::Unknown,
             path: String::new(),
@@ -3662,6 +3680,213 @@ impl ItemLocks {
     pub fn locked(&self, field: &str) -> bool {
         self.lock_data || self.fields.iter().any(|f| f.eq_ignore_ascii_case(field))
     }
+}
+
+impl ItemLocks {
+    /// Whether an NFO or a provider may not change the forced sort name: the whole item, its name
+    /// or its sort name is locked. The sort name itself is always made from the forced sort name
+    /// or the name, as in Jellyfin.
+    pub fn forced_sort_name_locked(&self) -> bool {
+        self.locked("Name") || self.locked("SortName")
+    }
+}
+
+/// An item's forced sort name (Jellyfin's ForcedSortName), as written; none when it has none.
+pub async fn forced_sort_name(
+    pool: &SqlitePool,
+    item_id: uuid::Uuid,
+) -> Result<Option<String>, sqlx::Error> {
+    let forced: Option<Option<String>> =
+        sqlx::query_scalar("SELECT forced_sort_name FROM item_metadata_extras WHERE item_id = ?")
+            .bind(item_id.to_string())
+            .fetch_optional(pool)
+            .await?;
+    Ok(forced.flatten().filter(|s| !s.trim().is_empty()))
+}
+
+/// Sets an item's forced sort name, or clears it with None. The caller writes the sort name made
+/// from it to `media_items.sort_name`.
+pub async fn set_forced_sort_name(
+    pool: &SqlitePool,
+    item_id: uuid::Uuid,
+    forced: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    let mut conn = pool.acquire().await?;
+    set_forced_sort_name_on(&mut conn, item_id, forced).await
+}
+
+/// [`set_forced_sort_name`] on one connection, for a transaction.
+pub async fn set_forced_sort_name_on(
+    conn: &mut SqliteConnection,
+    item_id: uuid::Uuid,
+    forced: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO item_metadata_extras (item_id, forced_sort_name) VALUES (?, ?) \
+         ON CONFLICT(item_id) DO UPDATE SET forced_sort_name = excluded.forced_sort_name",
+    )
+    .bind(item_id.to_string())
+    .bind(forced.map(str::trim).filter(|s| !s.is_empty()))
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// SQL that is true while the `media_items` row's sort name is made from a forced sort name, which
+/// a sort name made from the name must not replace. For
+/// `sort_name = CASE WHEN … THEN sort_name ELSE …`.
+pub const SORT_NAME_KEPT: &str = "EXISTS (SELECT 1 FROM item_metadata_extras kept \
+    WHERE kept.item_id = media_items.id AND kept.forced_sort_name IS NOT NULL)";
+
+/// The `configuration` key holding the fingerprint of the sort rules the stored sort names were
+/// made with.
+const SORT_RULES_KEY: &str = "sort_name_rules";
+/// The `configuration` key migration 094 sets: the startup pass still has to find the forced sort
+/// names of items whose names SQLite cannot lowercase.
+const SORT_LEGACY_KEY: &str = "sort_name_legacy_check";
+/// Sort names updated per transaction, so a pass on a large library never holds the write lock
+/// for long.
+const SORT_BATCH: usize = 500;
+
+/// Finishes what migration 094 left: among the items whose names SQLite cannot lowercase, a sort
+/// name that is neither the lowercased name nor the sort name made from it was forced, and is
+/// kept as the forced sort name. All of it, and the removal of the key that asks for it, is one
+/// transaction, so it runs once and a crash leaves nothing half done. The server runs it before
+/// any scan. Returns how many forced sort names it kept.
+pub async fn classify_legacy_sort_names(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
+    use rustyfin_model::sort_name::{current_rules, item_sort_name};
+
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let done = sqlx::query("DELETE FROM configuration WHERE key = ?")
+        .bind(SORT_LEGACY_KEY)
+        .execute(&mut *tx)
+        .await?;
+    if done.rows_affected() == 0 {
+        return Ok(0);
+    }
+    type Row = (String, String, String, String, Option<i32>, Option<i32>);
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT m.id, m.name, m.sort_name, m.media_type, m.parent_index_number, m.index_number \
+         FROM media_items m LEFT JOIN item_metadata_extras e ON e.item_id = m.id \
+         WHERE e.forced_sort_name IS NULL AND m.sort_name IS NOT NULL AND m.sort_name != '' \
+           AND m.media_type NOT IN ('Episode', 'Season', 'Audio')",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    let rules = current_rules();
+    let mut kept = 0;
+    for (id, name, sort, kind, parent_index, index) in rows {
+        if name.is_ascii() || sort == name.to_lowercase() {
+            continue;
+        }
+        let media_type = match kind.as_str() {
+            "Folder" => MediaType::Unknown,
+            other => other.parse().unwrap_or(MediaType::Unknown),
+        };
+        if sort == item_sort_name(media_type, &name, parent_index, index, &rules) {
+            continue;
+        }
+        sqlx::query(
+            "INSERT INTO item_metadata_extras (item_id, forced_sort_name) VALUES (?, ?) \
+             ON CONFLICT(item_id) DO UPDATE SET forced_sort_name = excluded.forced_sort_name",
+        )
+        .bind(&id)
+        .bind(&sort)
+        .execute(&mut *tx)
+        .await?;
+        kept += 1;
+    }
+    tx.commit().await?;
+    Ok(kept)
+}
+
+/// Makes every stored sort name again with `rules`, when they were made with other rules (or
+/// before migration 094): a forced sort name gives Jellyfin's lowercased, padded form of it, and
+/// any other item the sort name of its type and name. Seasons keep theirs. Locks don't keep a
+/// sort name, as in Jellyfin, where it is always made from the forced sort name or the name. Each
+/// update holds only while the name and sort name are still the ones read, so an edit that lands
+/// meanwhile wins. Returns how many sort names changed.
+pub async fn recompute_sort_names(
+    pool: &SqlitePool,
+    rules: &rustyfin_model::sort_name::SortRules,
+) -> Result<u64, sqlx::Error> {
+    use rustyfin_model::sort_name::{forced_sort_name, item_sort_name};
+
+    // Normally done at startup already; a no-op then
+    classify_legacy_sort_names(pool).await?;
+    let fingerprint = rules.fingerprint();
+    let stored: Option<String> =
+        sqlx::query_scalar("SELECT value FROM configuration WHERE key = ?")
+            .bind(SORT_RULES_KEY)
+            .fetch_optional(pool)
+            .await?;
+    if stored.as_deref() == Some(fingerprint.as_str()) {
+        return Ok(0);
+    }
+
+    type Row = (
+        String,
+        String,
+        Option<String>,
+        String,
+        Option<i32>,
+        Option<i32>,
+        Option<String>,
+    );
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT m.id, m.name, m.sort_name, m.media_type, m.parent_index_number, m.index_number, \
+         e.forced_sort_name \
+         FROM media_items m LEFT JOIN item_metadata_extras e ON e.item_id = m.id",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut changed = 0;
+    let mut pending = 0;
+    let mut tx = pool.begin().await?;
+    for (id, name, sort_name, kind, parent_index, index, forced) in rows {
+        let media_type = match kind.as_str() {
+            "Folder" => MediaType::Unknown,
+            other => other.parse().unwrap_or(MediaType::Unknown),
+        };
+        let forced = forced.filter(|s| !s.trim().is_empty());
+        if media_type == MediaType::Season && forced.is_none() {
+            continue;
+        }
+        let wanted = match &forced {
+            Some(forced) => forced_sort_name(forced),
+            None => item_sort_name(media_type, &name, parent_index, index, rules),
+        };
+        if sort_name.as_deref() == Some(wanted.as_str()) {
+            continue;
+        }
+        let done = sqlx::query(
+            "UPDATE media_items SET sort_name = ? WHERE id = ? AND name IS ? AND sort_name IS ?",
+        )
+        .bind(&wanted)
+        .bind(&id)
+        .bind(&name)
+        .bind(&sort_name)
+        .execute(&mut *tx)
+        .await?;
+        changed += done.rows_affected();
+        pending += 1;
+        if pending >= SORT_BATCH {
+            tx.commit().await?;
+            tx = pool.begin().await?;
+            pending = 0;
+        }
+    }
+    sqlx::query(
+        "INSERT INTO configuration (key, value) VALUES (?, ?) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(SORT_RULES_KEY)
+    .bind(&fingerprint)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(changed)
 }
 
 /// An item's locks; none when it has no extras row.

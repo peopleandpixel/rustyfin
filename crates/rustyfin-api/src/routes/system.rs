@@ -563,9 +563,14 @@ async fn update_configuration(
     // Persist to disk
     save_config_file(state.data_dir.join("config.json"), new_config.clone()).await?;
 
-    // Update in-memory
+    // Update in-memory. Other sort rules make the stored sort names again, in the background.
     let mut config = state.config.write().await;
+    let sort_rules_changed = config.sort_rules() != new_config.sort_rules();
     *config = new_config;
+    if sort_rules_changed {
+        let state = state.clone();
+        tokio::spawn(async move { crate::sort_names::apply(&state).await });
+    }
     state
         .task_scheduler
         .changes()
