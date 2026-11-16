@@ -49366,7 +49366,6 @@ async fn r3item2_hidden_items_are_404_on_download_and_subtitle_delete() {
     .await;
     assert_eq!(status, StatusCode::OK);
 }
-}
 
 // ── Music: lyrics and instant mix ──
 
