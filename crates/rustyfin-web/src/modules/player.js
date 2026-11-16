@@ -3,11 +3,12 @@ import { $, icon, formatDurationSeconds } from './util.js';
 import { cardImage } from './cards.js';
 import { currentPage } from './router.js';
 import { renderHome } from './home.js';
-import { currentDetailId, renderDetail } from './item.js';
+import { currentDetailId, renderDetail, versionLabels } from './item.js';
 import { clearQueue, queueNeighbours, playQueueStep } from './queue.js';
 import {
     trackPrefs, defaultTracks, defaultSubtitleIndex as preferredSubtitleIndex, subtitleAppearance, saveSubtitleAppearance,
-    subtitleCss, stepSubtitleOffset,
+    subtitleCss, stepSubtitleOffset, qualityOptions, bitrateLabel, maxStreamingBitrate, setMaxStreamingBitrate,
+    AUTO_BITRATE, aspectRatio, setAspectRatio,
 } from './playerprefs.js';
 let playerReportInterval = null;
 let playerBars = null;
@@ -109,6 +110,8 @@ async function openStream(session, startTicks) {
                 mediaSourceId: session.mediaSourceId,
                 audioStreamIndex: session.audioIndex,
                 subtitleStreamIndex: session.subtitleIndex,
+                // The quality chosen on this device (the settings menu); Auto lets the source play as it is
+                maxBitrate: maxStreamingBitrate() || AUTO_BITRATE,
             });
             if (!current()) return;
             if (data && data.url) {
@@ -154,7 +157,10 @@ async function openStream(session, startTicks) {
     session.startAt = startSeconds;
     session.isHls = isHls;
     session.playSessionId = playSessionId;
-    session.mediaSourceId = mediaSourceId || session.mediaSourceId;
+    // Universal lists every version, the first one first: the requested version stays the session's
+    session.mediaSourceId = session.mediaSourceId || mediaSourceId;
+    session.playMethod = isHls ? 'Transcode' : (url.includes('Static=true') ? 'DirectPlay' : 'DirectStream');
+    updateQualityTag();
     session.burnedIn = isHls && isImageSubtitle(findStream(session, 'subtitle', requestedSubtitle)?.Codec);
 
     video.onerror = () => {
@@ -598,6 +604,7 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
     seekDragging = false;
     clearTextSubtitle();
     applySubtitleAppearance();
+    applyAspectRatio();
     closePlayerSettings();
     renderTrackMenus(null);
     resetEpisodeNav();
@@ -738,6 +745,7 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
     };
     activePlayback = session;
     session.trickplay = trickplayInfo(item, session.mediaSourceId);
+    renderChapters(session);
     renderTrackMenus(session);
     if (streamType === 'Videos') session.segmentsLoad = loadMediaSegments(session);
     loadEpisodeNav(session, item);
@@ -772,6 +780,9 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
         const slider = $('player-vol');
         if (slider) slider.value = video.volume;
     };
+
+    // An item without a runtime gets its chapter marks once the stream's length is known
+    video.ondurationchange = () => { if (activePlayback === session && !session.runtime) renderChapters(session); };
 
     video.onended = () => {
         if (activePlayback !== session) return;
@@ -1493,6 +1504,12 @@ function showTrickplay(percent) {
         img.style.backgroundPosition = `-${thumb.x}px -${thumb.y}px`;
     }
     $('player-trickplay-time').textContent = formatDurationSeconds(seconds);
+    const chapter = chapterAt(session.chapters, seconds);
+    const name = $('player-trickplay-chapter');
+    if (name) {
+        name.textContent = chapter?.Name || '';
+        name.hidden = !chapter?.Name;
+    }
     bubble.style.left = `${Math.min(Math.max(percent, 0), 100)}%`;
     bubble.hidden = false;
 }
@@ -1509,6 +1526,73 @@ function hoverSeek(e) {
     showTrickplay(Math.min(Math.max((e.clientX - rect.left) / rect.width, 0), 1) * 100);
 }
 
+// --- Chapters: marks on the seek bar, the chapters menu, and the chapter's name over the seek preview ---
+function chapterStart(c) {
+    return (c.StartPositionTicks ?? c.StartTicks ?? 0) / 1e7;
+}
+
+// The chapter playing at seconds: the last one that started by then
+function chapterAt(chapters, seconds) {
+    let found = null;
+    for (const c of [...(chapters || [])].sort((a, b) => chapterStart(a) - chapterStart(b))) {
+        if (chapterStart(c) <= seconds) found = c;
+    }
+    return found;
+}
+
+// A mark at each chapter start after the first, as Jellyfin Web's seek bar shows them; the menu for two or more
+function renderChapters(session) {
+    const chapters = [...(session?.chapters || [])].sort((a, b) => chapterStart(a) - chapterStart(b));
+    const total = session ? session.total() : 0;
+    const marks = $('player-chapter-marks');
+    if (marks) {
+        marks.replaceChildren(...(total > 0 ? chapters.filter(c => chapterStart(c) > 0 && chapterStart(c) < total) : []).map(c => {
+            const mark = document.createElement('span');
+            mark.className = 'jf-chapter-mark';
+            mark.style.left = `${chapterStart(c) / total * 100}%`;
+            return mark;
+        }));
+    }
+    const list = $('player-chapters-list');
+    if (list) {
+        list.replaceChildren(...chapters.map((c, i) => {
+            const button = document.createElement('button');
+            button.type = 'button';
+            button.className = 'jf-chapter-item';
+            const name = document.createElement('span');
+            name.className = 'truncate';
+            name.textContent = c.Name || t('player.chapter_number', { number: i + 1 });
+            const time = document.createElement('span');
+            time.className = 'font-mono text-white/60';
+            time.textContent = formatDurationSeconds(chapterStart(c));
+            button.append(name, time);
+            button.onclick = () => playChapter(chapterStart(c));
+            return button;
+        }));
+    }
+    const menu = $('player-chapters');
+    if (menu) {
+        menu.hidden = chapters.length < 2;
+        if (menu.hidden) menu.open = false;
+    }
+}
+
+// Marks the chapter playing now when the menu opens
+function renderChapterMenu(open) {
+    const session = activePlayback;
+    if (!open || !session) return;
+    const chapters = [...session.chapters].sort((a, b) => chapterStart(a) - chapterStart(b));
+    const current = chapterAt(chapters, session.position());
+    const buttons = $('player-chapters-list')?.children || [];
+    chapters.forEach((c, i) => buttons[i]?.setAttribute('aria-current', String(c === current)));
+}
+
+function playChapter(seconds) {
+    const menu = $('player-chapters');
+    if (menu) menu.open = false;
+    if (activePlayback) seekTo(activePlayback, seconds);
+}
+
 // --- The settings menu (the gear): fills its fields from the playback and the stored settings when it opens ---
 function renderPlayerSettings(open) {
     if (!open) return;
@@ -1520,17 +1604,109 @@ function renderPlayerSettings(open) {
     const offset = $('player-subtitle-offset');
     if (offset) offset.textContent = formatOffset(activePlayback?.subtitleOffset || 0);
     applySubtitleAppearance();
+    renderPlaybackSettings(activePlayback);
 }
 
+// --- Quality, version and aspect ratio: the menu's Playback section ---
+// The source's video bitrate, which bounds the quality steps offered
+function sourceVideoBitrate(session) {
+    const video = session.streams.find(s => isStreamType(s, 'video'));
+    const source = session.sources.find(s => s.Id === session.mediaSourceId);
+    return video?.BitRate || source?.Bitrate || 0;
+}
+
+function renderPlaybackSettings(session) {
+    const isVideo = !!session && session.streamType === 'Videos';
+    const quality = $('player-quality');
+    if (quality) {
+        const video = session?.streams.find(s => isStreamType(s, 'video'));
+        const steps = isVideo ? qualityOptions(sourceVideoBitrate(session), video?.Codec) : [0];
+        const current = maxStreamingBitrate();
+        // A limit chosen for another item stays, and shows, even where this item lists no such step
+        if (!steps.includes(current)) steps.push(current);
+        quality.replaceChildren(...steps.map(b => new Option(b ? bitrateLabel(b) : t('player.quality_auto'), b)));
+        quality.value = String(current);
+    }
+    const sources = isVideo ? session.sources : [];
+    const version = $('player-version');
+    if (version) {
+        const labels = versionLabels(sources);
+        version.replaceChildren(...sources.map((s, i) => new Option(labels[i], s.Id)));
+        version.value = session?.mediaSourceId || '';
+    }
+    const show = (id, on) => { const row = $(id); if (row) row.hidden = !on; };
+    show('player-quality-row', isVideo);
+    show('player-version-row', sources.length > 1);
+    show('player-aspect-row', isVideo);
+    const aspect = $('player-aspect');
+    if (aspect) aspect.value = aspectRatio();
+}
+
+// The top bar's tag: how the item plays and the quality limit
+function updateQualityTag() {
+    const tag = $('player-quality-tag');
+    const session = activePlayback;
+    if (!tag) return;
+    tag.hidden = !session || session.streamType !== 'Videos';
+    const limit = maxStreamingBitrate();
+    tag.textContent = limit ? bitrateLabel(limit) : t('player.quality_auto');
+}
+
+// A new quality limit restarts the stream at the same point, as Jellyfin Web does
+function changeQuality(value) {
+    setMaxStreamingBitrate(Number(value));
+    updateQualityTag();
+    const session = activePlayback;
+    if (!session || session.streamType !== 'Videos') return;
+    session.tracksChanged = true;
+    scheduleRestart(session, session.position());
+}
+
+// Another version plays from the same point, keeping the audio and subtitle languages where it has them
+function changeVersion(id) {
+    const session = activePlayback;
+    const source = session?.sources.find(s => s.Id === id);
+    if (!source || id === session.mediaSourceId) return;
+    const carry = episodeTrackCarry(session);
+    const position = session.position();
+    session.mediaSourceId = id;
+    session.streams = source.MediaStreams || [];
+    const defaults = defaultTracks(source, session.prefs);
+    ({ audioIndex: session.audioIndex, subtitleIndex: session.subtitleIndex } = carriedTracks(session.streams, carry,
+        defaults.audioIndex, defaults.subtitleIndex, defaults.subtitleFromServer, session.prefs));
+    session.trickplay = trickplayInfo(session.item, id);
+    clearTextSubtitle();
+    renderTrackMenus(session);
+    renderPlaybackSettings(session);
+    session.tracksChanged = true;
+    scheduleRestart(session, position);
+}
+
+function applyAspectRatio() {
+    const video = $('video-player');
+    const value = aspectRatio();
+    if (video) video.style.objectFit = value === 'auto' ? '' : value;
+}
+
+function changeAspectRatio(value) {
+    setAspectRatio(value);
+    applyAspectRatio();
+}
+
+const PLAYER_MENUS = ['player-settings', 'player-chapters'];
 function closePlayerSettings() {
-    const menu = $('player-settings');
-    if (menu) menu.open = false;
+    for (const id of PLAYER_MENUS) {
+        const menu = $(id);
+        if (menu) menu.open = false;
+    }
 }
 
-// A click or tap outside the open menu closes it
+// A click or tap outside an open menu closes it
 document.addEventListener('pointerdown', e => {
-    const menu = $('player-settings');
-    if (menu?.open && !menu.contains(e.target)) menu.open = false;
+    for (const id of PLAYER_MENUS) {
+        const menu = $(id);
+        if (menu?.open && !menu.contains(e.target)) menu.open = false;
+    }
 });
 
 function toggleFullscreen() {
@@ -1577,7 +1753,7 @@ export {
     changeSubtitleTrack, playItem, playerAutoHide, onPlayerClosed, playerAreaClick, closePlayer, playAdjacentEpisode,
     playUpNextNow, cancelUpNext, togglePlayPause, setVolume, toggleMute, setPlaybackRate, toggleFullscreen,
     togglePictureInPicture, skipSegment, hoverSeek, hideTrickplay, renderPlayerSettings, setSubtitleAppearance,
-    changeSubtitleOffset,
+    changeSubtitleOffset, changeQuality, changeVersion, changeAspectRatio, renderChapterMenu,
 };
 
 // Shared state that inline handlers or other modules assign: reached through window

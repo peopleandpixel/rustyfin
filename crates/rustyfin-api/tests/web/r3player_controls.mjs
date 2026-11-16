@@ -52,7 +52,8 @@ function sandbox(heads, globals = {}, prelude = '') {
 }
 
 // --- Trickplay ---
-const TRICKPLAY = ['function trickplayInfo(', 'function trickplayThumb(', 'function showTrickplay(', 'function hideTrickplay(', 'function hoverSeek('];
+const TRICKPLAY = ['function trickplayInfo(', 'function trickplayThumb(', 'function showTrickplay(', 'function hideTrickplay(', 'function hoverSeek(',
+    'function chapterStart(', 'function chapterAt('];
 const sets = {
     160: { Width: 160, Height: 90, TileWidth: 10, TileHeight: 10, ThumbnailCount: 250, Interval: 10000 },
     320: { Width: 320, Height: 180, TileWidth: 10, TileHeight: 10, ThumbnailCount: 250, Interval: 10000 },

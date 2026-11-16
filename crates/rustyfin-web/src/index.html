@@ -527,8 +527,11 @@
                     <!-- Trickplay thumbnail and time over the point being dragged or hovered -->
                     <div id="player-trickplay" class="absolute bottom-full mb-3 -translate-x-1/2 pointer-events-none flex flex-col items-center gap-1" hidden>
                         <div id="player-trickplay-img" class="rounded border border-white/20 bg-black bg-no-repeat shadow-2xl" hidden></div>
+                        <span id="player-trickplay-chapter" class="text-xs text-white bg-black/70 rounded px-1.5 py-0.5 max-w-60 truncate" hidden></span>
                         <span id="player-trickplay-time" class="text-xs font-mono text-white bg-black/70 rounded px-1.5 py-0.5"></span>
                     </div>
+                    <!-- Chapter starts on the seek bar -->
+                    <div id="player-chapter-marks" class="jf-chapter-marks" aria-hidden="true"></div>
                     <input id="player-seek" type="range" min="0" max="100" value="0" step="0.1" class="w-full range range-xs range-primary accent-[#00a4dc] cursor-pointer"
                            oninput="previewSeek(this.value)" onchange="seekVideo(this.value)" onpointerup="seekDragging = false" onpointercancel="seekDragging = false"
                            onpointerdown="hoverSeek(event)" onpointermove="hoverSeek(event)" onpointerleave="if (!seekDragging) hideTrickplay()">
@@ -576,12 +579,38 @@
                         <i data-lucide="captions" class="w-4 h-4 shrink-0"></i>
                         <select id="player-subs" class="bg-white/10 text-xs text-white rounded px-2 py-1 outline-none border border-white/10 focus-visible:ring-2 focus-visible:ring-[#00a4dc] max-sm:absolute max-sm:inset-0 max-sm:w-full max-sm:opacity-0 sm:max-w-56" title="Choose subtitles" aria-label="Choose subtitles" data-i18n-title="player.choose_subtitles" data-i18n-aria-label="player.choose_subtitles" onchange="changeSubtitleTrack(this.value)"></select>
                     </label>
+                    <!-- Chapters: items with two or more -->
+                    <details id="player-chapters" class="relative" ontoggle="renderChapterMenu(this.open)" hidden>
+                        <summary class="jf-icon-btn list-none cursor-pointer" title="Chapters" aria-label="Chapters" data-i18n-title="player.chapters" data-i18n-aria-label="player.chapters">
+                            <i data-lucide="list" class="w-5 h-5"></i>
+                        </summary>
+                        <div class="jf-player-menu !gap-1">
+                            <h3 class="jf-player-menu-heading" data-i18n="player.chapters">Chapters</h3>
+                            <div id="player-chapters-list" class="flex flex-col gap-0.5"></div>
+                        </div>
+                    </details>
                     <!-- Player settings: a menu that keeps the bars up while it is open -->
                     <details id="player-settings" class="relative" ontoggle="renderPlayerSettings(this.open)">
                         <summary class="jf-icon-btn list-none cursor-pointer" title="Settings" aria-label="Settings" data-i18n-title="player.settings" data-i18n-aria-label="player.settings">
                             <i data-lucide="settings" class="w-5 h-5"></i>
                         </summary>
                         <div class="jf-player-menu">
+                            <section id="player-settings-playback" class="space-y-2">
+                                <h3 class="jf-player-menu-heading" data-i18n="player.playback">Playback</h3>
+                                <label id="player-quality-row" class="jf-player-menu-row"><span data-i18n="player.quality">Quality</span>
+                                    <select id="player-quality" class="jf-player-menu-select" onchange="changeQuality(this.value)"></select>
+                                </label>
+                                <label id="player-version-row" class="jf-player-menu-row" hidden><span data-i18n="player.version">Version</span>
+                                    <select id="player-version" class="jf-player-menu-select" onchange="changeVersion(this.value)"></select>
+                                </label>
+                                <label id="player-aspect-row" class="jf-player-menu-row"><span data-i18n="player.aspect_ratio">Aspect ratio</span>
+                                    <select id="player-aspect" class="jf-player-menu-select" onchange="changeAspectRatio(this.value)">
+                                        <option value="auto" data-i18n="player.aspect_auto">Auto</option>
+                                        <option value="cover" data-i18n="player.aspect_cover">Zoom</option>
+                                        <option value="fill" data-i18n="player.aspect_fill">Stretch</option>
+                                    </select>
+                                </label>
+                            </section>
                             <section id="player-settings-subtitles" class="space-y-2">
                                 <h3 class="jf-player-menu-heading" data-i18n="player.subtitles">Subtitles</h3>
                                 <div class="jf-player-menu-row">

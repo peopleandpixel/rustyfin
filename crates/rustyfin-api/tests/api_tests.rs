@@ -23357,6 +23357,12 @@ fn r3playercore_playback() {
     b124_node_test("r3playercore_playback.mjs");
 }
 
+// R3 core player: chapter marks on the seek bar, the chapters menu and the chapter name over the seek preview
+#[test]
+fn r3playercore_chapters() {
+    b124_node_test("r3playercore_chapters.mjs");
+}
+
 // The web client's item page: credits, ratings, media info, track pickers, chapters, links, "mark all
 // played" and delete (tests/web/r3item_detail.mjs), and the pickers' choice in the player
 // (tests/web/r3item_play.mjs)

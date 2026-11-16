@@ -996,8 +996,45 @@ select.jf-input {
   gap: 0.75rem;
 }
 
-#player-settings > summary::-webkit-details-marker {
+#player-settings > summary::-webkit-details-marker,
+#player-chapters > summary::-webkit-details-marker {
   display: none;
+}
+
+/* Chapter starts over the seek bar's track; the bar takes the pointer */
+.jf-chapter-marks {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 1;
+}
+
+.jf-chapter-mark {
+  position: absolute;
+  top: 50%;
+  width: 3px;
+  height: 0.6rem;
+  border-radius: 1px;
+  background: rgba(255, 255, 255, 0.75);
+  transform: translate(-50%, -50%);
+}
+
+.jf-chapter-item {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.75rem;
+  border-radius: 0.375rem;
+  padding: 0.35rem 0.5rem;
+  text-align: left;
+}
+
+.jf-chapter-item:hover,
+.jf-chapter-item:focus-visible {
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.jf-chapter-item[aria-current="true"] {
+  color: #38bdf8;
 }
 
 .jf-player-menu-heading {
