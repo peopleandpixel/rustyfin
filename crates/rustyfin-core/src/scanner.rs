@@ -1063,20 +1063,34 @@ async fn scan_flat_library(
         }
     }
 
-    // An extra belongs to the movie next to it: one whose owner folder holds no movie video of its own (the
-    // `Featurettes/` of a folder that only groups other folders) is a movie file like any other, and a stored
-    // extra there becomes a movie again, keeping its id.
+    // An extra belongs to a movie next to it on disk (`extras::owning_group`). One with no such movie (the
+    // `Featurettes/` of a folder that only groups other folders, or `B-short.mkv` among several films that
+    // it doesn't name) is a movie file like any other, and a stored extra there becomes a movie again,
+    // keeping its id.
+    let is_root = |folder: &Path| library.paths.iter().any(|p| Path::new(p) == folder);
+    let folder_groups: HashMap<PathBuf, Vec<naming::VersionGroup>> = movie_files
+        .iter()
+        .map(|(folder, files)| {
+            let groups = naming::group_movie_files(folder, files, is_root(folder));
+            (folder.clone(), groups)
+        })
+        .collect();
     let movie_folders: HashSet<PathBuf> = movie_files.keys().cloned().collect();
     let mut released: Vec<String> = Vec::new();
     let mut owned_extras: Vec<extras::FoundExtra> = Vec::new();
     let unowned_files = found_extras
         .into_iter()
-        .filter_map(|extra| {
-            if movie_folders.contains(&extra.owner_dir) {
-                owned_extras.push(extra);
-                None
-            } else {
-                Some(extra.path)
+        .filter_map(|mut extra| {
+            let owner = folder_groups
+                .get(&extra.owner_dir)
+                .and_then(|groups| extras::owning_group(&extra, groups, is_root(&extra.owner_dir)));
+            match owner {
+                Some(group) => {
+                    extra.owner_paths = group.files.clone();
+                    owned_extras.push(extra);
+                    None
+                }
+                None => Some(extra.path),
             }
         })
         .chain(
@@ -1098,14 +1112,8 @@ async fn scan_flat_library(
         }
     }
     let found_extras = owned_extras;
-    if let Err(e) =
-        rustyfin_db::repo_extras::release_extras(pool, library.id, &released, "Movie").await
-    {
-        tracing::error!(
-            "failed to make the extras of '{}' movies again: {e}",
-            library.name
-        );
-    }
+    // A failure here stops the scan: the reconcile would otherwise add a second movie at the same path.
+    rustyfin_db::repo_extras::release_extras(pool, library.id, &released, "Movie").await?;
 
     // Group the movie files of each folder into movies, then reconcile them with the items
     let mut movie_groups: Vec<naming::VersionGroup> = Vec::new();
@@ -1319,7 +1327,9 @@ async fn scan_tv_library(
         for file_path_buf in files {
             scanned_files += 1;
             match extras::classify_tv_file(&file_path_buf, path) {
-                extras::Classified::Extra(found) => {
+                extras::Classified::Extra(mut found) => {
+                    // The series or season folder; it owns the extra once it is stored.
+                    found.owner_paths = vec![found.owner_dir.clone()];
                     found_extras.push(found);
                     continue;
                 }

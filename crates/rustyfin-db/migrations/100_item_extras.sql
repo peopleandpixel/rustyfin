@@ -4,8 +4,9 @@
 -- ThemeVideo, BehindTheScenes, DeletedScene, Interview, Scene, Sample, Short, Featurette, Clip,
 -- Unknown); NULL for every other item.
 -- `owner_id` has no foreign key (SQLite can't add one with ALTER TABLE): the code keeps it valid.
--- Deleting an item deletes its extras (repo_media::delete_item_rows_in), and each scan sets every
--- extra's owner again (rustyfin_core::extras).
+-- Deleting an item detaches its extras (repo_media::delete_item_rows_in sets their owner_id to NULL;
+-- their files are still there), and each scan sets every extra's owner again from the files on disk
+-- or reads it as a library item (rustyfin_core::extras).
 ALTER TABLE media_items ADD COLUMN extra_type TEXT;
 ALTER TABLE media_items ADD COLUMN owner_id TEXT;
 

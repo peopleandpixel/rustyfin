@@ -7,7 +7,7 @@
 //! and the rest). Shows: the extras folders of a series or season folder, and `theme.mp3` and `trailer.mkv`
 //! in it. A show's `Extras` folder stays its specials season (`naming::is_specials_folder`).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use rustyfin_db::repo_extras;
@@ -30,6 +30,9 @@ pub struct FoundExtra {
     pub kind: ExtraKind,
     /// The owner's name that a suffix names (`Movie (2020)` in `Movie (2020)-trailer.mkv`), else empty.
     pub owner_name: String,
+    /// The paths its owner may be stored at, set by the scan from what is on disk: the files of the movie it
+    /// belongs to, or the series or season folder. Empty: it has no owner.
+    pub owner_paths: Vec<PathBuf>,
 }
 
 /// What a file is to a scan.
@@ -76,6 +79,7 @@ fn in_extras_dir(file: &Path, owner_dir: &Path, kind: ExtraKind) -> Classified {
         owner_dir: owner_dir.to_path_buf(),
         kind,
         owner_name: String::new(),
+        owner_paths: Vec::new(),
     })
 }
 
@@ -88,6 +92,7 @@ fn by_name(file: &Path, owner_dir: &Path, suffixes: bool) -> Classified {
             owner_dir: owner_dir.to_path_buf(),
             kind: ExtraKind::ThemeSong,
             owner_name: String::new(),
+            owner_paths: Vec::new(),
         });
     }
     if !is_video(file) {
@@ -100,6 +105,7 @@ fn by_name(file: &Path, owner_dir: &Path, suffixes: bool) -> Classified {
                 owner_dir: owner_dir.to_path_buf(),
                 kind,
                 owner_name,
+                owner_paths: Vec::new(),
             })
         }
         _ => Classified::No,
@@ -160,30 +166,55 @@ pub fn classify_tv_file(file: &Path, root: &Path) -> Classified {
     Classified::No
 }
 
-/// The owner of `extra` among the items in its folder (`candidates`: id and lower-case file stem, in path
-/// order). A suffix's name picks the item whose file stem is that name, else the first whose stem starts with
-/// it; otherwise the first item owns it.
-fn pick_owner<'a>(candidates: &'a [(String, String)], extra: &FoundExtra) -> Option<&'a str> {
-    let wanted = extra.owner_name.trim().to_lowercase();
-    if !wanted.is_empty()
-        && let Some((id, _)) = candidates
-            .iter()
-            .find(|(_, stem)| *stem == wanted)
-            .or_else(|| {
-                candidates
-                    .iter()
-                    .find(|(_, stem)| stem.starts_with(&wanted))
-            })
-    {
-        return Some(id);
+/// The movie that `extra` belongs to among the movies its folder holds on disk (`groups`, as
+/// `naming::group_movie_files` makes them; `is_root` as given to it).
+///
+/// - A folder-wide extra (`trailer.mkv`, `theme.mp3`, an extras folder) belongs to the folder's movie when it
+///   holds exactly one, as in Jellyfin; among several it belongs to none.
+/// - A suffix file (`Name-trailer.mkv`) belongs only to the movie it names: the one with a file of exactly
+///   that name, else the one whose title and year the name reads as. This is stricter than Jellyfin, which
+///   gives a suffix file in a one-movie folder to that movie whatever its name; here a real film named like
+///   `B-short.mkv` is never handed to another film, however many films its folder holds.
+///
+/// A file with no owner here is read by the scan as a movie of its own.
+pub fn owning_group<'a>(
+    extra: &FoundExtra,
+    groups: &'a [naming::VersionGroup],
+    is_root: bool,
+) -> Option<&'a naming::VersionGroup> {
+    let name = extra.owner_name.trim();
+    match groups {
+        [] => None,
+        [only] if name.is_empty() => Some(only),
+        _ if name.is_empty() => None,
+        _ => {
+            let lower = name.to_lowercase();
+            let stem_is = |file: &PathBuf| {
+                file.file_stem()
+                    .is_some_and(|s| s.to_string_lossy().to_lowercase() == lower)
+            };
+            if let Some(group) = groups.iter().find(|g| g.files.iter().any(stem_is)) {
+                return Some(group);
+            }
+            let named = naming::group_movie_files(
+                &extra.owner_dir,
+                &[extra.owner_dir.join(format!("{name}.mkv"))],
+                is_root,
+            );
+            let wanted = named.first()?;
+            groups
+                .iter()
+                .find(|g| g.title.eq_ignore_ascii_case(&wanted.title) && g.year == wanted.year)
+        }
     }
-    candidates.first().map(|(id, _)| id.as_str())
 }
 
-/// Stores the extras that a scan of `library` found in `scope`: each gets the owner its folder and name give
-/// it. A new extra is added, with a probe plan in the result; a stored item at an extra's path (an extra, or a
-/// movie that an older scan made of a trailer) is updated; and an extra that has no owner is deleted. The
-/// items whose files are gone are the removal's (`scan_sync::remove_not_collected`).
+/// Stores the extras that a scan of `library` found in `scope`. Each one's owner is the stored movie, series
+/// or season at one of its `owner_paths` (files and folders the scan just found, so a stale row whose file is
+/// gone never owns anything). A new extra is added, with a probe plan in the result; a stored item at an
+/// extra's path (an extra, or a movie that an older scan made of a trailer) is updated. An extra with no
+/// stored owner is left as it is: this never deletes a row. The items whose files are gone are the removal's
+/// (`scan_sync::remove_not_collected`).
 pub async fn sync_extras(
     pool: &SqlitePool,
     library: &Library,
@@ -194,27 +225,14 @@ pub async fn sync_extras(
     if found.is_empty() {
         return Ok(plans);
     }
-    // An item stored at an extra's own path (a trailer that an older scan read as a movie) owns nothing.
-    let extra_paths: HashSet<&Path> = found.iter().map(|e| e.path.as_path()).collect();
-    let mut owners: HashMap<PathBuf, Vec<(String, String)>> = HashMap::new();
-    for row in repo_extras::owner_candidates(pool, library.id).await? {
-        let path = Path::new(&row.path);
-        if extra_paths.contains(path) {
-            continue;
-        }
-        let (dir, stem) = if row.media_type == "Movie" {
-            let stem = path
-                .file_stem()
-                .map(|s| s.to_string_lossy().to_lowercase())
-                .unwrap_or_default();
-            (path.parent().map(Path::to_path_buf), stem)
-        } else {
-            (Some(path.to_path_buf()), String::new())
-        };
-        if let Some(dir) = dir {
-            owners.entry(dir).or_default().push((row.id, stem));
-        }
-    }
+    let owner_paths: Vec<String> = found
+        .iter()
+        .flat_map(|e| e.owner_paths.iter())
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    let owners = repo_extras::owners_at(pool, library.id, &owner_paths).await?;
     let stored = repo_extras::items_by_path(pool, library.id, scope).await?;
 
     let mut new_items: Vec<(MediaItem, String, &'static str)> = Vec::new();
@@ -224,9 +242,11 @@ pub async fn sync_extras(
             continue;
         }
         let path = extra.path.to_string_lossy().into_owned();
-        let owner = owners
-            .get(&extra.owner_dir)
-            .and_then(|candidates| pick_owner(candidates, extra));
+        let owner = extra
+            .owner_paths
+            .iter()
+            .find_map(|p| owners.get(p.to_string_lossy().as_ref()))
+            .map(String::as_str);
         let kind = extra.kind.as_str();
         let media_type = if extra.kind.is_audio() {
             MediaType::Audio
@@ -247,6 +267,12 @@ pub async fn sync_extras(
             (Some(owner), Some(row)) => {
                 if row.extra_type.as_deref() != Some(kind) || row.owner_id.as_deref() != Some(owner)
                 {
+                    if row.extra_type.is_none() {
+                        // A movie or episode that an older scan made of this file leaves the listings.
+                        tracing::info!(
+                            "{path} is now a {kind} extra of item {owner}; it was a library item"
+                        );
+                    }
                     repo_extras::set_extra(
                         pool,
                         &row.id,
@@ -309,6 +335,7 @@ mod tests {
             owner_dir: PathBuf::from(owner_dir),
             kind,
             owner_name: owner_name.to_string(),
+            owner_paths: Vec::new(),
         })
     }
 
@@ -450,29 +477,42 @@ mod tests {
     }
 
     #[test]
-    fn r3extras_a_suffix_picks_its_movie_and_a_folder_extra_the_only_one() {
-        let one = vec![("a".to_string(), "movie (2020)".to_string())];
-        let two = vec![
-            ("a".to_string(), "alpha".to_string()),
-            ("b".to_string(), "beta".to_string()),
-        ];
-        let found = |name: &str| FoundExtra {
-            path: PathBuf::from("/x"),
-            owner_dir: PathBuf::from("/"),
-            kind: ExtraKind::Trailer,
-            owner_name: name.to_string(),
+    fn r3extras_an_extra_goes_to_the_only_movie_or_the_one_its_suffix_names() {
+        let dir = Path::new("/m/Films");
+        let groups = |names: &[&str]| {
+            let files: Vec<PathBuf> = names.iter().map(|n| dir.join(n)).collect();
+            naming::group_movie_files(dir, &files, false)
         };
-        assert_eq!(pick_owner(&one, &found("Movie (2020)")), Some("a"));
-        assert_eq!(pick_owner(&one, &found("Other")), Some("a"));
-        assert_eq!(pick_owner(&two, &found("Beta")), Some("b"));
-        assert_eq!(pick_owner(&two, &found("Gamma")), Some("a"));
-        assert_eq!(pick_owner(&two, &found("")), Some("a"));
-        assert_eq!(pick_owner(&[], &found("")), None);
-        // The exact name wins over a longer one that sorts first.
-        let versions = vec![
-            ("cut".to_string(), "movie (2020)-directors cut".to_string()),
-            ("m".to_string(), "movie (2020)".to_string()),
-        ];
-        assert_eq!(pick_owner(&versions, &found("Movie (2020)")), Some("m"));
+        let found = |name: &str| FoundExtra {
+            path: dir.join("x.mkv"),
+            owner_dir: dir.to_path_buf(),
+            kind: ExtraKind::Short,
+            owner_name: name.to_string(),
+            owner_paths: Vec::new(),
+        };
+        let owner = |groups: &[naming::VersionGroup], name: &str| {
+            owning_group(&found(name), groups, false).map(|g| g.title.clone())
+        };
+        // One movie owns the folder-wide extras next to it, and the suffix files that name it.
+        let one = groups(&["Movie (2020) 1080p.mkv"]);
+        assert_eq!(owner(&one, ""), Some("Movie".to_string()));
+        assert_eq!(owner(&one, "Movie (2020)"), Some("Movie".to_string()));
+        assert_eq!(
+            owner(&one, "Other"),
+            None,
+            "Other-short.mkv is a film of its own"
+        );
+        assert_eq!(owner(&[], ""), None);
+        // Several: only a name that is one of them picks it, by file stem or by title and year.
+        let several = groups(&["A.mkv", "C.mkv", "Beta (2001) 1080p.mkv"]);
+        assert_eq!(owner(&several, "A"), Some("A".to_string()));
+        assert_eq!(owner(&several, "beta (2001)"), Some("Beta".to_string()));
+        // B-short.mkv next to A.mkv and C.mkv is a film of its own, not A's extra.
+        assert_eq!(owner(&several, "B"), None);
+        assert_eq!(
+            owner(&several, ""),
+            None,
+            "trailer.mkv belongs to no one of several"
+        );
     }
 }

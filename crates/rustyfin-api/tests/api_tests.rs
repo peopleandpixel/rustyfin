@@ -16820,15 +16820,31 @@ async fn r3extras_movie_extras_are_found_listed_and_kept_out_of_the_library() {
     let (_, item) = send_authed(&app, "GET", &format!("/Items/{movie}"), &token, None).await;
     assert_eq!(item["SpecialFeatureCount"], 2, "{item}");
 
-    // Deleting the movie deletes its extras.
+    // Deleting the movie detaches its extras (their files are still there), and the next scan, which finds
+    // the movie again, gives them back to it.
     let (status, _) = send_authed(&app, "DELETE", &format!("/Items/{movie}"), &token, None).await;
     assert!(status.is_success(), "{status}");
-    let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM media_items WHERE owner_id = ?")
-        .bind(&movie)
-        .fetch_one(&state.db)
+    let (owned, detached): (i64, i64) = sqlx::query_as(
+        "SELECT SUM(owner_id = ?1), SUM(owner_id IS NULL AND extra_type IS NOT NULL) FROM media_items",
+    )
+    .bind(&movie)
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    assert_eq!(
+        (owned, detached),
+        (0, 5),
+        "the extras are kept, without an owner"
+    );
+    rustyfin_core::scanner::scan_library(&state.db, &lib)
         .await
         .unwrap();
-    assert_eq!(left, 0);
+    rustyfin_core::scanner::wait_for_idle().await;
+    let again = j5_movie_ids(&state).await;
+    assert_eq!(again.len(), 1);
+    let (_, item) = send_authed(&app, "GET", &format!("/Items/{}", again[0]), &token, None).await;
+    assert_eq!(item["LocalTrailerCount"], 1, "{item}");
+    assert_eq!(item["SpecialFeatureCount"], 2, "{item}");
 }
 
 /// Creates a movie library on `media/<name>` holding `files` (paths in it; `.mp3` is audio), scans it and waits
@@ -17039,21 +17055,112 @@ async fn r3extras_parental_limits_and_deletes_reach_extras() {
         send_authed(&app, "GET", &format!("/Items/{mild_trailer}"), &token, None).await;
     assert_eq!(status, StatusCode::OK);
 
-    // The scan's removal of the movie removes its trailer too.
+    // The scan's removal of the movie detaches its trailer, whose file is still there; it isn't deleted.
     assert!(
         rustyfin_core::scan_sync::delete_item(&state.db, &rough)
             .await
             .unwrap()
     );
-    let left: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM media_items WHERE id = ? OR owner_id = ?")
+    let trailer: Vec<(Option<String>, Option<String>)> =
+        sqlx::query_as("SELECT owner_id, extra_type FROM media_items WHERE id = ?")
             .bind(&rough_trailer)
-            .bind(&rough)
-            .fetch_one(&state.db)
+            .fetch_all(&state.db)
             .await
             .unwrap();
-    assert_eq!(left, 0);
+    assert_eq!(trailer, [(None, Some("Trailer".to_string()))]);
     let _ = lib;
+}
+
+/// Regression: in a folder of several films, `B-short.mkv` names none of them, so it is a film of its own and
+/// not an extra of the first; when another film's file goes, or another film is deleted through the API, B
+/// keeps its item and user data. A suffix that names a film (`A-trailer.mkv`) is that film's extra, and
+/// deleting the film detaches it rather than deleting it.
+#[tokio::test]
+async fn r3extras_a_film_in_a_folder_of_several_is_never_lost() {
+    let state = test_state().await;
+    let Some((lib, root)) = r3extras_library(
+        &state,
+        "r3extras shelf",
+        &[
+            "Shelf/A.mkv",
+            "Shelf/B-short.mkv",
+            "Shelf/C.mkv",
+            "Shelf/A-trailer.mkv",
+        ],
+    )
+    .await
+    else {
+        return;
+    };
+    let id_at = |name: &'static str| {
+        let db = state.db.clone();
+        async move {
+            sqlx::query_as::<_, (String, String, Option<String>)>(
+                "SELECT id, media_type, owner_id FROM media_items WHERE name = ?",
+            )
+            .bind(name)
+            .fetch_all(&db)
+            .await
+            .unwrap()
+        }
+    };
+    let a = id_at("A").await[0].0.clone();
+    let b = id_at("B-short").await;
+    assert_eq!(b.len(), 1);
+    assert_eq!(
+        (b[0].1.as_str(), b[0].2.as_deref()),
+        ("Movie", None),
+        "B is a film"
+    );
+    let b = b[0].0.clone();
+    let trailer = id_at("A-trailer").await;
+    assert_eq!(
+        trailer[0].2.as_deref(),
+        Some(a.as_str()),
+        "A-trailer is A's"
+    );
+    let trailer = trailer[0].0.clone();
+    let user = add_user(&state, "r3x-shelf", "pw", false).await;
+    sqlx::query("INSERT INTO user_item_data (user_id, item_id, played) VALUES (?, ?, 1)")
+        .bind(user.to_string())
+        .bind(&b)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    let b_kept = || {
+        let db = state.db.clone();
+        let b = b.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM media_items m JOIN user_item_data u ON u.item_id = m.id \
+                 WHERE m.id = ? AND m.media_type = 'Movie' AND m.extra_type IS NULL",
+            )
+            .bind(&b)
+            .fetch_one(&db)
+            .await
+            .unwrap()
+        }
+    };
+
+    // A's file goes: the scan removes A, and B and its user data stay.
+    std::fs::remove_file(root.join("Shelf/A.mkv")).unwrap();
+    r3extras_rescan(&state, &lib).await;
+    assert!(id_at("A").await.is_empty(), "A is gone");
+    assert_eq!(b_kept().await, 1, "B keeps its item and user data");
+    // A's trailer, with no film left to belong to among several, is a film of its own now, same id.
+    let now = id_at("A-trailer").await;
+    assert_eq!(
+        (now[0].0.as_str(), now[0].1.as_str(), now[0].2.as_deref()),
+        (trailer.as_str(), "Movie", None)
+    );
+
+    // C deleted through the API: B stays.
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let c = id_at("C").await[0].0.clone();
+    let (status, _) = send_authed(&app, "DELETE", &format!("/Items/{c}"), &token, None).await;
+    assert!(status.is_success(), "{status}");
+    assert_eq!(b_kept().await, 1, "B keeps its item and user data");
 }
 
 /// A show's extras folders and themes belong to its series or season; an episode's page inherits the series'

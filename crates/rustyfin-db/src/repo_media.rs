@@ -634,31 +634,22 @@ pub async fn count_children(pool: &SqlitePool, parent_id: Uuid) -> Result<i64, s
     Ok(row.0)
 }
 
-/// Deletes the item `id` on `conn`, which the caller holds in a write transaction, and its extras
-/// (the trailers, special features and themes it owns), as Jellyfin deletes an item's extras with it.
-/// It does not check for child items. These references to media_items have no ON DELETE CASCADE, so
-/// they go first. Returns whether the item's own media_items row existed.
+/// Deletes the item `id` on `conn`, which the caller holds in a write transaction. It does not
+/// check for child items. These references to media_items have no ON DELETE CASCADE, so they go
+/// first. Returns whether the media_items row existed.
+///
+/// The item's extras (the trailers, special features and themes it owns) are detached, not deleted:
+/// their files are still there (no delete removes a file), so they lose their owner and stay out of
+/// the listings until the next scan gives them an owner again or reads them as library items. An
+/// extra whose own file is gone is removed by the scan, as any item is.
 pub async fn delete_item_rows_in(
     conn: &mut SqliteConnection,
     id: &str,
 ) -> Result<bool, sqlx::Error> {
-    // Extras own nothing, so one level is all there is.
-    let extras: Vec<String> =
-        sqlx::query_scalar("SELECT id FROM media_items WHERE owner_id = ?1 AND id <> ?1")
-            .bind(id)
-            .fetch_all(&mut *conn)
-            .await?;
-    for extra in &extras {
-        delete_one_item_rows_in(conn, extra).await?;
-    }
-    delete_one_item_rows_in(conn, id).await
-}
-
-/// Deletes the item `id` and the rows that refer to it, as [`delete_item_rows_in`] does, without its extras.
-async fn delete_one_item_rows_in(
-    conn: &mut SqliteConnection,
-    id: &str,
-) -> Result<bool, sqlx::Error> {
+    sqlx::query("UPDATE media_items SET owner_id = NULL WHERE owner_id = ?1")
+        .bind(id)
+        .execute(&mut *conn)
+        .await?;
     sqlx::query("DELETE FROM pinned_episodes WHERE series_id=?1 OR episode_id=?1 OR season_id=?1")
         .bind(id)
         .execute(&mut *conn)
@@ -696,8 +687,7 @@ pub async fn delete_item(pool: &SqlitePool, id: Uuid) -> Result<bool, sqlx::Erro
         "WITH RECURSIVE tree(id, depth) AS (
             SELECT id, 0 FROM media_items WHERE id = ?1
             UNION ALL
-            SELECT m.id, t.depth + 1 FROM media_items m
-            JOIN tree t ON m.parent_id = t.id OR m.owner_id = t.id
+            SELECT m.id, t.depth + 1 FROM media_items m JOIN tree t ON m.parent_id = t.id
         )
         SELECT id, MAX(depth) AS depth FROM tree GROUP BY id ORDER BY depth DESC",
     )

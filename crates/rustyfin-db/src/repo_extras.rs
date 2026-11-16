@@ -9,35 +9,30 @@ use uuid::Uuid;
 
 use crate::repo_media::PathScope;
 
-/// A stored item that can own extras: a movie, series or season that is not an extra itself.
-pub struct OwnerRow {
-    pub id: String,
-    pub media_type: String,
-    pub path: String,
-}
-
-/// The movies, series and seasons of `library`.
-pub async fn owner_candidates(
+/// The stored movies, series and seasons of `library` at `paths` (not extras themselves), as path to id. A
+/// path held by several gives the first by id. Only these paths can own extras: the caller passes the files
+/// and folders a scan just found, so a row whose file is gone never owns anything.
+pub async fn owners_at(
     pool: &SqlitePool,
     library_id: Uuid,
-) -> Result<Vec<OwnerRow>, sqlx::Error> {
-    let rows: Vec<(String, String, String)> = sqlx::query_as(
-        "SELECT id, media_type, path FROM media_items
+    paths: &[String],
+) -> Result<HashMap<String, String>, sqlx::Error> {
+    if paths.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let paths = serde_json::to_string(paths).unwrap_or_else(|_| "[]".to_string());
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT path, MIN(id) FROM media_items
          WHERE library_id = ?1 AND extra_type IS NULL
            AND media_type IN ('Movie', 'Series', 'Season')
-         ORDER BY path, id",
+           AND path IN (SELECT value FROM json_each(?2))
+         GROUP BY path",
     )
     .bind(library_id.to_string())
+    .bind(paths)
     .fetch_all(pool)
     .await?;
-    Ok(rows
-        .into_iter()
-        .map(|(id, media_type, path)| OwnerRow {
-            id,
-            media_type,
-            path,
-        })
-        .collect())
+    Ok(rows.into_iter().collect())
 }
 
 /// A stored item of a library by its path: its id, extra type and owner.
