@@ -21,6 +21,7 @@ import {
     toggleFullscreen, togglePictureInPicture, skipSegment, hoverSeek, hideTrickplay,
 } from './modules/player.js';
 import './modules/queue.js';
+import './modules/cardmenu.js';
 import { changeNextEpisodeAutoPlay, changeUiLanguage, handleSaveConfig } from './modules/settings.js';
 import { refreshTasks, openAddUser, closeAddUser, submitAddUser, clearLiveLog, setLogLevel } from './modules/admin.js';
 import {

@@ -3240,6 +3240,7 @@ async fn b118_validate_path_admin_only_after_owner() {
 const B124_WEB_MODULES: &[&str] = &[
     "admin.js",
     "auth.js",
+    "cardmenu.js",
     "cards.js",
     "home.js",
     "item.js",
@@ -23349,6 +23350,13 @@ fn r3item_detail() {
 #[test]
 fn r3item_play() {
     b124_node_test("r3item_play.mjs");
+}
+
+// The web client's cards: badges, played, favourite and menu buttons, the context menu, likes
+// (tests/web/r3cards_cards.mjs)
+#[test]
+fn r3cards_cards() {
+    b124_node_test("r3cards_cards.mjs");
 }
 
 // The web client's autoplay switch is Jellyfin's UserConfiguration.EnableNextEpisodeAutoPlay: each

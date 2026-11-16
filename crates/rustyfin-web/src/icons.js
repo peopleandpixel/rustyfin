@@ -6,7 +6,7 @@ import {
     HardDrive, BrushCleaning, Clock, RotateCcw, Square, Check, Star, Menu, Search, Smartphone, ChartColumn, LogOut,
     House, LayoutDashboard, ChevronLeft, X, Play, Pause, Rewind, FastForward, Volume1, Volume2, VolumeX, Captions,
     Maximize, ArrowDownUp, Circle, SkipBack, SkipForward, Funnel, FunnelX, Shuffle, PictureInPicture2, ThumbsUp,
-    ThumbsDown, Trash2,
+    ThumbsDown, Trash2, EllipsisVertical, ListPlus, FolderPlus, LayoutGrid, List,
 } from 'lucide';
 
 window.lucideIcons = {
@@ -14,7 +14,7 @@ window.lucideIcons = {
     HardDrive, BrushCleaning, Clock, RotateCcw, Square, Check, Star, Menu, Search, Smartphone, ChartColumn, LogOut,
     House, LayoutDashboard, ChevronLeft, X, Play, Pause, Rewind, FastForward, Volume1, Volume2, VolumeX, Captions,
     Maximize, ArrowDownUp, Circle, SkipBack, SkipForward, Funnel, FunnelX, Shuffle, PictureInPicture2, ThumbsUp,
-    ThumbsDown, Trash2,
+    ThumbsDown, Trash2, EllipsisVertical, ListPlus, FolderPlus, LayoutGrid, List,
 };
 
 createIcons({ icons: window.lucideIcons, attrs: { 'aria-hidden': 'true' } });
