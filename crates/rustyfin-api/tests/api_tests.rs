@@ -3398,6 +3398,7 @@ const B124_WEB_MODULES: &[&str] = &[
     "library.js",
     "metadata-admin.js",
     "music.js",
+    "photos.js",
     "playback-admin.js",
     "player.js",
     "playerprefs.js",
@@ -27011,6 +27012,203 @@ async fn r3photos_library_subfolders_are_folder_items() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
+/// Writes empty files at `files` under `root` (a scan lists them by name)
+fn r3photos_files(root: &std::path::Path, files: &[&str]) {
+    for file in files {
+        let path = root.join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"").unwrap();
+    }
+}
+
+/// The id of the folder named `name` that `parent` lists
+async fn r3photos_folder(
+    app: &axum::Router,
+    token: &str,
+    parent: &str,
+    name: &str,
+) -> Option<String> {
+    r3photos_list(app, token, &format!("/Items?ParentId={parent}"))
+        .await
+        .into_iter()
+        .find(|(n, t, _)| n == name && t == "Folder")
+        .map(|(_, _, id)| id)
+}
+
+#[tokio::test]
+async fn r3photos_mixed_folders_keep_ids_and_go_when_emptied() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let lib = create_library_via_api(&app, &state, &token, "R3PX", "Mixed").await;
+    let root = std::path::PathBuf::from(media_folder(&state, "r3px"));
+    r3photos_files(&root, &["Trips/a.jpg", "Home/b.jpg", "Home/Garden/c.jpg"]);
+    let refresh = format!("/Library/VirtualFolders/{lib}/Refresh");
+    let scan = || async {
+        let (status, body) = send_authed(&app, "POST", &refresh, &token, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    };
+    scan().await;
+    let lib_id = lib.to_string();
+    let trips = r3photos_folder(&app, &token, &lib_id, "Trips")
+        .await
+        .unwrap();
+    let home = r3photos_folder(&app, &token, &lib_id, "Home")
+        .await
+        .unwrap();
+    let garden = r3photos_folder(&app, &token, &home, "Garden")
+        .await
+        .unwrap();
+
+    // A rescan keeps every folder's id
+    scan().await;
+    assert_eq!(
+        r3photos_folder(&app, &token, &lib_id, "Trips")
+            .await
+            .unwrap(),
+        trips
+    );
+    assert_eq!(
+        r3photos_folder(&app, &token, &home, "Garden")
+            .await
+            .unwrap(),
+        garden
+    );
+
+    // A folder whose only photo is gone goes, and so does nothing else
+    std::fs::remove_file(root.join("Trips/a.jpg")).unwrap();
+    scan().await;
+    assert_eq!(r3photos_folder(&app, &token, &lib_id, "Trips").await, None);
+    let (status, _) = send_authed(&app, "GET", &format!("/Items/{trips}"), &token, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        r3photos_folder(&app, &token, &lib_id, "Home")
+            .await
+            .unwrap(),
+        home
+    );
+
+    // The photo back: the folder comes back with the same id
+    r3photos_files(&root, &["Trips/a.jpg"]);
+    scan().await;
+    assert_eq!(
+        r3photos_folder(&app, &token, &lib_id, "Trips")
+            .await
+            .unwrap(),
+        trips
+    );
+}
+
+#[tokio::test]
+async fn r3photos_folder_counts_and_ancestors_follow_access() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (admin, _) = admin_session(&state).await;
+    let lib = create_library_via_api(&app, &state, &admin, "R3PA2", "Photos").await;
+    let root = std::path::PathBuf::from(media_folder(&state, "r3pa2"));
+    r3photos_files(
+        &root,
+        &["Album/one.jpg", "Album/two.jpg", "Album/Inner/three.jpg"],
+    );
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        &format!("/Library/VirtualFolders/{lib}/Refresh"),
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    sqlx::query("UPDATE media_items SET tags = 'Private' WHERE name = 'two'")
+        .execute(&state.db)
+        .await
+        .unwrap();
+    let album = r3photos_folder(&app, &admin, &lib.to_string(), "Album")
+        .await
+        .unwrap();
+    let inner = r3photos_folder(&app, &admin, &album, "Inner")
+        .await
+        .unwrap();
+
+    // A user who may not see the "Private" tag, and one without this library
+    let set_policy = |user: String, change: serde_json::Value| {
+        let (app, admin) = (app.clone(), admin.clone());
+        async move {
+            let (_, got) = send_authed(&app, "GET", &format!("/Users/{user}"), &admin, None).await;
+            let mut policy = got["Policy"].clone();
+            for (k, v) in change.as_object().unwrap() {
+                policy[k] = v.clone();
+            }
+            let uri = format!("/Users/{user}/Policy");
+            let (status, _) =
+                send_authed(&app, "POST", &uri, &admin, Some(&policy.to_string())).await;
+            assert!(status.is_success(), "{status}");
+        }
+    };
+    let kid = add_user(&state, "r3p-kid", "r3p-pass", false).await;
+    set_policy(
+        kid.to_string(),
+        serde_json::json!({ "BlockedTags": ["Private"] }),
+    )
+    .await;
+    let other = add_user(&state, "r3p-other", "r3p-pass", false).await;
+    set_policy(
+        other.to_string(),
+        serde_json::json!({ "EnableAllFolders": false, "EnabledFolders": [] }),
+    )
+    .await;
+    let (kid_token, _) = login(&app, "r3p-kid", "r3p-pass").await.unwrap();
+    let (other_token, _) = login(&app, "r3p-other", "r3p-pass").await.unwrap();
+
+    // ChildCount: the folder's details and a list count only what the user may see
+    let count = |token: String, uri: String| {
+        let app = app.clone();
+        async move { send_authed(&app, "GET", &uri, &token, None).await.1["ChildCount"].clone() }
+    };
+    assert_eq!(count(admin.clone(), format!("/Items/{album}")).await, 3);
+    assert_eq!(count(kid_token.clone(), format!("/Items/{album}")).await, 2);
+    let (_, listed) = send_authed(
+        &app,
+        "GET",
+        &format!("/Items?ParentId={lib}"),
+        &kid_token,
+        None,
+    )
+    .await;
+    let album_row = listed["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["Id"] == album.as_str())
+        .cloned()
+        .unwrap();
+    assert_eq!(album_row["ChildCount"], 2);
+
+    // Ancestors: a visible folder's way up for the kid; not found without the library
+    let (status, up) = send_authed(
+        &app,
+        "GET",
+        &format!("/Items/{inner}/Ancestors"),
+        &kid_token,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(up[0]["Id"], album.as_str());
+    let (status, _) = send_authed(
+        &app,
+        "GET",
+        &format!("/Items/{inner}/Ancestors"),
+        &other_token,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) =
+        send_authed(&app, "GET", &format!("/Items/{album}"), &other_token, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
 /// The ids of the items `uri` answers with as a plain array
 async fn r3photos_list_plain(app: &axum::Router, token: &str, uri: &str) -> Vec<String> {
     let (status, body) = send_authed(app, "GET", uri, token, None).await;
@@ -27122,10 +27320,36 @@ async fn r3photos_home_settings_round_trip() {
     );
     assert_eq!(got["Client"], "emby");
     assert_eq!(got["SortBy"], "SortName");
+
+    // A POST without CustomPrefs keeps the saved ones; one with some changes only those, as
+    // Jellyfin merges them key by key (null removes one)
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        &prefs,
+        &token,
+        Some(r#"{"SortBy":"DateCreated"}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, got) = send_authed(&app, "GET", &prefs, &token, None).await;
+    assert_eq!(got["SortBy"], "DateCreated");
+    assert_eq!(
+        got["CustomPrefs"],
+        serde_json::json!({"homesection0": "latestmedia", "homesection1": "none"})
+    );
+    let body = r#"{"CustomPrefs":{"homesection1":null,"homesection3":"nextup"}}"#;
+    let (status, _) = send_authed(&app, "POST", &prefs, &token, Some(body)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, got) = send_authed(&app, "GET", &prefs, &token, None).await;
+    assert_eq!(
+        got["CustomPrefs"],
+        serde_json::json!({"homesection0": "latestmedia", "homesection3": "nextup"})
+    );
 }
 
 #[tokio::test]
-async fn r3photos_user_views_follow_order_and_my_media() {
+async fn r3photos_user_views_follow_ordered_views() {
     let state = test_state().await;
     let app = app(state.clone());
     let (token, user) = admin_session(&state).await;
@@ -27142,30 +27366,19 @@ async fn r3photos_user_views_follow_order_and_my_media() {
     assert_eq!(own, ["R3VA", "R3VB", "R3VC"]);
 
     // OrderedViews puts C then A first (dashless, upper-case ids match too); B, unnamed, follows.
-    // MyMediaExcludes hides B unless includeHidden.
+    // (MyMediaExcludes and includeHidden are the client queues change's, tested there.)
     let (_, me) = send_authed(&app, "GET", &format!("/Users/{user}"), &token, None).await;
     let mut config = me["Configuration"].clone();
     config["OrderedViews"] =
         serde_json::json!([ids[2].simple().to_string().to_uppercase(), ids[0]]);
-    config["MyMediaExcludes"] = serde_json::json!([ids[1]]);
     let uri = format!("/Users/{user}/Configuration");
     let (status, _) = send_authed(&app, "POST", &uri, &token, Some(&config.to_string())).await;
     assert!(status.is_success(), "{status}");
 
     let shown = r3photos_view_names(&app, &token, "/UserViews").await;
-    assert_eq!(&shown[..2], ["R3VC", "R3VA"]);
-    assert!(!shown.contains(&"R3VB".to_string()), "{shown:?}");
+    assert_eq!(shown, ["R3VC", "R3VA", "R3VB"]);
     let per_user = r3photos_view_names(&app, &token, &format!("/Users/{user}/Views")).await;
     assert_eq!(per_user, shown);
-    let hidden = r3photos_view_names(&app, &token, "/UserViews?includeHidden=true").await;
-    assert_eq!(&hidden[..3], ["R3VC", "R3VA", "R3VB"]);
-    let hidden = r3photos_view_names(
-        &app,
-        &token,
-        &format!("/Users/{user}/Views?IncludeHidden=true"),
-    )
-    .await;
-    assert_eq!(&hidden[..3], ["R3VC", "R3VA", "R3VB"]);
 }
 
 // R3 settings: the settings page saves each setting where Jellyfin keeps it

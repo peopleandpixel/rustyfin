@@ -3,7 +3,7 @@ import { $, icon, toast, escapeHtml, scanRing } from './util.js';
 import { backdropUrl, createCardElement, sectionRow } from './cards.js';
 import { serverVersion } from './wizard.js';
 import { LIBRARY_PAGE_SIZE, setupInfiniteScroll, destroyInfiniteScroll } from './library.js';
-import { loadUserSettings, homeSections, showsInLatest, arrangeLibraries } from './user-settings.js';
+import { loadUserSettings, homeSections, showsInLatest } from './user-settings.js';
 import { containerTilesHtml, revealContainerTiles } from './collections.js';
 
 // --- Home Page Renderer ---
@@ -86,11 +86,15 @@ async function renderHome() {
 
     try {
         let libsError = null;
-        // The user's home screen settings: the sections' order, the libraries' order (OrderedViews),
-        // those hidden from My Media (MyMediaExcludes) and those left out of "Latest"
+        // The user's home screen settings: the sections' order, and the libraries left out of
+        // "Recently Added" (LatestItemsExcludes, which Jellyfin Web also applies itself)
         const settingsLoad = loadUserSettings().catch(() => null);
         const libsRequest = API.getLibraries().catch(err => { libsError = err; return null; });
-        const homeLibs = Promise.all([libsRequest, settingsLoad]).then(([libs]) => arrangeLibraries(libs, { hide: true }));
+        // My Media as the server lists it, as Jellyfin Web shows it: in the user's order
+        // (OrderedViews), without the libraries hidden from it (MyMediaExcludes)
+        const homeLibs = Promise.all([API.getUserViews(), settingsLoad])
+            .then(([libs]) => libs)
+            .catch(err => { libsError = err; return []; });
         const [resumeData, resumeAudioData, nextUpData, latestRows, libsData] = await Promise.all([
             API.cachedGet(resumeUrl('Video')).catch(() => ({ Items: [] })),
             API.cachedGet(resumeUrl('Audio')).catch(() => ({ Items: [] })),

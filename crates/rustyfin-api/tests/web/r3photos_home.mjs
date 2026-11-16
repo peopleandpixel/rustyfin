@@ -1,6 +1,7 @@
-// R3 photos and home: the home page follows the user's library settings as Jellyfin's do: the
-// libraries in UserConfiguration.OrderedViews order, those in MyMediaExcludes left out of My Media
-// and of the Recently Added rows; and the Home settings save those lists. Runs
+// R3 photos and home: the home page follows the user's library settings as Jellyfin Web's does:
+// My Media is the server's /UserViews (in OrderedViews order, without MyMediaExcludes), its
+// Recently Added rows leave out the LatestItemsExcludes libraries; and the Home settings save
+// those lists. Runs
 // modules/user-settings.js, modules/home.js and modules/settings.js in a vm sandbox with the API
 // and the card helpers stubbed.
 // Usage: node r3photos_home.mjs (run by api_tests.rs r3photos_web).
@@ -22,7 +23,7 @@ const LIBS = [
 ];
 const latest = lib => `/Items/Latest?ParentId=${lib}&Limit=16&Fields=PrimaryImageAspectRatio`;
 
-function sandbox({ config = {}, prefs = {} } = {}) {
+function sandbox({ config = {}, prefs = {}, views = LIBS } = {}) {
     const gets = [];
     const posts = [];
     const rows = [];
@@ -54,6 +55,8 @@ function sandbox({ config = {}, prefs = {} } = {}) {
             isAdmin: true,
             isLoggedIn: () => true,
             getLibraries: async () => LIBS,
+            // The server's /UserViews: the user's order, hidden libraries left out
+            getUserViews: async () => views,
             getNextUp: async () => ({ Items: [] }),
             getMe: async () => ({ Id: 'u1', Configuration: config }),
             get: async url => {
@@ -84,12 +87,11 @@ test('the libraries follow OrderedViews: the named ones first in its order, then
     assert.deepEqual(names({}), ['Films', 'Shows', 'Photos']);
     assert.deepEqual(names({ OrderedViews: ['CCCC3333', 'aaaa-1111'] }), ['Photos', 'Films', 'Shows']);
     assert.deepEqual(names({ OrderedViews: ['bbbb-2222'], MyMediaExcludes: ['aaaa1111'] }), ['Shows', 'Films', 'Photos']);
-    assert.deepEqual(names({ OrderedViews: ['bbbb-2222'], MyMediaExcludes: ['aaaa1111'] }, { hide: true }), ['Shows', 'Photos']);
     assert.equal(context.showsInMyMedia('AAAA-1111', { MyMediaExcludes: ['aaaa1111'] }), false);
 });
 
-test('the home page shows the libraries and their Recently Added rows in the user\'s order', async () => {
-    const s = sandbox({ config: { OrderedViews: ['cccc-3333', 'bbbb-2222'] } });
+test('the home page shows the libraries and their Recently Added rows in the server\'s order', async () => {
+    const s = sandbox({ views: [LIBS[2], LIBS[1], LIBS[0]] });
     await s.context.renderHome();
     assert.deepEqual(latestRows(s), [
         'home.latest_in|{"name":"Photos"}',
@@ -101,8 +103,8 @@ test('the home page shows the libraries and their Recently Added rows in the use
     assert.ok(at('cccc-3333') > 0 && at('cccc-3333') < at('bbbb-2222') && at('bbbb-2222') < at('aaaa-1111'), 'tile order');
 });
 
-test('a library hidden from My Media has no tile, no Recently Added row and no request', async () => {
-    const s = sandbox({ config: { MyMediaExcludes: ['AAAA1111'], LatestItemsExcludes: ['cccc-3333'] } });
+test('a library the server leaves out of My Media has no tile, no Recently Added row and no request', async () => {
+    const s = sandbox({ views: [LIBS[1], LIBS[2]], config: { LatestItemsExcludes: ['CCCC3333'] } });
     await s.context.renderHome();
     assert.deepEqual(latestRows(s), ['home.latest_in|{"name":"Shows"}']);
     assert.ok(!s.page.innerHTML.includes('data-id="aaaa-1111"'));
