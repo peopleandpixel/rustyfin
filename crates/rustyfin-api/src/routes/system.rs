@@ -54,10 +54,6 @@ pub fn admin_routes() -> Router<AppState> {
             "/System/Configuration/{key}",
             post(update_configuration_by_key),
         )
-        .route(
-            "/System/Configuration/Branding",
-            post(update_branding_config),
-        )
         .route("/System/Info/Storage", get(get_storage_info))
         .route("/System/Logs/Log", get(get_logs_log))
         .route("/System/Shutdown", post(shutdown))
@@ -1184,35 +1180,6 @@ fn merge_json_values(
         }
         other => other,
     }
-}
-
-/// POST /System/Configuration/Branding - Update branding configuration
-async fn update_branding_config(
-    State(state): State<AppState>,
-    Json(body): Json<serde_json::Value>,
-) -> Result<StatusCode, ApiError> {
-    // Extract branding settings and store in cache
-    if let Some(enabled) = body.get("SplashscreenEnabled").and_then(|v| v.as_bool()) {
-        state
-            .cache
-            .branding
-            .insert("splashscreen_enabled".to_string(), enabled.to_string());
-    }
-    if let Some(css) = body.get("CustomCss").and_then(|v| v.as_str()) {
-        state
-            .cache
-            .branding
-            .insert("custom_css".to_string(), css.to_string());
-    }
-    if let Some(disclaimer) = body.get("LoginDisclaimer").and_then(|v| v.as_str()) {
-        state
-            .cache
-            .branding
-            .insert("login_disclaimer".to_string(), disclaimer.to_string());
-    }
-
-    tracing::info!("branding configuration updated");
-    Ok(StatusCode::NO_CONTENT)
 }
 
 /// GET /System/Info/Storage - Get storage information
