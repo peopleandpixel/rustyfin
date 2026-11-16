@@ -1831,7 +1831,7 @@ pub(crate) async fn enrich_items_with(
 
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route("/Items", get(get_items))
+        .route("/Items", get(get_items_for_query_user))
         // DELETE checks the caller itself: a playlist's owner may delete it, as in Jellyfin.
         .route("/Items/{id}", get(get_item).delete(delete_item))
         .route("/Items/{id}/Children", get(get_children))
@@ -3477,15 +3477,50 @@ async fn get_filters2(
     Ok(Json(json!({ "Genres": genres, "Tags": [] })))
 }
 
-// User-specific item endpoints (same as global for now; user-specific status comes in Phase 2)
-async fn get_user_items(
+/// The claims a list answers for: the user `user_id` names, under `path_user`'s rules, with that
+/// user's administrator flag, so their play state, favourites, filters and access apply, as in
+/// Jellyfin. No user, the nil id or the caller's own id leaves the claims as they are.
+async fn claims_for_user(
+    state: &AppState,
+    claims: Claims,
+    user_id: Option<Uuid>,
+) -> Result<Claims, ApiError> {
+    let Some(user_id) = user_id.filter(|id| !id.is_nil() && *id != claims.sub) else {
+        return Ok(claims);
+    };
+    path_user(state, &claims, user_id).await?;
+    let user = rustyfin_db::repo_user::get_user_by_id(&state.db_ro, user_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("user not found".into()))?;
+    Ok(Claims {
+        sub: user_id,
+        name: user.name,
+        is_admin: user.is_administrator,
+        ..claims
+    })
+}
+
+/// GET /Items, for the user a `userId` names.
+async fn get_items_for_query_user(
     State(state): State<AppState>,
-    Path(_user_id): Path<Uuid>,
-    Query(query): Query<ItemsQuery>,
+    Query(params): Query<Vec<(String, String)>>,
+    query: Query<ItemsQuery>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Response, ApiError> {
-    // Delegate to get_items with the user's claims
-    get_items(State(state), Query(query), Extension(claims)).await
+    let user_id = crate::query::uuid_param(&params, "userId")?;
+    let claims = claims_for_user(&state, claims, user_id).await?;
+    get_items(State(state), query, Extension(claims)).await
+}
+
+/// GET /Users/{userId}/Items, for that user.
+async fn get_user_items(
+    State(state): State<AppState>,
+    Path(user_id): Path<Uuid>,
+    query: Query<ItemsQuery>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Response, ApiError> {
+    let claims = claims_for_user(&state, claims, Some(user_id)).await?;
+    get_items(State(state), query, Extension(claims)).await
 }
 
 async fn get_user_latest(
