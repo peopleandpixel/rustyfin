@@ -73,6 +73,42 @@ pub async fn delete_media_segments(pool: &SqlitePool, item_id: Uuid) -> Result<(
     Ok(())
 }
 
+/// The file version (size, modified time in seconds) of each item when intro detection last ran
+/// on it successfully, by item id.
+pub async fn detected_versions(
+    pool: &SqlitePool,
+) -> Result<std::collections::HashMap<String, (i64, i64)>, sqlx::Error> {
+    let rows = sqlx::query("SELECT item_id, size, modified FROM media_segment_scans")
+        .fetch_all(pool)
+        .await?;
+    rows.iter()
+        .map(|r| {
+            Ok((
+                r.try_get("item_id")?,
+                (r.try_get("size")?, r.try_get("modified")?),
+            ))
+        })
+        .collect()
+}
+
+/// Records that intro detection ran on item `item_id` when its file was at `version`.
+pub async fn set_detected_version(
+    pool: &SqlitePool,
+    item_id: Uuid,
+    version: (i64, i64),
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO media_segment_scans (item_id, size, modified) VALUES (?1, ?2, ?3)
+         ON CONFLICT(item_id) DO UPDATE SET size = excluded.size, modified = excluded.modified",
+    )
+    .bind(item_id.to_string())
+    .bind(version.0)
+    .bind(version.1)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

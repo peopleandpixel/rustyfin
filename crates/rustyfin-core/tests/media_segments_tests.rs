@@ -441,3 +441,58 @@ async fn r3perf_all_episodes_are_detected_and_counted() {
     }
     pool.close().await;
 }
+
+#[tokio::test]
+async fn r3perf_an_unchanged_episode_is_not_detected_again() {
+    if !have_ffmpeg() {
+        eprintln!("skip: ffmpeg not found");
+        return;
+    }
+    let dir = TempDir::new("segments");
+    let clip = make_quoted_clip(&dir.0);
+    let (pool, item_id) = episode_db(&dir.0, &clip).await;
+    let progress = rustyfin_core::task_progress::TaskProgress::new();
+    let intro_start = || async {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT segment_start_ticks FROM media_segments
+             WHERE item_id = ?1 AND segment_type = 'Intro'",
+        )
+        .bind(item_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+    };
+
+    let count = media_segments::detect_for_all_episodes_with_progress(&pool, &progress)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+    let detected = intro_start().await;
+
+    // A mark on the stored intro survives the next run: the unchanged file isn't read again.
+    sqlx::query("UPDATE media_segments SET segment_start_ticks = 12345 WHERE item_id = ?1")
+        .bind(item_id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let count = media_segments::detect_for_all_episodes_with_progress(&pool, &progress)
+        .await
+        .unwrap();
+    assert_eq!(count, 1, "an unchanged episode counts as processed");
+    assert_eq!(intro_start().await, 12345);
+
+    // A changed file is detected again.
+    std::fs::File::options()
+        .write(true)
+        .open(&clip)
+        .unwrap()
+        .set_modified(
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000),
+        )
+        .unwrap();
+    media_segments::detect_for_all_episodes_with_progress(&pool, &progress)
+        .await
+        .unwrap();
+    assert_eq!(intro_start().await, detected);
+    pool.close().await;
+}

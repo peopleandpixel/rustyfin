@@ -616,7 +616,9 @@ pub async fn detect_for_all_episodes(pool: &SqlitePool) -> Result<usize, String>
 /// `detect_for_all_episodes`, reporting the share of the episodes looked at on `progress`.
 /// Episodes run in parallel, each holding one of the image job slots (`trickplay::image_job`,
 /// shared with trickplay and chapter images); an episode on a network share also holds one of the
-/// `media_reads::network_read_jobs`, since its whole file is read.
+/// `media_reads::network_read_jobs`, since its whole file is read. An episode whose file is the
+/// same version (size and modified time) as at its last successful detection is skipped, and
+/// counts as processed: its segments are those of that file.
 pub async fn detect_for_all_episodes_with_progress(
     pool: &SqlitePool,
     progress: &crate::task_progress::TaskProgress,
@@ -635,10 +637,14 @@ pub async fn detect_for_all_episodes_with_progress(
     .await
     .map_err(|e| format!("Failed to fetch episodes: {}", e))?;
 
+    let detected = rustyfin_db::repo_media_segment::detected_versions(pool)
+        .await
+        .map_err(|e| format!("Failed to read the detected file versions: {}", e))?;
     let total = episodes.len();
     let threads = crate::media_reads::decode_threads();
     let jobs = crate::trickplay::image_jobs();
     let mut count = 0;
+    let mut unchanged = 0;
     let mut done = 0;
     let mut running = tokio::task::JoinSet::new();
     progress.report_count(0, total);
@@ -664,6 +670,16 @@ pub async fn detect_for_all_episodes_with_progress(
             }
         };
 
+        // Read before the detection, so a file changed while it runs is detected again next time.
+        let version = crate::trickplay::file_version(&path).await;
+        if detected.get(&id_str) == Some(&version) {
+            unchanged += 1;
+            count += 1;
+            done += 1;
+            progress.report_count(done, total);
+            continue;
+        }
+
         // At most `jobs` episodes are under way; the ones that finished are counted meanwhile.
         while running.len() >= jobs {
             if let Some(finished) = running.join_next().await {
@@ -679,7 +695,18 @@ pub async fn detect_for_all_episodes_with_progress(
             let _read = crate::media_reads::whole_file_read(std::path::Path::new(&path)).await;
             let _slot = crate::trickplay::image_job(&crate::trickplay::Cancel::new()).await;
             match detect_and_save_with_threads(&pool, item_id, &path, duration, threads).await {
-                Ok(()) => true,
+                // An unreadable file (version 0) is never recorded, so it is tried again.
+                Ok(()) if version == (0, 0) => true,
+                Ok(()) => {
+                    let stored = rustyfin_db::repo_media_segment::set_detected_version(
+                        &pool, item_id, version,
+                    )
+                    .await;
+                    if let Err(e) = stored {
+                        warn!("Failed to record the detection of {}: {}", id_str, e);
+                    }
+                    true
+                }
                 Err(e) => {
                     warn!("Failed to detect segments for {}: {}", id_str, e);
                     false
@@ -693,7 +720,10 @@ pub async fn detect_for_all_episodes_with_progress(
         progress.report_count(done, total);
     }
 
-    info!("Detected segments for {} episodes", count);
+    info!(
+        "Detected segments for {} episodes ({} unchanged since their last detection)",
+        count, unchanged
+    );
     Ok(count)
 }
 
