@@ -20,7 +20,7 @@ function sandbox() {
             const [section, name] = key.split('.');
             const text = en[section]?.[name];
             assert.ok(text !== undefined, `en.json has ${key}`);
-            return text.replace(/\{(\w+)\}/g, (_, k) => vars[k] ?? '');
+            return text.replace(/\{\{(\w+)\}\}/g, (_, k) => vars[k] ?? '');
         },
         escapeHtml: s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'),
         icon: name => `<svg data-icon="${name}"></svg>`,

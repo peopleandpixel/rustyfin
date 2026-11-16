@@ -1060,7 +1060,7 @@
     },
     "user_editor": {
         "edit": "Edit",
-        "edit_for": "Edit {name}",
+        "edit_for": "Edit {{name}}",
         "save": "Save",
         "tab_profile": "Profile",
         "tab_access": "Access",
