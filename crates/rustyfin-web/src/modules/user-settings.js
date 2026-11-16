@@ -70,16 +70,22 @@ function userConfiguration() {
     return loaded?.userId === API.userId ? loaded.config : {};
 }
 
-// Saves CustomPrefs values (strings; null or '' removes one), keeping the other settings
+// Saves CustomPrefs values (strings; null or '' removes one), keeping the other settings. A removed
+// one is sent as null: the server merges CustomPrefs key by key, as Jellyfin does.
 async function saveUserSettings(values) {
     const settings = await loadUserSettings();
     const customPrefs = { ...settings.prefs.CustomPrefs };
+    const sent = { ...customPrefs };
     for (const [name, value] of Object.entries(values)) {
-        if (value == null || value === '') delete customPrefs[name];
-        else customPrefs[name] = String(value);
+        if (value == null || value === '') {
+            delete customPrefs[name];
+            sent[name] = null;
+        } else {
+            customPrefs[name] = sent[name] = String(value);
+        }
     }
     const prefs = { ...settings.prefs, CustomPrefs: customPrefs };
-    await API.post(prefsPath(settings.userId), prefs);
+    await API.post(prefsPath(settings.userId), { ...prefs, CustomPrefs: sent });
     settings.prefs = prefs;
     for (const [name, value] of Object.entries(values)) {
         if (name in DEVICE_SETTINGS) setDeviceSetting(name, value, DEVICE_SETTINGS[name]);
@@ -138,15 +144,14 @@ function showsInMyMedia(libraryId, config = userConfiguration()) {
 }
 
 // The libraries in the user's order, as the server's /UserViews: those UserConfiguration.OrderedViews
-// names first, in its order, then the others in theirs. With `hide`, MyMediaExcludes are left out.
-function arrangeLibraries(libs, { hide = false, config = userConfiguration() } = {}) {
+// names first, in its order, then the others in theirs (the settings page lists them so)
+function arrangeLibraries(libs, { config = userConfiguration() } = {}) {
     const order = (config.OrderedViews || []).map(libraryKey);
     const rank = lib => {
         const at = order.indexOf(libraryKey(lib.id || lib.Id));
         return at < 0 ? Infinity : at;
     };
     return (libs || [])
-        .filter(lib => !hide || showsInMyMedia(lib.id || lib.Id, config))
         .map((lib, i) => [lib, i])
         .sort((a, b) => (rank(a[0]) - rank(b[0])) || (a[1] - b[1]))
         .map(([lib]) => lib);
