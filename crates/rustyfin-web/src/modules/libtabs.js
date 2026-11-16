@@ -48,12 +48,13 @@ function itemsOf(data) {
 // A tab's page: the library's title, a status line and the tab bar over the tab's own content
 function tabPage(libName, contentType, tabBar, contentId) {
     const page = $('page-library');
+    const headerIcon = contentType === 'TvShows' ? 'Tv' : 'Film';
     page.classList.remove('jf-with-rail');
     page.innerHTML = `
     <div class="jf-page">
         <div class="mb-4 pb-4 border-b border-white/10">
             <div class="flex items-center gap-2">
-                <span class="inline-flex">${icon(contentType === 'TvShows' ? 'Tv' : 'Film', { size: 28 })}</span>
+                <span class="inline-flex">${icon(headerIcon, { size: 28 })}</span>
                 <h1 class="text-2xl lg:text-3xl font-extrabold text-white tracking-tight">${escapeHtml(libName)}</h1>
             </div>
             <p id="libtab-status" class="text-xs text-white/40 mt-1">${t('common.loading')}</p>
