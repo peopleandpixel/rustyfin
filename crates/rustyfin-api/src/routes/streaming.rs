@@ -916,6 +916,8 @@ struct VideoPlaybackInfoQuery {
     width: Option<i32>,
     height: Option<i32>,
     max_streaming_bitrate: Option<u32>,
+    /// Jellyfin's SubtitleMethod: "Encode" asks for the subtitle to be burned in, text ones too
+    subtitle_method: Option<String>,
     segment_time: Option<u32>,
     profile: Option<String>,
     max_video_bit_depth: Option<u32>,
@@ -974,6 +976,7 @@ impl From<HashMap<String, String>> for VideoPlaybackInfoQuery {
             max_streaming_bitrate: params
                 .get("MaxStreamingBitrate")
                 .and_then(|v| v.parse().ok()),
+            subtitle_method: params.get("SubtitleMethod").cloned(),
             segment_time: params.get("SegmentTime").and_then(|v| v.parse().ok()),
             profile: params.get("Profile").cloned(),
             max_video_bit_depth: params.get("MaxVideoBitDepth").and_then(|v| v.parse().ok()),
@@ -1014,14 +1017,20 @@ fn track_needs(
         }
         _ => false,
     };
-    // Picture subtitles are burned in by the transcode, text ones are drawn by the browser
+    // Picture subtitles are burned in by the transcode, text ones are drawn by the browser unless
+    // the request asks for them burned in too (SubtitleMethod=Encode)
+    let encode = query
+        .subtitle_method
+        .as_deref()
+        .is_some_and(|method| method.eq_ignore_ascii_case("encode"));
     let burn_in = match query.subtitle_stream_index {
         Some(wanted) if wanted >= 0 => source.media_streams.iter().any(|s| {
             s.index == wanted
                 && is_stream_type(s, "Subtitle")
-                && s.codec
-                    .as_deref()
-                    .is_some_and(rustyfin_core::subtitle::is_image_subtitle)
+                && (encode
+                    || s.codec
+                        .as_deref()
+                        .is_some_and(rustyfin_core::subtitle::is_image_subtitle))
         }),
         _ => false,
     };
@@ -1101,7 +1110,10 @@ async fn video_universal(
         if let Some(source) = media_sources.get(index) {
             url.push_str(&format!("&MediaSourceId={}", source.id));
         }
-        if let Some(bitrate) = query.max_video_bitrate {
+        if let Some(bitrate) = query
+            .max_video_bitrate
+            .or_else(|| streaming_video_kbps(query.max_streaming_bitrate))
+        {
             url.push_str(&format!("&VideoBitrate={}", bitrate));
         }
         if let Some(bitrate) = query.max_audio_bitrate {
@@ -1222,9 +1234,18 @@ async fn video_playback_info(
         source.supports_transcoding = i == index && supports_transcoding;
     }
 
-    // The caller's remembered tracks become each source's defaults, where the source has them
+    // The caller's remembered tracks become each source's defaults, where the source has them and
+    // the user keeps Jellyfin's RememberAudioSelections and RememberSubtitleSelections on
     let (remembered_audio, remembered_subtitle) =
         rustyfin_db::repo_playback::get_stream_choice(&state.db_ro, claims.sub, id).await?;
+    let config = rustyfin_db::repo_user::get_user_by_id(&state.db_ro, claims.sub)
+        .await?
+        .map(|user| rustyfin_model::user::jellyfin_configuration(&user.configuration))
+        .unwrap_or_default();
+    let remembers = |key: &str| config.get(key).and_then(|v| v.as_bool()) != Some(false);
+    let remembered_audio = remembered_audio.filter(|_| remembers("RememberAudioSelections"));
+    let remembered_subtitle =
+        remembered_subtitle.filter(|_| remembers("RememberSubtitleSelections"));
     let media_sources: Vec<rustyfin_model::playback_info::PlaybackMediaSource> = media_sources
         .into_iter()
         .map(|source| {
@@ -1373,6 +1394,18 @@ fn has_remembered_stream(
 
 /// Check if a media source can be directly played by the client.
 /// Direct play requires the client to support all codecs without any transcoding.
+/// The transcode's video bitrate in kbps for a client's MaxStreamingBitrate (bits/s): the limit
+/// less the default 192 kbps of audio. None when the limit leaves the transcode's default (8 Mbps)
+/// alone, so a client with a high or no limit transcodes as before.
+fn streaming_video_kbps(max_streaming_bitrate: Option<u32>) -> Option<u32> {
+    let default_kbps = rustyfin_core::transcode::TranscodeProfile::default().max_video_bitrate_kbps;
+    let audio_kbps = rustyfin_core::transcode::TranscodeProfile::default().max_audio_bitrate_kbps;
+    let kbps = (max_streaming_bitrate? / 1000)
+        .saturating_sub(audio_kbps)
+        .max(64);
+    (kbps < default_kbps).then_some(kbps)
+}
+
 fn check_direct_play(
     source: &rustyfin_model::media_source::MediaSourceResponse,
     query: &VideoPlaybackInfoQuery,
@@ -1393,6 +1426,12 @@ fn check_direct_play(
     }
     // If there's a video item but no video stream info, reject direct play
     if !has_video_stream && source.video_bitrate.is_some() {
+        return false;
+    }
+    // As in Jellyfin, a file above the client's MaxStreamingBitrate is not played directly
+    if let (Some(max), Some(bitrate)) = (query.max_streaming_bitrate, source.bitrate)
+        && bitrate > max
+    {
         return false;
     }
 

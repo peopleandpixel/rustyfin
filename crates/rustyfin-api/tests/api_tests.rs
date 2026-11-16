@@ -33314,6 +33314,63 @@ async fn b22_universal(
     (url, body["MediaSources"][0].clone())
 }
 
+// R3 settings: the web client's maximum streaming bitrate and subtitle burn-in settings. A file
+// above MaxStreamingBitrate is transcoded, at that rate less the audio; SubtitleMethod=Encode burns
+// in a text subtitle too.
+#[tokio::test]
+async fn r3settings_universal_bitrate_and_burn_in() {
+    let state = test_state().await;
+    let _dir = G4Dir(state.data_dir.to_path_buf());
+    let (token, _) = admin_session(&state).await;
+    let folder = std::path::PathBuf::from(media_folder(&state, "r3-universal"));
+    let file = folder.join("R3 Bitrate.mp4");
+    std::fs::write(&file, b"r3").unwrap();
+    let id = g4_insert_item(&state, "Movie", &file).await;
+    let source: rustyfin_model::media_source::MediaSourceResponse =
+        serde_json::from_value(serde_json::json!({
+            "Id": uuid::Uuid::new_v4().to_string(),
+            "Uid": uuid::Uuid::new_v4().to_string(),
+            "Container": "mp4",
+            "Protocol": "File",
+            "Path": file.to_str().unwrap(),
+            "Bitrate": 20_000_000,
+            "MediaStreams": [
+                { "Index": 0, "CodecType": "video", "Codec": "h264" },
+                { "Index": 1, "CodecType": "audio", "Codec": "aac", "IsDefault": true },
+                { "Index": 2, "CodecType": "subtitle", "Codec": "subrip" },
+            ],
+        }))
+        .unwrap();
+    rustyfin_db::repo_media_source::insert_media_source_with_streams(&state.db, &id, &source)
+        .await
+        .unwrap();
+    let app = app(state);
+    let m3u8 = format!("/Videos/{id}/main.m3u8?");
+
+    // A limit above the file's bitrate plays it directly, and a high limit adds no video bitrate
+    let (url, _) = b22_universal(&app, &token, id, "&MaxStreamingBitrate=100000000").await;
+    assert!(url.contains("Static=true"), "{url}");
+    let query = "&MaxStreamingBitrate=100000000&EnableDirectPlay=false&EnableDirectStream=false";
+    let (url, _) = b22_universal(&app, &token, id, query).await;
+    assert!(url.starts_with(&m3u8), "{url}");
+    assert!(!url.contains("VideoBitrate"), "{url}");
+
+    // 4 Mbps: below the file's 20, so a transcode at 4000 less 192 kbps of audio
+    let (url, source) = b22_universal(&app, &token, id, "&MaxStreamingBitrate=4000000").await;
+    assert!(url.starts_with(&m3u8), "{url}");
+    assert!(url.contains("&VideoBitrate=3808"), "{url}");
+    assert_eq!(source["SupportsDirectPlay"], false);
+
+    // A text subtitle is drawn by the browser unless the request asks for it burned in
+    let (url, _) = b22_universal(&app, &token, id, "&SubtitleStreamIndex=2").await;
+    assert!(url.contains("Static=true"), "{url}");
+    let query = "&SubtitleStreamIndex=2&SubtitleMethod=Encode";
+    let (url, _) = b22_universal(&app, &token, id, query).await;
+    assert!(url.starts_with(&m3u8), "{url}");
+    assert!(url.contains("&SubtitleStreamIndex=2"), "{url}");
+    assert!(url.contains("&SubtitleMethod=Encode"), "{url}");
+}
+
 #[tokio::test]
 async fn b22_universal_sends_other_tracks_to_a_transcode() {
     let state = test_state().await;
@@ -34312,6 +34369,38 @@ async fn b20_playback_info_defaults_from_progress_report() {
 
     let stored = b20_stored_tracks(&state, &user.to_string(), item).await;
     assert_eq!(stored, (Some(2), Some(4)));
+    assert_eq!(b20_only_defaults(&app, &token, item).await, b20_both(2, 4));
+}
+
+// R3 settings: Jellyfin's RememberAudioSelections and RememberSubtitleSelections. Turned off, the
+// remembered track of that kind is no longer the item's default; the choice stays stored.
+#[tokio::test]
+async fn r3settings_playback_info_follows_remember_flags() {
+    let state = test_state().await;
+    let _dir = G1cDataDir(state.data_dir.to_path_buf());
+    let app = app(state.clone());
+    let (token, user) = admin_session(&state).await;
+    let item = b20_movie(&state, "R3 Remember", b20_full_streams()).await;
+    let body = serde_json::json!({
+        "ItemId": item, "PositionTicks": 0, "AudioStreamIndex": 2, "SubtitleStreamIndex": 4,
+    });
+    b20_report(&app, &token, "/Progress", body).await;
+    let configure = |config: serde_json::Value| {
+        let uri = format!("/Users/{user}/Configuration");
+        let req = request("POST", &uri, Some(&token), Some(config));
+        let app = app.clone();
+        async move { assert!(send(&app, req).await.0.is_success()) }
+    };
+
+    configure(serde_json::json!({ "RememberAudioSelections": false })).await;
+    let defaults = b20_only_defaults(&app, &token, item).await;
+    assert_eq!(defaults, (None, Some(serde_json::json!(4))));
+
+    configure(serde_json::json!({ "RememberSubtitleSelections": false })).await;
+    let defaults = b20_only_defaults(&app, &token, item).await;
+    assert_eq!(defaults, (Some(serde_json::json!(2)), None));
+
+    configure(serde_json::json!({})).await;
     assert_eq!(b20_only_defaults(&app, &token, item).await, b20_both(2, 4));
 }
 
