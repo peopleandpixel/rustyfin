@@ -23345,6 +23345,12 @@ fn r3playercore_tracks() {
     b124_node_test("r3playercore_tracks.mjs");
 }
 
+// R3 core player: text subtitles drawn in the user's appearance, and the subtitle offset (G, H)
+#[test]
+fn r3playercore_subtitles() {
+    b124_node_test("r3playercore_subtitles.mjs");
+}
+
 // The web client's item page: credits, ratings, media info, track pickers, chapters, links, "mark all
 // played" and delete (tests/web/r3item_detail.mjs), and the pickers' choice in the player
 // (tests/web/r3item_play.mjs)

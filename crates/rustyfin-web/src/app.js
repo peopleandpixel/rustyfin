@@ -18,8 +18,10 @@ import { doSearch } from './modules/search.js';
 import {
     seekVideo, skipTime, previewSeek, changeAudioTrack, changeSubtitleTrack, playerAreaClick, closePlayer,
     playAdjacentEpisode, playUpNextNow, cancelUpNext, togglePlayPause, setVolume, toggleMute, setPlaybackRate,
-    toggleFullscreen, togglePictureInPicture, skipSegment, hoverSeek, hideTrickplay,
+    toggleFullscreen, togglePictureInPicture, skipSegment, hoverSeek, hideTrickplay, renderPlayerSettings,
+    setSubtitleAppearance, changeSubtitleOffset,
 } from './modules/player.js';
+import './modules/playerprefs.js';
 import './modules/queue.js';
 import { changeNextEpisodeAutoPlay, changeUiLanguage, handleSaveConfig } from './modules/settings.js';
 import { refreshTasks, openAddUser, closeAddUser, submitAddUser, clearLiveLog, setLogLevel } from './modules/admin.js';
@@ -36,7 +38,8 @@ Object.assign(window, {
     wizFinishWithoutImport, wizComplete, navigate, toggleUserMenu, closeUserMenu, toggleSidebar, doSearch, seekVideo,
     skipTime, previewSeek, changeAudioTrack, changeSubtitleTrack, playerAreaClick, closePlayer, playAdjacentEpisode,
     playUpNextNow, cancelUpNext, togglePlayPause, setVolume, toggleMute, setPlaybackRate, toggleFullscreen,
-    togglePictureInPicture, skipSegment, hoverSeek, hideTrickplay, renderLogin,
+    togglePictureInPicture, skipSegment, hoverSeek, hideTrickplay, renderPlayerSettings, setSubtitleAppearance,
+    changeSubtitleOffset, renderLogin,
     handleLogin, handleSetupPassword, doLogout, showQuickConnectModal, authorizeQuickConnect, changeNextEpisodeAutoPlay,
     changeUiLanguage, handleSaveConfig, jiAddPair, jiForget, jiSetMine, jiSetChoice, jiSetConfirm, jiPreview, jiRun,
     jiNewCode, jiCopyCodes, refreshTasks, openAddLibrary, closeAddLibrary, submitAddLibrary, closeLibraryOptions,

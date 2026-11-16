@@ -5,7 +5,10 @@ import { currentPage } from './router.js';
 import { renderHome } from './home.js';
 import { currentDetailId, renderDetail } from './item.js';
 import { clearQueue, queueNeighbours, playQueueStep } from './queue.js';
-import { trackPrefs, defaultTracks, defaultSubtitleIndex as preferredSubtitleIndex } from './playerprefs.js';
+import {
+    trackPrefs, defaultTracks, defaultSubtitleIndex as preferredSubtitleIndex, subtitleAppearance, saveSubtitleAppearance,
+    subtitleCss, stepSubtitleOffset,
+} from './playerprefs.js';
 let playerReportInterval = null;
 let playerBars = null;
 
@@ -375,9 +378,11 @@ function clearTextSubtitle() {
         track.remove();
     });
     disableOtherTextTracks(video);
+    renderSubtitleCues();
 }
 
-// Adds the chosen text subtitle as WebVTT; without a label, hls.js leaves the track alone
+// Adds the chosen text subtitle as WebVTT; without a label, hls.js leaves the track alone. The track stays
+// hidden: the player draws its cues itself (renderSubtitleCues), in the user's subtitle appearance and offset.
 function showTextSubtitle(session) {
     clearTextSubtitle();
     const stream = findStream(session, 'subtitle', session.subtitleIndex);
@@ -392,9 +397,95 @@ function showTextSubtitle(session) {
     track.addEventListener('error', () => {
         if (activePlayback === session) $('player-subtitle').textContent = t('player.subtitles_error');
     });
+    // The cues load once the track is on; the offset in force moves them then
+    track.addEventListener('load', () => applySubtitleOffset(session));
     $('video-player').appendChild(track);
-    track.track.mode = 'showing';
+    track.track.mode = 'hidden';
+    track.track.oncuechange = renderSubtitleCues;
     disableOtherTextTracks($('video-player'));
+}
+
+// --- Text subtitles on screen: Jellyfin Web's custom subtitle rendering, appearance and offset ---
+// Draws the active cues of the player's track, one line each, in the subtitle window
+function renderSubtitleCues() {
+    const win = $('player-subtitle-window');
+    if (!win) return;
+    const track = playerSubtitleTrack($('video-player'));
+    const cues = track && track.mode !== 'disabled' ? Array.from(track.activeCues || []) : [];
+    win.replaceChildren(...cues.map(cue => {
+        const line = document.createElement('div');
+        const text = document.createElement('span');
+        text.className = 'jf-subtitle-text';
+        // getCueAsHTML keeps the cue's italics and bold and never runs markup
+        text.append(typeof cue.getCueAsHTML === 'function' ? cue.getCueAsHTML() : document.createTextNode(cue.text || ''));
+        line.append(text);
+        return line;
+    }));
+}
+
+// The user's subtitle look on the subtitle window and on the settings preview
+function applySubtitleAppearance() {
+    const css = subtitleCss(subtitleAppearance());
+    for (const [id, withWindow] of [['player-subtitle-window', true], ['player-subtitle-preview', false]]) {
+        const el = $(id);
+        if (!el) continue;
+        const { backgroundColor, ...text } = css.text;
+        Object.assign(el.style, text, withWindow ? css.window : {});
+        el.style.setProperty('--jf-subtitle-bg', backgroundColor);
+    }
+}
+
+// One appearance field from the settings panel; the subtitles on screen follow at once
+function setSubtitleAppearance(field, value) {
+    saveSubtitleAppearance({ [field]: field === 'verticalPosition' ? Number(value) : value });
+    applySubtitleAppearance();
+}
+
+// Moves the cues of the player's track by the change since the offset last applied to them. A positive offset
+// shows them earlier, as Jellyfin Web's subtitle sync does.
+function applySubtitleOffset(session) {
+    const el = $('video-player')?.querySelector('track[data-player-subtitle]');
+    const cues = el?.track?.cues;
+    if (!el || !cues || activePlayback !== session) return;
+    const delta = session.subtitleOffset - Number(el.dataset.offset || 0);
+    if (!delta) return;
+    for (const cue of Array.from(cues)) {
+        cue.startTime -= delta;
+        cue.endTime -= delta;
+    }
+    el.dataset.offset = String(session.subtitleOffset);
+    renderSubtitleCues();
+}
+
+// G and H, and the panel's buttons: 0.1 s earlier (1) or later (-1); 0 resets. Text subtitles only.
+function changeSubtitleOffset(step) {
+    const session = activePlayback;
+    if (!session) return;
+    if (!playerSubtitleTrack($('video-player'))) {
+        showPlayerOsd(t('player.subtitle_offset_text_only'));
+        return;
+    }
+    session.subtitleOffset = step === 0 ? 0 : stepSubtitleOffset(session.subtitleOffset, step);
+    applySubtitleOffset(session);
+    const label = formatOffset(session.subtitleOffset);
+    showPlayerOsd(t('player.subtitle_offset_value', { offset: label }));
+    const value = $('player-subtitle-offset');
+    if (value) value.textContent = label;
+}
+
+function formatOffset(seconds) {
+    return `${seconds > 0 ? '+' : ''}${seconds.toFixed(1)} s`;
+}
+
+// A short message over the video (offset, skipped segment), gone after 1.5 s
+let osdTimer = null;
+function showPlayerOsd(text) {
+    const osd = $('player-osd');
+    if (!osd) return;
+    osd.textContent = text;
+    osd.hidden = false;
+    clearTimeout(osdTimer);
+    osdTimer = setTimeout(() => { osd.hidden = true; }, 1500);
 }
 
 // Language name in the page's language; und, mis, mul and zxx name no language
@@ -506,6 +597,8 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
     $('player-seek').value = 0;
     seekDragging = false;
     clearTextSubtitle();
+    applySubtitleAppearance();
+    closePlayerSettings();
     renderTrackMenus(null);
     resetEpisodeNav();
     hideSkipSegment();
@@ -578,6 +671,8 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
         segmentsLoad: null,
         audioIndex,
         subtitleIndex,
+        // Seconds the text subtitles show earlier (G, H); each playback starts at 0, as in Jellyfin Web
+        subtitleOffset: 0,
         burnedIn: false,
         tracksChanged: false,
         loads: 0,
@@ -1188,6 +1283,8 @@ function playerKeyAction(e) {
     case 'End': return () => seekPercent(100);
     case 'PageUp': return nextChapter;
     case 'PageDown': return previousChapter;
+    case 'g': return () => changeSubtitleOffset(-1);
+    case 'h': return () => changeSubtitleOffset(1);
     default: return null;
     }
 }
@@ -1412,6 +1509,30 @@ function hoverSeek(e) {
     showTrickplay(Math.min(Math.max((e.clientX - rect.left) / rect.width, 0), 1) * 100);
 }
 
+// --- The settings menu (the gear): fills its fields from the playback and the stored settings when it opens ---
+function renderPlayerSettings(open) {
+    if (!open) return;
+    const menu = $('player-settings');
+    const appearance = subtitleAppearance();
+    for (const field of menu?.querySelectorAll('#player-settings-subtitles [name]') || []) {
+        field.value = String(appearance[field.name] ?? '');
+    }
+    const offset = $('player-subtitle-offset');
+    if (offset) offset.textContent = formatOffset(activePlayback?.subtitleOffset || 0);
+    applySubtitleAppearance();
+}
+
+function closePlayerSettings() {
+    const menu = $('player-settings');
+    if (menu) menu.open = false;
+}
+
+// A click or tap outside the open menu closes it
+document.addEventListener('pointerdown', e => {
+    const menu = $('player-settings');
+    if (menu?.open && !menu.contains(e.target)) menu.open = false;
+});
+
 function toggleFullscreen() {
     const video = $('video-player');
     if (!video) return;
@@ -1455,7 +1576,8 @@ export {
     resumePositionTicks, playWithResumeChoice, stopPlayback, seekVideo, skipTime, previewSeek, changeAudioTrack,
     changeSubtitleTrack, playItem, playerAutoHide, onPlayerClosed, playerAreaClick, closePlayer, playAdjacentEpisode,
     playUpNextNow, cancelUpNext, togglePlayPause, setVolume, toggleMute, setPlaybackRate, toggleFullscreen,
-    togglePictureInPicture, skipSegment, hoverSeek, hideTrickplay,
+    togglePictureInPicture, skipSegment, hoverSeek, hideTrickplay, renderPlayerSettings, setSubtitleAppearance,
+    changeSubtitleOffset,
 };
 
 // Shared state that inline handlers or other modules assign: reached through window
