@@ -791,6 +791,18 @@ enum SortKey {
     ParentIndexNumber,
     IndexNumber,
     Random,
+    OfficialRating,
+    /// The newest date_created of a folder's children and grandchildren (a series' episodes), else
+    /// the item's own
+    DateLastContentAdded,
+    /// An episode's series' sort name, else its own
+    SeriesSortName,
+    /// The caller's play count of the item (bound user id)
+    PlayCount,
+    /// When the caller last played the item (bound user id)
+    DatePlayed,
+    /// When the caller last played one of a series' episodes (bound user id)
+    SeriesDatePlayed,
     /// Dropped after the keys are paired with the orders, so it never reaches a clause.
     Default,
     /// Any other key; it orders by `sort_name`.
@@ -812,6 +824,12 @@ impl SortKey {
             "parentindexnumber" => SortKey::ParentIndexNumber,
             "indexnumber" => SortKey::IndexNumber,
             "random" => SortKey::Random,
+            "officialrating" => SortKey::OfficialRating,
+            "datelastcontentadded" => SortKey::DateLastContentAdded,
+            "seriessortname" => SortKey::SeriesSortName,
+            "playcount" => SortKey::PlayCount,
+            "dateplayed" => SortKey::DatePlayed,
+            "seriesdateplayed" => SortKey::SeriesDatePlayed,
             _ => SortKey::Other,
         }
     }
@@ -832,8 +850,89 @@ impl SortKey {
             SortKey::ParentIndexNumber => "parent_index_number",
             SortKey::IndexNumber => "index_number",
             SortKey::Random => "ROWID",
+            // The rating's parental score (Jellyfin's ParentalRatingValue) from a bound JSON
+            // object of each stored rating's score; an unrated item has none
+            SortKey::OfficialRating => {
+                "(SELECT j.value FROM json_each(?) j WHERE j.key = media_items.official_rating)"
+            }
+            SortKey::DateLastContentAdded => concat!(
+                "COALESCE((SELECT MAX(d) FROM (",
+                "SELECT c.date_created AS d FROM media_items c WHERE c.parent_id = media_items.id ",
+                "UNION ALL SELECT g.date_created FROM media_items c ",
+                "JOIN media_items g ON g.parent_id = c.id WHERE c.parent_id = media_items.id)), ",
+                "date_created)"
+            ),
+            SortKey::SeriesSortName => concat!(
+                "COALESCE((SELECT p.sort_name FROM media_items p ",
+                "WHERE p.id = media_items.parent_id AND p.media_type = 'Series'), ",
+                "(SELECT g.sort_name FROM media_items p JOIN media_items g ON g.id = p.parent_id ",
+                "WHERE p.id = media_items.parent_id AND p.media_type = 'Season'), sort_name)"
+            ),
+            SortKey::PlayCount => concat!(
+                "COALESCE((SELECT ud.play_count FROM user_item_data ud ",
+                "WHERE ud.item_id = media_items.id AND ud.user_id = ?), 0)"
+            ),
+            SortKey::DatePlayed => concat!(
+                "(SELECT ud.last_played_date FROM user_item_data ud ",
+                "WHERE ud.item_id = media_items.id AND ud.user_id = ?)"
+            ),
+            SortKey::SeriesDatePlayed => concat!(
+                "(SELECT MAX(ud.last_played_date) FROM user_item_data ud WHERE ud.user_id = ? ",
+                "AND ud.item_id IN (SELECT c.id FROM media_items c WHERE c.parent_id = media_items.id ",
+                "UNION ALL SELECT g.id FROM media_items c JOIN media_items g ON g.parent_id = c.id ",
+                "WHERE c.parent_id = media_items.id))"
+            ),
         }
     }
+
+    /// What the key's expression binds (one `?`), if anything.
+    fn bind(self) -> Option<OrderBind> {
+        match self {
+            SortKey::PlayCount | SortKey::DatePlayed | SortKey::SeriesDatePlayed => {
+                Some(OrderBind::UserId)
+            }
+            SortKey::OfficialRating => Some(OrderBind::RatingScores),
+            _ => None,
+        }
+    }
+}
+
+/// A value the ORDER BY clause binds: the caller's user id, or the scores of the stored ratings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OrderBind {
+    UserId,
+    RatingScores,
+}
+
+/// The binds the ORDER BY clause of `sort_by` and `sort_order` takes, in order, after the
+/// filters' binds and before LIMIT and OFFSET.
+fn order_binds(sort_by: &str, sort_order: &str) -> Vec<OrderBind> {
+    let terms = parse_sort(sort_by, sort_order);
+    if is_random_sort(&terms) {
+        return Vec::new();
+    }
+    terms.iter().filter_map(|term| term.key.bind()).collect()
+}
+
+/// Each stored rating's parental score as a JSON object, `{rating: score * 1000 + sub score}`, for
+/// the OfficialRating sort. Ratings without a score (unrated, unknown) are left out, so they sort
+/// as unrated, before the others in ascending order, as Jellyfin's do.
+async fn rating_scores_json(pool: &SqlitePool) -> Result<String, sqlx::Error> {
+    let ratings: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT official_rating FROM media_items \
+         WHERE official_rating IS NOT NULL AND official_rating != ''",
+    )
+    .fetch_all(pool)
+    .await?;
+    let scores: serde_json::Map<String, serde_json::Value> = ratings
+        .into_iter()
+        .filter_map(|rating| {
+            let score = rustyfin_model::parental::rating_score(&rating)?;
+            let value = i64::from(score.score) * 1000 + i64::from(score.sub_score.unwrap_or(0));
+            Some((rating, value.into()))
+        })
+        .collect();
+    Ok(serde_json::Value::Object(scores).to_string())
 }
 
 /// One sort key with its direction.
@@ -930,6 +1029,10 @@ fn order_by_clause(terms: &[SortTerm]) -> String {
         add(term.key.expr(), dir);
         if i == 0 && term.key == SortKey::SortName {
             add("name", dir);
+        }
+        // Equal scores (PG-13 and TV-14) go by the rating text
+        if term.key == SortKey::OfficialRating {
+            add("official_rating", dir);
         }
     }
     let has_name_key = terms
@@ -1537,6 +1640,20 @@ pub async fn get_items_filtered(
     }
     if is_unplayed.is_some() {
         data_q = data_q.bind(&played_folders).bind(&uid_str);
+    }
+
+    // The sort keys' binds: the user id (play count, date played), the rating scores
+    let order_binds = order_binds(sort_by_str, sort_order_str);
+    let scores = if order_binds.contains(&OrderBind::RatingScores) {
+        rating_scores_json(pool).await?
+    } else {
+        String::new()
+    };
+    for bind in order_binds {
+        data_q = match bind {
+            OrderBind::UserId => data_q.bind(uid_str.clone()),
+            OrderBind::RatingScores => data_q.bind(scores.clone()),
+        };
     }
 
     // Pagination

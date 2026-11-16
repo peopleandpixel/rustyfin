@@ -12,6 +12,9 @@ import {
 import { renderSearch } from './search.js';
 import { playWithResumeChoice, stopPlayback, playItem, playerAutoHide, onPlayerClosed } from './player.js';
 import { playContainer } from './queue.js';
+import {
+    openCardMenu, toggleCardPlayed, toggleCardFavorite, setCardLikes, playCardItem, openAddTo,
+} from './cardmenu.js';
 import { playAlbumFrom } from './music.js';
 import { renderSettings } from './settings.js';
 import {
@@ -146,6 +149,15 @@ const clickActions = {
     'scan-all': () => startScanWithToast(API.scanAllLibraries(), t('admin.scanning_all')),
     'jump-letter': el => jumpToLetter(el.dataset.id, el.dataset.letter),
     'clear-library-filters': el => clearLibraryFilters(el.dataset.id),
+    // A card's buttons and its context menu's commands (cardmenu.js)
+    'card-menu': el => openCardMenu(el),
+    'card-played': el => toggleCardPlayed(el),
+    'card-favorite': el => toggleCardFavorite(el),
+    'card-like': el => setCardLikes(el, true),
+    'card-dislike': el => setCardLikes(el, false),
+    'card-play': el => playCardItem(el),
+    'card-add-playlist': el => openAddTo(el, 'playlist'),
+    'card-add-collection': el => openAddTo(el, 'collection'),
     'toggle-favorite': el => toggleFavorite(el.dataset.id, el.dataset.favorite === 'true'),
     'toggle-played': el => togglePlayed(el.dataset.id, el.dataset.played === 'true', el.dataset.all === 'true'),
     'delete-item': el => deleteItemFromDetail(el.dataset),

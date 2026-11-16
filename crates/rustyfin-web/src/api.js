@@ -471,7 +471,11 @@ const API = {
     markUnplayed(itemId) { return this.del(`/Users/${this.userId}/PlayedItems/${itemId}`); },
     setFavorite(itemId) { return this.post(`/Users/${this.userId}/FavoriteItems/${itemId}`); },
     unsetFavorite(itemId) { return this.del(`/Users/${this.userId}/FavoriteItems/${itemId}`); },
-    setRating(itemId, rating) { return this.put(`/Users/${this.userId}/Items/${itemId}/Rating`, { Rating: rating }); },
+    // Like (true) or dislike (false) an item, as Jellyfin's POST /UserItems/{id}/Rating?likes=; null clears it
+    setRating(itemId, likes) {
+        const path = `/UserItems/${encodeURIComponent(itemId)}/Rating`;
+        return likes === null ? this.del(path) : this.post(`${path}?likes=${likes ? 'true' : 'false'}`);
+    },
 
     // Streaming & Playback info
     streamUrl(itemId, type = 'Videos') {
@@ -561,6 +565,8 @@ const API = {
     getPlaylists() { return this.get('/Playlists'); },
     createPlaylist(name, ids) { return this.post('/Playlists', { Name: name, ItemIds: ids }); },
     getPlaylistItems(id) { return this.get(`/Playlists/${id}/Items`); },
+    addToPlaylist(id, ids) { return this.post(`/Playlists/${encodeURIComponent(id)}/Items?Ids=${ids.map(encodeURIComponent).join(',')}&UserId=${this.userId}`); },
+    addToCollection(id, ids) { return this.post(`/Collections/${encodeURIComponent(id)}/Items?Ids=${ids.map(encodeURIComponent).join(',')}`); },
 
     // Scheduled Tasks
     getTasks() { return this.get('/ScheduledTasks'); },
