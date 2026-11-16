@@ -26,6 +26,25 @@
         "type": "Type",
         "delete": "Delete"
     },
+    "remote": {
+        "play_on": "Play on",
+        "no_targets": "No other device can take over playback right now.",
+        "sent": "Playback sent to the other device.",
+        "command_failed": "The device could not be controlled.",
+        "queue_unsupported": "Adding to the queue from another device isn't supported yet.",
+        "idle": "Not playing",
+        "no_sessions": "No active sessions.",
+        "this_device": "this device",
+        "direct_play": "Direct play",
+        "direct_stream": "Direct stream",
+        "transcode": "Transcoding",
+        "pause": "Pause",
+        "resume": "Resume",
+        "stop": "Stop",
+        "send_message": "Send message",
+        "message_prompt": "Message to show on this device:",
+        "message_sent": "Message sent."
+    },
     "wizard": {
         "language_title": "Language & Region",
         "language_intro": "Choose the language of the interface and the preferred language for descriptions and metadata.",

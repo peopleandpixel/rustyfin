@@ -602,6 +602,11 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
             if (this.audioIndex !== null) fields.AudioStreamIndex = this.audioIndex;
             if (this.subtitleIndex !== null) fields.SubtitleStreamIndex = this.subtitleIndex;
             if (this.playSessionId) fields.PlaySessionId = this.playSessionId;
+            // The play state a session list shows (Jellyfin's PlayerStateInfo)
+            const video = $('video-player');
+            fields.PlayMethod = this.isHls ? 'Transcode' : 'DirectPlay';
+            fields.CanSeek = true;
+            if (video) Object.assign(fields, { VolumeLevel: Math.round(video.volume * 100), IsMuted: video.muted });
             return fields;
         },
         stop() {
@@ -1447,7 +1452,18 @@ document.addEventListener('keydown', e => {
     }
 });
 
+// Remote control (remote.js): the playing item and where it is, and a seek to an item time in ticks
+function nowPlaying() {
+    const s = activePlayback;
+    return s ? { itemId: s.itemId, streamType: s.streamType, positionTicks: Math.round(s.position() * 1e7) } : null;
+}
+
+function seekToTicks(ticks) {
+    if (activePlayback) seekTo(activePlayback, ticks / 1e7);
+}
+
 export {
+    nowPlaying, seekToTicks,
     resumePositionTicks, playWithResumeChoice, stopPlayback, seekVideo, skipTime, previewSeek, changeAudioTrack,
     changeSubtitleTrack, playItem, playerAutoHide, onPlayerClosed, playerAreaClick, closePlayer, playAdjacentEpisode,
     playUpNextNow, cancelUpNext, togglePlayPause, setVolume, toggleMute, setPlaybackRate, toggleFullscreen,

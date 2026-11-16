@@ -21,6 +21,8 @@ import {
     toggleFullscreen, togglePictureInPicture, skipSegment, hoverSeek, hideTrickplay,
 } from './modules/player.js';
 import './modules/queue.js';
+import './modules/remote.js';
+import { sessionControl, openPlayOn, playOnSession } from './modules/sessions.js';
 import { changeNextEpisodeAutoPlay, changeUiLanguage, handleSaveConfig } from './modules/settings.js';
 import { refreshTasks, openAddUser, closeAddUser, submitAddUser, clearLiveLog, setLogLevel } from './modules/admin.js';
 import {
@@ -42,5 +44,5 @@ Object.assign(window, {
     jiNewCode, jiCopyCodes, refreshTasks, openAddLibrary, closeAddLibrary, submitAddLibrary, closeLibraryOptions,
     submitLibraryOptions, openAddUser, closeAddUser,
     submitAddUser, clearLiveLog, setLogLevel, closePluginConfig, savePluginConfig, closePluginPriority,
-    savePluginPriority,
+    savePluginPriority, sessionControl, openPlayOn, playOnSession,
 });

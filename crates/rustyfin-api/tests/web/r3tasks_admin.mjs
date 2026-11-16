@@ -67,6 +67,8 @@ function sandbox(answers) {
         initLiveLog: () => {},
         loadOidcAdminTab: () => {},
         loadJellyfinImport: () => {},
+        followSessions: () => {},
+        unfollowSessions: () => {},
     });
     vm.runInContext(
         `${slice('function getTaskStateLabel(')}

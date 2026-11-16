@@ -26,6 +26,25 @@
         "type": "Typ",
         "delete": "Löschen"
     },
+    "remote": {
+        "play_on": "Wiedergeben auf",
+        "no_targets": "Gerade kann kein anderes Gerät die Wiedergabe übernehmen.",
+        "sent": "Wiedergabe an das andere Gerät übergeben.",
+        "command_failed": "Das Gerät konnte nicht gesteuert werden.",
+        "queue_unsupported": "Das Einreihen von einem anderen Gerät aus wird noch nicht unterstützt.",
+        "idle": "Keine Wiedergabe",
+        "no_sessions": "Keine aktiven Sitzungen.",
+        "this_device": "dieses Gerät",
+        "direct_play": "Direkte Wiedergabe",
+        "direct_stream": "Direktes Streaming",
+        "transcode": "Transkodierung",
+        "pause": "Pause",
+        "resume": "Fortsetzen",
+        "stop": "Stopp",
+        "send_message": "Nachricht senden",
+        "message_prompt": "Nachricht, die auf diesem Gerät erscheinen soll:",
+        "message_sent": "Nachricht gesendet."
+    },
     "wizard": {
         "language_title": "Sprache & Region",
         "language_intro": "Wähle die Sprache der Oberfläche und die bevorzugte Sprache für Filmbeschreibungen und Metadaten-Abrufe.",

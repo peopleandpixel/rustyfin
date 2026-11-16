@@ -3250,8 +3250,10 @@ const B124_WEB_MODULES: &[&str] = &[
     "player.js",
     "plugins.js",
     "queue.js",
+    "remote.js",
     "router.js",
     "search.js",
+    "sessions.js",
     "settings.js",
     "util.js",
     "wizard.js",
@@ -23322,6 +23324,11 @@ fn r3player_queue() {
     b124_node_test("r3player_queue.mjs");
 }
 
+// The web client as a remote control target (remote.js) and controller (the dashboard's sessions, Play on)
+#[test]
+fn r3sessions_remote() {
+    b124_node_test("r3sessions_remote.mjs");
+}
 
 // The web player's trickplay thumbnails, skip intro, keyboard shortcuts, Media Session and picture-in-picture
 #[test]
