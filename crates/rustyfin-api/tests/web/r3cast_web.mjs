@@ -62,7 +62,7 @@ function castFramework() {
     return { context, framework };
 }
 
-function sandbox({ ua = CHROME, playing = null, receiverId = '6F511C87', sessions = [] } = {}) {
+function sandbox({ ua = CHROME, playing = null, receiverId = '6F511C87', sessions = [], stored = {}, token = 'tok' } = {}) {
     const calls = [];
     const log = name => (...args) => { calls.push([name, ...args]); };
     const elements = {};
@@ -96,7 +96,12 @@ function sandbox({ ua = CHROME, playing = null, receiverId = '6F511C87', session
         i2: { Id: 'i2', ServerId: 'srv', Name: 'Other Film', Type: 'Movie', MediaType: 'Video', IsFolder: false, RunTimeTicks: 2e10,
             UserData: { PlaybackPositionTicks: 7e8 } },
     };
-    const window = { chrome: { cast: { AutoJoinPolicy: { ORIGIN_SCOPED: 'origin_scoped' } } }, navigator: { userAgent: ua }, isSecureContext: true };
+    const idle = [];
+    const storage = { rustyfin_device_id: 'me', ...stored };
+    const window = {
+        chrome: { cast: { AutoJoinPolicy: { ORIGIN_SCOPED: 'origin_scoped' } } }, navigator: { userAgent: ua }, isSecureContext: true,
+        requestIdleCallback: fn => { idle.push(fn); },
+    };
     if (!/Chrome\//.test(ua)) delete window.chrome;
     const ctx = {
         console, Promise, JSON, Math, Number, String, Object, Date, Set, Infinity, encodeURIComponent,
@@ -108,14 +113,14 @@ function sandbox({ ua = CHROME, playing = null, receiverId = '6F511C87', session
             activeElement: null,
         },
         location: { hostname: 'rf.test' },
-        localStorage: { getItem: k => (k === 'rustyfin_device_id' ? 'me' : null) },
+        localStorage: { getItem: k => storage[k] ?? null, setItem: (k, v) => { storage[k] = String(v); } },
         setTimeout: () => 0,
         clearTimeout: () => {},
         setInterval: () => 1,
         clearInterval: () => {},
         t: (key, vars) => (vars ? `${key}:${JSON.stringify(vars)}` : key),
         API: {
-            token: 'tok', userId: 'u1', base: 'https://rf.test',
+            token, userId: 'u1', base: 'https://rf.test',
             getMe: async () => ({ Configuration: receiverId ? { CastReceiverId: receiverId } : {} }),
             get: async path => {
                 if (path === '/System/Info/Public') return { Id: 'srv', Version: '10.11.0', LocalAddress: 'http://192.0.2.5:8096' };
@@ -151,7 +156,7 @@ function sandbox({ ua = CHROME, playing = null, receiverId = '6F511C87', session
         window.__onGCastApiAvailable(true);
         await flush();
     };
-    return { ctx, cast, sessions: sessionsModule, calls, elements, scripts, context, intercept, sdkLoaded, navCast };
+    return { ctx, cast, sessions: sessionsModule, calls, elements, scripts, context, intercept, sdkLoaded, navCast, idle, storage };
 }
 
 const flush = () => new Promise(resolve => setImmediate(resolve));
@@ -195,6 +200,37 @@ test('The SDK loads from Google only on demand, once, and uses the user\'s recei
     other.cast.loadCastSdk();
     await other.sdkLoaded();
     assert.equal(other.context.options.receiverApplicationId, 'F007D354', 'Jellyfin\'s stable receiver by default');
+});
+
+test('Opening the picker remembers Cast; later page loads fetch the SDK when idle and rejoin a running cast', async () => {
+    const fresh = sandbox({ playing: { itemId: 'i1', streamType: 'Videos', positionTicks: 0 } });
+    assert.equal(fresh.idle.length, 0, 'a browser that never opened the picker schedules nothing');
+    assert.equal(fresh.scripts.length, 0);
+    await fresh.sessions.openPlayOn();
+    assert.equal(fresh.storage.rustyfin_cast_used, '1');
+
+    const sb = sandbox({ stored: { rustyfin_cast_used: '1' } });
+    assert.equal(sb.scripts.length, 0, 'not during the page load itself');
+    assert.equal(sb.idle.length, 1);
+    sb.idle[0]();
+    assert.equal(sb.scripts.length, 1);
+    await sb.sdkLoaded();
+    sb.context.listeners.caststatechanged({ castState: 'CONNECTED' });
+    assert.ok(!sb.navCast.classList.contains('hidden'), 'the header button shows without opening the picker');
+    // The SDK's auto-join finds the cast this browser started before the reload
+    sb.context.current = new FakeSession();
+    sb.context.listeners.sessionstatechanged({ sessionState: 'SESSION_RESUMED' });
+    await flush();
+    assert.equal(sb.cast.isCasting(), true);
+    assert.equal(sent(sb)[0].command, 'Identify');
+    assert.ok(sb.elements['cast-bar']);
+
+    // Never in a browser that can't cast, nor signed out
+    for (const opts of [{ ua: FIREFOX }, { ua: SAFARI }, { token: null }]) {
+        const other = sandbox({ ...opts, stored: { rustyfin_cast_used: '1' } });
+        assert.equal(other.idle.length, 0, JSON.stringify(opts));
+        assert.equal(other.scripts.length, 0);
+    }
 });
 
 test('A failed SDK load can be tried again', async () => {

@@ -1,7 +1,9 @@
 // Google Cast, as Jellyfin Web's chromecastPlayer: this browser is the sender, and the Jellyfin receiver app
 // (the user's CastReceiverId, one of the server's CastReceiverApplications) plays from this server itself with
-// this user's token. The sender SDK loads from Google's CDN only when the user opens the "Play on" picker, and
-// never in a browser that can't cast (Firefox, Safari, iOS). Commands go to the receiver on Jellyfin's connectsdk
+// this user's token. The sender SDK loads from Google's CDN only once the user has opened the "Play on" picker in
+// this browser: then, and on later page loads when the page is idle (so the header button shows and a running cast
+// is rejoined). A browser that never opened the picker never contacts Google, and one that can't cast (Firefox,
+// Safari, iOS) never loads it. Commands go to the receiver on Jellyfin's connectsdk
 // namespace; what it reports back drives the cast bar. Stopping the cast resumes here where the receiver was.
 import { $, icon, toast, escapeHtml, formatDurationSeconds } from './util.js';
 import { nowPlaying, closePlayer, playItem, setPlayInterceptor } from './player.js';
@@ -12,6 +14,8 @@ const SDK_TIMEOUT_MS = 15000;
 const NAMESPACE = 'urn:x-cast:com.connectsdk';
 // Jellyfin's stable receiver, for a user configuration without a CastReceiverId
 const DEFAULT_RECEIVER = 'F007D354';
+// Set when the user first opens the picker in a browser that can cast: from then on the SDK loads when idle
+const CAST_USED_KEY = 'rustyfin_cast_used';
 
 let sdk = null;
 let castState = 'NO_DEVICES_AVAILABLE';
@@ -441,8 +445,20 @@ function castPickerEntry() {
 // Opening the picker loads the SDK; the entry is drawn again once it knows about devices
 function refreshPickerEntry() {
     if (!castSupported()) return;
+    try {
+        localStorage.setItem(CAST_USED_KEY, '1');
+    } catch (e) { /* storage off: the SDK loads with the picker only */ }
     loadCastSdk().then(updateCastButtons);
 }
+
+// After the user has used the picker in this browser, a page load fetches the SDK once the page is idle
+function loadCastWhenIdle() {
+    if (!castSupported() || !API.token || localStorage.getItem(CAST_USED_KEY) !== '1') return false;
+    const idle = window.requestIdleCallback || (fn => setTimeout(fn, 2000));
+    idle(() => { loadCastSdk().then(updateCastButtons); });
+    return true;
+}
+loadCastWhenIdle();
 
 export {
     castSupported, loadCastSdk, isCasting, castPickerEntry, refreshPickerEntry, castToDevice, stopCasting, castPlay,
