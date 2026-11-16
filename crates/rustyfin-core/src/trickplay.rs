@@ -24,6 +24,7 @@ use uuid::Uuid;
 use rustyfin_model::trickplay::TrickplayInfo;
 
 use crate::key_frames::{self, Codec, KeyFrameStream};
+use crate::mkv_index::{self, MkvIndex};
 
 /// Thumbnail width, in pixels.
 pub const WIDTH: u32 = 320;
@@ -382,7 +383,7 @@ fn rejects_input_bsf(e: &str) -> bool {
 }
 
 /// What `make_tiles` knows of a video before reading it, from one short ffprobe run.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Probe {
     /// Where ffmpeg starts the video's time line, in the file's seconds.
     start: f64,
@@ -415,6 +416,8 @@ struct RawVideo {
     /// The container's cropping (Matroska PixelCrop, MP4 `clap`), in pixels from the top,
     /// bottom, left and right, which ffmpeg applies to the file but can't see in a raw stream.
     crop: Option<[u64; 4]>,
+    /// A Matroska file's Cues, which find the key frames without ffprobe.
+    index: Option<Arc<MkvIndex>>,
 }
 
 impl RawVideo {
@@ -610,8 +613,20 @@ async fn probe(path: &str, cancel: &Cancel) -> Result<Option<Probe>, String> {
             config: key_frames::hex_dump(stream["extradata"].as_str().unwrap_or_default()),
             sar,
             crop,
+            index: None,
         })
         .filter(|raw| KeyFrameStream::new(raw.codec, &raw.config).is_some());
+    let mut raw = raw;
+    if let Some(raw) = raw.as_mut()
+        && format_name.contains("matroska")
+    {
+        let file = PathBuf::from(path);
+        raw.index = tokio::task::spawn_blocking(move || MkvIndex::read(&file))
+            .await
+            .ok()
+            .flatten()
+            .map(Arc::new);
+    }
     let probe = (|| {
         Some(Probe {
             start: num(&format["start_time"])?,
@@ -735,22 +750,43 @@ async fn seek_tile(
         _ = cancel.cancelled() => return Err("cancelled".to_string()),
     };
     let interval = f64::from(INTERVAL_MS) / 1000.0;
-    let intervals: Vec<String> = slots
-        .clone()
-        // Just before the middle: a key frame right on it is the next thumbnail's to the fps
-        // filter. A millisecond, as Matroska's times are in milliseconds and a seek rounds to them.
-        .map(|k| {
-            format!(
-                "{:.6}%+#1",
-                start + f64::from(k) * interval + interval / 2.0 - 1e-3
-            )
-        })
+    // Just before the middle: a key frame right on it is the next thumbnail's to the fps
+    // filter. A millisecond, as Matroska's times are in milliseconds and a seek rounds to them.
+    let targets: Vec<f64> = slots
+        .map(|k| start + f64::from(k) * interval + interval / 2.0 - 1e-3)
         .collect();
+    let intervals: Vec<String> = targets.iter().map(|t| format!("{t:.6}%+#1")).collect();
     let intervals = intervals.join(",");
     match raw {
-        Some(raw) => raw_tile(&tile, &intervals, slots.len(), &raw, cancel).await,
-        None => concat_tile(&tile, &intervals, slots.len(), cancel).await,
+        Some(raw) => {
+            if let Some(index) = &raw.index {
+                let from = PacketSource::Index {
+                    index,
+                    targets: &targets,
+                };
+                match raw_tile(&tile, from, targets.len(), &raw, cancel).await {
+                    Err(e) if e.starts_with(mkv_index::INDEX_FAILED) => {
+                        info!(path = tile.path, error = %e, "trickplay asks ffprobe for the key frames");
+                    }
+                    done => return done,
+                }
+            }
+            let from = PacketSource::Probe(&intervals);
+            raw_tile(&tile, from, targets.len(), &raw, cancel).await
+        }
+        None => concat_tile(&tile, &intervals, targets.len(), cancel).await,
     }
+}
+
+/// Where `raw_tile` gets a tile's key frame packets.
+enum PacketSource<'a> {
+    /// From ffprobe, which seeks to each of these intervals (`-read_intervals`).
+    Probe(&'a str),
+    /// From the file's Matroska index: the key frame each of the times seeks to.
+    Index {
+        index: &'a Arc<MkvIndex>,
+        targets: &'a [f64],
+    },
 }
 
 /// The ffmpeg arguments that decode one input into tile image `tile`, and list each frame
@@ -805,15 +841,15 @@ async fn frame_times(frames: &Path) -> Result<Vec<i64>, String> {
         .collect())
 }
 
-/// `seek_tile` from a raw stream: one ffprobe opens the file once, seeks to each of the
-/// `wanted` key frames (`intervals`) and prints its packet, which a `KeyFrameStream` turns into
-/// the input of one ffmpeg. The order is the stream's own (see `key_frames`), so this checks
-/// that each key frame gave one frame, and that the decoder met no error: ffmpeg conceals a
-/// damaged slice and still hands out a frame, so a decode error stops it (`-xerror`) and any
-/// error it prints fails the tile (`pipe_key_frames`).
+/// `seek_tile` from a raw stream: the `wanted` key frames' packets come `from` the Matroska
+/// index or from ffprobe, and a `KeyFrameStream` turns them into the input of one ffmpeg. The
+/// order is the stream's own (see `key_frames`), so this checks that each key frame gave one
+/// frame, and that the decoder met no error: ffmpeg conceals a damaged slice and still hands
+/// out a frame, so a decode error stops it (`-xerror`) and any error it prints fails the tile
+/// (`pipe_key_frames`).
 async fn raw_tile(
     tile: &Tile<'_>,
-    intervals: &str,
+    from: PacketSource<'_>,
     wanted: usize,
     raw: &RawVideo,
     cancel: &Cancel,
@@ -835,24 +871,7 @@ async fn raw_tile(
     .map(String::from)
     .to_vec();
     let ffmpeg_args = tile_args(input, &raw.container_filters(), tile, &frames);
-    let probe_args = [
-        "-probesize",
-        PROBE_BYTES,
-        "-analyzeduration",
-        "0",
-        "-select_streams",
-        // The first video that isn't cover art, as ffmpeg's 0:V:0
-        "V:0",
-        "-read_intervals",
-        intervals,
-        "-show_data",
-        "-show_entries",
-        "packet=flags,data",
-        "-of",
-        "default=noprint_wrappers=1",
-        tile.path,
-    ];
-    let fed = pipe_key_frames(&probe_args, &ffmpeg_args, stream, cancel).await?;
+    let fed = pipe_key_frames(from, tile.path, &ffmpeg_args, stream, cancel).await?;
     if fed != wanted {
         return Err(format!("ffprobe found {fed} of {wanted} key frames"));
     }
@@ -867,119 +886,202 @@ async fn raw_tile(
     Ok(())
 }
 
-/// Runs ffprobe with `probe_args`, which prints key frame packets (`-show_data`), and ffmpeg
-/// with `ffmpeg_args`, which reads them from its input as `stream` turns them out. Both run as
-/// `run_tool` runs one, and fail as it does; ffmpeg fails too where it printed an error, as
-/// it runs at the error log level. Returns how many packets went through.
+/// Turns key frame packets into ffmpeg's input, through a `KeyFrameStream`.
+struct Feed {
+    stream: KeyFrameStream,
+    input: tokio::process::ChildStdin,
+    out: Vec<u8>,
+    fed: usize,
+}
+
+impl Feed {
+    async fn send(&mut self, packet: &[u8]) -> Result<(), String> {
+        use tokio::io::AsyncWriteExt;
+        self.out.clear();
+        self.stream.push(packet, &mut self.out)?;
+        self.fed += 1;
+        self.input
+            .write_all(&self.out)
+            .await
+            .map_err(|e| format!("ffmpeg stopped reading the key frames: {e}"))
+    }
+
+    /// Sends the key frames ffprobe prints (`-show_data`) with `probe_args`. Dropping it kills
+    /// ffprobe.
+    async fn from_probe(&mut self, probe_args: &[&str]) -> Result<(), String> {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        let mut probe = tool("ffprobe");
+        probe.args(probe_args).stdin(Stdio::null());
+        let mut probe = probe
+            .spawn()
+            .map_err(|e| format!("ffprobe could not start: {e}"))?;
+        let packets = probe.stdout.take().ok_or("ffprobe has no pipe")?;
+        let read = async {
+            let mut lines = BufReader::with_capacity(1 << 16, packets);
+            // One buffer for every line: a 4K key frame takes thousands
+            let mut line = Vec::with_capacity(128);
+            let (mut packet, mut key, mut seen) = (Vec::new(), false, false);
+            // Each packet: flags=K__, then data=, its hex dump and an empty line
+            loop {
+                line.clear();
+                let read = lines
+                    .read_until(b'\n', &mut line)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let text = line.trim_ascii_end();
+                let next = text.strip_prefix(b"flags=");
+                if (read == 0 || next.is_some()) && seen {
+                    if !key {
+                        return Err("ffprobe landed on a frame that isn't a key frame".to_string());
+                    }
+                    self.send(&packet).await?;
+                    packet.clear();
+                }
+                if read == 0 {
+                    return Ok(());
+                }
+                if let Some(flags) = next {
+                    key = flags.starts_with(b"K");
+                    seen = true;
+                } else if !text.is_empty()
+                    && text != b"data="
+                    && !key_frames::hex_line(text, &mut packet)
+                {
+                    return Err(format!(
+                        "ffprobe printed {:?}",
+                        String::from_utf8_lossy(text)
+                    ));
+                }
+            }
+        };
+        tokio::try_join!(read, async {
+            exited("ffprobe", probe.wait_with_output().await, false)
+        })
+        .map(drop)
+    }
+
+    /// Sends the key frame each of `targets` seeks to in `index`, from the file at `path`, each
+    /// read while the one before goes to ffmpeg.
+    async fn from_index(
+        &mut self,
+        index: &Arc<MkvIndex>,
+        path: &str,
+        targets: &[f64],
+    ) -> Result<(), String> {
+        let file = std::fs::File::open(path)
+            .map(Arc::new)
+            .map_err(|e| format!("{}: {e}", mkv_index::INDEX_FAILED))?;
+        let read = |target: f64| {
+            let (index, file) = (index.clone(), file.clone());
+            tokio::task::spawn_blocking(move || index.frame(&file, index.pick(target)))
+        };
+        let mut targets = targets.iter();
+        let mut next = targets.next().map(|&t| read(t));
+        while let Some(reading) = next.take() {
+            let packet = reading.await.map_err(|e| e.to_string())??;
+            next = targets.next().map(|&t| read(t));
+            self.send(&packet).await?;
+        }
+        Ok(())
+    }
+}
+
+/// A `run_tool`-like command for `program` whose output is piped.
+fn tool(program: &str) -> Command {
+    let mut cmd = Command::new(program);
+    cmd.args(["-hide_banner", "-loglevel", "error"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    crate::media_reads::lower_priority(&mut cmd);
+    cmd
+}
+
+/// `Ok` where `program` exited well, and where `quiet`, printed nothing (it runs at the error
+/// log level).
+fn exited(
+    program: &str,
+    output: std::io::Result<std::process::Output>,
+    quiet: bool,
+) -> Result<(), String> {
+    let output = output.map_err(|e| format!("{program} failed: {e}"))?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        Err(format!("{program} failed: {}", stderr.trim()))
+    } else if quiet && !stderr.trim().is_empty() {
+        Err(format!("{program} met an error: {}", stderr.trim()))
+    } else {
+        Ok(())
+    }
+}
+
+/// Runs ffmpeg with `ffmpeg_args`, which reads the key frame packets of the video at `path`
+/// that come `from` the index or ffprobe, as `stream` turns them out. ffmpeg and ffprobe run as
+/// `run_tool` runs one, and fail as it does; ffmpeg fails too where it printed an error. Returns
+/// how many packets went through.
 async fn pipe_key_frames(
-    probe_args: &[&str],
+    from: PacketSource<'_>,
+    path: &str,
     ffmpeg_args: &[String],
-    mut stream: KeyFrameStream,
+    stream: KeyFrameStream,
     cancel: &Cancel,
 ) -> Result<usize, String> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-
-    let command = |program: &str| {
-        let mut cmd = Command::new(program);
-        cmd.args(["-hide_banner", "-loglevel", "error"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        crate::media_reads::lower_priority(&mut cmd);
-        cmd
-    };
-    let mut probe = command("ffprobe");
-    probe.args(probe_args).stdin(Stdio::null());
-    let mut ffmpeg = command("ffmpeg");
+    let mut ffmpeg = tool("ffmpeg");
     ffmpeg
         .args(["-nostdin", "-y"])
         .args(ffmpeg_args)
         .stdin(Stdio::piped());
-    let mut probe = probe
-        .spawn()
-        .map_err(|e| format!("ffprobe could not start: {e}"))?;
     let mut ffmpeg = ffmpeg
         .spawn()
         .map_err(|e| format!("ffmpeg could not start: {e}"))?;
-    let (Some(packets), Some(mut input)) = (probe.stdout.take(), ffmpeg.stdin.take()) else {
-        return Err("ffprobe or ffmpeg has no pipe".to_string());
+    let input = ffmpeg.stdin.take().ok_or("ffmpeg has no pipe")?;
+    let mut feed = Feed {
+        stream,
+        input,
+        out: Vec::new(),
+        fed: 0,
     };
-    let feed = async move {
-        let mut lines = BufReader::with_capacity(1 << 16, packets);
-        // One buffer for every line: a 4K key frame takes thousands
-        let mut line = Vec::with_capacity(128);
-        let (mut packet, mut key, mut fed) = (Vec::new(), false, 0);
-        let mut out = Vec::new();
-        let mut send = async |packet: &mut Vec<u8>, key: bool| -> Result<(), String> {
-            if !key {
-                return Err("ffprobe landed on a frame that isn't a key frame".to_string());
+    let feeding = async {
+        match from {
+            PacketSource::Probe(intervals) => {
+                let probe_args = [
+                    "-probesize",
+                    PROBE_BYTES,
+                    "-analyzeduration",
+                    "0",
+                    "-select_streams",
+                    // The first video that isn't cover art, as ffmpeg's 0:V:0
+                    "V:0",
+                    "-read_intervals",
+                    intervals,
+                    "-show_data",
+                    "-show_entries",
+                    "packet=flags,data",
+                    "-of",
+                    "default=noprint_wrappers=1",
+                    path,
+                ];
+                feed.from_probe(&probe_args).await?;
             }
-            out.clear();
-            stream.push(packet, &mut out)?;
-            packet.clear();
-            input
-                .write_all(&out)
-                .await
-                .map_err(|e| format!("ffmpeg stopped reading the key frames: {e}"))
-        };
-        // Each packet: flags=K__, then data=, its hex dump and an empty line
-        loop {
-            line.clear();
-            let read = lines
-                .read_until(b'\n', &mut line)
-                .await
-                .map_err(|e| e.to_string())?;
-            if read == 0 {
-                break;
-            }
-            let text = line.trim_ascii_end();
-            if let Some(flags) = text.strip_prefix(b"flags=") {
-                if fed > 0 {
-                    send(&mut packet, key).await?;
-                }
-                key = flags.starts_with(b"K");
-                fed += 1;
-            } else if !text.is_empty()
-                && text != b"data="
-                && !key_frames::hex_line(text, &mut packet)
-            {
-                return Err(format!(
-                    "ffprobe printed {:?}",
-                    String::from_utf8_lossy(text)
-                ));
+            PacketSource::Index { index, targets } => {
+                feed.from_index(index, path, targets).await?;
             }
         }
-        if fed > 0 {
-            send(&mut packet, key).await?;
-        }
-        drop(send);
         // ffmpeg's input ends here
+        let Feed { fed, input, .. } = feed;
         drop(input);
-        Ok(fed)
+        Ok::<_, String>(fed)
     };
-    let done =
-        |program: &'static str, output: std::io::Result<std::process::Output>, quiet: bool| {
-            let output = output.map_err(|e| format!("{program} failed: {e}"))?;
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if !output.status.success() {
-                Err(format!("{program} failed: {}", stderr.trim()))
-            } else if quiet && !stderr.trim().is_empty() {
-                Err(format!("{program} met an error: {}", stderr.trim()))
-            } else {
-                Ok(())
-            }
-        };
     let both = async {
-        // The first to fail drops the others, which kills ffprobe and ffmpeg (kill_on_drop)
-        tokio::try_join!(
-            feed,
-            async { done("ffprobe", probe.wait_with_output().await, false) },
-            async { done("ffmpeg", ffmpeg.wait_with_output().await, true) },
-        )
+        // The first to fail drops the other, which kills ffprobe and ffmpeg (kill_on_drop)
+        tokio::try_join!(feeding, async {
+            exited("ffmpeg", ffmpeg.wait_with_output().await, true)
+        })
     };
     tokio::select! {
         out = tokio::time::timeout(FFMPEG_TIMEOUT, both) => match out {
-            Ok(out) => out.map(|(fed, (), ())| fed),
+            Ok(out) => out.map(|(fed, ())| fed),
             Err(_) => Err("ffprobe and ffmpeg took too long and were stopped".to_string()),
         },
         _ = cancel.cancelled() => Err("cancelled".to_string()),
@@ -1929,6 +2031,64 @@ mod tests {
             }
         }
         std::fs::write(to, d).unwrap();
+    }
+
+    #[tokio::test]
+    async fn r3trickplay_the_index_finds_the_frames_ffprobe_does() {
+        let test = "r3trickplay_the_index_finds_the_frames_ffprobe_does";
+        if !have_ffmpeg(test) {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("r3trickplay-index-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let x264 = ["-x264-params", "keyint=20:min-keyint=20:scenecut=0"];
+        let x265 = [
+            "-x265-params",
+            "keyint=20:min-keyint=20:scenecut=0:log-level=error",
+        ];
+        let mut checked = 0;
+        for (encoder, params) in [("libx264", &x264), ("libx265", &x265)] {
+            if !have_encoder(encoder) {
+                eprintln!("SKIPPED {test} for {encoder}: ffmpeg can't encode with it");
+                continue;
+            }
+            let clip = timed_clip(&dir, encoder, params, &[], "index.mkv");
+            let clip = clip.to_string_lossy();
+            let probed = probe(&clip, &Cancel::new()).await.unwrap().unwrap();
+            let index = probed.raw.as_ref().unwrap().index.clone();
+            let index = index.expect("ffmpeg writes cues with the block's position");
+            // Through the index; through ffprobe; and through an index whose clusters are all
+            // in the wrong place, which falls back to ffprobe
+            let mut made = Vec::new();
+            for (name, index) in [
+                ("index", Some(index.clone())),
+                ("ffprobe", None),
+                ("broken", Some(Arc::new(index.shifted(7)))),
+            ] {
+                let mut p = probed.clone();
+                p.raw.as_mut().unwrap().index = index;
+                let work = dir.join(format!("work-{encoder}-{name}"));
+                let tiles = work.join("tiles");
+                std::fs::create_dir_all(&tiles).unwrap();
+                let count = seek_tiles(&clip, &p, Seeking::Raw, &work, &tiles, &Cancel::new())
+                    .await
+                    .unwrap_or_else(|e| panic!("{encoder} {name}: {e}"));
+                made.push((count, std::fs::read(tiles.join("0.jpg")).unwrap()));
+            }
+            assert!(
+                made[0] == made[1],
+                "{encoder}: the index's tile is ffprobe's"
+            );
+            assert!(
+                made[2] == made[1],
+                "{encoder}: a broken index falls back to ffprobe"
+            );
+            checked += 1;
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        if checked == 0 {
+            eprintln!("SKIPPED {test}: no H.264 or HEVC encoder, so this test checked nothing");
+        }
     }
 
     #[tokio::test]
