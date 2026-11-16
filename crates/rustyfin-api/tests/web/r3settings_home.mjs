@@ -65,7 +65,7 @@ function sandbox({ config = {}, prefs = {} } = {}) {
             },
         },
     });
-    vm.runInContext(`${source}\nthis.renderHome = renderHome; this.homeSections = homeSections; this.showsInLatest = showsInLatest;`, context);
+    vm.runInContext(`${source}\nthis.renderHome = renderHome; this.homeSections = homeSections; this.homeSlotValues = homeSlotValues; this.showsInLatest = showsInLatest;`, context);
     return { context, gets, rows: () => [...rows], page };
 }
 
@@ -79,6 +79,29 @@ test('the sections default to Jellyfin Web\'s order; a slot set to none hides th
         'a section set twice shows once, where it is set first',
     );
     assert.deepEqual(sections({ homesection0: 'livetv' }), ['resume', 'resumeaudio', 'nextup', 'latestmedia'], 'unknown sections are left out');
+});
+
+test('slots saved by Jellyfin Web read as Jellyfin Web reads them: ten slots, its defaults, its ids skipped', () => {
+    const { context } = sandbox();
+    const sections = prefs => [...context.homeSections(name => prefs[name] ?? null)];
+    // What Jellyfin Web's home screen settings save untouched: every slot, with its defaults
+    const jellyfinDefaults = {
+        homesection0: 'smalllibrarytiles', homesection1: 'resume', homesection2: 'resumeaudio', homesection3: 'resumebook',
+        homesection4: 'livetv', homesection5: 'nextup', homesection6: 'latestmedia', homesection7: 'none',
+        homesection8: 'none', homesection9: 'none',
+    };
+    assert.deepEqual(sections(jellyfinDefaults), ['smalllibrarytiles', 'resume', 'resumeaudio', 'nextup', 'latestmedia']);
+    // Next Up moved to the top and Continue Listening turned off in Jellyfin Web
+    assert.deepEqual(
+        sections({ ...jellyfinDefaults, homesection0: 'nextup', homesection2: 'none', homesection5: 'smalllibrarytiles' }),
+        ['nextup', 'resume', 'smalllibrarytiles', 'latestmedia'],
+    );
+    // A saved slot means the user chose: a section no slot names stays hidden
+    assert.deepEqual(sections({ homesection0: 'latestmedia', homesection1: 'none', homesection2: 'none', homesection5: 'none' }), ['latestmedia']);
+    assert.deepEqual(sections({ homesection0: 'folders' }), ['smalllibrarytiles', 'resume', 'resumeaudio', 'nextup', 'latestmedia']);
+    // Writing one slot writes all ten, keeping the ones Rustyfin doesn't show
+    const written = JSON.parse(JSON.stringify(context.homeSlotValues(2, 'none', name => jellyfinDefaults[name] ?? null)));
+    assert.deepEqual(written, { ...jellyfinDefaults, homesection2: 'none' });
 });
 
 test('the home page shows its sections in the user\'s order and leaves out the hidden ones', async () => {

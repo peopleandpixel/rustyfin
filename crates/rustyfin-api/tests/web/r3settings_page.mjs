@@ -57,7 +57,7 @@ function sandbox({ config = {}, prefs = {}, post } = {}) {
         },
     });
     vm.runInContext(`${source}
-        this.fns = { loadUserSettings, userSetting, changeUserConfig, changeUserPref, changeSubtitleAppearance,
+        this.fns = { loadUserSettings, userSetting, changeUserConfig, changeUserPref, changeHomeSection, changeSubtitleAppearance,
             changeLatestLibrary, homeSettingsHtml, playbackSettingsHtml, subtitleSettingsHtml, displaySettingsHtml };`, context);
     return { fns: context.fns, log, keys, posts: () => plain(log.filter(e => e[0] === 'post')) };
 }
@@ -93,6 +93,21 @@ test('a userSettings value saves into the usersettings CustomPrefs, keeping the 
 
     await box.fns.changeUserPref(toggle(false, { pref: 'enableBackdrops' }));
     assert.equal(box.fns.userSetting('enableBackdrops'), 'false');
+});
+
+test('a home section slot saves all ten slots, as Jellyfin Web does', async () => {
+    const box = sandbox({ prefs: { homesection3: 'livetv' } });
+    await box.fns.loadUserSettings();
+    await box.fns.changeHomeSection(select('latestmedia', { homeSlot: '0' }));
+    const [, , body] = box.posts().at(-1);
+    assert.deepEqual(body.CustomPrefs, {
+        homesection0: 'latestmedia', homesection1: 'resume', homesection2: 'resumeaudio', homesection3: 'livetv',
+        homesection4: 'livetv', homesection5: 'nextup', homesection6: 'latestmedia', homesection7: 'none',
+        homesection8: 'none', homesection9: 'none',
+    });
+    const html = box.fns.homeSettingsHtml({}, []);
+    assert.equal((html.match(/data-home-slot=/g) || []).length, 10);
+    assert.match(html, /<option value="livetv" selected>settings\.home_jellyfin_only/);
 });
 
 test('subtitle appearance is one JSON value under Jellyfin Web\'s key', async () => {
@@ -138,7 +153,7 @@ test('the cards show the saved values', async () => {
     assert.match(subtitles, /<option value="OnlyForced" selected>/);
     assert.match(subtitles, /<option value="all" selected>/);
     const home = box.fns.homeSettingsHtml(config, [{ Id: 'l1', Name: 'Films' }, { Id: 'l2', Name: 'Shows' }]);
-    assert.match(home, /data-pref="homesection1"[^>]*>.*<option value="none" selected>/s);
+    assert.match(home, /data-home-slot="1"[^>]*>[^]*?<option value="none" selected>/);
     assert.match(home, /data-latest-library="l1"[^>]*data-saved="true" checked>/);
     assert.match(home, /data-latest-library="l2"[^>]*data-saved="false" >/);
     assert.match(box.fns.displaySettingsHtml(), /<option value="de-DE" selected>/);

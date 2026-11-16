@@ -23,7 +23,7 @@ import {
 } from './modules/player.js';
 import './modules/queue.js';
 import {
-    changeNextEpisodeAutoPlay, changeUiLanguage, handleSaveConfig, changeUserConfig, changeUserPref,
+    changeNextEpisodeAutoPlay, changeUiLanguage, handleSaveConfig, changeUserConfig, changeUserPref, changeHomeSection,
     changeSubtitleAppearance, changeLatestLibrary, chooseProfileImage, deleteProfileImage,
 } from './modules/settings.js';
 import { refreshTasks, openAddUser, closeAddUser, submitAddUser, clearLiveLog, setLogLevel } from './modules/admin.js';
@@ -46,6 +46,6 @@ Object.assign(window, {
     jiNewCode, jiCopyCodes, refreshTasks, openAddLibrary, closeAddLibrary, submitAddLibrary, closeLibraryOptions,
     submitLibraryOptions, openAddUser, closeAddUser,
     submitAddUser, clearLiveLog, setLogLevel, closePluginConfig, savePluginConfig, closePluginPriority,
-    savePluginPriority, changeUserConfig, changeUserPref, changeSubtitleAppearance, changeLatestLibrary,
+    savePluginPriority, changeUserConfig, changeUserPref, changeHomeSection, changeSubtitleAppearance, changeLatestLibrary,
     chooseProfileImage, deleteProfileImage,
 });

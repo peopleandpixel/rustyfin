@@ -2,7 +2,7 @@
 import { $, toast, escapeHtml } from './util.js';
 import { showOidcLinkResult, oidcCardHtml } from './auth.js';
 import {
-    HOME_SECTIONS, loadUserSettings, userSetting, saveUserSettings, saveUserConfiguration, showsInLatest, avatarUrl,
+    HOME_SECTIONS, homeSlots, homeSlotValues, loadUserSettings, userSetting, saveUserSettings, saveUserConfiguration, showsInLatest, avatarUrl,
 } from './user-settings.js';
 
 // --- Settings Page Renderer ---
@@ -262,11 +262,13 @@ function homeSettingsHtml(config, libraries) {
         latestmedia: t('settings.home_latest'),
     };
     const options = [...HOME_SECTIONS.map(s => ({ value: s, label: names[s] })), { value: 'none', label: t('settings.home_none') }];
-    const sections = HOME_SECTIONS.map((fallback, i) => selectHtml(
+    // Jellyfin Web's ten slots. A slot holding a section Rustyfin lacks keeps it as an option, so
+    // saving another slot writes it back unchanged.
+    const sections = homeSlots().map((value, i) => selectHtml(
         t('settings.home_section', { n: i + 1 }),
-        `data-pref="homesection${i}" onchange="changeUserPref(this)"`,
-        options,
-        userSetting(`homesection${i}`, fallback),
+        `data-home-slot="${i}" onchange="changeHomeSection(this)"`,
+        options.some(o => o.value === value) ? options : [...options, { value, label: t('settings.home_jellyfin_only', { id: value }) }],
+        value,
     )).join('');
     const libs = (libraries || []).map(lib => {
         const libId = lib.Id || lib.id;
@@ -354,6 +356,11 @@ function changeSubtitleAppearance(input) {
     return saveControl(input, value => saveUserSettings({
         [SUBTITLE_APPEARANCE_KEY]: JSON.stringify({ ...subtitleAppearance(), [input.dataset.appearance]: value }),
     }));
+}
+
+// A home section slot: every slot is saved, as Jellyfin Web saves them
+function changeHomeSection(input) {
+    return saveControl(input, value => saveUserSettings(homeSlotValues(Number(input.dataset.homeSlot), value)));
 }
 
 // A library's "Show in Latest" switch: off adds it to UserConfiguration.LatestItemsExcludes
@@ -469,6 +476,6 @@ function oidcAccountKey(id) { return String(id).toLowerCase().replace(/-/g, '');
 
 export {
     renderSettings, changeNextEpisodeAutoPlay, changeUiLanguage, providerKeyField, handleSaveConfig, oidcAccountKey,
-    changeUserConfig, changeUserPref, changeSubtitleAppearance, changeLatestLibrary, chooseProfileImage,
+    changeUserConfig, changeUserPref, changeHomeSection, changeSubtitleAppearance, changeLatestLibrary, chooseProfileImage,
     deleteProfileImage, homeSettingsHtml, playbackSettingsHtml, subtitleSettingsHtml, displaySettingsHtml,
 };

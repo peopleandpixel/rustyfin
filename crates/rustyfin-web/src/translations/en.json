@@ -148,6 +148,7 @@
         "home_section": "Home section {{n}}",
         "home_latest": "Recently Added",
         "home_none": "None",
+        "home_jellyfin_only": "{{id}} (not shown by Rustyfin)",
         "home_show_in_latest": "Show in Recently Added",
         "any_language": "Any language",
         "audio_language": "Preferred audio language",

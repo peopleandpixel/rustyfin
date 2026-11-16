@@ -3,8 +3,12 @@
 // "usersettings" display preferences (client "emby") so they follow the account to every browser.
 // Both are loaded once per user and kept; a save updates the copy.
 
-// Jellyfin Web's home section ids, in its default order where Rustyfin has the section
+// The home sections Rustyfin has, by Jellyfin Web's ids
 const HOME_SECTIONS = ['smalllibrarytiles', 'resume', 'resumeaudio', 'nextup', 'latestmedia'];
+// Jellyfin Web's ten home section slots (homesection0..9) and each one's default (its DEFAULT_SECTIONS)
+const HOME_SLOT_DEFAULTS = [
+    'smalllibrarytiles', 'resume', 'resumeaudio', 'resumebook', 'livetv', 'nextup', 'latestmedia', 'none', 'none', 'none',
+];
 
 let loaded = null; // { userId, config, prefs }
 let loading = null;
@@ -74,15 +78,33 @@ async function saveUserConfiguration(fields) {
     settings.config = config;
 }
 
-// The home sections in the user's order, without hidden ones: Jellyfin Web's homesection0..n, where
-// 'none' hides a slot and an unset slot keeps the default; a section set twice shows once
+// Each of the ten slots' section as Jellyfin Web reads it: the saved one, else the slot's default
+// ('folders', an old id, is the first slot's default)
+function homeSlots(get = userSetting) {
+    return HOME_SLOT_DEFAULTS.map((fallback, i) => {
+        const value = get(`homesection${i}`) || fallback;
+        return value === 'folders' ? HOME_SLOT_DEFAULTS[0] : value;
+    });
+}
+
+// The home sections to show, in slot order. Sections Rustyfin lacks (Live TV, Continue Reading,
+// library buttons, recordings) and 'none' are skipped, and a section set twice shows once. Only when
+// no slot was ever saved are Rustyfin's sections that no default slot names added at the end.
 function homeSections(get = userSetting) {
     const sections = [];
-    for (let i = 0; i < HOME_SECTIONS.length; i++) {
-        const value = get(`homesection${i}`) || HOME_SECTIONS[i];
+    for (const value of homeSlots(get)) {
         if (HOME_SECTIONS.includes(value) && !sections.includes(value)) sections.push(value);
     }
+    const saved = HOME_SLOT_DEFAULTS.some((_, i) => get(`homesection${i}`));
+    if (!saved) for (const section of HOME_SECTIONS) if (!sections.includes(section)) sections.push(section);
     return sections;
+}
+
+// Sets slot `index` to `section` and returns every slot, as Jellyfin Web saves all ten at once
+function homeSlotValues(index, section, get = userSetting) {
+    const slots = homeSlots(get);
+    slots[index] = section;
+    return Object.fromEntries(slots.map((value, i) => [`homesection${i}`, value]));
 }
 
 // Whether a library's newest items get a "Recently Added" row (UserConfiguration.LatestItemsExcludes)
@@ -119,6 +141,6 @@ function applyUserSettings() {
 }
 
 export {
-    HOME_SECTIONS, loadUserSettings, userSetting, userConfiguration, saveUserSettings, saveUserConfiguration,
+    HOME_SECTIONS, HOME_SLOT_DEFAULTS, homeSlots, homeSlotValues, loadUserSettings, userSetting, userConfiguration, saveUserSettings, saveUserConfiguration,
     homeSections, showsInLatest, showBackdrops, applyUserSettings, avatarUrl, showAvatar,
 };

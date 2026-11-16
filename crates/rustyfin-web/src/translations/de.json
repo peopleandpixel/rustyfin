@@ -148,6 +148,7 @@
         "home_section": "Startseiten-Bereich {{n}}",
         "home_latest": "Kürzlich hinzugefügt",
         "home_none": "Keiner",
+        "home_jellyfin_only": "{{id}} (in Rustyfin nicht angezeigt)",
         "home_show_in_latest": "In „Kürzlich hinzugefügt“ anzeigen",
         "any_language": "Beliebige Sprache",
         "audio_language": "Bevorzugte Audiosprache",
