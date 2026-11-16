@@ -131,6 +131,33 @@ pub async fn insert_extras(
     tx.commit().await
 }
 
+/// Merges each user's data on `part_id`, a movie that becomes a later part of `movie_id` (two movies
+/// that a scan now stacks), into the movie: played or favourite if either was, the larger play count,
+/// the later last played date. The movie keeps its own resume point, since the part's position is in
+/// another file.
+pub async fn merge_part_user_data(
+    pool: &SqlitePool,
+    part_id: &str,
+    movie_id: &str,
+) -> Result<u64, sqlx::Error> {
+    let done = sqlx::query(
+        "INSERT INTO user_item_data (user_id, item_id, played, is_favorite, play_count, last_played_date)
+         SELECT user_id, ?2, played, is_favorite, play_count, last_played_date
+         FROM user_item_data WHERE item_id = ?1
+         ON CONFLICT(user_id, item_id) DO UPDATE SET
+             played = MAX(user_item_data.played, excluded.played),
+             is_favorite = MAX(user_item_data.is_favorite, excluded.is_favorite),
+             play_count = MAX(user_item_data.play_count, excluded.play_count),
+             last_played_date = NULLIF(MAX(COALESCE(user_item_data.last_played_date, ''),
+                                           COALESCE(excluded.last_played_date, '')), '')",
+    )
+    .bind(part_id)
+    .bind(movie_id)
+    .execute(pool)
+    .await?;
+    Ok(done.rows_affected())
+}
+
 /// Makes the stored extras of `library_id` at `paths` library items of type `media_type` again, keeping
 /// their ids and user data: a file that is no longer an extra (its folder no longer holds its movie).
 pub async fn release_extras(

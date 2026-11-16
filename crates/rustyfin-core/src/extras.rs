@@ -272,6 +272,11 @@ pub async fn sync_extras(
                         tracing::info!(
                             "{path} is now a {kind} extra of item {owner}; it was a library item"
                         );
+                        // A movie that is now a later part of another: its watch state goes to
+                        // that movie, once, as the change happens.
+                        if extra.kind == ExtraKind::Part {
+                            repo_extras::merge_part_user_data(pool, &row.id, owner).await?;
+                        }
                     }
                     repo_extras::set_extra(
                         pool,
