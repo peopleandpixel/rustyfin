@@ -6,13 +6,15 @@ import { oidcAccountKey } from './settings.js';
 import { jiPanelHtml, loadJellyfinImport } from './jellyfin-import.js';
 import { sessionsPanelHtml, followSessions, unfollowSessions } from './sessions.js';
 import { playbackPanelHtml, loadPlaybackAdmin } from './playback-admin.js';
+import { dlnaPanelHtml, loadDlnaAdmin } from './dlna-admin.js';
 import { serverDetailsHtml, generalPanelHtml, loadGeneralSettings, triggerSummary } from './dashboard.js';
 import { SERVER_ADMIN_TABS, SERVER_ADMIN_LOADERS, serverAdminPanelsHtml } from './server-admin.js';
 
 // The dashboard's tab panels, in the order of their tab buttons
 const ADMIN_TABS = [
     'admin-overview', 'admin-general', 'admin-users', 'admin-libs', 'admin-playback', 'admin-tasks', 'admin-plugins',
-    'admin-sessions', 'admin-activity', 'admin-livelog', 'admin-signin', 'admin-import', ...SERVER_ADMIN_TABS,
+    'admin-sessions', 'admin-activity', 'admin-livelog', 'admin-signin', 'admin-import', 'admin-network',
+    'admin-apikeys', 'admin-devices', 'admin-branding', 'admin-backups', 'admin-dlna',
 ];
 
 async function renderAdmin(tab) {
@@ -39,7 +41,7 @@ async function renderAdmin(tab) {
         const accountById = new Map(accounts.map(a => [oidcAccountKey(a.UserId), a]));
 
         const tabs = [t('admin.overview'), t('dashboard.general'), t('admin.users'), t('admin.libraries'), t('admin.playback'), t('admin.tasks'), t('admin.plugins'), t('admin.sessions'), t('admin.activity_log_tab'), t('admin.live_log'), t('oidc.admin_tab'), t('jellyfin_import.tab'),
-            t('server_admin.tab_network'), t('server_admin.tab_api_keys'), t('server_admin.tab_devices'), t('server_admin.tab_branding'), t('server_admin.tab_backups')];
+            t('server_admin.tab_network'), t('server_admin.tab_api_keys'), t('server_admin.tab_devices'), t('server_admin.tab_branding'), t('server_admin.tab_backups'), t('dlna_admin.tab')];
         const tabIds = ADMIN_TABS;
 
         page.innerHTML = `
@@ -279,6 +281,9 @@ async function renderAdmin(tab) {
 
             ${jiPanelHtml()}
 
+            <!-- DLNA: the server switch and the user DLNA devices browse as, filled by loadDlnaAdmin -->
+            ${dlnaPanelHtml()}
+
             <!-- Networking, API keys, Devices, Branding and Backups, filled by server-admin.js -->
             ${serverAdminPanelsHtml()}
         </div>`;
@@ -316,6 +321,7 @@ function showAdminTab(btn, tabId) {
     if (tabId === 'admin-playback') loadPlaybackAdmin();
     if (tabId === 'admin-general') loadGeneralSettings();
     if (tabId === 'admin-import') loadJellyfinImport();
+    if (tabId === 'admin-dlna') loadDlnaAdmin();
     SERVER_ADMIN_LOADERS[tabId]?.();
 }
 

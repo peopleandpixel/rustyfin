@@ -3,7 +3,7 @@
 // titles, refresh interval, subtitle options and the content-type ones. The choices come from
 // /Libraries/AvailableOptions. Fetcher lists live in `editor.lists`, so moving and ticking need
 // no DOM reads; the plain fields are read from the form by name.
-import { $, escapeHtml } from './util.js';
+import { $, escapeHtml, icon } from './util.js';
 
 const LABEL = 'block text-xs font-semibold text-white/70 mb-1.5';
 const CHECKBOX = 'w-4 h-4 rounded bg-white/10 border-white/20 text-[#00a4dc]';
@@ -67,8 +67,8 @@ function listHtml(key) {
             <input type="checkbox" id="lo-${escapeHtml(key)}-${i}" class="${CHECKBOX}" data-lo-toggle="${escapeHtml(key)}" data-index="${i}" ${f.enabled ? 'checked' : ''}>
             <label for="lo-${escapeHtml(key)}-${i}" class="flex-1 text-sm text-white/70">${escapeHtml(f.name)}</label>
             ${list.length > 1 && key !== 'savers' ? `
-            <button type="button" class="text-white/40 hover:text-white text-xs px-1" data-lo-move="${escapeHtml(key)}" data-index="${i}" data-by="-1" ${i === 0 ? 'disabled' : ''} aria-label="${escapeHtml(t('library_options.move_up', { name: f.name }))}">▲</button>
-            <button type="button" class="text-white/40 hover:text-white text-xs px-1" data-lo-move="${escapeHtml(key)}" data-index="${i}" data-by="1" ${i === list.length - 1 ? 'disabled' : ''} aria-label="${escapeHtml(t('library_options.move_down', { name: f.name }))}">▼</button>` : ''}
+            <button type="button" class="text-white/40 hover:text-white text-xs px-1" data-lo-move="${escapeHtml(key)}" data-index="${i}" data-by="-1" ${i === 0 ? 'disabled' : ''} aria-label="${escapeHtml(t('library_options.move_up', { name: f.name }))}">${icon('ChevronUp', { size: 14 })}</button>
+            <button type="button" class="text-white/40 hover:text-white text-xs px-1" data-lo-move="${escapeHtml(key)}" data-index="${i}" data-by="1" ${i === list.length - 1 ? 'disabled' : ''} aria-label="${escapeHtml(t('library_options.move_down', { name: f.name }))}">${icon('ChevronDown', { size: 14 })}</button>` : ''}
         </div>`).join('');
 }
 

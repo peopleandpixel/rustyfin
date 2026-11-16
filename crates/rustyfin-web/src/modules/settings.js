@@ -3,6 +3,7 @@ import { $, toast, escapeHtml } from './util.js';
 import { showOidcLinkResult, oidcCardHtml } from './auth.js';
 import {
     HOME_SECTIONS, homeSlots, homeSlotValues, loadUserSettings, userSetting, saveUserSettings, saveUserConfiguration, showsInLatest, avatarUrl,
+    SCREENSAVER_BACKDROP, SCREENSAVER_TIMES, DEFAULT_IDLE_SECONDS,
 } from './user-settings.js';
 
 // --- Settings Page Renderer ---
@@ -255,7 +256,16 @@ function displaySettingsHtml() {
     const dateOptions = [{ value: '', label: t('settings.date_format_auto') }, ...DATE_LOCALES.map(tag => ({ value: tag, label: dateLocaleLabel(tag) }))];
     return selectHtml(t('settings.date_format'), 'id="pref-datetimelocale" data-pref="datetimelocale" onchange="changeUserPref(this)"', dateOptions, userSetting('datetimelocale', ''))
         + toggleHtml(t('settings.show_backdrops'), 'id="pref-backdrops" data-pref="enableBackdrops" onchange="changeUserPref(this)"', userSetting('enableBackdrops', 'true') !== 'false')
-        + toggleHtml(t('settings.play_theme_songs'), 'id="pref-theme-songs" data-pref="enableThemeSongs" onchange="changeUserPref(this)"', userSetting('enableThemeSongs', 'false') === 'true');
+        + toggleHtml(t('settings.play_theme_songs'), 'id="pref-theme-songs" data-pref="enableThemeSongs" onchange="changeUserPref(this)"', userSetting('enableThemeSongs', 'false') === 'true')
+        + screensaverSettingsHtml();
+}
+
+// Jellyfin Web's Screensaver and Screensaver time (in seconds; shown in minutes). Off unless chosen.
+function screensaverSettingsHtml() {
+    const kinds = [{ value: 'none', label: t('settings.screensaver_none') }, { value: SCREENSAVER_BACKDROP, label: t('settings.screensaver_backdrop') }];
+    const times = SCREENSAVER_TIMES.map(s => ({ value: String(s), label: t('settings.screensaver_minutes', { minutes: s / 60 }) }));
+    return selectHtml(t('settings.screensaver'), 'id="pref-screensaver" data-pref="screensaver" onchange="changeUserPref(this)"', kinds, userSetting('screensaver', 'none'))
+        + selectHtml(t('settings.screensaver_time'), 'id="pref-screensaver-time" data-pref="screensaverTime" onchange="changeUserPref(this)"', times, userSetting('screensaverTime', String(DEFAULT_IDLE_SECONDS)));
 }
 
 function homeSettingsHtml(config, libraries) {

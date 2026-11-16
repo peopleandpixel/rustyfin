@@ -346,6 +346,10 @@
 
     <!-- Right Actions -->
     <div class="flex items-center gap-2 flex-shrink-0">
+        <!-- Google Cast: shown once a Cast device is found (cast.js) -->
+        <button id="nav-cast" class="hidden jf-icon-btn" title="Play on" aria-label="Play on" data-i18n-title="remote.play_on" data-i18n-aria-label="remote.play_on" onclick="openPlayOn()">
+            <i data-lucide="cast" class="w-5 h-5"></i>
+        </button>
         <!-- Quick Connect badge -->
         <button id="nav-quick-connect" class="hidden sm:inline-flex jf-icon-btn !w-auto px-2.5 text-xs text-white/60 hover:text-white" title="Quick Connect" aria-label="Quick Connect" data-i18n-title="quick_connect.title" data-i18n-aria-label="quick_connect.title" onclick="showQuickConnectModal()">
             <i data-lucide="smartphone" class="w-4 h-4 mr-1 text-[#00a4dc]"></i>
@@ -382,6 +386,10 @@
                     </a>
                 </div>
                 <div class="border-t border-white/10 py-1">
+                    <a class="jf-menu-item flex items-center gap-2" onclick="switchUser()">
+                        <i data-lucide="users" class="w-4 h-4 text-white/50"></i>
+                        <span data-i18n="nav.switch_user">Switch user</span>
+                    </a>
                     <a class="jf-menu-item text-red-400 hover:text-red-300 flex items-center gap-2" onclick="doLogout()">
                         <i data-lucide="log-out" class="w-4 h-4"></i>
                         <span data-i18n="nav.sign_out">Sign Out</span>
@@ -996,6 +1004,9 @@
         <button id="now-playing-next" type="button" class="jf-icon-btn disabled:opacity-40" onclick="playAdjacentEpisode(1)" title="Next" aria-label="Next" data-i18n-title="player.next_item" data-i18n-aria-label="player.next_item" hidden>
             <i data-lucide="skip-forward" class="w-5 h-5"></i>
         </button>
+        <button id="now-playing-lyrics" type="button" class="jf-icon-btn" onclick="toggleLyrics()" aria-pressed="false" title="Lyrics" aria-label="Lyrics" data-i18n-title="player.lyrics" data-i18n-aria-label="player.lyrics" hidden>
+            <i data-lucide="mic-vocal" class="w-5 h-5"></i>
+        </button>
         <button type="button" class="jf-icon-btn max-sm:hidden" onclick="openFullPlayer()" title="Open player" aria-label="Open player" data-i18n-title="player.open_player" data-i18n-aria-label="player.open_player">
             <i data-lucide="maximize" class="w-5 h-5"></i>
         </button>
@@ -1004,6 +1015,17 @@
         </button>
     </div>
 </div>
+
+<!-- The music player's lyrics (lyrics.js), over the now-playing bar -->
+<aside id="lyrics-panel" class="jf-lyrics-panel" aria-label="Lyrics" data-i18n-aria-label="player.lyrics" hidden>
+    <div class="flex items-center justify-between mb-2">
+        <h2 class="text-sm font-semibold text-white" data-i18n="player.lyrics">Lyrics</h2>
+        <button type="button" class="jf-icon-btn !w-8 !h-8" onclick="toggleLyrics(false)" title="Close" aria-label="Close" data-i18n-title="common.close" data-i18n-aria-label="common.close">
+            <i data-lucide="x" class="w-4 h-4"></i>
+        </button>
+    </div>
+    <div id="lyrics-body" class="jf-lyrics-body"></div>
+</aside>
 
 <!-- Are you still watching? Before the next episode, after a long run (the player's settings menu turns it on) -->
 <dialog id="still-watching" class="modal bg-black/70 backdrop-blur-md">

@@ -72,7 +72,7 @@ async fn get_activity_log(
 
 /// A `minDate` as UTC: an ISO 8601 date and time with an offset, or without one (taken as UTC),
 /// or a date alone.
-fn parse_min_date(date: &str) -> Option<chrono::NaiveDateTime> {
+pub(crate) fn parse_min_date(date: &str) -> Option<chrono::NaiveDateTime> {
     if let Ok(d) = chrono::DateTime::parse_from_rfc3339(date) {
         return Some(d.naive_utc());
     }

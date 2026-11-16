@@ -32,6 +32,7 @@ function sandbox(api = {}) {
     const context = vm.createContext({
         t: (key, opts) => (opts ? `${key}|${JSON.stringify(opts)}` : key),
         escapeHtml,
+        icon: name => `<i data-icon="${name}"></i>`,
         $: () => box,
         document: { querySelector: () => null },
         CSS: { escape: s => s },

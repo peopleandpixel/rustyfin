@@ -188,7 +188,8 @@ test('the dashboard has the five tabs, each loaded when shown', () => {
     same(fns.SERVER_ADMIN_TABS, ['admin-network', 'admin-apikeys', 'admin-devices', 'admin-branding', 'admin-backups']);
     same(Object.keys(fns.SERVER_ADMIN_LOADERS), [...JSON.parse(JSON.stringify(fns.SERVER_ADMIN_TABS))]);
     const admin = read('modules/admin.js');
-    assert.match(admin, /\.\.\.SERVER_ADMIN_TABS/);
+    const tabs = admin.slice(admin.indexOf('const ADMIN_TABS = ['), admin.indexOf('];', admin.indexOf('const ADMIN_TABS = [')));
+    for (const id of fns.SERVER_ADMIN_TABS) assert.ok(tabs.includes(`'${id}'`), id);
     assert.match(admin, /SERVER_ADMIN_LOADERS\[tabId\]\?\.\(\)/);
     assert.match(admin, /serverAdminPanelsHtml\(\)/);
     assert.match(read('app.js'), /import '\.\/modules\/server-admin\.js';/);
@@ -220,6 +221,7 @@ test('the branding CSS goes into a style element, and the login disclaimer is sh
     assert.equal(el.innerHTML, '');
     assert.equal(el.classList.contains('hidden'), false);
     const auth = read('modules/auth.js');
+    // In the sign-in card, filled each time the sign-in step is drawn
     assert.match(auth, /<p id="login-disclaimer"/);
-    assert.match(auth, /showLoginDisclaimer\(\$\('login-disclaimer'\)\)/);
+    assert.match(auth, /loadOidcSignIn\(\);\n\s*showLoginDisclaimer\(\$\('login-disclaimer'\)\);/);
 });
