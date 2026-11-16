@@ -14465,6 +14465,13 @@ async fn g12_stub() -> (String, G12Hits) {
                 "backdrops": [{"file_path": "/g12-backdrop.jpg"}]
             }),
             "/movie/9001/credits" => serde_json::json!({"id": 9001, "cast": [], "crew": []}),
+            // Another film, that an item can be wrongly identified as
+            "/movie/7101" => serde_json::json!({
+                "id": 7101,
+                "title": "Wrong Film",
+                "overview": "Not the item's film",
+                "release_date": "1985-03-01"
+            }),
             "/movie/9001/videos" => serde_json::json!({"results": [
                 {"key": "g12trailer", "name": "G12 Trailer", "type": "Trailer", "site": "YouTube"}
             ]}),
@@ -14727,6 +14734,54 @@ async fn r3metadata_identify_lists_matches_and_applies_one() {
         )
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// An item identified as the wrong film keeps that TMDb id through every refresh, "replace all
+/// metadata" included: as in Jellyfin, a refresh looks an id up and never searches again
+/// (MetadataService passes the item's provider ids to the providers). Identify is the way to
+/// re-identify it, and it replaces the wrong film's metadata.
+#[tokio::test]
+async fn r3meta_a_wrong_id_stays_until_identify_replaces_it() {
+    let server = g12_server(Some("r3-key"), None).await;
+    let id = server.insert_movie().await;
+    sqlx::query("UPDATE media_items SET tmdb_id = 7101 WHERE id = ?")
+        .bind(id.to_string())
+        .execute(&server.db)
+        .await
+        .unwrap();
+
+    let (status, body) = server
+        .send(
+            "POST",
+            &format!(
+                "/Items/{id}/Refresh?MetadataRefreshMode=FullRefresh\
+                 &ImageRefreshMode=FullRefresh&ReplaceAllMetadata=true&ReplaceAllImages=false"
+            ),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let item = server.item(id).await;
+    assert_eq!(item.tmdb_id, Some(7101));
+    assert_eq!(item.name, "Wrong Film");
+    assert_eq!(server.hits_to("/search/movie"), 0);
+
+    let (status, body) = server
+        .send(
+            "POST",
+            &format!("/Items/RemoteSearch/Apply/{id}"),
+            Some(
+                serde_json::json!({"Name": "Alpha Film", "ProviderIds": {"Tmdb": "9001"}})
+                    .to_string(),
+            ),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let item = server.item(id).await;
+    assert_eq!(item.tmdb_id, Some(9001));
+    assert_eq!(item.name, "Alpha Film");
+    assert_eq!(item.overview.as_deref(), Some("G12 stub overview"));
+    assert_eq!(item.production_year, Some(2001));
 }
 
 #[tokio::test]
