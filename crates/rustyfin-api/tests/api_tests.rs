@@ -23086,10 +23086,6 @@ async fn r2parental_lists_leave_out_items_above_the_limit() {
         ("/Movies/Featured".to_string(), "Rough"),
         (format!("/Items/{gentle}/Similar"), "Edgy"),
         (format!("/Movies/{gentle}/Similar"), "Edgy"),
-        (
-            format!("/Users/{}/Items/{gentle}/InstantMix", w.kid_id),
-            "Edgy",
-        ),
         // `Ids` isn't read on this base, so this checks only that the list leaves Rough out.
         (ids_query, "Rough"),
         ("/Genres".to_string(), "Thriller"),
@@ -48036,4 +48032,271 @@ async fn r3admin_restart_stops_with_the_restart_exit_code() {
 #[test]
 fn r3admin_web_dashboard() {
     b124_node_test("r3admin_dashboard.mjs");
+}
+
+// ── Music: lyrics and instant mix ──
+
+/// A track of `library` under `parent` at `path`, with `genres` (pipe-joined, as scans store them).
+async fn r3music2_track(
+    state: &AppState,
+    library: uuid::Uuid,
+    parent: Option<uuid::Uuid>,
+    name: &str,
+    genres: &str,
+) -> uuid::Uuid {
+    let id = j6_add_item(state, library, parent, name, "Audio").await;
+    let path = state
+        .data_dir
+        .join("media")
+        .join("r3music2")
+        .join(format!("{name}.flac"));
+    sqlx::query("UPDATE media_items SET genres = ?, path = ? WHERE id = ?")
+        .bind(genres)
+        .bind(path.to_string_lossy().to_string())
+        .bind(id.to_string())
+        .execute(&state.db)
+        .await
+        .unwrap();
+    id
+}
+
+async fn r3music2_send(
+    app: &axum::Router,
+    method: &str,
+    uri: &str,
+    token: &str,
+    body: &str,
+) -> (StatusCode, serde_json::Value) {
+    let req = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Content-Type", "text/plain")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    send(app, req).await
+}
+
+/// `/Audio/{id}/Lyrics` reads a lyric file beside the track as Jellyfin's LyricDto (synced lines
+/// with their start in ticks), takes an uploaded file from an administrator only, deletes the
+/// lyric files, and answers 404 for a track with none and for an item that is not audio. A scan's
+/// lyric-file pass sets HasLyrics.
+#[tokio::test]
+async fn r3music2_lyrics_read_upload_and_delete() {
+    let state = test_state().await;
+    let library = j6_library(&state, "Music").await;
+    let synced = r3music2_track(&state, library, None, "01 Sine Song", "Ambient").await;
+    let plain = r3music2_track(&state, library, None, "02 Square Song", "Ambient").await;
+    let movie = j6_add_item(&state, library, None, "Some Movie", "Movie").await;
+    let dir = state.data_dir.join("media").join("r3music2");
+    std::fs::create_dir_all(&dir).unwrap();
+    let sidecar = dir.join("01 Sine Song.lrc");
+    std::fs::write(
+        &sidecar,
+        "[ti:Sine Song]\n[00:02.50]Second line\n[00:01.00]First line\n",
+    )
+    .unwrap();
+    let (admin, _) = admin_session(&state).await;
+    let (user, _) = j6_user_session(&state).await;
+    let pool = state.db.clone();
+    let app = app(state);
+
+    let lyrics = b27_answer(&app, &format!("/Audio/{synced}/Lyrics"), &user).await;
+    assert_eq!(
+        lyrics["Lyrics"],
+        serde_json::json!([
+            {"Text": "First line", "Start": 10_000_000},
+            {"Text": "Second line", "Start": 25_000_000},
+        ]),
+        "{lyrics}"
+    );
+    assert_eq!(lyrics["Metadata"]["Title"], "Sine Song", "{lyrics}");
+    assert_eq!(lyrics["Metadata"]["IsSynced"], true, "{lyrics}");
+    for id in [plain, movie, uuid::Uuid::new_v4()] {
+        let (status, body) =
+            send_authed(&app, "GET", &format!("/Audio/{id}/Lyrics"), &user, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{id}: {body}");
+    }
+
+    // HasLyrics is what the scan found: nothing before its lyric-file pass.
+    let has = |body: &serde_json::Value| body["HasLyrics"].clone();
+    let item = b27_answer(&app, &format!("/Items/{synced}"), &admin).await;
+    assert_eq!(has(&item), false, "{item}");
+    rustyfin_core::lyrics::sync_sidecars(&pool, library, &rustyfin_db::repo_media::PathScope::All)
+        .await
+        .unwrap();
+    let item = b27_answer(&app, &format!("/Items/{synced}"), &admin).await;
+    assert_eq!(has(&item), true, "{item}");
+    let list = b27_answer(
+        &app,
+        &format!("/Items?ParentId={library}&IncludeItemTypes=Audio&Recursive=true&SortBy=SortName"),
+        &admin,
+    )
+    .await;
+    let flags: Vec<_> = list["Items"].as_array().unwrap().iter().map(has).collect();
+    assert_eq!(
+        flags,
+        [serde_json::json!(true), serde_json::json!(false)],
+        "{list}"
+    );
+    let movie_item = b27_answer(&app, &format!("/Items/{movie}"), &admin).await;
+    assert!(movie_item.get("HasLyrics").is_none(), "{movie_item}");
+
+    // Uploading needs lyric management, which administrators have.
+    let upload = format!("/Audio/{plain}/Lyrics?fileName=square.txt");
+    let (status, _) = r3music2_send(&app, "POST", &upload, &user, "one\ntwo").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) =
+        r3music2_send(&app, "POST", &format!("/Audio/{plain}/Lyrics"), &admin, "x").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, body) = r3music2_send(&app, "POST", &upload, &admin, "one\ntwo").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let expected = serde_json::json!([{"Text": "one"}, {"Text": "two"}]);
+    assert_eq!(body["Lyrics"], expected, "{body}");
+    let lyrics = b27_answer(&app, &format!("/Audio/{plain}/Lyrics"), &user).await;
+    assert_eq!(lyrics["Lyrics"], expected, "{lyrics}");
+    let item = b27_answer(&app, &format!("/Items/{plain}"), &admin).await;
+    assert_eq!(has(&item), true, "{item}");
+
+    // Deleting removes the uploaded file and the file beside the track.
+    let (status, _) =
+        r3music2_send(&app, "DELETE", &format!("/Audio/{plain}/Lyrics"), &user, "").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    for id in [plain, synced] {
+        let (status, body) =
+            r3music2_send(&app, "DELETE", &format!("/Audio/{id}/Lyrics"), &admin, "").await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        let (status, body) =
+            send_authed(&app, "GET", &format!("/Audio/{id}/Lyrics"), &user, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{id}: {body}");
+        let item = b27_answer(&app, &format!("/Items/{id}"), &admin).await;
+        assert_eq!(has(&item), false, "{item}");
+    }
+    assert!(!sidecar.exists());
+}
+
+/// Ids of the `Items` of an answer, in order.
+fn r3music2_ids(answer: &serde_json::Value) -> Vec<String> {
+    answer["Items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no Items in {answer}"))
+        .iter()
+        .map(|item| item["Id"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+fn r3music2_sorted(mut ids: Vec<String>) -> Vec<String> {
+    ids.sort();
+    ids
+}
+
+/// Jellyfin's instant mixes: tracks sharing a genre with the song (which comes first), album,
+/// artist, playlist or music genre, as a QueryResult of Audio items with StartIndex 0 and the
+/// count before Limit, on every path Jellyfin serves them; nothing for a movie, 404 for an unknown id.
+#[tokio::test]
+async fn r3music2_instant_mix_paths_and_shape() {
+    let state = test_state().await;
+    let library = j6_library(&state, "Music").await;
+    let album = j6_add_item(&state, library, None, "Wave Album", "MusicAlbum").await;
+    let sine = r3music2_track(&state, library, Some(album), "Sine", "Synth Rock").await;
+    let square = r3music2_track(&state, library, Some(album), "Square", "Synth Rock|Drone").await;
+    let saw = r3music2_track(&state, library, None, "Saw", "Cool Jazz").await;
+    let noise = r3music2_track(&state, library, None, "Noise", "Drone").await;
+    let movie = j6_add_item(&state, library, None, "Some Movie", "Movie").await;
+    let artist = r2music_link(&state, saw, "Made Up Trio", "Artist", 0).await;
+    let (admin, _) = admin_session(&state).await;
+    let (user, user_id) = j6_user_session(&state).await;
+    let app = app(state);
+    let s = |id: uuid::Uuid| id.to_string();
+
+    for path in [
+        format!("/Songs/{sine}/InstantMix"),
+        format!("/Items/{sine}/InstantMix"),
+        format!("/Users/{user_id}/Items/{sine}/InstantMix"),
+    ] {
+        let mix = b27_answer(&app, &path, &user).await;
+        let ids = r3music2_ids(&mix);
+        assert_eq!(ids[0], s(sine), "{path}: the song comes first: {mix}");
+        assert_eq!(
+            r3music2_sorted(ids[1..].to_vec()),
+            [s(square)],
+            "{path}: {mix}"
+        );
+        assert_eq!(mix["TotalRecordCount"], 2, "{path}: {mix}");
+        assert_eq!(mix["StartIndex"], 0, "{path}: {mix}");
+        for item in mix["Items"].as_array().unwrap() {
+            assert_eq!(item["Type"], "Audio", "{path}: {item}");
+            assert_eq!(item["HasLyrics"], false, "{path}: {item}");
+        }
+    }
+
+    // A song with two genres mixes the tracks of either.
+    let mix = b27_answer(&app, &format!("/Items/{square}/InstantMix"), &user).await;
+    assert_eq!(
+        r3music2_sorted(r3music2_ids(&mix)[1..].to_vec()),
+        r3music2_sorted(vec![s(sine), s(noise)]),
+        "{mix}"
+    );
+    // An album without genres of its own mixes its tracks' genres.
+    let mix = b27_answer(&app, &format!("/Albums/{album}/InstantMix"), &user).await;
+    assert_eq!(
+        r3music2_sorted(r3music2_ids(&mix)),
+        r3music2_sorted(vec![s(sine), s(square), s(noise)]),
+        "{mix}"
+    );
+    // An artist mixes the genres of the tracks credited to it, on both of Jellyfin's paths.
+    for path in [
+        format!("/Artists/{artist}/InstantMix"),
+        format!("/Artists/InstantMix?id={artist}"),
+    ] {
+        let mix = b27_answer(&app, &path, &user).await;
+        assert_eq!(r3music2_ids(&mix), [s(saw)], "{path}: {mix}");
+    }
+    // A music genre, by name and by id.
+    let jazz = rustyfin_db::repo_by_name::by_name_id(
+        rustyfin_db::repo_by_name::ByNameKind::MusicGenre,
+        "Cool Jazz",
+    );
+    for path in [
+        "/MusicGenres/Cool%20Jazz/InstantMix".to_string(),
+        format!("/MusicGenres/InstantMix?id={jazz}"),
+        format!("/Items/{jazz}/InstantMix"),
+    ] {
+        let mix = b27_answer(&app, &path, &user).await;
+        assert_eq!(r3music2_ids(&mix), [s(saw)], "{path}: {mix}");
+    }
+
+    // Limit keeps that many items; the count is of the whole mix.
+    let mix = b27_answer(&app, &format!("/Songs/{sine}/InstantMix?Limit=1"), &admin).await;
+    assert_eq!(r3music2_ids(&mix), [s(sine)], "{mix}");
+    assert_eq!(mix["TotalRecordCount"], 2, "{mix}");
+
+    // A movie has no music to mix; an unknown id is not found.
+    let mix = b27_answer(&app, &format!("/Items/{movie}/InstantMix"), &user).await;
+    assert_eq!(mix["Items"], serde_json::json!([]), "{mix}");
+    assert_eq!(mix["TotalRecordCount"], 0, "{mix}");
+    let (status, _) = send_authed(
+        &app,
+        "GET",
+        &format!("/Items/{}/InstantMix", uuid::Uuid::new_v4()),
+        &user,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[test]
+fn r3music2_web_lyrics() {
+    b124_node_test("r3music2_lyrics.mjs");
+}
+
+#[test]
+fn r3music2_web_instant_mix() {
+    b124_node_test("r3music2_instantmix.mjs");
+}
+
+#[test]
+fn r3music2_web_suggestions() {
+    b124_node_test("r3music2_suggestions.mjs");
 }
