@@ -23351,6 +23351,12 @@ fn r3playercore_subtitles() {
     b124_node_test("r3playercore_subtitles.mjs");
 }
 
+// R3 core player: quality steps, the version picker and the aspect ratio
+#[test]
+fn r3playercore_playback() {
+    b124_node_test("r3playercore_playback.mjs");
+}
+
 // The web client's item page: credits, ratings, media info, track pickers, chapters, links, "mark all
 // played" and delete (tests/web/r3item_detail.mjs), and the pickers' choice in the player
 // (tests/web/r3item_play.mjs)
@@ -32232,6 +32238,60 @@ async fn g4_universal_sends_unplayable_audio_to_transcode() {
                 "{uri}: {url}"
             );
             assert_eq!(source["SupportsDirectPlay"], true, "{uri}");
+        }
+    }
+}
+
+// R3 core player: the web player's quality choice. MaxStreamingBitrate below the source's bitrate turns direct
+// play off, and the transcode gets the limit less its audio as VideoBitrate (kbps); a high limit changes nothing.
+#[tokio::test]
+async fn r3playercore_universal_honours_max_streaming_bitrate() {
+    let state = test_state().await;
+    let _dir = G4Dir(state.data_dir.to_path_buf());
+    let (token, _) = admin_session(&state).await;
+    let folder = media_folder(&state, "r3playercore-quality");
+    let file = std::path::Path::new(&folder).join("R3 Quality.mp4");
+    std::fs::write(&file, b"r3").unwrap();
+    let id = g4_insert_item(&state, "Movie", &file).await;
+    let source: rustyfin_model::media_source::MediaSourceResponse =
+        serde_json::from_value(serde_json::json!({
+            "Id": uuid::Uuid::new_v4().to_string(),
+            "Uid": uuid::Uuid::new_v4().to_string(),
+            "Container": "mp4",
+            "Protocol": "File",
+            "Path": file.to_str().unwrap(),
+            "Bitrate": 4_500_000,
+            "MediaStreams": [
+                { "Index": 0, "Codec": "h264", "CodecType": "Video" },
+                { "Index": 1, "Codec": "aac", "CodecType": "Audio" },
+            ],
+        }))
+        .unwrap();
+    rustyfin_db::repo_media_source::insert_media_source_with_streams(&state.db, &id, &source)
+        .await
+        .unwrap();
+    let app = app(state);
+
+    let lists = "&VideoCodecs=h264,vp8,vp9,av1&AudioCodecs=aac,mp3,opus,flac";
+    for (limit, direct, video_bitrate) in [
+        (100_000_000, true, None),
+        (20_000_000, true, None),
+        (3_000_000, false, Some("VideoBitrate=2808&")),
+        (420_000, false, Some("VideoBitrate=228&")),
+    ] {
+        let uri = format!("/Videos/{id}/Universal?MaxStreamingBitrate={limit}{lists}");
+        let (status, body) = send(&app, request("GET", &uri, Some(&token), None)).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        let url = body["Url"].as_str().unwrap_or_default();
+        assert_eq!(
+            body["MediaSources"][0]["SupportsDirectPlay"], direct,
+            "{uri}"
+        );
+        if direct {
+            assert!(url.contains("Static=true"), "{uri}: {url}");
+        } else {
+            assert!(url.contains("main.m3u8"), "{uri}: {url}");
+            assert!(url.contains(video_bitrate.unwrap()), "{uri}: {url}");
         }
     }
 }
