@@ -44,6 +44,7 @@ vm.runInContext(
      ${slice(metadata, 'const LABEL = ', ';\n')}
      ${slice(metadata, 'function splitList(')}
      ${slice(metadata, 'function itemUpdateBody(')}
+     ${slice(metadata, 'function personTypeLabel(')}
      ${slice(metadata, 'function personRowHtml(')}
      ${slice(metadata, 'function providerIdsHtml(')}
      ${slice(subtitles, 'const UPLOAD_FORMATS = ', ';\n')}
@@ -86,12 +87,30 @@ test('the editor sends end date, studios, people and provider ids as Jellyfin do
     assert.ok(!('EndDate' in plain(fns.itemUpdateBody({ name: 'A', enabled: {} }))));
 });
 
+test('a person kind the list lacks, and studios with commas, stay as they were', () => {
+    const row = fns.personRowHtml({ Name: 'Lee Example', Type: 'Conductor' });
+    assert.match(row, /<option value="Conductor" selected>Conductor<\/option>/);
+    assert.equal((row.match(/ selected>/g) || []).length, 1);
+    // The sandbox's t() has no translations, so every label is the kind's name
+    assert.match(row, /<option value="Actor">Actor<\/option>/);
+
+    // Unedited, the studios go as the item had them; edited, the field is split on commas
+    const studioNames = ['Lantern, Ferry & Co', 'Quay Works'];
+    const studiosBefore = studioNames.join(', ');
+    const kept = plain(fns.itemUpdateBody({ name: 'A', enabled: {}, studioNames, studiosBefore, studios: studiosBefore }));
+    assert.deepEqual(kept.Studios, [{ Name: 'Lantern, Ferry & Co' }, { Name: 'Quay Works' }]);
+    const edited = plain(fns.itemUpdateBody({ name: 'A', enabled: {}, studioNames, studiosBefore, studios: 'Quay Works, Dock' }));
+    assert.deepEqual(edited.Studios, [{ Name: 'Quay Works' }, { Name: 'Dock' }]);
+    assert.match(metadata, /values\.studioNames = \(item\.Studios \|\| \[\]\)\.map\(s => s\.Name\)/);
+});
+
 test('people rows and provider id fields', () => {
     const row = fns.personRowHtml({ Name: 'Pat "P" Example', Role: 'Keeper', Type: 'Director' });
     assert.match(row, /data-person-name[^>]*value="Pat &quot;P&quot; Example"/);
     assert.match(row, /<option value="Director" selected>/);
     assert.match(row, /data-remove-person/);
-    assert.match(fns.personRowHtml({ Type: 'Narrator' }), /<option value="Actor" selected>/);
+    assert.match(fns.personRowHtml({}), /<option value="Actor" selected>/);
+    assert.match(fns.personRowHtml({ Type: 'Narrator' }), /<option value="Narrator" selected>/);
 
     const ids = fns.providerIdsHtml(
         [{ Name: 'TheMovieDb', Key: 'Tmdb' }, { Name: 'IMDb', Key: 'Imdb' }],
