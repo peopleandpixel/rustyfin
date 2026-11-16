@@ -3051,6 +3051,142 @@ async fn test_delete_library_updates_every_list_and_keeps_others() {
     assert_eq!(remaining_items, ["Film item"]);
 }
 
+// R3 core reliability: deletes, configuration saves
+
+/// Inserts a media item row; `parent` and `owner` as given.
+async fn r3rel_insert_item(
+    state: &AppState,
+    library: uuid::Uuid,
+    name: &str,
+    kind: &str,
+    parent: Option<uuid::Uuid>,
+    owner: Option<uuid::Uuid>,
+) -> uuid::Uuid {
+    let id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO media_items (id, library_id, name, media_type, path, parent_id, owner_id) \
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(id.to_string())
+    .bind(library.to_string())
+    .bind(name)
+    .bind(kind)
+    .bind(format!("/media/{name}.mkv"))
+    .bind(parent.map(|p| p.to_string()))
+    .bind(owner.map(|o| o.to_string()))
+    .execute(&state.db)
+    .await
+    .unwrap();
+    id
+}
+
+/// Gives `user` a resume point and a favourite on `item`.
+async fn r3rel_play_state(state: &AppState, user: uuid::Uuid, item: uuid::Uuid) {
+    sqlx::query(
+        "INSERT INTO user_item_data (user_id, item_id, playback_position_ticks, play_count, \
+         is_favorite, played) VALUES (?, ?, 600000000, 1, 1, 0)",
+    )
+    .bind(user.to_string())
+    .bind(item.to_string())
+    .execute(&state.db)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn r3rel_deleting_a_library_with_play_state_removes_it_whole_and_unknown_ids_are_404() {
+    let state = test_state().await;
+    let (token, user_id) = admin_session(&state).await;
+    let app = app(state.clone());
+
+    let films = create_library_via_api(&app, &state, &token, "Films", "Movies").await;
+    let shows = create_library_via_api(&app, &state, &token, "Shows", "TvShows").await;
+    let series = r3rel_insert_item(&state, shows, "Show", "Series", None, None).await;
+    let season = r3rel_insert_item(&state, shows, "Season 1", "Season", Some(series), None).await;
+    let episode =
+        r3rel_insert_item(&state, shows, "Episode 1", "Episode", Some(season), None).await;
+    let film = r3rel_insert_item(&state, films, "Film", "Movie", None, None).await;
+    // An extra in the other library that a Shows item owns loses its owner, not its row.
+    let extra = r3rel_insert_item(&state, films, "Trailer", "Movie", None, Some(series)).await;
+    for item in [series, episode, film] {
+        r3rel_play_state(&state, user_id, item).await;
+    }
+
+    let (status, body) = send_authed(
+        &app,
+        "DELETE",
+        &format!("/Library/VirtualFolders/{shows}"),
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "delete Shows: {body}");
+    assert_eq!(stored_library_names(&state).await, ["Films"]);
+    let mut items: Vec<String> = sqlx::query_scalar("SELECT id FROM media_items")
+        .fetch_all(&state.db)
+        .await
+        .unwrap();
+    items.sort();
+    let mut expected = vec![film.to_string(), extra.to_string()];
+    expected.sort();
+    assert_eq!(items, expected);
+    let owner: Option<String> = sqlx::query_scalar("SELECT owner_id FROM media_items WHERE id = ?")
+        .bind(extra.to_string())
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(owner, None);
+    let data: Vec<String> = sqlx::query_scalar("SELECT item_id FROM user_item_data")
+        .fetch_all(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        data,
+        [film.to_string()],
+        "only the Films play state is left"
+    );
+
+    // The same id again, and an id that never was a library, answer 404 as in Jellyfin.
+    for id in [shows, uuid::Uuid::new_v4()] {
+        let (status, body) = send_authed(
+            &app,
+            "DELETE",
+            &format!("/Library/VirtualFolders/{id}"),
+            &token,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "delete {id}: {body}");
+    }
+    assert_eq!(stored_library_names(&state).await, ["Films"]);
+}
+
+#[tokio::test]
+async fn r3rel_deleting_an_item_with_play_state_works_and_unknown_ids_are_404() {
+    let state = test_state().await;
+    let (token, user_id) = admin_session(&state).await;
+    let app = app(state.clone());
+    let films = create_library_via_api(&app, &state, &token, "Films", "Movies").await;
+    let film = r3rel_insert_item(&state, films, "Film", "Movie", None, None).await;
+    let kept = r3rel_insert_item(&state, films, "Kept", "Movie", None, None).await;
+    r3rel_play_state(&state, user_id, film).await;
+    r3rel_play_state(&state, user_id, kept).await;
+
+    let (status, body) = send_authed(&app, "DELETE", &format!("/Items/{film}"), &token, None).await;
+    assert!(status.is_success(), "delete: {status} {body}");
+    let data: Vec<String> = sqlx::query_scalar("SELECT item_id FROM user_item_data")
+        .fetch_all(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(data, [kept.to_string()]);
+
+    for id in [film, uuid::Uuid::new_v4()] {
+        let (status, body) =
+            send_authed(&app, "DELETE", &format!("/Items/{id}"), &token, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "delete {id}: {body}");
+    }
+}
+
 #[tokio::test]
 async fn test_failed_library_create_changes_no_list() {
     let state = test_state().await;
