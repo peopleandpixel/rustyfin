@@ -3618,6 +3618,7 @@ const B124_WEB_MODULES: &[&str] = &[
     "cast.js",
     "collections.js",
     "dashboard.js",
+    "dlna-admin.js",
     "genres.js",
     "home.js",
     "item.js",
