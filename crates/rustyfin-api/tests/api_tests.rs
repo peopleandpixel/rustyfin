@@ -3188,6 +3188,60 @@ async fn r3rel_deleting_an_item_with_play_state_works_and_unknown_ids_are_404() 
 }
 
 #[tokio::test]
+async fn r3rel_a_partial_configuration_post_keeps_every_other_setting() {
+    let state = test_state().await;
+    let (admin, _) = admin_session(&state).await;
+    let app = app(state.clone());
+    let (_, config) = send_authed(&app, "GET", "/System/Configuration", &admin, None).await;
+    let mut full = config.clone();
+    full["ServerName"] = serde_json::json!("Kept Server");
+    full["IsStartupWizardCompleted"] = serde_json::json!(true);
+    full["UICulture"] = serde_json::json!("de-DE");
+    full["MaxResumePct"] = serde_json::json!(85);
+    let (status, body) = send_authed(
+        &app,
+        "POST",
+        "/System/Configuration",
+        &admin,
+        Some(&full.to_string()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    // Only one field, in another case: the rest stays as saved, in memory and on disk.
+    let (status, body) = send_authed(
+        &app,
+        "POST",
+        "/System/Configuration",
+        &admin,
+        Some(r#"{"minResumePct":12}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let (_, config) = send_authed(&app, "GET", "/System/Configuration", &admin, None).await;
+    assert_eq!(config["MinResumePct"], 12, "{config}");
+    assert_eq!(config["ServerName"], "Kept Server", "{config}");
+    assert_eq!(config["IsStartupWizardCompleted"], true, "{config}");
+    assert_eq!(config["UICulture"], "de-DE", "{config}");
+    assert_eq!(config["MaxResumePct"], 85, "{config}");
+    let saved: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(state.data_dir.join("config.json")).unwrap())
+            .unwrap();
+    assert_eq!(saved["ServerName"], "Kept Server", "{saved}");
+    assert_eq!(saved["IsStartupWizardCompleted"], true, "{saved}");
+    assert_eq!(saved["MinResumePct"], 12, "{saved}");
+
+    // A body that isn't an object changes nothing.
+    for bad in ["[]", "\"x\""] {
+        let (status, body) =
+            send_authed(&app, "POST", "/System/Configuration", &admin, Some(bad)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {body}");
+    }
+    let (_, config) = send_authed(&app, "GET", "/System/Configuration", &admin, None).await;
+    assert_eq!(config["ServerName"], "Kept Server", "{config}");
+}
+
+#[tokio::test]
 async fn test_failed_library_create_changes_no_list() {
     let state = test_state().await;
     let (token, user_id) = admin_session(&state).await;
