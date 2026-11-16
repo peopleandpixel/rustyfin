@@ -1,6 +1,6 @@
-//! The transcoding URL, a port of Jellyfin's `StreamInfo.ToUrl` for an HLS transcode.
+//! The transcoding URL, a port of Jellyfin's `StreamInfo.ToUrl`.
 
-use rustyfin_model::device_profile::{SubtitleDeliveryMethod, TranscodeSeekInfo};
+use rustyfin_model::device_profile::{StreamProtocol, SubtitleDeliveryMethod, TranscodeSeekInfo};
 
 use super::video::StreamInfo;
 
@@ -64,10 +64,13 @@ impl StreamOptions {
 }
 
 impl StreamInfo {
-    /// The transcode URL for this stream, as Jellyfin's `StreamInfo.ToUrl` writes it for an HLS
-    /// transcode. The path is `/Videos/{item}/master.m3u8`, also for audio, the token goes in
-    /// `ApiKey`, and the bitrates are in bits per second. Empty ids and tokens are left out.
+    /// The transcode URL for this stream, as Jellyfin's `StreamInfo.ToUrl` writes it. An HLS
+    /// transcode's path is `/Videos/{item}/master.m3u8`, also for audio; a progressive (HTTP)
+    /// one's is `/audio/{item}/stream.{container}` or `/videos/{item}/stream.{container}`, with
+    /// no SegmentContainer. The token goes in `ApiKey`, and the bitrates are in bits per second.
+    /// Empty ids and tokens are left out.
     pub(super) fn to_url(&self) -> String {
+        let hls = self.sub_protocol == StreamProtocol::Hls;
         let mut params: Vec<String> = Vec::new();
         if !self.device_id.is_empty() {
             params.push(format!("DeviceId={}", self.device_id));
@@ -110,13 +113,14 @@ impl StreamInfo {
         if let Some(height) = self.max_height {
             params.push(format!("MaxHeight={height}"));
         }
-        if let Some(container) = self.container.as_deref().filter(|c| !c.is_empty()) {
+        let container = self.container.as_deref().filter(|c| !c.is_empty());
+        if let Some(container) = container.filter(|_| hls) {
             params.push(format!("SegmentContainer={container}"));
         }
-        if let Some(length) = self.segment_length {
+        if let Some(length) = self.segment_length.filter(|_| hls) {
             params.push(format!("SegmentLength={length}"));
         }
-        if let Some(min) = self.min_segments {
+        if let Some(min) = self.min_segments.filter(|_| hls) {
             params.push(format!("MinSegments={min}"));
         }
         if self.start_position_ticks != 0 {
@@ -169,11 +173,19 @@ impl StreamInfo {
         if !reasons.is_empty() {
             params.push(format!("TranscodeReasons={}", reasons.join(",")));
         }
-        if self.audio_only {
+        if self.audio_only && hls {
             params.push("AudioOnly=true".to_string());
         }
 
-        let path = format!("/Videos/{}/master.m3u8", self.item_id);
+        let path = match (hls, self.audio_only) {
+            (true, _) => format!("/Videos/{}/master.m3u8", self.item_id),
+            (false, audio) => format!(
+                "/{}/{}/stream{}",
+                if audio { "audio" } else { "videos" },
+                self.item_id,
+                container.map(|c| format!(".{c}")).unwrap_or_default()
+            ),
+        };
         if params.is_empty() {
             path
         } else {

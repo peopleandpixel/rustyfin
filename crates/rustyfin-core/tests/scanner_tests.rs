@@ -6020,6 +6020,60 @@ async fn b18_rescan_rereads_changed_movies() {
     );
 }
 
+/// ffmpeg. The scan stores a video's subtitle files with its streams, as Jellyfin numbers them
+/// from what the scan found: a file added later reaches the streams on the next scan, which
+/// probes only that video again, and a scan with nothing new probes nothing.
+#[tokio::test]
+async fn r3gaps2_the_scan_stores_subtitle_files() {
+    if !have_ffmpeg() {
+        eprintln!("skipped: needs ffmpeg and ffprobe");
+        return;
+    }
+    let fx = Fixture::new().await;
+    let lib = fx.library("film", LibraryContentType::Movies).await;
+    let pool = &fx.pool;
+    let root = root_of(&lib);
+    write_films(&fx, &root);
+    let heat = "Heat (1995)/Heat (1995).mkv";
+    std::fs::write(root.join("Heat (1995)/Heat (1995).eng.srt"), "").unwrap();
+    scan_idle(pool, &lib).await;
+    let externals = |pool: &SqlitePool| {
+        let pool = pool.clone();
+        let path = root.join(heat).to_str().unwrap().to_string();
+        async move {
+            let rows: Vec<(String,)> = sqlx::query_as(
+                "SELECT st.path FROM media_streams AS st
+                 JOIN media_sources AS s ON s.id = st.source_id
+                 WHERE s.path = ?1 AND st.is_external = 1 ORDER BY st.stream_index",
+            )
+            .bind(path)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            rows.into_iter()
+                .map(|(p,)| p.rsplit('/').next().unwrap().to_string())
+                .collect::<Vec<_>>()
+        }
+    };
+    assert_eq!(externals(pool).await, ["Heat (1995).eng.srt"]);
+
+    let before = b18_source_ids(pool, &lib).await;
+    std::fs::write(root.join("Heat (1995)/Heat (1995).ger.srt"), "").unwrap();
+    scan_idle(pool, &lib).await;
+    let after = b18_source_ids(pool, &lib).await;
+    assert_eq!(b18_reprobed(&before, &after), [heat]);
+    assert_eq!(
+        externals(pool).await,
+        ["Heat (1995).eng.srt", "Heat (1995).ger.srt"]
+    );
+    scan_idle(pool, &lib).await;
+    assert_eq!(
+        b18_source_ids(pool, &lib).await,
+        after,
+        "nothing new, no probe"
+    );
+}
+
 /// ffmpeg. B18 criterion 4: an episode replaced by a longer clip is probed again, on the same item.
 #[tokio::test]
 async fn b18_tv_rescan_rereads_a_changed_episode() {

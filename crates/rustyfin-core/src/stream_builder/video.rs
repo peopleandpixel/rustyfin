@@ -1106,11 +1106,7 @@ fn video_transcode_profile<'a>(
     device
         .transcoding_profiles
         .iter()
-        .filter(|tp| {
-            tp.r#type == ProfileType::Video
-                && tp.context == EncodingContext::Streaming
-                && tp.protocol == StreamProtocol::Hls
-        })
+        .filter(|tp| tp.r#type == ProfileType::Video && tp.context == EncodingContext::Streaming)
         .map(|tp| (tp, transcoding_rank(options, source, video, audio, tp)))
         .min_by_key(|(_, rank)| *rank)
         .map(|(tp, _)| tp)

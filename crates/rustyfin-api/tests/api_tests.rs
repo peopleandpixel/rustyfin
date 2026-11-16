@@ -36043,15 +36043,17 @@ async fn r3playback_subtitle_routes_refuse_files_out_of_the_library() {
             &[("video", "h264")],
         )
         .await;
+        r3gaps2_store_subtitles(&state, id).await;
     }
     let app = app(state);
 
-    // The subtitle beside the film is served by all three routes
+    // The subtitle beside the film is served by all three routes (stream 0: Jellyfin numbers
+    // the files the scan stored first)
     let routes = |id: uuid::Uuid| {
         [
             format!("/Videos/{id}/Subtitles/0/Stream"),
             format!("/Videos/{id}/Subtitles/0?Format=vtt"),
-            format!("/Videos/{id}/{id}/Subtitles/1/Stream.vtt"),
+            format!("/Videos/{id}/{id}/Subtitles/0/Stream.vtt"),
         ]
     };
     for uri in routes(good_id) {
@@ -37174,7 +37176,7 @@ async fn b22_insert_source(
     container: &str,
     streams: serde_json::Value,
 ) -> String {
-    let source: rustyfin_model::media_source::MediaSourceResponse =
+    let mut source: rustyfin_model::media_source::MediaSourceResponse =
         serde_json::from_value(serde_json::json!({
             "Id": uuid::Uuid::new_v4().to_string(),
             "Uid": uuid::Uuid::new_v4().to_string(),
@@ -37184,10 +37186,42 @@ async fn b22_insert_source(
             "MediaStreams": streams,
         }))
         .unwrap();
+    // The subtitle files beside the video, stored as the scan stores them
+    let found = rustyfin_core::subtitle::discover_external_subtitles(file);
+    rustyfin_core::probe::add_external_subtitles(&mut source, found);
     rustyfin_db::repo_media_source::insert_media_source_with_streams(&state.db, &item, &source)
         .await
         .unwrap()
         .to_string()
+}
+
+/// Stores the subtitle files beside the file of each of `item`'s sources with its streams, as a
+/// scan stores them (`probe::add_external_subtitles`).
+async fn r3gaps2_store_subtitles(state: &AppState, item: uuid::Uuid) {
+    for source in rustyfin_db::repo_media_source::get_media_sources(&state.db, &item)
+        .await
+        .unwrap()
+    {
+        let mut with = source.clone();
+        let stored: Vec<String> = source
+            .media_streams
+            .iter()
+            .filter_map(|s| s.path.clone())
+            .collect();
+        let found = rustyfin_core::subtitle::discover_external_subtitles(std::path::Path::new(
+            &source.path,
+        ))
+        .into_iter()
+        .filter(|sub| !stored.contains(&sub.path.to_string_lossy().into_owned()))
+        .collect();
+        rustyfin_core::probe::add_external_subtitles(&mut with, found);
+        let source_id = uuid::Uuid::parse_str(&source.id).unwrap();
+        for stream in &with.media_streams[source.media_streams.len()..] {
+            rustyfin_db::repo_media_source::insert_media_stream(&state.db, &source_id, stream)
+                .await
+                .unwrap();
+        }
+    }
 }
 
 /// Makes `B22 Film.mkv` in the media folder `folder`: 5 s of video (stream 0), FLAC audio (1)
@@ -37268,9 +37302,10 @@ async fn b22_subtitle_vtt_converts_embedded_and_external_subtitles() {
     let cache = state.data_dir.join("cache").join("subtitle-vtt");
     let app = app(state);
 
-    // The embedded stream 2, then the external files after the highest index, in name order
+    // Jellyfin's numbering: the external files first, in name order (eng 0, ger 1), then the
+    // embedded streams after them (the subtitle, stream 2 of the file, is 4)
     let vtt = |index: i32| format!("/Videos/{id}/{msid}/Subtitles/{index}/Stream.vtt");
-    let (status, content_type, embedded) = b22_get(&app, &vtt(2), &token).await;
+    let (status, content_type, embedded) = b22_get(&app, &vtt(4), &token).await;
     assert_eq!(status, StatusCode::OK, "{embedded}");
     assert_eq!(content_type, "text/vtt; charset=utf-8");
     assert!(embedded.starts_with("WEBVTT"), "{embedded}");
@@ -37281,7 +37316,7 @@ async fn b22_subtitle_vtt_converts_embedded_and_external_subtitles() {
         "{embedded}"
     );
 
-    let (status, _, body) = b22_get(&app, &vtt(3), &token).await;
+    let (status, _, body) = b22_get(&app, &vtt(0), &token).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(
         body.contains("External English") && !body.contains("Embedded"),
@@ -37289,13 +37324,13 @@ async fn b22_subtitle_vtt_converts_embedded_and_external_subtitles() {
     );
 
     // Windows-1252 text arrives as UTF-8; the format matches without case
-    let uri = format!("/Videos/{id}/{msid}/Subtitles/4/Stream.VTT");
+    let uri = format!("/Videos/{id}/{msid}/Subtitles/1/Stream.VTT");
     let (status, _, body) = b22_get(&app, &uri, &token).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body.contains("Grüße"), "{body}");
 
     // The item's own id, sent without dashes as clients do, names its primary source
-    let uri = format!("/Videos/{id}/{}/Subtitles/2/Stream.vtt", id.simple());
+    let uri = format!("/Videos/{id}/{}/Subtitles/4/Stream.vtt", id.simple());
     let (status, _, body) = b22_get(&app, &uri, &token).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body, embedded);
@@ -37309,11 +37344,12 @@ async fn b22_subtitle_vtt_converts_embedded_and_external_subtitles() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let cached = std::fs::read_to_string(cache.join(format!("v1-{msid}-2.vtt"))).unwrap();
+    let cached = std::fs::read_to_string(cache.join(format!("v1-{msid}-4.vtt"))).unwrap();
     let (stamp, text) = cached.split_once('\n').unwrap();
     let (hash, rest) = stamp.split_once('-').unwrap();
     assert_eq!(hash.len(), 16, "{stamp}");
-    assert_eq!(rest, format!("{}-{mtime}", meta.len()));
+    // ... and the stream in the file it was made from
+    assert_eq!(rest, format!("{}-{mtime}-m0:2", meta.len()));
     assert_eq!(text, embedded);
     let names: Vec<String> = std::fs::read_dir(&cache)
         .unwrap()
@@ -37345,7 +37381,8 @@ async fn b22_subtitle_vtt_moves_cues_back_by_the_start() {
     };
     // The same stream as SubRip, as a client with an srt subtitle profile asks for it, whole and
     // moved the same way
-    let srt = format!("/Videos/{id}/{msid}/Subtitles/2/Stream.srt");
+    // (the embedded subtitle is 4: the two external files come first)
+    let srt = format!("/Videos/{id}/{msid}/Subtitles/4/Stream.srt");
     let (status, content_type, body) = b22_get(&app, &srt, &token).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(content_type, "application/x-subrip; charset=utf-8");
@@ -37353,7 +37390,7 @@ async fn b22_subtitle_vtt_moves_cues_back_by_the_start() {
         body.contains("00:00:01,000 --> 00:00:02,000\nEmbedded one"),
         "{body}"
     );
-    let srt = format!("/Videos/{id}/{msid}/Subtitles/2/15000000/Stream.srt");
+    let srt = format!("/Videos/{id}/{msid}/Subtitles/4/15000000/Stream.srt");
     let (status, _, body) = b22_get(&app, &srt, &token).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(
@@ -37365,7 +37402,7 @@ async fn b22_subtitle_vtt_moves_cues_back_by_the_start() {
         "{body}"
     );
 
-    let (status, content_type, body) = b22_get(&app, &at(2, 15_000_000), &token).await;
+    let (status, content_type, body) = b22_get(&app, &at(4, 15_000_000), &token).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(content_type, "text/vtt; charset=utf-8");
     assert!(body.starts_with("WEBVTT"), "{body}");
@@ -37379,7 +37416,7 @@ async fn b22_subtitle_vtt_moves_cues_back_by_the_start() {
     );
 
     // An external file moves the same way
-    let (status, _, body) = b22_get(&app, &at(3, 15_000_000), &token).await;
+    let (status, _, body) = b22_get(&app, &at(0, 15_000_000), &token).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(
         body.contains("00:00:00.000 --> 00:00:00.500\nExternal English"),
@@ -37387,7 +37424,7 @@ async fn b22_subtitle_vtt_moves_cues_back_by_the_start() {
     );
 
     // After the last cue: the header alone
-    let (status, _, body) = b22_get(&app, &at(2, 50_000_000), &token).await;
+    let (status, _, body) = b22_get(&app, &at(4, 50_000_000), &token).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(
         body.starts_with("WEBVTT") && !body.contains("-->"),
@@ -37395,9 +37432,9 @@ async fn b22_subtitle_vtt_moves_cues_back_by_the_start() {
     );
 
     // A start of 0 is the whole subtitle
-    let whole = format!("/Videos/{id}/{msid}/Subtitles/2/Stream.vtt");
+    let whole = format!("/Videos/{id}/{msid}/Subtitles/4/Stream.vtt");
     let (_, _, whole) = b22_get(&app, &whole, &token).await;
-    let (status, _, body) = b22_get(&app, &at(2, 0), &token).await;
+    let (status, _, body) = b22_get(&app, &at(4, 0), &token).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body, whole);
 }
@@ -37494,10 +37531,12 @@ async fn b22_subtitle_vtt_strips_ass_blocks() {
         Dialogue: 0,0:00:03.00,0:00:04.00,Default,,0,0,0,,{\\i1}Plain{\\i0} {note}text\n";
     let ass_file = file.parent().unwrap().join("B22 Film.jpn.ass");
     std::fs::write(ass_file, script).unwrap();
+    // A rescan stores the new file after the others
+    r3gaps2_store_subtitles(&state, id).await;
     let app = app(state);
 
-    // The external files follow the embedded stream 2 in name order: eng 3, ger 4, jpn 5
-    let uri = format!("/Videos/{id}/{msid}/Subtitles/5/Stream.vtt");
+    // The external files come first: eng 0, ger 1, then jpn 2, which the rescan added
+    let uri = format!("/Videos/{id}/{msid}/Subtitles/2/Stream.vtt");
     let (status, _, body) = b22_get(&app, &uri, &token).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body.contains("Doom") && body.contains("Plain"), "{body}");
@@ -37517,8 +37556,8 @@ async fn b22_subtitle_vtt_cache_keeps_one_file_per_stream() {
     let eng = std::path::PathBuf::from(media_folder(&state, "b22-cache")).join("B22 Film.eng.srt");
     let app = app(state);
 
-    // External English is stream 3
-    let uri = format!("/Videos/{id}/{msid}/Subtitles/3/Stream.vtt");
+    // External English is stream 0
+    let uri = format!("/Videos/{id}/{msid}/Subtitles/0/Stream.vtt");
     let (status, _, body) = b22_get(&app, &uri, &token).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body.contains("External English"), "{body}");
@@ -37566,8 +37605,8 @@ async fn b22_subtitle_vtt_refuses_a_huge_file() {
         .unwrap();
     let app = app(state);
 
-    // The WebVTT of stream 3 and the file itself are both too large
-    let vtt_uri = format!("/Videos/{id}/{msid}/Subtitles/3/Stream.vtt");
+    // The WebVTT of stream 0 and the file itself are both too large
+    let vtt_uri = format!("/Videos/{id}/{msid}/Subtitles/0/Stream.vtt");
     let (vtt, _, _) = b22_get(&app, &vtt_uri, &token).await;
     let (file, _, _) = b22_get(&app, &format!("/Videos/{id}/Subtitles/0/Stream"), &token).await;
     assert_eq!(
@@ -37831,6 +37870,7 @@ async fn r3playback_item_streams_list_external_subtitle_files() {
         &[("video", "h264"), ("audio", "aac"), ("subtitle", "subrip")],
     )
     .await;
+    r3gaps2_store_subtitles(&state, id).await;
     let app = app(state);
 
     let external = |streams: &serde_json::Value| -> Vec<(i64, String)> {
@@ -37847,8 +37887,9 @@ async fn r3playback_item_streams_list_external_subtitle_files() {
             })
             .collect()
     };
+    // Numbered first, as Jellyfin numbers the files the scan found
     let srt = folder.join("R3 Film.en.srt").to_str().unwrap().to_string();
-    let expected = vec![(3, srt)];
+    let expected = vec![(0, srt)];
 
     for uri in [
         format!("/Items/{id}"),
@@ -37909,7 +37950,7 @@ async fn b22_playback_info_lists_external_subtitles() {
     b22_insert_source(&state, id, &file, "mkv", streams).await;
     let app = app(state);
 
-    // The files beside the video follow its streams, in name order
+    // The files beside the video come first, in name order, as Jellyfin numbers them
     let uri = format!("/Videos/{id}/PlaybackInfo");
     let (status, body) = send(&app, request("GET", &uri, Some(&token), None)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -37919,10 +37960,11 @@ async fn b22_playback_info_lists_external_subtitles() {
         .map(|s| s["Index"].as_i64().unwrap())
         .collect();
     assert_eq!(indexes, [0, 1, 2, 3, 4], "{body}");
-    assert_eq!(streams[2]["IsExternal"], false);
+    assert_eq!(streams[4]["IsExternal"], false);
+    assert_eq!(streams[4]["Codec"], "subrip");
     for (stream, codec, language, path) in [
-        (&streams[3], "ass", None, &ass),
-        (&streams[4], "srt", Some("eng"), &srt),
+        (&streams[0], "ass", None, &ass),
+        (&streams[1], "srt", Some("eng"), &srt),
     ] {
         assert_eq!(stream["CodecType"], "subtitle", "{stream}");
         assert_eq!(stream["Type"], "Subtitle", "{stream}");
@@ -39030,14 +39072,21 @@ async fn b20_defaults_after_rescan(
     before: serde_json::Value,
     after: serde_json::Value,
 ) -> B20Defaults {
+    // The German tracks, as a client numbers them: with the German subtitle an external file,
+    // Jellyfin numbers it 0 and the embedded streams after it
+    let external = before
+        .as_array()
+        .is_some_and(|streams| streams.iter().any(|s| s["IsExternal"] == true));
+    let (audio, subtitle) = if external { (3, 0) } else { (2, 4) };
     let item = b20_movie(state, name, before).await;
     let body = serde_json::json!({
-        "ItemId": item, "PositionTicks": 0, "AudioStreamIndex": 2, "SubtitleStreamIndex": 4,
+        "ItemId": item, "PositionTicks": 0, "AudioStreamIndex": audio,
+        "SubtitleStreamIndex": subtitle,
     });
     b20_report(app, token, "/Progress", body).await;
     assert_eq!(
         b20_only_defaults(app, token, item).await,
-        b20_both(2, 4),
+        b20_both(audio, subtitle),
         "{name}: before the rescan"
     );
     rustyfin_db::repo_media_source::delete_media_sources(&state.db, &item)
@@ -39124,13 +39173,13 @@ async fn b20_rescan_offers_only_the_chosen_streams() {
             "External",
             external("/subs/B20 Ext.ger.srt"),
             external("/subs/B20 Ext.fre.srt"),
-            (Some(serde_json::json!(2)), None),
+            (Some(serde_json::json!(3)), None),
         ),
         (
             "External Moved",
             external("/subs/B20 Ext.ger.srt"),
             external("/elsewhere/B20 Ext.ger.srt"),
-            kept.clone(),
+            b20_both(3, 0),
         ),
     ];
     let mut wrong = Vec::new();
@@ -45133,6 +45182,7 @@ async fn j2_subtitles_get_deliveries() {
         "1\n00:00:01,000 --> 00:00:02,000\nJ2 cue\n",
     )
     .unwrap();
+    r3gaps2_store_subtitles(&state, item).await;
     let app = app(state);
     let (token, _) = g2_login_device(&app, "j2-subs", "j2-pass", "j2-device")
         .await
@@ -45142,9 +45192,10 @@ async fn j2_subtitles_get_deliveries() {
     let (sources, _) = j2_play(&app, "POST", &uri, &token, Some(body)).await;
     let source = &sources[0];
 
-    // The file beside the video is the default subtitle; Chrome shows it over the direct play
+    // The file beside the video is the default subtitle; Chrome shows it over the direct play.
+    // Jellyfin numbers it first (0), and the embedded streams after it (1, 2, 3).
     assert_eq!(source["SupportsDirectPlay"], true);
-    assert_eq!(source["DefaultSubtitleStreamIndex"], 3);
+    assert_eq!(source["DefaultSubtitleStreamIndex"], 0);
     let streams = source["MediaStreams"]
         .as_array()
         .cloned()
@@ -45155,7 +45206,7 @@ async fn j2_subtitles_get_deliveries() {
             .find(|s| s["Index"] == index)
             .unwrap_or_else(|| panic!("no stream {index}"))
     };
-    for index in [2, 3] {
+    for index in [3, 0] {
         let subtitle = stream(index);
         assert_eq!(subtitle["DeliveryMethod"], "External", "stream {index}");
         assert_eq!(subtitle["IsExternalUrl"], false, "stream {index}");
@@ -45164,7 +45215,7 @@ async fn j2_subtitles_get_deliveries() {
             format!("/Videos/{item}/{source_id}/Subtitles/{index}/0/Stream.vtt?ApiKey=<token>");
         assert_eq!(url, expected, "stream {index}");
     }
-    for index in [0, 1] {
+    for index in [1, 2] {
         assert!(
             stream(index).get("DeliveryMethod").is_none(),
             "stream {index}"
@@ -45172,7 +45223,7 @@ async fn j2_subtitles_get_deliveries() {
     }
 
     // The external file loads as WebVTT without a header
-    let url = stream(3)["DeliveryUrl"].as_str().unwrap_or_default();
+    let url = stream(0)["DeliveryUrl"].as_str().unwrap_or_default();
     let (status, _, data) = g4_get(&app, url).await;
     assert_eq!(status, StatusCode::OK);
     let text = String::from_utf8_lossy(&data);
@@ -45180,6 +45231,10 @@ async fn j2_subtitles_get_deliveries() {
         text.starts_with("WEBVTT") && text.contains("J2 cue"),
         "{text}"
     );
+    // The embedded stream, now 3, is stream 2 of the file
+    let url = stream(3)["DeliveryUrl"].as_str().unwrap_or_default();
+    let (status, _, _) = g4_get(&app, url).await;
+    assert_ne!(status, StatusCode::NOT_FOUND, "{url}");
 }
 
 #[tokio::test]
@@ -45635,7 +45690,8 @@ async fn r3decisions_universal_audio_plays_the_file_or_the_hls_transcode() {
     assert_eq!(status, StatusCode::FOUND);
     assert!(location.unwrap().contains("ContainerBitrateExceedsLimit"));
 
-    // A progressive transcode isn't available: 400 that says so, not the FLAC as it is
+    // A progressive transcode is made (r3gaps2_progressive_audio_and_video_transcodes plays one);
+    // the 1000 zero bytes here aren't audio, so ffmpeg fails, and says so
     let (status, _, body) = r3decisions_get(
         &app,
         &format!(
@@ -45645,19 +45701,26 @@ async fn r3decisions_universal_audio_plays_the_file_or_the_hls_transcode() {
         &token,
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert!(String::from_utf8_lossy(&body).contains("HLS only"));
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert!(String::from_utf8_lossy(&body).contains("Transcode failed"));
 
     // stream.{container} answered 500, as its second path parameter failed the extractor. An MP3
-    // request for the FLAC track is a 400 now; the track's own codec, or static, gets the file.
+    // request for the FLAC track is a progressive transcode now; the track's own codec, or
+    // static, gets the file.
     let (status, _, body) = r3decisions_get(
         &app,
         &format!("/Audio/{song}/stream.mp3?AudioCodec=mp3&AudioBitrate=192000"),
         &token,
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert!(String::from_utf8_lossy(&body).contains("HLS only"));
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(String::from_utf8_lossy(&body).contains("Transcode failed"));
+    assert!(!transcodes.is_active(song).await, "a failed job is gone");
     for uri in [
         format!("/Audio/{song}/stream.flac"),
         format!("/Audio/{song}/stream.mp3?static=true"),
@@ -45667,6 +45730,423 @@ async fn r3decisions_universal_audio_plays_the_file_or_the_hls_transcode() {
         assert_eq!(status, StatusCode::OK, "{uri}");
         assert_eq!(body.len(), 1000, "{uri}");
     }
+}
+
+/// A library whose folders are links to media outside it (as a library of chosen films linked
+/// from a media share is): a static read with a byte range gets the file, with the default link
+/// setting; refusing links out of libraries refuses it.
+#[cfg(unix)]
+#[tokio::test]
+async fn r3gaps2_static_reads_follow_links_out_of_the_library() {
+    let state = test_state().await;
+    add_user(&state, "r3g2-link", "r3g2-pass", true).await;
+    let outside = std::env::temp_dir().join(format!("r3g2-share-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(outside.join("Film (2020)")).unwrap();
+    let bytes: Vec<u8> = (0..4000u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(outside.join("Film (2020)/Film (2020).mkv"), &bytes).unwrap();
+    std::fs::write(outside.join("Song.flac"), &bytes).unwrap();
+    // The library: a folder link and a file link into the share
+    let library = std::path::PathBuf::from(media_folder(&state, "r3g2-linked"));
+    std::os::unix::fs::symlink(outside.join("Film (2020)"), library.join("Film (2020)")).unwrap();
+    std::os::unix::fs::symlink(outside.join("Song.flac"), library.join("Song.flac")).unwrap();
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: "R3G2 linked".to_string(),
+        content_type: rustyfin_model::library::LibraryContentType::Movies,
+        paths: vec![library.to_str().unwrap().to_string()],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    let mut ids = Vec::new();
+    for (media_type, path) in [
+        ("Movie", library.join("Film (2020)/Film (2020).mkv")),
+        ("Audio", library.join("Song.flac")),
+    ] {
+        let id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO media_items (id, library_id, name, media_type, path) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(id.to_string())
+        .bind(lib.id.to_string())
+        .bind("linked")
+        .bind(media_type)
+        .bind(path.to_str().unwrap())
+        .execute(&state.db)
+        .await
+        .unwrap();
+        ids.push(id);
+    }
+    let config = state.config.clone();
+    let app = app(state);
+    let (token, _) = g2_login_device(&app, "r3g2-link", "r3g2-pass", "r3g2-device")
+        .await
+        .unwrap();
+
+    let uris = [
+        format!("/Videos/{}/stream.mkv?static=true", ids[0]),
+        format!("/Videos/{}/stream", ids[0]),
+        format!("/Audio/{}/stream?static=true", ids[1]),
+    ];
+    for uri in &uris {
+        let (status, range, body) = g4_get_range(&app, uri, &token, "bytes=1000-1999").await;
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT, "{uri}");
+        assert_eq!(range.as_deref(), Some("bytes 1000-1999/4000"), "{uri}");
+        assert_eq!(body, bytes[1000..2000], "{uri}");
+    }
+
+    // The stricter setting refuses links that leave the libraries
+    config.write().await.refuse_links_out_of_libraries = true;
+    let (status, _, _) = g4_get_range(&app, &uris[0], &token, "bytes=0-9").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let _ = std::fs::remove_dir_all(&outside);
+}
+
+/// The user policy on the progressive routes, as on the HLS route: a re-encode needs the
+/// transcoding switch (403), a copy needs remuxing (403), a hidden library's item is 404 on the
+/// stream routes and leaves /Items, and a remote caller's bitrate limit caps the decision.
+#[tokio::test]
+async fn r3gaps2_progressive_routes_follow_the_user_policy() {
+    let state = test_state().await;
+    add_user(&state, "r3g2-admin", "r3g2-pass", true).await;
+    let kid = add_user(&state, "r3g2-kid", "r3g2-pass", false).await;
+    let (song, _, flac) = j2_item(
+        &state,
+        "r3g2-psong",
+        "Audio",
+        "flac",
+        j2_song("flac", 900_000),
+    )
+    .await;
+    if !r3gaps2_make_media(
+        &flac,
+        &["sine=frequency=440:sample_rate=48000:duration=5"],
+        &["-ac", "2", "-c:a", "flac"],
+    ) {
+        return;
+    }
+    let (movie, _, mkv) = j2_item(
+        &state,
+        "r3g2-pmovie",
+        "Movie",
+        "mkv",
+        serde_json::json!([
+            {"Index": 0, "Codec": "mpeg4", "CodecType": "Video", "Width": 160, "Height": 120},
+            {"Index": 1, "Codec": "mp2", "CodecType": "Audio", "Channels": 1, "IsDefault": true},
+        ]),
+    )
+    .await;
+    assert!(r3gaps2_make_media(
+        &mkv,
+        &["testsrc=size=160x120:rate=10:duration=2", "sine=duration=2"],
+        &["-c:v", "mpeg4", "-c:a", "mp2"],
+    ));
+    let song_library: String =
+        sqlx::query_scalar("SELECT library_id FROM media_items WHERE id = ?")
+            .bind(song.to_string())
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+    let local = app(state.clone());
+    let remote = remote_app(state);
+    let (admin, _) = g2_login_device(&local, "r3g2-admin", "r3g2-pass", "r3g2-a")
+        .await
+        .unwrap();
+    let (token, _) = g2_login_device(&local, "r3g2-kid", "r3g2-pass", "r3g2-k")
+        .await
+        .unwrap();
+    let set_policy = |policy: serde_json::Value| {
+        let local = local.clone();
+        let admin = admin.clone();
+        async move {
+            let uri = format!("/Users/{kid}/Policy");
+            let (status, body) =
+                send(&local, request("POST", &uri, Some(&admin), Some(policy))).await;
+            assert!(status.is_success(), "{uri}: {status} {body}");
+        }
+    };
+    let status_of = |app: &axum::Router, method: &str, uri: String| {
+        let app = app.clone();
+        let token = token.clone();
+        let method = method.to_string();
+        async move { r3decisions_send(&app, &method, &uri, &token).await.0.0 }
+    };
+    let mp3 = format!("/Audio/{song}/stream.mp3?AudioCodec=mp3");
+    let universal = format!(
+        "/Audio/{song}/universal?Container=mp3&TranscodingContainer=mp3\
+         &TranscodingProtocol=http&AudioCodec=mp3"
+    );
+    let video = format!("/Videos/{movie}/stream.ts?static=false&VideoCodec=h264&AudioCodec=aac");
+    let flac_copy = format!("/Audio/{song}/stream.flac?AudioCodec=flac&AudioBitrate=100000000");
+
+    // No transcoding: every re-encode is 403, GET and HEAD; the file itself still plays
+    set_policy(serde_json::json!({
+        "EnableAudioPlaybackTranscoding": false,
+        "EnableVideoPlaybackTranscoding": false,
+    }))
+    .await;
+    for (method, uri) in [
+        ("GET", &mp3),
+        ("HEAD", &mp3),
+        ("GET", &universal),
+        ("GET", &video),
+    ] {
+        assert_eq!(
+            status_of(&local, method, uri.clone()).await,
+            StatusCode::FORBIDDEN,
+            "{method} {uri}"
+        );
+    }
+    assert_eq!(
+        status_of(&local, "GET", format!("/Audio/{song}/stream?static=true")).await,
+        StatusCode::OK
+    );
+
+    // No remuxing: a copy is 403, an encode plays
+    set_policy(serde_json::json!({
+        "EnableAudioPlaybackTranscoding": true,
+        "EnableVideoPlaybackTranscoding": true,
+        "EnablePlaybackRemuxing": false,
+    }))
+    .await;
+    assert_eq!(
+        status_of(&local, "GET", flac_copy.clone()).await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(status_of(&local, "GET", mp3.clone()).await, StatusCode::OK);
+
+    // A remote caller's limit caps the universal decision: the FLAC it would play as it is is
+    // transcoded to MP3 within the limit
+    let flac_universal = format!(
+        "/Audio/{song}/universal?Container=flac,mp3&TranscodingContainer=mp3\
+         &TranscodingProtocol=http&AudioCodec=mp3&MaxStreamingBitrate=140000000"
+    );
+    let ((_, _, _), content_type) = r3decisions_send(&remote, "GET", &flac_universal, &token).await;
+    assert_eq!(content_type.as_deref(), Some("audio/flac"), "no limit yet");
+    set_policy(serde_json::json!({
+        "EnablePlaybackRemuxing": true,
+        "RemoteClientBitrateLimit": 128000,
+    }))
+    .await;
+    let ((status, _, body), content_type) =
+        r3decisions_send(&remote, "GET", &flac_universal, &token).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(content_type.as_deref(), Some("audio/mpeg"));
+    assert!(body.starts_with(b"ID3") || body.starts_with(&[0xFF]));
+    let ((_, _, _), content_type) = r3decisions_send(&local, "GET", &flac_universal, &token).await;
+    assert_eq!(
+        content_type.as_deref(),
+        Some("audio/flac"),
+        "local callers have no limit"
+    );
+
+    // Library access: the song's library hidden, its streams are 404 and /Items leaves it out
+    set_policy(serde_json::json!({ "EnableAllFolders": false, "EnabledFolders": [] })).await;
+    for uri in [&mp3, &universal] {
+        assert_eq!(
+            status_of(&local, "GET", uri.clone()).await,
+            StatusCode::NOT_FOUND,
+            "{uri}"
+        );
+    }
+    let (status, body) = send(
+        &local,
+        request(
+            "GET",
+            "/Items?Recursive=true&Fields=MediaSources",
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !body.to_string().contains(&song.to_string()),
+        "a hidden item leaves /Items"
+    );
+    set_policy(serde_json::json!({ "EnableAllFolders": false, "EnabledFolders": [song_library] }))
+        .await;
+    let (_, body) = send(
+        &local,
+        request(
+            "GET",
+            "/Items?Recursive=true&Fields=MediaSources&IncludeItemTypes=Audio",
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    let items = body["Items"].as_array().cloned().unwrap_or_default();
+    assert_eq!(items.len(), 1, "{body}");
+    assert!(
+        items[0]["MediaSources"]
+            .as_array()
+            .is_some_and(|s| !s.is_empty())
+    );
+}
+
+/// Writes a real media file over `file` with ffmpeg's lavfi `inputs` and output `args`. False
+/// when ffmpeg isn't there.
+fn r3gaps2_make_media(file: &std::path::Path, inputs: &[&str], args: &[&str]) -> bool {
+    let mut command = std::process::Command::new("ffmpeg");
+    command.args(["-y", "-hide_banner", "-loglevel", "error"]);
+    for input in inputs {
+        command.args(["-f", "lavfi", "-i", input]);
+    }
+    command.args(args).arg(file);
+    match command.status() {
+        Ok(status) => {
+            assert!(
+                status.success(),
+                "ffmpeg could not write {}",
+                file.display()
+            );
+            true
+        }
+        Err(_) => {
+            eprintln!("skipped: no ffmpeg");
+            false
+        }
+    }
+}
+
+/// Progressive (HTTP) transcodes, as Jellyfin's progressive jobs: FLAC to MP3 for an HTTP-only
+/// universal client and for `stream.mp3`, a chunked body of MP3 frames; HEAD starts nothing;
+/// the job is registered, a stop by PlaySessionId ends the body, and a client that goes away
+/// kills ffmpeg. `/Videos/{id}/stream.ts?static=false` sends MPEG-TS.
+#[tokio::test]
+async fn r3gaps2_progressive_audio_and_video_transcodes() {
+    let state = test_state().await;
+    add_user(&state, "r3g2-audio", "r3g2-pass", true).await;
+    let (song, _, flac) = j2_item(
+        &state,
+        "r3g2-song",
+        "Audio",
+        "flac",
+        j2_song("flac", 900_000),
+    )
+    .await;
+    // Two minutes of tone: more MP3 than a pipe holds, so ffmpeg runs until it is read or killed
+    if !r3gaps2_make_media(
+        &flac,
+        &["sine=frequency=440:sample_rate=48000:duration=120"],
+        &["-ac", "2", "-c:a", "flac"],
+    ) {
+        return;
+    }
+    let (movie, _, mkv) = j2_item(
+        &state,
+        "r3g2-movie",
+        "Movie",
+        "mkv",
+        serde_json::json!([
+            {"Index": 0, "Codec": "mpeg4", "CodecType": "Video", "Width": 160, "Height": 120},
+            {"Index": 1, "Codec": "mp2", "CodecType": "Audio", "Channels": 1, "IsDefault": true},
+        ]),
+    )
+    .await;
+    assert!(r3gaps2_make_media(
+        &mkv,
+        &["testsrc=size=160x120:rate=10:duration=2", "sine=duration=2"],
+        &["-c:v", "mpeg4", "-c:a", "mp2"],
+    ));
+    let transcodes = state.transcode_manager.clone();
+    let app = app(state);
+    let (token, _) = g2_login_device(&app, "r3g2-audio", "r3g2-pass", "r3g2-device")
+        .await
+        .unwrap();
+    let is_mp3 = |body: &[u8]| body.starts_with(b"ID3") || body.starts_with(&[0xFF]);
+
+    // HEAD: the type, and no job
+    let universal = format!(
+        "/Audio/{song}/universal?Container=mp3&TranscodingContainer=mp3\
+         &TranscodingProtocol=http&AudioCodec=mp3&MaxStreamingBitrate=192000\
+         &PlaySessionId=r3g2-ps"
+    );
+    let ((status, _, _), content_type) = r3decisions_send(&app, "HEAD", &universal, &token).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(content_type.as_deref(), Some("audio/mpeg"));
+    assert!(
+        !transcodes.is_active(song).await,
+        "HEAD started a transcode"
+    );
+
+    // GET: MP3 as it is made; the job is registered and a stop by PlaySessionId ends the body
+    let request = |uri: &str| {
+        Request::builder()
+            .uri(uri)
+            .header("Authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap()
+    };
+    let resp = app.clone().oneshot(request(&universal)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()["content-type"], "audio/mpeg");
+    assert!(resp.headers().get("content-length").is_none(), "chunked");
+    let mut body = resp.into_body();
+    let first = body.frame().await.unwrap().unwrap().into_data().unwrap();
+    assert!(is_mp3(&first), "{:?}", &first[..4]);
+    assert!(transcodes.is_active(song).await, "the job is registered");
+    let stop = Request::builder()
+        .method("DELETE")
+        .uri("/Videos/ActiveEncodings?PlaySessionId=r3g2-ps&DeviceId=r3g2-device")
+        .header("Authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(stop).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+    let rest = tokio::time::timeout(std::time::Duration::from_secs(10), body.collect())
+        .await
+        .expect("the body ends with the stop");
+    assert!(rest.is_ok());
+    assert!(!transcodes.is_active(song).await);
+
+    // stream.mp3: the same, and a client that goes away kills ffmpeg
+    let resp = app
+        .clone()
+        .oneshot(request(&format!(
+            "/Audio/{song}/stream.mp3?AudioCodec=mp3&AudioBitrate=192000"
+        )))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()["content-type"], "audio/mpeg");
+    let mut body = resp.into_body();
+    let first = body.frame().await.unwrap().unwrap().into_data().unwrap();
+    assert!(is_mp3(&first));
+    assert!(transcodes.is_active(song).await);
+    drop(body);
+    let mut gone = false;
+    for _ in 0..50 {
+        if !transcodes.is_active(song).await {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(gone, "ffmpeg outlived its client");
+
+    // The track's own codec without limits, or static, is still the file
+    let (status, _, body) =
+        r3decisions_get(&app, &format!("/Audio/{song}/stream.flac"), &token).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.len() as u64, std::fs::metadata(&flac).unwrap().len());
+
+    // Video: static=false transcodes; without static and codecs, the file
+    let (status, _, body) = r3decisions_get(
+        &app,
+        &format!("/Videos/{movie}/stream.ts?static=false&VideoCodec=h264&AudioCodec=aac"),
+        &token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.first(), Some(&0x47), "MPEG-TS sync byte");
+    let (status, _, body) = r3decisions_get(&app, &format!("/Videos/{movie}/stream"), &token).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.len() as u64, std::fs::metadata(&mkv).unwrap().len());
+    assert!(!transcodes.is_active(movie).await);
 }
 
 #[tokio::test]

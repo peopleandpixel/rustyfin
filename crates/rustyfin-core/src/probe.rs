@@ -29,7 +29,7 @@ fn probe_semaphore() -> &'static Semaphore {
 }
 
 use rustyfin_model::chapter::Chapter;
-use rustyfin_model::media_source::{MediaSourceResponse, MediaStream};
+use rustyfin_model::media_source::{DoviConfig, MediaSourceResponse, MediaStream};
 
 /// Result of probing a media file with ffprobe.
 #[derive(Debug)]
@@ -133,6 +133,50 @@ struct SideData {
     attachment: Option<String>, // base64-encoded image data
     mime_type: Option<String>,
     filename: Option<String>,
+    // The "DOVI configuration record" fields
+    dv_version_major: Option<i32>,
+    dv_version_minor: Option<i32>,
+    dv_profile: Option<i32>,
+    dv_level: Option<i32>,
+    rpu_present_flag: Option<i32>,
+    el_present_flag: Option<i32>,
+    bl_present_flag: Option<i32>,
+    dv_bl_signal_compatibility_id: Option<i32>,
+}
+
+/// The Dolby Vision configuration record in a stream's side data, as Jellyfin reads it; empty
+/// when there is none.
+fn dovi_config(side_data: Option<&[SideData]>) -> DoviConfig {
+    let side_data = side_data.unwrap_or_default();
+    // HDR10+ dynamic metadata (SMPTE 2094-40), where the stream's side data lists it
+    let hdr10_plus = side_data.iter().any(|d| {
+        d.side_data_type
+            .as_deref()
+            .is_some_and(|t| t.contains("2094-40"))
+    });
+    let mut config = side_data
+        .iter()
+        .find(|d| {
+            d.side_data_type
+                .as_deref()
+                .is_some_and(|t| t.eq_ignore_ascii_case("DOVI configuration record"))
+        })
+        .map(|d| DoviConfig {
+            dv_version_major: d.dv_version_major,
+            dv_version_minor: d.dv_version_minor,
+            dv_profile: d.dv_profile,
+            dv_level: d.dv_level,
+            rpu_present_flag: d.rpu_present_flag,
+            el_present_flag: d.el_present_flag,
+            bl_present_flag: d.bl_present_flag,
+            dv_bl_signal_compatibility_id: d.dv_bl_signal_compatibility_id,
+            hdr10_plus_present_flag: None,
+        })
+        .unwrap_or_default();
+    if hdr10_plus {
+        config.hdr10_plus_present_flag = Some(true);
+    }
+    config
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -264,6 +308,56 @@ struct FfprobeChapter {
 
 /// Probe a media file using ffprobe and return the parsed result.
 pub async fn probe_file(path: &str) -> Result<ProbeResult, ProbeError> {
+    let mut result = probe_streams(path).await?;
+    // A video's subtitle files are stored with its streams, as Jellyfin stores them at scan
+    // time: the numbering clients see then holds until the next scan
+    if result
+        .source
+        .media_streams
+        .iter()
+        .any(|s| s.codec_type.eq_ignore_ascii_case("video"))
+    {
+        let media_path = std::path::PathBuf::from(path);
+        let found = tokio::task::spawn_blocking(move || {
+            crate::subtitle::discover_external_subtitles(&media_path)
+        })
+        .await
+        .unwrap_or_default();
+        add_external_subtitles(&mut result.source, found);
+    }
+    Ok(result)
+}
+
+/// Adds the external subtitle files `found` to `source`'s streams, after its embedded streams,
+/// in file-name order. Their stored index follows the embedded ones; PlaybackInfo numbers them
+/// first, as Jellyfin does.
+pub fn add_external_subtitles(
+    source: &mut MediaSourceResponse,
+    found: Vec<crate::subtitle::ExternalSubtitle>,
+) {
+    let next = source
+        .media_streams
+        .iter()
+        .map(|s| s.index)
+        .max()
+        .unwrap_or(-1)
+        + 1;
+    for (k, file) in found.into_iter().enumerate() {
+        source.media_streams.push(MediaStream {
+            index: next + k as i32,
+            codec: Some(file.format),
+            codec_type: "subtitle".to_string(),
+            language: file.language,
+            is_external: true,
+            path: Some(file.path.to_string_lossy().into_owned()),
+            r#type: MediaStream::stream_type("subtitle", None),
+            ..Default::default()
+        });
+    }
+}
+
+/// Probes `path` with ffprobe: its embedded streams, format, tags and chapters.
+async fn probe_streams(path: &str) -> Result<ProbeResult, ProbeError> {
     let output = Command::new("ffprobe")
         .args([
             "-v",
@@ -762,7 +856,12 @@ fn stream_to_model(s: FfprobeStream) -> MediaStream {
             !order.trim().is_empty() && !order.eq_ignore_ascii_case("progressive")
         });
 
-    MediaStream {
+    let dovi = if is_video {
+        dovi_config(s.side_data_list.as_deref())
+    } else {
+        DoviConfig::default()
+    };
+    let mut stream = MediaStream {
         index: s.index,
         codec: s.codec_name,
         codec_type: s.codec_type.unwrap_or_default(),
@@ -800,7 +899,12 @@ fn stream_to_model(s: FfprobeStream) -> MediaStream {
         embedded_bitmaps: false,
         level,
         is_anamorphic,
-    }
+        dovi,
+        video_range: None,
+        video_range_type: None,
+    };
+    stream.fill_video_range();
+    stream
 }
 
 /// A stream's bit rate from its Matroska statistics tags, as Jellyfin reads it: `BPS`, else

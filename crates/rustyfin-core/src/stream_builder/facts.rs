@@ -4,9 +4,6 @@ use rustyfin_model::media_source::{MediaSourceResponse, MediaStream};
 
 use super::StreamKind;
 
-/// Codec tags that mark Dolby Vision, in lowercase.
-const DOVI_TAGS: [&str; 5] = ["dvh1", "dvhe", "dav1", "dva1", "dvav"];
-
 /// One stream of a media source, reduced to the fields the conditions test.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct StreamFacts {
@@ -192,27 +189,11 @@ fn parse_frame_rate(text: &str) -> Option<f32> {
     rate.is_finite().then_some(rate)
 }
 
-/// The video range type from the codec tag and the colour transfer. Dolby Vision is
-/// recognised by its tag, HDR10 and HLG by the transfer function, and anything else is SDR.
+/// The video range type, as Jellyfin's `MediaStream.VideoRangeType` gives it: Dolby Vision by
+/// its configuration record (DOVIWithHDR10, DOVIWithEL, ...) or its tag, HDR10 and HLG by the
+/// transfer function, and anything else SDR (`MediaStream::video_range`).
 fn range_type(stream: &MediaStream) -> &'static str {
-    let tag = stream
-        .codec_tag
-        .as_deref()
-        .unwrap_or_default()
-        .to_lowercase();
-    if DOVI_TAGS.contains(&tag.as_str()) {
-        return "DOVI";
-    }
-    let transfer = stream
-        .color_transfer
-        .as_deref()
-        .unwrap_or_default()
-        .to_lowercase();
-    match transfer.as_str() {
-        "smpte2084" => "HDR10",
-        "arib-std-b67" => "HLG",
-        _ => "SDR",
-    }
+    stream.video_range().map_or("SDR", |(_, kind)| kind)
 }
 
 /// The default subtitle index. Among the subtitles that are external, forced or default, it

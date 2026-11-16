@@ -939,10 +939,18 @@ fn range_types_come_from_the_codec_tag_and_transfer() {
         range(Some("hvc1"), Some("arib-std-b67")).as_deref(),
         Some("HLG")
     );
-    for tag in ["dvh1", "DVHE", "dav1", "dva1", "dvav"] {
+    for tag in ["dovi", "dvh1", "DVHE", "dav1"] {
         assert_eq!(
             range(Some(tag), Some("smpte2084")).as_deref(),
             Some("DOVI"),
+            "{tag}"
+        );
+    }
+    // Jellyfin doesn't tag AVC Dolby Vision; without a profile record it's typed by transfer.
+    for tag in ["dva1", "dvav"] {
+        assert_eq!(
+            range(Some(tag), Some("smpte2084")).as_deref(),
+            Some("HDR10"),
             "{tag}"
         );
     }
