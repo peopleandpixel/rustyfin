@@ -324,7 +324,7 @@ fn video_facts(source: &SourceFacts, video: Option<&StreamFacts>) -> VideoFacts 
         level: video.and_then(|v| v.level),
         framerate: Some(video.and_then(|v| v.frame_rate).unwrap_or(0.0)),
         packet_length: None,
-        is_anamorphic: None,
+        is_anamorphic: video.and_then(|v| v.is_anamorphic),
         is_interlaced: video.and_then(|v| v.is_interlaced),
         ref_frames: None,
         num_streams: i32::try_from(source.streams.len()).unwrap_or(i32::MAX),

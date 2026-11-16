@@ -12,17 +12,18 @@ mod dlna_streaming;
 mod dynamic_hls;
 mod encoding_manager;
 mod images;
-mod items;
+pub(crate) mod items;
 mod jellyfin_import;
 pub(crate) mod library;
 mod library_monitor;
 mod live_tv;
 mod localization;
 mod media_segments;
+mod metadata_admin;
 mod oidc;
 mod packages;
 mod persons;
-mod playback;
+pub(crate) mod playback;
 mod plugins;
 mod quick_connect;
 mod scheduled_tasks;
@@ -37,7 +38,7 @@ mod system;
 mod transcode;
 mod trickplay;
 mod users;
-mod websocket;
+pub(crate) mod websocket;
 
 pub use startup::{StartupOwner, settle_owner_at_startup};
 
@@ -100,6 +101,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(library::admin_routes())
         .merge(library_monitor::admin_routes())
         .merge(images::admin_routes())
+        .merge(metadata_admin::admin_routes())
         .merge(items::admin_routes())
         .merge(subtitle::admin_routes())
         .merge(collections::admin_routes())

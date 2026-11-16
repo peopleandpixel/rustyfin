@@ -18,12 +18,12 @@ use uuid::Uuid;
 
 use rustyfin_core::subtitle::{
     OpenSubtitlesConfig, discover_external_subtitles, download_subtitle, is_image_subtitle,
-    shift_vtt, srt_to_vtt, strip_ass_blocks,
+    shift_srt, shift_vtt, srt_to_vtt, strip_ass_blocks,
 };
 use rustyfin_model::media_source::{MediaSourceResponse, MediaStream};
 
 use crate::error::ApiError;
-use crate::routes::streaming::{Version, select_version};
+use crate::routes::streaming::{Version, select_version, validate_path_against_library};
 use crate::state::AppState;
 
 pub fn routes() -> Router<AppState> {
@@ -72,13 +72,7 @@ async fn get_subtitle(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Item {id} not found")))?;
 
-    let media_path = PathBuf::from(&item.path);
-    let subs = discover_external_subtitles(&media_path);
-
-    let sub = subs
-        .into_iter()
-        .find(|s| s.index == index)
-        .ok_or_else(|| ApiError::NotFound(format!("Subtitle index {index} not found")))?;
+    let sub = external_subtitle(&state, &item, index).await?;
 
     let content = tokio::fs::read_to_string(&sub.path)
         .await
@@ -109,6 +103,30 @@ async fn get_subtitle(
     }
 }
 
+/// The external subtitle file `index` beside an item's file. The item's file and the subtitle
+/// file must both pass the library check the streams use, so neither a stored path nor a link
+/// beside it reads a file outside the library or one the server owns. The returned subtitle's
+/// path is the resolved one, which the caller opens.
+async fn external_subtitle(
+    state: &AppState,
+    item: &rustyfin_model::media::MediaItem,
+    index: usize,
+) -> Result<rustyfin_core::subtitle::ExternalSubtitle, ApiError> {
+    validate_path_against_library(state, &item.path).await?;
+    let media_path = PathBuf::from(&item.path);
+    let sub = tokio::task::spawn_blocking(move || discover_external_subtitles(&media_path))
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .find(|s| s.index == index)
+        .ok_or_else(|| ApiError::NotFound(format!("Subtitle index {index} not found")))?;
+    let path = validate_path_against_library(state, &sub.path.to_string_lossy()).await?;
+    Ok(rustyfin_core::subtitle::ExternalSubtitle {
+        path: PathBuf::from(path),
+        ..sub
+    })
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "PascalCase")]
 #[allow(dead_code)]
@@ -129,13 +147,7 @@ async fn get_subtitle_stream(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Item {id} not found")))?;
 
-    let media_path = PathBuf::from(&item.path);
-    let subs = discover_external_subtitles(&media_path);
-
-    let sub = subs
-        .into_iter()
-        .find(|s| s.index == index)
-        .ok_or_else(|| ApiError::NotFound(format!("Subtitle index {index} not found")))?;
+    let sub = external_subtitle(&state, &item, index).await?;
 
     let file = tokio::fs::File::open(&sub.path)
         .await
@@ -193,6 +205,58 @@ async fn source_subtitle_vtt_from(
 /// numbered after the highest stream index, in file-name order. The directory is read on a
 /// blocking thread, so the async workers do not wait on it; a failed task gives no files.
 pub(crate) async fn external_streams(source: &MediaSourceResponse) -> Vec<MediaStream> {
+    let media_path = PathBuf::from(&source.path);
+    let found = tokio::task::spawn_blocking(move || discover_external_subtitles(&media_path))
+        .await
+        .unwrap_or_default();
+    streams_of(source, found)
+}
+
+/// How many folders `add_external_streams` reads at once.
+const FOLDER_READS_AT_ONCE: usize = 8;
+
+/// Adds to each of `sources` the external subtitle streams `external_streams` gives it, reading
+/// each folder once however many sources sit in it, at most `FOLDER_READS_AT_ONCE` at a time.
+pub(crate) async fn add_external_streams(sources: &mut [&mut MediaSourceResponse]) {
+    use futures_util::StreamExt;
+
+    let mut folders: Vec<PathBuf> = sources
+        .iter()
+        .filter_map(|source| std::path::Path::new(&source.path).parent())
+        .map(PathBuf::from)
+        .collect();
+    folders.sort();
+    folders.dedup();
+    let listings: HashMap<PathBuf, Vec<PathBuf>> = futures_util::stream::iter(folders)
+        .map(|folder| async move {
+            let read = folder.clone();
+            let files = tokio::task::spawn_blocking(move || {
+                rustyfin_core::subtitle::subtitle_files_in(&read)
+            })
+            .await
+            .unwrap_or_default();
+            (folder, files)
+        })
+        .buffer_unordered(FOLDER_READS_AT_ONCE)
+        .collect()
+        .await;
+    for source in sources.iter_mut() {
+        let media_path = std::path::Path::new(&source.path);
+        let Some(files) = media_path.parent().and_then(|folder| listings.get(folder)) else {
+            continue;
+        };
+        let found = rustyfin_core::subtitle::external_subtitles_among(media_path, files);
+        let streams = streams_of(source, found);
+        source.media_streams.extend(streams);
+    }
+}
+
+/// `found`, the external subtitle files of `source`, as subtitle streams: those its streams
+/// don't list, numbered after its highest stream index.
+fn streams_of(
+    source: &MediaSourceResponse,
+    found: Vec<rustyfin_core::subtitle::ExternalSubtitle>,
+) -> Vec<MediaStream> {
     let listed: Vec<PathBuf> = source
         .media_streams
         .iter()
@@ -205,10 +269,6 @@ pub(crate) async fn external_streams(source: &MediaSourceResponse) -> Vec<MediaS
         .max()
         .unwrap_or(-1)
         + 1;
-    let media_path = PathBuf::from(&source.path);
-    let found = tokio::task::spawn_blocking(move || discover_external_subtitles(&media_path))
-        .await
-        .unwrap_or_default();
     found
         .into_iter()
         .filter(|file| !listed.contains(&file.path))
@@ -237,10 +297,18 @@ async fn subtitle_vtt(
     start_ticks: i64,
     format: &str,
 ) -> Result<Response, ApiError> {
-    if !format.eq_ignore_ascii_case("vtt") {
+    // The format the URL names, as the device profile's External subtitle profile gave it
+    let Some(output) = SubtitleOutput::of(format) else {
         return Err(ApiError::BadRequest(format!(
-            "Subtitles are served as vtt, not {format}"
+            "Subtitles are served as vtt, srt or ass, not {format}"
         )));
+    };
+    // ASS events carry their times in several places (override tags too), so an ASS file isn't
+    // moved; a client that starts a transcode later asks for WebVTT or SubRip
+    if start_ticks > 0 && output.muxer == "ass" {
+        return Err(ApiError::BadRequest(
+            "An ASS subtitle can't start later than 0; ask for vtt or srt".to_string(),
+        ));
     }
 
     let sources =
@@ -280,6 +348,9 @@ async fn subtitle_vtt(
     } else {
         (PathBuf::from(&source.path), format!("0:{index}"))
     };
+    // The input is read only when the streams' library check passes for it, by its resolved path
+    let input =
+        PathBuf::from(validate_path_against_library(state, &input.to_string_lossy()).await?);
     let meta = tokio::fs::metadata(&input).await.map_err(|e| {
         tracing::warn!("Cannot read the subtitle source {}: {e}", input.display());
         ApiError::Internal("Cannot read the subtitle source".to_string())
@@ -308,7 +379,7 @@ async fn subtitle_vtt(
         .collect();
     let cache_dir = state.data_dir.join("cache").join("subtitle-vtt");
     // One cache file per stream; its stamp names the input it was made from
-    let cache_file = cache_dir.join(format!("v1-{source_key}-{index}.vtt"));
+    let cache_file = cache_dir.join(format!("v1-{source_key}-{index}.{}", output.extension));
     let input_hash = fnv1a(input.as_os_str().as_encoded_bytes());
     let stamp = format!("{input_hash:016x}-{}-{mtime}", meta.len());
 
@@ -328,13 +399,17 @@ async fn subtitle_vtt(
                     } else {
                         None
                     };
-                    let text = ffmpeg_vtt(&input, &map, demuxer, cp1252).await?;
-                    // ffmpeg keeps the ASS override and comment blocks as text; no ASS renderer
-                    // shows them
+                    let text = ffmpeg_vtt(&input, &map, demuxer, cp1252, output.muxer).await?;
+                    // ffmpeg keeps the ASS override and comment blocks as text; outside ASS no
+                    // renderer shows them
                     let ass = stream.codec.as_deref().is_some_and(|codec| {
                         codec.eq_ignore_ascii_case("ass") || codec.eq_ignore_ascii_case("ssa")
                     });
-                    let text = if ass { strip_ass_blocks(&text) } else { text };
+                    let text = if ass && output.muxer != "ass" {
+                        strip_ass_blocks(&text)
+                    } else {
+                        text
+                    };
                     match write_cache(&cache_dir, &cache_file, &stamp, &text).await {
                         Ok(()) => sweep_vtt_cache_daily(&cache_dir),
                         Err(e) => {
@@ -350,17 +425,44 @@ async fn subtitle_vtt(
         }
     };
 
-    let vtt = if start_ticks > 0 {
-        shift_vtt(&text, start_ticks)
-    } else {
-        text
+    // The cues move back by the start offset; ASS was refused one above
+    let text = match output.muxer {
+        "webvtt" => shift_vtt(&text, start_ticks),
+        "srt" => shift_srt(&text, start_ticks),
+        _ => text,
     };
     Ok((
         StatusCode::OK,
-        [(header::CONTENT_TYPE, "text/vtt; charset=utf-8")],
-        vtt,
+        [(header::CONTENT_TYPE, output.content_type)],
+        text,
     )
         .into_response())
+}
+
+/// A text format that the subtitle endpoint writes: the ffmpeg muxer, the cache file's extension
+/// and the content type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SubtitleOutput {
+    muxer: &'static str,
+    extension: &'static str,
+    content_type: &'static str,
+}
+
+impl SubtitleOutput {
+    /// The output for a URL's format, the names Jellyfin's subtitle profiles use, in any case.
+    fn of(format: &str) -> Option<Self> {
+        let (muxer, extension, content_type) = match format.to_ascii_lowercase().as_str() {
+            "vtt" | "webvtt" => ("webvtt", "vtt", "text/vtt; charset=utf-8"),
+            "srt" | "subrip" => ("srt", "srt", "application/x-subrip; charset=utf-8"),
+            "ass" | "ssa" => ("ass", "ass", "text/x-ssa; charset=utf-8"),
+            _ => return None,
+        };
+        Some(Self {
+            muxer,
+            extension,
+            content_type,
+        })
+    }
 }
 
 /// The ffmpeg demuxer of the external subtitle file `path`, by its extension in lower case; None
@@ -375,7 +477,8 @@ fn subtitle_demuxer(path: &std::path::Path) -> Option<&'static str> {
     }
 }
 
-/// The ffmpeg arguments that write subtitle stream `map` of `input` as WebVTT on stdout. Input
+/// The ffmpeg arguments that write subtitle stream `map` of `input` on stdout with `muxer`
+/// (`webvtt`, `srt` or `ass`). Input
 /// options go before `-i`: `-sub_charenc CP1252` when `cp1252`, and `-f {demuxer}` when a demuxer
 /// is given. The forced format keeps ffmpeg from reading an external file by its content (a
 /// playlist or concat list named `.srt` would open other files or URLs), and only local files
@@ -385,6 +488,7 @@ fn vtt_args(
     map: &str,
     demuxer: Option<&str>,
     cp1252: bool,
+    muxer: &str,
 ) -> Vec<OsString> {
     let mut args: Vec<OsString> = ["-nostdin", "-v", "error", "-protocol_whitelist", "file"]
         .map(OsString::from)
@@ -397,7 +501,7 @@ fn vtt_args(
     }
     args.push("-i".into());
     args.push(input.into());
-    args.extend(["-map", map, "-f", "webvtt", "-"].map(OsString::from));
+    args.extend(["-map", map, "-f", muxer, "-"].map(OsString::from));
     args
 }
 
@@ -409,9 +513,10 @@ async fn ffmpeg_vtt(
     map: &str,
     demuxer: Option<&str>,
     cp1252: bool,
+    muxer: &str,
 ) -> Result<String, ApiError> {
     let mut command = tokio::process::Command::new("ffmpeg");
-    command.args(vtt_args(input, map, demuxer, cp1252));
+    command.args(vtt_args(input, map, demuxer, cp1252, muxer));
     let stderr = match run_capped(&mut command, MAX_SUBTITLE_BYTES, VTT_TIME_LIMIT).await {
         Ok(RunEnd::Exited { status, stdout, .. }) if status.success() => {
             match String::from_utf8(stdout) {
@@ -690,7 +795,7 @@ fn sweep_vtt_cache(dir: &std::path::Path, now: SystemTime, max_bytes: u64) -> us
         let age = now.duration_since(read).unwrap_or_default();
         let stale = if name.ends_with(".tmp") {
             age > HOUR
-        } else if name.ends_with(".vtt") {
+        } else if is_cached_text(&name) {
             !name.starts_with("v1-") || age > THIRTY_DAYS
         } else {
             false
@@ -699,7 +804,7 @@ fn sweep_vtt_cache(dir: &std::path::Path, now: SystemTime, max_bytes: u64) -> us
             if std::fs::remove_file(&path).is_ok() {
                 removed += 1;
             }
-        } else if name.starts_with("v1-") && name.ends_with(".vtt") {
+        } else if name.starts_with("v1-") && is_cached_text(&name) {
             kept.push((read, meta.len(), path));
         }
     }
@@ -716,6 +821,13 @@ fn sweep_vtt_cache(dir: &std::path::Path, now: SystemTime, max_bytes: u64) -> us
         }
     }
     removed
+}
+
+/// Whether `name` is a subtitle text that the cache holds: WebVTT, SubRip or ASS.
+fn is_cached_text(name: &str) -> bool {
+    [".vtt", ".srt", ".ass"]
+        .iter()
+        .any(|extension| name.ends_with(extension))
 }
 
 /// The most the WebVTT cache may hold, in bytes: the sweep removes the least recently read past it.
@@ -934,6 +1046,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn r3playback_folders_read_once_give_the_same_streams() {
+        // Two films in one folder, one in another, and a source whose folder is gone
+        let shared = Folder::with(&[
+            "Film.mkv",
+            "Film.en.srt",
+            "Other.mkv",
+            "Other.de.ass",
+            "Other.srt",
+        ]);
+        let alone = Folder::with(&["Film.mkv", "Film.fr.vtt"]);
+        let with_path = |folder: &Folder, name: &str, streams: serde_json::Value| {
+            let mut source = source(folder, streams);
+            source.path = folder.path(name);
+            source
+        };
+        let mut sources = vec![
+            with_path(
+                &shared,
+                "Film.mkv",
+                json!([{"Index": 0, "CodecType": "video"}]),
+            ),
+            with_path(&shared, "Other.mkv", json!([])),
+            with_path(&alone, "Film.mkv", json!([])),
+        ];
+        let mut gone = sources[2].clone();
+        gone.path = "/nonexistent-r3/Film.mkv".to_string();
+        sources.push(gone);
+        let mut expected = Vec::new();
+        for source in &sources {
+            expected.push(external_streams(source).await);
+        }
+        let mut batched = sources.clone();
+        let mut refs: Vec<&mut MediaSourceResponse> = batched.iter_mut().collect();
+        add_external_streams(&mut refs).await;
+        for (i, (source, before)) in batched.iter().zip(&sources).enumerate() {
+            let added = &source.media_streams[before.media_streams.len()..];
+            assert_eq!(summary(added), summary(&expected[i]), "source {i}");
+        }
+        assert_eq!(expected[1].len(), 2);
+        assert!(expected[3].is_empty());
+    }
+
+    #[tokio::test]
     async fn test_external_streams_of_a_source_without_streams_start_at_zero() {
         let folder = Folder::with(&FILES);
         let indexes: Vec<i32> = external_streams(&source(&folder, json!([])))
@@ -959,10 +1114,16 @@ mod tests {
 
     #[test]
     fn test_vtt_args_force_the_external_format() {
-        let args: Vec<String> = vtt_args(Path::new("/media/film.srt"), "0:s:0", Some("srt"), false)
-            .into_iter()
-            .map(|arg| arg.into_string().unwrap())
-            .collect();
+        let args: Vec<String> = vtt_args(
+            Path::new("/media/film.srt"),
+            "0:s:0",
+            Some("srt"),
+            false,
+            "webvtt",
+        )
+        .into_iter()
+        .map(|arg| arg.into_string().unwrap())
+        .collect();
         let input = args.iter().position(|arg| arg == "-i").unwrap();
         let before = &args[..input];
         assert!(before.windows(2).any(|p| p[0] == "-f" && p[1] == "srt"));
@@ -977,10 +1138,11 @@ mod tests {
 
     #[test]
     fn test_vtt_args_let_ffmpeg_probe_an_embedded_stream() {
-        let args: Vec<String> = vtt_args(Path::new("/media/film.mkv"), "0:3", None, false)
-            .into_iter()
-            .map(|arg| arg.into_string().unwrap())
-            .collect();
+        let args: Vec<String> =
+            vtt_args(Path::new("/media/film.mkv"), "0:3", None, false, "webvtt")
+                .into_iter()
+                .map(|arg| arg.into_string().unwrap())
+                .collect();
         let input = args.iter().position(|arg| arg == "-i").unwrap();
         assert!(!args[..input].iter().any(|arg| arg == "-f"));
         assert_eq!(args[input + 2..], ["-map", "0:3", "-f", "webvtt", "-"]);
@@ -988,10 +1150,16 @@ mod tests {
 
     #[test]
     fn test_vtt_args_read_cp1252() {
-        let args: Vec<String> = vtt_args(Path::new("/media/film.srt"), "0:s:0", Some("srt"), true)
-            .into_iter()
-            .map(|arg| arg.into_string().unwrap())
-            .collect();
+        let args: Vec<String> = vtt_args(
+            Path::new("/media/film.srt"),
+            "0:s:0",
+            Some("srt"),
+            true,
+            "webvtt",
+        )
+        .into_iter()
+        .map(|arg| arg.into_string().unwrap())
+        .collect();
         let input = args.iter().position(|arg| arg == "-i").unwrap();
         let before = &args[..input];
         assert!(

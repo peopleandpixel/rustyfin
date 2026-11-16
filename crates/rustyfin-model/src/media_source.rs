@@ -155,6 +155,13 @@ pub struct MediaStream {
     /// Whether subtitles have embedded bitmaps
     #[serde(default)]
     pub embedded_bitmaps: bool,
+    /// The codec level as ffprobe gives it (e.g. 41 for H.264 4.1, 153 for HEVC 5.1). Video only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<f64>,
+    /// Whether the video's pixels are not square (a sample aspect ratio other than 1:1). Video
+    /// only; unknown when ffprobe gives no sample aspect ratio.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_anamorphic: Option<bool>,
 }
 
 /// What identifies a media stream across rescans. A remembered track choice is offered only where
@@ -275,6 +282,22 @@ pub fn jellyfin_language(language: &str) -> &str {
         .map_or(language, |(_, t)| t)
 }
 
+/// The spellings of a language code that name the same language, lowercased: the code, and for
+/// an ISO 639-2 language with a bibliographic and a terminology code, both ("ger" and "deu").
+/// Stored streams keep the file's code while the API reports the terminology one, so a filter
+/// matches either.
+pub fn language_forms(language: &str) -> Vec<String> {
+    let code = language.trim().to_ascii_lowercase();
+    let mut forms = vec![code.clone()];
+    if let Some((b, t)) = BIBLIOGRAPHIC_LANGUAGES
+        .iter()
+        .find(|(b, t)| *b == code || *t == code)
+    {
+        forms = vec![b.to_string(), t.to_string()];
+    }
+    forms
+}
+
 fn serialize_jellyfin_codec<S: serde::Serializer>(
     codec: &Option<String>,
     serializer: S,
@@ -311,6 +334,15 @@ mod tests {
         assert_eq!(json["Type"], "Subtitle");
         // Rustyfin's own field stays for its web client
         assert_eq!(json["CodecType"], "subtitle");
+    }
+
+    #[test]
+    fn r3playback_language_forms_cover_both_iso_639_2_codes() {
+        assert_eq!(language_forms("ger"), ["ger", "deu"]);
+        assert_eq!(language_forms(" DEU "), ["ger", "deu"]);
+        assert_eq!(language_forms("Fre"), ["fre", "fra"]);
+        assert_eq!(language_forms("eng"), ["eng"]);
+        assert_eq!(language_forms("de"), ["de"]);
     }
 
     #[test]

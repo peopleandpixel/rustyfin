@@ -3,6 +3,7 @@ import { $, icon, toast, escapeHtml, scanRing } from './util.js';
 import { backdropUrl, createCardElement, sectionRow } from './cards.js';
 import { serverVersion } from './wizard.js';
 import { LIBRARY_PAGE_SIZE, setupInfiniteScroll, destroyInfiniteScroll } from './library.js';
+import { loadUserSettings, homeSections, showsInLatest } from './user-settings.js';
 
 // --- Home Page Renderer ---
 
@@ -85,11 +86,14 @@ async function renderHome() {
     try {
         let libsError = null;
         const libsRequest = API.getLibraries().catch(err => { libsError = err; return null; });
+        // The user's home screen settings: the sections' order, and the libraries left out of "Latest"
+        const settingsLoad = loadUserSettings().catch(() => null);
         const [resumeData, resumeAudioData, nextUpData, latestRows, libsData] = await Promise.all([
             API.cachedGet(resumeUrl('Video')).catch(() => ({ Items: [] })),
             API.cachedGet(resumeUrl('Audio')).catch(() => ({ Items: [] })),
             (API.getNextUp ? API.getNextUp(12) : Promise.resolve({ Items: [] })).catch(() => ({ Items: [] })),
-            libsRequest.then(fetchLatestRows),
+            Promise.all([libsRequest, settingsLoad])
+                .then(([libs]) => fetchLatestRows((libs || []).filter(lib => showsInLatest(lib.id || lib.Id)))),
             libsRequest,
         ]);
         if (API.token !== session) return;
@@ -143,8 +147,9 @@ async function renderHome() {
         }
 
         // 2. "Meine Medien" Library Tiles
+        let tiles = '';
         if (libsError) {
-            c += `
+            tiles = `
             <div class="mb-10">
                 <div class="flex items-center gap-2 mb-4">
                     <span class="w-2.5 h-2.5 rounded-full bg-[#00a4dc]"></span>
@@ -153,7 +158,7 @@ async function renderHome() {
                 <p class="text-sm text-red-400">${t('library.list_failed', { message: escapeHtml(libsError.message) })}</p>
             </div>`;
         } else if (libraries.length > 0) {
-            c += `
+            tiles = `
             <div class="mb-10">
                 <div class="flex items-center gap-2 mb-4">
                     <span class="w-2.5 h-2.5 rounded-full bg-[#00a4dc]"></span>
@@ -194,13 +199,16 @@ async function renderHome() {
             </div>`;
         }
 
-        // 3. Sections: Continue Watching, Continue Listening, Next Up, then each library's latest
-        c += sectionRow(t('home.continue_watching'), resume, null, { backdrop: true });
-        c += sectionRow(t('home.continue_listening'), resumeAudio);
-        c += sectionRow(t('home.next_up'), nextUp, null, { backdrop: true });
-        for (const row of latestRows) {
-            c += sectionRow(t('home.latest_in', { name: row.name }), row.items, { page: 'library', data: row.id });
-        }
+        // 3. The sections in the user's order (Jellyfin Web's homesection0..n), hidden ones left out
+        const sections = {
+            smalllibrarytiles: () => tiles,
+            resume: () => sectionRow(t('home.continue_watching'), resume, null, { backdrop: true }),
+            resumeaudio: () => sectionRow(t('home.continue_listening'), resumeAudio),
+            nextup: () => sectionRow(t('home.next_up'), nextUp, null, { backdrop: true }),
+            latestmedia: () => latestRows.map(row =>
+                sectionRow(t('home.latest_in', { name: row.name }), row.items, { page: 'library', data: row.id })).join(''),
+        };
+        for (const section of homeSections()) c += sections[section]();
 
         // Empty Library Welcome Banner
         if (!resume.length && !resumeAudio.length && !nextUp.length && !latest.length) {

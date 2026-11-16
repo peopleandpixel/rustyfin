@@ -10,6 +10,7 @@ import vm from 'node:vm';
 const WEB_SRC = new URL('../../../rustyfin-web/src/', import.meta.url);
 const read = file => fs.readFileSync(new URL(file, WEB_SRC), 'utf8');
 const home = read('modules/home.js');
+const userSettings = read('modules/playerprefs.js') + '\n' + read('modules/user-settings.js');
 
 const LIBS = [
     { Id: 'films', Name: 'Films', ContentType: 'Movies' },
@@ -39,10 +40,16 @@ function sandbox(answers = {}, { libs = LIBS } = {}) {
             rows.push({ title, ids: items.map(i => i.Id), more: more || null });
             return `<row ${title}>`;
         },
+        // user-settings.js runs here too, with no saved settings
+        document: { documentElement: { classList: { toggle() {} } }, getElementById: () => null },
+        window: {},
         API: {
             token: 'tok',
+            userId: 'u1',
             isAdmin: false,
             isLoggedIn: () => true,
+            getMe: async () => ({ Id: 'u1', Configuration: {} }),
+            get: async () => ({ CustomPrefs: {} }),
             getLibraries: async () => libs,
             getNextUp: async () => ({ Items: [] }),
             async cachedGet(url) {
@@ -53,7 +60,7 @@ function sandbox(answers = {}, { libs = LIBS } = {}) {
             },
         },
     });
-    const body = home.replace(/^import .*$/gm, '').replace(/^export \{[^}]*\};$/gm, '');
+    const body = [userSettings, home].join('\n').replace(/^import .*$/gm, '').replace(/^export \{[^}]*\};$/gm, '');
     vm.runInContext(`${body}\nthis.renderHome = renderHome; this.homeLatestPlan = homeLatestPlan;`, context);
     return { context, gets, rows: () => JSON.parse(JSON.stringify(rows)), page };
 }

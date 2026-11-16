@@ -66,33 +66,47 @@ pub struct ExternalSubtitle {
 /// Looks for files matching `<basename>.<ext>` and `<basename>.<lang>.<ext>`
 /// where `<ext>` is one of srt, ass, ssa, vtt.
 pub fn discover_external_subtitles(media_path: &Path) -> Vec<ExternalSubtitle> {
-    let parent = match media_path.parent() {
-        Some(p) => p,
-        None => return vec![],
+    match media_path.parent() {
+        Some(parent) => external_subtitles_among(media_path, &subtitle_files_in(parent)),
+        None => vec![],
+    }
+}
+
+/// The subtitle files (srt, ass, ssa, vtt) in `dir`; none when it can't be read. A caller that
+/// looks for several media files' subtitles in one folder reads it once with this.
+pub fn subtitle_files_in(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return vec![];
     };
-    let stem = match media_path.file_stem().and_then(|s| s.to_str()) {
-        Some(s) => s,
-        None => return vec![],
+    entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|ext| SUBTITLE_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
+                && path.is_file()
+        })
+        .collect()
+}
+
+/// The external subtitles of `media_path` among `files`, the subtitle files of its folder (see
+/// `subtitle_files_in`), numbered as `discover_external_subtitles` numbers them.
+pub fn external_subtitles_among(media_path: &Path, files: &[PathBuf]) -> Vec<ExternalSubtitle> {
+    let Some(stem) = media_path.file_stem().and_then(|s| s.to_str()) else {
+        return vec![];
     };
 
     let mut results = Vec::new();
-    let entries = match std::fs::read_dir(parent) {
-        Ok(e) => e,
-        Err(_) => return vec![],
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let ext = match path.extension().and_then(|e| e.to_str()) {
-            Some(e) => e.to_lowercase(),
-            None => continue,
+    for path in files {
+        let path = path.clone();
+        let Some(ext) = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_lowercase)
+        else {
+            continue;
         };
-        if !SUBTITLE_EXTENSIONS.contains(&ext.as_str()) {
-            continue;
-        }
-        if !path.is_file() {
-            continue;
-        }
         let file_stem_full = match path.file_stem().and_then(|s| s.to_str()) {
             Some(s) => s,
             None => continue,
@@ -177,6 +191,51 @@ pub fn shift_vtt(vtt: &str, start_ticks: i64) -> String {
         }
         for line in lines {
             out.push_str(&line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Moves the cues of a SubRip text back by `start_ticks` (100 ns units), as `shift_vtt` does
+/// WebVTT cues: a cue that has ended by then is dropped, the others start at 0 at the earliest,
+/// and the cues are numbered again from 1. A block without a timing line is dropped. Blocks are
+/// joined by one blank line and the text ends with a newline. A start of 0 or less returns the
+/// text unchanged.
+pub fn shift_srt(srt: &str, start_ticks: i64) -> String {
+    if start_ticks <= 0 {
+        return srt.to_string();
+    }
+    let shift = start_ticks / 10_000;
+    let mut out = String::with_capacity(srt.len());
+    let mut number = 0;
+    for block in vtt_blocks(srt) {
+        // SubRip writes a comma before the milliseconds, WebVTT a dot
+        let block: Vec<String> = block
+            .iter()
+            .map(|line| {
+                if line.contains(" --> ") {
+                    line.replace(',', ".")
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect();
+        let block: Vec<&str> = block.iter().map(String::as_str).collect();
+        let Some(mut lines) = shift_block(&block, shift) else {
+            continue;
+        };
+        let Some(at) = lines.iter().take(2).position(|line| line.contains(" --> ")) else {
+            continue;
+        };
+        lines[at] = lines[at].replace('.', ",");
+        number += 1;
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&format!("{number}\n"));
+        for line in &lines[at..] {
+            out.push_str(line);
             out.push('\n');
         }
     }
@@ -552,6 +611,19 @@ mod tests {
         let srt = "1\n00:00:01,000 --> 00:00:02,000\nHello, world";
         let vtt = srt_to_vtt(srt);
         assert!(vtt.contains("Hello, world"));
+    }
+
+    #[test]
+    fn r3decisions_shift_srt_moves_drops_and_renumbers() {
+        let srt = "1\n00:00:01,000 --> 00:00:02,000\nGone\n\n\
+                   2\n00:00:09,500 --> 00:00:12,250\nClipped\n\n\
+                   3\n00:01:00,000 --> 00:01:01,000\nMoved\nTwo lines\n";
+        assert_eq!(
+            shift_srt(srt, 100_000_000),
+            "1\n00:00:00,000 --> 00:00:02,250\nClipped\n\n\
+             2\n00:00:50,000 --> 00:00:51,000\nMoved\nTwo lines\n"
+        );
+        assert_eq!(shift_srt(srt, 0), srt);
     }
 
     #[test]

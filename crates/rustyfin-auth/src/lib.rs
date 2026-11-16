@@ -307,6 +307,25 @@ pub async fn token_device_id(pool: &SqlitePool, token: &str) -> Result<Option<St
     Ok(device)
 }
 
+/// The user and device of a token. `None` for an unknown token or one without a device id.
+pub async fn token_device(
+    pool: &SqlitePool,
+    token: &str,
+) -> Result<Option<(Uuid, TokenDevice)>, AuthError> {
+    let row = repo_token::get_token_device(pool, &token_hash(token)).await?;
+    Ok(row.filter(|(_, device_id, ..)| !device_id.is_empty()).map(
+        |(uid, device_id, device_name, app_name, app_version)| {
+            let device = TokenDevice {
+                device_id,
+                device_name,
+                app_name,
+                app_version,
+            };
+            (uid, device)
+        },
+    ))
+}
+
 /// Revokes a single token.
 pub async fn revoke_token(pool: &SqlitePool, token: &str) -> Result<(), AuthError> {
     repo_token::delete_token(pool, &token_hash(token)).await?;

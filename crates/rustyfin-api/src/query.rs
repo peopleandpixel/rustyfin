@@ -81,6 +81,7 @@ const LIST_PARAMS: &[&str] = &[
     "sortOrder",
     "studioIds",
     "studios",
+    "subtitleLanguages",
     "tags",
     "videoTypes",
     "years",

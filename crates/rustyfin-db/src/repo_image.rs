@@ -201,6 +201,22 @@ pub async fn delete_images_for_item(pool: &SqlitePool, item_id: Uuid) -> Result<
     Ok(())
 }
 
+/// Deletes an item's images that a refresh fetches again: the providers' and the admin's own
+/// (uploaded or chosen), not the ones found next to the media or taken from chapters. Returns how
+/// many went.
+pub async fn delete_replaceable_images(
+    pool: &SqlitePool,
+    item_id: Uuid,
+) -> Result<u64, sqlx::Error> {
+    let done = sqlx::query(
+        "DELETE FROM item_images WHERE item_id = ? AND provider NOT IN ('local', 'chapter')",
+    )
+    .bind(item_id.to_string())
+    .execute(pool)
+    .await?;
+    Ok(done.rows_affected())
+}
+
 /// Batch-fetch images for multiple items in a single query.
 /// Returns a map of item_id -> Vec<ItemImage>.
 pub async fn get_images_batch(

@@ -9,7 +9,7 @@ import {
     trackPrefs, defaultTracks, defaultSubtitleIndex as preferredSubtitleIndex, subtitleAppearance, saveSubtitleAppearance,
     subtitleCss, stepSubtitleOffset, qualityOptions, bitrateLabel, maxStreamingBitrate, setMaxStreamingBitrate,
     aspectRatio, setAspectRatio, SEGMENT_TYPES, segmentAction, setSegmentAction, stillWatchingSetting,
-    setStillWatchingSetting, stillWatchingDue,
+    setStillWatchingSetting, stillWatchingDue, burnsInSubtitle,
 } from './playerprefs.js';
 let playerReportInterval = null;
 let playerBars = null;
@@ -99,7 +99,7 @@ async function openStream(session, startTicks) {
     const startSeconds = startTicks / 1e7;
     // Capture the subtitle before the request so a change made during it sees this load's burn-in
     const requestedSubtitle = session.subtitleIndex;
-    session.burnedIn = streamType === 'Videos' && isImageSubtitle(findStream(session, 'subtitle', requestedSubtitle)?.Codec);
+    session.burnedIn = streamType === 'Videos' && burnsIn(findStream(session, 'subtitle', requestedSubtitle)?.Codec);
 
     let url;
     let isHls = false;
@@ -116,6 +116,8 @@ async function openStream(session, startTicks) {
                 // The quality chosen on this device (the settings menu); Auto sends no limit, as a high one would
                 // keep a high-bitrate source (a 4K remux) from playing directly
                 maxBitrate: maxStreamingBitrate() || undefined,
+                // A text subtitle that the device's burn-in setting burns in is asked for as Encode
+                subtitleMethod: session.burnedIn ? 'Encode' : undefined,
             });
             if (!current()) return;
             if (data && data.url) {
@@ -165,7 +167,7 @@ async function openStream(session, startTicks) {
     session.mediaSourceId = session.mediaSourceId || mediaSourceId;
     session.playMethod = isHls ? 'Transcode' : (url.includes('Static=true') ? 'DirectPlay' : 'DirectStream');
     updateQualityTag();
-    session.burnedIn = isHls && isImageSubtitle(findStream(session, 'subtitle', requestedSubtitle)?.Codec);
+    session.burnedIn = isHls && burnsIn(findStream(session, 'subtitle', requestedSubtitle)?.Codec);
 
     video.onerror = () => {
         if (!current()) return;
@@ -338,7 +340,7 @@ function changeSubtitleTrack(value) {
     const session = activePlayback;
     if (!session) return;
     session.subtitleIndex = Number(value);
-    if (session.burnedIn || isImageSubtitle(findStream(session, 'subtitle', session.subtitleIndex)?.Codec)) {
+    if (session.burnedIn || burnsIn(findStream(session, 'subtitle', session.subtitleIndex)?.Codec)) {
         clearTextSubtitle();
         session.tracksChanged = true;
         scheduleRestart(session, session.position());
@@ -361,6 +363,12 @@ function findStream(session, type, index) {
 function isImageSubtitle(codec) {
     const c = (codec || '').toLowerCase();
     return c.includes('pgs') || ['dvd_subtitle', 'dvdsub', 'vobsub', 'dvb_subtitle', 'dvbsub', 'xsub', 'sup'].includes(c);
+}
+
+// Whether the transcode burns in a subtitle of this codec: picture ones, and text ones the device's
+// burn-in setting (Jellyfin Web's subtitleburnin) names
+function burnsIn(codec) {
+    return burnsInSubtitle(codec, isImageSubtitle(codec));
 }
 
 // The text track of the subtitle that showTextSubtitle added, if any
@@ -396,7 +404,7 @@ function clearTextSubtitle() {
 function showTextSubtitle(session) {
     clearTextSubtitle();
     const stream = findStream(session, 'subtitle', session.subtitleIndex);
-    if (!session.mediaSourceId || !stream || isImageSubtitle(stream.Codec)) return;
+    if (!session.mediaSourceId || !stream || burnsIn(stream.Codec)) return;
     const track = document.createElement('track');
     track.kind = 'subtitles';
     track.dataset.playerSubtitle = '1';
@@ -721,6 +729,11 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
             if (this.audioIndex !== null) fields.AudioStreamIndex = this.audioIndex;
             if (this.subtitleIndex !== null) fields.SubtitleStreamIndex = this.subtitleIndex;
             if (this.playSessionId) fields.PlaySessionId = this.playSessionId;
+            // The play state a session list shows (Jellyfin's PlayerStateInfo)
+            const video = $('video-player');
+            fields.PlayMethod = this.isHls ? 'Transcode' : 'DirectPlay';
+            fields.CanSeek = true;
+            if (video) Object.assign(fields, { VolumeLevel: Math.round(video.volume * 100), IsMuted: video.muted });
             return fields;
         },
         stop() {
@@ -2029,7 +2042,18 @@ document.addEventListener('keydown', e => {
     }
 });
 
+// Remote control (remote.js): the playing item and where it is, and a seek to an item time in ticks
+function nowPlaying() {
+    const s = activePlayback;
+    return s ? { itemId: s.itemId, streamType: s.streamType, positionTicks: Math.round(s.position() * 1e7) } : null;
+}
+
+function seekToTicks(ticks) {
+    if (activePlayback) seekTo(activePlayback, ticks / 1e7);
+}
+
 export {
+    nowPlaying, seekToTicks,
     resumePositionTicks, playWithResumeChoice, stopPlayback, seekVideo, skipTime, previewSeek, changeAudioTrack,
     changeSubtitleTrack, playItem, playerAutoHide, onPlayerClosed, playerAreaClick, closePlayer, playAdjacentEpisode,
     playUpNextNow, cancelUpNext, togglePlayPause, setVolume, toggleMute, setPlaybackRate, toggleFullscreen,

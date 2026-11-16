@@ -12,6 +12,9 @@ import {
 import { renderSearch } from './search.js';
 import { playWithResumeChoice, stopPlayback, playItem, playerAutoHide, onPlayerClosed } from './player.js';
 import { playContainer } from './queue.js';
+import {
+    openCardMenu, toggleCardPlayed, toggleCardFavorite, setCardLikes, playCardItem, openAddTo,
+} from './cardmenu.js';
 import { playAlbumFrom } from './music.js';
 import { renderSettings } from './settings.js';
 import {
@@ -23,6 +26,7 @@ import {
     folderBrowserSelect, closeFolderBrowser, addLibraryPathRow, removeLibraryPathRow, initScanProgressWebSocket,
 } from './library-admin.js';
 import { openPluginConfig, openPluginPriority } from './plugins.js';
+import { openRefreshDialog, openIdentifyDialog, openImageEditor, openMetadataEditor } from './metadata-admin.js';
 let currentPage = 'home';
 
 // --- Navigation & Routing ---
@@ -94,7 +98,8 @@ function startScanWithToast(request, startedMessage) {
 }
 
 // The refresh answers only when the server has finished, so the button stays busy until then, and the open page is re-rendered from fresh data.
-async function refreshItemMetadata(button, id) {
+// `options` is the refresh dialog's query (Jellyfin's refresh modes).
+async function refreshItemMetadata(button, id, options) {
     if (button.disabled) return;
     const busy = t('detail.metadata_refreshing');
     button.disabled = true;
@@ -103,7 +108,7 @@ async function refreshItemMetadata(button, id) {
     button.setAttribute('aria-label', busy);
     button.setAttribute('title', busy);
     try {
-        await API.refreshItem(id);
+        await API.refreshItem(id, options);
         API.invalidateCache('/Items');
         API.invalidateCache('/Shows');
         toast(t('detail.metadata_refreshed'));
@@ -146,10 +151,22 @@ const clickActions = {
     'scan-all': () => startScanWithToast(API.scanAllLibraries(), t('admin.scanning_all')),
     'jump-letter': el => jumpToLetter(el.dataset.id, el.dataset.letter),
     'clear-library-filters': el => clearLibraryFilters(el.dataset.id),
+    // A card's buttons and its context menu's commands (cardmenu.js)
+    'card-menu': el => openCardMenu(el),
+    'card-played': el => toggleCardPlayed(el),
+    'card-favorite': el => toggleCardFavorite(el),
+    'card-like': el => setCardLikes(el, true),
+    'card-dislike': el => setCardLikes(el, false),
+    'card-play': el => playCardItem(el),
+    'card-add-playlist': el => openAddTo(el, 'playlist'),
+    'card-add-collection': el => openAddTo(el, 'collection'),
     'toggle-favorite': el => toggleFavorite(el.dataset.id, el.dataset.favorite === 'true'),
     'toggle-played': el => togglePlayed(el.dataset.id, el.dataset.played === 'true', el.dataset.all === 'true'),
     'delete-item': el => deleteItemFromDetail(el.dataset),
-    'refresh-item': el => refreshItemMetadata(el, el.dataset.id),
+    'refresh-item': el => openRefreshDialog(options => refreshItemMetadata(el, el.dataset.id, options)),
+    'edit-metadata': el => openMetadataEditor(el.dataset.id),
+    'identify-item': el => openIdentifyDialog(el.dataset.id),
+    'edit-images': el => openImageEditor(el.dataset.id),
     'admin-tab': el => showAdminTab(el, el.dataset.tab),
     'delete-user': el => { if (confirm(t('admin.delete_user_confirm'))) API.deleteUser(el.dataset.id).then(() => renderAdmin()); },
     'set-user-admin': el => setUserPolicy(el, { IsAdministrator: el.checked }),

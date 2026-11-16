@@ -9,5 +9,6 @@ pub mod parental;
 pub mod query;
 mod route_case;
 pub mod routes;
+pub mod sessions;
 pub mod state;
 pub mod wizard_import;

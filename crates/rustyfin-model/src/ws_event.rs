@@ -73,6 +73,30 @@ pub enum WsEvent {
         #[serde(rename = "Data")]
         data: RefreshProgressData,
     },
+    /// The session list (Jellyfin's `SessionInfoDto`s), to a socket that sent `SessionsStart`.
+    Sessions {
+        #[serde(rename = "Data")]
+        data: serde_json::Value,
+    },
+    /// A play request for the session (Jellyfin's `PlayRequest`).
+    Play {
+        #[serde(rename = "Data")]
+        data: serde_json::Value,
+    },
+    /// A playstate command for the session (Jellyfin's `PlaystateRequest`).
+    Playstate {
+        #[serde(rename = "Data")]
+        data: serde_json::Value,
+    },
+    /// A general command for the session (Jellyfin's `GeneralCommand`).
+    GeneralCommand {
+        #[serde(rename = "Data")]
+        data: serde_json::Value,
+    },
+    /// Internal: the session list changed. Each socket that follows the sessions sends its viewer
+    /// a `Sessions` frame; it is never sent as itself.
+    #[serde(skip)]
+    SessionsChanged,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
