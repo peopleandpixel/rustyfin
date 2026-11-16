@@ -27176,6 +27176,47 @@ async fn r3cards_library_sort_keys() {
     );
 }
 
+// R3 cards: the parental rating sort orders by the rating's score, as Jellyfin's
+// ParentalRatingValue, not by its text; unrated items come first ascending, and equal scores go by
+// the rating text
+#[tokio::test]
+async fn r3cards_parental_rating_sort_by_score() {
+    let state = test_state().await;
+    let ratings = ["TV-MA", "PG-13", "NR", "R", "G", "NC-17", "TV-14", "PG"];
+    let movie = |name| B23Item {
+        name,
+        sort_name: name,
+        media_type: "Movie",
+        ..Default::default()
+    };
+    let items: Vec<B23Item> = ratings.iter().map(|r| movie(r)).collect();
+    let movies = rustyfin_model::library::LibraryContentType::Movies;
+    let (token, _, ids) = b23_library(&state, movies, &items).await;
+    for (id, rating) in ids.iter().zip(ratings) {
+        sqlx::query("UPDATE media_items SET official_rating = ? WHERE id = ?")
+            .bind(rating)
+            .bind(id.to_string())
+            .execute(&state.db)
+            .await
+            .unwrap();
+    }
+    let app = app(state);
+    let uri = |order: &str| {
+        format!(
+            "/Items?Recursive=true&IncludeItemTypes=Movie&SortBy=OfficialRating,SortName&SortOrder={order}"
+        )
+    };
+    // R is 17; NC-17 and TV-MA are 17 with a sub score of 1, tied by their text
+    assert_eq!(
+        b23_names(&app, &token, &uri("Ascending")).await,
+        ["NR", "G", "PG", "PG-13", "TV-14", "R", "NC-17", "TV-MA"]
+    );
+    assert_eq!(
+        b23_names(&app, &token, &uri("Descending")).await,
+        ["TV-MA", "NC-17", "R", "TV-14", "PG-13", "PG", "G", "NR"]
+    );
+}
+
 #[tokio::test]
 async fn b23_comma_lists_apply_in_order_on_both_item_lists() {
     let state = test_state().await;
