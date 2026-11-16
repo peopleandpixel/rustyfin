@@ -504,6 +504,8 @@ const API = {
                 ac3: 'audio/mp4; codecs="ac-3"',
                 eac3: 'audio/mp4; codecs="ec-3"',
             }),
+            // HEVC Main 10, which most HEVC films are; the server copies 10-bit HEVC only when told
+            hevcMain10: canPlay('video/mp4; codecs="hvc1.2.4.L120.90"'),
         };
         return this._playableCodecs;
     },
@@ -518,6 +520,8 @@ const API = {
         const codecs = this.playableCodecs();
         q.set('VideoCodecs', codecs.video.join(','));
         q.set('AudioCodecs', codecs.audio.join(','));
+        // Jellyfin's codec condition: the HEVC bit depth this browser decodes
+        if (codecs.video.includes('hevc')) q.set('hevc-videobitdepth', codecs.hevcMain10 ? '10' : '8');
         if (params.startTimeTicks > 0) q.set('StartTimeTicks', params.startTimeTicks);
         if (params.mediaSourceId) q.set('MediaSourceId', params.mediaSourceId);
         if (params.audioStreamIndex != null) q.set('AudioStreamIndex', params.audioStreamIndex);
