@@ -3246,6 +3246,7 @@ const B124_WEB_MODULES: &[&str] = &[
     "jellyfin-import.js",
     "library-admin.js",
     "library.js",
+    "metadata-admin.js",
     "music.js",
     "player.js",
     "plugins.js",
@@ -23800,6 +23801,13 @@ fn r3item_detail() {
 #[test]
 fn r3item_play() {
     b124_node_test("r3item_play.mjs");
+}
+
+// R3 metadata: the admin's refresh, Identify, image and metadata editor dialogs in the web client
+// (tests/web/r3metadata_admin.mjs)
+#[test]
+fn r3metadata_web() {
+    b124_node_test("r3metadata_admin.mjs");
 }
 
 // The web client's autoplay switch is Jellyfin's UserConfiguration.EnableNextEpisodeAutoPlay: each

@@ -531,6 +531,7 @@ async function renderDetail(itemId) {
                             <button class="jf-btn-ghost h-11 !py-0 w-11 !px-0" title="${escapeHtml(t('detail.refresh_metadata'))}" aria-label="${escapeHtml(t('detail.refresh_metadata'))}" data-action="refresh-item" data-id="${escapeHtml(id)}">
                                 ${icon('RefreshCw', { size: 18, class: 'jf-busy-spin' })}
                             </button>
+                            ${metadataToolButtons(item)}
                             <button class="jf-btn-ghost h-11 !py-0 w-11 !px-0 hover:!text-rose-400" title="${escapeHtml(t('detail.delete_item'))}" aria-label="${escapeHtml(t('detail.delete_item'))}" data-action="delete-item" data-id="${escapeHtml(id)}" data-name="${escapeHtml(name)}" data-type="${escapeHtml(type)}" data-parent-id="${escapeHtml(deleteParentId(item))}">
                                 ${icon('Trash2', { size: 18 })}
                             </button>` : ''}
@@ -652,6 +653,16 @@ async function togglePlayed(id, current, all = false) {
     } catch (e) {
         toast(e.message, 'error');
     }
+}
+
+// Admin: the metadata editor, Identify (for the types the provider knows) and the image editor
+function metadataToolButtons(item) {
+    const tools = [['edit-metadata', 'Pencil', 'metadata.edit_metadata']];
+    if (item.Type === 'Movie' || item.Type === 'Series') tools.push(['identify-item', 'ScanSearch', 'metadata.identify']);
+    tools.push(['edit-images', 'Images', 'metadata.edit_images']);
+    return tools.map(([action, name, key]) => `<button class="jf-btn-ghost h-11 !py-0 w-11 !px-0" title="${escapeHtml(t(key))}" aria-label="${escapeHtml(t(key))}" data-action="${action}" data-id="${escapeHtml(item.Id)}">
+                                ${icon(name, { size: 18 })}
+                            </button>`).join('');
 }
 
 // The page an item's deletion leaves for: its season, series or album, else home

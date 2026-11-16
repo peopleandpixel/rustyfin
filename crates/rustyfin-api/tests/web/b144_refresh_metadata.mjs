@@ -207,5 +207,6 @@ test("the detail page's action row uses Lucide icons, not emoji, at one height",
     const buttons = row.match(/<button[^>]*>/g);
     assert.ok(buttons.length >= 4);
     for (const b of buttons) assert.match(b, /\bh-11\b/, `every action button is h-11: ${b}`);
-    assert.match(source, /'refresh-item': el => refreshItemMetadata\(el, el\.dataset\.id\)/);
+    // The button opens the refresh dialog first; its choice goes to the same busy-button refresh
+    assert.match(source, /'refresh-item': el => openRefreshDialog\(options => refreshItemMetadata\(el, el\.dataset\.id, options\)\)/);
 });
