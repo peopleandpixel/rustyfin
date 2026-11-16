@@ -4,6 +4,7 @@ mod additional_parts;
 mod auth;
 mod backup;
 mod branding;
+mod client_log;
 mod collections;
 mod configuration;
 mod devices;
@@ -164,6 +165,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(additional::routes())
         .merge(additional_parts::routes())
         .merge(suggestions::routes())
+        .merge(client_log::routes())
         .merge(media_segments::routes())
         .merge(trickplay::routes())
         .merge(
