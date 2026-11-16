@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Web client user settings**: The settings page gains Jellyfin Web's user settings, each saved as soon as it changes.
+  - Profile: choose or delete a profile picture; the header shows it in place of the initial.
+  - Display: the date and time format, and Show backdrops (on by default, as Rustyfin always showed them).
+  - Home screen: the order of the five home sections (My Media, Continue Watching, Continue Listening, Next Up, Recently Added), any of which can be hidden, and a "Show in Recently Added" switch per library. The home page follows them.
+  - Playback: preferred audio language, play the default audio track regardless of language, maximum streaming bitrate, play next episode automatically, and remember audio and subtitle selections.
+  - Subtitles: subtitle mode, preferred subtitle language, burn-in, and the subtitle appearance (text size, font, colour, background, drop shadow).
+  - The fields Jellyfin keeps in the user's configuration are saved there (`/Users/{id}/Configuration`); the others under Jellyfin Web's own key names in the user's `usersettings` display preferences, so they follow the account to every browser.
 - **Profile pictures**: A user can set and delete their profile picture through Jellyfin's `POST /UserImage` and `DELETE /UserImage` (also the older `/Users/{userId}/Images/Primary`), and `GET /UserImage?userId=` serves it, without sign-in as in Jellyfin. The upload is base64, as Jellyfin's clients send it, or the raw PNG, JPEG, GIF or WebP file. A user's `PrimaryImageTag` names the current picture. Before, the upload routes were missing and the delete did nothing.
 - **Playback settings on the server**: Video PlaybackInfo offers a remembered audio or subtitle track as the default only while the user keeps Jellyfin's `RememberAudioSelections` or `RememberSubtitleSelections` on. `/Videos/{id}/Universal` follows `MaxStreamingBitrate`: a file above it is not played directly, and a limit under the transcode's default 8 Mbps sets the transcode's video bitrate (the limit less 192 kbps of audio). `SubtitleMethod=Encode` burns in the chosen subtitle, text ones too.
 - **Web player: play queue and shuffle**: Series, seasons, albums, artists, playlists, collections and folders get Play and Shuffle buttons, and each library gets Shuffle. They play a queue in Jellyfin Web's order (a series from its first unplayed episode), or in the server's random order (`SortBy=Random`). The player's previous and next buttons, Shift+P and Shift+N, and the next-up card move through the queue. Music plays straight on, and videos follow the next-episode autoplay setting.

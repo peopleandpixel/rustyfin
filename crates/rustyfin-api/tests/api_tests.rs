@@ -3253,6 +3253,7 @@ const B124_WEB_MODULES: &[&str] = &[
     "router.js",
     "search.js",
     "settings.js",
+    "user-settings.js",
     "util.js",
     "wizard.js",
 ];
@@ -23519,6 +23520,18 @@ fn r3music_tabs() {
 #[test]
 fn r3home_rows() {
     b124_node_test("r3home_rows.mjs");
+}
+
+// R3 settings: the home screen follows the user's section order and Recently Added libraries
+#[test]
+fn r3settings_home() {
+    b124_node_test("r3settings_home.mjs");
+}
+
+// R3 settings: the settings page saves each setting where Jellyfin keeps it
+#[test]
+fn r3settings_page() {
+    b124_node_test("r3settings_page.mjs");
 }
 
 #[test]

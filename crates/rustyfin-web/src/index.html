@@ -360,8 +360,9 @@
         <!-- User Menu -->
         <div id="nav-user-menu" class="hidden relative">
             <button onclick="toggleUserMenu()" class="flex items-center gap-2 p-1 rounded-full hover:bg-white/10 transition border border-white/10">
-                <div class="w-8 h-8 rounded-full bg-gradient-to-tr from-[#00a4dc] to-[#38bdf8] flex items-center justify-center text-xs font-bold text-white shadow-md">
+                <div class="w-8 h-8 rounded-full bg-gradient-to-tr from-[#00a4dc] to-[#38bdf8] flex items-center justify-center text-xs font-bold text-white shadow-md overflow-hidden">
                     <span id="nav-avatar-letter">U</span>
+                    <img id="nav-avatar-img" class="w-full h-full object-cover" alt="" hidden>
                 </div>
                 <span id="nav-user-name" class="text-xs font-medium hidden md:inline pr-1"></span>
             </button>

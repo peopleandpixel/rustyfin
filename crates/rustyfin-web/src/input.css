@@ -319,6 +319,12 @@ body {
   object-fit: cover;
 }
 
+/* The user's "Show backdrops" setting, turned off */
+.rf-no-backdrops .jf-spotlight-backdrop,
+.rf-no-backdrops .jf-item-backdrop {
+  display: none;
+}
+
 .jf-spotlight-gradient {
   position: absolute;
   inset: 0;

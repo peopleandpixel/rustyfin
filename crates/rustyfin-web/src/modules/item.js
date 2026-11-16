@@ -470,7 +470,7 @@ async function renderDetail(itemId) {
         <div class="jf-page">
             <!-- Full Hero Backdrop Banner -->
             <div class="jf-detail-hero -mx-4 lg:-mx-8 -mt-6">
-                ${backdropSrc ? `<img src="${backdropSrc}" class="w-full h-[460px] object-cover opacity-35" onerror="this.style.display='none'">` : ''}
+                ${backdropSrc ? `<img src="${backdropSrc}" class="jf-item-backdrop w-full h-[460px] object-cover opacity-35" onerror="this.style.display='none'">` : ''}
                 <div class="absolute bottom-0 left-0 right-0 p-6 sm:p-10 lg:p-12 z-10 flex flex-col md:flex-row gap-8 items-end">
                     <!-- Poster Box -->
                     <div class="w-44 sm:w-56 rounded-2xl overflow-hidden shadow-2xl border border-white/10 flex-shrink-0 hidden md:block bg-black/60">
