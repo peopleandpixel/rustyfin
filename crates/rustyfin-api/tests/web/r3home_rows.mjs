@@ -10,7 +10,7 @@ import vm from 'node:vm';
 const WEB_SRC = new URL('../../../rustyfin-web/src/', import.meta.url);
 const read = file => fs.readFileSync(new URL(file, WEB_SRC), 'utf8');
 const home = read('modules/home.js');
-const userSettings = read('modules/user-settings.js');
+const userSettings = read('modules/playerprefs.js') + '\n' + read('modules/user-settings.js');
 
 const LIBS = [
     { Id: 'films', Name: 'Films', ContentType: 'Movies' },

@@ -523,6 +523,7 @@ const API = {
         if (params.mediaSourceId) q.set('MediaSourceId', params.mediaSourceId);
         if (params.audioStreamIndex != null) q.set('AudioStreamIndex', params.audioStreamIndex);
         if (params.subtitleStreamIndex != null) q.set('SubtitleStreamIndex', params.subtitleStreamIndex);
+        if (params.subtitleMethod) q.set('SubtitleMethod', params.subtitleMethod);
         const data = await this.get(`/Videos/${itemId}/Universal?${q.toString()}`);
         // The player reads `url`; the server sends `Url`
         if (data && !data.url) data.url = data.Url;

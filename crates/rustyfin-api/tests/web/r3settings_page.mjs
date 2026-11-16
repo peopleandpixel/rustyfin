@@ -11,7 +11,7 @@ import vm from 'node:vm';
 
 const WEB_SRC = new URL('../../../rustyfin-web/src/', import.meta.url);
 const read = file => fs.readFileSync(new URL(file, WEB_SRC), 'utf8');
-const source = [read('modules/user-settings.js'), read('modules/settings.js')].join('\n')
+const source = [read('modules/playerprefs.js'), read('modules/user-settings.js'), read('modules/settings.js')].join('\n')
     .replace(/^import \{[^}]*\} from .*$/gm, '')
     .replace(/^import .*$/gm, '')
     .replace(/^export \{[^}]*\};$/gm, '');

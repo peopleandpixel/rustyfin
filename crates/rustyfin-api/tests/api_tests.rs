@@ -23642,6 +23642,12 @@ fn r3settings_page() {
     b124_node_test("r3settings_page.mjs");
 }
 
+// R3 settings: the device settings reach the player; device over account, as in Jellyfin Web
+#[test]
+fn r3settings_device() {
+    b124_node_test("r3settings_device.mjs");
+}
+
 #[test]
 fn r3search_typeahead() {
     b124_node_test("r3search_typeahead.mjs");

@@ -2,6 +2,7 @@
 // settings Jellyfin Web keeps in its userSettings, saved here as the CustomPrefs of the
 // "usersettings" display preferences (client "emby") so they follow the account to every browser.
 // Both are loaded once per user and kept; a save updates the copy.
+import { deviceSetting, setDeviceSetting } from './playerprefs.js';
 
 // The home sections Rustyfin has, by Jellyfin Web's ids
 const HOME_SECTIONS = ['smalllibrarytiles', 'resume', 'resumeaudio', 'nextup', 'latestmedia'];
@@ -9,6 +10,11 @@ const HOME_SECTIONS = ['smalllibrarytiles', 'resume', 'resumeaudio', 'nextup', '
 const HOME_SLOT_DEFAULTS = [
     'smalllibrarytiles', 'resume', 'resumeaudio', 'resumebook', 'livetv', 'nextup', 'latestmedia', 'none', 'none', 'none',
 ];
+
+// The settings Jellyfin Web keeps only on the device, which the player reads there (playerprefs.js):
+// true for those kept per user on the device. The device's value wins, as in Jellyfin Web; the
+// account's fills a device that has none, and a save here writes both.
+const DEVICE_SETTINGS = { maxStreamingBitrate: false, subtitleburnin: false, localplayersubtitleappearance3: true };
 
 let loaded = null; // { userId, config, prefs }
 let loading = null;
@@ -33,6 +39,10 @@ function loadUserSettings({ force = false } = {}) {
         };
         if (API.userId === userId) {
             loaded = result;
+            for (const [name, perUser] of Object.entries(DEVICE_SETTINGS)) {
+                const saved = result.prefs.CustomPrefs[name];
+                if (saved != null && saved !== '' && deviceSetting(name, perUser) === null) setDeviceSetting(name, saved, perUser);
+            }
             applyUserSettings();
             showAvatar(me?.PrimaryImageTag || null);
         }
@@ -44,8 +54,13 @@ function loadUserSettings({ force = false } = {}) {
     return promise;
 }
 
-// A CustomPrefs value as stored (a string), or fallback before the settings load or when unset
+// A setting as stored (a string): the device's for a device setting that it has, else the account's
+// CustomPrefs value; fallback before the settings load or when unset
 function userSetting(name, fallback = null) {
+    if (name in DEVICE_SETTINGS) {
+        const device = deviceSetting(name, DEVICE_SETTINGS[name]);
+        if (device !== null && device !== '') return device;
+    }
     const value = loaded?.userId === API.userId ? loaded.prefs.CustomPrefs[name] : undefined;
     return value == null ? fallback : value;
 }
@@ -66,6 +81,9 @@ async function saveUserSettings(values) {
     const prefs = { ...settings.prefs, CustomPrefs: customPrefs };
     await API.post(prefsPath(settings.userId), prefs);
     settings.prefs = prefs;
+    for (const [name, value] of Object.entries(values)) {
+        if (name in DEVICE_SETTINGS) setDeviceSetting(name, value, DEVICE_SETTINGS[name]);
+    }
     applyUserSettings();
 }
 
