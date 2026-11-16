@@ -2829,6 +2829,7 @@ pub(crate) async fn media_item(
             apply_unplayed_counts(&mut item, counts.get(&key).copied().unwrap_or((0, 0)));
         }
     }
+    item.can_download = super::item_download::can_download(state, user, &item).await;
     Ok(item)
 }
 

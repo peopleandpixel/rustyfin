@@ -361,6 +361,7 @@ pub fn add_external_subtitles(
             codec: Some(external_subtitle_codec(&file.format)),
             codec_type: "subtitle".to_string(),
             language: file.language,
+            is_forced: file.forced,
             is_external: true,
             path: Some(file.path.to_string_lossy().into_owned()),
             r#type: MediaStream::stream_type("subtitle", None),

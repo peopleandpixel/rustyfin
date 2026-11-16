@@ -7,7 +7,7 @@ import {
     House, LayoutDashboard, ChevronLeft, X, Play, Pause, Rewind, FastForward, Volume1, Volume2, VolumeX, Captions,
     Maximize, ArrowDownUp, Circle, SkipBack, SkipForward, Funnel, FunnelX, Shuffle, PictureInPicture2, ThumbsUp,
     ThumbsDown, Trash2, EllipsisVertical, ListPlus, FolderPlus, LayoutGrid, List, Pencil, ScanSearch,
-    Images, Cast, MessageSquare, GripVertical, ListMusic, Plus, Power,
+    Images, Cast, MessageSquare, GripVertical, ListMusic, Plus, Power, Download, Share2, Upload,
 } from 'lucide';
 
 window.lucideIcons = {
@@ -16,7 +16,7 @@ window.lucideIcons = {
     House, LayoutDashboard, ChevronLeft, X, Play, Pause, Rewind, FastForward, Volume1, Volume2, VolumeX, Captions,
     Maximize, ArrowDownUp, Circle, SkipBack, SkipForward, Funnel, FunnelX, Shuffle, PictureInPicture2, ThumbsUp,
     ThumbsDown, Trash2, EllipsisVertical, ListPlus, FolderPlus, LayoutGrid, List, Pencil, ScanSearch,
-    Images, Cast, MessageSquare, GripVertical, ListMusic, Plus, Power,
+    Images, Cast, MessageSquare, GripVertical, ListMusic, Plus, Power, Download, Share2, Upload,
 };
 
 createIcons({ icons: window.lucideIcons, attrs: { 'aria-hidden': 'true' } });
